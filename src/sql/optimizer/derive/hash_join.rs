@@ -14,6 +14,20 @@ use crate::sql::optimizer::property::{
 
 use super::{ChildRequirementAlternative, DeriveOutput, DeriveRequired, PropertyAlternativeKind};
 
+pub(crate) fn join_execution_distribution_for_alternative(
+    alt_kind: &PropertyAlternativeKind,
+) -> Option<crate::sql::optimizer::physical_plan::JoinExecutionDistribution> {
+    match alt_kind {
+        PropertyAlternativeKind::BroadcastJoin => {
+            Some(crate::sql::optimizer::physical_plan::JoinExecutionDistribution::Broadcast)
+        }
+        PropertyAlternativeKind::ShuffleJoin => {
+            Some(crate::sql::optimizer::physical_plan::JoinExecutionDistribution::Partitioned)
+        }
+        PropertyAlternativeKind::Default => None,
+    }
+}
+
 /// Join types whose output rows are streamed from the left side intact —
 /// the join only filters/augments by attaching right-side data on a per-
 /// row basis. For these, output distribution follows the left child.

@@ -5,10 +5,9 @@
 
 use std::collections::HashMap;
 
-use super::derive::PropertyAlternativeKind;
 use super::memo::{GroupId, Memo};
 use super::operator::{JoinDistribution, Operator, PhysicalDistributionOp, PhysicalSortOp};
-use super::physical_plan::PhysicalPlanNode;
+use super::physical_plan::{JoinExecutionDistribution, PhysicalPlanNode, PlanExecutionProps};
 use super::property::{OrderingSpec, PhysicalPropertySet};
 use super::search::{EnforcerKind, Winner};
 use crate::sql::analysis::{ExprKind, SortItem, TypedExpr};
@@ -86,16 +85,19 @@ pub(crate) fn extract_best(
         Operator::PhysicalCTEAnchor(op) => Operator::PhysicalCTEAnchor(op.clone()),
         other => other.clone(),
     };
-    if let Operator::PhysicalHashJoin(join) = &mut op {
-        match winner.alt_kind {
-            PropertyAlternativeKind::BroadcastJoin => {
-                join.distribution = JoinDistribution::Broadcast;
-            }
-            PropertyAlternativeKind::ShuffleJoin => {
-                join.distribution = JoinDistribution::Shuffle;
-            }
-            PropertyAlternativeKind::Default => {}
-        }
+    let join_distribution = if matches!(op, Operator::PhysicalHashJoin(_)) {
+        crate::sql::optimizer::derive::hash_join::join_execution_distribution_for_alternative(
+            &winner.alt_kind,
+        )
+    } else {
+        None
+    };
+    if let (Operator::PhysicalHashJoin(join), Some(distribution)) = (&mut op, join_distribution) {
+        join.distribution = match distribution {
+            JoinExecutionDistribution::Broadcast => JoinDistribution::Broadcast,
+            JoinExecutionDistribution::Partitioned => JoinDistribution::Shuffle,
+            JoinExecutionDistribution::Colocate => JoinDistribution::Colocate,
+        };
     }
 
     let inner_node = PhysicalPlanNode {
@@ -103,7 +105,11 @@ pub(crate) fn extract_best(
         children,
         stats: group_stats.clone(),
         output_columns: output_columns.clone(),
-        execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+        execution_props: PlanExecutionProps {
+            output_property: winner.output.clone(),
+            child_output_properties: winner.child_outputs.clone(),
+            join_distribution,
+        },
         build_runtime_filters: Vec::new(),
         probe_runtime_filters: Vec::new(),
     };
@@ -132,7 +138,11 @@ pub(crate) fn extract_best(
             children: vec![inner_node],
             stats: group_stats,
             output_columns,
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            execution_props: PlanExecutionProps {
+                output_property: required.clone(),
+                child_output_properties: vec![winner.output.clone()],
+                join_distribution: None,
+            },
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         });
@@ -184,10 +194,28 @@ fn ordering_spec_to_sort_items(ordering: &OrderingSpec) -> Vec<SortItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::analysis::JoinKind;
+    use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::derive::PropertyAlternativeKind;
     use crate::sql::optimizer::memo::{MExpr, Memo};
-    use crate::sql::optimizer::operator::{Operator, PhysicalLimitOp, PhysicalScanOp};
+    use crate::sql::optimizer::operator::{
+        JoinDistribution, Operator, PhysicalHashJoinEqCondition, PhysicalHashJoinOp,
+        PhysicalLimitOp, PhysicalScanOp, PhysicalValuesOp,
+    };
+    use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::search::Winner;
+
+    fn test_col(id: u32) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId(id),
+                qualifier: None,
+                column: format!("c{id}"),
+            },
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+        }
+    }
 
     fn scan_op(table: &str) -> Operator {
         Operator::PhysicalScan(PhysicalScanOp {
@@ -207,6 +235,124 @@ mod tests {
             required_columns: None,
             dict_columns: vec![],
         })
+    }
+
+    fn make_hash_join_winner_with_shuffle_child_props_for_test() -> (
+        Memo,
+        GroupId,
+        HashMap<(GroupId, PhysicalPropertySet), Winner>,
+        PhysicalPropertySet,
+    ) {
+        let mut memo = Memo::new();
+        let left = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalValues(PhysicalValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
+            children: vec![],
+        });
+        let right = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalValues(PhysicalValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
+            children: vec![],
+        });
+        let root = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: test_col(10),
+                    right: test_col(20),
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Unknown,
+            }),
+            children: vec![left, right],
+        });
+
+        let required = PhysicalPropertySet::gather();
+        let left_req = PhysicalPropertySet {
+            distribution: DistributionSpec::shuffle_join([ColumnId(10)]),
+            ordering: OrderingSpec::Any,
+        };
+        let right_req = PhysicalPropertySet {
+            distribution: DistributionSpec::shuffle_join([ColumnId(20)]),
+            ordering: OrderingSpec::Any,
+        };
+        let root_output = PhysicalPropertySet {
+            distribution: DistributionSpec::shuffle_join([ColumnId(10), ColumnId(20)]),
+            ordering: OrderingSpec::Any,
+        };
+
+        let mut winners = HashMap::new();
+        winners.insert(
+            (left, left_req.clone()),
+            Winner {
+                group_id: left,
+                expr_index: 0,
+                cost: 1.0,
+                enforcer: None,
+                output: left_req.clone(),
+                alt_kind: PropertyAlternativeKind::Default,
+                child_props: vec![],
+                child_outputs: vec![],
+            },
+        );
+        winners.insert(
+            (right, right_req.clone()),
+            Winner {
+                group_id: right,
+                expr_index: 0,
+                cost: 1.0,
+                enforcer: None,
+                output: right_req.clone(),
+                alt_kind: PropertyAlternativeKind::Default,
+                child_props: vec![],
+                child_outputs: vec![],
+            },
+        );
+        winners.insert(
+            (root, required.clone()),
+            Winner {
+                group_id: root,
+                expr_index: 0,
+                cost: 3.0,
+                enforcer: None,
+                output: root_output,
+                alt_kind: PropertyAlternativeKind::ShuffleJoin,
+                child_props: vec![left_req.clone(), right_req.clone()],
+                child_outputs: vec![left_req, right_req],
+            },
+        );
+
+        (memo, root, winners, required)
+    }
+
+    #[test]
+    fn extract_uses_winner_child_props_instead_of_rederiving() {
+        let (memo, root, winners, required) =
+            make_hash_join_winner_with_shuffle_child_props_for_test();
+
+        let plan = extract_best(&memo, root, &required, &winners).expect("extract");
+        let winner = winners
+            .get(&(root, required.clone()))
+            .expect("fixture should record root winner");
+
+        assert_eq!(
+            plan.execution_props.join_distribution,
+            Some(crate::sql::optimizer::physical_plan::JoinExecutionDistribution::Partitioned)
+        );
+        assert_eq!(plan.execution_props.child_output_properties.len(), 2);
+        assert_eq!(plan.execution_props.output_property, winner.output);
+        assert_eq!(
+            plan.execution_props.child_output_properties,
+            winner.child_outputs
+        );
     }
 
     #[test]
