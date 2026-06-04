@@ -53,6 +53,13 @@ fn has_duplicates(cols: &[ColumnId]) -> bool {
     cols.iter().any(|col| !seen.insert(*col))
 }
 
+fn same_key_set(parent_cols: &[ColumnId], keys: &[ColumnId]) -> bool {
+    parent_cols.len() == keys.len()
+        && !has_duplicates(parent_cols)
+        && !has_duplicates(keys)
+        && parent_cols.iter().all(|col| keys.contains(col))
+}
+
 fn aligned_shuffle_keys(
     eq_conditions: &[PhysicalHashJoinEqCondition],
     parent_required: &PhysicalPropertySet,
@@ -70,42 +77,38 @@ fn aligned_shuffle_keys(
         return fallback();
     };
 
-    let mut matched_indices = Vec::new();
-    for parent_col in parent_cols {
-        let matches: Vec<usize> = eq_conditions
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, eq)| {
-                let left = typed_expr_to_column_id(&eq.left);
-                let right = typed_expr_to_column_id(&eq.right);
-                (left == Some(*parent_col) || right == Some(*parent_col)).then_some(idx)
-            })
-            .collect();
-        let [idx] = matches.as_slice() else {
-            return fallback();
-        };
-        if matched_indices.contains(idx) {
-            return fallback();
-        }
-        matched_indices.push(*idx);
-    }
-
-    if matched_indices.len() != eq_conditions.len() {
-        return fallback();
-    }
-
-    let mut aligned_left = Vec::with_capacity(matched_indices.len());
-    let mut aligned_right = Vec::with_capacity(matched_indices.len());
-    for idx in matched_indices {
-        let eq = &eq_conditions[idx];
-        let (Some(left), Some(right)) = (
+    let mut left = Vec::with_capacity(eq_conditions.len());
+    let mut right = Vec::with_capacity(eq_conditions.len());
+    for eq in eq_conditions {
+        let (Some(left_col), Some(right_col)) = (
             typed_expr_to_column_id(&eq.left),
             typed_expr_to_column_id(&eq.right),
         ) else {
             return fallback();
         };
-        aligned_left.push(left);
-        aligned_right.push(right);
+        left.push(left_col);
+        right.push(right_col);
+    }
+
+    let match_keys = if same_key_set(parent_cols, &left) {
+        &left
+    } else if same_key_set(parent_cols, &right) {
+        &right
+    } else {
+        return fallback();
+    };
+
+    let mut aligned_left = Vec::with_capacity(parent_cols.len());
+    let mut aligned_right = Vec::with_capacity(parent_cols.len());
+    for parent_col in parent_cols {
+        let Some(pos) = match_keys
+            .iter()
+            .position(|match_col| match_col == parent_col)
+        else {
+            return fallback();
+        };
+        aligned_left.push(left[pos]);
+        aligned_right.push(right[pos]);
     }
     if has_duplicates(&aligned_left) || has_duplicates(&aligned_right) {
         return fallback();
@@ -493,6 +496,46 @@ mod tests {
             .find(|alt| alt.kind == PropertyAlternativeKind::ShuffleJoin)
             .expect("shuffle alternative");
         let fallback = DistributionSpec::shuffle_join([ColumnId(10), ColumnId(20), ColumnId(21)]);
+
+        assert_eq!(shuffle.child_props[0].distribution, fallback);
+        assert_eq!(shuffle.child_props[1].distribution, fallback);
+    }
+
+    #[test]
+    fn hash_join_shuffle_alignment_rejects_mixed_side_parent_keys() {
+        let op = PhysicalHashJoinOp {
+            join_type: crate::sql::analysis::JoinKind::Inner,
+            eq_conditions: vec![
+                PhysicalHashJoinEqCondition {
+                    left: col(10),
+                    right: col(20),
+                    null_safe: false,
+                },
+                PhysicalHashJoinEqCondition {
+                    left: col(11),
+                    right: col(21),
+                    null_safe: false,
+                },
+            ],
+            other_condition: None,
+            distribution: JoinDistribution::Unknown,
+        };
+        let parent = PhysicalPropertySet {
+            distribution: DistributionSpec::shuffle_join([ColumnId(10), ColumnId(21)]),
+            ordering: OrderingSpec::Any,
+        };
+
+        let alternatives = op.derive_required_alternatives(&parent, 2);
+        let shuffle = alternatives
+            .iter()
+            .find(|alt| alt.kind == PropertyAlternativeKind::ShuffleJoin)
+            .expect("shuffle alternative");
+        let fallback = DistributionSpec::shuffle_join([
+            ColumnId(10),
+            ColumnId(20),
+            ColumnId(11),
+            ColumnId(21),
+        ]);
 
         assert_eq!(shuffle.child_props[0].distribution, fallback);
         assert_eq!(shuffle.child_props[1].distribution, fallback);
