@@ -11,6 +11,7 @@ use crate::sql::optimizer::rewrite::imv::action_propagation::{
 };
 use crate::sql::optimizer::rewrite::imv::aggregate_rewrite::RewriteAggregateStateRule;
 use crate::sql::optimizer::rewrite::imv::apply_key::InjectApplyKeyProjectRule;
+use crate::sql::optimizer::rewrite::imv::branch_union::RewriteBranchUnionRule;
 use crate::sql::optimizer::rewrite::imv::delta_pushdown::PushDeltaThroughUnaryRule;
 use crate::sql::optimizer::rewrite::imv::join_delta::RewriteJoinAggregateDeltaRule;
 use crate::sql::optimizer::rewrite::imv::marker::{
@@ -36,6 +37,11 @@ pub(crate) fn build_imv_pipeline() -> RewritePipeline {
             "imv-delta-marker",
             RewritePhase::StructuralRewrite,
             vec![Box::new(WrapRootInImvDeltaRule::new()) as Box<dyn LogicalRewriteRule>],
+        ),
+        RewriteStage::new(
+            "imv-branch-union",
+            RewritePhase::StructuralRewrite,
+            vec![Box::new(RewriteBranchUnionRule) as Box<dyn LogicalRewriteRule>],
         ),
         RewriteStage::new(
             "imv-join-delta",
@@ -127,6 +133,10 @@ mod tests {
             .iter()
             .position(|n| *n == "imv-union-delta")
             .expect("union delta stage must exist");
+        let branch_union = names
+            .iter()
+            .position(|n| *n == "imv-branch-union")
+            .expect("branch union stage must exist");
         let agg = names
             .iter()
             .position(|n| *n == "imv-aggregate-state")
@@ -136,6 +146,7 @@ mod tests {
             .position(|n| *n == "imv-delta-pushdown")
             .expect("delta pushdown stage must exist");
 
+        assert!(branch_union < pushdown, "stage order: {names:?}");
         assert!(join < union, "stage order: {names:?}");
         assert!(union < agg, "stage order: {names:?}");
         assert!(agg < pushdown, "stage order: {names:?}");
