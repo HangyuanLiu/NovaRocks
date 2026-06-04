@@ -831,6 +831,61 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_branch_union_of_project_over_aggregate_composes() {
+        use crate::sql::optimizer::rewrite::imv::marker::plan_contains_imv_marker;
+        use crate::sql::optimizer::rewrite::imv::pipeline::build_imv_pipeline;
+
+        let mut ctx = build_ctx();
+        // project_over_aggregate outputs: region (id=1) and total (id=30).
+        // Both branches reference the registered base "ice.db.b" so scan binding succeeds.
+        let plan = LogicalPlan::Union(UnionNode {
+            inputs: vec![
+                project_over_aggregate(scan("b", 1)),
+                project_over_aggregate(scan("b", 10)),
+            ],
+            all: true,
+            output_columns: vec![output_column(1, "region"), output_column(30, "total")],
+            required_output_columns: None,
+        });
+
+        let out = build_imv_pipeline()
+            .rewrite(plan, &mut ctx)
+            .expect("branch union of Project-over-Aggregate must compose");
+        assert!(
+            !plan_contains_imv_marker(&out),
+            "no marker may survive: each Project-over-Aggregate branch must fully decompose"
+        );
+        let LogicalPlan::Union(union) = &out else {
+            panic!("expected top Union, got {out:?}")
+        };
+        assert_eq!(union.inputs.len(), 2);
+        assert!(
+            union
+                .output_columns
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case("__branch_id__")),
+            "union output must expose __branch_id__"
+        );
+        for branch in &union.inputs {
+            let LogicalPlan::Project(p) = branch else {
+                panic!("expected Project branch, got {branch:?}")
+            };
+            assert!(
+                matches!(p.input.as_ref(), LogicalPlan::AggregateStateMerge(_)),
+                "Project-over-Aggregate branch must land on AggregateStateMerge, got {:?}",
+                p.input
+            );
+            assert!(
+                p.items
+                    .iter()
+                    .any(|i| i.output_name.eq_ignore_ascii_case("__branch_id__")),
+                "branch Project must carry __branch_id__, items: {:?}",
+                p.items
+            );
+        }
+    }
+
+    #[test]
     fn pipeline_branch_union_of_aggregate_over_join_composes() {
         use crate::sql::optimizer::rewrite::imv::marker::plan_contains_imv_marker;
         use crate::sql::optimizer::rewrite::imv::pipeline::build_imv_pipeline;
