@@ -29,6 +29,7 @@
 //!   future Phase 1.x can lift this if the use case arises.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::Arc;
 
 use iceberg::Catalog;
@@ -43,9 +44,9 @@ use crate::connector::iceberg::commit::{
     ensure_no_variant_columns_for_row_level_mutation, ensure_overwrite_single_partition_spec,
     run_iceberg_commit,
 };
+use crate::connector::iceberg::data_writer::write_record_batches_as_data_files;
 use crate::connector::starrocks::table::mv_refresh::query_result_to_chunks;
 use crate::engine::backend_resolver::TargetBackend;
-use crate::engine::mv::iceberg_refresh::write_chunks_as_iceberg_data_files;
 use crate::engine::{StandaloneState, StatementResult};
 use crate::exec::chunk::Chunk;
 use crate::sql::parser::ast::InsertSource;
@@ -169,7 +170,12 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
     let data_files: Vec<DataFile> = if chunks.iter().all(|c| c.batch.num_rows() == 0) {
         Vec::new()
     } else {
-        block_on_iceberg(async { write_chunks_as_iceberg_data_files(&table, &chunks).await })??
+        let write_table = table.clone();
+        let write_chunks = chunks.clone();
+        run_data_file_write_phase_on_sink_io(write_chunks_as_iceberg_data_files_owned(
+            write_table,
+            write_chunks,
+        ))?
     };
 
     // 5. Build the collector and inject every written file.
@@ -482,4 +488,58 @@ pub(crate) fn build_abort_cleanup_for_catalog_entry(
         fs,
         path_mapper: Some(mapper),
     })
+}
+
+fn run_data_file_write_phase_on_sink_io<F, T>(future: F) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>> + Send + 'static,
+    T: Send + 'static,
+{
+    let sink_io = crate::runtime::execution_services::execution_services()?
+        .sink_io()
+        .clone();
+    let join = sink_io.spawn(future);
+    futures::executor::block_on(join)
+        .map_err(|e| format!("standalone iceberg data-file write task join failed: {e}"))?
+}
+
+async fn write_chunks_as_iceberg_data_files_owned(
+    table: iceberg::table::Table,
+    chunks: Vec<Chunk>,
+) -> Result<Vec<DataFile>, String> {
+    let batches = chunks.into_iter().map(|chunk| chunk.batch);
+    write_record_batches_as_data_files(&table, batches).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn data_file_write_phase_helper_runs_on_sink_io_runtime() {
+        let thread_name = run_data_file_write_phase_on_sink_io(async {
+            Ok::<_, String>(
+                std::thread::current()
+                    .name()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default(),
+            )
+        })
+        .expect("sink_io write phase");
+
+        assert!(
+            thread_name.contains("novarocks-sink-io"),
+            "data-file write phase ran on unexpected thread: {thread_name}"
+        );
+    }
+
+    #[test]
+    fn data_file_write_phase_helper_preserves_write_error() {
+        let err = run_data_file_write_phase_on_sink_io(async {
+            Err::<(), String>("write failed".into())
+        })
+        .expect_err("write error should propagate");
+
+        assert_eq!(err, "write failed");
+    }
 }

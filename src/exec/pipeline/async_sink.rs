@@ -46,6 +46,13 @@ pub trait AsyncSinkBackend: Send + 'static {
     /// Result handed to the caller after a clean finish (e.g. staged files, stats).
     type Output: Send + 'static;
 
+    /// Observe the runtime state before the backend is moved to the `sink_io`
+    /// task. Backends that publish side-channel metadata can clone the pieces
+    /// they need here without extending the per-chunk driver contract.
+    fn bind_runtime_state(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Write one chunk. Runs on the `sink_io` runtime; may do real I/O.
     async fn write_chunk(&mut self, chunk: Chunk) -> Result<(), String>;
 
@@ -176,6 +183,11 @@ impl<B: AsyncSinkBackend> Operator for AsyncSinkOperator<B> {
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> Result<(), String> {
         let sink_io: IoExecutor = state.sink_io_executor()?;
         let error_state = state.error_state();
+        let backend_ref = self
+            .backend
+            .as_mut()
+            .ok_or_else(|| "async sink backend already bound".to_string())?;
+        backend_ref.bind_runtime_state(state)?;
         let backend = self
             .backend
             .take()
@@ -300,6 +312,7 @@ mod tests {
     struct TestAsyncSink {
         rows: Arc<AtomicUsize>,
         chunks: Arc<AtomicUsize>,
+        binds: Arc<AtomicUsize>,
         // When set, write_chunk waits until released (simulates slow I/O / backpressure).
         gate: Arc<tokio::sync::Semaphore>,
         // When Some(n), the n-th (0-based) write_chunk fails.
@@ -309,23 +322,32 @@ mod tests {
     }
 
     impl TestAsyncSink {
-        fn new(gate_permits: usize) -> (Self, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        fn new(
+            gate_permits: usize,
+        ) -> (Self, Arc<AtomicUsize>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
             let rows = Arc::new(AtomicUsize::new(0));
             let chunks = Arc::new(AtomicUsize::new(0));
+            let binds = Arc::new(AtomicUsize::new(0));
             let sink = Self {
                 rows: Arc::clone(&rows),
                 chunks: Arc::clone(&chunks),
+                binds: Arc::clone(&binds),
                 gate: Arc::new(tokio::sync::Semaphore::new(gate_permits)),
                 fail_at: None,
                 finish_delay: Duration::ZERO,
             };
-            (sink, rows, chunks)
+            (sink, rows, chunks, binds)
         }
     }
 
     #[async_trait::async_trait]
     impl AsyncSinkBackend for TestAsyncSink {
         type Output = usize;
+
+        fn bind_runtime_state(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            self.binds.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
 
         async fn write_chunk(&mut self, chunk: Chunk) -> Result<(), String> {
             let permit = self.gate.acquire().await.expect("gate");
@@ -361,7 +383,7 @@ mod tests {
     fn drains_all_chunks_with_backpressure() {
         let state = RuntimeState::default();
         // gate starts open (large permit count) so writes flow.
-        let (backend, rows, chunks) = TestAsyncSink::new(1_000);
+        let (backend, rows, chunks, _binds) = TestAsyncSink::new(1_000);
         let mut op = AsyncSinkOperator::new("test_async_sink", backend, 2);
         op.bind_runtime_state(&state).expect("bind");
 
@@ -395,7 +417,7 @@ mod tests {
     fn need_input_goes_false_when_queue_full_then_recovers() {
         let state = RuntimeState::default();
         // gate starts closed (0 permits): background blocks on the first write.
-        let (backend, _rows, _chunks) = TestAsyncSink::new(0);
+        let (backend, _rows, _chunks, _binds) = TestAsyncSink::new(0);
         let gate = Arc::clone(&backend.gate);
         let mut op = AsyncSinkOperator::new("bp_sink", backend, 2);
         op.bind_runtime_state(&state).expect("bind");
@@ -432,7 +454,7 @@ mod tests {
     #[test]
     fn pending_finish_true_while_finishing_then_clears() {
         let state = RuntimeState::default();
-        let (mut backend, _rows, _chunks) = TestAsyncSink::new(1_000);
+        let (mut backend, _rows, _chunks, _binds) = TestAsyncSink::new(1_000);
         backend.finish_delay = Duration::from_millis(200);
         let mut op = AsyncSinkOperator::new("finish_sink", backend, 4);
         op.bind_runtime_state(&state).expect("bind");
@@ -468,7 +490,7 @@ mod tests {
     #[test]
     fn background_failure_sets_query_error_and_does_not_hang() {
         let state = RuntimeState::default();
-        let (mut backend, _rows, _chunks) = TestAsyncSink::new(1_000);
+        let (mut backend, _rows, _chunks, _binds) = TestAsyncSink::new(1_000);
         backend.fail_at = Some(1); // second chunk fails
         let mut op = AsyncSinkOperator::new("err_sink", backend, 4);
         op.bind_runtime_state(&state).expect("bind");
@@ -503,7 +525,7 @@ mod tests {
         let state = RuntimeState::default();
         // gate closed: bg task is parked inside write_chunk (before it counts the
         // chunk) when we cancel, so this exercises cancel of an in-flight write.
-        let (backend, _rows, chunks) = TestAsyncSink::new(0);
+        let (backend, _rows, chunks, _binds) = TestAsyncSink::new(0);
         let mut op = AsyncSinkOperator::new("cancel_sink", backend, 4);
         op.bind_runtime_state(&state).expect("bind");
 
@@ -536,6 +558,21 @@ mod tests {
             chunks.load(Ordering::Acquire),
             0,
             "aborted in-flight write must not have completed"
+        );
+    }
+
+    #[test]
+    fn bind_runtime_state_reaches_backend_before_drain_task_starts() {
+        let state = RuntimeState::default();
+        let (backend, _rows, _chunks, binds) = TestAsyncSink::new(1_000);
+        let mut op = AsyncSinkOperator::new("bind_sink", backend, 2);
+
+        op.bind_runtime_state(&state).expect("bind");
+
+        assert_eq!(
+            binds.load(Ordering::Acquire),
+            1,
+            "backend must observe runtime state during operator bind"
         );
     }
 
@@ -601,7 +638,7 @@ mod tests {
         let runtime_state = Arc::new(RuntimeState::default());
 
         // gate starts closed so the sink saturates and the driver must block.
-        let (mut backend, _rows, _chunks) = TestAsyncSink::new(0);
+        let (mut backend, _rows, _chunks, _binds) = TestAsyncSink::new(0);
         backend.finish_delay = Duration::from_millis(150);
         let gate = Arc::clone(&backend.gate);
         let mut sink = AsyncSinkOperator::new("driver_sink", backend, 2);

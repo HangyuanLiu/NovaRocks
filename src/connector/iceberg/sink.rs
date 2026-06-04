@@ -56,10 +56,15 @@ const ICEBERG_POSITION_DELETE_POS_FIELD_ID: i32 = 2_147_483_545;
 const ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN: &str = "file_path";
 const ICEBERG_POSITION_DELETE_POS_COLUMN: &str = "pos";
 
+use super::data_writer::{
+    StagedWriteContext, StagedWriteOptions, to_sink_commit_info, write_record_batches,
+};
 use super::schema::build_full_output_schema;
+use crate::common::config;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::async_sink::{AsyncSinkBackend, AsyncSinkOperator};
+use crate::exec::pipeline::operator::Operator;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::lower::expr::lower_t_expr;
 use crate::lower::layout::Layout;
@@ -91,6 +96,7 @@ struct IcebergSinkPlan {
     /// Chooses between data-file and position-delete write paths. Derived
     /// from the upstream `TDataSinkType` by the caller of `try_new`.
     mode: IcebergSinkMode,
+    table_location: String,
     data_location: String,
     object_store_s3: Option<S3StoreConfig>,
     file_format: String,
@@ -107,6 +113,7 @@ struct IcebergSinkPlan {
     /// though they never reach the output parquet file.
     output_exprs: Vec<ExprId>,
     partition_exprs: Vec<ExprId>,
+    partition_source_column_names: Vec<String>,
     partition_column_names: Vec<String>,
     transform_exprs: Vec<String>,
 }
@@ -127,8 +134,12 @@ impl IcebergTableSinkFactory {
 
         let iceberg_table = resolve_iceberg_table(desc_tbl, sink.target_table_id)?;
 
-        let (partition_column_names, transform_exprs, mut partition_exprs) =
-            build_partition_exprs(&iceberg_table)?;
+        let (
+            partition_source_column_names,
+            partition_column_names,
+            transform_exprs,
+            mut partition_exprs,
+        ) = build_partition_exprs(&iceberg_table)?;
 
         let output_schema = match mode {
             IcebergSinkMode::Data => {
@@ -168,6 +179,10 @@ impl IcebergTableSinkFactory {
         let lowered_partition_exprs =
             lower_partition_exprs(&partition_exprs, &mut arena, layout, last_query_id, fe_addr)?;
 
+        let table_location = sink
+            .location
+            .clone()
+            .ok_or_else(|| "iceberg sink missing table location".to_string())?;
         let data_location = resolve_data_location(&sink)?;
         let object_store_s3 = resolve_sink_s3_config(&sink, &data_location)?;
         let file_format = sink
@@ -183,6 +198,7 @@ impl IcebergTableSinkFactory {
 
         let plan = IcebergSinkPlan {
             mode,
+            table_location,
             data_location,
             object_store_s3,
             file_format,
@@ -192,6 +208,7 @@ impl IcebergTableSinkFactory {
             output_schema,
             output_exprs: lowered_output_exprs,
             partition_exprs: lowered_partition_exprs,
+            partition_source_column_names,
             partition_column_names,
             transform_exprs,
         };
@@ -204,20 +221,57 @@ impl IcebergTableSinkFactory {
     }
 }
 
+impl IcebergSinkPlan {
+    fn build_staged_write_context(&self) -> Result<StagedWriteContext, String> {
+        if self.mode != IcebergSinkMode::Data {
+            return Err(format!(
+                "staged data-file writer context is only valid for DATA sinks, got {:?}",
+                self.mode
+            ));
+        }
+
+        let writer_schema = Arc::new(iceberg_schema_from_arrow_schema(&self.output_schema)?);
+        let partition_spec = build_staged_partition_spec(
+            writer_schema.as_ref(),
+            &self.partition_source_column_names,
+            &self.partition_column_names,
+            &self.transform_exprs,
+        )?;
+        let mut properties = HashMap::new();
+        properties.insert("write.data.path".to_string(), self.data_location.clone());
+        let metadata = iceberg::spec::TableMetadataBuilder::new(
+            writer_schema.as_ref().clone(),
+            iceberg::spec::PartitionSpec::unpartition_spec(),
+            iceberg::spec::SortOrder::unsorted_order(),
+            self.table_location.clone(),
+            iceberg::spec::FormatVersion::V2,
+            properties,
+        )
+        .map_err(|e| format!("build staged iceberg table metadata failed: {e}"))?
+        .add_current_schema(writer_schema.as_ref().clone())
+        .map_err(|e| format!("add staged iceberg writer schema failed: {e}"))?
+        .add_default_partition_spec(partition_spec)
+        .map_err(|e| format!("add staged iceberg partition spec failed: {e}"))?
+        .build()
+        .map_err(|e| format!("finalize staged iceberg table metadata failed: {e}"))?
+        .metadata;
+        let annotated_schema = Arc::new(
+            iceberg::arrow::schema_to_arrow_schema(&writer_schema)
+                .map_err(|e| format!("convert staged iceberg schema to arrow failed: {e}"))?,
+        );
+        let file_io = build_staged_file_io(&self.data_location, self.object_store_s3.as_ref())?;
+
+        StagedWriteContext::from_parts(metadata, file_io, writer_schema, annotated_schema)
+    }
+}
+
 impl OperatorFactory for IcebergTableSinkFactory {
     fn name(&self) -> &str {
         &self.name
     }
 
     fn create(&self, _dop: i32, driver_id: i32) -> Box<dyn Operator> {
-        Box::new(IcebergTableSinkOperator {
-            name: self.name.clone(),
-            arena: Arc::clone(&self.arena),
-            plan: Arc::clone(&self.plan),
-            driver_id,
-            file_seq: 0,
-            finished: false,
-        })
+        Box::new(self.create_async_operator(driver_id))
     }
 
     fn is_sink(&self) -> bool {
@@ -225,74 +279,59 @@ impl OperatorFactory for IcebergTableSinkFactory {
     }
 }
 
-struct IcebergTableSinkOperator {
-    name: String,
+impl IcebergTableSinkFactory {
+    fn create_async_operator(&self, driver_id: i32) -> AsyncSinkOperator<IcebergTableSinkBackend> {
+        AsyncSinkOperator::new(
+            self.name.clone(),
+            IcebergTableSinkBackend {
+                arena: Arc::clone(&self.arena),
+                plan: Arc::clone(&self.plan),
+                driver_id,
+                file_seq: 0,
+                runtime_state: None,
+            },
+            config::async_sink_queue_capacity(),
+        )
+    }
+}
+
+struct IcebergTableSinkBackend {
     arena: Arc<ExprArena>,
     plan: Arc<IcebergSinkPlan>,
     driver_id: i32,
     file_seq: u64,
-    finished: bool,
+    runtime_state: Option<RuntimeState>,
 }
 
-impl Operator for IcebergTableSinkOperator {
-    fn name(&self) -> &str {
-        &self.name
+#[async_trait::async_trait]
+impl AsyncSinkBackend for IcebergTableSinkBackend {
+    type Output = ();
+
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> Result<(), String> {
+        self.runtime_state = Some(state.clone());
+        Ok(())
     }
 
-    fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
-        Some(self)
-    }
-
-    fn is_finished(&self) -> bool {
-        self.finished
-    }
-}
-
-impl ProcessorOperator for IcebergTableSinkOperator {
-    fn need_input(&self) -> bool {
-        !self.finished
-    }
-
-    fn has_output(&self) -> bool {
-        false
-    }
-
-    fn push_chunk(&mut self, state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
-        if self.finished {
-            return Ok(());
-        }
+    async fn write_chunk(&mut self, chunk: Chunk) -> Result<(), String> {
         if chunk.is_empty() {
             return Ok(());
         }
+        let state = self
+            .runtime_state
+            .clone()
+            .ok_or_else(|| "iceberg async sink backend missing runtime state".to_string())?;
         match self.plan.mode {
-            IcebergSinkMode::Data => self.push_chunk_data(state, chunk),
-            IcebergSinkMode::PositionDeletes => self.push_chunk_position_delete(state, chunk),
+            IcebergSinkMode::Data => self.push_chunk_data(&state, chunk).await,
+            IcebergSinkMode::PositionDeletes => self.push_chunk_position_delete(&state, chunk),
         }
     }
 
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
-        Ok(None)
-    }
-
-    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
-        self.finished = true;
+    async fn finish(&mut self) -> Result<(), String> {
         Ok(())
     }
 }
 
-impl IcebergTableSinkOperator {
-    fn build_file_path(
-        &mut self,
-        state: &RuntimeState,
-        partition: &str,
-    ) -> Result<(String, String), String> {
-        self.build_file_path_with_prefix(state, partition, "data")
-    }
-
+impl IcebergTableSinkBackend {
     fn build_file_path_with_prefix(
         &mut self,
         state: &RuntimeState,
@@ -332,13 +371,18 @@ impl IcebergTableSinkOperator {
         }
     }
 
-    fn push_chunk_data(&mut self, state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+    async fn push_chunk_data(&mut self, state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
         let output_arrays = eval_exprs(&self.arena, &self.plan.output_exprs, &chunk)?;
         let output_arrays = align_arrays_to_schema(output_arrays, &self.plan.output_schema)?;
         let batch = RecordBatch::try_new(Arc::clone(&self.plan.output_schema), output_arrays)
             .map_err(|e| format!("iceberg sink build batch failed: {e}"))?;
 
         let partition_groups = self.partition_group_indices(&chunk, batch.num_rows())?;
+        let staged_ctx = self.plan.build_staged_write_context()?;
+        let staged_opts = StagedWriteOptions {
+            collect_theta_sketches: true,
+            ..StagedWriteOptions::default()
+        };
 
         for (key, group) in partition_groups {
             let indices = UInt32Array::from(group.indices);
@@ -347,47 +391,22 @@ impl IcebergTableSinkOperator {
             if part_batch.num_rows() == 0 {
                 continue;
             }
-            let (file_path, partition_path) = self.build_file_path(state, &key.path)?;
-            let mut write_result = write_parquet_file(
-                &file_path,
-                self.plan.object_store_s3.as_ref(),
-                Arc::clone(&self.plan.output_schema),
-                &part_batch,
-                self.plan.compression,
-            )?;
-
-            // Hand off the per-file Theta sketches to the side channel that
-            // the commit collector will drain at commit time. Done before
-            // `data_file` consumes `file_path` so the sketch set carries
-            // the correct path.
-            if let Some(sketches) = write_result.theta_sketches.take() {
-                state.add_iceberg_sketch_set(super::stats_assembler::FileSketchSet {
-                    file_path: file_path.clone(),
-                    sketches,
-                });
+            let staged_files =
+                write_record_batches(&staged_ctx, [part_batch], &staged_opts).await?;
+            let partition_path = self.partition_path_for_key(&key);
+            for staged in staged_files {
+                let (commit_info, sketch_set) = to_sink_commit_info(
+                    &staged,
+                    partition_path.clone(),
+                    key.null_fingerprint.clone(),
+                    self.plan.file_format.clone(),
+                    types::TIcebergFileContent::DATA,
+                )?;
+                if let Some(sketch_set) = sketch_set {
+                    state.add_iceberg_sketch_set(sketch_set);
+                }
+                state.add_sink_commit_info(commit_info);
             }
-
-            let data_file = types::TIcebergDataFile {
-                path: Some(file_path),
-                format: Some(self.plan.file_format.clone()),
-                record_count: Some(part_batch.num_rows() as i64),
-                file_size_in_bytes: Some(write_result.file_size as i64),
-                partition_path: Some(partition_path),
-                split_offsets: write_result.split_offsets,
-                column_stats: write_result.column_stats,
-                partition_null_fingerprint: Some(key.null_fingerprint),
-                file_content: Some(types::TIcebergFileContent::DATA),
-                referenced_data_file: None,
-            };
-
-            let commit_info = types::TSinkCommitInfo {
-                iceberg_data_file: Some(data_file),
-                hive_file_info: None,
-                is_overwrite: None,
-                staging_dir: None,
-                is_rewrite: None,
-            };
-            state.add_sink_commit_info(commit_info);
         }
 
         Ok(())
@@ -496,6 +515,17 @@ impl IcebergTableSinkOperator {
         }
 
         Ok(())
+    }
+
+    fn partition_path_for_key(&self, key: &PartitionKey) -> String {
+        let base = self.plan.data_location.trim_end_matches('/').to_string();
+        if key.path.is_empty() {
+            base
+        } else {
+            format!("{base}/{}", key.path)
+                .trim_end_matches('/')
+                .to_string()
+        }
     }
 
     fn partition_group_indices(
@@ -737,9 +767,227 @@ fn build_position_delete_output_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![file_path, pos]))
 }
 
-type PartitionExprs = (Vec<String>, Vec<String>, Vec<exprs::TExpr>);
+fn iceberg_schema_from_arrow_schema(schema: &Schema) -> Result<iceberg::spec::Schema, String> {
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| iceberg_nested_field_from_arrow_field(field.as_ref()))
+        .collect::<Result<Vec<_>, _>>()?;
+    iceberg::spec::Schema::builder()
+        .with_schema_id(1)
+        .with_fields(fields)
+        .build()
+        .map_err(|e| format!("build staged iceberg writer schema failed: {e}"))
+}
+
+fn iceberg_nested_field_from_arrow_field(
+    field: &Field,
+) -> Result<iceberg::spec::NestedFieldRef, String> {
+    let field_id = arrow_field_id(field)?;
+    let field_type = iceberg_type_from_arrow_type(field.data_type())?;
+    Ok(Arc::new(iceberg::spec::NestedField::new(
+        field_id,
+        field.name(),
+        field_type,
+        !field.is_nullable(),
+    )))
+}
+
+fn arrow_field_id(field: &Field) -> Result<i32, String> {
+    let raw = field
+        .metadata()
+        .get(PARQUET_FIELD_ID_META_KEY)
+        .ok_or_else(|| {
+            format!(
+                "iceberg sink field {} is missing parquet field id metadata",
+                field.name()
+            )
+        })?;
+    raw.parse::<i32>().map_err(|e| {
+        format!(
+            "iceberg sink field {} has invalid parquet field id {raw}: {e}",
+            field.name()
+        )
+    })
+}
+
+fn iceberg_type_from_arrow_type(data_type: &DataType) -> Result<iceberg::spec::Type, String> {
+    use arrow::datatypes::TimeUnit;
+    use iceberg::spec::{ListType, MapType, PrimitiveType, StructType, Type};
+
+    let primitive = match data_type {
+        DataType::Boolean => Some(PrimitiveType::Boolean),
+        DataType::Int8 | DataType::Int16 | DataType::Int32 => Some(PrimitiveType::Int),
+        DataType::Int64 => Some(PrimitiveType::Long),
+        DataType::Float32 => Some(PrimitiveType::Float),
+        DataType::Float64 => Some(PrimitiveType::Double),
+        DataType::Decimal128(precision, scale) => Some(PrimitiveType::Decimal {
+            precision: (*precision).into(),
+            scale: u32::try_from(*scale)
+                .map_err(|_| format!("iceberg sink decimal scale {scale} cannot convert to u32"))?,
+        }),
+        DataType::Date32 => Some(PrimitiveType::Date),
+        DataType::Time64(TimeUnit::Microsecond) => Some(PrimitiveType::Time),
+        DataType::Timestamp(TimeUnit::Microsecond, None) => Some(PrimitiveType::Timestamp),
+        DataType::Timestamp(TimeUnit::Microsecond, Some(_)) => Some(PrimitiveType::Timestamptz),
+        DataType::Timestamp(TimeUnit::Nanosecond, None) => Some(PrimitiveType::TimestampNs),
+        DataType::Timestamp(TimeUnit::Nanosecond, Some(_)) => Some(PrimitiveType::TimestamptzNs),
+        DataType::Utf8 | DataType::LargeUtf8 => Some(PrimitiveType::String),
+        DataType::Binary | DataType::LargeBinary => Some(PrimitiveType::Binary),
+        DataType::FixedSizeBinary(size) => {
+            Some(PrimitiveType::Fixed(u64::try_from(*size).map_err(
+                |_| format!("iceberg sink fixed binary width {size} cannot convert to u64"),
+            )?))
+        }
+        _ => None,
+    };
+    if let Some(primitive) = primitive {
+        return Ok(Type::Primitive(primitive));
+    }
+
+    match data_type {
+        DataType::Struct(fields) => {
+            let fields = fields
+                .iter()
+                .map(|field| iceberg_nested_field_from_arrow_field(field.as_ref()))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Type::Struct(StructType::new(fields)))
+        }
+        DataType::List(element) => Ok(Type::List(ListType::new(
+            iceberg_nested_field_from_arrow_field(element.as_ref())?,
+        ))),
+        DataType::Map(entries, _sorted) => {
+            let DataType::Struct(fields) = entries.data_type() else {
+                return Err(format!(
+                    "iceberg sink MAP entries field must be Struct, got {:?}",
+                    entries.data_type()
+                ));
+            };
+            if fields.len() != 2 {
+                return Err(format!(
+                    "iceberg sink MAP entries Struct must have 2 fields, got {}",
+                    fields.len()
+                ));
+            }
+            Ok(Type::Map(MapType::new(
+                iceberg_nested_field_from_arrow_field(fields[0].as_ref())?,
+                iceberg_nested_field_from_arrow_field(fields[1].as_ref())?,
+            )))
+        }
+        other => Err(format!(
+            "unsupported arrow type for staged iceberg sink writer schema: {other:?}"
+        )),
+    }
+}
+
+fn build_staged_partition_spec(
+    schema: &iceberg::spec::Schema,
+    source_column_names: &[String],
+    partition_column_names: &[String],
+    transform_exprs: &[String],
+) -> Result<iceberg::spec::UnboundPartitionSpec, String> {
+    if source_column_names.len() != partition_column_names.len()
+        || source_column_names.len() != transform_exprs.len()
+    {
+        return Err(format!(
+            "iceberg sink partition spec metadata mismatch: sources={} names={} transforms={}",
+            source_column_names.len(),
+            partition_column_names.len(),
+            transform_exprs.len()
+        ));
+    }
+
+    let mut builder = iceberg::spec::UnboundPartitionSpec::builder().with_spec_id(0);
+    for ((source_name, partition_name), transform_expr) in source_column_names
+        .iter()
+        .zip(partition_column_names.iter())
+        .zip(transform_exprs.iter())
+    {
+        let field = schema
+            .field_by_name_case_insensitive(source_name)
+            .ok_or_else(|| {
+                format!("iceberg sink partition source column {source_name} missing from schema")
+            })?;
+        builder = builder
+            .add_partition_field(
+                field.id,
+                partition_name,
+                parse_staged_partition_transform(transform_expr)?,
+            )
+            .map_err(|e| format!("build staged iceberg partition field failed: {e}"))?;
+    }
+    Ok(builder.build())
+}
+
+fn parse_staged_partition_transform(raw: &str) -> Result<iceberg::spec::Transform, String> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "identity" => Ok(iceberg::spec::Transform::Identity),
+        "year" => Ok(iceberg::spec::Transform::Year),
+        "month" => Ok(iceberg::spec::Transform::Month),
+        "day" => Ok(iceberg::spec::Transform::Day),
+        "hour" => Ok(iceberg::spec::Transform::Hour),
+        "void" => Ok(iceberg::spec::Transform::Void),
+        _ => {
+            if let Some(width) = parse_transform_arg(&normalized, "bucket")? {
+                return Ok(iceberg::spec::Transform::Bucket(width));
+            }
+            if let Some(width) = parse_transform_arg(&normalized, "truncate")? {
+                return Ok(iceberg::spec::Transform::Truncate(width));
+            }
+            Err(format!(
+                "unsupported iceberg partition transform for staged sink writer: {raw}"
+            ))
+        }
+    }
+}
+
+fn parse_transform_arg(raw: &str, name: &str) -> Result<Option<u32>, String> {
+    let Some(rest) = raw.strip_prefix(name) else {
+        return Ok(None);
+    };
+    let Some(rest) = rest.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else {
+        return Err(format!(
+            "iceberg partition transform {raw} must use {name}[N] syntax"
+        ));
+    };
+    let value = rest.parse::<u32>().map_err(|e| {
+        format!("iceberg partition transform {raw} has invalid numeric argument: {e}")
+    })?;
+    if value == 0 {
+        return Err(format!(
+            "iceberg partition transform {raw} requires a positive numeric argument"
+        ));
+    }
+    Ok(Some(value))
+}
+
+fn build_staged_file_io(
+    data_location: &str,
+    s3_config: Option<&S3StoreConfig>,
+) -> Result<iceberg::io::FileIO, String> {
+    if data_location.starts_with("s3://") || data_location.starts_with("oss://") {
+        let s3 = s3_config.ok_or_else(|| {
+            format!(
+                "iceberg sink missing S3 config for staged writer data_location={data_location}"
+            )
+        })?;
+        let factory = crate::connector::iceberg::catalog::s3_storage::S3StorageFactory {
+            endpoint: s3.endpoint.clone(),
+            access_key_id: s3.access_key_id.clone(),
+            access_key_secret: s3.access_key_secret.clone(),
+            region: s3.region.clone().unwrap_or_else(|| "us-east-1".to_string()),
+            enable_path_style: s3.enable_path_style_access.unwrap_or(false),
+        };
+        return Ok(iceberg::io::FileIOBuilder::new(Arc::new(factory)).build());
+    }
+    Ok(iceberg::io::FileIO::new_with_fs())
+}
+
+type PartitionExprs = (Vec<String>, Vec<String>, Vec<String>, Vec<exprs::TExpr>);
 
 fn build_partition_exprs(iceberg: &descriptors::TIcebergTable) -> Result<PartitionExprs, String> {
+    let mut partition_source_column_names = Vec::new();
     let mut partition_column_names = Vec::new();
     let mut transform_exprs = Vec::new();
     let mut exprs = Vec::new();
@@ -756,12 +1004,22 @@ fn build_partition_exprs(iceberg: &descriptors::TIcebergTable) -> Result<Partiti
                 .partition_expr
                 .clone()
                 .ok_or_else(|| "iceberg partition_info missing partition_expr".to_string())?;
+            let source_name = info
+                .source_column_name
+                .clone()
+                .ok_or_else(|| "iceberg partition_info missing source_column_name".to_string())?;
+            partition_source_column_names.push(source_name);
             partition_column_names.push(name);
             transform_exprs.push(transform);
             exprs.push(expr);
         }
     }
-    Ok((partition_column_names, transform_exprs, exprs))
+    Ok((
+        partition_source_column_names,
+        partition_column_names,
+        transform_exprs,
+        exprs,
+    ))
 }
 
 fn build_column_slot_map(
@@ -1725,11 +1983,270 @@ mod tests {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use parquet::file::reader::{FileReader, SerializedFileReader};
 
+    use crate::exec::pipeline::operator::Operator;
+
     use super::{
         ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID, ICEBERG_POSITION_DELETE_POS_FIELD_ID,
+        IcebergSinkMode, IcebergSinkPlan, IcebergTableSinkBackend, IcebergTableSinkFactory,
         align_arrays_to_schema, build_position_delete_output_schema, iceberg_partition_key_for_row,
         unique_file_path, write_parquet_to_bytes,
     };
+    use crate::connector::iceberg::data_writer::{StagedWriteOptions, write_record_batches};
+    use crate::exec::chunk::{Chunk, ChunkSchema};
+    use crate::exec::expr::ExprNode;
+    use crate::runtime::runtime_state::RuntimeState;
+    use crate::{common::ids::SlotId, common::types::UniqueId};
+
+    #[test]
+    fn iceberg_table_sink_factory_creates_async_sink_operator() {
+        let schema = Arc::new(Schema::new(vec![Field::new("c0", DataType::Int64, true)]));
+        let factory = IcebergTableSinkFactory {
+            name: "ICEBERG_TABLE_SINK".to_string(),
+            arena: Arc::new(crate::exec::expr::ExprArena::default()),
+            plan: Arc::new(IcebergSinkPlan {
+                mode: IcebergSinkMode::Data,
+                table_location: "file:///tmp/novarocks-iceberg-sink-test".to_string(),
+                data_location: "file:///tmp/novarocks-iceberg-sink-test/data".to_string(),
+                object_store_s3: None,
+                file_format: "parquet".to_string(),
+                compression: crate::types::TCompressionType::SNAPPY,
+                output_schema: schema,
+                output_exprs: Vec::new(),
+                partition_exprs: Vec::new(),
+                partition_source_column_names: Vec::new(),
+                partition_column_names: Vec::new(),
+                transform_exprs: Vec::new(),
+            }),
+        };
+        let op = factory.create_async_operator(0);
+
+        assert_eq!(op.name(), "ICEBERG_TABLE_SINK");
+    }
+
+    #[tokio::test]
+    async fn data_sink_plan_builds_staged_context_with_fe_metadata() {
+        let dir = tempfile::Builder::new()
+            .prefix("novarocks-iceberg-fe-staged-ctx-")
+            .tempdir()
+            .expect("temp dir");
+        let table_location = format!("file://{}", dir.path().display());
+        let data_location = format!("{table_location}/custom-data");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "42".to_string(),
+            )])),
+        ]));
+        let plan = IcebergSinkPlan {
+            mode: IcebergSinkMode::Data,
+            table_location: table_location.clone(),
+            data_location: data_location.clone(),
+            object_store_s3: None,
+            file_format: "parquet".to_string(),
+            compression: crate::types::TCompressionType::SNAPPY,
+            output_schema: Arc::clone(&schema),
+            output_exprs: Vec::new(),
+            partition_exprs: Vec::new(),
+            partition_source_column_names: vec!["id".to_string()],
+            partition_column_names: vec!["id_part".to_string()],
+            transform_exprs: vec!["identity".to_string()],
+        };
+
+        let ctx = plan.build_staged_write_context().expect("staged context");
+
+        assert_eq!(ctx.schema().as_struct().fields()[0].id, 42);
+        assert_eq!(ctx.partition_spec().fields().len(), 1);
+        assert_eq!(ctx.partition_spec().fields()[0].source_id, 42);
+        assert_eq!(ctx.partition_spec().fields()[0].name, "id_part");
+
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![7, 7]))])
+            .expect("record batch");
+        let staged = write_record_batches(&ctx, vec![batch], &StagedWriteOptions::default())
+            .await
+            .expect("write staged file");
+        assert_eq!(staged.len(), 1);
+        let path = staged[0].data_file.file_path().to_string();
+        assert!(
+            path.starts_with(&format!("{data_location}/id_part=7/")),
+            "staged sink context should write under FE data_location and partition path, got {path}"
+        );
+    }
+
+    #[tokio::test]
+    async fn data_sink_backend_writes_data_files_through_staged_writer_kernel() {
+        let dir = tempfile::Builder::new()
+            .prefix("novarocks-iceberg-fe-staged-write-")
+            .tempdir()
+            .expect("temp dir");
+        let table_location = format!("file://{}", dir.path().display());
+        let data_location = format!("{table_location}/custom-data");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "42".to_string(),
+            )])),
+        ]));
+        let slot_id = SlotId::new(1);
+        let mut arena = crate::exec::expr::ExprArena::default();
+        let id_expr = arena.push_typed(ExprNode::SlotId(slot_id), DataType::Int32);
+        let plan = Arc::new(IcebergSinkPlan {
+            mode: IcebergSinkMode::Data,
+            table_location,
+            data_location: data_location.clone(),
+            object_store_s3: None,
+            file_format: "parquet".to_string(),
+            compression: crate::types::TCompressionType::SNAPPY,
+            output_schema: Arc::clone(&schema),
+            output_exprs: vec![id_expr],
+            partition_exprs: vec![id_expr],
+            partition_source_column_names: vec!["id".to_string()],
+            partition_column_names: vec!["id_part".to_string()],
+            transform_exprs: vec!["identity".to_string()],
+        });
+        let mut backend = IcebergTableSinkBackend {
+            arena: Arc::new(arena),
+            plan,
+            driver_id: 3,
+            file_seq: 0,
+            runtime_state: None,
+        };
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![7, 7]))])
+            .expect("record batch");
+        let chunk_schema =
+            ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &[slot_id])
+                .expect("chunk schema");
+        let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk");
+        let finst_id = UniqueId { hi: 701, lo: 42 };
+        crate::runtime::sink_commit::unregister(finst_id);
+        let state = RuntimeState::new(
+            None,
+            None,
+            None,
+            None,
+            Some(finst_id),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        backend
+            .push_chunk_data(&state, chunk)
+            .await
+            .expect("write chunk");
+
+        let infos = crate::runtime::sink_commit::list(finst_id);
+        crate::runtime::sink_commit::unregister(finst_id);
+        assert_eq!(infos.len(), 1);
+        let data_file = infos[0]
+            .iceberg_data_file
+            .as_ref()
+            .expect("iceberg data file");
+        let path = data_file.path.as_deref().expect("path");
+        assert!(
+            path.starts_with(&format!("{data_location}/id_part=7/novarocks-00000-")),
+            "DATA sink should use staged writer kernel file naming under FE data_location, got {path}"
+        );
+        assert_eq!(data_file.record_count, Some(2));
+        assert_eq!(
+            data_file.file_content,
+            Some(crate::types::TIcebergFileContent::DATA)
+        );
+    }
+
+    #[test]
+    fn position_delete_backend_keeps_manual_delete_file_writer_path() {
+        let dir = tempfile::Builder::new()
+            .prefix("novarocks-iceberg-position-delete-write-")
+            .tempdir()
+            .expect("temp dir");
+        let table_location = format!("file://{}", dir.path().display());
+        let data_location = format!("{table_location}/custom-data");
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("file_path", DataType::Utf8, false),
+            Field::new("pos", DataType::Int64, false),
+            Field::new("id", DataType::Int32, false),
+        ]));
+        let file_slot = SlotId::new(1);
+        let pos_slot = SlotId::new(2);
+        let id_slot = SlotId::new(3);
+        let mut arena = crate::exec::expr::ExprArena::default();
+        let file_expr = arena.push_typed(ExprNode::SlotId(file_slot), DataType::Utf8);
+        let pos_expr = arena.push_typed(ExprNode::SlotId(pos_slot), DataType::Int64);
+        let id_expr = arena.push_typed(ExprNode::SlotId(id_slot), DataType::Int32);
+        let plan = Arc::new(IcebergSinkPlan {
+            mode: IcebergSinkMode::PositionDeletes,
+            table_location,
+            data_location: data_location.clone(),
+            object_store_s3: None,
+            file_format: "parquet".to_string(),
+            compression: crate::types::TCompressionType::SNAPPY,
+            output_schema: build_position_delete_output_schema(),
+            output_exprs: vec![file_expr, pos_expr, id_expr],
+            partition_exprs: vec![id_expr],
+            partition_source_column_names: vec!["id".to_string()],
+            partition_column_names: vec!["id_part".to_string()],
+            transform_exprs: vec!["identity".to_string()],
+        });
+        let mut backend = IcebergTableSinkBackend {
+            arena: Arc::new(arena),
+            plan,
+            driver_id: 5,
+            file_seq: 0,
+            runtime_state: None,
+        };
+        let referenced = "file:///tmp/base-data.parquet";
+        let batch = RecordBatch::try_new(
+            source_schema,
+            vec![
+                Arc::new(StringArray::from(vec![referenced, referenced])),
+                Arc::new(Int64Array::from(vec![9_i64, 2_i64])),
+                Arc::new(Int32Array::from(vec![7, 7])),
+            ],
+        )
+        .expect("record batch");
+        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[file_slot, pos_slot, id_slot],
+        )
+        .expect("chunk schema");
+        let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk");
+        let finst_id = UniqueId { hi: 702, lo: 42 };
+        crate::runtime::sink_commit::unregister(finst_id);
+        let state = RuntimeState::new(
+            None,
+            None,
+            None,
+            None,
+            Some(finst_id),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        backend
+            .push_chunk_position_delete(&state, chunk)
+            .expect("write position deletes");
+
+        let infos = crate::runtime::sink_commit::list(finst_id);
+        crate::runtime::sink_commit::unregister(finst_id);
+        assert_eq!(infos.len(), 1);
+        let data_file = infos[0]
+            .iceberg_data_file
+            .as_ref()
+            .expect("iceberg delete data file");
+        let path = data_file.path.as_deref().expect("path");
+        assert!(
+            path.starts_with(&format!("{data_location}/id_part=7/delete-")),
+            "position delete sink should keep manual delete file naming, got {path}"
+        );
+        assert_eq!(
+            data_file.file_content,
+            Some(crate::types::TIcebergFileContent::POSITION_DELETES)
+        );
+        assert_eq!(data_file.referenced_data_file.as_deref(), Some(referenced));
+    }
 
     #[test]
     fn test_align_arrays_to_schema_casts_int64_to_int32() {
