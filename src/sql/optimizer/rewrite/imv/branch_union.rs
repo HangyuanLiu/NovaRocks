@@ -145,7 +145,14 @@ fn append_branch_id_project(
         .collect::<Vec<_>>();
     items.push(ProjectItem {
         expr: TypedExpr {
-            kind: ExprKind::Literal(LiteralValue::Int(branch_id as i64)),
+            kind: ExprKind::Cast {
+                expr: Box::new(TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::Int(branch_id as i64)),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                }),
+                target: DataType::Int32,
+            },
             data_type: DataType::Int32,
             nullable: false,
         },
@@ -204,7 +211,9 @@ mod tests {
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
         ApplyKeySource, BranchIdColumnContract, BranchUnionContract,
     };
-    use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, TypedExpr};
+    use crate::sql::analysis::{
+        BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
+    };
     use crate::sql::catalog::{
         ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
@@ -215,7 +224,7 @@ mod tests {
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
     use crate::sql::planner::plan::{
-        AggregateCall, AggregateNode, LogicalPlan, ScanNode, UnionNode,
+        AggregateCall, AggregateNode, FilterNode, LogicalPlan, ProjectNode, ScanNode, UnionNode,
     };
 
     #[test]
@@ -249,10 +258,7 @@ mod tests {
                 .iter()
                 .find(|item| item.output_name.eq_ignore_ascii_case("__branch_id__"))
                 .expect("branch id item");
-            assert!(matches!(
-                &branch_item.expr.kind,
-                ExprKind::Literal(LiteralValue::Int(value)) if *value == idx as i64
-            ));
+            assert_branch_id_cast(branch_item, idx as i64);
             assert!(matches!(
                 project.input.as_ref(),
                 LogicalPlan::AggregateStateMerge(_)
@@ -299,6 +305,35 @@ mod tests {
         }));
 
         assert!(!rule.matches(&plan, &ctx));
+    }
+
+    #[test]
+    fn does_not_match_projection_filter_union() {
+        let rule = RewriteBranchUnionRule;
+        let ctx = build_ctx();
+        let plan = root_delta(LogicalPlan::Union(UnionNode {
+            inputs: vec![project_over_filter("t1", 1), project_over_filter("t2", 10)],
+            all: true,
+            output_columns: vec![output_column(1, "region"), output_column(2, "amount")],
+            required_output_columns: None,
+        }));
+
+        assert!(!rule.matches(&plan, &ctx));
+    }
+
+    fn assert_branch_id_cast(item: &ProjectItem, expected_branch_id: i64) {
+        assert_eq!(item.expr.data_type, DataType::Int32);
+        assert!(!item.expr.nullable);
+        let ExprKind::Cast { expr, target } = &item.expr.kind else {
+            panic!("expected branch id Cast, got {:?}", item.expr.kind);
+        };
+        assert_eq!(*target, DataType::Int32);
+        assert_eq!(expr.data_type, DataType::Int64);
+        assert!(!expr.nullable);
+        assert!(matches!(
+            &expr.kind,
+            ExprKind::Literal(LiteralValue::Int(value)) if *value == expected_branch_id
+        ));
     }
 
     fn single_state_column(type_signature: &str) -> AggregateStateColumnContract {
@@ -477,6 +512,46 @@ mod tests {
             predicates: Vec::new(),
             required_columns: None,
             dict_columns: Vec::new(),
+            required_output_columns: None,
+        })
+    }
+
+    fn project_over_filter(name: &str, first_id: u32) -> LogicalPlan {
+        LogicalPlan::Project(ProjectNode {
+            input: Box::new(filter_over(scan(name, first_id), first_id, "region")),
+            items: vec![
+                ProjectItem {
+                    expr: col_expr(first_id, "region"),
+                    output_name: "region".to_string(),
+                    output_column_id: ColumnId::new_for_test(first_id),
+                },
+                ProjectItem {
+                    expr: col_expr(first_id + 1, "amount"),
+                    output_name: "amount".to_string(),
+                    output_column_id: ColumnId::new_for_test(first_id + 1),
+                },
+            ],
+            output_qualifier: None,
+            required_output_columns: None,
+        })
+    }
+
+    fn filter_over(input: LogicalPlan, column_id: u32, column: &str) -> LogicalPlan {
+        LogicalPlan::Filter(FilterNode {
+            input: Box::new(input),
+            predicate: TypedExpr {
+                kind: ExprKind::BinaryOp {
+                    left: Box::new(col_expr(column_id, column)),
+                    op: BinOp::Ge,
+                    right: Box::new(TypedExpr {
+                        kind: ExprKind::Literal(LiteralValue::Int(0)),
+                        data_type: DataType::Int32,
+                        nullable: false,
+                    }),
+                },
+                data_type: DataType::Boolean,
+                nullable: false,
+            },
             required_output_columns: None,
         })
     }

@@ -1,9 +1,9 @@
 //! IMV rewrite pipeline construction.
 //!
-//! Stages run in order: logical normalize, delta marker, join delta, union
-//! delta, aggregate state, delta pushdown, scan binding, action propagation,
-//! marker cleanup, validation. Each stage's name is part of the trace contract
-//! and is asserted in pipeline tests.
+//! Stages run in order: logical normalize, delta marker, branch union, join
+//! delta, union delta, aggregate state, delta pushdown, scan binding, action
+//! propagation, marker cleanup, validation. Each stage's name is part of the
+//! trace contract and is asserted in pipeline tests.
 
 use crate::sql::optimizer::rewrite::imv::action_column::ActionColumnValidationRule;
 use crate::sql::optimizer::rewrite::imv::action_propagation::{
