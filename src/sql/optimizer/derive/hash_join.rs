@@ -182,6 +182,18 @@ impl DeriveRequired for PhysicalHashJoinOp {
     }
 }
 
+impl PhysicalHashJoinOp {
+    pub(crate) fn derive_required_alternatives(
+        &self,
+        parent_required: &PhysicalPropertySet,
+        num_children: usize,
+    ) -> Vec<super::ChildRequirementAlternative> {
+        vec![super::ChildRequirementAlternative::default(
+            self.derive_required(parent_required, num_children),
+        )]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

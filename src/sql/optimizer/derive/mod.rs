@@ -38,6 +38,28 @@ pub(crate) trait DeriveRequired {
     ) -> Vec<PhysicalPropertySet>;
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub(crate) enum PropertyAlternativeKind {
+    Default,
+    BroadcastJoin,
+    ShuffleJoin,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub(crate) struct ChildRequirementAlternative {
+    pub kind: PropertyAlternativeKind,
+    pub child_props: Vec<PhysicalPropertySet>,
+}
+
+impl ChildRequirementAlternative {
+    pub(crate) fn default(child_props: Vec<PhysicalPropertySet>) -> Self {
+        Self {
+            kind: PropertyAlternativeKind::Default,
+            child_props,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Dispatchers
 // ---------------------------------------------------------------------------
@@ -123,6 +145,23 @@ pub(crate) fn derive_required(
     }
 }
 
+pub(crate) fn derive_required_alternatives(
+    op: &Operator,
+    parent_required: &PhysicalPropertySet,
+    num_children: usize,
+) -> Vec<ChildRequirementAlternative> {
+    match op {
+        Operator::PhysicalHashJoin(o) => {
+            o.derive_required_alternatives(parent_required, num_children)
+        }
+        _ => vec![ChildRequirementAlternative::default(derive_required(
+            op,
+            parent_required,
+            num_children,
+        ))],
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Enforcer helpers — single source of truth (search.rs re-exports EnforcerKind).
 // ---------------------------------------------------------------------------
@@ -189,6 +228,22 @@ mod tests {
         let provided = PhysicalPropertySet::gather();
         let enforcers = needed_enforcers(&required, &provided);
         assert!(enforcers.is_empty());
+    }
+
+    #[test]
+    fn default_required_alternative_wraps_legacy_deriver() {
+        let op = Operator::PhysicalLimit(PhysicalLimitOp {
+            limit: Some(10),
+            offset: None,
+        });
+        let parent = PhysicalPropertySet::gather();
+
+        let legacy = derive_required(&op, &parent, 1);
+        let alternatives = derive_required_alternatives(&op, &parent, 1);
+
+        assert_eq!(alternatives.len(), 1);
+        assert_eq!(alternatives[0].kind, PropertyAlternativeKind::Default);
+        assert_eq!(alternatives[0].child_props, legacy);
     }
 
     #[test]
