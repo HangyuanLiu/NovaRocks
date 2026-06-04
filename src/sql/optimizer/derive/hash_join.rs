@@ -258,6 +258,33 @@ impl DeriveRequired for PhysicalHashJoinOp {
 }
 
 impl PhysicalHashJoinOp {
+    fn broadcast_required_alternative() -> ChildRequirementAlternative {
+        ChildRequirementAlternative {
+            kind: PropertyAlternativeKind::BroadcastJoin,
+            child_props: vec![PhysicalPropertySet::any(), PhysicalPropertySet::broadcast()],
+        }
+    }
+
+    fn shuffle_required_alternative(
+        &self,
+        parent_required: &PhysicalPropertySet,
+    ) -> ChildRequirementAlternative {
+        let (left_keys, right_keys) = aligned_shuffle_keys(&self.eq_conditions, parent_required);
+        ChildRequirementAlternative {
+            kind: PropertyAlternativeKind::ShuffleJoin,
+            child_props: vec![
+                PhysicalPropertySet {
+                    distribution: DistributionSpec::shuffle_join(left_keys),
+                    ordering: OrderingSpec::Any,
+                },
+                PhysicalPropertySet {
+                    distribution: DistributionSpec::shuffle_join(right_keys),
+                    ordering: OrderingSpec::Any,
+                },
+            ],
+        }
+    }
+
     pub(crate) fn derive_required_alternatives(
         &self,
         parent_required: &PhysicalPropertySet,
@@ -270,29 +297,28 @@ impl PhysicalHashJoinOp {
             ])];
         }
 
-        let mut alternatives = Vec::new();
-        if !hash_join_only_shuffle(self.join_type) {
-            alternatives.push(ChildRequirementAlternative {
-                kind: PropertyAlternativeKind::BroadcastJoin,
-                child_props: vec![PhysicalPropertySet::any(), PhysicalPropertySet::broadcast()],
-            });
+        let shuffle = || self.shuffle_required_alternative(parent_required);
+        match self.distribution {
+            JoinDistribution::Unknown => {
+                let mut alternatives = Vec::new();
+                if !hash_join_only_shuffle(self.join_type) {
+                    alternatives.push(Self::broadcast_required_alternative());
+                }
+                alternatives.push(shuffle());
+                alternatives
+            }
+            JoinDistribution::Broadcast => {
+                if hash_join_only_shuffle(self.join_type) {
+                    vec![shuffle()]
+                } else {
+                    vec![Self::broadcast_required_alternative()]
+                }
+            }
+            JoinDistribution::Shuffle => vec![shuffle()],
+            JoinDistribution::Colocate => vec![ChildRequirementAlternative::default(
+                self.derive_required(parent_required, num_children),
+            )],
         }
-
-        let (left_keys, right_keys) = aligned_shuffle_keys(&self.eq_conditions, parent_required);
-        alternatives.push(ChildRequirementAlternative {
-            kind: PropertyAlternativeKind::ShuffleJoin,
-            child_props: vec![
-                PhysicalPropertySet {
-                    distribution: DistributionSpec::shuffle_join(left_keys),
-                    ordering: OrderingSpec::Any,
-                },
-                PhysicalPropertySet {
-                    distribution: DistributionSpec::shuffle_join(right_keys),
-                    ordering: OrderingSpec::Any,
-                },
-            ],
-        });
-        alternatives
     }
 }
 
@@ -352,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn hash_join_required_alternatives_include_broadcast_and_shuffle() {
+    fn hash_join_unknown_distribution_enumerates_implementation_alternatives() {
         let op = PhysicalHashJoinOp {
             join_type: crate::sql::analysis::JoinKind::Inner,
             eq_conditions: vec![PhysicalHashJoinEqCondition {
@@ -384,6 +410,44 @@ mod tests {
             alternatives[1].child_props[1].distribution,
             DistributionSpec::shuffle_join([ColumnId(10), ColumnId(20)])
         );
+    }
+
+    #[test]
+    fn hash_join_legacy_concrete_distribution_limits_alternatives() {
+        let mut op = PhysicalHashJoinOp {
+            join_type: crate::sql::analysis::JoinKind::Inner,
+            eq_conditions: vec![PhysicalHashJoinEqCondition {
+                left: col(10),
+                right: col(20),
+                null_safe: false,
+            }],
+            other_condition: None,
+            distribution: JoinDistribution::Broadcast,
+        };
+
+        let broadcast = op.derive_required_alternatives(&PhysicalPropertySet::any(), 2);
+        assert_eq!(broadcast.len(), 1);
+        assert_eq!(broadcast[0].kind, PropertyAlternativeKind::BroadcastJoin);
+
+        op.join_type = crate::sql::analysis::JoinKind::RightOuter;
+        let broadcast_only_shuffle =
+            op.derive_required_alternatives(&PhysicalPropertySet::any(), 2);
+        assert_eq!(broadcast_only_shuffle.len(), 1);
+        assert_eq!(
+            broadcast_only_shuffle[0].kind,
+            PropertyAlternativeKind::ShuffleJoin
+        );
+
+        op.join_type = crate::sql::analysis::JoinKind::Inner;
+        op.distribution = JoinDistribution::Shuffle;
+        let shuffle = op.derive_required_alternatives(&PhysicalPropertySet::any(), 2);
+        assert_eq!(shuffle.len(), 1);
+        assert_eq!(shuffle[0].kind, PropertyAlternativeKind::ShuffleJoin);
+
+        op.distribution = JoinDistribution::Colocate;
+        let colocate = op.derive_required_alternatives(&PhysicalPropertySet::any(), 2);
+        assert_eq!(colocate.len(), 1);
+        assert_eq!(colocate[0].kind, PropertyAlternativeKind::Default);
     }
 
     #[test]
