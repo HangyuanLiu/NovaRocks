@@ -53,6 +53,7 @@ impl LogicalRewriteRule for RewriteJoinAggregateDeltaRule {
         if !delta.is_root {
             return Ok(RewriteResult::Unchanged);
         }
+        let branch_scope = delta.branch_scope;
         let LogicalPlan::Aggregate(mut aggregate) = *delta.input else {
             return Ok(RewriteResult::Unchanged);
         };
@@ -126,7 +127,7 @@ impl LogicalRewriteRule for RewriteJoinAggregateDeltaRule {
                 input: Box::new(LogicalPlan::Aggregate(aggregate)),
                 is_root: true,
                 action_column: Some(action_column),
-                branch_scope: None,
+                branch_scope,
             },
         )))
     }
@@ -368,6 +369,33 @@ mod tests {
         assert_supported_join_rewrite(JoinKind::Cross);
     }
 
+    #[test]
+    fn join_delta_preserves_branch_scope() {
+        let rule = RewriteJoinAggregateDeltaRule;
+        let mut ctx = build_ctx();
+        let scope = crate::sql::catalog::BranchScope {
+            branch_id_column_name:
+                crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN.to_string(),
+            branch_id: 2,
+        };
+        let plan = LogicalPlan::ImvDelta(ImvDeltaNode {
+            input: Box::new(aggregate_over(join_of(scan("l", 1), scan("r", 10)))),
+            is_root: true,
+            action_column: None,
+            branch_scope: Some(scope.clone()),
+        });
+        let RewriteResult::Changed(LogicalPlan::ImvDelta(out)) =
+            rule.apply(plan, &mut ctx).expect("rewrite")
+        else {
+            panic!("expected rewritten root ImvDelta")
+        };
+        assert_eq!(
+            out.branch_scope,
+            Some(scope),
+            "join-delta must carry branch_scope onto the rewritten root delta"
+        );
+    }
+
     fn assert_supported_join_rewrite(join_type: JoinKind) {
         let rule = RewriteJoinAggregateDeltaRule;
         let mut ctx = build_ctx();
@@ -494,6 +522,28 @@ mod tests {
             right: Box::new(project_over(scan("right", 10))),
             join_type,
             condition: Some(condition()),
+            required_output_columns: None,
+        })
+    }
+
+    fn join_of(left: LogicalPlan, right: LogicalPlan) -> LogicalPlan {
+        let left_cols = plan_output_columns(&left).expect("left output columns");
+        let right_cols = plan_output_columns(&right).expect("right output columns");
+        let left_key = &left_cols[0];
+        let right_key = &right_cols[0];
+        LogicalPlan::Join(JoinNode {
+            left: Box::new(left),
+            right: Box::new(right),
+            join_type: JoinKind::Inner,
+            condition: Some(TypedExpr {
+                kind: ExprKind::BinaryOp {
+                    left: Box::new(col_expr(left_key.column_id.0, &left_key.name)),
+                    op: BinOp::Eq,
+                    right: Box::new(col_expr(right_key.column_id.0, &right_key.name)),
+                },
+                data_type: DataType::Boolean,
+                nullable: false,
+            }),
             required_output_columns: None,
         })
     }

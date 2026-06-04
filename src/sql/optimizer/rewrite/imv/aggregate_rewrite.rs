@@ -66,6 +66,7 @@ impl LogicalRewriteRule for RewriteAggregateStateRule {
         if !delta.is_root {
             return Ok(RewriteResult::Unchanged);
         }
+        let branch_scope = delta.branch_scope;
         let LogicalPlan::Aggregate(aggregate) = *delta.input else {
             return Ok(RewriteResult::Unchanged);
         };
@@ -76,7 +77,8 @@ impl LogicalRewriteRule for RewriteAggregateStateRule {
                 "RewriteAggregateState requires ImvExtension in RewriteContext".to_string()
             })?
             .clone();
-        let merge = build_aggregate_state_merge(aggregate, delta.action_column, None, &ext)?;
+        let merge =
+            build_aggregate_state_merge(aggregate, delta.action_column, branch_scope, &ext)?;
         Ok(RewriteResult::Changed(merge))
     }
 }
@@ -1733,6 +1735,32 @@ mod tests {
             assert_eq!(*column_id, source.column_id);
             assert_eq!(item.output_column_id, source.column_id);
         }
+    }
+
+    #[test]
+    fn aggregate_state_rule_threads_marker_branch_scope() {
+        let rule = RewriteAggregateStateRule;
+        let mut ctx = build_branch_ctx();
+        let plan = LogicalPlan::ImvDelta(ImvDeltaNode {
+            input: Box::new(aggregate_over(leaf_scan())),
+            is_root: true,
+            action_column: None,
+            branch_scope: Some(crate::sql::catalog::BranchScope {
+                branch_id_column_name:
+                    crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN.to_string(),
+                branch_id: 1,
+            }),
+        });
+        let RewriteResult::Changed(LogicalPlan::AggregateStateMerge(merge)) =
+            rule.apply(plan, &mut ctx).expect("rewrite")
+        else {
+            panic!("expected AggregateStateMerge")
+        };
+        // Branch scope manifests as Project(Filter(Scan)) on the old input.
+        assert!(
+            matches!(merge.old_input.as_ref(), LogicalPlan::Project(_)),
+            "branch-scoped old input must be wrapped in a passthrough Project over a Filter"
+        );
     }
 
     #[test]

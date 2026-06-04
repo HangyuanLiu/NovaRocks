@@ -49,6 +49,7 @@ impl LogicalRewriteRule for RewriteUnionAggregateDeltaRule {
         if !delta.is_root {
             return Ok(RewriteResult::Unchanged);
         }
+        let branch_scope = delta.branch_scope;
         let LogicalPlan::Aggregate(mut aggregate) = *delta.input else {
             return Ok(RewriteResult::Unchanged);
         };
@@ -83,7 +84,7 @@ impl LogicalRewriteRule for RewriteUnionAggregateDeltaRule {
                 input: Box::new(LogicalPlan::Aggregate(aggregate)),
                 is_root: true,
                 action_column: Some(action_column),
-                branch_scope: None,
+                branch_scope,
             },
         )))
     }
