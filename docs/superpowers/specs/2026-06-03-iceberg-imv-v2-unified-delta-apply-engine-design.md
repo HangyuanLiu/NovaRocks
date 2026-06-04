@@ -1,230 +1,393 @@
-# Iceberg IMV-v2:统一 delta-apply 引擎设计(RFC)
+# Iceberg IMV-v2: Logical-Plan-Derived Refresh Contract 设计
 
 日期：2026-06-03
-状态：Draft / 待团队评审
-范围：Iceberg-backed 增量物化视图(IMV)的**物理 refresh 编排层**重构方向
+状态：Spec / 待实现计划
+范围：Iceberg-backed IMV 的 CREATE/REFRESH contract 派生、refresh strategy 与物理 refresh/apply 编排抽象
 
 ---
 
 ## 0. TL;DR
 
-NovaRocks 的 Iceberg IMV **逻辑层**已经是与 StarRocks 最新 IVM 同构的 *marker-pushdown* 框架(`ImvDelta` / `ImvVersion` marker + 每算子一条 delta rule，递归组合），并且在 **base DELETE / signed-state retraction** 上比 StarRocks 当前的 IVM 更靠前。真正的 case-by-case 重复发生在**物理 refresh 编排层**：每新增一种算子组合（projection / aggregate / join / join+aggregate / UNION ALL …）就要写一个新的 `refresh_*_mv` 函数。
+本任务不实现 B 族 `UNION ALL of aggregate branches` 的 refresh 执行。B 族只作为下一任务的预期应用方，用来校验本次抽象边界是否足够。
 
-本 RFC 提议把物理编排收敛为一个**统一的多-base delta-apply 引擎**：
-1. 把"apply key 的类型与定位语义"抽象成 **ApplyKeyContract**，由 plan 自底向上派生，取代按 shape dispatch；
-2. 把各 `refresh_*_mv` 里重复的 base-load / pin / contract-validate / changes 构造 / first-metadata-incremental 决策提取成**一个公共编排骨架**；
-3. （可选）引入 **PCT-style 全量重刷 fallback** 作为 operator-agnostic 安全网 + **CREATE-time trial rewrite** 防"缺 rule 写错数据"。
-
-目标：**新增算子组合的边际成本，从"一个新 refresh 函数"降到"一条 rewrite rule + 一个 apply-key 契约"**；通用性由 fallback 兜底，细粒度增量只在能证明正确的形态上做。
-
-非目标：不改变"只物化 target 表、中间无 state"的存储模型（不转向 differential-dataflow 式的全算子物化）。
-
----
-
-## 1. 背景与动机
-
-当前对 `UNION ALL of aggregate branches`（roadmap 任务 9，下称 B 族）的支持，按现有模式又需要新增一个 `refresh_union_aggregate_mv` + `plan_iceberg_union_aggregate_mv_refresh`。这触发了一个根本问题：
-
-> 这种按 SQL 形态逐个支持的方式，更像 case-by-case，而不是通用 planner。未来每出现新的算子组合（`union+join`、多层嵌套、window…），是不是都要单独写一遍？
-
-本 RFC 回答这个问题，并给出收敛方向。结论先行：**逻辑层不需要推倒重来（方向已正确），需要收敛的是物理编排层。**
-
----
-
-## 2. 现状剖析：两层架构
-
-### 2.1 逻辑层 —— 已经通用、可组合
-
-IMV rewrite pipeline（`src/sql/optimizer/rewrite/imv/pipeline.rs`）：
-
-```
-delta-marker → [join-delta] → [union-delta] → [aggregate-state] → delta-pushdown
-            → scan-binding → action-propagation → apply-key → marker-cleanup → validation
-```
-
-- 两个 marker 算子：`ImvDelta`（change-stream，携带 `__change_op` 动作列）+ `ImvVersion`（snapshot-as-of）。
-- 每个"难算子"一条 structural rule：`RewriteJoinAggregateDelta`、`RewriteUnionAggregateDelta`(A 族)、`RewriteTopLevelUnionDelta`(B 族投影)、`RewriteAggregateState`；unary（project/filter）由通用的 `PushDeltaThroughUnary` 处理。
-- **rule 之间通过 marker 契约组合**：A 族 = `union-delta`（把 `δ(Union)=Union(δ(branch))`）+ `aggregate-state`（消费"已带 marker 的 union"）两个独立 rule 串联，**不是单独 case**。join-delta 内部也是造一个 union 再交给 aggregate-state。
-- `scan-binding`(`BindIcebergScanRule`)的 `resolve_snapshot_window` 按 `mv_ctx.base_refs` + `pin` 为**每个** scan 独立绑定 delta 窗口——天然多-base，与算子组合无关。
-
-这一层背后是代数化的 delta 规则：`δ(Filter)=Filter(δ)`、`δ(Union)=Union(δ)`、`δ(Join)=Join(δ,old)∪Join(new,δ)`、`δ(Agg)=signed-state-merge`。**已经接近"每算子一条规则、递归组合"的通用形态。**
-
-### 2.2 物理层 —— 半统一，外层编排重复
-
-入口与 dispatch（`src/engine/mv/iceberg_refresh.rs`）：
-
-- 执行入口：`refresh_iceberg_mv` → `refresh_iceberg_mv_with_planned_partitions`；生产路径 `execute_iceberg_mv_refresh` 也汇入 `refresh_iceberg_mv_with_planned_partitions`。
-- 按 shape dispatch 到：`refresh_single_aggregate_iceberg_mv` / `refresh_fan_in_aggregate_iceberg_mv`(A 族，本次新增) / `refresh_join_aggregate_iceberg_mv` / `refresh_join_mv` / `refresh_iceberg_union_projection_mv` / 单 base projection / fail-fast(B 族 aggregate)。
-
-**核心 apply 已经统一**：上述各路径最终都调同一个
-`incremental_refresh_iceberg_mv_with_changes(state, ctx, &[RewriteMergeBaseChange], options)`，
-只是 `RewriteMergeRefreshOptions` 不同：
-
-| shape | apply_key_column | apply_key_value_type | rewrite_evidence |
-| --- | --- | --- | --- |
-| projection/filter | `__nova_base_row_id` | `Int64` | `None` |
-| aggregate / join-aggregate / A 族 | `__row_id__` | `Utf8` | `Aggregate` / `JoinAggregate` |
-| B 族 projection | `__nova_base_row_id` | `BranchInt64` | `None` |
-
-apply 定位器也已按类型分好：`locate_target_rows_by_apply_key`(Int64) / `locate_target_rows_by_string_apply_key`(Utf8) / `locate_target_rows_by_branch_apply_key`(BranchInt64)。
-
-**真正重复的是外层编排**：每个 `refresh_*_mv` 都各自做一遍——
-base 表 load、多-base pin(`RefreshSnapshotPin::capture`）、per-shape 的 schema-contract 校验、`has_previous/all_current` 的 first/metadata/incremental 决策、构造 `Vec<RewriteMergeBaseChange>`、staging-branch first-refresh、metadata-only finalize。本次实现 A 族时，`refresh_fan_in_aggregate_iceberg_mv` 几乎是 `refresh_iceberg_union_projection_mv` 的骨架镜像——这正说明该骨架可提取。
-
-### 2.3 为什么物理层比逻辑层更"厚"
-
-NovaRocks 把结果物化进 **Iceberg target 表**（无原生 PK upsert），增量 apply 必须：按 apply key 在 target 文件里**定位**命中行 → 写 **position delete** → 追加 **insert** → 单次 commit。这比"输出到原生 by-PK upsert 的 OLAP 表"重。这是物理编排更复杂的客观原因，不是设计失误（见 §3.2 对比）。
-
----
-
-## 3. StarRocks 参考（`~/project/starrocks`，fe/fe-core）
-
-StarRocks 维护 MV 数据有**两套机制**，恰好对应"通用但粗"和"细但窄"两端。
-
-### 3.1 PCT（Partition Change Tracking）—— 生产默认，operator-agnostic
-
-`MVPCTRefreshProcessor`：检测哪些 base 分区变了 → 经 `MVTimelinessRangePartitionArbiter` 做**分区范围映射**（完全不看 join/aggregate/projection 形态）→ **重跑 MV 定义 SQL 的那个分区子集**（`INSERT OVERWRITE`）。
-
-- 优点：零 per-operator 逻辑，任意 SQL 都能刷，**用"重算"彻底回避组合爆炸**。
-- 代价：粒度粗——1 行变化重刷整个分区；任何**非分区** base 表变化 → **全量重建**（`MVTimelinessRangePartitionArbiter.java:68`）。I/O 正比于分区大小，不是 delta 大小。
-
-### 3.2 IVM —— 与 NovaRocks 同构的 marker-pushdown 框架（新，默认关闭）
-
-`sql/optimizer/rule/ivm/`（2026-04 起，`enable_ivm_refresh` 默认 `false`）：
-
-- 两个 marker：`LogicalDeltaOperator`(`__ACTION__`) + `LogicalVersionOperator`；`IvmRewriter` 把它们下推到 scan，**未收敛即硬报错**（不静默回退）。
-- **每算子一对 rule**（6 Delta + 6 Version，共 12 个）：`IvmDeltaJoinRule` 实现 `δ(A⋈B)=(ΔA⋈B_from)∪(A_to⋈ΔB)`；`IvmDeltaAggregateRule` 用 `state_union` 对 `__ROW_ID__=encode_row_id(group_keys)` 做 signed-state merge；`IvmDeltaUnionRule` 把 Delta 推进每个 union child。
-- 成本 **O(算子数)，不是 O(组合数)**：新组合零代码，新算子 +2 rule。
-- 输出到 **PK OLAP 表**（`INSERT ... __op`，引擎原生 by-PK upsert），所以 refresh processor 很薄。
-
-**与 NovaRocks 的同构对照**：
-
-| 维度 | StarRocks IVM | NovaRocks IMV |
-| --- | --- | --- |
-| change-stream marker | `LogicalDeltaOperator` + `__ACTION__` | `ImvDelta` + `__change_op` |
-| snapshot marker | `LogicalVersionOperator` | `ImvVersion` |
-| 每算子 delta rule | `IvmDelta{Join,Aggregate,Union}Rule` | `join_delta` / `aggregate_state` / `union_delta` |
-| apply key | `encode_row_id(group_keys) → __ROW_ID__` | `__row_id__ = hex\|join(gk)` |
-| signed merge | `state_union` over `_combine` | `*_state_signed` + `AggregateStateMerge` |
-| change op | `__ACTION__` (UPSERT/DELETE) | `__change_op` |
-| 输出目标 | PK OLAP 表（原生 upsert） | Iceberg（locate + position-delete + insert） |
-
-### 3.3 对 NovaRocks 的启示（含诚实校准）
-
-1. **方向已对**：NovaRocks 逻辑层 = StarRocks 最新押注的通用 IVM 框架，不是 case-by-case。
-2. **NovaRocks 在最难处更超前**：StarRocks IVM 当前 **append-only Iceberg + inner/cross join only，base DELETE 硬拒绝**（`MVIVMRefreshProcessor.java:290`，"Drop and recreate to recover"），最难的 delete-retraction + 不可逆聚合（MIN/MAX）正是其止步处。而 NovaRocks 已支持 base INSERT/DELETE/UPDATE + signed-state retraction（join-aggregate / A 族测试覆盖）。
-3. **统一性来自输出模型**：StarRocks IVM 的薄 processor 得益于输出 PK OLAP 表。NovaRocks 输出 Iceberg，apply 必然更重——但**仍可统一**：rewrite 产出统一 change-stream，一个引擎按 apply-key 契约消费。
-4. **安全网思路**：StarRocks 用 PCT 兜底任意 IVM 不支持的 SQL，并用 CREATE-time `IvmTrialRewriter` 防"缺 rule = 错数据"。值得借鉴。
-5. **通用 query-rewrite 也有边界**：StarRocks SPJG（Goldstein–Larson）查询改写很通用，但明确不支持 grouping sets/cube、outer-join 受限——印证"通用 planner 也不能适配任意 SQL 都高效增量"，有理论边界。
-
----
-
-## 4. 提议设计：统一 delta-apply 引擎
-
-核心思想：**逻辑层保持 marker-pushdown（已通用）；物理层把"按 shape dispatch 到专门 refresh 函数"换成"按算子派生 apply-key 契约 + 一个统一引擎消费 change-stream"。**
-
-### 4.1 ApplyKeyContract —— 抽象 apply key 的类型与定位语义
-
-把当前散落在 `RewriteMergeRefreshOptions{apply_key_column, apply_key_value_type}` 的信息提升为一个一等契约：
+本期设计的核心不是再引入一个独立的“shape tree”中心类型，而是利用 CREATE/REFRESH 时已经存在的 SQL parse/analyze 流程：
 
 ```text
-ApplyKeyContract {
-    column: &str,                 // __nova_base_row_id / __row_id__ / ...
-    kind: ApplyKeyKind,           // Int64 | Utf8 | Composite{ prefix: BranchId, inner: Box<ApplyKeyKind> }
-    // 定位语义：如何在 target 表里按该 key 命中物理行
+SQL
+  -> parser AST
+  -> analyzed query / logical relation tree
+  -> derive_imv_refresh_contract(MvAnalysis)
+  -> ImvRefreshContract { strategy, base refs, apply key, aggregate/join/branch contracts, ... }
+  -> IcebergMvRefreshDriver
+```
+
+`RefreshStrategy` 只是 `ImvRefreshContract` 里的一个字段，表示物理 refresh contract 类型。它不是 SQL shape 本身，也不直接由 SQL 字符串枚举出来。
+
+目标是：
+
+- 复用 analyzer / logical plan 的 name resolution、type resolution、alias 展开和表达式绑定；
+- 移除 refresh 层手写 SQL pattern classifier 对组合形态的依赖；
+- 用一个稳定、可持久化、可对比的 `ImvRefreshContract` 连接 CREATE 和 REFRESH；
+- 把物理 refresh 生命周期收敛到统一 driver；
+- B 族可被 logical plan visitor 识别并记录为 unsupported future strategy，但本任务不接执行。
+
+---
+
+## 1. 当前问题
+
+当前 Iceberg IMV 有两个问题叠在一起。
+
+第一，逻辑层其实已经比较统一。IMV rewrite pipeline 通过 `ImvDelta` / `ImvVersion` marker，以及 join、union、aggregate、scan binding、action propagation、apply-key 等 rewrite rule 组合出 delta plan。差异主体应该留在 logical plan rewrite 和 operator 组合里。
+
+第二，refresh 物理层仍然按 SQL 形态写了多套路径：
+
+- single projection/filter；
+- join projection/filter；
+- UNION ALL projection/filter；
+- single aggregate；
+- A 族 `Aggregate(UNION ALL(...))`；
+- join aggregate。
+
+这些路径各自重复处理 base load、snapshot pin、previous/current 判断、first refresh、metadata-only refresh、incremental apply 和 refresh intent。
+
+更深的问题是：如果继续用平铺 `IncrementalMvShape` 枚举“支持的 SQL 组合名”，未来会继续出现组合爆炸。例如 `Aggregate(Union)`、`Union(Aggregate)`、`Aggregate(Join)` 都会诱导出新的 bespoke variant 或字段。
+
+正确方向是：不要在 refresh 层再手写一套 SQL classifier，也不要持久化完整 logical plan；而是从 analyzed logical plan 派生稳定的 IMV refresh contract。
+
+---
+
+## 2. 设计原则
+
+### 2.1 Raw AST 不够
+
+AST 只描述语法，不能可靠回答：
+
+- 表名最终绑定到哪个 catalog/db/table；
+- column 引用绑定到哪个 base field；
+- output 类型和 nullable；
+- alias 展开后的表达式；
+- group key / join key / output lineage；
+- schema evolution 后 field-id rebind 是否安全。
+
+所以 IMV refresh contract 不应只从 raw AST 派生。
+
+### 2.2 直接持久化 logical plan 也不合适
+
+Logical plan 是 planner 内部结构，会随 optimizer 演进而变化。它也包含 refresh 不需要的大量执行细节。CREATE MV metadata 需要的是稳定 semantic contract，而不是完整 planner node。
+
+### 2.3 派生稳定 contract
+
+CREATE MV 和 REFRESH MV 都走 analyzed logical plan，然后派生同一类稳定摘要：
+
+```text
+ImvRefreshContract {
+  strategy: RefreshStrategy,
+  base_refs: Vec<IcebergTableRef>,
+  apply_key: ApplyKeyContract,
+  structure: ImvRefreshStructure,
+  aggregate: Option<AggregateRefreshContract>,
+  join: Option<JoinRefreshContract>,
+  branch: Option<BranchRefreshContract>,
+  schema: MvSchemaContract,
 }
 ```
 
-- 由 plan **自底向上派生**：projection/filter → `BaseRowId`；aggregate → `GroupRowId`；带 `__branch_id__` 的 union → 在 inner key 外包一层 `Composite`（或采用 §5 的 row_id 编码方案，使 inner key 自带 branch）。
-- 取代"shape → 选哪个 `locate_target_rows_by_*`"的 dispatch：locator 成为契约 `kind` 的函数。
+CREATE 阶段把 contract 的稳定字段持久化到现有 MV metadata / `MvSchemaContract`
+等 repository contract 中。REFRESH 阶段重新 analyze stored SQL，再派生
+current contract，并和 persisted contract 做 validate/rebind。不要持久化
+完整 logical plan。
 
-### 4.2 统一编排骨架（MultiBaseRefreshDriver）
+---
 
-把各 `refresh_*_mv` 的公共流程提取为一个骨架，shape-specific 的部分变成注入参数：
+## 3. 核心架构
+
+### 3.1 Contract Deriver
+
+新增 logical-plan visitor，工作名：
 
 ```text
-unified_refresh(bases, contract_validator, apply_key_contract, first_refresh_sql_builder):
-  1. load 所有 base 表
-  2. RefreshSnapshotPin::capture(all bases)  + uuid 校验
-  3. 对每个 base 跑 contract_validator（shape 提供的校验闭包）
-  4. has_previous / all_current → 决策 First / MetadataOnly / Incremental
-  5. First       → first_refresh_sql_builder 产 state/physical SQL → run → write → commit
-     MetadataOnly→ finalize_iceberg_mv_metadata_only_refresh
-     Incremental → 构造 Vec<RewriteMergeBaseChange> → incremental_refresh_iceberg_mv_with_changes(apply_key_contract)
+derive_imv_refresh_contract(MvAnalysis) -> ImvRefreshContract
 ```
 
-现有的 `refresh_single_aggregate` / `refresh_fan_in_aggregate` / `refresh_join_aggregate` / `refresh_union_projection` 退化成**薄 wrapper**：各自只提供 (a) contract validator、(b) apply-key 契约、(c) first-refresh SQL 构造器。`incremental_refresh_iceberg_mv_with_changes` 已是统一 apply，无需大改。
+它递归 walk `MvAnalysis.resolved_query` 中的 analyzed query / relation
+结构，识别 IMV 支持的结构：
 
-### 4.3 统一 first-refresh
+```text
+Scan
+Project / Filter
+Join
+Aggregate
+UnionAll
+```
 
-当前 first-refresh 有两套：`first_refresh_iceberg_aggregate_mv`（state-shaped 单 SELECT，要求 outer 是 `SetExpr::Select`）+ `rewrite_union_projection_full_refresh_select_with_pin`（union 投影）。统一为一个 **first-refresh SQL builder**：给定 plan，产出 state-shaped / row-id-stamped 的 full-refresh SQL（含 union 分支拼接 + branch 标记），交给现有 `run_mv_full_select_chunks` + write/commit。
+visitor 输出稳定 contract，而不是输出完整 plan。实现中可以使用内部轻量结构辅助递归，但它不是 refresh 层的中心概念。
 
-### 4.4（可选）PCT-style 全量 fallback + CREATE-time trial
+### 3.2 RefreshStrategy
 
-- **Fallback**：当 rewrite 判定 plan 不可增量（出现未支持算子/组合），退回"全量/分区重刷 defining SQL"。这让**通用性由 fallback 保证**，IMV 引擎只需在能证明正确的形态上做细粒度——与 StarRocks PCT+IVM 并存的策略一致。
-- **CREATE-time trial**：建 MV 时就跑一遍 delta rewrite（对齐 StarRocks `IvmTrialRewriter`），缺 rule 立即在 CREATE 报错，杜绝"运行期才发现写错数据"。NovaRocks 现有 `ActionColumnValidationRule` / `UnresolvedMarkerCheckRule` 已是雏形。
+`RefreshStrategy` 表示物理 refresh contract 类型：
+
+```text
+ProjectionFilter
+JoinProjectionFilter
+UnionProjectionFilter
+SingleAggregate
+FanInAggregate
+JoinAggregate
+UnsupportedBranchUnionAggregate   # B 族 future consumer
+```
+
+它由 contract deriver 从 logical plan 结构归约出来：
+
+```text
+Project/Filter(Scan)
+  -> ProjectionFilter
+
+Join(Scan, Scan)
+  -> JoinProjectionFilter
+
+UnionAll(Project/Filter(Scan), ...)
+  -> UnionProjectionFilter
+
+Aggregate(Scan)
+  -> SingleAggregate
+
+Aggregate(UnionAll(Scan or Project/Filter(Scan), ...))
+  -> FanInAggregate
+
+Aggregate(Join(Scan, Scan))
+  -> JoinAggregate
+
+UnionAll(Aggregate(...), Aggregate(...))
+  -> UnsupportedBranchUnionAggregate
+```
+
+新增 `RefreshStrategy` 的标准不是 SQL 多一种写法，而是物理 refresh contract 发生变化：snapshot policy、first refresh materialization、apply key、schema/rebind 或 rewrite evidence 无法由现有 strategy 表达。
+
+### 3.3 ApplyKeyContract
+
+把当前散落在 `RewriteMergeRefreshOptions` 中的 apply 语义提升为一等 contract：
+
+```text
+ApplyKeyContract {
+  column_name,
+  value_type,
+  source,
+  rewrite_evidence,
+  locator_preload,
+  full_rebuild_fallback,
+}
+```
+
+当前策略：
+
+- projection/filter：base row id + `Int64`；
+- UNION projection/filter：branch + base row id + `BranchInt64`；
+- aggregate：group row id + `Utf8` + aggregate evidence；
+- join aggregate：group row id + `Utf8` + join aggregate evidence。
+
+B 族未来需要 branch-scoped aggregate identity。本任务只在 contract 结构上保留扩展空间，不实现 row-id 编码。
+
+### 3.4 Refresh Driver
+
+`IcebergMvRefreshDriver` 负责所有 shape 共享的生命周期：
+
+1. load target / MV definition；
+2. parse/analyze stored SQL；
+3. derive current `ImvRefreshContract`；
+4. validate/rebind against persisted contract；
+5. preload base tables；
+6. apply base snapshot policy；
+7. capture `RefreshSnapshotPin`；
+8. build `IcebergMvRefreshContext`；
+9. dispatch first / metadata-only / incremental；
+10. manage refresh intent、staging branch、abort、publish、finalize。
+
+driver 不负责：
+
+- SQL pattern matching；
+- logical rewrite rule 语义；
+- first-refresh SQL 的具体生成；
+- apply key 的语义选择；
+- B 族执行支持。
+
+### 3.5 Stable CREATE/REFRESH Contract
+
+CREATE MV：
+
+```text
+SQL
+  -> analyze query / relation tree
+  -> derive_imv_refresh_contract
+  -> build target schema + schema contract
+  -> persist StoredMvDefinition + stable contract fields
+```
+
+REFRESH MV：
+
+```text
+stored SQL
+  -> analyze logical plan
+  -> derive_imv_refresh_contract
+  -> compare/rebind against persisted contract
+  -> RefreshStrategy drives refresh lifecycle
+```
+
+这让 CREATE-time 判断和 REFRESH-time 判断复用同一套 derivation 逻辑。
 
 ---
 
-## 5. B 族在 IMV-v2 下的落地（首个验证场景）
+## 4. B 族边界
 
-B 族（`Union(Aggregate(b₁)..Aggregate(bₙ))`，UNION 在聚合之上，bag semantics）在统一引擎下应当只需要：
+B 族：
 
-- **逻辑层**：新增一条 `RewriteBranchUnionAggregateDelta` rule（`δ(Union(Agg))=Union(δ(Agg) per branch + 注入 branch 身份)`），复用现有 `aggregate-state` 的 signed-merge 构造。这就是 StarRocks `IvmDeltaUnionRule` 的对应物。
-- **apply-key 契约**：采用 **A2 方案** —— 让 branch i 的 `__row_id__` 编码 `branch_id`（在 `build_row_id_array`，`src/connector/starrocks/table/mv_agg_state.rs:743`，及 first-refresh SQL 两处一致地 prepend `branch_id`）。这样两个 branch 的同 group key 天然得到不同 row_id，`AggregateStateMerge` 按 row_id 过滤即**天然 branch-isolated**，**复用现有 `Utf8` string locator，不需要 composite locator、不需要 branch-scoped scan、不动 merge 核心**。
-- **first-refresh**：统一 first-refresh builder 的 union 变体（每 branch state-shaped SELECT + branch 编码 row_id + `__branch_id__` 列，UNION ALL 拼接）。
-- **物理 orchestration**：**无新 `refresh_*_mv` 函数**——只通过 unified_refresh + 上述契约落地。
+```text
+UNION ALL(
+  Aggregate(base_1),
+  Aggregate(base_2),
+  ...
+)
+```
 
-> 关键正确性背景（必须保留为验收）：`AggregateStateMergeOp` 当前纯 `__row_id__`-keyed，零 branch 感知；若不让 row_id 含 branch，跨 branch 同 group key 会被错误折叠（违反 bag semantics）。A2 用"row_id 编码 branch"在不动 merge 核心的前提下解决它。
+本任务中：
 
----
+- contract deriver 可以识别它；
+- contract 中记录它是 `UnsupportedBranchUnionAggregate`；
+- CREATE 阶段可以选择 fail-fast，或允许创建但 REFRESH fail-fast；本任务推荐 CREATE 阶段 fail-fast，除非现有 CREATE 行为已经允许并持久化 unsupported MV；
+- 不新增 logical rewrite；
+- 不解 ignored test；
+- 不实现 branch-scoped aggregate row id。
 
-## 6. 迁移路径（分阶段，每阶段保持全绿）
+后续 B 族任务只应补：
 
-- **Phase 0（已完成）**：A 族 `Aggregate(UNION ALL)` fan-in execute 已实现（`refresh_fan_in_aggregate_iceberg_mv`，含首刷/增量/跨-branch 合并/INSERT/DELETE 端到端测试，`iceberg_refresh` 模块 78 测试无回归）。它镜像了 join/union-projection 的多-base 编排——是 Phase 1 的提取素材。
-- **Phase 1**：提取 `unified_refresh` 多-base 编排骨架；现有 `refresh_*` 改薄 wrapper（注入 contract validator + apply-key 契约 + first-refresh builder）。**验收：iceberg-ivm 全 suite 行为不变。**
-- **Phase 2**：落地 `ApplyKeyContract`（参数化 `RewriteMergeRefreshOptions`）+ 统一 first-refresh builder。
-- **Phase 3**：B 族 aggregate 作为"在统一引擎上新增 shape"的首个验证——只加 rule + 契约，无新 refresh fn（§5）。**验收：B 族集成测试绿（同 group key 跨 branch 不合并、删一个 branch 不影响另一个）。**
-- **Phase 4（可选，按 §8 决策）**：PCT-style 全量 fallback + CREATE-time trial rewrite。
-
----
-
-## 7. 风险、边界、非目标
-
-- **不改 state 模型**：保持"只物化 target 表、中间算子无 state"。这与 differential-dataflow（每中间算子物化 arrangement）不同，是 NovaRocks 资源友好的有意选择；代价是某些算子无法做到 delta-sized 增量，由 fallback 兜底。
-- **理论边界**：无界 window、`DISTINCT` 聚合、不可逆聚合在删数下的某些场景，本质需要全量/更多 state；IMV 引擎应 fail-fast 到 fallback，而非给错结果。
-- **重构回归风险**：现有 projection/aggregate/join shape 必须行为不变——分阶段 + 每阶段全 suite 绿 + 强回归。
-- **保持现有优势**：NovaRocks 已有的 base DELETE / signed-state retraction 正确性必须在统一引擎下保留（这是相对 StarRocks IVM 的领先点）。
+- B-specific logical rewrite；
+- branch-scoped aggregate apply key / row identity policy；
+- B-specific first refresh strategy；
+- 将 `UnsupportedBranchUnionAggregate` 升级为可执行 `BranchUnionAggregate`。
 
 ---
 
-## 8. 待决策问题（供团队评审）
+## 5. 迁移计划
 
-- **D1**：是否引入 PCT-style 全量重刷 fallback？（operator-agnostic 安全网，显著提升"任意 SQL 可刷"，但需分区/重刷基础设施）
-- **D2**：`ApplyKeyContract` 的抽象边界——Iceberg-specific 还是预留通用后端？
-- **D3**：`unified_refresh` 的提取形态——driver struct + 注入闭包，还是 per-shape trait 实现？
-- **D4**：是否引入 CREATE-time trial rewrite（防缺 rule 写错数据）？
-- **D5**：B 族 apply-key——**A2（row_id 编码 branch，推荐：最简、复用现有 locator/merge）** vs 设计文档原方案（composite `(branch_id, group_row_id)` locator + branch-scoped scan，触及更深 codegen）。本 RFC 推荐 A2。
+### Phase 1: Contract Deriver Foundation
+
+- 从 CREATE/REFRESH 当前已有分析入口定位 analyzed logical plan；
+- 新增 `ImvRefreshContract` / `RefreshStrategy` / `ApplyKeyContract`；
+- 实现 logical-plan visitor 的最小结构识别；
+- 为 projection/filter、aggregate、join、union、A 族、B 族写 contract derivation 单元测试。
+
+### Phase 2: CREATE MV Contract Persistence
+
+- CREATE MV 阶段由 logical plan 派生 contract；
+- 用 contract 构造 base refs、schema contract、apply key source、branch/join/aggregate metadata；
+- 移除 CREATE 阶段对手写 SQL shape classifier 的依赖；
+- B 族保持明确 unsupported。
+
+### Phase 3: REFRESH Strategy Selection
+
+- REFRESH 阶段重新 analyze stored SQL；
+- 重新 derive current contract；
+- compare/rebind against persisted contract；
+- refresh strategy 从 contract 读取，不再从 SQL AST classifier 读取。
+
+### Phase 4: Refresh Driver
+
+- 提取 base snapshot decision；
+- 提取 `ApplyKeyContract`；
+- 统一 first / metadata-only / incremental dispatch；
+- 现有 refresh paths 降级为 strategy helper。
+
+### Phase 5: Existing Shape Migration
+
+逐步接入：
+
+- projection/filter；
+- UNION projection/filter；
+- single aggregate；
+- A 族 fan-in aggregate；
+- join aggregate；
+- join projection/filter。
+
+B 族不在本期接入执行。
 
 ---
 
-## 9. 验收标准
+## 6. 测试计划
 
-- 现有 shape（projection / aggregate / join / join-aggregate / A 族）在统一引擎上**行为不变**（iceberg-ivm 全 suite 绿）。
-- **新增算子或组合的边际成本 = O(1) rule + 一个 apply-key 契约**，不再需要新的 `refresh_*_mv` orchestration 函数。
-- B 族 aggregate 通过统一引擎落地（无专门 refresh fn），且满足 bag-semantics 正确性（同 group key 跨 branch 不合并；删/增一个 branch 不影响其它 branch）。
-- 可选 fallback 落地后：rewrite 不支持的 MV 定义在 CREATE 期明确报错或在 refresh 期走全量重刷，无静默错误结果。
+### Contract Derivation Tests
+
+覆盖：
+
+- `Project/Filter(Scan)` -> `ProjectionFilter`；
+- `UnionAll(Project/Filter(Scan), ...)` -> `UnionProjectionFilter`；
+- `Aggregate(Scan)` -> `SingleAggregate`；
+- `Aggregate(UnionAll(...))` -> `FanInAggregate`；
+- `Aggregate(Join(...))` -> `JoinAggregate`；
+- `UnionAll(Aggregate(...), Aggregate(...))` -> B 族 unsupported contract；
+- unsupported operator fail-fast。
+
+### Refresh Policy Tests
+
+覆盖：
+
+- single base empty skip；
+- previous snapshot missing fail-fast；
+- all bases required partial first refresh fail-fast；
+- join pair partial initial skip；
+- unchanged metadata-only；
+- changed incremental。
+
+### Regression Tests
+
+保持现有 `iceberg_refresh` 模块测试通过，重点覆盖：
+
+- projection/filter first / metadata-only / incremental；
+- UNION projection/filter branch apply；
+- single aggregate first / incremental；
+- A 族 fan-in aggregate first / incremental / delete；
+- join projection/filter partial initial skip；
+- join aggregate update/delete retraction。
+
+SQL suite：至少跑 Iceberg IMV 相关 suite；B 族 ignored test 保持 ignored。
 
 ---
 
-## 10. 附：本 RFC 依据的关键代码位置
+## 7. 验收标准
 
-NovaRocks：
-- 逻辑层 pipeline：`src/sql/optimizer/rewrite/imv/pipeline.rs`；marker/rules 同目录（`join_delta.rs` / `union_delta.rs` / `aggregate_rewrite.rs` / `delta_pushdown.rs` / `scan_binding.rs`）。
-- 物理编排 + 核心 apply：`src/engine/mv/iceberg_refresh.rs`（`refresh_*_mv`、`incremental_refresh_iceberg_mv_with_changes`、`RewriteMergeRefreshOptions`、first-refresh）。
-- apply 定位器 / merge：`src/engine/mv/iceberg_target_apply.rs`、`src/engine/mv/iceberg_aggregate_state.rs`、`src/exec/operators/aggregate_state_merge.rs`；row_id 编码 `src/connector/starrocks/table/mv_agg_state.rs:743`。
+本任务完成时：
 
-StarRocks（`~/project/starrocks/fe/fe-core/src/main/java/com/starrocks/`）：
-- 三模式 dispatch：`scheduler/mv/MVRefreshProcessorFactory.java`；PCT：`scheduler/mv/pct/MVPCTRefreshProcessor.java`；分区映射：`catalog/mv/MVTimelinessRangePartitionArbiter.java`。
-- IVM：`sql/optimizer/rule/ivm/IvmRewriter.java` + `sql/optimizer/rule/ivm/`（`IvmDelta{Join,Aggregate,Union}Rule.java`）；marker：`sql/optimizer/operator/logical/Logical{Delta,Version}Operator.java`；契约：`sql/analyzer/mv/IVMAnalyzer.java`、`sql/optimizer/rule/ivm/common/IvmOpUtils.java`。
-- SPJG 查询改写：`sql/optimizer/rule/transformation/materialization/`。
+- CREATE MV 和 REFRESH MV 使用同一套 logical-plan-derived contract derivation；
+- refresh strategy 不再由 raw SQL pattern classifier 直接决定；
+- `ImvRefreshContract` 是 CREATE/REFRESH 的稳定语义边界；
+- refresh lifecycle 的重复逻辑集中到 driver；
+- `ApplyKeyContract` 成为 apply 语义的一等结构；
+- 现有 supported shape 行为不变；
+- B 族未实现，但 contract derivation 能识别并明确 unsupported。
+
+---
+
+## 8. 风险与约束
+
+- 不要持久化完整 logical plan；
+- 不要只依赖 raw AST；
+- 不要在本任务中偷渡 B 族执行；
+- join projection / join aggregate 的 partial initial skip 必须保留；
+- single projection/filter 的 full-rebuild fallback 与 multi-base 禁止 fallback 的差异必须保留；
+- schema rebind 仍然要基于 persisted contract 与 current analyzed plan 对比。
+
+---
+
+## 9. 关键代码位置
+
+- `src/engine/mv/iceberg_refresh.rs`
+  - refresh dispatcher；
+  - current shape-specific refresh paths；
+  - incremental apply core；
+  - first-refresh helpers。
+- `src/connector/starrocks/table/mv_shape.rs`
+  - current AST-based classifier；本任务应逐步降级或迁移出 refresh decision 入口。
+- `src/engine/mv/refresh_context.rs`
+  - refresh execution context。
+- `src/meta/repository/mv_contract.rs`
+  - persisted schema / apply / branch / aggregate contracts。
+- `src/sql/optimizer/rewrite/imv/pipeline.rs`
+  - existing IMV logical rewrite pipeline。
