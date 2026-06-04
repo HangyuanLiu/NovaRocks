@@ -175,6 +175,13 @@ impl PhysicalPropertySet {
         }
     }
 
+    pub fn broadcast() -> Self {
+        Self {
+            distribution: DistributionSpec::Broadcast,
+            ordering: OrderingSpec::Any,
+        }
+    }
+
     pub fn satisfies(&self, required: &PhysicalPropertySet) -> bool {
         self.distribution.satisfies(&required.distribution)
             && self.ordering.satisfies(&required.ordering)
@@ -191,6 +198,7 @@ pub(crate) enum HashSource {
 pub(crate) enum DistributionSpec {
     Any,
     Gather,
+    Broadcast,
     HashPartitioned {
         cols: Vec<ColumnId>,
         source: HashSource,
@@ -253,6 +261,7 @@ impl DistributionSpec {
         match required {
             DistributionSpec::Any => true,
             DistributionSpec::Gather => matches!(self, DistributionSpec::Gather),
+            DistributionSpec::Broadcast => matches!(self, DistributionSpec::Broadcast),
             DistributionSpec::HashPartitioned {
                 cols: required_cols,
                 source: required_source,
@@ -483,6 +492,26 @@ mod tests {
         let provided = DistributionSpec::Gather;
         let required = DistributionSpec::shuffle_agg([ColumnId(1)]);
         assert!(!provided.satisfies(&required));
+    }
+
+    #[test]
+    fn broadcast_distribution_satisfies_only_broadcast_and_any() {
+        let provided = DistributionSpec::Broadcast;
+
+        assert!(provided.satisfies(&DistributionSpec::Any));
+        assert!(provided.satisfies(&DistributionSpec::Broadcast));
+        assert!(!provided.satisfies(&DistributionSpec::Gather));
+        assert!(!provided.satisfies(&DistributionSpec::shuffle_join([ColumnId(1)])));
+        assert!(!DistributionSpec::Gather.satisfies(&DistributionSpec::Broadcast));
+        assert!(!DistributionSpec::shuffle_join([ColumnId(1)])
+            .satisfies(&DistributionSpec::Broadcast));
+    }
+
+    #[test]
+    fn physical_property_set_broadcast_uses_any_ordering() {
+        let props = PhysicalPropertySet::broadcast();
+        assert_eq!(props.distribution, DistributionSpec::Broadcast);
+        assert_eq!(props.ordering, OrderingSpec::Any);
     }
 
     #[test]

@@ -669,6 +669,7 @@ fn format_physical_node(
             let label = match &op.spec {
                 DistributionSpec::Any => "ANY EXCHANGE".to_string(),
                 DistributionSpec::Gather => "GATHER EXCHANGE".to_string(),
+                DistributionSpec::Broadcast => "BROADCAST EXCHANGE".to_string(),
                 DistributionSpec::HashPartitioned { cols, source } => {
                     let col_names: Vec<String> = cols.iter().map(|c| format!("{}", c)).collect();
                     format!(

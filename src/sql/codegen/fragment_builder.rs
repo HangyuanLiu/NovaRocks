@@ -4195,6 +4195,9 @@ impl<'a> PlanFragmentBuilder<'a> {
             crate::sql::optimizer::property::DistributionSpec::Gather => {
                 Ok(unpartitioned_stream_partition())
             }
+            crate::sql::optimizer::property::DistributionSpec::Broadcast => {
+                Ok(unpartitioned_stream_partition())
+            }
             crate::sql::optimizer::property::DistributionSpec::HashPartitioned { cols, .. } => {
                 // For shuffle joins, cols contains ALL eq key columns from both
                 // sides. Pick the ones that resolve in this child's scope.
