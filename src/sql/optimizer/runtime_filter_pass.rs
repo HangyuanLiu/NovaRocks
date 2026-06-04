@@ -539,6 +539,7 @@ pub(crate) mod test_support {
             children: vec![scan],
             stats: Statistics {
                 output_row_count: 1_000_000.0,
+                row_count_confidence: crate::sql::optimizer::statistics::Confidence::Estimated,
                 column_statistics: Default::default(),
                 ..Default::default()
             },
@@ -563,6 +564,7 @@ pub(crate) mod test_support {
             children: vec![exch, build], // children[0]=probe-exchange, children[1]=build
             stats: Statistics {
                 output_row_count: 100.0,
+                row_count_confidence: crate::sql::optimizer::statistics::Confidence::Estimated,
                 column_statistics: Default::default(),
                 ..Default::default()
             },
