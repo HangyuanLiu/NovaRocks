@@ -507,6 +507,7 @@ pub(crate) fn build_aggregate_state_merge_exec_node(
     old_input: crate::exec::node::ExecNode,
     delta_input: crate::exec::node::ExecNode,
     layout: crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
+    branch_id: Option<i32>,
 ) -> crate::exec::node::ExecNode {
     crate::exec::node::ExecNode {
         kind: crate::exec::node::ExecNodeKind::AggregateStateMerge(
@@ -514,6 +515,7 @@ pub(crate) fn build_aggregate_state_merge_exec_node(
                 old_input: Box::new(old_input),
                 delta_input: Box::new(delta_input),
                 layout,
+                branch_id,
             },
         ),
     }

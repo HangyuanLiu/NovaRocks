@@ -3280,6 +3280,7 @@ fn lower_plan_build_result(
                 old_input,
                 delta_input,
                 layout,
+                branch_id,
             } => {
                 let old_input =
                     lower_plan_build_result(*old_input, arena, query_opts, iceberg_catalogs)?;
@@ -3290,6 +3291,7 @@ fn lower_plan_build_result(
                         old_input,
                         delta_input,
                         layout,
+                        branch_id,
                     ),
                 );
             }
@@ -3306,6 +3308,19 @@ fn lower_plan_build_result(
                             layout,
                             shape,
                         },
+                    ),
+                });
+            }
+            crate::sql::codegen::DirectExecPlan::UnionAll { inputs } => {
+                let inputs = inputs
+                    .into_iter()
+                    .map(|input| {
+                        lower_plan_build_result(input, arena, query_opts, iceberg_catalogs)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                return Ok(crate::exec::node::ExecNode {
+                    kind: crate::exec::node::ExecNodeKind::UnionAll(
+                        crate::exec::node::union_all::UnionAllNode { inputs, node_id: 0 },
                     ),
                 });
             }

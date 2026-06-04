@@ -124,6 +124,27 @@ fn aggregate_physical_output_columns(
         .collect()
 }
 
+fn branch_union_project_branch_id(op: &PhysicalProjectOp) -> Option<i32> {
+    op.items
+        .iter()
+        .find(|item| {
+            item.output_name.eq_ignore_ascii_case(
+                crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN,
+            )
+        })
+        .and_then(|item| branch_id_literal_expr(&item.expr))
+}
+
+fn branch_id_literal_expr(expr: &TypedExpr) -> Option<i32> {
+    match &expr.kind {
+        ExprKind::Literal(LiteralValue::Int(value)) => i32::try_from(*value).ok(),
+        ExprKind::Cast { expr, target } if *target == DataType::Int32 => {
+            branch_id_literal_expr(expr)
+        }
+        _ => None,
+    }
+}
+
 fn validate_aggregate_state_merge_child_output(
     input_name: &str,
     actual: &[OutputColumn],
@@ -544,6 +565,16 @@ impl<'a> PlanFragmentBuilder<'a> {
             _ => plan,
         };
 
+        if let Some(build) = Self::try_build_branch_union_aggregate_direct(
+            plan,
+            catalog,
+            connectors,
+            _current_database,
+            mv_refresh_ctx,
+        )? {
+            return Ok(build);
+        }
+
         if matches!(plan.op, Operator::PhysicalAggregateStateMerge(_)) {
             return Self::build_aggregate_state_merge_direct(
                 plan,
@@ -664,6 +695,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             mv_refresh_ctx,
             shape,
             layout,
+            None,
         )
     }
 
@@ -676,6 +708,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         mv_refresh_ctx: Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
         shape: crate::connector::starrocks::table::mv_shape::AggregateMvShape,
         layout: crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
+        branch_id: Option<i32>,
     ) -> Result<MultiFragmentBuildResult, String> {
         let Operator::PhysicalAggregateStateMerge(op) = &plan.op else {
             return Err("internal error: expected PhysicalAggregateStateMerge".to_string());
@@ -764,6 +797,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                 old_input,
                 delta_input,
                 layout,
+                branch_id,
             })),
             cte_id: None,
             cte_exchange_nodes: Vec::new(),
@@ -777,6 +811,94 @@ impl<'a> PlanFragmentBuilder<'a> {
             edges: Vec::new(),
             rf_plan: None,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_build_branch_union_aggregate_direct(
+        plan: &PhysicalPlanNode,
+        catalog: &'a dyn CatalogProvider,
+        connectors: &'a crate::connector::ConnectorRegistry,
+        current_database: &str,
+        mv_refresh_ctx: Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+    ) -> Result<Option<MultiFragmentBuildResult>, String> {
+        let Operator::PhysicalUnion(union_op) = &plan.op else {
+            return Ok(None);
+        };
+        if !union_op.all || plan.children.is_empty() {
+            return Ok(None);
+        }
+        let Some(refresh_ctx) = mv_refresh_ctx else {
+            return Ok(None);
+        };
+
+        let mut branch_inputs = Vec::with_capacity(plan.children.len());
+        for branch in &plan.children {
+            let Operator::PhysicalProject(project_op) = &branch.op else {
+                return Ok(None);
+            };
+            let Some(branch_id) = branch_union_project_branch_id(project_op) else {
+                return Ok(None);
+            };
+            if branch.children.len() != 1 {
+                return Err(format!(
+                    "branch UNION aggregate direct codegen expected Project with one child, got {}",
+                    branch.children.len()
+                ));
+            }
+            let merge = &branch.children[0];
+            if !matches!(merge.op, Operator::PhysicalAggregateStateMerge(_)) {
+                return Ok(None);
+            }
+            let (shape, layout) = refresh_ctx
+                .rewrite
+                .aggregate_shape_and_layout_for_execution()?;
+            let child =
+                single_fragment_child_plan(Self::build_aggregate_state_merge_direct_with_layout(
+                    merge,
+                    catalog,
+                    connectors,
+                    current_database,
+                    mv_refresh_ctx,
+                    shape,
+                    layout,
+                    Some(branch_id),
+                )?)?;
+            branch_inputs.push(*child);
+        }
+
+        let output_columns = union_op
+            .output_columns
+            .iter()
+            .map(|c| OutputColumn {
+                name: c.name.clone(),
+                data_type: c.data_type.clone(),
+                nullable: c.nullable,
+            })
+            .collect();
+        let exec_params =
+            nodes::build_exec_params_multi_with_refresh_context(connectors, &[], mv_refresh_ctx)?;
+        let fragment = FragmentBuildResult {
+            fragment_id: 0,
+            plan: plan_nodes::TPlan::new(Vec::new()),
+            desc_tbl: DescriptorTableBuilder::new().build(),
+            exec_params,
+            output_sink: build_result_sink(),
+            output_columns,
+            direct_exec: Some(Box::new(DirectExecPlan::UnionAll {
+                inputs: branch_inputs,
+            })),
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+            query_global_dicts: None,
+            query_global_dict_exprs: None,
+        };
+
+        Ok(Some(MultiFragmentBuildResult {
+            fragment_results: vec![fragment],
+            root_fragment_id: 0,
+            edges: Vec::new(),
+            rf_plan: None,
+        }))
     }
 
     fn validate_aggregate_state_merge_layout(
@@ -5187,6 +5309,7 @@ mod tests {
             None,
             shape,
             layout,
+            None,
         )
         .expect("direct aggregate merge build");
         let root = build
@@ -5244,6 +5367,7 @@ mod tests {
             None,
             shape,
             layout,
+            None,
         )
         .expect("direct sum-only aggregate merge build");
         let root = build
@@ -5321,6 +5445,7 @@ mod tests {
             None,
             shape,
             layout,
+            None,
         ) {
             Ok(_) => panic!("distributed child unexpectedly built"),
             Err(err) => err,

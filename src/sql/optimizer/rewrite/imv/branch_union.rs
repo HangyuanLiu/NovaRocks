@@ -2,6 +2,7 @@ use arrow::datatypes::DataType;
 
 use crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN;
 use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
+use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::imv::aggregate_rewrite::build_aggregate_state_merge;
 use crate::sql::optimizer::rewrite::imv::annotation::ImvExtension;
@@ -10,7 +11,7 @@ use crate::sql::optimizer::rewrite::imv::marker::plan_contains_imv_marker;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
-use crate::sql::planner::plan::{LogicalPlan, ProjectNode, UnionNode};
+use crate::sql::planner::plan::{AggregateNode, LogicalPlan, ProjectNode, UnionNode};
 
 pub(crate) struct RewriteBranchUnionRule;
 
@@ -36,10 +37,7 @@ impl LogicalRewriteRule for RewriteBranchUnionRule {
                         delta.input.as_ref(),
                         LogicalPlan::Union(union)
                             if union.all
-                                && union.inputs.iter().all(|branch| matches!(
-                                    branch,
-                                    LogicalPlan::Aggregate(_)
-                                ))
+                                && union.inputs.iter().all(is_branch_union_aggregate_branch)
                                 && !plan_contains_imv_marker(delta.input.as_ref())
                     )
         )
@@ -72,9 +70,9 @@ impl LogicalRewriteRule for RewriteBranchUnionRule {
             required_output_columns,
         } = union;
         for branch in &inputs {
-            if !matches!(branch, LogicalPlan::Aggregate(_)) {
+            if !is_branch_union_aggregate_branch(branch) {
                 return Err(format!(
-                    "Iceberg IMV branch UNION rewrite supports only aggregate branches, got {}",
+                    "Iceberg IMV branch UNION rewrite supports only aggregate or Project-over-Aggregate branches, got {}",
                     plan_kind(branch)
                 ));
             }
@@ -91,12 +89,15 @@ impl LogicalRewriteRule for RewriteBranchUnionRule {
         for (idx, branch) in inputs.into_iter().enumerate() {
             let branch_id = i32::try_from(idx)
                 .map_err(|_| "Iceberg IMV branch UNION branch index overflow".to_string())?;
-            let LogicalPlan::Aggregate(aggregate) = branch else {
-                return Err(format!(
-                    "Iceberg IMV branch UNION rewrite supports only aggregate branches, got {}",
-                    plan_kind(&branch)
-                ));
-            };
+            let branch_kind = plan_kind(&branch);
+            let branch = extract_branch_union_aggregate_branch(branch).ok_or_else(|| {
+                format!(
+                    "Iceberg IMV branch UNION rewrite supports only aggregate or Project-over-Aggregate branches, got {}",
+                    branch_kind
+                )
+            })?;
+            let aggregate = branch.aggregate;
+            let post_project = branch.post_project;
             let merge = build_aggregate_state_merge(
                 aggregate,
                 delta.action_column,
@@ -106,11 +107,20 @@ impl LogicalRewriteRule for RewriteBranchUnionRule {
                 }),
                 &ext,
             )?;
-            rewritten_inputs.push(append_branch_id_project(
-                merge,
-                branch_id,
-                branch_id_column,
-            )?);
+            let rewritten = match post_project {
+                Some(project) => append_branch_id_to_project(
+                    ProjectNode {
+                        input: Box::new(merge),
+                        items: project.items,
+                        output_qualifier: project.output_qualifier,
+                        required_output_columns: None,
+                    },
+                    branch_id,
+                    branch_id_column,
+                ),
+                None => append_branch_id_project(merge, branch_id, branch_id_column),
+            }?;
+            rewritten_inputs.push(rewritten);
         }
 
         Ok(RewriteResult::Changed(LogicalPlan::Union(UnionNode {
@@ -122,10 +132,90 @@ impl LogicalRewriteRule for RewriteBranchUnionRule {
     }
 }
 
+struct BranchUnionAggregateBranch {
+    aggregate: AggregateNode,
+    post_project: Option<BranchUnionAggregateProject>,
+}
+
+struct BranchUnionAggregateProject {
+    items: Vec<ProjectItem>,
+    output_qualifier: Option<String>,
+}
+
+fn is_branch_union_aggregate_branch(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Aggregate(_) => true,
+        LogicalPlan::Project(project) => {
+            matches!(project.input.as_ref(), LogicalPlan::Aggregate(_))
+        }
+        _ => false,
+    }
+}
+
+fn extract_branch_union_aggregate_branch(
+    branch: LogicalPlan,
+) -> Option<BranchUnionAggregateBranch> {
+    match branch {
+        LogicalPlan::Aggregate(aggregate) => Some(BranchUnionAggregateBranch {
+            aggregate,
+            post_project: None,
+        }),
+        LogicalPlan::Project(project) => {
+            let ProjectNode {
+                input,
+                items,
+                output_qualifier,
+                required_output_columns: _,
+            } = project;
+            let LogicalPlan::Aggregate(aggregate) = *input else {
+                return None;
+            };
+            Some(BranchUnionAggregateBranch {
+                aggregate,
+                post_project: Some(BranchUnionAggregateProject {
+                    items,
+                    output_qualifier,
+                }),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn append_branch_id_to_project(
+    mut project: ProjectNode,
+    branch_id: i32,
+    branch_id_column: ColumnId,
+) -> Result<LogicalPlan, String> {
+    project
+        .items
+        .push(branch_id_project_item(branch_id, branch_id_column));
+    Ok(LogicalPlan::Project(project))
+}
+
+fn branch_id_project_item(branch_id: i32, branch_id_column: ColumnId) -> ProjectItem {
+    ProjectItem {
+        expr: TypedExpr {
+            kind: ExprKind::Cast {
+                expr: Box::new(TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::Int(branch_id as i64)),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                }),
+                target: DataType::Int32,
+            },
+            data_type: DataType::Int32,
+            nullable: false,
+        },
+        output_name: ICEBERG_MV_BRANCH_ID_COLUMN.to_string(),
+        output_column_id: branch_id_column,
+    }
+}
+
 fn append_branch_id_project(
     input: LogicalPlan,
     branch_id: i32,
-    branch_id_column: crate::sql::column_id::ColumnId,
+    branch_id_column: ColumnId,
 ) -> Result<LogicalPlan, String> {
     let mut items = plan_output_columns(&input)?
         .into_iter()
@@ -143,22 +233,7 @@ fn append_branch_id_project(
             output_column_id: column.column_id,
         })
         .collect::<Vec<_>>();
-    items.push(ProjectItem {
-        expr: TypedExpr {
-            kind: ExprKind::Cast {
-                expr: Box::new(TypedExpr {
-                    kind: ExprKind::Literal(LiteralValue::Int(branch_id as i64)),
-                    data_type: DataType::Int64,
-                    nullable: false,
-                }),
-                target: DataType::Int32,
-            },
-            data_type: DataType::Int32,
-            nullable: false,
-        },
-        output_name: ICEBERG_MV_BRANCH_ID_COLUMN.to_string(),
-        output_column_id: branch_id_column,
-    });
+    items.push(branch_id_project_item(branch_id, branch_id_column));
     Ok(LogicalPlan::Project(ProjectNode {
         input: Box::new(input),
         items,
@@ -166,10 +241,9 @@ fn append_branch_id_project(
         required_output_columns: None,
     }))
 }
-
 fn branch_union_output_columns(
     mut output_columns: Vec<OutputColumn>,
-    branch_id_column: crate::sql::column_id::ColumnId,
+    branch_id_column: ColumnId,
 ) -> Vec<OutputColumn> {
     output_columns.push(OutputColumn {
         column_id: branch_id_column,
@@ -267,6 +341,48 @@ mod tests {
     }
 
     #[test]
+    fn rewrites_project_over_aggregate_branches_into_branch_scoped_merges() {
+        let rule = RewriteBranchUnionRule;
+        let mut ctx = build_ctx();
+        let plan = root_delta(LogicalPlan::Union(UnionNode {
+            inputs: vec![
+                project_over_aggregate(scan("t1", 1)),
+                project_over_aggregate(scan("t2", 10)),
+            ],
+            all: true,
+            output_columns: vec![output_column(1, "region"), output_column(30, "total")],
+            required_output_columns: None,
+        }));
+
+        assert!(rule.matches(&plan, &ctx));
+        let RewriteResult::Changed(LogicalPlan::Union(union)) =
+            rule.apply(plan, &mut ctx).expect("rewrite")
+        else {
+            panic!("expected Changed(Union)");
+        };
+
+        assert_eq!(union.inputs.len(), 2);
+        for (idx, branch) in union.inputs.iter().enumerate() {
+            let LogicalPlan::Project(project) = branch else {
+                panic!("expected Project branch");
+            };
+            assert!(
+                matches!(project.input.as_ref(), LogicalPlan::AggregateStateMerge(_)),
+                "Project-over-Aggregate branch should be rebased directly onto AggregateStateMerge"
+            );
+            assert!(project.items.iter().any(|item| {
+                item.output_name == "total" && item.output_column_id == ColumnId::new_for_test(30)
+            }));
+            let branch_item = project
+                .items
+                .iter()
+                .find(|item| item.output_name.eq_ignore_ascii_case("__branch_id__"))
+                .expect("branch id item");
+            assert_branch_id_cast(branch_item, idx as i64);
+        }
+    }
+
+    #[test]
     fn rejects_non_aggregate_branch() {
         let rule = RewriteBranchUnionRule;
         let mut ctx = build_ctx();
@@ -281,7 +397,7 @@ mod tests {
             .apply(plan, &mut ctx)
             .expect_err("scan branch must fail");
         assert!(
-            err.contains("supports only aggregate branches"),
+            err.contains("supports only aggregate or Project-over-Aggregate branches"),
             "unexpected error: {err}"
         );
     }
@@ -474,6 +590,26 @@ mod tests {
             }],
             output_columns: vec![output_column(1, "region"), output_column(3, "s")],
             already_pushed: false,
+            required_output_columns: None,
+        })
+    }
+
+    fn project_over_aggregate(input: LogicalPlan) -> LogicalPlan {
+        LogicalPlan::Project(ProjectNode {
+            input: Box::new(aggregate_over(input)),
+            items: vec![
+                ProjectItem {
+                    expr: col_expr(1, "region"),
+                    output_name: "region".to_string(),
+                    output_column_id: ColumnId::new_for_test(1),
+                },
+                ProjectItem {
+                    expr: col_expr(3, "s"),
+                    output_name: "total".to_string(),
+                    output_column_id: ColumnId::new_for_test(30),
+                },
+            ],
+            output_qualifier: None,
             required_output_columns: None,
         })
     }
