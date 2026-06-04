@@ -523,6 +523,12 @@ struct TExecPlanFragmentParams {
   60: optional TPredicateTreeParams pred_tree_params
 
   61: optional list<i32> exec_stats_node_ids;
+
+  62: optional i32 arrow_flight_sql_version;
+
+  // NovaRocks-only standalone coordinator report endpoint. Task 6 wires the
+  // coordinator-provided value.
+  10001: optional Types.TNetworkAddress novarocks_report_addr;
 }
 
 struct TExecPlanFragmentResult {

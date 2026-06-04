@@ -18,7 +18,7 @@
 //! wiring exactly.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::data_sinks;
 use crate::novarocks_logging::debug;
@@ -27,6 +27,9 @@ use crate::planner;
 use crate::runtime::dispatcher::{FetchOutcome, FragmentDispatcher};
 use crate::runtime::exec_params::build_exec_plan_fragment_params;
 use crate::runtime::scheduler::FragmentScheduler;
+use crate::runtime::write_coordinator::{
+    WriteCommitInput, WriteCoordinator, WriterKey, register_query, unregister_query,
+};
 use crate::runtime_filter;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::codegen::{
@@ -174,6 +177,7 @@ impl ExecutionCoordinator {
         // 4. Translate every placement into a fragment params and submit.
         // ---------------------------------------------------------------
         let pipeline_dop = crate::runtime::dispatcher::compute_pipeline_dop();
+        let mut novarocks_report_addr: Option<types::TNetworkAddress> = None;
 
         // Snapshot the per-consumer-fragment instance destinations for CTE
         // multicast sub-sinks (each consumer fans out to all of its instances).
@@ -230,6 +234,7 @@ impl ExecutionCoordinator {
             Vec::new();
         let mut root_submission: Option<(usize, crate::internal_service::TExecPlanFragmentParams)> =
             None;
+        let mut expected_writers = Vec::new();
 
         for (&fragment_id, placements) in &plan.by_fragment {
             let fr = *fr_by_id
@@ -305,6 +310,15 @@ impl ExecutionCoordinator {
                     (output_sink, unpartitioned_partition(), None)
                 };
 
+                let write_report_addr = if data_sink_requires_write_report(&output_sink) {
+                    if novarocks_report_addr.is_none() {
+                        novarocks_report_addr = Some(local_coordinator_report_addr()?);
+                    }
+                    novarocks_report_addr.clone()
+                } else {
+                    None
+                };
+
                 let thrift_fragment = planner::TPlanFragment::new(
                     Some(fr.plan.clone()),
                     None::<Vec<crate::exprs::TExpr>>,
@@ -340,7 +354,19 @@ impl ExecutionCoordinator {
                     query_options.clone(),
                     pipeline_dop,
                     Some(placement.instance_index as i32),
+                    write_report_addr,
                 );
+
+                if is_write_sink(&params) {
+                    let exec = params.params.as_ref().ok_or_else(|| {
+                        "write sink fragment missing exec params in coordinator".to_string()
+                    })?;
+                    expected_writers.push(WriterKey {
+                        query_id: exec.query_id.clone(),
+                        fragment_instance_id: exec.fragment_instance_id.clone(),
+                        backend_num: placement.instance_index as i32,
+                    });
+                }
 
                 if is_root {
                     root_submission = Some((placement.backend_idx, params));
@@ -355,20 +381,41 @@ impl ExecutionCoordinator {
         // Root last: keep prior submission ordering (producers before root).
         submissions.push(root_submission);
 
+        let (write_coordinator, _write_registration) = if expected_writers.is_empty() {
+            (None, None)
+        } else {
+            let write = register_query(query_id.clone(), expected_writers)?;
+            (
+                Some(write),
+                Some(RegisteredWriteCoordinator::new(query_id.clone())),
+            )
+        };
+
         let timeout_ms = query_options
             .as_ref()
             .and_then(|q| q.query_timeout)
             .map(|t| t as i64 * 1000)
             .unwrap_or(300_000); // 5 minute default
 
-        let chunks = submit_and_fetch_loop(
+        let fetch_result = submit_and_fetch_loop(
             &dispatcher,
             &mut tracker,
             submissions,
             plan.root_backend_idx,
             plan.root_finst_id.clone(),
             timeout_ms,
+            write_coordinator.as_ref(),
         )?;
+
+        if let Some(commit) = fetch_result.write_commit.as_ref() {
+            tracing::info!(
+                target: "novarocks::write_coordinator",
+                write_hi = commit.write_id.hi,
+                write_lo = commit.write_id.lo,
+                writers = commit.writers.len(),
+                "write coordinator commit input ready"
+            );
+        }
 
         let root_fragment = fr_by_id
             .get(&root_fragment_id)
@@ -384,7 +431,7 @@ impl ExecutionCoordinator {
                     logical_type: None,
                 })
                 .collect(),
-            chunks,
+            chunks: fetch_result.chunks,
         })
     }
 }
@@ -445,6 +492,47 @@ fn wrap_multi_cast_sink(
     )
 }
 
+fn is_write_sink(params: &crate::internal_service::TExecPlanFragmentParams) -> bool {
+    params
+        .fragment
+        .as_ref()
+        .and_then(|fragment| fragment.output_sink.as_ref())
+        .map(data_sink_requires_write_report)
+        .unwrap_or(false)
+}
+
+fn data_sink_requires_write_report(sink: &data_sinks::TDataSink) -> bool {
+    matches!(
+        sink.type_,
+        data_sinks::TDataSinkType::ICEBERG_TABLE_SINK
+            | data_sinks::TDataSinkType::ICEBERG_DELETE_SINK
+            | data_sinks::TDataSinkType::HIVE_TABLE_SINK
+            | data_sinks::TDataSinkType::OLAP_TABLE_SINK
+    )
+}
+
+struct RegisteredWriteCoordinator {
+    query_id: types::TUniqueId,
+}
+
+impl RegisteredWriteCoordinator {
+    fn new(query_id: types::TUniqueId) -> Self {
+        Self { query_id }
+    }
+}
+
+impl Drop for RegisteredWriteCoordinator {
+    fn drop(&mut self) {
+        unregister_query(&self.query_id);
+    }
+}
+
+fn validate_write_commit_ready(
+    write: &Arc<Mutex<WriteCoordinator>>,
+) -> Result<WriteCommitInput, String> {
+    write.lock().expect("write coordinator lock").commit_input()
+}
+
 /// Convert `backends[idx]` into a `TNetworkAddress`.
 fn backend_to_network_addr(
     backends: &[std::net::SocketAddr],
@@ -459,6 +547,16 @@ fn backend_to_network_addr(
     Ok(types::TNetworkAddress::new(
         addr.ip().to_string(),
         addr.port() as i32,
+    ))
+}
+
+fn local_coordinator_report_addr() -> Result<types::TNetworkAddress, String> {
+    let cfg = crate::novarocks_config::config()
+        .map_err(|e| format!("cannot read coordinator config: {e}"))?;
+    let host = crate::common::network::advertise_host().unwrap_or_else(|_| cfg.server.host.clone());
+    Ok(types::TNetworkAddress::new(
+        host,
+        cfg.server.http_port as i32,
     ))
 }
 
@@ -548,6 +646,35 @@ impl InFlightTracker {
     }
 }
 
+pub(crate) fn poll_write_failure_and_cancel(
+    write: &Arc<Mutex<WriteCoordinator>>,
+    tracker: &InFlightTracker,
+    dispatcher: &dyn FragmentDispatcher,
+) -> Result<(), String> {
+    let reason = {
+        write
+            .lock()
+            .expect("write coordinator lock")
+            .failed_reason()
+    };
+    let Some(reason) = reason else {
+        return Ok(());
+    };
+
+    tracker.cancel_all(dispatcher);
+    write
+        .lock()
+        .expect("write coordinator lock")
+        .mark_canceled_except_finished(reason.clone());
+    Err(reason)
+}
+
+#[derive(Debug)]
+pub(crate) struct SubmitAndFetchResult {
+    pub(crate) chunks: Vec<crate::exec::chunk::Chunk>,
+    pub(crate) write_commit: Option<WriteCommitInput>,
+}
+
 // ---------------------------------------------------------------------------
 // Submit-and-fetch orchestration (testable helper)
 // ---------------------------------------------------------------------------
@@ -564,7 +691,8 @@ pub(crate) fn submit_and_fetch_loop(
     root_backend_idx: usize,
     root_finst_id: types::TUniqueId,
     timeout_ms: i64,
-) -> Result<Vec<crate::exec::chunk::Chunk>, String> {
+    write_coordinator: Option<&Arc<Mutex<WriteCoordinator>>>,
+) -> Result<SubmitAndFetchResult, String> {
     const REMOTE_FETCH_POLL_INTERVAL_MS: i64 = 300;
 
     for (backend_idx, p) in submissions {
@@ -584,6 +712,9 @@ pub(crate) fn submit_and_fetch_loop(
     let timeout = std::time::Duration::from_millis(timeout_ms.max(0) as u64);
     let deadline = std::time::Instant::now() + timeout;
     loop {
+        if let Some(write) = write_coordinator {
+            poll_write_failure_and_cancel(write, tracker, dispatcher.as_ref())?;
+        }
         if crate::runtime::query_cancel::client_disconnected() {
             tracker.cancel_all(dispatcher.as_ref());
             return Err("client disconnected".to_string());
@@ -613,7 +744,124 @@ pub(crate) fn submit_and_fetch_loop(
         }
     }
 
-    Ok(chunks)
+    let write_commit = if let Some(write) = write_coordinator {
+        Some(wait_for_write_commit_ready(
+            write,
+            tracker,
+            dispatcher.as_ref(),
+            deadline,
+            timeout_ms,
+        )?)
+    } else {
+        None
+    };
+
+    Ok(SubmitAndFetchResult {
+        chunks,
+        write_commit,
+    })
+}
+
+fn wait_for_write_commit_ready(
+    write: &Arc<Mutex<WriteCoordinator>>,
+    tracker: &InFlightTracker,
+    dispatcher: &dyn FragmentDispatcher,
+    deadline: std::time::Instant,
+    timeout_ms: i64,
+) -> Result<WriteCommitInput, String> {
+    const WRITE_COMMIT_POLL_INTERVAL_MS: i64 = 10;
+
+    loop {
+        poll_write_failure_and_cancel(write, tracker, dispatcher)?;
+
+        if crate::runtime::query_cancel::client_disconnected() {
+            tracker.cancel_all(dispatcher);
+            return Err("client disconnected".to_string());
+        }
+
+        let commit_error = match validate_write_commit_ready(write) {
+            Ok(commit) => return Ok(commit),
+            Err(e) => e,
+        };
+        #[cfg(test)]
+        notify_write_commit_wait_observer(&commit_error);
+
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            let reason = format!(
+                "query timed out after {timeout_ms} ms waiting for write final reports: {commit_error}"
+            );
+            tracker.cancel_all(dispatcher);
+            write
+                .lock()
+                .expect("write coordinator lock")
+                .mark_canceled_except_finished(reason.clone());
+            return Err(reason);
+        }
+
+        let remaining_ms = deadline
+            .saturating_duration_since(now)
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        let sleep_ms = remaining_ms.clamp(1, WRITE_COMMIT_POLL_INTERVAL_MS);
+        std::thread::sleep(std::time::Duration::from_millis(sleep_ms as u64));
+    }
+}
+
+#[cfg(test)]
+struct WriteCommitWaitObserverGuard;
+
+#[cfg(test)]
+struct WriteCommitWaitObserver {
+    expected_error_substring: String,
+    tx: std::sync::mpsc::Sender<String>,
+}
+
+#[cfg(test)]
+impl Drop for WriteCommitWaitObserverGuard {
+    fn drop(&mut self) {
+        *write_commit_wait_observer()
+            .lock()
+            .expect("write commit wait observer lock") = None;
+    }
+}
+
+#[cfg(test)]
+fn write_commit_wait_observer() -> &'static Mutex<Option<WriteCommitWaitObserver>> {
+    static OBSERVER: std::sync::OnceLock<Mutex<Option<WriteCommitWaitObserver>>> =
+        std::sync::OnceLock::new();
+    OBSERVER.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn set_write_commit_wait_observer(
+    expected_error_substring: impl Into<String>,
+    tx: std::sync::mpsc::Sender<String>,
+) -> WriteCommitWaitObserverGuard {
+    let mut observer = write_commit_wait_observer()
+        .lock()
+        .expect("write commit wait observer lock");
+    assert!(
+        observer.is_none(),
+        "write commit wait observer already registered"
+    );
+    *observer = Some(WriteCommitWaitObserver {
+        expected_error_substring: expected_error_substring.into(),
+        tx,
+    });
+    WriteCommitWaitObserverGuard
+}
+
+#[cfg(test)]
+fn notify_write_commit_wait_observer(commit_error: &str) {
+    let observer = write_commit_wait_observer()
+        .lock()
+        .expect("write commit wait observer lock");
+    if let Some(observer) = observer.as_ref()
+        && commit_error.contains(&observer.expected_error_substring)
+    {
+        let _ = observer.tx.send(commit_error.to_string());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -628,6 +876,10 @@ mod tests {
 
     use super::*;
     use crate::runtime::dispatcher::{FetchOutcome, FragmentDispatcher};
+    use crate::runtime::write_coordinator::{
+        FragmentExecStatusReport, WriteCoordinator, WriterKey, write_registry_test_guard,
+    };
+    use crate::{status, status_code};
 
     // -----------------------------------------------------------------------
     // Simple mock (all-success, Eof on fetch)
@@ -770,6 +1022,12 @@ mod tests {
         fetch_count: AtomicUsize,
     }
 
+    struct EofSignalDispatcher {
+        submitted: Mutex<Vec<types::TUniqueId>>,
+        cancelled: Mutex<Vec<types::TUniqueId>>,
+        eof_tx: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    }
+
     impl RecordingWaitDispatcher {
         fn new() -> Arc<Self> {
             Arc::new(Self {
@@ -781,6 +1039,20 @@ mod tests {
 
         fn fetch_waits_ms(&self) -> Vec<i64> {
             self.fetch_waits_ms.lock().unwrap().clone()
+        }
+    }
+
+    impl EofSignalDispatcher {
+        fn new(eof_tx: std::sync::mpsc::Sender<()>) -> Arc<Self> {
+            Arc::new(Self {
+                submitted: Mutex::new(Vec::new()),
+                cancelled: Mutex::new(Vec::new()),
+                eof_tx: Mutex::new(Some(eof_tx)),
+            })
+        }
+
+        fn cancelled_ids(&self) -> Vec<types::TUniqueId> {
+            self.cancelled.lock().unwrap().clone()
         }
     }
 
@@ -861,6 +1133,44 @@ mod tests {
         }
 
         fn cancel_fragments(&self, _backend_idx: usize, _finst_ids: &[types::TUniqueId]) {}
+
+        fn backend_count(&self) -> usize {
+            1
+        }
+    }
+
+    impl FragmentDispatcher for EofSignalDispatcher {
+        fn submit_fragment(
+            &self,
+            _backend_idx: usize,
+            params: crate::internal_service::TExecPlanFragmentParams,
+        ) -> Result<(), String> {
+            let finst_id = params
+                .params
+                .as_ref()
+                .map(|ep| {
+                    types::TUniqueId::new(ep.fragment_instance_id.hi, ep.fragment_instance_id.lo)
+                })
+                .unwrap_or_else(|| types::TUniqueId::new(0, 0));
+            self.submitted.lock().unwrap().push(finst_id);
+            Ok(())
+        }
+
+        fn fetch_result(
+            &self,
+            _backend_idx: usize,
+            _finst_id: types::TUniqueId,
+            _max_wait_ms: i64,
+        ) -> Result<FetchOutcome, String> {
+            if let Some(tx) = self.eof_tx.lock().unwrap().take() {
+                tx.send(()).expect("signal root EOF");
+            }
+            Ok(FetchOutcome::Eof)
+        }
+
+        fn cancel_fragments(&self, _backend_idx: usize, finst_ids: &[types::TUniqueId]) {
+            self.cancelled.lock().unwrap().extend_from_slice(finst_ids);
+        }
 
         fn backend_count(&self) -> usize {
             1
@@ -959,7 +1269,92 @@ mod tests {
             None::<i32>,
             None::<internal_service::TPredicateTreeParams>,
             None::<Vec<i32>>,
+            None::<i32>,
+            None::<types::TNetworkAddress>,
         )
+    }
+
+    fn make_params_with_sink_type(
+        sink_type: data_sinks::TDataSinkType,
+    ) -> crate::internal_service::TExecPlanFragmentParams {
+        let mut params = make_params_with_finst(30, 40);
+        params
+            .fragment
+            .as_mut()
+            .expect("fragment")
+            .output_sink
+            .as_mut()
+            .expect("output sink")
+            .type_ = sink_type;
+        params
+    }
+
+    fn is_write_sink_for_test(params: &crate::internal_service::TExecPlanFragmentParams) -> bool {
+        super::is_write_sink(params)
+    }
+
+    fn id(hi: i64, lo: i64) -> types::TUniqueId {
+        types::TUniqueId::new(hi, lo)
+    }
+
+    fn writer_key(
+        query_hi: i64,
+        query_lo: i64,
+        finst_hi: i64,
+        finst_lo: i64,
+        backend_num: i32,
+    ) -> WriterKey {
+        WriterKey {
+            query_id: id(query_hi, query_lo),
+            fragment_instance_id: id(finst_hi, finst_lo),
+            backend_num,
+        }
+    }
+
+    fn ok_status() -> status::TStatus {
+        status::TStatus::new(status_code::TStatusCode::OK, None)
+    }
+
+    fn err_status(msg: &str) -> status::TStatus {
+        status::TStatus::new(
+            status_code::TStatusCode::INTERNAL_ERROR,
+            Some(vec![msg.to_string()]),
+        )
+    }
+
+    fn write_report(
+        writer: &WriterKey,
+        done: bool,
+        status: status::TStatus,
+        path: &str,
+    ) -> FragmentExecStatusReport {
+        let sink_commit_infos = if path.is_empty() {
+            Vec::new()
+        } else {
+            vec![types::TSinkCommitInfo {
+                iceberg_data_file: Some(types::TIcebergDataFile {
+                    path: Some(path.to_string()),
+                    record_count: Some(3),
+                    file_size_in_bytes: Some(30),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]
+        };
+        FragmentExecStatusReport {
+            query_id: writer.query_id.clone(),
+            fragment_instance_id: writer.fragment_instance_id.clone(),
+            backend_num: writer.backend_num,
+            done,
+            status,
+            sink_commit_infos,
+            tablet_commit_infos: Vec::new(),
+            tablet_fail_infos: Vec::new(),
+            load_counters: Default::default(),
+            loaded_rows: 3,
+            loaded_bytes: 30,
+            filtered_rows: 0,
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1081,6 +1476,283 @@ mod tests {
         assert_eq!(backend1.1.len(), 2, "backend 1 cancels 2 instances");
     }
 
+    #[test]
+    fn write_sink_detection_marks_supported_write_sinks() {
+        for sink_type in [
+            data_sinks::TDataSinkType::ICEBERG_TABLE_SINK,
+            data_sinks::TDataSinkType::ICEBERG_DELETE_SINK,
+            data_sinks::TDataSinkType::HIVE_TABLE_SINK,
+            data_sinks::TDataSinkType::OLAP_TABLE_SINK,
+        ] {
+            let params = make_params_with_sink_type(sink_type);
+            assert!(
+                is_write_sink_for_test(&params),
+                "{sink_type:?} must register with the write coordinator"
+            );
+        }
+
+        for sink_type in [
+            data_sinks::TDataSinkType::NOOP_SINK,
+            data_sinks::TDataSinkType::RESULT_SINK,
+            data_sinks::TDataSinkType::DATA_STREAM_SINK,
+        ] {
+            let params = make_params_with_sink_type(sink_type);
+            assert!(
+                !is_write_sink_for_test(&params),
+                "{sink_type:?} must not register with the write coordinator"
+            );
+        }
+    }
+
+    #[test]
+    fn write_failure_seen_by_coordinator_cancels_inflight_fragments() {
+        let mut guard = write_registry_test_guard();
+        let query_id = id(710, 711);
+        let writer = writer_key(710, 711, 712, 713, 0);
+        let write = guard
+            .register_query(query_id.clone(), vec![writer.clone()])
+            .expect("register writer");
+
+        write
+            .lock()
+            .expect("write coordinator lock")
+            .apply_report(write_report(&writer, true, err_status("writer failed"), ""))
+            .expect("failed writer report");
+
+        let dispatcher = RecordingCancelDispatcher::new();
+        let mut tracker = InFlightTracker::default();
+        let submitted = id(710, 900);
+        tracker.record_submitted(0, submitted.clone());
+
+        let err = poll_write_failure_and_cancel(&write, &tracker, dispatcher.as_ref())
+            .expect_err("writer failure must propagate");
+
+        assert!(err.contains("writer failed"), "{err}");
+        let cancels = dispatcher.cancels.lock().unwrap();
+        assert_eq!(cancels.len(), 1, "writer failure cancels submitted work");
+        assert_eq!(cancels[0].0, 0);
+        assert_eq!(cancels[0].1, vec![submitted]);
+        let commit_err = write
+            .lock()
+            .expect("write coordinator lock")
+            .commit_input()
+            .expect_err("failed writer must block commit");
+        assert!(commit_err.contains("writer failed"), "{commit_err}");
+    }
+
+    #[test]
+    fn write_commit_readiness_helper_accepts_finished_writers() {
+        let query_id = id(720, 721);
+        let writer = writer_key(720, 721, 722, 723, 0);
+        let write = Arc::new(Mutex::new(
+            WriteCoordinator::new(query_id.clone(), vec![writer.clone()])
+                .expect("write coordinator"),
+        ));
+        write
+            .lock()
+            .expect("write coordinator lock")
+            .apply_report(write_report(
+                &writer,
+                true,
+                ok_status(),
+                "s3://warehouse/data.parquet",
+            ))
+            .expect("writer report");
+
+        let commit = validate_write_commit_ready(&write).expect("commit input");
+
+        assert_eq!(commit.write_id, query_id);
+        assert_eq!(commit.writers.len(), 1);
+        assert_eq!(commit.writers[0].writer_key, writer);
+    }
+
+    #[test]
+    fn write_commit_readiness_helper_rejects_missing_final_report() {
+        let query_id = id(730, 731);
+        let writer = writer_key(730, 731, 732, 733, 0);
+        let write = Arc::new(Mutex::new(
+            WriteCoordinator::new(query_id, vec![writer]).expect("write coordinator"),
+        ));
+
+        let err = validate_write_commit_ready(&write)
+            .expect_err("missing writer final report must block commit readiness");
+
+        assert!(err.contains("missing writer final report"), "{err}");
+    }
+
+    #[test]
+    fn delayed_write_final_report_after_root_eof_is_accepted() {
+        let query_id = id(740, 741);
+        let writer = writer_key(740, 741, 742, 743, 0);
+        let write = Arc::new(Mutex::new(
+            WriteCoordinator::new(query_id, vec![writer.clone()]).expect("write coordinator"),
+        ));
+        let (eof_tx, eof_rx) = std::sync::mpsc::channel();
+        let inner = EofSignalDispatcher::new(eof_tx);
+        let dispatcher: Arc<dyn FragmentDispatcher> = inner;
+        let write_for_report = Arc::clone(&write);
+        let writer_for_report = writer.clone();
+        let report_thread = std::thread::spawn(move || {
+            eof_rx.recv().expect("root EOF signal");
+            write_for_report
+                .lock()
+                .expect("write coordinator lock")
+                .apply_report(write_report(
+                    &writer_for_report,
+                    true,
+                    ok_status(),
+                    "s3://warehouse/delayed.parquet",
+                ))
+                .expect("delayed writer report");
+        });
+
+        let root_finst_id = types::TUniqueId::new(740, 1);
+        let params = single_backend(vec![
+            make_params_with_finst(740, 10),
+            make_params_with_finst(740, 1),
+        ]);
+        let mut tracker = InFlightTracker::default();
+        let result = submit_and_fetch_loop(
+            &dispatcher,
+            &mut tracker,
+            params,
+            0,
+            root_finst_id,
+            1_000,
+            Some(&write),
+        );
+
+        report_thread.join().expect("delayed report thread");
+        assert!(
+            result.is_ok(),
+            "delayed writer final report after root EOF must be accepted, got {result:?}"
+        );
+        let output = result.expect("delayed final report succeeds");
+        assert!(output.chunks.is_empty());
+        assert!(output.write_commit.is_some());
+    }
+
+    #[test]
+    fn write_failure_during_post_eof_wait_cancels_submitted_fragments() {
+        let query_id = id(760, 761);
+        let writer = writer_key(760, 761, 762, 763, 0);
+        let write = Arc::new(Mutex::new(
+            WriteCoordinator::new(query_id.clone(), vec![writer.clone()])
+                .expect("write coordinator"),
+        ));
+        let (eof_tx, _eof_rx) = std::sync::mpsc::channel();
+        let inner = EofSignalDispatcher::new(eof_tx);
+        let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
+        let (wait_tx, wait_rx) = std::sync::mpsc::channel();
+        let _wait_observer = set_write_commit_wait_observer(
+            format!("query={}/{}", query_id.hi, query_id.lo),
+            wait_tx,
+        );
+        let write_for_report = Arc::clone(&write);
+        let writer_for_report = writer.clone();
+        let report_thread = std::thread::spawn(move || {
+            let wait_error = wait_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("post-EOF write wait signal");
+            assert!(
+                wait_error.contains("missing writer final report"),
+                "{wait_error}"
+            );
+            write_for_report
+                .lock()
+                .expect("write coordinator lock")
+                .apply_report(write_report(
+                    &writer_for_report,
+                    true,
+                    err_status("delayed writer failure"),
+                    "",
+                ))
+                .expect("delayed writer failure report");
+        });
+
+        let root_finst_id = types::TUniqueId::new(760, 1);
+        let params = single_backend(vec![
+            make_params_with_finst(760, 10),
+            make_params_with_finst(760, 1),
+        ]);
+        let mut tracker = InFlightTracker::default();
+        let err = submit_and_fetch_loop(
+            &dispatcher,
+            &mut tracker,
+            params,
+            0,
+            root_finst_id,
+            1_000,
+            Some(&write),
+        )
+        .expect_err("writer failure during post-EOF wait must fail query");
+
+        report_thread.join().expect("delayed report thread");
+        assert!(err.contains("delayed writer failure"), "{err}");
+        assert_eq!(
+            inner.cancelled_ids(),
+            vec![
+                types::TUniqueId::new(760, 10),
+                types::TUniqueId::new(760, 1)
+            ],
+            "post-EOF writer failure must cancel all submitted fragments"
+        );
+        let commit_err = write
+            .lock()
+            .expect("write coordinator lock")
+            .commit_input()
+            .expect_err("failed writer must block commit");
+        assert!(
+            commit_err.contains("delayed writer failure"),
+            "{commit_err}"
+        );
+    }
+
+    #[test]
+    fn missing_write_final_report_after_root_eof_times_out_and_cancels() {
+        let query_id = id(750, 751);
+        let writer = writer_key(750, 751, 752, 753, 0);
+        let write = Arc::new(Mutex::new(
+            WriteCoordinator::new(query_id, vec![writer.clone()]).expect("write coordinator"),
+        ));
+        let inner = ControllableDispatcher::succeeds_always_eof();
+        let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
+        let root_finst_id = types::TUniqueId::new(750, 1);
+        let params = single_backend(vec![
+            make_params_with_finst(750, 10),
+            make_params_with_finst(750, 1),
+        ]);
+        let mut tracker = InFlightTracker::default();
+
+        let err = submit_and_fetch_loop(
+            &dispatcher,
+            &mut tracker,
+            params,
+            0,
+            root_finst_id,
+            25,
+            Some(&write),
+        )
+        .expect_err("missing writer final report after EOF must time out");
+
+        assert!(err.contains("timed out"), "{err}");
+        assert!(err.contains("missing writer final report"), "{err}");
+        let cancelled = inner.cancelled_ids();
+        assert_eq!(
+            cancelled.len(),
+            2,
+            "missing final report timeout must cancel all submitted fragments"
+        );
+        let abort = write
+            .lock()
+            .expect("write coordinator lock")
+            .abort_input()
+            .expect("missing final report timeout must create abort input");
+        assert!(abort.reason.contains("timed out"), "{}", abort.reason);
+        assert_eq!(abort.completed_writer_outputs.len(), 0);
+        assert_eq!(abort.incomplete_writers, vec![writer]);
+    }
+
     // -----------------------------------------------------------------------
     // I4: submit_and_fetch_loop orchestration tests
     // -----------------------------------------------------------------------
@@ -1097,11 +1769,25 @@ mod tests {
             make_params_with_finst(1, 1),
         ]);
         let mut tracker = InFlightTracker::default();
-        let result =
-            submit_and_fetch_loop(&dispatcher, &mut tracker, params, 0, root_finst_id, 100);
+        let result = submit_and_fetch_loop(
+            &dispatcher,
+            &mut tracker,
+            params,
+            0,
+            root_finst_id,
+            100,
+            None,
+        );
         assert!(result.is_ok(), "expected Ok, got {result:?}");
-        let chunks = result.unwrap();
-        assert!(chunks.is_empty(), "expected no chunks from Eof dispatcher");
+        let output = result.unwrap();
+        assert!(
+            output.chunks.is_empty(),
+            "expected no chunks from Eof dispatcher"
+        );
+        assert!(
+            output.write_commit.is_none(),
+            "non-write query should not produce write commit input"
+        );
         assert_eq!(
             inner.submitted_ids().len(),
             2,
@@ -1121,8 +1807,15 @@ mod tests {
             make_params_with_finst(2, 1),
         ]);
         let mut tracker = InFlightTracker::default();
-        let result =
-            submit_and_fetch_loop(&dispatcher, &mut tracker, params, 0, root_finst_id, 100);
+        let result = submit_and_fetch_loop(
+            &dispatcher,
+            &mut tracker,
+            params,
+            0,
+            root_finst_id,
+            100,
+            None,
+        );
         assert!(result.is_err(), "expected Err on submit failure");
         let submitted = inner.submitted_ids();
         assert_eq!(
@@ -1154,8 +1847,15 @@ mod tests {
             make_params_with_finst(3, 1),
         ]);
         let mut tracker = InFlightTracker::default();
-        let result =
-            submit_and_fetch_loop(&dispatcher, &mut tracker, params, 0, root_finst_id, 100);
+        let result = submit_and_fetch_loop(
+            &dispatcher,
+            &mut tracker,
+            params,
+            0,
+            root_finst_id,
+            100,
+            None,
+        );
         assert!(result.is_err(), "expected Err on fetch error");
         let err = result.unwrap_err();
         assert!(
@@ -1186,7 +1886,15 @@ mod tests {
             make_params_with_finst(4, 1),
         ]);
         let mut tracker = InFlightTracker::default();
-        let result = submit_and_fetch_loop(&dispatcher, &mut tracker, params, 0, root_finst_id, 10);
+        let result = submit_and_fetch_loop(
+            &dispatcher,
+            &mut tracker,
+            params,
+            0,
+            root_finst_id,
+            10,
+            None,
+        );
         assert!(result.is_err(), "expected timeout error");
         let err = result.unwrap_err();
         assert!(
@@ -1216,8 +1924,15 @@ mod tests {
         ]);
 
         let mut tracker = InFlightTracker::default();
-        let result =
-            submit_and_fetch_loop(&dispatcher, &mut tracker, params, 0, root_finst_id, 300_000);
+        let result = submit_and_fetch_loop(
+            &dispatcher,
+            &mut tracker,
+            params,
+            0,
+            root_finst_id,
+            300_000,
+            None,
+        );
 
         assert!(result.is_ok(), "expected fetch loop to finish after Eof");
         let waits = inner.fetch_waits_ms();
@@ -1246,7 +1961,15 @@ mod tests {
         let result =
             crate::runtime::query_cancel::with_client_disconnect_signal(disconnected, || {
                 let mut tracker = InFlightTracker::default();
-                submit_and_fetch_loop(&dispatcher, &mut tracker, params, 0, root_finst_id, 100)
+                submit_and_fetch_loop(
+                    &dispatcher,
+                    &mut tracker,
+                    params,
+                    0,
+                    root_finst_id,
+                    100,
+                    None,
+                )
             });
 
         let err = result.expect_err("expected client disconnect error");

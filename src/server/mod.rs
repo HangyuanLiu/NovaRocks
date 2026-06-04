@@ -65,10 +65,42 @@ struct ResolvedStandaloneServerOptions {
     /// Pre-loaded config to pass directly to engine open, bypassing a second
     /// disk read.  `None` falls back to the legacy disk/env load path.
     preloaded_config: Option<NovaRocksConfig>,
-    /// Whether to start the local gRPC/exchange server.
-    /// `true` for all-in-one (exchange runs in-process); `false` for role=fe
-    /// (all fragments execute on the remote BE, no local exchange needed).
-    start_grpc_exchange: bool,
+    /// Whether this process may execute local fragments that need the exchange
+    /// registry.
+    start_local_exchange_execution: bool,
+    /// Whether this process should expose the NovaRocksGrpc endpoint that can
+    /// receive standalone coordinator reports.
+    start_coordinator_report_grpc: bool,
+    /// Host to bind the standalone NovaRocksGrpc report/exchange endpoint on.
+    grpc_bind_host: String,
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct TestResolvedServerOptions {
+    pub(crate) start_local_exchange_execution: bool,
+    pub(crate) start_coordinator_report_grpc: bool,
+    pub(crate) grpc_bind_host: String,
+}
+
+#[cfg(test)]
+pub(crate) fn test_resolve_fe_server_options(
+    cfg: NovaRocksConfig,
+    port_override: Option<u16>,
+) -> Result<TestResolvedServerOptions, String> {
+    let resolved = resolve_server_options_from_config(&cfg, port_override)?;
+    let resolved = ResolvedStandaloneServerOptions {
+        config_path: None,
+        preloaded_config: Some(cfg),
+        start_local_exchange_execution: false,
+        start_coordinator_report_grpc: true,
+        ..resolved
+    };
+    Ok(TestResolvedServerOptions {
+        start_local_exchange_execution: resolved.start_local_exchange_execution,
+        start_coordinator_report_grpc: resolved.start_coordinator_report_grpc,
+        grpc_bind_host: resolved.grpc_bind_host,
+    })
 }
 
 /// Legacy standalone server entrypoint that loads config from disk/env inside
@@ -89,7 +121,8 @@ pub fn run_standalone_server(opts: StandaloneServerOptions) -> Result<(), String
 /// resolving relative paths (e.g. SQLite metadata DB paths); pass `None` to
 /// use built-in path defaults.
 ///
-/// This variant starts the local gRPC/exchange server (all-in-one mode).
+/// This variant starts local exchange execution and the coordinator report
+/// gRPC endpoint (all-in-one mode).
 /// For `role=fe` use [`run_standalone_fe_server_with_config`] instead.
 pub fn run_standalone_server_with_config(
     cfg: NovaRocksConfig,
@@ -100,7 +133,8 @@ pub fn run_standalone_server_with_config(
     let resolved = ResolvedStandaloneServerOptions {
         config_path,
         preloaded_config: Some(cfg),
-        start_grpc_exchange: true,
+        start_local_exchange_execution: true,
+        start_coordinator_report_grpc: true,
         ..resolved
     };
     run_with_resolved_options(resolved)
@@ -108,10 +142,11 @@ pub fn run_standalone_server_with_config(
 
 /// Run the standalone server for `role=fe`.
 ///
-/// Identical to [`run_standalone_server_with_config`] except the local
-/// gRPC/exchange server is **not** started.  In role=fe all fragments
-/// (including root) run on the remote BE; the FE only runs MySQL, the
-/// optimizer, and the coordinator which uses `RemoteDispatcher`.
+/// Identical to [`run_standalone_server_with_config`] except local fragment
+/// exchange execution is disabled.  In role=fe all fragments (including root)
+/// run on the remote BE; the FE only runs MySQL, the optimizer, the
+/// `RemoteDispatcher` coordinator, and the report-capable NovaRocksGrpc
+/// endpoint.
 pub fn run_standalone_fe_server_with_config(
     cfg: NovaRocksConfig,
     config_path: Option<PathBuf>,
@@ -121,7 +156,8 @@ pub fn run_standalone_fe_server_with_config(
     let resolved = ResolvedStandaloneServerOptions {
         config_path,
         preloaded_config: Some(cfg),
-        start_grpc_exchange: false,
+        start_local_exchange_execution: false,
+        start_coordinator_report_grpc: true,
         ..resolved
     };
     run_with_resolved_options(resolved)
@@ -151,7 +187,9 @@ fn run_with_resolved_options(resolved: ResolvedStandaloneServerOptions) -> Resul
         engine,
         resolved.mysql_port,
         resolved.user.clone(),
-        resolved.start_grpc_exchange,
+        resolved.grpc_bind_host.clone(),
+        resolved.start_local_exchange_execution,
+        resolved.start_coordinator_report_grpc,
     ))
 }
 
@@ -161,6 +199,10 @@ fn resolve_server_options(
     let active_config_path = resolve_active_config_path(opts.config_path.as_deref());
     let file_cfg = load_active_config(active_config_path.as_deref())?;
     let standalone = file_cfg.as_ref().and_then(|c| c.standalone_server.as_ref());
+    let grpc_bind_host = file_cfg
+        .as_ref()
+        .map(|cfg| cfg.server.host.clone())
+        .unwrap_or_else(|| NovaRocksConfig::default().server.host);
     let (mysql_port, user, refresh_coordinator) =
         extract_server_settings(standalone, opts.mysql_port)?;
     Ok(ResolvedStandaloneServerOptions {
@@ -169,7 +211,9 @@ fn resolve_server_options(
         user,
         refresh_coordinator,
         preloaded_config: None,
-        start_grpc_exchange: true,
+        start_local_exchange_execution: true,
+        start_coordinator_report_grpc: true,
+        grpc_bind_host,
     })
 }
 
@@ -223,8 +267,10 @@ fn resolve_server_options_from_config(
         user,
         refresh_coordinator,
         preloaded_config: None,
-        // Callers override this; default to true (all-in-one exchange server).
-        start_grpc_exchange: true,
+        // Callers may override these; default to all-in-one behavior.
+        start_local_exchange_execution: true,
+        start_coordinator_report_grpc: true,
+        grpc_bind_host: cfg.server.host.clone(),
     })
 }
 
@@ -241,25 +287,37 @@ async fn serve_forever(
     engine: StandaloneNovaRocks,
     mysql_port: u16,
     user: String,
-    start_grpc_exchange: bool,
+    grpc_bind_host: String,
+    start_local_exchange_execution: bool,
+    start_coordinator_report_grpc: bool,
 ) -> Result<(), String> {
-    // Start gRPC exchange server for multi-fragment CTE execution in all-in-one
-    // mode.  Skipped for role=fe because all fragments run on the remote BE;
-    // the FE does not need a local exchange registry.
-    if start_grpc_exchange {
+    // Start the shared NovaRocksGrpc endpoint. It handles local exchange in
+    // all-in-one mode and standalone write reports in role=fe coordinator mode.
+    if start_local_exchange_execution || start_coordinator_report_grpc {
         let grpc_port = crate::common::config::http_port();
-        match crate::service::grpc_server::start_grpc_exchange_server("127.0.0.1", grpc_port) {
+        let start_result = if start_local_exchange_execution {
+            crate::service::grpc_server::start_grpc_exchange_server(&grpc_bind_host, grpc_port)
+        } else {
+            crate::service::grpc_server::start_grpc_report_server(&grpc_bind_host, grpc_port)
+        };
+        match start_result {
             Ok(()) => {
                 info!(
-                    "standalone grpc exchange server started on 127.0.0.1:{}",
-                    grpc_port
+                    "standalone coordinator grpc report/exchange endpoint started on {}:{}",
+                    grpc_bind_host, grpc_port
                 );
+            }
+            Err(e) if start_coordinator_report_grpc => {
+                return Err(format!(
+                    "failed to start required standalone coordinator grpc report/exchange endpoint on {}:{}: {}",
+                    grpc_bind_host, grpc_port, e
+                ));
             }
             Err(e) => {
                 warn!(
-                    "failed to start standalone grpc exchange server on port {}: {} \
-                     (multi-fragment CTE queries will not work)",
-                    grpc_port, e
+                    "failed to start standalone coordinator grpc report/exchange endpoint on {}:{}: {} \
+                     (standalone writer reports and local multi-fragment exchange may not work)",
+                    grpc_bind_host, grpc_port, e
                 );
             }
         }
@@ -1685,6 +1743,28 @@ mod tests {
             resolved.mysql_port, DEFAULT_MYSQL_PORT,
             "default port when no [standalone_server] section"
         );
+    }
+
+    #[test]
+    fn role_fe_server_options_start_report_endpoint_without_local_exchange_execution() {
+        let mut cfg = NovaRocksConfig::default();
+        cfg.cluster.role = crate::common::app_config::ClusterRole::Fe;
+        cfg.cluster.backends = vec!["127.0.0.1:19070".to_string()];
+
+        let opts = test_resolve_fe_server_options(cfg, None).expect("resolve role=fe options");
+        assert!(opts.start_coordinator_report_grpc);
+        assert!(!opts.start_local_exchange_execution);
+    }
+
+    #[test]
+    fn role_fe_server_options_use_configured_grpc_bind_host() {
+        let mut cfg = NovaRocksConfig::default();
+        cfg.server.host = "0.0.0.0".to_string();
+        cfg.cluster.role = crate::common::app_config::ClusterRole::Fe;
+        cfg.cluster.backends = vec!["127.0.0.1:19070".to_string()];
+
+        let opts = test_resolve_fe_server_options(cfg, None).expect("resolve role=fe options");
+        assert_eq!(opts.grpc_bind_host, "0.0.0.0");
     }
 
     #[test]

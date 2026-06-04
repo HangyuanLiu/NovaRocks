@@ -45,6 +45,9 @@ use crate::service::{load_tracking_http, stream_load_http};
 pub use crate::service::grpc_proto as proto;
 
 const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const REPORT_EXEC_STATUS_OK: i32 = 0;
+pub(crate) const REPORT_EXEC_STATUS_ERROR: i32 = 1;
+pub(crate) const REPORT_EXEC_STATUS_QUERY_GONE: i32 = 2;
 static SUBMIT_FRAGMENT_CALLS: AtomicUsize = AtomicUsize::new(0);
 static FETCH_RESULT_CALLS: AtomicUsize = AtomicUsize::new(0);
 static CANCEL_FRAGMENT_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -62,8 +65,40 @@ fn grpc_server_state() -> &'static Mutex<GrpcServerState> {
     STATE.get_or_init(|| Mutex::new(GrpcServerState::default()))
 }
 
-#[derive(Default)]
-pub struct GrpcService;
+#[derive(Clone, Debug)]
+pub struct GrpcService {
+    allow_local_execution: bool,
+}
+
+impl Default for GrpcService {
+    fn default() -> Self {
+        Self::full_execution()
+    }
+}
+
+impl GrpcService {
+    pub fn full_execution() -> Self {
+        Self {
+            allow_local_execution: true,
+        }
+    }
+
+    pub fn report_only() -> Self {
+        Self {
+            allow_local_execution: false,
+        }
+    }
+
+    fn require_local_execution(&self, rpc_name: &str) -> Result<(), tonic::Status> {
+        if self.allow_local_execution {
+            Ok(())
+        } else {
+            Err(tonic::Status::failed_precondition(format!(
+                "report-only NovaRocksGrpc endpoint rejects local execution RPC: {rpc_name}"
+            )))
+        }
+    }
+}
 
 #[tonic::async_trait]
 impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
@@ -82,6 +117,7 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
     ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
         use crate::novarocks_logging::debug;
 
+        self.require_local_execution("Exchange")?;
         let mut inbound = request.into_inner();
         let (tx, rx) = tokio::sync::mpsc::channel::<
             Result<proto::novarocks::ExchangeResponse, tonic::Status>,
@@ -180,6 +216,7 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         &self,
         request: tonic::Request<proto::novarocks::ExchangeRequest>,
     ) -> Result<tonic::Response<proto::novarocks::ExchangeResponse>, tonic::Status> {
+        self.require_local_execution("ExchangeUnary")?;
         let req = request.into_inner();
         let params = proto::starrocks::PTransmitChunkParams {
             finst_id: Some(proto::starrocks::PUniqueId {
@@ -219,6 +256,7 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         request: tonic::Request<proto::starrocks::PTransmitRuntimeFilterParams>,
     ) -> Result<tonic::Response<proto::starrocks::PTransmitRuntimeFilterResult>, tonic::Status>
     {
+        self.require_local_execution("TransmitRuntimeFilter")?;
         Ok(tonic::Response::new(
             internal_rpc::handle_transmit_runtime_filter(request.into_inner()),
         ))
@@ -228,6 +266,7 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         &self,
         request: tonic::Request<proto::starrocks::PLookUpRequest>,
     ) -> Result<tonic::Response<proto::starrocks::PLookUpResponse>, tonic::Status> {
+        self.require_local_execution("Lookup")?;
         Ok(tonic::Response::new(internal_rpc::handle_lookup(
             request.into_inner(),
         )))
@@ -237,6 +276,7 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         &self,
         request: tonic::Request<proto::novarocks::SubmitFragmentRequest>,
     ) -> Result<tonic::Response<proto::novarocks::SubmitFragmentResponse>, tonic::Status> {
+        self.require_local_execution("SubmitFragment")?;
         let call_index = SUBMIT_FRAGMENT_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
         if crate::common::config::debug_fault_inject_submit_fail_after()
             .is_some_and(|successes| call_index > successes)
@@ -276,6 +316,7 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
     ) -> Result<tonic::Response<proto::novarocks::FetchResultResponse>, tonic::Status> {
         use proto::novarocks::fetch_result_response::Status as FetchStatus;
 
+        self.require_local_execution("FetchResult")?;
         let req = request.into_inner();
         let finst_id = match req.finst_id {
             Some(id) => crate::UniqueId {
@@ -353,6 +394,7 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         &self,
         request: tonic::Request<proto::novarocks::CancelFragmentRequest>,
     ) -> Result<tonic::Response<proto::novarocks::CancelFragmentResponse>, tonic::Status> {
+        self.require_local_execution("CancelFragment")?;
         let req = request.into_inner();
         for id in &req.finst_ids {
             crate::cancel(crate::UniqueId {
@@ -373,6 +415,85 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         Ok(tonic::Response::new(
             proto::novarocks::CancelFragmentResponse { status_code: 0 },
         ))
+    }
+
+    async fn report_exec_status(
+        &self,
+        request: tonic::Request<proto::novarocks::ReportExecStatusRequest>,
+    ) -> Result<tonic::Response<proto::novarocks::ReportExecStatusResponse>, tonic::Status> {
+        let bytes = request.into_inner().report_exec_status_params_thrift;
+        let result = tokio::task::spawn_blocking(move || {
+            let params: crate::frontend_service::TReportExecStatusParams =
+                crate::common::thrift::thrift_binary_deserialize(&bytes).map_err(|e| {
+                    format!("failed to deserialize TReportExecStatusParams thrift: {e}")
+                })?;
+            crate::runtime::write_coordinator::handle_report_exec_status(params)?;
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|e| {
+            tonic::Status::internal(format!("report_exec_status handler panicked: {e}"))
+        })?;
+
+        match result {
+            Ok(()) => Ok(tonic::Response::new(
+                proto::novarocks::ReportExecStatusResponse {
+                    status_code: REPORT_EXEC_STATUS_OK,
+                    message: String::new(),
+                },
+            )),
+            Err(e) => Ok(tonic::Response::new(
+                proto::novarocks::ReportExecStatusResponse {
+                    status_code: report_exec_status_error_code(&e),
+                    message: e,
+                },
+            )),
+        }
+    }
+
+    async fn batch_report_exec_status(
+        &self,
+        request: tonic::Request<proto::novarocks::BatchReportExecStatusRequest>,
+    ) -> Result<tonic::Response<proto::novarocks::BatchReportExecStatusResponse>, tonic::Status>
+    {
+        let payloads = request.into_inner().report_exec_status_params_thrift;
+        let result = tokio::task::spawn_blocking(move || {
+            for bytes in payloads {
+                let params: crate::frontend_service::TReportExecStatusParams =
+                    crate::common::thrift::thrift_binary_deserialize(&bytes).map_err(|e| {
+                        format!("failed to deserialize TReportExecStatusParams thrift: {e}")
+                    })?;
+                crate::runtime::write_coordinator::handle_report_exec_status(params)?;
+            }
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|e| {
+            tonic::Status::internal(format!("batch_report_exec_status handler panicked: {e}"))
+        })?;
+
+        match result {
+            Ok(()) => Ok(tonic::Response::new(
+                proto::novarocks::BatchReportExecStatusResponse {
+                    status_code: REPORT_EXEC_STATUS_OK,
+                    message: String::new(),
+                },
+            )),
+            Err(e) => Ok(tonic::Response::new(
+                proto::novarocks::BatchReportExecStatusResponse {
+                    status_code: report_exec_status_error_code(&e),
+                    message: e,
+                },
+            )),
+        }
+    }
+}
+
+fn report_exec_status_error_code(message: &str) -> i32 {
+    if message.contains("write coordinator not found for query") {
+        REPORT_EXEC_STATUS_QUERY_GONE
+    } else {
+        REPORT_EXEC_STATUS_ERROR
     }
 }
 
@@ -673,7 +794,7 @@ pub fn start_grpc_server(host: &str) -> Result<(), String> {
             let mut http_shutdown = shutdown_rx.clone();
             let mut starlet_shutdown = shutdown_rx.clone();
 
-            let svc = GrpcService;
+            let svc = GrpcService::full_execution();
             let svc = proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(svc)
                 .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
                 .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
@@ -820,21 +941,61 @@ pub(crate) fn parse_grpc_bind_addr(host: &str, port: u16) -> Result<SocketAddr, 
 }
 
 fn ensure_bindable(host: &str, port: u16, role: &str) -> Result<(), String> {
+    drop(bind_tcp_listener(host, port, role)?);
+    Ok(())
+}
+
+fn bind_tcp_listener(host: &str, port: u16, role: &str) -> Result<TcpListener, String> {
     let addr = parse_grpc_bind_addr(host, port)
         .map_err(|e| format!("parse {role} bind addr failed: {e}"))?;
     let listener = TcpListener::bind(addr)
         .map_err(|e| format!("failed to bind {role} listener on {addr}: {e}"))?;
-    drop(listener);
-    Ok(())
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("failed to configure {role} listener on {addr}: {e}"))?;
+    Ok(listener)
 }
 
-/// Start a lightweight gRPC exchange server on a specific port.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StandaloneGrpcMode {
+    FullExecution,
+    ReportOnly,
+}
+
+impl StandaloneGrpcMode {
+    fn service(self) -> GrpcService {
+        match self {
+            StandaloneGrpcMode::FullExecution => GrpcService::full_execution(),
+            StandaloneGrpcMode::ReportOnly => GrpcService::report_only(),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            StandaloneGrpcMode::FullExecution => "standalone grpc report/exchange",
+            StandaloneGrpcMode::ReportOnly => "standalone grpc report-only",
+        }
+    }
+}
+
+/// Start a lightweight gRPC exchange/report server on a specific port.
 ///
 /// Unlike [`start_grpc_server`] this does not require global config to be
-/// initialised — the caller supplies the bind address directly.  Only the
-/// exchange service is started (no starlet, no HTTP routes), which is
-/// sufficient for standalone multi-fragment CTE execution.
+/// initialised — the caller supplies the bind address directly.
 pub fn start_grpc_exchange_server(host: &str, port: u16) -> Result<(), String> {
+    start_standalone_grpc_server(host, port, StandaloneGrpcMode::FullExecution)
+}
+
+/// Start a report-only standalone NovaRocksGrpc endpoint on a specific port.
+pub fn start_grpc_report_server(host: &str, port: u16) -> Result<(), String> {
+    start_standalone_grpc_server(host, port, StandaloneGrpcMode::ReportOnly)
+}
+
+fn start_standalone_grpc_server(
+    host: &str,
+    port: u16,
+    mode: StandaloneGrpcMode,
+) -> Result<(), String> {
     {
         let state = grpc_server_state()
             .lock()
@@ -845,7 +1006,7 @@ pub fn start_grpc_exchange_server(host: &str, port: u16) -> Result<(), String> {
     }
 
     let host = host.to_string();
-    ensure_bindable(&host, port, "standalone grpc/exchange")?;
+    let std_listener = bind_tcp_listener(&host, port, mode.label())?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let join_handle = std::thread::spawn(move || {
@@ -853,7 +1014,8 @@ pub fn start_grpc_exchange_server(host: &str, port: u16) -> Result<(), String> {
             target: "novarocks::grpc",
             host = %host,
             port = port,
-            "starting standalone grpc exchange server"
+            mode = ?mode,
+            "starting standalone grpc server"
         );
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -863,11 +1025,11 @@ pub fn start_grpc_exchange_server(host: &str, port: u16) -> Result<(), String> {
             .expect("build standalone grpc server runtime");
 
         rt.block_on(async move {
-            let addr = parse_grpc_bind_addr(&host, port)
-                .expect("parse standalone grpc bind addr");
+            let listener = TokioTcpListener::from_std(std_listener)
+                .expect("create standalone grpc/http tokio listener");
             let mut shutdown = shutdown_rx.clone();
 
-            let svc = GrpcService;
+            let svc = mode.service();
             let svc = proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(svc)
                 .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
                 .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
@@ -896,10 +1058,6 @@ pub fn start_grpc_exchange_server(host: &str, port: u16) -> Result<(), String> {
                     get(load_tracking_http::handle_load_tracking_log),
                 )
                 .fallback(grpc_unimplemented_fallback);
-            let listener = TokioTcpListener::bind(addr)
-                .await
-                .expect("bind standalone grpc/http addr");
-
             let server = axum::serve(listener, app).with_graceful_shutdown(async move {
                     while !*shutdown.borrow() {
                         if shutdown.changed().await.is_err() {
@@ -913,7 +1071,8 @@ pub fn start_grpc_exchange_server(host: &str, port: u16) -> Result<(), String> {
                     target: "novarocks::grpc",
                     error = %e,
                     port = port,
-                    "standalone grpc exchange server stopped"
+                    mode = ?mode,
+                    "standalone grpc server stopped"
                 );
             }
         });
@@ -1039,9 +1198,47 @@ mod pr3_tests {
     use super::proto::novarocks::fetch_result_response::Status as FetchStatus;
     use super::proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc as _;
     use super::proto::novarocks::{
-        CancelFragmentRequest, FetchResultRequest, PUniqueId, SubmitFragmentRequest,
+        CancelFragmentRequest, FetchResultRequest, PUniqueId, ReportExecStatusRequest,
+        SubmitFragmentRequest,
     };
+    use crate::common::thrift::thrift_binary_serialize;
+    use crate::{frontend_service, status, status_code, types};
     use tonic::Request;
+
+    fn ok_report_params(
+        query: types::TUniqueId,
+        finst: types::TUniqueId,
+    ) -> frontend_service::TReportExecStatusParams {
+        frontend_service::TReportExecStatusParams::new(
+            frontend_service::FrontendServiceVersion::V1,
+            Some(query),
+            Some(0),
+            Some(finst),
+            Some(status::TStatus::new(status_code::TStatusCode::OK, None)),
+            Some(true),
+            None,
+            Option::<Vec<String>>::None,
+            Option::<Vec<String>>::None,
+            None,
+            None,
+            Option::<Vec<String>>::None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
 
     #[tokio::test]
     async fn submit_fragment_thrift_decode_error_returns_business_error() {
@@ -1056,6 +1253,20 @@ mod pr3_tests {
             "should return business error for bad thrift"
         );
         assert!(!body.message.is_empty());
+    }
+
+    #[tokio::test]
+    async fn report_only_submit_fragment_is_rejected_before_thrift_decode() {
+        let svc = GrpcService::report_only();
+        let req = Request::new(SubmitFragmentRequest {
+            exec_plan_fragment_params_thrift: vec![0xff, 0xff, 0xff],
+        });
+        let err = svc
+            .submit_fragment(req)
+            .await
+            .expect_err("report-only endpoint must reject local execution RPCs");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("report-only"));
     }
 
     #[tokio::test]
@@ -1074,6 +1285,92 @@ mod pr3_tests {
         });
         let resp2 = svc.cancel_fragment(req2).await.expect("RPC success");
         assert_eq!(resp2.into_inner().status_code, 0);
+    }
+
+    #[tokio::test]
+    async fn report_exec_status_bad_thrift_returns_business_error() {
+        let svc = GrpcService::default();
+        let req = Request::new(ReportExecStatusRequest {
+            report_exec_status_params_thrift: vec![0xff, 0xff, 0xff],
+        });
+        let resp = svc
+            .report_exec_status(req)
+            .await
+            .expect("RPC level success");
+        let body = resp.into_inner();
+        assert_ne!(body.status_code, 0);
+        assert!(body.message.contains("deserialize") || body.message.contains("thrift"));
+    }
+
+    #[tokio::test]
+    async fn report_only_report_exec_status_bad_thrift_reaches_report_handler() {
+        let svc = GrpcService::report_only();
+        let req = Request::new(ReportExecStatusRequest {
+            report_exec_status_params_thrift: vec![0xff, 0xff, 0xff],
+        });
+        let resp = svc
+            .report_exec_status(req)
+            .await
+            .expect("report-only endpoint must allow report RPCs");
+        let body = resp.into_inner();
+        assert_ne!(body.status_code, 0);
+        assert!(body.message.contains("deserialize") || body.message.contains("thrift"));
+    }
+
+    #[tokio::test]
+    async fn report_exec_status_updates_registered_write_coordinator() {
+        crate::runtime::write_coordinator::test_clear_registry();
+        let query = types::TUniqueId::new(701, 801);
+        let finst = types::TUniqueId::new(702, 802);
+        crate::runtime::write_coordinator::register_query(
+            query.clone(),
+            vec![crate::runtime::write_coordinator::WriterKey {
+                query_id: query.clone(),
+                fragment_instance_id: finst.clone(),
+                backend_num: 0,
+            }],
+        )
+        .expect("register write coordinator");
+        let bytes = thrift_binary_serialize(&ok_report_params(query.clone(), finst))
+            .expect("serialize report params");
+        let svc = GrpcService::default();
+        let req = Request::new(ReportExecStatusRequest {
+            report_exec_status_params_thrift: bytes,
+        });
+        let resp = svc
+            .report_exec_status(req)
+            .await
+            .expect("RPC level success");
+        let body = resp.into_inner();
+        assert_eq!(body.status_code, 0, "{}", body.message);
+        crate::runtime::write_coordinator::unregister_query(&query);
+    }
+
+    #[tokio::test]
+    async fn report_exec_status_query_gone_returns_terminal_code() {
+        crate::runtime::write_coordinator::test_clear_registry();
+        let query = types::TUniqueId::new(801, 901);
+        let finst = types::TUniqueId::new(802, 902);
+        let bytes = thrift_binary_serialize(&ok_report_params(query, finst))
+            .expect("serialize report params");
+        let svc = GrpcService::default();
+        let req = Request::new(ReportExecStatusRequest {
+            report_exec_status_params_thrift: bytes,
+        });
+
+        let resp = svc
+            .report_exec_status(req)
+            .await
+            .expect("RPC level success");
+        let body = resp.into_inner();
+
+        assert_eq!(
+            body.status_code,
+            crate::service::grpc_server::REPORT_EXEC_STATUS_QUERY_GONE,
+            "{}",
+            body.message
+        );
+        assert!(body.message.contains("not found"), "{}", body.message);
     }
 
     #[tokio::test]
