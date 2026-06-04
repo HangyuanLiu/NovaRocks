@@ -2538,6 +2538,7 @@ fn collapse_distribution_enforcers_for_single_fragment(
     mut node: crate::sql::optimizer::PhysicalPlanNode,
 ) -> crate::sql::optimizer::PhysicalPlanNode {
     use crate::sql::optimizer::operator::{JoinDistribution, Operator};
+    use crate::sql::optimizer::physical_plan::JoinExecutionDistribution;
 
     node.children = node
         .children
@@ -2547,6 +2548,10 @@ fn collapse_distribution_enforcers_for_single_fragment(
 
     if let Operator::PhysicalHashJoin(join) = &mut node.op {
         join.distribution = JoinDistribution::Broadcast;
+        node.execution_props.join_distribution = Some(JoinExecutionDistribution::Broadcast);
+        for runtime_filter in &mut node.build_runtime_filters {
+            runtime_filter.distribution = JoinDistribution::Broadcast;
+        }
     }
 
     if matches!(&node.op, Operator::PhysicalDistribution(_)) && node.children.len() == 1 {
@@ -4115,8 +4120,11 @@ path = "{metadata_path}"
             JoinDistribution, Operator, PhysicalDistributionOp, PhysicalHashJoinOp,
             PhysicalValuesOp,
         };
-        use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
+        use crate::sql::optimizer::physical_plan::{
+            JoinExecutionDistribution, PhysicalPlanNode, PlanExecutionProps,
+        };
         use crate::sql::optimizer::property::DistributionSpec;
+        use crate::sql::optimizer::runtime_filter_pass::RuntimeFilterDesc;
         use crate::sql::optimizer::statistics::Statistics;
 
         fn stats() -> Statistics {
@@ -4168,8 +4176,15 @@ path = "{metadata_path}"
             children: vec![distributed_values_node(), distributed_values_node()],
             stats: stats(),
             output_columns: Vec::new(),
-            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
-            build_runtime_filters: Vec::new(),
+            execution_props: PlanExecutionProps {
+                join_distribution: Some(JoinExecutionDistribution::Partitioned),
+                ..PlanExecutionProps::default()
+            },
+            build_runtime_filters: {
+                let mut rf = RuntimeFilterDesc::placeholder(7);
+                rf.distribution = JoinDistribution::Shuffle;
+                vec![rf]
+            },
             probe_runtime_filters: Vec::new(),
         };
 
@@ -4179,6 +4194,15 @@ path = "{metadata_path}"
             &collapsed.op,
             Operator::PhysicalHashJoin(join)
                 if matches!(&join.distribution, JoinDistribution::Broadcast)
+        ));
+        assert_eq!(
+            collapsed.execution_props.join_distribution,
+            Some(JoinExecutionDistribution::Broadcast)
+        );
+        assert_eq!(collapsed.build_runtime_filters.len(), 1);
+        assert!(matches!(
+            collapsed.build_runtime_filters[0].distribution,
+            JoinDistribution::Broadcast
         ));
         assert!(matches!(
             &collapsed.children[0].op,
