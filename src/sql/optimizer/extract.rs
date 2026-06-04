@@ -99,6 +99,11 @@ pub(crate) fn extract_best(
             JoinExecutionDistribution::Colocate => JoinDistribution::Colocate,
         };
     }
+    let inner_output_property = winner
+        .enforcer
+        .as_ref()
+        .map(|enforcer| enforcer.child_props.clone())
+        .unwrap_or_else(|| winner.output.clone());
 
     let inner_node = PhysicalPlanNode {
         op,
@@ -106,7 +111,7 @@ pub(crate) fn extract_best(
         stats: group_stats.clone(),
         output_columns: output_columns.clone(),
         execution_props: PlanExecutionProps {
-            output_property: winner.output.clone(),
+            output_property: inner_output_property.clone(),
             child_output_properties: winner.child_outputs.clone(),
             join_distribution,
         },
@@ -140,7 +145,7 @@ pub(crate) fn extract_best(
             output_columns,
             execution_props: PlanExecutionProps {
                 output_property: required.clone(),
-                child_output_properties: vec![winner.output.clone()],
+                child_output_properties: vec![inner_output_property],
                 join_distribution: None,
             },
             build_runtime_filters: Vec::new(),
@@ -203,7 +208,7 @@ mod tests {
         PhysicalLimitOp, PhysicalScanOp, PhysicalValuesOp,
     };
     use crate::sql::optimizer::property::DistributionSpec;
-    use crate::sql::optimizer::search::Winner;
+    use crate::sql::optimizer::search::{EnforcerInfo, Winner};
 
     fn test_col(id: u32) -> TypedExpr {
         TypedExpr {
@@ -333,6 +338,145 @@ mod tests {
         (memo, root, winners, required)
     }
 
+    fn make_enforced_limit_winner_for_test() -> (
+        Memo,
+        GroupId,
+        HashMap<(GroupId, PhysicalPropertySet), Winner>,
+        PhysicalPropertySet,
+        PhysicalPropertySet,
+    ) {
+        let mut memo = Memo::new();
+        let child = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalValues(PhysicalValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
+            children: vec![],
+        });
+        let root = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalLimit(PhysicalLimitOp {
+                limit: Some(1),
+                offset: None,
+            }),
+            children: vec![child],
+        });
+
+        let required = PhysicalPropertySet::gather();
+        let child_req = PhysicalPropertySet::any();
+        let child_output = PhysicalPropertySet::any();
+        let pre_enforcer_output = PhysicalPropertySet {
+            distribution: DistributionSpec::shuffle_join([ColumnId(10)]),
+            ordering: OrderingSpec::Any,
+        };
+
+        let mut winners = HashMap::new();
+        winners.insert(
+            (child, child_req.clone()),
+            Winner {
+                group_id: child,
+                expr_index: 0,
+                cost: 1.0,
+                enforcer: None,
+                output: child_output.clone(),
+                alt_kind: PropertyAlternativeKind::Default,
+                child_props: vec![],
+                child_outputs: vec![],
+            },
+        );
+        winners.insert(
+            (root, required.clone()),
+            Winner {
+                group_id: root,
+                expr_index: 0,
+                cost: 3.0,
+                enforcer: Some(EnforcerInfo {
+                    kind: EnforcerKind::Distribution(required.distribution.clone()),
+                    child_props: pre_enforcer_output.clone(),
+                }),
+                output: required.clone(),
+                alt_kind: PropertyAlternativeKind::Default,
+                child_props: vec![child_req],
+                child_outputs: vec![child_output],
+            },
+        );
+
+        (memo, root, winners, required, pre_enforcer_output)
+    }
+
+    fn make_colocate_hash_join_winner_for_test() -> (
+        Memo,
+        GroupId,
+        HashMap<(GroupId, PhysicalPropertySet), Winner>,
+        PhysicalPropertySet,
+    ) {
+        let mut memo = Memo::new();
+        let left = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalValues(PhysicalValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
+            children: vec![],
+        });
+        let right = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalValues(PhysicalValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
+            children: vec![],
+        });
+        let root = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: test_col(10),
+                    right: test_col(20),
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Colocate,
+            }),
+            children: vec![left, right],
+        });
+
+        let required = PhysicalPropertySet::any();
+        let mut winners = HashMap::new();
+        for child in [left, right] {
+            winners.insert(
+                (child, PhysicalPropertySet::any()),
+                Winner {
+                    group_id: child,
+                    expr_index: 0,
+                    cost: 1.0,
+                    enforcer: None,
+                    output: PhysicalPropertySet::any(),
+                    alt_kind: PropertyAlternativeKind::Default,
+                    child_props: vec![],
+                    child_outputs: vec![],
+                },
+            );
+        }
+        winners.insert(
+            (root, required.clone()),
+            Winner {
+                group_id: root,
+                expr_index: 0,
+                cost: 3.0,
+                enforcer: None,
+                output: PhysicalPropertySet::any(),
+                alt_kind: PropertyAlternativeKind::Default,
+                child_props: vec![PhysicalPropertySet::any(), PhysicalPropertySet::any()],
+                child_outputs: vec![PhysicalPropertySet::any(), PhysicalPropertySet::any()],
+            },
+        );
+
+        (memo, root, winners, required)
+    }
+
     #[test]
     fn extract_uses_winner_child_props_instead_of_rederiving() {
         let (memo, root, winners, required) =
@@ -353,6 +497,37 @@ mod tests {
             plan.execution_props.child_output_properties,
             winner.child_outputs
         );
+    }
+
+    #[test]
+    fn extract_preserves_pre_enforcer_execution_output_property() {
+        let (memo, root, winners, required, pre_enforcer_output) =
+            make_enforced_limit_winner_for_test();
+
+        let plan = extract_best(&memo, root, &required, &winners).expect("extract");
+
+        assert_eq!(plan.execution_props.output_property, required);
+        assert_eq!(
+            plan.execution_props.child_output_properties,
+            vec![pre_enforcer_output.clone()]
+        );
+        assert_eq!(
+            plan.children[0].execution_props.output_property,
+            pre_enforcer_output
+        );
+    }
+
+    #[test]
+    fn extract_keeps_colocate_hash_join_distribution_when_default_metadata() {
+        let (memo, root, winners, required) = make_colocate_hash_join_winner_for_test();
+
+        let plan = extract_best(&memo, root, &required, &winners).expect("extract");
+
+        let Operator::PhysicalHashJoin(join) = &plan.op else {
+            panic!("expected hash join");
+        };
+        assert_eq!(join.distribution, JoinDistribution::Colocate);
+        assert_eq!(plan.execution_props.join_distribution, None);
     }
 
     #[test]
