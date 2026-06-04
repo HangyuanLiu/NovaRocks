@@ -48,25 +48,26 @@ fn shuffle_join_column_ids(eq_conditions: &[PhysicalHashJoinEqCondition]) -> Vec
         .collect()
 }
 
-fn fallback_shuffle_keys(
-    eq_conditions: &[PhysicalHashJoinEqCondition],
-) -> (Vec<ColumnId>, Vec<ColumnId>) {
-    (
-        shuffle_join_column_ids(eq_conditions),
-        shuffle_join_column_ids(eq_conditions),
-    )
+fn has_duplicates(cols: &[ColumnId]) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    cols.iter().any(|col| !seen.insert(*col))
 }
 
 fn aligned_shuffle_keys(
     eq_conditions: &[PhysicalHashJoinEqCondition],
     parent_required: &PhysicalPropertySet,
 ) -> (Vec<ColumnId>, Vec<ColumnId>) {
+    let fallback = || {
+        let keys = shuffle_join_column_ids(eq_conditions);
+        (keys.clone(), keys)
+    };
+
     let DistributionSpec::HashPartitioned {
         cols: parent_cols,
         source: HashSource::ShuffleJoin,
     } = &parent_required.distribution
     else {
-        return fallback_shuffle_keys(eq_conditions);
+        return fallback();
     };
 
     let mut matched_indices = Vec::new();
@@ -81,16 +82,16 @@ fn aligned_shuffle_keys(
             })
             .collect();
         let [idx] = matches.as_slice() else {
-            return fallback_shuffle_keys(eq_conditions);
+            return fallback();
         };
         if matched_indices.contains(idx) {
-            return fallback_shuffle_keys(eq_conditions);
+            return fallback();
         }
         matched_indices.push(*idx);
     }
 
     if matched_indices.len() != eq_conditions.len() {
-        return fallback_shuffle_keys(eq_conditions);
+        return fallback();
     }
 
     let mut aligned_left = Vec::with_capacity(matched_indices.len());
@@ -101,10 +102,13 @@ fn aligned_shuffle_keys(
             typed_expr_to_column_id(&eq.left),
             typed_expr_to_column_id(&eq.right),
         ) else {
-            return fallback_shuffle_keys(eq_conditions);
+            return fallback();
         };
         aligned_left.push(left);
         aligned_right.push(right);
+    }
+    if has_duplicates(&aligned_left) || has_duplicates(&aligned_right) {
+        return fallback();
     }
     (aligned_left, aligned_right)
 }
@@ -457,6 +461,70 @@ mod tests {
 
         assert_eq!(shuffle.child_props[0].distribution, fallback);
         assert_eq!(shuffle.child_props[1].distribution, fallback);
+    }
+
+    #[test]
+    fn hash_join_shuffle_alignment_rejects_duplicate_single_side_keys() {
+        let op = PhysicalHashJoinOp {
+            join_type: crate::sql::analysis::JoinKind::Inner,
+            eq_conditions: vec![
+                PhysicalHashJoinEqCondition {
+                    left: col(10),
+                    right: col(20),
+                    null_safe: false,
+                },
+                PhysicalHashJoinEqCondition {
+                    left: col(10),
+                    right: col(21),
+                    null_safe: false,
+                },
+            ],
+            other_condition: None,
+            distribution: JoinDistribution::Unknown,
+        };
+        let parent = PhysicalPropertySet {
+            distribution: DistributionSpec::shuffle_join([ColumnId(20), ColumnId(21)]),
+            ordering: OrderingSpec::Any,
+        };
+
+        let alternatives = op.derive_required_alternatives(&parent, 2);
+        let shuffle = alternatives
+            .iter()
+            .find(|alt| alt.kind == PropertyAlternativeKind::ShuffleJoin)
+            .expect("shuffle alternative");
+        let fallback = DistributionSpec::shuffle_join([ColumnId(10), ColumnId(20), ColumnId(21)]);
+
+        assert_eq!(shuffle.child_props[0].distribution, fallback);
+        assert_eq!(shuffle.child_props[1].distribution, fallback);
+    }
+
+    #[test]
+    fn hash_join_right_and_full_family_alternatives_are_shuffle_only() {
+        for join_type in [
+            crate::sql::analysis::JoinKind::RightOuter,
+            crate::sql::analysis::JoinKind::RightSemi,
+            crate::sql::analysis::JoinKind::RightAnti,
+            crate::sql::analysis::JoinKind::FullOuter,
+        ] {
+            let op = PhysicalHashJoinOp {
+                join_type,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: col(10),
+                    right: col(20),
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Unknown,
+            };
+
+            let alternatives = op.derive_required_alternatives(&PhysicalPropertySet::any(), 2);
+            assert_eq!(alternatives.len(), 1, "join_type={join_type:?}");
+            assert_eq!(
+                alternatives[0].kind,
+                PropertyAlternativeKind::ShuffleJoin,
+                "join_type={join_type:?}"
+            );
+        }
     }
 
     #[test]
