@@ -16,8 +16,9 @@ pub(crate) use crate::sql::planner::plan::ScanDictionaryColumn;
 // ---------------------------------------------------------------------------
 
 #[allow(dead_code)]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum JoinDistribution {
+    Unknown,
     Shuffle,
     Broadcast,
     Colocate,

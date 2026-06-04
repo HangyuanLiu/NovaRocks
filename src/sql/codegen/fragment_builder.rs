@@ -316,6 +316,9 @@ fn rf_layout_for_distribution(
     use crate::runtime_filter::{TRuntimeFilterBuildJoinMode, TRuntimeFilterLayoutMode};
     use crate::sql::optimizer::operator::JoinDistribution;
     match distribution {
+        JoinDistribution::Unknown => {
+            panic!("unknown join distribution should be resolved before runtime filter codegen")
+        }
         JoinDistribution::Broadcast => (
             TRuntimeFilterBuildJoinMode::BORADCAST,
             TRuntimeFilterLayoutMode::SINGLETON,
@@ -5076,6 +5079,7 @@ mod tests {
             children: Vec::new(),
             stats: stats_for_test(),
             output_columns: columns,
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         }
@@ -5165,6 +5169,7 @@ mod tests {
             children: vec![old_child, delta_child],
             stats: stats_for_test(),
             output_columns,
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         }
@@ -5190,6 +5195,7 @@ mod tests {
             children: vec![old_child, delta_child],
             stats: stats_for_test(),
             output_columns,
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         }
@@ -5264,6 +5270,7 @@ mod tests {
             ],
             stats: stats_for_test(),
             output_columns,
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -5431,6 +5438,7 @@ mod tests {
             children: vec![values_plan_for_test(aggregate_physical_columns_for_test())],
             stats: stats_for_test(),
             output_columns: aggregate_physical_columns_for_test(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -6057,6 +6065,7 @@ mod tests {
             children: vec![],
             stats: stats(),
             output_columns: output_columns(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -6188,6 +6197,7 @@ mod tests {
             children: vec![],
             stats: stats(),
             output_columns: output_columns(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         }
@@ -6221,6 +6231,7 @@ mod tests {
             children: vec![],
             stats: stats(),
             output_columns: output_columns(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         }
@@ -6256,6 +6267,7 @@ mod tests {
             children: vec![],
             stats: stats(),
             output_columns: output_columns(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         }
@@ -6294,6 +6306,7 @@ mod tests {
             children: vec![],
             stats: stats(),
             output_columns: output_columns(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         }
@@ -6332,6 +6345,7 @@ mod tests {
             children: vec![],
             stats: stats(),
             output_columns: output_columns(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         }
@@ -6369,6 +6383,7 @@ mod tests {
             children: vec![],
             stats: stats(),
             output_columns: output_columns(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         }
@@ -6408,6 +6423,7 @@ mod tests {
             children: vec![],
             stats: stats(),
             output_columns: output_columns(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         }
@@ -6595,6 +6611,7 @@ mod tests {
             children: vec![iceberg_scan_plan(), starrocks_scan_plan()],
             stats: stats(),
             output_columns: output_columns(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         }
@@ -6619,11 +6636,14 @@ mod tests {
                 children: vec![scan_plan(file.path().to_path_buf())],
                 stats: stats(),
                 output_columns: output_columns(),
+                execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(
+                ),
                 build_runtime_filters: Vec::new(),
                 probe_runtime_filters: Vec::new(),
             }],
             stats: stats(),
             output_columns: output_columns(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -6698,11 +6718,14 @@ mod tests {
                 children: vec![scan_plan(file.path().to_path_buf())],
                 stats: stats(),
                 output_columns: output_columns(),
+                execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(
+                ),
                 build_runtime_filters: Vec::new(),
                 probe_runtime_filters: Vec::new(),
             }],
             stats: stats(),
             output_columns: output_columns(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -6753,16 +6776,21 @@ mod tests {
                     children: vec![scan_plan(file.path().to_path_buf())],
                     stats: stats(),
                     output_columns: output_columns(),
+                    execution_props:
+                        crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
                     build_runtime_filters: Vec::new(),
                     probe_runtime_filters: Vec::new(),
                 }],
                 stats: stats(),
                 output_columns: output_columns(),
+                execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(
+                ),
                 build_runtime_filters: Vec::new(),
                 probe_runtime_filters: Vec::new(),
             }],
             stats: stats(),
             output_columns: output_columns(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -6805,6 +6833,7 @@ mod tests {
             children: vec![scan],
             stats: stats(),
             output_columns: output_columns(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -6836,6 +6865,7 @@ mod tests {
             children: vec![scan_plan(file.path().to_path_buf())],
             stats: stats(),
             output_columns: output_columns(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -6856,6 +6886,7 @@ mod tests {
             children: vec![scan_plan(file.path().to_path_buf())],
             stats: stats(),
             output_columns: output_columns(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -6890,6 +6921,7 @@ mod tests {
                 nullable: false,
                 is_internal: false,
             }],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -7305,6 +7337,7 @@ mod tests {
                 nullable: false,
                 is_internal: false,
             }],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -7332,6 +7365,7 @@ mod tests {
                 nullable: false,
                 is_internal: false,
             }],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -7482,6 +7516,7 @@ mod tests {
                     is_internal: false,
                 },
             ],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -7689,6 +7724,7 @@ mod tests {
                 nullable: false,
                 is_internal: false,
             }],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -7835,6 +7871,7 @@ mod tests {
                 nullable: false,
                 is_internal: false,
             }],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };

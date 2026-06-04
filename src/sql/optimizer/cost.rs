@@ -77,6 +77,9 @@ pub(crate) fn compute_cost(
                 JoinDistribution::Shuffle => (build_size + probe_size) * NETWORK_COST + probe_size,
                 JoinDistribution::Broadcast => build_size * NETWORK_COST + probe_size,
                 JoinDistribution::Colocate => probe_size,
+                JoinDistribution::Unknown => {
+                    panic!("unknown join distribution should be resolved before costing")
+                }
             };
 
             // Apply cross join penalty (StarRocks: getCrossJoinCostPenalty = 10).

@@ -79,6 +79,9 @@ fn expand_with_eq_equivalents(
 impl DeriveOutput for PhysicalHashJoinOp {
     fn derive_output(&self, children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
         match self.distribution {
+            JoinDistribution::Unknown => {
+                panic!("unknown join distribution should be resolved before property derivation")
+            }
             JoinDistribution::Shuffle => {
                 // Symmetric over both sides of each eq pair — a shuffle join
                 // partitions both inputs on their respective eq columns, so
@@ -133,6 +136,9 @@ impl DeriveRequired for PhysicalHashJoinOp {
         _n: usize,
     ) -> Vec<PhysicalPropertySet> {
         match self.distribution {
+            JoinDistribution::Unknown => {
+                panic!("unknown join distribution should be resolved before property derivation")
+            }
             JoinDistribution::Shuffle => {
                 let all_cols = shuffle_join_column_ids(&self.eq_conditions);
                 vec![

@@ -87,6 +87,7 @@ pub(crate) fn extract_best(
         children,
         stats: group_stats.clone(),
         output_columns: output_columns.clone(),
+        execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
         build_runtime_filters: Vec::new(),
         probe_runtime_filters: Vec::new(),
     };
@@ -115,6 +116,7 @@ pub(crate) fn extract_best(
             children: vec![inner_node],
             stats: group_stats,
             output_columns,
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         });

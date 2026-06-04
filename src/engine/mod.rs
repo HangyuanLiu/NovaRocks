@@ -4136,6 +4136,8 @@ path = "{metadata_path}"
                 children: Vec::new(),
                 stats: stats(),
                 output_columns: Vec::new(),
+                execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(
+                ),
                 build_runtime_filters: Vec::new(),
                 probe_runtime_filters: Vec::new(),
             }
@@ -4149,6 +4151,8 @@ path = "{metadata_path}"
                 children: vec![values_node()],
                 stats: stats(),
                 output_columns: Vec::new(),
+                execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(
+                ),
                 build_runtime_filters: Vec::new(),
                 probe_runtime_filters: Vec::new(),
             }
@@ -4164,6 +4168,7 @@ path = "{metadata_path}"
             children: vec![distributed_values_node(), distributed_values_node()],
             stats: stats(),
             output_columns: Vec::new(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };

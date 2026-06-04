@@ -458,6 +458,7 @@ pub(crate) mod test_support {
                 ..Default::default()
             },
             output_columns: vec![oc],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         }
@@ -486,6 +487,7 @@ pub(crate) mod test_support {
                 ..Default::default()
             },
             output_columns: vec![loc, roc],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         }
@@ -514,6 +516,7 @@ pub(crate) mod test_support {
                 ..Default::default()
             },
             output_columns: vec![loc, roc],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         }
@@ -544,6 +547,7 @@ pub(crate) mod test_support {
                 ..Default::default()
             },
             output_columns: vec![loc.clone()], // exchange preserves column 1
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
@@ -569,6 +573,7 @@ pub(crate) mod test_support {
                 ..Default::default()
             },
             output_columns: vec![loc, roc],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         }
@@ -592,6 +597,7 @@ pub(crate) mod test_support {
                 ..Default::default()
             },
             output_columns: vec![loc.clone()], // project passes column 1 through
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
@@ -614,6 +620,7 @@ pub(crate) mod test_support {
                 ..Default::default()
             },
             output_columns: vec![loc, roc],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         }
