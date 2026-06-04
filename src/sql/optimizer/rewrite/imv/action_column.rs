@@ -21,7 +21,7 @@ use crate::sql::optimizer::rewrite::imv::row_id_column::ImvRowIdColumn;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::{RewriteDiagnostic, RewriteResult};
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
-use crate::sql::planner::plan::{LogicalPlan, ProjectNode, ScanNode};
+use crate::sql::planner::plan::{LogicalPlan, ProjectNode, ScanNode, UnionNode};
 
 pub(crate) struct ImvActionColumn;
 
@@ -134,9 +134,6 @@ fn validate_node(plan: &LogicalPlan) -> Result<(), String> {
             validate_node(&node.old_input)?;
             validate_state_merge_delta_input(&node.delta_input)
         }
-        LogicalPlan::Project(node) if is_supported_branch_state_merge_project(node) => {
-            validate_node(&node.input)
-        }
         LogicalPlan::Project(node) => {
             validate_node(&node.input)?;
             // V3: if a delta is below, Project must expose the action column.
@@ -177,10 +174,7 @@ fn validate_node(plan: &LogicalPlan) -> Result<(), String> {
             Ok(())
         }
         LogicalPlan::Union(node) if is_supported_branch_union(node) => {
-            for input in &node.inputs {
-                validate_node(input)?;
-            }
-            Ok(())
+            validate_supported_branch_union(node)
         }
         LogicalPlan::Union(node) if is_supported_join_delta_union(node) => {
             for input in &node.inputs {
@@ -210,6 +204,30 @@ fn validate_node(plan: &LogicalPlan) -> Result<(), String> {
         }
         _ => Ok(()),
     }
+}
+
+fn validate_supported_branch_union(node: &UnionNode) -> Result<(), String> {
+    for input in &node.inputs {
+        validate_branch_union_input(input)?;
+    }
+    Ok(())
+}
+
+fn validate_branch_union_input(plan: &LogicalPlan) -> Result<(), String> {
+    let LogicalPlan::Project(project) = plan else {
+        return Err("supported branch UNION expected Project branch input".to_string());
+    };
+    if !is_supported_branch_state_merge_project(project) {
+        return Err(
+            "supported branch UNION expected Project over AggregateStateMerge with branch id"
+                .to_string(),
+        );
+    }
+    let LogicalPlan::AggregateStateMerge(merge) = project.input.as_ref() else {
+        return Err("supported branch UNION expected AggregateStateMerge branch input".to_string());
+    };
+    validate_node(&merge.old_input)?;
+    validate_state_merge_delta_input(&merge.delta_input)
 }
 
 fn is_supported_branch_state_merge_project(node: &ProjectNode) -> bool {
@@ -1050,6 +1068,17 @@ mod tests {
         let plan = branch_union_with_aggregate_state_merge();
 
         validate(&plan).expect("rewritten branch union should validate");
+    }
+
+    #[test]
+    fn validation_rejects_standalone_branch_project_without_action_column() {
+        let plan = project_with_branch_id(aggregate_state_merge_stub(), 0);
+
+        let err = validate_node(&plan).expect_err("standalone branch Project must fail");
+        assert!(
+            err.contains("action column dropped at Project"),
+            "got: {err}"
+        );
     }
 
     // ── V6 / V7 failing tests (RED phase) ───────────────────────────────────
