@@ -244,6 +244,10 @@ pub(crate) fn compute_cost_with_properties(
 
             let base_cost = match alt_kind {
                 PropertyAlternativeKind::BroadcastJoin => {
+                    // The distribution enforcer cost models making the build
+                    // child available to the join. The join self-cost still
+                    // charges backend fanout and memory pressure during hash
+                    // table materialization/probing.
                     probe_size
                         + build_size * options.network_cost * options.backend_factor
                         + build_size * options.memory_cost_weight * options.backend_factor
@@ -392,6 +396,37 @@ mod tests {
         let options = CostOptions::default();
 
         assert!(!broadcast_gate_passes(&probe, &build, &options));
+    }
+
+    #[test]
+    fn broadcast_join_alternative_charges_fanout_and_memory_pressure() {
+        let probe = stats(100_000.0, 100.0);
+        let build = stats(10_000.0, 100.0);
+        let own = stats(100_000.0, 200.0);
+        let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![],
+            other_condition: None,
+            distribution: JoinDistribution::Unknown,
+        });
+        let child_stats = [&probe, &build];
+        let child_outputs = [PhysicalPropertySet::any(), PhysicalPropertySet::broadcast()];
+        let child_output_refs = [&child_outputs[0], &child_outputs[1]];
+        let options = CostOptions::default();
+
+        let cost = compute_cost_with_properties(
+            &op,
+            &own,
+            &child_stats,
+            &child_output_refs,
+            &PropertyAlternativeKind::BroadcastJoin,
+            &options,
+        );
+
+        let expected = probe.compute_size()
+            + build.compute_size() * options.network_cost * options.backend_factor
+            + build.compute_size() * options.memory_cost_weight * options.backend_factor;
+        assert!((cost - expected).abs() < f64::EPSILON);
     }
 
     #[test]

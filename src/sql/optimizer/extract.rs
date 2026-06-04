@@ -64,14 +64,20 @@ pub(crate) fn extract_best(
     })?;
 
     let child_reqs = winner.child_props.clone();
+    if child_reqs.len() != expr.children.len() {
+        return Err(format!(
+            "winner child_props arity mismatch for group {} expr_index {}: expected {}, got {}",
+            root_group,
+            winner.expr_index,
+            expr.children.len(),
+            child_reqs.len()
+        ));
+    }
 
     // Recursively extract children.
     let mut children = Vec::with_capacity(expr.children.len());
     for (i, &child_group_id) in expr.children.iter().enumerate() {
-        let child_req = child_reqs
-            .get(i)
-            .cloned()
-            .unwrap_or_else(PhysicalPropertySet::any);
+        let child_req = child_reqs[i].clone();
         let child_node = extract_best(memo, child_group_id, &child_req, winners)?;
         children.push(child_node);
     }
@@ -172,5 +178,88 @@ fn ordering_spec_to_sort_items(ordering: &OrderingSpec) -> Vec<SortItem> {
                 nulls_first: sk.nulls_first,
             })
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::optimizer::derive::PropertyAlternativeKind;
+    use crate::sql::optimizer::memo::{MExpr, Memo};
+    use crate::sql::optimizer::operator::{Operator, PhysicalLimitOp, PhysicalScanOp};
+    use crate::sql::optimizer::search::Winner;
+
+    fn scan_op(table: &str) -> Operator {
+        Operator::PhysicalScan(PhysicalScanOp {
+            database: "db".into(),
+            table: crate::sql::catalog::TableDef {
+                name: table.into(),
+                columns: vec![],
+                iceberg_row_lineage_metadata_columns: vec![],
+                source: crate::sql::catalog::ScanSource::StarRocks {
+                    db_id: 0,
+                    table_id: 0,
+                },
+            },
+            alias: None,
+            columns: vec![],
+            predicates: vec![],
+            required_columns: None,
+            dict_columns: vec![],
+        })
+    }
+
+    #[test]
+    fn extract_rejects_winner_child_prop_arity_mismatch() {
+        let mut memo = Memo::new();
+        let child = memo.new_group(MExpr {
+            id: 0,
+            op: scan_op("child"),
+            children: vec![],
+        });
+        let root = memo.new_group(MExpr {
+            id: 1,
+            op: Operator::PhysicalLimit(PhysicalLimitOp {
+                limit: Some(1),
+                offset: None,
+            }),
+            children: vec![child],
+        });
+
+        let required = PhysicalPropertySet::any();
+        let mut winners = HashMap::new();
+        winners.insert(
+            (child, PhysicalPropertySet::any()),
+            Winner {
+                group_id: child,
+                expr_index: 0,
+                cost: 1.0,
+                enforcer: None,
+                output: PhysicalPropertySet::any(),
+                alt_kind: PropertyAlternativeKind::Default,
+                child_props: vec![],
+                child_outputs: vec![],
+            },
+        );
+        winners.insert(
+            (root, required.clone()),
+            Winner {
+                group_id: root,
+                expr_index: 0,
+                cost: 2.0,
+                enforcer: None,
+                output: PhysicalPropertySet::any(),
+                alt_kind: PropertyAlternativeKind::Default,
+                child_props: vec![],
+                child_outputs: vec![],
+            },
+        );
+
+        let err = extract_best(&memo, root, &required, &winners)
+            .expect_err("extract should reject missing child properties");
+        assert!(
+            err.contains("child_props") && err.contains("expected 1") && err.contains("got 0"),
+            "unexpected error: {err}"
+        );
     }
 }

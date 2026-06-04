@@ -293,6 +293,9 @@ impl PhysicalHashJoinOp {
         num_children: usize,
     ) -> Vec<ChildRequirementAlternative> {
         if num_children != 2 {
+            if self.distribution == JoinDistribution::Unknown {
+                return Vec::new();
+            }
             return vec![ChildRequirementAlternative::default(vec![
                 PhysicalPropertySet::any();
                 num_children

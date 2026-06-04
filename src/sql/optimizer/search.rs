@@ -421,6 +421,46 @@ mod tests {
         (memo, root)
     }
 
+    fn make_malformed_unknown_hash_join_memo_for_test() -> (Memo, GroupId) {
+        let mut memo = Memo::new();
+        let child_group = memo.new_group(MExpr {
+            id: 0,
+            op: Operator::PhysicalScan(PhysicalScanOp {
+                database: "db".into(),
+                table: crate::sql::catalog::TableDef {
+                    name: "single_child".into(),
+                    columns: vec![],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: crate::sql::catalog::ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 0,
+                    },
+                },
+                alias: None,
+                columns: vec![],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+            }),
+            children: vec![],
+        });
+        let root = memo.new_group(MExpr {
+            id: 1,
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: test_col(1, "a_id"),
+                    right: test_col(2, "b_id"),
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Unknown,
+            }),
+            children: vec![child_group],
+        });
+        (memo, root)
+    }
+
     fn find_hash_join_for_test(plan: &PhysicalPlanNode) -> Option<&PhysicalHashJoinOp> {
         if let Operator::PhysicalHashJoin(join) = &plan.op {
             return Some(join);
@@ -521,6 +561,25 @@ mod tests {
         ));
         assert_eq!(winner.child_props.len(), 2);
         assert_eq!(winner.child_outputs.len(), 2);
+        match winner.alt_kind {
+            super::super::derive::PropertyAlternativeKind::BroadcastJoin => {
+                assert_eq!(winner.child_props[0], PhysicalPropertySet::any());
+                assert_eq!(winner.child_props[1], PhysicalPropertySet::broadcast());
+            }
+            super::super::derive::PropertyAlternativeKind::ShuffleJoin => {
+                assert!(matches!(
+                    winner.child_props[0].distribution,
+                    DistributionSpec::HashPartitioned { .. }
+                ));
+                assert!(matches!(
+                    winner.child_props[1].distribution,
+                    DistributionSpec::HashPartitioned { .. }
+                ));
+            }
+            super::super::derive::PropertyAlternativeKind::Default => {
+                panic!("unknown hash join should choose a concrete property alternative")
+            }
+        }
     }
 
     #[test]
@@ -533,7 +592,39 @@ mod tests {
             crate::sql::optimizer::extract::extract_best(&memo, root, &required, &ctx.winners)
                 .expect("extract");
         let join = find_hash_join_for_test(&plan).expect("hash join");
-        assert!(!matches!(join.distribution, JoinDistribution::Unknown));
+        let winner = ctx
+            .winners
+            .get(&(root, required))
+            .expect("root winner should be recorded");
+        match winner.alt_kind {
+            super::super::derive::PropertyAlternativeKind::BroadcastJoin => {
+                assert_eq!(join.distribution, JoinDistribution::Broadcast);
+            }
+            super::super::derive::PropertyAlternativeKind::ShuffleJoin => {
+                assert_eq!(join.distribution, JoinDistribution::Shuffle);
+            }
+            super::super::derive::PropertyAlternativeKind::Default => {
+                assert!(!matches!(join.distribution, JoinDistribution::Unknown));
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_unknown_hash_join_is_infeasible_without_panic() {
+        let (memo, root) = make_malformed_unknown_hash_join_memo_for_test();
+        let mut ctx = SearchContext::new(Default::default());
+        let required = PhysicalPropertySet::gather();
+
+        let cost = ctx
+            .optimize_group(&memo, root, &required)
+            .expect("malformed unknown hash join should not panic");
+
+        assert!(cost.is_infinite());
+        let winner = ctx
+            .winners
+            .get(&(root, required))
+            .expect("infeasible winner should still be cached");
+        assert!(winner.cost.is_infinite());
     }
 }
 
