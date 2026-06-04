@@ -151,59 +151,6 @@ fn expand_with_eq_equivalents(
     out
 }
 
-impl DeriveOutput for PhysicalHashJoinOp {
-    fn derive_output(&self, children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
-        match self.distribution {
-            JoinDistribution::Unknown => {
-                panic!("unknown join distribution should be resolved before property derivation")
-            }
-            JoinDistribution::Shuffle => {
-                // Symmetric over both sides of each eq pair — a shuffle join
-                // partitions both inputs on their respective eq columns, so
-                // its output's HashPartitioned key is an equivalence class
-                // containing every eq column from either side.
-                let cols = shuffle_join_column_ids(&self.eq_conditions);
-                PhysicalPropertySet {
-                    distribution: if cols.is_empty() {
-                        DistributionSpec::Any
-                    } else {
-                        DistributionSpec::shuffle_join(cols)
-                    },
-                    ordering: OrderingSpec::Any,
-                }
-            }
-            JoinDistribution::Broadcast | JoinDistribution::Colocate => {
-                if preserves_left(&self.join_type) {
-                    let left = children
-                        .first()
-                        .copied()
-                        .cloned()
-                        .unwrap_or_else(PhysicalPropertySet::any);
-                    // Enrich left's HashPartitioned key with eq-equivalents
-                    // so a downstream requirement keyed on the OTHER side
-                    // of an eq pair (e.g. after JoinCommutativity put the
-                    // hash-providing side on the right) is also satisfied.
-                    let distribution = match left.distribution {
-                        DistributionSpec::HashPartitioned { cols, source } => {
-                            DistributionSpec::hash_partitioned(
-                                expand_with_eq_equivalents(&cols, &self.eq_conditions),
-                                source,
-                            )
-                        }
-                        other => other,
-                    };
-                    PhysicalPropertySet {
-                        distribution,
-                        ordering: OrderingSpec::Any,
-                    }
-                } else {
-                    PhysicalPropertySet::any()
-                }
-            }
-        }
-    }
-}
-
 impl DeriveRequired for PhysicalHashJoinOp {
     fn derive_required(
         &self,
@@ -258,6 +205,61 @@ impl DeriveRequired for PhysicalHashJoinOp {
 }
 
 impl PhysicalHashJoinOp {
+    fn derive_shuffle_output(&self) -> PhysicalPropertySet {
+        // Symmetric over both sides of each eq pair: a shuffle join partitions
+        // both inputs on their respective eq columns, so its output key is an
+        // equivalence class containing every eq column from either side.
+        let cols = shuffle_join_column_ids(&self.eq_conditions);
+        PhysicalPropertySet {
+            distribution: if cols.is_empty() {
+                DistributionSpec::Any
+            } else {
+                DistributionSpec::shuffle_join(cols)
+            },
+            ordering: OrderingSpec::Any,
+        }
+    }
+
+    fn derive_broadcast_output(&self, children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
+        if preserves_left(&self.join_type) {
+            let left = children
+                .first()
+                .copied()
+                .cloned()
+                .unwrap_or_else(PhysicalPropertySet::any);
+            // Enrich left's HashPartitioned key with eq-equivalents so a
+            // downstream requirement keyed on the other side of an eq pair is
+            // also satisfied.
+            let distribution = match left.distribution {
+                DistributionSpec::HashPartitioned { cols, source } => {
+                    DistributionSpec::hash_partitioned(
+                        expand_with_eq_equivalents(&cols, &self.eq_conditions),
+                        source,
+                    )
+                }
+                other => other,
+            };
+            PhysicalPropertySet {
+                distribution,
+                ordering: OrderingSpec::Any,
+            }
+        } else {
+            PhysicalPropertySet::any()
+        }
+    }
+
+    pub(crate) fn derive_output_for_alternative(
+        &self,
+        children: &[&PhysicalPropertySet],
+        alt_kind: &PropertyAlternativeKind,
+    ) -> PhysicalPropertySet {
+        match alt_kind {
+            PropertyAlternativeKind::BroadcastJoin => self.derive_broadcast_output(children),
+            PropertyAlternativeKind::ShuffleJoin => self.derive_shuffle_output(),
+            PropertyAlternativeKind::Default => self.derive_output(children),
+        }
+    }
+
     fn broadcast_required_alternative() -> ChildRequirementAlternative {
         ChildRequirementAlternative {
             kind: PropertyAlternativeKind::BroadcastJoin,
@@ -318,6 +320,20 @@ impl PhysicalHashJoinOp {
             JoinDistribution::Colocate => vec![ChildRequirementAlternative::default(
                 self.derive_required(parent_required, num_children),
             )],
+        }
+    }
+}
+
+impl DeriveOutput for PhysicalHashJoinOp {
+    fn derive_output(&self, children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
+        match self.distribution {
+            JoinDistribution::Unknown => {
+                panic!("unknown join distribution should be resolved before property derivation")
+            }
+            JoinDistribution::Shuffle => self.derive_shuffle_output(),
+            JoinDistribution::Broadcast | JoinDistribution::Colocate => {
+                self.derive_broadcast_output(children)
+            }
         }
     }
 }

@@ -5,9 +5,9 @@
 
 use std::collections::HashMap;
 
-use super::derive::derive_required;
+use super::derive::PropertyAlternativeKind;
 use super::memo::{GroupId, Memo};
-use super::operator::{Operator, PhysicalDistributionOp, PhysicalSortOp};
+use super::operator::{JoinDistribution, Operator, PhysicalDistributionOp, PhysicalSortOp};
 use super::physical_plan::PhysicalPlanNode;
 use super::property::{OrderingSpec, PhysicalPropertySet};
 use super::search::{EnforcerKind, Winner};
@@ -20,7 +20,7 @@ use crate::sql::optimizer::statistics::Statistics;
 /// For each winner, if it has an enforcer, an enforcer PhysicalPlanNode is
 /// created wrapping the recursive extraction with the enforcer's child props.
 /// Otherwise, the winner's physical expression is used directly with children
-/// extracted according to `derive_required`.
+/// extracted according to the child properties recorded by search.
 pub(crate) fn extract_best(
     memo: &Memo,
     root_group: GroupId,
@@ -63,8 +63,7 @@ pub(crate) fn extract_best(
         )
     })?;
 
-    // Determine child required properties — same call that the search loop made.
-    let child_reqs = derive_required(&expr.op, required, expr.children.len());
+    let child_reqs = winner.child_props.clone();
 
     // Recursively extract children.
     let mut children = Vec::with_capacity(expr.children.len());
@@ -77,10 +76,21 @@ pub(crate) fn extract_best(
         children.push(child_node);
     }
 
-    let op = match &expr.op {
+    let mut op = match &expr.op {
         Operator::PhysicalCTEAnchor(op) => Operator::PhysicalCTEAnchor(op.clone()),
         other => other.clone(),
     };
+    if let Operator::PhysicalHashJoin(join) = &mut op {
+        match winner.alt_kind {
+            PropertyAlternativeKind::BroadcastJoin => {
+                join.distribution = JoinDistribution::Broadcast;
+            }
+            PropertyAlternativeKind::ShuffleJoin => {
+                join.distribution = JoinDistribution::Shuffle;
+            }
+            PropertyAlternativeKind::Default => {}
+        }
+    }
 
     let inner_node = PhysicalPlanNode {
         op,

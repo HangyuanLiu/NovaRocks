@@ -103,6 +103,19 @@ pub(crate) fn derive_output(
     }
 }
 
+pub(crate) fn derive_output_for_alternative(
+    op: &Operator,
+    children_outputs: &[&PhysicalPropertySet],
+    alt_kind: &PropertyAlternativeKind,
+) -> PhysicalPropertySet {
+    match op {
+        Operator::PhysicalHashJoin(o) => {
+            o.derive_output_for_alternative(children_outputs, alt_kind)
+        }
+        _ => derive_output(op, children_outputs),
+    }
+}
+
 /// Dispatch `derive_required` based on the operator's concrete variant.
 pub(crate) fn derive_required(
     op: &Operator,

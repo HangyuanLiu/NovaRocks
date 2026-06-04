@@ -7,7 +7,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::cost::compute_cost;
+use super::cost::{CostOptions, compute_cost_with_properties};
+use super::derive::PropertyAlternativeKind;
 use super::memo::{Cost, GroupId, Memo};
 use super::operator::*;
 use super::property::*;
@@ -44,6 +45,9 @@ pub(crate) struct Winner {
     /// enforcer was selected to bridge `provided -> required`). Otherwise
     /// it equals the natural output of the chosen physical expression.
     pub(crate) output: PhysicalPropertySet,
+    pub(crate) alt_kind: PropertyAlternativeKind,
+    pub(crate) child_props: Vec<PhysicalPropertySet>,
+    pub(crate) child_outputs: Vec<PhysicalPropertySet>,
 }
 
 /// Describes the enforcer node that must wrap the winner expression.
@@ -123,6 +127,9 @@ impl SearchContext {
         let mut best_index: usize = 0;
         let mut best_enforcer: Option<EnforcerInfo> = None;
         let mut best_output = PhysicalPropertySet::any();
+        let mut best_alt_kind = PropertyAlternativeKind::Default;
+        let mut best_child_props = Vec::new();
+        let mut best_child_outputs = Vec::new();
 
         for expr_idx in 0..num_physical {
             let expr = &memo.groups[group_id].physical_exprs[expr_idx];
@@ -139,76 +146,97 @@ impl SearchContext {
                 continue;
             }
 
-            // 1. Determine each child's required properties (top-down — no child
-            //    visibility yet).
-            let child_reqs =
-                super::derive::derive_required(&expr.op, required, expr.children.len());
-
-            // 2. Compute own cost.
-            let own_stats = derive_statistics(expr, memo, &self.table_stats);
-            let child_stats_vec: Vec<_> = expr
-                .children
-                .iter()
-                .map(|&cg| stats_for_group(&memo.groups[cg], memo, &self.table_stats))
-                .collect();
-            let child_stats_refs: Vec<&_> = child_stats_vec.iter().collect();
-            let own_cost = compute_cost(&expr.op, &own_stats, &child_stats_refs);
-
-            // 3. Optimize each child; collect its winner output.
-            let mut total = own_cost;
-            let mut child_outputs: Vec<PhysicalPropertySet> =
-                Vec::with_capacity(expr.children.len());
-            let mut feasible = true;
-            for (i, &cg) in expr.children.iter().enumerate() {
-                let child_cost = self.optimize_group(memo, cg, &child_reqs[i])?;
-                if child_cost.is_infinite() {
-                    feasible = false;
-                    break;
-                }
-                total += child_cost;
-                let cw = self
-                    .winners
-                    .get(&(cg, child_reqs[i].clone()))
-                    .expect("child just optimized — winner must be in cache");
-                child_outputs.push(cw.output.clone());
-            }
-            if !feasible {
-                continue;
-            }
-
-            // 4. Derive this node's actual output from children winner outputs.
-            let child_output_refs: Vec<&PhysicalPropertySet> = child_outputs.iter().collect();
-            let provided = super::derive::derive_output(&expr.op, &child_output_refs);
-
-            // 5. Bridge provided → required via enforcer if needed.
-            let (actual_output, enforcer_info, candidate_cost) = if provided.satisfies(required) {
-                (provided, None, total)
-            } else {
-                let enforcers = super::derive::needed_enforcers(required, &provided);
-                if enforcers.is_empty() {
+            let alternatives = super::derive::derive_required_alternatives(
+                &expr.op,
+                required,
+                expr.children.len(),
+            );
+            for alt in alternatives {
+                let child_reqs = alt.child_props.clone();
+                if child_reqs.len() != expr.children.len() {
                     continue;
                 }
-                let group_stats = stats_for_group(&memo.groups[group_id], memo, &self.table_stats);
-                let enforcer_cost: Cost = enforcers
-                    .iter()
-                    .map(|e| super::derive::estimate_enforcer_cost(e, &group_stats))
-                    .sum();
-                let kind = enforcers.into_iter().next().unwrap();
-                (
-                    required.clone(),
-                    Some(EnforcerInfo {
-                        kind,
-                        child_props: provided,
-                    }),
-                    total + enforcer_cost,
-                )
-            };
 
-            if candidate_cost < best_cost {
-                best_cost = candidate_cost;
-                best_index = expr_idx;
-                best_enforcer = enforcer_info;
-                best_output = actual_output;
+                let own_stats = derive_statistics(expr, memo, &self.table_stats);
+                let child_stats_vec: Vec<_> = expr
+                    .children
+                    .iter()
+                    .map(|&cg| stats_for_group(&memo.groups[cg], memo, &self.table_stats))
+                    .collect();
+                let child_stats_refs: Vec<&_> = child_stats_vec.iter().collect();
+
+                let mut child_outputs: Vec<PhysicalPropertySet> =
+                    Vec::with_capacity(expr.children.len());
+                let mut child_cost_total = 0.0;
+                let mut feasible = true;
+                for (i, &cg) in expr.children.iter().enumerate() {
+                    let child_cost = self.optimize_group(memo, cg, &child_reqs[i])?;
+                    if child_cost.is_infinite() {
+                        feasible = false;
+                        break;
+                    }
+                    child_cost_total += child_cost;
+                    let cw = self
+                        .winners
+                        .get(&(cg, child_reqs[i].clone()))
+                        .expect("child just optimized; winner must be in cache");
+                    child_outputs.push(cw.output.clone());
+                }
+                if !feasible {
+                    continue;
+                }
+
+                let child_output_refs: Vec<&PhysicalPropertySet> = child_outputs.iter().collect();
+                let own_cost = compute_cost_with_properties(
+                    &expr.op,
+                    &own_stats,
+                    &child_stats_refs,
+                    &child_output_refs,
+                    &alt.kind,
+                    &CostOptions::default(),
+                );
+                let total = own_cost + child_cost_total;
+                let provided = super::derive::derive_output_for_alternative(
+                    &expr.op,
+                    &child_output_refs,
+                    &alt.kind,
+                );
+
+                // Bridge provided → required via enforcer if needed.
+                let (actual_output, enforcer_info, candidate_cost) = if provided.satisfies(required)
+                {
+                    (provided, None, total)
+                } else {
+                    let enforcers = super::derive::needed_enforcers(required, &provided);
+                    if enforcers.is_empty() {
+                        continue;
+                    }
+                    let group_stats =
+                        stats_for_group(&memo.groups[group_id], memo, &self.table_stats);
+                    let enforcer_cost: Cost = enforcers
+                        .iter()
+                        .map(|e| super::derive::estimate_enforcer_cost(e, &group_stats))
+                        .sum();
+                    let kind = enforcers.into_iter().next().unwrap();
+                    (
+                        required.clone(),
+                        Some(EnforcerInfo {
+                            kind,
+                            child_props: provided,
+                        }),
+                        total + enforcer_cost,
+                    )
+                };
+
+                if candidate_cost < best_cost {
+                    best_cost = candidate_cost;
+                    best_index = expr_idx;
+                    best_enforcer = enforcer_info;
+                    best_output = actual_output;
+                    best_alt_kind = alt.kind;
+                    best_child_props = child_reqs;
+                    best_child_outputs = child_outputs;
+                }
             }
         }
 
@@ -223,6 +251,9 @@ impl SearchContext {
             cost: best_cost,
             enforcer: best_enforcer,
             output: best_output,
+            alt_kind: best_alt_kind,
+            child_props: best_child_props,
+            child_outputs: best_child_outputs,
         };
         self.winners.insert(cache_key, winner);
         Ok(best_cost)
@@ -273,7 +304,11 @@ fn stats_for_group(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::analysis::{ExprKind, JoinKind, TypedExpr};
+    use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::MExpr;
+    use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
+    use arrow::datatypes::DataType;
 
     /// Build a simple memo with a single PhysicalScan group.
     pub(super) fn single_scan_memo() -> (Memo, GroupId) {
@@ -314,6 +349,86 @@ mod tests {
             },
         );
         ts
+    }
+
+    fn test_col(id: u32, name: &str) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId(id),
+                qualifier: None,
+                column: name.into(),
+            },
+            data_type: DataType::Int64,
+            nullable: false,
+        }
+    }
+
+    fn make_two_table_inner_join_memo_for_test() -> (Memo, GroupId) {
+        let mut memo = Memo::new();
+        let left_group = memo.new_group(MExpr {
+            id: 0,
+            op: Operator::PhysicalScan(PhysicalScanOp {
+                database: "db".into(),
+                table: crate::sql::catalog::TableDef {
+                    name: "left_t".into(),
+                    columns: vec![],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: crate::sql::catalog::ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 0,
+                    },
+                },
+                alias: None,
+                columns: vec![],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+            }),
+            children: vec![],
+        });
+        let right_group = memo.new_group(MExpr {
+            id: 1,
+            op: Operator::PhysicalScan(PhysicalScanOp {
+                database: "db".into(),
+                table: crate::sql::catalog::TableDef {
+                    name: "right_t".into(),
+                    columns: vec![],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: crate::sql::catalog::ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 0,
+                    },
+                },
+                alias: None,
+                columns: vec![],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+            }),
+            children: vec![],
+        });
+        let root = memo.new_group(MExpr {
+            id: 2,
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: test_col(1, "a_id"),
+                    right: test_col(2, "b_id"),
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Unknown,
+            }),
+            children: vec![left_group, right_group],
+        });
+        (memo, root)
+    }
+
+    fn find_hash_join_for_test(plan: &PhysicalPlanNode) -> Option<&PhysicalHashJoinOp> {
+        if let Operator::PhysicalHashJoin(join) = &plan.op {
+            return Some(join);
+        }
+        plan.children.iter().find_map(find_hash_join_for_test)
     }
 
     #[test]
@@ -389,6 +504,39 @@ mod tests {
             .optimize_group(&memo, gid, &PhysicalPropertySet::any())
             .unwrap();
         assert!((cost1 - cost2).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn winner_records_hash_join_alternative_and_child_properties() {
+        let (memo, root) = make_two_table_inner_join_memo_for_test();
+        let mut ctx = SearchContext::new(Default::default());
+        let required = PhysicalPropertySet::gather();
+        ctx.optimize_group(&memo, root, &required).expect("search");
+
+        let winner = ctx
+            .winners
+            .get(&(root, required))
+            .expect("root winner should be recorded");
+        assert!(matches!(
+            winner.alt_kind,
+            super::super::derive::PropertyAlternativeKind::BroadcastJoin
+                | super::super::derive::PropertyAlternativeKind::ShuffleJoin
+        ));
+        assert_eq!(winner.child_props.len(), 2);
+        assert_eq!(winner.child_outputs.len(), 2);
+    }
+
+    #[test]
+    fn unknown_hash_join_search_extracts_concrete_distribution() {
+        let (memo, root) = make_two_table_inner_join_memo_for_test();
+        let mut ctx = SearchContext::new(Default::default());
+        let required = PhysicalPropertySet::gather();
+        ctx.optimize_group(&memo, root, &required).expect("search");
+        let plan =
+            crate::sql::optimizer::extract::extract_best(&memo, root, &required, &ctx.winners)
+                .expect("extract");
+        let join = find_hash_join_for_test(&plan).expect("hash join");
+        assert!(!matches!(join.distribution, JoinDistribution::Unknown));
     }
 }
 

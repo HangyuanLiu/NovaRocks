@@ -6,6 +6,8 @@
 
 use super::memo::Cost;
 use super::operator::{AggMode, JoinDistribution, Operator};
+use super::property::PhysicalPropertySet;
+use crate::sql::optimizer::derive::PropertyAlternativeKind;
 use crate::sql::optimizer::statistics::Statistics;
 
 /// Network transfer multiplier applied to data that crosses node boundaries.
@@ -169,6 +171,54 @@ pub(crate) fn compute_cost(
         | Operator::PhysicalCTEConsume(_)
         | Operator::PhysicalDecode(_)
         | Operator::PhysicalAggregateStateMerge(_) => own_stats.output_row_count * 0.01,
+    }
+}
+
+pub(crate) struct CostOptions {
+    pub backend_factor: f64,
+}
+
+impl Default for CostOptions {
+    fn default() -> Self {
+        Self {
+            backend_factor: 3.0,
+        }
+    }
+}
+
+pub(crate) fn compute_cost_with_properties(
+    op: &Operator,
+    own_stats: &Statistics,
+    child_stats: &[&Statistics],
+    _child_outputs: &[&PhysicalPropertySet],
+    alt_kind: &PropertyAlternativeKind,
+    options: &CostOptions,
+) -> Cost {
+    let _ = options.backend_factor;
+    if let Operator::PhysicalHashJoin(j) = op {
+        match alt_kind {
+            PropertyAlternativeKind::BroadcastJoin => {
+                let mut concrete = j.clone();
+                concrete.distribution = JoinDistribution::Broadcast;
+                compute_cost(
+                    &Operator::PhysicalHashJoin(concrete),
+                    own_stats,
+                    child_stats,
+                )
+            }
+            PropertyAlternativeKind::ShuffleJoin => {
+                let mut concrete = j.clone();
+                concrete.distribution = JoinDistribution::Shuffle;
+                compute_cost(
+                    &Operator::PhysicalHashJoin(concrete),
+                    own_stats,
+                    child_stats,
+                )
+            }
+            PropertyAlternativeKind::Default => compute_cost(op, own_stats, child_stats),
+        }
+    } else {
+        compute_cost(op, own_stats, child_stats)
     }
 }
 
