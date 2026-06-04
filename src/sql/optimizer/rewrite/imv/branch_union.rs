@@ -288,6 +288,7 @@ mod tests {
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
         ApplyKeySource, BranchIdColumnContract, BranchUnionContract,
     };
+    use crate::sql::analysis::JoinKind;
     use crate::sql::analysis::{
         BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
@@ -301,7 +302,8 @@ mod tests {
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
     use crate::sql::planner::plan::{
-        AggregateCall, AggregateNode, FilterNode, LogicalPlan, ProjectNode, ScanNode, UnionNode,
+        AggregateCall, AggregateNode, FilterNode, JoinNode, LogicalPlan, ProjectNode, ScanNode,
+        UnionNode,
     };
 
     #[test]
@@ -801,5 +803,50 @@ mod tests {
             data_type: DataType::Int64,
             nullable: false,
         }
+    }
+
+    fn join_of(left: LogicalPlan, right: LogicalPlan) -> LogicalPlan {
+        // An inner equi-join on region columns from left (id=1) and right (id=10).
+        let condition = TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(col_expr(1, "region")),
+                op: BinOp::Eq,
+                right: Box::new(col_expr(10, "region")),
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        };
+        LogicalPlan::Join(JoinNode {
+            left: Box::new(left),
+            right: Box::new(right),
+            join_type: JoinKind::Inner,
+            condition: Some(condition),
+            required_output_columns: None,
+        })
+    }
+
+    #[test]
+    fn pipeline_branch_union_of_aggregate_over_join_composes() {
+        use crate::sql::optimizer::rewrite::imv::marker::plan_contains_imv_marker;
+        use crate::sql::optimizer::rewrite::imv::pipeline::build_imv_pipeline;
+
+        let mut ctx = build_ctx();
+        let plan = LogicalPlan::Union(UnionNode {
+            inputs: vec![
+                aggregate_over(join_of(scan("b", 1), scan("b", 10))),
+                aggregate_over(join_of(scan("b", 20), scan("b", 30))),
+            ],
+            all: true,
+            output_columns: vec![output_column(1, "region"), output_column(3, "s")],
+            required_output_columns: None,
+        });
+
+        let out = build_imv_pipeline()
+            .rewrite(plan, &mut ctx)
+            .expect("branch union of aggregate-over-join must compose");
+        assert!(
+            !plan_contains_imv_marker(&out),
+            "no marker may survive: the inner joins must be delta-expanded and bound"
+        );
     }
 }
