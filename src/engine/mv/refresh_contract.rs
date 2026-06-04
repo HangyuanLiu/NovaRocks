@@ -1539,10 +1539,7 @@ mod tests {
 
         let contract = derive_imv_refresh_contract(&analysis).expect("derive contract");
 
-        assert_eq!(
-            contract.strategy,
-            RefreshStrategy::BranchUnionAggregate
-        );
+        assert_eq!(contract.strategy, RefreshStrategy::BranchUnionAggregate);
         assert_eq!(contract.base_refs.len(), 2);
         assert_eq!(contract.branch.expect("branch contract").branch_count, 2);
         assert_eq!(

@@ -993,8 +993,7 @@ fn load_bases_for_refresh_contract(
             validate_join_shape_base_refs(join_shape, base_refs)?;
             load_all_bases_with_row_lineage(state, base_refs)
         }
-        RefreshStrategy::UnionProjectionFilter
-        | RefreshStrategy::BranchUnionAggregate => {
+        RefreshStrategy::UnionProjectionFilter | RefreshStrategy::BranchUnionAggregate => {
             load_all_bases_with_row_lineage(state, base_refs)
         }
         RefreshStrategy::FanInAggregate => {
@@ -1499,8 +1498,7 @@ fn build_iceberg_mv_schema_contract(
                 )?,
             }
         }
-        RefreshStrategy::UnionProjectionFilter
-        | RefreshStrategy::BranchUnionAggregate => {
+        RefreshStrategy::UnionProjectionFilter | RefreshStrategy::BranchUnionAggregate => {
             let IncrementalMvShape::UnionAll(union_shape) = shape else {
                 return Err(refresh_contract_legacy_shape_mismatch_error(
                     refresh_contract.strategy,
@@ -4375,10 +4373,9 @@ fn stored_strategy_matches_legacy_shape(
             !aggregate_shape.fan_in_bases.is_empty()
         }
         (RefreshStrategy::JoinAggregate, IncrementalMvShape::JoinAggregate(_)) => true,
-        (
-            RefreshStrategy::BranchUnionAggregate,
-            IncrementalMvShape::UnionAll(union_shape),
-        ) => union_shape.branch_kind == UnionBranchKind::Aggregate,
+        (RefreshStrategy::BranchUnionAggregate, IncrementalMvShape::UnionAll(union_shape)) => {
+            union_shape.branch_kind == UnionBranchKind::Aggregate
+        }
         _ => false,
     }
 }

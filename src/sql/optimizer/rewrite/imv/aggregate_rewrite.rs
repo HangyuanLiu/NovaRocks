@@ -13,7 +13,7 @@ use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
 use crate::sql::optimizer::rewrite::imv::annotation::ImvExtension;
 use crate::sql::optimizer::rewrite::imv::join_delta::plan_output_columns;
-use crate::sql::optimizer::rewrite::imv::marker::{plan_contains_imv_marker, ImvDeltaNode};
+use crate::sql::optimizer::rewrite::imv::marker::{ImvDeltaNode, plan_contains_imv_marker};
 use crate::sql::optimizer::rewrite::imv::target_state::build_target_state_scan_source;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
@@ -1062,17 +1062,17 @@ fn string_literal(value: &str) -> TypedExpr {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::atomic::AtomicU32;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicU32;
 
     use arrow::datatypes::DataType;
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
     use super::*;
+    use crate::engine::mv::refresh_context::IcebergMvRewriteContext;
     use crate::engine::mv::refresh_context::tests_support::{
         make_mv_definition, make_pin, make_ref, make_schema_contract, make_target, parse_query,
     };
-    use crate::engine::mv::refresh_context::IcebergMvRewriteContext;
     use crate::meta::repository::mv_contract::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
         ApplyKeySource, BranchIdColumnContract, BranchUnionContract, MvPartitionContract,
@@ -1714,10 +1714,12 @@ mod tests {
             panic!("expected branch predicate to reference branch column");
         };
         assert_eq!(*column_id, branch_output.column_id);
-        assert!(project
-            .items
-            .iter()
-            .all(|item| !item.output_name.eq_ignore_ascii_case("__branch_id__")));
+        assert!(
+            project
+                .items
+                .iter()
+                .all(|item| !item.output_name.eq_ignore_ascii_case("__branch_id__"))
+        );
         for item in &project.items {
             let source = find_output_column_by_name(old_scan.columns.as_slice(), &item.output_name)
                 .expect("project source column");
