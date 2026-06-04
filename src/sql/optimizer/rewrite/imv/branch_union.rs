@@ -99,6 +99,9 @@ impl LogicalRewriteRule for RewriteBranchUnionRule {
             // Tag the aggregate core as an independent, branch-scoped delta sub-problem.
             // The existing aggregate-state (and join/union-delta beneath it) rules
             // decompose it in later stages, reading branch_scope off this marker.
+            // Each branch becomes its own root delta sub-problem: `is_root` is
+            // per-sub-problem here, so the post-branch plan intentionally holds one
+            // root delta per branch (not a single global root).
             let scope = crate::sql::catalog::BranchScope {
                 branch_id_column_name: ICEBERG_MV_BRANCH_ID_COLUMN.to_string(),
                 branch_id,
@@ -288,9 +291,8 @@ mod tests {
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
         ApplyKeySource, BranchIdColumnContract, BranchUnionContract,
     };
-    use crate::sql::analysis::JoinKind;
     use crate::sql::analysis::{
-        BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
+        BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
     };
     use crate::sql::catalog::{
         ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
@@ -505,14 +507,17 @@ mod tests {
             let LogicalPlan::Project(p) = branch else {
                 panic!("expected Project branch, got {branch:?}")
             };
-            assert!(matches!(
-                p.input.as_ref(),
-                LogicalPlan::AggregateStateMerge(_)
-            ));
+            assert!(
+                matches!(p.input.as_ref(), LogicalPlan::AggregateStateMerge(_)),
+                "expected Project over AggregateStateMerge, got {:?}",
+                p.input
+            );
             assert!(
                 p.items
                     .iter()
-                    .any(|i| i.output_name.eq_ignore_ascii_case("__branch_id__"))
+                    .any(|i| i.output_name.eq_ignore_ascii_case("__branch_id__")),
+                "branch Project must carry __branch_id__, items: {:?}",
+                p.items
             );
         }
     }
