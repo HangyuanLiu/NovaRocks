@@ -132,7 +132,7 @@ fn aligned_shuffle_keys(
 
 fn hash_join_only_shuffle(join_type: crate::sql::analysis::JoinKind) -> bool {
     use crate::sql::analysis::JoinKind::*;
-    matches!(join_type, RightOuter | RightSemi | RightAnti | FullOuter)
+    matches!(join_type, RightSemi | RightAnti | FullOuter)
 }
 
 /// Given a set of column ids representing a HashPartitioned key, and the
@@ -463,12 +463,11 @@ mod tests {
         assert_eq!(broadcast[0].kind, PropertyAlternativeKind::BroadcastJoin);
 
         op.join_type = crate::sql::analysis::JoinKind::RightOuter;
-        let broadcast_only_shuffle =
-            op.derive_required_alternatives(&PhysicalPropertySet::any(), 2);
-        assert_eq!(broadcast_only_shuffle.len(), 1);
+        let right_outer_broadcast = op.derive_required_alternatives(&PhysicalPropertySet::any(), 2);
+        assert_eq!(right_outer_broadcast.len(), 1);
         assert_eq!(
-            broadcast_only_shuffle[0].kind,
-            PropertyAlternativeKind::ShuffleJoin
+            right_outer_broadcast[0].kind,
+            PropertyAlternativeKind::BroadcastJoin
         );
 
         op.join_type = crate::sql::analysis::JoinKind::Inner;
@@ -639,9 +638,27 @@ mod tests {
     }
 
     #[test]
-    fn hash_join_right_and_full_family_alternatives_are_shuffle_only() {
+    fn hash_join_right_outer_alternatives_include_broadcast_and_shuffle() {
+        let op = PhysicalHashJoinOp {
+            join_type: crate::sql::analysis::JoinKind::RightOuter,
+            eq_conditions: vec![PhysicalHashJoinEqCondition {
+                left: col(10),
+                right: col(20),
+                null_safe: false,
+            }],
+            other_condition: None,
+            distribution: JoinDistribution::Unknown,
+        };
+
+        let alternatives = op.derive_required_alternatives(&PhysicalPropertySet::any(), 2);
+        assert_eq!(alternatives.len(), 2);
+        assert_eq!(alternatives[0].kind, PropertyAlternativeKind::BroadcastJoin);
+        assert_eq!(alternatives[1].kind, PropertyAlternativeKind::ShuffleJoin);
+    }
+
+    #[test]
+    fn hash_join_right_semi_anti_and_full_alternatives_are_shuffle_only() {
         for join_type in [
-            crate::sql::analysis::JoinKind::RightOuter,
             crate::sql::analysis::JoinKind::RightSemi,
             crate::sql::analysis::JoinKind::RightAnti,
             crate::sql::analysis::JoinKind::FullOuter,

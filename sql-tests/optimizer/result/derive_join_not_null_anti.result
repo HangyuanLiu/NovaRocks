@@ -1,12 +1,13 @@
 Explain String
 GATHER EXCHANGE stats={rows=40000}
   PROJECT [l.v AS v] stats={rows=40000}
-    HASH JOIN (BROADCAST, LEFT ANTI, eq: [l.k = r.k]) stats={rows=40000}
-      SCAN db_sqlt_02c79e7866d27677.t_dnn_al (alias=l) stats={rows=100000}
-           TABLE: db_sqlt_02c79e7866d27677.t_dnn_al
-           columns: k, v
-           min-max stats
-      GATHER EXCHANGE stats={rows=100000}
+    HASH JOIN (PARTITIONED, LEFT ANTI, eq: [l.k = r.k]) stats={rows=40000}
+      HASH EXCHANGE (source: ShuffleJoin, hash: [c1, c3]) stats={rows=100000}
+        SCAN db_sqlt_02c79e7866d27677.t_dnn_al (alias=l) stats={rows=100000}
+             TABLE: db_sqlt_02c79e7866d27677.t_dnn_al
+             columns: k, v
+             min-max stats
+      HASH EXCHANGE (source: ShuffleJoin, hash: [c1, c3]) stats={rows=100000}
         SCAN db_sqlt_02c79e7866d27677.t_dnn_ar (alias=r) stats={rows=100000}
              TABLE: db_sqlt_02c79e7866d27677.t_dnn_ar
              columns: k

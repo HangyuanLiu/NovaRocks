@@ -14,7 +14,7 @@ GATHER EXCHANGE stats={rows=10}
                    TABLE: db_sqlt_437af06dfdaad5eb.t_agg_pd_lo_b
                    columns: k
                    min-max stats
-              GATHER EXCHANGE stats={rows=10}
+              BROADCAST EXCHANGE stats={rows=10}
                 HASH AGGREGATE (GLOBAL, group by: [a.k]) stats={rows=10}
                   aggregations: sum(a.v)
                   HASH EXCHANGE (source: ShuffleAgg, hash: [c1]) stats={rows=10}
