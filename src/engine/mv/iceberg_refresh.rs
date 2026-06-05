@@ -9108,8 +9108,18 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan(
         current_catalog,
         current_database,
     );
-    let shape = classify_incremental_mv_query(&canonical_select_query)?;
-    if aggregate_shape_for_layout(&shape).is_some() {
+    // Capability-driven (not classifier-driven): the aggregate metadata
+    // validation runs when the persisted contract carries an aggregate state.
+    // Deriving this from the schema contract instead of re-classifying the
+    // SELECT keeps EXPLAIN REFRESH working for composed branch-union shapes
+    // whose branches contain joins (the legacy classifier rejects those).
+    let dispatch_schema_contract = mv_definition.schema_contract.as_ref().ok_or_else(|| {
+        format!(
+            "iceberg MV target {}.{}.{} is missing A11 schema contract; rebuild or recreate the MV",
+            target.catalog, target.namespace, target.table
+        )
+    })?;
+    if RefreshCapabilities::from_schema_contract(dispatch_schema_contract)?.has_agg_state {
         validate_aggregate_schema_contract_metadata(&target, &mv_definition)?;
     }
 

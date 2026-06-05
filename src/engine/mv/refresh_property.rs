@@ -158,8 +158,8 @@ impl RefreshCapabilities {
 /// Derive `RefreshCapabilities` from a persisted `MvSchemaContract`.
 ///
 /// Returns `Err(String)` for contract shapes that do not correspond to any
-/// supported strategy (e.g. joint+branch, which is rejected at CREATE time
-/// and should never be persisted).
+/// supported strategy. A composed branch-union of aggregate-over-join persists
+/// a join + aggregate + branch contract (join+agg+branch) and is supported here.
 pub(crate) fn from_schema_contract(c: &MvSchemaContract) -> Result<RefreshCapabilities, String> {
     let has_join = c.join.is_some();
     let has_agg = c.aggregate.is_some();
@@ -168,12 +168,18 @@ pub(crate) fn from_schema_contract(c: &MvSchemaContract) -> Result<RefreshCapabi
 
     // Snapshot policy: mirrors stored_refresh_strategy_for_plan + the
     // per-strategy base-snapshot-policy chosen by the driver wrappers.
-    //   join                     -> JoinPairPartialInitialSkip
-    //   multiple bases or branch -> AllBasesRequired
-    //   single base, no branch   -> SingleBase
-    let snapshot_policy = if has_join {
+    //   branch (incl. composed over join) -> AllBasesRequired
+    //   join (no branch)                  -> JoinPairPartialInitialSkip
+    //   multiple bases (no branch/join)   -> AllBasesRequired
+    //   single base                       -> SingleBase
+    // Branch takes precedence over join: a composed branch-union of
+    // aggregate-over-join persists both a join and a branch section, and the
+    // branch-scoped refresh driver requires every base snapshot (AllBasesRequired).
+    let snapshot_policy = if has_branch {
+        BaseSnapshotPolicy::AllBasesRequired
+    } else if has_join {
         BaseSnapshotPolicy::JoinPairPartialInitialSkip
-    } else if has_extra_bases || has_branch {
+    } else if has_extra_bases {
         BaseSnapshotPolicy::AllBasesRequired
     } else {
         BaseSnapshotPolicy::SingleBase
@@ -222,7 +228,8 @@ pub(crate) fn from_schema_contract(c: &MvSchemaContract) -> Result<RefreshCapabi
         | (false, false, true)  // UnionProjectionFilter
         | (false, true,  false) // SingleAggregate or FanInAggregate
         | (true,  true,  false) // JoinAggregate
-        | (false, true,  true)  // BranchUnionAggregate
+        | (false, true,  true)  // BranchUnionAggregate (simple branches)
+        | (true,  true,  true)  // BranchUnionAggregate over join (composed)
         => {}
         _ => {
             return Err(format!(
@@ -2531,6 +2538,51 @@ mod tests {
             ),
         };
         let caps = from_schema_contract(&c).expect("branch_union_aggregate");
+        assert_eq!(caps.snapshot_policy, BaseSnapshotPolicy::AllBasesRequired);
+        assert!(caps.has_agg_state);
+        assert_eq!(
+            caps.identity,
+            RefreshIdentity::BranchScoped(Box::new(RefreshIdentity::GroupRowId))
+        );
+        assert_eq!(caps.apply_key_column, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME);
+        assert_eq!(caps.apply_key_value_type, ApplyKeyValueType::BranchUtf8);
+    }
+
+    /// Composed BranchUnionAggregate: aggregate-over-join branches persist a
+    /// join + aggregate + branch contract (join+agg+branch = true,true,true).
+    /// It shares the simple branch-union dispatch tuple (AllBasesRequired,
+    /// agg-state, BranchScoped(GroupRowId)) — the per-branch join is handled by
+    /// the focused extractor + RewriteBranchUnion at execution, not by the
+    /// capability dispatch. Regression guard for (a) the join+agg+branch shape
+    /// being a supported shape and (b) has_branch taking precedence over
+    /// has_join in the snapshot policy (a composed branch-union needs every base
+    /// snapshot, not the join-pair partial-initial-skip).
+    #[test]
+    fn parity_composed_branch_union_aggregate_over_join() {
+        let c = MvSchemaContract {
+            contract_version: 2,
+            base: parity_base("ice.db.left", "uuid-left"),
+            bases: vec![
+                parity_base("ice.db.left", "uuid-left"),
+                parity_base("ice.db.right", "uuid-right"),
+            ],
+            output: parity_output(),
+            join: Some(parity_join()),
+            aggregate: Some(parity_agg()),
+            branch: Some(BranchUnionContract {
+                branch_id_column: BranchIdColumnContract {
+                    column_name: "__nova_branch_id".to_string(),
+                    target_field_id: 100,
+                },
+                branch_count: 2,
+                inner_apply_key_source: ApplyKeySource::GroupRowId,
+            }),
+            target: parity_target(
+                GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
+                ApplyKeySource::GroupRowId,
+            ),
+        };
+        let caps = from_schema_contract(&c).expect("composed branch_union_aggregate over join");
         assert_eq!(caps.snapshot_policy, BaseSnapshotPolicy::AllBasesRequired);
         assert!(caps.has_agg_state);
         assert_eq!(
