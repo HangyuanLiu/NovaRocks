@@ -1371,6 +1371,14 @@ impl<'a> AnalyzerContext<'a> {
                 emitted_grouping_marker_count,
             );
         }
+        if let Some(from) = sel.from.as_mut() {
+            replace_grouping_markers_in_relation(
+                from,
+                &grouping_fn_args,
+                &grouping_fn_ids,
+                emitted_grouping_marker_count,
+            );
+        }
 
         // Attach RepeatInfo to the resolved SELECT.
         sel.repeat = Some(RepeatInfo {
@@ -3486,6 +3494,54 @@ fn replace_grouping_markers_in_typed_expr(
     }
 }
 
+fn replace_grouping_markers_in_relation(
+    rel: &mut Relation,
+    grouping_fn_args: &[(String, Vec<String>)],
+    grouping_fn_ids: &[(String, ColumnId)],
+    emitted_marker_count: usize,
+) {
+    match rel {
+        Relation::Join(join) => {
+            replace_grouping_markers_in_relation(
+                &mut join.left,
+                grouping_fn_args,
+                grouping_fn_ids,
+                emitted_marker_count,
+            );
+            replace_grouping_markers_in_relation(
+                &mut join.right,
+                grouping_fn_args,
+                grouping_fn_ids,
+                emitted_marker_count,
+            );
+            if let Some(condition) = join.condition.as_mut() {
+                *condition = replace_grouping_markers_in_typed_expr(
+                    condition,
+                    grouping_fn_args,
+                    grouping_fn_ids,
+                    emitted_marker_count,
+                );
+            }
+        }
+        Relation::Unnest(unnest) => {
+            for arg in &mut unnest.args {
+                *arg = replace_grouping_markers_in_typed_expr(
+                    arg,
+                    grouping_fn_args,
+                    grouping_fn_ids,
+                    emitted_marker_count,
+                );
+            }
+        }
+        Relation::Scan(_)
+        | Relation::IcebergMetadataScan(_)
+        | Relation::IcebergDeltaScan(_)
+        | Relation::Subquery { .. }
+        | Relation::GenerateSeries(_)
+        | Relation::CTEConsume { .. } => {}
+    }
+}
+
 fn is_bitmap_or_hll_type(sql_type: &crate::sql::SqlType) -> bool {
     matches!(
         sql_type,
@@ -5452,6 +5508,67 @@ mod tests {
         }
     }
 
+    fn find_grouping_ref_id_in_relation(
+        rel: &Relation,
+        name: &str,
+    ) -> Option<crate::sql::column_id::ColumnId> {
+        match rel {
+            Relation::Join(join) => join
+                .condition
+                .as_ref()
+                .and_then(|expr| find_grouping_ref_id(expr, name))
+                .or_else(|| find_grouping_ref_id_in_relation(&join.left, name))
+                .or_else(|| find_grouping_ref_id_in_relation(&join.right, name)),
+            Relation::Unnest(unnest) => unnest
+                .args
+                .iter()
+                .find_map(|expr| find_grouping_ref_id(expr, name)),
+            Relation::Scan(_)
+            | Relation::IcebergMetadataScan(_)
+            | Relation::IcebergDeltaScan(_)
+            | Relation::Subquery { .. }
+            | Relation::GenerateSeries(_)
+            | Relation::CTEConsume { .. } => None,
+        }
+    }
+
+    fn relation_contains_grouping_marker_literal(rel: &Relation) -> bool {
+        match rel {
+            Relation::Join(join) => {
+                join.condition
+                    .as_ref()
+                    .is_some_and(contains_grouping_marker_literal)
+                    || relation_contains_grouping_marker_literal(&join.left)
+                    || relation_contains_grouping_marker_literal(&join.right)
+            }
+            Relation::Unnest(unnest) => unnest.args.iter().any(contains_grouping_marker_literal),
+            Relation::Scan(_)
+            | Relation::IcebergMetadataScan(_)
+            | Relation::IcebergDeltaScan(_)
+            | Relation::Subquery { .. }
+            | Relation::GenerateSeries(_)
+            | Relation::CTEConsume { .. } => false,
+        }
+    }
+
+    fn outer_select_contains_grouping_marker_literal(sel: &ResolvedSelect) -> bool {
+        sel.projection
+            .iter()
+            .any(|item| contains_grouping_marker_literal(&item.expr))
+            || sel
+                .filter
+                .as_ref()
+                .is_some_and(contains_grouping_marker_literal)
+            || sel
+                .having
+                .as_ref()
+                .is_some_and(contains_grouping_marker_literal)
+            || sel
+                .from
+                .as_ref()
+                .is_some_and(relation_contains_grouping_marker_literal)
+    }
+
     #[test]
     fn p1_grouping_marker_carries_group_by_id() {
         let resolved =
@@ -5601,6 +5718,31 @@ mod tests {
         assert!(
             !contains_grouping_marker_literal(projection),
             "aggregate ORDER BY must not retain grouping marker literal: {projection:?}"
+        );
+    }
+
+    #[test]
+    fn p1_grouping_marker_replaced_in_having_in_subquery_join_condition() {
+        let resolved = parse_and_analyze(
+            "SELECT k1 FROM t1 \
+             GROUP BY ROLLUP(k1) \
+             HAVING grouping(k1) IN (SELECT k2 FROM t2)",
+        )
+        .expect("GROUPING in HAVING IN subquery should work");
+        let QueryBody::Select(sel) = &resolved.body else {
+            panic!("expected Select body");
+        };
+        let from = sel.from.as_ref().expect("expected rewritten FROM relation");
+        let gb_id = grouping_fn_group_by_id(sel, "__grouping_fn_0");
+        let join_id = find_grouping_ref_id_in_relation(from, "__grouping_fn_0")
+            .expect("expected rewritten join condition grouping ColumnRef");
+        assert_eq!(
+            join_id, gb_id,
+            "rewritten join condition grouping ref must reuse the group-by key id"
+        );
+        assert!(
+            !outer_select_contains_grouping_marker_literal(sel),
+            "outer select must not retain grouping marker literal: {sel:?}"
         );
     }
 
