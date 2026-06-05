@@ -6,7 +6,7 @@
 /// the table structure.
 use super::mv_shape::{
     AggregateCallShape, AggregateMvShape, GroupKeyShape, VisibleAggregateOutput,
-    classify_aggregate_select_outputs,
+    classify_aggregate_select_outputs, table_factor_name_and_alias,
 };
 
 /// The focused aggregate-call surface extracted from a stored MV SELECT.
@@ -25,6 +25,90 @@ pub(crate) struct AggregateSqlCalls {
     /// order of the stored SELECT so that downstream layout / codec / merge
     /// operators can derive column positions deterministically.
     pub(crate) visible_outputs: Vec<VisibleAggregateOutput>,
+}
+
+/// FROM-side complement to [`extract_aggregate_sql_calls`] for the Iceberg join refresh path.
+///
+/// Supplies the one execution-load-bearing join field (table aliases) needed by the
+/// de-classified Iceberg join refresh rewriters (`rewrite_join_full_refresh_query`,
+/// `rewrite_join_branch_query`). The aggregate-call content is sourced separately via
+/// [`extract_aggregate_sql_calls`]; this struct carries only the FROM-side aliases.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct JoinAliases {
+    /// Fully-qualified name of the left (FROM) table, e.g. `"ice.ns.orders"` —
+    /// the `ObjectName.to_string()` form the legacy join shape stored, which the
+    /// base-ref matching compares against `base.fqn()`.
+    pub(crate) left_table: String,
+    /// Left table alias: the explicit alias if present, else the last name
+    /// identifier (the legacy `table_factor_name_and_alias` fallback). The join
+    /// SQL rewriters resolve column references against this, so it is never empty.
+    pub(crate) left_alias: String,
+    /// Fully-qualified name of the right (JOIN) table.
+    pub(crate) right_table: String,
+    /// Right table alias (explicit, else the last name identifier).
+    pub(crate) right_alias: String,
+}
+
+/// Extract the left/right table FQNs and aliases from a two-relation join SELECT.
+///
+/// FROM-side complement to [`extract_aggregate_sql_calls`]: it reads the single
+/// top-level SELECT's `FROM` clause and returns the fully-qualified table names and
+/// aliases for the left (FROM relation) and right (first JOIN relation), reusing
+/// `table_factor_name_and_alias` so the output is byte-identical to what the legacy
+/// `JoinProjectionFilterMvShape`/`JoinAggregateMvShape` carried — aliases fall back to
+/// the last name identifier when no explicit alias is present, and the names are the
+/// full `ObjectName.to_string()` form the base-ref matching compares against.
+///
+/// The join ON condition and all projection/aggregate columns are intentionally ignored —
+/// this extractor exists solely to supply the table/alias pair the Iceberg join refresh
+/// path consumes (the join keys are never read by any refresh/plan path).
+///
+/// Returns `Err` if the query is not a plain SELECT over exactly one `FROM` table joined
+/// to exactly one other table, or if either relation is not a plain 3-part Iceberg table
+/// (inherited from `table_factor_name_and_alias`).
+pub(crate) fn extract_join_aliases(query: &sqlparser::ast::Query) -> Result<JoinAliases, String> {
+    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return Err(
+            "extract_join_aliases: expected a plain SELECT body, not a set operation".to_string(),
+        );
+    };
+
+    let [from] = select.from.as_slice() else {
+        return Err(
+            "extract_join_aliases: expected exactly one FROM clause entry for a two-relation join"
+                .to_string(),
+        );
+    };
+
+    let [join] = from.joins.as_slice() else {
+        if from.joins.is_empty() {
+            return Err(
+                "extract_join_aliases: expected a two-relation join (FROM ... JOIN ...), \
+                 but the FROM clause has no joins"
+                    .to_string(),
+            );
+        }
+        return Err(format!(
+            "extract_join_aliases: expected exactly one JOIN, found {}",
+            from.joins.len()
+        ));
+    };
+
+    // Reuse the legacy `table_factor_name_and_alias` so the (table FQN, alias)
+    // pair is byte-identical to what the legacy join shape carried: the name is
+    // the full `ObjectName`, and the alias falls back to the last name
+    // identifier when no explicit alias is present. This also inherits the
+    // "plain 3-part Iceberg table" validation, which the canonical MV SELECT
+    // always satisfies.
+    let (left_name, left_alias) = table_factor_name_and_alias(&from.relation)?;
+    let (right_name, right_alias) = table_factor_name_and_alias(&join.relation)?;
+
+    Ok(JoinAliases {
+        left_table: left_name.to_string(),
+        left_alias,
+        right_table: right_name.to_string(),
+        right_alias,
+    })
 }
 
 /// TEMPORARY bridge: project the aggregate-call subset out of an
@@ -230,6 +314,73 @@ mod tests {
         assert!(
             err.contains("GROUP BY key") || err.contains("aggregate call"),
             "expected GROUP BY key or aggregate call error, got: {err}"
+        );
+    }
+
+    // --- extract_join_aliases tests ---
+
+    fn extract_aliases(sql: &str) -> Result<JoinAliases, String> {
+        let query = parse_query(sql);
+        extract_join_aliases(&query)
+    }
+
+    // (a) Join with explicit aliases on both sides (3-part Iceberg tables).
+    // → left_table="ice.ns.fact", left_alias="a", right_table="ice.ns.dim", right_alias="b"
+    #[test]
+    fn join_aliases_with_explicit_aliases() {
+        let aliases = extract_aliases(
+            "SELECT a.k, b.v FROM ice.ns.fact a JOIN ice.ns.dim b ON a.dim_id = b.id",
+        )
+        .expect("join with explicit aliases should succeed");
+
+        assert_eq!(aliases.left_table, "ice.ns.fact");
+        assert_eq!(aliases.left_alias, "a");
+        assert_eq!(aliases.right_table, "ice.ns.dim");
+        assert_eq!(aliases.right_alias, "b");
+    }
+
+    // (b) Join with no aliases: the alias falls back to the last name identifier
+    // (legacy `table_factor_name_and_alias` semantics), not None / empty.
+    #[test]
+    fn join_aliases_fall_back_to_table_name() {
+        let aliases = extract_aliases(
+            "SELECT fact.k, dim.v FROM ice.ns.fact JOIN ice.ns.dim ON fact.dim_id = dim.id",
+        )
+        .expect("join without aliases should succeed");
+
+        assert_eq!(aliases.left_table, "ice.ns.fact");
+        assert_eq!(
+            aliases.left_alias, "fact",
+            "fallback to last name identifier"
+        );
+        assert_eq!(aliases.right_table, "ice.ns.dim");
+        assert_eq!(
+            aliases.right_alias, "dim",
+            "fallback to last name identifier"
+        );
+    }
+
+    // (c) Non-join SELECT (single table, no joins) must return Err.
+    #[test]
+    fn join_aliases_rejects_non_join() {
+        let err = extract_aliases("SELECT k FROM ice.ns.fact")
+            .expect_err("non-join SELECT must be rejected");
+        assert!(
+            !err.is_empty(),
+            "expected an error message, got empty string"
+        );
+    }
+
+    // (d) A non-3-part table name is rejected (inherited from
+    // `table_factor_name_and_alias`): the canonical Iceberg MV SELECT is always
+    // 3-part, and the legacy join shape required it.
+    #[test]
+    fn join_aliases_rejects_non_three_part_table() {
+        let err = extract_aliases("SELECT a.k, b.v FROM fact a JOIN dim b ON a.dim_id = b.id")
+            .expect_err("non-3-part table names must be rejected");
+        assert!(
+            !err.is_empty(),
+            "expected an error message, got empty string"
         );
     }
 }

@@ -524,7 +524,7 @@ fn classify_join_projection_filter_mv_query_for_select(
     })
 }
 
-fn table_factor_name_and_alias(
+pub(crate) fn table_factor_name_and_alias(
     factor: &sqlparser::ast::TableFactor,
 ) -> Result<(sqlparser::ast::ObjectName, String), String> {
     let sqlparser::ast::TableFactor::Table {
