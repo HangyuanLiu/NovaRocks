@@ -111,6 +111,46 @@ pub(crate) fn extract_join_aliases(query: &sqlparser::ast::Query) -> Result<Join
     })
 }
 
+/// Extract the single base-table FQN from a single-scan SELECT.
+///
+/// FROM-side complement to [`extract_aggregate_sql_calls`] / [`extract_join_aliases`]
+/// for the projection/filter-over-single-scan branch of the Iceberg path: it reads the
+/// single top-level SELECT's `FROM` clause (which must have exactly one relation and no
+/// joins) and returns the fully-qualified table name, reusing `table_factor_name_and_alias`
+/// so the FQN is byte-identical to what the legacy `ProjectionFilterMvShape.base_table`
+/// carried (the full `ObjectName.to_string()` form the base-ref matching compares against).
+///
+/// The projection list and WHERE filter are intentionally ignored — this extractor exists
+/// solely to resolve a single-scan branch's base table out of the loaded base set.
+///
+/// Returns `Err` if the query is not a plain SELECT over exactly one `FROM` table with no
+/// joins, or if the relation is not a plain 3-part Iceberg table (inherited from
+/// `table_factor_name_and_alias`).
+pub(crate) fn extract_single_scan_table_fqn(
+    query: &sqlparser::ast::Query,
+) -> Result<String, String> {
+    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return Err(
+            "extract_single_scan_table_fqn: expected a plain SELECT body, not a set operation"
+                .to_string(),
+        );
+    };
+    let [from] = select.from.as_slice() else {
+        return Err(
+            "extract_single_scan_table_fqn: expected exactly one FROM clause entry for a single scan"
+                .to_string(),
+        );
+    };
+    if !from.joins.is_empty() {
+        return Err(
+            "extract_single_scan_table_fqn: expected a single-scan FROM, but the FROM clause has joins"
+                .to_string(),
+        );
+    }
+    let (name, _alias) = table_factor_name_and_alias(&from.relation)?;
+    Ok(name.to_string())
+}
+
 /// TEMPORARY bridge: project the aggregate-call subset out of an
 /// `AggregateMvShape`.
 ///
@@ -378,6 +418,45 @@ mod tests {
     fn join_aliases_rejects_non_three_part_table() {
         let err = extract_aliases("SELECT a.k, b.v FROM fact a JOIN dim b ON a.dim_id = b.id")
             .expect_err("non-3-part table names must be rejected");
+        assert!(
+            !err.is_empty(),
+            "expected an error message, got empty string"
+        );
+    }
+
+    // --- extract_single_scan_table_fqn tests ---
+
+    fn extract_scan_fqn(sql: &str) -> Result<String, String> {
+        let query = parse_query(sql);
+        extract_single_scan_table_fqn(&query)
+    }
+
+    // (a) A single-scan SELECT returns the full 3-part FQN (projection/filter
+    // ignored), byte-identical to the legacy `ProjectionFilterMvShape.base_table`.
+    #[test]
+    fn single_scan_table_fqn_basic() {
+        let fqn =
+            extract_scan_fqn("SELECT k, v FROM ice.ns.fact WHERE v > 1").expect("single scan");
+        assert_eq!(fqn, "ice.ns.fact");
+    }
+
+    // (b) A join SELECT is rejected (it is not a single scan).
+    #[test]
+    fn single_scan_table_fqn_rejects_join() {
+        let err =
+            extract_scan_fqn("SELECT a.k FROM ice.ns.fact a JOIN ice.ns.dim b ON a.id = b.id")
+                .expect_err("a join is not a single scan");
+        assert!(
+            err.contains("joins"),
+            "expected a join rejection, got: {err}"
+        );
+    }
+
+    // (c) A set-operation body is rejected (the extractor wants a plain SELECT).
+    #[test]
+    fn single_scan_table_fqn_rejects_set_operation() {
+        let err = extract_scan_fqn("SELECT k FROM ice.ns.t1 UNION ALL SELECT k FROM ice.ns.t2")
+            .expect_err("a set operation is not a single scan");
         assert!(
             !err.is_empty(),
             "expected an error message, got empty string"
