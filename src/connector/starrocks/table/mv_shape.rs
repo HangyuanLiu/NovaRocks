@@ -410,7 +410,7 @@ fn classify_join_aggregate_mv_query(
     })
 }
 
-fn classify_aggregate_select_outputs(
+pub(crate) fn classify_aggregate_select_outputs(
     select: &sqlparser::ast::Select,
 ) -> Result<
     (
