@@ -2378,7 +2378,10 @@ fn iceberg_aggregate_first_refresh_select_sql(
     select_sql: &str,
     shape: &crate::connector::starrocks::table::mv_shape::AggregateMvShape,
 ) -> Result<String, String> {
-    crate::connector::starrocks::table::mv_shape::rewrite_select_sql_for_state(select_sql, shape)
+    crate::connector::starrocks::table::mv_shape::rewrite_select_sql_for_state(
+        select_sql,
+        &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls::from(shape),
+    )
 }
 
 /// Refresh an iceberg-backed materialized view.

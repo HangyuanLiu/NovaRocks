@@ -566,7 +566,10 @@ fn execute_aggregate_mv_full_refresh(
 
     // Step 3: rewrite the SELECT to emit state columns (AVG → SUM + COUNT) and execute
     // it to obtain the actual state-shaped data.
-    let state_sql = super::mv_shape::rewrite_select_sql_for_state(&ctx.select_sql, shape)?;
+    let state_sql = super::mv_shape::rewrite_select_sql_for_state(
+        &ctx.select_sql,
+        &super::aggregate_sql_calls::AggregateSqlCalls::from(shape),
+    )?;
     let result = execute_query_for_mv_refresh(&ctx.state, &ctx.database, &state_sql)?;
 
     // Step 4: materialize state-shaped executor result using the visible-type layout.
@@ -724,7 +727,7 @@ fn refresh_aggregate_mv_incremental(
     // aggregate, so any error from the rewriter is now a real error.
     let signed_state_sql = super::ivm_delta_aggregate::rewrite_select_sql_for_signed_delta_state(
         ctx.select_sql,
-        ctx.shape,
+        &super::aggregate_sql_calls::AggregateSqlCalls::from(ctx.shape),
     )?;
     let delta_result = execute_delta_source_query(
         IvmDeltaSourceInput {
