@@ -16,16 +16,20 @@
 //! instead of a closed enum of named strategies.
 //!
 //! The property algebra accepts a strictly larger set of UNION ALL shapes than
-//! the classifier did: it admits any UNION ALL whose branches synthesize the
-//! same `(TargetIdentity kind, StateContract kind)` (with matching aggregate
-//! arities), including previously-rejected composed branches such as
-//! `Aggregate(Join(..))`. `into_refresh_contract` then narrows the property to
-//! the set whose apply key is representable. For every shape the legacy
-//! classifier supported, that narrowing emits a byte-for-byte equivalent
-//! contract; on top of that it additionally admits a `BranchScoped(GroupRowId)`
-//! UNION ALL of *composed* aggregate branches (aggregate-over-join / fan-in),
-//! whose apply key is still `BranchUtf8` (A3). Truly-unrepresentable shapes
-//! (e.g. a UNION ALL of joins) are still rejected. See
+//! the refresh path can drive: it admits any UNION ALL whose branches
+//! synthesize the same `(TargetIdentity kind, StateContract kind)` (with
+//! matching aggregate arities), including composed branches such as
+//! `Aggregate(Join(..))`. `into_refresh_contract` then narrows the property
+//! back to the set the refresh path can actually execute incrementally, so
+//! CREATE never persists a contract whose refresh would fail. For every shape
+//! the legacy classifier supported, that narrowing emits a byte-for-byte
+//! equivalent contract. A `BranchScoped(GroupRowId)` UNION ALL of *composed*
+//! aggregate branches (aggregate-over-join / fan-in) is synthesized by the
+//! property algebra (the machinery is kept for a future Phase 4 that will add
+//! composed branch-union refresh), but `into_refresh_contract` REJECTS it today
+//! with an explicit "does not yet support … composed branch-union" message —
+//! the coherence gate that keeps CREATE aligned with refresh. Other
+//! unrepresentable shapes (e.g. a UNION ALL of joins) are also rejected. See
 //! [`RefreshFragmentProperty::into_refresh_contract`] for the precise narrowing.
 
 use crate::connector::starrocks::table::model::IcebergTableRef;
@@ -284,8 +288,10 @@ impl StateContract {
 /// (-> the legacy `BranchUnionAggregate`). Any composed branch — a join, a
 /// fan-in aggregate, a nested/subquery union, an aggregate over a join — landed
 /// in the classifier's catch-all rejection. `BranchShape` encodes which of
-/// those cases the synthesized branches correspond to; A3 now admits a
-/// `Composed` *aggregate* branch union (`into_refresh_contract`).
+/// those cases the synthesized branches correspond to. A `Composed` branch
+/// union is synthesized but rejected at the contract mapping (the coherence
+/// gate in `into_refresh_contract`) until composed branch-union refresh lands
+/// in Phase 4.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BranchShape {
     /// Every branch is a plain projection/filter over a single scan
@@ -327,9 +333,9 @@ pub(crate) struct RefreshFragmentProperty {
     /// `BranchScoped` property (the shape of its direct branches) and inherited
     /// by an aggregate synthesized directly over a UNION ALL (the shape of the
     /// union the aggregate fans in over). The contract mapping uses it to gate
-    /// which branch shapes each branch-bearing strategy admits — accepting a
-    /// composed aggregate branch union while still rejecting composed
-    /// projection/filter and fan-in shapes (see
+    /// which branch shapes each branch-bearing strategy admits — rejecting
+    /// composed projection/filter, fan-in, and (the coherence gate) composed
+    /// aggregate branch unions (see
     /// [`RefreshFragmentProperty::into_refresh_contract`]). Private: it is an
     /// internal narrowing input and is not read by property consumers.
     branch_shape: Option<BranchShape>,
@@ -345,34 +351,37 @@ impl RefreshFragmentProperty {
     /// `ApplyKeyContract` / `RefreshStrategy` the classifier chose.
     ///
     /// The property algebra accepts a strictly larger set of query shapes than
-    /// the legacy classifier (composed UNION ALL branches). This mapping is the
-    /// *single narrowing point*: it narrows back to the set whose apply key is
-    /// representable, so the emitted contract and its rejections stay aligned
-    /// with what the apply path can compute. The `branch_shape` carried up from
-    /// the set operation gates the three branch-bearing strategies:
+    /// the executable refresh path supports (composed UNION ALL branches). This
+    /// mapping is the *single narrowing point*: it narrows back to the set the
+    /// refresh path can actually drive incrementally, so the emitted contract
+    /// and its rejections stay aligned with what CREATE may coherently persist.
+    /// The `branch_shape` carried up from the set operation gates the three
+    /// branch-bearing strategies:
     ///   - `UnionProjectionFilter` requires `BranchShape::SimpleScan` branches;
     ///   - `FanInAggregate` requires the aggregated union to be
     ///     `BranchShape::SimpleScan`;
-    ///   - `BranchUnionAggregate` admits either `BranchShape::SimpleAggregate`
-    ///     *or* `BranchShape::Composed` branches.
+    ///   - `BranchUnionAggregate` requires `BranchShape::SimpleAggregate`
+    ///     branches (a UNION ALL of *simple* GROUP BY aggregates over scans).
     ///
-    /// What this NOW allows (A3 loosening): a `BranchScoped(GroupRowId)` union
-    /// whose branches are composed aggregates — an aggregate over a join
-    /// (`Agg(a JOIN b)`) or an aggregate over a fan-in union. Every such branch
-    /// still produces a per-branch group-row identity, so the composite apply
-    /// key is `BranchUtf8` (branch discriminant + per-group utf8), which the
-    /// apply path already represents. CREATE therefore succeeds and persists a
-    /// branch+aggregate contract whose per-branch lineage is built recursively
-    /// (see `build_iceberg_mv_schema_contract`).
+    /// Coherence gate (the Phase-4 lift point): a `BranchScoped(GroupRowId)`
+    /// union whose branches are *composed* aggregates — an aggregate over a join
+    /// (`Agg(a JOIN b)`) or an aggregate over a fan-in union — has a
+    /// representable `BranchUtf8` apply key, so the property synthesis still
+    /// builds it and `derive_fragment_property` keeps the machinery intact. But
+    /// the refresh path does not yet drive these composed shapes incrementally,
+    /// so admitting them at CREATE would produce a CREATE-succeeds-but-refresh-
+    /// fails half-state. This mapping therefore REJECTS a composed branch-union
+    /// aggregate with an explicit "does not yet support … composed branch-union"
+    /// error; full composed branch-union refresh support is deferred to Phase 4,
+    /// which will relax this single arm back to admit `BranchShape::Composed`.
     ///
-    /// What this STILL rejects: shapes whose apply key has no representation —
-    /// e.g. a top-level `JoinRowKey(GroupRowId, ..)` (a join over aggregated
-    /// inputs) or a `BranchScoped(JoinRowKey)` (UNION ALL of joins), both of
-    /// which fall into the catch-all `_` arm below. A composed
-    /// projection/filter branch union is also still rejected: the
-    /// `UnionProjectionFilter` and `FanInAggregate` arms keep requiring
-    /// `BranchShape::SimpleScan`, since A3 only enables the representable
-    /// branch-union-aggregate composition.
+    /// What this also rejects: shapes whose apply key has no representation at
+    /// all — e.g. a top-level `JoinRowKey(GroupRowId, ..)` (a join over
+    /// aggregated inputs) or a `BranchScoped(JoinRowKey)` (UNION ALL of joins),
+    /// both of which fall into the catch-all `_` arm below. A composed
+    /// projection/filter branch union is likewise rejected: the
+    /// `UnionProjectionFilter` and `FanInAggregate` arms require
+    /// `BranchShape::SimpleScan`.
     pub(crate) fn into_refresh_contract(self) -> Result<ImvRefreshContract, String> {
         match self.expected_distinct_base_refs() {
             // Exact arity is known (single scan, join, or a branch union whose
@@ -518,29 +527,42 @@ impl RefreshFragmentProperty {
             (TargetIdentity::BranchScoped(inner), StateContract::AggregateState { .. })
                 if matches!(inner.as_ref(), TargetIdentity::GroupRowId(_)) =>
             {
-                // A3 loosening point. Every branch produces a per-branch
-                // group-row identity, so the composite apply key is `BranchUtf8`
-                // regardless of how each branch is computed underneath; that key
-                // is representable, so we admit both:
-                //   - `BranchShape::SimpleAggregate` — aggregate directly over a
-                //     single scan (the only shape the legacy classifier accepted
-                //     here), and
-                //   - `BranchShape::Composed` — an aggregate over a join
-                //     (`Agg(a JOIN b)`) or over a fan-in union.
-                // Anything that is NOT one of those (e.g. an inherited
-                // `SimpleScan`/`None` shape, which cannot occur under an
-                // aggregate branch scope) is rejected. The branch top is never
+                // Coherence gate (Phase-4 lift point). Every aggregate branch
+                // produces a per-branch group-row identity, so the composite
+                // apply key is `BranchUtf8` regardless of how each branch is
+                // computed underneath — that key is representable. The property
+                // synthesis therefore still admits a `BranchScoped(GroupRowId)`
+                // UNION ALL of *composed* aggregate branches (an aggregate over a
+                // join `Agg(a JOIN b)`, or an aggregate over a fan-in union), and
+                // `derive_fragment_property` keeps building it (the machinery for
+                // Phase 4 stays intact). But the refresh path does NOT yet drive
+                // these composed branch-union shapes incrementally — refreshing
+                // them would fail. To keep CREATE coherent with what refresh can
+                // actually execute, the contract mapping only admits a UNION ALL
+                // of *simple* GROUP BY aggregates (`BranchShape::SimpleAggregate`,
+                // the shape the legacy classifier accepted here). A `Composed`
+                // branch union is rejected with an explicit "not yet supported"
+                // message; lifting this restriction is the Phase-4 task of adding
+                // composed branch-union refresh support. The branch top is never
                 // itself a join, so `join_key_count` is always `None` here — the
                 // discriminator is the per-branch shape, not the branch scope's
                 // own join key count.
-                if !matches!(
-                    branch_shape,
-                    Some(BranchShape::SimpleAggregate) | Some(BranchShape::Composed)
-                ) {
-                    return Err(
-                        "Iceberg IMV refresh contract only supports UNION ALL of projection/filter branches or aggregate branches"
-                            .to_string(),
-                    );
+                match branch_shape {
+                    Some(BranchShape::SimpleAggregate) => {}
+                    Some(BranchShape::Composed) => {
+                        return Err(
+                            "Iceberg IMV refresh contract does not yet support UNION ALL branches \
+                             that aggregate over joins or unions (composed branch-union); only \
+                             UNION ALL of simple GROUP BY aggregates is supported"
+                                .to_string(),
+                        );
+                    }
+                    _ => {
+                        return Err(
+                            "Iceberg IMV refresh contract only supports UNION ALL of projection/filter branches or aggregate branches"
+                                .to_string(),
+                        );
+                    }
                 }
                 let branch_count = branch_count.ok_or_else(|| {
                     "Iceberg IMV refresh contract internal error: branch-scoped identity without a branch count".to_string()
@@ -578,10 +600,13 @@ impl RefreshFragmentProperty {
     /// `Some(branch_count)` for a UNION ALL whose branches are simple per-scan
     /// structures. Mirrors the legacy `validate_base_ref_contract` expectations.
     ///
-    /// Returns `None` for a *composed* branch union (A3): there each branch
-    /// carries more than one base, so the per-branch "one base per branch"
-    /// assumption behind `branch_count` no longer holds and the exact distinct
-    /// count is validated structurally during contract building instead.
+    /// Returns `None` for a *composed* branch union: there each branch carries
+    /// more than one base, so the per-branch "one base per branch" assumption
+    /// behind `branch_count` does not hold. Composed branch unions are now
+    /// rejected by `into_refresh_contract` (the coherence gate — see the
+    /// `BranchScoped(GroupRowId)` aggregate arm); skipping the arity check here
+    /// lets that dedicated "composed branch-union" rejection surface its precise
+    /// message instead of a less-specific distinct-base-count error.
     fn expected_distinct_base_refs(&self) -> Option<usize> {
         if let Some(branch_count) = self.branch_count {
             if self.branch_shape == Some(BranchShape::Composed) {
@@ -891,12 +916,13 @@ fn derive_from_set_operation(set_op: &ResolvedSetOp) -> Result<RefreshFragmentPr
     }
 
     // Classify the branches' shared shape so the contract mapping can re-narrow
-    // to the *exact* legacy-supported branch set. Homogeneity above only pins
+    // to the *exact* refresh-supported branch set. Homogeneity above only pins
     // the (identity kind, state kind); a simple aggregate branch and an
-    // aggregate-over-join branch share that kind, yet the legacy classifier
-    // accepted only the former in a branch union. The union shape is the common
-    // branch shape, collapsing to `Composed` the moment any branch is composed
-    // (mirroring the classifier's all-or-nothing branch acceptance).
+    // aggregate-over-join branch share that kind, yet only the former (a simple
+    // GROUP BY aggregate over a scan) is a refresh-supported branch union today.
+    // The union shape is the common branch shape, collapsing to `Composed` the
+    // moment any branch is composed; `into_refresh_contract` then rejects a
+    // `Composed` aggregate branch union (the coherence gate) until Phase 4.
     let branch_shape = derived
         .iter()
         .map(RefreshFragmentProperty::branch_shape_as_union_branch)
@@ -909,22 +935,25 @@ fn derive_from_set_operation(set_op: &ResolvedSetOp) -> Result<RefreshFragmentPr
         })
         .expect("UNION ALL branch list was checked as non-empty");
 
-    // A3 safety — composed-branch structural homogeneity.
+    // Composed-branch structural homogeneity (property-synthesis machinery,
+    // kept for Phase 4).
     //
     // A `BranchScoped(GroupRowId)` union of *composed* aggregate branches
-    // (aggregate-over-join / fan-in) is representable (BranchUtf8 apply key), so
-    // `into_refresh_contract` admits it. But the persisted schema contract built
-    // at CREATE (`build_branch_union_schema_contract` GroupRowId arm) derives its
-    // base/join/group-key lineage from the FIRST branch only. That first-branch
-    // lineage is only correct for every branch when all branches share the SAME
-    // structure: the same distinct base-table set, the same top-level join key
-    // count, the same fan-in branch count, and the same group-key output layout.
-    // A heterogeneous composed union (branch0: a JOIN b, branch1: c JOIN d) would
-    // otherwise persist a contract that cannot drive a refresh of the later
-    // branches. Reject it here (the homogeneity gate) rather than later. Simple
-    // (non-composed) branch unions are unaffected: each such branch carries a
-    // single base, and `validate_distinct_base_ref_arity` already pins the
-    // per-branch base count.
+    // (aggregate-over-join / fan-in) is representable (BranchUtf8 apply key). The
+    // contract mapping (`into_refresh_contract`) currently REJECTS it outright as
+    // the coherence gate, but the property synthesis still builds it so the
+    // Phase-4 machinery stays intact and the property-level tests can assert the
+    // synthesized `BranchScoped(GroupRowId)` shape. The eventual persisted schema
+    // contract (`build_branch_union_schema_contract` GroupRowId arm) derives its
+    // base/join/group-key lineage from the FIRST branch only, which is only
+    // correct when all branches share the SAME structure: the same distinct
+    // base-table set, the same top-level join key count, the same fan-in branch
+    // count, and the same group-key output layout. A heterogeneous composed union
+    // (branch0: a JOIN b, branch1: c JOIN d) could never be driven from
+    // first-branch lineage, so reject it here regardless of the Phase-4 lift.
+    // Simple (non-composed) branch unions are unaffected: each such branch
+    // carries a single base, and `validate_distinct_base_ref_arity` already pins
+    // the per-branch base count.
     if branch_shape == BranchShape::Composed
         && matches!(first.state, StateContract::AggregateState { .. })
     {
@@ -1854,12 +1883,15 @@ mod tests {
 
     #[test]
     fn union_all_of_aggregate_joins_synthesizes_branch_scoped_group_row() {
-        // The composed case the flat classifier REJECTED (it required each
-        // branch to be a literal simple aggregate over a non-join input). The
-        // property algebra ACCEPTS it because every branch synthesizes the same
-        // (GroupRowId, AggregateState) kind — provided the branches are
-        // structurally homogeneous (same base set + join structure), so the
-        // first-branch lineage persisted at CREATE is representative (A3 safety).
+        // Composed branch-union machinery is kept intact for Phase 4: the
+        // property algebra still SYNTHESIZES `BranchScoped(GroupRowId)` for a
+        // UNION ALL whose branches are aggregates over joins, because every
+        // branch produces the same (GroupRowId, AggregateState) kind. CREATE no
+        // longer persists this shape — `into_refresh_contract` rejects a composed
+        // branch-union as the coherence gate (see
+        // `composed_branch_union_aggregate_rejected_by_contract` below) — but
+        // this synthesis is the substrate a future Phase 4 will lift. (Branches
+        // here are structurally homogeneous: same base set + join structure.)
         let prop = property(
             "SELECT l.region, count(*) AS c, sum(r.amount) AS s
              FROM fact_a l JOIN fact_b r ON l.id = r.id
@@ -1903,10 +1935,12 @@ mod tests {
 
     #[test]
     fn union_all_of_aggregate_joins_rejects_heterogeneous_base_sets() {
-        // A3 safety: a composed `BranchScoped(GroupRowId)` union whose branches
-        // join DIFFERENT base sets (branch0: fact_a JOIN fact_b, branch1: fact_c
-        // JOIN fact_d) is heterogeneous. The first-branch-only lineage persisted
-        // at CREATE cannot describe branch1, so the homogeneity gate rejects it.
+        // A composed `BranchScoped(GroupRowId)` union whose branches join
+        // DIFFERENT base sets (branch0: fact_a JOIN fact_b, branch1: fact_c JOIN
+        // fact_d) is structurally heterogeneous. The first-branch-only lineage a
+        // Phase-4 persist would use cannot describe branch1, so the homogeneity
+        // gate inside `derive_fragment_property` rejects it before the contract
+        // mapping is even reached.
         let err = error(
             "SELECT l.region, count(*) AS c, sum(r.amount) AS s
              FROM fact_a l JOIN fact_b r ON l.id = r.id
@@ -1918,6 +1952,41 @@ mod tests {
         );
         assert!(
             err.contains("homogeneous UNION ALL aggregate branches") && err.contains("branch 1"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn composed_branch_union_aggregate_rejected_by_contract() {
+        // Coherence gate: a homogeneous composed `BranchScoped(GroupRowId)` union
+        // (UNION ALL of `Agg(a JOIN b)` over the same two bases) is SYNTHESIZED
+        // as a branch-scoped group-row property (machinery kept for Phase 4), but
+        // `into_refresh_contract` rejects it because the refresh path does not
+        // yet drive composed branch unions incrementally. The property is
+        // representable (BranchUtf8 apply key) yet not refreshable, so CREATE must
+        // reject rather than persist a refresh-failing contract.
+        let prop = property(
+            "SELECT l.region, count(*) AS c, sum(r.amount) AS s
+             FROM fact_a l JOIN fact_b r ON l.id = r.id
+             GROUP BY l.region
+             UNION ALL
+             SELECT l.region, count(*) AS c, sum(r.amount) AS s
+             FROM fact_a l JOIN fact_b r ON l.id = r.id
+             GROUP BY l.region",
+        );
+        // Machinery intact: the property is still a branch-scoped group row.
+        assert_eq!(
+            prop.identity,
+            TargetIdentity::BranchScoped(Box::new(TargetIdentity::GroupRowId(vec![
+                "region".to_string()
+            ])))
+        );
+        // But the contract mapping rejects it as the coherence gate.
+        let err = prop
+            .into_refresh_contract()
+            .expect_err("composed branch-union aggregate must be rejected at the contract mapping");
+        assert!(
+            err.contains("does not yet support") && err.contains("composed branch-union"),
             "unexpected error: {err}"
         );
     }
@@ -2477,5 +2546,163 @@ mod tests {
         };
         let err = from_schema_contract(&c);
         assert!(err.is_err(), "expected error for join+branch shape");
+    }
+
+    // ------------------------------------------------------------------
+    // Capability dispatch round-trip
+    // ------------------------------------------------------------------
+
+    /// Every supported persisted `MvSchemaContract` shape must reconstruct to a
+    /// DISTINCT `(snapshot_policy, has_agg_state, identity)` dispatch tuple via
+    /// `RefreshCapabilities::from_schema_contract`. This documents that refresh
+    /// driver dispatch is fully capability-driven and needs no reference to any
+    /// `RefreshStrategy` enum (which has been deleted): the contract alone
+    /// determines the dispatch tuple, and the tuple uniquely identifies each
+    /// supported shape. Two shapes with the same tuple would be
+    /// indistinguishable to the driver, so uniqueness is the property that lets
+    /// dispatch key off these fields alone.
+    #[test]
+    fn capability_dispatch_tuple_is_unique_per_contract_shape() {
+        // Build one contract per supported shape, paired with a human-readable
+        // label for diagnostics.
+        let projection_filter = MvSchemaContract {
+            contract_version: 1,
+            base: parity_base("ice.db.orders", "uuid-orders"),
+            bases: vec![],
+            output: parity_output(),
+            join: None,
+            aggregate: None,
+            branch: None,
+            target: parity_target(HIDDEN_APPLY_KEY_COLUMN_NAME, ApplyKeySource::BaseRowId),
+        };
+        let single_aggregate = MvSchemaContract {
+            contract_version: 1,
+            base: parity_base("ice.db.orders", "uuid-orders"),
+            bases: vec![],
+            output: parity_output(),
+            join: None,
+            aggregate: Some(parity_agg()),
+            branch: None,
+            target: parity_target(
+                GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
+                ApplyKeySource::GroupRowId,
+            ),
+        };
+        let join_projection_filter = MvSchemaContract {
+            contract_version: 2,
+            base: parity_base("ice.db.left", "uuid-left"),
+            bases: vec![
+                parity_base("ice.db.left", "uuid-left"),
+                parity_base("ice.db.right", "uuid-right"),
+            ],
+            output: parity_output(),
+            join: Some(parity_join()),
+            aggregate: None,
+            branch: None,
+            target: parity_target(JOIN_APPLY_KEY_COLUMN_NAME, ApplyKeySource::JoinRowKey),
+        };
+        let join_aggregate = MvSchemaContract {
+            contract_version: 2,
+            base: parity_base("ice.db.left", "uuid-left"),
+            bases: vec![
+                parity_base("ice.db.left", "uuid-left"),
+                parity_base("ice.db.right", "uuid-right"),
+            ],
+            output: parity_output(),
+            join: Some(parity_join()),
+            aggregate: Some(parity_agg()),
+            branch: None,
+            target: parity_target(
+                GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
+                ApplyKeySource::GroupRowId,
+            ),
+        };
+        let union_projection_filter = MvSchemaContract {
+            contract_version: 2,
+            base: parity_base("ice.db.east", "uuid-east"),
+            bases: vec![],
+            output: parity_output(),
+            join: None,
+            aggregate: None,
+            branch: Some(BranchUnionContract {
+                branch_id_column: BranchIdColumnContract {
+                    column_name: "__nova_branch_id".to_string(),
+                    target_field_id: 100,
+                },
+                branch_count: 2,
+                inner_apply_key_source: ApplyKeySource::BaseRowId,
+            }),
+            target: parity_target(HIDDEN_APPLY_KEY_COLUMN_NAME, ApplyKeySource::BaseRowId),
+        };
+        let fan_in_aggregate = MvSchemaContract {
+            contract_version: 2,
+            base: parity_base("ice.db.east", "uuid-east"),
+            bases: vec![
+                parity_base("ice.db.east", "uuid-east"),
+                parity_base("ice.db.west", "uuid-west"),
+            ],
+            output: parity_output(),
+            join: None,
+            aggregate: Some(parity_agg()),
+            branch: None,
+            target: parity_target(
+                GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
+                ApplyKeySource::GroupRowId,
+            ),
+        };
+        let branch_union_aggregate = MvSchemaContract {
+            contract_version: 2,
+            base: parity_base("ice.db.east", "uuid-east"),
+            bases: vec![],
+            output: parity_output(),
+            join: None,
+            aggregate: Some(parity_agg()),
+            branch: Some(BranchUnionContract {
+                branch_id_column: BranchIdColumnContract {
+                    column_name: "__nova_branch_id".to_string(),
+                    target_field_id: 100,
+                },
+                branch_count: 2,
+                inner_apply_key_source: ApplyKeySource::GroupRowId,
+            }),
+            target: parity_target(
+                GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
+                ApplyKeySource::GroupRowId,
+            ),
+        };
+
+        let shapes = [
+            ("ProjectionFilter", projection_filter),
+            ("SingleAggregate", single_aggregate),
+            ("JoinProjectionFilter", join_projection_filter),
+            ("JoinAggregate", join_aggregate),
+            ("UnionProjectionFilter", union_projection_filter),
+            ("FanInAggregate", fan_in_aggregate),
+            ("BranchUnionAggregate", branch_union_aggregate),
+        ];
+
+        // The dispatch tuple is exactly the fields the driver branches on, with
+        // NO `RefreshStrategy` anywhere in sight (the enum is deleted).
+        let mut tuples: Vec<(&'static str, (BaseSnapshotPolicy, bool, RefreshIdentity))> =
+            Vec::new();
+        for (label, contract) in &shapes {
+            let caps = from_schema_contract(contract)
+                .unwrap_or_else(|e| panic!("from_schema_contract({label}): {e}"));
+            tuples.push((
+                label,
+                (caps.snapshot_policy, caps.has_agg_state, caps.identity),
+            ));
+        }
+
+        // Every supported shape must yield a unique dispatch tuple.
+        for (i, (label_i, tuple_i)) in tuples.iter().enumerate() {
+            for (label_j, tuple_j) in tuples.iter().skip(i + 1) {
+                assert_ne!(
+                    tuple_i, tuple_j,
+                    "dispatch tuple collision between {label_i} and {label_j}: {tuple_i:?}"
+                );
+            }
+        }
+        assert_eq!(tuples.len(), 7, "expected one tuple per supported shape");
     }
 }

@@ -4,7 +4,9 @@
 -- Test Point: Iceberg IMV UNION shape validation rejects unsupported
 -- neighboring shapes at CREATE time.
 -- Scope: UNION DISTINCT, mixed projection/aggregate branches, incompatible
--- aggregate branches, duplicate base refs, and reserved branch-id output names.
+-- aggregate branches, duplicate base refs, reserved branch-id output names, and
+-- composed branch-union aggregates (aggregate-over-join branches) that are
+-- representable but not yet refreshable (coherence gate at CREATE).
 
 -- query 1
 -- @skip_result_check=true
@@ -51,7 +53,7 @@ SELECT id, region
 FROM ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t2;
 
 -- query 3
--- @expect_error=Iceberg IMV refresh contract only supports UNION ALL of projection/filter branches or aggregate branches
+-- @expect_error=requires homogeneous UNION ALL branches
 CREATE MATERIALIZED VIEW union_mixed_mv_${uuid0}
 DISTRIBUTED BY HASH(region) BUCKETS 1
 PROPERTIES ('storage_engine' = 'iceberg')
@@ -92,7 +94,7 @@ FROM ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t1
 GROUP BY region;
 
 -- query 6
--- @expect_error=reserved
+-- @expect_error=reserved for internal branch id
 CREATE MATERIALIZED VIEW union_reserved_branch_id_mv_${uuid0}
 DISTRIBUTED BY HASH(__branch_id__) BUCKETS 1
 PROPERTIES ('storage_engine' = 'iceberg')
@@ -104,6 +106,24 @@ SELECT id AS __branch_id__, region
 FROM ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t2;
 
 -- query 7
+-- @expect_error=does not yet support
+CREATE MATERIALIZED VIEW union_composed_join_agg_mv_${uuid0}
+DISTRIBUTED BY HASH(region) BUCKETS 1
+PROPERTIES ('storage_engine' = 'iceberg')
+AS
+SELECT t1.region, COUNT(*) AS c, SUM(t2.amount) AS s
+FROM ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t1 t1
+JOIN ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t2 t2 ON t1.id = t2.id
+WHERE t1.amount > 0
+GROUP BY t1.region
+UNION ALL
+SELECT t1.region, COUNT(*) AS c, SUM(t2.amount) AS s
+FROM ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t1 t1
+JOIN ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t2 t2 ON t1.id = t2.id
+WHERE t1.amount > 10
+GROUP BY t1.region;
+
+-- query 8
 -- @skip_result_check=true
 DROP TABLE ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t1 FORCE;
 DROP TABLE ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t2 FORCE;

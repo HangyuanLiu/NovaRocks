@@ -1209,22 +1209,26 @@ mod tests {
         );
     }
 
-    // --- Composed branch-union-aggregate: now ACCEPTED (A3) -----------------
+    // --- Composed branch-union-aggregate: REJECTED at CREATE (coherence) ----
     //
     // The two cases below are UNION ALL tops whose branches are composed
     // aggregates (an aggregate over a join, or an aggregate over a fan-in
-    // union). Every branch still produces a per-branch group-row identity, so
-    // the composite apply key is `BranchUtf8` — representable — and CREATE now
-    // derives a `BranchUnionAggregate` contract for them. The third case below
-    // (fan-in aggregate over a union of joins) is the inverse nesting and stays
-    // rejected: there the union is *below* the aggregate, so the `FanInAggregate`
-    // arm still requires a union of simple scans.
+    // union). Every branch produces a per-branch group-row identity, so the
+    // composite apply key is `BranchUtf8` — representable — and the property
+    // algebra still SYNTHESIZES a `BranchScoped(GroupRowId)` property for them
+    // (the machinery is kept for a future Phase 4). But the refresh path does
+    // not yet drive composed branch unions incrementally, so admitting them at
+    // CREATE would be a CREATE-succeeds-but-refresh-fails half-state.
+    // `into_refresh_contract` therefore REJECTS them as the coherence gate. The
+    // third case (fan-in aggregate over a union of joins) is the inverse nesting
+    // and stays rejected for a different reason: there the union is *below* the
+    // aggregate, so the `FanInAggregate` arm requires a union of simple scans.
 
     #[test]
-    fn accepts_branch_union_of_join_aggregates_with_same_bases() {
+    fn rejects_branch_union_of_join_aggregates_as_composed() {
         // UNION ALL of `Agg(fact_a JOIN fact_b)` x 2 over the SAME two bases.
-        // distinct bases = {fact_a, fact_b} = 2 == branch_count, so arity is
-        // satisfied; A3 admits the composed aggregate branch union.
+        // The shape is representable but not yet refreshable, so CREATE rejects
+        // it with the composed branch-union coherence-gate message.
         let analysis = parse_and_analyze_mv_query(
             "SELECT l.region, count(*) AS c, sum(r.amount) AS s
              FROM fact_a l JOIN fact_b r ON l.id = r.id
@@ -1236,21 +1240,20 @@ mod tests {
             &["fact_a", "fact_b"],
         );
 
-        let contract = derive_imv_refresh_contract(&analysis)
-            .expect("branch union of join aggregates is now supported");
+        let err = derive_imv_refresh_contract(&analysis)
+            .expect_err("composed branch union of join aggregates is not yet supported");
 
-        assert_eq!(contract.branch.expect("branch contract").branch_count, 2);
-        assert_eq!(
-            contract.apply_key.value_type,
-            crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::BranchUtf8
+        assert!(
+            err.contains("does not yet support") && err.contains("composed branch-union"),
+            "unexpected error: {err}"
         );
     }
 
     #[test]
-    fn accepts_branch_union_of_fan_in_aggregates_with_same_bases() {
+    fn rejects_branch_union_of_fan_in_aggregates_as_composed() {
         // UNION ALL of `Agg(Union(fact_a, fact_b))` (fan-in) x 2 over the SAME
-        // two bases. distinct bases = 2 == branch_count, so arity is satisfied;
-        // A3 admits the composed (fan-in) aggregate branch union.
+        // two bases. Representable but not yet refreshable, so CREATE rejects it
+        // with the composed branch-union coherence-gate message.
         let analysis = parse_and_analyze_mv_query(
             "SELECT region, count(*) AS c, sum(amount) AS s
              FROM (
@@ -1270,13 +1273,12 @@ mod tests {
             &["fact_a", "fact_b"],
         );
 
-        let contract = derive_imv_refresh_contract(&analysis)
-            .expect("branch union of fan-in aggregates is now supported");
+        let err = derive_imv_refresh_contract(&analysis)
+            .expect_err("composed branch union of fan-in aggregates is not yet supported");
 
-        assert_eq!(contract.branch.expect("branch contract").branch_count, 2);
-        assert_eq!(
-            contract.apply_key.value_type,
-            crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType::BranchUtf8
+        assert!(
+            err.contains("does not yet support") && err.contains("composed branch-union"),
+            "unexpected error: {err}"
         );
     }
 

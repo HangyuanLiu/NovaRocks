@@ -1650,20 +1650,24 @@ fn build_branch_union_schema_contract(
                 target,
             }
         }
-        // UNION ALL of aggregate branches (legacy BranchUnionAggregate, plus the
-        // A3-enabled composed branches: aggregate-over-join / fan-in). Build the
-        // first branch's aggregate core, then overlay its narrowed bases onto
-        // the full cross-branch base set.
+        // UNION ALL of aggregate branches. Today only the simple
+        // BranchUnionAggregate shape (a UNION ALL of GROUP BY aggregates over
+        // scans) reaches here: `into_refresh_contract` is the coherence gate that
+        // rejects *composed* aggregate branch unions (aggregate-over-join /
+        // fan-in) before CREATE builds a contract, so the first-branch-only
+        // lineage below is exact. Build the first branch's aggregate core, then
+        // overlay its narrowed bases onto the full cross-branch base set.
         TargetIdentity::GroupRowId(_) => {
-            // TODO(per-branch lineage): the aggregate `bases`/`join`/group-key
-            // lineage persisted here is built from the FIRST branch only. That
-            // is correct for every branch only because
-            // `derive_from_set_operation` rejects a *composed* aggregate branch
-            // union whose branches do not share the same base set + join
-            // structure + group-key layout (A3 safety). If/when full per-branch
-            // lineage is persisted (e.g. a `Vec<BranchContract>`), that
-            // restriction can be lifted to admit heterogeneous-structure
-            // composed unions.
+            // TODO(Phase 4, per-branch lineage): when composed branch-union
+            // refresh lands, the coherence gate in `into_refresh_contract` will
+            // be relaxed to admit `BranchShape::Composed`, and composed branches
+            // will reach here. At that point the aggregate `bases`/`join`/
+            // group-key lineage built from the FIRST branch only is correct just
+            // for branches that share the same base set + join structure +
+            // group-key layout (enforced by the homogeneity gate in
+            // `derive_from_set_operation`). Persisting full per-branch lineage
+            // (e.g. a `Vec<BranchContract>`) is what would let that homogeneity
+            // restriction be lifted too.
             let first_branch_ast = first_union_branch_ast_query(canonical_query)?;
             // Only the first branch's bases are loaded for the inner core; pick
             // them out of the full set so the core builder's single/two-base
@@ -12615,13 +12619,15 @@ mod tests {
     }
 
     #[test]
-    fn create_iceberg_union_all_aggregate_over_join_persists_composed_branch_contract() {
-        // Composed branch-union shape: UNION ALL of `Agg(a JOIN b)` x 2 over
-        // overlapping bases. The legacy classifier rejected any join branch in
-        // a UNION ALL; the property algebra represents it as
-        // `BranchScoped(GroupRowId)` whose apply key is `BranchUtf8`, so CREATE
-        // now succeeds and persists a branch+aggregate contract with per-branch
-        // join lineage.
+    fn create_iceberg_union_all_aggregate_over_join_rejects_composed_branch() {
+        // Composed branch-union shape: UNION ALL of `Agg(a JOIN b)` x 2 over the
+        // same bases. The property algebra still represents it as
+        // `BranchScoped(GroupRowId)` (BranchUtf8 apply key — representable, and
+        // the synthesis machinery is kept for a future Phase 4), but the refresh
+        // path does not yet drive composed branch unions incrementally. To stay
+        // coherent, CREATE rejects it rather than persisting a contract whose
+        // refresh would fail. The simple branch-union aggregate
+        // (`Union(Agg(scan))`) remains supported.
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
         create_aggregate_fact_table(&env.state, "ice", "sales", "fact_a");
         create_aggregate_fact_table(&env.state, "ice", "sales", "fact_b");
@@ -12640,103 +12646,41 @@ mod tests {
                 GROUP BY a.region",
         );
 
-        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
-            .expect("create UNION ALL aggregate-over-join iceberg mv");
+        let err = create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect_err("composed UNION ALL aggregate-over-join must be rejected at CREATE");
+        assert!(
+            err.contains("does not yet support") && err.contains("composed branch-union"),
+            "unexpected error: {err}"
+        );
 
+        // The rejection happens before any target table is created.
         let entry = {
             let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
             catalogs.get("ice").expect("catalog")
         };
-        let loaded = crate::connector::iceberg::catalog::load_table(
-            &entry,
-            "analytics",
-            "mv_union_agg_join",
-        )
-        .expect("load composed union target table");
-        let fields = loaded
-            .table
-            .metadata()
-            .current_schema()
-            .as_struct()
-            .fields();
-        let field_names = fields
-            .iter()
-            .map(|field| field.name.as_str())
-            .collect::<Vec<_>>();
-        // Target schema carries the aggregate state columns plus the branch id.
-        assert_eq!(
-            field_names,
-            vec![
-                ICEBERG_MV_GROUP_APPLY_KEY_COLUMN,
-                "region",
-                "c",
-                "s",
-                "__agg_state_c",
-                "__agg_state_s",
-                ICEBERG_MV_BRANCH_ID_COLUMN
-            ]
-        );
-        let branch_field = fields
-            .iter()
-            .find(|field| field.name == ICEBERG_MV_BRANCH_ID_COLUMN)
-            .expect("branch id field");
-
-        let contract =
-            find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_union_agg_join")
-                .expect("mv definition")
-                .schema_contract
-                .expect("schema contract");
-        assert_eq!(contract.contract_version, 3);
-        // Branch-union aggregate apply key remains GroupRowId (BranchUtf8 value).
-        assert_eq!(
-            contract.target.hidden_apply_key.source,
-            crate::meta::repository::mv_contract::ApplyKeySource::GroupRowId
-        );
-        let aggregate = contract.aggregate.expect("aggregate contract present");
-        assert_eq!(aggregate.state_columns.len(), 2);
-        let branch = contract.branch.expect("branch contract present");
-        assert_eq!(branch.branch_count, 2);
-        assert_eq!(
-            branch.inner_apply_key_source,
-            crate::meta::repository::mv_contract::ApplyKeySource::GroupRowId
-        );
-        assert_eq!(branch.branch_id_column.target_field_id, branch_field.id);
-        // Per-branch join lineage: the contract carries a join contract built
-        // WITHIN the (first) branch over its two bases.
-        let join = contract.join.expect("per-branch join contract present");
-        assert_eq!(
-            join.kind,
-            crate::meta::repository::mv_contract::JoinContractKind::InnerEquiJoin
-        );
-        assert_eq!(join.predicates.len(), 1);
-        assert_eq!(join.predicates[0].left.table_fqn, "ice.sales.fact_a");
-        assert_eq!(join.predicates[0].right.table_fqn, "ice.sales.fact_b");
-        // Both join bases are recorded.
-        let base_fqns = contract
-            .bases
-            .iter()
-            .map(|base| base.table_fqn.clone())
-            .collect::<BTreeSet<_>>();
         assert!(
-            base_fqns.contains("ice.sales.fact_a"),
-            "bases={base_fqns:?}"
-        );
-        assert!(
-            base_fqns.contains("ice.sales.fact_b"),
-            "bases={base_fqns:?}"
+            crate::connector::iceberg::catalog::load_table(
+                &entry,
+                "analytics",
+                "mv_union_agg_join",
+            )
+            .is_err(),
+            "composed-branch CREATE must not have created a target table"
         );
     }
 
     #[test]
     fn create_iceberg_union_all_aggregate_over_join_rejects_heterogeneous_bases() {
-        // A3 safety: a composed `BranchScoped(GroupRowId)` UNION ALL whose
-        // branches join *different* base sets (branch0: a JOIN b, branch1:
-        // c JOIN d) is heterogeneous. The persisted schema contract uses
-        // FIRST-BRANCH-ONLY lineage (the `join` + narrowed `bases` describe
-        // branch0 alone), so it cannot correctly drive a refresh of branch1.
-        // CREATE must reject it rather than persist an incomplete-for-refresh
-        // contract. The homogeneous case (same base set in every branch) above
-        // still succeeds.
+        // A composed `BranchScoped(GroupRowId)` UNION ALL whose branches join
+        // *different* base sets (branch0: a JOIN b, branch1: c JOIN d) is
+        // structurally heterogeneous. It is rejected EARLIER than the composed
+        // branch-union coherence gate: the homogeneity gate inside
+        // `derive_fragment_property` fires first (Phase-4 machinery that ensures
+        // any future first-branch-only persisted lineage would be representative
+        // of every branch). The homogeneous composed case is also rejected today
+        // — by the coherence gate, with a different "does not yet support …
+        // composed branch-union" message (see
+        // `create_iceberg_union_all_aggregate_over_join_rejects_composed_branch`).
         let env = open_test_state_with_iceberg_catalog("ice", "analytics");
         create_aggregate_fact_table(&env.state, "ice", "sales", "fact_a");
         create_aggregate_fact_table(&env.state, "ice", "sales", "fact_b");
