@@ -381,7 +381,7 @@ impl<'a> AnalyzerContext<'a> {
         Ok((
             ResolvedValues {
                 rows: resolved_rows,
-                column_types,
+                output_columns: output_cols.clone(),
             },
             output_cols,
         ))
@@ -1673,9 +1673,10 @@ impl<'a> AnalyzerContext<'a> {
                 ..
             } => {
                 for col in output_columns {
-                    scope.add_column(
+                    scope.add_column_with_id(
                         Some(alias.as_str()),
                         &col.name,
+                        col.column_id,
                         col.data_type.clone(),
                         col.nullable,
                     );
@@ -1689,7 +1690,13 @@ impl<'a> AnalyzerContext<'a> {
             }
             Relation::GenerateSeries(gs) => {
                 let qualifier = gs.alias.as_deref().unwrap_or("generate_series");
-                scope.add_column(Some(qualifier), &gs.column_name, DataType::Int64, false);
+                scope.add_column_with_id(
+                    Some(qualifier),
+                    &gs.column_name,
+                    gs.output_column_id,
+                    DataType::Int64,
+                    false,
+                );
                 Ok(())
             }
             Relation::Unnest(unnest) => {
@@ -1710,9 +1717,10 @@ impl<'a> AnalyzerContext<'a> {
                 ..
             } => {
                 for col in output_columns {
-                    scope.add_column(
+                    scope.add_column_with_id(
                         Some(alias.as_str()),
                         &col.name,
+                        col.column_id,
                         col.data_type.clone(),
                         col.nullable,
                     );
@@ -1770,21 +1778,28 @@ impl<'a> AnalyzerContext<'a> {
         // Build a projection scope from body output columns for ORDER BY resolution.
         let mut projection_scope = self.new_scope();
         for col in body_output {
-            projection_scope.add_column(None, &col.name, col.data_type.clone(), col.nullable);
+            projection_scope.add_column_with_id(
+                None,
+                &col.name,
+                col.column_id,
+                col.data_type.clone(),
+                col.nullable,
+            );
         }
         // Also register qualified column refs from projection items
         // so ORDER BY a.id works when SELECT has a.id
         if let QueryBody::Select(sel) = body {
             for item in &sel.projection {
                 if let ExprKind::ColumnRef {
+                    column_id,
                     qualifier: Some(ref q),
                     ref column,
-                    ..
                 } = item.expr.kind
                 {
-                    projection_scope.add_column(
+                    projection_scope.add_column_with_id(
                         Some(q),
                         column,
+                        column_id,
                         item.expr.data_type.clone(),
                         item.expr.nullable,
                     );
@@ -1933,9 +1948,15 @@ impl<'a> AnalyzerContext<'a> {
                                             Err(_) => {
                                                 let mut alias_scope = from_scope.clone();
                                                 for item in &sel.projection {
-                                                    alias_scope.add_column(
+                                                    let col_id = select_item_output_column_id(
+                                                        item,
+                                                        self,
+                                                        &item.output_name,
+                                                    );
+                                                    alias_scope.add_column_with_id(
                                                         None,
                                                         &item.output_name,
+                                                        col_id,
                                                         item.expr.data_type.clone(),
                                                         item.expr.nullable,
                                                     );

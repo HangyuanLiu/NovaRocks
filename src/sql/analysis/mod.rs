@@ -145,6 +145,7 @@ pub(crate) struct GenerateSeriesRelation {
     pub step: i64,
     pub column_name: String,
     pub alias: Option<String>,
+    pub output_column_id: crate::sql::column_id::ColumnId,
 }
 
 #[derive(Clone, Debug)]
@@ -267,7 +268,7 @@ pub(crate) enum SetOpKind {
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedValues {
     pub rows: Vec<Vec<TypedExpr>>,
-    pub column_types: Vec<DataType>,
+    pub output_columns: Vec<OutputColumn>,
 }
 
 // ---------------------------------------------------------------------------

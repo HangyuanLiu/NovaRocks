@@ -3530,7 +3530,8 @@ impl<'a> PlanFragmentBuilder<'a> {
                 col.nullable,
                 idx as i32,
             );
-            scope.add_column(
+            scope.add_column_with_id(
+                col.column_id,
                 None,
                 col.name.clone(),
                 ColumnBinding {
@@ -3665,7 +3666,8 @@ impl<'a> PlanFragmentBuilder<'a> {
             .alias
             .clone()
             .unwrap_or_else(|| "generate_series".to_string());
-        scope.add_column(
+        scope.add_column_with_id(
+            op.output_column_id,
             Some(qualifier),
             col_name.clone(),
             ColumnBinding {
@@ -4919,8 +4921,8 @@ mod tests {
     use super::*;
     use crate::plan_nodes;
     use crate::sql::analysis::{
-        BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, SortItem, TypedExpr, WindowBound,
-        WindowFrame, WindowFrameType,
+        BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, SortItem, TypedExpr,
+        WindowBound, WindowFrame, WindowFrameType,
     };
     use crate::sql::catalog::{
         CatalogProvider, ColumnDef, IcebergColumnStats, IcebergDataFileInfo,
@@ -4928,10 +4930,13 @@ mod tests {
         IcebergPartitionFieldValue, IcebergPartitionValue, IcebergSchemaDef, IcebergSchemaFieldDef,
         IcebergTableInfo, PhysicalTableLayout, ScanSource, StarRocksTabletRef, TableDef,
     };
+    use crate::sql::codegen::fallback_audit;
+    use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
         AggregateStateMergeOp, JoinDistribution, Operator, PhysicalDistributionOp,
-        PhysicalGenerateSeriesOp, PhysicalHashJoinEqCondition, PhysicalHashJoinOp, PhysicalScanOp,
-        PhysicalSortOp, PhysicalValuesOp, PhysicalWindowOp, ScanDictionaryColumn,
+        PhysicalGenerateSeriesOp, PhysicalHashJoinEqCondition, PhysicalHashJoinOp,
+        PhysicalProjectOp, PhysicalScanOp, PhysicalSortOp, PhysicalValuesOp, PhysicalWindowOp,
+        ScanDictionaryColumn,
     };
     use crate::sql::optimizer::physical_plan::{
         JoinExecutionDistribution, PhysicalPlanNode, PlanExecutionProps,
@@ -5113,6 +5118,58 @@ mod tests {
             children: Vec::new(),
             stats: stats_for_test(),
             output_columns: columns,
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+        }
+    }
+
+    fn column_ref_expr_for_test(
+        column_id: ColumnId,
+        name: &str,
+        data_type: DataType,
+        nullable: bool,
+    ) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id,
+                qualifier: None,
+                column: name.to_string(),
+            },
+            data_type,
+            nullable,
+        }
+    }
+
+    fn project_passthrough_plan_for_test(
+        child: PhysicalPlanNode,
+        source_column: &OutputColumn,
+        output_column_id: ColumnId,
+    ) -> PhysicalPlanNode {
+        let output_column = OutputColumn {
+            column_id: output_column_id,
+            name: source_column.name.clone(),
+            data_type: source_column.data_type.clone(),
+            nullable: source_column.nullable,
+            is_internal: source_column.is_internal,
+        };
+        PhysicalPlanNode {
+            op: Operator::PhysicalProject(PhysicalProjectOp {
+                items: vec![ProjectItem {
+                    expr: column_ref_expr_for_test(
+                        source_column.column_id,
+                        &source_column.name,
+                        source_column.data_type.clone(),
+                        source_column.nullable,
+                    ),
+                    output_name: source_column.name.clone(),
+                    output_column_id,
+                }],
+                output_qualifier: None,
+            }),
+            children: vec![child],
+            stats: stats_for_test(),
+            output_columns: vec![output_column],
             execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
@@ -7123,6 +7180,76 @@ mod tests {
     }
 
     #[test]
+    fn p2_values_registers_output_columns_by_id_without_name_fallback() {
+        let source_column = output_col_for_test(9101, "v", DataType::Int32, true);
+        let plan = project_passthrough_plan_for_test(
+            values_plan_for_test(vec![source_column.clone()]),
+            &source_column,
+            ColumnId::new_for_test(9102),
+        );
+
+        let (result, audit) = fallback_audit::run_with_isolated_audit(|| {
+            PlanFragmentBuilder::build(
+                &plan,
+                &DummyCatalog,
+                &crate::connector::ConnectorRegistry::new(),
+                "default",
+            )
+        });
+        result.expect("build");
+        assert_eq!(
+            audit,
+            fallback_audit::FallbackAuditSnapshot::default(),
+            "Project over Values must resolve child output by ColumnId"
+        );
+    }
+
+    #[test]
+    fn p2_generate_series_registers_output_column_by_id_without_name_fallback() {
+        let source_column = output_col_for_test(9201, "x", DataType::Int64, false);
+        let generate_series = PhysicalPlanNode {
+            op: Operator::PhysicalGenerateSeries(PhysicalGenerateSeriesOp {
+                start: 1,
+                end: 3,
+                step: 1,
+                column_name: source_column.name.clone(),
+                alias: Some("gs".to_string()),
+                output_column_id: source_column.column_id,
+            }),
+            children: vec![],
+            stats: Statistics {
+                output_row_count: 3.0,
+                column_statistics: HashMap::new(),
+                ..Default::default()
+            },
+            output_columns: vec![source_column.clone()],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+        };
+        let plan = project_passthrough_plan_for_test(
+            generate_series,
+            &source_column,
+            ColumnId::new_for_test(9202),
+        );
+
+        let (result, audit) = fallback_audit::run_with_isolated_audit(|| {
+            PlanFragmentBuilder::build(
+                &plan,
+                &DummyCatalog,
+                &crate::connector::ConnectorRegistry::new(),
+                "default",
+            )
+        });
+        result.expect("build");
+        assert_eq!(
+            audit,
+            fallback_audit::FallbackAuditSnapshot::default(),
+            "Project over GenerateSeries must resolve child output by ColumnId"
+        );
+    }
+
+    #[test]
     fn build_generate_series_emits_table_function_without_scan_source() {
         let plan = PhysicalPlanNode {
             op: Operator::PhysicalGenerateSeries(PhysicalGenerateSeriesOp {
@@ -7131,6 +7258,7 @@ mod tests {
                 step: 1,
                 column_name: "generate_series".to_string(),
                 alias: Some("gs".to_string()),
+                output_column_id: crate::sql::column_id::ColumnId::new_for_test(9001),
             }),
             children: vec![],
             stats: Statistics {
@@ -7139,7 +7267,7 @@ mod tests {
                 ..Default::default()
             },
             output_columns: vec![OutputColumn {
-                column_id: crate::sql::column_id::ColumnId::UNSET,
+                column_id: crate::sql::column_id::ColumnId::new_for_test(9001),
                 name: "generate_series".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,

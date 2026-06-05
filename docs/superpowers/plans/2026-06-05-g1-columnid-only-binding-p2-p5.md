@@ -78,14 +78,14 @@
 - Modify: `src/sql/codegen/expr_compiler.rs`
 - Test: `src/sql/codegen/expr_compiler.rs` 或 `src/sql/codegen/fallback_audit.rs`
 
-- [ ] Step 1: 写红测 `p2_name_fallback_audit_records_columnref_fallback`
+- [x] Step 1: 写红测 `p2_name_fallback_audit_records_columnref_fallback`
   - 构造一个只有 name binding、没有 id binding 的 `ExprScope`。
   - 编译 `ColumnRef { column_id: ColumnId::UNSET, column: "a" }`。
   - 断言编译成功且 `fallback_audit::snapshot().column_ref_name_fallbacks == 1`。
   - Run: `cargo test --profile dev-opt p2_name_fallback_audit_records_columnref_fallback -- --nocapture`
   - Expected: FAIL,因为审计模块不存在。
 
-- [ ] Step 2: 实现审计模块
+- [x] Step 2: 实现审计模块
   - `fallback_audit.rs` 定义:
     - `pub(crate) struct FallbackAuditSnapshot { column_ref_name_fallbacks: u64, display_expr_name_fallbacks: u64, aggregate_display_name_fallbacks: u64 }`
     - `AtomicU64` 计数器
@@ -99,15 +99,15 @@
     - `FunctionCall` display name 重匹配
     - `AggregateCall` display name 重匹配
 
-- [ ] Step 3: 加一个审计归零测试入口
+- [x] Step 3: 加一个审计归零测试入口
   - 增加 helper `assert_no_codegen_name_fallbacks_after<F>(f: F)` 只用于测试。
   - 后续 P2 cases 都用该 helper 包住 planner -> optimizer -> codegen 路径。
 
-- [ ] Step 4: 验证
+- [x] Step 4: 验证
   - Run: `cargo test --profile dev-opt p2_name_fallback_audit_records_columnref_fallback -- --nocapture`
   - Run: `cargo fmt --check`
 
-- [ ] Step 5: Commit
+- [x] Step 5: Commit
   - `git commit -m "codegen: audit name fallback hits before ColumnId-only binding"`
 
 ---
@@ -121,20 +121,20 @@
 - Test: `src/sql/planner/mod.rs`
 - SQL Test: `sql-tests/optimizer/column_id_binding_aggregate.sql`
 
-- [ ] Step 1: 写红测 `p2_aggregate_projection_rewrites_agg_call_to_output_id_ref`
+- [x] Step 1: 写红测 `p2_aggregate_projection_rewrites_agg_call_to_output_id_ref`
   - SQL: `SELECT sum(b) + 1 AS s1 FROM t`
   - 断言上层 Project 的 `sum(b)+1` 中,`AggregateCall(sum)` 被替换成 `ExprKind::ColumnRef { column_id: aggregate.output_column_id, .. }`。
   - 断言 codegen fallback audit 为 0。
   - Run: `cargo test --profile dev-opt p2_aggregate_projection_rewrites_agg_call_to_output_id_ref -- --nocapture`
 
-- [ ] Step 2: 写红测 `p2_computed_group_key_rewrites_by_structural_expr`
+- [x] Step 2: 写红测 `p2_computed_group_key_rewrites_by_structural_expr`
   - SQL: `SELECT a + 1 AS k, sum(b) FROM t GROUP BY a + 1`
   - 断言 projection 中的 `a + 1` 被改写为 `ColumnRef(group_key_output_id)`。
   - 断言没有调用 `typed_expr_display_name` 做语义匹配;可用 grep gate:
     - Run: `rg -n "typed_expr_display_name\\(gb\\)|typed_expr_display_name\\(expr\\)" src/sql/planner/mod.rs`
     - Expected after green:不能命中 group-key rewrite 路径。
 
-- [ ] Step 3: 实现 aggregate call 替换
+- [x] Step 3: 实现 aggregate call 替换
   - 在 `split_projection_for_aggregate` 内,`collect_aggregates` 后建立 aggregate signature -> `output_column_id` 映射。
   - 新增 `rewrite_agg_calls_to_refs(expr, aggregate_calls)`。
   - 命中 `ExprKind::AggregateCall` 时返回:
@@ -142,7 +142,7 @@
     - `data_type` / `nullable` 保持原 expr。
   - HAVING 同样走该改写,避免 HAVING aggregate display fallback。
 
-- [ ] Step 4: 实现 group key 结构化匹配
+- [x] Step 4: 实现 group key 结构化匹配
   - 新增 `typed_expr_semantically_eq(left, right)` 递归比较:
     - `ColumnRef`:优先比较非 `UNSET` `column_id`;两边都 `UNSET` 时比较 qualifier/name 仅用于 analyzer 入口前的测试 fixture。
     - Literal/Binary/Unary/Function/Cast/Nested/Case/Between/Like/IsNull/Window/Aggregate:递归比较结构和函数名。
@@ -163,7 +163,7 @@
   - Run: `cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --suite optimizer --only column_id_binding_aggregate --mode verify`
   - Run: `cargo fmt --check`
 
-- [ ] Step 7: Commit
+- [x] Step 7: Commit
   - `git commit -m "planner: rewrite aggregate outputs and computed group keys by ColumnId"`
 
 ---
@@ -182,51 +182,51 @@
 - Modify: `src/sql/optimizer/cascades_rules/implement.rs`
 - Test: `src/sql/planner/mod.rs`, `src/sql/analyzer/subquery_rewrite.rs`, `src/sql/codegen/fragment_builder.rs`
 
-- [ ] Step 1: 写红测 `p2_window_call_rewrites_to_window_output_id`
+- [x] Step 1: 写红测 `p2_window_call_rewrites_to_window_output_id`
   - SQL: `SELECT row_number() OVER (PARTITION BY a ORDER BY b) + 1 FROM t`
   - 断言 Project 中的 window call 被替换成 `ColumnRef(window_expr.output_column_id)`。
   - Run: `cargo test --profile dev-opt p2_window_call_rewrites_to_window_output_id -- --nocapture`
 
-- [ ] Step 2: 写红测 `p2_select_alias_remap_preserves_inner_output_id`
+- [x] Step 2: 写红测 `p2_select_alias_remap_preserves_inner_output_id`
   - SQL: `SELECT a AS x FROM t ORDER BY x`
   - 定位 `__nr_sel_0` 的 `ColumnRef`,断言其 `column_id` 等于内层 project item 的 `output_column_id`,且非 `UNSET`。
 
-- [ ] Step 3: 写红测 `p2_values_output_uses_single_column_id`
+- [x] Step 3: 写红测 `p2_values_output_uses_single_column_id`
   - SQL: `VALUES (1, 2), (3, 4)`
   - 断言 `ValuesNode.columns` 与 query output columns 使用同一组 id。
 
-- [ ] Step 4: 写红测 `p2_generate_series_output_has_column_id_through_codegen`
+- [x] Step 4: 写红测 `p2_generate_series_output_has_column_id_through_codegen`
   - SQL: `SELECT * FROM TABLE(generate_series(1, 3, 1)) AS gs(v)`
   - 断言 `GenerateSeriesNode` / `LogicalGenerateSeriesOp` / `PhysicalGenerateSeriesOp` 都携带同一个 `output_column_id`。
 
-- [ ] Step 5: 实现 window id rewrite
+- [x] Step 5: 实现 window id rewrite
   - `rewrite_window_calls` 使用 P1 已填充的 `WindowExpr.output_column_id`。
   - 返回 `ColumnRef(window_output_id)`,不再用 `ColumnId::UNSET` + `output_name`。
 
-- [ ] Step 6: 实现 select alias id remap
+- [x] Step 6: 实现 select alias id remap
   - `remap_select_alias_refs` 的入参从 `name_to_idx` 扩展为 `name_to_output: HashMap<String, (usize, ColumnId)>`。
   - 生成 `__nr_sel_<idx>` 时保留对应 inner output id。
   - 只把 `__nr_sel_<idx>` 当 display label,不把它当 semantic binding key。
 
-- [ ] Step 7: 实现 VALUES id 一致性
+- [x] Step 7: 实现 VALUES id 一致性
   - `plan_values` 创建 `OutputColumn` 时一次性铸 id。
   - root query output 直接复用 `ValuesNode.columns` 的 id,不重新铸造。
 
-- [ ] Step 8: 实现 GenerateSeries id
+- [x] Step 8: 实现 GenerateSeries id
   - 给 `GenerateSeriesNode` 增加 `output_column_id: ColumnId`。
   - `resolve_from.rs` 构造 `GenerateSeriesRelation` 时使用 factory 铸造并保存 id。
   - `plan_output_columns(LogicalPlan::GenerateSeries)` 返回该 id。
   - `LogicalGenerateSeriesOp` / `PhysicalGenerateSeriesOp` 增加 `output_column_id` 并在 convert/implement 中透传。
   - `visit_generate_series` 注册 output scope 时用 `add_column_with_id(output_column_id, alias, column_name, binding)`。
 
-- [ ] Step 9: 验证
+- [x] Step 9: 验证
   - Run: `cargo test --profile dev-opt p2_window_call_rewrites_to_window_output_id -- --nocapture`
   - Run: `cargo test --profile dev-opt p2_select_alias_remap_preserves_inner_output_id -- --nocapture`
   - Run: `cargo test --profile dev-opt p2_values_output_uses_single_column_id -- --nocapture`
   - Run: `cargo test --profile dev-opt p2_generate_series_output_has_column_id_through_codegen -- --nocapture`
   - Run: `cargo fmt --check`
 
-- [ ] Step 10: Commit
+- [x] Step 10: Commit
   - `git commit -m "planner: preserve ColumnId for window aliases values and generate_series"`
 
 ---

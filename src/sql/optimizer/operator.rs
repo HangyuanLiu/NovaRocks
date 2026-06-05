@@ -219,6 +219,7 @@ pub(crate) struct LogicalGenerateSeriesOp {
     pub step: i64,
     pub column_name: String,
     pub alias: Option<String>,
+    pub output_column_id: crate::sql::column_id::ColumnId,
 }
 
 #[derive(Clone, Debug)]
@@ -432,6 +433,7 @@ pub(crate) struct PhysicalGenerateSeriesOp {
     pub step: i64,
     pub column_name: String,
     pub alias: Option<String>,
+    pub output_column_id: crate::sql::column_id::ColumnId,
 }
 
 #[derive(Clone, Debug)]

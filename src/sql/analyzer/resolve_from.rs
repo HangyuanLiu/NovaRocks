@@ -863,7 +863,8 @@ impl<'a> super::AnalyzerContext<'a> {
         let qualifier = alias_name.as_deref().unwrap_or("generate_series");
 
         let mut scope = self.new_scope();
-        scope.add_column(Some(qualifier), &column_name, DataType::Int64, false);
+        let output_column_id =
+            scope.add_column(Some(qualifier), &column_name, DataType::Int64, false);
 
         let relation = Relation::GenerateSeries(GenerateSeriesRelation {
             start,
@@ -871,6 +872,7 @@ impl<'a> super::AnalyzerContext<'a> {
             step,
             column_name,
             alias: alias_name,
+            output_column_id,
         });
         Ok((relation, scope))
     }

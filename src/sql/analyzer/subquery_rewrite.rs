@@ -37,6 +37,7 @@ fn take_from_or_synthesize_single_row(from: &mut Option<Relation>) -> Relation {
             step: 1,
             column_name: "__nr_subquery_join_dummy".to_string(),
             alias: None,
+            output_column_id: crate::sql::column_id::ColumnId::UNSET,
         })
     })
 }
@@ -2469,6 +2470,7 @@ fn dummy_relation() -> Relation {
         step: 1,
         column_name: "__nr_dummy".to_string(),
         alias: None,
+        output_column_id: crate::sql::column_id::ColumnId::UNSET,
     })
 }
 

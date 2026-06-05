@@ -180,14 +180,14 @@ fn apply_query_modifiers(
             // references like `ORDER BY v1` (matching SELECT v1 → renamed
             // to `__nr_sel_1`) would fail to resolve at sort time.
             let sort_items = if let Some(ref user) = user_select {
-                let name_to_idx: std::collections::HashMap<String, usize> = user
+                let name_to_output: std::collections::HashMap<String, (usize, ColumnId)> = user
                     .iter()
                     .enumerate()
-                    .map(|(idx, (name, _, _, _))| (name.to_lowercase(), idx))
+                    .map(|(idx, (name, _, _, output_id))| (name.to_lowercase(), (idx, *output_id)))
                     .collect();
                 sort_items
                     .into_iter()
-                    .map(|item| remap_sort_to_synthetic(item, &name_to_idx))
+                    .map(|item| remap_sort_to_synthetic(item, &name_to_output))
                     .collect()
             } else {
                 sort_items
@@ -331,7 +331,7 @@ fn collect_extra_sort_items(
 /// references still resolve.
 fn remap_sort_to_synthetic(
     item: SortItem,
-    name_to_idx: &std::collections::HashMap<String, usize>,
+    name_to_output: &std::collections::HashMap<String, (usize, ColumnId)>,
 ) -> SortItem {
     let SortItem {
         expr,
@@ -339,7 +339,7 @@ fn remap_sort_to_synthetic(
         nulls_first,
     } = item;
     SortItem {
-        expr: remap_select_alias_refs(expr, name_to_idx),
+        expr: remap_select_alias_refs(expr, name_to_output),
         asc,
         nulls_first,
     }
@@ -347,7 +347,7 @@ fn remap_sort_to_synthetic(
 
 fn remap_select_alias_refs(
     expr: TypedExpr,
-    name_to_idx: &std::collections::HashMap<String, usize>,
+    name_to_output: &std::collections::HashMap<String, (usize, ColumnId)>,
 ) -> TypedExpr {
     match expr.kind {
         ExprKind::ColumnRef {
@@ -355,12 +355,12 @@ fn remap_select_alias_refs(
             ref column,
             ..
         } => {
-            if let Some(idx) = name_to_idx.get(&column.to_lowercase()) {
+            if let Some((idx, output_id)) = name_to_output.get(&column.to_lowercase()) {
                 TypedExpr {
                     data_type: expr.data_type,
                     nullable: expr.nullable,
                     kind: ExprKind::ColumnRef {
-                        column_id: ColumnId::UNSET,
+                        column_id: *output_id,
                         qualifier: None,
                         column: format!("__nr_sel_{idx}"),
                     },
@@ -465,7 +465,7 @@ pub(crate) fn plan_output_columns(plan: &LogicalPlan) -> Result<Vec<OutputColumn
         LogicalPlan::Except(node) => Ok(node.output_columns.clone()),
         LogicalPlan::Values(node) => Ok(node.columns.clone()),
         LogicalPlan::GenerateSeries(node) => Ok(vec![OutputColumn {
-            column_id: ColumnId::UNSET,
+            column_id: node.output_column_id,
             name: node.column_name.clone(),
             data_type: arrow::datatypes::DataType::Int64,
             nullable: false,
@@ -1436,7 +1436,7 @@ fn rewrite_window_calls(
             });
             TypedExpr {
                 kind: ExprKind::ColumnRef {
-                    column_id: ColumnId::UNSET,
+                    column_id: output_column_id,
                     qualifier: None,
                     column: win_output_name,
                 },
@@ -2642,6 +2642,7 @@ fn plan_relation_scoped(
             step: gs.step,
             column_name: gs.column_name,
             alias: gs.alias,
+            output_column_id: gs.output_column_id,
             required_output_columns: None,
         })),
         Relation::Unnest(_) => Err("UNNEST is currently supported only in LATERAL JOIN".into()),
@@ -3052,23 +3053,9 @@ fn plan_set_operation_scoped(
 
 fn plan_values(
     values: ResolvedValues,
-    factory: &mut ColumnRefFactory,
+    _factory: &mut ColumnRefFactory,
 ) -> Result<LogicalPlan, String> {
-    let columns = values
-        .column_types
-        .iter()
-        .enumerate()
-        .map(|(i, dt)| {
-            let name = format!("column_{}", i);
-            OutputColumn {
-                column_id: factory.create(None, name.clone(), dt.clone(), true),
-                name,
-                data_type: dt.clone(),
-                nullable: true,
-                is_internal: false,
-            }
-        })
-        .collect();
+    let columns = values.output_columns;
     Ok(LogicalPlan::Values(ValuesNode {
         rows: values.rows,
         columns,
@@ -3176,6 +3163,13 @@ mod tests {
     }
 
     fn parse_analyze_and_plan(sql: &str) -> Result<LogicalPlan, String> {
+        let (resolved, cte_registry, mut factory) = parse_analyze_query(sql)?;
+        plan_query(resolved, cte_registry, &mut factory)
+    }
+
+    fn parse_analyze_query(
+        sql: &str,
+    ) -> Result<(ResolvedQuery, CTERegistry, ColumnRefFactory), String> {
         let dialect = crate::sql::parser::dialect::StarRocksDialect;
         let mut ast =
             sqlparser::parser::Parser::parse_sql(&dialect, sql).map_err(|e| e.to_string())?;
@@ -3186,9 +3180,7 @@ mod tests {
             sqlparser::ast::Statement::Query(q) => q,
             _ => return Err("expected query".into()),
         };
-        let (resolved, cte_registry, mut factory) =
-            crate::sql::analyzer::analyze(&query, &TestCatalog, "default")?;
-        plan_query(resolved, cte_registry, &mut factory)
+        crate::sql::analyzer::analyze(&query, &TestCatalog, "default")
     }
 
     fn plan_test_query(sql: &str) -> LogicalPlan {
@@ -3253,6 +3245,47 @@ mod tests {
             panic!("expected Aggregate under Filter, got {:?}", filter.input);
         };
         (project, filter, aggregate)
+    }
+
+    fn root_project_over_window(plan: &LogicalPlan) -> (&ProjectNode, &WindowNode) {
+        let LogicalPlan::Project(project) = plan else {
+            panic!("expected Project root, got {plan:?}");
+        };
+        let LogicalPlan::Window(window) = project.input.as_ref() else {
+            panic!("expected Window under Project, got {:?}", project.input);
+        };
+        (project, window)
+    }
+
+    fn root_strip_sort_inner_project(
+        plan: &LogicalPlan,
+    ) -> (&ProjectNode, &SortNode, &ProjectNode) {
+        let LogicalPlan::Project(outer_proj) = plan else {
+            panic!("expected outer strip Project, got {plan:?}");
+        };
+        let LogicalPlan::Sort(sort) = outer_proj.input.as_ref() else {
+            panic!(
+                "expected Sort under outer Project, got {:?}",
+                outer_proj.input
+            );
+        };
+        let LogicalPlan::Project(inner_proj) = sort.input.as_ref() else {
+            panic!("expected inner Project under Sort, got {:?}", sort.input);
+        };
+        (outer_proj, sort, inner_proj)
+    }
+
+    fn binary_left_column_id(expr: &TypedExpr) -> ColumnId {
+        let ExprKind::BinaryOp { left, .. } = &expr.kind else {
+            panic!("expected BinaryOp, got {:?}", expr.kind);
+        };
+        let ExprKind::ColumnRef { column_id, .. } = &left.kind else {
+            panic!(
+                "expected BinaryOp left side to be ColumnRef, got {:?}",
+                left.kind
+            );
+        };
+        *column_id
     }
 
     fn first_window_exprs(plan: &LogicalPlan) -> Vec<WindowExpr> {
@@ -3976,6 +4009,44 @@ mod tests {
     }
 
     #[test]
+    fn p2_window_call_rewrites_to_window_output_id() {
+        let plan = plan_test_query(
+            "SELECT row_number() OVER (PARTITION BY a ORDER BY b) + 1 AS rn1 FROM t",
+        );
+        let (project, window) = root_project_over_window(&plan);
+        let rn = window_expr_by_function_name(&window.window_exprs, "row_number");
+        assert_ne!(
+            rn.output_column_id,
+            ColumnId::UNSET,
+            "WindowExpr must have a real output id"
+        );
+
+        let ExprKind::BinaryOp { left, .. } = &project.items[0].expr.kind else {
+            panic!(
+                "expected row_number()+1 to remain a BinaryOp over the window output, got {:?}",
+                project.items[0].expr.kind
+            );
+        };
+        let ExprKind::ColumnRef {
+            column_id, column, ..
+        } = &left.kind
+        else {
+            panic!(
+                "window child in row_number()+1 must be rewritten to ColumnRef, got {:?}",
+                left.kind
+            );
+        };
+        assert_eq!(
+            *column_id, rn.output_column_id,
+            "project expression must reference the WindowExpr output id"
+        );
+        assert_eq!(
+            column, "rn1",
+            "window ColumnRef must preserve the P2 display name"
+        );
+    }
+
+    #[test]
     fn test_plan_query_builds_nested_anchor_chain() {
         let plan = parse_analyze_and_plan(
             "WITH a AS (SELECT o_orderkey AS ok FROM orders), \
@@ -4543,6 +4614,175 @@ mod tests {
         assert_eq!(
             sort_key_id, project_output_id,
             "ORDER BY select alias must point at the Project output ColumnId"
+        );
+    }
+
+    #[test]
+    fn p2_order_by_select_alias_extra_path_preserves_inner_output_id() {
+        let plan =
+            parse_analyze_and_plan("SELECT o_orderkey AS x FROM orders ORDER BY x, o_custkey")
+                .expect("planner should succeed");
+
+        let outer_proj = match &plan {
+            LogicalPlan::Project(p) => p,
+            other => panic!("expected outer strip Project, got {other:?}"),
+        };
+        let sort = match outer_proj.input.as_ref() {
+            LogicalPlan::Sort(s) => s,
+            other => panic!("expected Sort under outer Project, got {other:?}"),
+        };
+        let inner_proj = match sort.input.as_ref() {
+            LogicalPlan::Project(p) => p,
+            other => panic!("expected inner Project under Sort, got {other:?}"),
+        };
+
+        let inner_output_id = inner_proj.items[0].output_column_id;
+        assert_ne!(
+            inner_output_id,
+            ColumnId::UNSET,
+            "inner select alias output must have a real ColumnId"
+        );
+        let ExprKind::ColumnRef {
+            column_id, column, ..
+        } = &sort.items[0].expr.kind
+        else {
+            panic!("sort key should be a ColumnRef to the remapped select alias");
+        };
+        assert_eq!(
+            column, "__nr_sel_0",
+            "ORDER BY alias should remap to the synthetic inner Project label"
+        );
+        assert_eq!(
+            *column_id, inner_output_id,
+            "ORDER BY alias remap must preserve the inner Project output ColumnId"
+        );
+    }
+
+    #[test]
+    fn p2_order_by_derived_values_extra_preserves_source_column_id() {
+        let plan =
+            parse_analyze_and_plan("SELECT 1 FROM (VALUES (1, 2)) AS v(a, b) ORDER BY v.b + 1")
+                .expect("planner should succeed");
+
+        let (_, _, inner_proj) = root_strip_sort_inner_project(&plan);
+        let child_output_columns =
+            plan_output_columns(&inner_proj.input).expect("VALUES child output should be known");
+        assert_eq!(
+            child_output_columns.len(),
+            2,
+            "derived VALUES child should expose both columns"
+        );
+        let b_output_id = child_output_columns[1].column_id;
+        assert_ne!(
+            b_output_id,
+            ColumnId::UNSET,
+            "derived VALUES b output must have a real ColumnId"
+        );
+
+        let extra_item = inner_proj
+            .items
+            .last()
+            .expect("sort-extra ProjectItem should be appended");
+        assert_eq!(
+            binary_left_column_id(&extra_item.expr),
+            b_output_id,
+            "ORDER BY v.b + 1 extra must reference the derived VALUES source ColumnId"
+        );
+    }
+
+    #[test]
+    fn p2_order_by_generate_series_extra_preserves_source_column_id() {
+        let plan = parse_analyze_and_plan(
+            "SELECT 1 FROM TABLE(generate_series(1, 3, 1)) AS gs(x) ORDER BY gs.x + 1",
+        )
+        .expect("planner should succeed");
+
+        let (_, _, inner_proj) = root_strip_sort_inner_project(&plan);
+        let child_output_columns = plan_output_columns(&inner_proj.input)
+            .expect("GenerateSeries child output should be known");
+        assert_eq!(
+            child_output_columns.len(),
+            1,
+            "GenerateSeries child should expose one column"
+        );
+        let source_output_id = child_output_columns[0].column_id;
+        assert_ne!(
+            source_output_id,
+            ColumnId::UNSET,
+            "GenerateSeries output must have a real ColumnId"
+        );
+
+        let extra_item = inner_proj
+            .items
+            .last()
+            .expect("sort-extra ProjectItem should be appended");
+        assert_eq!(
+            binary_left_column_id(&extra_item.expr),
+            source_output_id,
+            "ORDER BY gs.x + 1 extra must reference the GenerateSeries source ColumnId"
+        );
+    }
+
+    #[test]
+    fn p2_values_output_uses_single_column_id() {
+        let (resolved, cte_registry, mut factory) =
+            parse_analyze_query("VALUES (1, 2), (3, 4)").expect("analyzer should succeed");
+        let analyzer_output_columns = resolved.output_columns.clone();
+        let plan =
+            plan_query(resolved, cte_registry, &mut factory).expect("planner should succeed");
+        let LogicalPlan::Values(values) = plan else {
+            panic!("expected Values root");
+        };
+        assert_eq!(
+            values.columns.len(),
+            analyzer_output_columns.len(),
+            "ValuesNode should expose the analyzer output columns"
+        );
+        for (value_column, analyzer_column) in
+            values.columns.iter().zip(analyzer_output_columns.iter())
+        {
+            assert_ne!(
+                value_column.column_id,
+                ColumnId::UNSET,
+                "VALUES output column must have a real ColumnId"
+            );
+            assert_eq!(
+                value_column.column_id, analyzer_column.column_id,
+                "ValuesNode column id must reuse the analyzer query output id"
+            );
+        }
+    }
+
+    #[test]
+    fn p2_generate_series_output_has_column_id_through_planner() {
+        let plan = parse_analyze_and_plan("SELECT x FROM TABLE(generate_series(1, 3, 1)) AS gs(x)")
+            .expect("planner should succeed");
+        let LogicalPlan::Project(project) = &plan else {
+            panic!("expected Project root, got {plan:?}");
+        };
+        let child_output_columns =
+            plan_output_columns(&project.input).expect("generate_series output should be known");
+        assert_eq!(
+            child_output_columns.len(),
+            1,
+            "generate_series should expose one output column"
+        );
+        let child_output_id = child_output_columns[0].column_id;
+        assert_ne!(
+            child_output_id,
+            ColumnId::UNSET,
+            "GenerateSeries output must have a real ColumnId"
+        );
+        let ExprKind::ColumnRef { column_id, .. } = project.items[0].expr.kind else {
+            panic!("project over generate_series should read a ColumnRef");
+        };
+        assert_eq!(
+            column_id, project.items[0].output_column_id,
+            "Project item should preserve the generate_series ColumnRef id"
+        );
+        assert_eq!(
+            column_id, child_output_id,
+            "GenerateSeries child output id must match the parent Project ColumnRef"
         );
     }
 

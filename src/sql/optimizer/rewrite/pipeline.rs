@@ -233,6 +233,7 @@ mod tests {
                     step: 1,
                     column_name: "stage1".to_string(),
                     alias: None,
+                    output_column_id: crate::sql::column_id::ColumnId::UNSET,
                     required_output_columns: None,
                 },
             )))

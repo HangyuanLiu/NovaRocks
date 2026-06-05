@@ -1316,9 +1316,7 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
         Operator::LogicalCTEConsume(c) => c.output_columns.clone(),
         Operator::LogicalGenerateSeries(g) => {
             vec![crate::sql::analysis::OutputColumn {
-                // GenerateSeries columns don't originate from the analyzer;
-                // use UNSET as there is no factory available in this read-only context.
-                column_id: ColumnId::UNSET,
+                column_id: g.output_column_id,
                 name: g.column_name.clone(),
                 data_type: arrow::datatypes::DataType::Int64,
                 nullable: false,
@@ -1403,7 +1401,7 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
         Operator::PhysicalCTEConsume(c) => c.output_columns.clone(),
         Operator::PhysicalGenerateSeries(g) => {
             vec![crate::sql::analysis::OutputColumn {
-                column_id: ColumnId::UNSET,
+                column_id: g.output_column_id,
                 name: g.column_name.clone(),
                 data_type: arrow::datatypes::DataType::Int64,
                 nullable: false,

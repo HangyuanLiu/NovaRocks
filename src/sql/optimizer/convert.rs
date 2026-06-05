@@ -191,6 +191,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
                 step: node.step,
                 column_name: node.column_name.clone(),
                 alias: node.alias.clone(),
+                output_column_id: node.output_column_id,
             });
             let expr = MExpr {
                 id: memo.next_expr_id(),

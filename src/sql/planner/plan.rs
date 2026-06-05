@@ -185,6 +185,7 @@ pub(crate) struct GenerateSeriesNode {
     pub step: i64,
     pub column_name: String,
     pub alias: Option<String>,
+    pub output_column_id: ColumnId,
     /// Set by the Phase-1 column-pruning tagging pass; `None` means all columns required.
     pub required_output_columns: Option<HashSet<ColumnId>>,
 }

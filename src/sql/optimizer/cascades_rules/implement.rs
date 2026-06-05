@@ -1295,6 +1295,7 @@ impl Rule for GenerateSeriesToPhysical {
                 step: op.step,
                 column_name: op.column_name.clone(),
                 alias: op.alias.clone(),
+                output_column_id: op.output_column_id,
             }),
             children: expr.children.clone(),
         }]
@@ -1493,7 +1494,7 @@ mod decode_tests {
 mod top_n_tests {
     use super::*;
     use crate::sql::optimizer::memo::{MExpr, Memo};
-    use crate::sql::optimizer::operator::{LogicalTopNOp, TopNPhase};
+    use crate::sql::optimizer::operator::{LogicalGenerateSeriesOp, LogicalTopNOp, TopNPhase};
 
     #[test]
     fn top_n_to_physical_produces_physical_top_n() {
@@ -1530,6 +1531,33 @@ mod top_n_tests {
             other => panic!("expected PhysicalTopN, got {:?}", other),
         }
         assert_eq!(out[0].children, vec![dummy_child]);
+    }
+
+    #[test]
+    fn generate_series_to_physical_preserves_output_column_id() {
+        let mut memo = Memo::new();
+        let output_column_id = ColumnId::new_for_test(8101);
+        let expr = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalGenerateSeries(LogicalGenerateSeriesOp {
+                start: 1,
+                end: 10,
+                step: 2,
+                column_name: "x".to_string(),
+                alias: Some("gs".to_string()),
+                output_column_id,
+            }),
+            children: vec![],
+        };
+
+        let out = GenerateSeriesToPhysical.apply(&expr, &mut memo);
+        assert_eq!(out.len(), 1);
+        let Operator::PhysicalGenerateSeries(p) = &out[0].op else {
+            panic!("expected PhysicalGenerateSeries");
+        };
+        assert_eq!(p.output_column_id, output_column_id);
+        assert_eq!(p.column_name, "x");
+        assert_eq!(p.alias.as_deref(), Some("gs"));
     }
 }
 
