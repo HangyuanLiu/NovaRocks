@@ -825,7 +825,7 @@ mod tests {
         })
         .expect("unknown disabled rule must not break the pipeline");
 
-        assert_eq!(outcome.trace.stage_names().len(), 12);
+        assert_eq!(outcome.trace.stage_names().len(), 11);
     }
 
     // ── Task-5 helpers ──────────────────────────────────────────────────────
@@ -966,7 +966,6 @@ mod tests {
                 "imv-logical-normalize",
                 "imv-delta-marker",
                 "imv-branch-union",
-                "imv-join-delta",
                 "imv-union-delta",
                 "imv-aggregate-state",
                 "imv-delta-pushdown",

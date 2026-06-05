@@ -4,8 +4,9 @@
 //! Delta commutes with projection and filtering (a row's insert/delete action
 //! is preserved through column projection and row filtering), so
 //! `Delta(Project(x)) == Project(Delta(x))` and `Delta(Filter(x)) == Filter(Delta(x))`.
-//! Delta does NOT commute with Aggregate/Join/Union; unsupported shapes
-//! fail-fast here unless an earlier aggregate/join rewrite consumed them.
+//! Delta does NOT commute with Aggregate/Union; unsupported shapes fail-fast
+//! here unless an earlier rewrite consumed them. Join is handled by
+//! `RewriteJoinDeltaRule` in the same stage's fixpoint.
 
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::imv::marker::ImvDeltaNode;
@@ -61,7 +62,8 @@ impl LogicalRewriteRule for PushDeltaThroughUnaryRule {
                 return Err("Iceberg IMV rewrite does not support this aggregate shape".to_string());
             }
             LogicalPlan::Join(_) => {
-                return Err("Iceberg IMV rewrite does not support this join shape".to_string());
+                // Left for RewriteJoinDeltaRule in the same stage's fixpoint.
+                return Ok(RewriteResult::Unchanged);
             }
             LogicalPlan::Union(_) => {
                 return Err("Iceberg IMV rewrite does not support this union shape".to_string());
@@ -313,15 +315,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_delta_over_join() {
+    fn leaves_delta_over_join_for_join_delta_rule() {
         let rule = PushDeltaThroughUnaryRule;
         let mut ctx = ctx();
         let plan = delta(join_over(leaf_scan(), leaf_scan()));
         assert!(rule.matches(&plan, &ctx));
-        let err = rule.apply(plan, &mut ctx).expect_err("Join must fail");
+        let result = rule
+            .apply(plan, &mut ctx)
+            .expect("join must be a no-op, not fail");
         assert!(
-            err.contains("Iceberg IMV rewrite does not support this join shape"),
-            "unexpected error: {err}"
+            matches!(result, RewriteResult::Unchanged),
+            "delta over join is left for RewriteJoinDeltaRule"
         );
     }
 

@@ -8826,10 +8826,10 @@ fn validate_aggregate_refresh_rewrite_outcome(
     evidence: RewriteMergeRefreshEvidence,
 ) -> Result<(), String> {
     if evidence == RewriteMergeRefreshEvidence::JoinAggregate
-        && !rewrite_outcome_rule_changed(outcome, "RewriteJoinAggregateDelta")
+        && !rewrite_outcome_rule_changed(outcome, "RewriteJoinDelta")
     {
         return Err(format!(
-            "iceberg join aggregate MV {} incremental refresh rewrite did not apply RewriteJoinAggregateDelta",
+            "iceberg join aggregate MV {} incremental refresh rewrite did not apply RewriteJoinDelta",
             target_fqn_string(&ctx.target)
         ));
     }
@@ -9021,10 +9021,7 @@ mod aggregate_refresh_rewrite_validation_tests {
         )
         .expect_err("join aggregate refresh must require join rewrite evidence");
 
-        assert!(
-            err.contains("did not apply RewriteJoinAggregateDelta"),
-            "got: {err}"
-        );
+        assert!(err.contains("did not apply RewriteJoinDelta"), "got: {err}");
     }
 
     #[test]
@@ -9032,7 +9029,7 @@ mod aggregate_refresh_rewrite_validation_tests {
         let ctx = crate::engine::mv::refresh_context::tests_support::dummy_rewrite_context();
         let outcome = outcome(
             empty_values_plan(),
-            &["RewriteJoinAggregateDelta", "RewriteAggregateState"],
+            &["RewriteJoinDelta", "RewriteAggregateState"],
         );
 
         let err = validate_aggregate_refresh_rewrite_outcome(

@@ -10,12 +10,15 @@ use std::sync::atomic::AtomicBool;
 use arrow::datatypes::DataType;
 
 use crate::engine::mv::iceberg_target_apply::ICEBERG_MV_APPLY_KEY_COLUMN;
-use crate::sql::analysis::{ExprKind, JoinKind, LiteralValue, OutputColumn};
+use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn};
 use crate::sql::catalog::ScanSource;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::imv::action_propagation::{
     first_delta_base_fqn, is_supported_branch_union, is_supported_fan_in_delta_union,
+};
+use crate::sql::optimizer::rewrite::imv::join_delta_shape::{
+    is_supported_join_delta_branch, is_supported_join_delta_union,
 };
 use crate::sql::optimizer::rewrite::imv::row_id_column::ImvRowIdColumn;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
@@ -327,68 +330,6 @@ fn validate_signed_delta_input(plan: &LogicalPlan) -> Result<(), String> {
     }
 }
 
-fn is_supported_join_delta_union(node: &crate::sql::planner::plan::UnionNode) -> bool {
-    node.all
-        && !node.inputs.is_empty()
-        && node
-            .inputs
-            .iter()
-            .all(is_supported_normalized_join_delta_branch)
-}
-
-fn is_supported_normalized_join_delta_branch(plan: &LogicalPlan) -> bool {
-    match plan {
-        LogicalPlan::Project(project) => {
-            project
-                .items
-                .iter()
-                .any(|item| item.output_name.eq_ignore_ascii_case(ImvActionColumn::NAME))
-                && matches!(
-                    project.input.as_ref(),
-                    LogicalPlan::Join(join) if is_supported_join_delta_branch(join)
-                )
-        }
-        LogicalPlan::Join(join) => is_supported_join_delta_branch(join),
-        _ => false,
-    }
-}
-
-fn is_supported_join_delta_branch(node: &crate::sql::planner::plan::JoinNode) -> bool {
-    matches!(node.join_type, JoinKind::Inner | JoinKind::Cross)
-        && exactly_one_delta_one_version(&node.left, &node.right)
-}
-
-fn exactly_one_delta_one_version(left: &LogicalPlan, right: &LogicalPlan) -> bool {
-    let left_delta = subtree_has_delta(left);
-    let right_delta = subtree_has_delta(right);
-    let left_version = subtree_has_version(left);
-    let right_version = subtree_has_version(right);
-    ((left_delta && right_version) || (right_delta && left_version))
-        && !(left_delta && right_delta)
-        && !(left_version && right_version)
-}
-
-fn subtree_has_version(plan: &LogicalPlan) -> bool {
-    match plan {
-        LogicalPlan::Scan(scan) => {
-            matches!(scan.table.source, ScanSource::IcebergVersionTable { .. })
-        }
-        LogicalPlan::Filter(node) => subtree_has_version(&node.input),
-        LogicalPlan::Project(node) => subtree_has_version(&node.input),
-        LogicalPlan::Aggregate(node) => subtree_has_version(&node.input),
-        LogicalPlan::AggregateStateMerge(node) => {
-            subtree_has_version(&node.old_input) || subtree_has_version(&node.delta_input)
-        }
-        LogicalPlan::Join(node) => {
-            subtree_has_version(&node.left) || subtree_has_version(&node.right)
-        }
-        LogicalPlan::Union(node) => node.inputs.iter().any(subtree_has_version),
-        LogicalPlan::ImvDelta(node) => subtree_has_version(&node.input),
-        LogicalPlan::ImvVersion(node) => subtree_has_version(&node.input),
-        _ => false,
-    }
-}
-
 fn validate_scan(scan: &ScanNode) -> Result<(), String> {
     let fqn = match &scan.table.source {
         ScanSource::IcebergDeltaTable { table, .. }
@@ -493,11 +434,12 @@ fn has_visible_output(plan: &LogicalPlan) -> bool {
 mod tests {
     use super::*;
     use crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN;
-    use crate::sql::analysis::{ExprKind, LiteralValue, ProjectItem, TypedExpr};
+    use crate::sql::analysis::{ExprKind, JoinKind, LiteralValue, ProjectItem, TypedExpr};
     use crate::sql::catalog::{ColumnDef, IcebergSchemaDef, IcebergTableInfo, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::plan::{
-        AggregateCall, AggregateNode, AggregateStateMergeNode, ProjectNode, UnionNode, ValuesNode,
+        AggregateCall, AggregateNode, AggregateStateMergeNode, JoinNode, ProjectNode, UnionNode,
+        ValuesNode,
     };
 
     #[test]
@@ -892,6 +834,114 @@ mod tests {
         })
     }
 
+    fn version_scan_without_action() -> ScanNode {
+        let mut scan = delta_scan_with(None);
+        let table = match &scan.table.source {
+            ScanSource::IcebergDeltaTable { table, .. } => table.clone(),
+            _ => unreachable!(),
+        };
+        scan.table.source = ScanSource::IcebergVersionTable {
+            table,
+            snapshot_id: 22,
+        };
+        scan
+    }
+
+    fn normalized_version_project(user_col_id: ColumnId) -> LogicalPlan {
+        let mut scan = version_scan_without_action();
+        scan.columns[0].column_id = user_col_id;
+        LogicalPlan::Project(ProjectNode {
+            input: Box::new(LogicalPlan::Scan(scan)),
+            items: vec![column_ref_item(
+                user_col_id,
+                "k",
+                DataType::Int64,
+                false,
+                "k",
+                user_col_id,
+            )],
+            output_qualifier: None,
+            required_output_columns: None,
+        })
+    }
+
+    fn join_plan(left: LogicalPlan, right: LogicalPlan) -> LogicalPlan {
+        LogicalPlan::Join(JoinNode {
+            left: Box::new(left),
+            right: Box::new(right),
+            join_type: JoinKind::Inner,
+            condition: None,
+            required_output_columns: None,
+        })
+    }
+
+    fn normalized_join_delta_branch(
+        left: LogicalPlan,
+        right: LogicalPlan,
+        action_id: ColumnId,
+        user_col_id: ColumnId,
+        row_id: ColumnId,
+    ) -> LogicalPlan {
+        LogicalPlan::Project(ProjectNode {
+            input: Box::new(join_plan(left, right)),
+            items: vec![
+                column_ref_item(user_col_id, "k", DataType::Int64, false, "k", user_col_id),
+                column_ref_item(
+                    action_id,
+                    ImvActionColumn::NAME,
+                    DataType::Int8,
+                    false,
+                    ImvActionColumn::NAME,
+                    action_id,
+                ),
+                column_ref_item(
+                    row_id,
+                    ImvRowIdColumn::NAME,
+                    DataType::Int64,
+                    false,
+                    ImvRowIdColumn::NAME,
+                    row_id,
+                ),
+            ],
+            output_qualifier: None,
+            required_output_columns: None,
+        })
+    }
+
+    fn recursive_join_delta_union(action_id: ColumnId) -> LogicalPlan {
+        LogicalPlan::Union(UnionNode {
+            inputs: vec![
+                normalized_join_delta_branch(
+                    normalized_delta_project(action_id, ColumnId(1), ColumnId(101)),
+                    normalized_version_project(ColumnId(10)),
+                    action_id,
+                    ColumnId(1),
+                    ColumnId(101),
+                ),
+                normalized_join_delta_branch(
+                    normalized_version_project(ColumnId(1)),
+                    normalized_delta_project(action_id, ColumnId(10), ColumnId(111)),
+                    action_id,
+                    ColumnId(1),
+                    ColumnId(101),
+                ),
+            ],
+            all: true,
+            output_columns: vec![
+                OutputColumn {
+                    column_id: ColumnId(1),
+                    name: "k".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    is_internal: false,
+                },
+                ImvActionColumn::output_column(action_id),
+                ImvRowIdColumn::output_column(ColumnId(101)),
+            ],
+            required_output_columns: None,
+        })
+    }
+
     fn fan_in_delta_union(action_id: ColumnId) -> LogicalPlan {
         LogicalPlan::Union(UnionNode {
             inputs: vec![
@@ -1253,6 +1303,19 @@ mod tests {
         let plan = signed_aggregate_state_merge_over(fan_in_delta_union(ColumnId(100)));
 
         validate(&plan).expect("fan-in delta union inside AggregateStateMerge must validate");
+    }
+
+    #[test]
+    fn validation_accepts_recursive_join_delta_union_inside_state_merge() {
+        let nested_delta_side = recursive_join_delta_union(ColumnId(100));
+        let version_side = join_plan(
+            normalized_version_project(ColumnId(20)),
+            normalized_version_project(ColumnId(30)),
+        );
+        let plan = signed_aggregate_state_merge_over(join_plan(nested_delta_side, version_side));
+
+        validate(&plan)
+            .expect("recursive join-delta union inside AggregateStateMerge must validate");
     }
 
     #[test]
