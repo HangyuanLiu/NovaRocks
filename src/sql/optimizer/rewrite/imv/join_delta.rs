@@ -178,9 +178,30 @@ fn mark_scan(plan: LogicalPlan, marker: MarkerKind) -> Result<LogicalPlan, Strin
             filter.input = Box::new(mark_scan(*filter.input, marker)?);
             LogicalPlan::Filter(filter)
         }
+        LogicalPlan::Join(join) => match marker {
+            MarkerKind::Delta(action_column) => {
+                wrap_scan_marker(LogicalPlan::Join(join), MarkerKind::Delta(action_column))
+            }
+            MarkerKind::Version(version_ref) => {
+                let JoinNode {
+                    left,
+                    right,
+                    join_type,
+                    condition,
+                    required_output_columns,
+                } = join;
+                LogicalPlan::Join(JoinNode {
+                    left: Box::new(mark_scan(*left, MarkerKind::Version(version_ref.clone()))?),
+                    right: Box::new(mark_scan(*right, MarkerKind::Version(version_ref))?),
+                    join_type,
+                    condition,
+                    required_output_columns,
+                })
+            }
+        },
         other => {
             return Err(format!(
-                "Iceberg IMV join aggregate rewrite supports only Scan/Project/Filter join sides, got {}",
+                "Iceberg IMV join delta rewrite supports only Scan/Project/Filter/Join join sides, got {}",
                 plan_kind(&other)
             ));
         }
@@ -394,6 +415,53 @@ mod tests {
             Some(scope),
             "join-delta must carry branch_scope onto the rewritten root delta"
         );
+    }
+
+    #[test]
+    fn mark_delta_scan_wraps_nested_join_whole() {
+        // Delta marker over a Join must wrap the entire join (pending recursive join-delta expansion),
+        // NOT push into the two sides.
+        let join = join_of(scan("a", 1), scan("b", 10));
+        let marked = mark_delta_scan(join, ColumnId(100)).expect("mark delta over join");
+        let LogicalPlan::ImvDelta(delta) = marked else {
+            panic!("expected ImvDelta wrapping the whole join, got {marked:?}");
+        };
+        assert!(!delta.is_root, "nested join delta marker is not root");
+        assert_eq!(delta.action_column, Some(ColumnId(100)));
+        assert!(matches!(delta.input.as_ref(), LogicalPlan::Join(_)));
+    }
+
+    #[test]
+    fn mark_version_scan_pushes_same_role_down_both_join_sides() {
+        // Version marker over a Join distributes over the join:
+        // Version(Join(a,b), from) == Join(Version(a, from), Version(b, from)).
+        let join = join_of(scan("a", 1), scan("b", 10));
+        let marked = mark_version_scan(join, ImvVersionRef::from_snapshot())
+            .expect("mark version over join");
+        let LogicalPlan::Join(j) = marked else {
+            panic!("expected Join with both sides version-marked, got {marked:?}");
+        };
+        let left_v = assert_version_side(j.left.as_ref());
+        let right_v = assert_version_side(j.right.as_ref());
+        assert_eq!(
+            left_v.version_ref,
+            ImvVersionRef {
+                role: ImvVersionRole::From
+            }
+        );
+        assert_eq!(
+            right_v.version_ref,
+            ImvVersionRef {
+                role: ImvVersionRole::From
+            }
+        );
+    }
+
+    fn assert_version_side(plan: &LogicalPlan) -> &ImvVersionNode {
+        match plan {
+            LogicalPlan::ImvVersion(v) => v,
+            other => panic!("expected ImvVersion on join side, got {other:?}"),
+        }
     }
 
     fn assert_supported_join_rewrite(join_type: JoinKind) {
