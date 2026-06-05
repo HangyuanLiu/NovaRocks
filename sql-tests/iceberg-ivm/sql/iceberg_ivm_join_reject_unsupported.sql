@@ -61,7 +61,7 @@ FROM ice_ivm_join_reject_${uuid0}.ns_${uuid0}.reject_left_${uuid0} AS l
 JOIN ice_ivm_join_reject_${uuid0}.ns_${uuid0}.reject_right_${uuid0} AS r ON l.rid > r.rid;
 
 -- query 4
--- @expect_error=Iceberg IMV refresh contract supports join keys only over direct scan inputs
+-- @expect_error=requires 2 distinct Iceberg base table refs
 CREATE MATERIALIZED VIEW reject_three_${uuid0}
 DISTRIBUTED BY HASH(id) BUCKETS 1
 PROPERTIES ('storage_engine' = 'iceberg')
