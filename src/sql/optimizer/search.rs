@@ -130,6 +130,9 @@ impl SearchContext {
                 required,
                 expr.children.len(),
             );
+            let broadcast_is_only_alternative = !alternatives
+                .iter()
+                .any(|alt| alt.kind != PropertyAlternativeKind::BroadcastJoin);
             for alt in alternatives {
                 let child_reqs = alt.child_props.clone();
                 if child_reqs.len() != expr.children.len() {
@@ -150,6 +153,7 @@ impl SearchContext {
                         let build_stats =
                             stats_for_group(&memo.groups[build_group_id], memo, &self.table_stats);
                         if !required_for_correctness
+                            && !broadcast_is_only_alternative
                             && !super::cost::broadcast_gate_passes(
                                 &probe_stats,
                                 &build_stats,
@@ -308,7 +312,7 @@ fn stats_for_group(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::{ExprKind, JoinKind, TypedExpr};
+    use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::MExpr;
     use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
@@ -361,6 +365,22 @@ mod tests {
                 column_id: ColumnId(id),
                 qualifier: None,
                 column: name.into(),
+            },
+            data_type: DataType::Int64,
+            nullable: false,
+        }
+    }
+
+    fn minus_int(expr: TypedExpr, value: i64) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(expr),
+                op: BinOp::Sub,
+                right: Box::new(TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::Int(value)),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                }),
             },
             data_type: DataType::Int64,
             nullable: false,
@@ -470,6 +490,37 @@ mod tests {
         );
         set_group_logical_rows_for_test(&mut memo, build_group, build_rows, build_confidence);
         (memo, root, HashMap::new())
+    }
+
+    fn make_expression_key_large_estimated_build_join_memo_for_test() -> (Memo, GroupId) {
+        let (mut memo, root) = make_two_table_inner_join_memo_for_test();
+        let (probe_group, build_group) = inner_join_child_groups_for_test(&memo, root);
+        set_group_logical_rows_for_test(
+            &mut memo,
+            probe_group,
+            3_543_657.0,
+            crate::sql::optimizer::statistics::Confidence::Estimated,
+        );
+        set_group_logical_rows_for_test(
+            &mut memo,
+            build_group,
+            648_000.0,
+            crate::sql::optimizer::statistics::Confidence::Estimated,
+        );
+
+        let root_expr = memo.groups[root]
+            .physical_exprs
+            .first_mut()
+            .expect("fixture root should have a physical expression");
+        let Operator::PhysicalHashJoin(join) = &mut root_expr.op else {
+            panic!("fixture root should be a hash join");
+        };
+        join.eq_conditions = vec![PhysicalHashJoinEqCondition {
+            left: test_col(1, "a_id"),
+            right: minus_int(test_col(2, "b_id"), 52),
+            null_safe: false,
+        }];
+        (memo, root)
     }
 
     fn make_join_over_prepartitioned_children_for_test() -> (Memo, GroupId, GroupId, GroupId) {
@@ -784,6 +835,25 @@ mod tests {
         assert_eq!(
             winner.alt_kind,
             crate::sql::optimizer::derive::PropertyAlternativeKind::ShuffleJoin
+        );
+    }
+
+    #[test]
+    fn search_allows_broadcast_when_expression_key_has_no_shuffle_fallback() {
+        let (memo, root) = make_expression_key_large_estimated_build_join_memo_for_test();
+        let mut ctx = SearchContext::new(HashMap::new());
+        let required = PhysicalPropertySet::gather();
+
+        let cost = ctx.optimize_group(&memo, root, &required).expect("search");
+        assert!(
+            cost.is_finite(),
+            "expression-key joins must keep a feasible broadcast fallback"
+        );
+        let winner = ctx.winners.get(&(root, required.clone())).expect("winner");
+
+        assert_eq!(
+            winner.alt_kind,
+            crate::sql::optimizer::derive::PropertyAlternativeKind::BroadcastJoin
         );
     }
 
