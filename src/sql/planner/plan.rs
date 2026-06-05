@@ -286,10 +286,11 @@ pub(crate) struct AggregateCall {
     pub distinct: bool,
     pub result_type: DataType,
     pub order_by: Vec<SortItem>,
-    /// G1: globally-unique id of THIS aggregate's output column. Minted by
-    /// `collect_aggregates` during projection splitting. Phase 1 only populates
-    /// it; Phase 2 rewrites upper-projection refs to `ColumnRef(this id)` and
-    /// Phase 3 binds the agg-result slot by it.
+    /// G1: id of THIS aggregate's output column. Planner-created calls are
+    /// minted by `collect_aggregates`; rewrite paths should preserve existing
+    /// ids or allocate ids for newly-defined aggregate outputs. Fixtures and
+    /// transient adapters may use `UNSET` until they become executable
+    /// bindings.
     pub output_column_id: crate::sql::column_id::ColumnId,
 }
 

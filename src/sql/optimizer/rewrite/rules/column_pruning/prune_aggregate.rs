@@ -10,10 +10,10 @@
 //! `aggregates[i]` is therefore incorrect and can panic or silently drop the
 //! wrong aggregate.
 //!
-//! Per-aggregate output pruning (Gap 5) requires an explicit `output_column_id`
-//! field on `AggregateCall` so that each aggregate result can be addressed by
-//! id independently of `output_columns` position.  Until that is implemented,
-//! this rule returns `Unchanged` unconditionally.
+//! Per-aggregate output pruning (Gap 5) remains disabled until upper
+//! projection refs and codegen aggregate-result binding are switched to
+//! `AggregateCall.output_column_id`.  Until then, this rule returns
+//! `Unchanged` unconditionally.
 
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
@@ -39,10 +39,8 @@ impl LogicalRewriteRule for PruneAggregateColumns {
     fn apply(&self, plan: LogicalPlan, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         // No-op: see module-level doc comment.
         //
-        // Per-aggregate output pruning (Gap 5) requires an explicit
-        // output_column_id on AggregateCall.  Until that is added, this rule
-        // always returns Unchanged to avoid incorrect positional indexing into
-        // output_columns.
+        // Per-aggregate output pruning (Gap 5) remains disabled until upper
+        // projection refs and codegen binding use AggregateCall.output_column_id.
         let _ = plan; // suppress unused-variable warning
         Ok(RewriteResult::Unchanged)
     }

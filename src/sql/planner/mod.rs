@@ -2902,6 +2902,45 @@ mod tests {
     }
 
     #[test]
+    fn p1_aggregate_call_ids_deduplicate_repeated_calls() {
+        let plan = plan_test_query("SELECT sum(b) AS s1, count(b) AS c, sum(b) AS s2 FROM t");
+        let aggs = first_aggregate_calls(&plan);
+        assert_eq!(aggs.len(), 2, "expected repeated sum(b) to deduplicate");
+        assert_eq!(
+            aggs.iter()
+                .filter(|call| call.name.eq_ignore_ascii_case("sum"))
+                .count(),
+            1,
+            "expected exactly one sum(b) AggregateCall"
+        );
+        assert_eq!(
+            aggs.iter()
+                .filter(|call| call.name.eq_ignore_ascii_case("count"))
+                .count(),
+            1,
+            "expected one count(b) AggregateCall"
+        );
+
+        let ids = aggs
+            .iter()
+            .map(|call| {
+                assert_ne!(
+                    call.output_column_id,
+                    crate::sql::column_id::ColumnId::UNSET,
+                    "AggregateCall {} must carry a real output_column_id",
+                    call.name
+                );
+                call.output_column_id
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            ids.len(),
+            aggs.len(),
+            "distinct AggregateCalls must carry distinct output ids"
+        );
+    }
+
+    #[test]
     fn test_plan_query_builds_nested_anchor_chain() {
         let plan = parse_analyze_and_plan(
             "WITH a AS (SELECT o_orderkey AS ok FROM orders), \
