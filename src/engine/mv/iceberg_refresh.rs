@@ -1655,6 +1655,15 @@ fn build_branch_union_schema_contract(
         // first branch's aggregate core, then overlay its narrowed bases onto
         // the full cross-branch base set.
         TargetIdentity::GroupRowId(_) => {
+            // TODO(per-branch lineage): the aggregate `bases`/`join`/group-key
+            // lineage persisted here is built from the FIRST branch only. That
+            // is correct for every branch only because
+            // `derive_from_set_operation` rejects a *composed* aggregate branch
+            // union whose branches do not share the same base set + join
+            // structure + group-key layout (A3 safety). If/when full per-branch
+            // lineage is persisted (e.g. a `Vec<BranchContract>`), that
+            // restriction can be lifted to admit heterogeneous-structure
+            // composed unions.
             let first_branch_ast = first_union_branch_ast_query(canonical_query)?;
             // Only the first branch's bases are loaded for the inner core; pick
             // them out of the full set so the core builder's single/two-base
@@ -5173,6 +5182,145 @@ fn plan_iceberg_union_projection_mv_refresh(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Plan the `AllBasesRequired` aggregate refresh variants (fan-in
+/// `GroupRowId` and branch-union `BranchScoped`). Extracted from
+/// `plan_iceberg_aggregate_mv_refresh` (I2) to mirror the execute-side
+/// [`refresh_fan_in_aggregate_iceberg_mv`] fold: both `AllBasesRequired`
+/// aggregate identities pin/validate every base, decide the refresh from the
+/// combined base-snapshot statuses, and build one multi-base refresh plan; only
+/// the up-front branch-contract vs fan-in base-ref validation and the log label
+/// differ. Behavior is byte-for-byte identical to the inline block it replaced.
+#[allow(clippy::too_many_arguments)]
+fn plan_iceberg_all_bases_aggregate_mv_refresh(
+    state: &Arc<StandaloneState>,
+    iceberg_target: &IcebergMvTarget,
+    target_table: &iceberg::table::Table,
+    target: MvTarget,
+    stmt: &RefreshMaterializedViewStmt,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    mv_definition: &StoredMvDefinition,
+    base_refs: &[IcebergTableRef],
+    caps: &RefreshCapabilities,
+    shape: &IncrementalMvShape,
+    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
+) -> Result<RefreshPlan, RefreshError> {
+    // The branch-union variant validates against `union_shape`; the
+    // fan-in/single variant validates against `aggregate_shape`. Both are
+    // recovered from the legacy classified shape here (retired in B4).
+    let is_branch_union = matches!(caps.identity, RefreshIdentity::BranchScoped(_));
+    if is_branch_union {
+        let (union_shape, _) =
+            branch_union_aggregate_shape_for_refresh(shape).map_err(RefreshError::user)?;
+        validate_branch_union_contract(iceberg_target, schema_contract, union_shape, target_table)
+            .map_err(RefreshError::user)?;
+        validate_branch_union_aggregate_base_refs(union_shape, base_refs)
+            .map_err(RefreshError::user)?;
+    } else {
+        let IncrementalMvShape::Aggregate(aggregate_shape) = shape else {
+            return Err(RefreshError::user(format!(
+                "iceberg aggregate MV {}.{}.{} refresh contract did not match legacy aggregate shape",
+                iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+            )));
+        };
+        validate_aggregate_fan_in_base_refs(aggregate_shape, base_refs)
+            .map_err(RefreshError::user)?;
+    }
+    let mut loaded_bases = BTreeMap::new();
+    let mut current_snapshots = BTreeMap::new();
+    let mut snapshot_pins = BTreeMap::new();
+    for base_ref in base_refs {
+        let loaded =
+            load_current_iceberg_base_table(state, base_ref).map_err(RefreshError::user)?;
+        validate_aggregate_schema_contract_for_base(
+            schema_contract,
+            base_ref,
+            &loaded.table,
+            target_table,
+        )
+        .map_err(RefreshError::user)?;
+        let current = expected_main_snapshot_id_from_table(&loaded.table);
+        let fqn = base_ref.fqn();
+        current_snapshots.insert(fqn.clone(), current);
+        snapshot_pins.insert(fqn.clone(), current);
+        loaded_bases.insert(fqn, loaded);
+    }
+    let previous_snapshots = &mv_definition.last_refresh_snapshots;
+    let refresh_kind_label = if is_branch_union {
+        "branch UNION ALL aggregate"
+    } else {
+        "aggregate-over-UNION-ALL"
+    };
+    let refresh_label = format!(
+        "iceberg {refresh_kind_label} MV {}.{}.{}",
+        iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+    );
+    let refresh_statuses =
+        base_snapshot_statuses_for_plan(base_refs, previous_snapshots, &current_snapshots);
+    let refresh_decision = decide_refresh(
+        BaseSnapshotPolicy::AllBasesRequired,
+        &refresh_statuses,
+        &refresh_label,
+    );
+    let skip_empty = matches!(refresh_decision, RefreshDecision::SkipEmpty);
+    let mode = plan_refresh_mode_from_decision(refresh_decision)?;
+    let has_previous = base_refs
+        .iter()
+        .any(|base_ref| previous_snapshots.contains_key(&base_ref.fqn()));
+    if has_previous {
+        for base_ref in base_refs {
+            let fqn = base_ref.fqn();
+            let previous = previous_snapshots.get(&fqn).copied().ok_or_else(|| {
+                RefreshError::user(format!(
+                    "iceberg {refresh_kind_label} MV {}.{}.{} has partial previous refresh snapshots; recreate the MV",
+                    iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
+                ))
+            })?;
+            let current = current_snapshots.get(&fqn).copied().flatten().ok_or_else(|| {
+                RefreshError::user(format!(
+                    "cannot refresh iceberg {refresh_kind_label} MV {}.{}.{}: previously-refreshed base snapshot for {} is no longer reachable",
+                    iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table, fqn
+                ))
+            })?;
+            if previous != current {
+                let loaded = loaded_bases.get(&fqn).ok_or_else(|| {
+                    RefreshError::user(format!(
+                        "cannot refresh iceberg {refresh_kind_label} MV {}.{}.{}: base {} was not loaded",
+                        iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table, fqn
+                    ))
+                })?;
+                crate::connector::iceberg::changes::classify_lineage(
+                    loaded.table.metadata(),
+                    previous,
+                    current,
+                )
+                .map_err(|e| {
+                    RefreshError::user(format!(
+                        "cannot refresh iceberg {refresh_kind_label} MV {}.{}.{}: previous base snapshot {previous} for {} is not reachable from pinned snapshot {current}: {e}",
+                        iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table, fqn
+                    ))
+                })?;
+            }
+        }
+    }
+    let affected_partitions = match mode {
+        RefreshMode::Noop if skip_empty => noop_affected_partitions(schema_contract),
+        _ => unknown_union_all_affected_partitions(),
+    };
+    log_planned_iceberg_mv_affected_partitions(iceberg_target, &affected_partitions);
+    Ok(build_iceberg_refresh_plan(
+        mv_definition,
+        target,
+        stmt,
+        current_catalog,
+        current_database,
+        base_refs,
+        snapshot_pins,
+        mode,
+        affected_partitions,
+    ))
+}
+
 fn plan_iceberg_aggregate_mv_refresh(
     state: &Arc<StandaloneState>,
     iceberg_target: &IcebergMvTarget,
@@ -5196,137 +5344,24 @@ fn plan_iceberg_aggregate_mv_refresh(
     //   JoinPairPartialInitialSkip -> join aggregate
     match &caps.snapshot_policy {
         BaseSnapshotPolicy::SingleBase | BaseSnapshotPolicy::AllBasesRequired => {
-            // The branch-union variant validates against `union_shape`; the
-            // fan-in/single variant validates against `aggregate_shape`. Both
-            // are recovered from the legacy classified shape here (retired in B4).
-            let is_branch_union = matches!(caps.identity, RefreshIdentity::BranchScoped(_));
+            // AllBasesRequired (fan-in `GroupRowId` / branch-union
+            // `BranchScoped`) is planned by a dedicated helper (I2) mirroring
+            // the execute-side `refresh_fan_in_aggregate_iceberg_mv` fold.
             if matches!(caps.snapshot_policy, BaseSnapshotPolicy::AllBasesRequired) {
-                if is_branch_union {
-                    let (union_shape, _) = branch_union_aggregate_shape_for_refresh(shape)
-                        .map_err(RefreshError::user)?;
-                    validate_branch_union_contract(
-                        iceberg_target,
-                        schema_contract,
-                        union_shape,
-                        target_table,
-                    )
-                    .map_err(RefreshError::user)?;
-                    validate_branch_union_aggregate_base_refs(union_shape, base_refs)
-                        .map_err(RefreshError::user)?;
-                } else {
-                    let IncrementalMvShape::Aggregate(aggregate_shape) = shape else {
-                        return Err(RefreshError::user(format!(
-                            "iceberg aggregate MV {}.{}.{} refresh contract did not match legacy aggregate shape",
-                            iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
-                        )));
-                    };
-                    validate_aggregate_fan_in_base_refs(aggregate_shape, base_refs)
-                        .map_err(RefreshError::user)?;
-                }
-                let mut loaded_bases = BTreeMap::new();
-                let mut current_snapshots = BTreeMap::new();
-                let mut snapshot_pins = BTreeMap::new();
-                for base_ref in base_refs {
-                    let loaded = load_current_iceberg_base_table(state, base_ref)
-                        .map_err(RefreshError::user)?;
-                    validate_aggregate_schema_contract_for_base(
-                        schema_contract,
-                        base_ref,
-                        &loaded.table,
-                        target_table,
-                    )
-                    .map_err(RefreshError::user)?;
-                    let current = expected_main_snapshot_id_from_table(&loaded.table);
-                    let fqn = base_ref.fqn();
-                    current_snapshots.insert(fqn.clone(), current);
-                    snapshot_pins.insert(fqn.clone(), current);
-                    loaded_bases.insert(fqn, loaded);
-                }
-                let previous_snapshots = &mv_definition.last_refresh_snapshots;
-                let refresh_kind_label = if is_branch_union {
-                    "branch UNION ALL aggregate"
-                } else {
-                    "aggregate-over-UNION-ALL"
-                };
-                let refresh_label = format!(
-                    "iceberg {refresh_kind_label} MV {}.{}.{}",
-                    iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
-                );
-                let refresh_statuses = base_snapshot_statuses_for_plan(
-                    base_refs,
-                    previous_snapshots,
-                    &current_snapshots,
-                );
-                let refresh_decision = decide_refresh(
-                    BaseSnapshotPolicy::AllBasesRequired,
-                    &refresh_statuses,
-                    &refresh_label,
-                );
-                let skip_empty = matches!(refresh_decision, RefreshDecision::SkipEmpty);
-                let mode = plan_refresh_mode_from_decision(refresh_decision)?;
-                let has_previous = base_refs
-                    .iter()
-                    .any(|base_ref| previous_snapshots.contains_key(&base_ref.fqn()));
-                if has_previous {
-                    for base_ref in base_refs {
-                        let fqn = base_ref.fqn();
-                        let previous = previous_snapshots.get(&fqn).copied().ok_or_else(|| {
-                            RefreshError::user(format!(
-                                "iceberg {refresh_kind_label} MV {}.{}.{} has partial previous refresh snapshots; recreate the MV",
-                                iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
-                            ))
-                        })?;
-                        let current = current_snapshots.get(&fqn).copied().flatten().ok_or_else(
-                            || {
-                                RefreshError::user(format!(
-                                    "cannot refresh iceberg {refresh_kind_label} MV {}.{}.{}: previously-refreshed base snapshot for {} is no longer reachable",
-                                    iceberg_target.catalog,
-                                    iceberg_target.namespace,
-                                    iceberg_target.table,
-                                    fqn
-                                ))
-                            },
-                        )?;
-                        if previous != current {
-                            let loaded = loaded_bases.get(&fqn).ok_or_else(|| {
-                                RefreshError::user(format!(
-                                    "cannot refresh iceberg {refresh_kind_label} MV {}.{}.{}: base {} was not loaded",
-                                    iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table, fqn
-                                ))
-                            })?;
-                            crate::connector::iceberg::changes::classify_lineage(
-                                loaded.table.metadata(),
-                                previous,
-                                current,
-                            )
-                            .map_err(|e| {
-                                RefreshError::user(format!(
-                                    "cannot refresh iceberg {refresh_kind_label} MV {}.{}.{}: previous base snapshot {previous} for {} is not reachable from pinned snapshot {current}: {e}",
-                                    iceberg_target.catalog,
-                                    iceberg_target.namespace,
-                                    iceberg_target.table,
-                                    fqn
-                                ))
-                            })?;
-                        }
-                    }
-                }
-                let affected_partitions = match mode {
-                    RefreshMode::Noop if skip_empty => noop_affected_partitions(schema_contract),
-                    _ => unknown_union_all_affected_partitions(),
-                };
-                log_planned_iceberg_mv_affected_partitions(iceberg_target, &affected_partitions);
-                return Ok(build_iceberg_refresh_plan(
-                    mv_definition,
+                return plan_iceberg_all_bases_aggregate_mv_refresh(
+                    state,
+                    iceberg_target,
+                    target_table,
                     target,
                     stmt,
                     current_catalog,
                     current_database,
+                    mv_definition,
                     base_refs,
-                    snapshot_pins,
-                    mode,
-                    affected_partitions,
-                ));
+                    caps,
+                    shape,
+                    schema_contract,
+                );
             }
             let [base_ref] = base_refs else {
                 return Err(RefreshError::user(
@@ -12689,6 +12724,42 @@ mod tests {
         assert!(
             base_fqns.contains("ice.sales.fact_b"),
             "bases={base_fqns:?}"
+        );
+    }
+
+    #[test]
+    fn create_iceberg_union_all_aggregate_over_join_rejects_heterogeneous_bases() {
+        // A3 safety: a composed `BranchScoped(GroupRowId)` UNION ALL whose
+        // branches join *different* base sets (branch0: a JOIN b, branch1:
+        // c JOIN d) is heterogeneous. The persisted schema contract uses
+        // FIRST-BRANCH-ONLY lineage (the `join` + narrowed `bases` describe
+        // branch0 alone), so it cannot correctly drive a refresh of branch1.
+        // CREATE must reject it rather than persist an incomplete-for-refresh
+        // contract. The homogeneous case (same base set in every branch) above
+        // still succeeds.
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_aggregate_fact_table(&env.state, "ice", "sales", "fact_a");
+        create_aggregate_fact_table(&env.state, "ice", "sales", "fact_b");
+        create_aggregate_fact_table(&env.state, "ice", "sales", "fact_c");
+        create_aggregate_fact_table(&env.state, "ice", "sales", "fact_d");
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_union_agg_join_het
+             DISTRIBUTED BY HASH(region) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT a.region, count(*) AS c, sum(a.amount) AS s
+                FROM ice.sales.fact_a a JOIN ice.sales.fact_b b ON a.id = b.id
+                GROUP BY a.region
+                UNION ALL
+                SELECT c0.region, count(*) AS c, sum(c0.amount) AS s
+                FROM ice.sales.fact_c c0 JOIN ice.sales.fact_d d ON c0.id = d.id
+                GROUP BY c0.region",
+        );
+
+        let err = create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect_err("heterogeneous-base composed UNION ALL aggregate must be rejected");
+        assert!(
+            err.contains("homogeneous") || err.contains("same base"),
+            "unexpected error: {err}"
         );
     }
 

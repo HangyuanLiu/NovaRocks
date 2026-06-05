@@ -909,6 +909,43 @@ fn derive_from_set_operation(set_op: &ResolvedSetOp) -> Result<RefreshFragmentPr
         })
         .expect("UNION ALL branch list was checked as non-empty");
 
+    // A3 safety — composed-branch structural homogeneity.
+    //
+    // A `BranchScoped(GroupRowId)` union of *composed* aggregate branches
+    // (aggregate-over-join / fan-in) is representable (BranchUtf8 apply key), so
+    // `into_refresh_contract` admits it. But the persisted schema contract built
+    // at CREATE (`build_branch_union_schema_contract` GroupRowId arm) derives its
+    // base/join/group-key lineage from the FIRST branch only. That first-branch
+    // lineage is only correct for every branch when all branches share the SAME
+    // structure: the same distinct base-table set, the same top-level join key
+    // count, the same fan-in branch count, and the same group-key output layout.
+    // A heterogeneous composed union (branch0: a JOIN b, branch1: c JOIN d) would
+    // otherwise persist a contract that cannot drive a refresh of the later
+    // branches. Reject it here (the homogeneity gate) rather than later. Simple
+    // (non-composed) branch unions are unaffected: each such branch carries a
+    // single base, and `validate_distinct_base_ref_arity` already pins the
+    // per-branch base count.
+    if branch_shape == BranchShape::Composed
+        && matches!(first.state, StateContract::AggregateState { .. })
+    {
+        let first_distinct_bases = distinct_base_ref_set(&first.base_refs);
+        let first_group_keys = group_row_id_names(&first.identity);
+        for (index, branch) in derived.iter().enumerate().skip(1) {
+            if distinct_base_ref_set(&branch.base_refs) != first_distinct_bases
+                || branch.join_key_count != first.join_key_count
+                || branch.branch_count != first.branch_count
+                || group_row_id_names(&branch.identity) != first_group_keys
+            {
+                return Err(format!(
+                    "Iceberg IMV refresh contract requires homogeneous UNION ALL aggregate \
+                     branches: branch {index} has a different base set, join structure, fan-in \
+                     arity, or group-key layout than branch 0; a composed UNION ALL of aggregates \
+                     is only supported when every branch shares the same base tables and structure"
+                ));
+            }
+        }
+    }
+
     let identity = TargetIdentity::branch_scoped(first.identity.clone());
     let state = first.state.clone();
     Ok(RefreshFragmentProperty {
@@ -921,6 +958,24 @@ fn derive_from_set_operation(set_op: &ResolvedSetOp) -> Result<RefreshFragmentPr
         join_key_count: None,
         branch_shape: Some(branch_shape),
     })
+}
+
+/// The set of distinct base table refs (order-independent) referenced by a
+/// branch, used to compare composed-branch structure for A3 homogeneity.
+fn distinct_base_ref_set(base_refs: &[IcebergTableRef]) -> std::collections::BTreeSet<String> {
+    base_refs
+        .iter()
+        .map(|base_ref| base_ref.fqn().to_ascii_lowercase())
+        .collect()
+}
+
+/// The group-key output names of a `GroupRowId` identity, or an empty slice for
+/// any other identity. Used to compare composed-branch group-key layout.
+fn group_row_id_names(identity: &TargetIdentity) -> &[String] {
+    match identity {
+        TargetIdentity::GroupRowId(names) => names,
+        _ => &[],
+    }
 }
 
 fn collect_union_all_branches<'a>(
@@ -1802,14 +1857,18 @@ mod tests {
         // The composed case the flat classifier REJECTED (it required each
         // branch to be a literal simple aggregate over a non-join input). The
         // property algebra ACCEPTS it because every branch synthesizes the same
-        // (GroupRowId, AggregateState) kind.
+        // (GroupRowId, AggregateState) kind — provided the branches are
+        // structurally homogeneous (same base set + join structure), so the
+        // first-branch lineage persisted at CREATE is representative (A3 safety).
         let prop = property(
             "SELECT l.region, count(*) AS c, sum(r.amount) AS s
              FROM fact_a l JOIN fact_b r ON l.id = r.id
+             WHERE l.amount > 0
              GROUP BY l.region
              UNION ALL
              SELECT l.region, count(*) AS c, sum(r.amount) AS s
-             FROM fact_c l JOIN fact_d r ON l.id = r.id
+             FROM fact_a l JOIN fact_b r ON l.id = r.id
+             WHERE l.amount > 10
              GROUP BY l.region",
         );
 
@@ -1826,17 +1885,41 @@ mod tests {
                 aggregate_count: 2,
             }
         );
+        // Both branches join the same two bases; the cross-branch ref list
+        // therefore repeats them (deduplicated only for the distinct-count
+        // checks elsewhere).
         assert_eq!(prop.base_refs.len(), 4);
         assert_eq!(
             base_ref_fqns(&prop),
             vec![
                 "ice.sales.fact_a",
                 "ice.sales.fact_b",
-                "ice.sales.fact_c",
-                "ice.sales.fact_d",
+                "ice.sales.fact_a",
+                "ice.sales.fact_b",
             ]
         );
         assert_eq!(prop.branch_count, Some(2));
+    }
+
+    #[test]
+    fn union_all_of_aggregate_joins_rejects_heterogeneous_base_sets() {
+        // A3 safety: a composed `BranchScoped(GroupRowId)` union whose branches
+        // join DIFFERENT base sets (branch0: fact_a JOIN fact_b, branch1: fact_c
+        // JOIN fact_d) is heterogeneous. The first-branch-only lineage persisted
+        // at CREATE cannot describe branch1, so the homogeneity gate rejects it.
+        let err = error(
+            "SELECT l.region, count(*) AS c, sum(r.amount) AS s
+             FROM fact_a l JOIN fact_b r ON l.id = r.id
+             GROUP BY l.region
+             UNION ALL
+             SELECT l.region, count(*) AS c, sum(r.amount) AS s
+             FROM fact_c l JOIN fact_d r ON l.id = r.id
+             GROUP BY l.region",
+        );
+        assert!(
+            err.contains("homogeneous UNION ALL aggregate branches") && err.contains("branch 1"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
