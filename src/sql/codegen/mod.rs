@@ -6,6 +6,7 @@
 
 pub(crate) mod descriptors;
 pub(crate) mod expr_compiler;
+pub(crate) mod fallback_audit;
 pub(crate) mod fragment_builder;
 pub(crate) mod helpers;
 pub(crate) mod nodes;

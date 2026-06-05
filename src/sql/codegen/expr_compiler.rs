@@ -419,9 +419,14 @@ impl<'a> ExprCompiler<'a> {
                                 column_id.0, column
                             ));
                         }
+                        super::fallback_audit::record_column_ref_name_fallback();
                         fallback
                     }
-                    None => self.scope.resolve_column(qualifier.as_deref(), column)?,
+                    None => {
+                        let fallback = self.scope.resolve_column(qualifier.as_deref(), column)?;
+                        super::fallback_audit::record_column_ref_name_fallback();
+                        fallback
+                    }
                 };
                 let type_desc = binding_type_desc(binding)?;
                 self.nodes
@@ -761,6 +766,7 @@ impl<'a> ExprCompiler<'a> {
                 use crate::sql::codegen::helpers::typed_expr_display_name;
                 let display = typed_expr_display_name(expr);
                 if let Ok(binding) = self.scope.resolve_column(None, &display) {
+                    super::fallback_audit::record_display_expr_name_fallback();
                     let type_desc = binding_type_desc(binding)?;
                     self.nodes
                         .push(slot_ref_node(binding.slot_id, binding.tuple_id, type_desc));
@@ -810,6 +816,7 @@ impl<'a> ExprCompiler<'a> {
                     name, args, *distinct, order_by,
                 );
                 if let Ok(binding) = self.scope.resolve_column(None, &display) {
+                    super::fallback_audit::record_aggregate_display_name_fallback();
                     let type_desc = binding_type_desc(binding)?;
                     self.nodes
                         .push(slot_ref_node(binding.slot_id, binding.tuple_id, type_desc));
@@ -3129,8 +3136,109 @@ mod tests {
     use std::sync::Arc;
 
     use crate::sql::analysis::{ExprKind, TypedExpr};
+    use crate::sql::codegen::fallback_audit;
+    use crate::sql::codegen::helpers::{agg_call_display_name_from_parts, typed_expr_display_name};
     use crate::sql::codegen::resolve::{ColumnBinding, ExprScope};
     use crate::sql::column_id::ColumnId;
+
+    fn test_binding(slot_id: i32, data_type: DataType) -> ColumnBinding {
+        ColumnBinding {
+            tuple_id: 1,
+            slot_id,
+            data_type,
+            type_desc: None,
+            nullable: false,
+        }
+    }
+
+    fn test_column_ref(name: &str, data_type: DataType) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId::UNSET,
+                qualifier: None,
+                column: name.to_string(),
+            },
+            data_type,
+            nullable: false,
+        }
+    }
+
+    #[test]
+    fn p2_name_fallback_audit_records_columnref_fallback() {
+        let ((), audit) = fallback_audit::run_with_isolated_audit(|| {
+            let mut scope = ExprScope::new();
+            scope.add_column(None, "a".to_string(), test_binding(10, DataType::Int32));
+            let expr = test_column_ref("a", DataType::Int32);
+            let slot_alloc = Rc::new(RefCell::new(100));
+            let mut compiler = ExprCompiler::new(slot_alloc, &scope);
+
+            compiler
+                .compile_typed(&expr)
+                .expect("name fallback should still compile during P2 audit");
+        });
+        assert_eq!(audit.column_ref_name_fallbacks, 1);
+        assert_eq!(audit.display_expr_name_fallbacks, 0);
+        assert_eq!(audit.aggregate_display_name_fallbacks, 0);
+    }
+
+    #[test]
+    fn p2_name_fallback_audit_records_function_display_fallback() {
+        let ((), audit) = fallback_audit::run_with_isolated_audit(|| {
+            let arg = test_column_ref("a", DataType::Int32);
+            let expr = TypedExpr {
+                kind: ExprKind::FunctionCall {
+                    name: "abs".to_string(),
+                    args: vec![arg],
+                    distinct: false,
+                },
+                data_type: DataType::Int32,
+                nullable: false,
+            };
+            let display = typed_expr_display_name(&expr);
+
+            let mut scope = ExprScope::new();
+            scope.add_column(None, display, test_binding(11, DataType::Int32));
+            let slot_alloc = Rc::new(RefCell::new(100));
+            let mut compiler = ExprCompiler::new(slot_alloc, &scope);
+
+            compiler
+                .compile_typed(&expr)
+                .expect("function display fallback should still compile during P2 audit");
+        });
+        assert_eq!(audit.column_ref_name_fallbacks, 0);
+        assert_eq!(audit.display_expr_name_fallbacks, 1);
+        assert_eq!(audit.aggregate_display_name_fallbacks, 0);
+    }
+
+    #[test]
+    fn p2_name_fallback_audit_records_aggregate_display_fallback() {
+        let ((), audit) = fallback_audit::run_with_isolated_audit(|| {
+            let arg = test_column_ref("a", DataType::Int64);
+            let expr = TypedExpr {
+                kind: ExprKind::AggregateCall {
+                    name: "sum".to_string(),
+                    args: vec![arg.clone()],
+                    distinct: false,
+                    order_by: vec![],
+                },
+                data_type: DataType::Int64,
+                nullable: true,
+            };
+            let display = agg_call_display_name_from_parts("sum", &[arg], false, &[]);
+
+            let mut scope = ExprScope::new();
+            scope.add_column(None, display, test_binding(12, DataType::Int64));
+            let slot_alloc = Rc::new(RefCell::new(100));
+            let mut compiler = ExprCompiler::new(slot_alloc, &scope);
+
+            compiler
+                .compile_typed(&expr)
+                .expect("aggregate display fallback should still compile during P2 audit");
+        });
+        assert_eq!(audit.column_ref_name_fallbacks, 0);
+        assert_eq!(audit.display_expr_name_fallbacks, 0);
+        assert_eq!(audit.aggregate_display_name_fallbacks, 1);
+    }
 
     #[test]
     fn column_id_mismatch_does_not_fall_back_to_name_when_scope_has_ids() {
