@@ -25,8 +25,7 @@ use crate::meta::repository::iceberg_catalog::{
     IcebergCatalogMetaRepository, IcebergCatalogProperties,
 };
 use crate::meta::repository::job::{
-    CreateIcebergOptimizeJobRequest, IcebergOptimizeJobState, JobMetaRepository,
-    StoredIcebergOptimizeJob,
+    IcebergOptimizeJobState, JobMetaRepository, StoredIcebergOptimizeJob,
 };
 use crate::meta::repository::mv::MvMetaRepository;
 use crate::meta::repository::starrocks_table::StarRocksTableMetaRepository;
@@ -38,6 +37,7 @@ pub(crate) mod catalog;
 pub(crate) mod catalog_mgr;
 pub(crate) mod dictionary;
 pub(crate) mod iceberg_ctas;
+pub(crate) mod iceberg_maintenance;
 pub(crate) mod iceberg_ref_flow;
 pub(crate) mod information_schema;
 pub(crate) mod insert;
@@ -48,6 +48,7 @@ pub(crate) mod mv_flow;
 pub(crate) mod mv_scheduler;
 pub(crate) mod name_resolve;
 pub(crate) mod parquet;
+pub(crate) mod procedure;
 pub(crate) mod query_prep;
 pub(crate) mod sql_expr;
 pub(crate) mod starrocks_table_ctas;
@@ -83,6 +84,7 @@ use self::statement::{
 use self::stream_load::{
     parse_csv_stream_load_rows, parse_json_stream_load_rows, parse_stream_load_columns,
 };
+use crate::engine::procedure::{looks_like_call_procedure, parse_call_procedure_sql};
 use crate::engine::query_prep::{has_time_travel_refs, rewrite_time_travel_refs};
 
 #[derive(Clone, Debug, Default)]
@@ -623,6 +625,17 @@ impl StandaloneSession {
                 current_database,
             );
         }
+        if looks_like_call_procedure(&normalized) {
+            let stmt = parse_call_procedure_sql(&normalized)?;
+            let request = crate::engine::iceberg_maintenance::MaintenanceActionRequest::from_call(
+                &stmt,
+                current_database,
+            )?;
+            return crate::engine::iceberg_maintenance::execute_maintenance_action(
+                &self.inner,
+                request,
+            );
+        }
         if looks_like_show_alter_table_optimize(&normalized) {
             let stmt = parse_show_alter_table_optimize_sql(&normalized)?;
             return self.handle_show_alter_table_optimize(stmt, current_catalog, current_database);
@@ -1091,9 +1104,9 @@ impl StandaloneSession {
         current_catalog: Option<&str>,
         current_database: &str,
     ) -> Result<StatementResult, String> {
-        let Some(provider) = self.inner.metadata_provider.as_ref() else {
+        if self.inner.metadata_provider.is_none() {
             return Err("ALTER TABLE OPTIMIZE requires metadata provider".to_string());
-        };
+        }
         let target = crate::engine::backend_resolver::resolve_existing_table_target(
             &self.inner,
             &stmt.table,
@@ -1106,51 +1119,21 @@ impl StandaloneSession {
                 target.backend_name
             ));
         }
-
-        let entry = {
-            let registry = self
-                .inner
-                .iceberg_catalogs
-                .read()
-                .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-            registry.get(&target.catalog)?
+        let request = crate::engine::iceberg_maintenance::MaintenanceActionRequest {
+            source: crate::engine::iceberg_maintenance::MaintenanceActionSource::LegacyAlter,
+            kind: crate::engine::iceberg_maintenance::MaintenanceActionKind::RewriteDataFiles,
+            catalog: target.catalog,
+            namespace: target.namespace,
+            table: target.table,
+            options: crate::engine::iceberg_maintenance::MaintenanceActionOptions::default(),
+            older_than_ms: None,
+            retain_last: None,
+            use_caching: None,
+            spec_id: None,
+            branch: None,
+            where_clause: None,
         };
-        entry.invalidate_table_cache(&target.namespace, &target.table);
-        let loaded = crate::connector::iceberg::catalog::load_table(
-            &entry,
-            &target.namespace,
-            &target.table,
-        )?;
-        let base_snapshot_id = loaded
-            .table
-            .metadata()
-            .current_snapshot()
-            .map(|snapshot| snapshot.snapshot_id())
-            .ok_or_else(|| {
-                format!(
-                    "ALTER TABLE OPTIMIZE requires iceberg table {}.{}.{} to have a current snapshot",
-                    target.catalog, target.namespace, target.table
-                )
-            })?;
-        let mut txn = provider
-            .begin_write("create iceberg optimize job")
-            .map_err(|e| format!("open iceberg optimize job transaction failed: {e}"))?;
-        self.inner
-            .job_repo
-            .create_iceberg_optimize_job(
-                txn.as_mut(),
-                CreateIcebergOptimizeJobRequest {
-                    catalog: target.catalog,
-                    namespace: target.namespace,
-                    table: target.table,
-                    base_snapshot_id,
-                    now_ms: standalone_now_ms(),
-                },
-            )
-            .map_err(|e| format!("create iceberg optimize job failed: {e}"))?;
-        txn.commit()
-            .map_err(|e| format!("commit iceberg optimize job failed: {e}"))?;
-        Ok(StatementResult::Ok)
+        crate::engine::iceberg_maintenance::execute_maintenance_action(&self.inner, request)
     }
 
     fn handle_alter_table_rewrite_manifests(

@@ -40,6 +40,7 @@ pub mod remove_orphan_files;
 pub mod retry;
 mod rewrite_data_files;
 pub mod rewrite_manifests;
+pub mod rewrite_position_delete_files;
 mod row_delta;
 mod row_delta_dv;
 mod run;
@@ -66,13 +67,15 @@ pub use overwrite::OverwriteCommit;
 pub use overwrite_partitions::OverwritePartitionsCommit;
 pub use position_delete_writer::{PositionDeleteGroup, write_position_delete_files};
 pub use puffin_dv::{
-    DeletionVector, WrittenPuffinDv, read_deletion_vector_puffin,
-    write_single_deletion_vector_puffin,
+    DeletionVector, DeletionVectorBlobInput, WrittenPuffinDv, read_deletion_vector_puffin,
+    write_multi_deletion_vector_puffin, write_single_deletion_vector_puffin,
 };
 pub use ref_action::{RefAction, RefActionOutcome, RefActionPlan, execute_ref_action};
 pub use retry::{commit_with_retry, is_retryable_commit_conflict};
 pub use rewrite_data_files::RewriteDataFilesCommit;
+#[allow(unused_imports)]
 pub(crate) use rewrite_data_files::count_current_live_files;
+pub(crate) use rewrite_data_files::{LiveFileMetrics, current_live_file_metrics};
 pub use row_delta::RowDeltaCommit;
 pub use row_delta_dv::RowDeltaDvCommit;
 pub use run::{CleanupPathMapper, RunInput, run_iceberg_commit};

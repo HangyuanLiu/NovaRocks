@@ -28,11 +28,11 @@ use sqlparser::ast::Statement;
 
 use crate::common::types::UniqueId;
 use crate::connector::iceberg::catalog::IcebergCatalogEntry;
-use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_hadoop_catalog};
+use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
 use crate::connector::iceberg::catalog::row_lineage_enabled;
 use crate::connector::iceberg::commit::{
-    AbortLog, CommitOpKind, IcebergCommitCollector, RunInput, count_current_live_files,
-    run_iceberg_commit,
+    AbortLog, CommitOpKind, IcebergCommitCollector, LiveFileMetrics, RunInput,
+    current_live_file_metrics, run_iceberg_commit,
 };
 use crate::connector::iceberg::data_writer::{
     RowLineageColumns, RowLineageWriteBatch, write_row_lineage_batches_as_data_files,
@@ -50,6 +50,40 @@ use crate::meta::repository::job::{
 };
 
 const OPTIMIZE_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WholeTableRewriteTarget {
+    pub(crate) catalog: String,
+    pub(crate) namespace: String,
+    pub(crate) table: String,
+    pub(crate) base_snapshot_id: i64,
+    pub(crate) job_id: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WholeTableRewriteResult {
+    pub(crate) optimize_outcome: IcebergOptimizeJobOutcome,
+    pub(crate) before_metrics: LiveFileMetrics,
+}
+
+impl WholeTableRewriteTarget {
+    fn from_job(job: &StoredIcebergOptimizeJob) -> Self {
+        Self {
+            catalog: job.catalog.clone(),
+            namespace: job.namespace.clone(),
+            table: job.table.clone(),
+            base_snapshot_id: job.base_snapshot_id,
+            job_id: Some(job.id),
+        }
+    }
+
+    fn context(&self) -> String {
+        match self.job_id {
+            Some(job_id) => format!("optimize job {job_id}"),
+            None => "rewrite_data_files".to_string(),
+        }
+    }
+}
 
 pub(crate) fn spawn_optimize_worker(state: Arc<StandaloneState>) {
     if state.metadata_provider.is_none() {
@@ -304,47 +338,65 @@ pub(crate) fn execute_whole_table_rewrite(
     state: &Arc<StandaloneState>,
     job: &StoredIcebergOptimizeJob,
 ) -> Result<IcebergOptimizeJobOutcome, String> {
+    let target = WholeTableRewriteTarget::from_job(job);
+    execute_whole_table_rewrite_for_target(state, &target)
+}
+
+pub(crate) fn execute_whole_table_rewrite_for_target(
+    state: &Arc<StandaloneState>,
+    rewrite_target: &WholeTableRewriteTarget,
+) -> Result<IcebergOptimizeJobOutcome, String> {
+    execute_whole_table_rewrite_with_metrics_for_target(state, rewrite_target)
+        .map(|result| result.optimize_outcome)
+}
+
+pub(crate) fn execute_whole_table_rewrite_with_metrics_for_target(
+    state: &Arc<StandaloneState>,
+    rewrite_target: &WholeTableRewriteTarget,
+) -> Result<WholeTableRewriteResult, String> {
     let target = TargetBackend {
         backend_name: "iceberg",
-        catalog: job.catalog.clone(),
-        namespace: job.namespace.clone(),
-        table: job.table.clone(),
+        catalog: rewrite_target.catalog.clone(),
+        namespace: rewrite_target.namespace.clone(),
+        table: rewrite_target.table.clone(),
     };
     let entry = {
         let registry = state
             .iceberg_catalogs
             .read()
             .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        registry.get(&job.catalog)?
+        registry.get(&rewrite_target.catalog)?
     };
-    entry.invalidate_table_cache(&job.namespace, &job.table);
+    entry.invalidate_table_cache(&rewrite_target.namespace, &rewrite_target.table);
 
-    let hadoop_catalog = build_hadoop_catalog(&entry)?;
-    let catalog: Arc<dyn Catalog> = Arc::new(hadoop_catalog);
+    let catalog: Arc<dyn Catalog> = build_iceberg_catalog(&entry)?;
     let table_ident = TableIdent::new(
-        NamespaceIdent::new(job.namespace.clone()),
-        job.table.clone(),
+        NamespaceIdent::new(rewrite_target.namespace.clone()),
+        rewrite_target.table.clone(),
     );
-    let table = load_current_table(catalog.as_ref(), &table_ident, job)?;
-    validate_base_snapshot(&table, job)?;
+    let table = load_current_table(catalog.as_ref(), &table_ident, rewrite_target)?;
+    validate_base_snapshot(&table, rewrite_target)?;
 
-    let (initial_data_files, initial_delete_files) =
-        block_on_iceberg(count_current_live_files(&table, table.file_io()))??;
-    if initial_data_files == 0 && initial_delete_files == 0 {
+    let initial_metrics = block_on_iceberg(current_live_file_metrics(&table, table.file_io()))??;
+    if initial_metrics.data_files == 0 && initial_metrics.delete_files == 0 {
         tracing::info!(
-            job_id = job.id,
-            catalog = job.catalog,
-            namespace = job.namespace,
-            table = job.table,
-            base_snapshot_id = job.base_snapshot_id,
+            job_id = ?rewrite_target.job_id,
+            catalog = rewrite_target.catalog,
+            namespace = rewrite_target.namespace,
+            table = rewrite_target.table,
+            base_snapshot_id = rewrite_target.base_snapshot_id,
             "iceberg optimize no-op: table has no live files"
         );
-        return Ok(IcebergOptimizeJobOutcome {
+        let optimize_outcome = IcebergOptimizeJobOutcome {
             target_snapshot_id: None,
             rewritten_data_files: 0,
             deleted_data_files: 0,
             added_data_files: 0,
             output_record_count: 0,
+        };
+        return Ok(WholeTableRewriteResult {
+            optimize_outcome,
+            before_metrics: initial_metrics,
         });
     }
 
@@ -352,16 +404,16 @@ pub(crate) fn execute_whole_table_rewrite(
     let select_sql = if preserve_row_lineage {
         format!(
             "SELECT *, {ICEBERG_ROW_ID_COL}, {ICEBERG_LAST_UPDATED_SEQ_COL} FROM {}.{}.{}",
-            quote_ident(&job.catalog),
-            quote_ident(&job.namespace),
-            quote_ident(&job.table)
+            quote_ident(&rewrite_target.catalog),
+            quote_ident(&rewrite_target.namespace),
+            quote_ident(&rewrite_target.table)
         )
     } else {
         format!(
             "SELECT * FROM {}.{}.{}",
-            quote_ident(&job.catalog),
-            quote_ident(&job.namespace),
-            quote_ident(&job.table)
+            quote_ident(&rewrite_target.catalog),
+            quote_ident(&rewrite_target.namespace),
+            quote_ident(&rewrite_target.table)
         )
     };
     let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(&select_sql)?;
@@ -389,13 +441,12 @@ pub(crate) fn execute_whole_table_rewrite(
     }
 
     let post_write = (|| {
-        let table = load_current_table(catalog.as_ref(), &table_ident, job)?;
-        validate_base_snapshot(&table, job)?;
-        let (input_data_files, input_delete_files) =
-            block_on_iceberg(count_current_live_files(&table, table.file_io()))??;
-        Ok::<_, String>((table, input_data_files, input_delete_files))
+        let table = load_current_table(catalog.as_ref(), &table_ident, rewrite_target)?;
+        validate_base_snapshot(&table, rewrite_target)?;
+        let input_metrics = block_on_iceberg(current_live_file_metrics(&table, table.file_io()))??;
+        Ok::<_, String>((table, input_metrics))
     })();
-    let (table, input_data_files, input_delete_files) = match post_write {
+    let (table, input_metrics) = match post_write {
         Ok(value) => value,
         Err(err) => {
             return Err(cleanup_written_data_files_after_error(
@@ -414,7 +465,7 @@ pub(crate) fn execute_whole_table_rewrite(
     );
     let collector = Arc::new(IcebergCommitCollector::new(
         CommitOpKind::RewriteDataFiles,
-        table_ident,
+        table_ident.clone(),
         metadata.current_snapshot().map(|s| s.snapshot_id()),
         metadata.last_sequence_number(),
         metadata.current_schema().clone(),
@@ -447,45 +498,52 @@ pub(crate) fn execute_whole_table_rewrite(
     invalidate_iceberg_caches(state, &target)?;
 
     tracing::info!(
-        job_id = job.id,
-        catalog = job.catalog,
-        namespace = job.namespace,
-        table = job.table,
-        base_snapshot_id = job.base_snapshot_id,
+        job_id = ?rewrite_target.job_id,
+        catalog = rewrite_target.catalog,
+        namespace = rewrite_target.namespace,
+        table = rewrite_target.table,
+        base_snapshot_id = rewrite_target.base_snapshot_id,
         target_snapshot_id = commit_outcome.new_snapshot_id,
-        input_data_files,
-        input_delete_files,
+        input_data_files = input_metrics.data_files,
+        input_delete_files = input_metrics.delete_files,
         output_data_files = data_files.len(),
         output_record_count,
         "iceberg optimize finished"
     );
 
-    Ok(IcebergOptimizeJobOutcome {
+    let optimize_outcome = IcebergOptimizeJobOutcome {
         target_snapshot_id: Some(commit_outcome.new_snapshot_id),
-        rewritten_data_files: input_data_files,
-        deleted_data_files: input_delete_files,
+        rewritten_data_files: input_metrics.data_files,
+        deleted_data_files: input_metrics.delete_files,
         added_data_files: i64::try_from(data_files.len())
             .map_err(|_| "iceberg optimize output data file count overflow".to_string())?,
         output_record_count,
+    };
+    Ok(WholeTableRewriteResult {
+        optimize_outcome,
+        before_metrics: input_metrics,
     })
 }
 
 fn load_current_table(
     catalog: &dyn Catalog,
     table_ident: &TableIdent,
-    job: &StoredIcebergOptimizeJob,
+    target: &WholeTableRewriteTarget,
 ) -> Result<iceberg::table::Table, String> {
     block_on_iceberg(async { catalog.load_table(table_ident).await })?.map_err(|e| {
         format!(
-            "load iceberg table {}.{}.{} for optimize job {} failed: {e}",
-            job.catalog, job.namespace, job.table, job.id
+            "load iceberg table {}.{}.{} for {} failed: {e}",
+            target.catalog,
+            target.namespace,
+            target.table,
+            target.context()
         )
     })
 }
 
 fn validate_base_snapshot(
     table: &iceberg::table::Table,
-    job: &StoredIcebergOptimizeJob,
+    target: &WholeTableRewriteTarget,
 ) -> Result<(), String> {
     let current_snapshot_id = table
         .metadata()
@@ -493,18 +551,22 @@ fn validate_base_snapshot(
         .map(|snapshot| snapshot.snapshot_id())
         .ok_or_else(|| {
             format!(
-                "iceberg optimize job {} requires {}.{}.{} to have current snapshot {}",
-                job.id, job.catalog, job.namespace, job.table, job.base_snapshot_id
+                "iceberg {} requires {}.{}.{} to have current snapshot {}",
+                target.context(),
+                target.catalog,
+                target.namespace,
+                target.table,
+                target.base_snapshot_id
             )
         })?;
-    if current_snapshot_id != job.base_snapshot_id {
+    if current_snapshot_id != target.base_snapshot_id {
         return Err(format!(
-            "iceberg optimize job {} base snapshot mismatch for {}.{}.{}: expected {}, current {}",
-            job.id,
-            job.catalog,
-            job.namespace,
-            job.table,
-            job.base_snapshot_id,
+            "iceberg {} base snapshot mismatch for {}.{}.{}: expected {}, current {}",
+            target.context(),
+            target.catalog,
+            target.namespace,
+            target.table,
+            target.base_snapshot_id,
             current_snapshot_id
         ));
     }
