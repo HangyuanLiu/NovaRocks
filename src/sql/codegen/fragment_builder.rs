@@ -2017,11 +2017,11 @@ impl<'a> PlanFragmentBuilder<'a> {
             let expr_a = &eq.left;
             let expr_b = &eq.right;
             // Try natural order: expr_a on left, expr_b on right.
-            let natural = ExprCompiler::new(self.slot_allocator(), &left.scope)
+            let natural = ExprCompiler::new_strict_id(self.slot_allocator(), &left.scope)
                 .compile_typed(expr_a)
                 .ok()
                 .and_then(|lt| {
-                    ExprCompiler::new(self.slot_allocator(), &right.scope)
+                    ExprCompiler::new_strict_id(self.slot_allocator(), &right.scope)
                         .compile_typed(expr_b)
                         .ok()
                         .map(|rt| (lt, rt))
@@ -2030,11 +2030,11 @@ impl<'a> PlanFragmentBuilder<'a> {
             // Needed when JoinCommutativity swapped children but the
             // eq_condition columns still reference the original order.
             let result = natural.or_else(|| {
-                ExprCompiler::new(self.slot_allocator(), &left.scope)
+                ExprCompiler::new_strict_id(self.slot_allocator(), &left.scope)
                     .compile_typed(expr_b)
                     .ok()
                     .and_then(|lt| {
-                        ExprCompiler::new(self.slot_allocator(), &right.scope)
+                        ExprCompiler::new_strict_id(self.slot_allocator(), &right.scope)
                             .compile_typed(expr_a)
                             .ok()
                             .map(|rt| (lt, rt))

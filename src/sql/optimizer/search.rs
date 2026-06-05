@@ -137,6 +137,11 @@ impl SearchContext {
                 }
 
                 if alt.kind == PropertyAlternativeKind::BroadcastJoin {
+                    let required_for_correctness = matches!(
+                        &expr.op,
+                        Operator::PhysicalHashJoin(join)
+                            if join.join_type == crate::sql::analysis::JoinKind::NullAwareLeftAnti
+                    );
                     if let (Some(&probe_group_id), Some(&build_group_id)) =
                         (expr.children.first(), expr.children.get(1))
                     {
@@ -144,11 +149,13 @@ impl SearchContext {
                             stats_for_group(&memo.groups[probe_group_id], memo, &self.table_stats);
                         let build_stats =
                             stats_for_group(&memo.groups[build_group_id], memo, &self.table_stats);
-                        if !super::cost::broadcast_gate_passes(
-                            &probe_stats,
-                            &build_stats,
-                            &CostOptions::default(),
-                        ) {
+                        if !required_for_correctness
+                            && !super::cost::broadcast_gate_passes(
+                                &probe_stats,
+                                &build_stats,
+                                &CostOptions::default(),
+                            )
+                        {
                             continue;
                         }
                     }
@@ -743,6 +750,44 @@ mod tests {
     }
 
     #[test]
+    fn search_prefers_shuffle_when_exact_build_exceeds_probe_side() {
+        let (memo, root, table_stats) = make_large_build_inner_join_memo_for_test(
+            325_847.0,
+            648_000.0,
+            crate::sql::optimizer::statistics::Confidence::Exact,
+        );
+        let mut ctx = SearchContext::new(table_stats);
+        let required = PhysicalPropertySet::gather();
+
+        ctx.optimize_group(&memo, root, &required).expect("search");
+        let winner = ctx.winners.get(&(root, required.clone())).expect("winner");
+
+        assert_eq!(
+            winner.alt_kind,
+            crate::sql::optimizer::derive::PropertyAlternativeKind::ShuffleJoin
+        );
+    }
+
+    #[test]
+    fn search_rejects_broadcast_for_estimated_large_build() {
+        let (memo, root, table_stats) = make_large_build_inner_join_memo_for_test(
+            3_543_657.0,
+            648_000.0,
+            crate::sql::optimizer::statistics::Confidence::Estimated,
+        );
+        let mut ctx = SearchContext::new(table_stats);
+        let required = PhysicalPropertySet::gather();
+
+        ctx.optimize_group(&memo, root, &required).expect("search");
+        let winner = ctx.winners.get(&(root, required.clone())).expect("winner");
+
+        assert_eq!(
+            winner.alt_kind,
+            crate::sql::optimizer::derive::PropertyAlternativeKind::ShuffleJoin
+        );
+    }
+
+    #[test]
     fn search_reuses_child_shuffle_output_without_top_hash_enforcer() {
         let (memo, root, left, right) = make_join_over_prepartitioned_children_for_test();
         let mut ctx = SearchContext::new(Default::default());
@@ -956,7 +1001,7 @@ mod cascaded_derivation_tests {
     }
 
     #[test]
-    fn cascaded_output_through_broadcast_join_skips_enforcer() {
+    fn cascaded_output_through_broadcast_join_repartitions_after_join() {
         let (memo, root, g_bj) = memo_window_over_broadcast_join();
         let mut ctx = SearchContext::new(table_stats_for_cascaded());
         let cost = ctx
@@ -964,22 +1009,20 @@ mod cascaded_derivation_tests {
             .unwrap();
         assert!(cost.is_finite(), "search must produce a feasible plan");
 
-        // Window group's winner: no enforcer between Window and the
-        // Broadcast Join below. This fixture intentionally uses the same
-        // ColumnId on both join sides, so the inherited hash key is exactly
-        // the window partition key after deduplication.
+        // Window group's direct winner still has no top enforcer; the child
+        // winner below is responsible for satisfying the partition requirement.
         let w = ctx
             .winners
             .get(&(root, PhysicalPropertySet::any()))
             .unwrap();
         assert!(
             w.enforcer.is_none(),
-            "Window should reuse Broadcast Join's left distribution; no enforcer needed. winner = {w:?}"
+            "Window should receive an already-partitioned child. winner = {w:?}"
         );
 
-        // The Broadcast Join's winner output must still contain c10. Use
-        // Window's actual child requirement here; it includes both partition
-        // distribution and ordering.
+        // Broadcast joins do not advertise inherited left distribution. When
+        // a parent requires hash partitioning, the enforcer must sit above the
+        // entire broadcast join, not below it on only the probe child.
         let window_expr = memo.groups[root]
             .physical_exprs
             .first()
@@ -997,21 +1040,12 @@ mod cascaded_derivation_tests {
             .winners
             .get(&(g_bj, bj_req))
             .expect("broadcast join child requirement should have a winner");
-        if let Some(enforcer) = &bj_winner.enforcer {
-            assert!(
-                !matches!(enforcer.kind, EnforcerKind::Distribution(_)),
-                "Broadcast Join should not need a distribution enforcer; winner = {bj_winner:?}"
-            );
-        }
-        match &bj_winner.output.distribution {
-            DistributionSpec::HashPartitioned { cols, .. } => {
-                assert!(
-                    cols.contains(&ColumnId(10)),
-                    "Broadcast Join should inherit Hash with c10, got {:?}",
-                    cols
-                );
-            }
-            other => panic!("expected HashPartitioned containing c10, got {:?}", other),
-        }
+        assert!(
+            matches!(
+                bj_winner.enforcer.as_ref().map(|e| &e.kind),
+                Some(EnforcerKind::Distribution(_))
+            ),
+            "Broadcast Join should repartition above the join. winner = {bj_winner:?}"
+        );
     }
 }

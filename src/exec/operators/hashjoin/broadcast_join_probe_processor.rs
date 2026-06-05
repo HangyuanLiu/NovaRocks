@@ -221,7 +221,11 @@ impl ProcessorOperator for BroadcastJoinProbeProcessorOperator {
             self.finishing_done = true;
         }
         let out = self.pending_output.take();
-        if self.finishing && self.finishing_done && self.pending_output.is_none() {
+        if self.finishing
+            && self.finishing_done
+            && self.pending_output.is_none()
+            && !self.core.has_pending_output()
+        {
             self.finished = true;
         }
         Ok(out)

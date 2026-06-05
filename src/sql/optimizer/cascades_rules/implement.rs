@@ -8,8 +8,10 @@ use std::collections::HashSet;
 use arrow::datatypes::DataType;
 
 use crate::sql::analysis::{BinOp, ExprKind, JoinKind, TypedExpr};
+use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::memo::{GroupId, MExpr, Memo};
 use crate::sql::optimizer::operator::*;
+use crate::sql::optimizer::rewrite::rules::utils::collect_column_id_refs;
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
 
 /// Get lowercase column names from a memo group's output columns.
@@ -22,6 +24,21 @@ pub(super) fn get_group_column_names(memo: &Memo, group_id: GroupId) -> HashSet<
                 .output_columns
                 .iter()
                 .map(|c| c.name.to_lowercase())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn get_group_column_ids(memo: &Memo, group_id: GroupId) -> HashSet<ColumnId> {
+    memo.groups
+        .get(group_id)
+        .and_then(|g| g.logical_props.as_ref())
+        .map(|props| {
+            props
+                .output_columns
+                .iter()
+                .map(|c| c.column_id)
+                .filter(|id| *id != ColumnId::UNSET)
                 .collect()
         })
         .unwrap_or_default()
@@ -202,12 +219,56 @@ fn orient_eq_pair(
     pair: PhysicalHashJoinEqCondition,
     left_cols: &HashSet<String>,
     right_cols: &HashSet<String>,
+    left_ids: &HashSet<ColumnId>,
+    right_ids: &HashSet<ColumnId>,
 ) -> Option<PhysicalHashJoinEqCondition> {
     let PhysicalHashJoinEqCondition {
         left: a,
         right: b,
         null_safe,
     } = pair;
+    let a_ids = collect_column_id_refs(&a);
+    let b_ids = collect_column_id_refs(&b);
+
+    let a_ids_classified = !a_ids.is_empty()
+        && a_ids
+            .iter()
+            .all(|id| left_ids.contains(id) || right_ids.contains(id));
+    let b_ids_classified = !b_ids.is_empty()
+        && b_ids
+            .iter()
+            .all(|id| left_ids.contains(id) || right_ids.contains(id));
+
+    if a_ids_classified && b_ids_classified {
+        let a_in_left = a_ids.iter().all(|id| left_ids.contains(id));
+        let a_in_right = a_ids.iter().all(|id| right_ids.contains(id));
+        let b_in_left = b_ids.iter().all(|id| left_ids.contains(id));
+        let b_in_right = b_ids.iter().all(|id| right_ids.contains(id));
+
+        if a_in_left && !a_in_right && b_in_right && !b_in_left {
+            return Some(PhysicalHashJoinEqCondition {
+                left: a,
+                right: b,
+                null_safe,
+            });
+        }
+        if a_in_right && !a_in_left && b_in_left && !b_in_right {
+            return Some(PhysicalHashJoinEqCondition {
+                left: b,
+                right: a,
+                null_safe,
+            });
+        }
+        let both_exclusively_left = a_in_left && !a_in_right && b_in_left && !b_in_right;
+        let both_exclusively_right = a_in_right && !a_in_left && b_in_right && !b_in_left;
+        if both_exclusively_left || both_exclusively_right {
+            return None;
+        }
+        if (!a_in_left && !a_in_right) || (!b_in_left && !b_in_right) {
+            return None;
+        }
+    }
+
     let a_cols = collect_column_refs_lowercase(&a);
     let b_cols = collect_column_refs_lowercase(&b);
 
@@ -629,11 +690,13 @@ impl Rule for JoinToHashJoin {
         if expr.children.len() == 2 {
             let left_cols = get_group_column_names(memo, expr.children[0]);
             let right_cols = get_group_column_names(memo, expr.children[1]);
+            let left_ids = get_group_column_ids(memo, expr.children[0]);
+            let right_ids = get_group_column_ids(memo, expr.children[1]);
             for pair in raw_eq_conds {
                 let a = pair.left.clone();
                 let b = pair.right.clone();
                 let null_safe = pair.null_safe;
-                match orient_eq_pair(pair, &left_cols, &right_cols) {
+                match orient_eq_pair(pair, &left_cols, &right_cols, &left_ids, &right_ids) {
                     Some(oriented) => eq_conds.push(oriented),
                     None => {
                         let demoted = TypedExpr {
@@ -717,9 +780,11 @@ impl Rule for JoinToNestLoop {
         if !eq_conds.is_empty() && op.join_type != JoinKind::Cross && expr.children.len() == 2 {
             let left_cols = get_group_column_names(memo, expr.children[0]);
             let right_cols = get_group_column_names(memo, expr.children[1]);
-            let has_orientable_pair = eq_conds
-                .iter()
-                .any(|p| orient_eq_pair(p.clone(), &left_cols, &right_cols).is_some());
+            let left_ids = get_group_column_ids(memo, expr.children[0]);
+            let right_ids = get_group_column_ids(memo, expr.children[1]);
+            let has_orientable_pair = eq_conds.iter().any(|p| {
+                orient_eq_pair(p.clone(), &left_cols, &right_cols, &left_ids, &right_ids).is_some()
+            });
             if has_orientable_pair {
                 // Has at least one usable equi-key — JoinToHashJoin handles this.
                 return vec![];
@@ -1486,8 +1551,24 @@ mod eq_pair_tests {
         }
     }
 
+    fn col_id(name: &str, id: u32) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId(id),
+                qualifier: None,
+                column: name.into(),
+            },
+            data_type: DataType::Int32,
+            nullable: false,
+        }
+    }
+
     fn cols(names: &[&str]) -> HashSet<String> {
         names.iter().map(|s| s.to_lowercase()).collect()
+    }
+
+    fn ids(values: &[u32]) -> HashSet<ColumnId> {
+        values.iter().copied().map(ColumnId).collect()
     }
 
     fn eq_pair(left: TypedExpr, right: TypedExpr) -> PhysicalHashJoinEqCondition {
@@ -1503,7 +1584,8 @@ mod eq_pair_tests {
         let left = cols(&["a_id"]);
         let right = cols(&["b_id"]);
         let pair = eq_pair(col("a_id"), col("b_id"));
-        let out = orient_eq_pair(pair, &left, &right).expect("should orient");
+        let out = orient_eq_pair(pair, &left, &right, &HashSet::new(), &HashSet::new())
+            .expect("should orient");
         match &out.left.kind {
             ExprKind::ColumnRef { column, .. } => assert_eq!(column, "a_id"),
             _ => panic!("expected ColumnRef"),
@@ -1519,7 +1601,8 @@ mod eq_pair_tests {
         let left = cols(&["a_id"]);
         let right = cols(&["b_id"]);
         let pair = eq_pair(col("b_id"), col("a_id"));
-        let out = orient_eq_pair(pair, &left, &right).expect("should orient");
+        let out = orient_eq_pair(pair, &left, &right, &HashSet::new(), &HashSet::new())
+            .expect("should orient");
         match &out.left.kind {
             ExprKind::ColumnRef { column, .. } => assert_eq!(column, "a_id"),
             _ => panic!("expected ColumnRef"),
@@ -1535,7 +1618,27 @@ mod eq_pair_tests {
         let left = cols(&["a_id", "a_name"]);
         let right = cols(&["b_id"]);
         let pair = eq_pair(col("a_id"), col("a_name"));
-        assert!(orient_eq_pair(pair, &left, &right).is_none());
+        assert!(orient_eq_pair(pair, &left, &right, &HashSet::new(), &HashSet::new()).is_none());
+    }
+
+    #[test]
+    fn orient_uses_column_ids_when_names_are_ambiguous() {
+        let left = cols(&["id"]);
+        let right = cols(&["id"]);
+        let left_ids = ids(&[10]);
+        let right_ids = ids(&[20]);
+        let pair = eq_pair(col_id("id", 20), col_id("id", 10));
+        let out = orient_eq_pair(pair, &left, &right, &left_ids, &right_ids)
+            .expect("column ids should disambiguate the join sides");
+
+        match &out.left.kind {
+            ExprKind::ColumnRef { column_id, .. } => assert_eq!(*column_id, ColumnId(10)),
+            _ => panic!("expected ColumnRef"),
+        }
+        match &out.right.kind {
+            ExprKind::ColumnRef { column_id, .. } => assert_eq!(*column_id, ColumnId(20)),
+            _ => panic!("expected ColumnRef"),
+        }
     }
 }
 

@@ -264,7 +264,11 @@ impl ProcessorOperator for PartitionedJoinProbeProcessorOperator {
             }
         }
         let out = self.pending_output.take();
-        if self.finishing && self.finishing_done && self.pending_output.is_none() {
+        if self.finishing
+            && self.finishing_done
+            && self.pending_output.is_none()
+            && !self.core.has_pending_output()
+        {
             self.finished = true;
         }
         Ok(out)
@@ -728,6 +732,113 @@ mod tests {
         }
 
         assert_eq!(out_rows, 4);
+    }
+
+    #[test]
+    fn partitioned_join_drains_finish_pending_outputs_before_finished() {
+        let rt = RuntimeState::default();
+        let mut arena = ExprArena::default();
+        let build_key = arena.push_typed(ExprNode::SlotId(RIGHT_K_SLOT_ID), DataType::Int32);
+        let probe_key = arena.push_typed(ExprNode::SlotId(LEFT_K_SLOT_ID), DataType::Int32);
+        let arena = Arc::new(arena);
+
+        let dep_manager = DependencyManager::new();
+        let runtime_filter_hub = Arc::new(RuntimeFilterHub::new(dep_manager.clone()));
+        let join_state = Arc::new(PartitionedJoinSharedState::new(
+            1,
+            1,
+            dep_manager.clone(),
+            false,
+        ));
+
+        let left_schema = schema_k(LEFT_K_SLOT_ID, false);
+        let right_schema = schema_k(RIGHT_K_SLOT_ID, false);
+        let join_scope_schema = join_schema(&left_schema, &right_schema);
+
+        let build_state: Arc<dyn JoinBuildSinkState> = join_state.clone();
+        let build_factory = HashJoinBuildSinkFactory::new(
+            Arc::clone(&arena),
+            JoinType::Inner,
+            vec![build_key],
+            vec![false],
+            Vec::new(),
+            JoinDistributionMode::Partitioned,
+            build_state,
+            Arc::clone(&runtime_filter_hub),
+            None,
+        );
+        let probe_factory = PartitionedJoinProbeProcessorFactory::new(
+            Arc::clone(&arena),
+            JoinType::Inner,
+            vec![probe_key],
+            None,
+            true,
+            chunk_schema_of(&left_schema, &LEFT_K_SLOT_IDS),
+            chunk_schema_of(&right_schema, &RIGHT_K_SLOT_IDS),
+            chunk_schema_of(&join_scope_schema, &JOIN_K_SLOT_IDS),
+            Arc::clone(&join_state),
+        );
+
+        let row_count = 20_000usize;
+        let values = (0..row_count as i32).collect::<Vec<_>>();
+        let mut build = build_factory.create(1, 0);
+        let mut probe = probe_factory.create(1, 0);
+
+        {
+            let probe_proc = probe.as_processor_mut().expect("probe processor");
+            push_expect_consumed(probe_proc, &rt, chunk_of(&values, LEFT_K_SLOT_ID));
+        }
+
+        push_expect_consumed(
+            build.as_processor_mut().expect("build processor"),
+            &rt,
+            chunk_of(&values, RIGHT_K_SLOT_ID),
+        );
+        build
+            .as_processor_mut()
+            .expect("build processor")
+            .set_finishing(&rt)
+            .expect("build finishing");
+
+        let first_rows = {
+            let probe_proc = probe.as_processor_mut().expect("probe processor");
+            probe_proc.set_finishing(&rt).expect("probe finishing");
+            probe_proc
+                .pull_chunk(&rt)
+                .expect("first pull")
+                .expect("first output")
+                .len()
+        };
+        assert!(
+            first_rows < row_count,
+            "test must exercise core pending output batches"
+        );
+        assert!(
+            !probe.is_finished(),
+            "probe must not finish while core still has pending output"
+        );
+
+        let mut out_rows = first_rows;
+        loop {
+            let has_output = probe
+                .as_processor_ref()
+                .expect("probe processor")
+                .has_output();
+            if !has_output {
+                break;
+            }
+            if let Some(chunk) = probe
+                .as_processor_mut()
+                .expect("probe processor")
+                .pull_chunk(&rt)
+                .expect("probe pull")
+            {
+                out_rows = out_rows.saturating_add(chunk.len());
+            }
+        }
+
+        assert!(probe.is_finished());
+        assert_eq!(out_rows, row_count);
     }
 
     #[test]

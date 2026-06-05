@@ -212,7 +212,7 @@ pub(crate) fn broadcast_gate_passes(
         return false;
     }
 
-    if build_stats.row_count_confidence == crate::sql::optimizer::statistics::Confidence::Fallback
+    if build_stats.row_count_confidence != crate::sql::optimizer::statistics::Confidence::Exact
         && build_rows > options.fallback_broadcast_row_limit
     {
         return false;
@@ -393,6 +393,16 @@ mod tests {
         let mut build = stats(600_000.0, 100.0);
         build.row_count_confidence = crate::sql::optimizer::statistics::Confidence::Fallback;
         let probe = stats(700_000.0, 100.0);
+        let options = CostOptions::default();
+
+        assert!(!broadcast_gate_passes(&probe, &build, &options));
+    }
+
+    #[test]
+    fn broadcast_gate_rejects_estimated_build_above_fallback_limit() {
+        let mut build = stats(648_000.0, 100.0);
+        build.row_count_confidence = crate::sql::optimizer::statistics::Confidence::Estimated;
+        let probe = stats(3_543_657.0, 100.0);
         let options = CostOptions::default();
 
         assert!(!broadcast_gate_passes(&probe, &build, &options));

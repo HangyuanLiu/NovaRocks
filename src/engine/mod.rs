@@ -2561,59 +2561,6 @@ fn collapse_distribution_enforcers_for_single_fragment(
     node
 }
 
-fn standalone_join_requires_partitioned(join_type: crate::sql::analysis::JoinKind) -> bool {
-    use crate::sql::analysis::JoinKind::*;
-    matches!(join_type, RightSemi | RightAnti | FullOuter)
-}
-
-fn strip_top_distribution_enforcer(
-    node: crate::sql::optimizer::PhysicalPlanNode,
-) -> crate::sql::optimizer::PhysicalPlanNode {
-    if matches!(
-        &node.op,
-        crate::sql::optimizer::operator::Operator::PhysicalDistribution(_)
-    ) && node.children.len() == 1
-    {
-        return node.children.into_iter().next().expect("single child");
-    }
-    node
-}
-
-fn prefer_broadcast_for_standalone_optional_shuffle_joins(
-    mut node: crate::sql::optimizer::PhysicalPlanNode,
-) -> crate::sql::optimizer::PhysicalPlanNode {
-    use crate::sql::optimizer::operator::{JoinDistribution, Operator};
-    use crate::sql::optimizer::physical_plan::JoinExecutionDistribution;
-
-    node.children = node
-        .children
-        .into_iter()
-        .map(prefer_broadcast_for_standalone_optional_shuffle_joins)
-        .collect();
-
-    if let Operator::PhysicalHashJoin(join) = &mut node.op
-        && matches!(join.distribution, JoinDistribution::Shuffle)
-        && !standalone_join_requires_partitioned(join.join_type)
-    {
-        // Standalone's partitioned hash join is still narrower than the
-        // optimizer's optional shuffle search space. Keep EXPLAIN plans intact,
-        // but execute optional shuffle joins through the established broadcast
-        // path until expression/null/fixed-size partitioned coverage is closed.
-        join.distribution = JoinDistribution::Broadcast;
-        node.execution_props.join_distribution = Some(JoinExecutionDistribution::Broadcast);
-        for runtime_filter in &mut node.build_runtime_filters {
-            runtime_filter.distribution = JoinDistribution::Broadcast;
-        }
-        node.children = node
-            .children
-            .into_iter()
-            .map(strip_top_distribution_enforcer)
-            .collect();
-    }
-
-    node
-}
-
 /// Common preparation pipeline shared by `EXPLAIN` and `EXPLAIN ANALYZE`:
 /// inline user-defined views and rewrite time-travel refs. Ordinary Iceberg
 /// table resolution is handled by the analyzer provider.
@@ -2916,8 +2863,6 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         terminal_sink.is_some() || iceberg_catalogs.is_some() || exchange_port == 0;
     if force_single_fragment {
         physical = collapse_distribution_enforcers_for_single_fragment(physical);
-    } else {
-        physical = prefer_broadcast_for_standalone_optional_shuffle_joins(physical);
     }
     let build_result =
         crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_with_mv_refresh_ctx(
@@ -4265,107 +4210,6 @@ path = "{metadata_path}"
         ));
         assert!(matches!(
             &collapsed.children[1].op,
-            Operator::PhysicalValues(_)
-        ));
-    }
-
-    #[test]
-    fn standalone_optional_shuffle_join_prefers_broadcast_execution() {
-        use crate::sql::analysis::JoinKind;
-        use crate::sql::optimizer::operator::{
-            JoinDistribution, Operator, PhysicalDistributionOp, PhysicalHashJoinOp,
-            PhysicalValuesOp,
-        };
-        use crate::sql::optimizer::physical_plan::{
-            JoinExecutionDistribution, PhysicalPlanNode, PlanExecutionProps,
-        };
-        use crate::sql::optimizer::property::DistributionSpec;
-        use crate::sql::optimizer::runtime_filter_pass::RuntimeFilterDesc;
-        use crate::sql::optimizer::statistics::Statistics;
-
-        fn stats() -> Statistics {
-            Statistics {
-                output_row_count: 0.0,
-                column_statistics: Default::default(),
-                ..Default::default()
-            }
-        }
-
-        fn values_node() -> PhysicalPlanNode {
-            PhysicalPlanNode {
-                op: Operator::PhysicalValues(PhysicalValuesOp {
-                    rows: Vec::new(),
-                    columns: Vec::new(),
-                }),
-                children: Vec::new(),
-                stats: stats(),
-                output_columns: Vec::new(),
-                execution_props: PlanExecutionProps::default(),
-                build_runtime_filters: Vec::new(),
-                probe_runtime_filters: Vec::new(),
-            }
-        }
-
-        fn hash_distributed_values_node() -> PhysicalPlanNode {
-            PhysicalPlanNode {
-                op: Operator::PhysicalDistribution(PhysicalDistributionOp {
-                    spec: DistributionSpec::shuffle_join([crate::sql::column_id::ColumnId(1)]),
-                }),
-                children: vec![values_node()],
-                stats: stats(),
-                output_columns: Vec::new(),
-                execution_props: PlanExecutionProps::default(),
-                build_runtime_filters: Vec::new(),
-                probe_runtime_filters: Vec::new(),
-            }
-        }
-
-        let plan = PhysicalPlanNode {
-            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
-                join_type: JoinKind::Inner,
-                eq_conditions: Vec::new(),
-                other_condition: None,
-                distribution: JoinDistribution::Shuffle,
-            }),
-            children: vec![
-                hash_distributed_values_node(),
-                hash_distributed_values_node(),
-            ],
-            stats: stats(),
-            output_columns: Vec::new(),
-            execution_props: PlanExecutionProps {
-                join_distribution: Some(JoinExecutionDistribution::Partitioned),
-                ..PlanExecutionProps::default()
-            },
-            build_runtime_filters: {
-                let mut rf = RuntimeFilterDesc::placeholder(9);
-                rf.distribution = JoinDistribution::Shuffle;
-                vec![rf]
-            },
-            probe_runtime_filters: Vec::new(),
-        };
-
-        let rewritten = super::prefer_broadcast_for_standalone_optional_shuffle_joins(plan);
-
-        assert!(matches!(
-            &rewritten.op,
-            Operator::PhysicalHashJoin(join)
-                if matches!(&join.distribution, JoinDistribution::Broadcast)
-        ));
-        assert_eq!(
-            rewritten.execution_props.join_distribution,
-            Some(JoinExecutionDistribution::Broadcast)
-        );
-        assert!(matches!(
-            rewritten.build_runtime_filters[0].distribution,
-            JoinDistribution::Broadcast
-        ));
-        assert!(matches!(
-            &rewritten.children[0].op,
-            Operator::PhysicalValues(_)
-        ));
-        assert!(matches!(
-            &rewritten.children[1].op,
             Operator::PhysicalValues(_)
         ));
     }

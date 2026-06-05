@@ -157,6 +157,11 @@ fn hash_join_only_shuffle(join_type: crate::sql::analysis::JoinKind) -> bool {
     matches!(join_type, RightSemi | RightAnti | FullOuter)
 }
 
+fn hash_join_only_broadcast(join_type: crate::sql::analysis::JoinKind) -> bool {
+    use crate::sql::analysis::JoinKind::*;
+    matches!(join_type, NullAwareLeftAnti)
+}
+
 /// Given a set of column ids representing a HashPartitioned key, and the
 /// join's `eq_conditions`, return the input extended with the
 /// equivalence-class partner from each matching eq pair.
@@ -256,16 +261,17 @@ impl PhysicalHashJoinOp {
         }
     }
 
-    fn derive_broadcast_output(&self, children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
+    fn derive_broadcast_output(&self, _children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
+        PhysicalPropertySet::any()
+    }
+
+    fn derive_colocate_output(&self, children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
         if preserves_left(&self.join_type) {
             let left = children
                 .first()
                 .copied()
                 .cloned()
                 .unwrap_or_else(PhysicalPropertySet::any);
-            // Enrich left's HashPartitioned key with eq-equivalents so a
-            // downstream requirement keyed on the other side of an eq pair is
-            // also satisfied.
             let distribution = match left.distribution {
                 DistributionSpec::HashPartitioned { cols, source } => {
                     DistributionSpec::hash_partitioned(
@@ -349,8 +355,9 @@ impl PhysicalHashJoinOp {
                 // ColumnIds. Expression and null-safe equality keys need a
                 // richer shuffle representation before they can safely use
                 // this optional partitioned alternative.
-                if hash_join_only_shuffle(self.join_type)
-                    || shuffle_join_keys_are_supported(&self.eq_conditions)
+                if !hash_join_only_broadcast(self.join_type)
+                    && (hash_join_only_shuffle(self.join_type)
+                        || shuffle_join_keys_are_supported(&self.eq_conditions))
                 {
                     alternatives.push(shuffle());
                 }
@@ -378,9 +385,8 @@ impl DeriveOutput for PhysicalHashJoinOp {
                 panic!("unknown join distribution should be resolved before property derivation")
             }
             JoinDistribution::Shuffle => self.derive_shuffle_output(),
-            JoinDistribution::Broadcast | JoinDistribution::Colocate => {
-                self.derive_broadcast_output(children)
-            }
+            JoinDistribution::Broadcast => self.derive_broadcast_output(children),
+            JoinDistribution::Colocate => self.derive_colocate_output(children),
         }
     }
 }
@@ -427,7 +433,7 @@ mod tests {
     }
 
     #[test]
-    fn hash_join_broadcast_inner_preserves_left_distribution() {
+    fn hash_join_broadcast_inner_returns_any_distribution() {
         let op = broadcast_inner(10, 20);
         let left_out = PhysicalPropertySet {
             distribution: DistributionSpec::shuffle_agg([ColumnId(10)]),
@@ -435,16 +441,7 @@ mod tests {
         };
         let right_out = PhysicalPropertySet::gather();
         let out = op.derive_output(&[&left_out, &right_out]);
-        // The join's output carries the eq-equivalence class: a left-side
-        // HashPartitioned([10]) becomes HashPartitioned([10, 20]) because the
-        // eq `10 = 20` makes both columns equivalent on the join output.
-        match &out.distribution {
-            DistributionSpec::HashPartitioned { cols, source } => {
-                assert_eq!(*source, HashSource::ShuffleAgg);
-                assert_eq!(cols.as_slice(), &[ColumnId(10), ColumnId(20)]);
-            }
-            other => panic!("expected HashPartitioned([10, 20]), got {other:?}"),
-        }
+        assert_eq!(out.distribution, DistributionSpec::Any);
         assert_eq!(out.ordering, OrderingSpec::Any);
     }
 
@@ -1074,9 +1071,9 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_output_enrichment_is_idempotent() {
-        // When left already contains both eq columns, enrichment must not
-        // duplicate ids.
+    fn broadcast_output_left_hash_returns_any_distribution() {
+        // Broadcast join does not preserve the probe side's partitioning as an
+        // output property: matched rows may be duplicated/dropped by the join.
         let op = broadcast_inner(10, 20);
         let left_out = PhysicalPropertySet {
             distribution: DistributionSpec::shuffle_agg([ColumnId(10), ColumnId(20)]),
@@ -1084,24 +1081,14 @@ mod tests {
         };
         let right_out = PhysicalPropertySet::gather();
         let out = op.derive_output(&[&left_out, &right_out]);
-        match &out.distribution {
-            DistributionSpec::HashPartitioned { cols, source } => {
-                assert_eq!(*source, HashSource::ShuffleAgg);
-                assert_eq!(cols.len(), 2, "no duplicates expected, got {cols:?}");
-                let ids: std::collections::HashSet<ColumnId> = cols.iter().copied().collect();
-                assert!(ids.contains(&ColumnId(10)));
-                assert!(ids.contains(&ColumnId(20)));
-            }
-            other => panic!("expected HashPartitioned, got {other:?}"),
-        }
+        assert_eq!(out.distribution, DistributionSpec::Any);
     }
 
     #[test]
-    fn broadcast_output_enrichment_via_right_eq_id() {
-        // Mirrors the failing-test shape: after CBO swap, LEFT child provides
-        // HashPartitioned([RIGHT eq column id]). Enrichment must add the
-        // LEFT eq column id so a downstream requirement keyed on the LEFT
-        // side of the original SQL eq is still satisfied.
+    fn broadcast_output_right_eq_hash_returns_any_distribution() {
+        // Even if the probe child is partitioned on an equivalent join-key id,
+        // the broadcast join output itself should not satisfy a parent hash
+        // distribution requirement without an explicit enforcer.
         let op = broadcast_inner(10, 20);
         let left_out = PhysicalPropertySet {
             distribution: DistributionSpec::shuffle_agg([ColumnId(20)]),
@@ -1109,15 +1096,7 @@ mod tests {
         };
         let right_out = PhysicalPropertySet::gather();
         let out = op.derive_output(&[&left_out, &right_out]);
-        match &out.distribution {
-            DistributionSpec::HashPartitioned { cols, source } => {
-                assert_eq!(*source, HashSource::ShuffleAgg);
-                let ids: std::collections::HashSet<ColumnId> = cols.iter().copied().collect();
-                assert!(ids.contains(&ColumnId(10)));
-                assert!(ids.contains(&ColumnId(20)));
-            }
-            other => panic!("expected HashPartitioned([10, 20]), got {other:?}"),
-        }
+        assert_eq!(out.distribution, DistributionSpec::Any);
     }
 
     #[test]
