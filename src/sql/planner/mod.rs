@@ -1053,22 +1053,25 @@ fn build_window_and_project(
 ) -> Result<LogicalPlan, String> {
     let has_window = project_items.iter().any(|item| has_window_call(&item.expr));
     if has_window {
-        let (window_exprs, rewritten_items) = extract_window_calls(&project_items);
         let mut output_columns = Vec::new();
         for item in original_projection {
+            let column_id = factory.create(
+                None,
+                item.output_name.clone(),
+                item.expr.data_type.clone(),
+                item.expr.nullable,
+            );
             output_columns.push(OutputColumn {
-                column_id: factory.create(
-                    None,
-                    item.output_name.clone(),
-                    item.expr.data_type.clone(),
-                    item.expr.nullable,
-                ),
+                column_id,
                 name: item.output_name.clone(),
                 data_type: item.expr.data_type.clone(),
                 nullable: item.expr.nullable,
                 is_internal: false,
             });
         }
+        let output_column_ids: Vec<_> = output_columns.iter().map(|col| col.column_id).collect();
+        let (window_exprs, rewritten_items) =
+            extract_window_calls(&project_items, &output_column_ids);
         // The analytic operator requires input sorted by (partition_by, order_by).
         // Insert a Sort node before the Window node using the first window
         // function's sort keys.  When window functions have different
@@ -1296,16 +1299,24 @@ fn normalize_window_frame_for_be(
 /// Returns (window_exprs, rewritten_projection_items).
 /// Each window call is replaced with a ColumnRef to its output name.
 /// Window calls may be nested inside expressions (e.g., `sum(x) * 100 / sum(sum(x)) OVER (...)`).
-fn extract_window_calls(items: &[ProjectItem]) -> (Vec<WindowExpr>, Vec<ProjectItem>) {
+fn extract_window_calls(
+    items: &[ProjectItem],
+    output_column_ids: &[ColumnId],
+) -> (Vec<WindowExpr>, Vec<ProjectItem>) {
     let mut window_exprs = Vec::new();
     let mut rewritten = Vec::new();
     let mut counter = 0usize;
 
-    for item in items {
+    for (idx, item) in items.iter().enumerate() {
         if has_window_call(&item.expr) {
+            let output_column_id = output_column_ids
+                .get(idx)
+                .copied()
+                .unwrap_or(item.output_column_id);
             let new_expr = rewrite_window_calls(
                 &item.expr,
                 &item.output_name,
+                output_column_id,
                 &mut window_exprs,
                 &mut counter,
             );
@@ -1327,6 +1338,7 @@ fn extract_window_calls(items: &[ProjectItem]) -> (Vec<WindowExpr>, Vec<ProjectI
 fn rewrite_window_calls(
     expr: &TypedExpr,
     base_name: &str,
+    output_column_id: ColumnId,
     window_exprs: &mut Vec<WindowExpr>,
     counter: &mut usize,
 ) -> TypedExpr {
@@ -1370,6 +1382,7 @@ fn rewrite_window_calls(
                 window_frame: rewritten_frame,
                 result_type: expr.data_type.clone(),
                 output_name: win_output_name.clone(),
+                output_column_id,
                 ignore_nulls: *ignore_nulls,
             });
             TypedExpr {
@@ -1384,11 +1397,18 @@ fn rewrite_window_calls(
         }
         ExprKind::BinaryOp { left, right, op } => TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(rewrite_window_calls(left, base_name, window_exprs, counter)),
+                left: Box::new(rewrite_window_calls(
+                    left,
+                    base_name,
+                    output_column_id,
+                    window_exprs,
+                    counter,
+                )),
                 op: *op,
                 right: Box::new(rewrite_window_calls(
                     right,
                     base_name,
+                    output_column_id,
                     window_exprs,
                     counter,
                 )),
@@ -1402,6 +1422,7 @@ fn rewrite_window_calls(
                 expr: Box::new(rewrite_window_calls(
                     inner,
                     base_name,
+                    output_column_id,
                     window_exprs,
                     counter,
                 )),
@@ -1418,7 +1439,15 @@ fn rewrite_window_calls(
                 name: name.clone(),
                 args: args
                     .iter()
-                    .map(|arg| rewrite_window_calls(arg, base_name, window_exprs, counter))
+                    .map(|arg| {
+                        rewrite_window_calls(
+                            arg,
+                            base_name,
+                            output_column_id,
+                            window_exprs,
+                            counter,
+                        )
+                    })
                     .collect(),
                 distinct: *distinct,
             },
@@ -1435,13 +1464,27 @@ fn rewrite_window_calls(
                 name: name.clone(),
                 args: args
                     .iter()
-                    .map(|arg| rewrite_window_calls(arg, base_name, window_exprs, counter))
+                    .map(|arg| {
+                        rewrite_window_calls(
+                            arg,
+                            base_name,
+                            output_column_id,
+                            window_exprs,
+                            counter,
+                        )
+                    })
                     .collect(),
                 distinct: *distinct,
                 order_by: order_by
                     .iter()
                     .map(|item| SortItem {
-                        expr: rewrite_window_calls(&item.expr, base_name, window_exprs, counter),
+                        expr: rewrite_window_calls(
+                            &item.expr,
+                            base_name,
+                            output_column_id,
+                            window_exprs,
+                            counter,
+                        ),
                         asc: item.asc,
                         nulls_first: item.nulls_first,
                     })
@@ -1458,6 +1501,7 @@ fn rewrite_window_calls(
                 expr: Box::new(rewrite_window_calls(
                     inner,
                     base_name,
+                    output_column_id,
                     window_exprs,
                     counter,
                 )),
@@ -1474,6 +1518,7 @@ fn rewrite_window_calls(
                 expr: Box::new(rewrite_window_calls(
                     inner,
                     base_name,
+                    output_column_id,
                     window_exprs,
                     counter,
                 )),
@@ -1491,12 +1536,21 @@ fn rewrite_window_calls(
                 expr: Box::new(rewrite_window_calls(
                     inner,
                     base_name,
+                    output_column_id,
                     window_exprs,
                     counter,
                 )),
                 list: list
                     .iter()
-                    .map(|item| rewrite_window_calls(item, base_name, window_exprs, counter))
+                    .map(|item| {
+                        rewrite_window_calls(
+                            item,
+                            base_name,
+                            output_column_id,
+                            window_exprs,
+                            counter,
+                        )
+                    })
                     .collect(),
                 negated: *negated,
             },
@@ -1513,11 +1567,24 @@ fn rewrite_window_calls(
                 expr: Box::new(rewrite_window_calls(
                     inner,
                     base_name,
+                    output_column_id,
                     window_exprs,
                     counter,
                 )),
-                low: Box::new(rewrite_window_calls(low, base_name, window_exprs, counter)),
-                high: Box::new(rewrite_window_calls(high, base_name, window_exprs, counter)),
+                low: Box::new(rewrite_window_calls(
+                    low,
+                    base_name,
+                    output_column_id,
+                    window_exprs,
+                    counter,
+                )),
+                high: Box::new(rewrite_window_calls(
+                    high,
+                    base_name,
+                    output_column_id,
+                    window_exprs,
+                    counter,
+                )),
                 negated: *negated,
             },
             data_type: expr.data_type.clone(),
@@ -1532,12 +1599,14 @@ fn rewrite_window_calls(
                 expr: Box::new(rewrite_window_calls(
                     inner,
                     base_name,
+                    output_column_id,
                     window_exprs,
                     counter,
                 )),
                 pattern: Box::new(rewrite_window_calls(
                     pattern,
                     base_name,
+                    output_column_id,
                     window_exprs,
                     counter,
                 )),
@@ -1556,6 +1625,7 @@ fn rewrite_window_calls(
                     Box::new(rewrite_window_calls(
                         inner,
                         base_name,
+                        output_column_id,
                         window_exprs,
                         counter,
                     ))
@@ -1564,8 +1634,20 @@ fn rewrite_window_calls(
                     .iter()
                     .map(|(when, then)| {
                         (
-                            rewrite_window_calls(when, base_name, window_exprs, counter),
-                            rewrite_window_calls(then, base_name, window_exprs, counter),
+                            rewrite_window_calls(
+                                when,
+                                base_name,
+                                output_column_id,
+                                window_exprs,
+                                counter,
+                            ),
+                            rewrite_window_calls(
+                                then,
+                                base_name,
+                                output_column_id,
+                                window_exprs,
+                                counter,
+                            ),
                         )
                     })
                     .collect(),
@@ -1573,6 +1655,7 @@ fn rewrite_window_calls(
                     Box::new(rewrite_window_calls(
                         inner,
                         base_name,
+                        output_column_id,
                         window_exprs,
                         counter,
                     ))
@@ -1590,6 +1673,7 @@ fn rewrite_window_calls(
                 expr: Box::new(rewrite_window_calls(
                     inner,
                     base_name,
+                    output_column_id,
                     window_exprs,
                     counter,
                 )),
@@ -1603,6 +1687,7 @@ fn rewrite_window_calls(
             kind: ExprKind::Nested(Box::new(rewrite_window_calls(
                 inner,
                 base_name,
+                output_column_id,
                 window_exprs,
                 counter,
             ))),
@@ -2584,6 +2669,76 @@ mod tests {
         visit(plan).unwrap_or_default()
     }
 
+    fn first_window_exprs(plan: &LogicalPlan) -> Vec<WindowExpr> {
+        fn visit(plan: &LogicalPlan) -> Option<Vec<WindowExpr>> {
+            match plan {
+                LogicalPlan::Window(node) => Some(node.window_exprs.clone()),
+                LogicalPlan::Filter(node) => visit(&node.input),
+                LogicalPlan::Project(node) => visit(&node.input),
+                LogicalPlan::Aggregate(node) => visit(&node.input),
+                LogicalPlan::Join(node) => visit(&node.left).or_else(|| visit(&node.right)),
+                LogicalPlan::Sort(node) => visit(&node.input),
+                LogicalPlan::Limit(node) => visit(&node.input),
+                LogicalPlan::Union(node) => node.inputs.iter().find_map(visit),
+                LogicalPlan::Intersect(node) => node.inputs.iter().find_map(visit),
+                LogicalPlan::Except(node) => node.inputs.iter().find_map(visit),
+                LogicalPlan::TableFunction(node) => visit(&node.input),
+                LogicalPlan::Repeat(node) => visit(&node.input),
+                LogicalPlan::CTEAnchor(node) => {
+                    visit(&node.consumer).or_else(|| visit(&node.produce))
+                }
+                LogicalPlan::CTEProduce(node) => visit(&node.input),
+                LogicalPlan::Decode(node) => visit(&node.input),
+                LogicalPlan::AggregateStateMerge(node) => {
+                    visit(&node.old_input).or_else(|| visit(&node.delta_input))
+                }
+                LogicalPlan::Scan(_)
+                | LogicalPlan::Values(_)
+                | LogicalPlan::GenerateSeries(_)
+                | LogicalPlan::CTEConsume(_)
+                | LogicalPlan::ImvDelta(_)
+                | LogicalPlan::ImvVersion(_) => None,
+            }
+        }
+
+        visit(plan).unwrap_or_default()
+    }
+
+    fn first_window_output_columns(plan: &LogicalPlan) -> Vec<OutputColumn> {
+        fn visit(plan: &LogicalPlan) -> Option<Vec<OutputColumn>> {
+            match plan {
+                LogicalPlan::Window(node) => Some(node.output_columns.clone()),
+                LogicalPlan::Filter(node) => visit(&node.input),
+                LogicalPlan::Project(node) => visit(&node.input),
+                LogicalPlan::Aggregate(node) => visit(&node.input),
+                LogicalPlan::Join(node) => visit(&node.left).or_else(|| visit(&node.right)),
+                LogicalPlan::Sort(node) => visit(&node.input),
+                LogicalPlan::Limit(node) => visit(&node.input),
+                LogicalPlan::Union(node) => node.inputs.iter().find_map(visit),
+                LogicalPlan::Intersect(node) => node.inputs.iter().find_map(visit),
+                LogicalPlan::Except(node) => node.inputs.iter().find_map(visit),
+                LogicalPlan::TableFunction(node) => visit(&node.input),
+                LogicalPlan::Repeat(node) => visit(&node.input),
+                LogicalPlan::CTEAnchor(node) => {
+                    visit(&node.consumer).or_else(|| visit(&node.produce))
+                }
+                LogicalPlan::CTEProduce(node) => visit(&node.input),
+                LogicalPlan::Decode(node) => visit(&node.input),
+                LogicalPlan::AggregateStateMerge(node) => {
+                    visit(&node.old_input).or_else(|| visit(&node.delta_input))
+                }
+                LogicalPlan::Scan(_)
+                | LogicalPlan::Values(_)
+                | LogicalPlan::GenerateSeries(_)
+                | LogicalPlan::CTEConsume(_)
+                | LogicalPlan::ImvDelta(_)
+                | LogicalPlan::ImvVersion(_) => None,
+            }
+        }
+
+        visit(plan).unwrap_or_default()
+    }
+
     fn strip_project_sort_limit(plan: &LogicalPlan) -> &LogicalPlan {
         match plan {
             LogicalPlan::Project(node) => strip_project_sort_limit(&node.input),
@@ -2938,6 +3093,32 @@ mod tests {
             aggs.len(),
             "distinct AggregateCalls must carry distinct output ids"
         );
+    }
+
+    #[test]
+    fn p1_window_expr_gets_output_column_id() {
+        let plan =
+            plan_test_query("SELECT a, row_number() OVER (PARTITION BY a ORDER BY b) AS rn FROM t");
+        let wins = first_window_exprs(&plan);
+        let output_columns = first_window_output_columns(&plan);
+        assert!(!wins.is_empty(), "expected at least one WindowExpr");
+        for w in &wins {
+            assert_ne!(
+                w.output_column_id,
+                crate::sql::column_id::ColumnId::UNSET,
+                "WindowExpr {} must carry a real output_column_id",
+                w.output_name
+            );
+            let output_column = output_columns
+                .iter()
+                .find(|col| col.name == w.output_name)
+                .unwrap_or_else(|| panic!("missing Window output column {}", w.output_name));
+            assert_eq!(
+                w.output_column_id, output_column.column_id,
+                "WindowExpr {} must share its WindowNode output column id",
+                w.output_name
+            );
+        }
     }
 
     #[test]

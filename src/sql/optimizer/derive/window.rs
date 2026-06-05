@@ -111,6 +111,7 @@ mod tests {
             ignore_nulls: false,
             distinct: false,
             output_name: "win".into(),
+            output_column_id: ColumnId::UNSET,
             result_type: arrow::datatypes::DataType::Int64,
         };
         let op = PhysicalWindowOp {
@@ -138,6 +139,7 @@ mod tests {
             ignore_nulls: false,
             distinct: false,
             output_name: "win".into(),
+            output_column_id: ColumnId::UNSET,
             result_type: arrow::datatypes::DataType::Int64,
         };
         let op = PhysicalWindowOp {
@@ -181,6 +183,7 @@ mod tests {
             ignore_nulls: false,
             distinct: false,
             output_name: "win".into(),
+            output_column_id: ColumnId::UNSET,
             result_type: arrow::datatypes::DataType::Int64,
         };
         let op = PhysicalWindowOp {

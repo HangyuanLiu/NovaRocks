@@ -6917,6 +6917,7 @@ mod tests {
             }),
             result_type: DataType::Int64,
             output_name: "sum_rows".to_string(),
+            output_column_id: crate::sql::column_id::ColumnId::UNSET,
             ignore_nulls: false,
         };
         let win_range = WindowExpr {

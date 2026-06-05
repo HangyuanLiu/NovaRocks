@@ -163,7 +163,12 @@ pub(crate) struct WindowExpr {
     pub order_by: Vec<SortItem>,
     pub window_frame: Option<crate::sql::analysis::WindowFrame>,
     pub result_type: DataType,
+    /// Display label only (EXPLAIN / output schema). Identity is now
+    /// `output_column_id`. (G1: `output_name` downgraded from a binding key.)
     pub output_name: String,
+    /// G1: globally-unique id of this window function's output column.
+    #[allow(dead_code)]
+    pub output_column_id: crate::sql::column_id::ColumnId,
     /// `IGNORE NULLS` modifier. Currently honored by first_value / last_value
     /// / lead / lag; ignored for other window functions.
     pub ignore_nulls: bool,

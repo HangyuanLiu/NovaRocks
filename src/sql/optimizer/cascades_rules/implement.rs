@@ -1886,6 +1886,7 @@ mod window_split_tests {
             window_frame: None,
             result_type: DataType::Int64,
             output_name: name.into(),
+            output_column_id: ColumnId::UNSET,
             ignore_nulls: false,
         }
     }
@@ -1945,6 +1946,7 @@ mod window_split_tests {
             window_frame: None,
             result_type: DataType::Int64,
             output_name: "w".into(),
+            output_column_id: ColumnId::UNSET,
             ignore_nulls: false,
         };
         let items = sort_items_for_window(&win);

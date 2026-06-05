@@ -94,6 +94,7 @@ mod tests {
             window_frame: None,
             result_type: DataType::Int64,
             output_name: output_name.to_string(),
+            output_column_id: ColumnId::UNSET,
             ignore_nulls: false,
         }
     }

@@ -1455,6 +1455,7 @@ mod tests {
                 window_frame: None,
                 result_type: DataType::Int64,
                 output_name: "row_number".to_string(),
+                output_column_id: ColumnId::new_for_test(301),
                 ignore_nulls: false,
             }],
             output_columns: vec![
@@ -1503,6 +1504,7 @@ mod tests {
                 window_frame: None,
                 result_type: DataType::Int64,
                 output_name: "row_number".to_string(),
+                output_column_id: ColumnId::new_for_test(301),
                 ignore_nulls: false,
             }],
             output_columns: vec![
