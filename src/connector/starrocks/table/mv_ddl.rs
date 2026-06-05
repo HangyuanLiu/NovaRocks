@@ -486,7 +486,7 @@ fn build_mv_storage_layout(
             validate_aggregate_distribution_columns(distribution, shape)?;
             let aggregate_input_types = if let Some(resolved_query) = resolved_query {
                 super::mv_agg_state::aggregate_input_types_from_resolved_query(
-                    shape,
+                    &super::aggregate_sql_calls::AggregateSqlCalls::from(shape),
                     resolved_query,
                 )?
             } else {

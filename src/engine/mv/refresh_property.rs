@@ -24,12 +24,14 @@
 //! CREATE never persists a contract whose refresh would fail. For every shape
 //! the legacy classifier supported, that narrowing emits a byte-for-byte
 //! equivalent contract. A `BranchScoped(GroupRowId)` UNION ALL of *composed*
-//! aggregate branches (aggregate-over-join / fan-in) is synthesized by the
-//! property algebra (the machinery is kept for a future Phase 4 that will add
-//! composed branch-union refresh), but `into_refresh_contract` REJECTS it today
-//! with an explicit "does not yet support … composed branch-union" message —
-//! the coherence gate that keeps CREATE aligned with refresh. Other
-//! unrepresentable shapes (e.g. a UNION ALL of joins) are also rejected. See
+//! aggregate branches (aggregate-over-join / fan-in) is now ACCEPTED as a
+//! `BranchUnionAggregate` contract, gated to HOMOGENEOUS-base branches only
+//! (every branch shares the same distinct base set / join structure / fan-in
+//! arity / group-key layout — enforced by the homogeneity check in
+//! `derive_from_set_operation`). The composed delta execution composes the
+//! branches off the full UNION ALL logical plan, so the contract is
+//! shape-independent. A heterogeneous-base composed union, and other
+//! unrepresentable shapes (e.g. a UNION ALL of joins), are still rejected. See
 //! [`RefreshFragmentProperty::into_refresh_contract`] for the precise narrowing.
 
 use crate::connector::starrocks::table::model::IcebergTableRef;
@@ -355,25 +357,28 @@ impl RefreshFragmentProperty {
     /// mapping is the *single narrowing point*: it narrows back to the set the
     /// refresh path can actually drive incrementally, so the emitted contract
     /// and its rejections stay aligned with what CREATE may coherently persist.
-    /// The `branch_shape` carried up from the set operation gates the three
+    /// The `branch_shape` carried up from the set operation gates the
     /// branch-bearing strategies:
     ///   - `UnionProjectionFilter` requires `BranchShape::SimpleScan` branches;
     ///   - `FanInAggregate` requires the aggregated union to be
     ///     `BranchShape::SimpleScan`;
-    ///   - `BranchUnionAggregate` requires `BranchShape::SimpleAggregate`
-    ///     branches (a UNION ALL of *simple* GROUP BY aggregates over scans).
+    ///   - `BranchUnionAggregate` admits BOTH `BranchShape::SimpleAggregate`
+    ///     branches (a UNION ALL of *simple* GROUP BY aggregates over scans) and
+    ///     `BranchShape::Composed` branches (a UNION ALL of `Agg(a JOIN b)` /
+    ///     `Agg(fan-in)`).
     ///
-    /// Coherence gate (the Phase-4 lift point): a `BranchScoped(GroupRowId)`
-    /// union whose branches are *composed* aggregates — an aggregate over a join
-    /// (`Agg(a JOIN b)`) or an aggregate over a fan-in union — has a
-    /// representable `BranchUtf8` apply key, so the property synthesis still
-    /// builds it and `derive_fragment_property` keeps the machinery intact. But
-    /// the refresh path does not yet drive these composed shapes incrementally,
-    /// so admitting them at CREATE would produce a CREATE-succeeds-but-refresh-
-    /// fails half-state. This mapping therefore REJECTS a composed branch-union
-    /// aggregate with an explicit "does not yet support … composed branch-union"
-    /// error; full composed branch-union refresh support is deferred to Phase 4,
-    /// which will relax this single arm back to admit `BranchShape::Composed`.
+    /// Composed branch-union aggregate (the P4.4 enablement): a
+    /// `BranchScoped(GroupRowId)` union whose branches are *composed* aggregates —
+    /// an aggregate over a join (`Agg(a JOIN b)`) or an aggregate over a fan-in
+    /// union — has a representable `BranchUtf8` apply key and is now ACCEPTED. The
+    /// composed delta execution re-parses the full UNION ALL SELECT into one
+    /// logical plan and branch-scopes each branch (`RewriteBranchUnionRule` +
+    /// downstream delta rules), so the apply-key/aggregate/branch contract is
+    /// shape-independent. This is gated to HOMOGENEOUS-base composed unions only
+    /// (every branch shares the same distinct base set / join structure / fan-in
+    /// arity / group-key layout); that homogeneity is enforced upstream in
+    /// `derive_from_set_operation`. A heterogeneous-base composed union is
+    /// rejected there before it reaches this mapping.
     ///
     /// What this also rejects: shapes whose apply key has no representation at
     /// all — e.g. a top-level `JoinRowKey(GroupRowId, ..)` (a join over
@@ -527,36 +532,32 @@ impl RefreshFragmentProperty {
             (TargetIdentity::BranchScoped(inner), StateContract::AggregateState { .. })
                 if matches!(inner.as_ref(), TargetIdentity::GroupRowId(_)) =>
             {
-                // Coherence gate (Phase-4 lift point). Every aggregate branch
-                // produces a per-branch group-row identity, so the composite
-                // apply key is `BranchUtf8` regardless of how each branch is
-                // computed underneath — that key is representable. The property
-                // synthesis therefore still admits a `BranchScoped(GroupRowId)`
-                // UNION ALL of *composed* aggregate branches (an aggregate over a
-                // join `Agg(a JOIN b)`, or an aggregate over a fan-in union), and
-                // `derive_fragment_property` keeps building it (the machinery for
-                // Phase 4 stays intact). But the refresh path does NOT yet drive
-                // these composed branch-union shapes incrementally — refreshing
-                // them would fail. To keep CREATE coherent with what refresh can
-                // actually execute, the contract mapping only admits a UNION ALL
-                // of *simple* GROUP BY aggregates (`BranchShape::SimpleAggregate`,
-                // the shape the legacy classifier accepted here). A `Composed`
-                // branch union is rejected with an explicit "not yet supported"
-                // message; lifting this restriction is the Phase-4 task of adding
-                // composed branch-union refresh support. The branch top is never
-                // itself a join, so `join_key_count` is always `None` here — the
-                // discriminator is the per-branch shape, not the branch scope's
-                // own join key count.
+                // Every aggregate branch produces a per-branch group-row identity,
+                // so the composite apply key is `BranchUtf8` regardless of how each
+                // branch is computed underneath — that key is representable. The
+                // contract mapping admits a `BranchScoped(GroupRowId)` UNION ALL of
+                // either *simple* GROUP BY aggregates (`BranchShape::SimpleAggregate`)
+                // or *composed* aggregate branches (an aggregate over a join
+                // `Agg(a JOIN b)`, or an aggregate over a fan-in union;
+                // `BranchShape::Composed`).
+                //
+                // Composed branch-union refresh works because the delta execution
+                // re-parses the MV's full UNION ALL SELECT into ONE logical plan and
+                // `RewriteBranchUnionRule` branch-scopes each branch while the
+                // downstream delta rules expand the inner join / fan-in. Refresh does
+                // NOT generate per-branch delta SQL, so the apply key + aggregate
+                // contract built below are shape-independent. The composed case is
+                // gated to HOMOGENEOUS-base branches only (every branch shares the
+                // same distinct base set, join structure, fan-in arity, and group-key
+                // layout); that homogeneity is enforced in `derive_from_set_operation`
+                // (the composed-branch structural-homogeneity check). A heterogeneous
+                // composed union is rejected there before it ever reaches this arm.
+                //
+                // The branch top is never itself a join, so `join_key_count` is always
+                // `None` here — the discriminator is the per-branch shape, not the
+                // branch scope's own join key count.
                 match branch_shape {
-                    Some(BranchShape::SimpleAggregate) => {}
-                    Some(BranchShape::Composed) => {
-                        return Err(
-                            "Iceberg IMV refresh contract does not yet support UNION ALL branches \
-                             that aggregate over joins or unions (composed branch-union); only \
-                             UNION ALL of simple GROUP BY aggregates is supported"
-                                .to_string(),
-                        );
-                    }
+                    Some(BranchShape::SimpleAggregate | BranchShape::Composed) => {}
                     _ => {
                         return Err(
                             "Iceberg IMV refresh contract only supports UNION ALL of projection/filter branches or aggregate branches"
@@ -600,13 +601,14 @@ impl RefreshFragmentProperty {
     /// `Some(branch_count)` for a UNION ALL whose branches are simple per-scan
     /// structures. Mirrors the legacy `validate_base_ref_contract` expectations.
     ///
-    /// Returns `None` for a *composed* branch union: there each branch carries
-    /// more than one base, so the per-branch "one base per branch" assumption
-    /// behind `branch_count` does not hold. Composed branch unions are now
-    /// rejected by `into_refresh_contract` (the coherence gate — see the
-    /// `BranchScoped(GroupRowId)` aggregate arm); skipping the arity check here
-    /// lets that dedicated "composed branch-union" rejection surface its precise
-    /// message instead of a less-specific distinct-base-count error.
+    /// Returns `None` for a *composed* branch union: there every branch carries
+    /// the SAME (possibly multi-table) base set under the homogeneity gate, so the
+    /// per-branch "one base per branch" assumption behind `branch_count` does not
+    /// hold. Composed branch unions are accepted by `into_refresh_contract` (the
+    /// `BranchScoped(GroupRowId)` aggregate arm); the distinct-base arity for the
+    /// composed case is instead enforced by the structural-homogeneity check in
+    /// `derive_from_set_operation` (every branch shares the same distinct base
+    /// set) plus the schema-contract base-ref validation at refresh time.
     fn expected_distinct_base_refs(&self) -> Option<usize> {
         if let Some(branch_count) = self.branch_count {
             if self.branch_shape == Some(BranchShape::Composed) {
@@ -1883,15 +1885,14 @@ mod tests {
 
     #[test]
     fn union_all_of_aggregate_joins_synthesizes_branch_scoped_group_row() {
-        // Composed branch-union machinery is kept intact for Phase 4: the
-        // property algebra still SYNTHESIZES `BranchScoped(GroupRowId)` for a
+        // The property algebra SYNTHESIZES `BranchScoped(GroupRowId)` for a
         // UNION ALL whose branches are aggregates over joins, because every
-        // branch produces the same (GroupRowId, AggregateState) kind. CREATE no
-        // longer persists this shape — `into_refresh_contract` rejects a composed
-        // branch-union as the coherence gate (see
-        // `composed_branch_union_aggregate_rejected_by_contract` below) — but
-        // this synthesis is the substrate a future Phase 4 will lift. (Branches
-        // here are structurally homogeneous: same base set + join structure.)
+        // branch produces the same (GroupRowId, AggregateState) kind. A
+        // homogeneous composed branch union of this shape is now also persisted
+        // at CREATE (`into_refresh_contract` accepts it — see
+        // `homogeneous_composed_branch_union_aggregate_builds_contract` below).
+        // (Branches here are structurally homogeneous: same base set + join
+        // structure.)
         let prop = property(
             "SELECT l.region, count(*) AS c, sum(r.amount) AS s
              FROM fact_a l JOIN fact_b r ON l.id = r.id
@@ -1957,14 +1958,17 @@ mod tests {
     }
 
     #[test]
-    fn composed_branch_union_aggregate_rejected_by_contract() {
-        // Coherence gate: a homogeneous composed `BranchScoped(GroupRowId)` union
-        // (UNION ALL of `Agg(a JOIN b)` over the same two bases) is SYNTHESIZED
-        // as a branch-scoped group-row property (machinery kept for Phase 4), but
-        // `into_refresh_contract` rejects it because the refresh path does not
-        // yet drive composed branch unions incrementally. The property is
-        // representable (BranchUtf8 apply key) yet not refreshable, so CREATE must
-        // reject rather than persist a refresh-failing contract.
+    fn homogeneous_composed_branch_union_aggregate_builds_contract() {
+        // P4.4 acceptance: a homogeneous composed `BranchScoped(GroupRowId)` union
+        // (UNION ALL of `Agg(a JOIN b)` over the SAME two bases in every branch) is
+        // SYNTHESIZED as a branch-scoped group-row property AND now successfully
+        // maps to a `BranchUnionAggregate`-style refresh contract. The delta
+        // execution composes the branches off the full UNION ALL logical plan
+        // (`RewriteBranchUnionRule` + downstream delta rules), so the apply key +
+        // aggregate/branch contract built here are shape-independent. The
+        // homogeneity gate in `derive_from_set_operation` keeps heterogeneous-base
+        // composed unions rejected (see
+        // `union_all_of_aggregate_joins_rejects_heterogeneous_base_sets`).
         let prop = property(
             "SELECT l.region, count(*) AS c, sum(r.amount) AS s
              FROM fact_a l JOIN fact_b r ON l.id = r.id
@@ -1974,20 +1978,33 @@ mod tests {
              FROM fact_a l JOIN fact_b r ON l.id = r.id
              GROUP BY l.region",
         );
-        // Machinery intact: the property is still a branch-scoped group row.
+        // The property is a branch-scoped group row over two repeated bases.
         assert_eq!(
             prop.identity,
             TargetIdentity::BranchScoped(Box::new(TargetIdentity::GroupRowId(vec![
                 "region".to_string()
             ])))
         );
-        // But the contract mapping rejects it as the coherence gate.
-        let err = prop
+        assert_eq!(prop.branch_count, Some(2));
+
+        // The contract mapping now ACCEPTS the composed branch union and yields a
+        // BranchUnionAggregate contract: a branch-scoped (BranchUtf8) apply key,
+        // an aggregate contract, and a branch contract carrying the branch count.
+        let contract = prop
             .into_refresh_contract()
-            .expect_err("composed branch-union aggregate must be rejected at the contract mapping");
-        assert!(
-            err.contains("does not yet support") && err.contains("composed branch-union"),
-            "unexpected error: {err}"
+            .expect("homogeneous composed branch-union aggregate must build a refresh contract");
+        assert_eq!(contract.apply_key.value_type, ApplyKeyValueType::BranchUtf8);
+        assert_eq!(
+            contract.aggregate,
+            Some(AggregateRefreshContract {
+                group_key_count: 1,
+                aggregate_count: 2,
+            })
+        );
+        assert_eq!(contract.join, None);
+        assert_eq!(
+            contract.branch,
+            Some(BranchRefreshContract { branch_count: 2 })
         );
     }
 

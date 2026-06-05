@@ -96,7 +96,7 @@ pub(crate) fn build_aggregate_state_merge(
         return Err("Iceberg IMV aggregate rewrite does not support SELECT DISTINCT".to_string());
     }
 
-    let (aggregate_shape, aggregate_layout) =
+    let (aggregate_calls, aggregate_layout) =
         ext.mv_ctx.aggregate_shape_and_layout_for_execution()?;
     let group_key_names = group_key_names(&aggregate)?;
     let aggregate_state_names = aggregate_state_names(ext, &aggregate, &aggregate_layout)?;
@@ -156,7 +156,7 @@ pub(crate) fn build_aggregate_state_merge(
         aggregate,
         action_column,
         ext,
-        &aggregate_shape,
+        &aggregate_calls,
         &aggregate_layout,
     )?;
 
@@ -590,7 +590,7 @@ fn signed_aggregate(
     aggregate: AggregateNode,
     action_column: ColumnId,
     ext: &ImvExtension,
-    shape: &crate::connector::starrocks::table::mv_shape::AggregateMvShape,
+    shape: &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls,
     layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
 ) -> Result<LogicalPlan, String> {
     let input_columns = plan_output_columns(&aggregate.input)?;
@@ -798,7 +798,7 @@ fn unique_input_column_by_name<'a>(
 
 fn signed_aggregate_output_columns(
     group_by: &[TypedExpr],
-    shape: &crate::connector::starrocks::table::mv_shape::AggregateMvShape,
+    shape: &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls,
     layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
     ext: &ImvExtension,
     signed_calls: &[AggregateCall],
@@ -848,7 +848,7 @@ fn signed_aggregate_output_columns(
 
 fn signed_aggregate_project_items(
     group_by: &[TypedExpr],
-    shape: &crate::connector::starrocks::table::mv_shape::AggregateMvShape,
+    shape: &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls,
     layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
     ext: &ImvExtension,
     signed_calls: &[AggregateCall],

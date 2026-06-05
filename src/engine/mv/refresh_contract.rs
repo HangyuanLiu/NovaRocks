@@ -1209,26 +1209,25 @@ mod tests {
         );
     }
 
-    // --- Composed branch-union-aggregate: REJECTED at CREATE (coherence) ----
+    // --- Homogeneous composed branch-union-aggregate: ACCEPTED at CREATE -----
     //
     // The two cases below are UNION ALL tops whose branches are composed
     // aggregates (an aggregate over a join, or an aggregate over a fan-in
-    // union). Every branch produces a per-branch group-row identity, so the
-    // composite apply key is `BranchUtf8` — representable — and the property
-    // algebra still SYNTHESIZES a `BranchScoped(GroupRowId)` property for them
-    // (the machinery is kept for a future Phase 4). But the refresh path does
-    // not yet drive composed branch unions incrementally, so admitting them at
-    // CREATE would be a CREATE-succeeds-but-refresh-fails half-state.
-    // `into_refresh_contract` therefore REJECTS them as the coherence gate. The
-    // third case (fan-in aggregate over a union of joins) is the inverse nesting
-    // and stays rejected for a different reason: there the union is *below* the
-    // aggregate, so the `FanInAggregate` arm requires a union of simple scans.
+    // union), HOMOGENEOUS over the same base set in every branch. Every branch
+    // produces a per-branch group-row identity, so the composite apply key is
+    // `BranchUtf8`. The delta execution composes the branches off the full
+    // UNION ALL logical plan (`RewriteBranchUnionRule` + downstream delta
+    // rules), so `into_refresh_contract` now ACCEPTS them and yields a
+    // BranchUnionAggregate contract. (The heterogeneous-base case is still
+    // rejected by the homogeneity gate in `derive_from_set_operation`.) The
+    // third case below (fan-in aggregate over a union of joins) is the inverse
+    // nesting and stays rejected for a different reason: there the union is
+    // *below* the aggregate, so the `FanInAggregate` arm requires a union of
+    // simple scans.
 
     #[test]
-    fn rejects_branch_union_of_join_aggregates_as_composed() {
+    fn accepts_homogeneous_branch_union_of_join_aggregates() {
         // UNION ALL of `Agg(fact_a JOIN fact_b)` x 2 over the SAME two bases.
-        // The shape is representable but not yet refreshable, so CREATE rejects
-        // it with the composed branch-union coherence-gate message.
         let analysis = parse_and_analyze_mv_query(
             "SELECT l.region, count(*) AS c, sum(r.amount) AS s
              FROM fact_a l JOIN fact_b r ON l.id = r.id
@@ -1240,20 +1239,31 @@ mod tests {
             &["fact_a", "fact_b"],
         );
 
-        let err = derive_imv_refresh_contract(&analysis)
-            .expect_err("composed branch union of join aggregates is not yet supported");
+        let contract = derive_imv_refresh_contract(&analysis)
+            .expect("homogeneous composed branch union of join aggregates builds a contract");
 
-        assert!(
-            err.contains("does not yet support") && err.contains("composed branch-union"),
-            "unexpected error: {err}"
+        assert_eq!(
+            contract.apply_key,
+            ApplyKeyContract::branch_union_aggregate_group_row()
         );
+        assert_eq!(
+            contract.aggregate,
+            Some(AggregateRefreshContract {
+                group_key_count: 1,
+                aggregate_count: 2,
+            })
+        );
+        assert_eq!(
+            contract.branch,
+            Some(BranchRefreshContract { branch_count: 2 })
+        );
+        assert_eq!(contract.join, None);
     }
 
     #[test]
-    fn rejects_branch_union_of_fan_in_aggregates_as_composed() {
+    fn accepts_homogeneous_branch_union_of_fan_in_aggregates() {
         // UNION ALL of `Agg(Union(fact_a, fact_b))` (fan-in) x 2 over the SAME
-        // two bases. Representable but not yet refreshable, so CREATE rejects it
-        // with the composed branch-union coherence-gate message.
+        // two bases.
         let analysis = parse_and_analyze_mv_query(
             "SELECT region, count(*) AS c, sum(amount) AS s
              FROM (
@@ -1273,13 +1283,25 @@ mod tests {
             &["fact_a", "fact_b"],
         );
 
-        let err = derive_imv_refresh_contract(&analysis)
-            .expect_err("composed branch union of fan-in aggregates is not yet supported");
+        let contract = derive_imv_refresh_contract(&analysis)
+            .expect("homogeneous composed branch union of fan-in aggregates builds a contract");
 
-        assert!(
-            err.contains("does not yet support") && err.contains("composed branch-union"),
-            "unexpected error: {err}"
+        assert_eq!(
+            contract.apply_key,
+            ApplyKeyContract::branch_union_aggregate_group_row()
         );
+        assert_eq!(
+            contract.aggregate,
+            Some(AggregateRefreshContract {
+                group_key_count: 1,
+                aggregate_count: 2,
+            })
+        );
+        assert_eq!(
+            contract.branch,
+            Some(BranchRefreshContract { branch_count: 2 })
+        );
+        assert_eq!(contract.join, None);
     }
 
     #[test]

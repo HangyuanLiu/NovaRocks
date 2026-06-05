@@ -553,8 +553,10 @@ fn execute_aggregate_mv_full_refresh(
     // (one column per visible_output), not state-shaped types (which expand AVG into
     // two columns: SUM + COUNT). Running the analyzer is cheap — no execution occurs.
     let visible_analysis = analyze_visible_query(&ctx.state, &ctx.database, &ctx.select_sql)?;
-    let aggregate_input_types =
-        super::mv_agg_state::aggregate_input_types_from_resolved_query(shape, &visible_analysis)?;
+    let aggregate_input_types = super::mv_agg_state::aggregate_input_types_from_resolved_query(
+        &super::aggregate_sql_calls::AggregateSqlCalls::from(shape),
+        &visible_analysis,
+    )?;
     let visible_output_columns = visible_analysis.output_columns;
 
     // Step 2: build the layout from visible types.
@@ -714,7 +716,7 @@ fn refresh_aggregate_mv_incremental(
     // avoids this mismatch before materializing state chunks.
     let visible_analysis = analyze_visible_query(ctx.state, ctx.database, ctx.select_sql)?;
     let aggregate_input_types = super::mv_agg_state::aggregate_input_types_from_resolved_query(
-        ctx.shape,
+        &super::aggregate_sql_calls::AggregateSqlCalls::from(ctx.shape),
         &visible_analysis,
     )?;
     let layout = super::mv_agg_state::build_aggregate_mv_layout_with_input_types(

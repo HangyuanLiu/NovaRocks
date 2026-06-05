@@ -296,22 +296,22 @@ pub(crate) fn build_aggregate_mv_layout_with_input_types(
 }
 
 pub(crate) fn aggregate_input_types_from_resolved_query(
-    shape: &AggregateMvShape,
+    calls: &AggregateSqlCalls,
     resolved: &crate::sql::analysis::ResolvedQuery,
 ) -> Result<Vec<Option<DataType>>, String> {
     let crate::sql::analysis::QueryBody::Select(select) = &resolved.body else {
         return Err("aggregate MV input type metadata requires SELECT analysis".to_string());
     };
-    if select.projection.len() != shape.visible_outputs.len() {
+    if select.projection.len() != calls.visible_outputs.len() {
         return Err(format!(
             "aggregate MV input type projection count mismatch: analyzed_projection={} shape_outputs={}",
             select.projection.len(),
-            shape.visible_outputs.len()
+            calls.visible_outputs.len()
         ));
     }
 
-    let mut input_types = vec![None; shape.aggregates.len()];
-    for (projection_index, visible_output) in shape.visible_outputs.iter().enumerate() {
+    let mut input_types = vec![None; calls.aggregates.len()];
+    for (projection_index, visible_output) in calls.visible_outputs.iter().enumerate() {
         let VisibleAggregateOutput::Aggregate(aggregate_index) = visible_output else {
             continue;
         };
