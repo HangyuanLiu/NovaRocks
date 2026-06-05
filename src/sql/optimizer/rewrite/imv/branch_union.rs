@@ -811,12 +811,21 @@ mod tests {
     }
 
     fn join_of(left: LogicalPlan, right: LogicalPlan) -> LogicalPlan {
-        // An inner equi-join on region columns from left (id=1) and right (id=10).
+        join_of_on(left, right, 1, 10)
+    }
+
+    fn join_of_on(
+        left: LogicalPlan,
+        right: LogicalPlan,
+        left_region_id: u32,
+        right_region_id: u32,
+    ) -> LogicalPlan {
+        // An inner equi-join on caller-selected region column ids.
         let condition = TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(col_expr(1, "region")),
+                left: Box::new(col_expr(left_region_id, "region")),
                 op: BinOp::Eq,
-                right: Box::new(col_expr(10, "region")),
+                right: Box::new(col_expr(right_region_id, "region")),
             },
             data_type: DataType::Boolean,
             nullable: false,
@@ -828,6 +837,60 @@ mod tests {
             condition: Some(condition),
             required_output_columns: None,
         })
+    }
+
+    fn assert_rule_changed(ctx: &RewriteContext, rule_name: &str) {
+        use crate::sql::optimizer::rewrite::trace::RewriteTraceEvent;
+
+        assert!(
+            ctx.trace().events().iter().any(|event| {
+                matches!(event, RewriteTraceEvent::RuleChanged { rule, .. } if *rule == rule_name)
+            }),
+            "{rule_name} must change the plan, trace: {:?}",
+            ctx.trace().events()
+        );
+    }
+
+    #[test]
+    fn pipeline_aggregate_over_filtered_join_composes() {
+        use crate::sql::optimizer::rewrite::imv::marker::plan_contains_imv_marker;
+        use crate::sql::optimizer::rewrite::imv::pipeline::build_imv_pipeline;
+
+        let mut ctx = build_ctx();
+        let join = join_of(scan("b", 1), scan("b", 10));
+        let filtered = filter_over(join, 1, "region");
+        let plan = aggregate_over(filtered);
+
+        let out = build_imv_pipeline()
+            .rewrite(plan, &mut ctx)
+            .expect("aggregate over filtered join must compose");
+
+        assert!(
+            !plan_contains_imv_marker(&out),
+            "no IMV marker may survive: {out:?}"
+        );
+        assert_rule_changed(&ctx, "RewriteJoinDelta");
+    }
+
+    #[test]
+    fn pipeline_aggregate_over_nested_join_composes() {
+        use crate::sql::optimizer::rewrite::imv::marker::plan_contains_imv_marker;
+        use crate::sql::optimizer::rewrite::imv::pipeline::build_imv_pipeline;
+
+        let mut ctx = build_ctx();
+        let inner = join_of(scan("b", 1), scan("b", 10));
+        let outer = join_of_on(inner, scan("b", 20), 1, 20);
+        let plan = aggregate_over(outer);
+
+        let out = build_imv_pipeline()
+            .rewrite(plan, &mut ctx)
+            .expect("aggregate over nested join must compose");
+
+        assert!(
+            !plan_contains_imv_marker(&out),
+            "no IMV marker may survive: {out:?}"
+        );
+        assert_rule_changed(&ctx, "RewriteJoinDelta");
     }
 
     #[test]
