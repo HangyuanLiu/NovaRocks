@@ -6,6 +6,7 @@
 //!
 //! Files will be added incrementally by the next tasks in this plan.
 
+pub(crate) mod aggregate_sql_calls;
 pub(crate) mod backend;
 pub(crate) mod catalog;
 pub(crate) mod config;

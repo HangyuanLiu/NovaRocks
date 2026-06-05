@@ -502,6 +502,7 @@ mod tests {
             input: Box::new(inner),
             is_root: true,
             action_column: None,
+            branch_scope: None,
         });
 
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());

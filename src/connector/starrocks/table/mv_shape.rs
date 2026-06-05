@@ -410,7 +410,7 @@ fn classify_join_aggregate_mv_query(
     })
 }
 
-fn classify_aggregate_select_outputs(
+pub(crate) fn classify_aggregate_select_outputs(
     select: &sqlparser::ast::Select,
 ) -> Result<
     (
@@ -1674,7 +1674,7 @@ fn union_all_branch_output_mismatch_error() -> String {
 /// Arrow batch that `materialize_aggregate_result_chunks` can consume.
 pub(crate) fn rewrite_select_sql_for_state(
     select_sql: &str,
-    shape: &AggregateMvShape,
+    calls: &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls,
 ) -> Result<String, String> {
     use sqlparser::ast::{SelectItem, SetExpr, Statement};
 
@@ -1692,11 +1692,11 @@ pub(crate) fn rewrite_select_sql_for_state(
     };
 
     let mut new_projection: Vec<SelectItem> =
-        Vec::with_capacity(shape.visible_outputs.len() + shape.aggregates.len() + 1);
-    for output in &shape.visible_outputs {
+        Vec::with_capacity(calls.visible_outputs.len() + calls.aggregates.len() + 1);
+    for output in &calls.visible_outputs {
         match output {
             VisibleAggregateOutput::GroupKey(group_key_index) => {
-                let group_key = shape.group_keys.get(*group_key_index).ok_or_else(|| {
+                let group_key = calls.group_keys.get(*group_key_index).ok_or_else(|| {
                     format!(
                         "rewrite_select_sql_for_state: group key index {group_key_index} out of range"
                     )
@@ -1707,7 +1707,7 @@ pub(crate) fn rewrite_select_sql_for_state(
                 });
             }
             VisibleAggregateOutput::Aggregate(aggregate_index) => {
-                let aggregate = shape.aggregates.get(*aggregate_index).ok_or_else(|| {
+                let aggregate = calls.aggregates.get(*aggregate_index).ok_or_else(|| {
                     format!(
                         "rewrite_select_sql_for_state: aggregate index {aggregate_index} out of range"
                     )
@@ -1716,7 +1716,7 @@ pub(crate) fn rewrite_select_sql_for_state(
             }
         }
     }
-    if crate::connector::starrocks::table::mv_agg_state::aggregate_shape_needs_retraction_count_state(shape) {
+    if crate::connector::starrocks::table::mv_agg_state::aggregate_shape_needs_retraction_count_state(calls) {
         new_projection.push(make_count_star_select_item(
             crate::connector::starrocks::table::mv_agg_state::AGG_RETRACTION_COUNT_STATE_COLUMN,
         ));
@@ -1874,6 +1874,7 @@ fn make_count_star_select_item(alias: &str) -> sqlparser::ast::SelectItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls;
 
     fn parse_query(sql: &str) -> sqlparser::ast::Query {
         let normalized =
@@ -2734,11 +2735,11 @@ mod tests {
             .expect("query should be accepted");
     }
 
-    fn as_aggregate_shape(shape: IncrementalMvShape) -> AggregateMvShape {
+    fn as_aggregate_shape(shape: IncrementalMvShape) -> AggregateSqlCalls {
         let IncrementalMvShape::Aggregate(shape) = shape else {
             panic!("expected aggregate shape");
         };
-        shape
+        AggregateSqlCalls::from(&shape)
     }
 
     #[test]
@@ -2837,7 +2838,7 @@ mod tests {
     fn rewrite_select_sql_avg_without_alias() {
         let original = "SELECT k1, AVG(v2) FROM ice.ns.orders GROUP BY k1";
         let shape = match classify_sql(original).expect("classify") {
-            IncrementalMvShape::Aggregate(s) => s,
+            IncrementalMvShape::Aggregate(s) => AggregateSqlCalls::from(&s),
             _ => panic!("expected aggregate shape"),
         };
         let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
@@ -2854,7 +2855,7 @@ mod tests {
     fn rewrite_select_sql_avg_with_complex_argument() {
         let original = "SELECT k1, AVG(v2 + 1) AS a FROM ice.ns.orders GROUP BY k1";
         let shape = match classify_sql(original).expect("classify") {
-            IncrementalMvShape::Aggregate(s) => s,
+            IncrementalMvShape::Aggregate(s) => AggregateSqlCalls::from(&s),
             _ => panic!("expected aggregate shape"),
         };
         let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");

@@ -6,7 +6,6 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout;
-use crate::connector::starrocks::table::mv_shape::AggregateMvShape;
 use crate::engine::mv::iceberg_aggregate_state::merge_aggregate_state_chunks_for_change_stream;
 use crate::engine::record_batch_to_chunk;
 use crate::exec::chunk::Chunk;
@@ -27,7 +26,6 @@ pub struct AggregateStateMergePlan {
 pub struct AggregateStatePhysicalizePlan {
     pub(crate) input: Box<crate::exec::node::ExecNode>,
     pub(crate) layout: AggregateMvLayout,
-    pub(crate) shape: AggregateMvShape,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -406,7 +404,6 @@ impl OperatorFactory for AggregateStatePhysicalizeProcessorFactory {
         Box::new(AggregateStatePhysicalizeProcessor {
             name: self.name.clone(),
             layout: self.plan.layout.clone(),
-            shape: self.plan.shape.clone(),
             pending_output: None,
             finishing: false,
             finished: false,
@@ -417,7 +414,6 @@ impl OperatorFactory for AggregateStatePhysicalizeProcessorFactory {
 struct AggregateStatePhysicalizeProcessor {
     name: String,
     layout: AggregateMvLayout,
-    shape: AggregateMvShape,
     pending_output: Option<Chunk>,
     finishing: bool,
     finished: bool,
@@ -464,7 +460,6 @@ impl ProcessorOperator for AggregateStatePhysicalizeProcessor {
             crate::connector::starrocks::table::mv_agg_state::materialize_aggregate_state_chunk(
                 chunk,
                 &self.layout,
-                &self.shape,
             )?,
         );
         Ok(())
@@ -502,9 +497,7 @@ mod tests {
     use crate::connector::starrocks::table::mv_agg_state::{
         AggregateMvLayout, AggregateStateColumn, AggregateStateRole, AggregateVisibleColumn,
     };
-    use crate::connector::starrocks::table::mv_shape::{
-        AggregateFunctionKind, AggregateMvShape, IncrementalMvShape, classify_incremental_mv_query,
-    };
+    use crate::connector::starrocks::table::mv_shape::AggregateFunctionKind;
     use crate::connector::starrocks::table::state_codec::{encode_count_state, encode_sum_int64};
     use crate::engine::record_batch_to_chunk;
     use crate::exec::change_op::{CHANGE_OP_DELETE, CHANGE_OP_INSERT};
@@ -597,7 +590,6 @@ mod tests {
                                     }),
                                 }),
                                 layout: layout.clone(),
-                                shape: aggregate_shape_for_test(),
                             },
                         ),
                     }),
@@ -668,7 +660,6 @@ mod tests {
                                     }),
                                 }),
                                 layout: layout.clone(),
-                                shape: aggregate_sum_only_shape_for_test(),
                             },
                         ),
                     }),
@@ -1117,34 +1108,6 @@ mod tests {
             group_key_source_indexes: vec![0],
             physical_columns,
         }
-    }
-
-    fn aggregate_shape_for_test() -> AggregateMvShape {
-        aggregate_shape_for_sql(
-            "select region, count(*) as c, sum(amount) as s from ice.ns.orders group by region",
-        )
-    }
-
-    fn aggregate_sum_only_shape_for_test() -> AggregateMvShape {
-        aggregate_shape_for_sql(
-            "select region, sum(amount) as s from ice.ns.orders group by region",
-        )
-    }
-
-    fn aggregate_shape_for_sql(sql: &str) -> AggregateMvShape {
-        let dialect = sqlparser::dialect::GenericDialect {};
-        let statements = sqlparser::parser::Parser::parse_sql(&dialect, sql)
-            .expect("parse aggregate shape query");
-        let sqlparser::ast::Statement::Query(query) =
-            statements.into_iter().next().expect("one query")
-        else {
-            panic!("expected query");
-        };
-        let shape = classify_incremental_mv_query(&query).expect("classify aggregate shape");
-        let IncrementalMvShape::Aggregate(shape) = shape else {
-            panic!("expected aggregate shape");
-        };
-        shape
     }
 
     fn row_id_for_region(region: &str) -> String {

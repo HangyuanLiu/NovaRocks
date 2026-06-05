@@ -553,24 +553,29 @@ fn execute_aggregate_mv_full_refresh(
     // (one column per visible_output), not state-shaped types (which expand AVG into
     // two columns: SUM + COUNT). Running the analyzer is cheap — no execution occurs.
     let visible_analysis = analyze_visible_query(&ctx.state, &ctx.database, &ctx.select_sql)?;
-    let aggregate_input_types =
-        super::mv_agg_state::aggregate_input_types_from_resolved_query(shape, &visible_analysis)?;
+    let aggregate_input_types = super::mv_agg_state::aggregate_input_types_from_resolved_query(
+        &super::aggregate_sql_calls::AggregateSqlCalls::from(shape),
+        &visible_analysis,
+    )?;
     let visible_output_columns = visible_analysis.output_columns;
 
     // Step 2: build the layout from visible types.
     let layout = super::mv_agg_state::build_aggregate_mv_layout_with_input_types(
-        shape,
+        &super::aggregate_sql_calls::AggregateSqlCalls::from(shape),
         &visible_output_columns,
         &aggregate_input_types,
     )?;
 
     // Step 3: rewrite the SELECT to emit state columns (AVG → SUM + COUNT) and execute
     // it to obtain the actual state-shaped data.
-    let state_sql = super::mv_shape::rewrite_select_sql_for_state(&ctx.select_sql, shape)?;
+    let state_sql = super::mv_shape::rewrite_select_sql_for_state(
+        &ctx.select_sql,
+        &super::aggregate_sql_calls::AggregateSqlCalls::from(shape),
+    )?;
     let result = execute_query_for_mv_refresh(&ctx.state, &ctx.database, &state_sql)?;
 
     // Step 4: materialize state-shaped executor result using the visible-type layout.
-    super::mv_agg_state::materialize_aggregate_result_chunks(result, &layout, shape)
+    super::mv_agg_state::materialize_aggregate_result_chunks(result, &layout)
 }
 
 fn rewrite_full_refresh_select_with_pin(
@@ -711,11 +716,11 @@ fn refresh_aggregate_mv_incremental(
     // avoids this mismatch before materializing state chunks.
     let visible_analysis = analyze_visible_query(ctx.state, ctx.database, ctx.select_sql)?;
     let aggregate_input_types = super::mv_agg_state::aggregate_input_types_from_resolved_query(
-        ctx.shape,
+        &super::aggregate_sql_calls::AggregateSqlCalls::from(ctx.shape),
         &visible_analysis,
     )?;
     let layout = super::mv_agg_state::build_aggregate_mv_layout_with_input_types(
-        ctx.shape,
+        &super::aggregate_sql_calls::AggregateSqlCalls::from(ctx.shape),
         &visible_analysis.output_columns,
         &aggregate_input_types,
     )?;
@@ -724,7 +729,7 @@ fn refresh_aggregate_mv_incremental(
     // aggregate, so any error from the rewriter is now a real error.
     let signed_state_sql = super::ivm_delta_aggregate::rewrite_select_sql_for_signed_delta_state(
         ctx.select_sql,
-        ctx.shape,
+        &super::aggregate_sql_calls::AggregateSqlCalls::from(ctx.shape),
     )?;
     let delta_result = execute_delta_source_query(
         IvmDeltaSourceInput {
@@ -737,7 +742,7 @@ fn refresh_aggregate_mv_incremental(
         source_files,
     )?;
     let delta_chunks =
-        super::mv_agg_state::materialize_aggregate_result_chunks(delta_result, &layout, ctx.shape)?;
+        super::mv_agg_state::materialize_aggregate_result_chunks(delta_result, &layout)?;
 
     let plan = load_physical_insert_plan(
         ctx.state,
@@ -2038,7 +2043,7 @@ mod tests {
                 let layout =
                     super::super::mv_agg_state::build_aggregate_mv_layout(&shape, &output_columns)?;
                 let chunks = super::super::mv_agg_state::materialize_aggregate_result_chunks(
-                    result, &layout, &shape,
+                    result, &layout,
                 )?;
                 assert_eq!(chunks.len(), 1);
                 assert_eq!(chunks[0].batch.num_columns(), layout.physical_columns.len());

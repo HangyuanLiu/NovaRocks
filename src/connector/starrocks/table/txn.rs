@@ -2775,7 +2775,7 @@ mod mv_target_tests {
         };
         let chunks =
             crate::connector::starrocks::table::mv_agg_state::materialize_aggregate_result_chunks(
-                result, &layout, &shape,
+                result, &layout,
             )
             .expect("physical chunks");
         (layout, chunks)

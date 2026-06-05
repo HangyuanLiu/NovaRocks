@@ -12,4 +12,5 @@ pub(crate) mod rebind;
 pub(crate) mod refresh_context;
 pub(crate) mod refresh_contract;
 pub(crate) mod refresh_driver;
+pub(crate) mod refresh_property;
 pub(crate) mod schema_contract;

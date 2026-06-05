@@ -312,6 +312,7 @@ mod tests {
             input: Box::new(LogicalPlan::Scan(iceberg_scan(Some("uuid-b")))),
             is_root: false,
             action_column: Some(ColumnId::new_for_test(77)),
+            branch_scope: None,
         });
         let bind = BindIcebergScanRule;
         let RewriteResult::Changed(LogicalPlan::Scan(bound)) =

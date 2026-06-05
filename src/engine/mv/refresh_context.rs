@@ -266,53 +266,31 @@ impl IcebergMvRewriteContext {
         &self,
     ) -> Result<
         (
-            crate::connector::starrocks::table::mv_shape::AggregateMvShape,
+            crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls,
             crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
         ),
         String,
     > {
-        let shape = crate::connector::starrocks::table::mv_shape::classify_incremental_mv_query(
-            self.canonical_select_query.as_ref(),
-        )
-        .map_err(|e| format!("classify aggregate MV query for execution layout: {e}"))?;
-        let aggregate_shape = match shape {
-            crate::connector::starrocks::table::mv_shape::IncrementalMvShape::Aggregate(shape) => {
-                shape
-            }
-            crate::connector::starrocks::table::mv_shape::IncrementalMvShape::JoinAggregate(
-                shape,
-            ) => shape.as_aggregate_shape_for_layout(),
-            // B-family UNION ALL of aggregate branches: every branch shares the
-            // same output schema (UNION ALL requirement), so the aggregate-state
-            // physical layout is branch-independent and derived from the first
-            // branch's aggregate shape — exactly the shape the CREATE path used
-            // to build the target schema + contract.
-            crate::connector::starrocks::table::mv_shape::IncrementalMvShape::UnionAll(
-                union_shape,
-            ) if union_shape.branch_kind
-                == crate::connector::starrocks::table::mv_shape::UnionBranchKind::Aggregate =>
-            {
-                match union_shape.branches.first() {
-                    Some(
-                        crate::connector::starrocks::table::mv_shape::IncrementalMvShape::Aggregate(
-                            shape,
-                        ),
-                    ) => shape.clone(),
-                    _ => {
-                        return Err(
-                            "UNION ALL aggregate execution layout requires aggregate branches"
-                                .to_string(),
-                        );
-                    }
-                }
-            }
-            _ => {
-                return Err(
-                    "AggregateStateMerge execution layout requires an aggregate MV shape"
-                        .to_string(),
-                );
-            }
+        // Source the aggregate-call surface from the focused extractor (not the
+        // legacy union classifier), so a composed branch (`Agg(a JOIN b)` /
+        // `Agg(fan-in)`) is supported. For a branch UNION ALL, every branch shares
+        // the same output schema (the UNION ALL requirement) and — under the
+        // CREATE-time homogeneity gate — the same aggregate layout, so the
+        // aggregate-state physical layout is derived from the FIRST branch's
+        // aggregate calls, exactly the surface the CREATE path used to build the
+        // target schema + contract. For a single aggregate / join aggregate, the
+        // whole query is the aggregate.
+        let query = self.canonical_select_query.as_ref();
+        let aggregate_query = if is_union_all_query(query) {
+            first_union_branch_query(query)?
+        } else {
+            query.clone()
         };
+        let aggregate_calls =
+            crate::connector::starrocks::table::aggregate_sql_calls::extract_aggregate_sql_calls(
+                &aggregate_query,
+            )
+            .map_err(|e| format!("extract aggregate calls for execution layout: {e}"))?;
 
         let arrow_schema = iceberg::arrow::schema_to_arrow_schema(self.target_schema.as_ref())
             .map_err(|e| format!("convert target iceberg schema to arrow schema: {e}"))?;
@@ -340,25 +318,58 @@ impl IcebergMvRewriteContext {
         }
 
         let aggregate_input_types =
-            aggregate_input_types_from_schema_contract(&aggregate_shape, &self.schema_contract)?;
+            aggregate_input_types_from_schema_contract(&aggregate_calls, &self.schema_contract)?;
         let layout =
             crate::connector::starrocks::table::mv_agg_state::build_aggregate_mv_layout_with_input_types(
-            &aggregate_shape,
+            &aggregate_calls,
             &output_columns,
             &aggregate_input_types,
         )?;
-        Ok((aggregate_shape, layout))
+        Ok((aggregate_calls, layout))
     }
 }
 
+/// Whether `query`'s body is a UNION ALL set operation (possibly nested), used
+/// to decide whether to source aggregate calls from the first branch.
+fn is_union_all_query(query: &sqlparser::ast::Query) -> bool {
+    matches!(
+        query.body.as_ref(),
+        sqlparser::ast::SetExpr::SetOperation {
+            op: sqlparser::ast::SetOperator::Union,
+            set_quantifier: sqlparser::ast::SetQuantifier::All,
+            ..
+        }
+    )
+}
+
+/// The first UNION ALL branch as a standalone `Query` (keeps the branch's own
+/// FROM — a scan, a join, or a fan-in union). Works off the AST so a composed
+/// branch is not classified.
+fn first_union_branch_query(
+    query: &sqlparser::ast::Query,
+) -> Result<sqlparser::ast::Query, String> {
+    fn first_branch_body(
+        body: &sqlparser::ast::SetExpr,
+    ) -> Result<&sqlparser::ast::SetExpr, String> {
+        match body {
+            sqlparser::ast::SetExpr::SetOperation { left, .. } => first_branch_body(left),
+            sqlparser::ast::SetExpr::Query(inner) => first_branch_body(inner.body.as_ref()),
+            other => Ok(other),
+        }
+    }
+    let mut branch = query.clone();
+    branch.body = Box::new(first_branch_body(query.body.as_ref())?.clone());
+    Ok(branch)
+}
+
 fn aggregate_input_types_from_schema_contract(
-    shape: &crate::connector::starrocks::table::mv_shape::AggregateMvShape,
+    calls: &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls,
     contract: &MvSchemaContract,
 ) -> Result<Vec<Option<DataType>>, String> {
     use crate::connector::starrocks::table::mv_shape::{AggregateInput, VisibleAggregateOutput};
 
-    let mut input_types = vec![None; shape.aggregates.len()];
-    for (aggregate_index, aggregate) in shape.aggregates.iter().enumerate() {
+    let mut input_types = vec![None; calls.aggregates.len()];
+    for (aggregate_index, aggregate) in calls.aggregates.iter().enumerate() {
         if matches!(aggregate.input, AggregateInput::Star) {
             continue;
         }
@@ -367,7 +378,7 @@ fn aggregate_input_types_from_schema_contract(
             continue;
         }
 
-        let visible_index = shape
+        let visible_index = calls
             .visible_outputs
             .iter()
             .position(|output| {

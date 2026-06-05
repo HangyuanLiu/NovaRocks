@@ -1,0 +1,61 @@
+-- query 3
+region	c	s
+east	2	14
+east	2	300
+south	1	13
+south	1	70
+west	1	11
+west	1	50
+
+-- query 4
+region	c	s
+east	2	14
+east	2	300
+south	1	13
+south	1	70
+west	1	11
+west	1	50
+
+-- query 7
+region	c	s
+east	3	21
+east	3	390
+north	1	5
+north	1	60
+south	1	13
+south	1	70
+west	2	22
+west	2	130
+
+-- query 8
+region	c	s
+east	3	21
+east	3	390
+north	1	5
+north	1	60
+south	1	13
+south	1	70
+west	2	22
+west	2	130
+
+-- query 11
+region	c	s
+east	2	14
+east	2	290
+north	1	5
+north	1	60
+south	1	13
+south	1	70
+west	2	22
+west	2	130
+
+-- query 12
+region	c	s
+east	2	14
+east	2	290
+north	1	5
+north	1	60
+south	1	13
+south	1	70
+west	2	22
+west	2	130

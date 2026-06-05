@@ -716,6 +716,7 @@ mod tests {
                 input: Box::new(LogicalPlan::Scan(scan)),
                 is_root: false,
                 action_column: Some(action_id),
+                branch_scope: None,
             })),
             items: vec![
                 ProjectItem {
@@ -758,6 +759,7 @@ mod tests {
                 input: Box::new(LogicalPlan::Scan(scan)),
                 is_root: false,
                 action_column: None,
+                branch_scope: None,
             })),
             items: vec![ProjectItem {
                 expr: TypedExpr {
@@ -788,6 +790,7 @@ mod tests {
                 input: Box::new(LogicalPlan::Scan(scan)),
                 is_root: false,
                 action_column: Some(action_id),
+                branch_scope: None,
             })),
             items: vec![
                 ProjectItem {

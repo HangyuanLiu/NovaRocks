@@ -1,10 +1,10 @@
+use crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls;
 use crate::connector::starrocks::table::mv_agg_state::{
     AGG_RETRACTION_COUNT_STATE_COLUMN, aggregate_shape_needs_retraction_count_state,
     sanitize_state_column_name,
 };
 use crate::connector::starrocks::table::mv_shape::{
-    AggregateCallShape, AggregateFunctionKind, AggregateInput, AggregateMvShape,
-    VisibleAggregateOutput,
+    AggregateCallShape, AggregateFunctionKind, AggregateInput, VisibleAggregateOutput,
 };
 use crate::exec::change_op::CHANGE_OP_COLUMN;
 use sqlparser::ast::{
@@ -14,14 +14,14 @@ use sqlparser::ast::{
 
 pub(crate) fn rewrite_select_sql_for_signed_delta_state(
     select_sql: &str,
-    shape: &AggregateMvShape,
+    calls: &AggregateSqlCalls,
 ) -> Result<String, String> {
-    rewrite_select_sql_for_signed_delta_state_with_change_op_qualifier(select_sql, shape, None)
+    rewrite_select_sql_for_signed_delta_state_with_change_op_qualifier(select_sql, calls, None)
 }
 
 pub(crate) fn rewrite_select_sql_for_signed_delta_state_with_change_op_qualifier(
     select_sql: &str,
-    shape: &AggregateMvShape,
+    calls: &AggregateSqlCalls,
     change_op_qualifier: Option<&str>,
 ) -> Result<String, String> {
     let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(select_sql)
@@ -39,7 +39,7 @@ pub(crate) fn rewrite_select_sql_for_signed_delta_state_with_change_op_qualifier
     };
 
     let change_op = ChangeOpExpr::new(change_op_qualifier);
-    select.projection = signed_delta_projection(shape, &change_op)?;
+    select.projection = signed_delta_projection(calls, &change_op)?;
 
     Ok(stmt.to_string())
 }
@@ -66,14 +66,14 @@ impl ChangeOpExpr {
 }
 
 fn signed_delta_projection(
-    shape: &AggregateMvShape,
+    calls: &AggregateSqlCalls,
     change_op: &ChangeOpExpr,
 ) -> Result<Vec<SelectItem>, String> {
-    let mut projection = Vec::with_capacity(shape.visible_outputs.len() + shape.aggregates.len());
-    for output in &shape.visible_outputs {
+    let mut projection = Vec::with_capacity(calls.visible_outputs.len() + calls.aggregates.len());
+    for output in &calls.visible_outputs {
         match output {
             VisibleAggregateOutput::GroupKey(group_key_index) => {
-                let group_key = shape.group_keys.get(*group_key_index).ok_or_else(|| {
+                let group_key = calls.group_keys.get(*group_key_index).ok_or_else(|| {
                     format!(
                         "rewrite_select_sql_for_signed_delta_state: group key index {group_key_index} out of range"
                     )
@@ -84,7 +84,7 @@ fn signed_delta_projection(
                 });
             }
             VisibleAggregateOutput::Aggregate(aggregate_index) => {
-                let aggregate = shape.aggregates.get(*aggregate_index).ok_or_else(|| {
+                let aggregate = calls.aggregates.get(*aggregate_index).ok_or_else(|| {
                     format!(
                         "rewrite_select_sql_for_signed_delta_state: aggregate index {aggregate_index} out of range"
                     )
@@ -93,7 +93,7 @@ fn signed_delta_projection(
             }
         }
     }
-    if aggregate_shape_needs_retraction_count_state(shape) {
+    if aggregate_shape_needs_retraction_count_state(calls) {
         projection.push(make_aggregate_select_item(
             "SUM",
             change_op.expr(),
@@ -248,7 +248,8 @@ fn is_plain_identifier(alias: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::starrocks::table::mv_shape::{AggregateMvShape, IncrementalMvShape};
+    use crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls;
+    use crate::connector::starrocks::table::mv_shape::IncrementalMvShape;
 
     fn parse_query(sql: &str) -> sqlparser::ast::Query {
         let normalized =
@@ -260,7 +261,7 @@ mod tests {
         *query
     }
 
-    fn parse_aggregate_shape(sql: &str) -> AggregateMvShape {
+    fn parse_aggregate_shape(sql: &str) -> AggregateSqlCalls {
         let normalized =
             crate::sql::parser::dialect::normalize_for_raw_parse(sql).expect("normalize");
         let stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized).expect("parse");
@@ -270,7 +271,7 @@ mod tests {
         match crate::connector::starrocks::table::mv_shape::classify_incremental_mv_query(&query)
             .expect("classify")
         {
-            IncrementalMvShape::Aggregate(shape) => shape,
+            IncrementalMvShape::Aggregate(shape) => AggregateSqlCalls::from(&shape),
             _ => panic!("expected aggregate shape"),
         }
     }
@@ -294,7 +295,7 @@ mod tests {
 
         let rewritten = rewrite_select_sql_for_signed_delta_state_with_change_op_qualifier(
             sql,
-            &shape.as_aggregate_shape_for_layout(),
+            &AggregateSqlCalls::from(&shape.as_aggregate_shape_for_layout()),
             Some("f"),
         )
         .expect("rewrite");
