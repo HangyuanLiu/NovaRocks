@@ -50,9 +50,7 @@ use crate::engine::mv::lifecycle::{
 };
 use crate::engine::mv::rebind::rewrite_select_sql_for_rebind;
 use crate::engine::mv::refresh_context::IcebergMvRefreshContext;
-use crate::engine::mv::refresh_contract::{
-    ApplyKeyContract, ImvRefreshContract, RefreshStrategy, RewriteEvidence,
-};
+use crate::engine::mv::refresh_contract::{ApplyKeyContract, ImvRefreshContract, RewriteEvidence};
 use crate::engine::mv::refresh_driver::{
     BaseSnapshotPolicy, BaseSnapshotStatus, IcebergMvRefreshLifecycle, RefreshDecision,
     decide_refresh,
@@ -4582,76 +4580,6 @@ fn log_planned_iceberg_mv_affected_partitions(
         affected_partitions = ?affected_partitions,
         "planned iceberg MV affected partitions"
     );
-}
-
-fn stored_refresh_strategy_for_plan(
-    iceberg_target: &IcebergMvTarget,
-    mv_definition: &StoredMvDefinition,
-    shape: &IncrementalMvShape,
-) -> Result<RefreshStrategy, RefreshError> {
-    let schema_contract = mv_definition.schema_contract.as_ref().ok_or_else(|| {
-        RefreshError::user(format!(
-            "iceberg MV target {}.{}.{} is missing A11 schema contract; rebuild or recreate the MV",
-            iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
-        ))
-    })?;
-    let strategy = match (
-        schema_contract.join.is_some(),
-        schema_contract.aggregate.is_some(),
-        schema_contract.branch.is_some(),
-    ) {
-        (false, false, false) => RefreshStrategy::ProjectionFilter,
-        (true, false, false) => RefreshStrategy::JoinProjectionFilter,
-        (false, false, true) => RefreshStrategy::UnionProjectionFilter,
-        (false, true, false) => {
-            if schema_contract.bases.is_empty() {
-                RefreshStrategy::SingleAggregate
-            } else {
-                RefreshStrategy::FanInAggregate
-            }
-        }
-        (true, true, false) => RefreshStrategy::JoinAggregate,
-        (false, true, true) => RefreshStrategy::BranchUnionAggregate,
-        _ => {
-            return Err(RefreshError::user(format!(
-                "iceberg MV target {}.{}.{} has unsupported schema contract shape",
-                iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
-            )));
-        }
-    };
-    if !stored_strategy_matches_legacy_shape(strategy, shape) {
-        return Err(RefreshError::user(format!(
-            "iceberg MV target {}.{}.{} refresh contract strategy {strategy:?} did not match legacy shape {shape:?}",
-            iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
-        )));
-    }
-    Ok(strategy)
-}
-
-fn stored_strategy_matches_legacy_shape(
-    strategy: RefreshStrategy,
-    shape: &IncrementalMvShape,
-) -> bool {
-    match (strategy, shape) {
-        (RefreshStrategy::ProjectionFilter, IncrementalMvShape::ProjectionFilter(_)) => true,
-        (RefreshStrategy::JoinProjectionFilter, IncrementalMvShape::JoinProjectionFilter(_)) => {
-            true
-        }
-        (RefreshStrategy::UnionProjectionFilter, IncrementalMvShape::UnionAll(union_shape)) => {
-            union_shape.branch_kind == UnionBranchKind::ProjectionFilter
-        }
-        (RefreshStrategy::SingleAggregate, IncrementalMvShape::Aggregate(aggregate_shape)) => {
-            aggregate_shape.fan_in_bases.is_empty()
-        }
-        (RefreshStrategy::FanInAggregate, IncrementalMvShape::Aggregate(aggregate_shape)) => {
-            !aggregate_shape.fan_in_bases.is_empty()
-        }
-        (RefreshStrategy::JoinAggregate, IncrementalMvShape::JoinAggregate(_)) => true,
-        (RefreshStrategy::BranchUnionAggregate, IncrementalMvShape::UnionAll(union_shape)) => {
-            union_shape.branch_kind == UnionBranchKind::Aggregate
-        }
-        _ => false,
-    }
 }
 
 pub(crate) fn plan_iceberg_mv_refresh(
@@ -10628,176 +10556,6 @@ mod tests {
         );
     }
 
-    fn target_for_strategy_plan_test() -> IcebergMvTarget {
-        IcebergMvTarget {
-            catalog: "ice".to_string(),
-            namespace: "analytics".to_string(),
-            table: "mv_orders".to_string(),
-        }
-    }
-
-    fn minimal_base_contract(
-        table_fqn: &str,
-    ) -> crate::meta::repository::mv_contract::BaseContract {
-        crate::meta::repository::mv_contract::BaseContract {
-            table_fqn: table_fqn.to_string(),
-            table_uuid: format!("{table_fqn}-uuid"),
-            alias_at_create: None,
-            schema_id_at_create: 1,
-            schema_at_create: crate::meta::repository::mv_contract::BaseSchemaSnapshot {
-                fields: vec![crate::meta::repository::mv_contract::BaseFieldRecord {
-                    field_id: 1,
-                    name_at_create: "region".to_string(),
-                    type_signature: "string".to_string(),
-                    required: false,
-                }],
-            },
-        }
-    }
-
-    fn minimal_aggregate_schema_contract(
-        fan_in: bool,
-    ) -> crate::meta::repository::mv_contract::MvSchemaContract {
-        let base = minimal_base_contract("ice.sales.orders");
-        let bases = if fan_in {
-            vec![base.clone(), minimal_base_contract("ice.sales.returns")]
-        } else {
-            Vec::new()
-        };
-        crate::meta::repository::mv_contract::MvSchemaContract {
-            contract_version: 3,
-            base,
-            bases,
-            output: crate::meta::repository::mv_contract::OutputContract {
-                columns: Vec::new(),
-                filter: None,
-            },
-            join: None,
-            aggregate: Some(
-                crate::meta::repository::mv_contract::AggregateStateContract {
-                    state_layout_version: 1,
-                    row_id_column_name: ICEBERG_MV_GROUP_APPLY_KEY_COLUMN.to_string(),
-                    state_columns: Vec::new(),
-                },
-            ),
-            branch: None,
-            target: crate::meta::repository::mv_contract::TargetContract {
-                table_fqn: "ice.analytics.mv_orders".to_string(),
-                table_uuid: "target-uuid".to_string(),
-                schema_id_at_create: 1,
-                visible_columns: Vec::new(),
-                hidden_apply_key: crate::meta::repository::mv_contract::HiddenApplyKeyContract {
-                    column_name: ICEBERG_MV_GROUP_APPLY_KEY_COLUMN.to_string(),
-                    target_field_id: 100,
-                    source: crate::meta::repository::mv_contract::ApplyKeySource::GroupRowId,
-                },
-                partition: None,
-            },
-        }
-    }
-
-    fn stored_definition_with_contract(
-        schema_contract: crate::meta::repository::mv_contract::MvSchemaContract,
-    ) -> StoredMvDefinition {
-        StoredMvDefinition {
-            mv_id: 1,
-            select_sql: "SELECT region, count(*) AS c FROM ice.sales.orders GROUP BY region"
-                .to_string(),
-            base_table_refs: vec!["ice.sales.orders".to_string()],
-            primary_key_columns: Vec::new(),
-            storage_engine: StarRocksMvStorageEngine::Iceberg.as_sql_str().to_string(),
-            target_catalog: Some("ice".to_string()),
-            target_namespace: Some("analytics".to_string()),
-            target_table: Some("mv_orders".to_string()),
-            schema_contract: Some(schema_contract),
-            partition_spec: None,
-            last_refresh_ms: None,
-            last_refresh_rows: None,
-            last_refresh_snapshots: BTreeMap::new(),
-            last_refresh_table_uuids: BTreeMap::new(),
-            last_refreshed_iceberg_snapshot_id: None,
-            refresh_in_progress: false,
-            active_refresh_id: None,
-            refresh_target_snapshots: BTreeMap::new(),
-            refresh_policy: Default::default(),
-            refresh_paused: false,
-            refresh_interval_ms: None,
-            max_staleness_ms: None,
-            last_scheduler_error: None,
-            next_refresh_after_ms: None,
-            created_at_ms: 1,
-        }
-    }
-
-    fn classified_shape(sql: &str) -> IncrementalMvShape {
-        let query = parse_select_query(sql);
-        classify_incremental_mv_query(&query).expect("shape")
-    }
-
-    #[test]
-    fn stored_strategy_uses_schema_contract_for_single_vs_fan_in_aggregate() {
-        let target = target_for_strategy_plan_test();
-        let single_shape =
-            classified_shape("SELECT region, count(*) AS c FROM ice.sales.orders GROUP BY region");
-        let fan_in_shape = classified_shape(
-            "SELECT region, count(*) AS c
-             FROM (
-                 SELECT region FROM ice.sales.orders
-                 UNION ALL
-                 SELECT region FROM ice.sales.returns
-             ) u
-             GROUP BY region",
-        );
-
-        let single_definition =
-            stored_definition_with_contract(minimal_aggregate_schema_contract(false));
-        assert_eq!(
-            stored_refresh_strategy_for_plan(&target, &single_definition, &single_shape)
-                .expect("single aggregate strategy"),
-            RefreshStrategy::SingleAggregate
-        );
-
-        let fan_in_definition =
-            stored_definition_with_contract(minimal_aggregate_schema_contract(true));
-        assert_eq!(
-            stored_refresh_strategy_for_plan(&target, &fan_in_definition, &fan_in_shape)
-                .expect("fan-in aggregate strategy"),
-            RefreshStrategy::FanInAggregate
-        );
-    }
-
-    #[test]
-    fn stored_strategy_rejects_aggregate_contract_legacy_shape_mismatch() {
-        let target = target_for_strategy_plan_test();
-        let single_shape =
-            classified_shape("SELECT region, count(*) AS c FROM ice.sales.orders GROUP BY region");
-        let fan_in_shape = classified_shape(
-            "SELECT region, count(*) AS c
-             FROM (
-                 SELECT region FROM ice.sales.orders
-                 UNION ALL
-                 SELECT region FROM ice.sales.returns
-             ) u
-             GROUP BY region",
-        );
-
-        let single_definition =
-            stored_definition_with_contract(minimal_aggregate_schema_contract(false));
-        let err = stored_refresh_strategy_for_plan(&target, &single_definition, &fan_in_shape)
-            .expect_err("single contract must reject fan-in legacy shape");
-        let err = err.to_string();
-        assert!(err.contains("SingleAggregate"), "err={err}");
-        assert!(err.contains("legacy shape"), "err={err}");
-
-        let fan_in_definition =
-            stored_definition_with_contract(minimal_aggregate_schema_contract(true));
-        let err = stored_refresh_strategy_for_plan(&target, &fan_in_definition, &single_shape)
-            .expect_err("fan-in contract must reject single legacy shape");
-        let err = err.to_string();
-        assert!(err.contains("FanInAggregate"), "err={err}");
-        assert!(err.contains("legacy shape"), "err={err}");
-    }
-
     #[test]
     fn refresh_status_uses_base_ref_fqn() {
         let base_ref = IcebergTableRef {
@@ -10838,10 +10596,26 @@ mod tests {
             analyze_mv_select(&env.state, Some("ice_fan_in"), "sales", &query).expect("analyze");
         let contract = crate::engine::mv::refresh_contract::derive_imv_refresh_contract(&analysis)
             .expect("derive");
-        assert_eq!(
-            contract.strategy,
-            crate::engine::mv::refresh_contract::RefreshStrategy::FanInAggregate
+        // FanInAggregate: aggregate over a UNION ALL of simple scans.
+        // Contract fields: aggregate present, branch present (the fan-in union),
+        // no join, apply key is aggregate_group_row (Utf8, group-row-id column).
+        assert!(
+            contract.aggregate.is_some(),
+            "fan-in aggregate must have aggregate contract"
         );
+        assert!(
+            contract.branch.is_some(),
+            "fan-in aggregate must have branch contract"
+        );
+        assert!(
+            contract.join.is_none(),
+            "fan-in aggregate must not have join contract"
+        );
+        assert_eq!(
+            contract.apply_key,
+            crate::engine::mv::refresh_contract::ApplyKeyContract::aggregate_group_row(),
+        );
+        assert_eq!(contract.base_refs.len(), 2);
     }
 
     #[test]

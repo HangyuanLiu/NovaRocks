@@ -1,17 +1,6 @@
 use crate::connector::starrocks::table::model::IcebergTableRef;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RefreshStrategy {
-    ProjectionFilter,
-    JoinProjectionFilter,
-    UnionProjectionFilter,
-    SingleAggregate,
-    FanInAggregate,
-    JoinAggregate,
-    BranchUnionAggregate,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RewriteEvidence {
     None,
     Aggregate,
@@ -91,7 +80,6 @@ impl ApplyKeyContract {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ImvRefreshContract {
-    pub(crate) strategy: RefreshStrategy,
     pub(crate) base_refs: Vec<IcebergTableRef>,
     pub(crate) apply_key: ApplyKeyContract,
     pub(crate) aggregate: Option<AggregateRefreshContract>,
@@ -275,7 +263,6 @@ mod tests {
 
         let contract = derive_imv_refresh_contract(&analysis).expect("derive contract");
 
-        assert_eq!(contract.strategy, RefreshStrategy::ProjectionFilter);
         assert_eq!(base_refs(&contract), vec!["ice.sales.fact_east"]);
         assert_eq!(contract.apply_key, ApplyKeyContract::projection_filter());
         assert_eq!(contract.aggregate, None);
@@ -294,7 +281,6 @@ mod tests {
 
         let contract = derive_imv_refresh_contract(&analysis).expect("derive contract");
 
-        assert_eq!(contract.strategy, RefreshStrategy::UnionProjectionFilter);
         assert_eq!(
             base_refs(&contract),
             vec!["ice.sales.fact_east", "ice.sales.fact_west"]
@@ -411,7 +397,6 @@ mod tests {
 
         let contract = derive_imv_refresh_contract(&analysis).expect("derive contract");
 
-        assert_eq!(contract.strategy, RefreshStrategy::SingleAggregate);
         assert_eq!(base_refs(&contract), vec!["ice.sales.fact"]);
         assert_eq!(contract.apply_key, ApplyKeyContract::aggregate_group_row());
         assert_eq!(
@@ -436,7 +421,6 @@ mod tests {
 
         let contract = derive_imv_refresh_contract(&analysis).expect("derive contract");
 
-        assert_eq!(contract.strategy, RefreshStrategy::JoinAggregate);
         assert_eq!(
             contract.apply_key,
             ApplyKeyContract::join_aggregate_group_row()
@@ -486,7 +470,6 @@ mod tests {
 
         let contract = derive_imv_refresh_contract(&analysis).expect("derive contract");
 
-        assert_eq!(contract.strategy, RefreshStrategy::FanInAggregate);
         assert_eq!(
             base_refs(&contract),
             vec!["ice.sales.fact_east", "ice.sales.fact_west"]
@@ -543,7 +526,6 @@ mod tests {
 
         let contract = derive_imv_refresh_contract(&analysis).expect("derive contract");
 
-        assert_eq!(contract.strategy, RefreshStrategy::BranchUnionAggregate);
         assert_eq!(contract.base_refs.len(), 2);
         assert_eq!(contract.branch.expect("branch contract").branch_count, 2);
         assert_eq!(
@@ -582,7 +564,6 @@ mod tests {
 
         let contract = derive_imv_refresh_contract(&analysis).expect("derive contract");
 
-        assert_eq!(contract.strategy, RefreshStrategy::JoinProjectionFilter);
         assert_eq!(
             contract.apply_key.column_name,
             crate::engine::mv::iceberg_target_apply::ICEBERG_MV_JOIN_APPLY_KEY_COLUMN
@@ -1258,7 +1239,6 @@ mod tests {
         let contract = derive_imv_refresh_contract(&analysis)
             .expect("branch union of join aggregates is now supported");
 
-        assert_eq!(contract.strategy, RefreshStrategy::BranchUnionAggregate);
         assert_eq!(contract.branch.expect("branch contract").branch_count, 2);
         assert_eq!(
             contract.apply_key.value_type,
@@ -1293,7 +1273,6 @@ mod tests {
         let contract = derive_imv_refresh_contract(&analysis)
             .expect("branch union of fan-in aggregates is now supported");
 
-        assert_eq!(contract.strategy, RefreshStrategy::BranchUnionAggregate);
         assert_eq!(contract.branch.expect("branch contract").branch_count, 2);
         assert_eq!(
             contract.apply_key.value_type,

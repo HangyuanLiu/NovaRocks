@@ -32,7 +32,7 @@ use crate::connector::starrocks::table::model::IcebergTableRef;
 use crate::engine::mv::iceberg_merge_sink::ApplyKeyValueType;
 use crate::engine::mv::refresh_contract::{
     AggregateRefreshContract, ApplyKeyContract, BranchRefreshContract, ImvRefreshContract,
-    JoinRefreshContract, RefreshStrategy,
+    JoinRefreshContract,
 };
 use crate::engine::mv::refresh_driver::BaseSnapshotPolicy;
 use crate::meta::repository::mv_contract::{ApplyKeySource, MvSchemaContract};
@@ -407,7 +407,6 @@ impl RefreshFragmentProperty {
         match (&identity, &state) {
             // Projection / filter over a single scan.
             (TargetIdentity::BaseRowId, StateContract::Stateless) => Ok(ImvRefreshContract {
-                strategy: RefreshStrategy::ProjectionFilter,
                 base_refs,
                 apply_key: ApplyKeyContract::projection_filter(),
                 aggregate: None,
@@ -420,7 +419,6 @@ impl RefreshFragmentProperty {
                     "Iceberg IMV refresh contract internal error: join identity without a join key count".to_string()
                 })?;
                 Ok(ImvRefreshContract {
-                    strategy: RefreshStrategy::JoinProjectionFilter,
                     base_refs,
                     apply_key: ApplyKeyContract::join_projection_filter(),
                     aggregate: None,
@@ -452,7 +450,6 @@ impl RefreshFragmentProperty {
                     "Iceberg IMV refresh contract internal error: branch-scoped identity without a branch count".to_string()
                 })?;
                 Ok(ImvRefreshContract {
-                    strategy: RefreshStrategy::UnionProjectionFilter,
                     base_refs,
                     apply_key: ApplyKeyContract::union_projection_filter(),
                     aggregate: None,
@@ -488,7 +485,6 @@ impl RefreshFragmentProperty {
                             );
                         }
                         Ok(ImvRefreshContract {
-                            strategy: RefreshStrategy::FanInAggregate,
                             base_refs,
                             apply_key: ApplyKeyContract::aggregate_group_row(),
                             aggregate: Some(aggregate),
@@ -498,7 +494,6 @@ impl RefreshFragmentProperty {
                     }
                     // Aggregate directly over a two-table inner equi-join.
                     (None, Some(join_key_count)) => Ok(ImvRefreshContract {
-                        strategy: RefreshStrategy::JoinAggregate,
                         base_refs,
                         apply_key: ApplyKeyContract::join_aggregate_group_row(),
                         aggregate: Some(aggregate),
@@ -507,7 +502,6 @@ impl RefreshFragmentProperty {
                     }),
                     // Aggregate directly over a single scan.
                     (None, None) => Ok(ImvRefreshContract {
-                        strategy: RefreshStrategy::SingleAggregate,
                         base_refs,
                         apply_key: ApplyKeyContract::aggregate_group_row(),
                         aggregate: Some(aggregate),
@@ -559,7 +553,6 @@ impl RefreshFragmentProperty {
                     unreachable!("aggregate state matched above");
                 };
                 Ok(ImvRefreshContract {
-                    strategy: RefreshStrategy::BranchUnionAggregate,
                     base_refs,
                     apply_key: ApplyKeyContract::branch_union_aggregate_group_row(),
                     aggregate: Some(AggregateRefreshContract {
