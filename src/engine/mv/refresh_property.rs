@@ -136,6 +136,19 @@ pub(crate) struct RefreshCapabilities {
     pub(crate) apply_key_value_type: ApplyKeyValueType,
 }
 
+impl RefreshCapabilities {
+    /// Derive `RefreshCapabilities` from a persisted `MvSchemaContract`.
+    ///
+    /// Thin associated-function alias for the module-level
+    /// [`from_schema_contract`]; this is the entry point the refresh driver
+    /// dispatches on (Phase 3 / B2+).
+    pub(crate) fn from_schema_contract(
+        c: &MvSchemaContract,
+    ) -> Result<RefreshCapabilities, String> {
+        from_schema_contract(c)
+    }
+}
+
 /// Derive `RefreshCapabilities` from a persisted `MvSchemaContract`.
 ///
 /// Returns `Err(String)` for contract shapes that do not correspond to any
