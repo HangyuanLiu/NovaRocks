@@ -38,6 +38,28 @@ pub(crate) trait DeriveRequired {
     ) -> Vec<PhysicalPropertySet>;
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub(crate) enum PropertyAlternativeKind {
+    Default,
+    BroadcastJoin,
+    ShuffleJoin,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub(crate) struct ChildRequirementAlternative {
+    pub kind: PropertyAlternativeKind,
+    pub child_props: Vec<PhysicalPropertySet>,
+}
+
+impl ChildRequirementAlternative {
+    pub(crate) fn default(child_props: Vec<PhysicalPropertySet>) -> Self {
+        Self {
+            kind: PropertyAlternativeKind::Default,
+            child_props,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Dispatchers
 // ---------------------------------------------------------------------------
@@ -81,6 +103,19 @@ pub(crate) fn derive_output(
     }
 }
 
+pub(crate) fn derive_output_for_alternative(
+    op: &Operator,
+    children_outputs: &[&PhysicalPropertySet],
+    alt_kind: &PropertyAlternativeKind,
+) -> PhysicalPropertySet {
+    match op {
+        Operator::PhysicalHashJoin(o) => {
+            o.derive_output_for_alternative(children_outputs, alt_kind)
+        }
+        _ => derive_output(op, children_outputs),
+    }
+}
+
 /// Dispatch `derive_required` based on the operator's concrete variant.
 pub(crate) fn derive_required(
     op: &Operator,
@@ -120,6 +155,23 @@ pub(crate) fn derive_required(
             );
             unreachable!("derive_required called on logical operator: {op:?}");
         }
+    }
+}
+
+pub(crate) fn derive_required_alternatives(
+    op: &Operator,
+    parent_required: &PhysicalPropertySet,
+    num_children: usize,
+) -> Vec<ChildRequirementAlternative> {
+    match op {
+        Operator::PhysicalHashJoin(o) => {
+            o.derive_required_alternatives(parent_required, num_children)
+        }
+        _ => vec![ChildRequirementAlternative::default(derive_required(
+            op,
+            parent_required,
+            num_children,
+        ))],
     }
 }
 
@@ -189,6 +241,22 @@ mod tests {
         let provided = PhysicalPropertySet::gather();
         let enforcers = needed_enforcers(&required, &provided);
         assert!(enforcers.is_empty());
+    }
+
+    #[test]
+    fn default_required_alternative_wraps_legacy_deriver() {
+        let op = Operator::PhysicalLimit(PhysicalLimitOp {
+            limit: Some(10),
+            offset: None,
+        });
+        let parent = PhysicalPropertySet::gather();
+
+        let legacy = derive_required(&op, &parent, 1);
+        let alternatives = derive_required_alternatives(&op, &parent, 1);
+
+        assert_eq!(alternatives.len(), 1);
+        assert_eq!(alternatives[0].kind, PropertyAlternativeKind::Default);
+        assert_eq!(alternatives[0].child_props, legacy);
     }
 
     #[test]

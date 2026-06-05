@@ -12,7 +12,7 @@
 --   (broadcast build), converting LEFT OUTER -> RIGHT OUTER.
 --   date_dim (10k rows) fits under the broadcast threshold; lineorder (1M) does not.
 -- Without JoinCommutativity: CBO cannot swap, lineorder RIGHT (1M rows) exceeds
---   the broadcast limit, so it falls back to a SHUFFLE LEFT OUTER join.
+--   the broadcast limit, so it falls back to a PARTITIONED LEFT OUTER join.
 DROP TABLE IF EXISTS ${case_db}.lineorder;
 DROP TABLE IF EXISTS ${case_db}.date_dim;
 CREATE TABLE ${case_db}.lineorder (lo_orderkey INT, lo_datekey INT, lo_revenue INT);
@@ -31,7 +31,7 @@ LEFT JOIN ${case_db}.lineorder lo ON d.d_datekey = lo.lo_datekey;
 SET disable_optimizer_rules = 'JoinCommutativity';
 
 -- Without commutativity: cannot swap, lineorder on RIGHT exceeds broadcast limit.
--- Expected: SHUFFLE join, date_dim stays LEFT, join remains LEFT OUTER.
+-- Expected: PARTITIONED join, date_dim stays LEFT, join remains LEFT OUTER.
 EXPLAIN VERBOSE
 SELECT lo.lo_orderkey, d.d_year
 FROM ${case_db}.date_dim d

@@ -3349,6 +3349,40 @@ mod tests {
     }
 
     #[test]
+    fn order_by_computed_select_alias_reuses_project_output_column_id() {
+        let plan =
+            parse_analyze_and_plan("SELECT o_orderkey * 2 AS revenue FROM orders ORDER BY revenue")
+                .expect("planner should succeed");
+
+        let sort = match &plan {
+            LogicalPlan::Sort(s) => s,
+            other => panic!("expected Sort root, got {other:?}"),
+        };
+        let project = match sort.input.as_ref() {
+            LogicalPlan::Project(p) => p,
+            other => panic!("expected Project under Sort, got {other:?}"),
+        };
+        let project_output_id = project.items[0].output_column_id;
+        let ExprKind::ColumnRef {
+            column_id: sort_key_id,
+            ..
+        } = sort.items[0].expr.kind
+        else {
+            panic!("sort key should be a ColumnRef to the select alias");
+        };
+
+        assert_ne!(
+            project_output_id,
+            ColumnId::UNSET,
+            "computed select alias must have a real output ColumnId"
+        );
+        assert_eq!(
+            sort_key_id, project_output_id,
+            "ORDER BY select alias must point at the Project output ColumnId"
+        );
+    }
+
+    #[test]
     fn qualified_order_by_selected_column_does_not_create_sort_extra() {
         let plan = parse_analyze_and_plan(
             "SELECT s.o_orderkey FROM (SELECT o_orderkey FROM orders) s ORDER BY s.o_orderkey",

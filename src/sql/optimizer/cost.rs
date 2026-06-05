@@ -6,6 +6,8 @@
 
 use super::memo::Cost;
 use super::operator::{AggMode, JoinDistribution, Operator};
+use super::property::PhysicalPropertySet;
+use crate::sql::optimizer::derive::PropertyAlternativeKind;
 use crate::sql::optimizer::statistics::Statistics;
 
 /// Network transfer multiplier applied to data that crosses node boundaries.
@@ -77,6 +79,9 @@ pub(crate) fn compute_cost(
                 JoinDistribution::Shuffle => (build_size + probe_size) * NETWORK_COST + probe_size,
                 JoinDistribution::Broadcast => build_size * NETWORK_COST + probe_size,
                 JoinDistribution::Colocate => probe_size,
+                JoinDistribution::Unknown => {
+                    panic!("unknown join distribution should be resolved before costing")
+                }
             };
 
             // Apply cross join penalty (StarRocks: getCrossJoinCostPenalty = 10).
@@ -169,11 +174,112 @@ pub(crate) fn compute_cost(
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct CostOptions {
+    pub backend_factor: f64,
+    pub broadcast_row_limit: f64,
+    pub broadcast_byte_limit: f64,
+    pub broadcast_right_table_scale_factor: f64,
+    pub fallback_broadcast_row_limit: f64,
+    pub network_cost: f64,
+    pub memory_cost_weight: f64,
+}
+
+impl Default for CostOptions {
+    fn default() -> Self {
+        Self {
+            backend_factor: 3.0,
+            broadcast_row_limit: 15_000_000.0,
+            broadcast_byte_limit: 512.0 * 1024.0 * 1024.0,
+            broadcast_right_table_scale_factor: 10.0,
+            fallback_broadcast_row_limit: 500_000.0,
+            network_cost: NETWORK_COST,
+            memory_cost_weight: 0.25,
+        }
+    }
+}
+
+pub(crate) fn broadcast_gate_passes(
+    probe_stats: &Statistics,
+    build_stats: &Statistics,
+    options: &CostOptions,
+) -> bool {
+    let build_rows = build_stats.output_row_count;
+    let build_bytes = build_stats.compute_size();
+    let probe_bytes = probe_stats.compute_size();
+
+    if build_bytes > options.broadcast_byte_limit {
+        return false;
+    }
+
+    if build_stats.row_count_confidence != crate::sql::optimizer::statistics::Confidence::Exact
+        && build_rows > options.fallback_broadcast_row_limit
+    {
+        return false;
+    }
+
+    let build_is_obviously_tiny = probe_bytes
+        >= build_bytes * options.backend_factor * options.broadcast_right_table_scale_factor;
+    if build_rows > options.broadcast_row_limit && !build_is_obviously_tiny {
+        return false;
+    }
+
+    true
+}
+
+pub(crate) fn compute_cost_with_properties(
+    op: &Operator,
+    own_stats: &Statistics,
+    child_stats: &[&Statistics],
+    _child_outputs: &[&PhysicalPropertySet],
+    alt_kind: &PropertyAlternativeKind,
+    options: &CostOptions,
+) -> Cost {
+    match op {
+        Operator::PhysicalHashJoin(j) => {
+            let probe_stats = child_stats.first().copied();
+            let build_stats = child_stats.get(1).copied();
+            let probe_size = probe_stats.map(|s| s.compute_size()).unwrap_or(0.0);
+            let build_size = build_stats.map(|s| s.compute_size()).unwrap_or(0.0);
+
+            let base_cost = match alt_kind {
+                PropertyAlternativeKind::BroadcastJoin => {
+                    // The distribution enforcer cost models making the build
+                    // child available to the join. The join self-cost still
+                    // charges backend fanout and memory pressure during hash
+                    // table materialization/probing.
+                    probe_size
+                        + build_size * options.network_cost * options.backend_factor
+                        + build_size * options.memory_cost_weight * options.backend_factor
+                }
+                PropertyAlternativeKind::ShuffleJoin => {
+                    probe_size + build_size / options.backend_factor.max(1.0)
+                }
+                PropertyAlternativeKind::Default => compute_cost(op, own_stats, child_stats),
+            };
+
+            let cost_after_cross = if j.join_type == crate::sql::analysis::JoinKind::Cross {
+                base_cost * CROSS_JOIN_COST_PENALTY
+            } else {
+                base_cost
+            };
+            if j.other_condition.is_some() {
+                cost_after_cross * NON_EQUI_JOIN_COST_PENALTY
+            } else {
+                cost_after_cross
+            }
+        }
+        _ => compute_cost(op, own_stats, child_stats),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sql::analysis::JoinKind;
+    use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::*;
+    use crate::sql::optimizer::property::{DistributionSpec, OrderingSpec};
     use crate::sql::optimizer::statistics::ColumnStatistic;
     use std::collections::HashMap;
 
@@ -243,6 +349,94 @@ mod tests {
         let c_shuffle = compute_cost(&shuffle, &own, &cs);
         let c_colocate = compute_cost(&colocate, &own, &cs);
         assert!(c_shuffle > c_colocate);
+    }
+
+    #[test]
+    fn child_output_aware_shuffle_join_does_not_charge_network_exchange_twice() {
+        let probe = stats(100_000.0, 100.0);
+        let build = stats(10_000.0, 100.0);
+        let own = stats(100_000.0, 200.0);
+        let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![],
+            other_condition: None,
+            distribution: JoinDistribution::Unknown,
+        });
+        let child_stats = [&probe, &build];
+        let left_output = PhysicalPropertySet {
+            distribution: DistributionSpec::shuffle_join([ColumnId(1)]),
+            ordering: OrderingSpec::Any,
+        };
+        let right_output = PhysicalPropertySet {
+            distribution: DistributionSpec::shuffle_join([ColumnId(2)]),
+            ordering: OrderingSpec::Any,
+        };
+        let child_outputs = [&left_output, &right_output];
+
+        let cost = compute_cost_with_properties(
+            &op,
+            &own,
+            &child_stats,
+            &child_outputs,
+            &PropertyAlternativeKind::ShuffleJoin,
+            &CostOptions::default(),
+        );
+
+        let probe_size = probe.compute_size();
+        let build_size = build.compute_size();
+        assert!(cost < (probe_size + build_size) * NETWORK_COST + probe_size);
+        assert!(cost >= probe_size);
+    }
+
+    #[test]
+    fn broadcast_gate_rejects_fallback_build_above_fallback_limit() {
+        let mut build = stats(600_000.0, 100.0);
+        build.row_count_confidence = crate::sql::optimizer::statistics::Confidence::Fallback;
+        let probe = stats(700_000.0, 100.0);
+        let options = CostOptions::default();
+
+        assert!(!broadcast_gate_passes(&probe, &build, &options));
+    }
+
+    #[test]
+    fn broadcast_gate_rejects_estimated_build_above_fallback_limit() {
+        let mut build = stats(648_000.0, 100.0);
+        build.row_count_confidence = crate::sql::optimizer::statistics::Confidence::Estimated;
+        let probe = stats(3_543_657.0, 100.0);
+        let options = CostOptions::default();
+
+        assert!(!broadcast_gate_passes(&probe, &build, &options));
+    }
+
+    #[test]
+    fn broadcast_join_alternative_charges_fanout_and_memory_pressure() {
+        let probe = stats(100_000.0, 100.0);
+        let build = stats(10_000.0, 100.0);
+        let own = stats(100_000.0, 200.0);
+        let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![],
+            other_condition: None,
+            distribution: JoinDistribution::Unknown,
+        });
+        let child_stats = [&probe, &build];
+        let child_outputs = [PhysicalPropertySet::any(), PhysicalPropertySet::broadcast()];
+        let child_output_refs = [&child_outputs[0], &child_outputs[1]];
+        let options = CostOptions::default();
+
+        let cost = compute_cost_with_properties(
+            &op,
+            &own,
+            &child_stats,
+            &child_output_refs,
+            &PropertyAlternativeKind::BroadcastJoin,
+            &options,
+        );
+
+        let expected = probe.compute_size()
+            + build.compute_size() * options.network_cost * options.backend_factor
+            + build.compute_size() * options.memory_cost_weight * options.backend_factor;
+        assert!((cost - expected).abs() < f64::EPSILON);
     }
 
     #[test]

@@ -122,6 +122,16 @@ impl ExprScope {
         self.by_id.get(&column_id)
     }
 
+    pub fn has_id_bindings(&self) -> bool {
+        !self.by_id.is_empty()
+    }
+
+    pub fn binding_has_id_index(&self, binding: &ColumnBinding) -> bool {
+        self.by_id.values().any(|indexed| {
+            indexed.tuple_id == binding.tuple_id && indexed.slot_id == binding.slot_id
+        })
+    }
+
     pub fn resolve_column(
         &self,
         qualifier: Option<&str>,

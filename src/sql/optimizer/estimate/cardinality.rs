@@ -166,7 +166,7 @@ fn inner_rows(
             confidence_inputs.push(confidence);
             let (denominator, invalid_ndv) = ndv_denominator(left_ndv, right_ndv);
             used_default_or_invalid |= invalid_ndv;
-            let selectivity = if confidence == Confidence::Fallback {
+            let selectivity = if confidence != Confidence::Exact {
                 fallback_key_count += 1;
                 if fallback_key_count > 1 {
                     PREDICATE_UNKNOWN_FILTER
@@ -177,6 +177,14 @@ fn inner_rows(
                 1.0 / denominator
             };
             selectivities.push(selectivity);
+        }
+        if fallback_key_count > 0 {
+            return inner_rows_with_inexact_key_statistics(
+                left_rows,
+                right_rows,
+                input,
+                confidence_inputs,
+            );
         }
         return inner_rows_with_key_selectivity(
             left_rows,
@@ -196,6 +204,26 @@ fn inner_rows(
         key_selectivity,
         false,
     )
+}
+
+fn inner_rows_with_inexact_key_statistics(
+    left_rows: f64,
+    right_rows: f64,
+    input: &JoinCardInput,
+    confidence_inputs: &mut Vec<Confidence>,
+) -> (f64, bool, bool) {
+    let max_rows = left_rows.max(right_rows);
+    let min_rows = left_rows.min(right_rows).max(1.0);
+    let scale_factor = max_rows / min_rows;
+    let base_rows = if scale_factor >= 10_000_000.0 {
+        let key_count = input.eq_key_ndvs.len().max(1) as i32;
+        max_rows * PREDICATE_UNKNOWN_FILTER.powi(key_count)
+    } else {
+        max_rows
+    };
+    let non_equi = non_equi_selectivity(input, confidence_inputs);
+    let (rows, saturated) = sat_mul(base_rows, non_equi.0);
+    (rows.max(1.0), saturated, true)
 }
 
 fn inner_rows_with_key_selectivity(
@@ -317,13 +345,23 @@ mod tests {
     use crate::sql::optimizer::statistics::Confidence;
 
     fn inp(kind: JoinKind, l: f64, r: f64, keys: Vec<(f64, f64)>) -> JoinCardInput {
+        inp_with_key_conf(kind, l, r, keys, Confidence::Exact)
+    }
+
+    fn inp_with_key_conf(
+        kind: JoinKind,
+        l: f64,
+        r: f64,
+        keys: Vec<(f64, f64)>,
+        key_confidence: Confidence,
+    ) -> JoinCardInput {
         JoinCardInput {
             left: (l, Confidence::Estimated),
             right: (r, Confidence::Estimated),
             kind,
             eq_key_ndvs: keys
                 .into_iter()
-                .map(|(a, b)| (a, b, Confidence::Estimated))
+                .map(|(a, b)| (a, b, key_confidence))
                 .collect(),
             non_equi_selectivity: None,
         }
@@ -381,7 +419,37 @@ mod tests {
         };
         let (rows, conf) = estimate_join_cardinality(&input);
         assert_eq!(conf, Confidence::Fallback);
-        assert!((rows - 82_012_500.0).abs() < 1.0, "got {rows}");
+        assert!((rows - 81_000.0).abs() < 1.0, "got {rows}");
+    }
+
+    #[test]
+    fn fallback_inner_key_keeps_fact_side_scale() {
+        let input = JoinCardInput {
+            left: (4_861_000.0, Confidence::Estimated),
+            right: (8_100.0, Confidence::Estimated),
+            kind: JoinKind::Inner,
+            eq_key_ndvs: vec![(10_000.0, 10_000.0, Confidence::Fallback)],
+            non_equi_selectivity: None,
+        };
+
+        let (rows, conf) = estimate_join_cardinality(&input);
+
+        assert_eq!(conf, Confidence::Fallback);
+        assert!((rows - 4_861_000.0).abs() < 1.0, "got {rows}");
+    }
+
+    #[test]
+    fn estimated_inner_key_keeps_fact_side_scale() {
+        let (rows, conf) = estimate_join_cardinality(&inp_with_key_conf(
+            JoinKind::Inner,
+            4_861_000.0,
+            8_100.0,
+            vec![(10_000.0, 10_000.0)],
+            Confidence::Estimated,
+        ));
+
+        assert_eq!(conf, Confidence::Fallback);
+        assert!((rows - 4_861_000.0).abs() < 1.0, "got {rows}");
     }
 
     #[test]

@@ -303,30 +303,67 @@ fn remap_rf_expr_order(
         .position(|&origin| origin == pre_demote_expr_order)
 }
 
-/// Map a join `JoinDistribution` to the thrift RF
-/// `(build_join_mode, local_layout, global_layout)` triple. Copied verbatim
-/// from the v1 post-pass so the wire encoding is identical.
-fn rf_layout_for_distribution(
+fn join_distribution_mode(
+    node: &PhysicalPlanNode,
+    fallback: &crate::sql::optimizer::operator::JoinDistribution,
+) -> plan_nodes::TJoinDistributionMode {
+    use crate::sql::optimizer::operator::JoinDistribution;
+    use crate::sql::optimizer::physical_plan::JoinExecutionDistribution;
+
+    match node.execution_props.join_distribution {
+        Some(JoinExecutionDistribution::Broadcast) => plan_nodes::TJoinDistributionMode::BROADCAST,
+        Some(JoinExecutionDistribution::Partitioned) => {
+            plan_nodes::TJoinDistributionMode::PARTITIONED
+        }
+        Some(JoinExecutionDistribution::Colocate) => plan_nodes::TJoinDistributionMode::COLOCATE,
+        None => match fallback {
+            JoinDistribution::Broadcast => plan_nodes::TJoinDistributionMode::BROADCAST,
+            JoinDistribution::Shuffle => plan_nodes::TJoinDistributionMode::PARTITIONED,
+            JoinDistribution::Colocate => plan_nodes::TJoinDistributionMode::COLOCATE,
+            JoinDistribution::Unknown => plan_nodes::TJoinDistributionMode::BROADCAST,
+        },
+    }
+}
+
+fn legacy_rf_distribution_to_execution(
     distribution: &crate::sql::optimizer::operator::JoinDistribution,
+) -> crate::sql::optimizer::physical_plan::JoinExecutionDistribution {
+    use crate::sql::optimizer::operator::JoinDistribution;
+    use crate::sql::optimizer::physical_plan::JoinExecutionDistribution;
+
+    match distribution {
+        JoinDistribution::Broadcast | JoinDistribution::Unknown => {
+            JoinExecutionDistribution::Broadcast
+        }
+        JoinDistribution::Shuffle => JoinExecutionDistribution::Partitioned,
+        JoinDistribution::Colocate => JoinExecutionDistribution::Colocate,
+    }
+}
+
+/// Map execution join distribution to the thrift RF
+/// `(build_join_mode, local_layout, global_layout)` triple.
+fn rf_layout_for_execution_distribution(
+    distribution: crate::sql::optimizer::physical_plan::JoinExecutionDistribution,
 ) -> (
     crate::runtime_filter::TRuntimeFilterBuildJoinMode,
     crate::runtime_filter::TRuntimeFilterLayoutMode,
     crate::runtime_filter::TRuntimeFilterLayoutMode,
 ) {
     use crate::runtime_filter::{TRuntimeFilterBuildJoinMode, TRuntimeFilterLayoutMode};
-    use crate::sql::optimizer::operator::JoinDistribution;
+    use crate::sql::optimizer::physical_plan::JoinExecutionDistribution;
+
     match distribution {
-        JoinDistribution::Broadcast => (
+        JoinExecutionDistribution::Broadcast => (
             TRuntimeFilterBuildJoinMode::BORADCAST,
             TRuntimeFilterLayoutMode::SINGLETON,
             TRuntimeFilterLayoutMode::SINGLETON,
         ),
-        JoinDistribution::Shuffle => (
+        JoinExecutionDistribution::Partitioned => (
             TRuntimeFilterBuildJoinMode::PARTITIONED,
             TRuntimeFilterLayoutMode::SINGLETON,
             TRuntimeFilterLayoutMode::GLOBAL_SHUFFLE_1L,
         ),
-        JoinDistribution::Colocate => (
+        JoinExecutionDistribution::Colocate => (
             TRuntimeFilterBuildJoinMode::COLOCATE,
             TRuntimeFilterLayoutMode::SINGLETON,
             TRuntimeFilterLayoutMode::GLOBAL_BUCKET_1L,
@@ -1980,11 +2017,11 @@ impl<'a> PlanFragmentBuilder<'a> {
             let expr_a = &eq.left;
             let expr_b = &eq.right;
             // Try natural order: expr_a on left, expr_b on right.
-            let natural = ExprCompiler::new(self.slot_allocator(), &left.scope)
+            let natural = ExprCompiler::new_strict_id(self.slot_allocator(), &left.scope)
                 .compile_typed(expr_a)
                 .ok()
                 .and_then(|lt| {
-                    ExprCompiler::new(self.slot_allocator(), &right.scope)
+                    ExprCompiler::new_strict_id(self.slot_allocator(), &right.scope)
                         .compile_typed(expr_b)
                         .ok()
                         .map(|rt| (lt, rt))
@@ -1993,11 +2030,11 @@ impl<'a> PlanFragmentBuilder<'a> {
             // Needed when JoinCommutativity swapped children but the
             // eq_condition columns still reference the original order.
             let result = natural.or_else(|| {
-                ExprCompiler::new(self.slot_allocator(), &left.scope)
+                ExprCompiler::new_strict_id(self.slot_allocator(), &left.scope)
                     .compile_typed(expr_b)
                     .ok()
                     .and_then(|lt| {
-                        ExprCompiler::new(self.slot_allocator(), &right.scope)
+                        ExprCompiler::new_strict_id(self.slot_allocator(), &right.scope)
                             .compile_typed(expr_a)
                             .ok()
                             .map(|rt| (lt, rt))
@@ -2048,11 +2085,13 @@ impl<'a> PlanFragmentBuilder<'a> {
             }
         }
 
+        let distribution_mode = join_distribution_mode(node, &op.distribution);
         let mut join_plan_node = nodes::build_hash_join_node(
             join_node_id,
             &left.tuple_ids,
             &right.tuple_ids,
             join_op,
+            distribution_mode,
             eq_join_conjuncts,
             other_join_conjuncts,
         );
@@ -2232,8 +2271,12 @@ impl<'a> PlanFragmentBuilder<'a> {
                 .map(|t| t.fragment_id != join_fragment)
                 .unwrap_or(false);
 
+            let execution_distribution = node
+                .execution_props
+                .join_distribution
+                .unwrap_or_else(|| legacy_rf_distribution_to_execution(&rf.distribution));
             let (build_join_mode, local_layout, global_layout) =
-                rf_layout_for_distribution(&rf.distribution);
+                rf_layout_for_execution_distribution(execution_distribution);
 
             let layout = runtime_filter::TRuntimeFilterLayout::new(
                 filter_id,
@@ -4195,6 +4238,9 @@ impl<'a> PlanFragmentBuilder<'a> {
             crate::sql::optimizer::property::DistributionSpec::Gather => {
                 Ok(unpartitioned_stream_partition())
             }
+            crate::sql::optimizer::property::DistributionSpec::Broadcast => {
+                Ok(unpartitioned_stream_partition())
+            }
             crate::sql::optimizer::property::DistributionSpec::HashPartitioned { cols, .. } => {
                 // For shuffle joins, cols contains ALL eq key columns from both
                 // sides. Pick the ones that resolve in this child's scope.
@@ -4205,12 +4251,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                 // for scopes / call sites that have not yet been migrated to
                 // register ColumnIds.
                 let mut partition_exprs = Vec::new();
-                let mut used_ids = std::collections::HashSet::new();
-                let mut used_names = std::collections::HashSet::new();
                 for col_id in cols.iter() {
-                    if used_ids.contains(col_id) {
-                        continue; // skip duplicate column ids
-                    }
                     if let Some(binding) = child_scope.resolve_by_id(*col_id) {
                         let binding = binding.clone();
                         let type_desc = expr_compiler::binding_type_desc(&binding)?;
@@ -4219,7 +4260,6 @@ impl<'a> PlanFragmentBuilder<'a> {
                             binding.tuple_id,
                             type_desc,
                         ));
-                        used_ids.insert(*col_id);
                         continue;
                     }
                     // Fallback: ColumnId → name (via output_columns) → name lookup.
@@ -4228,9 +4268,6 @@ impl<'a> PlanFragmentBuilder<'a> {
                         Some(oc) => oc.name.clone(),
                         None => continue, // column not in this child's output
                     };
-                    if used_names.contains(&col_name.to_lowercase()) {
-                        continue; // skip duplicate column names
-                    }
                     if let Ok(binding) = child_scope.resolve_column(None, &col_name) {
                         let binding = binding.clone();
                         let type_desc = expr_compiler::binding_type_desc(&binding)?;
@@ -4239,7 +4276,6 @@ impl<'a> PlanFragmentBuilder<'a> {
                             binding.tuple_id,
                             type_desc,
                         ));
-                        used_names.insert(col_name.to_lowercase());
                     }
                 }
                 if partition_exprs.is_empty() {
@@ -4896,8 +4932,11 @@ mod tests {
         PhysicalGenerateSeriesOp, PhysicalHashJoinEqCondition, PhysicalHashJoinOp, PhysicalScanOp,
         PhysicalSortOp, PhysicalValuesOp, PhysicalWindowOp, ScanDictionaryColumn,
     };
-    use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
+    use crate::sql::optimizer::physical_plan::{
+        JoinExecutionDistribution, PhysicalPlanNode, PlanExecutionProps,
+    };
     use crate::sql::optimizer::property::DistributionSpec;
+    use crate::sql::optimizer::runtime_filter_pass::RuntimeFilterDesc;
     use crate::sql::optimizer::statistics::Statistics;
     use crate::sql::planner::plan::WindowExpr;
 
@@ -5073,6 +5112,7 @@ mod tests {
             children: Vec::new(),
             stats: stats_for_test(),
             output_columns: columns,
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         }
@@ -5162,6 +5202,7 @@ mod tests {
             children: vec![old_child, delta_child],
             stats: stats_for_test(),
             output_columns,
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         }
@@ -5187,6 +5228,7 @@ mod tests {
             children: vec![old_child, delta_child],
             stats: stats_for_test(),
             output_columns,
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         }
@@ -5261,6 +5303,7 @@ mod tests {
             ],
             stats: stats_for_test(),
             output_columns,
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -5428,6 +5471,7 @@ mod tests {
             children: vec![values_plan_for_test(aggregate_physical_columns_for_test())],
             stats: stats_for_test(),
             output_columns: aggregate_physical_columns_for_test(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -6054,6 +6098,7 @@ mod tests {
             children: vec![],
             stats: stats(),
             output_columns: output_columns(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -6185,6 +6230,7 @@ mod tests {
             children: vec![],
             stats: stats(),
             output_columns: output_columns(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         }
@@ -6218,6 +6264,7 @@ mod tests {
             children: vec![],
             stats: stats(),
             output_columns: output_columns(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         }
@@ -6253,6 +6300,7 @@ mod tests {
             children: vec![],
             stats: stats(),
             output_columns: output_columns(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         }
@@ -6291,6 +6339,7 @@ mod tests {
             children: vec![],
             stats: stats(),
             output_columns: output_columns(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         }
@@ -6329,6 +6378,7 @@ mod tests {
             children: vec![],
             stats: stats(),
             output_columns: output_columns(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         }
@@ -6366,6 +6416,7 @@ mod tests {
             children: vec![],
             stats: stats(),
             output_columns: output_columns(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         }
@@ -6405,6 +6456,7 @@ mod tests {
             children: vec![],
             stats: stats(),
             output_columns: output_columns(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         }
@@ -6592,6 +6644,7 @@ mod tests {
             children: vec![iceberg_scan_plan(), starrocks_scan_plan()],
             stats: stats(),
             output_columns: output_columns(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         }
@@ -6616,11 +6669,14 @@ mod tests {
                 children: vec![scan_plan(file.path().to_path_buf())],
                 stats: stats(),
                 output_columns: output_columns(),
+                execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(
+                ),
                 build_runtime_filters: Vec::new(),
                 probe_runtime_filters: Vec::new(),
             }],
             stats: stats(),
             output_columns: output_columns(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -6646,6 +6702,198 @@ mod tests {
                 .nodes
                 .iter()
                 .any(|node| { node.node_type == plan_nodes::TPlanNodeType::EXCHANGE_NODE })
+        );
+    }
+
+    #[test]
+    fn build_broadcast_distribution_edge_uses_unpartitioned_stream_partition() {
+        let columns = output_columns();
+        let plan = PhysicalPlanNode {
+            op: Operator::PhysicalDistribution(PhysicalDistributionOp {
+                spec: DistributionSpec::Broadcast,
+            }),
+            children: vec![values_plan_for_test(columns.clone())],
+            stats: stats(),
+            output_columns: columns,
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+        };
+
+        let build =
+            PlanFragmentBuilder::build(&plan, &DummyCatalog, &mock_iceberg_registry(), "default")
+                .expect("build");
+
+        assert_eq!(build.edges.len(), 1);
+        assert!(matches!(
+            build.edges[0].edge_kind,
+            crate::sql::codegen::FragmentEdgeKind::Stream
+        ));
+        assert_eq!(
+            build.edges[0].output_partition.type_,
+            crate::partitions::TPartitionType::UNPARTITIONED
+        );
+    }
+
+    #[test]
+    fn hash_join_thrift_distribution_uses_execution_metadata_partitioned() {
+        let mut plan = mixed_starrocks_iceberg_join_plan();
+        let Operator::PhysicalHashJoin(op) = &mut plan.op else {
+            panic!("expected hash join");
+        };
+        op.distribution = JoinDistribution::Unknown;
+        plan.execution_props.join_distribution = Some(JoinExecutionDistribution::Partitioned);
+
+        let starrocks_layout = PhysicalTableLayout {
+            db_id: 11,
+            table_id: 22,
+            schema_id: 33,
+            tablets: vec![StarRocksTabletRef {
+                tablet_id: 101,
+                partition_id: 201,
+                version: 7,
+            }],
+        };
+        let registry = mock_starrocks_and_iceberg_registry(&starrocks_layout);
+        let catalog = MixedCatalog { starrocks_layout };
+
+        let build =
+            PlanFragmentBuilder::build(&plan, &catalog, &registry, "default").expect("build");
+        let root = build
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == build.root_fragment_id)
+            .expect("root fragment");
+        let hash_join_node = root
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.node_type == plan_nodes::TPlanNodeType::HASH_JOIN_NODE)
+            .expect("hash join node");
+
+        assert_eq!(
+            hash_join_node
+                .hash_join_node
+                .as_ref()
+                .and_then(|join| join.distribution_mode),
+            Some(plan_nodes::TJoinDistributionMode::PARTITIONED)
+        );
+    }
+
+    #[test]
+    fn runtime_filter_uses_execution_distribution_metadata() {
+        let mut plan = mixed_starrocks_iceberg_join_plan();
+        let Operator::PhysicalHashJoin(op) = &plan.op else {
+            panic!("expected hash join");
+        };
+        let eq = op.eq_conditions[0].clone();
+        plan.execution_props.join_distribution = Some(JoinExecutionDistribution::Partitioned);
+        plan.build_runtime_filters = vec![RuntimeFilterDesc {
+            filter_id: 7,
+            build_expr: eq.right,
+            probe_expr: eq.left,
+            expr_order: 0,
+            distribution: JoinDistribution::Broadcast,
+        }];
+
+        let starrocks_layout = PhysicalTableLayout {
+            db_id: 11,
+            table_id: 22,
+            schema_id: 33,
+            tablets: vec![StarRocksTabletRef {
+                tablet_id: 101,
+                partition_id: 201,
+                version: 7,
+            }],
+        };
+        let registry = mock_starrocks_and_iceberg_registry(&starrocks_layout);
+        let catalog = MixedCatalog { starrocks_layout };
+
+        let build =
+            PlanFragmentBuilder::build(&plan, &catalog, &registry, "default").expect("build");
+        let root = build
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == build.root_fragment_id)
+            .expect("root fragment");
+        let hash_join_node = root
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.node_type == plan_nodes::TPlanNodeType::HASH_JOIN_NODE)
+            .expect("hash join node");
+        let rf = hash_join_node
+            .hash_join_node
+            .as_ref()
+            .and_then(|join| join.build_runtime_filters.as_ref())
+            .and_then(|filters| filters.first())
+            .expect("runtime filter");
+
+        assert_eq!(
+            rf.build_join_mode,
+            Some(crate::runtime_filter::TRuntimeFilterBuildJoinMode::PARTITIONED)
+        );
+        assert_eq!(
+            rf.layout.as_ref().and_then(|layout| layout.global_layout),
+            Some(crate::runtime_filter::TRuntimeFilterLayoutMode::GLOBAL_SHUFFLE_1L)
+        );
+    }
+
+    #[test]
+    fn runtime_filter_unknown_without_execution_metadata_falls_back_to_broadcast() {
+        let mut plan = mixed_starrocks_iceberg_join_plan();
+        let Operator::PhysicalHashJoin(op) = &plan.op else {
+            panic!("expected hash join");
+        };
+        let eq = op.eq_conditions[0].clone();
+        plan.build_runtime_filters = vec![RuntimeFilterDesc {
+            filter_id: 7,
+            build_expr: eq.right,
+            probe_expr: eq.left,
+            expr_order: 0,
+            distribution: JoinDistribution::Unknown,
+        }];
+
+        let starrocks_layout = PhysicalTableLayout {
+            db_id: 11,
+            table_id: 22,
+            schema_id: 33,
+            tablets: vec![StarRocksTabletRef {
+                tablet_id: 101,
+                partition_id: 201,
+                version: 7,
+            }],
+        };
+        let registry = mock_starrocks_and_iceberg_registry(&starrocks_layout);
+        let catalog = MixedCatalog { starrocks_layout };
+
+        let build =
+            PlanFragmentBuilder::build(&plan, &catalog, &registry, "default").expect("build");
+        let root = build
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == build.root_fragment_id)
+            .expect("root fragment");
+        let hash_join_node = root
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.node_type == plan_nodes::TPlanNodeType::HASH_JOIN_NODE)
+            .expect("hash join node");
+        let rf = hash_join_node
+            .hash_join_node
+            .as_ref()
+            .and_then(|join| join.build_runtime_filters.as_ref())
+            .and_then(|filters| filters.first())
+            .expect("runtime filter");
+
+        assert_eq!(
+            rf.build_join_mode,
+            Some(crate::runtime_filter::TRuntimeFilterBuildJoinMode::BORADCAST)
+        );
+        assert_eq!(
+            rf.layout.as_ref().and_then(|layout| layout.global_layout),
+            Some(crate::runtime_filter::TRuntimeFilterLayoutMode::SINGLETON)
         );
     }
 
@@ -6695,11 +6943,14 @@ mod tests {
                 children: vec![scan_plan(file.path().to_path_buf())],
                 stats: stats(),
                 output_columns: output_columns(),
+                execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(
+                ),
                 build_runtime_filters: Vec::new(),
                 probe_runtime_filters: Vec::new(),
             }],
             stats: stats(),
             output_columns: output_columns(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -6750,16 +7001,21 @@ mod tests {
                     children: vec![scan_plan(file.path().to_path_buf())],
                     stats: stats(),
                     output_columns: output_columns(),
+                    execution_props:
+                        crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
                     build_runtime_filters: Vec::new(),
                     probe_runtime_filters: Vec::new(),
                 }],
                 stats: stats(),
                 output_columns: output_columns(),
+                execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(
+                ),
                 build_runtime_filters: Vec::new(),
                 probe_runtime_filters: Vec::new(),
             }],
             stats: stats(),
             output_columns: output_columns(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -6802,6 +7058,7 @@ mod tests {
             children: vec![scan],
             stats: stats(),
             output_columns: output_columns(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -6833,6 +7090,7 @@ mod tests {
             children: vec![scan_plan(file.path().to_path_buf())],
             stats: stats(),
             output_columns: output_columns(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -6853,6 +7111,7 @@ mod tests {
             children: vec![scan_plan(file.path().to_path_buf())],
             stats: stats(),
             output_columns: output_columns(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -6887,6 +7146,7 @@ mod tests {
                 nullable: false,
                 is_internal: false,
             }],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -7302,6 +7562,7 @@ mod tests {
                 nullable: false,
                 is_internal: false,
             }],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -7329,6 +7590,7 @@ mod tests {
                 nullable: false,
                 is_internal: false,
             }],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -7479,6 +7741,7 @@ mod tests {
                     is_internal: false,
                 },
             ],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -7686,6 +7949,7 @@ mod tests {
                 nullable: false,
                 is_internal: false,
             }],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -7832,6 +8096,7 @@ mod tests {
                 nullable: false,
                 is_internal: false,
             }],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };

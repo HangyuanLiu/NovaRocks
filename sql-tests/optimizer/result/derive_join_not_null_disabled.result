@@ -1,18 +1,15 @@
 -- query 7
 Explain String
-GATHER EXCHANGE stats={rows=202500000}
-  PROJECT [l.v AS v, r.v AS v] stats={rows=202500000}
-    HASH JOIN (BROADCAST, INNER, eq: [l.k = r.k]) stats={rows=202500000}
-      build runtime filters:
-      - filter_id = 0, build_expr = (r.k)
-      SCAN db_sqlt_6bef84b7f7bb0b5f.t_dnn_dl (alias=l) stats={rows=90000}
-           TABLE: db_sqlt_6bef84b7f7bb0b5f.t_dnn_dl
-           columns: k, v
-           min-max stats
-           predicates: l.k IS NOT NULL
-          probe runtime filters:
-          - filter_id = 0, probe_expr = (l.k)
-      GATHER EXCHANGE stats={rows=90000}
+GATHER EXCHANGE stats={rows=90000}
+  PROJECT [l.v AS v, r.v AS v] stats={rows=90000}
+    HASH JOIN (PARTITIONED, INNER, eq: [l.k = r.k]) stats={rows=90000}
+      HASH EXCHANGE (source: ShuffleJoin, hash: [c1]) stats={rows=90000}
+        SCAN db_sqlt_6bef84b7f7bb0b5f.t_dnn_dl (alias=l) stats={rows=90000}
+             TABLE: db_sqlt_6bef84b7f7bb0b5f.t_dnn_dl
+             columns: k, v
+             min-max stats
+             predicates: l.k IS NOT NULL
+      HASH EXCHANGE (source: ShuffleJoin, hash: [c3]) stats={rows=90000}
         SCAN db_sqlt_6bef84b7f7bb0b5f.t_dnn_dr (alias=r) stats={rows=90000}
              TABLE: db_sqlt_6bef84b7f7bb0b5f.t_dnn_dr
              columns: k, v
@@ -21,18 +18,15 @@ GATHER EXCHANGE stats={rows=202500000}
 
 -- query 9
 Explain String
-GATHER EXCHANGE stats={rows=250000000}
-  PROJECT [l.v AS v, r.v AS v] stats={rows=250000000}
-    HASH JOIN (BROADCAST, INNER, eq: [l.k = r.k]) stats={rows=250000000}
-      build runtime filters:
-      - filter_id = 0, build_expr = (r.k)
-      SCAN db_sqlt_6bef84b7f7bb0b5f.t_dnn_dl (alias=l) stats={rows=100000}
-           TABLE: db_sqlt_6bef84b7f7bb0b5f.t_dnn_dl
-           columns: k, v
-           min-max stats
-          probe runtime filters:
-          - filter_id = 0, probe_expr = (l.k)
-      GATHER EXCHANGE stats={rows=100000}
+GATHER EXCHANGE stats={rows=100000}
+  PROJECT [l.v AS v, r.v AS v] stats={rows=100000}
+    HASH JOIN (PARTITIONED, INNER, eq: [l.k = r.k]) stats={rows=100000}
+      HASH EXCHANGE (source: ShuffleJoin, hash: [c1]) stats={rows=100000}
+        SCAN db_sqlt_6bef84b7f7bb0b5f.t_dnn_dl (alias=l) stats={rows=100000}
+             TABLE: db_sqlt_6bef84b7f7bb0b5f.t_dnn_dl
+             columns: k, v
+             min-max stats
+      HASH EXCHANGE (source: ShuffleJoin, hash: [c3]) stats={rows=100000}
         SCAN db_sqlt_6bef84b7f7bb0b5f.t_dnn_dr (alias=r) stats={rows=100000}
              TABLE: db_sqlt_6bef84b7f7bb0b5f.t_dnn_dr
              columns: k, v

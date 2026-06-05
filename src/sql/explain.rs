@@ -8,7 +8,7 @@ use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, TypedExpr, U
 use crate::sql::catalog::ScanSource;
 use crate::sql::optimizer::estimate::arith::MAX_ROW_COUNT;
 use crate::sql::optimizer::operator::{AggMode, JoinDistribution, Operator};
-use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
+use crate::sql::optimizer::physical_plan::{JoinExecutionDistribution, PhysicalPlanNode};
 use crate::sql::optimizer::property::DistributionSpec;
 use crate::sql::planner::plan::LogicalPlan;
 
@@ -383,6 +383,20 @@ pub(crate) fn explain_physical_plan(plan: &PhysicalPlanNode, level: ExplainLevel
     out
 }
 
+fn join_distribution_label(node: &PhysicalPlanNode, fallback: &JoinDistribution) -> &'static str {
+    match node.execution_props.join_distribution {
+        Some(JoinExecutionDistribution::Broadcast) => "BROADCAST",
+        Some(JoinExecutionDistribution::Partitioned) => "PARTITIONED",
+        Some(JoinExecutionDistribution::Colocate) => "COLOCATE",
+        None => match fallback {
+            JoinDistribution::Broadcast => "BROADCAST",
+            JoinDistribution::Shuffle => "PARTITIONED",
+            JoinDistribution::Colocate => "COLOCATE",
+            JoinDistribution::Unknown => "UNKNOWN",
+        },
+    }
+}
+
 fn format_physical_node(
     node: &PhysicalPlanNode,
     level: ExplainLevel,
@@ -488,11 +502,7 @@ fn format_physical_node(
             }
         }
         Operator::PhysicalHashJoin(op) => {
-            let dist = match op.distribution {
-                JoinDistribution::Shuffle => "SHUFFLE",
-                JoinDistribution::Broadcast => "BROADCAST",
-                JoinDistribution::Colocate => "COLOCATE",
-            };
+            let dist = join_distribution_label(node, &op.distribution);
             let join_str = match op.join_type {
                 JoinKind::Inner => "INNER",
                 JoinKind::LeftOuter => "LEFT OUTER",
@@ -669,6 +679,7 @@ fn format_physical_node(
             let label = match &op.spec {
                 DistributionSpec::Any => "ANY EXCHANGE".to_string(),
                 DistributionSpec::Gather => "GATHER EXCHANGE".to_string(),
+                DistributionSpec::Broadcast => "BROADCAST EXCHANGE".to_string(),
                 DistributionSpec::HashPartitioned { cols, source } => {
                     let col_names: Vec<String> = cols.iter().map(|c| format!("{}", c)).collect();
                     format!(
@@ -1247,17 +1258,48 @@ mod tests {
         ExplainLevel, explain_physical_plan, explain_plan, format_physical_node,
         format_stats_trailer,
     };
-    use crate::sql::analysis::OutputColumn;
+    use crate::sql::analysis::{JoinKind, OutputColumn};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::operator::{Operator, PhysicalDistributionOp, PhysicalScanOp};
-    use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
+    use crate::sql::optimizer::operator::{
+        JoinDistribution, Operator, PhysicalDistributionOp, PhysicalHashJoinOp, PhysicalScanOp,
+    };
+    use crate::sql::optimizer::physical_plan::{
+        JoinExecutionDistribution, PhysicalPlanNode, PlanExecutionProps,
+    };
     use crate::sql::optimizer::property::DistributionSpec;
+    use crate::sql::optimizer::property::PhysicalPropertySet;
     use crate::sql::optimizer::statistics::{Confidence, Statistics};
     use crate::sql::planner::plan::{AggregateStateMergeNode, LogicalPlan, ValuesNode};
 
     fn explain_logical_plan_for_test(plan: &LogicalPlan) -> String {
         explain_plan(plan, ExplainLevel::Normal).join("\n")
+    }
+
+    #[test]
+    fn explain_hash_join_uses_execution_distribution_metadata() {
+        let plan = PhysicalPlanNode {
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![],
+                other_condition: None,
+                distribution: JoinDistribution::Unknown,
+            }),
+            children: vec![],
+            stats: Statistics::default(),
+            output_columns: vec![],
+            execution_props: PlanExecutionProps {
+                output_property: PhysicalPropertySet::any(),
+                child_output_properties: vec![],
+                join_distribution: Some(JoinExecutionDistribution::Partitioned),
+            },
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+
+        let text = explain_physical_plan(&plan, ExplainLevel::Verbose).join("\n");
+        assert!(text.contains("HASH JOIN (PARTITIONED, INNER"), "{text}");
+        assert!(!text.contains("UNKNOWN"), "{text}");
     }
 
     #[test]
@@ -1324,6 +1366,7 @@ mod tests {
                 ..Default::default()
             },
             output_columns: Vec::new(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -1376,6 +1419,7 @@ mod tests {
                 ..Default::default()
             },
             output_columns: Vec::new(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -1418,6 +1462,7 @@ mod tests {
                 ..Default::default()
             },
             output_columns: Vec::new(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -1436,6 +1481,7 @@ mod tests {
                 ..Default::default()
             },
             output_columns: Vec::new(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -1461,6 +1507,7 @@ mod tests {
                 ..Default::default()
             },
             output_columns: Vec::new(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };
@@ -1513,6 +1560,7 @@ mod tests {
                 ..Default::default()
             },
             output_columns: Vec::new(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         }
@@ -1585,6 +1633,7 @@ mod tests {
                 ..Default::default()
             },
             output_columns: Vec::new(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
         };

@@ -331,6 +331,7 @@ pub(crate) fn build_hash_join_node(
     left_tuple_ids: &[i32],
     right_tuple_ids: &[i32],
     join_op: plan_nodes::TJoinOp,
+    distribution_mode: plan_nodes::TJoinDistributionMode,
     eq_join_conjuncts: Vec<plan_nodes::TEqJoinCondition>,
     other_join_conjuncts: Vec<exprs::TExpr>,
 ) -> plan_nodes::TPlanNode {
@@ -384,7 +385,7 @@ pub(crate) fn build_hash_join_node(
         sql_predicates: None,
         build_runtime_filters: None,
         build_runtime_filters_from_planner: None,
-        distribution_mode: Some(plan_nodes::TJoinDistributionMode::BROADCAST),
+        distribution_mode: Some(distribution_mode),
         partition_exprs: None,
         output_columns: None,
         interpolate_passthrough: None,

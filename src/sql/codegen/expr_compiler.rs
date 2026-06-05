@@ -13,6 +13,7 @@ use crate::types;
 use super::resolve::{ColumnBinding, ExprScope};
 use super::type_infer::{arithmetic_result_type_with_op, arrow_type_to_type_desc, wider_type};
 use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr, UnOp};
+use crate::sql::column_id::ColumnId;
 use crate::sql::planner::plan::AggregateCall;
 
 /// Shared counter used to allocate fresh slot ids for lambda parameters. The
@@ -44,6 +45,7 @@ pub(crate) struct ExprCompiler<'a> {
     /// body, an unqualified `ColumnRef` whose name matches a binding becomes a
     /// `SLOT_REF` to the allocated slot id.
     lambda_stack: Vec<LambdaBinding>,
+    strict_missing_id: bool,
 }
 
 impl<'a> ExprCompiler<'a> {
@@ -58,7 +60,18 @@ impl<'a> ExprCompiler<'a> {
             last_nullable: true,
             slot_alloc,
             lambda_stack: Vec::new(),
+            strict_missing_id: false,
         }
+    }
+
+    /// Build a compiler that rejects name fallback when a real `ColumnId`
+    /// misses an id-indexed binding in the current scope. Use this for join-key
+    /// side binding, where a miss means the expression belongs to the other
+    /// child even if the display name also exists locally.
+    pub fn new_strict_id(slot_alloc: SlotAllocator, scope: &'a ExprScope) -> Self {
+        let mut compiler = Self::new(slot_alloc, scope);
+        compiler.strict_missing_id = true;
+        compiler
     }
 
     fn alloc_slot_id(&self) -> i32 {
@@ -387,14 +400,27 @@ impl<'a> ExprCompiler<'a> {
                     return Ok(data_type);
                 }
                 // G1: prefer ColumnId-based lookup when the scope has an
-                // id-indexed binding for this column. This is what lets the
-                // SELECT projection above a GROUPING SETS / CUBE / ROLLUP
-                // Aggregate still resolve `k1` even though the Aggregate's
-                // output slot is named `__repeat_group.k1`. Fall back to the
-                // name-based lookup for scopes / call sites that have not
-                // yet been migrated to register ColumnIds.
+                // id-indexed binding for this column. Strict mode is reserved
+                // for join-key side binding: a missed ColumnId there means the
+                // expression belongs to the other child, even if the same
+                // display name exists locally. Normal compilation still falls
+                // back by name because USING, aliases, and internal rewrite
+                // columns may carry stale or missing ColumnIds.
                 let binding = match self.scope.resolve_by_id(*column_id) {
                     Some(b) => b,
+                    None if self.strict_missing_id
+                        && *column_id != ColumnId::UNSET
+                        && self.scope.has_id_bindings() =>
+                    {
+                        let fallback = self.scope.resolve_column(qualifier.as_deref(), column)?;
+                        if self.scope.binding_has_id_index(fallback) {
+                            return Err(format!(
+                                "ColumnId({}) for column '{}' cannot be resolved in current scope.",
+                                column_id.0, column
+                            ));
+                        }
+                        fallback
+                    }
                     None => self.scope.resolve_column(qualifier.as_deref(), column)?,
                 };
                 let type_desc = binding_type_desc(binding)?;
@@ -3094,11 +3120,98 @@ fn starrocks_type_name(dt: &DataType) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        aggregate_arg_cast_type, infer_agg_function_types, infer_date_trunc_return_type,
-        infer_scalar_function_return_type, largeint,
+        ExprCompiler, aggregate_arg_cast_type, infer_agg_function_types,
+        infer_date_trunc_return_type, infer_scalar_function_return_type, largeint,
     };
     use arrow::datatypes::{DataType, Field, TimeUnit};
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use std::sync::Arc;
+
+    use crate::sql::analysis::{ExprKind, TypedExpr};
+    use crate::sql::codegen::resolve::{ColumnBinding, ExprScope};
+    use crate::sql::column_id::ColumnId;
+
+    #[test]
+    fn column_id_mismatch_does_not_fall_back_to_name_when_scope_has_ids() {
+        let mut scope = ExprScope::new();
+        scope.add_column_with_id(
+            ColumnId(1),
+            None,
+            "k".to_string(),
+            ColumnBinding {
+                tuple_id: 1,
+                slot_id: 10,
+                data_type: DataType::Int32,
+                type_desc: None,
+                nullable: false,
+            },
+        );
+        let expr = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId(2),
+                qualifier: None,
+                column: "k".to_string(),
+            },
+            data_type: DataType::Int32,
+            nullable: false,
+        };
+        let slot_alloc = Rc::new(RefCell::new(100));
+        let mut compiler = ExprCompiler::new_strict_id(slot_alloc, &scope);
+
+        let err = compiler
+            .compile_typed(&expr)
+            .expect_err("missing ColumnId must not bind by name");
+        assert!(err.contains("ColumnId(2)"), "err={err}");
+    }
+
+    #[test]
+    fn column_id_mismatch_allows_name_only_internal_binding() {
+        let mut scope = ExprScope::new();
+        scope.add_column_with_id(
+            ColumnId(1),
+            None,
+            "k".to_string(),
+            ColumnBinding {
+                tuple_id: 1,
+                slot_id: 10,
+                data_type: DataType::Int32,
+                type_desc: None,
+                nullable: false,
+            },
+        );
+        scope.add_column(
+            None,
+            "__change_op".to_string(),
+            ColumnBinding {
+                tuple_id: 1,
+                slot_id: 11,
+                data_type: DataType::Int8,
+                type_desc: None,
+                nullable: false,
+            },
+        );
+        let expr = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId(2),
+                qualifier: None,
+                column: "__change_op".to_string(),
+            },
+            data_type: DataType::Int8,
+            nullable: false,
+        };
+        let slot_alloc = Rc::new(RefCell::new(100));
+        let mut compiler = ExprCompiler::new_strict_id(slot_alloc, &scope);
+
+        let compiled = compiler
+            .compile_typed(&expr)
+            .expect("name-only internal binding should compile");
+        let slot_ref = compiled.nodes.first().expect("slot ref");
+        assert_eq!(
+            slot_ref.slot_ref.as_ref().expect("slot_ref node").slot_id,
+            11
+        );
+    }
 
     /// Cross-validation: for every (function, arg_types) probe in this
     /// table, the new central signature registry and the legacy

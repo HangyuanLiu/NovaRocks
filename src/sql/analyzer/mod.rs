@@ -1824,15 +1824,11 @@ impl<'a> AnalyzerContext<'a> {
                             ast_sel.projection.iter().zip(sel.projection.iter())
                         {
                             if ob_is_bare_ident && ir_item.output_name.to_lowercase() == ob_text {
-                                let col_id = match &ir_item.expr.kind {
-                                    ExprKind::ColumnRef { column_id, .. } => *column_id,
-                                    _ => self.alloc_column_id(
-                                        None,
-                                        ir_item.output_name.clone(),
-                                        ir_item.expr.data_type.clone(),
-                                        ir_item.expr.nullable,
-                                    ),
-                                };
+                                let col_id = select_item_output_column_id(
+                                    ir_item,
+                                    self,
+                                    &ir_item.output_name,
+                                );
                                 matched_alias = Some(TypedExpr {
                                     kind: ExprKind::ColumnRef {
                                         column_id: col_id,
@@ -1870,15 +1866,11 @@ impl<'a> AnalyzerContext<'a> {
                             // projection-output scope rather than against
                             // the pre-aggregation FROM-scope.
                             if ir_item.output_name.to_lowercase() == ob_text {
-                                let col_id = match &ir_item.expr.kind {
-                                    ExprKind::ColumnRef { column_id, .. } => *column_id,
-                                    _ => self.alloc_column_id(
-                                        None,
-                                        ir_item.output_name.clone(),
-                                        ir_item.expr.data_type.clone(),
-                                        ir_item.expr.nullable,
-                                    ),
-                                };
+                                let col_id = select_item_output_column_id(
+                                    ir_item,
+                                    self,
+                                    &ir_item.output_name,
+                                );
                                 matched_alias = Some(TypedExpr {
                                     kind: ExprKind::ColumnRef {
                                         column_id: col_id,
@@ -1980,6 +1972,25 @@ impl<'a> AnalyzerContext<'a> {
         }
 
         Ok(sort_items)
+    }
+}
+
+fn select_item_output_column_id(
+    item: &ProjectItem,
+    ctx: &AnalyzerContext<'_>,
+    fallback_name: &str,
+) -> crate::sql::column_id::ColumnId {
+    if item.output_column_id != crate::sql::column_id::ColumnId::UNSET {
+        return item.output_column_id;
+    }
+    match &item.expr.kind {
+        ExprKind::ColumnRef { column_id, .. } => *column_id,
+        _ => ctx.alloc_column_id(
+            None,
+            fallback_name.to_string(),
+            item.expr.data_type.clone(),
+            item.expr.nullable,
+        ),
     }
 }
 

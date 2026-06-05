@@ -2538,6 +2538,7 @@ fn collapse_distribution_enforcers_for_single_fragment(
     mut node: crate::sql::optimizer::PhysicalPlanNode,
 ) -> crate::sql::optimizer::PhysicalPlanNode {
     use crate::sql::optimizer::operator::{JoinDistribution, Operator};
+    use crate::sql::optimizer::physical_plan::JoinExecutionDistribution;
 
     node.children = node
         .children
@@ -2547,6 +2548,10 @@ fn collapse_distribution_enforcers_for_single_fragment(
 
     if let Operator::PhysicalHashJoin(join) = &mut node.op {
         join.distribution = JoinDistribution::Broadcast;
+        node.execution_props.join_distribution = Some(JoinExecutionDistribution::Broadcast);
+        for runtime_filter in &mut node.build_runtime_filters {
+            runtime_filter.distribution = JoinDistribution::Broadcast;
+        }
     }
 
     if matches!(&node.op, Operator::PhysicalDistribution(_)) && node.children.len() == 1 {
@@ -4115,8 +4120,11 @@ path = "{metadata_path}"
             JoinDistribution, Operator, PhysicalDistributionOp, PhysicalHashJoinOp,
             PhysicalValuesOp,
         };
-        use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
+        use crate::sql::optimizer::physical_plan::{
+            JoinExecutionDistribution, PhysicalPlanNode, PlanExecutionProps,
+        };
         use crate::sql::optimizer::property::DistributionSpec;
+        use crate::sql::optimizer::runtime_filter_pass::RuntimeFilterDesc;
         use crate::sql::optimizer::statistics::Statistics;
 
         fn stats() -> Statistics {
@@ -4136,6 +4144,8 @@ path = "{metadata_path}"
                 children: Vec::new(),
                 stats: stats(),
                 output_columns: Vec::new(),
+                execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(
+                ),
                 build_runtime_filters: Vec::new(),
                 probe_runtime_filters: Vec::new(),
             }
@@ -4149,6 +4159,8 @@ path = "{metadata_path}"
                 children: vec![values_node()],
                 stats: stats(),
                 output_columns: Vec::new(),
+                execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(
+                ),
                 build_runtime_filters: Vec::new(),
                 probe_runtime_filters: Vec::new(),
             }
@@ -4164,7 +4176,15 @@ path = "{metadata_path}"
             children: vec![distributed_values_node(), distributed_values_node()],
             stats: stats(),
             output_columns: Vec::new(),
-            build_runtime_filters: Vec::new(),
+            execution_props: PlanExecutionProps {
+                join_distribution: Some(JoinExecutionDistribution::Partitioned),
+                ..PlanExecutionProps::default()
+            },
+            build_runtime_filters: {
+                let mut rf = RuntimeFilterDesc::placeholder(7);
+                rf.distribution = JoinDistribution::Shuffle;
+                vec![rf]
+            },
             probe_runtime_filters: Vec::new(),
         };
 
@@ -4174,6 +4194,15 @@ path = "{metadata_path}"
             &collapsed.op,
             Operator::PhysicalHashJoin(join)
                 if matches!(&join.distribution, JoinDistribution::Broadcast)
+        ));
+        assert_eq!(
+            collapsed.execution_props.join_distribution,
+            Some(JoinExecutionDistribution::Broadcast)
+        );
+        assert_eq!(collapsed.build_runtime_filters.len(), 1);
+        assert!(matches!(
+            collapsed.build_runtime_filters[0].distribution,
+            JoinDistribution::Broadcast
         ));
         assert!(matches!(
             &collapsed.children[0].op,
@@ -4708,8 +4737,13 @@ enable_path_style_access = true
             }],
         };
         catalog
-            .register_starrocks_table("default", table, layout.clone())
+            .register_starrocks_table("default", table.clone(), layout.clone())
             .expect("register StarRocks tbl");
+        let mut date_dim = table;
+        date_dim.name = "date_dim".to_string();
+        catalog
+            .register_starrocks_table("default", date_dim, layout.clone())
+            .expect("register StarRocks date_dim");
 
         let registry = mock_starrocks_registry_for_engine_test(&layout);
 
@@ -5451,11 +5485,12 @@ enable_path_style_access = true
     /// `TRuntimeFilterDescription`s on the join node, AND assemble a
     /// `RuntimeFilterPlanResult`. Exercises the full standalone pipeline
     /// (analyze -> plan -> optimize[annotate] -> codegen) over the test
-    /// catalog's `tbl(id int, name varchar)`, self-joined on `id`.
+    /// catalog's fact-like `tbl(id int, name varchar)` joined to the small
+    /// `date_dim` fixture on `id`.
     #[test]
     fn codegen_emits_build_runtime_filters_from_annotation() {
         let build =
-            build_fragments_for_query("SELECT count(*) FROM tbl a JOIN tbl b ON a.id = b.id");
+            build_fragments_for_query("SELECT count(*) FROM tbl a JOIN date_dim b ON a.id = b.id");
         let has_rf = build.fragment_results.iter().any(|fr| {
             fr.plan.nodes.iter().any(|n| {
                 n.hash_join_node
