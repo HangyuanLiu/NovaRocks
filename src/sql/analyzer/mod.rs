@@ -1320,6 +1320,7 @@ impl<'a> AnalyzerContext<'a> {
                 &mut next_marker,
             ));
         }
+        let emitted_grouping_marker_count = grouping_fn_args.len();
 
         // Analyze the SELECT once with all GROUP BY keys active.
         let (mut sel, cols) = self.analyze_select(&modified_select)?;
@@ -1359,11 +1360,16 @@ impl<'a> AnalyzerContext<'a> {
                 &item.expr,
                 &grouping_fn_args,
                 &grouping_fn_ids,
+                emitted_grouping_marker_count,
             );
         }
         if let Some(having) = sel.having.as_mut() {
-            *having =
-                replace_grouping_markers_in_typed_expr(having, &grouping_fn_args, &grouping_fn_ids);
+            *having = replace_grouping_markers_in_typed_expr(
+                having,
+                &grouping_fn_args,
+                &grouping_fn_ids,
+                emitted_grouping_marker_count,
+            );
         }
 
         // Attach RepeatInfo to the resolved SELECT.
@@ -2143,12 +2149,337 @@ fn replace_grouping_in_window(
 /// Replace GROUPING/GROUPING_ID calls in an AST expression with unique marker
 /// literals (-9000, -9001, ...). Each call is recorded in `args` as
 /// (virtual_name, [column_args]) for the RepeatInfo.
+fn replace_grouping_markers_in_function_arg_expr(
+    arg_expr: &sqlast::FunctionArgExpr,
+    args: &mut Vec<(String, Vec<String>)>,
+    next_marker: &mut i64,
+) -> sqlast::FunctionArgExpr {
+    match arg_expr {
+        sqlast::FunctionArgExpr::Expr(expr) => sqlast::FunctionArgExpr::Expr(
+            replace_grouping_calls_with_markers(expr, args, next_marker),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn replace_grouping_markers_in_function_arg(
+    arg: &sqlast::FunctionArg,
+    args: &mut Vec<(String, Vec<String>)>,
+    next_marker: &mut i64,
+) -> sqlast::FunctionArg {
+    match arg {
+        sqlast::FunctionArg::Named {
+            name,
+            arg,
+            operator,
+        } => sqlast::FunctionArg::Named {
+            name: name.clone(),
+            arg: replace_grouping_markers_in_function_arg_expr(arg, args, next_marker),
+            operator: operator.clone(),
+        },
+        sqlast::FunctionArg::ExprNamed {
+            name,
+            arg,
+            operator,
+        } => sqlast::FunctionArg::ExprNamed {
+            name: replace_grouping_calls_with_markers(name, args, next_marker),
+            arg: replace_grouping_markers_in_function_arg_expr(arg, args, next_marker),
+            operator: operator.clone(),
+        },
+        sqlast::FunctionArg::Unnamed(arg) => sqlast::FunctionArg::Unnamed(
+            replace_grouping_markers_in_function_arg_expr(arg, args, next_marker),
+        ),
+    }
+}
+
+fn replace_grouping_markers_in_order_by_expr(
+    order_by: &sqlast::OrderByExpr,
+    args: &mut Vec<(String, Vec<String>)>,
+    next_marker: &mut i64,
+) -> sqlast::OrderByExpr {
+    sqlast::OrderByExpr {
+        expr: replace_grouping_calls_with_markers(&order_by.expr, args, next_marker),
+        with_fill: order_by
+            .with_fill
+            .as_ref()
+            .map(|with_fill| sqlast::WithFill {
+                from: with_fill
+                    .from
+                    .as_ref()
+                    .map(|expr| replace_grouping_calls_with_markers(expr, args, next_marker)),
+                to: with_fill
+                    .to
+                    .as_ref()
+                    .map(|expr| replace_grouping_calls_with_markers(expr, args, next_marker)),
+                step: with_fill
+                    .step
+                    .as_ref()
+                    .map(|expr| replace_grouping_calls_with_markers(expr, args, next_marker)),
+            }),
+        ..order_by.clone()
+    }
+}
+
+fn replace_grouping_markers_in_function_argument_clause(
+    clause: &sqlast::FunctionArgumentClause,
+    args: &mut Vec<(String, Vec<String>)>,
+    next_marker: &mut i64,
+) -> sqlast::FunctionArgumentClause {
+    match clause {
+        sqlast::FunctionArgumentClause::OrderBy(order_by) => {
+            sqlast::FunctionArgumentClause::OrderBy(
+                order_by
+                    .iter()
+                    .map(|item| replace_grouping_markers_in_order_by_expr(item, args, next_marker))
+                    .collect(),
+            )
+        }
+        sqlast::FunctionArgumentClause::Limit(expr) => sqlast::FunctionArgumentClause::Limit(
+            replace_grouping_calls_with_markers(expr, args, next_marker),
+        ),
+        sqlast::FunctionArgumentClause::Having(bound) => {
+            sqlast::FunctionArgumentClause::Having(sqlast::HavingBound(
+                bound.0,
+                replace_grouping_calls_with_markers(&bound.1, args, next_marker),
+            ))
+        }
+        other => other.clone(),
+    }
+}
+
+fn replace_grouping_markers_in_function_arguments(
+    arguments: &sqlast::FunctionArguments,
+    args: &mut Vec<(String, Vec<String>)>,
+    next_marker: &mut i64,
+) -> sqlast::FunctionArguments {
+    match arguments {
+        sqlast::FunctionArguments::List(list) => {
+            sqlast::FunctionArguments::List(sqlast::FunctionArgumentList {
+                args: list
+                    .args
+                    .iter()
+                    .map(|arg| replace_grouping_markers_in_function_arg(arg, args, next_marker))
+                    .collect(),
+                clauses: list
+                    .clauses
+                    .iter()
+                    .map(|clause| {
+                        replace_grouping_markers_in_function_argument_clause(
+                            clause,
+                            args,
+                            next_marker,
+                        )
+                    })
+                    .collect(),
+                ..list.clone()
+            })
+        }
+        sqlast::FunctionArguments::Subquery(_) | sqlast::FunctionArguments::None => {
+            arguments.clone()
+        }
+    }
+}
+
+fn replace_grouping_markers_in_subscript(
+    subscript: &sqlast::Subscript,
+    args: &mut Vec<(String, Vec<String>)>,
+    next_marker: &mut i64,
+) -> sqlast::Subscript {
+    match subscript {
+        sqlast::Subscript::Index { index } => sqlast::Subscript::Index {
+            index: replace_grouping_calls_with_markers(index, args, next_marker),
+        },
+        sqlast::Subscript::Slice {
+            lower_bound,
+            upper_bound,
+            stride,
+        } => sqlast::Subscript::Slice {
+            lower_bound: lower_bound
+                .as_ref()
+                .map(|expr| replace_grouping_calls_with_markers(expr, args, next_marker)),
+            upper_bound: upper_bound
+                .as_ref()
+                .map(|expr| replace_grouping_calls_with_markers(expr, args, next_marker)),
+            stride: stride
+                .as_ref()
+                .map(|expr| replace_grouping_calls_with_markers(expr, args, next_marker)),
+        },
+    }
+}
+
+fn replace_grouping_markers_in_access_expr(
+    access_expr: &sqlast::AccessExpr,
+    args: &mut Vec<(String, Vec<String>)>,
+    next_marker: &mut i64,
+) -> sqlast::AccessExpr {
+    match access_expr {
+        sqlast::AccessExpr::Dot(expr) => {
+            sqlast::AccessExpr::Dot(replace_grouping_calls_with_markers(expr, args, next_marker))
+        }
+        sqlast::AccessExpr::Subscript(subscript) => sqlast::AccessExpr::Subscript(
+            replace_grouping_markers_in_subscript(subscript, args, next_marker),
+        ),
+    }
+}
+
+fn replace_grouping_markers_in_json_path(
+    path: &sqlast::JsonPath,
+    args: &mut Vec<(String, Vec<String>)>,
+    next_marker: &mut i64,
+) -> sqlast::JsonPath {
+    sqlast::JsonPath {
+        path: path
+            .path
+            .iter()
+            .map(|elem| match elem {
+                sqlast::JsonPathElem::Bracket { key } => sqlast::JsonPathElem::Bracket {
+                    key: replace_grouping_calls_with_markers(key, args, next_marker),
+                },
+                other => other.clone(),
+            })
+            .collect(),
+    }
+}
+
 fn replace_grouping_calls_with_markers(
     expr: &sqlast::Expr,
     args: &mut Vec<(String, Vec<String>)>,
     next_marker: &mut i64,
 ) -> sqlast::Expr {
     match expr {
+        sqlast::Expr::CompoundFieldAccess { root, access_chain } => {
+            sqlast::Expr::CompoundFieldAccess {
+                root: Box::new(replace_grouping_calls_with_markers(root, args, next_marker)),
+                access_chain: access_chain
+                    .iter()
+                    .map(|access| {
+                        replace_grouping_markers_in_access_expr(access, args, next_marker)
+                    })
+                    .collect(),
+            }
+        }
+        sqlast::Expr::JsonAccess { value, path } => sqlast::Expr::JsonAccess {
+            value: Box::new(replace_grouping_calls_with_markers(
+                value,
+                args,
+                next_marker,
+            )),
+            path: replace_grouping_markers_in_json_path(path, args, next_marker),
+        },
+        sqlast::Expr::IsFalse(inner) => sqlast::Expr::IsFalse(Box::new(
+            replace_grouping_calls_with_markers(inner, args, next_marker),
+        )),
+        sqlast::Expr::IsNotFalse(inner) => sqlast::Expr::IsNotFalse(Box::new(
+            replace_grouping_calls_with_markers(inner, args, next_marker),
+        )),
+        sqlast::Expr::IsTrue(inner) => sqlast::Expr::IsTrue(Box::new(
+            replace_grouping_calls_with_markers(inner, args, next_marker),
+        )),
+        sqlast::Expr::IsNotTrue(inner) => sqlast::Expr::IsNotTrue(Box::new(
+            replace_grouping_calls_with_markers(inner, args, next_marker),
+        )),
+        sqlast::Expr::IsNull(inner) => sqlast::Expr::IsNull(Box::new(
+            replace_grouping_calls_with_markers(inner, args, next_marker),
+        )),
+        sqlast::Expr::IsNotNull(inner) => sqlast::Expr::IsNotNull(Box::new(
+            replace_grouping_calls_with_markers(inner, args, next_marker),
+        )),
+        sqlast::Expr::IsUnknown(inner) => sqlast::Expr::IsUnknown(Box::new(
+            replace_grouping_calls_with_markers(inner, args, next_marker),
+        )),
+        sqlast::Expr::IsNotUnknown(inner) => sqlast::Expr::IsNotUnknown(Box::new(
+            replace_grouping_calls_with_markers(inner, args, next_marker),
+        )),
+        sqlast::Expr::IsDistinctFrom(left, right) => sqlast::Expr::IsDistinctFrom(
+            Box::new(replace_grouping_calls_with_markers(left, args, next_marker)),
+            Box::new(replace_grouping_calls_with_markers(
+                right,
+                args,
+                next_marker,
+            )),
+        ),
+        sqlast::Expr::IsNotDistinctFrom(left, right) => sqlast::Expr::IsNotDistinctFrom(
+            Box::new(replace_grouping_calls_with_markers(left, args, next_marker)),
+            Box::new(replace_grouping_calls_with_markers(
+                right,
+                args,
+                next_marker,
+            )),
+        ),
+        sqlast::Expr::IsNormalized {
+            expr: inner,
+            form,
+            negated,
+        } => sqlast::Expr::IsNormalized {
+            expr: Box::new(replace_grouping_calls_with_markers(
+                inner,
+                args,
+                next_marker,
+            )),
+            form: form.clone(),
+            negated: *negated,
+        },
+        sqlast::Expr::InList {
+            expr: inner,
+            list,
+            negated,
+        } => sqlast::Expr::InList {
+            expr: Box::new(replace_grouping_calls_with_markers(
+                inner,
+                args,
+                next_marker,
+            )),
+            list: list
+                .iter()
+                .map(|item| replace_grouping_calls_with_markers(item, args, next_marker))
+                .collect(),
+            negated: *negated,
+        },
+        sqlast::Expr::InSubquery {
+            expr: inner,
+            subquery,
+            negated,
+        } => sqlast::Expr::InSubquery {
+            expr: Box::new(replace_grouping_calls_with_markers(
+                inner,
+                args,
+                next_marker,
+            )),
+            subquery: subquery.clone(),
+            negated: *negated,
+        },
+        sqlast::Expr::InUnnest {
+            expr: inner,
+            array_expr,
+            negated,
+        } => sqlast::Expr::InUnnest {
+            expr: Box::new(replace_grouping_calls_with_markers(
+                inner,
+                args,
+                next_marker,
+            )),
+            array_expr: Box::new(replace_grouping_calls_with_markers(
+                array_expr,
+                args,
+                next_marker,
+            )),
+            negated: *negated,
+        },
+        sqlast::Expr::Between {
+            expr: inner,
+            negated,
+            low,
+            high,
+        } => sqlast::Expr::Between {
+            expr: Box::new(replace_grouping_calls_with_markers(
+                inner,
+                args,
+                next_marker,
+            )),
+            negated: *negated,
+            low: Box::new(replace_grouping_calls_with_markers(low, args, next_marker)),
+            high: Box::new(replace_grouping_calls_with_markers(high, args, next_marker)),
+        },
         sqlast::Expr::Function(func) => {
             let name = func.name.to_string().to_lowercase();
             if matches!(name.as_str(), "grouping" | "grouping_id")
@@ -2173,37 +2504,27 @@ fn replace_grouping_calls_with_markers(
                     sqlast::Value::Number(marker.to_string(), false).into(),
                 );
             }
-            // Not a grouping pseudo-column — recurse into args and OVER clause
-            let new_args = match &func.args {
-                sqlast::FunctionArguments::List(list) => {
-                    let new_list_args: Vec<_> = list
-                        .args
-                        .iter()
-                        .map(|arg| match arg {
-                            sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) => {
-                                sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(
-                                    replace_grouping_calls_with_markers(e, args, next_marker),
-                                ))
-                            }
-                            other => other.clone(),
-                        })
-                        .collect();
-                    sqlast::FunctionArguments::List(sqlast::FunctionArgumentList {
-                        args: new_list_args,
-                        ..list.clone()
-                    })
-                }
-                other => other.clone(),
-            };
             let mut new_func = func.clone();
-            new_func.args = new_args;
-            if let Some(ref window) = func.over {
-                new_func.over = Some(replace_grouping_markers_in_window(
-                    window,
+            new_func.parameters =
+                replace_grouping_markers_in_function_arguments(&func.parameters, args, next_marker);
+            new_func.args =
+                replace_grouping_markers_in_function_arguments(&func.args, args, next_marker);
+            new_func.filter = func.filter.as_ref().map(|filter| {
+                Box::new(replace_grouping_calls_with_markers(
+                    filter,
                     args,
                     next_marker,
-                ));
-            }
+                ))
+            });
+            new_func.over = func
+                .over
+                .as_ref()
+                .map(|window| replace_grouping_markers_in_window(window, args, next_marker));
+            new_func.within_group = func
+                .within_group
+                .iter()
+                .map(|item| replace_grouping_markers_in_order_by_expr(item, args, next_marker))
+                .collect();
             sqlast::Expr::Function(new_func)
         }
         sqlast::Expr::BinaryOp { left, op, right } => sqlast::Expr::BinaryOp {
@@ -2223,9 +2544,295 @@ fn replace_grouping_calls_with_markers(
                 next_marker,
             )),
         },
+        sqlast::Expr::Like {
+            negated,
+            any,
+            expr: inner,
+            pattern,
+            escape_char,
+        } => sqlast::Expr::Like {
+            negated: *negated,
+            any: *any,
+            expr: Box::new(replace_grouping_calls_with_markers(
+                inner,
+                args,
+                next_marker,
+            )),
+            pattern: Box::new(replace_grouping_calls_with_markers(
+                pattern,
+                args,
+                next_marker,
+            )),
+            escape_char: escape_char.clone(),
+        },
+        sqlast::Expr::ILike {
+            negated,
+            any,
+            expr: inner,
+            pattern,
+            escape_char,
+        } => sqlast::Expr::ILike {
+            negated: *negated,
+            any: *any,
+            expr: Box::new(replace_grouping_calls_with_markers(
+                inner,
+                args,
+                next_marker,
+            )),
+            pattern: Box::new(replace_grouping_calls_with_markers(
+                pattern,
+                args,
+                next_marker,
+            )),
+            escape_char: escape_char.clone(),
+        },
+        sqlast::Expr::SimilarTo {
+            negated,
+            expr: inner,
+            pattern,
+            escape_char,
+        } => sqlast::Expr::SimilarTo {
+            negated: *negated,
+            expr: Box::new(replace_grouping_calls_with_markers(
+                inner,
+                args,
+                next_marker,
+            )),
+            pattern: Box::new(replace_grouping_calls_with_markers(
+                pattern,
+                args,
+                next_marker,
+            )),
+            escape_char: escape_char.clone(),
+        },
+        sqlast::Expr::RLike {
+            negated,
+            expr: inner,
+            pattern,
+            regexp,
+        } => sqlast::Expr::RLike {
+            negated: *negated,
+            expr: Box::new(replace_grouping_calls_with_markers(
+                inner,
+                args,
+                next_marker,
+            )),
+            pattern: Box::new(replace_grouping_calls_with_markers(
+                pattern,
+                args,
+                next_marker,
+            )),
+            regexp: *regexp,
+        },
+        sqlast::Expr::AnyOp {
+            left,
+            compare_op,
+            right,
+            is_some,
+        } => sqlast::Expr::AnyOp {
+            left: Box::new(replace_grouping_calls_with_markers(left, args, next_marker)),
+            compare_op: compare_op.clone(),
+            right: Box::new(replace_grouping_calls_with_markers(
+                right,
+                args,
+                next_marker,
+            )),
+            is_some: *is_some,
+        },
+        sqlast::Expr::AllOp {
+            left,
+            compare_op,
+            right,
+        } => sqlast::Expr::AllOp {
+            left: Box::new(replace_grouping_calls_with_markers(left, args, next_marker)),
+            compare_op: compare_op.clone(),
+            right: Box::new(replace_grouping_calls_with_markers(
+                right,
+                args,
+                next_marker,
+            )),
+        },
+        sqlast::Expr::Convert {
+            is_try,
+            expr: inner,
+            data_type,
+            charset,
+            target_before_value,
+            styles,
+        } => sqlast::Expr::Convert {
+            is_try: *is_try,
+            expr: Box::new(replace_grouping_calls_with_markers(
+                inner,
+                args,
+                next_marker,
+            )),
+            data_type: data_type.clone(),
+            charset: charset.clone(),
+            target_before_value: *target_before_value,
+            styles: styles
+                .iter()
+                .map(|style| replace_grouping_calls_with_markers(style, args, next_marker))
+                .collect(),
+        },
+        sqlast::Expr::Cast {
+            kind,
+            expr: inner,
+            data_type,
+            array,
+            format,
+        } => sqlast::Expr::Cast {
+            kind: kind.clone(),
+            expr: Box::new(replace_grouping_calls_with_markers(
+                inner,
+                args,
+                next_marker,
+            )),
+            data_type: data_type.clone(),
+            array: *array,
+            format: format.clone(),
+        },
+        sqlast::Expr::AtTimeZone {
+            timestamp,
+            time_zone,
+        } => sqlast::Expr::AtTimeZone {
+            timestamp: Box::new(replace_grouping_calls_with_markers(
+                timestamp,
+                args,
+                next_marker,
+            )),
+            time_zone: Box::new(replace_grouping_calls_with_markers(
+                time_zone,
+                args,
+                next_marker,
+            )),
+        },
+        sqlast::Expr::Extract {
+            field,
+            syntax,
+            expr: inner,
+        } => sqlast::Expr::Extract {
+            field: field.clone(),
+            syntax: syntax.clone(),
+            expr: Box::new(replace_grouping_calls_with_markers(
+                inner,
+                args,
+                next_marker,
+            )),
+        },
+        sqlast::Expr::Ceil { expr: inner, field } => sqlast::Expr::Ceil {
+            expr: Box::new(replace_grouping_calls_with_markers(
+                inner,
+                args,
+                next_marker,
+            )),
+            field: field.clone(),
+        },
+        sqlast::Expr::Floor { expr: inner, field } => sqlast::Expr::Floor {
+            expr: Box::new(replace_grouping_calls_with_markers(
+                inner,
+                args,
+                next_marker,
+            )),
+            field: field.clone(),
+        },
+        sqlast::Expr::Position { expr: inner, r#in } => sqlast::Expr::Position {
+            expr: Box::new(replace_grouping_calls_with_markers(
+                inner,
+                args,
+                next_marker,
+            )),
+            r#in: Box::new(replace_grouping_calls_with_markers(r#in, args, next_marker)),
+        },
+        sqlast::Expr::Substring {
+            expr: inner,
+            substring_from,
+            substring_for,
+            special,
+            shorthand,
+        } => sqlast::Expr::Substring {
+            expr: Box::new(replace_grouping_calls_with_markers(
+                inner,
+                args,
+                next_marker,
+            )),
+            substring_from: substring_from
+                .as_ref()
+                .map(|expr| Box::new(replace_grouping_calls_with_markers(expr, args, next_marker))),
+            substring_for: substring_for
+                .as_ref()
+                .map(|expr| Box::new(replace_grouping_calls_with_markers(expr, args, next_marker))),
+            special: *special,
+            shorthand: *shorthand,
+        },
+        sqlast::Expr::Trim {
+            expr: inner,
+            trim_where,
+            trim_what,
+            trim_characters,
+        } => sqlast::Expr::Trim {
+            expr: Box::new(replace_grouping_calls_with_markers(
+                inner,
+                args,
+                next_marker,
+            )),
+            trim_where: trim_where.clone(),
+            trim_what: trim_what
+                .as_ref()
+                .map(|expr| Box::new(replace_grouping_calls_with_markers(expr, args, next_marker))),
+            trim_characters: trim_characters.as_ref().map(|exprs| {
+                exprs
+                    .iter()
+                    .map(|expr| replace_grouping_calls_with_markers(expr, args, next_marker))
+                    .collect()
+            }),
+        },
+        sqlast::Expr::Overlay {
+            expr: inner,
+            overlay_what,
+            overlay_from,
+            overlay_for,
+        } => sqlast::Expr::Overlay {
+            expr: Box::new(replace_grouping_calls_with_markers(
+                inner,
+                args,
+                next_marker,
+            )),
+            overlay_what: Box::new(replace_grouping_calls_with_markers(
+                overlay_what,
+                args,
+                next_marker,
+            )),
+            overlay_from: Box::new(replace_grouping_calls_with_markers(
+                overlay_from,
+                args,
+                next_marker,
+            )),
+            overlay_for: overlay_for
+                .as_ref()
+                .map(|expr| Box::new(replace_grouping_calls_with_markers(expr, args, next_marker))),
+        },
+        sqlast::Expr::Collate {
+            expr: inner,
+            collation,
+        } => sqlast::Expr::Collate {
+            expr: Box::new(replace_grouping_calls_with_markers(
+                inner,
+                args,
+                next_marker,
+            )),
+            collation: collation.clone(),
+        },
         sqlast::Expr::Nested(inner) => sqlast::Expr::Nested(Box::new(
             replace_grouping_calls_with_markers(inner, args, next_marker),
         )),
+        sqlast::Expr::Prefixed { prefix, value } => sqlast::Expr::Prefixed {
+            prefix: prefix.clone(),
+            value: Box::new(replace_grouping_calls_with_markers(
+                value,
+                args,
+                next_marker,
+            )),
+        },
         sqlast::Expr::Case {
             case_token,
             end_token,
@@ -2253,6 +2860,137 @@ fn replace_grouping_calls_with_markers(
                 .as_ref()
                 .map(|e| Box::new(replace_grouping_calls_with_markers(e, args, next_marker))),
         },
+        sqlast::Expr::GroupingSets(groups) => sqlast::Expr::GroupingSets(
+            groups
+                .iter()
+                .map(|group| {
+                    group
+                        .iter()
+                        .map(|expr| replace_grouping_calls_with_markers(expr, args, next_marker))
+                        .collect()
+                })
+                .collect(),
+        ),
+        sqlast::Expr::Cube(groups) => sqlast::Expr::Cube(
+            groups
+                .iter()
+                .map(|group| {
+                    group
+                        .iter()
+                        .map(|expr| replace_grouping_calls_with_markers(expr, args, next_marker))
+                        .collect()
+                })
+                .collect(),
+        ),
+        sqlast::Expr::Rollup(groups) => sqlast::Expr::Rollup(
+            groups
+                .iter()
+                .map(|group| {
+                    group
+                        .iter()
+                        .map(|expr| replace_grouping_calls_with_markers(expr, args, next_marker))
+                        .collect()
+                })
+                .collect(),
+        ),
+        sqlast::Expr::Tuple(exprs) => sqlast::Expr::Tuple(
+            exprs
+                .iter()
+                .map(|expr| replace_grouping_calls_with_markers(expr, args, next_marker))
+                .collect(),
+        ),
+        sqlast::Expr::Struct { values, fields } => sqlast::Expr::Struct {
+            values: values
+                .iter()
+                .map(|expr| replace_grouping_calls_with_markers(expr, args, next_marker))
+                .collect(),
+            fields: fields.clone(),
+        },
+        sqlast::Expr::Named { expr: inner, name } => sqlast::Expr::Named {
+            expr: Box::new(replace_grouping_calls_with_markers(
+                inner,
+                args,
+                next_marker,
+            )),
+            name: name.clone(),
+        },
+        sqlast::Expr::Dictionary(fields) => sqlast::Expr::Dictionary(
+            fields
+                .iter()
+                .map(|field| sqlast::DictionaryField {
+                    key: field.key.clone(),
+                    value: Box::new(replace_grouping_calls_with_markers(
+                        &field.value,
+                        args,
+                        next_marker,
+                    )),
+                })
+                .collect(),
+        ),
+        sqlast::Expr::Map(map) => sqlast::Expr::Map(sqlast::Map {
+            entries: map
+                .entries
+                .iter()
+                .map(|entry| sqlast::MapEntry {
+                    key: Box::new(replace_grouping_calls_with_markers(
+                        &entry.key,
+                        args,
+                        next_marker,
+                    )),
+                    value: Box::new(replace_grouping_calls_with_markers(
+                        &entry.value,
+                        args,
+                        next_marker,
+                    )),
+                })
+                .collect(),
+        }),
+        sqlast::Expr::Array(array) => sqlast::Expr::Array(sqlast::Array {
+            elem: array
+                .elem
+                .iter()
+                .map(|expr| replace_grouping_calls_with_markers(expr, args, next_marker))
+                .collect(),
+            named: array.named,
+        }),
+        sqlast::Expr::Interval(interval) => sqlast::Expr::Interval(sqlast::Interval {
+            value: Box::new(replace_grouping_calls_with_markers(
+                &interval.value,
+                args,
+                next_marker,
+            )),
+            leading_field: interval.leading_field.clone(),
+            leading_precision: interval.leading_precision,
+            last_field: interval.last_field.clone(),
+            fractional_seconds_precision: interval.fractional_seconds_precision,
+        }),
+        sqlast::Expr::OuterJoin(inner) => sqlast::Expr::OuterJoin(Box::new(
+            replace_grouping_calls_with_markers(inner, args, next_marker),
+        )),
+        sqlast::Expr::Prior(inner) => sqlast::Expr::Prior(Box::new(
+            replace_grouping_calls_with_markers(inner, args, next_marker),
+        )),
+        sqlast::Expr::Lambda(lambda) => sqlast::Expr::Lambda(sqlast::LambdaFunction {
+            params: lambda.params.clone(),
+            body: Box::new(replace_grouping_calls_with_markers(
+                &lambda.body,
+                args,
+                next_marker,
+            )),
+            syntax: lambda.syntax,
+        }),
+        sqlast::Expr::MemberOf(member_of) => sqlast::Expr::MemberOf(sqlast::MemberOf {
+            value: Box::new(replace_grouping_calls_with_markers(
+                &member_of.value,
+                args,
+                next_marker,
+            )),
+            array: Box::new(replace_grouping_calls_with_markers(
+                &member_of.array,
+                args,
+                next_marker,
+            )),
+        }),
         other => other.clone(),
     }
 }
@@ -2272,10 +3010,7 @@ fn replace_grouping_markers_in_window(
             let order_by = spec
                 .order_by
                 .iter()
-                .map(|ob| sqlast::OrderByExpr {
-                    expr: replace_grouping_calls_with_markers(&ob.expr, args, next_marker),
-                    ..ob.clone()
-                })
+                .map(|ob| replace_grouping_markers_in_order_by_expr(ob, args, next_marker))
                 .collect();
             sqlast::WindowType::WindowSpec(sqlast::WindowSpec {
                 partition_by,
@@ -2344,29 +3079,44 @@ fn replace_grouping_markers_in_sort_item(
     item: &SortItem,
     grouping_fn_args: &[(String, Vec<String>)],
     grouping_fn_ids: &[(String, ColumnId)],
+    emitted_marker_count: usize,
 ) -> SortItem {
     SortItem {
-        expr: replace_grouping_markers_in_typed_expr(&item.expr, grouping_fn_args, grouping_fn_ids),
+        expr: replace_grouping_markers_in_typed_expr(
+            &item.expr,
+            grouping_fn_args,
+            grouping_fn_ids,
+            emitted_marker_count,
+        ),
         asc: item.asc,
         nulls_first: item.nulls_first,
     }
+}
+
+fn grouping_marker_index(value: i64, emitted_marker_count: usize) -> Option<usize> {
+    let offset = (-9000i128).checked_sub(value as i128)?;
+    if offset < 0 {
+        return None;
+    }
+    let idx = usize::try_from(offset).ok()?;
+    (idx < emitted_marker_count).then_some(idx)
 }
 
 fn replace_grouping_markers_in_typed_expr(
     expr: &TypedExpr,
     grouping_fn_args: &[(String, Vec<String>)],
     grouping_fn_ids: &[(String, ColumnId)],
+    emitted_marker_count: usize,
 ) -> TypedExpr {
     match &expr.kind {
-        ExprKind::Literal(crate::sql::analysis::LiteralValue::Int(v)) if *v <= -9000 => {
-            let idx = ((-9000i64) - v) as usize;
-            if let Some((fn_name, _)) = grouping_fn_args.get(idx) {
+        ExprKind::Literal(crate::sql::analysis::LiteralValue::Int(v)) => {
+            if let Some(idx) = grouping_marker_index(*v, emitted_marker_count)
+                && let (Some((fn_name, _)), Some((_, column_id))) =
+                    (grouping_fn_args.get(idx), grouping_fn_ids.get(idx))
+            {
                 return TypedExpr {
                     kind: ExprKind::ColumnRef {
-                        column_id: grouping_fn_ids
-                            .get(idx)
-                            .map(|(_, id)| *id)
-                            .expect("grouping_fn id must exist for marker index"),
+                        column_id: *column_id,
                         qualifier: None,
                         column: fn_name.clone(),
                     },
@@ -2384,12 +3134,14 @@ fn replace_grouping_markers_in_typed_expr(
                     left,
                     grouping_fn_args,
                     grouping_fn_ids,
+                    emitted_marker_count,
                 )),
                 op: *op,
                 right: Box::new(replace_grouping_markers_in_typed_expr(
                     right,
                     grouping_fn_args,
                     grouping_fn_ids,
+                    emitted_marker_count,
                 )),
             },
         },
@@ -2402,6 +3154,7 @@ fn replace_grouping_markers_in_typed_expr(
                     inner,
                     grouping_fn_args,
                     grouping_fn_ids,
+                    emitted_marker_count,
                 )),
             },
         },
@@ -2421,6 +3174,7 @@ fn replace_grouping_markers_in_typed_expr(
                             arg,
                             grouping_fn_args,
                             grouping_fn_ids,
+                            emitted_marker_count,
                         )
                     })
                     .collect(),
@@ -2436,6 +3190,7 @@ fn replace_grouping_markers_in_typed_expr(
                     body,
                     grouping_fn_args,
                     grouping_fn_ids,
+                    emitted_marker_count,
                 )),
             },
         },
@@ -2456,6 +3211,7 @@ fn replace_grouping_markers_in_typed_expr(
                             arg,
                             grouping_fn_args,
                             grouping_fn_ids,
+                            emitted_marker_count,
                         )
                     })
                     .collect(),
@@ -2467,6 +3223,7 @@ fn replace_grouping_markers_in_typed_expr(
                             item,
                             grouping_fn_args,
                             grouping_fn_ids,
+                            emitted_marker_count,
                         )
                     })
                     .collect(),
@@ -2483,6 +3240,7 @@ fn replace_grouping_markers_in_typed_expr(
                     inner,
                     grouping_fn_args,
                     grouping_fn_ids,
+                    emitted_marker_count,
                 )),
                 target: target.clone(),
             },
@@ -2498,6 +3256,7 @@ fn replace_grouping_markers_in_typed_expr(
                     inner,
                     grouping_fn_args,
                     grouping_fn_ids,
+                    emitted_marker_count,
                 )),
                 negated: *negated,
             },
@@ -2514,6 +3273,7 @@ fn replace_grouping_markers_in_typed_expr(
                     inner,
                     grouping_fn_args,
                     grouping_fn_ids,
+                    emitted_marker_count,
                 )),
                 list: list
                     .iter()
@@ -2522,6 +3282,7 @@ fn replace_grouping_markers_in_typed_expr(
                             item,
                             grouping_fn_args,
                             grouping_fn_ids,
+                            emitted_marker_count,
                         )
                     })
                     .collect(),
@@ -2541,16 +3302,19 @@ fn replace_grouping_markers_in_typed_expr(
                     inner,
                     grouping_fn_args,
                     grouping_fn_ids,
+                    emitted_marker_count,
                 )),
                 low: Box::new(replace_grouping_markers_in_typed_expr(
                     low,
                     grouping_fn_args,
                     grouping_fn_ids,
+                    emitted_marker_count,
                 )),
                 high: Box::new(replace_grouping_markers_in_typed_expr(
                     high,
                     grouping_fn_args,
                     grouping_fn_ids,
+                    emitted_marker_count,
                 )),
                 negated: *negated,
             },
@@ -2567,11 +3331,13 @@ fn replace_grouping_markers_in_typed_expr(
                     inner,
                     grouping_fn_args,
                     grouping_fn_ids,
+                    emitted_marker_count,
                 )),
                 pattern: Box::new(replace_grouping_markers_in_typed_expr(
                     pattern,
                     grouping_fn_args,
                     grouping_fn_ids,
+                    emitted_marker_count,
                 )),
                 negated: *negated,
             },
@@ -2583,6 +3349,7 @@ fn replace_grouping_markers_in_typed_expr(
                 inner,
                 grouping_fn_args,
                 grouping_fn_ids,
+                emitted_marker_count,
             ))),
         },
         ExprKind::WindowCall {
@@ -2601,20 +3368,35 @@ fn replace_grouping_markers_in_typed_expr(
                 args: args
                     .iter()
                     .map(|a| {
-                        replace_grouping_markers_in_typed_expr(a, grouping_fn_args, grouping_fn_ids)
+                        replace_grouping_markers_in_typed_expr(
+                            a,
+                            grouping_fn_args,
+                            grouping_fn_ids,
+                            emitted_marker_count,
+                        )
                     })
                     .collect(),
                 distinct: *distinct,
                 partition_by: partition_by
                     .iter()
                     .map(|p| {
-                        replace_grouping_markers_in_typed_expr(p, grouping_fn_args, grouping_fn_ids)
+                        replace_grouping_markers_in_typed_expr(
+                            p,
+                            grouping_fn_args,
+                            grouping_fn_ids,
+                            emitted_marker_count,
+                        )
                     })
                     .collect(),
                 order_by: order_by
                     .iter()
                     .map(|ob| {
-                        replace_grouping_markers_in_sort_item(ob, grouping_fn_args, grouping_fn_ids)
+                        replace_grouping_markers_in_sort_item(
+                            ob,
+                            grouping_fn_args,
+                            grouping_fn_ids,
+                            emitted_marker_count,
+                        )
                     })
                     .collect(),
                 window_frame: window_frame.clone(),
@@ -2634,6 +3416,7 @@ fn replace_grouping_markers_in_typed_expr(
                         o,
                         grouping_fn_args,
                         grouping_fn_ids,
+                        emitted_marker_count,
                     ))
                 }),
                 when_then: when_then
@@ -2644,11 +3427,13 @@ fn replace_grouping_markers_in_typed_expr(
                                 w,
                                 grouping_fn_args,
                                 grouping_fn_ids,
+                                emitted_marker_count,
                             ),
                             replace_grouping_markers_in_typed_expr(
                                 t,
                                 grouping_fn_args,
                                 grouping_fn_ids,
+                                emitted_marker_count,
                             ),
                         )
                     })
@@ -2658,6 +3443,7 @@ fn replace_grouping_markers_in_typed_expr(
                         e,
                         grouping_fn_args,
                         grouping_fn_ids,
+                        emitted_marker_count,
                     ))
                 }),
             },
@@ -2674,6 +3460,7 @@ fn replace_grouping_markers_in_typed_expr(
                     inner,
                     grouping_fn_args,
                     grouping_fn_ids,
+                    emitted_marker_count,
                 )),
                 value: *value,
                 negated: *negated,
@@ -2688,6 +3475,7 @@ fn replace_grouping_markers_in_typed_expr(
                     body,
                     grouping_fn_args,
                     grouping_fn_ids,
+                    emitted_marker_count,
                 )),
             },
         },
@@ -4723,6 +5511,29 @@ mod tests {
     }
 
     #[test]
+    fn p1_grouping_marker_replaced_inside_cast_projection() {
+        let resolved = parse_and_analyze(
+            "SELECT CAST(grouping(k1) AS BIGINT) AS g FROM t1 GROUP BY ROLLUP(k1)",
+        )
+        .expect("CAST around GROUPING projection should work");
+        let QueryBody::Select(sel) = &resolved.body else {
+            panic!("expected Select body");
+        };
+        let projection = &sel.projection[0].expr;
+        let gb_id = grouping_fn_group_by_id(sel, "__grouping_fn_0");
+        let proj_id = find_grouping_ref_id(projection, "__grouping_fn_0")
+            .expect("expected cast projection grouping ColumnRef");
+        assert_eq!(
+            proj_id, gb_id,
+            "cast projection grouping ref must reuse the group-by key id"
+        );
+        assert!(
+            !contains_grouping_marker_literal(projection),
+            "cast projection must not retain grouping marker literal: {projection:?}"
+        );
+    }
+
+    #[test]
     fn p1_grouping_id_marker_replaced_inside_nested_projection() {
         let resolved = parse_and_analyze(
             "SELECT abs(grouping_id(k1, k2)) AS gid \
@@ -4745,6 +5556,106 @@ mod tests {
             !contains_grouping_marker_literal(projection),
             "nested grouping_id projection must not retain grouping marker literal: {projection:?}"
         );
+    }
+
+    #[test]
+    fn p1_grouping_marker_replaced_in_having_in_list() {
+        let resolved =
+            parse_and_analyze("SELECT k1 FROM t1 GROUP BY ROLLUP(k1) HAVING grouping(k1) IN (0)")
+                .expect("GROUPING in HAVING IN list should work");
+        let QueryBody::Select(sel) = &resolved.body else {
+            panic!("expected Select body");
+        };
+        let having = sel.having.as_ref().expect("expected HAVING expression");
+        let gb_id = grouping_fn_group_by_id(sel, "__grouping_fn_0");
+        let having_id = find_grouping_ref_id(having, "__grouping_fn_0")
+            .expect("expected HAVING IN grouping ColumnRef");
+        assert_eq!(
+            having_id, gb_id,
+            "HAVING IN grouping ref must reuse the group-by key id"
+        );
+        assert!(
+            !contains_grouping_marker_literal(having),
+            "HAVING IN must not retain grouping marker literal: {having:?}"
+        );
+    }
+
+    #[test]
+    fn p1_grouping_marker_replaced_in_aggregate_order_by() {
+        let resolved = parse_and_analyze(
+            "SELECT sum(v1 ORDER BY grouping(k1)) AS g \
+             FROM t1 GROUP BY ROLLUP(k1)",
+        )
+        .expect("GROUPING in aggregate ORDER BY should work");
+        let QueryBody::Select(sel) = &resolved.body else {
+            panic!("expected Select body");
+        };
+        let projection = &sel.projection[0].expr;
+        let gb_id = grouping_fn_group_by_id(sel, "__grouping_fn_0");
+        let proj_id = find_grouping_ref_id(projection, "__grouping_fn_0")
+            .expect("expected aggregate ORDER BY grouping ColumnRef");
+        assert_eq!(
+            proj_id, gb_id,
+            "aggregate ORDER BY grouping ref must reuse the group-by key id"
+        );
+        assert!(
+            !contains_grouping_marker_literal(projection),
+            "aggregate ORDER BY must not retain grouping marker literal: {projection:?}"
+        );
+    }
+
+    #[test]
+    fn p1_synthetic_grouping_does_not_replace_real_marker_literal() {
+        let resolved = parse_and_analyze("SELECT -9000 AS marker, k1 FROM t1 GROUP BY ROLLUP(k1)")
+            .expect("ROLLUP with real -9000 literal should work");
+        let QueryBody::Select(sel) = &resolved.body else {
+            panic!("expected Select body");
+        };
+        assert!(
+            sel.repeat
+                .as_ref()
+                .expect("ROLLUP should produce RepeatInfo")
+                .grouping_fn_args
+                .iter()
+                .any(|(name, _)| name == "__grouping_fn_0"),
+            "ROLLUP without explicit GROUPING should still synthesize grouping_fn"
+        );
+        assert!(
+            find_grouping_ref_id(&sel.projection[0].expr, "__grouping_fn_0").is_none(),
+            "real -9000 literal must not be rewritten to synthetic grouping ColumnRef"
+        );
+        match &sel.projection[0].expr.kind {
+            ExprKind::Literal(crate::sql::analysis::LiteralValue::Int(v)) => assert_eq!(*v, -9000),
+            ExprKind::UnaryOp { expr, .. } => match &expr.kind {
+                ExprKind::Literal(crate::sql::analysis::LiteralValue::Int(v)) => {
+                    assert_eq!(*v, 9000)
+                }
+                other => panic!("expected numeric literal under unary op, got {other:?}"),
+            },
+            other => panic!("expected real -9000 literal to remain literal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn p1_typed_marker_replacement_ignores_synthetic_grouping_entry() {
+        let expr = TypedExpr {
+            kind: ExprKind::Literal(crate::sql::analysis::LiteralValue::Int(-9000)),
+            data_type: DataType::Int64,
+            nullable: false,
+        };
+        let grouping_fn_args = vec![("__grouping_fn_0".to_string(), vec!["k1".to_string()])];
+        let grouping_fn_ids = vec![(
+            "__grouping_fn_0".to_string(),
+            crate::sql::column_id::ColumnId::new_for_test(99),
+        )];
+
+        let replaced =
+            replace_grouping_markers_in_typed_expr(&expr, &grouping_fn_args, &grouping_fn_ids, 0);
+
+        match replaced.kind {
+            ExprKind::Literal(crate::sql::analysis::LiteralValue::Int(v)) => assert_eq!(v, -9000),
+            other => panic!("real -9000 literal must remain literal, got {other:?}"),
+        }
     }
 
     #[test]
