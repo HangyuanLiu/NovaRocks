@@ -30,10 +30,7 @@ use crate::connector::starrocks::table::mv_refresh::{
     acquire_mv_refresh_lock, load_current_iceberg_base_table, parse_iceberg_table_refs,
     run_mv_full_select_chunks, single_snapshot_map, single_table_uuid_map,
 };
-use crate::connector::starrocks::table::mv_shape::{
-    AggregateMvShape, IncrementalMvShape, JoinAggregateMvShape, UnionBranchKind,
-    classify_incremental_mv_query,
-};
+use crate::connector::starrocks::table::mv_shape::UnionBranchKind;
 use crate::engine::mv::iceberg_target_apply::{
     ICEBERG_MV_APPLY_KEY_COLUMN, ICEBERG_MV_APPLY_KEY_SOURCE_BASE_ROW_ID,
     ICEBERG_MV_APPLY_KEY_SOURCE_GROUP_ROW_ID, ICEBERG_MV_APPLY_KEY_SOURCE_JOIN_ROW_KEY,
@@ -413,40 +410,18 @@ fn iceberg_mv_target_exists(
     }
 }
 
-fn validate_join_shape_base_refs(
-    shape: &crate::connector::starrocks::table::mv_shape::JoinProjectionFilterMvShape,
-    base_refs: &[IcebergTableRef],
-) -> Result<(), String> {
-    for name in [
-        shape.left_table.to_string().to_ascii_lowercase(),
-        shape.right_table.to_string().to_ascii_lowercase(),
-    ] {
-        if !base_refs
-            .iter()
-            .any(|base| base.fqn().eq_ignore_ascii_case(&name))
-        {
-            return Err(format!(
-                "join MV shape references base {name} but analyzer resolved {base_refs:?}"
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn validate_aggregate_fan_in_base_refs(
-    shape: &AggregateMvShape,
-    base_refs: &[IcebergTableRef],
-) -> Result<(), String> {
-    let mut fan_in_refs = BTreeSet::new();
-    for base in &shape.fan_in_bases {
-        let fqn = base.to_string().to_ascii_lowercase();
-        if !fan_in_refs.insert(fqn.clone()) {
-            return Err(format!(
-                "aggregate-over-UNION-ALL MV duplicate fan-in base {fqn} is not supported in this build"
-            ));
-        }
-    }
-
+/// Validate the resolved base-ref set for an aggregate-over-UNION-ALL fan-in MV.
+///
+/// The legacy invariant compared the classifier's `fan_in_bases` against the
+/// analyzer-resolved `base_refs` and required exact equality. With the shape
+/// retired, the resolved `base_refs` ARE the fan-in base set (the analyzer
+/// resolved the union branches), so the "fan_in == resolved" comparison is
+/// trivially satisfied by construction. The only remaining invariant to enforce
+/// is the one the legacy check also enforced independently: the resolved base
+/// refs must be distinct (a duplicate fan-in base is not supported in this
+/// build). Each resolved base is further checked against the persisted schema
+/// contract by `validate_aggregate_schema_contract_for_base`.
+fn validate_aggregate_fan_in_base_refs(base_refs: &[IcebergTableRef]) -> Result<(), String> {
     let mut resolved_refs = BTreeSet::new();
     for base in base_refs {
         let fqn = base.fqn().to_ascii_lowercase();
@@ -455,11 +430,6 @@ fn validate_aggregate_fan_in_base_refs(
                 "aggregate-over-UNION-ALL MV duplicate resolved base ref {fqn} is not supported in this build"
             ));
         }
-    }
-    if fan_in_refs != resolved_refs {
-        return Err(format!(
-            "aggregate-over-UNION-ALL MV fan-in bases must exactly match resolved base refs: fan_in={fan_in_refs:?}, resolved={resolved_refs:?}"
-        ));
     }
     Ok(())
 }
@@ -652,41 +622,47 @@ fn validate_branch_union_contract(
     }
 }
 
-fn validate_union_projection_shape_base_refs(
-    union_shape: &crate::connector::starrocks::table::mv_shape::UnionAllMvShape,
+/// Validate that the resolved `base_refs` exactly match the persisted base set
+/// in the schema contract and that the contract has one base per expected branch.
+///
+/// Replaces the legacy `UnionAllMvShape`-based check: instead of collecting
+/// per-branch `base_table` FQNs from the classifier, we compare the resolved
+/// `base_refs` (already the authority for base identity) against the FQNs
+/// recorded in `schema_contract.bases[]`. The accept/reject contract is
+/// identical: a mismatch between the resolved refs and the contract base set is
+/// an error; a match is accepted.
+fn validate_union_projection_base_refs(
     base_refs: &[IcebergTableRef],
+    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
 ) -> Result<(), String> {
-    if union_shape.branch_kind != UnionBranchKind::ProjectionFilter {
-        return Err(
-            "UNION ALL projection/filter refresh requires projection/filter branches".to_string(),
-        );
-    }
-    let mut branch_refs = BTreeSet::new();
-    for branch in &union_shape.branches {
-        let IncrementalMvShape::ProjectionFilter(branch) = branch else {
-            return Err(
-                "UNION ALL projection/filter refresh requires projection/filter branches"
-                    .to_string(),
-            );
-        };
-        branch_refs.insert(branch.base_table.to_string().to_ascii_lowercase());
-    }
-    let resolved_refs = base_refs
+    let contract_fqns = schema_contract
+        .bases
+        .iter()
+        .map(|base| base.table_fqn.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    let resolved_fqns = base_refs
         .iter()
         .map(|base_ref| base_ref.fqn().to_ascii_lowercase())
         .collect::<BTreeSet<_>>();
-    if branch_refs != resolved_refs {
+    if contract_fqns != resolved_fqns {
         return Err(format!(
-            "UNION ALL projection/filter MV branch bases must exactly match resolved base refs: branch_bases={branch_refs:?}, resolved={resolved_refs:?}"
+            "UNION ALL projection/filter MV branch bases must exactly match resolved base refs: contract_bases={contract_fqns:?}, resolved={resolved_fqns:?}"
         ));
     }
     Ok(())
 }
 
+/// Validate the persisted schema contract for a single base table of a UNION ALL
+/// projection/filter MV.
+///
+/// The `branch_count` parameter replaces the legacy `union_shape.branches.len()`
+/// access: callers source it from `contract.branch.branch_count` (the persisted
+/// contract) so the check remains byte-identical — a mismatch between the
+/// contract-recorded count and the caller-supplied count is still an error.
 fn validate_union_projection_schema_contract_for_base(
     iceberg_target: &IcebergMvTarget,
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
-    union_shape: &crate::connector::starrocks::table::mv_shape::UnionAllMvShape,
+    branch_count: usize,
     base_ref: &IcebergTableRef,
     base_table: &iceberg::table::Table,
     target_table: &iceberg::table::Table,
@@ -712,14 +688,14 @@ fn validate_union_projection_schema_contract_for_base(
             iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
         )
     })?;
-    if branch_contract.branch_count != union_shape.branches.len() as u32 {
+    if branch_contract.branch_count != branch_count as u32 {
         return Err(format!(
             "iceberg UNION ALL projection/filter MV {}.{}.{} branch contract expected {} branches, query has {}",
             iceberg_target.catalog,
             iceberg_target.namespace,
             iceberg_target.table,
             branch_contract.branch_count,
-            union_shape.branches.len()
+            branch_count
         ));
     }
     if branch_contract.inner_apply_key_source
@@ -808,18 +784,6 @@ fn validate_union_projection_schema_contract_for_base(
     }
 }
 
-fn is_join_projection_filter_mv(shape: &IncrementalMvShape) -> bool {
-    matches!(shape, IncrementalMvShape::JoinProjectionFilter(_))
-}
-
-fn aggregate_shape_for_layout(shape: &IncrementalMvShape) -> Option<AggregateMvShape> {
-    match shape {
-        IncrementalMvShape::Aggregate(shape) => Some(shape.clone()),
-        IncrementalMvShape::JoinAggregate(shape) => Some(shape.as_aggregate_shape_for_layout()),
-        _ => None,
-    }
-}
-
 pub(crate) fn union_branch_inner_apply_key(
     branch_kind: UnionBranchKind,
 ) -> crate::meta::repository::mv_contract::ApplyKeySource {
@@ -878,8 +842,8 @@ fn aggregate_state_hidden_columns_from_property(
 /// query. For a branch-union aggregate (`BranchScoped(GroupRowId)`) it is built
 /// from the *first* branch — matching the legacy single-representative target
 /// layout. The first branch may itself be a simple aggregate, an aggregate over
-/// a join, or a fan-in aggregate; `classify_incremental_mv_query` derives the
-/// right `AggregateMvShape` in every case.
+/// a join, or a fan-in aggregate; the FROM-agnostic `extract_aggregate_sql_calls`
+/// extractor yields the right aggregate-call surface in every case.
 fn representative_aggregate_layout(
     property: &RefreshFragmentProperty,
     canonical_query: &sqlparser::ast::Query,
@@ -888,12 +852,10 @@ fn representative_aggregate_layout(
     match inner_row_identity(&property.identity) {
         TargetIdentity::BaseRowId | TargetIdentity::JoinRowKey(_, _) => Ok(None),
         TargetIdentity::GroupRowId(_) => {
-            let (aggregate_shape, resolved_query) =
-                representative_aggregate_shape(property, canonical_query, analysis)?;
+            let (aggregate_calls, resolved_query) =
+                representative_aggregate_calls(property, canonical_query, analysis)?;
             let layout = build_aggregate_layout_from_resolved_query(
-                &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls::from(
-                    &aggregate_shape,
-                ),
+                &aggregate_calls,
                 &analysis.output_columns,
                 resolved_query,
             )?;
@@ -908,37 +870,38 @@ fn representative_aggregate_layout(
     }
 }
 
-/// The representative aggregate `(shape, resolved query)` for the property:
-/// the whole query for a non-branch aggregate, or the first branch for a
-/// branch-union aggregate. The shape is classified locally so the build no
-/// longer depends on a top-level `IncrementalMvShape`.
-fn representative_aggregate_shape<'a>(
+/// The representative aggregate `(calls, resolved query)` for the property: the
+/// whole query for a non-branch aggregate, or the first branch for a
+/// branch-union aggregate. The aggregate-call surface is sourced from the
+/// FROM-agnostic [`extract_aggregate_sql_calls`] extractor, so a simple
+/// aggregate, an aggregate over a join, and a fan-in aggregate all yield the
+/// same `group_keys`/`aggregates`/`visible_outputs` the layout builder needs —
+/// the build is driven by the focused extractor and the persisted contract.
+fn representative_aggregate_calls<'a>(
     property: &RefreshFragmentProperty,
     canonical_query: &sqlparser::ast::Query,
     analysis: &'a MvAnalysis,
-) -> Result<(AggregateMvShape, &'a crate::sql::analysis::ResolvedQuery), String> {
+) -> Result<
+    (
+        crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls,
+        &'a crate::sql::analysis::ResolvedQuery,
+    ),
+    String,
+> {
     if matches!(property.identity, TargetIdentity::BranchScoped(_)) {
         let first_branch_ast = first_union_branch_ast_query(canonical_query)?;
-        let aggregate_shape = aggregate_shape_from_query(&first_branch_ast)?;
+        let aggregate_calls =
+            crate::connector::starrocks::table::aggregate_sql_calls::extract_aggregate_sql_calls(
+                &first_branch_ast,
+            )?;
         let resolved_query = first_union_branch_resolved_query(&analysis.resolved_query)?;
-        Ok((aggregate_shape, resolved_query))
+        Ok((aggregate_calls, resolved_query))
     } else {
-        let aggregate_shape = aggregate_shape_from_query(canonical_query)?;
-        Ok((aggregate_shape, &analysis.resolved_query))
-    }
-}
-
-/// Classify a non-UNION-ALL query into its `AggregateMvShape` for layout. The
-/// query may be a simple aggregate, an aggregate over a join, or a fan-in
-/// aggregate; all three lower to an `AggregateMvShape` (the join-aggregate via
-/// `as_aggregate_shape_for_layout`).
-fn aggregate_shape_from_query(query: &sqlparser::ast::Query) -> Result<AggregateMvShape, String> {
-    match classify_incremental_mv_query(query)? {
-        IncrementalMvShape::Aggregate(shape) => Ok(shape),
-        IncrementalMvShape::JoinAggregate(shape) => Ok(shape.as_aggregate_shape_for_layout()),
-        other => Err(format!(
-            "Iceberg MV aggregate target layout requires an aggregate query, got {other:?}"
-        )),
+        let aggregate_calls =
+            crate::connector::starrocks::table::aggregate_sql_calls::extract_aggregate_sql_calls(
+                canonical_query,
+            )?;
+        Ok((aggregate_calls, &analysis.resolved_query))
     }
 }
 
@@ -1077,26 +1040,19 @@ fn base_snapshot_status_for_refresh(
 }
 
 fn iceberg_aggregate_target_columns(
-    shape: &AggregateMvShape,
+    calls: &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls,
     analysis: &MvAnalysis,
 ) -> Result<Vec<crate::sql::parser::ast::TableColumnDef>, String> {
-    let layout = build_aggregate_layout_from_analysis(
-        &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls::from(shape),
-        analysis,
-    )?;
+    let layout = build_aggregate_layout_from_analysis(calls, analysis)?;
     iceberg_aggregate_target_columns_from_layout(&layout)
 }
 
 fn iceberg_aggregate_target_columns_from_resolved_query(
-    shape: &AggregateMvShape,
+    calls: &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls,
     output_columns: &[crate::sql::analysis::OutputColumn],
     resolved_query: &crate::sql::analysis::ResolvedQuery,
 ) -> Result<Vec<crate::sql::parser::ast::TableColumnDef>, String> {
-    let layout = build_aggregate_layout_from_resolved_query(
-        &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls::from(shape),
-        output_columns,
-        resolved_query,
-    )?;
+    let layout = build_aggregate_layout_from_resolved_query(calls, output_columns, resolved_query)?;
     iceberg_aggregate_target_columns_from_layout(&layout)
 }
 
@@ -1141,16 +1097,6 @@ fn build_aggregate_layout_from_resolved_query(
     )
 }
 
-fn first_union_aggregate_branch(
-    union_shape: &crate::connector::starrocks::table::mv_shape::UnionAllMvShape,
-) -> Result<&AggregateMvShape, String> {
-    match union_shape.branches.first() {
-        Some(IncrementalMvShape::Aggregate(shape)) => Ok(shape),
-        Some(_) => Err("UNION ALL aggregate MV requires aggregate branches".to_string()),
-        None => Err("UNION ALL MV requires at least one branch".to_string()),
-    }
-}
-
 fn first_union_branch_resolved_query(
     resolved_query: &crate::sql::analysis::ResolvedQuery,
 ) -> Result<&crate::sql::analysis::ResolvedQuery, String> {
@@ -1166,8 +1112,7 @@ fn first_union_branch_resolved_query(
 }
 
 /// Build the persisted [`MvSchemaContract`] for a new Iceberg MV, dispatching
-/// on the synthesized [`TargetIdentity`] rather than the legacy flat
-/// `RefreshStrategy` + `IncrementalMvShape`.
+/// on the synthesized [`TargetIdentity`].
 ///
 /// The dispatch is identity-RECURSIVE: a `BranchScoped(inner)` top builds each
 /// branch's inner contract by recursing on the inner structure (so a branch
@@ -1176,9 +1121,11 @@ fn first_union_branch_resolved_query(
 /// (`target_contract` / `aggregate_contract` / `base_contract` /
 /// `build_*_lineage`) are reused unchanged; only the dispatch changed.
 ///
-/// Shape data the leaf builders still need (aggregate layout, join table
-/// identity/aliases) is classified locally from `canonical_query` (or its first
-/// branch) so the build no longer consumes a top-level `IncrementalMvShape`.
+/// Shape data the leaf builders need (aggregate calls, join table
+/// identity/aliases) is sourced from the focused FROM-agnostic extractors
+/// (`extract_aggregate_sql_calls` / `extract_join_aliases` /
+/// `extract_single_scan_table_fqn`) over `canonical_query` (or its first branch)
+/// plus the resolved `MvAnalysis`.
 #[allow(clippy::too_many_arguments)]
 fn build_iceberg_mv_schema_contract(
     refresh_contract: &ImvRefreshContract,
@@ -1341,9 +1288,12 @@ fn build_non_branch_contract_core(
         // join half of a JoinAggregate. The aggregate is layered on by the
         // GroupRowId arm below.
         TargetIdentity::JoinRowKey(_, _) => {
-            let join_shape = join_shape_from_query(query)?;
+            let join_aliases =
+                crate::connector::starrocks::table::aggregate_sql_calls::extract_join_aliases(
+                    query,
+                )?;
             let (left_contract, right_contract, join) =
-                build_join_base_contracts_and_lineage(&join_shape, resolved_query, loaded_bases)?;
+                build_join_base_contracts_and_lineage(&join_aliases, resolved_query, loaded_bases)?;
             Ok(NonBranchContractCore {
                 contract_version: 2,
                 bases: vec![left_contract, right_contract],
@@ -1369,6 +1319,38 @@ fn build_non_branch_contract_core(
     }
 }
 
+/// Whether an aggregate query's FROM clause is a fan-in UNION ALL subquery.
+///
+/// FROM-side complement to [`extract_aggregate_sql_calls`] for distinguishing a
+/// fan-in aggregate from a single-scan aggregate WITHOUT the legacy classifier.
+/// Mirrors `mv_shape::extract_union_all_fan_in_bases`'s structural test: a
+/// fan-in FROM is exactly one relation, no joins, a non-lateral derived subquery
+/// whose body is a `UNION ALL` set operation.
+fn from_clause_is_fan_in_union(query: &sqlparser::ast::Query) -> bool {
+    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return false;
+    };
+    let [from] = select.from.as_slice() else {
+        return false;
+    };
+    if !from.joins.is_empty() {
+        return false;
+    }
+    let sqlparser::ast::TableFactor::Derived {
+        lateral, subquery, ..
+    } = &from.relation
+    else {
+        return false;
+    };
+    if *lateral {
+        return false;
+    }
+    matches!(
+        subquery.body.as_ref(),
+        sqlparser::ast::SetExpr::SetOperation { .. }
+    )
+}
+
 /// Build the aggregate-group-row contract core, dispatching on whether the
 /// aggregate sits over a single scan, a join, or a fan-in union. Reproduces the
 /// legacy SingleAggregate / JoinAggregate / FanInAggregate arms.
@@ -1382,116 +1364,127 @@ fn build_aggregate_contract_core(
     )],
     target_loaded: &crate::connector::iceberg::catalog::IcebergLoadedTable,
 ) -> Result<NonBranchContractCore, String> {
-    match classify_incremental_mv_query(query)? {
+    // Aggregate-call surface (group keys, aggregates, visible-output ordering)
+    // is FROM-agnostic, so the focused extractor produces the same calls for a
+    // simple aggregate, a join-aggregate, and a fan-in aggregate — byte-identical
+    // to the legacy `AggregateSqlCalls::from(&shape)` (both share
+    // `classify_aggregate_select_outputs`).
+    let aggregate_calls =
+        crate::connector::starrocks::table::aggregate_sql_calls::extract_aggregate_sql_calls(
+            query,
+        )?;
+    let layout = build_aggregate_layout_from_resolved_query(
+        &aggregate_calls,
+        &analysis.output_columns,
+        resolved_query,
+    )?;
+
+    // Dispatch on the FROM structure rather than the legacy classifier:
+    //   * a two-table inner equi-join FROM    -> JoinAggregate core
+    //   * a fan-in UNION ALL subquery in FROM -> FanInAggregate core
+    //   * a single scan                       -> SingleAggregate core
+    // The join lineage (predicate field-ids, output/filter lineage, per-base
+    // narrowing) is still derived from the resolved AST inside
+    // `build_join_base_contracts_and_lineage`; the join-alias extractor supplies
+    // only the (table FQN, qualifier) pairs.
+    if let Ok(join_aliases) =
+        crate::connector::starrocks::table::aggregate_sql_calls::extract_join_aliases(query)
+    {
         // Aggregate over a two-table inner equi-join (legacy JoinAggregate).
-        IncrementalMvShape::JoinAggregate(join_aggregate_shape) => {
-            let join_shape = &join_aggregate_shape.join;
-            let (left_contract, right_contract, join) =
-                build_join_base_contracts_and_lineage(join_shape, resolved_query, loaded_bases)?;
-            let aggregate_shape = join_aggregate_shape.as_aggregate_shape_for_layout();
-            let layout = build_aggregate_layout_from_resolved_query(
-                &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls::from(
-                    &aggregate_shape,
-                ),
-                &analysis.output_columns,
-                resolved_query,
-            )?;
-            Ok(NonBranchContractCore {
-                contract_version: 3,
-                bases: vec![left_contract, right_contract],
-                output: crate::meta::repository::mv_contract::OutputContract {
-                    columns: join.output_columns,
-                    filter: join.filter,
-                },
-                join: Some(join.join),
-                aggregate: Some(aggregate_contract(&layout, target_loaded)?),
+        let (left_contract, right_contract, join) =
+            build_join_base_contracts_and_lineage(&join_aliases, resolved_query, loaded_bases)?;
+        return Ok(NonBranchContractCore {
+            contract_version: 3,
+            bases: vec![left_contract, right_contract],
+            output: crate::meta::repository::mv_contract::OutputContract {
+                columns: join.output_columns,
+                filter: join.filter,
+            },
+            join: Some(join.join),
+            aggregate: Some(aggregate_contract(&layout, target_loaded)?),
+        });
+    }
+
+    if from_clause_is_fan_in_union(query) {
+        // Aggregate over a fan-in UNION ALL (legacy FanInAggregate).
+        //
+        // The degenerate fan-in over the SAME physical table more than once
+        // (e.g. `FROM (SELECT .. FROM ice.s.t UNION ALL SELECT .. FROM
+        // ice.s.t)`) dedups to a single resolved base, but is already rejected
+        // upstream of this builder by
+        // `RefreshFragmentProperty::into_refresh_contract` →
+        // `validate_distinct_base_ref_arity` (which requires the distinct base
+        // count to equal the fan-in branch count). So by the time the schema
+        // contract is built the fan-in base set is guaranteed distinct; the
+        // `validate_aggregate_fan_in_base_refs` check below is the
+        // schema-contract-side restatement of that invariant.
+        let loaded_base_refs = loaded_bases
+            .iter()
+            .map(|(base_ref, _)| base_ref.clone())
+            .collect::<Vec<_>>();
+        validate_aggregate_fan_in_base_refs(&loaded_base_refs)?;
+        let bases = loaded_bases
+            .iter()
+            .map(|(base_ref, loaded_base)| {
+                base_contract(
+                    base_ref,
+                    loaded_base,
+                    None,
+                    base_fields_from_current_schema(loaded_base.table.metadata().current_schema()),
+                )
             })
-        }
-        IncrementalMvShape::Aggregate(aggregate_shape) => {
-            let layout = build_aggregate_layout_from_resolved_query(
-                &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls::from(
-                    &aggregate_shape,
-                ),
-                &analysis.output_columns,
-                resolved_query,
-            )?;
-            if aggregate_shape.fan_in_bases.is_empty() {
-                // Aggregate directly over a single scan (legacy SingleAggregate).
-                let [(base_ref, loaded_base)] = loaded_bases else {
-                    return Err(
-                        "aggregate iceberg MV schema contract requires one loaded base".to_string(),
-                    );
-                };
-                let lineage = crate::sql::analyzer::mv_lineage::build_projection_filter_lineage(
-                    resolved_query,
-                    loaded_base.table.metadata().current_schema(),
-                )?;
-                Ok(NonBranchContractCore {
-                    contract_version: 3,
-                    bases: vec![base_contract(
-                        base_ref,
-                        loaded_base,
-                        None,
-                        lineage.base_fields.clone(),
-                    )],
-                    output: crate::meta::repository::mv_contract::OutputContract {
-                        columns: lineage.output_columns,
-                        filter: lineage.filter,
-                    },
-                    join: None,
-                    aggregate: Some(aggregate_contract(&layout, target_loaded)?),
-                })
-            } else {
-                // Aggregate over a fan-in UNION ALL (legacy FanInAggregate).
-                let loaded_base_refs = loaded_bases
+            .collect::<Vec<_>>();
+        Ok(NonBranchContractCore {
+            contract_version: 3,
+            bases,
+            output: crate::meta::repository::mv_contract::OutputContract {
+                // Precise branch-aware output lineage for aggregate fan-in is not
+                // available yet. Keep full base schemas and mark outputs as mixed so
+                // refresh validates base schema compatibility conservatively.
+                columns: analysis
+                    .output_columns
                     .iter()
-                    .map(|(base_ref, _)| base_ref.clone())
-                    .collect::<Vec<_>>();
-                validate_aggregate_fan_in_base_refs(&aggregate_shape, &loaded_base_refs)?;
-                let bases = loaded_bases
-                    .iter()
-                    .map(|(base_ref, loaded_base)| {
-                        base_contract(
-                            base_ref,
-                            loaded_base,
-                            None,
-                            base_fields_from_current_schema(
-                                loaded_base.table.metadata().current_schema(),
-                            ),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                Ok(NonBranchContractCore {
-                    contract_version: 3,
-                    bases,
-                    output: crate::meta::repository::mv_contract::OutputContract {
-                        // Precise branch-aware output lineage for aggregate fan-in is not
-                        // available yet. Keep full base schemas and mark outputs as mixed so
-                        // refresh validates base schema compatibility conservatively.
-                        columns: analysis
-                            .output_columns
-                            .iter()
-                            .map(
-                                |_| crate::meta::repository::mv_contract::OutputColumnLineage {
-                                    expression:
-                                        crate::meta::repository::mv_contract::ExpressionLineage {
-                                            kind: crate::meta::repository::mv_contract::ExpressionKind::Mixed,
-                                            referenced_base_field_ids: Vec::new(),
-                                            referenced_base_fields: Vec::new(),
-                                        },
-                                },
-                            )
-                            .collect(),
-                        filter: None,
-                    },
-                    join: None,
-                    aggregate: Some(aggregate_contract(&layout, target_loaded)?),
-                })
-            }
-        }
-        other => Err(format!(
-            "iceberg MV aggregate schema contract requires an aggregate query, got {other:?}"
-        )),
+                    .map(
+                        |_| crate::meta::repository::mv_contract::OutputColumnLineage {
+                            expression: crate::meta::repository::mv_contract::ExpressionLineage {
+                                kind: crate::meta::repository::mv_contract::ExpressionKind::Mixed,
+                                referenced_base_field_ids: Vec::new(),
+                                referenced_base_fields: Vec::new(),
+                            },
+                        },
+                    )
+                    .collect(),
+                filter: None,
+            },
+            join: None,
+            aggregate: Some(aggregate_contract(&layout, target_loaded)?),
+        })
+    } else {
+        // Aggregate directly over a single scan (legacy SingleAggregate).
+        let [(base_ref, loaded_base)] = loaded_bases else {
+            return Err(
+                "aggregate iceberg MV schema contract requires one loaded base".to_string(),
+            );
+        };
+        let lineage = crate::sql::analyzer::mv_lineage::build_projection_filter_lineage(
+            resolved_query,
+            loaded_base.table.metadata().current_schema(),
+        )?;
+        Ok(NonBranchContractCore {
+            contract_version: 3,
+            bases: vec![base_contract(
+                base_ref,
+                loaded_base,
+                None,
+                lineage.base_fields.clone(),
+            )],
+            output: crate::meta::repository::mv_contract::OutputContract {
+                columns: lineage.output_columns,
+                filter: lineage.filter,
+            },
+            join: None,
+            aggregate: Some(aggregate_contract(&layout, target_loaded)?),
+        })
     }
 }
 
@@ -1500,7 +1493,7 @@ fn build_aggregate_contract_core(
 /// Shared by the JoinProjectionFilter and JoinAggregate cores and by a composed
 /// join-aggregate branch.
 fn build_join_base_contracts_and_lineage(
-    join_shape: &crate::connector::starrocks::table::mv_shape::JoinProjectionFilterMvShape,
+    join_aliases: &crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases,
     resolved_query: &crate::sql::analysis::ResolvedQuery,
     loaded_bases: &[(
         IcebergTableRef,
@@ -1515,18 +1508,23 @@ fn build_join_base_contracts_and_lineage(
     String,
 > {
     let (left_ref, left_loaded) =
-        loaded_base_for_shape_table(loaded_bases, &join_shape.left_table)?;
+        loaded_base_for_table_fqn(loaded_bases, &join_aliases.left_table)?;
     let (right_ref, right_loaded) =
-        loaded_base_for_shape_table(loaded_bases, &join_shape.right_table)?;
+        loaded_base_for_table_fqn(loaded_bases, &join_aliases.right_table)?;
     let left_schema = left_loaded.table.metadata().current_schema();
     let right_schema = right_loaded.table.metadata().current_schema();
     let left_fqn = left_ref.fqn();
     let right_fqn = right_ref.fqn();
+    // The join predicate field-ids, output-column lineage, filter lineage, and
+    // per-base field narrowing are all derived from `resolved_query` (the
+    // analyzer-resolved AST) — NOT the join aliases. The aliases supply only the
+    // (table FQN, qualifier) pairs the collector keys schemas by, so the
+    // persisted `join`/`output` sections are byte-identical to the legacy build.
     let join_lineage = crate::sql::analyzer::mv_lineage::build_join_projection_filter_lineage(
         resolved_query,
         &[
-            (&left_fqn, &join_shape.left_alias, left_schema.as_ref()),
-            (&right_fqn, &join_shape.right_alias, right_schema.as_ref()),
+            (&left_fqn, &join_aliases.left_alias, left_schema.as_ref()),
+            (&right_fqn, &join_aliases.right_alias, right_schema.as_ref()),
         ],
     )?;
     let left_fields = join_lineage
@@ -1542,13 +1540,13 @@ fn build_join_base_contracts_and_lineage(
     let left_contract = base_contract(
         left_ref,
         left_loaded,
-        Some(join_shape.left_alias.clone()),
+        Some(join_aliases.left_alias.clone()),
         left_fields,
     );
     let right_contract = base_contract(
         right_ref,
         right_loaded,
-        Some(join_shape.right_alias.clone()),
+        Some(join_aliases.right_alias.clone()),
         right_fields,
     );
     Ok((left_contract, right_contract, join_lineage))
@@ -1602,18 +1600,17 @@ fn build_branch_union_schema_contract(
             // Resolve the FIRST branch's base table by name (mirroring the
             // legacy `loaded_base_for_shape_table(.., first_branch.base_table)`)
             // so the lineage schema is the first branch's, even if the loaded
-            // bases are not in branch order.
+            // bases are not in branch order. The single-scan base FQN is sourced
+            // from the focused FROM extractor (the projection/filter branch has
+            // neither aggregate nor join), byte-identical to the legacy
+            // `ProjectionFilterMvShape.base_table`.
             let first_branch_ast = first_union_branch_ast_query(canonical_query)?;
-            let first_branch_base_table = match classify_incremental_mv_query(&first_branch_ast)? {
-                IncrementalMvShape::ProjectionFilter(shape) => shape.base_table,
-                other => {
-                    return Err(format!(
-                        "iceberg MV UNION ALL projection/filter branch must be a single-scan projection, got {other:?}"
-                    ));
-                }
-            };
+            let first_branch_base_table =
+                crate::connector::starrocks::table::aggregate_sql_calls::extract_single_scan_table_fqn(
+                    &first_branch_ast,
+                )?;
             let (_, first_loaded_base) =
-                loaded_base_for_shape_table(loaded_bases, &first_branch_base_table)?;
+                loaded_base_for_table_fqn(loaded_bases, &first_branch_base_table)?;
             let first_schema = first_loaded_base.table.metadata().current_schema();
             let lineage = crate::sql::analyzer::mv_lineage::build_projection_filter_lineage(
                 &analysis.resolved_query,
@@ -1734,6 +1731,81 @@ fn union_branch_count(query: &sqlparser::ast::Query) -> u32 {
     count(query.body.as_ref())
 }
 
+/// The (lower-cased) base-table FQNs referenced by a single UNION ALL branch
+/// query, sourced from the focused FROM extractors. A single branch is one of:
+/// single-scan projection/filter or aggregate, a two-table join, or a fan-in
+/// aggregate over a UNION ALL of single scans:
+///   * a two-table inner equi-join FROM    -> [left_table, right_table]
+///   * a fan-in UNION ALL subquery in FROM -> one FQN per union branch
+///   * a single scan                       -> [the single FROM table]
+fn branch_base_table_fqns(branch_query: &sqlparser::ast::Query) -> Result<Vec<String>, String> {
+    use crate::connector::starrocks::table::aggregate_sql_calls;
+
+    if let Ok(join_aliases) = aggregate_sql_calls::extract_join_aliases(branch_query) {
+        return Ok(vec![join_aliases.left_table, join_aliases.right_table]);
+    }
+
+    // Fan-in aggregate: collect the single-scan base table of each UNION ALL
+    // branch inside the FROM subquery. `from_clause_is_fan_in_union` confirms
+    // the fan-in FROM shape; the branch base tables come from flattening that
+    // subquery's branches.
+    if from_clause_is_fan_in_union(branch_query) {
+        let sqlparser::ast::SetExpr::Select(select) = branch_query.body.as_ref() else {
+            return Err("UNION ALL branch fan-in requires a SELECT body".to_string());
+        };
+        let [from] = select.from.as_slice() else {
+            return Err("UNION ALL branch fan-in requires a single FROM relation".to_string());
+        };
+        let sqlparser::ast::TableFactor::Derived { subquery, .. } = &from.relation else {
+            return Err("UNION ALL branch fan-in requires a derived FROM subquery".to_string());
+        };
+        let mut branch_bodies = Vec::new();
+        flatten_union_all_branches(subquery.body.as_ref(), &mut branch_bodies);
+        return branch_bodies
+            .into_iter()
+            .map(|body| {
+                let branch = wrap_set_expr_as_query(branch_query, body);
+                aggregate_sql_calls::extract_single_scan_table_fqn(&branch)
+            })
+            .collect();
+    }
+
+    // Single scan (projection/filter or aggregate over one table).
+    Ok(vec![aggregate_sql_calls::extract_single_scan_table_fqn(
+        branch_query,
+    )?])
+}
+
+/// Flatten a (possibly nested) UNION ALL set-operation body into its leaf
+/// branch bodies, mirroring `mv_shape::flatten_union_all` without re-validating
+/// the UNION ALL operator (the fan-in shape is already confirmed by the caller).
+fn flatten_union_all_branches<'a>(
+    body: &'a sqlparser::ast::SetExpr,
+    out: &mut Vec<&'a sqlparser::ast::SetExpr>,
+) {
+    match body {
+        sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
+            flatten_union_all_branches(left, out);
+            flatten_union_all_branches(right, out);
+        }
+        sqlparser::ast::SetExpr::Query(inner) => {
+            flatten_union_all_branches(inner.body.as_ref(), out)
+        }
+        other => out.push(other),
+    }
+}
+
+/// Wrap a `SetExpr` branch body as a standalone `Query`, inheriting the outer
+/// query's non-body fields. Mirrors `mv_shape::wrap_setexpr_as_query`.
+fn wrap_set_expr_as_query(
+    outer: &sqlparser::ast::Query,
+    body: &sqlparser::ast::SetExpr,
+) -> sqlparser::ast::Query {
+    let mut query = outer.clone();
+    query.body = Box::new(body.clone());
+    query
+}
+
 /// The subset of `loaded_bases` referenced by `branch_query`, preserving the
 /// loaded order. Used to feed only a branch's own bases into the non-branch
 /// core builder.
@@ -1750,11 +1822,9 @@ fn first_branch_loaded_bases(
     )>,
     String,
 > {
-    let shape = classify_incremental_mv_query(branch_query)?;
-    let branch_table_fqns = shape
-        .base_tables()
-        .iter()
-        .map(|name| name.to_string().to_ascii_lowercase())
+    let branch_table_fqns = branch_base_table_fqns(branch_query)?
+        .into_iter()
+        .map(|fqn| fqn.to_ascii_lowercase())
         .collect::<BTreeSet<_>>();
     Ok(loaded_bases
         .iter()
@@ -1784,27 +1854,12 @@ fn overlay_narrowed_bases(
     all_bases
 }
 
-/// Classify `query` and extract its two-table inner equi-join shape (from a
-/// JoinProjectionFilter or a JoinAggregate). Used to source join table identity
-/// and aliases locally instead of from a top-level `IncrementalMvShape`.
-fn join_shape_from_query(
-    query: &sqlparser::ast::Query,
-) -> Result<crate::connector::starrocks::table::mv_shape::JoinProjectionFilterMvShape, String> {
-    match classify_incremental_mv_query(query)? {
-        IncrementalMvShape::JoinProjectionFilter(shape) => Ok(shape),
-        IncrementalMvShape::JoinAggregate(shape) => Ok(shape.join),
-        other => Err(format!(
-            "iceberg MV join schema contract requires a two-table inner equi-join, got {other:?}"
-        )),
-    }
-}
-
-fn loaded_base_for_shape_table<'a>(
+fn loaded_base_for_table_fqn<'a>(
     loaded_bases: &'a [(
         IcebergTableRef,
         crate::connector::iceberg::catalog::IcebergLoadedTable,
     )],
-    shape_table: &sqlparser::ast::ObjectName,
+    table_fqn: &str,
 ) -> Result<
     &'a (
         IcebergTableRef,
@@ -1812,11 +1867,10 @@ fn loaded_base_for_shape_table<'a>(
     ),
     String,
 > {
-    let table_name = shape_table.to_string();
     loaded_bases
         .iter()
-        .find(|(base_ref, _)| base_ref.fqn().eq_ignore_ascii_case(&table_name))
-        .ok_or_else(|| format!("join MV shape base {table_name} was not loaded"))
+        .find(|(base_ref, _)| base_ref.fqn().eq_ignore_ascii_case(table_fqn))
+        .ok_or_else(|| format!("join MV shape base {table_fqn} was not loaded"))
 }
 
 fn base_contract(
@@ -2271,7 +2325,7 @@ fn rewrite_full_refresh_select_with_pin(
 fn rewrite_union_projection_full_refresh_select_with_pin(
     select_sql: &str,
     pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
-    union_shape: &crate::connector::starrocks::table::mv_shape::UnionAllMvShape,
+    branch_count: usize,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<String, String> {
@@ -2295,12 +2349,11 @@ fn rewrite_union_projection_full_refresh_select_with_pin(
     append_union_projection_hidden_columns_to_set_expr(
         query.body.as_mut(),
         &mut next_branch_id,
-        union_shape.branches.len() as i32,
+        branch_count as i32,
     )?;
-    if next_branch_id != union_shape.branches.len() as i32 {
+    if next_branch_id != branch_count as i32 {
         return Err(format!(
-            "iceberg UNION ALL MV full refresh expected {} branches, rewrote {next_branch_id}",
-            union_shape.branches.len()
+            "iceberg UNION ALL MV full refresh expected {branch_count} branches, rewrote {next_branch_id}"
         ));
     }
     Ok(stmt.to_string())
@@ -2469,15 +2522,27 @@ fn refresh_iceberg_mv_with_planned_partitions(
         )
         | (true, BaseSnapshotPolicy::AllBasesRequired, RefreshIdentity::GroupRowId) => {
             // The single-base / join / fan-in aggregate paths (non-composed)
-            // still classify the query to feed the first-refresh and layout
-            // helpers. Composed branch-union takes the BranchScoped arm below
-            // (extractor-driven); these remaining classify callers on the
-            // non-composed paths are retired in P4.5.
-            let shape = classify_incremental_mv_query(&canonical_select_query)?;
-            let aggregate_shape = aggregate_shape_for_layout(&shape).ok_or_else(|| {
-                "iceberg aggregate MV refresh contract did not match legacy aggregate shape"
-                    .to_string()
-            })?;
+            // source the aggregate-call surface from the focused extractor
+            // (FROM-agnostic) rather than the legacy classifier. The join sub-arm
+            // additionally needs the left/right table aliases, sourced from the
+            // focused join-alias extractor. Composed branch-union takes the
+            // BranchScoped arm below (also extractor-driven).
+            let aggregate_calls =
+                crate::connector::starrocks::table::aggregate_sql_calls::extract_aggregate_sql_calls(
+                    &canonical_select_query,
+                )?;
+            let join_aliases = if matches!(
+                caps.snapshot_policy,
+                BaseSnapshotPolicy::JoinPairPartialInitialSkip
+            ) {
+                Some(
+                    crate::connector::starrocks::table::aggregate_sql_calls::extract_join_aliases(
+                        &canonical_select_query,
+                    )?,
+                )
+            } else {
+                None
+            };
             return refresh_iceberg_aggregate_mv(
                 state,
                 &target,
@@ -2490,8 +2555,8 @@ fn refresh_iceberg_mv_with_planned_partitions(
                 &mv_definition,
                 &base_refs,
                 &caps,
-                &shape,
-                &aggregate_shape,
+                &aggregate_calls,
+                join_aliases.as_ref(),
                 refresh_contract.apply_key,
                 planned_affected_partitions,
             );
@@ -2523,15 +2588,15 @@ fn refresh_iceberg_mv_with_planned_partitions(
                 planned_affected_partitions,
             );
         }
-        // Two-table inner equi-join projection/filter.
+        // Two-table inner equi-join projection/filter. The left/right table
+        // aliases (the single execution-load-bearing join field, consumed by the
+        // join-refresh SQL rewriters) are sourced from the focused join-alias
+        // extractor rather than the legacy classifier.
         (false, BaseSnapshotPolicy::JoinPairPartialInitialSkip, _) => {
-            // KEEP: classification still feeds the first-refresh/layout helper.
-            let shape = classify_incremental_mv_query(&canonical_select_query)?;
-            let IncrementalMvShape::JoinProjectionFilter(join_shape) = &shape else {
-                return Err(
-                    "iceberg join MV refresh contract did not match legacy join shape".to_string(),
-                );
-            };
+            let join_aliases =
+                crate::connector::starrocks::table::aggregate_sql_calls::extract_join_aliases(
+                    &canonical_select_query,
+                )?;
             return refresh_iceberg_join_mv(
                 state,
                 &target,
@@ -2543,26 +2608,22 @@ fn refresh_iceberg_mv_with_planned_partitions(
                 current_database,
                 &mv_definition,
                 &base_refs,
-                join_shape,
+                &join_aliases,
                 refresh_contract.apply_key,
             );
         }
         // UNION ALL of projection/filter branches.
         (false, BaseSnapshotPolicy::AllBasesRequired, _) => {
-            // KEEP: classification still feeds the first-refresh/layout helper.
-            let shape = classify_incremental_mv_query(&canonical_select_query)?;
-            let IncrementalMvShape::UnionAll(union_shape) = &shape else {
-                return Err(
-                    "iceberg UNION ALL projection/filter refresh contract did not match legacy union shape"
-                        .to_string(),
-                );
-            };
-            if union_shape.branch_kind != UnionBranchKind::ProjectionFilter {
-                return Err(
-                    "iceberg UNION ALL projection/filter refresh contract did not match legacy union shape"
-                        .to_string(),
-                );
-            }
+            // Source branch count from the persisted contract (no classifier
+            // needed). The contract always has a BranchUnionContract for this
+            // capability shape; fall back to counting the AST branches if for
+            // some reason the contract is absent (e.g. a hand-crafted test
+            // fixture), matching the branch-union aggregate fallback pattern.
+            let branch_count = dispatch_schema_contract
+                .branch
+                .as_ref()
+                .map(|b| b.branch_count as usize)
+                .unwrap_or_else(|| union_branch_count(&canonical_select_query) as usize);
             return refresh_iceberg_union_projection_mv(
                 state,
                 &target,
@@ -2575,7 +2636,8 @@ fn refresh_iceberg_mv_with_planned_partitions(
                 &mv_definition,
                 &base_refs,
                 &canonical_select_query,
-                union_shape,
+                branch_count,
+                dispatch_schema_contract,
                 refresh_contract.apply_key,
             );
         }
@@ -2840,16 +2902,11 @@ fn refresh_iceberg_union_projection_mv(
     mv_definition: &StoredMvDefinition,
     base_refs: &[IcebergTableRef],
     canonical_select_query: &sqlparser::ast::Query,
-    union_shape: &crate::connector::starrocks::table::mv_shape::UnionAllMvShape,
+    branch_count: usize,
+    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
     apply_key: ApplyKeyContract,
 ) -> Result<StatementResult, String> {
-    validate_union_projection_shape_base_refs(union_shape, base_refs)?;
-    let schema_contract = mv_definition.schema_contract.as_ref().ok_or_else(|| {
-        format!(
-            "iceberg MV target {}.{}.{} is missing A11 schema contract; rebuild or recreate the MV",
-            target.catalog, target.namespace, target.table
-        )
-    })?;
+    validate_union_projection_base_refs(base_refs, schema_contract)?;
 
     let mut pre_pin_current_snapshots = BTreeMap::new();
     for base_ref in base_refs {
@@ -2857,7 +2914,7 @@ fn refresh_iceberg_union_projection_mv(
         validate_union_projection_schema_contract_for_base(
             target,
             schema_contract,
-            union_shape,
+            branch_count,
             base_ref,
             &loaded.table,
             target_table,
@@ -2941,7 +2998,7 @@ fn refresh_iceberg_union_projection_mv(
         validate_union_projection_schema_contract_for_base(
             target,
             schema_contract,
-            union_shape,
+            branch_count,
             base_ref,
             &loaded.table,
             target_table,
@@ -3049,7 +3106,7 @@ fn refresh_iceberg_union_projection_mv(
             let full_select_sql = rewrite_union_projection_full_refresh_select_with_pin(
                 &ctx.rewrite.mv_definition.select_sql,
                 &pin,
-                union_shape,
+                branch_count,
                 current_catalog,
                 current_database,
             )?;
@@ -3142,42 +3199,35 @@ fn refresh_iceberg_aggregate_mv(
     mv_definition: &StoredMvDefinition,
     base_refs: &[IcebergTableRef],
     caps: &RefreshCapabilities,
-    shape: &IncrementalMvShape,
-    aggregate_shape: &AggregateMvShape,
+    aggregate_calls: &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls,
+    join_aliases: Option<&crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases>,
     apply_key: ApplyKeyContract,
     planned_affected_partitions: &crate::engine::mv::partition::AffectedMvPartitions,
 ) -> Result<StatementResult, String> {
     let schema_contract = validate_aggregate_schema_contract_metadata(target, mv_definition)?;
     // Tier-2 dispatch (Phase 3 / B2): single-base aggregate, fan-in aggregate
     // (AllBasesRequired), and join aggregate are selected by capability. The
-    // legacy `shape` only feeds the per-wrapper first-refresh/layout helpers.
+    // aggregate-call surface comes from the focused extractor; the join sub-arm
+    // additionally consumes the join aliases for base-ref matching.
     match &caps.snapshot_policy {
-        BaseSnapshotPolicy::AllBasesRequired => {
-            let IncrementalMvShape::Aggregate(aggregate_shape) = shape else {
-                return Err(
-                    "iceberg fan-in aggregate MV refresh contract did not match legacy aggregate shape"
-                        .to_string(),
-                );
-            };
-            refresh_fan_in_aggregate_iceberg_mv(
-                state,
-                target,
-                target_entry,
-                iceberg_catalog,
-                target_table,
-                expected_main_snapshot_id,
-                current_catalog,
-                current_database,
-                mv_definition,
-                base_refs,
-                AllBasesAggregateRefresh::FanIn {
-                    schema_contract,
-                    aggregate_shape,
-                },
-                apply_key,
-                planned_affected_partitions,
-            )
-        }
+        BaseSnapshotPolicy::AllBasesRequired => refresh_fan_in_aggregate_iceberg_mv(
+            state,
+            target,
+            target_entry,
+            iceberg_catalog,
+            target_table,
+            expected_main_snapshot_id,
+            current_catalog,
+            current_database,
+            mv_definition,
+            base_refs,
+            AllBasesAggregateRefresh::FanIn {
+                schema_contract,
+                aggregate_calls,
+            },
+            apply_key,
+            planned_affected_partitions,
+        ),
         BaseSnapshotPolicy::SingleBase => refresh_single_aggregate_iceberg_mv(
             state,
             target,
@@ -3190,17 +3240,15 @@ fn refresh_iceberg_aggregate_mv(
             mv_definition,
             base_refs,
             schema_contract,
-            aggregate_shape,
+            aggregate_calls,
             apply_key,
             planned_affected_partitions,
         ),
         BaseSnapshotPolicy::JoinPairPartialInitialSkip => {
-            let IncrementalMvShape::JoinAggregate(join_aggregate_shape) = shape else {
-                return Err(
-                    "iceberg join aggregate MV refresh contract did not match legacy join aggregate shape"
-                        .to_string(),
-                );
-            };
+            let join_aliases = join_aliases.ok_or_else(|| {
+                "iceberg join aggregate MV refresh requires join aliases but none were extracted"
+                    .to_string()
+            })?;
             refresh_join_aggregate_iceberg_mv(
                 state,
                 target,
@@ -3213,8 +3261,8 @@ fn refresh_iceberg_aggregate_mv(
                 mv_definition,
                 base_refs,
                 schema_contract,
-                join_aggregate_shape,
-                aggregate_shape,
+                join_aliases,
+                aggregate_calls,
                 apply_key,
                 planned_affected_partitions,
             )
@@ -3260,7 +3308,7 @@ fn refresh_single_aggregate_iceberg_mv(
     mv_definition: &StoredMvDefinition,
     base_refs: &[IcebergTableRef],
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
-    aggregate_shape: &AggregateMvShape,
+    aggregate_calls: &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls,
     apply_key: ApplyKeyContract,
     planned_affected_partitions: &crate::engine::mv::partition::AffectedMvPartitions,
 ) -> Result<StatementResult, String> {
@@ -3348,23 +3396,20 @@ fn refresh_single_aggregate_iceberg_mv(
         current_catalog,
         current_database,
     );
-    // When rebind rewrote stored SELECT, the original `aggregate_shape`
-    // captured by `plan_iceberg_aggregate_mv_refresh` still references the
-    // pre-rebind base column names. Reclassify against the rewritten SQL so
-    // downstream signed-delta/full-state rewrites consistently use the
-    // current base column names.
-    let reclassified_aggregate_shape = if rebind_happened {
-        let new_shape =
-            crate::connector::starrocks::table::mv_shape::classify_incremental_mv_query(
-                &canonical_select_query,
-            )?;
-        aggregate_shape_for_layout(&new_shape).ok_or_else(|| {
-            "iceberg aggregate MV rebind broke aggregate classification".to_string()
-        })?
+    // When rebind rewrote the stored SELECT, the `aggregate_calls` sourced at
+    // the dispatch arm still reference the pre-rebind base column names.
+    // Re-extract the aggregate-call surface from the rewritten SQL (the rebind
+    // rewrote the SELECT projection, which the extractor reads) so downstream
+    // signed-delta/full-state rewrites consistently use the current base column
+    // names.
+    let reextracted_aggregate_calls = if rebind_happened {
+        crate::connector::starrocks::table::aggregate_sql_calls::extract_aggregate_sql_calls(
+            &canonical_select_query,
+        )?
     } else {
-        aggregate_shape.clone()
+        aggregate_calls.clone()
     };
-    let aggregate_shape = &reclassified_aggregate_shape;
+    let aggregate_calls = &reextracted_aggregate_calls;
     let ctx = {
         let iceberg_catalog_guard = state
             .iceberg_catalogs
@@ -3422,7 +3467,7 @@ fn refresh_single_aggregate_iceberg_mv(
                 &ctx,
                 &staging_branch,
                 refresh_id,
-                aggregate_shape,
+                aggregate_calls,
             )
         },
         || {
@@ -3473,8 +3518,7 @@ fn refresh_single_aggregate_iceberg_mv(
 ///
 /// UNION ALL sits BELOW the aggregate, so the same group key folds across
 /// branches and the ordinary group-row-id apply key applies — there is no
-/// `__branch_id__` (that is the B-family / `IncrementalMvShape::UnionAll`
-/// concern). The rewrite (`RewriteUnionAggregateDelta` + the aggregate-state
+/// `__branch_id__` (that is the B-family / branch-union concern). The rewrite (`RewriteUnionAggregateDelta` + the aggregate-state
 /// stage) and IMV scan binding already fan a per-branch delta window off the
 /// multi-base pin, exactly like `refresh_join_aggregate_iceberg_mv` does for
 /// its two bases. This orchestration just pins/loads every fan-in base, builds
@@ -3500,9 +3544,12 @@ fn refresh_single_aggregate_iceberg_mv(
 /// branch-contract validation and the first-refresh strategy differ.
 enum AllBasesAggregateRefresh<'a> {
     /// Aggregate-over-UNION-ALL fan-in: one aggregate above a union of scans.
+    /// The aggregate-call surface is sourced from the focused extractor
+    /// (`extract_aggregate_sql_calls`), not the legacy classifier.
     FanIn {
         schema_contract: &'a crate::meta::repository::mv_contract::MvSchemaContract,
-        aggregate_shape: &'a AggregateMvShape,
+        aggregate_calls:
+            &'a crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls,
     },
     /// UNION ALL of aggregate branches (`BranchScoped` identity): the union sits
     /// above per-branch aggregates and the first refresh injects `__branch_id__`.
@@ -3547,9 +3594,9 @@ fn refresh_fan_in_aggregate_iceberg_mv(
     let schema_contract = match &refresh {
         AllBasesAggregateRefresh::FanIn {
             schema_contract,
-            aggregate_shape,
+            aggregate_calls: _,
         } => {
-            validate_aggregate_fan_in_base_refs(aggregate_shape, base_refs)?;
+            validate_aggregate_fan_in_base_refs(base_refs)?;
             *schema_contract
         }
         AllBasesAggregateRefresh::BranchUnion {
@@ -3752,13 +3799,13 @@ fn refresh_fan_in_aggregate_iceberg_mv(
             // per branch, fan-in runs the single aggregate select.
             match &refresh {
                 AllBasesAggregateRefresh::FanIn {
-                    aggregate_shape, ..
+                    aggregate_calls, ..
                 } => first_refresh_iceberg_aggregate_mv(
                     state,
                     &ctx,
                     &staging_branch,
                     refresh_id,
-                    aggregate_shape,
+                    aggregate_calls,
                 ),
                 AllBasesAggregateRefresh::BranchUnion {
                     branch_count,
@@ -4207,8 +4254,8 @@ fn refresh_join_aggregate_iceberg_mv(
     mv_definition: &StoredMvDefinition,
     base_refs: &[IcebergTableRef],
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
-    join_aggregate_shape: &JoinAggregateMvShape,
-    aggregate_shape: &AggregateMvShape,
+    join_aliases: &crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases,
+    aggregate_calls: &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls,
     apply_key: ApplyKeyContract,
     planned_affected_partitions: &crate::engine::mv::partition::AffectedMvPartitions,
 ) -> Result<StatementResult, String> {
@@ -4218,9 +4265,11 @@ fn refresh_join_aggregate_iceberg_mv(
                 .to_string(),
         );
     }
-    let join_shape = &join_aggregate_shape.join;
-    validate_join_shape_base_refs(join_shape, base_refs)?;
-    let (left_ref, right_ref) = join_base_refs_for_shape(join_shape, base_refs)?;
+    // Base-ref matching uses the join aliases (left/right table FQNs); the join
+    // ON keys are never read by the refresh path. The aggregate-call surface
+    // drives the first-refresh full-state build.
+    validate_join_aliases_base_refs(join_aliases, base_refs)?;
+    let (left_ref, right_ref) = join_base_refs_for_aliases(join_aliases, base_refs)?;
     let left_loaded_before_pin = load_current_iceberg_base_table(state, left_ref)?;
     let right_loaded_before_pin = load_current_iceberg_base_table(state, right_ref)?;
     let left_current_before_pin =
@@ -4297,33 +4346,21 @@ fn refresh_join_aggregate_iceberg_mv(
         current_catalog,
         current_database,
     );
-    // Reclassify the join aggregate shape against the rewritten SELECT so
-    // downstream signed-delta / branch rewrites use the current base column
-    // names (join key and group key).
-    let reclassified_join_aggregate_shape = if rebind_happened {
-        let new_shape =
-            crate::connector::starrocks::table::mv_shape::classify_incremental_mv_query(
-                &canonical_select_query,
-            )?;
-        match new_shape {
-            IncrementalMvShape::JoinAggregate(shape) => shape,
-            _ => {
-                return Err(
-                    "iceberg join aggregate MV rebind broke join aggregate classification"
-                        .to_string(),
-                );
-            }
-        }
+    // When rebind rewrote the stored SELECT, re-extract the aggregate-call
+    // surface from the rewritten SQL so downstream signed-delta / branch
+    // rewrites use the current base column names (the rebind rewrote the SELECT
+    // projection / group keys, which the extractor reads). The join aliases come
+    // from the FROM clause, which a field-id rebind never rewrites, so the
+    // base-ref matching above already used the correct (carried-forward)
+    // aliases.
+    let reextracted_aggregate_calls = if rebind_happened {
+        crate::connector::starrocks::table::aggregate_sql_calls::extract_aggregate_sql_calls(
+            &canonical_select_query,
+        )?
     } else {
-        join_aggregate_shape.clone()
+        aggregate_calls.clone()
     };
-    let join_aggregate_shape = &reclassified_join_aggregate_shape;
-    let reclassified_aggregate_shape = if rebind_happened {
-        join_aggregate_shape.as_aggregate_shape_for_layout()
-    } else {
-        aggregate_shape.clone()
-    };
-    let aggregate_shape = &reclassified_aggregate_shape;
+    let aggregate_calls = &reextracted_aggregate_calls;
     let ctx = {
         let iceberg_catalog_guard = state
             .iceberg_catalogs
@@ -4387,7 +4424,7 @@ fn refresh_join_aggregate_iceberg_mv(
                 &ctx,
                 &staging_branch,
                 refresh_id,
-                aggregate_shape,
+                aggregate_calls,
             )
         },
         || {
@@ -4646,16 +4683,14 @@ pub(crate) fn plan_iceberg_mv_refresh(
     match (caps.has_agg_state, &caps.snapshot_policy, &caps.identity) {
         // UNION ALL of projection/filter branches.
         (false, BaseSnapshotPolicy::AllBasesRequired, _) => {
-            // KEEP: the legacy classifier still feeds the per-branch
-            // first-refresh/layout helpers for projection/filter branch unions
-            // (these branches are single-scan, so classification succeeds).
-            let shape = classify_incremental_mv_query(&canonical_select_query)
-                .map_err(RefreshError::user)?;
-            let IncrementalMvShape::UnionAll(union_shape) = &shape else {
-                return Err(RefreshError::user(
-                    "iceberg UNION ALL projection/filter refresh contract did not match legacy union shape",
-                ));
-            };
+            // Source branch count from the persisted contract; fall back to
+            // counting the AST branches if the branch contract is absent,
+            // matching the refresh-dispatch fallback pattern.
+            let branch_count = dispatch_schema_contract
+                .branch
+                .as_ref()
+                .map(|b| b.branch_count as usize)
+                .unwrap_or_else(|| union_branch_count(&canonical_select_query) as usize);
             return plan_iceberg_union_projection_mv_refresh(
                 state,
                 &iceberg_target,
@@ -4666,7 +4701,8 @@ pub(crate) fn plan_iceberg_mv_refresh(
                 current_database,
                 &mv_definition,
                 &base_refs,
-                union_shape,
+                branch_count,
+                dispatch_schema_contract,
             );
         }
         // Aggregate shapes: single-base, fan-in, branch-union, and join
@@ -4694,22 +4730,22 @@ pub(crate) fn plan_iceberg_mv_refresh(
         (false, BaseSnapshotPolicy::JoinPairPartialInitialSkip, _)
         | (false, BaseSnapshotPolicy::SingleBase, _) => {}
     }
-    // KEEP: the legacy classifier still feeds the join/single-scan inline paths
-    // below (these shapes are not composed branch unions, so it succeeds).
-    let shape =
-        classify_incremental_mv_query(&canonical_select_query).map_err(RefreshError::user)?;
     if is_join {
-        let IncrementalMvShape::JoinProjectionFilter(join_shape) = &shape else {
-            return Err(RefreshError::user(
-                "iceberg join projection/filter refresh contract did not match legacy join shape",
-            ));
-        };
+        // The join projection/filter plan path sources the left/right table
+        // aliases from the focused join-alias extractor (not the legacy
+        // classifier); base-ref matching uses the `JoinAliases`-sourced
+        // validators, mirroring the execute path.
+        let join_aliases =
+            crate::connector::starrocks::table::aggregate_sql_calls::extract_join_aliases(
+                &canonical_select_query,
+            )
+            .map_err(RefreshError::user)?;
         if base_refs.len() != 2 {
             return Err(RefreshError::user(
                 "iceberg join materialized view refresh requires exactly two base table references",
             ));
         }
-        validate_join_shape_base_refs(join_shape, &base_refs).map_err(RefreshError::user)?;
+        validate_join_aliases_base_refs(&join_aliases, &base_refs).map_err(RefreshError::user)?;
         let schema_contract = mv_definition.schema_contract.as_ref().ok_or_else(|| {
             RefreshError::user(format!(
                 "iceberg MV target {}.{}.{} is missing A11 schema contract; rebuild or recreate the MV",
@@ -4726,7 +4762,7 @@ pub(crate) fn plan_iceberg_mv_refresh(
             )));
         }
         let (left_ref, right_ref) =
-            join_base_refs_for_shape(join_shape, &base_refs).map_err(RefreshError::user)?;
+            join_base_refs_for_aliases(&join_aliases, &base_refs).map_err(RefreshError::user)?;
         let left_loaded =
             load_current_iceberg_base_table(state, left_ref).map_err(RefreshError::user)?;
         let right_loaded =
@@ -4842,11 +4878,8 @@ pub(crate) fn plan_iceberg_mv_refresh(
             }),
         });
     }
-    if !matches!(shape, IncrementalMvShape::ProjectionFilter(_)) {
-        return Err(RefreshError::user(
-            "iceberg materialized view refresh only supports projection/filter or join projection/filter shapes",
-        ));
-    }
+    // The capability dispatch above (has_agg=false, SingleBase, non-join) routes only
+    // single-base projection/filter MVs to this point. No classify guard needed.
     let [base_ref] = base_refs.as_slice() else {
         return Err(RefreshError::user(
             "iceberg materialized view refresh requires exactly one base table reference",
@@ -5039,16 +5072,10 @@ fn plan_iceberg_union_projection_mv_refresh(
     current_database: &str,
     mv_definition: &StoredMvDefinition,
     base_refs: &[IcebergTableRef],
-    union_shape: &crate::connector::starrocks::table::mv_shape::UnionAllMvShape,
+    branch_count: usize,
+    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
 ) -> Result<RefreshPlan, RefreshError> {
-    validate_union_projection_shape_base_refs(union_shape, base_refs)
-        .map_err(RefreshError::user)?;
-    let schema_contract = mv_definition.schema_contract.as_ref().ok_or_else(|| {
-        RefreshError::user(format!(
-            "iceberg MV target {}.{}.{} is missing A11 schema contract; rebuild or recreate the MV",
-            iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
-        ))
-    })?;
+    validate_union_projection_base_refs(base_refs, schema_contract).map_err(RefreshError::user)?;
 
     let mut loaded_bases = BTreeMap::new();
     let mut current_snapshots = BTreeMap::new();
@@ -5059,7 +5086,7 @@ fn plan_iceberg_union_projection_mv_refresh(
         validate_union_projection_schema_contract_for_base(
             iceberg_target,
             schema_contract,
-            union_shape,
+            branch_count,
             base_ref,
             &loaded.table,
             target_table,
@@ -5217,9 +5244,8 @@ fn plan_iceberg_all_bases_aggregate_mv_refresh(
 ) -> Result<RefreshPlan, RefreshError> {
     // The branch-union variant validates the branch count (off the AST, so a
     // composed branch union is supported) + the resolved base-ref set; the
-    // fan-in variant validates against the fan-in aggregate shape (a simple
-    // aggregate over a union of scans, which the legacy classifier still
-    // accepts).
+    // fan-in variant validates the resolved base-ref set directly (the resolved
+    // bases ARE the fan-in base set now that the classifier is retired).
     let is_branch_union = matches!(caps.identity, RefreshIdentity::BranchScoped(_));
     if is_branch_union {
         let branch_count = union_branch_count(canonical_select_query) as usize;
@@ -5227,16 +5253,7 @@ fn plan_iceberg_all_bases_aggregate_mv_refresh(
             .map_err(RefreshError::user)?;
         validate_branch_union_aggregate_base_refs(base_refs).map_err(RefreshError::user)?;
     } else {
-        let shape =
-            classify_incremental_mv_query(canonical_select_query).map_err(RefreshError::user)?;
-        let IncrementalMvShape::Aggregate(aggregate_shape) = shape else {
-            return Err(RefreshError::user(format!(
-                "iceberg aggregate MV {}.{}.{} refresh contract did not match legacy aggregate shape",
-                iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
-            )));
-        };
-        validate_aggregate_fan_in_base_refs(&aggregate_shape, base_refs)
-            .map_err(RefreshError::user)?;
+        validate_aggregate_fan_in_base_refs(base_refs).map_err(RefreshError::user)?;
     }
     let mut loaded_bases = BTreeMap::new();
     let mut current_snapshots = BTreeMap::new();
@@ -5453,26 +5470,24 @@ fn plan_iceberg_aggregate_mv_refresh(
             ))
         }
         BaseSnapshotPolicy::JoinPairPartialInitialSkip => {
-            // A join-aggregate is not a composed branch union, so the legacy
-            // classifier still accepts it; classify locally for the join shape.
-            let shape = classify_incremental_mv_query(canonical_select_query)
+            // The join-aggregate plan sources the left/right table aliases from
+            // the focused join-alias extractor (FROM-side only); the join ON
+            // keys are never read by the plan path. Base-ref matching uses those
+            // table FQNs against the analyzer-resolved base refs.
+            let join_aliases =
+                crate::connector::starrocks::table::aggregate_sql_calls::extract_join_aliases(
+                    canonical_select_query,
+                )
                 .map_err(RefreshError::user)?;
-            let IncrementalMvShape::JoinAggregate(join_aggregate_shape) = shape else {
-                return Err(RefreshError::user(format!(
-                    "iceberg join aggregate MV {}.{}.{} refresh contract did not match legacy join aggregate shape",
-                    iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
-                )));
-            };
             if base_refs.len() != 2 {
                 return Err(RefreshError::user(
                     "iceberg join aggregate MV refresh requires exactly two base table references",
                 ));
             }
-            validate_join_shape_base_refs(&join_aggregate_shape.join, base_refs)
+            validate_join_aliases_base_refs(&join_aliases, base_refs)
                 .map_err(RefreshError::user)?;
             let (left_ref, right_ref) =
-                join_base_refs_for_shape(&join_aggregate_shape.join, base_refs)
-                    .map_err(RefreshError::user)?;
+                join_base_refs_for_aliases(&join_aliases, base_refs).map_err(RefreshError::user)?;
             let left_loaded =
                 load_current_iceberg_base_table(state, left_ref).map_err(RefreshError::user)?;
             let right_loaded =
@@ -6468,7 +6483,7 @@ fn first_refresh_iceberg_aggregate_mv(
     ctx: &IcebergMvRefreshContext,
     staging_branch: &str,
     refresh_id: i64,
-    aggregate_shape: &AggregateMvShape,
+    aggregate_calls: &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls,
 ) -> Result<StatementResult, String> {
     let current_catalog = ctx.rewrite.current_catalog.as_deref();
     let current_database = ctx.rewrite.current_database.as_str();
@@ -6479,9 +6494,7 @@ fn first_refresh_iceberg_aggregate_mv(
         current_catalog,
         current_database,
         mv_definition,
-        &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls::from(
-            aggregate_shape,
-        ),
+        aggregate_calls,
         pin,
     ) {
         Ok(chunks) => chunks,
@@ -7775,7 +7788,7 @@ fn refresh_iceberg_join_mv(
     current_database: &str,
     mv_definition: &StoredMvDefinition,
     base_refs: &[IcebergTableRef],
-    shape: &crate::connector::starrocks::table::mv_shape::JoinProjectionFilterMvShape,
+    aliases: &crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases,
     apply_key: ApplyKeyContract,
 ) -> Result<StatementResult, String> {
     if base_refs.len() != 2 {
@@ -7787,7 +7800,7 @@ fn refresh_iceberg_join_mv(
                 .to_string(),
         );
     }
-    validate_join_shape_base_refs(shape, base_refs)?;
+    validate_join_aliases_base_refs(aliases, base_refs)?;
     let schema_contract = mv_definition.schema_contract.as_ref().ok_or_else(|| {
         format!(
             "iceberg MV target {}.{}.{} is missing A11 schema contract; rebuild or recreate the MV",
@@ -7800,7 +7813,7 @@ fn refresh_iceberg_join_mv(
             target.catalog, target.namespace, target.table, schema_contract.contract_version
         ));
     }
-    let (left_ref, right_ref) = join_base_refs_for_shape(shape, base_refs)?;
+    let (left_ref, right_ref) = join_base_refs_for_aliases(aliases, base_refs)?;
     let left_loaded_before_pin = load_current_iceberg_base_table(state, left_ref)?;
     let right_loaded_before_pin = load_current_iceberg_base_table(state, right_ref)?;
     let left_current_before_pin =
@@ -7944,7 +7957,7 @@ fn refresh_iceberg_join_mv(
                 &ctx,
                 &staging_branch,
                 refresh_id,
-                shape,
+                aliases,
                 left_ref,
                 right_ref,
             )
@@ -7969,25 +7982,48 @@ fn refresh_iceberg_join_mv(
                 state,
                 &ctx,
                 &[left_ref.clone(), right_ref.clone()],
-                shape,
+                aliases,
             )
         },
     )
 }
 
-fn join_base_refs_for_shape<'a>(
-    shape: &crate::connector::starrocks::table::mv_shape::JoinProjectionFilterMvShape,
+fn validate_join_aliases_base_refs(
+    aliases: &crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases,
+    base_refs: &[IcebergTableRef],
+) -> Result<(), String> {
+    for name in [
+        aliases.left_table.to_ascii_lowercase(),
+        aliases.right_table.to_ascii_lowercase(),
+    ] {
+        if !base_refs
+            .iter()
+            .any(|base| base.fqn().eq_ignore_ascii_case(&name))
+        {
+            return Err(format!(
+                "join MV references base {name} but analyzer resolved {base_refs:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Resolves the left/right `base_refs` for a join MV by matching
+/// `JoinAliases.{left_table,right_table}` (the `ObjectName.to_string()` FQN form)
+/// against `base.fqn()`.
+fn join_base_refs_for_aliases<'a>(
+    aliases: &crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases,
     base_refs: &'a [IcebergTableRef],
 ) -> Result<(&'a IcebergTableRef, &'a IcebergTableRef), String> {
-    let left_name = shape.left_table.to_string();
-    let right_name = shape.right_table.to_string();
+    let left_name = aliases.left_table.as_str();
+    let right_name = aliases.right_table.as_str();
     let left = base_refs
         .iter()
-        .find(|base| base.fqn().eq_ignore_ascii_case(&left_name))
+        .find(|base| base.fqn().eq_ignore_ascii_case(left_name))
         .ok_or_else(|| format!("join MV left base {left_name} was not resolved"))?;
     let right = base_refs
         .iter()
-        .find(|base| base.fqn().eq_ignore_ascii_case(&right_name))
+        .find(|base| base.fqn().eq_ignore_ascii_case(right_name))
         .ok_or_else(|| format!("join MV right base {right_name} was not resolved"))?;
     Ok((left, right))
 }
@@ -8187,7 +8223,7 @@ fn first_refresh_iceberg_join_mv(
     ctx: &IcebergMvRefreshContext,
     staging_branch: &str,
     refresh_id: i64,
-    shape: &crate::connector::starrocks::table::mv_shape::JoinProjectionFilterMvShape,
+    aliases: &crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases,
     left_ref: &IcebergTableRef,
     right_ref: &IcebergTableRef,
 ) -> Result<StatementResult, String> {
@@ -8255,8 +8291,8 @@ fn first_refresh_iceberg_join_mv(
         left_snapshot,
         right_ref,
         right_snapshot,
-        &shape.left_alias,
-        &shape.right_alias,
+        &aliases.left_alias,
+        &aliases.right_alias,
     )
     .map_err(|err| {
         handle_iceberg_mv_commit_error(state, target, target_entry, staging_branch, refresh_id, err)
@@ -9202,7 +9238,7 @@ fn incremental_refresh_iceberg_join_mv(
     state: &Arc<StandaloneState>,
     ctx: &IcebergMvRefreshContext,
     base_refs: &[IcebergTableRef],
-    shape: &crate::connector::starrocks::table::mv_shape::JoinProjectionFilterMvShape,
+    aliases: &crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases,
 ) -> Result<StatementResult, String> {
     let target = &ctx.rewrite.target;
     let target_entry = &*ctx.target_entry;
@@ -9297,7 +9333,7 @@ fn incremental_refresh_iceberg_join_mv(
         expected_main_snapshot_id,
         current_database,
         mv_definition,
-        shape,
+        aliases,
         pin,
         branches,
     )
@@ -9312,7 +9348,7 @@ fn execute_join_delta_branches(
     expected_main_snapshot_id: Option<i64>,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
-    shape: &crate::connector::starrocks::table::mv_shape::JoinProjectionFilterMvShape,
+    aliases: &crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases,
     pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
     branches: Vec<crate::engine::mv::iceberg_join_branch::JoinDeltaBranchPlan>,
 ) -> Result<StatementResult, String> {
@@ -9370,8 +9406,8 @@ fn execute_join_delta_branches(
         let mut branch_query = crate::engine::mv::iceberg_join_branch::rewrite_join_branch_query(
             &base_query,
             &branch,
-            &shape.left_alias,
-            &shape.right_alias,
+            &aliases.left_alias,
+            &aliases.right_alias,
         )
         .map_err(|err| {
             handle_iceberg_mv_commit_error(
@@ -10644,14 +10680,6 @@ mod tests {
     }
 
     #[test]
-    fn refresh_dispatch_identifies_join_shape() {
-        let query =
-            parse_select_query("select l.id from ice.ns.left l join ice.ns.right r on l.id = r.id");
-        let shape = classify_incremental_mv_query(&query).expect("shape");
-        assert!(is_join_projection_filter_mv(&shape));
-    }
-
-    #[test]
     fn refresh_contract_selects_fan_in_aggregate_for_a_family() {
         let env = open_test_state_with_hadoop_iceberg_catalog("ice_fan_in", "sales");
         create_aggregate_fact_table(&env.state, "ice_fan_in", "sales", "t1");
@@ -10718,18 +10746,13 @@ mod tests {
         let sql = "select region, avg(amount) as a \
                    from ice.ns.fact group by region";
         let query = parse_select_query(sql);
-        let shape = match classify_incremental_mv_query(&query).expect("shape") {
-            IncrementalMvShape::Aggregate(shape) => shape,
-            other => panic!("expected aggregate shape, got {other:?}"),
-        };
+        let calls =
+            crate::connector::starrocks::table::aggregate_sql_calls::extract_aggregate_sql_calls(
+                &query,
+            )
+            .expect("extract aggregate calls");
 
-        let state_sql = iceberg_aggregate_first_refresh_select_sql(
-            sql,
-            &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls::from(
-                &shape,
-            ),
-        )
-        .expect("rewrite");
+        let state_sql = iceberg_aggregate_first_refresh_select_sql(sql, &calls).expect("rewrite");
         let upper = state_sql.to_uppercase();
 
         assert!(
@@ -11490,17 +11513,23 @@ mod tests {
         }
     }
 
-    fn analyze_aggregate_fact_query(sql: &str) -> (AggregateMvShape, MvAnalysis) {
+    fn analyze_aggregate_fact_query(
+        sql: &str,
+    ) -> (
+        crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls,
+        MvAnalysis,
+    ) {
         let env = open_test_state_with_iceberg_catalog("ice", "ns");
         create_aggregate_fact_table(&env.state, "ice", "ns", "fact");
         let query = parse_select_query(sql);
-        let shape = match classify_incremental_mv_query(&query).expect("shape") {
-            IncrementalMvShape::Aggregate(shape) => shape,
-            other => panic!("expected aggregate shape, got {other:?}"),
-        };
+        let calls =
+            crate::connector::starrocks::table::aggregate_sql_calls::extract_aggregate_sql_calls(
+                &query,
+            )
+            .expect("extract aggregate calls");
         let analysis = analyze_mv_select(&env.state, Some("ice"), &env.current_db, &query)
             .expect("analyze aggregate query");
-        (shape, analysis)
+        (calls, analysis)
     }
 
     struct IcebergMvTestState {
@@ -13130,57 +13159,32 @@ mod tests {
     }
 
     #[test]
-    fn validate_aggregate_fan_in_base_refs_rejects_mismatch() {
-        let query = parse_select_query(
-            "SELECT region, sum(amount) AS s
-             FROM (
-                 SELECT region, amount FROM ice.sales.fact_east
-                 UNION ALL
-                 SELECT region, amount FROM ice.sales.fact_west
-             ) u
-             GROUP BY region",
-        );
-        let shape = match classify_incremental_mv_query(&query).expect("shape") {
-            IncrementalMvShape::Aggregate(shape) => shape,
-            other => panic!("expected aggregate shape, got {other:?}"),
-        };
+    fn validate_aggregate_fan_in_base_refs_accepts_distinct_resolved_refs() {
+        // The validator no longer compares a classifier-derived fan-in base set
+        // against the resolved refs (that invariant is trivially satisfied now
+        // that the resolved refs ARE the fan-in base set). A distinct resolved
+        // base-ref set is accepted; per-base schema-contract checks live in
+        // `validate_aggregate_schema_contract_for_base`.
         let base_refs = vec![
             iceberg_ref("ice", "sales", "fact_east"),
-            iceberg_ref("ice", "sales", "fact_other"),
+            iceberg_ref("ice", "sales", "fact_west"),
         ];
 
-        let err = validate_aggregate_fan_in_base_refs(&shape, &base_refs)
-            .expect_err("fan-in and resolved refs must match exactly");
-
-        assert!(err.contains("exactly match"), "err={err}");
-        assert!(err.contains("fact_west"), "err={err}");
-        assert!(err.contains("fact_other"), "err={err}");
+        validate_aggregate_fan_in_base_refs(&base_refs)
+            .expect("distinct resolved fan-in base refs must be accepted");
     }
 
     #[test]
-    fn validate_aggregate_fan_in_base_refs_rejects_duplicate_fan_in_base() {
-        let query = parse_select_query(
-            "SELECT region, sum(amount) AS s
-             FROM (
-                 SELECT region, amount FROM ice.sales.fact
-                 UNION ALL
-                 SELECT region, amount FROM ice.sales.fact
-             ) u
-             GROUP BY region",
-        );
-        let shape = match classify_incremental_mv_query(&query).expect("shape") {
-            IncrementalMvShape::Aggregate(shape) => shape,
-            other => panic!("expected aggregate shape, got {other:?}"),
-        };
+    fn validate_aggregate_fan_in_base_refs_rejects_duplicate_resolved_base() {
         let base_refs = vec![
             iceberg_ref("ice", "sales", "fact"),
             iceberg_ref("ice", "sales", "fact"),
         ];
 
-        let err = validate_aggregate_fan_in_base_refs(&shape, &base_refs)
-            .expect_err("duplicate fan-in bases should be rejected");
+        let err = validate_aggregate_fan_in_base_refs(&base_refs)
+            .expect_err("duplicate resolved base refs should be rejected");
 
-        assert!(err.contains("duplicate fan-in base"), "err={err}");
+        assert!(err.contains("duplicate resolved base ref"), "err={err}");
         assert!(err.contains("ice.sales.fact"), "err={err}");
     }
 
@@ -13228,10 +13232,6 @@ mod tests {
         );
         let analysis = analyze_mv_select(&env.state, Some("ice"), &env.current_db, &query)
             .expect("analyze UNION ALL aggregate query");
-        let shape = classify_incremental_mv_query(&query).expect("classify shape");
-        let IncrementalMvShape::UnionAll(union_shape) = &shape else {
-            panic!("expected UNION ALL shape, got {shape:?}");
-        };
         let resolved_dependencies = crate::engine::mv::dependency::resolve_create_mv_dependencies(
             &env.state,
             &analysis.resolved_refs,
@@ -13247,15 +13247,21 @@ mod tests {
                 (base_ref.clone(), loaded)
             })
             .collect::<Vec<_>>();
-        let first_aggregate_branch =
-            first_union_aggregate_branch(union_shape).expect("first aggregate branch");
+        // Source the first-branch aggregate calls from the AST (no classifier).
+        let first_branch_ast =
+            first_union_branch_ast_query(&query).expect("first branch ast query");
+        let first_branch_calls =
+            crate::connector::starrocks::table::aggregate_sql_calls::extract_aggregate_sql_calls(
+                &first_branch_ast,
+            )
+            .expect("first branch aggregate calls");
         let target = IcebergMvTarget {
             catalog: "ice".to_string(),
             namespace: "analytics".to_string(),
             table: "mv_union_fact_region_contract".to_string(),
         };
         let mut columns = iceberg_aggregate_target_columns_from_resolved_query(
-            first_aggregate_branch,
+            &first_branch_calls,
             &analysis.output_columns,
             first_union_branch_resolved_query(&analysis.resolved_query)
                 .expect("first branch resolved query"),
@@ -13365,6 +13371,40 @@ mod tests {
             crate::meta::repository::mv_contract::ApplyKeySource::GroupRowId
         );
         assert_eq!(branch.branch_id_column.target_field_id, branch_field.id);
+    }
+
+    // A fan-in aggregate over the SAME physical table more than once
+    // (`FROM (SELECT .. FROM t UNION ALL SELECT .. FROM t) GROUP BY ..`) dedups
+    // to a single resolved base. After de-classifying the CREATE schema-contract
+    // builders (R6), the degenerate fan-in must still be rejected at CREATE. It
+    // is rejected upstream of the schema-contract builder, by the capability
+    // property's `validate_distinct_base_ref_arity` (which requires the distinct
+    // base count to equal the fan-in branch count), so the de-classification
+    // did not regress this guard. This end-to-end `create_iceberg_mv` test pins
+    // that rejection (the `refresh_contract` unit suite covers the in-isolation
+    // `derive_imv_refresh_contract` path).
+    #[test]
+    fn create_iceberg_mv_rejects_fan_in_aggregate_over_same_table_twice() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_aggregate_fact_table(&env.state, "ice", "sales", "fact");
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_fan_in_same_table
+             DISTRIBUTED BY HASH(region) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT region, sum(amount) AS s
+                FROM (
+                    SELECT region, amount FROM ice.sales.fact
+                    UNION ALL
+                    SELECT region, amount FROM ice.sales.fact
+                ) u
+                GROUP BY region",
+        );
+        let err = create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect_err("fan-in over the same physical table twice must be rejected at CREATE");
+        assert!(
+            err.contains("distinct Iceberg base table refs"),
+            "expected same-physical-table fan-in rejection, got: {err}"
+        );
     }
 
     #[test]

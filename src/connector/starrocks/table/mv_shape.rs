@@ -19,30 +19,6 @@ impl IncrementalMvShape {
             }
         }
     }
-
-    pub(crate) fn base_tables(&self) -> Vec<&sqlparser::ast::ObjectName> {
-        match self {
-            IncrementalMvShape::ProjectionFilter(shape) => vec![&shape.base_table],
-            IncrementalMvShape::Aggregate(shape) => {
-                if shape.fan_in_bases.is_empty() {
-                    vec![&shape.base_table]
-                } else {
-                    shape.fan_in_bases.iter().collect()
-                }
-            }
-            IncrementalMvShape::UnionAll(shape) => shape
-                .branches
-                .iter()
-                .flat_map(|branch| branch.base_tables())
-                .collect(),
-            IncrementalMvShape::JoinProjectionFilter(shape) => {
-                vec![&shape.left_table, &shape.right_table]
-            }
-            IncrementalMvShape::JoinAggregate(shape) => {
-                vec![&shape.join.left_table, &shape.join.right_table]
-            }
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -524,7 +500,7 @@ fn classify_join_projection_filter_mv_query_for_select(
     })
 }
 
-fn table_factor_name_and_alias(
+pub(crate) fn table_factor_name_and_alias(
     factor: &sqlparser::ast::TableFactor,
 ) -> Result<(sqlparser::ast::ObjectName, String), String> {
     let sqlparser::ast::TableFactor::Table {
@@ -1942,36 +1918,6 @@ mod tests {
     }
 
     #[test]
-    fn union_all_shape_reports_all_branch_base_tables() {
-        let agg = AggregateMvShape {
-            base_table: name("ice.ns.t1"),
-            fan_in_bases: Vec::new(),
-            group_keys: Vec::new(),
-            aggregates: Vec::new(),
-            visible_outputs: Vec::new(),
-        };
-        let agg2 = AggregateMvShape {
-            base_table: name("ice.ns.t2"),
-            fan_in_bases: Vec::new(),
-            group_keys: Vec::new(),
-            aggregates: Vec::new(),
-            visible_outputs: Vec::new(),
-        };
-        let shape = IncrementalMvShape::UnionAll(UnionAllMvShape {
-            branch_kind: UnionBranchKind::Aggregate,
-            branches: vec![
-                IncrementalMvShape::Aggregate(agg),
-                IncrementalMvShape::Aggregate(agg2),
-            ],
-        });
-        let bases: Vec<String> = shape.base_tables().iter().map(|n| n.to_string()).collect();
-        assert_eq!(
-            bases,
-            vec!["ice.ns.t1".to_string(), "ice.ns.t2".to_string()]
-        );
-    }
-
-    #[test]
     fn accepts_top_level_union_all_of_aggregate_branches() {
         let shape = classify_sql(
             "select k1, sum(v2) as s from ice.ns.t1 group by k1 \
@@ -1986,14 +1932,6 @@ mod tests {
         assert_eq!(u.branches.len(), 2);
         assert!(matches!(u.branches[0], IncrementalMvShape::Aggregate(_)));
         assert!(matches!(u.branches[1], IncrementalMvShape::Aggregate(_)));
-        assert_eq!(
-            u.branches
-                .iter()
-                .flat_map(|b| b.base_tables())
-                .map(|n| n.to_string())
-                .collect::<Vec<_>>(),
-            vec!["ice.ns.t1".to_string(), "ice.ns.t2".to_string()]
-        );
     }
 
     #[test]
@@ -2087,23 +2025,6 @@ mod tests {
         assert!(
             err.contains("UNION ALL") || err.contains("incremental"),
             "unexpected: {err}"
-        );
-    }
-
-    #[test]
-    fn aggregate_shape_fan_in_bases_drive_base_tables() {
-        let agg = AggregateMvShape {
-            base_table: name("ice.ns.t1"),
-            fan_in_bases: vec![name("ice.ns.t1"), name("ice.ns.t2")],
-            group_keys: Vec::new(),
-            aggregates: Vec::new(),
-            visible_outputs: Vec::new(),
-        };
-        let shape = IncrementalMvShape::Aggregate(agg);
-        let bases: Vec<String> = shape.base_tables().iter().map(|n| n.to_string()).collect();
-        assert_eq!(
-            bases,
-            vec!["ice.ns.t1".to_string(), "ice.ns.t2".to_string()]
         );
     }
 
