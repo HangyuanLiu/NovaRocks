@@ -412,6 +412,9 @@ fn iceberg_mv_target_exists(
     }
 }
 
+// TODO(R7): delete — dead after the join projection/filter and join-aggregate
+// refresh/plan paths moved to `validate_join_aliases_base_refs`. Retained only so
+// the alias-sibling doc links stay valid until the final classifier-retirement task.
 fn validate_join_shape_base_refs(
     shape: &crate::connector::starrocks::table::mv_shape::JoinProjectionFilterMvShape,
     base_refs: &[IcebergTableRef],
@@ -2529,15 +2532,15 @@ fn refresh_iceberg_mv_with_planned_partitions(
                 planned_affected_partitions,
             );
         }
-        // Two-table inner equi-join projection/filter.
+        // Two-table inner equi-join projection/filter. The left/right table
+        // aliases (the single execution-load-bearing join field, consumed by the
+        // join-refresh SQL rewriters) are sourced from the focused join-alias
+        // extractor rather than the legacy classifier.
         (false, BaseSnapshotPolicy::JoinPairPartialInitialSkip, _) => {
-            // KEEP: classification still feeds the first-refresh/layout helper.
-            let shape = classify_incremental_mv_query(&canonical_select_query)?;
-            let IncrementalMvShape::JoinProjectionFilter(join_shape) = &shape else {
-                return Err(
-                    "iceberg join MV refresh contract did not match legacy join shape".to_string(),
-                );
-            };
+            let join_aliases =
+                crate::connector::starrocks::table::aggregate_sql_calls::extract_join_aliases(
+                    &canonical_select_query,
+                )?;
             return refresh_iceberg_join_mv(
                 state,
                 &target,
@@ -2549,7 +2552,7 @@ fn refresh_iceberg_mv_with_planned_partitions(
                 current_database,
                 &mv_definition,
                 &base_refs,
-                join_shape,
+                &join_aliases,
                 refresh_contract.apply_key,
             );
         }
@@ -4682,22 +4685,22 @@ pub(crate) fn plan_iceberg_mv_refresh(
         (false, BaseSnapshotPolicy::JoinPairPartialInitialSkip, _)
         | (false, BaseSnapshotPolicy::SingleBase, _) => {}
     }
-    // KEEP: the legacy classifier still feeds the join/single-scan inline paths
-    // below (these shapes are not composed branch unions, so it succeeds).
-    let shape =
-        classify_incremental_mv_query(&canonical_select_query).map_err(RefreshError::user)?;
     if is_join {
-        let IncrementalMvShape::JoinProjectionFilter(join_shape) = &shape else {
-            return Err(RefreshError::user(
-                "iceberg join projection/filter refresh contract did not match legacy join shape",
-            ));
-        };
+        // The join projection/filter plan path sources the left/right table
+        // aliases from the focused join-alias extractor (not the legacy
+        // classifier); base-ref matching uses the `JoinAliases`-sourced
+        // validators, mirroring the execute path.
+        let join_aliases =
+            crate::connector::starrocks::table::aggregate_sql_calls::extract_join_aliases(
+                &canonical_select_query,
+            )
+            .map_err(RefreshError::user)?;
         if base_refs.len() != 2 {
             return Err(RefreshError::user(
                 "iceberg join materialized view refresh requires exactly two base table references",
             ));
         }
-        validate_join_shape_base_refs(join_shape, &base_refs).map_err(RefreshError::user)?;
+        validate_join_aliases_base_refs(&join_aliases, &base_refs).map_err(RefreshError::user)?;
         let schema_contract = mv_definition.schema_contract.as_ref().ok_or_else(|| {
             RefreshError::user(format!(
                 "iceberg MV target {}.{}.{} is missing A11 schema contract; rebuild or recreate the MV",
@@ -4714,7 +4717,7 @@ pub(crate) fn plan_iceberg_mv_refresh(
             )));
         }
         let (left_ref, right_ref) =
-            join_base_refs_for_shape(join_shape, &base_refs).map_err(RefreshError::user)?;
+            join_base_refs_for_aliases(&join_aliases, &base_refs).map_err(RefreshError::user)?;
         let left_loaded =
             load_current_iceberg_base_table(state, left_ref).map_err(RefreshError::user)?;
         let right_loaded =
@@ -4830,6 +4833,11 @@ pub(crate) fn plan_iceberg_mv_refresh(
             }),
         });
     }
+    // KEEP: the single-scan projection/filter inline path below is not a composed
+    // branch union, so the legacy classifier still feeds its first-refresh/layout
+    // helpers. (The join path above no longer classifies.)
+    let shape =
+        classify_incremental_mv_query(&canonical_select_query).map_err(RefreshError::user)?;
     if !matches!(shape, IncrementalMvShape::ProjectionFilter(_)) {
         return Err(RefreshError::user(
             "iceberg materialized view refresh only supports projection/filter or join projection/filter shapes",
@@ -7749,7 +7757,7 @@ fn refresh_iceberg_join_mv(
     current_database: &str,
     mv_definition: &StoredMvDefinition,
     base_refs: &[IcebergTableRef],
-    shape: &crate::connector::starrocks::table::mv_shape::JoinProjectionFilterMvShape,
+    aliases: &crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases,
     apply_key: ApplyKeyContract,
 ) -> Result<StatementResult, String> {
     if base_refs.len() != 2 {
@@ -7761,7 +7769,7 @@ fn refresh_iceberg_join_mv(
                 .to_string(),
         );
     }
-    validate_join_shape_base_refs(shape, base_refs)?;
+    validate_join_aliases_base_refs(aliases, base_refs)?;
     let schema_contract = mv_definition.schema_contract.as_ref().ok_or_else(|| {
         format!(
             "iceberg MV target {}.{}.{} is missing A11 schema contract; rebuild or recreate the MV",
@@ -7774,7 +7782,7 @@ fn refresh_iceberg_join_mv(
             target.catalog, target.namespace, target.table, schema_contract.contract_version
         ));
     }
-    let (left_ref, right_ref) = join_base_refs_for_shape(shape, base_refs)?;
+    let (left_ref, right_ref) = join_base_refs_for_aliases(aliases, base_refs)?;
     let left_loaded_before_pin = load_current_iceberg_base_table(state, left_ref)?;
     let right_loaded_before_pin = load_current_iceberg_base_table(state, right_ref)?;
     let left_current_before_pin =
@@ -7918,7 +7926,7 @@ fn refresh_iceberg_join_mv(
                 &ctx,
                 &staging_branch,
                 refresh_id,
-                shape,
+                aliases,
                 left_ref,
                 right_ref,
             )
@@ -7943,12 +7951,15 @@ fn refresh_iceberg_join_mv(
                 state,
                 &ctx,
                 &[left_ref.clone(), right_ref.clone()],
-                shape,
+                aliases,
             )
         },
     )
 }
 
+// TODO(R7): delete — dead after the join projection/filter and join-aggregate
+// refresh/plan paths moved to `join_base_refs_for_aliases`. Retained only so the
+// alias-sibling doc links stay valid until the final classifier-retirement task.
 fn join_base_refs_for_shape<'a>(
     shape: &crate::connector::starrocks::table::mv_shape::JoinProjectionFilterMvShape,
     base_refs: &'a [IcebergTableRef],
@@ -8211,7 +8222,7 @@ fn first_refresh_iceberg_join_mv(
     ctx: &IcebergMvRefreshContext,
     staging_branch: &str,
     refresh_id: i64,
-    shape: &crate::connector::starrocks::table::mv_shape::JoinProjectionFilterMvShape,
+    aliases: &crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases,
     left_ref: &IcebergTableRef,
     right_ref: &IcebergTableRef,
 ) -> Result<StatementResult, String> {
@@ -8279,8 +8290,8 @@ fn first_refresh_iceberg_join_mv(
         left_snapshot,
         right_ref,
         right_snapshot,
-        &shape.left_alias,
-        &shape.right_alias,
+        &aliases.left_alias,
+        &aliases.right_alias,
     )
     .map_err(|err| {
         handle_iceberg_mv_commit_error(state, target, target_entry, staging_branch, refresh_id, err)
@@ -9226,7 +9237,7 @@ fn incremental_refresh_iceberg_join_mv(
     state: &Arc<StandaloneState>,
     ctx: &IcebergMvRefreshContext,
     base_refs: &[IcebergTableRef],
-    shape: &crate::connector::starrocks::table::mv_shape::JoinProjectionFilterMvShape,
+    aliases: &crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases,
 ) -> Result<StatementResult, String> {
     let target = &ctx.rewrite.target;
     let target_entry = &*ctx.target_entry;
@@ -9321,7 +9332,7 @@ fn incremental_refresh_iceberg_join_mv(
         expected_main_snapshot_id,
         current_database,
         mv_definition,
-        shape,
+        aliases,
         pin,
         branches,
     )
@@ -9336,7 +9347,7 @@ fn execute_join_delta_branches(
     expected_main_snapshot_id: Option<i64>,
     current_database: &str,
     mv_definition: &StoredMvDefinition,
-    shape: &crate::connector::starrocks::table::mv_shape::JoinProjectionFilterMvShape,
+    aliases: &crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases,
     pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
     branches: Vec<crate::engine::mv::iceberg_join_branch::JoinDeltaBranchPlan>,
 ) -> Result<StatementResult, String> {
@@ -9394,8 +9405,8 @@ fn execute_join_delta_branches(
         let mut branch_query = crate::engine::mv::iceberg_join_branch::rewrite_join_branch_query(
             &base_query,
             &branch,
-            &shape.left_alias,
-            &shape.right_alias,
+            &aliases.left_alias,
+            &aliases.right_alias,
         )
         .map_err(|err| {
             handle_iceberg_mv_commit_error(
