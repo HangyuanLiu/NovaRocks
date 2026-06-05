@@ -6,6 +6,8 @@
 
 pub(crate) mod plan;
 
+use arrow::datatypes::DataType;
+
 use crate::sql::analysis::cte::CTERegistry;
 use crate::sql::analysis::*;
 use crate::sql::catalog::{IcebergDataFileInfo, IcebergDeleteFileContent};
@@ -1069,9 +1071,8 @@ fn build_window_and_project(
                 is_internal: false,
             });
         }
-        let output_column_ids: Vec<_> = output_columns.iter().map(|col| col.column_id).collect();
         let (window_exprs, rewritten_items) =
-            extract_window_calls(&project_items, &output_column_ids);
+            extract_window_calls(&project_items, &mut output_columns, factory);
         // The analytic operator requires input sorted by (partition_by, order_by).
         // Insert a Sort node before the Window node using the first window
         // function's sort keys.  When window functions have different
@@ -1301,7 +1302,8 @@ fn normalize_window_frame_for_be(
 /// Window calls may be nested inside expressions (e.g., `sum(x) * 100 / sum(sum(x)) OVER (...)`).
 fn extract_window_calls(
     items: &[ProjectItem],
-    output_column_ids: &[ColumnId],
+    output_columns: &mut Vec<OutputColumn>,
+    factory: &mut ColumnRefFactory,
 ) -> (Vec<WindowExpr>, Vec<ProjectItem>) {
     let mut window_exprs = Vec::new();
     let mut rewritten = Vec::new();
@@ -1309,14 +1311,21 @@ fn extract_window_calls(
 
     for (idx, item) in items.iter().enumerate() {
         if has_window_call(&item.expr) {
-            let output_column_id = output_column_ids
+            let visible_output_column_id = output_columns
                 .get(idx)
-                .copied()
+                .map(|col| col.column_id)
                 .unwrap_or(item.output_column_id);
+            let mut output_ids = WindowOutputIdAllocator {
+                factory,
+                output_columns,
+                visible_output_column_id,
+                reuse_visible_output_id: is_exact_window_call(&item.expr),
+                visible_output_id_used: false,
+            };
             let new_expr = rewrite_window_calls(
                 &item.expr,
                 &item.output_name,
-                output_column_id,
+                &mut output_ids,
                 &mut window_exprs,
                 &mut counter,
             );
@@ -1333,12 +1342,49 @@ fn extract_window_calls(
     (window_exprs, rewritten)
 }
 
+struct WindowOutputIdAllocator<'a> {
+    factory: &'a mut ColumnRefFactory,
+    output_columns: &'a mut Vec<OutputColumn>,
+    visible_output_column_id: ColumnId,
+    reuse_visible_output_id: bool,
+    visible_output_id_used: bool,
+}
+
+impl WindowOutputIdAllocator<'_> {
+    fn allocate(&mut self, output_name: &str, data_type: DataType, nullable: bool) -> ColumnId {
+        if self.reuse_visible_output_id && !self.visible_output_id_used {
+            self.visible_output_id_used = true;
+            return self.visible_output_column_id;
+        }
+
+        let column_id =
+            self.factory
+                .create(None, output_name.to_string(), data_type.clone(), nullable);
+        self.output_columns.push(OutputColumn {
+            column_id,
+            name: output_name.to_string(),
+            data_type,
+            nullable,
+            is_internal: true,
+        });
+        column_id
+    }
+}
+
+fn is_exact_window_call(expr: &TypedExpr) -> bool {
+    match &expr.kind {
+        ExprKind::WindowCall { .. } => true,
+        ExprKind::Nested(inner) => is_exact_window_call(inner),
+        _ => false,
+    }
+}
+
 /// Recursively rewrite an expression tree, replacing each WindowCall node
 /// with a ColumnRef that points to the window function's output column.
 fn rewrite_window_calls(
     expr: &TypedExpr,
     base_name: &str,
-    output_column_id: ColumnId,
+    output_ids: &mut WindowOutputIdAllocator<'_>,
     window_exprs: &mut Vec<WindowExpr>,
     counter: &mut usize,
 ) -> TypedExpr {
@@ -1372,6 +1418,8 @@ fn rewrite_window_calls(
             // "first" vs "last".
             let (rewritten_name, rewritten_order_by, rewritten_frame) =
                 normalize_window_frame_for_be(name, order_by.clone(), window_frame.clone());
+            let output_column_id =
+                output_ids.allocate(&win_output_name, expr.data_type.clone(), expr.nullable);
 
             window_exprs.push(WindowExpr {
                 name: rewritten_name,
@@ -1400,7 +1448,7 @@ fn rewrite_window_calls(
                 left: Box::new(rewrite_window_calls(
                     left,
                     base_name,
-                    output_column_id,
+                    output_ids,
                     window_exprs,
                     counter,
                 )),
@@ -1408,7 +1456,7 @@ fn rewrite_window_calls(
                 right: Box::new(rewrite_window_calls(
                     right,
                     base_name,
-                    output_column_id,
+                    output_ids,
                     window_exprs,
                     counter,
                 )),
@@ -1422,7 +1470,7 @@ fn rewrite_window_calls(
                 expr: Box::new(rewrite_window_calls(
                     inner,
                     base_name,
-                    output_column_id,
+                    output_ids,
                     window_exprs,
                     counter,
                 )),
@@ -1440,13 +1488,7 @@ fn rewrite_window_calls(
                 args: args
                     .iter()
                     .map(|arg| {
-                        rewrite_window_calls(
-                            arg,
-                            base_name,
-                            output_column_id,
-                            window_exprs,
-                            counter,
-                        )
+                        rewrite_window_calls(arg, base_name, output_ids, window_exprs, counter)
                     })
                     .collect(),
                 distinct: *distinct,
@@ -1465,13 +1507,7 @@ fn rewrite_window_calls(
                 args: args
                     .iter()
                     .map(|arg| {
-                        rewrite_window_calls(
-                            arg,
-                            base_name,
-                            output_column_id,
-                            window_exprs,
-                            counter,
-                        )
+                        rewrite_window_calls(arg, base_name, output_ids, window_exprs, counter)
                     })
                     .collect(),
                 distinct: *distinct,
@@ -1481,7 +1517,7 @@ fn rewrite_window_calls(
                         expr: rewrite_window_calls(
                             &item.expr,
                             base_name,
-                            output_column_id,
+                            output_ids,
                             window_exprs,
                             counter,
                         ),
@@ -1501,7 +1537,7 @@ fn rewrite_window_calls(
                 expr: Box::new(rewrite_window_calls(
                     inner,
                     base_name,
-                    output_column_id,
+                    output_ids,
                     window_exprs,
                     counter,
                 )),
@@ -1518,7 +1554,7 @@ fn rewrite_window_calls(
                 expr: Box::new(rewrite_window_calls(
                     inner,
                     base_name,
-                    output_column_id,
+                    output_ids,
                     window_exprs,
                     counter,
                 )),
@@ -1536,20 +1572,14 @@ fn rewrite_window_calls(
                 expr: Box::new(rewrite_window_calls(
                     inner,
                     base_name,
-                    output_column_id,
+                    output_ids,
                     window_exprs,
                     counter,
                 )),
                 list: list
                     .iter()
                     .map(|item| {
-                        rewrite_window_calls(
-                            item,
-                            base_name,
-                            output_column_id,
-                            window_exprs,
-                            counter,
-                        )
+                        rewrite_window_calls(item, base_name, output_ids, window_exprs, counter)
                     })
                     .collect(),
                 negated: *negated,
@@ -1567,21 +1597,21 @@ fn rewrite_window_calls(
                 expr: Box::new(rewrite_window_calls(
                     inner,
                     base_name,
-                    output_column_id,
+                    output_ids,
                     window_exprs,
                     counter,
                 )),
                 low: Box::new(rewrite_window_calls(
                     low,
                     base_name,
-                    output_column_id,
+                    output_ids,
                     window_exprs,
                     counter,
                 )),
                 high: Box::new(rewrite_window_calls(
                     high,
                     base_name,
-                    output_column_id,
+                    output_ids,
                     window_exprs,
                     counter,
                 )),
@@ -1599,14 +1629,14 @@ fn rewrite_window_calls(
                 expr: Box::new(rewrite_window_calls(
                     inner,
                     base_name,
-                    output_column_id,
+                    output_ids,
                     window_exprs,
                     counter,
                 )),
                 pattern: Box::new(rewrite_window_calls(
                     pattern,
                     base_name,
-                    output_column_id,
+                    output_ids,
                     window_exprs,
                     counter,
                 )),
@@ -1625,7 +1655,7 @@ fn rewrite_window_calls(
                     Box::new(rewrite_window_calls(
                         inner,
                         base_name,
-                        output_column_id,
+                        output_ids,
                         window_exprs,
                         counter,
                     ))
@@ -1637,14 +1667,14 @@ fn rewrite_window_calls(
                             rewrite_window_calls(
                                 when,
                                 base_name,
-                                output_column_id,
+                                output_ids,
                                 window_exprs,
                                 counter,
                             ),
                             rewrite_window_calls(
                                 then,
                                 base_name,
-                                output_column_id,
+                                output_ids,
                                 window_exprs,
                                 counter,
                             ),
@@ -1655,7 +1685,7 @@ fn rewrite_window_calls(
                     Box::new(rewrite_window_calls(
                         inner,
                         base_name,
-                        output_column_id,
+                        output_ids,
                         window_exprs,
                         counter,
                     ))
@@ -1673,7 +1703,7 @@ fn rewrite_window_calls(
                 expr: Box::new(rewrite_window_calls(
                     inner,
                     base_name,
-                    output_column_id,
+                    output_ids,
                     window_exprs,
                     counter,
                 )),
@@ -1687,7 +1717,7 @@ fn rewrite_window_calls(
             kind: ExprKind::Nested(Box::new(rewrite_window_calls(
                 inner,
                 base_name,
-                output_column_id,
+                output_ids,
                 window_exprs,
                 counter,
             ))),
@@ -2739,6 +2769,38 @@ mod tests {
         visit(plan).unwrap_or_default()
     }
 
+    fn assert_window_expr_ids_are_real_unique_and_backed_by_output_columns(plan: &LogicalPlan) {
+        let wins = first_window_exprs(plan);
+        let output_columns = first_window_output_columns(plan);
+        assert!(!wins.is_empty(), "expected at least one WindowExpr");
+
+        let output_ids = output_columns
+            .iter()
+            .map(|col| col.column_id)
+            .collect::<std::collections::HashSet<_>>();
+        let mut window_ids = std::collections::HashSet::new();
+        for w in &wins {
+            assert_ne!(
+                w.output_column_id,
+                crate::sql::column_id::ColumnId::UNSET,
+                "WindowExpr {} must carry a real output_column_id",
+                w.output_name
+            );
+            assert!(
+                window_ids.insert(w.output_column_id),
+                "WindowExpr {} reuses output_column_id {}",
+                w.output_name,
+                w.output_column_id
+            );
+            assert!(
+                output_ids.contains(&w.output_column_id),
+                "WindowExpr {} output_column_id {} missing from WindowNode.output_columns",
+                w.output_name,
+                w.output_column_id
+            );
+        }
+    }
+
     fn strip_project_sort_limit(plan: &LogicalPlan) -> &LogicalPlan {
         match plan {
             LogicalPlan::Project(node) => strip_project_sort_limit(&node.input),
@@ -3099,26 +3161,43 @@ mod tests {
     fn p1_window_expr_gets_output_column_id() {
         let plan =
             plan_test_query("SELECT a, row_number() OVER (PARTITION BY a ORDER BY b) AS rn FROM t");
+        assert_window_expr_ids_are_real_unique_and_backed_by_output_columns(&plan);
+    }
+
+    #[test]
+    fn p1_compound_window_exprs_get_distinct_output_column_ids() {
+        let plan = plan_test_query(
+            "SELECT row_number() OVER (ORDER BY a) + rank() OVER (ORDER BY b) AS x FROM t",
+        );
         let wins = first_window_exprs(&plan);
         let output_columns = first_window_output_columns(&plan);
-        assert!(!wins.is_empty(), "expected at least one WindowExpr");
+        assert_eq!(wins.len(), 2, "expected two extracted WindowExprs");
+        assert_window_expr_ids_are_real_unique_and_backed_by_output_columns(&plan);
         for w in &wins {
-            assert_ne!(
-                w.output_column_id,
-                crate::sql::column_id::ColumnId::UNSET,
-                "WindowExpr {} must carry a real output_column_id",
-                w.output_name
-            );
             let output_column = output_columns
                 .iter()
-                .find(|col| col.name == w.output_name)
-                .unwrap_or_else(|| panic!("missing Window output column {}", w.output_name));
-            assert_eq!(
-                w.output_column_id, output_column.column_id,
-                "WindowExpr {} must share its WindowNode output column id",
+                .find(|col| col.column_id == w.output_column_id)
+                .expect("window output id should be present");
+            assert!(
+                output_column.is_internal,
+                "compound WindowExpr {} should use an internal output column",
                 w.output_name
             );
         }
+        let visible = plan_output_columns(&plan).expect("plan output should be known");
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].name, "x");
+        assert!(!visible[0].is_internal);
+    }
+
+    #[test]
+    fn p1_multiple_projection_window_exprs_get_distinct_output_column_ids() {
+        let plan = plan_test_query(
+            "SELECT row_number() OVER (ORDER BY a) AS rn, rank() OVER (ORDER BY b) AS rk FROM t",
+        );
+        let wins = first_window_exprs(&plan);
+        assert_eq!(wins.len(), 2, "expected two extracted WindowExprs");
+        assert_window_expr_ids_are_real_unique_and_backed_by_output_columns(&plan);
     }
 
     #[test]
