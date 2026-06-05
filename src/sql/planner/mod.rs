@@ -2801,6 +2801,22 @@ mod tests {
         }
     }
 
+    fn window_expr_by_function_name<'a>(wins: &'a [WindowExpr], name: &str) -> &'a WindowExpr {
+        wins.iter()
+            .find(|w| w.name.eq_ignore_ascii_case(name))
+            .unwrap_or_else(|| panic!("missing WindowExpr function {name}"))
+    }
+
+    fn visible_output_column_by_name<'a>(
+        output_columns: &'a [OutputColumn],
+        name: &str,
+    ) -> &'a OutputColumn {
+        output_columns
+            .iter()
+            .find(|col| !col.is_internal && col.name == name)
+            .unwrap_or_else(|| panic!("missing visible Window output column {name}"))
+    }
+
     fn strip_project_sort_limit(plan: &LogicalPlan) -> &LogicalPlan {
         match plan {
             LogicalPlan::Project(node) => strip_project_sort_limit(&node.input),
@@ -3162,6 +3178,14 @@ mod tests {
         let plan =
             plan_test_query("SELECT a, row_number() OVER (PARTITION BY a ORDER BY b) AS rn FROM t");
         assert_window_expr_ids_are_real_unique_and_backed_by_output_columns(&plan);
+        let wins = first_window_exprs(&plan);
+        let output_columns = first_window_output_columns(&plan);
+        let rn = window_expr_by_function_name(&wins, "row_number");
+        let visible_rn = visible_output_column_by_name(&output_columns, "rn");
+        assert_eq!(
+            rn.output_column_id, visible_rn.column_id,
+            "single visible window projection must reuse the visible rn output id"
+        );
     }
 
     #[test]
@@ -3196,8 +3220,21 @@ mod tests {
             "SELECT row_number() OVER (ORDER BY a) AS rn, rank() OVER (ORDER BY b) AS rk FROM t",
         );
         let wins = first_window_exprs(&plan);
+        let output_columns = first_window_output_columns(&plan);
         assert_eq!(wins.len(), 2, "expected two extracted WindowExprs");
         assert_window_expr_ids_are_real_unique_and_backed_by_output_columns(&plan);
+        let rn = window_expr_by_function_name(&wins, "row_number");
+        let rk = window_expr_by_function_name(&wins, "rank");
+        let visible_rn = visible_output_column_by_name(&output_columns, "rn");
+        let visible_rk = visible_output_column_by_name(&output_columns, "rk");
+        assert_eq!(
+            rn.output_column_id, visible_rn.column_id,
+            "single visible window projection must reuse the visible rn output id"
+        );
+        assert_eq!(
+            rk.output_column_id, visible_rk.column_id,
+            "single visible window projection must reuse the visible rk output id"
+        );
     }
 
     #[test]

@@ -167,6 +167,8 @@ pub(crate) struct WindowExpr {
     /// `output_column_id`. (G1: `output_name` downgraded from a binding key.)
     pub output_name: String,
     /// G1: globally-unique id of this window function's output column.
+    /// TODO(G1 P2/P3): remove this allow once parent Project/window references
+    /// are rebound by id and downstream binding consumes the populated field.
     #[allow(dead_code)]
     pub output_column_id: crate::sql::column_id::ColumnId,
     /// `IGNORE NULLS` modifier. Currently honored by first_value / last_value

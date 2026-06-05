@@ -3,25 +3,23 @@
 //! ## Gap-5: Window output pruning is intentionally deferred (NO-OP)
 //!
 //! `WindowNode.output_columns` is built by `build_window_and_project` in the
-//! planner using **fresh factory-allocated ColumnIds** (`factory.create(...)`),
-//! one per item in the original SELECT projection.  These fresh ids are
-//! distinct from the ColumnIds carried by the child scan/project items, and
-//! the name-based `output_name` ↔ `window_exprs[i].output_name` matching used
-//! by the old pruning strategy is fragile: in some query shapes the name
-//! match over-prunes and leaves `window_exprs` empty, which codegen rejects
-//! with "empty window_exprs".
+//! planner. Window function outputs now carry stable
+//! `WindowExpr.output_column_id` values that correspond to entries in
+//! `WindowNode.output_columns`, including internal synthetic slots for
+//! compound SELECT expressions.
 //!
-//! Safe pruning of Window output_columns requires a correct ColumnId contract
-//! between the Window node's `output_columns` entries and the window function
-//! output slots — equivalent to the `output_column_id` fix applied to
-//! `ProjectItem` (Gap 2).  Until that contract is established, this rule is a
-//! documented NO-OP.
+//! Safe pruning is still deferred because the parent Project currently reads
+//! rewritten window outputs through `ColumnRef { column_id: UNSET, column:
+//! <display-name> }`. The parent request is ColumnId-based, but the reference
+//! from Project back to Window output slots has not yet been rebound by id.
+//! Falling back to name-based `output_name` matching remains fragile and can
+//! over-prune `window_exprs`.
 //!
 //! `tag_window` already passes `None` (keep-all) to the child, so the child
 //! keeps all its input columns as well.  This is consistent and safe.
 //!
-//! Follow-up: re-enable pruning here once `WindowExpr` carries a stable
-//! `output_column_id` that the parent can address without name matching.
+//! Follow-up: re-enable pruning once the parent Project/window references are
+//! rewritten to address `WindowExpr.output_column_id` directly.
 
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
@@ -50,12 +48,9 @@ impl LogicalRewriteRule for PruneWindowColumns {
         _ctx: &mut RewriteContext,
     ) -> Result<RewriteResult, String> {
         // NO-OP: Window output pruning is deferred (Gap-5).
-        // Window.output_columns use fresh planner-allocated ColumnIds that
-        // don't correlate cleanly with the parent's required_output_columns set.
-        // Name-based pruning (matching output_column.name to window_expr.output_name)
-        // over-prunes in some query shapes, leaving window_exprs empty and
-        // causing a codegen error. Return Unchanged always until a proper
-        // ColumnId contract is established for WindowExpr outputs.
+        // WindowExpr outputs have stable ids, but the parent Project still
+        // references them through UNSET/name ColumnRefs. Name-based pruning
+        // remains unsafe until those references are rebound by id.
         Ok(RewriteResult::Unchanged)
     }
 }
