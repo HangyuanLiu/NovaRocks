@@ -1022,6 +1022,7 @@ mod tests {
                     distinct: false,
                     result_type: DataType::Int64,
                     order_by: vec![],
+                    output_column_id: ColumnId::UNSET,
                 },
                 AggregateCall {
                     name: "sum".to_string(),
@@ -1029,6 +1030,7 @@ mod tests {
                     distinct: false,
                     result_type: DataType::Int64,
                     order_by: vec![],
+                    output_column_id: ColumnId::UNSET,
                 },
             ],
             // SELECT-ordered: [count_oc@301, sum_oc@302] — y is NOT here.
@@ -1071,6 +1073,7 @@ mod tests {
                 distinct: false,
                 result_type: DataType::Int64,
                 order_by: vec![],
+                output_column_id: ColumnId::UNSET,
             }],
             output_columns: vec![make_output_column(ColumnId::new_for_test(301), "sum_x")],
             already_pushed: false,

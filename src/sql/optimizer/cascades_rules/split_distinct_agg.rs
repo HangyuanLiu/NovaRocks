@@ -160,6 +160,7 @@ fn distinct_aggregate_calls(
             distinct: true,
             result_type: arrow::datatypes::DataType::Int64,
             order_by: vec![],
+            output_column_id: ColumnId::UNSET,
         }]
     } else {
         distinct_aggs
@@ -387,6 +388,7 @@ mod tests {
             distinct: true,
             result_type: DataType::Int64,
             order_by: vec![],
+            output_column_id: ColumnId::UNSET,
         }
     }
 
@@ -401,6 +403,7 @@ mod tests {
                 true,
             ))),
             order_by: vec![],
+            output_column_id: ColumnId::UNSET,
         }
     }
 
@@ -411,6 +414,7 @@ mod tests {
             distinct: false,
             result_type: DataType::Int64,
             order_by: vec![],
+            output_column_id: ColumnId::UNSET,
         }
     }
 
@@ -444,6 +448,7 @@ mod tests {
             distinct: true,
             result_type: DataType::Int64,
             order_by: vec![],
+            output_column_id: ColumnId::UNSET,
         };
         let id = memo.next_expr_id();
         let mexpr = MExpr {
@@ -499,6 +504,7 @@ mod tests {
                             asc: true,
                             nulls_first: true,
                         }],
+                        output_column_id: ColumnId::UNSET,
                     },
                     count_distinct("name"),
                 ],
@@ -526,6 +532,7 @@ mod tests {
                         distinct: false,
                         result_type: DataType::Int64,
                         order_by: vec![],
+                        output_column_id: ColumnId::UNSET,
                     },
                 ],
                 vec![],
@@ -558,6 +565,7 @@ mod tests {
                         asc: true,
                         nulls_first: true,
                     }],
+                    output_column_id: ColumnId::UNSET,
                 }],
                 vec![],
             )),
@@ -575,6 +583,7 @@ mod tests {
             distinct: true,
             result_type: DataType::Int64,
             order_by: vec![],
+            output_column_id: ColumnId::UNSET,
         };
         let col_out = extract_single_distinct_col(&[count_distinct("x"), sum_distinct_x]);
         assert!(

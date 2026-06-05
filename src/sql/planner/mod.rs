@@ -146,7 +146,7 @@ fn apply_query_modifiers(
                 if let LogicalPlan::Project(ref mut proj) = body_plan {
                     if let LogicalPlan::Aggregate(ref mut agg) = *proj.input {
                         for extra in &extra_items {
-                            collect_aggregates(&extra.expr, &mut agg.aggregates);
+                            collect_aggregates(&extra.expr, &mut agg.aggregates, factory);
                         }
                     }
                     let user: Vec<(String, arrow::datatypes::DataType, bool, ColumnId)> = proj
@@ -1632,7 +1632,7 @@ fn split_projection_for_aggregate(
 
     // Collect aggregate calls from projection
     for item in projection {
-        collect_aggregates(&item.expr, &mut agg_calls);
+        collect_aggregates(&item.expr, &mut agg_calls, factory);
         output_columns.push(OutputColumn {
             column_id: expr_column_id(&item.expr, &item.output_name, factory),
             name: item.output_name.clone(),
@@ -1650,7 +1650,7 @@ fn split_projection_for_aggregate(
     // Also collect aggregate calls from HAVING clause so the aggregate node
     // computes them even when they don't appear in SELECT.
     if let Some(having_expr) = having {
-        collect_aggregates(having_expr, &mut agg_calls);
+        collect_aggregates(having_expr, &mut agg_calls, factory);
     }
 
     (project_items, agg_calls, output_columns)
@@ -1683,7 +1683,11 @@ fn rewrite_exact_group_by_expr_ref(expr: &TypedExpr, group_by: &[TypedExpr]) -> 
 }
 
 /// Recursively collect AggregateCall from a TypedExpr tree.
-fn collect_aggregates(expr: &TypedExpr, out: &mut Vec<AggregateCall>) {
+fn collect_aggregates(
+    expr: &TypedExpr,
+    out: &mut Vec<AggregateCall>,
+    factory: &mut ColumnRefFactory,
+) {
     match &expr.kind {
         ExprKind::AggregateCall {
             name,
@@ -1710,63 +1714,71 @@ fn collect_aggregates(expr: &TypedExpr, out: &mut Vec<AggregateCall>) {
                     })
             });
             if !already {
+                let display = crate::sql::codegen::helpers::agg_call_display_name_from_parts(
+                    name, args, *distinct, order_by,
+                );
+                let output_column_id =
+                    factory.create(None, display, expr.data_type.clone(), expr.nullable);
                 out.push(AggregateCall {
                     name: name.clone(),
                     args: args.clone(),
                     distinct: *distinct,
                     result_type: expr.data_type.clone(),
                     order_by: order_by.clone(),
+                    output_column_id,
                 });
             }
         }
         ExprKind::BinaryOp { left, right, .. } => {
-            collect_aggregates(left, out);
-            collect_aggregates(right, out);
+            collect_aggregates(left, out, factory);
+            collect_aggregates(right, out, factory);
         }
-        ExprKind::UnaryOp { expr: inner, .. } => collect_aggregates(inner, out),
+        ExprKind::UnaryOp { expr: inner, .. } => collect_aggregates(inner, out, factory),
         ExprKind::FunctionCall { args, .. } => {
             for arg in args {
-                collect_aggregates(arg, out);
+                collect_aggregates(arg, out, factory);
             }
         }
-        ExprKind::LambdaFunction { body, .. } => collect_aggregates(body, out),
-        ExprKind::Cast { expr: inner, .. } => collect_aggregates(inner, out),
+        ExprKind::LambdaFunction { body, .. } => collect_aggregates(body, out, factory),
+        ExprKind::Cast { expr: inner, .. } => collect_aggregates(inner, out, factory),
         ExprKind::Case {
             operand,
             when_then,
             else_expr,
         } => {
             if let Some(op) = operand {
-                collect_aggregates(op, out);
+                collect_aggregates(op, out, factory);
             }
             for (w, t) in when_then {
-                collect_aggregates(w, out);
-                collect_aggregates(t, out);
+                collect_aggregates(w, out, factory);
+                collect_aggregates(t, out, factory);
             }
             if let Some(e) = else_expr {
-                collect_aggregates(e, out);
+                collect_aggregates(e, out, factory);
             }
         }
-        ExprKind::IsNull { expr: inner, .. } => collect_aggregates(inner, out),
-        ExprKind::Nested(inner) => collect_aggregates(inner, out),
+        ExprKind::IsNull { expr: inner, .. } => collect_aggregates(inner, out, factory),
+        ExprKind::Nested(inner) => collect_aggregates(inner, out, factory),
         ExprKind::InList { expr, list, .. } => {
-            collect_aggregates(expr, out);
+            collect_aggregates(expr, out, factory);
             for item in list {
-                collect_aggregates(item, out);
+                collect_aggregates(item, out, factory);
             }
         }
         ExprKind::Between {
             expr, low, high, ..
         } => {
-            collect_aggregates(expr, out);
-            collect_aggregates(low, out);
-            collect_aggregates(high, out);
+            collect_aggregates(expr, out, factory);
+            collect_aggregates(low, out, factory);
+            collect_aggregates(high, out, factory);
         }
         ExprKind::Like { expr, pattern, .. } => {
-            collect_aggregates(expr, out);
-            collect_aggregates(pattern, out);
+            collect_aggregates(expr, out, factory);
+            collect_aggregates(pattern, out, factory);
         }
-        ExprKind::IsTruthValue { expr: inner, .. } => collect_aggregates(inner, out),
+        ExprKind::IsTruthValue { expr: inner, .. } => {
+            collect_aggregates(inner, out, factory);
+        }
         // Leaves
         ExprKind::ColumnRef { .. } | ExprKind::LambdaParamRef { .. } | ExprKind::Literal(_) => {}
         // Window calls themselves are not aggregates, but their args may
@@ -1779,13 +1791,13 @@ fn collect_aggregates(expr: &TypedExpr, out: &mut Vec<AggregateCall>) {
             ..
         } => {
             for arg in args {
-                collect_aggregates(arg, out);
+                collect_aggregates(arg, out, factory);
             }
             for expr in partition_by {
-                collect_aggregates(expr, out);
+                collect_aggregates(expr, out, factory);
             }
             for sort_item in order_by {
-                collect_aggregates(&sort_item.expr, out);
+                collect_aggregates(&sort_item.expr, out, factory);
             }
         }
         // SubqueryPlaceholder should be rewritten before reaching the planner
@@ -2488,6 +2500,30 @@ mod tests {
                         table_id: 0,
                     },
                 }),
+                "t" => Ok(TableDef {
+                    name: "t".to_string(),
+                    columns: vec![
+                        ColumnDef {
+                            name: "a".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                            write_default: None,
+                            logical_type: None,
+                        },
+                        ColumnDef {
+                            name: "b".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: true,
+                            write_default: None,
+                            logical_type: None,
+                        },
+                    ],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 0,
+                    },
+                }),
                 other => Err(format!("unknown test table: {other}")),
             }
         }
@@ -2507,6 +2543,45 @@ mod tests {
         let (resolved, cte_registry, mut factory) =
             crate::sql::analyzer::analyze(&query, &TestCatalog, "default")?;
         plan_query(resolved, cte_registry, &mut factory)
+    }
+
+    fn plan_test_query(sql: &str) -> LogicalPlan {
+        parse_analyze_and_plan(sql).expect("planner should succeed")
+    }
+
+    fn first_aggregate_calls(plan: &LogicalPlan) -> Vec<AggregateCall> {
+        fn visit(plan: &LogicalPlan) -> Option<Vec<AggregateCall>> {
+            match plan {
+                LogicalPlan::Aggregate(node) => Some(node.aggregates.clone()),
+                LogicalPlan::Filter(node) => visit(&node.input),
+                LogicalPlan::Project(node) => visit(&node.input),
+                LogicalPlan::Join(node) => visit(&node.left).or_else(|| visit(&node.right)),
+                LogicalPlan::Sort(node) => visit(&node.input),
+                LogicalPlan::Limit(node) => visit(&node.input),
+                LogicalPlan::Union(node) => node.inputs.iter().find_map(visit),
+                LogicalPlan::Intersect(node) => node.inputs.iter().find_map(visit),
+                LogicalPlan::Except(node) => node.inputs.iter().find_map(visit),
+                LogicalPlan::TableFunction(node) => visit(&node.input),
+                LogicalPlan::Window(node) => visit(&node.input),
+                LogicalPlan::Repeat(node) => visit(&node.input),
+                LogicalPlan::CTEAnchor(node) => {
+                    visit(&node.consumer).or_else(|| visit(&node.produce))
+                }
+                LogicalPlan::CTEProduce(node) => visit(&node.input),
+                LogicalPlan::Decode(node) => visit(&node.input),
+                LogicalPlan::AggregateStateMerge(node) => {
+                    visit(&node.old_input).or_else(|| visit(&node.delta_input))
+                }
+                LogicalPlan::Scan(_)
+                | LogicalPlan::Values(_)
+                | LogicalPlan::GenerateSeries(_)
+                | LogicalPlan::CTEConsume(_)
+                | LogicalPlan::ImvDelta(_)
+                | LogicalPlan::ImvVersion(_) => None,
+            }
+        }
+
+        visit(plan).unwrap_or_default()
     }
 
     fn strip_project_sort_limit(plan: &LogicalPlan) -> &LogicalPlan {
@@ -2808,6 +2883,21 @@ mod tests {
                 assert!(matches!(*anchor.produce, LogicalPlan::CTEProduce(_)));
             }
             other => panic!("expected CTEAnchor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn p1_aggregate_call_gets_output_column_id() {
+        let plan = plan_test_query("SELECT a, sum(b) AS s FROM t GROUP BY a");
+        let aggs = first_aggregate_calls(&plan);
+        assert!(!aggs.is_empty(), "expected at least one AggregateCall");
+        for call in &aggs {
+            assert_ne!(
+                call.output_column_id,
+                crate::sql::column_id::ColumnId::UNSET,
+                "AggregateCall {} must carry a real output_column_id",
+                call.name
+            );
         }
     }
 

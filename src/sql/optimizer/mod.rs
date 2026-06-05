@@ -484,6 +484,7 @@ mod is_known_rule_name_tests {
                 distinct: false,
                 result_type: DataType::Int64,
                 order_by: vec![],
+                output_column_id: ColumnId::UNSET,
             }],
             output_columns: vec![
                 s_col,

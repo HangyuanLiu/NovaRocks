@@ -579,6 +579,7 @@ mod aggregate_stage_tests {
             distinct: false,
             result_type: arrow::datatypes::DataType::Int64,
             order_by: vec![],
+            output_column_id: ColumnId::UNSET,
         }
     }
 

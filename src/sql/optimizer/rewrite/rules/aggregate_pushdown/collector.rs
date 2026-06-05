@@ -404,6 +404,7 @@ mod tests {
             distinct: false,
             result_type: DataType::Int64,
             order_by: vec![],
+            output_column_id: ColumnId::UNSET,
         }
     }
 
@@ -441,6 +442,7 @@ mod tests {
             distinct: false,
             result_type: DataType::Int64,
             order_by: vec![],
+            output_column_id: ColumnId::UNSET,
         };
         let agg = make_agg(vec![col_ref("k", DataType::Int64)], vec![count_star], false);
         assert!(entry_safety_check(&agg).is_none());
@@ -454,6 +456,7 @@ mod tests {
             distinct: false,
             result_type: DataType::Float64,
             order_by: vec![],
+            output_column_id: ColumnId::UNSET,
         };
         let agg = make_agg(vec![col_ref("k", DataType::Int64)], vec![avg], false);
         assert!(entry_safety_check(&agg).is_none());
@@ -859,6 +862,7 @@ mod tests {
                 distinct: false,
                 result_type: DataType::Int64,
                 order_by: vec![],
+                output_column_id: ColumnId::UNSET,
             }],
             output_columns: vec![],
             already_pushed: false,

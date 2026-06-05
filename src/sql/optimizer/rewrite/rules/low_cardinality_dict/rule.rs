@@ -206,6 +206,7 @@ mod tests {
                 distinct: false,
                 result_type: DataType::Int64,
                 order_by: vec![],
+                output_column_id: ColumnId::UNSET,
             }],
             output_columns: vec![
                 s_output_column(),
@@ -316,6 +317,7 @@ mod tests {
                 distinct: false,
                 result_type: DataType::Int64,
                 order_by: vec![],
+                output_column_id: ColumnId::UNSET,
             }],
             output_columns: vec![
                 s_output_column(),
@@ -1074,6 +1076,7 @@ mod tests {
                 distinct: false,
                 result_type: DataType::Int64,
                 order_by: vec![],
+                output_column_id: ColumnId::UNSET,
             }],
             output_columns: vec![OutputColumn {
                 column_id: ColumnId::UNSET,
@@ -1140,6 +1143,7 @@ mod tests {
                 distinct: false,
                 result_type: DataType::Utf8,
                 order_by: vec![],
+                output_column_id: ColumnId::UNSET,
             }],
             output_columns: vec![OutputColumn {
                 column_id: ColumnId::UNSET,
@@ -1216,6 +1220,7 @@ mod tests {
                 distinct: false,
                 result_type: DataType::Utf8,
                 order_by: vec![],
+                output_column_id: ColumnId::UNSET,
             }],
             output_columns: vec![OutputColumn {
                 column_id: ColumnId::UNSET,
@@ -1343,6 +1348,7 @@ mod tests {
                 distinct: false,
                 result_type: DataType::Int64,
                 order_by: vec![],
+                output_column_id: ColumnId::UNSET,
             }],
             output_columns: vec![
                 OutputColumn {
@@ -1433,6 +1439,7 @@ mod tests {
                 distinct: true,
                 result_type: DataType::Int64,
                 order_by: vec![],
+                output_column_id: ColumnId::UNSET,
             }],
             output_columns: vec![OutputColumn {
                 column_id: ColumnId::UNSET,

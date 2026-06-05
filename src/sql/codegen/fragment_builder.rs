@@ -3134,6 +3134,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                 distinct: win_expr.distinct,
                 result_type: win_expr.result_type.clone(),
                 order_by: vec![],
+                output_column_id: ColumnId::UNSET,
             };
             let mut texpr = compiler.compile_aggregate_call_typed(&agg_call)?;
             apply_ignore_nulls_to_root_fn(&mut texpr, win_expr.ignore_nulls);
@@ -3366,6 +3367,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                     distinct: win_expr.distinct,
                     result_type: win_expr.result_type.clone(),
                     order_by: vec![],
+                    output_column_id: ColumnId::UNSET,
                 };
                 let mut texpr = compiler.compile_aggregate_call_typed(&agg_call)?;
                 apply_ignore_nulls_to_root_fn(&mut texpr, win_expr.ignore_nulls);

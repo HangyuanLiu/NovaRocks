@@ -191,6 +191,7 @@ mod tests {
             distinct,
             result_type: DataType::Int64,
             order_by: vec![],
+            output_column_id: ColumnId::UNSET,
         }
     }
 

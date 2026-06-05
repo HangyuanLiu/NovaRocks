@@ -353,6 +353,7 @@ mod tests {
                 distinct: false,
                 result_type: DataType::Int64,
                 order_by: vec![],
+                output_column_id: ColumnId::UNSET,
             }],
             output_columns: vec![
                 OutputColumn {

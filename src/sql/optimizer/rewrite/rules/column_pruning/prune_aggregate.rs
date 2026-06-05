@@ -163,6 +163,7 @@ mod tests {
                     distinct: false,
                     result_type: DataType::Int64,
                     order_by: vec![],
+                    output_column_id: ColumnId::UNSET,
                 },
                 AggregateCall {
                     name: "sum".to_string(),
@@ -170,6 +171,7 @@ mod tests {
                     distinct: false,
                     result_type: DataType::Int64,
                     order_by: vec![],
+                    output_column_id: ColumnId::UNSET,
                 },
             ],
             // SELECT-ordered output_columns: [count_oc, sum_oc]
@@ -208,6 +210,7 @@ mod tests {
                 distinct: false,
                 result_type: DataType::Int64,
                 order_by: vec![],
+                output_column_id: ColumnId::UNSET,
             }],
             output_columns: vec![
                 make_output_column(id_k, "k"),

@@ -681,6 +681,7 @@ mod tests {
             distinct: false,
             order_by: vec![],
             result_type: DataType::Float64,
+            output_column_id: crate::sql::column_id::ColumnId::UNSET,
         };
         assert_eq!(
             agg_call_display_name_without_qualifiers(&call),

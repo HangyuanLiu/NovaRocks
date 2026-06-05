@@ -2064,6 +2064,7 @@ mod two_phase_agg_tests {
             distinct,
             result_type: DataType::Int64,
             order_by: vec![],
+            output_column_id: ColumnId::UNSET,
         }
     }
 
@@ -2166,6 +2167,7 @@ mod two_phase_agg_tests {
                     distinct: true,
                     result_type: DataType::Int64,
                     order_by: vec![],
+                    output_column_id: ColumnId::UNSET,
                 }],
                 vec![
                     OutputColumn {
