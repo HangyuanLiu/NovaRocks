@@ -28,16 +28,19 @@ pub(crate) fn column_pruning_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
     rules
 }
 
-/// Predicate pushdown rules only (no column pruning). Used in the
-/// push → reorder → push pattern. Column pruning runs as a separate
-/// final pass AFTER all pushdown and reorder passes are complete —
-/// matching the legacy pipeline where prune_columns was always last.
+/// Reusable predicate pushdown rules only (no column pruning). Query rewrite
+/// stages decide where to run these rules; column pruning stays in its own pass
+/// after predicate placement has stabilized.
 /// Mixing PruneColumns with PushDownPredicate in a fixed-point loop
 /// causes the needed-column set to shrink across iterations as
 /// predicates get reshuffled, incorrectly dropping join-key or
 /// select-list columns from scan required_columns.
 pub(crate) fn predicate_pushdown_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
     predicate_pushdown::predicate_pushdown_rules()
+}
+
+pub(crate) fn predicate_move_around_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
+    predicate_pushdown::predicate_move_around_rules()
 }
 
 /// Join reorder rule only. Called as a SEPARATE pass between two
@@ -53,15 +56,15 @@ pub(crate) fn join_reorder_rules(
     )))]
 }
 
-/// All query rewrite rules including join reorder. For registry test only;
-/// production code calls predicate_pushdown_rules(), join_reorder,
-/// and column_pruning_rules() separately per the four-pass pattern.
+/// All known query rewrite rules for registry and rule-name validation.
+/// Production ordering is defined by query_rewrite_pipeline(), not this set.
 #[allow(dead_code)]
 pub(crate) fn all_query_rewrite_rules(
     table_stats: &HashMap<String, TableStatistics>,
 ) -> Vec<Box<dyn LogicalRewriteRule>> {
     let mut all = Vec::new();
     all.extend(predicate_pushdown_rules());
+    all.extend(predicate_move_around_rules());
     all.extend(column_pruning_rules());
     all.extend(join_reorder_rules(table_stats));
     all.extend(aggregate_pushdown::aggregate_pushdown_rules(table_stats));
@@ -78,8 +81,9 @@ mod tests {
     fn registry_contains_expected_rules() {
         let rules = all_query_rewrite_rules(&HashMap::new());
         // 17 v2 pruning rules + 2 ukfk + 1 JoinReorder + 1 AggregatePushdown
-        // + 1 LowCardinalityDictionaryRewrite + 5 predicate pushdown rules + 1 DeriveJoinNotNullPredicate = 28
-        assert_eq!(rules.len(), 28);
+        // + 1 LowCardinalityDictionaryRewrite + 5 predicate pushdown rules
+        // + 1 predicate move-around rule + 1 DeriveJoinNotNullPredicate = 29
+        assert_eq!(rules.len(), 29);
         let mut names: Vec<&str> = rules.iter().map(|r| r.name()).collect();
         names.sort();
         assert_eq!(
@@ -88,6 +92,7 @@ mod tests {
                 "AggregatePushdown",
                 "DeriveJoinNotNullPredicate",
                 "EliminateUniqueAggregate",
+                "JoinPredicateMoveAround",
                 "JoinReorder",
                 "LowCardinalityDictionaryRewrite",
                 "PruneAggregateColumns",
