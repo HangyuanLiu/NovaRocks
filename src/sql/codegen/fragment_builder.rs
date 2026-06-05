@@ -176,13 +176,13 @@ fn validate_aggregate_state_merge_child_output(
 
 fn aggregate_state_shaped_output_columns(
     layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
-    shape: &crate::connector::starrocks::table::mv_shape::AggregateMvShape,
 ) -> Result<Vec<OutputColumn>, String> {
     use crate::connector::starrocks::table::mv_agg_state::AggregateStateRole;
     use crate::connector::starrocks::table::mv_shape::VisibleAggregateOutput;
 
-    let mut output = Vec::with_capacity(shape.visible_outputs.len() + layout.state_columns.len());
-    for visible_output in &shape.visible_outputs {
+    let visible_outputs = layout.visible_output_order();
+    let mut output = Vec::with_capacity(visible_outputs.len() + layout.state_columns.len());
+    for visible_output in &visible_outputs {
         match visible_output {
             VisibleAggregateOutput::GroupKey(group_key_index) => {
                 let visible_source_index = *layout
@@ -684,7 +684,10 @@ impl<'a> PlanFragmentBuilder<'a> {
         }
         let refresh_ctx = mv_refresh_ctx
             .ok_or_else(|| "AggregateStateMerge codegen requires MV refresh context".to_string())?;
-        let (shape, layout) = refresh_ctx
+        // The shape is still produced by the rewrite (P4.4 territory) but the
+        // direct builder now derives the visible-output ordering from the
+        // layout, so the shape is no longer threaded into it.
+        let (_shape, layout) = refresh_ctx
             .rewrite
             .aggregate_shape_and_layout_for_execution()?;
         Self::build_aggregate_state_merge_direct_with_layout(
@@ -693,7 +696,6 @@ impl<'a> PlanFragmentBuilder<'a> {
             connectors,
             current_database,
             mv_refresh_ctx,
-            shape,
             layout,
             None,
         )
@@ -706,7 +708,6 @@ impl<'a> PlanFragmentBuilder<'a> {
         connectors: &'a crate::connector::ConnectorRegistry,
         current_database: &str,
         mv_refresh_ctx: Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
-        shape: crate::connector::starrocks::table::mv_shape::AggregateMvShape,
         layout: crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
         branch_id: Option<i32>,
     ) -> Result<MultiFragmentBuildResult, String> {
@@ -751,7 +752,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             &old_input.output_columns,
             &physical_columns,
         )?;
-        let delta_state_columns = aggregate_state_shaped_output_columns(&layout, &shape)?;
+        let delta_state_columns = aggregate_state_shaped_output_columns(&layout)?;
         validate_aggregate_state_merge_child_output(
             "delta state-shaped",
             &delta_state_input.output_columns,
@@ -769,7 +770,6 @@ impl<'a> PlanFragmentBuilder<'a> {
             direct_exec: Some(Box::new(DirectExecPlan::AggregateStatePhysicalize {
                 input: delta_state_input,
                 layout: layout.clone(),
-                shape,
             })),
             query_global_dicts: None,
             query_global_dict_exprs: None,
@@ -849,7 +849,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             if !matches!(merge.op, Operator::PhysicalAggregateStateMerge(_)) {
                 return Ok(None);
             }
-            let (shape, layout) = refresh_ctx
+            let (_shape, layout) = refresh_ctx
                 .rewrite
                 .aggregate_shape_and_layout_for_execution()?;
             let child =
@@ -859,7 +859,6 @@ impl<'a> PlanFragmentBuilder<'a> {
                     connectors,
                     current_database,
                     mv_refresh_ctx,
-                    shape,
                     layout,
                     Some(branch_id),
                 )?)?;
@@ -5307,7 +5306,6 @@ mod tests {
             &crate::connector::ConnectorRegistry::default(),
             "db",
             None,
-            shape,
             layout,
             None,
         )
@@ -5365,7 +5363,6 @@ mod tests {
             &crate::connector::ConnectorRegistry::default(),
             "db",
             None,
-            shape,
             layout,
             None,
         )
@@ -5443,7 +5440,6 @@ mod tests {
             &crate::connector::ConnectorRegistry::default(),
             "db",
             None,
-            shape,
             layout,
             None,
         ) {

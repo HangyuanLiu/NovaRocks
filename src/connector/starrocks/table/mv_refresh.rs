@@ -559,7 +559,7 @@ fn execute_aggregate_mv_full_refresh(
 
     // Step 2: build the layout from visible types.
     let layout = super::mv_agg_state::build_aggregate_mv_layout_with_input_types(
-        shape,
+        &super::aggregate_sql_calls::AggregateSqlCalls::from(shape),
         &visible_output_columns,
         &aggregate_input_types,
     )?;
@@ -570,7 +570,7 @@ fn execute_aggregate_mv_full_refresh(
     let result = execute_query_for_mv_refresh(&ctx.state, &ctx.database, &state_sql)?;
 
     // Step 4: materialize state-shaped executor result using the visible-type layout.
-    super::mv_agg_state::materialize_aggregate_result_chunks(result, &layout, shape)
+    super::mv_agg_state::materialize_aggregate_result_chunks(result, &layout)
 }
 
 fn rewrite_full_refresh_select_with_pin(
@@ -715,7 +715,7 @@ fn refresh_aggregate_mv_incremental(
         &visible_analysis,
     )?;
     let layout = super::mv_agg_state::build_aggregate_mv_layout_with_input_types(
-        ctx.shape,
+        &super::aggregate_sql_calls::AggregateSqlCalls::from(ctx.shape),
         &visible_analysis.output_columns,
         &aggregate_input_types,
     )?;
@@ -737,7 +737,7 @@ fn refresh_aggregate_mv_incremental(
         source_files,
     )?;
     let delta_chunks =
-        super::mv_agg_state::materialize_aggregate_result_chunks(delta_result, &layout, ctx.shape)?;
+        super::mv_agg_state::materialize_aggregate_result_chunks(delta_result, &layout)?;
 
     let plan = load_physical_insert_plan(
         ctx.state,
@@ -2038,7 +2038,7 @@ mod tests {
                 let layout =
                     super::super::mv_agg_state::build_aggregate_mv_layout(&shape, &output_columns)?;
                 let chunks = super::super::mv_agg_state::materialize_aggregate_result_chunks(
-                    result, &layout, &shape,
+                    result, &layout,
                 )?;
                 assert_eq!(chunks.len(), 1);
                 assert_eq!(chunks[0].batch.num_columns(), layout.physical_columns.len());

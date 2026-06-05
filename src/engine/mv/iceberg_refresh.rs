@@ -1149,7 +1149,7 @@ fn build_aggregate_layout_from_resolved_query(
             resolved_query,
         )?;
     crate::connector::starrocks::table::mv_agg_state::build_aggregate_mv_layout_with_input_types(
-        shape,
+        &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls::from(shape),
         output_columns,
         &aggregate_input_types,
     )
@@ -6688,9 +6688,7 @@ fn prepare_aggregate_first_refresh_chunks_for_select_sql(
     let result = run_mv_full_select_result(state, current_catalog, current_database, state_query)?;
     let result = normalize_aggregate_state_result_column_names(result, &layout, aggregate_shape)?;
     crate::connector::starrocks::table::mv_agg_state::materialize_aggregate_result_chunks(
-        result,
-        &layout,
-        aggregate_shape,
+        result, &layout,
     )
 }
 

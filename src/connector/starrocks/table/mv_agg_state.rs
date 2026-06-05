@@ -14,6 +14,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
+use crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls;
 use crate::connector::starrocks::table::ddl::{StarRocksPhysicalColumn, starrocks_physical_column};
 use crate::connector::starrocks::table::mv_ddl;
 use crate::connector::starrocks::table::mv_shape::{
@@ -49,6 +50,57 @@ pub(crate) struct AggregateMvLayout {
     pub(crate) aggregate_input_types: Vec<Option<DataType>>,
     pub(crate) group_key_source_indexes: Vec<usize>,
     pub(crate) physical_columns: Vec<StarRocksPhysicalColumn>,
+}
+
+impl AggregateMvLayout {
+    /// Reconstruct the visible-output ordering (interleaved group keys and
+    /// aggregates, in stored-SELECT projection order) purely from the layout.
+    ///
+    /// The layout already encodes this ordering: `group_key_source_indexes[gk]`
+    /// is the visible-row position of group key `gk`, and each `Single` state
+    /// column's `visible_source_index` is the visible-row position of its
+    /// aggregate. This is the inverse of how the layout is built, so for any
+    /// supported shape `layout.visible_output_order() == shape.visible_outputs`.
+    ///
+    /// The merge operator / codegen / materialize paths use this instead of
+    /// holding an `AggregateMvShape`, so the visible-output ordering has a
+    /// single source of truth.
+    pub(crate) fn visible_output_order(&self) -> Vec<VisibleAggregateOutput> {
+        let mut order: Vec<Option<VisibleAggregateOutput>> = vec![None; self.visible_columns.len()];
+        for (group_key_index, &visible_source_index) in
+            self.group_key_source_indexes.iter().enumerate()
+        {
+            if let Some(slot) = order.get_mut(visible_source_index) {
+                *slot = Some(VisibleAggregateOutput::GroupKey(group_key_index));
+            }
+        }
+        for state_column in &self.state_columns {
+            if state_column.state_role != AggregateStateRole::Single {
+                continue;
+            }
+            if let Some(slot) = order.get_mut(state_column.visible_source_index) {
+                *slot = Some(VisibleAggregateOutput::Aggregate(
+                    state_column.aggregate_index,
+                ));
+            }
+        }
+        // Every visible position is filled by construction of the layout. A gap
+        // here means the layout is internally inconsistent (a layout-builder
+        // bug, not a user error), so fail loudly rather than emit a silently
+        // wrong column ordering.
+        order
+            .into_iter()
+            .enumerate()
+            .map(|(position, slot)| {
+                slot.unwrap_or_else(|| {
+                    panic!(
+                        "malformed aggregate MV layout: visible slot at position {position} was \
+                         not filled by any group key or Single aggregate state column"
+                    )
+                })
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -102,26 +154,27 @@ pub(crate) fn build_aggregate_mv_layout(
     shape: &AggregateMvShape,
     output_columns: &[OutputColumn],
 ) -> Result<AggregateMvLayout, String> {
-    let aggregate_input_types = vec![None; shape.aggregates.len()];
-    build_aggregate_mv_layout_with_input_types(shape, output_columns, &aggregate_input_types)
+    let calls = AggregateSqlCalls::from(shape);
+    let aggregate_input_types = vec![None; calls.aggregates.len()];
+    build_aggregate_mv_layout_with_input_types(&calls, output_columns, &aggregate_input_types)
 }
 
 pub(crate) fn build_aggregate_mv_layout_with_input_types(
-    shape: &AggregateMvShape,
+    calls: &AggregateSqlCalls,
     output_columns: &[OutputColumn],
     aggregate_input_types: &[Option<DataType>],
 ) -> Result<AggregateMvLayout, String> {
-    if aggregate_input_types.len() != shape.aggregates.len() {
+    if aggregate_input_types.len() != calls.aggregates.len() {
         return Err(format!(
             "aggregate MV input type metadata count mismatch: inputs={} aggregates={}",
             aggregate_input_types.len(),
-            shape.aggregates.len()
+            calls.aggregates.len()
         ));
     }
-    if output_columns.len() != shape.visible_outputs.len() {
+    if output_columns.len() != calls.visible_outputs.len() {
         return Err(format!(
             "aggregate MV output count mismatch: shape_outputs={} analyzed_outputs={}",
-            shape.visible_outputs.len(),
+            calls.visible_outputs.len(),
             output_columns.len()
         ));
     }
@@ -134,7 +187,7 @@ pub(crate) fn build_aggregate_mv_layout_with_input_types(
         true,
     );
     let mut physical_columns = vec![row_id_column.clone()];
-    let group_key_source_indexes = group_key_source_indexes(shape)?;
+    let group_key_source_indexes = group_key_source_indexes(calls)?;
 
     let visible_columns = output_columns
         .iter()
@@ -159,8 +212,8 @@ pub(crate) fn build_aggregate_mv_layout_with_input_types(
         .collect::<Result<Vec<_>, String>>()?;
 
     let mut state_columns = Vec::new();
-    for (aggregate_index, aggregate) in shape.aggregates.iter().enumerate() {
-        let visible_source_index = aggregate_visible_source_index(shape, aggregate_index)?;
+    for (aggregate_index, aggregate) in calls.aggregates.iter().enumerate() {
+        let visible_source_index = aggregate_visible_source_index(calls, aggregate_index)?;
         let visible = output_columns.get(visible_source_index).ok_or_else(|| {
             format!(
                 "aggregate MV visible source index out of range: aggregate_index={aggregate_index} source_index={visible_source_index}"
@@ -205,7 +258,7 @@ pub(crate) fn build_aggregate_mv_layout_with_input_types(
         });
     }
 
-    if aggregate_shape_needs_retraction_count_state(shape) {
+    if aggregate_shape_needs_retraction_count_state(calls) {
         validate_state_column_type(
             AggregateFunctionKind::Count,
             AggregateStateRole::RetractionCount,
@@ -225,7 +278,7 @@ pub(crate) fn build_aggregate_mv_layout_with_input_types(
             sql_type: SqlType::BigInt,
             nullable: false,
             visible_source_index: 0,
-            aggregate_index: shape.aggregates.len(),
+            aggregate_index: calls.aggregates.len(),
             function: AggregateFunctionKind::Count,
             state_role: AggregateStateRole::RetractionCount,
             count_star: true,
@@ -278,8 +331,8 @@ pub(crate) fn aggregate_input_types_from_resolved_query(
     Ok(input_types)
 }
 
-pub(crate) fn aggregate_shape_needs_retraction_count_state(shape: &AggregateMvShape) -> bool {
-    !shape.aggregates.iter().any(|aggregate| {
+pub(crate) fn aggregate_shape_needs_retraction_count_state(calls: &AggregateSqlCalls) -> bool {
+    !calls.aggregates.iter().any(|aggregate| {
         aggregate.function == AggregateFunctionKind::Count
             && matches!(aggregate.input, AggregateInput::Star)
     })
@@ -288,21 +341,19 @@ pub(crate) fn aggregate_shape_needs_retraction_count_state(shape: &AggregateMvSh
 pub(crate) fn materialize_aggregate_result_chunks(
     result: QueryResult,
     layout: &AggregateMvLayout,
-    shape: &AggregateMvShape,
 ) -> Result<Vec<Chunk>, String> {
     result
         .chunks
         .into_iter()
-        .map(|chunk| materialize_aggregate_result_batch(&chunk.batch, layout, shape))
+        .map(|chunk| materialize_aggregate_result_batch(&chunk.batch, layout))
         .collect()
 }
 
 pub(crate) fn materialize_aggregate_state_chunk(
     chunk: Chunk,
     layout: &AggregateMvLayout,
-    shape: &AggregateMvShape,
 ) -> Result<Chunk, String> {
-    materialize_aggregate_result_batch(&chunk.batch, layout, shape)
+    materialize_aggregate_result_batch(&chunk.batch, layout)
 }
 
 pub(crate) fn load_aggregate_physical_rows(
@@ -465,7 +516,7 @@ fn all_count_states_zero(row: &AggregatePhysicalRow, layout: &AggregateMvLayout)
 /// Materialize a state-shaped executor result batch into a physical batch.
 ///
 /// **State-shaped input**: the executor output after `rewrite_select_sql_for_state` has been
-/// applied. Column layout (in `shape.visible_outputs` order):
+/// applied. Column layout (in `layout.visible_output_order()` order):
 /// - GroupKey columns: one column per group key, in the order they appear in the projection.
 /// - Aggregate columns: one opaque VARBINARY state column per aggregate.
 ///   Visible values are derived from those states after materialization.
@@ -475,19 +526,21 @@ fn all_count_states_zero(row: &AggregatePhysicalRow, layout: &AggregateMvLayout)
 fn materialize_aggregate_result_batch(
     batch: &RecordBatch,
     layout: &AggregateMvLayout,
-    shape: &AggregateMvShape,
 ) -> Result<Chunk, String> {
-    validate_state_shaped_input_schema(batch, layout, shape)?;
-    let (group_key_batch_cols, state_col_batch_cols) = compute_batch_col_indexes(shape, layout);
+    let visible_outputs = layout.visible_output_order();
+    validate_state_shaped_input_schema(batch, layout, &visible_outputs)?;
+    let (group_key_batch_cols, state_col_batch_cols) =
+        compute_batch_col_indexes(&visible_outputs, layout);
 
-    let expected = shape.group_keys.len() + layout.state_columns.len();
+    let group_key_count = layout.group_key_source_indexes.len();
+    let expected = group_key_count + layout.state_columns.len();
     if batch.num_columns() != expected {
         return Err(format!(
             "aggregate MV materialize column count mismatch: \
              batch_columns={} expected={expected} \
              (group_keys={} + state_columns={})",
             batch.num_columns(),
-            shape.group_keys.len(),
+            group_key_count,
             layout.state_columns.len()
         ));
     }
@@ -563,9 +616,9 @@ fn materialize_aggregate_result_batch(
 fn validate_state_shaped_input_schema(
     batch: &RecordBatch,
     layout: &AggregateMvLayout,
-    shape: &AggregateMvShape,
+    visible_outputs: &[VisibleAggregateOutput],
 ) -> Result<(), String> {
-    let expected = state_shaped_input_fields(layout, shape)?;
+    let expected = state_shaped_input_fields(layout, visible_outputs)?;
     if batch.num_columns() != expected.len() {
         return Ok(());
     }
@@ -575,8 +628,8 @@ fn validate_state_shaped_input_schema(
         if !actual_field
             .name()
             .eq_ignore_ascii_case(expected_field.name())
-            || !state_shaped_data_type_matches(index, actual_field, expected_field, shape)
-            || !state_shaped_nullable_matches(index, actual_field, expected_field, shape)
+            || !state_shaped_data_type_matches(index, actual_field, expected_field, visible_outputs)
+            || !state_shaped_nullable_matches(index, actual_field, expected_field, visible_outputs)
         {
             return Err(format!(
                 "aggregate MV state-shaped input schema mismatch at column {index}: got {}:{:?}:{} expected {}:{:?}:{}",
@@ -596,10 +649,10 @@ fn state_shaped_data_type_matches(
     index: usize,
     actual: &Field,
     expected: &Field,
-    shape: &AggregateMvShape,
+    visible_outputs: &[VisibleAggregateOutput],
 ) -> bool {
     actual.data_type() == expected.data_type()
-        || (state_shaped_field_is_state(index, shape)
+        || (state_shaped_field_is_state(index, visible_outputs)
             && is_varbinary_arrow_type(actual.data_type())
             && is_varbinary_arrow_type(expected.data_type()))
 }
@@ -608,28 +661,30 @@ fn state_shaped_nullable_matches(
     index: usize,
     actual: &Field,
     expected: &Field,
-    shape: &AggregateMvShape,
+    visible_outputs: &[VisibleAggregateOutput],
 ) -> bool {
     if actual.is_nullable() == expected.is_nullable() {
         return true;
     }
-    actual.is_nullable() && !expected.is_nullable() && state_shaped_field_is_state(index, shape)
+    actual.is_nullable()
+        && !expected.is_nullable()
+        && state_shaped_field_is_state(index, visible_outputs)
 }
 
-fn state_shaped_field_is_state(index: usize, shape: &AggregateMvShape) -> bool {
-    index >= shape.visible_outputs.len()
+fn state_shaped_field_is_state(index: usize, visible_outputs: &[VisibleAggregateOutput]) -> bool {
+    index >= visible_outputs.len()
         || matches!(
-            shape.visible_outputs.get(index),
+            visible_outputs.get(index),
             Some(VisibleAggregateOutput::Aggregate(_))
         )
 }
 
 fn state_shaped_input_fields(
     layout: &AggregateMvLayout,
-    shape: &AggregateMvShape,
+    visible_outputs: &[VisibleAggregateOutput],
 ) -> Result<Vec<Field>, String> {
-    let mut fields = Vec::with_capacity(shape.visible_outputs.len() + layout.state_columns.len());
-    for output in &shape.visible_outputs {
+    let mut fields = Vec::with_capacity(visible_outputs.len() + layout.state_columns.len());
+    for output in visible_outputs {
         match output {
             VisibleAggregateOutput::GroupKey(group_key_index) => {
                 let visible_source_index = *layout
@@ -696,7 +751,8 @@ fn state_shaped_state_data_type(state_column: &AggregateStateColumn) -> DataType
 /// Compute the batch column indexes for group keys and state columns in a state-shaped
 /// executor result batch.
 ///
-/// The state-shaped batch column order is determined by walking `shape.visible_outputs`:
+/// The state-shaped batch column order is determined by walking `visible_outputs`
+/// (derived from the layout via `visible_output_order`):
 /// - Each GroupKey output contributes one column.
 /// - Each aggregate contributes one opaque VARBINARY state column.
 ///
@@ -704,14 +760,20 @@ fn state_shaped_state_data_type(state_column: &AggregateStateColumn) -> DataType
 /// - `group_key_batch_cols[gk_idx]` = batch column index for group key `gk_idx`.
 /// - `state_col_batch_cols[sc_idx]` = batch column index for state column `sc_idx`.
 fn compute_batch_col_indexes(
-    shape: &AggregateMvShape,
+    visible_outputs: &[VisibleAggregateOutput],
     layout: &AggregateMvLayout,
 ) -> (Vec<usize>, Vec<usize>) {
-    let mut group_key_batch_col = vec![0usize; shape.group_keys.len()];
-    let mut agg_batch_col_start = vec![0usize; shape.aggregates.len()];
+    let group_key_count = layout.group_key_source_indexes.len();
+    let aggregate_count = layout
+        .state_columns
+        .iter()
+        .filter(|column| column.state_role == AggregateStateRole::Single)
+        .count();
+    let mut group_key_batch_col = vec![0usize; group_key_count];
+    let mut agg_batch_col_start = vec![0usize; aggregate_count];
 
     let mut batch_col = 0usize;
-    for output in &shape.visible_outputs {
+    for output in visible_outputs {
         match output {
             VisibleAggregateOutput::GroupKey(gk_idx) => {
                 group_key_batch_col[*gk_idx] = batch_col;
@@ -1143,10 +1205,10 @@ fn validate_aggregate_state_visible_type(
 }
 
 fn aggregate_visible_source_index(
-    shape: &AggregateMvShape,
+    calls: &AggregateSqlCalls,
     aggregate_index: usize,
 ) -> Result<usize, String> {
-    shape
+    calls
         .visible_outputs
         .iter()
         .position(|output| matches!(output, VisibleAggregateOutput::Aggregate(idx) if *idx == aggregate_index))
@@ -1157,9 +1219,9 @@ fn aggregate_visible_source_index(
         })
 }
 
-fn group_key_source_indexes(shape: &AggregateMvShape) -> Result<Vec<usize>, String> {
-    let mut source_indexes_by_group_key = vec![None; shape.group_keys.len()];
-    for (source_index, output) in shape.visible_outputs.iter().enumerate() {
+fn group_key_source_indexes(calls: &AggregateSqlCalls) -> Result<Vec<usize>, String> {
+    let mut source_indexes_by_group_key = vec![None; calls.group_keys.len()];
+    for (source_index, output) in calls.visible_outputs.iter().enumerate() {
         let VisibleAggregateOutput::GroupKey(group_key_index) = output else {
             continue;
         };
@@ -1169,7 +1231,7 @@ fn group_key_source_indexes(shape: &AggregateMvShape) -> Result<Vec<usize>, Stri
                 format!(
                     "aggregate MV group key output index out of range: group_key_index={} group_keys={}",
                     group_key_index,
-                    shape.group_keys.len()
+                    calls.group_keys.len()
                 )
             })?;
         if slot.replace(source_index).is_some() {
@@ -1767,7 +1829,6 @@ mod tests {
 
     fn physical_chunks_with_count_state(
         layout: &AggregateMvLayout,
-        shape: &AggregateMvShape,
         count_state: Option<i64>,
     ) -> Vec<Chunk> {
         let mut chunks = materialize_aggregate_result_chunks(
@@ -1779,7 +1840,6 @@ mod tests {
                 ],
             },
             layout,
-            shape,
         )
         .expect("physical");
         let batch = &chunks[0].batch;
@@ -1798,10 +1858,7 @@ mod tests {
         chunks
     }
 
-    fn physical_chunks_with_bad_row_id(
-        layout: &AggregateMvLayout,
-        shape: &AggregateMvShape,
-    ) -> Vec<Chunk> {
+    fn physical_chunks_with_bad_row_id(layout: &AggregateMvLayout) -> Vec<Chunk> {
         let mut chunks = materialize_aggregate_result_chunks(
             QueryResult {
                 columns: Vec::new(),
@@ -1811,7 +1868,6 @@ mod tests {
                 ],
             },
             layout,
-            shape,
         )
         .expect("physical");
         let batch = &chunks[0].batch;
@@ -1832,8 +1888,7 @@ mod tests {
             chunks: vec![record_batch_to_chunk(batch).expect("chunk")],
         };
 
-        let chunks =
-            materialize_aggregate_result_chunks(result, &layout, &shape).expect("materialize");
+        let chunks = materialize_aggregate_result_chunks(result, &layout).expect("materialize");
         let schema = chunks[0].batch.schema();
         let names = schema
             .fields()
@@ -1866,7 +1921,6 @@ mod tests {
                 ],
             },
             &layout,
-            &shape,
         )
         .expect("old physical");
         let delta = materialize_aggregate_result_chunks(
@@ -1878,7 +1932,6 @@ mod tests {
                 ],
             },
             &layout,
-            &shape,
         )
         .expect("delta physical");
         let old_rows = load_aggregate_physical_rows(&old, &layout).expect("old rows");
@@ -1935,7 +1988,6 @@ mod tests {
                 ],
             },
             &layout,
-            &shape,
         )
         .expect("delta physical");
 
@@ -2247,7 +2299,6 @@ mod tests {
                 ],
             },
             &layout,
-            &shape,
         )
         .expect("old physical");
         let old_rows = load_aggregate_physical_rows(&old, &layout).expect("old rows");
@@ -2261,7 +2312,6 @@ mod tests {
                 ],
             },
             &layout,
-            &shape,
         )
         .expect("delta physical");
 
@@ -2302,7 +2352,6 @@ mod tests {
                 ],
             },
             &layout,
-            &shape,
         )
         .expect("old physical");
 
@@ -2314,7 +2363,7 @@ mod tests {
     fn load_rejects_null_count_state_as_corruption() {
         let shape = test_shape();
         let layout = build_aggregate_mv_layout(&shape, &output_columns()).expect("layout");
-        let chunks = physical_chunks_with_count_state(&layout, &shape, None);
+        let chunks = physical_chunks_with_count_state(&layout, None);
 
         let err = load_aggregate_physical_rows(&chunks, &layout).expect_err("null count rejected");
         assert!(err.contains("corruption"), "err={err}");
@@ -2326,7 +2375,7 @@ mod tests {
     fn load_rejects_zero_count_state_as_corruption() {
         let shape = test_shape();
         let layout = build_aggregate_mv_layout(&shape, &output_columns()).expect("layout");
-        let chunks = physical_chunks_with_count_state(&layout, &shape, Some(0));
+        let chunks = physical_chunks_with_count_state(&layout, Some(0));
 
         let err = load_aggregate_physical_rows(&chunks, &layout).expect_err("zero count rejected");
         assert!(err.contains("corruption"), "err={err}");
@@ -2348,7 +2397,6 @@ mod tests {
                 ],
             },
             &layout,
-            &shape,
         )
         .expect("physical");
 
@@ -2369,7 +2417,7 @@ mod tests {
     fn load_rejects_row_id_mismatch_as_corruption() {
         let shape = test_shape();
         let layout = build_aggregate_mv_layout(&shape, &output_columns()).expect("layout");
-        let chunks = physical_chunks_with_bad_row_id(&layout, &shape);
+        let chunks = physical_chunks_with_bad_row_id(&layout);
 
         let err =
             load_aggregate_physical_rows(&chunks, &layout).expect_err("row id mismatch rejected");
@@ -2395,7 +2443,6 @@ mod tests {
                 ],
             },
             &layout,
-            &shape,
         )
         .expect("delta physical");
 
@@ -2431,7 +2478,6 @@ mod tests {
                 ],
             },
             &layout,
-            &shape,
         )
         .expect("old physical");
         let old_rows = load_aggregate_physical_rows(&old, &layout).expect("old rows");
@@ -2444,7 +2490,6 @@ mod tests {
                 ],
             },
             &layout,
-            &shape,
         )
         .expect("insert delta");
         let delete_delta = materialize_aggregate_result_chunks(
@@ -2456,7 +2501,6 @@ mod tests {
                 ],
             },
             &layout,
-            &shape,
         )
         .expect("delete delta");
         let mut delta = Vec::new();
@@ -2568,7 +2612,6 @@ mod tests {
                 ],
             },
             &layout,
-            &shape,
         )
         .expect("old physical");
         let old_rows = load_aggregate_physical_rows(&old, &layout).expect("old rows");
@@ -2585,7 +2628,6 @@ mod tests {
                 ],
             },
             &layout,
-            &shape,
         )
         .expect("delta physical");
 
@@ -2721,7 +2763,7 @@ mod tests {
             "err={err}"
         );
         let decimal_layout = build_aggregate_mv_layout_with_input_types(
-            &shape,
+            &AggregateSqlCalls::from(&shape),
             &outputs,
             &[Some(DataType::Decimal128(20, 4))],
         )
@@ -2902,8 +2944,7 @@ mod tests {
         )
         .expect("state-shaped batch");
 
-        let chunk =
-            materialize_aggregate_result_batch(&batch, &layout, &shape).expect("materialize");
+        let chunk = materialize_aggregate_result_batch(&batch, &layout).expect("materialize");
 
         // Physical schema: [__row_id__, k1, a, __agg_state_a, row_count]
         let batch_schema = chunk.batch.schema();
@@ -2983,7 +3024,7 @@ mod tests {
         )
         .expect("state-shaped batch");
 
-        let err = materialize_aggregate_result_batch(&batch, &layout, &shape)
+        let err = materialize_aggregate_result_batch(&batch, &layout)
             .expect_err("state-shaped order mismatch must fail");
         assert!(
             err.contains("aggregate MV state-shaped input schema mismatch"),
@@ -3102,5 +3143,32 @@ mod tests {
             ),
             "Float64 different values must not compare equal"
         );
+    }
+
+    /// Behavior-preservation proof for the visible-output ordering derivation:
+    /// for every supported aggregate shape, the ordering reconstructed from the
+    /// layout (`group_key_source_indexes` + state-column `visible_source_index`)
+    /// must equal the shape's own `visible_outputs`. This is what lets the merge
+    /// operator / codegen / materialize paths drop their `AggregateMvShape` and
+    /// read the ordering from the layout instead.
+    #[test]
+    fn layout_visible_output_order_round_trips_shape_visible_outputs() {
+        // (shape, output_columns) pairs covering: group-key-first interleaving,
+        // aggregate-first interleaving, count(expr), and sum-only (which adds a
+        // hidden retraction-count state column that must NOT perturb the order).
+        let cases: Vec<(AggregateMvShape, Vec<OutputColumn>)> = vec![
+            (test_shape(), output_columns()),
+            (aggregate_first_shape(), aggregate_first_output_columns()),
+            (count_expr_shape(), count_expr_output_columns()),
+            (sum_only_shape(), sum_only_output_columns()),
+        ];
+        for (shape, output_columns) in cases {
+            let layout = build_aggregate_mv_layout(&shape, &output_columns).expect("layout");
+            assert_eq!(
+                layout.visible_output_order(),
+                shape.visible_outputs,
+                "visible_output_order must round-trip shape.visible_outputs for shape {shape:?}"
+            );
+        }
     }
 }

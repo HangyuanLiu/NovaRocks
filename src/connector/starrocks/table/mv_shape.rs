@@ -1716,7 +1716,9 @@ pub(crate) fn rewrite_select_sql_for_state(
             }
         }
     }
-    if crate::connector::starrocks::table::mv_agg_state::aggregate_shape_needs_retraction_count_state(shape) {
+    if crate::connector::starrocks::table::mv_agg_state::aggregate_shape_needs_retraction_count_state(
+        &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls::from(shape),
+    ) {
         new_projection.push(make_count_star_select_item(
             crate::connector::starrocks::table::mv_agg_state::AGG_RETRACTION_COUNT_STATE_COLUMN,
         ));

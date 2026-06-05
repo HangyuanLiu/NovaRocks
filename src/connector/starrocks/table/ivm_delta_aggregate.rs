@@ -93,7 +93,9 @@ fn signed_delta_projection(
             }
         }
     }
-    if aggregate_shape_needs_retraction_count_state(shape) {
+    if aggregate_shape_needs_retraction_count_state(
+        &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls::from(shape),
+    ) {
         projection.push(make_aggregate_select_item(
             "SUM",
             change_op.expr(),

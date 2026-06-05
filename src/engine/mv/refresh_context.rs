@@ -343,7 +343,7 @@ impl IcebergMvRewriteContext {
             aggregate_input_types_from_schema_contract(&aggregate_shape, &self.schema_contract)?;
         let layout =
             crate::connector::starrocks::table::mv_agg_state::build_aggregate_mv_layout_with_input_types(
-            &aggregate_shape,
+            &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls::from(&aggregate_shape),
             &output_columns,
             &aggregate_input_types,
         )?;

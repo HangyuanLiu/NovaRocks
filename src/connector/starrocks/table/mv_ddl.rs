@@ -493,7 +493,7 @@ fn build_mv_storage_layout(
                 vec![None; shape.aggregates.len()]
             };
             let layout = super::mv_agg_state::build_aggregate_mv_layout_with_input_types(
-                shape,
+                &super::aggregate_sql_calls::AggregateSqlCalls::from(shape),
                 output_columns,
                 &aggregate_input_types,
             )?;

@@ -5,7 +5,8 @@
 /// intentionally ignored — this extractor does not classify or reject based on
 /// the table structure.
 use super::mv_shape::{
-    AggregateCallShape, GroupKeyShape, VisibleAggregateOutput, classify_aggregate_select_outputs,
+    AggregateCallShape, AggregateMvShape, GroupKeyShape, VisibleAggregateOutput,
+    classify_aggregate_select_outputs,
 };
 
 /// The focused aggregate-call surface extracted from a stored MV SELECT.
@@ -24,6 +25,24 @@ pub(crate) struct AggregateSqlCalls {
     /// order of the stored SELECT so that downstream layout / codec / merge
     /// operators can derive column positions deterministically.
     pub(crate) visible_outputs: Vec<VisibleAggregateOutput>,
+}
+
+/// TEMPORARY bridge: project the aggregate-call subset out of an
+/// `AggregateMvShape`.
+///
+/// This exists only while the Iceberg path still classifies a stored SELECT
+/// into a full `IncrementalMvShape` before consuming it. It lets the narrowed
+/// layout builder / SQL rewrites take `AggregateSqlCalls` without disturbing the
+/// shape acquisition. It will be deleted in P4.5 once the Iceberg path no longer
+/// produces an `AggregateMvShape` at all.
+impl From<&AggregateMvShape> for AggregateSqlCalls {
+    fn from(shape: &AggregateMvShape) -> Self {
+        AggregateSqlCalls {
+            group_keys: shape.group_keys.clone(),
+            aggregates: shape.aggregates.clone(),
+            visible_outputs: shape.visible_outputs.clone(),
+        }
+    }
 }
 
 /// Extract aggregate calls + GROUP BY keys from a parsed aggregate SELECT.
