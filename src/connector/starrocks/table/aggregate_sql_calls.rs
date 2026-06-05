@@ -151,14 +151,12 @@ pub(crate) fn extract_single_scan_table_fqn(
     Ok(name.to_string())
 }
 
-/// TEMPORARY bridge: project the aggregate-call subset out of an
-/// `AggregateMvShape`.
+/// Project the aggregate-call subset out of an `AggregateMvShape`.
 ///
-/// This exists only while the Iceberg path still classifies a stored SELECT
-/// into a full `IncrementalMvShape` before consuming it. It lets the narrowed
-/// layout builder / SQL rewrites take `AggregateSqlCalls` without disturbing the
-/// shape acquisition. It will be deleted in P4.5 once the Iceberg path no longer
-/// produces an `AggregateMvShape` at all.
+/// Used by the StarRocks managed-lake path (`mv_ddl.rs`, `mv_agg_state.rs`,
+/// `ivm_delta_aggregate.rs`), which still classifies a stored SELECT into a full
+/// `IncrementalMvShape` before consuming it. The Iceberg refresh path uses
+/// [`extract_aggregate_sql_calls`] directly and no longer calls this.
 impl From<&AggregateMvShape> for AggregateSqlCalls {
     fn from(shape: &AggregateMvShape) -> Self {
         AggregateSqlCalls {

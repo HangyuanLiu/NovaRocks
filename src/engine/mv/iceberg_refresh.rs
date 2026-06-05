@@ -30,9 +30,7 @@ use crate::connector::starrocks::table::mv_refresh::{
     acquire_mv_refresh_lock, load_current_iceberg_base_table, parse_iceberg_table_refs,
     run_mv_full_select_chunks, single_snapshot_map, single_table_uuid_map,
 };
-use crate::connector::starrocks::table::mv_shape::{
-    AggregateMvShape, IncrementalMvShape, UnionBranchKind, classify_incremental_mv_query,
-};
+use crate::connector::starrocks::table::mv_shape::UnionBranchKind;
 use crate::engine::mv::iceberg_target_apply::{
     ICEBERG_MV_APPLY_KEY_COLUMN, ICEBERG_MV_APPLY_KEY_SOURCE_BASE_ROW_ID,
     ICEBERG_MV_APPLY_KEY_SOURCE_GROUP_ROW_ID, ICEBERG_MV_APPLY_KEY_SOURCE_JOIN_ROW_KEY,
@@ -412,29 +410,6 @@ fn iceberg_mv_target_exists(
     }
 }
 
-// TODO(R7): delete — dead after the join projection/filter and join-aggregate
-// refresh/plan paths moved to `validate_join_aliases_base_refs`. Retained only so
-// the alias-sibling doc links stay valid until the final classifier-retirement task.
-fn validate_join_shape_base_refs(
-    shape: &crate::connector::starrocks::table::mv_shape::JoinProjectionFilterMvShape,
-    base_refs: &[IcebergTableRef],
-) -> Result<(), String> {
-    for name in [
-        shape.left_table.to_string().to_ascii_lowercase(),
-        shape.right_table.to_string().to_ascii_lowercase(),
-    ] {
-        if !base_refs
-            .iter()
-            .any(|base| base.fqn().eq_ignore_ascii_case(&name))
-        {
-            return Err(format!(
-                "join MV shape references base {name} but analyzer resolved {base_refs:?}"
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// Validate the resolved base-ref set for an aggregate-over-UNION-ALL fan-in MV.
 ///
 /// The legacy invariant compared the classifier's `fan_in_bases` against the
@@ -809,20 +784,6 @@ fn validate_union_projection_schema_contract_for_base(
     }
 }
 
-fn is_join_projection_filter_mv(shape: &IncrementalMvShape) -> bool {
-    matches!(shape, IncrementalMvShape::JoinProjectionFilter(_))
-}
-
-// TODO(R7): delete — dead after the aggregate refresh/plan paths stopped
-// classifying; retained only until the final IncrementalMvShape removal task.
-fn aggregate_shape_for_layout(shape: &IncrementalMvShape) -> Option<AggregateMvShape> {
-    match shape {
-        IncrementalMvShape::Aggregate(shape) => Some(shape.clone()),
-        IncrementalMvShape::JoinAggregate(shape) => Some(shape.as_aggregate_shape_for_layout()),
-        _ => None,
-    }
-}
-
 pub(crate) fn union_branch_inner_apply_key(
     branch_kind: UnionBranchKind,
 ) -> crate::meta::repository::mv_contract::ApplyKeySource {
@@ -915,7 +876,7 @@ fn representative_aggregate_layout(
 /// FROM-agnostic [`extract_aggregate_sql_calls`] extractor, so a simple
 /// aggregate, an aggregate over a join, and a fan-in aggregate all yield the
 /// same `group_keys`/`aggregates`/`visible_outputs` the layout builder needs —
-/// the build no longer depends on a top-level `IncrementalMvShape`.
+/// the build is driven by the focused extractor and the persisted contract.
 fn representative_aggregate_calls<'a>(
     property: &RefreshFragmentProperty,
     canonical_query: &sqlparser::ast::Query,
@@ -1079,26 +1040,19 @@ fn base_snapshot_status_for_refresh(
 }
 
 fn iceberg_aggregate_target_columns(
-    shape: &AggregateMvShape,
+    calls: &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls,
     analysis: &MvAnalysis,
 ) -> Result<Vec<crate::sql::parser::ast::TableColumnDef>, String> {
-    let layout = build_aggregate_layout_from_analysis(
-        &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls::from(shape),
-        analysis,
-    )?;
+    let layout = build_aggregate_layout_from_analysis(calls, analysis)?;
     iceberg_aggregate_target_columns_from_layout(&layout)
 }
 
 fn iceberg_aggregate_target_columns_from_resolved_query(
-    shape: &AggregateMvShape,
+    calls: &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls,
     output_columns: &[crate::sql::analysis::OutputColumn],
     resolved_query: &crate::sql::analysis::ResolvedQuery,
 ) -> Result<Vec<crate::sql::parser::ast::TableColumnDef>, String> {
-    let layout = build_aggregate_layout_from_resolved_query(
-        &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls::from(shape),
-        output_columns,
-        resolved_query,
-    )?;
+    let layout = build_aggregate_layout_from_resolved_query(calls, output_columns, resolved_query)?;
     iceberg_aggregate_target_columns_from_layout(&layout)
 }
 
@@ -1143,16 +1097,6 @@ fn build_aggregate_layout_from_resolved_query(
     )
 }
 
-fn first_union_aggregate_branch(
-    union_shape: &crate::connector::starrocks::table::mv_shape::UnionAllMvShape,
-) -> Result<&AggregateMvShape, String> {
-    match union_shape.branches.first() {
-        Some(IncrementalMvShape::Aggregate(shape)) => Ok(shape),
-        Some(_) => Err("UNION ALL aggregate MV requires aggregate branches".to_string()),
-        None => Err("UNION ALL MV requires at least one branch".to_string()),
-    }
-}
-
 fn first_union_branch_resolved_query(
     resolved_query: &crate::sql::analysis::ResolvedQuery,
 ) -> Result<&crate::sql::analysis::ResolvedQuery, String> {
@@ -1168,8 +1112,7 @@ fn first_union_branch_resolved_query(
 }
 
 /// Build the persisted [`MvSchemaContract`] for a new Iceberg MV, dispatching
-/// on the synthesized [`TargetIdentity`] rather than the legacy flat
-/// `RefreshStrategy` + `IncrementalMvShape`.
+/// on the synthesized [`TargetIdentity`].
 ///
 /// The dispatch is identity-RECURSIVE: a `BranchScoped(inner)` top builds each
 /// branch's inner contract by recursing on the inner structure (so a branch
@@ -1178,12 +1121,11 @@ fn first_union_branch_resolved_query(
 /// (`target_contract` / `aggregate_contract` / `base_contract` /
 /// `build_*_lineage`) are reused unchanged; only the dispatch changed.
 ///
-/// Shape data the leaf builders still need (aggregate calls, join table
+/// Shape data the leaf builders need (aggregate calls, join table
 /// identity/aliases) is sourced from the focused FROM-agnostic extractors
 /// (`extract_aggregate_sql_calls` / `extract_join_aliases` /
 /// `extract_single_scan_table_fqn`) over `canonical_query` (or its first branch)
-/// plus the resolved `MvAnalysis`, so the build no longer consumes a top-level
-/// `IncrementalMvShape`.
+/// plus the resolved `MvAnalysis`.
 #[allow(clippy::too_many_arguments)]
 fn build_iceberg_mv_schema_contract(
     refresh_contract: &ImvRefreshContract,
@@ -1790,10 +1732,9 @@ fn union_branch_count(query: &sqlparser::ast::Query) -> u32 {
 }
 
 /// The (lower-cased) base-table FQNs referenced by a single UNION ALL branch
-/// query, sourced from the focused FROM extractors rather than the legacy
-/// classifier. Reproduces `IncrementalMvShape::base_tables()` for a single
-/// branch (which is one of: single-scan projection/filter or aggregate, a
-/// two-table join, or a fan-in aggregate over a UNION ALL of single scans):
+/// query, sourced from the focused FROM extractors. A single branch is one of:
+/// single-scan projection/filter or aggregate, a two-table join, or a fan-in
+/// aggregate over a UNION ALL of single scans:
 ///   * a two-table inner equi-join FROM    -> [left_table, right_table]
 ///   * a fan-in UNION ALL subquery in FROM -> one FQN per union branch
 ///   * a single scan                       -> [the single FROM table]
@@ -3577,8 +3518,7 @@ fn refresh_single_aggregate_iceberg_mv(
 ///
 /// UNION ALL sits BELOW the aggregate, so the same group key folds across
 /// branches and the ordinary group-row-id apply key applies — there is no
-/// `__branch_id__` (that is the B-family / `IncrementalMvShape::UnionAll`
-/// concern). The rewrite (`RewriteUnionAggregateDelta` + the aggregate-state
+/// `__branch_id__` (that is the B-family / branch-union concern). The rewrite (`RewriteUnionAggregateDelta` + the aggregate-state
 /// stage) and IMV scan binding already fan a per-branch delta window off the
 /// multi-base pin, exactly like `refresh_join_aggregate_iceberg_mv` does for
 /// its two bases. This orchestration just pins/loads every fan-in base, builds
@@ -4325,10 +4265,9 @@ fn refresh_join_aggregate_iceberg_mv(
                 .to_string(),
         );
     }
-    // Base-ref matching is sourced from the join aliases (left/right table FQNs)
-    // rather than the legacy `JoinAggregateMvShape.join`; the join ON keys are
-    // never read by the refresh path. The aggregate-call surface drives the
-    // first-refresh full-state build.
+    // Base-ref matching uses the join aliases (left/right table FQNs); the join
+    // ON keys are never read by the refresh path. The aggregate-call surface
+    // drives the first-refresh full-state build.
     validate_join_aliases_base_refs(join_aliases, base_refs)?;
     let (left_ref, right_ref) = join_base_refs_for_aliases(join_aliases, base_refs)?;
     let left_loaded_before_pin = load_current_iceberg_base_table(state, left_ref)?;
@@ -4939,16 +4878,8 @@ pub(crate) fn plan_iceberg_mv_refresh(
             }),
         });
     }
-    // KEEP: the single-scan projection/filter inline path below is not a composed
-    // branch union, so the legacy classifier still feeds its first-refresh/layout
-    // helpers. (The join path above no longer classifies.)
-    let shape =
-        classify_incremental_mv_query(&canonical_select_query).map_err(RefreshError::user)?;
-    if !matches!(shape, IncrementalMvShape::ProjectionFilter(_)) {
-        return Err(RefreshError::user(
-            "iceberg materialized view refresh only supports projection/filter or join projection/filter shapes",
-        ));
-    }
+    // The capability dispatch above (has_agg=false, SingleBase, non-join) routes only
+    // single-base projection/filter MVs to this point. No classify guard needed.
     let [base_ref] = base_refs.as_slice() else {
         return Err(RefreshError::user(
             "iceberg materialized view refresh requires exactly one base table reference",
@@ -8057,35 +7988,6 @@ fn refresh_iceberg_join_mv(
     )
 }
 
-// TODO(R7): delete — dead after the join projection/filter and join-aggregate
-// refresh/plan paths moved to `join_base_refs_for_aliases`. Retained only so the
-// alias-sibling doc links stay valid until the final classifier-retirement task.
-fn join_base_refs_for_shape<'a>(
-    shape: &crate::connector::starrocks::table::mv_shape::JoinProjectionFilterMvShape,
-    base_refs: &'a [IcebergTableRef],
-) -> Result<(&'a IcebergTableRef, &'a IcebergTableRef), String> {
-    let left_name = shape.left_table.to_string();
-    let right_name = shape.right_table.to_string();
-    let left = base_refs
-        .iter()
-        .find(|base| base.fqn().eq_ignore_ascii_case(&left_name))
-        .ok_or_else(|| format!("join MV left base {left_name} was not resolved"))?;
-    let right = base_refs
-        .iter()
-        .find(|base| base.fqn().eq_ignore_ascii_case(&right_name))
-        .ok_or_else(|| format!("join MV right base {right_name} was not resolved"))?;
-    Ok((left, right))
-}
-
-/// `JoinAliases`-sourced counterpart to [`validate_join_shape_base_refs`] for the
-/// de-classified join-aggregate refresh/plan paths.
-///
-/// The join-aggregate paths no longer classify the stored SELECT into a
-/// `JoinAggregateMvShape`; they source the left/right table FQNs from
-/// [`extract_join_aliases`]. `JoinAliases.{left_table,right_table}` carry the
-/// same `ObjectName.to_string()` form the legacy join shape stored, so this
-/// check (each join base FQN must appear in the analyzer-resolved `base_refs`)
-/// makes the same accept/reject decision as the legacy `validate_join_shape_base_refs`.
 fn validate_join_aliases_base_refs(
     aliases: &crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases,
     base_refs: &[IcebergTableRef],
@@ -8106,10 +8008,9 @@ fn validate_join_aliases_base_refs(
     Ok(())
 }
 
-/// `JoinAliases`-sourced counterpart to [`join_base_refs_for_shape`] for the
-/// de-classified join-aggregate refresh/plan paths. Resolves the left/right
-/// `base_refs` by matching `JoinAliases.{left_table,right_table}` (the same FQN
-/// strings the legacy join shape carried) against `base.fqn()`.
+/// Resolves the left/right `base_refs` for a join MV by matching
+/// `JoinAliases.{left_table,right_table}` (the `ObjectName.to_string()` FQN form)
+/// against `base.fqn()`.
 fn join_base_refs_for_aliases<'a>(
     aliases: &crate::connector::starrocks::table::aggregate_sql_calls::JoinAliases,
     base_refs: &'a [IcebergTableRef],
@@ -10779,14 +10680,6 @@ mod tests {
     }
 
     #[test]
-    fn refresh_dispatch_identifies_join_shape() {
-        let query =
-            parse_select_query("select l.id from ice.ns.left l join ice.ns.right r on l.id = r.id");
-        let shape = classify_incremental_mv_query(&query).expect("shape");
-        assert!(is_join_projection_filter_mv(&shape));
-    }
-
-    #[test]
     fn refresh_contract_selects_fan_in_aggregate_for_a_family() {
         let env = open_test_state_with_hadoop_iceberg_catalog("ice_fan_in", "sales");
         create_aggregate_fact_table(&env.state, "ice_fan_in", "sales", "t1");
@@ -10853,18 +10746,13 @@ mod tests {
         let sql = "select region, avg(amount) as a \
                    from ice.ns.fact group by region";
         let query = parse_select_query(sql);
-        let shape = match classify_incremental_mv_query(&query).expect("shape") {
-            IncrementalMvShape::Aggregate(shape) => shape,
-            other => panic!("expected aggregate shape, got {other:?}"),
-        };
+        let calls =
+            crate::connector::starrocks::table::aggregate_sql_calls::extract_aggregate_sql_calls(
+                &query,
+            )
+            .expect("extract aggregate calls");
 
-        let state_sql = iceberg_aggregate_first_refresh_select_sql(
-            sql,
-            &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls::from(
-                &shape,
-            ),
-        )
-        .expect("rewrite");
+        let state_sql = iceberg_aggregate_first_refresh_select_sql(sql, &calls).expect("rewrite");
         let upper = state_sql.to_uppercase();
 
         assert!(
@@ -11625,17 +11513,23 @@ mod tests {
         }
     }
 
-    fn analyze_aggregate_fact_query(sql: &str) -> (AggregateMvShape, MvAnalysis) {
+    fn analyze_aggregate_fact_query(
+        sql: &str,
+    ) -> (
+        crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls,
+        MvAnalysis,
+    ) {
         let env = open_test_state_with_iceberg_catalog("ice", "ns");
         create_aggregate_fact_table(&env.state, "ice", "ns", "fact");
         let query = parse_select_query(sql);
-        let shape = match classify_incremental_mv_query(&query).expect("shape") {
-            IncrementalMvShape::Aggregate(shape) => shape,
-            other => panic!("expected aggregate shape, got {other:?}"),
-        };
+        let calls =
+            crate::connector::starrocks::table::aggregate_sql_calls::extract_aggregate_sql_calls(
+                &query,
+            )
+            .expect("extract aggregate calls");
         let analysis = analyze_mv_select(&env.state, Some("ice"), &env.current_db, &query)
             .expect("analyze aggregate query");
-        (shape, analysis)
+        (calls, analysis)
     }
 
     struct IcebergMvTestState {
@@ -13338,10 +13232,6 @@ mod tests {
         );
         let analysis = analyze_mv_select(&env.state, Some("ice"), &env.current_db, &query)
             .expect("analyze UNION ALL aggregate query");
-        let shape = classify_incremental_mv_query(&query).expect("classify shape");
-        let IncrementalMvShape::UnionAll(union_shape) = &shape else {
-            panic!("expected UNION ALL shape, got {shape:?}");
-        };
         let resolved_dependencies = crate::engine::mv::dependency::resolve_create_mv_dependencies(
             &env.state,
             &analysis.resolved_refs,
@@ -13357,15 +13247,21 @@ mod tests {
                 (base_ref.clone(), loaded)
             })
             .collect::<Vec<_>>();
-        let first_aggregate_branch =
-            first_union_aggregate_branch(union_shape).expect("first aggregate branch");
+        // Source the first-branch aggregate calls from the AST (no classifier).
+        let first_branch_ast =
+            first_union_branch_ast_query(&query).expect("first branch ast query");
+        let first_branch_calls =
+            crate::connector::starrocks::table::aggregate_sql_calls::extract_aggregate_sql_calls(
+                &first_branch_ast,
+            )
+            .expect("first branch aggregate calls");
         let target = IcebergMvTarget {
             catalog: "ice".to_string(),
             namespace: "analytics".to_string(),
             table: "mv_union_fact_region_contract".to_string(),
         };
         let mut columns = iceberg_aggregate_target_columns_from_resolved_query(
-            first_aggregate_branch,
+            &first_branch_calls,
             &analysis.output_columns,
             first_union_branch_resolved_query(&analysis.resolved_query)
                 .expect("first branch resolved query"),
