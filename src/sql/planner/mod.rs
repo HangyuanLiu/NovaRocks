@@ -660,12 +660,13 @@ fn plan_select_scoped(
             }
         }
 
-        let (project_items, agg_calls, output_columns) = split_projection_for_aggregate(
-            &select.projection,
-            &select.group_by,
-            select.having.as_ref(),
-            factory,
-        );
+        let (project_items, agg_calls, output_columns, rewritten_having) =
+            split_projection_for_aggregate(
+                &select.projection,
+                &select.group_by,
+                select.having.as_ref(),
+                factory,
+            );
         current = LogicalPlan::Aggregate(AggregateNode {
             input: Box::new(current),
             group_by: select.group_by,
@@ -674,7 +675,7 @@ fn plan_select_scoped(
             already_pushed: false,
             required_output_columns: None,
         });
-        if let Some(having) = select.having {
+        if let Some(having) = rewritten_having {
             current = LogicalPlan::Filter(FilterNode {
                 input: Box::new(current),
                 predicate: having,
@@ -1740,26 +1741,36 @@ fn split_projection_for_aggregate(
     group_by: &[TypedExpr],
     having: Option<&TypedExpr>,
     factory: &mut ColumnRefFactory,
-) -> (Vec<ProjectItem>, Vec<AggregateCall>, Vec<OutputColumn>) {
+) -> (
+    Vec<ProjectItem>,
+    Vec<AggregateCall>,
+    Vec<OutputColumn>,
+    Option<TypedExpr>,
+) {
     let mut agg_calls = Vec::new();
     let mut output_columns = Vec::new();
-    let mut project_items = Vec::with_capacity(projection.len());
+    let mut group_by_rewrite_targets = Vec::new();
 
-    // Collect aggregate calls from projection
     for item in projection {
         collect_aggregates(&item.expr, &mut agg_calls, factory);
-        output_columns.push(OutputColumn {
+        let output_column = OutputColumn {
             column_id: expr_column_id(&item.expr, &item.output_name, factory),
             name: item.output_name.clone(),
             data_type: item.expr.data_type.clone(),
             nullable: item.expr.nullable,
             is_internal: false,
-        });
-        project_items.push(ProjectItem {
-            expr: rewrite_exact_group_by_expr_ref(&item.expr, group_by),
-            output_name: item.output_name.clone(),
-            output_column_id: item.output_column_id,
-        });
+        };
+        if let Some(gb) = group_by
+            .iter()
+            .find(|gb| typed_expr_semantically_eq(&item.expr, gb))
+        {
+            group_by_rewrite_targets.push(GroupByRewriteTarget {
+                expr: gb.clone(),
+                column_id: output_column.column_id,
+                display_name: typed_expr_display_name(gb),
+            });
+        }
+        output_columns.push(output_column);
     }
 
     // Also collect aggregate calls from HAVING clause so the aggregate node
@@ -1768,33 +1779,545 @@ fn split_projection_for_aggregate(
         collect_aggregates(having_expr, &mut agg_calls, factory);
     }
 
-    (project_items, agg_calls, output_columns)
+    let project_items = projection
+        .iter()
+        .map(|item| {
+            let expr = rewrite_agg_calls_to_refs(&item.expr, &agg_calls);
+            let expr = rewrite_group_by_expr_refs(&expr, &group_by_rewrite_targets);
+            ProjectItem {
+                expr,
+                output_name: item.output_name.clone(),
+                output_column_id: item.output_column_id,
+            }
+        })
+        .collect();
+    let rewritten_having = having.map(|expr| {
+        let expr = rewrite_agg_calls_to_refs(expr, &agg_calls);
+        rewrite_group_by_expr_refs(&expr, &group_by_rewrite_targets)
+    });
+
+    (project_items, agg_calls, output_columns, rewritten_having)
 }
 
-fn rewrite_exact_group_by_expr_ref(expr: &TypedExpr, group_by: &[TypedExpr]) -> TypedExpr {
-    let expr_name = typed_expr_display_name(expr);
-    for gb in group_by {
-        if typed_expr_display_name(gb) == expr_name {
-            // Reuse the group-by expression's ColumnId if it is a ColumnRef.
-            let cid = if let ExprKind::ColumnRef { column_id, .. } = &gb.kind {
-                *column_id
-            } else if let ExprKind::ColumnRef { column_id, .. } = &expr.kind {
-                *column_id
-            } else {
-                ColumnId::UNSET
-            };
+#[derive(Clone)]
+struct GroupByRewriteTarget {
+    expr: TypedExpr,
+    column_id: ColumnId,
+    display_name: String,
+}
+
+fn rewrite_agg_calls_to_refs(expr: &TypedExpr, agg_calls: &[AggregateCall]) -> TypedExpr {
+    if let ExprKind::AggregateCall {
+        name,
+        args,
+        distinct,
+        order_by,
+    } = &expr.kind
+        && let Some(call) = agg_calls
+            .iter()
+            .find(|call| aggregate_call_matches(call, name, args, *distinct, order_by))
+    {
+        let display = crate::sql::codegen::helpers::agg_call_display_name_from_parts(
+            name, args, *distinct, order_by,
+        );
+        return TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: call.output_column_id,
+                qualifier: None,
+                column: display,
+            },
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+        };
+    }
+    rewrite_expr_children(expr, |child| rewrite_agg_calls_to_refs(child, agg_calls))
+}
+
+fn rewrite_group_by_expr_refs(expr: &TypedExpr, targets: &[GroupByRewriteTarget]) -> TypedExpr {
+    for target in targets {
+        if typed_expr_semantically_eq(expr, &target.expr) {
             return TypedExpr {
                 kind: ExprKind::ColumnRef {
-                    column_id: cid,
+                    column_id: target.column_id,
                     qualifier: None,
-                    column: expr_name,
+                    column: target.display_name.clone(),
                 },
-                data_type: gb.data_type.clone(),
-                nullable: gb.nullable,
+                data_type: expr.data_type.clone(),
+                nullable: expr.nullable,
             };
         }
     }
-    expr.clone()
+    rewrite_expr_children(expr, |child| rewrite_group_by_expr_refs(child, targets))
+}
+
+fn rewrite_expr_children(
+    expr: &TypedExpr,
+    mut rewrite_child: impl FnMut(&TypedExpr) -> TypedExpr,
+) -> TypedExpr {
+    let kind = match &expr.kind {
+        ExprKind::BinaryOp { left, op, right } => ExprKind::BinaryOp {
+            left: Box::new(rewrite_child(left)),
+            op: *op,
+            right: Box::new(rewrite_child(right)),
+        },
+        ExprKind::UnaryOp { op, expr: inner } => ExprKind::UnaryOp {
+            op: *op,
+            expr: Box::new(rewrite_child(inner)),
+        },
+        ExprKind::FunctionCall {
+            name,
+            args,
+            distinct,
+        } => ExprKind::FunctionCall {
+            name: name.clone(),
+            args: args.iter().map(&mut rewrite_child).collect(),
+            distinct: *distinct,
+        },
+        ExprKind::LambdaFunction { params, body } => ExprKind::LambdaFunction {
+            params: params.clone(),
+            body: Box::new(rewrite_child(body)),
+        },
+        ExprKind::Cast {
+            expr: inner,
+            target,
+        } => ExprKind::Cast {
+            expr: Box::new(rewrite_child(inner)),
+            target: target.clone(),
+        },
+        ExprKind::IsNull {
+            expr: inner,
+            negated,
+        } => ExprKind::IsNull {
+            expr: Box::new(rewrite_child(inner)),
+            negated: *negated,
+        },
+        ExprKind::InList {
+            expr: inner,
+            list,
+            negated,
+        } => ExprKind::InList {
+            expr: Box::new(rewrite_child(inner)),
+            list: list.iter().map(&mut rewrite_child).collect(),
+            negated: *negated,
+        },
+        ExprKind::Between {
+            expr: inner,
+            low,
+            high,
+            negated,
+        } => ExprKind::Between {
+            expr: Box::new(rewrite_child(inner)),
+            low: Box::new(rewrite_child(low)),
+            high: Box::new(rewrite_child(high)),
+            negated: *negated,
+        },
+        ExprKind::Like {
+            expr: inner,
+            pattern,
+            negated,
+        } => ExprKind::Like {
+            expr: Box::new(rewrite_child(inner)),
+            pattern: Box::new(rewrite_child(pattern)),
+            negated: *negated,
+        },
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => ExprKind::Case {
+            operand: operand
+                .as_ref()
+                .map(|operand| Box::new(rewrite_child(operand))),
+            when_then: when_then
+                .iter()
+                .map(|(when, then)| (rewrite_child(when), rewrite_child(then)))
+                .collect(),
+            else_expr: else_expr
+                .as_ref()
+                .map(|else_expr| Box::new(rewrite_child(else_expr))),
+        },
+        ExprKind::IsTruthValue {
+            expr: inner,
+            value,
+            negated,
+        } => ExprKind::IsTruthValue {
+            expr: Box::new(rewrite_child(inner)),
+            value: *value,
+            negated: *negated,
+        },
+        ExprKind::Nested(inner) => ExprKind::Nested(Box::new(rewrite_child(inner))),
+        ExprKind::WindowCall {
+            name,
+            args,
+            distinct,
+            partition_by,
+            order_by,
+            window_frame,
+            ignore_nulls,
+        } => ExprKind::WindowCall {
+            name: name.clone(),
+            args: args.iter().map(&mut rewrite_child).collect(),
+            distinct: *distinct,
+            partition_by: partition_by.iter().map(&mut rewrite_child).collect(),
+            order_by: order_by
+                .iter()
+                .map(|item| SortItem {
+                    expr: rewrite_child(&item.expr),
+                    asc: item.asc,
+                    nulls_first: item.nulls_first,
+                })
+                .collect(),
+            window_frame: window_frame.clone(),
+            ignore_nulls: *ignore_nulls,
+        },
+        ExprKind::Lambda { params, body } => ExprKind::Lambda {
+            params: params.clone(),
+            body: Box::new(rewrite_child(body)),
+        },
+        ExprKind::AggregateCall { .. }
+        | ExprKind::ColumnRef { .. }
+        | ExprKind::LambdaParamRef { .. }
+        | ExprKind::Literal(_)
+        | ExprKind::SubqueryPlaceholder { .. } => return expr.clone(),
+    };
+    TypedExpr {
+        kind,
+        data_type: expr.data_type.clone(),
+        nullable: expr.nullable,
+    }
+}
+
+fn aggregate_call_matches(
+    call: &AggregateCall,
+    name: &str,
+    args: &[TypedExpr],
+    distinct: bool,
+    order_by: &[SortItem],
+) -> bool {
+    call.name == name
+        && call.distinct == distinct
+        && call.args.len() == args.len()
+        && call.order_by.len() == order_by.len()
+        && call
+            .args
+            .iter()
+            .zip(args.iter())
+            .all(|(left, right)| typed_expr_semantically_eq(left, right))
+        && call
+            .order_by
+            .iter()
+            .zip(order_by.iter())
+            .all(|(left, right)| sort_item_semantically_eq(left, right))
+}
+
+fn typed_expr_semantically_eq(left: &TypedExpr, right: &TypedExpr) -> bool {
+    match (&left.kind, &right.kind) {
+        (
+            ExprKind::ColumnRef {
+                column_id: left_id,
+                qualifier: left_qualifier,
+                column: left_column,
+            },
+            ExprKind::ColumnRef {
+                column_id: right_id,
+                qualifier: right_qualifier,
+                column: right_column,
+            },
+        ) => {
+            if *left_id != ColumnId::UNSET && *right_id != ColumnId::UNSET {
+                left_id == right_id
+            } else {
+                left_qualifier.as_ref().map(|q| q.to_lowercase())
+                    == right_qualifier.as_ref().map(|q| q.to_lowercase())
+                    && left_column.eq_ignore_ascii_case(right_column)
+            }
+        }
+        (
+            ExprKind::LambdaParamRef {
+                name: left_name,
+                slot_id: left_slot,
+            },
+            ExprKind::LambdaParamRef {
+                name: right_name,
+                slot_id: right_slot,
+            },
+        ) => left_slot == right_slot && left_name.eq_ignore_ascii_case(right_name),
+        (ExprKind::Literal(left), ExprKind::Literal(right)) => left == right,
+        (
+            ExprKind::BinaryOp {
+                left: left_left,
+                op: left_op,
+                right: left_right,
+            },
+            ExprKind::BinaryOp {
+                left: right_left,
+                op: right_op,
+                right: right_right,
+            },
+        ) => {
+            left_op == right_op
+                && typed_expr_semantically_eq(left_left, right_left)
+                && typed_expr_semantically_eq(left_right, right_right)
+        }
+        (
+            ExprKind::UnaryOp {
+                op: left_op,
+                expr: left_expr,
+            },
+            ExprKind::UnaryOp {
+                op: right_op,
+                expr: right_expr,
+            },
+        ) => left_op == right_op && typed_expr_semantically_eq(left_expr, right_expr),
+        (
+            ExprKind::FunctionCall {
+                name: left_name,
+                args: left_args,
+                distinct: left_distinct,
+            },
+            ExprKind::FunctionCall {
+                name: right_name,
+                args: right_args,
+                distinct: right_distinct,
+            },
+        ) => {
+            left_name.eq_ignore_ascii_case(right_name)
+                && left_distinct == right_distinct
+                && typed_expr_slices_semantically_eq(left_args, right_args)
+        }
+        (
+            ExprKind::LambdaFunction {
+                params: left_params,
+                body: left_body,
+            },
+            ExprKind::LambdaFunction {
+                params: right_params,
+                body: right_body,
+            },
+        ) => {
+            left_params.len() == right_params.len()
+                && typed_expr_semantically_eq(left_body, right_body)
+        }
+        (
+            ExprKind::AggregateCall {
+                name: left_name,
+                args: left_args,
+                distinct: left_distinct,
+                order_by: left_order_by,
+            },
+            ExprKind::AggregateCall {
+                name: right_name,
+                args: right_args,
+                distinct: right_distinct,
+                order_by: right_order_by,
+            },
+        ) => {
+            left_name.eq_ignore_ascii_case(right_name)
+                && left_distinct == right_distinct
+                && typed_expr_slices_semantically_eq(left_args, right_args)
+                && sort_item_slices_semantically_eq(left_order_by, right_order_by)
+        }
+        (
+            ExprKind::Cast {
+                expr: left_expr,
+                target: left_target,
+            },
+            ExprKind::Cast {
+                expr: right_expr,
+                target: right_target,
+            },
+        ) => left_target == right_target && typed_expr_semantically_eq(left_expr, right_expr),
+        (
+            ExprKind::IsNull {
+                expr: left_expr,
+                negated: left_negated,
+            },
+            ExprKind::IsNull {
+                expr: right_expr,
+                negated: right_negated,
+            },
+        ) => left_negated == right_negated && typed_expr_semantically_eq(left_expr, right_expr),
+        (
+            ExprKind::InList {
+                expr: left_expr,
+                list: left_list,
+                negated: left_negated,
+            },
+            ExprKind::InList {
+                expr: right_expr,
+                list: right_list,
+                negated: right_negated,
+            },
+        ) => {
+            left_negated == right_negated
+                && typed_expr_semantically_eq(left_expr, right_expr)
+                && typed_expr_slices_semantically_eq(left_list, right_list)
+        }
+        (
+            ExprKind::Between {
+                expr: left_expr,
+                low: left_low,
+                high: left_high,
+                negated: left_negated,
+            },
+            ExprKind::Between {
+                expr: right_expr,
+                low: right_low,
+                high: right_high,
+                negated: right_negated,
+            },
+        ) => {
+            left_negated == right_negated
+                && typed_expr_semantically_eq(left_expr, right_expr)
+                && typed_expr_semantically_eq(left_low, right_low)
+                && typed_expr_semantically_eq(left_high, right_high)
+        }
+        (
+            ExprKind::Like {
+                expr: left_expr,
+                pattern: left_pattern,
+                negated: left_negated,
+            },
+            ExprKind::Like {
+                expr: right_expr,
+                pattern: right_pattern,
+                negated: right_negated,
+            },
+        ) => {
+            left_negated == right_negated
+                && typed_expr_semantically_eq(left_expr, right_expr)
+                && typed_expr_semantically_eq(left_pattern, right_pattern)
+        }
+        (
+            ExprKind::Case {
+                operand: left_operand,
+                when_then: left_when_then,
+                else_expr: left_else,
+            },
+            ExprKind::Case {
+                operand: right_operand,
+                when_then: right_when_then,
+                else_expr: right_else,
+            },
+        ) => {
+            optional_typed_expr_semantically_eq(left_operand.as_deref(), right_operand.as_deref())
+                && left_when_then.len() == right_when_then.len()
+                && left_when_then.iter().zip(right_when_then.iter()).all(
+                    |((left_when, left_then), (right_when, right_then))| {
+                        typed_expr_semantically_eq(left_when, right_when)
+                            && typed_expr_semantically_eq(left_then, right_then)
+                    },
+                )
+                && optional_typed_expr_semantically_eq(left_else.as_deref(), right_else.as_deref())
+        }
+        (
+            ExprKind::IsTruthValue {
+                expr: left_expr,
+                value: left_value,
+                negated: left_negated,
+            },
+            ExprKind::IsTruthValue {
+                expr: right_expr,
+                value: right_value,
+                negated: right_negated,
+            },
+        ) => {
+            left_value == right_value
+                && left_negated == right_negated
+                && typed_expr_semantically_eq(left_expr, right_expr)
+        }
+        (ExprKind::Nested(left), ExprKind::Nested(right)) => {
+            typed_expr_semantically_eq(left, right)
+        }
+        (
+            ExprKind::WindowCall {
+                name: left_name,
+                args: left_args,
+                distinct: left_distinct,
+                partition_by: left_partition_by,
+                order_by: left_order_by,
+                window_frame: left_frame,
+                ignore_nulls: left_ignore_nulls,
+            },
+            ExprKind::WindowCall {
+                name: right_name,
+                args: right_args,
+                distinct: right_distinct,
+                partition_by: right_partition_by,
+                order_by: right_order_by,
+                window_frame: right_frame,
+                ignore_nulls: right_ignore_nulls,
+            },
+        ) => {
+            left_name.eq_ignore_ascii_case(right_name)
+                && left_distinct == right_distinct
+                && left_ignore_nulls == right_ignore_nulls
+                && format!("{left_frame:?}") == format!("{right_frame:?}")
+                && typed_expr_slices_semantically_eq(left_args, right_args)
+                && typed_expr_slices_semantically_eq(left_partition_by, right_partition_by)
+                && sort_item_slices_semantically_eq(left_order_by, right_order_by)
+        }
+        (
+            ExprKind::SubqueryPlaceholder {
+                id: left_id,
+                kind: left_kind,
+                data_type: left_type,
+            },
+            ExprKind::SubqueryPlaceholder {
+                id: right_id,
+                kind: right_kind,
+                data_type: right_type,
+            },
+        ) => {
+            left_id == right_id
+                && format!("{left_kind:?}") == format!("{right_kind:?}")
+                && left_type == right_type
+        }
+        (
+            ExprKind::Lambda {
+                params: left_params,
+                body: left_body,
+            },
+            ExprKind::Lambda {
+                params: right_params,
+                body: right_body,
+            },
+        ) => left_params == right_params && typed_expr_semantically_eq(left_body, right_body),
+        _ => false,
+    }
+}
+
+fn optional_typed_expr_semantically_eq(
+    left: Option<&TypedExpr>,
+    right: Option<&TypedExpr>,
+) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => typed_expr_semantically_eq(left, right),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn typed_expr_slices_semantically_eq(left: &[TypedExpr], right: &[TypedExpr]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(left, right)| typed_expr_semantically_eq(left, right))
+}
+
+fn sort_item_semantically_eq(left: &SortItem, right: &SortItem) -> bool {
+    left.asc == right.asc
+        && left.nulls_first == right.nulls_first
+        && typed_expr_semantically_eq(&left.expr, &right.expr)
+}
+
+fn sort_item_slices_semantically_eq(left: &[SortItem], right: &[SortItem]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(left, right)| sort_item_semantically_eq(left, right))
 }
 
 /// Recursively collect AggregateCall from a TypedExpr tree.
@@ -1937,6 +2460,14 @@ fn collect_non_agg_column_refs_inner(
     out: &mut Vec<TypedExpr>,
     inside_agg: bool,
 ) {
+    if !inside_agg
+        && group_by
+            .iter()
+            .any(|gb| typed_expr_semantically_eq(expr, gb))
+    {
+        return;
+    }
+
     match &expr.kind {
         ExprKind::AggregateCall { .. } => {
             // Don't recurse into aggregate calls — columns inside aggregates
@@ -2699,6 +3230,31 @@ mod tests {
         visit(plan).unwrap_or_default()
     }
 
+    fn root_project_over_aggregate(plan: &LogicalPlan) -> (&ProjectNode, &AggregateNode) {
+        let LogicalPlan::Project(project) = plan else {
+            panic!("expected Project root, got {plan:?}");
+        };
+        let LogicalPlan::Aggregate(aggregate) = project.input.as_ref() else {
+            panic!("expected Aggregate under Project, got {:?}", project.input);
+        };
+        (project, aggregate)
+    }
+
+    fn root_project_filter_aggregate(
+        plan: &LogicalPlan,
+    ) -> (&ProjectNode, &FilterNode, &AggregateNode) {
+        let LogicalPlan::Project(project) = plan else {
+            panic!("expected Project root, got {plan:?}");
+        };
+        let LogicalPlan::Filter(filter) = project.input.as_ref() else {
+            panic!("expected Filter under Project, got {:?}", project.input);
+        };
+        let LogicalPlan::Aggregate(aggregate) = filter.input.as_ref() else {
+            panic!("expected Aggregate under Filter, got {:?}", filter.input);
+        };
+        (project, filter, aggregate)
+    }
+
     fn first_window_exprs(plan: &LogicalPlan) -> Vec<WindowExpr> {
         fn visit(plan: &LogicalPlan) -> Option<Vec<WindowExpr>> {
             match plan {
@@ -3170,6 +3726,188 @@ mod tests {
             ids.len(),
             aggs.len(),
             "distinct AggregateCalls must carry distinct output ids"
+        );
+    }
+
+    #[test]
+    fn p2_aggregate_projection_rewrites_agg_call_to_output_id_ref() {
+        let plan = plan_test_query("SELECT sum(b) + 1 AS s1 FROM t");
+        let (project, aggregate) = root_project_over_aggregate(&plan);
+        let sum_id = aggregate
+            .aggregates
+            .iter()
+            .find(|call| call.name.eq_ignore_ascii_case("sum"))
+            .expect("expected sum AggregateCall")
+            .output_column_id;
+        assert_ne!(
+            sum_id,
+            ColumnId::UNSET,
+            "AggregateCall must have a real output id"
+        );
+
+        let ExprKind::BinaryOp { left, .. } = &project.items[0].expr.kind else {
+            panic!(
+                "expected sum(b)+1 to remain a BinaryOp over the aggregate output, got {:?}",
+                project.items[0].expr.kind
+            );
+        };
+        let ExprKind::ColumnRef {
+            column_id, column, ..
+        } = &left.kind
+        else {
+            panic!(
+                "aggregate child in sum(b)+1 must be rewritten to ColumnRef, got {:?}",
+                left.kind
+            );
+        };
+        assert_eq!(
+            *column_id, sum_id,
+            "project expression must reference the AggregateCall output id"
+        );
+        assert_eq!(
+            column, "sum(b)",
+            "project aggregate ColumnRef must preserve the display name for the P2 fallback"
+        );
+    }
+
+    #[test]
+    fn p2_computed_group_key_rewrites_to_group_output_id() {
+        let plan = plan_test_query("SELECT a + 1 AS k, sum(b) AS s FROM t GROUP BY a + 1");
+        let (project, aggregate) = root_project_over_aggregate(&plan);
+        let group_output_id = aggregate
+            .output_columns
+            .iter()
+            .find(|col| col.name == "k")
+            .expect("expected aggregate output column for computed key")
+            .column_id;
+        assert_ne!(
+            group_output_id,
+            ColumnId::UNSET,
+            "computed group output column must have a real id"
+        );
+
+        let ExprKind::ColumnRef {
+            column_id, column, ..
+        } = &project.items[0].expr.kind
+        else {
+            panic!(
+                "computed group key projection must be rewritten to ColumnRef, got {:?}",
+                project.items[0].expr.kind
+            );
+        };
+        assert_eq!(
+            *column_id, group_output_id,
+            "computed group key projection must reference the Aggregate output id"
+        );
+        assert_eq!(
+            column, "a + 1",
+            "computed group key ColumnRef must preserve the group expression display name"
+        );
+    }
+
+    #[test]
+    fn p2_having_rewrites_agg_call_to_output_id_ref() {
+        let plan = plan_test_query("SELECT sum(b) AS s FROM t HAVING sum(b) > 10");
+        let (_project, filter, aggregate) = root_project_filter_aggregate(&plan);
+        let sum_id = aggregate
+            .aggregates
+            .iter()
+            .find(|call| call.name.eq_ignore_ascii_case("sum"))
+            .expect("expected sum AggregateCall")
+            .output_column_id;
+        assert_ne!(
+            sum_id,
+            ColumnId::UNSET,
+            "AggregateCall must have a real output id"
+        );
+
+        let ExprKind::BinaryOp { left, .. } = &filter.predicate.kind else {
+            panic!(
+                "expected HAVING sum(b)>10 to remain a BinaryOp over the aggregate output, got {:?}",
+                filter.predicate.kind
+            );
+        };
+        let ExprKind::ColumnRef {
+            column_id, column, ..
+        } = &left.kind
+        else {
+            panic!(
+                "aggregate child in HAVING must be rewritten to ColumnRef, got {:?}",
+                left.kind
+            );
+        };
+        assert_eq!(
+            *column_id, sum_id,
+            "HAVING predicate must reference the AggregateCall output id"
+        );
+        assert_eq!(
+            column, "sum(b)",
+            "HAVING aggregate ColumnRef must preserve the display name for the P2 fallback"
+        );
+    }
+
+    #[test]
+    fn p2_having_computed_group_key_does_not_append_leaf_group_by() {
+        let plan = plan_test_query(
+            "SELECT abs(a) AS k, sum(b) AS s FROM t GROUP BY abs(a) HAVING abs(a) > 1",
+        );
+        let (project, filter, aggregate) = root_project_filter_aggregate(&plan);
+        assert_eq!(
+            aggregate.group_by.len(),
+            1,
+            "HAVING group expression must not append its leaf column as an extra group key"
+        );
+        let group_output_id = aggregate
+            .output_columns
+            .iter()
+            .find(|col| col.name == "k")
+            .expect("expected aggregate output column for computed key")
+            .column_id;
+        assert_ne!(
+            group_output_id,
+            ColumnId::UNSET,
+            "computed group output column must have a real id"
+        );
+        let ExprKind::ColumnRef {
+            column_id, column, ..
+        } = &project.items[0].expr.kind
+        else {
+            panic!(
+                "computed group key projection must be rewritten to ColumnRef, got {:?}",
+                project.items[0].expr.kind
+            );
+        };
+        assert_eq!(
+            *column_id, group_output_id,
+            "computed group key projection must reference the Aggregate output id"
+        );
+        assert_eq!(
+            column, "abs(a)",
+            "computed group key ColumnRef must preserve the group expression display name"
+        );
+
+        let ExprKind::BinaryOp { left, .. } = &filter.predicate.kind else {
+            panic!(
+                "expected HAVING abs(a)>1 to remain a BinaryOp over the group key output, got {:?}",
+                filter.predicate.kind
+            );
+        };
+        let ExprKind::ColumnRef {
+            column_id, column, ..
+        } = &left.kind
+        else {
+            panic!(
+                "computed group key in HAVING must be rewritten to ColumnRef, got {:?}",
+                left.kind
+            );
+        };
+        assert_eq!(
+            *column_id, group_output_id,
+            "HAVING computed group key must reference the Aggregate output id"
+        );
+        assert_eq!(
+            column, "abs(a)",
+            "HAVING computed group key ColumnRef must preserve the group expression display name"
         );
     }
 
