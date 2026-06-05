@@ -1373,9 +1373,7 @@ fn from_clause_is_direct_inner_on_join(query: &sqlparser::ast::Query) -> bool {
     )
 }
 
-fn validate_composed_aggregate_fallback_query(
-    query: &sqlparser::ast::Query,
-) -> Result<(), String> {
+fn validate_composed_aggregate_fallback_query(query: &sqlparser::ast::Query) -> Result<(), String> {
     let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
         return Err("composed aggregate fallback requires a plain SELECT body".to_string());
     };

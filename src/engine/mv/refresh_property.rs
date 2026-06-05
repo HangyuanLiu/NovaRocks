@@ -9,8 +9,8 @@
 //! `derive_imv_refresh_contract` delegates here.
 //!
 //! The synthesis MIRRORS the structural acceptance/rejection of the former flat
-//! classifier (non-inner / non-equi joins, non-UNION-ALL set ops, metadata /
-//! delta / generate-series / unnest / CTE relations, DISTINCT, HAVING,
+//! classifier (unsupported join kinds, non-equi inner joins, non-UNION-ALL set
+//! ops, metadata / delta / generate-series / unnest / CTE relations, DISTINCT, HAVING,
 //! ROLLUP/CUBE/GROUPING SETS, ORDER BY / LIMIT / OFFSET, WITH, unsupported /
 //! non-deterministic expressions, etc.) but emits a compositional property
 //! instead of a closed enum of named strategies.
@@ -452,6 +452,12 @@ impl RefreshFragmentProperty {
                 let join_key_count = join_key_count.ok_or_else(|| {
                     "Iceberg IMV refresh contract internal error: join identity without a join key count".to_string()
                 })?;
+                if join_key_count == 0 {
+                    return Err(
+                        "Iceberg IMV refresh contract requires at least one equi-join predicate"
+                            .to_string(),
+                    );
+                }
                 Ok(ImvRefreshContract {
                     base_refs,
                     apply_key: ApplyKeyContract::join_projection_filter(),
@@ -526,11 +532,11 @@ impl RefreshFragmentProperty {
                             branch: Some(BranchRefreshContract { branch_count }),
                         })
                     }
-                    // Aggregate directly over a two-table inner equi-join.
+                    // Aggregate directly over a two-table inner/cross join.
                     (None, Some(join_key_count)) => {
                         if aggregate_input_shape != Some(AggregateInputShape::DirectJoinTree) {
                             return Err(
-                                "Iceberg IMV refresh contract supports aggregate-over-join only when the aggregate input is a direct inner equi-join tree of base scans"
+                                "Iceberg IMV refresh contract supports aggregate-over-join only when the aggregate input is a direct inner/cross join tree of base scans"
                                     .to_string(),
                             );
                         }
@@ -886,25 +892,33 @@ fn derive_from_relation(relation: &Relation) -> Result<RefreshFragmentProperty, 
         }
         Relation::Subquery { query, .. } => derive_fragment_property(query),
         Relation::Join(join) => {
-            if join.join_type != JoinKind::Inner {
+            if !matches!(join.join_type, JoinKind::Inner | JoinKind::Cross) {
                 return Err(
-                    "Iceberg IMV refresh contract supports only two-table inner equi-join shapes"
+                    "Iceberg IMV refresh contract supports only inner/cross join shapes"
                         .to_string(),
                 );
             }
-            let condition = join.condition.as_ref().ok_or_else(|| {
-                "Iceberg IMV refresh contract requires JOIN ... ON equi-join predicates".to_string()
-            })?;
-            let left_qualifiers = relation_qualifiers(&join.left)?;
-            let right_qualifiers = relation_qualifiers(&join.right)?;
-            let join_key_count =
-                count_equality_join_keys(condition, &left_qualifiers, &right_qualifiers)?;
-            if join_key_count == 0 {
-                return Err(
-                    "Iceberg IMV refresh contract requires at least one equi-join predicate"
-                        .to_string(),
-                );
-            }
+            let join_key_count = match join.join_type {
+                JoinKind::Inner => {
+                    let condition = join.condition.as_ref().ok_or_else(|| {
+                        "Iceberg IMV refresh contract requires JOIN ... ON equi-join predicates"
+                            .to_string()
+                    })?;
+                    let left_qualifiers = relation_qualifiers(&join.left)?;
+                    let right_qualifiers = relation_qualifiers(&join.right)?;
+                    let count =
+                        count_equality_join_keys(condition, &left_qualifiers, &right_qualifiers)?;
+                    if count == 0 {
+                        return Err(
+                            "Iceberg IMV refresh contract requires at least one equi-join predicate"
+                                .to_string(),
+                        );
+                    }
+                    count
+                }
+                JoinKind::Cross => 0,
+                _ => unreachable!("join kind checked above"),
+            };
             let left = derive_from_relation(&join.left)?;
             let right = derive_from_relation(&join.right)?;
             let mut base_refs = left.base_refs;
@@ -2000,6 +2014,45 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_over_cross_join_synthesizes_join_aggregate_contract() {
+        let prop = property(
+            "SELECT l.region, count(*) AS c, sum(r.amount) AS s
+             FROM fact_east l CROSS JOIN fact_west r
+             GROUP BY l.region",
+        );
+
+        assert_eq!(
+            prop.identity,
+            TargetIdentity::GroupRowId(vec!["region".to_string()])
+        );
+        assert_eq!(
+            prop.state,
+            StateContract::AggregateState {
+                group_key_count: 1,
+                aggregate_count: 2,
+            }
+        );
+        assert_eq!(
+            base_ref_fqns(&prop),
+            vec!["ice.sales.fact_east", "ice.sales.fact_west"]
+        );
+        assert_eq!(prop.branch_count, None);
+        assert_eq!(prop.join_key_count, Some(0));
+
+        let contract = prop
+            .into_refresh_contract()
+            .expect("cross join aggregate must build a refresh contract");
+        assert_eq!(
+            contract.apply_key,
+            ApplyKeyContract::join_aggregate_group_row()
+        );
+        assert_eq!(
+            contract.join,
+            Some(JoinRefreshContract { join_key_count: 0 })
+        );
+    }
+
+    #[test]
     fn nested_join_projection_does_not_build_refresh_contract() {
         let prop = property(
             "SELECT f.region
@@ -2288,16 +2341,23 @@ mod tests {
             "SELECT l.region, r.amount
              FROM fact_east l LEFT JOIN fact_west r ON l.id = r.id",
         );
-        assert!(err.contains("inner equi-join"), "unexpected error: {err}");
+        assert!(err.contains("inner/cross"), "unexpected error: {err}");
     }
 
     #[test]
     fn rejects_cross_join() {
-        let err = error(
+        let prop = property(
             "SELECT l.region, r.amount
              FROM fact_east l CROSS JOIN fact_west r",
         );
-        assert!(err.contains("inner equi-join"), "unexpected error: {err}");
+
+        let err = prop
+            .into_refresh_contract()
+            .expect_err("cross join projection must stay outside the refresh contract boundary");
+        assert!(
+            err.contains("requires at least one equi-join predicate"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
