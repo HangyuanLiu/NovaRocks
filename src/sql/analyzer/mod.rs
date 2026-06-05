@@ -22,6 +22,7 @@ use arrow::datatypes::DataType;
 use sqlparser::ast as sqlast;
 
 use crate::sql::catalog::CatalogProvider;
+use crate::sql::column_id::ColumnId;
 
 use crate::sql::analysis::{
     ExprKind, JoinKind, JoinRelation, OutputColumn, ProjectItem, QueryBody, Relation,
@@ -1323,13 +1324,6 @@ impl<'a> AnalyzerContext<'a> {
         // Analyze the SELECT once with all GROUP BY keys active.
         let (mut sel, cols) = self.analyze_select(&modified_select)?;
 
-        // Post-analysis fixup: replace GROUPING() marker literals in the
-        // resolved projection with ColumnRef to the virtual slot names.
-        // Markers are Literal(Int(-9000)), Literal(Int(-9001)), etc.
-        // Each maps to grouping_fn_args[marker - (-9000)].
-        for item in &mut sel.projection {
-            item.expr = replace_grouping_markers_in_typed_expr(&item.expr, &grouping_fn_args);
-        }
         // When no GROUPING() calls exist, synthesize one for the first rollup
         // column so that __grouping_fn_0 is always in the GROUP BY.  This
         // ensures ROLLUP levels are distinguishable even when grouped columns
@@ -1340,8 +1334,11 @@ impl<'a> AnalyzerContext<'a> {
         }
         // Also add each GROUPING() virtual column as a GROUP BY key so it
         // passes through the Aggregate operator.
+        let mut grouping_fn_ids: Vec<(String, ColumnId)> =
+            Vec::with_capacity(grouping_fn_args.len());
         for (fn_name, _) in &grouping_fn_args {
             let column_id = self.alloc_column_id(None, fn_name.clone(), DataType::Int64, false);
+            grouping_fn_ids.push((fn_name.clone(), column_id));
             sel.group_by.push(TypedExpr {
                 kind: ExprKind::ColumnRef {
                     column_id,
@@ -1351,6 +1348,18 @@ impl<'a> AnalyzerContext<'a> {
                 data_type: DataType::Int64,
                 nullable: false,
             });
+        }
+
+        // Post-analysis fixup: replace GROUPING() marker literals in the
+        // resolved projection with ColumnRef to the virtual slot names.
+        // Markers are Literal(Int(-9000)), Literal(Int(-9001)), etc.
+        // Each maps to grouping_fn_args[marker - (-9000)].
+        for item in &mut sel.projection {
+            item.expr = replace_grouping_markers_in_typed_expr(
+                &item.expr,
+                &grouping_fn_args,
+                &grouping_fn_ids,
+            );
         }
 
         // Attach RepeatInfo to the resolved SELECT.
@@ -2330,6 +2339,7 @@ fn cube_grouping_sets(groups: &[Vec<sqlast::Expr>]) -> Vec<Vec<sqlast::Expr>> {
 fn replace_grouping_markers_in_typed_expr(
     expr: &TypedExpr,
     grouping_fn_args: &[(String, Vec<String>)],
+    grouping_fn_ids: &[(String, ColumnId)],
 ) -> TypedExpr {
     match &expr.kind {
         ExprKind::Literal(crate::sql::analysis::LiteralValue::Int(v)) if *v <= -9000 => {
@@ -2337,7 +2347,10 @@ fn replace_grouping_markers_in_typed_expr(
             if let Some((fn_name, _)) = grouping_fn_args.get(idx) {
                 return TypedExpr {
                     kind: ExprKind::ColumnRef {
-                        column_id: crate::sql::column_id::ColumnId::UNSET,
+                        column_id: grouping_fn_ids
+                            .get(idx)
+                            .map(|(_, id)| *id)
+                            .expect("grouping_fn id must exist for marker index"),
                         qualifier: None,
                         column: fn_name.clone(),
                     },
@@ -2354,11 +2367,13 @@ fn replace_grouping_markers_in_typed_expr(
                 left: Box::new(replace_grouping_markers_in_typed_expr(
                     left,
                     grouping_fn_args,
+                    grouping_fn_ids,
                 )),
                 op: *op,
                 right: Box::new(replace_grouping_markers_in_typed_expr(
                     right,
                     grouping_fn_args,
+                    grouping_fn_ids,
                 )),
             },
         },
@@ -2370,6 +2385,7 @@ fn replace_grouping_markers_in_typed_expr(
                 expr: Box::new(replace_grouping_markers_in_typed_expr(
                     inner,
                     grouping_fn_args,
+                    grouping_fn_ids,
                 )),
             },
         },
@@ -2383,6 +2399,7 @@ fn replace_grouping_markers_in_typed_expr(
                 expr: Box::new(replace_grouping_markers_in_typed_expr(
                     inner,
                     grouping_fn_args,
+                    grouping_fn_ids,
                 )),
                 target: target.clone(),
             },
@@ -2393,6 +2410,7 @@ fn replace_grouping_markers_in_typed_expr(
             kind: ExprKind::Nested(Box::new(replace_grouping_markers_in_typed_expr(
                 inner,
                 grouping_fn_args,
+                grouping_fn_ids,
             ))),
         },
         ExprKind::WindowCall {
@@ -2410,17 +2428,25 @@ fn replace_grouping_markers_in_typed_expr(
                 name: name.clone(),
                 args: args
                     .iter()
-                    .map(|a| replace_grouping_markers_in_typed_expr(a, grouping_fn_args))
+                    .map(|a| {
+                        replace_grouping_markers_in_typed_expr(a, grouping_fn_args, grouping_fn_ids)
+                    })
                     .collect(),
                 distinct: *distinct,
                 partition_by: partition_by
                     .iter()
-                    .map(|p| replace_grouping_markers_in_typed_expr(p, grouping_fn_args))
+                    .map(|p| {
+                        replace_grouping_markers_in_typed_expr(p, grouping_fn_args, grouping_fn_ids)
+                    })
                     .collect(),
                 order_by: order_by
                     .iter()
                     .map(|ob| SortItem {
-                        expr: replace_grouping_markers_in_typed_expr(&ob.expr, grouping_fn_args),
+                        expr: replace_grouping_markers_in_typed_expr(
+                            &ob.expr,
+                            grouping_fn_args,
+                            grouping_fn_ids,
+                        ),
                         asc: ob.asc,
                         nulls_first: ob.nulls_first,
                     })
@@ -2437,21 +2463,37 @@ fn replace_grouping_markers_in_typed_expr(
             data_type: expr.data_type.clone(),
             nullable: expr.nullable,
             kind: ExprKind::Case {
-                operand: operand
-                    .as_ref()
-                    .map(|o| Box::new(replace_grouping_markers_in_typed_expr(o, grouping_fn_args))),
+                operand: operand.as_ref().map(|o| {
+                    Box::new(replace_grouping_markers_in_typed_expr(
+                        o,
+                        grouping_fn_args,
+                        grouping_fn_ids,
+                    ))
+                }),
                 when_then: when_then
                     .iter()
                     .map(|(w, t)| {
                         (
-                            replace_grouping_markers_in_typed_expr(w, grouping_fn_args),
-                            replace_grouping_markers_in_typed_expr(t, grouping_fn_args),
+                            replace_grouping_markers_in_typed_expr(
+                                w,
+                                grouping_fn_args,
+                                grouping_fn_ids,
+                            ),
+                            replace_grouping_markers_in_typed_expr(
+                                t,
+                                grouping_fn_args,
+                                grouping_fn_ids,
+                            ),
                         )
                     })
                     .collect(),
-                else_expr: else_expr
-                    .as_ref()
-                    .map(|e| Box::new(replace_grouping_markers_in_typed_expr(e, grouping_fn_args))),
+                else_expr: else_expr.as_ref().map(|e| {
+                    Box::new(replace_grouping_markers_in_typed_expr(
+                        e,
+                        grouping_fn_args,
+                        grouping_fn_ids,
+                    ))
+                }),
             },
         },
         _ => expr.clone(),
@@ -4218,6 +4260,53 @@ mod tests {
         } else {
             panic!("expected Select body with RepeatInfo");
         }
+    }
+
+    fn grouping_fn_ids(
+        resolved: &ResolvedQuery,
+    ) -> (
+        crate::sql::column_id::ColumnId,
+        crate::sql::column_id::ColumnId,
+    ) {
+        let QueryBody::Select(sel) = &resolved.body else {
+            panic!("expected Select body");
+        };
+
+        let proj_id = sel
+            .projection
+            .iter()
+            .find_map(|item| match &item.expr.kind {
+                ExprKind::ColumnRef {
+                    column_id, column, ..
+                } if column == "__grouping_fn_0" => Some(*column_id),
+                _ => None,
+            })
+            .expect("expected projection grouping ColumnRef");
+        let gb_id = sel
+            .group_by
+            .iter()
+            .find_map(|expr| match &expr.kind {
+                ExprKind::ColumnRef {
+                    column_id, column, ..
+                } if column == "__grouping_fn_0" => Some(*column_id),
+                _ => None,
+            })
+            .expect("expected group-by grouping ColumnRef");
+
+        (proj_id, gb_id)
+    }
+
+    #[test]
+    fn p1_grouping_marker_carries_group_by_id() {
+        let resolved =
+            parse_and_analyze("SELECT k1, grouping(k1) AS g FROM t1 GROUP BY ROLLUP(k1)")
+                .expect("GROUP BY ROLLUP with GROUPING should work");
+        let (proj_id, gb_id) = grouping_fn_ids(&resolved);
+        assert_ne!(proj_id, crate::sql::column_id::ColumnId::UNSET);
+        assert_eq!(
+            proj_id, gb_id,
+            "projection grouping ref must reuse the group-by key id"
+        );
     }
 
     #[test]
