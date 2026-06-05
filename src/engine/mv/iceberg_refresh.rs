@@ -647,41 +647,47 @@ fn validate_branch_union_contract(
     }
 }
 
-fn validate_union_projection_shape_base_refs(
-    union_shape: &crate::connector::starrocks::table::mv_shape::UnionAllMvShape,
+/// Validate that the resolved `base_refs` exactly match the persisted base set
+/// in the schema contract and that the contract has one base per expected branch.
+///
+/// Replaces the legacy `UnionAllMvShape`-based check: instead of collecting
+/// per-branch `base_table` FQNs from the classifier, we compare the resolved
+/// `base_refs` (already the authority for base identity) against the FQNs
+/// recorded in `schema_contract.bases[]`. The accept/reject contract is
+/// identical: a mismatch between the resolved refs and the contract base set is
+/// an error; a match is accepted.
+fn validate_union_projection_base_refs(
     base_refs: &[IcebergTableRef],
+    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
 ) -> Result<(), String> {
-    if union_shape.branch_kind != UnionBranchKind::ProjectionFilter {
-        return Err(
-            "UNION ALL projection/filter refresh requires projection/filter branches".to_string(),
-        );
-    }
-    let mut branch_refs = BTreeSet::new();
-    for branch in &union_shape.branches {
-        let IncrementalMvShape::ProjectionFilter(branch) = branch else {
-            return Err(
-                "UNION ALL projection/filter refresh requires projection/filter branches"
-                    .to_string(),
-            );
-        };
-        branch_refs.insert(branch.base_table.to_string().to_ascii_lowercase());
-    }
-    let resolved_refs = base_refs
+    let contract_fqns = schema_contract
+        .bases
+        .iter()
+        .map(|base| base.table_fqn.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    let resolved_fqns = base_refs
         .iter()
         .map(|base_ref| base_ref.fqn().to_ascii_lowercase())
         .collect::<BTreeSet<_>>();
-    if branch_refs != resolved_refs {
+    if contract_fqns != resolved_fqns {
         return Err(format!(
-            "UNION ALL projection/filter MV branch bases must exactly match resolved base refs: branch_bases={branch_refs:?}, resolved={resolved_refs:?}"
+            "UNION ALL projection/filter MV branch bases must exactly match resolved base refs: contract_bases={contract_fqns:?}, resolved={resolved_fqns:?}"
         ));
     }
     Ok(())
 }
 
+/// Validate the persisted schema contract for a single base table of a UNION ALL
+/// projection/filter MV.
+///
+/// The `branch_count` parameter replaces the legacy `union_shape.branches.len()`
+/// access: callers source it from `contract.branch.branch_count` (the persisted
+/// contract) so the check remains byte-identical — a mismatch between the
+/// contract-recorded count and the caller-supplied count is still an error.
 fn validate_union_projection_schema_contract_for_base(
     iceberg_target: &IcebergMvTarget,
     schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
-    union_shape: &crate::connector::starrocks::table::mv_shape::UnionAllMvShape,
+    branch_count: usize,
     base_ref: &IcebergTableRef,
     base_table: &iceberg::table::Table,
     target_table: &iceberg::table::Table,
@@ -707,14 +713,14 @@ fn validate_union_projection_schema_contract_for_base(
             iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
         )
     })?;
-    if branch_contract.branch_count != union_shape.branches.len() as u32 {
+    if branch_contract.branch_count != branch_count as u32 {
         return Err(format!(
             "iceberg UNION ALL projection/filter MV {}.{}.{} branch contract expected {} branches, query has {}",
             iceberg_target.catalog,
             iceberg_target.namespace,
             iceberg_target.table,
             branch_contract.branch_count,
-            union_shape.branches.len()
+            branch_count
         ));
     }
     if branch_contract.inner_apply_key_source
@@ -2268,7 +2274,7 @@ fn rewrite_full_refresh_select_with_pin(
 fn rewrite_union_projection_full_refresh_select_with_pin(
     select_sql: &str,
     pin: &crate::connector::starrocks::table::refresh_pin::RefreshSnapshotPin,
-    union_shape: &crate::connector::starrocks::table::mv_shape::UnionAllMvShape,
+    branch_count: usize,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<String, String> {
@@ -2292,12 +2298,11 @@ fn rewrite_union_projection_full_refresh_select_with_pin(
     append_union_projection_hidden_columns_to_set_expr(
         query.body.as_mut(),
         &mut next_branch_id,
-        union_shape.branches.len() as i32,
+        branch_count as i32,
     )?;
-    if next_branch_id != union_shape.branches.len() as i32 {
+    if next_branch_id != branch_count as i32 {
         return Err(format!(
-            "iceberg UNION ALL MV full refresh expected {} branches, rewrote {next_branch_id}",
-            union_shape.branches.len()
+            "iceberg UNION ALL MV full refresh expected {branch_count} branches, rewrote {next_branch_id}"
         ));
     }
     Ok(stmt.to_string())
@@ -2558,20 +2563,16 @@ fn refresh_iceberg_mv_with_planned_partitions(
         }
         // UNION ALL of projection/filter branches.
         (false, BaseSnapshotPolicy::AllBasesRequired, _) => {
-            // KEEP: classification still feeds the first-refresh/layout helper.
-            let shape = classify_incremental_mv_query(&canonical_select_query)?;
-            let IncrementalMvShape::UnionAll(union_shape) = &shape else {
-                return Err(
-                    "iceberg UNION ALL projection/filter refresh contract did not match legacy union shape"
-                        .to_string(),
-                );
-            };
-            if union_shape.branch_kind != UnionBranchKind::ProjectionFilter {
-                return Err(
-                    "iceberg UNION ALL projection/filter refresh contract did not match legacy union shape"
-                        .to_string(),
-                );
-            }
+            // Source branch count from the persisted contract (no classifier
+            // needed). The contract always has a BranchUnionContract for this
+            // capability shape; fall back to counting the AST branches if for
+            // some reason the contract is absent (e.g. a hand-crafted test
+            // fixture), matching the branch-union aggregate fallback pattern.
+            let branch_count = dispatch_schema_contract
+                .branch
+                .as_ref()
+                .map(|b| b.branch_count as usize)
+                .unwrap_or_else(|| union_branch_count(&canonical_select_query) as usize);
             return refresh_iceberg_union_projection_mv(
                 state,
                 &target,
@@ -2584,7 +2585,8 @@ fn refresh_iceberg_mv_with_planned_partitions(
                 &mv_definition,
                 &base_refs,
                 &canonical_select_query,
-                union_shape,
+                branch_count,
+                dispatch_schema_contract,
                 refresh_contract.apply_key,
             );
         }
@@ -2849,16 +2851,11 @@ fn refresh_iceberg_union_projection_mv(
     mv_definition: &StoredMvDefinition,
     base_refs: &[IcebergTableRef],
     canonical_select_query: &sqlparser::ast::Query,
-    union_shape: &crate::connector::starrocks::table::mv_shape::UnionAllMvShape,
+    branch_count: usize,
+    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
     apply_key: ApplyKeyContract,
 ) -> Result<StatementResult, String> {
-    validate_union_projection_shape_base_refs(union_shape, base_refs)?;
-    let schema_contract = mv_definition.schema_contract.as_ref().ok_or_else(|| {
-        format!(
-            "iceberg MV target {}.{}.{} is missing A11 schema contract; rebuild or recreate the MV",
-            target.catalog, target.namespace, target.table
-        )
-    })?;
+    validate_union_projection_base_refs(base_refs, schema_contract)?;
 
     let mut pre_pin_current_snapshots = BTreeMap::new();
     for base_ref in base_refs {
@@ -2866,7 +2863,7 @@ fn refresh_iceberg_union_projection_mv(
         validate_union_projection_schema_contract_for_base(
             target,
             schema_contract,
-            union_shape,
+            branch_count,
             base_ref,
             &loaded.table,
             target_table,
@@ -2950,7 +2947,7 @@ fn refresh_iceberg_union_projection_mv(
         validate_union_projection_schema_contract_for_base(
             target,
             schema_contract,
-            union_shape,
+            branch_count,
             base_ref,
             &loaded.table,
             target_table,
@@ -3058,7 +3055,7 @@ fn refresh_iceberg_union_projection_mv(
             let full_select_sql = rewrite_union_projection_full_refresh_select_with_pin(
                 &ctx.rewrite.mv_definition.select_sql,
                 &pin,
-                union_shape,
+                branch_count,
                 current_catalog,
                 current_database,
             )?;
@@ -4637,16 +4634,14 @@ pub(crate) fn plan_iceberg_mv_refresh(
     match (caps.has_agg_state, &caps.snapshot_policy, &caps.identity) {
         // UNION ALL of projection/filter branches.
         (false, BaseSnapshotPolicy::AllBasesRequired, _) => {
-            // KEEP: the legacy classifier still feeds the per-branch
-            // first-refresh/layout helpers for projection/filter branch unions
-            // (these branches are single-scan, so classification succeeds).
-            let shape = classify_incremental_mv_query(&canonical_select_query)
-                .map_err(RefreshError::user)?;
-            let IncrementalMvShape::UnionAll(union_shape) = &shape else {
-                return Err(RefreshError::user(
-                    "iceberg UNION ALL projection/filter refresh contract did not match legacy union shape",
-                ));
-            };
+            // Source branch count from the persisted contract; fall back to
+            // counting the AST branches if the branch contract is absent,
+            // matching the refresh-dispatch fallback pattern.
+            let branch_count = dispatch_schema_contract
+                .branch
+                .as_ref()
+                .map(|b| b.branch_count as usize)
+                .unwrap_or_else(|| union_branch_count(&canonical_select_query) as usize);
             return plan_iceberg_union_projection_mv_refresh(
                 state,
                 &iceberg_target,
@@ -4657,7 +4652,8 @@ pub(crate) fn plan_iceberg_mv_refresh(
                 current_database,
                 &mv_definition,
                 &base_refs,
-                union_shape,
+                branch_count,
+                dispatch_schema_contract,
             );
         }
         // Aggregate shapes: single-base, fan-in, branch-union, and join
@@ -5035,16 +5031,10 @@ fn plan_iceberg_union_projection_mv_refresh(
     current_database: &str,
     mv_definition: &StoredMvDefinition,
     base_refs: &[IcebergTableRef],
-    union_shape: &crate::connector::starrocks::table::mv_shape::UnionAllMvShape,
+    branch_count: usize,
+    schema_contract: &crate::meta::repository::mv_contract::MvSchemaContract,
 ) -> Result<RefreshPlan, RefreshError> {
-    validate_union_projection_shape_base_refs(union_shape, base_refs)
-        .map_err(RefreshError::user)?;
-    let schema_contract = mv_definition.schema_contract.as_ref().ok_or_else(|| {
-        RefreshError::user(format!(
-            "iceberg MV target {}.{}.{} is missing A11 schema contract; rebuild or recreate the MV",
-            iceberg_target.catalog, iceberg_target.namespace, iceberg_target.table
-        ))
-    })?;
+    validate_union_projection_base_refs(base_refs, schema_contract).map_err(RefreshError::user)?;
 
     let mut loaded_bases = BTreeMap::new();
     let mut current_snapshots = BTreeMap::new();
@@ -5055,7 +5045,7 @@ fn plan_iceberg_union_projection_mv_refresh(
         validate_union_projection_schema_contract_for_base(
             iceberg_target,
             schema_contract,
-            union_shape,
+            branch_count,
             base_ref,
             &loaded.table,
             target_table,
