@@ -185,6 +185,11 @@ pub(crate) fn create_iceberg_mv(
             }
         }
     }
+    if matches!(stmt.partition_by.as_deref(), Some(fields) if !fields.is_empty())
+        && property.is_composed_aggregate_schema_contract_fallback()
+    {
+        return Err("partitioned composed aggregate Iceberg MV is not supported".to_string());
+    }
 
     // 2. Create the empty Iceberg v3 target table in the current catalog.
     let apply_key_column_name = refresh_contract.apply_key.column_name;
@@ -1351,6 +1356,112 @@ fn from_clause_is_fan_in_union(query: &sqlparser::ast::Query) -> bool {
     )
 }
 
+fn from_clause_is_direct_inner_on_join(query: &sqlparser::ast::Query) -> bool {
+    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return false;
+    };
+    let [from] = select.from.as_slice() else {
+        return false;
+    };
+    let [join] = from.joins.as_slice() else {
+        return false;
+    };
+    matches!(
+        join.join_operator,
+        sqlparser::ast::JoinOperator::Join(sqlparser::ast::JoinConstraint::On(_))
+            | sqlparser::ast::JoinOperator::Inner(sqlparser::ast::JoinConstraint::On(_))
+    )
+}
+
+fn validate_composed_aggregate_fallback_query(
+    query: &sqlparser::ast::Query,
+) -> Result<(), String> {
+    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return Err("composed aggregate fallback requires a plain SELECT body".to_string());
+    };
+    if select.from.len() != 1 {
+        return Err(
+            "composed aggregate fallback requires a single direct FROM join tree".to_string(),
+        );
+    }
+    let from = &select.from[0];
+    if from.joins.is_empty() {
+        return Err(
+            "composed aggregate fallback requires the aggregate input to be a direct join tree"
+                .to_string(),
+        );
+    }
+    validate_composed_aggregate_table_factor(&from.relation)?;
+    for join in &from.joins {
+        validate_composed_aggregate_join_operator(&join.join_operator)?;
+        validate_composed_aggregate_table_factor(&join.relation)?;
+    }
+    Ok(())
+}
+
+fn validate_composed_aggregate_table_factor(
+    factor: &sqlparser::ast::TableFactor,
+) -> Result<(), String> {
+    match factor {
+        sqlparser::ast::TableFactor::Table { .. } => Ok(()),
+        sqlparser::ast::TableFactor::NestedJoin { table_with_joins, .. } => {
+            validate_composed_aggregate_table_factor(&table_with_joins.relation)?;
+            if table_with_joins.joins.is_empty() {
+                return Err(
+                    "composed aggregate fallback nested join must contain at least one join"
+                        .to_string(),
+                );
+            }
+            for join in &table_with_joins.joins {
+                validate_composed_aggregate_join_operator(&join.join_operator)?;
+                validate_composed_aggregate_table_factor(&join.relation)?;
+            }
+            Ok(())
+        }
+        _ => Err(
+            "composed aggregate fallback supports only direct base-table joins, not subqueries or table functions"
+                .to_string(),
+        ),
+    }
+}
+
+fn validate_composed_aggregate_join_operator(
+    operator: &sqlparser::ast::JoinOperator,
+) -> Result<(), String> {
+    use sqlparser::ast::{JoinConstraint, JoinOperator};
+
+    match operator {
+        JoinOperator::Join(JoinConstraint::On(_)) | JoinOperator::Inner(JoinConstraint::On(_)) => {
+            Ok(())
+        }
+        JoinOperator::CrossJoin(JoinConstraint::None) => Ok(()),
+        _ => Err(
+            "composed aggregate fallback supports only direct INNER JOIN ... ON predicates or CROSS JOIN"
+                .to_string(),
+        ),
+    }
+}
+
+fn mixed_output_contract(
+    output_columns: &[crate::sql::analysis::OutputColumn],
+) -> crate::meta::repository::mv_contract::OutputContract {
+    crate::meta::repository::mv_contract::OutputContract {
+        columns: output_columns
+            .iter()
+            .map(
+                |_| crate::meta::repository::mv_contract::OutputColumnLineage {
+                    expression: crate::meta::repository::mv_contract::ExpressionLineage {
+                        kind: crate::meta::repository::mv_contract::ExpressionKind::Mixed,
+                        referenced_base_field_ids: Vec::new(),
+                        referenced_base_fields: Vec::new(),
+                    },
+                },
+            )
+            .collect(),
+        filter: None,
+    }
+}
+
 /// Build the aggregate-group-row contract core, dispatching on whether the
 /// aggregate sits over a single scan, a join, or a fan-in union. Reproduces the
 /// legacy SingleAggregate / JoinAggregate / FanInAggregate arms.
@@ -1387,9 +1498,9 @@ fn build_aggregate_contract_core(
     // narrowing) is still derived from the resolved AST inside
     // `build_join_base_contracts_and_lineage`; the join-alias extractor supplies
     // only the (table FQN, qualifier) pairs.
-    if let Ok(join_aliases) =
-        crate::connector::starrocks::table::aggregate_sql_calls::extract_join_aliases(query)
-    {
+    if from_clause_is_direct_inner_on_join(query) {
+        let join_aliases =
+            crate::connector::starrocks::table::aggregate_sql_calls::extract_join_aliases(query)?;
         // Aggregate over a two-table inner equi-join (legacy JoinAggregate).
         let (left_contract, right_contract, join) =
             build_join_base_contracts_and_lineage(&join_aliases, resolved_query, loaded_bases)?;
@@ -1456,6 +1567,26 @@ fn build_aggregate_contract_core(
                     .collect(),
                 filter: None,
             },
+            join: None,
+            aggregate: Some(aggregate_contract(&layout, target_loaded)?),
+        })
+    } else if loaded_bases.len() > 1 {
+        validate_composed_aggregate_fallback_query(query)?;
+        let bases = loaded_bases
+            .iter()
+            .map(|(base_ref, loaded_base)| {
+                base_contract(
+                    base_ref,
+                    loaded_base,
+                    None,
+                    base_fields_from_current_schema(loaded_base.table.metadata().current_schema()),
+                )
+            })
+            .collect::<Vec<_>>();
+        Ok(NonBranchContractCore {
+            contract_version: 3,
+            bases,
+            output: mixed_output_contract(&analysis.output_columns),
             join: None,
             aggregate: Some(aggregate_contract(&layout, target_loaded)?),
         })
@@ -3210,24 +3341,34 @@ fn refresh_iceberg_aggregate_mv(
     // aggregate-call surface comes from the focused extractor; the join sub-arm
     // additionally consumes the join aliases for base-ref matching.
     match &caps.snapshot_policy {
-        BaseSnapshotPolicy::AllBasesRequired => refresh_fan_in_aggregate_iceberg_mv(
-            state,
-            target,
-            target_entry,
-            iceberg_catalog,
-            target_table,
-            expected_main_snapshot_id,
-            current_catalog,
-            current_database,
-            mv_definition,
-            base_refs,
-            AllBasesAggregateRefresh::FanIn {
-                schema_contract,
-                aggregate_calls,
-            },
-            apply_key,
-            planned_affected_partitions,
-        ),
+        BaseSnapshotPolicy::AllBasesRequired => {
+            let refresh = if apply_key.rewrite_evidence == RewriteEvidence::JoinAggregate {
+                AllBasesAggregateRefresh::ComposedJoinAggregate {
+                    schema_contract,
+                    aggregate_calls,
+                }
+            } else {
+                AllBasesAggregateRefresh::FanIn {
+                    schema_contract,
+                    aggregate_calls,
+                }
+            };
+            refresh_fan_in_aggregate_iceberg_mv(
+                state,
+                target,
+                target_entry,
+                iceberg_catalog,
+                target_table,
+                expected_main_snapshot_id,
+                current_catalog,
+                current_database,
+                mv_definition,
+                base_refs,
+                refresh,
+                apply_key,
+                planned_affected_partitions,
+            )
+        }
         BaseSnapshotPolicy::SingleBase => refresh_single_aggregate_iceberg_mv(
             state,
             target,
@@ -3551,6 +3692,15 @@ enum AllBasesAggregateRefresh<'a> {
         aggregate_calls:
             &'a crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls,
     },
+    /// Aggregate over a composed multi-base relation, such as a nested join or
+    /// a zero-key CROSS JOIN. The change stream still uses the aggregate
+    /// rewrite-merge path; the apply-key evidence decides whether join-delta
+    /// proof is required.
+    ComposedJoinAggregate {
+        schema_contract: &'a crate::meta::repository::mv_contract::MvSchemaContract,
+        aggregate_calls:
+            &'a crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls,
+    },
     /// UNION ALL of aggregate branches (`BranchScoped` identity): the union sits
     /// above per-branch aggregates and the first refresh injects `__branch_id__`.
     /// The per-branch aggregate-call model is sourced from the focused extractor
@@ -3599,6 +3749,10 @@ fn refresh_fan_in_aggregate_iceberg_mv(
             validate_aggregate_fan_in_base_refs(base_refs)?;
             *schema_contract
         }
+        AllBasesAggregateRefresh::ComposedJoinAggregate {
+            schema_contract,
+            aggregate_calls: _,
+        } => *schema_contract,
         AllBasesAggregateRefresh::BranchUnion {
             branch_count,
             first_branch_calls: _,
@@ -3612,6 +3766,7 @@ fn refresh_fan_in_aggregate_iceberg_mv(
     };
     let refresh_kind_label = match &refresh {
         AllBasesAggregateRefresh::FanIn { .. } => "aggregate-over-UNION-ALL",
+        AllBasesAggregateRefresh::ComposedJoinAggregate { .. } => "composed join aggregate",
         AllBasesAggregateRefresh::BranchUnion { .. } => "branch UNION ALL aggregate",
     };
 
@@ -3799,6 +3954,15 @@ fn refresh_fan_in_aggregate_iceberg_mv(
             // per branch, fan-in runs the single aggregate select.
             match &refresh {
                 AllBasesAggregateRefresh::FanIn {
+                    aggregate_calls, ..
+                } => first_refresh_iceberg_aggregate_mv(
+                    state,
+                    &ctx,
+                    &staging_branch,
+                    refresh_id,
+                    aggregate_calls,
+                ),
+                AllBasesAggregateRefresh::ComposedJoinAggregate {
                     aggregate_calls, ..
                 } => first_refresh_iceberg_aggregate_mv(
                     state,
@@ -5247,11 +5411,16 @@ fn plan_iceberg_all_bases_aggregate_mv_refresh(
     // fan-in variant validates the resolved base-ref set directly (the resolved
     // bases ARE the fan-in base set now that the classifier is retired).
     let is_branch_union = matches!(caps.identity, RefreshIdentity::BranchScoped(_));
+    let is_composed_join_aggregate =
+        !is_branch_union && !from_clause_is_fan_in_union(canonical_select_query);
     if is_branch_union {
         let branch_count = union_branch_count(canonical_select_query) as usize;
         validate_branch_union_contract(iceberg_target, schema_contract, branch_count, target_table)
             .map_err(RefreshError::user)?;
         validate_branch_union_aggregate_base_refs(base_refs).map_err(RefreshError::user)?;
+    } else if is_composed_join_aggregate {
+        validate_composed_aggregate_fallback_query(canonical_select_query)
+            .map_err(RefreshError::user)?;
     } else {
         validate_aggregate_fan_in_base_refs(base_refs).map_err(RefreshError::user)?;
     }
@@ -5277,6 +5446,8 @@ fn plan_iceberg_all_bases_aggregate_mv_refresh(
     let previous_snapshots = &mv_definition.last_refresh_snapshots;
     let refresh_kind_label = if is_branch_union {
         "branch UNION ALL aggregate"
+    } else if is_composed_join_aggregate {
+        "composed join aggregate"
     } else {
         "aggregate-over-UNION-ALL"
     };

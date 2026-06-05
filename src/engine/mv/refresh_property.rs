@@ -317,6 +317,13 @@ enum BranchShape {
     Composed,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AggregateInputShape {
+    DirectScan,
+    DirectJoinTree,
+    UnionAll,
+}
+
 /// The synthesized capability property of a refresh fragment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RefreshFragmentProperty {
@@ -348,6 +355,11 @@ pub(crate) struct RefreshFragmentProperty {
     /// [`RefreshFragmentProperty::into_refresh_contract`]). Private: it is an
     /// internal narrowing input and is not read by property consumers.
     branch_shape: Option<BranchShape>,
+    /// The direct input shape of an aggregate SELECT. This is intentionally
+    /// stricter than `(join_key_count, base_refs.len())`: a subquery-wrapped join
+    /// may synthesize the same public property as a direct join tree, but it is
+    /// outside the executable IMV boundary.
+    aggregate_input_shape: Option<AggregateInputShape>,
 }
 
 impl RefreshFragmentProperty {
@@ -423,6 +435,7 @@ impl RefreshFragmentProperty {
             branch_count,
             join_key_count,
             branch_shape,
+            aggregate_input_shape,
         } = self;
 
         match (&identity, &state) {
@@ -514,13 +527,21 @@ impl RefreshFragmentProperty {
                         })
                     }
                     // Aggregate directly over a two-table inner equi-join.
-                    (None, Some(join_key_count)) => Ok(ImvRefreshContract {
-                        base_refs,
-                        apply_key: ApplyKeyContract::join_aggregate_group_row(),
-                        aggregate: Some(aggregate),
-                        join: Some(JoinRefreshContract { join_key_count }),
-                        branch: None,
-                    }),
+                    (None, Some(join_key_count)) => {
+                        if aggregate_input_shape != Some(AggregateInputShape::DirectJoinTree) {
+                            return Err(
+                                "Iceberg IMV refresh contract supports aggregate-over-join only when the aggregate input is a direct inner equi-join tree of base scans"
+                                    .to_string(),
+                            );
+                        }
+                        Ok(ImvRefreshContract {
+                            base_refs,
+                            apply_key: ApplyKeyContract::join_aggregate_group_row(),
+                            aggregate: Some(aggregate),
+                            join: Some(JoinRefreshContract { join_key_count }),
+                            branch: None,
+                        })
+                    }
                     // Aggregate directly over a single scan.
                     (None, None) => Ok(ImvRefreshContract {
                         base_refs,
@@ -624,6 +645,16 @@ impl RefreshFragmentProperty {
             return Some(branch_count);
         }
         if self.join_key_count.is_some() {
+            if matches!(
+                (&self.identity, &self.state),
+                (
+                    TargetIdentity::GroupRowId(_),
+                    StateContract::AggregateState { .. }
+                )
+            ) && self.aggregate_input_shape == Some(AggregateInputShape::DirectJoinTree)
+            {
+                return Some(self.base_refs.len());
+            }
             return Some(2);
         }
         Some(1)
@@ -650,6 +681,19 @@ impl RefreshFragmentProperty {
             // legacy classifier rejected such UNION ALL branches.
             _ => BranchShape::Composed,
         }
+    }
+
+    pub(crate) fn is_composed_aggregate_schema_contract_fallback(&self) -> bool {
+        matches!(
+            (&self.identity, &self.state),
+            (
+                TargetIdentity::GroupRowId(_),
+                StateContract::AggregateState { .. }
+            )
+        ) && self.branch_count.is_none()
+            && self.join_key_count.is_some()
+            && self.aggregate_input_shape == Some(AggregateInputShape::DirectJoinTree)
+            && self.base_refs.len() > 2
     }
 }
 
@@ -744,6 +788,7 @@ fn derive_from_select(select: &ResolvedSelect) -> Result<RefreshFragmentProperty
             );
         }
         let child = derive_from_optional_relation(select.from.as_ref())?;
+        let aggregate_input_shape = classify_aggregate_input_shape(select.from.as_ref(), &child)?;
         let group_key_output_names = group_key_output_names(select);
         Ok(RefreshFragmentProperty {
             identity: TargetIdentity::GroupRowId(group_key_output_names),
@@ -762,6 +807,7 @@ fn derive_from_select(select: &ResolvedSelect) -> Result<RefreshFragmentProperty
             // contract mapping's fan-in arm uses it to admit only a fan-in over
             // a union of plain scans (legacy `FanInAggregate`).
             branch_shape: child.branch_shape,
+            aggregate_input_shape: Some(aggregate_input_shape),
         })
     } else {
         validate_projection_filter_exprs(select)?;
@@ -793,6 +839,37 @@ fn derive_from_optional_relation(
     derive_from_relation(relation)
 }
 
+fn classify_aggregate_input_shape(
+    relation: Option<&Relation>,
+    child: &RefreshFragmentProperty,
+) -> Result<AggregateInputShape, String> {
+    if matches!(child.state, StateContract::AggregateState { .. }) {
+        return Err(
+            "Iceberg IMV refresh contract does not support aggregate over aggregate subqueries"
+                .to_string(),
+        );
+    }
+    if child.branch_count.is_some() {
+        return Ok(AggregateInputShape::UnionAll);
+    }
+
+    match relation {
+        Some(Relation::Scan(_)) => Ok(AggregateInputShape::DirectScan),
+        Some(Relation::Join(_)) => Ok(AggregateInputShape::DirectJoinTree),
+        Some(Relation::Subquery { .. }) => Err(
+            "Iceberg IMV refresh contract supports aggregate inputs only over direct base scans, direct inner equi-join trees, or supported UNION ALL fan-in"
+                .to_string(),
+        ),
+        Some(other) => Err(format!(
+            "Iceberg IMV refresh contract does not support aggregate input relation {other:?}"
+        )),
+        None => Err(
+            "Iceberg IMV refresh contract requires aggregate queries to read from a base relation"
+                .to_string(),
+        ),
+    }
+}
+
 fn derive_from_relation(relation: &Relation) -> Result<RefreshFragmentProperty, String> {
     match relation {
         Relation::Scan(scan) => {
@@ -804,6 +881,7 @@ fn derive_from_relation(relation: &Relation) -> Result<RefreshFragmentProperty, 
                 branch_count: None,
                 join_key_count: None,
                 branch_shape: None,
+                aggregate_input_shape: None,
             })
         }
         Relation::Subquery { query, .. } => derive_fragment_property(query),
@@ -843,6 +921,7 @@ fn derive_from_relation(relation: &Relation) -> Result<RefreshFragmentProperty, 
                 branch_count: None,
                 join_key_count: Some(join_key_count),
                 branch_shape: None,
+                aggregate_input_shape: None,
             })
         }
         Relation::IcebergMetadataScan(_)
@@ -995,6 +1074,7 @@ fn derive_from_set_operation(set_op: &ResolvedSetOp) -> Result<RefreshFragmentPr
         // key count under a branch scope.
         join_key_count: None,
         branch_shape: Some(branch_shape),
+        aggregate_input_shape: None,
     })
 }
 
@@ -1639,6 +1719,11 @@ fn relation_qualifiers(relation: &Relation) -> Result<Vec<String>, String> {
                 .unwrap_or_else(|| scan.table.name.clone())
                 .to_ascii_lowercase(),
         ]),
+        Relation::Join(join) => {
+            let mut qualifiers = relation_qualifiers(&join.left)?;
+            qualifiers.extend(relation_qualifiers(&join.right)?);
+            Ok(qualifiers)
+        }
         _ => Err(
             "Iceberg IMV refresh contract supports join keys only over direct scan inputs"
                 .to_string(),
@@ -1721,7 +1806,6 @@ fn join_key_side(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::QueryBody;
     use crate::sql::catalog::{
         CatalogProvider, ColumnDef, IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo,
         ScanSource, TableDef,
@@ -1856,6 +1940,98 @@ mod tests {
             vec!["ice.sales.fact_east", "ice.sales.fact_west"]
         );
         assert_eq!(prop.branch_count, None);
+    }
+
+    #[test]
+    fn aggregate_over_nested_join_synthesizes_join_aggregate_contract() {
+        let prop = property(
+            "SELECT d2.region, count(*) AS c, sum(f.amount) AS s
+             FROM fact_a f
+             JOIN fact_b d ON f.id = d.id
+             JOIN fact_c d2 ON d.region = d2.region
+             GROUP BY d2.region",
+        );
+
+        assert_eq!(
+            prop.identity,
+            TargetIdentity::GroupRowId(vec!["region".to_string()])
+        );
+        assert_eq!(
+            prop.state,
+            StateContract::AggregateState {
+                group_key_count: 1,
+                aggregate_count: 2,
+            }
+        );
+        assert_eq!(
+            base_ref_fqns(&prop),
+            vec!["ice.sales.fact_a", "ice.sales.fact_b", "ice.sales.fact_c"]
+        );
+        assert_eq!(prop.branch_count, None);
+        assert_eq!(prop.join_key_count, Some(1));
+
+        let contract = prop
+            .into_refresh_contract()
+            .expect("nested join aggregate must build a refresh contract");
+        assert_eq!(
+            contract.apply_key,
+            ApplyKeyContract::join_aggregate_group_row()
+        );
+        assert_eq!(
+            contract.aggregate,
+            Some(AggregateRefreshContract {
+                group_key_count: 1,
+                aggregate_count: 2,
+            })
+        );
+        assert_eq!(
+            contract.join,
+            Some(JoinRefreshContract { join_key_count: 1 })
+        );
+        assert_eq!(contract.branch, None);
+        assert_eq!(
+            contract
+                .base_refs
+                .iter()
+                .map(IcebergTableRef::fqn)
+                .collect::<Vec<_>>(),
+            vec!["ice.sales.fact_a", "ice.sales.fact_b", "ice.sales.fact_c"]
+        );
+    }
+
+    #[test]
+    fn nested_join_projection_does_not_build_refresh_contract() {
+        let prop = property(
+            "SELECT f.region
+             FROM fact_a f
+             JOIN fact_b d ON f.id = d.id
+             JOIN fact_c d2 ON d.region = d2.region",
+        );
+
+        assert_eq!(
+            prop.identity,
+            TargetIdentity::JoinRowKey(
+                Box::new(TargetIdentity::JoinRowKey(
+                    Box::new(TargetIdentity::BaseRowId),
+                    Box::new(TargetIdentity::BaseRowId),
+                )),
+                Box::new(TargetIdentity::BaseRowId),
+            )
+        );
+        assert_eq!(prop.state, StateContract::Stateless);
+        assert_eq!(
+            base_ref_fqns(&prop),
+            vec!["ice.sales.fact_a", "ice.sales.fact_b", "ice.sales.fact_c"]
+        );
+        assert_eq!(prop.join_key_count, Some(1));
+
+        let err = prop
+            .into_refresh_contract()
+            .expect_err("nested join projection must stay outside the refresh contract boundary");
+        assert!(
+            err.contains("requires 2 distinct Iceberg base table refs"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -2227,6 +2403,41 @@ mod tests {
         );
         assert!(
             err.contains("projection/filter over aggregate subqueries"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_aggregate_over_aggregate_subquery() {
+        let err = error(
+            "SELECT region, sum(s) AS total_s
+             FROM (
+                 SELECT d.region, sum(f.amount) AS s
+                 FROM fact_a f JOIN fact_b d ON f.id = d.id
+                 GROUP BY d.region
+             ) g
+             GROUP BY region",
+        );
+        assert!(
+            err.contains("aggregate over aggregate subqueries"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_aggregate_over_subquery_wrapped_join() {
+        let err = error(
+            "SELECT j.region, count(*) AS c
+             FROM (
+                 SELECT d2.region
+                 FROM fact_a f
+                 JOIN fact_b d ON f.id = d.id
+                 JOIN fact_c d2 ON d.region = d2.region
+             ) j
+             GROUP BY j.region",
+        );
+        assert!(
+            err.contains("aggregate inputs only over direct base scans"),
             "unexpected error: {err}"
         );
     }
