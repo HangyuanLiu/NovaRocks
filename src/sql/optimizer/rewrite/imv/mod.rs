@@ -14,6 +14,7 @@ pub(crate) mod branch_union;
 pub(crate) mod delta_pushdown;
 pub(crate) mod entrypoint;
 pub(crate) mod join_delta;
+pub(crate) mod join_delta_shape;
 pub(crate) mod marker;
 pub(crate) mod pipeline;
 pub(crate) mod row_id_column;

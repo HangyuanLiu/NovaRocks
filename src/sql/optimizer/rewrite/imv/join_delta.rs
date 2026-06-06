@@ -11,7 +11,7 @@ use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
 use crate::sql::planner::plan::{JoinNode, LogicalPlan, ProjectNode, UnionNode};
 
-pub(crate) struct RewriteJoinAggregateDeltaRule;
+pub(crate) struct RewriteJoinDeltaRule;
 
 pub(crate) fn join_delta_kind_supported(kind: crate::sql::analysis::JoinKind) -> bool {
     matches!(
@@ -20,9 +20,9 @@ pub(crate) fn join_delta_kind_supported(kind: crate::sql::analysis::JoinKind) ->
     )
 }
 
-impl LogicalRewriteRule for RewriteJoinAggregateDeltaRule {
+impl LogicalRewriteRule for RewriteJoinDeltaRule {
     fn name(&self) -> &'static str {
-        "RewriteJoinAggregateDelta"
+        "RewriteJoinDelta"
     }
 
     fn phase(&self) -> RewritePhase {
@@ -36,13 +36,7 @@ impl LogicalRewriteRule for RewriteJoinAggregateDeltaRule {
     fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
         matches!(
             plan,
-            LogicalPlan::ImvDelta(delta)
-                if delta.is_root
-                    && matches!(
-                        delta.input.as_ref(),
-                        LogicalPlan::Aggregate(aggregate)
-                            if matches!(aggregate.input.as_ref(), LogicalPlan::Join(_))
-                    )
+            LogicalPlan::ImvDelta(delta) if matches!(delta.input.as_ref(), LogicalPlan::Join(_))
         )
     }
 
@@ -50,20 +44,13 @@ impl LogicalRewriteRule for RewriteJoinAggregateDeltaRule {
         let LogicalPlan::ImvDelta(delta) = plan else {
             return Ok(RewriteResult::Unchanged);
         };
-        if !delta.is_root {
-            return Ok(RewriteResult::Unchanged);
-        }
-        let branch_scope = delta.branch_scope;
-        let LogicalPlan::Aggregate(mut aggregate) = *delta.input else {
-            return Ok(RewriteResult::Unchanged);
-        };
-        let LogicalPlan::Join(join) = *aggregate.input else {
+        let LogicalPlan::Join(join) = *delta.input else {
             return Ok(RewriteResult::Unchanged);
         };
 
         if !join_delta_kind_supported(join.join_type) {
             return Err(format!(
-                "Iceberg IMV join aggregate rewrite supports inner/cross joins only, got {:?}",
+                "Iceberg IMV join delta rewrite supports inner/cross joins only, got {:?}",
                 join.join_type
             ));
         }
@@ -73,7 +60,7 @@ impl LogicalRewriteRule for RewriteJoinAggregateDeltaRule {
             None => ctx
                 .extension::<ImvExtension>()
                 .ok_or_else(|| {
-                    "RewriteJoinAggregateDelta requires ImvExtension in RewriteContext".to_string()
+                    "RewriteJoinDelta requires ImvExtension in RewriteContext".to_string()
                 })?
                 .allocate_column_id(),
         };
@@ -115,21 +102,12 @@ impl LogicalRewriteRule for RewriteJoinAggregateDeltaRule {
             &output_columns,
         );
 
-        aggregate.input = Box::new(LogicalPlan::Union(UnionNode {
+        Ok(RewriteResult::Changed(LogicalPlan::Union(UnionNode {
             inputs: vec![left_delta_branch, right_delta_branch],
             all: true,
             output_columns,
             required_output_columns,
-        }));
-
-        Ok(RewriteResult::Changed(LogicalPlan::ImvDelta(
-            ImvDeltaNode {
-                input: Box::new(LogicalPlan::Aggregate(aggregate)),
-                is_root: true,
-                action_column: Some(action_column),
-                branch_scope,
-            },
-        )))
+        })))
     }
 }
 
@@ -140,7 +118,7 @@ fn join_output_columns(
 ) -> Result<Vec<OutputColumn>, String> {
     if !join_delta_kind_supported(join_type) {
         return Err(format!(
-            "Iceberg IMV join aggregate rewrite cannot derive output columns for unsupported join kind {:?}",
+            "Iceberg IMV join delta rewrite cannot derive output columns for unsupported join kind {:?}",
             join_type
         ));
     }
@@ -178,9 +156,30 @@ fn mark_scan(plan: LogicalPlan, marker: MarkerKind) -> Result<LogicalPlan, Strin
             filter.input = Box::new(mark_scan(*filter.input, marker)?);
             LogicalPlan::Filter(filter)
         }
+        LogicalPlan::Join(join) => match marker {
+            MarkerKind::Delta(action_column) => {
+                wrap_scan_marker(LogicalPlan::Join(join), MarkerKind::Delta(action_column))
+            }
+            MarkerKind::Version(version_ref) => {
+                let JoinNode {
+                    left,
+                    right,
+                    join_type,
+                    condition,
+                    required_output_columns,
+                } = join;
+                LogicalPlan::Join(JoinNode {
+                    left: Box::new(mark_scan(*left, MarkerKind::Version(version_ref.clone()))?),
+                    right: Box::new(mark_scan(*right, MarkerKind::Version(version_ref))?),
+                    join_type,
+                    condition,
+                    required_output_columns,
+                })
+            }
+        },
         other => {
             return Err(format!(
-                "Iceberg IMV join aggregate rewrite supports only Scan/Project/Filter join sides, got {}",
+                "Iceberg IMV join delta rewrite supports only Scan/Project/Filter/Join join sides, got {}",
                 plan_kind(&other)
             ));
         }
@@ -344,114 +343,137 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_join_aggregate_delta_rejects_outer_join() {
-        let rule = RewriteJoinAggregateDeltaRule;
-        let mut ctx = build_ctx();
-        let plan = delta(aggregate_over(join_over(JoinKind::LeftOuter)));
-
-        assert!(rule.matches(&plan, &ctx));
-        let err = rule
-            .apply(plan, &mut ctx)
-            .expect_err("outer join must be rejected");
-        assert_eq!(
-            err,
-            "Iceberg IMV join aggregate rewrite supports inner/cross joins only, got LeftOuter"
-        );
-    }
-
-    #[test]
-    fn rewrite_inner_join_aggregate_delta_expands_two_stable_branches() {
-        assert_supported_join_rewrite(JoinKind::Inner);
-    }
-
-    #[test]
-    fn rewrite_cross_join_aggregate_delta_expands_two_stable_branches() {
-        assert_supported_join_rewrite(JoinKind::Cross);
-    }
-
-    #[test]
-    fn join_delta_preserves_branch_scope() {
-        let rule = RewriteJoinAggregateDeltaRule;
-        let mut ctx = build_ctx();
-        let scope = crate::sql::catalog::BranchScope {
-            branch_id_column_name:
-                crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN.to_string(),
-            branch_id: 2,
-        };
-        let plan = LogicalPlan::ImvDelta(ImvDeltaNode {
-            input: Box::new(aggregate_over(join_of(scan("l", 1), scan("r", 10)))),
-            is_root: true,
-            action_column: None,
-            branch_scope: Some(scope.clone()),
+    fn pure_join_delta_matches_imv_delta_over_join_any_root() {
+        let rule = RewriteJoinDeltaRule;
+        let ctx = build_ctx();
+        let non_root = LogicalPlan::ImvDelta(ImvDeltaNode {
+            input: Box::new(join_of(scan("l", 1), scan("r", 10))),
+            is_root: false,
+            action_column: Some(ColumnId(100)),
+            branch_scope: None,
         });
-        let RewriteResult::Changed(LogicalPlan::ImvDelta(out)) =
-            rule.apply(plan, &mut ctx).expect("rewrite")
-        else {
-            panic!("expected rewritten root ImvDelta")
-        };
-        assert_eq!(
-            out.branch_scope,
-            Some(scope),
-            "join-delta must carry branch_scope onto the rewritten root delta"
-        );
+        assert!(rule.matches(&non_root, &ctx));
+
+        let over_agg = delta(aggregate_over(join_over(JoinKind::Inner)));
+        assert!(!rule.matches(&over_agg, &ctx));
     }
 
-    fn assert_supported_join_rewrite(join_type: JoinKind) {
-        let rule = RewriteJoinAggregateDeltaRule;
+    #[test]
+    fn pure_join_delta_expands_into_union_without_outer_aggregate() {
+        let rule = RewriteJoinDeltaRule;
         let mut ctx = build_ctx();
-        let plan = delta(aggregate_over(join_over(join_type)));
+        let plan = LogicalPlan::ImvDelta(ImvDeltaNode {
+            input: Box::new(join_over(JoinKind::Inner)),
+            is_root: false,
+            action_column: Some(ColumnId(100)),
+            branch_scope: None,
+        });
 
-        assert!(rule.matches(&plan, &ctx));
-        let RewriteResult::Changed(LogicalPlan::ImvDelta(root_delta)) = rule
-            .apply(plan, &mut ctx)
-            .expect("supported join must rewrite")
+        let RewriteResult::Changed(LogicalPlan::Union(union)) =
+            rule.apply(plan, &mut ctx).expect("expand")
         else {
-            panic!("expected Changed(ImvDelta)");
+            panic!("pure join-delta must expand ImvDelta(Join) directly into a Union");
         };
-        assert!(root_delta.is_root);
-        let action_column = root_delta
-            .action_column
-            .expect("root delta must carry allocated action column");
-        assert_eq!(action_column, ColumnId(100));
 
-        let LogicalPlan::Aggregate(aggregate) = root_delta.input.as_ref() else {
-            panic!("expected root ImvDelta(Aggregate)");
-        };
-        let LogicalPlan::Union(union) = aggregate.input.as_ref() else {
-            panic!("expected Aggregate(UnionAll)");
-        };
         assert!(union.all);
         assert_eq!(union.inputs.len(), 2);
+        let left = assert_normalized_branch(&union.inputs[0], ColumnId(100));
+        assert_condition_refs(left.condition.as_ref());
+        assert_delta(left.left.as_ref(), "left", ColumnId(100));
+        assert_version(left.right.as_ref(), "right", ImvVersionRole::From);
+
+        let right = assert_normalized_branch(&union.inputs[1], ColumnId(100));
+        assert_condition_refs(right.condition.as_ref());
+        assert_version(right.left.as_ref(), "left", ImvVersionRole::To);
+        assert_delta(right.right.as_ref(), "right", ColumnId(100));
+    }
+
+    #[test]
+    fn pure_join_delta_rejects_outer_join() {
+        let rule = RewriteJoinDeltaRule;
+        let mut ctx = build_ctx();
+        let plan = LogicalPlan::ImvDelta(ImvDeltaNode {
+            input: Box::new(join_over(JoinKind::LeftOuter)),
+            is_root: false,
+            action_column: Some(ColumnId(100)),
+            branch_scope: None,
+        });
+
+        let err = rule.apply(plan, &mut ctx).expect_err("outer must reject");
+        assert!(err.contains("inner/cross"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn pure_join_delta_nested_leaves_inner_join_delta_for_next_iteration() {
+        let rule = RewriteJoinDeltaRule;
+        let mut ctx = build_ctx();
+        let inner = join_of(scan("a", 1), scan("b", 10));
+        let outer = join_of_with_left(inner, scan("c", 20));
+        let plan = LogicalPlan::ImvDelta(ImvDeltaNode {
+            input: Box::new(outer),
+            is_root: false,
+            action_column: Some(ColumnId(100)),
+            branch_scope: None,
+        });
+
+        let RewriteResult::Changed(LogicalPlan::Union(union)) =
+            rule.apply(plan, &mut ctx).expect("expand outer")
+        else {
+            panic!("expected Union");
+        };
+
+        let left = assert_normalized_branch(&union.inputs[0], ColumnId(100));
+        assert!(
+            plan_contains_inner_join_delta(left.left.as_ref()),
+            "outer-left delta side must leave ImvDelta(Join(a,b)) for the next fixpoint iteration"
+        );
+    }
+
+    #[test]
+    fn mark_delta_scan_wraps_nested_join_whole() {
+        // Delta marker over a Join must wrap the entire join (pending recursive join-delta expansion),
+        // NOT push into the two sides.
+        let join = join_of(scan("a", 1), scan("b", 10));
+        let marked = mark_delta_scan(join, ColumnId(100)).expect("mark delta over join");
+        let LogicalPlan::ImvDelta(delta) = marked else {
+            panic!("expected ImvDelta wrapping the whole join, got {marked:?}");
+        };
+        assert!(!delta.is_root, "nested join delta marker is not root");
+        assert_eq!(delta.action_column, Some(ColumnId(100)));
+        assert!(matches!(delta.input.as_ref(), LogicalPlan::Join(_)));
+    }
+
+    #[test]
+    fn mark_version_scan_pushes_same_role_down_both_join_sides() {
+        // Version marker over a Join distributes over the join:
+        // Version(Join(a,b), from) == Join(Version(a, from), Version(b, from)).
+        let join = join_of(scan("a", 1), scan("b", 10));
+        let marked = mark_version_scan(join, ImvVersionRef::from_snapshot())
+            .expect("mark version over join");
+        let LogicalPlan::Join(j) = marked else {
+            panic!("expected Join with both sides version-marked, got {marked:?}");
+        };
+        let left_v = assert_version_side(j.left.as_ref());
+        let right_v = assert_version_side(j.right.as_ref());
         assert_eq!(
-            union
-                .output_columns
-                .iter()
-                .map(|column| column.column_id)
-                .collect::<Vec<_>>(),
-            vec![
-                ColumnId(1),
-                ColumnId(2),
-                ColumnId(10),
-                ColumnId(11),
-                ColumnId(100)
-            ]
+            left_v.version_ref,
+            ImvVersionRef {
+                role: ImvVersionRole::From
+            }
         );
-
-        let left_delta_branch = assert_normalized_branch(&union.inputs[0], action_column);
-        assert_eq!(left_delta_branch.join_type, join_type);
-        assert_condition_refs(left_delta_branch.condition.as_ref());
-        assert_delta(left_delta_branch.left.as_ref(), "left", action_column);
-        assert_version(
-            left_delta_branch.right.as_ref(),
-            "right",
-            ImvVersionRole::From,
+        assert_eq!(
+            right_v.version_ref,
+            ImvVersionRef {
+                role: ImvVersionRole::From
+            }
         );
+    }
 
-        let right_delta_branch = assert_normalized_branch(&union.inputs[1], action_column);
-        assert_eq!(right_delta_branch.join_type, join_type);
-        assert_condition_refs(right_delta_branch.condition.as_ref());
-        assert_version(right_delta_branch.left.as_ref(), "left", ImvVersionRole::To);
-        assert_delta(right_delta_branch.right.as_ref(), "right", action_column);
+    fn assert_version_side(plan: &LogicalPlan) -> &ImvVersionNode {
+        match plan {
+            LogicalPlan::ImvVersion(v) => v,
+            other => panic!("expected ImvVersion on join side, got {other:?}"),
+        }
     }
 
     fn assert_normalized_branch(plan: &LogicalPlan, action_column: ColumnId) -> &JoinNode {
@@ -464,13 +486,12 @@ mod tests {
                 .iter()
                 .map(|item| item.output_column_id)
                 .collect::<Vec<_>>(),
-            vec![
-                ColumnId(1),
-                ColumnId(2),
-                ColumnId(10),
-                ColumnId(11),
-                action_column
-            ]
+            plan_output_columns(project.input.as_ref())
+                .expect("branch output columns")
+                .into_iter()
+                .map(|column| column.column_id)
+                .chain(std::iter::once(action_column))
+                .collect::<Vec<_>>()
         );
         assert!(
             project
@@ -546,6 +567,10 @@ mod tests {
             }),
             required_output_columns: None,
         })
+    }
+
+    fn join_of_with_left(left: LogicalPlan, right: LogicalPlan) -> LogicalPlan {
+        join_of(left, right)
     }
 
     fn project_over(input: LogicalPlan) -> LogicalPlan {
@@ -672,6 +697,22 @@ mod tests {
             ExprKind::ColumnRef { column_id, column, .. }
                 if *column_id == ColumnId(10) && column == "right_k"
         ));
+    }
+
+    fn plan_contains_inner_join_delta(plan: &LogicalPlan) -> bool {
+        match plan {
+            LogicalPlan::ImvDelta(delta) => {
+                matches!(delta.input.as_ref(), LogicalPlan::Join(_))
+                    || plan_contains_inner_join_delta(delta.input.as_ref())
+            }
+            LogicalPlan::Project(project) => plan_contains_inner_join_delta(project.input.as_ref()),
+            LogicalPlan::Filter(filter) => plan_contains_inner_join_delta(filter.input.as_ref()),
+            LogicalPlan::Join(join) => {
+                plan_contains_inner_join_delta(join.left.as_ref())
+                    || plan_contains_inner_join_delta(join.right.as_ref())
+            }
+            _ => false,
+        }
     }
 
     fn assert_delta(plan: &LogicalPlan, expected_scan: &str, action_column: ColumnId) {

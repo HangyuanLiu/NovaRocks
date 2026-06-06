@@ -6,7 +6,9 @@
 -- Scope: UNION DISTINCT, mixed projection/aggregate branches, incompatible
 -- aggregate branches, duplicate base refs, reserved branch-id output names, and
 -- heterogeneous-base composed branch-union aggregates (aggregate-over-join
--- branches whose two branches join DIFFERENT base sets).
+-- branches whose two branches join DIFFERENT base sets). Also pins the
+-- join-of-aggregate boundary: joins with aggregate subquery sides remain
+-- outside this phase.
 
 -- query 1
 -- @skip_result_check=true
@@ -130,6 +132,21 @@ JOIN ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t3 t3 ON t1.id = t3.id
 GROUP BY t1.region;
 
 -- query 8
+-- @expect_error=Iceberg IMV refresh contract supports join keys only over direct scan inputs
+CREATE MATERIALIZED VIEW union_join_of_aggregate_reject_${uuid0}
+DISTRIBUTED BY HASH(region) BUCKETS 1
+PROPERTIES ('storage_engine' = 'iceberg')
+AS
+SELECT d.region, SUM(g.sv) AS total
+FROM (
+    SELECT id, SUM(amount) AS sv
+    FROM ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t1
+    GROUP BY id
+) AS g
+JOIN ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t2 AS d ON g.id = d.id
+GROUP BY d.region;
+
+-- query 9
 -- @skip_result_check=true
 DROP TABLE ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t1 FORCE;
 DROP TABLE ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t2 FORCE;

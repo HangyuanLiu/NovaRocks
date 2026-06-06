@@ -1,9 +1,9 @@
 //! IMV rewrite pipeline construction.
 //!
-//! Stages run in order: logical normalize, delta marker, branch union, join
-//! delta, union delta, aggregate state, delta pushdown, scan binding, action
-//! propagation, marker cleanup, validation. Each stage's name is part of the
-//! trace contract and is asserted in pipeline tests.
+//! Stages run in order: logical normalize, delta marker, branch union, union
+//! delta, aggregate state, delta pushdown, scan binding, action propagation,
+//! marker cleanup, validation. Each stage's name is part of the trace contract
+//! and is asserted in pipeline tests.
 
 use crate::sql::optimizer::rewrite::imv::action_column::ActionColumnValidationRule;
 use crate::sql::optimizer::rewrite::imv::action_propagation::{
@@ -13,7 +13,7 @@ use crate::sql::optimizer::rewrite::imv::aggregate_rewrite::RewriteAggregateStat
 use crate::sql::optimizer::rewrite::imv::apply_key::InjectApplyKeyProjectRule;
 use crate::sql::optimizer::rewrite::imv::branch_union::RewriteBranchUnionRule;
 use crate::sql::optimizer::rewrite::imv::delta_pushdown::PushDeltaThroughUnaryRule;
-use crate::sql::optimizer::rewrite::imv::join_delta::RewriteJoinAggregateDeltaRule;
+use crate::sql::optimizer::rewrite::imv::join_delta::RewriteJoinDeltaRule;
 use crate::sql::optimizer::rewrite::imv::marker::{
     UnresolvedMarkerCheckRule, WrapRootInImvDeltaRule,
 };
@@ -44,11 +44,6 @@ pub(crate) fn build_imv_pipeline() -> RewritePipeline {
             vec![Box::new(RewriteBranchUnionRule) as Box<dyn LogicalRewriteRule>],
         ),
         RewriteStage::new(
-            "imv-join-delta",
-            RewritePhase::StructuralRewrite,
-            vec![Box::new(RewriteJoinAggregateDeltaRule) as Box<dyn LogicalRewriteRule>],
-        ),
-        RewriteStage::new(
             "imv-union-delta",
             RewritePhase::StructuralRewrite,
             vec![
@@ -64,7 +59,10 @@ pub(crate) fn build_imv_pipeline() -> RewritePipeline {
         RewriteStage::new(
             "imv-delta-pushdown",
             RewritePhase::StructuralRewrite,
-            vec![Box::new(PushDeltaThroughUnaryRule) as Box<dyn LogicalRewriteRule>],
+            vec![
+                Box::new(PushDeltaThroughUnaryRule) as Box<dyn LogicalRewriteRule>,
+                Box::new(RewriteJoinDeltaRule) as Box<dyn LogicalRewriteRule>,
+            ],
         ),
         RewriteStage::new(
             "imv-scan-binding",
@@ -122,13 +120,13 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_runs_join_and_aggregate_rewrite_before_generic_delta_pushdown() {
+    fn pipeline_runs_join_delta_inside_pushdown_after_aggregate_state() {
         let p = build_imv_pipeline();
         let names = p.stage_names();
-        let join = names
-            .iter()
-            .position(|n| *n == "imv-join-delta")
-            .expect("join delta stage must exist");
+        assert!(
+            !names.iter().any(|n| *n == "imv-join-delta"),
+            "imv-join-delta stage must be removed: {names:?}"
+        );
         let union = names
             .iter()
             .position(|n| *n == "imv-union-delta")
@@ -147,8 +145,11 @@ mod tests {
             .expect("delta pushdown stage must exist");
 
         assert!(branch_union < pushdown, "stage order: {names:?}");
-        assert!(join < union, "stage order: {names:?}");
         assert!(union < agg, "stage order: {names:?}");
         assert!(agg < pushdown, "stage order: {names:?}");
+        assert!(
+            p.rule_names().iter().any(|n| *n == "RewriteJoinDelta"),
+            "RewriteJoinDelta must run inside imv-delta-pushdown"
+        );
     }
 }

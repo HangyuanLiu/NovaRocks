@@ -581,6 +581,34 @@ mod tests {
     }
 
     #[test]
+    fn derives_cross_join_aggregate_contract() {
+        let analysis = parse_and_analyze_mv_query(
+            "SELECT l.region, count(*) AS c, sum(r.amount) AS s
+             FROM fact_east l CROSS JOIN fact_west r
+             GROUP BY l.region",
+            &["fact_east", "fact_west"],
+        );
+
+        let contract = derive_imv_refresh_contract(&analysis).expect("derive contract");
+
+        assert_eq!(
+            contract.apply_key,
+            ApplyKeyContract::join_aggregate_group_row()
+        );
+        assert_eq!(
+            contract.aggregate,
+            Some(AggregateRefreshContract {
+                group_key_count: 1,
+                aggregate_count: 2,
+            })
+        );
+        assert_eq!(
+            contract.join,
+            Some(JoinRefreshContract { join_key_count: 0 })
+        );
+    }
+
+    #[test]
     fn rejects_outer_join_contracts() {
         let analysis = parse_and_analyze_mv_query(
             "SELECT l.region, r.amount
@@ -590,20 +618,24 @@ mod tests {
 
         let err = derive_imv_refresh_contract(&analysis).expect_err("outer join is unsupported");
 
-        assert!(err.contains("inner equi-join"), "unexpected error: {err}");
+        assert!(err.contains("inner/cross"), "unexpected error: {err}");
     }
 
     #[test]
-    fn rejects_cross_join_contracts() {
+    fn rejects_cross_join_projection_contracts() {
         let analysis = parse_and_analyze_mv_query(
             "SELECT l.region, r.amount
              FROM fact_east l CROSS JOIN fact_west r",
             &["fact_east", "fact_west"],
         );
 
-        let err = derive_imv_refresh_contract(&analysis).expect_err("cross join is unsupported");
+        let err = derive_imv_refresh_contract(&analysis)
+            .expect_err("cross join projection is unsupported");
 
-        assert!(err.contains("inner equi-join"), "unexpected error: {err}");
+        assert!(
+            err.contains("requires at least one equi-join predicate"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

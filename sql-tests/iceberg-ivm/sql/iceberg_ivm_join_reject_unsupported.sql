@@ -2,7 +2,7 @@
 -- @order_sensitive=true
 -- @tags=mv,iceberg,ivm,row_lineage,join,negative
 -- Test Point: Unsupported join IMV shapes fail at CREATE time.
--- Method: Try outer join, non-equi join, and three-table join.
+-- Method: Try outer join, non-equi join, projection cross join, and three-table join.
 -- Scope: Iceberg-backed join IMV shape validation.
 
 -- query 1
@@ -43,7 +43,7 @@ SET CATALOG ice_ivm_join_reject_${uuid0};
 USE ns_${uuid0};
 
 -- query 2
--- @expect_error=Iceberg IMV refresh contract supports only two-table inner equi-join shapes
+-- @expect_error=Iceberg IMV refresh contract supports only inner/cross join shapes
 CREATE MATERIALIZED VIEW reject_outer_${uuid0}
 DISTRIBUTED BY HASH(id) BUCKETS 1
 PROPERTIES ('storage_engine' = 'iceberg')
@@ -61,7 +61,16 @@ FROM ice_ivm_join_reject_${uuid0}.ns_${uuid0}.reject_left_${uuid0} AS l
 JOIN ice_ivm_join_reject_${uuid0}.ns_${uuid0}.reject_right_${uuid0} AS r ON l.rid > r.rid;
 
 -- query 4
--- @expect_error=Iceberg IMV refresh contract supports join keys only over direct scan inputs
+-- @expect_error=requires at least one equi-join predicate
+CREATE MATERIALIZED VIEW reject_cross_projection_${uuid0}
+DISTRIBUTED BY HASH(id) BUCKETS 1
+PROPERTIES ('storage_engine' = 'iceberg')
+AS SELECT l.id
+FROM ice_ivm_join_reject_${uuid0}.ns_${uuid0}.reject_left_${uuid0} AS l
+CROSS JOIN ice_ivm_join_reject_${uuid0}.ns_${uuid0}.reject_right_${uuid0} AS r;
+
+-- query 5
+-- @expect_error=requires 2 distinct Iceberg base table refs
 CREATE MATERIALIZED VIEW reject_three_${uuid0}
 DISTRIBUTED BY HASH(id) BUCKETS 1
 PROPERTIES ('storage_engine' = 'iceberg')
@@ -70,10 +79,11 @@ FROM ice_ivm_join_reject_${uuid0}.ns_${uuid0}.reject_left_${uuid0} AS l
 JOIN ice_ivm_join_reject_${uuid0}.ns_${uuid0}.reject_right_${uuid0} AS r ON l.rid = r.rid
 JOIN ice_ivm_join_reject_${uuid0}.ns_${uuid0}.reject_extra_${uuid0} AS x ON x.rid = r.rid;
 
--- query 5
+-- query 6
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW IF EXISTS reject_outer_${uuid0};
 DROP MATERIALIZED VIEW IF EXISTS reject_nonequi_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS reject_cross_projection_${uuid0};
 DROP MATERIALIZED VIEW IF EXISTS reject_three_${uuid0};
 DROP TABLE ice_ivm_join_reject_${uuid0}.ns_${uuid0}.reject_left_${uuid0} FORCE;
 DROP TABLE ice_ivm_join_reject_${uuid0}.ns_${uuid0}.reject_right_${uuid0} FORCE;
