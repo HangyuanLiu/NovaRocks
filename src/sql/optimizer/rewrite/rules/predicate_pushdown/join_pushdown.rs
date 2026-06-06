@@ -21,8 +21,7 @@ use crate::sql::optimizer::rewrite::rules::predicate_pushdown::predicate_group::
     PredicateGroup, PredicateOrigin, predicate_key as canonical_predicate_key,
 };
 use crate::sql::optimizer::rewrite::rules::utils::{
-    collect_column_id_refs, collect_column_refs, collect_output_columns, collect_output_ids,
-    collect_qualified_column_refs, collect_qualified_output_columns, combine_and, split_and,
+    collect_column_id_refs_strict, collect_output_ids, combine_and, split_and,
     wrap_remaining_filter,
 };
 use crate::sql::planner::plan::*;
@@ -67,10 +66,10 @@ pub(crate) fn push_filter_predicates_through_join(
     predicate: TypedExpr,
     join: JoinNode,
 ) -> (LogicalPlan, bool) {
-    let left_cols = collect_output_columns(&join.left);
-    let right_cols = collect_output_columns(&join.right);
-    let left_ids = collect_output_ids(&join.left);
-    let right_ids = collect_output_ids(&join.right);
+    let mut left_ids = collect_output_ids(&join.left);
+    let mut right_ids = collect_output_ids(&join.right);
+    left_ids.remove(&ColumnId::UNSET);
+    right_ids.remove(&ColumnId::UNSET);
     let filter_groups = PredicateGroup::from_predicate(predicate.clone(), PredicateOrigin::Filter);
     let join_groups = join
         .condition
@@ -84,34 +83,16 @@ pub(crate) fn push_filter_predicates_through_join(
         append_new_derived_conjuncts(&mut conjuncts, derived, &join, &left_ids, &right_ids);
     }
 
-    // Qualified output columns for precise self-join disambiguation.
-    let left_qcols = collect_qualified_output_columns(&join.left);
-    let right_qcols = collect_qualified_output_columns(&join.right);
-
     let mut left_preds = Vec::new();
     let mut right_preds = Vec::new();
     let mut join_preds = Vec::new();
     let mut remaining = Vec::new();
 
-    // For LEFT joins (OUTER/SEMI/ANTI), subquery rewrites can produce a right
-    // child whose output columns share names with the left child. A predicate
-    // that references only left-child columns may look like "both-sides" due to
-    // this name overlap. Detect this and treat such predicates as left-only.
-    let is_left_join_variant = matches!(
-        join.join_type,
-        JoinKind::LeftOuter | JoinKind::LeftSemi | JoinKind::LeftAnti
-    );
-
     for conj in conjuncts {
-        let refs = collect_column_refs(&conj);
-        let id_sides = classify_sides_by_column_ids(&conj, &left_ids, &right_ids);
-        let (in_left, in_right, classified_by_ids) = match id_sides {
-            Some((in_left, in_right)) => (in_left, in_right, true),
-            None => (
-                refs.iter().any(|c| left_cols.contains(&c.to_lowercase())),
-                refs.iter().any(|c| right_cols.contains(&c.to_lowercase())),
-                false,
-            ),
+        let Some((in_left, in_right)) = classify_sides_by_column_ids(&conj, &left_ids, &right_ids)
+        else {
+            remaining.push(conj);
+            continue;
         };
 
         match (in_left, in_right) {
@@ -135,15 +116,8 @@ pub(crate) fn push_filter_predicates_through_join(
             }
             (true, true) => {
                 if matches!(join.join_type, JoinKind::Inner | JoinKind::Cross) {
-                    let (implied_left, implied_right) = extract_implied_or_side_filters(
-                        &conj,
-                        &left_ids,
-                        &right_ids,
-                        &left_cols,
-                        &right_cols,
-                        &left_qcols,
-                        &right_qcols,
-                    );
+                    let (implied_left, implied_right) =
+                        extract_implied_or_side_filters(&conj, &left_ids, &right_ids);
                     for pred in implied_left {
                         if !subtree_has_predicate(&join.left, &pred) {
                             left_preds.push(pred);
@@ -156,135 +130,26 @@ pub(crate) fn push_filter_predicates_through_join(
                     }
                 }
 
-                if classified_by_ids {
-                    if is_left_join_variant
-                        || matches!(join.join_type, JoinKind::RightOuter | JoinKind::FullOuter)
-                    {
-                        remaining.push(conj);
-                    } else {
-                        let (factored, or_remaining) =
-                            factor_common_eq_from_or(&conj, &left_cols, &right_cols);
-                        if !factored.is_empty() {
-                            join_preds.extend(factored);
-                            if let Some(rem) = or_remaining {
-                                remaining.push(rem);
-                            }
-                        } else {
-                            join_preds.push(conj);
-                        }
-                    }
-                    continue;
-                }
-
-                // Bare-name matching says "both sides". Re-check with qualified
-                // column references to handle self-joins (e.g. nation n1, nation n2)
-                // where both sides share the same bare column names.
-                let qrefs = collect_qualified_column_refs(&conj);
-                let q_in_left = qrefs.iter().any(|r| left_qcols.contains(r));
-                let q_in_right = qrefs.iter().any(|r| right_qcols.contains(r));
-
-                // If ALL qualified refs are present in left (and not exclusively
-                // right), treat as left-only. Vice versa for right-only.
-                // Only if qualified refs genuinely span both sides treat as
-                // "both-sides".
-                let all_in_left = qrefs.iter().all(|r| left_qcols.contains(r));
-                let all_in_right = qrefs.iter().all(|r| right_qcols.contains(r));
-
-                // Guard against false "left-only" or "right-only" classification
-                // when unqualified refs are ambiguous (present in both sides).
-                // E.g., `d_week_seq = __sq_2.d_week_seq` has refs:
-                //   (None, "d_week_seq")  — in both left & right qcols
-                //   (Some("__sq_2"), "d_week_seq") — only in right qcols
-                // `all_in_right` would be true, but the unqualified ref is
-                // genuinely a left-side column. Treat as join predicate.
-                let any_ambiguous_in_both = qrefs
-                    .iter()
-                    .any(|r| left_qcols.contains(r) && right_qcols.contains(r));
-
-                if all_in_left && !all_in_right && !any_ambiguous_in_both {
-                    // Qualified analysis shows left-only
-                    left_preds.push(conj);
-                } else if all_in_right && !all_in_left && !any_ambiguous_in_both {
-                    // Qualified analysis shows right-only
-                    match join.join_type {
-                        JoinKind::Inner
-                        | JoinKind::Cross
+                if matches!(
+                    join.join_type,
+                    JoinKind::LeftOuter
+                        | JoinKind::LeftSemi
+                        | JoinKind::LeftAnti
                         | JoinKind::RightOuter
-                        | JoinKind::RightSemi
-                        | JoinKind::RightAnti => {
-                            right_preds.push(conj);
-                        }
-                        _ => remaining.push(conj),
-                    }
-                } else if q_in_left && q_in_right {
-                    // Genuinely references both sides.
-                    //
-                    // For self-joins (left and right share the same bare column
-                    // names), keep the predicate as a remaining filter above the
-                    // join.  Merging it into the join condition can cause the
-                    // execution layer to mis-resolve ambiguous column references
-                    // when both sides originate from the same table.
-                    let is_self_join_overlap = {
-                        let bare_refs: Vec<String> =
-                            refs.iter().map(|c| c.to_lowercase()).collect();
-                        bare_refs
-                            .iter()
-                            .all(|c| left_cols.contains(c) && right_cols.contains(c))
-                    };
-                    if is_self_join_overlap
-                        && q_in_left
-                        && q_in_right
-                        && !is_left_join_variant
-                        && matches!(join.join_type, JoinKind::Cross | JoinKind::Inner)
-                    {
-                        // Shared column names but qualified refs confirm both sides
-                        // are referenced (e.g., CTE.d_week_seq = date_dim.d_week_seq).
-                        // Only push for CROSS/INNER joins to enable CROSS → INNER
-                        // upgrade. Do NOT push for SEMI/ANTI/OUTER which have
-                        // different scope semantics.
-                        join_preds.push(conj);
-                    } else if is_self_join_overlap {
-                        remaining.push(conj);
-                    } else if is_left_join_variant
-                        && refs.iter().all(|c| left_cols.contains(&c.to_lowercase()))
-                    {
-                        left_preds.push(conj);
-                    } else if is_left_join_variant {
-                        remaining.push(conj);
-                    } else if matches!(join.join_type, JoinKind::RightOuter | JoinKind::FullOuter) {
-                        // For RIGHT OUTER / FULL OUTER, predicates that
-                        // reference both sides cannot be fused into the
-                        // join's `other` condition: unmatched rows on the
-                        // null-extending side still produce a null-padded
-                        // output row through `other`, so a
-                        // `WHERE abs(left.v1 + right.v4) > 5` becomes
-                        // "either match passes the predicate OR emit
-                        // null-extended row" instead of the intended
-                        // post-join filter. Keep these predicates above
-                        // the join.
-                        remaining.push(conj);
-                    } else {
-                        // For OR predicates, try to extract common equi-join
-                        // conditions shared by all OR branches. This handles:
-                        //   (cd_demo_sk=ss_cdemo_sk AND ...) OR (cd_demo_sk=ss_cdemo_sk AND ...)
-                        // → factor out cd_demo_sk=ss_cdemo_sk as join_pred,
-                        //   keep remaining OR as other condition.
-                        let (factored, or_remaining) =
-                            factor_common_eq_from_or(&conj, &left_cols, &right_cols);
-                        if !factored.is_empty() {
-                            join_preds.extend(factored);
-                            if let Some(rem) = or_remaining {
-                                remaining.push(rem);
-                            }
-                        } else {
-                            join_preds.push(conj);
-                        }
-                    }
-                } else {
-                    // Fallback: keep above the join as remaining filter.
-                    // This handles cases where qualified matching cannot
-                    // disambiguate (e.g. mixed qualified/unqualified refs).
+                        | JoinKind::FullOuter
+                ) {
                     remaining.push(conj);
+                } else {
+                    let (factored, or_remaining) =
+                        factor_common_eq_from_or(&conj, &left_ids, &right_ids);
+                    if !factored.is_empty() {
+                        join_preds.extend(factored);
+                        if let Some(rem) = or_remaining {
+                            remaining.push(rem);
+                        }
+                    } else {
+                        join_preds.push(conj);
+                    }
                 }
             }
             (false, false) => {
@@ -366,10 +231,10 @@ pub(crate) fn push_join_condition_predicates(join: JoinNode) -> Option<LogicalPl
     }
 
     let condition = join.condition.clone()?;
-    let left_ids = collect_output_ids(&join.left);
-    let right_ids = collect_output_ids(&join.right);
-    let left_cols = collect_output_columns(&join.left);
-    let right_cols = collect_output_columns(&join.right);
+    let mut left_ids = collect_output_ids(&join.left);
+    let mut right_ids = collect_output_ids(&join.right);
+    left_ids.remove(&ColumnId::UNSET);
+    right_ids.remove(&ColumnId::UNSET);
     let condition_groups =
         PredicateGroup::from_predicate(condition.clone(), PredicateOrigin::JoinCondition);
     let mut conjuncts = split_and(condition);
@@ -382,14 +247,11 @@ pub(crate) fn push_join_condition_predicates(join: JoinNode) -> Option<LogicalPl
     let mut residual_preds = Vec::new();
 
     for conj in conjuncts {
-        let refs = collect_column_refs(&conj);
-        let (in_left, in_right) = classify_sides_by_column_ids(&conj, &left_ids, &right_ids)
-            .unwrap_or_else(|| {
-                (
-                    refs.iter().any(|c| left_cols.contains(&c.to_lowercase())),
-                    refs.iter().any(|c| right_cols.contains(&c.to_lowercase())),
-                )
-            });
+        let Some((in_left, in_right)) = classify_sides_by_column_ids(&conj, &left_ids, &right_ids)
+        else {
+            residual_preds.push(conj);
+            continue;
+        };
 
         match (in_left, in_right) {
             (true, false) => left_preds.push(conj),
@@ -470,7 +332,9 @@ fn derived_exists_below_child(
     left_ids: &HashSet<ColumnId>,
     right_ids: &HashSet<ColumnId>,
 ) -> bool {
-    let ids = collect_column_id_refs(expr);
+    let Some(ids) = collect_column_id_refs_strict(expr) else {
+        return false;
+    };
     if ids.is_empty() {
         return false;
     }
@@ -488,9 +352,9 @@ fn classify_sides_by_column_ids(
     left_ids: &HashSet<ColumnId>,
     right_ids: &HashSet<ColumnId>,
 ) -> Option<(bool, bool)> {
-    let ids = collect_column_id_refs(expr);
-    if ids.is_empty() || ids.len() != collect_qualified_column_refs(expr).len() {
-        return None;
+    let ids = collect_column_id_refs_strict(expr)?;
+    if ids.is_empty() {
+        return Some((false, false));
     }
 
     let mut in_left = false;
@@ -513,12 +377,8 @@ enum PredicateSide {
 
 fn extract_implied_or_side_filters(
     expr: &TypedExpr,
-    left_ids: &HashSet<crate::sql::column_id::ColumnId>,
-    right_ids: &HashSet<crate::sql::column_id::ColumnId>,
-    left_cols: &HashSet<String>,
-    right_cols: &HashSet<String>,
-    left_qcols: &HashSet<crate::sql::optimizer::rewrite::rules::utils::QualifiedRef>,
-    right_qcols: &HashSet<crate::sql::optimizer::rewrite::rules::utils::QualifiedRef>,
+    left_ids: &HashSet<ColumnId>,
+    right_ids: &HashSet<ColumnId>,
 ) -> (Vec<TypedExpr>, Vec<TypedExpr>) {
     let branches = split_or_branches(expr);
     if branches.len() < 2 {
@@ -532,15 +392,7 @@ fn extract_implied_or_side_filters(
         let mut left_conjuncts = Vec::new();
         let mut right_conjuncts = Vec::new();
         for conjunct in split_and_refs(branch) {
-            match classify_implied_filter_side(
-                conjunct,
-                left_ids,
-                right_ids,
-                left_cols,
-                right_cols,
-                left_qcols,
-                right_qcols,
-            ) {
+            match classify_implied_filter_side(conjunct, left_ids, right_ids) {
                 Some(PredicateSide::Left) => left_conjuncts.push((*conjunct).clone()),
                 Some(PredicateSide::Right) => right_conjuncts.push((*conjunct).clone()),
                 None => {}
@@ -570,43 +422,11 @@ fn extract_implied_or_side_filters(
 
 fn classify_implied_filter_side(
     expr: &TypedExpr,
-    left_ids: &HashSet<crate::sql::column_id::ColumnId>,
-    right_ids: &HashSet<crate::sql::column_id::ColumnId>,
-    left_cols: &HashSet<String>,
-    right_cols: &HashSet<String>,
-    left_qcols: &HashSet<crate::sql::optimizer::rewrite::rules::utils::QualifiedRef>,
-    right_qcols: &HashSet<crate::sql::optimizer::rewrite::rules::utils::QualifiedRef>,
+    left_ids: &HashSet<ColumnId>,
+    right_ids: &HashSet<ColumnId>,
 ) -> Option<PredicateSide> {
-    if let Some((in_left, in_right)) = classify_sides_by_column_ids(expr, left_ids, right_ids) {
-        return match (in_left, in_right) {
-            (true, false) => Some(PredicateSide::Left),
-            (false, true) => Some(PredicateSide::Right),
-            _ => None,
-        };
-    }
-
-    let qrefs = collect_qualified_column_refs(expr);
-    if !qrefs.is_empty() {
-        let all_left = qrefs.iter().all(|qref| left_qcols.contains(qref));
-        let all_right = qrefs.iter().all(|qref| right_qcols.contains(qref));
-        return match (all_left, all_right) {
-            (true, false) => Some(PredicateSide::Left),
-            (false, true) => Some(PredicateSide::Right),
-            _ => None,
-        };
-    }
-
-    let refs = collect_column_refs(expr);
-    if refs.is_empty() {
-        return None;
-    }
-    let all_left = refs.iter().all(|name| {
-        left_cols.contains(&name.to_lowercase()) && !right_cols.contains(&name.to_lowercase())
-    });
-    let all_right = refs.iter().all(|name| {
-        right_cols.contains(&name.to_lowercase()) && !left_cols.contains(&name.to_lowercase())
-    });
-    match (all_left, all_right) {
+    let (in_left, in_right) = classify_sides_by_column_ids(expr, left_ids, right_ids)?;
+    match (in_left, in_right) {
         (true, false) => Some(PredicateSide::Left),
         (false, true) => Some(PredicateSide::Right),
         _ => None,
@@ -708,8 +528,8 @@ fn predicate_key(expr: &TypedExpr) -> String {
 /// extracts `A=B` as a join predicate and returns `X OR Y` as remaining.
 fn factor_common_eq_from_or(
     expr: &TypedExpr,
-    left_cols: &HashSet<String>,
-    right_cols: &HashSet<String>,
+    left_ids: &HashSet<ColumnId>,
+    right_ids: &HashSet<ColumnId>,
 ) -> (Vec<TypedExpr>, Option<TypedExpr>) {
     // Split OR into branches
     let branches = split_or_branches(expr);
@@ -726,7 +546,7 @@ fn factor_common_eq_from_or(
     let mut common_eqs: Vec<TypedExpr> = Vec::new();
     if let Some(first) = branch_conjuncts.first() {
         for candidate in first {
-            if !is_cross_side_eq(candidate, left_cols, right_cols) {
+            if !is_cross_side_eq(candidate, left_ids, right_ids) {
                 continue;
             }
             let in_all = branch_conjuncts[1..]
@@ -820,8 +640,8 @@ fn split_and_refs(expr: &TypedExpr) -> Vec<&TypedExpr> {
 
 fn is_cross_side_eq(
     expr: &TypedExpr,
-    left_cols: &HashSet<String>,
-    right_cols: &HashSet<String>,
+    left_ids: &HashSet<ColumnId>,
+    right_ids: &HashSet<ColumnId>,
 ) -> bool {
     if let ExprKind::BinaryOp {
         left,
@@ -829,18 +649,22 @@ fn is_cross_side_eq(
         right,
     } = &expr.kind
     {
-        let l_name = match &left.kind {
-            ExprKind::ColumnRef { column, .. } => Some(column.to_lowercase()),
+        let l_id = match &left.kind {
+            ExprKind::ColumnRef { column_id, .. } if *column_id != ColumnId::UNSET => {
+                Some(*column_id)
+            }
             _ => None,
         };
-        let r_name = match &right.kind {
-            ExprKind::ColumnRef { column, .. } => Some(column.to_lowercase()),
+        let r_id = match &right.kind {
+            ExprKind::ColumnRef { column_id, .. } if *column_id != ColumnId::UNSET => {
+                Some(*column_id)
+            }
             _ => None,
         };
-        match (l_name, r_name) {
+        match (l_id, r_id) {
             (Some(l), Some(r)) => {
-                (left_cols.contains(&l) && right_cols.contains(&r))
-                    || (left_cols.contains(&r) && right_cols.contains(&l))
+                (left_ids.contains(&l) && right_ids.contains(&r))
+                    || (left_ids.contains(&r) && right_ids.contains(&l))
             }
             _ => false,
         }
@@ -889,12 +713,23 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use arrow::datatypes::DataType;
 
+    fn test_col_id(name: &str) -> ColumnId {
+        match name {
+            "x" => ColumnId::new_for_test(1),
+            "y" => ColumnId::new_for_test(2),
+            "a" => ColumnId::new_for_test(3),
+            "b" => ColumnId::new_for_test(4),
+            "k" => ColumnId::new_for_test(5),
+            _ => ColumnId::new_for_test(100),
+        }
+    }
+
     fn col(name: &str) -> TypedExpr {
         TypedExpr {
             data_type: DataType::Int64,
             nullable: true,
             kind: ExprKind::ColumnRef {
-                column_id: ColumnId::UNSET,
+                column_id: test_col_id(name),
                 qualifier: None,
                 column: name.into(),
             },
@@ -945,8 +780,7 @@ mod tests {
         }
     }
 
-    /// Build a scan for a named table with an alias (the alias is used by
-    /// `collect_qualified_output_columns` when disambiguating self-joins).
+    /// Build a scan with stable test ColumnIds.
     fn scan(table_name: &str, cols: &[&str]) -> LogicalPlan {
         LogicalPlan::Scan(ScanNode {
             database: "db".into(),
@@ -972,7 +806,7 @@ mod tests {
             columns: cols
                 .iter()
                 .map(|n| OutputColumn {
-                    column_id: ColumnId::UNSET,
+                    column_id: test_col_id(n),
                     name: (*n).into(),
                     data_type: DataType::Int64,
                     nullable: true,

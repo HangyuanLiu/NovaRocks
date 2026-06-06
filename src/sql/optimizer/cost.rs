@@ -291,7 +291,7 @@ mod tests {
     fn stats(rows: f64, avg_size: f64) -> Statistics {
         let mut col = HashMap::new();
         col.insert(
-            "c".to_string(),
+            ColumnId::new_for_test(1),
             ColumnStatistic {
                 min_value: 0.0,
                 max_value: 100.0,

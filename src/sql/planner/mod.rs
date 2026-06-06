@@ -688,14 +688,9 @@ fn plan_select_scoped(
             });
         }
 
-        current = build_window_and_project(current, project_items, &select.projection, factory)?;
+        current = build_window_and_project(current, project_items, factory)?;
     } else {
-        current = build_window_and_project(
-            current,
-            select.projection.clone(),
-            &select.projection,
-            factory,
-        )?;
+        current = build_window_and_project(current, select.projection.clone(), factory)?;
     }
 
     // SELECT DISTINCT → Aggregate on all output columns (deduplication)
@@ -1097,27 +1092,11 @@ fn build_distinct(
 fn build_window_and_project(
     input: LogicalPlan,
     project_items: Vec<ProjectItem>,
-    original_projection: &[ProjectItem],
     factory: &mut ColumnRefFactory,
 ) -> Result<LogicalPlan, String> {
     let has_window = project_items.iter().any(|item| has_window_call(&item.expr));
     if has_window {
-        let mut output_columns = Vec::new();
-        for item in original_projection {
-            let column_id = factory.create(
-                None,
-                item.output_name.clone(),
-                item.expr.data_type.clone(),
-                item.expr.nullable,
-            );
-            output_columns.push(OutputColumn {
-                column_id,
-                name: item.output_name.clone(),
-                data_type: item.expr.data_type.clone(),
-                nullable: item.expr.nullable,
-                is_internal: false,
-            });
-        }
+        let mut output_columns = plan_output_columns(&input)?;
         let (window_exprs, rewritten_items) =
             extract_window_calls(&project_items, &mut output_columns, factory);
         // The analytic operator requires input sorted by (partition_by, order_by).
@@ -1354,18 +1333,14 @@ fn extract_window_calls(
 ) -> (Vec<WindowExpr>, Vec<ProjectItem>) {
     let mut window_exprs = Vec::new();
     let mut rewritten = Vec::new();
-    let mut counter = 0usize;
 
-    for (idx, item) in items.iter().enumerate() {
+    for item in items {
         if has_window_call(&item.expr) {
-            let visible_output_column_id = output_columns
-                .get(idx)
-                .map(|col| col.column_id)
-                .unwrap_or(item.output_column_id);
+            let mut counter = 0usize;
             let mut output_ids = WindowOutputIdAllocator {
                 factory,
                 output_columns,
-                visible_output_column_id,
+                visible_output_column_id: item.output_column_id,
                 reuse_visible_output_id: is_exact_window_call(&item.expr),
                 visible_output_id_used: false,
             };
@@ -1399,20 +1374,22 @@ struct WindowOutputIdAllocator<'a> {
 
 impl WindowOutputIdAllocator<'_> {
     fn allocate(&mut self, output_name: &str, data_type: DataType, nullable: bool) -> ColumnId {
-        if self.reuse_visible_output_id && !self.visible_output_id_used {
+        let reuse_visible_output_id = self.reuse_visible_output_id
+            && !self.visible_output_id_used
+            && self.visible_output_column_id != ColumnId::UNSET;
+        let column_id = if reuse_visible_output_id {
             self.visible_output_id_used = true;
-            return self.visible_output_column_id;
-        }
-
-        let column_id =
+            self.visible_output_column_id
+        } else {
             self.factory
-                .create(None, output_name.to_string(), data_type.clone(), nullable);
+                .create(None, output_name.to_string(), data_type.clone(), nullable)
+        };
         self.output_columns.push(OutputColumn {
             column_id,
             name: output_name.to_string(),
             data_type,
             nullable,
-            is_internal: true,
+            is_internal: !reuse_visible_output_id,
         });
         column_id
     }
@@ -1794,29 +1771,9 @@ fn split_projection_for_aggregate(
     Option<TypedExpr>,
 ) {
     let mut agg_calls = Vec::new();
-    let mut output_columns = Vec::new();
-    let mut group_by_rewrite_targets = Vec::new();
 
     for item in projection {
         collect_aggregates(&item.expr, &mut agg_calls, factory);
-        let output_column = OutputColumn {
-            column_id: expr_column_id(&item.expr, &item.output_name, factory),
-            name: item.output_name.clone(),
-            data_type: item.expr.data_type.clone(),
-            nullable: item.expr.nullable,
-            is_internal: false,
-        };
-        if let Some(gb) = group_by
-            .iter()
-            .find(|gb| typed_expr_semantically_eq(&item.expr, gb))
-        {
-            group_by_rewrite_targets.push(GroupByRewriteTarget {
-                expr: gb.clone(),
-                column_id: output_column.column_id,
-                display_name: typed_expr_display_name(gb),
-            });
-        }
-        output_columns.push(output_column);
     }
 
     // Also collect aggregate calls from HAVING clause so the aggregate node
@@ -1824,6 +1781,28 @@ fn split_projection_for_aggregate(
     if let Some(having_expr) = having {
         collect_aggregates(having_expr, &mut agg_calls, factory);
     }
+
+    let mut output_columns = Vec::with_capacity(group_by.len() + agg_calls.len());
+    let mut group_by_rewrite_targets = Vec::new();
+    for gb in group_by {
+        let output_column = group_by_output_column(gb, projection, factory);
+        group_by_rewrite_targets.push(GroupByRewriteTarget {
+            expr: gb.clone(),
+            column_id: output_column.column_id,
+            display_name: typed_expr_display_name(gb),
+        });
+        output_columns.push(output_column);
+    }
+    output_columns.extend(agg_calls.iter().map(|call| {
+        let name = crate::sql::codegen::helpers::agg_call_display_name(call);
+        OutputColumn {
+            column_id: call.output_column_id,
+            name,
+            data_type: call.result_type.clone(),
+            nullable: true,
+            is_internal: false,
+        }
+    }));
 
     let project_items = projection
         .iter()
@@ -1843,6 +1822,34 @@ fn split_projection_for_aggregate(
     });
 
     (project_items, agg_calls, output_columns, rewritten_having)
+}
+
+fn group_by_output_column(
+    group_by: &TypedExpr,
+    projection: &[ProjectItem],
+    factory: &mut ColumnRefFactory,
+) -> OutputColumn {
+    let matching_projection = projection
+        .iter()
+        .find(|item| typed_expr_semantically_eq(&item.expr, group_by));
+    if let Some(item) = matching_projection {
+        return OutputColumn {
+            column_id: expr_column_id(&item.expr, &item.output_name, factory),
+            name: item.output_name.clone(),
+            data_type: item.expr.data_type.clone(),
+            nullable: item.expr.nullable,
+            is_internal: false,
+        };
+    }
+
+    let name = typed_expr_display_name(group_by);
+    OutputColumn {
+        column_id: expr_column_id(group_by, &name, factory),
+        name,
+        data_type: group_by.data_type.clone(),
+        nullable: group_by.nullable,
+        is_internal: true,
+    }
 }
 
 #[derive(Clone)]
@@ -2596,7 +2603,8 @@ fn plan_relation_scoped(
             // the rest of the plan (Window PARTITION BY, GROUP BY, ORDER BY,
             // join eq keys, etc.) from the scan output, and distribution
             // matching would fail.
-            let columns = scan
+            let base_len = scan.table.columns.len();
+            let mut columns: Vec<OutputColumn> = scan
                 .table
                 .columns
                 .iter()
@@ -2616,6 +2624,28 @@ fn plan_relation_scoped(
                     is_internal: false,
                 })
                 .collect();
+            for (meta_idx, c) in scan
+                .table
+                .iceberg_row_lineage_metadata_columns
+                .iter()
+                .enumerate()
+            {
+                let col_id_idx = base_len + meta_idx;
+                columns.push(OutputColumn {
+                    column_id: scan.column_ids.get(col_id_idx).copied().unwrap_or_else(|| {
+                        factory.create(
+                            scan.alias.as_ref().or(Some(&scan.table.name)).cloned(),
+                            c.name.clone(),
+                            c.data_type.clone(),
+                            c.nullable,
+                        )
+                    }),
+                    name: c.name.clone(),
+                    data_type: c.data_type.clone(),
+                    nullable: c.nullable,
+                    is_internal: false,
+                });
+            }
             Ok(LogicalPlan::Scan(ScanNode {
                 database: scan.database,
                 table: scan.table,
@@ -3198,6 +3228,45 @@ mod tests {
                         },
                     ],
                     iceberg_row_lineage_metadata_columns: vec![],
+                    source: ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 0,
+                    },
+                }),
+                "iv_orders" => Ok(TableDef {
+                    name: "iv_orders".to_string(),
+                    columns: vec![
+                        ColumnDef {
+                            name: "o_orderkey".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                            write_default: None,
+                            logical_type: None,
+                        },
+                        ColumnDef {
+                            name: "o_custkey".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                            write_default: None,
+                            logical_type: None,
+                        },
+                    ],
+                    iceberg_row_lineage_metadata_columns: vec![
+                        ColumnDef {
+                            name: "_row_id".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                            write_default: None,
+                            logical_type: None,
+                        },
+                        ColumnDef {
+                            name: "_last_updated_sequence_number".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                            write_default: None,
+                            logical_type: None,
+                        },
+                    ],
                     source: ScanSource::StarRocks {
                         db_id: 0,
                         table_id: 0,
@@ -4033,6 +4102,46 @@ mod tests {
     }
 
     #[test]
+    fn p2_repeat_grouping_aggregate_outputs_follow_group_by_order() {
+        let plan = plan_test_query(
+            "SELECT grouping(a + 1) AS g, a + 1 AS k, count(*) AS cnt \
+             FROM t GROUP BY ROLLUP(a + 1)",
+        );
+        let (project, aggregate) = root_project_over_aggregate(&plan);
+        assert_eq!(
+            aggregate.group_by.len(),
+            2,
+            "ROLLUP with GROUPING() should group by repeat key and grouping marker"
+        );
+        let group_ids = aggregate
+            .group_by
+            .iter()
+            .map(column_ref_id)
+            .collect::<Vec<_>>();
+        let output_prefix_ids = aggregate
+            .output_columns
+            .iter()
+            .take(aggregate.group_by.len())
+            .map(|col| col.column_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            output_prefix_ids, group_ids,
+            "Aggregate output_columns prefix must match group_by physical output order"
+        );
+
+        let g_id = column_ref_id(&project.items[0].expr);
+        let k_id = column_ref_id(&project.items[1].expr);
+        assert_eq!(
+            g_id, group_ids[1],
+            "GROUPING() projection must bind to the grouping marker output"
+        );
+        assert_eq!(
+            k_id, group_ids[0],
+            "rollup key projection must bind to the repeat key output"
+        );
+    }
+
+    #[test]
     fn p1_window_expr_gets_output_column_id() {
         let plan =
             plan_test_query("SELECT a, row_number() OVER (PARTITION BY a ORDER BY b) AS rn FROM t");
@@ -4093,6 +4202,29 @@ mod tests {
         assert_eq!(
             rk.output_column_id, visible_rk.column_id,
             "single visible window projection must reuse the visible rk output id"
+        );
+    }
+
+    #[test]
+    fn p2_window_output_columns_preserve_passthrough_input_ids() {
+        let plan =
+            plan_test_query("SELECT a, row_number() OVER (PARTITION BY a ORDER BY b) AS rn FROM t");
+        let (project, window) = root_project_over_window(&plan);
+        let passthrough_id = column_ref_id(&project.items[0].expr);
+        assert!(
+            window
+                .output_columns
+                .iter()
+                .any(|col| col.column_id == passthrough_id),
+            "WindowNode output_columns must expose child passthrough ColumnIds"
+        );
+        let rn = window_expr_by_function_name(&window.window_exprs, "row_number");
+        assert!(
+            window
+                .output_columns
+                .iter()
+                .any(|col| col.column_id == rn.output_column_id),
+            "WindowNode output_columns must include window result ColumnIds"
         );
     }
 
@@ -4871,6 +5003,37 @@ mod tests {
         assert_eq!(
             column_id, child_output_id,
             "GenerateSeries child output id must match the parent Project ColumnRef"
+        );
+    }
+
+    #[test]
+    fn p2_base_scan_row_lineage_metadata_preserves_column_id_through_planner() {
+        let plan = parse_analyze_and_plan("SELECT _row_id FROM iv_orders AS t")
+            .expect("planner should succeed");
+        let LogicalPlan::Project(project) = &plan else {
+            panic!("expected Project root, got {plan:?}");
+        };
+        let LogicalPlan::Scan(scan) = project.input.as_ref() else {
+            panic!("expected Scan under Project, got {:?}", project.input);
+        };
+
+        let row_id_output = scan
+            .columns
+            .iter()
+            .find(|col| col.name == "_row_id")
+            .expect("ScanNode must expose _row_id metadata output");
+        assert_ne!(row_id_output.column_id, ColumnId::UNSET);
+
+        let ExprKind::ColumnRef { column_id, .. } = project.items[0].expr.kind else {
+            panic!("Project over _row_id should read a ColumnRef");
+        };
+        assert_eq!(
+            column_id, row_id_output.column_id,
+            "Project must read the _row_id ColumnId exposed by the ScanNode"
+        );
+        assert_eq!(
+            project.items[0].output_column_id, row_id_output.column_id,
+            "visible _row_id output should preserve the ScanNode metadata ColumnId"
         );
     }
 

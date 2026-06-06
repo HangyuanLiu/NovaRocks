@@ -14,6 +14,7 @@ use crate::sql::optimizer::estimate::ndv::{agg_group_rows, cap_ndv_at_rows, get_
 use crate::sql::optimizer::estimate::selectivity::apply_filter;
 use crate::sql::optimizer::statistics::*;
 use crate::sql::optimizer::stats::estimate_selectivity;
+use crate::sql::optimizer::stats::extract_column_id;
 use crate::sql::planner::plan::*;
 
 /// Estimate output statistics for a logical plan node recursively.
@@ -105,16 +106,17 @@ fn estimate_scan(scan: &ScanNode, table_stats: &HashMap<String, TableStatistics>
 
     if let Some(ts) = ts_opt {
         let row_count = ts.row_count.max(1) as f64;
+        let table_column_statistics = map_table_column_stats_to_ids(&scan.columns, ts);
 
         let mut output_rows = row_count;
         let mut row_count_confidence = Confidence::Exact;
         for pred in &scan.predicates {
-            let selectivity = estimate_selectivity(pred, &ts.column_stats);
+            let selectivity = estimate_selectivity(pred, &table_column_statistics);
             (output_rows, row_count_confidence) =
                 apply_filter(output_rows, row_count_confidence, selectivity);
         }
 
-        let mut column_statistics: HashMap<String, ColumnStatistic> = scan
+        let mut column_statistics: HashMap<crate::sql::column_id::ColumnId, ColumnStatistic> = scan
             .columns
             .iter()
             .map(|c| {
@@ -124,7 +126,7 @@ fn estimate_scan(scan: &ScanNode, table_stats: &HashMap<String, TableStatistics>
                     .get(&col_name)
                     .cloned()
                     .unwrap_or_else(ColumnStatistic::unknown);
-                (col_name, cs)
+                (c.column_id, cs)
             })
             .collect();
         cap_column_ndvs(&mut column_statistics, output_rows);
@@ -136,10 +138,10 @@ fn estimate_scan(scan: &ScanNode, table_stats: &HashMap<String, TableStatistics>
         }
     } else {
         // No table stats available: use defaults.
-        let mut column_statistics: HashMap<String, ColumnStatistic> = scan
+        let mut column_statistics: HashMap<crate::sql::column_id::ColumnId, ColumnStatistic> = scan
             .columns
             .iter()
-            .map(|c| (c.name.to_lowercase(), ColumnStatistic::unknown()))
+            .map(|c| (c.column_id, ColumnStatistic::unknown()))
             .collect();
         let mut output_rows = 10_000.0;
         let mut row_count_confidence = Confidence::Fallback;
@@ -183,16 +185,14 @@ fn estimate_project(
 ) -> Statistics {
     let input_stats = estimate_statistics(&project.input, table_stats);
     // Filter column_statistics to only projected columns.
-    let projected: HashMap<String, ColumnStatistic> = project
+    let projected: HashMap<crate::sql::column_id::ColumnId, ColumnStatistic> = project
         .items
         .iter()
         .filter_map(|item| {
-            let name = item.output_name.to_lowercase();
-            input_stats
-                .column_statistics
-                .get(&name)
+            extract_column_id(&item.expr)
+                .and_then(|column_id| input_stats.column_statistics.get(&column_id))
                 .cloned()
-                .map(|cs| (name, cs))
+                .map(|cs| (item.output_column_id, cs))
         })
         .collect();
     Statistics {
@@ -374,10 +374,30 @@ fn positive_set_op_output_rows(rows: f64) -> (f64, bool) {
     }
 }
 
-fn cap_column_ndvs(column_statistics: &mut HashMap<String, ColumnStatistic>, output_rows: f64) {
+fn cap_column_ndvs(
+    column_statistics: &mut HashMap<crate::sql::column_id::ColumnId, ColumnStatistic>,
+    output_rows: f64,
+) {
     for stat in column_statistics.values_mut() {
         stat.distinct_values_count = cap_ndv_at_rows(stat.distinct_values_count, output_rows);
     }
+}
+
+fn map_table_column_stats_to_ids(
+    columns: &[crate::sql::analysis::OutputColumn],
+    table_stats: &TableStatistics,
+) -> HashMap<crate::sql::column_id::ColumnId, ColumnStatistic> {
+    columns
+        .iter()
+        .map(|column| {
+            let stat = table_stats
+                .column_stats
+                .get(&column.name.to_lowercase())
+                .cloned()
+                .unwrap_or_else(ColumnStatistic::unknown);
+            (column.column_id, stat)
+        })
+        .collect()
 }
 
 // ===========================================================================
@@ -437,11 +457,35 @@ mod tests {
         )
     }
 
+    fn test_col_id(name: &str) -> ColumnId {
+        let id = match name {
+            "id" | "a" | "x" | "l_orderkey" => 1,
+            "status" | "b" | "o_orderkey" => 2,
+            "amount" => 3,
+            other => {
+                let mut hash = 2_166_136_261u32;
+                for byte in other.bytes() {
+                    hash ^= byte as u32;
+                    hash = hash.wrapping_mul(16_777_619);
+                }
+                1_000 + (hash % 100_000)
+            }
+        };
+        ColumnId::new_for_test(id)
+    }
+
+    fn stat_by_name<'a>(
+        stats: &'a HashMap<ColumnId, ColumnStatistic>,
+        name: &str,
+    ) -> &'a ColumnStatistic {
+        stats.get(&test_col_id(name)).unwrap()
+    }
+
     fn scan_plan(name: &str, cols: &[&str]) -> LogicalPlan {
         let columns: Vec<OutputColumn> = cols
             .iter()
             .map(|c| OutputColumn {
-                column_id: ColumnId::UNSET,
+                column_id: test_col_id(c),
                 name: c.to_string(),
                 data_type: DataType::Int32,
                 nullable: false,
@@ -516,7 +560,7 @@ mod tests {
     fn col_ref(name: &str) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
-                column_id: ColumnId::UNSET,
+                column_id: test_col_id(name),
                 qualifier: None,
                 column: name.to_string(),
             },
@@ -579,10 +623,13 @@ mod tests {
         let stats = estimate_statistics(&plan, &table_stats);
 
         assert!((stats.output_row_count - 100_000.0).abs() < 1.0);
-        assert!(stats.column_statistics.contains_key("id"));
-        assert!(stats.column_statistics.contains_key("status"));
+        assert!(stats.column_statistics.contains_key(&test_col_id("id")));
+        assert!(stats.column_statistics.contains_key(&test_col_id("status")));
         assert_eq!(stats.row_count_confidence, Confidence::Exact);
-        assert_eq!(stats.column_statistics["id"].confidence, Confidence::Exact);
+        assert_eq!(
+            stat_by_name(&stats.column_statistics, "id").confidence,
+            Confidence::Exact
+        );
     }
 
     #[test]
@@ -624,7 +671,10 @@ mod tests {
 
         assert_eq!(stats.output_row_count, 1.0);
         assert_eq!(stats.row_count_confidence, Confidence::Fallback);
-        assert_eq!(stats.column_statistics["id"].distinct_values_count, 1.0);
+        assert_eq!(
+            stat_by_name(&stats.column_statistics, "id").distinct_values_count,
+            1.0
+        );
     }
 
     #[test]
@@ -634,7 +684,7 @@ mod tests {
         assert!((stats.output_row_count - 10_000.0).abs() < 1.0);
         assert_eq!(stats.row_count_confidence, Confidence::Fallback);
         assert_eq!(
-            stats.column_statistics["x"].confidence,
+            stat_by_name(&stats.column_statistics, "x").confidence,
             Confidence::Fallback
         );
     }
@@ -670,9 +720,9 @@ mod tests {
 
     #[test]
     fn and_selectivity_uses_damped_conjunction() {
-        let col_stats: HashMap<String, ColumnStatistic> = [
+        let col_stats: HashMap<ColumnId, ColumnStatistic> = [
             (
-                "a".to_string(),
+                test_col_id("a"),
                 ColumnStatistic {
                     min_value: 0.0,
                     max_value: 100.0,
@@ -683,7 +733,7 @@ mod tests {
                 },
             ),
             (
-                "b".to_string(),
+                test_col_id("b"),
                 ColumnStatistic {
                     min_value: 0.0,
                     max_value: 50.0,
@@ -713,8 +763,8 @@ mod tests {
 
     #[test]
     fn or_selectivity() {
-        let col_stats: HashMap<String, ColumnStatistic> = [(
-            "a".to_string(),
+        let col_stats: HashMap<ColumnId, ColumnStatistic> = [(
+            test_col_id("a"),
             ColumnStatistic {
                 min_value: 0.0,
                 max_value: 100.0,
@@ -738,8 +788,8 @@ mod tests {
 
     #[test]
     fn is_null_selectivity() {
-        let col_stats: HashMap<String, ColumnStatistic> = [(
-            "x".to_string(),
+        let col_stats: HashMap<ColumnId, ColumnStatistic> = [(
+            test_col_id("x"),
             ColumnStatistic {
                 min_value: 0.0,
                 max_value: 100.0,
@@ -811,8 +861,14 @@ mod tests {
         let stats = estimate_statistics(&plan, &table_stats);
         assert_eq!(stats.output_row_count, 1.0);
         assert_eq!(stats.row_count_confidence, Confidence::Fallback);
-        assert_eq!(stats.column_statistics["a"].distinct_values_count, 1.0);
-        assert_eq!(stats.column_statistics["b"].distinct_values_count, 1.0);
+        assert_eq!(
+            stat_by_name(&stats.column_statistics, "a").distinct_values_count,
+            1.0
+        );
+        assert_eq!(
+            stat_by_name(&stats.column_statistics, "b").distinct_values_count,
+            1.0
+        );
     }
 
     #[test]

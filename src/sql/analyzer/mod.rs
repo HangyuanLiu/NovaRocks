@@ -1655,20 +1655,30 @@ impl<'a> AnalyzerContext<'a> {
         match relation {
             Relation::Scan(scan) => {
                 let qualifier = scan.alias.as_deref().unwrap_or(&scan.table.name);
-                if scan.column_ids.len() == scan.table.columns.len() {
+                let base_len = scan.table.columns.len();
+                let meta_len = scan.table.iceberg_row_lineage_metadata_columns.len();
+                if scan.column_ids.len() >= base_len {
                     scope.add_table_with_ids(
                         Some(qualifier),
                         &scan.table.columns,
-                        &scan.column_ids,
+                        &scan.column_ids[..base_len],
                     );
                 } else {
                     scope.add_table(Some(qualifier), &scan.table.columns);
                 }
                 if !scan.table.iceberg_row_lineage_metadata_columns.is_empty() {
-                    scope.add_iceberg_metadata_columns(
-                        qualifier,
-                        &scan.table.iceberg_row_lineage_metadata_columns,
-                    );
+                    if scan.column_ids.len() == base_len + meta_len {
+                        scope.add_iceberg_metadata_columns_with_ids(
+                            qualifier,
+                            &scan.table.iceberg_row_lineage_metadata_columns,
+                            &scan.column_ids[base_len..],
+                        );
+                    } else {
+                        scope.add_iceberg_metadata_columns(
+                            qualifier,
+                            &scan.table.iceberg_row_lineage_metadata_columns,
+                        );
+                    }
                 }
                 Ok(())
             }
@@ -1751,11 +1761,29 @@ impl<'a> AnalyzerContext<'a> {
                 // Mirror Scan: expose base columns + row-lineage metadata
                 // columns under the alias (or table name).
                 let qualifier = rel.alias.as_deref().unwrap_or(&rel.table.name);
-                scope.add_table(Some(qualifier), &rel.table.columns);
-                scope.add_iceberg_metadata_columns(
-                    qualifier,
-                    &rel.table.iceberg_row_lineage_metadata_columns,
-                );
+                let base_len = rel.table.columns.len();
+                let meta_len = rel.table.iceberg_row_lineage_metadata_columns.len();
+                if rel.column_ids.len() >= base_len {
+                    scope.add_table_with_ids(
+                        Some(qualifier),
+                        &rel.table.columns,
+                        &rel.column_ids[..base_len],
+                    );
+                } else {
+                    scope.add_table(Some(qualifier), &rel.table.columns);
+                }
+                if rel.column_ids.len() == base_len + meta_len {
+                    scope.add_iceberg_metadata_columns_with_ids(
+                        qualifier,
+                        &rel.table.iceberg_row_lineage_metadata_columns,
+                        &rel.column_ids[base_len..],
+                    );
+                } else {
+                    scope.add_iceberg_metadata_columns(
+                        qualifier,
+                        &rel.table.iceberg_row_lineage_metadata_columns,
+                    );
+                }
                 Ok(())
             }
         }
@@ -4114,6 +4142,15 @@ mod tests {
         }
     }
 
+    fn find_generate_series_output_id(rel: &Relation) -> Option<ColumnId> {
+        match rel {
+            Relation::GenerateSeries(gs) => Some(gs.output_column_id),
+            Relation::Join(jr) => find_generate_series_output_id(&jr.left)
+                .or_else(|| find_generate_series_output_id(&jr.right)),
+            _ => None,
+        }
+    }
+
     fn find_join_kind<'a>(
         rel: &'a Relation,
         kind: JoinKind,
@@ -4624,6 +4661,13 @@ mod tests {
             assert!(
                 has_join_kind(from, JoinKind::Cross),
                 "scalar subquery without outer FROM should produce CROSS JOIN, got: {from:?}"
+            );
+            let dummy_output_id =
+                find_generate_series_output_id(from).expect("dummy GenerateSeries should exist");
+            assert_ne!(
+                dummy_output_id,
+                ColumnId::UNSET,
+                "dummy GenerateSeries must carry a real ColumnId"
             );
         } else {
             panic!("expected Select body");
@@ -6315,6 +6359,45 @@ mod tests {
         assert_eq!(
             resolved.output_columns[0].data_type,
             arrow::datatypes::DataType::Int64
+        );
+    }
+
+    #[test]
+    fn analyzer_preserves_row_lineage_metadata_column_ids_for_base_scan() {
+        let resolved = parse_raw_and_analyze("SELECT _row_id FROM iv_orders AS t")
+            .expect("analysis should succeed");
+        let QueryBody::Select(sel) = &resolved.body else {
+            panic!("expected Select body");
+        };
+        let from = sel.from.as_ref().expect("FROM should be present");
+        let Relation::Scan(scan) = from else {
+            panic!("expected base Scan, got {from:?}");
+        };
+
+        let base_len = scan.table.columns.len();
+        let meta_len = scan.table.iceberg_row_lineage_metadata_columns.len();
+        assert_eq!(
+            scan.column_ids.len(),
+            base_len + meta_len,
+            "base scan must carry base column ids followed by row-lineage metadata ids"
+        );
+        let row_id = scan.column_ids[base_len];
+        assert_ne!(row_id, ColumnId::UNSET);
+
+        let ExprKind::ColumnRef {
+            column_id, column, ..
+        } = &sel.projection[0].expr.kind
+        else {
+            panic!("expected projection to resolve _row_id as ColumnRef");
+        };
+        assert_eq!(column, "_row_id");
+        assert_eq!(
+            *column_id, row_id,
+            "projection must reference the metadata ColumnId from the base Scan relation"
+        );
+        assert_eq!(
+            resolved.output_columns[0].column_id, row_id,
+            "visible output must preserve the same metadata ColumnId"
         );
     }
 

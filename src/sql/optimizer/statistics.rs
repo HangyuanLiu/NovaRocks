@@ -4,6 +4,8 @@ use std::collections::HashMap;
 
 use arrow::datatypes::DataType;
 
+use crate::sql::column_id::ColumnId;
+
 /// Trustworthiness of a statistic. Variant order is meaningful: derived
 /// `Ord` makes `Exact > Estimated > Fallback`, so `min` yields the
 /// least-confident input.
@@ -66,7 +68,7 @@ impl ColumnStatistic {
 pub struct Statistics {
     pub output_row_count: f64,
     pub row_count_confidence: Confidence,
-    pub column_statistics: HashMap<String, ColumnStatistic>,
+    pub column_statistics: HashMap<ColumnId, ColumnStatistic>,
 }
 
 impl Statistics {
@@ -440,7 +442,7 @@ mod tests {
     fn statistics_compute_size() {
         let mut col_stats = HashMap::new();
         col_stats.insert(
-            "a".to_string(),
+            ColumnId::new_for_test(1),
             ColumnStatistic {
                 min_value: 0.0,
                 max_value: 100.0,
@@ -451,7 +453,7 @@ mod tests {
             },
         );
         col_stats.insert(
-            "b".to_string(),
+            ColumnId::new_for_test(2),
             ColumnStatistic {
                 min_value: 0.0,
                 max_value: 1000.0,

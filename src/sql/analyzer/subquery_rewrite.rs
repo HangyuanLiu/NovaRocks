@@ -29,15 +29,25 @@ use super::scope::AnalyzerScope;
 /// `generate_series(1, 1)` so the join below has a valid left side.
 /// `GenerateSeries` is already in the analyzer's `Relation` vocabulary
 /// and lowers to a simple 1-row source operator.
-fn take_from_or_synthesize_single_row(from: &mut Option<Relation>) -> Relation {
+fn take_from_or_synthesize_single_row(
+    from: &mut Option<Relation>,
+    scope: &AnalyzerScope,
+) -> Relation {
     from.take().unwrap_or_else(|| {
+        let column_name = "__nr_subquery_join_dummy".to_string();
+        let output_column_id = scope.factory().borrow_mut().create(
+            Some("generate_series".to_string()),
+            column_name.clone(),
+            DataType::Int64,
+            false,
+        );
         Relation::GenerateSeries(GenerateSeriesRelation {
             start: 1,
             end: 1,
             step: 1,
-            column_name: "__nr_subquery_join_dummy".to_string(),
+            column_name,
             alias: None,
-            output_column_id: crate::sql::column_id::ColumnId::UNSET,
+            output_column_id,
         })
     })
 }
@@ -948,7 +958,7 @@ impl<'a> AnalyzerContext<'a> {
             (sub_rel, join_cond)
         };
 
-        let current_from = take_from_or_synthesize_single_row(&mut select.from);
+        let current_from = take_from_or_synthesize_single_row(&mut select.from, scope);
 
         select.from = Some(Relation::Join(Box::new(JoinRelation {
             left: current_from,
@@ -1022,7 +1032,7 @@ impl<'a> AnalyzerContext<'a> {
             DataType::Int64,
             true,
         );
-        let current_from = take_from_or_synthesize_single_row(&mut select.from);
+        let current_from = take_from_or_synthesize_single_row(&mut select.from, scope);
         select.from = Some(Relation::Join(Box::new(JoinRelation {
             left: current_from,
             right: sub_rel,
@@ -1175,6 +1185,7 @@ impl<'a> AnalyzerContext<'a> {
         if is_correlated && !inside_or {
             return self.rewrite_correlated_in_subquery(
                 select,
+                scope,
                 lhs_typed,
                 resolved_sub,
                 sq_info.id,
@@ -1263,7 +1274,7 @@ impl<'a> AnalyzerContext<'a> {
             );
         }
 
-        let current_from = take_from_or_synthesize_single_row(&mut select.from);
+        let current_from = take_from_or_synthesize_single_row(&mut select.from, scope);
 
         if inside_or {
             // IN-inside-OR: use LEFT OUTER JOIN, replace placeholder with
@@ -1437,6 +1448,7 @@ impl<'a> AnalyzerContext<'a> {
     fn rewrite_correlated_in_subquery(
         &self,
         select: &mut ResolvedSelect,
+        scope: &AnalyzerScope,
         lhs_typed: TypedExpr,
         resolved_sub: ResolvedQuery,
         sq_id: usize,
@@ -1514,7 +1526,7 @@ impl<'a> AnalyzerContext<'a> {
             JoinKind::LeftSemi
         };
 
-        let current_from = take_from_or_synthesize_single_row(&mut select.from);
+        let current_from = take_from_or_synthesize_single_row(&mut select.from, scope);
         select.from = Some(Relation::Join(Box::new(JoinRelation {
             left: current_from,
             right: sub_rel,
@@ -1609,7 +1621,7 @@ impl<'a> AnalyzerContext<'a> {
                 scalar_nullable,
             );
 
-            let current_from = take_from_or_synthesize_single_row(&mut select.from);
+            let current_from = take_from_or_synthesize_single_row(&mut select.from, scope);
 
             select.from = Some(Relation::Join(Box::new(JoinRelation {
                 left: current_from,
@@ -1653,7 +1665,7 @@ impl<'a> AnalyzerContext<'a> {
                 scalar_col.nullable,
             );
 
-            let current_from = take_from_or_synthesize_single_row(&mut select.from);
+            let current_from = take_from_or_synthesize_single_row(&mut select.from, scope);
 
             select.from = Some(Relation::Join(Box::new(JoinRelation {
                 left: current_from,
@@ -2555,10 +2567,18 @@ fn relation_first_output_column(rel: &Relation) -> Option<OutputColumn> {
             })
         }
         Relation::Join(j) => relation_first_output_column(&j.left),
-        Relation::GenerateSeries(_) => {
-            // GenerateSeries has no ColumnId on its output (only a column_name string).
-            // Cannot produce a ColumnId-addressable indicator from it.
-            None
+        Relation::GenerateSeries(g) => {
+            if g.output_column_id == crate::sql::column_id::ColumnId::UNSET {
+                None
+            } else {
+                Some(OutputColumn {
+                    column_id: g.output_column_id,
+                    name: g.column_name.clone(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    is_internal: false,
+                })
+            }
         }
     }
 }

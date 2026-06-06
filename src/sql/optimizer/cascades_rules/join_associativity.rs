@@ -15,7 +15,9 @@ use crate::sql::optimizer::memo::{MExpr, Memo};
 use crate::sql::optimizer::operator::{LogicalJoinOp, Operator};
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
 
-use super::implement::{collect_column_refs_lowercase, get_group_column_names};
+use crate::sql::optimizer::rewrite::rules::utils::collect_column_id_refs_strict;
+
+use super::implement::get_group_column_ids;
 
 pub(crate) struct JoinAssociativity;
 
@@ -95,19 +97,20 @@ impl Rule for JoinAssociativity {
         // an unsound plan. A future improvement would split the condition by
         // conjunct and re-distribute across the new structure.
         if let Some(ref cond) = inner_op.condition {
-            let cond_cols = collect_column_refs_lowercase(cond);
-            let a_cols = get_group_column_names(memo, a_group);
-            let b_cols = get_group_column_names(memo, b_group);
-            let c_cols = get_group_column_names(memo, c_group);
-            let bc_cols: std::collections::HashSet<String> =
-                b_cols.union(&c_cols).cloned().collect();
+            let Some(cond_ids) = collect_column_id_refs_strict(cond) else {
+                return vec![];
+            };
+            let a_ids = get_group_column_ids(memo, a_group);
+            let b_ids = get_group_column_ids(memo, b_group);
+            let c_ids = get_group_column_ids(memo, c_group);
+            let bc_ids: std::collections::HashSet<_> = b_ids.union(&c_ids).copied().collect();
             // Only fire if every column the condition references is available
             // in B ∪ C, and at least one column also lies in B (otherwise the
             // condition is purely over A, which is even more clearly wrong).
-            let refs_only_bc = cond_cols.iter().all(|c| bc_cols.contains(c));
-            let refs_any_a = cond_cols
+            let refs_only_bc = cond_ids.iter().all(|id| bc_ids.contains(id));
+            let refs_any_a = cond_ids
                 .iter()
-                .any(|c| a_cols.contains(c) && !bc_cols.contains(c));
+                .any(|id| a_ids.contains(id) && !bc_ids.contains(id));
             if !refs_only_bc || refs_any_a {
                 return vec![];
             }

@@ -335,6 +335,35 @@ impl AnalyzerScope {
         ids
     }
 
+    /// Register Iceberg row-lineage pseudo-columns using pre-allocated ids.
+    ///
+    /// This mirrors [`add_table_with_ids`] for hidden metadata columns: the
+    /// analyzer may need to rebuild a relation scope after the initial FROM
+    /// resolution, and reminting ids there would disconnect existing
+    /// `ColumnRef`s from the planner's scan output ids.
+    pub(super) fn add_iceberg_metadata_columns_with_ids(
+        &mut self,
+        qualifier: &str,
+        columns: &[crate::sql::catalog::ColumnDef],
+        column_ids: &[crate::sql::column_id::ColumnId],
+    ) {
+        assert_eq!(
+            columns.len(),
+            column_ids.len(),
+            "add_iceberg_metadata_columns_with_ids: columns/column_ids length mismatch"
+        );
+        let q_lower = qualifier.to_lowercase();
+        for (col, &id) in columns.iter().zip(column_ids.iter()) {
+            let name_lower = col.name.to_lowercase();
+            self.qualified.insert(
+                (q_lower.clone(), name_lower.clone()),
+                (id, col.data_type.clone(), col.nullable),
+            );
+            self.unqualified
+                .insert(name_lower, (id, col.data_type.clone(), col.nullable));
+        }
+    }
+
     /// Merge another scope into this one (for JOINs).
     pub(super) fn merge(&mut self, other: &AnalyzerScope) {
         for name in other.unqualified.keys() {

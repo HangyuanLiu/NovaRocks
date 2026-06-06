@@ -169,10 +169,11 @@ pub(crate) struct ScanRelation {
     pub table: TableDef,
     pub alias: Option<String>,
     /// G1: ColumnId assigned by the analyzer when this table was added to a
-    /// scope. The planner reuses these instead of minting fresh ones so the
-    /// scan output's ColumnIds match the analyzer-produced `ColumnRef`s in
-    /// the rest of the plan (filters, GROUP BY, ORDER BY, Window
-    /// PARTITION BY, etc.).
+    /// scope. For Iceberg v3 row-lineage scans, ids are base columns first,
+    /// then hidden metadata columns. The planner reuses these instead of
+    /// minting fresh ones so the scan output's ColumnIds match the
+    /// analyzer-produced `ColumnRef`s in the rest of the plan (filters,
+    /// GROUP BY, ORDER BY, Window PARTITION BY, etc.).
     pub column_ids: Vec<ColumnId>,
 }
 

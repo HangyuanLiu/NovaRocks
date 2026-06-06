@@ -1471,7 +1471,18 @@ impl<'a> PlanFragmentBuilder<'a> {
                 type_desc: None,
                 nullable: col.nullable,
             };
-            scope.add_column(qualifier.map(|s| s.to_string()), col.name.clone(), binding);
+            let col_id = op
+                .columns
+                .iter()
+                .find(|oc| oc.name.eq_ignore_ascii_case(&col.name))
+                .map(|oc| oc.column_id)
+                .unwrap_or(crate::sql::column_id::ColumnId::UNSET);
+            scope.add_column_with_id(
+                col_id,
+                qualifier.map(|s| s.to_string()),
+                col.name.clone(),
+                binding,
+            );
         }
 
         // Compile predicates pushed down by the optimizer
@@ -5932,7 +5943,7 @@ mod tests {
 
     fn output_columns() -> Vec<OutputColumn> {
         vec![OutputColumn {
-            column_id: crate::sql::column_id::ColumnId::UNSET,
+            column_id: crate::sql::column_id::ColumnId::new_for_test(1),
             name: "id".to_string(),
             data_type: DataType::Int32,
             nullable: false,
@@ -5943,7 +5954,7 @@ mod tests {
     fn id_expr() -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
-                column_id: crate::sql::column_id::ColumnId::UNSET,
+                column_id: crate::sql::column_id::ColumnId::new_for_test(1),
                 qualifier: None,
                 column: "id".to_string(),
             },

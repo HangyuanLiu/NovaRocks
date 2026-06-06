@@ -488,7 +488,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 // Build scope
                 let mut scope = self.new_scope();
                 let qualifier = alias_name.as_deref().unwrap_or(&table_def.name);
-                let column_ids = scope.add_table(Some(qualifier), &table_def.columns);
+                let mut column_ids = scope.add_table(Some(qualifier), &table_def.columns);
                 // If alias differs from table name, also register with table name
                 if let Some(ref a) = alias_name
                     && !a.eq_ignore_ascii_case(&table_def.name)
@@ -499,10 +499,11 @@ impl<'a> super::AnalyzerContext<'a> {
                 // _last_updated_sequence_number) when the table carries them.
                 // These are hidden from SELECT * but resolvable by explicit name.
                 if !table_def.iceberg_row_lineage_metadata_columns.is_empty() {
-                    scope.add_iceberg_metadata_columns(
+                    let meta_ids = scope.add_iceberg_metadata_columns(
                         qualifier,
                         &table_def.iceberg_row_lineage_metadata_columns,
                     );
+                    column_ids.extend(meta_ids);
                 }
 
                 let relation = Relation::Scan(ScanRelation {

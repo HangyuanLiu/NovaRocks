@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr, UnOp};
+use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::statistics::{
     ColumnStatistic, Confidence, IN_PREDICATE_DEFAULT_FILTER, IS_NULL_FILTER,
     PREDICATE_UNKNOWN_FILTER,
@@ -13,7 +14,7 @@ use super::arith::{damped_conjunction, sat_mul};
 /// Estimate selectivity of a predicate expression (0.0..1.0).
 pub(crate) fn estimate_selectivity(
     expr: &TypedExpr,
-    column_stats: &HashMap<String, ColumnStatistic>,
+    column_stats: &HashMap<ColumnId, ColumnStatistic>,
 ) -> f64 {
     match &expr.kind {
         ExprKind::BinaryOp { left, op, right } => match op {
@@ -39,9 +40,9 @@ pub(crate) fn estimate_selectivity(
             _ => PREDICATE_UNKNOWN_FILTER,
         },
         ExprKind::IsNull { negated, expr } => {
-            let col_name = extract_column_name(expr);
-            let null_frac = col_name
-                .and_then(|name| column_stats.get(&name.to_lowercase()))
+            let col_id = extract_column_id(expr);
+            let null_frac = col_id
+                .and_then(|column_id| column_stats.get(&column_id))
                 .map(|cs| {
                     if cs.nulls_fraction > 0.0 {
                         cs.nulls_fraction
@@ -57,9 +58,9 @@ pub(crate) fn estimate_selectivity(
             list,
             negated,
         } => {
-            let col_name = extract_column_name(expr);
-            let ndv = col_name
-                .and_then(|name| column_stats.get(&name.to_lowercase()))
+            let col_id = extract_column_id(expr);
+            let ndv = col_id
+                .and_then(|column_id| column_stats.get(&column_id))
                 .and_then(trusted_distinct_values_count);
 
             let sel = if let Some(ndv) = ndv {
@@ -148,13 +149,13 @@ fn flatten_and<'a>(expr: &'a TypedExpr, out: &mut Vec<&'a TypedExpr>) {
 fn estimate_eq_selectivity(
     left: &TypedExpr,
     right: &TypedExpr,
-    column_stats: &HashMap<String, ColumnStatistic>,
+    column_stats: &HashMap<ColumnId, ColumnStatistic>,
 ) -> f64 {
     // col = literal: use 1/ndv
-    let col_name = extract_column_name(left).or_else(|| extract_column_name(right));
+    let col_id = extract_column_id(left).or_else(|| extract_column_id(right));
 
-    if let Some(name) = col_name
-        && let Some(cs) = column_stats.get(&name.to_lowercase())
+    if let Some(column_id) = col_id
+        && let Some(cs) = column_stats.get(&column_id)
         && let Some(ndv) = trusted_distinct_values_count(cs)
     {
         return 1.0 / ndv;
@@ -177,14 +178,14 @@ fn estimate_range_selectivity(
     left: &TypedExpr,
     right: &TypedExpr,
     op: BinOp,
-    column_stats: &HashMap<String, ColumnStatistic>,
+    column_stats: &HashMap<ColumnId, ColumnStatistic>,
 ) -> f64 {
     // Try to use min/max range if available.
-    let col_name = extract_column_name(left);
+    let col_id = extract_column_id(left);
     let literal_val = extract_literal_f64(right);
 
-    if let (Some(name), Some(val)) = (col_name, literal_val)
-        && let Some(cs) = column_stats.get(&name.to_lowercase())
+    if let (Some(column_id), Some(val)) = (col_id, literal_val)
+        && let Some(cs) = column_stats.get(&column_id)
     {
         let min = cs.min_value;
         let max = cs.max_value;
@@ -214,12 +215,12 @@ fn extract_literal_f64(expr: &TypedExpr) -> Option<f64> {
     }
 }
 
-/// Extract column name from a simple column reference expression.
-pub(crate) fn extract_column_name(expr: &TypedExpr) -> Option<&str> {
+/// Extract ColumnId from a simple column reference expression.
+pub(crate) fn extract_column_id(expr: &TypedExpr) -> Option<ColumnId> {
     match &expr.kind {
-        ExprKind::ColumnRef { column, .. } => Some(column.as_str()),
-        ExprKind::Cast { expr, .. } => extract_column_name(expr),
-        ExprKind::Nested(inner) => extract_column_name(inner),
+        ExprKind::ColumnRef { column_id, .. } if *column_id != ColumnId::UNSET => Some(*column_id),
+        ExprKind::Cast { expr, .. } => extract_column_id(expr),
+        ExprKind::Nested(inner) => extract_column_id(inner),
         _ => None,
     }
 }
@@ -352,7 +353,7 @@ mod tests {
     fn fallback_ndv_does_not_drive_equality_selectivity() {
         let mut stats = HashMap::new();
         stats.insert(
-            "c".to_string(),
+            ColumnId::new_for_test(1),
             ColumnStatistic {
                 distinct_values_count: 10_000.0,
                 confidence: Confidence::Fallback,
@@ -371,7 +372,7 @@ mod tests {
     fn fallback_ndv_does_not_drive_in_list_selectivity() {
         let mut stats = HashMap::new();
         stats.insert(
-            "c".to_string(),
+            ColumnId::new_for_test(1),
             ColumnStatistic {
                 distinct_values_count: 10_000.0,
                 confidence: Confidence::Fallback,

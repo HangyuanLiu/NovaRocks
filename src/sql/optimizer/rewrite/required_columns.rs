@@ -104,17 +104,20 @@ fn tag_values(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> Lo
     LogicalPlan::Values(node)
 }
 
-/// GenerateSeries has no ColumnId on its output slot (only a `column_name:
-/// String`).  We write `parent_needed` (or an empty set when None, meaning
-/// all-required) onto the field so Phase-2 no-ops cleanly.
+/// GenerateSeries is a leaf with one output ColumnId.  Like Scan/Values, a
+/// `None` parent means all leaf outputs are required.
 fn tag_generate_series(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> LogicalPlan {
     let LogicalPlan::GenerateSeries(mut node) = plan else {
         unreachable!()
     };
-    // Use an empty set as the "all required" sentinel: GenerateSeries is a
-    // leaf with a single unnamed column and no column-id addressable outputs.
-    // Phase-2 prune rule is a no-op for GenerateSeries anyway.
-    node.required_output_columns = Some(parent_needed.unwrap_or_default());
+    let needed = parent_needed.unwrap_or_else(|| {
+        if node.output_column_id == ColumnId::UNSET {
+            HashSet::new()
+        } else {
+            HashSet::from([node.output_column_id])
+        }
+    });
+    node.required_output_columns = Some(needed);
     LogicalPlan::GenerateSeries(node)
 }
 
@@ -197,13 +200,11 @@ fn tag_aggregate(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) ->
 
     // Conservative keep-all-aggregate-inputs strategy.
     //
-    // `output_columns` is built by `split_projection_for_aggregate` in SELECT
-    // order (1:1 with the SELECT list), NOT as [group_by cols ++ aggregate
-    // result cols].  The `aggregates` list is extracted separately from the
-    // projection expressions and has NO positional correspondence to
-    // `output_columns`.  Attempting `output_columns[group_by.len() + i]` to
-    // find the output id of `aggregates[i]` is therefore WRONG and can panic
-    // or silently drop the wrong aggregate.
+    // Aggregate output metadata starts with the group-by output prefix used by
+    // the physical layout, while aggregate function identity lives on
+    // AggregateCall.output_column_id.  Required input derivation should not
+    // infer liveness from output positions; if the aggregate node is live at
+    // all, every expression it consumes remains needed.
     //
     // Conservative fix: child always needs ALL group-by column refs PLUS ALL
     // aggregate args and order-by column refs, regardless of parent_needed.
@@ -252,7 +253,9 @@ fn tag_repeat(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> Lo
         unreachable!()
     };
     node.required_output_columns = parent_needed.clone();
-    let child_needed = if node.all_rollup_column_ids.len() == node.all_rollup_columns.len() {
+    let child_needed = if parent_needed.is_none() {
+        None
+    } else if node.all_rollup_column_ids.len() == node.all_rollup_columns.len() {
         let grouping_output_ids: HashSet<ColumnId> = node
             .grouping_fn_ids
             .iter()
@@ -997,11 +1000,10 @@ mod tests {
     /// Bug A regression: tag_aggregate must use the conservative keep-all
     /// strategy for aggregate args.
     ///
-    /// `AggregateNode.output_columns` is SELECT-ordered (built by
-    /// `split_projection_for_aggregate`), NOT [group_by ++ aggregates].
-    /// Using `output_columns[group_by.len() + i]` to find `aggregates[i]`'s
-    /// output id is incorrect and can panic or silently drop the wrong
-    /// aggregate's args from child_needed.
+    /// Required input derivation must not use output positions to decide which
+    /// aggregate calls are live. Aggregate call identity is
+    /// `AggregateCall.output_column_id`, and this pass conservatively keeps
+    /// every aggregate input while the aggregate node itself is live.
     ///
     /// Conservative fix: child_needed always includes ALL group_by column refs
     /// PLUS ALL aggregate args and order_by column refs, regardless of
@@ -1009,18 +1011,13 @@ mod tests {
     /// and prevents input columns from being spuriously dropped by PruneScan.
     #[test]
     fn tag_aggregate_conservative_keeps_all_aggregate_args_in_child_needed() {
-        // Aggregate[group_by=[y@1], count(*)→301, sum(x@10)→302]
-        // output_columns is SELECT-ordered: [count_oc@301, sum_oc@302]
-        // (y is NOT in output_columns — it is only in group_by)
+        // Aggregate[group_by=[y@1], count(*)→301, sum(x@2)→302]
         // parent_needed = {301}  (only count needed)
         //
         // Expected (conservative fix):
         //   child_needed = {1, 10}  (group_by y@1 + ALL aggregate args: x@10)
         //   c@3 (not referenced by any group_by or agg arg) is NOT needed.
         //
-        // A positional approach would have tried output_columns[group_by.len()+0]
-        // = output_columns[1] = sum_oc@302 (WRONG — positions don't align), then
-        // possibly panicked on output_columns[1+1] (out of bounds for 2-elem vec).
         let agg = LogicalPlan::Aggregate(AggregateNode {
             input: Box::new(scan_with_3_cols()),
             group_by: vec![col_ref_expr(ColumnId::new_for_test(1))],
@@ -1042,8 +1039,8 @@ mod tests {
                     output_column_id: ColumnId::UNSET,
                 },
             ],
-            // SELECT-ordered: [count_oc@301, sum_oc@302] — y is NOT here.
             output_columns: vec![
+                make_output_column(ColumnId::new_for_test(1), "y"),
                 make_output_column(ColumnId::new_for_test(301), "count"),
                 make_output_column(ColumnId::new_for_test(302), "sum_x"),
             ],
@@ -1790,6 +1787,68 @@ mod tests {
         assert!(req.contains(&ColumnId::new_for_test(1)));
         assert!(req.contains(&ColumnId::new_for_test(2)));
         assert!(!req.contains(&ColumnId::new_for_test(3)));
+    }
+
+    #[test]
+    fn tag_repeat_parent_none_preserves_all_child_outputs() {
+        use crate::sql::planner::plan::RepeatPlanNode;
+
+        let repeat = LogicalPlan::Repeat(RepeatPlanNode {
+            input: Box::new(scan_with_3_cols()),
+            repeat_column_ref_list: vec![vec!["b".to_string()]],
+            repeat_column_ref_ids: vec![vec![ColumnId::new_for_test(2)]],
+            grouping_ids: vec![1],
+            all_rollup_columns: vec!["b".to_string()],
+            all_rollup_column_ids: vec![ColumnId::new_for_test(2)],
+            grouping_key_aliases: vec![],
+            grouping_fn_args: vec![],
+            grouping_fn_arg_ids: vec![],
+            grouping_fn_ids: vec![],
+            required_output_columns: None,
+        });
+
+        let tagged = tag_required_columns(repeat, None);
+        let LogicalPlan::Repeat(r) = tagged else {
+            panic!()
+        };
+        assert!(
+            r.required_output_columns.is_none(),
+            "Repeat root should keep the all-required None marker"
+        );
+        let LogicalPlan::Scan(s) = *r.input else {
+            panic!()
+        };
+        let req = s.required_output_columns.unwrap();
+        assert_eq!(req.len(), 3, "child scan must keep all outputs");
+        assert!(req.contains(&ColumnId::new_for_test(1)));
+        assert!(req.contains(&ColumnId::new_for_test(2)));
+        assert!(req.contains(&ColumnId::new_for_test(3)));
+    }
+
+    #[test]
+    fn tag_generate_series_parent_none_requires_output_id() {
+        use crate::sql::planner::plan::GenerateSeriesNode;
+
+        let output_id = ColumnId::new_for_test(301);
+        let tagged = tag_required_columns(
+            LogicalPlan::GenerateSeries(GenerateSeriesNode {
+                start: 1,
+                end: 3,
+                step: 1,
+                column_name: "x".to_string(),
+                alias: Some("gs".to_string()),
+                output_column_id: output_id,
+                required_output_columns: None,
+            }),
+            None,
+        );
+
+        let LogicalPlan::GenerateSeries(node) = tagged else {
+            panic!()
+        };
+        let req = node.required_output_columns.unwrap();
+        assert_eq!(req.len(), 1);
+        assert!(req.contains(&output_id));
     }
 
     #[test]

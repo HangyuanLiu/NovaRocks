@@ -1,25 +1,26 @@
 use std::collections::HashMap;
 
 use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
+use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence, PREDICATE_UNKNOWN_FILTER};
 
 use super::arith::damped_conjunction;
 use super::ndv::get_join_key_ndv_with_confidence;
-use super::selectivity::{estimate_selectivity, extract_column_name};
+use super::selectivity::{estimate_selectivity, extract_column_id};
 
 const UNKNOWN_JOIN_RESIDUAL_EQ_FILTER: f64 = 0.5;
 
 #[derive(Default)]
 pub(crate) struct JoinConditionEstimate {
     pub eq_key_ndvs: Vec<(f64, f64, Confidence)>,
-    pub eq_key_pairs: Vec<(String, String)>,
+    pub eq_key_pairs: Vec<(ColumnId, ColumnId)>,
     pub residual_selectivity: Option<(f64, Confidence)>,
 }
 
 pub(crate) fn estimate_join_condition(
     condition: Option<&TypedExpr>,
-    left_stats: &HashMap<String, ColumnStatistic>,
-    right_stats: &HashMap<String, ColumnStatistic>,
+    left_stats: &HashMap<ColumnId, ColumnStatistic>,
+    right_stats: &HashMap<ColumnId, ColumnStatistic>,
 ) -> JoinConditionEstimate {
     let Some(condition) = condition else {
         return JoinConditionEstimate::default();
@@ -50,8 +51,8 @@ pub(crate) fn estimate_join_condition(
 
 fn collect_join_conjuncts<'a>(
     expr: &'a TypedExpr,
-    left_stats: &HashMap<String, ColumnStatistic>,
-    right_stats: &HashMap<String, ColumnStatistic>,
+    left_stats: &HashMap<ColumnId, ColumnStatistic>,
+    right_stats: &HashMap<ColumnId, ColumnStatistic>,
     estimate: &mut JoinConditionEstimate,
     residuals: &mut Vec<&'a TypedExpr>,
 ) {
@@ -77,8 +78,8 @@ fn collect_join_conjuncts<'a>(
 
 fn try_collect_equi_key(
     expr: &TypedExpr,
-    left_stats: &HashMap<String, ColumnStatistic>,
-    right_stats: &HashMap<String, ColumnStatistic>,
+    left_stats: &HashMap<ColumnId, ColumnStatistic>,
+    right_stats: &HashMap<ColumnId, ColumnStatistic>,
     estimate: &mut JoinConditionEstimate,
 ) -> bool {
     let ExprKind::BinaryOp {
@@ -90,19 +91,19 @@ fn try_collect_equi_key(
         return false;
     };
 
-    let Some(left_name) = lower_column_name(left) else {
+    let Some(left_id) = extract_column_id(left) else {
         return false;
     };
-    let Some(right_name) = lower_column_name(right) else {
+    let Some(right_id) = extract_column_id(right) else {
         return false;
     };
 
-    let forward = left_stats.contains_key(&left_name) && right_stats.contains_key(&right_name);
-    let reverse = left_stats.contains_key(&right_name) && right_stats.contains_key(&left_name);
+    let forward = left_stats.contains_key(&left_id) && right_stats.contains_key(&right_id);
+    let reverse = left_stats.contains_key(&right_id) && right_stats.contains_key(&left_id);
     let (left_expr, right_expr, left_key, right_key) = match (forward, reverse) {
-        (true, false) => (left.as_ref(), right.as_ref(), left_name, right_name),
-        (false, true) => (right.as_ref(), left.as_ref(), right_name, left_name),
-        (true, true) if left_name == right_name => {
+        (true, false) => (left.as_ref(), right.as_ref(), left_id, right_id),
+        (false, true) => (right.as_ref(), left.as_ref(), right_id, left_id),
+        (true, true) if left_id == right_id => {
             let (left_ndv, left_confidence) = get_join_key_ndv_with_confidence(left, left_stats);
             let (right_ndv, right_confidence) =
                 get_join_key_ndv_with_confidence(right, right_stats);
@@ -129,7 +130,7 @@ fn try_collect_equi_key(
 
 fn estimate_join_residual_selectivity(
     expr: &TypedExpr,
-    column_stats: &HashMap<String, ColumnStatistic>,
+    column_stats: &HashMap<ColumnId, ColumnStatistic>,
 ) -> f64 {
     let selectivity = estimate_selectivity(expr, column_stats);
     if (selectivity - PREDICATE_UNKNOWN_FILTER).abs() < f64::EPSILON
@@ -143,7 +144,7 @@ fn estimate_join_residual_selectivity(
 
 fn is_unknown_column_literal_eq(
     expr: &TypedExpr,
-    column_stats: &HashMap<String, ColumnStatistic>,
+    column_stats: &HashMap<ColumnId, ColumnStatistic>,
 ) -> bool {
     let ExprKind::BinaryOp {
         left,
@@ -154,14 +155,14 @@ fn is_unknown_column_literal_eq(
         return false;
     };
 
-    let Some(column_name) = extract_column_name(left).or_else(|| extract_column_name(right)) else {
+    let Some(column_id) = extract_column_id(left).or_else(|| extract_column_id(right)) else {
         return false;
     };
     if !(is_literal_like(left) || is_literal_like(right)) {
         return false;
     }
     column_stats
-        .get(&column_name.to_lowercase())
+        .get(&column_id)
         .map_or(true, |cs| cs.distinct_values_count <= 1.0)
 }
 
@@ -179,14 +180,10 @@ fn is_literal_like(expr: &TypedExpr) -> bool {
     }
 }
 
-fn lower_column_name(expr: &TypedExpr) -> Option<String> {
-    extract_column_name(expr).map(|name| name.to_lowercase())
-}
-
 fn combined_column_statistics(
-    left_stats: &HashMap<String, ColumnStatistic>,
-    right_stats: &HashMap<String, ColumnStatistic>,
-) -> HashMap<String, ColumnStatistic> {
+    left_stats: &HashMap<ColumnId, ColumnStatistic>,
+    right_stats: &HashMap<ColumnId, ColumnStatistic>,
+) -> HashMap<ColumnId, ColumnStatistic> {
     let mut combined = left_stats.clone();
     combined.extend(right_stats.clone());
     combined

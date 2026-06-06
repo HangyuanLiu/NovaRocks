@@ -394,8 +394,13 @@ pub(crate) fn collect_output_ids_ordered(
             a.output_columns.iter().map(|c| c.column_id).collect()
         }
         LogicalPlan::Values(v) => v.columns.iter().map(|c| c.column_id).collect(),
-        // GenerateSeries has no ColumnId on its output slot (only a name string).
-        LogicalPlan::GenerateSeries(_) => vec![],
+        LogicalPlan::GenerateSeries(g) => {
+            if g.output_column_id == crate::sql::column_id::ColumnId::UNSET {
+                vec![]
+            } else {
+                vec![g.output_column_id]
+            }
+        }
         // Passthrough: the node does not add or rename output ColumnIds.
         LogicalPlan::Filter(f) => collect_output_ids_ordered(&f.input),
         LogicalPlan::Sort(s) => collect_output_ids_ordered(&s.input),
@@ -425,6 +430,116 @@ pub(crate) fn collect_output_ids_ordered(
 /// `collect_output_ids(plan) = collect_output_ids_ordered(plan).into_iter().collect()`.
 pub(crate) fn collect_output_ids(plan: &LogicalPlan) -> HashSet<crate::sql::column_id::ColumnId> {
     collect_output_ids_ordered(plan).into_iter().collect()
+}
+
+/// Collect every referenced [`ColumnId`] only when all column references in the
+/// expression have been bound.
+///
+/// Constants return `Some(empty set)`. Any `ColumnRef` carrying
+/// [`ColumnId::UNSET`] returns `None`, so rewrite rules can leave the predicate
+/// in place instead of falling back to names.
+pub(crate) fn collect_column_id_refs_strict(
+    expr: &TypedExpr,
+) -> Option<HashSet<crate::sql::column_id::ColumnId>> {
+    let mut out = HashSet::new();
+    collect_column_id_refs_strict_inner(expr, &mut out)?;
+    Some(out)
+}
+
+fn collect_column_id_refs_strict_inner(
+    expr: &TypedExpr,
+    out: &mut HashSet<crate::sql::column_id::ColumnId>,
+) -> Option<()> {
+    use crate::sql::column_id::ColumnId;
+
+    match &expr.kind {
+        ExprKind::ColumnRef { column_id, .. } => {
+            if *column_id == ColumnId::UNSET {
+                return None;
+            }
+            out.insert(*column_id);
+        }
+        ExprKind::LambdaParamRef { .. } | ExprKind::Literal(_) => {}
+        ExprKind::BinaryOp { left, right, .. } => {
+            collect_column_id_refs_strict_inner(left, out)?;
+            collect_column_id_refs_strict_inner(right, out)?;
+        }
+        ExprKind::UnaryOp { expr, .. } => collect_column_id_refs_strict_inner(expr, out)?,
+        ExprKind::FunctionCall { args, .. } => {
+            for arg in args {
+                collect_column_id_refs_strict_inner(arg, out)?;
+            }
+        }
+        ExprKind::LambdaFunction { body, .. } => {
+            collect_column_id_refs_strict_inner(body, out)?;
+        }
+        ExprKind::AggregateCall { args, order_by, .. } => {
+            for arg in args {
+                collect_column_id_refs_strict_inner(arg, out)?;
+            }
+            for item in order_by {
+                collect_column_id_refs_strict_inner(&item.expr, out)?;
+            }
+        }
+        ExprKind::Cast { expr, .. } => collect_column_id_refs_strict_inner(expr, out)?,
+        ExprKind::IsNull { expr, .. } => collect_column_id_refs_strict_inner(expr, out)?,
+        ExprKind::InList { expr, list, .. } => {
+            collect_column_id_refs_strict_inner(expr, out)?;
+            for item in list {
+                collect_column_id_refs_strict_inner(item, out)?;
+            }
+        }
+        ExprKind::Between {
+            expr, low, high, ..
+        } => {
+            collect_column_id_refs_strict_inner(expr, out)?;
+            collect_column_id_refs_strict_inner(low, out)?;
+            collect_column_id_refs_strict_inner(high, out)?;
+        }
+        ExprKind::Like { expr, pattern, .. } => {
+            collect_column_id_refs_strict_inner(expr, out)?;
+            collect_column_id_refs_strict_inner(pattern, out)?;
+        }
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(operand) = operand {
+                collect_column_id_refs_strict_inner(operand, out)?;
+            }
+            for (when, then) in when_then {
+                collect_column_id_refs_strict_inner(when, out)?;
+                collect_column_id_refs_strict_inner(then, out)?;
+            }
+            if let Some(else_expr) = else_expr {
+                collect_column_id_refs_strict_inner(else_expr, out)?;
+            }
+        }
+        ExprKind::IsTruthValue { expr, .. } => collect_column_id_refs_strict_inner(expr, out)?,
+        ExprKind::Nested(inner) => collect_column_id_refs_strict_inner(inner, out)?,
+        ExprKind::WindowCall {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for arg in args {
+                collect_column_id_refs_strict_inner(arg, out)?;
+            }
+            for expr in partition_by {
+                collect_column_id_refs_strict_inner(expr, out)?;
+            }
+            for item in order_by {
+                collect_column_id_refs_strict_inner(&item.expr, out)?;
+            }
+        }
+        ExprKind::SubqueryPlaceholder { .. } => {}
+        ExprKind::Lambda { body, .. } => {
+            collect_column_id_refs_strict_inner(body, out)?;
+        }
+    }
+    Some(())
 }
 
 /// Merge a parent's needed columns with additional column names.
@@ -1068,6 +1183,32 @@ mod column_id_helper_tests {
 
         let ordered = collect_output_ids_ordered(&plan);
         assert_eq!(ordered, vec![real_id], "UNSET items must be filtered out");
+    }
+
+    #[test]
+    fn generate_series_output_id_is_collected() {
+        use crate::sql::planner::plan::GenerateSeriesNode;
+
+        let output_id = ColumnId::new_for_test(88);
+        let plan = LogicalPlan::GenerateSeries(GenerateSeriesNode {
+            start: 1,
+            end: 3,
+            step: 1,
+            column_name: "x".to_string(),
+            alias: Some("gs".to_string()),
+            output_column_id: output_id,
+            required_output_columns: None,
+        });
+
+        let ordered = collect_output_ids_ordered(&plan);
+        assert_eq!(
+            ordered,
+            vec![output_id],
+            "GenerateSeries must expose its output ColumnId to pruning helpers"
+        );
+        let unordered = collect_output_ids(&plan);
+        assert_eq!(unordered.len(), 1);
+        assert!(unordered.contains(&output_id));
     }
 
     // ---------------------------------------------------------------------
