@@ -1469,9 +1469,10 @@ impl<'a> AnalyzerContext<'a> {
                     // future items would resolve to the alias expression
                     // instead of the FROM column.
                     if scope.resolve(None, &name).is_err() {
-                        effective_scope.add_column(
+                        effective_scope.add_column_with_id(
                             None,
                             &name,
+                            column_id,
                             typed.data_type.clone(),
                             typed.nullable,
                         );
@@ -6387,6 +6388,78 @@ mod tests {
         assert_ne!(
             computed_item.output_column_id, passthrough_item.output_column_id,
             "each projection item must receive a distinct output_column_id"
+        );
+    }
+
+    #[test]
+    fn p2_using_reference_keeps_analyzer_selected_id() {
+        let resolved =
+            parse_and_analyze("SELECT k1 FROM t1 JOIN t2 USING(k1)").expect("analysis succeeds");
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("expected Select body");
+        };
+        let item = &select.projection[0];
+        let ExprKind::ColumnRef {
+            column_id,
+            qualifier,
+            column,
+        } = &item.expr.kind
+        else {
+            panic!(
+                "expected USING projection to resolve as ColumnRef, got {:?}",
+                item.expr.kind
+            );
+        };
+        assert_eq!(column, "k1");
+        assert!(
+            qualifier.is_none(),
+            "USING projection must not rely on canonical qualifier steering: {:?}",
+            item.expr.kind
+        );
+        assert_ne!(
+            *column_id,
+            crate::sql::column_id::ColumnId::UNSET,
+            "USING projection must carry a real ColumnId"
+        );
+        assert_eq!(
+            *column_id, item.output_column_id,
+            "USING projection output must reuse the analyzer-selected source ColumnId"
+        );
+        assert_eq!(
+            *column_id, resolved.output_columns[0].column_id,
+            "query output must expose the same USING source ColumnId"
+        );
+    }
+
+    #[test]
+    fn p2_full_outer_using_coalesce_has_project_output_id() {
+        let resolved = parse_and_analyze("SELECT k1 FROM t1 FULL OUTER JOIN t2 USING(k1)")
+            .expect("analysis succeeds");
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("expected Select body");
+        };
+        let merged_item = &select.projection[0];
+        assert_ne!(
+            merged_item.output_column_id,
+            crate::sql::column_id::ColumnId::UNSET,
+            "FULL OUTER USING merged projection must have a real output ColumnId"
+        );
+        assert_eq!(
+            merged_item.output_column_id, resolved.output_columns[0].column_id,
+            "FULL OUTER USING merged query output must expose the project output id"
+        );
+        let ExprKind::FunctionCall { name, args, .. } = &merged_item.expr.kind else {
+            panic!(
+                "expected FULL OUTER USING merged column to be COALESCE, got {:?}",
+                merged_item.expr.kind
+            );
+        };
+        assert_eq!(name, "coalesce");
+        assert_eq!(args.len(), 2);
+        assert!(
+            args.iter()
+                .all(|arg| matches!(arg.kind, ExprKind::ColumnRef { .. })),
+            "FULL OUTER USING merged expression should coalesce the two side ColumnRefs"
         );
     }
 }

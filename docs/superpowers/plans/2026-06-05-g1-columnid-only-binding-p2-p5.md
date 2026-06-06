@@ -245,38 +245,38 @@
 - Test: `src/sql/planner/mod.rs`, `src/sql/analyzer/mod.rs`, `src/sql/analyzer/subquery_rewrite.rs`
 - SQL Test: `sql-tests/optimizer/column_id_binding_repeat_using.sql`
 
-- [ ] Step 1: 写红测 `p2_rollup_materialized_key_has_real_id`
+- [x] Step 1: 写红测 `p2_rollup_materialized_key_has_real_id`
   - SQL: `SELECT grouping(a + 1), a + 1 FROM t GROUP BY ROLLUP(a + 1)`
   - 断言 `prepare_repeat_input` 物化的 `__repeat_group_key_0` Project item 有真实 id,后续 repeat/grouping refs 复用该 id 或对应 repeat output id。
 
-- [ ] Step 2: 写红测 `p2_using_reference_keeps_analyzer_selected_id`
+- [x] Step 2: 写红测 `p2_using_reference_keeps_analyzer_selected_id`
   - SQL: `SELECT k FROM l JOIN r USING(k)`
   - 断言 unqualified `k` 的 `ColumnRef.column_id` 等于 analyzer 选定侧输出 id,而不是通过 `canonical_qualifier` 改 qualifier。
 
-- [ ] Step 3: 写红测 `p2_full_outer_using_coalesce_has_project_output_id`
+- [x] Step 3: 写红测 `p2_full_outer_using_coalesce_has_project_output_id`
   - SQL: `SELECT k FROM l FULL OUTER JOIN r USING(k)`
   - 断言 `COALESCE(l.k, r.k)` 作为计算型 Project 输出有真实 id,上层引用该 id。
 
-- [ ] Step 4: 写红测 `p2_subquery_alias_reexposes_producing_id`
+- [x] Step 4: 写红测 `p2_subquery_alias_reexposes_producing_id`
   - SQL: `SELECT x FROM (SELECT a AS x FROM t) s WHERE x > 1`
   - 断言外层 `x` 与内层 `a AS x` producing id 一致。
 
-- [ ] Step 5: 实现 Repeat 非 ColumnRef key 物化 id
+- [x] Step 5: 实现 Repeat 非 ColumnRef key 物化 id
   - `prepare_repeat_input` 中每个非 `ColumnRef` rollup key 物化成 Project item 时铸造 `materialized_id`。
   - 对应 repeat 输出再铸造 `repeat_output_id`。
   - 在 P2 内保留旧 `grouping_key_aliases: Vec<(String, String)>` 供现有 reader 使用,但新增 side table 或局部 map `(materialized_id, repeat_output_id)` 供 expression rewrite 使用。
   - `rewrite_grouping_key_refs` 不再写 `qualifier = "__repeat_group"`;它返回带 `repeat_output_id` 的 `ColumnRef`。
 
-- [ ] Step 6: 修 USING
+- [x] Step 6: 修 USING
   - INNER/LEFT/RIGHT USING:解析出的 unqualified USING column 直接保留 analyzer 选定侧 id。
   - FULL OUTER USING:生成 `COALESCE` project output id,后续 unqualified 引用绑定到该 output id。
   - `canonical_qualifier` 仅临时保留给旧测试或 dead code,生产路径不再依赖它。
 
-- [ ] Step 7: 修 subquery alias 重曝光
+- [x] Step 7: 修 subquery alias 重曝光
   - `subquery_rewrite.rs` / derived relation scope 注册列时,从 producer `OutputColumn.column_id` 调用 `add_column_with_id` 或 analyzer 等价 API。
   - 禁止为 alias wrapper fresh 一个新 id,除非该 alias 是新的计算表达式输出。
 
-- [ ] Step 8: SQL golden
+- [x] Step 8: SQL golden
   - 新增 `sql-tests/optimizer/column_id_binding_repeat_using.sql`:
     - rollup computed key
     - cube simple key
@@ -284,7 +284,7 @@
     - subquery alias with WHERE and ORDER BY
   - 每个 case 验证结果;可加 `-- @explain_contains=Repeat` / `HashJoin`。
 
-- [ ] Step 9: 验证 P2 fallback 归零
+- [x] Step 9: 验证 P2 fallback 归零
   - Run: `cargo test --profile dev-opt p2_rollup_materialized_key_has_real_id -- --nocapture`
   - Run: `cargo test --profile dev-opt p2_using_reference_keeps_analyzer_selected_id -- --nocapture`
   - Run: `cargo test --profile dev-opt p2_full_outer_using_coalesce_has_project_output_id -- --nocapture`
@@ -292,7 +292,7 @@
   - Run: `cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --suite optimizer --only column_id_binding_repeat_using --mode verify`
   - Run: `cargo fmt --check`
 
-- [ ] Step 10: Commit
+- [x] Step 10: Commit
   - `git commit -m "planner: preserve ColumnId across repeat using and subquery aliases"`
 
 ---

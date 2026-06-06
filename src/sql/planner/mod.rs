@@ -639,6 +639,7 @@ fn plan_select_scoped(
             &mut select,
             &mut repeat_info,
             REPEAT_GROUP_QUALIFIER,
+            factory,
         );
         current = LogicalPlan::Repeat(RepeatPlanNode {
             input: Box::new(current),
@@ -706,6 +707,7 @@ fn prepare_repeat_input(
     select: &mut ResolvedSelect,
     repeat_info: &mut crate::sql::analysis::RepeatInfo,
     repeat_group_qualifier: &str,
+    factory: &mut ColumnRefFactory,
 ) -> Vec<(String, String)> {
     let grouping_key_aliases: Vec<(String, String)> = repeat_info
         .all_rollup_columns
@@ -753,6 +755,12 @@ fn prepare_repeat_input(
         let data_type = source_expr.data_type.clone();
         let nullable = source_expr.nullable;
         let original_display = typed_expr_display_name(&source_expr);
+        let materialized_column_id =
+            if let ExprKind::ColumnRef { column_id, .. } = &source_expr.kind {
+                *column_id
+            } else {
+                factory.create(None, alias_name.clone(), data_type.clone(), nullable)
+            };
 
         // Substitute downstream references to the original expression with a
         // ColumnRef on the alias. For the ColumnRef case the existing
@@ -775,7 +783,7 @@ fn prepare_repeat_input(
             },
             _ => TypedExpr {
                 kind: ExprKind::ColumnRef {
-                    column_id: ColumnId::UNSET,
+                    column_id: materialized_column_id,
                     qualifier: None,
                     column: alias_name.clone(),
                 },
@@ -785,15 +793,10 @@ fn prepare_repeat_input(
         };
         substitutions.push((original_display, replacement));
 
-        let output_column_id = if let ExprKind::ColumnRef { column_id, .. } = &source_expr.kind {
-            *column_id
-        } else {
-            ColumnId::UNSET
-        };
         project_items.push(ProjectItem {
             expr: source_expr,
             output_name: alias_name.clone(),
-            output_column_id,
+            output_column_id: materialized_column_id,
         });
     }
 
@@ -3247,6 +3250,48 @@ mod tests {
         (project, filter, aggregate)
     }
 
+    fn first_repeat_node(plan: &LogicalPlan) -> &RepeatPlanNode {
+        fn visit(plan: &LogicalPlan) -> Option<&RepeatPlanNode> {
+            match plan {
+                LogicalPlan::Repeat(node) => Some(node),
+                LogicalPlan::Filter(node) => visit(&node.input),
+                LogicalPlan::Project(node) => visit(&node.input),
+                LogicalPlan::Aggregate(node) => visit(&node.input),
+                LogicalPlan::Join(node) => visit(&node.left).or_else(|| visit(&node.right)),
+                LogicalPlan::Sort(node) => visit(&node.input),
+                LogicalPlan::Limit(node) => visit(&node.input),
+                LogicalPlan::Union(node) => node.inputs.iter().find_map(visit),
+                LogicalPlan::Intersect(node) => node.inputs.iter().find_map(visit),
+                LogicalPlan::Except(node) => node.inputs.iter().find_map(visit),
+                LogicalPlan::TableFunction(node) => visit(&node.input),
+                LogicalPlan::Window(node) => visit(&node.input),
+                LogicalPlan::CTEAnchor(node) => {
+                    visit(&node.consumer).or_else(|| visit(&node.produce))
+                }
+                LogicalPlan::CTEProduce(node) => visit(&node.input),
+                LogicalPlan::Decode(node) => visit(&node.input),
+                LogicalPlan::AggregateStateMerge(node) => {
+                    visit(&node.old_input).or_else(|| visit(&node.delta_input))
+                }
+                LogicalPlan::Scan(_)
+                | LogicalPlan::Values(_)
+                | LogicalPlan::GenerateSeries(_)
+                | LogicalPlan::CTEConsume(_)
+                | LogicalPlan::ImvDelta(_)
+                | LogicalPlan::ImvVersion(_) => None,
+            }
+        }
+
+        visit(plan).unwrap_or_else(|| panic!("missing Repeat node in {plan:?}"))
+    }
+
+    fn column_ref_id(expr: &TypedExpr) -> ColumnId {
+        let ExprKind::ColumnRef { column_id, .. } = &expr.kind else {
+            panic!("expected ColumnRef, got {:?}", expr.kind);
+        };
+        *column_id
+    }
+
     fn root_project_over_window(plan: &LogicalPlan) -> (&ProjectNode, &WindowNode) {
         let LogicalPlan::Project(project) = plan else {
             panic!("expected Project root, got {plan:?}");
@@ -4783,6 +4828,96 @@ mod tests {
         assert_eq!(
             column_id, child_output_id,
             "GenerateSeries child output id must match the parent Project ColumnRef"
+        );
+    }
+
+    #[test]
+    fn p2_rollup_materialized_key_has_real_id() {
+        let plan = parse_analyze_and_plan("SELECT a + 1 AS k FROM t GROUP BY ROLLUP(a + 1)")
+            .expect("planner should succeed");
+        let (_project, aggregate) = root_project_over_aggregate(&plan);
+        let repeat = first_repeat_node(&plan);
+        let LogicalPlan::Project(repeat_input_project) = repeat.input.as_ref() else {
+            panic!("expected Repeat input Project, got {:?}", repeat.input);
+        };
+        let repeat_key = repeat_input_project
+            .items
+            .iter()
+            .find(|item| item.output_name == "__repeat_group_key_0")
+            .expect("computed rollup key should be materialized before Repeat");
+        assert_ne!(
+            repeat_key.output_column_id,
+            ColumnId::UNSET,
+            "computed ROLLUP key materialization must have a real ColumnId"
+        );
+        assert_eq!(
+            column_ref_id(&aggregate.group_by[0]),
+            repeat_key.output_column_id,
+            "Aggregate over Repeat must group by the materialized key ColumnId"
+        );
+    }
+
+    #[test]
+    fn p2_subquery_alias_reexposes_producing_id() {
+        let plan = parse_analyze_and_plan("SELECT x FROM (SELECT a AS x FROM t) s WHERE x > 1")
+            .expect("planner should succeed");
+        let LogicalPlan::Project(project) = &plan else {
+            panic!("expected Project root, got {plan:?}");
+        };
+        let LogicalPlan::Filter(filter) = project.input.as_ref() else {
+            panic!("expected Filter under Project, got {:?}", project.input);
+        };
+        let child_output = plan_output_columns(&filter.input).expect("child output columns");
+        let producing_id = child_output
+            .iter()
+            .find(|col| col.name == "x")
+            .expect("subquery child should expose x")
+            .column_id;
+        assert_ne!(
+            producing_id,
+            ColumnId::UNSET,
+            "subquery alias producer must expose a real ColumnId"
+        );
+        let ExprKind::BinaryOp { left, .. } = &filter.predicate.kind else {
+            panic!(
+                "expected WHERE x > 1 binary predicate, got {:?}",
+                filter.predicate.kind
+            );
+        };
+        assert_eq!(
+            column_ref_id(left),
+            producing_id,
+            "outer WHERE x must reuse the subquery producer ColumnId"
+        );
+        assert_eq!(
+            column_ref_id(&project.items[0].expr),
+            producing_id,
+            "outer SELECT x must reuse the subquery producer ColumnId"
+        );
+    }
+
+    #[test]
+    fn p2_full_outer_using_order_by_uses_project_output_id() {
+        let plan = parse_analyze_and_plan(
+            "SELECT a AS merged FROM t l FULL OUTER JOIN t r USING(a) ORDER BY merged",
+        )
+        .expect("planner should succeed");
+        let LogicalPlan::Sort(sort) = &plan else {
+            panic!("expected Sort root, got {plan:?}");
+        };
+        let LogicalPlan::Project(project) = sort.input.as_ref() else {
+            panic!("expected Project under Sort, got {:?}", sort.input);
+        };
+        let merged_output_id = project.items[0].output_column_id;
+        assert_ne!(
+            merged_output_id,
+            ColumnId::UNSET,
+            "FULL OUTER USING merged projection must have a real output ColumnId"
+        );
+        assert_eq!(
+            column_ref_id(&sort.items[0].expr),
+            merged_output_id,
+            "ORDER BY merged must reference the FULL OUTER USING project output ColumnId"
         );
     }
 
