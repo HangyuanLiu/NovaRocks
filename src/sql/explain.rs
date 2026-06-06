@@ -1434,6 +1434,7 @@ mod tests {
 
     #[test]
     fn physical_decode_explain_prints_dict_to_string_mapping() {
+        use crate::sql::column_id::ColumnId;
         use crate::sql::optimizer::operator::PhysicalDecodeOp;
         use crate::sql::planner::plan::DecodeMapping;
 
@@ -1469,6 +1470,8 @@ mod tests {
         let decode = PhysicalPlanNode {
             op: Operator::PhysicalDecode(PhysicalDecodeOp {
                 mappings: vec![DecodeMapping {
+                    source_column_id: ColumnId::new_for_test(1),
+                    output_column_id: ColumnId::new_for_test(2),
                     dict_column: "d".to_string(),
                     string_column: "s".to_string(),
                 }],

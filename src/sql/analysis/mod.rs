@@ -80,12 +80,18 @@ pub(crate) struct ResolvedSelect {
 pub(crate) struct RepeatInfo {
     /// For each repeat level, the column names that are NON-null.
     pub repeat_column_ref_list: Vec<Vec<String>>,
+    /// For each repeat level, the ColumnIds that are NON-null.
+    pub repeat_column_ref_ids: Vec<Vec<ColumnId>>,
     /// Grouping ID bitmap for each level. Bit=1 means column is NULLed.
     pub grouping_ids: Vec<u64>,
     /// All rollup column names.
     pub all_rollup_columns: Vec<String>,
+    /// All rollup ColumnIds.
+    pub all_rollup_column_ids: Vec<ColumnId>,
     /// GROUPING() function calls: (output_name, arg_column_names).
     pub grouping_fn_args: Vec<(String, Vec<String>)>,
+    /// GROUPING() function argument ColumnIds, aligned with `grouping_fn_args`.
+    pub grouping_fn_arg_ids: Vec<Vec<ColumnId>>,
     /// GROUPING() virtual output ids: (output_name, analyzer-minted ColumnId).
     pub grouping_fn_ids: Vec<(String, ColumnId)>,
 }

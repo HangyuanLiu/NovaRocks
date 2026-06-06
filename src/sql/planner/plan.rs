@@ -87,6 +87,8 @@ pub(crate) struct DecodeNode {
 /// rest of the plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DecodeMapping {
+    pub source_column_id: ColumnId,
+    pub output_column_id: ColumnId,
     pub dict_column: String,
     pub string_column: String,
 }
@@ -107,10 +109,13 @@ pub(crate) struct AggregateStateMergeNode {
 pub(crate) struct RepeatPlanNode {
     pub input: Box<LogicalPlan>,
     pub repeat_column_ref_list: Vec<Vec<String>>,
+    pub repeat_column_ref_ids: Vec<Vec<ColumnId>>,
     pub grouping_ids: Vec<u64>,
     pub all_rollup_columns: Vec<String>,
+    pub all_rollup_column_ids: Vec<ColumnId>,
     pub grouping_key_aliases: Vec<(String, String)>,
     pub grouping_fn_args: Vec<(String, Vec<String>)>,
+    pub grouping_fn_arg_ids: Vec<Vec<ColumnId>>,
     pub grouping_fn_ids: Vec<(String, ColumnId)>,
     /// Set by the Phase-1 column-pruning tagging pass; `None` means all columns required.
     pub required_output_columns: Option<HashSet<ColumnId>>,

@@ -4,7 +4,6 @@ use arrow::datatypes::DataType;
 
 use crate::engine::dictionary::model::DictionarySnapshot;
 use crate::sql::analysis::{ExprKind, TypedExpr};
-use crate::sql::column_id::ColumnId;
 
 use super::context::DictScope;
 
@@ -112,7 +111,7 @@ pub(crate) fn rewrite_column_ref_with_scope(expr: &TypedExpr, scope: &DictScope)
     {
         return TypedExpr {
             kind: ExprKind::ColumnRef {
-                column_id: ColumnId::UNSET,
+                column_id: binding.source_column_id,
                 qualifier: qualifier.clone(),
                 column: binding.dict_column.clone(),
             },

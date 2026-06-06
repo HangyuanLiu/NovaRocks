@@ -1373,21 +1373,12 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
         Operator::PhysicalProject(p) => p
             .items
             .iter()
-            .map(|item| {
-                let cid = if let crate::sql::analysis::ExprKind::ColumnRef { column_id, .. } =
-                    &item.expr.kind
-                {
-                    *column_id
-                } else {
-                    ColumnId::UNSET
-                };
-                crate::sql::analysis::OutputColumn {
-                    column_id: cid,
-                    name: item.output_name.clone(),
-                    data_type: item.expr.data_type.clone(),
-                    nullable: item.expr.nullable,
-                    is_internal: false,
-                }
+            .map(|item| crate::sql::analysis::OutputColumn {
+                column_id: item.output_column_id,
+                name: item.output_name.clone(),
+                data_type: item.expr.data_type.clone(),
+                nullable: item.expr.nullable,
+                is_internal: false,
             })
             .collect(),
         Operator::PhysicalHashAggregate(a) => a.output_columns.clone(),
@@ -3589,6 +3580,8 @@ mod tests {
         let plan = LogicalPlan::Decode(DecodeNode {
             input: Box::new(scan),
             mappings: vec![DecodeMapping {
+                source_column_id: ColumnId::new_for_test(1),
+                output_column_id: ColumnId::new_for_test(2),
                 dict_column: "a".to_string(),
                 string_column: "a_str".to_string(),
             }],

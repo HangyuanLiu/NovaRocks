@@ -644,10 +644,13 @@ fn plan_select_scoped(
         current = LogicalPlan::Repeat(RepeatPlanNode {
             input: Box::new(current),
             repeat_column_ref_list: repeat_info.repeat_column_ref_list,
+            repeat_column_ref_ids: repeat_info.repeat_column_ref_ids,
             grouping_ids: repeat_info.grouping_ids,
             all_rollup_columns: repeat_info.all_rollup_columns,
+            all_rollup_column_ids: repeat_info.all_rollup_column_ids,
             grouping_key_aliases,
             grouping_fn_args: repeat_info.grouping_fn_args,
+            grouping_fn_arg_ids: repeat_info.grouping_fn_arg_ids,
             grouping_fn_ids: repeat_info.grouping_fn_ids,
             required_output_columns: None,
         });
@@ -749,6 +752,9 @@ fn prepare_repeat_input(
     // display name so a later pass can rewrite projection / having
     // occurrences of the same expression to a ColumnRef on the alias.
     let mut substitutions: Vec<(String, TypedExpr)> = Vec::new();
+    let mut repeat_key_ids_by_name: std::collections::HashMap<String, ColumnId> =
+        std::collections::HashMap::new();
+    let mut all_rollup_column_ids = Vec::with_capacity(grouping_key_aliases.len());
     for (idx, (_, alias_name)) in grouping_key_aliases.iter().enumerate() {
         let Some(source_expr) = select.group_by.get(idx).cloned() else {
             continue;
@@ -762,6 +768,12 @@ fn prepare_repeat_input(
             } else {
                 factory.create(None, alias_name.clone(), data_type.clone(), nullable)
             };
+        if let Some((original_name, _)) = grouping_key_aliases.get(idx) {
+            repeat_key_ids_by_name
+                .insert(original_name.to_ascii_lowercase(), materialized_column_id);
+        }
+        repeat_key_ids_by_name.insert(alias_name.to_ascii_lowercase(), materialized_column_id);
+        all_rollup_column_ids.push(materialized_column_id);
 
         // Substitute downstream references to the original expression with a
         // ColumnRef on the alias. For the ColumnRef case the existing
@@ -800,6 +812,36 @@ fn prepare_repeat_input(
             output_column_id: materialized_column_id,
         });
     }
+
+    repeat_info.repeat_column_ref_ids = repeat_info
+        .repeat_column_ref_list
+        .iter()
+        .map(|non_null_cols| {
+            non_null_cols
+                .iter()
+                .filter_map(|col| {
+                    repeat_key_ids_by_name
+                        .get(&col.to_ascii_lowercase())
+                        .copied()
+                })
+                .collect()
+        })
+        .collect();
+    repeat_info.all_rollup_column_ids = all_rollup_column_ids;
+    repeat_info.grouping_fn_arg_ids = repeat_info
+        .grouping_fn_args
+        .iter()
+        .map(|(_, arg_cols)| {
+            arg_cols
+                .iter()
+                .filter_map(|col| {
+                    repeat_key_ids_by_name
+                        .get(&col.to_ascii_lowercase())
+                        .copied()
+                })
+                .collect()
+        })
+        .collect();
 
     *current = LogicalPlan::Project(ProjectNode {
         input: Box::new(current.clone()),

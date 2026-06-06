@@ -1383,9 +1383,12 @@ impl<'a> AnalyzerContext<'a> {
         // Attach RepeatInfo to the resolved SELECT.
         sel.repeat = Some(RepeatInfo {
             repeat_column_ref_list,
+            repeat_column_ref_ids: Vec::new(),
             grouping_ids,
             all_rollup_columns,
+            all_rollup_column_ids: Vec::new(),
             grouping_fn_args,
+            grouping_fn_arg_ids: Vec::new(),
             grouping_fn_ids,
         });
 

@@ -1140,10 +1140,13 @@ impl Rule for RepeatToPhysical {
         vec![NewExpr {
             op: Operator::PhysicalRepeat(PhysicalRepeatOp {
                 repeat_column_ref_list: op.repeat_column_ref_list.clone(),
+                repeat_column_ref_ids: op.repeat_column_ref_ids.clone(),
                 grouping_ids: op.grouping_ids.clone(),
                 all_rollup_columns: op.all_rollup_columns.clone(),
+                all_rollup_column_ids: op.all_rollup_column_ids.clone(),
                 grouping_key_aliases: op.grouping_key_aliases.clone(),
                 grouping_fn_args: op.grouping_fn_args.clone(),
+                grouping_fn_arg_ids: op.grouping_fn_arg_ids.clone(),
                 grouping_fn_ids: op.grouping_fn_ids.clone(),
             }),
             children: expr.children.clone(),
@@ -1418,6 +1421,8 @@ mod decode_tests {
         let child_group = memo.new_group(child_mexpr);
 
         let mappings = vec![DecodeMapping {
+            source_column_id: ColumnId::new_for_test(1),
+            output_column_id: ColumnId::new_for_test(2),
             dict_column: "a".into(),
             string_column: "a_str".into(),
         }];
@@ -1456,6 +1461,8 @@ mod decode_tests {
         let child_group = memo.new_group(child_mexpr);
 
         let mappings = vec![DecodeMapping {
+            source_column_id: ColumnId::new_for_test(1),
+            output_column_id: ColumnId::new_for_test(2),
             dict_column: "dict_col".into(),
             string_column: "string_col".into(),
         }];

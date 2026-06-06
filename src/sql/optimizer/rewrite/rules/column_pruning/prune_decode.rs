@@ -151,10 +151,14 @@ mod tests {
             input: dummy_input(),
             mappings: vec![
                 DecodeMapping {
+                    source_column_id: id_s1,
+                    output_column_id: id_s1,
                     dict_column: "__nr_dict_s1".to_string(),
                     string_column: "s1".to_string(),
                 },
                 DecodeMapping {
+                    source_column_id: id_s2,
+                    output_column_id: id_s2,
                     dict_column: "__nr_dict_s2".to_string(),
                     string_column: "s2".to_string(),
                 },
@@ -221,6 +225,8 @@ mod tests {
         let node = DecodeNode {
             input: dummy_input(),
             mappings: vec![DecodeMapping {
+                source_column_id: id_s,
+                output_column_id: id_s,
                 dict_column: "__nr_dict_s".to_string(),
                 string_column: "s".to_string(),
             }],

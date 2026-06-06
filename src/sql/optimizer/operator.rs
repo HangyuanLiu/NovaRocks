@@ -235,10 +235,13 @@ pub(crate) struct LogicalTableFunctionOp {
 #[derive(Clone, Debug)]
 pub(crate) struct LogicalRepeatOp {
     pub repeat_column_ref_list: Vec<Vec<String>>,
+    pub repeat_column_ref_ids: Vec<Vec<ColumnId>>,
     pub grouping_ids: Vec<u64>,
     pub all_rollup_columns: Vec<String>,
+    pub all_rollup_column_ids: Vec<ColumnId>,
     pub grouping_key_aliases: Vec<(String, String)>,
     pub grouping_fn_args: Vec<(String, Vec<String>)>,
+    pub grouping_fn_arg_ids: Vec<Vec<ColumnId>>,
     pub grouping_fn_ids: Vec<(String, ColumnId)>,
 }
 
@@ -400,10 +403,13 @@ pub(crate) struct PhysicalCTEConsumeOp {
 #[derive(Clone, Debug)]
 pub(crate) struct PhysicalRepeatOp {
     pub repeat_column_ref_list: Vec<Vec<String>>,
+    pub repeat_column_ref_ids: Vec<Vec<ColumnId>>,
     pub grouping_ids: Vec<u64>,
     pub all_rollup_columns: Vec<String>,
+    pub all_rollup_column_ids: Vec<ColumnId>,
     pub grouping_key_aliases: Vec<(String, String)>,
     pub grouping_fn_args: Vec<(String, Vec<String>)>,
+    pub grouping_fn_arg_ids: Vec<Vec<ColumnId>>,
     pub grouping_fn_ids: Vec<(String, ColumnId)>,
 }
 

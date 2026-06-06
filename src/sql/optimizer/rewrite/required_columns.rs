@@ -248,15 +248,24 @@ fn tag_window(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> Lo
 }
 
 fn tag_repeat(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> LogicalPlan {
-    // RepeatPlanNode.repeat_column_ref_list is Vec<Vec<String>> (column names),
-    // not ColumnIds.  We cannot map names to ids here, so we cannot determine
-    // which child columns the rollup groups reference.  Pass None to the child
-    // (keep all input columns) to avoid under-tagging.
     let LogicalPlan::Repeat(mut node) = plan else {
         unreachable!()
     };
-    node.required_output_columns = parent_needed;
-    node.input = Box::new(tag_required_columns(*node.input, None));
+    node.required_output_columns = parent_needed.clone();
+    let child_needed = if node.all_rollup_column_ids.len() == node.all_rollup_columns.len() {
+        let grouping_output_ids: HashSet<ColumnId> = node
+            .grouping_fn_ids
+            .iter()
+            .map(|(_, column_id)| *column_id)
+            .collect();
+        let mut needed = parent_needed.unwrap_or_default();
+        needed.retain(|column_id| !grouping_output_ids.contains(column_id));
+        needed.extend(node.all_rollup_column_ids.iter().copied());
+        Some(needed)
+    } else {
+        None
+    };
+    node.input = Box::new(tag_required_columns(*node.input, child_needed));
     LogicalPlan::Repeat(node)
 }
 
@@ -1745,19 +1754,22 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn tag_repeat_passes_none_to_child_even_when_parent_needed_is_narrow() {
+    fn tag_repeat_maps_parent_needed_and_rollup_keys_to_child_ids() {
         use crate::sql::planner::plan::RepeatPlanNode;
-        // Repeat node referencing rollup columns b@2 (by name, not id).
+        // Repeat node referencing rollup columns b@2 by ColumnId.
         // parent_needed = {1}  (only a — does NOT include the rollup column b@2).
-        // The handler cannot resolve the name→id for b, so it must pass None
-        // to the child, keeping all {1,2,3}.
+        // The handler sends {1,2} to the child: parent output a@1 plus
+        // rollup key b@2 needed by Repeat's nulling/grouping logic.
         let repeat = LogicalPlan::Repeat(RepeatPlanNode {
             input: Box::new(scan_with_3_cols()),
             repeat_column_ref_list: vec![vec!["b".to_string()]],
+            repeat_column_ref_ids: vec![vec![ColumnId::new_for_test(2)]],
             grouping_ids: vec![1],
             all_rollup_columns: vec!["b".to_string()],
+            all_rollup_column_ids: vec![ColumnId::new_for_test(2)],
             grouping_key_aliases: vec![],
             grouping_fn_args: vec![],
+            grouping_fn_arg_ids: vec![],
             grouping_fn_ids: vec![],
             required_output_columns: None,
         });
@@ -1773,16 +1785,11 @@ mod tests {
         let LogicalPlan::Scan(s) = *r.input else {
             panic!()
         };
-        // Child got None → Scan expands to all columns.
         let req = s.required_output_columns.unwrap();
-        assert_eq!(
-            req.len(),
-            3,
-            "scan keeps all 3 columns, including b@2 needed by rollup"
-        );
+        assert_eq!(req.len(), 2, "scan keeps parent-needed and rollup key ids");
         assert!(req.contains(&ColumnId::new_for_test(1)));
         assert!(req.contains(&ColumnId::new_for_test(2)));
-        assert!(req.contains(&ColumnId::new_for_test(3)));
+        assert!(!req.contains(&ColumnId::new_for_test(3)));
     }
 
     #[test]

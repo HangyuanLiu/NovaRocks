@@ -356,17 +356,17 @@
 - Modify: `src/sql/codegen/expr_compiler.rs`
 - Test: `src/sql/codegen/resolve.rs`
 
-- [ ] Step 1: 写红测 `p3_expr_scope_does_not_resolve_semantic_columns_by_name`
+- [x] Step 1: 写红测 `p3_expr_scope_does_not_resolve_semantic_columns_by_name`
   - `ExprScope::add_column_with_id(real_id, None, "a", binding)`
   - 断言 `resolve_by_id(real_id)` 成功。
   - 断言不存在普通 name resolver;若测试无法直接表达,先改调用点使 `resolve_column` 删除后编译失败作为红。
 
-- [ ] Step 2: 写红测 `p3_internal_name_channel_is_explicit`
+- [x] Step 2: 写红测 `p3_internal_name_channel_is_explicit`
   - `scope.add_internal_column("__change_op", binding)`
   - `resolve_internal_by_name("__change_op")` 成功。
   - `resolve_internal_by_name("a")` 失败,除非显式 add internal。
 
-- [ ] Step 3: 修改 `ExprScope`
+- [x] Step 3: 修改 `ExprScope`
   - 删除字段:
     - `qualified`
     - `unqualified`
@@ -384,17 +384,21 @@
     - `add_internal_column(name, binding)`
     - `resolve_internal_by_name(name)`
 
-- [ ] Step 4: 修改所有 scope 注册
+- [x] Step 4: 修改所有 scope 注册
   - 普通输出全部调用 `add_column_with_id` 或 `add_id_alias`。
   - `add_column` 若保留,签名必须要求 `ColumnId` 或只追加 `ordered`,不能建立 name binding。
   - `AggregateStateMerge` 内部列用 `add_internal_column("__change_op", ...)` 等显式注册。
 
-- [ ] Step 5: 验证
+- [x] Step 5: 验证
   - Run: `cargo test --profile dev-opt p3_expr_scope_ -- --nocapture`
   - Run: `cargo build --profile dev-opt`
   - Run: `cargo fmt --check`
+  - 2026-06-06 evidence:
+    - `cargo test --profile dev-opt p3_ -- --nocapture` PASS for 6 P3 scope/compiler tests.
+    - `cargo build --profile dev-opt` PASS.
+    - `cargo fmt` applied; later `cargo fmt --check` is part of phase verification.
 
-- [ ] Step 6: Commit
+- [x] Step 6: Commit
   - `git commit -m "codegen: make ExprScope semantic binding ColumnId-only"`
 
 ---
@@ -408,33 +412,36 @@
 - Modify: `src/sql/codegen/fragment_builder.rs`
 - Test: `src/sql/codegen/expr_compiler.rs`
 
-- [ ] Step 1: 写红测 `p3_columnref_without_id_fails_fast`
+- [x] Step 1: 写红测 `p3_columnref_without_id_fails_fast`
   - 构造 `ColumnRef { column_id: ColumnId::UNSET, column: "a" }`。
   - scope 即使有 display `"a"` 的 ordered column,编译也必须失败。
   - 期望错误包含 `ColumnRef 'a' has no ColumnId`。
 
-- [ ] Step 2: 写红测 `p3_aggregate_call_is_not_display_rebound_in_expr_compiler`
+- [x] Step 2: 写红测 `p3_aggregate_call_is_not_display_rebound_in_expr_compiler`
   - 构造 project-over-aggregate scope 中带同名 output 的场景。
   - 直接编译 `ExprKind::AggregateCall` 应进入函数编译或报错,不能通过 display name 返回 slot。
   - 正常 planner 路径应已在 P2 改写为 `ColumnRef(output_id)`。
 
-- [ ] Step 3: 修改 `ExprKind::ColumnRef` arm
+- [x] Step 3: 修改 `ExprKind::ColumnRef` arm
   - `column_id == ColumnId::UNSET` 直接 `Err("ColumnRef '<name>' has no ColumnId in executable plan")`。
   - `scope.resolve_by_id(column_id)` miss 直接 `Err("ColumnId(<id>) for column '<name>' cannot be resolved in current scope")`。
   - 删除 `strict_missing_id` 字段、`for_join_side_binding`、`has_id_bindings` 和 `binding_has_id_index` 分支。
 
-- [ ] Step 4: 删除 display 重匹配
+- [x] Step 4: 删除 display 重匹配
   - `FunctionCall` arm 删除 `typed_expr_display_name(expr)` + `scope.resolve_column`。
   - `AggregateCall` arm 删除 `agg_call_display_name_from_parts` + `scope.resolve_column`。
   - compiler 只编译真实函数/聚合函数;project-over-aggregate 由 P2 `ColumnRef(id)` 表达。
 
-- [ ] Step 5: 验证
+- [x] Step 5: 验证
   - Run: `cargo test --profile dev-opt p3_columnref_without_id_fails_fast -- --nocapture`
   - Run: `cargo test --profile dev-opt p3_aggregate_call_is_not_display_rebound_in_expr_compiler -- --nocapture`
   - Run: `cargo build --profile dev-opt`
   - Run: `cargo fmt --check`
+  - 2026-06-06 evidence:
+    - `cargo test --profile dev-opt p3_ -- --nocapture` PASS for `p3_columnref_without_id_fails_fast`, `p3_column_id_mismatch_does_not_fall_back_to_name`, `p3_internal_name_channel_is_explicit`, and `p3_aggregate_call_is_not_display_rebound_in_expr_compiler`.
+    - `cargo build --profile dev-opt` PASS.
 
-- [ ] Step 6: Commit
+- [x] Step 6: Commit
   - `git commit -m "codegen: remove name fallback from expression compilation"`
 
 ---
@@ -449,16 +456,16 @@
 - Modify: `src/sql/codegen/fragment_builder.rs`
 - Test: `src/sql/codegen/id_binding_verifier.rs`
 
-- [ ] Step 1: 写红测 `p3_verify_id_binding_rejects_unset_columnref`
+- [x] Step 1: 写红测 `p3_verify_id_binding_rejects_unset_columnref`
   - 构造最小 `PhysicalProject` over `PhysicalValues`,Project expr 含 `ColumnRef(UNSET)`。
   - 调用 `verify_id_binding(&plan)`。
   - 断言返回 Err 且包含 `UNSET ColumnRef`。
 
-- [ ] Step 2: 写红测 `p3_verify_id_binding_rejects_missing_input_binding`
+- [x] Step 2: 写红测 `p3_verify_id_binding_rejects_missing_input_binding`
   - child output 只含 id A,Project expr 引用 id B。
   - 断言 Err 包含 `not produced by child scope`。
 
-- [ ] Step 3: 实现 verifier
+- [x] Step 3: 实现 verifier
   - walker 输入 `&PhysicalPlanNode`。
   - 每个节点返回 `HashSet<ColumnId>` 表示该节点输出 ids。
   - 对每个节点表达式中的 executable `ColumnRef`:
@@ -475,16 +482,20 @@
     - 用各自 output columns / op 字段计算输出集合。
   - IMV `AggregateStateMerge` 内部机器列不通过普通 `ColumnRef`;若当前实现确有内部 name refs,必须在 verifier 中只允许 `AggregateStateMergeOp` 专用白名单并注释 `IMV refactor: migrate to ColumnId`。
 
-- [ ] Step 4: 接入 codegen 入口
+- [x] Step 4: 接入 codegen 入口
   - 在 `PlanFragmentBuilder::build` 和 `build_with_mv_refresh_ctx` 进入 `visit(plan)` 前调用 verifier。
   - debug build 使用 `debug_assert!(verify_id_binding(plan).is_ok())` 之外仍返回 Err,避免 release 静默。
 
-- [ ] Step 5: 验证
+- [x] Step 5: 验证
   - Run: `cargo test --profile dev-opt p3_verify_id_binding_ -- --nocapture`
   - Run: `cargo build --profile dev-opt`
   - Run: `cargo fmt --check`
+  - 2026-06-06 evidence:
+    - `cargo test --profile dev-opt p3_ -- --nocapture` PASS for verifier red tests plus aggregate/repeat output-id edge cases.
+    - `cargo test --profile dev-opt p2_targeted_surfaces_do_not_use_name_fallback -- --nocapture` PASS.
+    - `cargo build --profile dev-opt` PASS.
 
-- [ ] Step 6: Commit
+- [x] Step 6: Commit
   - `git commit -m "codegen: verify ColumnId bindings before fragment build"`
 
 ---
@@ -506,13 +517,13 @@
 - Modify: `src/sql/codegen/nodes.rs`
 - Test: `src/sql/codegen/fragment_builder.rs`, `src/sql/optimizer/rewrite/rules/low_cardinality_dict/rewriter.rs`
 
-- [ ] Step 1: 写红测 `p3_repeat_codegen_uses_column_ids_not_repeat_group_name`
+- [x] Step 1: 写红测 `p3_repeat_codegen_uses_column_ids_not_repeat_group_name`
   - 构造 `PhysicalRepeatOp` 使用 `ColumnId` lists。
   - 断言 `visit_repeat` 输出 scope 能用 repeat output id resolve。
   - grep gate: `rg -n "__repeat_group|grouping_key_aliases: Vec<\\(String, String\\)>|repeat_column_ref_list: Vec<Vec<String>>" src/sql`
   - Expected after green:不在生产代码命中。
 
-- [ ] Step 2: 写红测 `p3_decode_codegen_uses_source_and_output_ids`
+- [x] Step 2: 写红测 `p3_decode_codegen_uses_source_and_output_ids`
   - 构造 `DecodeMapping { source_column_id, output_column_id }`。
   - child scope 中有 source id。
   - `visit_decode` 不调用 `resolve_column`,直接 `resolve_by_id(source_column_id)` 并注册 `output_column_id`。
@@ -525,14 +536,14 @@
     - `grouping_fn_args: Vec<(ColumnId, Vec<ColumnId>)>`
   - display name 只保留在 `OutputColumn.name`。
 
-- [ ] Step 4: 迁移 Decode structs
+- [x] Step 4: 迁移 Decode structs
   - `DecodeMapping` 改为:
     - `source_column_id: ColumnId`
     - `output_column_id: ColumnId`
   - low-cardinality rewrite 仍可在 catalog/dict metadata 边界按真实列名判断资格,但产出的 mapping 必须是 ids。
   - column pruning decode rule 按 output/source ids 判断 required set。
 
-- [ ] Step 5: 修改 `fragment_builder`
+- [x] Step 5: 修改 `fragment_builder`
   - `visit_repeat`:
     - child binding lookup 全部 `resolve_by_id`
     - grouping fn / grouping id 虚拟槽按 ids 注册
@@ -542,12 +553,16 @@
     - 对每个 mapping 从 source id 找 slot,生成 decode output slot,注册 output id
     - dict 传播按 source slot id -> output slot id
 
-- [ ] Step 6: 验证
+- [x] Step 6: 验证
   - Run: `cargo test --profile dev-opt p3_repeat_codegen_uses_column_ids_not_repeat_group_name -- --nocapture`
   - Run: `cargo test --profile dev-opt p3_decode_codegen_uses_source_and_output_ids -- --nocapture`
   - Run: `cargo test --profile dev-opt low_cardinality -- --nocapture`
   - Run: `cargo build --profile dev-opt`
   - Run: `cargo fmt --check`
+  - 2026-06-06 evidence:
+    - `cargo test --profile dev-opt p3_ -- --nocapture` PASS, including Repeat output-id and direct fragment scope tests.
+    - `cargo test --profile dev-opt low_cardinality -- --nocapture` PASS.
+    - `cargo build --profile dev-opt` PASS.
 
 - [ ] Step 7: Commit
   - `git commit -m "optimizer: model repeat and decode columns by ColumnId"`
@@ -562,11 +577,11 @@
 - Modify: `src/sql/codegen/fragment_builder.rs`
 - Test: `src/sql/codegen/fragment_builder.rs`
 
-- [ ] Step 1: 写红测 `p3_every_fragment_builder_output_has_id_binding`
+- [x] Step 1: 写红测 `p3_every_fragment_builder_output_has_id_binding`
   - 构造覆盖 Scan/Project/Aggregate/Window/Values/GenerateSeries/Repeat/Decode/Join/SetOp/CTE 的小 physical plans。
   - 对每个 visit result,遍历 expected output ids,断言 `scope.resolve_by_id(id).is_some()`。
 
-- [ ] Step 2: 修改 output scope 注册
+- [x] Step 2: 修改 output scope 注册
   - `visit_scan`: scan columns by id。
   - `visit_project`: project item output id 注册;ColumnRef passthrough dict 传播按 input id 查 binding。
   - `visit_hash_aggregate`:group-by output ids + aggregate output ids 按 `op.output_columns` 注册,停止用 display name 重建 key。
@@ -577,19 +592,23 @@
   - `visit_union` / `visit_intersect` / `visit_except`:输出 id 来自 op output columns,child refs 已由 planner/optimizer 对齐。
   - `visit_cte_produce` / `visit_cte_consume`:produce/consume ids 对齐。
 
-- [ ] Step 3: dict 传播改 id
+- [x] Step 3: dict 传播改 id
   - 替换 `fragment_builder.rs` 中 `resolve_column(None, column)` 的 dict lookup:
     - Project:从 `ExprKind::ColumnRef { column_id, .. }` 用 `resolve_by_id`
     - Aggregate:group-by expr 从 `ColumnRef.column_id` 或 expression output id 查 source binding
     - Decode:source id -> output id
 
-- [ ] Step 4: 验证
+- [x] Step 4: 验证
   - Run: `cargo test --profile dev-opt p3_every_fragment_builder_output_has_id_binding -- --nocapture`
   - Run: `cargo test --profile dev-opt data_stream_sink -- --nocapture`
   - Run: `cargo build --profile dev-opt`
   - Run: `cargo fmt --check`
+  - 2026-06-06 evidence:
+    - `cargo test --profile dev-opt p3_every_fragment_builder_output_has_id_binding -- --nocapture` PASS.
+    - `cargo test --profile dev-opt p2_targeted_surfaces_do_not_use_name_fallback -- --nocapture` PASS.
+    - `cargo build --profile dev-opt` PASS.
 
-- [ ] Step 5: Commit
+- [x] Step 5: Commit
   - `git commit -m "codegen: register all fragment output bindings by ColumnId"`
 
 ---

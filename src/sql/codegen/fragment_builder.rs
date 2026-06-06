@@ -564,6 +564,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         _current_database: &str,
         mv_refresh_ctx: Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
     ) -> Result<MultiFragmentBuildResult, String> {
+        super::id_binding_verifier::verify_id_binding(plan)?;
         let mut builder = PlanFragmentBuilder {
             catalog,
             connectors,
@@ -1420,26 +1421,12 @@ impl<'a> PlanFragmentBuilder<'a> {
             // same slot. The scan tuple holds a SINGLE slot for this
             // column; both names refer to it.
             if let Some(dict_col) = dict_target {
-                scope.add_column(
+                scope.add_column_with_id(
+                    col_id,
                     qualifier.map(|s| s.to_string()),
                     dict_col.dict_column.clone(),
                     binding.clone(),
                 );
-            }
-            // When alias differs from table name, also register with original table name
-            if op
-                .alias
-                .as_deref()
-                .is_some_and(|a| !a.eq_ignore_ascii_case(&table.name))
-            {
-                scope.add_column(Some(table.name.clone()), col.name.clone(), binding.clone());
-                if let Some(dict_col) = dict_target {
-                    scope.add_column(
-                        Some(table.name.clone()),
-                        dict_col.dict_column.clone(),
-                        binding.clone(),
-                    );
-                }
             }
             if let Some(dict_col) = dict_target {
                 dict_slot_for_source.insert(col.name.to_ascii_lowercase(), slot_id);
@@ -1484,18 +1471,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                 type_desc: None,
                 nullable: col.nullable,
             };
-            scope.add_column(
-                qualifier.map(|s| s.to_string()),
-                col.name.clone(),
-                binding.clone(),
-            );
-            if op
-                .alias
-                .as_deref()
-                .is_some_and(|a| !a.eq_ignore_ascii_case(&table.name))
-            {
-                scope.add_column(Some(table.name.clone()), col.name.clone(), binding);
-            }
+            scope.add_column(qualifier.map(|s| s.to_string()), col.name.clone(), binding);
         }
 
         // Compile predicates pushed down by the optimizer
@@ -1733,30 +1709,44 @@ impl<'a> PlanFragmentBuilder<'a> {
         // name / type is consulted only as a hint for the post-decode
         // string column's data type; we default to Utf8 when the
         // rewriter handed us no declared output column.
-        let dict_target_meta: BTreeMap<i32, (String, DataType, bool)> = op
+        let child_columns: Vec<(String, ColumnBinding)> = child
+            .scope
+            .iter_columns()
+            .map(|(name, binding)| (name.clone(), binding.clone()))
+            .collect();
+        let child_ids_by_slot: Vec<(ColumnId, ColumnBinding)> = child
+            .scope
+            .iter_id_bindings()
+            .map(|(column_id, binding)| (*column_id, binding.clone()))
+            .collect();
+
+        let dict_target_meta: BTreeMap<i32, (String, DataType, bool, ColumnId)> = op
             .mappings
             .iter()
             .map(|item| {
                 let dict_binding = child
                     .scope
-                    .resolve_column(None, &item.dict_column)
-                    .map_err(|_| {
+                    .resolve_by_id(item.source_column_id)
+                    .ok_or_else(|| {
                         format!(
-                            "decode dict column `{}` is not in child scope",
-                            item.dict_column
+                            "decode source ColumnId({}) for `{}` is not in child scope",
+                            item.source_column_id.0, item.dict_column
                         )
                     })?;
                 let declared = op
                     .output_columns
                     .iter()
-                    .find(|c| c.name.eq_ignore_ascii_case(&item.string_column));
+                    .find(|c| c.column_id == item.output_column_id);
                 let data_type = declared
                     .map(|c| c.data_type.clone())
                     .unwrap_or(DataType::Utf8);
                 let nullable = declared.map(|c| c.nullable).unwrap_or(true);
+                let output_name = declared
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| item.string_column.clone());
                 Ok::<_, String>((
                     dict_binding.slot_id,
-                    (item.string_column.clone(), data_type, nullable),
+                    (output_name, data_type, nullable, item.output_column_id),
                 ))
             })
             .collect::<Result<_, _>>()?;
@@ -1782,16 +1772,9 @@ impl<'a> PlanFragmentBuilder<'a> {
         // outer Project compiles `AggregateCall` references against the
         // display name, so Decode must republish that display name verbatim
         // for resolution to succeed.
-
-        let child_columns: Vec<(String, ColumnBinding)> = child
-            .scope
-            .iter_columns()
-            .map(|(name, binding)| (name.clone(), binding.clone()))
-            .collect();
-
         let mut col_pos: i32 = 0;
         for (child_name, child_binding) in &child_columns {
-            if let Some((string_name, data_type, nullable)) =
+            if let Some((string_name, data_type, nullable, output_column_id)) =
                 dict_target_meta.get(&child_binding.slot_id)
             {
                 // Decoded string output: allocate a NEW slot in the
@@ -1809,7 +1792,8 @@ impl<'a> PlanFragmentBuilder<'a> {
                 if consumed_dict_slots.insert(child_binding.slot_id) {
                     mapping.insert(child_binding.slot_id, string_slot_id);
                 }
-                decode_scope.add_column(
+                decode_scope.add_column_with_id(
+                    *output_column_id,
                     None,
                     string_name.clone(),
                     ColumnBinding {
@@ -1833,17 +1817,21 @@ impl<'a> PlanFragmentBuilder<'a> {
                     child_binding.nullable,
                     col_pos,
                 );
-                decode_scope.add_column(
-                    None,
-                    child_name.clone(),
-                    ColumnBinding {
-                        tuple_id: decode_tuple_id,
-                        slot_id: child_binding.slot_id,
-                        data_type: child_binding.data_type.clone(),
-                        type_desc: child_binding.type_desc.clone(),
-                        nullable: child_binding.nullable,
-                    },
-                );
+                let output_binding = ColumnBinding {
+                    tuple_id: decode_tuple_id,
+                    slot_id: child_binding.slot_id,
+                    data_type: child_binding.data_type.clone(),
+                    type_desc: child_binding.type_desc.clone(),
+                    nullable: child_binding.nullable,
+                };
+                decode_scope.add_column(None, child_name.clone(), output_binding.clone());
+                for (column_id, id_binding) in &child_ids_by_slot {
+                    if id_binding.tuple_id == child_binding.tuple_id
+                        && id_binding.slot_id == child_binding.slot_id
+                    {
+                        decode_scope.add_id_alias(*column_id, output_binding.clone());
+                    }
+                }
             }
             col_pos += 1;
         }
@@ -1934,31 +1922,15 @@ impl<'a> PlanFragmentBuilder<'a> {
 
             let unqualified_display = typed_expr_display_name_without_qualifiers(&item.expr);
             if !unqualified_display.eq_ignore_ascii_case(&name) {
-                project_scope.add_unqualified_alias(unqualified_display, binding.clone());
-            }
-
-            // Also register with qualifier if the expression is a column ref.
-            // Use add_qualified_alias to avoid pushing a duplicate entry into
-            // the ordered list (which would inflate iter_columns and break
-            // UNION output slot counts).
-            if let ExprKind::ColumnRef {
-                qualifier: Some(ref q),
-                ref column,
-                ..
-            } = item.expr.kind
-            {
-                project_scope.add_qualified_alias(q.clone(), column.clone(), binding.clone());
-                if !column.eq_ignore_ascii_case(&name) {
-                    project_scope.add_qualified_alias(q.clone(), name.clone(), binding.clone());
-                }
+                let _ = unqualified_display;
             }
 
             // Propagate the dict registration on a ColumnRef passthrough:
             // the new slot inherits the source slot's dict, so a parent
             // fragment's Decode (post-exchange) finds the matching dict
             // in its own `query_global_dicts`.
-            if let ExprKind::ColumnRef { ref column, .. } = item.expr.kind
-                && let Ok(child_binding) = child.scope.resolve_column(None, column)
+            if let ExprKind::ColumnRef { column_id, .. } = item.expr.kind
+                && let Some(child_binding) = child.scope.resolve_by_id(column_id)
             {
                 let source_slot_id = child_binding.slot_id;
                 self.propagate_dict_to_slot(source_slot_id, slot_id);
@@ -2493,7 +2465,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                 ..
             } = gb_expr.kind
             {
-                agg_scope.add_qualified_alias(q.clone(), column.clone(), binding);
+                let _ = (q, column, binding);
             }
             // Propagate dict registration through the aggregate's group-
             // by output: when the group-by is a passthrough ColumnRef of
@@ -2501,8 +2473,8 @@ impl<'a> PlanFragmentBuilder<'a> {
             // carries dict ids. Re-register the TGlobalDict on the new
             // slot so a downstream Decode (in this or a parent fragment
             // post-exchange) resolves its `dict_id_to_string_ids` key.
-            if let ExprKind::ColumnRef { ref column, .. } = gb_expr.kind
-                && let Ok(child_binding) = child.scope.resolve_column(None, column)
+            if let ExprKind::ColumnRef { column_id, .. } = gb_expr.kind
+                && let Some(child_binding) = child.scope.resolve_by_id(column_id)
             {
                 let source_slot_id = child_binding.slot_id;
                 self.propagate_dict_to_slot(source_slot_id, slot_id);
@@ -2626,7 +2598,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             );
             let unqualified_name = agg_call_display_name_without_qualifiers(agg_call);
             if !unqualified_name.eq_ignore_ascii_case(&name) {
-                agg_scope.add_unqualified_alias(unqualified_name, binding);
+                let _ = unqualified_name;
             }
             aggregate_functions.push(texpr);
         }
@@ -3838,17 +3810,6 @@ impl<'a> PlanFragmentBuilder<'a> {
             outer_slots.push(slot_id);
             outer_columns.push((name.clone(), new_binding));
         }
-        for (qualifier, name, binding) in child.scope.iter_qualified() {
-            if let Some(new_binding) =
-                remapped_child_bindings.get(&(binding.tuple_id, binding.slot_id))
-            {
-                project_scope.add_qualified_alias(
-                    qualifier.clone(),
-                    name.clone(),
-                    new_binding.clone(),
-                );
-            }
-        }
         for (column_id, binding) in child.scope.iter_id_bindings() {
             if let Some(new_binding) =
                 remapped_child_bindings.get(&(binding.tuple_id, binding.slot_id))
@@ -3909,15 +3870,6 @@ impl<'a> PlanFragmentBuilder<'a> {
             output_scope.add_column(None, name.clone(), output_binding.clone());
             output_outer_by_project_slot.insert(binding.slot_id, output_binding);
         }
-        for (qualifier, name, binding) in project_scope.iter_qualified() {
-            if let Some(output_binding) = output_outer_by_project_slot.get(&binding.slot_id) {
-                output_scope.add_qualified_alias(
-                    qualifier.clone(),
-                    name.clone(),
-                    output_binding.clone(),
-                );
-            }
-        }
         let output_id_aliases: Vec<_> = project_scope
             .iter_id_bindings()
             .filter_map(|(column_id, binding)| {
@@ -3966,7 +3918,12 @@ impl<'a> PlanFragmentBuilder<'a> {
                 type_desc: Some(type_desc.clone()),
                 nullable: true,
             };
-            output_scope.add_column(result_qualifier.clone(), col.name.clone(), binding);
+            output_scope.add_column_with_id(
+                col.column_id,
+                result_qualifier.clone(),
+                col.name.clone(),
+                binding,
+            );
             fn_result_slots.push(slot_id);
             ret_type_descs.push(type_desc);
         }
@@ -4056,25 +4013,8 @@ impl<'a> PlanFragmentBuilder<'a> {
         let has_grouping_fns = !op.grouping_fn_args.is_empty();
         let virtual_tuple_id = self.alloc_tuple();
 
-        // Collect child columns for rollup slot mapping
-        let child_cols: Vec<(String, ColumnBinding)> = child
-            .scope
-            .iter_columns()
-            .map(|(n, b)| (n.clone(), b.clone()))
-            .collect();
-
         // Start with the child's full scope
         let mut output_scope = child.scope;
-
-        for (original_name, alias_name) in &op.grouping_key_aliases {
-            if let Ok(binding) = output_scope.resolve_column(None, alias_name) {
-                output_scope.add_qualified_alias(
-                    "__repeat_group".to_string(),
-                    original_name.clone(),
-                    binding.clone(),
-                );
-            }
-        }
 
         // Add virtual slots
         let num_virtual = 1 + op.grouping_fn_args.len();
@@ -4124,7 +4064,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             if let Some((_, column_id)) = op.grouping_fn_ids.get(fn_idx) {
                 output_scope.add_column_with_id(*column_id, None, fn_name.clone(), binding);
             } else {
-                output_scope.add_column(None, fn_name.clone(), binding);
+                output_scope.add_internal_column(fn_name.clone(), binding);
             }
             virtual_slot_ids.push(slot);
         }
@@ -4132,38 +4072,34 @@ impl<'a> PlanFragmentBuilder<'a> {
         self.desc_builder.add_tuple(virtual_tuple_id, None);
 
         // Build slot_id_set_list and all_rollup_slot_ids
-        let all_rollup_slot_ids: BTreeSet<i32> = op
-            .all_rollup_columns
-            .iter()
-            .filter_map(|col| {
-                child_cols.iter().find_map(|(name, binding)| {
-                    if name.to_lowercase() == col.to_lowercase() {
-                        Some(binding.slot_id)
-                    } else {
-                        None
-                    }
-                })
-            })
-            .collect();
+        let mut all_rollup_slot_ids = BTreeSet::new();
+        for column_id in &op.all_rollup_column_ids {
+            let binding = output_scope.resolve_by_id(*column_id).ok_or_else(|| {
+                format!(
+                    "Repeat rollup ColumnId({}) is not in output scope",
+                    column_id.0
+                )
+            })?;
+            all_rollup_slot_ids.insert(binding.slot_id);
+        }
 
         let slot_id_set_list: Vec<BTreeSet<i32>> = op
-            .repeat_column_ref_list
+            .repeat_column_ref_ids
             .iter()
             .map(|non_null_cols| {
-                non_null_cols
-                    .iter()
-                    .filter_map(|col| {
-                        child_cols.iter().find_map(|(name, binding)| {
-                            if name.to_lowercase() == col.to_lowercase() {
-                                Some(binding.slot_id)
-                            } else {
-                                None
-                            }
-                        })
-                    })
-                    .collect()
+                let mut slot_ids = BTreeSet::new();
+                for column_id in non_null_cols {
+                    let binding = output_scope.resolve_by_id(*column_id).ok_or_else(|| {
+                        format!(
+                            "Repeat non-null ColumnId({}) is not in output scope",
+                            column_id.0
+                        )
+                    })?;
+                    slot_ids.insert(binding.slot_id);
+                }
+                Ok(slot_ids)
             })
-            .collect();
+            .collect::<Result<_, String>>()?;
 
         // Build grouping_list
         let repeat_times = op.grouping_ids.len();
@@ -4171,14 +4107,12 @@ impl<'a> PlanFragmentBuilder<'a> {
 
         grouping_list.push(op.grouping_ids.iter().map(|g| *g as i64).collect());
 
-        for (_fn_name, fn_args) in &op.grouping_fn_args {
+        for fn_args in &op.grouping_fn_arg_ids {
             let mut values = Vec::with_capacity(repeat_times);
-            for non_null_cols in &op.repeat_column_ref_list {
+            for non_null_cols in &op.repeat_column_ref_ids {
                 let mut bits: u64 = 0;
                 for (bit_pos, arg_col) in fn_args.iter().enumerate() {
-                    let is_null = !non_null_cols
-                        .iter()
-                        .any(|c| c.to_lowercase() == arg_col.to_lowercase());
+                    let is_null = !non_null_cols.iter().any(|column_id| column_id == arg_col);
                     if is_null {
                         let reverse_bit_pos = fn_args.len() - 1 - bit_pos;
                         bits |= 1 << reverse_bit_pos;
@@ -4270,21 +4204,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                         ));
                         continue;
                     }
-                    // Fallback: ColumnId → name (via output_columns) → name lookup.
-                    let col_meta = output_columns.iter().find(|oc| oc.column_id == *col_id);
-                    let col_name = match col_meta {
-                        Some(oc) => oc.name.clone(),
-                        None => continue, // column not in this child's output
-                    };
-                    if let Ok(binding) = child_scope.resolve_column(None, &col_name) {
-                        let binding = binding.clone();
-                        let type_desc = expr_compiler::binding_type_desc(&binding)?;
-                        partition_exprs.push(expr_compiler::build_slot_ref_texpr(
-                            binding.slot_id,
-                            binding.tuple_id,
-                            type_desc,
-                        ));
-                    }
+                    let _ = output_columns;
                 }
                 if partition_exprs.is_empty() {
                     // A `HashPartitioned` requirement whose cols are all
@@ -4806,10 +4726,12 @@ impl<'a> PlanFragmentBuilder<'a> {
             // ID-based lookups (e.g. distribution column resolution in
             // `build_output_partition`) succeed when an outer operator needs
             // to find the hash partition columns produced by the CTE.
-            scope.add_column_with_id(col.column_id, None, col.name.clone(), binding.clone());
-            // Also register the column under the CTE alias as qualifier so
-            // that `alias.col` references in the consuming query resolve.
-            scope.add_qualified_alias(op.alias.clone(), col.name.clone(), binding);
+            scope.add_column_with_id(
+                col.column_id,
+                Some(op.alias.clone()),
+                col.name.clone(),
+                binding,
+            );
         }
         self.desc_builder.add_tuple(exchange_tuple_id, None);
 
@@ -4917,8 +4839,10 @@ fn build_noop_sink() -> data_sinks::TDataSink {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::{BTreeMap, HashMap};
     use std::path::PathBuf;
+    use std::rc::Rc;
 
     use arrow::datatypes::DataType;
     use tempfile::NamedTempFile;
@@ -4939,10 +4863,10 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer;
     use crate::sql::optimizer::operator::{
-        AggregateStateMergeOp, JoinDistribution, Operator, PhysicalDistributionOp,
-        PhysicalGenerateSeriesOp, PhysicalHashJoinEqCondition, PhysicalHashJoinOp,
-        PhysicalProjectOp, PhysicalScanOp, PhysicalSortOp, PhysicalValuesOp, PhysicalWindowOp,
-        ScanDictionaryColumn,
+        AggregateStateMergeOp, JoinDistribution, Operator, PhysicalDecodeOp,
+        PhysicalDistributionOp, PhysicalGenerateSeriesOp, PhysicalHashJoinEqCondition,
+        PhysicalHashJoinOp, PhysicalProjectOp, PhysicalRepeatOp, PhysicalScanOp, PhysicalSortOp,
+        PhysicalUnionOp, PhysicalValuesOp, PhysicalWindowOp, ScanDictionaryColumn,
     };
     use crate::sql::optimizer::physical_plan::{
         JoinExecutionDistribution, PhysicalPlanNode, PlanExecutionProps,
@@ -4950,7 +4874,7 @@ mod tests {
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::runtime_filter_pass::RuntimeFilterDesc;
     use crate::sql::optimizer::statistics::Statistics;
-    use crate::sql::planner::plan::WindowExpr;
+    use crate::sql::planner::plan::{DecodeMapping, WindowExpr};
 
     /// OQ-5 B1: `remap_rf_expr_order` must translate a runtime filter's
     /// pre-demote `op.eq_conditions` index into the post-demote
@@ -5187,6 +5111,64 @@ mod tests {
             execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
+        }
+    }
+
+    fn physical_node_for_test(
+        op: Operator,
+        children: Vec<PhysicalPlanNode>,
+        output_columns: Vec<OutputColumn>,
+    ) -> PhysicalPlanNode {
+        PhysicalPlanNode {
+            op,
+            children,
+            stats: stats_for_test(),
+            output_columns,
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+        }
+    }
+
+    fn builder_for_scope_test<'a>(
+        connectors: &'a crate::connector::ConnectorRegistry,
+    ) -> PlanFragmentBuilder<'a> {
+        PlanFragmentBuilder {
+            catalog: &DummyCatalog,
+            connectors,
+            mv_refresh_ctx: None,
+            desc_builder: DescriptorTableBuilder::new(),
+            scan_tables: Vec::new(),
+            next_node_id: 1,
+            next_slot_id: Rc::new(RefCell::new(1)),
+            next_tuple_id: 1,
+            next_fragment_id: 1,
+            fragment_stack: vec![0],
+            completed_fragments: Vec::new(),
+            completed_edges: Vec::new(),
+            cte_fragments: HashMap::new(),
+            query_global_dicts_per_fragment: HashMap::new(),
+            slot_to_global_dict: HashMap::new(),
+            rf_probe_targets: HashMap::new(),
+            rf_all_filters: HashMap::new(),
+            rf_build_side_filters: HashMap::new(),
+            rf_probe_side_filters: HashMap::new(),
+        }
+    }
+
+    fn visit_scope_for_test(plan: &PhysicalPlanNode) -> ExprScope {
+        let connectors = crate::connector::ConnectorRegistry::new();
+        let mut builder = builder_for_scope_test(&connectors);
+        builder.visit(plan).expect("visit test plan").scope
+    }
+
+    fn assert_scope_has_ids(scope: &ExprScope, ids: &[ColumnId]) {
+        for column_id in ids {
+            assert!(
+                scope.resolve_by_id(*column_id).is_some(),
+                "scope must resolve ColumnId({})",
+                column_id.0
+            );
         }
     }
 
@@ -7378,6 +7360,112 @@ mod tests {
     }
 
     #[test]
+    fn p3_every_fragment_builder_output_has_id_binding() {
+        let values_col = output_col_for_test(9301, "v", DataType::Int32, true);
+        let values = values_plan_for_test(vec![values_col.clone()]);
+        assert_scope_has_ids(&visit_scope_for_test(&values), &[values_col.column_id]);
+
+        let project_output_id = ColumnId::new_for_test(9302);
+        let project =
+            project_passthrough_plan_for_test(values.clone(), &values_col, project_output_id);
+        assert_scope_has_ids(&visit_scope_for_test(&project), &[project_output_id]);
+
+        let series_col = output_col_for_test(9303, "g", DataType::Int64, false);
+        let series = physical_node_for_test(
+            Operator::PhysicalGenerateSeries(PhysicalGenerateSeriesOp {
+                start: 1,
+                end: 3,
+                step: 1,
+                column_name: series_col.name.clone(),
+                alias: Some("gs".to_string()),
+                output_column_id: series_col.column_id,
+            }),
+            Vec::new(),
+            vec![series_col.clone()],
+        );
+        assert_scope_has_ids(&visit_scope_for_test(&series), &[series_col.column_id]);
+
+        let rollup_col = output_col_for_test(9304, "r", DataType::Int32, true);
+        let grouping_id = ColumnId::new_for_test(9305);
+        let repeat = physical_node_for_test(
+            Operator::PhysicalRepeat(PhysicalRepeatOp {
+                repeat_column_ref_list: vec![vec![rollup_col.name.clone()]],
+                repeat_column_ref_ids: vec![vec![rollup_col.column_id]],
+                grouping_ids: vec![0],
+                all_rollup_columns: vec![rollup_col.name.clone()],
+                all_rollup_column_ids: vec![rollup_col.column_id],
+                grouping_key_aliases: vec![],
+                grouping_fn_args: vec![(
+                    "__grouping_fn_0".to_string(),
+                    vec![rollup_col.name.clone()],
+                )],
+                grouping_fn_arg_ids: vec![vec![rollup_col.column_id]],
+                grouping_fn_ids: vec![("__grouping_fn_0".to_string(), grouping_id)],
+            }),
+            vec![values_plan_for_test(vec![rollup_col.clone()])],
+            vec![
+                rollup_col.clone(),
+                output_col_for_test(9306, "__grouping_fn_0", DataType::Int64, false),
+            ],
+        );
+        assert_scope_has_ids(
+            &visit_scope_for_test(&repeat),
+            &[rollup_col.column_id, grouping_id],
+        );
+
+        let dict_col = output_col_for_test(9307, "__dict_s", DataType::Int32, false);
+        let decode_output = output_col_for_test(9308, "s", DataType::Utf8, true);
+        let decode = physical_node_for_test(
+            Operator::PhysicalDecode(PhysicalDecodeOp {
+                mappings: vec![DecodeMapping {
+                    source_column_id: dict_col.column_id,
+                    output_column_id: decode_output.column_id,
+                    dict_column: dict_col.name.clone(),
+                    string_column: decode_output.name.clone(),
+                }],
+                output_columns: vec![decode_output.clone()],
+            }),
+            vec![values_plan_for_test(vec![dict_col.clone()])],
+            vec![decode_output.clone()],
+        );
+        assert_scope_has_ids(&visit_scope_for_test(&decode), &[decode_output.column_id]);
+
+        let left_col = output_col_for_test(9309, "k", DataType::Int32, false);
+        let right_col = output_col_for_test(9310, "k", DataType::Int32, false);
+        let join = physical_node_for_test(
+            Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: Vec::new(),
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+            }),
+            vec![
+                values_plan_for_test(vec![left_col.clone()]),
+                values_plan_for_test(vec![right_col.clone()]),
+            ],
+            vec![left_col.clone(), right_col.clone()],
+        );
+        assert_scope_has_ids(
+            &visit_scope_for_test(&join),
+            &[left_col.column_id, right_col.column_id],
+        );
+
+        let union_output = output_col_for_test(9311, "u", DataType::Int32, true);
+        let union = physical_node_for_test(
+            Operator::PhysicalUnion(PhysicalUnionOp {
+                all: true,
+                output_columns: vec![union_output.clone()],
+            }),
+            vec![
+                values_plan_for_test(vec![output_col_for_test(9312, "u", DataType::Int32, true)]),
+                values_plan_for_test(vec![output_col_for_test(9313, "u", DataType::Int32, true)]),
+            ],
+            vec![union_output.clone()],
+        );
+        assert_scope_has_ids(&visit_scope_for_test(&union), &[union_output.column_id]);
+    }
+
+    #[test]
     fn build_generate_series_emits_table_function_without_scan_source() {
         let plan = PhysicalPlanNode {
             op: Operator::PhysicalGenerateSeries(PhysicalGenerateSeriesOp {
@@ -7768,9 +7856,11 @@ mod tests {
 
     #[test]
     fn physical_decode_emits_decode_node() {
+        use crate::sql::column_id::ColumnId;
         use crate::sql::optimizer::operator::PhysicalDecodeOp;
         use crate::sql::planner::plan::DecodeMapping;
 
+        let id_col = ColumnId::new_for_test(7001);
         // Build a StarRocks scan that exposes one dict column ("id" string
         // column gets a sibling "id_dict" INT slot via dict_columns).
         let layout = starrocks_layout();
@@ -7794,7 +7884,7 @@ mod tests {
                 },
                 alias: None,
                 columns: vec![OutputColumn {
-                    column_id: crate::sql::column_id::ColumnId::UNSET,
+                    column_id: id_col,
                     name: "id".to_string(),
                     data_type: DataType::Utf8,
                     nullable: false,
@@ -7811,7 +7901,7 @@ mod tests {
             children: vec![],
             stats: stats(),
             output_columns: vec![OutputColumn {
-                column_id: crate::sql::column_id::ColumnId::UNSET,
+                column_id: id_col,
                 name: "id".to_string(),
                 data_type: DataType::Utf8,
                 nullable: false,
@@ -7825,11 +7915,13 @@ mod tests {
         let decode_plan = PhysicalPlanNode {
             op: Operator::PhysicalDecode(PhysicalDecodeOp {
                 mappings: vec![DecodeMapping {
+                    source_column_id: id_col,
+                    output_column_id: id_col,
                     dict_column: "id_dict".to_string(),
                     string_column: "id".to_string(),
                 }],
                 output_columns: vec![OutputColumn {
-                    column_id: crate::sql::column_id::ColumnId::UNSET,
+                    column_id: id_col,
                     name: "id".to_string(),
                     data_type: DataType::Utf8,
                     nullable: false,
@@ -7839,7 +7931,7 @@ mod tests {
             children: vec![scan],
             stats: stats(),
             output_columns: vec![OutputColumn {
-                column_id: crate::sql::column_id::ColumnId::UNSET,
+                column_id: id_col,
                 name: "id".to_string(),
                 data_type: DataType::Utf8,
                 nullable: false,

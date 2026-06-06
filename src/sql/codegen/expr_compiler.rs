@@ -45,7 +45,6 @@ pub(crate) struct ExprCompiler<'a> {
     /// body, an unqualified `ColumnRef` whose name matches a binding becomes a
     /// `SLOT_REF` to the allocated slot id.
     lambda_stack: Vec<LambdaBinding>,
-    strict_missing_id: bool,
 }
 
 impl<'a> ExprCompiler<'a> {
@@ -60,7 +59,6 @@ impl<'a> ExprCompiler<'a> {
             last_nullable: true,
             slot_alloc,
             lambda_stack: Vec::new(),
-            strict_missing_id: false,
         }
     }
 
@@ -69,9 +67,7 @@ impl<'a> ExprCompiler<'a> {
     /// side binding, where a miss means the expression belongs to the other
     /// child even if the display name also exists locally.
     pub fn new_strict_id(slot_alloc: SlotAllocator, scope: &'a ExprScope) -> Self {
-        let mut compiler = Self::new(slot_alloc, scope);
-        compiler.strict_missing_id = true;
-        compiler
+        Self::new(slot_alloc, scope)
     }
 
     fn alloc_slot_id(&self) -> i32 {
@@ -399,34 +395,17 @@ impl<'a> ExprCompiler<'a> {
                     self.last_nullable = nullable;
                     return Ok(data_type);
                 }
-                // G1: prefer ColumnId-based lookup when the scope has an
-                // id-indexed binding for this column. Strict mode is reserved
-                // for join-key side binding: a missed ColumnId there means the
-                // expression belongs to the other child, even if the same
-                // display name exists locally. Normal compilation still falls
-                // back by name because USING, aliases, and internal rewrite
-                // columns may carry stale or missing ColumnIds.
-                let binding = match self.scope.resolve_by_id(*column_id) {
-                    Some(b) => b,
-                    None if self.strict_missing_id
-                        && *column_id != ColumnId::UNSET
-                        && self.scope.has_id_bindings() =>
-                    {
-                        let fallback = self.scope.resolve_column(qualifier.as_deref(), column)?;
-                        if self.scope.binding_has_id_index(fallback) {
-                            return Err(format!(
-                                "ColumnId({}) for column '{}' cannot be resolved in current scope.",
-                                column_id.0, column
-                            ));
-                        }
-                        super::fallback_audit::record_column_ref_name_fallback();
-                        fallback
-                    }
-                    None => {
-                        let fallback = self.scope.resolve_column(qualifier.as_deref(), column)?;
-                        super::fallback_audit::record_column_ref_name_fallback();
-                        fallback
-                    }
+                let binding = if let Some(binding) = self.scope.resolve_by_id(*column_id) {
+                    binding
+                } else if *column_id == ColumnId::UNSET {
+                    self.scope.resolve_internal_by_name(column).map_err(|_| {
+                        format!("ColumnRef '{}' has no ColumnId in executable plan.", column)
+                    })?
+                } else {
+                    return Err(format!(
+                        "ColumnId({}) for column '{}' cannot be resolved in current scope.",
+                        column_id.0, column
+                    ));
                 };
                 let type_desc = binding_type_desc(binding)?;
                 self.nodes
@@ -760,27 +739,12 @@ impl<'a> ExprCompiler<'a> {
                 args,
                 distinct: _,
             } => {
-                // In a project-over-aggregate context, the scope may have a
-                // GROUP BY expression registered by display name (e.g. "mod(k, Int(2))").
-                // Try scope lookup first to emit a slot ref instead of recompiling.
-                use crate::sql::codegen::helpers::typed_expr_display_name;
-                let display = typed_expr_display_name(expr);
-                if let Ok(binding) = self.scope.resolve_column(None, &display) {
-                    super::fallback_audit::record_display_expr_name_fallback();
-                    let type_desc = binding_type_desc(binding)?;
-                    self.nodes
-                        .push(slot_ref_node(binding.slot_id, binding.tuple_id, type_desc));
-                    self.last_type = binding.data_type.clone();
-                    self.last_nullable = binding.nullable;
-                    Ok(binding.data_type.clone())
-                } else {
-                    // Use the analyzer's data_type as override hint for the
-                    // return type. This handles cases like round(decimal, 2)
-                    // where the analyzer computed Decimal128(38, 2) but the
-                    // physical layer would re-infer Decimal128(38, 8) from
-                    // the input type alone.
-                    self.compile_typed_function_call_with_hint(name, args, &expr.data_type)
-                }
+                // Use the analyzer's data_type as override hint for the
+                // return type. This handles cases like round(decimal, 2)
+                // where the analyzer computed Decimal128(38, 2) but the
+                // physical layer would re-infer Decimal128(38, 8) from
+                // the input type alone.
+                self.compile_typed_function_call_with_hint(name, args, &expr.data_type)
             }
             ExprKind::LambdaFunction { params, body } => {
                 let parent_idx = self.nodes.len();
@@ -806,28 +770,9 @@ impl<'a> ExprCompiler<'a> {
             ExprKind::AggregateCall {
                 name,
                 args,
-                distinct,
-                order_by,
-            } => {
-                // In a project-over-aggregate context, the scope has aggregate
-                // output columns registered by display name. Try to look up
-                // as a slot reference first.
-                let display = super::helpers::agg_call_display_name_from_parts(
-                    name, args, *distinct, order_by,
-                );
-                if let Ok(binding) = self.scope.resolve_column(None, &display) {
-                    super::fallback_audit::record_aggregate_display_name_fallback();
-                    let type_desc = binding_type_desc(binding)?;
-                    self.nodes
-                        .push(slot_ref_node(binding.slot_id, binding.tuple_id, type_desc));
-                    self.last_type = binding.data_type.clone();
-                    self.last_nullable = binding.nullable;
-                    Ok(binding.data_type.clone())
-                } else {
-                    // Fallback: compile as function call (scan-scope context)
-                    self.compile_typed_function_call(name, args)
-                }
-            }
+                distinct: _,
+                order_by: _,
+            } => self.compile_typed_function_call(name, args),
             ExprKind::IsTruthValue {
                 expr: inner,
                 value,
@@ -3136,8 +3081,6 @@ mod tests {
     use std::sync::Arc;
 
     use crate::sql::analysis::{ExprKind, TypedExpr};
-    use crate::sql::codegen::fallback_audit;
-    use crate::sql::codegen::helpers::{agg_call_display_name_from_parts, typed_expr_display_name};
     use crate::sql::codegen::resolve::{ColumnBinding, ExprScope};
     use crate::sql::column_id::ColumnId;
 
@@ -3164,84 +3107,24 @@ mod tests {
     }
 
     #[test]
-    fn p2_name_fallback_audit_records_columnref_fallback() {
-        let ((), audit) = fallback_audit::run_with_isolated_audit(|| {
-            let mut scope = ExprScope::new();
-            scope.add_column(None, "a".to_string(), test_binding(10, DataType::Int32));
-            let expr = test_column_ref("a", DataType::Int32);
-            let slot_alloc = Rc::new(RefCell::new(100));
-            let mut compiler = ExprCompiler::new(slot_alloc, &scope);
+    fn p3_columnref_without_id_fails_fast() {
+        let mut scope = ExprScope::new();
+        scope.add_column(None, "a".to_string(), test_binding(10, DataType::Int32));
+        let expr = test_column_ref("a", DataType::Int32);
+        let slot_alloc = Rc::new(RefCell::new(100));
+        let mut compiler = ExprCompiler::new(slot_alloc, &scope);
 
-            compiler
-                .compile_typed(&expr)
-                .expect("name fallback should still compile during P2 audit");
-        });
-        assert_eq!(audit.column_ref_name_fallbacks, 1);
-        assert_eq!(audit.display_expr_name_fallbacks, 0);
-        assert_eq!(audit.aggregate_display_name_fallbacks, 0);
+        let err = compiler
+            .compile_typed(&expr)
+            .expect_err("semantic ColumnRef without id must fail");
+        assert!(
+            err.contains("ColumnRef 'a' has no ColumnId"),
+            "unexpected err={err}"
+        );
     }
 
     #[test]
-    fn p2_name_fallback_audit_records_function_display_fallback() {
-        let ((), audit) = fallback_audit::run_with_isolated_audit(|| {
-            let arg = test_column_ref("a", DataType::Int32);
-            let expr = TypedExpr {
-                kind: ExprKind::FunctionCall {
-                    name: "abs".to_string(),
-                    args: vec![arg],
-                    distinct: false,
-                },
-                data_type: DataType::Int32,
-                nullable: false,
-            };
-            let display = typed_expr_display_name(&expr);
-
-            let mut scope = ExprScope::new();
-            scope.add_column(None, display, test_binding(11, DataType::Int32));
-            let slot_alloc = Rc::new(RefCell::new(100));
-            let mut compiler = ExprCompiler::new(slot_alloc, &scope);
-
-            compiler
-                .compile_typed(&expr)
-                .expect("function display fallback should still compile during P2 audit");
-        });
-        assert_eq!(audit.column_ref_name_fallbacks, 0);
-        assert_eq!(audit.display_expr_name_fallbacks, 1);
-        assert_eq!(audit.aggregate_display_name_fallbacks, 0);
-    }
-
-    #[test]
-    fn p2_name_fallback_audit_records_aggregate_display_fallback() {
-        let ((), audit) = fallback_audit::run_with_isolated_audit(|| {
-            let arg = test_column_ref("a", DataType::Int64);
-            let expr = TypedExpr {
-                kind: ExprKind::AggregateCall {
-                    name: "sum".to_string(),
-                    args: vec![arg.clone()],
-                    distinct: false,
-                    order_by: vec![],
-                },
-                data_type: DataType::Int64,
-                nullable: true,
-            };
-            let display = agg_call_display_name_from_parts("sum", &[arg], false, &[]);
-
-            let mut scope = ExprScope::new();
-            scope.add_column(None, display, test_binding(12, DataType::Int64));
-            let slot_alloc = Rc::new(RefCell::new(100));
-            let mut compiler = ExprCompiler::new(slot_alloc, &scope);
-
-            compiler
-                .compile_typed(&expr)
-                .expect("aggregate display fallback should still compile during P2 audit");
-        });
-        assert_eq!(audit.column_ref_name_fallbacks, 0);
-        assert_eq!(audit.display_expr_name_fallbacks, 0);
-        assert_eq!(audit.aggregate_display_name_fallbacks, 1);
-    }
-
-    #[test]
-    fn column_id_mismatch_does_not_fall_back_to_name_when_scope_has_ids() {
+    fn p3_column_id_mismatch_does_not_fall_back_to_name() {
         let mut scope = ExprScope::new();
         scope.add_column_with_id(
             ColumnId(1),
@@ -3265,7 +3148,7 @@ mod tests {
             nullable: false,
         };
         let slot_alloc = Rc::new(RefCell::new(100));
-        let mut compiler = ExprCompiler::new_strict_id(slot_alloc, &scope);
+        let mut compiler = ExprCompiler::new(slot_alloc, &scope);
 
         let err = compiler
             .compile_typed(&expr)
@@ -3274,7 +3157,7 @@ mod tests {
     }
 
     #[test]
-    fn column_id_mismatch_allows_name_only_internal_binding() {
+    fn p3_internal_name_channel_is_explicit() {
         let mut scope = ExprScope::new();
         scope.add_column_with_id(
             ColumnId(1),
@@ -3288,8 +3171,7 @@ mod tests {
                 nullable: false,
             },
         );
-        scope.add_column(
-            None,
+        scope.add_internal_column(
             "__change_op".to_string(),
             ColumnBinding {
                 tuple_id: 1,
@@ -3301,7 +3183,7 @@ mod tests {
         );
         let expr = TypedExpr {
             kind: ExprKind::ColumnRef {
-                column_id: ColumnId(2),
+                column_id: ColumnId::UNSET,
                 qualifier: None,
                 column: "__change_op".to_string(),
             },
@@ -3309,7 +3191,7 @@ mod tests {
             nullable: false,
         };
         let slot_alloc = Rc::new(RefCell::new(100));
-        let mut compiler = ExprCompiler::new_strict_id(slot_alloc, &scope);
+        let mut compiler = ExprCompiler::new(slot_alloc, &scope);
 
         let compiled = compiler
             .compile_typed(&expr)
@@ -3318,6 +3200,38 @@ mod tests {
         assert_eq!(
             slot_ref.slot_ref.as_ref().expect("slot_ref node").slot_id,
             11
+        );
+    }
+
+    #[test]
+    fn p3_aggregate_call_is_not_display_rebound_in_expr_compiler() {
+        let arg = test_column_ref("a", DataType::Int64);
+        let expr = TypedExpr {
+            kind: ExprKind::AggregateCall {
+                name: "sum".to_string(),
+                args: vec![arg],
+                distinct: false,
+                order_by: vec![],
+            },
+            data_type: DataType::Int64,
+            nullable: true,
+        };
+        let mut scope = ExprScope::new();
+        scope.add_column_with_id(
+            ColumnId(50),
+            None,
+            "sum(a)".to_string(),
+            test_binding(12, DataType::Int64),
+        );
+        let slot_alloc = Rc::new(RefCell::new(100));
+        let mut compiler = ExprCompiler::new(slot_alloc, &scope);
+
+        let err = compiler
+            .compile_typed(&expr)
+            .expect_err("aggregate display name must not bind to the output slot");
+        assert!(
+            err.contains("ColumnRef 'a' has no ColumnId"),
+            "unexpected err={err}"
         );
     }
 
