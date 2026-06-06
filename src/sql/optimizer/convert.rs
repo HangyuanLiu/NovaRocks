@@ -240,6 +240,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
                 all_rollup_columns: node.all_rollup_columns.clone(),
                 grouping_key_aliases: node.grouping_key_aliases.clone(),
                 grouping_fn_args: node.grouping_fn_args.clone(),
+                grouping_fn_ids: node.grouping_fn_ids.clone(),
             });
             let expr = MExpr {
                 id: memo.next_expr_id(),

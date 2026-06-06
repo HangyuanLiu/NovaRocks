@@ -1,6 +1,6 @@
 Explain String
 Planning: <MS> ms / Execution: <MS> ms / Rows: 1
-PROJECT [count() AS count(*)] stats={rows=1 conf=estimated}
+PROJECT [count(*)] stats={rows=1 conf=estimated}
   HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated}
     aggregations: count()
     GATHER EXCHANGE stats={rows=1 conf=estimated}

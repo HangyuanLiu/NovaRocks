@@ -1386,6 +1386,7 @@ impl<'a> AnalyzerContext<'a> {
             grouping_ids,
             all_rollup_columns,
             grouping_fn_args,
+            grouping_fn_ids,
         });
 
         Ok((QueryBody::Select(sel), cols))

@@ -1,5 +1,5 @@
 Explain String
-PROJECT [count() AS count(*)] stats={rows=1}
+PROJECT [count(*)] stats={rows=1}
   HASH AGGREGATE (GLOBAL) stats={rows=1}
     aggregations: count()
     GATHER EXCHANGE stats={rows=1}

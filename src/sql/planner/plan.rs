@@ -111,6 +111,7 @@ pub(crate) struct RepeatPlanNode {
     pub all_rollup_columns: Vec<String>,
     pub grouping_key_aliases: Vec<(String, String)>,
     pub grouping_fn_args: Vec<(String, Vec<String>)>,
+    pub grouping_fn_ids: Vec<(String, ColumnId)>,
     /// Set by the Phase-1 column-pruning tagging pass; `None` means all columns required.
     pub required_output_columns: Option<HashSet<ColumnId>>,
 }

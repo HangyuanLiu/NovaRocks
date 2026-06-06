@@ -164,6 +164,7 @@ pub(crate) fn inline_single_use_ctes(
             all_rollup_columns: node.all_rollup_columns,
             grouping_key_aliases: node.grouping_key_aliases,
             grouping_fn_args: node.grouping_fn_args,
+            grouping_fn_ids: node.grouping_fn_ids,
             required_output_columns: node.required_output_columns,
         })),
         LogicalPlan::CTEProduce(node) => Ok(LogicalPlan::CTEProduce(CTEProduceNode {
@@ -323,6 +324,7 @@ fn replace_cte_consume(
             all_rollup_columns: node.all_rollup_columns,
             grouping_key_aliases: node.grouping_key_aliases,
             grouping_fn_args: node.grouping_fn_args,
+            grouping_fn_ids: node.grouping_fn_ids,
             required_output_columns: node.required_output_columns,
         })),
         LogicalPlan::CTEProduce(node) => Ok(LogicalPlan::CTEProduce(CTEProduceNode {

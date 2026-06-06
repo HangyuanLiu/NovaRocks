@@ -86,6 +86,8 @@ pub(crate) struct RepeatInfo {
     pub all_rollup_columns: Vec<String>,
     /// GROUPING() function calls: (output_name, arg_column_names).
     pub grouping_fn_args: Vec<(String, Vec<String>)>,
+    /// GROUPING() virtual output ids: (output_name, analyzer-minted ColumnId).
+    pub grouping_fn_ids: Vec<(String, ColumnId)>,
 }
 
 #[derive(Clone, Debug)]

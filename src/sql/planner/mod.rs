@@ -648,6 +648,7 @@ fn plan_select_scoped(
             all_rollup_columns: repeat_info.all_rollup_columns,
             grouping_key_aliases,
             grouping_fn_args: repeat_info.grouping_fn_args,
+            grouping_fn_ids: repeat_info.grouping_fn_ids,
             required_output_columns: None,
         });
     }

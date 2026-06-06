@@ -306,7 +306,7 @@
 - Test: `src/sql/codegen/fragment_builder.rs` 或 `src/sql/planner/mod.rs`
 - SQL Test: existing suites only
 
-- [ ] Step 1: 新增集成式 rust test `p2_targeted_surfaces_do_not_use_name_fallback`
+- [x] Step 1: 新增集成式 rust test `p2_targeted_surfaces_do_not_use_name_fallback`
   - 覆盖 queries:
     - aggregate: `SELECT sum(b)+1 FROM t`
     - computed group key: `SELECT a+1, count(*) FROM t GROUP BY a+1`
@@ -318,19 +318,30 @@
     - using: `SELECT k FROM l JOIN r USING(k)`
     - subquery alias: `SELECT x FROM (SELECT a AS x FROM t) s WHERE x > 0`
   - 每个 query:reset audit -> plan/optimize/codegen -> assert snapshot 全 0。
+  - 2026-06-06 evidence:
+    - RED: aggregate case hit `column_ref_name_fallbacks=1`.
+    - GREEN: `cargo test --profile dev-opt p2_targeted_surfaces_do_not_use_name_fallback -- --nocapture` PASS.
+    - Fixes included aggregate group/output id registration, window output id registration, and Repeat `GROUPING()` virtual output id propagation.
 
-- [ ] Step 2: 跑 SQL targeted suites
+- [x] Step 2: 跑 SQL targeted suites
   - Run: `cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --suite optimizer --mode verify`
   - Run: `cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --suite join --mode verify`
   - Run: `cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --suite cte --mode verify`
+  - 2026-06-06 evidence:
+    - `optimizer --mode verify` PASS 39/39 after updating five `count(*)` EXPLAIN goldens from old fallback display `count() AS count(*)` to direct semantic display `count(*)`.
+    - `join --mode verify` PASS 60/60.
+    - `cte --mode verify` PASS 3/3.
 
-- [ ] Step 3: grep gate
+- [x] Step 3: grep gate
   - Run: `rg -n "ColumnId::UNSET|resolve_column\\(|typed_expr_display_name\\(" src/sql/planner src/sql/analyzer src/sql/codegen`
   - 人审分类:
     - allow: display/output labels, SQL parse/analyzer入口, connector boundary, tests
     - block: executable `ColumnRef` construction, codegen semantic binding, optimizer matching
+  - 2026-06-06 classification:
+    - allow: display/output labels, audit/fallback implementation still present for P2, tests/fixtures, analyzer parse/default literal sentinels, connector/dict/internal boundary lookups.
+    - P3 block list remains intentional: `ExprCompiler` name fallback paths, general `ExprScope::resolve_column`, Repeat/Decode/name lookup migration points.
 
-- [ ] Step 4: Commit
+- [x] Step 4: Commit
   - `git commit -m "test: prove targeted ColumnId binding surfaces avoid name fallback"`
 
 ---

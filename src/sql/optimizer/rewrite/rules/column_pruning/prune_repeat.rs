@@ -66,6 +66,7 @@ mod tests {
             all_rollup_columns: vec![],
             grouping_key_aliases: vec![],
             grouping_fn_args: vec![],
+            grouping_fn_ids: vec![],
             required_output_columns: None,
         };
 

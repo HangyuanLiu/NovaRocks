@@ -1758,6 +1758,7 @@ mod tests {
             all_rollup_columns: vec!["b".to_string()],
             grouping_key_aliases: vec![],
             grouping_fn_args: vec![],
+            grouping_fn_ids: vec![],
             required_output_columns: None,
         });
         let tagged = tag_required_columns(repeat, Some(needed_set(&[1])));

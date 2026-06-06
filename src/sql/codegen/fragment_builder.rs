@@ -2478,17 +2478,14 @@ impl<'a> PlanFragmentBuilder<'a> {
                 type_desc: Some(slot_type_desc),
                 nullable,
             };
-            // G1: when the group-by expression is itself a ColumnRef with a
-            // real ColumnId, register the agg's output slot under that id so
-            // upstream operators (the SELECT projection on top of a GROUPING
-            // SETS / CUBE Aggregate, the Global merge above a Local agg,
-            // etc.) can resolve the column by id regardless of the slot's
-            // display name. Non-ColumnRef group-by exprs (e.g. `a + b`)
-            // remain name-indexed only.
-            let gb_column_id = match &gb_expr.kind {
-                ExprKind::ColumnRef { column_id, .. } => *column_id,
-                _ => crate::sql::column_id::ColumnId::UNSET,
-            };
+            let gb_column_id = op
+                .output_columns
+                .get(idx)
+                .map(|col| col.column_id)
+                .unwrap_or_else(|| match &gb_expr.kind {
+                    ExprKind::ColumnRef { column_id, .. } => *column_id,
+                    _ => crate::sql::column_id::ColumnId::UNSET,
+                });
             agg_scope.add_column_with_id(gb_column_id, None, name, binding.clone());
             if let ExprKind::ColumnRef {
                 qualifier: Some(ref q),
@@ -2621,7 +2618,12 @@ impl<'a> PlanFragmentBuilder<'a> {
                 type_desc: Some(slot_type_desc),
                 nullable,
             };
-            agg_scope.add_column(None, name.clone(), binding.clone());
+            agg_scope.add_column_with_id(
+                agg_call.output_column_id,
+                None,
+                name.clone(),
+                binding.clone(),
+            );
             let unqualified_name = agg_call_display_name_without_qualifiers(agg_call);
             if !unqualified_name.eq_ignore_ascii_case(&name) {
                 agg_scope.add_unqualified_alias(unqualified_name, binding);
@@ -3171,7 +3173,8 @@ impl<'a> PlanFragmentBuilder<'a> {
                 true,
                 idx as i32,
             );
-            output_scope.add_column(
+            output_scope.add_column_with_id(
+                win_expr.output_column_id,
                 None,
                 win_expr.output_name.clone(),
                 ColumnBinding {
@@ -3399,7 +3402,8 @@ impl<'a> PlanFragmentBuilder<'a> {
                     true,
                     idx as i32,
                 );
-                output_scope.add_column(
+                output_scope.add_column_with_id(
+                    win_expr.output_column_id,
                     None,
                     win_expr.output_name.clone(),
                     ColumnBinding {
@@ -4110,17 +4114,18 @@ impl<'a> PlanFragmentBuilder<'a> {
                 false,
                 1 + fn_idx as i32,
             );
-            output_scope.add_column(
-                None,
-                fn_name.clone(),
-                ColumnBinding {
-                    tuple_id: virtual_tuple_id,
-                    slot_id: slot,
-                    data_type: DataType::Int64,
-                    type_desc: None,
-                    nullable: false,
-                },
-            );
+            let binding = ColumnBinding {
+                tuple_id: virtual_tuple_id,
+                slot_id: slot,
+                data_type: DataType::Int64,
+                type_desc: None,
+                nullable: false,
+            };
+            if let Some((_, column_id)) = op.grouping_fn_ids.get(fn_idx) {
+                output_scope.add_column_with_id(*column_id, None, fn_name.clone(), binding);
+            } else {
+                output_scope.add_column(None, fn_name.clone(), binding);
+            }
             virtual_slot_ids.push(slot);
         }
 
@@ -4932,6 +4937,7 @@ mod tests {
     };
     use crate::sql::codegen::fallback_audit;
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer;
     use crate::sql::optimizer::operator::{
         AggregateStateMergeOp, JoinDistribution, Operator, PhysicalDistributionOp,
         PhysicalGenerateSeriesOp, PhysicalHashJoinEqCondition, PhysicalHashJoinOp,
@@ -5043,6 +5049,66 @@ mod tests {
             _table: &str,
         ) -> Result<Option<PhysicalTableLayout>, String> {
             Ok(None)
+        }
+    }
+
+    struct FallbackGateCatalog;
+
+    impl FallbackGateCatalog {
+        fn test_table() -> TableDef {
+            TableDef {
+                name: "t".to_string(),
+                columns: vec![
+                    ColumnDef {
+                        name: "a".to_string(),
+                        data_type: DataType::Int32,
+                        nullable: false,
+                        write_default: None,
+                        logical_type: None,
+                    },
+                    ColumnDef {
+                        name: "b".to_string(),
+                        data_type: DataType::Int32,
+                        nullable: false,
+                        write_default: None,
+                        logical_type: None,
+                    },
+                ],
+                iceberg_row_lineage_metadata_columns: vec![],
+                source: ScanSource::IcebergDataFiles {
+                    table: test_iceberg_table_info_with_schema(vec![
+                        IcebergSchemaFieldDef {
+                            field_id: 1,
+                            name: "a".to_string(),
+                            initial_default: None,
+                            write_default: None,
+                            initial_default_json: None,
+                            children: vec![],
+                        },
+                        IcebergSchemaFieldDef {
+                            field_id: 2,
+                            name: "b".to_string(),
+                            initial_default: None,
+                            write_default: None,
+                            initial_default_json: None,
+                            children: vec![],
+                        },
+                    ]),
+                    files: vec![],
+                    cloud_properties: BTreeMap::new(),
+                    binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+                },
+            }
+        }
+    }
+
+    impl CatalogProvider for FallbackGateCatalog {
+        fn get_table(&self, _database: &str, table: &str) -> Result<TableDef, String> {
+            if table.eq_ignore_ascii_case("t") {
+                Ok(Self::test_table())
+            } else {
+                Err(format!("unknown test table `{table}`"))
+            }
         }
     }
 
@@ -5789,6 +5855,68 @@ mod tests {
             1,
             1,
         )])
+    }
+
+    fn build_query_for_fallback_gate(sql: &str) -> Result<(), String> {
+        let dialect = crate::sql::parser::dialect::StarRocksDialect;
+        let mut stmts =
+            sqlparser::parser::Parser::parse_sql(&dialect, sql).map_err(|err| err.to_string())?;
+        let stmt = stmts
+            .pop()
+            .ok_or_else(|| "expected one query statement".to_string())?;
+        let query = match stmt {
+            sqlparser::ast::Statement::Query(query) => query,
+            other => return Err(format!("expected query statement, got {other:?}")),
+        };
+
+        let catalog = FallbackGateCatalog;
+        let (resolved, cte_registry, mut factory) =
+            crate::sql::analyzer::analyze(&query, &catalog, "default")?;
+        let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
+        let physical = optimizer::optimize(logical, &HashMap::new(), factory, None)?;
+        let registry = mock_iceberg_registry();
+        PlanFragmentBuilder::build(&physical, &catalog, &registry, "default")?;
+        Ok(())
+    }
+
+    #[test]
+    fn p2_targeted_surfaces_do_not_use_name_fallback() {
+        let cases = [
+            ("aggregate", "SELECT sum(b) + 1 FROM t"),
+            (
+                "computed_group_key",
+                "SELECT a + 1, count(*) FROM t GROUP BY a + 1",
+            ),
+            (
+                "window",
+                "SELECT row_number() OVER (PARTITION BY a ORDER BY b) + 1 FROM t",
+            ),
+            ("select_alias_order", "SELECT a AS x FROM t ORDER BY x"),
+            ("values", "SELECT * FROM (VALUES (1, 2)) v(a, b)"),
+            (
+                "generate_series",
+                "SELECT * FROM TABLE(generate_series(1, 3, 1)) AS gs(v)",
+            ),
+            ("rollup", "SELECT grouping(a), a FROM t GROUP BY ROLLUP(a)"),
+            ("using", "SELECT a FROM t l JOIN t r USING(a)"),
+            (
+                "subquery_alias",
+                "SELECT x FROM (SELECT a AS x FROM t) s WHERE x > 0",
+            ),
+        ];
+
+        for (name, sql) in cases {
+            let (result, audit) =
+                fallback_audit::run_with_isolated_audit(|| build_query_for_fallback_gate(sql));
+            result.unwrap_or_else(|err| {
+                panic!("{name} should build without fallback gate error: {err}")
+            });
+            assert_eq!(
+                audit,
+                fallback_audit::FallbackAuditSnapshot::default(),
+                "{name} triggered codegen name fallback audit: {audit:?}"
+            );
+        }
     }
 
     fn mock_current_snapshot_iceberg_registry_with_files(

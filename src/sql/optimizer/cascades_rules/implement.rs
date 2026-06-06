@@ -1144,6 +1144,7 @@ impl Rule for RepeatToPhysical {
                 all_rollup_columns: op.all_rollup_columns.clone(),
                 grouping_key_aliases: op.grouping_key_aliases.clone(),
                 grouping_fn_args: op.grouping_fn_args.clone(),
+                grouping_fn_ids: op.grouping_fn_ids.clone(),
             }),
             children: expr.children.clone(),
         }]

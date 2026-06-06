@@ -7,6 +7,7 @@
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{JoinKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
 use crate::sql::catalog::TableDef;
+use crate::sql::column_id::ColumnId;
 use crate::sql::planner::plan::{AggregateCall, DecodeMapping, WindowExpr};
 
 pub(crate) use crate::sql::planner::plan::ScanDictionaryColumn;
@@ -238,6 +239,7 @@ pub(crate) struct LogicalRepeatOp {
     pub all_rollup_columns: Vec<String>,
     pub grouping_key_aliases: Vec<(String, String)>,
     pub grouping_fn_args: Vec<(String, Vec<String>)>,
+    pub grouping_fn_ids: Vec<(String, ColumnId)>,
 }
 
 #[derive(Clone, Debug)]
@@ -402,6 +404,7 @@ pub(crate) struct PhysicalRepeatOp {
     pub all_rollup_columns: Vec<String>,
     pub grouping_key_aliases: Vec<(String, String)>,
     pub grouping_fn_args: Vec<(String, Vec<String>)>,
+    pub grouping_fn_ids: Vec<(String, ColumnId)>,
 }
 
 #[derive(Clone, Debug)]
