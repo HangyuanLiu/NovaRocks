@@ -118,7 +118,7 @@ fn apply_query_modifiers(
 
     // Wrap with Sort if ORDER BY is present.
     if !order_by.is_empty() {
-        let extra_items = collect_extra_sort_items(&order_by, &output_columns, factory);
+        let mut extra_items = collect_extra_sort_items(&order_by, &output_columns, factory);
         let sort_items = rewrite_sort_items_to_projection_refs(&order_by, &extra_items);
         if !extra_items.is_empty() {
             // We're about to add extra sort-only columns to the inner Project
@@ -149,6 +149,19 @@ fn apply_query_modifiers(
                     if let LogicalPlan::Aggregate(ref mut agg) = *proj.input {
                         for extra in &extra_items {
                             collect_aggregates(&extra.expr, &mut agg.aggregates, factory);
+                        }
+                        // ORDER BY-only aggregates (e.g. `count(v2)` that does
+                        // not appear in SELECT) were just folded into the
+                        // aggregate node above. Their extra Project items still
+                        // carry raw AggregateCall expressions; rewrite them to
+                        // reference the aggregate's output columns, exactly as
+                        // split_projection_for_aggregate does for SELECT/HAVING.
+                        // Without this the post-aggregate Project keeps a
+                        // ColumnRef to the aggregate's *input* column (the
+                        // aggregate argument), which the id-binding verifier
+                        // rejects as "not produced by child scope".
+                        for extra in &mut extra_items {
+                            extra.expr = rewrite_agg_calls_to_refs(&extra.expr, &agg.aggregates);
                         }
                     }
                     let user: Vec<(String, arrow::datatypes::DataType, bool, ColumnId)> = proj

@@ -17,6 +17,10 @@ use crate::sql::optimizer::operator::{
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
 use crate::sql::planner::plan::AggregateCall;
 
+use crate::sql::codegen::helpers::typed_expr_display_name;
+
+use super::split_aggregate::{aggregate_group_key_output_ref, group_key_output_column_id};
+
 pub(crate) struct SplitDistinctAgg;
 
 impl Rule for SplitDistinctAgg {
@@ -201,15 +205,52 @@ fn apply_three_phase(
     // Group-by for LOCAL and DISTINCT_GLOBAL: original group_by + distinct_col.
     let mut gb_with_distinct = agg.group_by.clone();
     gb_with_distinct.push(distinct_col.clone());
-    let gb_with_distinct_outputs = phase_group_output_columns(&gb_with_distinct);
+    // Reuse the original aggregate's group output ids (real ids even for
+    // non-ColumnRef group keys such as `group by 1+1`); the distinct column is a
+    // plain ColumnRef so it resolves to its own id. The previous
+    // phase_group_output_columns derived ids from the expressions and assigned
+    // ColumnId::UNSET to any non-ColumnRef group key, which the id-binding
+    // verifier rejects ("group output: ColumnId::UNSET"). This mirrors
+    // split_aggregate::local_output_columns.
+    let gb_with_distinct_outputs: Vec<OutputColumn> = gb_with_distinct
+        .iter()
+        .enumerate()
+        .map(|(idx, expr)| {
+            let name = typed_expr_display_name(expr);
+            // A plain ColumnRef uses its own id; a non-ColumnRef key
+            // (constant/alias/expression, e.g. `'a' as g`) reuses the original
+            // aggregate's group output id by position. The distinct column is
+            // always a ColumnRef and is the trailing entry, so the positional
+            // lookup never needs to reach past the real group outputs.
+            let column_id = match &expr.kind {
+                ExprKind::ColumnRef { column_id, .. } => *column_id,
+                _ => agg
+                    .output_columns
+                    .get(idx)
+                    .map(|output| output.column_id)
+                    .filter(|id| *id != ColumnId::UNSET)
+                    .unwrap_or_else(|| {
+                        group_key_output_column_id(expr, &name, &agg.output_columns)
+                    }),
+            };
+            OutputColumn {
+                column_id,
+                name,
+                data_type: expr.data_type.clone(),
+                nullable: expr.nullable,
+                is_internal: false,
+            }
+        })
+        .collect();
 
-    // LOCAL: group_by = g + x; non_distinct aggs computed with update semantics.
+    // LOCAL: group_by = g + x evaluated over the child; non_distinct aggs
+    // computed with update semantics.
     let local_id = memo.next_expr_id();
     let local = MExpr {
         id: local_id,
         op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
             mode: AggMode::Local,
-            group_by: gb_with_distinct.clone(),
+            group_by: gb_with_distinct,
             aggregates: non_distinct.to_vec(),
             output_columns: gb_with_distinct_outputs.clone(),
             is_merge: vec![false; non_distinct.len()],
@@ -218,15 +259,19 @@ fn apply_three_phase(
     };
     let local_group = memo.new_group(local);
 
-    // DISTINCT_GLOBAL: same group_by; merge non_distinct states.
+    // DISTINCT_GLOBAL: group by references to the LOCAL group outputs (the raw
+    // expressions reference child columns the LOCAL no longer produces); merge
+    // non_distinct states.
+    let dg_group_by =
+        aggregate_group_key_output_ref(&gb_with_distinct_outputs, gb_with_distinct_outputs.len());
     let dg_id = memo.next_expr_id();
     let dg = MExpr {
         id: dg_id,
         op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
             mode: AggMode::DistinctGlobal,
-            group_by: gb_with_distinct,
+            group_by: dg_group_by,
             aggregates: non_distinct.to_vec(),
-            output_columns: gb_with_distinct_outputs,
+            output_columns: gb_with_distinct_outputs.clone(),
             is_merge: vec![true; non_distinct.len()],
         }),
         children: vec![local_group],
@@ -257,7 +302,10 @@ fn apply_three_phase(
     vec![NewExpr {
         op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
             mode: AggMode::Global,
-            group_by: agg.group_by.clone(),
+            // Reference DISTINCT_GLOBAL's original group outputs (drop the
+            // trailing distinct column), not the raw group expressions which
+            // reference child columns no longer produced below the GLOBAL phase.
+            group_by: aggregate_group_key_output_ref(&gb_with_distinct_outputs, agg.group_by.len()),
             aggregates: global_aggs,
             output_columns: agg.output_columns.clone(),
             is_merge: global_merge,
