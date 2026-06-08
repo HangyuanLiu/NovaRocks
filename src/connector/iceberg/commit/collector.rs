@@ -242,6 +242,25 @@ impl IcebergCommitCollector {
         Ok(out)
     }
 
+    /// Reconstruct a [`WrittenFile`] from a writer-reported `TIcebergDataFile`.
+    ///
+    /// As of PR-0 this is lossless against the inject path
+    /// (`engine::iceberg_writer::data_file_to_written_file`) for data and
+    /// delete files: column statistics (`column_stats`), `first_row_id`,
+    /// `equality_ids`, and `key_metadata` all round-trip. Three boundaries
+    /// are intentional and handled (or deferred) elsewhere:
+    ///
+    /// - Partition values are decoded from `partition_path` and currently
+    ///   support identity transforms only; non-identity transforms return an
+    ///   explicit error (see `parse_partition_path`).
+    /// - Column-stat bounds for field-ids absent from the table schema (e.g.
+    ///   stats left behind for a dropped column) are skipped rather than
+    ///   decoded, matching the inject path's tolerance for stale stats.
+    /// - Puffin/NDV sketches are not part of `WrittenFile`; they ride the
+    ///   out-of-band sketch channel (`take_sketch_sets` /
+    ///   `runtime::sink_commit::take_sketch_sets`), which is in-process today.
+    ///   Cross-node sketch transport is required only when multi-BE append is
+    ///   cut over and is out of scope for PR-0.
     fn convert(&self, df: crate::types::TIcebergDataFile) -> Result<WrittenFile, String> {
         use iceberg::spec::{DataContentType, DataFileFormat};
 
@@ -350,9 +369,7 @@ fn i64_map_to_u64(
             u64::try_from(value)
                 .map(|value| (field_id, value))
                 .map_err(|_| {
-                    format!(
-                        "iceberg column stat {field}[{field_id}] value {value} is negative"
-                    )
+                    format!("iceberg column stat {field}[{field_id}] value {value} is negative")
                 })
         })
         .collect()
@@ -670,7 +687,9 @@ mod parity_tests {
             "file:///tmp/staging".to_string(),
             UniqueId { hi: 0, lo: 0 },
         );
-        let err = collector.convert(thrift).expect_err("transform must be rejected");
+        let err = collector
+            .convert(thrift)
+            .expect_err("transform must be rejected");
         assert!(
             err.contains("transform"),
             "expected an explicit transform-not-supported error, got: {err}"
