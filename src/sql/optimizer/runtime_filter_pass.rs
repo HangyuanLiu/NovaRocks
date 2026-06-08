@@ -467,6 +467,9 @@ fn annotate_node(
         let Some(oriented) = orient_rf_key(node, sides, expr_order, eq) else {
             continue;
         };
+        if (*next_filter_id as usize) >= options.rf_max_count {
+            continue;
+        }
         let filter_id = *next_filter_id;
         *next_filter_id += 1;
         descs.push(RuntimeFilterDesc {
@@ -479,7 +482,7 @@ fn annotate_node(
     }
 
     // Push each probe descriptor down to the deepest binding descendant within
-    // the probe child (children[0]). Stops at exchange (fragment) boundaries.
+    // the true probe child. Stops at exchange (fragment) boundaries.
     // If no binding node is found the RF is build-only (probe remains unplaced).
     for d in &descs {
         let probe = RuntimeFilterProbe {
@@ -1040,6 +1043,18 @@ mod tests {
         opts.rf_build_max_bytes = 1; // 1 byte -> build gate rejects
         annotate(&mut j, &opts);
         assert!(j.build_runtime_filters.is_empty());
+    }
+
+    #[test]
+    fn rf_count_cap_limits_new_descriptors() {
+        let mut join = super::test_support::inner_join_two_scans();
+        let mut opts = OptimizerOptions::default_settings();
+        opts.rf_max_count = 0;
+
+        annotate(&mut join, &opts);
+
+        assert!(join.build_runtime_filters.is_empty());
+        assert_eq!(probe_runtime_filter_count(&join), 0);
     }
 
     fn probe_runtime_filter_count(node: &PhysicalPlanNode) -> usize {

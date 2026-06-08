@@ -78,6 +78,9 @@ pub(crate) struct OptimizerOptions {
     /// The RF is emitted only when `build/probe <= 1 - min_selectivity`.
     /// Default: 0.5 (StarRocks RuntimeFilterDescription.MIN_RUNTIME_FILTER_SELECTIVITY).
     pub rf_probe_min_selectivity: f64,
+    /// Hard cap on runtime-filter descriptors emitted by one optimize call.
+    /// Prevents complex plans from producing unbounded RF lists.
+    pub rf_max_count: usize,
     /// Whether probe runtime filters may be pushed across shuffle exchanges
     /// (cross-fragment placement). Currently always `false` (flag-off):
     /// cross-exchange placement has correctness bugs under multi-BE (a partial
@@ -101,6 +104,7 @@ impl OptimizerOptions {
             rf_build_min_bytes: 128 * 1024,
             rf_probe_min_bytes: 100 * 1024,
             rf_probe_min_selectivity: 0.5,
+            rf_max_count: 1024,
             // Cross-exchange RF placement is disabled (flag-off) because it has
             // correctness bugs in both multi-BE and standalone; probe RFs stay
             // within-fragment. Kept as a flag so a future stage can re-enable it.
@@ -193,6 +197,12 @@ mod tests {
         assert_eq!(o.rf_build_min_bytes, 128 * 1024);
         assert_eq!(o.rf_probe_min_bytes, 100 * 1024);
         assert!((o.rf_probe_min_selectivity - 0.5).abs() < 1e-9);
+        assert_eq!(o.rf_max_count, 1024);
+    }
+
+    #[test]
+    fn runtime_filter_max_count_default_is_stable() {
+        assert_eq!(OptimizerOptions::default_settings().rf_max_count, 1024);
     }
 
     #[test]
