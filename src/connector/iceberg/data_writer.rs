@@ -361,7 +361,8 @@ pub(crate) fn to_sink_commit_info(
     String,
 > {
     let df = &staged.data_file;
-    let data_file = data_file_to_iceberg_thrift(df, partition_path, null_fingerprint, format, content)?;
+    let data_file =
+        data_file_to_iceberg_thrift(df, partition_path, null_fingerprint, format, content)?;
     let commit_info = crate::types::TSinkCommitInfo {
         iceberg_data_file: Some(data_file),
         hive_file_info: None,

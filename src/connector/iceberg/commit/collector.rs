@@ -296,6 +296,9 @@ impl IcebergCommitCollector {
 
         Ok(WrittenFile {
             path,
+            // The standalone sink is Parquet-only (enforced in `sink.rs`), so the
+            // wire `df.format` is intentionally not re-read here. Revisit if a
+            // non-Parquet sink is added.
             format: DataFileFormat::Parquet,
             content,
             partition_values,
