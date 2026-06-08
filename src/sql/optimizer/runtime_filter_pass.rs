@@ -86,7 +86,6 @@ fn join_builds_rf(kind: JoinKind) -> bool {
             | JoinKind::RightOuter
             | JoinKind::RightSemi
             | JoinKind::RightAnti
-            | JoinKind::Cross
     )
 }
 
@@ -927,6 +926,10 @@ mod tests {
         assert!(
             cross.build_runtime_filters.is_empty(),
             "Cross without equality keys should not build an RF"
+        );
+        assert!(
+            !join_builds_rf(JoinKind::Cross),
+            "Cross should not be marked RF-producing"
         );
     }
 
