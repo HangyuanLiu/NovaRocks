@@ -28,7 +28,7 @@ use crate::runtime::dispatcher::{FetchOutcome, FragmentDispatcher};
 use crate::runtime::exec_params::build_exec_plan_fragment_params;
 use crate::runtime::scheduler::FragmentScheduler;
 use crate::runtime::write_coordinator::{
-    WriteCommitInput, WriteCoordinator, WriterKey, register_query, unregister_query,
+    WriteAbortInput, WriteCommitInput, WriteCoordinator, WriterKey, register_query, unregister_query,
 };
 use crate::runtime_filter;
 use crate::sql::analysis::cte::CteId;
@@ -38,6 +38,18 @@ use crate::sql::codegen::{
 use crate::types;
 
 use crate::runtime::query_result::{QueryResult, QueryResultColumn};
+
+/// Result of a coordinated execution, exposing the writer-side outcome to the
+/// engine layer. `write_commit` is set when writers reported a commit input on
+/// the success path. `write_abort` is reserved for the failure path that PR-2
+/// wires when SQL write routing moves onto the coordinator; on the current
+/// success path it is `None`.
+#[derive(Debug)]
+pub(crate) struct CoordinatedQueryResult {
+    pub(crate) query_result: QueryResult,
+    pub(crate) write_commit: Option<WriteCommitInput>,
+    pub(crate) write_abort: Option<WriteAbortInput>,
+}
 
 /// Coordinates multi-fragment query execution across one or more backends.
 ///
@@ -66,7 +78,7 @@ impl ExecutionCoordinator {
         }
     }
 
-    pub(crate) fn execute(self) -> Result<QueryResult, String> {
+    pub(crate) fn execute_with_write_outcome(self) -> Result<CoordinatedQueryResult, String> {
         let MultiFragmentBuildResult {
             mut fragment_results,
             root_fragment_id,
@@ -420,7 +432,7 @@ impl ExecutionCoordinator {
         let root_fragment = fr_by_id
             .get(&root_fragment_id)
             .ok_or_else(|| "root fragment not found in build results".to_string())?;
-        Ok(QueryResult {
+        let query_result = QueryResult {
             columns: root_fragment
                 .output_columns
                 .iter()
@@ -432,7 +444,20 @@ impl ExecutionCoordinator {
                 })
                 .collect(),
             chunks: fetch_result.chunks,
+        };
+        Ok(CoordinatedQueryResult {
+            query_result,
+            write_commit: fetch_result.write_commit,
+            write_abort: None,
         })
+    }
+
+    /// Backward-compatible entry point: runs the coordinated execution and
+    /// returns only the query result, discarding the writer outcome. Existing
+    /// callers that do not participate in the Iceberg write lifecycle use this.
+    pub(crate) fn execute(self) -> Result<QueryResult, String> {
+        self.execute_with_write_outcome()
+            .map(|outcome| outcome.query_result)
     }
 }
 
