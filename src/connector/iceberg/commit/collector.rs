@@ -572,6 +572,111 @@ mod parity_tests {
         assert_eq!(actual.equality_ids, Some(vec![1]));
     }
 
+    fn identity_partition_spec(schema: &SchemaRef) -> PartitionSpecRef {
+        Arc::new(
+            iceberg::spec::PartitionSpec::builder(schema.clone())
+                .with_spec_id(0)
+                .add_partition_field("k1", "k1", Transform::Identity)
+                .expect("add partition field")
+                .build()
+                .expect("partition spec"),
+        )
+    }
+
+    #[test]
+    fn convert_reproduces_identity_partition_values() {
+        use iceberg::spec::Literal;
+
+        let schema = int_schema();
+        let spec = identity_partition_spec(&schema);
+
+        let partition = Struct::from_iter([Some(Literal::int(5))]);
+        let mut b = DataFileBuilder::default();
+        b.content(DataContentType::Data)
+            .file_path("file:///t/k1=5/data-1.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .partition(partition.clone())
+            .partition_spec_id(0)
+            .record_count(1)
+            .file_size_in_bytes(64);
+        let df = b.build().expect("data file");
+
+        let expected =
+            crate::engine::iceberg_writer::data_file_to_written_file(&df, 0).expect("expected");
+
+        let thrift = crate::connector::iceberg::data_writer::data_file_to_iceberg_thrift(
+            &df,
+            "k1=5".to_string(),
+            String::new(),
+            "PARQUET".to_string(),
+            crate::types::TIcebergFileContent::DATA,
+        )
+        .expect("thrift");
+
+        let collector = IcebergCommitCollector::new(
+            CommitOpKind::FastAppend,
+            TableIdent::from_strs(["db", "t"]).expect("ident"),
+            None,
+            0,
+            schema,
+            spec,
+            "file:///tmp/staging".to_string(),
+            UniqueId { hi: 0, lo: 0 },
+        );
+        let actual = collector.convert(thrift).expect("convert");
+
+        assert_eq!(expected.partition_values, actual.partition_values);
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn convert_rejects_unsupported_transform_partition_paths() {
+        let schema = int_schema();
+        let spec = Arc::new(
+            iceberg::spec::PartitionSpec::builder(schema.clone())
+                .with_spec_id(0)
+                .add_partition_field("k1", "k1_bucket", Transform::Bucket(4))
+                .expect("add partition field")
+                .build()
+                .expect("partition spec"),
+        );
+
+        let mut b = DataFileBuilder::default();
+        b.content(DataContentType::Data)
+            .file_path("file:///t/k1_bucket=2/data-1.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .partition(Struct::from_iter([Some(iceberg::spec::Literal::int(2))]))
+            .partition_spec_id(0)
+            .record_count(1)
+            .file_size_in_bytes(64);
+        let df = b.build().expect("data file");
+
+        let thrift = crate::connector::iceberg::data_writer::data_file_to_iceberg_thrift(
+            &df,
+            "k1_bucket=2".to_string(),
+            String::new(),
+            "PARQUET".to_string(),
+            crate::types::TIcebergFileContent::DATA,
+        )
+        .expect("thrift");
+
+        let collector = IcebergCommitCollector::new(
+            CommitOpKind::FastAppend,
+            TableIdent::from_strs(["db", "t"]).expect("ident"),
+            None,
+            0,
+            schema,
+            spec,
+            "file:///tmp/staging".to_string(),
+            UniqueId { hi: 0, lo: 0 },
+        );
+        let err = collector.convert(thrift).expect_err("transform must be rejected");
+        assert!(
+            err.contains("transform"),
+            "expected an explicit transform-not-supported error, got: {err}"
+        );
+    }
+
     #[test]
     fn convert_skips_bounds_for_field_ids_absent_from_schema() {
         // int_schema() has only field id 1; a bound for field id 999 simulates
