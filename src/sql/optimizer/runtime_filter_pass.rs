@@ -760,6 +760,110 @@ pub(crate) mod test_support {
         }
     }
 
+    pub(crate) fn broadcast_join_with_probe_exchange() -> PhysicalPlanNode {
+        use crate::sql::optimizer::operator::PhysicalDistributionOp;
+        use crate::sql::optimizer::property::{DistributionSpec, HashSource};
+        let (loc, lexpr) = col(1, "lc"); // probe column
+        let (roc, rexpr) = col(2, "rc"); // build column
+        let scan = leaf(1_000_000.0, loc.clone());
+        let exch = PhysicalPlanNode {
+            op: Operator::PhysicalDistribution(PhysicalDistributionOp {
+                spec: DistributionSpec::HashPartitioned {
+                    cols: vec![loc.column_id],
+                    source: HashSource::ShuffleJoin,
+                },
+            }),
+            children: vec![scan],
+            stats: Statistics {
+                output_row_count: 1_000_000.0,
+                row_count_confidence: crate::sql::optimizer::statistics::Confidence::Estimated,
+                column_statistics: Default::default(),
+                ..Default::default()
+            },
+            output_columns: vec![loc.clone()],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+        let build = leaf(100.0, roc.clone());
+        PhysicalPlanNode {
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: lexpr,
+                    right: rexpr,
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+            }),
+            children: vec![exch, build],
+            stats: Statistics {
+                output_row_count: 100.0,
+                row_count_confidence: crate::sql::optimizer::statistics::Confidence::Estimated,
+                column_statistics: Default::default(),
+                ..Default::default()
+            },
+            output_columns: vec![loc, roc],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        }
+    }
+
+    pub(crate) fn inner_join_over_left_outer_probe_child() -> PhysicalPlanNode {
+        let (preserved_oc, preserved_expr) = col(1, "preserved");
+        let (outer_build_oc, outer_build_expr) = col(2, "outer_build");
+        let (top_build_oc, top_build_expr) = col(3, "top_build");
+        let preserved = leaf(1_000_000.0, preserved_oc.clone());
+        let outer_build = leaf(10.0, outer_build_oc.clone());
+        let left_outer = PhysicalPlanNode {
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::LeftOuter,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: preserved_expr.clone(),
+                    right: outer_build_expr,
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+            }),
+            children: vec![preserved, outer_build],
+            stats: Statistics {
+                output_row_count: 1_000_000.0,
+                column_statistics: Default::default(),
+                ..Default::default()
+            },
+            output_columns: vec![preserved_oc.clone(), outer_build_oc],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+        let top_build = leaf(10.0, top_build_oc.clone());
+        PhysicalPlanNode {
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: preserved_expr,
+                    right: top_build_expr,
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+            }),
+            children: vec![left_outer, top_build],
+            stats: Statistics {
+                output_row_count: 10.0,
+                column_statistics: Default::default(),
+                ..Default::default()
+            },
+            output_columns: vec![preserved_oc, top_build_oc],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        }
+    }
+
     pub(crate) fn join_with_project_over_probe_scan() -> PhysicalPlanNode {
         use crate::sql::optimizer::operator::PhysicalProjectOp;
         let (loc, lexpr) = col(1, "lc"); // probe column
@@ -865,6 +969,66 @@ mod tests {
         );
         // ...it reached the scan beneath the project (children[0].children[0]).
         assert_eq!(join.children[0].children[0].probe_runtime_filters.len(), 1);
+    }
+
+    #[test]
+    fn partitioned_rf_does_not_cross_exchange_even_when_flag_enabled() {
+        let mut j = super::test_support::shuffle_join_with_probe_exchange();
+        let mut opts = OptimizerOptions::default_settings();
+        opts.allow_cross_exchange_rf = true;
+
+        annotate(&mut j, &opts);
+
+        assert_eq!(j.build_runtime_filters.len(), 1, "build RF expected");
+        let exch = &j.children[0];
+        assert!(
+            exch.probe_runtime_filters.is_empty(),
+            "partitioned probe RF must not stop at the exchange"
+        );
+        assert!(
+            exch.children[0].probe_runtime_filters.is_empty(),
+            "partitioned probe RF must not cross the exchange"
+        );
+    }
+
+    #[test]
+    fn broadcast_rf_crosses_exchange_when_flag_enabled() {
+        let mut j = super::test_support::broadcast_join_with_probe_exchange();
+        let mut opts = OptimizerOptions::default_settings();
+        opts.allow_cross_exchange_rf = true;
+
+        annotate(&mut j, &opts);
+
+        assert_eq!(j.build_runtime_filters.len(), 1, "build RF expected");
+        let exch = &j.children[0];
+        assert!(
+            exch.probe_runtime_filters.is_empty(),
+            "broadcast probe RF must not stop at the exchange"
+        );
+        assert_eq!(
+            exch.children[0].probe_runtime_filters.len(),
+            1,
+            "broadcast probe RF should reach the scan below the exchange"
+        );
+    }
+
+    #[test]
+    fn probe_does_not_descend_through_outer_join_boundary() {
+        let mut join = super::test_support::inner_join_over_left_outer_probe_child();
+
+        annotate(&mut join, &OptimizerOptions::default_settings());
+
+        assert_eq!(join.build_runtime_filters.len(), 1, "build RF expected");
+        let left_outer = &join.children[0];
+        assert_eq!(
+            left_outer.probe_runtime_filters.len(),
+            1,
+            "probe RF should stop on the outer join boundary"
+        );
+        assert!(
+            left_outer.children[0].probe_runtime_filters.is_empty(),
+            "probe RF must not descend into the preserved child"
+        );
     }
 
     #[test]
