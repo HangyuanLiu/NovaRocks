@@ -508,6 +508,64 @@ pub(crate) mod test_support {
         }
     }
 
+    pub(crate) fn hash_join_two_scans(join_type: JoinKind) -> PhysicalPlanNode {
+        let (loc, lexpr) = col(1, "lc");
+        let (roc, rexpr) = col(2, "rc");
+        let left = leaf(1_000_000.0, loc.clone());
+        let right = leaf(10.0, roc.clone());
+        PhysicalPlanNode {
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: lexpr,
+                    right: rexpr,
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+            }),
+            children: vec![left, right],
+            stats: Statistics {
+                output_row_count: 10.0,
+                column_statistics: Default::default(),
+                ..Default::default()
+            },
+            output_columns: vec![loc, roc],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        }
+    }
+
+    pub(crate) fn inner_join_with_swapped_eq_labels() -> PhysicalPlanNode {
+        let (loc, lexpr) = col(1, "lc");
+        let (roc, rexpr) = col(2, "rc");
+        let left = leaf(1_000_000.0, loc.clone());
+        let right = leaf(10.0, roc.clone());
+        PhysicalPlanNode {
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: rexpr,
+                    right: lexpr,
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+            }),
+            children: vec![left, right],
+            stats: Statistics {
+                output_row_count: 10.0,
+                column_statistics: Default::default(),
+                ..Default::default()
+            },
+            output_columns: vec![loc, roc],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        }
+    }
+
     pub(crate) fn shuffle_join(build_rows: f64, probe_rows: f64) -> PhysicalPlanNode {
         let (loc, lexpr) = col(1, "lc");
         let (roc, rexpr) = col(2, "rc");
@@ -806,6 +864,59 @@ mod tests {
     }
 
     #[test]
+    fn rf_join_eligibility_matches_probe_output_semantics() {
+        use crate::sql::analysis::JoinKind;
+
+        for kind in [
+            JoinKind::Inner,
+            JoinKind::LeftSemi,
+            JoinKind::RightOuter,
+            JoinKind::RightSemi,
+            JoinKind::RightAnti,
+            JoinKind::Cross,
+        ] {
+            let mut join = super::test_support::hash_join_two_scans(kind);
+            annotate(&mut join, &OptimizerOptions::default_settings());
+            assert_eq!(
+                join.build_runtime_filters.len(),
+                1,
+                "{kind:?} should build an RF"
+            );
+        }
+
+        for kind in [
+            JoinKind::LeftOuter,
+            JoinKind::FullOuter,
+            JoinKind::LeftAnti,
+            JoinKind::NullAwareLeftAnti,
+        ] {
+            let mut join = super::test_support::hash_join_two_scans(kind);
+            annotate(&mut join, &OptimizerOptions::default_settings());
+            assert!(
+                join.build_runtime_filters.is_empty(),
+                "{kind:?} should not build an RF"
+            );
+        }
+    }
+
+    #[test]
+    fn rf_orients_swapped_eq_labels_by_child_column_ids() {
+        let mut join = super::test_support::inner_join_with_swapped_eq_labels();
+        annotate(&mut join, &OptimizerOptions::default_settings());
+        assert_eq!(join.build_runtime_filters.len(), 1);
+        assert_eq!(join.children[0].probe_runtime_filters.len(), 1);
+        assert!(join.children[1].probe_runtime_filters.is_empty());
+        assert_eq!(
+            column_id_vec(&join.build_runtime_filters[0].build_expr),
+            vec![crate::sql::column_id::ColumnId::new_for_test(2)]
+        );
+        assert_eq!(
+            column_id_vec(&join.build_runtime_filters[0].probe_expr),
+            vec![crate::sql::column_id::ColumnId::new_for_test(1)]
+        );
+    }
+
+    #[test]
     fn session_build_max_can_skip_rf() {
         // build_rows=1000, avg_row_size=8 bytes -> build_size=8KB.
         // With rf_build_max_bytes=1, build gate rejects even a tiny build.
@@ -814,6 +925,14 @@ mod tests {
         opts.rf_build_max_bytes = 1; // 1 byte -> build gate rejects
         annotate(&mut j, &opts);
         assert!(j.build_runtime_filters.is_empty());
+    }
+
+    fn column_id_vec(expr: &TypedExpr) -> Vec<ColumnId> {
+        let mut ids = HashSet::new();
+        column_ids(expr, &mut ids);
+        let mut ids: Vec<_> = ids.into_iter().collect();
+        ids.sort();
+        ids
     }
 
     fn probe_runtime_filter_count(node: &PhysicalPlanNode) -> usize {
