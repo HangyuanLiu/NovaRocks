@@ -1,0 +1,99 @@
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 81.2
+  Memory: 12.8
+
+PLAN FRAGMENT 0(F05)
+  Fragment Cost: 35.99999999999999
+  Output Exprs:49: sum
+  Input Partition: UNPARTITIONED
+  RESULT SINK
+
+  10:AGGREGATE (merge finalize)
+  |  aggregate: sum[([49: sum, BIGINT, true]); args: INT; result: BIGINT; args nullable: true; result nullable: true]
+  |  cardinality: 1
+  |
+  9:EXCHANGE
+     distribution type: GATHER
+     cardinality: 1
+
+PLAN FRAGMENT 1(F04)
+  Fragment Cost: 26.6
+
+  Input Partition: HASH_PARTITIONED: 6: lo_orderdate
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 09
+
+  8:AGGREGATE (update serialize)
+  |  aggregate: sum[([13: lo_revenue, INT, false]); args: INT; result: BIGINT; args nullable: false; result nullable: true]
+  |  cardinality: 1
+  |
+  7:Project
+  |  output columns:
+  |  13 <-> [13: lo_revenue, INT, false]
+  |  cardinality: 1
+  |
+  6:HASH JOIN
+  |  join op: INNER JOIN (PARTITIONED)
+  |  equal join conjunct: [6: lo_orderdate, INT, false] = [25: d_datekey, INT, false]
+  |  build runtime filters:
+  |  - filter_id = 0, build_expr = (25: d_datekey), remote = true
+  |  output columns: 13
+  |  can local shuffle: true
+  |  cardinality: 1
+  |
+  |----5:EXCHANGE
+  |       distribution type: SHUFFLE
+  |       partition exprs: [25: d_datekey, INT, false]
+  |       cardinality: 1
+  |
+  2:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [6: lo_orderdate, INT, false]
+     cardinality: 1
+
+PLAN FRAGMENT 2(F02)
+  Fragment Cost: 6.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 25: d_datekey
+  OutPut Exchange Id: 05
+
+  4:Project
+  |  output columns:
+  |  25 <-> [25: d_datekey, INT, false]
+  |  cardinality: 1
+  |
+  3:OlapScanNode
+     table: dates, rollup: dates
+     preAggregation: on
+     Predicates: [36: d_weeknuminyear, INT, false] = 6, [29: d_year, INT, false] = 1994
+     partitionsRatio=1/1, tabletsRatio=1/1
+     tabletList=99308
+     actualRows=0, avgRowSize=3.0
+     cardinality: 1
+
+PLAN FRAGMENT 3(F00)
+  Fragment Cost: 8.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 6: lo_orderdate
+  OutPut Exchange Id: 02
+
+  1:Project
+  |  output columns:
+  |  6 <-> [6: lo_orderdate, INT, false]
+  |  13 <-> [13: lo_revenue, INT, false]
+  |  cardinality: 1
+  |
+  0:OlapScanNode
+     table: lineorder, rollup: lineorder
+     preAggregation: on
+     Predicates: [12: lo_discount, INT, false] >= 5, [12: lo_discount, INT, false] <= 7, [9: lo_quantity, INT, false] >= 26, [9: lo_quantity, INT, false] <= 35
+     partitionsRatio=1/1, tabletsRatio=1/1
+     tabletList=99292
+     actualRows=0, avgRowSize=4.0
+     cardinality: 1
+     probe runtime filters:
+     - filter_id = 0, probe_expr = (6: lo_orderdate)

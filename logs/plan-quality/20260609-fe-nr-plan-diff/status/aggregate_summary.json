@@ -1,0 +1,600 @@
+[
+  {
+    "case": "tpc-h/q4",
+    "sql_path": "/Users/harbor/.codex/worktrees/da01/NovaRocks/sql-tests/tpc-h/sql/q4.sql",
+    "database": "tpch",
+    "fe": {
+      "file": "logs/plan-quality/20260609-fe-nr-plan-diff/fe/tpc-h__q4.out",
+      "runtime_filter_line_count": 4,
+      "runtime_filter_lines": [
+        "  |  build runtime filters:",
+        "  |  - filter_id = 0, build_expr = (17: l_orderkey), remote = true",
+        "     probe runtime filters:",
+        "     - filter_id = 0, probe_expr = (1: o_orderkey)"
+      ]
+    },
+    "nr": {
+      "file": "logs/plan-quality/20260609-fe-nr-plan-diff/nr/tpc-h__q4.out",
+      "runtime_filter_line_count": 0,
+      "runtime_filter_lines": []
+    }
+  },
+  {
+    "case": "tpc-h/q22",
+    "sql_path": "/Users/harbor/.codex/worktrees/da01/NovaRocks/sql-tests/tpc-h/sql/q22.sql",
+    "database": "tpch",
+    "fe": {
+      "file": "logs/plan-quality/20260609-fe-nr-plan-diff/fe/tpc-h__q22.out",
+      "runtime_filter_line_count": 0,
+      "runtime_filter_lines": []
+    },
+    "nr": {
+      "file": "logs/plan-quality/20260609-fe-nr-plan-diff/nr/tpc-h__q22.out",
+      "runtime_filter_line_count": 0,
+      "runtime_filter_lines": []
+    }
+  },
+  {
+    "case": "tpc-ds/q41",
+    "sql_path": "/Users/harbor/.codex/worktrees/da01/NovaRocks/sql-tests/tpc-ds/sql/q41.sql",
+    "database": "tpcds",
+    "fe": {
+      "file": "logs/plan-quality/20260609-fe-nr-plan-diff/fe/tpc-ds__q41.out",
+      "runtime_filter_line_count": 4,
+      "runtime_filter_lines": [
+        "  |  build runtime filters:",
+        "  |  - filter_id = 0, build_expr = (44: i_manufact), remote = true",
+        "     probe runtime filters:",
+        "     - filter_id = 0, probe_expr = (15: i_manufact)"
+      ]
+    },
+    "nr": {
+      "file": "logs/plan-quality/20260609-fe-nr-plan-diff/nr/tpc-ds__q41.out",
+      "runtime_filter_line_count": 0,
+      "runtime_filter_lines": []
+    }
+  },
+  {
+    "case": "tpc-ds/q72",
+    "sql_path": "/Users/harbor/.codex/worktrees/da01/NovaRocks/sql-tests/tpc-ds/sql/q72.sql",
+    "database": "tpcds",
+    "fe": {
+      "file": "logs/plan-quality/20260609-fe-nr-plan-diff/fe/tpc-ds__q72.out",
+      "runtime_filter_line_count": 34,
+      "runtime_filter_lines": [
+        "  |  build runtime filters:",
+        "  |  - filter_id = 8, build_expr = (201: d_date_sk), remote = true",
+        "  |  build runtime filters:",
+        "  |  - filter_id = 6, build_expr = (166: d_date_sk), remote = true",
+        "  |  - filter_id = 7, build_expr = (170: d_week_seq), remote = true",
+        "  |  build runtime filters:",
+        "  |  - filter_id = 5, build_expr = (131: d_date_sk), remote = true",
+        "  |  probe runtime filters:",
+        "  |  - filter_id = 7, probe_expr = (135: d_week_seq), partition_exprs = (42: inv_date_sk,135: d_week_seq)",
+        "  |  build runtime filters:",
+        "  |  - filter_id = 4, build_expr = (119: hd_demo_sk), remote = true",
+        "  |  probe runtime filters:",
+        "  |  - filter_id = 6, probe_expr = (42: inv_date_sk), partition_exprs = (42: inv_date_sk,135: d_week_seq)",
+        "  |  build runtime filters:",
+        "  |  - filter_id = 3, build_expr = (103: cd_demo_sk), remote = true",
+        "  |  build runtime filters:",
+        "  |  - filter_id = 2, build_expr = (74: i_item_sk), remote = true",
+        "     probe runtime filters:",
+        "     - filter_id = 3, probe_expr = (7: cs_bill_cdemo_sk)",
+        "     - filter_id = 4, probe_expr = (8: cs_bill_hdemo_sk)",
+        "  |  build runtime filters:",
+        "  |  - filter_id = 1, build_expr = (53: w_warehouse_sk), remote = true",
+        "  |  build runtime filters:",
+        "  |  - filter_id = 0, build_expr = (43: inv_item_sk), remote = true",
+        "     probe runtime filters:",
+        "     - filter_id = 1, probe_expr = (44: inv_warehouse_sk)",
+        "     - filter_id = 2, probe_expr = (43: inv_item_sk)",
+        "     probe runtime filters:",
+        "     - filter_id = 0, probe_expr = (1: cs_item_sk)",
+        "     - filter_id = 2, probe_expr = (1: cs_item_sk)",
+        "     - filter_id = 3, probe_expr = (7: cs_bill_cdemo_sk)",
+        "     - filter_id = 4, probe_expr = (8: cs_bill_hdemo_sk)",
+        "     - filter_id = 5, probe_expr = (3: cs_sold_date_sk)",
+        "     - filter_id = 8, probe_expr = (5: cs_ship_date_sk)"
+      ]
+    },
+    "nr": {
+      "file": "logs/plan-quality/20260609-fe-nr-plan-diff/nr/tpc-ds__q72.out",
+      "runtime_filter_line_count": 21,
+      "runtime_filter_lines": [
+        "                    build runtime filters:",
+        "                    - filter_id = 5, build_expr = (i_item_sk)",
+        "                      build runtime filters:",
+        "                      - filter_id = 4, build_expr = (w_warehouse_sk)",
+        "                        build runtime filters:",
+        "                        - filter_id = 3, build_expr = (cd_demo_sk)",
+        "                          build runtime filters:",
+        "                          - filter_id = 2, build_expr = (hd_demo_sk)",
+        "                            build runtime filters:",
+        "                            - filter_id = 1, build_expr = (d3.d_date_sk)",
+        "                                    probe runtime filters:",
+        "                                    - filter_id = 1, probe_expr = (cs_ship_date_sk)",
+        "                                    - filter_id = 2, probe_expr = (cs_bill_hdemo_sk)",
+        "                                    - filter_id = 3, probe_expr = (cs_bill_cdemo_sk)",
+        "                                    - filter_id = 5, probe_expr = (cs_item_sk)",
+        "                                        probe runtime filters:",
+        "                                        - filter_id = 4, probe_expr = (inv_warehouse_sk)",
+        "                                      build runtime filters:",
+        "                                      - filter_id = 0, build_expr = (d1.d_week_seq)",
+        "                                          probe runtime filters:",
+        "                                          - filter_id = 0, probe_expr = (d2.d_week_seq)"
+      ]
+    }
+  },
+  {
+    "case": "ssb/q1.1",
+    "sql_path": "/Users/harbor/.codex/worktrees/da01/NovaRocks/sql-tests/ssb/sql/q1.1.sql",
+    "database": "ssb",
+    "fe": {
+      "file": "logs/plan-quality/20260609-fe-nr-plan-diff/fe/ssb__q1.1.out",
+      "runtime_filter_line_count": 4,
+      "runtime_filter_lines": [
+        "  |  build runtime filters:",
+        "  |  - filter_id = 0, build_expr = (25: d_datekey), remote = true",
+        "     probe runtime filters:",
+        "     - filter_id = 0, probe_expr = (6: lo_orderdate)"
+      ]
+    },
+    "nr": {
+      "file": "logs/plan-quality/20260609-fe-nr-plan-diff/nr/ssb__q1.1.out",
+      "runtime_filter_line_count": 4,
+      "runtime_filter_lines": [
+        "          build runtime filters:",
+        "          - filter_id = 0, build_expr = (d_datekey)",
+        "              probe runtime filters:",
+        "              - filter_id = 0, probe_expr = (lo_orderdate)"
+      ]
+    }
+  },
+  {
+    "case": "ssb/q1.2",
+    "sql_path": "/Users/harbor/.codex/worktrees/da01/NovaRocks/sql-tests/ssb/sql/q1.2.sql",
+    "database": "ssb",
+    "fe": {
+      "file": "logs/plan-quality/20260609-fe-nr-plan-diff/fe/ssb__q1.2.out",
+      "runtime_filter_line_count": 4,
+      "runtime_filter_lines": [
+        "  |  build runtime filters:",
+        "  |  - filter_id = 0, build_expr = (25: d_datekey), remote = true",
+        "     probe runtime filters:",
+        "     - filter_id = 0, probe_expr = (6: lo_orderdate)"
+      ]
+    },
+    "nr": {
+      "file": "logs/plan-quality/20260609-fe-nr-plan-diff/nr/ssb__q1.2.out",
+      "runtime_filter_line_count": 4,
+      "runtime_filter_lines": [
+        "          build runtime filters:",
+        "          - filter_id = 0, build_expr = (d_datekey)",
+        "              probe runtime filters:",
+        "              - filter_id = 0, probe_expr = (lo_orderdate)"
+      ]
+    }
+  },
+  {
+    "case": "ssb/q1.3",
+    "sql_path": "/Users/harbor/.codex/worktrees/da01/NovaRocks/sql-tests/ssb/sql/q1.3.sql",
+    "database": "ssb",
+    "fe": {
+      "file": "logs/plan-quality/20260609-fe-nr-plan-diff/fe/ssb__q1.3.out",
+      "runtime_filter_line_count": 4,
+      "runtime_filter_lines": [
+        "  |  build runtime filters:",
+        "  |  - filter_id = 0, build_expr = (25: d_datekey), remote = true",
+        "     probe runtime filters:",
+        "     - filter_id = 0, probe_expr = (6: lo_orderdate)"
+      ]
+    },
+    "nr": {
+      "file": "logs/plan-quality/20260609-fe-nr-plan-diff/nr/ssb__q1.3.out",
+      "runtime_filter_line_count": 4,
+      "runtime_filter_lines": [
+        "          build runtime filters:",
+        "          - filter_id = 0, build_expr = (d_datekey)",
+        "              probe runtime filters:",
+        "              - filter_id = 0, probe_expr = (lo_orderdate)"
+      ]
+    }
+  },
+  {
+    "case": "ssb/q2.1",
+    "sql_path": "/Users/harbor/.codex/worktrees/da01/NovaRocks/sql-tests/ssb/sql/q2.1.sql",
+    "database": "ssb",
+    "fe": {
+      "file": "logs/plan-quality/20260609-fe-nr-plan-diff/fe/ssb__q2.1.out",
+      "runtime_filter_line_count": 11,
+      "runtime_filter_lines": [
+        "  |  build runtime filters:",
+        "  |  - filter_id = 2, build_expr = (4: lo_partkey), remote = true",
+        "  |  build runtime filters:",
+        "  |  - filter_id = 1, build_expr = (25: d_datekey), remote = true",
+        "  |  build runtime filters:",
+        "  |  - filter_id = 0, build_expr = (65: s_suppkey), remote = true",
+        "     probe runtime filters:",
+        "     - filter_id = 0, probe_expr = (5: lo_suppkey)",
+        "     - filter_id = 1, probe_expr = (6: lo_orderdate)",
+        "     probe runtime filters:",
+        "     - filter_id = 2, probe_expr = (49: p_partkey)"
+      ]
+    },
+    "nr": {
+      "file": "logs/plan-quality/20260609-fe-nr-plan-diff/nr/ssb__q2.1.out",
+      "runtime_filter_line_count": 10,
+      "runtime_filter_lines": [
+        "              build runtime filters:",
+        "              - filter_id = 2, build_expr = (d_datekey)",
+        "                build runtime filters:",
+        "                - filter_id = 1, build_expr = (p_partkey)",
+        "                  build runtime filters:",
+        "                  - filter_id = 0, build_expr = (s_suppkey)",
+        "                      probe runtime filters:",
+        "                      - filter_id = 0, probe_expr = (lo_suppkey)",
+        "                      - filter_id = 1, probe_expr = (lo_partkey)",
+        "                      - filter_id = 2, probe_expr = (lo_orderdate)"
+      ]
+    }
+  },
+  {
+    "case": "ssb/q2.2",
+    "sql_path": "/Users/harbor/.codex/worktrees/da01/NovaRocks/sql-tests/ssb/sql/q2.2.sql",
+    "database": "ssb",
+    "fe": {
+      "file": "logs/plan-quality/20260609-fe-nr-plan-diff/fe/ssb__q2.2.out",
+      "runtime_filter_line_count": 11,
+      "runtime_filter_lines": [
+        "  |  build runtime filters:",
+        "  |  - filter_id = 2, build_expr = (4: lo_partkey), remote = true",
+        "  |  build runtime filters:",
+        "  |  - filter_id = 1, build_expr = (25: d_datekey), remote = true",
+        "  |  build runtime filters:",
+        "  |  - filter_id = 0, build_expr = (65: s_suppkey), remote = true",
+        "     probe runtime filters:",
+        "     - filter_id = 0, probe_expr = (5: lo_suppkey)",
+        "     - filter_id = 1, probe_expr = (6: lo_orderdate)",
+        "     probe runtime filters:",
+        "     - filter_id = 2, probe_expr = (49: p_partkey)"
+      ]
+    },
+    "nr": {
+      "file": "logs/plan-quality/20260609-fe-nr-plan-diff/nr/ssb__q2.2.out",
+      "runtime_filter_line_count": 10,
+      "runtime_filter_lines": [
+        "              build runtime filters:",
+        "              - filter_id = 2, build_expr = (d_datekey)",
+        "                build runtime filters:",
+        "                - filter_id = 1, build_expr = (p_partkey)",
+        "                  build runtime filters:",
+        "                  - filter_id = 0, build_expr = (s_suppkey)",
+        "                      probe runtime filters:",
+        "                      - filter_id = 0, probe_expr = (lo_suppkey)",
+        "                      - filter_id = 1, probe_expr = (lo_partkey)",
+        "                      - filter_id = 2, probe_expr = (lo_orderdate)"
+      ]
+    }
+  },
+  {
+    "case": "ssb/q2.3",
+    "sql_path": "/Users/harbor/.codex/worktrees/da01/NovaRocks/sql-tests/ssb/sql/q2.3.sql",
+    "database": "ssb",
+    "fe": {
+      "file": "logs/plan-quality/20260609-fe-nr-plan-diff/fe/ssb__q2.3.out",
+      "runtime_filter_line_count": 11,
+      "runtime_filter_lines": [
+        "  |  build runtime filters:",
+        "  |  - filter_id = 2, build_expr = (4: lo_partkey), remote = true",
+        "  |  build runtime filters:",
+        "  |  - filter_id = 1, build_expr = (25: d_datekey), remote = true",
+        "  |  build runtime filters:",
+        "  |  - filter_id = 0, build_expr = (65: s_suppkey), remote = true",
+        "     probe runtime filters:",
+        "     - filter_id = 0, probe_expr = (5: lo_suppkey)",
+        "     - filter_id = 1, probe_expr = (6: lo_orderdate)",
+        "     probe runtime filters:",
+        "     - filter_id = 2, probe_expr = (49: p_partkey)"
+      ]
+    },
+    "nr": {
+      "file": "logs/plan-quality/20260609-fe-nr-plan-diff/nr/ssb__q2.3.out",
+      "runtime_filter_line_count": 10,
+      "runtime_filter_lines": [
+        "              build runtime filters:",
+        "              - filter_id = 2, build_expr = (d_datekey)",
+        "                build runtime filters:",
+        "                - filter_id = 1, build_expr = (p_partkey)",
+        "                  build runtime filters:",
+        "                  - filter_id = 0, build_expr = (s_suppkey)",
+        "                      probe runtime filters:",
+        "                      - filter_id = 0, probe_expr = (lo_suppkey)",
+        "                      - filter_id = 1, probe_expr = (lo_partkey)",
+        "                      - filter_id = 2, probe_expr = (lo_orderdate)"
+      ]
+    }
+  },
+  {
+    "case": "ssb/q3.1",
+    "sql_path": "/Users/harbor/.codex/worktrees/da01/NovaRocks/sql-tests/ssb/sql/q3.1.sql",
+    "database": "ssb",
+    "fe": {
+      "file": "logs/plan-quality/20260609-fe-nr-plan-diff/fe/ssb__q3.1.out",
+      "runtime_filter_line_count": 11,
+      "runtime_filter_lines": [
+        "  |  build runtime filters:",
+        "  |  - filter_id = 2, build_expr = (64: s_suppkey), remote = true",
+        "  |  build runtime filters:",
+        "  |  - filter_id = 1, build_expr = (3: lo_custkey), remote = true",
+        "  |  build runtime filters:",
+        "  |  - filter_id = 0, build_expr = (25: d_datekey), remote = true",
+        "     probe runtime filters:",
+        "     - filter_id = 0, probe_expr = (6: lo_orderdate)",
+        "     - filter_id = 2, probe_expr = (5: lo_suppkey)",
+        "     probe runtime filters:",
+        "     - filter_id = 1, probe_expr = (49: c_custkey)"
+      ]
+    },
+    "nr": {
+      "file": "logs/plan-quality/20260609-fe-nr-plan-diff/nr/ssb__q3.1.out",
+      "runtime_filter_line_count": 10,
+      "runtime_filter_lines": [
+        "              build runtime filters:",
+        "              - filter_id = 2, build_expr = (d_datekey)",
+        "                build runtime filters:",
+        "                - filter_id = 1, build_expr = (c_custkey)",
+        "                  build runtime filters:",
+        "                  - filter_id = 0, build_expr = (s_suppkey)",
+        "                      probe runtime filters:",
+        "                      - filter_id = 0, probe_expr = (lo_suppkey)",
+        "                      - filter_id = 1, probe_expr = (lo_custkey)",
+        "                      - filter_id = 2, probe_expr = (lo_orderdate)"
+      ]
+    }
+  },
+  {
+    "case": "ssb/q3.2",
+    "sql_path": "/Users/harbor/.codex/worktrees/da01/NovaRocks/sql-tests/ssb/sql/q3.2.sql",
+    "database": "ssb",
+    "fe": {
+      "file": "logs/plan-quality/20260609-fe-nr-plan-diff/fe/ssb__q3.2.out",
+      "runtime_filter_line_count": 11,
+      "runtime_filter_lines": [
+        "  |  build runtime filters:",
+        "  |  - filter_id = 2, build_expr = (64: s_suppkey), remote = true",
+        "  |  build runtime filters:",
+        "  |  - filter_id = 1, build_expr = (3: lo_custkey), remote = true",
+        "  |  build runtime filters:",
+        "  |  - filter_id = 0, build_expr = (25: d_datekey), remote = true",
+        "     probe runtime filters:",
+        "     - filter_id = 0, probe_expr = (6: lo_orderdate)",
+        "     - filter_id = 2, probe_expr = (5: lo_suppkey)",
+        "     probe runtime filters:",
+        "     - filter_id = 1, probe_expr = (49: c_custkey)"
+      ]
+    },
+    "nr": {
+      "file": "logs/plan-quality/20260609-fe-nr-plan-diff/nr/ssb__q3.2.out",
+      "runtime_filter_line_count": 10,
+      "runtime_filter_lines": [
+        "              build runtime filters:",
+        "              - filter_id = 2, build_expr = (d_datekey)",
+        "                build runtime filters:",
+        "                - filter_id = 1, build_expr = (c_custkey)",
+        "                  build runtime filters:",
+        "                  - filter_id = 0, build_expr = (s_suppkey)",
+        "                      probe runtime filters:",
+        "                      - filter_id = 0, probe_expr = (lo_suppkey)",
+        "                      - filter_id = 1, probe_expr = (lo_custkey)",
+        "                      - filter_id = 2, probe_expr = (lo_orderdate)"
+      ]
+    }
+  },
+  {
+    "case": "ssb/q3.3",
+    "sql_path": "/Users/harbor/.codex/worktrees/da01/NovaRocks/sql-tests/ssb/sql/q3.3.sql",
+    "database": "ssb",
+    "fe": {
+      "file": "logs/plan-quality/20260609-fe-nr-plan-diff/fe/ssb__q3.3.out",
+      "runtime_filter_line_count": 11,
+      "runtime_filter_lines": [
+        "  |  build runtime filters:",
+        "  |  - filter_id = 2, build_expr = (64: s_suppkey), remote = true",
+        "  |  build runtime filters:",
+        "  |  - filter_id = 1, build_expr = (3: lo_custkey), remote = true",
+        "  |  build runtime filters:",
+        "  |  - filter_id = 0, build_expr = (25: d_datekey), remote = true",
+        "     probe runtime filters:",
+        "     - filter_id = 0, probe_expr = (6: lo_orderdate)",
+        "     - filter_id = 2, probe_expr = (5: lo_suppkey)",
+        "     probe runtime filters:",
+        "     - filter_id = 1, probe_expr = (49: c_custkey)"
+      ]
+    },
+    "nr": {
+      "file": "logs/plan-quality/20260609-fe-nr-plan-diff/nr/ssb__q3.3.out",
+      "runtime_filter_line_count": 10,
+      "runtime_filter_lines": [
+        "              build runtime filters:",
+        "              - filter_id = 2, build_expr = (d_datekey)",
+        "                build runtime filters:",
+        "                - filter_id = 1, build_expr = (c_custkey)",
+        "                  build runtime filters:",
+        "                  - filter_id = 0, build_expr = (s_suppkey)",
+        "                      probe runtime filters:",
+        "                      - filter_id = 0, probe_expr = (lo_suppkey)",
+        "                      - filter_id = 1, probe_expr = (lo_custkey)",
+        "                      - filter_id = 2, probe_expr = (lo_orderdate)"
+      ]
+    }
+  },
+  {
+    "case": "ssb/q3.4",
+    "sql_path": "/Users/harbor/.codex/worktrees/da01/NovaRocks/sql-tests/ssb/sql/q3.4.sql",
+    "database": "ssb",
+    "fe": {
+      "file": "logs/plan-quality/20260609-fe-nr-plan-diff/fe/ssb__q3.4.out",
+      "runtime_filter_line_count": 11,
+      "runtime_filter_lines": [
+        "  |  build runtime filters:",
+        "  |  - filter_id = 2, build_expr = (64: s_suppkey), remote = true",
+        "  |  build runtime filters:",
+        "  |  - filter_id = 1, build_expr = (3: lo_custkey), remote = true",
+        "  |  build runtime filters:",
+        "  |  - filter_id = 0, build_expr = (25: d_datekey), remote = true",
+        "     probe runtime filters:",
+        "     - filter_id = 0, probe_expr = (6: lo_orderdate)",
+        "     - filter_id = 2, probe_expr = (5: lo_suppkey)",
+        "     probe runtime filters:",
+        "     - filter_id = 1, probe_expr = (49: c_custkey)"
+      ]
+    },
+    "nr": {
+      "file": "logs/plan-quality/20260609-fe-nr-plan-diff/nr/ssb__q3.4.out",
+      "runtime_filter_line_count": 10,
+      "runtime_filter_lines": [
+        "              build runtime filters:",
+        "              - filter_id = 2, build_expr = (d_datekey)",
+        "                build runtime filters:",
+        "                - filter_id = 1, build_expr = (c_custkey)",
+        "                  build runtime filters:",
+        "                  - filter_id = 0, build_expr = (s_suppkey)",
+        "                      probe runtime filters:",
+        "                      - filter_id = 0, probe_expr = (lo_suppkey)",
+        "                      - filter_id = 1, probe_expr = (lo_custkey)",
+        "                      - filter_id = 2, probe_expr = (lo_orderdate)"
+      ]
+    }
+  },
+  {
+    "case": "ssb/q4.1",
+    "sql_path": "/Users/harbor/.codex/worktrees/da01/NovaRocks/sql-tests/ssb/sql/q4.1.sql",
+    "database": "ssb",
+    "fe": {
+      "file": "logs/plan-quality/20260609-fe-nr-plan-diff/fe/ssb__q4.1.out",
+      "runtime_filter_line_count": 14,
+      "runtime_filter_lines": [
+        "  |  build runtime filters:",
+        "  |  - filter_id = 3, build_expr = (3: lo_custkey), remote = true",
+        "  |  build runtime filters:",
+        "  |  - filter_id = 2, build_expr = (25: d_datekey), remote = true",
+        "  |  build runtime filters:",
+        "  |  - filter_id = 1, build_expr = (78: p_partkey), remote = true",
+        "  |  build runtime filters:",
+        "  |  - filter_id = 0, build_expr = (64: s_suppkey), remote = true",
+        "     probe runtime filters:",
+        "     - filter_id = 0, probe_expr = (5: lo_suppkey)",
+        "     - filter_id = 1, probe_expr = (4: lo_partkey)",
+        "     - filter_id = 2, probe_expr = (6: lo_orderdate)",
+        "     probe runtime filters:",
+        "     - filter_id = 3, probe_expr = (49: c_custkey)"
+      ]
+    },
+    "nr": {
+      "file": "logs/plan-quality/20260609-fe-nr-plan-diff/nr/ssb__q4.1.out",
+      "runtime_filter_line_count": 13,
+      "runtime_filter_lines": [
+        "              build runtime filters:",
+        "              - filter_id = 3, build_expr = (d_datekey)",
+        "                build runtime filters:",
+        "                - filter_id = 2, build_expr = (c_custkey)",
+        "                  build runtime filters:",
+        "                  - filter_id = 1, build_expr = (s_suppkey)",
+        "                    build runtime filters:",
+        "                    - filter_id = 0, build_expr = (p_partkey)",
+        "                        probe runtime filters:",
+        "                        - filter_id = 0, probe_expr = (lo_partkey)",
+        "                        - filter_id = 1, probe_expr = (lo_suppkey)",
+        "                        - filter_id = 2, probe_expr = (lo_custkey)",
+        "                        - filter_id = 3, probe_expr = (lo_orderdate)"
+      ]
+    }
+  },
+  {
+    "case": "ssb/q4.2",
+    "sql_path": "/Users/harbor/.codex/worktrees/da01/NovaRocks/sql-tests/ssb/sql/q4.2.sql",
+    "database": "ssb",
+    "fe": {
+      "file": "logs/plan-quality/20260609-fe-nr-plan-diff/fe/ssb__q4.2.out",
+      "runtime_filter_line_count": 13,
+      "runtime_filter_lines": [
+        "  |  build runtime filters:",
+        "  |  - filter_id = 3, build_expr = (78: p_partkey), remote = true",
+        "  |  build runtime filters:",
+        "  |  - filter_id = 2, build_expr = (64: s_suppkey), remote = true",
+        "  |  build runtime filters:",
+        "  |  - filter_id = 1, build_expr = (25: d_datekey), remote = true",
+        "  |  build runtime filters:",
+        "  |  - filter_id = 0, build_expr = (49: c_custkey), remote = true",
+        "     probe runtime filters:",
+        "     - filter_id = 0, probe_expr = (3: lo_custkey)",
+        "     - filter_id = 1, probe_expr = (6: lo_orderdate)",
+        "     - filter_id = 2, probe_expr = (5: lo_suppkey)",
+        "     - filter_id = 3, probe_expr = (4: lo_partkey)"
+      ]
+    },
+    "nr": {
+      "file": "logs/plan-quality/20260609-fe-nr-plan-diff/nr/ssb__q4.2.out",
+      "runtime_filter_line_count": 13,
+      "runtime_filter_lines": [
+        "              build runtime filters:",
+        "              - filter_id = 3, build_expr = (d_datekey)",
+        "                build runtime filters:",
+        "                - filter_id = 2, build_expr = (c_custkey)",
+        "                  build runtime filters:",
+        "                  - filter_id = 1, build_expr = (s_suppkey)",
+        "                    build runtime filters:",
+        "                    - filter_id = 0, build_expr = (p_partkey)",
+        "                        probe runtime filters:",
+        "                        - filter_id = 0, probe_expr = (lo_partkey)",
+        "                        - filter_id = 1, probe_expr = (lo_suppkey)",
+        "                        - filter_id = 2, probe_expr = (lo_custkey)",
+        "                        - filter_id = 3, probe_expr = (lo_orderdate)"
+      ]
+    }
+  },
+  {
+    "case": "ssb/q4.3",
+    "sql_path": "/Users/harbor/.codex/worktrees/da01/NovaRocks/sql-tests/ssb/sql/q4.3.sql",
+    "database": "ssb",
+    "fe": {
+      "file": "logs/plan-quality/20260609-fe-nr-plan-diff/fe/ssb__q4.3.out",
+      "runtime_filter_line_count": 13,
+      "runtime_filter_lines": [
+        "  |  build runtime filters:",
+        "  |  - filter_id = 3, build_expr = (78: p_partkey), remote = true",
+        "  |  build runtime filters:",
+        "  |  - filter_id = 2, build_expr = (64: s_suppkey), remote = true",
+        "  |  build runtime filters:",
+        "  |  - filter_id = 1, build_expr = (25: d_datekey), remote = true",
+        "  |  build runtime filters:",
+        "  |  - filter_id = 0, build_expr = (49: c_custkey), remote = true",
+        "     probe runtime filters:",
+        "     - filter_id = 0, probe_expr = (3: lo_custkey)",
+        "     - filter_id = 1, probe_expr = (6: lo_orderdate)",
+        "     - filter_id = 2, probe_expr = (5: lo_suppkey)",
+        "     - filter_id = 3, probe_expr = (4: lo_partkey)"
+      ]
+    },
+    "nr": {
+      "file": "logs/plan-quality/20260609-fe-nr-plan-diff/nr/ssb__q4.3.out",
+      "runtime_filter_line_count": 13,
+      "runtime_filter_lines": [
+        "              build runtime filters:",
+        "              - filter_id = 3, build_expr = (d_datekey)",
+        "                build runtime filters:",
+        "                - filter_id = 2, build_expr = (p_partkey)",
+        "                  build runtime filters:",
+        "                  - filter_id = 1, build_expr = (c_custkey)",
+        "                    build runtime filters:",
+        "                    - filter_id = 0, build_expr = (s_suppkey)",
+        "                        probe runtime filters:",
+        "                        - filter_id = 0, probe_expr = (lo_suppkey)",
+        "                        - filter_id = 1, probe_expr = (lo_custkey)",
+        "                        - filter_id = 2, probe_expr = (lo_partkey)",
+        "                        - filter_id = 3, probe_expr = (lo_orderdate)"
+      ]
+    }
+  }
+]

@@ -1,0 +1,42 @@
+SORT BY [d_year ASC NULLS FIRST, p_brand ASC NULLS FIRST] stats={rows=32}
+  GATHER EXCHANGE stats={rows=32}
+    PROJECT [sum(lo_revenue) AS lo_revenue, d_year, p_brand] stats={rows=32}
+      HASH AGGREGATE (GLOBAL, group by: [d_year, p_brand]) stats={rows=32}
+        aggregations: sum(lo_revenue)
+        HASH EXCHANGE (source: ShuffleAgg, hash: [c22, c39]) stats={rows=32}
+          HASH AGGREGATE (LOCAL, group by: [d_year, p_brand]) stats={rows=32}
+            aggregations: sum(lo_revenue)
+            HASH JOIN (BROADCAST, INNER, eq: [lo_orderdate = d_datekey]) stats={rows=25000000000}
+              build runtime filters:
+              - filter_id = 2, build_expr = (d_datekey)
+              HASH JOIN (BROADCAST, INNER, eq: [lo_partkey = p_partkey]) stats={rows=1000000}
+                build runtime filters:
+                - filter_id = 1, build_expr = (p_partkey)
+                HASH JOIN (BROADCAST, INNER, eq: [lo_suppkey = s_suppkey]) stats={rows=1000000}
+                  build runtime filters:
+                  - filter_id = 0, build_expr = (s_suppkey)
+                  SCAN ssb.lineorder stats={rows=1000000}
+                       TABLE: ssb.lineorder
+                       columns: lo_partkey, lo_suppkey, lo_orderdate, lo_revenue
+                       min-max stats
+                      probe runtime filters:
+                      - filter_id = 0, probe_expr = (lo_suppkey)
+                      - filter_id = 1, probe_expr = (lo_partkey)
+                      - filter_id = 2, probe_expr = (lo_orderdate)
+                  BROADCAST EXCHANGE stats={rows=25000}
+                    SCAN ssb.supplier stats={rows=25000}
+                         TABLE: ssb.supplier
+                         columns: s_suppkey, s_region
+                         min-max stats
+                         predicates: s_region = 'AMERICA'
+                BROADCAST EXCHANGE stats={rows=25000}
+                  SCAN ssb.part stats={rows=25000}
+                       TABLE: ssb.part
+                       columns: p_partkey, p_brand, p_category
+                       min-max stats
+                       predicates: p_category = 'MFGR#12'
+              BROADCAST EXCHANGE stats={rows=100000}
+                SCAN ssb.dates stats={rows=100000}
+                     TABLE: ssb.dates
+                     columns: d_datekey, d_year
+                     min-max stats

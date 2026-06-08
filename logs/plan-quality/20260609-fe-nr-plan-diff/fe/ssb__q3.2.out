@@ -1,0 +1,225 @@
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 561.2
+  Memory: 180.4
+
+PLAN FRAGMENT 0(F14)
+  Fragment Cost: 176.0
+  Output Exprs:52: c_city | 67: s_city | 29: d_year | 78: sum
+  Input Partition: UNPARTITIONED
+  RESULT SINK
+
+  22:MERGING-EXCHANGE
+     distribution type: GATHER
+     cardinality: 1
+
+PLAN FRAGMENT 1(F13)
+  Fragment Cost: 288.2
+
+  Input Partition: HASH_PARTITIONED: 52: c_city, 67: s_city, 29: d_year
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 22
+
+  21:SORT
+  |  order by: [29, INT, false] ASC, [78, BIGINT, true] DESC
+  |  offset: 0
+  |  cardinality: 1
+  |
+  20:AGGREGATE (merge finalize)
+  |  aggregate: sum[([78: sum, BIGINT, true]); args: INT; result: BIGINT; args nullable: true; result nullable: true]
+  |  group by: [52: c_city, VARCHAR(11), false], [67: s_city, VARCHAR(11), false], [29: d_year, INT, false]
+  |  cardinality: 1
+  |
+  19:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [52: c_city, VARCHAR(11), false], [67: s_city, VARCHAR(11), false], [29: d_year, INT, false]
+     cardinality: 1
+
+PLAN FRAGMENT 2(F12)
+  Fragment Cost: 115.19999999999996
+
+  Input Partition: HASH_PARTITIONED: 5: lo_suppkey
+  OutPut Partition: HASH_PARTITIONED: 52: c_city, 67: s_city, 29: d_year
+  OutPut Exchange Id: 19
+
+  18:AGGREGATE (update serialize)
+  |  STREAMING
+  |  aggregate: sum[([13: lo_revenue, INT, false]); args: INT; result: BIGINT; args nullable: false; result nullable: true]
+  |  group by: [52: c_city, VARCHAR(11), false], [67: s_city, VARCHAR(11), false], [29: d_year, INT, false]
+  |  cardinality: 1
+  |
+  17:Project
+  |  output columns:
+  |  13 <-> [13: lo_revenue, INT, false]
+  |  29 <-> [29: d_year, INT, false]
+  |  52 <-> [52: c_city, VARCHAR(11), false]
+  |  67 <-> [67: s_city, VARCHAR(11), false]
+  |  cardinality: 1
+  |
+  16:HASH JOIN
+  |  join op: INNER JOIN (PARTITIONED)
+  |  equal join conjunct: [5: lo_suppkey, INT, false] = [64: s_suppkey, INT, false]
+  |  build runtime filters:
+  |  - filter_id = 2, build_expr = (64: s_suppkey), remote = true
+  |  output columns: 13, 29, 52, 67
+  |  can local shuffle: true
+  |  cardinality: 1
+  |
+  |----15:EXCHANGE
+  |       distribution type: SHUFFLE
+  |       partition exprs: [64: s_suppkey, INT, false]
+  |       cardinality: 1
+  |
+  12:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [5: lo_suppkey, INT, false]
+     cardinality: 1
+
+PLAN FRAGMENT 3(F10)
+  Fragment Cost: 18.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 64: s_suppkey
+  OutPut Exchange Id: 15
+
+  14:Project
+  |  output columns:
+  |  64 <-> [64: s_suppkey, INT, false]
+  |  67 <-> [67: s_city, VARCHAR(11), false]
+  |  cardinality: 1
+  |
+  13:OlapScanNode
+     table: supplier, rollup: supplier
+     preAggregation: on
+     Predicates: [68: s_nation, VARCHAR(16), false] = 'UNITED STATES'
+     partitionsRatio=1/1, tabletsRatio=1/1
+     tabletList=99316
+     actualRows=0, avgRowSize=3.0
+     cardinality: 1
+
+PLAN FRAGMENT 4(F08)
+  Fragment Cost: 79.60000000000001
+
+  Input Partition: HASH_PARTITIONED: 49: c_custkey
+  OutPut Partition: HASH_PARTITIONED: 5: lo_suppkey
+  OutPut Exchange Id: 12
+
+  11:Project
+  |  output columns:
+  |  5 <-> [5: lo_suppkey, INT, false]
+  |  13 <-> [13: lo_revenue, INT, false]
+  |  29 <-> [29: d_year, INT, false]
+  |  52 <-> [52: c_city, VARCHAR(11), false]
+  |  cardinality: 1
+  |
+  10:HASH JOIN
+  |  join op: INNER JOIN (PARTITIONED)
+  |  equal join conjunct: [49: c_custkey, INT, false] = [3: lo_custkey, INT, false]
+  |  build runtime filters:
+  |  - filter_id = 1, build_expr = (3: lo_custkey), remote = true
+  |  output columns: 5, 13, 29, 52
+  |  can local shuffle: true
+  |  cardinality: 1
+  |
+  |----9:EXCHANGE
+  |       distribution type: SHUFFLE
+  |       partition exprs: [3: lo_custkey, INT, false]
+  |       cardinality: 1
+  |
+  2:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [49: c_custkey, INT, false]
+     cardinality: 1
+
+PLAN FRAGMENT 5(F06)
+  Fragment Cost: 48.8
+
+  Input Partition: HASH_PARTITIONED: 6: lo_orderdate
+  OutPut Partition: HASH_PARTITIONED: 3: lo_custkey
+  OutPut Exchange Id: 09
+
+  8:Project
+  |  output columns:
+  |  3 <-> [3: lo_custkey, INT, false]
+  |  5 <-> [5: lo_suppkey, INT, false]
+  |  13 <-> [13: lo_revenue, INT, false]
+  |  29 <-> [29: d_year, INT, false]
+  |  cardinality: 1
+  |
+  7:HASH JOIN
+  |  join op: INNER JOIN (PARTITIONED)
+  |  equal join conjunct: [6: lo_orderdate, INT, false] = [25: d_datekey, INT, false]
+  |  build runtime filters:
+  |  - filter_id = 0, build_expr = (25: d_datekey), remote = true
+  |  output columns: 3, 5, 13, 29
+  |  can local shuffle: true
+  |  cardinality: 1
+  |
+  |----6:EXCHANGE
+  |       distribution type: SHUFFLE
+  |       partition exprs: [25: d_datekey, INT, false]
+  |       cardinality: 1
+  |
+  4:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [6: lo_orderdate, INT, false]
+     cardinality: 1
+
+PLAN FRAGMENT 6(F04)
+  Fragment Cost: 4.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 25: d_datekey
+  OutPut Exchange Id: 06
+
+  5:OlapScanNode
+     table: dates, rollup: dates
+     preAggregation: on
+     Predicates: [29: d_year, INT, false] >= 1992, [29: d_year, INT, false] <= 1997
+     partitionsRatio=1/1, tabletsRatio=1/1
+     tabletList=99308
+     actualRows=0, avgRowSize=2.0
+     cardinality: 1
+
+PLAN FRAGMENT 7(F02)
+  Fragment Cost: 8.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 6: lo_orderdate
+  OutPut Exchange Id: 04
+
+  3:OlapScanNode
+     table: lineorder, rollup: lineorder
+     preAggregation: on
+     partitionsRatio=1/1, tabletsRatio=1/1
+     tabletList=99292
+     actualRows=0, avgRowSize=4.0
+     cardinality: 1
+     probe runtime filters:
+     - filter_id = 0, probe_expr = (6: lo_orderdate)
+     - filter_id = 2, probe_expr = (5: lo_suppkey)
+
+PLAN FRAGMENT 8(F00)
+  Fragment Cost: 18.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 49: c_custkey
+  OutPut Exchange Id: 02
+
+  1:Project
+  |  output columns:
+  |  49 <-> [49: c_custkey, INT, false]
+  |  52 <-> [52: c_city, VARCHAR(11), false]
+  |  cardinality: 1
+  |
+  0:OlapScanNode
+     table: customer, rollup: customer
+     preAggregation: on
+     Predicates: [53: c_nation, VARCHAR(16), false] = 'UNITED STATES'
+     partitionsRatio=1/1, tabletsRatio=1/1
+     tabletList=99300
+     actualRows=0, avgRowSize=3.0
+     cardinality: 1
+     probe runtime filters:
+     - filter_id = 1, probe_expr = (49: c_custkey)
