@@ -9,9 +9,8 @@ import os
 import re
 import subprocess
 import sys
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, NamedTuple
 
 
 RF_PATTERNS = (
@@ -45,8 +44,10 @@ DEFAULT_CASES = (
 )
 
 
-@dataclass(frozen=True)
-class Endpoint:
+DEFAULT_DATABASES = {"ssb": "ssb", "tpc-h": "tpch", "tpc-ds": "tpcds"}
+
+
+class Endpoint(NamedTuple):
     name: str
     host: str
     port: str
@@ -62,12 +63,22 @@ def case_to_sql_path(case_id: str) -> Path:
     return repo_root() / "sql-tests" / suite / "sql" / f"{case_name}.sql"
 
 
+def case_default_database(case_id: str) -> str | None:
+    suite = case_id.split("/", 1)[0]
+    return DEFAULT_DATABASES.get(suite)
+
+
 def explain_sql(raw_sql: str) -> str:
-    stripped = raw_sql.strip().rstrip(";")
+    non_comment_lines = [
+        line for line in raw_sql.splitlines() if not line.lstrip().startswith("--")
+    ]
+    stripped = "\n".join(non_comment_lines).strip().rstrip(";").strip()
+    if not stripped:
+        raise ValueError("SQL body is empty after removing full-line comments")
     return f"EXPLAIN VERBOSE {stripped};"
 
 
-def run_mysql(endpoint: Endpoint, sql: str, timeout: int) -> str:
+def run_mysql(endpoint: Endpoint, sql: str, timeout: int, database: str | None) -> str:
     cmd = [
         "mysql",
         "-h",
@@ -79,9 +90,10 @@ def run_mysql(endpoint: Endpoint, sql: str, timeout: int) -> str:
         "--batch",
         "--raw",
         "--skip-column-names",
-        "-e",
-        sql,
     ]
+    if database is not None:
+        cmd.extend(["--database", database])
+    cmd.extend(["-e", sql])
     env = os.environ.copy()
     env.update(
         {
@@ -133,9 +145,14 @@ def collect_case(
     sql_path = case_to_sql_path(case_id)
     raw_sql = sql_path.read_text()
     sql = explain_sql(raw_sql)
-    entry: dict[str, object] = {"case": case_id, "sql_path": str(sql_path)}
+    database = case_default_database(case_id)
+    entry: dict[str, object] = {
+        "case": case_id,
+        "sql_path": str(sql_path),
+        "database": database,
+    }
     for endpoint in endpoints:
-        explain = run_mysql(endpoint, sql, timeout)
+        explain = run_mysql(endpoint, sql, timeout, database)
         out_path = output_dir / endpoint.name / f"{safe_file_name(case_id)}.out"
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(explain)
