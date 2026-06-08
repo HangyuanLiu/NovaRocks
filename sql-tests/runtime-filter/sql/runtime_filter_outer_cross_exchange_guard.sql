@@ -5,8 +5,8 @@
 -- 2. Compare against RuntimeFilterPushDown-disabled execution to guard cross-exchange placement.
 -- Test Flow:
 -- 1. Create/reset left, right, and dimension tables.
--- 2. Insert deterministic rows including a NULL probe key.
--- 3. Run the same outer-join query with runtime filter enabled and disabled.
+-- 2. Insert deterministic rows including NULL and right-only FULL OUTER keys.
+-- 3. Run the same guarded query with runtime filter enabled and disabled.
 DROP TABLE IF EXISTS ${case_db}.rf_outer_l;
 DROP TABLE IF EXISTS ${case_db}.rf_outer_r;
 DROP TABLE IF EXISTS ${case_db}.rf_outer_dim;
@@ -28,31 +28,54 @@ INSERT INTO ${case_db}.rf_outer_l VALUES
     (1, 10),
     (2, NULL),
     (3, 30);
-INSERT INTO ${case_db}.rf_outer_r VALUES (10);
-INSERT INTO ${case_db}.rf_outer_dim VALUES (10), (30);
+INSERT INTO ${case_db}.rf_outer_r VALUES (10), (40);
+INSERT INTO ${case_db}.rf_outer_dim VALUES (10), (30), (40);
 
 SET disable_optimizer_rules = '';
-SELECT id, k
-FROM (
+-- @explain_contains=HASH JOIN (PARTITIONED, FULL OUTER
+-- @explain_contains=build runtime filters:
+-- @explain_contains=probe_expr = (d.k)
+-- @explain_not_contains=probe_expr = (l.k)
+-- @explain_not_contains=probe_expr = (r.k)
+WITH x AS (
     SELECT l.id, l.k, r.k AS rk
     FROM ${case_db}.rf_outer_l l
     FULL OUTER JOIN ${case_db}.rf_outer_r r
       ON l.k = r.k
-) x
-WHERE x.k IS NULL OR x.k IN (
-    SELECT d.k FROM ${case_db}.rf_outer_dim d
+),
+q AS (
+    SELECT id, k, rk
+    FROM x
+    WHERE k IS NULL AND rk IS NULL
+    UNION ALL
+    SELECT x.id, x.k, x.rk
+    FROM x
+    INNER JOIN ${case_db}.rf_outer_dim d
+      ON COALESCE(x.k, x.rk) = d.k
 )
-ORDER BY id;
+SELECT id, k, rk
+FROM q
+ORDER BY COALESCE(id, 999999), COALESCE(k, rk);
 
 SET disable_optimizer_rules = 'RuntimeFilterPushDown';
-SELECT id, k
-FROM (
+WITH x AS (
     SELECT l.id, l.k, r.k AS rk
     FROM ${case_db}.rf_outer_l l
     FULL OUTER JOIN ${case_db}.rf_outer_r r
       ON l.k = r.k
-) x
-WHERE x.k IS NULL OR x.k IN (
-    SELECT d.k FROM ${case_db}.rf_outer_dim d
+),
+q AS (
+    SELECT id, k, rk
+    FROM x
+    WHERE k IS NULL AND rk IS NULL
+    UNION ALL
+    SELECT x.id, x.k, x.rk
+    FROM x
+    INNER JOIN ${case_db}.rf_outer_dim d
+      ON COALESCE(x.k, x.rk) = d.k
 )
-ORDER BY id;
+SELECT id, k, rk
+FROM q
+ORDER BY COALESCE(id, 999999), COALESCE(k, rk);
+
+SET disable_optimizer_rules = '';
