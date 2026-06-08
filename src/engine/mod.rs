@@ -58,6 +58,7 @@ pub(crate) mod statistics;
 pub(crate) mod stream_load;
 pub(crate) mod view_rewrite;
 pub(crate) mod virtual_table;
+pub(crate) mod write_operation_lifecycle;
 
 pub(crate) use self::name_resolve::ResolvedLocalTableName;
 

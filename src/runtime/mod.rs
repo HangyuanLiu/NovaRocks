@@ -43,3 +43,4 @@ pub(crate) mod scheduler;
 pub mod sink_commit;
 pub mod starlet_shard_registry;
 pub mod thread_cpu_time;
+pub(crate) mod write_operation_lifecycle;

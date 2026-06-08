@@ -1319,19 +1319,20 @@ mod pr3_tests {
 
     #[tokio::test]
     async fn report_exec_status_updates_registered_write_coordinator() {
-        crate::runtime::write_coordinator::test_clear_registry();
+        let mut guard = crate::runtime::write_coordinator::write_registry_test_guard();
         let query = types::TUniqueId::new(701, 801);
         let finst = types::TUniqueId::new(702, 802);
-        crate::runtime::write_coordinator::register_query(
-            query.clone(),
-            vec![crate::runtime::write_coordinator::WriterKey {
-                query_id: query.clone(),
-                fragment_instance_id: finst.clone(),
-                backend_num: 0,
-            }],
-        )
-        .expect("register write coordinator");
-        let bytes = thrift_binary_serialize(&ok_report_params(query.clone(), finst))
+        guard
+            .register_query(
+                query.clone(),
+                vec![crate::runtime::write_coordinator::WriterKey {
+                    query_id: query.clone(),
+                    fragment_instance_id: finst.clone(),
+                    backend_num: 0,
+                }],
+            )
+            .expect("register write coordinator");
+        let bytes = thrift_binary_serialize(&ok_report_params(query, finst))
             .expect("serialize report params");
         let svc = GrpcService::default();
         let req = Request::new(ReportExecStatusRequest {
@@ -1343,12 +1344,11 @@ mod pr3_tests {
             .expect("RPC level success");
         let body = resp.into_inner();
         assert_eq!(body.status_code, 0, "{}", body.message);
-        crate::runtime::write_coordinator::unregister_query(&query);
     }
 
     #[tokio::test]
     async fn report_exec_status_query_gone_returns_terminal_code() {
-        crate::runtime::write_coordinator::test_clear_registry();
+        let _guard = crate::runtime::write_coordinator::write_registry_test_guard();
         let query = types::TUniqueId::new(801, 901);
         let finst = types::TUniqueId::new(802, 902);
         let bytes = thrift_binary_serialize(&ok_report_params(query, finst))
@@ -1372,7 +1372,6 @@ mod pr3_tests {
         );
         assert!(body.message.contains("not found"), "{}", body.message);
     }
-
     #[tokio::test]
     async fn fetch_result_missing_finst_id_returns_error_status() {
         let svc = GrpcService::default();
