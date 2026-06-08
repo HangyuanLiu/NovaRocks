@@ -80,12 +80,20 @@ pub(crate) struct ResolvedSelect {
 pub(crate) struct RepeatInfo {
     /// For each repeat level, the column names that are NON-null.
     pub repeat_column_ref_list: Vec<Vec<String>>,
+    /// For each repeat level, the ColumnIds that are NON-null.
+    pub repeat_column_ref_ids: Vec<Vec<ColumnId>>,
     /// Grouping ID bitmap for each level. Bit=1 means column is NULLed.
     pub grouping_ids: Vec<u64>,
     /// All rollup column names.
     pub all_rollup_columns: Vec<String>,
+    /// All rollup ColumnIds.
+    pub all_rollup_column_ids: Vec<ColumnId>,
     /// GROUPING() function calls: (output_name, arg_column_names).
     pub grouping_fn_args: Vec<(String, Vec<String>)>,
+    /// GROUPING() function argument ColumnIds, aligned with `grouping_fn_args`.
+    pub grouping_fn_arg_ids: Vec<Vec<ColumnId>>,
+    /// GROUPING() virtual output ids: (output_name, analyzer-minted ColumnId).
+    pub grouping_fn_ids: Vec<(String, ColumnId)>,
 }
 
 #[derive(Clone, Debug)]
@@ -145,6 +153,7 @@ pub(crate) struct GenerateSeriesRelation {
     pub step: i64,
     pub column_name: String,
     pub alias: Option<String>,
+    pub output_column_id: crate::sql::column_id::ColumnId,
 }
 
 #[derive(Clone, Debug)]
@@ -160,10 +169,11 @@ pub(crate) struct ScanRelation {
     pub table: TableDef,
     pub alias: Option<String>,
     /// G1: ColumnId assigned by the analyzer when this table was added to a
-    /// scope. The planner reuses these instead of minting fresh ones so the
-    /// scan output's ColumnIds match the analyzer-produced `ColumnRef`s in
-    /// the rest of the plan (filters, GROUP BY, ORDER BY, Window
-    /// PARTITION BY, etc.).
+    /// scope. For Iceberg v3 row-lineage scans, ids are base columns first,
+    /// then hidden metadata columns. The planner reuses these instead of
+    /// minting fresh ones so the scan output's ColumnIds match the
+    /// analyzer-produced `ColumnRef`s in the rest of the plan (filters,
+    /// GROUP BY, ORDER BY, Window PARTITION BY, etc.).
     pub column_ids: Vec<ColumnId>,
 }
 
@@ -267,7 +277,7 @@ pub(crate) enum SetOpKind {
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedValues {
     pub rows: Vec<Vec<TypedExpr>>,
-    pub column_types: Vec<DataType>,
+    pub output_columns: Vec<OutputColumn>,
 }
 
 // ---------------------------------------------------------------------------

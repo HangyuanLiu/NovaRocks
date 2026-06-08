@@ -87,6 +87,8 @@ pub(crate) struct DecodeNode {
 /// rest of the plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DecodeMapping {
+    pub source_column_id: ColumnId,
+    pub output_column_id: ColumnId,
     pub dict_column: String,
     pub string_column: String,
 }
@@ -107,10 +109,14 @@ pub(crate) struct AggregateStateMergeNode {
 pub(crate) struct RepeatPlanNode {
     pub input: Box<LogicalPlan>,
     pub repeat_column_ref_list: Vec<Vec<String>>,
+    pub repeat_column_ref_ids: Vec<Vec<ColumnId>>,
     pub grouping_ids: Vec<u64>,
     pub all_rollup_columns: Vec<String>,
+    pub all_rollup_column_ids: Vec<ColumnId>,
     pub grouping_key_aliases: Vec<(String, String)>,
     pub grouping_fn_args: Vec<(String, Vec<String>)>,
+    pub grouping_fn_arg_ids: Vec<Vec<ColumnId>>,
+    pub grouping_fn_ids: Vec<(String, ColumnId)>,
     /// Set by the Phase-1 column-pruning tagging pass; `None` means all columns required.
     pub required_output_columns: Option<HashSet<ColumnId>>,
 }
@@ -163,7 +169,14 @@ pub(crate) struct WindowExpr {
     pub order_by: Vec<SortItem>,
     pub window_frame: Option<crate::sql::analysis::WindowFrame>,
     pub result_type: DataType,
+    /// Display label only (EXPLAIN / output schema). Identity is now
+    /// `output_column_id`. (G1: `output_name` downgraded from a binding key.)
     pub output_name: String,
+    /// G1: globally-unique id of this window function's output column.
+    /// TODO(G1 P2/P3): remove this allow once parent Project/window references
+    /// are rebound by id and downstream binding consumes the populated field.
+    #[allow(dead_code)]
+    pub output_column_id: crate::sql::column_id::ColumnId,
     /// `IGNORE NULLS` modifier. Currently honored by first_value / last_value
     /// / lead / lag; ignored for other window functions.
     pub ignore_nulls: bool,
@@ -178,6 +191,7 @@ pub(crate) struct GenerateSeriesNode {
     pub step: i64,
     pub column_name: String,
     pub alias: Option<String>,
+    pub output_column_id: ColumnId,
     /// Set by the Phase-1 column-pruning tagging pass; `None` means all columns required.
     pub required_output_columns: Option<HashSet<ColumnId>>,
 }
@@ -286,6 +300,12 @@ pub(crate) struct AggregateCall {
     pub distinct: bool,
     pub result_type: DataType,
     pub order_by: Vec<SortItem>,
+    /// G1: id of THIS aggregate's output column. Planner-created calls are
+    /// minted by `collect_aggregates`; rewrite paths should preserve existing
+    /// ids or allocate ids for newly-defined aggregate outputs. Fixtures and
+    /// transient adapters may use `UNSET` until they become executable
+    /// bindings.
+    pub output_column_id: crate::sql::column_id::ColumnId,
 }
 
 #[derive(Clone, Debug)]

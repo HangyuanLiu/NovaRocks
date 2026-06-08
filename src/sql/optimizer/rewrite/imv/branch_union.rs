@@ -673,6 +673,7 @@ mod tests {
                 distinct: false,
                 result_type: DataType::Int64,
                 order_by: Vec::new(),
+                output_column_id: ColumnId::UNSET,
             }],
             output_columns: vec![output_column(1, "region"), output_column(3, "s")],
             already_pushed: false,

@@ -7,6 +7,7 @@
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{JoinKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
 use crate::sql::catalog::TableDef;
+use crate::sql::column_id::ColumnId;
 use crate::sql::planner::plan::{AggregateCall, DecodeMapping, WindowExpr};
 
 pub(crate) use crate::sql::planner::plan::ScanDictionaryColumn;
@@ -219,6 +220,7 @@ pub(crate) struct LogicalGenerateSeriesOp {
     pub step: i64,
     pub column_name: String,
     pub alias: Option<String>,
+    pub output_column_id: crate::sql::column_id::ColumnId,
 }
 
 #[derive(Clone, Debug)]
@@ -233,10 +235,14 @@ pub(crate) struct LogicalTableFunctionOp {
 #[derive(Clone, Debug)]
 pub(crate) struct LogicalRepeatOp {
     pub repeat_column_ref_list: Vec<Vec<String>>,
+    pub repeat_column_ref_ids: Vec<Vec<ColumnId>>,
     pub grouping_ids: Vec<u64>,
     pub all_rollup_columns: Vec<String>,
+    pub all_rollup_column_ids: Vec<ColumnId>,
     pub grouping_key_aliases: Vec<(String, String)>,
     pub grouping_fn_args: Vec<(String, Vec<String>)>,
+    pub grouping_fn_arg_ids: Vec<Vec<ColumnId>>,
+    pub grouping_fn_ids: Vec<(String, ColumnId)>,
 }
 
 #[derive(Clone, Debug)]
@@ -397,10 +403,14 @@ pub(crate) struct PhysicalCTEConsumeOp {
 #[derive(Clone, Debug)]
 pub(crate) struct PhysicalRepeatOp {
     pub repeat_column_ref_list: Vec<Vec<String>>,
+    pub repeat_column_ref_ids: Vec<Vec<ColumnId>>,
     pub grouping_ids: Vec<u64>,
     pub all_rollup_columns: Vec<String>,
+    pub all_rollup_column_ids: Vec<ColumnId>,
     pub grouping_key_aliases: Vec<(String, String)>,
     pub grouping_fn_args: Vec<(String, Vec<String>)>,
+    pub grouping_fn_arg_ids: Vec<Vec<ColumnId>>,
+    pub grouping_fn_ids: Vec<(String, ColumnId)>,
 }
 
 #[derive(Clone, Debug)]
@@ -432,6 +442,7 @@ pub(crate) struct PhysicalGenerateSeriesOp {
     pub step: i64,
     pub column_name: String,
     pub alias: Option<String>,
+    pub output_column_id: crate::sql::column_id::ColumnId,
 }
 
 #[derive(Clone, Debug)]
@@ -579,6 +590,7 @@ mod aggregate_stage_tests {
             distinct: false,
             result_type: arrow::datatypes::DataType::Int64,
             order_by: vec![],
+            output_column_id: ColumnId::UNSET,
         }
     }
 

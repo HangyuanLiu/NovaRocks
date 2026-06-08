@@ -56,19 +56,20 @@ pub(crate) fn format_column_stats_costs(
     if stats.column_statistics.is_empty() {
         return String::new();
     }
-    let mut names: Vec<&String> = stats.column_statistics.keys().collect();
-    names.sort();
-    let parts: Vec<String> = names
+    let mut ids: Vec<_> = stats.column_statistics.keys().copied().collect();
+    ids.sort_by_key(|id| id.0);
+    let parts: Vec<String> = ids
         .into_iter()
-        .map(|name| {
-            let c = &stats.column_statistics[name];
+        .map(|column_id| {
+            let c = &stats.column_statistics[&column_id];
             let ndv = if c.distinct_values_count.is_finite() {
                 (c.distinct_values_count.round() as i64).to_string()
             } else {
                 "?".to_string()
             };
             format!(
-                "{name}[min={} max={} ndv={ndv} null_frac={}]",
+                "col#{}[min={} max={} ndv={ndv} null_frac={}]",
+                column_id.0,
                 fmt_f64(c.min_value),
                 fmt_f64(c.max_value),
                 fmt_f64(c.nulls_fraction),
@@ -1434,6 +1435,7 @@ mod tests {
 
     #[test]
     fn physical_decode_explain_prints_dict_to_string_mapping() {
+        use crate::sql::column_id::ColumnId;
         use crate::sql::optimizer::operator::PhysicalDecodeOp;
         use crate::sql::planner::plan::DecodeMapping;
 
@@ -1469,6 +1471,8 @@ mod tests {
         let decode = PhysicalPlanNode {
             op: Operator::PhysicalDecode(PhysicalDecodeOp {
                 mappings: vec![DecodeMapping {
+                    source_column_id: ColumnId::new_for_test(1),
+                    output_column_id: ColumnId::new_for_test(2),
                     dict_column: "d".to_string(),
                     string_column: "s".to_string(),
                 }],
@@ -1811,6 +1815,7 @@ mod tests {
 #[cfg(test)]
 mod costs_level_tests {
     use super::*;
+    use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::statistics::{ColumnStatistic, Statistics};
     use std::collections::HashMap;
 
@@ -1827,7 +1832,7 @@ mod costs_level_tests {
         // Normal column: exact format pinned.
         let mut cs = HashMap::new();
         cs.insert(
-            "k1".to_string(),
+            ColumnId::new_for_test(1),
             ColumnStatistic {
                 min_value: 0.0,
                 max_value: 1000.0,
@@ -1843,7 +1848,7 @@ mod costs_level_tests {
             ..Default::default()
         };
         let s = format_column_stats_costs(&stats);
-        assert_eq!(s, "colstats={k1[min=0 max=1000 ndv=1000 null_frac=0]}");
+        assert_eq!(s, "colstats={col#1[min=0 max=1000 ndv=1000 null_frac=0]}");
     }
 
     #[test]
@@ -1861,7 +1866,7 @@ mod costs_level_tests {
     fn format_column_stats_costs_non_finite_ndv_renders_question_mark() {
         let mut cs = HashMap::new();
         cs.insert(
-            "x".to_string(),
+            ColumnId::new_for_test(9),
             ColumnStatistic {
                 min_value: 0.0,
                 max_value: 1.0,

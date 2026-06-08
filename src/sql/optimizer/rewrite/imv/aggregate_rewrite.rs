@@ -619,8 +619,13 @@ fn signed_aggregate(
             branch_scope: None,
         }))
     };
-    let aggregate_output_columns =
-        signed_aggregate_output_columns(&aggregate.group_by, shape, layout, ext, &signed_calls)?;
+    let aggregate_output_columns = signed_aggregate_output_columns(
+        &aggregate.group_by,
+        shape,
+        layout,
+        ext,
+        &mut signed_calls,
+    )?;
     let project_items =
         signed_aggregate_project_items(&aggregate.group_by, shape, layout, ext, &signed_calls)?;
     Ok(LogicalPlan::Project(ProjectNode {
@@ -801,7 +806,7 @@ fn signed_aggregate_output_columns(
     shape: &crate::connector::starrocks::table::aggregate_sql_calls::AggregateSqlCalls,
     layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
     ext: &ImvExtension,
-    signed_calls: &[AggregateCall],
+    signed_calls: &mut [AggregateCall],
 ) -> Result<Vec<crate::sql::analysis::OutputColumn>, String> {
     let mut output_columns = Vec::with_capacity(shape.group_keys.len() + signed_calls.len());
     for (group_key_index, &visible_source_index) in
@@ -829,8 +834,12 @@ fn signed_aggregate_output_columns(
     }
     for (state_index, state_column) in layout.state_columns.iter().enumerate() {
         let data_type = state_shaped_state_data_type(state_column);
+        let column_id = ext.allocate_column_id();
+        if let Some(call) = signed_calls.get_mut(state_index) {
+            call.output_column_id = column_id;
+        }
         output_columns.push(crate::sql::analysis::OutputColumn {
-            column_id: ext.allocate_column_id(),
+            column_id,
             name: state_column.name.clone(),
             data_type,
             nullable: false,
@@ -985,6 +994,7 @@ fn retraction_count_aggregate_call(action_column: ColumnId) -> AggregateCall {
         distinct: false,
         result_type: DataType::Int64,
         order_by: Vec::new(),
+        output_column_id: ColumnId::UNSET,
     }
 }
 
@@ -1000,6 +1010,7 @@ fn signed_aggregate_call(
         distinct: false,
         result_type: DataType::Binary,
         order_by: call.order_by.clone(),
+        output_column_id: ColumnId::UNSET,
     })
 }
 
@@ -1375,6 +1386,7 @@ mod tests {
                 distinct: false,
                 result_type: DataType::Int64,
                 order_by: Vec::new(),
+                output_column_id: ColumnId::UNSET,
             }],
             output_columns: vec![
                 OutputColumn {
@@ -1407,6 +1419,7 @@ mod tests {
                 distinct: false,
                 result_type: DataType::Int64,
                 order_by: Vec::new(),
+                output_column_id: ColumnId::UNSET,
             }],
             output_columns: vec![
                 OutputColumn {
@@ -1440,6 +1453,7 @@ mod tests {
             distinct: false,
             result_type: DataType::Int64,
             order_by: Vec::new(),
+            output_column_id: ColumnId::UNSET,
         });
         plan.output_columns.push(OutputColumn {
             column_id: ColumnId::new_for_test(4),

@@ -191,6 +191,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
                 step: node.step,
                 column_name: node.column_name.clone(),
                 alias: node.alias.clone(),
+                output_column_id: node.output_column_id,
             });
             let expr = MExpr {
                 id: memo.next_expr_id(),
@@ -235,10 +236,14 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
             let child = logical_plan_to_memo(&node.input, memo);
             let op = Operator::LogicalRepeat(LogicalRepeatOp {
                 repeat_column_ref_list: node.repeat_column_ref_list.clone(),
+                repeat_column_ref_ids: node.repeat_column_ref_ids.clone(),
                 grouping_ids: node.grouping_ids.clone(),
                 all_rollup_columns: node.all_rollup_columns.clone(),
+                all_rollup_column_ids: node.all_rollup_column_ids.clone(),
                 grouping_key_aliases: node.grouping_key_aliases.clone(),
                 grouping_fn_args: node.grouping_fn_args.clone(),
+                grouping_fn_arg_ids: node.grouping_fn_arg_ids.clone(),
+                grouping_fn_ids: node.grouping_fn_ids.clone(),
             });
             let expr = MExpr {
                 id: memo.next_expr_id(),

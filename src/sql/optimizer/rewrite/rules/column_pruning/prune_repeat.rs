@@ -62,10 +62,14 @@ mod tests {
                 required_output_columns: None,
             })),
             repeat_column_ref_list: vec![],
+            repeat_column_ref_ids: vec![],
             grouping_ids: vec![],
             all_rollup_columns: vec![],
+            all_rollup_column_ids: vec![],
             grouping_key_aliases: vec![],
             grouping_fn_args: vec![],
+            grouping_fn_arg_ids: vec![],
+            grouping_fn_ids: vec![],
             required_output_columns: None,
         };
 

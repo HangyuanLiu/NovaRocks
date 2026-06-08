@@ -31,8 +31,8 @@ pub(crate) fn should_push(plan: &PushPlan, table_stats: &HashMap<String, TableSt
         .partial_groupby
         .iter()
         .map(|gb| match &gb.kind {
-            ExprKind::ColumnRef { column, .. } => {
-                stats.column_statistics.get(column).and_then(|cs| {
+            ExprKind::ColumnRef { column_id, .. } => {
+                stats.column_statistics.get(column_id).and_then(|cs| {
                     let ndv = cs.distinct_values_count;
                     if !ndv.is_finite() || ndv <= 0.0 {
                         return None;

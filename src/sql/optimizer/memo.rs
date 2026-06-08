@@ -10,7 +10,7 @@ use super::property::{ColumnIdSet, EquivalenceClasses};
 use super::statistics::{ColumnStatistic, Confidence};
 use crate::sql::analysis::OutputColumn;
 use crate::sql::analysis::cte::CteId;
-use crate::sql::column_id::ColumnRefFactory;
+use crate::sql::column_id::{ColumnId, ColumnRefFactory};
 
 // ---------------------------------------------------------------------------
 // Core type aliases
@@ -108,7 +108,7 @@ pub(crate) struct LogicalProperties {
     pub(crate) output_columns: Vec<OutputColumn>,
     pub(crate) row_count: f64,
     pub(crate) row_count_confidence: Confidence,
-    pub(crate) column_statistics: HashMap<String, ColumnStatistic>,
+    pub(crate) column_statistics: HashMap<ColumnId, ColumnStatistic>,
     pub(crate) equivalence_classes: EquivalenceClasses,
     pub(crate) unique_columns: Vec<ColumnIdSet>,
 }

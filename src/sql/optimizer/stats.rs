@@ -11,7 +11,7 @@ use super::estimate::ndv::{
     agg_group_rows, cap_ndv_at_rows, get_expr_ndv, get_join_key_ndv_with_confidence,
 };
 use super::estimate::selectivity::apply_filter;
-pub(crate) use super::estimate::selectivity::{estimate_selectivity, extract_column_name};
+pub(crate) use super::estimate::selectivity::{estimate_selectivity, extract_column_id};
 use super::memo::{MExpr, Memo};
 use super::operator::Operator;
 use crate::sql::analysis::{BinOp, ExprKind, JoinKind, OutputColumn, TypedExpr};
@@ -103,16 +103,14 @@ pub(crate) fn derive_statistics(
 
         Operator::LogicalProject(proj) => {
             let child_stats = child_statistics(memo, &expr.children, 0);
-            let projected: HashMap<String, ColumnStatistic> = proj
+            let projected: HashMap<ColumnId, ColumnStatistic> = proj
                 .items
                 .iter()
                 .filter_map(|item| {
-                    let name = item.output_name.to_lowercase();
-                    child_stats
-                        .column_statistics
-                        .get(&name)
+                    extract_column_id(&item.expr)
+                        .and_then(|column_id| child_stats.column_statistics.get(&column_id))
                         .cloned()
-                        .map(|cs| (name, cs))
+                        .map(|cs| (item.output_column_id, cs))
                 })
                 .collect();
             Statistics {
@@ -284,16 +282,14 @@ pub(crate) fn derive_statistics(
 
         Operator::PhysicalProject(proj) => {
             let child_stats = child_statistics(memo, &expr.children, 0);
-            let projected: HashMap<String, ColumnStatistic> = proj
+            let projected: HashMap<ColumnId, ColumnStatistic> = proj
                 .items
                 .iter()
                 .filter_map(|item| {
-                    let name = item.output_name.to_lowercase();
-                    child_stats
-                        .column_statistics
-                        .get(&name)
+                    extract_column_id(&item.expr)
+                        .and_then(|column_id| child_stats.column_statistics.get(&column_id))
                         .cloned()
-                        .map(|cs| (name, cs))
+                        .map(|cs| (item.output_column_id, cs))
                 })
                 .collect();
             Statistics {
@@ -337,17 +333,11 @@ pub(crate) fn derive_statistics(
         Operator::PhysicalHashJoin(join) => {
             let left_stats = child_statistics(memo, &expr.children, 0);
             let right_stats = child_statistics(memo, &expr.children, 1);
-            let mut eq_key_pairs = Vec::new();
-            let eq_key_ndvs = join
+            let eq_key_ndvs: Vec<(f64, f64, Confidence, Option<(ColumnId, ColumnId)>)> = join
                 .eq_conditions
                 .iter()
                 .map(|eq| {
-                    if let (Some(left), Some(right)) = (
-                        extract_column_name(&eq.left),
-                        extract_column_name(&eq.right),
-                    ) {
-                        eq_key_pairs.push((left.to_lowercase(), right.to_lowercase()));
-                    }
+                    let eq_key_pair = extract_column_id(&eq.left).zip(extract_column_id(&eq.right));
                     let (left_ndv, left_confidence) = best_join_key_ndv(
                         &eq.left,
                         &left_stats.column_statistics,
@@ -362,9 +352,18 @@ pub(crate) fn derive_statistics(
                         left_ndv,
                         right_ndv,
                         left_confidence.combine(right_confidence),
+                        eq_key_pair,
                     )
                 })
                 .collect();
+            let mut eq_key_ndvs_for_cardinality = Vec::new();
+            let mut eq_key_pairs = Vec::new();
+            for (left_ndv, right_ndv, confidence, pair) in eq_key_ndvs {
+                eq_key_ndvs_for_cardinality.push((left_ndv, right_ndv, confidence));
+                if let Some(pair) = pair {
+                    eq_key_pairs.push(pair);
+                }
+            }
 
             let (output_rows, row_count_confidence) = estimate_join_cardinality(&JoinCardInput {
                 left: (left_stats.output_row_count, left_stats.row_count_confidence),
@@ -373,7 +372,7 @@ pub(crate) fn derive_statistics(
                     right_stats.row_count_confidence,
                 ),
                 kind: join.join_type,
-                eq_key_ndvs,
+                eq_key_ndvs: eq_key_ndvs_for_cardinality,
                 non_equi_selectivity: None,
             });
 
@@ -587,8 +586,8 @@ pub(crate) fn derive_logical_plan_statistics(
 
 fn best_join_key_ndv(
     expr: &TypedExpr,
-    primary_stats: &HashMap<String, ColumnStatistic>,
-    secondary_stats: &HashMap<String, ColumnStatistic>,
+    primary_stats: &HashMap<ColumnId, ColumnStatistic>,
+    secondary_stats: &HashMap<ColumnId, ColumnStatistic>,
 ) -> (f64, Confidence) {
     let primary = get_join_key_ndv_with_confidence(expr, primary_stats);
     let secondary = get_join_key_ndv_with_confidence(expr, secondary_stats);
@@ -608,13 +607,13 @@ fn aggregate_group_column_statistics(
     output_columns: &[OutputColumn],
     child_stats: &Statistics,
     output_rows: f64,
-) -> HashMap<String, ColumnStatistic> {
+) -> HashMap<ColumnId, ColumnStatistic> {
     group_by
         .iter()
         .zip(output_columns.iter())
         .map(|(expr, output)| {
-            let mut stat = extract_column_name(expr)
-                .and_then(|name| child_stats.column_statistics.get(&name.to_lowercase()))
+            let mut stat = extract_column_id(expr)
+                .and_then(|column_id| child_stats.column_statistics.get(&column_id))
                 .cloned()
                 .unwrap_or_else(|| {
                     let mut fallback = ColumnStatistic::unknown();
@@ -623,7 +622,7 @@ fn aggregate_group_column_statistics(
                     fallback
                 });
             stat.distinct_values_count = cap_ndv_at_rows(stat.distinct_values_count, output_rows);
-            (output.name.to_lowercase(), stat)
+            (output.column_id, stat)
         })
         .collect()
 }
@@ -768,7 +767,7 @@ fn merge_set_op_column_statistics(
     child_stats: &[Statistics],
     output_rows: f64,
     kind: SetOpKind,
-) -> HashMap<String, ColumnStatistic> {
+) -> HashMap<ColumnId, ColumnStatistic> {
     let child_output_columns: Vec<_> = children
         .iter()
         .enumerate()
@@ -779,16 +778,14 @@ fn merge_set_op_column_statistics(
     for (column_idx, output_column) in output_columns.iter().enumerate() {
         let mut stats_for_column = Vec::new();
         let mut missing_child_stat = false;
-        let output_name = output_column.name.to_lowercase();
         for (child_idx, stats) in child_stats.iter().enumerate() {
-            let child_name = child_output_columns
+            let child_column_id = child_output_columns
                 .get(child_idx)
                 .and_then(|columns| columns.get(column_idx))
-                .map(|column| column.name.to_lowercase());
-            let child_stat = child_name
-                .as_deref()
-                .and_then(|name| stats.column_statistics.get(name))
-                .or_else(|| stats.column_statistics.get(&output_name));
+                .map(|column| column.column_id);
+            let child_stat = child_column_id
+                .and_then(|column_id| stats.column_statistics.get(&column_id))
+                .or_else(|| stats.column_statistics.get(&output_column.column_id));
             if let Some(stat) = child_stat {
                 stats_for_column.push(stat);
             } else {
@@ -828,7 +825,7 @@ fn merge_set_op_column_statistics(
         }
 
         merged.insert(
-            output_name,
+            output_column.column_id,
             ColumnStatistic {
                 min_value,
                 max_value,
@@ -860,7 +857,7 @@ fn bounded_set_op_ndv(ndv: f64, output_rows: f64) -> f64 {
     bounded.max(1.0)
 }
 
-fn cap_column_ndvs(column_statistics: &mut HashMap<String, ColumnStatistic>, output_rows: f64) {
+fn cap_column_ndvs(column_statistics: &mut HashMap<ColumnId, ColumnStatistic>, output_rows: f64) {
     for stat in column_statistics.values_mut() {
         stat.distinct_values_count = cap_ndv_at_rows(stat.distinct_values_count, output_rows);
     }
@@ -880,8 +877,8 @@ fn merge_join_column_statistics(
     output_rows: f64,
     row_count_confidence: Confidence,
     join_type: JoinKind,
-    eq_key_pairs: &[(String, String)],
-) -> HashMap<String, ColumnStatistic> {
+    eq_key_pairs: &[(ColumnId, ColumnId)],
+) -> HashMap<ColumnId, ColumnStatistic> {
     let mut column_statistics = match join_type {
         JoinKind::LeftSemi | JoinKind::LeftAnti | JoinKind::NullAwareLeftAnti => {
             left_stats.column_statistics.clone()
@@ -896,22 +893,22 @@ fn merge_join_column_statistics(
 
     for (left_key, right_key) in eq_key_pairs {
         let Some((left_key, right_key)) =
-            orient_join_key_pair(left_key, right_key, left_stats, right_stats)
+            orient_join_key_pair(*left_key, *right_key, left_stats, right_stats)
         else {
             continue;
         };
-        let left = &left_stats.column_statistics[left_key];
-        let right = &right_stats.column_statistics[right_key];
+        let left = &left_stats.column_statistics[&left_key];
+        let right = &right_stats.column_statistics[&right_key];
         let Some((contained_ndv, confidence)) =
             contained_join_key_ndv(left, right, row_count_confidence)
         else {
             continue;
         };
-        if let Some(stat) = column_statistics.get_mut(left_key) {
+        if let Some(stat) = column_statistics.get_mut(&left_key) {
             stat.distinct_values_count = contained_ndv;
             stat.confidence = confidence;
         }
-        if let Some(stat) = column_statistics.get_mut(right_key) {
+        if let Some(stat) = column_statistics.get_mut(&right_key) {
             stat.distinct_values_count = contained_ndv;
             stat.confidence = confidence;
         }
@@ -928,16 +925,16 @@ fn merge_join_column_statistics(
     column_statistics
 }
 
-fn orient_join_key_pair<'a>(
-    first: &'a str,
-    second: &'a str,
+fn orient_join_key_pair(
+    first: ColumnId,
+    second: ColumnId,
     left_stats: &Statistics,
     right_stats: &Statistics,
-) -> Option<(&'a str, &'a str)> {
-    let forward = left_stats.column_statistics.contains_key(first)
-        && right_stats.column_statistics.contains_key(second);
-    let reverse = left_stats.column_statistics.contains_key(second)
-        && right_stats.column_statistics.contains_key(first);
+) -> Option<(ColumnId, ColumnId)> {
+    let forward = left_stats.column_statistics.contains_key(&first)
+        && right_stats.column_statistics.contains_key(&second);
+    let reverse = left_stats.column_statistics.contains_key(&second)
+        && right_stats.column_statistics.contains_key(&first);
     match (forward, reverse) {
         (true, false) => Some((first, second)),
         (false, true) => Some((second, first)),
@@ -973,7 +970,7 @@ fn real_column_ndv(stat: &ColumnStatistic) -> Option<f64> {
     }
 }
 
-fn collect_equi_join_column_pairs(condition: Option<&TypedExpr>) -> Vec<(String, String)> {
+fn collect_equi_join_column_pairs(condition: Option<&TypedExpr>) -> Vec<(ColumnId, ColumnId)> {
     let mut pairs = Vec::new();
     if let Some(condition) = condition {
         collect_equi_join_column_pairs_inner(condition, &mut pairs);
@@ -981,17 +978,17 @@ fn collect_equi_join_column_pairs(condition: Option<&TypedExpr>) -> Vec<(String,
     pairs
 }
 
-fn collect_equi_join_column_pairs_inner(expr: &TypedExpr, pairs: &mut Vec<(String, String)>) {
+fn collect_equi_join_column_pairs_inner(expr: &TypedExpr, pairs: &mut Vec<(ColumnId, ColumnId)>) {
     match &expr.kind {
         ExprKind::BinaryOp {
             left,
             op: BinOp::Eq | BinOp::EqForNull,
             right,
         } => {
-            if let (Some(left_name), Some(right_name)) =
-                (extract_column_name(left), extract_column_name(right))
+            if let (Some(left_id), Some(right_id)) =
+                (extract_column_id(left), extract_column_id(right))
             {
-                pairs.push((left_name.to_lowercase(), right_name.to_lowercase()));
+                pairs.push((left_id, right_id));
             }
         }
         ExprKind::BinaryOp {
@@ -1012,10 +1009,9 @@ fn derive_window_statistics(
     window_exprs: &[crate::sql::planner::plan::WindowExpr],
 ) -> Statistics {
     for window_expr in window_exprs {
-        child_stats.column_statistics.insert(
-            window_expr.output_name.to_lowercase(),
-            ColumnStatistic::unknown(),
-        );
+        child_stats
+            .column_statistics
+            .insert(window_expr.output_column_id, ColumnStatistic::unknown());
     }
     child_stats
 }
@@ -1058,13 +1054,14 @@ fn derive_scan_statistics(
 
         let mut output_rows = row_count;
         let mut row_count_confidence = Confidence::Exact;
+        let table_column_statistics = map_table_column_stats_to_ids(columns, ts);
         for pred in predicates {
-            let selectivity = estimate_selectivity(pred, &ts.column_stats);
+            let selectivity = estimate_selectivity(pred, &table_column_statistics);
             (output_rows, row_count_confidence) =
                 apply_filter(output_rows, row_count_confidence, selectivity);
         }
 
-        let mut column_statistics: HashMap<String, ColumnStatistic> = columns
+        let mut column_statistics: HashMap<ColumnId, ColumnStatistic> = columns
             .iter()
             .map(|c| {
                 let col_name = c.name.to_lowercase();
@@ -1073,7 +1070,7 @@ fn derive_scan_statistics(
                     .get(&col_name)
                     .cloned()
                     .unwrap_or_else(ColumnStatistic::unknown);
-                (col_name, cs)
+                (c.column_id, cs)
             })
             .collect();
         cap_column_ndvs(&mut column_statistics, output_rows);
@@ -1085,9 +1082,9 @@ fn derive_scan_statistics(
         }
     } else {
         // No table stats available: use heuristic defaults based on table name.
-        let mut column_statistics: HashMap<String, ColumnStatistic> = columns
+        let mut column_statistics: HashMap<ColumnId, ColumnStatistic> = columns
             .iter()
-            .map(|c| (c.name.to_lowercase(), ColumnStatistic::unknown()))
+            .map(|c| (c.column_id, ColumnStatistic::unknown()))
             .collect();
         let mut output_rows = default_rows;
         let mut row_count_confidence = Confidence::Fallback;
@@ -1103,6 +1100,23 @@ fn derive_scan_statistics(
             column_statistics,
         }
     }
+}
+
+fn map_table_column_stats_to_ids(
+    columns: &[OutputColumn],
+    table_stats: &TableStatistics,
+) -> HashMap<ColumnId, ColumnStatistic> {
+    columns
+        .iter()
+        .map(|column| {
+            let stat = table_stats
+                .column_stats
+                .get(&column.name.to_lowercase())
+                .cloned()
+                .unwrap_or_else(ColumnStatistic::unknown);
+            (column.column_id, stat)
+        })
+        .collect()
 }
 
 /// Heuristic row count estimation for tables without real statistics.
@@ -1316,9 +1330,7 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
         Operator::LogicalCTEConsume(c) => c.output_columns.clone(),
         Operator::LogicalGenerateSeries(g) => {
             vec![crate::sql::analysis::OutputColumn {
-                // GenerateSeries columns don't originate from the analyzer;
-                // use UNSET as there is no factory available in this read-only context.
-                column_id: ColumnId::UNSET,
+                column_id: g.output_column_id,
                 name: g.column_name.clone(),
                 data_type: arrow::datatypes::DataType::Int64,
                 nullable: false,
@@ -1375,21 +1387,12 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
         Operator::PhysicalProject(p) => p
             .items
             .iter()
-            .map(|item| {
-                let cid = if let crate::sql::analysis::ExprKind::ColumnRef { column_id, .. } =
-                    &item.expr.kind
-                {
-                    *column_id
-                } else {
-                    ColumnId::UNSET
-                };
-                crate::sql::analysis::OutputColumn {
-                    column_id: cid,
-                    name: item.output_name.clone(),
-                    data_type: item.expr.data_type.clone(),
-                    nullable: item.expr.nullable,
-                    is_internal: false,
-                }
+            .map(|item| crate::sql::analysis::OutputColumn {
+                column_id: item.output_column_id,
+                name: item.output_name.clone(),
+                data_type: item.expr.data_type.clone(),
+                nullable: item.expr.nullable,
+                is_internal: false,
             })
             .collect(),
         Operator::PhysicalHashAggregate(a) => a.output_columns.clone(),
@@ -1403,7 +1406,7 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
         Operator::PhysicalCTEConsume(c) => c.output_columns.clone(),
         Operator::PhysicalGenerateSeries(g) => {
             vec![crate::sql::analysis::OutputColumn {
-                column_id: ColumnId::UNSET,
+                column_id: g.output_column_id,
                 name: g.column_name.clone(),
                 data_type: arrow::datatypes::DataType::Int64,
                 nullable: false,
@@ -1540,11 +1543,42 @@ mod tests {
         )
     }
 
+    fn test_col_id(name: &str) -> ColumnId {
+        let id = match name {
+            "id" | "a" | "base" | "k1" | "filter_col" | "l_key" | "l_k1" | "l_filter"
+            | "l_orderkey" => 1,
+            "status" | "payload" | "rn" | "k2" | "r_key" | "r_k1" | "r_filter" | "o_orderkey" => 2,
+            "missing" | "k3" | "l_payload" | "l_k2" | "count(v)" => 3,
+            "r_payload" | "r_k2" | "count(*)" => 4,
+            "k" => 10,
+            other => {
+                let mut hash = 2_166_136_261u32;
+                for byte in other.bytes() {
+                    hash ^= byte as u32;
+                    hash = hash.wrapping_mul(16_777_619);
+                }
+                1_000 + (hash % 100_000)
+            }
+        };
+        ColumnId::new_for_test(id)
+    }
+
+    fn stat_by_name<'a>(
+        stats: &'a HashMap<ColumnId, ColumnStatistic>,
+        name: &str,
+    ) -> &'a ColumnStatistic {
+        stats.get(&test_col_id(name)).unwrap()
+    }
+
+    fn has_stat(stats: &HashMap<ColumnId, ColumnStatistic>, name: &str) -> bool {
+        stats.contains_key(&test_col_id(name))
+    }
+
     fn scan_plan(name: &str, cols: &[&str]) -> LogicalPlan {
         let columns: Vec<OutputColumn> = cols
             .iter()
             .map(|c| OutputColumn {
-                column_id: ColumnId::UNSET,
+                column_id: test_col_id(c),
                 name: c.to_string(),
                 data_type: DataType::Int32,
                 nullable: false,
@@ -1652,13 +1686,16 @@ mod tests {
         let props = memo.groups[0].logical_props.as_ref().unwrap();
         assert!((props.row_count - 100_000.0).abs() < 1.0);
         assert_eq!(props.row_count_confidence, Confidence::Exact);
-        assert_eq!(props.column_statistics["id"].confidence, Confidence::Exact);
         assert_eq!(
-            props.column_statistics["status"].confidence,
+            stat_by_name(&props.column_statistics, "id").confidence,
+            Confidence::Exact
+        );
+        assert_eq!(
+            stat_by_name(&props.column_statistics, "status").confidence,
             Confidence::Estimated
         );
         assert_eq!(
-            props.column_statistics["missing"].confidence,
+            stat_by_name(&props.column_statistics, "missing").confidence,
             Confidence::Fallback
         );
     }
@@ -1695,7 +1732,10 @@ mod tests {
         let props = memo.groups[0].logical_props.as_ref().unwrap();
         assert_eq!(props.row_count, 1.0);
         assert_eq!(props.row_count_confidence, Confidence::Fallback);
-        assert_eq!(props.column_statistics["id"].distinct_values_count, 1.0);
+        assert_eq!(
+            stat_by_name(&props.column_statistics, "id").distinct_values_count,
+            1.0
+        );
     }
 
     #[test]
@@ -1730,7 +1770,10 @@ mod tests {
 
         assert!((stats.output_row_count - 1_000.0).abs() < 1.0);
         assert_eq!(stats.row_count_confidence, Confidence::Estimated);
-        assert_eq!(stats.column_statistics["id"].confidence, Confidence::Exact);
+        assert_eq!(
+            stat_by_name(&stats.column_statistics, "id").confidence,
+            Confidence::Exact
+        );
     }
 
     #[test]
@@ -1798,6 +1841,7 @@ mod tests {
                 distinct: false,
                 result_type: arrow::datatypes::DataType::Int64,
                 order_by: vec![],
+                output_column_id: ColumnId::UNSET,
             }
         }
 
@@ -1817,7 +1861,7 @@ mod tests {
         let child_group = values_group(&mut memo);
         let mut child_props = LogicalProperties::new(vec![output_column(1, "k")], 10_000.0);
         child_props.column_statistics.insert(
-            "k".to_string(),
+            ColumnId::new_for_test(1),
             ColumnStatistic {
                 min_value: 0.0,
                 max_value: 10_000.0,
@@ -1940,7 +1984,7 @@ mod tests {
         props.row_count_confidence = row_count_confidence;
         props
             .column_statistics
-            .insert(output_name.to_lowercase(), stat);
+            .insert(ColumnId::new_for_test(1), stat);
         memo.groups[group].logical_props = Some(props);
         group
     }
@@ -2001,7 +2045,7 @@ mod tests {
 
         assert_eq!(stats.output_row_count, MAX_ROW_COUNT);
         assert_eq!(stats.row_count_confidence, Confidence::Fallback);
-        let col = stats.column_statistics.get("k").unwrap();
+        let col = stat_by_name(&stats.column_statistics, "k");
         assert_eq!(col.min_value, -10.0);
         assert_eq!(col.max_value, 20.0);
         assert_eq!(col.nulls_fraction, 0.20);
@@ -2042,7 +2086,7 @@ mod tests {
 
         assert_eq!(stats.output_row_count, 300.0);
         assert_eq!(stats.row_count_confidence, Confidence::Estimated);
-        let col = stats.column_statistics.get("k").unwrap();
+        let col = stat_by_name(&stats.column_statistics, "k");
         assert_eq!(col.min_value, -5.0);
         assert_eq!(col.max_value, 50.0);
         assert_eq!(col.nulls_fraction, 0.15);
@@ -2077,7 +2121,7 @@ mod tests {
         let stats = derive_statistics(&union, &memo, &HashMap::new());
 
         assert_eq!(stats.output_row_count, 300.0);
-        let col = stats.column_statistics.get("k").unwrap();
+        let col = stat_by_name(&stats.column_statistics, "k");
         assert_eq!(col.min_value, 5.0);
         assert_eq!(col.max_value, 30.0);
         assert_eq!(col.distinct_values_count, 40.0);
@@ -2115,7 +2159,7 @@ mod tests {
 
         assert_eq!(stats.output_row_count, 100.0);
         assert_eq!(stats.row_count_confidence, Confidence::Estimated);
-        let col = stats.column_statistics.get("k").unwrap();
+        let col = stat_by_name(&stats.column_statistics, "k");
         assert_eq!(col.min_value, -20.0);
         assert_eq!(col.max_value, 100.0);
         assert_eq!(col.nulls_fraction, 0.25);
@@ -2155,7 +2199,7 @@ mod tests {
 
         assert_eq!(stats.output_row_count, 500.0);
         assert_eq!(stats.row_count_confidence, Confidence::Estimated);
-        let col = stats.column_statistics.get("k").unwrap();
+        let col = stat_by_name(&stats.column_statistics, "k");
         assert_eq!(col.min_value, -10.0);
         assert_eq!(col.max_value, 100.0);
         assert_eq!(col.nulls_fraction, 0.20);
@@ -2204,7 +2248,7 @@ mod tests {
         for name in ["k1", "k2", "k3"] {
             props
                 .column_statistics
-                .insert(name.to_string(), aggregate_child_stat(100.0));
+                .insert(test_col_id(name), aggregate_child_stat(100.0));
         }
         memo.groups[group].logical_props = Some(props);
         group
@@ -2342,9 +2386,18 @@ mod tests {
             derive_statistics(&physical, &memo, &HashMap::new()),
         ] {
             assert_row_count_close(stats.output_row_count, expected);
-            assert_eq!(stats.column_statistics["k1"].distinct_values_count, 100.0);
-            assert_eq!(stats.column_statistics["k2"].distinct_values_count, 100.0);
-            assert_eq!(stats.column_statistics["k3"].distinct_values_count, 100.0);
+            assert_eq!(
+                stat_by_name(&stats.column_statistics, "k1").distinct_values_count,
+                100.0
+            );
+            assert_eq!(
+                stat_by_name(&stats.column_statistics, "k2").distinct_values_count,
+                100.0
+            );
+            assert_eq!(
+                stat_by_name(&stats.column_statistics, "k3").distinct_values_count,
+                100.0
+            );
         }
     }
 
@@ -2391,7 +2444,7 @@ mod tests {
     fn col_ref(name: &str) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
-                column_id: ColumnId::UNSET,
+                column_id: test_col_id(name),
                 qualifier: None,
                 column: name.to_string(),
             },
@@ -2467,10 +2520,10 @@ mod tests {
         props.row_count_confidence = Confidence::Exact;
         props
             .column_statistics
-            .insert("filter_col".to_string(), filter_ndv_child_stat(10.0));
+            .insert(test_col_id("filter_col"), filter_ndv_child_stat(10.0));
         props
             .column_statistics
-            .insert("payload".to_string(), filter_ndv_child_stat(1_000.0));
+            .insert(test_col_id("payload"), filter_ndv_child_stat(1_000.0));
         memo.groups[group].logical_props = Some(props);
         group
     }
@@ -2482,7 +2535,7 @@ mod tests {
             stats.output_row_count
         );
         assert_eq!(stats.row_count_confidence, Confidence::Estimated);
-        let payload = stats.column_statistics.get("payload").unwrap();
+        let payload = stat_by_name(&stats.column_statistics, "payload");
         assert_eq!(payload.distinct_values_count, 100.0);
         assert_eq!(payload.min_value, 7.0);
         assert_eq!(payload.max_value, 77.0);
@@ -2602,7 +2655,7 @@ mod tests {
             for &(name, ndv) in stats {
                 props
                     .column_statistics
-                    .insert(name.to_string(), column_stat(ndv));
+                    .insert(test_col_id(name), column_stat(ndv));
             }
             memo.groups[group].logical_props = Some(props);
             group
@@ -2641,8 +2694,8 @@ mod tests {
             stats.output_row_count
         );
         assert_eq!(stats.row_count_confidence, Confidence::Estimated);
-        assert!(stats.column_statistics.contains_key("l_k1"));
-        assert!(stats.column_statistics.contains_key("r_k1"));
+        assert!(has_stat(&stats.column_statistics, "l_k1"));
+        assert!(has_stat(&stats.column_statistics, "r_k1"));
     }
 
     #[test]
@@ -2678,7 +2731,7 @@ mod tests {
             for &(name, ndv) in stats {
                 props
                     .column_statistics
-                    .insert(name.to_string(), column_stat(ndv));
+                    .insert(test_col_id(name), column_stat(ndv));
             }
             memo.groups[group].logical_props = Some(props);
             group
@@ -2709,14 +2762,20 @@ mod tests {
         let stats = derive_statistics(&join, &memo, &HashMap::new());
 
         assert_eq!(stats.output_row_count, 40.0);
-        assert_eq!(stats.column_statistics["l_key"].distinct_values_count, 20.0);
-        assert_eq!(stats.column_statistics["r_key"].distinct_values_count, 20.0);
         assert_eq!(
-            stats.column_statistics["l_payload"].distinct_values_count,
+            stat_by_name(&stats.column_statistics, "l_key").distinct_values_count,
+            20.0
+        );
+        assert_eq!(
+            stat_by_name(&stats.column_statistics, "r_key").distinct_values_count,
+            20.0
+        );
+        assert_eq!(
+            stat_by_name(&stats.column_statistics, "l_payload").distinct_values_count,
             40.0
         );
         assert_eq!(
-            stats.column_statistics["r_payload"].distinct_values_count,
+            stat_by_name(&stats.column_statistics, "r_payload").distinct_values_count,
             40.0
         );
     }
@@ -2752,7 +2811,7 @@ mod tests {
             for &(name, ndv) in stats {
                 props
                     .column_statistics
-                    .insert(name.to_string(), column_stat(ndv));
+                    .insert(test_col_id(name), column_stat(ndv));
             }
             memo.groups[group].logical_props = Some(props);
             group
@@ -2778,8 +2837,8 @@ mod tests {
             stats.output_row_count
         );
         assert_eq!(stats.row_count_confidence, Confidence::Estimated);
-        assert!(stats.column_statistics.contains_key("l_key"));
-        assert!(stats.column_statistics.contains_key("r_key"));
+        assert!(has_stat(&stats.column_statistics, "l_key"));
+        assert!(has_stat(&stats.column_statistics, "r_key"));
     }
 
     #[test]
@@ -2812,7 +2871,7 @@ mod tests {
             for &(name, ndv) in stats {
                 props
                     .column_statistics
-                    .insert(name.to_string(), column_stat(ndv));
+                    .insert(test_col_id(name), column_stat(ndv));
             }
             memo.groups[group].logical_props = Some(props);
             group
@@ -2841,14 +2900,20 @@ mod tests {
         let stats = derive_statistics(&join, &memo, &HashMap::new());
 
         assert_eq!(stats.output_row_count, 400_000.0);
-        assert_eq!(stats.column_statistics["l_key"].distinct_values_count, 20.0);
-        assert_eq!(stats.column_statistics["r_key"].distinct_values_count, 20.0);
         assert_eq!(
-            stats.column_statistics["l_payload"].distinct_values_count,
+            stat_by_name(&stats.column_statistics, "l_key").distinct_values_count,
+            20.0
+        );
+        assert_eq!(
+            stat_by_name(&stats.column_statistics, "r_key").distinct_values_count,
+            20.0
+        );
+        assert_eq!(
+            stat_by_name(&stats.column_statistics, "l_payload").distinct_values_count,
             400_000.0
         );
         assert_eq!(
-            stats.column_statistics["r_payload"].distinct_values_count,
+            stat_by_name(&stats.column_statistics, "r_payload").distinct_values_count,
             400_000.0
         );
     }
@@ -2883,7 +2948,7 @@ mod tests {
             for &(name, ndv) in stats {
                 props
                     .column_statistics
-                    .insert(name.to_string(), column_stat(ndv));
+                    .insert(test_col_id(name), column_stat(ndv));
             }
             memo.groups[group].logical_props = Some(props);
             group
@@ -2944,7 +3009,7 @@ mod tests {
             for &(name, ndv) in stats {
                 props
                     .column_statistics
-                    .insert(name.to_string(), column_stat(ndv));
+                    .insert(test_col_id(name), column_stat(ndv));
             }
             memo.groups[group].logical_props = Some(props);
             group
@@ -2964,8 +3029,14 @@ mod tests {
 
         let stats = derive_statistics(&join, &memo, &HashMap::new());
 
-        assert_eq!(stats.column_statistics["l_key"].distinct_values_count, 20.0);
-        assert_eq!(stats.column_statistics["r_key"].distinct_values_count, 20.0);
+        assert_eq!(
+            stat_by_name(&stats.column_statistics, "l_key").distinct_values_count,
+            20.0
+        );
+        assert_eq!(
+            stat_by_name(&stats.column_statistics, "r_key").distinct_values_count,
+            20.0
+        );
     }
 
     #[test]
@@ -2998,7 +3069,7 @@ mod tests {
             for &(name, ndv) in stats {
                 props
                     .column_statistics
-                    .insert(name.to_string(), column_stat(ndv));
+                    .insert(test_col_id(name), column_stat(ndv));
             }
             memo.groups[group].logical_props = Some(props);
             group
@@ -3023,10 +3094,22 @@ mod tests {
         let stats = derive_statistics(&join, &memo, &HashMap::new());
 
         assert_eq!(stats.output_row_count, 8_000.0);
-        assert_eq!(stats.column_statistics["l_k1"].distinct_values_count, 20.0);
-        assert_eq!(stats.column_statistics["r_k1"].distinct_values_count, 20.0);
-        assert_eq!(stats.column_statistics["l_k2"].distinct_values_count, 50.0);
-        assert_eq!(stats.column_statistics["r_k2"].distinct_values_count, 50.0);
+        assert_eq!(
+            stat_by_name(&stats.column_statistics, "l_k1").distinct_values_count,
+            20.0
+        );
+        assert_eq!(
+            stat_by_name(&stats.column_statistics, "r_k1").distinct_values_count,
+            20.0
+        );
+        assert_eq!(
+            stat_by_name(&stats.column_statistics, "l_k2").distinct_values_count,
+            50.0
+        );
+        assert_eq!(
+            stat_by_name(&stats.column_statistics, "r_k2").distinct_values_count,
+            50.0
+        );
     }
 
     #[test]
@@ -3045,7 +3128,7 @@ mod tests {
             });
             let mut props = LogicalProperties::new(vec![], rows);
             props.row_count_confidence = Confidence::Exact;
-            props.column_statistics.insert(name.to_string(), stat);
+            props.column_statistics.insert(test_col_id(name), stat);
             memo.groups[group].logical_props = Some(props);
             group
         }
@@ -3074,25 +3157,25 @@ mod tests {
         let stats = derive_statistics(&join, &memo, &HashMap::new());
 
         assert_eq!(
-            stats.column_statistics["l_key"].distinct_values_count,
+            stat_by_name(&stats.column_statistics, "l_key").distinct_values_count,
             100.0
         );
         assert_eq!(
-            stats.column_statistics["r_key"].distinct_values_count,
+            stat_by_name(&stats.column_statistics, "r_key").distinct_values_count,
             100.0
         );
         assert_eq!(
-            stats.column_statistics["l_key"].confidence,
+            stat_by_name(&stats.column_statistics, "l_key").confidence,
             Confidence::Fallback
         );
         assert_eq!(
-            stats.column_statistics["r_key"].confidence,
+            stat_by_name(&stats.column_statistics, "r_key").confidence,
             Confidence::Fallback
         );
     }
 
     #[test]
-    fn logical_join_same_name_keys_skip_ambiguous_containment() {
+    fn p4_self_join_same_name_columns_keep_distinct_statistics() {
         use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
         use crate::sql::optimizer::operator::{LogicalJoinOp, LogicalValuesOp, Operator};
 
@@ -3107,7 +3190,19 @@ mod tests {
             }
         }
 
-        fn values_group(memo: &mut Memo, rows: f64, ndv: f64) -> usize {
+        fn col_ref_with_id(column_id: ColumnId) -> TypedExpr {
+            TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id,
+                    qualifier: None,
+                    column: "id".to_string(),
+                },
+                data_type: DataType::Int32,
+                nullable: false,
+            }
+        }
+
+        fn values_group(memo: &mut Memo, rows: f64, column_id: ColumnId, ndv: f64) -> usize {
             let group = memo.new_group(MExpr {
                 id: memo.next_expr_id(),
                 op: Operator::LogicalValues(LogicalValuesOp {
@@ -3118,21 +3213,21 @@ mod tests {
             });
             let mut props = LogicalProperties::new(vec![], rows);
             props.row_count_confidence = Confidence::Exact;
-            props
-                .column_statistics
-                .insert("id".to_string(), column_stat(ndv));
+            props.column_statistics.insert(column_id, column_stat(ndv));
             memo.groups[group].logical_props = Some(props);
             group
         }
 
+        let left_id = ColumnId::new_for_test(101);
+        let right_id = ColumnId::new_for_test(201);
         let mut memo = Memo::new();
-        let left = values_group(&mut memo, 10_000.0, 100.0);
-        let right = values_group(&mut memo, 4_000.0, 20.0);
+        let left = values_group(&mut memo, 10_000.0, left_id, 100.0);
+        let right = values_group(&mut memo, 4_000.0, right_id, 20.0);
         let join = MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
-                condition: Some(eq_expr(col_ref("id"), col_ref("id"))),
+                condition: Some(eq_expr(col_ref_with_id(left_id), col_ref_with_id(right_id))),
             }),
             children: vec![left, right],
         };
@@ -3140,7 +3235,14 @@ mod tests {
         let stats = derive_statistics(&join, &memo, &HashMap::new());
 
         assert_eq!(stats.output_row_count, 400_000.0);
-        assert_eq!(stats.column_statistics["id"].distinct_values_count, 20.0);
+        assert_eq!(
+            stats.column_statistics[&left_id].distinct_values_count,
+            20.0
+        );
+        assert_eq!(
+            stats.column_statistics[&right_id].distinct_values_count,
+            20.0
+        );
     }
 
     #[test]
@@ -3174,7 +3276,7 @@ mod tests {
             for &(name, ndv) in stats {
                 props
                     .column_statistics
-                    .insert(name.to_string(), column_stat(ndv));
+                    .insert(test_col_id(name), column_stat(ndv));
             }
             memo.groups[group].logical_props = Some(props);
             group
@@ -3200,8 +3302,8 @@ mod tests {
             stats.output_row_count
         );
         assert_eq!(stats.row_count_confidence, Confidence::Estimated);
-        assert!(stats.column_statistics.contains_key("l_filter"));
-        assert!(!stats.column_statistics.contains_key("r_payload"));
+        assert!(has_stat(&stats.column_statistics, "l_filter"));
+        assert!(!has_stat(&stats.column_statistics, "r_payload"));
     }
 
     #[test]
@@ -3235,7 +3337,7 @@ mod tests {
             for &(name, ndv) in stats {
                 props
                     .column_statistics
-                    .insert(name.to_string(), column_stat(ndv));
+                    .insert(test_col_id(name), column_stat(ndv));
             }
             memo.groups[group].logical_props = Some(props);
             group
@@ -3260,8 +3362,8 @@ mod tests {
             "expected right anti output, got {}",
             stats.output_row_count
         );
-        assert!(!stats.column_statistics.contains_key("l_payload"));
-        assert!(stats.column_statistics.contains_key("r_filter"));
+        assert!(!has_stat(&stats.column_statistics, "l_payload"));
+        assert!(has_stat(&stats.column_statistics, "r_filter"));
     }
 
     #[test]
@@ -3281,6 +3383,7 @@ mod tests {
                 window_frame: None,
                 result_type: DataType::Int64,
                 output_name: output_name.to_string(),
+                output_column_id: test_col_id(output_name),
                 ignore_nulls: false,
             }
         }
@@ -3297,7 +3400,7 @@ mod tests {
             let mut props = LogicalProperties::new(vec![stats_output_column(1, "base")], 25.0);
             props.row_count_confidence = Confidence::Exact;
             props.column_statistics.insert(
-                "base".to_string(),
+                test_col_id("base"),
                 ColumnStatistic {
                     min_value: 1.0,
                     max_value: 10.0,
@@ -3314,8 +3417,11 @@ mod tests {
         fn assert_window_stats(stats: Statistics) {
             assert_eq!(stats.output_row_count, 25.0);
             assert_eq!(stats.row_count_confidence, Confidence::Exact);
-            assert_eq!(stats.column_statistics["base"].distinct_values_count, 10.0);
-            let row_number = stats.column_statistics.get("rn").unwrap();
+            assert_eq!(
+                stat_by_name(&stats.column_statistics, "base").distinct_values_count,
+                10.0
+            );
+            let row_number = stat_by_name(&stats.column_statistics, "rn");
             assert_eq!(row_number.confidence, Confidence::Fallback);
             assert_eq!(row_number.distinct_values_count, 1.0);
         }
@@ -3589,6 +3695,8 @@ mod tests {
         let plan = LogicalPlan::Decode(DecodeNode {
             input: Box::new(scan),
             mappings: vec![DecodeMapping {
+                source_column_id: ColumnId::new_for_test(1),
+                output_column_id: ColumnId::new_for_test(2),
                 dict_column: "a".to_string(),
                 string_column: "a_str".to_string(),
             }],
@@ -3642,7 +3750,7 @@ mod tests {
     #[test]
     fn between_uses_range_selectivity() {
         let mut cs = HashMap::new();
-        cs.insert("a".to_string(), col_stat(0.0, 100.0, 100.0));
+        cs.insert(test_col_id("a"), col_stat(0.0, 100.0, 100.0));
         // a BETWEEN 0 AND 50 over [0,100]: ge = clamp((100-0+1)/100) = 0.99,
         // le = (50-0+1)/100 = 0.51, product ≈ 0.5049.
         let pred = between_expr(col_ref("a"), int_lit(0), int_lit(50));
@@ -3653,7 +3761,7 @@ mod tests {
     #[test]
     fn not_between_is_complement_of_between() {
         let mut cs = HashMap::new();
-        cs.insert("a".to_string(), col_stat(0.0, 100.0, 100.0));
+        cs.insert(test_col_id("a"), col_stat(0.0, 100.0, 100.0));
         // NOT (a BETWEEN 0 AND 10) over [0,100]:
         //   ge(a >= 0) = clamp((100-0+1)/100) = 0.99
         //   le(a <= 10) = (10-0+1)/100 = 0.11

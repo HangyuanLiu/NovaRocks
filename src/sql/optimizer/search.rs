@@ -1047,6 +1047,7 @@ mod cascaded_derivation_tests {
                 ignore_nulls: false,
                 distinct: false,
                 output_name: "win".into(),
+                output_column_id: crate::sql::column_id::ColumnId::UNSET,
                 result_type: DataType::Int64,
             }],
             output_columns: vec![],

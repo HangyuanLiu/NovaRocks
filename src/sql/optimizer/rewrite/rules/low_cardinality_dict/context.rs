@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::engine::dictionary::model::DictionarySnapshot;
+use crate::sql::column_id::ColumnId;
 
 /// Identifies a base-table column that is participating in dictionary
 /// rewrite. `(database, table, column)` are all lowercased to match the
@@ -46,6 +47,7 @@ impl ScanColumnKey {
 #[derive(Clone, Debug)]
 pub(crate) struct DictBinding {
     pub dict_column: String,
+    pub source_column_id: ColumnId,
     pub snapshot: Arc<DictionarySnapshot>,
 }
 
@@ -178,6 +180,7 @@ mod tests {
         use arrow::datatypes::DataType;
         DictBinding {
             dict_column: format!("__nr_dict_{name}"),
+            source_column_id: ColumnId::new_for_test(10),
             snapshot: Arc::new(DictionarySnapshot {
                 dictionary_id: 1,
                 owner: DictionaryOwner::StarRocksTable {

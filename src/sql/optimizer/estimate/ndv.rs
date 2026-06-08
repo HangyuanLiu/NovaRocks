@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 
 use crate::sql::analysis::TypedExpr;
+use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::statistics::{
     ColumnStatistic, Confidence, UNKNOWN_GROUP_BY_CORRELATION,
 };
 
 use super::arith::sat_mul;
-use super::selectivity::extract_column_name;
+use super::selectivity::extract_column_id;
 
 const DEFAULT_EXPR_NDV: f64 = 10.0;
 const DEFAULT_JOIN_KEY_NDV: f64 = 40.0;
@@ -14,7 +15,7 @@ const DEFAULT_JOIN_KEY_NDV: f64 = 40.0;
 /// Get the NDV for an expression from column statistics.
 pub(crate) fn get_expr_ndv(
     expr: &TypedExpr,
-    column_stats: &HashMap<String, ColumnStatistic>,
+    column_stats: &HashMap<ColumnId, ColumnStatistic>,
 ) -> f64 {
     real_expr_ndv(expr, column_stats)
         .map(|(ndv, _)| ndv)
@@ -23,14 +24,14 @@ pub(crate) fn get_expr_ndv(
 
 pub(crate) fn get_join_key_ndv_with_confidence(
     expr: &TypedExpr,
-    column_stats: &HashMap<String, ColumnStatistic>,
+    column_stats: &HashMap<ColumnId, ColumnStatistic>,
 ) -> (f64, Confidence) {
     real_expr_ndv(expr, column_stats).unwrap_or((DEFAULT_JOIN_KEY_NDV, Confidence::Fallback))
 }
 
 fn real_expr_ndv(
     expr: &TypedExpr,
-    column_stats: &HashMap<String, ColumnStatistic>,
+    column_stats: &HashMap<ColumnId, ColumnStatistic>,
 ) -> Option<(f64, Confidence)> {
     // A column is only useful for cardinality if it carries a real NDV (> 1).
     // ColumnStatistic::unknown() (propagated for no-stats / managed-lake tables)
@@ -38,8 +39,8 @@ fn real_expr_ndv(
     // join-key estimation divide left*right by ~1 and explode joins to near
     // cross-products. Mirror the `> 1.0` guard estimate_eq_selectivity uses and
     // fall back to the default NDV for unknown/degenerate columns.
-    if let Some(name) = extract_column_name(expr)
-        && let Some(cs) = column_stats.get(&name.to_lowercase())
+    if let Some(column_id) = extract_column_id(expr)
+        && let Some(cs) = column_stats.get(&column_id)
         && cs.distinct_values_count > 1.0
     {
         return Some((cs.distinct_values_count, cs.confidence));
@@ -104,10 +105,20 @@ mod tests {
     use crate::sql::optimizer::estimate::arith::MAX_ROW_COUNT;
     use crate::sql::optimizer::statistics::ColumnStatistic;
 
+    fn test_col_id(name: &str) -> ColumnId {
+        match name {
+            "unknown_col" => ColumnId::new_for_test(1),
+            "degenerate_col" => ColumnId::new_for_test(2),
+            "real_col" => ColumnId::new_for_test(3),
+            "missing_col" => ColumnId::new_for_test(4),
+            _ => ColumnId::new_for_test(100),
+        }
+    }
+
     fn col_ref(name: &str) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
-                column_id: ColumnId::UNSET,
+                column_id: test_col_id(name),
                 qualifier: None,
                 column: name.to_string(),
             },
@@ -121,15 +132,18 @@ mod tests {
         // OQ-3 propagates ColumnStatistic::unknown() (distinct_values_count = 1.0)
         // for no-stats / managed-lake tables. get_expr_ndv must treat that as
         // "no information" and return the generic expression default.
-        let mut column_stats: HashMap<String, ColumnStatistic> = HashMap::new();
-        column_stats.insert("unknown_col".to_string(), ColumnStatistic::unknown());
-        assert_eq!(column_stats["unknown_col"].distinct_values_count, 1.0);
+        let mut column_stats: HashMap<ColumnId, ColumnStatistic> = HashMap::new();
+        column_stats.insert(test_col_id("unknown_col"), ColumnStatistic::unknown());
+        assert_eq!(
+            column_stats[&test_col_id("unknown_col")].distinct_values_count,
+            1.0
+        );
         let unknown_expr = col_ref("unknown_col");
         assert_eq!(get_expr_ndv(&unknown_expr, &column_stats), DEFAULT_EXPR_NDV);
 
         // A degenerate ndv of exactly 1.0 (not via unknown()) is also ignored.
         column_stats.insert(
-            "degenerate_col".to_string(),
+            test_col_id("degenerate_col"),
             ColumnStatistic {
                 min_value: 0.0,
                 max_value: 100.0,
@@ -147,7 +161,7 @@ mod tests {
 
         // A real NDV (> 1) is still used verbatim.
         column_stats.insert(
-            "real_col".to_string(),
+            test_col_id("real_col"),
             ColumnStatistic {
                 min_value: 0.0,
                 max_value: 100.0,
@@ -167,8 +181,8 @@ mod tests {
 
     #[test]
     fn join_key_ndv_uses_wider_fallback() {
-        let mut column_stats: HashMap<String, ColumnStatistic> = HashMap::new();
-        column_stats.insert("unknown_col".to_string(), ColumnStatistic::unknown());
+        let mut column_stats: HashMap<ColumnId, ColumnStatistic> = HashMap::new();
+        column_stats.insert(test_col_id("unknown_col"), ColumnStatistic::unknown());
 
         let unknown_expr = col_ref("unknown_col");
         let (ndv, confidence) = get_join_key_ndv_with_confidence(&unknown_expr, &column_stats);
@@ -176,7 +190,7 @@ mod tests {
         assert_eq!(confidence, Confidence::Fallback);
 
         column_stats.insert(
-            "real_col".to_string(),
+            test_col_id("real_col"),
             ColumnStatistic {
                 distinct_values_count: 50.0,
                 confidence: Confidence::Exact,

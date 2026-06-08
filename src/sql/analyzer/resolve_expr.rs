@@ -64,16 +64,10 @@ impl<'a> super::AnalyzerContext<'a> {
                     return Ok(expr.clone());
                 }
                 let (column_id, data_type, nullable) = scope.resolve(None, &ident.value)?;
-                // If the scope tracks a canonical qualifier for this column
-                // name (USING-join shared column resolves to one specific
-                // side), normalize the ColumnRef to be qualified so the
-                // codegen layer picks the correct physical slot — its
-                // own ExprScope merge keeps left-first by default.
-                let qualifier = scope.canonical_qualifier_for(&ident.value);
                 Ok(TypedExpr {
                     kind: ExprKind::ColumnRef {
                         column_id,
-                        qualifier,
+                        qualifier: None,
                         column: ident.value.to_lowercase(),
                     },
                     data_type,

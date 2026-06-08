@@ -448,7 +448,7 @@ mod tests {
         let child = scan_group(&mut memo, 1, "a");
         let mut child_props = LogicalProperties::new(vec![output(1, "a")], 100.0);
         child_props.column_statistics.insert(
-            "a".to_string(),
+            ColumnId::new_for_test(1),
             ColumnStatistic {
                 min_value: 0.0,
                 max_value: 99.0,
@@ -474,7 +474,9 @@ mod tests {
             "column_statistics must not be empty after add_filter_group"
         );
         assert!(
-            filter_props.column_statistics.contains_key("a"),
+            filter_props
+                .column_statistics
+                .contains_key(&ColumnId::new_for_test(1)),
             "column_statistics must contain the child column 'a'"
         );
     }

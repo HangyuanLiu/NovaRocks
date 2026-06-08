@@ -16,7 +16,7 @@ pub(crate) fn derive_for_group(
     output_columns: Vec<OutputColumn>,
     row_count: f64,
     row_count_confidence: Confidence,
-    column_statistics: HashMap<String, ColumnStatistic>,
+    column_statistics: HashMap<ColumnId, ColumnStatistic>,
 ) -> LogicalProperties {
     let group = &memo.groups[group_idx];
     let expr = group.logical_exprs.first().or(group.physical_exprs.first());
@@ -42,7 +42,7 @@ pub(crate) fn derive_for_expr(
     output_columns: Vec<OutputColumn>,
     row_count: f64,
     row_count_confidence: Confidence,
-    column_statistics: HashMap<String, ColumnStatistic>,
+    column_statistics: HashMap<ColumnId, ColumnStatistic>,
 ) -> LogicalProperties {
     let output_ids = output_id_set(&output_columns);
     let mut props = LogicalProperties::new(output_columns, row_count);

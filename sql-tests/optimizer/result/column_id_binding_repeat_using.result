@@ -1,0 +1,35 @@
+-- query 7
+g	k	cnt
+0	2	1
+0	3	1
+0	4	1
+1	NULL	3
+
+-- query 8
+a	v	w
+2	l2	r2
+3	l3	r3
+
+-- query 9
+a	v	w
+1	l1	NULL
+2	l2	r2
+3	l3	r3
+
+-- query 10
+a	v	w
+2	l2	r2
+3	l3	r3
+4	NULL	r4
+
+-- query 11
+a	v	w
+1	l1	NULL
+2	l2	r2
+3	l3	r3
+4	NULL	r4
+
+-- query 12
+x
+2
+3

@@ -1,6 +1,6 @@
 Explain String
 GATHER EXCHANGE stats={rows=32}
-  PROJECT [l.k1 AS k1, l.k2 AS k2, count() AS match_count] stats={rows=32}
+  PROJECT [l.k1 AS k1, l.k2 AS k2, count(*) AS match_count] stats={rows=32}
     HASH AGGREGATE (GLOBAL, group by: [l.k1, l.k2]) stats={rows=32}
       aggregations: count()
       HASH EXCHANGE (source: ShuffleAgg, hash: [c1, c2]) stats={rows=32}

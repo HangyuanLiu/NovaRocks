@@ -10,10 +10,11 @@
 use std::collections::HashSet;
 
 use crate::sql::analysis::TypedExpr;
+use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::rewrite::rule::PlanRewriteRule as RewriteRule;
 use crate::sql::optimizer::rewrite::rules::predicate_pushdown::predicate_group::predicate_key as canonical_predicate_key;
 use crate::sql::optimizer::rewrite::rules::utils::{
-    collect_column_refs, split_and, wrap_remaining_filter,
+    collect_column_id_refs_strict, collect_output_ids, split_and, wrap_remaining_filter,
 };
 use crate::sql::planner::plan::*;
 
@@ -40,8 +41,8 @@ impl RewriteRule for PushDownPredicateScan {
         };
 
         let conjuncts = split_and(filter.predicate);
-        let scan_columns: HashSet<String> =
-            scan.columns.iter().map(|c| c.name.to_lowercase()).collect();
+        let mut scan_ids = collect_output_ids(&LogicalPlan::Scan(scan.clone()));
+        scan_ids.remove(&ColumnId::UNSET);
 
         // Canonical keys of predicates already on the scan, so we never append a
         // structurally-identical duplicate (`P AND P == P`).
@@ -54,11 +55,11 @@ impl RewriteRule for PushDownPredicateScan {
         let mut pushed_any = false;
         let mut remaining = Vec::new();
         for conj in conjuncts {
-            let refs = collect_column_refs(&conj);
-            if refs
-                .iter()
-                .all(|r| scan_columns.contains(&r.to_lowercase()))
-            {
+            let Some(refs) = collect_column_id_refs_strict(&conj) else {
+                remaining.push(conj);
+                continue;
+            };
+            if refs.is_empty() || refs.iter().all(|id| scan_ids.contains(id)) {
                 // Push only if no structurally-identical predicate is present.
                 if seen.insert(predicate_key(&conj)) {
                     scan.predicates.push(conj);
@@ -97,16 +98,29 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use arrow::datatypes::DataType;
 
-    fn col(name: &str) -> TypedExpr {
+    fn test_col_id(name: &str) -> ColumnId {
+        match name {
+            "a" => ColumnId::new_for_test(1),
+            "b" => ColumnId::new_for_test(2),
+            "zz" => ColumnId::new_for_test(99),
+            _ => ColumnId::new_for_test(100),
+        }
+    }
+
+    fn col_with_id(name: &str, column_id: ColumnId) -> TypedExpr {
         TypedExpr {
             data_type: DataType::Int64,
             nullable: true,
             kind: ExprKind::ColumnRef {
-                column_id: ColumnId::UNSET,
+                column_id,
                 qualifier: None,
                 column: name.into(),
             },
         }
+    }
+
+    fn col(name: &str) -> TypedExpr {
+        col_with_id(name, test_col_id(name))
     }
 
     fn int_lit(v: i64) -> TypedExpr {
@@ -154,7 +168,7 @@ mod tests {
             columns: cols
                 .iter()
                 .map(|n| OutputColumn {
-                    column_id: ColumnId::UNSET,
+                    column_id: test_col_id(n),
                     name: (*n).into(),
                     data_type: DataType::Int64,
                     nullable: true,
@@ -207,6 +221,21 @@ mod tests {
         });
         let rule = PushDownPredicateScan;
         assert!(rule.apply(filter).is_none());
+    }
+
+    #[test]
+    fn p4_scan_does_not_push_same_name_with_different_column_id() {
+        let scan = scan_with_cols(&["a"]);
+        let filter = LogicalPlan::Filter(FilterNode {
+            input: Box::new(scan),
+            predicate: eq(col_with_id("a", ColumnId::new_for_test(77)), int_lit(1)),
+            required_output_columns: None,
+        });
+        let rule = PushDownPredicateScan;
+        assert!(
+            rule.apply(filter).is_none(),
+            "same name must not push when ColumnId is not produced by the scan"
+        );
     }
 
     fn and(a: TypedExpr, b: TypedExpr) -> TypedExpr {

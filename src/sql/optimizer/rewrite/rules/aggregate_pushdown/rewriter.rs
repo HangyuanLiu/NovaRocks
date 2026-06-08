@@ -24,12 +24,19 @@ pub(crate) fn rewrite(
     let partial_calls: Vec<AggregateCall> = plan
         .partial_aggregates
         .iter()
-        .map(|c| AggregateCall {
-            name: partial_fn_name(&c.name),
-            args: c.args.clone(),
-            distinct: false,
-            result_type: c.result_type.clone(),
-            order_by: vec![],
+        .map(|c| {
+            let mut call = AggregateCall {
+                name: partial_fn_name(&c.name),
+                args: c.args.clone(),
+                distinct: false,
+                result_type: c.result_type.clone(),
+                order_by: vec![],
+                output_column_id: ColumnId::UNSET,
+            };
+            let name = agg_call_display_name(&call);
+            call.output_column_id =
+                column_ref_factory.create(None, name, call.result_type.clone(), true);
+            call
         })
         .collect();
 
@@ -37,10 +44,7 @@ pub(crate) fn rewrite(
     let partial_output_cols: Vec<OutputColumn> = partial_calls
         .iter()
         .map(|call| OutputColumn {
-            column_id: {
-                let name = agg_call_display_name(call);
-                column_ref_factory.create(None, name, call.result_type.clone(), true)
-            },
+            column_id: call.output_column_id,
             name: agg_call_display_name(call),
             data_type: call.result_type.clone(),
             nullable: true,
@@ -113,6 +117,7 @@ pub(crate) fn rewrite(
             distinct: false,
             result_type: orig.result_type.clone(),
             order_by: orig.order_by.clone(),
+            output_column_id: orig.output_column_id,
         })
         .collect();
 
@@ -355,6 +360,7 @@ mod tests {
             distinct: false,
             result_type: DataType::Int64,
             order_by: vec![],
+            output_column_id: ColumnId::UNSET,
         };
         let original = AggregateNode {
             input: Box::new(join),
@@ -411,6 +417,7 @@ mod tests {
                 distinct: false,
                 result_type: DataType::Int64,
                 order_by: vec![],
+                output_column_id: ColumnId::UNSET,
             }],
             output_columns: vec![],
             already_pushed: false,
@@ -454,6 +461,7 @@ mod tests {
                 distinct: false,
                 result_type: DataType::Int64,
                 order_by: vec![],
+                output_column_id: ColumnId::UNSET,
             }],
             output_columns: vec![
                 OutputColumn {
@@ -540,6 +548,7 @@ mod tests {
                 distinct: false,
                 result_type: DataType::Int64,
                 order_by: vec![],
+                output_column_id: ColumnId::UNSET,
             }],
             output_columns: vec![
                 OutputColumn {
@@ -625,6 +634,7 @@ mod tests {
             distinct: false,
             result_type: DataType::Int64,
             order_by: vec![],
+            output_column_id: ColumnId::UNSET,
         };
         let original = AggregateNode {
             input: Box::new(LogicalPlan::Join(JoinNode {

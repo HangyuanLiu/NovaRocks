@@ -11,25 +11,10 @@ use crate::sql::analysis::{BinOp, ExprKind, JoinKind, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::memo::{GroupId, MExpr, Memo};
 use crate::sql::optimizer::operator::*;
-use crate::sql::optimizer::rewrite::rules::utils::collect_column_id_refs;
+use crate::sql::optimizer::rewrite::rules::utils::collect_column_id_refs_strict;
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
 
-/// Get lowercase column names from a memo group's output columns.
-pub(super) fn get_group_column_names(memo: &Memo, group_id: GroupId) -> HashSet<String> {
-    memo.groups
-        .get(group_id)
-        .and_then(|g| g.logical_props.as_ref())
-        .map(|props| {
-            props
-                .output_columns
-                .iter()
-                .map(|c| c.name.to_lowercase())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn get_group_column_ids(memo: &Memo, group_id: GroupId) -> HashSet<ColumnId> {
+pub(super) fn get_group_column_ids(memo: &Memo, group_id: GroupId) -> HashSet<ColumnId> {
     memo.groups
         .get(group_id)
         .and_then(|g| g.logical_props.as_ref())
@@ -92,133 +77,12 @@ fn expr_has_column_ref_inner(expr: &TypedExpr, out: &mut bool) {
     }
 }
 
-pub(super) fn collect_column_refs_lowercase(expr: &TypedExpr) -> HashSet<String> {
-    let mut out = HashSet::new();
-    walk_column_refs(expr, &mut out);
-    out
-}
-
-fn walk_column_refs(expr: &TypedExpr, out: &mut HashSet<String>) {
-    match &expr.kind {
-        ExprKind::ColumnRef { column, .. } => {
-            out.insert(column.to_lowercase());
-        }
-        ExprKind::LambdaParamRef { .. } => {}
-        ExprKind::BinaryOp { left, right, .. } => {
-            walk_column_refs(left, out);
-            walk_column_refs(right, out);
-        }
-        ExprKind::UnaryOp { expr, .. } => {
-            walk_column_refs(expr, out);
-        }
-        ExprKind::FunctionCall { args, .. } => {
-            for a in args {
-                walk_column_refs(a, out);
-            }
-        }
-        ExprKind::LambdaFunction { body, .. } => walk_column_refs(body, out),
-        ExprKind::AggregateCall { args, order_by, .. } => {
-            for a in args {
-                walk_column_refs(a, out);
-            }
-            for item in order_by {
-                walk_column_refs(&item.expr, out);
-            }
-        }
-        ExprKind::Cast { expr, .. } => {
-            walk_column_refs(expr, out);
-        }
-        ExprKind::IsNull { expr, .. } => {
-            walk_column_refs(expr, out);
-        }
-        ExprKind::InList { expr, list, .. } => {
-            walk_column_refs(expr, out);
-            for item in list {
-                walk_column_refs(item, out);
-            }
-        }
-        ExprKind::Between {
-            expr, low, high, ..
-        } => {
-            walk_column_refs(expr, out);
-            walk_column_refs(low, out);
-            walk_column_refs(high, out);
-        }
-        ExprKind::Like { expr, pattern, .. } => {
-            walk_column_refs(expr, out);
-            walk_column_refs(pattern, out);
-        }
-        ExprKind::Case {
-            operand,
-            when_then,
-            else_expr,
-        } => {
-            if let Some(op) = operand {
-                walk_column_refs(op, out);
-            }
-            for (cond, val) in when_then {
-                walk_column_refs(cond, out);
-                walk_column_refs(val, out);
-            }
-            if let Some(e) = else_expr {
-                walk_column_refs(e, out);
-            }
-        }
-        ExprKind::IsTruthValue { expr, .. } => {
-            walk_column_refs(expr, out);
-        }
-        ExprKind::Nested(inner) => {
-            walk_column_refs(inner, out);
-        }
-        ExprKind::WindowCall {
-            args,
-            partition_by,
-            order_by,
-            ..
-        } => {
-            for a in args {
-                walk_column_refs(a, out);
-            }
-            for p in partition_by {
-                walk_column_refs(p, out);
-            }
-            for item in order_by {
-                walk_column_refs(&item.expr, out);
-            }
-        }
-        ExprKind::Literal(_) | ExprKind::SubqueryPlaceholder { .. } => {}
-        ExprKind::Lambda { params, body } => {
-            // Walk the body but drop lambda-bound parameter names from the
-            // collected outer refs.
-            let mut nested = HashSet::new();
-            walk_column_refs(body, &mut nested);
-            let bound: HashSet<String> = params.iter().map(|p| p.to_lowercase()).collect();
-            for name in nested {
-                if !bound.contains(&name) {
-                    out.insert(name);
-                }
-            }
-        }
-    }
-}
-
 /// Orient an eq pair so that the first element references the left child's
-/// columns and the second references the right. Returns:
-///   - `Some((a, b))` if natural order is confirmed or plausible.
-///   - `Some((b, a))` if swapping is unambiguously correct.
-///   - `None` only when we are certain BOTH sides reference the same single
-///     child (e.g. `t.a = t.b` where both come exclusively from left).
-///     The caller demotes such pairs into the residual "other" predicate.
-///
-/// This is a best-effort heuristic used to set `output_properties` correctly
-/// for the CBO search.  The fragment builder has a try-natural-then-swap
-/// fallback that handles any cases where this function's guess is wrong
-/// (e.g. self-joins where the same column name appears in both children, or
-/// when logical_props is missing for a child group).
+/// columns and the second references the right. Returns `None` when either side
+/// has unresolved ids, cannot be assigned exclusively to one child, or both
+/// expressions reference the same child.
 fn orient_eq_pair(
     pair: PhysicalHashJoinEqCondition,
-    left_cols: &HashSet<String>,
-    right_cols: &HashSet<String>,
     left_ids: &HashSet<ColumnId>,
     right_ids: &HashSet<ColumnId>,
 ) -> Option<PhysicalHashJoinEqCondition> {
@@ -227,55 +91,24 @@ fn orient_eq_pair(
         right: b,
         null_safe,
     } = pair;
-    let a_ids = collect_column_id_refs(&a);
-    let b_ids = collect_column_id_refs(&b);
-
-    let a_ids_classified = !a_ids.is_empty()
-        && a_ids
-            .iter()
-            .all(|id| left_ids.contains(id) || right_ids.contains(id));
-    let b_ids_classified = !b_ids.is_empty()
-        && b_ids
-            .iter()
-            .all(|id| left_ids.contains(id) || right_ids.contains(id));
-
-    if a_ids_classified && b_ids_classified {
-        let a_in_left = a_ids.iter().all(|id| left_ids.contains(id));
-        let a_in_right = a_ids.iter().all(|id| right_ids.contains(id));
-        let b_in_left = b_ids.iter().all(|id| left_ids.contains(id));
-        let b_in_right = b_ids.iter().all(|id| right_ids.contains(id));
-
-        if a_in_left && !a_in_right && b_in_right && !b_in_left {
-            return Some(PhysicalHashJoinEqCondition {
-                left: a,
-                right: b,
-                null_safe,
-            });
-        }
-        if a_in_right && !a_in_left && b_in_left && !b_in_right {
-            return Some(PhysicalHashJoinEqCondition {
-                left: b,
-                right: a,
-                null_safe,
-            });
-        }
-        let both_exclusively_left = a_in_left && !a_in_right && b_in_left && !b_in_right;
-        let both_exclusively_right = a_in_right && !a_in_left && b_in_right && !b_in_left;
-        if both_exclusively_left || both_exclusively_right {
-            return None;
-        }
-        if (!a_in_left && !a_in_right) || (!b_in_left && !b_in_right) {
-            return None;
-        }
+    let a_ids = collect_column_id_refs_strict(&a)?;
+    let b_ids = collect_column_id_refs_strict(&b)?;
+    if a_ids.is_empty() || b_ids.is_empty() {
+        return None;
     }
 
-    let a_cols = collect_column_refs_lowercase(&a);
-    let b_cols = collect_column_refs_lowercase(&b);
-
-    let a_in_left = !a_cols.is_empty() && a_cols.iter().all(|c| left_cols.contains(c));
-    let a_in_right = !a_cols.is_empty() && a_cols.iter().all(|c| right_cols.contains(c));
-    let b_in_left = !b_cols.is_empty() && b_cols.iter().all(|c| left_cols.contains(c));
-    let b_in_right = !b_cols.is_empty() && b_cols.iter().all(|c| right_cols.contains(c));
+    let a_in_left = a_ids
+        .iter()
+        .all(|id| left_ids.contains(id) && !right_ids.contains(id));
+    let a_in_right = a_ids
+        .iter()
+        .all(|id| right_ids.contains(id) && !left_ids.contains(id));
+    let b_in_left = b_ids
+        .iter()
+        .all(|id| left_ids.contains(id) && !right_ids.contains(id));
+    let b_in_right = b_ids
+        .iter()
+        .all(|id| right_ids.contains(id) && !left_ids.contains(id));
 
     // Unambiguous exclusive assignment: a from left only, b from right only.
     if a_in_left && !a_in_right && b_in_right && !b_in_left {
@@ -293,29 +126,7 @@ fn orient_eq_pair(
             null_safe,
         });
     }
-    // Ambiguous or unknown: preserve natural order.  The fragment builder's
-    // try-swap fallback will handle any incorrect orientation at compile time.
-    // We only demote to None when BOTH sides are exclusively from the same
-    // child (proven intra-child predicate, never a valid equi-join key).
-    let both_exclusively_left = a_in_left && !a_in_right && b_in_left && !b_in_right;
-    let both_exclusively_right = a_in_right && !a_in_left && b_in_right && !b_in_left;
-    if both_exclusively_left || both_exclusively_right {
-        return None;
-    }
-    // Reject expression-keys that span BOTH children on at least one side:
-    // a hash key must be computable purely from one side's columns. When an
-    // expression references columns from both t0 and t1 (e.g. CROSS JOIN
-    // with `WHERE abs(t0.x + t1.y) = abs(t0.u + t1.v)`), neither hash table
-    // build nor probe can produce a deterministic key — the only correct
-    // execution is a NestLoopJoin with this predicate as the residual.
-    if (!a_in_left && !a_in_right) || (!b_in_left && !b_in_right) {
-        return None;
-    }
-    Some(PhysicalHashJoinEqCondition {
-        left: a,
-        right: b,
-        null_safe,
-    })
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -688,15 +499,13 @@ impl Rule for JoinToHashJoin {
         // JOIN condition) are demoted into other_condition.
         let mut eq_conds = Vec::new();
         if expr.children.len() == 2 {
-            let left_cols = get_group_column_names(memo, expr.children[0]);
-            let right_cols = get_group_column_names(memo, expr.children[1]);
             let left_ids = get_group_column_ids(memo, expr.children[0]);
             let right_ids = get_group_column_ids(memo, expr.children[1]);
             for pair in raw_eq_conds {
                 let a = pair.left.clone();
                 let b = pair.right.clone();
                 let null_safe = pair.null_safe;
-                match orient_eq_pair(pair, &left_cols, &right_cols, &left_ids, &right_ids) {
+                match orient_eq_pair(pair, &left_ids, &right_ids) {
                     Some(oriented) => eq_conds.push(oriented),
                     None => {
                         let demoted = TypedExpr {
@@ -778,13 +587,11 @@ impl Rule for JoinToNestLoop {
         // plan for group N".
         let (eq_conds, _) = extract_eq_conditions(&op.condition, &op.join_type);
         if !eq_conds.is_empty() && op.join_type != JoinKind::Cross && expr.children.len() == 2 {
-            let left_cols = get_group_column_names(memo, expr.children[0]);
-            let right_cols = get_group_column_names(memo, expr.children[1]);
             let left_ids = get_group_column_ids(memo, expr.children[0]);
             let right_ids = get_group_column_ids(memo, expr.children[1]);
-            let has_orientable_pair = eq_conds.iter().any(|p| {
-                orient_eq_pair(p.clone(), &left_cols, &right_cols, &left_ids, &right_ids).is_some()
-            });
+            let has_orientable_pair = eq_conds
+                .iter()
+                .any(|p| orient_eq_pair(p.clone(), &left_ids, &right_ids).is_some());
             if has_orientable_pair {
                 // Has at least one usable equi-key — JoinToHashJoin handles this.
                 return vec![];
@@ -1140,10 +947,14 @@ impl Rule for RepeatToPhysical {
         vec![NewExpr {
             op: Operator::PhysicalRepeat(PhysicalRepeatOp {
                 repeat_column_ref_list: op.repeat_column_ref_list.clone(),
+                repeat_column_ref_ids: op.repeat_column_ref_ids.clone(),
                 grouping_ids: op.grouping_ids.clone(),
                 all_rollup_columns: op.all_rollup_columns.clone(),
+                all_rollup_column_ids: op.all_rollup_column_ids.clone(),
                 grouping_key_aliases: op.grouping_key_aliases.clone(),
                 grouping_fn_args: op.grouping_fn_args.clone(),
+                grouping_fn_arg_ids: op.grouping_fn_arg_ids.clone(),
+                grouping_fn_ids: op.grouping_fn_ids.clone(),
             }),
             children: expr.children.clone(),
         }]
@@ -1295,6 +1106,7 @@ impl Rule for GenerateSeriesToPhysical {
                 step: op.step,
                 column_name: op.column_name.clone(),
                 alias: op.alias.clone(),
+                output_column_id: op.output_column_id,
             }),
             children: expr.children.clone(),
         }]
@@ -1416,6 +1228,8 @@ mod decode_tests {
         let child_group = memo.new_group(child_mexpr);
 
         let mappings = vec![DecodeMapping {
+            source_column_id: ColumnId::new_for_test(1),
+            output_column_id: ColumnId::new_for_test(2),
             dict_column: "a".into(),
             string_column: "a_str".into(),
         }];
@@ -1454,6 +1268,8 @@ mod decode_tests {
         let child_group = memo.new_group(child_mexpr);
 
         let mappings = vec![DecodeMapping {
+            source_column_id: ColumnId::new_for_test(1),
+            output_column_id: ColumnId::new_for_test(2),
             dict_column: "dict_col".into(),
             string_column: "string_col".into(),
         }];
@@ -1493,7 +1309,7 @@ mod decode_tests {
 mod top_n_tests {
     use super::*;
     use crate::sql::optimizer::memo::{MExpr, Memo};
-    use crate::sql::optimizer::operator::{LogicalTopNOp, TopNPhase};
+    use crate::sql::optimizer::operator::{LogicalGenerateSeriesOp, LogicalTopNOp, TopNPhase};
 
     #[test]
     fn top_n_to_physical_produces_physical_top_n() {
@@ -1531,6 +1347,33 @@ mod top_n_tests {
         }
         assert_eq!(out[0].children, vec![dummy_child]);
     }
+
+    #[test]
+    fn generate_series_to_physical_preserves_output_column_id() {
+        let mut memo = Memo::new();
+        let output_column_id = ColumnId::new_for_test(8101);
+        let expr = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalGenerateSeries(LogicalGenerateSeriesOp {
+                start: 1,
+                end: 10,
+                step: 2,
+                column_name: "x".to_string(),
+                alias: Some("gs".to_string()),
+                output_column_id,
+            }),
+            children: vec![],
+        };
+
+        let out = GenerateSeriesToPhysical.apply(&expr, &mut memo);
+        assert_eq!(out.len(), 1);
+        let Operator::PhysicalGenerateSeries(p) = &out[0].op else {
+            panic!("expected PhysicalGenerateSeries");
+        };
+        assert_eq!(p.output_column_id, output_column_id);
+        assert_eq!(p.column_name, "x");
+        assert_eq!(p.alias.as_deref(), Some("gs"));
+    }
 }
 
 #[cfg(test)]
@@ -1538,18 +1381,6 @@ mod eq_pair_tests {
     use super::*;
     use crate::sql::column_id::ColumnId;
     use arrow::datatypes::DataType;
-
-    fn col(name: &str) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::ColumnRef {
-                column_id: ColumnId::UNSET,
-                qualifier: None,
-                column: name.into(),
-            },
-            data_type: DataType::Int32,
-            nullable: false,
-        }
-    }
 
     fn col_id(name: &str, id: u32) -> TypedExpr {
         TypedExpr {
@@ -1561,10 +1392,6 @@ mod eq_pair_tests {
             data_type: DataType::Int32,
             nullable: false,
         }
-    }
-
-    fn cols(names: &[&str]) -> HashSet<String> {
-        names.iter().map(|s| s.to_lowercase()).collect()
     }
 
     fn ids(values: &[u32]) -> HashSet<ColumnId> {
@@ -1581,11 +1408,10 @@ mod eq_pair_tests {
 
     #[test]
     fn orient_natural_order_keeps_order() {
-        let left = cols(&["a_id"]);
-        let right = cols(&["b_id"]);
-        let pair = eq_pair(col("a_id"), col("b_id"));
-        let out = orient_eq_pair(pair, &left, &right, &HashSet::new(), &HashSet::new())
-            .expect("should orient");
+        let left_ids = ids(&[10]);
+        let right_ids = ids(&[20]);
+        let pair = eq_pair(col_id("a_id", 10), col_id("b_id", 20));
+        let out = orient_eq_pair(pair, &left_ids, &right_ids).expect("should orient");
         match &out.left.kind {
             ExprKind::ColumnRef { column, .. } => assert_eq!(column, "a_id"),
             _ => panic!("expected ColumnRef"),
@@ -1598,11 +1424,10 @@ mod eq_pair_tests {
 
     #[test]
     fn orient_swapped_pair_returns_swapped() {
-        let left = cols(&["a_id"]);
-        let right = cols(&["b_id"]);
-        let pair = eq_pair(col("b_id"), col("a_id"));
-        let out = orient_eq_pair(pair, &left, &right, &HashSet::new(), &HashSet::new())
-            .expect("should orient");
+        let left_ids = ids(&[10]);
+        let right_ids = ids(&[20]);
+        let pair = eq_pair(col_id("b_id", 20), col_id("a_id", 10));
+        let out = orient_eq_pair(pair, &left_ids, &right_ids).expect("should orient");
         match &out.left.kind {
             ExprKind::ColumnRef { column, .. } => assert_eq!(column, "a_id"),
             _ => panic!("expected ColumnRef"),
@@ -1615,20 +1440,18 @@ mod eq_pair_tests {
 
     #[test]
     fn orient_single_side_pair_returns_none() {
-        let left = cols(&["a_id", "a_name"]);
-        let right = cols(&["b_id"]);
-        let pair = eq_pair(col("a_id"), col("a_name"));
-        assert!(orient_eq_pair(pair, &left, &right, &HashSet::new(), &HashSet::new()).is_none());
+        let left_ids = ids(&[10, 11]);
+        let right_ids = ids(&[20]);
+        let pair = eq_pair(col_id("a_id", 10), col_id("a_name", 11));
+        assert!(orient_eq_pair(pair, &left_ids, &right_ids).is_none());
     }
 
     #[test]
     fn orient_uses_column_ids_when_names_are_ambiguous() {
-        let left = cols(&["id"]);
-        let right = cols(&["id"]);
         let left_ids = ids(&[10]);
         let right_ids = ids(&[20]);
         let pair = eq_pair(col_id("id", 20), col_id("id", 10));
-        let out = orient_eq_pair(pair, &left, &right, &left_ids, &right_ids)
+        let out = orient_eq_pair(pair, &left_ids, &right_ids)
             .expect("column ids should disambiguate the join sides");
 
         match &out.left.kind {
@@ -1651,10 +1474,19 @@ mod join_demotion_tests {
     use crate::sql::optimizer::memo::{LogicalProperties, MExpr, Memo};
     use arrow::datatypes::DataType;
 
+    fn test_col_id(name: &str) -> ColumnId {
+        match name {
+            "a_id" => ColumnId::new_for_test(10),
+            "a_name" => ColumnId::new_for_test(11),
+            "b_id" => ColumnId::new_for_test(20),
+            _ => ColumnId::new_for_test(100),
+        }
+    }
+
     fn col(name: &str) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
-                column_id: ColumnId::UNSET,
+                column_id: test_col_id(name),
                 qualifier: None,
                 column: name.into(),
             },
@@ -1668,7 +1500,7 @@ mod join_demotion_tests {
         let output_columns: Vec<OutputColumn> = col_names
             .iter()
             .map(|name| OutputColumn {
-                column_id: ColumnId::UNSET,
+                column_id: test_col_id(name),
                 name: (*name).into(),
                 data_type: DataType::Int32,
                 nullable: false,
@@ -1697,7 +1529,7 @@ mod join_demotion_tests {
             children: vec![],
         };
         let gid = memo.new_group(scan_mexpr);
-        // Inject logical_props so get_group_column_names returns the column names.
+        // Inject logical_props so side ownership can be derived from ColumnId.
         memo.groups[gid].logical_props = Some(LogicalProperties::new(output_columns, 100.0));
         gid
     }
@@ -1886,6 +1718,7 @@ mod window_split_tests {
             window_frame: None,
             result_type: DataType::Int64,
             output_name: name.into(),
+            output_column_id: ColumnId::UNSET,
             ignore_nulls: false,
         }
     }
@@ -1945,6 +1778,7 @@ mod window_split_tests {
             window_frame: None,
             result_type: DataType::Int64,
             output_name: "w".into(),
+            output_column_id: ColumnId::UNSET,
             ignore_nulls: false,
         };
         let items = sort_items_for_window(&win);
@@ -2064,6 +1898,7 @@ mod two_phase_agg_tests {
             distinct,
             result_type: DataType::Int64,
             order_by: vec![],
+            output_column_id: ColumnId::UNSET,
         }
     }
 
@@ -2166,6 +2001,7 @@ mod two_phase_agg_tests {
                     distinct: true,
                     result_type: DataType::Int64,
                     order_by: vec![],
+                    output_column_id: ColumnId::UNSET,
                 }],
                 vec![
                     OutputColumn {

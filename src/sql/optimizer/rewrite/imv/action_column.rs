@@ -999,6 +999,7 @@ mod tests {
                     distinct: false,
                     result_type: DataType::Binary,
                     order_by: Vec::new(),
+                    output_column_id: ColumnId::UNSET,
                 }],
                 output_columns: vec![output_column(2, "s", DataType::Int64, true, false)],
                 already_pushed: false,
@@ -1226,6 +1227,7 @@ mod tests {
                     distinct: false,
                     result_type: DataType::Binary,
                     order_by: Vec::new(),
+                    output_column_id: ColumnId::UNSET,
                 }],
                 output_columns: vec![OutputColumn {
                     column_id: ColumnId(10),
@@ -1266,6 +1268,7 @@ mod tests {
                     distinct: false,
                     result_type: DataType::Binary,
                     order_by: Vec::new(),
+                    output_column_id: ColumnId::UNSET,
                 }],
                 output_columns: vec![OutputColumn {
                     column_id: ColumnId(10),

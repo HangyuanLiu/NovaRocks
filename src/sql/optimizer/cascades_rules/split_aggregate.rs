@@ -1,5 +1,7 @@
 use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
-use crate::sql::codegen::helpers::{agg_call_display_name, typed_expr_display_name};
+use crate::sql::codegen::helpers::{
+    agg_call_display_name, agg_call_display_name_without_qualifiers, typed_expr_display_name,
+};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::memo::{MExpr, Memo};
 use crate::sql::optimizer::operator::{AggStage, LogicalAggregateOp, Operator};
@@ -95,12 +97,15 @@ fn local_output_columns(agg: &LogicalAggregateOp) -> Vec<OutputColumn> {
             is_internal: false,
         }
     }));
-    columns.extend(agg.aggregates.iter().map(|call| OutputColumn {
-        column_id: ColumnId::UNSET,
-        name: agg_call_display_name(call),
-        data_type: call.result_type.clone(),
-        nullable: true,
-        is_internal: true,
+    columns.extend(agg.aggregates.iter().map(|call| {
+        let name = agg_call_display_name(call);
+        OutputColumn {
+            column_id: aggregate_output_column_id(call, &name, &agg.output_columns),
+            name,
+            data_type: call.result_type.clone(),
+            nullable: true,
+            is_internal: true,
+        }
     }));
     columns
 }
@@ -118,6 +123,22 @@ fn group_key_output_column_id(
             .map(|output| output.column_id)
             .unwrap_or(ColumnId::UNSET),
     }
+}
+
+fn aggregate_output_column_id(
+    call: &AggregateCall,
+    display_name: &str,
+    existing_outputs: &[OutputColumn],
+) -> ColumnId {
+    if call.output_column_id != ColumnId::UNSET {
+        return call.output_column_id;
+    }
+    let unqualified_display_name = agg_call_display_name_without_qualifiers(call);
+    existing_outputs
+        .iter()
+        .find(|output| output.name == display_name || output.name == unqualified_display_name)
+        .map(|output| output.column_id)
+        .unwrap_or(ColumnId::UNSET)
 }
 
 fn aggregate_group_key_output_ref(
@@ -191,6 +212,7 @@ mod tests {
             distinct,
             result_type: DataType::Int64,
             order_by: vec![],
+            output_column_id: ColumnId::UNSET,
         }
     }
 
@@ -269,6 +291,10 @@ mod tests {
         assert_eq!(local.stage, AggStage::Local);
         assert_eq!(local.is_merge, vec![false]);
         assert!(local.is_split);
+        assert_eq!(
+            local.output_columns[local.group_by.len()].column_id,
+            ColumnId::new_for_test(3)
+        );
     }
 
     #[test]
@@ -324,6 +350,7 @@ mod tests {
         };
         assert_eq!(local.stage, AggStage::Local);
         assert!(local.group_by.is_empty());
+        assert_eq!(local.output_columns[0].column_id, ColumnId::new_for_test(3));
     }
 
     #[test]

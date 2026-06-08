@@ -12,9 +12,10 @@
 use std::collections::HashSet;
 
 use crate::sql::analysis::ExprKind;
+use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::rewrite::rule::PlanRewriteRule as RewriteRule;
 use crate::sql::optimizer::rewrite::rules::utils::{
-    collect_column_refs, combine_and, split_and, wrap_remaining_filter,
+    collect_column_id_refs_strict, combine_and, split_and, wrap_remaining_filter,
 };
 use crate::sql::planner::plan::*;
 
@@ -40,13 +41,15 @@ impl RewriteRule for PushDownPredicateAggregate {
             return None;
         };
 
-        // GROUP BY key column names — only bare ColumnRef items contribute
-        // pushable column names; computed GROUP BY expressions do not.
-        let group_by_columns: HashSet<String> = agg
+        // GROUP BY key ColumnIds — only bare ColumnRef items contribute
+        // pushable ids; computed GROUP BY expressions do not.
+        let group_by_ids: HashSet<ColumnId> = agg
             .group_by
             .iter()
             .filter_map(|e| match &e.kind {
-                ExprKind::ColumnRef { column, .. } => Some(column.to_lowercase()),
+                ExprKind::ColumnRef { column_id, .. } if *column_id != ColumnId::UNSET => {
+                    Some(*column_id)
+                }
                 _ => None,
             })
             .collect();
@@ -55,14 +58,13 @@ impl RewriteRule for PushDownPredicateAggregate {
         let mut pushable = Vec::new();
         let mut remaining = Vec::new();
         for conj in conjuncts {
-            let refs = collect_column_refs(&conj);
+            let refs = collect_column_id_refs_strict(&conj);
             // Keep the `!refs.is_empty()` guard: constant predicates (empty
             // refs) are not pushed through aggregates — they don't depend on
             // any GROUP BY key.
-            if !refs.is_empty()
-                && refs
-                    .iter()
-                    .all(|r| group_by_columns.contains(&r.to_lowercase()))
+            if let Some(refs) = refs
+                && !refs.is_empty()
+                && refs.iter().all(|id| group_by_ids.contains(id))
             {
                 pushable.push(conj);
             } else {
@@ -96,16 +98,29 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use arrow::datatypes::DataType;
 
-    fn col(name: &str) -> TypedExpr {
+    fn test_col_id(name: &str) -> ColumnId {
+        match name {
+            "a" => ColumnId::new_for_test(1),
+            "b" => ColumnId::new_for_test(2),
+            "sum_b" => ColumnId::new_for_test(3),
+            _ => ColumnId::new_for_test(100),
+        }
+    }
+
+    fn col_with_id(name: &str, column_id: ColumnId) -> TypedExpr {
         TypedExpr {
             data_type: DataType::Int64,
             nullable: true,
             kind: ExprKind::ColumnRef {
-                column_id: ColumnId::UNSET,
+                column_id,
                 qualifier: None,
                 column: name.into(),
             },
         }
+    }
+
+    fn col(name: &str) -> TypedExpr {
+        col_with_id(name, test_col_id(name))
     }
 
     fn int_lit(v: i64) -> TypedExpr {
@@ -153,7 +168,7 @@ mod tests {
             columns: cols
                 .iter()
                 .map(|n| OutputColumn {
-                    column_id: ColumnId::UNSET,
+                    column_id: test_col_id(n),
                     name: (*n).into(),
                     data_type: DataType::Int64,
                     nullable: true,
@@ -178,17 +193,18 @@ mod tests {
                 distinct: false,
                 result_type: DataType::Int64,
                 order_by: vec![],
+                output_column_id: test_col_id("sum_b"),
             }],
             output_columns: vec![
                 OutputColumn {
-                    column_id: ColumnId::UNSET,
+                    column_id: test_col_id("a"),
                     name: "a".into(),
                     data_type: DataType::Int64,
                     nullable: true,
                     is_internal: false,
                 },
                 OutputColumn {
-                    column_id: ColumnId::UNSET,
+                    column_id: test_col_id("sum_b"),
                     name: "sum_b".into(),
                     data_type: DataType::Int64,
                     nullable: true,

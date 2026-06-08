@@ -8,7 +8,7 @@
 //!
 //! Mirrors StarRocks's `SplitAggregateRule` / `AggType.java` convention.
 
-use crate::sql::analysis::{ExprKind, TypedExpr};
+use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::memo::{MExpr, Memo};
 use crate::sql::optimizer::operator::{
@@ -160,10 +160,35 @@ fn distinct_aggregate_calls(
             distinct: true,
             result_type: arrow::datatypes::DataType::Int64,
             order_by: vec![],
+            output_column_id: ColumnId::UNSET,
         }]
     } else {
         distinct_aggs
     }
+}
+
+fn group_output_column_from_expr(expr: &TypedExpr, fallback_name: String) -> OutputColumn {
+    let (column_id, name) = match &expr.kind {
+        ExprKind::ColumnRef {
+            column_id, column, ..
+        } => (*column_id, column.clone()),
+        _ => (ColumnId::UNSET, fallback_name),
+    };
+    OutputColumn {
+        column_id,
+        name,
+        data_type: expr.data_type.clone(),
+        nullable: expr.nullable,
+        is_internal: false,
+    }
+}
+
+fn phase_group_output_columns(group_by: &[TypedExpr]) -> Vec<OutputColumn> {
+    group_by
+        .iter()
+        .enumerate()
+        .map(|(idx, expr)| group_output_column_from_expr(expr, format!("group_{idx}")))
+        .collect()
 }
 
 fn apply_three_phase(
@@ -176,6 +201,7 @@ fn apply_three_phase(
     // Group-by for LOCAL and DISTINCT_GLOBAL: original group_by + distinct_col.
     let mut gb_with_distinct = agg.group_by.clone();
     gb_with_distinct.push(distinct_col.clone());
+    let gb_with_distinct_outputs = phase_group_output_columns(&gb_with_distinct);
 
     // LOCAL: group_by = g + x; non_distinct aggs computed with update semantics.
     let local_id = memo.next_expr_id();
@@ -185,7 +211,7 @@ fn apply_three_phase(
             mode: AggMode::Local,
             group_by: gb_with_distinct.clone(),
             aggregates: non_distinct.to_vec(),
-            output_columns: vec![],
+            output_columns: gb_with_distinct_outputs.clone(),
             is_merge: vec![false; non_distinct.len()],
         }),
         children: expr.children.clone(),
@@ -200,7 +226,7 @@ fn apply_three_phase(
             mode: AggMode::DistinctGlobal,
             group_by: gb_with_distinct,
             aggregates: non_distinct.to_vec(),
-            output_columns: vec![],
+            output_columns: gb_with_distinct_outputs,
             is_merge: vec![true; non_distinct.len()],
         }),
         children: vec![local_group],
@@ -247,6 +273,8 @@ fn apply_four_phase(
     distinct_col: &TypedExpr,
     non_distinct: &[AggregateCall],
 ) -> Vec<NewExpr> {
+    let distinct_group_outputs = phase_group_output_columns(std::slice::from_ref(distinct_col));
+
     // LOCAL: group_by = [x]; non_distinct aggs with update semantics.
     let local_id = memo.next_expr_id();
     let local = MExpr {
@@ -255,7 +283,7 @@ fn apply_four_phase(
             mode: AggMode::Local,
             group_by: vec![distinct_col.clone()],
             aggregates: non_distinct.to_vec(),
-            output_columns: vec![],
+            output_columns: distinct_group_outputs.clone(),
             is_merge: vec![false; non_distinct.len()],
         }),
         children: expr.children.clone(),
@@ -270,7 +298,7 @@ fn apply_four_phase(
             mode: AggMode::DistinctGlobal,
             group_by: vec![distinct_col.clone()],
             aggregates: non_distinct.to_vec(),
-            output_columns: vec![],
+            output_columns: distinct_group_outputs,
             is_merge: vec![true; non_distinct.len()],
         }),
         children: vec![local_group],
@@ -355,6 +383,15 @@ mod tests {
         }
     }
 
+    fn col_with_id(name: &str, id: u32) -> TypedExpr {
+        let mut expr = col(name);
+        let ExprKind::ColumnRef { column_id, .. } = &mut expr.kind else {
+            unreachable!("col() must build a ColumnRef");
+        };
+        *column_id = ColumnId::new_for_test(id);
+        expr
+    }
+
     fn scan_group(memo: &mut Memo) -> usize {
         let m = MExpr {
             id: memo.next_expr_id(),
@@ -387,6 +424,7 @@ mod tests {
             distinct: true,
             result_type: DataType::Int64,
             order_by: vec![],
+            output_column_id: ColumnId::UNSET,
         }
     }
 
@@ -401,6 +439,7 @@ mod tests {
                 true,
             ))),
             order_by: vec![],
+            output_column_id: ColumnId::UNSET,
         }
     }
 
@@ -411,6 +450,7 @@ mod tests {
             distinct: false,
             result_type: DataType::Int64,
             order_by: vec![],
+            output_column_id: ColumnId::UNSET,
         }
     }
 
@@ -444,6 +484,7 @@ mod tests {
             distinct: true,
             result_type: DataType::Int64,
             order_by: vec![],
+            output_column_id: ColumnId::UNSET,
         };
         let id = memo.next_expr_id();
         let mexpr = MExpr {
@@ -499,6 +540,7 @@ mod tests {
                             asc: true,
                             nulls_first: true,
                         }],
+                        output_column_id: ColumnId::UNSET,
                     },
                     count_distinct("name"),
                 ],
@@ -526,6 +568,7 @@ mod tests {
                         distinct: false,
                         result_type: DataType::Int64,
                         order_by: vec![],
+                        output_column_id: ColumnId::UNSET,
                     },
                 ],
                 vec![],
@@ -558,6 +601,7 @@ mod tests {
                         asc: true,
                         nulls_first: true,
                     }],
+                    output_column_id: ColumnId::UNSET,
                 }],
                 vec![],
             )),
@@ -575,6 +619,7 @@ mod tests {
             distinct: true,
             result_type: DataType::Int64,
             order_by: vec![],
+            output_column_id: ColumnId::UNSET,
         };
         let col_out = extract_single_distinct_col(&[count_distinct("x"), sum_distinct_x]);
         assert!(
@@ -662,6 +707,94 @@ mod tests {
         assert_eq!(local.aggregates.len(), 1);
         assert_eq!(local.is_merge, vec![false]);
         assert_eq!(local_group.physical_exprs[0].children, vec![sg]);
+    }
+
+    #[test]
+    fn three_phase_intermediate_outputs_preserve_group_and_distinct_input_ids() {
+        let mut memo = Memo::new();
+        let sg = scan_group(&mut memo);
+        let g = col_with_id("g", 4);
+        let x = col_with_id("x", 5);
+        let a = col_with_id("a", 6);
+        let id = memo.next_expr_id();
+        let mexpr = MExpr {
+            id,
+            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+                vec![g],
+                vec![
+                    AggregateCall {
+                        name: "count".into(),
+                        args: vec![x],
+                        distinct: true,
+                        result_type: DataType::Int64,
+                        order_by: vec![],
+                        output_column_id: ColumnId::new_for_test(7),
+                    },
+                    AggregateCall {
+                        name: "sum".into(),
+                        args: vec![a],
+                        distinct: false,
+                        result_type: DataType::Int64,
+                        order_by: vec![],
+                        output_column_id: ColumnId::new_for_test(8),
+                    },
+                ],
+                vec![
+                    OutputColumn {
+                        column_id: ColumnId::new_for_test(9),
+                        name: "g_alias".into(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        is_internal: false,
+                    },
+                    OutputColumn {
+                        column_id: ColumnId::new_for_test(7),
+                        name: "count(distinct x)".into(),
+                        data_type: DataType::Int64,
+                        nullable: true,
+                        is_internal: false,
+                    },
+                    OutputColumn {
+                        column_id: ColumnId::new_for_test(8),
+                        name: "sum(a)".into(),
+                        data_type: DataType::Int64,
+                        nullable: true,
+                        is_internal: false,
+                    },
+                ],
+            )),
+            children: vec![sg],
+        };
+
+        let out = SplitDistinctAgg.apply(&mexpr, &mut memo);
+        assert_eq!(out.len(), 1);
+        let dg_group = &memo.groups[out[0].children[0]];
+        let dg = match &dg_group.physical_exprs[0].op {
+            Operator::PhysicalHashAggregate(p) => p,
+            other => panic!("expected DISTINCT_GLOBAL, got {:?}", other),
+        };
+        let local_group = &memo.groups[dg_group.physical_exprs[0].children[0]];
+        let local = match &local_group.physical_exprs[0].op {
+            Operator::PhysicalHashAggregate(p) => p,
+            other => panic!("expected LOCAL, got {:?}", other),
+        };
+
+        let expected = vec![ColumnId::new_for_test(4), ColumnId::new_for_test(5)];
+        assert_eq!(
+            dg.output_columns
+                .iter()
+                .map(|c| c.column_id)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            local
+                .output_columns
+                .iter()
+                .map(|c| c.column_id)
+                .collect::<Vec<_>>(),
+            expected
+        );
     }
 
     #[test]
@@ -772,5 +905,65 @@ mod tests {
         assert_eq!(local.group_by.len(), 1);
         assert_eq!(local.is_merge, vec![false]);
         assert_eq!(local_group.physical_exprs[0].children, vec![sg]);
+    }
+
+    #[test]
+    fn four_phase_intermediate_outputs_preserve_distinct_input_id() {
+        let mut memo = Memo::new();
+        let sg = scan_group(&mut memo);
+        let x = col_with_id("x", 5);
+        let id = memo.next_expr_id();
+        let mexpr = MExpr {
+            id,
+            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+                vec![],
+                vec![AggregateCall {
+                    name: "count".into(),
+                    args: vec![x],
+                    distinct: true,
+                    result_type: DataType::Int64,
+                    order_by: vec![],
+                    output_column_id: ColumnId::new_for_test(8),
+                }],
+                vec![OutputColumn {
+                    column_id: ColumnId::new_for_test(8),
+                    name: "count(distinct x)".into(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    is_internal: false,
+                }],
+            )),
+            children: vec![sg],
+        };
+
+        let out = SplitDistinctAgg.apply(&mexpr, &mut memo);
+        assert_eq!(out.len(), 1);
+        let dl_group = &memo.groups[out[0].children[0]];
+        let dg_group = &memo.groups[dl_group.physical_exprs[0].children[0]];
+        let dg = match &dg_group.physical_exprs[0].op {
+            Operator::PhysicalHashAggregate(p) => p,
+            other => panic!("expected DISTINCT_GLOBAL, got {:?}", other),
+        };
+        let local_group = &memo.groups[dg_group.physical_exprs[0].children[0]];
+        let local = match &local_group.physical_exprs[0].op {
+            Operator::PhysicalHashAggregate(p) => p,
+            other => panic!("expected LOCAL, got {:?}", other),
+        };
+
+        assert_eq!(
+            dg.output_columns
+                .iter()
+                .map(|c| c.column_id)
+                .collect::<Vec<_>>(),
+            vec![ColumnId::new_for_test(5)]
+        );
+        assert_eq!(
+            local
+                .output_columns
+                .iter()
+                .map(|c| c.column_id)
+                .collect::<Vec<_>>(),
+            vec![ColumnId::new_for_test(5)]
+        );
     }
 }

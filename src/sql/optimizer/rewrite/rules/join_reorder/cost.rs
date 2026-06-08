@@ -109,13 +109,14 @@ fn estimate_join_cost(
 mod tests {
     use super::*;
     use crate::sql::analysis::JoinKind;
+    use crate::sql::column_id::ColumnId;
     use arrow::datatypes::DataType;
     use std::collections::HashMap;
 
     fn simple_stats(rows: f64, avg_size: f64) -> Statistics {
         let mut col_stats = HashMap::new();
         col_stats.insert(
-            "c".to_string(),
+            ColumnId::new_for_test(1),
             ColumnStatistic {
                 min_value: 0.0,
                 max_value: 100.0,

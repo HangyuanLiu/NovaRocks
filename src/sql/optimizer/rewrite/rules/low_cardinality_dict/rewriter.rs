@@ -160,10 +160,20 @@ fn rewrite_scan(mut scan: ScanNode, ctx: &mut DictionaryRewriteContext) -> (Scan
     // see the bindings.
     if !scan.dict_columns.is_empty() {
         for hint in &scan.dict_columns {
+            let source_column_id = scan
+                .columns
+                .iter()
+                .find(|c| {
+                    c.name.eq_ignore_ascii_case(&hint.dict_column)
+                        || c.name.eq_ignore_ascii_case(&hint.source_column)
+                })
+                .map(|c| c.column_id)
+                .unwrap_or(ColumnId::UNSET);
             scope.insert(
                 hint.source_column.clone(),
                 DictBinding {
                     dict_column: hint.dict_column.clone(),
+                    source_column_id,
                     snapshot: hint.dictionary.clone(),
                 },
             );
@@ -225,6 +235,7 @@ fn rewrite_scan(mut scan: ScanNode, ctx: &mut DictionaryRewriteContext) -> (Scan
             source_name,
             DictBinding {
                 dict_column,
+                source_column_id,
                 snapshot,
             },
         );
@@ -313,7 +324,7 @@ fn rewrite_project(
         items.push(crate::sql::analysis::ProjectItem {
             expr: TypedExpr {
                 kind: ExprKind::ColumnRef {
-                    column_id: ColumnId::UNSET,
+                    column_id: binding.source_column_id,
                     qualifier: None,
                     column: dict_name.clone(),
                 },
@@ -322,7 +333,7 @@ fn rewrite_project(
             },
             output_name: dict_name,
             // Synthetic dict-slot pass-through; not addressed by the pruning pass.
-            output_column_id: ColumnId::UNSET,
+            output_column_id: binding.source_column_id,
         });
     }
     Ok((
@@ -345,6 +356,7 @@ fn rewrite_aggregate(
     let mut decoded_group_keys: Vec<(
         String,
         String,
+        ColumnId,
         std::sync::Arc<crate::engine::dictionary::model::DictionarySnapshot>,
     )> = Vec::new();
     for expr in &node.group_by {
@@ -368,6 +380,7 @@ fn rewrite_aggregate(
             decoded_group_keys.push((
                 binding.dict_column.clone(),
                 column.clone(),
+                binding.source_column_id,
                 binding.snapshot.clone(),
             ));
             continue;
@@ -438,12 +451,14 @@ fn rewrite_aggregate(
             std::sync::Arc<crate::engine::dictionary::model::DictionarySnapshot>,
         ),
     > = std::collections::BTreeMap::new();
-    for (dict, string, snap) in &decoded_group_keys {
+    for (dict, string, _, snap) in &decoded_group_keys {
         decoded_index.insert(dict.clone(), (string.clone(), snap.clone()));
     }
     let mappings: Vec<DecodeMapping> = decoded_group_keys
         .iter()
-        .map(|(dict, string, _)| DecodeMapping {
+        .map(|(dict, string, source_column_id, _)| DecodeMapping {
+            source_column_id: *source_column_id,
+            output_column_id: *source_column_id,
             dict_column: dict.clone(),
             string_column: string.clone(),
         })
@@ -1221,6 +1236,8 @@ pub(crate) fn wrap_with_decode(
                 continue;
             }
             mappings.push(DecodeMapping {
+                source_column_id: binding.source_column_id,
+                output_column_id: col.column_id,
                 dict_column: binding.dict_column.clone(),
                 string_column: source_name.to_string(),
             });

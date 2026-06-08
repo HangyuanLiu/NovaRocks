@@ -6,6 +6,8 @@
 
 pub(crate) mod plan;
 
+use arrow::datatypes::DataType;
+
 use crate::sql::analysis::cte::CTERegistry;
 use crate::sql::analysis::*;
 use crate::sql::catalog::{IcebergDataFileInfo, IcebergDeleteFileContent};
@@ -146,7 +148,7 @@ fn apply_query_modifiers(
                 if let LogicalPlan::Project(ref mut proj) = body_plan {
                     if let LogicalPlan::Aggregate(ref mut agg) = *proj.input {
                         for extra in &extra_items {
-                            collect_aggregates(&extra.expr, &mut agg.aggregates);
+                            collect_aggregates(&extra.expr, &mut agg.aggregates, factory);
                         }
                     }
                     let user: Vec<(String, arrow::datatypes::DataType, bool, ColumnId)> = proj
@@ -178,14 +180,14 @@ fn apply_query_modifiers(
             // references like `ORDER BY v1` (matching SELECT v1 → renamed
             // to `__nr_sel_1`) would fail to resolve at sort time.
             let sort_items = if let Some(ref user) = user_select {
-                let name_to_idx: std::collections::HashMap<String, usize> = user
+                let name_to_output: std::collections::HashMap<String, (usize, ColumnId)> = user
                     .iter()
                     .enumerate()
-                    .map(|(idx, (name, _, _, _))| (name.to_lowercase(), idx))
+                    .map(|(idx, (name, _, _, output_id))| (name.to_lowercase(), (idx, *output_id)))
                     .collect();
                 sort_items
                     .into_iter()
-                    .map(|item| remap_sort_to_synthetic(item, &name_to_idx))
+                    .map(|item| remap_sort_to_synthetic(item, &name_to_output))
                     .collect()
             } else {
                 sort_items
@@ -329,7 +331,7 @@ fn collect_extra_sort_items(
 /// references still resolve.
 fn remap_sort_to_synthetic(
     item: SortItem,
-    name_to_idx: &std::collections::HashMap<String, usize>,
+    name_to_output: &std::collections::HashMap<String, (usize, ColumnId)>,
 ) -> SortItem {
     let SortItem {
         expr,
@@ -337,7 +339,7 @@ fn remap_sort_to_synthetic(
         nulls_first,
     } = item;
     SortItem {
-        expr: remap_select_alias_refs(expr, name_to_idx),
+        expr: remap_select_alias_refs(expr, name_to_output),
         asc,
         nulls_first,
     }
@@ -345,7 +347,7 @@ fn remap_sort_to_synthetic(
 
 fn remap_select_alias_refs(
     expr: TypedExpr,
-    name_to_idx: &std::collections::HashMap<String, usize>,
+    name_to_output: &std::collections::HashMap<String, (usize, ColumnId)>,
 ) -> TypedExpr {
     match expr.kind {
         ExprKind::ColumnRef {
@@ -353,12 +355,12 @@ fn remap_select_alias_refs(
             ref column,
             ..
         } => {
-            if let Some(idx) = name_to_idx.get(&column.to_lowercase()) {
+            if let Some((idx, output_id)) = name_to_output.get(&column.to_lowercase()) {
                 TypedExpr {
                     data_type: expr.data_type,
                     nullable: expr.nullable,
                     kind: ExprKind::ColumnRef {
-                        column_id: ColumnId::UNSET,
+                        column_id: *output_id,
                         qualifier: None,
                         column: format!("__nr_sel_{idx}"),
                     },
@@ -463,7 +465,7 @@ pub(crate) fn plan_output_columns(plan: &LogicalPlan) -> Result<Vec<OutputColumn
         LogicalPlan::Except(node) => Ok(node.output_columns.clone()),
         LogicalPlan::Values(node) => Ok(node.columns.clone()),
         LogicalPlan::GenerateSeries(node) => Ok(vec![OutputColumn {
-            column_id: ColumnId::UNSET,
+            column_id: node.output_column_id,
             name: node.column_name.clone(),
             data_type: arrow::datatypes::DataType::Int64,
             nullable: false,
@@ -637,14 +639,19 @@ fn plan_select_scoped(
             &mut select,
             &mut repeat_info,
             REPEAT_GROUP_QUALIFIER,
+            factory,
         );
         current = LogicalPlan::Repeat(RepeatPlanNode {
             input: Box::new(current),
             repeat_column_ref_list: repeat_info.repeat_column_ref_list,
+            repeat_column_ref_ids: repeat_info.repeat_column_ref_ids,
             grouping_ids: repeat_info.grouping_ids,
             all_rollup_columns: repeat_info.all_rollup_columns,
+            all_rollup_column_ids: repeat_info.all_rollup_column_ids,
             grouping_key_aliases,
             grouping_fn_args: repeat_info.grouping_fn_args,
+            grouping_fn_arg_ids: repeat_info.grouping_fn_arg_ids,
+            grouping_fn_ids: repeat_info.grouping_fn_ids,
             required_output_columns: None,
         });
     }
@@ -658,12 +665,13 @@ fn plan_select_scoped(
             }
         }
 
-        let (project_items, agg_calls, output_columns) = split_projection_for_aggregate(
-            &select.projection,
-            &select.group_by,
-            select.having.as_ref(),
-            factory,
-        );
+        let (project_items, agg_calls, output_columns, rewritten_having) =
+            split_projection_for_aggregate(
+                &select.projection,
+                &select.group_by,
+                select.having.as_ref(),
+                factory,
+            );
         current = LogicalPlan::Aggregate(AggregateNode {
             input: Box::new(current),
             group_by: select.group_by,
@@ -672,7 +680,7 @@ fn plan_select_scoped(
             already_pushed: false,
             required_output_columns: None,
         });
-        if let Some(having) = select.having {
+        if let Some(having) = rewritten_having {
             current = LogicalPlan::Filter(FilterNode {
                 input: Box::new(current),
                 predicate: having,
@@ -680,14 +688,9 @@ fn plan_select_scoped(
             });
         }
 
-        current = build_window_and_project(current, project_items, &select.projection, factory)?;
+        current = build_window_and_project(current, project_items, factory)?;
     } else {
-        current = build_window_and_project(
-            current,
-            select.projection.clone(),
-            &select.projection,
-            factory,
-        )?;
+        current = build_window_and_project(current, select.projection.clone(), factory)?;
     }
 
     // SELECT DISTINCT → Aggregate on all output columns (deduplication)
@@ -703,6 +706,7 @@ fn prepare_repeat_input(
     select: &mut ResolvedSelect,
     repeat_info: &mut crate::sql::analysis::RepeatInfo,
     repeat_group_qualifier: &str,
+    factory: &mut ColumnRefFactory,
 ) -> Vec<(String, String)> {
     let grouping_key_aliases: Vec<(String, String)> = repeat_info
         .all_rollup_columns
@@ -743,6 +747,9 @@ fn prepare_repeat_input(
     // display name so a later pass can rewrite projection / having
     // occurrences of the same expression to a ColumnRef on the alias.
     let mut substitutions: Vec<(String, TypedExpr)> = Vec::new();
+    let mut repeat_key_ids_by_name: std::collections::HashMap<String, ColumnId> =
+        std::collections::HashMap::new();
+    let mut all_rollup_column_ids = Vec::with_capacity(grouping_key_aliases.len());
     for (idx, (_, alias_name)) in grouping_key_aliases.iter().enumerate() {
         let Some(source_expr) = select.group_by.get(idx).cloned() else {
             continue;
@@ -750,6 +757,18 @@ fn prepare_repeat_input(
         let data_type = source_expr.data_type.clone();
         let nullable = source_expr.nullable;
         let original_display = typed_expr_display_name(&source_expr);
+        let materialized_column_id =
+            if let ExprKind::ColumnRef { column_id, .. } = &source_expr.kind {
+                *column_id
+            } else {
+                factory.create(None, alias_name.clone(), data_type.clone(), nullable)
+            };
+        if let Some((original_name, _)) = grouping_key_aliases.get(idx) {
+            repeat_key_ids_by_name
+                .insert(original_name.to_ascii_lowercase(), materialized_column_id);
+        }
+        repeat_key_ids_by_name.insert(alias_name.to_ascii_lowercase(), materialized_column_id);
+        all_rollup_column_ids.push(materialized_column_id);
 
         // Substitute downstream references to the original expression with a
         // ColumnRef on the alias. For the ColumnRef case the existing
@@ -772,7 +791,7 @@ fn prepare_repeat_input(
             },
             _ => TypedExpr {
                 kind: ExprKind::ColumnRef {
-                    column_id: ColumnId::UNSET,
+                    column_id: materialized_column_id,
                     qualifier: None,
                     column: alias_name.clone(),
                 },
@@ -782,17 +801,42 @@ fn prepare_repeat_input(
         };
         substitutions.push((original_display, replacement));
 
-        let output_column_id = if let ExprKind::ColumnRef { column_id, .. } = &source_expr.kind {
-            *column_id
-        } else {
-            ColumnId::UNSET
-        };
         project_items.push(ProjectItem {
             expr: source_expr,
             output_name: alias_name.clone(),
-            output_column_id,
+            output_column_id: materialized_column_id,
         });
     }
+
+    repeat_info.repeat_column_ref_ids = repeat_info
+        .repeat_column_ref_list
+        .iter()
+        .map(|non_null_cols| {
+            non_null_cols
+                .iter()
+                .filter_map(|col| {
+                    repeat_key_ids_by_name
+                        .get(&col.to_ascii_lowercase())
+                        .copied()
+                })
+                .collect()
+        })
+        .collect();
+    repeat_info.all_rollup_column_ids = all_rollup_column_ids;
+    repeat_info.grouping_fn_arg_ids = repeat_info
+        .grouping_fn_args
+        .iter()
+        .map(|(_, arg_cols)| {
+            arg_cols
+                .iter()
+                .filter_map(|col| {
+                    repeat_key_ids_by_name
+                        .get(&col.to_ascii_lowercase())
+                        .copied()
+                })
+                .collect()
+        })
+        .collect();
 
     *current = LogicalPlan::Project(ProjectNode {
         input: Box::new(current.clone()),
@@ -1048,27 +1092,13 @@ fn build_distinct(
 fn build_window_and_project(
     input: LogicalPlan,
     project_items: Vec<ProjectItem>,
-    original_projection: &[ProjectItem],
     factory: &mut ColumnRefFactory,
 ) -> Result<LogicalPlan, String> {
     let has_window = project_items.iter().any(|item| has_window_call(&item.expr));
     if has_window {
-        let (window_exprs, rewritten_items) = extract_window_calls(&project_items);
-        let mut output_columns = Vec::new();
-        for item in original_projection {
-            output_columns.push(OutputColumn {
-                column_id: factory.create(
-                    None,
-                    item.output_name.clone(),
-                    item.expr.data_type.clone(),
-                    item.expr.nullable,
-                ),
-                name: item.output_name.clone(),
-                data_type: item.expr.data_type.clone(),
-                nullable: item.expr.nullable,
-                is_internal: false,
-            });
-        }
+        let mut output_columns = plan_output_columns(&input)?;
+        let (window_exprs, rewritten_items) =
+            extract_window_calls(&project_items, &mut output_columns, factory);
         // The analytic operator requires input sorted by (partition_by, order_by).
         // Insert a Sort node before the Window node using the first window
         // function's sort keys.  When window functions have different
@@ -1296,16 +1326,28 @@ fn normalize_window_frame_for_be(
 /// Returns (window_exprs, rewritten_projection_items).
 /// Each window call is replaced with a ColumnRef to its output name.
 /// Window calls may be nested inside expressions (e.g., `sum(x) * 100 / sum(sum(x)) OVER (...)`).
-fn extract_window_calls(items: &[ProjectItem]) -> (Vec<WindowExpr>, Vec<ProjectItem>) {
+fn extract_window_calls(
+    items: &[ProjectItem],
+    output_columns: &mut Vec<OutputColumn>,
+    factory: &mut ColumnRefFactory,
+) -> (Vec<WindowExpr>, Vec<ProjectItem>) {
     let mut window_exprs = Vec::new();
     let mut rewritten = Vec::new();
-    let mut counter = 0usize;
 
     for item in items {
         if has_window_call(&item.expr) {
+            let mut counter = 0usize;
+            let mut output_ids = WindowOutputIdAllocator {
+                factory,
+                output_columns,
+                visible_output_column_id: item.output_column_id,
+                reuse_visible_output_id: is_exact_window_call(&item.expr),
+                visible_output_id_used: false,
+            };
             let new_expr = rewrite_window_calls(
                 &item.expr,
                 &item.output_name,
+                &mut output_ids,
                 &mut window_exprs,
                 &mut counter,
             );
@@ -1322,11 +1364,51 @@ fn extract_window_calls(items: &[ProjectItem]) -> (Vec<WindowExpr>, Vec<ProjectI
     (window_exprs, rewritten)
 }
 
+struct WindowOutputIdAllocator<'a> {
+    factory: &'a mut ColumnRefFactory,
+    output_columns: &'a mut Vec<OutputColumn>,
+    visible_output_column_id: ColumnId,
+    reuse_visible_output_id: bool,
+    visible_output_id_used: bool,
+}
+
+impl WindowOutputIdAllocator<'_> {
+    fn allocate(&mut self, output_name: &str, data_type: DataType, nullable: bool) -> ColumnId {
+        let reuse_visible_output_id = self.reuse_visible_output_id
+            && !self.visible_output_id_used
+            && self.visible_output_column_id != ColumnId::UNSET;
+        let column_id = if reuse_visible_output_id {
+            self.visible_output_id_used = true;
+            self.visible_output_column_id
+        } else {
+            self.factory
+                .create(None, output_name.to_string(), data_type.clone(), nullable)
+        };
+        self.output_columns.push(OutputColumn {
+            column_id,
+            name: output_name.to_string(),
+            data_type,
+            nullable,
+            is_internal: !reuse_visible_output_id,
+        });
+        column_id
+    }
+}
+
+fn is_exact_window_call(expr: &TypedExpr) -> bool {
+    match &expr.kind {
+        ExprKind::WindowCall { .. } => true,
+        ExprKind::Nested(inner) => is_exact_window_call(inner),
+        _ => false,
+    }
+}
+
 /// Recursively rewrite an expression tree, replacing each WindowCall node
 /// with a ColumnRef that points to the window function's output column.
 fn rewrite_window_calls(
     expr: &TypedExpr,
     base_name: &str,
+    output_ids: &mut WindowOutputIdAllocator<'_>,
     window_exprs: &mut Vec<WindowExpr>,
     counter: &mut usize,
 ) -> TypedExpr {
@@ -1360,6 +1442,8 @@ fn rewrite_window_calls(
             // "first" vs "last".
             let (rewritten_name, rewritten_order_by, rewritten_frame) =
                 normalize_window_frame_for_be(name, order_by.clone(), window_frame.clone());
+            let output_column_id =
+                output_ids.allocate(&win_output_name, expr.data_type.clone(), expr.nullable);
 
             window_exprs.push(WindowExpr {
                 name: rewritten_name,
@@ -1370,11 +1454,12 @@ fn rewrite_window_calls(
                 window_frame: rewritten_frame,
                 result_type: expr.data_type.clone(),
                 output_name: win_output_name.clone(),
+                output_column_id,
                 ignore_nulls: *ignore_nulls,
             });
             TypedExpr {
                 kind: ExprKind::ColumnRef {
-                    column_id: ColumnId::UNSET,
+                    column_id: output_column_id,
                     qualifier: None,
                     column: win_output_name,
                 },
@@ -1384,11 +1469,18 @@ fn rewrite_window_calls(
         }
         ExprKind::BinaryOp { left, right, op } => TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(rewrite_window_calls(left, base_name, window_exprs, counter)),
+                left: Box::new(rewrite_window_calls(
+                    left,
+                    base_name,
+                    output_ids,
+                    window_exprs,
+                    counter,
+                )),
                 op: *op,
                 right: Box::new(rewrite_window_calls(
                     right,
                     base_name,
+                    output_ids,
                     window_exprs,
                     counter,
                 )),
@@ -1402,6 +1494,7 @@ fn rewrite_window_calls(
                 expr: Box::new(rewrite_window_calls(
                     inner,
                     base_name,
+                    output_ids,
                     window_exprs,
                     counter,
                 )),
@@ -1418,7 +1511,9 @@ fn rewrite_window_calls(
                 name: name.clone(),
                 args: args
                     .iter()
-                    .map(|arg| rewrite_window_calls(arg, base_name, window_exprs, counter))
+                    .map(|arg| {
+                        rewrite_window_calls(arg, base_name, output_ids, window_exprs, counter)
+                    })
                     .collect(),
                 distinct: *distinct,
             },
@@ -1435,13 +1530,21 @@ fn rewrite_window_calls(
                 name: name.clone(),
                 args: args
                     .iter()
-                    .map(|arg| rewrite_window_calls(arg, base_name, window_exprs, counter))
+                    .map(|arg| {
+                        rewrite_window_calls(arg, base_name, output_ids, window_exprs, counter)
+                    })
                     .collect(),
                 distinct: *distinct,
                 order_by: order_by
                     .iter()
                     .map(|item| SortItem {
-                        expr: rewrite_window_calls(&item.expr, base_name, window_exprs, counter),
+                        expr: rewrite_window_calls(
+                            &item.expr,
+                            base_name,
+                            output_ids,
+                            window_exprs,
+                            counter,
+                        ),
                         asc: item.asc,
                         nulls_first: item.nulls_first,
                     })
@@ -1458,6 +1561,7 @@ fn rewrite_window_calls(
                 expr: Box::new(rewrite_window_calls(
                     inner,
                     base_name,
+                    output_ids,
                     window_exprs,
                     counter,
                 )),
@@ -1474,6 +1578,7 @@ fn rewrite_window_calls(
                 expr: Box::new(rewrite_window_calls(
                     inner,
                     base_name,
+                    output_ids,
                     window_exprs,
                     counter,
                 )),
@@ -1491,12 +1596,15 @@ fn rewrite_window_calls(
                 expr: Box::new(rewrite_window_calls(
                     inner,
                     base_name,
+                    output_ids,
                     window_exprs,
                     counter,
                 )),
                 list: list
                     .iter()
-                    .map(|item| rewrite_window_calls(item, base_name, window_exprs, counter))
+                    .map(|item| {
+                        rewrite_window_calls(item, base_name, output_ids, window_exprs, counter)
+                    })
                     .collect(),
                 negated: *negated,
             },
@@ -1513,11 +1621,24 @@ fn rewrite_window_calls(
                 expr: Box::new(rewrite_window_calls(
                     inner,
                     base_name,
+                    output_ids,
                     window_exprs,
                     counter,
                 )),
-                low: Box::new(rewrite_window_calls(low, base_name, window_exprs, counter)),
-                high: Box::new(rewrite_window_calls(high, base_name, window_exprs, counter)),
+                low: Box::new(rewrite_window_calls(
+                    low,
+                    base_name,
+                    output_ids,
+                    window_exprs,
+                    counter,
+                )),
+                high: Box::new(rewrite_window_calls(
+                    high,
+                    base_name,
+                    output_ids,
+                    window_exprs,
+                    counter,
+                )),
                 negated: *negated,
             },
             data_type: expr.data_type.clone(),
@@ -1532,12 +1653,14 @@ fn rewrite_window_calls(
                 expr: Box::new(rewrite_window_calls(
                     inner,
                     base_name,
+                    output_ids,
                     window_exprs,
                     counter,
                 )),
                 pattern: Box::new(rewrite_window_calls(
                     pattern,
                     base_name,
+                    output_ids,
                     window_exprs,
                     counter,
                 )),
@@ -1556,6 +1679,7 @@ fn rewrite_window_calls(
                     Box::new(rewrite_window_calls(
                         inner,
                         base_name,
+                        output_ids,
                         window_exprs,
                         counter,
                     ))
@@ -1564,8 +1688,20 @@ fn rewrite_window_calls(
                     .iter()
                     .map(|(when, then)| {
                         (
-                            rewrite_window_calls(when, base_name, window_exprs, counter),
-                            rewrite_window_calls(then, base_name, window_exprs, counter),
+                            rewrite_window_calls(
+                                when,
+                                base_name,
+                                output_ids,
+                                window_exprs,
+                                counter,
+                            ),
+                            rewrite_window_calls(
+                                then,
+                                base_name,
+                                output_ids,
+                                window_exprs,
+                                counter,
+                            ),
                         )
                     })
                     .collect(),
@@ -1573,6 +1709,7 @@ fn rewrite_window_calls(
                     Box::new(rewrite_window_calls(
                         inner,
                         base_name,
+                        output_ids,
                         window_exprs,
                         counter,
                     ))
@@ -1590,6 +1727,7 @@ fn rewrite_window_calls(
                 expr: Box::new(rewrite_window_calls(
                     inner,
                     base_name,
+                    output_ids,
                     window_exprs,
                     counter,
                 )),
@@ -1603,6 +1741,7 @@ fn rewrite_window_calls(
             kind: ExprKind::Nested(Box::new(rewrite_window_calls(
                 inner,
                 base_name,
+                output_ids,
                 window_exprs,
                 counter,
             ))),
@@ -1625,65 +1764,621 @@ fn split_projection_for_aggregate(
     group_by: &[TypedExpr],
     having: Option<&TypedExpr>,
     factory: &mut ColumnRefFactory,
-) -> (Vec<ProjectItem>, Vec<AggregateCall>, Vec<OutputColumn>) {
+) -> (
+    Vec<ProjectItem>,
+    Vec<AggregateCall>,
+    Vec<OutputColumn>,
+    Option<TypedExpr>,
+) {
     let mut agg_calls = Vec::new();
-    let mut output_columns = Vec::new();
-    let mut project_items = Vec::with_capacity(projection.len());
 
-    // Collect aggregate calls from projection
     for item in projection {
-        collect_aggregates(&item.expr, &mut agg_calls);
-        output_columns.push(OutputColumn {
-            column_id: expr_column_id(&item.expr, &item.output_name, factory),
-            name: item.output_name.clone(),
-            data_type: item.expr.data_type.clone(),
-            nullable: item.expr.nullable,
-            is_internal: false,
-        });
-        project_items.push(ProjectItem {
-            expr: rewrite_exact_group_by_expr_ref(&item.expr, group_by),
-            output_name: item.output_name.clone(),
-            output_column_id: item.output_column_id,
-        });
+        collect_aggregates(&item.expr, &mut agg_calls, factory);
     }
 
     // Also collect aggregate calls from HAVING clause so the aggregate node
     // computes them even when they don't appear in SELECT.
     if let Some(having_expr) = having {
-        collect_aggregates(having_expr, &mut agg_calls);
+        collect_aggregates(having_expr, &mut agg_calls, factory);
     }
 
-    (project_items, agg_calls, output_columns)
+    let mut output_columns = Vec::with_capacity(group_by.len() + agg_calls.len());
+    let mut group_by_rewrite_targets = Vec::new();
+    for gb in group_by {
+        let output_column = group_by_output_column(gb, projection, factory);
+        group_by_rewrite_targets.push(GroupByRewriteTarget {
+            expr: gb.clone(),
+            column_id: output_column.column_id,
+            display_name: typed_expr_display_name(gb),
+        });
+        output_columns.push(output_column);
+    }
+    output_columns.extend(agg_calls.iter().map(|call| {
+        let name = crate::sql::codegen::helpers::agg_call_display_name(call);
+        OutputColumn {
+            column_id: call.output_column_id,
+            name,
+            data_type: call.result_type.clone(),
+            nullable: true,
+            is_internal: false,
+        }
+    }));
+
+    let project_items = projection
+        .iter()
+        .map(|item| {
+            let expr = rewrite_agg_calls_to_refs(&item.expr, &agg_calls);
+            let expr = rewrite_group_by_expr_refs(&expr, &group_by_rewrite_targets);
+            ProjectItem {
+                expr,
+                output_name: item.output_name.clone(),
+                output_column_id: item.output_column_id,
+            }
+        })
+        .collect();
+    let rewritten_having = having.map(|expr| {
+        let expr = rewrite_agg_calls_to_refs(expr, &agg_calls);
+        rewrite_group_by_expr_refs(&expr, &group_by_rewrite_targets)
+    });
+
+    (project_items, agg_calls, output_columns, rewritten_having)
 }
 
-fn rewrite_exact_group_by_expr_ref(expr: &TypedExpr, group_by: &[TypedExpr]) -> TypedExpr {
-    let expr_name = typed_expr_display_name(expr);
-    for gb in group_by {
-        if typed_expr_display_name(gb) == expr_name {
-            // Reuse the group-by expression's ColumnId if it is a ColumnRef.
-            let cid = if let ExprKind::ColumnRef { column_id, .. } = &gb.kind {
-                *column_id
-            } else if let ExprKind::ColumnRef { column_id, .. } = &expr.kind {
-                *column_id
-            } else {
-                ColumnId::UNSET
-            };
+fn group_by_output_column(
+    group_by: &TypedExpr,
+    projection: &[ProjectItem],
+    factory: &mut ColumnRefFactory,
+) -> OutputColumn {
+    let matching_projection = projection
+        .iter()
+        .find(|item| typed_expr_semantically_eq(&item.expr, group_by));
+    if let Some(item) = matching_projection {
+        return OutputColumn {
+            column_id: expr_column_id(&item.expr, &item.output_name, factory),
+            name: item.output_name.clone(),
+            data_type: item.expr.data_type.clone(),
+            nullable: item.expr.nullable,
+            is_internal: false,
+        };
+    }
+
+    let name = typed_expr_display_name(group_by);
+    OutputColumn {
+        column_id: expr_column_id(group_by, &name, factory),
+        name,
+        data_type: group_by.data_type.clone(),
+        nullable: group_by.nullable,
+        is_internal: true,
+    }
+}
+
+#[derive(Clone)]
+struct GroupByRewriteTarget {
+    expr: TypedExpr,
+    column_id: ColumnId,
+    display_name: String,
+}
+
+fn rewrite_agg_calls_to_refs(expr: &TypedExpr, agg_calls: &[AggregateCall]) -> TypedExpr {
+    if let ExprKind::AggregateCall {
+        name,
+        args,
+        distinct,
+        order_by,
+    } = &expr.kind
+        && let Some(call) = agg_calls
+            .iter()
+            .find(|call| aggregate_call_matches(call, name, args, *distinct, order_by))
+    {
+        let display = crate::sql::codegen::helpers::agg_call_display_name_from_parts(
+            name, args, *distinct, order_by,
+        );
+        return TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: call.output_column_id,
+                qualifier: None,
+                column: display,
+            },
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+        };
+    }
+    rewrite_expr_children(expr, |child| rewrite_agg_calls_to_refs(child, agg_calls))
+}
+
+fn rewrite_group_by_expr_refs(expr: &TypedExpr, targets: &[GroupByRewriteTarget]) -> TypedExpr {
+    for target in targets {
+        if typed_expr_semantically_eq(expr, &target.expr) {
             return TypedExpr {
                 kind: ExprKind::ColumnRef {
-                    column_id: cid,
+                    column_id: target.column_id,
                     qualifier: None,
-                    column: expr_name,
+                    column: target.display_name.clone(),
                 },
-                data_type: gb.data_type.clone(),
-                nullable: gb.nullable,
+                data_type: expr.data_type.clone(),
+                nullable: expr.nullable,
             };
         }
     }
-    expr.clone()
+    rewrite_expr_children(expr, |child| rewrite_group_by_expr_refs(child, targets))
+}
+
+fn rewrite_expr_children(
+    expr: &TypedExpr,
+    mut rewrite_child: impl FnMut(&TypedExpr) -> TypedExpr,
+) -> TypedExpr {
+    let kind = match &expr.kind {
+        ExprKind::BinaryOp { left, op, right } => ExprKind::BinaryOp {
+            left: Box::new(rewrite_child(left)),
+            op: *op,
+            right: Box::new(rewrite_child(right)),
+        },
+        ExprKind::UnaryOp { op, expr: inner } => ExprKind::UnaryOp {
+            op: *op,
+            expr: Box::new(rewrite_child(inner)),
+        },
+        ExprKind::FunctionCall {
+            name,
+            args,
+            distinct,
+        } => ExprKind::FunctionCall {
+            name: name.clone(),
+            args: args.iter().map(&mut rewrite_child).collect(),
+            distinct: *distinct,
+        },
+        ExprKind::LambdaFunction { params, body } => ExprKind::LambdaFunction {
+            params: params.clone(),
+            body: Box::new(rewrite_child(body)),
+        },
+        ExprKind::Cast {
+            expr: inner,
+            target,
+        } => ExprKind::Cast {
+            expr: Box::new(rewrite_child(inner)),
+            target: target.clone(),
+        },
+        ExprKind::IsNull {
+            expr: inner,
+            negated,
+        } => ExprKind::IsNull {
+            expr: Box::new(rewrite_child(inner)),
+            negated: *negated,
+        },
+        ExprKind::InList {
+            expr: inner,
+            list,
+            negated,
+        } => ExprKind::InList {
+            expr: Box::new(rewrite_child(inner)),
+            list: list.iter().map(&mut rewrite_child).collect(),
+            negated: *negated,
+        },
+        ExprKind::Between {
+            expr: inner,
+            low,
+            high,
+            negated,
+        } => ExprKind::Between {
+            expr: Box::new(rewrite_child(inner)),
+            low: Box::new(rewrite_child(low)),
+            high: Box::new(rewrite_child(high)),
+            negated: *negated,
+        },
+        ExprKind::Like {
+            expr: inner,
+            pattern,
+            negated,
+        } => ExprKind::Like {
+            expr: Box::new(rewrite_child(inner)),
+            pattern: Box::new(rewrite_child(pattern)),
+            negated: *negated,
+        },
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => ExprKind::Case {
+            operand: operand
+                .as_ref()
+                .map(|operand| Box::new(rewrite_child(operand))),
+            when_then: when_then
+                .iter()
+                .map(|(when, then)| (rewrite_child(when), rewrite_child(then)))
+                .collect(),
+            else_expr: else_expr
+                .as_ref()
+                .map(|else_expr| Box::new(rewrite_child(else_expr))),
+        },
+        ExprKind::IsTruthValue {
+            expr: inner,
+            value,
+            negated,
+        } => ExprKind::IsTruthValue {
+            expr: Box::new(rewrite_child(inner)),
+            value: *value,
+            negated: *negated,
+        },
+        ExprKind::Nested(inner) => ExprKind::Nested(Box::new(rewrite_child(inner))),
+        ExprKind::WindowCall {
+            name,
+            args,
+            distinct,
+            partition_by,
+            order_by,
+            window_frame,
+            ignore_nulls,
+        } => ExprKind::WindowCall {
+            name: name.clone(),
+            args: args.iter().map(&mut rewrite_child).collect(),
+            distinct: *distinct,
+            partition_by: partition_by.iter().map(&mut rewrite_child).collect(),
+            order_by: order_by
+                .iter()
+                .map(|item| SortItem {
+                    expr: rewrite_child(&item.expr),
+                    asc: item.asc,
+                    nulls_first: item.nulls_first,
+                })
+                .collect(),
+            window_frame: window_frame.clone(),
+            ignore_nulls: *ignore_nulls,
+        },
+        ExprKind::Lambda { params, body } => ExprKind::Lambda {
+            params: params.clone(),
+            body: Box::new(rewrite_child(body)),
+        },
+        ExprKind::AggregateCall { .. }
+        | ExprKind::ColumnRef { .. }
+        | ExprKind::LambdaParamRef { .. }
+        | ExprKind::Literal(_)
+        | ExprKind::SubqueryPlaceholder { .. } => return expr.clone(),
+    };
+    TypedExpr {
+        kind,
+        data_type: expr.data_type.clone(),
+        nullable: expr.nullable,
+    }
+}
+
+fn aggregate_call_matches(
+    call: &AggregateCall,
+    name: &str,
+    args: &[TypedExpr],
+    distinct: bool,
+    order_by: &[SortItem],
+) -> bool {
+    call.name == name
+        && call.distinct == distinct
+        && call.args.len() == args.len()
+        && call.order_by.len() == order_by.len()
+        && call
+            .args
+            .iter()
+            .zip(args.iter())
+            .all(|(left, right)| typed_expr_semantically_eq(left, right))
+        && call
+            .order_by
+            .iter()
+            .zip(order_by.iter())
+            .all(|(left, right)| sort_item_semantically_eq(left, right))
+}
+
+fn typed_expr_semantically_eq(left: &TypedExpr, right: &TypedExpr) -> bool {
+    match (&left.kind, &right.kind) {
+        (
+            ExprKind::ColumnRef {
+                column_id: left_id,
+                qualifier: left_qualifier,
+                column: left_column,
+            },
+            ExprKind::ColumnRef {
+                column_id: right_id,
+                qualifier: right_qualifier,
+                column: right_column,
+            },
+        ) => {
+            if *left_id != ColumnId::UNSET && *right_id != ColumnId::UNSET {
+                left_id == right_id
+            } else {
+                left_qualifier.as_ref().map(|q| q.to_lowercase())
+                    == right_qualifier.as_ref().map(|q| q.to_lowercase())
+                    && left_column.eq_ignore_ascii_case(right_column)
+            }
+        }
+        (
+            ExprKind::LambdaParamRef {
+                name: left_name,
+                slot_id: left_slot,
+            },
+            ExprKind::LambdaParamRef {
+                name: right_name,
+                slot_id: right_slot,
+            },
+        ) => left_slot == right_slot && left_name.eq_ignore_ascii_case(right_name),
+        (ExprKind::Literal(left), ExprKind::Literal(right)) => left == right,
+        (
+            ExprKind::BinaryOp {
+                left: left_left,
+                op: left_op,
+                right: left_right,
+            },
+            ExprKind::BinaryOp {
+                left: right_left,
+                op: right_op,
+                right: right_right,
+            },
+        ) => {
+            left_op == right_op
+                && typed_expr_semantically_eq(left_left, right_left)
+                && typed_expr_semantically_eq(left_right, right_right)
+        }
+        (
+            ExprKind::UnaryOp {
+                op: left_op,
+                expr: left_expr,
+            },
+            ExprKind::UnaryOp {
+                op: right_op,
+                expr: right_expr,
+            },
+        ) => left_op == right_op && typed_expr_semantically_eq(left_expr, right_expr),
+        (
+            ExprKind::FunctionCall {
+                name: left_name,
+                args: left_args,
+                distinct: left_distinct,
+            },
+            ExprKind::FunctionCall {
+                name: right_name,
+                args: right_args,
+                distinct: right_distinct,
+            },
+        ) => {
+            left_name.eq_ignore_ascii_case(right_name)
+                && left_distinct == right_distinct
+                && typed_expr_slices_semantically_eq(left_args, right_args)
+        }
+        (
+            ExprKind::LambdaFunction {
+                params: left_params,
+                body: left_body,
+            },
+            ExprKind::LambdaFunction {
+                params: right_params,
+                body: right_body,
+            },
+        ) => {
+            left_params.len() == right_params.len()
+                && typed_expr_semantically_eq(left_body, right_body)
+        }
+        (
+            ExprKind::AggregateCall {
+                name: left_name,
+                args: left_args,
+                distinct: left_distinct,
+                order_by: left_order_by,
+            },
+            ExprKind::AggregateCall {
+                name: right_name,
+                args: right_args,
+                distinct: right_distinct,
+                order_by: right_order_by,
+            },
+        ) => {
+            left_name.eq_ignore_ascii_case(right_name)
+                && left_distinct == right_distinct
+                && typed_expr_slices_semantically_eq(left_args, right_args)
+                && sort_item_slices_semantically_eq(left_order_by, right_order_by)
+        }
+        (
+            ExprKind::Cast {
+                expr: left_expr,
+                target: left_target,
+            },
+            ExprKind::Cast {
+                expr: right_expr,
+                target: right_target,
+            },
+        ) => left_target == right_target && typed_expr_semantically_eq(left_expr, right_expr),
+        (
+            ExprKind::IsNull {
+                expr: left_expr,
+                negated: left_negated,
+            },
+            ExprKind::IsNull {
+                expr: right_expr,
+                negated: right_negated,
+            },
+        ) => left_negated == right_negated && typed_expr_semantically_eq(left_expr, right_expr),
+        (
+            ExprKind::InList {
+                expr: left_expr,
+                list: left_list,
+                negated: left_negated,
+            },
+            ExprKind::InList {
+                expr: right_expr,
+                list: right_list,
+                negated: right_negated,
+            },
+        ) => {
+            left_negated == right_negated
+                && typed_expr_semantically_eq(left_expr, right_expr)
+                && typed_expr_slices_semantically_eq(left_list, right_list)
+        }
+        (
+            ExprKind::Between {
+                expr: left_expr,
+                low: left_low,
+                high: left_high,
+                negated: left_negated,
+            },
+            ExprKind::Between {
+                expr: right_expr,
+                low: right_low,
+                high: right_high,
+                negated: right_negated,
+            },
+        ) => {
+            left_negated == right_negated
+                && typed_expr_semantically_eq(left_expr, right_expr)
+                && typed_expr_semantically_eq(left_low, right_low)
+                && typed_expr_semantically_eq(left_high, right_high)
+        }
+        (
+            ExprKind::Like {
+                expr: left_expr,
+                pattern: left_pattern,
+                negated: left_negated,
+            },
+            ExprKind::Like {
+                expr: right_expr,
+                pattern: right_pattern,
+                negated: right_negated,
+            },
+        ) => {
+            left_negated == right_negated
+                && typed_expr_semantically_eq(left_expr, right_expr)
+                && typed_expr_semantically_eq(left_pattern, right_pattern)
+        }
+        (
+            ExprKind::Case {
+                operand: left_operand,
+                when_then: left_when_then,
+                else_expr: left_else,
+            },
+            ExprKind::Case {
+                operand: right_operand,
+                when_then: right_when_then,
+                else_expr: right_else,
+            },
+        ) => {
+            optional_typed_expr_semantically_eq(left_operand.as_deref(), right_operand.as_deref())
+                && left_when_then.len() == right_when_then.len()
+                && left_when_then.iter().zip(right_when_then.iter()).all(
+                    |((left_when, left_then), (right_when, right_then))| {
+                        typed_expr_semantically_eq(left_when, right_when)
+                            && typed_expr_semantically_eq(left_then, right_then)
+                    },
+                )
+                && optional_typed_expr_semantically_eq(left_else.as_deref(), right_else.as_deref())
+        }
+        (
+            ExprKind::IsTruthValue {
+                expr: left_expr,
+                value: left_value,
+                negated: left_negated,
+            },
+            ExprKind::IsTruthValue {
+                expr: right_expr,
+                value: right_value,
+                negated: right_negated,
+            },
+        ) => {
+            left_value == right_value
+                && left_negated == right_negated
+                && typed_expr_semantically_eq(left_expr, right_expr)
+        }
+        (ExprKind::Nested(left), ExprKind::Nested(right)) => {
+            typed_expr_semantically_eq(left, right)
+        }
+        (
+            ExprKind::WindowCall {
+                name: left_name,
+                args: left_args,
+                distinct: left_distinct,
+                partition_by: left_partition_by,
+                order_by: left_order_by,
+                window_frame: left_frame,
+                ignore_nulls: left_ignore_nulls,
+            },
+            ExprKind::WindowCall {
+                name: right_name,
+                args: right_args,
+                distinct: right_distinct,
+                partition_by: right_partition_by,
+                order_by: right_order_by,
+                window_frame: right_frame,
+                ignore_nulls: right_ignore_nulls,
+            },
+        ) => {
+            left_name.eq_ignore_ascii_case(right_name)
+                && left_distinct == right_distinct
+                && left_ignore_nulls == right_ignore_nulls
+                && format!("{left_frame:?}") == format!("{right_frame:?}")
+                && typed_expr_slices_semantically_eq(left_args, right_args)
+                && typed_expr_slices_semantically_eq(left_partition_by, right_partition_by)
+                && sort_item_slices_semantically_eq(left_order_by, right_order_by)
+        }
+        (
+            ExprKind::SubqueryPlaceholder {
+                id: left_id,
+                kind: left_kind,
+                data_type: left_type,
+            },
+            ExprKind::SubqueryPlaceholder {
+                id: right_id,
+                kind: right_kind,
+                data_type: right_type,
+            },
+        ) => {
+            left_id == right_id
+                && format!("{left_kind:?}") == format!("{right_kind:?}")
+                && left_type == right_type
+        }
+        (
+            ExprKind::Lambda {
+                params: left_params,
+                body: left_body,
+            },
+            ExprKind::Lambda {
+                params: right_params,
+                body: right_body,
+            },
+        ) => left_params == right_params && typed_expr_semantically_eq(left_body, right_body),
+        _ => false,
+    }
+}
+
+fn optional_typed_expr_semantically_eq(
+    left: Option<&TypedExpr>,
+    right: Option<&TypedExpr>,
+) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => typed_expr_semantically_eq(left, right),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn typed_expr_slices_semantically_eq(left: &[TypedExpr], right: &[TypedExpr]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(left, right)| typed_expr_semantically_eq(left, right))
+}
+
+fn sort_item_semantically_eq(left: &SortItem, right: &SortItem) -> bool {
+    left.asc == right.asc
+        && left.nulls_first == right.nulls_first
+        && typed_expr_semantically_eq(&left.expr, &right.expr)
+}
+
+fn sort_item_slices_semantically_eq(left: &[SortItem], right: &[SortItem]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(left, right)| sort_item_semantically_eq(left, right))
 }
 
 /// Recursively collect AggregateCall from a TypedExpr tree.
-fn collect_aggregates(expr: &TypedExpr, out: &mut Vec<AggregateCall>) {
+fn collect_aggregates(
+    expr: &TypedExpr,
+    out: &mut Vec<AggregateCall>,
+    factory: &mut ColumnRefFactory,
+) {
     match &expr.kind {
         ExprKind::AggregateCall {
             name,
@@ -1710,63 +2405,71 @@ fn collect_aggregates(expr: &TypedExpr, out: &mut Vec<AggregateCall>) {
                     })
             });
             if !already {
+                let display = crate::sql::codegen::helpers::agg_call_display_name_from_parts(
+                    name, args, *distinct, order_by,
+                );
+                let output_column_id =
+                    factory.create(None, display, expr.data_type.clone(), expr.nullable);
                 out.push(AggregateCall {
                     name: name.clone(),
                     args: args.clone(),
                     distinct: *distinct,
                     result_type: expr.data_type.clone(),
                     order_by: order_by.clone(),
+                    output_column_id,
                 });
             }
         }
         ExprKind::BinaryOp { left, right, .. } => {
-            collect_aggregates(left, out);
-            collect_aggregates(right, out);
+            collect_aggregates(left, out, factory);
+            collect_aggregates(right, out, factory);
         }
-        ExprKind::UnaryOp { expr: inner, .. } => collect_aggregates(inner, out),
+        ExprKind::UnaryOp { expr: inner, .. } => collect_aggregates(inner, out, factory),
         ExprKind::FunctionCall { args, .. } => {
             for arg in args {
-                collect_aggregates(arg, out);
+                collect_aggregates(arg, out, factory);
             }
         }
-        ExprKind::LambdaFunction { body, .. } => collect_aggregates(body, out),
-        ExprKind::Cast { expr: inner, .. } => collect_aggregates(inner, out),
+        ExprKind::LambdaFunction { body, .. } => collect_aggregates(body, out, factory),
+        ExprKind::Cast { expr: inner, .. } => collect_aggregates(inner, out, factory),
         ExprKind::Case {
             operand,
             when_then,
             else_expr,
         } => {
             if let Some(op) = operand {
-                collect_aggregates(op, out);
+                collect_aggregates(op, out, factory);
             }
             for (w, t) in when_then {
-                collect_aggregates(w, out);
-                collect_aggregates(t, out);
+                collect_aggregates(w, out, factory);
+                collect_aggregates(t, out, factory);
             }
             if let Some(e) = else_expr {
-                collect_aggregates(e, out);
+                collect_aggregates(e, out, factory);
             }
         }
-        ExprKind::IsNull { expr: inner, .. } => collect_aggregates(inner, out),
-        ExprKind::Nested(inner) => collect_aggregates(inner, out),
+        ExprKind::IsNull { expr: inner, .. } => collect_aggregates(inner, out, factory),
+        ExprKind::Nested(inner) => collect_aggregates(inner, out, factory),
         ExprKind::InList { expr, list, .. } => {
-            collect_aggregates(expr, out);
+            collect_aggregates(expr, out, factory);
             for item in list {
-                collect_aggregates(item, out);
+                collect_aggregates(item, out, factory);
             }
         }
         ExprKind::Between {
             expr, low, high, ..
         } => {
-            collect_aggregates(expr, out);
-            collect_aggregates(low, out);
-            collect_aggregates(high, out);
+            collect_aggregates(expr, out, factory);
+            collect_aggregates(low, out, factory);
+            collect_aggregates(high, out, factory);
         }
         ExprKind::Like { expr, pattern, .. } => {
-            collect_aggregates(expr, out);
-            collect_aggregates(pattern, out);
+            collect_aggregates(expr, out, factory);
+            collect_aggregates(pattern, out, factory);
         }
-        ExprKind::IsTruthValue { expr: inner, .. } => collect_aggregates(inner, out),
+        ExprKind::IsTruthValue { expr: inner, .. } => {
+            collect_aggregates(inner, out, factory);
+        }
         // Leaves
         ExprKind::ColumnRef { .. } | ExprKind::LambdaParamRef { .. } | ExprKind::Literal(_) => {}
         // Window calls themselves are not aggregates, but their args may
@@ -1779,13 +2482,13 @@ fn collect_aggregates(expr: &TypedExpr, out: &mut Vec<AggregateCall>) {
             ..
         } => {
             for arg in args {
-                collect_aggregates(arg, out);
+                collect_aggregates(arg, out, factory);
             }
             for expr in partition_by {
-                collect_aggregates(expr, out);
+                collect_aggregates(expr, out, factory);
             }
             for sort_item in order_by {
-                collect_aggregates(&sort_item.expr, out);
+                collect_aggregates(&sort_item.expr, out, factory);
             }
         }
         // SubqueryPlaceholder should be rewritten before reaching the planner
@@ -1810,6 +2513,14 @@ fn collect_non_agg_column_refs_inner(
     out: &mut Vec<TypedExpr>,
     inside_agg: bool,
 ) {
+    if !inside_agg
+        && group_by
+            .iter()
+            .any(|gb| typed_expr_semantically_eq(expr, gb))
+    {
+        return;
+    }
+
     match &expr.kind {
         ExprKind::AggregateCall { .. } => {
             // Don't recurse into aggregate calls — columns inside aggregates
@@ -1892,7 +2603,8 @@ fn plan_relation_scoped(
             // the rest of the plan (Window PARTITION BY, GROUP BY, ORDER BY,
             // join eq keys, etc.) from the scan output, and distribution
             // matching would fail.
-            let columns = scan
+            let base_len = scan.table.columns.len();
+            let mut columns: Vec<OutputColumn> = scan
                 .table
                 .columns
                 .iter()
@@ -1912,6 +2624,28 @@ fn plan_relation_scoped(
                     is_internal: false,
                 })
                 .collect();
+            for (meta_idx, c) in scan
+                .table
+                .iceberg_row_lineage_metadata_columns
+                .iter()
+                .enumerate()
+            {
+                let col_id_idx = base_len + meta_idx;
+                columns.push(OutputColumn {
+                    column_id: scan.column_ids.get(col_id_idx).copied().unwrap_or_else(|| {
+                        factory.create(
+                            scan.alias.as_ref().or(Some(&scan.table.name)).cloned(),
+                            c.name.clone(),
+                            c.data_type.clone(),
+                            c.nullable,
+                        )
+                    }),
+                    name: c.name.clone(),
+                    data_type: c.data_type.clone(),
+                    nullable: c.nullable,
+                    is_internal: false,
+                });
+            }
             Ok(LogicalPlan::Scan(ScanNode {
                 database: scan.database,
                 table: scan.table,
@@ -1984,6 +2718,7 @@ fn plan_relation_scoped(
             step: gs.step,
             column_name: gs.column_name,
             alias: gs.alias,
+            output_column_id: gs.output_column_id,
             required_output_columns: None,
         })),
         Relation::Unnest(_) => Err("UNNEST is currently supported only in LATERAL JOIN".into()),
@@ -2394,23 +3129,9 @@ fn plan_set_operation_scoped(
 
 fn plan_values(
     values: ResolvedValues,
-    factory: &mut ColumnRefFactory,
+    _factory: &mut ColumnRefFactory,
 ) -> Result<LogicalPlan, String> {
-    let columns = values
-        .column_types
-        .iter()
-        .enumerate()
-        .map(|(i, dt)| {
-            let name = format!("column_{}", i);
-            OutputColumn {
-                column_id: factory.create(None, name.clone(), dt.clone(), true),
-                name,
-                data_type: dt.clone(),
-                nullable: true,
-                is_internal: false,
-            }
-        })
-        .collect();
+    let columns = values.output_columns;
     Ok(LogicalPlan::Values(ValuesNode {
         rows: values.rows,
         columns,
@@ -2488,12 +3209,82 @@ mod tests {
                         table_id: 0,
                     },
                 }),
+                "t" => Ok(TableDef {
+                    name: "t".to_string(),
+                    columns: vec![
+                        ColumnDef {
+                            name: "a".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                            write_default: None,
+                            logical_type: None,
+                        },
+                        ColumnDef {
+                            name: "b".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: true,
+                            write_default: None,
+                            logical_type: None,
+                        },
+                    ],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 0,
+                    },
+                }),
+                "iv_orders" => Ok(TableDef {
+                    name: "iv_orders".to_string(),
+                    columns: vec![
+                        ColumnDef {
+                            name: "o_orderkey".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                            write_default: None,
+                            logical_type: None,
+                        },
+                        ColumnDef {
+                            name: "o_custkey".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                            write_default: None,
+                            logical_type: None,
+                        },
+                    ],
+                    iceberg_row_lineage_metadata_columns: vec![
+                        ColumnDef {
+                            name: "_row_id".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                            write_default: None,
+                            logical_type: None,
+                        },
+                        ColumnDef {
+                            name: "_last_updated_sequence_number".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                            write_default: None,
+                            logical_type: None,
+                        },
+                    ],
+                    source: ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 0,
+                    },
+                }),
                 other => Err(format!("unknown test table: {other}")),
             }
         }
     }
 
     fn parse_analyze_and_plan(sql: &str) -> Result<LogicalPlan, String> {
+        let (resolved, cte_registry, mut factory) = parse_analyze_query(sql)?;
+        plan_query(resolved, cte_registry, &mut factory)
+    }
+
+    fn parse_analyze_query(
+        sql: &str,
+    ) -> Result<(ResolvedQuery, CTERegistry, ColumnRefFactory), String> {
         let dialect = crate::sql::parser::dialect::StarRocksDialect;
         let mut ast =
             sqlparser::parser::Parser::parse_sql(&dialect, sql).map_err(|e| e.to_string())?;
@@ -2504,9 +3295,272 @@ mod tests {
             sqlparser::ast::Statement::Query(q) => q,
             _ => return Err("expected query".into()),
         };
-        let (resolved, cte_registry, mut factory) =
-            crate::sql::analyzer::analyze(&query, &TestCatalog, "default")?;
-        plan_query(resolved, cte_registry, &mut factory)
+        crate::sql::analyzer::analyze(&query, &TestCatalog, "default")
+    }
+
+    fn plan_test_query(sql: &str) -> LogicalPlan {
+        parse_analyze_and_plan(sql).expect("planner should succeed")
+    }
+
+    fn first_aggregate_calls(plan: &LogicalPlan) -> Vec<AggregateCall> {
+        fn visit(plan: &LogicalPlan) -> Option<Vec<AggregateCall>> {
+            match plan {
+                LogicalPlan::Aggregate(node) => Some(node.aggregates.clone()),
+                LogicalPlan::Filter(node) => visit(&node.input),
+                LogicalPlan::Project(node) => visit(&node.input),
+                LogicalPlan::Join(node) => visit(&node.left).or_else(|| visit(&node.right)),
+                LogicalPlan::Sort(node) => visit(&node.input),
+                LogicalPlan::Limit(node) => visit(&node.input),
+                LogicalPlan::Union(node) => node.inputs.iter().find_map(visit),
+                LogicalPlan::Intersect(node) => node.inputs.iter().find_map(visit),
+                LogicalPlan::Except(node) => node.inputs.iter().find_map(visit),
+                LogicalPlan::TableFunction(node) => visit(&node.input),
+                LogicalPlan::Window(node) => visit(&node.input),
+                LogicalPlan::Repeat(node) => visit(&node.input),
+                LogicalPlan::CTEAnchor(node) => {
+                    visit(&node.consumer).or_else(|| visit(&node.produce))
+                }
+                LogicalPlan::CTEProduce(node) => visit(&node.input),
+                LogicalPlan::Decode(node) => visit(&node.input),
+                LogicalPlan::AggregateStateMerge(node) => {
+                    visit(&node.old_input).or_else(|| visit(&node.delta_input))
+                }
+                LogicalPlan::Scan(_)
+                | LogicalPlan::Values(_)
+                | LogicalPlan::GenerateSeries(_)
+                | LogicalPlan::CTEConsume(_)
+                | LogicalPlan::ImvDelta(_)
+                | LogicalPlan::ImvVersion(_) => None,
+            }
+        }
+
+        visit(plan).unwrap_or_default()
+    }
+
+    fn root_project_over_aggregate(plan: &LogicalPlan) -> (&ProjectNode, &AggregateNode) {
+        let LogicalPlan::Project(project) = plan else {
+            panic!("expected Project root, got {plan:?}");
+        };
+        let LogicalPlan::Aggregate(aggregate) = project.input.as_ref() else {
+            panic!("expected Aggregate under Project, got {:?}", project.input);
+        };
+        (project, aggregate)
+    }
+
+    fn root_project_filter_aggregate(
+        plan: &LogicalPlan,
+    ) -> (&ProjectNode, &FilterNode, &AggregateNode) {
+        let LogicalPlan::Project(project) = plan else {
+            panic!("expected Project root, got {plan:?}");
+        };
+        let LogicalPlan::Filter(filter) = project.input.as_ref() else {
+            panic!("expected Filter under Project, got {:?}", project.input);
+        };
+        let LogicalPlan::Aggregate(aggregate) = filter.input.as_ref() else {
+            panic!("expected Aggregate under Filter, got {:?}", filter.input);
+        };
+        (project, filter, aggregate)
+    }
+
+    fn first_repeat_node(plan: &LogicalPlan) -> &RepeatPlanNode {
+        fn visit(plan: &LogicalPlan) -> Option<&RepeatPlanNode> {
+            match plan {
+                LogicalPlan::Repeat(node) => Some(node),
+                LogicalPlan::Filter(node) => visit(&node.input),
+                LogicalPlan::Project(node) => visit(&node.input),
+                LogicalPlan::Aggregate(node) => visit(&node.input),
+                LogicalPlan::Join(node) => visit(&node.left).or_else(|| visit(&node.right)),
+                LogicalPlan::Sort(node) => visit(&node.input),
+                LogicalPlan::Limit(node) => visit(&node.input),
+                LogicalPlan::Union(node) => node.inputs.iter().find_map(visit),
+                LogicalPlan::Intersect(node) => node.inputs.iter().find_map(visit),
+                LogicalPlan::Except(node) => node.inputs.iter().find_map(visit),
+                LogicalPlan::TableFunction(node) => visit(&node.input),
+                LogicalPlan::Window(node) => visit(&node.input),
+                LogicalPlan::CTEAnchor(node) => {
+                    visit(&node.consumer).or_else(|| visit(&node.produce))
+                }
+                LogicalPlan::CTEProduce(node) => visit(&node.input),
+                LogicalPlan::Decode(node) => visit(&node.input),
+                LogicalPlan::AggregateStateMerge(node) => {
+                    visit(&node.old_input).or_else(|| visit(&node.delta_input))
+                }
+                LogicalPlan::Scan(_)
+                | LogicalPlan::Values(_)
+                | LogicalPlan::GenerateSeries(_)
+                | LogicalPlan::CTEConsume(_)
+                | LogicalPlan::ImvDelta(_)
+                | LogicalPlan::ImvVersion(_) => None,
+            }
+        }
+
+        visit(plan).unwrap_or_else(|| panic!("missing Repeat node in {plan:?}"))
+    }
+
+    fn column_ref_id(expr: &TypedExpr) -> ColumnId {
+        let ExprKind::ColumnRef { column_id, .. } = &expr.kind else {
+            panic!("expected ColumnRef, got {:?}", expr.kind);
+        };
+        *column_id
+    }
+
+    fn root_project_over_window(plan: &LogicalPlan) -> (&ProjectNode, &WindowNode) {
+        let LogicalPlan::Project(project) = plan else {
+            panic!("expected Project root, got {plan:?}");
+        };
+        let LogicalPlan::Window(window) = project.input.as_ref() else {
+            panic!("expected Window under Project, got {:?}", project.input);
+        };
+        (project, window)
+    }
+
+    fn root_strip_sort_inner_project(
+        plan: &LogicalPlan,
+    ) -> (&ProjectNode, &SortNode, &ProjectNode) {
+        let LogicalPlan::Project(outer_proj) = plan else {
+            panic!("expected outer strip Project, got {plan:?}");
+        };
+        let LogicalPlan::Sort(sort) = outer_proj.input.as_ref() else {
+            panic!(
+                "expected Sort under outer Project, got {:?}",
+                outer_proj.input
+            );
+        };
+        let LogicalPlan::Project(inner_proj) = sort.input.as_ref() else {
+            panic!("expected inner Project under Sort, got {:?}", sort.input);
+        };
+        (outer_proj, sort, inner_proj)
+    }
+
+    fn binary_left_column_id(expr: &TypedExpr) -> ColumnId {
+        let ExprKind::BinaryOp { left, .. } = &expr.kind else {
+            panic!("expected BinaryOp, got {:?}", expr.kind);
+        };
+        let ExprKind::ColumnRef { column_id, .. } = &left.kind else {
+            panic!(
+                "expected BinaryOp left side to be ColumnRef, got {:?}",
+                left.kind
+            );
+        };
+        *column_id
+    }
+
+    fn first_window_exprs(plan: &LogicalPlan) -> Vec<WindowExpr> {
+        fn visit(plan: &LogicalPlan) -> Option<Vec<WindowExpr>> {
+            match plan {
+                LogicalPlan::Window(node) => Some(node.window_exprs.clone()),
+                LogicalPlan::Filter(node) => visit(&node.input),
+                LogicalPlan::Project(node) => visit(&node.input),
+                LogicalPlan::Aggregate(node) => visit(&node.input),
+                LogicalPlan::Join(node) => visit(&node.left).or_else(|| visit(&node.right)),
+                LogicalPlan::Sort(node) => visit(&node.input),
+                LogicalPlan::Limit(node) => visit(&node.input),
+                LogicalPlan::Union(node) => node.inputs.iter().find_map(visit),
+                LogicalPlan::Intersect(node) => node.inputs.iter().find_map(visit),
+                LogicalPlan::Except(node) => node.inputs.iter().find_map(visit),
+                LogicalPlan::TableFunction(node) => visit(&node.input),
+                LogicalPlan::Repeat(node) => visit(&node.input),
+                LogicalPlan::CTEAnchor(node) => {
+                    visit(&node.consumer).or_else(|| visit(&node.produce))
+                }
+                LogicalPlan::CTEProduce(node) => visit(&node.input),
+                LogicalPlan::Decode(node) => visit(&node.input),
+                LogicalPlan::AggregateStateMerge(node) => {
+                    visit(&node.old_input).or_else(|| visit(&node.delta_input))
+                }
+                LogicalPlan::Scan(_)
+                | LogicalPlan::Values(_)
+                | LogicalPlan::GenerateSeries(_)
+                | LogicalPlan::CTEConsume(_)
+                | LogicalPlan::ImvDelta(_)
+                | LogicalPlan::ImvVersion(_) => None,
+            }
+        }
+
+        visit(plan).unwrap_or_default()
+    }
+
+    fn first_window_output_columns(plan: &LogicalPlan) -> Vec<OutputColumn> {
+        fn visit(plan: &LogicalPlan) -> Option<Vec<OutputColumn>> {
+            match plan {
+                LogicalPlan::Window(node) => Some(node.output_columns.clone()),
+                LogicalPlan::Filter(node) => visit(&node.input),
+                LogicalPlan::Project(node) => visit(&node.input),
+                LogicalPlan::Aggregate(node) => visit(&node.input),
+                LogicalPlan::Join(node) => visit(&node.left).or_else(|| visit(&node.right)),
+                LogicalPlan::Sort(node) => visit(&node.input),
+                LogicalPlan::Limit(node) => visit(&node.input),
+                LogicalPlan::Union(node) => node.inputs.iter().find_map(visit),
+                LogicalPlan::Intersect(node) => node.inputs.iter().find_map(visit),
+                LogicalPlan::Except(node) => node.inputs.iter().find_map(visit),
+                LogicalPlan::TableFunction(node) => visit(&node.input),
+                LogicalPlan::Repeat(node) => visit(&node.input),
+                LogicalPlan::CTEAnchor(node) => {
+                    visit(&node.consumer).or_else(|| visit(&node.produce))
+                }
+                LogicalPlan::CTEProduce(node) => visit(&node.input),
+                LogicalPlan::Decode(node) => visit(&node.input),
+                LogicalPlan::AggregateStateMerge(node) => {
+                    visit(&node.old_input).or_else(|| visit(&node.delta_input))
+                }
+                LogicalPlan::Scan(_)
+                | LogicalPlan::Values(_)
+                | LogicalPlan::GenerateSeries(_)
+                | LogicalPlan::CTEConsume(_)
+                | LogicalPlan::ImvDelta(_)
+                | LogicalPlan::ImvVersion(_) => None,
+            }
+        }
+
+        visit(plan).unwrap_or_default()
+    }
+
+    fn assert_window_expr_ids_are_real_unique_and_backed_by_output_columns(plan: &LogicalPlan) {
+        let wins = first_window_exprs(plan);
+        let output_columns = first_window_output_columns(plan);
+        assert!(!wins.is_empty(), "expected at least one WindowExpr");
+
+        let output_ids = output_columns
+            .iter()
+            .map(|col| col.column_id)
+            .collect::<std::collections::HashSet<_>>();
+        let mut window_ids = std::collections::HashSet::new();
+        for w in &wins {
+            assert_ne!(
+                w.output_column_id,
+                crate::sql::column_id::ColumnId::UNSET,
+                "WindowExpr {} must carry a real output_column_id",
+                w.output_name
+            );
+            assert!(
+                window_ids.insert(w.output_column_id),
+                "WindowExpr {} reuses output_column_id {}",
+                w.output_name,
+                w.output_column_id
+            );
+            assert!(
+                output_ids.contains(&w.output_column_id),
+                "WindowExpr {} output_column_id {} missing from WindowNode.output_columns",
+                w.output_name,
+                w.output_column_id
+            );
+        }
+    }
+
+    fn window_expr_by_function_name<'a>(wins: &'a [WindowExpr], name: &str) -> &'a WindowExpr {
+        wins.iter()
+            .find(|w| w.name.eq_ignore_ascii_case(name))
+            .unwrap_or_else(|| panic!("missing WindowExpr function {name}"))
+    }
+
+    fn visible_output_column_by_name<'a>(
+        output_columns: &'a [OutputColumn],
+        name: &str,
+    ) -> &'a OutputColumn {
+        output_columns
+            .iter()
+            .find(|col| !col.is_internal && col.name == name)
+            .unwrap_or_else(|| panic!("missing visible Window output column {name}"))
     }
 
     fn strip_project_sort_limit(plan: &LogicalPlan) -> &LogicalPlan {
@@ -2809,6 +3863,407 @@ mod tests {
             }
             other => panic!("expected CTEAnchor, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn p1_aggregate_call_gets_output_column_id() {
+        let plan = plan_test_query("SELECT a, sum(b) AS s FROM t GROUP BY a");
+        let aggs = first_aggregate_calls(&plan);
+        assert!(!aggs.is_empty(), "expected at least one AggregateCall");
+        for call in &aggs {
+            assert_ne!(
+                call.output_column_id,
+                crate::sql::column_id::ColumnId::UNSET,
+                "AggregateCall {} must carry a real output_column_id",
+                call.name
+            );
+        }
+    }
+
+    #[test]
+    fn p1_aggregate_call_ids_deduplicate_repeated_calls() {
+        let plan = plan_test_query("SELECT sum(b) AS s1, count(b) AS c, sum(b) AS s2 FROM t");
+        let aggs = first_aggregate_calls(&plan);
+        assert_eq!(aggs.len(), 2, "expected repeated sum(b) to deduplicate");
+        assert_eq!(
+            aggs.iter()
+                .filter(|call| call.name.eq_ignore_ascii_case("sum"))
+                .count(),
+            1,
+            "expected exactly one sum(b) AggregateCall"
+        );
+        assert_eq!(
+            aggs.iter()
+                .filter(|call| call.name.eq_ignore_ascii_case("count"))
+                .count(),
+            1,
+            "expected one count(b) AggregateCall"
+        );
+
+        let ids = aggs
+            .iter()
+            .map(|call| {
+                assert_ne!(
+                    call.output_column_id,
+                    crate::sql::column_id::ColumnId::UNSET,
+                    "AggregateCall {} must carry a real output_column_id",
+                    call.name
+                );
+                call.output_column_id
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            ids.len(),
+            aggs.len(),
+            "distinct AggregateCalls must carry distinct output ids"
+        );
+    }
+
+    #[test]
+    fn p2_aggregate_projection_rewrites_agg_call_to_output_id_ref() {
+        let plan = plan_test_query("SELECT sum(b) + 1 AS s1 FROM t");
+        let (project, aggregate) = root_project_over_aggregate(&plan);
+        let sum_id = aggregate
+            .aggregates
+            .iter()
+            .find(|call| call.name.eq_ignore_ascii_case("sum"))
+            .expect("expected sum AggregateCall")
+            .output_column_id;
+        assert_ne!(
+            sum_id,
+            ColumnId::UNSET,
+            "AggregateCall must have a real output id"
+        );
+
+        let ExprKind::BinaryOp { left, .. } = &project.items[0].expr.kind else {
+            panic!(
+                "expected sum(b)+1 to remain a BinaryOp over the aggregate output, got {:?}",
+                project.items[0].expr.kind
+            );
+        };
+        let ExprKind::ColumnRef {
+            column_id, column, ..
+        } = &left.kind
+        else {
+            panic!(
+                "aggregate child in sum(b)+1 must be rewritten to ColumnRef, got {:?}",
+                left.kind
+            );
+        };
+        assert_eq!(
+            *column_id, sum_id,
+            "project expression must reference the AggregateCall output id"
+        );
+        assert_eq!(
+            column, "sum(b)",
+            "project aggregate ColumnRef must preserve the display name for the P2 fallback"
+        );
+    }
+
+    #[test]
+    fn p2_computed_group_key_rewrites_to_group_output_id() {
+        let plan = plan_test_query("SELECT a + 1 AS k, sum(b) AS s FROM t GROUP BY a + 1");
+        let (project, aggregate) = root_project_over_aggregate(&plan);
+        let group_output_id = aggregate
+            .output_columns
+            .iter()
+            .find(|col| col.name == "k")
+            .expect("expected aggregate output column for computed key")
+            .column_id;
+        assert_ne!(
+            group_output_id,
+            ColumnId::UNSET,
+            "computed group output column must have a real id"
+        );
+
+        let ExprKind::ColumnRef {
+            column_id, column, ..
+        } = &project.items[0].expr.kind
+        else {
+            panic!(
+                "computed group key projection must be rewritten to ColumnRef, got {:?}",
+                project.items[0].expr.kind
+            );
+        };
+        assert_eq!(
+            *column_id, group_output_id,
+            "computed group key projection must reference the Aggregate output id"
+        );
+        assert_eq!(
+            column, "a + 1",
+            "computed group key ColumnRef must preserve the group expression display name"
+        );
+    }
+
+    #[test]
+    fn p2_having_rewrites_agg_call_to_output_id_ref() {
+        let plan = plan_test_query("SELECT sum(b) AS s FROM t HAVING sum(b) > 10");
+        let (_project, filter, aggregate) = root_project_filter_aggregate(&plan);
+        let sum_id = aggregate
+            .aggregates
+            .iter()
+            .find(|call| call.name.eq_ignore_ascii_case("sum"))
+            .expect("expected sum AggregateCall")
+            .output_column_id;
+        assert_ne!(
+            sum_id,
+            ColumnId::UNSET,
+            "AggregateCall must have a real output id"
+        );
+
+        let ExprKind::BinaryOp { left, .. } = &filter.predicate.kind else {
+            panic!(
+                "expected HAVING sum(b)>10 to remain a BinaryOp over the aggregate output, got {:?}",
+                filter.predicate.kind
+            );
+        };
+        let ExprKind::ColumnRef {
+            column_id, column, ..
+        } = &left.kind
+        else {
+            panic!(
+                "aggregate child in HAVING must be rewritten to ColumnRef, got {:?}",
+                left.kind
+            );
+        };
+        assert_eq!(
+            *column_id, sum_id,
+            "HAVING predicate must reference the AggregateCall output id"
+        );
+        assert_eq!(
+            column, "sum(b)",
+            "HAVING aggregate ColumnRef must preserve the display name for the P2 fallback"
+        );
+    }
+
+    #[test]
+    fn p2_having_computed_group_key_does_not_append_leaf_group_by() {
+        let plan = plan_test_query(
+            "SELECT abs(a) AS k, sum(b) AS s FROM t GROUP BY abs(a) HAVING abs(a) > 1",
+        );
+        let (project, filter, aggregate) = root_project_filter_aggregate(&plan);
+        assert_eq!(
+            aggregate.group_by.len(),
+            1,
+            "HAVING group expression must not append its leaf column as an extra group key"
+        );
+        let group_output_id = aggregate
+            .output_columns
+            .iter()
+            .find(|col| col.name == "k")
+            .expect("expected aggregate output column for computed key")
+            .column_id;
+        assert_ne!(
+            group_output_id,
+            ColumnId::UNSET,
+            "computed group output column must have a real id"
+        );
+        let ExprKind::ColumnRef {
+            column_id, column, ..
+        } = &project.items[0].expr.kind
+        else {
+            panic!(
+                "computed group key projection must be rewritten to ColumnRef, got {:?}",
+                project.items[0].expr.kind
+            );
+        };
+        assert_eq!(
+            *column_id, group_output_id,
+            "computed group key projection must reference the Aggregate output id"
+        );
+        assert_eq!(
+            column, "abs(a)",
+            "computed group key ColumnRef must preserve the group expression display name"
+        );
+
+        let ExprKind::BinaryOp { left, .. } = &filter.predicate.kind else {
+            panic!(
+                "expected HAVING abs(a)>1 to remain a BinaryOp over the group key output, got {:?}",
+                filter.predicate.kind
+            );
+        };
+        let ExprKind::ColumnRef {
+            column_id, column, ..
+        } = &left.kind
+        else {
+            panic!(
+                "computed group key in HAVING must be rewritten to ColumnRef, got {:?}",
+                left.kind
+            );
+        };
+        assert_eq!(
+            *column_id, group_output_id,
+            "HAVING computed group key must reference the Aggregate output id"
+        );
+        assert_eq!(
+            column, "abs(a)",
+            "HAVING computed group key ColumnRef must preserve the group expression display name"
+        );
+    }
+
+    #[test]
+    fn p2_repeat_grouping_aggregate_outputs_follow_group_by_order() {
+        let plan = plan_test_query(
+            "SELECT grouping(a + 1) AS g, a + 1 AS k, count(*) AS cnt \
+             FROM t GROUP BY ROLLUP(a + 1)",
+        );
+        let (project, aggregate) = root_project_over_aggregate(&plan);
+        assert_eq!(
+            aggregate.group_by.len(),
+            2,
+            "ROLLUP with GROUPING() should group by repeat key and grouping marker"
+        );
+        let group_ids = aggregate
+            .group_by
+            .iter()
+            .map(column_ref_id)
+            .collect::<Vec<_>>();
+        let output_prefix_ids = aggregate
+            .output_columns
+            .iter()
+            .take(aggregate.group_by.len())
+            .map(|col| col.column_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            output_prefix_ids, group_ids,
+            "Aggregate output_columns prefix must match group_by physical output order"
+        );
+
+        let g_id = column_ref_id(&project.items[0].expr);
+        let k_id = column_ref_id(&project.items[1].expr);
+        assert_eq!(
+            g_id, group_ids[1],
+            "GROUPING() projection must bind to the grouping marker output"
+        );
+        assert_eq!(
+            k_id, group_ids[0],
+            "rollup key projection must bind to the repeat key output"
+        );
+    }
+
+    #[test]
+    fn p1_window_expr_gets_output_column_id() {
+        let plan =
+            plan_test_query("SELECT a, row_number() OVER (PARTITION BY a ORDER BY b) AS rn FROM t");
+        assert_window_expr_ids_are_real_unique_and_backed_by_output_columns(&plan);
+        let wins = first_window_exprs(&plan);
+        let output_columns = first_window_output_columns(&plan);
+        let rn = window_expr_by_function_name(&wins, "row_number");
+        let visible_rn = visible_output_column_by_name(&output_columns, "rn");
+        assert_eq!(
+            rn.output_column_id, visible_rn.column_id,
+            "single visible window projection must reuse the visible rn output id"
+        );
+    }
+
+    #[test]
+    fn p1_compound_window_exprs_get_distinct_output_column_ids() {
+        let plan = plan_test_query(
+            "SELECT row_number() OVER (ORDER BY a) + rank() OVER (ORDER BY b) AS x FROM t",
+        );
+        let wins = first_window_exprs(&plan);
+        let output_columns = first_window_output_columns(&plan);
+        assert_eq!(wins.len(), 2, "expected two extracted WindowExprs");
+        assert_window_expr_ids_are_real_unique_and_backed_by_output_columns(&plan);
+        for w in &wins {
+            let output_column = output_columns
+                .iter()
+                .find(|col| col.column_id == w.output_column_id)
+                .expect("window output id should be present");
+            assert!(
+                output_column.is_internal,
+                "compound WindowExpr {} should use an internal output column",
+                w.output_name
+            );
+        }
+        let visible = plan_output_columns(&plan).expect("plan output should be known");
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].name, "x");
+        assert!(!visible[0].is_internal);
+    }
+
+    #[test]
+    fn p1_multiple_projection_window_exprs_get_distinct_output_column_ids() {
+        let plan = plan_test_query(
+            "SELECT row_number() OVER (ORDER BY a) AS rn, rank() OVER (ORDER BY b) AS rk FROM t",
+        );
+        let wins = first_window_exprs(&plan);
+        let output_columns = first_window_output_columns(&plan);
+        assert_eq!(wins.len(), 2, "expected two extracted WindowExprs");
+        assert_window_expr_ids_are_real_unique_and_backed_by_output_columns(&plan);
+        let rn = window_expr_by_function_name(&wins, "row_number");
+        let rk = window_expr_by_function_name(&wins, "rank");
+        let visible_rn = visible_output_column_by_name(&output_columns, "rn");
+        let visible_rk = visible_output_column_by_name(&output_columns, "rk");
+        assert_eq!(
+            rn.output_column_id, visible_rn.column_id,
+            "single visible window projection must reuse the visible rn output id"
+        );
+        assert_eq!(
+            rk.output_column_id, visible_rk.column_id,
+            "single visible window projection must reuse the visible rk output id"
+        );
+    }
+
+    #[test]
+    fn p2_window_output_columns_preserve_passthrough_input_ids() {
+        let plan =
+            plan_test_query("SELECT a, row_number() OVER (PARTITION BY a ORDER BY b) AS rn FROM t");
+        let (project, window) = root_project_over_window(&plan);
+        let passthrough_id = column_ref_id(&project.items[0].expr);
+        assert!(
+            window
+                .output_columns
+                .iter()
+                .any(|col| col.column_id == passthrough_id),
+            "WindowNode output_columns must expose child passthrough ColumnIds"
+        );
+        let rn = window_expr_by_function_name(&window.window_exprs, "row_number");
+        assert!(
+            window
+                .output_columns
+                .iter()
+                .any(|col| col.column_id == rn.output_column_id),
+            "WindowNode output_columns must include window result ColumnIds"
+        );
+    }
+
+    #[test]
+    fn p2_window_call_rewrites_to_window_output_id() {
+        let plan = plan_test_query(
+            "SELECT row_number() OVER (PARTITION BY a ORDER BY b) + 1 AS rn1 FROM t",
+        );
+        let (project, window) = root_project_over_window(&plan);
+        let rn = window_expr_by_function_name(&window.window_exprs, "row_number");
+        assert_ne!(
+            rn.output_column_id,
+            ColumnId::UNSET,
+            "WindowExpr must have a real output id"
+        );
+
+        let ExprKind::BinaryOp { left, .. } = &project.items[0].expr.kind else {
+            panic!(
+                "expected row_number()+1 to remain a BinaryOp over the window output, got {:?}",
+                project.items[0].expr.kind
+            );
+        };
+        let ExprKind::ColumnRef {
+            column_id, column, ..
+        } = &left.kind
+        else {
+            panic!(
+                "window child in row_number()+1 must be rewritten to ColumnRef, got {:?}",
+                left.kind
+            );
+        };
+        assert_eq!(
+            *column_id, rn.output_column_id,
+            "project expression must reference the WindowExpr output id"
+        );
+        assert_eq!(
+            column, "rn1",
+            "window ColumnRef must preserve the P2 display name"
+        );
     }
 
     #[test]
@@ -3379,6 +4834,296 @@ mod tests {
         assert_eq!(
             sort_key_id, project_output_id,
             "ORDER BY select alias must point at the Project output ColumnId"
+        );
+    }
+
+    #[test]
+    fn p2_order_by_select_alias_extra_path_preserves_inner_output_id() {
+        let plan =
+            parse_analyze_and_plan("SELECT o_orderkey AS x FROM orders ORDER BY x, o_custkey")
+                .expect("planner should succeed");
+
+        let outer_proj = match &plan {
+            LogicalPlan::Project(p) => p,
+            other => panic!("expected outer strip Project, got {other:?}"),
+        };
+        let sort = match outer_proj.input.as_ref() {
+            LogicalPlan::Sort(s) => s,
+            other => panic!("expected Sort under outer Project, got {other:?}"),
+        };
+        let inner_proj = match sort.input.as_ref() {
+            LogicalPlan::Project(p) => p,
+            other => panic!("expected inner Project under Sort, got {other:?}"),
+        };
+
+        let inner_output_id = inner_proj.items[0].output_column_id;
+        assert_ne!(
+            inner_output_id,
+            ColumnId::UNSET,
+            "inner select alias output must have a real ColumnId"
+        );
+        let ExprKind::ColumnRef {
+            column_id, column, ..
+        } = &sort.items[0].expr.kind
+        else {
+            panic!("sort key should be a ColumnRef to the remapped select alias");
+        };
+        assert_eq!(
+            column, "__nr_sel_0",
+            "ORDER BY alias should remap to the synthetic inner Project label"
+        );
+        assert_eq!(
+            *column_id, inner_output_id,
+            "ORDER BY alias remap must preserve the inner Project output ColumnId"
+        );
+    }
+
+    #[test]
+    fn p2_order_by_derived_values_extra_preserves_source_column_id() {
+        let plan =
+            parse_analyze_and_plan("SELECT 1 FROM (VALUES (1, 2)) AS v(a, b) ORDER BY v.b + 1")
+                .expect("planner should succeed");
+
+        let (_, _, inner_proj) = root_strip_sort_inner_project(&plan);
+        let child_output_columns =
+            plan_output_columns(&inner_proj.input).expect("VALUES child output should be known");
+        assert_eq!(
+            child_output_columns.len(),
+            2,
+            "derived VALUES child should expose both columns"
+        );
+        let b_output_id = child_output_columns[1].column_id;
+        assert_ne!(
+            b_output_id,
+            ColumnId::UNSET,
+            "derived VALUES b output must have a real ColumnId"
+        );
+
+        let extra_item = inner_proj
+            .items
+            .last()
+            .expect("sort-extra ProjectItem should be appended");
+        assert_eq!(
+            binary_left_column_id(&extra_item.expr),
+            b_output_id,
+            "ORDER BY v.b + 1 extra must reference the derived VALUES source ColumnId"
+        );
+    }
+
+    #[test]
+    fn p2_order_by_generate_series_extra_preserves_source_column_id() {
+        let plan = parse_analyze_and_plan(
+            "SELECT 1 FROM TABLE(generate_series(1, 3, 1)) AS gs(x) ORDER BY gs.x + 1",
+        )
+        .expect("planner should succeed");
+
+        let (_, _, inner_proj) = root_strip_sort_inner_project(&plan);
+        let child_output_columns = plan_output_columns(&inner_proj.input)
+            .expect("GenerateSeries child output should be known");
+        assert_eq!(
+            child_output_columns.len(),
+            1,
+            "GenerateSeries child should expose one column"
+        );
+        let source_output_id = child_output_columns[0].column_id;
+        assert_ne!(
+            source_output_id,
+            ColumnId::UNSET,
+            "GenerateSeries output must have a real ColumnId"
+        );
+
+        let extra_item = inner_proj
+            .items
+            .last()
+            .expect("sort-extra ProjectItem should be appended");
+        assert_eq!(
+            binary_left_column_id(&extra_item.expr),
+            source_output_id,
+            "ORDER BY gs.x + 1 extra must reference the GenerateSeries source ColumnId"
+        );
+    }
+
+    #[test]
+    fn p2_values_output_uses_single_column_id() {
+        let (resolved, cte_registry, mut factory) =
+            parse_analyze_query("VALUES (1, 2), (3, 4)").expect("analyzer should succeed");
+        let analyzer_output_columns = resolved.output_columns.clone();
+        let plan =
+            plan_query(resolved, cte_registry, &mut factory).expect("planner should succeed");
+        let LogicalPlan::Values(values) = plan else {
+            panic!("expected Values root");
+        };
+        assert_eq!(
+            values.columns.len(),
+            analyzer_output_columns.len(),
+            "ValuesNode should expose the analyzer output columns"
+        );
+        for (value_column, analyzer_column) in
+            values.columns.iter().zip(analyzer_output_columns.iter())
+        {
+            assert_ne!(
+                value_column.column_id,
+                ColumnId::UNSET,
+                "VALUES output column must have a real ColumnId"
+            );
+            assert_eq!(
+                value_column.column_id, analyzer_column.column_id,
+                "ValuesNode column id must reuse the analyzer query output id"
+            );
+        }
+    }
+
+    #[test]
+    fn p2_generate_series_output_has_column_id_through_planner() {
+        let plan = parse_analyze_and_plan("SELECT x FROM TABLE(generate_series(1, 3, 1)) AS gs(x)")
+            .expect("planner should succeed");
+        let LogicalPlan::Project(project) = &plan else {
+            panic!("expected Project root, got {plan:?}");
+        };
+        let child_output_columns =
+            plan_output_columns(&project.input).expect("generate_series output should be known");
+        assert_eq!(
+            child_output_columns.len(),
+            1,
+            "generate_series should expose one output column"
+        );
+        let child_output_id = child_output_columns[0].column_id;
+        assert_ne!(
+            child_output_id,
+            ColumnId::UNSET,
+            "GenerateSeries output must have a real ColumnId"
+        );
+        let ExprKind::ColumnRef { column_id, .. } = project.items[0].expr.kind else {
+            panic!("project over generate_series should read a ColumnRef");
+        };
+        assert_eq!(
+            column_id, project.items[0].output_column_id,
+            "Project item should preserve the generate_series ColumnRef id"
+        );
+        assert_eq!(
+            column_id, child_output_id,
+            "GenerateSeries child output id must match the parent Project ColumnRef"
+        );
+    }
+
+    #[test]
+    fn p2_base_scan_row_lineage_metadata_preserves_column_id_through_planner() {
+        let plan = parse_analyze_and_plan("SELECT _row_id FROM iv_orders AS t")
+            .expect("planner should succeed");
+        let LogicalPlan::Project(project) = &plan else {
+            panic!("expected Project root, got {plan:?}");
+        };
+        let LogicalPlan::Scan(scan) = project.input.as_ref() else {
+            panic!("expected Scan under Project, got {:?}", project.input);
+        };
+
+        let row_id_output = scan
+            .columns
+            .iter()
+            .find(|col| col.name == "_row_id")
+            .expect("ScanNode must expose _row_id metadata output");
+        assert_ne!(row_id_output.column_id, ColumnId::UNSET);
+
+        let ExprKind::ColumnRef { column_id, .. } = project.items[0].expr.kind else {
+            panic!("Project over _row_id should read a ColumnRef");
+        };
+        assert_eq!(
+            column_id, row_id_output.column_id,
+            "Project must read the _row_id ColumnId exposed by the ScanNode"
+        );
+        assert_eq!(
+            project.items[0].output_column_id, row_id_output.column_id,
+            "visible _row_id output should preserve the ScanNode metadata ColumnId"
+        );
+    }
+
+    #[test]
+    fn p2_rollup_materialized_key_has_real_id() {
+        let plan = parse_analyze_and_plan("SELECT a + 1 AS k FROM t GROUP BY ROLLUP(a + 1)")
+            .expect("planner should succeed");
+        let (_project, aggregate) = root_project_over_aggregate(&plan);
+        let repeat = first_repeat_node(&plan);
+        let LogicalPlan::Project(repeat_input_project) = repeat.input.as_ref() else {
+            panic!("expected Repeat input Project, got {:?}", repeat.input);
+        };
+        let repeat_key = repeat_input_project
+            .items
+            .iter()
+            .find(|item| item.output_name == "__repeat_group_key_0")
+            .expect("computed rollup key should be materialized before Repeat");
+        assert_ne!(
+            repeat_key.output_column_id,
+            ColumnId::UNSET,
+            "computed ROLLUP key materialization must have a real ColumnId"
+        );
+        assert_eq!(
+            column_ref_id(&aggregate.group_by[0]),
+            repeat_key.output_column_id,
+            "Aggregate over Repeat must group by the materialized key ColumnId"
+        );
+    }
+
+    #[test]
+    fn p2_subquery_alias_reexposes_producing_id() {
+        let plan = parse_analyze_and_plan("SELECT x FROM (SELECT a AS x FROM t) s WHERE x > 1")
+            .expect("planner should succeed");
+        let LogicalPlan::Project(project) = &plan else {
+            panic!("expected Project root, got {plan:?}");
+        };
+        let LogicalPlan::Filter(filter) = project.input.as_ref() else {
+            panic!("expected Filter under Project, got {:?}", project.input);
+        };
+        let child_output = plan_output_columns(&filter.input).expect("child output columns");
+        let producing_id = child_output
+            .iter()
+            .find(|col| col.name == "x")
+            .expect("subquery child should expose x")
+            .column_id;
+        assert_ne!(
+            producing_id,
+            ColumnId::UNSET,
+            "subquery alias producer must expose a real ColumnId"
+        );
+        let ExprKind::BinaryOp { left, .. } = &filter.predicate.kind else {
+            panic!(
+                "expected WHERE x > 1 binary predicate, got {:?}",
+                filter.predicate.kind
+            );
+        };
+        assert_eq!(
+            column_ref_id(left),
+            producing_id,
+            "outer WHERE x must reuse the subquery producer ColumnId"
+        );
+        assert_eq!(
+            column_ref_id(&project.items[0].expr),
+            producing_id,
+            "outer SELECT x must reuse the subquery producer ColumnId"
+        );
+    }
+
+    #[test]
+    fn p2_full_outer_using_order_by_uses_project_output_id() {
+        let plan = parse_analyze_and_plan(
+            "SELECT a AS merged FROM t l FULL OUTER JOIN t r USING(a) ORDER BY merged",
+        )
+        .expect("planner should succeed");
+        let LogicalPlan::Sort(sort) = &plan else {
+            panic!("expected Sort root, got {plan:?}");
+        };
+        let LogicalPlan::Project(project) = sort.input.as_ref() else {
+            panic!("expected Project under Sort, got {:?}", sort.input);
+        };
+        let merged_output_id = project.items[0].output_column_id;
+        assert_ne!(
+            merged_output_id,
+            ColumnId::UNSET,
+            "FULL OUTER USING merged projection must have a real output ColumnId"
+        );
+        assert_eq!(
+            column_ref_id(&sort.items[0].expr),
+            merged_output_id,
+            "ORDER BY merged must reference the FULL OUTER USING project output ColumnId"
         );
     }
 

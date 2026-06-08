@@ -18,10 +18,10 @@
 //! being exposed through the new logical rewrite rule trait.
 
 use crate::sql::analysis::{JoinKind, TypedExpr};
+use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::rewrite::rule::PlanRewriteRule as RewriteRule;
 use crate::sql::optimizer::rewrite::rules::utils::{
-    collect_column_id_refs, collect_column_refs, collect_output_columns, collect_output_ids,
-    collect_qualified_column_refs, collect_qualified_output_columns, combine_and, split_and,
+    collect_column_id_refs_strict, collect_output_ids, combine_and, split_and,
 };
 use crate::sql::planner::plan::*;
 
@@ -50,42 +50,17 @@ impl RewriteRule for PushSemiAntiRightOnlyCondition {
 
         // Port of push_semi_condition_into_children logic (legacy lines 374-431).
         let conjuncts = split_and(condition.clone());
-        let right_cols = collect_output_columns(&join.right);
-        let left_cols = collect_output_columns(&join.left);
-        let right_ids = collect_output_ids(&join.right);
-        let left_ids = collect_output_ids(&join.left);
-        let right_qcols = collect_qualified_output_columns(&join.right);
+        let mut right_ids = collect_output_ids(&join.right);
+        let mut left_ids = collect_output_ids(&join.left);
+        right_ids.remove(&ColumnId::UNSET);
+        left_ids.remove(&ColumnId::UNSET);
 
         let mut keep_in_condition: Vec<TypedExpr> = Vec::new();
         let mut push_to_right: Vec<TypedExpr> = Vec::new();
 
         for conj in conjuncts {
-            let refs = collect_column_refs(&conj);
-            let qrefs = collect_qualified_column_refs(&conj);
-            let id_right_only = classify_right_only_by_column_ids(&conj, &left_ids, &right_ids);
-
-            // Use qualified refs when available to handle self-joins
-            // (e.g., catalog_sales cs1, catalog_sales cs2 — same bare names).
-            // But also check bare refs to avoid pushing cross-side predicates
-            // where one side is qualified and the other isn't.
-            let is_right_only = match id_right_only {
-                Some(right_only) => right_only,
-                None if !qrefs.is_empty() => {
-                    // All qualified refs must be in right's qualified columns,
-                    // AND all bare refs must be right-only (not also in left).
-                    let q_all_right = qrefs.iter().all(|r| right_qcols.contains(r));
-                    let bare_any_left = refs.iter().any(|c| left_cols.contains(&c.to_lowercase()));
-                    q_all_right && !bare_any_left
-                }
-                None if !refs.is_empty() => {
-                    // Fallback: all bare refs in right but NOT all in left
-                    // (avoids pushing cross-side predicates for self-joins)
-                    let all_in_right = refs.iter().all(|c| right_cols.contains(&c.to_lowercase()));
-                    let any_in_left = refs.iter().any(|c| left_cols.contains(&c.to_lowercase()));
-                    all_in_right && !any_in_left
-                }
-                None => false,
-            };
+            let is_right_only =
+                classify_right_only_by_column_ids(&conj, &left_ids, &right_ids).unwrap_or(false);
 
             if is_right_only {
                 push_to_right.push(conj);
@@ -121,14 +96,11 @@ impl RewriteRule for PushSemiAntiRightOnlyCondition {
 
 fn classify_right_only_by_column_ids(
     expr: &TypedExpr,
-    left_ids: &std::collections::HashSet<crate::sql::column_id::ColumnId>,
-    right_ids: &std::collections::HashSet<crate::sql::column_id::ColumnId>,
+    left_ids: &std::collections::HashSet<ColumnId>,
+    right_ids: &std::collections::HashSet<ColumnId>,
 ) -> Option<bool> {
-    let ids = collect_column_id_refs(expr);
+    let ids = collect_column_id_refs_strict(expr)?;
     if ids.is_empty() {
-        return None;
-    }
-    if ids.len() != collect_qualified_column_refs(expr).len() {
         return Some(false);
     }
 
@@ -151,12 +123,26 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use arrow::datatypes::DataType;
 
+    fn test_col_id(name: &str) -> ColumnId {
+        match name {
+            "ss_sold_date_sk" => ColumnId::new_for_test(1),
+            "ss_item_sk" => ColumnId::new_for_test(2),
+            "d_date_sk" => ColumnId::new_for_test(3),
+            "d_year" => ColumnId::new_for_test(4),
+            "x" => ColumnId::new_for_test(10),
+            "y" => ColumnId::new_for_test(11),
+            "a" => ColumnId::new_for_test(20),
+            "b" => ColumnId::new_for_test(21),
+            _ => ColumnId::new_for_test(100),
+        }
+    }
+
     fn col(name: &str) -> TypedExpr {
         TypedExpr {
             data_type: DataType::Int64,
             nullable: true,
             kind: ExprKind::ColumnRef {
-                column_id: ColumnId::UNSET,
+                column_id: test_col_id(name),
                 qualifier: None,
                 column: name.into(),
             },
@@ -232,7 +218,7 @@ mod tests {
             columns: cols
                 .iter()
                 .map(|n| OutputColumn {
-                    column_id: ColumnId::UNSET,
+                    column_id: test_col_id(n),
                     name: (*n).into(),
                     data_type: DataType::Int64,
                     nullable: true,
@@ -358,6 +344,21 @@ mod tests {
             )
         ));
         assert!(matches!(*filter.input, LogicalPlan::Project(_)));
+    }
+
+    #[test]
+    fn p4_semi_anti_does_not_push_same_name_with_wrong_column_id() {
+        let left = values_with_output("k", 101);
+        let right = values_with_output("k", 202);
+        let join_pred = eq(col_with_id("l", "k", 101), col_with_id("r", "k", 202));
+        let same_name_wrong_id = gt(col_with_id("r", "k", 999), int_lit(10));
+        let join = semi_join(left, right, Some(and(join_pred, same_name_wrong_id)));
+
+        let rule = PushSemiAntiRightOnlyCondition;
+        assert!(
+            rule.apply(join).is_none(),
+            "same column name must not make a predicate right-only without a right ColumnId"
+        );
     }
 
     // Test 1: LEFT SEMI ON (ss_sold_date_sk=d_date_sk AND corr AND d_year=2002)

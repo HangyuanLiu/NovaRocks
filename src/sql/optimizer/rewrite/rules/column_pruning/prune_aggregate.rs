@@ -2,18 +2,14 @@
 //!
 //! **Currently a no-op.**
 //!
-//! `AggregateNode.output_columns` is built by `split_projection_for_aggregate`
-//! in SELECT order (1:1 with the SELECT list), NOT in `[group_by ++ aggregates]`
-//! order.  The `aggregates` list is extracted separately from the projection
-//! expressions and has NO positional correspondence to `output_columns`.
-//! Indexing `output_columns[group_by.len() + i]` to find the output id of
-//! `aggregates[i]` is therefore incorrect and can panic or silently drop the
-//! wrong aggregate.
+//! `AggregateNode.output_columns` starts with the group-by output prefix used by
+//! the physical aggregate layout.  The aggregate function outputs themselves
+//! must be identified from `AggregateCall.output_column_id`, not from SELECT
+//! projection order or display names.
 //!
-//! Per-aggregate output pruning (Gap 5) requires an explicit `output_column_id`
-//! field on `AggregateCall` so that each aggregate result can be addressed by
-//! id independently of `output_columns` position.  Until that is implemented,
-//! this rule returns `Unchanged` unconditionally.
+//! Per-aggregate output pruning remains disabled in this rule until it can
+//! preserve every required aggregate call by ColumnId.  Until then, this rule
+//! returns `Unchanged` unconditionally.
 
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
@@ -39,10 +35,8 @@ impl LogicalRewriteRule for PruneAggregateColumns {
     fn apply(&self, plan: LogicalPlan, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         // No-op: see module-level doc comment.
         //
-        // Per-aggregate output pruning (Gap 5) requires an explicit
-        // output_column_id on AggregateCall.  Until that is added, this rule
-        // always returns Unchanged to avoid incorrect positional indexing into
-        // output_columns.
+        // Per-aggregate output pruning (Gap 5) remains disabled until upper
+        // projection refs and codegen binding use AggregateCall.output_column_id.
         let _ = plan; // suppress unused-variable warning
         Ok(RewriteResult::Unchanged)
     }
@@ -121,30 +115,18 @@ mod tests {
     // -----------------------------------------------------------------------
     // Bug A regression: PruneAggregateColumns must be a no-op.
     //
-    // AggregateNode.output_columns is SELECT-ordered (built by
-    // split_projection_for_aggregate), NOT [group_by ++ aggregates].
-    // Indexing output_columns[group_by.len() + i] to find aggregates[i]'s
-    // output id is incorrect and can panic or drop the wrong aggregate.
-    // Until Gap 5 (per-aggregate output_column_id) is implemented, the rule
-    // must always return Unchanged regardless of what required_output_columns
-    // contains.
+    // Aggregate function outputs are identified by AggregateCall.output_column_id,
+    // not by SELECT projection order or display names. Until this rule performs
+    // that ColumnId-aware pruning, it must always return Unchanged regardless
+    // of what required_output_columns contains.
     // -----------------------------------------------------------------------
 
     /// Rule is a no-op even when needed contains only some aggregate output ids.
     /// Previously this would have returned Changed and incorrectly dropped avg.
     #[test]
     fn prune_aggregate_is_noop_regardless_of_needed_set() {
-        // output_columns is SELECT-ordered: [count_oc@301, sum_oc@302]
-        // group_by = [y@1],  aggregates = [count, sum(x)]
-        // This layout does NOT match [group_by ++ aggregates].
-        // The old code would have tried output_columns[1+0]=count_oc and
-        // output_columns[1+1]=sum_oc but those are wrong positions given the
-        // SELECT-ordered layout — here they happen to line up by accident, but
-        // in a query like SELECT count(*), sum(x) GROUP BY y the positions
-        // would be output_columns[0]=count, [1]=sum, group_by.len()=1, so
-        // output_columns[1+0]=sum and output_columns[1+1] would panic.
-        //
-        // Regardless: the rule must be Unchanged.
+        // Regardless of which aggregate outputs the parent needs, this rule is
+        // still a no-op until it prunes by AggregateCall.output_column_id.
         let id_y = ColumnId::new_for_test(1);
         let id_x = ColumnId::new_for_test(10);
         let id_count_oc = ColumnId::new_for_test(301);
@@ -163,6 +145,7 @@ mod tests {
                     distinct: false,
                     result_type: DataType::Int64,
                     order_by: vec![],
+                    output_column_id: ColumnId::UNSET,
                 },
                 AggregateCall {
                     name: "sum".to_string(),
@@ -170,11 +153,11 @@ mod tests {
                     distinct: false,
                     result_type: DataType::Int64,
                     order_by: vec![],
+                    output_column_id: ColumnId::UNSET,
                 },
             ],
-            // SELECT-ordered output_columns: [count_oc, sum_oc]
-            // group_by key y is NOT in output_columns (it's in group_by only).
             output_columns: vec![
+                make_output_column(id_y, "y"),
                 make_output_column(id_count_oc, "count"),
                 make_output_column(id_sum_oc, "sum_x"),
             ],
@@ -208,6 +191,7 @@ mod tests {
                 distinct: false,
                 result_type: DataType::Int64,
                 order_by: vec![],
+                output_column_id: ColumnId::UNSET,
             }],
             output_columns: vec![
                 make_output_column(id_k, "k"),

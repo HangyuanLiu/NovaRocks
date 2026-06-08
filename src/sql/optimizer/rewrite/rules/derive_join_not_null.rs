@@ -95,9 +95,8 @@ fn eligible_not_null<'a>(
     child: &LogicalPlan,
     operands: impl Iterator<Item = &'a TypedExpr>,
 ) -> Vec<TypedExpr> {
-    let (guaranteed_ids, guaranteed_names) = spine_not_null(child);
+    let guaranteed_ids = spine_not_null(child);
     let mut seen_ids: HashSet<ColumnId> = HashSet::new();
-    let mut seen_names: HashSet<String> = HashSet::new();
     let mut preds = Vec::new();
     for operand in operands {
         if !operand.nullable {
@@ -105,24 +104,16 @@ fn eligible_not_null<'a>(
         }
         // Keys from join_equi_keys are always bare ColumnRef (Cast/Nested
         // already peeled); this guard is defensive.
-        let ExprKind::ColumnRef {
-            column_id, column, ..
-        } = &operand.kind
-        else {
+        let ExprKind::ColumnRef { column_id, .. } = &operand.kind else {
             continue;
         };
-        let name = column.to_lowercase();
-        if (*column_id != ColumnId::UNSET && guaranteed_ids.contains(column_id))
-            || guaranteed_names.contains(&name)
-        {
+        if *column_id == ColumnId::UNSET {
+            continue;
+        }
+        if guaranteed_ids.contains(column_id) {
             continue; // already guaranteed non-null -> idempotency
         }
-        let fresh = if *column_id != ColumnId::UNSET {
-            seen_ids.insert(*column_id)
-        } else {
-            seen_names.insert(name.clone())
-        };
-        if fresh {
+        if seen_ids.insert(*column_id) {
             preds.push(is_not_null(operand.clone()));
         }
     }
@@ -154,54 +145,44 @@ fn wrap_not_null(child: LogicalPlan, preds: Vec<TypedExpr>) -> LogicalPlan {
 /// Walk `plan`'s predicate spine (passthrough single-input nodes down to the
 /// root scan) collecting column identities already guaranteed non-null by an
 /// `IS NOT NULL` conjunct. Used for idempotency / redundant-filter avoidance.
-fn spine_not_null(plan: &LogicalPlan) -> (HashSet<ColumnId>, HashSet<String>) {
+fn spine_not_null(plan: &LogicalPlan) -> HashSet<ColumnId> {
     let mut ids = HashSet::new();
-    let mut names = HashSet::new();
-    spine_not_null_inner(plan, &mut ids, &mut names);
-    (ids, names)
+    spine_not_null_inner(plan, &mut ids);
+    ids
 }
 
-fn spine_not_null_inner(
-    plan: &LogicalPlan,
-    ids: &mut HashSet<ColumnId>,
-    names: &mut HashSet<String>,
-) {
+fn spine_not_null_inner(plan: &LogicalPlan, ids: &mut HashSet<ColumnId>) {
     match plan {
         LogicalPlan::Filter(f) => {
             for conj in split_and(f.predicate.clone()) {
-                record_not_null(&conj, ids, names);
+                record_not_null(&conj, ids);
             }
-            spine_not_null_inner(&f.input, ids, names);
+            spine_not_null_inner(&f.input, ids);
         }
         LogicalPlan::Scan(s) => {
             for p in &s.predicates {
-                record_not_null(p, ids, names);
+                record_not_null(p, ids);
             }
         }
-        // Project may rename columns; descending is intentionally conservative.
-        // A post-Project name match can only cause a (safe) skip of a possibly
-        // redundant filter — never an incorrectly-omitted one.
-        LogicalPlan::Project(p) => spine_not_null_inner(&p.input, ids, names),
-        LogicalPlan::Sort(s) => spine_not_null_inner(&s.input, ids, names),
-        LogicalPlan::Limit(l) => spine_not_null_inner(&l.input, ids, names),
+        // Project may rename columns; id-based matching remains valid through
+        // passthrough projections and intentionally ignores name-only matches.
+        LogicalPlan::Project(p) => spine_not_null_inner(&p.input, ids),
+        LogicalPlan::Sort(s) => spine_not_null_inner(&s.input, ids),
+        LogicalPlan::Limit(l) => spine_not_null_inner(&l.input, ids),
         _ => {}
     }
 }
 
-fn record_not_null(expr: &TypedExpr, ids: &mut HashSet<ColumnId>, names: &mut HashSet<String>) {
+fn record_not_null(expr: &TypedExpr, ids: &mut HashSet<ColumnId>) {
     if let ExprKind::IsNull {
         expr: inner,
         negated: true,
     } = &expr.kind
     {
-        if let ExprKind::ColumnRef {
-            column_id, column, ..
-        } = &inner.kind
-        {
+        if let ExprKind::ColumnRef { column_id, .. } = &inner.kind {
             if *column_id != ColumnId::UNSET {
                 ids.insert(*column_id);
             }
-            names.insert(column.to_lowercase());
         }
     }
 }
