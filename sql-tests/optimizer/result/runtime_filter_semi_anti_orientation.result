@@ -1,0 +1,7 @@
+-- query 9
+count(*)
+3
+
+-- query 10
+count(*)
+99997
