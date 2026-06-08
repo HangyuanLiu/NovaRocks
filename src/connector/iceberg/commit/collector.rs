@@ -30,7 +30,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use iceberg::TableIdent;
-use iceberg::spec::{Literal, PartitionSpecRef, PrimitiveType, SchemaRef, Struct, Transform, Type};
+use iceberg::spec::{
+    Datum, Literal, PartitionSpecRef, PrimitiveType, SchemaRef, Struct, Transform, Type,
+};
+use std::collections::{BTreeMap, HashMap};
 
 use crate::common::types::UniqueId;
 
@@ -239,6 +242,25 @@ impl IcebergCommitCollector {
         Ok(out)
     }
 
+    /// Reconstruct a [`WrittenFile`] from a writer-reported `TIcebergDataFile`.
+    ///
+    /// As of PR-0 this is lossless against the inject path
+    /// (`engine::iceberg_writer::data_file_to_written_file`) for data and
+    /// delete files: column statistics (`column_stats`), `first_row_id`,
+    /// `equality_ids`, and `key_metadata` all round-trip. Three boundaries
+    /// are intentional and handled (or deferred) elsewhere:
+    ///
+    /// - Partition values are decoded from `partition_path` and currently
+    ///   support identity transforms only; non-identity transforms return an
+    ///   explicit error (see `parse_partition_path`).
+    /// - Column-stat bounds for field-ids absent from the table schema (e.g.
+    ///   stats left behind for a dropped column) are skipped rather than
+    ///   decoded, matching the inject path's tolerance for stale stats.
+    /// - Puffin/NDV sketches are not part of `WrittenFile`; they ride the
+    ///   out-of-band sketch channel (`take_sketch_sets` /
+    ///   `runtime::sink_commit::take_sketch_sets`), which is in-process today.
+    ///   Cross-node sketch transport is required only when multi-BE append is
+    ///   cut over and is out of scope for PR-0.
     fn convert(&self, df: crate::types::TIcebergDataFile) -> Result<WrittenFile, String> {
         use iceberg::spec::{DataContentType, DataFileFormat};
 
@@ -251,12 +273,7 @@ impl IcebergCommitCollector {
         {
             crate::types::TIcebergFileContent::DATA => DataContentType::Data,
             crate::types::TIcebergFileContent::POSITION_DELETES => DataContentType::PositionDeletes,
-            crate::types::TIcebergFileContent::EQUALITY_DELETES => {
-                return Err(
-                    "IcebergSink commit info cannot carry equality_ids for equality-delete files"
-                        .to_string(),
-                );
-            }
+            crate::types::TIcebergFileContent::EQUALITY_DELETES => DataContentType::EqualityDeletes,
             other => {
                 return Err(format!(
                     "unexpected TIcebergFileContent variant {other:?} in sink_commit_info"
@@ -270,8 +287,18 @@ impl IcebergCommitCollector {
             &self.schema,
         )?;
 
+        let stats = df.column_stats.unwrap_or_default();
+        let column_sizes = i64_map_to_u64(stats.column_sizes, "column_sizes")?;
+        let value_counts = i64_map_to_u64(stats.value_counts, "value_counts")?;
+        let null_value_counts = i64_map_to_u64(stats.null_value_counts, "null_value_counts")?;
+        let lower_bounds = self.decode_bounds(stats.lower_bounds, "lower_bounds")?;
+        let upper_bounds = self.decode_bounds(stats.upper_bounds, "upper_bounds")?;
+
         Ok(WrittenFile {
             path,
+            // The standalone sink is Parquet-only (enforced in `sink.rs`), so the
+            // wire `df.format` is intentionally not re-read here. Revisit if a
+            // non-Parquet sink is added.
             format: DataFileFormat::Parquet,
             content,
             partition_values,
@@ -279,16 +306,49 @@ impl IcebergCommitCollector {
             record_count: df.record_count.unwrap_or(0).max(0) as u64,
             file_size_in_bytes: df.file_size_in_bytes.unwrap_or(0).max(0) as u64,
             split_offsets: df.split_offsets.unwrap_or_default(),
-            column_sizes: Default::default(),
-            value_counts: Default::default(),
-            null_value_counts: Default::default(),
-            lower_bounds: Default::default(),
-            upper_bounds: Default::default(),
-            key_metadata: None,
+            column_sizes,
+            value_counts,
+            null_value_counts,
+            lower_bounds,
+            upper_bounds,
+            key_metadata: df.key_metadata,
             referenced_data_file: df.referenced_data_file,
-            equality_ids: None,
-            first_row_id: None,
+            equality_ids: df.equality_ids,
+            first_row_id: df.first_row_id,
         })
+    }
+
+    /// Decode per-column bound bytes (Iceberg single-value binary encoding)
+    /// back into `Datum`s, using the table schema to resolve each field id's
+    /// primitive type. Inverse of `data_writer::datum_bounds_to_bytes`.
+    fn decode_bounds(
+        &self,
+        bounds: Option<BTreeMap<i32, Vec<u8>>>,
+        field: &str,
+    ) -> Result<HashMap<i32, Datum>, String> {
+        let mut out = HashMap::new();
+        for (field_id, bytes) in bounds.unwrap_or_default() {
+            // Iceberg writers may leave bounds for retired field-ids in a file
+            // after a column is dropped. We cannot decode bytes without the
+            // field's type, so skip unknown ids rather than failing the commit.
+            // This matches the inject path (`data_file_to_written_file`), which
+            // carries bounds through without validating against the schema.
+            let Some(schema_field) = self.schema.field_by_id(field_id) else {
+                continue;
+            };
+            let prim = match &*schema_field.field_type {
+                Type::Primitive(p) => p.clone(),
+                other => {
+                    return Err(format!(
+                        "column stat {field} field id {field_id} has non-primitive type {other:?}"
+                    ));
+                }
+            };
+            let datum = Datum::try_from_bytes(&bytes, prim)
+                .map_err(|e| format!("decode column stat {field}[{field_id}] failed: {e}"))?;
+            out.insert(field_id, datum);
+        }
+        Ok(out)
     }
 
     pub fn mark_committed(&self) {
@@ -298,6 +358,24 @@ impl IcebergCommitCollector {
     pub fn is_committed(&self) -> bool {
         self.committed.load(Ordering::SeqCst)
     }
+}
+
+/// Convert a thrift `map<i32, i64>` column-stat map into the `WrittenFile`
+/// `HashMap<i32, u64>` representation. Inverse of `data_writer::u64_stats_to_i64`.
+fn i64_map_to_u64(
+    map: Option<BTreeMap<i32, i64>>,
+    field: &str,
+) -> Result<HashMap<i32, u64>, String> {
+    map.unwrap_or_default()
+        .into_iter()
+        .map(|(field_id, value)| {
+            u64::try_from(value)
+                .map(|value| (field_id, value))
+                .map_err(|_| {
+                    format!("iceberg column stat {field}[{field_id}] value {value} is negative")
+                })
+        })
+        .collect()
 }
 
 /// Decode an Iceberg v2-style partition path (e.g. `p=1/q=A`) into a
@@ -410,6 +488,251 @@ fn parse_literal_for_type(raw: &str, ty: &Type) -> Result<Literal, String> {
         other => Err(format!(
             "phase 1 partition primitive type {other:?} not yet supported"
         )),
+    }
+}
+
+#[cfg(test)]
+mod parity_tests {
+    use super::*;
+    use iceberg::spec::{
+        DataContentType, DataFileBuilder, DataFileFormat, Datum, NestedField, PrimitiveType,
+        Schema, Struct, Type,
+    };
+
+    fn int_schema() -> SchemaRef {
+        Arc::new(
+            Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::required(
+                    1,
+                    "k1",
+                    Type::Primitive(PrimitiveType::Int),
+                ))])
+                .build()
+                .expect("schema"),
+        )
+    }
+
+    fn unpartitioned_collector(schema: SchemaRef) -> IcebergCommitCollector {
+        IcebergCommitCollector::new(
+            CommitOpKind::FastAppend,
+            TableIdent::from_strs(["db", "t"]).expect("ident"),
+            None,
+            0,
+            schema,
+            Arc::new(iceberg::spec::PartitionSpec::unpartition_spec()),
+            "file:///tmp/staging".to_string(),
+            UniqueId { hi: 0, lo: 0 },
+        )
+    }
+
+    #[test]
+    fn convert_reproduces_inject_path_for_data_file_stats() {
+        let mut b = DataFileBuilder::default();
+        b.content(DataContentType::Data)
+            .file_path("file:///t/data-1.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .record_count(1000)
+            .file_size_in_bytes(2048);
+        b.column_sizes(HashMap::from([(1, 4000u64)]));
+        b.value_counts(HashMap::from([(1, 1000u64)]));
+        b.null_value_counts(HashMap::from([(1, 0u64)]));
+        b.lower_bounds(HashMap::from([(1, Datum::int(1))]));
+        b.upper_bounds(HashMap::from([(1, Datum::int(1000))]));
+        let df = b.build().expect("data file");
+
+        let expected =
+            crate::engine::iceberg_writer::data_file_to_written_file(&df, 0).expect("expected");
+
+        let thrift = crate::connector::iceberg::data_writer::data_file_to_iceberg_thrift(
+            &df,
+            String::new(),
+            String::new(),
+            "PARQUET".to_string(),
+            crate::types::TIcebergFileContent::DATA,
+        )
+        .expect("thrift");
+
+        let collector = unpartitioned_collector(int_schema());
+        let actual = collector.convert(thrift).expect("convert");
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn convert_roundtrips_equality_delete_files() {
+        let mut b = DataFileBuilder::default();
+        b.content(DataContentType::EqualityDeletes)
+            .file_path("file:///t/eq-del-1.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .record_count(3)
+            .file_size_in_bytes(64)
+            .equality_ids(Some(vec![1]));
+        let df = b.build().expect("eq delete file");
+
+        let expected =
+            crate::engine::iceberg_writer::data_file_to_written_file(&df, 0).expect("expected");
+
+        let thrift = crate::connector::iceberg::data_writer::data_file_to_iceberg_thrift(
+            &df,
+            String::new(),
+            String::new(),
+            "PARQUET".to_string(),
+            crate::types::TIcebergFileContent::EQUALITY_DELETES,
+        )
+        .expect("thrift");
+
+        let collector = unpartitioned_collector(int_schema());
+        let actual = collector.convert(thrift).expect("convert");
+
+        assert_eq!(expected, actual);
+        assert_eq!(actual.equality_ids, Some(vec![1]));
+    }
+
+    fn identity_partition_spec(schema: &SchemaRef) -> PartitionSpecRef {
+        Arc::new(
+            iceberg::spec::PartitionSpec::builder(schema.clone())
+                .with_spec_id(0)
+                .add_partition_field("k1", "k1", Transform::Identity)
+                .expect("add partition field")
+                .build()
+                .expect("partition spec"),
+        )
+    }
+
+    #[test]
+    fn convert_reproduces_identity_partition_values() {
+        use iceberg::spec::Literal;
+
+        let schema = int_schema();
+        let spec = identity_partition_spec(&schema);
+
+        let partition = Struct::from_iter([Some(Literal::int(5))]);
+        let mut b = DataFileBuilder::default();
+        b.content(DataContentType::Data)
+            .file_path("file:///t/k1=5/data-1.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .partition(partition.clone())
+            .partition_spec_id(0)
+            .record_count(1)
+            .file_size_in_bytes(64);
+        let df = b.build().expect("data file");
+
+        let expected =
+            crate::engine::iceberg_writer::data_file_to_written_file(&df, 0).expect("expected");
+
+        let thrift = crate::connector::iceberg::data_writer::data_file_to_iceberg_thrift(
+            &df,
+            "k1=5".to_string(),
+            String::new(),
+            "PARQUET".to_string(),
+            crate::types::TIcebergFileContent::DATA,
+        )
+        .expect("thrift");
+
+        let collector = IcebergCommitCollector::new(
+            CommitOpKind::FastAppend,
+            TableIdent::from_strs(["db", "t"]).expect("ident"),
+            None,
+            0,
+            schema,
+            spec,
+            "file:///tmp/staging".to_string(),
+            UniqueId { hi: 0, lo: 0 },
+        );
+        let actual = collector.convert(thrift).expect("convert");
+
+        assert_eq!(expected.partition_values, actual.partition_values);
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn convert_rejects_unsupported_transform_partition_paths() {
+        let schema = int_schema();
+        let spec = Arc::new(
+            iceberg::spec::PartitionSpec::builder(schema.clone())
+                .with_spec_id(0)
+                .add_partition_field("k1", "k1_bucket", Transform::Bucket(4))
+                .expect("add partition field")
+                .build()
+                .expect("partition spec"),
+        );
+
+        let mut b = DataFileBuilder::default();
+        b.content(DataContentType::Data)
+            .file_path("file:///t/k1_bucket=2/data-1.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .partition(Struct::from_iter([Some(iceberg::spec::Literal::int(2))]))
+            .partition_spec_id(0)
+            .record_count(1)
+            .file_size_in_bytes(64);
+        let df = b.build().expect("data file");
+
+        let thrift = crate::connector::iceberg::data_writer::data_file_to_iceberg_thrift(
+            &df,
+            "k1_bucket=2".to_string(),
+            String::new(),
+            "PARQUET".to_string(),
+            crate::types::TIcebergFileContent::DATA,
+        )
+        .expect("thrift");
+
+        let collector = IcebergCommitCollector::new(
+            CommitOpKind::FastAppend,
+            TableIdent::from_strs(["db", "t"]).expect("ident"),
+            None,
+            0,
+            schema,
+            spec,
+            "file:///tmp/staging".to_string(),
+            UniqueId { hi: 0, lo: 0 },
+        );
+        let err = collector
+            .convert(thrift)
+            .expect_err("transform must be rejected");
+        assert!(
+            err.contains("transform"),
+            "expected an explicit transform-not-supported error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn convert_skips_bounds_for_field_ids_absent_from_schema() {
+        // int_schema() has only field id 1; a bound for field id 999 simulates
+        // stats left behind for a dropped column. convert() must succeed and
+        // simply omit field 999 rather than erroring.
+        let mut b = DataFileBuilder::default();
+        b.content(DataContentType::Data)
+            .file_path("file:///t/data-1.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .record_count(1)
+            .file_size_in_bytes(10);
+        b.lower_bounds(HashMap::from([(999, Datum::int(7))]));
+        let df = b.build().expect("data file");
+
+        let thrift = crate::connector::iceberg::data_writer::data_file_to_iceberg_thrift(
+            &df,
+            String::new(),
+            String::new(),
+            "PARQUET".to_string(),
+            crate::types::TIcebergFileContent::DATA,
+        )
+        .expect("thrift");
+
+        let collector = unpartitioned_collector(int_schema());
+        let actual = collector
+            .convert(thrift)
+            .expect("convert should skip unknown field-id, not error");
+        assert!(
+            actual.lower_bounds.is_empty(),
+            "stale field-id bound should be skipped, got {:?}",
+            actual.lower_bounds
+        );
     }
 }
 

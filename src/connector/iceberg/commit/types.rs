@@ -95,7 +95,7 @@ pub const NOVAROCKS_UPDATE_MODE_MOR: &str = "merge-on-read";
 /// Metadata about a single Parquet file produced by `IcebergSink` during a
 /// pipeline run. Mirrors the subset of `TIcebergDataFile` we need for commit
 /// and abort flows. Constructed from `TSinkCommitInfo` after pipeline finish.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct WrittenFile {
     pub path: String,
     pub format: DataFileFormat,

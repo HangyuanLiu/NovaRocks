@@ -361,18 +361,8 @@ pub(crate) fn to_sink_commit_info(
     String,
 > {
     let df = &staged.data_file;
-    let data_file = crate::types::TIcebergDataFile {
-        path: Some(df.file_path().to_string()),
-        format: Some(format),
-        record_count: Some(u64_to_i64(df.record_count(), "record_count")?),
-        file_size_in_bytes: Some(u64_to_i64(df.file_size_in_bytes(), "file_size_in_bytes")?),
-        partition_path: Some(partition_path),
-        split_offsets: df.split_offsets().map(|offsets| offsets.to_vec()),
-        column_stats: iceberg_data_file_to_column_stats(df)?,
-        partition_null_fingerprint: Some(null_fingerprint),
-        file_content: Some(content),
-        referenced_data_file: df.referenced_data_file().map(|path| path.to_string()),
-    };
+    let data_file =
+        data_file_to_iceberg_thrift(df, partition_path, null_fingerprint, format, content)?;
     let commit_info = crate::types::TSinkCommitInfo {
         iceberg_data_file: Some(data_file),
         hive_file_info: None,
@@ -389,6 +379,35 @@ pub(crate) fn to_sink_commit_info(
                 sketches: clone_theta_sketches(sketches),
             });
     Ok((commit_info, sketch_set))
+}
+
+/// Serialize an iceberg-rust `DataFile` into the thrift `TIcebergDataFile`
+/// carried over the writer report channel. This is the single forward
+/// serialization site; keep it lossless against
+/// `engine::iceberg_writer::data_file_to_written_file` (the inject path) so
+/// the distributed coordinator path reconstructs the same `WrittenFile`.
+pub(crate) fn data_file_to_iceberg_thrift(
+    df: &DataFile,
+    partition_path: String,
+    null_fingerprint: String,
+    format: String,
+    content: crate::types::TIcebergFileContent,
+) -> Result<crate::types::TIcebergDataFile, String> {
+    Ok(crate::types::TIcebergDataFile {
+        path: Some(df.file_path().to_string()),
+        format: Some(format),
+        record_count: Some(u64_to_i64(df.record_count(), "record_count")?),
+        file_size_in_bytes: Some(u64_to_i64(df.file_size_in_bytes(), "file_size_in_bytes")?),
+        partition_path: Some(partition_path),
+        split_offsets: df.split_offsets().map(|offsets| offsets.to_vec()),
+        column_stats: iceberg_data_file_to_column_stats(df)?,
+        partition_null_fingerprint: Some(null_fingerprint),
+        file_content: Some(content),
+        referenced_data_file: df.referenced_data_file(),
+        first_row_id: df.first_row_id(),
+        equality_ids: df.equality_ids(),
+        key_metadata: df.key_metadata().map(|k| k.to_vec()),
+    })
 }
 
 fn iceberg_data_file_to_column_stats(
@@ -930,6 +949,35 @@ mod tests {
     use iceberg::spec::{DataContentType, Struct};
 
     use super::*;
+
+    #[test]
+    fn data_file_to_iceberg_thrift_carries_lineage_equality_and_key_metadata() {
+        use iceberg::spec::{DataFileBuilder, DataFileFormat};
+
+        let mut b = DataFileBuilder::default();
+        b.content(DataContentType::Data)
+            .file_path("file:///t/data-1.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .partition(Struct::empty())
+            .partition_spec_id(0)
+            .record_count(10)
+            .file_size_in_bytes(100);
+        b.key_metadata(Some(vec![1u8, 2, 3]));
+        b.first_row_id(Some(42));
+        let df = b.build().expect("data file");
+
+        let thrift = data_file_to_iceberg_thrift(
+            &df,
+            String::new(),
+            String::new(),
+            "PARQUET".to_string(),
+            crate::types::TIcebergFileContent::DATA,
+        )
+        .expect("thrift");
+
+        assert_eq!(thrift.first_row_id, Some(42));
+        assert_eq!(thrift.key_metadata, Some(vec![1u8, 2, 3]));
+    }
 
     #[test]
     fn retag_unpartitioned_data_file_with_current_default_spec_id() {
