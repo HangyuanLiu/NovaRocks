@@ -193,9 +193,24 @@ fn exposure_project_items(
         .collect::<Vec<_>>();
     items.extend(original.aggregates.iter().zip(final_aggs.iter()).map(
         |(original_call, final_call)| ProjectItem {
-            expr: aggregate_call_expr(final_call),
+            // The final Aggregate already computes this aggregate (e.g.
+            // sum(partial)); expose its result as a ColumnRef to the final
+            // aggregate's output. Repeating the AggregateCall here would
+            // reference the partial-input column, which lives below the final
+            // aggregate and is not in its output scope ("not produced by child
+            // scope"). The output id reuses the original aggregate's id so the
+            // SELECT Project above resolves against it.
+            expr: TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: final_call.output_column_id,
+                    qualifier: None,
+                    column: agg_call_display_name(final_call),
+                },
+                data_type: final_call.result_type.clone(),
+                nullable: true,
+            },
             output_name: agg_call_display_name(original_call),
-            output_column_id: ColumnId::UNSET,
+            output_column_id: original_call.output_column_id,
         },
     ));
     items
@@ -219,19 +234,6 @@ fn group_by_project_item(expr: &TypedExpr) -> ProjectItem {
         },
         output_name,
         output_column_id: column_id,
-    }
-}
-
-fn aggregate_call_expr(call: &AggregateCall) -> TypedExpr {
-    TypedExpr {
-        kind: ExprKind::AggregateCall {
-            name: call.name.clone(),
-            args: call.args.clone(),
-            distinct: call.distinct,
-            order_by: call.order_by.clone(),
-        },
-        data_type: call.result_type.clone(),
-        nullable: true,
     }
 }
 
