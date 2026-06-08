@@ -1,0 +1,11 @@
+-- query 11
+id	k
+1	10
+2	NULL
+3	30
+
+-- query 13
+id	k
+1	10
+2	NULL
+3	30
