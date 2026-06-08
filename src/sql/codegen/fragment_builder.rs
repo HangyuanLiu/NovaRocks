@@ -2236,26 +2236,19 @@ impl<'a> PlanFragmentBuilder<'a> {
             }
 
             // The build key MUST be the equi-join side that binds the build
-            // (right) child's scope. The physical pass labels build/probe by
-            // `eq.right`/`eq.left`, but join commutativity can swap children
-            // relative to that labeling (the same try-natural-then-swap
-            // ambiguity `visit_hash_join` resolves for `eq_join_conjuncts`).
-            // We therefore compile `build_expr` against the build scope and,
-            // on failure, fall back to `probe_expr` (the swapped orientation).
-            // Resolution is ColumnId-aware (see `ExprCompiler::compile_typed`),
-            // so this matches the same physical column the join key uses.
+            // (right) child's scope. Invalid RF descriptors are skipped rather
+            // than reinterpreted with the probe key, because the optimizer RF
+            // descriptor is the source of truth for build/probe semantics.
             let build_texpr = match ExprCompiler::new(self.slot_allocator(), build_scope)
                 .compile_typed(&rf.build_expr)
             {
                 Ok(t) => t,
-                Err(_) => ExprCompiler::new(self.slot_allocator(), build_scope)
-                    .compile_typed(&rf.probe_expr)
-                    .map_err(|e| {
-                        format!(
-                            "runtime filter {filter_id}: neither build nor probe key \
-                             binds the build child scope: {e}"
-                        )
-                    })?,
+                Err(err) => {
+                    tracing::debug!(
+                        "skip runtime filter {filter_id}: build expr does not bind build scope: {err}"
+                    );
+                    continue;
+                }
             };
 
             // Probe target recorded while visiting the probe descendants. When
@@ -6832,6 +6825,58 @@ mod tests {
         assert_eq!(
             rf.layout.as_ref().and_then(|layout| layout.global_layout),
             Some(crate::runtime_filter::TRuntimeFilterLayoutMode::GLOBAL_SHUFFLE_1L)
+        );
+    }
+
+    #[test]
+    fn runtime_filter_invalid_build_binding_is_skipped() {
+        let mut plan = mixed_starrocks_iceberg_join_plan();
+        let Operator::PhysicalHashJoin(op) = &plan.op else {
+            panic!("expected hash join");
+        };
+        let eq = op.eq_conditions[0].clone();
+        plan.build_runtime_filters = vec![RuntimeFilterDesc {
+            filter_id: 99,
+            build_expr: eq.left.clone(),
+            probe_expr: eq.left,
+            expr_order: 0,
+            distribution: JoinDistribution::Broadcast,
+        }];
+
+        let starrocks_layout = PhysicalTableLayout {
+            db_id: 11,
+            table_id: 22,
+            schema_id: 33,
+            tablets: vec![StarRocksTabletRef {
+                tablet_id: 101,
+                partition_id: 201,
+                version: 7,
+            }],
+        };
+        let registry = mock_starrocks_and_iceberg_registry(&starrocks_layout);
+        let catalog = MixedCatalog { starrocks_layout };
+
+        let build =
+            PlanFragmentBuilder::build(&plan, &catalog, &registry, "default").expect("build");
+        let root = build
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == build.root_fragment_id)
+            .expect("root fragment");
+        let hash_join_node = root
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.node_type == plan_nodes::TPlanNodeType::HASH_JOIN_NODE)
+            .expect("hash join node");
+        let build_filters = hash_join_node
+            .hash_join_node
+            .as_ref()
+            .and_then(|join| join.build_runtime_filters.as_ref());
+
+        assert!(
+            build_filters.is_none_or(Vec::is_empty),
+            "invalid runtime filter descriptor should be skipped"
         );
     }
 
