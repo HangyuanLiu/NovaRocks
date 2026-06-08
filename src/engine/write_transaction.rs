@@ -265,7 +265,7 @@ mod tests {
     use crate::connector::iceberg::commit::{CommitOutcome, CommitServiceError};
     use crate::meta::repository::iceberg_operation::IcebergOperationState;
     use crate::runtime::query_result::QueryResult;
-    use crate::runtime::write_coordinator::{WriteAbortInput, WriteCommitInput};
+    use crate::runtime::write_coordinator::WriteCommitInput;
     use std::cell::RefCell;
 
     struct TestEnv {
@@ -359,6 +359,10 @@ mod tests {
         }
     }
 
+    fn one_writer_abort() -> crate::runtime::write_coordinator::WriteAbortInput {
+        crate::engine::write_operation_lifecycle::test_support::write_abort_with_data_file()
+    }
+
     #[test]
     fn successful_append_drives_operation_to_finalized() {
         let env = test_env();
@@ -391,5 +395,161 @@ mod tests {
             stored.commit_outcome.as_ref().map(|c| c.snapshot_id),
             Some(1234)
         );
+    }
+
+    #[test]
+    fn writer_abort_records_failed_known_uncommitted() {
+        let env = test_env();
+        let exec = FakeExecutor {
+            write: RefCell::new(Some(Ok(CoordinatedQueryResult {
+                query_result: empty_query_result(),
+                write_commit: None,
+                write_abort: Some(one_writer_abort()),
+            }))),
+            commit: RefCell::new(None),
+            finalize: Ok(()),
+        };
+        let runner = IcebergWriteTransactionRunner::new(Arc::clone(&env.state), &exec);
+        let err = runner.run(sample_spec()).expect_err("abort surfaces error");
+        assert!(err.contains("aborted before commit"), "got: {err}");
+        let read = env.provider.begin_read().expect("read txn");
+        let stored = env
+            .state
+            .iceberg_operation_repo
+            .load_operation(read.as_ref(), 1)
+            .expect("load")
+            .expect("present");
+        assert_eq!(stored.state, IcebergOperationState::FailedKnownUncommitted);
+    }
+
+    #[test]
+    fn commit_known_uncommitted_records_failed_known_uncommitted() {
+        use crate::connector::iceberg::commit::CleanupAttempt;
+        let env = test_env();
+        let exec = FakeExecutor {
+            write: RefCell::new(Some(Ok(CoordinatedQueryResult {
+                query_result: empty_query_result(),
+                write_commit: Some(write_commit_with_one_writer()),
+                write_abort: None,
+            }))),
+            commit: RefCell::new(Some(Err(CommitServiceError::KnownUncommitted {
+                message: "conflict".to_string(),
+                cleanup: CleanupAttempt {
+                    attempted: true,
+                    error_count: 0,
+                    error_paths: Vec::new(),
+                },
+            }))),
+            finalize: Ok(()),
+        };
+        let runner = IcebergWriteTransactionRunner::new(Arc::clone(&env.state), &exec);
+        let err = runner
+            .run(sample_spec())
+            .expect_err("commit failure surfaces");
+        assert!(err.contains("commit failed"), "got: {err}");
+        let read = env.provider.begin_read().expect("read txn");
+        let stored = env
+            .state
+            .iceberg_operation_repo
+            .load_operation(read.as_ref(), 1)
+            .expect("load")
+            .expect("present");
+        assert_eq!(stored.state, IcebergOperationState::FailedKnownUncommitted);
+    }
+
+    #[test]
+    fn commit_unknown_records_commit_unknown_and_skips_finalize() {
+        use crate::connector::iceberg::commit::RecoveryEvidence;
+        let env = test_env();
+        let exec = FakeExecutor {
+            write: RefCell::new(Some(Ok(CoordinatedQueryResult {
+                query_result: empty_query_result(),
+                write_commit: Some(write_commit_with_one_writer()),
+                write_abort: None,
+            }))),
+            commit: RefCell::new(Some(Err(CommitServiceError::Unknown {
+                message: "rpc timeout".to_string(),
+                evidence: RecoveryEvidence {
+                    table_ident: "db.orders".to_string(),
+                    op_kind: CommitOpKind::FastAppend,
+                    base_snapshot_id: Some(7),
+                    base_sequence_number: 3,
+                    staging_dir: "s3://bucket/_staging/x".to_string(),
+                },
+            }))),
+            finalize: Err("finalize must not be called".to_string()),
+        };
+        let runner = IcebergWriteTransactionRunner::new(Arc::clone(&env.state), &exec);
+        let _ = runner
+            .run(sample_spec())
+            .expect_err("commit unknown surfaces");
+        let read = env.provider.begin_read().expect("read txn");
+        let stored = env
+            .state
+            .iceberg_operation_repo
+            .load_operation(read.as_ref(), 1)
+            .expect("load")
+            .expect("present");
+        assert_eq!(stored.state, IcebergOperationState::CommitUnknown);
+        assert!(stored.recovery_evidence.is_some());
+    }
+
+    #[test]
+    fn finalize_failure_records_finalize_failed_known_committed() {
+        let env = test_env();
+        let exec = FakeExecutor {
+            write: RefCell::new(Some(Ok(CoordinatedQueryResult {
+                query_result: empty_query_result(),
+                write_commit: Some(write_commit_with_one_writer()),
+                write_abort: None,
+            }))),
+            commit: RefCell::new(Some(Ok(CommitOutcome {
+                new_snapshot_id: 9,
+                written_manifest_paths: Vec::new(),
+            }))),
+            finalize: Err("cache invalidation failed".to_string()),
+        };
+        let runner = IcebergWriteTransactionRunner::new(Arc::clone(&env.state), &exec);
+        let err = runner
+            .run(sample_spec())
+            .expect_err("finalize failure surfaces");
+        assert!(err.contains("known committed"), "got: {err}");
+        let read = env.provider.begin_read().expect("read txn");
+        let stored = env
+            .state
+            .iceberg_operation_repo
+            .load_operation(read.as_ref(), 1)
+            .expect("load")
+            .expect("present");
+        assert_eq!(
+            stored.state,
+            IcebergOperationState::FinalizeFailedKnownCommitted
+        );
+    }
+
+    #[test]
+    fn empty_write_transitions_to_aborted_with_no_committed_outcome() {
+        let env = test_env();
+        let exec = FakeExecutor {
+            write: RefCell::new(Some(Ok(CoordinatedQueryResult {
+                query_result: empty_query_result(),
+                write_commit: None,
+                write_abort: None,
+            }))),
+            commit: RefCell::new(None),
+            finalize: Ok(()),
+        };
+        let runner = IcebergWriteTransactionRunner::new(Arc::clone(&env.state), &exec);
+        let outcome = runner.run(sample_spec()).expect("empty is OK");
+        assert_eq!(outcome.operation_id, None);
+        assert_eq!(outcome.committed_snapshot_id, None);
+        let read = env.provider.begin_read().expect("read txn");
+        let stored = env
+            .state
+            .iceberg_operation_repo
+            .load_operation(read.as_ref(), 1)
+            .expect("load")
+            .expect("present");
+        assert_eq!(stored.state, IcebergOperationState::Aborted);
     }
 }
