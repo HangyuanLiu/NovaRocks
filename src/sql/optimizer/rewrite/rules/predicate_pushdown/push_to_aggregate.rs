@@ -29,7 +29,8 @@ impl RewriteRule for PushDownPredicateAggregate {
     fn matches(&self, plan: &LogicalPlan) -> bool {
         matches!(
             plan,
-            LogicalPlan::Filter(f) if matches!(*f.input, LogicalPlan::Aggregate(_))
+            LogicalPlan::Filter(f)
+                if matches!(*f.input, LogicalPlan::Aggregate(ref a) if !aggregate_child_is_repeat(&a.input))
         )
     }
 
@@ -40,6 +41,18 @@ impl RewriteRule for PushDownPredicateAggregate {
         let LogicalPlan::Aggregate(agg) = *filter.input else {
             return None;
         };
+
+        // ROLLUP/CUBE/GROUPING SETS guard: a Repeat below the aggregate
+        // synthesizes subtotal rows where GROUP BY key columns are NULL in the
+        // aggregate's *output*. A predicate that holds on the output (e.g. a
+        // DeriveJoinNotNull-derived IS NOT NULL on a join key) does NOT hold on
+        // the aggregate's input, so pushing it below would drop subtotal rows
+        // (wrong results). It also breaks DeriveJoinNotNull idempotency
+        // (spine_not_null stops at Aggregate), causing unbounded re-derivation
+        // of the same filter and cardinality blowup.
+        if aggregate_child_is_repeat(&agg.input) {
+            return None;
+        }
 
         // GROUP BY key ColumnIds — only bare ColumnRef items contribute
         // pushable ids; computed GROUP BY expressions do not.
@@ -87,6 +100,19 @@ impl RewriteRule for PushDownPredicateAggregate {
             ..agg
         });
         Some(wrap_remaining_filter(new_agg, remaining))
+    }
+}
+
+/// True if the aggregate's input is (or passes through to) a Repeat node —
+/// i.e. this is a ROLLUP / CUBE / GROUPING SETS aggregate whose GROUP BY keys
+/// can be NULL in its output, so output-level predicates must not be pushed
+/// below it.
+fn aggregate_child_is_repeat(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Repeat(_) => true,
+        LogicalPlan::Filter(f) => aggregate_child_is_repeat(&f.input),
+        LogicalPlan::Project(p) => aggregate_child_is_repeat(&p.input),
+        _ => false,
     }
 }
 

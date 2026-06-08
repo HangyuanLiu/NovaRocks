@@ -87,10 +87,25 @@ fn is_splittable_aggregate(call: &AggregateCall) -> bool {
 
 fn local_output_columns(agg: &LogicalAggregateOp) -> Vec<OutputColumn> {
     let mut columns = Vec::with_capacity(agg.group_by.len() + agg.aggregates.len());
-    columns.extend(agg.group_by.iter().map(|expr| {
+    columns.extend(agg.group_by.iter().enumerate().map(|(idx, expr)| {
         let name = typed_expr_display_name(expr);
+        // Non-ColumnRef group keys (constant/alias/expression, e.g. `'a' as g`)
+        // reuse the original aggregate's group output id *by position* (the
+        // first group_by.len() output columns are the group keys, in order).
+        // The previous by-name lookup returned ColumnId::UNSET when the output
+        // name was a SELECT alias rather than the expression's display name,
+        // which the id-binding verifier rejects once the aggregate is split.
+        let column_id = match &expr.kind {
+            ExprKind::ColumnRef { column_id, .. } => *column_id,
+            _ => agg
+                .output_columns
+                .get(idx)
+                .map(|output| output.column_id)
+                .filter(|id| *id != ColumnId::UNSET)
+                .unwrap_or_else(|| group_key_output_column_id(expr, &name, &agg.output_columns)),
+        };
         OutputColumn {
-            column_id: group_key_output_column_id(expr, &name, &agg.output_columns),
+            column_id,
             name,
             data_type: expr.data_type.clone(),
             nullable: expr.nullable,
@@ -110,7 +125,7 @@ fn local_output_columns(agg: &LogicalAggregateOp) -> Vec<OutputColumn> {
     columns
 }
 
-fn group_key_output_column_id(
+pub(crate) fn group_key_output_column_id(
     expr: &TypedExpr,
     display_name: &str,
     existing_outputs: &[OutputColumn],
@@ -141,7 +156,7 @@ fn aggregate_output_column_id(
         .unwrap_or(ColumnId::UNSET)
 }
 
-fn aggregate_group_key_output_ref(
+pub(crate) fn aggregate_group_key_output_ref(
     local_output_columns: &[OutputColumn],
     group_by_len: usize,
 ) -> Vec<TypedExpr> {
