@@ -502,6 +502,9 @@ impl IcebergTableSinkBackend {
                 partition_null_fingerprint: Some(key.null_fingerprint),
                 file_content: Some(types::TIcebergFileContent::POSITION_DELETES),
                 referenced_data_file,
+                first_row_id: None,
+                equality_ids: None,
+                key_metadata: None,
             };
 
             let commit_info = types::TSinkCommitInfo {

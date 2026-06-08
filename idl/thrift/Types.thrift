@@ -599,6 +599,11 @@ struct TIcebergDataFile {
     8: optional string partition_null_fingerprint;
     9: optional TIcebergFileContent file_content;
     10: optional string referenced_data_file;
+    // NovaRocks-internal writer->coordinator carriage for Iceberg commit
+    // fidelity. Optional => backward-compatible for the FE-compatible path.
+    11: optional i64 first_row_id;
+    12: optional list<i32> equality_ids;
+    13: optional binary key_metadata;
 }
 
 struct THiveFileInfo {
