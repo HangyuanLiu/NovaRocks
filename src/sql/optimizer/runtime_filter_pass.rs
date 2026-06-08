@@ -537,6 +537,31 @@ pub(crate) mod test_support {
         }
     }
 
+    pub(crate) fn cross_hash_join_without_eq_conditions() -> PhysicalPlanNode {
+        let (loc, _) = col(1, "lc");
+        let (roc, _) = col(2, "rc");
+        let left = leaf(1_000_000.0, loc.clone());
+        let right = leaf(10.0, roc.clone());
+        PhysicalPlanNode {
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Cross,
+                eq_conditions: vec![],
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+            }),
+            children: vec![left, right],
+            stats: Statistics {
+                output_row_count: 10.0,
+                column_statistics: Default::default(),
+                ..Default::default()
+            },
+            output_columns: vec![loc, roc],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        }
+    }
+
     pub(crate) fn inner_join_with_swapped_eq_labels() -> PhysicalPlanNode {
         let (loc, lexpr) = col(1, "lc");
         let (roc, rexpr) = col(2, "rc");
@@ -873,7 +898,6 @@ mod tests {
             JoinKind::RightOuter,
             JoinKind::RightSemi,
             JoinKind::RightAnti,
-            JoinKind::Cross,
         ] {
             let mut join = super::test_support::hash_join_two_scans(kind);
             annotate(&mut join, &OptimizerOptions::default_settings());
@@ -897,6 +921,13 @@ mod tests {
                 "{kind:?} should not build an RF"
             );
         }
+
+        let mut cross = super::test_support::cross_hash_join_without_eq_conditions();
+        annotate(&mut cross, &OptimizerOptions::default_settings());
+        assert!(
+            cross.build_runtime_filters.is_empty(),
+            "Cross without equality keys should not build an RF"
+        );
     }
 
     #[test]

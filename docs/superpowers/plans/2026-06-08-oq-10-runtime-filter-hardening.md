@@ -305,6 +305,31 @@ Inside `#[cfg(test)] pub(crate) mod test_support`, add these helper functions af
         }
     }
 
+    pub(crate) fn cross_hash_join_without_eq_conditions() -> PhysicalPlanNode {
+        let (loc, _) = col(1, "lc");
+        let (roc, _) = col(2, "rc");
+        let left = leaf(1_000_000.0, loc.clone());
+        let right = leaf(10.0, roc.clone());
+        PhysicalPlanNode {
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Cross,
+                eq_conditions: vec![],
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+            }),
+            children: vec![left, right],
+            stats: Statistics {
+                output_row_count: 10.0,
+                column_statistics: Default::default(),
+                ..Default::default()
+            },
+            output_columns: vec![loc, roc],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        }
+    }
+
     pub(crate) fn inner_join_with_swapped_eq_labels() -> PhysicalPlanNode {
         let (loc, lexpr) = col(1, "lc");
         let (roc, rexpr) = col(2, "rc");
@@ -350,7 +375,6 @@ Inside `#[cfg(test)] mod tests`, add:
             JoinKind::RightOuter,
             JoinKind::RightSemi,
             JoinKind::RightAnti,
-            JoinKind::Cross,
         ] {
             let mut join = super::test_support::hash_join_two_scans(kind);
             annotate(&mut join, &OptimizerOptions::default_settings());
@@ -374,6 +398,13 @@ Inside `#[cfg(test)] mod tests`, add:
                 "{kind:?} should not build an RF"
             );
         }
+
+        let mut cross = super::test_support::cross_hash_join_without_eq_conditions();
+        annotate(&mut cross, &OptimizerOptions::default_settings());
+        assert!(
+            cross.build_runtime_filters.is_empty(),
+            "Cross without equality keys should not build an RF"
+        );
     }
 
     #[test]
@@ -433,15 +464,15 @@ fn rf_sides_for_join(kind: JoinKind) -> Option<JoinRfSides> {
         | JoinKind::LeftSemi
         | JoinKind::RightOuter
         | JoinKind::RightSemi
-        | JoinKind::RightAnti
-        | JoinKind::Cross => Some(JoinRfSides {
+        | JoinKind::RightAnti => Some(JoinRfSides {
             probe_child: 0,
             build_child: 1,
         }),
         JoinKind::LeftOuter
         | JoinKind::FullOuter
         | JoinKind::LeftAnti
-        | JoinKind::NullAwareLeftAnti => None,
+        | JoinKind::NullAwareLeftAnti
+        | JoinKind::Cross => None,
     }
 }
 
