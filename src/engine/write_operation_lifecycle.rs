@@ -55,6 +55,67 @@ pub(crate) fn record_writer_abort_fact(
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use std::collections::BTreeMap;
+
+    use crate::runtime::write_coordinator::{
+        WriteAbortInput, WriteCommitInput, WriterCommitInput, WriterKey,
+    };
+    use crate::types;
+
+    fn staging_writer_key() -> WriterKey {
+        let query_id = types::TUniqueId::new(10, 20);
+        WriterKey {
+            query_id: query_id.clone(),
+            fragment_instance_id: types::TUniqueId::new(101, 201),
+            backend_num: 0,
+        }
+    }
+
+    fn staging_writer_commit_input(writer_key: WriterKey) -> WriterCommitInput {
+        WriterCommitInput {
+            writer_id: 0,
+            writer_key,
+            sink_commit_infos: vec![types::TSinkCommitInfo {
+                iceberg_data_file: Some(types::TIcebergDataFile {
+                    path: Some("s3://warehouse/orders/_staging/a.parquet".to_string()),
+                    record_count: Some(11),
+                    file_size_in_bytes: Some(110),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            tablet_commit_infos: Vec::new(),
+            tablet_fail_infos: Vec::new(),
+            load_counters: BTreeMap::from([("loaded.rows".to_string(), "11".to_string())]),
+            loaded_rows: 11,
+            loaded_bytes: 110,
+            filtered_rows: 0,
+        }
+    }
+
+    pub(crate) fn write_commit_with_data_file() -> WriteCommitInput {
+        let query_id = types::TUniqueId::new(10, 20);
+        let writer_key = staging_writer_key();
+        WriteCommitInput {
+            write_id: query_id,
+            writers: vec![staging_writer_commit_input(writer_key)],
+        }
+    }
+
+    pub(crate) fn write_abort_with_data_file() -> WriteAbortInput {
+        let query_id = types::TUniqueId::new(10, 20);
+        let writer_key = staging_writer_key();
+        WriteAbortInput {
+            write_id: query_id,
+            reason: "query timed out waiting for write final reports".to_string(),
+            completed_writer_outputs: vec![staging_writer_commit_input(writer_key)],
+            incomplete_writers: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
