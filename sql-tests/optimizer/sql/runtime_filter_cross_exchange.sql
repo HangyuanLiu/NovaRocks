@@ -31,6 +31,7 @@ SET global_runtime_filter_build_max_size = 10737418240;
 SET global_runtime_filter_probe_min_selectivity = 0.0;
 
 -- @explain_contains=HASH JOIN (PARTITIONED
+-- @explain_contains=build_expr = (t2.cv)
 -- @explain_contains=probe_expr = (a.k)
 -- @explain_not_contains=probe_expr = (t1.av)
 SELECT count(*) AS cnt
