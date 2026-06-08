@@ -28,7 +28,8 @@ use crate::runtime::dispatcher::{FetchOutcome, FragmentDispatcher};
 use crate::runtime::exec_params::build_exec_plan_fragment_params;
 use crate::runtime::scheduler::FragmentScheduler;
 use crate::runtime::write_coordinator::{
-    WriteAbortInput, WriteCommitInput, WriteCoordinator, WriterKey, register_query, unregister_query,
+    WriteAbortInput, WriteCommitInput, WriteCoordinator, WriterKey, register_query,
+    unregister_query,
 };
 use crate::runtime_filter;
 use crate::sql::analysis::cte::CteId;
