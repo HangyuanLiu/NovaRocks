@@ -20,9 +20,9 @@ pub(crate) const RUNTIME_FILTER_RULE: &str = "RuntimeFilterPushDown";
 #[derive(Clone, Debug)]
 pub(crate) struct RuntimeFilterDesc {
     pub filter_id: i32,
-    /// Build-side key expression (eq.right, in build-child column space).
+    /// Oriented build-side key expression in build-child column space.
     pub build_expr: TypedExpr,
-    /// Probe-side key expression (eq.left), in the target node's column space.
+    /// Oriented probe-side key expression in the target node's column space.
     pub probe_expr: TypedExpr,
     /// Index into the join's `eq_conditions`.
     pub expr_order: usize,
@@ -456,7 +456,6 @@ fn annotate_node(
 
     // Build descriptors for each non-null-safe equi-conjunct.
     let mut descs: Vec<RuntimeFilterDesc> = Vec::new();
-    let mut seen_keys: HashSet<(Vec<ColumnId>, Vec<ColumnId>)> = HashSet::new();
     for (expr_order, eq) in eq_conditions.iter().enumerate() {
         if eq.null_safe {
             continue;
@@ -468,11 +467,6 @@ fn annotate_node(
         let Some(oriented) = orient_rf_key(node, sides, expr_order, eq) else {
             continue;
         };
-        let probe_key = column_id_vec(&oriented.probe_expr);
-        let build_key = column_id_vec(&oriented.build_expr);
-        if !seen_keys.insert((probe_key, build_key)) {
-            continue;
-        }
         let filter_id = *next_filter_id;
         *next_filter_id += 1;
         descs.push(RuntimeFilterDesc {
@@ -515,7 +509,6 @@ fn test_null_expr() -> TypedExpr {
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::*;
     use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{

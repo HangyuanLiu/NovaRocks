@@ -563,7 +563,6 @@ Then replace descriptor construction with:
 
 ```rust
     let mut descs: Vec<RuntimeFilterDesc> = Vec::new();
-    let mut seen_keys: HashSet<(Vec<ColumnId>, Vec<ColumnId>)> = HashSet::new();
     for (expr_order, eq) in eq_conditions.iter().enumerate() {
         if eq.null_safe {
             continue;
@@ -574,13 +573,6 @@ Then replace descriptor construction with:
         let Some(oriented) = orient_rf_key(node, sides, expr_order, eq) else {
             continue;
         };
-        let dedup_key = (
-            column_id_vec(&oriented.probe_expr),
-            column_id_vec(&oriented.build_expr),
-        );
-        if !seen_keys.insert(dedup_key) {
-            continue;
-        }
         let filter_id = *next_filter_id;
         *next_filter_id += 1;
         descs.push(RuntimeFilterDesc {
