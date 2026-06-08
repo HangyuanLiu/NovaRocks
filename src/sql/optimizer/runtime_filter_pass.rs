@@ -7,7 +7,7 @@
 
 use crate::sql::analysis::{ExprKind, JoinKind, TypedExpr};
 use crate::sql::column_id::ColumnId;
-use crate::sql::optimizer::operator::{JoinDistribution, Operator};
+use crate::sql::optimizer::operator::{JoinDistribution, Operator, PhysicalHashJoinEqCondition};
 use crate::sql::optimizer::options::OptimizerOptions;
 use crate::sql::optimizer::physical_plan::{JoinExecutionDistribution, PhysicalPlanNode};
 use std::collections::HashSet;
@@ -75,18 +75,30 @@ pub(crate) fn annotate(root: &mut PhysicalPlanNode, options: &OptimizerOptions) 
     annotate_node(root, &mut next_filter_id, options);
 }
 
-/// True if a hash join of this kind should produce runtime filters on its
-/// build side.  Anti-joins and full-outer joins are excluded because they
-/// cannot safely early-filter the probe side.
-fn join_builds_rf(kind: JoinKind) -> bool {
-    matches!(
-        kind,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct JoinRfSides {
+    probe_child: usize,
+    build_child: usize,
+}
+
+/// Runtime filters are only produced when the join semantics allow the true
+/// probe child to be early-filtered by keys from the true build child.
+fn rf_sides_for_join(kind: JoinKind) -> Option<JoinRfSides> {
+    match kind {
         JoinKind::Inner
-            | JoinKind::LeftSemi
-            | JoinKind::RightOuter
-            | JoinKind::RightSemi
-            | JoinKind::RightAnti
-    )
+        | JoinKind::LeftSemi
+        | JoinKind::RightOuter
+        | JoinKind::RightSemi
+        | JoinKind::RightAnti => Some(JoinRfSides {
+            probe_child: 0,
+            build_child: 1,
+        }),
+        JoinKind::LeftOuter
+        | JoinKind::FullOuter
+        | JoinKind::LeftAnti
+        | JoinKind::NullAwareLeftAnti
+        | JoinKind::Cross => None,
+    }
 }
 
 /// Collect ALL column ids referenced by `expr` into `out`.
@@ -198,6 +210,70 @@ fn column_ids(expr: &TypedExpr, out: &mut HashSet<ColumnId>) {
         ExprKind::Literal(_)
         | ExprKind::LambdaParamRef { .. }
         | ExprKind::SubqueryPlaceholder { .. } => {}
+    }
+}
+
+fn column_id_vec(expr: &TypedExpr) -> Vec<ColumnId> {
+    let mut ids = HashSet::new();
+    column_ids(expr, &mut ids);
+    let mut ids: Vec<_> = ids.into_iter().collect();
+    ids.sort();
+    ids
+}
+
+fn child_column_set(node: &PhysicalPlanNode) -> HashSet<ColumnId> {
+    node.output_columns.iter().map(|c| c.column_id).collect()
+}
+
+fn expr_bound_child(node: &PhysicalPlanNode, expr: &TypedExpr) -> Option<usize> {
+    let ids = column_id_vec(expr);
+    if ids.is_empty() {
+        return None;
+    }
+
+    let mut bound_child = None;
+    for (idx, child) in node.children.iter().enumerate() {
+        let child_cols = child_column_set(child);
+        if ids.iter().all(|id| child_cols.contains(id)) {
+            if bound_child.is_some() {
+                return None;
+            }
+            bound_child = Some(idx);
+        }
+    }
+    bound_child
+}
+
+#[derive(Clone, Debug)]
+struct OrientedRfKey {
+    build_expr: TypedExpr,
+    probe_expr: TypedExpr,
+    expr_order: usize,
+}
+
+fn orient_rf_key(
+    node: &PhysicalPlanNode,
+    sides: JoinRfSides,
+    expr_order: usize,
+    eq: &PhysicalHashJoinEqCondition,
+) -> Option<OrientedRfKey> {
+    let left_child = expr_bound_child(node, &eq.left)?;
+    let right_child = expr_bound_child(node, &eq.right)?;
+
+    if left_child == sides.probe_child && right_child == sides.build_child {
+        Some(OrientedRfKey {
+            build_expr: eq.right.clone(),
+            probe_expr: eq.left.clone(),
+            expr_order,
+        })
+    } else if left_child == sides.build_child && right_child == sides.probe_child {
+        Some(OrientedRfKey {
+            build_expr: eq.left.clone(),
+            probe_expr: eq.right.clone(),
+            expr_order,
+        })
+    } else {
+        None
     }
 }
 
@@ -349,7 +425,11 @@ fn annotate_node(
     let Operator::PhysicalHashJoin(join) = &node.op else {
         return;
     };
-    if !join_builds_rf(join.join_type) {
+    let Some(sides) = rf_sides_for_join(join.join_type) else {
+        return;
+    };
+    let max_child = sides.probe_child.max(sides.build_child);
+    if node.children.len() <= max_child {
         return;
     }
     let eq_conditions = join.eq_conditions.clone();
@@ -357,9 +437,8 @@ fn annotate_node(
     if matches!(distribution, JoinDistribution::Unknown) {
         return;
     }
-    // Right child is build side (confirmed via pipeline builder + lowering).
-    let build_size = node.children[1].stats.compute_size();
-    let probe_size = node.children[0].stats.compute_size();
+    let build_size = node.children[sides.build_child].stats.compute_size();
+    let probe_size = node.children[sides.probe_child].stats.compute_size();
 
     // Cast session thresholds (u64 bytes) to f64 for size comparisons.
     let build_max = options.rf_build_max_bytes as f64;
@@ -377,6 +456,7 @@ fn annotate_node(
 
     // Build descriptors for each non-null-safe equi-conjunct.
     let mut descs: Vec<RuntimeFilterDesc> = Vec::new();
+    let mut seen_keys: HashSet<(Vec<ColumnId>, Vec<ColumnId>)> = HashSet::new();
     for (expr_order, eq) in eq_conditions.iter().enumerate() {
         if eq.null_safe {
             continue;
@@ -385,13 +465,21 @@ fn annotate_node(
         if !probe_gate_passes(local, build_size, probe_size, build_min, probe_min, min_sel) {
             continue;
         }
+        let Some(oriented) = orient_rf_key(node, sides, expr_order, eq) else {
+            continue;
+        };
+        let probe_key = column_id_vec(&oriented.probe_expr);
+        let build_key = column_id_vec(&oriented.build_expr);
+        if !seen_keys.insert((probe_key, build_key)) {
+            continue;
+        }
         let filter_id = *next_filter_id;
         *next_filter_id += 1;
         descs.push(RuntimeFilterDesc {
             filter_id,
-            build_expr: eq.right.clone(),
-            probe_expr: eq.left.clone(),
-            expr_order,
+            build_expr: oriented.build_expr,
+            probe_expr: oriented.probe_expr,
+            expr_order: oriented.expr_order,
             distribution: distribution.clone(),
         });
     }
@@ -404,9 +492,9 @@ fn annotate_node(
             filter_id: d.filter_id,
             probe_expr: d.probe_expr.clone(),
         };
-        // children[0] = probe side; descend to the deepest binding node.
+        // Descend into the true probe side to the deepest binding node.
         let _ = push_probe_down(
-            &mut node.children[0],
+            &mut node.children[sides.probe_child],
             &probe,
             options.allow_cross_exchange_rf,
         );
@@ -928,7 +1016,7 @@ mod tests {
             "Cross without equality keys should not build an RF"
         );
         assert!(
-            !join_builds_rf(JoinKind::Cross),
+            rf_sides_for_join(JoinKind::Cross).is_none(),
             "Cross should not be marked RF-producing"
         );
     }
@@ -959,14 +1047,6 @@ mod tests {
         opts.rf_build_max_bytes = 1; // 1 byte -> build gate rejects
         annotate(&mut j, &opts);
         assert!(j.build_runtime_filters.is_empty());
-    }
-
-    fn column_id_vec(expr: &TypedExpr) -> Vec<ColumnId> {
-        let mut ids = HashSet::new();
-        column_ids(expr, &mut ids);
-        let mut ids: Vec<_> = ids.into_iter().collect();
-        ids.sort();
-        ids
     }
 
     fn probe_runtime_filter_count(node: &PhysicalPlanNode) -> usize {
