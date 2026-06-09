@@ -494,7 +494,17 @@ fn handle_analyze_statement(
     }
 
     let columns = analyze_column_list(sql)?.unwrap_or(table_columns(state, &key)?);
-    let rows = collect_column_stats_by_query(state, &key, &columns)?;
+    // Iceberg target: compute + persist Puffin NDV stats for the optimizer
+    // (Spark-consistent: Puffin holds NDV only). Returns lowercased name->ndv;
+    // non-iceberg targets return empty and keep the in-memory-only path below.
+    let ndv_by_name = crate::connector::iceberg::analyze::analyze_iceberg_puffin_stats(
+        state,
+        current_catalog,
+        current_database,
+        &table, // the ObjectName already parsed above (the same value passed to register_external_table_by_name)
+        &columns,
+    )?;
+    let rows = collect_column_stats_by_query(state, &key, &columns, &ndv_by_name)?;
     replace_column_stats(state, &key, rows);
     let status_columns = if columns.len() == table_columns(state, &key)?.len() {
         "ALL".to_string()
@@ -1072,6 +1082,7 @@ fn collect_column_stats_by_query(
     state: &Arc<StandaloneState>,
     key: &TableKey,
     columns: &[String],
+    ndv_by_name: &std::collections::HashMap<String, f64>,
 ) -> Result<Vec<ColumnStatRow>, String> {
     let mut out = Vec::new();
     for column in columns {
@@ -1117,7 +1128,10 @@ fn collect_column_stats_by_query(
             row_count,
             max,
             min,
-            ndv: row_count.to_string(),
+            ndv: ndv_by_name
+                .get(&column.to_lowercase()) // keys are lowercased column names from analyze_iceberg_puffin_stats
+                .map(|v| (v.round() as i64).to_string())
+                .unwrap_or_else(|| row_count.to_string()),
         });
     }
     Ok(out)

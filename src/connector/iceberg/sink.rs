@@ -1438,9 +1438,17 @@ pub(crate) fn compute_theta_sketches_for_batch(
     collect_theta_sketches(batch)
 }
 
-fn collect_theta_sketches(
-    batch: &RecordBatch,
-) -> Option<HashMap<i32, super::theta_sketch::ThetaSketchHandle>> {
+/// Feed every non-null value of `array` into `sketch`, dispatching by Arrow
+/// type. Returns true if at least one value was fed. NaN floats are collapsed
+/// to a single canonical bit pattern so independent NaN encodings count once.
+/// Shared by `collect_theta_sketches` (write path, field-id from Arrow
+/// metadata) and `collect_theta_sketches_by_name` (ANALYZE path, field-id from
+/// an explicit name map). Unsupported/complex types feed nothing -> false.
+fn feed_array_into_sketch(
+    sketch: &mut super::theta_sketch::ThetaSketchHandle,
+    data_type: &DataType,
+    array: &arrow::array::ArrayRef,
+) -> bool {
     use arrow::array::{
         BooleanArray, Date32Array, Date64Array, Decimal128Array, Float32Array, Float64Array,
         Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray,
@@ -1448,7 +1456,113 @@ fn collect_theta_sketches(
         TimestampSecondArray,
     };
     use arrow::datatypes::TimeUnit;
+    let mut updated = false;
+    macro_rules! feed_int {
+        ($ty:ty) => {{
+            if let Some(arr) = array.as_any().downcast_ref::<$ty>() {
+                for i in 0..arr.len() {
+                    if !arr.is_null(i) {
+                        sketch.update(arr.value(i));
+                        updated = true;
+                    }
+                }
+            }
+        }};
+    }
+    match data_type {
+        DataType::Boolean => {
+            if let Some(arr) = array.as_any().downcast_ref::<BooleanArray>() {
+                for i in 0..arr.len() {
+                    if !arr.is_null(i) {
+                        let v: u8 = if arr.value(i) { 1 } else { 0 };
+                        sketch.update(v);
+                        updated = true;
+                    }
+                }
+            }
+        }
+        DataType::Int8 => feed_int!(Int8Array),
+        DataType::Int16 => feed_int!(Int16Array),
+        DataType::Int32 => feed_int!(Int32Array),
+        DataType::Int64 => feed_int!(Int64Array),
+        DataType::Date32 => feed_int!(Date32Array),
+        DataType::Date64 => feed_int!(Date64Array),
+        DataType::Float32 => {
+            if let Some(arr) = array.as_any().downcast_ref::<Float32Array>() {
+                for i in 0..arr.len() {
+                    if !arr.is_null(i) {
+                        let v = arr.value(i);
+                        let bits = if v.is_nan() {
+                            f32::NAN.to_bits()
+                        } else {
+                            v.to_bits()
+                        };
+                        sketch.update(bits);
+                        updated = true;
+                    }
+                }
+            }
+        }
+        DataType::Float64 => {
+            if let Some(arr) = array.as_any().downcast_ref::<Float64Array>() {
+                for i in 0..arr.len() {
+                    if !arr.is_null(i) {
+                        let v = arr.value(i);
+                        let bits = if v.is_nan() {
+                            f64::NAN.to_bits()
+                        } else {
+                            v.to_bits()
+                        };
+                        sketch.update(bits);
+                        updated = true;
+                    }
+                }
+            }
+        }
+        DataType::Decimal128(_, _) => {
+            if let Some(arr) = array.as_any().downcast_ref::<Decimal128Array>() {
+                for i in 0..arr.len() {
+                    if !arr.is_null(i) {
+                        sketch.update(arr.value(i));
+                        updated = true;
+                    }
+                }
+            }
+        }
+        DataType::Utf8 => {
+            if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
+                for i in 0..arr.len() {
+                    if !arr.is_null(i) {
+                        sketch.update(arr.value(i));
+                        updated = true;
+                    }
+                }
+            }
+        }
+        DataType::LargeUtf8 => {
+            if let Some(arr) = array.as_any().downcast_ref::<LargeStringArray>() {
+                for i in 0..arr.len() {
+                    if !arr.is_null(i) {
+                        sketch.update(arr.value(i));
+                        updated = true;
+                    }
+                }
+            }
+        }
+        DataType::Timestamp(unit, _) => match unit {
+            TimeUnit::Second => feed_int!(TimestampSecondArray),
+            TimeUnit::Millisecond => feed_int!(TimestampMillisecondArray),
+            TimeUnit::Microsecond => feed_int!(TimestampMicrosecondArray),
+            TimeUnit::Nanosecond => feed_int!(TimestampNanosecondArray),
+        },
+        _ => {}
+    }
+    updated
+}
 
+fn collect_theta_sketches(
+    batch: &RecordBatch,
+) -> Option<HashMap<i32, super::theta_sketch::ThetaSketchHandle>> {
     use super::theta_sketch::ThetaSketchHandle;
 
     // Apache DataSketches Java/Spark default lg_k = 12 (k = 4096, ~1.5% error)
@@ -1468,192 +1582,7 @@ fn collect_theta_sketches(
         };
         let array = batch.column(col_idx);
         let mut sketch = ThetaSketchHandle::new(LG_K);
-        let mut updated = false;
-        match field.data_type() {
-            DataType::Boolean => {
-                if let Some(arr) = array.as_any().downcast_ref::<BooleanArray>() {
-                    for i in 0..arr.len() {
-                        if !arr.is_null(i) {
-                            let v: u8 = if arr.value(i) { 1 } else { 0 };
-                            sketch.update(v);
-                            updated = true;
-                        }
-                    }
-                }
-            }
-            DataType::Int8 => {
-                if let Some(arr) = array.as_any().downcast_ref::<Int8Array>() {
-                    for i in 0..arr.len() {
-                        if !arr.is_null(i) {
-                            sketch.update(arr.value(i));
-                            updated = true;
-                        }
-                    }
-                }
-            }
-            DataType::Int16 => {
-                if let Some(arr) = array.as_any().downcast_ref::<Int16Array>() {
-                    for i in 0..arr.len() {
-                        if !arr.is_null(i) {
-                            sketch.update(arr.value(i));
-                            updated = true;
-                        }
-                    }
-                }
-            }
-            DataType::Int32 => {
-                if let Some(arr) = array.as_any().downcast_ref::<Int32Array>() {
-                    for i in 0..arr.len() {
-                        if !arr.is_null(i) {
-                            sketch.update(arr.value(i));
-                            updated = true;
-                        }
-                    }
-                }
-            }
-            DataType::Int64 => {
-                if let Some(arr) = array.as_any().downcast_ref::<Int64Array>() {
-                    for i in 0..arr.len() {
-                        if !arr.is_null(i) {
-                            sketch.update(arr.value(i));
-                            updated = true;
-                        }
-                    }
-                }
-            }
-            DataType::Float32 => {
-                if let Some(arr) = array.as_any().downcast_ref::<Float32Array>() {
-                    for i in 0..arr.len() {
-                        if !arr.is_null(i) {
-                            // NaN normalization: collapse all NaNs to a single
-                            // canonical bit pattern before hashing so that two
-                            // independent NaN encodings count as one distinct
-                            // value.
-                            let v = arr.value(i);
-                            let bits = if v.is_nan() {
-                                f32::NAN.to_bits()
-                            } else {
-                                v.to_bits()
-                            };
-                            sketch.update(bits);
-                            updated = true;
-                        }
-                    }
-                }
-            }
-            DataType::Float64 => {
-                if let Some(arr) = array.as_any().downcast_ref::<Float64Array>() {
-                    for i in 0..arr.len() {
-                        if !arr.is_null(i) {
-                            let v = arr.value(i);
-                            let bits = if v.is_nan() {
-                                f64::NAN.to_bits()
-                            } else {
-                                v.to_bits()
-                            };
-                            sketch.update(bits);
-                            updated = true;
-                        }
-                    }
-                }
-            }
-            DataType::Date32 => {
-                if let Some(arr) = array.as_any().downcast_ref::<Date32Array>() {
-                    for i in 0..arr.len() {
-                        if !arr.is_null(i) {
-                            sketch.update(arr.value(i));
-                            updated = true;
-                        }
-                    }
-                }
-            }
-            DataType::Date64 => {
-                if let Some(arr) = array.as_any().downcast_ref::<Date64Array>() {
-                    for i in 0..arr.len() {
-                        if !arr.is_null(i) {
-                            sketch.update(arr.value(i));
-                            updated = true;
-                        }
-                    }
-                }
-            }
-            DataType::Timestamp(unit, _) => match unit {
-                TimeUnit::Second => {
-                    if let Some(arr) = array.as_any().downcast_ref::<TimestampSecondArray>() {
-                        for i in 0..arr.len() {
-                            if !arr.is_null(i) {
-                                sketch.update(arr.value(i));
-                                updated = true;
-                            }
-                        }
-                    }
-                }
-                TimeUnit::Millisecond => {
-                    if let Some(arr) = array.as_any().downcast_ref::<TimestampMillisecondArray>() {
-                        for i in 0..arr.len() {
-                            if !arr.is_null(i) {
-                                sketch.update(arr.value(i));
-                                updated = true;
-                            }
-                        }
-                    }
-                }
-                TimeUnit::Microsecond => {
-                    if let Some(arr) = array.as_any().downcast_ref::<TimestampMicrosecondArray>() {
-                        for i in 0..arr.len() {
-                            if !arr.is_null(i) {
-                                sketch.update(arr.value(i));
-                                updated = true;
-                            }
-                        }
-                    }
-                }
-                TimeUnit::Nanosecond => {
-                    if let Some(arr) = array.as_any().downcast_ref::<TimestampNanosecondArray>() {
-                        for i in 0..arr.len() {
-                            if !arr.is_null(i) {
-                                sketch.update(arr.value(i));
-                                updated = true;
-                            }
-                        }
-                    }
-                }
-            },
-            DataType::Decimal128(_, _) => {
-                if let Some(arr) = array.as_any().downcast_ref::<Decimal128Array>() {
-                    for i in 0..arr.len() {
-                        if !arr.is_null(i) {
-                            sketch.update(arr.value(i));
-                            updated = true;
-                        }
-                    }
-                }
-            }
-            DataType::Utf8 => {
-                if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
-                    for i in 0..arr.len() {
-                        if !arr.is_null(i) {
-                            sketch.update(arr.value(i));
-                            updated = true;
-                        }
-                    }
-                }
-            }
-            DataType::LargeUtf8 => {
-                if let Some(arr) = array.as_any().downcast_ref::<LargeStringArray>() {
-                    for i in 0..arr.len() {
-                        if !arr.is_null(i) {
-                            sketch.update(arr.value(i));
-                            updated = true;
-                        }
-                    }
-                }
-            }
-            // Nested types (struct/list/map), binary, and other unsupported
-            // primitives are intentionally skipped — the Iceberg spec only
-            // requires NDV sketches for primitive scalar columns.
-            _ => {}
-        }
+        let updated = feed_array_into_sketch(&mut sketch, field.data_type(), array);
         if updated {
             sketches.insert(field_id, sketch);
         }
@@ -1664,6 +1593,30 @@ fn collect_theta_sketches(
     } else {
         Some(sketches)
     }
+}
+
+/// Build per-field Theta sketches from a `RecordBatch` whose columns carry no
+/// iceberg field-id metadata (e.g. an `execute_query` scan result), using an
+/// explicit lowercased-column-name -> field_id map. Columns absent from the map,
+/// or of unsupported type, are skipped. Sketches accumulate per call; union
+/// across batches via `ThetaSketchHandle::union` at the call site.
+pub(crate) fn collect_theta_sketches_by_name(
+    batch: &RecordBatch,
+    name_to_field_id: &HashMap<String, i32>,
+) -> HashMap<i32, super::theta_sketch::ThetaSketchHandle> {
+    const LG_K: u8 = 12;
+    let schema = batch.schema();
+    let mut sketches = HashMap::new();
+    for (col_idx, field) in schema.fields().iter().enumerate() {
+        let Some(&field_id) = name_to_field_id.get(&field.name().to_lowercase()) else {
+            continue;
+        };
+        let mut sketch = super::theta_sketch::ThetaSketchHandle::new(LG_K);
+        if feed_array_into_sketch(&mut sketch, field.data_type(), batch.column(col_idx)) {
+            sketches.insert(field_id, sketch);
+        }
+    }
+    sketches
 }
 
 fn merge_statistics(current: &mut Statistics, next: &Statistics) {
@@ -1991,14 +1944,46 @@ mod tests {
     use super::{
         ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID, ICEBERG_POSITION_DELETE_POS_FIELD_ID,
         IcebergSinkMode, IcebergSinkPlan, IcebergTableSinkBackend, IcebergTableSinkFactory,
-        align_arrays_to_schema, build_position_delete_output_schema, iceberg_partition_key_for_row,
-        unique_file_path, write_parquet_to_bytes,
+        align_arrays_to_schema, build_position_delete_output_schema,
+        collect_theta_sketches_by_name, iceberg_partition_key_for_row, unique_file_path,
+        write_parquet_to_bytes,
     };
     use crate::connector::iceberg::data_writer::{StagedWriteOptions, write_record_batches};
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::expr::ExprNode;
     use crate::runtime::runtime_state::RuntimeState;
     use crate::{common::ids::SlotId, common::types::UniqueId};
+
+    #[test]
+    fn collect_theta_sketches_by_name_keys_by_explicit_map() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        // No PARQUET_FIELD_ID_META_KEY metadata on fields (mirrors a query result).
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("s", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 1, 2, 3])), // 3 distinct
+                Arc::new(StringArray::from(vec!["a", "a", "b", "b"])), // 2 distinct
+            ],
+        )
+        .unwrap();
+        let mut name_to_field_id = HashMap::new();
+        name_to_field_id.insert("k".to_string(), 7_i32);
+        name_to_field_id.insert("s".to_string(), 9_i32);
+
+        let sketches = collect_theta_sketches_by_name(&batch, &name_to_field_id);
+        assert!((sketches[&7].estimate() - 3.0).abs() < 0.5, "k ndv ~3");
+        assert!((sketches[&9].estimate() - 2.0).abs() < 0.5, "s ndv ~2");
+        assert!(!sketches.contains_key(&999));
+    }
 
     #[test]
     fn iceberg_table_sink_factory_creates_async_sink_operator() {

@@ -306,7 +306,7 @@ async fn read_previous_sketches(
 }
 
 /// Write a new Puffin file holding one Theta blob per primitive column.
-async fn write_puffin(
+pub(crate) async fn write_puffin(
     file_io: &FileIO,
     puffin_path: &str,
     snapshot_id: i64,
@@ -421,7 +421,7 @@ async fn read_footer_size(
 /// same `snap-<id>-<seq>-<uuid>.stats` pattern, but for NovaRocks we keep
 /// things deterministic with a fixed suffix that is recoverable from the
 /// snapshot id alone.
-fn puffin_path_for_snapshot(table_metadata: &TableMetadata, snapshot_id: i64) -> String {
+pub(crate) fn puffin_path_for_snapshot(table_metadata: &TableMetadata, snapshot_id: i64) -> String {
     let location = table_metadata.location().trim_end_matches('/');
     format!("{location}/metadata/snap-{snapshot_id}-statistics.puffin")
 }
@@ -501,5 +501,71 @@ mod tests {
         assert_eq!(merged.len(), 2);
         assert!(merged.contains_key(&1));
         assert!(merged.contains_key(&2));
+    }
+
+    /// Round-trip: write a Puffin file via `write_puffin` for one field with
+    /// ~500 distinct values, then read its Theta blob back through the same
+    /// `PuffinReader` path the loader uses and assert the recovered NDV is
+    /// within +/-10% of 500. FileIO is constructed the same way the
+    /// `stats_loader` tests do (`FileIO::new_with_fs()` + a `file://` path).
+    #[tokio::test]
+    async fn write_puffin_then_read_ndv_roundtrips() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rt.puffin");
+        let path_str = format!("file://{}", path.display());
+        let file_io = FileIO::new_with_fs();
+
+        let mut sketch = ThetaSketchHandle::new(12);
+        for i in 0..500_i64 {
+            sketch.update(i);
+        }
+        let mut sketches = HashMap::new();
+        sketches.insert(3_i32, sketch);
+
+        let sf = write_puffin(&file_io, &path_str, 100, 1, &sketches)
+            .await
+            .expect("write_puffin ok")
+            .expect("statistics file present");
+
+        // Returned StatisticsFile structure.
+        assert_eq!(sf.snapshot_id, 100);
+        assert_eq!(sf.blob_metadata.len(), 1);
+        assert_eq!(sf.blob_metadata[0].fields, vec![3]);
+        assert_eq!(sf.blob_metadata[0].r#type, APACHE_DATASKETCHES_THETA_V1);
+        assert!(sf.file_size_in_bytes > 0);
+
+        // Real NDV read-back through the same PuffinReader + ThetaSketchHandle
+        // decode path the loader uses (see `read_previous_sketches`).
+        let recovered = read_previous_sketches_from_path(&file_io, &sf.statistics_path).await;
+        let ndv = recovered.get(&3).expect("field 3 present").estimate();
+        assert!(
+            (450.0..=550.0).contains(&ndv),
+            "field 3 NDV {ndv} should be ~500 (within +/-10%)"
+        );
+    }
+
+    /// Test helper: read every Theta blob from a Puffin file at `path` and
+    /// decode it back into a `field_id -> ThetaSketchHandle` map. Mirrors the
+    /// reader path used by `read_previous_sketches` / `StatsLoader`.
+    async fn read_previous_sketches_from_path(
+        file_io: &FileIO,
+        path: &str,
+    ) -> HashMap<i32, ThetaSketchHandle> {
+        let input_file = file_io.new_input(path).expect("open puffin");
+        let reader = PuffinReader::new(input_file);
+        let file_metadata = reader.file_metadata().await.expect("read puffin metadata");
+        let mut out = HashMap::new();
+        for blob_metadata in file_metadata.blobs() {
+            if blob_metadata.blob_type() != APACHE_DATASKETCHES_THETA_V1 {
+                continue;
+            }
+            let Some(&field_id) = blob_metadata.fields().first() else {
+                continue;
+            };
+            let blob = reader.blob(blob_metadata).await.expect("read blob");
+            let sketch = ThetaSketchHandle::deserialize(blob.data()).expect("deserialize sketch");
+            out.insert(field_id, sketch);
+        }
+        out
     }
 }
