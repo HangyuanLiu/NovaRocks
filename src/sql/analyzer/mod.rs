@@ -1840,6 +1840,19 @@ impl<'a> AnalyzerContext<'a> {
             }
         }
 
+        // Pre-aggregation (FROM) scope used to rebind aggregate arguments
+        // below. An ORDER BY aggregate's argument must reference a base column,
+        // not a projection alias of the same name. Built once; rebuilding it
+        // from base-table scans reuses their ColumnIds (no minting), so it has
+        // no effect on non-aggregate ORDER BY items.
+        let order_by_from_scope: Option<AnalyzerScope> = match body {
+            QueryBody::Select(sel) => sel
+                .from
+                .as_ref()
+                .and_then(|rel| self.rebuild_from_scope(rel).ok().map(|(_, scope)| scope)),
+            _ => None,
+        };
+
         let mut sort_items = Vec::with_capacity(order_by_exprs.len());
         for ob in order_by_exprs {
             // Try resolving against the projection scope first, then fall back
@@ -2015,6 +2028,17 @@ impl<'a> AnalyzerContext<'a> {
                 }
             };
 
+            // Rebind columns inside aggregate arguments to the base FROM scope.
+            // The projection-scope resolution above can mis-bind a column
+            // *inside* an aggregate (e.g. `v1` in `ORDER BY abs(min(v1)) +
+            // abs(v1)` where `min(v1) AS v1` shadows the base column), minting a
+            // phantom ColumnId the aggregate's child scope never produces. Only
+            // aggregate args are touched; top-level references are unchanged.
+            let typed = match &order_by_from_scope {
+                Some(from_scope) => self.rebind_order_by_agg_args(typed, from_scope, false),
+                None => typed,
+            };
+
             let asc = ob.options.asc.unwrap_or(true);
             let nulls_first = ob.options.nulls_first.unwrap_or(asc);
 
@@ -2053,6 +2077,178 @@ impl<'a> AnalyzerContext<'a> {
         }
 
         Ok(sort_items)
+    }
+
+    /// Rebind `ColumnRef`s that occur inside an aggregate argument to the
+    /// pre-aggregation `from_scope`, so an ORDER BY aggregate binds its
+    /// argument to the base column rather than a SELECT alias of the same
+    /// name. Aggregates cannot nest, so once `inside_agg` is set every
+    /// `ColumnRef` reached is an aggregate argument and is re-resolved by name
+    /// against the FROM scope (kept as-is when the name is not a base column).
+    /// Top-level references (`inside_agg == false`) are returned unchanged —
+    /// they may legitimately point at projection outputs (for example a FULL
+    /// OUTER USING coalesce column that is only valid above the Project).
+    fn rebind_order_by_agg_args(
+        &self,
+        expr: TypedExpr,
+        from_scope: &AnalyzerScope,
+        inside_agg: bool,
+    ) -> TypedExpr {
+        let TypedExpr {
+            kind,
+            data_type,
+            nullable,
+        } = expr;
+        let kind = match kind {
+            ExprKind::ColumnRef {
+                column_id,
+                qualifier,
+                column,
+            } => {
+                let column_id = if inside_agg {
+                    match from_scope.resolve(qualifier.as_deref(), &column) {
+                        Ok((base_id, _, _)) => base_id,
+                        Err(_) => column_id,
+                    }
+                } else {
+                    column_id
+                };
+                ExprKind::ColumnRef {
+                    column_id,
+                    qualifier,
+                    column,
+                }
+            }
+            ExprKind::AggregateCall {
+                name,
+                args,
+                distinct,
+                order_by,
+            } => ExprKind::AggregateCall {
+                name,
+                args: args
+                    .into_iter()
+                    .map(|arg| self.rebind_order_by_agg_args(arg, from_scope, true))
+                    .collect(),
+                distinct,
+                order_by: order_by
+                    .into_iter()
+                    .map(|item| SortItem {
+                        expr: self.rebind_order_by_agg_args(item.expr, from_scope, true),
+                        asc: item.asc,
+                        nulls_first: item.nulls_first,
+                    })
+                    .collect(),
+            },
+            ExprKind::BinaryOp { left, op, right } => ExprKind::BinaryOp {
+                left: Box::new(self.rebind_order_by_agg_args(*left, from_scope, inside_agg)),
+                op,
+                right: Box::new(self.rebind_order_by_agg_args(*right, from_scope, inside_agg)),
+            },
+            ExprKind::UnaryOp { op, expr: inner } => ExprKind::UnaryOp {
+                op,
+                expr: Box::new(self.rebind_order_by_agg_args(*inner, from_scope, inside_agg)),
+            },
+            ExprKind::FunctionCall {
+                name,
+                args,
+                distinct,
+            } => ExprKind::FunctionCall {
+                name,
+                args: args
+                    .into_iter()
+                    .map(|arg| self.rebind_order_by_agg_args(arg, from_scope, inside_agg))
+                    .collect(),
+                distinct,
+            },
+            ExprKind::Cast {
+                expr: inner,
+                target,
+            } => ExprKind::Cast {
+                expr: Box::new(self.rebind_order_by_agg_args(*inner, from_scope, inside_agg)),
+                target,
+            },
+            ExprKind::IsNull {
+                expr: inner,
+                negated,
+            } => ExprKind::IsNull {
+                expr: Box::new(self.rebind_order_by_agg_args(*inner, from_scope, inside_agg)),
+                negated,
+            },
+            ExprKind::IsTruthValue {
+                expr: inner,
+                value,
+                negated,
+            } => ExprKind::IsTruthValue {
+                expr: Box::new(self.rebind_order_by_agg_args(*inner, from_scope, inside_agg)),
+                value,
+                negated,
+            },
+            ExprKind::Nested(inner) => ExprKind::Nested(Box::new(
+                self.rebind_order_by_agg_args(*inner, from_scope, inside_agg),
+            )),
+            ExprKind::InList {
+                expr: inner,
+                list,
+                negated,
+            } => ExprKind::InList {
+                expr: Box::new(self.rebind_order_by_agg_args(*inner, from_scope, inside_agg)),
+                list: list
+                    .into_iter()
+                    .map(|item| self.rebind_order_by_agg_args(item, from_scope, inside_agg))
+                    .collect(),
+                negated,
+            },
+            ExprKind::Between {
+                expr: inner,
+                low,
+                high,
+                negated,
+            } => ExprKind::Between {
+                expr: Box::new(self.rebind_order_by_agg_args(*inner, from_scope, inside_agg)),
+                low: Box::new(self.rebind_order_by_agg_args(*low, from_scope, inside_agg)),
+                high: Box::new(self.rebind_order_by_agg_args(*high, from_scope, inside_agg)),
+                negated,
+            },
+            ExprKind::Like {
+                expr: inner,
+                pattern,
+                negated,
+            } => ExprKind::Like {
+                expr: Box::new(self.rebind_order_by_agg_args(*inner, from_scope, inside_agg)),
+                pattern: Box::new(self.rebind_order_by_agg_args(*pattern, from_scope, inside_agg)),
+                negated,
+            },
+            ExprKind::Case {
+                operand,
+                when_then,
+                else_expr,
+            } => ExprKind::Case {
+                operand: operand
+                    .map(|e| Box::new(self.rebind_order_by_agg_args(*e, from_scope, inside_agg))),
+                when_then: when_then
+                    .into_iter()
+                    .map(|(when, then)| {
+                        (
+                            self.rebind_order_by_agg_args(when, from_scope, inside_agg),
+                            self.rebind_order_by_agg_args(then, from_scope, inside_agg),
+                        )
+                    })
+                    .collect(),
+                else_expr: else_expr
+                    .map(|e| Box::new(self.rebind_order_by_agg_args(*e, from_scope, inside_agg))),
+            },
+            // Leaves and node kinds that cannot carry an aggregate argument
+            // needing a base-column rebind (Literal, LambdaParamRef,
+            // SubqueryPlaceholder, WindowCall, LambdaFunction, Lambda): keep
+            // as-is. This mirrors substitute_select_aliases_inner's coverage.
+            other => other,
+        };
+        TypedExpr {
+            kind,
+            data_type,
+            nullable,
+        }
     }
 }
 
