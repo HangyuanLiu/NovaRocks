@@ -168,7 +168,14 @@ fn inner_rows(
             confidence_inputs.push(confidence);
             let (denominator, invalid_ndv) = ndv_denominator(left_ndv, right_ndv);
             used_default_or_invalid |= invalid_ndv;
-            let selectivity = if confidence != Confidence::Exact {
+            // Only a true Fallback NDV (no real stats, default DEFAULT_JOIN_KEY_NDV)
+            // triggers the many-to-many hedge. An Estimated NDV is a real value
+            // derived through joins/filters from base stats, so use the standard
+            // |L|*|R|/max(ndv) denominator just like Exact. Previously Estimated
+            // was lumped with Fallback (`!= Exact`), which made deep joins whose
+            // key NDV was correctly propagated still collapse to many-to-many
+            // (e.g. tpc-ds q72's depth-4 catalog_sales x customer_demographics).
+            let selectivity = if confidence == Confidence::Fallback {
                 fallback_key_count += 1;
                 if fallback_key_count > 1 {
                     PREDICATE_UNKNOWN_FILTER
@@ -472,7 +479,12 @@ mod tests {
     }
 
     #[test]
-    fn estimated_inner_key_keeps_fact_side_scale() {
+    fn estimated_inner_key_uses_ndv_denominator() {
+        // An Estimated NDV is a real value derived (through joins/filters) from
+        // base stats, so the inner join uses the standard |L|*|R|/max(ndv)
+        // denominator — NOT the many-to-many hedge, which is reserved for
+        // Fallback (no-stats, default-NDV) keys. (Previously Estimated was lumped
+        // with Fallback and this kept the fact-side max_rows scale.)
         let (rows, conf) = estimate_join_cardinality(&inp_with_key_conf(
             JoinKind::Inner,
             4_861_000.0,
@@ -481,8 +493,14 @@ mod tests {
             Confidence::Estimated,
         ));
 
-        assert_eq!(conf, Confidence::Fallback);
-        assert!((rows - 4_861_000.0).abs() < 1.0, "got {rows}");
+        // 4_861_000 * 8_100 / 10_000 ~= 3.94M (System-R denominator estimate).
+        let expected = 4_861_000.0 * 8_100.0 / 10_000.0;
+        assert!(
+            (rows - expected).abs() < 1.0,
+            "got {rows}, expected {expected}"
+        );
+        // A derived NDV must not be downgraded to Fallback.
+        assert_ne!(conf, Confidence::Fallback);
     }
 
     #[test]
