@@ -537,6 +537,10 @@ impl IcebergWriteTransactionExecutor for MutationWriteExecutor {
     fn finalize(&self, _spec: &IcebergWriteTransactionSpec) -> Result<(), String> {
         self.commit_executor.finalize()
     }
+
+    fn has_preloaded_commit_output(&self) -> bool {
+        self.collector.has_injected_written_files()
+    }
 }
 
 impl MutationWriteExecutor {

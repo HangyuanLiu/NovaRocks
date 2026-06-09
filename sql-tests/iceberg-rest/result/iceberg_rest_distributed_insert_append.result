@@ -1,0 +1,15 @@
+-- query 5
+id	region	amount
+1	us	7
+2	eu	7
+
+-- query 7
+id	region	amount
+1	us	7
+2	eu	7
+11	us	7
+12	eu	7
+
+-- query 9
+n
+4

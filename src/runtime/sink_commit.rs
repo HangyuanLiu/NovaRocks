@@ -69,6 +69,13 @@ pub(crate) fn unregister(finst_id: UniqueId) {
     guard.remove(&finst_id);
 }
 
+#[cfg(test)]
+pub(crate) fn contains(finst_id: UniqueId) -> bool {
+    let store = store();
+    let guard = store.mu.lock().expect("sink commit store lock");
+    guard.contains_key(&finst_id)
+}
+
 pub(crate) fn add(finst_id: UniqueId, info: TSinkCommitInfo) {
     let store = store();
     let mut guard = store.mu.lock().expect("sink commit store lock");

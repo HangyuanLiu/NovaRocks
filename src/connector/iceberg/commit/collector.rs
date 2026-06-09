@@ -222,6 +222,14 @@ impl IcebergCommitCollector {
         }
     }
 
+    pub(crate) fn has_injected_written_files(&self) -> bool {
+        !self
+            .injected
+            .lock()
+            .expect("collector injected lock poisoned")
+            .is_empty()
+    }
+
     /// Convert one writer-reported sink commit payload without mutating the
     /// collector. This lets callers validate all writer payloads before any file
     /// becomes visible to the commit-action or abort log.

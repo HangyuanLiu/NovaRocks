@@ -100,6 +100,10 @@ pub(crate) trait IcebergWriteTransactionExecutor {
 
     /// Post-commit finalization (cache invalidation, dictionary stale marking).
     fn finalize(&self, spec: &IcebergWriteTransactionSpec) -> Result<(), String>;
+
+    fn has_preloaded_commit_output(&self) -> bool {
+        false
+    }
 }
 
 /// Reusable Iceberg commit/finalize context for coordinated writer output.
@@ -282,6 +286,7 @@ impl<'a, E: IcebergWriteTransactionExecutor> IcebergWriteTransactionRunner<'a, E
 
         let Some(write_commit) = written.write_commit.as_ref().filter(|c| {
             write_commit_has_files(c)
+                || self.executor.has_preloaded_commit_output()
                 || !matches!(spec.commit.commit_op_kind, CommitOpKind::FastAppend)
         }) else {
             self.transition(operation_id, IcebergOperationState::Aborting)?;
@@ -497,6 +502,7 @@ mod tests {
         write: RefCell<Option<Result<CoordinatedQueryResult, String>>>,
         commit: RefCell<Option<Result<CommitOutcome, CommitServiceError>>>,
         finalize: Result<(), String>,
+        preloaded_commit_output: bool,
     }
 
     impl IcebergWriteTransactionExecutor for FakeExecutor {
@@ -524,6 +530,10 @@ mod tests {
         fn finalize(&self, _spec: &IcebergWriteTransactionSpec) -> Result<(), String> {
             self.finalize.clone()
         }
+
+        fn has_preloaded_commit_output(&self) -> bool {
+            self.preloaded_commit_output
+        }
     }
 
     fn one_writer_abort() -> crate::runtime::write_coordinator::WriteAbortInput {
@@ -544,6 +554,7 @@ mod tests {
                 written_manifest_paths: vec!["s3://bucket/m.avro".to_string()],
             }))),
             finalize: Ok(()),
+            preloaded_commit_output: false,
         };
         let runner = IcebergWriteTransactionRunner::new(Arc::clone(&env.state), &exec);
         let outcome = runner.run(sample_spec()).expect("run");
@@ -575,6 +586,7 @@ mod tests {
             }))),
             commit: RefCell::new(None),
             finalize: Ok(()),
+            preloaded_commit_output: false,
         };
         let runner = IcebergWriteTransactionRunner::new(Arc::clone(&env.state), &exec);
         let err = runner.run(sample_spec()).expect_err("abort surfaces error");
@@ -596,6 +608,7 @@ mod tests {
             write: RefCell::new(Some(Err("coordinated write failed".to_string()))),
             commit: RefCell::new(None),
             finalize: Ok(()),
+            preloaded_commit_output: false,
         };
         let runner = IcebergWriteTransactionRunner::new(Arc::clone(&env.state), &exec);
         let err = runner
@@ -638,6 +651,7 @@ mod tests {
                 },
             }))),
             finalize: Ok(()),
+            preloaded_commit_output: false,
         };
         let runner = IcebergWriteTransactionRunner::new(Arc::clone(&env.state), &exec);
         let err = runner
@@ -675,6 +689,7 @@ mod tests {
                 },
             }))),
             finalize: Err("finalize must not be called".to_string()),
+            preloaded_commit_output: false,
         };
         let runner = IcebergWriteTransactionRunner::new(Arc::clone(&env.state), &exec);
         let _ = runner
@@ -705,6 +720,7 @@ mod tests {
                 written_manifest_paths: Vec::new(),
             }))),
             finalize: Err("cache invalidation failed".to_string()),
+            preloaded_commit_output: false,
         };
         let runner = IcebergWriteTransactionRunner::new(Arc::clone(&env.state), &exec);
         let err = runner
@@ -735,6 +751,7 @@ mod tests {
             }))),
             commit: RefCell::new(None),
             finalize: Ok(()),
+            preloaded_commit_output: false,
         };
         let runner = IcebergWriteTransactionRunner::new(Arc::clone(&env.state), &exec);
         let outcome = runner.run(sample_spec()).expect("empty is OK");
@@ -761,6 +778,7 @@ mod tests {
             }))),
             commit: RefCell::new(None),
             finalize: Ok(()),
+            preloaded_commit_output: false,
         };
         let runner = IcebergWriteTransactionRunner::new(Arc::clone(&env.state), &exec);
         let outcome = runner
@@ -777,5 +795,37 @@ mod tests {
             .expect("load")
             .expect("present");
         assert_eq!(stored.state, IcebergOperationState::Aborted);
+    }
+
+    #[test]
+    fn runner_commits_fast_append_with_preloaded_local_output() {
+        let env = test_env();
+        let exec = FakeExecutor {
+            write: RefCell::new(Some(Ok(CoordinatedQueryResult {
+                query_result: empty_query_result(),
+                write_commit: Some(write_commit_with_writer_without_files()),
+                write_abort: None,
+            }))),
+            commit: RefCell::new(Some(Ok(CommitOutcome {
+                new_snapshot_id: 4321,
+                written_manifest_paths: vec!["s3://bucket/preloaded.avro".to_string()],
+            }))),
+            finalize: Ok(()),
+            preloaded_commit_output: true,
+        };
+        let runner = IcebergWriteTransactionRunner::new(Arc::clone(&env.state), &exec);
+        let outcome = runner
+            .run(sample_spec())
+            .expect("preloaded local output must be committed");
+        assert_eq!(outcome.committed_snapshot_id, Some(4321));
+
+        let read = env.provider.begin_read().expect("read txn");
+        let stored = env
+            .state
+            .iceberg_operation_repo
+            .load_operation(read.as_ref(), outcome.operation_id.expect("operation id"))
+            .expect("load")
+            .expect("present");
+        assert_eq!(stored.state, IcebergOperationState::Finalized);
     }
 }

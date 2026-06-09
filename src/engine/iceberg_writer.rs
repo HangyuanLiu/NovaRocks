@@ -502,13 +502,14 @@ fn wrap_insert_query_with_target_projection(
     for column in target_columns {
         let target_name = crate::engine::catalog::normalize_identifier(&column.name)?;
         let expr = if let Some(source_idx) = insert_idx_by_target.get(&target_name) {
-            format!(
+            let source_expr = format!(
                 "{}.{}",
                 sql_identifier(source_alias),
                 sql_identifier(&insert_columns[*source_idx])
-            )
+            );
+            target_cast_expr_sql(&source_expr, column)?
         } else {
-            omitted_column_expr_sql(column)?
+            target_cast_expr_sql(&omitted_column_expr_sql(column)?, column)?
         };
         projection.push(format!("{expr} AS {}", sql_identifier(&column.name)));
     }
@@ -551,7 +552,8 @@ fn values_append_source_to_query(
         .map(|row| {
             let values = row
                 .iter()
-                .map(literal_to_sql)
+                .zip(target_columns.iter())
+                .map(|(literal, column)| target_literal_expr_sql(literal, column))
                 .collect::<Result<Vec<_>, _>>()?
                 .join(", ");
             Ok(format!("({values})"))
@@ -594,6 +596,17 @@ fn omitted_column_expr_sql(column: &ColumnDef) -> Result<String, String> {
     let literal =
         crate::connector::iceberg::default_value::iceberg_literal_to_ast(write_default, &sql_type)?;
     literal_to_sql(&literal)
+}
+
+fn target_literal_expr_sql(literal: &Literal, column: &ColumnDef) -> Result<String, String> {
+    target_cast_expr_sql(&literal_to_sql(literal)?, column)
+}
+
+fn target_cast_expr_sql(expr_sql: &str, column: &ColumnDef) -> Result<String, String> {
+    Ok(format!(
+        "CAST({expr_sql} AS {})",
+        arrow_data_type_to_sql_type_name(&column.data_type)?
+    ))
 }
 
 fn parse_generated_query(sql: &str, context: &str) -> Result<sqlparser::ast::Query, String> {
@@ -804,6 +817,10 @@ impl IcebergWriteTransactionExecutor for InsertOrOverwriteWriteExecutor {
 
     fn finalize(&self, _spec: &IcebergWriteTransactionSpec) -> Result<(), String> {
         self.commit_executor.finalize()
+    }
+
+    fn has_preloaded_commit_output(&self) -> bool {
+        self.collector.has_injected_written_files()
     }
 }
 
@@ -1229,7 +1246,75 @@ mod tests {
         };
         let row = values.rows.first().expect("one row");
         let rendered: Vec<String> = row.iter().map(ToString::to_string).collect();
-        assert_eq!(rendered, vec!["10", "5", "30"]);
+        assert_eq!(
+            rendered,
+            vec!["CAST(10 AS INT)", "CAST(5 AS INT)", "CAST(30 AS INT)"]
+        );
+    }
+
+    #[test]
+    fn append_source_to_query_values_casts_literals_to_target_types() {
+        let target_columns = vec![
+            test_column("id", DataType::Int64, None),
+            test_column("region", DataType::Utf8, None),
+            test_column("amount", DataType::Float64, None),
+        ];
+        let source = InsertSource::Values(vec![
+            vec![
+                crate::sql::parser::ast::Literal::Int(1),
+                crate::sql::parser::ast::Literal::String("us".to_string()),
+                crate::sql::parser::ast::Literal::Float(10.5),
+            ],
+            vec![
+                crate::sql::parser::ast::Literal::Int(2),
+                crate::sql::parser::ast::Literal::String("eu".to_string()),
+                crate::sql::parser::ast::Literal::Float(20.0),
+            ],
+        ]);
+
+        let query =
+            append_source_to_query(&source, &[], &target_columns).expect("append source query");
+
+        let sqlast::SetExpr::Values(values) = query.body.as_ref() else {
+            panic!("expected VALUES query, got: {query}");
+        };
+        let first_row: Vec<String> = values.rows[0].iter().map(ToString::to_string).collect();
+        let second_row: Vec<String> = values.rows[1].iter().map(ToString::to_string).collect();
+        assert_eq!(
+            first_row,
+            vec![
+                "CAST(1 AS BIGINT)",
+                "CAST('us' AS STRING)",
+                "CAST(10.5 AS DOUBLE)"
+            ]
+        );
+        assert_eq!(
+            second_row,
+            vec![
+                "CAST(2 AS BIGINT)",
+                "CAST('eu' AS STRING)",
+                "CAST(20 AS DOUBLE)"
+            ]
+        );
+    }
+
+    #[test]
+    fn append_source_to_query_values_rejects_column_list_width_mismatch() {
+        let target_columns = vec![
+            test_column("a", DataType::Int32, None),
+            test_column("b", DataType::Int32, None),
+        ];
+        let source = InsertSource::Values(vec![vec![
+            crate::sql::parser::ast::Literal::Int(1),
+            crate::sql::parser::ast::Literal::Int(2),
+        ]]);
+
+        let err = append_source_to_query(&source, &["a".to_string()], &target_columns)
+            .expect_err("extra value must be rejected");
+        assert!(
+            err.contains("expected 1 values for column list, got 2"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -1261,7 +1346,7 @@ mod tests {
         );
         assert!(
             rendered.starts_with(
-                "SELECT `__nr_insert_src`.`a` AS `a`, 7 AS `b`, `__nr_insert_src`.`c` AS `c`"
+                "SELECT CAST(`__nr_insert_src`.`a` AS INT) AS `a`, CAST(7 AS INT) AS `b`, CAST(`__nr_insert_src`.`c` AS INT) AS `c`"
             ),
             "projection should target table column order, got: {rendered}"
         );

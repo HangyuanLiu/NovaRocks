@@ -28,6 +28,15 @@ pub(crate) fn reorder_insert_rows(
     if insert_columns.is_empty() {
         return Ok(rows.to_vec());
     }
+    for row in rows {
+        if row.len() != insert_columns.len() {
+            return Err(format!(
+                "insert column count mismatch: expected {} values for column list, got {}",
+                insert_columns.len(),
+                row.len()
+            ));
+        }
+    }
     let mapping = build_insert_column_mapping(insert_columns, target_columns)?;
     rows.iter()
         .map(|row| reorder_insert_row(row, &mapping, target_columns))
@@ -662,6 +671,34 @@ mod tests {
         let result = reorder_insert_rows(&rows, &insert_columns, &target_columns).expect("reorder");
         assert_eq!(result[0][0], Literal::Int(1));
         assert_eq!(result[0][1], Literal::Int(5));
+    }
+
+    #[test]
+    fn reorder_insert_row_rejects_extra_values_for_column_list() {
+        let target_columns = vec![
+            ColumnDef {
+                name: "a".to_string(),
+                data_type: DataType::Int32,
+                nullable: true,
+                write_default: None,
+                logical_type: None,
+            },
+            ColumnDef {
+                name: "b".to_string(),
+                data_type: DataType::Int32,
+                nullable: true,
+                write_default: None,
+                logical_type: None,
+            },
+        ];
+        let rows = vec![vec![Literal::Int(1), Literal::Int(2)]];
+        let insert_columns = vec!["a".to_string()];
+        let err = reorder_insert_rows(&rows, &insert_columns, &target_columns)
+            .expect_err("extra value must be rejected");
+        assert!(
+            err.contains("expected 1 values for column list, got 2"),
+            "got: {err}"
+        );
     }
 
     #[test]
