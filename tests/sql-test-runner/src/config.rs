@@ -402,8 +402,17 @@ pub fn suite_default_db(suite_name: &str) -> String {
 }
 
 pub fn suite_default_catalog(suite_name: &str) -> String {
-    let _ = suite_name;
-    "default_catalog".to_string()
+    match suite_name {
+        // The optimizer suite uses iceberg base tables so that ANALYZE-derived
+        // NDV (Puffin statistics) reaches the cost-based optimizer; managed-lake
+        // (StarRocks-type) tables are intentionally not exercised here. The
+        // `iceberg_opt` catalog is created by `sql-tests/optimizer/init.sql`. A
+        // stable catalog name is safe: each worktree's standalone-server has its
+        // own in-memory catalog registry, and per-case `${case_db}` reset
+        // isolates data between cases.
+        "optimizer" => "iceberg_opt".to_string(),
+        _ => "default_catalog".to_string(),
+    }
 }
 
 pub fn suite_auto_case_db(suite_name: &str) -> bool {

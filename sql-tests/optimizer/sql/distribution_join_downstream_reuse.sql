@@ -5,6 +5,8 @@ CREATE TABLE ${case_db}.oq8_down_l (k INT, v INT);
 CREATE TABLE ${case_db}.oq8_down_r (k INT, w INT);
 INSERT INTO ${case_db}.oq8_down_l VALUES (1, 10), (2, 20), (3, 30);
 INSERT INTO ${case_db}.oq8_down_r VALUES (1, 100), (2, 200), (3, 300);
+ANALYZE TABLE ${case_db}.oq8_down_l;
+ANALYZE TABLE ${case_db}.oq8_down_r;
 
 -- @explain_contains=HASH JOIN (PARTITIONED
 -- @explain_contains=WINDOW [

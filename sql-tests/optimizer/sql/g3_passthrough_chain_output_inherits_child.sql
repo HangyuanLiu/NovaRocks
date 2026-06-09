@@ -1,17 +1,15 @@
 -- @tags=optimizer,g3
--- Test Objective:
--- 1. Lock in the G3 contract: passthrough operators (Filter / Project)
---    report the child's actual distribution as their own output.
--- 2. OQ-4 split aggregate is not a passthrough: the Local aggregate does
---    not claim ShuffleAgg output, so the Global aggregate must receive an
---    explicit ShuffleAgg HASH EXCHANGE above the Local stage.
+-- G3 passthrough (Filter/Project report the child distribution) over small
+-- iceberg base tables; plan-shape golden. The two-phase ShuffleAgg path
+-- triggers at scale and is covered by the benchmark suites.
 DROP TABLE IF EXISTS ${case_db}.g3_pt_a;
 DROP TABLE IF EXISTS ${case_db}.g3_pt_b;
 CREATE TABLE ${case_db}.g3_pt_a (k INT, v INT);
 CREATE TABLE ${case_db}.g3_pt_b (k INT, w INT);
 INSERT INTO ${case_db}.g3_pt_a VALUES (1, 10), (2, 20);
 INSERT INTO ${case_db}.g3_pt_b VALUES (1, 100), (2, 200);
--- @result_contains=HASH EXCHANGE (source: ShuffleAgg
+ANALYZE TABLE ${case_db}.g3_pt_a;
+ANALYZE TABLE ${case_db}.g3_pt_b;
 EXPLAIN VERBOSE
 SELECT a.k, SUM(a.v + b.w) AS s
 FROM ${case_db}.g3_pt_a a

@@ -19,6 +19,8 @@ CREATE TABLE ${case_db}.lineorder (lo_orderkey INT, lo_datekey INT, lo_revenue I
 CREATE TABLE ${case_db}.date_dim (d_datekey INT, d_year INT);
 INSERT INTO ${case_db}.lineorder VALUES (1, 19980101, 100), (2, 19980102, 200);
 INSERT INTO ${case_db}.date_dim VALUES (19980101, 1998), (19980102, 1998);
+ANALYZE TABLE ${case_db}.lineorder;
+ANALYZE TABLE ${case_db}.date_dim;
 
 -- Baseline (no disable): full CBO including JoinCommutativity.
 -- Expected: CBO swaps to lineorder LEFT + date_dim RIGHT (BROADCAST, RIGHT OUTER).

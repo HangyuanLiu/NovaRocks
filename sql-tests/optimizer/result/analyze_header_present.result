@@ -6,7 +6,7 @@ PROJECT [count(*)] stats={rows=1 conf=estimated}
     GATHER EXCHANGE stats={rows=1 conf=estimated}
       HASH AGGREGATE (LOCAL) stats={rows=1 conf=estimated}
         aggregations: count()
-        SCAN db_sqlt_c2ef190265c86c9f.t_analyze_header stats={rows=100000 conf=fallback}
+        SCAN db_sqlt_c2ef190265c86c9f.t_analyze_header stats={rows=3}
              TABLE: db_sqlt_c2ef190265c86c9f.t_analyze_header
              columns: k
              min-max stats

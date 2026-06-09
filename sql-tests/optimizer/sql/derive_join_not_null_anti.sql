@@ -12,6 +12,8 @@ INSERT INTO ${case_db}.t_dnn_al
 INSERT INTO ${case_db}.t_dnn_ar
     SELECT CASE WHEN generate_series % 12 = 0 THEN generate_series ELSE NULL END
     FROM TABLE(generate_series(1, 2000));
+ANALYZE TABLE ${case_db}.t_dnn_al;
+ANALYZE TABLE ${case_db}.t_dnn_ar;
 EXPLAIN VERBOSE
 SELECT l.v
 FROM ${case_db}.t_dnn_al l

@@ -32,6 +32,8 @@ INSERT INTO ${case_db}.cid_repeat_using_r VALUES
     (2, 200, 'r2'),
     (3, 300, 'r3'),
     (4, 400, 'r4');
+ANALYZE TABLE ${case_db}.cid_repeat_using_l;
+ANALYZE TABLE ${case_db}.cid_repeat_using_r;
 
 -- query 7
 -- @order_sensitive=true

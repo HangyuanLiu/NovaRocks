@@ -8,6 +8,7 @@
 DROP TABLE IF EXISTS ${case_db}.oq6_alias_base;
 CREATE TABLE ${case_db}.oq6_alias_base (k INT, v INT);
 INSERT INTO ${case_db}.oq6_alias_base VALUES (1, 10), (2, 20), (3, 30);
+ANALYZE TABLE ${case_db}.oq6_alias_base;
 
 EXPLAIN VERBOSE
 SELECT s.k

@@ -1,16 +1,17 @@
 Explain String
-GATHER EXCHANGE stats={rows=25000}
-  PROJECT [l.v AS v] stats={rows=25000}
-    HASH JOIN (PARTITIONED, LEFT SEMI, eq: [l.k = r.k]) stats={rows=25000}
+GATHER EXCHANGE stats={rows=2000}
+  PROJECT [l.v AS v] stats={rows=2000}
+    HASH JOIN (BROADCAST, LEFT SEMI, eq: [l.k = r.k]) stats={rows=2000}
       build runtime filters:
       - filter_id = 0, build_expr = (r.k)
-      HASH EXCHANGE (source: ShuffleJoin, hash: [c1]) stats={rows=100000}
-        SCAN db_sqlt_7cd7263e7b7b29cb.t_dnn_sl (alias=l) stats={rows=100000}
-             TABLE: db_sqlt_7cd7263e7b7b29cb.t_dnn_sl
-             columns: k, v
-             min-max stats
-      HASH EXCHANGE (source: ShuffleJoin, hash: [c3]) stats={rows=90000}
-        SCAN db_sqlt_7cd7263e7b7b29cb.t_dnn_sr (alias=r) stats={rows=90000}
+      SCAN db_sqlt_7cd7263e7b7b29cb.t_dnn_sl (alias=l) stats={rows=2000}
+           TABLE: db_sqlt_7cd7263e7b7b29cb.t_dnn_sl
+           columns: k, v
+           min-max stats
+          probe runtime filters:
+          - filter_id = 0, probe_expr = (l.k)
+      BROADCAST EXCHANGE stats={rows=166}
+        SCAN db_sqlt_7cd7263e7b7b29cb.t_dnn_sr (alias=r) stats={rows=166}
              TABLE: db_sqlt_7cd7263e7b7b29cb.t_dnn_sr
              columns: k
              min-max stats
