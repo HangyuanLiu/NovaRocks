@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub(crate) mod analyze;
 pub mod catalog;
 pub mod changes;
 pub mod commit;
