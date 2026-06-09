@@ -24,6 +24,20 @@ impl DescriptorTableBuilder {
         }
     }
 
+    pub(crate) fn from_existing(desc_tbl: descriptors::TDescriptorTable) -> Self {
+        let table_ids = desc_tbl
+            .table_descriptors
+            .as_ref()
+            .map(|tables| tables.iter().map(|table| table.id).collect())
+            .unwrap_or_default();
+        Self {
+            slots: desc_tbl.slot_descriptors.unwrap_or_default(),
+            tuples: desc_tbl.tuple_descriptors,
+            tables: desc_tbl.table_descriptors.unwrap_or_default(),
+            table_ids,
+        }
+    }
+
     pub fn add_slot(
         &mut self,
         slot_id: types::TSlotId,

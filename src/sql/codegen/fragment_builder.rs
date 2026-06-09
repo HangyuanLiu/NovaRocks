@@ -29,6 +29,7 @@ use crate::sql::codegen::helpers::{
     agg_call_display_name, agg_call_display_name_without_qualifiers, join_kind_to_op,
     split_and_conjuncts_typed, typed_expr_display_name, typed_expr_display_name_without_qualifiers,
 };
+use crate::sql::codegen::iceberg_write_sink::IcebergWriteSinkSpec;
 use crate::sql::codegen::nodes;
 use crate::sql::codegen::resolve::{ColumnBinding, ExprScope, ResolvedTable};
 use crate::sql::codegen::type_infer;
@@ -642,6 +643,53 @@ impl<'a> PlanFragmentBuilder<'a> {
         _current_database: &str,
     ) -> Result<MultiFragmentBuildResult, String> {
         Self::build_with_mv_refresh_ctx(plan, catalog, connectors, _current_database, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_with_iceberg_sink(
+        plan: &PhysicalPlanNode,
+        catalog: &'a dyn CatalogProvider,
+        connectors: &'a crate::connector::ConnectorRegistry,
+        current_database: &str,
+        mv_refresh_ctx: Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+        sink_spec: &IcebergWriteSinkSpec,
+    ) -> Result<MultiFragmentBuildResult, String> {
+        let mut build = Self::build_with_mv_refresh_ctx(
+            plan,
+            catalog,
+            connectors,
+            current_database,
+            mv_refresh_ctx,
+        )?;
+        let root_index = build
+            .fragment_results
+            .iter()
+            .position(|fragment| fragment.fragment_id == build.root_fragment_id)
+            .ok_or_else(|| {
+                format!(
+                    "Iceberg sink codegen could not find root fragment id={}",
+                    build.root_fragment_id
+                )
+            })?;
+        let sink_tuple_id = root_output_tuple_id_for_sink(&build.fragment_results[root_index])?;
+        build.fragment_results[root_index].output_sink = sink_spec.build_sink(sink_tuple_id);
+
+        let mut desc_builder = DescriptorTableBuilder::from_existing(
+            build.fragment_results[root_index].desc_tbl.clone(),
+        );
+        desc_builder.add_iceberg_target_table(
+            sink_spec.target_table_id,
+            current_database,
+            &sink_spec.target_table,
+            &sink_spec.iceberg,
+            Vec::new(),
+        );
+        let desc_tbl = desc_builder.build();
+        for fragment in &mut build.fragment_results {
+            fragment.desc_tbl = desc_tbl.clone();
+        }
+
+        Ok(build)
     }
 
     pub(crate) fn build_with_mv_refresh_ctx(
@@ -4874,6 +4922,26 @@ fn synthetic_iceberg_table_id(scan_node_id: i32) -> i64 {
     -(scan_node_id as i64)
 }
 
+fn root_output_tuple_id_for_sink(fragment: &FragmentBuildResult) -> Result<i32, String> {
+    let Some(root_node) = fragment.plan.nodes.first() else {
+        return Err(format!(
+            "Iceberg sink codegen requires root fragment id={} to have a thrift root plan node",
+            fragment.fragment_id
+        ));
+    };
+    match root_node.row_tuples.as_slice() {
+        [tuple_id] => Ok(*tuple_id),
+        [] => Err(format!(
+            "Iceberg sink codegen root fragment id={} has no output tuple",
+            fragment.fragment_id
+        )),
+        tuple_ids => Err(format!(
+            "Iceberg sink codegen root fragment id={} has ambiguous output tuples {:?}; add a Project root before building the sink fragment",
+            fragment.fragment_id, tuple_ids
+        )),
+    }
+}
+
 /// Set `TFunction.ignore_nulls` on the root function node of an analytic-call
 /// `TExpr` so the BE-side `lower_window_function` picks up the modifier when
 /// constructing `WindowFunctionKind::FirstValue/LastValue/Lead/Lag`.
@@ -7871,6 +7939,61 @@ mod tests {
                 .and_then(|fields| fields.first())
                 .and_then(|field| field.field_id),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn build_with_iceberg_sink_sets_root_output_sink() {
+        let plan = values_plan_for_test(vec![output_col_for_test(1, "id", DataType::Int32, false)]);
+        let connectors = crate::connector::ConnectorRegistry::new();
+        let spec = crate::sql::codegen::iceberg_write_sink::test_support::simple_sink_spec();
+
+        let build = PlanFragmentBuilder::build_with_iceberg_sink(
+            &plan,
+            &DummyCatalog,
+            &connectors,
+            "default",
+            None,
+            &spec,
+        )
+        .expect("build with iceberg sink");
+
+        let root = build
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == build.root_fragment_id)
+            .expect("root fragment");
+        assert_eq!(
+            root.output_sink.type_,
+            data_sinks::TDataSinkType::ICEBERG_TABLE_SINK
+        );
+        let iceberg_sink = root
+            .output_sink
+            .iceberg_table_sink
+            .as_ref()
+            .expect("iceberg sink payload");
+        assert_eq!(iceberg_sink.target_table_id, Some(spec.target_table_id));
+
+        let root_tuple_id = root
+            .plan
+            .nodes
+            .first()
+            .and_then(|node| node.row_tuples.first())
+            .copied()
+            .expect("root output tuple");
+        assert_eq!(iceberg_sink.tuple_id, Some(root_tuple_id));
+
+        let target_desc = root
+            .desc_tbl
+            .table_descriptors
+            .as_ref()
+            .expect("table descriptors")
+            .iter()
+            .find(|table| table.id == spec.target_table_id)
+            .expect("target iceberg table descriptor");
+        assert_eq!(
+            target_desc.table_type,
+            crate::types::TTableType::ICEBERG_TABLE
         );
     }
 

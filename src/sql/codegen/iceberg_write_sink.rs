@@ -87,6 +87,73 @@ fn source_column_slot_ref_placeholder_expr() -> crate::exprs::TExpr {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use arrow::datatypes::DataType;
+
+    use super::*;
+    use crate::sql::catalog::{IcebergSchemaDef, IcebergSchemaFieldDef, ScanSource};
+
+    pub(crate) fn simple_sink_spec() -> IcebergWriteSinkSpec {
+        let iceberg = IcebergTableInfo {
+            catalog: "test_catalog".to_string(),
+            namespace: "test_db".to_string(),
+            table: "target_orders".to_string(),
+            table_uuid: Some("00000000-0000-0000-0000-000000000002".to_string()),
+            current_snapshot_id: Some(1),
+            schema_id: 1,
+            location: "file:///warehouse/target_orders".to_string(),
+            schema: IcebergSchemaDef {
+                fields: vec![IcebergSchemaFieldDef {
+                    field_id: 1,
+                    name: "id".to_string(),
+                    initial_default: None,
+                    write_default: None,
+                    initial_default_json: None,
+                    children: Vec::new(),
+                }],
+            },
+            serialized_metadata: None,
+            serialized_metadata_rows: None,
+        };
+        let target_table = TableDef {
+            name: "target_orders".to_string(),
+            columns: vec![ColumnDef {
+                name: "id".to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+                write_default: None,
+                logical_type: None,
+            }],
+            iceberg_row_lineage_metadata_columns: Vec::new(),
+            source: ScanSource::IcebergDataFiles {
+                table: iceberg.clone(),
+                files: Vec::new(),
+                cloud_properties: Default::default(),
+                binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+            },
+        };
+
+        IcebergWriteSinkSpec {
+            target_table_id: 99,
+            target_table,
+            iceberg,
+            target_columns: vec![ColumnDef {
+                name: "id".to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+                write_default: None,
+                logical_type: None,
+            }],
+            table_location: "file:///warehouse/target_orders".to_string(),
+            data_location: "file:///warehouse/target_orders/data".to_string(),
+            cloud_configuration: None,
+            file_format: "parquet".to_string(),
+            compression: types::TCompressionType::SNAPPY,
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
