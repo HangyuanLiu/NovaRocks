@@ -5,7 +5,6 @@ use crate::sql::catalog::{ColumnDef, IcebergTableInfo, TableDef};
 use crate::types;
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub(crate) struct IcebergWriteSinkSpec {
     pub target_table_id: i64,
     pub target_table: TableDef,
@@ -19,7 +18,6 @@ pub(crate) struct IcebergWriteSinkSpec {
 }
 
 impl IcebergWriteSinkSpec {
-    #[allow(dead_code)]
     pub(crate) fn build_sink(&self, tuple_id: i32) -> data_sinks::TDataSink {
         data_sinks::TDataSink::new(
             data_sinks::TDataSinkType::ICEBERG_TABLE_SINK,
@@ -56,7 +54,6 @@ pub(crate) fn transform_to_thrift_string(transform: &iceberg::spec::Transform) -
     transform.to_string()
 }
 
-#[allow(dead_code)]
 pub(crate) fn partition_info_from_metadata(
     metadata: &iceberg::spec::TableMetadata,
 ) -> Result<Vec<descriptors::TIcebergPartitionInfo>, String> {
@@ -75,15 +72,24 @@ pub(crate) fn partition_info_from_metadata(
                 Some(source.name.clone()),
                 Some(field.name.clone()),
                 Some(transform_to_thrift_string(&field.transform)),
-                None::<crate::exprs::TExpr>,
+                Some(source_column_slot_ref_placeholder_expr()),
             ))
         })
         .collect()
 }
 
+fn source_column_slot_ref_placeholder_expr() -> crate::exprs::TExpr {
+    super::expr_compiler::build_slot_ref_texpr(
+        0,
+        0,
+        crate::lower::type_lowering::scalar_type_desc(types::TPrimitiveType::INT),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn transform_to_thrift_string_matches_sink_parser_contract() {
@@ -103,5 +109,48 @@ mod tests {
             transform_to_thrift_string(&iceberg::spec::Transform::Day),
             "day"
         );
+    }
+
+    #[test]
+    fn partition_info_from_metadata_includes_slot_ref_placeholder_expr() {
+        let schema = iceberg::spec::Schema::builder()
+            .with_fields(vec![Arc::new(iceberg::spec::NestedField::required(
+                1,
+                "id",
+                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
+            ))])
+            .build()
+            .expect("schema");
+        let partition_spec = iceberg::spec::PartitionSpec::builder(schema.clone())
+            .add_partition_field("id", "id", iceberg::spec::Transform::Identity)
+            .expect("partition field")
+            .build()
+            .expect("partition spec");
+        let metadata = iceberg::spec::TableMetadataBuilder::new(
+            schema,
+            partition_spec,
+            iceberg::spec::SortOrder::unsorted_order(),
+            "file:///warehouse/orders".to_string(),
+            iceberg::spec::FormatVersion::V3,
+            std::collections::HashMap::new(),
+        )
+        .expect("metadata builder")
+        .build()
+        .expect("metadata");
+        let metadata = metadata.metadata;
+
+        let partition_info = partition_info_from_metadata(&metadata).expect("partition info");
+
+        assert_eq!(partition_info.len(), 1);
+        let expr = partition_info[0]
+            .partition_expr
+            .as_ref()
+            .expect("partition expr");
+        assert_eq!(expr.nodes.len(), 1);
+        assert_eq!(
+            expr.nodes[0].node_type,
+            crate::exprs::TExprNodeType::SLOT_REF
+        );
+        assert!(expr.nodes[0].slot_ref.is_some());
     }
 }
