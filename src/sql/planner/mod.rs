@@ -119,7 +119,8 @@ fn apply_query_modifiers(
     // Wrap with Sort if ORDER BY is present.
     if !order_by.is_empty() {
         let mut extra_items = collect_extra_sort_items(&order_by, &output_columns, factory);
-        let sort_items = rewrite_sort_items_to_projection_refs(&order_by, &extra_items);
+        let sort_items =
+            rewrite_sort_items_to_projection_refs(&order_by, &extra_items, &output_columns);
         if !extra_items.is_empty() {
             // We're about to add extra sort-only columns to the inner Project
             // and then strip them with an outer Project after the sort. To
@@ -160,8 +161,34 @@ fn apply_query_modifiers(
                         // ColumnRef to the aggregate's *input* column (the
                         // aggregate argument), which the id-binding verifier
                         // rejects as "not produced by child scope".
+                        // ORDER BY-only group-by *expressions* (e.g. `substr(col, ...)`
+                        // that appears in GROUP BY/SELECT but whose ORDER BY display
+                        // name didn't match the SELECT output name — most commonly the
+                        // `substr`/`substring` alias, where the SELECT output name keeps
+                        // the SQL-text spelling but the analyzed expr canonicalizes the
+                        // function name) keep a raw expression over the aggregate's
+                        // *input* columns. Rewrite them to reference the group-key output
+                        // columns, exactly as split_projection_for_aggregate does for
+                        // SELECT/HAVING (group keys occupy the first group_by.len() output
+                        // columns of the aggregate). Without this the post-aggregate
+                        // Project re-derives the group key from a pre-aggregate column
+                        // that the id-binding verifier rejects as "not produced by child
+                        // scope".
+                        let gb_targets: Vec<GroupByRewriteTarget> = agg
+                            .group_by
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, gb)| {
+                                agg.output_columns.get(i).map(|oc| GroupByRewriteTarget {
+                                    expr: gb.clone(),
+                                    column_id: oc.column_id,
+                                    display_name: typed_expr_display_name(gb),
+                                })
+                            })
+                            .collect();
                         for extra in &mut extra_items {
                             extra.expr = rewrite_agg_calls_to_refs(&extra.expr, &agg.aggregates);
+                            extra.expr = rewrite_group_by_expr_refs(&extra.expr, &gb_targets);
                         }
                     }
                     let user: Vec<(String, arrow::datatypes::DataType, bool, ColumnId)> = proj
@@ -389,6 +416,7 @@ fn remap_select_alias_refs(
 fn rewrite_sort_items_to_projection_refs(
     order_by: &[SortItem],
     extra_items: &[ProjectItem],
+    output: &[OutputColumn],
 ) -> Vec<SortItem> {
     let extra_names: std::collections::HashMap<String, &ProjectItem> = extra_items
         .iter()
@@ -398,6 +426,17 @@ fn rewrite_sort_items_to_projection_refs(
                 item,
             )
         })
+        .collect();
+    // SELECT output columns keyed by display name. A non-ColumnRef ORDER BY item
+    // (e.g. `sum(x)`) whose display name matches a SELECT output already computed
+    // by the aggregate/projection must reference that output column rather than
+    // repeat the expression — repeating it keeps a raw AggregateCall whose
+    // argument column lives below the aggregate and is not in the sort's input
+    // scope ("not produced by child scope").
+    let output_by_name: std::collections::HashMap<String, &OutputColumn> = output
+        .iter()
+        .filter(|c| c.column_id != ColumnId::UNSET)
+        .map(|c| (c.name.to_lowercase(), c))
         .collect();
 
     order_by
@@ -420,6 +459,24 @@ fn rewrite_sort_items_to_projection_refs(
                             column_id: extra.output_column_id,
                             qualifier: None,
                             column: extra.output_name.clone(),
+                        },
+                        data_type: item.expr.data_type.clone(),
+                        nullable: item.expr.nullable,
+                    },
+                    asc: item.asc,
+                    nulls_first: item.nulls_first,
+                }
+            } else if !matches!(item.expr.kind, ExprKind::ColumnRef { .. })
+                && let Some(col) = output_by_name.get(&display)
+            {
+                // Non-ColumnRef ORDER BY item (e.g. an aggregate) that names a
+                // SELECT output: reference that already-computed output column.
+                SortItem {
+                    expr: TypedExpr {
+                        kind: ExprKind::ColumnRef {
+                            column_id: col.column_id,
+                            qualifier: None,
+                            column: col.name.clone(),
                         },
                         data_type: item.expr.data_type.clone(),
                         nullable: item.expr.nullable,
