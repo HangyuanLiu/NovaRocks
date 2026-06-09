@@ -146,6 +146,14 @@ pub(crate) fn analyze_iceberg_puffin_stats(
         stats_file,
     ))??;
 
+    // Invalidate the cached table metadata (registry table_cache + catalog-mgr)
+    // so a query in the SAME session reloads the snapshot WITH the
+    // freshly-committed StatisticsFile. Mirrors the INSERT/CTAS/TRUNCATE commit
+    // paths; without it, ANALYZE-then-query in one session keeps the stale
+    // (no-stats) metadata and the optimizer falls back to the many-to-many NDV
+    // estimate.
+    crate::engine::iceberg_writer::invalidate_iceberg_caches(state, &target)?;
+
     // 7. Translate field_id -> ndv back to lowercased column names.
     Ok(ndv_by_name(&sketches, &name_to_field_id))
 }
