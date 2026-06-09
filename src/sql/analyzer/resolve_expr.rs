@@ -2513,79 +2513,114 @@ impl<'a> super::AnalyzerContext<'a> {
             other => return Err(format!("{name} expects a MAP argument, got {:?}", other)),
         };
 
-        let mut inner_scope = scope.clone();
-        inner_scope.add_column(None, &param_names[0], key_type.clone(), true);
-        inner_scope.add_column(None, &param_names[1], value_type.clone(), true);
-
-        // `map_apply` bodies are a `(new_key, new_value)` tuple. In
-        // StarRocks/NovaRocks this is shorthand for a single-entry MAP
-        // literal `map(new_key, new_value)` — the BE-side `map_apply`
-        // concatenates one such map per (k, v) input pair into the
-        // output map. For `transform_keys` / `transform_values` the body
-        // is a single scalar and the BE wraps it; only the map_apply
-        // shape needs the tuple→map rewrite.
-        let tuple_items: Option<Vec<&sqlast::Expr>> = if name == "map_apply" {
-            match body_expr {
-                sqlast::Expr::Tuple(items) => Some(items.iter().collect()),
-                sqlast::Expr::Nested(inner) => match inner.as_ref() {
-                    sqlast::Expr::Tuple(items) => Some(items.iter().collect()),
-                    _ => None,
-                },
-                _ => None,
-            }
-        } else {
-            None
-        };
-        let body_typed = if let Some(tuple_items) = tuple_items {
-            if tuple_items.len() != 2 {
-                return Err(format!(
-                    "map_apply lambda body must produce (new_key, new_value), got {} items",
-                    tuple_items.len()
-                ));
-            }
-            let mut typed_items = Vec::with_capacity(2);
-            for item in &tuple_items {
-                typed_items.push(self.analyze_expr(item, &inner_scope)?);
-            }
-            let new_key_type = typed_items[0].data_type.clone();
-            let new_value_type = typed_items[1].data_type.clone();
-            let entry_field = std::sync::Arc::new(arrow::datatypes::Field::new(
-                "entries",
-                DataType::Struct(
-                    vec![
-                        std::sync::Arc::new(arrow::datatypes::Field::new(
-                            "key",
-                            new_key_type,
-                            false,
-                        )),
-                        std::sync::Arc::new(arrow::datatypes::Field::new(
-                            "value",
-                            new_value_type,
-                            true,
-                        )),
-                    ]
-                    .into(),
-                ),
-                false,
-            ));
-            TypedExpr {
-                kind: ExprKind::FunctionCall {
-                    name: "map".to_string(),
-                    args: typed_items,
-                    distinct: false,
-                },
-                data_type: DataType::Map(entry_field, false),
+        // Bind the (key, value) lambda parameters as proper lambda slots, NOT
+        // scope columns. `add_column` mints a fresh ColumnId per parameter, so
+        // body references would resolve to a `ColumnRef` carrying that phantom
+        // id — an id no scan produces. The ColumnId-binding verifier then
+        // rejects it ("ColumnId(N) is not produced by child scope"), which
+        // broke `map_apply` / `transform_keys` / `transform_values` in
+        // projections, filters, and join conditions. Binding them via
+        // `add_lambda_param` makes body references resolve to `LambdaParamRef`,
+        // mirroring the array higher-order path (`try_analyze_higher_order_function`).
+        let lambda_params = vec![
+            LambdaParam {
+                name: param_names[0].to_lowercase(),
+                slot_id: self.alloc_lambda_slot_id(),
+                data_type: key_type.clone(),
                 nullable: true,
+            },
+            LambdaParam {
+                name: param_names[1].to_lowercase(),
+                slot_id: self.alloc_lambda_slot_id(),
+                data_type: value_type.clone(),
+                nullable: true,
+            },
+        ];
+        let mut inner_scope = scope.clone();
+        for param in &lambda_params {
+            inner_scope.add_lambda_param(param.clone());
+        }
+
+        // The shared `map_apply` executor expects the lambda body to evaluate
+        // to a single-entry MAP per `(k, v)` input pair, which it concatenates
+        // into the output map. Each map family supplies the `(new_key,
+        // new_value)` pair differently, so normalize all three to a
+        // `map(new_key, new_value)` body here:
+        //   map_apply       : body is a `(new_key, new_value)` tuple.
+        //   transform_keys  : body is the new key scalar; value passes through.
+        //   transform_values: body is the new value scalar; key passes through.
+        let lambda_param_ref = |param: &LambdaParam, data_type: DataType| TypedExpr {
+            kind: ExprKind::LambdaParamRef {
+                name: param.name.clone(),
+                slot_id: param.slot_id,
+            },
+            data_type,
+            nullable: true,
+        };
+        let (new_key, new_value) = match name {
+            "map_apply" => {
+                let tuple_items: Vec<&sqlast::Expr> = match body_expr {
+                    sqlast::Expr::Tuple(items) => items.iter().collect(),
+                    sqlast::Expr::Nested(inner) => match inner.as_ref() {
+                        sqlast::Expr::Tuple(items) => items.iter().collect(),
+                        _ => Vec::new(),
+                    },
+                    _ => Vec::new(),
+                };
+                if tuple_items.len() != 2 {
+                    return Err(format!(
+                        "map_apply lambda body must produce (new_key, new_value), got {} items",
+                        tuple_items.len()
+                    ));
+                }
+                (
+                    self.analyze_expr(tuple_items[0], &inner_scope)?,
+                    self.analyze_expr(tuple_items[1], &inner_scope)?,
+                )
             }
-        } else {
-            self.analyze_expr(body_expr, &inner_scope)?
+            "transform_keys" => (
+                self.analyze_expr(body_expr, &inner_scope)?,
+                lambda_param_ref(&lambda_params[1], value_type.clone()),
+            ),
+            // transform_values
+            _ => (
+                lambda_param_ref(&lambda_params[0], key_type.clone()),
+                self.analyze_expr(body_expr, &inner_scope)?,
+            ),
+        };
+
+        let new_key_type = new_key.data_type.clone();
+        let new_value_type = new_value.data_type.clone();
+        let entry_field = std::sync::Arc::new(arrow::datatypes::Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    std::sync::Arc::new(arrow::datatypes::Field::new("key", new_key_type, false)),
+                    std::sync::Arc::new(arrow::datatypes::Field::new(
+                        "value",
+                        new_value_type,
+                        true,
+                    )),
+                ]
+                .into(),
+            ),
+            false,
+        ));
+        let body_typed = TypedExpr {
+            kind: ExprKind::FunctionCall {
+                name: "map".to_string(),
+                args: vec![new_key, new_value],
+                distinct: false,
+            },
+            data_type: DataType::Map(entry_field, false),
+            nullable: true,
         };
         let body_type = body_typed.data_type.clone();
         let body_nullable = body_typed.nullable;
 
         let lambda_typed = TypedExpr {
-            kind: ExprKind::Lambda {
-                params: param_names.iter().map(|p| p.to_lowercase()).collect(),
+            kind: ExprKind::LambdaFunction {
+                params: lambda_params,
                 body: Box::new(body_typed),
             },
             data_type: body_type,
