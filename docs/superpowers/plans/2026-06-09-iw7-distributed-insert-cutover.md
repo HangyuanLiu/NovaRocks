@@ -649,7 +649,10 @@ pub(crate) fn partition_info_from_serialized_metadata(
     iceberg: &IcebergTableInfo,
 ) -> Result<Vec<descriptors::TIcebergPartitionInfo>, String> {
     let Some(json) = iceberg.serialized_metadata.as_ref() else {
-        return Ok(Vec::new());
+        return Err(format!(
+            "iceberg write sink requires serialized table metadata for {}.{}",
+            iceberg.namespace, iceberg.table
+        ));
     };
     let metadata: iceberg::spec::TableMetadata = serde_json::from_str(json)
         .map_err(|e| format!("parse iceberg table metadata for sink partition info: {e}"))?;
