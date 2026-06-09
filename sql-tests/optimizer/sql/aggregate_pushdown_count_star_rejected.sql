@@ -9,6 +9,8 @@ CREATE TABLE ${case_db}.t_agg_pd_neg_a (k INT);
 CREATE TABLE ${case_db}.t_agg_pd_neg_b (k INT);
 INSERT INTO ${case_db}.t_agg_pd_neg_a VALUES (1), (2);
 INSERT INTO ${case_db}.t_agg_pd_neg_b VALUES (1);
+ANALYZE TABLE ${case_db}.t_agg_pd_neg_a;
+ANALYZE TABLE ${case_db}.t_agg_pd_neg_b;
 EXPLAIN VERBOSE
 SELECT COUNT(*)
 FROM ${case_db}.t_agg_pd_neg_a a

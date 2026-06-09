@@ -12,6 +12,8 @@ CREATE TABLE ${case_db}.lineitem (k INT, v INT);
 CREATE TABLE ${case_db}.orders (k INT, w INT);
 INSERT INTO ${case_db}.lineitem VALUES (1, 10), (2, 20);
 INSERT INTO ${case_db}.orders VALUES (1, 100), (2, 200);
+ANALYZE TABLE ${case_db}.lineitem;
+ANALYZE TABLE ${case_db}.orders;
 
 SET disable_optimizer_rules = 'JoinCommutativity';
 

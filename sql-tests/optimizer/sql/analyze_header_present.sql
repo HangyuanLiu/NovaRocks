@@ -6,5 +6,6 @@
 DROP TABLE IF EXISTS ${case_db}.t_analyze_header;
 CREATE TABLE ${case_db}.t_analyze_header (k INT);
 INSERT INTO ${case_db}.t_analyze_header VALUES (1), (2), (3);
+ANALYZE TABLE ${case_db}.t_analyze_header;
 EXPLAIN ANALYZE
 SELECT COUNT(*) FROM ${case_db}.t_analyze_header;

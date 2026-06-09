@@ -15,6 +15,9 @@ CREATE TABLE ${case_db}.g3_bj_small (s INT, x INT);
 INSERT INTO ${case_db}.g3_bj_left  VALUES (1, 10), (2, 20);
 INSERT INTO ${case_db}.g3_bj_right VALUES (1, 100), (2, 200);
 INSERT INTO ${case_db}.g3_bj_small VALUES (1, 1000);
+ANALYZE TABLE ${case_db}.g3_bj_left;
+ANALYZE TABLE ${case_db}.g3_bj_right;
+ANALYZE TABLE ${case_db}.g3_bj_small;
 -- Inner BROADCAST(small) join above an INNER SHUFFLE join keyed on a.k.
 -- Window keyed on a.k must add a ShuffleAgg HASH EXCHANGE above the
 -- Broadcast output instead of reusing the ShuffleJoin source directly.

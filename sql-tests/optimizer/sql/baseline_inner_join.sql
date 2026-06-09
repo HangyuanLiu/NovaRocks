@@ -9,6 +9,8 @@ CREATE TABLE ${case_db}.t_optimizer_baseline_a (k INT, v INT);
 CREATE TABLE ${case_db}.t_optimizer_baseline_b (k INT, w INT);
 INSERT INTO ${case_db}.t_optimizer_baseline_a VALUES (1, 10), (2, 20);
 INSERT INTO ${case_db}.t_optimizer_baseline_b VALUES (1, 100), (2, 200);
+ANALYZE TABLE ${case_db}.t_optimizer_baseline_a;
+ANALYZE TABLE ${case_db}.t_optimizer_baseline_b;
 EXPLAIN VERBOSE
 SELECT a.k, a.v, b.w
 FROM ${case_db}.t_optimizer_baseline_a a

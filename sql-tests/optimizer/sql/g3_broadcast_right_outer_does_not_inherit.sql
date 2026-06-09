@@ -12,6 +12,8 @@ CREATE TABLE ${case_db}.g3_ro_left  (k INT, v INT);
 CREATE TABLE ${case_db}.date_dim (k INT, w INT);
 INSERT INTO ${case_db}.g3_ro_left  VALUES (1, 10), (2, 20);
 INSERT INTO ${case_db}.date_dim VALUES (1, 100), (3, 300);
+ANALYZE TABLE ${case_db}.g3_ro_left;
+ANALYZE TABLE ${case_db}.date_dim;
 EXPLAIN VERBOSE
 SELECT a.k, b.w, ROW_NUMBER() OVER (PARTITION BY a.k ORDER BY a.v) AS rn
 FROM ${case_db}.g3_ro_left a

@@ -1,7 +1,7 @@
 Explain String
-GATHER EXCHANGE stats={rows=24}
-  PROJECT [payload] stats={rows=24}
-    SCAN db_sqlt_48f70249c9561374.oq12_stats_and_chain stats={rows=24}
+GATHER EXCHANGE stats={rows=2555}
+  PROJECT [payload] stats={rows=2555}
+    SCAN db_sqlt_48f70249c9561374.oq12_stats_and_chain stats={rows=2555}
          TABLE: db_sqlt_48f70249c9561374.oq12_stats_and_chain
          columns: payload, c1, c2, c3, c4, c5, c6
          min-max stats
