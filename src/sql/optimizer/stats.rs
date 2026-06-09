@@ -430,6 +430,10 @@ pub(crate) fn derive_statistics(
 
         Operator::PhysicalSort(_) => child_statistics(memo, &expr.children, 0),
 
+        // IW-7: Iceberg sink writes its input rows through; output row count
+        // equals the input.
+        Operator::PhysicalIcebergSink(_) => child_statistics(memo, &expr.children, 0),
+
         Operator::PhysicalTopN(topn) => {
             // TopN limits output rows to at most limit+offset.
             let child_stats = child_statistics(memo, &expr.children, 0);
@@ -1423,7 +1427,8 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
         | Operator::PhysicalLimit(_)
         | Operator::PhysicalTopN(_)
         | Operator::PhysicalDistribution(_)
-        | Operator::PhysicalRepeat(_) => {
+        | Operator::PhysicalRepeat(_)
+        | Operator::PhysicalIcebergSink(_) => {
             if let Some(&child_id) = expr.children.first() {
                 memo.groups[child_id]
                     .logical_props

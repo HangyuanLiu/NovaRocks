@@ -93,6 +93,7 @@ pub(crate) fn derive_output(
         Operator::PhysicalSort(o) => o.derive_output(children_outputs),
         Operator::PhysicalTopN(o) => o.derive_output(children_outputs),
         Operator::PhysicalHashJoin(o) => o.derive_output(children_outputs),
+        Operator::PhysicalIcebergSink(o) => o.derive_output(children_outputs),
         op => {
             debug_assert!(
                 !op.is_physical(),
@@ -148,6 +149,7 @@ pub(crate) fn derive_required(
         Operator::PhysicalSort(o) => o.derive_required(parent_required, num_children),
         Operator::PhysicalTopN(o) => o.derive_required(parent_required, num_children),
         Operator::PhysicalHashJoin(o) => o.derive_required(parent_required, num_children),
+        Operator::PhysicalIcebergSink(o) => o.derive_required(parent_required, num_children),
         op => {
             debug_assert!(
                 !op.is_physical(),
@@ -316,6 +318,7 @@ pub(crate) mod cte;
 pub(crate) mod enforcer;
 pub(crate) mod hash_aggregate;
 pub(crate) mod hash_join;
+pub(crate) mod iceberg_sink;
 pub(crate) mod nest_loop_join;
 pub(crate) mod passthrough;
 pub(crate) mod scan;

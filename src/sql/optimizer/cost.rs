@@ -160,6 +160,11 @@ pub(crate) fn compute_cost(
 
         Operator::PhysicalLimit(_) => 0.01,
 
+        // IW-7: terminal Iceberg writer. Model only light per-row handling;
+        // write I/O is not part of optimizer cost, and the sink sits at the
+        // root so its cost does not affect plan selection.
+        Operator::PhysicalIcebergSink(_) => own_stats.output_row_count * 0.01,
+
         Operator::PhysicalCTEAnchor(_) => 0.0,
 
         // Window, Repeat, Union, Intersect, Except, Values, GenerateSeries,

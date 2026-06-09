@@ -313,6 +313,16 @@ pub(crate) struct PhysicalProjectOp {
     pub output_qualifier: Option<String>,
 }
 
+/// Physical Iceberg table sink (IW-7, path B): writes its input rows as Iceberg
+/// data files. Single input child. Requires the input to be hash-partitioned by
+/// the table's partition key columns so each writer owns whole partitions
+/// (`partition_key_column_ids` empty => unpartitioned table, no shuffle).
+#[derive(Clone, Debug)]
+pub(crate) struct PhysicalIcebergSinkOp {
+    pub target_table_id: i64,
+    pub partition_key_column_ids: Vec<ColumnId>,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct PhysicalHashJoinOp {
     pub join_type: JoinKind,
@@ -519,6 +529,7 @@ pub(crate) enum Operator {
     PhysicalTableFunction(PhysicalTableFunctionOp),
     PhysicalDecode(PhysicalDecodeOp),
     PhysicalAggregateStateMerge(AggregateStateMergeOp),
+    PhysicalIcebergSink(PhysicalIcebergSinkOp),
 }
 
 impl Operator {
