@@ -1451,7 +1451,7 @@ fn feed_array_into_sketch(
 ) -> bool {
     use arrow::array::{
         BooleanArray, Date32Array, Date64Array, Decimal128Array, Float32Array, Float64Array,
-        Int16Array, Int32Array, Int64Array, Int8Array, LargeStringArray, StringArray,
+        Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray,
         TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
         TimestampSecondArray,
     };
@@ -1492,7 +1492,11 @@ fn feed_array_into_sketch(
                 for i in 0..arr.len() {
                     if !arr.is_null(i) {
                         let v = arr.value(i);
-                        let bits = if v.is_nan() { f32::NAN.to_bits() } else { v.to_bits() };
+                        let bits = if v.is_nan() {
+                            f32::NAN.to_bits()
+                        } else {
+                            v.to_bits()
+                        };
                         sketch.update(bits);
                         updated = true;
                     }
@@ -1504,7 +1508,11 @@ fn feed_array_into_sketch(
                 for i in 0..arr.len() {
                     if !arr.is_null(i) {
                         let v = arr.value(i);
-                        let bits = if v.is_nan() { f64::NAN.to_bits() } else { v.to_bits() };
+                        let bits = if v.is_nan() {
+                            f64::NAN.to_bits()
+                        } else {
+                            v.to_bits()
+                        };
                         sketch.update(bits);
                         updated = true;
                     }
@@ -1585,6 +1593,30 @@ fn collect_theta_sketches(
     } else {
         Some(sketches)
     }
+}
+
+/// Build per-field Theta sketches from a `RecordBatch` whose columns carry no
+/// iceberg field-id metadata (e.g. an `execute_query` scan result), using an
+/// explicit lowercased-column-name -> field_id map. Columns absent from the map,
+/// or of unsupported type, are skipped. Sketches accumulate per call; union
+/// across batches via `ThetaSketchHandle::union` at the call site.
+pub(crate) fn collect_theta_sketches_by_name(
+    batch: &RecordBatch,
+    name_to_field_id: &HashMap<String, i32>,
+) -> HashMap<i32, super::theta_sketch::ThetaSketchHandle> {
+    const LG_K: u8 = 12;
+    let schema = batch.schema();
+    let mut sketches = HashMap::new();
+    for (col_idx, field) in schema.fields().iter().enumerate() {
+        let Some(&field_id) = name_to_field_id.get(&field.name().to_lowercase()) else {
+            continue;
+        };
+        let mut sketch = super::theta_sketch::ThetaSketchHandle::new(LG_K);
+        if feed_array_into_sketch(&mut sketch, field.data_type(), batch.column(col_idx)) {
+            sketches.insert(field_id, sketch);
+        }
+    }
+    sketches
 }
 
 fn merge_statistics(current: &mut Statistics, next: &Statistics) {
@@ -1912,14 +1944,46 @@ mod tests {
     use super::{
         ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID, ICEBERG_POSITION_DELETE_POS_FIELD_ID,
         IcebergSinkMode, IcebergSinkPlan, IcebergTableSinkBackend, IcebergTableSinkFactory,
-        align_arrays_to_schema, build_position_delete_output_schema, iceberg_partition_key_for_row,
-        unique_file_path, write_parquet_to_bytes,
+        align_arrays_to_schema, build_position_delete_output_schema,
+        collect_theta_sketches_by_name, iceberg_partition_key_for_row, unique_file_path,
+        write_parquet_to_bytes,
     };
     use crate::connector::iceberg::data_writer::{StagedWriteOptions, write_record_batches};
     use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::expr::ExprNode;
     use crate::runtime::runtime_state::RuntimeState;
     use crate::{common::ids::SlotId, common::types::UniqueId};
+
+    #[test]
+    fn collect_theta_sketches_by_name_keys_by_explicit_map() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        // No PARQUET_FIELD_ID_META_KEY metadata on fields (mirrors a query result).
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("s", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 1, 2, 3])), // 3 distinct
+                Arc::new(StringArray::from(vec!["a", "a", "b", "b"])), // 2 distinct
+            ],
+        )
+        .unwrap();
+        let mut name_to_field_id = HashMap::new();
+        name_to_field_id.insert("k".to_string(), 7_i32);
+        name_to_field_id.insert("s".to_string(), 9_i32);
+
+        let sketches = collect_theta_sketches_by_name(&batch, &name_to_field_id);
+        assert!((sketches[&7].estimate() - 3.0).abs() < 0.5, "k ndv ~3");
+        assert!((sketches[&9].estimate() - 2.0).abs() < 0.5, "s ndv ~2");
+        assert!(!sketches.contains_key(&999));
+    }
 
     #[test]
     fn iceberg_table_sink_factory_creates_async_sink_operator() {
