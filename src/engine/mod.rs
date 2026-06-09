@@ -2450,6 +2450,7 @@ fn strip_top_level_stream_root_wrapper(
         return build_result;
     }
     let root_output_sink = root_fragment.output_sink.clone();
+    let root_output_exprs = root_fragment.output_exprs.clone();
     let root_output_columns = root_fragment.output_columns.clone();
 
     build_result
@@ -2480,6 +2481,7 @@ fn strip_top_level_stream_root_wrapper(
         .find(|fragment| fragment.fragment_id == child_id)
     {
         child.output_sink = root_output_sink;
+        child.output_exprs = root_output_exprs;
         child.output_columns = root_output_columns;
     }
     build_result

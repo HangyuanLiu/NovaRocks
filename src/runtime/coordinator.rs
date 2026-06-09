@@ -334,7 +334,7 @@ impl ExecutionCoordinator {
 
                 let thrift_fragment = planner::TPlanFragment::new(
                     Some(fr.plan.clone()),
-                    None::<Vec<crate::exprs::TExpr>>,
+                    fr.output_exprs.clone(),
                     Some(output_sink),
                     fragment_partition,
                     None::<i64>,

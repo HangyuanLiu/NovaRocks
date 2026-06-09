@@ -78,6 +78,22 @@ pub(crate) fn partition_info_from_metadata(
         .collect()
 }
 
+pub(crate) fn partition_info_from_serialized_metadata(
+    iceberg: &IcebergTableInfo,
+) -> Result<Vec<descriptors::TIcebergPartitionInfo>, String> {
+    let Some(serialized) = iceberg.serialized_metadata.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let metadata =
+        serde_json::from_str::<iceberg::spec::TableMetadata>(serialized).map_err(|e| {
+            format!(
+                "parse iceberg write sink serialized metadata for {}.{} failed: {e}",
+                iceberg.namespace, iceberg.table
+            )
+        })?;
+    partition_info_from_metadata(&metadata)
+}
+
 fn source_column_slot_ref_placeholder_expr() -> crate::exprs::TExpr {
     super::expr_compiler::build_slot_ref_texpr(
         0,
@@ -151,12 +167,72 @@ pub(crate) mod test_support {
             compression: types::TCompressionType::SNAPPY,
         }
     }
+
+    pub(crate) fn single_bucket_partition_metadata_json() -> String {
+        use std::sync::Arc;
+
+        let schema = iceberg::spec::Schema::builder()
+            .with_fields(vec![Arc::new(iceberg::spec::NestedField::required(
+                1,
+                "id",
+                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
+            ))])
+            .build()
+            .expect("schema");
+        let partition_spec = iceberg::spec::PartitionSpec::builder(schema.clone())
+            .add_partition_field("id", "id_bucket", iceberg::spec::Transform::Bucket(16))
+            .expect("partition field")
+            .build()
+            .expect("partition spec");
+        let metadata = iceberg::spec::TableMetadataBuilder::new(
+            schema,
+            partition_spec,
+            iceberg::spec::SortOrder::unsorted_order(),
+            "file:///warehouse/target_orders".to_string(),
+            iceberg::spec::FormatVersion::V3,
+            std::collections::HashMap::new(),
+        )
+        .expect("metadata builder")
+        .build()
+        .expect("metadata");
+        serde_json::to_string(&metadata.metadata).expect("serialize metadata")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    fn metadata_with_single_partition(
+        transform: iceberg::spec::Transform,
+    ) -> iceberg::spec::TableMetadata {
+        let schema = iceberg::spec::Schema::builder()
+            .with_fields(vec![Arc::new(iceberg::spec::NestedField::required(
+                1,
+                "id",
+                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
+            ))])
+            .build()
+            .expect("schema");
+        let partition_spec = iceberg::spec::PartitionSpec::builder(schema.clone())
+            .add_partition_field("id", "id_bucket", transform)
+            .expect("partition field")
+            .build()
+            .expect("partition spec");
+        let metadata = iceberg::spec::TableMetadataBuilder::new(
+            schema,
+            partition_spec,
+            iceberg::spec::SortOrder::unsorted_order(),
+            "file:///warehouse/orders".to_string(),
+            iceberg::spec::FormatVersion::V3,
+            std::collections::HashMap::new(),
+        )
+        .expect("metadata builder")
+        .build()
+        .expect("metadata");
+        metadata.metadata
+    }
 
     #[test]
     fn transform_to_thrift_string_matches_sink_parser_contract() {
@@ -180,31 +256,7 @@ mod tests {
 
     #[test]
     fn partition_info_from_metadata_includes_slot_ref_placeholder_expr() {
-        let schema = iceberg::spec::Schema::builder()
-            .with_fields(vec![Arc::new(iceberg::spec::NestedField::required(
-                1,
-                "id",
-                iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
-            ))])
-            .build()
-            .expect("schema");
-        let partition_spec = iceberg::spec::PartitionSpec::builder(schema.clone())
-            .add_partition_field("id", "id", iceberg::spec::Transform::Identity)
-            .expect("partition field")
-            .build()
-            .expect("partition spec");
-        let metadata = iceberg::spec::TableMetadataBuilder::new(
-            schema,
-            partition_spec,
-            iceberg::spec::SortOrder::unsorted_order(),
-            "file:///warehouse/orders".to_string(),
-            iceberg::spec::FormatVersion::V3,
-            std::collections::HashMap::new(),
-        )
-        .expect("metadata builder")
-        .build()
-        .expect("metadata");
-        let metadata = metadata.metadata;
+        let metadata = metadata_with_single_partition(iceberg::spec::Transform::Identity);
 
         let partition_info = partition_info_from_metadata(&metadata).expect("partition info");
 
@@ -219,5 +271,38 @@ mod tests {
             crate::exprs::TExprNodeType::SLOT_REF
         );
         assert!(expr.nodes[0].slot_ref.is_some());
+    }
+
+    #[test]
+    fn partition_info_from_serialized_metadata_preserves_bucket_transform() {
+        let metadata = metadata_with_single_partition(iceberg::spec::Transform::Bucket(16));
+        let mut spec = test_support::simple_sink_spec();
+        spec.iceberg.serialized_metadata =
+            Some(serde_json::to_string(&metadata).expect("serialize metadata"));
+
+        let partition_info =
+            partition_info_from_serialized_metadata(&spec.iceberg).expect("partition info");
+
+        assert_eq!(partition_info.len(), 1);
+        assert_eq!(partition_info[0].source_column_name.as_deref(), Some("id"));
+        assert_eq!(
+            partition_info[0].partition_column_name.as_deref(),
+            Some("id_bucket")
+        );
+        assert_eq!(
+            partition_info[0].transform_expr.as_deref(),
+            Some("bucket[16]")
+        );
+    }
+
+    #[test]
+    fn partition_info_from_serialized_metadata_rejects_invalid_json() {
+        let mut spec = test_support::simple_sink_spec();
+        spec.iceberg.serialized_metadata = Some("{not valid json".to_string());
+
+        let err = partition_info_from_serialized_metadata(&spec.iceberg)
+            .expect_err("invalid metadata json must fail");
+
+        assert!(err.contains("parse iceberg write sink serialized metadata"));
     }
 }

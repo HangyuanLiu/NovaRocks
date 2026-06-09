@@ -29,7 +29,9 @@ use crate::sql::codegen::helpers::{
     agg_call_display_name, agg_call_display_name_without_qualifiers, join_kind_to_op,
     split_and_conjuncts_typed, typed_expr_display_name, typed_expr_display_name_without_qualifiers,
 };
-use crate::sql::codegen::iceberg_write_sink::IcebergWriteSinkSpec;
+use crate::sql::codegen::iceberg_write_sink::{
+    IcebergWriteSinkSpec, partition_info_from_serialized_metadata,
+};
 use crate::sql::codegen::nodes;
 use crate::sql::codegen::resolve::{ColumnBinding, ExprScope, ResolvedTable};
 use crate::sql::codegen::type_infer;
@@ -672,17 +674,24 @@ impl<'a> PlanFragmentBuilder<'a> {
                 )
             })?;
         let sink_tuple_id = root_output_tuple_id_for_sink(&build.fragment_results[root_index])?;
+        let output_exprs = iceberg_sink_output_exprs_for_tuple(
+            &build.fragment_results[root_index].desc_tbl,
+            sink_tuple_id,
+            sink_spec.target_columns.len(),
+        )?;
         build.fragment_results[root_index].output_sink = sink_spec.build_sink(sink_tuple_id);
+        build.fragment_results[root_index].output_exprs = Some(output_exprs);
 
         let mut desc_builder = DescriptorTableBuilder::from_existing(
             build.fragment_results[root_index].desc_tbl.clone(),
         );
+        let partition_info = partition_info_from_serialized_metadata(&sink_spec.iceberg)?;
         desc_builder.add_iceberg_target_table(
             sink_spec.target_table_id,
             current_database,
             &sink_spec.target_table,
             &sink_spec.iceberg,
-            Vec::new(),
+            partition_info,
         );
         let desc_tbl = desc_builder.build();
         for fragment in &mut build.fragment_results {
@@ -797,6 +806,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             desc_tbl: desc_tbl.clone(),
             exec_params: exec_params.clone(),
             output_sink: build_result_sink(),
+            output_exprs: None,
             output_columns,
             direct_exec: None,
             cte_id: None,
@@ -965,6 +975,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             desc_tbl: DescriptorTableBuilder::new().build(),
             exec_params,
             output_sink: build_result_sink(),
+            output_exprs: None,
             output_columns,
             direct_exec: Some(Box::new(DirectExecPlan::AggregateStateMerge {
                 old_input,
@@ -1055,6 +1066,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             desc_tbl: DescriptorTableBuilder::new().build(),
             exec_params,
             output_sink: build_result_sink(),
+            output_exprs: None,
             output_columns,
             direct_exec: Some(Box::new(DirectExecPlan::UnionAll {
                 inputs: branch_inputs,
@@ -3050,6 +3062,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             desc_tbl: DescriptorTableBuilder::new().build(),
             exec_params: nodes::build_exec_params_multi(self.connectors, &[])?,
             output_sink: build_noop_sink(),
+            output_exprs: None,
             output_columns: node.children[0]
                 .output_columns
                 .iter()
@@ -3173,6 +3186,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             desc_tbl: DescriptorTableBuilder::new().build(),
             exec_params: nodes::build_exec_params_multi(self.connectors, &[])?,
             output_sink: build_noop_sink(),
+            output_exprs: None,
             output_columns: node.children[0]
                 .output_columns
                 .iter()
@@ -4433,6 +4447,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             desc_tbl: DescriptorTableBuilder::new().build(),
             exec_params: nodes::build_exec_params_multi(self.connectors, &[])?,
             output_sink: build_noop_sink(),
+            output_exprs: None,
             output_columns: node.children[0]
                 .output_columns
                 .iter()
@@ -4812,6 +4827,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             desc_tbl: DescriptorTableBuilder::new().build(),
             exec_params: nodes::build_exec_params_multi(self.connectors, &[])?,
             output_sink: build_noop_sink(),
+            output_exprs: None,
             output_columns: op
                 .output_columns
                 .iter()
@@ -4940,6 +4956,48 @@ fn root_output_tuple_id_for_sink(fragment: &FragmentBuildResult) -> Result<i32, 
             fragment.fragment_id, tuple_ids
         )),
     }
+}
+
+fn iceberg_sink_output_exprs_for_tuple(
+    desc_tbl: &crate::descriptors::TDescriptorTable,
+    tuple_id: i32,
+    target_column_count: usize,
+) -> Result<Vec<exprs::TExpr>, String> {
+    let slots = desc_tbl
+        .slot_descriptors
+        .as_ref()
+        .ok_or_else(|| "Iceberg sink codegen requires slot descriptors".to_string())?;
+    let mut output_slots = slots
+        .iter()
+        .filter(|slot| slot.parent == Some(tuple_id) && slot.is_materialized.unwrap_or(true))
+        .map(|slot| {
+            let slot_id = slot.id.ok_or_else(|| {
+                format!("Iceberg sink tuple {tuple_id} contains a slot without id")
+            })?;
+            let col_pos = slot.column_pos.ok_or_else(|| {
+                format!("Iceberg sink tuple {tuple_id} slot {slot_id} missing col_pos")
+            })?;
+            let slot_type = slot.slot_type.clone().ok_or_else(|| {
+                format!("Iceberg sink tuple {tuple_id} slot {slot_id} missing slot_type")
+            })?;
+            Ok((col_pos, slot_id, slot_type))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    output_slots.sort_by_key(|(col_pos, slot_id, _)| (*col_pos, *slot_id));
+
+    if output_slots.len() != target_column_count {
+        return Err(format!(
+            "Iceberg sink output column count mismatch for tuple {tuple_id}: root has {} materialized slots, target table has {target_column_count} columns",
+            output_slots.len()
+        ));
+    }
+
+    Ok(output_slots
+        .into_iter()
+        .map(|(_, slot_id, slot_type)| {
+            expr_compiler::build_slot_ref_texpr(slot_id, tuple_id, slot_type)
+        })
+        .collect())
 }
 
 /// Set `TFunction.ignore_nulls` on the root function node of an analytic-call
@@ -7946,7 +8004,10 @@ mod tests {
     fn build_with_iceberg_sink_sets_root_output_sink() {
         let plan = values_plan_for_test(vec![output_col_for_test(1, "id", DataType::Int32, false)]);
         let connectors = crate::connector::ConnectorRegistry::new();
-        let spec = crate::sql::codegen::iceberg_write_sink::test_support::simple_sink_spec();
+        let mut spec = crate::sql::codegen::iceberg_write_sink::test_support::simple_sink_spec();
+        spec.iceberg.serialized_metadata = Some(
+            crate::sql::codegen::iceberg_write_sink::test_support::single_bucket_partition_metadata_json(),
+        );
 
         let build = PlanFragmentBuilder::build_with_iceberg_sink(
             &plan,
@@ -7982,6 +8043,13 @@ mod tests {
             .copied()
             .expect("root output tuple");
         assert_eq!(iceberg_sink.tuple_id, Some(root_tuple_id));
+        let output_exprs = root.output_exprs.as_ref().expect("sink output exprs");
+        assert_eq!(output_exprs.len(), spec.target_columns.len());
+        assert_eq!(output_exprs[0].nodes.len(), 1);
+        let expr_node = &output_exprs[0].nodes[0];
+        assert_eq!(expr_node.node_type, exprs::TExprNodeType::SLOT_REF);
+        let slot_ref = expr_node.slot_ref.as_ref().expect("slot ref");
+        assert_eq!(slot_ref.tuple_id, root_tuple_id);
 
         let target_desc = root
             .desc_tbl
@@ -7994,6 +8062,17 @@ mod tests {
         assert_eq!(
             target_desc.table_type,
             crate::types::TTableType::ICEBERG_TABLE
+        );
+        let partition_info = target_desc
+            .iceberg_table
+            .as_ref()
+            .and_then(|table| table.partition_info.as_ref())
+            .expect("target iceberg partition info");
+        assert_eq!(partition_info.len(), 1);
+        assert_eq!(partition_info[0].source_column_name.as_deref(), Some("id"));
+        assert_eq!(
+            partition_info[0].transform_expr.as_deref(),
+            Some("bucket[16]")
         );
     }
 

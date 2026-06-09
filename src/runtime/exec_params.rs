@@ -143,6 +143,7 @@ mod tests {
             desc_tbl: descriptors::TDescriptorTable::new(vec![], vec![], vec![], false),
             exec_params,
             output_sink,
+            output_exprs: None,
             output_columns: vec![OutputColumn {
                 name: "col".to_string(),
                 data_type: arrow::datatypes::DataType::Int64,

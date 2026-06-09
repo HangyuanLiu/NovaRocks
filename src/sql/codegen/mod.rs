@@ -128,6 +128,7 @@ pub(crate) struct FragmentBuildResult {
     #[allow(dead_code)]
     // populated by fragment builder, will be read when standalone multi-fragment execution is wired
     pub output_sink: data_sinks::TDataSink,
+    pub output_exprs: Option<Vec<crate::exprs::TExpr>>,
     pub output_columns: Vec<OutputColumn>,
     pub direct_exec: Option<Box<DirectExecPlan>>,
     /// CTE ID if this is a multicast fragment.
