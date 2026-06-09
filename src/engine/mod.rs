@@ -2710,6 +2710,63 @@ pub(crate) fn execute_query_with_catalog_mgr(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_query_as_iceberg_write(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    query: &sqlparser::ast::Query,
+    sink_spec: crate::sql::codegen::iceberg_write_sink::IcebergWriteSinkSpec,
+    query_opts: Option<crate::internal_service::TQueryOptions>,
+) -> Result<crate::runtime::coordinator::CoordinatedQueryResult, String> {
+    let exchange_port = if state.exchange_port == 0 {
+        ensure_standalone_exchange_server()?
+    } else {
+        state.exchange_port
+    };
+    let catalog_snapshot = state
+        .catalog
+        .read()
+        .expect("standalone catalog read lock")
+        .clone();
+    let connectors_snapshot = state
+        .connectors
+        .read()
+        .expect("standalone connector registry read lock")
+        .clone();
+    let catalog_mgr_snapshot = catalog_mgr_snapshot(state);
+    let analyzer_provider = build_analyzer_provider(
+        current_catalog,
+        &catalog_snapshot,
+        &catalog_mgr_snapshot,
+        &connectors_snapshot,
+        crate::sql::catalog::TableLookupMode::SchemaOnly,
+    );
+
+    let (resolved, cte_registry, mut factory) =
+        crate::sql::analyzer::analyze(query, &analyzer_provider, current_database)?;
+    let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
+    let table_stats = build_table_stats_from_plan(&logical);
+    let physical = crate::sql::optimizer::optimize(logical, &table_stats, factory, None)?;
+    let build_result =
+        crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_with_iceberg_sink(
+            &physical,
+            &catalog_snapshot,
+            &connectors_snapshot,
+            current_database,
+            None,
+            &sink_spec,
+        )?;
+    let (dispatcher, scheduler) = coordinated_execution_services(exchange_port)?;
+    crate::runtime::coordinator::ExecutionCoordinator::new(
+        build_result,
+        dispatcher,
+        scheduler,
+        query_opts,
+    )
+    .execute_with_write_outcome()
+}
+
 pub(crate) fn execute_query_with_catalog_provider(
     query: &sqlparser::ast::Query,
     analyzer_catalog: &dyn crate::sql::catalog::CatalogProvider,
@@ -2883,38 +2940,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
                         .to_string(),
                 );
             }
-            use crate::common::app_config::ClusterRole;
-            use std::net::SocketAddr;
-            let role = crate::novarocks_config::config()
-                .map(|c| c.cluster.role)
-                .unwrap_or(ClusterRole::AllInOne);
-            let dispatcher = dispatcher_for_role(role)?;
-            // Backend list for the scheduler: FE reads cluster.backends; all-in-one
-            // is the local exchange endpoint; pure BE must not coordinate.
-            let backends: Vec<SocketAddr> = match role {
-                ClusterRole::Fe => {
-                    let cfg =
-                        crate::novarocks_config::config().map_err(|e| format!("role=fe: {e}"))?;
-                    cfg.cluster
-                        .backends
-                        .iter()
-                        .map(|s| {
-                            s.parse::<SocketAddr>()
-                                .map_err(|e| format!("role=fe: invalid backend '{s}': {e}"))
-                        })
-                        .collect::<Result<_, _>>()?
-                }
-                ClusterRole::AllInOne => vec![
-                    format!("127.0.0.1:{exchange_port}")
-                        .parse()
-                        .map_err(|e| format!("{e}"))?,
-                ],
-                ClusterRole::Be => {
-                    return Err("role=be must not enter standalone coordinator".into());
-                }
-            };
-            let scheduler =
-                std::sync::Arc::new(crate::runtime::scheduler::FragmentScheduler::new(backends));
+            let (dispatcher, scheduler) = coordinated_execution_services(exchange_port)?;
             crate::runtime::coordinator::ExecutionCoordinator::new(
                 *build_result,
                 dispatcher,
@@ -2924,6 +2950,49 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
             .execute()
         }
     }
+}
+
+fn coordinated_execution_services(
+    exchange_port: u16,
+) -> Result<
+    (
+        Arc<dyn crate::runtime::dispatcher::FragmentDispatcher>,
+        Arc<crate::runtime::scheduler::FragmentScheduler>,
+    ),
+    String,
+> {
+    use crate::common::app_config::ClusterRole;
+    use std::net::SocketAddr;
+
+    let role = crate::novarocks_config::config()
+        .map(|c| c.cluster.role)
+        .unwrap_or(ClusterRole::AllInOne);
+    let dispatcher = dispatcher_for_role(role)?;
+    // Backend list for the scheduler: FE reads cluster.backends; all-in-one
+    // is the local exchange endpoint; pure BE must not coordinate.
+    let backends: Vec<SocketAddr> = match role {
+        ClusterRole::Fe => {
+            let cfg = crate::novarocks_config::config().map_err(|e| format!("role=fe: {e}"))?;
+            cfg.cluster
+                .backends
+                .iter()
+                .map(|s| {
+                    s.parse::<SocketAddr>()
+                        .map_err(|e| format!("role=fe: invalid backend '{s}': {e}"))
+                })
+                .collect::<Result<_, _>>()?
+        }
+        ClusterRole::AllInOne => vec![
+            format!("127.0.0.1:{exchange_port}")
+                .parse()
+                .map_err(|e| format!("{e}"))?,
+        ],
+        ClusterRole::Be => {
+            return Err("role=be must not enter standalone coordinator".into());
+        }
+    };
+    let scheduler = Arc::new(crate::runtime::scheduler::FragmentScheduler::new(backends));
+    Ok((dispatcher, scheduler))
 }
 
 /// Select a `FragmentDispatcher` implementation based on the effective cluster role.
@@ -8301,6 +8370,26 @@ path = "meta/operations.sqlite"
             dispatcher.backend_count(),
             2,
             "dispatcher must route to both configured backends"
+        );
+    }
+
+    #[test]
+    fn coordinated_iceberg_insert_requires_exchange_server() {
+        let query = parse_query_for_engine_test("SELECT id FROM missing_table");
+        let state = Arc::new(StandaloneState::default());
+        let mut sink_spec =
+            crate::sql::codegen::iceberg_write_sink::test_support::simple_sink_spec();
+        sink_spec.iceberg.serialized_metadata = Some(
+            crate::sql::codegen::iceberg_write_sink::test_support::single_bucket_partition_metadata_json(),
+        );
+
+        let result =
+            super::execute_query_as_iceberg_write(&state, None, "default", &query, sink_spec, None);
+
+        let err = result.expect_err("default state should fail before executing the sink");
+        assert!(
+            err.contains("missing_table"),
+            "error should come from analyzer/catalog lookup, got: {err}"
         );
     }
 
