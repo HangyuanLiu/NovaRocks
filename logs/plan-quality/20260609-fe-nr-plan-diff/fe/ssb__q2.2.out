@@ -1,0 +1,214 @@
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 370.0
+  Memory: 110.8
+
+PLAN FRAGMENT 0(F14)
+  Fragment Cost: 112.0
+  Output Exprs:79: sum | 29: d_year | 53: p_brand
+  Input Partition: UNPARTITIONED
+  RESULT SINK
+
+  21:MERGING-EXCHANGE
+     distribution type: GATHER
+     cardinality: 1
+
+PLAN FRAGMENT 1(F13)
+  Fragment Cost: 183.40000000000003
+
+  Input Partition: HASH_PARTITIONED: 29: d_year, 53: p_brand
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 21
+
+  20:SORT
+  |  order by: [29, INT, false] ASC, [53, VARCHAR(10), false] ASC
+  |  offset: 0
+  |  cardinality: 1
+  |
+  19:AGGREGATE (merge finalize)
+  |  aggregate: sum[([79: sum, BIGINT, true]); args: INT; result: BIGINT; args nullable: true; result nullable: true]
+  |  group by: [29: d_year, INT, false], [53: p_brand, VARCHAR(10), false]
+  |  cardinality: 1
+  |
+  18:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [29: d_year, INT, false], [53: p_brand, VARCHAR(10), false]
+     cardinality: 1
+
+PLAN FRAGMENT 2(F12)
+  Fragment Cost: 74.39999999999996
+
+  Input Partition: HASH_PARTITIONED: 49: p_partkey
+  OutPut Partition: HASH_PARTITIONED: 29: d_year, 53: p_brand
+  OutPut Exchange Id: 18
+
+  17:AGGREGATE (update serialize)
+  |  STREAMING
+  |  aggregate: sum[([13: lo_revenue, INT, false]); args: INT; result: BIGINT; args nullable: false; result nullable: true]
+  |  group by: [29: d_year, INT, false], [53: p_brand, VARCHAR(10), false]
+  |  cardinality: 1
+  |
+  16:Project
+  |  output columns:
+  |  13 <-> [13: lo_revenue, INT, false]
+  |  29 <-> [29: d_year, INT, false]
+  |  53 <-> [53: p_brand, VARCHAR(10), false]
+  |  cardinality: 1
+  |
+  15:HASH JOIN
+  |  join op: INNER JOIN (PARTITIONED)
+  |  equal join conjunct: [49: p_partkey, INT, false] = [4: lo_partkey, INT, false]
+  |  build runtime filters:
+  |  - filter_id = 2, build_expr = (4: lo_partkey), remote = true
+  |  output columns: 13, 29, 53
+  |  can local shuffle: true
+  |  cardinality: 1
+  |
+  |----14:EXCHANGE
+  |       distribution type: SHUFFLE
+  |       partition exprs: [4: lo_partkey, INT, false]
+  |       cardinality: 1
+  |
+  1:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [49: p_partkey, INT, false]
+     cardinality: 1
+
+PLAN FRAGMENT 3(F10)
+  Fragment Cost: 42.800000000000004
+
+  Input Partition: HASH_PARTITIONED: 6: lo_orderdate
+  OutPut Partition: HASH_PARTITIONED: 4: lo_partkey
+  OutPut Exchange Id: 14
+
+  13:Project
+  |  output columns:
+  |  4 <-> [4: lo_partkey, INT, false]
+  |  13 <-> [13: lo_revenue, INT, false]
+  |  29 <-> [29: d_year, INT, false]
+  |  cardinality: 1
+  |
+  12:HASH JOIN
+  |  join op: INNER JOIN (PARTITIONED)
+  |  equal join conjunct: [6: lo_orderdate, INT, false] = [25: d_datekey, INT, false]
+  |  build runtime filters:
+  |  - filter_id = 1, build_expr = (25: d_datekey), remote = true
+  |  output columns: 4, 13, 29
+  |  can local shuffle: true
+  |  cardinality: 1
+  |
+  |----11:EXCHANGE
+  |       distribution type: SHUFFLE
+  |       partition exprs: [25: d_datekey, INT, false]
+  |       cardinality: 1
+  |
+  9:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [6: lo_orderdate, INT, false]
+     cardinality: 1
+
+PLAN FRAGMENT 4(F08)
+  Fragment Cost: 4.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 25: d_datekey
+  OutPut Exchange Id: 11
+
+  10:OlapScanNode
+     table: dates, rollup: dates
+     preAggregation: on
+     partitionsRatio=1/1, tabletsRatio=1/1
+     tabletList=99308
+     actualRows=0, avgRowSize=2.0
+     cardinality: 1
+
+PLAN FRAGMENT 5(F06)
+  Fragment Cost: 36.4
+
+  Input Partition: HASH_PARTITIONED: 5: lo_suppkey
+  OutPut Partition: HASH_PARTITIONED: 6: lo_orderdate
+  OutPut Exchange Id: 09
+
+  8:Project
+  |  output columns:
+  |  4 <-> [4: lo_partkey, INT, false]
+  |  6 <-> [6: lo_orderdate, INT, false]
+  |  13 <-> [13: lo_revenue, INT, false]
+  |  cardinality: 1
+  |
+  7:HASH JOIN
+  |  join op: INNER JOIN (PARTITIONED)
+  |  equal join conjunct: [5: lo_suppkey, INT, false] = [65: s_suppkey, INT, false]
+  |  build runtime filters:
+  |  - filter_id = 0, build_expr = (65: s_suppkey), remote = true
+  |  output columns: 4, 6, 13
+  |  can local shuffle: true
+  |  cardinality: 1
+  |
+  |----6:EXCHANGE
+  |       distribution type: SHUFFLE
+  |       partition exprs: [65: s_suppkey, INT, false]
+  |       cardinality: 1
+  |
+  3:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [5: lo_suppkey, INT, false]
+     cardinality: 1
+
+PLAN FRAGMENT 6(F04)
+  Fragment Cost: 10.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 65: s_suppkey
+  OutPut Exchange Id: 06
+
+  5:Project
+  |  output columns:
+  |  65 <-> [65: s_suppkey, INT, false]
+  |  cardinality: 1
+  |
+  4:OlapScanNode
+     table: supplier, rollup: supplier
+     preAggregation: on
+     Predicates: [70: s_region, VARCHAR(13), false] = 'ASIA'
+     partitionsRatio=1/1, tabletsRatio=1/1
+     tabletList=99316
+     actualRows=0, avgRowSize=2.0
+     cardinality: 1
+
+PLAN FRAGMENT 7(F02)
+  Fragment Cost: 8.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 5: lo_suppkey
+  OutPut Exchange Id: 03
+
+  2:OlapScanNode
+     table: lineorder, rollup: lineorder
+     preAggregation: on
+     partitionsRatio=1/1, tabletsRatio=1/1
+     tabletList=99292
+     actualRows=0, avgRowSize=4.0
+     cardinality: 1
+     probe runtime filters:
+     - filter_id = 0, probe_expr = (5: lo_suppkey)
+     - filter_id = 1, probe_expr = (6: lo_orderdate)
+
+PLAN FRAGMENT 8(F00)
+  Fragment Cost: 10.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 49: p_partkey
+  OutPut Exchange Id: 01
+
+  0:OlapScanNode
+     table: part, rollup: part
+     preAggregation: on
+     Predicates: [53: p_brand, VARCHAR(10), false] >= 'MFGR#2221', [53: p_brand, VARCHAR(10), false] <= 'MFGR#2228'
+     partitionsRatio=1/1, tabletsRatio=1/1
+     tabletList=99324
+     actualRows=0, avgRowSize=2.0
+     cardinality: 1
+     probe runtime filters:
+     - filter_id = 2, probe_expr = (49: p_partkey)

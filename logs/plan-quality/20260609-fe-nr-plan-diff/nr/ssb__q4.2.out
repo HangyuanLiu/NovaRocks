@@ -1,0 +1,53 @@
+SORT BY [d_year ASC NULLS FIRST, s_nation ASC NULLS FIRST, p_category ASC NULLS FIRST] stats={rows=56}
+  GATHER EXCHANGE stats={rows=56}
+    PROJECT [d_year, s_nation, p_category, sum(lo_revenue) - sum(lo_supplycost) AS profit] stats={rows=56}
+      HASH AGGREGATE (GLOBAL, group by: [d_year, s_nation, p_category]) stats={rows=56}
+        aggregations: sum(lo_revenue), sum(lo_supplycost)
+        HASH EXCHANGE (source: ShuffleAgg, hash: [c22, c47, c53]) stats={rows=56}
+          HASH AGGREGATE (LOCAL, group by: [d_year, s_nation, p_category]) stats={rows=56}
+            aggregations: sum(lo_revenue), sum(lo_supplycost)
+            HASH JOIN (BROADCAST, INNER, eq: [lo_orderdate = d_datekey]) stats={rows=1000000}
+              build runtime filters:
+              - filter_id = 3, build_expr = (d_datekey)
+              HASH JOIN (BROADCAST, INNER, eq: [lo_custkey = c_custkey]) stats={rows=1000000}
+                build runtime filters:
+                - filter_id = 2, build_expr = (c_custkey)
+                HASH JOIN (BROADCAST, INNER, eq: [lo_suppkey = s_suppkey]) stats={rows=1000000}
+                  build runtime filters:
+                  - filter_id = 1, build_expr = (s_suppkey)
+                  HASH JOIN (BROADCAST, INNER, eq: [lo_partkey = p_partkey]) stats={rows=1000000}
+                    build runtime filters:
+                    - filter_id = 0, build_expr = (p_partkey)
+                    SCAN ssb.lineorder stats={rows=1000000}
+                         TABLE: ssb.lineorder
+                         columns: lo_custkey, lo_partkey, lo_suppkey, lo_orderdate, lo_revenue, lo_supplycost
+                         min-max stats
+                        probe runtime filters:
+                        - filter_id = 0, probe_expr = (lo_partkey)
+                        - filter_id = 1, probe_expr = (lo_suppkey)
+                        - filter_id = 2, probe_expr = (lo_custkey)
+                        - filter_id = 3, probe_expr = (lo_orderdate)
+                    BROADCAST EXCHANGE stats={rows=21875}
+                      SCAN ssb.part stats={rows=21875}
+                           TABLE: ssb.part
+                           columns: p_partkey, p_category, p_mfgr
+                           min-max stats
+                           predicates: p_mfgr = 'MFGR#1' OR p_mfgr = 'MFGR#2' AND p_mfgr IN ('MFGR#1', 'MFGR#2')
+                  BROADCAST EXCHANGE stats={rows=25000}
+                    SCAN ssb.supplier stats={rows=25000}
+                         TABLE: ssb.supplier
+                         columns: s_suppkey, s_nation, s_region
+                         min-max stats
+                         predicates: s_region = 'AMERICA'
+                BROADCAST EXCHANGE stats={rows=25000}
+                  SCAN ssb.customer stats={rows=25000}
+                       TABLE: ssb.customer
+                       columns: c_custkey, c_region
+                       min-max stats
+                       predicates: c_region = 'AMERICA'
+              BROADCAST EXCHANGE stats={rows=21875}
+                SCAN ssb.dates stats={rows=21875}
+                     TABLE: ssb.dates
+                     columns: d_datekey, d_year
+                     min-max stats
+                     predicates: d_year = 1997 OR d_year = 1998 AND d_year IN (1997, 1998)

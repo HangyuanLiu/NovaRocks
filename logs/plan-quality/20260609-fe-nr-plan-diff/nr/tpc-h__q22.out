@@ -1,0 +1,32 @@
+SORT BY [cntrycode ASC NULLS FIRST] stats={rows=10}
+  GATHER EXCHANGE stats={rows=10}
+    PROJECT [cntrycode, count() AS numcust, sum(c_acctbal) AS totacctbal] stats={rows=10}
+      HASH AGGREGATE (SINGLE, group by: [cntrycode]) stats={rows=10}
+        aggregations: count(), sum(c_acctbal)
+        PROJECT [cntrycode, c_acctbal] stats={rows=10000}
+          PROJECT [substring(c_phone, 1, 2) AS cntrycode, c_acctbal] stats={rows=10000}
+            HASH JOIN (PARTITIONED, LEFT ANTI, eq: [c_custkey = o_custkey]) stats={rows=10000}
+              HASH EXCHANGE (source: ShuffleJoin, hash: [c1]) stats={rows=25000}
+                NEST LOOP JOIN (INNER) stats={rows=25000}
+                  on: c_acctbal > __sq_0.avg(c_acctbal)
+                  GATHER EXCHANGE stats={rows=50000}
+                    SCAN tpch.customer stats={rows=50000}
+                         TABLE: tpch.customer
+                         columns: c_custkey, c_phone, c_acctbal
+                         min-max stats
+                         predicates: substring(c_phone, 1, 2) IN ('21', '28', '24', '32', '35', '34', '37')
+                  PROJECT [avg(c_acctbal)] stats={rows=1}
+                    PROJECT [avg(customer.c_acctbal) AS avg(c_acctbal)] stats={rows=1}
+                      HASH AGGREGATE (SINGLE) stats={rows=1}
+                        aggregations: avg(customer.c_acctbal)
+                        GATHER EXCHANGE stats={rows=25000}
+                          SCAN tpch.customer stats={rows=25000}
+                               TABLE: tpch.customer
+                               columns: c_acctbal, c_phone
+                               min-max stats
+                               predicates: customer.c_acctbal > 0.00 AND substring(customer.c_phone, 1, 2) IN ('21', '28', '24', '32', '35', '34', '37')
+              HASH EXCHANGE (source: ShuffleJoin, hash: [c31]) stats={rows=1000000}
+                SCAN tpch.orders stats={rows=1000000}
+                     TABLE: tpch.orders
+                     columns: o_custkey
+                     min-max stats

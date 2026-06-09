@@ -1,0 +1,22 @@
+PROJECT [sum(lo_revenue) AS revenue] stats={rows=1}
+  HASH AGGREGATE (GLOBAL) stats={rows=1}
+    aggregations: sum(lo_revenue)
+    GATHER EXCHANGE stats={rows=1}
+      HASH AGGREGATE (LOCAL) stats={rows=1}
+        aggregations: sum(lo_revenue)
+        HASH JOIN (BROADCAST, INNER, eq: [lo_orderdate = d_datekey]) stats={rows=390625000}
+          build runtime filters:
+          - filter_id = 0, build_expr = (d_datekey)
+          SCAN ssb.lineorder stats={rows=62500}
+               TABLE: ssb.lineorder
+               columns: lo_orderdate, lo_revenue, lo_quantity, lo_discount
+               min-max stats
+               predicates: lo_discount BETWEEN 4 AND 6 AND lo_quantity BETWEEN 26 AND 35
+              probe runtime filters:
+              - filter_id = 0, probe_expr = (lo_orderdate)
+          BROADCAST EXCHANGE stats={rows=25000}
+            SCAN ssb.dates stats={rows=25000}
+                 TABLE: ssb.dates
+                 columns: d_datekey, d_yearmonthnum
+                 min-max stats
+                 predicates: d_yearmonthnum = 199401

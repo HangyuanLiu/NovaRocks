@@ -7,7 +7,7 @@
 
 use crate::sql::analysis::{ExprKind, JoinKind, TypedExpr};
 use crate::sql::column_id::ColumnId;
-use crate::sql::optimizer::operator::{JoinDistribution, Operator};
+use crate::sql::optimizer::operator::{JoinDistribution, Operator, PhysicalHashJoinEqCondition};
 use crate::sql::optimizer::options::OptimizerOptions;
 use crate::sql::optimizer::physical_plan::{JoinExecutionDistribution, PhysicalPlanNode};
 use std::collections::HashSet;
@@ -20,9 +20,9 @@ pub(crate) const RUNTIME_FILTER_RULE: &str = "RuntimeFilterPushDown";
 #[derive(Clone, Debug)]
 pub(crate) struct RuntimeFilterDesc {
     pub filter_id: i32,
-    /// Build-side key expression (eq.right, in build-child column space).
+    /// Oriented build-side key expression in build-child column space.
     pub build_expr: TypedExpr,
-    /// Probe-side key expression (eq.left), in the target node's column space.
+    /// Oriented probe-side key expression in the target node's column space.
     pub probe_expr: TypedExpr,
     /// Index into the join's `eq_conditions`.
     pub expr_order: usize,
@@ -75,19 +75,30 @@ pub(crate) fn annotate(root: &mut PhysicalPlanNode, options: &OptimizerOptions) 
     annotate_node(root, &mut next_filter_id, options);
 }
 
-/// True if a hash join of this kind should produce runtime filters on its
-/// build side.  Anti-joins and full-outer joins are excluded because they
-/// cannot safely early-filter the probe side.
-fn join_builds_rf(kind: JoinKind) -> bool {
-    matches!(
-        kind,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct JoinRfSides {
+    probe_child: usize,
+    build_child: usize,
+}
+
+/// Runtime filters are only produced when the join semantics allow the true
+/// probe child to be early-filtered by keys from the true build child.
+fn rf_sides_for_join(kind: JoinKind) -> Option<JoinRfSides> {
+    match kind {
         JoinKind::Inner
-            | JoinKind::LeftSemi
-            | JoinKind::RightOuter
-            | JoinKind::RightSemi
-            | JoinKind::RightAnti
-            | JoinKind::Cross
-    )
+        | JoinKind::LeftSemi
+        | JoinKind::RightOuter
+        | JoinKind::RightSemi
+        | JoinKind::RightAnti => Some(JoinRfSides {
+            probe_child: 0,
+            build_child: 1,
+        }),
+        JoinKind::LeftOuter
+        | JoinKind::FullOuter
+        | JoinKind::LeftAnti
+        | JoinKind::NullAwareLeftAnti
+        | JoinKind::Cross => None,
+    }
 }
 
 /// Collect ALL column ids referenced by `expr` into `out`.
@@ -202,6 +213,70 @@ fn column_ids(expr: &TypedExpr, out: &mut HashSet<ColumnId>) {
     }
 }
 
+fn column_id_vec(expr: &TypedExpr) -> Vec<ColumnId> {
+    let mut ids = HashSet::new();
+    column_ids(expr, &mut ids);
+    let mut ids: Vec<_> = ids.into_iter().collect();
+    ids.sort();
+    ids
+}
+
+fn child_column_set(node: &PhysicalPlanNode) -> HashSet<ColumnId> {
+    node.output_columns.iter().map(|c| c.column_id).collect()
+}
+
+fn expr_bound_child(node: &PhysicalPlanNode, expr: &TypedExpr) -> Option<usize> {
+    let ids = column_id_vec(expr);
+    if ids.is_empty() {
+        return None;
+    }
+
+    let mut bound_child = None;
+    for (idx, child) in node.children.iter().enumerate() {
+        let child_cols = child_column_set(child);
+        if ids.iter().all(|id| child_cols.contains(id)) {
+            if bound_child.is_some() {
+                return None;
+            }
+            bound_child = Some(idx);
+        }
+    }
+    bound_child
+}
+
+#[derive(Clone, Debug)]
+struct OrientedRfKey {
+    build_expr: TypedExpr,
+    probe_expr: TypedExpr,
+    expr_order: usize,
+}
+
+fn orient_rf_key(
+    node: &PhysicalPlanNode,
+    sides: JoinRfSides,
+    expr_order: usize,
+    eq: &PhysicalHashJoinEqCondition,
+) -> Option<OrientedRfKey> {
+    let left_child = expr_bound_child(node, &eq.left)?;
+    let right_child = expr_bound_child(node, &eq.right)?;
+
+    if left_child == sides.probe_child && right_child == sides.build_child {
+        Some(OrientedRfKey {
+            build_expr: eq.right.clone(),
+            probe_expr: eq.left.clone(),
+            expr_order,
+        })
+    } else if left_child == sides.build_child && right_child == sides.probe_child {
+        Some(OrientedRfKey {
+            build_expr: eq.left.clone(),
+            probe_expr: eq.right.clone(),
+            expr_order,
+        })
+    } else {
+        None
+    }
+}
+
 /// Returns true if `node` outputs every column id referenced by `probe_expr`.
 ///
 /// An empty needed set (e.g. a literal probe expression) cannot be bound — the
@@ -223,23 +298,8 @@ fn is_exchange(node: &PhysicalPlanNode) -> bool {
 }
 
 /// A `PhysicalDistribution` whose spec is a shuffle/hash partition is the kind
-/// of boundary a probe runtime filter *may* cross (StarRocks
-/// canPushAcrossExchangeNode for PARTITIONED). Gather / Any are never crossable.
-///
-/// CORRECTNESS: crossing a shuffle exchange to place a probe RF deeper is only
-/// safe when the build side produces the *complete* key set AND no
-/// semantic-changing node (e.g. an OUTER join) sits between the exchange and
-/// the target scan. Two known violations make it currently unsafe, so the
-/// caller keeps it gated OFF — `push_probe_down` consults this predicate only
-/// when `OptimizerOptions::allow_cross_exchange_rf` is set, which is always
-/// false today (see its doc):
-///   1. multi-BE — a build fragment fans out to N>1 instances, each producing a
-///      *partial* RF; applying it to an unshuffled probe scan drops valid rows.
-///   2. standalone — crossing an OUTER join pushes the RF onto the outer side's
-///      scan and drops null-key rows the join/predicate must keep.
-/// The predicate and the placement code are retained for a future stage that
-/// fixes both. It only classifies the distribution type; it deliberately omits
-/// StarRocks' multi-column `canCrossExchangeNode` restriction.
+/// of boundary a probe runtime filter may cross when the build RF is complete.
+/// Gather / Any are never crossable.
 fn distribution_is_crossable(node: &PhysicalPlanNode) -> bool {
     use crate::sql::optimizer::property::DistributionSpec;
     matches!(
@@ -249,44 +309,71 @@ fn distribution_is_crossable(node: &PhysicalPlanNode) -> bool {
     )
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ProbePushPolicy {
+    allow_cross_exchange: bool,
+    cross_exchange_build_complete: bool,
+}
+
+fn join_is_outer_or_anti_boundary(kind: JoinKind) -> bool {
+    matches!(
+        kind,
+        JoinKind::LeftOuter
+            | JoinKind::RightOuter
+            | JoinKind::FullOuter
+            | JoinKind::LeftAnti
+            | JoinKind::RightAnti
+            | JoinKind::NullAwareLeftAnti
+    )
+}
+
+fn is_probe_semantic_boundary(node: &PhysicalPlanNode) -> bool {
+    matches!(
+        &node.op,
+        Operator::PhysicalHashJoin(join) if join_is_outer_or_anti_boundary(join.join_type)
+    )
+}
+
 /// Descend into `node` and attach `probe` at the DEEPEST descendant that can
 /// bind the probe expression. Returns `true` when the probe has been placed.
 ///
 /// Rules:
-/// 1. Crossable exchange (HashPartitioned/shuffle): descend transparently into
-///    its single child without binding-checking the exchange itself, since a
-///    shuffle exchange preserves column ids and carries no projection.
+/// 1. Crossable exchange (HashPartitioned/shuffle): descend transparently only
+///    when the policy allows it and the build RF is complete. Shuffle exchanges
+///    preserve column ids and carry no projection, so no exchange bind check is
+///    needed in that case.
 /// 2. Non-crossable exchange (Gather/Any): hard fragment boundary — stop.
 /// 3. If `node` cannot bind the probe, stop (return false) — do not descend.
-/// 4. Try each child recursively; if a child accepts the probe, we are done.
-/// 5. If no child accepted it, place the probe on `node` itself (the deepest
+/// 4. Outer/anti/null-preserving joins are semantic boundaries: place there.
+/// 5. Try each child recursively; if a child accepts the probe, we are done.
+/// 6. If no child accepted it, place the probe on `node` itself (the deepest
 ///    reachable binder).
 fn push_probe_down(
     node: &mut PhysicalPlanNode,
     probe: &RuntimeFilterProbe,
-    allow_cross_exchange: bool,
+    policy: ProbePushPolicy,
 ) -> bool {
-    // Crossable exchange (shuffle): descend into its single child without
-    // binding-checking the exchange itself (it preserves the child's columns).
-    // Gated by `allow_cross_exchange`: under multi-BE the build side produces
-    // only a partial RF, so crossing the exchange is unsound (see
-    // `distribution_is_crossable`) — fall through to the hard boundary below.
-    if allow_cross_exchange && distribution_is_crossable(node) {
+    if policy.allow_cross_exchange
+        && policy.cross_exchange_build_complete
+        && distribution_is_crossable(node)
+    {
         if let Some(child) = node.children.first_mut() {
-            return push_probe_down(child, probe, allow_cross_exchange);
+            return push_probe_down(child, probe, policy);
         }
         return false;
     }
-    // Non-crossable exchange (Gather/Any), or cross-exchange disabled: a hard
-    // fragment boundary. The probe stays above it (build-only fallback).
     if is_exchange(node) {
         return false;
     }
     if !could_bound(node, &probe.probe_expr) {
         return false;
     }
+    if is_probe_semantic_boundary(node) {
+        node.probe_runtime_filters.push(probe.clone());
+        return true;
+    }
     for child in &mut node.children {
-        if push_probe_down(child, probe, allow_cross_exchange) {
+        if push_probe_down(child, probe, policy) {
             return true;
         }
     }
@@ -350,7 +437,11 @@ fn annotate_node(
     let Operator::PhysicalHashJoin(join) = &node.op else {
         return;
     };
-    if !join_builds_rf(join.join_type) {
+    let Some(sides) = rf_sides_for_join(join.join_type) else {
+        return;
+    };
+    let max_child = sides.probe_child.max(sides.build_child);
+    if node.children.len() <= max_child {
         return;
     }
     let eq_conditions = join.eq_conditions.clone();
@@ -358,9 +449,8 @@ fn annotate_node(
     if matches!(distribution, JoinDistribution::Unknown) {
         return;
     }
-    // Right child is build side (confirmed via pipeline builder + lowering).
-    let build_size = node.children[1].stats.compute_size();
-    let probe_size = node.children[0].stats.compute_size();
+    let build_size = node.children[sides.build_child].stats.compute_size();
+    let probe_size = node.children[sides.probe_child].stats.compute_size();
 
     // Cast session thresholds (u64 bytes) to f64 for size comparisons.
     let build_max = options.rf_build_max_bytes as f64;
@@ -386,31 +476,37 @@ fn annotate_node(
         if !probe_gate_passes(local, build_size, probe_size, build_min, probe_min, min_sel) {
             continue;
         }
+        let Some(oriented) = orient_rf_key(node, sides, expr_order, eq) else {
+            continue;
+        };
+        if (*next_filter_id as usize) >= options.rf_max_count {
+            continue;
+        }
         let filter_id = *next_filter_id;
         *next_filter_id += 1;
         descs.push(RuntimeFilterDesc {
             filter_id,
-            build_expr: eq.right.clone(),
-            probe_expr: eq.left.clone(),
-            expr_order,
+            build_expr: oriented.build_expr,
+            probe_expr: oriented.probe_expr,
+            expr_order: oriented.expr_order,
             distribution: distribution.clone(),
         });
     }
 
     // Push each probe descriptor down to the deepest binding descendant within
-    // the probe child (children[0]). Stops at exchange (fragment) boundaries.
+    // the true probe child. Stops at exchange (fragment) boundaries.
     // If no binding node is found the RF is build-only (probe remains unplaced).
+    let policy = ProbePushPolicy {
+        allow_cross_exchange: options.allow_cross_exchange_rf,
+        cross_exchange_build_complete: matches!(distribution, JoinDistribution::Broadcast),
+    };
     for d in &descs {
         let probe = RuntimeFilterProbe {
             filter_id: d.filter_id,
             probe_expr: d.probe_expr.clone(),
         };
-        // children[0] = probe side; descend to the deepest binding node.
-        let _ = push_probe_down(
-            &mut node.children[0],
-            &probe,
-            options.allow_cross_exchange_rf,
-        );
+        // Descend into the true probe side to the deepest binding node.
+        let _ = push_probe_down(&mut node.children[sides.probe_child], &probe, policy);
     }
 
     node.build_runtime_filters = descs;
@@ -428,7 +524,6 @@ fn test_null_expr() -> TypedExpr {
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::*;
     use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
@@ -490,6 +585,89 @@ pub(crate) mod test_support {
                 eq_conditions: vec![PhysicalHashJoinEqCondition {
                     left: lexpr,
                     right: rexpr,
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+            }),
+            children: vec![left, right],
+            stats: Statistics {
+                output_row_count: 10.0,
+                column_statistics: Default::default(),
+                ..Default::default()
+            },
+            output_columns: vec![loc, roc],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        }
+    }
+
+    pub(crate) fn hash_join_two_scans(join_type: JoinKind) -> PhysicalPlanNode {
+        let (loc, lexpr) = col(1, "lc");
+        let (roc, rexpr) = col(2, "rc");
+        let left = leaf(1_000_000.0, loc.clone());
+        let right = leaf(10.0, roc.clone());
+        PhysicalPlanNode {
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: lexpr,
+                    right: rexpr,
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+            }),
+            children: vec![left, right],
+            stats: Statistics {
+                output_row_count: 10.0,
+                column_statistics: Default::default(),
+                ..Default::default()
+            },
+            output_columns: vec![loc, roc],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        }
+    }
+
+    pub(crate) fn cross_hash_join_without_eq_conditions() -> PhysicalPlanNode {
+        let (loc, _) = col(1, "lc");
+        let (roc, _) = col(2, "rc");
+        let left = leaf(1_000_000.0, loc.clone());
+        let right = leaf(10.0, roc.clone());
+        PhysicalPlanNode {
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Cross,
+                eq_conditions: vec![],
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+            }),
+            children: vec![left, right],
+            stats: Statistics {
+                output_row_count: 10.0,
+                column_statistics: Default::default(),
+                ..Default::default()
+            },
+            output_columns: vec![loc, roc],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        }
+    }
+
+    pub(crate) fn inner_join_with_swapped_eq_labels() -> PhysicalPlanNode {
+        let (loc, lexpr) = col(1, "lc");
+        let (roc, rexpr) = col(2, "rc");
+        let left = leaf(1_000_000.0, loc.clone());
+        let right = leaf(10.0, roc.clone());
+        PhysicalPlanNode {
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: rexpr,
+                    right: lexpr,
                     null_safe: false,
                 }],
                 other_condition: None,
@@ -588,6 +766,110 @@ pub(crate) mod test_support {
                 ..Default::default()
             },
             output_columns: vec![loc, roc],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        }
+    }
+
+    pub(crate) fn broadcast_join_with_probe_exchange() -> PhysicalPlanNode {
+        use crate::sql::optimizer::operator::PhysicalDistributionOp;
+        use crate::sql::optimizer::property::{DistributionSpec, HashSource};
+        let (loc, lexpr) = col(1, "lc"); // probe column
+        let (roc, rexpr) = col(2, "rc"); // build column
+        let scan = leaf(1_000_000.0, loc.clone());
+        let exch = PhysicalPlanNode {
+            op: Operator::PhysicalDistribution(PhysicalDistributionOp {
+                spec: DistributionSpec::HashPartitioned {
+                    cols: vec![loc.column_id],
+                    source: HashSource::ShuffleJoin,
+                },
+            }),
+            children: vec![scan],
+            stats: Statistics {
+                output_row_count: 1_000_000.0,
+                row_count_confidence: crate::sql::optimizer::statistics::Confidence::Estimated,
+                column_statistics: Default::default(),
+                ..Default::default()
+            },
+            output_columns: vec![loc.clone()],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+        let build = leaf(100.0, roc.clone());
+        PhysicalPlanNode {
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: lexpr,
+                    right: rexpr,
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+            }),
+            children: vec![exch, build],
+            stats: Statistics {
+                output_row_count: 100.0,
+                row_count_confidence: crate::sql::optimizer::statistics::Confidence::Estimated,
+                column_statistics: Default::default(),
+                ..Default::default()
+            },
+            output_columns: vec![loc, roc],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        }
+    }
+
+    pub(crate) fn inner_join_over_left_outer_probe_child() -> PhysicalPlanNode {
+        let (preserved_oc, preserved_expr) = col(1, "preserved");
+        let (outer_build_oc, outer_build_expr) = col(2, "outer_build");
+        let (top_build_oc, top_build_expr) = col(3, "top_build");
+        let preserved = leaf(1_000_000.0, preserved_oc.clone());
+        let outer_build = leaf(10.0, outer_build_oc.clone());
+        let left_outer = PhysicalPlanNode {
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::LeftOuter,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: preserved_expr.clone(),
+                    right: outer_build_expr,
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+            }),
+            children: vec![preserved, outer_build],
+            stats: Statistics {
+                output_row_count: 1_000_000.0,
+                column_statistics: Default::default(),
+                ..Default::default()
+            },
+            output_columns: vec![preserved_oc.clone(), outer_build_oc],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+        let top_build = leaf(10.0, top_build_oc.clone());
+        PhysicalPlanNode {
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: preserved_expr,
+                    right: top_build_expr,
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+            }),
+            children: vec![left_outer, top_build],
+            stats: Statistics {
+                output_row_count: 10.0,
+                column_statistics: Default::default(),
+                ..Default::default()
+            },
+            output_columns: vec![preserved_oc, top_build_oc],
             execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
@@ -702,35 +984,70 @@ mod tests {
     }
 
     #[test]
-    fn probe_crosses_exchange_when_flag_enabled() {
-        // Flag-on behavior (disabled by default): with cross-exchange RF
-        // explicitly enabled, the probe descends past the shuffle exchange to
-        // the base scan. Guards the retained placement code for a future stage
-        // that re-enables it once the correctness bugs are fixed.
+    fn partitioned_rf_does_not_cross_exchange_even_when_flag_enabled() {
         let mut j = super::test_support::shuffle_join_with_probe_exchange();
         let mut opts = OptimizerOptions::default_settings();
         opts.allow_cross_exchange_rf = true;
+
         annotate(&mut j, &opts);
+
         assert_eq!(j.build_runtime_filters.len(), 1, "build RF expected");
         let exch = &j.children[0];
         assert!(
             exch.probe_runtime_filters.is_empty(),
-            "probe must not stop at the exchange"
+            "partitioned probe RF must not be placed on the exchange"
+        );
+        assert!(
+            exch.children[0].probe_runtime_filters.is_empty(),
+            "partitioned probe RF must not cross the exchange"
+        );
+    }
+
+    #[test]
+    fn broadcast_rf_crosses_exchange_when_flag_enabled() {
+        let mut j = super::test_support::broadcast_join_with_probe_exchange();
+        let mut opts = OptimizerOptions::default_settings();
+        opts.allow_cross_exchange_rf = true;
+
+        annotate(&mut j, &opts);
+
+        assert_eq!(j.build_runtime_filters.len(), 1, "build RF expected");
+        let exch = &j.children[0];
+        assert!(
+            exch.probe_runtime_filters.is_empty(),
+            "broadcast probe RF must not stop at the exchange"
         );
         assert_eq!(
             exch.children[0].probe_runtime_filters.len(),
             1,
-            "probe should reach the scan below the exchange"
+            "broadcast probe RF should reach the scan below the exchange"
+        );
+    }
+
+    #[test]
+    fn probe_does_not_descend_through_outer_join_boundary() {
+        let mut join = super::test_support::inner_join_over_left_outer_probe_child();
+
+        annotate(&mut join, &OptimizerOptions::default_settings());
+
+        assert_eq!(join.build_runtime_filters.len(), 1, "build RF expected");
+        let left_outer = &join.children[0];
+        assert_eq!(
+            left_outer.probe_runtime_filters.len(),
+            1,
+            "probe RF should stop on the outer join boundary"
+        );
+        assert!(
+            left_outer.children[0].probe_runtime_filters.is_empty(),
+            "probe RF must not descend into the preserved child"
         );
     }
 
     #[test]
     fn probe_stays_within_fragment_by_default() {
-        // Default (flag-off): cross-exchange placement is disabled, so the probe
-        // RF must not cross the shuffle exchange. It falls back to build-only —
-        // the probe stays unplaced above the exchange. This avoids the multi-BE
-        // (partial RF over a fanned-out build) and standalone (crossing an OUTER
-        // join drops null-key rows) correctness bugs.
+        // Default: partial partitioned RF must not cross the shuffle exchange.
+        // It falls back to build-only — the probe stays unplaced above the
+        // exchange.
         let mut j = super::test_support::shuffle_join_with_probe_exchange();
         annotate(&mut j, &OptimizerOptions::default_settings());
         assert_eq!(j.build_runtime_filters.len(), 1, "build RF still expected");
@@ -806,6 +1123,69 @@ mod tests {
     }
 
     #[test]
+    fn rf_join_eligibility_matches_probe_output_semantics() {
+        use crate::sql::analysis::JoinKind;
+
+        for kind in [
+            JoinKind::Inner,
+            JoinKind::LeftSemi,
+            JoinKind::RightOuter,
+            JoinKind::RightSemi,
+            JoinKind::RightAnti,
+        ] {
+            let mut join = super::test_support::hash_join_two_scans(kind);
+            annotate(&mut join, &OptimizerOptions::default_settings());
+            assert_eq!(
+                join.build_runtime_filters.len(),
+                1,
+                "{kind:?} should build an RF"
+            );
+        }
+
+        for kind in [
+            JoinKind::LeftOuter,
+            JoinKind::FullOuter,
+            JoinKind::LeftAnti,
+            JoinKind::NullAwareLeftAnti,
+        ] {
+            let mut join = super::test_support::hash_join_two_scans(kind);
+            annotate(&mut join, &OptimizerOptions::default_settings());
+            assert!(
+                join.build_runtime_filters.is_empty(),
+                "{kind:?} should not build an RF"
+            );
+        }
+
+        let mut cross = super::test_support::cross_hash_join_without_eq_conditions();
+        annotate(&mut cross, &OptimizerOptions::default_settings());
+        assert!(
+            cross.build_runtime_filters.is_empty(),
+            "Cross without equality keys should not build an RF"
+        );
+        assert!(
+            rf_sides_for_join(JoinKind::Cross).is_none(),
+            "Cross should not be marked RF-producing"
+        );
+    }
+
+    #[test]
+    fn rf_orients_swapped_eq_labels_by_child_column_ids() {
+        let mut join = super::test_support::inner_join_with_swapped_eq_labels();
+        annotate(&mut join, &OptimizerOptions::default_settings());
+        assert_eq!(join.build_runtime_filters.len(), 1);
+        assert_eq!(join.children[0].probe_runtime_filters.len(), 1);
+        assert!(join.children[1].probe_runtime_filters.is_empty());
+        assert_eq!(
+            column_id_vec(&join.build_runtime_filters[0].build_expr),
+            vec![crate::sql::column_id::ColumnId::new_for_test(2)]
+        );
+        assert_eq!(
+            column_id_vec(&join.build_runtime_filters[0].probe_expr),
+            vec![crate::sql::column_id::ColumnId::new_for_test(1)]
+        );
+    }
+
+    #[test]
     fn session_build_max_can_skip_rf() {
         // build_rows=1000, avg_row_size=8 bytes -> build_size=8KB.
         // With rf_build_max_bytes=1, build gate rejects even a tiny build.
@@ -814,6 +1194,18 @@ mod tests {
         opts.rf_build_max_bytes = 1; // 1 byte -> build gate rejects
         annotate(&mut j, &opts);
         assert!(j.build_runtime_filters.is_empty());
+    }
+
+    #[test]
+    fn rf_count_cap_limits_new_descriptors() {
+        let mut join = super::test_support::inner_join_two_scans();
+        let mut opts = OptimizerOptions::default_settings();
+        opts.rf_max_count = 0;
+
+        annotate(&mut join, &opts);
+
+        assert!(join.build_runtime_filters.is_empty());
+        assert_eq!(probe_runtime_filter_count(&join), 0);
     }
 
     fn probe_runtime_filter_count(node: &PhysicalPlanNode) -> usize {

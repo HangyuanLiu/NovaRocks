@@ -1,0 +1,18 @@
+SORT BY [o_orderpriority ASC NULLS FIRST] stats={rows=10}
+  GATHER EXCHANGE stats={rows=10}
+    PROJECT [o_orderpriority, count() AS order_count] stats={rows=10}
+      HASH AGGREGATE (SINGLE, group by: [o_orderpriority]) stats={rows=10}
+        aggregations: count()
+        HASH JOIN (PARTITIONED, LEFT SEMI, eq: [o_orderkey = l_orderkey]) stats={rows=62500}
+          HASH EXCHANGE (source: ShuffleJoin, hash: [c1]) stats={rows=250000}
+            SCAN tpch.orders stats={rows=250000}
+                 TABLE: tpch.orders
+                 columns: o_orderkey, o_orderpriority, o_orderdate
+                 min-max stats
+                 predicates: o_orderdate >= 9009 AND o_orderdate < 9100
+          HASH EXCHANGE (source: ShuffleJoin, hash: [c12]) stats={rows=500000}
+            SCAN tpch.lineitem stats={rows=500000}
+                 TABLE: tpch.lineitem
+                 columns: l_orderkey, l_commitdate, l_receiptdate
+                 min-max stats
+                 predicates: l_receiptdate > l_commitdate
