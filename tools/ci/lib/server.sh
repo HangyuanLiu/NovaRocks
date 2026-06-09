@@ -6,11 +6,32 @@ ci_start_standalone_server() {
   local config_path="$1"
   local log_path="$2"
   local timeout_seconds="$3"
+  local cargo_profile="${4:-dev-opt}"
+  local binary_dir
+  local binary_path
   local i
 
-  NO_PROXY=127.0.0.1,localhost \
-    target/debug/novarocks standalone-server \
-      --config "$config_path" >"$log_path" 2>&1 &
+  case "$cargo_profile" in
+    dev)
+      binary_dir="target/debug"
+      ;;
+    release)
+      binary_dir="target/release"
+      ;;
+    *)
+      binary_dir="target/$cargo_profile"
+      ;;
+  esac
+  binary_path="$binary_dir/novarocks"
+
+  {
+    printf "+ NO_PROXY=127.0.0.1,localhost %q standalone-server --config %q\n" \
+      "$binary_path" \
+      "$config_path"
+    NO_PROXY=127.0.0.1,localhost \
+      "$binary_path" standalone-server \
+        --config "$config_path"
+  } >"$log_path" 2>&1 &
   CI_SERVER_PID=$!
 
   i=0

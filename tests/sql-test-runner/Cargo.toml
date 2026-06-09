@@ -14,3 +14,11 @@ mysql = "25.0.1"
 rayon = "1.10"
 regex = "1.10"
 toml = "0.8"
+
+[profile.dev-opt]
+inherits = "dev"
+opt-level = 1
+debug = 1
+incremental = true
+lto = false
+codegen-units = 256
