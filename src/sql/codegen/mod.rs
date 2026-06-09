@@ -9,6 +9,7 @@ pub(crate) mod expr_compiler;
 pub(crate) mod fallback_audit;
 pub(crate) mod fragment_builder;
 pub(crate) mod helpers;
+pub(crate) mod iceberg_write_sink;
 pub(crate) mod id_binding_verifier;
 pub(crate) mod nodes;
 pub(crate) mod resolve;
