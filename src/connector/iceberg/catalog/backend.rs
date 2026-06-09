@@ -640,6 +640,10 @@ fn build_iceberg_table_info(
     })
 }
 
+pub(crate) fn iceberg_schema_def_for_codegen(schema: &iceberg::spec::Schema) -> IcebergSchemaDef {
+    iceberg_schema_def(schema)
+}
+
 fn iceberg_schema_def(schema: &iceberg::spec::Schema) -> IcebergSchemaDef {
     IcebergSchemaDef {
         fields: schema

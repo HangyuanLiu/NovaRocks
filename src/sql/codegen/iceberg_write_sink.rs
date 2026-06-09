@@ -17,6 +17,10 @@ pub(crate) struct IcebergWriteSinkSpec {
     pub compression: types::TCompressionType,
 }
 
+pub(crate) fn synthetic_iceberg_write_table_id() -> i64 {
+    -9_000_000_001
+}
+
 impl IcebergWriteSinkSpec {
     pub(crate) fn build_sink(&self, tuple_id: i32) -> data_sinks::TDataSink {
         data_sinks::TDataSink::new(

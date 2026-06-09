@@ -222,6 +222,13 @@ pub(crate) fn synthetic_write_commit_input() -> WriteCommitInput {
     }
 }
 
+pub(crate) fn write_commit_has_files(write_commit: &WriteCommitInput) -> bool {
+    write_commit
+        .writers
+        .iter()
+        .any(|writer| !writer.sink_commit_infos.is_empty())
+}
+
 fn synthetic_unique_id() -> crate::types::TUniqueId {
     let uuid = uuid::Uuid::new_v4();
     let bytes = uuid.as_bytes();
@@ -273,11 +280,10 @@ impl<'a, E: IcebergWriteTransactionExecutor> IcebergWriteTransactionRunner<'a, E
             ));
         }
 
-        let Some(write_commit) = written
-            .write_commit
-            .as_ref()
-            .filter(|c| !c.writers.is_empty())
-        else {
+        let Some(write_commit) = written.write_commit.as_ref().filter(|c| {
+            write_commit_has_files(c)
+                || !matches!(spec.commit.commit_op_kind, CommitOpKind::FastAppend)
+        }) else {
             self.transition(operation_id, IcebergOperationState::Aborting)?;
             self.transition(operation_id, IcebergOperationState::Aborted)?;
             return Ok(IcebergWriteTransactionOutcome {
@@ -462,6 +468,29 @@ mod tests {
 
     fn write_commit_with_one_writer() -> WriteCommitInput {
         crate::engine::write_operation_lifecycle::test_support::write_commit_with_data_file()
+    }
+
+    fn write_commit_with_writer_without_files() -> WriteCommitInput {
+        let write_id = crate::types::TUniqueId::new(10, 20);
+        let writer_key = WriterKey {
+            query_id: write_id.clone(),
+            fragment_instance_id: crate::types::TUniqueId::new(101, 201),
+            backend_num: 0,
+        };
+        WriteCommitInput {
+            write_id,
+            writers: vec![WriterCommitInput {
+                writer_id: 0,
+                writer_key,
+                sink_commit_infos: Vec::new(),
+                tablet_commit_infos: Vec::new(),
+                tablet_fail_infos: Vec::new(),
+                load_counters: BTreeMap::new(),
+                loaded_rows: 0,
+                loaded_bytes: 0,
+                filtered_rows: 0,
+            }],
+        }
     }
 
     struct FakeExecutor {
@@ -711,6 +740,35 @@ mod tests {
         let outcome = runner.run(sample_spec()).expect("empty is OK");
         assert_eq!(outcome.operation_id, None);
         assert_eq!(outcome.committed_snapshot_id, None);
+        let read = env.provider.begin_read().expect("read txn");
+        let stored = env
+            .state
+            .iceberg_operation_repo
+            .load_operation(read.as_ref(), 1)
+            .expect("load")
+            .expect("present");
+        assert_eq!(stored.state, IcebergOperationState::Aborted);
+    }
+
+    #[test]
+    fn runner_treats_writers_without_files_as_empty_write() {
+        let env = test_env();
+        let exec = FakeExecutor {
+            write: RefCell::new(Some(Ok(CoordinatedQueryResult {
+                query_result: empty_query_result(),
+                write_commit: Some(write_commit_with_writer_without_files()),
+                write_abort: None,
+            }))),
+            commit: RefCell::new(None),
+            finalize: Ok(()),
+        };
+        let runner = IcebergWriteTransactionRunner::new(Arc::clone(&env.state), &exec);
+        let outcome = runner
+            .run(sample_spec())
+            .expect("writer with no data files is an empty write");
+        assert_eq!(outcome.operation_id, None);
+        assert_eq!(outcome.committed_snapshot_id, None);
+
         let read = env.provider.begin_read().expect("read txn");
         let stored = env
             .state
