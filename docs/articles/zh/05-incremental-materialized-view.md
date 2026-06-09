@@ -129,7 +129,7 @@ pub(crate) fn build_imv_pipeline() -> RewritePipeline {
 - **从"形状分类"到"能力属性"，是这篇最核心的设计跃迁**。shape-dispatch 的复杂度随形状种类组合爆炸；property 是可组合代数，嵌套结构（join 套在 union 里、聚合套在 join 上）能自然表达，对应的增量改写也由可组合的规则拼出，而不是一个巨型 special-case 函数。
 - **表达力 > 可执行性，用 fail-fast 收口**。属性代数刻意做得比可执行集合更宽，再用 `into_refresh_contract` 一道显式边界把"还不能正确增量"的形状挡在外面。在系统最复杂的角落，仍然是"宁可明确拒绝，不可悄悄算错"。
 - **正确性靠规则可组合，而非穷举**。`Δ(join)`、`Δ(aggregate)`、`Δ(union)` 各是一条规则，靠重写流水线的定点迭代拼装；新增一种结构的增量支持，是加一条规则、而不是改一个上帝函数。
-- **诚实的边界与中间态**。大量 fail-fast 守卫（不支持 DISTINCT/HAVING/子查询、join 仅限两表 inner equi-join、自连接被距离拒绝）划清了能力边界。另外，面向 StarRocks-table 后端的旧 `IncrementalMvShape` 形状分类器仍然并存——Iceberg 路径已完全切到 property framework，两条后端路径处于迁移的中间态。
+- **诚实的边界与中间态**。大量 fail-fast 守卫（不支持 DISTINCT/HAVING/子查询、join 被限制在受支持的形状内、自连接被拒绝）划清了能力边界。另外，面向 StarRocks-table 后端的旧 `IncrementalMvShape` 形状分类器仍然并存——Iceberg 路径已完全切到 property framework，两条后端路径处于迁移的中间态。
 
 ## 小结：最后，凭什么相信它是对的？
 
