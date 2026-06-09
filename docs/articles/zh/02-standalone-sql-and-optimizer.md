@@ -4,7 +4,7 @@
 
 前两篇我们反复说"`ExecPlan` 拿到手之后怎么跑"，但都默认它是 StarRocks FE 用 thrift 下发、再经 lowering 得到的。问题是：NovaRocks 还能**完全脱离 FE** 自己跑 SQL。那这条线上，一句 `SELECT` 字符串是怎么一路变成能在上一篇那套 pipeline 上执行的 `ExecPlan` 的？
 
-这一篇就拆 standalone 模式的"另一个前门"——NovaRocks 自带的那颗 SQL 大脑：解析、分析、优化、codegen。
+这一篇就拆 standalone 模式的"另一个前门"——NovaRocks 自带的那颗 SQL 大脑：解析、分析、优化、codegen。其中优化器是重头，我们会把它的两段式结构（RBO 重写 + Cascades CBO）讲透，并借"聚合下推"这一条规则看清里面的工程细节。
 
 ## 定位：同一套内核的另一个前门
 
@@ -25,14 +25,14 @@ flowchart TD
 
 关键在最后两步：codegen 产出的，是和 FE 路径**同一个 `ExecPlan` 类型**，因此能复用同一套 pipeline。换句话说，NovaRocks 不是"两个引擎"，而是"一套执行内核 + 两套前端"。
 
-入口在 `src/server/mod.rs` 的 `on_query`（一个 MySQL 协议 shim），它把 SQL 拆成语句、维护会话状态（当前库、`SET` 的会话变量等），再交给引擎执行。分析阶段的入口是 `src/sql/analyzer/mod.rs:49` 的 `analyze`——负责名称解析、类型推断，产出一个已解析的查询 IR 加一个全局列 id 工厂。之后 plan 成 `LogicalPlan`，进入优化器。
+入口在 `src/server/mod.rs:574` 的 `on_query`（一个 MySQL 协议 shim），它把一次请求里的多条语句拆开、维护会话状态（当前库、`SET` 的会话变量、查询超时等），再逐条交给引擎执行。SELECT 的分析入口是 `src/sql/analyzer/mod.rs:49` 的 `analyze`——负责名称解析、类型推断，产出一个已解析的查询 IR（`ResolvedQuery`），外加一个 CTE 注册表和一个全局列 id 工厂（`ColumnRefFactory`，给每个列引用分配稳定 id，后续整条链路都靠它对齐列）。之后 plan 成 `LogicalPlan`，进入优化器。
 
-## 优化器：RBO 重写 + Cascades CBO
+## 优化器：先 RBO 重写，再 Cascades CBO
 
-优化器是这颗大脑里最重的一块。`src/sql/optimizer/mod.rs:61` 的 `optimize` 把整条流水线串了起来，读它的注释就能看清分层：
+优化器是这颗大脑里最重的一块。`src/sql/optimizer/mod.rs:61` 的 `optimize` 把整条流水线串了起来，它的阶段注释几乎就是一张目录：
 
 ```rust
-// src/sql/optimizer/mod.rs:61
+// src/sql/optimizer/mod.rs:61（节选关键阶段）
 pub(crate) fn optimize(
     plan: LogicalPlan,
     table_stats: &HashMap<String, TableStatistics>,
@@ -44,7 +44,6 @@ pub(crate) fn optimize(
     //    aggregate pushdown → column pruning → low-cardinality dict rewrite.
     let rewritten =
         rewrite::registry::query_rewrite_pipeline(table_stats).rewrite(plan, &mut rewrite_ctx)?;
-    // ...
     // 5. Convert to Memo.
     let root_group = convert::logical_plan_to_memo(&rewritten, &mut memo);
     // 6. Derive initial statistics.
@@ -53,13 +52,32 @@ pub(crate) fn optimize(
     explore(&mut memo, &transform_rules, &options, deadline)?;
     // 8. Implement: apply implementation rules (logical -> physical).
     implement(&mut memo, &impl_rules, &options);
-    // ... 10. top-down search with property enforcement; 11. extract best ...
+    // 10. Top-down search with property enforcement.
+    let root_required = PhysicalPropertySet::gather();
+    ctx.optimize_group(&memo, root_group, &root_required)?;
+    // 11. Extract best plan.
+    let mut physical = extract::extract_best(&memo, root_group, &root_required, &ctx.winners)?;
+    // 12. Annotate physical plan with runtime filter descriptors.
+    runtime_filter_pass::annotate(&mut physical, &options);
+    Ok(physical)
 }
 ```
 
-两段式很清晰：**先 RBO**——一条规则重写流水线，按"谓词下推 → join 重排 → 再下推 → 聚合下推 → 列裁剪 → 低基数字典重写"的固定顺序把逻辑计划改写到一个稳定形态；**再 CBO**——把逻辑计划灌进 `Memo`，派生统计、explore（逻辑→逻辑的变换规则）、implement（逻辑→物理的实现规则），最后自顶向下做带属性强制的代价搜索、抽出最优物理计划。这是经典的 Cascades 框架。
+两段式很清晰。**先 RBO**——一条规则重写流水线，按"谓词下推 → join 重排 → 再下推 → 聚合下推 → 列裁剪 → 低基数字典重写"的固定顺序把逻辑计划改写到一个稳定形态。**再 CBO**——把逻辑计划灌进 `Memo`（Cascades 的核心数据结构，用等价组把搜索空间紧凑表示），派生统计、`explore`（逻辑→逻辑的变换规则，比如 join 交换律）、`implement`（逻辑→物理的实现规则），再 `optimize_group` 做**自顶向下、带物理属性强制（分布、有序性）的代价搜索**，`extract_best` 抽出最优物理计划，最后给它标注 runtime filter。注意这里还埋了一个 `deadline`——优化本身有超时，避免在复杂查询上把搜索跑飞。
 
-规则本身被抽象成 trait。逻辑重写规则长这样：
+RBO 这一侧的规则被组织成带阶段的流水线，阶段本身是个枚举：
+
+```rust
+// src/sql/optimizer/rewrite/phase.rs:2
+pub(crate) enum RewritePhase {
+    LogicalNormalize,   // 形状归一化
+    StructuralRewrite,  // 谓词下推/聚合下推/列裁剪等结构改写
+    SemanticRewrite,    // 约束/唯一性传播
+    Validation,         // IR 不变量校验
+}
+```
+
+而每条规则实现一个统一的 trait：
 
 ```rust
 // src/sql/optimizer/rewrite/rule.rs:12
@@ -72,11 +90,13 @@ pub(crate) trait LogicalRewriteRule: Send + Sync {
 }
 ```
 
-`name / phase / matches / apply` 四件套——框架负责遍历、定点迭代、disable 处理和 tracing，规则只管"匹配某种形状、改写成另一种形状"。
+`name / phase / matches / apply` 四件套——框架负责遍历、定点迭代、disable 处理和 tracing，规则只管"匹配某种形状、改写成另一种形状"。还有一个更轻的 `PlanRewriteRule`，给只做"单节点 `LogicalPlan -> LogicalPlan`"的简单规则用，把遍历和迭代交给框架。
 
 ## 一个规则的工程细节：聚合下推与幂等护栏
 
-抽象讲完，看一个真实规则的难点。聚合下推（`AggregatePushdown`）想把聚合推过 join 往叶子靠，以减少 join 的输入行数——但它有个经典陷阱：改写产出的计划里仍然有一个聚合节点，规则会不会对自己的输出再次开火、无限下推？NovaRocks 用一个标志位封住了这个口子：
+抽象讲完，看一个真实规则的难点。聚合下推（`AggregatePushdown`）想把聚合推过 join 往叶子靠，以减少 join 的输入行数。它内部分三步：`collector` 收集能下推的形态、`cost::should_push`（`src/sql/optimizer/rewrite/rules/aggregate_pushdown/cost.rs:22`）用统计判断"推下去到底有没有收益"、`rewriter` 真正改写。
+
+但它有个经典陷阱：改写产出的计划里仍然有一个聚合节点，规则会不会对自己的输出再次开火、无限下推？NovaRocks 用一个标志位封住了这个口子：
 
 ```rust
 // src/sql/planner/plan.rs:287
@@ -87,7 +107,35 @@ pub(crate) trait LogicalRewriteRule: Send + Sync {
 pub already_pushed: bool,
 ```
 
-注意那句注释里的硬约束：**其他规则在克隆 `AggregateNode` 时必须保留这个标志**。这不是一句空话——比如 CTE 重写在重建节点时就老老实实地带上了它（`src/sql/optimizer/cte_rewrite.rs` 里 `already_pushed: node.already_pushed`）。一个跨规则的不变量，靠的是每条相关规则的自觉；NovaRocks 把这个约定写进了注释，并在测试里钉住了默认值。要不要真的下推，则由统计/NDV 估算（`should_push`）决定——没有收益就不动。
+注意那句注释里的硬约束：**其他规则在克隆 `AggregateNode` 时必须保留这个标志**。这不是一句空话——比如 CTE 重写在重建节点时就老老实实地带上了它（`cte_rewrite.rs` 里 `already_pushed: node.already_pushed`）。一个跨规则的不变量，靠的是每条相关规则的自觉；NovaRocks 把这个约定写进了注释，并在测试里钉住了默认值。这类"全局不变量 + 局部自觉"是优化器里最容易出 bug 的地方，值得显式约束。
+
+## CBO 的燃料：统计与 NDV，以及一个真实陷阱
+
+代价搜索的质量，取决于统计估得准不准；而其中最关键的一个量是 NDV（列的不同值个数）——它直接决定 join 的输出基数估计。这里有一个很能体现工程经验的细节：
+
+```rust
+// src/sql/optimizer/estimate/ndv.rs:32
+fn real_expr_ndv(
+    expr: &TypedExpr,
+    column_stats: &HashMap<ColumnId, ColumnStatistic>,
+) -> Option<(f64, Confidence)> {
+    // A column is only useful for cardinality if it carries a real NDV (> 1).
+    // ColumnStatistic::unknown() (propagated for no-stats / managed-lake tables)
+    // reports distinct_values_count = 1.0; treating that as a true NDV would make
+    // join-key estimation divide left*right by ~1 and explode joins to near
+    // cross-products. Mirror the `> 1.0` guard estimate_eq_selectivity uses and
+    // fall back to the default NDV for unknown/degenerate columns.
+    if let Some(column_id) = extract_column_id(expr)
+        && let Some(cs) = column_stats.get(&column_id)
+        && cs.distinct_values_count > 1.0
+    {
+        return Some((cs.distinct_values_count, cs.confidence));
+    }
+    None
+}
+```
+
+没有统计的表（比如 managed-lake 的新表）其 NDV 会被填成"未知"，而未知在内部表示成 `distinct_values_count = 1.0`。如果天真地拿它当真实 NDV——join 基数估计里 `左行数 × 右行数 / NDV` 会除以约等于 1，于是估出一个近似笛卡尔积的天文数字，CBO 就会选出灾难性的计划。这里用一个 `> 1.0` 的守卫把"退化的 NDV"挡掉，回退到一个保守默认值（`DEFAULT_JOIN_KEY_NDV = 40.0`）并标记为 `Fallback` 置信度。一行 `> 1.0`，背后是"没有统计时宁可保守、也不要把 join 估爆"的经验。
 
 ## 可观测、可 bisect
 
@@ -107,7 +155,7 @@ for name in ["disable_optimizer_rules", "cbo_disabled_rules"] {
 }
 ```
 
-`SET disable_optimizer_rules = 'AggregatePushdown,JoinCommutativity'` 就能把可疑规则逐个关掉做二分定位；写错规则名还会告警（`is_known_rule_name` 校验）。其二，`EXPLAIN` 有分级：
+`SET disable_optimizer_rules = 'AggregatePushdown,JoinCommutativity'` 就能把可疑规则逐个关掉做二分定位；写错规则名还会告警（`is_known_rule_name` 会校验它确实是某条变换/实现/重写规则）。其二，`EXPLAIN` 有分级：
 
 ```rust
 // src/sql/explain.rs:100
@@ -119,11 +167,11 @@ pub(crate) enum ExplainLevel {
 }
 ```
 
-`Costs` 会把每个节点的行数估计、列统计（min/max/NDV/置信度）打出来，`Analyze` 再叠上 planning/execution 耗时——misestimate 的根因（是 NDV 不准？还是回退到了默认统计？）因此变得可见。
+`Verbose`/`Costs`/`Analyze` 会给每个物理节点追加一个稳定的 `stats={rows=N}` 尾注；`Costs` 进一步打出列统计（min/max/NDV/置信度），`Analyze` 再叠上 planning/execution 耗时。于是 misestimate 的根因——是 NDV 不准？还是回退到了 `Fallback` 统计？——变得肉眼可见。配合上面的规则二分，"优化器为什么选了这个计划"从玄学变成了可排查的问题。
 
 ## 汇流：codegen 产出同一个 ExecPlan
 
-最后一步把优化后的物理计划交给 codegen，落成那个我们已经很熟悉的类型：
+最后一步把优化后的物理计划交给 codegen（`fragment_builder`），它会切分 fragment、构建描述符表，产出可执行的计划结构，最终落成那个我们已经很熟悉的类型：
 
 ```rust
 // src/engine/mod.rs:3363
@@ -131,14 +179,15 @@ let mut exec_plan = ExecPlan { arena, root };
 push_down_local_runtime_filters(&mut exec_plan.root, &exec_plan.arena);
 ```
 
-`ExecPlan { arena, root }`——和第 0 篇里 FE 路径 lower 出来的，是**同一个结构体**。到这里，"一套内核两个入口"不再是一句口号，而是落在同一个类型上的事实：两条前门各自把"SQL/thrift 计划"翻译成 `ExecPlan`，之后共享第 1 篇那套 pipeline。
+`ExecPlan { arena, root }`——和第 0 篇里 FE 路径 lower 出来的，是**同一个结构体**。到这里，"一套内核两个入口"不再是一句口号，而是落在同一个类型上的事实：FE 路径把 thrift 计划 lower 成它，standalone 路径把 SQL 优化、codegen 成它，之后共享第 1 篇那套 pipeline。两条前门在这个类型上真正会师。
 
 ## 取舍与对照
 
-- **一套执行内核，两套前端**。standalone 优化器可以独立演进（加 CBO 规则、改统计模型）而完全不动执行层——因为它们的接口就是 `ExecPlan` 这一个类型。
-- **RBO 重写 + Cascades CBO 并存**。先用固定顺序的规则把计划改写到稳定形态，再交给 memo 做代价搜索。这是工程上的折中：纯 Cascades 启动慢、规则爆炸难控，先 RBO 收一遍能显著缩小搜索空间。
-- **通用逻辑重写框架仍在渐进迁移**。`docs/design/2026-05-25-general-logical-rewrite-framework.md` 描述了一个统一的重写框架愿景；当前的现实是新框架与旧 RBO 驱动并存——简单规则走新框架（含聚合下推的幂等控制），复杂规则暂留旧路径。这是诚实的中间态，不是终态。
-- **优化器要可调试**。`disable_optimizer_rules` 的会话级二分 + 分级 `EXPLAIN`，让"优化器为什么选了这个计划"从玄学变成可排查的问题——这对一个仍在快速演进的引擎尤其重要。
+- **一套执行内核，两套前端**。standalone 优化器可以独立演进（加 CBO 规则、改统计模型）而完全不动执行层——因为它们的接口就是 `ExecPlan` 这一个类型。这是整个项目"为什么能同时服务两种模式"的根。
+- **RBO 重写 + Cascades CBO 并存**。先用固定顺序的规则把计划改写到稳定形态，再交给 memo 做代价搜索。纯 Cascades 启动慢、规则爆炸难控，先 RBO 收一遍能显著缩小搜索空间；优化还带 `deadline`，避免在病态查询上跑飞。
+- **统计不准时宁可保守**。`NDV > 1.0` 守卫这种细节，体现了一个务实判断：在 managed-lake 这类常常没有统计的场景下，错误的乐观估计（把 join 估成笛卡尔积）比保守估计危害大得多。
+- **优化器要可调试**。`disable_optimizer_rules` 的会话级二分 + 分级 `EXPLAIN`（带 `stats={rows=N}` 与列统计），让优化器的行为可观测、可回归——这也为第 6 篇"把计划形状纳入正确性护栏"埋了伏笔。
+- **通用逻辑重写框架仍在渐进迁移**。`docs/design/2026-05-25-general-logical-rewrite-framework.md` 描述了一个统一重写框架的愿景；当前现实是新框架与旧 RBO 驱动并存——简单规则走新框架，复杂规则暂留旧路径。这是诚实的中间态，不是终态。
 
 ## 小结：下一站，把湖接进来
 
