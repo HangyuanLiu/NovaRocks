@@ -82,7 +82,10 @@ pub(crate) fn partition_info_from_serialized_metadata(
     iceberg: &IcebergTableInfo,
 ) -> Result<Vec<descriptors::TIcebergPartitionInfo>, String> {
     let Some(serialized) = iceberg.serialized_metadata.as_ref() else {
-        return Ok(Vec::new());
+        return Err(format!(
+            "iceberg write sink requires serialized table metadata for {}.{}",
+            iceberg.namespace, iceberg.table
+        ));
     };
     let metadata =
         serde_json::from_str::<iceberg::spec::TableMetadata>(serialized).map_err(|e| {
@@ -293,6 +296,17 @@ mod tests {
             partition_info[0].transform_expr.as_deref(),
             Some("bucket[16]")
         );
+    }
+
+    #[test]
+    fn partition_info_from_serialized_metadata_requires_metadata() {
+        let spec = test_support::simple_sink_spec();
+
+        let err = partition_info_from_serialized_metadata(&spec.iceberg)
+            .expect_err("missing metadata must fail");
+
+        assert!(err.contains("iceberg write sink requires serialized table metadata"));
+        assert!(err.contains("test_db.target_orders"));
     }
 
     #[test]
