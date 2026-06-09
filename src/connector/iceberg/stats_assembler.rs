@@ -536,8 +536,7 @@ mod tests {
 
         // Real NDV read-back through the same PuffinReader + ThetaSketchHandle
         // decode path the loader uses (see `read_previous_sketches`).
-        let recovered =
-            read_previous_sketches_from_path(&file_io, &sf.statistics_path).await;
+        let recovered = read_previous_sketches_from_path(&file_io, &sf.statistics_path).await;
         let ndv = recovered.get(&3).expect("field 3 present").estimate();
         assert!(
             (450.0..=550.0).contains(&ndv),
