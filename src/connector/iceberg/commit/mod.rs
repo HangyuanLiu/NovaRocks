@@ -46,6 +46,7 @@ mod row_delta_dv;
 mod run;
 mod service;
 pub mod snapshot_lifecycle_helpers;
+pub(crate) mod statistics;
 #[cfg(test)]
 pub(crate) mod test_helpers;
 mod truncate;

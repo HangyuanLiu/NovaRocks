@@ -161,21 +161,9 @@ pub(crate) async fn register_puffin_stats(
     .await
     {
         Ok(Some(stats_file)) => {
-            // Apply the update via a follow-up Transaction.
-            let tx = Transaction::new(table_after);
-            let action = tx.update_statistics().set_statistics(stats_file);
-            let tx = match action.apply(tx) {
-                Ok(tx) => tx,
-                Err(err) => {
-                    tracing::warn!(
-                        new_snapshot_id,
-                        error = %err,
-                        "iceberg puffin stats apply failed; snapshot committed without stats",
-                    );
-                    return;
-                }
-            };
-            if let Err(err) = tx.commit(catalog).await {
+            if let Err(err) =
+                super::statistics::commit_statistics_file(table_after, catalog, stats_file).await
+            {
                 tracing::warn!(
                     new_snapshot_id,
                     error = %err,
@@ -223,20 +211,7 @@ pub(crate) async fn carry_forward_puffin_stats(
     for blob in entry.blob_metadata.iter_mut() {
         blob.snapshot_id = new_snapshot_id;
     }
-    let tx = Transaction::new(table_after);
-    let action = tx.update_statistics().set_statistics(entry);
-    let tx = match action.apply(tx) {
-        Ok(tx) => tx,
-        Err(err) => {
-            tracing::warn!(
-                new_snapshot_id,
-                error = %err,
-                "iceberg puffin carry-forward stats apply failed",
-            );
-            return;
-        }
-    };
-    if let Err(err) = tx.commit(catalog).await {
+    if let Err(err) = super::statistics::commit_statistics_file(table_after, catalog, entry).await {
         tracing::warn!(
             new_snapshot_id,
             error = %err,
