@@ -530,6 +530,9 @@ pub(crate) fn start_maintenance_coordinator_for_server(
 }
 
 #[cfg(test)]
+mod integration_tests;
+
+#[cfg(test)]
 mod tests {
     use super::policy::*;
     use super::*;
