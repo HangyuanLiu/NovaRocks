@@ -16,8 +16,12 @@ use crate::meta::repository::mv_contract::{ExpressionKind, MvSchemaContract};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AffectedTargetPartitions {
     Unpartitioned,
-    Known { partitions: BTreeSet<MvPartitionKey> },
-    NotDerived { reason: String },
+    Known {
+        partitions: BTreeSet<MvPartitionKey>,
+    },
+    NotDerived {
+        reason: String,
+    },
 }
 
 impl AffectedTargetPartitions {
@@ -246,20 +250,24 @@ pub(crate) fn bind_spec_to_aggregate_layout(
 ) -> Result<Vec<BoundPartitionField>, AffectedPartitionError> {
     let mut bound = Vec::with_capacity(spec.fields.len());
     for field in &spec.fields {
-        if !layout.group_key_source_indexes.contains(&field.output_index) {
+        if !layout
+            .group_key_source_indexes
+            .contains(&field.output_index)
+        {
             return Err(AffectedPartitionError::OutputLineageNotPureColumn {
                 field: field.partition_field_name.clone(),
             });
         }
-        let column = layout.visible_columns.get(field.output_index).ok_or_else(|| {
-            AffectedPartitionError::GroupKeyColumnMissing {
+        let column = layout
+            .visible_columns
+            .get(field.output_index)
+            .ok_or_else(|| AffectedPartitionError::GroupKeyColumnMissing {
                 field: field.partition_field_name.clone(),
                 reason: format!(
                     "layout has no visible column for output index {}",
                     field.output_index
                 ),
-            }
-        })?;
+            })?;
         bound.push(BoundPartitionField {
             partition_field_name: field.partition_field_name.clone(),
             column_name: column.name.clone(),
@@ -660,7 +668,11 @@ mod tests {
         let mut contract =
             count_contract_with_partition("region", MvPartitionTransformContract::Identity, 11);
         contract.target.partition = None;
-        assert!(resolve_partition_derivation_spec(&contract).unwrap().is_none());
+        assert!(
+            resolve_partition_derivation_spec(&contract)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -669,7 +681,11 @@ mod tests {
         let mut contract =
             count_contract_with_partition("region", MvPartitionTransformContract::Identity, 11);
         contract.target.partition.as_mut().unwrap().fields.clear();
-        assert!(resolve_partition_derivation_spec(&contract).unwrap().is_none());
+        assert!(
+            resolve_partition_derivation_spec(&contract)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -801,20 +817,16 @@ mod tests {
         use arrow::array::{Int64Array, StringArray};
         let n = values.len();
         let row_ids: Vec<String> = (0..n).map(|i| format!("rid-{i}")).collect();
-        let row_id_arr: arrow::array::ArrayRef =
-            StdArcFixture::new(StringArray::from(row_ids));
-        let counts: arrow::array::ArrayRef =
-            StdArcFixture::new(Int64Array::from(vec![1i64; n]));
-        let states: arrow::array::ArrayRef =
-            StdArcFixture::new(Int64Array::from(vec![1i64; n]));
+        let row_id_arr: arrow::array::ArrayRef = StdArcFixture::new(StringArray::from(row_ids));
+        let counts: arrow::array::ArrayRef = StdArcFixture::new(Int64Array::from(vec![1i64; n]));
+        let states: arrow::array::ArrayRef = StdArcFixture::new(Int64Array::from(vec![1i64; n]));
         let schema = StdArcFixture::new(Schema::new(vec![
             Field::new("__row_id__", DataType::Utf8, false),
             Field::new(name, dt, true),
             Field::new("c", DataType::Int64, false),
             Field::new("__agg_state_c", DataType::Int64, false),
         ]));
-        let batch =
-            RecordBatch::try_new(schema, vec![row_id_arr, values, counts, states]).unwrap();
+        let batch = RecordBatch::try_new(schema, vec![row_id_arr, values, counts, states]).unwrap();
         crate::engine::record_batch_to_chunk(batch).unwrap()
     }
 
@@ -828,8 +840,7 @@ mod tests {
     #[test]
     fn arrow_row_to_partition_value_supports_iceberg_primitive_arrow_types() {
         use arrow::array::{ArrayRef, StringArray};
-        let bool_arr =
-            StdArcFixture::new(BooleanArray::from(vec![Some(true)])) as ArrayRef;
+        let bool_arr = StdArcFixture::new(BooleanArray::from(vec![Some(true)])) as ArrayRef;
         assert_eq!(
             arrow_array_row_to_partition_value(bool_arr.as_ref(), 0, "f").unwrap(),
             MvPartitionValue::String("true".to_string())
@@ -844,27 +855,23 @@ mod tests {
             arrow_array_row_to_partition_value(long_arr.as_ref(), 0, "f").unwrap(),
             MvPartitionValue::String("20000".to_string())
         );
-        let float_arr =
-            StdArcFixture::new(Float32Array::from(vec![Some(1.5f32)])) as ArrayRef;
+        let float_arr = StdArcFixture::new(Float32Array::from(vec![Some(1.5f32)])) as ArrayRef;
         assert_eq!(
             arrow_array_row_to_partition_value(float_arr.as_ref(), 0, "f").unwrap(),
             MvPartitionValue::String("1.5".to_string())
         );
-        let double_arr =
-            StdArcFixture::new(Float64Array::from(vec![Some(2.5f64)])) as ArrayRef;
+        let double_arr = StdArcFixture::new(Float64Array::from(vec![Some(2.5f64)])) as ArrayRef;
         assert_eq!(
             arrow_array_row_to_partition_value(double_arr.as_ref(), 0, "f").unwrap(),
             MvPartitionValue::String("2.5".to_string())
         );
-        let str_arr =
-            StdArcFixture::new(StringArray::from(vec![Some("east")])) as ArrayRef;
+        let str_arr = StdArcFixture::new(StringArray::from(vec![Some("east")])) as ArrayRef;
         assert_eq!(
             arrow_array_row_to_partition_value(str_arr.as_ref(), 0, "f").unwrap(),
             MvPartitionValue::String("east".to_string())
         );
         // Date32: number of days since 1970-01-01.
-        let date_arr =
-            StdArcFixture::new(Date32Array::from(vec![Some(19500)])) as ArrayRef;
+        let date_arr = StdArcFixture::new(Date32Array::from(vec![Some(19500)])) as ArrayRef;
         assert_eq!(
             arrow_array_row_to_partition_value(date_arr.as_ref(), 0, "f").unwrap(),
             MvPartitionValue::String("19500".to_string())
@@ -881,8 +888,7 @@ mod tests {
 
     #[test]
     fn arrow_row_to_partition_value_handles_null() {
-        let arr =
-            StdArcFixture::new(Int32Array::from(vec![None::<i32>])) as arrow::array::ArrayRef;
+        let arr = StdArcFixture::new(Int32Array::from(vec![None::<i32>])) as arrow::array::ArrayRef;
         assert_eq!(
             arrow_array_row_to_partition_value(arr.as_ref(), 0, "f").unwrap(),
             MvPartitionValue::Null
@@ -939,8 +945,7 @@ mod tests {
         ];
         for (lit, arr) in cases {
             let manifest_value = manifest_primitive_to_string(&lit);
-            let client_value =
-                arrow_array_row_to_partition_value(arr.as_ref(), 0, "f").unwrap();
+            let client_value = arrow_array_row_to_partition_value(arr.as_ref(), 0, "f").unwrap();
             assert_eq!(
                 MvPartitionValue::String(manifest_value),
                 client_value,
@@ -969,9 +974,9 @@ mod tests {
 
     #[test]
     fn bind_and_evaluate_identity_partition_over_chunks() {
+        use crate::sql::parser::ast::SqlType;
         use arrow::array::StringArray;
         use arrow::datatypes::DataType;
-        use crate::sql::parser::ast::SqlType;
 
         let layout = count_layout_with_group_key("region", DataType::Utf8, SqlType::String);
         let contract =
@@ -1000,8 +1005,8 @@ mod tests {
 
     #[test]
     fn bind_rejects_non_group_key_output_index() {
-        use arrow::datatypes::DataType;
         use crate::sql::parser::ast::SqlType;
+        use arrow::datatypes::DataType;
 
         let mut layout = count_layout_with_group_key("region", DataType::Utf8, SqlType::String);
         layout.group_key_source_indexes = vec![1]; // "region" (index 0) no longer a group key
