@@ -500,6 +500,141 @@ pub(crate) fn map_children(e: &TypedExpr, f: &impl Fn(&TypedExpr) -> TypedExpr) 
     }
 }
 
+/// `Option`-returning analogue of [`map_children`]: rebuild `e` with each
+/// immediate `TypedExpr` child mapped through `f`, where any child returning
+/// `None` makes the whole call `None`.
+///
+/// Unlike [`map_children`] (which returns leaves/opaque variants unchanged),
+/// `try_map_children`'s contract is "rebuild fully or fail". It therefore
+/// returns `None` for LEAVES (`ColumnRef`/`LambdaParamRef`/`Literal`/
+/// `SubqueryPlaceholder`) and for OPAQUE/SPJG-unsupported variants
+/// (`WindowCall`/`LambdaFunction`/`Lambda`). [`MvColumnMap::rewrite`] handles
+/// `ColumnRef`/`Literal` itself and only calls this for the "everything else"
+/// recursion, so a subtree this cannot fully verify must fail closed rather
+/// than be emitted as a rewrite.
+pub(crate) fn try_map_children(
+    e: &TypedExpr,
+    f: &mut impl FnMut(&TypedExpr) -> Option<TypedExpr>,
+) -> Option<TypedExpr> {
+    let kind = match &e.kind {
+        // Leaves: pre-handled by callers, or unmappable -> fail closed.
+        ExprKind::ColumnRef { .. }
+        | ExprKind::LambdaParamRef { .. }
+        | ExprKind::Literal(_)
+        | ExprKind::SubqueryPlaceholder { .. } => return None,
+
+        ExprKind::BinaryOp { left, op, right } => ExprKind::BinaryOp {
+            left: Box::new(f(left)?),
+            op: *op,
+            right: Box::new(f(right)?),
+        },
+        ExprKind::UnaryOp { op, expr } => ExprKind::UnaryOp {
+            op: *op,
+            expr: Box::new(f(expr)?),
+        },
+        ExprKind::FunctionCall {
+            name,
+            args,
+            distinct,
+        } => ExprKind::FunctionCall {
+            name: name.clone(),
+            args: args.iter().map(&mut *f).collect::<Option<Vec<_>>>()?,
+            distinct: *distinct,
+        },
+        ExprKind::AggregateCall {
+            name,
+            args,
+            distinct,
+            order_by,
+        } => ExprKind::AggregateCall {
+            name: name.clone(),
+            args: args.iter().map(&mut *f).collect::<Option<Vec<_>>>()?,
+            distinct: *distinct,
+            order_by: order_by.clone(),
+        },
+        ExprKind::Cast { expr, target } => ExprKind::Cast {
+            expr: Box::new(f(expr)?),
+            target: target.clone(),
+        },
+        ExprKind::IsNull { expr, negated } => ExprKind::IsNull {
+            expr: Box::new(f(expr)?),
+            negated: *negated,
+        },
+        ExprKind::InList {
+            expr,
+            list,
+            negated,
+        } => ExprKind::InList {
+            expr: Box::new(f(expr)?),
+            list: list.iter().map(&mut *f).collect::<Option<Vec<_>>>()?,
+            negated: *negated,
+        },
+        ExprKind::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => ExprKind::Between {
+            expr: Box::new(f(expr)?),
+            low: Box::new(f(low)?),
+            high: Box::new(f(high)?),
+            negated: *negated,
+        },
+        ExprKind::Like {
+            expr,
+            pattern,
+            negated,
+        } => ExprKind::Like {
+            expr: Box::new(f(expr)?),
+            pattern: Box::new(f(pattern)?),
+            negated: *negated,
+        },
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            let operand = match operand {
+                Some(o) => Some(Box::new(f(o)?)),
+                None => None,
+            };
+            let mut mapped_when_then = Vec::with_capacity(when_then.len());
+            for (w, t) in when_then {
+                mapped_when_then.push((f(w)?, f(t)?));
+            }
+            let else_expr = match else_expr {
+                Some(els) => Some(Box::new(f(els)?)),
+                None => None,
+            };
+            ExprKind::Case {
+                operand,
+                when_then: mapped_when_then,
+                else_expr,
+            }
+        }
+        ExprKind::IsTruthValue {
+            expr,
+            value,
+            negated,
+        } => ExprKind::IsTruthValue {
+            expr: Box::new(f(expr)?),
+            value: *value,
+            negated: *negated,
+        },
+        ExprKind::Nested(inner) => ExprKind::Nested(Box::new(f(inner)?)),
+
+        // Opaque / SPJG-unsupported: cannot verify -> fail closed.
+        ExprKind::WindowCall { .. } | ExprKind::LambdaFunction { .. } | ExprKind::Lambda { .. } => {
+            return None;
+        }
+    };
+    Some(TypedExpr {
+        kind,
+        data_type: e.data_type.clone(),
+        nullable: e.nullable,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
