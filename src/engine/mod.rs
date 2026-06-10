@@ -40,6 +40,8 @@ pub(crate) mod dictionary;
 pub(crate) mod iceberg_ctas;
 pub(crate) mod iceberg_maintenance;
 pub(crate) mod iceberg_ref_flow;
+pub(crate) mod iceberg_view;
+pub(crate) mod iceberg_view_rewrite;
 pub(crate) mod information_schema;
 pub(crate) mod insert;
 pub(crate) mod insert_flow;
@@ -935,6 +937,14 @@ impl StandaloneSession {
                     &self.inner.views,
                     current_database,
                 );
+                // Inline iceberg-catalog views (REST only). Runs after session
+                // views so local definitions keep precedence.
+                self::iceberg_view_rewrite::expand_iceberg_views_in_query(
+                    &self.inner,
+                    &mut prepared,
+                    current_catalog,
+                    current_database,
+                )?;
                 // Materialize information_schema virtual tables (e.g. `schemata`)
                 // into VALUES-backed derived tables. Run after view expansion
                 // because a view may project from a virtual table.
@@ -2563,6 +2573,14 @@ fn prepare_explain_query(
     // Inline any user-defined views before the analyzer sees the query.
     let mut prepared = query.clone();
     self::view_rewrite::expand_views_in_query(&mut prepared, &state.views, current_database);
+    // Inline iceberg-catalog views (REST only). Runs after session
+    // views so local definitions keep precedence.
+    self::iceberg_view_rewrite::expand_iceberg_views_in_query(
+        state,
+        &mut prepared,
+        current_catalog,
+        current_database,
+    )?;
 
     // Time-travel refs become synthetic local tables. Ordinary Iceberg refs
     // remain untouched and resolve through CatalogMgrProvider during analysis.
