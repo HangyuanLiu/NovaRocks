@@ -24,10 +24,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use iceberg::io::{FileIO, FileIOBuilder, StorageFactory};
+use iceberg::spec::{ViewMetadata, ViewVersion};
 use iceberg::table::Table;
 use iceberg::{
     Catalog, CatalogBuilder, Error, ErrorKind, Namespace, NamespaceIdent, Result, TableCommit,
-    TableCreation, TableIdent,
+    TableCreation, TableIdent, ViewCommit, ViewCreation,
 };
 use itertools::Itertools;
 use reqwest::header::{
@@ -41,9 +42,10 @@ use crate::client::{
     HttpClient, deserialize_catalog_response, deserialize_unexpected_catalog_error,
 };
 use crate::types::{
-    CatalogConfig, CommitTableRequest, CommitTableResponse, CreateNamespaceRequest,
-    CreateTableRequest, ListNamespaceResponse, ListTablesResponse, LoadTableResult,
-    NamespaceResponse, RegisterTableRequest, RenameTableRequest,
+    CatalogConfig, CommitTableRequest, CommitTableResponse, CommitViewRequest,
+    CreateNamespaceRequest, CreateTableRequest, CreateViewRequest, ListNamespaceResponse,
+    ListTablesResponse, ListViewsResponse, LoadTableResult, LoadViewResult, NamespaceResponse,
+    RegisterTableRequest, RenameTableRequest,
 };
 
 /// REST catalog URI
@@ -204,6 +206,19 @@ impl RestCatalogConfig {
             &table.namespace.to_url_string(),
             "tables",
             &table.name,
+        ])
+    }
+
+    fn views_endpoint(&self, ns: &NamespaceIdent) -> String {
+        self.url_prefixed(&["namespaces", &ns.to_url_string(), "views"])
+    }
+
+    fn view_endpoint(&self, view: &TableIdent) -> String {
+        self.url_prefixed(&[
+            "namespaces",
+            &view.namespace.to_url_string(),
+            "views",
+            &view.name,
         ])
     }
 
@@ -1040,6 +1055,233 @@ impl Catalog for RestCatalog {
             .metadata(response.metadata)
             .metadata_location(response.metadata_location)
             .build()
+    }
+
+    /// Create a new view inside the namespace.
+    async fn create_view(
+        &self,
+        namespace: &NamespaceIdent,
+        creation: ViewCreation,
+    ) -> Result<ViewMetadata> {
+        let context = self.context().await?;
+
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    format!("system clock before epoch: {e}"),
+                )
+            })?
+            .as_millis() as i64;
+        let view_version = ViewVersion::builder()
+            .with_version_id(1)
+            .with_schema_id(creation.schema.schema_id())
+            .with_timestamp_ms(timestamp_ms)
+            .with_summary(creation.summary)
+            .with_representations(creation.representations)
+            .with_default_catalog(creation.default_catalog)
+            .with_default_namespace(creation.default_namespace)
+            .build();
+
+        let request = context
+            .client
+            .request(Method::POST, context.config.views_endpoint(namespace))
+            .json(&CreateViewRequest {
+                name: creation.name,
+                location: creation.location,
+                schema: creation.schema,
+                view_version,
+                properties: creation.properties,
+            })
+            .build()?;
+
+        let http_response = context.client.query_catalog(request).await?;
+
+        match http_response.status() {
+            StatusCode::OK => {
+                let response =
+                    deserialize_catalog_response::<LoadViewResult>(http_response).await?;
+                Ok(response.metadata)
+            }
+            StatusCode::NOT_FOUND => Err(Error::new(
+                ErrorKind::NamespaceNotFound,
+                "Tried to create a view under a namespace that does not exist",
+            )),
+            StatusCode::CONFLICT => {
+                Err(Error::new(ErrorKind::Unexpected, "The view already exists"))
+            }
+            _ => Err(deserialize_unexpected_catalog_error(
+                http_response,
+                context.client.disable_header_redaction(),
+            )
+            .await),
+        }
+    }
+
+    /// Load a view's metadata from the catalog.
+    async fn load_view(&self, view: &TableIdent) -> Result<ViewMetadata> {
+        let context = self.context().await?;
+
+        let request = context
+            .client
+            .request(Method::GET, context.config.view_endpoint(view))
+            .build()?;
+
+        let http_response = context.client.query_catalog(request).await?;
+
+        match http_response.status() {
+            StatusCode::OK => {
+                let response =
+                    deserialize_catalog_response::<LoadViewResult>(http_response).await?;
+                Ok(response.metadata)
+            }
+            StatusCode::NOT_FOUND => Err(Error::new(
+                ErrorKind::Unexpected,
+                "Tried to load a view that does not exist",
+            )),
+            _ => Err(deserialize_unexpected_catalog_error(
+                http_response,
+                context.client.disable_header_redaction(),
+            )
+            .await),
+        }
+    }
+
+    /// Commit updates to an existing view.
+    async fn update_view(&self, mut commit: ViewCommit) -> Result<ViewMetadata> {
+        let context = self.context().await?;
+
+        let request = context
+            .client
+            .request(
+                Method::POST,
+                context.config.view_endpoint(commit.identifier()),
+            )
+            .json(&CommitViewRequest {
+                identifier: Some(commit.identifier().clone()),
+                requirements: commit.take_requirements(),
+                updates: commit.take_updates(),
+            })
+            .build()?;
+
+        let http_response = context.client.query_catalog(request).await?;
+
+        match http_response.status() {
+            StatusCode::OK => {
+                let response =
+                    deserialize_catalog_response::<LoadViewResult>(http_response).await?;
+                Ok(response.metadata)
+            }
+            StatusCode::NOT_FOUND => Err(Error::new(
+                ErrorKind::Unexpected,
+                "Tried to update a view that does not exist",
+            )),
+            StatusCode::CONFLICT => Err(Error::new(
+                ErrorKind::CatalogCommitConflicts,
+                "View commit failed due to a conflicting update",
+            )
+            .with_retryable(true)),
+            _ => Err(deserialize_unexpected_catalog_error(
+                http_response,
+                context.client.disable_header_redaction(),
+            )
+            .await),
+        }
+    }
+
+    /// Drop a view from the catalog.
+    async fn drop_view(&self, view: &TableIdent) -> Result<()> {
+        let context = self.context().await?;
+
+        let request = context
+            .client
+            .request(Method::DELETE, context.config.view_endpoint(view))
+            .build()?;
+
+        let http_response = context.client.query_catalog(request).await?;
+
+        match http_response.status() {
+            StatusCode::OK | StatusCode::NO_CONTENT => Ok(()),
+            StatusCode::NOT_FOUND => Err(Error::new(
+                ErrorKind::Unexpected,
+                "Tried to drop a view that does not exist",
+            )),
+            _ => Err(deserialize_unexpected_catalog_error(
+                http_response,
+                context.client.disable_header_redaction(),
+            )
+            .await),
+        }
+    }
+
+    /// Check if a view exists in the catalog.
+    async fn view_exists(&self, view: &TableIdent) -> Result<bool> {
+        let context = self.context().await?;
+
+        let request = context
+            .client
+            .request(Method::HEAD, context.config.view_endpoint(view))
+            .build()?;
+
+        let http_response = context.client.query_catalog(request).await?;
+
+        match http_response.status() {
+            StatusCode::OK | StatusCode::NO_CONTENT => Ok(true),
+            StatusCode::NOT_FOUND => Ok(false),
+            _ => Err(deserialize_unexpected_catalog_error(
+                http_response,
+                context.client.disable_header_redaction(),
+            )
+            .await),
+        }
+    }
+
+    /// List views in the namespace.
+    async fn list_views(&self, namespace: &NamespaceIdent) -> Result<Vec<TableIdent>> {
+        let context = self.context().await?;
+        let endpoint = context.config.views_endpoint(namespace);
+        let mut identifiers = Vec::new();
+        let mut next_token = None;
+
+        loop {
+            let mut request = context.client.request(Method::GET, endpoint.clone());
+
+            if let Some(token) = next_token {
+                request = request.query(&[("pageToken", token)]);
+            }
+
+            let http_response = context.client.query_catalog(request.build()?).await?;
+
+            match http_response.status() {
+                StatusCode::OK => {
+                    let response =
+                        deserialize_catalog_response::<ListViewsResponse>(http_response).await?;
+
+                    identifiers.extend(response.identifiers);
+
+                    match response.next_page_token {
+                        Some(token) => next_token = Some(token),
+                        None => break,
+                    }
+                }
+                StatusCode::NOT_FOUND => {
+                    return Err(Error::new(
+                        ErrorKind::NamespaceNotFound,
+                        "Tried to list views under a namespace that does not exist",
+                    ));
+                }
+                _ => {
+                    return Err(deserialize_unexpected_catalog_error(
+                        http_response,
+                        context.client.disable_header_redaction(),
+                    )
+                    .await);
+                }
+            }
+        }
+
+        Ok(identifiers)
     }
 }
 
