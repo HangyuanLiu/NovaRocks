@@ -1,5 +1,7 @@
+use crate::sql::analysis::{ExprKind, OutputColumn, SortItem};
 use crate::sql::optimizer::memo::{MExpr, Memo};
 use crate::sql::optimizer::operator::{LogicalTopNOp, Operator, TopNPhase};
+use crate::sql::optimizer::property::typed_expr_to_column_id;
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
 use crate::sql::optimizer::topn_proof::{
     ScanTopNCapability, TopNWindow, default_scan_topn_capability, ordering_covers,
@@ -356,13 +358,6 @@ fn push_topn_through_setop(expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
     let Some(union_group) = memo.groups.get(expr.children[0]).cloned() else {
         return vec![];
     };
-    let branch_topn_op = Operator::LogicalTopN(LogicalTopNOp {
-        items: topn.items.clone(),
-        limit: Some(branch_limit),
-        offset: Some(0),
-        phase: topn.phase,
-        is_split: topn.is_split,
-    });
 
     let mut results = Vec::new();
     for union_expr in union_group.logical_exprs.iter() {
@@ -372,17 +367,25 @@ fn push_topn_through_setop(expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
         if !union.all || union_expr.children.is_empty() {
             continue;
         }
+        let Some(branch_topn_ops) =
+            build_union_branch_topn_ops(topn, branch_limit, union, &union_expr.children, memo)
+        else {
+            continue;
+        };
         if union_expr
             .children
             .iter()
-            .all(|group| group_starts_with_logical_op(memo, *group, &branch_topn_op))
+            .zip(&branch_topn_ops)
+            .all(|(group, op)| {
+                group_starts_with_logical_op(memo, *group, &Operator::LogicalTopN(op.clone()))
+            })
         {
             continue;
         }
 
         let mut pushed_branch_groups = Vec::with_capacity(union_expr.children.len());
-        for branch_group in &union_expr.children {
-            let pushed_op = branch_topn_op.clone();
+        for (branch_group, branch_topn_op) in union_expr.children.iter().zip(branch_topn_ops) {
+            let pushed_op = Operator::LogicalTopN(branch_topn_op);
             let pushed_children = vec![*branch_group];
             let pushed_group = find_existing_logical_group(memo, &pushed_op, &pushed_children)
                 .unwrap_or_else(|| {
@@ -413,6 +416,71 @@ fn push_topn_through_setop(expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
         });
     }
     results
+}
+
+fn build_union_branch_topn_ops(
+    topn: &LogicalTopNOp,
+    branch_limit: i64,
+    union: &crate::sql::optimizer::operator::LogicalUnionOp,
+    branch_groups: &[usize],
+    memo: &Memo,
+) -> Option<Vec<LogicalTopNOp>> {
+    branch_groups
+        .iter()
+        .map(|branch_group| {
+            let branch_outputs = memo
+                .groups
+                .get(*branch_group)?
+                .logical_props
+                .as_ref()?
+                .output_columns
+                .as_slice();
+            let items =
+                remap_sort_items_through_union(&topn.items, &union.output_columns, branch_outputs)?;
+            Some(LogicalTopNOp {
+                items,
+                limit: Some(branch_limit),
+                offset: Some(0),
+                phase: topn.phase,
+                is_split: topn.is_split,
+            })
+        })
+        .collect()
+}
+
+fn remap_sort_items_through_union(
+    items: &[SortItem],
+    union_outputs: &[OutputColumn],
+    branch_outputs: &[OutputColumn],
+) -> Option<Vec<SortItem>> {
+    items
+        .iter()
+        .map(|item| {
+            let union_column_id = typed_expr_to_column_id(&item.expr)?;
+            let output_position = union_outputs
+                .iter()
+                .position(|column| column.column_id == union_column_id)?;
+            let union_output = union_outputs.get(output_position)?;
+            let branch_output = branch_outputs.get(output_position)?;
+            if item.expr.data_type != union_output.data_type
+                || item.expr.nullable != union_output.nullable
+                || branch_output.data_type != union_output.data_type
+                || branch_output.nullable != union_output.nullable
+            {
+                return None;
+            }
+
+            let mut remapped = item.clone();
+            remapped.expr.kind = ExprKind::ColumnRef {
+                column_id: branch_output.column_id,
+                qualifier: None,
+                column: branch_output.name.clone(),
+            };
+            remapped.expr.data_type = branch_output.data_type.clone();
+            remapped.expr.nullable = branch_output.nullable;
+            Some(remapped)
+        })
+        .collect()
 }
 
 fn group_starts_with_logical_op(memo: &Memo, group_id: usize, op: &Operator) -> bool {
@@ -524,15 +592,17 @@ mod tests {
         let columns = column_ids
             .iter()
             .map(|id| output_column(*id, &format!("c{id}")))
-            .collect();
-        memo.new_group(MExpr {
+            .collect::<Vec<_>>();
+        let group = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalValues(LogicalValuesOp {
                 rows: vec![],
-                columns,
+                columns: columns.clone(),
             }),
             children: vec![],
-        })
+        });
+        memo.groups[group].logical_props = Some(LogicalProperties::new(columns, 0.0));
+        group
     }
 
     fn join_group(memo: &mut Memo, left_group: usize, right_group: usize) -> usize {
@@ -566,11 +636,20 @@ mod tests {
     }
 
     fn union_group(memo: &mut Memo, all: bool, inputs: Vec<usize>) -> usize {
+        union_group_with_outputs(memo, all, inputs, vec![output_column(1, "c1")])
+    }
+
+    fn union_group_with_outputs(
+        memo: &mut Memo,
+        all: bool,
+        inputs: Vec<usize>,
+        output_columns: Vec<crate::sql::analysis::OutputColumn>,
+    ) -> usize {
         memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalUnion(LogicalUnionOp {
                 all,
-                output_columns: vec![output_column(1, "c1")],
+                output_columns,
             }),
             children: inputs,
         })
@@ -675,6 +754,7 @@ mod tests {
         expected_child_group: usize,
         expected_limit: i64,
         expected_offset: i64,
+        expected_sort_column_id: u32,
     ) {
         let branch_expr = memo.groups[branch_group]
             .logical_exprs
@@ -690,6 +770,13 @@ mod tests {
             Operator::LogicalTopN(branch_topn) => {
                 assert_eq!(branch_topn.limit, Some(expected_limit));
                 assert_eq!(branch_topn.offset, Some(expected_offset));
+                assert_eq!(branch_topn.items.len(), 1);
+                match &branch_topn.items[0].expr.kind {
+                    ExprKind::ColumnRef { column_id, .. } => {
+                        assert_eq!(*column_id, ColumnId(expected_sort_column_id));
+                    }
+                    other => panic!("expected branch TopN ColumnRef sort item, got {other:?}"),
+                }
             }
             other => panic!("expected branch LogicalTopN, got {other:?}"),
         }
@@ -1170,8 +1257,8 @@ mod tests {
             2,
             "pushed UNION should keep both branches"
         );
-        assert_single_branch_topn(&memo, pushed_union_expr.children[0], left_group, 10, 0);
-        assert_single_branch_topn(&memo, pushed_union_expr.children[1], right_group, 10, 0);
+        assert_single_branch_topn(&memo, pushed_union_expr.children[0], left_group, 10, 0, 1);
+        assert_single_branch_topn(&memo, pushed_union_expr.children[1], right_group, 10, 0, 1);
 
         let group_count_after_first = memo.groups.len();
         let second = rule.apply(&topn, &mut memo);
@@ -1215,8 +1302,53 @@ mod tests {
             .logical_exprs
             .first()
             .expect("pushed union group should contain a logical expression");
-        assert_single_branch_topn(&memo, pushed_union_expr.children[0], left_group, 5, 0);
-        assert_single_branch_topn(&memo, pushed_union_expr.children[1], right_group, 5, 0);
+        assert_single_branch_topn(&memo, pushed_union_expr.children[0], left_group, 5, 0, 1);
+        assert_single_branch_topn(&memo, pushed_union_expr.children[1], right_group, 5, 0, 1);
+    }
+
+    #[test]
+    fn setop_pushdown_remaps_union_output_sort_key_to_branch_outputs() {
+        let mut memo = Memo::new();
+        let left_group = values_group(&mut memo, &[1]);
+        let right_group = values_group(&mut memo, &[2]);
+        memo.groups[left_group].logical_props = Some(LogicalProperties::new(
+            vec![output_column(1, "left_c")],
+            10.0,
+        ));
+        memo.groups[right_group].logical_props = Some(LogicalProperties::new(
+            vec![output_column(2, "right_c")],
+            10.0,
+        ));
+        let union_group = union_group_with_outputs(
+            &mut memo,
+            true,
+            vec![left_group, right_group],
+            vec![output_column(10, "union_c")],
+        );
+        let topn = topn_with_item(
+            &memo,
+            sort_item(10),
+            10,
+            0,
+            TopNPhase::Final,
+            false,
+            union_group,
+        );
+
+        let out = rule_by_name("PushTopNThroughSetOp").apply(&topn, &mut memo);
+
+        assert_eq!(
+            out.len(),
+            1,
+            "UNION ALL should remap parent output sort key into branch output keys"
+        );
+        let pushed_union_group = out[0].children[0];
+        let pushed_union_expr = memo.groups[pushed_union_group]
+            .logical_exprs
+            .first()
+            .expect("pushed union group should contain a logical expression");
+        assert_single_branch_topn(&memo, pushed_union_expr.children[0], left_group, 10, 0, 1);
+        assert_single_branch_topn(&memo, pushed_union_expr.children[1], right_group, 10, 0, 2);
     }
 
     #[test]
