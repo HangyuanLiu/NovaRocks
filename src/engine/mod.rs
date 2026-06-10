@@ -51,6 +51,7 @@ pub(crate) mod mutation_flow;
 pub(crate) mod mv;
 pub(crate) mod mv_flow;
 pub(crate) mod mv_maintenance;
+pub(crate) mod mv_rewrite_prep;
 pub(crate) mod mv_scheduler;
 pub(crate) mod name_resolve;
 pub(crate) mod parquet;
@@ -903,6 +904,7 @@ impl StandaloneSession {
                     &catalog_snapshot,
                     current_database,
                     level,
+                    Some(&self.inner),
                 )?;
                 Ok(StatementResult::Query(result))
             }
@@ -944,6 +946,7 @@ impl StandaloneSession {
                     current_database,
                     self.inner.exchange_port,
                     None,
+                    Some(&self.inner),
                 )?;
                 Ok(StatementResult::Query(result))
             }
@@ -1029,6 +1032,7 @@ impl StandaloneSession {
                     current_database,
                     self.inner.exchange_port,
                     query_opts.clone(),
+                    Some(&self.inner),
                 )?;
                 Ok(StatementResult::Query(result))
             }
@@ -2759,6 +2763,7 @@ fn explain_analyze_query(
     current_database: &str,
     exchange_port: u16,
     query_opts: Option<crate::internal_service::TQueryOptions>,
+    mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
     use crate::sql::explain::{ExplainLevel, explain_physical_plan};
 
@@ -2771,10 +2776,23 @@ fn explain_analyze_query(
     let (resolved, cte_registry, mut factory) =
         crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
-    let table_stats = build_table_stats_from_plan(&logical);
+    let mut table_stats = build_table_stats_from_plan(&logical);
+    // MV query rewrite candidate prep (EXPLAIN ANALYZE has no MV refresh
+    // context, so the gate is only `mv_rewrite_state.is_some()`).
+    let mv_candidates = match mv_rewrite_state {
+        Some(state) => crate::engine::mv_rewrite_prep::prepare_mv_rewrite_candidates(
+            state,
+            analyzer_catalog,
+            current_database,
+            &logical,
+            &mut factory,
+            &mut table_stats,
+        ),
+        None => Vec::new(),
+    };
     // dictionary_provider intentionally None; installed via TLS by execute_in_context.
     let physical =
-        crate::sql::optimizer::optimize(logical, &table_stats, factory, None, Vec::new())?;
+        crate::sql::optimizer::optimize(logical, &table_stats, factory, None, mv_candidates)?;
     let planning_ms = t_plan.elapsed().as_millis() as u64;
 
     let t_exec = Instant::now();
@@ -2786,6 +2804,7 @@ fn explain_analyze_query(
         current_database,
         exchange_port,
         query_opts,
+        mv_rewrite_state,
     )?;
     let rows: u64 = executed.chunks.iter().map(|c| c.len() as u64).sum();
     let execution_ms = t_exec.elapsed().as_millis() as u64;
@@ -2806,16 +2825,30 @@ fn explain_query(
     _codegen_catalog: &InMemoryCatalog,
     current_database: &str,
     level: crate::sql::explain::ExplainLevel,
+    mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
     use crate::sql::explain::{ExplainLevel, explain_physical_plan};
 
     let (resolved, cte_registry, mut factory) =
         crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
-    let table_stats = build_table_stats_from_plan(&logical);
+    let mut table_stats = build_table_stats_from_plan(&logical);
+    // MV query rewrite candidate prep (plain EXPLAIN has no MV refresh
+    // context, so the gate is only `mv_rewrite_state.is_some()`).
+    let mv_candidates = match mv_rewrite_state {
+        Some(state) => crate::engine::mv_rewrite_prep::prepare_mv_rewrite_candidates(
+            state,
+            analyzer_catalog,
+            current_database,
+            &logical,
+            &mut factory,
+            &mut table_stats,
+        ),
+        None => Vec::new(),
+    };
     // dictionary_provider intentionally None; installed via TLS by execute_in_context.
     let physical =
-        crate::sql::optimizer::optimize(logical, &table_stats, factory, None, Vec::new())?;
+        crate::sql::optimizer::optimize(logical, &table_stats, factory, None, mv_candidates)?;
 
     let mut lines = Vec::new();
     if matches!(level, ExplainLevel::Costs) {
@@ -2847,6 +2880,7 @@ pub(crate) fn execute_query(
         current_database,
         exchange_port,
         query_opts,
+        None,
     )
 }
 
@@ -2883,6 +2917,7 @@ pub(crate) fn execute_query_with_catalog_mgr(
         current_database,
         state.exchange_port,
         query_opts,
+        Some(state),
     )
 }
 
@@ -2952,6 +2987,7 @@ pub(crate) fn execute_query_with_catalog_provider(
     current_database: &str,
     exchange_port: u16,
     query_opts: Option<crate::internal_service::TQueryOptions>,
+    mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
     execute_query_with_options_and_imv_validator_with_catalog_provider(
         query,
@@ -2965,6 +3001,7 @@ pub(crate) fn execute_query_with_catalog_provider(
         None,
         None,
         None,
+        mv_rewrite_state,
     )
 }
 
@@ -3005,6 +3042,7 @@ pub(crate) fn execute_query_with_options(
         iceberg_catalogs,
         mv_refresh_ctx,
         None,
+        None,
     )
 }
 
@@ -3020,6 +3058,7 @@ pub(crate) fn execute_query_with_options_and_imv_validator(
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
     imv_rewrite_validator: Option<&ImvRewriteValidator<'_>>,
+    mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
     execute_query_with_options_and_imv_validator_with_catalog_provider(
         query,
@@ -3033,6 +3072,7 @@ pub(crate) fn execute_query_with_options_and_imv_validator(
         iceberg_catalogs,
         mv_refresh_ctx,
         imv_rewrite_validator,
+        mv_rewrite_state,
     )
 }
 
@@ -3049,6 +3089,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
     imv_rewrite_validator: Option<&ImvRewriteValidator<'_>>,
+    mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
     let (resolved, cte_registry, mut factory) =
         crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
@@ -3075,10 +3116,27 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
     } else if imv_rewrite_validator.is_some() {
         return Err("IMV rewrite validator requires MV refresh context".to_string());
     }
-    let table_stats = build_table_stats_from_plan(&logical);
+    let mut table_stats = build_table_stats_from_plan(&logical);
+    // MV query rewrite: discover fresh Iceberg MV candidates and inject their
+    // target-table stats. Gated on a standalone-rewrite path (`Some(state)`)
+    // and disabled during MV refresh (`mv_refresh_ctx.is_some()`) so refresh
+    // queries never rewrite onto the MV they are computing.
+    let mv_candidates = match mv_rewrite_state {
+        Some(state) if mv_refresh_ctx.is_none() => {
+            crate::engine::mv_rewrite_prep::prepare_mv_rewrite_candidates(
+                state,
+                analyzer_catalog,
+                current_database,
+                &logical,
+                &mut factory,
+                &mut table_stats,
+            )
+        }
+        _ => Vec::new(),
+    };
     // dictionary_provider intentionally None; installed via TLS by execute_in_context.
     let mut physical =
-        crate::sql::optimizer::optimize(logical, &table_stats, factory, None, Vec::new())?;
+        crate::sql::optimizer::optimize(logical, &table_stats, factory, None, mv_candidates)?;
     // Unit-test states may not start the standalone exchange server. IVM-A1
     // internal queries also pass runtime-local handles (`terminal_sink` or
     // `iceberg_catalogs`) that coordinated fragments cannot currently clone
@@ -5357,6 +5415,7 @@ enable_path_style_access = true
             None,
             Some(&mv_ctx),
             Some(&validator),
+            None,
         )
         .expect_err("validator errors must abort refresh query execution");
 
