@@ -341,15 +341,28 @@ fn push_topn_through_setop(expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
     let Operator::LogicalTopN(topn) = &expr.op else {
         return vec![];
     };
-    if TopNWindow::from_limit_offset(topn.limit, topn.offset).is_none() {
+    if !matches!(topn.phase, TopNPhase::Final) || topn.is_split {
         return vec![];
     }
+    let Some(window) = TopNWindow::from_limit_offset(topn.limit, topn.offset) else {
+        return vec![];
+    };
+    let Some(branch_limit) = window.end_exclusive() else {
+        return vec![];
+    };
     if expr.children.len() != 1 {
         return vec![];
     }
     let Some(union_group) = memo.groups.get(expr.children[0]).cloned() else {
         return vec![];
     };
+    let branch_topn_op = Operator::LogicalTopN(LogicalTopNOp {
+        items: topn.items.clone(),
+        limit: Some(branch_limit),
+        offset: Some(0),
+        phase: topn.phase,
+        is_split: topn.is_split,
+    });
 
     let mut results = Vec::new();
     for union_expr in union_group.logical_exprs.iter() {
@@ -359,10 +372,17 @@ fn push_topn_through_setop(expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
         if !union.all || union_expr.children.is_empty() {
             continue;
         }
+        if union_expr
+            .children
+            .iter()
+            .all(|group| group_starts_with_logical_op(memo, *group, &branch_topn_op))
+        {
+            continue;
+        }
 
         let mut pushed_branch_groups = Vec::with_capacity(union_expr.children.len());
         for branch_group in &union_expr.children {
-            let pushed_op = Operator::LogicalTopN(topn.clone());
+            let pushed_op = branch_topn_op.clone();
             let pushed_children = vec![*branch_group];
             let pushed_group = find_existing_logical_group(memo, &pushed_op, &pushed_children)
                 .unwrap_or_else(|| {
@@ -393,6 +413,14 @@ fn push_topn_through_setop(expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
         });
     }
     results
+}
+
+fn group_starts_with_logical_op(memo: &Memo, group_id: usize, op: &Operator) -> bool {
+    let op_debug = format!("{op:?}");
+    memo.groups
+        .get(group_id)
+        .and_then(|group| group.logical_exprs.first())
+        .is_some_and(|expr| expr.children.len() == 1 && format!("{:?}", expr.op) == op_debug)
 }
 
 fn find_existing_logical_group(memo: &Memo, op: &Operator, children: &[usize]) -> Option<usize> {
@@ -639,6 +667,32 @@ mod tests {
                 children: new_expr.children,
             },
         );
+    }
+
+    fn assert_single_branch_topn(
+        memo: &Memo,
+        branch_group: usize,
+        expected_child_group: usize,
+        expected_limit: i64,
+        expected_offset: i64,
+    ) {
+        let branch_expr = memo.groups[branch_group]
+            .logical_exprs
+            .iter()
+            .find(|expr| matches!(expr.op, Operator::LogicalTopN(_)))
+            .expect("branch group should contain pushed LogicalTopN");
+        assert_eq!(
+            branch_expr.children,
+            vec![expected_child_group],
+            "branch TopN should point at the original UNION branch"
+        );
+        match &branch_expr.op {
+            Operator::LogicalTopN(branch_topn) => {
+                assert_eq!(branch_topn.limit, Some(expected_limit));
+                assert_eq!(branch_topn.offset, Some(expected_offset));
+            }
+            other => panic!("expected branch LogicalTopN, got {other:?}"),
+        }
     }
 
     fn analytic_sort_with_items(memo: &Memo, items: Vec<SortItem>, child_group: usize) -> MExpr {
@@ -1116,15 +1170,8 @@ mod tests {
             2,
             "pushed UNION should keep both branches"
         );
-        for branch_group in &pushed_union_expr.children {
-            assert!(
-                memo.groups[*branch_group]
-                    .logical_exprs
-                    .iter()
-                    .any(|expr| matches!(expr.op, Operator::LogicalTopN(_))),
-                "each UNION ALL branch should receive a pushed TopN"
-            );
-        }
+        assert_single_branch_topn(&memo, pushed_union_expr.children[0], left_group, 10, 0);
+        assert_single_branch_topn(&memo, pushed_union_expr.children[1], right_group, 10, 0);
 
         let group_count_after_first = memo.groups.len();
         let second = rule.apply(&topn, &mut memo);
@@ -1142,6 +1189,114 @@ mod tests {
             memo.groups.len(),
             group_count_after_first,
             "repeated apply must not create duplicate branch TopN or UNION groups"
+        );
+    }
+
+    #[test]
+    fn setop_pushdown_uses_branch_window_for_offset() {
+        let mut memo = Memo::new();
+        let left_group = values_group(&mut memo, &[1]);
+        let right_group = values_group(&mut memo, &[1]);
+        let union_group = union_group(&mut memo, true, vec![left_group, right_group]);
+        let topn = topn(&memo, 2, 3, TopNPhase::Final, false, union_group);
+
+        let out = rule_by_name("PushTopNThroughSetOp").apply(&topn, &mut memo);
+
+        assert_eq!(out.len(), 1, "UNION ALL should allow offset-safe pruning");
+        match &out[0].op {
+            Operator::LogicalTopN(final_topn) => {
+                assert_eq!(final_topn.limit, Some(2));
+                assert_eq!(final_topn.offset, Some(3));
+            }
+            other => panic!("expected final LogicalTopN, got {other:?}"),
+        }
+        let pushed_union_group = out[0].children[0];
+        let pushed_union_expr = memo.groups[pushed_union_group]
+            .logical_exprs
+            .first()
+            .expect("pushed union group should contain a logical expression");
+        assert_single_branch_topn(&memo, pushed_union_expr.children[0], left_group, 5, 0);
+        assert_single_branch_topn(&memo, pushed_union_expr.children[1], right_group, 5, 0);
+    }
+
+    #[test]
+    fn setop_pushdown_is_idempotent_after_candidate_is_added_to_group() {
+        let mut memo = Memo::new();
+        let left_group = values_group(&mut memo, &[1]);
+        let right_group = values_group(&mut memo, &[1]);
+        let union_group = union_group(&mut memo, true, vec![left_group, right_group]);
+        let topn_group = memo.new_group(topn(&memo, 10, 0, TopNPhase::Final, false, union_group));
+        let topn_expr = memo.groups[topn_group].logical_exprs[0].clone();
+        let rule = rule_by_name("PushTopNThroughSetOp");
+
+        let mut first = rule.apply(&topn_expr, &mut memo);
+        assert_eq!(first.len(), 1, "first apply should produce branch pruning");
+        add_new_expr_to_group(&mut memo, topn_group, first.pop().unwrap());
+        let pushed_expr = memo.groups[topn_group]
+            .logical_exprs
+            .last()
+            .expect("candidate should be added back to the original group")
+            .clone();
+        let group_count_after_add = memo.groups.len();
+
+        let second = rule.apply(&pushed_expr, &mut memo);
+
+        assert!(
+            second.is_empty(),
+            "already-pushed UNION ALL branch pruning must not chain"
+        );
+        assert_eq!(
+            memo.groups.len(),
+            group_count_after_add,
+            "idempotent apply must not create additional memo groups"
+        );
+    }
+
+    #[test]
+    fn setop_pushdown_fails_closed_for_partial_topn() {
+        let mut memo = Memo::new();
+        let left_group = values_group(&mut memo, &[1]);
+        let right_group = values_group(&mut memo, &[1]);
+        let union_group = union_group(&mut memo, true, vec![left_group, right_group]);
+        let topn = topn(&memo, 10, 0, TopNPhase::Partial, false, union_group);
+
+        let out = rule_by_name("PushTopNThroughSetOp").apply(&topn, &mut memo);
+
+        assert!(
+            out.is_empty(),
+            "set-op TopN pruning only supports unsplit final TopN"
+        );
+    }
+
+    #[test]
+    fn setop_pushdown_fails_closed_for_split_topn() {
+        let mut memo = Memo::new();
+        let left_group = values_group(&mut memo, &[1]);
+        let right_group = values_group(&mut memo, &[1]);
+        let union_group = union_group(&mut memo, true, vec![left_group, right_group]);
+        let topn = topn(&memo, 10, 0, TopNPhase::Final, true, union_group);
+
+        let out = rule_by_name("PushTopNThroughSetOp").apply(&topn, &mut memo);
+
+        assert!(
+            out.is_empty(),
+            "set-op TopN pruning only supports unsplit final TopN"
+        );
+    }
+
+    #[test]
+    fn setop_pushdown_fails_closed_when_branch_window_overflows() {
+        let mut memo = Memo::new();
+        let left_group = values_group(&mut memo, &[1]);
+        let right_group = values_group(&mut memo, &[1]);
+        let union_group = union_group(&mut memo, true, vec![left_group, right_group]);
+        let topn = topn(&memo, 1, i64::MAX, TopNPhase::Final, false, union_group);
+
+        let out = rule_by_name("PushTopNThroughSetOp").apply(&topn, &mut memo);
+
+        assert!(
+            out.is_empty(),
+            "branch pruning must fail closed when offset + limit overflows"
         );
     }
 }
