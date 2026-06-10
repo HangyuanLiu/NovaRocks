@@ -328,14 +328,10 @@ impl ExecutionCoordinator {
                     (output_sink, unpartitioned_partition(), None)
                 };
 
-                let write_report_addr = if data_sink_requires_write_report(&output_sink) {
-                    if novarocks_report_addr.is_none() {
-                        novarocks_report_addr = Some(local_coordinator_report_addr()?);
-                    }
-                    novarocks_report_addr.clone()
-                } else {
-                    None
-                };
+                if novarocks_report_addr.is_none() {
+                    novarocks_report_addr = Some(local_coordinator_report_addr()?);
+                }
+                let report_addr = novarocks_report_addr.clone();
 
                 let thrift_fragment = planner::TPlanFragment::new(
                     Some(fr.plan.clone()),
@@ -372,7 +368,7 @@ impl ExecutionCoordinator {
                     query_options.clone(),
                     pipeline_dop,
                     Some(placement.instance_index as i32),
-                    write_report_addr,
+                    report_addr,
                 );
 
                 if is_write_sink(&params) {
@@ -421,6 +417,7 @@ impl ExecutionCoordinator {
             submissions,
             plan.root_backend_idx,
             plan.root_finst_id.clone(),
+            &query_id,
             timeout_ms,
             write_coordinator.as_ref(),
         )?;
@@ -719,6 +716,16 @@ pub(crate) struct SubmitAndFetchResult {
     pub(crate) write_abort: Option<WriteAbortInput>,
 }
 
+struct QueryStateRegistrationGuard {
+    query_id: crate::runtime::query_context::QueryId,
+}
+
+impl Drop for QueryStateRegistrationGuard {
+    fn drop(&mut self) {
+        crate::runtime::query_state::in_flight_table().forget(self.query_id);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Submit-and-fetch orchestration (testable helper)
 // ---------------------------------------------------------------------------
@@ -734,10 +741,17 @@ pub(crate) fn submit_and_fetch_loop(
     submissions: Vec<(usize, crate::internal_service::TExecPlanFragmentParams)>,
     root_backend_idx: usize,
     root_finst_id: types::TUniqueId,
+    query_id: &types::TUniqueId,
     timeout_ms: i64,
     write_coordinator: Option<&Arc<Mutex<WriteCoordinator>>>,
 ) -> Result<SubmitAndFetchResult, String> {
     const REMOTE_FETCH_POLL_INTERVAL_MS: i64 = 300;
+    let _query_state_guard = QueryStateRegistrationGuard {
+        query_id: crate::runtime::query_context::QueryId {
+            hi: query_id.hi,
+            lo: query_id.lo,
+        },
+    };
 
     for (backend_idx, p) in submissions {
         let finst_id = p
@@ -749,7 +763,18 @@ pub(crate) fn submit_and_fetch_loop(
             tracker.cancel_all(dispatcher.as_ref());
             return Err(e);
         }
-        tracker.record_submitted(backend_idx, finst_id);
+        tracker.record_submitted(backend_idx, finst_id.clone());
+        crate::runtime::query_state::in_flight_table().register(
+            crate::runtime::query_context::QueryId {
+                hi: query_id.hi,
+                lo: query_id.lo,
+            },
+            crate::common::types::UniqueId {
+                hi: finst_id.hi,
+                lo: finst_id.lo,
+            },
+            backend_idx,
+        );
     }
 
     let mut chunks = Vec::new();
@@ -1356,6 +1381,10 @@ mod tests {
         types::TUniqueId::new(hi, lo)
     }
 
+    fn runtime_query_id(hi: i64, lo: i64) -> crate::runtime::query_context::QueryId {
+        crate::runtime::query_context::QueryId { hi, lo }
+    }
+
     fn writer_key(
         query_hi: i64,
         query_lo: i64,
@@ -1677,6 +1706,7 @@ mod tests {
             params,
             0,
             root_finst_id,
+            &types::TUniqueId::new(740, 741),
             1_000,
             Some(&write),
         );
@@ -1742,6 +1772,7 @@ mod tests {
             params,
             0,
             root_finst_id,
+            &query_id,
             1_000,
             Some(&write),
         )
@@ -1822,6 +1853,7 @@ mod tests {
             params,
             0,
             root_finst_id,
+            &types::TUniqueId::new(780, 781),
             1_000,
             Some(&write),
         )
@@ -1882,6 +1914,7 @@ mod tests {
             params,
             0,
             root_finst_id,
+            &types::TUniqueId::new(750, 751),
             25,
             Some(&write),
         )
@@ -1938,6 +1971,8 @@ mod tests {
     fn execute_submits_all_fragments_and_fetches_to_eof() {
         let inner = ControllableDispatcher::succeeds_always_eof();
         let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
+        let query_id = types::TUniqueId::new(1, 99);
+        let runtime_query_id = runtime_query_id(query_id.hi, query_id.lo);
         let root_finst_id = types::TUniqueId::new(1, 1);
         let params = single_backend(vec![
             make_params_with_finst(1, 10),
@@ -1950,6 +1985,7 @@ mod tests {
             params,
             0,
             root_finst_id,
+            &query_id,
             100,
             None,
         );
@@ -1972,6 +2008,11 @@ mod tests {
             2,
             "both fragments must be submitted"
         );
+        assert_eq!(
+            crate::runtime::query_state::in_flight_table().state(runtime_query_id),
+            None,
+            "submit_and_fetch_loop must forget query_state entries on success"
+        );
     }
 
     /// I2: When the second submit fails, the coordinator cancels the first
@@ -1992,6 +2033,7 @@ mod tests {
             params,
             0,
             root_finst_id,
+            &types::TUniqueId::new(2, 99),
             100,
             None,
         );
@@ -2012,6 +2054,11 @@ mod tests {
         );
         assert_eq!(cancelled[0].hi, 2);
         assert_eq!(cancelled[0].lo, 10);
+        assert_eq!(
+            crate::runtime::query_state::in_flight_table().state(runtime_query_id(2, 99)),
+            None,
+            "submit_and_fetch_loop must forget query_state entries on submit failure"
+        );
     }
 
     /// I3: When fetch returns FetchOutcome::Err, all submitted fragment
@@ -2032,6 +2079,7 @@ mod tests {
             params,
             0,
             root_finst_id,
+            &types::TUniqueId::new(3, 99),
             100,
             None,
         );
@@ -2071,6 +2119,7 @@ mod tests {
             params,
             0,
             root_finst_id,
+            &types::TUniqueId::new(4, 99),
             10,
             None,
         );
@@ -2109,6 +2158,7 @@ mod tests {
             params,
             0,
             root_finst_id,
+            &types::TUniqueId::new(6, 99),
             300_000,
             None,
         );
@@ -2146,6 +2196,7 @@ mod tests {
                     params,
                     0,
                     root_finst_id,
+                    &types::TUniqueId::new(5, 99),
                     100,
                     None,
                 )

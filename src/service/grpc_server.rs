@@ -1256,6 +1256,49 @@ mod pr3_tests {
         )
     }
 
+    fn write_report_params(
+        query: types::TUniqueId,
+        finst: types::TUniqueId,
+    ) -> frontend_service::TReportExecStatusParams {
+        frontend_service::TReportExecStatusParams::new(
+            frontend_service::FrontendServiceVersion::V1,
+            Some(query),
+            Some(0),
+            Some(finst),
+            Some(status::TStatus::new(status_code::TStatusCode::OK, None)),
+            Some(true),
+            None,
+            Option::<Vec<String>>::None,
+            Option::<Vec<String>>::None,
+            None,
+            None,
+            Option::<Vec<String>>::None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(vec![types::TSinkCommitInfo {
+                iceberg_data_file: Some(types::TIcebergDataFile {
+                    path: Some("s3://w/grpc-query-gone.parquet".to_string()),
+                    record_count: Some(1),
+                    file_size_in_bytes: Some(1),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            None,
+            None,
+            None,
+        )
+    }
+
     #[tokio::test]
     async fn submit_fragment_thrift_decode_error_returns_business_error() {
         let svc = GrpcService::default();
@@ -1385,7 +1428,7 @@ mod pr3_tests {
         let _guard = crate::runtime::write_coordinator::write_registry_test_guard();
         let query = types::TUniqueId::new(801, 901);
         let finst = types::TUniqueId::new(802, 902);
-        let bytes = thrift_binary_serialize(&ok_report_params(query, finst))
+        let bytes = thrift_binary_serialize(&write_report_params(query, finst))
             .expect("serialize report params");
         let svc = GrpcService::default();
         let req = Request::new(ReportExecStatusRequest {
