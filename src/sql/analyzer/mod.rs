@@ -58,9 +58,32 @@ pub(crate) fn analyze(
     ),
     String,
 > {
-    let factory = std::rc::Rc::new(std::cell::RefCell::new(
+    analyze_with_factory(
+        query,
+        catalog,
+        current_database,
         crate::sql::column_id::ColumnRefFactory::new(),
-    ));
+    )
+}
+
+/// Like [`analyze`], but threads an existing [`ColumnRefFactory`] so that
+/// ColumnIds allocated by this analysis never collide with ids the caller
+/// already minted (used by MV rewrite candidate preparation, which analyzes
+/// the MV defining SQL inside an already-planned user query).
+pub(crate) fn analyze_with_factory(
+    query: &sqlast::Query,
+    catalog: &dyn CatalogProvider,
+    current_database: &str,
+    factory: crate::sql::column_id::ColumnRefFactory,
+) -> Result<
+    (
+        ResolvedQuery,
+        crate::sql::analysis::cte::CTERegistry,
+        crate::sql::column_id::ColumnRefFactory,
+    ),
+    String,
+> {
+    let factory = std::rc::Rc::new(std::cell::RefCell::new(factory));
     let ctx = AnalyzerContext {
         catalog,
         current_database,
@@ -6743,6 +6766,35 @@ mod tests {
             args.iter()
                 .all(|arg| matches!(arg.kind, ExprKind::ColumnRef { .. })),
             "FULL OUTER USING merged expression should coalesce the two side ColumnRefs"
+        );
+    }
+
+    #[test]
+    fn analyze_with_factory_threads_column_ids() {
+        // Pre-seed the factory with 3 ids so threaded analysis must start at 4.
+        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+        for i in 0..3_u32 {
+            factory.create(
+                None,
+                format!("seed{i}"),
+                arrow::datatypes::DataType::Int64,
+                false,
+            );
+        }
+        assert_eq!(factory.peek_next_id(), 4);
+
+        let stmt = crate::sql::parser::parse_sql_raw("SELECT 1 + 1 AS x").expect("parse");
+        let query = match stmt {
+            sqlparser::ast::Statement::Query(q) => q,
+            _ => panic!("not a query"),
+        };
+        let (_resolved, _ctes, out_factory) =
+            analyze_with_factory(&query, &TestCatalog, "db", factory).expect("analyze");
+        // The analysis must have allocated its ids on top of the seeded ones.
+        assert!(out_factory.peek_next_id() > 4);
+        assert_eq!(
+            out_factory.get(crate::sql::column_id::ColumnId(1)).name,
+            "seed0"
         );
     }
 }
