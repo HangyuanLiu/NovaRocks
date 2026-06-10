@@ -280,8 +280,8 @@ pub(crate) fn bind_spec_to_aggregate_layout(
 /// Mechanically evaluate bound partition fields over delta chunks: apply each
 /// field's Iceberg transform to its source column, then build one
 /// `MvPartitionKey` per row, deduplicated into a sorted set. This is the
-/// transformation + partitioning phase extracted verbatim from the original
-/// `derive_from_aggregate_delta`.
+/// transformation + partitioning phase of the contract-driven derivation
+/// pipeline (resolve -> bind -> evaluate).
 pub(crate) fn evaluate_partition_spec(
     target_spec_id: i32,
     bound_fields: &[BoundPartitionField],
@@ -833,7 +833,7 @@ mod tests {
     // --- Moved from aggregate_delta.rs: arrow_array_row_to_partition_value tests ---
 
     use arrow::array::{
-        BooleanArray, Date32Array, Float32Array, Float64Array, Int32Array, Int64Array,
+        BooleanArray, Date32Array, Float32Array, Float64Array, Int32Array, Int64Array, StringArray,
         TimestampMicrosecondArray,
     };
 
@@ -1016,6 +1016,330 @@ mod tests {
             .expect("resolve")
             .expect("partitioned");
         let err = bind_spec_to_aggregate_layout(&spec, &layout).unwrap_err();
+        assert!(matches!(
+            err,
+            AffectedPartitionError::OutputLineageNotPureColumn { ref field } if field == "region"
+        ));
+    }
+
+    // --- End-to-end derivation behavior-lock tests -------------------------
+    //
+    // Ported from the removed pre-cutover aggregate-delta derivation tests.
+    // `derive_for_test` composes the three public stages
+    // (resolve -> bind -> evaluate) exactly as the old single-shot deriver
+    // did, so these lock the same observable behavior over the retained
+    // derivation library. `None` mirrors the old `Unpartitioned` result;
+    // `Some(partitions)` mirrors the old `Known { partitions }` result.
+    fn derive_for_test(
+        contract: &MvSchemaContract,
+        layout: &AggregateMvLayout,
+        chunks: &[Chunk],
+    ) -> Result<Option<BTreeSet<MvPartitionKey>>, AffectedPartitionError> {
+        let Some(spec) = resolve_partition_derivation_spec(contract)? else {
+            return Ok(None);
+        };
+        let bound = bind_spec_to_aggregate_layout(&spec, layout)?;
+        let partitions = evaluate_partition_spec(spec.target_spec_id, &bound, chunks)?;
+        Ok(Some(partitions))
+    }
+
+    #[test]
+    fn derive_identity_returns_known_partition_per_unique_value() {
+        let layout = count_layout_with_group_key("region", DataType::Utf8, SqlType::String);
+        let contract =
+            count_contract_with_partition("region", MvPartitionTransformContract::Identity, 11);
+        let chunk = batch_with_group_key(
+            "region",
+            DataType::Utf8,
+            StdArcFixture::new(StringArray::from(vec![Some("a"), Some("b"), Some("a")]))
+                as arrow::array::ArrayRef,
+        );
+
+        let partitions = derive_for_test(&contract, &layout, &[chunk])
+            .expect("derive")
+            .expect("partitioned");
+        let names: Vec<_> = partitions
+            .iter()
+            .map(|key| match &key.fields[0].value {
+                MvPartitionValue::String(s) => s.clone(),
+                MvPartitionValue::Null => "<NULL>".to_string(),
+            })
+            .collect();
+        assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+        for key in &partitions {
+            assert_eq!(key.spec_id, 7);
+            assert_eq!(key.fields[0].field_name, "region");
+        }
+    }
+
+    #[test]
+    fn derive_day_transform_normalizes_dates_to_day_buckets() {
+        let layout = count_layout_with_group_key("ts", DataType::Date32, SqlType::Date);
+        let contract = count_contract_with_partition("ts", MvPartitionTransformContract::Day, 11);
+        // Two distinct days: 19500 and 19501.
+        let chunk = batch_with_group_key(
+            "ts",
+            DataType::Date32,
+            StdArcFixture::new(Date32Array::from(vec![
+                Some(19500),
+                Some(19501),
+                Some(19500),
+            ])) as arrow::array::ArrayRef,
+        );
+
+        let partitions = derive_for_test(&contract, &layout, &[chunk])
+            .expect("derive")
+            .expect("partitioned");
+        let values: Vec<_> = partitions
+            .iter()
+            .map(|key| match &key.fields[0].value {
+                MvPartitionValue::String(s) => s.clone(),
+                MvPartitionValue::Null => "<NULL>".to_string(),
+            })
+            .collect();
+        // Day transform on a Date32 input should yield the integer day-since-epoch
+        // for each distinct row. After dedup and sort: "19500", "19501".
+        assert_eq!(values, vec!["19500".to_string(), "19501".to_string()]);
+    }
+
+    #[test]
+    fn derive_bucket_transform_uses_iceberg_hash() {
+        let layout = count_layout_with_group_key("region", DataType::Utf8, SqlType::String);
+        let contract = count_contract_with_partition(
+            "region",
+            MvPartitionTransformContract::Bucket { num_buckets: 8 },
+            11,
+        );
+        // Build the chunk and run derivation.
+        let chunk = batch_with_group_key(
+            "region",
+            DataType::Utf8,
+            StdArcFixture::new(StringArray::from(vec![Some("east"), Some("west")]))
+                as arrow::array::ArrayRef,
+        );
+
+        // Independently compute the expected bucket values via iceberg-rust
+        // and assert the derivation produced exactly those.
+        let arr: arrow::array::ArrayRef =
+            StdArcFixture::new(StringArray::from(vec![Some("east"), Some("west")]));
+        let xform =
+            iceberg::transform::create_transform_function(&iceberg::spec::Transform::Bucket(8))
+                .expect("transform");
+        let out = xform.transform(arr).expect("apply");
+        let expected: Vec<String> = (0..out.len())
+            .map(|i| {
+                let arr = out.as_any().downcast_ref::<Int32Array>().expect("int32");
+                arr.value(i).to_string()
+            })
+            .collect();
+
+        let partitions = derive_for_test(&contract, &layout, &[chunk])
+            .expect("derive")
+            .expect("partitioned");
+        let got: std::collections::BTreeSet<String> = partitions
+            .iter()
+            .map(|key| match &key.fields[0].value {
+                MvPartitionValue::String(s) => s.clone(),
+                MvPartitionValue::Null => "<NULL>".to_string(),
+            })
+            .collect();
+        let want: std::collections::BTreeSet<String> = expected.into_iter().collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn derive_unpartitioned_contract_returns_unpartitioned() {
+        let layout = count_layout_with_group_key("region", DataType::Utf8, SqlType::String);
+        let mut contract =
+            count_contract_with_partition("region", MvPartitionTransformContract::Identity, 11);
+        contract.target.partition = None;
+        let chunk = batch_with_group_key(
+            "region",
+            DataType::Utf8,
+            StdArcFixture::new(StringArray::from(vec![Some("a")])) as arrow::array::ArrayRef,
+        );
+
+        // `None` is the ported equivalent of the old `Unpartitioned` result.
+        assert!(
+            derive_for_test(&contract, &layout, &[chunk])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn derive_void_transform_returns_unsupported_error() {
+        let layout = count_layout_with_group_key("region", DataType::Utf8, SqlType::String);
+        let contract =
+            count_contract_with_partition("region", MvPartitionTransformContract::Void, 11);
+        let chunk = batch_with_group_key(
+            "region",
+            DataType::Utf8,
+            StdArcFixture::new(StringArray::from(vec![Some("a")])) as arrow::array::ArrayRef,
+        );
+
+        let err = derive_for_test(&contract, &layout, &[chunk]).unwrap_err();
+        assert!(matches!(
+            err,
+            AffectedPartitionError::TransformUnsupported { ref field, ref transform }
+                if field == "region" && transform == "void"
+        ));
+    }
+
+    #[test]
+    fn derive_missing_target_field_returns_group_key_missing() {
+        let layout = count_layout_with_group_key("region", DataType::Utf8, SqlType::String);
+        let mut contract =
+            count_contract_with_partition("region", MvPartitionTransformContract::Identity, 11);
+        contract.target.partition.as_mut().unwrap().fields[0].source_target_field_id = 999;
+        let chunk = batch_with_group_key(
+            "region",
+            DataType::Utf8,
+            StdArcFixture::new(StringArray::from(vec![Some("a")])) as arrow::array::ArrayRef,
+        );
+
+        let err = derive_for_test(&contract, &layout, &[chunk]).unwrap_err();
+        assert!(matches!(
+            err,
+            AffectedPartitionError::GroupKeyColumnMissing { ref field, .. } if field == "region"
+        ));
+    }
+
+    #[test]
+    fn derive_non_pure_output_lineage_returns_error() {
+        let layout = count_layout_with_group_key("region", DataType::Utf8, SqlType::String);
+        let mut contract =
+            count_contract_with_partition("region", MvPartitionTransformContract::Identity, 11);
+        // Force the output column to look like a non-pure expression.
+        contract.output.columns[0].expression.kind = ExpressionKind::Func;
+        contract.output.columns[0]
+            .expression
+            .referenced_base_field_ids = vec![1, 2];
+
+        let chunk = batch_with_group_key(
+            "region",
+            DataType::Utf8,
+            StdArcFixture::new(StringArray::from(vec![Some("a")])) as arrow::array::ArrayRef,
+        );
+        let err = derive_for_test(&contract, &layout, &[chunk]).unwrap_err();
+        assert!(matches!(
+            err,
+            AffectedPartitionError::OutputLineageNotPureColumn { ref field } if field == "region"
+        ));
+    }
+
+    #[test]
+    fn derive_missing_chunk_column_returns_group_key_missing() {
+        use arrow::array::ArrayRef;
+        let layout = count_layout_with_group_key("region", DataType::Utf8, SqlType::String);
+        let contract =
+            count_contract_with_partition("region", MvPartitionTransformContract::Identity, 11);
+        // Build a chunk whose group-key column name does NOT match the layout's.
+        let row_ids: ArrayRef = StdArcFixture::new(StringArray::from(vec![Some("rid-0")]));
+        let other: ArrayRef = StdArcFixture::new(StringArray::from(vec![Some("a")]));
+        let counts: ArrayRef = StdArcFixture::new(Int64Array::from(vec![1i64]));
+        let states: ArrayRef = StdArcFixture::new(Int64Array::from(vec![1i64]));
+        let schema = StdArcFixture::new(Schema::new(vec![
+            Field::new("__row_id__", DataType::Utf8, false),
+            Field::new("not_region", DataType::Utf8, true),
+            Field::new("c", DataType::Int64, false),
+            Field::new("__agg_state_c", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![row_ids, other, counts, states]).unwrap();
+        let chunk = crate::engine::record_batch_to_chunk(batch).unwrap();
+
+        let err = derive_for_test(&contract, &layout, &[chunk]).unwrap_err();
+        assert!(matches!(
+            err,
+            AffectedPartitionError::GroupKeyColumnMissing { ref field, .. } if field == "region"
+        ));
+    }
+
+    #[test]
+    fn derive_empty_chunks_returns_known_empty_set() {
+        let layout = count_layout_with_group_key("region", DataType::Utf8, SqlType::String);
+        let contract =
+            count_contract_with_partition("region", MvPartitionTransformContract::Identity, 11);
+        let chunk = batch_with_group_key(
+            "region",
+            DataType::Utf8,
+            StdArcFixture::new(StringArray::from(Vec::<Option<&str>>::new()))
+                as arrow::array::ArrayRef,
+        );
+
+        // Empty chunks must still resolve to `Known` (Some) with an empty set,
+        // not Unpartitioned (None).
+        let partitions = derive_for_test(&contract, &layout, &[chunk])
+            .expect("derive")
+            .expect("partitioned");
+        assert!(partitions.is_empty());
+    }
+
+    #[test]
+    fn derive_accepts_join_aggregate_pure_column_lineage() {
+        use crate::meta::repository::mv_contract::QualifiedFieldLineage;
+        let layout = count_layout_with_group_key("region", DataType::Utf8, SqlType::String);
+        let mut contract =
+            count_contract_with_partition("region", MvPartitionTransformContract::Identity, 11);
+        // Swap the lineage from single-base form to join form: clear
+        // referenced_base_field_ids and populate referenced_base_fields
+        // with a single qualified ref. This simulates a join-aggregate MV
+        // where the output column is backed by a qualified field reference
+        // instead of a direct base field id.
+        contract.output.columns[0]
+            .expression
+            .referenced_base_field_ids = Vec::new();
+        contract.output.columns[0].expression.referenced_base_fields =
+            vec![QualifiedFieldLineage {
+                table_fqn: "ice.sales.orders".to_string(),
+                qualifier_at_create: "base".to_string(),
+                field_id: 1,
+            }];
+
+        let chunk = batch_with_group_key(
+            "region",
+            DataType::Utf8,
+            StdArcFixture::new(StringArray::from(vec![Some("a"), Some("b")]))
+                as arrow::array::ArrayRef,
+        );
+        let partitions = derive_for_test(&contract, &layout, &[chunk])
+            .expect("derive")
+            .expect("partitioned");
+        assert_eq!(partitions.len(), 2);
+    }
+
+    #[test]
+    fn derive_rejects_join_aggregate_multi_base_field_lineage() {
+        use crate::meta::repository::mv_contract::QualifiedFieldLineage;
+        let layout = count_layout_with_group_key("region", DataType::Utf8, SqlType::String);
+        let mut contract =
+            count_contract_with_partition("region", MvPartitionTransformContract::Identity, 11);
+        // Two base-field refs simulates a computed/joined expression, which
+        // is NOT a pure passthrough and should be rejected. This represents
+        // a scenario where the output column depends on multiple base fields
+        // (e.g., a computed column in a join context).
+        contract.output.columns[0]
+            .expression
+            .referenced_base_field_ids = Vec::new();
+        contract.output.columns[0].expression.referenced_base_fields = vec![
+            QualifiedFieldLineage {
+                table_fqn: "ice.sales.orders".to_string(),
+                qualifier_at_create: "f".to_string(),
+                field_id: 1,
+            },
+            QualifiedFieldLineage {
+                table_fqn: "ice.sales.orders".to_string(),
+                qualifier_at_create: "d".to_string(),
+                field_id: 2,
+            },
+        ];
+
+        let chunk = batch_with_group_key(
+            "region",
+            DataType::Utf8,
+            StdArcFixture::new(StringArray::from(vec![Some("a")])) as arrow::array::ArrayRef,
+        );
+        let err = derive_for_test(&contract, &layout, &[chunk]).unwrap_err();
         assert!(matches!(
             err,
             AffectedPartitionError::OutputLineageNotPureColumn { ref field } if field == "region"
