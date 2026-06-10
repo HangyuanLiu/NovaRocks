@@ -6136,7 +6136,7 @@ mod tests {
         let (resolved, cte_registry, mut factory) =
             crate::sql::analyzer::analyze(&query, &catalog, "default")?;
         let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
-        let physical = optimizer::optimize(logical, &HashMap::new(), factory, None)?;
+        let physical = optimizer::optimize(logical, &HashMap::new(), factory, None, Vec::new())?;
         let registry = mock_iceberg_registry();
         PlanFragmentBuilder::build(&physical, &catalog, &registry, "default")?;
         Ok(())
@@ -6153,7 +6153,7 @@ mod tests {
         let (resolved, cte_registry, mut factory) =
             crate::sql::analyzer::analyze(&query, &catalog, "default")?;
         let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
-        let physical = optimizer::optimize(logical, &HashMap::new(), factory, None)?;
+        let physical = optimizer::optimize(logical, &HashMap::new(), factory, None, Vec::new())?;
         let registry = mock_iceberg_registry();
         PlanFragmentBuilder::build(&physical, &catalog, &registry, "default")?;
         Ok(())

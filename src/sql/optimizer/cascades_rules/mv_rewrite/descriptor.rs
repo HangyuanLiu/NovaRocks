@@ -9,7 +9,24 @@ use std::collections::HashMap;
 use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
 use crate::sql::catalog::TableDef;
 use crate::sql::column_id::ColumnId;
+use crate::sql::optimizer::memo::{MExpr, Memo};
+use crate::sql::optimizer::operator::{AggStage, LogicalAggregateOp, Operator};
 use crate::sql::planner::plan::{AggregateCall, LogicalPlan};
+
+/// What the alternative must reproduce at the matched group's top.
+///
+/// Carries the original operator shape so the rule can reuse the matched
+/// group's output `ColumnId`s when constructing the rewritten alternative
+/// (memo-group equivalence requires equivalent expressions to share their
+/// output columns).
+#[derive(Clone, Debug)]
+pub(crate) enum MatchedShape {
+    /// Top is the scan itself or `Filter(Scan)`: outputs are scan columns.
+    Spj,
+    /// Top is `LogicalAggregate`: the original op is cloned so the rule can
+    /// reuse its `output_columns` ids.
+    Spjg { original_agg: LogicalAggregateOp },
+}
 
 /// One visible output of the SPJG subtree, in output order.
 #[derive(Clone, Debug)]
@@ -206,6 +223,160 @@ impl SpjgDescriptor {
             aggregate: agg,
             outputs,
         })
+    }
+
+    /// Rebuild the SPJG view of the subtree rooted at `expr`, walking the
+    /// memo by following the FIRST logical expression of each child group.
+    ///
+    /// The first logical expr of a group is always its original (unsplit)
+    /// shape — `convert.rs` seeds each group with the planner node, and
+    /// transformation rules only ever append alternatives. MvRewrite runs in
+    /// the same explore round as `SplitAggregateRule`, so an aggregate group
+    /// may already carry a split Local/Global alternative; the first expr is
+    /// still the original Single aggregate, which is the only form this
+    /// accepts.
+    ///
+    /// Mirrors [`SpjgDescriptor::from_logical_plan`] arm-by-arm but over
+    /// `Operator` variants. Returns `None` for any non-SPJG operator in the
+    /// chain (the same fail-closed contract). Unlike `from_logical_plan` there
+    /// is no top-project arm: the rule only matches on Aggregate/Filter/Scan,
+    /// so the matched node is the subtree top.
+    pub(crate) fn from_memo(expr: &MExpr, memo: &Memo) -> Option<(SpjgDescriptor, MatchedShape)> {
+        // Helper: the first logical expr of a child group (the original shape).
+        let first_logical = |gid: usize| memo.groups[gid].logical_exprs.first();
+
+        // Peel an optional top aggregate.
+        let (aggregate, mut node) = match &expr.op {
+            Operator::LogicalAggregate(a) => {
+                // Only the original, unsplit Single aggregate is accepted.
+                if a.stage != AggStage::Single || a.is_split {
+                    return None;
+                }
+                let child = first_logical(*expr.children.first()?)?;
+                (Some(a), child)
+            }
+            _ => (None, expr),
+        };
+
+        // Optional pre-aggregate (or sole) project below the current node.
+        let mid_project = match &node.op {
+            Operator::LogicalProject(p) => {
+                let child = first_logical(*node.children.first()?)?;
+                let saved = p;
+                node = child;
+                Some(saved)
+            }
+            _ => None,
+        };
+
+        // Filter chain down to the scan.
+        let mut predicates: Vec<TypedExpr> = Vec::new();
+        while let Operator::LogicalFilter(f) = &node.op {
+            split_conjuncts(&f.predicate, &mut predicates);
+            node = first_logical(*node.children.first()?)?;
+        }
+
+        let Operator::LogicalScan(scan) = &node.op else {
+            return None;
+        };
+        // Reject scans already injected by a prior MV rewrite (MV-on-MV).
+        if scan.mv_rewritten_from.is_some() {
+            return None;
+        }
+        predicates.extend(scan.predicates.iter().cloned());
+
+        // Composition map from the mid project (ColumnId -> expr over scan cols).
+        let mut defs: HashMap<ColumnId, TypedExpr> = HashMap::new();
+        if let Some(p) = mid_project {
+            for item in &p.items {
+                let composed = substitute(&item.expr, &defs);
+                defs.insert(item.output_column_id, composed);
+            }
+        }
+        let compose = |e: &TypedExpr| substitute(e, &defs);
+
+        let (agg, outputs, shape) = match aggregate {
+            Some(a) => {
+                let group_by: Vec<TypedExpr> = a.group_by.iter().map(&compose).collect();
+                let aggregates: Vec<AggregateCall> = a
+                    .aggregates
+                    .iter()
+                    .map(|c| AggregateCall {
+                        args: c.args.iter().map(&compose).collect(),
+                        ..c.clone()
+                    })
+                    .collect();
+                if a.output_columns.len() != a.group_by.len() + a.aggregates.len() {
+                    return None;
+                }
+                let mut agg_outputs: Vec<SpjgOutput> = Vec::new();
+                for (i, oc) in a.output_columns.iter().enumerate() {
+                    let out_expr = if i < a.group_by.len() {
+                        SpjgOutputExpr::Dimension(group_by[i].clone())
+                    } else {
+                        SpjgOutputExpr::Aggregate(aggregates[i - a.group_by.len()].clone())
+                    };
+                    agg_outputs.push(SpjgOutput {
+                        name: oc.name.clone(),
+                        column_id: oc.column_id,
+                        expr: out_expr,
+                    });
+                }
+                (
+                    Some(SpjgAggregate {
+                        group_by,
+                        aggregates,
+                    }),
+                    agg_outputs,
+                    MatchedShape::Spjg {
+                        original_agg: a.clone(),
+                    },
+                )
+            }
+            None => {
+                let outputs: Vec<SpjgOutput> = match mid_project {
+                    Some(p) => p
+                        .items
+                        .iter()
+                        .map(|item| SpjgOutput {
+                            name: item.output_name.clone(),
+                            column_id: item.output_column_id,
+                            expr: SpjgOutputExpr::Dimension(substitute(&item.expr, &defs)),
+                        })
+                        .collect(),
+                    None => scan
+                        .columns
+                        .iter()
+                        .map(|c| SpjgOutput {
+                            name: c.name.clone(),
+                            column_id: c.column_id,
+                            expr: SpjgOutputExpr::Dimension(TypedExpr {
+                                kind: ExprKind::ColumnRef {
+                                    column_id: c.column_id,
+                                    qualifier: None,
+                                    column: c.name.clone(),
+                                },
+                                data_type: c.data_type.clone(),
+                                nullable: c.nullable,
+                            }),
+                        })
+                        .collect(),
+                };
+                (None, outputs, MatchedShape::Spj)
+            }
+        };
+
+        Some((
+            SpjgDescriptor {
+                database: scan.database.clone(),
+                table: scan.table.clone(),
+                scan_columns: scan.columns.clone(),
+                predicates,
+                aggregate: agg,
+                outputs,
+            },
+            shape,
+        ))
     }
 }
 
@@ -780,5 +951,105 @@ mod tests {
             required_output_columns: None,
         });
         assert!(SpjgDescriptor::from_logical_plan(&plan).is_err());
+    }
+
+    /// Build a memo from a plan and return the first logical expr of the root
+    /// group (cloned) plus the memo, ready for `from_memo`.
+    fn memo_root(plan: &LogicalPlan) -> (crate::sql::optimizer::memo::Memo, MExpr) {
+        use crate::sql::optimizer::convert::logical_plan_to_memo;
+        let mut memo = crate::sql::optimizer::memo::Memo::new();
+        let root = logical_plan_to_memo(plan, &mut memo);
+        let root_expr = memo.groups[root].logical_exprs[0].clone();
+        (memo, root_expr)
+    }
+
+    #[test]
+    fn from_memo_matches_filter_scan() {
+        let a = col(1, "a");
+        let b = col(2, "b");
+        let plan = LogicalPlan::Filter(FilterNode {
+            input: Box::new(LogicalPlan::Scan(scan(&[a.clone(), b.clone()]))),
+            predicate: cmp(col_ref(&a), crate::sql::analysis::BinOp::Ge, int_lit(5)),
+            required_output_columns: None,
+        });
+        let logical = SpjgDescriptor::from_logical_plan(&plan).expect("spjg");
+        let (memo, root_expr) = memo_root(&plan);
+        let (mem, shape) = SpjgDescriptor::from_memo(&root_expr, &memo).expect("from_memo");
+        assert!(matches!(shape, MatchedShape::Spj));
+        assert_eq!(mem.table.name, logical.table.name);
+        assert_eq!(mem.predicates.len(), logical.predicates.len());
+        assert!(mem.aggregate.is_none());
+        assert_eq!(mem.outputs.len(), logical.outputs.len());
+    }
+
+    #[test]
+    fn from_memo_matches_aggregate() {
+        let a = col(1, "a");
+        let v = col(2, "v");
+        let sum_out = col(3, "s");
+        let plan = LogicalPlan::Aggregate(AggregateNode {
+            input: Box::new(LogicalPlan::Scan(scan(&[a.clone(), v.clone()]))),
+            group_by: vec![col_ref(&a)],
+            aggregates: vec![AggregateCall {
+                name: "sum".to_string(),
+                args: vec![col_ref(&v)],
+                distinct: false,
+                result_type: DataType::Int64,
+                order_by: vec![],
+                output_column_id: sum_out.column_id,
+            }],
+            output_columns: vec![col(1, "a"), sum_out.clone()],
+            already_pushed: false,
+            required_output_columns: None,
+        });
+        let logical = SpjgDescriptor::from_logical_plan(&plan).expect("spjg");
+        let (memo, root_expr) = memo_root(&plan);
+        let (mem, shape) = SpjgDescriptor::from_memo(&root_expr, &memo).expect("from_memo");
+        // Shape carries the original aggregate op for output-id reuse.
+        let MatchedShape::Spjg { original_agg } = &shape else {
+            panic!("expected Spjg shape");
+        };
+        assert_eq!(original_agg.output_columns.len(), 2);
+        assert_eq!(original_agg.stage, AggStage::Single);
+        let agg = mem.aggregate.as_ref().expect("aggregate present");
+        let logical_agg = logical.aggregate.as_ref().expect("aggregate present");
+        assert_eq!(agg.group_by.len(), logical_agg.group_by.len());
+        assert_eq!(agg.aggregates.len(), logical_agg.aggregates.len());
+        assert_eq!(mem.outputs.len(), logical.outputs.len());
+    }
+
+    #[test]
+    fn from_memo_rejects_split_aggregate() {
+        use crate::sql::optimizer::operator::{LogicalAggregateOp, Operator};
+        // A split (Local) aggregate is not the original Single shape and must
+        // be rejected even when it sits at the matched position.
+        let a = col(1, "a");
+        let v = col(2, "v");
+        let sum_out = col(3, "s");
+        let scan_op = scan(&[a.clone(), v.clone()]);
+        let plan = LogicalPlan::Scan(scan_op);
+        let mut memo = crate::sql::optimizer::memo::Memo::new();
+        let scan_gid = crate::sql::optimizer::convert::logical_plan_to_memo(&plan, &mut memo);
+        let split = LogicalAggregateOp::staged(
+            AggStage::Local,
+            vec![col_ref(&a)],
+            vec![AggregateCall {
+                name: "sum".to_string(),
+                args: vec![col_ref(&v)],
+                distinct: false,
+                result_type: DataType::Int64,
+                order_by: vec![],
+                output_column_id: sum_out.column_id,
+            }],
+            vec![col(1, "a"), sum_out.clone()],
+            vec![false],
+            true,
+        );
+        let expr = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalAggregate(split),
+            children: vec![scan_gid],
+        };
+        assert!(SpjgDescriptor::from_memo(&expr, &memo).is_none());
     }
 }

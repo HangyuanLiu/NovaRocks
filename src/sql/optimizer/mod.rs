@@ -64,6 +64,7 @@ pub(crate) fn optimize(
     table_stats: &HashMap<String, TableStatistics>,
     factory: ColumnRefFactory,
     dictionary_provider: Option<std::sync::Arc<dyn rewrite::context::QueryDictionaryProvider>>,
+    mv_candidates: Vec<cascades_rules::mv_rewrite::MvRewriteCandidate>,
 ) -> Result<PhysicalPlanNode, String> {
     let deadline = Instant::now() + OPTIMIZE_TIMEOUT;
 
@@ -129,8 +130,15 @@ pub(crate) fn optimize(
 
     check_deadline(deadline)?;
 
-    // 7. Explore: apply transformation rules (logical -> logical).
-    let transform_rules = cascades_rules::all_transformation_rules();
+    // 7. Explore: apply transformation rules (logical -> logical). When the
+    //    caller supplied usable MV candidates, append the MvRewrite rule so it
+    //    can inject MV-scan alternatives alongside the other transformations.
+    let mut transform_rules = cascades_rules::all_transformation_rules();
+    if !mv_candidates.is_empty() {
+        transform_rules.push(Box::new(
+            cascades_rules::mv_rewrite::rule::MvRewriteRule::new(mv_candidates),
+        ));
+    }
     explore(&mut memo, &transform_rules, &options, deadline)?;
 
     check_deadline(deadline)?;
@@ -190,6 +198,7 @@ pub(crate) fn is_known_rule_name(name: &str) -> bool {
             .any(|r| r.name() == name)
         || rewrite::registry::is_known_rewrite_rule_name(name)
         || name == runtime_filter_pass::RUNTIME_FILTER_RULE
+        || name == cascades_rules::mv_rewrite::RULE_NAME
 }
 
 fn check_deadline(deadline: Instant) -> Result<(), String> {
@@ -368,7 +377,8 @@ mod is_known_rule_name_tests {
             required_output_columns: None,
         });
         let factory = ColumnRefFactory::new();
-        let physical = optimize(plan, &HashMap::new(), factory, None).expect("optimize values");
+        let physical =
+            optimize(plan, &HashMap::new(), factory, None, Vec::new()).expect("optimize values");
         let physical_debug = format!("{physical:?}");
         assert!(physical_debug.contains("PhysicalValues"));
     }
@@ -520,6 +530,11 @@ mod is_known_rule_name_tests {
     #[test]
     fn is_known_rule_name_recognizes_split_aggregate_rule() {
         assert!(is_known_rule_name("SplitAggregateRule"));
+    }
+
+    #[test]
+    fn is_known_rule_name_recognizes_mv_rewrite() {
+        assert!(is_known_rule_name("MvRewrite"));
     }
 
     #[test]
@@ -761,8 +776,8 @@ mod is_known_rule_name_tests {
             required_output_columns: None,
         });
         let factory = ColumnRefFactory::new();
-        let physical =
-            optimize(plan, &HashMap::new(), factory, None).expect("optimize assert one row");
+        let physical = optimize(plan, &HashMap::new(), factory, None, Vec::new())
+            .expect("optimize assert one row");
         let physical_debug = format!("{physical:?}");
         assert!(physical_debug.contains("PhysicalAssertOneRow"));
     }
@@ -818,7 +833,13 @@ mod is_known_rule_name_tests {
             ..Default::default()
         };
         let err = crate::sql::optimizer::options::with_session_optimizer_settings(settings, || {
-            optimize(plan, &HashMap::new(), ColumnRefFactory::new(), None)
+            optimize(
+                plan,
+                &HashMap::new(),
+                ColumnRefFactory::new(),
+                None,
+                Vec::new(),
+            )
         })
         .expect_err("backstop must reject the residual apply");
         assert!(

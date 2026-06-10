@@ -7,6 +7,7 @@ pub(crate) mod aggregate_rollup;
 pub(crate) mod column_mapping;
 pub(crate) mod descriptor;
 pub(crate) mod predicate_split;
+pub(crate) mod rule;
 
 use crate::sql::catalog::TableDef;
 use descriptor::SpjgDescriptor;

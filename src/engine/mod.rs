@@ -2773,7 +2773,8 @@ fn explain_analyze_query(
     let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
     let table_stats = build_table_stats_from_plan(&logical);
     // dictionary_provider intentionally None; installed via TLS by execute_in_context.
-    let physical = crate::sql::optimizer::optimize(logical, &table_stats, factory, None)?;
+    let physical =
+        crate::sql::optimizer::optimize(logical, &table_stats, factory, None, Vec::new())?;
     let planning_ms = t_plan.elapsed().as_millis() as u64;
 
     let t_exec = Instant::now();
@@ -2813,7 +2814,8 @@ fn explain_query(
     let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
     let table_stats = build_table_stats_from_plan(&logical);
     // dictionary_provider intentionally None; installed via TLS by execute_in_context.
-    let physical = crate::sql::optimizer::optimize(logical, &table_stats, factory, None)?;
+    let physical =
+        crate::sql::optimizer::optimize(logical, &table_stats, factory, None, Vec::new())?;
 
     let mut lines = Vec::new();
     if matches!(level, ExplainLevel::Costs) {
@@ -2921,7 +2923,8 @@ pub(crate) fn execute_query_as_iceberg_write(
         crate::sql::analyzer::analyze(query, &analyzer_provider, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
     let table_stats = build_table_stats_from_plan(&logical);
-    let physical = crate::sql::optimizer::optimize(logical, &table_stats, factory, None)?;
+    let physical =
+        crate::sql::optimizer::optimize(logical, &table_stats, factory, None, Vec::new())?;
     let build_result =
         crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_with_iceberg_sink(
             &physical,
@@ -3074,7 +3077,8 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
     }
     let table_stats = build_table_stats_from_plan(&logical);
     // dictionary_provider intentionally None; installed via TLS by execute_in_context.
-    let mut physical = crate::sql::optimizer::optimize(logical, &table_stats, factory, None)?;
+    let mut physical =
+        crate::sql::optimizer::optimize(logical, &table_stats, factory, None, Vec::new())?;
     // Unit-test states may not start the standalone exchange server. IVM-A1
     // internal queries also pass runtime-local handles (`terminal_sink` or
     // `iceberg_catalogs`) that coordinated fragments cannot currently clone
@@ -5077,8 +5081,9 @@ enable_path_style_access = true
         let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)
             .expect("plan query");
         let table_stats = super::build_table_stats_from_plan(&logical);
-        let physical = crate::sql::optimizer::optimize(logical, &table_stats, factory, None)
-            .expect("optimize");
+        let physical =
+            crate::sql::optimizer::optimize(logical, &table_stats, factory, None, Vec::new())
+                .expect("optimize");
         crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
             &physical, &catalog, &registry, "default",
         )
