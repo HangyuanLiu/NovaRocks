@@ -246,6 +246,7 @@ mod tests {
     use crate::sql::optimizer::operator::{
         LogicalProjectOp, LogicalScanOp, LogicalSortOp, LogicalTopNOp, TopNPhase,
     };
+    use crate::sql::optimizer::rule::NewExpr;
     use arrow::datatypes::DataType;
 
     fn col(id: u32) -> TypedExpr {
@@ -377,6 +378,17 @@ mod tests {
             .into_iter()
             .find(|rule| rule.name() == "PushTopNThroughProject")
             .expect("PushTopNThroughProject should be registered")
+    }
+
+    fn add_new_expr_to_group(memo: &mut Memo, group_id: usize, new_expr: NewExpr) {
+        memo.add_expr_to_group(
+            group_id,
+            MExpr {
+                id: memo.next_expr_id(),
+                op: new_expr.op,
+                children: new_expr.children,
+            },
+        );
     }
 
     fn analytic_sort_with_items(memo: &Memo, items: Vec<SortItem>, child_group: usize) -> MExpr {
@@ -660,6 +672,57 @@ mod tests {
             memo.groups.len(),
             group_count_after_first,
             "second apply must not create another equivalent pushed TopN group"
+        );
+    }
+
+    #[test]
+    fn project_pushdown_merge_survives_physical_implementation_dedup() {
+        let mut memo = Memo::new();
+        let scan_group = scan_group(&mut memo);
+        let inner_group = memo.new_group(topn(&memo, 3, 0, TopNPhase::Final, false, scan_group));
+        let project_group = memo.new_group(project_with_items(
+            &memo,
+            vec![project_item(col(1), 10, "alias_c1")],
+            inner_group,
+        ));
+        let outer_group = memo.new_group(topn_with_item(
+            &memo,
+            sort_item(10),
+            2,
+            0,
+            TopNPhase::Final,
+            false,
+            project_group,
+        ));
+
+        let outer_expr = memo.groups[outer_group].logical_exprs[0].clone();
+        let pushed = project_pushdown_rule().apply(&outer_expr, &mut memo);
+        assert_eq!(
+            pushed.len(),
+            1,
+            "project pushdown should expose nested TopN"
+        );
+        let pushed_group = pushed[0].children[0];
+        add_new_expr_to_group(&mut memo, outer_group, pushed.into_iter().next().unwrap());
+
+        let pushed_expr = memo.groups[pushed_group].logical_exprs[0].clone();
+        let merged = MergeConsecutiveTopN.apply(&pushed_expr, &mut memo);
+        assert_eq!(merged.len(), 1, "exposed adjacent TopNs should merge");
+        add_new_expr_to_group(&mut memo, pushed_group, merged.into_iter().next().unwrap());
+
+        crate::sql::optimizer::implement(
+            &mut memo,
+            &crate::sql::optimizer::cascades_rules::all_implementation_rules(),
+            &crate::sql::optimizer::options::OptimizerOptions::default_settings(),
+        );
+
+        assert!(
+            memo.groups[pushed_group]
+                .physical_exprs
+                .iter()
+                .any(|expr| matches!(expr.op, Operator::PhysicalTopN(_))
+                    && expr.children == vec![scan_group]),
+            "implementation must keep the merged TopN alternative that bypasses the inner TopN"
         );
     }
 

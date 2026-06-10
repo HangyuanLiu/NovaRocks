@@ -290,10 +290,11 @@ fn implement(memo: &mut Memo, rules: &[Box<dyn Rule>], options: &options::Optimi
                     if rule.matches(&expr.op) {
                         let new_exprs = rule.apply(expr, memo);
                         for new_expr in new_exprs {
-                            let already_exists = memo.groups[group_id]
-                                .physical_exprs
-                                .iter()
-                                .any(|existing| op_equal(&existing.op, &new_expr.op));
+                            let already_exists =
+                                memo.groups[group_id].physical_exprs.iter().any(|existing| {
+                                    existing.children == new_expr.children
+                                        && op_equal(&existing.op, &new_expr.op)
+                                });
                             if !already_exists {
                                 let mexpr = MExpr {
                                     id: memo.next_expr_id(),
