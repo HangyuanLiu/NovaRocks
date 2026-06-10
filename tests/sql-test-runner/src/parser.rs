@@ -142,6 +142,30 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
                     .with_context(|| format!("invalid retry_interval_ms: {}", raw_value))?;
                 meta.retry_interval_ms = Some(value);
             }
+            "kill_be_index" => {
+                let value: usize = raw_value
+                    .parse()
+                    .with_context(|| format!("invalid kill_be_index: {}", raw_value))?;
+                meta.kill_be_index = Some(value);
+            }
+            "network_partition_be" => {
+                let value: usize = raw_value
+                    .parse()
+                    .with_context(|| format!("invalid network_partition_be: {}", raw_value))?;
+                meta.network_partition_be = Some(value);
+            }
+            "heartbeat_delay_ms" => {
+                let value: u64 = raw_value
+                    .parse()
+                    .with_context(|| format!("invalid heartbeat_delay_ms: {}", raw_value))?;
+                meta.heartbeat_delay_ms = Some(value);
+            }
+            "restart_be_delay_ms" => {
+                let value: u64 = raw_value
+                    .parse()
+                    .with_context(|| format!("invalid restart_be_delay_ms: {}", raw_value))?;
+                meta.restart_be_delay_ms = Some(value);
+            }
             "wait_alter_column" => {
                 meta.wait_alter_column = Some(raw_value);
             }
@@ -204,6 +228,14 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         skip_result_check: override_meta.skip_result_check || base.skip_result_check,
         retry_count: override_meta.retry_count.or(base.retry_count),
         retry_interval_ms: override_meta.retry_interval_ms.or(base.retry_interval_ms),
+        kill_be_index: override_meta.kill_be_index.or(base.kill_be_index),
+        network_partition_be: override_meta
+            .network_partition_be
+            .or(base.network_partition_be),
+        heartbeat_delay_ms: override_meta.heartbeat_delay_ms.or(base.heartbeat_delay_ms),
+        restart_be_delay_ms: override_meta
+            .restart_be_delay_ms
+            .or(base.restart_be_delay_ms),
         wait_alter_column: override_meta
             .wait_alter_column
             .clone()
@@ -580,5 +612,77 @@ mod opt5_directive_tests {
         let override_meta = QueryMeta::default();
         let merged = merge_meta(&base, &override_meta);
         assert!(merged.normalize_explain_timing);
+    }
+
+    #[test]
+    fn parse_meta_parses_fault_injection_directives() {
+        let re = meta_re();
+        let lines = vec![
+            "-- @kill_be_index=1".to_string(),
+            "-- @network_partition_be=2".to_string(),
+            "-- @heartbeat_delay_ms=250".to_string(),
+            "-- @restart_be_delay_ms=500".to_string(),
+        ];
+
+        let meta = parse_meta(&lines, &re).expect("parse ok");
+
+        assert_eq!(meta.kill_be_index, Some(1));
+        assert_eq!(meta.network_partition_be, Some(2));
+        assert_eq!(meta.heartbeat_delay_ms, Some(250));
+        assert_eq!(meta.restart_be_delay_ms, Some(500));
+    }
+
+    #[test]
+    fn parse_meta_reports_invalid_fault_number_with_context() {
+        let re = meta_re();
+        let lines = vec!["-- @restart_be_delay_ms=soon".to_string()];
+
+        let err = parse_meta(&lines, &re).expect_err("invalid number should fail");
+
+        assert!(
+            format!("{err:#}").contains("invalid restart_be_delay_ms: soon"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn merge_meta_inherits_fault_directives_from_base() {
+        let base = QueryMeta {
+            kill_be_index: Some(1),
+            network_partition_be: Some(2),
+            heartbeat_delay_ms: Some(250),
+            restart_be_delay_ms: Some(500),
+            ..QueryMeta::default()
+        };
+        let merged = merge_meta(&base, &QueryMeta::default());
+
+        assert_eq!(merged.kill_be_index, Some(1));
+        assert_eq!(merged.network_partition_be, Some(2));
+        assert_eq!(merged.heartbeat_delay_ms, Some(250));
+        assert_eq!(merged.restart_be_delay_ms, Some(500));
+    }
+
+    #[test]
+    fn merge_meta_overrides_fault_directives_when_present() {
+        let base = QueryMeta {
+            kill_be_index: Some(1),
+            network_partition_be: Some(2),
+            heartbeat_delay_ms: Some(250),
+            restart_be_delay_ms: Some(500),
+            ..QueryMeta::default()
+        };
+        let override_meta = QueryMeta {
+            kill_be_index: Some(3),
+            network_partition_be: Some(4),
+            heartbeat_delay_ms: Some(750),
+            restart_be_delay_ms: Some(1000),
+            ..QueryMeta::default()
+        };
+        let merged = merge_meta(&base, &override_meta);
+
+        assert_eq!(merged.kill_be_index, Some(3));
+        assert_eq!(merged.network_partition_be, Some(4));
+        assert_eq!(merged.heartbeat_delay_ms, Some(750));
+        assert_eq!(merged.restart_be_delay_ms, Some(1000));
     }
 }
