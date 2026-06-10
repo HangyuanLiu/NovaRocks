@@ -257,6 +257,10 @@ fn push_topn_through_project(expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
     let Operator::LogicalTopN(topn) = &expr.op else {
         return vec![];
     };
+    // Split TopN codegen expects the final TopN to read directly from its partial root.
+    if topn.phase != TopNPhase::Final || topn.is_split {
+        return vec![];
+    }
     if expr.children.len() != 1 {
         return vec![];
     }
@@ -1150,6 +1154,60 @@ mod tests {
         assert!(
             out.is_empty(),
             "computed Project expressions must fail closed"
+        );
+    }
+
+    #[test]
+    fn project_pushdown_fails_closed_for_partial_topn() {
+        let mut memo = Memo::new();
+        let scan_group = scan_group(&mut memo);
+        let project_group = memo.new_group(project_with_items(
+            &memo,
+            vec![project_item(col(1), 10, "alias_c1")],
+            scan_group,
+        ));
+        let topn = topn_with_item(
+            &memo,
+            sort_item(10),
+            7,
+            0,
+            TopNPhase::Partial,
+            false,
+            project_group,
+        );
+
+        let out = project_pushdown_rule().apply(&topn, &mut memo);
+
+        assert!(
+            out.is_empty(),
+            "Project pushdown must not move PARTIAL TopN away from split-final shape"
+        );
+    }
+
+    #[test]
+    fn project_pushdown_fails_closed_for_split_final_topn() {
+        let mut memo = Memo::new();
+        let scan_group = scan_group(&mut memo);
+        let project_group = memo.new_group(project_with_items(
+            &memo,
+            vec![project_item(col(1), 10, "alias_c1")],
+            scan_group,
+        ));
+        let topn = topn_with_item(
+            &memo,
+            sort_item(10),
+            7,
+            0,
+            TopNPhase::Final,
+            true,
+            project_group,
+        );
+
+        let out = project_pushdown_rule().apply(&topn, &mut memo);
+
+        assert!(
+            out.is_empty(),
+            "Project pushdown must not wrap an already split-final TopN"
         );
     }
 
