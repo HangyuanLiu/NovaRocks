@@ -3,7 +3,6 @@
 -- Lock in compact consecutive TopN planning and the rule-disable escape hatch.
 
 -- query 1
--- @skip_result_check=true
 -- @explain_contains=TOP-N
 -- @explain_contains=stats={rows=
 EXPLAIN VERBOSE SELECT *
@@ -25,7 +24,6 @@ LIMIT 2;
 SET disable_optimizer_rules = 'MergeConsecutiveTopN';
 
 -- query 3
--- @skip_result_check=true
 -- @explain_contains=TOP-N
 EXPLAIN VERBOSE SELECT *
 FROM (

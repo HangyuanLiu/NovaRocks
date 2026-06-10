@@ -3,7 +3,6 @@
 -- Lock in redundant Sort elision under TopN and the rule-disable escape hatch.
 
 -- query 1
--- @skip_result_check=true
 -- @explain_contains=TOP-N
 EXPLAIN VERBOSE SELECT id, score
 FROM (
@@ -22,7 +21,6 @@ LIMIT 2;
 SET disable_optimizer_rules = 'RemoveRedundantSortUnderTopN';
 
 -- query 3
--- @skip_result_check=true
 -- @explain_contains=SORT
 EXPLAIN VERBOSE SELECT id, score
 FROM (

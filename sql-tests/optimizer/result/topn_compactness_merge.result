@@ -1,0 +1,41 @@
+-- query 1
+Explain String
+TOP-N (limit=2) [s.score DESC NULLS LAST, id ASC NULLS FIRST] stats={rows=2}
+  PROJECT [s.id AS id, s.score AS score] stats={rows=3}
+    PROJECT [id, score] stats={rows=3}
+      TOP-N (limit=3) [score DESC NULLS LAST, id ASC NULLS FIRST] stats={rows=3}
+        TOP-N (limit=3, offset=0) [score DESC NULLS LAST, id ASC NULLS FIRST] stats={rows=3}
+          PROJECT [id, score] stats={rows=4}
+            PROJECT [id, score] stats={rows=4}
+              UNION ALL stats={rows=4}
+                UNION ALL stats={rows=3}
+                  UNION ALL stats={rows=2}
+                    PROJECT [1 AS id, 10 AS score] stats={rows=1}
+                      VALUES (1 rows) stats={rows=1}
+                    PROJECT [2 AS id, 20 AS score] stats={rows=1}
+                      VALUES (1 rows) stats={rows=1}
+                  PROJECT [3 AS id, 20 AS score] stats={rows=1}
+                    VALUES (1 rows) stats={rows=1}
+                PROJECT [4 AS id, 5 AS score] stats={rows=1}
+                  VALUES (1 rows) stats={rows=1}
+
+-- query 3
+Explain String
+TOP-N (limit=2) [s.score DESC NULLS LAST, id ASC NULLS FIRST] stats={rows=2}
+  PROJECT [s.id AS id, s.score AS score] stats={rows=3}
+    PROJECT [id, score] stats={rows=3}
+      TOP-N (limit=3) [score DESC NULLS LAST, id ASC NULLS FIRST] stats={rows=3}
+        TOP-N (limit=3, offset=0) [score DESC NULLS LAST, id ASC NULLS FIRST] stats={rows=3}
+          PROJECT [id, score] stats={rows=4}
+            PROJECT [id, score] stats={rows=4}
+              UNION ALL stats={rows=4}
+                UNION ALL stats={rows=3}
+                  UNION ALL stats={rows=2}
+                    PROJECT [1 AS id, 10 AS score] stats={rows=1}
+                      VALUES (1 rows) stats={rows=1}
+                    PROJECT [2 AS id, 20 AS score] stats={rows=1}
+                      VALUES (1 rows) stats={rows=1}
+                  PROJECT [3 AS id, 20 AS score] stats={rows=1}
+                    VALUES (1 rows) stats={rows=1}
+                PROJECT [4 AS id, 5 AS score] stats={rows=1}
+                  VALUES (1 rows) stats={rows=1}
