@@ -227,6 +227,8 @@ fn plan_kind(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::CTEConsume(_) => "CTEConsume",
         LogicalPlan::Decode(_) => "Decode",
         LogicalPlan::AggregateStateMerge(_) => "AggregateStateMerge",
+        LogicalPlan::Apply(_) => "Apply",
+        LogicalPlan::AssertOneRow(_) => "AssertOneRow",
         LogicalPlan::ImvDelta(_) => "ImvDelta",
         LogicalPlan::ImvVersion(_) => "ImvVersion",
     }
@@ -296,6 +298,12 @@ pub(crate) fn plan_output_columns(plan: &LogicalPlan) -> Result<Vec<OutputColumn
         LogicalPlan::CTEConsume(consume) => consume.output_columns.clone(),
         LogicalPlan::Decode(decode) => decode.output_columns.clone(),
         LogicalPlan::AggregateStateMerge(merge) => merge.output_columns.clone(),
+        LogicalPlan::Apply(apply) => {
+            let mut out = plan_output_columns(&apply.left)?;
+            out.push(apply.output_column.clone());
+            out
+        }
+        LogicalPlan::AssertOneRow(assert) => plan_output_columns(&assert.input)?,
         LogicalPlan::ImvDelta(delta) => plan_output_columns(&delta.input)?,
         LogicalPlan::ImvVersion(version) => plan_output_columns(&version.input)?,
     })

@@ -503,6 +503,11 @@ fn subtree_has_predicate_key(plan: &LogicalPlan, key: &str) -> bool {
                 || subtree_has_predicate_key(&anchor.consumer, key)
         }
         LogicalPlan::CTEProduce(produce) => subtree_has_predicate_key(&produce.input, key),
+        LogicalPlan::Apply(apply) => {
+            subtree_has_predicate_key(&apply.left, key)
+                || subtree_has_predicate_key(&apply.right, key)
+        }
+        LogicalPlan::AssertOneRow(assert) => subtree_has_predicate_key(&assert.input, key),
         LogicalPlan::Values(_)
         | LogicalPlan::GenerateSeries(_)
         | LogicalPlan::CTEConsume(_)

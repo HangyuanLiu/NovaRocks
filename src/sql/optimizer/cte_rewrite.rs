@@ -56,6 +56,11 @@ pub(crate) fn collect_cte_counts(plan: &LogicalPlan) -> CTEContext {
                 visit(&node.old_input, ctx);
                 visit(&node.delta_input, ctx);
             }
+            LogicalPlan::Apply(node) => {
+                visit(&node.left, ctx);
+                visit(&node.right, ctx);
+            }
+            LogicalPlan::AssertOneRow(node) => visit(&node.input, ctx),
             LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
                 panic!("imv marker leaked into non-IMV plan");
             }
@@ -216,6 +221,15 @@ pub(crate) fn inline_single_use_ctes(
                 output_columns: node.output_columns,
             }))
         }
+        LogicalPlan::Apply(node) => Ok(LogicalPlan::Apply(ApplyNode {
+            left: Box::new(inline_single_use_ctes(*node.left, ctx)?),
+            right: Box::new(inline_single_use_ctes(*node.right, ctx)?),
+            ..node
+        })),
+        LogicalPlan::AssertOneRow(node) => Ok(LogicalPlan::AssertOneRow(AssertOneRowNode {
+            input: Box::new(inline_single_use_ctes(*node.input, ctx)?),
+            ..node
+        })),
         LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
         }
@@ -361,6 +375,15 @@ fn replace_cte_consume(
                 output_columns: node.output_columns,
             }))
         }
+        LogicalPlan::Apply(node) => Ok(LogicalPlan::Apply(ApplyNode {
+            left: Box::new(replace_cte_consume(*node.left, cte_id, replacement)?),
+            right: Box::new(replace_cte_consume(*node.right, cte_id, replacement)?),
+            ..node
+        })),
+        LogicalPlan::AssertOneRow(node) => Ok(LogicalPlan::AssertOneRow(AssertOneRowNode {
+            input: Box::new(replace_cte_consume(*node.input, cte_id, replacement)?),
+            ..node
+        })),
         LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
         }

@@ -22,6 +22,7 @@ pub(crate) fn all_implementation_rules() -> Vec<Box<dyn Rule>> {
         Box::new(implement::AggToHashAgg),
         Box::new(implement::SortToPhysical),
         Box::new(implement::LimitToPhysical),
+        Box::new(implement::AssertOneRowToPhysical),
         Box::new(implement::TopNToPhysical), // NEW
         Box::new(implement::WindowToPhysical),
         Box::new(implement::CTEAnchorToPhysical),

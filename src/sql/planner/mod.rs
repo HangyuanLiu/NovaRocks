@@ -553,6 +553,12 @@ pub(crate) fn plan_output_columns(plan: &LogicalPlan) -> Result<Vec<OutputColumn
         LogicalPlan::CTEConsume(node) => Ok(node.output_columns.clone()),
         LogicalPlan::Decode(node) => Ok(node.output_columns.clone()),
         LogicalPlan::AggregateStateMerge(node) => Ok(node.output_columns.clone()),
+        LogicalPlan::Apply(node) => {
+            let mut columns = plan_output_columns(&node.left)?;
+            columns.push(node.output_column.clone());
+            Ok(columns)
+        }
+        LogicalPlan::AssertOneRow(node) => plan_output_columns(&node.input),
         LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
             Err("imv marker leaked into non-IMV planner output adaptation".to_string())
         }
@@ -3395,6 +3401,8 @@ mod tests {
                 LogicalPlan::AggregateStateMerge(node) => {
                     visit(&node.old_input).or_else(|| visit(&node.delta_input))
                 }
+                LogicalPlan::Apply(node) => visit(&node.left).or_else(|| visit(&node.right)),
+                LogicalPlan::AssertOneRow(node) => visit(&node.input),
                 LogicalPlan::Scan(_)
                 | LogicalPlan::Values(_)
                 | LogicalPlan::GenerateSeries(_)
@@ -3455,6 +3463,8 @@ mod tests {
                 LogicalPlan::AggregateStateMerge(node) => {
                     visit(&node.old_input).or_else(|| visit(&node.delta_input))
                 }
+                LogicalPlan::Apply(node) => visit(&node.left).or_else(|| visit(&node.right)),
+                LogicalPlan::AssertOneRow(node) => visit(&node.input),
                 LogicalPlan::Scan(_)
                 | LogicalPlan::Values(_)
                 | LogicalPlan::GenerateSeries(_)
@@ -3538,6 +3548,8 @@ mod tests {
                 LogicalPlan::AggregateStateMerge(node) => {
                     visit(&node.old_input).or_else(|| visit(&node.delta_input))
                 }
+                LogicalPlan::Apply(node) => visit(&node.left).or_else(|| visit(&node.right)),
+                LogicalPlan::AssertOneRow(node) => visit(&node.input),
                 LogicalPlan::Scan(_)
                 | LogicalPlan::Values(_)
                 | LogicalPlan::GenerateSeries(_)
@@ -3573,6 +3585,8 @@ mod tests {
                 LogicalPlan::AggregateStateMerge(node) => {
                     visit(&node.old_input).or_else(|| visit(&node.delta_input))
                 }
+                LogicalPlan::Apply(node) => visit(&node.left).or_else(|| visit(&node.right)),
+                LogicalPlan::AssertOneRow(node) => visit(&node.input),
                 LogicalPlan::Scan(_)
                 | LogicalPlan::Values(_)
                 | LogicalPlan::GenerateSeries(_)

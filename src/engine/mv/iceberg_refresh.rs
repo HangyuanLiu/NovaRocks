@@ -9438,6 +9438,11 @@ fn logical_plan_contains_aggregate_state_merge(
         LogicalPlan::Decode(n) => logical_plan_contains_aggregate_state_merge(&n.input),
         LogicalPlan::ImvDelta(n) => logical_plan_contains_aggregate_state_merge(&n.input),
         LogicalPlan::ImvVersion(n) => logical_plan_contains_aggregate_state_merge(&n.input),
+        LogicalPlan::Apply(n) => {
+            logical_plan_contains_aggregate_state_merge(&n.left)
+                || logical_plan_contains_aggregate_state_merge(&n.right)
+        }
+        LogicalPlan::AssertOneRow(n) => logical_plan_contains_aggregate_state_merge(&n.input),
         LogicalPlan::Scan(_)
         | LogicalPlan::Values(_)
         | LogicalPlan::GenerateSeries(_)

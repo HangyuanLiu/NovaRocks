@@ -55,7 +55,9 @@ fn verify_node(node: &PhysicalPlanNode) -> Result<HashSet<ColumnId>, String> {
             verify_sort_items(&op.items, input, "PhysicalTopN item")?;
             Ok(input.clone())
         }
-        Operator::PhysicalLimit(_) | Operator::PhysicalDistribution(_) => {
+        Operator::PhysicalLimit(_)
+        | Operator::PhysicalDistribution(_)
+        | Operator::PhysicalAssertOneRow(_) => {
             let input = only_child(&child_outputs, "pass-through physical node")?;
             if let Operator::PhysicalDistribution(op) = &node.op {
                 verify_distribution(op, input)?;

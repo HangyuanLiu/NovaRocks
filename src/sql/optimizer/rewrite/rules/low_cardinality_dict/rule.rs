@@ -64,6 +64,8 @@ fn contains_scan(plan: &LogicalPlan) -> bool {
         LogicalPlan::Union(node) => node.inputs.iter().any(contains_scan),
         LogicalPlan::Intersect(node) => node.inputs.iter().any(contains_scan),
         LogicalPlan::Except(node) => node.inputs.iter().any(contains_scan),
+        LogicalPlan::Apply(node) => contains_scan(&node.left) || contains_scan(&node.right),
+        LogicalPlan::AssertOneRow(node) => contains_scan(&node.input),
         LogicalPlan::Values(_) | LogicalPlan::GenerateSeries(_) | LogicalPlan::CTEConsume(_) => {
             false
         }

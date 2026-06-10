@@ -51,6 +51,11 @@ pub(crate) enum LogicalPlan {
     /// Logical IMV aggregate-state reconciliation over old target state and
     /// delta state. Execution lowering is added by later tasks.
     AggregateStateMerge(AggregateStateMergeNode),
+    /// Subquery glue node (outer ⋈ subquery). Eliminated by the
+    /// SubqueryRewrite stage; see ApplyNode.
+    Apply(ApplyNode),
+    /// At-most-one-row runtime guard for scalar subqueries.
+    AssertOneRow(AssertOneRowNode),
     /// IMV marker: "compute the incremental of input". Emitted by the
     /// `imv-delta-marker` stage; rejected by `imv-validation` if not
     /// consumed. Must never reach physical lowering. See
@@ -101,6 +106,73 @@ pub(crate) struct AggregateStateMergeNode {
     pub(crate) aggregate_state_names: Vec<String>,
     pub(crate) change_op_column: String,
     pub(crate) output_columns: Vec<OutputColumn>,
+}
+
+/// What the subquery expression looks like to its enclosing clause.
+/// M1 consumes the non-Scalar variants; remove the allow then.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ApplyKind {
+    Scalar,
+    Exists { negated: bool },
+    In { negated: bool },
+}
+
+/// Subquery glue node: left child = outer plan, right child = subquery plan.
+/// Built by the planner from analyzer-collected subquery metadata (M1);
+/// rewritten into join / aggregate / window shapes by the optimizer's
+/// SubqueryRewrite stage. Must never survive past that stage — the
+/// ApplyException rule and the optimize() backstop enforce this, and
+/// memo conversion panics on a leaked Apply as defence in depth.
+/// Field semantics mirror StarRocks LogicalApplyOperator; see the design doc
+/// docs/superpowers/specs/2026-06-10-apply-correlated-subquery-framework-design.md §5.1.
+/// M1 consumes the remaining fields; remove the allow then.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct ApplyNode {
+    pub left: Box<LogicalPlan>,
+    /// Subquery plan. May reference outer columns from
+    /// `correlation_column_ids` while the Apply is alive.
+    pub right: Box<LogicalPlan>,
+    pub kind: ApplyKind,
+    /// The expression the Apply was built from, written over the inner plan's
+    /// output columns (`lhs IN (inner_col)`, `EXISTS(inner_col)`, or a bare
+    /// `ColumnRef(inner_col)` for scalar subqueries).
+    pub subquery_expr: TypedExpr,
+    /// Fresh column standing in for the subquery's value in outer expressions.
+    pub output_column: OutputColumn,
+    /// Outer-side columns referenced inside the subquery.
+    pub correlation_column_ids: Vec<ColumnId>,
+    /// Correlated conjuncts hoisted out of the inner plan by the
+    /// SubqueryRewrite push-down rules (empty at construction).
+    pub correlation_conjuncts: Vec<TypedExpr>,
+    /// Uncorrelated residual predicate hoisted out of the inner plan.
+    pub residual_predicate: Option<TypedExpr>,
+    /// Scalar only: the subquery must still be runtime-checked to <= 1 row.
+    pub need_check_max_rows: bool,
+    /// True iff the subquery sits as a top-level AND conjunct of
+    /// WHERE / HAVING / JOIN-ON, so it may collapse into a semi/anti join.
+    pub use_semi_anti: bool,
+    /// For uncorrelated scalar subqueries used inside a predicate: the outer
+    /// sibling columns of that predicate (drives left-side Apply push-down).
+    pub uncorrelated_outer_predicate_columns: HashSet<ColumnId>,
+    /// Set by the Phase-1 column-pruning tagging pass; `None` means all columns required.
+    pub required_output_columns: Option<HashSet<ColumnId>>,
+}
+
+/// Runtime guard asserting its input yields at most one row (SQL scalar
+/// subquery cardinality rule). Lowered to thrift ASSERT_NUM_ROWS_NODE; the
+/// exec operator and FE-compat lowering already exist. Must not be reordered
+/// with Limit (a LIMIT above would mask the multi-row error).
+/// M1 produces this node from ScalarApplyToJoin; remove the allow then.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct AssertOneRowNode {
+    pub input: Box<LogicalPlan>,
+    /// Original subquery text used in the runtime error message.
+    pub subquery_text: String,
+    /// Set by the Phase-1 column-pruning tagging pass; `None` means all columns required.
+    pub required_output_columns: Option<HashSet<ColumnId>>,
 }
 
 /// Repeat node for ROLLUP/CUBE/GROUPING SETS.

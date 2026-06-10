@@ -63,7 +63,8 @@ pub(crate) fn compute_cost(
         | Operator::LogicalCTEProduce(_)
         | Operator::LogicalCTEConsume(_)
         | Operator::LogicalDecode(_)
-        | Operator::LogicalAggregateStateMerge(_) => 0.0,
+        | Operator::LogicalAggregateStateMerge(_)
+        | Operator::LogicalAssertOneRow(_) => 0.0,
 
         // ------------------------------------------------------------------
         // Physical operators
@@ -159,6 +160,8 @@ pub(crate) fn compute_cost(
         }
 
         Operator::PhysicalLimit(_) => 0.01,
+
+        Operator::PhysicalAssertOneRow(_) => 0.01,
 
         Operator::PhysicalCTEAnchor(_) => 0.0,
 

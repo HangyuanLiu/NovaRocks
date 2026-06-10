@@ -4,9 +4,9 @@ use crate::sql::optimizer::rewrite::context::{RewriteContext, RewriteFailurePoli
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
 use crate::sql::planner::plan::{
-    AggregateNode, AggregateStateMergeNode, CTEAnchorNode, CTEProduceNode, DecodeNode, ExceptNode,
-    FilterNode, IntersectNode, JoinNode, LimitNode, LogicalPlan, ProjectNode, RepeatPlanNode,
-    SortNode, TableFunctionNode, UnionNode, WindowNode,
+    AggregateNode, AggregateStateMergeNode, ApplyNode, AssertOneRowNode, CTEAnchorNode,
+    CTEProduceNode, DecodeNode, ExceptNode, FilterNode, IntersectNode, JoinNode, LimitNode,
+    LogicalPlan, ProjectNode, RepeatPlanNode, SortNode, TableFunctionNode, UnionNode, WindowNode,
 };
 
 pub(crate) fn rewrite_with_rule(
@@ -264,6 +264,28 @@ fn rewrite_children(
                     ..node
                 }),
                 old_changed || delta_changed,
+            ))
+        }
+        LogicalPlan::Apply(node) => {
+            let (left, left_changed) = rewrite_with_rule(*node.left, rule, ctx)?;
+            let (right, right_changed) = rewrite_with_rule(*node.right, rule, ctx)?;
+            Ok((
+                LogicalPlan::Apply(ApplyNode {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    ..node
+                }),
+                left_changed || right_changed,
+            ))
+        }
+        LogicalPlan::AssertOneRow(node) => {
+            let (input, changed) = rewrite_with_rule(*node.input, rule, ctx)?;
+            Ok((
+                LogicalPlan::AssertOneRow(AssertOneRowNode {
+                    input: Box::new(input),
+                    ..node
+                }),
+                changed,
             ))
         }
         LogicalPlan::ImvDelta(node) => {
@@ -585,6 +607,8 @@ mod tests {
                 | LogicalPlan::CTEConsume(_)
                 | LogicalPlan::Decode(_)
                 | LogicalPlan::AggregateStateMerge(_)
+                | LogicalPlan::Apply(_)
+                | LogicalPlan::AssertOneRow(_)
                 | LogicalPlan::ImvDelta(_)
                 | LogicalPlan::ImvVersion(_) => {}
             }

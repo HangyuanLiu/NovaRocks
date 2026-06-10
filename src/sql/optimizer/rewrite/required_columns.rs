@@ -62,6 +62,8 @@ pub(crate) fn tag_required_columns(
         LogicalPlan::Decode(_) => tag_decode(plan, parent_needed),
         LogicalPlan::AggregateStateMerge(_) => tag_aggregate_state_merge(plan, parent_needed),
         LogicalPlan::TableFunction(_) => tag_table_function(plan, parent_needed),
+        LogicalPlan::Apply(_) => tag_apply(plan, parent_needed),
+        LogicalPlan::AssertOneRow(_) => tag_assert_one_row(plan, parent_needed),
         LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
             panic!("imv marker should not appear in non-IMV column pruning")
         }
@@ -78,6 +80,33 @@ fn tag_aggregate_state_merge(
     node.old_input = Box::new(tag_required_columns(*node.old_input, None));
     node.delta_input = Box::new(tag_required_columns(*node.delta_input, None));
     LogicalPlan::AggregateStateMerge(node)
+}
+
+/// Apply is eliminated by the SubqueryRewrite stage, which runs before column
+/// pruning, so pruning never sees it in production plans. Tag conservatively:
+/// require everything below, prune nothing.
+fn tag_apply(plan: LogicalPlan, _parent_needed: Option<HashSet<ColumnId>>) -> LogicalPlan {
+    let LogicalPlan::Apply(mut node) = plan else {
+        unreachable!()
+    };
+    node.required_output_columns = None;
+    node.left = Box::new(tag_required_columns(*node.left, None));
+    node.right = Box::new(tag_required_columns(*node.right, None));
+    LogicalPlan::Apply(node)
+}
+
+/// Conservative: no pruning through AssertOneRow in M0. Tighten when M1
+/// starts producing this node in real plans.
+fn tag_assert_one_row(
+    plan: LogicalPlan,
+    _parent_needed: Option<HashSet<ColumnId>>,
+) -> LogicalPlan {
+    let LogicalPlan::AssertOneRow(mut node) = plan else {
+        unreachable!()
+    };
+    node.required_output_columns = None;
+    node.input = Box::new(tag_required_columns(*node.input, None));
+    LogicalPlan::AssertOneRow(node)
 }
 
 // ---------------------------------------------------------------------------
@@ -542,6 +571,11 @@ fn collect_cte_consumer_needs(plan: &LogicalPlan, target_id: CteId, acc: &mut Ha
             collect_cte_consumer_needs(&n.old_input, target_id, acc);
             collect_cte_consumer_needs(&n.delta_input, target_id, acc);
         }
+        LogicalPlan::Apply(n) => {
+            collect_cte_consumer_needs(&n.left, target_id, acc);
+            collect_cte_consumer_needs(&n.right, target_id, acc);
+        }
+        LogicalPlan::AssertOneRow(n) => collect_cte_consumer_needs(&n.input, target_id, acc),
         LogicalPlan::CTEProduce(p) => collect_cte_consumer_needs(&p.input, target_id, acc),
         LogicalPlan::CTEAnchor(a) => {
             // Recurse into the consumer side of nested CTEAnchors to find any
@@ -616,6 +650,11 @@ fn walk_consume_position_map(
             walk_consume_position_map(&n.old_input, target_id, map);
             walk_consume_position_map(&n.delta_input, target_id, map);
         }
+        LogicalPlan::Apply(n) => {
+            walk_consume_position_map(&n.left, target_id, map);
+            walk_consume_position_map(&n.right, target_id, map);
+        }
+        LogicalPlan::AssertOneRow(n) => walk_consume_position_map(&n.input, target_id, map),
         LogicalPlan::CTEProduce(p) => walk_consume_position_map(&p.input, target_id, map),
         LogicalPlan::CTEAnchor(a) => {
             walk_consume_position_map(&a.consumer, target_id, map);
@@ -668,6 +707,8 @@ fn subtree_untagged(plan: &LogicalPlan) -> bool {
         LogicalPlan::CTEProduce(n) => subtree_untagged(&n.input),
         LogicalPlan::Decode(n) => subtree_untagged(&n.input),
         LogicalPlan::AggregateStateMerge(n) => subtree_untagged(&n.old_input),
+        LogicalPlan::Apply(n) => subtree_untagged(&n.left),
+        LogicalPlan::AssertOneRow(n) => subtree_untagged(&n.input),
         LogicalPlan::TableFunction(n) => subtree_untagged(&n.input),
         LogicalPlan::Union(n) => n
             .inputs

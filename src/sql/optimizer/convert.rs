@@ -2,8 +2,8 @@
 
 use super::memo::{GroupId, MExpr, Memo};
 use super::operator::{
-    AggregateStateMergeOp, LogicalAggregateOp, LogicalCTEAnchorOp, LogicalCTEConsumeOp,
-    LogicalCTEProduceOp, LogicalDecodeOp, LogicalExceptOp, LogicalFilterOp,
+    AggregateStateMergeOp, LogicalAggregateOp, LogicalAssertOneRowOp, LogicalCTEAnchorOp,
+    LogicalCTEConsumeOp, LogicalCTEProduceOp, LogicalDecodeOp, LogicalExceptOp, LogicalFilterOp,
     LogicalGenerateSeriesOp, LogicalIntersectOp, LogicalJoinOp, LogicalLimitOp, LogicalProjectOp,
     LogicalRepeatOp, LogicalScanOp, LogicalSortOp, LogicalTableFunctionOp, LogicalUnionOp,
     LogicalValuesOp, LogicalWindowOp, Operator,
@@ -328,6 +328,25 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
             memo.new_group(expr)
         }
 
+        LogicalPlan::AssertOneRow(node) => {
+            let child = logical_plan_to_memo(&node.input, memo);
+            let op = Operator::LogicalAssertOneRow(LogicalAssertOneRowOp {
+                subquery_text: node.subquery_text.clone(),
+            });
+            let expr = MExpr {
+                id: memo.next_expr_id(),
+                op,
+                children: vec![child],
+            };
+            memo.new_group(expr)
+        }
+        LogicalPlan::Apply(_) => {
+            // Defence in depth: the SubqueryRewrite stage's ApplyException
+            // rule and the optimize() residual-Apply backstop (added later in
+            // M0) eliminate every Apply before this point. Reaching here means
+            // a planner bug, so fail loudly rather than mis-optimize.
+            panic!("apply operator must be eliminated by the SubqueryRewrite stage before memo conversion");
+        }
         LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
         }

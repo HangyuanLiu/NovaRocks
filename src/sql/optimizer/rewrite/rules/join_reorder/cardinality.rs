@@ -90,6 +90,17 @@ pub(crate) fn estimate_statistics(
                 column_statistics: HashMap::new(),
             }
         }
+        // Apply is row-preserving on the outer side for the estimator's
+        // purposes; join reorder never reorders through it anyway.
+        LogicalPlan::Apply(n) => estimate_statistics(&n.left, table_stats),
+        LogicalPlan::AssertOneRow(n) => {
+            let child = estimate_statistics(&n.input, table_stats);
+            Statistics {
+                output_row_count: child.output_row_count.min(1.0),
+                row_count_confidence: Confidence::Estimated,
+                column_statistics: HashMap::new(),
+            }
+        }
         LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
         }
