@@ -345,7 +345,9 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
             // rule and the optimize() residual-Apply backstop (added later in
             // M0) eliminate every Apply before this point. Reaching here means
             // a planner bug, so fail loudly rather than mis-optimize.
-            panic!("apply operator must be eliminated by the SubqueryRewrite stage before memo conversion");
+            panic!(
+                "apply operator must be eliminated by the SubqueryRewrite stage before memo conversion"
+            );
         }
         LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");

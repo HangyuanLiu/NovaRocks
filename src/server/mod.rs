@@ -1728,10 +1728,7 @@ mod tests {
     #[test]
     fn parse_set_string_csv_matches_subquery_unnest_mode() {
         assert_eq!(
-            parse_set_string_csv(
-                "SET subquery_unnest_mode = 'apply'",
-                "subquery_unnest_mode"
-            ),
+            parse_set_string_csv("SET subquery_unnest_mode = 'apply'", "subquery_unnest_mode"),
             Some(vec!["apply".to_string()]),
         );
         assert_eq!(

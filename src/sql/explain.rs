@@ -2008,8 +2008,9 @@ mod rf_explain_tests {
         let mut out = Vec::new();
         super::format_node(&plan, super::ExplainLevel::Normal, 0, &mut out);
         assert!(
-            out.iter()
-                .any(|line| line.contains("APPLY (NOT EXISTS, correlated=true, use_semi_anti=true)")),
+            out.iter().any(
+                |line| line.contains("APPLY (NOT EXISTS, correlated=true, use_semi_anti=true)")
+            ),
             "missing APPLY line: {out:?}"
         );
         assert!(

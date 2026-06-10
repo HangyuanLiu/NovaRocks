@@ -97,10 +97,7 @@ fn tag_apply(plan: LogicalPlan, _parent_needed: Option<HashSet<ColumnId>>) -> Lo
 
 /// Conservative: no pruning through AssertOneRow in M0. Tighten when M1
 /// starts producing this node in real plans.
-fn tag_assert_one_row(
-    plan: LogicalPlan,
-    _parent_needed: Option<HashSet<ColumnId>>,
-) -> LogicalPlan {
+fn tag_assert_one_row(plan: LogicalPlan, _parent_needed: Option<HashSet<ColumnId>>) -> LogicalPlan {
     let LogicalPlan::AssertOneRow(mut node) = plan else {
         unreachable!()
     };
