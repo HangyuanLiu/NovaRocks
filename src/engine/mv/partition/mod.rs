@@ -13,6 +13,5 @@ pub(crate) use derivation::{
     evaluate_partition_spec, resolve_partition_derivation_spec,
 };
 pub(crate) use key::{
-    AffectedMvPartitions, MvPartitionKey, MvPartitionKeyField, MvPartitionValue,
-    TargetPartitionFilter,
+    MvPartitionKey, MvPartitionKeyField, MvPartitionValue, TargetPartitionFilter,
 };

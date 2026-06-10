@@ -103,7 +103,7 @@ mod lifecycle_tests {
                     table: "base".to_string(),
                 }],
                 snapshot_pins: Default::default(),
-                affected_partitions: crate::engine::mv::partition::AffectedMvPartitions::unknown(
+                affected_partitions: crate::engine::mv::partition::AffectedTargetPartitions::not_derived(
                     "mock MV backend does not plan affected partitions",
                 ),
                 backend_plan: BackendRefreshPlan::StarRocks(StarRocksTableRefreshPlan {

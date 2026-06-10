@@ -264,7 +264,7 @@ impl MvBackend for StarRocksTableMvBackend {
                 table: req.statement.name.parts.join("."),
             }],
             snapshot_pins: Default::default(),
-            affected_partitions: crate::engine::mv::partition::AffectedMvPartitions::unknown(
+            affected_partitions: crate::engine::mv::partition::AffectedTargetPartitions::not_derived(
                 "StarRocks table MV partition planning is not implemented",
             ),
             backend_plan: BackendRefreshPlan::StarRocks(StarRocksTableRefreshPlan {

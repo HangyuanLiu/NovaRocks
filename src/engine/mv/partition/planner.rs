@@ -1,6 +1,6 @@
 use crate::connector::iceberg::changes::IcebergChangeBatch;
 use crate::engine::mv::partition::mapping::map_file_partition_to_mv_key;
-use crate::engine::mv::partition::{AffectedMvPartitions, MvPartitionKey};
+use crate::engine::mv::partition::{AffectedTargetPartitions, MvPartitionKey};
 use crate::meta::repository::mv_contract::MvSchemaContract;
 
 pub(crate) struct AffectedPartitionPlanInput<'a> {
@@ -10,17 +10,17 @@ pub(crate) struct AffectedPartitionPlanInput<'a> {
 
 pub(crate) fn plan_affected_partitions(
     input: &AffectedPartitionPlanInput<'_>,
-) -> AffectedMvPartitions {
+) -> AffectedTargetPartitions {
     if input.schema_contract.target.partition.is_none() {
-        return AffectedMvPartitions::Unpartitioned;
+        return AffectedTargetPartitions::Unpartitioned;
     }
     let Some(batch) = input.change_batch else {
-        return AffectedMvPartitions::unknown(
+        return AffectedTargetPartitions::not_derived(
             "full refresh affected partition planning is not implemented",
         );
     };
     if !batch.deletes.is_empty() || !batch.equality_deletes.is_empty() {
-        return AffectedMvPartitions::unknown(
+        return AffectedTargetPartitions::not_derived(
             "row-level delete affected partitions require row-evaluation fallback",
         );
     }
@@ -28,34 +28,34 @@ pub(crate) fn plan_affected_partitions(
     let mut new_partitions = Vec::<MvPartitionKey>::new();
     for file in &batch.inserts {
         let Some(spec_id) = file.partition_spec_id else {
-            return AffectedMvPartitions::unknown(format!(
+            return AffectedTargetPartitions::not_derived(format!(
                 "inserted data file {} is missing partition spec id",
                 file.path
             ));
         };
         match map_file_partition_to_mv_key(input.schema_contract, spec_id, &file.partition_values) {
             Ok(Some(key)) => new_partitions.push(key),
-            Ok(None) => return AffectedMvPartitions::Unpartitioned,
-            Err(reason) => return AffectedMvPartitions::unknown(reason),
+            Ok(None) => return AffectedTargetPartitions::Unpartitioned,
+            Err(reason) => return AffectedTargetPartitions::not_derived(reason),
         }
     }
 
     let mut old_partitions = Vec::<MvPartitionKey>::new();
     for file in &batch.deleted_data_files {
         let Some(spec_id) = file.partition_spec_id else {
-            return AffectedMvPartitions::unknown(format!(
+            return AffectedTargetPartitions::not_derived(format!(
                 "deleted data file {} is missing partition spec id",
                 file.path
             ));
         };
         match map_file_partition_to_mv_key(input.schema_contract, spec_id, &file.partition_values) {
             Ok(Some(key)) => old_partitions.push(key),
-            Ok(None) => return AffectedMvPartitions::Unpartitioned,
-            Err(reason) => return AffectedMvPartitions::unknown(reason),
+            Ok(None) => return AffectedTargetPartitions::Unpartitioned,
+            Err(reason) => return AffectedTargetPartitions::not_derived(reason),
         }
     }
 
-    AffectedMvPartitions::known(new_partitions, old_partitions)
+    AffectedTargetPartitions::known(new_partitions.into_iter().chain(old_partitions))
 }
 
 #[cfg(test)]
@@ -66,7 +66,7 @@ mod tests {
         IcebergChangeBatch, PositionDeleteRef,
     };
     use crate::engine::mv::partition::{
-        AffectedMvPartitions, MvPartitionKey, MvPartitionKeyField, MvPartitionValue,
+        AffectedTargetPartitions, MvPartitionKey, MvPartitionKeyField, MvPartitionValue,
     };
     use crate::meta::repository::mv_contract::{
         ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
@@ -210,22 +210,17 @@ mod tests {
             change_batch: Some(&batch),
         });
 
-        let AffectedMvPartitions::Known {
-            new_partitions,
-            old_partitions,
-        } = result
-        else {
+        let AffectedTargetPartitions::Known { partitions } = result else {
             panic!("expected known affected partitions");
         };
         assert_eq!(
-            new_partitions.into_iter().collect::<Vec<_>>(),
+            partitions.into_iter().collect::<Vec<_>>(),
             vec![mv_key("42")]
         );
-        assert!(old_partitions.is_empty());
     }
 
     #[test]
-    fn overwrite_diff_returns_new_and_old_partitions() {
+    fn overwrite_diff_returns_merged_partitions() {
         let contract = contract_with_identity_partition();
         let mut batch = change_batch();
         batch
@@ -240,21 +235,13 @@ mod tests {
             change_batch: Some(&batch),
         });
 
-        let AffectedMvPartitions::Known {
-            new_partitions,
-            old_partitions,
-        } = result
-        else {
+        let AffectedTargetPartitions::Known { partitions } = result else {
             panic!("expected known affected partitions");
         };
-        assert_eq!(
-            new_partitions.into_iter().collect::<Vec<_>>(),
-            vec![mv_key("42")]
-        );
-        assert_eq!(
-            old_partitions.into_iter().collect::<Vec<_>>(),
-            vec![mv_key("24")]
-        );
+        let partitions: Vec<_> = partitions.into_iter().collect();
+        assert!(partitions.contains(&mv_key("42")));
+        assert!(partitions.contains(&mv_key("24")));
+        assert_eq!(partitions.len(), 2);
     }
 
     #[test]
@@ -278,7 +265,7 @@ mod tests {
         });
 
         assert_eq!(
-            result.unknown_reason(),
+            result.not_derived_reason(),
             Some("row-level delete affected partitions require row-evaluation fallback")
         );
     }
@@ -298,7 +285,7 @@ mod tests {
 
         assert!(
             result
-                .unknown_reason()
+                .not_derived_reason()
                 .is_some_and(|reason| reason.contains("missing partition spec id"))
         );
     }
@@ -314,6 +301,6 @@ mod tests {
             change_batch: Some(&batch),
         });
 
-        assert_eq!(result, AffectedMvPartitions::Unpartitioned);
+        assert_eq!(result, AffectedTargetPartitions::Unpartitioned);
     }
 }
