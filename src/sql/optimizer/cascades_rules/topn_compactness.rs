@@ -1,7 +1,9 @@
 use crate::sql::optimizer::memo::{MExpr, Memo};
 use crate::sql::optimizer::operator::{LogicalTopNOp, Operator, TopNPhase};
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
-use crate::sql::optimizer::topn_proof::{TopNWindow, sort_items_to_keys, sort_keys_equivalent};
+use crate::sql::optimizer::topn_proof::{
+    TopNWindow, ordering_covers, sort_items_to_keys, sort_keys_equivalent,
+};
 
 pub(crate) struct MergeConsecutiveTopN;
 
@@ -20,6 +22,26 @@ impl Rule for MergeConsecutiveTopN {
 
     fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
         merge_consecutive_topn(expr, memo)
+    }
+}
+
+pub(crate) struct RemoveRedundantSortUnderTopN;
+
+impl Rule for RemoveRedundantSortUnderTopN {
+    fn name(&self) -> &str {
+        "RemoveRedundantSortUnderTopN"
+    }
+
+    fn rule_type(&self) -> RuleType {
+        RuleType::Transformation
+    }
+
+    fn matches(&self, op: &Operator) -> bool {
+        matches!(op, Operator::LogicalTopN(_))
+    }
+
+    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
+        remove_redundant_sort_under_topn(expr, memo)
     }
 }
 
@@ -84,6 +106,50 @@ fn merge_consecutive_topn(expr: &MExpr, memo: &Memo) -> Vec<NewExpr> {
     results
 }
 
+fn remove_redundant_sort_under_topn(expr: &MExpr, memo: &Memo) -> Vec<NewExpr> {
+    let Operator::LogicalTopN(topn) = &expr.op else {
+        return vec![];
+    };
+    if expr.children.len() != 1 {
+        return vec![];
+    }
+    let Some(topn_keys) = sort_items_to_keys(&topn.items) else {
+        return vec![];
+    };
+    let Some(child_group) = memo.groups.get(expr.children[0]) else {
+        return vec![];
+    };
+    let equivalences = child_group
+        .logical_props
+        .as_ref()
+        .map(|props| &props.equivalence_classes);
+
+    let mut results = Vec::new();
+    for child_expr in child_group.logical_exprs.iter() {
+        let Operator::LogicalSort(sort) = &child_expr.op else {
+            continue;
+        };
+        if !sort.analytic_partition_exprs.is_empty() {
+            continue;
+        }
+        if child_expr.children.len() != 1 {
+            continue;
+        }
+        let Some(sort_keys) = sort_items_to_keys(&sort.items) else {
+            continue;
+        };
+        if !ordering_covers(&sort_keys, &topn_keys, equivalences) {
+            continue;
+        }
+
+        results.push(NewExpr {
+            op: Operator::LogicalTopN(topn.clone()),
+            children: child_expr.children.clone(),
+        });
+    }
+    results
+}
+
 fn topn_phase_can_merge(outer: &LogicalTopNOp, inner: &LogicalTopNOp) -> bool {
     matches!(
         (outer.phase, inner.phase, outer.is_split, inner.is_split),
@@ -98,7 +164,7 @@ mod tests {
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
-    use crate::sql::optimizer::operator::{LogicalScanOp, LogicalTopNOp, TopNPhase};
+    use crate::sql::optimizer::operator::{LogicalScanOp, LogicalSortOp, LogicalTopNOp, TopNPhase};
     use arrow::datatypes::DataType;
 
     fn col(id: u32) -> TypedExpr {
@@ -185,6 +251,28 @@ mod tests {
             is_split,
             child_group,
         )
+    }
+
+    fn sort_with_items(memo: &Memo, items: Vec<SortItem>, child_group: usize) -> MExpr {
+        MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalSort(LogicalSortOp {
+                items,
+                analytic_partition_exprs: Vec::new(),
+            }),
+            children: vec![child_group],
+        }
+    }
+
+    fn analytic_sort_with_items(memo: &Memo, items: Vec<SortItem>, child_group: usize) -> MExpr {
+        MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalSort(LogicalSortOp {
+                items,
+                analytic_partition_exprs: vec![col(2)],
+            }),
+            children: vec![child_group],
+        }
     }
 
     #[test]
@@ -297,5 +385,65 @@ mod tests {
 
         assert_eq!(out.len(), 1, "equivalent sort keys should allow merge");
         assert_eq!(out[0].children, vec![scan_group]);
+    }
+
+    #[test]
+    fn removes_plain_sort_under_matching_topn() {
+        let mut memo = Memo::new();
+        let scan_group = scan_group(&mut memo);
+        let sort_group = memo.new_group(sort_with_items(&memo, vec![sort_item(1)], scan_group));
+        let topn = topn(&memo, 10, 0, TopNPhase::Final, false, sort_group);
+
+        let out = RemoveRedundantSortUnderTopN.apply(&topn, &mut memo);
+
+        assert_eq!(out.len(), 1, "matching plain Sort should be elided");
+        match &out[0].op {
+            Operator::LogicalTopN(rewritten) => {
+                assert_eq!(rewritten.limit, Some(10));
+                assert_eq!(rewritten.offset, Some(0));
+                assert_eq!(rewritten.phase, TopNPhase::Final);
+                assert!(!rewritten.is_split);
+            }
+            other => panic!("expected LogicalTopN, got {other:?}"),
+        }
+        assert_eq!(
+            out[0].children,
+            vec![scan_group],
+            "rewritten TopN should bypass the redundant Sort"
+        );
+    }
+
+    #[test]
+    fn does_not_remove_analytic_partition_sort_under_topn() {
+        let mut memo = Memo::new();
+        let scan_group = scan_group(&mut memo);
+        let sort_group = memo.new_group(analytic_sort_with_items(
+            &memo,
+            vec![sort_item(1)],
+            scan_group,
+        ));
+        let topn = topn(&memo, 10, 0, TopNPhase::Final, false, sort_group);
+
+        let out = RemoveRedundantSortUnderTopN.apply(&topn, &mut memo);
+
+        assert!(
+            out.is_empty(),
+            "analytic partition sort carries distribution semantics and must not be elided"
+        );
+    }
+
+    #[test]
+    fn does_not_remove_sort_when_ordering_does_not_cover_topn() {
+        let mut memo = Memo::new();
+        let scan_group = scan_group(&mut memo);
+        let sort_group = memo.new_group(sort_with_items(&memo, vec![sort_item(2)], scan_group));
+        let topn = topn(&memo, 10, 0, TopNPhase::Final, false, sort_group);
+
+        let out = RemoveRedundantSortUnderTopN.apply(&topn, &mut memo);
+
+        assert!(
+            out.is_empty(),
+            "Sort ordering must cover TopN ordering before the Sort can be elided"
+        );
     }
 }
