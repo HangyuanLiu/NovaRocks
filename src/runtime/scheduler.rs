@@ -631,6 +631,7 @@ mod tests {
             desc_tbl: minimal_desc_tbl(),
             exec_params: minimal_exec_params(scan_ranges),
             output_sink: minimal_noop_sink(),
+            output_exprs: None,
             output_columns: vec![],
             direct_exec: None,
             cte_id: None,

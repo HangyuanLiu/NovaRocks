@@ -334,7 +334,7 @@ impl ExecutionCoordinator {
 
                 let thrift_fragment = planner::TPlanFragment::new(
                     Some(fr.plan.clone()),
-                    None::<Vec<crate::exprs::TExpr>>,
+                    fr.output_exprs.clone(),
                     Some(output_sink),
                     fragment_partition,
                     None::<i64>,
@@ -589,10 +589,9 @@ fn local_coordinator_report_addr() -> Result<types::TNetworkAddress, String> {
     let cfg = crate::novarocks_config::config()
         .map_err(|e| format!("cannot read coordinator config: {e}"))?;
     let host = crate::common::network::advertise_host().unwrap_or_else(|_| cfg.server.host.clone());
-    Ok(types::TNetworkAddress::new(
-        host,
-        cfg.server.http_port as i32,
-    ))
+    let port =
+        crate::service::grpc_server::grpc_server_bound_port().unwrap_or(cfg.server.http_port);
+    Ok(types::TNetworkAddress::new(host, port as i32))
 }
 
 /// Assemble the per-instance `TRuntimeFilterParams` from scheduler-provided

@@ -37,6 +37,7 @@ use thrift::transport::{TBufferChannel, TIoChannel};
 
 use crate::common::ids::SlotId;
 use crate::common::thrift::thrift_binary_deserialize;
+use crate::common::types::UniqueId;
 use crate::exec::chunk::Chunk;
 use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
 use crate::exec::node::{ExecPlan, push_down_local_runtime_filters};
@@ -374,6 +375,41 @@ fn cancel_all_submitted(state: &InProcessState) {
     }
 }
 
+fn register_in_process_report_instance(
+    params: &internal_service::TExecPlanFragmentParams,
+    finst_id: UniqueId,
+    query_id: QueryId,
+) {
+    let backend_num = params.backend_num;
+    if let (Some(report_addr), Some(backend_num)) =
+        (params.novarocks_report_addr.clone(), backend_num)
+    {
+        crate::service::fe_report::register_novarocks_instance(
+            finst_id,
+            query_id,
+            report_addr,
+            backend_num,
+            false,
+            None,
+            None,
+            None,
+            None,
+        );
+    } else if let (Some(coord), Some(backend_num)) = (params.coord.clone(), backend_num) {
+        crate::service::fe_report::register_instance(
+            finst_id,
+            query_id,
+            coord,
+            backend_num,
+            false,
+            None,
+            None,
+            None,
+            None,
+        );
+    }
+}
+
 fn record_fragment_error(state: &InProcessState, query_key: QueryKey, msg: String) {
     let msg = {
         let mut guard = state.fragment_errors.lock().expect("fragment_errors lock");
@@ -475,7 +511,18 @@ impl FragmentDispatcher for InProcessDispatcher {
             // Non-root fragment path: execute_plan_fragment_sync in a thread.
             let state = Arc::clone(&self.state);
             std::thread::spawn(move || {
+                let finst_id = UniqueId {
+                    hi: finst_key.0,
+                    lo: finst_key.1,
+                };
+                let query_id = QueryId {
+                    hi: query_key.0,
+                    lo: query_key.1,
+                };
+                register_in_process_report_instance(&params, finst_id, query_id);
                 let result = crate::service::internal_service::execute_plan_fragment_sync(params);
+                let report_error = result.as_ref().err().cloned();
+                crate::service::fe_report::report_fragment_done(finst_id, report_error.clone());
                 if let Err(e) = result {
                     warn!("{}", format_fragment_error(finst_key, &e));
                     record_fragment_error(&state, query_key, e);
@@ -1596,6 +1643,26 @@ mod tests {
             err.kind,
             crate::runtime::result_buffer::FetchErrorKind::Cancelled
         ));
+    }
+
+    #[test]
+    fn in_process_non_result_fragment_reports_done() {
+        let dispatcher = InProcessDispatcher::default();
+        let finst_id = crate::common::types::UniqueId { hi: 701, lo: 801 };
+        crate::runtime::sink_commit::register(finst_id);
+
+        dispatcher
+            .submit_fragment(0, make_noop_sink_params(finst_id.hi, finst_id.lo))
+            .expect("submit noop fragment");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while crate::runtime::sink_commit::contains(finst_id) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "non-result fragment completion must report done and clear sink commit state"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[test]

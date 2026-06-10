@@ -100,6 +100,10 @@ pub(crate) trait IcebergWriteTransactionExecutor {
 
     /// Post-commit finalization (cache invalidation, dictionary stale marking).
     fn finalize(&self, spec: &IcebergWriteTransactionSpec) -> Result<(), String>;
+
+    fn has_preloaded_commit_output(&self) -> bool {
+        false
+    }
 }
 
 /// Reusable Iceberg commit/finalize context for coordinated writer output.
@@ -197,29 +201,50 @@ pub(crate) fn current_unix_millis() -> i64 {
         .unwrap_or(0)
 }
 
-/// Synthetic writer outcome for local standalone write executors that already
-/// injected full-fidelity file metadata into their commit collector.
-pub(crate) fn synthetic_write_commit_input() -> WriteCommitInput {
-    let write_id = synthetic_unique_id();
+pub(crate) fn new_local_writer_write_id() -> crate::types::TUniqueId {
+    synthetic_unique_id()
+}
+
+pub(crate) fn local_writer_commit_input(
+    write_id: crate::types::TUniqueId,
+    sink_commit_infos: Vec<crate::types::TSinkCommitInfo>,
+) -> WriteCommitInput {
     let writer_key = WriterKey {
         query_id: write_id.clone(),
         fragment_instance_id: write_id.clone(),
         backend_num: 0,
     };
+    let loaded_rows = sink_commit_infos
+        .iter()
+        .filter_map(|info| info.iceberg_data_file.as_ref())
+        .filter_map(|file| file.record_count)
+        .sum();
+    let loaded_bytes = sink_commit_infos
+        .iter()
+        .filter_map(|info| info.iceberg_data_file.as_ref())
+        .filter_map(|file| file.file_size_in_bytes)
+        .sum();
     WriteCommitInput {
         write_id,
         writers: vec![WriterCommitInput {
             writer_id: 0,
             writer_key,
-            sink_commit_infos: Vec::new(),
+            sink_commit_infos,
             tablet_commit_infos: Vec::new(),
             tablet_fail_infos: Vec::new(),
             load_counters: BTreeMap::new(),
-            loaded_rows: 0,
-            loaded_bytes: 0,
+            loaded_rows,
+            loaded_bytes,
             filtered_rows: 0,
         }],
     }
+}
+
+pub(crate) fn write_commit_has_files(write_commit: &WriteCommitInput) -> bool {
+    write_commit
+        .writers
+        .iter()
+        .any(|writer| !writer.sink_commit_infos.is_empty())
 }
 
 fn synthetic_unique_id() -> crate::types::TUniqueId {
@@ -273,11 +298,11 @@ impl<'a, E: IcebergWriteTransactionExecutor> IcebergWriteTransactionRunner<'a, E
             ));
         }
 
-        let Some(write_commit) = written
-            .write_commit
-            .as_ref()
-            .filter(|c| !c.writers.is_empty())
-        else {
+        let Some(write_commit) = written.write_commit.as_ref().filter(|c| {
+            write_commit_has_files(c)
+                || self.executor.has_preloaded_commit_output()
+                || !matches!(spec.commit.commit_op_kind, CommitOpKind::FastAppend)
+        }) else {
             self.transition(operation_id, IcebergOperationState::Aborting)?;
             self.transition(operation_id, IcebergOperationState::Aborted)?;
             return Ok(IcebergWriteTransactionOutcome {
@@ -464,10 +489,34 @@ mod tests {
         crate::engine::write_operation_lifecycle::test_support::write_commit_with_data_file()
     }
 
+    fn write_commit_with_writer_without_files() -> WriteCommitInput {
+        let write_id = crate::types::TUniqueId::new(10, 20);
+        let writer_key = WriterKey {
+            query_id: write_id.clone(),
+            fragment_instance_id: crate::types::TUniqueId::new(101, 201),
+            backend_num: 0,
+        };
+        WriteCommitInput {
+            write_id,
+            writers: vec![WriterCommitInput {
+                writer_id: 0,
+                writer_key,
+                sink_commit_infos: Vec::new(),
+                tablet_commit_infos: Vec::new(),
+                tablet_fail_infos: Vec::new(),
+                load_counters: BTreeMap::new(),
+                loaded_rows: 0,
+                loaded_bytes: 0,
+                filtered_rows: 0,
+            }],
+        }
+    }
+
     struct FakeExecutor {
         write: RefCell<Option<Result<CoordinatedQueryResult, String>>>,
         commit: RefCell<Option<Result<CommitOutcome, CommitServiceError>>>,
         finalize: Result<(), String>,
+        preloaded_commit_output: bool,
     }
 
     impl IcebergWriteTransactionExecutor for FakeExecutor {
@@ -495,6 +544,10 @@ mod tests {
         fn finalize(&self, _spec: &IcebergWriteTransactionSpec) -> Result<(), String> {
             self.finalize.clone()
         }
+
+        fn has_preloaded_commit_output(&self) -> bool {
+            self.preloaded_commit_output
+        }
     }
 
     fn one_writer_abort() -> crate::runtime::write_coordinator::WriteAbortInput {
@@ -515,6 +568,7 @@ mod tests {
                 written_manifest_paths: vec!["s3://bucket/m.avro".to_string()],
             }))),
             finalize: Ok(()),
+            preloaded_commit_output: false,
         };
         let runner = IcebergWriteTransactionRunner::new(Arc::clone(&env.state), &exec);
         let outcome = runner.run(sample_spec()).expect("run");
@@ -546,6 +600,7 @@ mod tests {
             }))),
             commit: RefCell::new(None),
             finalize: Ok(()),
+            preloaded_commit_output: false,
         };
         let runner = IcebergWriteTransactionRunner::new(Arc::clone(&env.state), &exec);
         let err = runner.run(sample_spec()).expect_err("abort surfaces error");
@@ -567,6 +622,7 @@ mod tests {
             write: RefCell::new(Some(Err("coordinated write failed".to_string()))),
             commit: RefCell::new(None),
             finalize: Ok(()),
+            preloaded_commit_output: false,
         };
         let runner = IcebergWriteTransactionRunner::new(Arc::clone(&env.state), &exec);
         let err = runner
@@ -609,6 +665,7 @@ mod tests {
                 },
             }))),
             finalize: Ok(()),
+            preloaded_commit_output: false,
         };
         let runner = IcebergWriteTransactionRunner::new(Arc::clone(&env.state), &exec);
         let err = runner
@@ -646,6 +703,7 @@ mod tests {
                 },
             }))),
             finalize: Err("finalize must not be called".to_string()),
+            preloaded_commit_output: false,
         };
         let runner = IcebergWriteTransactionRunner::new(Arc::clone(&env.state), &exec);
         let _ = runner
@@ -676,6 +734,7 @@ mod tests {
                 written_manifest_paths: Vec::new(),
             }))),
             finalize: Err("cache invalidation failed".to_string()),
+            preloaded_commit_output: false,
         };
         let runner = IcebergWriteTransactionRunner::new(Arc::clone(&env.state), &exec);
         let err = runner
@@ -696,6 +755,29 @@ mod tests {
     }
 
     #[test]
+    fn local_writer_commit_input_carries_sink_commit_infos() {
+        let write_id = crate::types::TUniqueId::new(41, 42);
+        let sink_commit_info = crate::types::TSinkCommitInfo {
+            iceberg_data_file: Some(crate::types::TIcebergDataFile {
+                path: Some("file:///t/data-1.parquet".to_string()),
+                record_count: Some(3),
+                file_size_in_bytes: Some(30),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let commit = local_writer_commit_input(write_id.clone(), vec![sink_commit_info.clone()]);
+
+        assert!(write_commit_has_files(&commit));
+        assert_eq!(commit.write_id, write_id);
+        assert_eq!(commit.writers.len(), 1);
+        assert_eq!(commit.writers[0].sink_commit_infos, vec![sink_commit_info]);
+        assert_eq!(commit.writers[0].loaded_rows, 3);
+        assert_eq!(commit.writers[0].loaded_bytes, 30);
+    }
+
+    #[test]
     fn empty_write_transitions_to_aborted_with_no_committed_outcome() {
         let env = test_env();
         let exec = FakeExecutor {
@@ -706,6 +788,7 @@ mod tests {
             }))),
             commit: RefCell::new(None),
             finalize: Ok(()),
+            preloaded_commit_output: false,
         };
         let runner = IcebergWriteTransactionRunner::new(Arc::clone(&env.state), &exec);
         let outcome = runner.run(sample_spec()).expect("empty is OK");
@@ -719,5 +802,67 @@ mod tests {
             .expect("load")
             .expect("present");
         assert_eq!(stored.state, IcebergOperationState::Aborted);
+    }
+
+    #[test]
+    fn runner_treats_writers_without_files_as_empty_write() {
+        let env = test_env();
+        let exec = FakeExecutor {
+            write: RefCell::new(Some(Ok(CoordinatedQueryResult {
+                query_result: empty_query_result(),
+                write_commit: Some(write_commit_with_writer_without_files()),
+                write_abort: None,
+            }))),
+            commit: RefCell::new(None),
+            finalize: Ok(()),
+            preloaded_commit_output: false,
+        };
+        let runner = IcebergWriteTransactionRunner::new(Arc::clone(&env.state), &exec);
+        let outcome = runner
+            .run(sample_spec())
+            .expect("writer with no data files is an empty write");
+        assert_eq!(outcome.operation_id, None);
+        assert_eq!(outcome.committed_snapshot_id, None);
+
+        let read = env.provider.begin_read().expect("read txn");
+        let stored = env
+            .state
+            .iceberg_operation_repo
+            .load_operation(read.as_ref(), 1)
+            .expect("load")
+            .expect("present");
+        assert_eq!(stored.state, IcebergOperationState::Aborted);
+    }
+
+    #[test]
+    fn runner_commits_fast_append_with_preloaded_local_output() {
+        let env = test_env();
+        let exec = FakeExecutor {
+            write: RefCell::new(Some(Ok(CoordinatedQueryResult {
+                query_result: empty_query_result(),
+                write_commit: Some(write_commit_with_writer_without_files()),
+                write_abort: None,
+            }))),
+            commit: RefCell::new(Some(Ok(CommitOutcome {
+                new_snapshot_id: 4321,
+                written_manifest_paths: vec!["s3://bucket/preloaded.avro".to_string()],
+            }))),
+            finalize: Ok(()),
+            preloaded_commit_output: true,
+        };
+        let runner = IcebergWriteTransactionRunner::new(Arc::clone(&env.state), &exec);
+        let outcome = runner
+            .run(sample_spec())
+            .expect("preloaded local output must be committed");
+        assert_eq!(outcome.committed_snapshot_id, Some(4321));
+
+        let read = env.provider.begin_read().expect("read txn");
+        let stored = env
+            .state
+            .iceberg_operation_repo
+            .load_operation(read.as_ref(), outcome.operation_id.expect("operation id"))
+            .expect("load")
+            .expect("present");
+        assert_eq!(stored.state, IcebergOperationState::Finalized);
     }
 }

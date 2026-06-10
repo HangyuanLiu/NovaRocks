@@ -604,6 +604,7 @@ struct TIcebergDataFile {
     11: optional i64 first_row_id;
     12: optional list<i32> equality_ids;
     13: optional binary key_metadata;
+    14: optional i32 partition_spec_id;
 }
 
 struct THiveFileInfo {

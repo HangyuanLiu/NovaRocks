@@ -20,7 +20,9 @@ use crate::connector::iceberg::commit::{
     execute_ref_action, publish_staging_branch_to_main, run_iceberg_commit,
     snapshot_matches_refresh_marker,
 };
-use crate::connector::iceberg::data_writer::write_record_batches_as_data_files;
+use crate::connector::iceberg::data_writer::{
+    write_record_batches_as_data_files, written_file_to_sink_commit_info_for_metadata,
+};
 use crate::connector::starrocks::table::model::{IcebergTableRef, StarRocksMvStorageEngine};
 use crate::connector::starrocks::table::mv_ddl::{
     MvAnalysis, analyze_mv_select, canonicalize_iceberg_mv_select_query, now_ms,
@@ -7814,13 +7816,7 @@ async fn commit_iceberg_mv_target_files_with_ref(
         staging_dir,
         crate::common::types::UniqueId { hi: 0, lo: 0 },
     ));
-    let default_spec_id = metadata.default_partition_spec_id();
-    for df in data_files {
-        collector.inject_written_file(crate::engine::iceberg_writer::data_file_to_written_file(
-            &df,
-            default_spec_id,
-        )?);
-    }
+    inject_iceberg_mv_data_file_reports(&collector, metadata, data_files)?;
 
     let abort_cleanup =
         crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(entry)?;
@@ -8053,13 +8049,7 @@ async fn commit_iceberg_mv_apply_with_ref(
         staging_dir,
         crate::common::types::UniqueId { hi: 0, lo: 0 },
     ));
-    let default_spec_id = metadata.default_partition_spec_id();
-    for df in data_files {
-        collector.inject_written_file(crate::engine::iceberg_writer::data_file_to_written_file(
-            &df,
-            default_spec_id,
-        )?);
-    }
+    inject_iceberg_mv_data_file_reports(&collector, metadata, data_files)?;
     for group in delete_groups {
         collector.inject_delete_group(group);
     }
@@ -8121,6 +8111,23 @@ async fn commit_iceberg_mv_apply_with_ref(
             })?;
     }
     Ok(outcome)
+}
+
+fn inject_iceberg_mv_data_file_reports(
+    collector: &IcebergCommitCollector,
+    metadata: &iceberg::spec::TableMetadata,
+    data_files: Vec<DataFile>,
+) -> Result<(), String> {
+    let default_spec_id = metadata.default_partition_spec_id();
+    let sink_commit_infos = data_files
+        .into_iter()
+        .map(|df| {
+            let written =
+                crate::engine::iceberg_writer::data_file_to_written_file(&df, default_spec_id)?;
+            written_file_to_sink_commit_info_for_metadata(&written, metadata)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    collector.inject_sink_commit_infos(sink_commit_infos)
 }
 
 fn derive_refresh_contract_for_strategy_dispatch(

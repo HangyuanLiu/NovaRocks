@@ -24,6 +24,20 @@ impl DescriptorTableBuilder {
         }
     }
 
+    pub(crate) fn from_existing(desc_tbl: descriptors::TDescriptorTable) -> Self {
+        let table_ids = desc_tbl
+            .table_descriptors
+            .as_ref()
+            .map(|tables| tables.iter().map(|table| table.id).collect())
+            .unwrap_or_default();
+        Self {
+            slots: desc_tbl.slot_descriptors.unwrap_or_default(),
+            tuples: desc_tbl.tuple_descriptors,
+            tables: desc_tbl.table_descriptors.unwrap_or_default(),
+            table_ids,
+        }
+    }
+
     pub fn add_slot(
         &mut self,
         slot_id: types::TSlotId,
@@ -131,6 +145,34 @@ impl DescriptorTableBuilder {
         table: &TableDef,
         iceberg: &crate::sql::catalog::IcebergTableInfo,
     ) {
+        self.add_iceberg_table_with_partition_info(table_id, db_name, table, iceberg, Vec::new());
+    }
+
+    pub(crate) fn add_iceberg_target_table(
+        &mut self,
+        table_id: types::TTableId,
+        db_name: &str,
+        table: &TableDef,
+        iceberg: &crate::sql::catalog::IcebergTableInfo,
+        partition_info: Vec<descriptors::TIcebergPartitionInfo>,
+    ) {
+        self.add_iceberg_table_with_partition_info(
+            table_id,
+            db_name,
+            table,
+            iceberg,
+            partition_info,
+        );
+    }
+
+    fn add_iceberg_table_with_partition_info(
+        &mut self,
+        table_id: types::TTableId,
+        db_name: &str,
+        table: &TableDef,
+        iceberg: &crate::sql::catalog::IcebergTableInfo,
+        partition_info: Vec<descriptors::TIcebergPartitionInfo>,
+    ) {
         if !self.table_ids.insert(table_id) {
             return;
         }
@@ -166,7 +208,7 @@ impl DescriptorTableBuilder {
             None::<descriptors::TCompressedPartitionMap>,
             None::<std::collections::BTreeMap<i64, descriptors::THdfsPartition>>,
             None::<descriptors::TIcebergSchema>,
-            None::<Vec<descriptors::TIcebergPartitionInfo>>,
+            (!partition_info.is_empty()).then_some(partition_info),
             None::<descriptors::TSortOrder>,
         );
         self.tables.push(descriptors::TTableDescriptor::new(
@@ -428,5 +470,55 @@ mod tests {
         let json = thrift.initial_default_json.expect("present");
         let decoded: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(decoded.as_str(), Some("a\nb\\c\"d"));
+    }
+
+    #[test]
+    fn target_iceberg_descriptor_preserves_partition_info() {
+        let mut builder = DescriptorTableBuilder::new();
+        let iceberg = test_iceberg_table_info(IcebergSchemaDef {
+            fields: vec![IcebergSchemaFieldDef {
+                field_id: 1,
+                name: "id".to_string(),
+                initial_default: None,
+                write_default: None,
+                initial_default_json: None,
+                children: vec![],
+            }],
+        });
+        let table = TableDef {
+            name: "orders".to_string(),
+            columns: vec![ColumnDef {
+                name: "id".to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+                write_default: None,
+                logical_type: None,
+            }],
+            iceberg_row_lineage_metadata_columns: vec![],
+            source: ScanSource::IcebergDataFiles {
+                table: iceberg.clone(),
+                files: vec![],
+                cloud_properties: Default::default(),
+                binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+            },
+        };
+        let partition_info = vec![descriptors::TIcebergPartitionInfo::new(
+            Some("id".to_string()),
+            Some("id".to_string()),
+            Some("identity".to_string()),
+            None::<crate::exprs::TExpr>,
+        )];
+
+        builder.add_iceberg_target_table(99, "db", &table, &iceberg, partition_info);
+        let desc = builder.build();
+        let tables = desc.table_descriptors.expect("table descriptors");
+        let iceberg_table = tables[0].iceberg_table.as_ref().expect("iceberg table");
+        let partitions = iceberg_table
+            .partition_info
+            .as_ref()
+            .expect("partition info");
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions[0].source_column_name.as_deref(), Some("id"));
+        assert_eq!(partitions[0].transform_expr.as_deref(), Some("identity"));
     }
 }

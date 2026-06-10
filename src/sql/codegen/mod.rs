@@ -9,6 +9,7 @@ pub(crate) mod expr_compiler;
 pub(crate) mod fallback_audit;
 pub(crate) mod fragment_builder;
 pub(crate) mod helpers;
+pub(crate) mod iceberg_write_sink;
 pub(crate) mod id_binding_verifier;
 pub(crate) mod nodes;
 pub(crate) mod resolve;
@@ -127,6 +128,7 @@ pub(crate) struct FragmentBuildResult {
     #[allow(dead_code)]
     // populated by fragment builder, will be read when standalone multi-fragment execution is wired
     pub output_sink: data_sinks::TDataSink,
+    pub output_exprs: Option<Vec<crate::exprs::TExpr>>,
     pub output_columns: Vec<OutputColumn>,
     pub direct_exec: Option<Box<DirectExecPlan>>,
     /// CTE ID if this is a multicast fragment.

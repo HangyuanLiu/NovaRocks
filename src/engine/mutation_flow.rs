@@ -20,7 +20,7 @@ use crate::connector::iceberg::data_writer::{RowLineageColumns, RowLineageWriteB
 use crate::engine::write_transaction::{
     IcebergWriteCommitExecutor, IcebergWriteCommitPolicy, IcebergWriteSource,
     IcebergWriteTransactionExecutor, IcebergWriteTransactionRunner, IcebergWriteTransactionSpec,
-    IcebergWriteValidationPolicy, synthetic_write_commit_input,
+    IcebergWriteValidationPolicy, local_writer_commit_input, new_local_writer_write_id,
 };
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOperationTarget};
@@ -454,18 +454,23 @@ impl IcebergWriteTransactionExecutor for MutationWriteExecutor {
             .expect("mutation write plan lock poisoned")
             .take()
             .ok_or_else(|| "mutation write plan was already consumed".to_string())?;
+        let mut sink_commit_infos = Vec::new();
         match plan {
             MutationWritePlan::MorUpdate { matched } => {
-                self.run_mor_update_write(matched, spec.commit.base_snapshot_id)?;
+                sink_commit_infos
+                    .extend(self.run_mor_update_write(matched, spec.commit.base_snapshot_id)?);
             }
             MutationWritePlan::CowUpdate {
                 matched,
                 entry,
                 target_ref,
             } => {
-                let Some(rewrite) = self.run_cow_update_write(matched, entry, &target_ref)? else {
+                let Some((rewrite, commit_infos)) =
+                    self.run_cow_update_write(matched, entry, &target_ref)?
+                else {
                     return Ok(no_mutation_write_result());
                 };
+                sink_commit_infos.extend(commit_infos);
                 *self
                     .cow_update_rewrite
                     .lock()
@@ -503,11 +508,16 @@ impl IcebergWriteTransactionExecutor for MutationWriteExecutor {
                         &df,
                         default_spec_id,
                     )?;
-                    self.collector.inject_written_file(wf);
+                    sink_commit_infos.push(
+                        crate::connector::iceberg::data_writer::written_file_to_sink_commit_info(
+                            &wf,
+                            self.table.metadata().default_partition_spec(),
+                        )?,
+                    );
                 }
             }
         }
-        Ok(mutation_write_result())
+        Ok(mutation_write_result(sink_commit_infos))
     }
 
     fn commit(
@@ -537,6 +547,10 @@ impl IcebergWriteTransactionExecutor for MutationWriteExecutor {
     fn finalize(&self, _spec: &IcebergWriteTransactionSpec) -> Result<(), String> {
         self.commit_executor.finalize()
     }
+
+    fn has_preloaded_commit_output(&self) -> bool {
+        self.collector.has_injected_written_files()
+    }
 }
 
 impl MutationWriteExecutor {
@@ -544,10 +558,11 @@ impl MutationWriteExecutor {
         &self,
         matched: MatchedUpdateBatch,
         base_snapshot_id: Option<i64>,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<crate::types::TSinkCommitInfo>, String> {
         if matched.row_ids.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
+        let mut sink_commit_infos = Vec::new();
         let referenced_partitions =
             crate::engine::delete_flow::load_referenced_data_file_partitions_at(
                 &self.table,
@@ -580,13 +595,18 @@ impl MutationWriteExecutor {
                     "MOR UPDATE first_row_id cursor overflow when chaining rolling files"
                         .to_string()
                 })?;
-                self.collector.inject_written_file(wf);
+                sink_commit_infos.push(
+                    crate::connector::iceberg::data_writer::written_file_to_sink_commit_info(
+                        &wf,
+                        self.table.metadata().default_partition_spec(),
+                    )?,
+                );
             }
         }
         for group in delete_groups {
             self.collector.inject_delete_group(group);
         }
-        Ok(())
+        Ok(sink_commit_infos)
     }
 
     fn run_cow_update_write(
@@ -594,7 +614,7 @@ impl MutationWriteExecutor {
         matched: MatchedUpdateBatch,
         entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
         target_ref: &str,
-    ) -> Result<Option<CowUpdateRewriteSet>, String> {
+    ) -> Result<Option<(CowUpdateRewriteSet, Vec<crate::types::TSinkCommitInfo>)>, String> {
         if matched.row_ids.is_empty() {
             return Ok(None);
         }
@@ -617,13 +637,19 @@ impl MutationWriteExecutor {
         if data_files.is_empty() {
             return Ok(None);
         }
+        let mut sink_commit_infos = Vec::with_capacity(data_files.len());
         let default_spec_id = self.table.metadata().default_partition_spec_id();
         for df in data_files {
             let wf =
                 crate::engine::iceberg_writer::data_file_to_written_file(&df, default_spec_id)?;
-            self.collector.inject_written_file(wf);
+            sink_commit_infos.push(
+                crate::connector::iceberg::data_writer::written_file_to_sink_commit_info(
+                    &wf,
+                    self.table.metadata().default_partition_spec(),
+                )?,
+            );
         }
-        Ok(Some(rewrite))
+        Ok(Some((rewrite, sink_commit_infos)))
     }
 }
 
@@ -635,10 +661,15 @@ fn no_mutation_write_result() -> CoordinatedQueryResult {
     }
 }
 
-fn mutation_write_result() -> CoordinatedQueryResult {
+fn mutation_write_result(
+    sink_commit_infos: Vec<crate::types::TSinkCommitInfo>,
+) -> CoordinatedQueryResult {
     CoordinatedQueryResult {
         query_result: QueryResult::empty(),
-        write_commit: Some(synthetic_write_commit_input()),
+        write_commit: Some(local_writer_commit_input(
+            new_local_writer_write_id(),
+            sink_commit_infos,
+        )),
         write_abort: None,
     }
 }

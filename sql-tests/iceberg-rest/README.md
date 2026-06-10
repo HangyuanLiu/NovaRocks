@@ -13,6 +13,7 @@ and read, exercising the REST commit protocol branches that the Hadoop-catalog
 | `iceberg_rest_namespace_ddl` | REST namespace API: CREATE/DROP DATABASE, IF (NOT) EXISTS, error path |
 | `iceberg_rest_table_ddl` | createTable / dropTable commit, partitioned table, CREATE TABLE IF NOT EXISTS no-op |
 | `iceberg_rest_insert_select` | appendData / overwrite commit (INSERT VALUES / SELECT / OVERWRITE) |
+| `iceberg_rest_distributed_insert_append` | IW-7 distributed INSERT append sink, column-list reorder/defaults, width mismatch error |
 | `iceberg_rest_schema_evolution` | updateSchema commit: ADD/RENAME/DROP COLUMN, INT→BIGINT widen |
 | `iceberg_rest_branch_tag_ddl` | updateRefs commit: CREATE BRANCH/TAG, branch write, FOR VERSION AS OF '<branch>' |
 | `iceberg_rest_v3_default_columns` | format-v3 ADD COLUMN with DEFAULT + initial-default backfill + v2 rejection |

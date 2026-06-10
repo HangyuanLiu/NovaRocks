@@ -28,7 +28,6 @@
 //! * `INSERT OVERWRITE iceberg VALUES (...)` — handled here.
 
 use std::collections::BTreeMap;
-use std::future::Future;
 use std::sync::Arc;
 
 use iceberg::Catalog;
@@ -36,27 +35,34 @@ use iceberg::spec::DataFile;
 use iceberg::{NamespaceIdent, TableIdent};
 
 use crate::connector::backend::ResolvedTable;
-use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
+use crate::connector::iceberg::catalog::backend::iceberg_schema_def_for_codegen;
+use crate::connector::iceberg::catalog::registry::{
+    IcebergCatalogEntry, block_on_iceberg, build_iceberg_catalog,
+};
 use crate::connector::iceberg::commit::{
     CleanupPathMapper, CommitOpKind, CommitOutcome, CommitServiceError, IcebergCommitCollector,
     WrittenFile, ensure_iceberg_write_supported, ensure_no_equality_deletes,
     ensure_no_variant_columns_for_row_level_mutation, ensure_overwrite_single_partition_spec,
 };
-use crate::connector::iceberg::data_writer::write_record_batches_as_data_files;
 use crate::connector::starrocks::table::mv_refresh::query_result_to_chunks;
 use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::write_transaction::{
     IcebergWriteCommitExecutor, IcebergWriteCommitPolicy, IcebergWriteSource,
     IcebergWriteTransactionExecutor, IcebergWriteTransactionRunner, IcebergWriteTransactionSpec,
-    IcebergWriteValidationPolicy, synthetic_write_commit_input,
+    IcebergWriteValidationPolicy,
 };
 use crate::engine::{StandaloneState, StatementResult};
 use crate::exec::chunk::Chunk;
 use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOperationTarget};
 use crate::runtime::coordinator::CoordinatedQueryResult;
-use crate::runtime::query_result::QueryResult;
 use crate::runtime::write_coordinator::WriteCommitInput;
-use crate::sql::parser::ast::InsertSource;
+use crate::sql::catalog::{
+    ColumnDef, IcebergDataFileBinding, IcebergTableInfo, ScanSource, TableDef,
+};
+use crate::sql::codegen::iceberg_write_sink::{
+    IcebergWriteSinkSpec, synthetic_iceberg_write_table_id,
+};
+use crate::sql::parser::ast::{InsertSource, Literal, SqlType};
 
 pub(crate) fn execute_iceberg_insert_or_overwrite(
     state: &Arc<StandaloneState>,
@@ -137,66 +143,44 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
         }
     }
 
-    // 3. Produce chunks from the source.
-    //    - FromQuery: execute the SELECT and collect the result chunks.
-    //    - Values / SelectLiteralRow: build a RecordBatch from the literal rows
-    //      using the iceberg table schema, then wrap it as a single Chunk.
-    //      This supports branch-qualified INSERT INTO t.branch_dev VALUES (...).
-    let (chunks, chunks_aligned_to_target_schema): (Vec<Chunk>, bool) = match source {
-        InsertSource::FromQuery(query) => (run_select_to_chunks(state, target, query)?, false),
-        InsertSource::Values(rows) => {
-            let loaded = load_iceberg_table_for_literals(state, target)?;
-            let literal_rows = if insert_columns.is_empty() {
-                rows.clone()
-            } else {
-                crate::engine::insert::reorder_insert_rows(rows, insert_columns, &resolved.columns)?
-            };
-            let batch = crate::connector::iceberg::catalog::registry::build_insert_batch(
-                &loaded,
-                &literal_rows,
-            )?;
-            (vec![crate::engine::record_batch_to_chunk(batch)?], true)
-        }
-        InsertSource::SelectLiteralRow(row) => {
-            let loaded = load_iceberg_table_for_literals(state, target)?;
-            let literal_rows = if insert_columns.is_empty() {
-                vec![row.clone()]
-            } else {
-                crate::engine::insert::reorder_insert_rows(
-                    std::slice::from_ref(row),
-                    insert_columns,
-                    &resolved.columns,
-                )?
-            };
-            let batch = crate::connector::iceberg::catalog::registry::build_insert_batch(
-                &loaded,
-                &literal_rows,
-            )?;
-            (vec![crate::engine::record_batch_to_chunk(batch)?], true)
-        }
-        InsertSource::UnionAll(_) => {
-            unreachable!("rejected above")
-        }
-    };
+    execute_iceberg_insert_distributed(
+        state,
+        target,
+        resolved,
+        insert_columns,
+        source,
+        overwrite_mode,
+        target_ref,
+        catalog,
+        table,
+        &entry,
+        table_ident,
+    )
+}
 
-    // 3.5. If the user specified an explicit column list, reorder columns and
-    //      fill omitted columns with their write_default literal (or NULL).
-    let chunks = if chunks_aligned_to_target_schema || insert_columns.is_empty() {
-        chunks
-    } else {
-        align_chunks_to_target_schema(chunks, insert_columns, &resolved.columns)?
-    };
+#[allow(clippy::too_many_arguments)]
+fn execute_iceberg_insert_distributed(
+    state: &Arc<StandaloneState>,
+    target: &TargetBackend,
+    resolved: &ResolvedTable,
+    insert_columns: &[String],
+    source: &InsertSource,
+    overwrite_mode: crate::sql::parser::ast::OverwriteMode,
+    target_ref: &str,
+    catalog: Arc<dyn Catalog>,
+    table: iceberg::table::Table,
+    entry: &IcebergCatalogEntry,
+    table_ident: TableIdent,
+) -> Result<StatementResult, String> {
+    let query = append_source_to_query(source, insert_columns, &resolved.columns)?;
+    let sink_spec = build_insert_write_sink_spec(target, resolved, &table, entry)?;
 
-    // 4. Build the collector. The runner creates the operation record before
-    //    the executor writes data files, then the executor injects files into
-    //    this collector before commit.
     let metadata = table.metadata();
     let commit_op_kind = commit_op_kind_for_overwrite_mode(overwrite_mode);
     let base_snapshot_id = write_base_snapshot_id(metadata, target_ref)?;
     let base_sequence_number = metadata.last_sequence_number();
     let current_schema = metadata.current_schema().clone();
     let default_partition_spec = metadata.default_partition_spec().clone();
-    let default_spec_id = metadata.default_partition_spec_id();
     let staging_dir = format!(
         "{}/data/_staging/{}",
         metadata.location(),
@@ -204,7 +188,7 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
     );
     let collector = Arc::new(IcebergCommitCollector::new(
         commit_op_kind,
-        table_ident.clone(),
+        table_ident,
         base_snapshot_id,
         base_sequence_number,
         current_schema,
@@ -213,27 +197,25 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
         crate::common::types::UniqueId { hi: 0, lo: 0 },
     ));
 
-    // 5. Build the OpenDAL Operator and transaction runner.
-    let abort_cleanup = build_abort_cleanup_for_catalog_entry(&entry)?;
+    let abort_cleanup = build_abort_cleanup_for_catalog_entry(entry)?;
     let commit_executor = IcebergWriteCommitExecutor {
         state: Arc::clone(state),
         target: target.clone(),
-        catalog: Arc::clone(&catalog),
-        table: table.clone(),
-        collector: Arc::clone(&collector),
+        catalog,
+        table,
+        collector,
         fs: abort_cleanup.fs,
         cleanup_path_mapper: abort_cleanup.path_mapper,
         cow_update_rewrite: None,
         target_ref: target_ref.to_string(),
         snapshot_properties: BTreeMap::new(),
     };
-    let executor = InsertOrOverwriteWriteExecutor {
+    let executor = DistributedInsertWriteExecutor {
+        state: Arc::clone(state),
+        target: target.clone(),
+        query,
+        sink_spec,
         commit_executor,
-        table,
-        chunks,
-        collector,
-        default_spec_id,
-        should_commit_empty_input: !matches!(overwrite_mode, OverwriteMode::None),
     };
     let spec = IcebergWriteTransactionSpec {
         target: IcebergOperationTarget {
@@ -262,47 +244,27 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
     Ok(StatementResult::Ok)
 }
 
-struct InsertOrOverwriteWriteExecutor {
+struct DistributedInsertWriteExecutor {
+    state: Arc<StandaloneState>,
+    target: TargetBackend,
+    query: sqlparser::ast::Query,
+    sink_spec: IcebergWriteSinkSpec,
     commit_executor: IcebergWriteCommitExecutor,
-    table: iceberg::table::Table,
-    chunks: Vec<Chunk>,
-    collector: Arc<IcebergCommitCollector>,
-    default_spec_id: i32,
-    should_commit_empty_input: bool,
 }
 
-impl IcebergWriteTransactionExecutor for InsertOrOverwriteWriteExecutor {
+impl IcebergWriteTransactionExecutor for DistributedInsertWriteExecutor {
     fn run_coordinated_write(
         &self,
         _spec: &IcebergWriteTransactionSpec,
     ) -> Result<CoordinatedQueryResult, String> {
-        let has_rows = self.chunks.iter().any(|c| c.batch.num_rows() > 0);
-        if !has_rows && !self.should_commit_empty_input {
-            return Ok(CoordinatedQueryResult {
-                query_result: QueryResult::empty(),
-                write_commit: None,
-                write_abort: None,
-            });
-        }
-
-        if has_rows {
-            let write_table = self.table.clone();
-            let write_chunks = self.chunks.clone();
-            let data_files = run_data_file_write_phase_on_sink_io(
-                write_chunks_as_iceberg_data_files_owned(write_table, write_chunks),
-            )?;
-            for df in data_files {
-                let wf = data_file_to_written_file(&df, self.default_spec_id)?;
-                self.collector.inject_written_file(wf);
-            }
-            inject_theta_sketches(&self.collector, &self.chunks);
-        }
-
-        Ok(CoordinatedQueryResult {
-            query_result: QueryResult::empty(),
-            write_commit: Some(synthetic_write_commit_input()),
-            write_abort: None,
-        })
+        crate::engine::execute_query_as_iceberg_write(
+            &self.state,
+            Some(&self.target.catalog),
+            &self.target.namespace,
+            &self.query,
+            self.sink_spec.clone(),
+            None,
+        )
     }
 
     fn commit(
@@ -316,6 +278,363 @@ impl IcebergWriteTransactionExecutor for InsertOrOverwriteWriteExecutor {
     fn finalize(&self, _spec: &IcebergWriteTransactionSpec) -> Result<(), String> {
         self.commit_executor.finalize()
     }
+}
+
+fn build_insert_write_sink_spec(
+    target: &TargetBackend,
+    resolved: &ResolvedTable,
+    table: &iceberg::table::Table,
+    entry: &IcebergCatalogEntry,
+) -> Result<IcebergWriteSinkSpec, String> {
+    let metadata = table.metadata();
+    let iceberg = IcebergTableInfo {
+        catalog: target.catalog.clone(),
+        namespace: target.namespace.clone(),
+        table: target.table.clone(),
+        table_uuid: Some(metadata.uuid().to_string()),
+        current_snapshot_id: metadata.current_snapshot_id(),
+        schema_id: metadata.current_schema_id(),
+        location: metadata.location().to_string(),
+        schema: iceberg_schema_def_for_codegen(metadata.current_schema()),
+        serialized_metadata: Some(
+            serde_json::to_string(metadata)
+                .map_err(|err| format!("serialize iceberg table metadata failed: {err}"))?,
+        ),
+        serialized_metadata_rows: None,
+    };
+    let cloud_properties = entry.cloud_properties_map();
+    let target_table = TableDef {
+        name: resolved.table.clone(),
+        columns: resolved.columns.clone(),
+        iceberg_row_lineage_metadata_columns: Vec::new(),
+        source: ScanSource::IcebergDataFiles {
+            table: iceberg.clone(),
+            files: Vec::new(),
+            cloud_properties: cloud_properties.clone(),
+            binding: IcebergDataFileBinding::CurrentSnapshot,
+        },
+    };
+    let table_location = metadata.location().to_string();
+    let data_location = metadata
+        .properties()
+        .get("write.data.path")
+        .cloned()
+        .unwrap_or_else(|| format!("{}/data", table_location.trim_end_matches('/')));
+    let cloud_configuration = (!cloud_properties.is_empty()).then(|| {
+        crate::cloud_configuration::TCloudConfiguration::new(
+            None::<crate::cloud_configuration::TCloudType>,
+            None::<Vec<crate::cloud_configuration::TCloudProperty>>,
+            Some(cloud_properties),
+            None::<bool>,
+        )
+    });
+
+    Ok(IcebergWriteSinkSpec {
+        target_table_id: synthetic_iceberg_write_table_id(),
+        target_table,
+        iceberg,
+        target_columns: resolved.columns.clone(),
+        table_location,
+        data_location,
+        cloud_configuration,
+        file_format: "parquet".to_string(),
+        compression: crate::types::TCompressionType::SNAPPY,
+    })
+}
+
+fn append_source_to_query(
+    source: &InsertSource,
+    insert_columns: &[String],
+    target_columns: &[ColumnDef],
+) -> Result<sqlparser::ast::Query, String> {
+    match source {
+        InsertSource::FromQuery(query) if insert_columns.is_empty() => Ok((**query).clone()),
+        InsertSource::FromQuery(query) => {
+            wrap_insert_query_with_target_projection(query, insert_columns, target_columns)
+        }
+        InsertSource::Values(rows) => {
+            values_append_source_to_query(rows, insert_columns, target_columns)
+        }
+        InsertSource::SelectLiteralRow(row) => {
+            values_append_source_to_query(std::slice::from_ref(row), insert_columns, target_columns)
+        }
+        InsertSource::UnionAll(_) => {
+            Err("iceberg INSERT append does not support UNION ALL sources on this path".to_string())
+        }
+    }
+}
+
+fn wrap_insert_query_with_target_projection(
+    query: &sqlparser::ast::Query,
+    insert_columns: &[String],
+    target_columns: &[ColumnDef],
+) -> Result<sqlparser::ast::Query, String> {
+    let insert_idx_by_target = insert_column_index_by_target_name(insert_columns, target_columns)?;
+    let source_alias = "__nr_insert_src";
+    let mut projection = Vec::with_capacity(target_columns.len());
+    for column in target_columns {
+        let target_name = crate::engine::catalog::normalize_identifier(&column.name)?;
+        let expr = if let Some(source_idx) = insert_idx_by_target.get(&target_name) {
+            let source_expr = format!(
+                "{}.{}",
+                sql_identifier(source_alias),
+                sql_identifier(&insert_columns[*source_idx])
+            );
+            target_cast_expr_sql(&source_expr, column)?
+        } else {
+            target_cast_expr_sql(&omitted_column_expr_sql(column)?, column)?
+        };
+        projection.push(format!("{expr} AS {}", sql_identifier(&column.name)));
+    }
+    let alias_columns = insert_columns
+        .iter()
+        .map(|column| sql_identifier(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT {} FROM ({}) AS {} ({})",
+        projection.join(", "),
+        query,
+        sql_identifier(source_alias),
+        alias_columns
+    );
+    parse_generated_query(&sql, "append INSERT SELECT projection")
+}
+
+fn values_append_source_to_query(
+    rows: &[Vec<Literal>],
+    insert_columns: &[String],
+    target_columns: &[ColumnDef],
+) -> Result<sqlparser::ast::Query, String> {
+    let rows = if insert_columns.is_empty() {
+        for row in rows {
+            if row.len() != target_columns.len() {
+                return Err(format!(
+                    "insert column count mismatch: expected {} values, got {}",
+                    target_columns.len(),
+                    row.len()
+                ));
+            }
+        }
+        rows.to_vec()
+    } else {
+        crate::engine::insert::reorder_insert_rows(rows, insert_columns, target_columns)?
+    };
+    let rendered_rows = rows
+        .iter()
+        .map(|row| {
+            let values = row
+                .iter()
+                .zip(target_columns.iter())
+                .map(|(literal, column)| target_literal_expr_sql(literal, column))
+                .collect::<Result<Vec<_>, _>>()?
+                .join(", ");
+            Ok(format!("({values})"))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let sql = format!("VALUES {}", rendered_rows.join(", "));
+    parse_generated_query(&sql, "append INSERT VALUES")
+}
+
+fn insert_column_index_by_target_name(
+    insert_columns: &[String],
+    target_columns: &[ColumnDef],
+) -> Result<std::collections::HashMap<String, usize>, String> {
+    let mut target_names = std::collections::HashSet::with_capacity(target_columns.len());
+    for column in target_columns {
+        target_names.insert(crate::engine::catalog::normalize_identifier(&column.name)?);
+    }
+
+    let mut mapping = std::collections::HashMap::with_capacity(insert_columns.len());
+    for (idx, column) in insert_columns.iter().enumerate() {
+        let normalized = crate::engine::catalog::normalize_identifier(column)?;
+        if !target_names.contains(&normalized) {
+            return Err(format!("unknown INSERT column `{column}`"));
+        }
+        if mapping.insert(normalized.clone(), idx).is_some() {
+            return Err(format!("duplicate INSERT column `{column}`"));
+        }
+    }
+    Ok(mapping)
+}
+
+fn omitted_column_expr_sql(column: &ColumnDef) -> Result<String, String> {
+    let Some(write_default) = &column.write_default else {
+        return Ok(format!(
+            "CAST(NULL AS {})",
+            arrow_data_type_to_sql_type_name(&column.data_type)?
+        ));
+    };
+    let sql_type = arrow_data_type_to_sql_type(&column.data_type)?;
+    let literal =
+        crate::connector::iceberg::default_value::iceberg_literal_to_ast(write_default, &sql_type)?;
+    literal_to_sql(&literal)
+}
+
+fn target_literal_expr_sql(literal: &Literal, column: &ColumnDef) -> Result<String, String> {
+    target_cast_expr_sql(&literal_to_sql(literal)?, column)
+}
+
+fn target_cast_expr_sql(expr_sql: &str, column: &ColumnDef) -> Result<String, String> {
+    Ok(format!(
+        "CAST({expr_sql} AS {})",
+        arrow_data_type_to_sql_type_name(&column.data_type)?
+    ))
+}
+
+fn parse_generated_query(sql: &str, context: &str) -> Result<sqlparser::ast::Query, String> {
+    match crate::sql::parser::parse_sql_raw(sql)? {
+        sqlparser::ast::Statement::Query(query) => Ok(*query),
+        other => Err(format!("{context}: generated non-query statement: {other}")),
+    }
+}
+
+fn sql_identifier(name: &str) -> String {
+    format!("`{}`", name.replace('`', "``"))
+}
+
+fn literal_to_sql(literal: &Literal) -> Result<String, String> {
+    Ok(match literal {
+        Literal::Null => "NULL".to_string(),
+        Literal::Bool(value) => {
+            if *value {
+                "TRUE".to_string()
+            } else {
+                "FALSE".to_string()
+            }
+        }
+        Literal::Int(value) => value.to_string(),
+        Literal::Float(value) => {
+            if !value.is_finite() {
+                return Err(format!(
+                    "non-finite floating literal is not supported: {value}"
+                ));
+            }
+            value.to_string()
+        }
+        Literal::String(value) | Literal::Date(value) => single_quoted_sql(value),
+        Literal::Array(items) => format!(
+            "[{}]",
+            items
+                .iter()
+                .map(literal_to_sql)
+                .collect::<Result<Vec<_>, _>>()?
+                .join(", ")
+        ),
+        Literal::Map(entries) => {
+            let mut args = Vec::with_capacity(entries.len() * 2);
+            for (key, value) in entries {
+                args.push(literal_to_sql(key)?);
+                args.push(literal_to_sql(value)?);
+            }
+            format!("map({})", args.join(", "))
+        }
+        Literal::Struct(values) => format!(
+            "row({})",
+            values
+                .iter()
+                .map(literal_to_sql)
+                .collect::<Result<Vec<_>, _>>()?
+                .join(", ")
+        ),
+    })
+}
+
+fn single_quoted_sql(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn arrow_data_type_to_sql_type(dt: &arrow::datatypes::DataType) -> Result<SqlType, String> {
+    use arrow::datatypes::{DataType, TimeUnit};
+    Ok(match dt {
+        DataType::Boolean => SqlType::Boolean,
+        DataType::Int8 => SqlType::TinyInt,
+        DataType::Int16 => SqlType::SmallInt,
+        DataType::Int32 => SqlType::Int,
+        DataType::Int64 => SqlType::BigInt,
+        DataType::Float32 => SqlType::Float,
+        DataType::Float64 => SqlType::Double,
+        DataType::Decimal128(precision, scale) => SqlType::Decimal {
+            precision: *precision,
+            scale: *scale,
+        },
+        DataType::Utf8 | DataType::LargeUtf8 => SqlType::String,
+        DataType::Date32 => SqlType::Date,
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => SqlType::DateTimeNs,
+        DataType::Timestamp(TimeUnit::Microsecond, _) => SqlType::DateTime,
+        DataType::Binary | DataType::LargeBinary => SqlType::Binary,
+        DataType::List(element_field) => SqlType::Array(Box::new(arrow_data_type_to_sql_type(
+            element_field.data_type(),
+        )?)),
+        DataType::Map(entries_field, _) => {
+            let DataType::Struct(fields) = entries_field.data_type() else {
+                return Err(format!("unsupported Arrow map entries type: {dt:?}"));
+            };
+            if fields.len() != 2 {
+                return Err(format!("unsupported Arrow map entries field count: {dt:?}"));
+            }
+            SqlType::Map(
+                Box::new(arrow_data_type_to_sql_type(fields[0].data_type())?),
+                Box::new(arrow_data_type_to_sql_type(fields[1].data_type())?),
+            )
+        }
+        DataType::Struct(fields) => SqlType::Struct(
+            fields
+                .iter()
+                .map(|field| {
+                    Ok((
+                        field.name().clone(),
+                        arrow_data_type_to_sql_type(field.data_type())?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+        ),
+        other => {
+            return Err(format!(
+                "unsupported Arrow type for INSERT default conversion: {other:?}"
+            ));
+        }
+    })
+}
+
+fn arrow_data_type_to_sql_type_name(dt: &arrow::datatypes::DataType) -> Result<String, String> {
+    sql_type_name(&arrow_data_type_to_sql_type(dt)?)
+}
+
+fn sql_type_name(sql_type: &SqlType) -> Result<String, String> {
+    Ok(match sql_type {
+        SqlType::TinyInt => "TINYINT".to_string(),
+        SqlType::SmallInt => "SMALLINT".to_string(),
+        SqlType::Int => "INT".to_string(),
+        SqlType::BigInt => "BIGINT".to_string(),
+        SqlType::LargeInt => "LARGEINT".to_string(),
+        SqlType::Float => "FLOAT".to_string(),
+        SqlType::Double => "DOUBLE".to_string(),
+        SqlType::Decimal { precision, scale } => format!("DECIMAL({precision}, {scale})"),
+        SqlType::String => "STRING".to_string(),
+        SqlType::Json => "JSON".to_string(),
+        SqlType::Binary => "BINARY".to_string(),
+        SqlType::Bitmap => "BITMAP".to_string(),
+        SqlType::Hll => "HLL".to_string(),
+        SqlType::Boolean => "BOOLEAN".to_string(),
+        SqlType::Date => "DATE".to_string(),
+        SqlType::DateTime => "DATETIME".to_string(),
+        SqlType::DateTimeNs => "DATETIME_NS".to_string(),
+        SqlType::Time => "TIME".to_string(),
+        SqlType::Array(inner) => format!("ARRAY<{}>", sql_type_name(inner)?),
+        SqlType::Map(key, value) => {
+            format!("MAP<{}, {}>", sql_type_name(key)?, sql_type_name(value)?)
+        }
+        SqlType::Struct(fields) => format!(
+            "STRUCT<{}>",
+            fields
+                .iter()
+                .map(|(name, ty)| Ok(format!("{} {}", sql_identifier(name), sql_type_name(ty)?)))
+                .collect::<Result<Vec<_>, String>>()?
+                .join(", ")
+        ),
+        SqlType::Variant => "VARIANT".to_string(),
+    })
 }
 
 fn commit_op_kind_for_overwrite_mode(
@@ -353,29 +672,6 @@ fn write_base_snapshot_id(
         .ok_or_else(|| format!("iceberg ref: branch '{target_ref}' not found in table metadata"))
 }
 
-fn inject_theta_sketches(collector: &IcebergCommitCollector, chunks: &[Chunk]) {
-    // Compute Theta sketches from the source chunks and push them through the
-    // collector so the commit action can register Puffin NDV statistics. We
-    // emit one sketch set per chunk; StatsAssembler unions sketches across
-    // sets per field id, so per-file attribution is not required to get
-    // accurate aggregate NDV.
-    for (idx, chunk) in chunks.iter().enumerate() {
-        if chunk.batch.num_rows() == 0 {
-            continue;
-        }
-        if let Some(sketches) =
-            crate::connector::iceberg::sink::compute_theta_sketches_for_batch(&chunk.batch)
-        {
-            collector.inject_sketch_set(
-                crate::connector::iceberg::stats_assembler::FileSketchSet {
-                    file_path: format!("standalone_insert_chunk_{idx}"),
-                    sketches,
-                },
-            );
-        }
-    }
-}
-
 pub(crate) fn invalidate_iceberg_caches(
     state: &Arc<StandaloneState>,
     target: &TargetBackend,
@@ -398,25 +694,6 @@ pub(crate) fn invalidate_iceberg_caches(
 
 fn target_string(t: &TargetBackend) -> String {
     format!("{}.{}.{}", t.catalog, t.namespace, t.table)
-}
-
-/// Load the iceberg table metadata as an `IcebergLoadedTable` for use by the
-/// literal-row (VALUES) branch of the insert path. This provides the schema
-/// information needed by `build_insert_batch`.
-fn load_iceberg_table_for_literals(
-    state: &Arc<StandaloneState>,
-    target: &TargetBackend,
-) -> Result<crate::connector::iceberg::catalog::registry::IcebergLoadedTable, String> {
-    let registry = state
-        .iceberg_catalogs
-        .read()
-        .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-    let entry = registry.get(&target.catalog)?;
-    crate::connector::iceberg::catalog::registry::load_table(
-        &entry,
-        &target.namespace,
-        &target.table,
-    )
 }
 
 pub(crate) fn data_file_to_written_file(
@@ -508,73 +785,6 @@ pub(crate) struct AbortCleanupOperator {
     pub(crate) path_mapper: Option<CleanupPathMapper>,
 }
 
-fn align_chunks_to_target_schema(
-    chunks: Vec<Chunk>,
-    insert_columns: &[String],
-    target_columns: &[crate::sql::catalog::ColumnDef],
-) -> Result<Vec<Chunk>, String> {
-    use crate::connector::iceberg::default_value::literal_to_constant_array;
-    use crate::engine::catalog::normalize_identifier;
-    use std::collections::HashMap;
-    use std::sync::Arc;
-
-    let normalized_insert: Vec<String> = insert_columns
-        .iter()
-        .map(|c| normalize_identifier(c))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut insert_idx_by_name: HashMap<String, usize> = HashMap::new();
-    for (i, name) in normalized_insert.iter().enumerate() {
-        if insert_idx_by_name.insert(name.clone(), i).is_some() {
-            return Err(format!("duplicate INSERT column `{name}`"));
-        }
-    }
-
-    let mut aligned = Vec::with_capacity(chunks.len());
-    for chunk in chunks {
-        let row_count = chunk.batch.num_rows();
-        let source_schema = chunk.batch.schema();
-        if source_schema.fields().len() != insert_columns.len() {
-            return Err(format!(
-                "INSERT column-list length {} does not match SELECT projection length {}",
-                insert_columns.len(),
-                source_schema.fields().len()
-            ));
-        }
-        let mut columns: Vec<arrow::array::ArrayRef> = Vec::with_capacity(target_columns.len());
-        let mut fields: Vec<arrow::datatypes::FieldRef> = Vec::with_capacity(target_columns.len());
-        for column in target_columns {
-            let normalized = normalize_identifier(&column.name)?;
-            if let Some(insert_idx) = insert_idx_by_name.get(&normalized) {
-                let field = source_schema.field(*insert_idx);
-                columns.push(chunk.batch.column(*insert_idx).clone());
-                fields.push(Arc::new(arrow::datatypes::Field::new(
-                    column.name.clone(),
-                    field.data_type().clone(),
-                    field.is_nullable(),
-                )));
-            } else {
-                let array = match &column.write_default {
-                    Some(iceberg_lit) => {
-                        literal_to_constant_array(iceberg_lit, &column.data_type, row_count)?
-                    }
-                    None => arrow::array::new_null_array(&column.data_type, row_count),
-                };
-                fields.push(Arc::new(arrow::datatypes::Field::new(
-                    column.name.clone(),
-                    column.data_type.clone(),
-                    column.nullable,
-                )));
-                columns.push(array);
-            }
-        }
-        let schema = Arc::new(arrow::datatypes::Schema::new(fields));
-        let batch = arrow::record_batch::RecordBatch::try_new(schema, columns)
-            .map_err(|e| format!("align INSERT batch: {e}"))?;
-        aligned.push(crate::engine::record_batch_to_chunk(batch)?);
-    }
-    Ok(aligned)
-}
-
 pub(crate) fn build_abort_cleanup_for_catalog_entry(
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
 ) -> Result<AbortCleanupOperator, String> {
@@ -612,56 +822,217 @@ pub(crate) fn build_abort_cleanup_for_catalog_entry(
     })
 }
 
-fn run_data_file_write_phase_on_sink_io<F, T>(future: F) -> Result<T, String>
-where
-    F: Future<Output = Result<T, String>> + Send + 'static,
-    T: Send + 'static,
-{
-    let sink_io = crate::runtime::execution_services::execution_services()?
-        .sink_io()
-        .clone();
-    let join = sink_io.spawn(future);
-    futures::executor::block_on(join)
-        .map_err(|e| format!("standalone iceberg data-file write task join failed: {e}"))?
-}
-
-async fn write_chunks_as_iceberg_data_files_owned(
-    table: iceberg::table::Table,
-    chunks: Vec<Chunk>,
-) -> Result<Vec<DataFile>, String> {
-    let batches = chunks.into_iter().map(|chunk| chunk.batch);
-    write_record_batches_as_data_files(&table, batches).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::datatypes::DataType;
+    use sqlparser::ast as sqlast;
+
+    fn test_column(
+        name: &str,
+        data_type: DataType,
+        write_default: Option<iceberg::spec::Literal>,
+    ) -> crate::sql::catalog::ColumnDef {
+        crate::sql::catalog::ColumnDef {
+            name: name.to_string(),
+            data_type,
+            nullable: true,
+            write_default,
+            logical_type: None,
+        }
+    }
+
+    fn parse_query(sql: &str) -> sqlast::Query {
+        let stmt = crate::sql::parser::parse_sql_raw(sql).expect("parse query");
+        let sqlast::Statement::Query(query) = stmt else {
+            panic!("expected query statement");
+        };
+        *query
+    }
 
     #[test]
-    fn data_file_write_phase_helper_runs_on_sink_io_runtime() {
-        let thread_name = run_data_file_write_phase_on_sink_io(async {
-            Ok::<_, String>(
-                std::thread::current()
-                    .name()
-                    .map(|s| s.to_string())
-                    .unwrap_or_default(),
-            )
-        })
-        .expect("sink_io write phase");
+    fn overwrite_path_uses_distributed_writer_not_local_collect() {
+        let source = include_str!("iceberg_writer.rs");
+        let entrypoint = source
+            .split("pub(crate) fn execute_iceberg_insert_or_overwrite")
+            .nth(1)
+            .expect("insert/overwrite entrypoint must exist")
+            .split("#[allow(clippy::too_many_arguments)]")
+            .next()
+            .expect("entrypoint source section");
 
         assert!(
-            thread_name.contains("novarocks-sink-io"),
-            "data-file write phase ran on unexpected thread: {thread_name}"
+            entrypoint.contains("execute_iceberg_insert_distributed"),
+            "INSERT OVERWRITE must call the distributed iceberg sink path"
+        );
+        assert!(
+            !entrypoint.contains("run_select_to_chunks"),
+            "INSERT OVERWRITE must not collect SELECT output in the coordinator"
+        );
+        assert!(
+            !entrypoint.contains("InsertOrOverwriteWriteExecutor"),
+            "INSERT OVERWRITE must not use the local file writer executor"
+        );
+        assert!(
+            !entrypoint.contains("synthetic_write_commit_input"),
+            "INSERT OVERWRITE must not synthesize writer output"
         );
     }
 
     #[test]
-    fn data_file_write_phase_helper_preserves_write_error() {
-        let err = run_data_file_write_phase_on_sink_io(async {
-            Err::<(), String>("write failed".into())
-        })
-        .expect_err("write error should propagate");
+    fn append_executor_does_not_use_synthetic_commit_input() {
+        let source = include_str!("iceberg_writer.rs");
+        let impl_source = source
+            .split("impl IcebergWriteTransactionExecutor for DistributedInsertWriteExecutor")
+            .nth(1)
+            .expect("distributed append executor impl must exist")
+            .split("fn build_insert_write_sink_spec")
+            .next()
+            .expect("append executor source section");
 
-        assert_eq!(err, "write failed");
+        assert!(
+            impl_source.contains("execute_query_as_iceberg_write"),
+            "append executor must use the distributed iceberg write path"
+        );
+        assert!(
+            !impl_source.contains("synthetic_write_commit_input"),
+            "append executor must not return a synthetic write commit"
+        );
+    }
+
+    #[test]
+    fn append_source_to_query_values_reorders_columns_and_fills_defaults() {
+        let target_columns = vec![
+            test_column("a", DataType::Int32, None),
+            test_column(
+                "b",
+                DataType::Int32,
+                Some(iceberg::spec::Literal::Primitive(
+                    iceberg::spec::PrimitiveLiteral::Int(5),
+                )),
+            ),
+            test_column("c", DataType::Int32, None),
+        ];
+        let source = InsertSource::Values(vec![vec![
+            crate::sql::parser::ast::Literal::Int(30),
+            crate::sql::parser::ast::Literal::Int(10),
+        ]]);
+
+        let query = append_source_to_query(
+            &source,
+            &["c".to_string(), "a".to_string()],
+            &target_columns,
+        )
+        .expect("append source query");
+
+        let sqlast::SetExpr::Values(values) = query.body.as_ref() else {
+            panic!("expected VALUES query, got: {query}");
+        };
+        let row = values.rows.first().expect("one row");
+        let rendered: Vec<String> = row.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            rendered,
+            vec!["CAST(10 AS INT)", "CAST(5 AS INT)", "CAST(30 AS INT)"]
+        );
+    }
+
+    #[test]
+    fn append_source_to_query_values_casts_literals_to_target_types() {
+        let target_columns = vec![
+            test_column("id", DataType::Int64, None),
+            test_column("region", DataType::Utf8, None),
+            test_column("amount", DataType::Float64, None),
+        ];
+        let source = InsertSource::Values(vec![
+            vec![
+                crate::sql::parser::ast::Literal::Int(1),
+                crate::sql::parser::ast::Literal::String("us".to_string()),
+                crate::sql::parser::ast::Literal::Float(10.5),
+            ],
+            vec![
+                crate::sql::parser::ast::Literal::Int(2),
+                crate::sql::parser::ast::Literal::String("eu".to_string()),
+                crate::sql::parser::ast::Literal::Float(20.0),
+            ],
+        ]);
+
+        let query =
+            append_source_to_query(&source, &[], &target_columns).expect("append source query");
+
+        let sqlast::SetExpr::Values(values) = query.body.as_ref() else {
+            panic!("expected VALUES query, got: {query}");
+        };
+        let first_row: Vec<String> = values.rows[0].iter().map(ToString::to_string).collect();
+        let second_row: Vec<String> = values.rows[1].iter().map(ToString::to_string).collect();
+        assert_eq!(
+            first_row,
+            vec![
+                "CAST(1 AS BIGINT)",
+                "CAST('us' AS STRING)",
+                "CAST(10.5 AS DOUBLE)"
+            ]
+        );
+        assert_eq!(
+            second_row,
+            vec![
+                "CAST(2 AS BIGINT)",
+                "CAST('eu' AS STRING)",
+                "CAST(20 AS DOUBLE)"
+            ]
+        );
+    }
+
+    #[test]
+    fn append_source_to_query_values_rejects_column_list_width_mismatch() {
+        let target_columns = vec![
+            test_column("a", DataType::Int32, None),
+            test_column("b", DataType::Int32, None),
+        ];
+        let source = InsertSource::Values(vec![vec![
+            crate::sql::parser::ast::Literal::Int(1),
+            crate::sql::parser::ast::Literal::Int(2),
+        ]]);
+
+        let err = append_source_to_query(&source, &["a".to_string()], &target_columns)
+            .expect_err("extra value must be rejected");
+        assert!(
+            err.contains("expected 1 values for column list, got 2"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn append_source_to_query_from_query_column_list_wraps_projection() {
+        let target_columns = vec![
+            test_column("a", DataType::Int32, None),
+            test_column(
+                "b",
+                DataType::Int32,
+                Some(iceberg::spec::Literal::Primitive(
+                    iceberg::spec::PrimitiveLiteral::Int(7),
+                )),
+            ),
+            test_column("c", DataType::Int32, None),
+        ];
+        let source = InsertSource::FromQuery(Box::new(parse_query("SELECT x, y FROM src")));
+
+        let query = append_source_to_query(
+            &source,
+            &["c".to_string(), "a".to_string()],
+            &target_columns,
+        )
+        .expect("append source query");
+
+        let rendered = query.to_string();
+        assert!(
+            rendered.contains("FROM (SELECT x, y FROM src) AS `__nr_insert_src` (`c`, `a`)"),
+            "derived query should carry source column aliases, got: {rendered}"
+        );
+        assert!(
+            rendered.starts_with(
+                "SELECT CAST(`__nr_insert_src`.`a` AS INT) AS `a`, CAST(7 AS INT) AS `b`, CAST(`__nr_insert_src`.`c` AS INT) AS `c`"
+            ),
+            "projection should target table column order, got: {rendered}"
+        );
     }
 }

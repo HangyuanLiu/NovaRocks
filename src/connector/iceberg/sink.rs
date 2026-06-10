@@ -167,13 +167,23 @@ impl IcebergTableSinkFactory {
                 build_position_delete_output_schema()
             }
         };
+        let output_column_names = match mode {
+            IcebergSinkMode::Data => output_schema
+                .fields()
+                .iter()
+                .map(|field| field.name().to_string())
+                .collect::<Vec<_>>(),
+            IcebergSinkMode::PositionDeletes => {
+                let mut names = vec![
+                    ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN.to_string(),
+                    ICEBERG_POSITION_DELETE_POS_COLUMN.to_string(),
+                ];
+                names.extend(partition_source_column_names.iter().cloned());
+                names
+            }
+        };
         if !partition_exprs.is_empty() {
-            let slot_map = build_column_slot_map(
-                output_exprs,
-                desc_tbl,
-                sink.tuple_id
-                    .ok_or_else(|| "iceberg sink missing tuple_id".to_string())?,
-            )?;
+            let slot_map = build_column_slot_map(output_exprs, &output_column_names)?;
             update_partition_expr_slot_refs(&mut partition_exprs, &slot_map, &iceberg_table)?;
         }
         let lowered_partition_exprs =
@@ -338,16 +348,9 @@ impl IcebergTableSinkBackend {
         partition: &str,
         prefix: &str,
     ) -> Result<(String, String), String> {
-        // Preserve the caller-supplied URI scheme (e.g. "file:///tmp/...") in the
-        // paths we return, so that:
-        //   1. FE's prefix check in IcebergMetadata.getIcebergRelativePartitionPath
-        //      sees a partition_path whose scheme matches tableDataLocation and the
-        //      raw startsWith succeeds.
-        //   2. The iceberg manifest entry stores the data file path in the same URI
-        //      form as the table's declared location, matching upstream StarRocks
-        //      BE behaviour (HdfsFileSystem preserves the scheme end-to-end).
-        // Scheme stripping for the actual local file write happens inside
-        // write_parquet_file instead of here.
+        // Preserve the caller-supplied URI scheme in the data file path. The
+        // report partition_path remains Iceberg-relative because the NovaRocks
+        // commit collector decodes partition values from path segments.
         let base = self.plan.data_location.trim_end_matches('/').to_string();
         let finst = state
             .fragment_instance_id()
@@ -361,12 +364,10 @@ impl IcebergTableSinkBackend {
 
         if partition.is_empty() {
             let path = format!("{base}/{file_name}");
-            Ok((path, base))
+            Ok((path, String::new()))
         } else {
-            let partition_path = format!("{base}/{partition}")
-                .trim_end_matches('/')
-                .to_string();
-            let path = format!("{partition_path}/{file_name}");
+            let partition_path = partition.trim_matches('/').to_string();
+            let path = format!("{base}/{partition_path}/{file_name}");
             Ok((path, partition_path))
         }
     }
@@ -505,6 +506,7 @@ impl IcebergTableSinkBackend {
                 first_row_id: None,
                 equality_ids: None,
                 key_metadata: None,
+                partition_spec_id: None,
             };
 
             let commit_info = types::TSinkCommitInfo {
@@ -521,14 +523,7 @@ impl IcebergTableSinkBackend {
     }
 
     fn partition_path_for_key(&self, key: &PartitionKey) -> String {
-        let base = self.plan.data_location.trim_end_matches('/').to_string();
-        if key.path.is_empty() {
-            base
-        } else {
-            format!("{base}/{}", key.path)
-                .trim_end_matches('/')
-                .to_string()
-        }
+        key.path.trim_matches('/').to_string()
     }
 
     fn partition_group_indices(
@@ -1027,33 +1022,18 @@ fn build_partition_exprs(iceberg: &descriptors::TIcebergTable) -> Result<Partiti
 
 fn build_column_slot_map(
     output_exprs: &[exprs::TExpr],
-    desc_tbl: &descriptors::TDescriptorTable,
-    tuple_id: i32,
+    output_column_names: &[String],
 ) -> Result<HashMap<String, exprs::TExprNode>, String> {
-    let slots = desc_tbl
-        .slot_descriptors
-        .as_ref()
-        .ok_or_else(|| "descriptor table missing slot_descriptors".to_string())?;
-    let mut tuple_slots = Vec::new();
-    for slot in slots {
-        if slot.parent == Some(tuple_id) {
-            tuple_slots.push(slot);
-        }
-    }
-    if tuple_slots.len() != output_exprs.len() {
+    if output_column_names.len() != output_exprs.len() {
         return Err(format!(
-            "iceberg sink slot count mismatch: slots={} output_exprs={}",
-            tuple_slots.len(),
+            "iceberg sink output column count mismatch: columns={} output_exprs={}",
+            output_column_names.len(),
             output_exprs.len()
         ));
     }
 
     let mut map = HashMap::new();
-    for (slot, expr) in tuple_slots.iter().zip(output_exprs.iter()) {
-        let col_name = slot
-            .col_name
-            .clone()
-            .ok_or_else(|| "slot descriptor missing col_name".to_string())?;
+    for (col_name, expr) in output_column_names.iter().zip(output_exprs.iter()) {
         let mut slot_ref = None;
         for node in &expr.nodes {
             if node.node_type == exprs::TExprNodeType::SLOT_REF {
@@ -1062,8 +1042,8 @@ fn build_column_slot_map(
             }
         }
         let slot_ref = slot_ref
-            .ok_or_else(|| format!("output expr for column {} missing SLOT_REF node", col_name))?;
-        map.insert(col_name, slot_ref);
+            .ok_or_else(|| format!("output expr for column {col_name} missing SLOT_REF node"))?;
+        map.insert(col_name.clone(), slot_ref);
     }
     Ok(map)
 }
@@ -1944,7 +1924,7 @@ mod tests {
     use super::{
         ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID, ICEBERG_POSITION_DELETE_POS_FIELD_ID,
         IcebergSinkMode, IcebergSinkPlan, IcebergTableSinkBackend, IcebergTableSinkFactory,
-        align_arrays_to_schema, build_position_delete_output_schema,
+        align_arrays_to_schema, build_column_slot_map, build_position_delete_output_schema,
         collect_theta_sketches_by_name, iceberg_partition_key_for_row, unique_file_path,
         write_parquet_to_bytes,
     };
@@ -1953,6 +1933,24 @@ mod tests {
     use crate::exec::expr::ExprNode;
     use crate::runtime::runtime_state::RuntimeState;
     use crate::{common::ids::SlotId, common::types::UniqueId};
+
+    #[test]
+    fn build_column_slot_map_uses_sink_output_column_names() {
+        let int_type =
+            crate::lower::type_lowering::scalar_type_desc(crate::types::TPrimitiveType::INT);
+        let id_expr =
+            crate::sql::codegen::expr_compiler::build_slot_ref_texpr(10, 1, int_type.clone());
+        let region_expr = crate::sql::codegen::expr_compiler::build_slot_ref_texpr(11, 1, int_type);
+        let output_names = vec!["id".to_string(), "region".to_string()];
+
+        let map = build_column_slot_map(&[id_expr, region_expr], &output_names).expect("slot map");
+
+        let region_slot = map
+            .get("region")
+            .and_then(|node| node.slot_ref.as_ref())
+            .expect("region slot");
+        assert_eq!(region_slot.slot_id, 11);
+    }
 
     #[test]
     fn collect_theta_sketches_by_name_keys_by_explicit_map() {
@@ -2135,6 +2133,7 @@ mod tests {
             path.starts_with(&format!("{data_location}/id_part=7/novarocks-00000-")),
             "DATA sink should use staged writer kernel file naming under FE data_location, got {path}"
         );
+        assert_eq!(data_file.partition_path.as_deref(), Some("id_part=7"));
         assert_eq!(data_file.record_count, Some(2));
         assert_eq!(
             data_file.file_content,

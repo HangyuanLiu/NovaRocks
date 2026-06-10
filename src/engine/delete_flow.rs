@@ -58,7 +58,7 @@ use crate::engine::backend_resolver::resolve_existing_table_target;
 use crate::engine::write_transaction::{
     IcebergWriteCommitExecutor, IcebergWriteCommitPolicy, IcebergWriteSource,
     IcebergWriteTransactionExecutor, IcebergWriteTransactionRunner, IcebergWriteTransactionSpec,
-    IcebergWriteValidationPolicy, synthetic_write_commit_input,
+    IcebergWriteValidationPolicy, local_writer_commit_input, new_local_writer_write_id,
 };
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOperationTarget};
@@ -273,6 +273,7 @@ impl IcebergWriteTransactionExecutor for DeleteWriteExecutor {
             .expect("delete write plan lock poisoned")
             .take()
             .ok_or_else(|| "DELETE write plan was already consumed".to_string())?;
+        let mut sink_commit_infos = Vec::new();
         match plan {
             DeleteWritePlan::PositionDeleteFiles { groups } => {
                 let file_io = self.table.file_io().clone();
@@ -280,7 +281,12 @@ impl IcebergWriteTransactionExecutor for DeleteWriteExecutor {
                     write_position_delete_files(&file_io, &self.collector.staging_dir, groups).await
                 })??;
                 for wf in written {
-                    self.collector.inject_written_file(wf);
+                    sink_commit_infos.push(
+                        crate::connector::iceberg::data_writer::written_file_to_sink_commit_info_for_metadata(
+                            &wf,
+                            self.table.metadata(),
+                        )?,
+                    );
                 }
             }
             DeleteWritePlan::DeletionVectors { groups } => {
@@ -291,7 +297,10 @@ impl IcebergWriteTransactionExecutor for DeleteWriteExecutor {
         }
         Ok(CoordinatedQueryResult {
             query_result: QueryResult::empty(),
-            write_commit: Some(synthetic_write_commit_input()),
+            write_commit: Some(local_writer_commit_input(
+                new_local_writer_write_id(),
+                sink_commit_infos,
+            )),
             write_abort: None,
         })
     }

@@ -155,14 +155,22 @@ impl JoinDeltaCoalescer {
                     insert_batches,
                 ),
             )??;
-            let partition_spec_id = target_table.metadata().default_partition_spec_id();
-            for data_file in data_files {
-                let written = crate::engine::iceberg_writer::data_file_to_written_file(
-                    &data_file,
-                    partition_spec_id,
-                )?;
-                collector.inject_written_file(written);
-            }
+            let metadata = target_table.metadata();
+            let partition_spec_id = metadata.default_partition_spec_id();
+            let sink_commit_infos = data_files
+                .into_iter()
+                .map(|data_file| {
+                    let written = crate::engine::iceberg_writer::data_file_to_written_file(
+                        &data_file,
+                        partition_spec_id,
+                    )?;
+                    crate::connector::iceberg::data_writer::written_file_to_sink_commit_info_for_metadata(
+                        &written,
+                        metadata,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            collector.inject_sink_commit_infos(sink_commit_infos)?;
         }
 
         for group in delete_groups {
