@@ -2,8 +2,8 @@
 //!
 //! Stages run in order: logical normalize, delta marker, branch union, union
 //! delta, aggregate state, delta pushdown, scan binding, action propagation,
-//! marker cleanup, validation. Each stage's name is part of the trace contract
-//! and is asserted in pipeline tests.
+//! apply key, partition derivation, marker cleanup, validation. Each stage's
+//! name is part of the trace contract and is asserted in pipeline tests.
 
 use crate::sql::optimizer::rewrite::imv::action_column::ActionColumnValidationRule;
 use crate::sql::optimizer::rewrite::imv::action_propagation::{
@@ -17,6 +17,7 @@ use crate::sql::optimizer::rewrite::imv::join_delta::RewriteJoinDeltaRule;
 use crate::sql::optimizer::rewrite::imv::marker::{
     UnresolvedMarkerCheckRule, WrapRootInImvDeltaRule,
 };
+use crate::sql::optimizer::rewrite::imv::partition_derivation::DerivePartitionSpecRule;
 use crate::sql::optimizer::rewrite::imv::row_id_column::InjectRowIdRule;
 use crate::sql::optimizer::rewrite::imv::scan_binding::BindIcebergScanRule;
 use crate::sql::optimizer::rewrite::imv::union_delta::{
@@ -84,6 +85,11 @@ pub(crate) fn build_imv_pipeline() -> RewritePipeline {
             vec![Box::new(InjectApplyKeyProjectRule::new()) as Box<dyn LogicalRewriteRule>],
         ),
         RewriteStage::new(
+            "imv-partition-derivation",
+            RewritePhase::SemanticRewrite,
+            vec![Box::new(DerivePartitionSpecRule) as Box<dyn LogicalRewriteRule>],
+        ),
+        RewriteStage::new(
             "imv-marker-cleanup",
             RewritePhase::SemanticRewrite,
             Vec::new(),
@@ -117,6 +123,23 @@ mod tests {
             .expect("imv-apply-key stage must exist");
         let val = names.iter().position(|n| *n == "imv-validation").unwrap();
         assert!(ap < ak && ak < val, "stage order: {names:?}");
+    }
+
+    #[test]
+    fn pipeline_runs_partition_derivation_after_apply_key_before_validation() {
+        let p = build_imv_pipeline();
+        let names = p.stage_names();
+        let ak = names.iter().position(|n| *n == "imv-apply-key").unwrap();
+        let pd = names
+            .iter()
+            .position(|n| *n == "imv-partition-derivation")
+            .expect("imv-partition-derivation stage must exist");
+        let val = names.iter().position(|n| *n == "imv-validation").unwrap();
+        assert!(ak < pd && pd < val, "stage order: {names:?}");
+        assert!(
+            p.rule_names().iter().any(|n| *n == "DerivePartitionSpec"),
+            "DerivePartitionSpec must be registered"
+        );
     }
 
     #[test]

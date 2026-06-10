@@ -16,6 +16,7 @@ pub(crate) mod entrypoint;
 pub(crate) mod join_delta;
 pub(crate) mod join_delta_shape;
 pub(crate) mod marker;
+pub(crate) mod partition_derivation;
 pub(crate) mod pipeline;
 pub(crate) mod row_id_column;
 pub(crate) mod scan_binding;
