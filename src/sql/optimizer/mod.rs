@@ -89,6 +89,14 @@ pub(crate) fn optimize(
     let rewritten =
         rewrite::registry::query_rewrite_pipeline(table_stats).rewrite(plan, &mut rewrite_ctx)?;
 
+    // Non-disableable backstop: Apply must not survive the SubqueryRewrite
+    // stage. The ApplyException rule reports this with rule attribution, but
+    // a user-disabled rule must not let an Apply leak into memo conversion
+    // (which panics by contract).
+    if let Some(message) = rewrite::rules::subquery::find_residual_apply(&rewritten) {
+        return Err(message);
+    }
+
     // 4. CTE cleanup: intentional pre-Memo structural rewrite for CTE shape
     //    cleanup, not a second full logical optimization pass.
     let cte_ctx = cte_rewrite::collect_cte_counts(&rewritten);
@@ -597,5 +605,65 @@ mod is_known_rule_name_tests {
             optimize(plan, &HashMap::new(), factory, None).expect("optimize assert one row");
         let physical_debug = format!("{physical:?}");
         assert!(physical_debug.contains("PhysicalAssertOneRow"));
+    }
+
+    #[test]
+    fn optimize_rejects_residual_apply_when_rule_disabled() {
+        use std::collections::{HashMap, HashSet};
+
+        use arrow::datatypes::DataType;
+
+        use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
+        use crate::sql::column_id::{ColumnId, ColumnRefFactory};
+        use crate::sql::planner::plan::{ApplyKind, ApplyNode, LogicalPlan, ValuesNode};
+
+        let values = || {
+            LogicalPlan::Values(ValuesNode {
+                rows: vec![],
+                columns: vec![],
+                required_output_columns: None,
+            })
+        };
+        let plan = LogicalPlan::Apply(ApplyNode {
+            left: Box::new(values()),
+            right: Box::new(values()),
+            kind: ApplyKind::Scalar,
+            subquery_expr: TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: ColumnId(5),
+                    qualifier: None,
+                    column: "sq".to_string(),
+                },
+                data_type: DataType::Int64,
+                nullable: true,
+            },
+            output_column: OutputColumn {
+                column_id: ColumnId(5),
+                name: "sq".to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+                is_internal: true,
+            },
+            correlation_column_ids: vec![],
+            correlation_conjuncts: vec![],
+            residual_predicate: None,
+            need_check_max_rows: true,
+            use_semi_anti: false,
+            uncorrelated_outer_predicate_columns: HashSet::new(),
+            required_output_columns: None,
+        });
+
+        let settings = crate::sql::optimizer::options::SessionOptimizerSettings {
+            disabled_rules: vec!["ApplyException".to_string()],
+            ..Default::default()
+        };
+        let err = crate::sql::optimizer::options::with_session_optimizer_settings(settings, || {
+            optimize(plan, &HashMap::new(), ColumnRefFactory::new(), None)
+        })
+        .expect_err("backstop must reject the residual apply");
+        assert!(
+            err.contains("subquery decorrelation failed"),
+            "unexpected error: {err}"
+        );
     }
 }
