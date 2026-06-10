@@ -18,6 +18,7 @@
 //! wiring exactly.
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use crate::data_sinks;
@@ -122,10 +123,20 @@ impl ExecutionCoordinator {
             );
         }
 
-        let mut plan = scheduler.assign(&fragment_results, &edges, query_id.clone())?;
-        scheduler.fill_destinations(&mut plan, &edges);
+        let live: Vec<(usize, std::net::SocketAddr)> =
+            match crate::runtime::backend_registry::backend_registry() {
+                Some(reg) => reg
+                    .live_endpoints()
+                    .into_iter()
+                    .map(|(be_id, ep)| (be_id as usize, ep))
+                    .collect(),
+                None => scheduler.backends().iter().copied().enumerate().collect(),
+            };
+        let mut plan =
+            scheduler.assign_with_live(&fragment_results, &edges, query_id.clone(), &live)?;
+        scheduler.fill_destinations_with_live(&mut plan, &edges, &live)?;
         if let Some(rf) = rf_plan.as_ref() {
-            scheduler.fill_runtime_filter_params(&mut plan, rf);
+            scheduler.fill_runtime_filter_params_with_live(&mut plan, rf, &live)?;
         }
         scheduler.fill_per_exch_num_senders(&mut plan, &edges);
 
@@ -181,7 +192,7 @@ impl ExecutionCoordinator {
         // The merge node is the backend that hosts the (single) root instance.
         // At one backend this equals the local exchange address, matching the
         // prior `dispatcher.exchange_addr()` behavior exactly.
-        let merge_addr = backend_to_network_addr(scheduler.backends(), plan.root_backend_idx)?;
+        let merge_addr = backend_to_network_addr(&live, plan.root_backend_idx)?;
         if rf_plan.is_some() {
             inject_runtime_filter_merge_nodes(&mut fragment_results, &merge_addr);
         }
@@ -201,13 +212,7 @@ impl ExecutionCoordinator {
                 let dests: Result<Vec<_>, String> = insts
                     .iter()
                     .map(|inst| {
-                        let addr = scheduler.backends().get(inst.backend_idx).ok_or_else(|| {
-                            format!(
-                                "backend idx {} out of range ({} backends)",
-                                inst.backend_idx,
-                                scheduler.backends().len()
-                            )
-                        })?;
+                        let addr = live_backend_addr(&live, inst.backend_idx)?;
                         Ok(data_sinks::TPlanFragmentDestination::new(
                             inst.finst_id.clone(),
                             None::<types::TNetworkAddress>,
@@ -570,19 +575,23 @@ fn validate_write_commit_ready(
 
 /// Convert `backends[idx]` into a `TNetworkAddress`.
 fn backend_to_network_addr(
-    backends: &[std::net::SocketAddr],
+    live: &[(usize, SocketAddr)],
     idx: usize,
 ) -> Result<types::TNetworkAddress, String> {
-    let addr = backends.get(idx).ok_or_else(|| {
-        format!(
-            "backend index {idx} out of range ({} backends)",
-            backends.len()
-        )
-    })?;
+    let addr = live_backend_addr(live, idx)?;
     Ok(types::TNetworkAddress::new(
         addr.ip().to_string(),
         addr.port() as i32,
     ))
+}
+
+fn live_backend_addr(
+    live: &[(usize, SocketAddr)],
+    backend_idx: usize,
+) -> Result<SocketAddr, String> {
+    live.iter()
+        .find_map(|(idx, addr)| (*idx == backend_idx).then_some(*addr))
+        .ok_or_else(|| format!("backend index {backend_idx} missing from live snapshot"))
 }
 
 fn local_coordinator_report_addr() -> Result<types::TNetworkAddress, String> {
