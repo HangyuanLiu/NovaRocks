@@ -7,11 +7,17 @@ pub(crate) mod policy;
 pub(crate) mod stats;
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use self::policy::{
     ActionKind, EvaluationOutcome, MaintenanceAction, MaintenancePolicyConfig,
     TableMaintenanceStats, TablePolicy, TableRuntimeState, evaluate_table, failure_backoff_ms,
 };
+
+use crate::engine::StandaloneState;
 
 /// Signals consumed by the coordinator thread. `Wake` is sent after every
 /// successful MV refresh; `Stop` is sent by the handle on drop.
@@ -216,6 +222,310 @@ impl MaintenanceCoordinator {
         }
         self.runtime_entry(mv_id).last_seen_snapshot_id = stats.current_snapshot_id;
         outcome
+    }
+}
+
+/// Production executor: expire / DV-rewrite run inline via block_on_iceberg;
+/// optimize is submitted to the existing SQLite job queue and executed by the
+/// iceberg-optimize-worker.
+pub(crate) struct StateMaintenanceExecutor {
+    state: Arc<StandaloneState>,
+}
+
+impl StateMaintenanceExecutor {
+    pub(crate) fn new(state: Arc<StandaloneState>) -> Self {
+        Self { state }
+    }
+}
+
+impl MaintenanceExecutor for StateMaintenanceExecutor {
+    fn expire_snapshots(
+        &mut self,
+        target: &MaintenanceTarget,
+        older_than_ms: i64,
+        retain_last: u32,
+    ) -> Result<crate::connector::iceberg::commit::expire_snapshots::ExpireOutcome, String> {
+        let (catalog, table_ident, _) =
+            crate::engine::iceberg_maintenance::resolve_maintenance_catalog(
+                &self.state,
+                &target.catalog,
+                &target.namespace,
+                &target.table,
+            )?;
+        let params = crate::connector::iceberg::commit::expire_snapshots::ExpireParams {
+            older_than_ms: Some(older_than_ms),
+            retain_last: Some(retain_last),
+        };
+        crate::connector::iceberg::catalog::registry::block_on_iceberg(async move {
+            crate::connector::iceberg::commit::expire_snapshots::run_expire_snapshots(
+                catalog,
+                table_ident,
+                params,
+            )
+            .await
+        })?
+    }
+
+    fn rewrite_position_deletes(
+        &mut self,
+        target: &MaintenanceTarget,
+        min_input_files: usize,
+    ) -> Result<
+        crate::connector::iceberg::commit::rewrite_position_delete_files::RewritePositionDeleteOutcome,
+        String,
+    >{
+        let (catalog, table_ident, _) =
+            crate::engine::iceberg_maintenance::resolve_maintenance_catalog(
+                &self.state,
+                &target.catalog,
+                &target.namespace,
+                &target.table,
+            )?;
+        let options =
+            crate::connector::iceberg::commit::rewrite_position_delete_files::RewritePositionDeleteOptions {
+                rewrite_all: false,
+                min_input_files,
+            };
+        crate::connector::iceberg::catalog::registry::block_on_iceberg(async move {
+            crate::connector::iceberg::commit::rewrite_position_delete_files::run_rewrite_position_delete_files(
+                catalog,
+                table_ident,
+                options,
+            )
+            .await
+        })?
+    }
+
+    fn submit_optimize(
+        &mut self,
+        target: &MaintenanceTarget,
+    ) -> Result<OptimizeSubmission, String> {
+        match crate::engine::iceberg_maintenance::enqueue_optimize_job(
+            &self.state,
+            &target.catalog,
+            &target.namespace,
+            &target.table,
+        ) {
+            Ok(job_id) => Ok(OptimizeSubmission::Submitted { job_id }),
+            // The job repo rejects duplicates with a conflict error; treat it
+            // as "already active" instead of a failure.
+            Err(err) if err.contains("already exists") => Ok(OptimizeSubmission::AlreadyActive),
+            Err(err) => Err(err),
+        }
+    }
+}
+
+struct MaintenanceCandidate {
+    mv_id: i64,
+    target: MaintenanceTarget,
+    refresh_in_flight: bool,
+}
+
+fn load_candidates(
+    state: &Arc<StandaloneState>,
+) -> Result<
+    (
+        Vec<crate::meta::repository::mv::StoredMvDefinition>,
+        Vec<MaintenanceCandidate>,
+    ),
+    String,
+> {
+    let Some(provider) = state.metadata_provider.as_ref() else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let read = provider
+        .begin_read()
+        .map_err(|e| format!("open mv maintenance read transaction failed: {e}"))?;
+    let definitions = state
+        .mv_repo
+        .list_definitions(read.as_ref())
+        .map_err(|e| format!("list mv definitions for maintenance failed: {e}"))?;
+    let candidates = definitions
+        .iter()
+        .filter(|d| d.storage_engine.eq_ignore_ascii_case("iceberg"))
+        .filter_map(|d| {
+            let (Some(catalog), Some(namespace), Some(table)) = (
+                d.target_catalog.as_ref(),
+                d.target_namespace.as_ref(),
+                d.target_table.as_ref(),
+            ) else {
+                return None;
+            };
+            Some(MaintenanceCandidate {
+                mv_id: d.mv_id,
+                target: MaintenanceTarget {
+                    catalog: catalog.clone(),
+                    namespace: namespace.clone(),
+                    table: table.clone(),
+                },
+                refresh_in_flight: d.refresh_in_progress || d.active_refresh_id.is_some(),
+            })
+        })
+        .collect();
+    Ok((definitions, candidates))
+}
+
+impl MaintenanceCoordinator {
+    /// One full evaluation pass over all Iceberg-backed MV storage tables.
+    /// Deterministic given (state contents, now_ms); the integration tests
+    /// call this directly instead of going through the thread.
+    pub(crate) fn run_pass(
+        &mut self,
+        state: &Arc<StandaloneState>,
+        executor: &mut dyn MaintenanceExecutor,
+        now_ms: i64,
+    ) -> Result<(), String> {
+        let (definitions, candidates) = load_candidates(state)?;
+        let mut executed_tables = 0usize;
+        for candidate in &candidates {
+            if candidate.refresh_in_flight {
+                tracing::debug!(
+                    table = %candidate.target.fqn(),
+                    "auto maintenance skipped: refresh in flight"
+                );
+                continue;
+            }
+            // Stop once enough tables have acted this pass. Checked before
+            // loading metadata so deferred tables cost no IO; the table is left
+            // un-observed, so the next pass re-evaluates it from scratch.
+            if executed_tables >= self.config.max_concurrent {
+                continue;
+            }
+            let stats = match stats::collect_table_stats(
+                state,
+                &candidate.target.catalog,
+                &candidate.target.namespace,
+                &candidate.target.table,
+                &definitions,
+            ) {
+                Ok(stats) => stats,
+                Err(err) => {
+                    tracing::warn!(
+                        table = %candidate.target.fqn(),
+                        error = %err,
+                        "auto maintenance stats collection failed"
+                    );
+                    continue;
+                }
+            };
+            let outcome =
+                self.process_table(candidate.mv_id, &candidate.target, &stats, executor, now_ms);
+            // `executed_tables` counts tables that actually performed an action;
+            // no-op evaluations (cooldown, snapshot unchanged) do not consume
+            // the concurrency budget.
+            if !outcome.actions.is_empty() {
+                executed_tables += 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) struct MaintenanceCoordinatorHandle {
+    enabled: bool,
+    signal_tx: Option<Sender<MaintenanceSignal>>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl MaintenanceCoordinatorHandle {
+    pub(crate) fn disabled() -> Self {
+        Self {
+            enabled: false,
+            signal_tx: None,
+            worker: None,
+        }
+    }
+
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
+impl Drop for MaintenanceCoordinatorHandle {
+    fn drop(&mut self) {
+        if let Some(tx) = self.signal_tx.take() {
+            let _ = tx.send(MaintenanceSignal::Stop);
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn current_time_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX)
+}
+
+/// Notify the coordinator that an MV refresh committed. Cheap no-op when the
+/// coordinator is not running (tests, disabled config).
+pub(crate) fn notify_refresh_completed(state: &Arc<StandaloneState>) {
+    if let Ok(guard) = state.maintenance_signal_tx.lock() {
+        if let Some(tx) = guard.as_ref() {
+            let _ = tx.send(MaintenanceSignal::Wake);
+        }
+    }
+}
+
+pub(crate) fn start_maintenance_coordinator_for_server(
+    engine: &crate::engine::StandaloneNovaRocks,
+    config: MaintenanceCoordinatorConfig,
+) -> MaintenanceCoordinatorHandle {
+    if !config.enabled {
+        return MaintenanceCoordinatorHandle::disabled();
+    }
+    let state = Arc::clone(&engine.inner);
+    let (signal_tx, signal_rx) = mpsc::channel();
+    if let Ok(mut guard) = state.maintenance_signal_tx.lock() {
+        *guard = Some(signal_tx.clone());
+    }
+    let worker_config = config.clone();
+    let worker_state = Arc::clone(&state);
+    let worker = thread::Builder::new()
+        .name("novarocks-iceberg-maintenance".to_string())
+        .spawn(move || {
+            let mut coordinator = MaintenanceCoordinator::new(worker_config.clone());
+            let mut executor = StateMaintenanceExecutor::new(Arc::clone(&worker_state));
+            loop {
+                if let Err(err) =
+                    coordinator.run_pass(&worker_state, &mut executor, current_time_ms())
+                {
+                    tracing::warn!(error = %err, "iceberg maintenance pass failed");
+                }
+                match signal_rx.recv_timeout(Duration::from_millis(worker_config.tick_interval_ms))
+                {
+                    Ok(MaintenanceSignal::Stop) | Err(RecvTimeoutError::Disconnected) => break,
+                    Ok(MaintenanceSignal::Wake) => {
+                        // Coalesce bursts of refresh completions into one pass.
+                        let mut stop = false;
+                        while let Ok(signal) = signal_rx.try_recv() {
+                            if signal == MaintenanceSignal::Stop {
+                                stop = true;
+                                break;
+                            }
+                        }
+                        if stop {
+                            break;
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                }
+            }
+        });
+    match worker {
+        Ok(worker) => MaintenanceCoordinatorHandle {
+            enabled: true,
+            signal_tx: Some(signal_tx),
+            worker: Some(worker),
+        },
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to start iceberg maintenance worker");
+            MaintenanceCoordinatorHandle::disabled()
+        }
     }
 }
 
