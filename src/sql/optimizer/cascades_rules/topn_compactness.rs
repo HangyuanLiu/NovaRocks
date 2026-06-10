@@ -2,8 +2,8 @@ use crate::sql::optimizer::memo::{MExpr, Memo};
 use crate::sql::optimizer::operator::{LogicalTopNOp, Operator, TopNPhase};
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
 use crate::sql::optimizer::topn_proof::{
-    TopNWindow, ordering_covers, remap_sort_items_through_project, sort_items_to_keys,
-    sort_keys_equivalent,
+    ScanTopNCapability, TopNWindow, default_scan_topn_capability, ordering_covers,
+    remap_sort_items_through_project, sort_items_to_keys, sort_keys_equivalent,
 };
 
 pub(crate) struct MergeConsecutiveTopN;
@@ -63,6 +63,26 @@ impl Rule for PushTopNThroughProject {
 
     fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
         push_topn_through_project(expr, memo)
+    }
+}
+
+pub(crate) struct PushTopNIntoScan;
+
+impl Rule for PushTopNIntoScan {
+    fn name(&self) -> &str {
+        "PushTopNIntoScan"
+    }
+
+    fn rule_type(&self) -> RuleType {
+        RuleType::Transformation
+    }
+
+    fn matches(&self, op: &Operator) -> bool {
+        matches!(op, Operator::LogicalTopN(_))
+    }
+
+    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
+        push_topn_into_scan(expr, memo)
     }
 }
 
@@ -217,6 +237,36 @@ fn push_topn_through_project(expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
         });
     }
     results
+}
+
+fn push_topn_into_scan(expr: &MExpr, memo: &Memo) -> Vec<NewExpr> {
+    let Operator::LogicalTopN(topn) = &expr.op else {
+        return vec![];
+    };
+    if TopNWindow::from_limit_offset(topn.limit, topn.offset).is_none() {
+        return vec![];
+    }
+    if expr.children.len() != 1 {
+        return vec![];
+    }
+    let Some(child_group) = memo.groups.get(expr.children[0]) else {
+        return vec![];
+    };
+    let has_scan = child_group
+        .logical_exprs
+        .iter()
+        .any(|child| matches!(child.op, Operator::LogicalScan(_)));
+    if !has_scan {
+        return vec![];
+    }
+
+    match default_scan_topn_capability() {
+        ScanTopNCapability::NoOrdering => vec![],
+        ScanTopNCapability::OrderedTopK => vec![NewExpr {
+            op: expr.op.clone(),
+            children: expr.children.clone(),
+        }],
+    }
 }
 
 fn find_existing_logical_group(memo: &Memo, op: &Operator, children: &[usize]) -> Option<usize> {
@@ -750,6 +800,20 @@ mod tests {
         assert!(
             out.is_empty(),
             "computed Project expressions must fail closed"
+        );
+    }
+
+    #[test]
+    fn scan_pushdown_fails_closed_with_default_capability() {
+        let mut memo = Memo::new();
+        let scan_group = scan_group(&mut memo);
+        let topn = topn(&memo, 10, 0, TopNPhase::Final, false, scan_group);
+
+        let out = PushTopNIntoScan.apply(&topn, &mut memo);
+
+        assert!(
+            out.is_empty(),
+            "default scan capability must not produce TopN pushdown candidates"
         );
     }
 }

@@ -136,6 +136,16 @@ pub(crate) fn remap_sort_items_through_project(
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScanTopNCapability {
+    NoOrdering,
+    OrderedTopK,
+}
+
+pub(crate) fn default_scan_topn_capability() -> ScanTopNCapability {
+    ScanTopNCapability::NoOrdering
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,5 +340,13 @@ mod tests {
             }
             other => panic!("expected ColumnRef after remap, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn default_scan_capability_does_not_claim_ordered_topk() {
+        assert_eq!(
+            default_scan_topn_capability(),
+            ScanTopNCapability::NoOrdering
+        );
     }
 }
