@@ -195,23 +195,38 @@ fn push_topn_through_project(expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
             continue;
         };
 
-        let pushed_group = memo.new_group(MExpr {
-            id: memo.next_expr_id(),
-            op: Operator::LogicalTopN(LogicalTopNOp {
-                items: remapped_items,
-                limit: topn.limit,
-                offset: topn.offset,
-                phase: topn.phase,
-                is_split: topn.is_split,
-            }),
-            children: project_expr.children.clone(),
+        let pushed_op = Operator::LogicalTopN(LogicalTopNOp {
+            items: remapped_items,
+            limit: topn.limit,
+            offset: topn.offset,
+            phase: topn.phase,
+            is_split: topn.is_split,
         });
+        let pushed_group = find_existing_logical_group(memo, &pushed_op, &project_expr.children)
+            .unwrap_or_else(|| {
+                let pushed_id = memo.next_expr_id();
+                memo.new_group(MExpr {
+                    id: pushed_id,
+                    op: pushed_op,
+                    children: project_expr.children.clone(),
+                })
+            });
         results.push(NewExpr {
             op: Operator::LogicalProject(project.clone()),
             children: vec![pushed_group],
         });
     }
     results
+}
+
+fn find_existing_logical_group(memo: &Memo, op: &Operator, children: &[usize]) -> Option<usize> {
+    let op_debug = format!("{op:?}");
+    memo.groups.iter().position(|group| {
+        group
+            .logical_exprs
+            .iter()
+            .any(|expr| expr.children == children && format!("{:?}", expr.op) == op_debug)
+    })
 }
 
 fn topn_phase_can_merge(outer: &LogicalTopNOp, inner: &LogicalTopNOp) -> bool {
@@ -603,6 +618,49 @@ mod tests {
             }
             other => panic!("expected pushed LogicalTopN, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn project_pushdown_reuses_existing_pushed_topn_group() {
+        let mut memo = Memo::new();
+        let scan_group = scan_group(&mut memo);
+        let project_group = memo.new_group(project_with_items(
+            &memo,
+            vec![project_item(col(1), 10, "alias_c1")],
+            scan_group,
+        ));
+        let topn = topn_with_item(
+            &memo,
+            sort_item(10),
+            7,
+            0,
+            TopNPhase::Final,
+            false,
+            project_group,
+        );
+        let rule = project_pushdown_rule();
+
+        let first = rule.apply(&topn, &mut memo);
+        assert_eq!(first.len(), 1, "first apply should push TopN");
+        let first_pushed_group = first[0].children[0];
+        let group_count_after_first = memo.groups.len();
+
+        let second = rule.apply(&topn, &mut memo);
+
+        assert_eq!(
+            second.len(),
+            1,
+            "second apply should still return the candidate"
+        );
+        assert_eq!(
+            second[0].children[0], first_pushed_group,
+            "second apply should reuse the existing pushed TopN group"
+        );
+        assert_eq!(
+            memo.groups.len(),
+            group_count_after_first,
+            "second apply must not create another equivalent pushed TopN group"
+        );
     }
 
     #[test]
