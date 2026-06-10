@@ -14,7 +14,7 @@ pub(crate) mod schema_update;
 pub(crate) use backend::{
     IcebergCatalogBackend, IcebergTableSink, IcebergTableSource,
     build_iceberg_table_def_for_delta_scan, build_iceberg_table_def_with_files,
-    row_lineage_enabled,
+    hidden_internal_column_names_from_metadata, row_lineage_enabled,
 };
 pub(crate) use registry::{
     IcebergCatalogEntry, IcebergCatalogRegistry, IcebergLoadedTable, create_namespace,

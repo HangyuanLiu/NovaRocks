@@ -3,13 +3,21 @@
 //! background thread, injected `now_ms`) against a real `StandaloneState`
 //! backed by a local hadoop iceberg catalog, and verify the four acceptance
 //! behaviors:
-//!   1. auto OPTIMIZE compacts small files (see the `#[ignore]` note on
-//!      `scenario_1_auto_optimize_compacts_small_files` — blocked by a
-//!      pre-existing OPTIMIZE-of-MV-storage-table bug);
+//!   1. auto OPTIMIZE compacts small files
+//!      (`scenario_1_auto_optimize_compacts_small_files`);
 //!   2. auto EXPIRE honors `history.expire.*` and keeps min snapshots;
 //!   3. auto EXPIRE does not break a downstream incremental consumer;
 //!   4. the per-table escape hatch (`novarocks.maintenance.enabled=false`)
 //!      disables all maintenance for that table.
+//!
+//! Two additional correctness gates assert that OPTIMIZE of an MV storage
+//! table preserves the hidden apply-key (and aggregate-state) columns verbatim
+//! so a subsequent incremental refresh still locates the right target rows in
+//! the compacted files:
+//!   * `optimize_preserves_mv_apply_key_for_incremental_delete` (projection MV,
+//!     stored `__nova_base_row_id` apply key);
+//!   * `optimize_preserves_aggregate_mv_apply_key_and_state` (aggregate MV,
+//!     `__row_id__` group apply key plus hidden `__agg_state_*` columns).
 //!
 //! Setup intentionally reuses the proven, format-version-3 / row-lineage
 //! helpers from `crate::engine::mv::iceberg_refresh` (copied verbatim here, as
@@ -112,6 +120,61 @@ fn select_row_count(
         StatementResult::Ok => panic!("expected query result for {sql}"),
     };
     result.chunks.iter().map(|c| c.batch.num_rows()).sum()
+}
+
+/// Run a `SELECT id, region, amount FROM <mv> ORDER BY id` style query and
+/// return the materialized rows as `(id, region, amount)` tuples. Used by the
+/// apply-key correctness gate to assert the EXACT post-OPTIMIZE / post-refresh
+/// contents of a projection MV — not just the row count — so a dropped or
+/// corrupted hidden apply-key column (which would delete the wrong target row
+/// on the next incremental refresh) is caught.
+fn select_id_region_amount_rows(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    sql: &str,
+) -> Vec<(i32, String, i64)> {
+    use arrow::array::{Int32Array, Int64Array, StringArray};
+
+    let session = StandaloneSession {
+        inner: Arc::clone(state),
+    };
+    let result = match session
+        .execute_in_context(sql, current_catalog, current_database, None)
+        .unwrap_or_else(|e| panic!("execute select `{sql}`: {e}"))
+    {
+        StatementResult::Query(result) => result,
+        StatementResult::Ok => panic!("expected query result for {sql}"),
+    };
+    let mut rows = Vec::new();
+    for chunk in &result.chunks {
+        let id = chunk
+            .batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("id column is Int32");
+        let region = chunk
+            .batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("region column is Utf8");
+        let amount = chunk
+            .batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("amount column is Int64");
+        for row in 0..chunk.batch.num_rows() {
+            rows.push((
+                id.value(row),
+                region.value(row).to_string(),
+                amount.value(row),
+            ));
+        }
+    }
+    rows
 }
 
 fn parse_create_mv(sql: &str) -> CreateMaterializedViewStmt {
@@ -269,29 +332,18 @@ fn run_pass(env: &MaintenanceTestEnv, coordinator: &mut MaintenanceCoordinator) 
 
 // --- Scenario ①: auto OPTIMIZE compacts small files ---
 //
-// IGNORED — blocked by a PRE-EXISTING production bug, NOT by the maintenance
-// feature. The maintenance coordinator (correctly) submits an optimize job for
-// the small-file MV storage table, but executing that job via
-// `execute_whole_table_rewrite` (the existing `ALTER TABLE ... OPTIMIZE` job
-// path) fails on any NovaRocks iceberg MV storage table:
-//
-//     annotate_batch column count mismatch: batch=5 schema=6
-//
-// Root cause: `src/connector/iceberg/compact.rs` reads the table for a
-// row-lineage rewrite with `SELECT *, __row_id__, __last_updated_sequence_number__`.
-// `SELECT *` omits the MV's hidden internal apply-key column
-// (`__nova_base_row_id`, marked internal/hidden), so the read batch has 5
-// columns while the write target schema (which includes `__nova_base_row_id`)
-// expects 6. This reproduces via the plain manual `ALTER TABLE
-// ice.analytics.mv_opt OPTIMIZE` path too, so it is independent of IV3-11.
-// Fixing it requires production changes in compact.rs (out of scope for this
-// test task / forbidden by the test-only rule). Re-enable this test once the
-// OPTIMIZE-of-MV-storage-table path is fixed.
+// Previously ignored because OPTIMIZE of an MV storage table failed with
+// `annotate_batch column count mismatch: batch=5 schema=6`: the rewrite read
+// the table with `SELECT *, _row_id, _last_updated_sequence_number`, and
+// `SELECT *` omitted the MV's hidden internal apply-key column
+// (`__nova_base_row_id`) while the writer schema (built from the full physical
+// `current_schema()`) included it. The fix in `compact.rs` rewrites tables that
+// carry hidden internal columns through a direct physical read that preserves
+// every physical column (including the apply key) verbatim. This scenario now
+// exercises the small-file compaction path on a projection MV storage table;
+// `optimize_preserves_mv_apply_key_for_incremental_delete` is the companion
+// correctness gate that proves the apply key survives compaction.
 #[test]
-#[ignore = "blocked: OPTIMIZE of an MV storage table fails with `annotate_batch \
-            column count mismatch` (hidden apply-key column omitted by SELECT *); \
-            pre-existing production bug in compact.rs, reproducible via manual \
-            ALTER TABLE ... OPTIMIZE"]
 fn scenario_1_auto_optimize_compacts_small_files() {
     let env = open_env("ice", "analytics");
     create_aggregate_fact_table(&env.state, "ice", "sales", "fact");
@@ -605,5 +657,303 @@ fn scenario_4_escape_hatch_disables_table() {
     assert_eq!(
         after, before,
         "disabled table must be untouched: before={before} after={after}"
+    );
+}
+
+// --- Apply-key correctness gate: OPTIMIZE must preserve the hidden apply-key ---
+//
+// This is the strong correctness test for the OPTIMIZE-of-MV-storage-table fix.
+// Unlike `scenario_1` (which only `SELECT *`s after optimize and so never
+// exercises the apply-key locator against compacted files), this test forces an
+// incremental DELETE refresh that locates the target row by its STORED hidden
+// apply-key value (`__nova_base_row_id`) inside the now-compacted data files.
+//
+// A projection/filter MV (`SELECT id, region, amount FROM fact`) is used on
+// purpose: its apply key is `ApplyKeySource::BaseRowId`, materialized as a real
+// physical column `__nova_base_row_id` (field id 4) that is hidden from
+// `SELECT *`. The incremental DELETE path (`locate_target_rows_by_apply_key`)
+// reads that column BY STORED VALUE — it is NOT recomputable from the visible
+// columns. Therefore:
+//   * If OPTIMIZE drops the column, the post-optimize files have no
+//     `__nova_base_row_id` and the locator scan errors (column missing) or the
+//     MV silently full-refreshes.
+//   * If OPTIMIZE writes a WRONG value (e.g. regenerated row ids), the locator
+//     matches the wrong physical row and the DELETE removes the wrong MV row,
+//     producing incorrect final contents.
+//   * Only a verbatim carry-through of every row's `__nova_base_row_id` keeps
+//     the final rows exactly correct.
+//
+// Before the compact.rs fix this test fails at the OPTIMIZE step itself with
+// `annotate_batch column count mismatch: batch=5 schema=6` (the hidden column is
+// omitted by `SELECT *` while the writer schema includes it).
+#[test]
+fn optimize_preserves_mv_apply_key_for_incremental_delete() {
+    let env = open_env("ice", "analytics");
+    create_aggregate_fact_table(&env.state, "ice", "sales", "fact");
+    insert_into_aggregate_fact_table(&env.state, "ice", "sales", "fact", &[(1, "east", 10)]);
+
+    // Projection MV: each base append produces a fresh small data file on the
+    // MV storage table, and every MV row carries a distinct stored
+    // `__nova_base_row_id`.
+    create_mv(
+        &env,
+        "CREATE MATERIALIZED VIEW mv_keyed
+         DISTRIBUTED BY HASH(region) BUCKETS 1
+         PROPERTIES('storage_engine'='iceberg')
+         AS SELECT id, region, amount FROM ice.sales.fact",
+    );
+    refresh_mv(&env, "mv_keyed");
+    for id in 2..=4 {
+        insert_into_aggregate_fact_table(
+            &env.state,
+            "ice",
+            "sales",
+            "fact",
+            &[(id, "east", i64::from(id) * 10)],
+        );
+        refresh_mv(&env, "mv_keyed");
+    }
+
+    // Sanity: all four projected rows are present before compaction.
+    let before_rows = select_id_region_amount_rows(
+        &env.state,
+        Some("ice"),
+        &env.current_db,
+        "SELECT id, region, amount FROM mv_keyed ORDER BY id",
+    );
+    assert_eq!(
+        before_rows,
+        vec![
+            (1, "east".to_string(), 10),
+            (2, "east".to_string(), 20),
+            (3, "east".to_string(), 30),
+            (4, "east".to_string(), 40),
+        ],
+        "MV must hold all four rows before optimize"
+    );
+
+    // Lower the file-count threshold so the small files trigger a compaction
+    // job over the MV storage table.
+    let mut coordinator = coordinator_with(|cfg| {
+        cfg.policy.compaction_min_data_files = 2;
+    });
+    run_pass(&env, &mut coordinator);
+
+    // The optimize worker thread is not spawned under cfg(test); drive the
+    // submitted job synchronously. With the fix it rewrites the storage table
+    // (carrying `__nova_base_row_id` verbatim) and reaches Finished.
+    crate::connector::iceberg::compact::run_optimize_jobs_once(&env.state)
+        .expect("run optimize job");
+
+    let provider = env.state.metadata_provider.as_ref().expect("provider");
+    let read = provider.begin_read().expect("read txn");
+    let jobs = env
+        .state
+        .job_repo
+        .show_iceberg_optimize_jobs(read.as_ref())
+        .expect("list jobs");
+    drop(read);
+    assert!(!jobs.is_empty(), "expected an auto-submitted optimize job");
+    assert!(
+        jobs.iter().all(|j| matches!(
+            j.state,
+            crate::meta::repository::job::IcebergOptimizeJobState::Finished
+        )),
+        "optimize of the MV storage table must Finish (not Fail): {jobs:?}"
+    );
+
+    // Contents must be unchanged by the pure rewrite.
+    let after_optimize_rows = select_id_region_amount_rows(
+        &env.state,
+        Some("ice"),
+        &env.current_db,
+        "SELECT id, region, amount FROM mv_keyed ORDER BY id",
+    );
+    assert_eq!(
+        after_optimize_rows, before_rows,
+        "OPTIMIZE must not change MV contents"
+    );
+
+    // Now DELETE a base row whose projected MV row lives in the COMPACTED
+    // files, then refresh. The incremental DELETE path must locate the target
+    // row by its stored `__nova_base_row_id` inside the rewritten files. If the
+    // apply key was dropped/corrupted this either errors or deletes the wrong
+    // row.
+    exec_sql(
+        &env.state,
+        Some("ice"),
+        &env.current_db,
+        "DELETE FROM ice.sales.fact WHERE id = 2",
+    );
+    refresh_mv(&env, "mv_keyed");
+
+    let final_rows = select_id_region_amount_rows(
+        &env.state,
+        Some("ice"),
+        &env.current_db,
+        "SELECT id, region, amount FROM mv_keyed ORDER BY id",
+    );
+    assert_eq!(
+        final_rows,
+        vec![
+            (1, "east".to_string(), 10),
+            (3, "east".to_string(), 30),
+            (4, "east".to_string(), 40),
+        ],
+        "incremental DELETE refresh after OPTIMIZE must remove exactly id=2 \
+         (proves the stored apply key survived compaction verbatim)"
+    );
+}
+
+/// Run a `SELECT region, c FROM <mv> ORDER BY region` style query and return
+/// the rows as `(region, count)` tuples.
+fn select_region_count_rows(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    sql: &str,
+) -> Vec<(String, i64)> {
+    use arrow::array::{Int64Array, StringArray};
+
+    let session = StandaloneSession {
+        inner: Arc::clone(state),
+    };
+    let result = match session
+        .execute_in_context(sql, current_catalog, current_database, None)
+        .unwrap_or_else(|e| panic!("execute select `{sql}`: {e}"))
+    {
+        StatementResult::Query(result) => result,
+        StatementResult::Ok => panic!("expected query result for {sql}"),
+    };
+    let mut rows = Vec::new();
+    for chunk in &result.chunks {
+        let region = chunk
+            .batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("region column is Utf8");
+        let count = chunk
+            .batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count column is Int64");
+        for row in 0..chunk.batch.num_rows() {
+            rows.push((region.value(row).to_string(), count.value(row)));
+        }
+    }
+    rows
+}
+
+// --- Apply-key correctness gate (aggregate MV): OPTIMIZE preserves the group
+//     apply key AND the hidden aggregate-state columns ---
+//
+// Companion to `optimize_preserves_mv_apply_key_for_incremental_delete`, this
+// time over an AGGREGATE MV whose storage table carries different hidden
+// internal columns: the `GroupRowId` apply key (`__row_id__`, field id 1) plus
+// the hidden aggregate-state columns (`__agg_state_*`). An incremental refresh
+// that updates an existing group locates the group's target row by its apply
+// key inside the compacted files AND must read back the correct accumulated
+// aggregate state. If OPTIMIZE dropped or corrupted any hidden column, this
+// errors or produces wrong group counts. Without the compact.rs fix it fails at
+// the OPTIMIZE step with the same column-count mismatch (more columns hidden, so
+// the gap is even larger).
+#[test]
+fn optimize_preserves_aggregate_mv_apply_key_and_state() {
+    let env = open_env("ice", "analytics");
+    create_aggregate_fact_table(&env.state, "ice", "sales", "fact");
+    insert_into_aggregate_fact_table(&env.state, "ice", "sales", "fact", &[(1, "east", 10)]);
+
+    // Aggregate MV: a fresh small data file is written on each refresh that
+    // touches a group, and the storage table carries `__row_id__` + agg-state
+    // columns hidden from `SELECT *`.
+    create_mv(
+        &env,
+        "CREATE MATERIALIZED VIEW mv_agg
+         DISTRIBUTED BY HASH(region) BUCKETS 1
+         PROPERTIES('storage_engine'='iceberg')
+         AS SELECT region, count(*) AS c FROM ice.sales.fact GROUP BY region",
+    );
+    refresh_mv(&env, "mv_agg");
+    // Insert into several regions across refreshes to accumulate small files.
+    for (id, region) in [(2, "west"), (3, "east"), (4, "north"), (5, "west")] {
+        insert_into_aggregate_fact_table(&env.state, "ice", "sales", "fact", &[(id, region, 10)]);
+        refresh_mv(&env, "mv_agg");
+    }
+
+    let before_rows = select_region_count_rows(
+        &env.state,
+        Some("ice"),
+        &env.current_db,
+        "SELECT region, c FROM mv_agg ORDER BY region",
+    );
+    assert_eq!(
+        before_rows,
+        vec![
+            ("east".to_string(), 2),
+            ("north".to_string(), 1),
+            ("west".to_string(), 2),
+        ],
+        "aggregate MV must hold correct group counts before optimize"
+    );
+
+    let mut coordinator = coordinator_with(|cfg| {
+        cfg.policy.compaction_min_data_files = 2;
+    });
+    run_pass(&env, &mut coordinator);
+    crate::connector::iceberg::compact::run_optimize_jobs_once(&env.state)
+        .expect("run optimize job");
+
+    let provider = env.state.metadata_provider.as_ref().expect("provider");
+    let read = provider.begin_read().expect("read txn");
+    let jobs = env
+        .state
+        .job_repo
+        .show_iceberg_optimize_jobs(read.as_ref())
+        .expect("list jobs");
+    drop(read);
+    assert!(!jobs.is_empty(), "expected an auto-submitted optimize job");
+    assert!(
+        jobs.iter().all(|j| matches!(
+            j.state,
+            crate::meta::repository::job::IcebergOptimizeJobState::Finished
+        )),
+        "optimize of the aggregate MV storage table must Finish (not Fail): {jobs:?}"
+    );
+
+    // Contents unchanged by the pure rewrite.
+    let after_optimize_rows = select_region_count_rows(
+        &env.state,
+        Some("ice"),
+        &env.current_db,
+        "SELECT region, c FROM mv_agg ORDER BY region",
+    );
+    assert_eq!(
+        after_optimize_rows, before_rows,
+        "OPTIMIZE must not change aggregate MV contents"
+    );
+
+    // Insert into an EXISTING group, then refresh. The incremental refresh must
+    // UPDATE that group's row, which locates the old group row by its apply key
+    // inside the COMPACTED files and reads back its accumulated state.
+    insert_into_aggregate_fact_table(&env.state, "ice", "sales", "fact", &[(6, "east", 10)]);
+    refresh_mv(&env, "mv_agg");
+
+    let final_rows = select_region_count_rows(
+        &env.state,
+        Some("ice"),
+        &env.current_db,
+        "SELECT region, c FROM mv_agg ORDER BY region",
+    );
+    assert_eq!(
+        final_rows,
+        vec![
+            ("east".to_string(), 3),
+            ("north".to_string(), 1),
+            ("west".to_string(), 2),
+        ],
+        "incremental refresh after OPTIMIZE must update east -> 3 (proves the \
+         group apply key and aggregate state survived compaction verbatim)"
     );
 }
