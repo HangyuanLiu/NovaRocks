@@ -464,6 +464,9 @@ fn format_physical_node(
                 "{pad}     TABLE: {}.{}",
                 op.database, op.table.name
             ));
+            if let Some(ref mv) = op.mv_rewritten_from {
+                out.push(format!("{pad}     rewritten with mv: {mv}"));
+            }
             if let Some(ref cols) = op.required_columns
                 && matches!(
                     level,
@@ -1392,6 +1395,7 @@ mod tests {
                 predicates: Vec::new(),
                 required_columns: Some(vec![column.name.clone()]),
                 dict_columns: vec![],
+                mv_rewritten_from: None,
             }),
             children: Vec::new(),
             stats: Statistics {
@@ -1445,6 +1449,7 @@ mod tests {
                 predicates: Vec::new(),
                 required_columns: Some(vec![column.name.clone()]),
                 dict_columns: vec![],
+                mv_rewritten_from: None,
             }),
             children: Vec::new(),
             stats: Statistics {
@@ -1489,6 +1494,7 @@ mod tests {
                 predicates: Vec::new(),
                 required_columns: None,
                 dict_columns: vec![],
+                mv_rewritten_from: None,
             }),
             children: Vec::new(),
             stats: Statistics {
@@ -1636,6 +1642,7 @@ mod tests {
                 predicates: Vec::new(),
                 required_columns: Some(vec![column.name.clone()]),
                 dict_columns: vec![],
+                mv_rewritten_from: None,
             }),
             children: Vec::new(),
             stats: Statistics {
@@ -1709,6 +1716,7 @@ mod tests {
                 predicates: Vec::new(),
                 required_columns: Some(vec![column.name.clone()]),
                 dict_columns: vec![],
+                mv_rewritten_from: None,
             }),
             children: Vec::new(),
             stats: Statistics {

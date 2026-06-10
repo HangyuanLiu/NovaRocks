@@ -344,6 +344,7 @@ mod tests {
                 predicates: Vec::new(),
                 required_columns: None,
                 dict_columns: Vec::new(),
+                mv_rewritten_from: None,
             }),
             children: Vec::new(),
         });

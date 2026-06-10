@@ -25,6 +25,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
                 predicates: node.predicates.clone(),
                 required_columns: node.required_columns.clone(),
                 dict_columns: node.dict_columns.clone(),
+                mv_rewritten_from: None,
             });
             let expr = MExpr {
                 id: memo.next_expr_id(),
