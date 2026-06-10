@@ -89,7 +89,7 @@ Commit message language is English.
 - Create: `src/sql/optimizer/topn_proof.rs`
 - Modify: `src/sql/optimizer/mod.rs`
 
-- [ ] **Step 1: Add the module export**
+- [x] **Step 1: Add the module export**
 
 In `src/sql/optimizer/mod.rs`, add this line near the other optimizer modules:
 
@@ -97,7 +97,7 @@ In `src/sql/optimizer/mod.rs`, add this line near the other optimizer modules:
 pub(crate) mod topn_proof;
 ```
 
-- [ ] **Step 2: Write failing proof helper tests**
+- [x] **Step 2: Write failing proof helper tests**
 
 Create `src/sql/optimizer/topn_proof.rs` with this test-first skeleton:
 
@@ -330,7 +330,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Run proof helper tests**
+- [x] **Step 3: Run proof helper tests**
 
 Run:
 
@@ -340,7 +340,7 @@ cargo test --lib topn_proof -- --nocapture
 
 Expected: PASS.
 
-- [ ] **Step 4: Format and commit**
+- [x] **Step 4: Format and commit**
 
 ```bash
 cargo fmt
@@ -354,7 +354,7 @@ git commit -m "feat(optimizer): add TopN proof helper"
 - Create: `src/sql/optimizer/cascades_rules/topn_compactness.rs`
 - Modify: `src/sql/optimizer/cascades_rules/mod.rs`
 
-- [ ] **Step 1: Write failing rule tests**
+- [x] **Step 1: Write failing rule tests**
 
 Create `src/sql/optimizer/cascades_rules/topn_compactness.rs` with this initial module:
 
@@ -543,7 +543,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Register the module and rule**
+- [x] **Step 2: Register the module and rule**
 
 In `src/sql/optimizer/cascades_rules/mod.rs`, add:
 
@@ -558,7 +558,7 @@ In `all_transformation_rules()`, add `MergeConsecutiveTopN` after `SplitTopN`:
         Box::new(topn_compactness::MergeConsecutiveTopN),
 ```
 
-- [ ] **Step 3: Run rule tests**
+- [x] **Step 3: Run rule tests**
 
 Run:
 
@@ -569,7 +569,7 @@ cargo test --lib topn_compactness::tests::does_not_merge_when_inner_window_is_to
 
 Expected: PASS.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 cargo fmt
@@ -583,7 +583,7 @@ git commit -m "feat(optimizer): merge consecutive TopN alternatives"
 - Modify: `src/sql/optimizer/cascades_rules/topn_compactness.rs`
 - Modify: `src/sql/optimizer/cascades_rules/mod.rs`
 
-- [ ] **Step 1: Add failing tests for Sort elision**
+- [x] **Step 1: Add failing tests for Sort elision**
 
 Append this rule implementation shell and tests to `topn_compactness.rs`:
 
@@ -684,7 +684,7 @@ fn removes_plain_sort_under_matching_topn() {
 }
 ```
 
-- [ ] **Step 2: Register the rule**
+- [x] **Step 2: Register the rule**
 
 In `all_transformation_rules()` add:
 
@@ -694,7 +694,7 @@ In `all_transformation_rules()` add:
 
 immediately after `MergeConsecutiveTopN`.
 
-- [ ] **Step 3: Run focused tests**
+- [x] **Step 3: Run focused tests**
 
 Run:
 
@@ -704,7 +704,7 @@ cargo test --lib topn_compactness::tests::removes_plain_sort_under_matching_topn
 
 Expected: PASS.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 cargo fmt
@@ -718,7 +718,7 @@ git commit -m "feat(optimizer): remove redundant sort under TopN"
 - Create: `sql-tests/optimizer/sql/topn_compactness_merge.sql`
 - Create: `sql-tests/optimizer/sql/topn_compactness_sort_elision.sql`
 
-- [ ] **Step 1: Create merge golden**
+- [x] **Step 1: Create merge golden**
 
 Create `sql-tests/optimizer/sql/topn_compactness_merge.sql`:
 
@@ -766,7 +766,7 @@ LIMIT 2;
 SET disable_optimizer_rules = '';
 ```
 
-- [ ] **Step 2: Create sort elision golden**
+- [x] **Step 2: Create sort elision golden**
 
 Create `sql-tests/optimizer/sql/topn_compactness_sort_elision.sql`:
 
@@ -809,7 +809,7 @@ LIMIT 2;
 SET disable_optimizer_rules = '';
 ```
 
-- [ ] **Step 3: Run optimizer cases**
+- [x] **Step 3: Run optimizer cases**
 
 Start standalone server from the generated environment, then run:
 
@@ -823,7 +823,7 @@ cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
 
 Expected: PASS. If output goldens are missing because these are new cases, run the same command with `--mode record`, inspect the generated result files for compactness, then rerun `--mode verify`.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add sql-tests/optimizer/sql/topn_compactness_merge.sql sql-tests/optimizer/sql/topn_compactness_sort_elision.sql sql-tests/optimizer/result/topn_compactness_merge.result sql-tests/optimizer/result/topn_compactness_sort_elision.result
@@ -837,7 +837,7 @@ git commit -m "test(optimizer): add TopN compactness goldens"
 **Files:**
 - Modify: `src/sql/optimizer/cascades_rules/topn_compactness.rs`
 
-- [ ] **Step 1: Add Project pushdown rule**
+- [x] **Step 1: Add Project pushdown rule**
 
 Append this rule:
 
@@ -908,7 +908,7 @@ fn push_topn_through_project(expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
 }
 ```
 
-- [ ] **Step 2: Add positive Project pushdown test**
+- [x] **Step 2: Add positive Project pushdown test**
 
 Add this test to the existing `tests` module:
 
@@ -975,7 +975,7 @@ fn project_pushdown_remaps_column_ref_sort_keys() {
 }
 ```
 
-- [ ] **Step 3: Register Project rule**
+- [x] **Step 3: Register Project rule**
 
 In `src/sql/optimizer/cascades_rules/mod.rs`, add:
 
@@ -985,7 +985,7 @@ In `src/sql/optimizer/cascades_rules/mod.rs`, add:
 
 after the Sort elision rule.
 
-- [ ] **Step 4: Run focused tests**
+- [x] **Step 4: Run focused tests**
 
 Run:
 
@@ -995,7 +995,7 @@ cargo test --lib topn_compactness -- --nocapture
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cargo fmt
@@ -1010,7 +1010,7 @@ git commit -m "feat(optimizer): push TopN through pure projects"
 - Modify: `src/sql/optimizer/cascades_rules/topn_compactness.rs`
 - Modify: `src/sql/optimizer/cascades_rules/mod.rs`
 
-- [ ] **Step 1: Add scan capability helper**
+- [x] **Step 1: Add scan capability helper**
 
 Add to `topn_proof.rs`:
 
@@ -1035,7 +1035,7 @@ fn default_scan_capability_does_not_claim_ordered_topk() {
 }
 ```
 
-- [ ] **Step 2: Add PushTopNIntoScan rule that fails closed**
+- [x] **Step 2: Add PushTopNIntoScan rule that fails closed**
 
 Add to `topn_compactness.rs`:
 
@@ -1090,7 +1090,7 @@ impl Rule for PushTopNIntoScan {
 
 This intentionally produces no new candidate with current scan backends. It locks in the fail-closed capability boundary so a future backend can opt in explicitly.
 
-- [ ] **Step 3: Register Scan rule**
+- [x] **Step 3: Register Scan rule**
 
 In `all_transformation_rules()` add:
 
@@ -1100,7 +1100,7 @@ In `all_transformation_rules()` add:
 
 before Project pushdown.
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run:
 
@@ -1111,7 +1111,7 @@ cargo test --lib topn_compactness -- --nocapture
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cargo fmt
@@ -1125,7 +1125,7 @@ git commit -m "feat(optimizer): add scan TopN capability guard"
 - Modify: `src/sql/optimizer/cascades_rules/topn_compactness.rs`
 - Modify: `src/sql/optimizer/cascades_rules/mod.rs`
 
-- [ ] **Step 1: Add guarded rule structs**
+- [x] **Step 1: Add guarded rule structs**
 
 Add these rule structs with fail-closed implementations first:
 
@@ -1178,7 +1178,7 @@ fn push_topn_through_setop(_expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
 
 This creates stable rule names and disable hooks before adding positive cases.
 
-- [ ] **Step 2: Add false-case tests**
+- [x] **Step 2: Add false-case tests**
 
 Add these tests to the existing `tests` module in `topn_compactness.rs`:
 
@@ -1282,7 +1282,7 @@ fn setop_pushdown_fails_closed_for_union_distinct() {
 }
 ```
 
-- [ ] **Step 3: Register guarded rules**
+- [x] **Step 3: Register guarded rules**
 
 In `all_transformation_rules()` add:
 
@@ -1292,7 +1292,7 @@ In `all_transformation_rules()` add:
         Box::new(topn_compactness::PushTopNThroughSetOp),
 ```
 
-- [ ] **Step 4: Run false-case tests**
+- [x] **Step 4: Run false-case tests**
 
 Run:
 
@@ -1302,7 +1302,7 @@ cargo test --lib topn_compactness -- --nocapture
 
 Expected: PASS and no rule generates unsafe candidates.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cargo fmt
@@ -1315,7 +1315,7 @@ git commit -m "feat(optimizer): add guarded TopN pushdown rules"
 **Files:**
 - Modify: `src/sql/optimizer/cascades_rules/topn_compactness.rs`
 
-- [ ] **Step 1: Implement UNION ALL branch candidate**
+- [x] **Step 1: Implement UNION ALL branch candidate**
 
 Replace `push_topn_through_setop` with:
 
@@ -1363,7 +1363,7 @@ fn push_topn_through_setop(expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
 
 This is pruning-only: the final TopN is intentionally retained.
 
-- [ ] **Step 2: Add positive UNION ALL test**
+- [x] **Step 2: Add positive UNION ALL test**
 
 Add this test to the existing `tests` module:
 
@@ -1419,7 +1419,7 @@ fn setop_pushdown_adds_branch_topn_for_union_all_and_keeps_final_topn() {
 }
 ```
 
-- [ ] **Step 3: Run tests**
+- [x] **Step 3: Run tests**
 
 Run:
 
@@ -1429,7 +1429,7 @@ cargo test --lib topn_compactness -- --nocapture
 
 Expected: PASS.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 cargo fmt
@@ -1443,7 +1443,7 @@ git commit -m "feat(optimizer): add UNION ALL TopN branch pruning"
 - Create: `sql-tests/optimizer/sql/topn_compactness_scan_project.sql`
 - Create: `sql-tests/optimizer/sql/topn_compactness_join_aggregate_setop.sql`
 
-- [ ] **Step 1: Create scan/project SQL case**
+- [x] **Step 1: Create scan/project SQL case**
 
 Create `sql-tests/optimizer/sql/topn_compactness_scan_project.sql`:
 
@@ -1485,7 +1485,7 @@ LIMIT 2;
 SET disable_optimizer_rules = '';
 ```
 
-- [ ] **Step 2: Create join/aggregate/set-op SQL case**
+- [x] **Step 2: Create join/aggregate/set-op SQL case**
 
 Create `sql-tests/optimizer/sql/topn_compactness_join_aggregate_setop.sql`:
 
@@ -1534,7 +1534,7 @@ ORDER BY l.score DESC
 LIMIT 1;
 ```
 
-- [ ] **Step 3: Record and verify**
+- [x] **Step 3: Record and verify**
 
 Run:
 
@@ -1553,7 +1553,7 @@ cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
 
 Expected: verify PASS.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add sql-tests/optimizer/sql/topn_compactness_scan_project.sql sql-tests/optimizer/sql/topn_compactness_join_aggregate_setop.sql sql-tests/optimizer/result/topn_compactness_scan_project.result sql-tests/optimizer/result/topn_compactness_join_aggregate_setop.result
@@ -1568,7 +1568,7 @@ git commit -m "test(optimizer): add TopN pushdown guard goldens"
 - Modify: `src/sql/optimizer/derive/top_n.rs`
 - Modify: `src/sql/optimizer/property.rs`
 
-- [ ] **Step 1: Add regression test for non-column TopN key**
+- [x] **Step 1: Add regression test for non-column TopN key**
 
 In `derive/top_n.rs` tests, add:
 
@@ -1601,7 +1601,7 @@ fn top_n_non_column_sort_key_does_not_claim_ordering() {
 }
 ```
 
-- [ ] **Step 2: Run test**
+- [x] **Step 2: Run test**
 
 Run:
 
@@ -1611,7 +1611,7 @@ cargo test --lib top_n_non_column_sort_key_does_not_claim_ordering
 
 Expected: PASS with current or minimally adjusted implementation.
 
-- [ ] **Step 3: Add ordering proof helper test in property module**
+- [x] **Step 3: Add ordering proof helper test in property module**
 
 In `property.rs` tests, add:
 
@@ -1635,7 +1635,7 @@ fn ordering_prefix_stays_strict_without_equivalence_helper() {
 
 This preserves the existing strict `satisfies` contract; equivalence-aware decisions stay in `topn_proof`.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 cargo fmt
@@ -1650,7 +1650,7 @@ git commit -m "test(optimizer): lock conservative TopN ordering properties"
 - Modify: `src/sql/explain.rs`
 - Modify: `sql-tests/optimizer/sql/topn_compactness_merge.sql`
 
-- [ ] **Step 1: Inspect current q41/q72 shapes**
+- [x] **Step 1: Inspect current q41/q72 shapes**
 
 Run:
 
@@ -1662,15 +1662,15 @@ rg -n "TOP-N|SORT|MERGING-EXCHANGE|EXCHANGE" \
 
 Expected current baseline includes consecutive `TOP-N` lines in NR q41/q72.
 
-- [ ] **Step 2: Add a Rust regression only if physical extraction still emits duplicate global TopN**
+- [x] **Step 2: Add a Rust regression only if physical extraction still emits duplicate global TopN**
 
 If the earlier rule changes still leave a duplicate global `PhysicalTopN` in extracted plans, add a focused unit test near existing TopN/fragment builder tests in `fragment_builder.rs`. The test should build `PhysicalTopN(Final, is_split=true)` over `PhysicalTopN(Partial)` and assert the generated root plan does not contain two global TopN labels. Use existing helper patterns around TopN tests in `fragment_builder.rs`; do not rewrite fragment builder setup.
 
-- [ ] **Step 3: Make the minimal codegen/explain adjustment**
+- [x] **Step 3: Make the minimal codegen/explain adjustment**
 
 If the failure is only explain labeling, adjust `src/sql/explain.rs` to distinguish local partial pre-sort from global `TOP-N`. If the failure is physical tree shape, adjust extraction/rule generation first instead of hiding it in EXPLAIN.
 
-- [ ] **Step 4: Run focused checks**
+- [x] **Step 4: Run focused checks**
 
 Run:
 
@@ -1681,7 +1681,7 @@ cargo test --lib explain -- --nocapture
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit if code changed**
+- [x] **Step 5: Commit if code changed**
 
 If this task changed code, commit:
 
@@ -1698,7 +1698,7 @@ If inspection proves no code change is needed, leave no commit for this task and
 - No source edits expected.
 - The external roadmap note is not modified by this plan.
 
-- [ ] **Step 1: Run formatting**
+- [x] **Step 1: Run formatting**
 
 Run:
 
@@ -1708,7 +1708,7 @@ cargo fmt --check
 
 Expected: PASS.
 
-- [ ] **Step 2: Run Rust focused tests**
+- [x] **Step 2: Run Rust focused tests**
 
 Run:
 
@@ -1720,7 +1720,7 @@ cargo test --lib top_n_non_column_sort_key_does_not_claim_ordering
 
 Expected: PASS.
 
-- [ ] **Step 3: Build**
+- [x] **Step 3: Build**
 
 Run:
 
@@ -1730,7 +1730,7 @@ cargo build
 
 Expected: PASS.
 
-- [ ] **Step 4: Run order-sensitive SQL verify**
+- [x] **Step 4: Run order-sensitive SQL verify**
 
 Run with standalone server running:
 
@@ -1744,7 +1744,7 @@ cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
 
 Expected: PASS.
 
-- [ ] **Step 5: Run optimizer TopN compactness verify**
+- [x] **Step 5: Run optimizer TopN compactness verify**
 
 Run:
 
@@ -1758,7 +1758,7 @@ cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
 
 Expected: PASS.
 
-- [ ] **Step 6: Compare plan-quality baseline snippets**
+- [x] **Step 6: Compare plan-quality baseline snippets**
 
 Run:
 
@@ -1773,7 +1773,7 @@ Expected after regenerating plan-quality outputs in a follow-up validation run:
 - q41/q72 no longer show consecutive equivalent global `TOP-N`.
 - q22 does not gain extra Sort/Gather.
 
-- [ ] **Step 7: Final commit for validation artifacts if any were recorded**
+- [x] **Step 7: Final commit for validation artifacts if any were recorded**
 
 If any result files changed during verification:
 
