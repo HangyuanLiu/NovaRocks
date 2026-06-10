@@ -19,6 +19,7 @@ pub(crate) mod runtime_filter_pass;
 pub(crate) mod search;
 pub(crate) mod statistics;
 pub(crate) mod stats;
+pub(crate) mod topn_proof;
 
 pub(crate) use memo::Memo;
 pub(crate) use operator::Operator;
