@@ -129,7 +129,7 @@ async fn run_expire_one_attempt(
         });
     }
 
-    // Step 5: enumerate files.
+    // Enumerate files referenced by the candidate snapshots (algorithm step 5).
     let candidate_set: HashSet<i64> = candidates.iter().copied().collect();
     let files_for_candidates =
         enumerate_files_for_snapshots(file_io, metadata, &candidate_set).await?;
@@ -147,7 +147,7 @@ async fn run_expire_one_attempt(
         .cloned()
         .collect();
 
-    // Step 6: puffin half-reference protection.
+    // Puffin half-reference protection (algorithm step 6).
     // NOTE(R7 spike): `DataFile::referenced_data_file()` is pub in iceberg-0.9.0
     // (`vendor/iceberg-0.9.0/src/spec/manifest/data_file.rs:276`), so the full
     // DV index can be built. If it were absent, we would return an empty index
@@ -155,7 +155,7 @@ async fn run_expire_one_attempt(
     let dv_index = build_dv_index_from_metadata(metadata, file_io, &all_snapshot_ids).await?;
     puffin_half_reference_protection(&mut to_delete, &dv_index, &protected_files);
 
-    // Step 7: commit the metadata change via OCC.
+    // Commit the metadata change via OCC (algorithm step 7).
     // The `RemoveSnapshots` update tells the catalog to drop the listed snapshot
     // entries from metadata. The iceberg-rs builder automatically:
     //   - prunes refs whose snapshot id was removed (table_metadata_builder.rs),
@@ -188,7 +188,7 @@ async fn run_expire_one_attempt(
         .build();
     catalog.update_table(commit).await?;
 
-    // Step 8: best-effort physical delete.
+    // Best-effort physical delete (algorithm step 8).
     let deleted_file_count = best_effort_delete_files(file_io, &to_delete).await;
 
     Ok(ExpireOutcome {
@@ -205,8 +205,8 @@ async fn run_expire_one_attempt(
 ///   * the most-recent `retain_last` snapshots of the main ancestor chain.
 ///
 /// When `older_than_ms` is set, only protected-complement snapshots strictly
-/// older than the threshold are expired. Genuine danglers (in no ref and not
-/// in the main retain window) are expirable and therefore preserved here.
+/// older than the threshold are expired. Genuine danglers (in no ref and
+/// outside the main retain window) are not protected, so they remain expirable.
 ///
 /// Default keep = 1 so the table is never left headless even when the caller
 /// passes no `retain_last`. This prunes old snapshots on a normal linearly
