@@ -738,6 +738,7 @@ impl FragmentDispatcher for RemoteDispatcher {
                 })
                 .collect(),
             reason: "coordinator cancel".to_string(),
+            start_epoch: 0,
         };
         let runtime_handle = match crate::runtime::global_async_runtime::data_runtime_handle() {
             Ok(handle) => handle,
@@ -938,8 +939,8 @@ mod tests {
     use proto::novarocks::{
         BatchReportExecStatusRequest, BatchReportExecStatusResponse, CancelFragmentRequest,
         ExchangeRequest, ExchangeResponse, FetchResultRequest, FetchResultResponse,
-        ReportExecStatusRequest, ReportExecStatusResponse, SubmitFragmentRequest,
-        SubmitFragmentResponse,
+        HeartbeatRequest, HeartbeatResponse, ReportExecStatusRequest, ReportExecStatusResponse,
+        SubmitFragmentRequest, SubmitFragmentResponse,
     };
     use proto::starrocks::{
         PLookUpRequest, PLookUpResponse, PTransmitRuntimeFilterParams, PTransmitRuntimeFilterResult,
@@ -1175,6 +1176,18 @@ mod tests {
             }
             self.0.cancel_count.fetch_add(1, Ordering::SeqCst);
             Ok(Response::new(proto::novarocks::CancelFragmentResponse {
+                status_code: 0,
+            }))
+        }
+
+        async fn heartbeat(
+            &self,
+            _request: Request<HeartbeatRequest>,
+        ) -> Result<Response<HeartbeatResponse>, Status> {
+            Ok(Response::new(HeartbeatResponse {
+                start_epoch: 1,
+                version: "test".into(),
+                num_cores: 1,
                 status_code: 0,
             }))
         }

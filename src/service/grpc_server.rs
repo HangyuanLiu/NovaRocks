@@ -417,6 +417,22 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         ))
     }
 
+    async fn heartbeat(
+        &self,
+        request: tonic::Request<proto::novarocks::HeartbeatRequest>,
+    ) -> Result<tonic::Response<proto::novarocks::HeartbeatResponse>, tonic::Status> {
+        let _req = request.into_inner();
+        let num_cores = std::thread::available_parallelism()
+            .map(|n| n.get() as u32)
+            .unwrap_or(1);
+        Ok(tonic::Response::new(proto::novarocks::HeartbeatResponse {
+            start_epoch: crate::runtime::start_epoch::start_epoch(),
+            version: crate::version::short_version().to_string(),
+            num_cores,
+            status_code: 0,
+        }))
+    }
+
     async fn report_exec_status(
         &self,
         request: tonic::Request<proto::novarocks::ReportExecStatusRequest>,
@@ -1198,8 +1214,8 @@ mod pr3_tests {
     use super::proto::novarocks::fetch_result_response::Status as FetchStatus;
     use super::proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc as _;
     use super::proto::novarocks::{
-        CancelFragmentRequest, FetchResultRequest, PUniqueId, ReportExecStatusRequest,
-        SubmitFragmentRequest,
+        CancelFragmentRequest, FetchResultRequest, HeartbeatRequest, PUniqueId,
+        ReportExecStatusRequest, SubmitFragmentRequest,
     };
     use crate::common::thrift::thrift_binary_serialize;
     use crate::{frontend_service, status, status_code, types};
@@ -1275,6 +1291,7 @@ mod pr3_tests {
         let req = Request::new(CancelFragmentRequest {
             finst_ids: vec![PUniqueId { hi: 1, lo: 2 }],
             reason: "test".to_string(),
+            start_epoch: 0,
         });
         let resp = svc.cancel_fragment(req).await.expect("RPC success");
         assert_eq!(resp.into_inner().status_code, 0);
@@ -1282,9 +1299,26 @@ mod pr3_tests {
         let req2 = Request::new(CancelFragmentRequest {
             finst_ids: vec![PUniqueId { hi: 1, lo: 2 }],
             reason: "test-2".to_string(),
+            start_epoch: 0,
         });
         let resp2 = svc.cancel_fragment(req2).await.expect("RPC success");
         assert_eq!(resp2.into_inner().status_code, 0);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_returns_local_start_epoch_and_capacity() {
+        let svc = GrpcService::default();
+        let resp = svc
+            .heartbeat(tonic::Request::new(HeartbeatRequest {
+                assigned_be_id: 7,
+                fe_epoch: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.start_epoch, crate::runtime::start_epoch::start_epoch());
+        assert!(resp.num_cores >= 1);
+        assert_eq!(resp.status_code, 0);
     }
 
     #[tokio::test]
