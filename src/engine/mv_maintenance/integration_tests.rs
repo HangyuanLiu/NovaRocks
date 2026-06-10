@@ -352,20 +352,18 @@ fn scenario_1_auto_optimize_compacts_small_files() {
 
 // --- Scenario ②: auto EXPIRE honors history.expire.* and keeps min snapshots ---
 //
-// NOTE on the assertion shape: NovaRocks `run_expire_snapshots` only removes
-// snapshots that are NOT reachable from any ref's ancestor chain (dangling
-// snapshots). A linearly-appended MV storage table has every snapshot on
-// main's ancestor chain, so all snapshots are "live" and expire is a deliberate
-// no-op — this is correct Iceberg lifecycle behavior, not a defect, and the
-// codebase itself documents that real dangling-snapshot expiry is covered by
-// the Spark-backed SQL regression suite (see the note at the bottom of
-// `src/connector/iceberg/commit/expire_snapshots.rs`). A lib test cannot
-// fabricate dangling snapshots without fragile low-level metadata stitching, so
-// this test verifies the behaviors that ARE reachable end-to-end: the pass
-// runs without error, never violates `history.expire.min-snapshots-to-keep`
-// (count stays >= 1 and never grows), and the MV remains queryable. The expire
-// candidate/cutoff/min-keep decision logic itself is exhaustively unit-tested
-// in `policy.rs` and `stats.rs`.
+// NOTE on the assertion shape: NovaRocks `run_expire_snapshots` implements
+// standard Iceberg expireSnapshots semantics — it prunes old snapshots on the
+// main ancestor chain (not just dangling ones), keeping the current snapshot of
+// every ref plus the most-recent `retain_last` main-chain snapshots. With the
+// aggressive retention below, the old non-current snapshots of this linearly
+// appended MV storage table are pruned. The assertions intentionally stay
+// behavior-agnostic about the exact post-count: the pass runs without error,
+// never violates `history.expire.min-snapshots-to-keep` (count stays >= 1 and
+// never grows), and the MV remains queryable with all rows intact. The expire
+// candidate/cutoff/min-keep decision logic itself is exhaustively unit-tested in
+// `policy.rs` and `stats.rs`, and the candidate-computation correctness in
+// `src/connector/iceberg/commit/expire_snapshots.rs`.
 #[test]
 fn scenario_2_auto_expire_keeps_min_snapshots() {
     let env = open_env("ice", "analytics");
