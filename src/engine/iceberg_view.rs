@@ -7,8 +7,11 @@
 
 use std::sync::Arc;
 
+use crate::connector::backend::CreateViewRequest;
 use crate::engine::catalog::normalize_identifier;
-use crate::engine::StandaloneState;
+use crate::engine::{StandaloneState, StatementResult};
+use crate::sql::analysis::OutputColumn;
+use crate::sql::parser::ast::TableColumnDef;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct IcebergViewTarget {
@@ -79,4 +82,140 @@ pub(crate) fn resolve_iceberg_view_target(
         })
         .collect();
     resolve_iceberg_view_target_parts(state, &parts, current_catalog, current_database)
+}
+
+/// Create (or replace) a view on an iceberg REST catalog. The original body is
+/// persisted verbatim; an expanded copy is analyzed so views over views
+/// type-check. Output columns come from the analyzer and may be renamed by the
+/// optional column-alias list.
+pub(crate) fn create_iceberg_view(
+    state: &Arc<StandaloneState>,
+    target: &IcebergViewTarget,
+    stmt: sqlparser::ast::CreateView,
+) -> Result<StatementResult, String> {
+    if stmt.materialized {
+        return Err(
+            "CREATE MATERIALIZED VIEW must go through the materialized-view DDL path".to_string(),
+        );
+    }
+    let backend = state
+        .connectors
+        .read()
+        .expect("connector registry read")
+        .catalog_backend("iceberg")?;
+
+    // Views and tables share the namespace on iceberg catalogs; reject
+    // shadowing instead of letting the REST server pick a winner.
+    if backend.table_exists(&target.catalog, &target.namespace, &target.view)? {
+        return Err(format!(
+            "a table named {}.{}.{} already exists",
+            target.catalog, target.namespace, target.view
+        ));
+    }
+    if stmt.if_not_exists
+        && backend.view_exists(&target.catalog, &target.namespace, &target.view)?
+    {
+        return Ok(StatementResult::Ok);
+    }
+
+    // Persist the original body; analyze an expanded copy so views over
+    // views type-check. Bare names in the body resolve against the view's
+    // own catalog/namespace — identical to read-time qualification.
+    let view_sql = stmt.query.to_string();
+    let mut analyzed_query = (*stmt.query).clone();
+    crate::engine::iceberg_view_rewrite::expand_iceberg_views_in_query(
+        state,
+        &mut analyzed_query,
+        Some(&target.catalog),
+        &target.namespace,
+    )?;
+    let output_columns =
+        analyze_view_query(state, &target.catalog, &target.namespace, &analyzed_query)?;
+    let columns = view_columns(&output_columns, &stmt.columns)?;
+
+    backend.create_view(CreateViewRequest {
+        catalog: target.catalog.clone(),
+        namespace: target.namespace.clone(),
+        view: target.view.clone(),
+        columns,
+        view_sql,
+        comment: stmt.comment.clone(),
+        or_replace: stmt.or_replace,
+    })?;
+    Ok(StatementResult::Ok)
+}
+
+/// Analyze the (already expanded) view body and return its user-visible output
+/// columns, skipping optimizer-internal pseudo-columns.
+fn analyze_view_query(
+    state: &Arc<StandaloneState>,
+    catalog: &str,
+    namespace: &str,
+    query: &sqlparser::ast::Query,
+) -> Result<Vec<OutputColumn>, String> {
+    let catalog_snapshot = state
+        .catalog
+        .read()
+        .expect("standalone catalog read lock")
+        .clone();
+    let connectors_snapshot = state
+        .connectors
+        .read()
+        .expect("standalone connector registry read lock")
+        .clone();
+    let catalog_mgr_snapshot = crate::engine::catalog_mgr_snapshot(state);
+    let provider = crate::engine::build_analyzer_provider(
+        Some(catalog),
+        &catalog_snapshot,
+        &catalog_mgr_snapshot,
+        &connectors_snapshot,
+        crate::sql::catalog::TableLookupMode::SchemaOnly,
+    );
+    let (resolved, _ctes, _factory) = crate::sql::analyzer::analyze(query, &provider, namespace)
+        .map_err(|e| format!("analyze view definition failed: {e}"))?;
+    let columns: Vec<OutputColumn> = resolved
+        .output_columns
+        .into_iter()
+        .filter(|column| !column.is_internal)
+        .collect();
+    if columns.is_empty() {
+        return Err("CREATE VIEW: SELECT produced no output columns".to_string());
+    }
+    Ok(columns)
+}
+
+/// Map analyzed output columns to backend column definitions, applying the
+/// optional column-alias list. The alias list, when present, must match the
+/// number of output columns exactly.
+fn view_columns(
+    output: &[OutputColumn],
+    aliases: &[sqlparser::ast::ViewColumnDef],
+) -> Result<Vec<TableColumnDef>, String> {
+    if !aliases.is_empty() && aliases.len() != output.len() {
+        return Err(format!(
+            "view column list has {} names but the SELECT produces {} columns",
+            aliases.len(),
+            output.len()
+        ));
+    }
+    output
+        .iter()
+        .enumerate()
+        .map(|(idx, column)| {
+            let name = if aliases.is_empty() {
+                column.name.clone()
+            } else {
+                aliases[idx].name.value.clone()
+            };
+            let data_type =
+                crate::engine::iceberg_ctas::arrow_data_type_to_sql_type(&column.data_type)?;
+            Ok(TableColumnDef {
+                name,
+                data_type,
+                nullable: column.nullable,
+                aggregation: None,
+                default: None,
+            })
+        })
+        .collect()
 }

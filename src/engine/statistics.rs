@@ -107,8 +107,8 @@ pub(crate) fn try_handle_statement(
         handle_admin_statement(state, trimmed)?;
         return Ok(Some(StatementResult::Ok));
     }
-    if lower.starts_with("create view ") {
-        return handle_create_view(state, trimmed, current_database).map(Some);
+    if lower.starts_with("create view ") || lower.starts_with("create or replace view ") {
+        return handle_create_view(state, trimmed, current_catalog, current_database).map(Some);
     }
     if lower.starts_with("drop view ") {
         return handle_drop_view(state, trimmed, current_database).map(Some);
@@ -2250,6 +2250,7 @@ fn string_result(columns: Vec<String>, rows: Vec<Vec<String>>) -> Result<QueryRe
 fn handle_create_view(
     state: &Arc<StandaloneState>,
     trimmed: &str,
+    current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<StatementResult, String> {
     use crate::sql::parser::dialect::StarRocksDialect;
@@ -2264,6 +2265,17 @@ fn handle_create_view(
     let sqlparser::ast::Statement::CreateView(create_view) = stmt else {
         return Err("CREATE VIEW: failed to parse statement".to_string());
     };
+    // A 3-part name, or a 1/2-part name under an active `SET CATALOG`, routes
+    // to the iceberg REST backend. `default_catalog` names fall through to the
+    // existing session-view registration below.
+    if let Some(target) = crate::engine::iceberg_view::resolve_iceberg_view_target(
+        state,
+        &create_view.name,
+        current_catalog,
+        current_database,
+    )? {
+        return crate::engine::iceberg_view::create_iceberg_view(state, &target, create_view);
+    }
     let (db, name) = view_name_parts(&create_view.name, current_database)?;
     let mut views = state
         .views
