@@ -80,11 +80,11 @@ use self::statement::{
     looks_like_alter_table_expire_snapshots, looks_like_alter_table_optimize,
     looks_like_alter_table_remove_orphan_files, looks_like_alter_table_rewrite_manifests,
     looks_like_show_alter_table_optimize, looks_like_show_create_table,
-    parse_add_legacy_range_partition_sql, parse_alter_iceberg_properties_sql,
-    parse_alter_partition_column_sql, parse_alter_table_expire_snapshots_sql,
-    parse_alter_table_optimize_sql, parse_alter_table_remove_orphan_files_sql,
-    parse_alter_table_rewrite_manifests_sql, parse_show_alter_table_optimize_sql,
-    parse_show_create_table,
+    looks_like_show_create_view, looks_like_show_views, parse_add_legacy_range_partition_sql,
+    parse_alter_iceberg_properties_sql, parse_alter_partition_column_sql,
+    parse_alter_table_expire_snapshots_sql, parse_alter_table_optimize_sql,
+    parse_alter_table_remove_orphan_files_sql, parse_alter_table_rewrite_manifests_sql,
+    parse_show_alter_table_optimize_sql, parse_show_create_table,
 };
 use self::stream_load::{
     parse_csv_stream_load_rows, parse_json_stream_load_rows, parse_stream_load_columns,
@@ -814,6 +814,16 @@ impl StandaloneSession {
             return self.handle_show_create_table(&normalized, current_catalog, current_database);
         }
 
+        // SHOW CREATE VIEW ...
+        if looks_like_show_create_view(&normalized) {
+            return self.handle_show_create_view(&normalized, current_catalog, current_database);
+        }
+
+        // SHOW VIEWS [FROM db]
+        if looks_like_show_views(&normalized) {
+            return self.handle_show_views(&normalized, current_catalog, current_database);
+        }
+
         // ALTER TABLE ... ADD EQUALITY DELETE (...) VALUES (...)
         if looks_like_add_equality_delete(&normalized) {
             return self.handle_add_equality_delete(&normalized, current_catalog, current_database);
@@ -1325,6 +1335,126 @@ impl StandaloneSession {
                     logical_type: None,
                 },
             ],
+            chunks: vec![record_batch_to_chunk(batch)?],
+        }))
+    }
+
+    fn handle_show_create_view(
+        &self,
+        sql: &str,
+        current_catalog: Option<&str>,
+        current_database: &str,
+    ) -> Result<StatementResult, String> {
+        let view_name = crate::engine::statement::parse_show_create_view(sql)?;
+        let Some(target) = crate::engine::iceberg_view::resolve_iceberg_view_target_parts(
+            &self.inner,
+            &view_name.parts,
+            current_catalog,
+            current_database,
+        )?
+        else {
+            return Err("SHOW CREATE VIEW only supports views in iceberg catalogs".to_string());
+        };
+        let backend = self
+            .inner
+            .connectors
+            .read()
+            .expect("connector registry read")
+            .catalog_backend("iceberg")?;
+        let view = backend.load_view(&target.catalog, &target.namespace, &target.view)?;
+
+        let columns = view
+            .column_names
+            .iter()
+            .map(|name| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut ddl = format!(
+            "CREATE VIEW `{}`.`{}`.`{}` ({})",
+            target.catalog, target.namespace, target.view, columns
+        );
+        if let Some(comment) = &view.comment {
+            ddl.push_str(&format!("\nCOMMENT \"{}\"", comment.replace('"', "\\\"")));
+        }
+        ddl.push_str(&format!("\nAS {};", view.sql));
+
+        let fields = vec![
+            Field::new("View", DataType::Utf8, false),
+            Field::new("Create View", DataType::Utf8, false),
+        ];
+        let arrays: Vec<Arc<dyn arrow::array::Array>> = vec![
+            Arc::new(StringArray::from(vec![target.view.clone()])),
+            Arc::new(StringArray::from(vec![ddl])),
+        ];
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+            .map_err(|e| format!("build SHOW CREATE VIEW result failed: {e}"))?;
+        Ok(StatementResult::Query(QueryResult {
+            columns: vec![
+                QueryResultColumn {
+                    name: "View".to_string(),
+                    data_type: DataType::Utf8,
+                    nullable: false,
+                    logical_type: None,
+                },
+                QueryResultColumn {
+                    name: "Create View".to_string(),
+                    data_type: DataType::Utf8,
+                    nullable: false,
+                    logical_type: None,
+                },
+            ],
+            chunks: vec![record_batch_to_chunk(batch)?],
+        }))
+    }
+
+    fn handle_show_views(
+        &self,
+        sql: &str,
+        current_catalog: Option<&str>,
+        current_database: &str,
+    ) -> Result<StatementResult, String> {
+        let from_db = crate::engine::statement::parse_show_views(sql)?;
+        let db = from_db.as_deref().unwrap_or(current_database);
+        let session_catalog =
+            current_catalog.filter(|catalog| !catalog.eq_ignore_ascii_case("default_catalog"));
+        let names: Vec<String> = match session_catalog {
+            Some(catalog) => {
+                let backend = self
+                    .inner
+                    .connectors
+                    .read()
+                    .expect("connector registry read")
+                    .catalog_backend("iceberg")?;
+                backend.list_views(catalog, db)?
+            }
+            None => {
+                let views = self
+                    .inner
+                    .views
+                    .read()
+                    .map_err(|e| format!("view registry read lock: {e}"))?;
+                let db_lower = db.to_ascii_lowercase();
+                let mut names: Vec<String> = views
+                    .keys()
+                    .filter(|(database, _)| database == &db_lower)
+                    .map(|(_, view)| view.clone())
+                    .collect();
+                names.sort();
+                names
+            }
+        };
+        let column_name = format!("Views_in_{db}");
+        let fields = vec![Field::new(column_name.clone(), DataType::Utf8, false)];
+        let arrays: Vec<Arc<dyn arrow::array::Array>> = vec![Arc::new(StringArray::from(names))];
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+            .map_err(|e| format!("build SHOW VIEWS result failed: {e}"))?;
+        Ok(StatementResult::Query(QueryResult {
+            columns: vec![QueryResultColumn {
+                name: column_name,
+                data_type: DataType::Utf8,
+                nullable: false,
+                logical_type: None,
+            }],
             chunks: vec![record_batch_to_chunk(batch)?],
         }))
     }
