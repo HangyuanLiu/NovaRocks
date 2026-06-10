@@ -48,6 +48,8 @@ const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const REPORT_EXEC_STATUS_OK: i32 = 0;
 pub(crate) const REPORT_EXEC_STATUS_ERROR: i32 = 1;
 pub(crate) const REPORT_EXEC_STATUS_QUERY_GONE: i32 = 2;
+const CANCEL_FRAGMENT_OK: i32 = 0;
+const CANCEL_FRAGMENT_IGNORED_STALE_EPOCH: i32 = 2;
 static SUBMIT_FRAGMENT_CALLS: AtomicUsize = AtomicUsize::new(0);
 static FETCH_RESULT_CALLS: AtomicUsize = AtomicUsize::new(0);
 static CANCEL_FRAGMENT_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -396,6 +398,13 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
     ) -> Result<tonic::Response<proto::novarocks::CancelFragmentResponse>, tonic::Status> {
         self.require_local_execution("CancelFragment")?;
         let req = request.into_inner();
+        if req.start_epoch != 0 && req.start_epoch != crate::runtime::start_epoch::start_epoch() {
+            return Ok(tonic::Response::new(
+                proto::novarocks::CancelFragmentResponse {
+                    status_code: CANCEL_FRAGMENT_IGNORED_STALE_EPOCH,
+                },
+            ));
+        }
         for id in &req.finst_ids {
             crate::cancel(crate::UniqueId {
                 hi: id.hi,
@@ -413,7 +422,9 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
             let _ = std::io::Write::flush(&mut std::io::stdout());
         }
         Ok(tonic::Response::new(
-            proto::novarocks::CancelFragmentResponse { status_code: 0 },
+            proto::novarocks::CancelFragmentResponse {
+                status_code: CANCEL_FRAGMENT_OK,
+            },
         ))
     }
 
@@ -1337,7 +1348,7 @@ mod pr3_tests {
             start_epoch: 0,
         });
         let resp = svc.cancel_fragment(req).await.expect("RPC success");
-        assert_eq!(resp.into_inner().status_code, 0);
+        assert_eq!(resp.into_inner().status_code, super::CANCEL_FRAGMENT_OK);
 
         let req2 = Request::new(CancelFragmentRequest {
             finst_ids: vec![PUniqueId { hi: 1, lo: 2 }],
@@ -1345,7 +1356,61 @@ mod pr3_tests {
             start_epoch: 0,
         });
         let resp2 = svc.cancel_fragment(req2).await.expect("RPC success");
-        assert_eq!(resp2.into_inner().status_code, 0);
+        assert_eq!(resp2.into_inner().status_code, super::CANCEL_FRAGMENT_OK);
+    }
+
+    mod cancel_epoch_tests {
+        use super::super::{CANCEL_FRAGMENT_IGNORED_STALE_EPOCH, GrpcService};
+        use super::super::proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc as _;
+        use super::super::proto::novarocks::{CancelFragmentRequest, PUniqueId};
+        use crate::common::types::UniqueId;
+        use crate::runtime::exchange::{
+            self, ExchangeKey, set_expected_senders, snapshot_receiver_state,
+        };
+        use tonic::Request;
+
+        struct ExchangeCleanup(UniqueId);
+
+        impl Drop for ExchangeCleanup {
+            fn drop(&mut self) {
+                exchange::cancel_fragment(self.0.hi, self.0.lo);
+            }
+        }
+
+        #[tokio::test]
+        async fn cancel_with_mismatched_epoch_is_ignored() {
+            let svc = GrpcService::default();
+            let finst = PUniqueId { hi: 6201, lo: 6202 };
+            let key = ExchangeKey {
+                finst_id_hi: finst.hi,
+                finst_id_lo: finst.lo,
+                node_id: 6203,
+            };
+            set_expected_senders(key, 1);
+            let _cleanup = ExchangeCleanup(UniqueId {
+                hi: finst.hi,
+                lo: finst.lo,
+            });
+            assert!(snapshot_receiver_state(key).is_some());
+
+            let mut stale_epoch = crate::runtime::start_epoch::start_epoch().wrapping_add(1);
+            if stale_epoch == 0 {
+                stale_epoch = stale_epoch.wrapping_add(1);
+            }
+
+            let resp = svc
+                .cancel_fragment(Request::new(CancelFragmentRequest {
+                    finst_ids: vec![finst],
+                    reason: "stale epoch".to_string(),
+                    start_epoch: stale_epoch,
+                }))
+                .await
+                .expect("RPC success")
+                .into_inner();
+
+            assert_eq!(resp.status_code, CANCEL_FRAGMENT_IGNORED_STALE_EPOCH);
+            assert!(snapshot_receiver_state(key).is_some());
+        }
     }
 
     #[tokio::test]
