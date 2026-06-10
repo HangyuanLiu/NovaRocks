@@ -28,6 +28,7 @@ use crate::planner;
 use crate::runtime::dispatcher::{FetchOutcome, FragmentDispatcher};
 use crate::runtime::exec_params::build_exec_plan_fragment_params;
 use crate::runtime::scheduler::FragmentScheduler;
+use crate::runtime::query_state::QueryState;
 use crate::runtime::write_coordinator::{
     WriteAbortInput, WriteCommitInput, WriteCoordinator, WriterKey, register_query,
     unregister_query,
@@ -798,6 +799,17 @@ pub(crate) fn submit_and_fetch_loop(
             tracker.cancel_all(dispatcher.as_ref());
             return Err("client disconnected".to_string());
         }
+        let qid = crate::runtime::query_context::QueryId {
+            hi: query_id.hi,
+            lo: query_id.lo,
+        };
+        if crate::runtime::query_state::in_flight_table().state(qid) == Some(QueryState::Failed) {
+            let reason = crate::runtime::query_state::in_flight_table()
+                .failure_reason(qid)
+                .unwrap_or_else(|| format!("query {} failed", qid));
+            tracker.cancel_all(dispatcher.as_ref());
+            return Err(reason);
+        }
         let now = std::time::Instant::now();
         if now >= deadline {
             tracker.cancel_all(dispatcher.as_ref());
@@ -956,7 +968,7 @@ fn notify_write_commit_wait_observer(commit_error: &str) {
 mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::*;
     use crate::runtime::dispatcher::{FetchOutcome, FragmentDispatcher};
@@ -1100,6 +1112,38 @@ mod tests {
         }
     }
 
+    struct QueryStateFailureDispatcher {
+        submitted: Mutex<Vec<types::TUniqueId>>,
+        cancelled: Mutex<Vec<types::TUniqueId>>,
+        fetch_count: AtomicUsize,
+        first_fetch: AtomicBool,
+        failure_reason: String,
+    }
+
+    impl QueryStateFailureDispatcher {
+        fn new(reason: impl Into<String>) -> Arc<Self> {
+            Arc::new(Self {
+                submitted: Mutex::new(Vec::new()),
+                cancelled: Mutex::new(Vec::new()),
+                fetch_count: AtomicUsize::new(0),
+                first_fetch: AtomicBool::new(true),
+                failure_reason: reason.into(),
+            })
+        }
+
+        fn cancelled_ids(&self) -> Vec<types::TUniqueId> {
+            self.cancelled.lock().unwrap().clone()
+        }
+
+        fn submitted_ids(&self) -> Vec<types::TUniqueId> {
+            self.submitted.lock().unwrap().clone()
+        }
+
+        fn fetch_count(&self) -> usize {
+            self.fetch_count.load(Ordering::SeqCst)
+        }
+    }
+
     struct RecordingWaitDispatcher {
         submitted: Mutex<Vec<types::TUniqueId>>,
         fetch_waits_ms: Mutex<Vec<i64>>,
@@ -1172,6 +1216,52 @@ mod tests {
                 FetchBehavior::Eof => Ok(FetchOutcome::Eof),
                 FetchBehavior::Err(msg) => Ok(FetchOutcome::Err(msg.clone())),
                 FetchBehavior::NotReady => Ok(FetchOutcome::NotReady),
+            }
+        }
+
+        fn cancel_fragments(&self, _backend_idx: usize, finst_ids: &[types::TUniqueId]) {
+            self.cancelled.lock().unwrap().extend_from_slice(finst_ids);
+        }
+
+        fn backend_count(&self) -> usize {
+            1
+        }
+    }
+
+    impl FragmentDispatcher for QueryStateFailureDispatcher {
+        fn submit_fragment(
+            &self,
+            _backend_idx: usize,
+            params: crate::internal_service::TExecPlanFragmentParams,
+        ) -> Result<(), String> {
+            let finst_id = params
+                .params
+                .as_ref()
+                .map(|ep| {
+                    types::TUniqueId::new(ep.fragment_instance_id.hi, ep.fragment_instance_id.lo)
+                })
+                .unwrap_or_else(|| types::TUniqueId::new(0, 0));
+            self.submitted.lock().unwrap().push(finst_id);
+            Ok(())
+        }
+
+        fn fetch_result(
+            &self,
+            _backend_idx: usize,
+            finst_id: types::TUniqueId,
+            _max_wait_ms: i64,
+        ) -> Result<FetchOutcome, String> {
+            self.fetch_count.fetch_add(1, Ordering::SeqCst);
+            if self.first_fetch.swap(false, Ordering::SeqCst) {
+                let finst = crate::common::types::UniqueId {
+                    hi: finst_id.hi,
+                    lo: finst_id.lo,
+                };
+                crate::runtime::query_state::in_flight_table()
+                    .on_fragment_done(finst, Err(self.failure_reason.clone()));
+                Ok(FetchOutcome::NotReady)
+            } else {
+                panic!("fetch_result called after query state failure should have been observed");
             }
         }
 
@@ -2138,6 +2228,50 @@ mod tests {
             cancelled.len(),
             2,
             "all submitted fragments must be cancelled on timeout"
+        );
+    }
+
+    #[test]
+    fn execute_aborts_before_second_fetch_when_query_state_failed() {
+        let inner = QueryStateFailureDispatcher::new("remote query failed");
+        let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
+        let root_finst_id = types::TUniqueId::new(8, 1);
+        let params = single_backend(vec![
+            make_params_with_finst(8, 10),
+            make_params_with_finst(8, 1),
+        ]);
+        let mut tracker = InFlightTracker::default();
+
+        let result = submit_and_fetch_loop(
+            &dispatcher,
+            &mut tracker,
+            params,
+            0,
+            root_finst_id,
+            &types::TUniqueId::new(8, 99),
+            100,
+            None,
+        );
+
+        let err = result.expect_err("query state failure must propagate");
+        assert!(
+            err.contains("remote query failed"),
+            "error should contain failure reason, got: {err}"
+        );
+        assert_eq!(
+            inner.fetch_count(),
+            1,
+            "coordinator must stop before the second fetch after observing query failure"
+        );
+        assert_eq!(
+            inner.submitted_ids().len(),
+            2,
+            "both fragments should have been submitted before failure is observed"
+        );
+        assert_eq!(
+            inner.cancelled_ids().len(),
+            2,
+            "query_state failure must cancel all submitted fragments"
         );
     }
 
