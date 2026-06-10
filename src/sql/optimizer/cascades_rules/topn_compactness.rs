@@ -86,6 +86,66 @@ impl Rule for PushTopNIntoScan {
     }
 }
 
+pub(crate) struct PushTopNThroughJoin;
+
+impl Rule for PushTopNThroughJoin {
+    fn name(&self) -> &str {
+        stringify!(PushTopNThroughJoin)
+    }
+
+    fn rule_type(&self) -> RuleType {
+        RuleType::Transformation
+    }
+
+    fn matches(&self, op: &Operator) -> bool {
+        matches!(op, Operator::LogicalTopN(_))
+    }
+
+    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
+        push_topn_through_join(expr, memo)
+    }
+}
+
+pub(crate) struct PushTopNThroughAggregate;
+
+impl Rule for PushTopNThroughAggregate {
+    fn name(&self) -> &str {
+        stringify!(PushTopNThroughAggregate)
+    }
+
+    fn rule_type(&self) -> RuleType {
+        RuleType::Transformation
+    }
+
+    fn matches(&self, op: &Operator) -> bool {
+        matches!(op, Operator::LogicalTopN(_))
+    }
+
+    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
+        push_topn_through_aggregate(expr, memo)
+    }
+}
+
+pub(crate) struct PushTopNThroughSetOp;
+
+impl Rule for PushTopNThroughSetOp {
+    fn name(&self) -> &str {
+        stringify!(PushTopNThroughSetOp)
+    }
+
+    fn rule_type(&self) -> RuleType {
+        RuleType::Transformation
+    }
+
+    fn matches(&self, op: &Operator) -> bool {
+        matches!(op, Operator::LogicalTopN(_))
+    }
+
+    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
+        push_topn_through_setop(expr, memo)
+    }
+}
+
 fn merge_consecutive_topn(expr: &MExpr, memo: &Memo) -> Vec<NewExpr> {
     let Operator::LogicalTopN(outer) = &expr.op else {
         return vec![];
@@ -269,6 +329,18 @@ fn push_topn_into_scan(expr: &MExpr, memo: &Memo) -> Vec<NewExpr> {
     }
 }
 
+fn push_topn_through_join(_expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+    Vec::new()
+}
+
+fn push_topn_through_aggregate(_expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+    Vec::new()
+}
+
+fn push_topn_through_setop(_expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+    Vec::new()
+}
+
 fn find_existing_logical_group(memo: &Memo, op: &Operator, children: &[usize]) -> Option<usize> {
     let op_debug = format!("{op:?}");
     memo.groups.iter().position(|group| {
@@ -289,14 +361,18 @@ fn topn_phase_can_merge(outer: &LogicalTopNOp, inner: &LogicalTopNOp) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::{ExprKind, LiteralValue, ProjectItem, SortItem, TypedExpr};
+    use crate::sql::analysis::{
+        ExprKind, JoinKind, LiteralValue, ProjectItem, SortItem, TypedExpr,
+    };
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
     use crate::sql::optimizer::operator::{
-        LogicalProjectOp, LogicalScanOp, LogicalSortOp, LogicalTopNOp, TopNPhase,
+        LogicalAggregateOp, LogicalJoinOp, LogicalProjectOp, LogicalScanOp, LogicalSortOp,
+        LogicalTopNOp, LogicalUnionOp, LogicalValuesOp, TopNPhase,
     };
     use crate::sql::optimizer::rule::NewExpr;
+    use crate::sql::planner::plan::AggregateCall;
     use arrow::datatypes::DataType;
 
     fn col(id: u32) -> TypedExpr {
@@ -350,6 +426,72 @@ mod tests {
             children: vec![],
         };
         memo.new_group(scan)
+    }
+
+    fn output_column(id: u32, name: &str) -> crate::sql::analysis::OutputColumn {
+        crate::sql::analysis::OutputColumn {
+            column_id: ColumnId(id),
+            name: name.to_string(),
+            data_type: DataType::Int64,
+            nullable: true,
+            is_internal: false,
+        }
+    }
+
+    fn values_group(memo: &mut Memo, column_ids: &[u32]) -> usize {
+        let columns = column_ids
+            .iter()
+            .map(|id| output_column(*id, &format!("c{id}")))
+            .collect();
+        memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalValues(LogicalValuesOp {
+                rows: vec![],
+                columns,
+            }),
+            children: vec![],
+        })
+    }
+
+    fn join_group(memo: &mut Memo, left_group: usize, right_group: usize) -> usize {
+        memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalJoin(LogicalJoinOp {
+                join_type: JoinKind::Inner,
+                condition: None,
+            }),
+            children: vec![left_group, right_group],
+        })
+    }
+
+    fn aggregate_group(memo: &mut Memo, child_group: usize) -> usize {
+        memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+                vec![col(1)],
+                vec![AggregateCall {
+                    name: "array_agg".to_string(),
+                    args: vec![col(2)],
+                    distinct: false,
+                    result_type: DataType::Int64,
+                    order_by: vec![sort_item(2)],
+                    output_column_id: ColumnId(10),
+                }],
+                vec![output_column(1, "c1"), output_column(10, "array_agg")],
+            )),
+            children: vec![child_group],
+        })
+    }
+
+    fn union_group(memo: &mut Memo, all: bool, inputs: Vec<usize>) -> usize {
+        memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalUnion(LogicalUnionOp {
+                all,
+                output_columns: vec![output_column(1, "c1")],
+            }),
+            children: inputs,
+        })
     }
 
     fn topn_with_item(
@@ -424,10 +566,14 @@ mod tests {
     }
 
     fn project_pushdown_rule() -> Box<dyn Rule> {
+        rule_by_name("PushTopNThroughProject")
+    }
+
+    fn rule_by_name(name: &str) -> Box<dyn Rule> {
         crate::sql::optimizer::cascades_rules::all_transformation_rules()
             .into_iter()
-            .find(|rule| rule.name() == "PushTopNThroughProject")
-            .expect("PushTopNThroughProject should be registered")
+            .find(|rule| rule.name() == name)
+            .unwrap_or_else(|| panic!("{name} should be registered"))
     }
 
     fn add_new_expr_to_group(memo: &mut Memo, group_id: usize, new_expr: NewExpr) {
@@ -814,6 +960,61 @@ mod tests {
         assert!(
             out.is_empty(),
             "default scan capability must not produce TopN pushdown candidates"
+        );
+    }
+
+    #[test]
+    fn join_pushdown_fails_closed_for_inner_join_without_multiplicity_proof() {
+        let mut memo = Memo::new();
+        let left_group = values_group(&mut memo, &[1]);
+        let right_group = values_group(&mut memo, &[2]);
+        let join_group = join_group(&mut memo, left_group, right_group);
+        let topn = topn(&memo, 10, 0, TopNPhase::Final, false, join_group);
+
+        let out = rule_by_name("PushTopNThroughJoin").apply(&topn, &mut memo);
+
+        assert!(
+            out.is_empty(),
+            "join TopN pushdown must fail closed until multiplicity is proven"
+        );
+    }
+
+    #[test]
+    fn aggregate_pushdown_fails_closed_for_aggregate_function_order() {
+        let mut memo = Memo::new();
+        let input_group = values_group(&mut memo, &[1, 2]);
+        let aggregate_group = aggregate_group(&mut memo, input_group);
+        let topn = topn_with_item(
+            &memo,
+            sort_item(10),
+            10,
+            0,
+            TopNPhase::Final,
+            false,
+            aggregate_group,
+        );
+
+        let out = rule_by_name("PushTopNThroughAggregate").apply(&topn, &mut memo);
+
+        assert!(
+            out.is_empty(),
+            "aggregate TopN pushdown must fail closed for ordered aggregate functions"
+        );
+    }
+
+    #[test]
+    fn setop_pushdown_fails_closed_for_union_distinct() {
+        let mut memo = Memo::new();
+        let left_group = values_group(&mut memo, &[1]);
+        let right_group = values_group(&mut memo, &[1]);
+        let union_group = union_group(&mut memo, false, vec![left_group, right_group]);
+        let topn = topn(&memo, 10, 0, TopNPhase::Final, false, union_group);
+
+        let out = rule_by_name("PushTopNThroughSetOp").apply(&topn, &mut memo);
+
+        assert!(
+            out.is_empty(),
+            "set-op TopN pushdown must fail closed for UNION DISTINCT"
         );
     }
 }

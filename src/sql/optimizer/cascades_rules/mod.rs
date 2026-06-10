@@ -54,5 +54,8 @@ pub(crate) fn all_transformation_rules() -> Vec<Box<dyn Rule>> {
         Box::new(topn_compactness::RemoveRedundantSortUnderTopN),
         Box::new(topn_compactness::PushTopNIntoScan),
         Box::new(topn_compactness::PushTopNThroughProject),
+        Box::new(topn_compactness::PushTopNThroughJoin),
+        Box::new(topn_compactness::PushTopNThroughAggregate),
+        Box::new(topn_compactness::PushTopNThroughSetOp),
     ]
 }
