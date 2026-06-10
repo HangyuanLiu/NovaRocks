@@ -2079,9 +2079,8 @@ mod tests {
             base_catalog_entries,
             iceberg_catalog,
             target_table,
-            affected_partitions: crate::engine::mv::partition::AffectedTargetPartitions::not_derived(
-                "test context",
-            ),
+            affected_partitions:
+                crate::engine::mv::partition::AffectedTargetPartitions::not_derived("test context"),
         };
         let table = IcebergTableInfo {
             catalog: "ice".to_string(),
@@ -2215,9 +2214,8 @@ mod tests {
             base_catalog_entries: BTreeMap::new(),
             iceberg_catalog,
             target_table,
-            affected_partitions: crate::engine::mv::partition::AffectedTargetPartitions::not_derived(
-                "test context",
-            ),
+            affected_partitions:
+                crate::engine::mv::partition::AffectedTargetPartitions::not_derived("test context"),
         };
         let scan = IcebergMvTargetStateScan {
             catalog: "tgt".to_string(),
@@ -2249,9 +2247,10 @@ mod tests {
 
         let new_key = crate::engine::mv::partition::MvPartitionKey::new(1, Vec::new());
         let old_key = crate::engine::mv::partition::MvPartitionKey::new(2, Vec::new());
-        ctx.affected_partitions = crate::engine::mv::partition::AffectedTargetPartitions::known(
-            [new_key.clone(), old_key.clone()],
-        );
+        ctx.affected_partitions = crate::engine::mv::partition::AffectedTargetPartitions::known([
+            new_key.clone(),
+            old_key.clone(),
+        ]);
         let allow_list = ctx
             .target_state_partition_allow_list(&scan)
             .expect("known affected partitions should satisfy partition contract")
