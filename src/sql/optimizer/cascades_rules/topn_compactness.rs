@@ -2,7 +2,8 @@ use crate::sql::optimizer::memo::{MExpr, Memo};
 use crate::sql::optimizer::operator::{LogicalTopNOp, Operator, TopNPhase};
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
 use crate::sql::optimizer::topn_proof::{
-    TopNWindow, ordering_covers, sort_items_to_keys, sort_keys_equivalent,
+    TopNWindow, ordering_covers, remap_sort_items_through_project, sort_items_to_keys,
+    sort_keys_equivalent,
 };
 
 pub(crate) struct MergeConsecutiveTopN;
@@ -42,6 +43,26 @@ impl Rule for RemoveRedundantSortUnderTopN {
 
     fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
         remove_redundant_sort_under_topn(expr, memo)
+    }
+}
+
+pub(crate) struct PushTopNThroughProject;
+
+impl Rule for PushTopNThroughProject {
+    fn name(&self) -> &str {
+        "PushTopNThroughProject"
+    }
+
+    fn rule_type(&self) -> RuleType {
+        RuleType::Transformation
+    }
+
+    fn matches(&self, op: &Operator) -> bool {
+        matches!(op, Operator::LogicalTopN(_))
+    }
+
+    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
+        push_topn_through_project(expr, memo)
     }
 }
 
@@ -150,6 +171,49 @@ fn remove_redundant_sort_under_topn(expr: &MExpr, memo: &Memo) -> Vec<NewExpr> {
     results
 }
 
+fn push_topn_through_project(expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
+    let Operator::LogicalTopN(topn) = &expr.op else {
+        return vec![];
+    };
+    if expr.children.len() != 1 {
+        return vec![];
+    }
+    let Some(project_group) = memo.groups.get(expr.children[0]).cloned() else {
+        return vec![];
+    };
+
+    let mut results = Vec::new();
+    for project_expr in project_group.logical_exprs.iter() {
+        let Operator::LogicalProject(project) = &project_expr.op else {
+            continue;
+        };
+        if project_expr.children.len() != 1 {
+            continue;
+        }
+        let Some(remapped_items) = remap_sort_items_through_project(&topn.items, &project.items)
+        else {
+            continue;
+        };
+
+        let pushed_group = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalTopN(LogicalTopNOp {
+                items: remapped_items,
+                limit: topn.limit,
+                offset: topn.offset,
+                phase: topn.phase,
+                is_split: topn.is_split,
+            }),
+            children: project_expr.children.clone(),
+        });
+        results.push(NewExpr {
+            op: Operator::LogicalProject(project.clone()),
+            children: vec![pushed_group],
+        });
+    }
+    results
+}
+
 fn topn_phase_can_merge(outer: &LogicalTopNOp, inner: &LogicalTopNOp) -> bool {
     matches!(
         (outer.phase, inner.phase, outer.is_split, inner.is_split),
@@ -160,11 +224,13 @@ fn topn_phase_can_merge(outer: &LogicalTopNOp, inner: &LogicalTopNOp) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::{ExprKind, SortItem, TypedExpr};
+    use crate::sql::analysis::{ExprKind, LiteralValue, ProjectItem, SortItem, TypedExpr};
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
-    use crate::sql::optimizer::operator::{LogicalScanOp, LogicalSortOp, LogicalTopNOp, TopNPhase};
+    use crate::sql::optimizer::operator::{
+        LogicalProjectOp, LogicalScanOp, LogicalSortOp, LogicalTopNOp, TopNPhase,
+    };
     use arrow::datatypes::DataType;
 
     fn col(id: u32) -> TypedExpr {
@@ -184,6 +250,14 @@ mod tests {
             expr: col(id),
             asc: true,
             nulls_first: false,
+        }
+    }
+
+    fn literal_expr(value: i64) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Int(value)),
+            data_type: DataType::Int64,
+            nullable: false,
         }
     }
 
@@ -262,6 +336,32 @@ mod tests {
             }),
             children: vec![child_group],
         }
+    }
+
+    fn project_with_items(memo: &Memo, items: Vec<ProjectItem>, child_group: usize) -> MExpr {
+        MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalProject(LogicalProjectOp {
+                items,
+                output_qualifier: None,
+            }),
+            children: vec![child_group],
+        }
+    }
+
+    fn project_item(expr: TypedExpr, output_id: u32, output_name: &str) -> ProjectItem {
+        ProjectItem {
+            expr,
+            output_name: output_name.to_string(),
+            output_column_id: ColumnId(output_id),
+        }
+    }
+
+    fn project_pushdown_rule() -> Box<dyn Rule> {
+        crate::sql::optimizer::cascades_rules::all_transformation_rules()
+            .into_iter()
+            .find(|rule| rule.name() == "PushTopNThroughProject")
+            .expect("PushTopNThroughProject should be registered")
     }
 
     fn analytic_sort_with_items(memo: &Memo, items: Vec<SortItem>, child_group: usize) -> MExpr {
@@ -444,6 +544,91 @@ mod tests {
         assert!(
             out.is_empty(),
             "Sort ordering must cover TopN ordering before the Sort can be elided"
+        );
+    }
+
+    #[test]
+    fn project_pushdown_remaps_column_ref_sort_keys() {
+        let mut memo = Memo::new();
+        let scan_group = scan_group(&mut memo);
+        let project_items = vec![
+            project_item(col(1), 10, "alias_c1"),
+            project_item(col(2), 20, "alias_c2"),
+        ];
+        let project_group =
+            memo.new_group(project_with_items(&memo, project_items.clone(), scan_group));
+        let topn = topn_with_item(
+            &memo,
+            sort_item(10),
+            7,
+            2,
+            TopNPhase::Final,
+            false,
+            project_group,
+        );
+
+        let out = project_pushdown_rule().apply(&topn, &mut memo);
+
+        assert_eq!(out.len(), 1, "project alias should allow TopN pushdown");
+        match &out[0].op {
+            Operator::LogicalProject(project) => {
+                assert_eq!(project.items.len(), project_items.len());
+                assert_eq!(project.items[0].output_column_id, ColumnId(10));
+            }
+            other => panic!("expected LogicalProject, got {other:?}"),
+        }
+        let pushed_group = out[0].children[0];
+        let pushed_expr = memo.groups[pushed_group]
+            .logical_exprs
+            .first()
+            .expect("pushed TopN group should contain a logical expression");
+        assert_eq!(
+            pushed_expr.children,
+            vec![scan_group],
+            "pushed TopN should point at the original Project child"
+        );
+        match &pushed_expr.op {
+            Operator::LogicalTopN(pushed) => {
+                assert_eq!(pushed.limit, Some(7));
+                assert_eq!(pushed.offset, Some(2));
+                assert_eq!(pushed.phase, TopNPhase::Final);
+                assert!(!pushed.is_split);
+                assert_eq!(pushed.items.len(), 1);
+                match &pushed.items[0].expr.kind {
+                    ExprKind::ColumnRef { column_id, .. } => {
+                        assert_eq!(*column_id, ColumnId(1));
+                    }
+                    other => panic!("expected remapped ColumnRef sort key, got {other:?}"),
+                }
+            }
+            other => panic!("expected pushed LogicalTopN, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn project_pushdown_rejects_computed_sort_keys() {
+        let mut memo = Memo::new();
+        let scan_group = scan_group(&mut memo);
+        let project_group = memo.new_group(project_with_items(
+            &memo,
+            vec![project_item(literal_expr(42), 10, "computed")],
+            scan_group,
+        ));
+        let topn = topn_with_item(
+            &memo,
+            sort_item(10),
+            7,
+            0,
+            TopNPhase::Final,
+            false,
+            project_group,
+        );
+
+        let out = project_pushdown_rule().apply(&topn, &mut memo);
+
+        assert!(
+            out.is_empty(),
+            "computed Project expressions must fail closed"
         );
     }
 }
