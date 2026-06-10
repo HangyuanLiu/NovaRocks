@@ -24,6 +24,7 @@ pub mod exec_env;
 pub(crate) mod exec_params;
 pub mod execution_services;
 pub mod global_async_runtime;
+pub mod heartbeat_mgr;
 pub mod io;
 pub mod load_tracking;
 pub mod lookup;
