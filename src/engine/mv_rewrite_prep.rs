@@ -107,7 +107,7 @@ fn try_prepare(
                     );
                     continue;
                 }
-                if let Some(ts) = load_target_stats(&c.target_table) {
+                if let Some(ts) = load_target_stats(state, &c.target_table) {
                     table_stats.insert(key, ts);
                 }
                 candidates.push(c);
@@ -328,34 +328,82 @@ fn current_table_uuid(
 }
 
 /// Best-effort target-table statistics for the rewritten scan, mirroring
-/// `collect_scan_stats`. The target is registered as
-/// `ScanSource::IcebergDataFiles` with a `CurrentSnapshot` binding, so its
-/// `files` vector is empty; `build_table_statistics_with_ndv` may then return
-/// `None`, in which case the CBO falls back to a default row count. That is a
-/// degraded-but-valid outcome, not a reason to drop the candidate.
-fn load_target_stats(table_def: &crate::sql::catalog::TableDef) -> Option<TableStatistics> {
+/// `collect_scan_stats`.
+///
+/// The target TableDef is built schema-only (CurrentSnapshot binding, empty
+/// `files`), so reading its `files` vector directly always yields `None` and
+/// the CBO falls back to a default row count. With a small base table that
+/// default is *larger* than the real MV cardinality, so the MV alternative
+/// loses on cost and the rewrite never fires (plan §"已知风险" #6). To cost
+/// the alternative correctly we enumerate the target table's CURRENT-snapshot
+/// data files here — the same enumeration the ANALYZE/scan path uses
+/// (`extract_data_files_with_stats` -> `data_file_with_stats_to_iceberg_data_file_info`)
+/// — and build stats from those real files plus Puffin NDV.
+///
+/// This is costing metadata only: the injected scan still resolves files at
+/// execution time from its CurrentSnapshot binding, so the stats snapshot used
+/// here never affects result correctness. Fail-closed: any registry/IO error
+/// yields `None` (CBO fallback), never a panic.
+fn load_target_stats(
+    state: &Arc<StandaloneState>,
+    table_def: &crate::sql::catalog::TableDef,
+) -> Option<TableStatistics> {
     let ScanSource::IcebergDataFiles {
         table,
-        files,
         cloud_properties,
         ..
     } = &table_def.source
     else {
         return None;
     };
+
+    let files = match current_snapshot_data_files(state, table) {
+        Ok(files) => files,
+        Err(e) => {
+            tracing::debug!(
+                "mv rewrite: failed to enumerate current-snapshot files for target table {}: {e}; using CBO fallback",
+                table_def.name
+            );
+            return None;
+        }
+    };
+
     let (ndv_by_name, name_to_field_id) =
         super::load_iceberg_puffin_ndv(Some(table), cloud_properties);
     let stats = crate::sql::optimizer::statistics::build_table_statistics_with_ndv(
-        files,
+        &files,
         &table_def.columns,
         &ndv_by_name,
         &name_to_field_id,
     );
     if stats.is_none() {
         tracing::debug!(
-            "mv rewrite: no derivable stats for target table {} (CurrentSnapshot binding, empty files); using CBO fallback",
-            table_def.name
+            "mv rewrite: no derivable stats for target table {} ({} current-snapshot files); using CBO fallback",
+            table_def.name,
+            files.len()
         );
     }
     stats
+}
+
+/// Enumerate the CURRENT-snapshot data files of an Iceberg target table as
+/// `IcebergDataFileInfo`, reusing the catalog registry view (no cache
+/// invalidation, matching `current_snapshot_id`'s consistency contract).
+fn current_snapshot_data_files(
+    state: &Arc<StandaloneState>,
+    table: &crate::sql::catalog::IcebergTableInfo,
+) -> Result<Vec<crate::sql::catalog::IcebergDataFileInfo>, String> {
+    let registry = state
+        .iceberg_catalogs
+        .read()
+        .expect("iceberg catalogs read lock");
+    let entry = registry.get(&table.catalog)?;
+    let loaded =
+        crate::connector::iceberg::catalog::load_table(&entry, &table.namespace, &table.table)?;
+    let data_files =
+        crate::connector::iceberg::catalog::registry::extract_data_files_with_stats(&loaded.table)?;
+    Ok(data_files
+        .into_iter()
+        .map(crate::connector::iceberg::catalog::backend::data_file_with_stats_to_iceberg_data_file_info)
+        .collect())
 }
