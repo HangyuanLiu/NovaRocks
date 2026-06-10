@@ -130,7 +130,9 @@ pub(crate) fn derive_for_expr(
         | Operator::PhysicalTableFunction(_)
         | Operator::LogicalCTEProduce(_)
         | Operator::PhysicalCTEProduce(_)
-        | Operator::PhysicalDistribution(_) => {
+        | Operator::PhysicalDistribution(_)
+        | Operator::LogicalAssertOneRow(_)
+        | Operator::PhysicalAssertOneRow(_) => {
             inherit_from_child(memo, expr, 0, &output_ids, &mut props);
         }
         _ => {}

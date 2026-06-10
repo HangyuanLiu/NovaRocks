@@ -727,6 +727,35 @@ impl Rule for LimitToPhysical {
 }
 
 // ---------------------------------------------------------------------------
+// AssertOneRowToPhysical
+// ---------------------------------------------------------------------------
+
+pub(crate) struct AssertOneRowToPhysical;
+
+impl Rule for AssertOneRowToPhysical {
+    fn name(&self) -> &str {
+        "AssertOneRowToPhysical"
+    }
+    fn rule_type(&self) -> RuleType {
+        RuleType::Implementation
+    }
+    fn matches(&self, op: &Operator) -> bool {
+        matches!(op, Operator::LogicalAssertOneRow(_))
+    }
+    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+        let Operator::LogicalAssertOneRow(op) = &expr.op else {
+            return vec![];
+        };
+        vec![NewExpr {
+            op: Operator::PhysicalAssertOneRow(PhysicalAssertOneRowOp {
+                subquery_text: op.subquery_text.clone(),
+            }),
+            children: expr.children.clone(),
+        }]
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 8b. TopNToPhysical
 // ---------------------------------------------------------------------------
 

@@ -721,6 +721,11 @@ fn existing_delta_action_column(plan: &LogicalPlan) -> Result<Option<ColumnId>, 
                 }
                 Ok(())
             }
+            LogicalPlan::Apply(node) => {
+                visit(&node.left, found)?;
+                visit(&node.right, found)
+            }
+            LogicalPlan::AssertOneRow(node) => visit(&node.input, found),
         }
     }
 
@@ -835,6 +840,15 @@ fn thread_delta_action_column(
                 .map(|input| thread_delta_action_column(input, action_column))
                 .collect::<Result<Vec<_>, _>>()?;
             LogicalPlan::Except(node)
+        }
+        LogicalPlan::Apply(mut node) => {
+            node.left = Box::new(thread_delta_action_column(*node.left, action_column)?);
+            node.right = Box::new(thread_delta_action_column(*node.right, action_column)?);
+            LogicalPlan::Apply(node)
+        }
+        LogicalPlan::AssertOneRow(mut node) => {
+            node.input = Box::new(thread_delta_action_column(*node.input, action_column)?);
+            LogicalPlan::AssertOneRow(node)
         }
     })
 }

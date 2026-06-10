@@ -158,6 +158,11 @@ fn collect_blocklist(plan: &LogicalPlan, out: &mut BTreeSet<String>) {
                 collect_blocklist(input, out);
             }
         }
+        LogicalPlan::Apply(node) => {
+            collect_blocklist(&node.left, out);
+            collect_blocklist(&node.right, out);
+        }
+        LogicalPlan::AssertOneRow(node) => collect_blocklist(&node.input, out),
         LogicalPlan::Values(_) | LogicalPlan::GenerateSeries(_) | LogicalPlan::CTEConsume(_) => {}
         LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
@@ -252,6 +257,11 @@ fn walk(
                 walk(input, provider, blocklist, dict_ctx)?;
             }
         }
+        LogicalPlan::Apply(node) => {
+            walk(&node.left, provider, blocklist, dict_ctx)?;
+            walk(&node.right, provider, blocklist, dict_ctx)?;
+        }
+        LogicalPlan::AssertOneRow(node) => walk(&node.input, provider, blocklist, dict_ctx)?,
         LogicalPlan::Values(_) | LogicalPlan::GenerateSeries(_) | LogicalPlan::CTEConsume(_) => {}
         LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");

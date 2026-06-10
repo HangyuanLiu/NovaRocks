@@ -19,6 +19,11 @@ pub(crate) fn query_rewrite_pipeline(
 ) -> RewritePipeline {
     RewritePipeline::from_stages(vec![
         RewriteStage::new(
+            "SubqueryRewrite",
+            RewritePhase::StructuralRewrite,
+            rules::subquery::subquery_rewrite_rules(),
+        ),
+        RewriteStage::new(
             "PredicatePushdownPreJoin",
             RewritePhase::StructuralRewrite,
             rules::predicate_pushdown_rules(),
@@ -116,6 +121,7 @@ mod tests {
         assert_eq!(
             pipeline.stage_names(),
             vec![
+                "SubqueryRewrite",
                 "PredicatePushdownPreJoin",
                 "JoinReorder",
                 "PredicatePushdownPostJoin",
@@ -135,6 +141,7 @@ mod tests {
             names,
             vec![
                 "AggregatePushdown",
+                "ApplyException",
                 "DeriveJoinNotNullPredicate",
                 "EliminateUniqueAggregate",
                 "JoinPredicateMoveAround",
@@ -214,6 +221,7 @@ mod tests {
         assert!(!is_known_rewrite_rule_name("PushFilterThroughProject"));
         assert!(is_known_rewrite_rule_name("DeriveJoinNotNullPredicate"));
         assert!(is_known_rewrite_rule_name("JoinPredicateMoveAround"));
+        assert!(is_known_rewrite_rule_name("ApplyException"));
     }
 
     fn assert_default_phase_trace(ctx: &RewriteContext) {

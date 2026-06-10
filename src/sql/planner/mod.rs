@@ -554,6 +554,12 @@ pub(crate) fn plan_output_columns(plan: &LogicalPlan) -> Result<Vec<OutputColumn
         LogicalPlan::CTEConsume(node) => Ok(node.output_columns.clone()),
         LogicalPlan::Decode(node) => Ok(node.output_columns.clone()),
         LogicalPlan::AggregateStateMerge(node) => Ok(node.output_columns.clone()),
+        LogicalPlan::Apply(node) => {
+            let mut columns = plan_output_columns(&node.left)?;
+            columns.push(node.output_column.clone());
+            Ok(columns)
+        }
+        LogicalPlan::AssertOneRow(node) => plan_output_columns(&node.input),
         LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
             Err("imv marker leaked into non-IMV planner output adaptation".to_string())
         }
@@ -3396,6 +3402,8 @@ mod tests {
                 LogicalPlan::AggregateStateMerge(node) => {
                     visit(&node.old_input).or_else(|| visit(&node.delta_input))
                 }
+                LogicalPlan::Apply(node) => visit(&node.left).or_else(|| visit(&node.right)),
+                LogicalPlan::AssertOneRow(node) => visit(&node.input),
                 LogicalPlan::Scan(_)
                 | LogicalPlan::Values(_)
                 | LogicalPlan::GenerateSeries(_)
@@ -3456,6 +3464,8 @@ mod tests {
                 LogicalPlan::AggregateStateMerge(node) => {
                     visit(&node.old_input).or_else(|| visit(&node.delta_input))
                 }
+                LogicalPlan::Apply(node) => visit(&node.left).or_else(|| visit(&node.right)),
+                LogicalPlan::AssertOneRow(node) => visit(&node.input),
                 LogicalPlan::Scan(_)
                 | LogicalPlan::Values(_)
                 | LogicalPlan::GenerateSeries(_)
@@ -3539,6 +3549,8 @@ mod tests {
                 LogicalPlan::AggregateStateMerge(node) => {
                     visit(&node.old_input).or_else(|| visit(&node.delta_input))
                 }
+                LogicalPlan::Apply(node) => visit(&node.left).or_else(|| visit(&node.right)),
+                LogicalPlan::AssertOneRow(node) => visit(&node.input),
                 LogicalPlan::Scan(_)
                 | LogicalPlan::Values(_)
                 | LogicalPlan::GenerateSeries(_)
@@ -3574,6 +3586,8 @@ mod tests {
                 LogicalPlan::AggregateStateMerge(node) => {
                     visit(&node.old_input).or_else(|| visit(&node.delta_input))
                 }
+                LogicalPlan::Apply(node) => visit(&node.left).or_else(|| visit(&node.right)),
+                LogicalPlan::AssertOneRow(node) => visit(&node.input),
                 LogicalPlan::Scan(_)
                 | LogicalPlan::Values(_)
                 | LogicalPlan::GenerateSeries(_)
@@ -5231,5 +5245,96 @@ mod tests {
             sort_key_id, project.items[0].output_column_id,
             "sort key should reference the selected output column by ColumnId"
         );
+    }
+
+    #[test]
+    fn apply_output_columns_extend_left_with_output_column() {
+        use std::collections::HashSet;
+
+        use arrow::datatypes::DataType;
+
+        use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
+        use crate::sql::column_id::ColumnId;
+        use crate::sql::planner::plan::{ApplyKind, ApplyNode, ValuesNode};
+
+        let left_col = OutputColumn {
+            column_id: ColumnId(11),
+            name: "l1".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        };
+        let out_col = OutputColumn {
+            column_id: ColumnId(12),
+            name: "__sq_1".to_string(),
+            data_type: DataType::Int64,
+            nullable: true,
+            is_internal: true,
+        };
+        let plan = LogicalPlan::Apply(ApplyNode {
+            left: Box::new(LogicalPlan::Values(ValuesNode {
+                rows: vec![],
+                columns: vec![left_col.clone()],
+                required_output_columns: None,
+            })),
+            right: Box::new(LogicalPlan::Values(ValuesNode {
+                rows: vec![],
+                columns: vec![],
+                required_output_columns: None,
+            })),
+            kind: ApplyKind::Scalar,
+            subquery_expr: TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: ColumnId(12),
+                    qualifier: None,
+                    column: "__sq_1".to_string(),
+                },
+                data_type: DataType::Int64,
+                nullable: true,
+            },
+            output_column: out_col.clone(),
+            correlation_column_ids: vec![],
+            correlation_conjuncts: vec![],
+            residual_predicate: None,
+            need_check_max_rows: true,
+            use_semi_anti: false,
+            uncorrelated_outer_predicate_columns: HashSet::new(),
+            required_output_columns: None,
+        });
+
+        let columns = plan_output_columns(&plan).expect("apply output columns");
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0].column_id, left_col.column_id);
+        assert_eq!(columns[1].column_id, out_col.column_id);
+    }
+
+    #[test]
+    fn assert_one_row_output_columns_pass_through() {
+        use arrow::datatypes::DataType;
+
+        use crate::sql::analysis::OutputColumn;
+        use crate::sql::column_id::ColumnId;
+        use crate::sql::planner::plan::{AssertOneRowNode, ValuesNode};
+
+        let col = OutputColumn {
+            column_id: ColumnId(21),
+            name: "c1".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        };
+        let plan = LogicalPlan::AssertOneRow(AssertOneRowNode {
+            input: Box::new(LogicalPlan::Values(ValuesNode {
+                rows: vec![],
+                columns: vec![col.clone()],
+                required_output_columns: None,
+            })),
+            subquery_text: "select 1".to_string(),
+            required_output_columns: None,
+        });
+
+        let columns = plan_output_columns(&plan).expect("assert output columns");
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].column_id, col.column_id);
     }
 }

@@ -4,9 +4,9 @@ use crate::sql::optimizer::rewrite::context::{RewriteContext, RewriteFailurePoli
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
 use crate::sql::planner::plan::{
-    AggregateNode, AggregateStateMergeNode, CTEAnchorNode, CTEProduceNode, DecodeNode, ExceptNode,
-    FilterNode, IntersectNode, JoinNode, LimitNode, LogicalPlan, ProjectNode, RepeatPlanNode,
-    SortNode, TableFunctionNode, UnionNode, WindowNode,
+    AggregateNode, AggregateStateMergeNode, ApplyNode, AssertOneRowNode, CTEAnchorNode,
+    CTEProduceNode, DecodeNode, ExceptNode, FilterNode, IntersectNode, JoinNode, LimitNode,
+    LogicalPlan, ProjectNode, RepeatPlanNode, SortNode, TableFunctionNode, UnionNode, WindowNode,
 };
 
 pub(crate) fn rewrite_with_rule(
@@ -264,6 +264,28 @@ fn rewrite_children(
                     ..node
                 }),
                 old_changed || delta_changed,
+            ))
+        }
+        LogicalPlan::Apply(node) => {
+            let (left, left_changed) = rewrite_with_rule(*node.left, rule, ctx)?;
+            let (right, right_changed) = rewrite_with_rule(*node.right, rule, ctx)?;
+            Ok((
+                LogicalPlan::Apply(ApplyNode {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    ..node
+                }),
+                left_changed || right_changed,
+            ))
+        }
+        LogicalPlan::AssertOneRow(node) => {
+            let (input, changed) = rewrite_with_rule(*node.input, rule, ctx)?;
+            Ok((
+                LogicalPlan::AssertOneRow(AssertOneRowNode {
+                    input: Box::new(input),
+                    ..node
+                }),
+                changed,
             ))
         }
         LogicalPlan::ImvDelta(node) => {
@@ -585,6 +607,8 @@ mod tests {
                 | LogicalPlan::CTEConsume(_)
                 | LogicalPlan::Decode(_)
                 | LogicalPlan::AggregateStateMerge(_)
+                | LogicalPlan::Apply(_)
+                | LogicalPlan::AssertOneRow(_)
                 | LogicalPlan::ImvDelta(_)
                 | LogicalPlan::ImvVersion(_) => {}
             }
@@ -603,5 +627,48 @@ mod tests {
         .unwrap();
 
         assert!(count.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn bottom_up_rewrite_rebuilds_apply_children() {
+        use std::collections::HashSet;
+
+        use crate::sql::planner::plan::{ApplyKind, ApplyNode};
+
+        let outer = project_over_scan("outer");
+        let LogicalPlan::Project(outer_project) = outer else {
+            panic!("helper returns project");
+        };
+        let inner = project_over_scan("before");
+        let LogicalPlan::Project(inner_project) = inner else {
+            panic!("helper returns project");
+        };
+
+        let plan = LogicalPlan::Apply(ApplyNode {
+            left: outer_project.input,
+            right: inner_project.input,
+            kind: ApplyKind::Scalar,
+            subquery_expr: column_ref(ColumnId(7), "sq"),
+            output_column: output_column("sq"),
+            correlation_column_ids: vec![],
+            correlation_conjuncts: vec![],
+            residual_predicate: None,
+            need_check_max_rows: true,
+            use_semi_anti: false,
+            uncorrelated_outer_predicate_columns: HashSet::new(),
+            required_output_columns: None,
+        });
+
+        let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        let (rewritten, changed) = rewrite_with_rule(plan, &RenameScanRule, &mut ctx).unwrap();
+
+        assert!(changed);
+        let LogicalPlan::Apply(apply) = rewritten else {
+            panic!("expected apply root");
+        };
+        let LogicalPlan::Scan(right_scan) = *apply.right else {
+            panic!("expected scan on apply right side");
+        };
+        assert_eq!(right_scan.table.name, "after");
     }
 }

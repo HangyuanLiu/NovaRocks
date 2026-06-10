@@ -205,6 +205,10 @@ pub(crate) fn plan_contains_imv_marker(plan: &LogicalPlan) -> bool {
         LogicalPlan::CTEAnchor(n) => {
             plan_contains_imv_marker(&n.produce) || plan_contains_imv_marker(&n.consumer)
         }
+        LogicalPlan::Apply(n) => {
+            plan_contains_imv_marker(&n.left) || plan_contains_imv_marker(&n.right)
+        }
+        LogicalPlan::AssertOneRow(n) => plan_contains_imv_marker(&n.input),
         LogicalPlan::Union(n) => n.inputs.iter().any(plan_contains_imv_marker),
         LogicalPlan::Intersect(n) => n.inputs.iter().any(plan_contains_imv_marker),
         LogicalPlan::Except(n) => n.inputs.iter().any(plan_contains_imv_marker),
@@ -257,6 +261,11 @@ fn collect_into(plan: &LogicalPlan, found: &mut Vec<&'static str>) {
             collect_into(&n.produce, found);
             collect_into(&n.consumer, found);
         }
+        LogicalPlan::Apply(n) => {
+            collect_into(&n.left, found);
+            collect_into(&n.right, found);
+        }
+        LogicalPlan::AssertOneRow(n) => collect_into(&n.input, found),
         LogicalPlan::Union(n) => n.inputs.iter().for_each(|p| collect_into(p, found)),
         LogicalPlan::Intersect(n) => n.inputs.iter().for_each(|p| collect_into(p, found)),
         LogicalPlan::Except(n) => n.inputs.iter().for_each(|p| collect_into(p, found)),

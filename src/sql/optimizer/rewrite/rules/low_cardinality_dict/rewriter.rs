@@ -125,6 +125,8 @@ fn rewrite_node(
         | LogicalPlan::TableFunction(_)
         | LogicalPlan::Repeat(_)
         | LogicalPlan::AggregateStateMerge(_)
+        | LogicalPlan::Apply(_)
+        | LogicalPlan::AssertOneRow(_)
         // TODO(post-Task-9): multi-consumer CTEs with matching dict
         // snapshots across every consumer could keep the dict column
         // on the producer output. Doing so requires a fix-up pass over
@@ -1304,6 +1306,12 @@ fn plan_output_columns(plan: &LogicalPlan) -> Vec<OutputColumn> {
             is_internal: false,
         }],
         LogicalPlan::CTEAnchor(node) => plan_output_columns(&node.consumer),
+        LogicalPlan::Apply(node) => {
+            let mut out = plan_output_columns(&node.left);
+            out.push(node.output_column.clone());
+            out
+        }
+        LogicalPlan::AssertOneRow(node) => plan_output_columns(&node.input),
         LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
         }

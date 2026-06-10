@@ -39,12 +39,12 @@ use crate::sql::codegen::{
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::operator::{
-    AggMode, PhysicalCTEAnchorOp, PhysicalCTEConsumeOp, PhysicalCTEProduceOp, PhysicalDecodeOp,
-    PhysicalDistributionOp, PhysicalExceptOp, PhysicalFilterOp, PhysicalGenerateSeriesOp,
-    PhysicalHashAggregateOp, PhysicalHashJoinOp, PhysicalIntersectOp, PhysicalLimitOp,
-    PhysicalNestLoopJoinOp, PhysicalProjectOp, PhysicalRepeatOp, PhysicalScanOp, PhysicalSortOp,
-    PhysicalTableFunctionOp, PhysicalTopNOp, PhysicalUnionOp, PhysicalValuesOp, PhysicalWindowOp,
-    ScanDictionaryColumn,
+    AggMode, PhysicalAssertOneRowOp, PhysicalCTEAnchorOp, PhysicalCTEConsumeOp,
+    PhysicalCTEProduceOp, PhysicalDecodeOp, PhysicalDistributionOp, PhysicalExceptOp,
+    PhysicalFilterOp, PhysicalGenerateSeriesOp, PhysicalHashAggregateOp, PhysicalHashJoinOp,
+    PhysicalIntersectOp, PhysicalLimitOp, PhysicalNestLoopJoinOp, PhysicalProjectOp,
+    PhysicalRepeatOp, PhysicalScanOp, PhysicalSortOp, PhysicalTableFunctionOp, PhysicalTopNOp,
+    PhysicalUnionOp, PhysicalValuesOp, PhysicalWindowOp, ScanDictionaryColumn,
 };
 use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
 use crate::sql::optimizer::property::{OrderingSpec, window_ordering_spec};
@@ -1240,6 +1240,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             Operator::PhysicalSort(op) => self.visit_sort(op, node),
             Operator::PhysicalTopN(op) => self.visit_physical_top_n(op, node),
             Operator::PhysicalLimit(op) => self.visit_limit(op, node),
+            Operator::PhysicalAssertOneRow(op) => self.visit_assert_one_row(op, node),
             Operator::PhysicalWindow(op) => self.visit_window(op, node),
             Operator::PhysicalValues(op) => self.visit_values(op, node),
             Operator::PhysicalGenerateSeries(op) => self.visit_generate_series(op, node),
@@ -3164,6 +3165,51 @@ impl<'a> PlanFragmentBuilder<'a> {
             tuple_ids: child_tuple_ids,
             cte_exchange_nodes: Vec::new(),
             ordering: OrderingSpec::Any,
+        })
+    }
+
+    // -------------------------------------------------------------------
+    // visit_assert_one_row
+    // -------------------------------------------------------------------
+
+    fn visit_assert_one_row(
+        &mut self,
+        op: &PhysicalAssertOneRowOp,
+        node: &PhysicalPlanNode,
+    ) -> Result<VisitResult, String> {
+        if node.children.len() != 1 {
+            return Err(format!(
+                "PhysicalAssertOneRow expected exactly 1 child, got {}",
+                node.children.len()
+            ));
+        }
+        let child = self.visit(&node.children[0])?;
+        let node_id = self.alloc_node();
+
+        let mut plan_node = nodes::default_plan_node();
+        plan_node.node_id = node_id;
+        plan_node.node_type = plan_nodes::TPlanNodeType::ASSERT_NUM_ROWS_NODE;
+        plan_node.num_children = 1;
+        plan_node.limit = -1;
+        plan_node.row_tuples = child.tuple_ids.clone();
+        plan_node.nullable_tuples = vec![];
+        plan_node.compact_data = true;
+        plan_node.assert_num_rows_node = Some(plan_nodes::TAssertNumRowsNode {
+            desired_num_rows: Some(1),
+            subquery_string: Some(op.subquery_text.clone()),
+            assertion: Some(plan_nodes::TAssertion::LE),
+        });
+
+        // Pre-order: assert node first, then child nodes.
+        let mut out_nodes = vec![plan_node];
+        out_nodes.extend(child.plan_nodes);
+
+        Ok(VisitResult {
+            plan_nodes: out_nodes,
+            scope: child.scope,
+            tuple_ids: child.tuple_ids,
+            cte_exchange_nodes: child.cte_exchange_nodes,
+            ordering: child.ordering,
         })
     }
 
@@ -8934,5 +8980,67 @@ mod tests {
 
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, "s3://bucket/explicit-snapshot.parquet");
+    }
+
+    #[test]
+    fn assert_one_row_emits_assert_num_rows_node() {
+        let child = PhysicalPlanNode {
+            op: Operator::PhysicalGenerateSeries(PhysicalGenerateSeriesOp {
+                start: 1,
+                end: 3,
+                step: 1,
+                column_name: "generate_series".to_string(),
+                alias: Some("gs".to_string()),
+                output_column_id: crate::sql::column_id::ColumnId::new_for_test(9001),
+            }),
+            children: vec![],
+            stats: Statistics::default(),
+            output_columns: vec![OutputColumn {
+                column_id: crate::sql::column_id::ColumnId::new_for_test(9001),
+                name: "generate_series".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                is_internal: false,
+            }],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+        };
+        let output_columns = child.output_columns.clone();
+        let plan = PhysicalPlanNode {
+            op: Operator::PhysicalAssertOneRow(
+                crate::sql::optimizer::operator::PhysicalAssertOneRowOp {
+                    subquery_text: "select 1".to_string(),
+                },
+            ),
+            children: vec![child],
+            stats: Statistics::default(),
+            output_columns,
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+        };
+
+        let build = PlanFragmentBuilder::build(
+            &plan,
+            &DummyCatalog,
+            &crate::connector::ConnectorRegistry::new(),
+            "default",
+        )
+        .expect("build");
+        let root = build.fragment_results.first().expect("root fragment");
+        let assert_node = root
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.node_type == plan_nodes::TPlanNodeType::ASSERT_NUM_ROWS_NODE)
+            .expect("assert num rows node");
+        let payload = assert_node
+            .assert_num_rows_node
+            .as_ref()
+            .expect("assert payload");
+        assert_eq!(payload.desired_num_rows, Some(1));
+        assert_eq!(payload.assertion, Some(plan_nodes::TAssertion::LE));
+        assert_eq!(payload.subquery_string.as_deref(), Some("select 1"));
     }
 }

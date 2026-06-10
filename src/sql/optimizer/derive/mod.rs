@@ -84,6 +84,7 @@ pub(crate) fn derive_output(
         Operator::PhysicalDecode(o) => o.derive_output(children_outputs),
         Operator::PhysicalAggregateStateMerge(o) => o.derive_output(children_outputs),
         Operator::PhysicalLimit(o) => o.derive_output(children_outputs),
+        Operator::PhysicalAssertOneRow(o) => o.derive_output(children_outputs),
         Operator::PhysicalCTEProduce(o) => o.derive_output(children_outputs),
         Operator::PhysicalRepeat(o) => o.derive_output(children_outputs),
         Operator::PhysicalTableFunction(o) => o.derive_output(children_outputs),
@@ -139,6 +140,7 @@ pub(crate) fn derive_required(
             o.derive_required(parent_required, num_children)
         }
         Operator::PhysicalLimit(o) => o.derive_required(parent_required, num_children),
+        Operator::PhysicalAssertOneRow(o) => o.derive_required(parent_required, num_children),
         Operator::PhysicalCTEProduce(o) => o.derive_required(parent_required, num_children),
         Operator::PhysicalRepeat(o) => o.derive_required(parent_required, num_children),
         Operator::PhysicalTableFunction(o) => o.derive_required(parent_required, num_children),
@@ -312,6 +314,7 @@ mod tests {
 // ---------------------------------------------------------------------------
 
 pub(crate) mod aggregate_state_merge;
+pub(crate) mod assert_one_row;
 pub(crate) mod cte;
 pub(crate) mod enforcer;
 pub(crate) mod hash_aggregate;

@@ -253,6 +253,12 @@ pub(crate) fn collect_output_columns(plan: &LogicalPlan) -> HashSet<String> {
             }
             cols
         }
+        LogicalPlan::Apply(a) => {
+            let mut out = collect_output_columns(&a.left);
+            out.insert(a.output_column.name.to_lowercase());
+            out
+        }
+        LogicalPlan::AssertOneRow(a) => collect_output_columns(&a.input),
         LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
         }
@@ -419,6 +425,12 @@ pub(crate) fn collect_output_ids_ordered(
             ids
         }
         LogicalPlan::CTEAnchor(a) => collect_output_ids_ordered(&a.consumer),
+        LogicalPlan::Apply(a) => {
+            let mut ids = collect_output_ids_ordered(&a.left);
+            ids.push(a.output_column.column_id);
+            ids
+        }
+        LogicalPlan::AssertOneRow(a) => collect_output_ids_ordered(&a.input),
         LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
             panic!("imv marker should not appear in non-IMV pruning")
         }
@@ -792,6 +804,12 @@ fn collect_qualified_output_columns_inner(plan: &LogicalPlan, out: &mut HashSet<
                 out.insert((None, mapping.string_column.to_lowercase()));
             }
         }
+        // Apply's synthesized output column is unqualified; only the left
+        // side contributes qualified refs.
+        // Apply's right child (the subquery) is in a nested scope; its table
+        // qualifications are not visible in the outer query.
+        LogicalPlan::Apply(a) => collect_qualified_output_columns_inner(&a.left, out),
+        LogicalPlan::AssertOneRow(a) => collect_qualified_output_columns_inner(&a.input, out),
         LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
         }

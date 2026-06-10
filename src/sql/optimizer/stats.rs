@@ -559,6 +559,14 @@ pub(crate) fn derive_statistics(
                 column_statistics: HashMap::new(),
             }
         }
+        Operator::LogicalAssertOneRow(_) | Operator::PhysicalAssertOneRow(_) => {
+            let child_stats = child_statistics(memo, &expr.children, 0);
+            Statistics {
+                output_row_count: child_stats.output_row_count.min(1.0),
+                row_count_confidence: Confidence::Estimated,
+                column_statistics: child_stats.column_statistics,
+            }
+        }
     }
 }
 
@@ -1348,7 +1356,8 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
         | Operator::LogicalSort(_)
         | Operator::LogicalLimit(_)
         | Operator::LogicalTopN(_)
-        | Operator::LogicalRepeat(_) => {
+        | Operator::LogicalRepeat(_)
+        | Operator::LogicalAssertOneRow(_) => {
             if let Some(&child_id) = expr.children.first() {
                 memo.groups[child_id]
                     .logical_props
@@ -1423,7 +1432,8 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
         | Operator::PhysicalLimit(_)
         | Operator::PhysicalTopN(_)
         | Operator::PhysicalDistribution(_)
-        | Operator::PhysicalRepeat(_) => {
+        | Operator::PhysicalRepeat(_)
+        | Operator::PhysicalAssertOneRow(_) => {
             if let Some(&child_id) = expr.children.first() {
                 memo.groups[child_id]
                     .logical_props

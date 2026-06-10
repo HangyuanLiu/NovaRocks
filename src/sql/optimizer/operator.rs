@@ -362,6 +362,18 @@ pub(crate) struct PhysicalLimitOp {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct LogicalAssertOneRowOp {
+    /// Original subquery text used in the runtime error message.
+    pub subquery_text: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PhysicalAssertOneRowOp {
+    /// Original subquery text forwarded to the runtime error message.
+    pub subquery_text: String,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct PhysicalTopNOp {
     pub items: Vec<SortItem>,
     pub limit: Option<i64>,
@@ -494,6 +506,7 @@ pub(crate) enum Operator {
     LogicalCTEConsume(LogicalCTEConsumeOp),
     LogicalDecode(LogicalDecodeOp),
     LogicalAggregateStateMerge(AggregateStateMergeOp),
+    LogicalAssertOneRow(LogicalAssertOneRowOp),
 
     // Physical operators
     PhysicalScan(PhysicalScanOp),
@@ -519,6 +532,7 @@ pub(crate) enum Operator {
     PhysicalTableFunction(PhysicalTableFunctionOp),
     PhysicalDecode(PhysicalDecodeOp),
     PhysicalAggregateStateMerge(AggregateStateMergeOp),
+    PhysicalAssertOneRow(PhysicalAssertOneRowOp),
 }
 
 impl Operator {
@@ -546,6 +560,7 @@ impl Operator {
                 | Operator::LogicalCTEConsume(_)
                 | Operator::LogicalDecode(_)
                 | Operator::LogicalAggregateStateMerge(_)
+                | Operator::LogicalAssertOneRow(_)
         )
     }
 

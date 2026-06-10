@@ -10,7 +10,7 @@ use crate::sql::optimizer::estimate::arith::MAX_ROW_COUNT;
 use crate::sql::optimizer::operator::{AggMode, JoinDistribution, Operator};
 use crate::sql::optimizer::physical_plan::{JoinExecutionDistribution, PhysicalPlanNode};
 use crate::sql::optimizer::property::DistributionSpec;
-use crate::sql::planner::plan::LogicalPlan;
+use crate::sql::planner::plan::{ApplyKind, LogicalPlan};
 
 /// Build the per-node `stats={...}` trailer surfaced under
 /// `Verbose | Costs | Analyze` levels. Future PRs (OPT-3 NDV, OPT-4
@@ -351,6 +351,26 @@ fn format_node(plan: &LogicalPlan, level: ExplainLevel, indent: usize, out: &mut
             format_node(&node.old_input, level, indent + 1, out);
             format_node(&node.delta_input, level, indent + 1, out);
         }
+        LogicalPlan::Apply(node) => {
+            let kind = match node.kind {
+                ApplyKind::Scalar => "SCALAR",
+                ApplyKind::Exists { negated: false } => "EXISTS",
+                ApplyKind::Exists { negated: true } => "NOT EXISTS",
+                ApplyKind::In { negated: false } => "IN",
+                ApplyKind::In { negated: true } => "NOT IN",
+            };
+            out.push(format!(
+                "{pad}APPLY ({kind}, correlated={}, use_semi_anti={})",
+                !node.correlation_column_ids.is_empty(),
+                node.use_semi_anti
+            ));
+            format_node(&node.left, level, indent + 1, out);
+            format_node(&node.right, level, indent + 1, out);
+        }
+        LogicalPlan::AssertOneRow(node) => {
+            out.push(format!("{pad}ASSERT ONE ROW"));
+            format_node(&node.input, level, indent + 1, out);
+        }
         LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
         }
@@ -671,6 +691,14 @@ fn format_physical_node(
             out.push(format!(
                 "{pad}LIMIT [{}]{costs_suffix}{stats_suffix}",
                 parts.join(", ")
+            ));
+            for child in &node.children {
+                format_physical_node(child, level, indent + 1, out);
+            }
+        }
+        Operator::PhysicalAssertOneRow(_) => {
+            out.push(format!(
+                "{pad}ASSERT NUM ROWS (<= 1){costs_suffix}{stats_suffix}"
             ));
             for child in &node.children {
                 format_physical_node(child, level, indent + 1, out);
@@ -1922,6 +1950,72 @@ mod rf_explain_tests {
         assert!(
             !lines.contains("runtime filters:"),
             "RF must be hidden at Normal level"
+        );
+    }
+
+    #[test]
+    fn logical_explain_formats_apply_and_assert_one_row() {
+        use std::collections::HashSet;
+
+        use arrow::datatypes::DataType;
+
+        use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
+        use crate::sql::column_id::ColumnId;
+        use crate::sql::planner::plan::{
+            ApplyKind, ApplyNode, AssertOneRowNode, LogicalPlan, ValuesNode,
+        };
+
+        let values = || {
+            LogicalPlan::Values(ValuesNode {
+                rows: vec![],
+                columns: vec![],
+                required_output_columns: None,
+            })
+        };
+        let plan = LogicalPlan::Apply(ApplyNode {
+            left: Box::new(values()),
+            right: Box::new(LogicalPlan::AssertOneRow(AssertOneRowNode {
+                input: Box::new(values()),
+                subquery_text: "select 1".to_string(),
+                required_output_columns: None,
+            })),
+            kind: ApplyKind::Exists { negated: true },
+            subquery_expr: TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: ColumnId(5),
+                    qualifier: None,
+                    column: "sq".to_string(),
+                },
+                data_type: DataType::Boolean,
+                nullable: false,
+            },
+            output_column: OutputColumn {
+                column_id: ColumnId(5),
+                name: "sq".to_string(),
+                data_type: DataType::Boolean,
+                nullable: false,
+                is_internal: true,
+            },
+            correlation_column_ids: vec![ColumnId(1)],
+            correlation_conjuncts: vec![],
+            residual_predicate: None,
+            need_check_max_rows: false,
+            use_semi_anti: true,
+            uncorrelated_outer_predicate_columns: HashSet::new(),
+            required_output_columns: None,
+        });
+
+        let mut out = Vec::new();
+        super::format_node(&plan, super::ExplainLevel::Normal, 0, &mut out);
+        assert!(
+            out.iter().any(
+                |line| line.contains("APPLY (NOT EXISTS, correlated=true, use_semi_anti=true)")
+            ),
+            "missing APPLY line: {out:?}"
+        );
+        assert!(
+            out.iter().any(|line| line.contains("ASSERT ONE ROW")),
+            "missing ASSERT ONE ROW line: {out:?}"
         );
     }
 }
