@@ -8838,4 +8838,66 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, "s3://bucket/explicit-snapshot.parquet");
     }
+
+    #[test]
+    fn assert_one_row_emits_assert_num_rows_node() {
+        let child = PhysicalPlanNode {
+            op: Operator::PhysicalGenerateSeries(PhysicalGenerateSeriesOp {
+                start: 1,
+                end: 3,
+                step: 1,
+                column_name: "generate_series".to_string(),
+                alias: Some("gs".to_string()),
+                output_column_id: crate::sql::column_id::ColumnId::new_for_test(9001),
+            }),
+            children: vec![],
+            stats: Statistics::default(),
+            output_columns: vec![OutputColumn {
+                column_id: crate::sql::column_id::ColumnId::new_for_test(9001),
+                name: "generate_series".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                is_internal: false,
+            }],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+        };
+        let output_columns = child.output_columns.clone();
+        let plan = PhysicalPlanNode {
+            op: Operator::PhysicalAssertOneRow(
+                crate::sql::optimizer::operator::PhysicalAssertOneRowOp {
+                    subquery_text: "select 1".to_string(),
+                },
+            ),
+            children: vec![child],
+            stats: Statistics::default(),
+            output_columns,
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+        };
+
+        let build = PlanFragmentBuilder::build(
+            &plan,
+            &DummyCatalog,
+            &crate::connector::ConnectorRegistry::new(),
+            "default",
+        )
+        .expect("build");
+        let root = build.fragment_results.first().expect("root fragment");
+        let assert_node = root
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.node_type == plan_nodes::TPlanNodeType::ASSERT_NUM_ROWS_NODE)
+            .expect("assert num rows node");
+        let payload = assert_node
+            .assert_num_rows_node
+            .as_ref()
+            .expect("assert payload");
+        assert_eq!(payload.desired_num_rows, Some(1));
+        assert_eq!(payload.assertion, Some(plan_nodes::TAssertion::LE));
+        assert_eq!(payload.subquery_string.as_deref(), Some("select 1"));
+    }
 }

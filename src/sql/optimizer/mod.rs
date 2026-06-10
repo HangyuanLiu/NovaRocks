@@ -575,4 +575,27 @@ mod is_known_rule_name_tests {
         };
         assert!(scan.dict_columns.is_empty());
     }
+
+    #[test]
+    fn optimize_implements_assert_one_row() {
+        use std::collections::HashMap;
+
+        use crate::sql::column_id::ColumnRefFactory;
+        use crate::sql::planner::plan::{AssertOneRowNode, LogicalPlan, ValuesNode};
+
+        let plan = LogicalPlan::AssertOneRow(AssertOneRowNode {
+            input: Box::new(LogicalPlan::Values(ValuesNode {
+                rows: vec![],
+                columns: vec![],
+                required_output_columns: None,
+            })),
+            subquery_text: "select 1".to_string(),
+            required_output_columns: None,
+        });
+        let factory = ColumnRefFactory::new();
+        let physical =
+            optimize(plan, &HashMap::new(), factory, None).expect("optimize assert one row");
+        let physical_debug = format!("{physical:?}");
+        assert!(physical_debug.contains("PhysicalAssertOneRow"));
+    }
 }

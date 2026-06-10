@@ -628,4 +628,47 @@ mod tests {
 
         assert!(count.load(Ordering::SeqCst) >= 1);
     }
+
+    #[test]
+    fn bottom_up_rewrite_rebuilds_apply_children() {
+        use std::collections::HashSet;
+
+        use crate::sql::planner::plan::{ApplyKind, ApplyNode};
+
+        let outer = project_over_scan("outer");
+        let LogicalPlan::Project(outer_project) = outer else {
+            panic!("helper returns project");
+        };
+        let inner = project_over_scan("before");
+        let LogicalPlan::Project(inner_project) = inner else {
+            panic!("helper returns project");
+        };
+
+        let plan = LogicalPlan::Apply(ApplyNode {
+            left: outer_project.input,
+            right: inner_project.input,
+            kind: ApplyKind::Scalar,
+            subquery_expr: column_ref(ColumnId(7), "sq"),
+            output_column: output_column("sq"),
+            correlation_column_ids: vec![],
+            correlation_conjuncts: vec![],
+            residual_predicate: None,
+            need_check_max_rows: true,
+            use_semi_anti: false,
+            uncorrelated_outer_predicate_columns: HashSet::new(),
+            required_output_columns: None,
+        });
+
+        let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        let (rewritten, changed) = rewrite_with_rule(plan, &RenameScanRule, &mut ctx).unwrap();
+
+        assert!(changed);
+        let LogicalPlan::Apply(apply) = rewritten else {
+            panic!("expected apply root");
+        };
+        let LogicalPlan::Scan(right_scan) = *apply.right else {
+            panic!("expected scan on apply right side");
+        };
+        assert_eq!(right_scan.table.name, "after");
+    }
 }
