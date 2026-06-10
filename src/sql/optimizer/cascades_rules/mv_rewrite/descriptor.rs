@@ -48,14 +48,14 @@ pub(crate) enum SpjgOutputExpr {
 #[derive(Clone, Debug)]
 pub(crate) struct SpjgAggregate {
     /// Group keys, composed down to base-table column expressions.
+    /// Rollup matching only needs the group-by set; aggregate calls are matched
+    /// through the descriptor's `outputs` (the `Aggregate` variant), so they are
+    /// not duplicated here.
     pub group_by: Vec<TypedExpr>,
-    /// Aggregate calls, args composed down to base-table columns.
-    pub aggregates: Vec<AggregateCall>,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct SpjgDescriptor {
-    pub database: String,
     pub table: TableDef,
     /// Scan output columns: ColumnId -> base column binding.
     pub scan_columns: Vec<OutputColumn>,
@@ -69,7 +69,6 @@ pub(crate) struct SpjgDescriptor {
 impl SpjgDescriptor {
     /// Map from scan ColumnId to base column name (for cross-side matching:
     /// the two sides see the same physical table through different ids).
-    #[allow(dead_code)]
     pub(crate) fn base_name_of(&self) -> HashMap<ColumnId, String> {
         self.scan_columns
             .iter()
@@ -171,13 +170,7 @@ impl SpjgDescriptor {
                     });
                 }
                 let outputs = apply_top_project(top_project, agg_outputs)?;
-                (
-                    Some(SpjgAggregate {
-                        group_by,
-                        aggregates,
-                    }),
-                    outputs,
-                )
+                (Some(SpjgAggregate { group_by }), outputs)
             }
             None => {
                 let scan_outputs: Vec<SpjgOutput> = scan
@@ -216,7 +209,6 @@ impl SpjgDescriptor {
         };
 
         Ok(SpjgDescriptor {
-            database: scan.database.clone(),
             table: scan.table.clone(),
             scan_columns: scan.columns.clone(),
             predicates,
@@ -323,10 +315,7 @@ impl SpjgDescriptor {
                     });
                 }
                 (
-                    Some(SpjgAggregate {
-                        group_by,
-                        aggregates,
-                    }),
+                    Some(SpjgAggregate { group_by }),
                     agg_outputs,
                     MatchedShape::Spjg {
                         original_agg: a.clone(),
@@ -384,7 +373,6 @@ impl SpjgDescriptor {
 
         Some((
             SpjgDescriptor {
-                database: scan.database.clone(),
                 table: scan.table.clone(),
                 scan_columns: scan.columns.clone(),
                 predicates,
@@ -951,9 +939,11 @@ mod tests {
         let d = SpjgDescriptor::from_logical_plan(&plan).expect("spjg");
         let agg = d.aggregate.as_ref().expect("aggregate present");
         assert_eq!(agg.group_by.len(), 1);
-        assert_eq!(agg.aggregates.len(), 1);
-        // outputs: Dimension(a) then Aggregate(sum(v))
+        // outputs: Dimension(a) then Aggregate(sum(v)); the aggregate call is
+        // captured in `outputs`, not duplicated on `SpjgAggregate`.
         assert_eq!(d.outputs.len(), 2);
+        assert!(matches!(d.outputs[0].expr, SpjgOutputExpr::Dimension(_)));
+        assert!(matches!(d.outputs[1].expr, SpjgOutputExpr::Aggregate(_)));
     }
 
     #[test]
@@ -961,7 +951,7 @@ mod tests {
         // Any node outside {Scan, Filter, Project, Aggregate} must yield Err.
         let a = col(1, "a");
         let plan = LogicalPlan::Sort(SortNode {
-            input: Box::new(LogicalPlan::Scan(scan(&[a.clone()]))),
+            input: Box::new(LogicalPlan::Scan(scan(std::slice::from_ref(&a)))),
             items: vec![],
             analytic_partition_by: vec![],
             required_output_columns: None,
@@ -1030,7 +1020,8 @@ mod tests {
         let agg = mem.aggregate.as_ref().expect("aggregate present");
         let logical_agg = logical.aggregate.as_ref().expect("aggregate present");
         assert_eq!(agg.group_by.len(), logical_agg.group_by.len());
-        assert_eq!(agg.aggregates.len(), logical_agg.aggregates.len());
+        // Aggregate-call parity is covered by output-length equality
+        // (outputs = group keys + aggregates) below.
         assert_eq!(mem.outputs.len(), logical.outputs.len());
     }
 

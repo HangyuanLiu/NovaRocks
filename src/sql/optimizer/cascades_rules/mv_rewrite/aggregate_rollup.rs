@@ -217,10 +217,6 @@ mod tests {
 
         let mv_agg = SpjgAggregate {
             group_by: vec![col_ref(&mv_a), col_ref(&mv_b)],
-            aggregates: vec![
-                agg("sum", vec![col_ref(&mv_v)], false),
-                agg("count", vec![], false),
-            ],
         };
         let mv_outputs = vec![
             dim_out(&col(101, "a"), col_ref(&mv_a)),
@@ -273,10 +269,6 @@ mod tests {
 
         let mv_agg = SpjgAggregate {
             group_by: vec![col_ref(&mv_a)],
-            aggregates: vec![
-                agg("sum", vec![col_ref(&mv_v)], false),
-                agg("count", vec![], false),
-            ],
         };
         let mv_outputs = vec![
             dim_out(&col(101, "a"), col_ref(&mv_a)),
@@ -326,7 +318,6 @@ mod tests {
 
         let mv_agg = SpjgAggregate {
             group_by: vec![col_ref(&mv_a)],
-            aggregates: vec![agg("count", vec![col_ref(&mv_x)], true)],
         };
         let mv_outputs = vec![
             dim_out(&col(101, "a"), col_ref(&mv_a)),
@@ -365,7 +356,6 @@ mod tests {
 
         let mv_agg = SpjgAggregate {
             group_by: vec![col_ref(&mv_a), col_ref(&mv_b)],
-            aggregates: vec![agg("avg", vec![col_ref(&mv_v)], false)],
         };
         let mv_outputs = vec![
             dim_out(&col(101, "a"), col_ref(&mv_a)),
@@ -418,7 +408,6 @@ mod tests {
 
         let mv_agg = SpjgAggregate {
             group_by: vec![col_ref(&mv_a)],
-            aggregates: vec![agg("count", vec![], false)],
         };
         let mv_outputs = vec![
             dim_out(&col(101, "a"), col_ref(&mv_a)),
