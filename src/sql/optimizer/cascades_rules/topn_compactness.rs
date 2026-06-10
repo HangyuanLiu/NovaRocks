@@ -85,7 +85,6 @@ fn topn_phase_can_merge(outer: &LogicalTopNOp, inner: &LogicalTopNOp) -> bool {
     matches!(
         (outer.phase, inner.phase, outer.is_split, inner.is_split),
         (TopNPhase::Final, TopNPhase::Final, false, false)
-            | (TopNPhase::Final, TopNPhase::Partial, true, false)
     )
 }
 
@@ -227,7 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn merges_split_final_over_partial_topn() {
+    fn does_not_merge_split_final_over_partial_topn() {
         let mut memo = Memo::new();
         let scan_group = scan_group(&mut memo);
         let inner_group = memo.new_group(topn(&memo, 20, 0, TopNPhase::Partial, false, scan_group));
@@ -235,8 +234,10 @@ mod tests {
 
         let out = MergeConsecutiveTopN.apply(&outer, &mut memo);
 
-        assert_eq!(out.len(), 1, "split final may merge over partial TopN");
-        assert_eq!(out[0].children, vec![scan_group]);
+        assert!(
+            out.is_empty(),
+            "split final TopN must keep its partial TopN child"
+        );
     }
 
     #[test]
