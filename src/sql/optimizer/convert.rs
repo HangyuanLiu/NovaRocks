@@ -342,9 +342,9 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
         }
         LogicalPlan::Apply(_) => {
             // Defence in depth: the SubqueryRewrite stage's ApplyException
-            // rule and the optimize() residual-Apply backstop (added later in
-            // M0) eliminate every Apply before this point. Reaching here means
-            // a planner bug, so fail loudly rather than mis-optimize.
+            // rule and the optimize() residual-Apply backstop eliminate every
+            // Apply before this point. Reaching here means a planner bug, so
+            // fail loudly rather than mis-optimize.
             panic!(
                 "apply operator must be eliminated by the SubqueryRewrite stage before memo conversion"
             );
