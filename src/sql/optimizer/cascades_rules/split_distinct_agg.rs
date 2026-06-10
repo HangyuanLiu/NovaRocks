@@ -171,6 +171,31 @@ fn distinct_aggregate_calls(
     }
 }
 
+fn rebind_distinct_arg_to_phase_output(
+    mut call: AggregateCall,
+    phase_output: &TypedExpr,
+) -> AggregateCall {
+    if call.distinct && call.args.len() == 1 {
+        let mut arg = call.args[0].clone();
+        if let (
+            ExprKind::ColumnRef { column_id, .. },
+            ExprKind::ColumnRef {
+                column_id: phase_id,
+                ..
+            },
+        ) = (&mut arg.kind, &phase_output.kind)
+        {
+            *column_id = *phase_id;
+            arg.data_type = phase_output.data_type.clone();
+            arg.nullable = phase_output.nullable;
+        } else {
+            arg = phase_output.clone();
+        }
+        call.args = vec![arg];
+    }
+    call
+}
+
 fn group_output_column_from_expr(expr: &TypedExpr, fallback_name: String) -> OutputColumn {
     let (column_id, name) = match &expr.kind {
         ExprKind::ColumnRef {
@@ -264,6 +289,10 @@ fn apply_three_phase(
     // non_distinct states.
     let dg_group_by =
         aggregate_group_key_output_ref(&gb_with_distinct_outputs, gb_with_distinct_outputs.len());
+    let distinct_phase_arg = dg_group_by
+        .last()
+        .cloned()
+        .unwrap_or_else(|| distinct_col.clone());
     let dg_id = memo.next_expr_id();
     let dg = MExpr {
         id: dg_id,
@@ -286,7 +315,10 @@ fn apply_three_phase(
     // non-DISTINCT merge calls immediately after the first DISTINCT call: the
     // fragment builder maps merge inputs by aggregate index and this ordering
     // aligns them with the DISTINCT_GLOBAL output slots.
-    let distinct_aggs = distinct_aggregate_calls(agg, distinct_col);
+    let distinct_aggs: Vec<AggregateCall> = distinct_aggregate_calls(agg, distinct_col)
+        .into_iter()
+        .map(|call| rebind_distinct_arg_to_phase_output(call, &distinct_phase_arg))
+        .collect();
     let mut global_aggs = Vec::with_capacity(distinct_aggs.len() + non_distinct.len());
     global_aggs.push(distinct_aggs[0].clone());
     global_aggs.extend(non_distinct.iter().cloned());
@@ -322,6 +354,12 @@ fn apply_four_phase(
     non_distinct: &[AggregateCall],
 ) -> Vec<NewExpr> {
     let distinct_group_outputs = phase_group_output_columns(std::slice::from_ref(distinct_col));
+    let distinct_group_by =
+        aggregate_group_key_output_ref(&distinct_group_outputs, distinct_group_outputs.len());
+    let distinct_phase_arg = distinct_group_by
+        .first()
+        .cloned()
+        .unwrap_or_else(|| distinct_col.clone());
 
     // LOCAL: group_by = [x]; non_distinct aggs with update semantics.
     let local_id = memo.next_expr_id();
@@ -344,9 +382,9 @@ fn apply_four_phase(
         id: dg_id,
         op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
             mode: AggMode::DistinctGlobal,
-            group_by: vec![distinct_col.clone()],
+            group_by: distinct_group_by,
             aggregates: non_distinct.to_vec(),
-            output_columns: distinct_group_outputs,
+            output_columns: distinct_group_outputs.clone(),
             is_merge: vec![true; non_distinct.len()],
         }),
         children: vec![local_group],
@@ -360,7 +398,10 @@ fn apply_four_phase(
     //
     // Use the original distinct aggregate calls so their display names match
     // what the PROJECT node expects.
-    let distinct_aggs = distinct_aggregate_calls(agg, distinct_col);
+    let distinct_aggs: Vec<AggregateCall> = distinct_aggregate_calls(agg, distinct_col)
+        .into_iter()
+        .map(|call| rebind_distinct_arg_to_phase_output(call, &distinct_phase_arg))
+        .collect();
     let mut phase_aggs = Vec::with_capacity(distinct_aggs.len() + non_distinct.len());
     phase_aggs.push(distinct_aggs[0].clone());
     phase_aggs.extend(non_distinct.iter().cloned());
@@ -1012,6 +1053,94 @@ mod tests {
                 .map(|c| c.column_id)
                 .collect::<Vec<_>>(),
             vec![ColumnId::new_for_test(5)]
+        );
+    }
+
+    #[test]
+    fn four_phase_rebinds_distinct_update_args_to_phase_output_id() {
+        let mut memo = Memo::new();
+        let sg = scan_group(&mut memo);
+        let x_phase = col_with_id("x", 5);
+        let x_duplicate = col_with_id("x", 55);
+        let a = col_with_id("a", 6);
+        let id = memo.next_expr_id();
+        let mexpr = MExpr {
+            id,
+            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+                vec![],
+                vec![
+                    AggregateCall {
+                        name: "count".into(),
+                        args: vec![x_phase],
+                        distinct: true,
+                        result_type: DataType::Int64,
+                        order_by: vec![],
+                        output_column_id: ColumnId::new_for_test(8),
+                    },
+                    AggregateCall {
+                        name: "sum".into(),
+                        args: vec![a],
+                        distinct: false,
+                        result_type: DataType::Int64,
+                        order_by: vec![],
+                        output_column_id: ColumnId::new_for_test(9),
+                    },
+                    AggregateCall {
+                        name: "count".into(),
+                        args: vec![x_duplicate],
+                        distinct: true,
+                        result_type: DataType::Int64,
+                        order_by: vec![],
+                        output_column_id: ColumnId::new_for_test(10),
+                    },
+                ],
+                vec![
+                    OutputColumn {
+                        column_id: ColumnId::new_for_test(8),
+                        name: "count(distinct x)".into(),
+                        data_type: DataType::Int64,
+                        nullable: true,
+                        is_internal: false,
+                    },
+                    OutputColumn {
+                        column_id: ColumnId::new_for_test(9),
+                        name: "sum(a)".into(),
+                        data_type: DataType::Int64,
+                        nullable: true,
+                        is_internal: false,
+                    },
+                    OutputColumn {
+                        column_id: ColumnId::new_for_test(10),
+                        name: "count(distinct x)".into(),
+                        data_type: DataType::Int64,
+                        nullable: true,
+                        is_internal: false,
+                    },
+                ],
+            )),
+            children: vec![sg],
+        };
+
+        let out = SplitDistinctAgg.apply(&mexpr, &mut memo);
+        assert_eq!(out.len(), 1);
+        let dl_group = &memo.groups[out[0].children[0]];
+        let dl = match &dl_group.physical_exprs[0].op {
+            Operator::PhysicalHashAggregate(p) => p,
+            other => panic!("expected DISTINCT_LOCAL, got {:?}", other),
+        };
+
+        let distinct_arg_ids = dl
+            .aggregates
+            .iter()
+            .filter(|call| call.distinct)
+            .map(|call| match &call.args[0].kind {
+                ExprKind::ColumnRef { column_id, .. } => *column_id,
+                other => panic!("expected ColumnRef arg, got {:?}", other),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            distinct_arg_ids,
+            vec![ColumnId::new_for_test(5), ColumnId::new_for_test(5)]
         );
     }
 }

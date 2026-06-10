@@ -683,6 +683,12 @@ fn annotate_batch(
 ) -> Result<RecordBatch, String> {
     use arrow::array::ArrayRef;
 
+    if batch_has_iceberg_field_ids(batch)
+        || batch_has_reordered_target_names(batch, annotated_schema)
+    {
+        return annotate_batch_by_identity(batch, annotated_schema);
+    }
+
     if batch.num_columns() != annotated_schema.fields().len() {
         return Err(format!(
             "annotate_batch column count mismatch: batch={} schema={}",
@@ -701,6 +707,116 @@ fn annotate_batch(
             .map_err(|e| format!("annotate_batch column {idx} ({}): {e}", target_field.name()))?;
         new_columns.push(new_col);
     }
+    RecordBatch::try_new(Arc::clone(annotated_schema), new_columns)
+        .map_err(|e| format!("re-annotate batch with iceberg field ids failed: {e}"))
+}
+
+fn batch_has_iceberg_field_ids(batch: &RecordBatch) -> bool {
+    batch
+        .schema()
+        .fields()
+        .iter()
+        .any(|field| iceberg_field_id(field).is_some())
+}
+
+fn iceberg_field_id(field: &arrow::datatypes::Field) -> Option<&str> {
+    field
+        .metadata()
+        .get(parquet::arrow::PARQUET_FIELD_ID_META_KEY)
+        .map(String::as_str)
+}
+
+fn batch_has_reordered_target_names(
+    batch: &RecordBatch,
+    annotated_schema: &arrow::datatypes::SchemaRef,
+) -> bool {
+    if batch.num_columns() != annotated_schema.fields().len() {
+        return false;
+    }
+
+    let batch_fields = batch.schema();
+    let batch_fields = batch_fields.fields();
+    let target_fields = annotated_schema.fields();
+    let names_match_positionally = batch_fields
+        .iter()
+        .zip(target_fields.iter())
+        .all(|(source, target)| source.name().eq_ignore_ascii_case(target.name()));
+    if names_match_positionally {
+        return false;
+    }
+
+    let mut source_names = batch_fields
+        .iter()
+        .map(|field| field.name().to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let mut target_names = target_fields
+        .iter()
+        .map(|field| field.name().to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    source_names.sort();
+    target_names.sort();
+    source_names == target_names
+}
+
+fn annotate_batch_by_identity(
+    batch: &RecordBatch,
+    annotated_schema: &arrow::datatypes::SchemaRef,
+) -> Result<RecordBatch, String> {
+    use arrow::array::ArrayRef;
+
+    let source_schema = batch.schema();
+    let mut source_by_field_id: HashMap<String, usize> = HashMap::new();
+    let mut source_by_name: HashMap<String, usize> = HashMap::new();
+    for (idx, field) in source_schema.fields().iter().enumerate() {
+        if let Some(field_id) = iceberg_field_id(field) {
+            if source_by_field_id
+                .insert(field_id.to_string(), idx)
+                .is_some()
+            {
+                return Err(format!(
+                    "annotate_batch duplicate iceberg field id {field_id} in source batch"
+                ));
+            }
+        }
+        let name_key = field.name().to_ascii_lowercase();
+        if source_by_name.insert(name_key.clone(), idx).is_some() {
+            return Err(format!(
+                "annotate_batch duplicate source column name `{}`",
+                field.name()
+            ));
+        }
+    }
+
+    let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(annotated_schema.fields().len());
+    for (target_idx, target_field) in annotated_schema.fields().iter().enumerate() {
+        let source_idx = iceberg_field_id(target_field)
+            .and_then(|field_id| source_by_field_id.get(field_id).copied())
+            .or_else(|| {
+                source_by_name
+                    .get(&target_field.name().to_ascii_lowercase())
+                    .copied()
+            });
+
+        let new_col = if let Some(source_idx) = source_idx {
+            let col = batch.column(source_idx);
+            reannotate_array(col, target_field.data_type()).map_err(|e| {
+                format!(
+                    "annotate_batch column {target_idx} ({}): {e}",
+                    target_field.name()
+                )
+            })?
+        } else {
+            if !target_field.is_nullable() {
+                return Err(format!(
+                    "annotate_batch missing required target column `{}`",
+                    target_field.name()
+                ));
+            }
+            arrow::array::new_null_array(target_field.data_type(), batch.num_rows())
+        };
+        new_columns.push(new_col);
+    }
+
     RecordBatch::try_new(Arc::clone(annotated_schema), new_columns)
         .map_err(|e| format!("re-annotate batch with iceberg field ids failed: {e}"))
 }
@@ -1592,6 +1708,18 @@ mod tests {
         .expect("test batch")
     }
 
+    fn arrow_field_with_iceberg_id(
+        name: &str,
+        data_type: arrow::datatypes::DataType,
+        nullable: bool,
+        field_id: i32,
+    ) -> arrow::datatypes::Field {
+        arrow::datatypes::Field::new(name, data_type, nullable).with_metadata(HashMap::from([(
+            parquet::arrow::PARQUET_FIELD_ID_META_KEY.to_string(),
+            field_id.to_string(),
+        )]))
+    }
+
     #[test]
     fn append_row_lineage_columns_sets_reserved_field_ids() {
         use arrow::array::{Int64Array, StringArray};
@@ -1751,6 +1879,104 @@ mod tests {
         assert_eq!(
             annotated.schema().field(2).name(),
             "_last_updated_sequence_number"
+        );
+    }
+
+    #[test]
+    fn annotate_batch_aligns_by_iceberg_field_id_and_fills_nullable_added_columns() {
+        use arrow::array::{Int32Array, Int64Array};
+        use arrow::datatypes::{DataType, Schema};
+        use std::sync::Arc;
+
+        let source_schema = Arc::new(Schema::new(vec![
+            arrow_field_with_iceberg_id("id", DataType::Int32, false, 1),
+            arrow_field_with_iceberg_id("amount", DataType::Int64, true, 2),
+        ]));
+        let source = RecordBatch::try_new(
+            source_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![4])),
+                Arc::new(Int64Array::from(vec![400_i64])),
+            ],
+        )
+        .expect("source batch");
+        let annotated_schema = Arc::new(Schema::new(vec![
+            arrow_field_with_iceberg_id("id", DataType::Int32, false, 1),
+            arrow_field_with_iceberg_id("amount", DataType::Int64, true, 2),
+            arrow_field_with_iceberg_id("category", DataType::Utf8, true, 3),
+        ]));
+
+        let annotated = annotate_batch(&source, &annotated_schema).expect("annotate");
+
+        assert_eq!(annotated.num_columns(), 3);
+        assert_eq!(annotated.schema().field(2).name(), "category");
+        assert_eq!(annotated.column(2).data_type(), &DataType::Utf8);
+        assert!(annotated.column(2).is_null(0));
+    }
+
+    #[test]
+    fn annotate_batch_aligns_by_iceberg_field_id_and_ignores_dropped_columns() {
+        use arrow::array::{Int32Array, Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Schema};
+        use std::sync::Arc;
+
+        let source_schema = Arc::new(Schema::new(vec![
+            arrow_field_with_iceberg_id("id", DataType::Int32, false, 1),
+            arrow_field_with_iceberg_id("region", DataType::Utf8, true, 2),
+            arrow_field_with_iceberg_id("amount", DataType::Int64, true, 3),
+        ]));
+        let source = RecordBatch::try_new(
+            source_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![4])),
+                Arc::new(StringArray::from(vec!["US"])),
+                Arc::new(Int64Array::from(vec![400_i64])),
+            ],
+        )
+        .expect("source batch");
+        let annotated_schema = Arc::new(Schema::new(vec![
+            arrow_field_with_iceberg_id("amount", DataType::Int64, true, 3),
+            arrow_field_with_iceberg_id("id", DataType::Int32, false, 1),
+        ]));
+
+        let annotated = annotate_batch(&source, &annotated_schema).expect("annotate");
+
+        assert_eq!(annotated.num_columns(), 2);
+        let amount = annotated
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("amount");
+        let id = annotated
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("id");
+        assert_eq!(amount.value(0), 400);
+        assert_eq!(id.value(0), 4);
+    }
+
+    #[test]
+    fn annotate_batch_keeps_count_mismatch_error_without_iceberg_identity() {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let source = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from(vec![4]))],
+        )
+        .expect("source batch");
+        let annotated_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("amount", DataType::Int64, true),
+        ]));
+
+        let err = annotate_batch(&source, &annotated_schema).expect_err("count mismatch");
+
+        assert_eq!(
+            err,
+            "annotate_batch column count mismatch: batch=1 schema=2"
         );
     }
 

@@ -86,6 +86,32 @@ fn verify_node(node: &PhysicalPlanNode) -> Result<HashSet<ColumnId>, String> {
             for column in &op.output_columns {
                 verify_output_id(column.column_id, "PhysicalCTEProduce output")?;
             }
+            if !op.output_columns.is_empty() {
+                let child = node
+                    .children
+                    .first()
+                    .ok_or_else(|| "PhysicalCTEProduce expected one child".to_string())?;
+                if child.output_columns.len() != op.output_columns.len() {
+                    return Err(format!(
+                        "PhysicalCTEProduce output arity mismatch: child has {}, declared has {}",
+                        child.output_columns.len(),
+                        op.output_columns.len()
+                    ));
+                }
+                for (idx, (child_col, declared_col)) in child
+                    .output_columns
+                    .iter()
+                    .zip(op.output_columns.iter())
+                    .enumerate()
+                {
+                    if child_col.column_id != declared_col.column_id {
+                        return Err(format!(
+                            "PhysicalCTEProduce output ColumnId mismatch at index {}: child={}, declared={}",
+                            idx, child_col.column_id, declared_col.column_id
+                        ));
+                    }
+                }
+            }
             Ok(if op.output_columns.is_empty() {
                 input.clone()
             } else {
