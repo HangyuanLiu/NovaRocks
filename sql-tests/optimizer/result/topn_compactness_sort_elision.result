@@ -5,7 +5,7 @@ PROJECT [id, score] stats={rows=2}
     PROJECT [id, score] stats={rows=2}
       PROJECT [id, score] stats={rows=2}
         TOP-N (limit=2) [score DESC NULLS LAST, id ASC NULLS FIRST] stats={rows=2}
-          TOP-N (limit=2, offset=0) [score DESC NULLS LAST, id ASC NULLS FIRST] stats={rows=2}
+          LOCAL TOP-N (limit=2, offset=0) [score DESC NULLS LAST, id ASC NULLS FIRST] stats={rows=2}
             UNION ALL stats={rows=3}
               UNION ALL stats={rows=2}
                 PROJECT [1 AS id, 10 AS score] stats={rows=1}
