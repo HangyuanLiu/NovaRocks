@@ -46,6 +46,7 @@ pub(crate) mod insert_flow;
 pub(crate) mod mutation_flow;
 pub(crate) mod mv;
 pub(crate) mod mv_flow;
+pub(crate) mod mv_maintenance;
 pub(crate) mod mv_scheduler;
 pub(crate) mod name_resolve;
 pub(crate) mod parquet;
