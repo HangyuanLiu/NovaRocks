@@ -579,11 +579,20 @@ mod tests {
     }
 
     fn output_column(id: u32, name: &str) -> crate::sql::analysis::OutputColumn {
+        output_column_with(id, name, DataType::Int64, true)
+    }
+
+    fn output_column_with(
+        id: u32,
+        name: &str,
+        data_type: DataType,
+        nullable: bool,
+    ) -> crate::sql::analysis::OutputColumn {
         crate::sql::analysis::OutputColumn {
             column_id: ColumnId(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: true,
+            data_type,
+            nullable,
             is_internal: false,
         }
     }
@@ -1349,6 +1358,158 @@ mod tests {
             .expect("pushed union group should contain a logical expression");
         assert_single_branch_topn(&memo, pushed_union_expr.children[0], left_group, 10, 0, 1);
         assert_single_branch_topn(&memo, pushed_union_expr.children[1], right_group, 10, 0, 2);
+    }
+
+    #[test]
+    fn setop_pushdown_fails_closed_for_non_column_ref_sort_item() {
+        let mut memo = Memo::new();
+        let left_group = values_group(&mut memo, &[1]);
+        let right_group = values_group(&mut memo, &[1]);
+        let union_group = union_group(&mut memo, true, vec![left_group, right_group]);
+        let topn = topn_with_item(
+            &memo,
+            SortItem {
+                expr: literal_expr(1),
+                asc: true,
+                nulls_first: false,
+            },
+            10,
+            0,
+            TopNPhase::Final,
+            false,
+            union_group,
+        );
+
+        let out = rule_by_name("PushTopNThroughSetOp").apply(&topn, &mut memo);
+
+        assert!(
+            out.is_empty(),
+            "UNION ALL TopN pushdown must fail closed for non-ColumnRef sort items"
+        );
+    }
+
+    #[test]
+    fn setop_pushdown_fails_closed_when_sort_column_is_not_union_output() {
+        let mut memo = Memo::new();
+        let left_group = values_group(&mut memo, &[1]);
+        let right_group = values_group(&mut memo, &[2]);
+        let union_group = union_group_with_outputs(
+            &mut memo,
+            true,
+            vec![left_group, right_group],
+            vec![output_column(10, "union_c")],
+        );
+        let topn = topn_with_item(
+            &memo,
+            sort_item(99),
+            10,
+            0,
+            TopNPhase::Final,
+            false,
+            union_group,
+        );
+
+        let out = rule_by_name("PushTopNThroughSetOp").apply(&topn, &mut memo);
+
+        assert!(
+            out.is_empty(),
+            "UNION ALL TopN pushdown must fail closed when sort key is not a UNION output"
+        );
+    }
+
+    #[test]
+    fn setop_pushdown_fails_closed_when_branch_lacks_output_position() {
+        let mut memo = Memo::new();
+        let left_group = values_group(&mut memo, &[1, 3]);
+        let right_group = values_group(&mut memo, &[2]);
+        let union_group = union_group_with_outputs(
+            &mut memo,
+            true,
+            vec![left_group, right_group],
+            vec![output_column(10, "union_c1"), output_column(11, "union_c2")],
+        );
+        let topn = topn_with_item(
+            &memo,
+            sort_item(11),
+            10,
+            0,
+            TopNPhase::Final,
+            false,
+            union_group,
+        );
+
+        let out = rule_by_name("PushTopNThroughSetOp").apply(&topn, &mut memo);
+
+        assert!(
+            out.is_empty(),
+            "UNION ALL TopN pushdown must fail closed when any branch lacks the mapped position"
+        );
+    }
+
+    #[test]
+    fn setop_pushdown_fails_closed_when_branch_output_type_mismatches_union_output() {
+        let mut memo = Memo::new();
+        let left_group = values_group(&mut memo, &[1]);
+        let right_group = values_group(&mut memo, &[2]);
+        memo.groups[right_group].logical_props = Some(LogicalProperties::new(
+            vec![output_column_with(2, "right_c", DataType::Utf8, true)],
+            10.0,
+        ));
+        let union_group = union_group_with_outputs(
+            &mut memo,
+            true,
+            vec![left_group, right_group],
+            vec![output_column(10, "union_c")],
+        );
+        let topn = topn_with_item(
+            &memo,
+            sort_item(10),
+            10,
+            0,
+            TopNPhase::Final,
+            false,
+            union_group,
+        );
+
+        let out = rule_by_name("PushTopNThroughSetOp").apply(&topn, &mut memo);
+
+        assert!(
+            out.is_empty(),
+            "UNION ALL TopN pushdown must fail closed on branch output type mismatch"
+        );
+    }
+
+    #[test]
+    fn setop_pushdown_fails_closed_when_branch_output_nullability_mismatches_union_output() {
+        let mut memo = Memo::new();
+        let left_group = values_group(&mut memo, &[1]);
+        let right_group = values_group(&mut memo, &[2]);
+        memo.groups[right_group].logical_props = Some(LogicalProperties::new(
+            vec![output_column_with(2, "right_c", DataType::Int64, false)],
+            10.0,
+        ));
+        let union_group = union_group_with_outputs(
+            &mut memo,
+            true,
+            vec![left_group, right_group],
+            vec![output_column(10, "union_c")],
+        );
+        let topn = topn_with_item(
+            &memo,
+            sort_item(10),
+            10,
+            0,
+            TopNPhase::Final,
+            false,
+            union_group,
+        );
+
+        let out = rule_by_name("PushTopNThroughSetOp").apply(&topn, &mut memo);
+
+        assert!(
+            out.is_empty(),
+            "UNION ALL TopN pushdown must fail closed on branch output nullability mismatch"
+        );
     }
 
     #[test]
