@@ -2,6 +2,9 @@ use std::collections::BTreeSet;
 
 use crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout;
 use crate::engine::mv::partition::MvPartitionKey;
+use crate::engine::mv::partition::derivation::{
+    AffectedPartitionError, contract_transform_to_iceberg,
+};
 use crate::exec::chunk::Chunk;
 use crate::meta::repository::mv_contract::{ExpressionKind, MvSchemaContract};
 
@@ -33,70 +36,6 @@ impl AffectedAggregateTargetPartitions {
         }
     }
 }
-
-/// Reasons aggregate-delta partition derivation can refuse a delta batch.
-/// Every variant carries enough context for the refresh error message to
-/// name the failing field and / or value.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum AffectedPartitionError {
-    /// The schema contract has no `target.partition` but the caller expected
-    /// a partitioned MV. Only raised when the layout reports group-key columns
-    /// but the contract is unpartitioned (callers should treat `partition =
-    /// None` as Unpartitioned, not as an error — this variant is reserved
-    /// for drift between layout and contract).
-    ContractMissing(String),
-    /// Transform listed in the contract has no first-class derivation rule.
-    TransformUnsupported { field: String, transform: String },
-    /// Output column referenced by the partition field is not a pure column
-    /// expression, OR resolves to a non-group-key column in the layout.
-    OutputLineageNotPureColumn { field: String },
-    /// Partition field references a target visible column that does not
-    /// exist in the contract, or whose backing visible column is missing
-    /// from the layout / from the delta chunk schema.
-    GroupKeyColumnMissing { field: String, reason: String },
-    /// Group-key column in the delta chunk has an Arrow type that the
-    /// Iceberg transform function refuses.
-    GroupKeyTypeMismatch {
-        field: String,
-        want: String,
-        got: String,
-    },
-    /// `iceberg::transform::create_transform_function(...).transform(array)`
-    /// itself returned an error.
-    TransformFailed { field: String, source: String },
-}
-
-impl std::fmt::Display for AffectedPartitionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ContractMissing(reason) => write!(
-                f,
-                "aggregate target partition contract missing or inconsistent: {reason}"
-            ),
-            Self::TransformUnsupported { field, transform } => write!(
-                f,
-                "aggregate target partition field {field} uses unsupported transform {transform}"
-            ),
-            Self::OutputLineageNotPureColumn { field } => write!(
-                f,
-                "aggregate target partition field {field} requires row-evaluation fallback"
-            ),
-            Self::GroupKeyColumnMissing { field, reason } => {
-                write!(f, "aggregate target partition field {field}: {reason}")
-            }
-            Self::GroupKeyTypeMismatch { field, want, got } => write!(
-                f,
-                "aggregate target partition field {field} delta column type mismatch: want {want}, got {got}"
-            ),
-            Self::TransformFailed { field, source } => write!(
-                f,
-                "aggregate target partition field {field} transform failed: {source}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for AffectedPartitionError {}
 
 /// Inputs required to derive the affected target partitions from a signed
 /// aggregate delta batch.
@@ -383,26 +322,6 @@ fn arrow_array_row_to_partition_value(
     Ok(MvPartitionValue::String(primitive))
 }
 
-fn contract_transform_to_iceberg(
-    transform: &crate::meta::repository::mv_contract::MvPartitionTransformContract,
-    field: &str,
-) -> Result<iceberg::spec::Transform, AffectedPartitionError> {
-    use crate::meta::repository::mv_contract::MvPartitionTransformContract as C;
-    match transform {
-        C::Identity => Ok(iceberg::spec::Transform::Identity),
-        C::Year => Ok(iceberg::spec::Transform::Year),
-        C::Month => Ok(iceberg::spec::Transform::Month),
-        C::Day => Ok(iceberg::spec::Transform::Day),
-        C::Hour => Ok(iceberg::spec::Transform::Hour),
-        C::Bucket { num_buckets } => Ok(iceberg::spec::Transform::Bucket(*num_buckets)),
-        C::Truncate { width } => Ok(iceberg::spec::Transform::Truncate(*width)),
-        C::Void => Err(AffectedPartitionError::TransformUnsupported {
-            field: field.to_string(),
-            transform: "void".to_string(),
-        }),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,72 +354,12 @@ mod tests {
     }
 
     #[test]
-    fn affected_partition_error_display_includes_field_and_reason() {
-        let err = AffectedPartitionError::TransformUnsupported {
-            field: "region".to_string(),
-            transform: "void".to_string(),
-        };
-        let message = format!("{err}");
-        assert!(message.contains("region"), "{message}");
-        assert!(message.contains("void"), "{message}");
-    }
-
-    #[test]
     fn affected_aggregate_target_partitions_unpartitioned_has_no_partitions() {
         let result = AffectedAggregateTargetPartitions::Unpartitioned;
         assert!(result.partitions().is_none());
     }
 
     use crate::meta::repository::mv_contract::MvPartitionTransformContract;
-
-    #[test]
-    fn contract_transform_to_iceberg_handles_all_first_class_transforms() {
-        for (input, expect) in [
-            (
-                MvPartitionTransformContract::Identity,
-                iceberg::spec::Transform::Identity,
-            ),
-            (
-                MvPartitionTransformContract::Year,
-                iceberg::spec::Transform::Year,
-            ),
-            (
-                MvPartitionTransformContract::Month,
-                iceberg::spec::Transform::Month,
-            ),
-            (
-                MvPartitionTransformContract::Day,
-                iceberg::spec::Transform::Day,
-            ),
-            (
-                MvPartitionTransformContract::Hour,
-                iceberg::spec::Transform::Hour,
-            ),
-            (
-                MvPartitionTransformContract::Bucket { num_buckets: 8 },
-                iceberg::spec::Transform::Bucket(8),
-            ),
-            (
-                MvPartitionTransformContract::Truncate { width: 16 },
-                iceberg::spec::Transform::Truncate(16),
-            ),
-        ] {
-            let result =
-                contract_transform_to_iceberg(&input, "test_field").expect("transform conversion");
-            assert_eq!(result, expect, "input={input:?}");
-        }
-    }
-
-    #[test]
-    fn contract_transform_to_iceberg_rejects_void() {
-        let err = contract_transform_to_iceberg(&MvPartitionTransformContract::Void, "test_field")
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            AffectedPartitionError::TransformUnsupported { ref field, ref transform }
-                if field == "test_field" && transform == "void"
-        ));
-    }
 
     use arrow::array::{
         BooleanArray, Date32Array, Float32Array, Float64Array, Int32Array, Int64Array, StringArray,
