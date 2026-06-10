@@ -337,8 +337,62 @@ fn push_topn_through_aggregate(_expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> 
     Vec::new()
 }
 
-fn push_topn_through_setop(_expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
-    Vec::new()
+fn push_topn_through_setop(expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
+    let Operator::LogicalTopN(topn) = &expr.op else {
+        return vec![];
+    };
+    if TopNWindow::from_limit_offset(topn.limit, topn.offset).is_none() {
+        return vec![];
+    }
+    if expr.children.len() != 1 {
+        return vec![];
+    }
+    let Some(union_group) = memo.groups.get(expr.children[0]).cloned() else {
+        return vec![];
+    };
+
+    let mut results = Vec::new();
+    for union_expr in union_group.logical_exprs.iter() {
+        let Operator::LogicalUnion(union) = &union_expr.op else {
+            continue;
+        };
+        if !union.all || union_expr.children.is_empty() {
+            continue;
+        }
+
+        let mut pushed_branch_groups = Vec::with_capacity(union_expr.children.len());
+        for branch_group in &union_expr.children {
+            let pushed_op = Operator::LogicalTopN(topn.clone());
+            let pushed_children = vec![*branch_group];
+            let pushed_group = find_existing_logical_group(memo, &pushed_op, &pushed_children)
+                .unwrap_or_else(|| {
+                    let pushed_id = memo.next_expr_id();
+                    memo.new_group(MExpr {
+                        id: pushed_id,
+                        op: pushed_op,
+                        children: pushed_children,
+                    })
+                });
+            pushed_branch_groups.push(pushed_group);
+        }
+
+        let pushed_union_op = Operator::LogicalUnion(union.clone());
+        let pushed_union_group =
+            find_existing_logical_group(memo, &pushed_union_op, &pushed_branch_groups)
+                .unwrap_or_else(|| {
+                    let pushed_id = memo.next_expr_id();
+                    memo.new_group(MExpr {
+                        id: pushed_id,
+                        op: pushed_union_op,
+                        children: pushed_branch_groups.clone(),
+                    })
+                });
+        results.push(NewExpr {
+            op: Operator::LogicalTopN(topn.clone()),
+            children: vec![pushed_union_group],
+        });
+    }
+    results
 }
 
 fn find_existing_logical_group(memo: &Memo, op: &Operator, children: &[usize]) -> Option<usize> {
@@ -1015,6 +1069,79 @@ mod tests {
         assert!(
             out.is_empty(),
             "set-op TopN pushdown must fail closed for UNION DISTINCT"
+        );
+    }
+
+    #[test]
+    fn setop_pushdown_adds_branch_topn_for_union_all_and_keeps_final_topn() {
+        let mut memo = Memo::new();
+        let left_group = values_group(&mut memo, &[1]);
+        let right_group = values_group(&mut memo, &[1]);
+        let union_group = union_group(&mut memo, true, vec![left_group, right_group]);
+        let topn = topn(&memo, 10, 0, TopNPhase::Final, false, union_group);
+        let rule = rule_by_name("PushTopNThroughSetOp");
+
+        let first = rule.apply(&topn, &mut memo);
+
+        assert_eq!(first.len(), 1, "UNION ALL should allow branch pruning");
+        match &first[0].op {
+            Operator::LogicalTopN(final_topn) => {
+                assert_eq!(final_topn.limit, Some(10));
+                assert_eq!(final_topn.offset, Some(0));
+            }
+            other => panic!("expected final LogicalTopN, got {other:?}"),
+        }
+        assert_eq!(
+            first[0].children.len(),
+            1,
+            "final TopN must have the pushed UNION as its child"
+        );
+        let pushed_union_group = first[0].children[0];
+        assert_ne!(
+            pushed_union_group, union_group,
+            "final TopN should wrap the pushed UNION, not the original UNION"
+        );
+        let pushed_union_expr = memo.groups[pushed_union_group]
+            .logical_exprs
+            .first()
+            .expect("pushed union group should contain a logical expression");
+        match &pushed_union_expr.op {
+            Operator::LogicalUnion(pushed_union) => {
+                assert!(pushed_union.all, "pushed UNION must preserve UNION ALL");
+            }
+            other => panic!("expected pushed LogicalUnion, got {other:?}"),
+        }
+        assert_eq!(
+            pushed_union_expr.children.len(),
+            2,
+            "pushed UNION should keep both branches"
+        );
+        for branch_group in &pushed_union_expr.children {
+            assert!(
+                memo.groups[*branch_group]
+                    .logical_exprs
+                    .iter()
+                    .any(|expr| matches!(expr.op, Operator::LogicalTopN(_))),
+                "each UNION ALL branch should receive a pushed TopN"
+            );
+        }
+
+        let group_count_after_first = memo.groups.len();
+        let second = rule.apply(&topn, &mut memo);
+
+        assert_eq!(
+            second.len(),
+            1,
+            "repeated apply should still produce one candidate"
+        );
+        assert_eq!(
+            second[0].children[0], pushed_union_group,
+            "repeated apply should reuse the pushed UNION group"
+        );
+        assert_eq!(
+            memo.groups.len(),
+            group_count_after_first,
+            "repeated apply must not create duplicate branch TopN or UNION groups"
         );
     }
 }
