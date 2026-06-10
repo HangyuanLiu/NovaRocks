@@ -27,7 +27,7 @@ pub(crate) use physical_plan::PhysicalPlanNode;
 pub(crate) use property::PhysicalPropertySet;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -272,10 +272,16 @@ fn explore(
     Ok(())
 }
 
-/// Apply implementation rules to all groups.
+/// Apply implementation rules to all groups to a fixed point.
 ///
-/// Single pass — each logical expr gets physical alternatives once.
+/// Some implementation rules allocate intermediate groups while lowering one
+/// logical expression. The fixed-point loop visits those new groups, but each
+/// logical expression is implemented by each rule at most once; otherwise rules
+/// that allocate fresh child groups on every apply can keep the loop alive
+/// indefinitely. Physical alternatives are deduplicated by both operator and
+/// children so child-distinct alternatives remain visible to search.
 fn implement(memo: &mut Memo, rules: &[Box<dyn Rule>], options: &options::OptimizerOptions) {
+    let mut implemented_logical_rules = HashSet::new();
     let mut changed = true;
     while changed {
         changed = false;
@@ -288,6 +294,15 @@ fn implement(memo: &mut Memo, rules: &[Box<dyn Rule>], options: &options::Optimi
                         continue;
                     }
                     if rule.matches(&expr.op) {
+                        let application_key = (
+                            group_id,
+                            expr.children.clone(),
+                            format!("{:?}", expr.op),
+                            rule.name().to_string(),
+                        );
+                        if !implemented_logical_rules.insert(application_key) {
+                            continue;
+                        }
                         let new_exprs = rule.apply(expr, memo);
                         for new_expr in new_exprs {
                             let already_exists =
@@ -324,6 +339,13 @@ fn op_equal(a: &Operator, b: &Operator) -> bool {
 #[cfg(test)]
 mod is_known_rule_name_tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::sql::optimizer::memo::{MExpr, Memo};
+    use crate::sql::optimizer::operator::{
+        LogicalLimitOp, LogicalValuesOp, Operator, PhysicalLimitOp, PhysicalValuesOp,
+    };
+    use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
 
     #[test]
     fn optimize_accepts_migrated_query_rewrite_pipeline() {
@@ -341,6 +363,142 @@ mod is_known_rule_name_tests {
         let physical = optimize(plan, &HashMap::new(), factory, None).expect("optimize values");
         let physical_debug = format!("{physical:?}");
         assert!(physical_debug.contains("PhysicalValues"));
+    }
+
+    struct AllocatingLimitRule {
+        apply_count: AtomicUsize,
+    }
+
+    impl Rule for AllocatingLimitRule {
+        fn name(&self) -> &str {
+            "AllocatingLimitRule"
+        }
+
+        fn rule_type(&self) -> RuleType {
+            RuleType::Implementation
+        }
+
+        fn matches(&self, op: &Operator) -> bool {
+            matches!(op, Operator::LogicalLimit(_))
+        }
+
+        fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
+            let previous_count = self.apply_count.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(
+                previous_count, 0,
+                "same logical expression should not be implemented twice by one rule"
+            );
+            let Operator::LogicalLimit(limit) = &expr.op else {
+                return vec![];
+            };
+            let child_group = memo.new_group(MExpr {
+                id: memo.next_expr_id(),
+                op: Operator::PhysicalValues(PhysicalValuesOp {
+                    rows: vec![],
+                    columns: vec![],
+                }),
+                children: vec![],
+            });
+            vec![NewExpr {
+                op: Operator::PhysicalLimit(PhysicalLimitOp {
+                    limit: limit.limit,
+                    offset: limit.offset,
+                }),
+                children: vec![child_group],
+            }]
+        }
+    }
+
+    struct LimitToPhysicalWithOriginalChildren;
+
+    impl Rule for LimitToPhysicalWithOriginalChildren {
+        fn name(&self) -> &str {
+            "LimitToPhysicalWithOriginalChildren"
+        }
+
+        fn rule_type(&self) -> RuleType {
+            RuleType::Implementation
+        }
+
+        fn matches(&self, op: &Operator) -> bool {
+            matches!(op, Operator::LogicalLimit(_))
+        }
+
+        fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+            let Operator::LogicalLimit(limit) = &expr.op else {
+                return vec![];
+            };
+            vec![NewExpr {
+                op: Operator::PhysicalLimit(PhysicalLimitOp {
+                    limit: limit.limit,
+                    offset: limit.offset,
+                }),
+                children: expr.children.clone(),
+            }]
+        }
+    }
+
+    fn logical_values_group(memo: &mut Memo) -> usize {
+        memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalValues(LogicalValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
+            children: vec![],
+        })
+    }
+
+    fn logical_limit(child: usize) -> MExpr {
+        MExpr {
+            id: 0,
+            op: Operator::LogicalLimit(LogicalLimitOp {
+                limit: Some(1),
+                offset: Some(0),
+            }),
+            children: vec![child],
+        }
+    }
+
+    #[test]
+    fn implement_applies_allocating_rule_once_per_logical_expression() {
+        let mut memo = Memo::new();
+        let child = logical_values_group(&mut memo);
+        let root = memo.new_group(logical_limit(child));
+        let rule: Box<dyn Rule> = Box::new(AllocatingLimitRule {
+            apply_count: AtomicUsize::new(0),
+        });
+        let options = options::OptimizerOptions::default_settings();
+
+        implement(&mut memo, &[rule], &options);
+
+        assert_eq!(memo.groups[root].physical_exprs.len(), 1);
+        assert_eq!(memo.groups.len(), 3);
+    }
+
+    #[test]
+    fn implement_preserves_child_distinct_physical_alternatives() {
+        let mut memo = Memo::new();
+        let child_a = logical_values_group(&mut memo);
+        let child_b = logical_values_group(&mut memo);
+        let root = memo.new_group(logical_limit(child_a));
+        memo.add_expr_to_group(root, logical_limit(child_b));
+        let rule: Box<dyn Rule> = Box::new(LimitToPhysicalWithOriginalChildren);
+        let options = options::OptimizerOptions::default_settings();
+
+        implement(&mut memo, &[rule], &options);
+
+        let physical_children: Vec<_> = memo.groups[root]
+            .physical_exprs
+            .iter()
+            .filter_map(|expr| match expr.op {
+                Operator::PhysicalLimit(_) => Some(expr.children.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(physical_children.len(), 2);
+        assert!(physical_children.contains(&vec![child_a]));
+        assert!(physical_children.contains(&vec![child_b]));
     }
 
     #[test]
