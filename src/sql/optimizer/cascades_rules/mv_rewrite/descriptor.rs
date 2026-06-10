@@ -344,23 +344,39 @@ impl SpjgDescriptor {
                             expr: SpjgOutputExpr::Dimension(substitute(&item.expr, &defs)),
                         })
                         .collect(),
-                    None => scan
-                        .columns
-                        .iter()
-                        .map(|c| SpjgOutput {
-                            name: c.name.clone(),
-                            column_id: c.column_id,
-                            expr: SpjgOutputExpr::Dimension(TypedExpr {
-                                kind: ExprKind::ColumnRef {
-                                    column_id: c.column_id,
-                                    qualifier: None,
-                                    column: c.name.clone(),
-                                },
-                                data_type: c.data_type.clone(),
-                                nullable: c.nullable,
-                            }),
-                        })
-                        .collect(),
+                    // No surviving Project: the scan's output IS the subtree
+                    // output. Honor the scan's pruned `required_columns` when
+                    // present so the descriptor reflects the columns the plan
+                    // actually produces. Without this, columns the optimizer
+                    // prunes away — the row-lineage metadata columns (`_file`,
+                    // `_pos`, `_row_id`, `_last_updated_sequence_number`) that
+                    // are mandatory on format-v3 row-lineage Iceberg base
+                    // tables, plus any unreferenced data column — leak into the
+                    // SPJ output set and never map onto the MV's narrower
+                    // output list, so every SPJ rewrite is rejected. The
+                    // physical scan is pruned to exactly `required_columns`, so
+                    // matching on that set is sound. `None` keeps the full
+                    // column list (the planner did not record a pruned set).
+                    None => {
+                        let pruned: Option<&Vec<String>> = scan.required_columns.as_ref();
+                        scan.columns
+                            .iter()
+                            .filter(|c| pruned.is_none_or(|req| req.contains(&c.name)))
+                            .map(|c| SpjgOutput {
+                                name: c.name.clone(),
+                                column_id: c.column_id,
+                                expr: SpjgOutputExpr::Dimension(TypedExpr {
+                                    kind: ExprKind::ColumnRef {
+                                        column_id: c.column_id,
+                                        qualifier: None,
+                                        column: c.name.clone(),
+                                    },
+                                    data_type: c.data_type.clone(),
+                                    nullable: c.nullable,
+                                }),
+                            })
+                            .collect()
+                    }
                 };
                 (None, outputs, MatchedShape::Spj)
             }
