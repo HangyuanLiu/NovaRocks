@@ -89,6 +89,7 @@ fn plan_scoped_query(
             .get(cte_id)
             .ok_or_else(|| format!("missing CTE entry for id {cte_id}"))?;
         let produce_input = plan_scoped_query(entry.resolved_query.clone(), cte_registry, factory)?;
+        let produce_input = adapt_plan_output(produce_input, &entry.output_columns)?;
         let produce = LogicalPlan::CTEProduce(CTEProduceNode {
             cte_id: entry.id,
             input: Box::new(produce_input),

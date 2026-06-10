@@ -142,21 +142,37 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
     //    - Values / SelectLiteralRow: build a RecordBatch from the literal rows
     //      using the iceberg table schema, then wrap it as a single Chunk.
     //      This supports branch-qualified INSERT INTO t.branch_dev VALUES (...).
-    let chunks: Vec<Chunk> = match source {
-        InsertSource::FromQuery(query) => run_select_to_chunks(state, target, query)?,
+    let (chunks, chunks_aligned_to_target_schema): (Vec<Chunk>, bool) = match source {
+        InsertSource::FromQuery(query) => (run_select_to_chunks(state, target, query)?, false),
         InsertSource::Values(rows) => {
             let loaded = load_iceberg_table_for_literals(state, target)?;
-            let batch =
-                crate::connector::iceberg::catalog::registry::build_insert_batch(&loaded, rows)?;
-            vec![crate::engine::record_batch_to_chunk(batch)?]
+            let literal_rows = if insert_columns.is_empty() {
+                rows.clone()
+            } else {
+                crate::engine::insert::reorder_insert_rows(rows, insert_columns, &resolved.columns)?
+            };
+            let batch = crate::connector::iceberg::catalog::registry::build_insert_batch(
+                &loaded,
+                &literal_rows,
+            )?;
+            (vec![crate::engine::record_batch_to_chunk(batch)?], true)
         }
         InsertSource::SelectLiteralRow(row) => {
             let loaded = load_iceberg_table_for_literals(state, target)?;
+            let literal_rows = if insert_columns.is_empty() {
+                vec![row.clone()]
+            } else {
+                crate::engine::insert::reorder_insert_rows(
+                    std::slice::from_ref(row),
+                    insert_columns,
+                    &resolved.columns,
+                )?
+            };
             let batch = crate::connector::iceberg::catalog::registry::build_insert_batch(
                 &loaded,
-                std::slice::from_ref(row),
+                &literal_rows,
             )?;
-            vec![crate::engine::record_batch_to_chunk(batch)?]
+            (vec![crate::engine::record_batch_to_chunk(batch)?], true)
         }
         InsertSource::UnionAll(_) => {
             unreachable!("rejected above")
@@ -165,7 +181,7 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
 
     // 3.5. If the user specified an explicit column list, reorder columns and
     //      fill omitted columns with their write_default literal (or NULL).
-    let chunks = if insert_columns.is_empty() {
+    let chunks = if chunks_aligned_to_target_schema || insert_columns.is_empty() {
         chunks
     } else {
         align_chunks_to_target_schema(chunks, insert_columns, &resolved.columns)?

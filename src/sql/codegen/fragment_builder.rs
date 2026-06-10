@@ -303,6 +303,93 @@ fn remap_rf_expr_order(
         .position(|&origin| origin == pre_demote_expr_order)
 }
 
+fn collect_rf_column_refs(expr: &TypedExpr, refs: &mut Vec<(ColumnId, Option<String>, String)>) {
+    match &expr.kind {
+        ExprKind::ColumnRef {
+            column_id,
+            qualifier,
+            column,
+        } => refs.push((*column_id, qualifier.clone(), column.clone())),
+        ExprKind::BinaryOp { left, right, .. } => {
+            collect_rf_column_refs(left, refs);
+            collect_rf_column_refs(right, refs);
+        }
+        ExprKind::UnaryOp { expr, .. }
+        | ExprKind::Cast { expr, .. }
+        | ExprKind::IsNull { expr, .. }
+        | ExprKind::IsTruthValue { expr, .. }
+        | ExprKind::Nested(expr)
+        | ExprKind::LambdaFunction { body: expr, .. }
+        | ExprKind::Lambda { body: expr, .. } => collect_rf_column_refs(expr, refs),
+        ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
+            for arg in args {
+                collect_rf_column_refs(arg, refs);
+            }
+        }
+        ExprKind::InList { expr, list, .. } => {
+            collect_rf_column_refs(expr, refs);
+            for item in list {
+                collect_rf_column_refs(item, refs);
+            }
+        }
+        ExprKind::Between {
+            expr, low, high, ..
+        } => {
+            collect_rf_column_refs(expr, refs);
+            collect_rf_column_refs(low, refs);
+            collect_rf_column_refs(high, refs);
+        }
+        ExprKind::Like { expr, pattern, .. } => {
+            collect_rf_column_refs(expr, refs);
+            collect_rf_column_refs(pattern, refs);
+        }
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                collect_rf_column_refs(operand, refs);
+            }
+            for (when, then) in when_then {
+                collect_rf_column_refs(when, refs);
+                collect_rf_column_refs(then, refs);
+            }
+            if let Some(else_expr) = else_expr {
+                collect_rf_column_refs(else_expr, refs);
+            }
+        }
+        ExprKind::WindowCall {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for arg in args {
+                collect_rf_column_refs(arg, refs);
+            }
+            for partition_expr in partition_by {
+                collect_rf_column_refs(partition_expr, refs);
+            }
+            for item in order_by {
+                collect_rf_column_refs(&item.expr, refs);
+            }
+        }
+        ExprKind::Literal(_)
+        | ExprKind::LambdaParamRef { .. }
+        | ExprKind::SubqueryPlaceholder { .. } => {}
+    }
+}
+
+fn rf_build_expr_matches_join_build_expr(candidate: &TypedExpr, expected: &TypedExpr) -> bool {
+    let mut candidate_refs = Vec::new();
+    let mut expected_refs = Vec::new();
+    collect_rf_column_refs(candidate, &mut candidate_refs);
+    collect_rf_column_refs(expected, &mut expected_refs);
+    !expected_refs.is_empty() && candidate_refs == expected_refs
+}
+
 fn join_distribution_mode(
     node: &PhysicalPlanNode,
     fallback: &crate::sql::optimizer::operator::JoinDistribution,
@@ -1995,6 +2082,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         // remap the physical pass's pre-demote `expr_order` onto the post-demote
         // conjunct index that BE lowering uses. See `remap_rf_expr_order`.
         let mut surviving_eq_origin: Vec<usize> = Vec::new();
+        let mut surviving_eq_build_exprs: Vec<TypedExpr> = Vec::new();
         for (eq_index, eq) in op.eq_conditions.iter().enumerate() {
             let expr_a = &eq.left;
             let expr_b = &eq.right;
@@ -2006,7 +2094,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                     ExprCompiler::new_strict_id(self.slot_allocator(), &right.scope)
                         .compile_typed(expr_b)
                         .ok()
-                        .map(|rt| (lt, rt))
+                        .map(|rt| (lt, rt, expr_b.clone()))
                 });
             // Try swapped order: expr_b on left, expr_a on right.
             // Needed when JoinCommutativity swapped children but the
@@ -2019,10 +2107,10 @@ impl<'a> PlanFragmentBuilder<'a> {
                         ExprCompiler::new_strict_id(self.slot_allocator(), &right.scope)
                             .compile_typed(expr_a)
                             .ok()
-                            .map(|rt| (lt, rt))
+                            .map(|rt| (lt, rt, expr_a.clone()))
                     })
             });
-            if let Some((lt, rt)) = result {
+            if let Some((lt, rt, build_expr)) = result {
                 eq_join_conjuncts.push(plan_nodes::TEqJoinCondition {
                     left: lt,
                     right: rt,
@@ -2033,6 +2121,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                     }),
                 });
                 surviving_eq_origin.push(eq_index);
+                surviving_eq_build_exprs.push(build_expr);
             } else {
                 // Both sides belong to the same child — demote to other_condition
                 // compiled with a merged scope.
@@ -2085,8 +2174,13 @@ impl<'a> PlanFragmentBuilder<'a> {
         // output scope further below. `surviving_eq_origin` remaps each RF's
         // pre-demote `expr_order` onto the post-demote `eq_join_conjuncts`
         // index that BE lowering indexes.
-        let rf_descs =
-            self.build_rf_descriptors(node, join_node_id, &right.scope, &surviving_eq_origin)?;
+        let rf_descs = self.build_rf_descriptors(
+            node,
+            join_node_id,
+            &right.scope,
+            &surviving_eq_origin,
+            &surviving_eq_build_exprs,
+        )?;
         if !rf_descs.is_empty()
             && let Some(hj) = join_plan_node.hash_join_node.as_mut()
         {
@@ -2184,6 +2278,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         join_node_id: i32,
         build_scope: &ExprScope,
         surviving_eq_origin: &[usize],
+        surviving_eq_build_exprs: &[TypedExpr],
     ) -> Result<Vec<crate::runtime_filter::TRuntimeFilterDescription>, String> {
         use crate::runtime_filter;
 
@@ -2215,6 +2310,16 @@ impl<'a> PlanFragmentBuilder<'a> {
             // `surviving_eq_origin`, whose length equals `eq_join_conjuncts`,
             // so this can only trip on a future invariant break.
             if post_demote_expr_order >= surviving_eq_origin.len() {
+                continue;
+            }
+            let Some(expected_build_expr) = surviving_eq_build_exprs.get(post_demote_expr_order)
+            else {
+                continue;
+            };
+            if !rf_build_expr_matches_join_build_expr(&rf.build_expr, expected_build_expr) {
+                tracing::debug!(
+                    "skip runtime filter {filter_id}: build expr does not match join build key"
+                );
                 continue;
             }
 
@@ -5865,6 +5970,23 @@ mod tests {
         Ok(())
     }
 
+    fn build_raw_query_for_fallback_gate(sql: &str) -> Result<(), String> {
+        let stmt = crate::sql::parser::parse_sql_raw(sql)?;
+        let query = match stmt {
+            sqlparser::ast::Statement::Query(query) => query,
+            other => return Err(format!("expected query statement, got {other:?}")),
+        };
+
+        let catalog = FallbackGateCatalog;
+        let (resolved, cte_registry, mut factory) =
+            crate::sql::analyzer::analyze(&query, &catalog, "default")?;
+        let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
+        let physical = optimizer::optimize(logical, &HashMap::new(), factory, None)?;
+        let registry = mock_iceberg_registry();
+        PlanFragmentBuilder::build(&physical, &catalog, &registry, "default")?;
+        Ok(())
+    }
+
     #[test]
     fn p2_targeted_surfaces_do_not_use_name_fallback() {
         let cases = [
@@ -5903,6 +6025,27 @@ mod tests {
                 "{name} triggered codegen name fallback audit: {audit:?}"
             );
         }
+    }
+
+    #[test]
+    fn cte_produce_declared_output_ids_match_fragment_child_after_recursive_unroll() {
+        build_raw_query_for_fallback_gate(
+            "WITH RECURSIVE const_cte AS ( \
+                 SELECT CAST(1 AS INT) AS a \
+             ), \
+             r AS ( \
+                 SELECT t.a, CAST(0 AS BIGINT) AS step \
+                 FROM t, const_cte \
+                 WHERE t.a = const_cte.a \
+                 UNION ALL \
+                 SELECT t.a, r.step + 1 \
+                 FROM t INNER JOIN r ON r.a = t.a \
+             ) \
+             SELECT /*+ SET_VAR(enable_recursive_cte=true, recursive_cte_max_depth=2)*/ \
+                    r.a, step, const_cte.a \
+             FROM r, const_cte",
+        )
+        .expect("recursive CTE fragment build should keep CTE produce ids aligned");
     }
 
     fn mock_current_snapshot_iceberg_registry_with_files(

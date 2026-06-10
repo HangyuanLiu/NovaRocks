@@ -5576,7 +5576,7 @@ enable_path_style_access = true
     #[test]
     fn embedded_session_supports_minimal_iceberg_flow() {
         let warehouse = TempDir::new().expect("create iceberg warehouse");
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
+        let engine = open_test_engine_with_metadata(&warehouse);
         let session = engine.session();
 
         let create_catalog_sql = format!(
@@ -5629,7 +5629,7 @@ enable_path_style_access = true
     #[test]
     fn embedded_session_preserves_iceberg_projection_order() {
         let warehouse = TempDir::new().expect("create iceberg warehouse");
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
+        let engine = open_test_engine_with_metadata(&warehouse);
         let session = engine.session();
 
         let create_catalog_sql = format!(
@@ -5750,7 +5750,7 @@ enable_path_style_access = true
     #[test]
     fn embedded_session_preserves_projection_order_with_current_catalog_context() {
         let warehouse = TempDir::new().expect("create iceberg warehouse");
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
+        let engine = open_test_engine_with_metadata(&warehouse);
         let session = engine.session();
 
         let create_catalog_sql = format!(
@@ -6849,7 +6849,7 @@ path = "meta/operations.sqlite"
         // SELECT must not materialize ordinary Iceberg tables into the local
         // in-memory catalog.
         let warehouse = TempDir::new().expect("warehouse");
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
+        let engine = open_test_engine_with_metadata(&warehouse);
         let session = engine.session();
         let create_catalog_sql = format!(
             r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="memory","iceberg.catalog.warehouse"="{}")"#,
@@ -7881,8 +7881,7 @@ path = "meta/operations.sqlite"
         use iceberg::Catalog;
         use iceberg::spec::{NestedField, PrimitiveType, Type};
 
-        let engine = StandaloneNovaRocks::open(StandaloneOptions::default())
-            .expect("open standalone engine");
+        let engine = open_test_engine_with_metadata(warehouse);
         let session = engine.session();
         let create_catalog_sql = format!(
             r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="memory","iceberg.catalog.warehouse"="{}")"#,

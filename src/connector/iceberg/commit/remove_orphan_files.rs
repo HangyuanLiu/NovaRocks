@@ -119,6 +119,12 @@ pub async fn run_remove_orphan_files(
         location.trim_end_matches('/')
     );
     live_files.insert(version_hint_path);
+    for stats in metadata.statistics_iter() {
+        live_files.insert(stats.statistics_path.clone());
+    }
+    for stats in metadata.partition_statistics_iter() {
+        live_files.insert(stats.statistics_path.clone());
+    }
 
     // Step 2: scan warehouse paths.
     // Both scan paths must be canonically inside the table's location.
@@ -792,6 +798,56 @@ mod tests {
         assert!(
             std::path::Path::new(disk_path).exists(),
             "current metadata.json was unexpectedly deleted: {current_meta_location}"
+        );
+
+        drop(tmpdir);
+    }
+
+    #[tokio::test]
+    async fn orphan_protects_registered_statistics_files() {
+        let (catalog, table_ident, tmpdir) = build_local_table_with_n_appends(1).await;
+
+        let table = catalog.load_table(&table_ident).await.unwrap();
+        let snapshot_id = table
+            .metadata()
+            .current_snapshot()
+            .expect("fixture should have a current snapshot")
+            .snapshot_id();
+        let stats_path = format!(
+            "{}/metadata/test-statistics.puffin",
+            table.metadata().location().trim_end_matches('/')
+        );
+        let disk_path = stats_path.strip_prefix("file://").unwrap_or(&stats_path);
+        std::fs::write(disk_path, b"registered statistics").expect("write stats file");
+
+        crate::connector::iceberg::commit::statistics::commit_statistics_file(
+            &table,
+            catalog.as_ref(),
+            iceberg::spec::StatisticsFile {
+                snapshot_id,
+                statistics_path: stats_path.clone(),
+                file_size_in_bytes: 21,
+                file_footer_size_in_bytes: 0,
+                key_metadata: None,
+                blob_metadata: vec![],
+            },
+        )
+        .await
+        .expect("register statistics file");
+
+        let far_future_ms = chrono::Utc::now().timestamp_millis() + 86_400_000;
+        let outcome =
+            run_remove_orphan_files(catalog.clone(), table_ident.clone(), far_future_ms, None)
+                .await
+                .expect("run_remove_orphan_files should succeed");
+
+        assert_eq!(
+            outcome.deleted_count, 0,
+            "registered statistics files must not be treated as orphans"
+        );
+        assert!(
+            std::path::Path::new(disk_path).exists(),
+            "registered statistics file was unexpectedly deleted: {stats_path}"
         );
 
         drop(tmpdir);

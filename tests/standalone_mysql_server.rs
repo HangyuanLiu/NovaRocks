@@ -32,7 +32,7 @@ impl ServerGuard {
     fn spawn(args: &[String]) -> Self {
         let lock = STANDALONE_SERVER_TEST_LOCK
             .lock()
-            .expect("standalone server test lock");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let child = Command::new(env!("CARGO_BIN_EXE_novarocks"))
             .args(args)
             .stdout(Stdio::piped())
@@ -200,6 +200,36 @@ fn starrocks_table_endpoint_reachable(endpoint: &str) -> bool {
         Duration::from_secs(1),
     )
     .is_ok()
+}
+
+fn write_standalone_metadata_config(mysql_port: u16) -> (TempDir, PathBuf) {
+    let config_dir = TempDir::new().expect("create standalone server config dir");
+    let config_path = config_dir.path().join("novarocks.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"[metadata]
+provider = "sqlite"
+path = "meta/catalog.db"
+
+[standalone_server]
+mysql_port = {mysql_port}
+user = "root"
+"#
+        ),
+    )
+    .expect("write standalone server config");
+    (config_dir, config_path)
+}
+
+fn standalone_server_args_with_metadata(mysql_port: u16) -> (TempDir, Vec<String>) {
+    let (config_dir, config_path) = write_standalone_metadata_config(mysql_port);
+    let args = vec![
+        "standalone-server".to_string(),
+        "--config".to_string(),
+        config_path.display().to_string(),
+    ];
+    (config_dir, args)
 }
 
 fn maybe_write_starrocks_table_config(mysql_port: u16) -> Option<(TempDir, PathBuf)> {
@@ -375,11 +405,7 @@ fn standalone_mysql_server_rejects_wrong_auth_and_unsupported_sql() {
 fn standalone_mysql_server_supports_minimal_iceberg_flow() {
     let warehouse = TempDir::new().expect("create iceberg warehouse");
     let port = alloc_port();
-    let args = vec![
-        "standalone-server".to_string(),
-        "--port".to_string(),
-        port.to_string(),
-    ];
+    let (_config_dir, args) = standalone_server_args_with_metadata(port);
     let mut server = ServerGuard::spawn(&args);
     let mut conn = server.connect_root(port);
 
@@ -416,11 +442,7 @@ fn standalone_mysql_server_supports_minimal_iceberg_flow() {
 fn standalone_mysql_server_writes_hadoop_catalog_compat_metadata_files() {
     let warehouse = TempDir::new().expect("create iceberg warehouse");
     let port = alloc_port();
-    let args = vec![
-        "standalone-server".to_string(),
-        "--port".to_string(),
-        port.to_string(),
-    ];
+    let (_config_dir, args) = standalone_server_args_with_metadata(port);
     let mut server = ServerGuard::spawn(&args);
     let mut conn = server.connect_root(port);
 
@@ -439,18 +461,14 @@ fn standalone_mysql_server_writes_hadoop_catalog_compat_metadata_files() {
     conn.query_drop("insert into ice.db1.tbl values (1, 'a'), (2, 'b')")
         .expect("insert iceberg rows");
 
-    assert_hadoop_catalog_metadata_compat(warehouse.path(), "db1", "tbl", 2);
+    assert_hadoop_catalog_metadata_compat(warehouse.path(), "db1", "tbl", 3);
 }
 
 #[test]
 fn standalone_mysql_server_reads_hadoop_only_iceberg_tables() {
     let warehouse = TempDir::new().expect("create iceberg warehouse");
     let port = alloc_port();
-    let args = vec![
-        "standalone-server".to_string(),
-        "--port".to_string(),
-        port.to_string(),
-    ];
+    let (_config_dir, args) = standalone_server_args_with_metadata(port);
     let mut server = ServerGuard::spawn(&args);
     let mut conn = server.connect_root(port);
 
@@ -467,7 +485,7 @@ fn standalone_mysql_server_reads_hadoop_only_iceberg_tables() {
     conn.query_drop("insert into ice.db1.tbl values (1, 'a'), (2, 'b')")
         .expect("insert iceberg rows");
 
-    assert_hadoop_catalog_metadata_compat(warehouse.path(), "db1", "tbl", 2);
+    assert_hadoop_catalog_metadata_compat(warehouse.path(), "db1", "tbl", 3);
 
     // Phase 2: Register a fresh catalog with a different name over the SAME
     // warehouse, so the per-entry table_cache is empty. This simulates reading
@@ -499,19 +517,15 @@ fn standalone_mysql_server_reads_hadoop_only_iceberg_tables() {
     conn.query_drop("insert into ice2.db1.tbl values (3, 'c')")
         .expect("insert into hadoop-only table");
 
-    // After the insert, v3.metadata.json must exist and version-hint must be 3.
-    assert_hadoop_catalog_metadata_compat(warehouse.path(), "db1", "tbl", 3);
+    // Each INSERT publishes data and then best-effort Puffin stats metadata.
+    assert_hadoop_catalog_metadata_compat(warehouse.path(), "db1", "tbl", 5);
 }
 
 #[test]
 fn standalone_mysql_server_supports_catalog_session_context() {
     let warehouse = TempDir::new().expect("create iceberg warehouse");
     let port = alloc_port();
-    let args = vec![
-        "standalone-server".to_string(),
-        "--port".to_string(),
-        port.to_string(),
-    ];
+    let (_config_dir, args) = standalone_server_args_with_metadata(port);
     let mut server = ServerGuard::spawn(&args);
     let mut conn = server.connect_root(port);
 
@@ -575,11 +589,7 @@ fn standalone_mysql_server_supports_catalog_session_context() {
 fn standalone_mysql_server_supports_multi_statement_iceberg_steps() {
     let warehouse = TempDir::new().expect("create iceberg warehouse");
     let port = alloc_port();
-    let args = vec![
-        "standalone-server".to_string(),
-        "--port".to_string(),
-        port.to_string(),
-    ];
+    let (_config_dir, args) = standalone_server_args_with_metadata(port);
     let mut server = ServerGuard::spawn(&args);
     let mut conn = server.connect_root(port);
 
