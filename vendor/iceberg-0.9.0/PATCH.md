@@ -254,3 +254,15 @@ When bumping the vendored copy to a newer iceberg-rust patch release:
 
 If upstream changes the surrounding code substantially, re-apply by hand and
 update this file.
+
+## View API surface (NovaRocks)
+
+- `Catalog` trait: added default-erroring view methods (`create_view`,
+  `load_view`, `update_view`, `drop_view`, `view_exists`, `list_views`).
+- Added `ViewRequirement` (`assert-view-uuid`) and `ViewCommit` (public
+  builder, mirrors `TableCommit`).
+- `ViewCreation.location` is now `Option<String>` so REST servers can
+  assign the location; `ViewMetadataBuilder::from_view_creation` errors
+  on `None`.
+- `ViewRepresentations::new` is public so downstream crates can build
+  representation lists.
