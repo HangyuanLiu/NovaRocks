@@ -8,7 +8,9 @@
 
 use std::collections::BTreeSet;
 
-use crate::engine::mv::partition::MvPartitionKey;
+use crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout;
+use crate::engine::mv::partition::{MvPartitionKey, MvPartitionKeyField};
+use crate::exec::chunk::Chunk;
 use crate::meta::repository::mv_contract::{ExpressionKind, MvSchemaContract};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -217,6 +219,239 @@ pub(crate) fn resolve_partition_derivation_spec(
         target_spec_id: partition.target_spec_id,
         fields,
     }))
+}
+
+/// A derivation field bound to a physical delta-chunk column name.
+#[derive(Clone, Debug)]
+pub(crate) struct BoundPartitionField {
+    pub partition_field_name: String,
+    pub column_name: String,
+    pub transform: iceberg::spec::Transform,
+}
+
+/// Bind a resolved spec to an aggregate layout (steps 3-4 of the original
+/// derivation): the output index must be a group key, and the physical Arrow
+/// column name comes from the layout's visible columns.
+///
+/// Invariant: `PartitionDerivationField::output_index` is a position in
+/// `contract.target.visible_columns` (see `resolve_partition_derivation_spec`),
+/// and this function reuses it as a position in `layout.visible_columns`. That
+/// is sound only because both lists are built from the same output-column
+/// projection in the same order. If those orderings ever diverge, the
+/// group-key membership check would pass but the binding would silently pick
+/// the wrong physical column — keep the two projections aligned.
+pub(crate) fn bind_spec_to_aggregate_layout(
+    spec: &PartitionDerivationSpec,
+    layout: &AggregateMvLayout,
+) -> Result<Vec<BoundPartitionField>, AffectedPartitionError> {
+    let mut bound = Vec::with_capacity(spec.fields.len());
+    for field in &spec.fields {
+        if !layout.group_key_source_indexes.contains(&field.output_index) {
+            return Err(AffectedPartitionError::OutputLineageNotPureColumn {
+                field: field.partition_field_name.clone(),
+            });
+        }
+        let column = layout.visible_columns.get(field.output_index).ok_or_else(|| {
+            AffectedPartitionError::GroupKeyColumnMissing {
+                field: field.partition_field_name.clone(),
+                reason: format!(
+                    "layout has no visible column for output index {}",
+                    field.output_index
+                ),
+            }
+        })?;
+        bound.push(BoundPartitionField {
+            partition_field_name: field.partition_field_name.clone(),
+            column_name: column.name.clone(),
+            transform: field.transform,
+        });
+    }
+    Ok(bound)
+}
+
+/// Mechanically evaluate bound partition fields over delta chunks: apply each
+/// field's Iceberg transform to its source column, then build one
+/// `MvPartitionKey` per row, deduplicated into a sorted set. This is the
+/// transformation + partitioning phase extracted verbatim from the original
+/// `derive_from_aggregate_delta`.
+pub(crate) fn evaluate_partition_spec(
+    target_spec_id: i32,
+    bound_fields: &[BoundPartitionField],
+    delta_chunks: &[Chunk],
+) -> Result<BTreeSet<MvPartitionKey>, AffectedPartitionError> {
+    let mut partitions: BTreeSet<MvPartitionKey> = BTreeSet::new();
+
+    for chunk in delta_chunks {
+        if chunk.batch.num_rows() == 0 {
+            continue;
+        }
+
+        let mut transformed: Vec<arrow::array::ArrayRef> = Vec::with_capacity(bound_fields.len());
+        for field in bound_fields {
+            let col_index = chunk
+                .batch
+                .schema()
+                .index_of(&field.column_name)
+                .map_err(|e| AffectedPartitionError::GroupKeyColumnMissing {
+                    field: field.partition_field_name.clone(),
+                    reason: format!("delta chunk is missing column `{}`: {e}", field.column_name),
+                })?;
+            let array = chunk.batch.column(col_index).clone();
+            let xform =
+                iceberg::transform::create_transform_function(&field.transform).map_err(|e| {
+                    AffectedPartitionError::TransformFailed {
+                        field: field.partition_field_name.clone(),
+                        source: e.to_string(),
+                    }
+                })?;
+            let out =
+                xform
+                    .transform(array)
+                    .map_err(|e| AffectedPartitionError::TransformFailed {
+                        field: field.partition_field_name.clone(),
+                        source: e.to_string(),
+                    })?;
+            transformed.push(out);
+        }
+
+        let row_count = chunk.batch.num_rows();
+        for row in 0..row_count {
+            let mut fields = Vec::with_capacity(bound_fields.len());
+            for (bound_field, array) in bound_fields.iter().zip(transformed.iter()) {
+                let value = arrow_array_row_to_partition_value(
+                    array.as_ref(),
+                    row,
+                    &bound_field.partition_field_name,
+                )?;
+                fields.push(MvPartitionKeyField::new(
+                    bound_field.partition_field_name.clone(),
+                    value,
+                ));
+            }
+            partitions.insert(MvPartitionKey::new(target_spec_id, fields));
+        }
+    }
+
+    Ok(partitions)
+}
+
+fn arrow_array_row_to_partition_value(
+    array: &dyn arrow::array::Array,
+    row: usize,
+    field: &str,
+) -> Result<crate::engine::mv::partition::MvPartitionValue, AffectedPartitionError> {
+    use crate::engine::mv::partition::MvPartitionValue;
+    use arrow::array::{
+        BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int32Array,
+        Int64Array, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray,
+    };
+    use arrow::datatypes::{DataType, TimeUnit};
+
+    if array.is_null(row) {
+        return Ok(MvPartitionValue::Null);
+    }
+
+    let primitive = match array.data_type() {
+        DataType::Boolean => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .expect("Boolean downcast");
+            arr.value(row).to_string()
+        }
+        DataType::Int32 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("Int32 downcast");
+            arr.value(row).to_string()
+        }
+        DataType::Int64 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64 downcast");
+            arr.value(row).to_string()
+        }
+        DataType::Float32 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .expect("Float32 downcast");
+            arr.value(row).to_string()
+        }
+        DataType::Float64 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("Float64 downcast");
+            arr.value(row).to_string()
+        }
+        DataType::Utf8 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("Utf8 downcast");
+            arr.value(row).to_string()
+        }
+        DataType::Date32 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .expect("Date32 downcast");
+            arr.value(row).to_string()
+        }
+        DataType::Timestamp(TimeUnit::Second, _) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .expect("TimestampSecond downcast");
+            arr.value(row).to_string()
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .expect("TimestampMillisecond downcast");
+            arr.value(row).to_string()
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .expect("TimestampMicrosecond downcast");
+            arr.value(row).to_string()
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .expect("TimestampNanosecond downcast");
+            arr.value(row).to_string()
+        }
+        DataType::Decimal128(_, _) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("Decimal128 downcast");
+            // Stringify as the raw integer representation so manifest's
+            // PrimitiveLiteral::Decimal-equivalent rendering aligns. (Iceberg
+            // partition-side stringification uses raw integer too; if/when
+            // change_partition_value gains a Decimal arm, that helper and
+            // this branch must stay in sync.)
+            arr.value(row).to_string()
+        }
+        other => {
+            return Err(AffectedPartitionError::GroupKeyTypeMismatch {
+                field: field.to_string(),
+                want: "Iceberg-compatible primitive Arrow type".to_string(),
+                got: format!("{other:?}"),
+            });
+        }
+    };
+
+    Ok(MvPartitionValue::String(primitive))
 }
 
 #[cfg(test)]
@@ -485,6 +720,297 @@ mod tests {
             .expression
             .referenced_base_field_ids = vec![1, 2];
         let err = resolve_partition_derivation_spec(&contract).unwrap_err();
+        assert!(matches!(
+            err,
+            AffectedPartitionError::OutputLineageNotPureColumn { ref field } if field == "region"
+        ));
+    }
+
+    // --- Test fixtures for bind/evaluate tests (copied verbatim from aggregate_delta.rs) ---
+
+    use crate::connector::starrocks::table::ddl::starrocks_physical_column;
+    use crate::connector::starrocks::table::mv_agg_state::{
+        AggregateMvLayout, AggregateStateColumn, AggregateStateRole, AggregateVisibleColumn,
+    };
+    use crate::connector::starrocks::table::mv_shape::AggregateFunctionKind;
+    use crate::exec::chunk::Chunk;
+    use crate::sql::parser::ast::SqlType;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc as StdArcFixture;
+
+    fn count_layout_with_group_key(
+        name: &str,
+        data_type: DataType,
+        sql_type: SqlType,
+    ) -> AggregateMvLayout {
+        let row_id = starrocks_physical_column(
+            "__row_id__".to_string(),
+            SqlType::String,
+            false,
+            false,
+            true,
+        );
+        let group =
+            starrocks_physical_column(name.to_string(), sql_type.clone(), true, true, false);
+        let counter =
+            starrocks_physical_column("c".to_string(), SqlType::BigInt, false, true, false);
+        let state = starrocks_physical_column(
+            "__agg_state_c".to_string(),
+            SqlType::BigInt,
+            false,
+            false,
+            false,
+        );
+        AggregateMvLayout {
+            row_id_column: row_id.clone(),
+            visible_columns: vec![
+                AggregateVisibleColumn {
+                    name: name.to_string(),
+                    data_type,
+                    sql_type,
+                    nullable: true,
+                    source_index: 0,
+                },
+                AggregateVisibleColumn {
+                    name: "c".to_string(),
+                    data_type: DataType::Int64,
+                    sql_type: SqlType::BigInt,
+                    nullable: false,
+                    source_index: 1,
+                },
+            ],
+            state_columns: vec![AggregateStateColumn {
+                name: "__agg_state_c".to_string(),
+                data_type: DataType::Int64,
+                sql_type: SqlType::BigInt,
+                nullable: false,
+                visible_source_index: 1,
+                aggregate_index: 0,
+                function: AggregateFunctionKind::Count,
+                state_role: AggregateStateRole::Single,
+                count_star: true,
+            }],
+            aggregate_input_types: vec![None],
+            group_key_source_indexes: vec![0],
+            physical_columns: vec![row_id, group, counter, state],
+        }
+    }
+
+    fn batch_with_group_key(name: &str, dt: DataType, values: arrow::array::ArrayRef) -> Chunk {
+        use arrow::array::{Int64Array, StringArray};
+        let n = values.len();
+        let row_ids: Vec<String> = (0..n).map(|i| format!("rid-{i}")).collect();
+        let row_id_arr: arrow::array::ArrayRef =
+            StdArcFixture::new(StringArray::from(row_ids));
+        let counts: arrow::array::ArrayRef =
+            StdArcFixture::new(Int64Array::from(vec![1i64; n]));
+        let states: arrow::array::ArrayRef =
+            StdArcFixture::new(Int64Array::from(vec![1i64; n]));
+        let schema = StdArcFixture::new(Schema::new(vec![
+            Field::new("__row_id__", DataType::Utf8, false),
+            Field::new(name, dt, true),
+            Field::new("c", DataType::Int64, false),
+            Field::new("__agg_state_c", DataType::Int64, false),
+        ]));
+        let batch =
+            RecordBatch::try_new(schema, vec![row_id_arr, values, counts, states]).unwrap();
+        crate::engine::record_batch_to_chunk(batch).unwrap()
+    }
+
+    // --- Moved from aggregate_delta.rs: arrow_array_row_to_partition_value tests ---
+
+    use arrow::array::{
+        BooleanArray, Date32Array, Float32Array, Float64Array, Int32Array, Int64Array,
+        TimestampMicrosecondArray,
+    };
+
+    #[test]
+    fn arrow_row_to_partition_value_supports_iceberg_primitive_arrow_types() {
+        use arrow::array::{ArrayRef, StringArray};
+        let bool_arr =
+            StdArcFixture::new(BooleanArray::from(vec![Some(true)])) as ArrayRef;
+        assert_eq!(
+            arrow_array_row_to_partition_value(bool_arr.as_ref(), 0, "f").unwrap(),
+            MvPartitionValue::String("true".to_string())
+        );
+        let int_arr = StdArcFixture::new(Int32Array::from(vec![Some(7)])) as ArrayRef;
+        assert_eq!(
+            arrow_array_row_to_partition_value(int_arr.as_ref(), 0, "f").unwrap(),
+            MvPartitionValue::String("7".to_string())
+        );
+        let long_arr = StdArcFixture::new(Int64Array::from(vec![Some(20000)])) as ArrayRef;
+        assert_eq!(
+            arrow_array_row_to_partition_value(long_arr.as_ref(), 0, "f").unwrap(),
+            MvPartitionValue::String("20000".to_string())
+        );
+        let float_arr =
+            StdArcFixture::new(Float32Array::from(vec![Some(1.5f32)])) as ArrayRef;
+        assert_eq!(
+            arrow_array_row_to_partition_value(float_arr.as_ref(), 0, "f").unwrap(),
+            MvPartitionValue::String("1.5".to_string())
+        );
+        let double_arr =
+            StdArcFixture::new(Float64Array::from(vec![Some(2.5f64)])) as ArrayRef;
+        assert_eq!(
+            arrow_array_row_to_partition_value(double_arr.as_ref(), 0, "f").unwrap(),
+            MvPartitionValue::String("2.5".to_string())
+        );
+        let str_arr =
+            StdArcFixture::new(StringArray::from(vec![Some("east")])) as ArrayRef;
+        assert_eq!(
+            arrow_array_row_to_partition_value(str_arr.as_ref(), 0, "f").unwrap(),
+            MvPartitionValue::String("east".to_string())
+        );
+        // Date32: number of days since 1970-01-01.
+        let date_arr =
+            StdArcFixture::new(Date32Array::from(vec![Some(19500)])) as ArrayRef;
+        assert_eq!(
+            arrow_array_row_to_partition_value(date_arr.as_ref(), 0, "f").unwrap(),
+            MvPartitionValue::String("19500".to_string())
+        );
+        // TimestampMicrosecond: integer micros since epoch.
+        let ts_arr = StdArcFixture::new(TimestampMicrosecondArray::from(vec![Some(
+            1_700_000_000_000_000,
+        )])) as ArrayRef;
+        assert_eq!(
+            arrow_array_row_to_partition_value(ts_arr.as_ref(), 0, "f").unwrap(),
+            MvPartitionValue::String("1700000000000000".to_string())
+        );
+    }
+
+    #[test]
+    fn arrow_row_to_partition_value_handles_null() {
+        let arr =
+            StdArcFixture::new(Int32Array::from(vec![None::<i32>])) as arrow::array::ArrayRef;
+        assert_eq!(
+            arrow_array_row_to_partition_value(arr.as_ref(), 0, "f").unwrap(),
+            MvPartitionValue::Null
+        );
+    }
+
+    #[test]
+    fn arrow_row_to_partition_value_rejects_unsupported_arrow_type() {
+        // Use a UInt32Array — not an Iceberg-native partition output type.
+        let arr = StdArcFixture::new(arrow::array::UInt32Array::from(vec![Some(1u32)]))
+            as arrow::array::ArrayRef;
+        let err = arrow_array_row_to_partition_value(arr.as_ref(), 0, "f").unwrap_err();
+        assert!(matches!(
+            err,
+            AffectedPartitionError::GroupKeyTypeMismatch { ref field, .. } if field == "f"
+        ));
+    }
+
+    #[test]
+    fn client_side_serialization_matches_file_metadata_path_for_primitive_literals() {
+        // Property-style equality: for every primitive value Iceberg can carry
+        // in a partition struct, the file-metadata path's stringification and
+        // the client-side path's stringification must agree, so MvPartitionKey
+        // values from base manifests and from delta chunks compare equal.
+        use arrow::array::ArrayRef;
+        use iceberg::spec::PrimitiveLiteral;
+
+        // (manifest literal, builder of a 1-row Arrow array carrying the same value)
+        let cases: Vec<(PrimitiveLiteral, ArrayRef)> = vec![
+            (
+                PrimitiveLiteral::Boolean(true),
+                StdArcFixture::new(BooleanArray::from(vec![Some(true)])) as ArrayRef,
+            ),
+            (
+                PrimitiveLiteral::Int(42),
+                StdArcFixture::new(Int32Array::from(vec![Some(42)])) as ArrayRef,
+            ),
+            (
+                PrimitiveLiteral::Long(100),
+                StdArcFixture::new(Int64Array::from(vec![Some(100)])) as ArrayRef,
+            ),
+            (
+                PrimitiveLiteral::Float(ordered_float::OrderedFloat(0.5)),
+                StdArcFixture::new(Float32Array::from(vec![Some(0.5f32)])) as ArrayRef,
+            ),
+            (
+                PrimitiveLiteral::Double(ordered_float::OrderedFloat(0.25)),
+                StdArcFixture::new(Float64Array::from(vec![Some(0.25f64)])) as ArrayRef,
+            ),
+            (
+                PrimitiveLiteral::String("east".to_string()),
+                StdArcFixture::new(arrow::array::StringArray::from(vec![Some("east")])) as ArrayRef,
+            ),
+        ];
+        for (lit, arr) in cases {
+            let manifest_value = manifest_primitive_to_string(&lit);
+            let client_value =
+                arrow_array_row_to_partition_value(arr.as_ref(), 0, "f").unwrap();
+            assert_eq!(
+                MvPartitionValue::String(manifest_value),
+                client_value,
+                "literal={lit:?}"
+            );
+        }
+    }
+
+    fn manifest_primitive_to_string(lit: &iceberg::spec::PrimitiveLiteral) -> String {
+        // Helper that mirrors `change_partition_value` from changes.rs for the
+        // primitive subset this property test exercises. If `change_partition_value`
+        // ever changes its stringification rule, this helper must be updated and
+        // the property test will catch the divergence in `arrow_array_row_to_partition_value`.
+        match lit {
+            iceberg::spec::PrimitiveLiteral::Boolean(v) => v.to_string(),
+            iceberg::spec::PrimitiveLiteral::Int(v) => v.to_string(),
+            iceberg::spec::PrimitiveLiteral::Long(v) => v.to_string(),
+            iceberg::spec::PrimitiveLiteral::Float(v) => v.0.to_string(),
+            iceberg::spec::PrimitiveLiteral::Double(v) => v.0.to_string(),
+            iceberg::spec::PrimitiveLiteral::String(v) => v.clone(),
+            _ => unreachable!("only the primitives this test exercises are listed above"),
+        }
+    }
+
+    // --- Tests for bind_spec_to_aggregate_layout and evaluate_partition_spec ---
+
+    #[test]
+    fn bind_and_evaluate_identity_partition_over_chunks() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::DataType;
+        use crate::sql::parser::ast::SqlType;
+
+        let layout = count_layout_with_group_key("region", DataType::Utf8, SqlType::String);
+        let contract =
+            count_contract_with_partition("region", MvPartitionTransformContract::Identity, 11);
+        let spec = resolve_partition_derivation_spec(&contract)
+            .expect("resolve")
+            .expect("partitioned");
+        let bound = bind_spec_to_aggregate_layout(&spec, &layout).expect("bind");
+        assert_eq!(bound.len(), 1);
+        assert_eq!(bound[0].column_name, "region");
+
+        let chunk = batch_with_group_key(
+            "region",
+            DataType::Utf8,
+            StdArcFixture::new(StringArray::from(vec![Some("a"), Some("b"), Some("a")]))
+                as arrow::array::ArrayRef,
+        );
+        let partitions =
+            evaluate_partition_spec(spec.target_spec_id, &bound, &[chunk]).expect("evaluate");
+        assert_eq!(partitions.len(), 2);
+        for key in &partitions {
+            assert_eq!(key.spec_id, 7);
+            assert_eq!(key.fields[0].field_name, "region");
+        }
+    }
+
+    #[test]
+    fn bind_rejects_non_group_key_output_index() {
+        use arrow::datatypes::DataType;
+        use crate::sql::parser::ast::SqlType;
+
+        let mut layout = count_layout_with_group_key("region", DataType::Utf8, SqlType::String);
+        layout.group_key_source_indexes = vec![1]; // "region" (index 0) no longer a group key
+        let contract =
+            count_contract_with_partition("region", MvPartitionTransformContract::Identity, 11);
+        let spec = resolve_partition_derivation_spec(&contract)
+            .expect("resolve")
+            .expect("partitioned");
+        let err = bind_spec_to_aggregate_layout(&spec, &layout).unwrap_err();
         assert!(matches!(
             err,
             AffectedPartitionError::OutputLineageNotPureColumn { ref field } if field == "region"
