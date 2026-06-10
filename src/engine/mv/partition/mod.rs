@@ -3,13 +3,17 @@ pub(crate) mod key;
 pub(crate) mod mapping;
 pub(crate) mod planner;
 
-pub(crate) use derivation::AffectedTargetPartitions;
-// P2/P3 partition-pruning asset; the sole P1 caller (pre-cutover apply path)
-// is removed in this commit. Live consumer lands in PR-3 / P2 (umbrella spec §5.1).
+pub(crate) use derivation::{
+    AffectedTargetPartitions, PartitionDerivationSpec, resolve_partition_derivation_spec,
+};
+// P2 partition-pruning asset: the chunk evaluator + its bound/error types were
+// extracted in P1 (the dead pre-cutover apply path that used them is removed),
+// and the live consumer lands in P2 (join PF / sink-side pruning, umbrella
+// spec §5.1). Kept re-exported so P2 wires in without re-plumbing the module.
 #[allow(unused_imports)]
 pub(crate) use derivation::{
-    AffectedPartitionError, BoundPartitionField, PartitionDerivationField, PartitionDerivationSpec,
-    bind_spec_to_aggregate_layout, evaluate_partition_spec, resolve_partition_derivation_spec,
+    AffectedPartitionError, BoundPartitionField, PartitionDerivationField,
+    bind_spec_to_aggregate_layout, evaluate_partition_spec,
 };
 pub(crate) use key::{
     MvPartitionKey, MvPartitionKeyField, MvPartitionValue, TargetPartitionFilter,
