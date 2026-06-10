@@ -75,7 +75,7 @@ mv_flow::refresh_mv 成功提交 ──RefreshCompleted(mv_id)──┐
 
 ### 组件
 
-1. **`MaintenanceCoordinator`**(新文件 `src/engine/mv_maintenance.rs`):独立 OS 线程,骨架照 `RefreshCoordinator`(`src/engine/mv_scheduler.rs`):mpsc stop channel、Handle `Drop` 时发停止信号并 join、`running_table_ids` 防重入、`max_concurrent` 默认 1。事件枚举 v1 仅 `RefreshCompleted { mv_id }` 与 `Tick`。
+1. **`MaintenanceCoordinator`**(新模块 `src/engine/mv_maintenance/`):独立 OS 线程,骨架照 `RefreshCoordinator`(`src/engine/mv_scheduler.rs`):mpsc stop channel、Handle `Drop` 时发停止信号并 join、`running_table_ids` 防重入、`max_concurrent` 默认 1。事件信号 v1 为无载荷的 `Wake`(refresh 成功后投递,突发事件合并)与 `Stop`;收到 Wake 或兜底 tick 超时后做一轮全量评估,逐表靠 snapshot 短路保持廉价 —— 与「携带 mv_id 的定向评估」语义等价,实现更简单。
 2. **`MaintenancePolicy`**:策略合成 —— 全局默认(`[standalone_server]` 配置)+ 表属性覆盖(`history.expire.*`、`novarocks.maintenance.enabled`),产出解析好的 policy 结构。这是 `history.expire.*` 在代码库中的第一个消费者。
 3. **`PolicyEngine`**:纯函数,输入 snapshot summary 统计 + 该表上次 maintenance 内存状态,输出动作列表。零 IO,可直接单测。
 4. **执行通道**:EXPIRE 与 DV compaction 由 Coordinator 用现有 block-on 模式直接 await `run_*` 函数;OPTIMIZE 走现有 job 队列入口(同 `create_legacy_optimize_job` 路径),只提交不等待。
@@ -89,7 +89,7 @@ mv_flow::refresh_mv 成功提交 ──RefreshCompleted(mv_id)──┐
 
 ### 信号
 
-全部来自当前 snapshot 的 summary(只读表 metadata JSON,零 manifest walk):`total-data-files`、`total-files-size`、`total-delete-files`;加 Coordinator 内存的「上次评估 snapshot id / 上次动作时间 / 连续失败计数」。「当前 snapshot id 与上次评估相同」直接短路跳过该表(Dremio 模式)。
+全部来自当前 snapshot 的 summary(只读表 metadata JSON,零 manifest walk):`total-data-files`、`total-files-size`、`total-delete-files`;加 Coordinator 内存的「上次评估 snapshot id / 上次动作时间 / 连续失败计数」。「当前 snapshot id 与上次评估相同」时跳过 OPTIMIZE / DV compaction 评估(Dremio 模式);EXPIRE 每轮基于已加载的 metadata 纯计算评估(零额外 IO),仅当存在可过期 snapshot 时才执行动作——这保证停止刷新的表残留的 retention 尾巴仍会被兜底 tick 清掉。
 
 ### 触发规则与默认值
 
@@ -144,7 +144,7 @@ iceberg_maintenance_max_consecutive_failures = 4   # 熔断阈值,对齐 Glue
 
 ## 9. 边界情况
 
-1. **replace snapshot 对下游增量 MV 必须是 no-op —— 实现的前置验证项**。自动 OPTIMIZE / DV compaction 产生无逻辑行变更的 snapshot,下游增量消费必须正确跳过;若现状不满足,先修这个阻塞依赖。实现计划第一步即写此验证测试。
+1. **replace snapshot 对下游增量 MV 必须是 no-op —— 实现的前置验证项**。代码调研确认该能力已存在:`src/connector/iceberg/changes.rs` 的 `classify_snapshot` 对 `Operation::Replace` 做验证后静默吸收(`validate_replace_snapshot` 校验 total-records 不变、added/deleted 文件数符合 compaction 形态、schema 未变),验证失败则增量刷新显式报错。实现计划第一步用端到端测试确认该链路对 OPTIMIZE 与 DV compaction 的产物成立;若测试失败则先修这个阻塞依赖。同文件的 `LineageBroken` 错误路径(previous snapshot 被 expire 后增量断链)印证了下游安全下界的必要性。
 2. **MV 在 maintenance 中被 DROP**:动作失败记一次;候选来自 `mv_repo`,已删表自然消失,不会重试堆积。事件中 `mv_id` 加载失败静默跳过。
 3. **非 Iceberg 存储的 MV**(managed-lake 后端):候选过滤阶段排除。
 4. **纯 equality-delete 表**:`total-delete-files` 不区分 delete 类型,DV compaction 会 no-op;不计失败、照常冷却,防空转。
@@ -154,7 +154,7 @@ iceberg_maintenance_max_consecutive_failures = 4   # 熔断阈值,对齐 Glue
 
 1. **PolicyEngine 纯函数单测(主力)**:表驱动覆盖阈值边界、OPTIMIZE 抑制 DV、下游安全下界收紧、ref 守卫、冷却、熔断、snapshot 未变短路。
 2. **Coordinator 生命周期测试**:启动/关闭/disabled、事件投递与运行中丢弃、job 表防重入;写法照 `mv_scheduler` 现有测试。
-3. **端到端 SQL 测试**(`sql-tests`,Iceberg REST 环境):专用测试配置(秒级 tick、小阈值、表属性设极小 `history.expire.max-snapshot-age-ms`):
+3. **端到端集成测试**(Rust 级,hadoop 本地 catalog 环境,直接调用 Coordinator 的评估入口注入 `now_ms`,完全确定性、无线程/计时依赖;场景与原 sql-tests 方案一致,放弃计时敏感的 sql-tests 形态):
    - ① 反复 refresh 积累小文件后自动 OPTIMIZE,文件数收敛(对应验收标准 1)
    - ② 配 `history.expire.*` 的 MV 自动过期旧 snapshot(对应验收标准 2)
    - ③ 关键回归:base MV + 下游增量 MV,自动 maintenance 开启后下游增量刷新结果正确、未触发全量回退
