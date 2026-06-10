@@ -32,6 +32,7 @@ pub mod mem_tracker;
 pub mod profile;
 pub(crate) mod query_cancel;
 pub mod query_context;
+pub(crate) mod query_state;
 pub mod query_result;
 pub(crate) mod write_coordinator;
 // Result buffer fetch infrastructure is accessed from C++ shim FFI path.
