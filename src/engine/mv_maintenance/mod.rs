@@ -4,3 +4,4 @@
 //! docs/superpowers/specs/2026-06-10-iceberg-mv-maintenance-scheduler-design.md.
 
 pub(crate) mod policy;
+pub(crate) mod stats;

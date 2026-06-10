@@ -391,45 +391,46 @@ fn run_rewrite_position_delete_files_action(
     })
 }
 
-fn create_legacy_optimize_job(
+/// Create a pending whole-table optimize job for `catalog.namespace.table`.
+/// Returns the job id. Fails with the repository conflict error when an
+/// active (pending/running) job already exists for the table.
+pub(crate) fn enqueue_optimize_job(
     state: &Arc<StandaloneState>,
-    request: &MaintenanceActionRequest,
-) -> Result<StatementResult, String> {
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+) -> Result<i64, String> {
     let Some(provider) = state.metadata_provider.as_ref() else {
-        return Err("ALTER TABLE OPTIMIZE requires metadata provider".to_string());
+        return Err("iceberg optimize requires metadata provider".to_string());
     };
     let entry = {
         let registry = state
             .iceberg_catalogs
             .read()
             .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        registry.get(&request.catalog)?
+        registry.get(catalog)?
     };
-    entry.invalidate_table_cache(&request.namespace, &request.table);
-    let loaded =
-        crate::connector::iceberg::catalog::load_table(&entry, &request.namespace, &request.table)?;
+    entry.invalidate_table_cache(namespace, table);
+    let loaded = crate::connector::iceberg::catalog::load_table(&entry, namespace, table)?;
     let base_snapshot_id = loaded
         .table
         .metadata()
         .current_snapshot()
         .map(|snapshot| snapshot.snapshot_id())
         .ok_or_else(|| {
-            format!(
-                "ALTER TABLE OPTIMIZE requires iceberg table {} to have a current snapshot",
-                action_target(request)
-            )
+            format!("iceberg table {catalog}.{namespace}.{table} has no current snapshot")
         })?;
     let mut txn = provider
         .begin_write("create iceberg optimize job")
         .map_err(|e| format!("open iceberg optimize job transaction failed: {e}"))?;
-    state
+    let job = state
         .job_repo
         .create_iceberg_optimize_job(
             txn.as_mut(),
             CreateIcebergOptimizeJobRequest {
-                catalog: request.catalog.clone(),
-                namespace: request.namespace.clone(),
-                table: request.table.clone(),
+                catalog: catalog.to_string(),
+                namespace: namespace.to_string(),
+                table: table.to_string(),
                 base_snapshot_id,
                 now_ms: maintenance_now_ms(),
             },
@@ -437,6 +438,15 @@ fn create_legacy_optimize_job(
         .map_err(|e| format!("create iceberg optimize job failed: {e}"))?;
     txn.commit()
         .map_err(|e| format!("commit iceberg optimize job failed: {e}"))?;
+    Ok(job.id)
+}
+
+fn create_legacy_optimize_job(
+    state: &Arc<StandaloneState>,
+    request: &MaintenanceActionRequest,
+) -> Result<StatementResult, String> {
+    enqueue_optimize_job(state, &request.catalog, &request.namespace, &request.table)
+        .map_err(|e| format!("ALTER TABLE OPTIMIZE: {e}"))?;
     Ok(StatementResult::Ok)
 }
 
@@ -475,25 +485,37 @@ fn maintenance_now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn build_action_catalog(
+/// Resolve a registered iceberg catalog into an executable handle for
+/// maintenance actions. Shared by SQL-driven maintenance and the automatic
+/// maintenance coordinator (mv_maintenance).
+pub(crate) fn resolve_maintenance_catalog(
     state: &Arc<StandaloneState>,
-    request: &MaintenanceActionRequest,
+    catalog_name: &str,
+    namespace: &str,
+    table: &str,
 ) -> Result<(Arc<dyn Catalog>, TableIdent, Option<ObjectStoreConfig>), String> {
     let entry = {
         let registry = state
             .iceberg_catalogs
             .read()
             .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
-        registry.get(&request.catalog)?
+        registry.get(catalog_name)?
     };
-    entry.invalidate_table_cache(&request.namespace, &request.table);
+    entry.invalidate_table_cache(namespace, table);
     let object_store_config = entry.object_store_config().cloned();
     let catalog: Arc<dyn Catalog> = build_iceberg_catalog(&entry)?;
     let table_ident = TableIdent::new(
-        NamespaceIdent::new(request.namespace.clone()),
-        request.table.clone(),
+        NamespaceIdent::new(namespace.to_string()),
+        table.to_string(),
     );
     Ok((catalog, table_ident, object_store_config))
+}
+
+fn build_action_catalog(
+    state: &Arc<StandaloneState>,
+    request: &MaintenanceActionRequest,
+) -> Result<(Arc<dyn Catalog>, TableIdent, Option<ObjectStoreConfig>), String> {
+    resolve_maintenance_catalog(state, &request.catalog, &request.namespace, &request.table)
 }
 
 fn action_target(request: &MaintenanceActionRequest) -> String {
