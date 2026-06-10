@@ -47,6 +47,9 @@ fn merge_consecutive_topn(expr: &MExpr, memo: &Memo) -> Vec<NewExpr> {
         if !topn_phase_can_merge(outer, inner) {
             continue;
         }
+        if inner.offset.unwrap_or(0) != 0 {
+            continue;
+        }
         let Some(outer_window) = TopNWindow::from_limit_offset(outer.limit, outer.offset) else {
             continue;
         };
@@ -222,6 +225,21 @@ mod tests {
         assert!(
             out.is_empty(),
             "inner TopN that ends before the outer window must not be removed"
+        );
+    }
+
+    #[test]
+    fn does_not_merge_when_inner_offset_is_non_zero() {
+        let mut memo = Memo::new();
+        let scan_group = scan_group(&mut memo);
+        let inner_group = memo.new_group(topn(&memo, 20, 3, TopNPhase::Final, false, scan_group));
+        let outer = topn(&memo, 5, 10, TopNPhase::Final, false, inner_group);
+
+        let out = MergeConsecutiveTopN.apply(&outer, &mut memo);
+
+        assert!(
+            out.is_empty(),
+            "inner offset must be preserved instead of dropping the inner TopN"
         );
     }
 
