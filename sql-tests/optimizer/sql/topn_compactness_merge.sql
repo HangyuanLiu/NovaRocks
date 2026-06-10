@@ -3,6 +3,9 @@
 -- Lock in compact consecutive TopN planning and the rule-disable escape hatch.
 
 -- query 1
+SET disable_optimizer_rules = 'SplitTopN';
+
+-- query 2
 -- @explain_contains=TOP-N
 -- @explain_contains=stats={rows=
 EXPLAIN VERBOSE SELECT *
@@ -20,10 +23,10 @@ FROM (
 ORDER BY score DESC, id ASC
 LIMIT 2;
 
--- query 2
-SET disable_optimizer_rules = 'MergeConsecutiveTopN';
-
 -- query 3
+SET disable_optimizer_rules = 'SplitTopN,PushTopNThroughProject,MergeConsecutiveTopN';
+
+-- query 4
 -- @explain_contains=TOP-N
 EXPLAIN VERBOSE SELECT *
 FROM (
@@ -40,5 +43,5 @@ FROM (
 ORDER BY score DESC, id ASC
 LIMIT 2;
 
--- query 4
+-- query 5
 SET disable_optimizer_rules = '';
