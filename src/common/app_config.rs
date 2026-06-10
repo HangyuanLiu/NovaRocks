@@ -61,13 +61,45 @@ impl Default for ClusterRole {
 }
 
 /// Configuration for the `[cluster]` TOML section.
-#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Deserialize)]
 #[serde(default)]
 pub struct ClusterConfig {
     pub role: ClusterRole,
     pub backends: Vec<String>,
     pub advertise_host: String,
     pub advertise_port: u16,
+    #[serde(default = "default_heartbeat_interval_ms")]
+    pub heartbeat_interval_ms: u64,
+    #[serde(default = "default_heartbeat_timeout_retries")]
+    pub heartbeat_timeout_retries: u32,
+    #[serde(default = "default_decommission_timeout_secs")]
+    pub decommission_timeout_secs: u64,
+}
+
+fn default_heartbeat_interval_ms() -> u64 {
+    5000
+}
+
+fn default_heartbeat_timeout_retries() -> u32 {
+    3
+}
+
+fn default_decommission_timeout_secs() -> u64 {
+    300
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            role: ClusterRole::default(),
+            backends: Vec::new(),
+            advertise_host: String::new(),
+            advertise_port: 0,
+            heartbeat_interval_ms: default_heartbeat_interval_ms(),
+            heartbeat_timeout_retries: default_heartbeat_timeout_retries(),
+            decommission_timeout_secs: default_decommission_timeout_secs(),
+        }
+    }
 }
 
 impl ClusterConfig {
@@ -109,6 +141,33 @@ impl ClusterConfig {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cluster_hb_tests {
+    use super::ClusterConfig;
+
+    #[test]
+    fn cluster_config_heartbeat_defaults() {
+        let c = ClusterConfig::default();
+        assert_eq!(c.heartbeat_interval_ms, 5000);
+        assert_eq!(c.heartbeat_timeout_retries, 3);
+        assert_eq!(c.decommission_timeout_secs, 300);
+    }
+
+    #[test]
+    fn cluster_config_parses_heartbeat_overrides() {
+        let toml = r#"
+            role = "fe"
+            backends = ["127.0.0.1:9070"]
+            heartbeat_interval_ms = 2000
+            heartbeat_timeout_retries = 5
+        "#;
+        let c: ClusterConfig = toml::from_str(toml).unwrap();
+        assert_eq!(c.heartbeat_interval_ms, 2000);
+        assert_eq!(c.heartbeat_timeout_retries, 5);
+        assert_eq!(c.decommission_timeout_secs, 300);
     }
 }
 
