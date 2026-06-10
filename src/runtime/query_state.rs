@@ -177,6 +177,10 @@ impl InFlightQueryTable {
     }
 
     pub(crate) fn on_backend_lost(&self, backend_idx: usize) -> Vec<QueryId> {
+        self.on_backend_failed(backend_idx, format!("backend {backend_idx} lost"))
+    }
+
+    pub(crate) fn on_backend_failed(&self, backend_idx: usize, reason: String) -> Vec<QueryId> {
         let mut guard = self.inner.lock().expect("query_state lock");
         let mut failed = Vec::new();
 
@@ -190,7 +194,7 @@ impl InFlightQueryTable {
                 .any(|record| record.backend_idx == backend_idx)
             {
                 entry.state = QueryState::Failed;
-                entry.failure_reason = Some(format!("backend {backend_idx} lost"));
+                entry.failure_reason = Some(reason.clone());
                 failed.push(*query_id);
             }
         }
@@ -259,6 +263,24 @@ mod tests {
         assert_eq!(failed, vec![qid(2), qid(3)]);
         assert_eq!(t.state(qid(3)), Some(QueryState::Failed));
         assert_eq!(t.state(qid(2)), Some(QueryState::Failed));
+    }
+
+    #[test]
+    fn backend_failed_records_custom_reason_atomically() {
+        let t = InFlightQueryTable::new();
+        t.register(qid(12), fid(120), 2);
+        t.register(qid(13), fid(130), 3);
+
+        let failed = t.on_backend_failed(2, "backend 2 restarted (epoch 7 -> 8)".into());
+
+        assert_eq!(failed, vec![qid(12)]);
+        assert_eq!(t.state(qid(12)), Some(QueryState::Failed));
+        assert_eq!(
+            t.failure_reason(qid(12)).as_deref(),
+            Some("backend 2 restarted (epoch 7 -> 8)")
+        );
+        assert_eq!(t.state(qid(13)), Some(QueryState::Running));
+        assert_eq!(t.failure_reason(qid(13)), None);
     }
 
     #[test]
