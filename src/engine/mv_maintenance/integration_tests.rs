@@ -491,14 +491,15 @@ fn scenario_2_auto_expire_keeps_min_snapshots() {
     run_pass(&env, &mut coordinator);
 
     let after = mv_table_snapshot_count(&env, "analytics", "mv_exp");
-    // min-snapshots-to-keep is respected and the table is never grown by expire.
+    // min-snapshots-to-keep is respected.
     assert!(
         after >= 1,
         "must keep at least one snapshot (min-snapshots-to-keep=1), got {after}"
     );
+    // expire must actually prune old snapshots (not a no-op).
     assert!(
-        after <= before,
-        "expire must not add snapshots: before={before} after={after}"
+        after < before,
+        "auto-expire must remove old snapshots now: before={before} after={after}"
     );
 
     // The MV still answers SELECT after the expire pass.
@@ -571,15 +572,28 @@ fn scenario_3_auto_expire_respects_downstream_consumer() {
     run_pass(&env, &mut coordinator);
 
     // The downstream consumer's lineage was not broken: refreshing mv_b again
-    // still succeeds and mv_b still answers SELECT.
+    // still succeeds and mv_b reflects the correct aggregate result.
     refresh_mv(&env, "mv_b");
-    let rows = select_row_count(
+    let total_rows = select_row_count(
         &env.state,
         Some("ice"),
         &env.current_db,
         "SELECT region, c FROM mv_b",
     );
-    assert!(rows >= 1, "mv_b must still answer SELECT, got {rows} rows");
+    assert_eq!(
+        total_rows, 1,
+        "mv_b must have exactly one region row, got {total_rows}"
+    );
+    let correct = select_row_count(
+        &env.state,
+        Some("ice"),
+        &env.current_db,
+        "SELECT region FROM mv_b WHERE region = 'east' AND c = 3",
+    );
+    assert_eq!(
+        correct, 1,
+        "mv_b must report east count = 3 after expire + incremental refresh"
+    );
 }
 
 // --- Scenario ④: escape hatch disables a table ---
