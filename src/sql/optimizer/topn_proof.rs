@@ -1,4 +1,4 @@
-use crate::sql::analysis::{ExprKind, ProjectItem, SortItem, TypedExpr};
+use crate::sql::analysis::{ExprKind, ProjectItem, SortItem};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::property::{EquivalenceClasses, SortKey, typed_expr_to_column_id};
 
@@ -95,7 +95,7 @@ pub(crate) fn columns_equivalent(
         .unwrap_or(false)
 }
 
-pub(crate) fn pure_project_column_remap(items: &[ProjectItem]) -> Vec<(ColumnId, ColumnId)> {
+pub(crate) fn passthrough_project_column_remap(items: &[ProjectItem]) -> Vec<(ColumnId, ColumnId)> {
     items
         .iter()
         .filter_map(|item| {
@@ -114,25 +114,24 @@ pub(crate) fn remap_sort_items_through_project(
     items: &[SortItem],
     project_items: &[ProjectItem],
 ) -> Option<Vec<SortItem>> {
-    let remap = pure_project_column_remap(project_items);
     items
         .iter()
         .map(|item| {
             let output_col = typed_expr_to_column_id(&item.expr)?;
-            let input_col = remap
+            let project_item = project_items
                 .iter()
-                .find_map(|(out, input)| (*out == output_col).then_some(*input))?;
-            let mut remapped = item.clone();
-            remapped.expr = TypedExpr {
-                kind: ExprKind::ColumnRef {
-                    column_id: input_col,
-                    qualifier: None,
-                    column: format!("{}", input_col),
-                },
-                data_type: item.expr.data_type.clone(),
-                nullable: item.expr.nullable,
+                .find(|project_item| project_item.output_column_id == output_col)?;
+            let ExprKind::ColumnRef { column_id, .. } = &project_item.expr.kind else {
+                return None;
             };
-            Some(remapped)
+            if *column_id == ColumnId::UNSET || project_item.output_column_id == ColumnId::UNSET {
+                return None;
+            }
+            Some(SortItem {
+                expr: project_item.expr.clone(),
+                asc: item.asc,
+                nulls_first: item.nulls_first,
+            })
         })
         .collect()
 }
@@ -140,7 +139,7 @@ pub(crate) fn remap_sort_items_through_project(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::{LiteralValue, ProjectItem};
+    use crate::sql::analysis::{LiteralValue, ProjectItem, TypedExpr};
     use arrow::datatypes::DataType;
 
     fn col(id: u32, name: &str) -> TypedExpr {
@@ -155,9 +154,29 @@ mod tests {
         }
     }
 
+    fn qualified_col(id: u32, qualifier: &str, name: &str, nullable: bool) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId(id),
+                qualifier: Some(qualifier.to_string()),
+                column: name.to_string(),
+            },
+            data_type: DataType::Utf8,
+            nullable,
+        }
+    }
+
     fn sort_item(id: u32, asc: bool, nulls_first: bool) -> SortItem {
         SortItem {
             expr: col(id, &format!("c{id}")),
+            asc,
+            nulls_first,
+        }
+    }
+
+    fn sort_key(id: u32, asc: bool, nulls_first: bool) -> SortKey {
+        SortKey {
+            column: ColumnId(id),
             asc,
             nulls_first,
         }
@@ -210,6 +229,46 @@ mod tests {
     }
 
     #[test]
+    fn ordering_covers_required_prefix() {
+        let provided = vec![sort_key(1, true, false), sort_key(2, false, true)];
+        let required = vec![sort_key(1, true, false)];
+        assert!(ordering_covers(&provided, &required, None));
+    }
+
+    #[test]
+    fn ordering_covers_rejects_shorter_provided_ordering() {
+        let provided = vec![sort_key(1, true, false)];
+        let required = vec![sort_key(1, true, false), sort_key(2, true, false)];
+        assert!(!ordering_covers(&provided, &required, None));
+    }
+
+    #[test]
+    fn ordering_covers_rejects_direction_or_null_order_mismatch() {
+        let required = vec![sort_key(1, true, false)];
+        assert!(!ordering_covers(
+            &[sort_key(1, false, false)],
+            &required,
+            None
+        ));
+        assert!(!ordering_covers(
+            &[sort_key(1, true, true)],
+            &required,
+            None
+        ));
+    }
+
+    #[test]
+    fn ordering_covers_uses_equivalence_classes() {
+        let mut eq = EquivalenceClasses::default();
+        eq.merge_pair(ColumnId(1), ColumnId(2));
+        assert!(ordering_covers(
+            &[sort_key(1, true, false)],
+            &[sort_key(2, true, false)],
+            Some(&eq)
+        ));
+    }
+
+    #[test]
     fn project_remap_accepts_column_refs_only() {
         let project_items = vec![
             ProjectItem {
@@ -229,7 +288,7 @@ mod tests {
         ];
 
         assert_eq!(
-            pure_project_column_remap(&project_items),
+            passthrough_project_column_remap(&project_items),
             vec![(ColumnId(10), ColumnId(1))]
         );
         assert!(
@@ -240,5 +299,36 @@ mod tests {
             remap_sort_items_through_project(&[sort_item(11, true, false)], &project_items)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn project_remap_preserves_passthrough_expr_metadata() {
+        let project_items = vec![ProjectItem {
+            expr: qualified_col(1, "src", "source_name", false),
+            output_name: "alias_name".to_string(),
+            output_column_id: ColumnId(10),
+        }];
+
+        let remapped =
+            remap_sort_items_through_project(&[sort_item(10, false, true)], &project_items)
+                .expect("sort item should remap through passthrough project");
+
+        assert_eq!(remapped.len(), 1);
+        assert!(!remapped[0].asc);
+        assert!(remapped[0].nulls_first);
+        assert_eq!(remapped[0].expr.data_type, DataType::Utf8);
+        assert!(!remapped[0].expr.nullable);
+        match &remapped[0].expr.kind {
+            ExprKind::ColumnRef {
+                column_id,
+                qualifier,
+                column,
+            } => {
+                assert_eq!(*column_id, ColumnId(1));
+                assert_eq!(qualifier.as_deref(), Some("src"));
+                assert_eq!(column, "source_name");
+            }
+            other => panic!("expected ColumnRef after remap, got {other:?}"),
+        }
     }
 }
