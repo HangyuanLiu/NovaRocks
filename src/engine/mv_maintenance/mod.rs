@@ -464,10 +464,10 @@ fn current_time_ms() -> i64 {
 /// Notify the coordinator that an MV refresh committed. Cheap no-op when the
 /// coordinator is not running (tests, disabled config).
 pub(crate) fn notify_refresh_completed(state: &Arc<StandaloneState>) {
-    if let Ok(guard) = state.maintenance_signal_tx.lock() {
-        if let Some(tx) = guard.as_ref() {
-            let _ = tx.send(MaintenanceSignal::Wake);
-        }
+    if let Ok(guard) = state.maintenance_signal_tx.lock()
+        && let Some(tx) = guard.as_ref()
+    {
+        let _ = tx.send(MaintenanceSignal::Wake);
     }
 }
 

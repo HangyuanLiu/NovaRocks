@@ -26,6 +26,10 @@ use crate::engine::{
 use crate::fs::object_store::ObjectStoreConfig;
 use crate::meta::repository::job::CreateIcebergOptimizeJobRequest;
 
+/// Return type shared by `resolve_maintenance_catalog` and `build_action_catalog`.
+pub(crate) type MaintenanceCatalogTriple =
+    (Arc<dyn Catalog>, TableIdent, Option<ObjectStoreConfig>);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum MaintenanceActionSource {
     SparkProcedure,
@@ -493,7 +497,7 @@ pub(crate) fn resolve_maintenance_catalog(
     catalog_name: &str,
     namespace: &str,
     table: &str,
-) -> Result<(Arc<dyn Catalog>, TableIdent, Option<ObjectStoreConfig>), String> {
+) -> Result<MaintenanceCatalogTriple, String> {
     let entry = {
         let registry = state
             .iceberg_catalogs
@@ -514,7 +518,7 @@ pub(crate) fn resolve_maintenance_catalog(
 fn build_action_catalog(
     state: &Arc<StandaloneState>,
     request: &MaintenanceActionRequest,
-) -> Result<(Arc<dyn Catalog>, TableIdent, Option<ObjectStoreConfig>), String> {
+) -> Result<MaintenanceCatalogTriple, String> {
     resolve_maintenance_catalog(state, &request.catalog, &request.namespace, &request.table)
 }
 
