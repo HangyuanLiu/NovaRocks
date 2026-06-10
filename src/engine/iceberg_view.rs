@@ -145,6 +145,37 @@ pub(crate) fn create_iceberg_view(
     Ok(StatementResult::Ok)
 }
 
+/// Drop a view on an iceberg REST catalog. `IF EXISTS` swallows an unknown
+/// view; dropping a name that is actually a table reports an explicit
+/// type-mismatch error so callers reach for `DROP TABLE` instead.
+pub(crate) fn drop_iceberg_view(
+    state: &Arc<StandaloneState>,
+    target: &IcebergViewTarget,
+    if_exists: bool,
+) -> Result<(), String> {
+    let backend = state
+        .connectors
+        .read()
+        .expect("connector registry read")
+        .catalog_backend("iceberg")?;
+    match backend.drop_view(&target.catalog, &target.namespace, &target.view) {
+        Ok(()) => Ok(()),
+        Err(err) if err.contains("unknown view") => {
+            if if_exists {
+                return Ok(());
+            }
+            if backend.table_exists(&target.catalog, &target.namespace, &target.view)? {
+                return Err(format!(
+                    "{}.{}.{} is a table, use DROP TABLE",
+                    target.catalog, target.namespace, target.view
+                ));
+            }
+            Err(err)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 /// Analyze the (already expanded) view body and return its user-visible output
 /// columns, skipping optimizer-internal pseudo-columns.
 fn analyze_view_query(

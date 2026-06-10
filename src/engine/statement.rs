@@ -1139,7 +1139,21 @@ pub(crate) fn execute_drop_table_statement(
             }
             Ok(StatementResult::Ok)
         }
-        Err(err) => Err(err),
+        Err(err) => {
+            // A DROP TABLE aimed at a view must say so instead of "unknown
+            // table" — views and tables are separate REST resources.
+            if target.backend_name == "iceberg"
+                && backend
+                    .view_exists(&target.catalog, &target.namespace, &target.table)
+                    .unwrap_or(false)
+            {
+                return Err(format!(
+                    "{}.{}.{} is a view, use DROP VIEW",
+                    target.catalog, target.namespace, target.table
+                ));
+            }
+            Err(err)
+        }
     }
 }
 

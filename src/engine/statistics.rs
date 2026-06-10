@@ -111,7 +111,7 @@ pub(crate) fn try_handle_statement(
         return handle_create_view(state, trimmed, current_catalog, current_database).map(Some);
     }
     if lower.starts_with("drop view ") {
-        return handle_drop_view(state, trimmed, current_database).map(Some);
+        return handle_drop_view(state, trimmed, current_catalog, current_database).map(Some);
     }
     if lower.starts_with("alter table ") && lower.contains("enable_statistic_collect_on_first_load")
     {
@@ -2293,6 +2293,7 @@ fn handle_create_view(
 fn handle_drop_view(
     state: &Arc<StandaloneState>,
     trimmed: &str,
+    current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<StatementResult, String> {
     use crate::sql::parser::dialect::StarRocksDialect;
@@ -2307,17 +2308,27 @@ fn handle_drop_view(
     let sqlparser::ast::Statement::Drop {
         object_type: sqlparser::ast::ObjectType::View,
         names,
+        if_exists,
         ..
     } = stmt
     else {
         return Err("DROP VIEW: failed to parse statement".to_string());
     };
-    let mut views = state
-        .views
-        .write()
-        .map_err(|e| format!("view registry write lock: {e}"))?;
     for name in names {
+        if let Some(target) = crate::engine::iceberg_view::resolve_iceberg_view_target(
+            state,
+            &name,
+            current_catalog,
+            current_database,
+        )? {
+            crate::engine::iceberg_view::drop_iceberg_view(state, &target, if_exists)?;
+            continue;
+        }
         let (db, view) = view_name_parts(&name, current_database)?;
+        let mut views = state
+            .views
+            .write()
+            .map_err(|e| format!("view registry write lock: {e}"))?;
         views.remove(&(db, view));
     }
     Ok(StatementResult::Ok)
