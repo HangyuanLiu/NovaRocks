@@ -17,7 +17,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
+
+static GLOBAL_REGISTRY: OnceLock<Arc<BackendRegistry>> = OnceLock::new();
 
 pub type BeId = u32;
 
@@ -259,6 +261,16 @@ impl BackendRegistry {
             .filter(|entry| entry.state == BackendState::Live)
             .count()
     }
+}
+
+/// Install the process registry (role=fe only). Idempotent: first writer wins.
+pub fn install_backend_registry(reg: Arc<BackendRegistry>) {
+    let _ = GLOBAL_REGISTRY.set(reg);
+}
+
+/// The process registry, if installed (role=fe).
+pub fn backend_registry() -> Option<Arc<BackendRegistry>> {
+    GLOBAL_REGISTRY.get().cloned()
 }
 
 #[cfg(test)]
