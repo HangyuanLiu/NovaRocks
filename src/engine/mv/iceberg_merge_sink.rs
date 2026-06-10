@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //! IVM-A1 merge sink: routes mixed +/- chunks to data-file writer or
-//! A9 target locator, accumulating `WrittenFile`s and `PositionDeleteGroup`s
-//! into a shared `IcebergCommitCollector`. Commit dispatch is owned by the
-//! refresh driver (not this sink) per design §3 / §5.
+//! A9 target locator, accumulating writer-reported files and
+//! `PositionDeleteGroup`s into a shared `IcebergCommitCollector`. Commit
+//! dispatch is owned by the refresh driver (not this sink) per design §3 / §5.
 
 use std::sync::Arc;
 
@@ -26,7 +26,9 @@ use arrow::record_batch::RecordBatch;
 use iceberg::spec::DataFile;
 
 use crate::connector::iceberg::commit::IcebergCommitCollector;
-use crate::connector::iceberg::data_writer::IcebergStreamingDataFileWriter;
+use crate::connector::iceberg::data_writer::{
+    IcebergStreamingDataFileWriter, written_file_to_sink_commit_info_for_metadata,
+};
 use crate::engine::iceberg_writer::data_file_to_written_file;
 use crate::exec::change_op::{CHANGE_OP_COLUMN, CHANGE_OP_DELETE, CHANGE_OP_INSERT};
 use crate::exec::chunk::Chunk;
@@ -171,15 +173,18 @@ impl ProcessorOperator for IcebergMergeSinkOperator {
     fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
         if let Some(writer) = self.writer.take() {
             let data_files: Vec<DataFile> = data_block_on(writer.finish())??;
-            let partition_spec_id = self
-                .plan
-                .target_table
-                .metadata()
-                .default_partition_spec_id();
-            for df in data_files {
-                let wf = data_file_to_written_file(&df, partition_spec_id)?;
-                self.plan.collector.inject_written_file(wf);
-            }
+            let metadata = self.plan.target_table.metadata();
+            let partition_spec_id = metadata.default_partition_spec_id();
+            let sink_commit_infos = data_files
+                .into_iter()
+                .map(|df| {
+                    let wf = data_file_to_written_file(&df, partition_spec_id)?;
+                    written_file_to_sink_commit_info_for_metadata(&wf, metadata)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            self.plan
+                .collector
+                .inject_sink_commit_infos(sink_commit_infos)?;
         }
         self.finished = true;
         Ok(())

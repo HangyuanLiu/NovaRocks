@@ -40,7 +40,7 @@ use crate::engine::statement::AddEqualityDeleteStmt;
 use crate::engine::write_transaction::{
     IcebergWriteCommitExecutor, IcebergWriteCommitPolicy, IcebergWriteSource,
     IcebergWriteTransactionExecutor, IcebergWriteTransactionRunner, IcebergWriteTransactionSpec,
-    IcebergWriteValidationPolicy, synthetic_write_commit_input,
+    IcebergWriteValidationPolicy, local_writer_commit_input, new_local_writer_write_id,
 };
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOperationTarget};
@@ -139,7 +139,6 @@ pub(crate) fn execute_add_equality_delete_statement(
     let executor = EqualityDeleteWriteExecutor {
         commit_executor,
         table,
-        collector,
         default_spec_id,
         plan: Mutex::new(Some((delete_columns, batch))),
     };
@@ -178,7 +177,6 @@ pub(crate) fn execute_add_equality_delete_statement(
 struct EqualityDeleteWriteExecutor {
     commit_executor: IcebergWriteCommitExecutor,
     table: iceberg::table::Table,
-    collector: Arc<IcebergCommitCollector>,
     default_spec_id: i32,
     plan: Mutex<Option<(Vec<EqualityDeleteColumn>, RecordBatch)>>,
 }
@@ -198,7 +196,7 @@ impl IcebergWriteTransactionExecutor for EqualityDeleteWriteExecutor {
         let Some(written) = block_on_iceberg(async {
             write_equality_delete_file(
                 &file_io,
-                &self.collector.staging_dir,
+                &self.commit_executor.collector.staging_dir,
                 self.default_spec_id,
                 delete_columns,
                 batch,
@@ -212,10 +210,17 @@ impl IcebergWriteTransactionExecutor for EqualityDeleteWriteExecutor {
                 write_abort: None,
             });
         };
-        self.collector.inject_written_file(written);
+        let sink_commit_info =
+            crate::connector::iceberg::data_writer::written_file_to_sink_commit_info(
+                &written,
+                self.table.metadata().default_partition_spec(),
+            )?;
         Ok(CoordinatedQueryResult {
             query_result: QueryResult::empty(),
-            write_commit: Some(synthetic_write_commit_input()),
+            write_commit: Some(local_writer_commit_input(
+                new_local_writer_write_id(),
+                vec![sink_commit_info],
+            )),
             write_abort: None,
         })
     }

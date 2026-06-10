@@ -337,10 +337,14 @@ impl IcebergCommitCollector {
             }
         };
 
+        let partition_spec_id = df
+            .partition_spec_id
+            .unwrap_or(self.partition_spec.spec_id());
         let partition_values = parse_partition_path(
             df.partition_path.as_deref().unwrap_or(""),
             &self.partition_spec,
             &self.schema,
+            df.partition_null_fingerprint.as_deref(),
         )?;
 
         let stats = df.column_stats.unwrap_or_default();
@@ -358,7 +362,7 @@ impl IcebergCommitCollector {
             format: DataFileFormat::Parquet,
             content,
             partition_values,
-            partition_spec_id: self.partition_spec.spec_id(),
+            partition_spec_id,
             record_count: df.record_count.unwrap_or(0).max(0) as u64,
             file_size_in_bytes: df.file_size_in_bytes.unwrap_or(0).max(0) as u64,
             split_offsets: df.split_offsets.unwrap_or_default(),
@@ -444,6 +448,7 @@ fn parse_partition_path(
     path: &str,
     spec: &PartitionSpecRef,
     schema: &SchemaRef,
+    null_fingerprint: Option<&str>,
 ) -> Result<Struct, String> {
     if path.is_empty() {
         return Ok(Struct::empty());
@@ -457,9 +462,19 @@ fn parse_partition_path(
             spec.fields().len()
         ));
     }
+    let null_fingerprint = null_fingerprint.filter(|fp| !fp.is_empty());
+    if let Some(fp) = null_fingerprint
+        && fp.len() != segments.len()
+    {
+        return Err(format!(
+            "partition_null_fingerprint length {} does not match partition_path segment count {}",
+            fp.len(),
+            segments.len()
+        ));
+    }
 
     let mut values: Vec<Option<Literal>> = Vec::with_capacity(spec.fields().len());
-    for (seg, field) in segments.iter().zip(spec.fields().iter()) {
+    for (idx, (seg, field)) in segments.iter().zip(spec.fields().iter()).enumerate() {
         let (_k, v) = seg
             .split_once('=')
             .ok_or_else(|| format!("partition_path segment `{seg}` is missing `=`"))?;
@@ -476,9 +491,26 @@ fn parse_partition_path(
                 field.source_id
             )
         })?;
-        let lit = parse_literal_for_type(v, &source_field.field_type)
-            .map_err(|e| format!("partition value `{v}` parse failed: {e}"))?;
-        values.push(Some(lit));
+        let is_null = match null_fingerprint.and_then(|fp| fp.as_bytes().get(idx)) {
+            Some(b'0') => false,
+            Some(b'1') => true,
+            Some(other) => {
+                return Err(format!(
+                    "partition_null_fingerprint contains invalid byte `{}` at index {}",
+                    *other as char, idx
+                ));
+            }
+            None => v == "__HIVE_DEFAULT_PARTITION__" || v == "null",
+        };
+        let lit = if is_null {
+            None
+        } else {
+            Some(
+                parse_literal_for_type(v, &source_field.field_type)
+                    .map_err(|e| format!("partition value `{v}` parse failed: {e}"))?,
+            )
+        };
+        values.push(lit);
     }
     Ok(Struct::from_iter(values))
 }
@@ -492,6 +524,11 @@ fn decode_partition_value(raw: &str) -> String {
     let bytes = raw.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
+        if bytes[i] == b'+' {
+            out.push(' ');
+            i += 1;
+            continue;
+        }
         if bytes[i] == b'%'
             && i + 2 < bytes.len()
             && let (Some(h), Some(l)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2]))
@@ -524,9 +561,6 @@ fn parse_literal_for_type(raw: &str, ty: &Type) -> Result<Literal, String> {
             ));
         }
     };
-    if raw == "__HIVE_DEFAULT_PARTITION__" || raw == "null" {
-        return Err("phase 1 does not support null partition values".to_string());
-    }
     match prim {
         PrimitiveType::Int => raw
             .parse::<i32>()
@@ -607,6 +641,7 @@ mod parity_tests {
             String::new(),
             "PARQUET".to_string(),
             crate::types::TIcebergFileContent::DATA,
+            Some(0),
         )
         .expect("thrift");
 
@@ -634,6 +669,7 @@ mod parity_tests {
             String::new(),
             "PARQUET".to_string(),
             crate::types::TIcebergFileContent::DATA,
+            Some(0),
         )
         .expect("thrift");
 
@@ -689,6 +725,7 @@ mod parity_tests {
             String::new(),
             "PARQUET".to_string(),
             crate::types::TIcebergFileContent::DATA,
+            Some(0),
         )
         .expect("thrift");
 
@@ -744,6 +781,7 @@ mod parity_tests {
             String::new(),
             "PARQUET".to_string(),
             crate::types::TIcebergFileContent::EQUALITY_DELETES,
+            Some(0),
         )
         .expect("thrift");
 
@@ -752,6 +790,7 @@ mod parity_tests {
 
         assert_eq!(expected, actual);
         assert_eq!(actual.equality_ids, Some(vec![1]));
+        assert_eq!(actual.partition_spec_id, 0);
     }
 
     fn identity_partition_spec(schema: &SchemaRef) -> PartitionSpecRef {
@@ -792,6 +831,7 @@ mod parity_tests {
             String::new(),
             "PARQUET".to_string(),
             crate::types::TIcebergFileContent::DATA,
+            Some(0),
         )
         .expect("thrift");
 
@@ -839,6 +879,7 @@ mod parity_tests {
             String::new(),
             "PARQUET".to_string(),
             crate::types::TIcebergFileContent::DATA,
+            Some(0),
         )
         .expect("thrift");
 
@@ -883,6 +924,7 @@ mod parity_tests {
             String::new(),
             "PARQUET".to_string(),
             crate::types::TIcebergFileContent::DATA,
+            Some(0),
         )
         .expect("thrift");
 
@@ -924,17 +966,37 @@ mod tests {
         (schema, Arc::new(spec))
     }
 
+    fn fixture_string_schema_and_spec() -> (SchemaRef, PartitionSpecRef) {
+        let schema: SchemaRef = Arc::new(
+            Schema::builder()
+                .with_schema_id(0)
+                .with_fields(vec![
+                    NestedField::required(1, "p", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::required(2, "v", Type::Primitive(PrimitiveType::String)).into(),
+                ])
+                .build()
+                .expect("build schema"),
+        );
+        let spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(0)
+            .add_partition_field("v", "v", Transform::Identity)
+            .expect("add partition field")
+            .build()
+            .expect("build partition spec");
+        (schema, Arc::new(spec))
+    }
+
     #[test]
     fn parse_empty_partition_path_returns_empty_struct() {
         let (schema, spec) = fixture_schema_and_spec();
-        let s = parse_partition_path("", &spec, &schema).expect("parse empty path");
+        let s = parse_partition_path("", &spec, &schema, None).expect("parse empty path");
         assert_eq!(s.fields().len(), 0);
     }
 
     #[test]
     fn parse_one_segment_identity_int() {
         let (schema, spec) = fixture_schema_and_spec();
-        let s = parse_partition_path("p=42", &spec, &schema).expect("parse identity int");
+        let s = parse_partition_path("p=42", &spec, &schema, None).expect("parse identity int");
         assert_eq!(s.fields().len(), 1);
         match &s.fields()[0] {
             Some(Literal::Primitive(_)) => {}
@@ -943,16 +1005,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_partition_path_uses_null_fingerprint() {
+        let (schema, spec) = fixture_string_schema_and_spec();
+
+        let literal = parse_partition_path("v=null", &spec, &schema, Some("0"))
+            .expect("parse non-null literal");
+        match &literal.fields()[0] {
+            Some(Literal::Primitive(iceberg::spec::PrimitiveLiteral::String(value))) => {
+                assert_eq!(value, "null");
+            }
+            other => panic!("expected string literal, got {other:?}"),
+        }
+
+        let null =
+            parse_partition_path("v=null", &spec, &schema, Some("1")).expect("parse null literal");
+        assert!(null.fields()[0].is_none());
+    }
+
+    #[test]
     fn rejects_segment_count_mismatch() {
         let (schema, spec) = fixture_schema_and_spec();
-        let r = parse_partition_path("p=1/q=2", &spec, &schema);
+        let r = parse_partition_path("p=1/q=2", &spec, &schema, None);
         assert!(r.is_err());
     }
 
     #[test]
     fn rejects_segment_without_equals_sign() {
         let (schema, spec) = fixture_schema_and_spec();
-        let r = parse_partition_path("p1", &spec, &schema);
+        let r = parse_partition_path("p1", &spec, &schema, None);
         assert!(r.is_err());
     }
 

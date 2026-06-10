@@ -506,6 +506,7 @@ impl IcebergTableSinkBackend {
                 first_row_id: None,
                 equality_ids: None,
                 key_metadata: None,
+                partition_spec_id: None,
             };
 
             let commit_info = types::TSinkCommitInfo {
