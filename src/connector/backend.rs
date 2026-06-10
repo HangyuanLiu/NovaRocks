@@ -33,6 +33,29 @@ pub(crate) struct CreateTableRequest {
     pub properties: Vec<(String, String)>,
 }
 
+/// Create-view request routed to a catalog backend.
+#[derive(Clone, Debug)]
+pub(crate) struct CreateViewRequest {
+    pub catalog: String,
+    pub namespace: String,
+    pub view: String,
+    pub columns: Vec<TableColumnDef>,
+    /// The view body as SQL text (StarRocks dialect).
+    pub view_sql: String,
+    pub comment: Option<String>,
+    pub or_replace: bool,
+}
+
+/// A view loaded through a catalog backend.
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedView {
+    pub sql: String,
+    pub dialect: String,
+    pub default_namespace: String,
+    pub column_names: Vec<String>,
+    pub comment: Option<String>,
+}
+
 /// Resolved table metadata returned by `CatalogBackend::load_table`. This is
 /// the subset of table shape the engine layer needs in order to plan INSERTs
 /// and to register the table with the in-memory logical catalog.
@@ -88,6 +111,38 @@ pub(crate) trait CatalogBackend: Send + Sync {
         _table: &str,
     ) -> Result<Option<i32>, String> {
         Ok(None)
+    }
+
+    fn create_view(&self, _req: CreateViewRequest) -> Result<(), String> {
+        Err(format!("{} backend does not support views", self.name()))
+    }
+
+    fn drop_view(&self, _catalog: &str, _namespace: &str, _view: &str) -> Result<(), String> {
+        Err(format!("{} backend does not support views", self.name()))
+    }
+
+    fn load_view(
+        &self,
+        _catalog: &str,
+        _namespace: &str,
+        _view: &str,
+    ) -> Result<ResolvedView, String> {
+        Err(format!("{} backend does not support views", self.name()))
+    }
+
+    /// Whether a view with this name exists. Backends without view support
+    /// report `false` so strict DROP-type checks degrade gracefully.
+    fn view_exists(
+        &self,
+        _catalog: &str,
+        _namespace: &str,
+        _view: &str,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    fn list_views(&self, _catalog: &str, _namespace: &str) -> Result<Vec<String>, String> {
+        Err(format!("{} backend does not support views", self.name()))
     }
 }
 
