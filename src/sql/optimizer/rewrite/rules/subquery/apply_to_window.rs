@@ -1920,6 +1920,12 @@ mod tests {
     }
 
     /// Recursively find any Window node in the plan tree.
+    ///
+    /// Test-only walker. Covers only the plan shapes the SubqueryRewrite stage can
+    /// emit (Filter/Sort/Project/Aggregate/Join/Limit inputs). The Apply case is
+    /// intentionally omitted: every caller asserts `find_residual_apply(..).is_none()`
+    /// first, so no Apply is present when this runs. Extend if a future rule emits a
+    /// Window under a variant not traversed here.
     fn find_window(plan: &LogicalPlan) -> bool {
         match plan {
             LogicalPlan::Window(_) => true,
@@ -1934,6 +1940,12 @@ mod tests {
     }
 
     /// Recursively find any LeftOuter Join node in the plan tree.
+    ///
+    /// Test-only walker. Covers only the plan shapes the SubqueryRewrite stage can
+    /// emit (Join/Filter/Sort/Project/Aggregate/Limit/Window inputs). The Apply case
+    /// is intentionally omitted: every caller asserts `find_residual_apply(..).is_none()`
+    /// first, so no Apply is present when this runs. Extend if a future rule emits a
+    /// LeftOuter join under a variant not traversed here.
     fn find_left_outer_join(plan: &LogicalPlan) -> bool {
         match plan {
             LogicalPlan::Join(n) if n.join_type == JoinKind::LeftOuter => true,

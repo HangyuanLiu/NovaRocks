@@ -229,6 +229,7 @@ mod tests {
         // M1b scalar decorrelation rules (Task 4).
         assert!(is_known_rewrite_rule_name("PushDownApplyAggFilter"));
         assert!(is_known_rewrite_rule_name("PushDownApplyFilter"));
+        // M2 window decorrelation rule.
         assert!(is_known_rewrite_rule_name("ApplyToWindow"));
         assert!(is_known_rewrite_rule_name("ScalarApplyToJoin"));
     }
