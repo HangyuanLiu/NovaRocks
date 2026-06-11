@@ -20,7 +20,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ptr;
 use std::sync::OnceLock;
 
-use crate::common::app_config::ServerConfig;
+use crate::common::app_config::{NovaRocksConfig, ServerConfig};
 use crate::novarocks_config::config as novarocks_app_config;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,14 +35,34 @@ struct LocalAddress {
     is_loopback: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdvertiseEndpoint {
+    pub host: String,
+    pub port: u16,
+}
+
 pub(crate) fn advertise_host() -> Result<String, String> {
     static ADVERTISE_HOST: OnceLock<Result<String, String>> = OnceLock::new();
     ADVERTISE_HOST
         .get_or_init(|| {
             let cfg = novarocks_app_config().map_err(|e| e.to_string())?;
-            advertise_host_for_server(&cfg.server)
+            advertise_endpoint_for_config(&cfg).map(|endpoint| endpoint.host)
         })
         .clone()
+}
+
+pub fn advertise_endpoint_for_config(cfg: &NovaRocksConfig) -> Result<AdvertiseEndpoint, String> {
+    let host = if cfg.cluster.advertise_host.trim().is_empty() {
+        advertise_host_for_server(&cfg.server)?
+    } else {
+        cfg.cluster.advertise_host.trim().to_string()
+    };
+    let port = if cfg.cluster.advertise_port == 0 {
+        cfg.server.starlet_port
+    } else {
+        cfg.cluster.advertise_port
+    };
+    Ok(AdvertiseEndpoint { host, port })
 }
 
 pub fn advertise_host_for_server(server: &ServerConfig) -> Result<String, String> {
@@ -240,7 +260,9 @@ fn mask_v6(addr: Ipv6Addr, prefix_len: u8) -> u128 {
 
 #[cfg(test)]
 mod tests {
-    use super::{LocalAddress, choose_advertise_host, format_host_for_url};
+    use super::{
+        LocalAddress, advertise_endpoint_for_config, choose_advertise_host, format_host_for_url,
+    };
     use std::net::IpAddr;
 
     fn addr(ip: &str, is_loopback: bool) -> LocalAddress {
@@ -317,5 +339,29 @@ mod tests {
     fn format_host_for_url_wraps_ipv6() {
         assert_eq!(format_host_for_url("2001:db8::1"), "[2001:db8::1]");
         assert_eq!(format_host_for_url("10.0.0.9"), "10.0.0.9");
+    }
+
+    #[test]
+    fn advertise_endpoint_prefers_cluster_override() {
+        let mut cfg = crate::common::app_config::NovaRocksConfig::default();
+        cfg.server.starlet_port = 9070;
+        cfg.cluster.advertise_host = "be.example.com".to_string();
+        cfg.cluster.advertise_port = 19070;
+
+        let endpoint = advertise_endpoint_for_config(&cfg).expect("resolve endpoint");
+        assert_eq!(endpoint.host, "be.example.com");
+        assert_eq!(endpoint.port, 19070);
+    }
+
+    #[test]
+    fn advertise_endpoint_uses_starlet_port_when_port_is_zero() {
+        let mut cfg = crate::common::app_config::NovaRocksConfig::default();
+        cfg.server.starlet_port = 19070;
+        cfg.cluster.advertise_host = "be.example.com".to_string();
+        cfg.cluster.advertise_port = 0;
+
+        let endpoint = advertise_endpoint_for_config(&cfg).expect("resolve endpoint");
+        assert_eq!(endpoint.host, "be.example.com");
+        assert_eq!(endpoint.port, 19070);
     }
 }

@@ -1546,11 +1546,37 @@ impl DataStreamSinkOperator {
         ) {
             accounting.transfer_to(Arc::clone(tracker));
         }
-        let dest_port = addr.port as u16;
-        let task = ExchangeSendTask {
-            dest_host: addr.hostname.to_string(),
+        let task = self.build_exchange_send_task(
+            addr.hostname.to_string(),
+            addr.port as u16,
+            dest_finst_id,
+            pending,
+            Arc::clone(error_state),
+        );
+        if allow_overflow {
+            exchange_send_queue().try_submit(task, true)?;
+            return Ok(PayloadEnqueue::Enqueued);
+        }
+        exchange_send_queue().submit_reserved(task, reserve_bytes)?;
+        Ok(PayloadEnqueue::Enqueued)
+    }
+
+    fn build_exchange_send_task(
+        &self,
+        dest_host: String,
+        dest_port: u16,
+        dest_finst_id: UniqueId,
+        pending: PendingPayload,
+        error_state: Arc<RuntimeErrorState>,
+    ) -> ExchangeSendTask {
+        ExchangeSendTask {
+            dest_host,
             dest_port,
             finst_id: dest_finst_id,
+            sender_finst_id: UniqueId {
+                hi: self.exec_params.fragment_instance_id.hi,
+                lo: self.exec_params.fragment_instance_id.lo,
+            },
             node_id: self.sink.dest_node_id,
             sender_id: self.sender_id,
             be_number: pending.be_number,
@@ -1562,15 +1588,9 @@ impl DataStreamSinkOperator {
             payload_bytes: pending.payload_bytes,
             profiles: self.profiles.clone(),
             notify: Arc::clone(&self.send_observable),
-            error_state: Arc::clone(error_state),
+            error_state,
             tracker: Arc::clone(&self.send_tracker),
-        };
-        if allow_overflow {
-            exchange_send_queue().try_submit(task, true)?;
-            return Ok(PayloadEnqueue::Enqueued);
         }
-        exchange_send_queue().submit_reserved(task, reserve_bytes)?;
-        Ok(PayloadEnqueue::Enqueued)
     }
 
     fn should_include_wire_meta(chunks_empty: bool) -> bool {
@@ -2147,6 +2167,26 @@ mod tests {
         )
     }
 
+    fn make_test_exchange_send_task() -> ExchangeSendTask {
+        let mut op = make_test_operator();
+        op.exec_params.fragment_instance_id = types::TUniqueId::new(81, 82);
+        op.build_exchange_send_task(
+            "127.0.0.1".to_string(),
+            9030,
+            UniqueId { hi: 91, lo: 92 },
+            PendingPayload {
+                be_number: 7,
+                payload: vec![1, 2, 3],
+                payload_bytes: 3,
+                encode_ns: 123,
+                sequence: 99,
+                eos: false,
+                accounting: None,
+            },
+            Arc::new(RuntimeErrorState::default()),
+        )
+    }
+
     fn zero_column_chunk_with_rows(row_count: usize) -> Chunk {
         let options = RecordBatchOptions::new().with_row_count(Some(row_count));
         let batch = arrow::array::RecordBatch::try_new_with_options(
@@ -2207,6 +2247,14 @@ mod tests {
             payload.be_number, 7,
             "pending payload must keep its encoded backend number, not current operator state"
         );
+    }
+
+    #[test]
+    fn exchange_send_task_carries_distinct_dest_and_sender_finsts() {
+        let task = make_test_exchange_send_task();
+
+        assert_eq!(task.finst_id, UniqueId { hi: 91, lo: 92 });
+        assert_eq!(task.sender_finst_id, UniqueId { hi: 81, lo: 82 });
     }
 
     #[test]

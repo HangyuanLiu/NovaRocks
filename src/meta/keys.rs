@@ -5,6 +5,7 @@ pub const NS_ICEBERG_CATALOG: &str = "iceberg_catalog";
 pub const NS_ICEBERG_OPERATION: &str = "iceberg.operation";
 pub const NS_JOB: &str = "job";
 pub const NS_DICTIONARY: &str = "dictionary";
+pub const NS_CLUSTER: &str = "cluster";
 
 pub fn normalize_lookup_name(value: &str) -> String {
     value.to_ascii_lowercase()

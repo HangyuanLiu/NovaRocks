@@ -49,3 +49,20 @@ pub use service::grpc_server::start_grpc_server;
 pub use service::internal_service::{
     cancel, submit_exec_batch_plan_fragments, submit_exec_plan_fragment,
 };
+
+pub(crate) fn cancel_query_by_id(query_id: crate::runtime::query_context::QueryId, reason: String) {
+    let finsts =
+        crate::runtime::query_context::query_context_manager().cancel_query(query_id, reason);
+    let cleanup: Vec<_> = finsts
+        .into_iter()
+        .map(|id| {
+            std::thread::spawn(move || {
+                crate::runtime::result_buffer::cancel(id);
+                crate::runtime::exchange::cancel_fragment(id.hi, id.lo);
+            })
+        })
+        .collect();
+    for handle in cleanup {
+        let _ = handle.join();
+    }
+}

@@ -18,6 +18,7 @@
 //! wiring exactly.
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use crate::data_sinks;
@@ -26,6 +27,7 @@ use crate::partitions;
 use crate::planner;
 use crate::runtime::dispatcher::{FetchOutcome, FragmentDispatcher};
 use crate::runtime::exec_params::build_exec_plan_fragment_params;
+use crate::runtime::query_state::QueryState;
 use crate::runtime::scheduler::FragmentScheduler;
 use crate::runtime::write_coordinator::{
     WriteAbortInput, WriteCommitInput, WriteCoordinator, WriterKey, register_query,
@@ -122,10 +124,20 @@ impl ExecutionCoordinator {
             );
         }
 
-        let mut plan = scheduler.assign(&fragment_results, &edges, query_id.clone())?;
-        scheduler.fill_destinations(&mut plan, &edges);
+        let live: Vec<(usize, std::net::SocketAddr)> =
+            match crate::runtime::backend_registry::backend_registry() {
+                Some(reg) => reg
+                    .live_endpoints()
+                    .into_iter()
+                    .map(|(be_id, ep)| (be_id as usize, ep))
+                    .collect(),
+                None => scheduler.backends().iter().copied().enumerate().collect(),
+            };
+        let mut plan =
+            scheduler.assign_with_live(&fragment_results, &edges, query_id.clone(), &live)?;
+        scheduler.fill_destinations_with_live(&mut plan, &edges, &live)?;
         if let Some(rf) = rf_plan.as_ref() {
-            scheduler.fill_runtime_filter_params(&mut plan, rf);
+            scheduler.fill_runtime_filter_params_with_live(&mut plan, rf, &live)?;
         }
         scheduler.fill_per_exch_num_senders(&mut plan, &edges);
 
@@ -181,7 +193,7 @@ impl ExecutionCoordinator {
         // The merge node is the backend that hosts the (single) root instance.
         // At one backend this equals the local exchange address, matching the
         // prior `dispatcher.exchange_addr()` behavior exactly.
-        let merge_addr = backend_to_network_addr(scheduler.backends(), plan.root_backend_idx)?;
+        let merge_addr = backend_to_network_addr(&live, plan.root_backend_idx)?;
         if rf_plan.is_some() {
             inject_runtime_filter_merge_nodes(&mut fragment_results, &merge_addr);
         }
@@ -201,13 +213,7 @@ impl ExecutionCoordinator {
                 let dests: Result<Vec<_>, String> = insts
                     .iter()
                     .map(|inst| {
-                        let addr = scheduler.backends().get(inst.backend_idx).ok_or_else(|| {
-                            format!(
-                                "backend idx {} out of range ({} backends)",
-                                inst.backend_idx,
-                                scheduler.backends().len()
-                            )
-                        })?;
+                        let addr = live_backend_addr(&live, inst.backend_idx)?;
                         Ok(data_sinks::TPlanFragmentDestination::new(
                             inst.finst_id.clone(),
                             None::<types::TNetworkAddress>,
@@ -323,14 +329,10 @@ impl ExecutionCoordinator {
                     (output_sink, unpartitioned_partition(), None)
                 };
 
-                let write_report_addr = if data_sink_requires_write_report(&output_sink) {
-                    if novarocks_report_addr.is_none() {
-                        novarocks_report_addr = Some(local_coordinator_report_addr()?);
-                    }
-                    novarocks_report_addr.clone()
-                } else {
-                    None
-                };
+                if novarocks_report_addr.is_none() {
+                    novarocks_report_addr = Some(local_coordinator_report_addr()?);
+                }
+                let report_addr = novarocks_report_addr.clone();
 
                 let thrift_fragment = planner::TPlanFragment::new(
                     Some(fr.plan.clone()),
@@ -367,7 +369,7 @@ impl ExecutionCoordinator {
                     query_options.clone(),
                     pipeline_dop,
                     Some(placement.instance_index as i32),
-                    write_report_addr,
+                    report_addr,
                 );
 
                 if is_write_sink(&params) {
@@ -416,6 +418,7 @@ impl ExecutionCoordinator {
             submissions,
             plan.root_backend_idx,
             plan.root_finst_id.clone(),
+            &query_id,
             timeout_ms,
             write_coordinator.as_ref(),
         )?;
@@ -570,19 +573,23 @@ fn validate_write_commit_ready(
 
 /// Convert `backends[idx]` into a `TNetworkAddress`.
 fn backend_to_network_addr(
-    backends: &[std::net::SocketAddr],
+    live: &[(usize, SocketAddr)],
     idx: usize,
 ) -> Result<types::TNetworkAddress, String> {
-    let addr = backends.get(idx).ok_or_else(|| {
-        format!(
-            "backend index {idx} out of range ({} backends)",
-            backends.len()
-        )
-    })?;
+    let addr = live_backend_addr(live, idx)?;
     Ok(types::TNetworkAddress::new(
         addr.ip().to_string(),
         addr.port() as i32,
     ))
+}
+
+fn live_backend_addr(
+    live: &[(usize, SocketAddr)],
+    backend_idx: usize,
+) -> Result<SocketAddr, String> {
+    live.iter()
+        .find_map(|(idx, addr)| (*idx == backend_idx).then_some(*addr))
+        .ok_or_else(|| format!("backend index {backend_idx} missing from live snapshot"))
 }
 
 fn local_coordinator_report_addr() -> Result<types::TNetworkAddress, String> {
@@ -710,6 +717,16 @@ pub(crate) struct SubmitAndFetchResult {
     pub(crate) write_abort: Option<WriteAbortInput>,
 }
 
+struct QueryStateRegistrationGuard {
+    query_id: crate::runtime::query_context::QueryId,
+}
+
+impl Drop for QueryStateRegistrationGuard {
+    fn drop(&mut self) {
+        crate::runtime::query_state::in_flight_table().forget(self.query_id);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Submit-and-fetch orchestration (testable helper)
 // ---------------------------------------------------------------------------
@@ -725,10 +742,17 @@ pub(crate) fn submit_and_fetch_loop(
     submissions: Vec<(usize, crate::internal_service::TExecPlanFragmentParams)>,
     root_backend_idx: usize,
     root_finst_id: types::TUniqueId,
+    query_id: &types::TUniqueId,
     timeout_ms: i64,
     write_coordinator: Option<&Arc<Mutex<WriteCoordinator>>>,
 ) -> Result<SubmitAndFetchResult, String> {
     const REMOTE_FETCH_POLL_INTERVAL_MS: i64 = 300;
+    let _query_state_guard = QueryStateRegistrationGuard {
+        query_id: crate::runtime::query_context::QueryId {
+            hi: query_id.hi,
+            lo: query_id.lo,
+        },
+    };
 
     for (backend_idx, p) in submissions {
         let finst_id = p
@@ -740,7 +764,23 @@ pub(crate) fn submit_and_fetch_loop(
             tracker.cancel_all(dispatcher.as_ref());
             return Err(e);
         }
-        tracker.record_submitted(backend_idx, finst_id);
+        crate::service::metrics_http::observe_fragment_scheduled();
+        if let Some(registry) = crate::runtime::backend_registry::backend_registry() {
+            registry
+                .record_scheduled_fragment(backend_idx as crate::runtime::backend_registry::BeId);
+        }
+        tracker.record_submitted(backend_idx, finst_id.clone());
+        crate::runtime::query_state::in_flight_table().register(
+            crate::runtime::query_context::QueryId {
+                hi: query_id.hi,
+                lo: query_id.lo,
+            },
+            crate::common::types::UniqueId {
+                hi: finst_id.hi,
+                lo: finst_id.lo,
+            },
+            backend_idx,
+        );
     }
 
     let mut chunks = Vec::new();
@@ -763,6 +803,17 @@ pub(crate) fn submit_and_fetch_loop(
         if crate::runtime::query_cancel::client_disconnected() {
             tracker.cancel_all(dispatcher.as_ref());
             return Err("client disconnected".to_string());
+        }
+        let qid = crate::runtime::query_context::QueryId {
+            hi: query_id.hi,
+            lo: query_id.lo,
+        };
+        if crate::runtime::query_state::in_flight_table().state(qid) == Some(QueryState::Failed) {
+            let reason = crate::runtime::query_state::in_flight_table()
+                .failure_reason(qid)
+                .unwrap_or_else(|| format!("query {} failed", qid));
+            tracker.cancel_all(dispatcher.as_ref());
+            return Err(reason);
         }
         let now = std::time::Instant::now();
         if now >= deadline {
@@ -922,7 +973,7 @@ fn notify_write_commit_wait_observer(commit_error: &str) {
 mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::*;
     use crate::runtime::dispatcher::{FetchOutcome, FragmentDispatcher};
@@ -1066,6 +1117,38 @@ mod tests {
         }
     }
 
+    struct QueryStateFailureDispatcher {
+        submitted: Mutex<Vec<types::TUniqueId>>,
+        cancelled: Mutex<Vec<types::TUniqueId>>,
+        fetch_count: AtomicUsize,
+        first_fetch: AtomicBool,
+        failure_reason: String,
+    }
+
+    impl QueryStateFailureDispatcher {
+        fn new(reason: impl Into<String>) -> Arc<Self> {
+            Arc::new(Self {
+                submitted: Mutex::new(Vec::new()),
+                cancelled: Mutex::new(Vec::new()),
+                fetch_count: AtomicUsize::new(0),
+                first_fetch: AtomicBool::new(true),
+                failure_reason: reason.into(),
+            })
+        }
+
+        fn cancelled_ids(&self) -> Vec<types::TUniqueId> {
+            self.cancelled.lock().unwrap().clone()
+        }
+
+        fn submitted_ids(&self) -> Vec<types::TUniqueId> {
+            self.submitted.lock().unwrap().clone()
+        }
+
+        fn fetch_count(&self) -> usize {
+            self.fetch_count.load(Ordering::SeqCst)
+        }
+    }
+
     struct RecordingWaitDispatcher {
         submitted: Mutex<Vec<types::TUniqueId>>,
         fetch_waits_ms: Mutex<Vec<i64>>,
@@ -1138,6 +1221,52 @@ mod tests {
                 FetchBehavior::Eof => Ok(FetchOutcome::Eof),
                 FetchBehavior::Err(msg) => Ok(FetchOutcome::Err(msg.clone())),
                 FetchBehavior::NotReady => Ok(FetchOutcome::NotReady),
+            }
+        }
+
+        fn cancel_fragments(&self, _backend_idx: usize, finst_ids: &[types::TUniqueId]) {
+            self.cancelled.lock().unwrap().extend_from_slice(finst_ids);
+        }
+
+        fn backend_count(&self) -> usize {
+            1
+        }
+    }
+
+    impl FragmentDispatcher for QueryStateFailureDispatcher {
+        fn submit_fragment(
+            &self,
+            _backend_idx: usize,
+            params: crate::internal_service::TExecPlanFragmentParams,
+        ) -> Result<(), String> {
+            let finst_id = params
+                .params
+                .as_ref()
+                .map(|ep| {
+                    types::TUniqueId::new(ep.fragment_instance_id.hi, ep.fragment_instance_id.lo)
+                })
+                .unwrap_or_else(|| types::TUniqueId::new(0, 0));
+            self.submitted.lock().unwrap().push(finst_id);
+            Ok(())
+        }
+
+        fn fetch_result(
+            &self,
+            _backend_idx: usize,
+            finst_id: types::TUniqueId,
+            _max_wait_ms: i64,
+        ) -> Result<FetchOutcome, String> {
+            self.fetch_count.fetch_add(1, Ordering::SeqCst);
+            if self.first_fetch.swap(false, Ordering::SeqCst) {
+                let finst = crate::common::types::UniqueId {
+                    hi: finst_id.hi,
+                    lo: finst_id.lo,
+                };
+                crate::runtime::query_state::in_flight_table()
+                    .on_fragment_done(finst, Err(self.failure_reason.clone()));
+                Ok(FetchOutcome::NotReady)
+            } else {
+                panic!("fetch_result called after query state failure should have been observed");
             }
         }
 
@@ -1345,6 +1474,10 @@ mod tests {
 
     fn id(hi: i64, lo: i64) -> types::TUniqueId {
         types::TUniqueId::new(hi, lo)
+    }
+
+    fn runtime_query_id(hi: i64, lo: i64) -> crate::runtime::query_context::QueryId {
+        crate::runtime::query_context::QueryId { hi, lo }
     }
 
     fn writer_key(
@@ -1668,6 +1801,7 @@ mod tests {
             params,
             0,
             root_finst_id,
+            &types::TUniqueId::new(740, 741),
             1_000,
             Some(&write),
         );
@@ -1733,6 +1867,7 @@ mod tests {
             params,
             0,
             root_finst_id,
+            &query_id,
             1_000,
             Some(&write),
         )
@@ -1813,6 +1948,7 @@ mod tests {
             params,
             0,
             root_finst_id,
+            &types::TUniqueId::new(780, 781),
             1_000,
             Some(&write),
         )
@@ -1873,6 +2009,7 @@ mod tests {
             params,
             0,
             root_finst_id,
+            &types::TUniqueId::new(750, 751),
             25,
             Some(&write),
         )
@@ -1929,6 +2066,8 @@ mod tests {
     fn execute_submits_all_fragments_and_fetches_to_eof() {
         let inner = ControllableDispatcher::succeeds_always_eof();
         let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
+        let query_id = types::TUniqueId::new(1, 99);
+        let runtime_query_id = runtime_query_id(query_id.hi, query_id.lo);
         let root_finst_id = types::TUniqueId::new(1, 1);
         let params = single_backend(vec![
             make_params_with_finst(1, 10),
@@ -1941,6 +2080,7 @@ mod tests {
             params,
             0,
             root_finst_id,
+            &query_id,
             100,
             None,
         );
@@ -1963,6 +2103,11 @@ mod tests {
             2,
             "both fragments must be submitted"
         );
+        assert_eq!(
+            crate::runtime::query_state::in_flight_table().state(runtime_query_id),
+            None,
+            "submit_and_fetch_loop must forget query_state entries on success"
+        );
     }
 
     /// I2: When the second submit fails, the coordinator cancels the first
@@ -1983,6 +2128,7 @@ mod tests {
             params,
             0,
             root_finst_id,
+            &types::TUniqueId::new(2, 99),
             100,
             None,
         );
@@ -2003,6 +2149,11 @@ mod tests {
         );
         assert_eq!(cancelled[0].hi, 2);
         assert_eq!(cancelled[0].lo, 10);
+        assert_eq!(
+            crate::runtime::query_state::in_flight_table().state(runtime_query_id(2, 99)),
+            None,
+            "submit_and_fetch_loop must forget query_state entries on submit failure"
+        );
     }
 
     /// I3: When fetch returns FetchOutcome::Err, all submitted fragment
@@ -2023,6 +2174,7 @@ mod tests {
             params,
             0,
             root_finst_id,
+            &types::TUniqueId::new(3, 99),
             100,
             None,
         );
@@ -2062,6 +2214,7 @@ mod tests {
             params,
             0,
             root_finst_id,
+            &types::TUniqueId::new(4, 99),
             10,
             None,
         );
@@ -2084,6 +2237,50 @@ mod tests {
     }
 
     #[test]
+    fn execute_aborts_before_second_fetch_when_query_state_failed() {
+        let inner = QueryStateFailureDispatcher::new("remote query failed");
+        let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
+        let root_finst_id = types::TUniqueId::new(8, 1);
+        let params = single_backend(vec![
+            make_params_with_finst(8, 10),
+            make_params_with_finst(8, 1),
+        ]);
+        let mut tracker = InFlightTracker::default();
+
+        let result = submit_and_fetch_loop(
+            &dispatcher,
+            &mut tracker,
+            params,
+            0,
+            root_finst_id,
+            &types::TUniqueId::new(8, 99),
+            100,
+            None,
+        );
+
+        let err = result.expect_err("query state failure must propagate");
+        assert!(
+            err.contains("remote query failed"),
+            "error should contain failure reason, got: {err}"
+        );
+        assert_eq!(
+            inner.fetch_count(),
+            1,
+            "coordinator must stop before the second fetch after observing query failure"
+        );
+        assert_eq!(
+            inner.submitted_ids().len(),
+            2,
+            "both fragments should have been submitted before failure is observed"
+        );
+        assert_eq!(
+            inner.cancelled_ids().len(),
+            2,
+            "query_state failure must cancel all submitted fragments"
+        );
+    }
+
+    #[test]
     fn fetch_loop_caps_remote_waits_below_full_timeout() {
         let inner = RecordingWaitDispatcher::new();
         let dispatcher: Arc<dyn FragmentDispatcher> = inner.clone();
@@ -2100,6 +2297,7 @@ mod tests {
             params,
             0,
             root_finst_id,
+            &types::TUniqueId::new(6, 99),
             300_000,
             None,
         );
@@ -2137,6 +2335,7 @@ mod tests {
                     params,
                     0,
                     root_finst_id,
+                    &types::TUniqueId::new(5, 99),
                     100,
                     None,
                 )

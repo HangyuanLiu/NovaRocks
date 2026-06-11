@@ -29,7 +29,7 @@ use crate::runtime::global_async_runtime::{data_block_on, data_runtime_handle};
 
 pub use crate::service::grpc_proto as proto;
 
-/// gRPC client for the three D1 distributed-execution RPCs.
+/// gRPC client for NovaRocks BE-to-BE and coordinator RPCs.
 ///
 /// Wraps the tonic async client with blocking wrappers so that PR-4's
 /// `RemoteDispatcher` can drive it from a non-async context.  One
@@ -164,6 +164,34 @@ impl NovaRocksGrpcRemoteClient {
             .await
             .map(|r| r.into_inner())
             .map_err(|e| format!("cancel_fragment rpc failed: {e}"))
+    }
+
+    pub async fn heartbeat_async(
+        &self,
+        req: proto::novarocks::HeartbeatRequest,
+    ) -> Result<proto::novarocks::HeartbeatResponse, String> {
+        let mut cli = self.make_async_client().await?;
+        let mut req = Request::new(req);
+        req.set_timeout(Duration::from_secs(3));
+        cli.heartbeat(req)
+            .await
+            .map(|r| r.into_inner())
+            .map_err(|e| format!("heartbeat rpc failed: {e}"))
+    }
+
+    pub fn blocking_heartbeat(
+        &self,
+        req: proto::novarocks::HeartbeatRequest,
+    ) -> Result<proto::novarocks::HeartbeatResponse, String> {
+        let mut cli = self.make_client()?;
+        data_block_on(async move {
+            let mut req = Request::new(req);
+            req.set_timeout(Duration::from_secs(3));
+            cli.heartbeat(req)
+                .await
+                .map(|r| r.into_inner())
+                .map_err(|e| format!("heartbeat rpc failed: {e}"))
+        })?
     }
 }
 

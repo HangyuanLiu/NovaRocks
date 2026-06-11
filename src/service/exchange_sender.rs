@@ -64,6 +64,7 @@ pub struct ExchangeSendTask {
     pub dest_host: String,
     pub dest_port: u16,
     pub finst_id: UniqueId,
+    pub sender_finst_id: UniqueId,
     pub node_id: i32,
     pub sender_id: i32,
     pub be_number: i32,
@@ -323,12 +324,24 @@ fn run_send_task(task: ExchangeSendTask, inflight: Arc<AtomicUsize>, reserve_byt
         );
     }
 
+    if result.is_ok() {
+        crate::service::metrics_http::observe_exchange_shuffle_bytes(task.payload_bytes);
+    }
+
     if let Err(err) = result {
         task.error_state.set_error(err.clone());
         error!(
-            "exchange send failed: dest={} finst={} node_id={} sender_id={} seq={} error={}",
-            task.dest_host, task.finst_id, task.node_id, task.sender_id, task.sequence, err
+            "exchange send failed: dest={} dest_finst={} sender_finst={} node_id={} sender_id={} seq={} error={}",
+            task.dest_host,
+            task.finst_id,
+            task.sender_finst_id,
+            task.node_id,
+            task.sender_id,
+            task.sequence,
+            err
         );
+        crate::runtime::query_context::query_context_manager()
+            .propagate_sender_error(task.sender_finst_id, err);
     } else {
         debug!(
             "exchange send completed: dest={} finst={} node_id={} sender_id={} eos={} seq={} bytes={}",

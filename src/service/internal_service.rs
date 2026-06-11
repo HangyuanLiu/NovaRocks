@@ -1631,7 +1631,17 @@ pub fn cancel(finst_id: UniqueId) {
 
     for id in &target_finsts {
         result_buffer::cancel(*id);
-        exchange::cancel_fragment(id.hi, id.lo);
+    }
+
+    let cleanup: Vec<_> = target_finsts
+        .iter()
+        .map(|id| {
+            let id = *id;
+            std::thread::spawn(move || exchange::cancel_fragment(id.hi, id.lo))
+        })
+        .collect();
+    for h in cleanup {
+        let _ = h.join();
     }
 
     // Fallback cleanup for detached/unknown finst that cannot be mapped to a query context.
@@ -1661,6 +1671,7 @@ mod tests {
         common::types::UniqueId,
         data_sinks, descriptors, exprs, internal_service, partitions, plan_nodes, planner,
         runtime::{
+            exchange::{ExchangeKey, set_expected_senders, snapshot_receiver_state},
             query_context::{QueryId, query_context_manager},
             result_buffer::{self, FetchErrorKind, TryFetchResult},
         },
@@ -1699,6 +1710,46 @@ mod tests {
             "{}",
             err.message
         );
+    }
+
+    #[test]
+    fn cancel_fanout_tests() {
+        let query_id = QueryId { hi: 7011, lo: 7012 };
+        let finst_a = UniqueId { hi: 7013, lo: 7014 };
+        let finst_b = UniqueId { hi: 7015, lo: 7016 };
+        let key_a = ExchangeKey {
+            finst_id_hi: finst_a.hi,
+            finst_id_lo: finst_a.lo,
+            node_id: 51,
+        };
+        let key_b = ExchangeKey {
+            finst_id_hi: finst_b.hi,
+            finst_id_lo: finst_b.lo,
+            node_id: 52,
+        };
+
+        let mgr = query_context_manager();
+        mgr.register_finst(finst_a, query_id);
+        mgr.register_finst(finst_b, query_id);
+        set_expected_senders(key_a, 1);
+        set_expected_senders(key_b, 1);
+
+        assert!(snapshot_receiver_state(key_a).is_some());
+        assert!(snapshot_receiver_state(key_b).is_some());
+
+        super::cancel(finst_a);
+
+        assert!(
+            snapshot_receiver_state(key_a).is_none(),
+            "target finst receiver must be canceled"
+        );
+        assert!(
+            snapshot_receiver_state(key_b).is_none(),
+            "peer finst receiver must be canceled"
+        );
+
+        mgr.unregister_finst(finst_a);
+        mgr.unregister_finst(finst_b);
     }
 
     fn address(host: &str, port: i32) -> types::TNetworkAddress {

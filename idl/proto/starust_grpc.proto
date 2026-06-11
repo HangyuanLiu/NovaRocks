@@ -16,6 +16,8 @@ service NovaRocksGrpc {
   rpc SubmitFragment(SubmitFragmentRequest) returns (SubmitFragmentResponse);
   rpc FetchResult(FetchResultRequest) returns (FetchResultResponse);
   rpc CancelFragment(CancelFragmentRequest) returns (CancelFragmentResponse);
+  // D3 cluster heartbeat (FE-pull, unary).
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 
   // IW-4 distributed write coordinator report RPCs.
   rpc ReportExecStatus(ReportExecStatusRequest)
@@ -78,10 +80,23 @@ message FetchResultResponse {
 message CancelFragmentRequest {
   repeated PUniqueId finst_ids = 1;
   string reason = 2;
+  uint64 start_epoch = 3;
 }
 
 message CancelFragmentResponse {
   int32 status_code = 1;
+}
+
+message HeartbeatRequest {
+  uint32 assigned_be_id = 1;
+  int64 fe_epoch = 2;
+}
+
+message HeartbeatResponse {
+  uint64 start_epoch = 1;
+  string version = 2;
+  uint32 num_cores = 3;
+  int32 status_code = 4;
 }
 
 message ReportExecStatusRequest {

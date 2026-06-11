@@ -34,6 +34,10 @@ use crate::engine::statement::{
 };
 use crate::engine::{StandaloneNovaRocks, StandaloneOptions, StatementResult};
 use crate::sql::optimizer::options::SessionOptimizerSettings;
+use crate::sql::parser::dialect::StarRocksDialect;
+use crate::sql::parser::dialect::backend::{
+    looks_like_add_backend, looks_like_drop_backend, looks_like_show_backends,
+};
 
 const DEFAULT_MYSQL_PORT: u16 = 9030;
 const DEFAULT_CATALOG: &str = "default_catalog";
@@ -640,6 +644,16 @@ fn is_session_noop(query: &str) -> bool {
     lower.starts_with("set ") || lower.starts_with("show ") || lower.starts_with("submit ")
 }
 
+fn is_backend_management_statement(query: &str) -> bool {
+    let dialect = StarRocksDialect;
+    let Ok(parser) = sqlparser::parser::Parser::new(&dialect).try_with_sql(query) else {
+        return false;
+    };
+    looks_like_add_backend(&parser)
+        || looks_like_drop_backend(&parser)
+        || looks_like_show_backends(&parser)
+}
+
 fn is_materialized_view_management_statement(query: &str) -> bool {
     let lower = query.to_ascii_lowercase();
     lower.starts_with("create materialized view ")
@@ -1078,6 +1092,7 @@ async fn execute_statement_text(
     }
 
     if is_session_noop(trimmed)
+        && !is_backend_management_statement(trimmed)
         && !is_materialized_view_management_statement(trimmed)
         && !looks_like_show_alter_table_optimize(trimmed)
         && !looks_like_show_create_table(trimmed)
@@ -1104,6 +1119,7 @@ async fn execute_statement_text(
         .map_err(|err| (ErrorKind::ER_PARSE_ERROR, err))?;
 
     if !is_supported_embedded_statement(&rewritten)
+        && !is_backend_management_statement(&rewritten)
         && !is_materialized_view_management_statement(&rewritten)
         && !looks_like_show_alter_table_optimize(&rewritten)
         && !looks_like_show_create_table(&rewritten)
@@ -1620,6 +1636,22 @@ mod tests {
         let sql = "CALL ice.system.rewrite_manifests(table => 'ns.orders')";
         assert!(!is_session_noop(sql));
         assert!(is_supported_embedded_statement(sql));
+    }
+
+    #[test]
+    fn backend_management_reaches_embedded_engine() {
+        assert!(
+            is_backend_management_statement("ADD BACKEND '127.0.0.1:19050'"),
+            "ADD BACKEND must bypass the standalone-server unsupported-SQL gate"
+        );
+        assert!(
+            is_backend_management_statement("DROP BACKEND '127.0.0.1:19050' FORCE"),
+            "DROP BACKEND must route to the engine-owned parser"
+        );
+        assert!(
+            is_backend_management_statement("SHOW BACKENDS"),
+            "SHOW BACKENDS must not be swallowed as a session no-op"
+        );
     }
 
     #[test]

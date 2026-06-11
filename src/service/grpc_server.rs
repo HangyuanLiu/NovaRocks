@@ -40,7 +40,7 @@ use crate::connector::starrocks::starmgr;
 use crate::novarocks_logging::{error, info, warn};
 use crate::runtime::starlet_shard_registry;
 use crate::service::internal_rpc;
-use crate::service::{load_tracking_http, stream_load_http};
+use crate::service::{load_tracking_http, metrics_http, stream_load_http};
 
 pub use crate::service::grpc_proto as proto;
 
@@ -48,6 +48,8 @@ const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const REPORT_EXEC_STATUS_OK: i32 = 0;
 pub(crate) const REPORT_EXEC_STATUS_ERROR: i32 = 1;
 pub(crate) const REPORT_EXEC_STATUS_QUERY_GONE: i32 = 2;
+const CANCEL_FRAGMENT_OK: i32 = 0;
+const CANCEL_FRAGMENT_IGNORED_STALE_EPOCH: i32 = 2;
 static SUBMIT_FRAGMENT_CALLS: AtomicUsize = AtomicUsize::new(0);
 static FETCH_RESULT_CALLS: AtomicUsize = AtomicUsize::new(0);
 static CANCEL_FRAGMENT_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -396,6 +398,13 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
     ) -> Result<tonic::Response<proto::novarocks::CancelFragmentResponse>, tonic::Status> {
         self.require_local_execution("CancelFragment")?;
         let req = request.into_inner();
+        if req.start_epoch != 0 && req.start_epoch != crate::runtime::start_epoch::start_epoch() {
+            return Ok(tonic::Response::new(
+                proto::novarocks::CancelFragmentResponse {
+                    status_code: CANCEL_FRAGMENT_IGNORED_STALE_EPOCH,
+                },
+            ));
+        }
         for id in &req.finst_ids {
             crate::cancel(crate::UniqueId {
                 hi: id.hi,
@@ -413,8 +422,26 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
             let _ = std::io::Write::flush(&mut std::io::stdout());
         }
         Ok(tonic::Response::new(
-            proto::novarocks::CancelFragmentResponse { status_code: 0 },
+            proto::novarocks::CancelFragmentResponse {
+                status_code: CANCEL_FRAGMENT_OK,
+            },
         ))
+    }
+
+    async fn heartbeat(
+        &self,
+        request: tonic::Request<proto::novarocks::HeartbeatRequest>,
+    ) -> Result<tonic::Response<proto::novarocks::HeartbeatResponse>, tonic::Status> {
+        let _req = request.into_inner();
+        let num_cores = std::thread::available_parallelism()
+            .map(|n| n.get() as u32)
+            .unwrap_or(1);
+        Ok(tonic::Response::new(proto::novarocks::HeartbeatResponse {
+            start_epoch: crate::runtime::start_epoch::start_epoch(),
+            version: crate::version::short_version().to_string(),
+            num_cores,
+            status_code: 0,
+        }))
     }
 
     async fn report_exec_status(
@@ -596,6 +623,7 @@ fn build_novarocks_http_app(grpc_routes: Routes) -> Router {
             "/api/_load_tracking/:hi/:lo",
             get(load_tracking_http::handle_load_tracking_log),
         )
+        .route("/metrics", get(metrics_http::handle_metrics))
 }
 
 #[tonic::async_trait]
@@ -1057,6 +1085,7 @@ fn start_standalone_grpc_server(
                     "/api/_load_tracking/:hi/:lo",
                     get(load_tracking_http::handle_load_tracking_log),
                 )
+                .route("/metrics", get(metrics_http::handle_metrics))
                 .fallback(grpc_unimplemented_fallback);
             let server = axum::serve(listener, app).with_graceful_shutdown(async move {
                     while !*shutdown.borrow() {
@@ -1198,8 +1227,8 @@ mod pr3_tests {
     use super::proto::novarocks::fetch_result_response::Status as FetchStatus;
     use super::proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc as _;
     use super::proto::novarocks::{
-        CancelFragmentRequest, FetchResultRequest, PUniqueId, ReportExecStatusRequest,
-        SubmitFragmentRequest,
+        CancelFragmentRequest, FetchResultRequest, HeartbeatRequest, PUniqueId,
+        ReportExecStatusRequest, SubmitFragmentRequest,
     };
     use crate::common::thrift::thrift_binary_serialize;
     use crate::{frontend_service, status, status_code, types};
@@ -1234,6 +1263,49 @@ mod pr3_tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn write_report_params(
+        query: types::TUniqueId,
+        finst: types::TUniqueId,
+    ) -> frontend_service::TReportExecStatusParams {
+        frontend_service::TReportExecStatusParams::new(
+            frontend_service::FrontendServiceVersion::V1,
+            Some(query),
+            Some(0),
+            Some(finst),
+            Some(status::TStatus::new(status_code::TStatusCode::OK, None)),
+            Some(true),
+            None,
+            Option::<Vec<String>>::None,
+            Option::<Vec<String>>::None,
+            None,
+            None,
+            Option::<Vec<String>>::None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(vec![types::TSinkCommitInfo {
+                iceberg_data_file: Some(types::TIcebergDataFile {
+                    path: Some("s3://w/grpc-query-gone.parquet".to_string()),
+                    record_count: Some(1),
+                    file_size_in_bytes: Some(1),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
             None,
             None,
             None,
@@ -1275,16 +1347,88 @@ mod pr3_tests {
         let req = Request::new(CancelFragmentRequest {
             finst_ids: vec![PUniqueId { hi: 1, lo: 2 }],
             reason: "test".to_string(),
+            start_epoch: 0,
         });
         let resp = svc.cancel_fragment(req).await.expect("RPC success");
-        assert_eq!(resp.into_inner().status_code, 0);
+        assert_eq!(resp.into_inner().status_code, super::CANCEL_FRAGMENT_OK);
 
         let req2 = Request::new(CancelFragmentRequest {
             finst_ids: vec![PUniqueId { hi: 1, lo: 2 }],
             reason: "test-2".to_string(),
+            start_epoch: 0,
         });
         let resp2 = svc.cancel_fragment(req2).await.expect("RPC success");
-        assert_eq!(resp2.into_inner().status_code, 0);
+        assert_eq!(resp2.into_inner().status_code, super::CANCEL_FRAGMENT_OK);
+    }
+
+    mod cancel_epoch_tests {
+        use super::super::proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc as _;
+        use super::super::proto::novarocks::{CancelFragmentRequest, PUniqueId};
+        use super::super::{CANCEL_FRAGMENT_IGNORED_STALE_EPOCH, GrpcService};
+        use crate::common::types::UniqueId;
+        use crate::runtime::exchange::{
+            self, ExchangeKey, set_expected_senders, snapshot_receiver_state,
+        };
+        use tonic::Request;
+
+        struct ExchangeCleanup(UniqueId);
+
+        impl Drop for ExchangeCleanup {
+            fn drop(&mut self) {
+                exchange::cancel_fragment(self.0.hi, self.0.lo);
+            }
+        }
+
+        #[tokio::test]
+        async fn cancel_with_mismatched_epoch_is_ignored() {
+            let svc = GrpcService::default();
+            let finst = PUniqueId { hi: 6201, lo: 6202 };
+            let key = ExchangeKey {
+                finst_id_hi: finst.hi,
+                finst_id_lo: finst.lo,
+                node_id: 6203,
+            };
+            set_expected_senders(key, 1);
+            let _cleanup = ExchangeCleanup(UniqueId {
+                hi: finst.hi,
+                lo: finst.lo,
+            });
+            assert!(snapshot_receiver_state(key).is_some());
+
+            let mut stale_epoch = crate::runtime::start_epoch::start_epoch().wrapping_add(1);
+            if stale_epoch == 0 {
+                stale_epoch = stale_epoch.wrapping_add(1);
+            }
+
+            let resp = svc
+                .cancel_fragment(Request::new(CancelFragmentRequest {
+                    finst_ids: vec![finst],
+                    reason: "stale epoch".to_string(),
+                    start_epoch: stale_epoch,
+                }))
+                .await
+                .expect("RPC success")
+                .into_inner();
+
+            assert_eq!(resp.status_code, CANCEL_FRAGMENT_IGNORED_STALE_EPOCH);
+            assert!(snapshot_receiver_state(key).is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_returns_local_start_epoch_and_capacity() {
+        let svc = GrpcService::default();
+        let resp = svc
+            .heartbeat(tonic::Request::new(HeartbeatRequest {
+                assigned_be_id: 7,
+                fe_epoch: 1,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.start_epoch, crate::runtime::start_epoch::start_epoch());
+        assert!(resp.num_cores >= 1);
+        assert_eq!(resp.status_code, 0);
     }
 
     #[tokio::test]
@@ -1351,7 +1495,7 @@ mod pr3_tests {
         let _guard = crate::runtime::write_coordinator::write_registry_test_guard();
         let query = types::TUniqueId::new(801, 901);
         let finst = types::TUniqueId::new(802, 902);
-        let bytes = thrift_binary_serialize(&ok_report_params(query, finst))
+        let bytes = thrift_binary_serialize(&write_report_params(query, finst))
             .expect("serialize report params");
         let svc = GrpcService::default();
         let req = Request::new(ReportExecStatusRequest {

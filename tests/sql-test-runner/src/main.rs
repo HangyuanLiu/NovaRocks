@@ -1,6 +1,7 @@
 mod benchmark_bootstrap;
 mod cluster;
 mod config;
+mod fault_injection;
 mod parser;
 mod results;
 mod runner;
@@ -11,7 +12,7 @@ mod types;
 use crate::benchmark_bootstrap::{
     BenchmarkBootstrapOptions, ensure_benchmark_data, parse_scale_overrides,
 };
-use crate::cluster::{ClusterMode, launch_server, validate_cluster_args};
+use crate::cluster::{ClusterMode, ServerHandle, launch_server, validate_cluster_args};
 use crate::config::{
     build_suite_configs, case_auto_db_name, env_optional, env_or_default, list_sql_files,
     load_runner_config, placeholder_variables, resolve_config_path, resolve_path,
@@ -36,8 +37,8 @@ use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -331,6 +332,7 @@ struct SuiteRunContext {
     update_expected: bool,
     marker_re: Regex,
     fail_fast: bool,
+    server_handle: Arc<Mutex<Box<dyn ServerHandle>>>,
 }
 
 struct CaseOutcome {
@@ -884,6 +886,25 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             "  step {} (order_sensitive={}, epsilon={:?})",
             step.query_number, order_sensitive, epsilon
         );
+
+        if fault_injection::has_fault(&step.meta) {
+            let fault_result = ctx
+                .server_handle
+                .lock()
+                .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))
+                .and_then(|mut server_handle| {
+                    fault_injection::apply_pre_query(&step.meta, server_handle.as_mut())
+                });
+            if let Err(exc) = fault_result {
+                case_failed = true;
+                let _ = writeln!(
+                    log,
+                    "    ❌ failed to apply fault injection before step {}: {:#}",
+                    step.query_number, exc
+                );
+                break;
+            }
+        }
 
         match ctx.mode {
             Mode::Verify => {
@@ -1739,6 +1760,22 @@ fn format_case_timings(timings: &[CaseTiming]) -> String {
     out
 }
 
+fn cases_have_fault_directives(cases: &[SqlCase]) -> bool {
+    cases
+        .iter()
+        .flat_map(|case| case.steps.iter())
+        .any(|step| fault_injection::has_fault(&step.meta))
+}
+
+fn validate_fault_injection_jobs(cases: &[SqlCase], jobs: usize) -> Result<()> {
+    if jobs != 1 && cases_have_fault_directives(cases) {
+        bail!(
+            "fault injection directives require -j 1 because they mutate the shared cross-process cluster"
+        );
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -1852,6 +1889,7 @@ fn run() -> Result<i32> {
         .or_else(|| env_optional("STARUST_TEST_HOST"))
         .or_else(|| runner_config.cluster.get("host").cloned())
         .unwrap_or_else(|| "127.0.0.1".to_string());
+    let server_handle = Arc::new(Mutex::new(server_handle));
     let target_user = cli
         .user
         .clone()
@@ -2070,6 +2108,11 @@ fn run() -> Result<i32> {
             continue;
         }
 
+        if let Err(exc) = validate_fault_injection_jobs(&cases, jobs) {
+            println!("❌ ERROR: {}", exc);
+            return Ok(1);
+        }
+
         if matches!(cli.mode, Mode::Verify | Mode::Record) && result_dir.is_none() {
             println!(
                 "❌ ERROR: result_dir is required for verify/record mode (suite {})",
@@ -2218,6 +2261,7 @@ fn run() -> Result<i32> {
             update_expected: cli.update_expected,
             marker_re: marker_re.clone(),
             fail_fast: cli.fail_fast,
+            server_handle: Arc::clone(&server_handle),
         };
 
         prepared_suites.push(PreparedSuite {
@@ -2365,12 +2409,12 @@ mod tests {
         discover_novarocks_binary_with_override, render_cross_process_config,
         startup_timeout_from_env, validate_cluster_args,
     };
-    use crate::Cli;
     use crate::config::substitute_placeholders;
     use crate::parser::{extract_suite_hook, load_sql_case_from_file};
     use crate::results::{load_expected_results, parse_output, write_result_file};
     use crate::runner::{is_transient_iceberg_commit_error, parse_selector_list};
-    use crate::types::ResultSet;
+    use crate::types::{QueryMeta, ResultSet, SqlCase, SqlStep};
+    use crate::{Cli, validate_fault_injection_jobs};
     use clap::Parser;
     use regex::Regex;
     use std::collections::BTreeMap;
@@ -2410,6 +2454,41 @@ mod tests {
             std::process::id(),
             nanos
         ))
+    }
+
+    fn test_case_with_meta(meta: QueryMeta) -> SqlCase {
+        SqlCase {
+            source_file: PathBuf::from("fault.sql"),
+            case_id: "fault_case".to_string(),
+            steps: vec![SqlStep {
+                query_number: 1,
+                sql: "select 1".to_string(),
+                meta,
+            }],
+            case_dbs: vec![],
+            sequential: false,
+        }
+    }
+
+    #[test]
+    fn fault_directives_require_serial_jobs() {
+        let cases = vec![test_case_with_meta(QueryMeta {
+            kill_be_index: Some(0),
+            ..QueryMeta::default()
+        })];
+
+        let err = validate_fault_injection_jobs(&cases, 2)
+            .expect_err("fault directives should reject parallel jobs");
+        assert!(
+            err.to_string().contains(
+                "fault injection directives require -j 1 because they mutate the shared cross-process cluster"
+            ),
+            "unexpected error: {err}"
+        );
+
+        validate_fault_injection_jobs(&cases, 1).expect("serial jobs should be accepted");
+        validate_fault_injection_jobs(&[test_case_with_meta(QueryMeta::default())], 8)
+            .expect("cases without fault directives should allow parallel jobs");
     }
 
     #[test]
@@ -2943,7 +3022,8 @@ enable_path_style_access = true
         assert_eq!(cli.cluster_mode, crate::cluster::ClusterMode::AllInOne);
         let err = validate_cluster_args(cli.cluster_mode, cli.cluster_size).unwrap_err();
         assert!(
-            err.to_string().contains("all-in-one mode requires --cluster-size 1"),
+            err.to_string()
+                .contains("all-in-one mode requires --cluster-size 1"),
             "unexpected: {err}"
         );
     }
