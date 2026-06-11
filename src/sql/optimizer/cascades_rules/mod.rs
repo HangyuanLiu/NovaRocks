@@ -8,6 +8,7 @@ pub(crate) mod sort_limit_to_top_n;
 pub(crate) mod split_aggregate;
 pub(crate) mod split_distinct_agg;
 pub(crate) mod split_top_n;
+pub(crate) mod topn_compactness;
 
 use super::rule::Rule;
 
@@ -50,5 +51,12 @@ pub(crate) fn all_transformation_rules() -> Vec<Box<dyn Rule>> {
         Box::new(sort_limit_to_top_n::SortLimitToTopN),
         Box::new(split_aggregate::SplitAggregateRule),
         Box::new(split_top_n::SplitTopN),
+        Box::new(topn_compactness::MergeConsecutiveTopN),
+        Box::new(topn_compactness::RemoveRedundantSortUnderTopN),
+        Box::new(topn_compactness::PushTopNIntoScan),
+        Box::new(topn_compactness::PushTopNThroughProject),
+        Box::new(topn_compactness::PushTopNThroughJoin),
+        Box::new(topn_compactness::PushTopNThroughAggregate),
+        Box::new(topn_compactness::PushTopNThroughSetOp),
     ]
 }
