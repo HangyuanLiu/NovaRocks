@@ -214,6 +214,8 @@ pub(crate) fn render_cross_process_config(
     match role {
         ClusterProcessRole::Fe => {
             cluster.insert("role".to_string(), Value::String("fe".to_string()));
+            cluster.insert("heartbeat_interval_ms".to_string(), Value::Integer(500));
+            cluster.insert("heartbeat_timeout_retries".to_string(), Value::Integer(2));
             let backends: Vec<Value> = runtime
                 .be
                 .iter()
@@ -915,6 +917,14 @@ exec_node_output = true
         );
         assert_eq!(fe_value["standalone_server"]["user"].as_str(), Some("root"));
         assert_eq!(fe_value["cluster"]["role"].as_str(), Some("fe"));
+        assert_eq!(
+            fe_value["cluster"]["heartbeat_interval_ms"].as_integer(),
+            Some(500)
+        );
+        assert_eq!(
+            fe_value["cluster"]["heartbeat_timeout_retries"].as_integer(),
+            Some(2)
+        );
         // 1-BE: FE backends list has exactly one entry pointing at the single BE's starlet port.
         let fe_backends = fe_value["cluster"]["backends"]
             .as_array()
@@ -948,6 +958,60 @@ exec_node_output = true
                 .and_then(|value| value.get("backends"))
                 .is_none()
         );
+        assert!(
+            be_value
+                .get("cluster")
+                .and_then(|value| value.get("heartbeat_interval_ms"))
+                .is_none()
+        );
+        assert!(
+            be_value
+                .get("cluster")
+                .and_then(|value| value.get("heartbeat_timeout_retries"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn render_cross_process_config_empty_base_patches_fe_heartbeat_only() {
+        let runtime = make_runtime_1be();
+
+        let fe = render_cross_process_config("", ClusterProcessRole::Fe, 0, &runtime)
+            .expect("render fe config");
+        let be = render_cross_process_config("", ClusterProcessRole::Be, 0, &runtime)
+            .expect("render be config");
+
+        let fe_value: toml::Value = fe.parse().expect("parse fe toml");
+        let be_value: toml::Value = be.parse().expect("parse be toml");
+
+        assert_eq!(fe_value["cluster"]["role"].as_str(), Some("fe"));
+        assert_eq!(
+            fe_value["cluster"]["heartbeat_interval_ms"].as_integer(),
+            Some(500)
+        );
+        assert_eq!(
+            fe_value["cluster"]["heartbeat_timeout_retries"].as_integer(),
+            Some(2)
+        );
+        let fe_backends = fe_value["cluster"]["backends"]
+            .as_array()
+            .expect("fe backends array");
+        assert_eq!(fe_backends.len(), 1);
+        assert_eq!(fe_backends[0].as_str(), Some("127.0.0.1:19070"));
+
+        assert_eq!(be_value["cluster"]["role"].as_str(), Some("be"));
+        assert!(
+            be_value
+                .get("cluster")
+                .and_then(|value| value.get("heartbeat_interval_ms"))
+                .is_none()
+        );
+        assert!(
+            be_value
+                .get("cluster")
+                .and_then(|value| value.get("heartbeat_timeout_retries"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -959,6 +1023,14 @@ exec_node_output = true
         let fe_value: toml::Value = fe.parse().expect("parse fe toml");
 
         assert_eq!(fe_value["cluster"]["role"].as_str(), Some("fe"));
+        assert_eq!(
+            fe_value["cluster"]["heartbeat_interval_ms"].as_integer(),
+            Some(500)
+        );
+        assert_eq!(
+            fe_value["cluster"]["heartbeat_timeout_retries"].as_integer(),
+            Some(2)
+        );
         let backends = fe_value["cluster"]["backends"]
             .as_array()
             .expect("fe backends array");

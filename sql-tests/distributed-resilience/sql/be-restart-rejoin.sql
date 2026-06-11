@@ -12,7 +12,7 @@ USE ${case_db};
 SELECT 1;
 
 -- query 3
--- @heartbeat_delay_ms=20000
+-- @heartbeat_delay_ms=3000
 -- @retry_count=5
 -- @retry_interval_ms=2000
 -- @result_contains=1000000
