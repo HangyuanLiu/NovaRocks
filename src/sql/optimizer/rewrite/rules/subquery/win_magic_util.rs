@@ -15,17 +15,26 @@ use crate::sql::planner::plan::{LogicalPlan, ScanNode};
 #[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(super) enum TableIdentity {
-    StarRocks { db_id: i64, table_id: i64 },
-    Iceberg { catalog: String, namespace: String, table: String, table_uuid: Option<String> },
+    StarRocks {
+        db_id: i64,
+        table_id: i64,
+    },
+    Iceberg {
+        catalog: String,
+        namespace: String,
+        table: String,
+        table_uuid: Option<String>,
+    },
 }
 
 impl TableIdentity {
     #[allow(dead_code)]
     pub(super) fn from_scan(scan: &ScanNode) -> Self {
         match &scan.table.source {
-            ScanSource::StarRocks { db_id, table_id } => {
-                TableIdentity::StarRocks { db_id: *db_id, table_id: *table_id }
-            }
+            ScanSource::StarRocks { db_id, table_id } => TableIdentity::StarRocks {
+                db_id: *db_id,
+                table_id: *table_id,
+            },
             ScanSource::IcebergDataFiles { table, .. }
             | ScanSource::IcebergMetadataTable { table, .. }
             | ScanSource::IcebergDeltaTable { table, .. }
@@ -142,16 +151,23 @@ pub(super) fn expr_phys_eq(
     map: &HashMap<ColumnId, (TableIdentity, String)>,
 ) -> bool {
     match (&a.kind, &b.kind) {
+        (ExprKind::ColumnRef { column_id: ia, .. }, ExprKind::ColumnRef { column_id: ib, .. }) => {
+            match (map.get(ia), map.get(ib)) {
+                (Some(pa), Some(pb)) => pa == pb,
+                _ => ia == ib,
+            }
+        }
         (
-            ExprKind::ColumnRef { column_id: ia, .. },
-            ExprKind::ColumnRef { column_id: ib, .. },
-        ) => match (map.get(ia), map.get(ib)) {
-            (Some(pa), Some(pb)) => pa == pb,
-            _ => ia == ib,
-        },
-        (
-            ExprKind::BinaryOp { left: la, op: oa, right: ra },
-            ExprKind::BinaryOp { left: lb, op: ob, right: rb },
+            ExprKind::BinaryOp {
+                left: la,
+                op: oa,
+                right: ra,
+            },
+            ExprKind::BinaryOp {
+                left: lb,
+                op: ob,
+                right: rb,
+            },
         ) => {
             oa == ob
                 && ((expr_phys_eq(la, lb, map) && expr_phys_eq(ra, rb, map))
@@ -160,8 +176,16 @@ pub(super) fn expr_phys_eq(
                         && expr_phys_eq(ra, lb, map)))
         }
         (
-            ExprKind::FunctionCall { name: na, args: aa, distinct: da },
-            ExprKind::FunctionCall { name: nb, args: ab, distinct: db },
+            ExprKind::FunctionCall {
+                name: na,
+                args: aa,
+                distinct: da,
+            },
+            ExprKind::FunctionCall {
+                name: nb,
+                args: ab,
+                distinct: db,
+            },
         ) => {
             na == nb
                 && da == db
@@ -169,8 +193,14 @@ pub(super) fn expr_phys_eq(
                 && aa.iter().zip(ab).all(|(x, y)| expr_phys_eq(x, y, map))
         }
         (
-            ExprKind::IsNull { expr: ea, negated: ga },
-            ExprKind::IsNull { expr: eb, negated: gb },
+            ExprKind::IsNull {
+                expr: ea,
+                negated: ga,
+            },
+            ExprKind::IsNull {
+                expr: eb,
+                negated: gb,
+            },
         ) => ga == gb && expr_phys_eq(ea, eb, map),
         (ExprKind::Literal(la), ExprKind::Literal(lb)) => literal_eq(la, lb),
         // Other / mixed kinds: conservative debug-structural equality.
@@ -264,7 +294,10 @@ mod tests {
                 name: "t".to_string(),
                 columns: vec![],
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::StarRocks { db_id: 7, table_id: 42 },
+                source: ScanSource::StarRocks {
+                    db_id: 7,
+                    table_id: 42,
+                },
             },
             alias: None,
             columns: vec![],
@@ -274,7 +307,13 @@ mod tests {
             required_output_columns: None,
         };
         let id = TableIdentity::from_scan(&scan_node);
-        assert_eq!(id, TableIdentity::StarRocks { db_id: 7, table_id: 42 });
+        assert_eq!(
+            id,
+            TableIdentity::StarRocks {
+                db_id: 7,
+                table_id: 42
+            }
+        );
     }
 
     // -----------------------------------------------------------------
@@ -295,8 +334,14 @@ mod tests {
         assert_eq!(ids.len(), 2);
         let set: HashSet<_> = ids.iter().collect();
         assert_eq!(set.len(), 2);
-        assert!(set.contains(&TableIdentity::StarRocks { db_id: 0, table_id: 1 }));
-        assert!(set.contains(&TableIdentity::StarRocks { db_id: 0, table_id: 2 }));
+        assert!(set.contains(&TableIdentity::StarRocks {
+            db_id: 0,
+            table_id: 1
+        }));
+        assert!(set.contains(&TableIdentity::StarRocks {
+            db_id: 0,
+            table_id: 2
+        }));
     }
 
     // -----------------------------------------------------------------
@@ -328,7 +373,13 @@ mod tests {
         let plan = make_scan(5, vec![(cid, "l_partkey")]);
         let map = collect_scan_column_map(&plan);
         let entry = map.get(&cid).expect("ColumnId(3) must be in the map");
-        assert_eq!(entry.0, TableIdentity::StarRocks { db_id: 0, table_id: 5 });
+        assert_eq!(
+            entry.0,
+            TableIdentity::StarRocks {
+                db_id: 0,
+                table_id: 5
+            }
+        );
         assert_eq!(entry.1, "l_partkey");
     }
 
@@ -343,7 +394,10 @@ mod tests {
         let cid_b = ColumnId(20);
 
         let mut map: HashMap<ColumnId, (TableIdentity, String)> = HashMap::new();
-        let identity = TableIdentity::StarRocks { db_id: 0, table_id: 5 };
+        let identity = TableIdentity::StarRocks {
+            db_id: 0,
+            table_id: 5,
+        };
         map.insert(cid_a, (identity.clone(), "l_partkey".to_string()));
         map.insert(cid_b, (identity.clone(), "l_partkey".to_string()));
 
@@ -408,10 +462,7 @@ mod tests {
         let l5 = int_lit(5);
         let l5b = int_lit(5);
         let l6 = int_lit(6);
-        assert!(
-            expr_phys_eq(&l5, &l5b, &map),
-            "same literal must be equal"
-        );
+        assert!(expr_phys_eq(&l5, &l5b, &map), "same literal must be equal");
         assert!(
             !expr_phys_eq(&l5, &l6, &map),
             "different literals must be unequal"
@@ -428,7 +479,10 @@ mod tests {
         let cid_b = ColumnId(20);
 
         let mut map: HashMap<ColumnId, (TableIdentity, String)> = HashMap::new();
-        let id1 = TableIdentity::StarRocks { db_id: 0, table_id: 1 };
+        let id1 = TableIdentity::StarRocks {
+            db_id: 0,
+            table_id: 1,
+        };
         map.insert(cid_a, (id1.clone(), "a".to_string()));
         map.insert(cid_b, (id1.clone(), "b".to_string()));
 

@@ -11,14 +11,18 @@ use std::collections::HashSet;
 
 use arrow::datatypes::DataType;
 
-use super::win_magic_util::{collect_scan_column_map, collect_table_ids, expr_phys_eq, TableIdentity};
+use super::win_magic_util::{
+    TableIdentity, collect_scan_column_map, collect_table_ids, expr_phys_eq,
+};
 use crate::sql::analysis::{ExprKind, OutputColumn, SortItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::optimizer::rewrite::rules::utils::{collect_column_id_refs, combine_and, split_and};
+use crate::sql::optimizer::rewrite::rules::utils::{
+    collect_column_id_refs, combine_and, split_and,
+};
 use crate::sql::planner::plan::{
     AggregateCall, AggregateNode, ApplyKind, ApplyNode, FilterNode, LogicalPlan, SortNode,
     WindowExpr, WindowNode,
@@ -52,23 +56,33 @@ impl LogicalRewriteRule for ApplyToWindow {
     }
 
     fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
-        let LogicalPlan::Filter(f) = plan else { return false };
-        let LogicalPlan::Apply(a) = f.input.as_ref() else { return false };
-        a.kind == ApplyKind::Scalar
-            && !a.need_check_max_rows
-            && !a.correlation_conjuncts.is_empty()
+        let LogicalPlan::Filter(f) = plan else {
+            return false;
+        };
+        let LogicalPlan::Apply(a) = f.input.as_ref() else {
+            return false;
+        };
+        a.kind == ApplyKind::Scalar && !a.need_check_max_rows && !a.correlation_conjuncts.is_empty()
     }
 
     fn apply(&self, plan: LogicalPlan, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
-        let LogicalPlan::Filter(f) = &plan else { return Ok(RewriteResult::Unchanged) };
-        let LogicalPlan::Apply(a) = f.input.as_ref() else { return Ok(RewriteResult::Unchanged) };
+        let LogicalPlan::Filter(f) = &plan else {
+            return Ok(RewriteResult::Unchanged);
+        };
+        let LogicalPlan::Apply(a) = f.input.as_ref() else {
+            return Ok(RewriteResult::Unchanged);
+        };
         let Some(m) = check_preconditions(&f.predicate, a) else {
             return Ok(RewriteResult::Unchanged);
         };
 
         // Re-own the pieces. (matches() guaranteed Filter(Apply).)
-        let LogicalPlan::Filter(f) = plan else { unreachable!() };
-        let LogicalPlan::Apply(a) = *f.input else { unreachable!() };
+        let LogicalPlan::Filter(f) = plan else {
+            unreachable!()
+        };
+        let LogicalPlan::Apply(a) = *f.input else {
+            unreachable!()
+        };
 
         // --- 1. Remap the inner aggregate's args to the outer instance of the same physical column. ---
         let outer_map = collect_scan_column_map(&a.left);
@@ -142,7 +156,11 @@ impl LogicalRewriteRule for ApplyToWindow {
         let sort_items: Vec<SortItem> = m
             .partition_by
             .iter()
-            .map(|e| SortItem { expr: e.clone(), asc: true, nulls_first: true })
+            .map(|e| SortItem {
+                expr: e.clone(),
+                asc: true,
+                nulls_first: true,
+            })
             .collect();
         let sorted = LogicalPlan::Sort(SortNode {
             input: Box::new(before_filtered),
@@ -215,7 +233,9 @@ fn remap_inner_to_outer(
     phys_to_outer: &HashMap<(TableIdentity, String), OutputColumn>,
 ) -> bool {
     match &mut expr.kind {
-        ExprKind::ColumnRef { column_id, column, .. } => {
+        ExprKind::ColumnRef {
+            column_id, column, ..
+        } => {
             if let Some((tab, name)) = inner_map.get(column_id) {
                 // This ColumnRef is from an inner scan; find its outer twin.
                 match phys_to_outer.get(&(tab.clone(), name.clone())) {
@@ -248,34 +268,51 @@ fn remap_inner_to_outer(
             }
             ok
         }
-        ExprKind::IsNull { expr: inner_expr, .. } => {
-            remap_inner_to_outer(inner_expr, inner_map, phys_to_outer)
-        }
-        ExprKind::UnaryOp { expr: inner_expr, .. } => {
-            remap_inner_to_outer(inner_expr, inner_map, phys_to_outer)
-        }
-        ExprKind::Cast { expr: inner_expr, .. } => {
-            remap_inner_to_outer(inner_expr, inner_map, phys_to_outer)
-        }
-        ExprKind::InList { expr: inner_expr, list, .. } => {
+        ExprKind::IsNull {
+            expr: inner_expr, ..
+        } => remap_inner_to_outer(inner_expr, inner_map, phys_to_outer),
+        ExprKind::UnaryOp {
+            expr: inner_expr, ..
+        } => remap_inner_to_outer(inner_expr, inner_map, phys_to_outer),
+        ExprKind::Cast {
+            expr: inner_expr, ..
+        } => remap_inner_to_outer(inner_expr, inner_map, phys_to_outer),
+        ExprKind::InList {
+            expr: inner_expr,
+            list,
+            ..
+        } => {
             let e_ok = remap_inner_to_outer(inner_expr, inner_map, phys_to_outer);
             let l_ok = list
                 .iter_mut()
                 .all(|item| remap_inner_to_outer(item, inner_map, phys_to_outer));
             e_ok && l_ok
         }
-        ExprKind::Between { expr: inner_expr, low, high, .. } => {
+        ExprKind::Between {
+            expr: inner_expr,
+            low,
+            high,
+            ..
+        } => {
             let e_ok = remap_inner_to_outer(inner_expr, inner_map, phys_to_outer);
             let lo_ok = remap_inner_to_outer(low, inner_map, phys_to_outer);
             let hi_ok = remap_inner_to_outer(high, inner_map, phys_to_outer);
             e_ok && lo_ok && hi_ok
         }
-        ExprKind::Like { expr: inner_expr, pattern, .. } => {
+        ExprKind::Like {
+            expr: inner_expr,
+            pattern,
+            ..
+        } => {
             let e_ok = remap_inner_to_outer(inner_expr, inner_map, phys_to_outer);
             let p_ok = remap_inner_to_outer(pattern, inner_map, phys_to_outer);
             e_ok && p_ok
         }
-        ExprKind::Case { operand, when_then, else_expr } => {
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
             let mut ok = true;
             if let Some(op) = operand {
                 ok &= remap_inner_to_outer(op, inner_map, phys_to_outer);
@@ -289,12 +326,10 @@ fn remap_inner_to_outer(
             }
             ok
         }
-        ExprKind::IsTruthValue { expr: inner_expr, .. } => {
-            remap_inner_to_outer(inner_expr, inner_map, phys_to_outer)
-        }
-        ExprKind::Nested(inner_expr) => {
-            remap_inner_to_outer(inner_expr, inner_map, phys_to_outer)
-        }
+        ExprKind::IsTruthValue {
+            expr: inner_expr, ..
+        } => remap_inner_to_outer(inner_expr, inner_map, phys_to_outer),
+        ExprKind::Nested(inner_expr) => remap_inner_to_outer(inner_expr, inner_map, phys_to_outer),
         ExprKind::AggregateCall { args, order_by, .. } => {
             let mut ok = true;
             for arg in args.iter_mut() {
@@ -308,10 +343,13 @@ fn remap_inner_to_outer(
         ExprKind::LambdaFunction { body, .. } => {
             remap_inner_to_outer(body, inner_map, phys_to_outer)
         }
-        ExprKind::Lambda { body, .. } => {
-            remap_inner_to_outer(body, inner_map, phys_to_outer)
-        }
-        ExprKind::WindowCall { args, partition_by, order_by, .. } => {
+        ExprKind::Lambda { body, .. } => remap_inner_to_outer(body, inner_map, phys_to_outer),
+        ExprKind::WindowCall {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
             let mut ok = true;
             for arg in args.iter_mut() {
                 ok &= remap_inner_to_outer(arg, inner_map, phys_to_outer);
@@ -372,7 +410,11 @@ fn build_value_expr(
 /// Build a nullable `ColumnRef` TypedExpr for `id` with the given type.
 fn col_ref_expr(id: ColumnId, dt: &DataType) -> TypedExpr {
     TypedExpr {
-        kind: ExprKind::ColumnRef { column_id: id, qualifier: None, column: format!("col_{}", id.0) },
+        kind: ExprKind::ColumnRef {
+            column_id: id,
+            qualifier: None,
+            column: format!("col_{}", id.0),
+        },
         data_type: dt.clone(),
         nullable: true,
     }
@@ -382,11 +424,11 @@ fn col_ref_expr(id: ColumnId, dt: &DataType) -> TypedExpr {
 /// `replacement.clone()`.
 fn replace_column_ref(expr: &mut TypedExpr, target: ColumnId, replacement: &TypedExpr) {
     // Base case: this node IS the target column ref — replace in place and return.
-    if let ExprKind::ColumnRef { column_id, .. } = &expr.kind {
-        if *column_id == target {
-            *expr = replacement.clone();
-            return;
-        }
+    if let ExprKind::ColumnRef { column_id, .. } = &expr.kind
+        && *column_id == target
+    {
+        *expr = replacement.clone();
+        return;
     }
     // Recurse into all compound variants.
     match &mut expr.kind {
@@ -399,31 +441,54 @@ fn replace_column_ref(expr: &mut TypedExpr, target: ColumnId, replacement: &Type
                 replace_column_ref(arg, target, replacement);
             }
         }
-        ExprKind::IsNull { expr: inner_expr, .. } => {
+        ExprKind::IsNull {
+            expr: inner_expr, ..
+        } => {
             replace_column_ref(inner_expr, target, replacement);
         }
-        ExprKind::UnaryOp { expr: inner_expr, .. } => {
+        ExprKind::UnaryOp {
+            expr: inner_expr, ..
+        } => {
             replace_column_ref(inner_expr, target, replacement);
         }
-        ExprKind::Cast { expr: inner_expr, .. } => {
+        ExprKind::Cast {
+            expr: inner_expr, ..
+        } => {
             replace_column_ref(inner_expr, target, replacement);
         }
-        ExprKind::InList { expr: inner_expr, list, .. } => {
+        ExprKind::InList {
+            expr: inner_expr,
+            list,
+            ..
+        } => {
             replace_column_ref(inner_expr, target, replacement);
             for item in list.iter_mut() {
                 replace_column_ref(item, target, replacement);
             }
         }
-        ExprKind::Between { expr: inner_expr, low, high, .. } => {
+        ExprKind::Between {
+            expr: inner_expr,
+            low,
+            high,
+            ..
+        } => {
             replace_column_ref(inner_expr, target, replacement);
             replace_column_ref(low, target, replacement);
             replace_column_ref(high, target, replacement);
         }
-        ExprKind::Like { expr: inner_expr, pattern, .. } => {
+        ExprKind::Like {
+            expr: inner_expr,
+            pattern,
+            ..
+        } => {
             replace_column_ref(inner_expr, target, replacement);
             replace_column_ref(pattern, target, replacement);
         }
-        ExprKind::Case { operand, when_then, else_expr } => {
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
             if let Some(op) = operand {
                 replace_column_ref(op, target, replacement);
             }
@@ -435,7 +500,9 @@ fn replace_column_ref(expr: &mut TypedExpr, target: ColumnId, replacement: &Type
                 replace_column_ref(els, target, replacement);
             }
         }
-        ExprKind::IsTruthValue { expr: inner_expr, .. } => {
+        ExprKind::IsTruthValue {
+            expr: inner_expr, ..
+        } => {
             replace_column_ref(inner_expr, target, replacement);
         }
         ExprKind::Nested(inner_expr) => {
@@ -455,7 +522,12 @@ fn replace_column_ref(expr: &mut TypedExpr, target: ColumnId, replacement: &Type
         ExprKind::Lambda { body, .. } => {
             replace_column_ref(body, target, replacement);
         }
-        ExprKind::WindowCall { args, partition_by, order_by, .. } => {
+        ExprKind::WindowCall {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
             for arg in args.iter_mut() {
                 replace_column_ref(arg, target, replacement);
             }
@@ -484,10 +556,7 @@ fn expr_struct_eq(a: &TypedExpr, b: &TypedExpr) -> bool {
 
 /// Port of StarRocks ScalarApply2AnalyticRule's check() family. Returns the
 /// validated match data, or None if any precondition fails (-> caller Unchanged).
-pub(super) fn check_preconditions(
-    where_pred: &TypedExpr,
-    a: &ApplyNode,
-) -> Option<WinMagicMatch> {
+pub(super) fn check_preconditions(where_pred: &TypedExpr, a: &ApplyNode) -> Option<WinMagicMatch> {
     // (0) Inner: peel optional leading Project, require a vector Aggregate with a
     // single non-DISTINCT whitelisted aggregate.
     let agg = peel_to_aggregate(&a.right)?;
@@ -591,9 +660,9 @@ pub(super) fn check_preconditions(
     outer_conjuncts.retain(|oc| {
         let refs = collect_column_id_refs(oc);
         let only_extra = !refs.is_empty()
-            && refs.iter().all(|id| {
-                matches!(col_map.get(id), Some((t, _)) if *t == correlated_outer_table)
-            });
+            && refs
+                .iter()
+                .all(|id| matches!(col_map.get(id), Some((t, _)) if *t == correlated_outer_table));
         !only_extra
     });
 
@@ -686,7 +755,9 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
+    use crate::sql::analysis::{
+        BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
+    };
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::{ColumnId, ColumnRefFactory};
     use crate::sql::optimizer::rewrite::context::RewriteContext;
@@ -1013,10 +1084,7 @@ mod tests {
                     col_ref(L_PARTKEY, "l_partkey", DataType::Int64),
                 ),
                 // extra: p_brand == 'x'  (references only correlated_outer_table=part)
-                eq_expr(
-                    col_ref(P_BRAND, "p_brand", DataType::Utf8),
-                    str_lit("x"),
-                ),
+                eq_expr(col_ref(P_BRAND, "p_brand", DataType::Utf8), str_lit("x")),
             ),
             // subquery comparison: l_quantity < APPLY_OUT
             lt_expr(
@@ -1092,10 +1160,7 @@ mod tests {
                     col_ref(P_PARTKEY, "p_partkey", DataType::Int64),
                     col_ref(L_PARTKEY, "l_partkey", DataType::Int64),
                 ),
-                eq_expr(
-                    col_ref(P_BRAND, "p_brand", DataType::Utf8),
-                    str_lit("x"),
-                ),
+                eq_expr(col_ref(P_BRAND, "p_brand", DataType::Utf8), str_lit("x")),
             ),
             lt_expr(
                 col_ref(L_QUANTITY, "l_quantity", DataType::Float64),
@@ -1200,14 +1265,23 @@ mod tests {
 
         // Partition-by: one ColumnRef pointing to OUTER p_partkey (P_PARTKEY = 10).
         assert_eq!(win_expr.partition_by.len(), 1);
-        let ExprKind::ColumnRef { column_id: pb_id, .. } = &win_expr.partition_by[0].kind else {
+        let ExprKind::ColumnRef {
+            column_id: pb_id, ..
+        } = &win_expr.partition_by[0].kind
+        else {
             panic!("expected ColumnRef in partition_by");
         };
-        assert_eq!(*pb_id, P_PARTKEY, "partition_by must reference outer p_partkey");
+        assert_eq!(
+            *pb_id, P_PARTKEY,
+            "partition_by must reference outer p_partkey"
+        );
 
         // args[0] must reference OUTER l_quantity (L_QUANTITY = 3, NOT INNER_L_QUANTITY = 21).
         assert_eq!(win_expr.args.len(), 1);
-        let ExprKind::ColumnRef { column_id: arg_id, .. } = &win_expr.args[0].kind else {
+        let ExprKind::ColumnRef {
+            column_id: arg_id, ..
+        } = &win_expr.args[0].kind
+        else {
             panic!("expected ColumnRef in window args");
         };
         assert_eq!(
@@ -1259,9 +1333,15 @@ mod tests {
             let plan = winmagic_filter_apply();
             let mut ctx = ctx_with_factory();
             let result = rule.apply(plan, &mut ctx).unwrap();
-            let RewriteResult::Changed(result) = result else { panic!("expected Changed") };
-            let LogicalPlan::Filter(after) = &result else { panic!("expected Filter") };
-            let LogicalPlan::Window(win) = after.input.as_ref() else { panic!("expected Window") };
+            let RewriteResult::Changed(result) = result else {
+                panic!("expected Changed")
+            };
+            let LogicalPlan::Filter(after) = &result else {
+                panic!("expected Filter")
+            };
+            let LogicalPlan::Window(win) = after.input.as_ref() else {
+                panic!("expected Window")
+            };
             let win_id = win.window_exprs[0].output_column_id;
 
             // The after-filter predicate must reference win_id, not APPLY_OUT, not AVG_RESULT.
@@ -1285,9 +1365,15 @@ mod tests {
             let (plan, _val_id) = winmagic_filter_apply_with_project();
             let mut ctx = ctx_with_factory();
             let result = rule.apply(plan, &mut ctx).unwrap();
-            let RewriteResult::Changed(result) = result else { panic!("expected Changed") };
-            let LogicalPlan::Filter(after) = &result else { panic!("expected Filter") };
-            let LogicalPlan::Window(win) = after.input.as_ref() else { panic!("expected Window") };
+            let RewriteResult::Changed(result) = result else {
+                panic!("expected Changed")
+            };
+            let LogicalPlan::Filter(after) = &result else {
+                panic!("expected Filter")
+            };
+            let LogicalPlan::Window(win) = after.input.as_ref() else {
+                panic!("expected Window")
+            };
             let win_id = win.window_exprs[0].output_column_id;
 
             let refs = collect_column_id_refs(&after.predicate);
@@ -1307,7 +1393,11 @@ mod tests {
             // Walk the predicate: find the BinaryOp whose right (or left) is ColumnRef(win_id).
             fn contains_mul_with_win(expr: &TypedExpr, win_id: ColumnId) -> bool {
                 match &expr.kind {
-                    ExprKind::BinaryOp { left, op: BinOp::Mul, right } => {
+                    ExprKind::BinaryOp {
+                        left,
+                        op: BinOp::Mul,
+                        right,
+                    } => {
                         let lr = collect_column_id_refs(right);
                         let ll = collect_column_id_refs(left);
                         if lr.contains(&win_id) || ll.contains(&win_id) {
@@ -1361,8 +1451,12 @@ mod tests {
 
     /// Helper: extract the ApplyNode and predicate from the canonical Filter(Apply) fixture.
     fn extract_filter_apply(plan: &LogicalPlan) -> (&TypedExpr, &ApplyNode) {
-        let LogicalPlan::Filter(f) = plan else { panic!("expected Filter") };
-        let LogicalPlan::Apply(a) = f.input.as_ref() else { panic!("expected Apply") };
+        let LogicalPlan::Filter(f) = plan else {
+            panic!("expected Filter")
+        };
+        let LogicalPlan::Apply(a) = f.input.as_ref() else {
+            panic!("expected Apply")
+        };
         (&f.predicate, a)
     }
 
@@ -1782,10 +1876,7 @@ mod tests {
                     col_ref(P_PARTKEY, "p_partkey", DataType::Int64),
                     col_ref(L_PARTKEY, "l_partkey", DataType::Int64),
                 ),
-                eq_expr(
-                    col_ref(P_BRAND, "p_brand", DataType::Utf8),
-                    str_lit("x"),
-                ),
+                eq_expr(col_ref(P_BRAND, "p_brand", DataType::Utf8), str_lit("x")),
             ),
             between_conjunct.clone(),
         );
@@ -1822,7 +1913,9 @@ mod tests {
             "after-window predicate must NOT reference APPLY_OUT after Between rewrite"
         );
         // win_id is present instead.
-        let LogicalPlan::Window(win) = after_filter.input.as_ref() else { unreachable!() };
+        let LogicalPlan::Window(win) = after_filter.input.as_ref() else {
+            unreachable!()
+        };
         let win_id = win.window_exprs[0].output_column_id;
         assert!(
             refs.contains(&win_id),
@@ -1901,10 +1994,7 @@ mod tests {
                     col_ref(P_PARTKEY, "p_partkey", DataType::Int64),
                     col_ref(L_PARTKEY, "l_partkey", DataType::Int64),
                 ),
-                eq_expr(
-                    col_ref(P_BRAND, "p_brand", DataType::Utf8),
-                    str_lit("x"),
-                ),
+                eq_expr(col_ref(P_BRAND, "p_brand", DataType::Utf8), str_lit("x")),
             ),
             lt_expr(
                 col_ref(L_QUANTITY, "l_quantity", DataType::Float64),
@@ -1970,8 +2060,8 @@ mod tests {
     ///   as a Window node with no Apply remaining in the tree.
     #[test]
     fn full_pipeline_pre_pushdown_becomes_window() {
-        use crate::sql::optimizer::rewrite::pipeline::{RewritePipeline, RewriteStage};
         use crate::sql::optimizer::rewrite::phase::RewritePhase;
+        use crate::sql::optimizer::rewrite::pipeline::{RewritePipeline, RewriteStage};
         use crate::sql::optimizer::rewrite::rules::subquery::subquery_rewrite_rules;
 
         let plan = winmagic_pre_pushdown_filter_apply();
@@ -2009,8 +2099,8 @@ mod tests {
     ///   produced by ScalarApplyToJoin, with no Window node in the tree.
     #[test]
     fn full_pipeline_pre_pushdown_disabled_falls_back_to_join() {
-        use crate::sql::optimizer::rewrite::pipeline::{RewritePipeline, RewriteStage};
         use crate::sql::optimizer::rewrite::phase::RewritePhase;
+        use crate::sql::optimizer::rewrite::pipeline::{RewritePipeline, RewriteStage};
         use crate::sql::optimizer::rewrite::rules::subquery::subquery_rewrite_rules;
 
         let plan = winmagic_pre_pushdown_filter_apply();
