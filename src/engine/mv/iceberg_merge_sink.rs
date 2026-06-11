@@ -51,6 +51,12 @@ pub struct IcebergMergeSinkPlan {
     pub locator_state: Option<TargetLocatorState>,
     pub apply_key_column: String,
     pub apply_key_value_type: ApplyKeyValueType,
+    /// Partition allow-list for the delete-side locator. `None` = no pruning
+    /// (join / union / unpartitioned / NotDerived). Derived from the refresh
+    /// context's `affected_partitions` at construction; when it is an
+    /// `AllowList`, the locator skips target files whose partition key is not
+    /// in the set, mirroring the target-state read-side pruning.
+    pub partition_filter: crate::engine::mv::partition::TargetPartitionFilter,
 }
 
 pub struct TargetLocatorState {
@@ -214,7 +220,7 @@ impl IcebergMergeSinkOperator {
                         &apply_keys,
                         &locator_state.existing_deletes_by_file,
                         &locator_state.referenced_data_file_partitions,
-                        &crate::engine::mv::partition::TargetPartitionFilter::None,
+                        &self.plan.partition_filter,
                     ),
                 )??
             }
@@ -233,7 +239,7 @@ impl IcebergMergeSinkOperator {
                         &apply_keys,
                         &locator_state.existing_deletes_by_file,
                         &locator_state.referenced_data_file_partitions,
-                        &crate::engine::mv::partition::TargetPartitionFilter::None,
+                        &self.plan.partition_filter,
                     ),
                 )??
             }
@@ -248,7 +254,7 @@ impl IcebergMergeSinkOperator {
                         &apply_keys,
                         &locator_state.existing_deletes_by_file,
                         &locator_state.referenced_data_file_partitions,
-                        &crate::engine::mv::partition::TargetPartitionFilter::None,
+                        &self.plan.partition_filter,
                     ),
                 )??
             }
@@ -267,7 +273,7 @@ impl IcebergMergeSinkOperator {
                         &apply_keys,
                         &locator_state.existing_deletes_by_file,
                         &locator_state.referenced_data_file_partitions,
-                        &crate::engine::mv::partition::TargetPartitionFilter::None,
+                        &self.plan.partition_filter,
                     ),
                 )??
             }

@@ -10304,6 +10304,10 @@ fn incremental_refresh_iceberg_mv_with_changes(
         locator_state,
         apply_key_column: apply_key.column_name.to_string(),
         apply_key_value_type: apply_key.value_type,
+        // Prune the delete-side locator to the same affected-partition
+        // allow-list the planner derived for the target-state read side.
+        // `Known` => AllowList; join/union/unpartitioned/NotDerived => None.
+        partition_filter: ctx.affected_partitions.to_target_partition_filter(),
     };
     let merge_sink =
         crate::engine::mv::iceberg_merge_sink::IcebergMergeSinkFactory::new(merge_sink_plan);
