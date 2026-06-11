@@ -9,6 +9,7 @@ mod decorrelate_util;
 mod push_down_apply_agg_filter;
 mod push_down_apply_filter;
 mod scalar_apply_to_join;
+mod win_magic_util;
 
 pub(crate) use apply_exception::ApplyException;
 pub(crate) use push_down_apply_agg_filter::PushDownApplyAggFilter;
