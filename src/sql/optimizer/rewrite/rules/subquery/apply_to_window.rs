@@ -859,18 +859,18 @@ mod tests {
             "WHERE predicate without APPLY_OUT reference must reject"
         );
     }
-}
 
-// Helper trait to make test code more readable — extracts AggregateNode from plan.
-trait AsAggregate {
-    fn as_aggregate(&self) -> Option<&AggregateNode>;
-}
+    // Helper trait to make test code more readable — extracts AggregateNode from plan.
+    trait AsAggregate {
+        fn as_aggregate(&self) -> Option<&AggregateNode>;
+    }
 
-impl AsAggregate for LogicalPlan {
-    fn as_aggregate(&self) -> Option<&AggregateNode> {
-        match self {
-            LogicalPlan::Aggregate(a) => Some(a),
-            _ => None,
+    impl AsAggregate for LogicalPlan {
+        fn as_aggregate(&self) -> Option<&AggregateNode> {
+            match self {
+                LogicalPlan::Aggregate(a) => Some(a),
+                _ => None,
+            }
         }
     }
 }

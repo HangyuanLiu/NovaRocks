@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
+use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
 use crate::sql::catalog::ScanSource;
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::plan::{LogicalPlan, ScanNode};
@@ -152,7 +152,13 @@ pub(super) fn expr_phys_eq(
         (
             ExprKind::BinaryOp { left: la, op: oa, right: ra },
             ExprKind::BinaryOp { left: lb, op: ob, right: rb },
-        ) => oa == ob && expr_phys_eq(la, lb, map) && expr_phys_eq(ra, rb, map),
+        ) => {
+            oa == ob
+                && ((expr_phys_eq(la, lb, map) && expr_phys_eq(ra, rb, map))
+                    || (matches!(oa, BinOp::Eq | BinOp::Ne)
+                        && expr_phys_eq(la, rb, map)
+                        && expr_phys_eq(ra, lb, map)))
+        }
         (
             ExprKind::FunctionCall { name: na, args: aa, distinct: da },
             ExprKind::FunctionCall { name: nb, args: ab, distinct: db },
@@ -409,6 +415,48 @@ mod tests {
         assert!(
             !expr_phys_eq(&l5, &l6, &map),
             "different literals must be unequal"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // expr_phys_eq_commutative_eq
+    // -----------------------------------------------------------------
+    #[test]
+    fn expr_phys_eq_commutative_eq() {
+        // Two physical columns: (table_id=1, "a") and (table_id=1, "b").
+        let cid_a = ColumnId(10);
+        let cid_b = ColumnId(20);
+
+        let mut map: HashMap<ColumnId, (TableIdentity, String)> = HashMap::new();
+        let id1 = TableIdentity::StarRocks { db_id: 0, table_id: 1 };
+        map.insert(cid_a, (id1.clone(), "a".to_string()));
+        map.insert(cid_b, (id1.clone(), "b".to_string()));
+
+        let a = col_ref(cid_a, "a");
+        let b = col_ref(cid_b, "b");
+
+        // `a = b` must equal `b = a` (Eq is commutative).
+        let a_eq_b = binop(a.clone(), BinOp::Eq, b.clone());
+        let b_eq_a = binop(b.clone(), BinOp::Eq, a.clone());
+        assert!(
+            expr_phys_eq(&a_eq_b, &b_eq_a, &map),
+            "Eq must be commutative: a = b should match b = a"
+        );
+
+        // `a != b` must equal `b != a` (Ne is commutative).
+        let a_ne_b = binop(a.clone(), BinOp::Ne, b.clone());
+        let b_ne_a = binop(b.clone(), BinOp::Ne, a.clone());
+        assert!(
+            expr_phys_eq(&a_ne_b, &b_ne_a, &map),
+            "Ne must be commutative: a != b should match b != a"
+        );
+
+        // `a < b` must NOT equal `b < a` (Lt is not commutative).
+        let a_lt_b = binop(a.clone(), BinOp::Lt, b.clone());
+        let b_lt_a = binop(b.clone(), BinOp::Lt, a.clone());
+        assert!(
+            !expr_phys_eq(&a_lt_b, &b_lt_a, &map),
+            "Lt must NOT be commutative: a < b should not match b < a"
         );
     }
 }
