@@ -1,0 +1,23 @@
+-- query 10
+sum(a.l_ext)
+2000
+
+-- query 11
+sum(a.l_ext)
+2000
+
+-- query 12
+sum(l_ext)
+400
+
+-- query 13
+sum(l_ext)
+400
+
+-- query 14
+sum(l_ext)
+400
+
+-- query 15
+sum(l_ext)
+400

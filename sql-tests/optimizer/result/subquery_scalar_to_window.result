@@ -1,0 +1,11 @@
+-- query 10
+sum(l_ext)
+750
+
+-- query 11
+sum(l_ext)
+750
+
+-- query 13
+sum(l_ext)
+750
