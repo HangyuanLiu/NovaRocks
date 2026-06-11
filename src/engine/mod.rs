@@ -2755,6 +2755,7 @@ fn prepare_explain_query(
 /// `Planning: <ms> / Execution: <ms> / Rows: <N>` followed by the Verbose
 /// plan body. Per-operator runtime stats merge is out of scope for OPT-5;
 /// the pipeline has no systematic profile collection yet.
+#[allow(clippy::too_many_arguments)]
 fn explain_analyze_query(
     query: &sqlparser::ast::Query,
     analyzer_catalog: &dyn crate::sql::catalog::CatalogProvider,
@@ -2979,6 +2980,7 @@ pub(crate) fn execute_query_as_iceberg_write(
     .execute_with_write_outcome()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_query_with_catalog_provider(
     query: &sqlparser::ast::Query,
     analyzer_catalog: &dyn crate::sql::catalog::CatalogProvider,

@@ -22,7 +22,7 @@ pub(crate) enum NormExpr {
 }
 
 /// Returns None for unsupported expression kinds (window calls, subqueries,
-/// lambdas, CASE, IS TRUE/FALSE) — callers must treat None as "cannot match"
+/// lambdas, IS TRUE/FALSE) — callers must treat None as "cannot match"
 /// (fail closed).
 pub(crate) fn normalize(e: &TypedExpr, base_names: &HashMap<ColumnId, String>) -> Option<NormExpr> {
     let call = |name: &str, args: Vec<NormExpr>| NormExpr::Call {
@@ -152,7 +152,32 @@ pub(crate) fn normalize(e: &TypedExpr, base_names: &HashMap<ColumnId, String>) -
             ],
         ),
         ExprKind::Nested(inner) => return normalize(inner, base_names),
-        // Case / IsTruthValue / WindowCall / Lambda* / LambdaParamRef /
+        // CASE [operand] WHEN .. THEN .. [ELSE ..] END. WHEN/THEN pair order
+        // is semantically significant (first match wins), so args are NOT
+        // sorted. Absent operand/else are encoded with distinct zero-arg
+        // marker calls so `CASE WHEN c THEN a END` can never collide with
+        // `CASE WHEN c THEN a ELSE b END`.
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            let mut args = Vec::with_capacity(when_then.len() * 2 + 2);
+            args.push(match operand {
+                Some(op) => call("case_operand", vec![normalize(op, base_names)?]),
+                None => call("case_no_operand", vec![]),
+            });
+            for (when, then) in when_then {
+                args.push(normalize(when, base_names)?);
+                args.push(normalize(then, base_names)?);
+            }
+            args.push(match else_expr {
+                Some(e) => call("case_else", vec![normalize(e, base_names)?]),
+                None => call("case_no_else", vec![]),
+            });
+            call("case", args)
+        }
+        // IsTruthValue / WindowCall / Lambda* / LambdaParamRef /
         // SubqueryPlaceholder: not normalizable here -> fail closed.
         _ => return None,
     })
@@ -423,5 +448,46 @@ mod tests {
         let query_expr = bin(col_ref(&q_c), BinOp::Add, int_lit(1));
 
         assert!(map.rewrite(&query_expr, &q_names).is_none());
+    }
+
+    fn case_when(when: TypedExpr, then: TypedExpr, else_expr: Option<TypedExpr>) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::Case {
+                operand: None,
+                when_then: vec![(when, then)],
+                else_expr: else_expr.map(Box::new),
+            },
+            data_type: DataType::Int64,
+            nullable: true,
+        }
+    }
+
+    #[test]
+    fn case_when_normalizes_structurally() {
+        // CASE WHEN a > 1 THEN b ELSE 0 END must compare equal across
+        // ColumnId spaces and unequal when the ELSE differs or is absent.
+        let a1 = col(1, "a");
+        let b1 = col(2, "b");
+        let n1 = names(&[(1, "a"), (2, "b")]);
+        let a9 = col(9, "a");
+        let b9 = col(8, "b");
+        let n9 = names(&[(9, "a"), (8, "b")]);
+
+        let mk = |a: &OutputColumn, b: &OutputColumn, else_expr: Option<TypedExpr>| {
+            case_when(
+                bin(col_ref(a), BinOp::Gt, int_lit(1)),
+                col_ref(b),
+                else_expr,
+            )
+        };
+
+        let lhs = normalize(&mk(&a1, &b1, Some(int_lit(0))), &n1).expect("lhs");
+        let rhs = normalize(&mk(&a9, &b9, Some(int_lit(0))), &n9).expect("rhs");
+        assert_eq!(lhs, rhs);
+
+        let other_else = normalize(&mk(&a1, &b1, Some(int_lit(7))), &n1).expect("else 7");
+        assert_ne!(lhs, other_else);
+        let no_else = normalize(&mk(&a1, &b1, None), &n1).expect("no else");
+        assert_ne!(lhs, no_else);
     }
 }
