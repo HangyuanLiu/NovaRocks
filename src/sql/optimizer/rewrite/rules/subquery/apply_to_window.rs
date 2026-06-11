@@ -6,17 +6,24 @@
 //! precondition failure returns `Unchanged` so `ScalarApplyToJoin` produces the
 //! M1 join form. Never errors (the join form is always a valid fallback).
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 
+use arrow::datatypes::DataType;
+
 use super::win_magic_util::{collect_scan_column_map, collect_table_ids, expr_phys_eq, TableIdentity};
-use crate::sql::analysis::{ExprKind, TypedExpr};
+use crate::sql::analysis::{ExprKind, OutputColumn, SortItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::optimizer::rewrite::rules::utils::{collect_column_id_refs, split_and};
-use crate::sql::planner::plan::{AggregateCall, AggregateNode, ApplyKind, ApplyNode, LogicalPlan};
+use crate::sql::optimizer::rewrite::rules::utils::{collect_column_id_refs, combine_and, split_and};
+use crate::sql::planner::plan::{
+    AggregateCall, AggregateNode, ApplyKind, ApplyNode, FilterNode, LogicalPlan, SortNode,
+    WindowExpr, WindowNode,
+};
+use crate::sql::planner::plan_output_columns;
 
 const WHITELIST: &[&str] = &["count", "sum", "avg", "min", "max"];
 
@@ -52,15 +59,273 @@ impl LogicalRewriteRule for ApplyToWindow {
             && !a.correlation_conjuncts.is_empty()
     }
 
-    fn apply(&self, plan: LogicalPlan, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(&self, plan: LogicalPlan, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         let LogicalPlan::Filter(f) = &plan else { return Ok(RewriteResult::Unchanged) };
         let LogicalPlan::Apply(a) = f.input.as_ref() else { return Ok(RewriteResult::Unchanged) };
-        let Some(_m) = check_preconditions(&f.predicate, a) else {
+        let Some(m) = check_preconditions(&f.predicate, a) else {
             return Ok(RewriteResult::Unchanged);
         };
-        // Task 3 replaces this with the transform.
-        Ok(RewriteResult::Unchanged)
+
+        // Re-own the pieces. (matches() guaranteed Filter(Apply).)
+        let LogicalPlan::Filter(f) = plan else { unreachable!() };
+        let LogicalPlan::Apply(a) = *f.input else { unreachable!() };
+
+        // --- 1. Remap the inner aggregate's args to the outer instance of the same physical column. ---
+        let outer_map = collect_scan_column_map(&a.left);
+        let inner_map = collect_scan_column_map(&a.right);
+        let outer_cols = plan_output_columns(&a.left)?;
+        let mut phys_to_outer: HashMap<(TableIdentity, String), OutputColumn> = HashMap::new();
+        for oc in &outer_cols {
+            if let Some((tab, name)) = outer_map.get(&oc.column_id) {
+                phys_to_outer.insert((tab.clone(), name.clone()), oc.clone());
+            }
+        }
+        let mut agg_args = m.inner_agg.args.clone();
+        for arg in &mut agg_args {
+            if !remap_inner_to_outer(arg, &inner_map, &phys_to_outer) {
+                // Required column unavailable on outer side → fall back to join form.
+                return Ok(RewriteResult::Unchanged);
+            }
+        }
+
+        // --- 2. Mint the window output column; build the WindowExpr. ---
+        let factory = ctx
+            .column_ref_factory()
+            .ok_or_else(|| "ApplyToWindow requires ColumnRefFactory".to_string())?;
+        let win_id = factory.borrow_mut().create(
+            None,
+            format!("{}_window", m.inner_agg.name),
+            m.inner_agg.result_type.clone(),
+            true,
+        );
+        let win_expr = WindowExpr {
+            name: m.inner_agg.name.clone(),
+            args: agg_args,
+            distinct: false,
+            partition_by: m.partition_by.clone(),
+            order_by: vec![],
+            window_frame: None,
+            result_type: m.inner_agg.result_type.clone(),
+            output_name: format!("{}_window", m.inner_agg.name),
+            output_column_id: win_id,
+            ignore_nulls: false,
+        };
+
+        // --- 3. before-window Filter = all outer conjuncts except the subquery one. ---
+        let before: Vec<TypedExpr> = m
+            .outer_conjuncts
+            .iter()
+            .filter(|oc| !expr_struct_eq(oc, &m.subquery_conjunct))
+            .cloned()
+            .collect();
+        let outer_subtree = *a.left;
+        let before_filtered = if before.is_empty() {
+            outer_subtree
+        } else {
+            LogicalPlan::Filter(FilterNode {
+                predicate: combine_and(before),
+                input: Box::new(outer_subtree),
+                required_output_columns: None,
+            })
+        };
+
+        // --- 4. Sort(partition keys) under the Window. ---
+        let sort_items: Vec<SortItem> = m
+            .partition_by
+            .iter()
+            .map(|e| SortItem { expr: e.clone(), asc: true, nulls_first: true })
+            .collect();
+        let sorted = LogicalPlan::Sort(SortNode {
+            input: Box::new(before_filtered),
+            items: sort_items,
+            analytic_partition_by: m.partition_by.clone(),
+            required_output_columns: None,
+        });
+
+        // --- 5. Window node: output = base outer columns + the window column. ---
+        let mut window_output = plan_output_columns(&sorted)?;
+        window_output.push(OutputColumn {
+            column_id: win_id,
+            name: format!("{}_window", m.inner_agg.name),
+            data_type: m.inner_agg.result_type.clone(),
+            nullable: true,
+            is_internal: true,
+        });
+        let window = LogicalPlan::Window(WindowNode {
+            input: Box::new(sorted),
+            window_exprs: vec![win_expr],
+            output_columns: window_output,
+            required_output_columns: None,
+        });
+
+        // --- 6. after-window Filter = subquery comparison with APPLY_OUT replaced by the value expr. ---
+        let value_expr = build_value_expr(
+            &a.right,
+            a.inner_output_column_id,
+            m.inner_agg.output_column_id,
+            win_id,
+            &m.inner_agg.result_type,
+        )?;
+        let mut after_pred = m.subquery_conjunct.clone();
+        replace_column_ref(&mut after_pred, a.output_column.column_id, &value_expr);
+        let after = LogicalPlan::Filter(FilterNode {
+            predicate: after_pred,
+            input: Box::new(window),
+            required_output_columns: None,
+        });
+
+        Ok(RewriteResult::Changed(after))
     }
+}
+
+/// Recursively remap each `ColumnRef` in `expr` from an inner-scan column id to
+/// the corresponding outer-scan column id, using physical (table, column-name)
+/// identity.
+///
+/// Returns `true` if all ColumnRefs that appear in `inner_map` were successfully
+/// remapped to an outer twin. Returns `false` if a ColumnRef IS in `inner_map`
+/// but has NO outer twin in `phys_to_outer` (the column is not present on the
+/// outer side → caller should fall back to the join form).
+///
+/// ColumnRefs whose ids are NOT in `inner_map` (e.g. already-outer refs or
+/// literal-derived ids) are left unchanged and contribute `true`.
+fn remap_inner_to_outer(
+    expr: &mut TypedExpr,
+    inner_map: &HashMap<ColumnId, (TableIdentity, String)>,
+    phys_to_outer: &HashMap<(TableIdentity, String), OutputColumn>,
+) -> bool {
+    match &mut expr.kind {
+        ExprKind::ColumnRef { column_id, column, .. } => {
+            if let Some((tab, name)) = inner_map.get(column_id) {
+                // This ColumnRef is from an inner scan; find its outer twin.
+                match phys_to_outer.get(&(tab.clone(), name.clone())) {
+                    Some(outer_col) => {
+                        *column_id = outer_col.column_id;
+                        *column = outer_col.name.clone();
+                        expr.data_type = outer_col.data_type.clone();
+                        expr.nullable = outer_col.nullable;
+                        true
+                    }
+                    None => false, // inner column has no outer counterpart
+                }
+            } else {
+                // Not an inner-scan column; leave unchanged.
+                true
+            }
+        }
+        ExprKind::BinaryOp { left, right, .. } => {
+            // Clone to avoid simultaneous mutable borrows via reborrow trick.
+            let l_ok = remap_inner_to_outer(left, inner_map, phys_to_outer);
+            let r_ok = remap_inner_to_outer(right, inner_map, phys_to_outer);
+            l_ok && r_ok
+        }
+        ExprKind::FunctionCall { args, .. } => {
+            let mut ok = true;
+            for arg in args.iter_mut() {
+                if !remap_inner_to_outer(arg, inner_map, phys_to_outer) {
+                    ok = false;
+                }
+            }
+            ok
+        }
+        ExprKind::IsNull { expr: inner_expr, .. } => {
+            remap_inner_to_outer(inner_expr, inner_map, phys_to_outer)
+        }
+        ExprKind::UnaryOp { expr: inner_expr, .. } => {
+            remap_inner_to_outer(inner_expr, inner_map, phys_to_outer)
+        }
+        ExprKind::Cast { expr: inner_expr, .. } => {
+            remap_inner_to_outer(inner_expr, inner_map, phys_to_outer)
+        }
+        // Literals and other non-column-ref leaves: always ok, nothing to remap.
+        _ => true,
+    }
+}
+
+/// Build the "value expression" that replaces `APPLY_OUT` in the after-window
+/// filter predicate.
+///
+/// Post-`PushDownApplyAggFilter`, `apply_right` has at most ONE leading `Project`
+/// that computes the arithmetic on top of the aggregate result (e.g. `0.2 * avg`).
+/// If such a Project item with `output_column_id == inner_output_col_id` exists,
+/// clone that item's expression and substitute the aggregate output column with
+/// `WIN_ID`. If there is no leading Project (bare aggregate, `inner_output_col_id
+/// == agg_out_col_id`), return a bare `ColumnRef(WIN_ID)`.
+fn build_value_expr(
+    apply_right: &LogicalPlan,
+    inner_output_col_id: ColumnId,
+    agg_out_col_id: ColumnId,
+    win_id: ColumnId,
+    win_type: &DataType,
+) -> Result<TypedExpr, String> {
+    let win_ref = col_ref_expr(win_id, win_type);
+    // Peel exactly one optional leading Project (single-leading-Project assumption:
+    // PushDownApplyAggFilter inserts at most one Project above the Aggregate).
+    if let LogicalPlan::Project(proj) = apply_right {
+        // Look for the Project item whose output id matches inner_output_col_id.
+        for item in &proj.items {
+            if item.output_column_id == inner_output_col_id {
+                let mut value_expr = item.expr.clone();
+                // Replace the aggregate output column reference with win_id.
+                replace_column_ref(&mut value_expr, agg_out_col_id, &win_ref);
+                return Ok(value_expr);
+            }
+        }
+        // No matching item found in the Project (unusual shape) → safe fallback.
+    }
+    // No leading Project OR no matching item: inner_output_col_id IS the aggregate
+    // output column (bare agg case, e.g. q2 min/max with no arithmetic).
+    Ok(win_ref)
+}
+
+/// Build a nullable `ColumnRef` TypedExpr for `id` with the given type.
+fn col_ref_expr(id: ColumnId, dt: &DataType) -> TypedExpr {
+    TypedExpr {
+        kind: ExprKind::ColumnRef { column_id: id, qualifier: None, column: format!("col_{}", id.0) },
+        data_type: dt.clone(),
+        nullable: true,
+    }
+}
+
+/// Recursively replace every `ColumnRef { column_id == target }` in `expr` with
+/// `replacement.clone()`.
+fn replace_column_ref(expr: &mut TypedExpr, target: ColumnId, replacement: &TypedExpr) {
+    match &expr.kind {
+        ExprKind::ColumnRef { column_id, .. } if *column_id == target => {
+            *expr = replacement.clone();
+        }
+        _ => {}
+    }
+    // Recurse into children (non-ColumnRef nodes).
+    match &mut expr.kind {
+        ExprKind::BinaryOp { left, right, .. } => {
+            replace_column_ref(left, target, replacement);
+            replace_column_ref(right, target, replacement);
+        }
+        ExprKind::FunctionCall { args, .. } => {
+            for arg in args.iter_mut() {
+                replace_column_ref(arg, target, replacement);
+            }
+        }
+        ExprKind::IsNull { expr: inner_expr, .. } => {
+            replace_column_ref(inner_expr, target, replacement);
+        }
+        ExprKind::UnaryOp { expr: inner_expr, .. } => {
+            replace_column_ref(inner_expr, target, replacement);
+        }
+        ExprKind::Cast { expr: inner_expr, .. } => {
+            replace_column_ref(inner_expr, target, replacement);
+        }
+        // Literals, ColumnRefs (already handled above), and other leaves: nothing to recurse.
+        _ => {}
+    }
+}
+
+/// Structural equality used ONLY to identify the exact `subquery_conjunct` within
+/// the `outer_conjuncts` set. Both expressions come from the same `where_pred`
+/// via `split_and`, so debug-format equality is exact and correct here.
+fn expr_struct_eq(a: &TypedExpr, b: &TypedExpr) -> bool {
+    format!("{:?}", a.kind) == format!("{:?}", b.kind)
 }
 
 /// Port of StarRocks ScalarApply2AnalyticRule's check() family. Returns the
@@ -260,18 +525,22 @@ fn subquery_residual_conjuncts(apply_right: &LogicalPlan) -> Vec<TypedExpr> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::HashSet;
+    use std::rc::Rc;
 
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, TypedExpr};
+    use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
     use crate::sql::catalog::{ScanSource, TableDef};
-    use crate::sql::column_id::ColumnId;
+    use crate::sql::column_id::{ColumnId, ColumnRefFactory};
     use crate::sql::optimizer::rewrite::context::RewriteContext;
+    use crate::sql::optimizer::rewrite::result::RewriteResult;
+    use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
     use crate::sql::planner::plan::{
         AggregateCall, AggregateNode, ApplyKind, ApplyNode, FilterNode, JoinNode, LimitNode,
-        LogicalPlan, ScanNode,
+        LogicalPlan, ProjectNode, ScanNode,
     };
 
     // ---- Column ID constants -------------------------------------------------
@@ -350,10 +619,30 @@ mod tests {
         }
     }
 
+    fn mul_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(left),
+                op: BinOp::Mul,
+                right: Box::new(right),
+            },
+            data_type: DataType::Float64,
+            nullable: true,
+        }
+    }
+
     fn str_lit(s: &str) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::String(s.to_string())),
             data_type: DataType::Utf8,
+            nullable: false,
+        }
+    }
+
+    fn float_lit(v: f64) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Float(v)),
+            data_type: DataType::Float64,
             nullable: false,
         }
     }
@@ -589,8 +878,94 @@ mod tests {
         })
     }
 
+    /// Variant of the base fixture but with a leading Project above the agg:
+    /// `Project[inner_output_col_id := 2.0 * AVG_RESULT](Agg)`.
+    /// Here `inner_output_column_id` is VAL_ID (100), not AVG_RESULT.
+    fn winmagic_filter_apply_with_project() -> (LogicalPlan, ColumnId) {
+        const VAL_ID: ColumnId = ColumnId(100);
+        let corr_conj = eq_expr(
+            col_ref(P_PARTKEY, "p_partkey", DataType::Int64),
+            col_ref(INNER_L_PARTKEY, "l_partkey", DataType::Int64),
+        );
+        // Project: VAL_ID := 2.0 * AVG_RESULT
+        let project_expr = mul_expr(
+            float_lit(2.0),
+            col_ref_nullable(AVG_RESULT, "avg(l_quantity)", DataType::Float64),
+        );
+        let projected_right = LogicalPlan::Project(ProjectNode {
+            input: Box::new(make_inner_avg_agg()),
+            items: vec![
+                // passthrough: l_partkey
+                ProjectItem {
+                    expr: col_ref(INNER_L_PARTKEY, "l_partkey", DataType::Int64),
+                    output_name: "l_partkey".to_string(),
+                    output_column_id: INNER_L_PARTKEY,
+                },
+                // computed: 2.0 * avg -> VAL_ID
+                ProjectItem {
+                    expr: project_expr,
+                    output_name: "val".to_string(),
+                    output_column_id: VAL_ID,
+                },
+            ],
+            output_qualifier: None,
+            required_output_columns: None,
+        });
+        let apply = LogicalPlan::Apply(ApplyNode {
+            left: Box::new(make_outer_join()),
+            right: Box::new(projected_right),
+            kind: ApplyKind::Scalar,
+            subquery_expr: col_ref_nullable(APPLY_OUT, "val_subq", DataType::Float64),
+            output_column: OutputColumn {
+                column_id: APPLY_OUT,
+                name: "val_subq".to_string(),
+                data_type: DataType::Float64,
+                nullable: true,
+                is_internal: true,
+            },
+            inner_output_column_id: VAL_ID,
+            correlation_column_ids: vec![P_PARTKEY],
+            correlation_conjuncts: vec![corr_conj],
+            residual_predicate: None,
+            need_check_max_rows: false,
+            use_semi_anti: false,
+            uncorrelated_outer_predicate_columns: HashSet::new(),
+            required_output_columns: None,
+        });
+        let pred = and_expr(
+            and_expr(
+                eq_expr(
+                    col_ref(P_PARTKEY, "p_partkey", DataType::Int64),
+                    col_ref(L_PARTKEY, "l_partkey", DataType::Int64),
+                ),
+                eq_expr(
+                    col_ref(P_BRAND, "p_brand", DataType::Utf8),
+                    str_lit("x"),
+                ),
+            ),
+            lt_expr(
+                col_ref(L_QUANTITY, "l_quantity", DataType::Float64),
+                col_ref_nullable(APPLY_OUT, "val_subq", DataType::Float64),
+            ),
+        );
+        (
+            LogicalPlan::Filter(FilterNode {
+                input: Box::new(apply),
+                predicate: pred,
+                required_output_columns: None,
+            }),
+            VAL_ID,
+        )
+    }
+
     fn ctx() -> RewriteContext {
         RewriteContext::for_query(Vec::<String>::new())
+    }
+
+    fn ctx_with_factory() -> RewriteContext {
+        let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        ctx.set_column_ref_factory(Rc::new(RefCell::new(ColumnRefFactory::new())));
+        ctx
     }
 
     // ---- matches() tests --------------------------------------------------------
@@ -631,6 +1006,201 @@ mod tests {
             required_output_columns: None,
         });
         assert!(!rule.matches(&apply, &ctx()));
+    }
+
+    // ---- transform tests --------------------------------------------------------
+
+    /// The transform must emit a Window with exactly one WindowExpr (avg),
+    /// with partition_by pointing to the OUTER p_partkey, args[0] pointing
+    /// to the OUTER l_quantity (NOT inner INNER_L_QUANTITY), and no Apply
+    /// anywhere in the result tree.
+    #[test]
+    fn transform_emits_window_over_outer() {
+        let rule = ApplyToWindow;
+        let plan = winmagic_filter_apply();
+        let mut ctx = ctx_with_factory();
+
+        let result = rule.apply(plan, &mut ctx).expect("apply must not error");
+        let RewriteResult::Changed(result) = result else {
+            panic!("expected Changed, got Unchanged");
+        };
+
+        // No Apply anywhere.
+        assert!(
+            super::super::find_residual_apply(&result).is_none(),
+            "Apply must be gone after transform"
+        );
+
+        // after-window Filter at the top.
+        let LogicalPlan::Filter(after_filter) = &result else {
+            panic!("expected after-window Filter at root, got: {:?}", result);
+        };
+
+        // Window inside.
+        let LogicalPlan::Window(window_node) = after_filter.input.as_ref() else {
+            panic!("expected Window under after-filter");
+        };
+        assert_eq!(window_node.window_exprs.len(), 1);
+        let win_expr = &window_node.window_exprs[0];
+        assert_eq!(win_expr.name, "avg");
+
+        // Partition-by: one ColumnRef pointing to OUTER p_partkey (P_PARTKEY = 10).
+        assert_eq!(win_expr.partition_by.len(), 1);
+        let ExprKind::ColumnRef { column_id: pb_id, .. } = &win_expr.partition_by[0].kind else {
+            panic!("expected ColumnRef in partition_by");
+        };
+        assert_eq!(*pb_id, P_PARTKEY, "partition_by must reference outer p_partkey");
+
+        // args[0] must reference OUTER l_quantity (L_QUANTITY = 3, NOT INNER_L_QUANTITY = 21).
+        assert_eq!(win_expr.args.len(), 1);
+        let ExprKind::ColumnRef { column_id: arg_id, .. } = &win_expr.args[0].kind else {
+            panic!("expected ColumnRef in window args");
+        };
+        assert_eq!(
+            *arg_id, L_QUANTITY,
+            "window arg must reference outer lineitem.l_quantity (id=3), not inner (id=21)"
+        );
+
+        // Sort under Window.
+        let LogicalPlan::Sort(sort_node) = window_node.input.as_ref() else {
+            panic!("expected Sort under Window");
+        };
+        assert_eq!(sort_node.items.len(), 1);
+        assert_eq!(sort_node.analytic_partition_by.len(), 1);
+
+        // before-window Filter under Sort.
+        let LogicalPlan::Filter(before_filter) = sort_node.input.as_ref() else {
+            panic!("expected before-window Filter under Sort");
+        };
+        // before-filter predicate must contain p_partkey == l_partkey AND p_brand == 'x'
+        // (NOT the l_quantity < APPLY_OUT conjunct).
+        let before_conjuncts = split_and(before_filter.predicate.clone());
+        // Should not contain any reference to APPLY_OUT.
+        for c in &before_conjuncts {
+            let ids = collect_column_id_refs(c);
+            assert!(
+                !ids.contains(&APPLY_OUT),
+                "before-window filter must not reference APPLY_OUT"
+            );
+        }
+        // before-filter input is the original CrossJoin.
+        assert!(
+            matches!(before_filter.input.as_ref(), LogicalPlan::Join(_)),
+            "before-window filter input must be the original Join"
+        );
+    }
+
+    /// The after-window Filter predicate must reference WIN_ID (the minted window
+    /// output column), not APPLY_OUT and not the inner AVG_RESULT.
+    ///
+    /// Two sub-cases:
+    /// (a) bare aggregate (no leading Project): value_expr == ColumnRef(WIN_ID).
+    /// (b) with leading Project (`2 * avg`): value_expr == `2.0 * ColumnRef(WIN_ID)`.
+    #[test]
+    fn transform_rewrites_subquery_comparison_to_window_col() {
+        let rule = ApplyToWindow;
+
+        // --- (a) Bare aggregate (no leading Project) ---
+        {
+            let plan = winmagic_filter_apply();
+            let mut ctx = ctx_with_factory();
+            let result = rule.apply(plan, &mut ctx).unwrap();
+            let RewriteResult::Changed(result) = result else { panic!("expected Changed") };
+            let LogicalPlan::Filter(after) = &result else { panic!("expected Filter") };
+            let LogicalPlan::Window(win) = after.input.as_ref() else { panic!("expected Window") };
+            let win_id = win.window_exprs[0].output_column_id;
+
+            // The after-filter predicate must reference win_id, not APPLY_OUT, not AVG_RESULT.
+            let refs = collect_column_id_refs(&after.predicate);
+            assert!(
+                refs.contains(&win_id),
+                "after-window predicate must reference WIN_ID (bare agg case)"
+            );
+            assert!(
+                !refs.contains(&APPLY_OUT),
+                "after-window predicate must NOT reference APPLY_OUT"
+            );
+            assert!(
+                !refs.contains(&AVG_RESULT),
+                "after-window predicate must NOT reference inner AVG_RESULT"
+            );
+        }
+
+        // --- (b) With leading Project (2 * avg) ---
+        {
+            let (plan, _val_id) = winmagic_filter_apply_with_project();
+            let mut ctx = ctx_with_factory();
+            let result = rule.apply(plan, &mut ctx).unwrap();
+            let RewriteResult::Changed(result) = result else { panic!("expected Changed") };
+            let LogicalPlan::Filter(after) = &result else { panic!("expected Filter") };
+            let LogicalPlan::Window(win) = after.input.as_ref() else { panic!("expected Window") };
+            let win_id = win.window_exprs[0].output_column_id;
+
+            let refs = collect_column_id_refs(&after.predicate);
+            assert!(
+                refs.contains(&win_id),
+                "after-window predicate must reference WIN_ID (project case)"
+            );
+            assert!(
+                !refs.contains(&APPLY_OUT),
+                "after-window predicate must NOT reference APPLY_OUT (project case)"
+            );
+            assert!(
+                !refs.contains(&AVG_RESULT),
+                "after-window predicate must NOT reference inner AVG_RESULT (project case)"
+            );
+            // The value expression must be `2.0 * WIN_ID`, i.e. the BinaryOp must be Mul.
+            // Walk the predicate: find the BinaryOp whose right (or left) is ColumnRef(win_id).
+            fn contains_mul_with_win(expr: &TypedExpr, win_id: ColumnId) -> bool {
+                match &expr.kind {
+                    ExprKind::BinaryOp { left, op: BinOp::Mul, right } => {
+                        let lr = collect_column_id_refs(right);
+                        let ll = collect_column_id_refs(left);
+                        if lr.contains(&win_id) || ll.contains(&win_id) {
+                            return true;
+                        }
+                        contains_mul_with_win(left, win_id) || contains_mul_with_win(right, win_id)
+                    }
+                    ExprKind::BinaryOp { left, right, .. } => {
+                        contains_mul_with_win(left, win_id) || contains_mul_with_win(right, win_id)
+                    }
+                    _ => false,
+                }
+            }
+            assert!(
+                contains_mul_with_win(&after.predicate, win_id),
+                "after-window predicate for project case must contain (2.0 * WIN_ID)"
+            );
+        }
+    }
+
+    /// When preconditions fail (e.g. self-join on outer), the rule must return Unchanged.
+    #[test]
+    fn transform_unchanged_when_precondition_fails() {
+        let rule = ApplyToWindow;
+        // Self-join outer: CrossJoin(lineitem(table_id=1), lineitem(table_id=1))
+        let plan = winmagic_filter_apply();
+        let (pred, a_orig) = extract_filter_apply(&plan);
+        let mut a = a_orig.clone();
+        a.left = Box::new(LogicalPlan::Join(JoinNode {
+            left: Box::new(make_outer_lineitem_scan()),
+            right: Box::new(make_outer_lineitem_scan()),
+            join_type: JoinKind::Cross,
+            condition: None,
+            required_output_columns: None,
+        }));
+        let bad_plan = LogicalPlan::Filter(FilterNode {
+            input: Box::new(LogicalPlan::Apply(a)),
+            predicate: pred.clone(),
+            required_output_columns: None,
+        });
+
+        let mut ctx = ctx_with_factory();
+        let result = rule.apply(bad_plan, &mut ctx).expect("must not error");
+        assert!(
+            matches!(result, RewriteResult::Unchanged),
+            "self-join fixture must produce Unchanged"
+        );
     }
 
     // ---- precondition tests -----------------------------------------------------
@@ -857,6 +1427,127 @@ mod tests {
         assert!(
             check_preconditions(&pred_without_apply, a).is_none(),
             "WHERE predicate without APPLY_OUT reference must reject"
+        );
+    }
+
+    /// Step 3(b): exercises the 4d per-conjunct mismatch branch directly.
+    /// A subquery with a residual Filter that has the SAME number of conjuncts
+    /// as the outer-side remainders but a DIFFERENT conjunct (non-phys-eq) must
+    /// reject.
+    #[test]
+    fn precond_rejects_4d_differing_residual_same_count() {
+        // Build a plan where:
+        // - outer WHERE has one "extra" conjunct beyond corr-twin and subquery-comparison:
+        //   l_orderkey > 100  (references outer lineitem, not only part)
+        // - subquery has a residual Filter with one conjunct, but different:
+        //   inner l_quantity < 999.0  (does NOT phys-match l_orderkey > 100)
+        let corr_conj = eq_expr(
+            col_ref(P_PARTKEY, "p_partkey", DataType::Int64),
+            col_ref(INNER_L_PARTKEY, "l_partkey", DataType::Int64),
+        );
+        // Residual inside subquery: l_quantity < 999
+        let inner_residual = TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(col_ref(INNER_L_QUANTITY, "l_quantity", DataType::Float64)),
+                op: BinOp::Lt,
+                right: Box::new(TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::Float(999.0)),
+                    data_type: DataType::Float64,
+                    nullable: false,
+                }),
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        };
+        let inner_with_filter = LogicalPlan::Filter(FilterNode {
+            input: Box::new(make_inner_lineitem_scan()),
+            predicate: inner_residual,
+            required_output_columns: None,
+        });
+        let agg_with_residual = AggregateNode {
+            input: Box::new(inner_with_filter),
+            group_by: vec![col_ref(INNER_L_PARTKEY, "l_partkey", DataType::Int64)],
+            aggregates: vec![AggregateCall {
+                name: "avg".to_string(),
+                args: vec![col_ref(INNER_L_QUANTITY, "l_quantity", DataType::Float64)],
+                distinct: false,
+                result_type: DataType::Float64,
+                order_by: vec![],
+                output_column_id: AVG_RESULT,
+            }],
+            output_columns: vec![
+                OutputColumn {
+                    column_id: INNER_L_PARTKEY,
+                    name: "l_partkey".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    is_internal: false,
+                },
+                OutputColumn {
+                    column_id: AVG_RESULT,
+                    name: "avg(l_quantity)".to_string(),
+                    data_type: DataType::Float64,
+                    nullable: true,
+                    is_internal: false,
+                },
+            ],
+            already_pushed: false,
+            required_output_columns: None,
+        };
+        let apply = ApplyNode {
+            left: Box::new(make_outer_join()),
+            right: Box::new(LogicalPlan::Aggregate(agg_with_residual)),
+            kind: ApplyKind::Scalar,
+            subquery_expr: col_ref_nullable(APPLY_OUT, "avg_subq", DataType::Float64),
+            output_column: OutputColumn {
+                column_id: APPLY_OUT,
+                name: "avg_subq".to_string(),
+                data_type: DataType::Float64,
+                nullable: true,
+                is_internal: true,
+            },
+            inner_output_column_id: AVG_RESULT,
+            correlation_column_ids: vec![P_PARTKEY],
+            correlation_conjuncts: vec![corr_conj],
+            residual_predicate: None,
+            need_check_max_rows: false,
+            use_semi_anti: false,
+            uncorrelated_outer_predicate_columns: HashSet::new(),
+            required_output_columns: None,
+        };
+        // Outer WHERE: (p_partkey == l_partkey) AND (l_orderkey > 100) AND (l_quantity < APPLY_OUT)
+        // l_orderkey > 100 references outer lineitem (not only "part"), so 4c does NOT drop it.
+        // After 4a (removes corr-twin) and 4b (removes subquery-comparison), outer_conjuncts = [l_orderkey > 100].
+        // sub_residual = [inner l_quantity < 999].  Same count (1), but non-phys-eq → None.
+        let outer_extra = TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(col_ref(L_ORDERKEY, "l_orderkey", DataType::Int64)),
+                op: BinOp::Gt,
+                right: Box::new(TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::Int(100)),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                }),
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        };
+        let pred = and_expr(
+            and_expr(
+                eq_expr(
+                    col_ref(P_PARTKEY, "p_partkey", DataType::Int64),
+                    col_ref(L_PARTKEY, "l_partkey", DataType::Int64),
+                ),
+                outer_extra,
+            ),
+            lt_expr(
+                col_ref(L_QUANTITY, "l_quantity", DataType::Float64),
+                col_ref_nullable(APPLY_OUT, "avg_subq", DataType::Float64),
+            ),
+        );
+        assert!(
+            check_preconditions(&pred, &apply).is_none(),
+            "differing residual conjunct (same count, non-phys-eq) must reject (4d branch)"
         );
     }
 
