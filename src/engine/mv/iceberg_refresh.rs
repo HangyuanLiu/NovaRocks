@@ -8261,7 +8261,7 @@ fn try_rewrite_select_sql_for_strategy_dispatch_rebind(
     }
 }
 
-fn parse_mv_select_query(sql: &str) -> Result<sqlparser::ast::Query, String> {
+pub(crate) fn parse_mv_select_query(sql: &str) -> Result<sqlparser::ast::Query, String> {
     let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)
         .map_err(|e| format!("stored MV SELECT normalize error: {e}"))?;
     let statement = crate::sql::parser::parse_normalized_sql_raw(&normalized)
@@ -10714,6 +10714,9 @@ fn incremental_refresh_iceberg_mv_with_changes(
             Some(&*catalogs_guard),
             Some(&ctx),
             imv_rewrite_validator,
+            // MV refresh must never rewrite onto a materialized view (and the
+            // mv_refresh_ctx gate would block it anyway): no MV rewrite here.
+            None,
         ) {
             drop(catalogs_guard);
             return Err(handle_iceberg_mv_commit_error(

@@ -406,6 +406,9 @@ impl Rule for ScanToPhysical {
                 // Propagated from the logical scan. Populated by Task 7
                 // `LowCardinalityDictionaryRewrite`; empty otherwise.
                 dict_columns: op.dict_columns.clone(),
+                // Propagated from the logical scan so that MvRewrite-injected
+                // scans carry the annotation through to the physical plan.
+                mv_rewritten_from: op.mv_rewritten_from.clone(),
             }),
             children: expr.children.clone(),
         }]
@@ -1554,6 +1557,7 @@ mod join_demotion_tests {
                 predicates: vec![],
                 required_columns: None,
                 dict_columns: vec![],
+                mv_rewritten_from: None,
             }),
             children: vec![],
         };

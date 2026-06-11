@@ -1772,6 +1772,7 @@ mod tests {
                 predicates: scan.predicates,
                 required_columns: scan.required_columns,
                 dict_columns: scan.dict_columns,
+                mv_rewritten_from: None,
             }),
             children: vec![],
         };

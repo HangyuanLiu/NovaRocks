@@ -1020,6 +1020,11 @@ async fn execute_statement_text(
                 shim.optimizer_settings.enable_table_prune_on_update = enabled
             }
             "enable_eliminate_agg" => shim.optimizer_settings.enable_eliminate_agg = enabled,
+            // Tri-state Option<bool> field: store Some(enabled) so an explicit
+            // SET is preserved as an override; None elsewhere means "default".
+            "enable_materialized_view_rewrite" => {
+                shim.optimizer_settings.enable_materialized_view_rewrite = Some(enabled)
+            }
             _ => return Ok(StatementResult::Ok),
         }
         return Ok(StatementResult::Ok);

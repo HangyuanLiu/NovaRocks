@@ -337,6 +337,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            mv_rewritten_from: None,
         });
         let expr = MExpr {
             id: 0,
@@ -407,6 +408,7 @@ mod tests {
                 predicates: vec![],
                 required_columns: None,
                 dict_columns: vec![],
+                mv_rewritten_from: None,
             }),
             children: vec![],
         });
@@ -428,6 +430,7 @@ mod tests {
                 predicates: vec![],
                 required_columns: None,
                 dict_columns: vec![],
+                mv_rewritten_from: None,
             }),
             children: vec![],
         });
@@ -592,6 +595,7 @@ mod tests {
                 predicates: vec![],
                 required_columns: None,
                 dict_columns: vec![],
+                mv_rewritten_from: None,
             }),
             children: vec![],
         });
@@ -666,6 +670,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            mv_rewritten_from: None,
         });
         let expr = MExpr {
             id: 0,
@@ -954,6 +959,7 @@ mod cascaded_derivation_tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            mv_rewritten_from: None,
         })
     }
 

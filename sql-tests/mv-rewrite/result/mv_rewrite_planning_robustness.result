@@ -1,0 +1,25 @@
+-- query 10
+dairy_cnt	snack_cnt
+50	50
+
+-- query 11
+acd
+50
+
+-- query 12
+category_l1	c
+Baby	800
+Dairy	800
+Snacks	800
+
+-- query 17
+category_l1	c	s
+Baby	800	192900
+Dairy	800	193200
+Snacks	800	193100
+
+-- query 24
+region	s
+east	39600
+north	39600
+west	39600

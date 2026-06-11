@@ -334,6 +334,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            mv_rewritten_from: None,
         });
         let cost = compute_cost(&op, &s, &[]);
         assert!((cost - 100_000.0).abs() < 1.0);
@@ -590,6 +591,7 @@ mod tests {
             predicates: vec![],
             required_columns: None,
             dict_columns: vec![],
+            mv_rewritten_from: None,
         });
         assert!((compute_cost(&op, &s, &[]) - 0.0).abs() < f64::EPSILON);
     }

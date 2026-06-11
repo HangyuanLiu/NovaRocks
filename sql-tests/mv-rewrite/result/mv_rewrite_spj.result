@@ -1,0 +1,15 @@
+-- query 10
+region	day	c	s
+east	d2	40	360
+north	d2	40	360
+west	d2	40	360
+
+-- query 12
+region	day	s
+east	d2	360
+
+-- query 14
+region	s
+east	360
+north	360
+west	360

@@ -51,6 +51,15 @@ pub(crate) struct SessionOptimizerSettings {
     /// Session override for the RF probe-side minimum selectivity gate.
     /// `None` means use the StarRocks default (0.5).
     pub rf_probe_min_selectivity: Option<f64>,
+    /// Session override for transparent MV query rewrite.
+    /// `None` means the default (enabled).
+    pub enable_materialized_view_rewrite: Option<bool>,
+}
+
+impl SessionOptimizerSettings {
+    pub(crate) fn mv_rewrite_enabled(&self) -> bool {
+        self.enable_materialized_view_rewrite.unwrap_or(true)
+    }
 }
 
 thread_local! {
@@ -261,5 +270,17 @@ mod tests {
             SessionOptimizerSettings::default().subquery_unnest_mode,
             SubqueryUnnestMode::Legacy
         );
+    }
+
+    #[test]
+    fn mv_rewrite_enabled_defaults_to_true() {
+        let settings = SessionOptimizerSettings::default();
+        assert!(settings.mv_rewrite_enabled());
+        let mut off = SessionOptimizerSettings::default();
+        off.enable_materialized_view_rewrite = Some(false);
+        assert!(!off.mv_rewrite_enabled());
+        let mut on = SessionOptimizerSettings::default();
+        on.enable_materialized_view_rewrite = Some(true);
+        assert!(on.mv_rewrite_enabled());
     }
 }
