@@ -1814,11 +1814,12 @@ fn build_storage_factory_for_entry(
 }
 
 /// Synchronous dispatcher that returns an `Arc<dyn Catalog>` regardless of
-/// whether the entry is Hadoop or REST. REST catalog construction is
-/// asynchronous (one `/v1/config` handshake is required), so this helper
-/// blocks on it via `block_on_iceberg`. Callers in synchronous engine
-/// flows can swap `build_hadoop_catalog(...).map(Arc::new)` for
-/// `build_iceberg_catalog(...)` to gain REST support transparently.
+/// whether the entry is Hadoop, REST, or Hive. REST and Hive catalog
+/// construction is asynchronous (REST does a `/v1/config` handshake; the Hive
+/// HMS client uses async volo-thrift), so this helper blocks on them via
+/// `block_on_iceberg`. Callers in synchronous engine flows can swap
+/// `build_hadoop_catalog(...).map(Arc::new)` for `build_iceberg_catalog(...)`
+/// to gain REST / Hive support transparently.
 #[allow(dead_code)] // Will replace explicit build_hadoop_catalog calls in a follow-up.
 pub(crate) fn build_iceberg_catalog(
     entry: &IcebergCatalogEntry,
