@@ -6,7 +6,8 @@ use std::sync::{Arc, RwLock};
 use arrow::record_batch::RecordBatch;
 
 use crate::connector::backend::{
-    CatalogBackend, CreateTableRequest, ResolvedTable, TableSink, TableSource,
+    CatalogBackend, CreateTableRequest, CreateViewRequest, ResolvedTable, ResolvedView, TableSink,
+    TableSource,
 };
 use crate::connector::iceberg::catalog::IcebergLoadedTable;
 use crate::sql::catalog::{
@@ -22,6 +23,7 @@ use super::registry::{
     insert_rows as reg_insert_rows, list_tables as reg_list_tables, load_table as reg_load_table,
     namespace_exists as reg_namespace_exists,
 };
+use super::views;
 
 const NOVAROCKS_MV_APPLY_KEY_COLUMN_PROPERTY: &str = "novarocks.mv.apply-key.column";
 const NOVAROCKS_MV_HIDDEN_COLUMNS_PROPERTY: &str = "novarocks.mv.hidden-columns";
@@ -127,6 +129,47 @@ impl CatalogBackend for IcebergCatalogBackend {
         table: &str,
     ) -> Result<Option<i32>, String> {
         reg_current_schema_id(&self.entry(catalog)?, namespace, table).map(Some)
+    }
+
+    fn create_view(&self, req: CreateViewRequest) -> Result<(), String> {
+        let entry = self.entry(&req.catalog)?;
+        views::create_view(
+            &entry,
+            &req.namespace,
+            &req.view,
+            &req.columns,
+            &req.view_sql,
+            req.comment.as_deref(),
+            req.or_replace,
+        )
+    }
+
+    fn drop_view(&self, catalog: &str, namespace: &str, view: &str) -> Result<(), String> {
+        views::drop_view(&self.entry(catalog)?, namespace, view)
+    }
+
+    fn load_view(
+        &self,
+        catalog: &str,
+        namespace: &str,
+        view: &str,
+    ) -> Result<ResolvedView, String> {
+        let loaded = views::load_view(&self.entry(catalog)?, namespace, view)?;
+        Ok(ResolvedView {
+            sql: loaded.sql,
+            dialect: loaded.dialect,
+            default_namespace: loaded.default_namespace,
+            column_names: loaded.column_names,
+            comment: loaded.comment,
+        })
+    }
+
+    fn view_exists(&self, catalog: &str, namespace: &str, view: &str) -> Result<bool, String> {
+        views::view_exists(&self.entry(catalog)?, namespace, view)
+    }
+
+    fn list_views(&self, catalog: &str, namespace: &str) -> Result<Vec<String>, String> {
+        views::list_views(&self.entry(catalog)?, namespace)
     }
 }
 

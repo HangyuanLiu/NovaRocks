@@ -1703,9 +1703,8 @@ fn latest_table_metadata_file_s3(
         tbl_name
     );
 
-    // Find the latest metadata JSON — prefer Hadoop-catalog format (`vN.metadata.json`)
-    // which is the canonical format written by HadoopFileSystemCatalog, with fallback
-    // to the internal format (`{version}-{uuid}.metadata.json`) for pre-migration tables.
+    // Find the latest metadata JSON in the Hadoop-catalog naming convention
+    // (`vN.metadata.json`) — the only layout NovaRocks writes.
     block_on_iceberg(async {
         let entries = op
             .list(&meta_prefix)
@@ -1744,50 +1743,71 @@ fn current_schema_id_from_metadata_json(
     })
 }
 
-fn parse_internal_metadata_version(file_name: &str) -> Option<i32> {
-    let base = file_name.strip_suffix(".metadata.json")?;
-    let (version, uuid) = base.split_once('-')?;
-    if uuid.is_empty() {
-        return None;
-    }
-    version.parse::<i32>().ok()
-}
-
 fn parse_hadoop_metadata_version(file_name: &str) -> Option<i32> {
     let base = file_name.strip_suffix(".metadata.json")?;
     let version_str = base.strip_prefix('v')?;
-    // Must be purely numeric (no dash, no UUID suffix) to distinguish from internal format.
+    // Must be purely numeric — reject names like "v1-foo.metadata.json".
     if version_str.contains('-') {
         return None;
     }
     version_str.parse::<i32>().ok()
 }
 
+#[cfg(test)]
+mod metadata_filename_tests {
+    use super::choose_latest_metadata_filename;
+
+    #[test]
+    fn picks_highest_hadoop_version() {
+        let files = vec![
+            "v1.metadata.json".to_string(),
+            "v10.metadata.json".to_string(),
+            "v2.metadata.json".to_string(),
+        ];
+        assert_eq!(
+            choose_latest_metadata_filename(&files).unwrap(),
+            "v10.metadata.json"
+        );
+    }
+
+    #[test]
+    fn ignores_internal_uuid_format() {
+        let files = vec![
+            "00009-9a8b7c6d-1111-2222-3333-444455556666.metadata.json".to_string(),
+            "v3.metadata.json".to_string(),
+        ];
+        assert_eq!(
+            choose_latest_metadata_filename(&files).unwrap(),
+            "v3.metadata.json"
+        );
+    }
+
+    #[test]
+    fn internal_format_only_is_an_error() {
+        // Pre-deletion the {version}-{uuid} fallback would return Ok here.
+        // NovaRocks has no historical users; the internal naming was never a
+        // supported on-disk layout, so it must not be recognized.
+        let files =
+            vec!["00001-9a8b7c6d-1111-2222-3333-444455556666.metadata.json".to_string()];
+        assert!(choose_latest_metadata_filename(&files).is_err());
+    }
+}
+
 /// Choose the latest metadata file from a list of file names found in the
-/// metadata directory. Prefers Hadoop-catalog format (`v{N}.metadata.json`)
-/// which is the canonical format written by `HadoopFileSystemCatalog`. Falls
-/// back to the internal format (`{version}-{uuid}.metadata.json`) for
-/// pre-migration tables.
+/// metadata directory. Only the Hadoop-catalog naming convention
+/// (`v{N}.metadata.json`) is recognized — it is the only layout NovaRocks
+/// writes and the only one StarRocks FE / Spark / Trino can discover via
+/// `version-hint.text`.
 fn choose_latest_metadata_filename(file_names: &[String]) -> Result<String, String> {
-    // Prefer Hadoop-catalog format — canonical format written by HadoopFileSystemCatalog
     let mut hadoop: Vec<(i32, &str)> = file_names
         .iter()
         .filter_map(|name| parse_hadoop_metadata_version(name).map(|v| (v, name.as_str())))
         .collect();
-    if !hadoop.is_empty() {
-        hadoop.sort_by_key(|(v, _)| *v);
-        return Ok(hadoop.last().unwrap().1.to_string());
+    if hadoop.is_empty() {
+        return Err("no iceberg metadata files found".to_string());
     }
-    // Fallback: internal format for pre-migration tables
-    let mut internal: Vec<(i32, &str)> = file_names
-        .iter()
-        .filter_map(|name| parse_internal_metadata_version(name).map(|v| (v, name.as_str())))
-        .collect();
-    if !internal.is_empty() {
-        internal.sort_by_key(|(v, _)| *v);
-        return Ok(internal.last().unwrap().1.to_string());
-    }
-    Err("no iceberg metadata files found".to_string())
+    hadoop.sort_by_key(|(v, _)| *v);
+    Ok(hadoop.last().unwrap().1.to_string())
 }
 
 fn path_to_file_uri(path: &Path) -> String {

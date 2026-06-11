@@ -1060,6 +1060,8 @@ async fn execute_statement_text(
         && !is_materialized_view_management_statement(trimmed)
         && !looks_like_show_alter_table_optimize(trimmed)
         && !looks_like_show_create_table(trimmed)
+        && !crate::engine::statement::looks_like_show_create_view(trimmed)
+        && !crate::engine::statement::looks_like_show_views(trimmed)
     {
         return Ok(StatementResult::Ok);
     }
@@ -1084,6 +1086,8 @@ async fn execute_statement_text(
         && !is_materialized_view_management_statement(&rewritten)
         && !looks_like_show_alter_table_optimize(&rewritten)
         && !looks_like_show_create_table(&rewritten)
+        && !crate::engine::statement::looks_like_show_create_view(&rewritten)
+        && !crate::engine::statement::looks_like_show_views(&rewritten)
     {
         return Err((
             ErrorKind::ER_NOT_SUPPORTED_YET,

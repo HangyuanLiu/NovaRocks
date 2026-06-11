@@ -7,6 +7,7 @@ pub(crate) mod hadoop_catalog;
 pub(crate) mod registry;
 pub(crate) mod s3_storage;
 pub(crate) mod schema_update;
+pub(crate) mod views;
 
 // Re-export the same surface the previous `standalone::iceberg::*` module
 // offered, so callers only need to update the module prefix, not each

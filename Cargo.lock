@@ -2044,8 +2044,6 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "892fe71df3f5d1707c7ede042545051aca659a8a4a8ca828c5a13064338f56fc"
 dependencies = [
  "async-trait",
  "chrono",
