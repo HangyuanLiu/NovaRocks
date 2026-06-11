@@ -30,6 +30,17 @@ if [[ ! -f "$NOVAROCKS_SPARK_DEFAULTS" ]]; then
   exit 1
 fi
 
+extra_defaults_files=()
+if [[ -n "${NOVAROCKS_SPARK_EXTRA_DEFAULTS:-}" ]]; then
+  IFS=':' read -r -a extra_defaults_files <<< "$NOVAROCKS_SPARK_EXTRA_DEFAULTS"
+  for defaults_file in "${extra_defaults_files[@]}"; do
+    if [[ ! -f "$defaults_file" ]]; then
+      echo "Spark extra defaults file not found: $defaults_file" >&2
+      exit 1
+    fi
+  done
+fi
+
 compose_args=(
   docker compose
   --env-file "$NOVA_ENV_COMPOSE_ENV"
@@ -43,7 +54,13 @@ tmp_defaults="$tmp_dir/spark-defaults.conf"
 
 cd "$WORKSPACE_ROOT"
 "${compose_args[@]}" exec -T spark /bin/bash -lc "mkdir -p '$tmp_dir'"
-"${compose_args[@]}" exec -T spark /bin/bash -lc "cat > '$tmp_defaults'" < "$NOVAROCKS_SPARK_DEFAULTS"
+{
+  cat "$NOVAROCKS_SPARK_DEFAULTS"
+  for defaults_file in "${extra_defaults_files[@]}"; do
+    printf '\n'
+    cat "$defaults_file"
+  done
+} | "${compose_args[@]}" exec -T spark /bin/bash -lc "cat > '$tmp_defaults'"
 "${compose_args[@]}" exec -T spark /bin/bash -lc "cat > '$tmp_sql'" < "$sql_file"
 "${compose_args[@]}" exec -T spark /bin/bash -lc "
   set -euo pipefail

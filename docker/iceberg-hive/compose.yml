@@ -1,0 +1,22 @@
+services:
+  hms:
+    image: ${HMS_IMAGE:-novarocks/hive-metastore:4.0.0}
+    build:
+      context: .
+    pull_policy: missing
+    environment:
+      SERVICE_NAME: metastore
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-admin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-admin123}
+      AWS_REGION: us-east-1
+    ports:
+      - "${NOVA_ENV_HMS_PORT:-9083}:9083"
+    networks:
+      iceberg_rest_net:
+        aliases:
+          - hms
+
+networks:
+  iceberg_rest_net:
+    external: true
+    name: ${NOVA_ENV_REST_NETWORK:-nr-iceberg-rest_iceberg_net}

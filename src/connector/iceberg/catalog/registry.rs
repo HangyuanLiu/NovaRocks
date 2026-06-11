@@ -57,6 +57,12 @@ pub(crate) enum IcebergCatalogKind {
     /// protocol against an external server (`uri`). Used by Lakekeeper /
     /// Polaris / Tabular / Snowflake Open Catalog / etc.
     Rest,
+    /// `iceberg.catalog.type = hive` — speak Hive Metastore (HMS) Thrift
+    /// against an external metastore (`hive.metastore.uris`). Table state lives
+    /// in HMS table parameters (`metadata_location`); commits go through the
+    /// `iceberg-catalog-hms` crate's lock + alter_table protocol. v1: plaintext
+    /// thrift only, single-level namespace.
+    Hive,
 }
 
 #[derive(Clone)]
@@ -71,6 +77,10 @@ pub(crate) struct IcebergCatalogEntry {
     /// `kind == IcebergCatalogKind::Rest`. None for Hadoop / Memory.
     #[allow(dead_code)]
     pub(crate) rest_uri: Option<String>,
+    /// HMS endpoint in `host:port` form (no `thrift://`) — populated only when
+    /// `kind == IcebergCatalogKind::Hive`. None otherwise.
+    #[allow(dead_code)]
+    pub(crate) hms_uris: Option<String>,
     pub(crate) properties: Vec<(String, String)>,
     s3_config: Option<crate::fs::object_store::ObjectStoreConfig>,
     pub(crate) warehouse_path: PathBuf,
@@ -139,6 +149,18 @@ impl IcebergCatalogEntry {
 
     pub(crate) fn is_s3(&self) -> bool {
         self.s3_config.is_some()
+    }
+
+    /// True when namespace/table state is owned by a remote Iceberg catalog
+    /// service (REST server or Hive Metastore) rather than NovaRocks' direct
+    /// filesystem / object-store warehouse layout (Hadoop / Memory). These
+    /// catalogs route namespace + table operations through the iceberg-rust
+    /// `Catalog` trait via `build_iceberg_catalog`.
+    pub(crate) fn uses_remote_catalog(&self) -> bool {
+        matches!(
+            self.kind,
+            IcebergCatalogKind::Rest | IcebergCatalogKind::Hive
+        )
     }
 
     pub(crate) fn object_store_config(
@@ -221,15 +243,15 @@ pub(crate) fn create_namespace(
     namespace_name: &str,
 ) -> Result<(), String> {
     let ns_name = normalize_identifier(namespace_name)?;
-    if matches!(entry.kind, IcebergCatalogKind::Rest) {
+    if entry.uses_remote_catalog() {
         let namespace = NamespaceIdent::new(ns_name);
-        let catalog = block_on_iceberg(async { build_rest_catalog(entry).await })??;
+        let catalog = build_iceberg_catalog(entry)?;
         return block_on_iceberg(async {
             catalog.create_namespace(&namespace, HashMap::new()).await
         })
-        .map_err(|e| format!("create REST namespace runtime: {e}"))?
+        .map_err(|e| format!("create iceberg namespace runtime: {e}"))?
         .map(|_| ())
-        .map_err(|e| format!("create REST namespace {namespace}: {e}"));
+        .map_err(|e| format!("create iceberg namespace {namespace}: {e}"));
     }
     if let Some(s3_config) = &entry.s3_config {
         let op = crate::fs::object_store::build_oss_operator(s3_config)
@@ -261,12 +283,12 @@ pub(crate) fn namespace_exists(
     namespace_name: &str,
 ) -> Result<bool, String> {
     let ns_name = normalize_identifier(namespace_name)?;
-    if matches!(entry.kind, IcebergCatalogKind::Rest) {
+    if entry.uses_remote_catalog() {
         let namespace = NamespaceIdent::new(ns_name);
-        let catalog = block_on_iceberg(async { build_rest_catalog(entry).await })??;
+        let catalog = build_iceberg_catalog(entry)?;
         return block_on_iceberg(async { catalog.namespace_exists(&namespace).await })
-            .map_err(|e| format!("check REST namespace runtime: {e}"))?
-            .map_err(|e| format!("check REST namespace failed: {e}"));
+            .map_err(|e| format!("check iceberg namespace runtime: {e}"))?
+            .map_err(|e| format!("check iceberg namespace failed: {e}"));
     }
     if let Some(s3_config) = &entry.s3_config {
         let op = crate::fs::object_store::build_oss_operator(s3_config)
@@ -302,11 +324,11 @@ pub(crate) fn namespace_exists(
 /// Hidden entries (names starting with `.`) are excluded. Results are returned
 /// sorted and deduplicated.
 pub(crate) fn list_namespaces(entry: &IcebergCatalogEntry) -> Result<Vec<String>, String> {
-    if matches!(entry.kind, IcebergCatalogKind::Rest) {
-        let catalog = block_on_iceberg(async { build_rest_catalog(entry).await })??;
+    if entry.uses_remote_catalog() {
+        let catalog = build_iceberg_catalog(entry)?;
         let namespaces = block_on_iceberg(async { catalog.list_namespaces(None).await })
-            .map_err(|e| format!("list REST namespaces runtime failed: {e}"))?
-            .map_err(|e| format!("list REST namespaces failed: {e}"))?;
+            .map_err(|e| format!("list iceberg namespaces runtime failed: {e}"))?
+            .map_err(|e| format!("list iceberg namespaces failed: {e}"))?;
         let mut names: Vec<String> = namespaces
             .into_iter()
             .flat_map(|ns| ns.iter().map(|s| s.to_string()).collect::<Vec<_>>())
@@ -380,12 +402,12 @@ pub(crate) fn drop_namespace(
     namespace_name: &str,
 ) -> Result<(), String> {
     let ns_name = normalize_identifier(namespace_name)?;
-    if matches!(entry.kind, IcebergCatalogKind::Rest) {
+    if entry.uses_remote_catalog() {
         let namespace = NamespaceIdent::new(ns_name);
-        let catalog = block_on_iceberg(async { build_rest_catalog(entry).await })??;
+        let catalog = build_iceberg_catalog(entry)?;
         return block_on_iceberg(async { catalog.drop_namespace(&namespace).await })
-            .map_err(|e| format!("drop REST namespace runtime: {e}"))?
-            .map_err(|e| format!("drop REST namespace {namespace}: {e}"));
+            .map_err(|e| format!("drop iceberg namespace runtime: {e}"))?
+            .map_err(|e| format!("drop iceberg namespace {namespace}: {e}"));
     }
     if let Some(s3_config) = &entry.s3_config {
         let op = crate::fs::object_store::build_oss_operator(s3_config)
@@ -465,12 +487,12 @@ pub(crate) fn list_tables(
     namespace_name: &str,
 ) -> Result<Vec<String>, String> {
     let ns_name = normalize_identifier(namespace_name)?;
-    if matches!(entry.kind, IcebergCatalogKind::Rest) {
+    if entry.uses_remote_catalog() {
         let namespace = NamespaceIdent::new(ns_name);
-        let catalog = block_on_iceberg(async { build_rest_catalog(entry).await })??;
+        let catalog = build_iceberg_catalog(entry)?;
         let mut tables = block_on_iceberg(async { catalog.list_tables(&namespace).await })
-            .map_err(|e| format!("list REST tables runtime failed: {e}"))?
-            .map_err(|e| format!("list REST tables for namespace {namespace}: {e}"))?
+            .map_err(|e| format!("list iceberg tables runtime failed: {e}"))?
+            .map_err(|e| format!("list iceberg tables for namespace {namespace}: {e}"))?
             .into_iter()
             .map(|ident| ident.name)
             .collect::<Vec<_>>();
@@ -569,8 +591,8 @@ pub(crate) fn create_table(
     };
 
     // For Hadoop/Memory catalogs, ensure the namespace exists before table creation.
-    // REST catalogs manage namespace separately via CREATE DATABASE.
-    if !matches!(entry.kind, IcebergCatalogKind::Rest) {
+    // Remote catalogs (REST / Hive) manage namespace separately via CREATE DATABASE.
+    if !entry.uses_remote_catalog() {
         let _ =
             block_on_iceberg(async { catalog.create_namespace(&namespace, HashMap::new()).await });
     }
@@ -674,14 +696,17 @@ pub(crate) fn drop_table(
 
     entry.invalidate_table_cache(&ns_name, &tbl_name);
 
-    if matches!(entry.kind, IcebergCatalogKind::Rest) {
+    if entry.uses_remote_catalog() {
         let ident = TableIdent::from_strs([ns_name.as_str(), tbl_name.as_str()])
-            .map_err(|e| format!("build REST table ident: {e}"))?;
-        let catalog = block_on_iceberg(async { build_rest_catalog(entry).await })??;
+            .map_err(|e| format!("build iceberg table ident: {e}"))?;
+        let catalog = build_iceberg_catalog(entry)?;
         block_on_iceberg(async { catalog.drop_table(&ident).await })
-            .map_err(|e| format!("drop REST iceberg table runtime failed: {e}"))?
-            .map_err(|e| format!("drop REST iceberg table {ident}: {e}"))?;
-        if entry.s3_config.is_some() && !entry.warehouse_uri.trim().is_empty() {
+            .map_err(|e| format!("drop iceberg table runtime failed: {e}"))?
+            .map_err(|e| format!("drop iceberg table {ident}: {e}"))?;
+        if matches!(entry.kind, IcebergCatalogKind::Rest)
+            && entry.s3_config.is_some()
+            && !entry.warehouse_uri.trim().is_empty()
+        {
             drop_s3_table_prefix(entry, &ns_name, &tbl_name)
                 .map_err(|e| format!("purge REST iceberg table {ident} data prefix: {e}"))?;
         }
@@ -743,13 +768,13 @@ pub(crate) fn load_table(
         }
     }
 
-    let table = if matches!(entry.kind, IcebergCatalogKind::Rest) {
-        let catalog = block_on_iceberg(async { build_rest_catalog(entry).await })??;
+    let table = if entry.uses_remote_catalog() {
+        let catalog = build_iceberg_catalog(entry)?;
         let ident = TableIdent::from_strs([ns_name.as_str(), tbl_name.as_str()])
-            .map_err(|e| format!("build REST table ident: {e}"))?;
+            .map_err(|e| format!("build iceberg table ident: {e}"))?;
         block_on_iceberg(async { catalog.load_table(&ident).await })
-            .map_err(|e| format!("load REST iceberg table runtime failed: {e}"))?
-            .map_err(|e| format_rest_load_table_error(&ident, &ns_name, &tbl_name, e))?
+            .map_err(|e| format!("load iceberg table runtime failed: {e}"))?
+            .map_err(|e| format_remote_load_table_error(&ident, &ns_name, &tbl_name, e))?
     } else if entry.s3_config.is_some() {
         // S3 path: discover metadata from S3 directly
         let (metadata_file_name, metadata_bytes) =
@@ -889,13 +914,13 @@ pub(crate) fn current_schema_id(
     let ns_name = normalize_identifier(namespace_name)?;
     let tbl_name = normalize_identifier(table_name)?;
 
-    if matches!(entry.kind, IcebergCatalogKind::Rest) {
-        let catalog = block_on_iceberg(async { build_rest_catalog(entry).await })??;
+    if entry.uses_remote_catalog() {
+        let catalog = build_iceberg_catalog(entry)?;
         let ident = TableIdent::from_strs([ns_name.as_str(), tbl_name.as_str()])
-            .map_err(|e| format!("build REST table ident: {e}"))?;
+            .map_err(|e| format!("build iceberg table ident: {e}"))?;
         let table = block_on_iceberg(async { catalog.load_table(&ident).await })
-            .map_err(|e| format!("load REST iceberg table runtime failed: {e}"))?
-            .map_err(|e| format_rest_load_table_error(&ident, &ns_name, &tbl_name, e))?;
+            .map_err(|e| format!("load iceberg table runtime failed: {e}"))?
+            .map_err(|e| format_remote_load_table_error(&ident, &ns_name, &tbl_name, e))?;
         return Ok(table.metadata().current_schema_id());
     }
 
@@ -930,8 +955,9 @@ pub(crate) fn insert_rows(
 
     // For Hadoop/Memory catalogs: ensure namespace exists and register the table
     // by its metadata location so the catalog can resolve it for the commit.
-    // REST catalogs already track tables through the REST API; skip registration.
-    if !matches!(entry.kind, IcebergCatalogKind::Rest) {
+    // Remote catalogs (REST / Hive) already track tables through the metastore /
+    // REST API; skip registration.
+    if !entry.uses_remote_catalog() {
         let ns = NamespaceIdent::new(normalize_identifier(namespace_name)?);
         let _ = block_on_iceberg(async { catalog.create_namespace(&ns, HashMap::new()).await });
         let metadata_location = loaded
@@ -1370,15 +1396,20 @@ pub(crate) fn build_catalog_entry(
         Some(v) if v.eq_ignore_ascii_case("hadoop") => IcebergCatalogKind::Hadoop,
         Some(v) if v.eq_ignore_ascii_case("memory") => IcebergCatalogKind::Memory,
         Some(v) if v.eq_ignore_ascii_case("rest") => IcebergCatalogKind::Rest,
+        Some(v) if v.eq_ignore_ascii_case("hive") => IcebergCatalogKind::Hive,
         Some(v) => {
             return Err(format!(
-                "standalone iceberg catalog supports iceberg.catalog.type=memory|hadoop|rest, got {v}"
+                "standalone iceberg catalog supports iceberg.catalog.type=memory|hadoop|rest|hive, got {v}"
             ));
         }
     };
 
     if matches!(kind, IcebergCatalogKind::Rest) {
         return build_rest_catalog_entry(&mut props);
+    }
+
+    if matches!(kind, IcebergCatalogKind::Hive) {
+        return build_hms_catalog_entry(&mut props);
     }
 
     let raw_warehouse = props
@@ -1446,6 +1477,7 @@ pub(crate) fn build_catalog_entry(
         kind,
         warehouse_uri,
         rest_uri: None,
+        hms_uris: None,
         properties: sorted_properties(&props),
         s3_config,
         warehouse_path,
@@ -1454,6 +1486,44 @@ pub(crate) fn build_catalog_entry(
     };
 
     Ok(entry)
+}
+
+/// Build an object-store config from catalog S3 properties, deriving the
+/// bucket from an `s3://` / `s3a://` / `oss://` warehouse URI. Shared by the
+/// REST and Hive entry builders (both point at object-store warehouses and
+/// inject a `StorageFactory` rather than touching a local warehouse path).
+fn object_store_config_from_props(
+    props: &HashMap<String, String>,
+    warehouse: &str,
+) -> Option<crate::fs::object_store::ObjectStoreConfig> {
+    let raw_props: Vec<(String, String)> =
+        props.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let s3_factory =
+        crate::connector::iceberg::catalog::s3_storage::S3StorageFactory::from_catalog_properties(
+            &raw_props,
+        )?;
+    let bucket = warehouse
+        .strip_prefix("s3://")
+        .or_else(|| warehouse.strip_prefix("s3a://"))
+        .or_else(|| warehouse.strip_prefix("oss://"))
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or_default()
+        .to_string();
+    Some(crate::fs::object_store::ObjectStoreConfig {
+        endpoint: s3_factory.endpoint.clone(),
+        bucket,
+        root: String::new(),
+        access_key_id: s3_factory.access_key_id.clone(),
+        access_key_secret: s3_factory.access_key_secret.clone(),
+        session_token: None,
+        enable_path_style_access: Some(s3_factory.enable_path_style),
+        region: Some(s3_factory.region.clone()),
+        retry_max_times: Some(3),
+        retry_min_delay_ms: Some(100),
+        retry_max_delay_ms: Some(2000),
+        timeout_ms: Some(30000),
+        io_timeout_ms: Some(30000),
+    })
 }
 
 /// Build an [`IcebergCatalogEntry`] for `iceberg.catalog.type = rest`. The
@@ -1490,37 +1560,7 @@ fn build_rest_catalog_entry(
     // Optional S3 storage props — populated only when the user provided them.
     // The REST server may also vend storage credentials; that codepath is a
     // follow-up (Issue: REST credential vending).
-    let raw_props: Vec<(String, String)> =
-        props.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-    let s3_config = if let Some(s3_factory) =
-        crate::connector::iceberg::catalog::s3_storage::S3StorageFactory::from_catalog_properties(
-            &raw_props,
-        ) {
-        let bucket = warehouse
-            .strip_prefix("s3://")
-            .or_else(|| warehouse.strip_prefix("s3a://"))
-            .or_else(|| warehouse.strip_prefix("oss://"))
-            .and_then(|rest| rest.split('/').next())
-            .unwrap_or_default()
-            .to_string();
-        Some(crate::fs::object_store::ObjectStoreConfig {
-            endpoint: s3_factory.endpoint.clone(),
-            bucket,
-            root: String::new(),
-            access_key_id: s3_factory.access_key_id.clone(),
-            access_key_secret: s3_factory.access_key_secret.clone(),
-            session_token: None,
-            enable_path_style_access: Some(s3_factory.enable_path_style),
-            region: Some(s3_factory.region.clone()),
-            retry_max_times: Some(3),
-            retry_min_delay_ms: Some(100),
-            retry_max_delay_ms: Some(2000),
-            timeout_ms: Some(30000),
-            io_timeout_ms: Some(30000),
-        })
-    } else {
-        None
-    };
+    let s3_config = object_store_config_from_props(props, &warehouse);
 
     // No local warehouse_path for REST; allocate an empty placeholder so any
     // legacy hadoop-only code path that touches `entry.warehouse_path` fails
@@ -1538,6 +1578,87 @@ fn build_rest_catalog_entry(
         kind: IcebergCatalogKind::Rest,
         warehouse_uri: warehouse,
         rest_uri: Some(uri),
+        hms_uris: None,
+        properties: sorted_properties(props),
+        s3_config,
+        warehouse_path,
+        table_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        data_files_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+    })
+}
+
+/// Build an [`IcebergCatalogEntry`] for `iceberg.catalog.type = hive`.
+///
+/// Hive Metastore stores each table's current `metadata.json` pointer in the
+/// table's HMS parameters. NovaRocks delegates the HMS Thrift protocol and the
+/// lock + alter_table commit to the `iceberg-catalog-hms` crate; this function
+/// only validates and normalizes catalog properties.
+///
+/// v1 scope: plaintext thrift, single metastore, single-level namespace.
+/// Kerberos/SASL and multi-URI HA are rejected / reduced here (fail fast).
+fn build_hms_catalog_entry(
+    props: &mut HashMap<String, String>,
+) -> Result<IcebergCatalogEntry, String> {
+    // v1 = plaintext thrift only. Reject auth-related properties up front.
+    for k in props.keys() {
+        let lk = k.to_ascii_lowercase();
+        if lk.contains("kerberos")
+            || lk.contains("sasl")
+            || lk.contains("keytab")
+            || lk.contains("principal")
+        {
+            return Err(format!(
+                "hive iceberg catalog v1 supports plaintext thrift only; unsupported auth property `{k}`"
+            ));
+        }
+    }
+
+    let raw_uris = props
+        .get("hive.metastore.uris")
+        .or_else(|| props.get("iceberg.catalog.hive.metastore.uris"))
+        .cloned()
+        .ok_or_else(|| {
+            "hive iceberg catalog requires `hive.metastore.uris` (e.g. thrift://host:9083)"
+                .to_string()
+        })?;
+    // v1: single metastore — take the first comma-separated URI. HA is a follow-up.
+    let first_uri = raw_uris
+        .split(',')
+        .map(|s| s.trim())
+        .find(|s| !s.is_empty())
+        .ok_or_else(|| "hive.metastore.uris is empty".to_string())?
+        .to_string();
+    // HMS_CATALOG_PROP_URI wants `host:port`, not a `thrift://` URI.
+    let hms_endpoint = first_uri
+        .strip_prefix("thrift://")
+        .unwrap_or(&first_uri)
+        .to_string();
+
+    let warehouse = props
+        .get("iceberg.catalog.warehouse")
+        .or_else(|| props.get("warehouse"))
+        .or_else(|| props.get("hive.metastore.warehouse.dir"))
+        .cloned()
+        .unwrap_or_default();
+
+    let s3_config = object_store_config_from_props(props, &warehouse);
+
+    // No local warehouse_path for HMS; placeholder so any legacy hadoop-only
+    // path that touches warehouse_path fails loudly instead of corrupting a dir.
+    let warehouse_path = PathBuf::from("/__novarocks_hms_catalog_no_local_warehouse__");
+
+    props.insert("type".to_string(), "iceberg".to_string());
+    props.insert("iceberg.catalog.type".to_string(), "hive".to_string());
+    props.insert("hive.metastore.uris".to_string(), first_uri);
+    if !warehouse.is_empty() {
+        props.insert("iceberg.catalog.warehouse".to_string(), warehouse.clone());
+    }
+
+    Ok(IcebergCatalogEntry {
+        kind: IcebergCatalogKind::Hive,
+        warehouse_uri: warehouse,
+        rest_uri: None,
+        hms_uris: Some(hms_endpoint),
         properties: sorted_properties(props),
         s3_config,
         warehouse_path,
@@ -1615,6 +1736,67 @@ pub(crate) async fn build_rest_catalog(
         .map_err(|e| format!("build REST iceberg catalog: {e}"))
 }
 
+/// Build an Iceberg `HmsCatalog` for an entry whose
+/// `kind == IcebergCatalogKind::Hive`. Asynchronous because the volo-thrift
+/// client connects during catalog operations; synchronous engine flows go
+/// through [`build_iceberg_catalog`], which wraps this with `block_on_iceberg`.
+pub(crate) async fn build_hms_catalog(
+    entry: &IcebergCatalogEntry,
+) -> Result<iceberg_catalog_hms::HmsCatalog, String> {
+    use iceberg::CatalogBuilder;
+    use iceberg_catalog_hms::{
+        HMS_CATALOG_PROP_THRIFT_TRANSPORT, HMS_CATALOG_PROP_URI, HMS_CATALOG_PROP_WAREHOUSE,
+        HmsCatalogBuilder, THRIFT_TRANSPORT_BUFFERED, THRIFT_TRANSPORT_FRAMED,
+    };
+
+    if !matches!(entry.kind, IcebergCatalogKind::Hive) {
+        return Err(format!(
+            "build_hms_catalog called on non-Hive entry kind={:?}",
+            entry.kind
+        ));
+    }
+    let uri = entry.hms_uris.clone().ok_or_else(|| {
+        "hive iceberg catalog entry missing hms_uris (CREATE EXTERNAL CATALOG must set `hive.metastore.uris`)"
+            .to_string()
+    })?;
+
+    let mut props: HashMap<String, String> = HashMap::new();
+    props.insert(HMS_CATALOG_PROP_URI.to_string(), uri);
+    if !entry.warehouse_uri.is_empty() {
+        props.insert(
+            HMS_CATALOG_PROP_WAREHOUSE.to_string(),
+            entry.warehouse_uri.clone(),
+        );
+    }
+    // thrift transport: default buffered; framed when hive.metastore.thrift.framed=true.
+    let framed = entry
+        .properties
+        .iter()
+        .find(|(k, _)| k == "hive.metastore.thrift.framed")
+        .map(|(_, v)| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
+    props.insert(
+        HMS_CATALOG_PROP_THRIFT_TRANSPORT.to_string(),
+        if framed {
+            THRIFT_TRANSPORT_FRAMED.to_string()
+        } else {
+            THRIFT_TRANSPORT_BUFFERED.to_string()
+        },
+    );
+
+    let storage_factory = build_storage_factory_for_entry(entry)?;
+    HmsCatalogBuilder::default()
+        .with_storage_factory(storage_factory)
+        .load("hms", props)
+        .await
+        .map_err(|e| format!("build HMS iceberg catalog: {e}"))
+}
+
 fn build_storage_factory_for_entry(
     entry: &IcebergCatalogEntry,
 ) -> Result<Arc<dyn iceberg::io::StorageFactory>, String> {
@@ -1633,11 +1815,12 @@ fn build_storage_factory_for_entry(
 }
 
 /// Synchronous dispatcher that returns an `Arc<dyn Catalog>` regardless of
-/// whether the entry is Hadoop or REST. REST catalog construction is
-/// asynchronous (one `/v1/config` handshake is required), so this helper
-/// blocks on it via `block_on_iceberg`. Callers in synchronous engine
-/// flows can swap `build_hadoop_catalog(...).map(Arc::new)` for
-/// `build_iceberg_catalog(...)` to gain REST support transparently.
+/// whether the entry is Hadoop, REST, or Hive. REST and Hive catalog
+/// construction is asynchronous (REST does a `/v1/config` handshake; the Hive
+/// HMS client uses async volo-thrift), so this helper blocks on them via
+/// `block_on_iceberg`. Callers in synchronous engine flows can swap
+/// `build_hadoop_catalog(...).map(Arc::new)` for `build_iceberg_catalog(...)`
+/// to gain REST / Hive support transparently.
 #[allow(dead_code)] // Will replace explicit build_hadoop_catalog calls in a follow-up.
 pub(crate) fn build_iceberg_catalog(
     entry: &IcebergCatalogEntry,
@@ -1650,6 +1833,10 @@ pub(crate) fn build_iceberg_catalog(
         IcebergCatalogKind::Rest => {
             let rest = block_on_iceberg(async { build_rest_catalog(entry).await })??;
             Ok(Arc::new(rest) as Arc<dyn iceberg::Catalog>)
+        }
+        IcebergCatalogKind::Hive => {
+            let hms = block_on_iceberg(async { build_hms_catalog(entry).await })??;
+            Ok(Arc::new(hms) as Arc<dyn iceberg::Catalog>)
         }
     }
 }
@@ -1713,7 +1900,7 @@ fn latest_table_metadata_location_local(
     Ok(path_to_file_uri(&metadata_dir.join(latest)))
 }
 
-fn format_rest_load_table_error<E: fmt::Display>(
+fn format_remote_load_table_error<E: fmt::Display>(
     ident: &TableIdent,
     ns_name: &str,
     tbl_name: &str,
@@ -1723,7 +1910,7 @@ fn format_rest_load_table_error<E: fmt::Display>(
     if message.contains("Tried to load a table that does not exist") {
         format!("unknown table: {ns_name}.{tbl_name}")
     } else {
-        format!("load REST iceberg table {ident}: {message}")
+        format!("load iceberg table {ident}: {message}")
     }
 }
 
@@ -2929,6 +3116,7 @@ mod data_file_with_stats_tests {
             kind: IcebergCatalogKind::Hadoop,
             warehouse_uri: "file:///tmp/warehouse".to_string(),
             rest_uri: None,
+            hms_uris: None,
             properties: vec![],
             s3_config: None,
             warehouse_path: PathBuf::from("/tmp/warehouse"),
@@ -3324,8 +3512,8 @@ mod rest_catalog_tests {
     use mockito::Server;
 
     use super::{
-        IcebergCatalogEntry, IcebergCatalogKind, build_catalog_entry, build_iceberg_catalog,
-        build_rest_catalog, current_schema_id, load_table,
+        IcebergCatalogEntry, IcebergCatalogKind, block_on_iceberg, build_catalog_entry,
+        build_iceberg_catalog, build_rest_catalog, current_schema_id, load_table,
     };
 
     fn rest_props(uri: &str) -> Vec<(String, String)> {
@@ -3398,7 +3586,110 @@ mod rest_catalog_tests {
         )
         .map(|_| ())
         .expect_err("unknown type should be rejected");
-        assert!(err.contains("memory|hadoop|rest"), "{err}");
+        assert!(err.contains("memory|hadoop|rest|hive"), "{err}");
+    }
+
+    fn hive_props(uris: &str) -> Vec<(String, String)> {
+        vec![
+            ("type".to_string(), "iceberg".to_string()),
+            ("iceberg.catalog.type".to_string(), "hive".to_string()),
+            ("hive.metastore.uris".to_string(), uris.to_string()),
+            ("warehouse".to_string(), "s3://warehouse/hms".to_string()),
+        ]
+    }
+
+    #[test]
+    fn build_catalog_entry_accepts_hive_kind_with_uris() {
+        let entry = build_catalog_entry(
+            "ice_hms",
+            &[
+                ("type".to_string(), "iceberg".to_string()),
+                ("iceberg.catalog.type".to_string(), "hive".to_string()),
+                (
+                    "hive.metastore.uris".to_string(),
+                    "thrift://hms-host:9083".to_string(),
+                ),
+                ("warehouse".to_string(), "s3://warehouse/hms".to_string()),
+            ],
+        )
+        .expect("hive entry");
+        assert_eq!(entry.kind, IcebergCatalogKind::Hive);
+        // hms_uris is the host:port form with thrift:// stripped.
+        assert_eq!(entry.hms_uris.as_deref(), Some("hms-host:9083"));
+        assert_eq!(entry.warehouse_uri, "s3://warehouse/hms");
+    }
+
+    #[test]
+    fn build_catalog_entry_hive_takes_first_uri_and_strips_scheme() {
+        let entry = build_catalog_entry(
+            "ice_hms",
+            &[
+                ("iceberg.catalog.type".to_string(), "hive".to_string()),
+                (
+                    "hive.metastore.uris".to_string(),
+                    "thrift://a:9083,thrift://b:9083".to_string(),
+                ),
+            ],
+        )
+        .expect("hive entry");
+        assert_eq!(entry.hms_uris.as_deref(), Some("a:9083"));
+    }
+
+    #[test]
+    fn build_catalog_entry_rejects_hive_without_uris() {
+        let err = build_catalog_entry(
+            "ice_hms",
+            &[("iceberg.catalog.type".to_string(), "hive".to_string())],
+        )
+        .map(|_| ())
+        .expect_err("uris required");
+        assert!(err.contains("hive.metastore.uris"), "{err}");
+    }
+
+    #[test]
+    fn build_catalog_entry_rejects_hive_kerberos_v1() {
+        let err = build_catalog_entry(
+            "ice_hms",
+            &[
+                ("iceberg.catalog.type".to_string(), "hive".to_string()),
+                (
+                    "hive.metastore.uris".to_string(),
+                    "thrift://hms:9083".to_string(),
+                ),
+                (
+                    "hive.metastore.sasl.enabled".to_string(),
+                    "true".to_string(),
+                ),
+            ],
+        )
+        .map(|_| ())
+        .expect_err("kerberos/sasl rejected in v1");
+        assert!(err.contains("plaintext thrift only"), "{err}");
+    }
+
+    /// The Hive entry must route through `build_hms_catalog` (volo-thrift
+    /// client) under `block_on_iceberg`. Pointing at a closed port, the catalog
+    /// must surface an error (connection refused) WITHOUT hanging or panicking —
+    /// proving the async bridge and the dispatcher routing both work.
+    #[test]
+    fn build_iceberg_catalog_dispatches_hive_kind_and_errors_on_dead_port() {
+        let entry = build_catalog_entry("ice_hms", &hive_props("thrift://127.0.0.1:1"))
+            .expect("hive entry");
+        assert_eq!(entry.kind, IcebergCatalogKind::Hive);
+
+        // Build + force a catalog round-trip. Either build_iceberg_catalog errs
+        // (eager connect) or list_namespaces errs (lazy connect); both are fine.
+        let result: Result<(), String> = (|| {
+            let catalog = build_iceberg_catalog(&entry)?;
+            block_on_iceberg(async { catalog.list_namespaces(None).await })
+                .map_err(|e| format!("runtime: {e}"))?
+                .map(|_| ())
+                .map_err(|e| format!("list: {e}"))
+        })();
+        assert!(
+            result.is_err(),
+            "HMS catalog against a dead port must error, got Ok"
+        );
     }
 
     /// Confirms `build_rest_catalog` performs the spec-required

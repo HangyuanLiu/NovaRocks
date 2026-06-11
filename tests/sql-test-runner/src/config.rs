@@ -170,6 +170,21 @@ pub fn apply_suite_placeholder_defaults(variables: &mut HashMap<String, String>,
                 env_or_default("NOVAROCKS_ICEBERG_REST_WAREHOUSE", &rest_warehouse_default),
             );
         }
+        "iceberg-hms" | "iceberg-hms-compatibility" => {
+            insert_placeholder_default(
+                variables,
+                "iceberg_hms_uris",
+                env_or_default("NOVAROCKS_ICEBERG_HMS_URI", "thrift://127.0.0.1:9083"),
+            );
+            insert_placeholder_default(
+                variables,
+                "iceberg_hms_warehouse",
+                env_or_default(
+                    "NOVA_ENV_SHARED_HMS_WAREHOUSE_URI",
+                    "s3://warehouse/shared/hms",
+                ),
+            );
+        }
         _ => return,
     }
 
@@ -535,5 +550,28 @@ mod tests {
             &format!("/tmp/novarocks-sql-tests/{suite_uuid0}/{run_id}/")
         );
         assert!(!warehouse.contains("${"));
+    }
+
+    #[test]
+    fn hms_suite_defaults_populate_uris_warehouse_and_oss() {
+        // Env-independent: the crate's tests avoid touching process env (Rust
+        // 2024 `std::env::{set,remove}_var` is `unsafe`), so assert only that
+        // the HMS arm populates the expected keys plus the shared oss_* block.
+        // The concrete values come from `env_or_default` and so vary with the
+        // ambient environment; presence is what this arm guarantees.
+        let mut vars = std::collections::HashMap::new();
+        apply_suite_placeholder_defaults(&mut vars, "iceberg-hms");
+        assert!(vars.contains_key("iceberg_hms_uris"));
+        assert!(vars.contains_key("iceberg_hms_warehouse"));
+        assert!(vars.contains_key("oss_ak"));
+        assert!(vars.contains_key("oss_sk"));
+        assert!(vars.contains_key("oss_endpoint"));
+
+        // The compatibility suite shares the same arm.
+        let mut compat_vars = std::collections::HashMap::new();
+        apply_suite_placeholder_defaults(&mut compat_vars, "iceberg-hms-compatibility");
+        assert!(compat_vars.contains_key("iceberg_hms_uris"));
+        assert!(compat_vars.contains_key("iceberg_hms_warehouse"));
+        assert!(compat_vars.contains_key("oss_endpoint"));
     }
 }

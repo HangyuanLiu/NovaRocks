@@ -77,8 +77,8 @@ SQL client / SQL test runner
                                       |
                  +--------------------+--------------------+
                  |                    |                    |
-          Local Parquet        Iceberg Catalogs      Managed Lake
-        in-memory catalog      memory/hadoop/rest    SQLite + object store
+          Local Parquet        Iceberg Catalogs        Managed Lake
+        in-memory catalog    memory/hadoop/rest/hive   SQLite + object store
 ```
 
 ---
@@ -322,7 +322,7 @@ SQL client / SQL test runner
 
 1. Local Parquet tables are registered in the standalone in-memory catalog.
 2. Iceberg catalogs are registered in `IcebergCatalogRegistry`; supported
-   catalog types are `memory`, `hadoop`, and `rest`.
+   catalog types are `memory`, `hadoop`, `rest`, and `hive`.
 3. Managed-lake tables use SQLite metadata (`metadata_db_path`) plus object
    store configuration (`warehouse_uri` and `[standalone_server.object_store]`).
 4. Standalone DDL/DML uses connector backends (`CatalogBackend`, `TableSource`,
