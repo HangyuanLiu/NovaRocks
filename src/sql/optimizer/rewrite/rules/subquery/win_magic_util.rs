@@ -35,9 +35,11 @@ impl TableIdentity {
                 table: table.table.clone(),
                 table_uuid: table.table_uuid.clone(),
             },
-            // MV-target-state scans never appear inside a SELECT-time subquery;
-            // if one does, WinMagic must not fire. Use a name-based identity that
-            // can still distinguish tables but never matches an ordinary scan.
+            // MV-target-state scans never reach this in practice: ApplyToWindow's
+            // operator whitelist (a later task) rejects any plan containing an
+            // IcebergMvTargetState node before identity comparison runs. The __mv__
+            // prefix is a belt-and-suspenders signal, not the sole guard — a same-named
+            // user catalog colliding here is harmless because the whitelist fires first.
             ScanSource::IcebergMvTargetState(mv) => TableIdentity::Iceberg {
                 catalog: format!("__mv__{}", mv.catalog),
                 namespace: mv.database.clone(),
@@ -75,6 +77,10 @@ fn collect_table_ids_inner(plan: &LogicalPlan, out: &mut Vec<TableIdentity>) {
             collect_table_ids_inner(&a.left, out);
             collect_table_ids_inner(&a.right, out);
         }
+        // Nodes not reachable through a WinMagic-eligible plan (Limit, Union,
+        // CTEAnchor/Produce/Consume, Values, Repeat, Decode, IMV markers, …)
+        // contribute no Scan children. The operator whitelist (a later task)
+        // rejects any plan containing them before these helpers are called.
         _ => {}
     }
 }
@@ -117,6 +123,10 @@ fn collect_scan_column_map_inner(
             collect_scan_column_map_inner(&a.left, map);
             collect_scan_column_map_inner(&a.right, map);
         }
+        // Nodes not reachable through a WinMagic-eligible plan (Limit, Union,
+        // CTEAnchor/Produce/Consume, Values, Repeat, Decode, IMV markers, …)
+        // contribute no Scan children. The operator whitelist (a later task)
+        // rejects any plan containing them before these helpers are called.
         _ => {}
     }
 }
