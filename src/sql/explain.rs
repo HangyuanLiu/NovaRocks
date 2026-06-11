@@ -2057,6 +2057,7 @@ mod rf_explain_tests {
                 nullable: false,
                 is_internal: true,
             },
+            inner_output_column_id: ColumnId(5),
             correlation_column_ids: vec![ColumnId(1)],
             correlation_conjuncts: vec![],
             residual_predicate: None,

@@ -16,6 +16,19 @@ use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
 use crate::sql::optimizer::rewrite::rules::column_pruning::auto_fill_column_id;
 use crate::sql::planner::plan::*;
 
+/// Returns `true` when a project item's expression is an `assert_true(...)` call.
+///
+/// Such items must never be dropped by column pruning, even when their
+/// `output_column_id` is not referenced by any upstream operator.  This mirrors
+/// the StarRocks `PruneProjectColumnsRule` carve-out for `assert_true` items
+/// (used, e.g., for the per-group row-check emitted by `ScalarApplyToJoin`).
+fn is_assert_true_item(item: &ProjectItem) -> bool {
+    matches!(
+        &item.expr.kind,
+        ExprKind::FunctionCall { name, .. } if name == "assert_true"
+    )
+}
+
 pub(crate) struct PruneProjectColumns;
 
 impl LogicalRewriteRule for PruneProjectColumns {
@@ -47,11 +60,17 @@ impl LogicalRewriteRule for PruneProjectColumns {
         // Items with UNSET output_column_id are kept (synthetic dict-slot items
         // that are never addressed by pruning — same logic as
         // collect_output_ids_ordered which excludes UNSET).
+        // assert_true items are always kept regardless of whether their
+        // output_column_id appears in needed: they carry runtime correctness
+        // checks (e.g. the per-group row-check from ScalarApplyToJoin) that
+        // must not be silently dropped when nothing upstream references them.
         let mut new_items: Vec<ProjectItem> = node
             .items
             .into_iter()
             .filter(|item| {
-                item.output_column_id == ColumnId::UNSET || needed.contains(&item.output_column_id)
+                item.output_column_id == ColumnId::UNSET
+                    || needed.contains(&item.output_column_id)
+                    || is_assert_true_item(item)
             })
             .collect();
 
@@ -351,6 +370,215 @@ mod tests {
             pruned.items[0].output_name.starts_with("auto_fill_"),
             "auto-fill item name must start with 'auto_fill_', got: {}",
             pruned.items[0].output_name
+        );
+    }
+
+    /// Carve-out regression test: an `assert_true` item in an inner Project is
+    /// NEVER dropped by `PruneProjectColumns`, even when nothing upstream
+    /// references its `output_column_id`.
+    ///
+    /// Plan shape:
+    ///   Project_outer(needed={out_x}) [items: x→out_x]
+    ///     Project_inner [items: x→out_x (passthrough), assert_true(cnt IS NULL OR cnt<=1)→assert_id]
+    ///       Scan[x@id_x, cnt@id_cnt, dummy@id_dummy]
+    ///
+    /// Without the carve-out, PruneProjectColumns would drop the assert_true item
+    /// from Project_inner because assert_id ∉ {out_x}.  With it, the item survives
+    /// and tag_required_columns also unions cnt into child_needed so id_cnt reaches
+    /// the Scan's required_output_columns.
+    #[test]
+    fn prune_project_assert_true_item_survives_even_when_not_in_needed() {
+        use crate::sql::analysis::{BinOp, LiteralValue};
+        use crate::sql::optimizer::rewrite::required_columns::tag_required_columns;
+
+        let id_x = ColumnId::new_for_test(1);
+        let id_cnt = ColumnId::new_for_test(2);
+        let id_dummy = ColumnId::new_for_test(3);
+        let out_x = ColumnId::new_for_test(101); // output id for x in inner project
+        let assert_id = ColumnId::new_for_test(200);
+
+        // 3-column scan: x, cnt, dummy (uses existing make_scan helper).
+        let scan = make_scan(id_x, id_cnt, id_dummy);
+
+        // Build the assert_true condition: cnt IS NULL OR cnt <= 1.
+        let cnt_ref = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: id_cnt,
+                qualifier: None,
+                column: "cnt".to_string(),
+            },
+            data_type: DataType::Int64,
+            nullable: false,
+        };
+        let cnt_is_null = TypedExpr {
+            kind: ExprKind::IsNull {
+                expr: Box::new(cnt_ref.clone()),
+                negated: false,
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        };
+        let cnt_le_1 = TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(cnt_ref),
+                op: BinOp::Le,
+                right: Box::new(TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::Int(1)),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                }),
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        };
+        let assert_cond = TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(cnt_is_null),
+                op: BinOp::Or,
+                right: Box::new(cnt_le_1),
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        };
+        let assert_true_expr = TypedExpr {
+            kind: ExprKind::FunctionCall {
+                name: "assert_true".to_string(),
+                args: vec![
+                    assert_cond,
+                    TypedExpr {
+                        kind: ExprKind::Literal(LiteralValue::String(
+                            "subquery must return at most 1 row".to_string(),
+                        )),
+                        data_type: DataType::Utf8,
+                        nullable: false,
+                    },
+                ],
+                distinct: false,
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        };
+
+        // Project_inner: [x→out_x (passthrough, different output_column_id),
+        //                 assert_true(...)→assert_id]
+        // The x item's expr references id_x (from scan) but its output_column_id
+        // is out_x (a different ColumnId, simulating a planner-assigned output id).
+        let inner_x_item = ProjectItem {
+            expr: TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: id_x,
+                    qualifier: None,
+                    column: "x".to_string(),
+                },
+                data_type: DataType::Int32,
+                nullable: false,
+            },
+            output_name: "x".to_string(),
+            output_column_id: out_x,
+        };
+        let inner_project = LogicalPlan::Project(ProjectNode {
+            input: Box::new(scan),
+            items: vec![
+                inner_x_item,
+                ProjectItem {
+                    expr: assert_true_expr,
+                    output_name: "__assert".to_string(),
+                    output_column_id: assert_id,
+                },
+            ],
+            output_qualifier: None,
+            required_output_columns: None,
+        });
+
+        // Project_outer: [x→out_x] — only references out_x, does NOT reference assert_id.
+        let outer_x_item = ProjectItem {
+            expr: TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: out_x,
+                    qualifier: None,
+                    column: "x".to_string(),
+                },
+                data_type: DataType::Int32,
+                nullable: false,
+            },
+            output_name: "x".to_string(),
+            output_column_id: out_x,
+        };
+        let outer_project = LogicalPlan::Project(ProjectNode {
+            input: Box::new(inner_project),
+            items: vec![outer_x_item],
+            output_qualifier: None,
+            required_output_columns: None,
+        });
+
+        // Phase 1: tag_required_columns with parent_needed = None (root).
+        // After tagging, inner Project's required_output_columns = Some({out_x})
+        // because the outer Project only needs out_x; but the assert_true carve-out
+        // in tag_project must ALSO include id_cnt in the Scan's child_needed.
+        let tagged = tag_required_columns(outer_project, None);
+
+        // Phase 2: apply PruneProjectColumns on each Project node top-down.
+        let rule = PruneProjectColumns;
+        let mut ctx = ctx_with_factory();
+
+        // Pull out the tagged outer Project node and apply the rule.
+        let LogicalPlan::Project(outer_node) = tagged else {
+            panic!("expected outer Project after tagging");
+        };
+        let outer_result = rule
+            .apply(LogicalPlan::Project(outer_node.clone()), &mut ctx)
+            .unwrap();
+        // Outer has 1 item (out_x) which is in needed — result is Unchanged.
+        let outer_after_node = match outer_result {
+            RewriteResult::Changed(LogicalPlan::Project(p)) => p,
+            RewriteResult::Unchanged => outer_node,
+            other => panic!("unexpected outer result: {:?}", other),
+        };
+
+        // Now apply the rule to the inner Project (which was tagged with needed={out_x}).
+        // With the carve-out both items survive (x ∈ needed, assert_true via carve-out),
+        // so lengths are equal and the rule returns Unchanged.
+        // Without the carve-out the assert_true item would be dropped → Changed with 1 item.
+        // Either way we need the inner ProjectNode to inspect items; carry it along.
+        let inner_plan = *outer_after_node.input;
+        // Clone the plan so we can inspect items regardless of Changed/Unchanged.
+        let inner_plan_clone = inner_plan.clone();
+        let inner_result = rule.apply(inner_plan, &mut ctx).unwrap();
+
+        let inner_pruned_node = match inner_result {
+            RewriteResult::Changed(LogicalPlan::Project(p)) => p,
+            RewriteResult::Unchanged => {
+                // Carve-out preserved both items → no change → extract from clone.
+                let LogicalPlan::Project(p) = inner_plan_clone else {
+                    panic!("expected inner Project in clone");
+                };
+                p
+            }
+            other => panic!("unexpected inner result: {:?}", other),
+        };
+
+        // The assert_true item MUST survive even though assert_id ∉ {out_x}.
+        let has_assert_true = inner_pruned_node.items.iter().any(|item| {
+            matches!(&item.expr.kind, ExprKind::FunctionCall { name, .. } if name == "assert_true")
+        });
+        assert!(
+            has_assert_true,
+            "assert_true item must survive PruneProjectColumns (carve-out missing)"
+        );
+
+        // The cnt column must appear in the child Scan's required_output_columns.
+        // tag_required_columns unions assert_true item's column refs (id_cnt) into
+        // child_needed, so the Scan must expose cnt even though out_x doesn't reference it.
+        let LogicalPlan::Scan(scan_node) = inner_pruned_node.input.as_ref() else {
+            panic!("expected Scan under inner Project");
+        };
+        let scan_req = scan_node
+            .required_output_columns
+            .as_ref()
+            .expect("Scan must have required_output_columns after tagging");
+        assert!(
+            scan_req.contains(&id_cnt),
+            "cnt column must reach the Scan (assert_true item refs must be in child_needed)"
         );
     }
 }

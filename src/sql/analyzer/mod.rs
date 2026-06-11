@@ -575,6 +575,7 @@ impl<'a> AnalyzerContext<'a> {
             has_aggregation,
             distinct,
             repeat: None,
+            apply_specs: Vec::new(),
         };
 
         // --- Subquery rewriting ---
@@ -2273,6 +2274,12 @@ impl<'a> AnalyzerContext<'a> {
             nullable,
         }
     }
+}
+
+/// The active subquery-unnesting mode for this statement. Reads the
+/// thread-local session settings installed by the server before execution.
+pub(super) fn subquery_unnest_mode() -> crate::sql::optimizer::options::SubqueryUnnestMode {
+    crate::sql::optimizer::options::current_session_optimizer_settings().subquery_unnest_mode
 }
 
 fn select_item_output_column_id(
@@ -6808,6 +6815,114 @@ mod tests {
         assert_eq!(
             out_factory.get(crate::sql::column_id::ColumnId(1)).name,
             "seed0"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Task 3 — apply-mode scalar subquery routing tests
+    // ---------------------------------------------------------------------------
+
+    const CORRELATED_SCALAR_SQL: &str =
+        "SELECT k1 FROM t1 WHERE k1 = (SELECT max(k2) FROM t2 WHERE t2.k1 = t1.k1)";
+
+    /// In apply mode a correlated scalar WHERE subquery must be recorded as an
+    /// ApplyScalarSpec instead of being rewritten into a join.
+    #[test]
+    fn apply_mode_routes_where_scalar_subquery_to_apply_spec() {
+        use crate::sql::analysis::{ApplyClause, QueryBody};
+        use crate::sql::optimizer::options::{
+            SessionOptimizerSettings, SubqueryUnnestMode, with_session_optimizer_settings,
+        };
+
+        let dialect = sqlparser::dialect::GenericDialect {};
+        let stmts = sqlparser::parser::Parser::parse_sql(&dialect, CORRELATED_SCALAR_SQL).unwrap();
+        let query = match stmts.into_iter().next().unwrap() {
+            sqlparser::ast::Statement::Query(q) => q,
+            _ => panic!("expected query"),
+        };
+        let settings = SessionOptimizerSettings {
+            subquery_unnest_mode: SubqueryUnnestMode::Apply,
+            ..Default::default()
+        };
+        let (resolved, _cte, _factory) =
+            with_session_optimizer_settings(settings, || analyze(&query, &TestCatalog, "default"))
+                .expect("analyze in apply mode");
+
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("expected select body");
+        };
+        assert_eq!(
+            select.apply_specs.len(),
+            1,
+            "one scalar apply spec expected"
+        );
+        let spec = &select.apply_specs[0];
+        assert_eq!(spec.clause, ApplyClause::Where);
+        assert!(spec.need_check_max_rows);
+        assert!(
+            !spec.correlation_column_ids.is_empty(),
+            "correlated subquery must record outer column ids"
+        );
+        // The placeholder must be gone from the WHERE predicate (replaced by a
+        // ColumnRef to the spec's output column). Verify no SubqueryPlaceholder
+        // remains in the WHERE filter.
+        if let Some(ref filter) = select.filter {
+            assert!(
+                !expr_has_subquery_placeholder(filter),
+                "WHERE filter must not contain a SubqueryPlaceholder after apply routing"
+            );
+        }
+        // In apply mode the FROM should NOT have grown a join — no legacy rewrite.
+        let from_is_join = matches!(select.from, Some(crate::sql::analysis::Relation::Join(_)));
+        assert!(
+            !from_is_join,
+            "apply mode must NOT rewrite the scalar subquery into a join"
+        );
+    }
+
+    /// Helper: returns true if `expr` or any descendant is a SubqueryPlaceholder.
+    fn expr_has_subquery_placeholder(expr: &TypedExpr) -> bool {
+        match &expr.kind {
+            ExprKind::SubqueryPlaceholder { .. } => true,
+            ExprKind::BinaryOp { left, right, .. } => {
+                expr_has_subquery_placeholder(left) || expr_has_subquery_placeholder(right)
+            }
+            ExprKind::UnaryOp { expr: inner, .. } => expr_has_subquery_placeholder(inner),
+            ExprKind::IsNull { expr: inner, .. } => expr_has_subquery_placeholder(inner),
+            ExprKind::Cast { expr: inner, .. } => expr_has_subquery_placeholder(inner),
+            ExprKind::Nested(inner) => expr_has_subquery_placeholder(inner),
+            ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
+                args.iter().any(expr_has_subquery_placeholder)
+            }
+            _ => false,
+        }
+    }
+
+    /// In legacy mode (the default) the same correlated scalar subquery must
+    /// still be rewritten into a JOIN — no apply_specs recorded.
+    #[test]
+    fn legacy_mode_still_rewrites_scalar_subquery_to_join() {
+        use crate::sql::analysis::QueryBody;
+
+        let dialect = sqlparser::dialect::GenericDialect {};
+        let stmts = sqlparser::parser::Parser::parse_sql(&dialect, CORRELATED_SCALAR_SQL).unwrap();
+        let query = match stmts.into_iter().next().unwrap() {
+            sqlparser::ast::Statement::Query(q) => q,
+            _ => panic!("expected query"),
+        };
+        let (resolved, _cte, _factory) =
+            analyze(&query, &TestCatalog, "default").expect("legacy analyze");
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("expected select body");
+        };
+        assert!(
+            select.apply_specs.is_empty(),
+            "legacy mode must not record apply specs"
+        );
+        // Legacy rewrites the scalar subquery into a LEFT OUTER JOIN.
+        assert!(
+            matches!(select.from, Some(crate::sql::analysis::Relation::Join(_))),
+            "legacy mode must rewrite scalar subquery into a join"
         );
     }
 }

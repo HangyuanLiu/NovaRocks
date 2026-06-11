@@ -819,6 +819,7 @@ mod is_known_rule_name_tests {
                 nullable: true,
                 is_internal: true,
             },
+            inner_output_column_id: ColumnId(5),
             correlation_column_ids: vec![],
             correlation_conjuncts: vec![],
             residual_predicate: None,
@@ -828,8 +829,18 @@ mod is_known_rule_name_tests {
             required_output_columns: None,
         });
 
+        // Disable ALL rules that could eliminate the Apply: ApplyException
+        // (the SubqueryRewrite guard) AND the M1b decorrelation rules
+        // (ScalarApplyToJoin, PushDownApplyAggFilter, PushDownApplyFilter).
+        // With all three disabled, the Apply survives the SubqueryRewrite stage
+        // and the non-disableable optimize() backstop (find_residual_apply) fires.
         let settings = crate::sql::optimizer::options::SessionOptimizerSettings {
-            disabled_rules: vec!["ApplyException".to_string()],
+            disabled_rules: vec![
+                "ApplyException".to_string(),
+                "ScalarApplyToJoin".to_string(),
+                "PushDownApplyAggFilter".to_string(),
+                "PushDownApplyFilter".to_string(),
+            ],
             ..Default::default()
         };
         let err = crate::sql::optimizer::options::with_session_optimizer_settings(settings, || {
@@ -845,6 +856,113 @@ mod is_known_rule_name_tests {
         assert!(
             err.contains("subquery decorrelation failed"),
             "unexpected error: {err}"
+        );
+    }
+
+    /// End-to-end proof: the full analyze → plan_query → optimize chain in
+    /// apply mode turns a scalar subquery into a `LogicalPlan::Apply`, which
+    /// M1b's `SubqueryRewrite` decorrelation rules (PushDownApplyAggFilter +
+    /// ScalarApplyToJoin) rewrite into a LEFT OUTER JOIN over a vector
+    /// aggregate. The optimized physical plan contains a HashJoin (or NestLoop)
+    /// and no residual Apply node or "subquery decorrelation failed" error.
+    ///
+    /// Both the analyze and optimize calls run inside the same
+    /// `with_session_optimizer_settings` closure so both read the same
+    /// session-level `subquery_unnest_mode = Apply`.
+    #[test]
+    fn apply_mode_scalar_subquery_decorrelates_to_join() {
+        use crate::sql::catalog::{CatalogProvider, ColumnDef, ScanSource, TableDef};
+        use crate::sql::column_id::ColumnRefFactory;
+        use crate::sql::optimizer::options::{
+            SessionOptimizerSettings, SubqueryUnnestMode, with_session_optimizer_settings,
+        };
+
+        // Minimal catalog providing t1(k1, k2) and t2(k1, k2) — the same
+        // shape the planner and analyzer test modules use.
+        struct MinimalCatalog;
+        impl CatalogProvider for MinimalCatalog {
+            fn get_table(&self, _db: &str, table: &str) -> Result<TableDef, String> {
+                match table {
+                    "t1" | "t2" => Ok(TableDef {
+                        name: table.to_string(),
+                        columns: vec![
+                            ColumnDef {
+                                name: "k1".to_string(),
+                                data_type: arrow::datatypes::DataType::Int64,
+                                nullable: true,
+                                write_default: None,
+                                logical_type: None,
+                            },
+                            ColumnDef {
+                                name: "k2".to_string(),
+                                data_type: arrow::datatypes::DataType::Int64,
+                                nullable: true,
+                                write_default: None,
+                                logical_type: None,
+                            },
+                        ],
+                        iceberg_row_lineage_metadata_columns: vec![],
+                        source: ScanSource::StarRocks {
+                            db_id: 0,
+                            table_id: 0,
+                        },
+                    }),
+                    other => Err(format!("table not found: {other}")),
+                }
+            }
+        }
+
+        // A correlated WHERE-clause scalar subquery: aggregate inner with an
+        // outer-column equality predicate. M1b decorrelates this shape into a
+        // LEFT OUTER JOIN over a vector aggregate.
+        let sql = "SELECT k1 FROM t1 WHERE k1 = (SELECT max(k2) FROM t2 WHERE t2.k1 = t1.k1)";
+
+        let settings = SessionOptimizerSettings {
+            subquery_unnest_mode: SubqueryUnnestMode::Apply,
+            ..Default::default()
+        };
+
+        let physical = with_session_optimizer_settings(settings, || {
+            // parse → analyze
+            let dialect = crate::sql::parser::dialect::StarRocksDialect;
+            let mut ast = sqlparser::parser::Parser::parse_sql(&dialect, sql)
+                .map_err(|e| e.to_string())
+                .expect("parse must succeed");
+            let stmt = ast.pop().expect("expected a statement");
+            let query = match stmt {
+                sqlparser::ast::Statement::Query(q) => q,
+                _ => panic!("expected a query"),
+            };
+            let (resolved, cte_registry, mut factory) =
+                crate::sql::analyzer::analyze(&query, &MinimalCatalog, "default")
+                    .expect("analyze in apply mode must succeed");
+
+            // plan_query: turns the ApplyScalarSpec into LogicalPlan::Apply.
+            let plan = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)
+                .expect("plan_query in apply mode must succeed");
+
+            // optimize: M1b's decorrelation rules must rewrite the Apply to a
+            // join; no ApplyException error, no residual Apply.
+            optimize(
+                plan,
+                &HashMap::new(),
+                ColumnRefFactory::new(),
+                None,
+                Vec::new(),
+            )
+        })
+        .expect("optimize must succeed: M1b decorrelates correlated aggregate scalar subquery");
+
+        let physical_debug = format!("{physical:?}");
+        // The correlated aggregate scalar path becomes a LEFT OUTER JOIN (HashJoin or NestLoop).
+        assert!(
+            physical_debug.contains("HashJoin") || physical_debug.contains("NestLoop"),
+            "expected a join in the decorrelated plan; got: {physical_debug}"
+        );
+        // No residual Apply must survive.
+        assert!(
+            !physical_debug.contains("Apply"),
+            "residual Apply must not appear in the decorrelated plan; got: {physical_debug}"
         );
     }
 }
