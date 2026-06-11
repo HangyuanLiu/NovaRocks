@@ -1830,6 +1830,211 @@ mod tests {
         );
     }
 
+    // ---- full-pipeline integration tests ----------------------------------------
+
+    /// Build the PRE-pushdown shape: Apply{need_check_max_rows=true,
+    /// correlation_column_ids=[P_PARTKEY], correlation_conjuncts=[]} where the inner
+    /// is Agg{group_by:[]}(Filter(inner.l_partkey==outer.p_partkey)(inner_scan)).
+    /// This is the shape the planner emits before PushDownApplyAggFilter fires.
+    fn winmagic_pre_pushdown_filter_apply() -> LogicalPlan {
+        // Correlation predicate inside the inner filter: inner.l_partkey == outer.p_partkey
+        let inner_corr_pred = eq_expr(
+            col_ref(INNER_L_PARTKEY, "l_partkey", DataType::Int64),
+            col_ref(P_PARTKEY, "p_partkey", DataType::Int64),
+        );
+        // Inner: Agg{group_by:[]}(Filter(corr_pred)(inner_scan))
+        let inner_filter = LogicalPlan::Filter(FilterNode {
+            input: Box::new(make_inner_lineitem_scan()),
+            predicate: inner_corr_pred,
+            required_output_columns: None,
+        });
+        let inner_agg = LogicalPlan::Aggregate(AggregateNode {
+            input: Box::new(inner_filter),
+            group_by: vec![],
+            aggregates: vec![AggregateCall {
+                name: "avg".to_string(),
+                args: vec![col_ref(INNER_L_QUANTITY, "l_quantity", DataType::Float64)],
+                distinct: false,
+                result_type: DataType::Float64,
+                order_by: vec![],
+                output_column_id: AVG_RESULT,
+            }],
+            output_columns: vec![OutputColumn {
+                column_id: AVG_RESULT,
+                name: "avg(l_quantity)".to_string(),
+                data_type: DataType::Float64,
+                nullable: true,
+                is_internal: false,
+            }],
+            already_pushed: false,
+            required_output_columns: None,
+        });
+
+        let apply = LogicalPlan::Apply(ApplyNode {
+            left: Box::new(make_outer_join()),
+            right: Box::new(inner_agg),
+            kind: ApplyKind::Scalar,
+            subquery_expr: col_ref_nullable(APPLY_OUT, "avg_subq", DataType::Float64),
+            output_column: OutputColumn {
+                column_id: APPLY_OUT,
+                name: "avg_subq".to_string(),
+                data_type: DataType::Float64,
+                nullable: true,
+                is_internal: true,
+            },
+            // inner_output_column_id == AVG_RESULT (no leading Project)
+            inner_output_column_id: AVG_RESULT,
+            correlation_column_ids: vec![P_PARTKEY],
+            // correlation_conjuncts is EMPTY — PushDownApplyAggFilter has not run yet
+            correlation_conjuncts: vec![],
+            residual_predicate: None,
+            need_check_max_rows: true, // pre-pushdown flag
+            use_semi_anti: false,
+            uncorrelated_outer_predicate_columns: HashSet::new(),
+            required_output_columns: None,
+        });
+
+        // WHERE: (p_partkey == l_partkey) AND (p_brand == 'x') AND (l_quantity < APPLY_OUT)
+        let pred = and_expr(
+            and_expr(
+                eq_expr(
+                    col_ref(P_PARTKEY, "p_partkey", DataType::Int64),
+                    col_ref(L_PARTKEY, "l_partkey", DataType::Int64),
+                ),
+                eq_expr(
+                    col_ref(P_BRAND, "p_brand", DataType::Utf8),
+                    str_lit("x"),
+                ),
+            ),
+            lt_expr(
+                col_ref(L_QUANTITY, "l_quantity", DataType::Float64),
+                col_ref_nullable(APPLY_OUT, "avg_subq", DataType::Float64),
+            ),
+        );
+
+        LogicalPlan::Filter(FilterNode {
+            input: Box::new(apply),
+            predicate: pred,
+            required_output_columns: None,
+        })
+    }
+
+    /// Recursively find any Window node in the plan tree.
+    fn find_window(plan: &LogicalPlan) -> bool {
+        match plan {
+            LogicalPlan::Window(_) => true,
+            LogicalPlan::Filter(n) => find_window(&n.input),
+            LogicalPlan::Sort(n) => find_window(&n.input),
+            LogicalPlan::Project(n) => find_window(&n.input),
+            LogicalPlan::Aggregate(n) => find_window(&n.input),
+            LogicalPlan::Join(n) => find_window(&n.left) || find_window(&n.right),
+            LogicalPlan::Limit(n) => find_window(&n.input),
+            _ => false,
+        }
+    }
+
+    /// Recursively find any LeftOuter Join node in the plan tree.
+    fn find_left_outer_join(plan: &LogicalPlan) -> bool {
+        match plan {
+            LogicalPlan::Join(n) if n.join_type == JoinKind::LeftOuter => true,
+            LogicalPlan::Join(n) => find_left_outer_join(&n.left) || find_left_outer_join(&n.right),
+            LogicalPlan::Filter(n) => find_left_outer_join(&n.input),
+            LogicalPlan::Sort(n) => find_left_outer_join(&n.input),
+            LogicalPlan::Project(n) => find_left_outer_join(&n.input),
+            LogicalPlan::Aggregate(n) => find_left_outer_join(&n.input),
+            LogicalPlan::Limit(n) => find_left_outer_join(&n.input),
+            LogicalPlan::Window(n) => find_left_outer_join(&n.input),
+            _ => false,
+        }
+    }
+
+    /// Full-pipeline integration test (SubqueryRewrite stage only — the full query
+    /// pipeline's later stages such as ColumnPruning require `required_output_columns`
+    /// wiring that synthetic fixtures lack).
+    ///
+    /// Variant 1: ApplyToWindow enabled.
+    ///   A PRE-pushdown correlated scalar-aggregate Apply (need_check_max_rows=true,
+    ///   correlation_conjuncts=[]) fed through the SubqueryRewrite stage must emerge
+    ///   as a Window node with no Apply remaining in the tree.
+    #[test]
+    fn full_pipeline_pre_pushdown_becomes_window() {
+        use crate::sql::optimizer::rewrite::pipeline::{RewritePipeline, RewriteStage};
+        use crate::sql::optimizer::rewrite::phase::RewritePhase;
+        use crate::sql::optimizer::rewrite::rules::subquery::subquery_rewrite_rules;
+
+        let plan = winmagic_pre_pushdown_filter_apply();
+
+        let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        ctx.set_column_ref_factory(Rc::new(RefCell::new(ColumnRefFactory::new())));
+
+        // Run only the SubqueryRewrite stage so the fixture doesn't need full column wiring.
+        let pipeline = RewritePipeline::from_stages(vec![RewriteStage::new(
+            "SubqueryRewrite",
+            RewritePhase::StructuralRewrite,
+            subquery_rewrite_rules(),
+        )]);
+        let result = pipeline
+            .rewrite(plan, &mut ctx)
+            .expect("SubqueryRewrite stage must succeed for decorrelatable Apply");
+
+        // No Apply must survive.
+        assert!(
+            super::super::find_residual_apply(&result).is_none(),
+            "no Apply must survive after SubqueryRewrite stage"
+        );
+
+        // A Window node must be present (ApplyToWindow fired).
+        assert!(
+            find_window(&result),
+            "expected a Window node in the result — ApplyToWindow must have fired"
+        );
+    }
+
+    /// Full-pipeline integration test (SubqueryRewrite stage only).
+    ///
+    /// Variant 2: ApplyToWindow disabled via `disable_optimizer_rules='ApplyToWindow'`.
+    ///   The same PRE-pushdown fixture must fall back to the M1 LEFT OUTER JOIN form
+    ///   produced by ScalarApplyToJoin, with no Window node in the tree.
+    #[test]
+    fn full_pipeline_pre_pushdown_disabled_falls_back_to_join() {
+        use crate::sql::optimizer::rewrite::pipeline::{RewritePipeline, RewriteStage};
+        use crate::sql::optimizer::rewrite::phase::RewritePhase;
+        use crate::sql::optimizer::rewrite::rules::subquery::subquery_rewrite_rules;
+
+        let plan = winmagic_pre_pushdown_filter_apply();
+
+        // Disable ApplyToWindow → should fall back to ScalarApplyToJoin (LEFT OUTER JOIN form).
+        let mut ctx = RewriteContext::for_query(vec!["ApplyToWindow".to_string()]);
+        ctx.set_column_ref_factory(Rc::new(RefCell::new(ColumnRefFactory::new())));
+
+        let pipeline = RewritePipeline::from_stages(vec![RewriteStage::new(
+            "SubqueryRewrite",
+            RewritePhase::StructuralRewrite,
+            subquery_rewrite_rules(),
+        )]);
+        let result = pipeline
+            .rewrite(plan, &mut ctx)
+            .expect("SubqueryRewrite stage must succeed when ApplyToWindow is disabled");
+
+        // No Apply must survive.
+        assert!(
+            super::super::find_residual_apply(&result).is_none(),
+            "no Apply must survive after SubqueryRewrite stage (disabled-ApplyToWindow path)"
+        );
+
+        // No Window — ApplyToWindow was disabled.
+        assert!(
+            !find_window(&result),
+            "no Window must be present when ApplyToWindow is disabled"
+        );
+
+        // ScalarApplyToJoin must have produced a LEFT OUTER JOIN form.
+        assert!(
+            find_left_outer_join(&result),
+            "expected a LEFT OUTER JOIN when ApplyToWindow is disabled (M1 join form)"
+        );
+    }
+
     // Helper trait to make test code more readable — extracts AggregateNode from plan.
     trait AsAggregate {
         fn as_aggregate(&self) -> Option<&AggregateNode>;

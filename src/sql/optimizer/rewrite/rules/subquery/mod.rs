@@ -25,6 +25,7 @@ pub(crate) fn subquery_rewrite_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
     vec![
         Box::new(PushDownApplyAggFilter),
         Box::new(PushDownApplyFilter),
+        Box::new(ApplyToWindow),       // to-window BEFORE to-join (StarRocks ordering)
         Box::new(ScalarApplyToJoin),
         Box::new(ApplyException), // must stay LAST
     ]
