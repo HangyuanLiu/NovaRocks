@@ -246,15 +246,15 @@ pub(crate) fn create_namespace(
     namespace_name: &str,
 ) -> Result<(), String> {
     let ns_name = normalize_identifier(namespace_name)?;
-    if matches!(entry.kind, IcebergCatalogKind::Rest) {
+    if entry.uses_remote_catalog() {
         let namespace = NamespaceIdent::new(ns_name);
-        let catalog = block_on_iceberg(async { build_rest_catalog(entry).await })??;
+        let catalog = build_iceberg_catalog(entry)?;
         return block_on_iceberg(async {
             catalog.create_namespace(&namespace, HashMap::new()).await
         })
-        .map_err(|e| format!("create REST namespace runtime: {e}"))?
+        .map_err(|e| format!("create iceberg namespace runtime: {e}"))?
         .map(|_| ())
-        .map_err(|e| format!("create REST namespace {namespace}: {e}"));
+        .map_err(|e| format!("create iceberg namespace {namespace}: {e}"));
     }
     if let Some(s3_config) = &entry.s3_config {
         let op = crate::fs::object_store::build_oss_operator(s3_config)
@@ -286,12 +286,12 @@ pub(crate) fn namespace_exists(
     namespace_name: &str,
 ) -> Result<bool, String> {
     let ns_name = normalize_identifier(namespace_name)?;
-    if matches!(entry.kind, IcebergCatalogKind::Rest) {
+    if entry.uses_remote_catalog() {
         let namespace = NamespaceIdent::new(ns_name);
-        let catalog = block_on_iceberg(async { build_rest_catalog(entry).await })??;
+        let catalog = build_iceberg_catalog(entry)?;
         return block_on_iceberg(async { catalog.namespace_exists(&namespace).await })
-            .map_err(|e| format!("check REST namespace runtime: {e}"))?
-            .map_err(|e| format!("check REST namespace failed: {e}"));
+            .map_err(|e| format!("check iceberg namespace runtime: {e}"))?
+            .map_err(|e| format!("check iceberg namespace failed: {e}"));
     }
     if let Some(s3_config) = &entry.s3_config {
         let op = crate::fs::object_store::build_oss_operator(s3_config)
@@ -327,11 +327,11 @@ pub(crate) fn namespace_exists(
 /// Hidden entries (names starting with `.`) are excluded. Results are returned
 /// sorted and deduplicated.
 pub(crate) fn list_namespaces(entry: &IcebergCatalogEntry) -> Result<Vec<String>, String> {
-    if matches!(entry.kind, IcebergCatalogKind::Rest) {
-        let catalog = block_on_iceberg(async { build_rest_catalog(entry).await })??;
+    if entry.uses_remote_catalog() {
+        let catalog = build_iceberg_catalog(entry)?;
         let namespaces = block_on_iceberg(async { catalog.list_namespaces(None).await })
-            .map_err(|e| format!("list REST namespaces runtime failed: {e}"))?
-            .map_err(|e| format!("list REST namespaces failed: {e}"))?;
+            .map_err(|e| format!("list iceberg namespaces runtime failed: {e}"))?
+            .map_err(|e| format!("list iceberg namespaces failed: {e}"))?;
         let mut names: Vec<String> = namespaces
             .into_iter()
             .flat_map(|ns| ns.iter().map(|s| s.to_string()).collect::<Vec<_>>())
@@ -405,12 +405,12 @@ pub(crate) fn drop_namespace(
     namespace_name: &str,
 ) -> Result<(), String> {
     let ns_name = normalize_identifier(namespace_name)?;
-    if matches!(entry.kind, IcebergCatalogKind::Rest) {
+    if entry.uses_remote_catalog() {
         let namespace = NamespaceIdent::new(ns_name);
-        let catalog = block_on_iceberg(async { build_rest_catalog(entry).await })??;
+        let catalog = build_iceberg_catalog(entry)?;
         return block_on_iceberg(async { catalog.drop_namespace(&namespace).await })
-            .map_err(|e| format!("drop REST namespace runtime: {e}"))?
-            .map_err(|e| format!("drop REST namespace {namespace}: {e}"));
+            .map_err(|e| format!("drop iceberg namespace runtime: {e}"))?
+            .map_err(|e| format!("drop iceberg namespace {namespace}: {e}"));
     }
     if let Some(s3_config) = &entry.s3_config {
         let op = crate::fs::object_store::build_oss_operator(s3_config)
@@ -490,12 +490,12 @@ pub(crate) fn list_tables(
     namespace_name: &str,
 ) -> Result<Vec<String>, String> {
     let ns_name = normalize_identifier(namespace_name)?;
-    if matches!(entry.kind, IcebergCatalogKind::Rest) {
+    if entry.uses_remote_catalog() {
         let namespace = NamespaceIdent::new(ns_name);
-        let catalog = block_on_iceberg(async { build_rest_catalog(entry).await })??;
+        let catalog = build_iceberg_catalog(entry)?;
         let mut tables = block_on_iceberg(async { catalog.list_tables(&namespace).await })
-            .map_err(|e| format!("list REST tables runtime failed: {e}"))?
-            .map_err(|e| format!("list REST tables for namespace {namespace}: {e}"))?
+            .map_err(|e| format!("list iceberg tables runtime failed: {e}"))?
+            .map_err(|e| format!("list iceberg tables for namespace {namespace}: {e}"))?
             .into_iter()
             .map(|ident| ident.name)
             .collect::<Vec<_>>();
@@ -594,8 +594,8 @@ pub(crate) fn create_table(
     };
 
     // For Hadoop/Memory catalogs, ensure the namespace exists before table creation.
-    // REST catalogs manage namespace separately via CREATE DATABASE.
-    if !matches!(entry.kind, IcebergCatalogKind::Rest) {
+    // Remote catalogs (REST / Hive) manage namespace separately via CREATE DATABASE.
+    if !entry.uses_remote_catalog() {
         let _ =
             block_on_iceberg(async { catalog.create_namespace(&namespace, HashMap::new()).await });
     }
@@ -699,14 +699,17 @@ pub(crate) fn drop_table(
 
     entry.invalidate_table_cache(&ns_name, &tbl_name);
 
-    if matches!(entry.kind, IcebergCatalogKind::Rest) {
+    if entry.uses_remote_catalog() {
         let ident = TableIdent::from_strs([ns_name.as_str(), tbl_name.as_str()])
-            .map_err(|e| format!("build REST table ident: {e}"))?;
-        let catalog = block_on_iceberg(async { build_rest_catalog(entry).await })??;
+            .map_err(|e| format!("build iceberg table ident: {e}"))?;
+        let catalog = build_iceberg_catalog(entry)?;
         block_on_iceberg(async { catalog.drop_table(&ident).await })
-            .map_err(|e| format!("drop REST iceberg table runtime failed: {e}"))?
-            .map_err(|e| format!("drop REST iceberg table {ident}: {e}"))?;
-        if entry.s3_config.is_some() && !entry.warehouse_uri.trim().is_empty() {
+            .map_err(|e| format!("drop iceberg table runtime failed: {e}"))?
+            .map_err(|e| format!("drop iceberg table {ident}: {e}"))?;
+        if matches!(entry.kind, IcebergCatalogKind::Rest)
+            && entry.s3_config.is_some()
+            && !entry.warehouse_uri.trim().is_empty()
+        {
             drop_s3_table_prefix(entry, &ns_name, &tbl_name)
                 .map_err(|e| format!("purge REST iceberg table {ident} data prefix: {e}"))?;
         }
@@ -768,12 +771,12 @@ pub(crate) fn load_table(
         }
     }
 
-    let table = if matches!(entry.kind, IcebergCatalogKind::Rest) {
-        let catalog = block_on_iceberg(async { build_rest_catalog(entry).await })??;
+    let table = if entry.uses_remote_catalog() {
+        let catalog = build_iceberg_catalog(entry)?;
         let ident = TableIdent::from_strs([ns_name.as_str(), tbl_name.as_str()])
-            .map_err(|e| format!("build REST table ident: {e}"))?;
+            .map_err(|e| format!("build iceberg table ident: {e}"))?;
         block_on_iceberg(async { catalog.load_table(&ident).await })
-            .map_err(|e| format!("load REST iceberg table runtime failed: {e}"))?
+            .map_err(|e| format!("load iceberg table runtime failed: {e}"))?
             .map_err(|e| format_rest_load_table_error(&ident, &ns_name, &tbl_name, e))?
     } else if entry.s3_config.is_some() {
         // S3 path: discover metadata from S3 directly
@@ -914,12 +917,12 @@ pub(crate) fn current_schema_id(
     let ns_name = normalize_identifier(namespace_name)?;
     let tbl_name = normalize_identifier(table_name)?;
 
-    if matches!(entry.kind, IcebergCatalogKind::Rest) {
-        let catalog = block_on_iceberg(async { build_rest_catalog(entry).await })??;
+    if entry.uses_remote_catalog() {
+        let catalog = build_iceberg_catalog(entry)?;
         let ident = TableIdent::from_strs([ns_name.as_str(), tbl_name.as_str()])
-            .map_err(|e| format!("build REST table ident: {e}"))?;
+            .map_err(|e| format!("build iceberg table ident: {e}"))?;
         let table = block_on_iceberg(async { catalog.load_table(&ident).await })
-            .map_err(|e| format!("load REST iceberg table runtime failed: {e}"))?
+            .map_err(|e| format!("load iceberg table runtime failed: {e}"))?
             .map_err(|e| format_rest_load_table_error(&ident, &ns_name, &tbl_name, e))?;
         return Ok(table.metadata().current_schema_id());
     }
@@ -955,8 +958,9 @@ pub(crate) fn insert_rows(
 
     // For Hadoop/Memory catalogs: ensure namespace exists and register the table
     // by its metadata location so the catalog can resolve it for the commit.
-    // REST catalogs already track tables through the REST API; skip registration.
-    if !matches!(entry.kind, IcebergCatalogKind::Rest) {
+    // Remote catalogs (REST / Hive) already track tables through the metastore /
+    // REST API; skip registration.
+    if !entry.uses_remote_catalog() {
         let ns = NamespaceIdent::new(normalize_identifier(namespace_name)?);
         let _ = block_on_iceberg(async { catalog.create_namespace(&ns, HashMap::new()).await });
         let metadata_location = loaded
