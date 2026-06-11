@@ -171,23 +171,29 @@ HMS_CATALOG_PROP_THRIFT_TRANSPORT, THRIFT_TRANSPORT_BUFFERED, THRIFT_TRANSPORT_F
 
 ## 8. 测试
 
-### 8.1 docker 夹具（`docker/iceberg-rest/`，跨 worktree 共享）
+### 8.1 docker 夹具（`docker/iceberg-hive/`，跨 worktree 共享）
 
-- `compose.yml` 新增 `hms` 服务：
-  - standalone Hive Metastore，配 S3A → MinIO（`fs.s3a.endpoint=http://minio:9000`、
-    path-style、`fs.s3a.access.key/secret.key` = MinIO 凭据）。
-  - thrift 端口 `9083`，网络别名 `hms`，`depends_on: { mc: service_completed_successfully }`（桶就绪）。
-  - 镜像：基于 `apache/hive:4.0.0` metastore 模式 + `hadoop-aws` / `aws-java-sdk-bundle`
-    的**自建镜像**（`docker/iceberg-rest/hms/Dockerfile`，对照已自建的
-    `novarocks/spark-iceberg` 镜像；embedded Derby 作元库，容器重启清空，测试可接受）。
-  - `mc` 服务已建 `warehouse` 桶，HMS warehouse 复用之。
-- `shared.env` 新增：`NOVA_ENV_HMS_PORT=9083`、`NOVA_ENV_SHARED_HMS_WAREHOUSE_URI=s3://warehouse/shared/hms`、
-  `HMS_IMAGE=novarocks/hive-metastore:4.0.0`。
-- `up.sh` 生成的 `runtime/current/env.sh` 导出 `NOVA_ENV_HMS_PORT`、
-  `NOVAROCKS_ICEBERG_HMS_URI`（host 端点形如 `thrift://127.0.0.1:9083`），并加 HMS 就绪等待。
-- `spark` 服务追加一个 HMS HiveCatalog 配置（`spark.sql.catalog.hms_catalog =
-  org.apache.iceberg.spark.SparkCatalog`、`type=hive`、`uri=thrift://hms:9083`），供跨引擎对拍。
-  容器内 Spark 用 `thrift://hms:9083` 与 `http://minio:9000`；NovaRocks 用 host 端点。
+- HMS 不放进 `docker/iceberg-rest/compose.yml`。REST 夹具继续只负责
+  MinIO / REST Catalog / Spark；HMS 用独立 `docker/iceberg-hive/` 夹具和独立
+  Compose project（默认 `nr-iceberg-hive`）。
+- `docker/iceberg-hive/compose.yml` 只包含 `hms` 服务，并加入 REST 夹具的外部
+  Docker network（默认 `nr-iceberg-rest_iceberg_net`）。这样 HMS 容器内仍可用
+  `http://minio:9000` 访问 MinIO，但生命周期与 REST 夹具解耦。
+- standalone Hive Metastore 配 S3A → MinIO（`fs.s3a.endpoint=http://minio:9000`、
+  path-style、`fs.s3a.access.key/secret.key` = MinIO 凭据），thrift host 端口默认
+  `9083`，网络别名 `hms`。
+- 镜像：基于 `apache/hive:4.0.0` metastore 模式 + `hadoop-aws` /
+  `aws-java-sdk-bundle` 的自建镜像（`docker/iceberg-hive/Dockerfile`；
+  embedded Derby 作元库，容器重启清空，测试可接受）。
+- `docker/iceberg-hive/up.sh` 生成独立 `runtime/current/env.sh`，导出
+  `NOVA_ENV_HMS_PORT`、`NOVAROCKS_ICEBERG_HMS_URI`、`NOVA_ENV_SHARED_HMS_WAREHOUSE_URI`
+  `NOVAROCKS_ICE_HMS_CATALOG_SQL` 和 `NOVAROCKS_SPARK_EXTRA_DEFAULTS`。运行 HMS
+  suite 前需要先 source `docker/iceberg-rest/runtime/current/env.sh`，再 source
+  `docker/iceberg-hive/runtime/current/env.sh`。
+- 跨引擎对拍时，Spark 仍运行在 REST 夹具网络中；Spark 用容器内端点
+  `thrift://hms:9083` 与 `http://minio:9000`，NovaRocks 用 host 端点。REST
+  Spark 默认配置保持 REST-only；`docker/iceberg-rest/spark-sql.sh` 只在
+  `NOVAROCKS_SPARK_EXTRA_DEFAULTS` 存在时追加 HMS catalog 配置。
 
 ### 8.2 SQL suites（`sql-tests/`）
 

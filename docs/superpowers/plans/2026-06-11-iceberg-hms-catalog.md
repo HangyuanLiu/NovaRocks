@@ -40,7 +40,7 @@ the Docker/network-heavy steps. Resume with subagent-driven-development.
   to `uses_remote_catalog()` (Rest|Hive) routing through `build_iceberg_catalog`;
   fmt/clippy clean. **REST no-regression proven** (the 5 REST mockito tests pass).
   `views.rs` / `iceberg_view_rewrite.rs` left Rest-only (HMS views out of scope v1).
-- **Task 9 (partial)** — image source committed: `docker/iceberg-rest/hms/{Dockerfile,core-site.xml}`.
+- **Task 9 (partial)** — image source moved to `docker/iceberg-hive/{Dockerfile,core-site.xml}`.
   **Image NOT built yet** (this is the paused step — slow `docker pull`/`build`).
 - **Task 12** — `iceberg-hms` / `iceberg-hms-compatibility` placeholder arm in
   `tests/sql-test-runner/src/config.rs` (+ test). Reviewed.
@@ -56,27 +56,33 @@ All Rust changes verified: `cargo test -p novarocks --lib connector::iceberg::ca
    ```bash
    docker pull apache/hive:4.0.0
    docker run --rm --entrypoint bash apache/hive:4.0.0 -lc 'ls /opt/hive/lib/hadoop-common-*.jar'
-   # If the bundled hadoop is NOT 3.3.6, edit docker/iceberg-rest/hms/Dockerfile's
+   # If the bundled hadoop is NOT 3.3.6, edit docker/iceberg-hive/Dockerfile's
    # HADOOP_VERSION (and a compatible AWS_SDK_VERSION) to match, THEN:
-   docker build -t novarocks/hive-metastore:4.0.0 docker/iceberg-rest/hms
+   docker build -t novarocks/hive-metastore:4.0.0 docker/iceberg-hive
    ```
-2. **Task 10** — add the `hms` service to `compose.yml` + `shared.env` (per the Task 10
-   section); bring the shared fixture up (do NOT tear it down) and verify the `hms`
+2. **Task 10** — maintain HMS as a separate Docker fixture under
+   `docker/iceberg-hive/`; do not add `hms` to `docker/iceberg-rest/compose.yml`.
+   Start REST/MinIO first, then `docker/iceberg-hive/up.sh`, and verify the `hms`
    container is Up and the thrift port is reachable.
-3. **Task 11** — thread HMS env + readiness through `up.sh`; regenerate and verify
-   `NOVAROCKS_ICEBERG_HMS_URI` etc. are exported.
+3. **Task 11** — source both generated runtime env files before HMS SQL suites:
+   `docker/iceberg-rest/runtime/current/env.sh` for NovaRocks/MinIO config and
+   `docker/iceberg-hive/runtime/current/env.sh` for `NOVAROCKS_ICEBERG_HMS_URI`
+   and `NOVA_ENV_SHARED_HMS_WAREHOUSE_URI`.
 4. **Task 13** — `sql-tests/iceberg-hms` round-trip suite (incl. DELETE/UPDATE — the
    full-parity gate); record (`--record-from target`) + verify.
 5. **Task 14** — `sql-tests/iceberg-hms-compatibility` cross-engine suite (Spark HMS
-   catalog config + both directions); record + verify.
+   catalog config from `docker/iceberg-hive/runtime/current/spark-hms-defaults.conf`
+   + both directions); record + verify.
 6. **Task 15 (finish)** — flip the HMS row in `docs/guides/iceberg-v3/catalog.md` to ✅.
 7. **Task 16** — full regression (registry tests, iceberg-rest suite for no-regression,
    both HMS suites).
 
 ### Environment notes
-- The Docker fixture (`docker/iceberg-rest/`) is shared across worktrees; MinIO/REST/Spark
-  were already running. NEVER `down.sh --docker`. Add `hms` and `docker compose up -d`.
-- `shared.env` is shared — adding `NOVA_ENV_HMS_PORT=9083` etc. there is intended.
+- The REST Docker fixture (`docker/iceberg-rest/`) remains MinIO/REST/Spark only.
+  NEVER add `hms` back into its compose file.
+- HMS has its own fixture (`docker/iceberg-hive/`) and Compose project
+  (`nr-iceberg-hive` by default). It joins the REST fixture's Docker network
+  (`nr-iceberg-rest_iceberg_net`) so HMS can reach MinIO as `http://minio:9000`.
 - The paused build was handed to the user because of a slow-network `docker pull`/`build`.
 
 ---
@@ -96,16 +102,16 @@ All Rust changes verified: `cargo test -p novarocks --lib connector::iceberg::ca
 **Modified:**
 - `Cargo.toml` — add `iceberg-catalog-hms = "0.9.0"` dependency.
 - `src/connector/iceberg/catalog/registry.rs` — the entire catalog-side change (enum variant, entry field, predicate, parsing, builder, dispatcher arm, broadened branch points, unit tests). All catalog logic stays in this one file, matching the REST precedent.
-- `docker/iceberg-rest/compose.yml` — add `hms` service.
-- `docker/iceberg-rest/shared.env` — add HMS port + warehouse + image defaults.
-- `docker/iceberg-rest/up.sh` — emit HMS env vars, add HMS readiness wait, add HMS to manifest + printed examples.
+- `docker/iceberg-hive/compose.yml` — standalone HMS service in a separate Compose project, attached to the REST fixture network.
+- `docker/iceberg-hive/shared.env` — HMS port, warehouse, image, and REST-network defaults.
+- `docker/iceberg-hive/up.sh` / `down.sh` / `status.sh` — generate HMS runtime env and manage only HMS.
 - `tests/sql-test-runner/src/config.rs` — `apply_suite_placeholder_defaults` arms for the two new suites.
 - `docs/guides/iceberg-v3/catalog.md` — flip the HMS row to supported.
 - `CLAUDE.md` / `AGENTS.md` — note `hive` as a supported catalog type.
 
 **Created:**
-- `docker/iceberg-rest/hms/Dockerfile` — standalone Hive Metastore image (apache/hive:4.0.0 + hadoop-aws + S3A config).
-- `docker/iceberg-rest/hms/core-site.xml` — S3A → MinIO configuration for the metastore.
+- `docker/iceberg-hive/Dockerfile` — standalone Hive Metastore image (apache/hive:4.0.0 + hadoop-aws + S3A config).
+- `docker/iceberg-hive/core-site.xml` — S3A → MinIO configuration for the metastore.
 - `sql-tests/iceberg-hms/` — NovaRocks-only round-trip suite (`init.sql`, `cleanup.sql`, `sql/*.sql`, `result/*.result`, `README.md`).
 - `sql-tests/iceberg-hms-compatibility/` — Spark ↔ NovaRocks cross-engine suite (same layout).
 
@@ -770,15 +776,15 @@ git commit -m "style(iceberg): fmt + clippy for HMS catalog"
 
 ## Phase 3 — Docker fixture: standalone Hive Metastore
 
-This phase adds a real HMS service to the shared `docker/iceberg-rest` fixture so the catalog can be exercised end-to-end and cross-engine. **This is the highest-risk phase** (HMS image + S3A → MinIO). Build the image and validate connectivity before formalizing suites.
+This phase adds a real HMS service as a separate `docker/iceberg-hive` fixture so the catalog can be exercised end-to-end and cross-engine without coupling HMS lifecycle to the REST fixture. **This is the highest-risk phase** (HMS image + S3A → MinIO). Build the image and validate connectivity before formalizing suites.
 
 ### Task 9: Hive Metastore Docker image (apache/hive:4.0.0 + S3A)
 
 **Files:**
-- Create: `docker/iceberg-rest/hms/Dockerfile`
-- Create: `docker/iceberg-rest/hms/core-site.xml`
+- Create: `docker/iceberg-hive/Dockerfile`
+- Create: `docker/iceberg-hive/core-site.xml`
 
-- [ ] **Step 1: Write `docker/iceberg-rest/hms/core-site.xml`**
+- [ ] **Step 1: Write `docker/iceberg-hive/core-site.xml`**
 
 ```xml
 <?xml version="1.0"?>
@@ -793,7 +799,7 @@ This phase adds a real HMS service to the shared `docker/iceberg-rest` fixture s
 </configuration>
 ```
 
-- [ ] **Step 2: Write `docker/iceberg-rest/hms/Dockerfile`**
+- [ ] **Step 2: Write `docker/iceberg-hive/Dockerfile`**
 
 ```dockerfile
 # Standalone Hive Metastore for the NovaRocks Iceberg test fixture.
@@ -831,46 +837,54 @@ docker run --rm --entrypoint bash apache/hive:4.0.0 -lc 'ls /opt/hive/lib/hadoop
 ```
 Set the `HADOOP_VERSION` ARG in the Dockerfile to the version shown, then:
 ```bash
-docker build -t novarocks/hive-metastore:4.0.0 docker/iceberg-rest/hms
+docker build -t novarocks/hive-metastore:4.0.0 docker/iceberg-hive
 ```
 Expected: image builds; both jars download.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add docker/iceberg-rest/hms/Dockerfile docker/iceberg-rest/hms/core-site.xml
+git add docker/iceberg-hive/Dockerfile docker/iceberg-hive/core-site.xml
 git commit -m "test(iceberg): standalone Hive Metastore docker image for HMS catalog"
 ```
 
-### Task 10: Add the `hms` service to compose.yml and shared.env
+### Task 10: Add the separate `docker/iceberg-hive` fixture
 
 **Files:**
-- Modify: `docker/iceberg-rest/compose.yml`
-- Modify: `docker/iceberg-rest/shared.env`
+- Create: `docker/iceberg-hive/compose.yml`
+- Create: `docker/iceberg-hive/shared.env`
+- Create: `docker/iceberg-hive/up.sh`
+- Create: `docker/iceberg-hive/down.sh`
+- Create: `docker/iceberg-hive/status.sh`
+- Create: `docker/iceberg-hive/README.md`
 
-- [ ] **Step 1: Add HMS defaults to `shared.env`**
+- [ ] **Step 1: Add HMS defaults to `docker/iceberg-hive/shared.env`**
 
-Append to `docker/iceberg-rest/shared.env`:
+Create defaults for the independent HMS Compose project. It must reference the
+REST fixture network, but must not add services to `docker/iceberg-rest`:
 
 ```bash
+NOVA_ENV_SHARED_DOCKER=true
+NOVA_ENV_SHARED_HIVE_COMPOSE_PROJECT=nr-iceberg-hive
+NOVA_ENV_REST_COMPOSE_PROJECT=nr-iceberg-rest
+NOVA_ENV_REST_NETWORK=nr-iceberg-rest_iceberg_net
 NOVA_ENV_HMS_PORT=9083
 NOVA_ENV_SHARED_HMS_WAREHOUSE_URI=s3://warehouse/shared/hms
 HMS_IMAGE=novarocks/hive-metastore:4.0.0
 ```
 
-- [ ] **Step 2: Add the `hms` service to `compose.yml`**
+- [ ] **Step 2: Add `docker/iceberg-hive/compose.yml`**
 
-In `docker/iceberg-rest/compose.yml`, add this service after the `rest` service block (before `spark`):
+The compose file owns only HMS and attaches to the external REST fixture
+network:
 
 ```yaml
+services:
   hms:
     image: ${HMS_IMAGE:-novarocks/hive-metastore:4.0.0}
     build:
-      context: ./hms
+      context: .
     pull_policy: missing
-    depends_on:
-      mc:
-        condition: service_completed_successfully
     environment:
       SERVICE_NAME: metastore
       AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-admin}
@@ -879,17 +893,37 @@ In `docker/iceberg-rest/compose.yml`, add this service after the `rest` service 
     ports:
       - "${NOVA_ENV_HMS_PORT:-9083}:9083"
     networks:
-      iceberg_net:
+      iceberg_rest_net:
         aliases:
           - hms
+
+networks:
+  iceberg_rest_net:
+    external: true
+    name: ${NOVA_ENV_REST_NETWORK:-nr-iceberg-rest_iceberg_net}
 ```
 
-- [ ] **Step 3: Bring up the fixture and verify HMS starts and listens**
+- [ ] **Step 3: Add `up.sh` / `down.sh` / `status.sh`**
+
+The HMS `up.sh` should:
+- generate `docker/iceberg-hive/runtime/<env-id>/` and `runtime/current/`;
+- source `docker/iceberg-rest/runtime/current/env.sh` when present to discover
+  the active REST Compose project and host MinIO endpoint;
+- fail fast if the REST Docker network does not exist, with a message to run
+  `docker/iceberg-rest/up.sh` first;
+- export `NOVAROCKS_ICEBERG_HMS_URI`, `NOVA_ENV_SHARED_HMS_WAREHOUSE_URI`,
+  `NOVAROCKS_ICEBERG_HMS_WAREHOUSE`, `NOVAROCKS_ICE_HMS_CATALOG_SQL`, and
+  `NOVAROCKS_SPARK_EXTRA_DEFAULTS`.
+
+- [ ] **Step 4: Bring up both fixtures and verify HMS starts and listens**
 
 ```bash
 source docker/iceberg-rest/runtime/current/env.sh 2>/dev/null || docker/iceberg-rest/up.sh --prepare-only
 docker/iceberg-rest/up.sh
-docker compose -p "${NOVA_ENV_COMPOSE_PROJECT:-nr-iceberg-rest}" -f docker/iceberg-rest/compose.yml ps
+docker/iceberg-hive/up.sh
+docker compose --env-file docker/iceberg-hive/runtime/current/compose.env \
+  -p "${NOVA_ENV_HIVE_COMPOSE_PROJECT:-nr-iceberg-hive}" \
+  -f docker/iceberg-hive/compose.yml ps
 ```
 Then verify the thrift port accepts connections:
 ```bash
@@ -897,105 +931,52 @@ Then verify the thrift port accepts connections:
 ```
 Expected: the `hms` container is `Up` and the port is open. If the container exits, inspect logs:
 ```bash
-docker compose -p "${NOVA_ENV_COMPOSE_PROJECT:-nr-iceberg-rest}" -f docker/iceberg-rest/compose.yml logs hms --tail=120
+docker compose --env-file docker/iceberg-hive/runtime/current/compose.env \
+  -p "${NOVA_ENV_HIVE_COMPOSE_PROJECT:-nr-iceberg-hive}" \
+  -f docker/iceberg-hive/compose.yml logs hms --tail=120
 ```
 Common failure: metastore schema not initialized — apache/hive:4.0.0 metastore auto-creates the Derby schema on first boot via `SERVICE_NAME=metastore`; if it complains about schema, add `IS_RESUME=true` or an init step per the image docs.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add docker/iceberg-rest/compose.yml docker/iceberg-rest/shared.env
-git commit -m "test(iceberg): add hms service to the shared docker fixture"
+git add docker/iceberg-hive .gitignore
+git commit -m "test(iceberg): add standalone Hive Metastore docker fixture"
 ```
 
-### Task 11: Emit HMS env vars + readiness wait in up.sh
+### Task 11: Source both runtime env files before HMS suites
 
 **Files:**
-- Modify: `docker/iceberg-rest/up.sh` (anchors below are 1:1 with the current file).
+- Modify: `sql-tests/iceberg-hms/README.md`
+- Modify: `sql-tests/iceberg-hms-compatibility/README.md`
 
-- [ ] **Step 1: Add an `hms_port` variable next to the other ports**
-
-Near lines 123-124 (`configured_rest_port`/`configured_spark_ui_port`) and 140-141 (`rest_port`/`spark_ui_port`), add an HMS port alongside, e.g. after line 141:
-
-```bash
-    hms_port="${NOVA_ENV_HMS_PORT:-9083}"
-```
-and near line 124:
-```bash
-configured_hms_port="${NOVA_ENV_HMS_PORT:-9083}"
-```
-Use whichever of these two variables the surrounding code uses to compose `compose.env` and `env.sh` (mirror exactly how `rest_port` is threaded through).
-
-- [ ] **Step 2: Write `NOVA_ENV_HMS_PORT` into `compose.env`**
-
-At the `compose.env` heredoc (around lines 320-321, where `NOVA_ENV_REST_PORT=$rest_port` is written), add:
-```bash
-NOVA_ENV_HMS_PORT=$hms_port
-```
-
-- [ ] **Step 3: Export HMS vars in `env.sh`**
-
-In the `env.sh` export block (around lines 471-496), after `export NOVA_ENV_REST_PORT="$rest_port"` (line 477) add:
-```bash
-export NOVA_ENV_HMS_PORT="$hms_port"
-```
-and after `export NOVAROCKS_ICEBERG_REST_URI="$rest_uri"` (line 489) add:
-```bash
-hms_uri="thrift://127.0.0.1:$hms_port"
-export NOVAROCKS_ICEBERG_HMS_URI="$hms_uri"
-export NOVA_ENV_SHARED_HMS_WAREHOUSE_URI="${NOVA_ENV_SHARED_HMS_WAREHOUSE_URI:-s3://warehouse/shared/hms}"
-```
-
-- [ ] **Step 4: Add an HMS entry to the manifest heredoc**
-
-In the `manifest.json` heredoc (starts line 509), add an `hms` endpoint field mirroring the `rest` field (keep valid JSON — add a comma). Example field:
-```
-  "hms_uri": "$hms_uri",
-  "hms_port": $hms_port,
-```
-
-- [ ] **Step 5: Add a TCP readiness wait for HMS**
-
-In the readiness section (around lines 613-628 with `wait_http` for MinIO + REST), add a TCP-based wait (HMS is thrift, not HTTP) after the REST wait (line 628):
-
-```bash
-  wait_tcp() {
-    local host="$1" port="$2" name="$3" i
-    for i in $(seq 1 60); do
-      if (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null; then exec 3>&- 3<&-; return 0; fi
-      sleep 1
-    done
-    echo "timed out waiting for $name on $host:$port" >&2
-    docker compose --env-file "$compose_env" -p "$compose_project" -f "$compose_file" logs --tail=120 hms >&2
-    return 1
-  }
-  wait_tcp 127.0.0.1 "$hms_port" "Hive Metastore"
-```
-
-> NOTE: A TCP-accept check only proves the port is bound, not that the metastore finished schema init. This is acceptable for v1; the suite's `CREATE DATABASE` in `init.sql` is the real readiness gate. A stronger check (a thrift `get_all_databases` ping) is a follow-up.
-
-- [ ] **Step 6: Add the new suites to the printed example commands**
-
-After the `iceberg-compatibility` example lines (596-598 and 664-666), add:
-```bash
-cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-hms --mode verify
-cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-hms-compatibility --mode verify
-```
-
-- [ ] **Step 7: Regenerate and verify env exports**
+- [ ] **Step 1: Regenerate and verify env exports**
 
 ```bash
 docker/iceberg-rest/up.sh --prepare-only
 source docker/iceberg-rest/runtime/current/env.sh
+docker/iceberg-hive/up.sh --prepare-only
+source docker/iceberg-hive/runtime/current/env.sh
 echo "HMS_PORT=$NOVA_ENV_HMS_PORT HMS_URI=$NOVAROCKS_ICEBERG_HMS_URI WH=$NOVA_ENV_SHARED_HMS_WAREHOUSE_URI"
 ```
 Expected: all three print non-empty values; `NOVAROCKS_ICEBERG_HMS_URI=thrift://127.0.0.1:9083` (or the worktree's port).
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 2: Document suite startup**
+
+Any HMS suite README should show this startup sequence:
 
 ```bash
-git add docker/iceberg-rest/up.sh
-git commit -m "test(iceberg): emit HMS env + readiness wait in up.sh"
+docker/iceberg-rest/up.sh
+docker/iceberg-hive/up.sh
+source docker/iceberg-rest/runtime/current/env.sh
+source docker/iceberg-hive/runtime/current/env.sh
+```
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add sql-tests/iceberg-hms sql-tests/iceberg-hms-compatibility
+git commit -m "docs(iceberg): document standalone HMS fixture usage"
 ```
 
 ---
@@ -1230,23 +1211,24 @@ git commit -m "test(iceberg): iceberg-hms NovaRocks write/read round-trip suite"
 ### Task 14: `iceberg-hms-compatibility` suite — Spark ↔ NovaRocks cross-engine
 
 **Files:**
-- Modify: `docker/iceberg-rest/spark/` (add an HMS catalog to Spark's config — read the dir first).
+- Modify: `docker/iceberg-rest/spark-sql.sh` (already supports appending `NOVAROCKS_SPARK_EXTRA_DEFAULTS`).
 - Create: `sql-tests/iceberg-hms-compatibility/init.sql`, `cleanup.sql`, `README.md`, `sql/*.sql`, `result/*.result`.
 
-- [ ] **Step 1: Inspect how Spark catalogs are configured**
+- [ ] **Step 1: Inspect how Spark extra defaults are configured**
 
 Run:
 ```bash
-ls -R docker/iceberg-rest/spark
-grep -rn "spark.sql.catalog" docker/iceberg-rest/spark
-echo "--- generated spark catalog SQL env ---"
-grep -n "SPARK" docker/iceberg-rest/up.sh | head
+grep -n "NOVAROCKS_SPARK_EXTRA_DEFAULTS" docker/iceberg-rest/spark-sql.sh
+source docker/iceberg-hive/runtime/current/env.sh
+cat "$NOVAROCKS_SPARK_HMS_DEFAULTS"
 ```
-Identify where the REST catalog is registered for Spark (e.g. `spark-defaults.conf` or a generated `NOVAROCKS_ICE_REST_CATALOG_SQL`). The HMS catalog mirrors it with `type=hive`.
+The REST fixture's generated Spark defaults stay REST-only. The HMS fixture
+generates an extra defaults file and exports `NOVAROCKS_SPARK_EXTRA_DEFAULTS`;
+`docker/iceberg-rest/spark-sql.sh` appends that file when it is present.
 
-- [ ] **Step 2: Add a Spark HMS catalog config**
+- [ ] **Step 2: Confirm the Spark HMS catalog config**
 
-In Spark's `spark-defaults.conf` (under `docker/iceberg-rest/spark/`), add an Iceberg HiveCatalog pointing at the in-network HMS + MinIO:
+The generated `spark-hms-defaults.conf` should contain an Iceberg HiveCatalog pointing at the in-network HMS + MinIO:
 ```
 spark.sql.catalog.hms_catalog                 org.apache.iceberg.spark.SparkCatalog
 spark.sql.catalog.hms_catalog.type            hive
@@ -1362,17 +1344,18 @@ SPARK_SQL
 DROP TABLE iceberg_hms_compat_${suite_uuid0}.nr_hms_w_db_${uuid0}.nova_hms_${uuid0};
 ```
 
-- [ ] **Step 5: Rebuild Spark image (config baked in) and bring the fixture up**
+- [ ] **Step 5: Bring both fixtures up**
 
 ```bash
-docker compose -p "${NOVA_ENV_COMPOSE_PROJECT:-nr-iceberg-rest}" -f docker/iceberg-rest/compose.yml build spark
 docker/iceberg-rest/up.sh
+docker/iceberg-hive/up.sh
 ```
 
 - [ ] **Step 6: Record + verify**
 
 ```bash
 source docker/iceberg-rest/runtime/current/env.sh
+source docker/iceberg-hive/runtime/current/env.sh
 cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-hms-compatibility \
   --mode record --record-from target
@@ -1386,7 +1369,7 @@ Expected: both directions PASS — Spark-written rows read by NovaRocks and vice
 `sql-tests/iceberg-hms-compatibility/README.md`: adapt from `sql-tests/iceberg-compatibility/README.md`.
 
 ```bash
-git add sql-tests/iceberg-hms-compatibility docker/iceberg-rest/spark
+git add sql-tests/iceberg-hms-compatibility docker/iceberg-rest/spark-sql.sh
 git commit -m "test(iceberg): iceberg-hms-compatibility cross-engine suite (Spark <-> NovaRocks)"
 ```
 

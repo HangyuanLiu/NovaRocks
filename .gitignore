@@ -27,6 +27,7 @@ nosetests.xml
 /.codex/worktrees/
 /.codex/environments/runtime/
 /docker/iceberg-rest/runtime/
+/docker/iceberg-hive/runtime/
 /logs/
 __pycache__/
 *.pyc
