@@ -612,6 +612,28 @@ fn hide_novarocks_mv_internal_columns_by_property(
         .collect())
 }
 
+/// Names of the NovaRocks MV internal columns (the apply-key column plus any
+/// declared hidden aggregate-state columns) that `hide_novarocks_mv_internal_columns`
+/// strips from a table's analyzer-visible schema. Derived from the same table
+/// properties used by the hiding logic, so callers (e.g. the OPTIMIZE rewrite)
+/// can detect whether a table carries hidden physical columns that a plain
+/// `SELECT *` would omit, and react accordingly. An empty result means the
+/// table has no hidden internal columns (plain Iceberg table or non-MV table).
+pub(crate) fn hidden_internal_column_names_from_metadata(
+    metadata: &iceberg::spec::TableMetadata,
+) -> Vec<String> {
+    hidden_internal_column_names(
+        metadata
+            .properties()
+            .get(NOVAROCKS_MV_APPLY_KEY_COLUMN_PROPERTY)
+            .map(String::as_str),
+        metadata
+            .properties()
+            .get(NOVAROCKS_MV_HIDDEN_COLUMNS_PROPERTY)
+            .map(String::as_str),
+    )
+}
+
 fn hidden_internal_column_names(
     apply_key_column: Option<&str>,
     hidden_columns: Option<&str>,

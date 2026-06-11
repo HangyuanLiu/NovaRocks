@@ -614,6 +614,7 @@ pub(crate) fn refresh_mv(
             return Err(err);
         }
     }
+    crate::engine::mv_maintenance::notify_refresh_completed(state);
     Ok(StatementResult::Ok)
 }
 

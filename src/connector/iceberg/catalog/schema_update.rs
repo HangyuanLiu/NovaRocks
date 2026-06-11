@@ -2079,6 +2079,14 @@ mod tests {
     }
 
     #[test]
+    fn reserved_key_allows_maintenance_enabled_escape_hatch() {
+        // The per-table auto-maintenance escape hatch must be user-settable
+        // even though the rest of the novarocks.* namespace stays reserved.
+        assert!(is_reserved_property_key("novarocks.maintenance.enabled").is_none());
+        assert!(is_reserved_property_key("novarocks.maintenance.future-knob").is_some());
+    }
+
+    #[test]
     fn reserved_key_allows_user_custom_keys() {
         assert!(is_reserved_property_key("my.custom.key").is_none());
         assert!(is_reserved_property_key("foo").is_none());
@@ -3902,6 +3910,12 @@ fn is_reserved_property_key(key: &str) -> Option<&'static str> {
             | "last-sequence-number"
     ) {
         return Some("Iceberg internal metadata key, not user-settable");
+    }
+    // Escape hatch for automatic table maintenance (IV3-11). This single key
+    // is intentionally user-settable; everything else under novarocks.* stays
+    // engine-owned.
+    if key == "novarocks.maintenance.enabled" {
+        return None;
     }
     if key.starts_with("novarocks.") {
         return Some("novarocks.* namespace is reserved for engine-owned properties");

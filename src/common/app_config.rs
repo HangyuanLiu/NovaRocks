@@ -374,6 +374,20 @@ pub struct StandaloneServerConfig {
     pub mv_refresh_scheduler_failure_backoff_ms: i64,
     #[serde(default = "default_standalone_mv_refresh_scheduler_max_failure_backoff_ms")]
     pub mv_refresh_scheduler_max_failure_backoff_ms: i64,
+    #[serde(default = "default_standalone_iceberg_maintenance_enabled")]
+    pub iceberg_maintenance_enabled: bool,
+    #[serde(default = "default_standalone_iceberg_maintenance_tick_interval_ms")]
+    pub iceberg_maintenance_tick_interval_ms: u64,
+    #[serde(default = "default_standalone_iceberg_maintenance_max_concurrent")]
+    pub iceberg_maintenance_max_concurrent: usize,
+    #[serde(default = "default_standalone_iceberg_maintenance_compaction_min_data_files")]
+    pub iceberg_maintenance_compaction_min_data_files: u64,
+    #[serde(default = "default_standalone_iceberg_maintenance_dv_min_delete_files")]
+    pub iceberg_maintenance_dv_min_delete_files: u64,
+    #[serde(default = "default_standalone_iceberg_maintenance_action_cooldown_ms")]
+    pub iceberg_maintenance_action_cooldown_ms: i64,
+    #[serde(default = "default_standalone_iceberg_maintenance_max_consecutive_failures")]
+    pub iceberg_maintenance_max_consecutive_failures: u32,
 }
 
 fn default_standalone_server_mysql_port() -> u16 {
@@ -400,6 +414,34 @@ fn default_standalone_mv_refresh_scheduler_max_failure_backoff_ms() -> i64 {
     1_800_000
 }
 
+fn default_standalone_iceberg_maintenance_enabled() -> bool {
+    true
+}
+
+fn default_standalone_iceberg_maintenance_tick_interval_ms() -> u64 {
+    600_000
+}
+
+fn default_standalone_iceberg_maintenance_max_concurrent() -> usize {
+    1
+}
+
+fn default_standalone_iceberg_maintenance_compaction_min_data_files() -> u64 {
+    100
+}
+
+fn default_standalone_iceberg_maintenance_dv_min_delete_files() -> u64 {
+    10
+}
+
+fn default_standalone_iceberg_maintenance_action_cooldown_ms() -> i64 {
+    3_600_000
+}
+
+fn default_standalone_iceberg_maintenance_max_consecutive_failures() -> u32 {
+    4
+}
+
 impl Default for StandaloneServerConfig {
     fn default() -> Self {
         Self {
@@ -416,6 +458,19 @@ impl Default for StandaloneServerConfig {
                 default_standalone_mv_refresh_scheduler_failure_backoff_ms(),
             mv_refresh_scheduler_max_failure_backoff_ms:
                 default_standalone_mv_refresh_scheduler_max_failure_backoff_ms(),
+            iceberg_maintenance_enabled: default_standalone_iceberg_maintenance_enabled(),
+            iceberg_maintenance_tick_interval_ms:
+                default_standalone_iceberg_maintenance_tick_interval_ms(),
+            iceberg_maintenance_max_concurrent:
+                default_standalone_iceberg_maintenance_max_concurrent(),
+            iceberg_maintenance_compaction_min_data_files:
+                default_standalone_iceberg_maintenance_compaction_min_data_files(),
+            iceberg_maintenance_dv_min_delete_files:
+                default_standalone_iceberg_maintenance_dv_min_delete_files(),
+            iceberg_maintenance_action_cooldown_ms:
+                default_standalone_iceberg_maintenance_action_cooldown_ms(),
+            iceberg_maintenance_max_consecutive_failures:
+                default_standalone_iceberg_maintenance_max_consecutive_failures(),
         }
     }
 }
@@ -1422,8 +1477,29 @@ starlet_port = 19070
                 mv_refresh_scheduler_max_concurrent: 1,
                 mv_refresh_scheduler_failure_backoff_ms: 60_000,
                 mv_refresh_scheduler_max_failure_backoff_ms: 1_800_000,
+                iceberg_maintenance_enabled: true,
+                iceberg_maintenance_tick_interval_ms: 600_000,
+                iceberg_maintenance_max_concurrent: 1,
+                iceberg_maintenance_compaction_min_data_files: 100,
+                iceberg_maintenance_dv_min_delete_files: 10,
+                iceberg_maintenance_action_cooldown_ms: 3_600_000,
+                iceberg_maintenance_max_consecutive_failures: 4,
             })
         );
+    }
+
+    #[test]
+    fn standalone_server_config_iceberg_maintenance_defaults() {
+        let cfg: StandaloneServerConfig =
+            toml::from_str("").expect("empty standalone_server section parses");
+        assert!(cfg.iceberg_maintenance_enabled);
+        assert_eq!(cfg.iceberg_maintenance_tick_interval_ms, 600_000);
+        assert_eq!(cfg.iceberg_maintenance_max_concurrent, 1);
+        assert_eq!(cfg.iceberg_maintenance_compaction_min_data_files, 100);
+        assert_eq!(cfg.iceberg_maintenance_dv_min_delete_files, 10);
+        assert_eq!(cfg.iceberg_maintenance_action_cooldown_ms, 3_600_000);
+        assert_eq!(cfg.iceberg_maintenance_max_consecutive_failures, 4);
+        assert_eq!(cfg, StandaloneServerConfig::default());
     }
 
     #[test]

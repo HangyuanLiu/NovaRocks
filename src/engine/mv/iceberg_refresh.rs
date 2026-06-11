@@ -17028,6 +17028,61 @@ mod tests {
             "reason field missing transform context in:\n{output}"
         );
     }
+
+    #[test]
+    fn incremental_refresh_absorbs_optimize_replace_snapshot() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_aggregate_fact_table(&env.state, "ice", "sales", "fact");
+        insert_into_aggregate_fact_table(&env.state, "ice", "sales", "fact", &[(1, "east", 10)]);
+
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_fact
+             DISTRIBUTED BY HASH(region) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT region, count(*) AS c, sum(amount) AS s
+                FROM ice.sales.fact GROUP BY region",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create incremental MV");
+        execute_iceberg_sql(
+            &env.state,
+            Some("ice"),
+            &env.current_db,
+            "REFRESH MATERIALIZED VIEW mv_fact",
+        );
+
+        // Second append snapshot on the base, then compact the base table.
+        insert_into_aggregate_fact_table(&env.state, "ice", "sales", "fact", &[(2, "west", 5)]);
+        execute_iceberg_sql(
+            &env.state,
+            Some("ice"),
+            &env.current_db,
+            "ALTER TABLE ice.sales.fact OPTIMIZE",
+        );
+        // The optimize worker thread is not spawned under cfg(test); drive the
+        // pending job synchronously so the base table gains a REPLACE snapshot.
+        crate::connector::iceberg::compact::run_optimize_jobs_once(&env.state)
+            .expect("run optimize job");
+
+        // Third append after the replace snapshot, then refresh incrementally.
+        insert_into_aggregate_fact_table(&env.state, "ice", "sales", "fact", &[(3, "east", 7)]);
+        execute_iceberg_sql(
+            &env.state,
+            Some("ice"),
+            &env.current_db,
+            "REFRESH MATERIALIZED VIEW mv_fact",
+        );
+
+        // Lineage walk previous -> current crossed the REPLACE snapshot; rows
+        // must reflect all three appends.
+        assert_aggregate_region_rows(
+            &env.state,
+            "ice",
+            &env.current_db,
+            "mv_fact",
+            &[("east", 2, 17), ("west", 1, 5)],
+        );
+    }
 }
 
 #[cfg(test)]

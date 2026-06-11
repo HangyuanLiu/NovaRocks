@@ -27,6 +27,7 @@ use crate::version;
 
 use self::encoding::write_query_result;
 use crate::engine::catalog::{DEFAULT_DATABASE, normalize_identifier};
+use crate::engine::mv_maintenance::MaintenanceCoordinatorConfig;
 use crate::engine::mv_scheduler::RefreshCoordinatorConfig;
 use crate::engine::statement::{
     looks_like_show_alter_table_optimize, looks_like_show_create_table,
@@ -62,6 +63,7 @@ struct ResolvedStandaloneServerOptions {
     mysql_port: u16,
     user: String,
     refresh_coordinator: RefreshCoordinatorConfig,
+    maintenance: MaintenanceCoordinatorConfig,
     /// Pre-loaded config to pass directly to engine open, bypassing a second
     /// disk read.  `None` falls back to the legacy disk/env load path.
     preloaded_config: Option<NovaRocksConfig>,
@@ -176,6 +178,11 @@ fn run_with_resolved_options(resolved: ResolvedStandaloneServerOptions) -> Resul
         &engine,
         resolved.refresh_coordinator.clone(),
     );
+    let _maintenance_coordinator =
+        crate::engine::mv_maintenance::start_maintenance_coordinator_for_server(
+            &engine,
+            resolved.maintenance.clone(),
+        );
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -203,13 +210,14 @@ fn resolve_server_options(
         .as_ref()
         .map(|cfg| cfg.server.host.clone())
         .unwrap_or_else(|| NovaRocksConfig::default().server.host);
-    let (mysql_port, user, refresh_coordinator) =
+    let (mysql_port, user, refresh_coordinator, maintenance) =
         extract_server_settings(standalone, opts.mysql_port)?;
     Ok(ResolvedStandaloneServerOptions {
         config_path: opts.config_path.clone(),
         mysql_port,
         user,
         refresh_coordinator,
+        maintenance,
         preloaded_config: None,
         start_local_exchange_execution: true,
         start_coordinator_report_grpc: true,
@@ -221,17 +229,28 @@ fn resolve_active_config_path(explicit: Option<&Path>) -> Option<PathBuf> {
     crate::common::app_config::resolve_config_path(explicit)
 }
 
-/// Extract server-layer settings (port, user, refresh coordinator) from an
+/// Extract server-layer settings (port, user, refresh coordinator, maintenance) from an
 /// optional [`StandaloneServerConfig`], applying `port_override` last.
 /// Shared by both the disk-load path and the pre-loaded-config path to keep
 /// validation logic in one place.
 fn extract_server_settings(
     standalone: Option<&crate::common::app_config::StandaloneServerConfig>,
     port_override: Option<u16>,
-) -> Result<(u16, String, RefreshCoordinatorConfig), String> {
+) -> Result<
+    (
+        u16,
+        String,
+        RefreshCoordinatorConfig,
+        MaintenanceCoordinatorConfig,
+    ),
+    String,
+> {
     let mut mysql_port = DEFAULT_MYSQL_PORT;
     let mut user = ROOT_USER.to_string();
     let mut refresh_coordinator = RefreshCoordinatorConfig::default();
+    let mut maintenance = MaintenanceCoordinatorConfig::from_standalone_config(
+        &crate::common::app_config::StandaloneServerConfig::default(),
+    );
 
     if let Some(sc) = standalone {
         mysql_port = sc.mysql_port;
@@ -243,13 +262,14 @@ fn extract_server_settings(
         }
         user = sc.user.clone();
         refresh_coordinator = RefreshCoordinatorConfig::from_standalone_config(sc);
+        maintenance = MaintenanceCoordinatorConfig::from_standalone_config(sc);
     }
 
     if let Some(port) = port_override {
         mysql_port = port;
     }
 
-    Ok((mysql_port, user, refresh_coordinator))
+    Ok((mysql_port, user, refresh_coordinator, maintenance))
 }
 
 /// Extract server-layer settings directly from a pre-loaded [`NovaRocksConfig`].
@@ -257,7 +277,7 @@ fn resolve_server_options_from_config(
     cfg: &NovaRocksConfig,
     port_override: Option<u16>,
 ) -> Result<ResolvedStandaloneServerOptions, String> {
-    let (mysql_port, user, refresh_coordinator) =
+    let (mysql_port, user, refresh_coordinator, maintenance) =
         extract_server_settings(cfg.standalone_server.as_ref(), port_override)?;
     Ok(ResolvedStandaloneServerOptions {
         // config_path is intentionally None here; callers that need the path
@@ -266,6 +286,7 @@ fn resolve_server_options_from_config(
         mysql_port,
         user,
         refresh_coordinator,
+        maintenance,
         preloaded_config: None,
         // Callers may override these; default to all-in-one behavior.
         start_local_exchange_execution: true,

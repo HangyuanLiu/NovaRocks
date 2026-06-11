@@ -48,6 +48,7 @@ pub(crate) mod insert_flow;
 pub(crate) mod mutation_flow;
 pub(crate) mod mv;
 pub(crate) mod mv_flow;
+pub(crate) mod mv_maintenance;
 pub(crate) mod mv_scheduler;
 pub(crate) mod name_resolve;
 pub(crate) mod parquet;
@@ -233,6 +234,11 @@ pub(crate) struct StandaloneState {
     pub(crate) job_repo: JobMetaRepository,
     pub(crate) dictionary_manager: dictionary::DictionaryManager,
     pub(crate) exchange_port: u16,
+    /// Wake-up channel for the iceberg maintenance coordinator; injected by
+    /// the server after the coordinator thread starts, None otherwise.
+    pub(crate) maintenance_signal_tx: std::sync::Mutex<
+        Option<std::sync::mpsc::Sender<crate::engine::mv_maintenance::MaintenanceSignal>>,
+    >,
     /// In-memory registry of user-defined views, keyed by lowercase
     /// (database, view-name). Each entry stores the analysed `Query` AST
     /// from `CREATE VIEW ... AS <query>`. The analyzer expands these to
@@ -273,6 +279,7 @@ impl Default for StandaloneState {
             job_repo: JobMetaRepository,
             dictionary_manager: dictionary::DictionaryManager::default(),
             exchange_port: 0,
+            maintenance_signal_tx: std::sync::Mutex::new(None),
             views: RwLock::new(std::collections::HashMap::new()),
             virtual_tables: virtual_table::VirtualTableRegistry::with_defaults(),
             #[cfg(test)]

@@ -18,25 +18,26 @@
 //! `ALTER TABLE x EXPIRE SNAPSHOTS` — drops obsolete snapshots from
 //! metadata.json and physically deletes their orphan files.
 //!
-//! Algorithm (spec §3.2):
+//! Algorithm (standard Iceberg `expireSnapshots`):
 //!
-//! 1. Compute `live_set` = all snapshot ids reachable via any ref ancestor chain.
-//! 2. `candidates` = snapshots NOT in `live_set`.
+//! 1. Compute the PROTECTED set: the current snapshot of every branch / tag
+//!    ref, plus the most-recent `retain_last` snapshots of the main ancestor
+//!    chain (default keep = 1 so the table is never left headless).
+//! 2. `candidates` = snapshots NOT protected. This prunes OLD snapshots on a
+//!    normal linearly appended main chain (not just dangling snapshots).
 //! 3. Apply `OLDER THAN`: retain only those with `timestamp_ms < threshold`.
-//! 4. Apply `RETAIN LAST N`: walk main ref ancestor chain; remove top-N from
-//!    candidates (per spec §3.2 Step 4: RETAIN LAST protects only main chain).
-//! 5. If candidates empty → early return Ok (no metadata write).
-//! 6. Enumerate files for candidates; protect files referenced by all
+//! 4. If candidates empty → early return Ok (no metadata write).
+//! 5. Enumerate files for candidates; protect files referenced by all
 //!    remaining (non-candidate) snapshots.
-//! 7. Puffin half-reference protection (spec §3.2 Step 7).
-//! 8. Commit `TableUpdate::RemoveSnapshots` via `commit_with_retry`.
-//!    The vendored iceberg-rs builder (`table_metadata_builder.rs:505-510`)
-//!    auto-prunes refs whose snapshot was removed and (`update_snapshot_log`)
-//!    auto-prunes snapshot_log entries. Because we never expire `live_set`
-//!    (which covers all current ref snapshot ids), refs are never auto-pruned.
-//! 9. Best-effort physical delete each path in `to_delete`.
-//!
-//! Spec: docs/superpowers/specs/2026-05-07-iceberg-snapshot-lifecycle-design.md §3.
+//! 6. Puffin half-reference protection.
+//! 7. Commit `TableUpdate::RemoveSnapshots` via `commit_with_retry`.
+//!    The vendored iceberg-rs builder (`table_metadata_builder.rs`) auto-prunes
+//!    refs whose snapshot was removed and (`update_snapshot_log`) truncates the
+//!    snapshot_log. Because the current snapshot of every ref is protected, no
+//!    live ref snapshot is removed and refs are never auto-pruned; the current
+//!    snapshot stays the last snapshot_log entry, so `build()` succeeds even
+//!    when mid-chain snapshots are removed.
+//! 8. Best-effort physical delete each path in `to_delete`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -47,8 +48,7 @@ use iceberg::{Catalog, TableCommit, TableIdent, TableRequirement, TableUpdate};
 
 use super::retry::commit_with_retry;
 use super::snapshot_lifecycle_helpers::{
-    FileSet, compute_live_snapshot_set, enumerate_files_for_snapshots,
-    puffin_half_reference_protection,
+    FileSet, enumerate_files_for_snapshots, puffin_half_reference_protection,
 };
 
 /// Parameters for an EXPIRE SNAPSHOTS operation.
@@ -117,13 +117,11 @@ async fn run_expire_one_attempt(
     let metadata = table.metadata();
     let file_io = table.file_io();
 
-    // Step 1: live set (all snapshot ids reachable via any ref's ancestor chain).
-    let live_set = compute_live_snapshot_set(metadata);
+    // Compute candidate snapshot ids (standard Iceberg expireSnapshots:
+    // everything not protected by a ref or the main retain window).
+    let candidates = compute_expire_candidates(metadata, older_than_ms, retain_last);
 
-    // Steps 2-4: compute candidate snapshot ids.
-    let candidates = compute_expire_candidates(metadata, &live_set, older_than_ms, retain_last);
-
-    // Step 5: no candidates → early return, no metadata change.
+    // No candidates → early return, no metadata change.
     if candidates.is_empty() {
         return Ok(ExpireOutcome {
             expired_snapshot_count: 0,
@@ -131,7 +129,7 @@ async fn run_expire_one_attempt(
         });
     }
 
-    // Step 6: enumerate files.
+    // Enumerate files referenced by the candidate snapshots (algorithm step 5).
     let candidate_set: HashSet<i64> = candidates.iter().copied().collect();
     let files_for_candidates =
         enumerate_files_for_snapshots(file_io, metadata, &candidate_set).await?;
@@ -149,7 +147,7 @@ async fn run_expire_one_attempt(
         .cloned()
         .collect();
 
-    // Step 7: puffin half-reference protection.
+    // Puffin half-reference protection (algorithm step 6).
     // NOTE(R7 spike): `DataFile::referenced_data_file()` is pub in iceberg-0.9.0
     // (`vendor/iceberg-0.9.0/src/spec/manifest/data_file.rs:276`), so the full
     // DV index can be built. If it were absent, we would return an empty index
@@ -157,13 +155,15 @@ async fn run_expire_one_attempt(
     let dv_index = build_dv_index_from_metadata(metadata, file_io, &all_snapshot_ids).await?;
     puffin_half_reference_protection(&mut to_delete, &dv_index, &protected_files);
 
-    // Step 8: commit the metadata change via OCC (spec §3.2 Step 8).
+    // Commit the metadata change via OCC (algorithm step 7).
     // The `RemoveSnapshots` update tells the catalog to drop the listed snapshot
     // entries from metadata. The iceberg-rs builder automatically:
-    //   - prunes refs whose snapshot id was removed (table_metadata_builder.rs:505-510),
-    //   - prunes snapshot_log entries (update_snapshot_log — called during build()).
-    // Because we only expire non-live snapshots (not in `live_set`), no current
-    // ref snapshot ids are removed, so no refs are auto-pruned.
+    //   - prunes refs whose snapshot id was removed (table_metadata_builder.rs),
+    //   - truncates snapshot_log entries (update_snapshot_log — called during build()).
+    // Because the current snapshot of every ref is protected (never a candidate),
+    // no live ref snapshot id is removed, so no refs are auto-pruned and the
+    // current snapshot remains the last snapshot_log entry (build() succeeds even
+    // when mid-chain snapshots are removed).
     //
     // OCC requirements guard against concurrent EXPIRE races:
     //   - CurrentSchemaIdMatch: ensures schema has not changed since we read metadata.
@@ -188,7 +188,7 @@ async fn run_expire_one_attempt(
         .build();
     catalog.update_table(commit).await?;
 
-    // Step 9: best-effort physical delete.
+    // Best-effort physical delete (algorithm step 8).
     let deleted_file_count = best_effort_delete_files(file_io, &to_delete).await;
 
     Ok(ExpireOutcome {
@@ -197,43 +197,41 @@ async fn run_expire_one_attempt(
     })
 }
 
-/// Spec §3.2 Steps 2-4: compute the set of snapshot ids eligible for expiry.
+/// Compute the set of snapshot ids eligible for expiry (standard Iceberg
+/// `expireSnapshots` semantics).
 ///
-/// Step 2: candidates = snapshots not in `live_set`.
-/// Step 3: if `older_than_ms`, retain only those with `timestamp_ms < threshold`.
-/// Step 4: if `retain_last`, walk main ancestor chain and protect top-N.
+/// A snapshot is EXPIRABLE iff it is NOT protected, where the protected set is:
+///   * the current snapshot of EVERY branch / tag ref, plus
+///   * the most-recent `retain_last` snapshots of the main ancestor chain.
 ///
-/// `retain_last` only protects the *main* ancestor chain per spec §3.2 Step 4
-/// and §0.3 (per-branch retention is out-of-scope for Phase 1).
+/// When `older_than_ms` is set, only protected-complement snapshots strictly
+/// older than the threshold are expired. Genuine danglers (in no ref and
+/// outside the main retain window) are not protected, so they remain expirable.
+///
+/// Default keep = 1 so the table is never left headless even when the caller
+/// passes no `retain_last`. This prunes old snapshots on a normal linearly
+/// appended main chain, which the previous dangling-only logic never did.
 pub(crate) fn compute_expire_candidates(
     metadata: &TableMetadata,
-    live_set: &HashSet<i64>,
     older_than_ms: Option<i64>,
     retain_last: Option<u32>,
 ) -> Vec<i64> {
-    // Step 2: non-live snapshots only.
-    // metadata.snapshots() yields &Arc<Snapshot>; deref via s.as_ref().
-    let mut candidates: Vec<&Snapshot> = metadata
+    // Protect the current snapshot of EVERY ref (branches AND tags).
+    let mut protected: HashSet<i64> = metadata.refs().values().map(|r| r.snapshot_id).collect();
+    // Protect the most-recent `retain_last` snapshots of the main ancestor
+    // chain. Default keep = 1 so the table is never left headless even when
+    // the caller passes no retain_last.
+    let keep = retain_last.map(|n| n as usize).unwrap_or(1).max(1);
+    for id in main_ancestor_chain(metadata, keep) {
+        protected.insert(id);
+    }
+    metadata
         .snapshots()
         .map(|s| s.as_ref())
-        .filter(|s| !live_set.contains(&s.snapshot_id()))
-        .collect();
-
-    // Step 3: OLDER THAN filter.
-    if let Some(threshold) = older_than_ms {
-        candidates.retain(|s| s.timestamp_ms() < threshold);
-    }
-
-    // Step 4: RETAIN LAST N — remove the N most-recent main ancestor chain
-    // snapshots from candidates (even if they are technically non-live).
-    if let Some(n) = retain_last {
-        let main_chain: HashSet<i64> = main_ancestor_chain(metadata, n as usize)
-            .into_iter()
-            .collect();
-        candidates.retain(|s| !main_chain.contains(&s.snapshot_id()));
-    }
-
-    candidates.iter().map(|s| s.snapshot_id()).collect()
+        .filter(|s| !protected.contains(&s.snapshot_id()))
+        .filter(|s| older_than_ms.is_none_or(|t| s.timestamp_ms() < t))
+        .map(|s| s.snapshot_id())
+        .collect()
 }
 
 /// Walk the main ref's parent chain (newest-first) and return up to `n` ids.
@@ -325,22 +323,46 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::connector::iceberg::commit::snapshot_lifecycle_helpers::compute_live_snapshot_set;
     use crate::connector::iceberg::commit::snapshot_lifecycle_helpers::test_support::build_test_metadata_with_snapshots;
 
     // ---- compute_expire_candidates tests (graph-shape, no I/O) ----
 
     #[test]
-    fn candidates_no_filters_returns_non_live() {
-        // s1 <- s2 (main), s3 dangling (no parent in live chain, no ref)
+    fn expire_prunes_old_main_chain_beyond_retain() {
+        // s1 <- s2 <- s3 <- s4 (main); all live on the main ancestor chain.
+        // Standard Iceberg expireSnapshots with RETAIN LAST 1 must prune every
+        // main-chain snapshot except the retained head (s4).
+        let metadata = build_test_metadata_with_snapshots(
+            vec![(1, None), (2, Some(1)), (3, Some(2)), (4, Some(3))],
+            vec![("main", 4)],
+        );
+        let mut candidates = compute_expire_candidates(&metadata, Some(i64::MAX), Some(1));
+        candidates.sort();
+        assert_eq!(
+            candidates,
+            vec![1, 2, 3],
+            "RETAIN LAST 1 keeps only the main head; older main-chain snapshots expire"
+        );
+    }
+
+    #[test]
+    fn candidates_no_filters_keeps_only_protected_head() {
+        // s1 <- s2 (main), s3 dangling (no parent in live chain, no ref).
+        // No filters, no explicit retain → default keep = 1 protects only the
+        // main head (s2). s1 is an old main-chain snapshot and s3 is a dangling
+        // snapshot — both expire under standard expireSnapshots semantics.
         let metadata = build_test_metadata_with_snapshots(
             vec![(1, None), (2, Some(1)), (3, None)],
             vec![("main", 2)],
         );
-        let live = compute_live_snapshot_set(&metadata);
-        // live = {1, 2}; s3 is non-live → single candidate
-        let mut candidates = compute_expire_candidates(&metadata, &live, None, None);
+        let mut candidates = compute_expire_candidates(&metadata, None, None);
         candidates.sort();
-        assert_eq!(candidates, vec![3]);
+        assert_eq!(
+            candidates,
+            vec![1, 3],
+            "only the protected main head (s2) survives; old s1 and dangling s3 expire"
+        );
     }
 
     #[test]
@@ -358,52 +380,41 @@ mod tests {
             vec![(1, None), (2, None), (3, None)],
             vec![("main", 1)],
         );
-        let live = compute_live_snapshot_set(&metadata);
-        // s2, s3 are non-live
+        // s2, s3 are unprotected (only s1 = main head is protected)
         let threshold = 1_700_000_002_500i64;
-        let mut candidates = compute_expire_candidates(&metadata, &live, Some(threshold), None);
+        let mut candidates = compute_expire_candidates(&metadata, Some(threshold), None);
         candidates.sort();
         assert_eq!(candidates, vec![2]);
     }
 
     #[test]
-    fn candidates_retain_last_noop_when_no_dangling_main_chain() {
-        // s1 <- s2 <- s3 <- s4 (main); all are live (all reachable from main).
-        // Step 2 already excludes every snapshot because they are all in live_set.
-        // RETAIN LAST N therefore has no effect — it can only protect main-chain
-        // snapshots, but there are none left in candidates after Step 2.
-        //
-        // This verifies that RETAIN LAST never accidentally adds snapshots back
-        // to candidates, i.e., the filter is purely subtractive.
-        //
-        // Note: RETAIN LAST is only meaningful when Step 2 produces non-live
-        // candidates that happen to lie on the main ancestor chain (e.g., after
-        // a fast-forward / replace-branch that orphaned old ancestors). That
-        // end-to-end scenario is covered by the SQL regression suite
-        // (Task 8 dispatch 2: iceberg_v3_expire_snapshots.sql).
+    fn candidates_retain_last_prunes_main_chain_beyond_window() {
+        // s1 <- s2 <- s3 <- s4 (main); all reachable from main.
+        // RETAIN LAST 2 protects the two most-recent main-chain snapshots
+        // (s4, s3). The older main-chain snapshots (s1, s2) are expirable.
         let metadata = build_test_metadata_with_snapshots(
             vec![(1, None), (2, Some(1)), (3, Some(2)), (4, Some(3))],
             vec![("main", 4)],
         );
-        let live = compute_live_snapshot_set(&metadata);
-        let candidates = compute_expire_candidates(&metadata, &live, None, Some(2));
-        assert!(
-            candidates.is_empty(),
-            "all snapshots live → RETAIN LAST is a no-op; no candidates"
+        let mut candidates = compute_expire_candidates(&metadata, None, Some(2));
+        candidates.sort();
+        assert_eq!(
+            candidates,
+            vec![1, 2],
+            "RETAIN LAST 2 keeps s3,s4; older main-chain s1,s2 expire"
         );
     }
 
     #[test]
     fn candidates_dangling_with_retain_n_main_chain_unaffected() {
         // s1 <- s2 (main), s3 dangling (no ref, no parent in live chain).
-        // RETAIN LAST 5 → protects up to 5 main chain snapshots but s3 is
-        // not in the main chain → still a candidate.
+        // RETAIN LAST 5 protects the whole 2-snapshot main chain (s1, s2), so
+        // only the dangling s3 (not on the main chain) remains a candidate.
         let metadata = build_test_metadata_with_snapshots(
             vec![(1, None), (2, Some(1)), (3, None)],
             vec![("main", 2)],
         );
-        let live = compute_live_snapshot_set(&metadata);
-        let mut candidates = compute_expire_candidates(&metadata, &live, None, Some(5));
+        let mut candidates = compute_expire_candidates(&metadata, None, Some(5));
         candidates.sort();
         assert_eq!(candidates, vec![3]);
     }
@@ -435,27 +446,52 @@ mod tests {
     }
 
     #[test]
-    fn expire_noop_when_nothing_to_expire() {
-        // All snapshots reachable from main → no candidates → ExpireOutcome zeroed.
+    fn expire_prunes_old_main_chain_snapshot() {
+        // s1 <- s2 (main). With default keep = 1 and OLDER THAN in the far
+        // future, the protected set is just the main head (s2); the older
+        // main-chain snapshot s1 is expirable.
         // (This is the synchronous candidate-computation path; full async tested
         // via the v3_table tests below.)
         let metadata =
             build_test_metadata_with_snapshots(vec![(1, None), (2, Some(1))], vec![("main", 2)]);
-        let live = compute_live_snapshot_set(&metadata);
-        let candidates = compute_expire_candidates(&metadata, &live, Some(i64::MAX), None);
-        assert!(candidates.is_empty(), "all snapshots live → no candidates");
+        let candidates = compute_expire_candidates(&metadata, Some(i64::MAX), None);
+        assert_eq!(
+            candidates,
+            vec![1],
+            "old main-chain s1 expires; only the protected head s2 survives"
+        );
     }
 
     #[test]
-    fn expire_older_than_in_future_returns_empty_candidates() {
-        // OLDER THAN far in future → all candidate timestamps are below it, BUT
-        // all snapshots are live in this case (from main chain), so still empty.
+    fn expire_noop_when_retain_covers_whole_chain() {
+        // s1 <- s2 (main). RETAIN LAST 2 covers the entire main chain, so even
+        // with OLDER THAN in the far future there is nothing to expire.
         let metadata =
             build_test_metadata_with_snapshots(vec![(1, None), (2, Some(1))], vec![("main", 2)]);
-        let live = compute_live_snapshot_set(&metadata);
-        // All live → Step 2 yields no candidates even without OLDER THAN filter.
-        let candidates = compute_expire_candidates(&metadata, &live, Some(i64::MAX), None);
-        assert!(candidates.is_empty());
+        let candidates = compute_expire_candidates(&metadata, Some(i64::MAX), Some(2));
+        assert!(
+            candidates.is_empty(),
+            "RETAIN LAST 2 protects the whole 2-snapshot main chain → no candidates"
+        );
+    }
+
+    #[test]
+    fn expire_older_than_in_future_expires_all_unprotected() {
+        // OLDER THAN far in the future → the time filter admits every snapshot,
+        // so the only thing standing between a snapshot and expiry is the
+        // protected set. With default keep = 1 only the main head (s3) is
+        // protected; the older main-chain snapshots s1, s2 expire.
+        let metadata = build_test_metadata_with_snapshots(
+            vec![(1, None), (2, Some(1)), (3, Some(2))],
+            vec![("main", 3)],
+        );
+        let mut candidates = compute_expire_candidates(&metadata, Some(i64::MAX), None);
+        candidates.sort();
+        assert_eq!(
+            candidates,
+            vec![1, 2],
+            "far-future OLDER THAN admits all; only protected head s3 survives"
+        );
     }
 
     #[test]
@@ -464,8 +500,7 @@ mod tests {
         // (all timestamps are < i64::MAX).
         let metadata =
             build_test_metadata_with_snapshots(vec![(1, None), (2, None)], vec![("main", 1)]);
-        let live = compute_live_snapshot_set(&metadata);
-        let mut candidates = compute_expire_candidates(&metadata, &live, Some(i64::MAX), None);
+        let mut candidates = compute_expire_candidates(&metadata, Some(i64::MAX), None);
         candidates.sort();
         assert_eq!(candidates, vec![2]);
     }
@@ -473,7 +508,10 @@ mod tests {
     #[test]
     fn expire_preserves_branches_and_tags() {
         // s1 <- s2 <- s3 (main), s2 also pointed to by branch "dev", s1 by tag "v1".
-        // s4 is dangling (no ref). EXPIRE → only s4 is candidate.
+        // s4 is dangling (no ref). Even with default keep = 1 and OLDER THAN in
+        // the far future, s1 and s2 are protected by the "v1" / "dev" refs, so
+        // only the dangling s4 is a candidate. This is the key defense-in-depth
+        // case: every ref's current snapshot is protected.
         let metadata = build_test_metadata_with_snapshots(
             vec![(1, None), (2, Some(1)), (3, Some(2)), (4, None)],
             vec![("main", 3), ("dev", 2), ("v1", 1)],
@@ -485,28 +523,42 @@ mod tests {
         assert!(live.contains(&3));
         assert!(!live.contains(&4));
 
-        let mut candidates = compute_expire_candidates(&metadata, &live, Some(i64::MAX), None);
+        let mut candidates = compute_expire_candidates(&metadata, Some(i64::MAX), None);
         candidates.sort();
-        assert_eq!(candidates, vec![4], "only the dangling s4 should expire");
+        assert_eq!(
+            candidates,
+            vec![4],
+            "refs protect s1/s2/s3; only the dangling s4 should expire"
+        );
     }
 
     #[test]
     fn expire_table_with_no_snapshots() {
         // Empty table (no snapshots at all) → no candidates, noop.
         let metadata = build_test_metadata_with_snapshots(vec![], vec![]);
-        let live = compute_live_snapshot_set(&metadata);
-        let candidates = compute_expire_candidates(&metadata, &live, Some(i64::MAX), None);
+        let candidates = compute_expire_candidates(&metadata, Some(i64::MAX), None);
         assert!(candidates.is_empty());
     }
 
     // ---- Real V3 table tests (async, use MemoryCatalog) ----
 
     #[tokio::test]
-    async fn expire_real_table_all_live_is_noop() {
+    async fn expire_real_table_prunes_old_main_chain() {
         use crate::connector::iceberg::commit::test_helpers::v3_table_with_multi_batch_appends;
 
-        // 2 appends → 2 snapshots on main chain, both live.
+        // 2 appends → 2 snapshots on the main chain. With default keep = 1 and
+        // OLDER THAN in the far future, the older snapshot is pruned; the head
+        // snapshot is protected and the table stays queryable.
         let fixture = v3_table_with_multi_batch_appends(&[1, 1]).await;
+        let head_snapshot_id = fixture
+            .catalog
+            .load_table(&fixture.table_ident)
+            .await
+            .expect("load table before expire")
+            .metadata()
+            .current_snapshot_id()
+            .expect("table has a current snapshot");
+
         let outcome = run_expire_snapshots(
             fixture.catalog.clone(),
             fixture.table_ident.clone(),
@@ -518,10 +570,31 @@ mod tests {
         .await
         .expect("run_expire_snapshots should succeed");
         assert_eq!(
-            outcome.expired_snapshot_count, 0,
-            "all snapshots on main chain → nothing to expire"
+            outcome.expired_snapshot_count, 1,
+            "the older of the two main-chain snapshots must be expired"
         );
-        assert_eq!(outcome.deleted_file_count, 0);
+
+        // The table still loads and the head snapshot is intact after expiry.
+        let after = fixture
+            .catalog
+            .load_table(&fixture.table_ident)
+            .await
+            .expect("load table after expire");
+        assert_eq!(
+            after.metadata().current_snapshot_id(),
+            Some(head_snapshot_id),
+            "head snapshot must survive expiry"
+        );
+        let remaining: Vec<i64> = after
+            .metadata()
+            .snapshots()
+            .map(|s| s.snapshot_id())
+            .collect();
+        assert_eq!(
+            remaining,
+            vec![head_snapshot_id],
+            "only the protected head snapshot should remain"
+        );
     }
 
     #[tokio::test]
@@ -544,21 +617,16 @@ mod tests {
         assert_eq!(outcome.deleted_file_count, 0);
     }
 
-    // NOTE: end-to-end commit + physical-delete coverage (real dangling snapshot,
-    // OCC requirements validated, RemoveSnapshots commit landing, best_effort_delete_files
-    // called) is provided by the SQL regression suite (Task 8 dispatch 2:
-    // iceberg_v3_expire_snapshots.sql). That suite uses Spark to create multi-snapshot
-    // tables with real object-store files and exercises the full lifecycle including
-    // branch DDL to produce dangling snapshots.
-    //
-    // Constructing a dangling snapshot in a unit test would require either:
-    //   (a) branch DDL at the MemoryCatalog level (not exposed by the fixture), or
-    //   (b) manually stitching a snapshot via TableMetadataBuilder with a parent
-    //       not in any ref's ancestor chain.
-    // Option (b) is feasible but fragile across iceberg-rs upgrades, and the real
-    // coverage value comes from a live catalog + real files. We defer to the SQL suite.
+    // NOTE: `expire_real_table_prunes_old_main_chain` above already exercises the
+    // end-to-end commit path against a live MemoryCatalog: it lands a real
+    // `RemoveSnapshots` commit (mid-chain removal of an old main-chain snapshot),
+    // validates the OCC requirements, and confirms the table reloads with only
+    // the protected head snapshot. Physical-delete coverage over a real object
+    // store, plus dangling-snapshot topologies produced via branch DDL, is
+    // provided by the SQL regression suite (iceberg_v3_expire_snapshots.sql),
+    // which drives Spark to create multi-snapshot tables with real files.
     //
     // Graph-shape correctness (candidate computation) is fully covered by the unit
     // tests above, including the dangling-snapshot topology in
-    // `candidates_no_filters_returns_non_live` and related tests.
+    // `candidates_no_filters_keeps_only_protected_head` and related tests.
 }
