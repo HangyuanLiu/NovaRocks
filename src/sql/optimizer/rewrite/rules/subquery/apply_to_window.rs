@@ -73,6 +73,8 @@ impl LogicalRewriteRule for ApplyToWindow {
         // --- 1. Remap the inner aggregate's args to the outer instance of the same physical column. ---
         let outer_map = collect_scan_column_map(&a.left);
         let inner_map = collect_scan_column_map(&a.right);
+        // Collect the set of inner-scan ColumnIds upfront; used by post-condition guards.
+        let inner_ids: HashSet<ColumnId> = inner_map.keys().copied().collect();
         let outer_cols = plan_output_columns(&a.left)?;
         let mut phys_to_outer: HashMap<(TableIdentity, String), OutputColumn> = HashMap::new();
         for oc in &outer_cols {
@@ -85,6 +87,13 @@ impl LogicalRewriteRule for ApplyToWindow {
             if !remap_inner_to_outer(arg, &inner_map, &phys_to_outer) {
                 // Required column unavailable on outer side → fall back to join form.
                 return Ok(RewriteResult::Unchanged);
+            }
+        }
+        // Guard 1: post-condition — verify no inner-scan column survived the remap.
+        // This catches any ExprKind variant that remap_inner_to_outer might have missed.
+        for arg in &agg_args {
+            if !collect_column_id_refs(arg).is_disjoint(&inner_ids) {
+                return Ok(RewriteResult::Unchanged); // an inner column survived the remap
             }
         }
 
@@ -166,8 +175,19 @@ impl LogicalRewriteRule for ApplyToWindow {
             win_id,
             &m.inner_agg.result_type,
         )?;
+        // Guard 2: value_expr must not reference the inner agg output or any inner-scan column.
+        {
+            let vrefs = collect_column_id_refs(&value_expr);
+            if vrefs.contains(&m.inner_agg.output_column_id) || !vrefs.is_disjoint(&inner_ids) {
+                return Ok(RewriteResult::Unchanged); // value expr still references a disappearing inner column
+            }
+        }
         let mut after_pred = m.subquery_conjunct.clone();
         replace_column_ref(&mut after_pred, a.output_column.column_id, &value_expr);
+        // Guard 3: APPLY_OUT must be gone from after_pred — it has been fully replaced.
+        if collect_column_id_refs(&after_pred).contains(&a.output_column.column_id) {
+            return Ok(RewriteResult::Unchanged); // APPLY_OUT survived (comparison used an unhandled node)
+        }
         let after = LogicalPlan::Filter(FilterNode {
             predicate: after_pred,
             input: Box::new(window),
@@ -237,8 +257,79 @@ fn remap_inner_to_outer(
         ExprKind::Cast { expr: inner_expr, .. } => {
             remap_inner_to_outer(inner_expr, inner_map, phys_to_outer)
         }
-        // Literals and other non-column-ref leaves: always ok, nothing to remap.
-        _ => true,
+        ExprKind::InList { expr: inner_expr, list, .. } => {
+            let e_ok = remap_inner_to_outer(inner_expr, inner_map, phys_to_outer);
+            let l_ok = list
+                .iter_mut()
+                .all(|item| remap_inner_to_outer(item, inner_map, phys_to_outer));
+            e_ok && l_ok
+        }
+        ExprKind::Between { expr: inner_expr, low, high, .. } => {
+            let e_ok = remap_inner_to_outer(inner_expr, inner_map, phys_to_outer);
+            let lo_ok = remap_inner_to_outer(low, inner_map, phys_to_outer);
+            let hi_ok = remap_inner_to_outer(high, inner_map, phys_to_outer);
+            e_ok && lo_ok && hi_ok
+        }
+        ExprKind::Like { expr: inner_expr, pattern, .. } => {
+            let e_ok = remap_inner_to_outer(inner_expr, inner_map, phys_to_outer);
+            let p_ok = remap_inner_to_outer(pattern, inner_map, phys_to_outer);
+            e_ok && p_ok
+        }
+        ExprKind::Case { operand, when_then, else_expr } => {
+            let mut ok = true;
+            if let Some(op) = operand {
+                ok &= remap_inner_to_outer(op, inner_map, phys_to_outer);
+            }
+            for (when, then) in when_then.iter_mut() {
+                ok &= remap_inner_to_outer(when, inner_map, phys_to_outer);
+                ok &= remap_inner_to_outer(then, inner_map, phys_to_outer);
+            }
+            if let Some(els) = else_expr {
+                ok &= remap_inner_to_outer(els, inner_map, phys_to_outer);
+            }
+            ok
+        }
+        ExprKind::IsTruthValue { expr: inner_expr, .. } => {
+            remap_inner_to_outer(inner_expr, inner_map, phys_to_outer)
+        }
+        ExprKind::Nested(inner_expr) => {
+            remap_inner_to_outer(inner_expr, inner_map, phys_to_outer)
+        }
+        ExprKind::AggregateCall { args, order_by, .. } => {
+            let mut ok = true;
+            for arg in args.iter_mut() {
+                ok &= remap_inner_to_outer(arg, inner_map, phys_to_outer);
+            }
+            for ob in order_by.iter_mut() {
+                ok &= remap_inner_to_outer(&mut ob.expr, inner_map, phys_to_outer);
+            }
+            ok
+        }
+        ExprKind::LambdaFunction { body, .. } => {
+            remap_inner_to_outer(body, inner_map, phys_to_outer)
+        }
+        ExprKind::Lambda { body, .. } => {
+            remap_inner_to_outer(body, inner_map, phys_to_outer)
+        }
+        ExprKind::WindowCall { args, partition_by, order_by, .. } => {
+            let mut ok = true;
+            for arg in args.iter_mut() {
+                ok &= remap_inner_to_outer(arg, inner_map, phys_to_outer);
+            }
+            for pb in partition_by.iter_mut() {
+                ok &= remap_inner_to_outer(pb, inner_map, phys_to_outer);
+            }
+            for ob in order_by.iter_mut() {
+                ok &= remap_inner_to_outer(&mut ob.expr, inner_map, phys_to_outer);
+            }
+            ok
+        }
+        // True leaf variants: no child TypedExprs to recurse into.
+        // ColumnRef is handled above; LambdaParamRef, Literal, SubqueryPlaceholder
+        // carry no child expressions.
+        ExprKind::LambdaParamRef { .. }
+        | ExprKind::Literal(_)
+        | ExprKind::SubqueryPlaceholder { .. } => true,
     }
 }
 
@@ -290,13 +381,14 @@ fn col_ref_expr(id: ColumnId, dt: &DataType) -> TypedExpr {
 /// Recursively replace every `ColumnRef { column_id == target }` in `expr` with
 /// `replacement.clone()`.
 fn replace_column_ref(expr: &mut TypedExpr, target: ColumnId, replacement: &TypedExpr) {
-    match &expr.kind {
-        ExprKind::ColumnRef { column_id, .. } if *column_id == target => {
+    // Base case: this node IS the target column ref — replace in place and return.
+    if let ExprKind::ColumnRef { column_id, .. } = &expr.kind {
+        if *column_id == target {
             *expr = replacement.clone();
+            return;
         }
-        _ => {}
     }
-    // Recurse into children (non-ColumnRef nodes).
+    // Recurse into all compound variants.
     match &mut expr.kind {
         ExprKind::BinaryOp { left, right, .. } => {
             replace_column_ref(left, target, replacement);
@@ -316,8 +408,70 @@ fn replace_column_ref(expr: &mut TypedExpr, target: ColumnId, replacement: &Type
         ExprKind::Cast { expr: inner_expr, .. } => {
             replace_column_ref(inner_expr, target, replacement);
         }
-        // Literals, ColumnRefs (already handled above), and other leaves: nothing to recurse.
-        _ => {}
+        ExprKind::InList { expr: inner_expr, list, .. } => {
+            replace_column_ref(inner_expr, target, replacement);
+            for item in list.iter_mut() {
+                replace_column_ref(item, target, replacement);
+            }
+        }
+        ExprKind::Between { expr: inner_expr, low, high, .. } => {
+            replace_column_ref(inner_expr, target, replacement);
+            replace_column_ref(low, target, replacement);
+            replace_column_ref(high, target, replacement);
+        }
+        ExprKind::Like { expr: inner_expr, pattern, .. } => {
+            replace_column_ref(inner_expr, target, replacement);
+            replace_column_ref(pattern, target, replacement);
+        }
+        ExprKind::Case { operand, when_then, else_expr } => {
+            if let Some(op) = operand {
+                replace_column_ref(op, target, replacement);
+            }
+            for (when, then) in when_then.iter_mut() {
+                replace_column_ref(when, target, replacement);
+                replace_column_ref(then, target, replacement);
+            }
+            if let Some(els) = else_expr {
+                replace_column_ref(els, target, replacement);
+            }
+        }
+        ExprKind::IsTruthValue { expr: inner_expr, .. } => {
+            replace_column_ref(inner_expr, target, replacement);
+        }
+        ExprKind::Nested(inner_expr) => {
+            replace_column_ref(inner_expr, target, replacement);
+        }
+        ExprKind::AggregateCall { args, order_by, .. } => {
+            for arg in args.iter_mut() {
+                replace_column_ref(arg, target, replacement);
+            }
+            for ob in order_by.iter_mut() {
+                replace_column_ref(&mut ob.expr, target, replacement);
+            }
+        }
+        ExprKind::LambdaFunction { body, .. } => {
+            replace_column_ref(body, target, replacement);
+        }
+        ExprKind::Lambda { body, .. } => {
+            replace_column_ref(body, target, replacement);
+        }
+        ExprKind::WindowCall { args, partition_by, order_by, .. } => {
+            for arg in args.iter_mut() {
+                replace_column_ref(arg, target, replacement);
+            }
+            for pb in partition_by.iter_mut() {
+                replace_column_ref(pb, target, replacement);
+            }
+            for ob in order_by.iter_mut() {
+                replace_column_ref(&mut ob.expr, target, replacement);
+            }
+        }
+        // True leaf variants: ColumnRef already handled as base case above;
+        // LambdaParamRef, Literal, SubqueryPlaceholder carry no child exprs.
+        ExprKind::ColumnRef { .. }
+        | ExprKind::LambdaParamRef { .. }
+        | ExprKind::Literal(_)
+        | ExprKind::SubqueryPlaceholder { .. } => {}
     }
 }
 
@@ -1548,6 +1702,131 @@ mod tests {
         assert!(
             check_preconditions(&pred, &apply).is_none(),
             "differing residual conjunct (same count, non-phys-eq) must reject (4d branch)"
+        );
+    }
+
+    /// Regression test for the Between-wrapped subquery comparison bug.
+    ///
+    /// Builds a q17-shaped fixture where the subquery comparison conjunct is:
+    ///   `l_quantity BETWEEN (APPLY_OUT - 1.0) AND (APPLY_OUT + 1.0)`
+    ///
+    /// Before the fix, `replace_column_ref` did not recurse into `Between` children,
+    /// so APPLY_OUT survived as a dangling reference. After the fix the transform must
+    /// SUCCEED: result has a Window, no Apply, and the after-window predicate no longer
+    /// references APPLY_OUT (it references win_id instead).
+    #[test]
+    fn transform_rewrites_subquery_comparison_inside_between() {
+        // The subquery conjunct: l_quantity BETWEEN (APPLY_OUT - 1.0) AND (APPLY_OUT + 1.0)
+        // low  = APPLY_OUT - 1.0
+        let low_expr = TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(col_ref_nullable(APPLY_OUT, "avg_subq", DataType::Float64)),
+                op: BinOp::Sub,
+                right: Box::new(float_lit(1.0)),
+            },
+            data_type: DataType::Float64,
+            nullable: true,
+        };
+        // high = APPLY_OUT + 1.0
+        let high_expr = TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(col_ref_nullable(APPLY_OUT, "avg_subq", DataType::Float64)),
+                op: BinOp::Add,
+                right: Box::new(float_lit(1.0)),
+            },
+            data_type: DataType::Float64,
+            nullable: true,
+        };
+        let between_conjunct = TypedExpr {
+            kind: ExprKind::Between {
+                expr: Box::new(col_ref(L_QUANTITY, "l_quantity", DataType::Float64)),
+                low: Box::new(low_expr),
+                high: Box::new(high_expr),
+                negated: false,
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        };
+
+        // Build the corr conjunct and Apply/Filter plan mirroring winmagic_filter_apply().
+        let corr_conj = eq_expr(
+            col_ref(P_PARTKEY, "p_partkey", DataType::Int64),
+            col_ref(INNER_L_PARTKEY, "l_partkey", DataType::Int64),
+        );
+        let apply = LogicalPlan::Apply(ApplyNode {
+            left: Box::new(make_outer_join()),
+            right: Box::new(make_inner_avg_agg()),
+            kind: ApplyKind::Scalar,
+            subquery_expr: col_ref_nullable(APPLY_OUT, "avg_subq", DataType::Float64),
+            output_column: OutputColumn {
+                column_id: APPLY_OUT,
+                name: "avg_subq".to_string(),
+                data_type: DataType::Float64,
+                nullable: true,
+                is_internal: true,
+            },
+            inner_output_column_id: AVG_RESULT,
+            correlation_column_ids: vec![P_PARTKEY],
+            correlation_conjuncts: vec![corr_conj],
+            residual_predicate: None,
+            need_check_max_rows: false,
+            use_semi_anti: false,
+            uncorrelated_outer_predicate_columns: HashSet::new(),
+            required_output_columns: None,
+        });
+
+        // WHERE: (p_partkey == l_partkey) AND (p_brand == 'x') AND BETWEEN(...)
+        let pred = and_expr(
+            and_expr(
+                eq_expr(
+                    col_ref(P_PARTKEY, "p_partkey", DataType::Int64),
+                    col_ref(L_PARTKEY, "l_partkey", DataType::Int64),
+                ),
+                eq_expr(
+                    col_ref(P_BRAND, "p_brand", DataType::Utf8),
+                    str_lit("x"),
+                ),
+            ),
+            between_conjunct.clone(),
+        );
+        let plan = LogicalPlan::Filter(FilterNode {
+            input: Box::new(apply),
+            predicate: pred,
+            required_output_columns: None,
+        });
+
+        let rule = ApplyToWindow;
+        let mut ctx = ctx_with_factory();
+        let result = rule.apply(plan, &mut ctx).expect("apply must not error");
+        let RewriteResult::Changed(result) = result else {
+            panic!("expected Changed — Between-wrapped APPLY_OUT should now be handled");
+        };
+
+        // Structural assertions.
+        assert!(
+            super::super::find_residual_apply(&result).is_none(),
+            "Apply must be gone after transform"
+        );
+        let LogicalPlan::Filter(after_filter) = &result else {
+            panic!("expected after-window Filter at root");
+        };
+        assert!(
+            matches!(after_filter.input.as_ref(), LogicalPlan::Window(_)),
+            "expected Window under after-filter"
+        );
+
+        // Key correctness check: APPLY_OUT is gone from the after-window predicate.
+        let refs = collect_column_id_refs(&after_filter.predicate);
+        assert!(
+            !refs.contains(&APPLY_OUT),
+            "after-window predicate must NOT reference APPLY_OUT after Between rewrite"
+        );
+        // win_id is present instead.
+        let LogicalPlan::Window(win) = after_filter.input.as_ref() else { unreachable!() };
+        let win_id = win.window_exprs[0].output_column_id;
+        assert!(
+            refs.contains(&win_id),
+            "after-window predicate must reference the minted WIN_ID"
         );
     }
 
