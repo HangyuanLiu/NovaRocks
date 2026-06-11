@@ -624,10 +624,51 @@ impl Catalog for HmsCatalog {
         ))
     }
 
-    async fn update_table(&self, _commit: TableCommit) -> Result<Table> {
-        Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "Updating a table is not supported yet",
-        ))
+    async fn update_table(&self, commit: TableCommit) -> Result<Table> {
+        let table_ident = commit.identifier().clone();
+        let db_name = validate_namespace(table_ident.namespace())?;
+        let table_name = table_ident.name.clone();
+
+        let current_table = self.load_table(&table_ident).await?;
+        let current_metadata_location = current_table.metadata_location_result()?.to_string();
+        let staged_table = commit.apply(current_table)?;
+        let new_metadata_location = staged_table.metadata_location_result()?.to_string();
+
+        staged_table
+            .metadata()
+            .write_to(staged_table.file_io(), &new_metadata_location)
+            .await?;
+
+        let mut hive_table = self
+            .client
+            .0
+            .get_table(db_name.clone().into(), table_name.clone().into())
+            .await
+            .map(from_thrift_exception)
+            .map_err(from_thrift_error)??;
+        let hms_metadata_location = get_metadata_location(&hive_table.parameters)?;
+        if hms_metadata_location != current_metadata_location {
+            return Err(Error::new(
+                ErrorKind::CatalogCommitConflicts,
+                format!(
+                    "HMS metadata_location changed during commit for {db_name}.{table_name}: expected {current_metadata_location}, got {hms_metadata_location}"
+                ),
+            ));
+        }
+
+        update_hive_table_metadata(
+            &mut hive_table,
+            staged_table.metadata(),
+            &current_metadata_location,
+            &new_metadata_location,
+        )?;
+
+        self.client
+            .0
+            .alter_table(db_name.into(), table_name.into(), hive_table)
+            .await
+            .map_err(from_thrift_error)?;
+
+        Ok(staged_table)
     }
 }

@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 use chrono::Utc;
 use hive_metastore::{Database, PrincipalType, SerDeInfo, StorageDescriptor};
-use iceberg::spec::Schema;
+use iceberg::spec::{Schema, TableMetadata};
 use iceberg::{Error, ErrorKind, Namespace, NamespaceIdent, Result};
 use pilota::{AHashMap, FastStr};
 
@@ -39,6 +39,8 @@ const COMMENT: &str = "comment";
 const LOCATION: &str = "location";
 /// hive metatore `metadata_location` property
 const METADATA_LOCATION: &str = "metadata_location";
+/// hive metatore `previous_metadata_location` property
+const PREVIOUS_METADATA_LOCATION: &str = "previous_metadata_location";
 /// hive metatore `external` property
 const EXTERNAL: &str = "EXTERNAL";
 /// hive metatore `external_table` property
@@ -264,6 +266,34 @@ pub(crate) fn get_metadata_location(
             "No 'parameters' set on table. Location of metadata is undefined",
         )),
     }
+}
+
+/// Update an existing HMS table object after an Iceberg table metadata commit.
+pub(crate) fn update_hive_table_metadata(
+    table: &mut hive_metastore::Table,
+    metadata: &TableMetadata,
+    previous_metadata_location: &str,
+    metadata_location: &str,
+) -> Result<()> {
+    let parameters = table.parameters.get_or_insert_with(Default::default);
+    parameters.insert(
+        FastStr::from(METADATA_LOCATION),
+        FastStr::from_string(metadata_location.to_string()),
+    );
+    parameters.insert(
+        FastStr::from(PREVIOUS_METADATA_LOCATION),
+        FastStr::from_string(previous_metadata_location.to_string()),
+    );
+    parameters.insert(FastStr::from(EXTERNAL), FastStr::from("TRUE"));
+    parameters.insert(FastStr::from(TABLE_TYPE), FastStr::from("ICEBERG"));
+
+    if let Some(sd) = table.sd.as_mut() {
+        sd.location = Some(metadata.location().to_string().into());
+        sd.cols = Some(HiveSchemaBuilder::from_iceberg(metadata.current_schema())?.build());
+    }
+    table.last_access_time = Some(get_current_time()?);
+
+    Ok(())
 }
 
 /// Formats location_uri by e.g. removing trailing slashes.
