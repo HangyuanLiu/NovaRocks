@@ -12,6 +12,75 @@
 
 ---
 
+## Execution Progress / Handoff (as of 2026-06-11, branch `claude/admiring-kalam-30e7bf`)
+
+This plan is **partially executed**. The entire Rust implementation is done and
+unit-tested; what remains is the Docker HMS fixture + the two SQL suites + the
+final regression. Execution paused to hand off to a different environment for
+the Docker/network-heavy steps. Resume with subagent-driven-development.
+
+### DONE (committed)
+- **Task 1** — `iceberg-catalog-hms` dependency. **DEVIATION (important):** the crate
+  does NOT compile against this repo's vendored `iceberg 0.9.0` (vendored iceberg
+  PATCH 6 adds `PrimitiveType::Variant`, breaking the crate's exhaustive match,
+  `E0004`). So it is **VENDORED** at `vendor/iceberg-catalog-hms-0.9.0/` with a
+  one-arm patch (`Variant → FeatureUnsupported`) + `PATCH.md` + a `[patch.crates-io]`
+  entry — same pattern as the existing vendored iceberg crates. (The spec §4.1
+  "do not vendor" assumption was wrong; the spec's own contingency — vendor if a
+  patch is needed — was triggered.)
+- **Tasks 2–6** — `hive` catalog kind end-to-end in `src/connector/iceberg/catalog/registry.rs`:
+  `IcebergCatalogKind::Hive`, `hms_uris` field, `uses_remote_catalog()` predicate,
+  `hive` parsing + `build_hms_catalog_entry` (thrift:// strip, first-URI, kerberos
+  fail-fast), `build_hms_catalog` (+ `with_storage_factory`, buffered/framed), the
+  `Hive` dispatcher arm, and the routing smoke test.
+  **De-risk gate PASSED:** volo-thrift runs cleanly under `block_on_iceberg`
+  (`data_block_on` is already a multi-thread `enable_all` Tokio runtime) — NO
+  workaround needed; HMS uses the plain `block_on_iceberg` path like REST.
+- **Tasks 7–8** — broadened the ~10 namespace/table `matches!(Rest)` branch points
+  to `uses_remote_catalog()` (Rest|Hive) routing through `build_iceberg_catalog`;
+  fmt/clippy clean. **REST no-regression proven** (the 5 REST mockito tests pass).
+  `views.rs` / `iceberg_view_rewrite.rs` left Rest-only (HMS views out of scope v1).
+- **Task 9 (partial)** — image source committed: `docker/iceberg-rest/hms/{Dockerfile,core-site.xml}`.
+  **Image NOT built yet** (this is the paused step — slow `docker pull`/`build`).
+- **Task 12** — `iceberg-hms` / `iceberg-hms-compatibility` placeholder arm in
+  `tests/sql-test-runner/src/config.rs` (+ test). Reviewed.
+- **Task 15 (partial)** — `AGENTS.md`/`CLAUDE.md` now list `hive` as a supported
+  catalog type. The `docs/guides/iceberg-v3/catalog.md` ❌→✅ flip is **deliberately
+  deferred** until the e2e suites pass (so we don't claim verified e2e prematurely).
+
+All Rust changes verified: `cargo test -p novarocks --lib connector::iceberg::catalog::registry`
+→ 41 pass; `tests/sql-test-runner` → 89 pass; fmt/clippy clean.
+
+### REMAINING (needs Docker / a running HMS) — exact next steps
+1. **Finish Task 9 — build the image** (the paused step). On the new environment:
+   ```bash
+   docker pull apache/hive:4.0.0
+   docker run --rm --entrypoint bash apache/hive:4.0.0 -lc 'ls /opt/hive/lib/hadoop-common-*.jar'
+   # If the bundled hadoop is NOT 3.3.6, edit docker/iceberg-rest/hms/Dockerfile's
+   # HADOOP_VERSION (and a compatible AWS_SDK_VERSION) to match, THEN:
+   docker build -t novarocks/hive-metastore:4.0.0 docker/iceberg-rest/hms
+   ```
+2. **Task 10** — add the `hms` service to `compose.yml` + `shared.env` (per the Task 10
+   section); bring the shared fixture up (do NOT tear it down) and verify the `hms`
+   container is Up and the thrift port is reachable.
+3. **Task 11** — thread HMS env + readiness through `up.sh`; regenerate and verify
+   `NOVAROCKS_ICEBERG_HMS_URI` etc. are exported.
+4. **Task 13** — `sql-tests/iceberg-hms` round-trip suite (incl. DELETE/UPDATE — the
+   full-parity gate); record (`--record-from target`) + verify.
+5. **Task 14** — `sql-tests/iceberg-hms-compatibility` cross-engine suite (Spark HMS
+   catalog config + both directions); record + verify.
+6. **Task 15 (finish)** — flip the HMS row in `docs/guides/iceberg-v3/catalog.md` to ✅.
+7. **Task 16** — full regression (registry tests, iceberg-rest suite for no-regression,
+   both HMS suites).
+
+### Environment notes
+- The Docker fixture (`docker/iceberg-rest/`) is shared across worktrees; MinIO/REST/Spark
+  were already running. NEVER `down.sh --docker`. Add `hms` and `docker compose up -d`.
+- `shared.env` is shared — adding `NOVA_ENV_HMS_PORT=9083` etc. there is intended.
+- The paused build was handed to the user because of a slow-network `docker pull`/`build`.
+
+---
+
 ## Conventions for this plan
 
 - All commands run from the repo root: `/Users/harbor/.claude/worktrees/NovaRocks/admiring-kalam-30e7bf`.
