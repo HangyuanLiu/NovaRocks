@@ -37,7 +37,6 @@ pub(crate) struct SessionOptimizerSettings {
     pub enable_eliminate_agg: bool,
     pub disabled_rules: Vec<String>,
     /// Subquery unnesting routing mode. Read by M1 analyzer routing.
-    #[allow(dead_code)]
     pub subquery_unnest_mode: SubqueryUnnestMode,
     /// Session override for the RF build-side maximum size gate (bytes).
     /// `None` means use the StarRocks default (64 MiB).

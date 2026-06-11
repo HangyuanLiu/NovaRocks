@@ -650,6 +650,7 @@ mod tests {
             kind: ApplyKind::Scalar,
             subquery_expr: column_ref(ColumnId(7), "sq"),
             output_column: output_column("sq"),
+            inner_output_column_id: ColumnId(7),
             correlation_column_ids: vec![],
             correlation_conjuncts: vec![],
             residual_predicate: None,

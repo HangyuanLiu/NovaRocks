@@ -73,6 +73,10 @@ pub(crate) struct ResolvedSelect {
     pub distinct: bool,
     /// Repeat metadata for ROLLUP/CUBE/GROUPING SETS expansion.
     pub repeat: Option<RepeatInfo>,
+    /// Scalar subqueries routed to the Apply framework (apply mode only;
+    /// always empty in legacy mode). Consumed by the planner to emit
+    /// `LogicalPlan::Apply`.
+    pub apply_specs: Vec<ApplyScalarSpec>,
 }
 
 /// Metadata for ROLLUP/CUBE/GROUPING SETS repeat execution.
@@ -420,6 +424,54 @@ pub(crate) enum SubqueryKind {
     Exists { negated: bool },
     /// col [NOT] IN (SELECT ...)
     InSubquery { negated: bool },
+}
+
+/// Which clause of the enclosing SELECT a scalar subquery was found in.
+/// Determines where the planner inserts the Apply node relative to the
+/// WHERE filter, the aggregate, and the projection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ApplyClause {
+    Where,
+    Having,
+    Projection,
+}
+
+/// A scalar subquery the analyzer routed to the Apply framework (apply mode).
+/// The planner consumes these to emit `LogicalPlan::Apply`. The inner query is
+/// left INTACT — correlation predicates remain in its WHERE; M1b's
+/// PushDownApplyFilter rule extracts them into the Apply's correlation_conjuncts.
+// All fields are consumed by the M1a planner (Task 4) and M1b runtime (Task 5+).
+// The dead_code allows on individual fields drop when each is first read in
+// production code (the test build reads them but cfg(test) code is excluded
+// from the non-test dead-code analysis).
+#[derive(Clone, Debug)]
+pub(crate) struct ApplyScalarSpec {
+    /// Placeholder id this spec replaced (matches the original SubqueryInfo.id).
+    /// Read by M1b (AssertOneRow error message); unused in M1a production code.
+    #[allow(dead_code)]
+    pub subquery_id: usize,
+    /// Which clause of the enclosing SELECT the subquery was found in.
+    /// Read by the planner to select the insertion point.
+    pub clause: ApplyClause,
+    /// Fresh column representing the subquery's scalar value in outer exprs.
+    /// Read by the planner to build the Apply node.
+    pub output_column: OutputColumn,
+    /// Fully-analyzed inner subquery, with outer references carrying the outer
+    /// column ids (via merged-scope analysis). Becomes the Apply's right child.
+    /// Read by the planner to plan Apply.right.
+    pub inner: ResolvedQuery,
+    /// Outer columns referenced inside the subquery (their ids are the outer
+    /// factory's ids, since the outer scope was merged into the inner analysis).
+    /// Read by the planner to populate Apply.correlation_column_ids.
+    pub correlation_column_ids: Vec<ColumnId>,
+    /// Scalar subqueries must yield <= 1 row; M1b discharges this when the inner
+    /// is a scalar aggregate grouped by the correlation key.
+    /// Read by the planner to set Apply.need_check_max_rows.
+    pub need_check_max_rows: bool,
+    /// Original subquery SQL text, for the M1b AssertOneRow runtime message.
+    /// Read by M1b; unused in M1a production code.
+    #[allow(dead_code)]
+    pub subquery_text: String,
 }
 
 /// A collected subquery from expression analysis, ready for rewriting.

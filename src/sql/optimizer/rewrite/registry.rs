@@ -165,6 +165,8 @@ mod tests {
                 "PruneUkFkJoin",
                 "PruneUnionColumns",
                 "PruneWindowColumns",
+                "PushDownApplyAggFilter",
+                "PushDownApplyFilter",
                 "PushDownPredicateAggregate",
                 "PushDownPredicateAggregate",
                 "PushDownPredicateAggregate",
@@ -180,6 +182,7 @@ mod tests {
                 "PushSemiAntiRightOnlyCondition",
                 "PushSemiAntiRightOnlyCondition",
                 "PushSemiAntiRightOnlyCondition",
+                "ScalarApplyToJoin",
                 "TagRequiredColumns",
             ]
         );
@@ -222,6 +225,10 @@ mod tests {
         assert!(is_known_rewrite_rule_name("DeriveJoinNotNullPredicate"));
         assert!(is_known_rewrite_rule_name("JoinPredicateMoveAround"));
         assert!(is_known_rewrite_rule_name("ApplyException"));
+        // M1b scalar decorrelation rules (Task 4).
+        assert!(is_known_rewrite_rule_name("PushDownApplyAggFilter"));
+        assert!(is_known_rewrite_rule_name("PushDownApplyFilter"));
+        assert!(is_known_rewrite_rule_name("ScalarApplyToJoin"));
     }
 
     fn assert_default_phase_trace(ctx: &RewriteContext) {

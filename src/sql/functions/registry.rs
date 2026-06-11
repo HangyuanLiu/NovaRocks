@@ -669,6 +669,14 @@ fn register_condition_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "assert_true",
         Signature::new(vec![TypeSpec::Boolean], TypeSpec::Boolean),
     );
+    // `assert_true(bool, varchar) -> bool` — 2-arg form with a custom error
+    // message. The exec kernel already supports 2 args (assert_true.rs uses the
+    // 2nd arg as the message); only the SQL-layer signature was missing.
+    add(
+        m,
+        "assert_true",
+        Signature::new(vec![TypeSpec::Boolean, TypeSpec::Utf8], TypeSpec::Boolean),
+    );
     // `sleep(int) -> bool`.
     add(
         m,

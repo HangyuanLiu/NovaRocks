@@ -9137,4 +9137,557 @@ path = "meta/operations.sqlite"
         assert_eq!(parsed.1, crate::sql::explain::ExplainLevel::Analyze);
         assert!(parsed.2);
     }
+
+    // -------------------------------------------------------------------------
+    // Scalar subquery decorrelation — end-to-end correctness tests (Task 5).
+    //
+    // Each test runs the same query in both `legacy` and `apply` modes against
+    // the same Iceberg-backed in-memory tables and asserts identical results,
+    // OR asserts the apply-mode error for the multi-row case (which is the
+    // correct SQL-standard semantics).
+    //
+    // Setup: t1(k BIGINT, v BIGINT) and t2(k BIGINT, v BIGINT) in an Iceberg
+    // in-memory catalog, populated with controlled data per test.
+    //
+    // All engine calls are wrapped in `with_session_optimizer_settings` so the
+    // TLS-stored mode is active for both the analyzer (subquery routing) and the
+    // optimizer (SubqueryRewrite stage).
+    // -------------------------------------------------------------------------
+
+    /// Open an Iceberg-backed test engine and return (engine, session, warehouse_dir).
+    /// Tables are NOT yet created; the caller creates and populates them.
+    fn open_scalar_subquery_test_engine(
+        warehouse: &TempDir,
+    ) -> (StandaloneNovaRocks, StandaloneSession) {
+        let engine = open_test_engine_with_metadata(warehouse);
+        let session = engine.session();
+        let create_catalog_sql = format!(
+            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="memory","iceberg.catalog.warehouse"="{}")"#,
+            warehouse.path().display()
+        );
+        session
+            .execute_in_database(&create_catalog_sql, "default")
+            .expect("create iceberg catalog");
+        session
+            .execute_in_database("create database ice.db1", "default")
+            .expect("create iceberg database");
+        (engine, session)
+    }
+
+    /// Run a SELECT query in the given mode and return the first column's values
+    /// as a `Vec<Option<i64>>` (None = SQL NULL). Expects every row to have
+    /// exactly one column of type BIGINT/INT.
+    fn run_scalar_query_i64(
+        session: &StandaloneSession,
+        sql: &str,
+        mode: crate::sql::optimizer::options::SubqueryUnnestMode,
+    ) -> Result<Vec<Option<i64>>, String> {
+        use crate::sql::optimizer::options::{
+            SessionOptimizerSettings, with_session_optimizer_settings,
+        };
+        let settings = SessionOptimizerSettings {
+            subquery_unnest_mode: mode,
+            ..Default::default()
+        };
+        let result = with_session_optimizer_settings(settings, || {
+            session.execute_in_context(sql, Some("ice"), "db1", None)
+        })?;
+        let qr = match result {
+            StatementResult::Query(qr) => qr,
+            StatementResult::Ok => {
+                return Err("query returned no rows (StatementResult::Ok)".to_string());
+            }
+        };
+        let mut values = Vec::new();
+        for chunk in &qr.chunks {
+            let col = chunk.batch.column(0);
+            // Try Int64 first (BIGINT), then Int32 (INT).
+            if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+                for i in 0..arr.len() {
+                    values.push(if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i))
+                    });
+                }
+            } else if let Some(arr) = col.as_any().downcast_ref::<Int32Array>() {
+                for i in 0..arr.len() {
+                    values.push(if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i) as i64)
+                    });
+                }
+            } else {
+                return Err(format!(
+                    "expected Int64 or Int32 column, got {:?}",
+                    col.data_type()
+                ));
+            }
+        }
+        Ok(values)
+    }
+
+    /// Run a SELECT query in the given mode and return all columns' values as a
+    /// `Vec<Vec<Option<i64>>>` (outer = rows, inner = columns). Expects every
+    /// column to be BIGINT/INT.
+    fn run_scalar_query_multi_col(
+        session: &StandaloneSession,
+        sql: &str,
+        mode: crate::sql::optimizer::options::SubqueryUnnestMode,
+    ) -> Result<Vec<Vec<Option<i64>>>, String> {
+        use crate::sql::optimizer::options::{
+            SessionOptimizerSettings, with_session_optimizer_settings,
+        };
+        let settings = SessionOptimizerSettings {
+            subquery_unnest_mode: mode,
+            ..Default::default()
+        };
+        let result = with_session_optimizer_settings(settings, || {
+            session.execute_in_context(sql, Some("ice"), "db1", None)
+        })?;
+        let qr = match result {
+            StatementResult::Query(qr) => qr,
+            StatementResult::Ok => {
+                return Err("query returned no rows (StatementResult::Ok)".to_string());
+            }
+        };
+        let num_cols = qr.columns.len();
+        // Build row-major result: collect per-column arrays, then transpose.
+        let mut col_values: Vec<Vec<Option<i64>>> = vec![Vec::new(); num_cols];
+        for chunk in &qr.chunks {
+            for col_idx in 0..num_cols {
+                let col = chunk.batch.column(col_idx);
+                if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+                    for i in 0..arr.len() {
+                        col_values[col_idx].push(if arr.is_null(i) {
+                            None
+                        } else {
+                            Some(arr.value(i))
+                        });
+                    }
+                } else if let Some(arr) = col.as_any().downcast_ref::<Int32Array>() {
+                    for i in 0..arr.len() {
+                        col_values[col_idx].push(if arr.is_null(i) {
+                            None
+                        } else {
+                            Some(arr.value(i) as i64)
+                        });
+                    }
+                } else {
+                    return Err(format!(
+                        "col {col_idx}: expected Int64 or Int32, got {:?}",
+                        col.data_type()
+                    ));
+                }
+            }
+        }
+        // Transpose to row-major.
+        let num_rows = col_values.first().map(|v| v.len()).unwrap_or(0);
+        let rows = (0..num_rows)
+            .map(|r| (0..num_cols).map(|c| col_values[c][r]).collect())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Run a SELECT query in apply mode and expect an error containing `needle`.
+    fn expect_apply_error(session: &StandaloneSession, sql: &str, needle: &str) {
+        use crate::sql::optimizer::options::{
+            SessionOptimizerSettings, SubqueryUnnestMode, with_session_optimizer_settings,
+        };
+        let settings = SessionOptimizerSettings {
+            subquery_unnest_mode: SubqueryUnnestMode::Apply,
+            ..Default::default()
+        };
+        let result = with_session_optimizer_settings(settings, || {
+            session.execute_in_context(sql, Some("ice"), "db1", None)
+        });
+        let err = result.expect_err(&format!(
+            "expected apply-mode error containing '{needle}', but query succeeded"
+        ));
+        assert!(
+            err.contains(needle),
+            "expected error containing '{needle}'; got: {err}"
+        );
+    }
+
+    // ---- Test 1: correlated aggregate (q17-shape) — apply == legacy -----------
+
+    /// Correlated aggregate scalar: `WHERE v = (SELECT min(t2.v) FROM t2 WHERE t2.k = t1.k)`.
+    /// Both legacy and apply mode must return the same rows.
+    #[test]
+    fn scalar_subquery_correlated_agg_apply_matches_legacy() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
+
+        session
+            .execute_in_database("create table ice.db1.t1 (k bigint, v bigint)", "default")
+            .expect("create t1");
+        session
+            .execute_in_database("create table ice.db1.t2 (k bigint, v bigint)", "default")
+            .expect("create t2");
+        // t1: (1,10),(2,20),(3,30)
+        // t2: (1,10),(1,5),(2,20),(2,15)  -> min for k=1 is 5, k=2 is 15, k=3 has no match
+        session
+            .execute_in_database(
+                "insert into ice.db1.t1 values (1,10),(2,20),(3,30)",
+                "default",
+            )
+            .expect("insert t1");
+        session
+            .execute_in_database(
+                "insert into ice.db1.t2 values (1,10),(1,5),(2,20),(2,15)",
+                "default",
+            )
+            .expect("insert t2");
+
+        // The subquery: SELECT t1.k FROM t1 WHERE t1.v = (SELECT min(t2.v) FROM t2 WHERE t2.k = t1.k)
+        // k=1: min(t2.v) for k=1 = 5; t1.v=10 != 5 -> not selected
+        // k=2: min(t2.v) for k=2 = 15; t1.v=20 != 15 -> not selected
+        // k=3: no t2 rows -> NULL; t1.v=30 != NULL -> not selected
+        // Result: no rows (empty)
+        //
+        // Alternatively use a query where some rows DO match:
+        // WHERE t1.v = (SELECT min(t2.v) FROM t2 WHERE t2.k = t1.k)
+        // Let's insert a t1 row where v=5 (k=1) so it matches min(t2.v)=5.
+        session
+            .execute_in_database("insert into ice.db1.t1 values (1,5)", "default")
+            .expect("insert matching t1 row");
+
+        let sql = "SELECT t1.k FROM t1 WHERE t1.v = (SELECT min(t2.v) FROM t2 WHERE t2.k = t1.k) ORDER BY 1";
+
+        use crate::sql::optimizer::options::SubqueryUnnestMode;
+        let legacy = run_scalar_query_i64(&session, sql, SubqueryUnnestMode::Legacy)
+            .expect("legacy corr-agg query");
+        let apply = run_scalar_query_i64(&session, sql, SubqueryUnnestMode::Apply)
+            .expect("apply corr-agg query");
+
+        assert_eq!(
+            apply, legacy,
+            "apply mode must return the same result as legacy for correlated-aggregate scalar"
+        );
+        // k=1, v=5 matches min(t2.v for k=1)=5 — exactly one row
+        assert_eq!(legacy, vec![Some(1)]);
+    }
+
+    // ---- Test 2: uncorrelated scalar — apply == legacy -----------------------
+
+    #[test]
+    fn scalar_subquery_uncorrelated_apply_matches_legacy() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
+
+        session
+            .execute_in_database("create table ice.db1.t1 (k bigint, v bigint)", "default")
+            .expect("create t1");
+        session
+            .execute_in_database("create table ice.db1.t2 (k bigint, v bigint)", "default")
+            .expect("create t2");
+        session
+            .execute_in_database(
+                "insert into ice.db1.t1 values (1,10),(2,20),(3,30)",
+                "default",
+            )
+            .expect("insert t1");
+        session
+            .execute_in_database(
+                "insert into ice.db1.t2 values (1,100),(2,200),(3,300)",
+                "default",
+            )
+            .expect("insert t2");
+
+        // Uncorrelated scalar: v > (SELECT min(v) FROM t2). min(t2.v)=100 and all
+        // t1.v are < 100, so the result is empty in BOTH modes — which still
+        // proves apply mode is equivalent to legacy for an uncorrelated scalar.
+        let sql = "SELECT t1.k FROM t1 WHERE t1.v > (SELECT min(v) FROM t2) ORDER BY 1";
+
+        use crate::sql::optimizer::options::SubqueryUnnestMode;
+        let legacy = run_scalar_query_i64(&session, sql, SubqueryUnnestMode::Legacy)
+            .expect("legacy uncorrelated query");
+        let apply = run_scalar_query_i64(&session, sql, SubqueryUnnestMode::Apply)
+            .expect("apply uncorrelated query");
+
+        assert_eq!(
+            apply, legacy,
+            "apply mode must return the same result as legacy for uncorrelated scalar"
+        );
+        // t1.v > 100: v=20 no, v=30 no — wait, t1.v values are 10,20,30; min(t2.v)=100
+        // None qualify. Let's verify.
+        assert_eq!(legacy, vec![]);
+    }
+
+    // ---- Test 3: empty group → NULL — apply == legacy ------------------------
+
+    /// When some outer rows have no matching inner group, the correlated
+    /// aggregate returns NULL (LEFT OUTER JOIN null-extension). Both modes
+    /// must agree.
+    #[test]
+    fn scalar_subquery_empty_group_yields_null_apply_matches_legacy() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
+
+        session
+            .execute_in_database("create table ice.db1.t1 (k bigint, v bigint)", "default")
+            .expect("create t1");
+        session
+            .execute_in_database("create table ice.db1.t2 (k bigint, v bigint)", "default")
+            .expect("create t2");
+        // t1: k=1, k=2, k=3. t2 has only k=1 and k=2.
+        // k=3 has no match → scalar is NULL.
+        session
+            .execute_in_database("insert into ice.db1.t1 values (1,0),(2,0),(3,0)", "default")
+            .expect("insert t1");
+        session
+            .execute_in_database("insert into ice.db1.t2 values (1,10),(2,20)", "default")
+            .expect("insert t2");
+
+        // Project the scalar result (may be NULL) for each t1 row.
+        let sql = "SELECT (SELECT min(t2.v) FROM t2 WHERE t2.k = t1.k) FROM t1 ORDER BY t1.k";
+
+        use crate::sql::optimizer::options::SubqueryUnnestMode;
+        let legacy = run_scalar_query_i64(&session, sql, SubqueryUnnestMode::Legacy)
+            .expect("legacy empty-group query");
+        let apply = run_scalar_query_i64(&session, sql, SubqueryUnnestMode::Apply)
+            .expect("apply empty-group query");
+
+        assert_eq!(
+            apply, legacy,
+            "apply mode must return the same result as legacy for empty-group scalar"
+        );
+        // k=1 → Some(10), k=2 → Some(20), k=3 → None (NULL)
+        assert_eq!(legacy, vec![Some(10), Some(20), None]);
+    }
+
+    // ---- Test 4: count → 0, not NULL — apply mode normalizes correctly -------
+
+    /// Correlated count(*) scalar: apply mode must return 0 (not NULL) for outer
+    /// rows with no matching inner group, thanks to the `ifnull(count,0)`
+    /// normalization in ScalarApplyToJoin.
+    ///
+    /// Note: legacy mode returns NULL for count(*) with no matches (it does not
+    /// apply the ifnull normalization). Apply mode is the *correct* SQL-standard
+    /// behavior here; legacy is a known gap. We assert apply returns 0.
+    #[test]
+    fn scalar_subquery_count_zero_apply_normalizes_correctly() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
+
+        session
+            .execute_in_database("create table ice.db1.t1 (k bigint, v bigint)", "default")
+            .expect("create t1");
+        session
+            .execute_in_database("create table ice.db1.t2 (k bigint, v bigint)", "default")
+            .expect("create t2");
+        session
+            .execute_in_database("insert into ice.db1.t1 values (1,0),(2,0),(3,0)", "default")
+            .expect("insert t1");
+        session
+            .execute_in_database("insert into ice.db1.t2 values (1,10),(1,20)", "default")
+            .expect("insert t2");
+
+        // count(*) for k=1 → 2, k=2 → 0, k=3 → 0 (not NULL)
+        let sql = "SELECT (SELECT count(*) FROM t2 WHERE t2.k = t1.k) FROM t1 ORDER BY t1.k";
+
+        use crate::sql::optimizer::options::SubqueryUnnestMode;
+        let apply = run_scalar_query_i64(&session, sql, SubqueryUnnestMode::Apply)
+            .expect("apply count-zero query");
+
+        assert_eq!(
+            apply,
+            vec![Some(2), Some(0), Some(0)],
+            "apply mode: count(*) must return 0 (not NULL) for unmatched outer rows (ifnull normalization)"
+        );
+    }
+
+    // ---- Test 5: NULL correlation key → NULL scalar — apply == legacy --------
+
+    #[test]
+    fn scalar_subquery_null_correlation_key_yields_null_apply_matches_legacy() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
+
+        session
+            .execute_in_database("create table ice.db1.t1 (k bigint, v bigint)", "default")
+            .expect("create t1");
+        session
+            .execute_in_database("create table ice.db1.t2 (k bigint, v bigint)", "default")
+            .expect("create t2");
+        // t1 has a NULL k; the correlated scalar must also be NULL.
+        session
+            .execute_in_database("insert into ice.db1.t1 values (1,0),(NULL,0)", "default")
+            .expect("insert t1");
+        session
+            .execute_in_database("insert into ice.db1.t2 values (1,10),(1,5)", "default")
+            .expect("insert t2");
+
+        let sql =
+            "SELECT (SELECT min(t2.v) FROM t2 WHERE t2.k = t1.k) FROM t1 ORDER BY t1.k NULLS LAST";
+
+        use crate::sql::optimizer::options::SubqueryUnnestMode;
+        let legacy = run_scalar_query_i64(&session, sql, SubqueryUnnestMode::Legacy)
+            .expect("legacy null-key query");
+        let apply = run_scalar_query_i64(&session, sql, SubqueryUnnestMode::Apply)
+            .expect("apply null-key query");
+
+        assert_eq!(
+            apply, legacy,
+            "apply mode must return the same result as legacy for NULL correlation key"
+        );
+        // k=1 → Some(5), k=NULL → None (NULL: no match because NULL != NULL in the join)
+        assert_eq!(legacy, vec![Some(5), None]);
+    }
+
+    // ---- Test 6: correlated non-agg single-row — apply returns correct value -
+
+    /// Correlated NON-aggregate scalar where the inner key is unique (≤1 row
+    /// per outer key). The with-check path (count(1)/any_value/assert_true)
+    /// must return the correct value without raising the row-check error.
+    #[test]
+    fn scalar_subquery_correlated_nonagg_single_row_ok() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
+
+        session
+            .execute_in_database("create table ice.db1.t1 (k bigint, v bigint)", "default")
+            .expect("create t1");
+        session
+            .execute_in_database("create table ice.db1.t2 (k bigint, v bigint)", "default")
+            .expect("create t2");
+        // t2.k is effectively unique: each k appears exactly once.
+        session
+            .execute_in_database("insert into ice.db1.t1 values (1,0),(2,0),(3,0)", "default")
+            .expect("insert t1");
+        session
+            .execute_in_database("insert into ice.db1.t2 values (1,100),(2,200)", "default")
+            .expect("insert t2");
+
+        // Correlated non-aggregate: (SELECT t2.v FROM t2 WHERE t2.k = t1.k)
+        // k=1 → 100, k=2 → 200, k=3 → NULL (no match)
+        let sql = "SELECT (SELECT t2.v FROM t2 WHERE t2.k = t1.k) FROM t1 ORDER BY t1.k";
+
+        use crate::sql::optimizer::options::SubqueryUnnestMode;
+        let result = run_scalar_query_i64(&session, sql, SubqueryUnnestMode::Apply)
+            .expect("apply non-agg single-row query must succeed");
+
+        assert_eq!(
+            result,
+            vec![Some(100), Some(200), None],
+            "apply non-agg single-row must return correct values"
+        );
+    }
+
+    // ---- Test 7: correlated non-agg MULTI-ROW → apply must ERROR -------------
+    //
+    // This is the most important test: the assert_true(cnt IS NULL OR cnt <= 1,
+    // 'correlate scalar subquery result must 1 row') check must fire at runtime.
+    // Legacy mode does NOT enforce this (known gap); apply mode MUST error.
+
+    #[test]
+    fn scalar_subquery_correlated_nonagg_multirow_errors_in_apply_mode() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
+
+        session
+            .execute_in_database("create table ice.db1.t1 (k bigint, v bigint)", "default")
+            .expect("create t1");
+        session
+            .execute_in_database("create table ice.db1.t2 (k bigint, v bigint)", "default")
+            .expect("create t2");
+        // t2 has TWO rows with k=1, so the correlated scalar for t1.k=1 returns >1 row.
+        session
+            .execute_in_database("insert into ice.db1.t1 values (1,0)", "default")
+            .expect("insert t1");
+        session
+            .execute_in_database("insert into ice.db1.t2 values (1,100),(1,200)", "default")
+            .expect("insert t2");
+
+        // Apply mode must raise the assert_true error.
+        let sql = "SELECT (SELECT t2.v FROM t2 WHERE t2.k = t1.k) FROM t1";
+        expect_apply_error(&session, sql, "correlate scalar subquery result must 1 row");
+    }
+
+    // ---- Test 8: two correlated scalar subqueries in one query — apply == legacy
+
+    /// Two correlated scalar subqueries over different tables in the same SELECT
+    /// list. M1a stacks them as left-deep Apply nodes; M1b decorrelates each one
+    /// to a LEFT OUTER JOIN. This test verifies that both decorrelations succeed
+    /// and that apply-mode results match legacy, including NULL extension for
+    /// outer rows that only match one of the two subqueries.
+    ///
+    /// Schema:
+    ///   t1(k BIGINT, v BIGINT) — outer table
+    ///   t2(k BIGINT, v BIGINT) — has matches for k=1 and k=2, but NOT k=3
+    ///   t3(k BIGINT, v BIGINT) — has matches for k=1 and k=3, but NOT k=2
+    ///
+    /// Query:
+    ///   SELECT t1.k,
+    ///          (SELECT min(t2.v) FROM t2 WHERE t2.k = t1.k),
+    ///          (SELECT max(t3.v) FROM t3 WHERE t3.k = t1.k)
+    ///   FROM t1 ORDER BY t1.k
+    ///
+    /// Expected results (k, min_t2, max_t3):
+    ///   k=1 → (1, 5,  90)   — both subqueries match
+    ///   k=2 → (2, 20, NULL) — only t2 matches; t3 NULL-extends
+    ///   k=3 → (3, NULL, 30) — only t3 matches; t2 NULL-extends
+    #[test]
+    fn scalar_subquery_multiple_in_one_query_apply_matches_legacy() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
+
+        session
+            .execute_in_database("create table ice.db1.t1 (k bigint, v bigint)", "default")
+            .expect("create t1");
+        session
+            .execute_in_database("create table ice.db1.t2 (k bigint, v bigint)", "default")
+            .expect("create t2");
+        session
+            .execute_in_database("create table ice.db1.t3 (k bigint, v bigint)", "default")
+            .expect("create t3");
+
+        // t1: three outer rows with distinct keys
+        session
+            .execute_in_database("insert into ice.db1.t1 values (1,0),(2,0),(3,0)", "default")
+            .expect("insert t1");
+        // t2: k=1 has two rows (min=5), k=2 has one row (min=20), k=3 absent
+        session
+            .execute_in_database(
+                "insert into ice.db1.t2 values (1,5),(1,10),(2,20)",
+                "default",
+            )
+            .expect("insert t2");
+        // t3: k=1 has one row (max=90), k=2 absent, k=3 has one row (max=30)
+        session
+            .execute_in_database("insert into ice.db1.t3 values (1,90),(3,30)", "default")
+            .expect("insert t3");
+
+        let sql = "SELECT t1.k, \
+                   (SELECT min(t2.v) FROM t2 WHERE t2.k = t1.k), \
+                   (SELECT max(t3.v) FROM t3 WHERE t3.k = t1.k) \
+                   FROM t1 ORDER BY t1.k";
+
+        use crate::sql::optimizer::options::SubqueryUnnestMode;
+        let legacy = run_scalar_query_multi_col(&session, sql, SubqueryUnnestMode::Legacy)
+            .expect("legacy multi-scalar query");
+        let apply = run_scalar_query_multi_col(&session, sql, SubqueryUnnestMode::Apply)
+            .expect("apply multi-scalar query");
+
+        assert_eq!(
+            apply, legacy,
+            "apply mode must return the same result as legacy for two correlated scalar subqueries"
+        );
+
+        // Verify the concrete expected values:
+        //   k=1: min(t2.v for k=1)=5,  max(t3.v for k=1)=90
+        //   k=2: min(t2.v for k=2)=20, max(t3.v for k=2)=NULL (no t3 rows)
+        //   k=3: min(t2.v for k=3)=NULL (no t2 rows), max(t3.v for k=3)=30
+        assert_eq!(
+            legacy,
+            vec![
+                vec![Some(1), Some(5), Some(90)],
+                vec![Some(2), Some(20), None],
+                vec![Some(3), None, Some(30)],
+            ],
+            "unexpected result values for multiple scalar subqueries"
+        );
+    }
 }

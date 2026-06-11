@@ -275,4 +275,15 @@ mod tests {
         let r = resolve_scalar_function("now", &[]);
         assert_eq!(r, Ok(DataType::Timestamp(TimeUnit::Microsecond, None)));
     }
+
+    #[test]
+    fn resolve_assert_true_2arg_returns_boolean() {
+        // The 2-arg form assert_true(bool, varchar) -> bool must resolve to Boolean.
+        let r = resolve_scalar_function("assert_true", &[DataType::Boolean, DataType::Utf8]);
+        assert_eq!(
+            r,
+            Ok(DataType::Boolean),
+            "assert_true(bool, varchar) must resolve to Boolean"
+        );
+    }
 }
