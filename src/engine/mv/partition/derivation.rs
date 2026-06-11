@@ -54,6 +54,22 @@ impl AffectedTargetPartitions {
             Self::Known { partitions } => partitions.len(),
         }
     }
+
+    /// Convert to a `TargetPartitionFilter` for file-scan pruning. `Known`
+    /// becomes an `AllowList`; `Unpartitioned` and `NotDerived` become `None`
+    /// (no pruning). Pruning is an optimization (umbrella spec §4.3 / D5
+    /// BestEffort): a `NotDerived` outcome must never restrict the scan. The
+    /// empty `Known` set legitimately produces an empty `AllowList` (nothing
+    /// affected), which the locator honors by scanning zero files.
+    pub(crate) fn to_target_partition_filter(
+        &self,
+    ) -> crate::engine::mv::partition::TargetPartitionFilter {
+        use crate::engine::mv::partition::TargetPartitionFilter;
+        match self {
+            Self::Known { partitions } => TargetPartitionFilter::AllowList(partitions.clone()),
+            Self::Unpartitioned | Self::NotDerived { .. } => TargetPartitionFilter::None,
+        }
+    }
 }
 
 /// Reasons aggregate-delta partition derivation can refuse a delta batch.
@@ -486,6 +502,40 @@ mod tests {
         assert_eq!(
             partitions.into_iter().collect::<Vec<_>>(),
             vec![key("a"), key("b")]
+        );
+    }
+
+    #[test]
+    fn to_target_partition_filter_maps_known_to_allow_list() {
+        let result = AffectedTargetPartitions::known([key("a"), key("b")]);
+        let filter = result.to_target_partition_filter();
+        let crate::engine::mv::partition::TargetPartitionFilter::AllowList(set) = filter else {
+            panic!("expected AllowList");
+        };
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&key("a")));
+        assert!(set.contains(&key("b")));
+    }
+
+    #[test]
+    fn to_target_partition_filter_maps_empty_known_to_empty_allow_list() {
+        let filter = AffectedTargetPartitions::known(std::iter::empty::<MvPartitionKey>())
+            .to_target_partition_filter();
+        let crate::engine::mv::partition::TargetPartitionFilter::AllowList(set) = filter else {
+            panic!("expected AllowList for empty Known set");
+        };
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn to_target_partition_filter_maps_unpartitioned_and_not_derived_to_none() {
+        assert_eq!(
+            AffectedTargetPartitions::Unpartitioned.to_target_partition_filter(),
+            crate::engine::mv::partition::TargetPartitionFilter::None
+        );
+        assert_eq!(
+            AffectedTargetPartitions::not_derived("x").to_target_partition_filter(),
+            crate::engine::mv::partition::TargetPartitionFilter::None
         );
     }
 
