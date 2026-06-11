@@ -32,8 +32,8 @@ pub mod mem_tracker;
 pub mod profile;
 pub(crate) mod query_cancel;
 pub mod query_context;
-pub(crate) mod query_state;
 pub mod query_result;
+pub(crate) mod query_state;
 pub(crate) mod registry_cleanup;
 pub(crate) mod write_coordinator;
 // Result buffer fetch infrastructure is accessed from C++ shim FFI path.
@@ -45,7 +45,7 @@ pub mod runtime_state;
 pub mod scan_executor;
 pub(crate) mod scheduler;
 pub mod sink_commit;
-pub mod start_epoch;
 pub mod starlet_shard_registry;
+pub mod start_epoch;
 pub mod thread_cpu_time;
 pub(crate) mod write_operation_lifecycle;

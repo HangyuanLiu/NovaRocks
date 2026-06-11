@@ -40,7 +40,7 @@ use crate::connector::starrocks::starmgr;
 use crate::novarocks_logging::{error, info, warn};
 use crate::runtime::starlet_shard_registry;
 use crate::service::internal_rpc;
-use crate::service::{load_tracking_http, stream_load_http};
+use crate::service::{load_tracking_http, metrics_http, stream_load_http};
 
 pub use crate::service::grpc_proto as proto;
 
@@ -623,6 +623,7 @@ fn build_novarocks_http_app(grpc_routes: Routes) -> Router {
             "/api/_load_tracking/:hi/:lo",
             get(load_tracking_http::handle_load_tracking_log),
         )
+        .route("/metrics", get(metrics_http::handle_metrics))
 }
 
 #[tonic::async_trait]
@@ -1084,6 +1085,7 @@ fn start_standalone_grpc_server(
                     "/api/_load_tracking/:hi/:lo",
                     get(load_tracking_http::handle_load_tracking_log),
                 )
+                .route("/metrics", get(metrics_http::handle_metrics))
                 .fallback(grpc_unimplemented_fallback);
             let server = axum::serve(listener, app).with_graceful_shutdown(async move {
                     while !*shutdown.borrow() {
@@ -1360,9 +1362,9 @@ mod pr3_tests {
     }
 
     mod cancel_epoch_tests {
-        use super::super::{CANCEL_FRAGMENT_IGNORED_STALE_EPOCH, GrpcService};
         use super::super::proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc as _;
         use super::super::proto::novarocks::{CancelFragmentRequest, PUniqueId};
+        use super::super::{CANCEL_FRAGMENT_IGNORED_STALE_EPOCH, GrpcService};
         use crate::common::types::UniqueId;
         use crate::runtime::exchange::{
             self, ExchangeKey, set_expected_senders, snapshot_receiver_state,

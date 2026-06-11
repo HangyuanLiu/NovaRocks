@@ -324,6 +324,10 @@ fn run_send_task(task: ExchangeSendTask, inflight: Arc<AtomicUsize>, reserve_byt
         );
     }
 
+    if result.is_ok() {
+        crate::service::metrics_http::observe_exchange_shuffle_bytes(task.payload_bytes);
+    }
+
     if let Err(err) = result {
         task.error_state.set_error(err.clone());
         error!(

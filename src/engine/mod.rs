@@ -21,6 +21,7 @@ use crate::connector::{
     iceberg_namespace_exists, register_existing_iceberg_table,
     register_starrocks_tables_in_catalog, runtime_registered,
 };
+use crate::meta::repository::backend::BackendMetaRepository;
 use crate::meta::repository::iceberg_catalog::{
     IcebergCatalogMetaRepository, IcebergCatalogProperties,
 };
@@ -33,6 +34,7 @@ use crate::meta::repository::starrocks_table::StarRocksTableMetaRepository;
 use crate::meta::repository::starrocks_txn::StarRocksTxnRepository;
 
 pub(crate) mod aggregate;
+pub(crate) mod backend_ops;
 pub(crate) mod backend_resolver;
 pub(crate) mod catalog;
 pub(crate) mod catalog_mgr;
@@ -226,6 +228,7 @@ pub(crate) struct StandaloneState {
     pub(crate) connectors: Arc<RwLock<crate::connector::ConnectorRegistry>>,
     pub(crate) starrocks_table_config: Option<StarRocksTableConfig>,
     pub(crate) metadata_provider: Option<Arc<dyn crate::meta::MetaStoreProvider>>,
+    pub(crate) backend_repo: BackendMetaRepository,
     pub(crate) starrocks_table_repo: StarRocksTableMetaRepository,
     pub(crate) starrocks_txn_repo: StarRocksTxnRepository,
     pub(crate) mv_repo: MvMetaRepository,
@@ -271,6 +274,7 @@ impl Default for StandaloneState {
             connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
             starrocks_table_config: None,
             metadata_provider: None,
+            backend_repo: BackendMetaRepository,
             starrocks_table_repo: StarRocksTableMetaRepository,
             starrocks_txn_repo: StarRocksTxnRepository,
             mv_repo: MvMetaRepository,
@@ -406,6 +410,7 @@ impl StandaloneNovaRocks {
             )),
             starrocks_table_config,
             metadata_provider,
+            backend_repo: BackendMetaRepository,
             starrocks_table_repo: StarRocksTableMetaRepository,
             starrocks_txn_repo: StarRocksTxnRepository,
             mv_repo: MvMetaRepository,
@@ -418,6 +423,9 @@ impl StandaloneNovaRocks {
         });
         register_connector_backends(&inner);
         restore_metadata_if_needed(&inner)?;
+        if role == crate::common::app_config::ClusterRole::Fe {
+            backend_ops::ensure_backend_registry(&inner)?;
+        }
         if inner.starrocks_table_config.is_some() && inner.metadata_provider.is_some() {
             crate::connector::spawn_starrocks_table_erase_worker(Arc::clone(&inner));
         }
@@ -691,6 +699,9 @@ impl StandaloneSession {
             if let Ok(ref peek_parser) =
                 sqlparser::parser::Parser::new(&sr_dialect).try_with_sql(&normalized)
             {
+                use crate::sql::parser::dialect::backend::{
+                    looks_like_add_backend, looks_like_drop_backend, looks_like_show_backends,
+                };
                 use crate::sql::parser::dialect::materialized_view::{
                     looks_like_create_materialized_view, looks_like_drop_materialized_view,
                     looks_like_refresh_materialized_view, looks_like_show_materialized_views,
@@ -705,6 +716,9 @@ impl StandaloneSession {
                     // instead of falling through to sqlparser-rs's permissive
                     // builtin which would silently accept and bypass our checks.
                     || looks_like_truncate_table(peek_parser)
+                    || looks_like_add_backend(peek_parser)
+                    || looks_like_drop_backend(peek_parser)
+                    || looks_like_show_backends(peek_parser)
                 {
                     let mut statements = crate::sql::parser::parse_sql(&normalized)?;
                     let statement = statements
@@ -2060,6 +2074,11 @@ pub(crate) fn dispatch_statement(
                 current_database,
             )
         }
+        Statement::AddBackend(stmt) => crate::engine::backend_ops::execute_add_backend(state, stmt),
+        Statement::DropBackend(stmt) => {
+            crate::engine::backend_ops::execute_drop_backend(state, stmt)
+        }
+        Statement::ShowBackends(_) => crate::engine::backend_ops::execute_show_backends(state),
     }
 }
 
@@ -3123,20 +3142,10 @@ fn coordinated_execution_services(
         .map(|c| c.cluster.role)
         .unwrap_or(ClusterRole::AllInOne);
     let dispatcher = dispatcher_for_role(role)?;
-    // Backend list for the scheduler: FE reads cluster.backends; all-in-one
-    // is the local exchange endpoint; pure BE must not coordinate.
+    // Backend list for the scheduler: FE uses the live registry snapshot;
+    // all-in-one is the local exchange endpoint; pure BE must not coordinate.
     let backends: Vec<SocketAddr> = match role {
-        ClusterRole::Fe => {
-            let cfg = crate::novarocks_config::config().map_err(|e| format!("role=fe: {e}"))?;
-            cfg.cluster
-                .backends
-                .iter()
-                .map(|s| {
-                    s.parse::<SocketAddr>()
-                        .map_err(|e| format!("role=fe: invalid backend '{s}': {e}"))
-                })
-                .collect::<Result<_, _>>()?
-        }
+        ClusterRole::Fe => backend_ops::live_backend_scheduler_endpoints()?,
         ClusterRole::AllInOne => vec![
             format!("127.0.0.1:{exchange_port}")
                 .parse()
@@ -3165,21 +3174,10 @@ pub(crate) fn dispatcher_for_role(
             crate::runtime::dispatcher::InProcessDispatcher::new(),
         )),
         ClusterRole::Fe => {
-            let cfg = crate::novarocks_config::config()
-                .map_err(|e| format!("role=fe: cannot read config: {e}"))?;
-            if cfg.cluster.backends.is_empty() {
-                return Err("role=fe: cluster.backends must not be empty".to_string());
-            }
-            let mut addrs = Vec::with_capacity(cfg.cluster.backends.len());
-            for backend_str in &cfg.cluster.backends {
-                let backend: std::net::SocketAddr = backend_str
-                    .parse()
-                    .map_err(|e| format!("role=fe: invalid backend addr '{backend_str}': {e}"))?;
-                addrs.push(backend);
-            }
-            Ok(Arc::new(crate::runtime::dispatcher::RemoteDispatcher::new(
-                &addrs,
-            )?))
+            let entries = backend_ops::live_backend_dispatch_entries()?;
+            Ok(Arc::new(
+                crate::runtime::dispatcher::RemoteDispatcher::new_with_backend_ids(&entries)?,
+            ))
         }
         ClusterRole::Be => Err("role=be must not enter standalone coordinator".to_string()),
     }
@@ -4174,6 +4172,31 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
+    struct BackendRegistryReset;
+
+    impl BackendRegistryReset {
+        fn new() -> Self {
+            crate::runtime::backend_registry::replace_backend_registry_for_test(None);
+            Self
+        }
+    }
+
+    impl Drop for BackendRegistryReset {
+        fn drop(&mut self) {
+            crate::runtime::backend_registry::replace_backend_registry_for_test(None);
+        }
+    }
+
+    fn string_cell(result: &QueryResult, row: usize, col: usize) -> String {
+        let batch = &result.chunks[0].batch;
+        let array = batch
+            .column(col)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("StringArray column");
+        array.value(row).to_string()
+    }
+
     fn write_test_metadata_config(dir: &TempDir, metadata_path: &str) -> PathBuf {
         let config_path = dir.path().join("novarocks.toml");
         std::fs::write(
@@ -4187,6 +4210,85 @@ path = "{metadata_path}"
         )
         .expect("write metadata config");
         config_path
+    }
+
+    #[test]
+    fn backend_management_sql_add_show_drop_force() {
+        let _registry = BackendRegistryReset::new();
+        let mut cfg = crate::common::app_config::NovaRocksConfig::default();
+        cfg.cluster.role = crate::common::app_config::ClusterRole::Fe;
+        cfg.cluster.backends.clear();
+        let engine = StandaloneNovaRocks::open_with_config(StandaloneOptions::default(), cfg)
+            .expect("open FE engine");
+        let session = engine.session();
+
+        session
+            .execute("ADD BACKEND '127.0.0.1:19170'")
+            .expect("ADD BACKEND");
+        let result = session.query("SHOW BACKENDS").expect("SHOW BACKENDS");
+        assert_eq!(result.row_count(), 1);
+        assert_eq!(string_cell(&result, 0, 1), "127.0.0.1");
+        assert_eq!(string_cell(&result, 0, 2), "19170");
+        assert_eq!(string_cell(&result, 0, 3), "Registering");
+
+        session
+            .execute("DROP BACKEND '127.0.0.1:19170' FORCE")
+            .expect("DROP BACKEND FORCE");
+        let result = session.query("SHOW BACKENDS").expect("SHOW BACKENDS");
+        assert_eq!(result.row_count(), 0);
+    }
+
+    #[test]
+    fn backend_management_sql_restores_persisted_backend_metadata() {
+        let _registry = BackendRegistryReset::new();
+        let dir = TempDir::new().expect("tempdir");
+        let metadata_path = dir.path().join("meta.sqlite");
+        let mut cfg = crate::common::app_config::NovaRocksConfig::default();
+        cfg.cluster.role = crate::common::app_config::ClusterRole::Fe;
+        cfg.cluster.backends.clear();
+        cfg.metadata = Some(crate::common::app_config::MetadataConfig {
+            provider: crate::common::app_config::MetadataProviderConfig::Sqlite,
+            path: metadata_path.clone(),
+        });
+
+        let engine =
+            StandaloneNovaRocks::open_with_config(StandaloneOptions::default(), cfg.clone())
+                .expect("open FE engine");
+        engine
+            .session()
+            .execute("ADD BACKEND '127.0.0.1:19172'")
+            .expect("ADD BACKEND");
+        drop(engine);
+
+        crate::runtime::backend_registry::replace_backend_registry_for_test(None);
+        let reopened = StandaloneNovaRocks::open_with_config(StandaloneOptions::default(), cfg)
+            .expect("reopen FE engine");
+        let result = reopened
+            .session()
+            .query("SHOW BACKENDS")
+            .expect("SHOW BACKENDS");
+        assert_eq!(result.row_count(), 1);
+        assert_eq!(string_cell(&result, 0, 1), "127.0.0.1");
+        assert_eq!(string_cell(&result, 0, 2), "19172");
+    }
+
+    #[test]
+    fn add_backend_requires_fe_role_but_show_backends_works_in_all_in_one() {
+        let _registry = BackendRegistryReset::new();
+        let mut cfg = crate::common::app_config::NovaRocksConfig::default();
+        cfg.cluster.role = crate::common::app_config::ClusterRole::AllInOne;
+        let engine = StandaloneNovaRocks::open_with_config(StandaloneOptions::default(), cfg)
+            .expect("open all-in-one engine");
+        let session = engine.session();
+
+        let err = session
+            .execute("ADD BACKEND '127.0.0.1:19171'")
+            .expect_err("ADD BACKEND must require FE role");
+        assert!(err.contains("requires role=fe"), "{err}");
+
+        let result = session.query("SHOW BACKENDS").expect("SHOW BACKENDS");
+        assert_eq!(result.row_count(), 1);
+        assert_eq!(string_cell(&result, 0, 3), "Live");
     }
 
     #[test]
@@ -8551,6 +8653,25 @@ path = "meta/operations.sqlite"
             err.contains("missing_table"),
             "error should come from analyzer/catalog lookup, got: {err}"
         );
+    }
+
+    #[test]
+    fn dispatcher_for_role_fe_uses_live_registry_backend_ids() {
+        let _guard = super::acquire_standalone_test_guard();
+        let _registry = BackendRegistryReset::new();
+        use crate::common::app_config::{ClusterRole, NovaRocksConfig};
+        use crate::runtime::backend_registry::{BackendRegistry, BackendState};
+        let mut cfg = NovaRocksConfig::default();
+        cfg.cluster.role = ClusterRole::Fe;
+        cfg.cluster.backends.clear();
+        crate::common::app_config::install_preloaded_config(cfg);
+
+        let registry = Arc::new(BackendRegistry::new(3));
+        registry.restore_backend(2, "127.0.0.1:19072".parse().unwrap(), BackendState::Live);
+        crate::runtime::backend_registry::replace_backend_registry_for_test(Some(registry));
+
+        let dispatcher = super::dispatcher_for_role(ClusterRole::Fe).expect("dispatcher");
+        assert_eq!(dispatcher.backend_count(), 1);
     }
 
     #[test]

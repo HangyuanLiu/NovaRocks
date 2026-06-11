@@ -23,7 +23,7 @@
 //! over gRPC by index; `FragmentScheduler` (PR-3/PR-4) will choose which
 //! backend each fragment instance lands on.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -604,8 +604,8 @@ impl FragmentDispatcher for InProcessDispatcher {
 // ---------------------------------------------------------------------------
 
 pub struct RemoteDispatcher {
-    clients: Vec<NovaRocksGrpcRemoteClient>,
-    addrs: Vec<std::net::SocketAddr>,
+    clients: BTreeMap<usize, NovaRocksGrpcRemoteClient>,
+    addrs: BTreeMap<usize, std::net::SocketAddr>,
 }
 
 impl RemoteDispatcher {
@@ -614,17 +614,31 @@ impl RemoteDispatcher {
     /// Clients are constructed via `connect_blocking`, which is lazy and cheap
     /// (no TCP dial at construction). Errors if `backends` is empty.
     pub fn new(backends: &[SocketAddr]) -> Result<Self, String> {
+        let entries = backends
+            .iter()
+            .copied()
+            .enumerate()
+            .collect::<Vec<(usize, SocketAddr)>>();
+        Self::new_with_backend_ids(&entries)
+    }
+
+    pub fn new_with_backend_ids(backends: &[(usize, SocketAddr)]) -> Result<Self, String> {
         if backends.is_empty() {
             return Err("RemoteDispatcher requires at least one backend".to_string());
         }
-        let mut clients = Vec::with_capacity(backends.len());
-        for addr in backends {
-            clients.push(NovaRocksGrpcRemoteClient::connect_blocking(*addr)?);
+        let mut clients = BTreeMap::new();
+        let mut addrs = BTreeMap::new();
+        for (backend_id, addr) in backends {
+            if clients.contains_key(backend_id) {
+                return Err(format!("duplicate backend_idx {backend_id}"));
+            }
+            clients.insert(
+                *backend_id,
+                NovaRocksGrpcRemoteClient::connect_blocking(*addr)?,
+            );
+            addrs.insert(*backend_id, *addr);
         }
-        Ok(Self {
-            clients,
-            addrs: backends.to_vec(),
-        })
+        Ok(Self { clients, addrs })
     }
 
     /// The address of `backend_idx`, if in range.
@@ -633,11 +647,11 @@ impl RemoteDispatcher {
     /// correct backend address into `TPlanFragmentDestination` entries when
     /// assigning fragment instances to specific backends.
     pub fn addr_of(&self, backend_idx: usize) -> Option<SocketAddr> {
-        self.addrs.get(backend_idx).copied()
+        self.addrs.get(&backend_idx).copied()
     }
 
     fn check_idx(&self, idx: usize) -> Result<(), String> {
-        if idx >= self.clients.len() {
+        if !self.clients.contains_key(&idx) {
             return Err(format!(
                 "backend_idx {} out of range (have {} backends)",
                 idx,
@@ -645,6 +659,19 @@ impl RemoteDispatcher {
             ));
         }
         Ok(())
+    }
+
+    fn client_and_addr(
+        &self,
+        idx: usize,
+    ) -> Result<(&NovaRocksGrpcRemoteClient, SocketAddr), String> {
+        self.check_idx(idx)?;
+        Ok((
+            self.clients
+                .get(&idx)
+                .expect("client exists after check_idx"),
+            *self.addrs.get(&idx).expect("addr exists after check_idx"),
+        ))
     }
 }
 
@@ -654,7 +681,7 @@ impl FragmentDispatcher for RemoteDispatcher {
         backend_idx: usize,
         params: internal_service::TExecPlanFragmentParams,
     ) -> Result<(), String> {
-        self.check_idx(backend_idx)?;
+        let (client, addr) = self.client_and_addr(backend_idx)?;
         // Counter increments only after a successful check_idx, so only valid-index
         // calls are counted — matches the fault-injection test assumptions.
         let call_index = REMOTE_SUBMIT_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
@@ -667,15 +694,15 @@ impl FragmentDispatcher for RemoteDispatcher {
         }
         let payload = serialize_thrift_binary(&params)
             .map_err(|e| format!("serialize fragment params for remote submit failed: {e}"))?;
-        let resp = self.clients[backend_idx]
+        let resp = client
             .blocking_submit_fragment(SubmitFragmentRequest {
                 exec_plan_fragment_params_thrift: payload,
             })
-            .map_err(|e| format!("BE[{backend_idx}] ({}): {e}", self.addrs[backend_idx]))?;
+            .map_err(|e| format!("BE[{backend_idx}] ({addr}): {e}"))?;
         if resp.status_code != 0 {
             return Err(format!(
                 "remote submit_fragment failed on {}: {}",
-                self.addrs[backend_idx], resp.message
+                addr, resp.message
             ));
         }
         Ok(())
@@ -687,7 +714,7 @@ impl FragmentDispatcher for RemoteDispatcher {
         finst_id: types::TUniqueId,
         max_wait_ms: i64,
     ) -> Result<FetchOutcome, String> {
-        self.check_idx(backend_idx)?;
+        let (client, addr) = self.client_and_addr(backend_idx)?;
         // Counter increments only after a successful check_idx, so only valid-index
         // calls are counted — matches the fault-injection test assumptions.
         let call_index = REMOTE_FETCH_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
@@ -698,7 +725,7 @@ impl FragmentDispatcher for RemoteDispatcher {
             let _ = std::io::Write::flush(&mut std::io::stdout());
             return Ok(FetchOutcome::NotReady);
         }
-        let resp = self.clients[backend_idx]
+        let resp = client
             .blocking_fetch_result(FetchResultRequest {
                 finst_id: Some(PUniqueId {
                     hi: finst_id.hi,
@@ -706,11 +733,11 @@ impl FragmentDispatcher for RemoteDispatcher {
                 }),
                 max_wait_ms,
             })
-            .map_err(|e| format!("BE[{backend_idx}] ({}): {e}", self.addrs[backend_idx]))?;
+            .map_err(|e| format!("BE[{backend_idx}] ({addr}): {e}"))?;
         let status = FetchStatus::try_from(resp.status).map_err(|_| {
             format!(
                 "BE[{backend_idx}] ({}): remote fetch_result returned unknown status {}",
-                self.addrs[backend_idx], resp.status
+                addr, resp.status
             )
         })?;
         match status {
@@ -728,7 +755,7 @@ impl FragmentDispatcher for RemoteDispatcher {
         if self.check_idx(backend_idx).is_err() {
             return;
         }
-        let addr = self.addrs[backend_idx];
+        let addr = self.addrs[&backend_idx];
         let req = CancelFragmentRequest {
             finst_ids: finst_ids
                 .iter()
@@ -1536,6 +1563,15 @@ mod tests {
         let a2 = spawn_mock_server(Arc::new(MockState::default()));
         let d = RemoteDispatcher::new(&[a1, a2]).expect("construct");
         assert_eq!(d.backend_count(), 2);
+    }
+
+    #[test]
+    fn remote_dispatcher_can_route_sparse_backend_ids() {
+        let a = spawn_mock_server(Arc::new(MockState::default()));
+        let d = RemoteDispatcher::new_with_backend_ids(&[(2, a)]).expect("construct");
+        assert_eq!(d.backend_count(), 1);
+        assert_eq!(d.addr_of(2), Some(a));
+        assert_eq!(d.addr_of(0), None);
     }
 
     #[test]

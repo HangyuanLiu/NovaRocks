@@ -6,7 +6,7 @@ use std::sync::{Mutex, MutexGuard, mpsc};
 use std::time::{Duration, Instant};
 
 use mysql::prelude::Queryable;
-use mysql::{Conn as MysqlConn, OptsBuilder};
+use mysql::{Conn as MysqlConn, OptsBuilder, Row};
 use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 
 static CLUSTER_MVP_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -512,6 +512,64 @@ fn send_mysql_query_and_disconnect(port: u16, sql: &str) {
         .expect("shutdown raw mysql client");
 }
 
+fn show_backends(conn: &mut MysqlConn) -> Vec<Row> {
+    conn.query("SHOW BACKENDS").expect("SHOW BACKENDS")
+}
+
+fn backend_row_by_port(rows: &[Row], port: u16) -> Option<&Row> {
+    let port = port.to_string();
+    rows.iter()
+        .find(|row| row.get::<String, usize>(2).as_deref() == Some(port.as_str()))
+}
+
+fn wait_for_backend_state(conn: &mut MysqlConn, port: u16, expected_state: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let rows = show_backends(conn);
+        if let Some(row) = backend_row_by_port(&rows, port) {
+            if row.get::<String, usize>(3).as_deref() == Some(expected_state) {
+                return;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "backend {port} did not reach state {expected_state}; rows={rows:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_until_backend_removed(conn: &mut MysqlConn, port: u16) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let rows = show_backends(conn);
+        if backend_row_by_port(&rows, port).is_none() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "backend {port} was not removed; rows={rows:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn fetch_http_text(port: u16, path: &str) -> String {
+    let url = format!("http://127.0.0.1:{port}{path}");
+    reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("build reqwest client")
+        .get(&url)
+        .send()
+        .unwrap_or_else(|err| panic!("GET {url} failed: {err}"))
+        .error_for_status()
+        .unwrap_or_else(|err| panic!("GET {url} status failed: {err}"))
+        .text()
+        .unwrap_or_else(|err| panic!("read {url} text failed: {err}"))
+}
+
 #[test]
 fn cross_process_remote_dispatcher_smoke() {
     let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
@@ -610,6 +668,105 @@ backends = ["127.0.0.1:{be_starlet_port}"]
         !err_str.is_empty(),
         "expected a non-empty error when BE is unreachable, got empty string"
     );
+}
+
+#[test]
+fn d4_dynamic_backend_sql_and_metrics_smoke() {
+    let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
+    if !binary.exists() {
+        return;
+    }
+    let _lock = lock_cluster_mvp();
+
+    let be_http = ReservedPort::new();
+    let be_starlet = ReservedPort::new();
+    let fe_mysql = ReservedPort::new();
+    let fe_http = ReservedPort::new();
+    let fe_starlet = ReservedPort::new();
+    let be_http_port = be_http.port();
+    let be_starlet_port = be_starlet.port();
+    let fe_mysql_port = fe_mysql.port();
+    let fe_http_port = fe_http.port();
+    let fe_starlet_port = fe_starlet.port();
+
+    let be_config = write_config(
+        "d4-be",
+        &format!(
+            r#"
+[server]
+host = "127.0.0.1"
+http_port = {be_http_port}
+starlet_port = {be_starlet_port}
+
+[cluster]
+role = "be"
+"#
+        ),
+    );
+    let fe_config = write_config(
+        "d4-fe",
+        &format!(
+            r#"
+[server]
+host = "127.0.0.1"
+http_port = {fe_http_port}
+starlet_port = {fe_starlet_port}
+
+[standalone_server]
+mysql_port = {fe_mysql_port}
+
+[cluster]
+role = "fe"
+backends = []
+heartbeat_interval_ms = 200
+heartbeat_timeout_retries = 2
+"#
+        ),
+    );
+
+    let _ = be_http.release();
+    let _ = be_starlet.release();
+    let mut be = ProcessGuard::spawn(be_config.path());
+    be.wait_for_ready("NOVAROCKS_READY role=be");
+
+    let _ = fe_mysql.release();
+    let _ = fe_http.release();
+    let _ = fe_starlet.release();
+    let mut fe = ProcessGuard::spawn(fe_config.path());
+    fe.wait_for_ready("NOVAROCKS_READY mysql_port=");
+
+    let mut conn = connect_mysql(fe_mysql_port);
+    assert!(
+        show_backends(&mut conn).is_empty(),
+        "FE should start with an empty dynamic backend registry"
+    );
+
+    let backend_addr = format!("127.0.0.1:{be_starlet_port}");
+    conn.query_drop(format!("ADD BACKEND '{backend_addr}'"))
+        .expect("ADD BACKEND");
+    wait_for_backend_state(&mut conn, be_starlet_port, "Live");
+
+    let rows: Vec<i64> = conn
+        .query(coordinated_query_sql())
+        .expect("coordinated query must succeed after ADD BACKEND");
+    assert_eq!(rows, vec![1i64, 2i64]);
+
+    let metrics = fetch_http_text(fe_http_port, "/metrics");
+    for needle in [
+        "novarocks_fragment_scheduled_total",
+        "novarocks_exchange_shuffle_bytes_total",
+        "novarocks_heartbeat_rtt_seconds",
+        "novarocks_live_backends",
+    ] {
+        assert!(
+            metrics.contains(needle),
+            "metrics scrape must contain {needle}; body={metrics}"
+        );
+    }
+
+    conn.query_drop(format!("DROP BACKEND '{backend_addr}' FORCE"))
+        .expect("DROP BACKEND FORCE");
+    wait_until_backend_removed(&mut conn, be_starlet_port);
 }
 
 #[test]

@@ -34,6 +34,7 @@ pub(crate) mod internal_rpc;
 pub(crate) mod internal_rpc_client;
 pub mod internal_service;
 pub mod load_tracking_http;
+pub(crate) mod metrics_http;
 pub mod report_worker;
 pub(crate) mod standalone_exec_state_reporter;
 pub mod stream_load;

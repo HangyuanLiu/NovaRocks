@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 
-static GLOBAL_REGISTRY: OnceLock<Arc<BackendRegistry>> = OnceLock::new();
+static GLOBAL_REGISTRY: OnceLock<Mutex<Option<Arc<BackendRegistry>>>> = OnceLock::new();
 
 pub type BeId = u32;
 
@@ -113,6 +113,10 @@ impl BackendRegistry {
     }
 
     pub fn add_backend(&self, endpoint: SocketAddr) -> BeId {
+        self.add_backend_with_state(endpoint, BackendState::Registering)
+    }
+
+    pub fn add_backend_with_state(&self, endpoint: SocketAddr, state: BackendState) -> BeId {
         let mut inner = self.inner.lock().unwrap();
         if let Some(be_id) = inner.endpoint_to_id.get(&endpoint) {
             return *be_id;
@@ -128,7 +132,7 @@ impl BackendRegistry {
             BackendEntry {
                 be_id,
                 endpoint,
-                state: BackendState::Registering,
+                state,
                 start_epoch: 0,
                 last_heartbeat_ms: 0,
                 missed_heartbeats: 0,
@@ -140,6 +144,33 @@ impl BackendRegistry {
         );
         inner.endpoint_to_id.insert(endpoint, be_id);
         be_id
+    }
+
+    pub fn restore_backend(&self, be_id: BeId, endpoint: SocketAddr, state: BackendState) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.entries.contains_key(&be_id) {
+            return;
+        }
+        if inner.endpoint_to_id.contains_key(&endpoint) {
+            return;
+        }
+        inner.next_be_id = inner.next_be_id.max(be_id.saturating_add(1));
+        inner.entries.insert(
+            be_id,
+            BackendEntry {
+                be_id,
+                endpoint,
+                state,
+                start_epoch: 0,
+                last_heartbeat_ms: 0,
+                missed_heartbeats: 0,
+                last_err: None,
+                version: String::new(),
+                num_cores: 0,
+                scheduled_fragments: 0,
+            },
+        );
+        inner.endpoint_to_id.insert(endpoint, be_id);
     }
 
     pub fn seed_from_config(&self, endpoints: &[SocketAddr]) {
@@ -252,6 +283,13 @@ impl BackendRegistry {
         }
     }
 
+    pub fn record_scheduled_fragment(&self, be_id: BeId) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(entry) = inner.entries.get_mut(&be_id) {
+            entry.scheduled_fragments = entry.scheduled_fragments.saturating_add(1);
+        }
+    }
+
     pub fn count_live(&self) -> usize {
         self.inner
             .lock()
@@ -261,16 +299,40 @@ impl BackendRegistry {
             .filter(|entry| entry.state == BackendState::Live)
             .count()
     }
+
+    pub fn count_by_state(&self, state: BackendState) -> usize {
+        self.inner
+            .lock()
+            .unwrap()
+            .entries
+            .values()
+            .filter(|entry| entry.state == state)
+            .count()
+    }
 }
 
 /// Install the process registry (role=fe only). Idempotent: first writer wins.
-pub fn install_backend_registry(reg: Arc<BackendRegistry>) {
-    let _ = GLOBAL_REGISTRY.set(reg);
+pub fn install_backend_registry(reg: Arc<BackendRegistry>) -> bool {
+    let mut guard = global_registry_cell().lock().unwrap();
+    if guard.is_none() {
+        *guard = Some(reg);
+        return true;
+    }
+    false
 }
 
 /// The process registry, if installed (role=fe).
 pub fn backend_registry() -> Option<Arc<BackendRegistry>> {
-    GLOBAL_REGISTRY.get().cloned()
+    global_registry_cell().lock().unwrap().clone()
+}
+
+fn global_registry_cell() -> &'static Mutex<Option<Arc<BackendRegistry>>> {
+    GLOBAL_REGISTRY.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+pub fn replace_backend_registry_for_test(reg: Option<Arc<BackendRegistry>>) {
+    *global_registry_cell().lock().unwrap() = reg;
 }
 
 #[cfg(test)]

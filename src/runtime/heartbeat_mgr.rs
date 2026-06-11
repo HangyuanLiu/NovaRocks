@@ -19,7 +19,7 @@ use std::net::SocketAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::runtime::backend_registry::{BackendRegistry, BeId, HeartbeatOutcome, RegistryEvent};
 use crate::service::grpc_client::{NovaRocksGrpcRemoteClient, proto};
@@ -41,22 +41,25 @@ where
 }
 
 pub fn grpc_heartbeat(be_id: BeId, endpoint: SocketAddr) -> HeartbeatOutcome {
-    let client = match NovaRocksGrpcRemoteClient::connect_blocking(endpoint) {
-        Ok(client) => client,
-        Err(err) => return HeartbeatOutcome::Failed { err },
-    };
-
-    let req = proto::novarocks::HeartbeatRequest {
-        assigned_be_id: be_id,
-        fe_epoch: 0,
-    };
-    match client.blocking_heartbeat(req) {
-        Ok(resp) if resp.status_code == 0 => {
-            heartbeat_response_to_outcome(resp, current_time_millis())
+    let start = Instant::now();
+    let outcome = match NovaRocksGrpcRemoteClient::connect_blocking(endpoint) {
+        Ok(client) => {
+            let req = proto::novarocks::HeartbeatRequest {
+                assigned_be_id: be_id,
+                fe_epoch: 0,
+            };
+            match client.blocking_heartbeat(req) {
+                Ok(resp) if resp.status_code == 0 => {
+                    heartbeat_response_to_outcome(resp, current_time_millis())
+                }
+                Ok(resp) => heartbeat_response_to_outcome(resp, 0),
+                Err(err) => HeartbeatOutcome::Failed { err },
+            }
         }
-        Ok(resp) => heartbeat_response_to_outcome(resp, 0),
         Err(err) => HeartbeatOutcome::Failed { err },
-    }
+    };
+    crate::service::metrics_http::observe_heartbeat_rtt(start.elapsed());
+    outcome
 }
 
 fn heartbeat_response_to_outcome(

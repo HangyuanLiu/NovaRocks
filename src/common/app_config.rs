@@ -107,11 +107,6 @@ impl ClusterConfig {
     pub fn validate(&self) -> Result<(), String> {
         match self.role {
             ClusterRole::Fe => {
-                if self.backends.is_empty() {
-                    return Err(
-                        "role=fe requires at least one backend in [cluster].backends".into(),
-                    );
-                }
                 let mut seen = std::collections::HashSet::new();
                 for b in &self.backends {
                     let canonical = b
@@ -2027,18 +2022,16 @@ backends = ["not-a-socket-addr"]
     }
 
     #[test]
-    fn test_cluster_role_fe_empty_backends_still_rejected() {
+    fn test_cluster_role_fe_empty_backends_allowed() {
         let toml = r#"
 [cluster]
 role = "fe"
 backends = []
 "#;
         let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse");
-        let err = cfg
-            .cluster
+        cfg.cluster
             .validate()
-            .expect_err("empty backends still rejected");
-        assert!(err.contains("at least one") || err.contains("backends"));
+            .expect("role=fe may start with no configured backends");
     }
 
     #[test]

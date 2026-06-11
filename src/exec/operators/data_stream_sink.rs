@@ -2253,20 +2253,8 @@ mod tests {
     fn exchange_send_task_carries_distinct_dest_and_sender_finsts() {
         let task = make_test_exchange_send_task();
 
-        assert_eq!(
-            task.finst_id,
-            UniqueId {
-                hi: 91,
-                lo: 92
-            }
-        );
-        assert_eq!(
-            task.sender_finst_id,
-            UniqueId {
-                hi: 81,
-                lo: 82
-            }
-        );
+        assert_eq!(task.finst_id, UniqueId { hi: 91, lo: 92 });
+        assert_eq!(task.sender_finst_id, UniqueId { hi: 81, lo: 82 });
     }
 
     #[test]

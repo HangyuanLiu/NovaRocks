@@ -59,6 +59,7 @@ tonic = { version = "0.12", features = ["transport"] }
 axum = "0.7"
 tokio-stream = "0.1"
 ctrlc = "3.4"
+prometheus = "0.13"
 base64 = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 md-5 = "0.10"

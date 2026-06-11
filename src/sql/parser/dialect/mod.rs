@@ -1,4 +1,5 @@
 pub(crate) mod alter_iceberg_ref;
+pub(crate) mod backend;
 pub(crate) mod create_catalog;
 pub(crate) mod create_table;
 pub(crate) mod drop;

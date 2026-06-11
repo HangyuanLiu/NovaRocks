@@ -1671,7 +1671,7 @@ mod tests {
         common::types::UniqueId,
         data_sinks, descriptors, exprs, internal_service, partitions, plan_nodes, planner,
         runtime::{
-            exchange::{set_expected_senders, snapshot_receiver_state, ExchangeKey},
+            exchange::{ExchangeKey, set_expected_senders, snapshot_receiver_state},
             query_context::{QueryId, query_context_manager},
             result_buffer::{self, FetchErrorKind, TryFetchResult},
         },

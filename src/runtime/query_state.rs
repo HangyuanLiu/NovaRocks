@@ -180,6 +180,21 @@ impl InFlightQueryTable {
         self.on_backend_failed(backend_idx, format!("backend {backend_idx} lost"))
     }
 
+    pub(crate) fn backend_has_inflight(&self, backend_idx: usize) -> bool {
+        self.inner
+            .lock()
+            .expect("query_state lock")
+            .queries
+            .values()
+            .filter(|entry| entry.state == QueryState::Running)
+            .any(|entry| {
+                entry
+                    .finsts
+                    .values()
+                    .any(|record| record.backend_idx == backend_idx && !record.done)
+            })
+    }
+
     pub(crate) fn on_backend_failed(&self, backend_idx: usize, reason: String) -> Vec<QueryId> {
         let mut guard = self.inner.lock().expect("query_state lock");
         let mut failed = Vec::new();
@@ -281,6 +296,15 @@ mod tests {
         );
         assert_eq!(t.state(qid(13)), Some(QueryState::Running));
         assert_eq!(t.failure_reason(qid(13)), None);
+    }
+
+    #[test]
+    fn backend_has_inflight_ignores_completed_fragments() {
+        let t = InFlightQueryTable::new();
+        t.register(qid(14), fid(140), 4);
+        assert!(t.backend_has_inflight(4));
+        t.on_fragment_done(fid(140), Ok(()));
+        assert!(!t.backend_has_inflight(4));
     }
 
     #[test]

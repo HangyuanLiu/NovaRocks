@@ -50,14 +50,9 @@ pub use service::internal_service::{
     cancel, submit_exec_batch_plan_fragments, submit_exec_plan_fragment,
 };
 
-pub(crate) fn cancel_query_by_id(
-    query_id: crate::runtime::query_context::QueryId,
-    reason: String,
-) {
-    let finsts = crate::runtime::query_context::query_context_manager().cancel_query(
-        query_id,
-        reason,
-    );
+pub(crate) fn cancel_query_by_id(query_id: crate::runtime::query_context::QueryId, reason: String) {
+    let finsts =
+        crate::runtime::query_context::query_context_manager().cancel_query(query_id, reason);
     let cleanup: Vec<_> = finsts
         .into_iter()
         .map(|id| {

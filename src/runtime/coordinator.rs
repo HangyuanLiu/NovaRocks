@@ -27,8 +27,8 @@ use crate::partitions;
 use crate::planner;
 use crate::runtime::dispatcher::{FetchOutcome, FragmentDispatcher};
 use crate::runtime::exec_params::build_exec_plan_fragment_params;
-use crate::runtime::scheduler::FragmentScheduler;
 use crate::runtime::query_state::QueryState;
+use crate::runtime::scheduler::FragmentScheduler;
 use crate::runtime::write_coordinator::{
     WriteAbortInput, WriteCommitInput, WriteCoordinator, WriterKey, register_query,
     unregister_query,
@@ -763,6 +763,11 @@ pub(crate) fn submit_and_fetch_loop(
         if let Err(e) = dispatcher.submit_fragment(backend_idx, p) {
             tracker.cancel_all(dispatcher.as_ref());
             return Err(e);
+        }
+        crate::service::metrics_http::observe_fragment_scheduled();
+        if let Some(registry) = crate::runtime::backend_registry::backend_registry() {
+            registry
+                .record_scheduled_fragment(backend_idx as crate::runtime::backend_registry::BeId);
         }
         tracker.record_submitted(backend_idx, finst_id.clone());
         crate::runtime::query_state::in_flight_table().register(

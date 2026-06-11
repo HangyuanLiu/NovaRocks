@@ -228,6 +228,7 @@ fn be_role_start_warning(port_override: Option<u16>) -> Option<String> {
 /// Dial every backend address in `backends` with a 3-second TCP timeout.
 /// Returns `Ok(())` if all are reachable, or an `Err` whose message identifies
 /// the failing backend index and address: `"failed to dial backend {idx} ({addr}): {e}"`.
+#[cfg(test)]
 pub(crate) fn probe_all_backends(backends: &[String]) -> Result<(), String> {
     for (idx, b) in backends.iter().enumerate() {
         let addr: std::net::SocketAddr = b
@@ -250,26 +251,18 @@ fn dispatch_standalone_role(
 ) -> anyhow::Result<()> {
     match role {
         novarocks::common::app_config::ClusterRole::AllInOne => run_all_in_one(cfg, port_override),
-        novarocks::common::app_config::ClusterRole::Fe => {
-            if cfg.cluster.backends.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "role=fe: at least one backend must be configured in [cluster].backends"
-                ));
-            }
-            probe_all_backends(&cfg.cluster.backends)
-                .map_err(|e| anyhow::anyhow!("role=fe: {e}"))?;
-            run_all_in_one(cfg, port_override)
-        }
+        novarocks::common::app_config::ClusterRole::Fe => run_all_in_one(cfg, port_override),
         novarocks::common::app_config::ClusterRole::Be => {
             if let Some(warn) = be_role_start_warning(port_override) {
                 eprintln!("WARN: {warn}");
             }
             let host = cfg.server.host.clone();
             let starlet_port = cfg.server.starlet_port;
+            let advertised = network::advertise_endpoint_for_config(&cfg)
+                .map_err(|e| anyhow::anyhow!("role=be: {e}"))?;
+            let advertised_addr = advertised_probe_addr(&advertised.host, advertised.port)
+                .map_err(|e| anyhow::anyhow!("role=be: {e}"))?;
             let pid = std::process::id();
-            let starlet_addr: std::net::SocketAddr =
-                be_readiness_probe_addr(&host, starlet_port)
-                    .map_err(|e| anyhow::anyhow!("role=be: {e}"))?;
             novarocks::common::app_config::install_preloaded_config(cfg);
             // Spec (PR-4): standalone BE exposes NovaRocksGrpc
             // (SubmitFragment/FetchResult/CancelFragment/Exchange) on starlet_port.
@@ -279,9 +272,16 @@ fn dispatch_standalone_role(
                     "role=be: failed to start NovaRocksGrpc server on {host}:{starlet_port}: {e}"
                 )
             })?;
-            wait_for_tcp_ready(starlet_addr, Duration::from_secs(5), "novarocks grpc")
-                .map_err(|e| anyhow::anyhow!("role=be: {e}"))?;
-            println!("NOVAROCKS_READY role=be starlet_port={starlet_port} pid={pid}");
+            wait_for_tcp_ready(
+                advertised_addr,
+                Duration::from_secs(5),
+                "advertised endpoint",
+            )
+            .map_err(|e| anyhow::anyhow!("role=be: failed to reach advertised endpoint: {e}"))?;
+            println!(
+                "NOVAROCKS_READY role=be starlet_port={starlet_port} advertise_host={} advertise_port={} pid={pid}",
+                advertised.host, advertised.port
+            );
             let (_tx, rx) = std::sync::mpsc::channel::<()>();
             rx.recv().ok();
             Ok(())
@@ -396,6 +396,7 @@ fn health_check_host(bind_host: &str) -> String {
 /// Builds a `SocketAddr` for the BE readiness probe, correctly handling IPv6
 /// hosts by using `SocketAddr` construction via `IpAddr` rather than string
 /// concatenation, which produces invalid `::1:PORT` for IPv6.
+#[cfg(test)]
 fn be_readiness_probe_addr(bind_host: &str, port: u16) -> Result<std::net::SocketAddr, String> {
     let probe_host = health_check_host(bind_host);
     // Strip brackets so bare IPv6 addresses can be parsed as IpAddr.
@@ -414,6 +415,15 @@ fn be_readiness_probe_addr(bind_host: &str, port: u16) -> Result<std::net::Socke
                 .parse::<std::net::SocketAddr>()
                 .map_err(|e| format!("invalid BE readiness probe addr '{bracketed}': {e}"))
         })
+}
+
+fn advertised_probe_addr(host: &str, port: u16) -> Result<std::net::SocketAddr, String> {
+    let host = host.trim().trim_matches(|c| c == '[' || c == ']');
+    (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("invalid advertised endpoint {host}:{port}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("advertised endpoint {host}:{port} resolved no addresses"))
 }
 
 fn heartbeat_ready(host: &str, port: u16) -> Result<(), String> {
@@ -764,8 +774,8 @@ fn main() {
             };
 
             let server = &cfg.server;
-            let advertise_host =
-                network::advertise_host_for_server(server).expect("resolve advertise host");
+            let advertise_endpoint =
+                network::advertise_endpoint_for_config(&cfg).expect("resolve advertise endpoint");
 
             novarocks::service::frontend_rpc::init_frontend_rpc_manager();
 
@@ -776,12 +786,12 @@ fn main() {
             // Start Rust heartbeat service
             let heartbeat_cfg = novarocks::service::heartbeat_service::HeartbeatConfig {
                 host: server.host.clone(),
-                advertise_host: advertise_host.clone(),
+                advertise_host: advertise_endpoint.host.clone(),
                 heartbeat_port: server.heartbeat_port,
                 be_port: server.be_port,
                 brpc_port: server.brpc_port,
                 http_port: server.http_port,
-                starlet_port: server.starlet_port,
+                starlet_port: advertise_endpoint.port,
             };
             novarocks::service::heartbeat_service::start_heartbeat_server(heartbeat_cfg)
                 .expect("start heartbeat server");
@@ -811,9 +821,10 @@ fn main() {
             }
 
             println!(
-                "novarocksd started (bind_host={}, advertise_host={}, heartbeat_port={}, be_port={}, brpc_port={}, http_port={}, starlet_port={})",
+                "novarocksd started (bind_host={}, advertise_host={}, advertise_port={}, heartbeat_port={}, be_port={}, brpc_port={}, http_port={}, starlet_port={})",
                 server.host,
-                advertise_host,
+                advertise_endpoint.host,
+                advertise_endpoint.port,
                 server.heartbeat_port,
                 server.be_port,
                 server.brpc_port,
@@ -1042,17 +1053,16 @@ mod tests {
     }
 
     #[test]
-    fn test_dispatch_role_fe_with_no_backend_errors() {
+    fn test_dispatch_role_fe_with_no_backend_enters_coordinator() {
         let mut cfg = novarocks::common::app_config::NovaRocksConfig::default();
         cfg.cluster.backends.clear();
-        let err = dispatch_standalone_role(
+        dispatch_standalone_role(
             novarocks::common::app_config::ClusterRole::Fe,
             cfg,
             None,
-            |_, _| unreachable!("all-in-one should not be called"),
+            |_, _| Ok(()),
         )
-        .expect_err("fe with no backend should error");
-        assert!(err.to_string().contains("role=fe"));
+        .expect("role=fe may start without configured backends");
     }
 
     // --- PR-4 spec compliance tests ---
@@ -1100,10 +1110,10 @@ mod tests {
         drop(l2);
     }
 
-    /// D2: if one backend in a multi-backend list is unreachable, dispatch errors
-    /// with a message that names the dead backend port.
+    /// D4: FE startup does not synchronously dial configured backends; the
+    /// dynamic registry and heartbeat/query paths own liveness.
     #[test]
-    fn dispatch_fe_one_unreachable_backend_fails_with_addr_in_message() {
+    fn dispatch_fe_one_unreachable_backend_still_enters_coordinator() {
         let live = std::net::TcpListener::bind("127.0.0.1:0").expect("bind live listener");
         let live_addr = live.local_addr().expect("live addr");
         let dead = std::net::TcpListener::bind("127.0.0.1:0").expect("bind dead listener");
@@ -1111,19 +1121,13 @@ mod tests {
         drop(dead);
         let mut cfg = novarocks::common::app_config::NovaRocksConfig::default();
         cfg.cluster.backends = vec![live_addr.to_string(), format!("127.0.0.1:{dead_port}")];
-        let err = dispatch_standalone_role(
+        dispatch_standalone_role(
             novarocks::common::app_config::ClusterRole::Fe,
             cfg,
             None,
-            |_, _| unreachable!("must not reach run_all_in_one with a dead backend"),
+            |_, _| Ok(()),
         )
-        .expect_err("fe with an unreachable backend must error");
-        let msg = err.to_string();
-        assert!(msg.contains("role=fe"), "must mention role=fe: {msg}");
-        assert!(
-            msg.contains(&dead_port.to_string()),
-            "must name the failing backend port: {msg}"
-        );
+        .expect("role=fe startup should not synchronously dial backends");
         drop(live);
     }
 
@@ -1234,9 +1238,9 @@ backends = ["{backend_addr}"]
     }
 
     #[test]
-    fn test_config_file_fe_zero_backends_fails_validation_before_dispatch() {
-        // Config declares role=fe with zero backends — invalid. Startup must fail
-        // before any dispatch happens.
+    fn test_config_file_fe_zero_backends_allowed_before_dispatch() {
+        // Config declares role=fe with zero backends. D4 allows this because
+        // backend membership is managed dynamically through SQL and metadata.
         let toml = r#"
 [cluster]
 role = "fe"
@@ -1248,15 +1252,10 @@ backends = []
             role: None,
             mysql_port: None,
         };
-        let result = load_config_and_resolve_role(&cli);
-        let err = match result {
-            Err(e) => e,
-            Ok(_) => panic!("fe with zero backends must fail validation"),
-        };
-        assert!(
-            err.to_string().contains("backends"),
-            "unexpected error: {err}"
-        );
+        let (cfg, role, _) =
+            load_config_and_resolve_role(&cli).expect("fe with zero backends must load");
+        assert_eq!(role, novarocks::common::app_config::ClusterRole::Fe);
+        assert!(cfg.cluster.backends.is_empty());
     }
 
     #[test]
