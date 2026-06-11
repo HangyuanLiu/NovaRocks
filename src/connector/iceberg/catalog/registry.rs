@@ -156,9 +156,6 @@ impl IcebergCatalogEntry {
     /// filesystem / object-store warehouse layout (Hadoop / Memory). These
     /// catalogs route namespace + table operations through the iceberg-rust
     /// `Catalog` trait via `build_iceberg_catalog`.
-    // Wired into the namespace/table branch points in a follow-up task; the
-    // catalog-kind plumbing lands first.
-    #[allow(dead_code)]
     pub(crate) fn uses_remote_catalog(&self) -> bool {
         matches!(
             self.kind,
@@ -777,7 +774,7 @@ pub(crate) fn load_table(
             .map_err(|e| format!("build iceberg table ident: {e}"))?;
         block_on_iceberg(async { catalog.load_table(&ident).await })
             .map_err(|e| format!("load iceberg table runtime failed: {e}"))?
-            .map_err(|e| format_rest_load_table_error(&ident, &ns_name, &tbl_name, e))?
+            .map_err(|e| format_remote_load_table_error(&ident, &ns_name, &tbl_name, e))?
     } else if entry.s3_config.is_some() {
         // S3 path: discover metadata from S3 directly
         let (metadata_file_name, metadata_bytes) =
@@ -923,7 +920,7 @@ pub(crate) fn current_schema_id(
             .map_err(|e| format!("build iceberg table ident: {e}"))?;
         let table = block_on_iceberg(async { catalog.load_table(&ident).await })
             .map_err(|e| format!("load iceberg table runtime failed: {e}"))?
-            .map_err(|e| format_rest_load_table_error(&ident, &ns_name, &tbl_name, e))?;
+            .map_err(|e| format_remote_load_table_error(&ident, &ns_name, &tbl_name, e))?;
         return Ok(table.metadata().current_schema_id());
     }
 
@@ -1903,7 +1900,7 @@ fn latest_table_metadata_location_local(
     Ok(path_to_file_uri(&metadata_dir.join(latest)))
 }
 
-fn format_rest_load_table_error<E: fmt::Display>(
+fn format_remote_load_table_error<E: fmt::Display>(
     ident: &TableIdent,
     ns_name: &str,
     tbl_name: &str,
@@ -1913,7 +1910,7 @@ fn format_rest_load_table_error<E: fmt::Display>(
     if message.contains("Tried to load a table that does not exist") {
         format!("unknown table: {ns_name}.{tbl_name}")
     } else {
-        format!("load REST iceberg table {ident}: {message}")
+        format!("load iceberg table {ident}: {message}")
     }
 }
 
