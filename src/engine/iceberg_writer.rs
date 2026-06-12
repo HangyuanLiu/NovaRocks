@@ -333,12 +333,14 @@ pub(crate) fn build_row_lineage_data_sink_spec(
     table: &iceberg::table::Table,
     entry: &IcebergCatalogEntry,
 ) -> Result<IcebergWriteSinkSpec, String> {
+    let target_columns = row_lineage_data_sink_input_columns(&resolved.columns);
     build_iceberg_write_sink_spec(
         target,
         resolved,
         table,
         entry,
         IcebergWriteSinkMode::RowLineageData,
+        target_columns,
     )
 }
 
@@ -351,15 +353,6 @@ pub(crate) fn build_iceberg_write_sink_spec(
     target_columns: Vec<ColumnDef>,
 ) -> Result<IcebergWriteSinkSpec, String> {
     let metadata = table.metadata();
-    let target_columns = match mode {
-        IcebergWriteSinkMode::Data => resolved.columns.clone(),
-        IcebergWriteSinkMode::RowLineageData => {
-            row_lineage_data_sink_input_columns(&resolved.columns)
-        }
-        IcebergWriteSinkMode::PositionDeletes => {
-            position_delete_sink_input_columns(metadata, &resolved.columns)?
-        }
-    };
     let target_descriptor_columns =
         write_sink_target_descriptor_columns(mode, &resolved.columns, &target_columns);
     let iceberg_schema = match mode {
