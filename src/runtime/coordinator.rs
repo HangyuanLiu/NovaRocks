@@ -21,21 +21,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use arrow::array::{
-    Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanBuilder, Decimal128Array, LargeBinaryArray,
-    LargeBinaryBuilder, StringBuilder,
-};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::common::ids::SlotId;
 use crate::data_sinks;
-use crate::exec::chunk::{Chunk, ChunkSchema};
+use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::novarocks_logging::debug;
 use crate::partitions;
 use crate::planner;
 use crate::runtime::dispatcher::{FetchOutcome, FragmentDispatcher};
-use crate::runtime::exec_params::build_exec_plan_fragment_params;
+use crate::runtime::exec_params::{ExecPlanFragmentParamOptions, build_exec_plan_fragment_params};
 use crate::runtime::query_state::QueryState;
 use crate::runtime::scheduler::{FragmentScheduler, topological_sort_bottom_up};
 use crate::runtime::write_coordinator::{
@@ -384,8 +380,11 @@ impl ExecutionCoordinator {
                     exec_params,
                     query_options.clone(),
                     pipeline_dop,
-                    Some(placement.instance_index as i32),
-                    fragment_report_addr,
+                    ExecPlanFragmentParamOptions {
+                        backend_num: Some(placement.instance_index as i32),
+                        novarocks_report_addr: fragment_report_addr,
+                        novarocks_typed_result_sink: is_root && needs_fragment_status_report,
+                    },
                 );
 
                 if is_write_sink(&params) {
@@ -441,6 +440,15 @@ impl ExecutionCoordinator {
             .and_then(|q| q.query_timeout)
             .map(|t| t as i64 * 1000)
             .unwrap_or(300_000); // 5 minute default
+        let root_fragment = fr_by_id
+            .get(&root_fragment_id)
+            .ok_or_else(|| "root fragment not found in build results".to_string())?;
+        let expected_root_chunk_schema =
+            if root_uses_typed_result_sink(&submissions, &plan.root_finst_id)? {
+                Some(build_root_expected_chunk_schema(root_fragment)?)
+            } else {
+                None
+            };
 
         let fetch_result = submit_and_fetch_loop(
             &dispatcher,
@@ -450,6 +458,7 @@ impl ExecutionCoordinator {
             plan.root_finst_id.clone(),
             &query_id,
             timeout_ms,
+            expected_root_chunk_schema.as_ref(),
             write_coordinator.as_ref(),
         )?;
 
@@ -463,10 +472,7 @@ impl ExecutionCoordinator {
             );
         }
 
-        let root_fragment = fr_by_id
-            .get(&root_fragment_id)
-            .ok_or_else(|| "root fragment not found in build results".to_string())?;
-        let chunks = coerce_fetch_chunks_to_output_columns(
+        let chunks = align_fetch_chunks_to_output_columns(
             fetch_result.chunks,
             &root_fragment.output_columns,
         )?;
@@ -508,364 +514,161 @@ fn query_result_or_write_abort_error(
     Ok(outcome.query_result)
 }
 
-fn coerce_fetch_chunks_to_output_columns(
+fn build_root_expected_chunk_schema(
+    root_fragment: &crate::sql::codegen::FragmentBuildResult,
+) -> Result<ChunkSchemaRef, String> {
+    let output_columns = &root_fragment.output_columns;
+    if output_columns.is_empty() {
+        if root_fragment
+            .output_exprs
+            .as_ref()
+            .is_some_and(|exprs| !exprs.is_empty())
+        {
+            return Err(
+                "root typed result metadata mismatch: output_exprs present for zero output columns"
+                    .to_string(),
+            );
+        }
+        return Ok(Arc::new(ChunkSchema::empty()));
+    }
+
+    let output_exprs = root_fragment
+        .output_exprs
+        .as_ref()
+        .ok_or_else(|| "root typed result requires output_exprs metadata".to_string())?;
+    if output_exprs.len() != output_columns.len() {
+        return Err(format!(
+            "root typed result output expr count mismatch: exprs={} columns={}",
+            output_exprs.len(),
+            output_columns.len()
+        ));
+    }
+
+    let mut output_specs = Vec::with_capacity(output_columns.len());
+    for (idx, (expr, output)) in output_exprs.iter().zip(output_columns.iter()).enumerate() {
+        if expr.nodes.len() != 1 {
+            return Err(format!(
+                "root typed result output expr {idx} must be a single SLOT_REF node, got {} nodes",
+                expr.nodes.len()
+            ));
+        }
+        let node = &expr.nodes[0];
+        if node.node_type != crate::exprs::TExprNodeType::SLOT_REF {
+            return Err(format!(
+                "root typed result output expr {idx} must be SLOT_REF, got {:?}",
+                node.node_type
+            ));
+        }
+        let slot_ref = node
+            .slot_ref
+            .as_ref()
+            .ok_or_else(|| format!("root typed result output expr {idx} missing slot_ref"))?;
+        let slot_id = u32::try_from(slot_ref.slot_id).map_err(|_| {
+            format!(
+                "root typed result output expr {idx} has negative slot id {}",
+                slot_ref.slot_id
+            )
+        })?;
+        output_specs.push((
+            SlotId::new(slot_id),
+            output.name.clone(),
+            output.nullable,
+            node.type_.clone(),
+        ));
+    }
+
+    let mut seen_slot_ids = BTreeSet::new();
+    let has_duplicate_slot_ids = output_specs
+        .iter()
+        .any(|(slot_id, _, _, _)| !seen_slot_ids.insert(slot_id.as_u32()));
+
+    let mut slots = Vec::with_capacity(output_specs.len());
+    for (idx, (slot_id, name, nullable, type_desc)) in output_specs.into_iter().enumerate() {
+        let output_slot_id = if has_duplicate_slot_ids {
+            let positional = u32::try_from(idx + 1)
+                .map_err(|_| "too many root typed result output columns".to_string())?;
+            SlotId::new(positional)
+        } else {
+            slot_id
+        };
+        slots.push(
+            ChunkSlotSchema::try_from_type_desc(output_slot_id, name, nullable, type_desc, None)
+                .map_err(|e| {
+                    format!("build root typed result slot schema at index {idx} failed: {e}")
+                })?,
+        );
+    }
+
+    ChunkSchema::try_new(slots).map(Arc::new)
+}
+
+fn align_fetch_chunks_to_output_columns(
     chunks: Vec<Chunk>,
     output_columns: &[crate::sql::codegen::OutputColumn],
 ) -> Result<Vec<Chunk>, String> {
     chunks
         .into_iter()
-        .map(|chunk| coerce_fetch_chunk_to_output_columns(chunk, output_columns))
+        .map(|chunk| align_fetch_chunk_to_output_columns(chunk, output_columns))
         .collect()
 }
 
-fn coerce_fetch_chunk_to_output_columns(
+fn align_fetch_chunk_to_output_columns(
     chunk: Chunk,
     output_columns: &[crate::sql::codegen::OutputColumn],
 ) -> Result<Chunk, String> {
-    if output_columns.is_empty() || chunk.batch.num_columns() != output_columns.len() {
-        return Ok(chunk);
+    if chunk.batch.num_columns() != output_columns.len() {
+        return Err(format!(
+            "typed root result column count mismatch: chunk has {}, output metadata has {}",
+            chunk.batch.num_columns(),
+            output_columns.len()
+        ));
+    }
+    if chunk.chunk_schema().slots().len() != output_columns.len() {
+        return Err(format!(
+            "typed root result slot count mismatch: chunk schema has {}, output metadata has {}",
+            chunk.chunk_schema().slots().len(),
+            output_columns.len()
+        ));
     }
 
-    let schema = chunk.batch.schema();
-    let already_aligned =
-        schema
-            .fields()
-            .iter()
-            .zip(output_columns.iter())
-            .all(|(field, output)| {
-                field.name() == &output.name
-                    && field.data_type() == &output.data_type
-                    && field.is_nullable() == output.nullable
-            });
-    if already_aligned {
-        return Ok(chunk);
-    }
-
-    let mut arrays = Vec::with_capacity(output_columns.len());
     let mut fields = Vec::with_capacity(output_columns.len());
+    let mut arrays = Vec::with_capacity(output_columns.len());
     for (idx, output) in output_columns.iter().enumerate() {
-        let source = chunk.batch.column(idx);
-        let array = if source.data_type() == &output.data_type {
-            source.clone()
-        } else if is_binary_like_result_column(source.data_type()) {
-            coerce_binary_like_result_column(source, &output.data_type, idx)?
-        } else {
-            return Ok(chunk);
-        };
-        let field_type = array.data_type().clone();
-        let field_nullable = output.nullable || array.null_count() > 0;
+        let array = chunk.batch.column(idx).clone();
+        if let Err(mismatch) = crate::exec::chunk::type_relation::relate(
+            &output.data_type,
+            array.data_type(),
+            crate::exec::chunk::type_relation::CompatibilityPolicy::SameScaleWiden,
+        ) {
+            return Err(format!(
+                "typed root result column {idx} type mismatch: output={:?} chunk={:?} ({:?})",
+                output.data_type,
+                array.data_type(),
+                mismatch.kind
+            ));
+        }
+        fields.push(Field::new(
+            output.name.clone(),
+            array.data_type().clone(),
+            output.nullable || array.null_count() > 0,
+        ));
         arrays.push(array);
-        fields.push(Field::new(output.name.clone(), field_type, field_nullable));
     }
 
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
-        .map_err(|e| format!("coerce remote fetch result batch failed: {e}"))?;
-    let slot_ids = (1..=batch.num_columns())
-        .map(|idx| {
-            u32::try_from(idx)
-                .map(SlotId::new)
-                .map_err(|_| "too many remote fetch result columns".to_string())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let chunk_schema =
-        ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slot_ids)?;
+        .map_err(|e| format!("align typed root result batch failed: {e}"))?;
+    let chunk_schema = chunk
+        .chunk_schema()
+        .with_fields_in_order(
+            batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.as_ref().clone())
+                .collect(),
+        )
+        .map(Arc::new)?;
     Chunk::try_new_with_chunk_schema(batch, chunk_schema)
-}
-
-fn is_binary_like_result_column(data_type: &DataType) -> bool {
-    matches!(data_type, DataType::Binary | DataType::LargeBinary)
-}
-
-enum BinaryLikeColumn<'a> {
-    Binary(&'a BinaryArray),
-    LargeBinary(&'a LargeBinaryArray),
-}
-
-impl<'a> BinaryLikeColumn<'a> {
-    fn try_new(array: &'a ArrayRef, col_idx: usize) -> Result<Self, String> {
-        match array.data_type() {
-            DataType::Binary => array
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .map(Self::Binary)
-                .ok_or_else(|| format!("remote fetch column {col_idx} is not BinaryArray")),
-            DataType::LargeBinary => array
-                .as_any()
-                .downcast_ref::<LargeBinaryArray>()
-                .map(Self::LargeBinary)
-                .ok_or_else(|| format!("remote fetch column {col_idx} is not LargeBinaryArray")),
-            other => Err(format!(
-                "remote fetch column {col_idx} is not binary-like: {other:?}"
-            )),
-        }
-    }
-
-    fn len(&self) -> usize {
-        match self {
-            Self::Binary(array) => array.len(),
-            Self::LargeBinary(array) => array.len(),
-        }
-    }
-
-    fn is_null(&self, row: usize) -> bool {
-        match self {
-            Self::Binary(array) => array.is_null(row),
-            Self::LargeBinary(array) => array.is_null(row),
-        }
-    }
-
-    fn value(&self, row: usize) -> &[u8] {
-        match self {
-            Self::Binary(array) => array.value(row),
-            Self::LargeBinary(array) => array.value(row),
-        }
-    }
-}
-
-fn coerce_binary_like_result_column(
-    source: &ArrayRef,
-    target_type: &DataType,
-    col_idx: usize,
-) -> Result<ArrayRef, String> {
-    let source = BinaryLikeColumn::try_new(source, col_idx)?;
-    match target_type {
-        DataType::Binary => {
-            let mut builder = BinaryBuilder::new();
-            for row in 0..source.len() {
-                if source.is_null(row) {
-                    builder.append_null();
-                } else {
-                    builder.append_value(source.value(row));
-                }
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        DataType::LargeBinary => {
-            let mut builder = LargeBinaryBuilder::new();
-            for row in 0..source.len() {
-                if source.is_null(row) {
-                    builder.append_null();
-                } else {
-                    builder.append_value(source.value(row));
-                }
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        DataType::Boolean => {
-            let mut builder = BooleanBuilder::new();
-            for row in 0..source.len() {
-                if source.is_null(row) {
-                    builder.append_null();
-                } else {
-                    builder.append_value(parse_mysql_bool(source.value(row), col_idx)?);
-                }
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        DataType::Null => {
-            for row in 0..source.len() {
-                if !source.is_null(row) {
-                    return Err(format!(
-                        "remote fetch column {col_idx} expected NULL_TYPE but row {row} has non-null mysql text"
-                    ));
-                }
-            }
-            Ok(arrow::array::new_null_array(target_type, source.len()))
-        }
-        DataType::Utf8 => binary_like_to_string_array(&source, col_idx),
-        DataType::List(_) | DataType::Map(_, _) | DataType::Struct(_) => {
-            binary_like_to_string_array(&source, col_idx)
-        }
-        dt if crate::common::largeint::is_largeint_data_type(dt) => {
-            binary_like_to_largeint_array(&source, col_idx)
-        }
-        DataType::Decimal128(precision, scale) => {
-            binary_like_to_decimal128_array(&source, *precision, *scale, col_idx)
-        }
-        _ => {
-            let strings = binary_like_to_string_array(&source, col_idx)?;
-            arrow::compute::cast(&strings, target_type).map_err(|e| {
-                format!(
-                    "coerce remote fetch column {col_idx} from mysql text to {target_type:?} failed: {e}"
-                )
-            })
-        }
-    }
-}
-
-fn binary_like_to_string_array(
-    source: &BinaryLikeColumn<'_>,
-    col_idx: usize,
-) -> Result<ArrayRef, String> {
-    let mut builder = StringBuilder::new();
-    for row in 0..source.len() {
-        if source.is_null(row) {
-            builder.append_null();
-            continue;
-        }
-        let text = std::str::from_utf8(source.value(row)).map_err(|e| {
-            format!("remote fetch column {col_idx} row {row} is not valid UTF-8: {e}")
-        })?;
-        builder.append_value(text);
-    }
-    Ok(Arc::new(builder.finish()))
-}
-
-fn binary_like_to_largeint_array(
-    source: &BinaryLikeColumn<'_>,
-    col_idx: usize,
-) -> Result<ArrayRef, String> {
-    let mut values = Vec::with_capacity(source.len());
-    for row in 0..source.len() {
-        if source.is_null(row) {
-            values.push(None);
-            continue;
-        }
-        let text = std::str::from_utf8(source.value(row)).map_err(|e| {
-            format!("remote fetch column {col_idx} row {row} is not valid UTF-8: {e}")
-        })?;
-        let value = text.trim().parse::<i128>().map_err(|e| {
-            format!("coerce remote fetch column {col_idx} row {row} to LARGEINT failed: {e}")
-        })?;
-        values.push(Some(value));
-    }
-    crate::common::largeint::array_from_i128(&values)
-}
-
-fn binary_like_to_decimal128_array(
-    source: &BinaryLikeColumn<'_>,
-    declared_precision: u8,
-    scale: i8,
-    col_idx: usize,
-) -> Result<ArrayRef, String> {
-    if declared_precision > 38 {
-        return Err(format!(
-            "remote fetch column {col_idx} Decimal128 precision exceeds 38: {declared_precision}"
-        ));
-    }
-    let mut values = Vec::with_capacity(source.len());
-    let mut requires_wide_precision = false;
-    for row in 0..source.len() {
-        if source.is_null(row) {
-            values.push(None);
-            continue;
-        }
-        let value = parse_mysql_decimal_text_to_i128(source.value(row), scale, col_idx, row)?;
-        if decimal128_precision(value) > declared_precision {
-            requires_wide_precision = true;
-        }
-        values.push(Some(value));
-    }
-    let precision = if requires_wide_precision {
-        38
-    } else {
-        declared_precision
-    };
-    let array = Decimal128Array::from(values)
-        .with_precision_and_scale(precision, scale)
-        .map_err(|e| {
-            format!(
-                "coerce remote fetch column {col_idx} to Decimal128({precision}, {scale}) failed: {e}"
-            )
-        })?;
-    Ok(Arc::new(array))
-}
-
-fn parse_mysql_decimal_text_to_i128(
-    bytes: &[u8],
-    scale: i8,
-    col_idx: usize,
-    row: usize,
-) -> Result<i128, String> {
-    if scale < 0 {
-        return Err(format!(
-            "remote fetch column {col_idx} has unsupported negative decimal scale: {scale}"
-        ));
-    }
-    let text = std::str::from_utf8(bytes).map_err(|e| {
-        format!("remote fetch column {col_idx} row {row} decimal text is not valid UTF-8: {e}")
-    })?;
-    let text = text.trim();
-    if text.is_empty() {
-        return Err(format!(
-            "remote fetch column {col_idx} row {row} has empty decimal text"
-        ));
-    }
-
-    let (negative, unsigned) = match text.as_bytes()[0] {
-        b'-' => (true, &text[1..]),
-        b'+' => (false, &text[1..]),
-        _ => (false, text),
-    };
-    if unsigned.is_empty() {
-        return Err(format!(
-            "remote fetch column {col_idx} row {row} has invalid decimal text: {text}"
-        ));
-    }
-
-    let mut parts = unsigned.split('.');
-    let whole = parts.next().unwrap_or_default();
-    let fraction = parts.next();
-    if parts.next().is_some() {
-        return Err(format!(
-            "remote fetch column {col_idx} row {row} has invalid decimal text: {text}"
-        ));
-    }
-    if whole.is_empty() && fraction.is_none_or(str::is_empty) {
-        return Err(format!(
-            "remote fetch column {col_idx} row {row} has invalid decimal text: {text}"
-        ));
-    }
-    let fraction = fraction.unwrap_or_default();
-    if !whole.bytes().all(|b| b.is_ascii_digit()) || !fraction.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(format!(
-            "remote fetch column {col_idx} row {row} has invalid decimal text: {text}"
-        ));
-    }
-
-    let scale = usize::try_from(scale)
-        .map_err(|_| format!("remote fetch column {col_idx} has unsupported scale"))?;
-    if fraction.len() > scale {
-        return Err(format!(
-            "remote fetch column {col_idx} row {row} decimal scale exceeds target scale {scale}: {text}"
-        ));
-    }
-    let mut digits = String::with_capacity(whole.len().saturating_add(scale));
-    digits.push_str(whole);
-    digits.push_str(fraction);
-    digits.extend(std::iter::repeat_n('0', scale - fraction.len()));
-    let digits = digits.trim_start_matches('0');
-    let digits = if digits.is_empty() { "0" } else { digits };
-    if digits.len() > 38 {
-        return Err(format!(
-            "remote fetch column {col_idx} row {row} decimal precision exceeds Decimal128 capacity: {text}"
-        ));
-    }
-    let value = digits.parse::<i128>().map_err(|e| {
-        format!("remote fetch column {col_idx} row {row} decimal parse failed: {e}")
-    })?;
-    Ok(if negative { -value } else { value })
-}
-
-fn decimal128_precision(value: i128) -> u8 {
-    let abs = value.unsigned_abs();
-    if abs == 0 {
-        return 1;
-    }
-    u8::try_from(abs.to_string().len()).unwrap_or(38)
-}
-
-fn parse_mysql_bool(bytes: &[u8], col_idx: usize) -> Result<bool, String> {
-    match bytes {
-        b"1" => Ok(true),
-        b"0" => Ok(false),
-        _ if bytes.eq_ignore_ascii_case(b"true") => Ok(true),
-        _ if bytes.eq_ignore_ascii_case(b"false") => Ok(false),
-        _ => Err(format!(
-            "coerce remote fetch column {col_idx} to Boolean failed: {:?}",
-            String::from_utf8_lossy(bytes)
-        )),
-    }
 }
 
 /// An `UNPARTITIONED` data partition (the common default).
@@ -978,6 +781,32 @@ fn root_uses_result_buffer(
             )
         })?;
     Ok(uses_result_buffer_sink(root))
+}
+
+fn root_uses_typed_result_sink(
+    submissions: &[(usize, crate::internal_service::TExecPlanFragmentParams)],
+    root_finst_id: &types::TUniqueId,
+) -> Result<bool, String> {
+    let root = submissions
+        .iter()
+        .map(|(_, params)| params)
+        .find(|params| {
+            params
+                .params
+                .as_ref()
+                .map(|exec| {
+                    exec.fragment_instance_id.hi == root_finst_id.hi
+                        && exec.fragment_instance_id.lo == root_finst_id.lo
+                })
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| {
+            format!(
+                "root fragment {}/{} is missing from submissions",
+                root_finst_id.hi, root_finst_id.lo
+            )
+        })?;
+    Ok(root.novarocks_typed_result_sink.unwrap_or(false))
 }
 
 struct RegisteredWriteCoordinator {
@@ -1237,6 +1066,7 @@ pub(crate) fn submit_and_fetch_loop(
     root_finst_id: types::TUniqueId,
     query_id: &types::TUniqueId,
     timeout_ms: i64,
+    expected_root_chunk_schema: Option<&ChunkSchemaRef>,
     write_coordinator: Option<&Arc<Mutex<WriteCoordinator>>>,
 ) -> Result<SubmitAndFetchResult, String> {
     const REMOTE_FETCH_POLL_INTERVAL_MS: i64 = 300;
@@ -1248,7 +1078,7 @@ pub(crate) fn submit_and_fetch_loop(
     let _query_state_guard = QueryStateRegistrationGuard {
         query_id: runtime_query_id,
     };
-    let _failure_guard = StandaloneQueryFailureGuard::register(&query_id);
+    let _failure_guard = StandaloneQueryFailureGuard::register(query_id);
 
     for (backend_idx, p) in submissions {
         let finst_id = p
@@ -1284,20 +1114,20 @@ pub(crate) fn submit_and_fetch_loop(
     let deadline = std::time::Instant::now() + timeout;
     if root_uses_result_buffer {
         loop {
-            if let Some(write) = write_coordinator {
-                if let Err(e) = poll_write_failure_and_cancel(write, tracker, dispatcher.as_ref()) {
-                    let abort = write.lock().expect("write coordinator lock").abort_input();
-                    let Some(abort) = abort else {
-                        return Err(e);
-                    };
-                    return Ok(SubmitAndFetchResult {
-                        chunks,
-                        write_commit: None,
-                        write_abort: Some(abort),
-                    });
-                }
+            if let Some(write) = write_coordinator
+                && let Err(e) = poll_write_failure_and_cancel(write, tracker, dispatcher.as_ref())
+            {
+                let abort = write.lock().expect("write coordinator lock").abort_input();
+                let Some(abort) = abort else {
+                    return Err(e);
+                };
+                return Ok(SubmitAndFetchResult {
+                    chunks,
+                    write_commit: None,
+                    write_abort: Some(abort),
+                });
             }
-            if let Some(err) = take_standalone_query_failure(&query_id) {
+            if let Some(err) = take_standalone_query_failure(query_id) {
                 tracker.cancel_all(dispatcher.as_ref());
                 return Err(err);
             }
@@ -1324,7 +1154,12 @@ pub(crate) fn submit_and_fetch_loop(
                 .as_millis()
                 .min(i64::MAX as u128) as i64;
             let fetch_wait_ms = remaining_ms.clamp(1, REMOTE_FETCH_POLL_INTERVAL_MS);
-            match dispatcher.fetch_result(root_backend_idx, root_finst_id.clone(), fetch_wait_ms) {
+            match dispatcher.fetch_result(
+                root_backend_idx,
+                root_finst_id.clone(),
+                fetch_wait_ms,
+                expected_root_chunk_schema,
+            ) {
                 Err(e) => {
                     tracker.cancel_all(dispatcher.as_ref());
                     return Err(e);
@@ -1496,119 +1331,25 @@ mod tests {
     };
     use crate::{status, status_code};
     use arrow::array::{
-        BinaryArray, Decimal128Array, FixedSizeBinaryArray, Int32Array, StringArray,
+        Array, ArrayRef, BinaryArray, Decimal128Array, FixedSizeBinaryArray, Int32Array,
     };
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
 
     #[test]
-    fn coerces_remote_binary_fetch_chunk_to_root_output_schema() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("col_0", DataType::Binary, true),
-            Field::new("col_1", DataType::Binary, true),
-        ]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(BinaryArray::from_vec(vec![b"east".as_slice()])),
-                Arc::new(BinaryArray::from_vec(vec![&[1_u8, 2, 3][..]])),
-            ],
-        )
-        .expect("remote binary batch");
-        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
-            schema.as_ref(),
-            &[SlotId::new(0), SlotId::new(1)],
-        )
-        .expect("chunk schema");
-        let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk");
-
-        let columns = vec![
-            crate::sql::codegen::OutputColumn {
-                name: "region".to_string(),
-                data_type: DataType::Utf8,
-                nullable: true,
-            },
-            crate::sql::codegen::OutputColumn {
-                name: "__agg_state_c".to_string(),
-                data_type: DataType::Binary,
-                nullable: false,
-            },
-        ];
-
-        let chunks =
-            coerce_fetch_chunks_to_output_columns(vec![chunk], &columns).expect("coerce chunks");
-        let batch = &chunks[0].batch;
-        assert_eq!(batch.schema().field(0).name(), "region");
-        assert_eq!(batch.schema().field(0).data_type(), &DataType::Utf8);
-        assert_eq!(batch.schema().field(1).name(), "__agg_state_c");
-        assert_eq!(batch.schema().field(1).data_type(), &DataType::Binary);
-        let region = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("region string array");
-        assert_eq!(region.value(0), "east");
-        let state = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .expect("state binary array");
-        assert_eq!(state.value(0), &[1_u8, 2, 3]);
-    }
-
-    #[test]
-    fn keeps_remote_complex_fetch_chunk_as_mysql_text() {
+    fn typed_root_alignment_renames_fields_and_widens_runtime_nullability() {
         let schema = Arc::new(Schema::new(vec![Field::new(
-            "col_0",
-            DataType::Binary,
+            "wire_i",
+            DataType::Int32,
             true,
         )]));
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
-            vec![Arc::new(BinaryArray::from_vec(vec![
-                b"{\"a\":1}".as_slice(),
-            ]))],
+            vec![Arc::new(Int32Array::from(vec![Some(1), None]))],
         )
-        .expect("remote binary batch");
+        .expect("typed batch");
         let chunk_schema =
-            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(0)])
-                .expect("chunk schema");
-        let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk");
-
-        let columns = vec![crate::sql::codegen::OutputColumn {
-            name: "payload".to_string(),
-            data_type: DataType::Struct(vec![Field::new("a", DataType::Int32, true)].into()),
-            nullable: true,
-        }];
-
-        let chunks =
-            coerce_fetch_chunks_to_output_columns(vec![chunk], &columns).expect("coerce chunks");
-        let batch = &chunks[0].batch;
-        assert_eq!(batch.schema().field(0).name(), "payload");
-        assert_eq!(batch.schema().field(0).data_type(), &DataType::Utf8);
-        let payload = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("payload string array");
-        assert_eq!(payload.value(0), "{\"a\":1}");
-    }
-
-    #[test]
-    fn remote_fetch_chunk_schema_allows_actual_nulls() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "col_0",
-            DataType::Binary,
-            true,
-        )]));
-        let values: Vec<Option<&[u8]>> = vec![Some(b"1".as_slice()), None];
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(BinaryArray::from(values))],
-        )
-        .expect("remote binary batch");
-        let chunk_schema =
-            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(0)])
+            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(7)])
                 .expect("chunk schema");
         let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk");
 
@@ -1619,8 +1360,9 @@ mod tests {
         }];
 
         let chunks =
-            coerce_fetch_chunks_to_output_columns(vec![chunk], &columns).expect("coerce chunks");
+            align_fetch_chunks_to_output_columns(vec![chunk], &columns).expect("align chunks");
         let batch = &chunks[0].batch;
+        assert_eq!(batch.schema().field(0).name(), "col1");
         assert!(batch.schema().field(0).is_nullable());
         let values = batch
             .column(0)
@@ -1632,130 +1374,112 @@ mod tests {
     }
 
     #[test]
-    fn coerces_remote_null_typed_fetch_chunk_to_null_array() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "col_0",
-            DataType::Binary,
-            true,
-        )]));
-        let values: Vec<Option<&[u8]>> = vec![None, None, None];
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(BinaryArray::from(values))],
-        )
-        .expect("remote binary batch");
-        let chunk_schema =
-            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(0)])
-                .expect("chunk schema");
-        let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk");
-
-        let columns = vec![crate::sql::codegen::OutputColumn {
-            name: "only_null".to_string(),
-            data_type: DataType::Null,
-            nullable: true,
-        }];
-
-        let chunks =
-            coerce_fetch_chunks_to_output_columns(vec![chunk], &columns).expect("coerce chunks");
-        let batch = &chunks[0].batch;
-        assert_eq!(batch.schema().field(0).name(), "only_null");
-        assert_eq!(batch.schema().field(0).data_type(), &DataType::Null);
-        assert_eq!(batch.column(0).len(), 3);
-    }
-
-    #[test]
-    fn coerces_remote_largeint_fetch_chunk_from_mysql_text() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "col_0",
-            DataType::Binary,
-            true,
-        )]));
-        let values: Vec<Option<&[u8]>> =
-            vec![Some(b"128".as_slice()), Some(b"-5".as_slice()), None];
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(BinaryArray::from(values))],
-        )
-        .expect("remote binary batch");
-        let chunk_schema =
-            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(0)])
-                .expect("chunk schema");
-        let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk");
-
-        let columns = vec![crate::sql::codegen::OutputColumn {
-            name: "big_value".to_string(),
-            data_type: DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH),
-            nullable: true,
-        }];
-
-        let chunks =
-            coerce_fetch_chunks_to_output_columns(vec![chunk], &columns).expect("coerce chunks");
-        let batch = &chunks[0].batch;
-        assert_eq!(batch.schema().field(0).name(), "big_value");
-        assert_eq!(
-            batch.schema().field(0).data_type(),
-            &DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH)
-        );
-        let values = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
+    fn typed_root_alignment_preserves_decimal_and_largeint_types() {
+        let decimal = Decimal128Array::from(vec![Some(100_000_000_000_000_000_000_i128), None])
+            .with_precision_and_scale(38, 2)
+            .expect("decimal array");
+        let largeint = crate::common::largeint::array_from_i128(&[Some(128), Some(-5)])
             .expect("largeint array");
-        assert_eq!(
-            crate::common::largeint::i128_from_be_bytes(values.value(0)).unwrap(),
-            128
-        );
-        assert_eq!(
-            crate::common::largeint::i128_from_be_bytes(values.value(1)).unwrap(),
-            -5
-        );
-        assert!(values.is_null(2));
-    }
-
-    #[test]
-    fn coerces_remote_decimal_fetch_chunk_without_declared_precision_loss() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "col_0",
-            DataType::Binary,
-            true,
-        )]));
-        let values: Vec<Option<&[u8]>> = vec![
-            Some(b"1000000000000000000.00".as_slice()),
-            Some(b"1.23".as_slice()),
-            None,
-        ];
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("wire_price", DataType::Decimal128(38, 2), true),
+            Field::new(
+                "wire_big",
+                DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH),
+                true,
+            ),
+        ]));
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
-            vec![Arc::new(BinaryArray::from(values))],
+            vec![Arc::new(decimal) as ArrayRef, largeint],
         )
-        .expect("remote binary batch");
-        let chunk_schema =
-            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(0)])
-                .expect("chunk schema");
+        .expect("typed batch");
+        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            schema.as_ref(),
+            &[SlotId::new(11), SlotId::new(12)],
+        )
+        .expect("chunk schema");
         let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk");
 
-        let columns = vec![crate::sql::codegen::OutputColumn {
-            name: "price".to_string(),
-            data_type: DataType::Decimal128(20, 2),
-            nullable: true,
-        }];
+        let columns = vec![
+            crate::sql::codegen::OutputColumn {
+                name: "price".to_string(),
+                data_type: DataType::Decimal128(20, 2),
+                nullable: true,
+            },
+            crate::sql::codegen::OutputColumn {
+                name: "big_value".to_string(),
+                data_type: DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH),
+                nullable: true,
+            },
+        ];
 
         let chunks =
-            coerce_fetch_chunks_to_output_columns(vec![chunk], &columns).expect("coerce chunks");
+            align_fetch_chunks_to_output_columns(vec![chunk], &columns).expect("align chunks");
         let batch = &chunks[0].batch;
         assert_eq!(batch.schema().field(0).name(), "price");
         assert_eq!(
             batch.schema().field(0).data_type(),
             &DataType::Decimal128(38, 2)
         );
-        let values = batch
+        let decimal_values = batch
             .column(0)
             .as_any()
             .downcast_ref::<Decimal128Array>()
             .expect("decimal array");
-        assert_eq!(values.value(0), 100_000_000_000_000_000_000_i128);
-        assert_eq!(values.value(1), 123_i128);
-        assert!(values.is_null(2));
+        assert_eq!(decimal_values.value(0), 100_000_000_000_000_000_000_i128);
+        assert!(decimal_values.is_null(1));
+
+        assert_eq!(batch.schema().field(1).name(), "big_value");
+        let largeint_values = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("largeint array");
+        assert_eq!(
+            crate::common::largeint::i128_from_be_bytes(largeint_values.value(0)).unwrap(),
+            128
+        );
+        assert_eq!(
+            crate::common::largeint::i128_from_be_bytes(largeint_values.value(1)).unwrap(),
+            -5
+        );
+    }
+
+    #[test]
+    fn typed_root_alignment_rejects_binary_mysql_text_for_complex_decimal_and_largeint() {
+        let make_binary_chunk = || {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "col_0",
+                DataType::Binary,
+                true,
+            )]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(BinaryArray::from_vec(vec![
+                    b"{\"a\":1}".as_slice(),
+                ]))],
+            )
+            .expect("binary batch");
+            let chunk_schema =
+                ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(0)])
+                    .expect("chunk schema");
+            Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk")
+        };
+
+        for target_type in [
+            DataType::Struct(vec![Field::new("a", DataType::Int32, true)].into()),
+            DataType::Decimal128(20, 2),
+            DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH),
+        ] {
+            let columns = vec![crate::sql::codegen::OutputColumn {
+                name: "payload".to_string(),
+                data_type: target_type,
+                nullable: true,
+            }];
+            let err = align_fetch_chunks_to_output_columns(vec![make_binary_chunk()], &columns)
+                .expect_err("binary mysql text must not be coerced at typed root");
+            assert!(err.contains("type mismatch"), "{err}");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1800,6 +1524,7 @@ mod tests {
             _backend_idx: usize,
             _finst_id: types::TUniqueId,
             _max_wait_ms: i64,
+            _expected_chunk_schema: Option<&ChunkSchemaRef>,
         ) -> Result<FetchOutcome, String> {
             Ok(FetchOutcome::Eof)
         }
@@ -1991,6 +1716,7 @@ mod tests {
             _backend_idx: usize,
             _finst_id: types::TUniqueId,
             _max_wait_ms: i64,
+            _expected_chunk_schema: Option<&ChunkSchemaRef>,
         ) -> Result<FetchOutcome, String> {
             self.fetch_count.fetch_add(1, Ordering::SeqCst);
             match &self.fetch_behavior {
@@ -2031,6 +1757,7 @@ mod tests {
             _backend_idx: usize,
             finst_id: types::TUniqueId,
             _max_wait_ms: i64,
+            _expected_chunk_schema: Option<&ChunkSchemaRef>,
         ) -> Result<FetchOutcome, String> {
             self.fetch_count.fetch_add(1, Ordering::SeqCst);
             if self.first_fetch.swap(false, Ordering::SeqCst) {
@@ -2077,6 +1804,7 @@ mod tests {
             _backend_idx: usize,
             _finst_id: types::TUniqueId,
             max_wait_ms: i64,
+            _expected_chunk_schema: Option<&ChunkSchemaRef>,
         ) -> Result<FetchOutcome, String> {
             self.fetch_waits_ms.lock().unwrap().push(max_wait_ms);
             let call = self.fetch_count.fetch_add(1, Ordering::SeqCst);
@@ -2116,6 +1844,7 @@ mod tests {
             _backend_idx: usize,
             _finst_id: types::TUniqueId,
             _max_wait_ms: i64,
+            _expected_chunk_schema: Option<&ChunkSchemaRef>,
         ) -> Result<FetchOutcome, String> {
             if let Some(tx) = self.eof_tx.lock().unwrap().take() {
                 tx.send(()).expect("signal root EOF");
@@ -2226,6 +1955,7 @@ mod tests {
             None::<Vec<i32>>,
             None::<i32>,
             None::<types::TNetworkAddress>,
+            None::<bool>,
         )
     }
 
@@ -2412,6 +2142,7 @@ mod tests {
             _backend_idx: usize,
             _finst_id: types::TUniqueId,
             _max_wait_ms: i64,
+            _expected_chunk_schema: Option<&ChunkSchemaRef>,
         ) -> Result<FetchOutcome, String> {
             Ok(FetchOutcome::Eof)
         }
@@ -2596,6 +2327,7 @@ mod tests {
             root_finst_id,
             &types::TUniqueId::new(740, 741),
             1_000,
+            None,
             Some(&write),
         );
 
@@ -2662,6 +2394,7 @@ mod tests {
             root_finst_id,
             &query_id,
             1_000,
+            None,
             Some(&write),
         )
         .expect("writer failure during post-EOF wait must surface write abort");
@@ -2743,6 +2476,7 @@ mod tests {
             root_finst_id,
             &types::TUniqueId::new(780, 781),
             1_000,
+            None,
             Some(&write),
         )
         .expect("pre-EOF writer failure must surface write abort");
@@ -2808,6 +2542,7 @@ mod tests {
             &types::TUniqueId::new(786, 1),
             1_000,
             None,
+            None,
         )
         .expect_err("standalone report failure must surface before timeout");
 
@@ -2863,6 +2598,7 @@ mod tests {
             root_finst_id,
             &query_id,
             1_000,
+            None,
             Some(&write),
         )
         .expect("write-only root should use writer reports instead of result fetch");
@@ -2901,6 +2637,7 @@ mod tests {
             root_finst_id,
             &types::TUniqueId::new(750, 751),
             25,
+            None,
             Some(&write),
         )
         .expect("missing writer final report after EOF must surface write abort");
@@ -2973,6 +2710,7 @@ mod tests {
             &query_id,
             100,
             None,
+            None,
         );
         assert!(result.is_ok(), "expected Ok, got {result:?}");
         let output = result.unwrap();
@@ -3021,6 +2759,7 @@ mod tests {
             &types::TUniqueId::new(2, 99),
             100,
             None,
+            None,
         );
         assert!(result.is_err(), "expected Err on submit failure");
         let submitted = inner.submitted_ids();
@@ -3067,6 +2806,7 @@ mod tests {
             &types::TUniqueId::new(3, 99),
             100,
             None,
+            None,
         );
         assert!(result.is_err(), "expected Err on fetch error");
         let err = result.unwrap_err();
@@ -3107,6 +2847,7 @@ mod tests {
             &types::TUniqueId::new(4, 99),
             10,
             None,
+            None,
         );
         assert!(result.is_err(), "expected timeout error");
         let err = result.unwrap_err();
@@ -3145,6 +2886,7 @@ mod tests {
             root_finst_id,
             &types::TUniqueId::new(8, 99),
             100,
+            None,
             None,
         );
 
@@ -3190,6 +2932,7 @@ mod tests {
             &types::TUniqueId::new(6, 99),
             300_000,
             None,
+            None,
         );
 
         assert!(result.is_ok(), "expected fetch loop to finish after Eof");
@@ -3227,6 +2970,7 @@ mod tests {
                     root_finst_id,
                     &types::TUniqueId::new(5, 99),
                     100,
+                    None,
                     None,
                 )
             });

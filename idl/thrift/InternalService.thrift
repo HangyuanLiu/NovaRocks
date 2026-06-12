@@ -529,6 +529,10 @@ struct TExecPlanFragmentParams {
   // NovaRocks-only standalone coordinator report endpoint. Task 6 wires the
   // coordinator-provided value.
   10001: optional Types.TNetworkAddress novarocks_report_addr;
+
+  // NovaRocks-only standalone remote root result path. When true, RESULT_SINK
+  // writes typed Arrow IPC exchange payloads instead of TResultBatch rows.
+  10002: optional bool novarocks_typed_result_sink;
 }
 
 struct TExecPlanFragmentResult {

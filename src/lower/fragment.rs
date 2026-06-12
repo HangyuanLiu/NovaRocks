@@ -159,6 +159,7 @@ pub(crate) fn execute_fragment(
     fe_addr: Option<&types::TNetworkAddress>,
     backend_num: Option<i32>,
     mem_tracker: Option<std::sync::Arc<crate::runtime::mem_tracker::MemTracker>>,
+    typed_result_sink: bool,
 ) -> Result<FragmentOutput, String> {
     let mut query_opts = query_opts.cloned();
     if let Some(opts) = query_opts.as_mut() {
@@ -431,6 +432,7 @@ pub(crate) fn execute_fragment(
                     result_sink.type_,
                     result_sink.format,
                     None,
+                    typed_result_sink,
                 );
                 let exchange_finst_id = exec_params.map(|params| {
                     (
