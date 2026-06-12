@@ -22,9 +22,10 @@
 //! - Keep sorting algorithms isolated from operator state transitions.
 
 use crate::exec::chunk::Chunk;
+use crate::exec::chunk::type_relation::{CompatibilityPolicy, relate, retag_column};
 use arrow::array::{
-    Array, ArrayRef, Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Int8Array, ListArray,
-    MapArray, StructArray, UInt64Array, make_array,
+    Array, ArrayRef, Decimal128Array, FixedSizeBinaryArray, Int8Array, ListArray, MapArray,
+    StructArray, UInt64Array,
 };
 use arrow::compute::{SortColumn, SortOptions, concat_batches};
 use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
@@ -56,18 +57,6 @@ pub(crate) fn concat_sort_chunks(chunks: &[Chunk]) -> Result<RecordBatch, String
         .map(|(idx, chunk)| normalize_sort_batch_for_schema(chunk, &schema, idx))
         .collect::<Result<Vec<_>, _>>()?;
     concat_batches(&schema, &batches).map_err(|e| e.to_string())
-}
-
-fn is_compatible_sort_field_type(expected: &DataType, actual: &DataType) -> bool {
-    match (expected, actual) {
-        (DataType::Decimal128(_, expected_scale), DataType::Decimal128(_, actual_scale)) => {
-            expected_scale == actual_scale
-        }
-        (DataType::Decimal256(_, expected_scale), DataType::Decimal256(_, actual_scale)) => {
-            expected_scale == actual_scale
-        }
-        _ => expected == actual,
-    }
 }
 
 fn sort_field_from_array(field: &Field, array: &ArrayRef) -> Field {
@@ -115,7 +104,12 @@ pub(crate) fn merged_sort_schema_for_chunks(chunks: &[Chunk]) -> Result<SchemaRe
             let actual = schema.field(idx);
             let actual = sort_field_from_array(actual, chunk.batch.column(idx));
             if expected.name() != actual.name()
-                || !is_compatible_sort_field_type(expected.data_type(), actual.data_type())
+                || relate(
+                    expected.data_type(),
+                    actual.data_type(),
+                    CompatibilityPolicy::SameScaleWiden,
+                )
+                .is_err()
             {
                 return Err(format!(
                     "sort schema field mismatch at index {}: expected=({}, {:?}) actual=({}, {:?})",
@@ -145,64 +139,19 @@ pub(crate) fn merged_sort_schema_for_chunks(chunks: &[Chunk]) -> Result<SchemaRe
     )))
 }
 
-fn retag_decimal128_array_for_sort(
-    array: &Decimal128Array,
-    target_precision: u8,
-    target_scale: i8,
-) -> Result<ArrayRef, String> {
-    let data = array
-        .to_data()
-        .into_builder()
-        .data_type(DataType::Decimal128(target_precision, target_scale))
-        .build()
-        .map_err(|e| e.to_string())?;
-    Ok(make_array(data))
-}
-
-fn retag_decimal256_array_for_sort(
-    array: &Decimal256Array,
-    target_precision: u8,
-    target_scale: i8,
-) -> Result<ArrayRef, String> {
-    let data = array
-        .to_data()
-        .into_builder()
-        .data_type(DataType::Decimal256(target_precision, target_scale))
-        .build()
-        .map_err(|e| e.to_string())?;
-    Ok(make_array(data))
-}
-
 fn normalize_sort_array_for_field(array: &ArrayRef, field: &Field) -> Result<ArrayRef, String> {
-    if array.data_type() == field.data_type() {
-        return Ok(array.clone());
-    }
-    match (array.data_type(), field.data_type()) {
-        (DataType::Decimal128(_, source_scale), DataType::Decimal128(precision, target_scale))
-            if source_scale == target_scale =>
-        {
-            let decimal = array
-                .as_any()
-                .downcast_ref::<Decimal128Array>()
-                .ok_or_else(|| "sort Decimal128 payload downcast failed".to_string())?;
-            retag_decimal128_array_for_sort(decimal, *precision, *target_scale)
-        }
-        (DataType::Decimal256(_, source_scale), DataType::Decimal256(precision, target_scale))
-            if source_scale == target_scale =>
-        {
-            let decimal = array
-                .as_any()
-                .downcast_ref::<Decimal256Array>()
-                .ok_or_else(|| "sort Decimal256 payload downcast failed".to_string())?;
-            retag_decimal256_array_for_sort(decimal, *precision, *target_scale)
-        }
-        _ => Err(format!(
-            "sort payload type mismatch for field {}: array={:?} field={:?}",
+    // Metadata-only retag of the column to the merged concat schema's type, via
+    // the single type-relation primitive (same-scale decimal / utf8<->binary /
+    // recursive). Replaces the sort-local decimal retag helpers.
+    retag_column(array, field.data_type()).map_err(|m| {
+        format!(
+            "sort payload retag failed for field {}: array={:?} field={:?} ({:?})",
             field.name(),
             array.data_type(),
-            field.data_type()
-        )),
-    }
+            field.data_type(),
+            m.kind
+        )
+    })
 }
 
 pub(crate) fn normalize_sort_batch_for_schema(

@@ -17,59 +17,19 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, Decimal128Array, Decimal256Array, make_array};
+use arrow::array::{Array, ArrayRef};
 use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 
-pub(crate) fn is_execution_data_type_compatible(expected: &DataType, actual: &DataType) -> bool {
-    if expected == actual {
-        return true;
-    }
+use crate::exec::chunk::type_relation::{CompatibilityPolicy, relate, retag_column};
 
-    match (expected, actual) {
-        (DataType::Decimal128(_, expected_scale), DataType::Decimal128(_, actual_scale)) => {
-            expected_scale == actual_scale
-        }
-        (DataType::Decimal256(_, expected_scale), DataType::Decimal256(_, actual_scale)) => {
-            expected_scale == actual_scale
-        }
-        (DataType::Timestamp(_, _), DataType::Timestamp(_, _)) => true,
-        (DataType::Utf8, DataType::Binary) | (DataType::Binary, DataType::Utf8) => true,
-        (DataType::List(expected_field), DataType::List(actual_field)) => {
-            is_execution_data_type_compatible(expected_field.data_type(), actual_field.data_type())
-        }
-        (DataType::LargeList(expected_field), DataType::LargeList(actual_field)) => {
-            is_execution_data_type_compatible(expected_field.data_type(), actual_field.data_type())
-        }
-        (
-            DataType::Map(expected_field, expected_ordered),
-            DataType::Map(actual_field, actual_ordered),
-        ) => {
-            expected_ordered == actual_ordered
-                && is_execution_data_type_compatible(
-                    expected_field.data_type(),
-                    actual_field.data_type(),
-                )
-        }
-        (DataType::List(_), DataType::Struct(actual_fields)) if actual_fields.len() == 1 => {
-            is_execution_data_type_compatible(expected, actual_fields[0].data_type())
-        }
-        (DataType::Struct(expected_fields), DataType::List(_)) if expected_fields.len() == 1 => {
-            is_execution_data_type_compatible(expected_fields[0].data_type(), actual)
-        }
-        (DataType::Struct(expected_fields), DataType::Struct(actual_fields)) => {
-            expected_fields.len() == actual_fields.len()
-                && expected_fields.iter().zip(actual_fields.iter()).all(
-                    |(expected_field, actual_field)| {
-                        is_execution_data_type_compatible(
-                            expected_field.data_type(),
-                            actual_field.data_type(),
-                        )
-                    },
-                )
-        }
-        _ => false,
-    }
+pub(crate) fn is_execution_data_type_compatible(expected: &DataType, actual: &DataType) -> bool {
+    // The one type relation governs execution-layer compatibility: same-scale
+    // decimal (precision may differ), timestamp, utf8<->binary, and recursion into
+    // list/largelist/map/struct. The former List<->Struct<1> arm was a StarRocks-FE
+    // intermediate-state bridge (added by #295 for 1FE3BE); NovaRocks owns its own
+    // array_agg intermediate shape, so it is no longer needed.
+    relate(expected, actual, CompatibilityPolicy::SameScaleWiden).is_ok()
 }
 
 fn align_field_to_data_type(
@@ -151,70 +111,22 @@ pub(crate) fn align_schema_to_batches(
     Ok(aligned)
 }
 
-fn retag_decimal128_array(
-    array: &Decimal128Array,
-    target_precision: u8,
-    target_scale: i8,
-) -> Result<ArrayRef, String> {
-    let data = array
-        .to_data()
-        .into_builder()
-        .data_type(DataType::Decimal128(target_precision, target_scale))
-        .build()
-        .map_err(|e| format!("retag Decimal128 array failed: {e}"))?;
-    Ok(make_array(data))
-}
-
-fn retag_decimal256_array(
-    array: &Decimal256Array,
-    target_precision: u8,
-    target_scale: i8,
-) -> Result<ArrayRef, String> {
-    let data = array
-        .to_data()
-        .into_builder()
-        .data_type(DataType::Decimal256(target_precision, target_scale))
-        .build()
-        .map_err(|e| format!("retag Decimal256 array failed: {e}"))?;
-    Ok(make_array(data))
-}
-
 pub(crate) fn normalize_array_to_data_type(
     array: &ArrayRef,
     target_type: &DataType,
     context: &str,
 ) -> Result<ArrayRef, String> {
-    if array.data_type() == target_type {
-        return Ok(array.clone());
-    }
-    match (array.data_type(), target_type) {
-        (
-            DataType::Decimal128(_, source_scale),
-            DataType::Decimal128(target_precision, target_scale),
-        ) if source_scale == target_scale => {
-            let decimal = array
-                .as_any()
-                .downcast_ref::<Decimal128Array>()
-                .ok_or_else(|| format!("{context} Decimal128 downcast failed"))?;
-            retag_decimal128_array(decimal, *target_precision, *target_scale)
-        }
-        (
-            DataType::Decimal256(_, source_scale),
-            DataType::Decimal256(target_precision, target_scale),
-        ) if source_scale == target_scale => {
-            let decimal = array
-                .as_any()
-                .downcast_ref::<Decimal256Array>()
-                .ok_or_else(|| format!("{context} Decimal256 downcast failed"))?;
-            retag_decimal256_array(decimal, *target_precision, *target_scale)
-        }
-        _ if is_execution_data_type_compatible(target_type, array.data_type()) => Ok(array.clone()),
-        _ => Err(format!(
-            "{context} array type mismatch: expected {:?}, got {:?}",
+    // Metadata-only retag of the column to target_type, via the one type-relation
+    // primitive (same-scale decimal / utf8<->binary / recursive). Replaces the
+    // schema_compat-local decimal retag helpers.
+    retag_column(array, target_type).map_err(|m| {
+        format!(
+            "{context} array type mismatch: expected {:?}, got {:?} ({:?})",
             target_type,
-            array.data_type()
-        )),
-    }
+            array.data_type(),
+            m.kind
+        )
+    })
 }
 
 pub(crate) fn normalize_batch_to_schema(
