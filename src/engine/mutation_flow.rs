@@ -678,109 +678,6 @@ fn run_mor_update_distributed_transaction(
     Ok(())
 }
 
-struct MorUpdateRun {
-    /// `_row_id` of the first row in the run. The data file written for this
-    /// run has `first_row_id = Self::first_row_id`, and rows occupy positions
-    /// `0..N` so the reader's `first_row_id + position` formula reconstructs
-    /// each row's `_row_id`.
-    first_row_id: i64,
-    batch: RowLineageWriteBatch,
-}
-
-fn build_mor_update_runs(
-    matched: &MatchedUpdateBatch,
-    new_sequence_number: i64,
-) -> Result<Vec<MorUpdateRun>, String> {
-    if matched.row_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    // Sort matched rows by row_id ascending so each contiguous run lays out
-    // the new data file in row_id order (required for the read-side fallback
-    // formula). Group rows whose row_ids form a contiguous integer sequence
-    // into a single data file; non-contiguous gaps start a new file so each
-    // file's stored `first_row_id` correctly identifies its starting row.
-    let mut order: Vec<usize> = (0..matched.row_ids.len()).collect();
-    order.sort_by_key(|&i| matched.row_ids[i]);
-
-    let mut runs = Vec::new();
-    let mut current_indices: Vec<usize> = Vec::new();
-    let mut prev_row_id: Option<i64> = None;
-    for &idx in &order {
-        let row_id = matched.row_ids[idx];
-        let starts_new_run = match prev_row_id {
-            None => true,
-            Some(prev)
-                if row_id
-                    == prev.checked_add(1).ok_or_else(|| {
-                        "MOR UPDATE matched _row_id overflow while grouping contiguous runs"
-                            .to_string()
-                    })? =>
-            {
-                false
-            }
-            Some(_) => true,
-        };
-        if starts_new_run && !current_indices.is_empty() {
-            runs.push(materialize_mor_update_run(
-                matched,
-                &current_indices,
-                new_sequence_number,
-            )?);
-            current_indices.clear();
-        }
-        current_indices.push(idx);
-        prev_row_id = Some(row_id);
-    }
-    if !current_indices.is_empty() {
-        runs.push(materialize_mor_update_run(
-            matched,
-            &current_indices,
-            new_sequence_number,
-        )?);
-    }
-    Ok(runs)
-}
-
-fn materialize_mor_update_run(
-    matched: &MatchedUpdateBatch,
-    indices: &[usize],
-    new_sequence_number: i64,
-) -> Result<MorUpdateRun, String> {
-    let user_batch = take_rows(&matched.new_rows, indices)?;
-    let row_ids: Vec<i64> = indices.iter().map(|&i| matched.row_ids[i]).collect();
-    let first_row_id = row_ids[0];
-    let last_updated: Vec<Option<i64>> = (0..indices.len())
-        .map(|_| Some(new_sequence_number))
-        .collect();
-    let lineage = RowLineageColumns {
-        row_ids: Int64Array::from(row_ids),
-        last_updated_sequence_numbers: Int64Array::from(last_updated),
-    };
-    Ok(MorUpdateRun {
-        first_row_id,
-        batch: RowLineageWriteBatch {
-            user_batch,
-            lineage,
-        },
-    })
-}
-
-fn take_rows(batch: &RecordBatch, indices: &[usize]) -> Result<RecordBatch, String> {
-    if indices.is_empty() {
-        return Ok(RecordBatch::new_empty(batch.schema()));
-    }
-    let idx_array =
-        arrow::array::UInt32Array::from(indices.iter().map(|&i| i as u32).collect::<Vec<_>>());
-    let mut new_columns = Vec::with_capacity(batch.num_columns());
-    for col in batch.columns() {
-        let taken = arrow::compute::take(col.as_ref(), &idx_array, None)
-            .map_err(|e| format!("take MOR UPDATE rows failed: {e}"))?;
-        new_columns.push(taken);
-    }
-    RecordBatch::try_new(batch.schema(), new_columns)
-        .map_err(|e| format!("rebuild MOR UPDATE batch failed: {e}"))
-}
-
 fn build_position_delete_groups_from_matched(
     matched: &MatchedUpdateBatch,
     referenced_partitions: &crate::engine::delete_flow::ReferencedDataFilePartitions,
@@ -805,9 +702,6 @@ fn build_position_delete_groups_from_matched(
 }
 
 enum MutationWritePlan {
-    MorUpdate {
-        matched: MatchedUpdateBatch,
-    },
     CowUpdate {
         matched: MatchedUpdateBatch,
         entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
@@ -824,7 +718,6 @@ enum MutationWritePlan {
 impl MutationWritePlan {
     fn attempt_name(&self) -> &'static str {
         match self {
-            Self::MorUpdate { .. } => "mor-update",
             Self::CowUpdate { .. } => "cow-update",
             Self::MergeMatchedDelete { .. } => "merge-delete",
             Self::MergeUnmatchedInsert { .. } => "merge-insert",
@@ -843,7 +736,7 @@ struct MutationWriteExecutor {
 impl IcebergWriteTransactionExecutor for MutationWriteExecutor {
     fn run_coordinated_write(
         &self,
-        spec: &IcebergWriteTransactionSpec,
+        _spec: &IcebergWriteTransactionSpec,
     ) -> Result<CoordinatedQueryResult, String> {
         let plan = self
             .plan
@@ -853,10 +746,6 @@ impl IcebergWriteTransactionExecutor for MutationWriteExecutor {
             .ok_or_else(|| "mutation write plan was already consumed".to_string())?;
         let mut sink_commit_infos = Vec::new();
         match plan {
-            MutationWritePlan::MorUpdate { matched } => {
-                sink_commit_infos
-                    .extend(self.run_mor_update_write(matched, spec.commit.base_snapshot_id)?);
-            }
             MutationWritePlan::CowUpdate {
                 matched,
                 entry,
@@ -951,61 +840,6 @@ impl IcebergWriteTransactionExecutor for MutationWriteExecutor {
 }
 
 impl MutationWriteExecutor {
-    fn run_mor_update_write(
-        &self,
-        matched: MatchedUpdateBatch,
-        base_snapshot_id: Option<i64>,
-    ) -> Result<Vec<crate::types::TSinkCommitInfo>, String> {
-        if matched.row_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut sink_commit_infos = Vec::new();
-        let referenced_partitions =
-            crate::engine::delete_flow::load_referenced_data_file_partitions_at(
-                &self.table,
-                base_snapshot_id,
-            )?;
-        let delete_groups =
-            build_position_delete_groups_from_matched(&matched, &referenced_partitions)?;
-        let new_sequence_number = self.table.metadata().last_sequence_number() + 1;
-        let default_spec_id = self.table.metadata().default_partition_spec_id();
-        let runs = build_mor_update_runs(&matched, new_sequence_number)?;
-        for run in &runs {
-            let data_files = block_on_iceberg(async {
-                crate::connector::iceberg::data_writer::write_row_lineage_batches_as_data_files(
-                    &self.table,
-                    std::slice::from_ref(&run.batch),
-                )
-                .await
-            })??;
-            if data_files.is_empty() {
-                return Err(
-                    "MOR UPDATE produced no replacement data files for matched rows".to_string(),
-                );
-            }
-            let mut cursor = run.first_row_id;
-            for df in data_files {
-                let mut wf =
-                    crate::engine::iceberg_writer::data_file_to_written_file(&df, default_spec_id)?;
-                wf.first_row_id = Some(cursor);
-                cursor = cursor.checked_add(wf.record_count as i64).ok_or_else(|| {
-                    "MOR UPDATE first_row_id cursor overflow when chaining rolling files"
-                        .to_string()
-                })?;
-                sink_commit_infos.push(
-                    crate::connector::iceberg::data_writer::written_file_to_sink_commit_info(
-                        &wf,
-                        self.table.metadata(),
-                    )?,
-                );
-            }
-        }
-        for group in delete_groups {
-            self.collector.inject_delete_group(group);
-        }
-        Ok(sink_commit_infos)
-    }
-
     fn run_cow_update_write(
         &self,
         matched: MatchedUpdateBatch,
