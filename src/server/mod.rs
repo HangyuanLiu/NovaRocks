@@ -21,18 +21,22 @@ use tokio::task;
 use tracing::{info, warn};
 
 use crate::common::failpoint::{self, FailPointMode};
-use crate::common::util::format_mysql_container_value_with_schema;
 use crate::novarocks_config::NovaRocksConfig;
 use crate::version;
 
 use self::encoding::write_query_result;
 use crate::engine::catalog::{DEFAULT_DATABASE, normalize_identifier};
+use crate::engine::mv_maintenance::MaintenanceCoordinatorConfig;
 use crate::engine::mv_scheduler::RefreshCoordinatorConfig;
 use crate::engine::statement::{
     looks_like_show_alter_table_optimize, looks_like_show_create_table,
 };
 use crate::engine::{StandaloneNovaRocks, StandaloneOptions, StatementResult};
 use crate::sql::optimizer::options::SessionOptimizerSettings;
+use crate::sql::parser::dialect::StarRocksDialect;
+use crate::sql::parser::dialect::backend::{
+    looks_like_add_backend, looks_like_drop_backend, looks_like_show_backends,
+};
 
 const DEFAULT_MYSQL_PORT: u16 = 9030;
 const DEFAULT_CATALOG: &str = "default_catalog";
@@ -62,6 +66,7 @@ struct ResolvedStandaloneServerOptions {
     mysql_port: u16,
     user: String,
     refresh_coordinator: RefreshCoordinatorConfig,
+    maintenance: MaintenanceCoordinatorConfig,
     /// Pre-loaded config to pass directly to engine open, bypassing a second
     /// disk read.  `None` falls back to the legacy disk/env load path.
     preloaded_config: Option<NovaRocksConfig>,
@@ -176,6 +181,11 @@ fn run_with_resolved_options(resolved: ResolvedStandaloneServerOptions) -> Resul
         &engine,
         resolved.refresh_coordinator.clone(),
     );
+    let _maintenance_coordinator =
+        crate::engine::mv_maintenance::start_maintenance_coordinator_for_server(
+            &engine,
+            resolved.maintenance.clone(),
+        );
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -203,13 +213,14 @@ fn resolve_server_options(
         .as_ref()
         .map(|cfg| cfg.server.host.clone())
         .unwrap_or_else(|| NovaRocksConfig::default().server.host);
-    let (mysql_port, user, refresh_coordinator) =
+    let (mysql_port, user, refresh_coordinator, maintenance) =
         extract_server_settings(standalone, opts.mysql_port)?;
     Ok(ResolvedStandaloneServerOptions {
         config_path: opts.config_path.clone(),
         mysql_port,
         user,
         refresh_coordinator,
+        maintenance,
         preloaded_config: None,
         start_local_exchange_execution: true,
         start_coordinator_report_grpc: true,
@@ -221,17 +232,28 @@ fn resolve_active_config_path(explicit: Option<&Path>) -> Option<PathBuf> {
     crate::common::app_config::resolve_config_path(explicit)
 }
 
-/// Extract server-layer settings (port, user, refresh coordinator) from an
+/// Extract server-layer settings (port, user, refresh coordinator, maintenance) from an
 /// optional [`StandaloneServerConfig`], applying `port_override` last.
 /// Shared by both the disk-load path and the pre-loaded-config path to keep
 /// validation logic in one place.
 fn extract_server_settings(
     standalone: Option<&crate::common::app_config::StandaloneServerConfig>,
     port_override: Option<u16>,
-) -> Result<(u16, String, RefreshCoordinatorConfig), String> {
+) -> Result<
+    (
+        u16,
+        String,
+        RefreshCoordinatorConfig,
+        MaintenanceCoordinatorConfig,
+    ),
+    String,
+> {
     let mut mysql_port = DEFAULT_MYSQL_PORT;
     let mut user = ROOT_USER.to_string();
     let mut refresh_coordinator = RefreshCoordinatorConfig::default();
+    let mut maintenance = MaintenanceCoordinatorConfig::from_standalone_config(
+        &crate::common::app_config::StandaloneServerConfig::default(),
+    );
 
     if let Some(sc) = standalone {
         mysql_port = sc.mysql_port;
@@ -243,13 +265,14 @@ fn extract_server_settings(
         }
         user = sc.user.clone();
         refresh_coordinator = RefreshCoordinatorConfig::from_standalone_config(sc);
+        maintenance = MaintenanceCoordinatorConfig::from_standalone_config(sc);
     }
 
     if let Some(port) = port_override {
         mysql_port = port;
     }
 
-    Ok((mysql_port, user, refresh_coordinator))
+    Ok((mysql_port, user, refresh_coordinator, maintenance))
 }
 
 /// Extract server-layer settings directly from a pre-loaded [`NovaRocksConfig`].
@@ -257,7 +280,7 @@ fn resolve_server_options_from_config(
     cfg: &NovaRocksConfig,
     port_override: Option<u16>,
 ) -> Result<ResolvedStandaloneServerOptions, String> {
-    let (mysql_port, user, refresh_coordinator) =
+    let (mysql_port, user, refresh_coordinator, maintenance) =
         extract_server_settings(cfg.standalone_server.as_ref(), port_override)?;
     Ok(ResolvedStandaloneServerOptions {
         // config_path is intentionally None here; callers that need the path
@@ -266,6 +289,7 @@ fn resolve_server_options_from_config(
         mysql_port,
         user,
         refresh_coordinator,
+        maintenance,
         preloaded_config: None,
         // Callers may override these; default to all-in-one behavior.
         start_local_exchange_execution: true,
@@ -294,7 +318,7 @@ async fn serve_forever(
     // Start the shared NovaRocksGrpc endpoint. It handles local exchange in
     // all-in-one mode and standalone write reports in role=fe coordinator mode.
     if start_local_exchange_execution || start_coordinator_report_grpc {
-        let grpc_port = crate::common::config::http_port();
+        let grpc_port = crate::common::config::grpc_port();
         let start_result = if start_local_exchange_execution {
             crate::service::grpc_server::start_grpc_exchange_server(&grpc_bind_host, grpc_port)
         } else {
@@ -617,6 +641,16 @@ fn is_session_noop(query: &str) -> bool {
     // mutation_flow::execute_update_statement, so it must reach the engine
     // instead of being silently swallowed.
     lower.starts_with("set ") || lower.starts_with("show ") || lower.starts_with("submit ")
+}
+
+fn is_backend_management_statement(query: &str) -> bool {
+    let dialect = StarRocksDialect;
+    let Ok(parser) = sqlparser::parser::Parser::new(&dialect).try_with_sql(query) else {
+        return false;
+    };
+    looks_like_add_backend(&parser)
+        || looks_like_drop_backend(&parser)
+        || looks_like_show_backends(&parser)
 }
 
 fn is_materialized_view_management_statement(query: &str) -> bool {
@@ -985,6 +1019,11 @@ async fn execute_statement_text(
                 shim.optimizer_settings.enable_table_prune_on_update = enabled
             }
             "enable_eliminate_agg" => shim.optimizer_settings.enable_eliminate_agg = enabled,
+            // Tri-state Option<bool> field: store Some(enabled) so an explicit
+            // SET is preserved as an override; None elsewhere means "default".
+            "enable_materialized_view_rewrite" => {
+                shim.optimizer_settings.enable_materialized_view_rewrite = Some(enabled)
+            }
             _ => return Ok(StatementResult::Ok),
         }
         return Ok(StatementResult::Ok);
@@ -1057,9 +1096,12 @@ async fn execute_statement_text(
     }
 
     if is_session_noop(trimmed)
+        && !is_backend_management_statement(trimmed)
         && !is_materialized_view_management_statement(trimmed)
         && !looks_like_show_alter_table_optimize(trimmed)
         && !looks_like_show_create_table(trimmed)
+        && !crate::engine::statement::looks_like_show_create_view(trimmed)
+        && !crate::engine::statement::looks_like_show_views(trimmed)
     {
         return Ok(StatementResult::Ok);
     }
@@ -1081,9 +1123,12 @@ async fn execute_statement_text(
         .map_err(|err| (ErrorKind::ER_PARSE_ERROR, err))?;
 
     if !is_supported_embedded_statement(&rewritten)
+        && !is_backend_management_statement(&rewritten)
         && !is_materialized_view_management_statement(&rewritten)
         && !looks_like_show_alter_table_optimize(&rewritten)
         && !looks_like_show_create_table(&rewritten)
+        && !crate::engine::statement::looks_like_show_create_view(&rewritten)
+        && !crate::engine::statement::looks_like_show_views(&rewritten)
     {
         return Err((
             ErrorKind::ER_NOT_SUPPORTED_YET,
@@ -1218,15 +1263,163 @@ fn query_result_to_user_variable_literal(
             .columns()
             .first()
             .ok_or((ErrorKind::ER_UNKNOWN_ERROR, "empty query chunk".to_string()))?;
-        let field_schema = chunk
-            .chunk_schema()
-            .slots()
-            .first()
-            .map(|slot| slot.field_schema());
-        return format_mysql_container_value_with_schema(column, 0, field_schema)
-            .map_err(|err| (ErrorKind::ER_UNKNOWN_ERROR, err));
+        let declared = result.columns.first().ok_or((
+            ErrorKind::ER_UNKNOWN_ERROR,
+            "user variable assignment missing column metadata".to_string(),
+        ))?;
+        return Ok(
+            query_result_cell_to_user_variable_sql(column, &declared.data_type, 0)
+                .map_err(|err| (ErrorKind::ER_UNKNOWN_ERROR, err))?,
+        );
     }
     Ok("null".to_string())
+}
+
+fn query_result_cell_to_user_variable_sql(
+    column: &arrow::array::ArrayRef,
+    declared_type: &arrow::datatypes::DataType,
+    row_idx: usize,
+) -> Result<String, String> {
+    if column.is_null(row_idx) {
+        return Ok("NULL".to_string());
+    }
+    if let Some(text) = arrow_text_cell(column, row_idx) {
+        return user_variable_text_to_sql(&text?, declared_type);
+    }
+    let literal = crate::engine::sql_expr::literal_from_batch(column, row_idx)?;
+    user_variable_literal_to_sql(&literal)
+}
+
+fn arrow_text_cell(
+    column: &arrow::array::ArrayRef,
+    row_idx: usize,
+) -> Option<Result<String, String>> {
+    match column.data_type() {
+        arrow::datatypes::DataType::Utf8 => {
+            let arr = column
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .ok_or_else(|| "failed to downcast user variable value to StringArray".to_string());
+            Some(arr.map(|arr| arr.value(row_idx).to_string()))
+        }
+        arrow::datatypes::DataType::LargeUtf8 => {
+            let arr = column
+                .as_any()
+                .downcast_ref::<arrow::array::LargeStringArray>()
+                .ok_or_else(|| {
+                    "failed to downcast user variable value to LargeStringArray".to_string()
+                });
+            Some(arr.map(|arr| arr.value(row_idx).to_string()))
+        }
+        arrow::datatypes::DataType::Binary => {
+            let arr = column
+                .as_any()
+                .downcast_ref::<arrow::array::BinaryArray>()
+                .ok_or_else(|| "failed to downcast user variable value to BinaryArray".to_string());
+            Some(arr.map(|arr| String::from_utf8_lossy(arr.value(row_idx)).into_owned()))
+        }
+        arrow::datatypes::DataType::LargeBinary => {
+            let arr = column
+                .as_any()
+                .downcast_ref::<arrow::array::LargeBinaryArray>()
+                .ok_or_else(|| {
+                    "failed to downcast user variable value to LargeBinaryArray".to_string()
+                });
+            Some(arr.map(|arr| String::from_utf8_lossy(arr.value(row_idx)).into_owned()))
+        }
+        _ => None,
+    }
+}
+
+fn user_variable_text_to_sql(
+    text: &str,
+    declared_type: &arrow::datatypes::DataType,
+) -> Result<String, String> {
+    use arrow::datatypes::DataType;
+
+    Ok(match declared_type {
+        DataType::Boolean
+        | DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Decimal128(_, _)
+        | DataType::Decimal256(_, _) => text.to_string(),
+        DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _) | DataType::Struct(_) => {
+            text.to_string()
+        }
+        DataType::Null => "NULL".to_string(),
+        _ => single_quoted_user_variable_sql(text),
+    })
+}
+
+fn user_variable_literal_to_sql(
+    literal: &crate::sql::parser::ast::Literal,
+) -> Result<String, String> {
+    use crate::sql::parser::ast::Literal;
+
+    Ok(match literal {
+        Literal::Null => "NULL".to_string(),
+        Literal::Bool(value) => {
+            if *value {
+                "TRUE".to_string()
+            } else {
+                "FALSE".to_string()
+            }
+        }
+        Literal::Int(value) => value.to_string(),
+        Literal::Float(value) => {
+            if !value.is_finite() {
+                return Err(format!(
+                    "non-finite floating literal is not supported: {value}"
+                ));
+            }
+            value.to_string()
+        }
+        Literal::String(value) | Literal::Date(value) => single_quoted_user_variable_sql(value),
+        Literal::Array(items) => format!(
+            "[{}]",
+            items
+                .iter()
+                .map(user_variable_literal_to_sql)
+                .collect::<Result<Vec<_>, _>>()?
+                .join(", ")
+        ),
+        Literal::Map(entries) => {
+            let mut args = Vec::with_capacity(entries.len() * 2);
+            for (key, value) in entries {
+                args.push(user_variable_literal_to_sql(key)?);
+                args.push(user_variable_literal_to_sql(value)?);
+            }
+            format!("map({})", args.join(", "))
+        }
+        Literal::Struct(values) => format!(
+            "row({})",
+            values
+                .iter()
+                .map(user_variable_literal_to_sql)
+                .collect::<Result<Vec<_>, _>>()?
+                .join(", ")
+        ),
+    })
+}
+
+fn single_quoted_user_variable_sql(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len() + 2);
+    for ch in value.chars() {
+        match ch {
+            '\'' => escaped.push_str("''"),
+            '\\' => escaped.push_str(r"\\"),
+            _ => escaped.push(ch),
+        }
+    }
+    format!("'{escaped}'")
 }
 
 fn resolve_catalog_name(
@@ -1527,6 +1720,86 @@ mod tests {
         );
     }
 
+    #[test]
+    fn query_result_to_user_variable_literal_preserves_array_expression() {
+        let mut builder = arrow::array::ListBuilder::new(arrow::array::StringBuilder::new());
+        builder.values().append_value("alpha");
+        builder.values().append_value("a'b\\c");
+        builder.append(true);
+        let array = std::sync::Arc::new(builder.finish()) as arrow::array::ArrayRef;
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("arr", array.data_type().clone(), true),
+            ])),
+            vec![array],
+        )
+        .expect("record batch");
+        let chunk = crate::engine::record_batch_to_chunk(batch).expect("chunk");
+        let result = crate::runtime::query_result::QueryResult {
+            columns: vec![crate::runtime::query_result::QueryResultColumn {
+                name: "arr".to_string(),
+                data_type: chunk.columns()[0].data_type().clone(),
+                nullable: true,
+                logical_type: None,
+            }],
+            chunks: vec![chunk],
+        };
+
+        assert_eq!(
+            query_result_to_user_variable_literal(&result).unwrap(),
+            "['alpha', 'a''b\\\\c']"
+        );
+    }
+
+    #[test]
+    fn query_result_to_user_variable_literal_preserves_remote_text_array_expression() {
+        let array = std::sync::Arc::new(arrow::array::BinaryArray::from(vec![Some(
+            br#"["alpha","beta"]"#.as_slice(),
+        )])) as arrow::array::ArrayRef;
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("arr", arrow::datatypes::DataType::Binary, true),
+            ])),
+            vec![array],
+        )
+        .expect("record batch");
+        let chunk = crate::engine::record_batch_to_chunk(batch).expect("chunk");
+        let result = crate::runtime::query_result::QueryResult {
+            columns: vec![crate::runtime::query_result::QueryResultColumn {
+                name: "arr".to_string(),
+                data_type: arrow::datatypes::DataType::List(std::sync::Arc::new(
+                    arrow::datatypes::Field::new("item", arrow::datatypes::DataType::Utf8, true),
+                )),
+                nullable: true,
+                logical_type: None,
+            }],
+            chunks: vec![chunk],
+        };
+
+        assert_eq!(
+            query_result_to_user_variable_literal(&result).unwrap(),
+            r#"["alpha","beta"]"#
+        );
+    }
+
+    #[test]
+    fn user_variable_literal_to_sql_formats_struct_and_map() {
+        use crate::sql::parser::ast::Literal;
+
+        let literal = Literal::Struct(vec![
+            Literal::Int(1),
+            Literal::Map(vec![(
+                Literal::String("k".to_string()),
+                Literal::Bool(true),
+            )]),
+        ]);
+
+        assert_eq!(
+            user_variable_literal_to_sql(&literal).unwrap(),
+            "row(1, map('k', TRUE))"
+        );
+    }
+
     /// Regression test: `parse_set_boolean` must not swallow `SET @i = 1`
     /// before `parse_set_user_variable_query` gets a chance to handle it.
     /// Previously, `"1"` matched the boolean token `"1"` and the user
@@ -1595,6 +1868,22 @@ mod tests {
         let sql = "CALL ice.system.rewrite_manifests(table => 'ns.orders')";
         assert!(!is_session_noop(sql));
         assert!(is_supported_embedded_statement(sql));
+    }
+
+    #[test]
+    fn backend_management_reaches_embedded_engine() {
+        assert!(
+            is_backend_management_statement("ADD BACKEND '127.0.0.1:19050'"),
+            "ADD BACKEND must bypass the standalone-server unsupported-SQL gate"
+        );
+        assert!(
+            is_backend_management_statement("DROP BACKEND '127.0.0.1:19050' FORCE"),
+            "DROP BACKEND must route to the engine-owned parser"
+        );
+        assert!(
+            is_backend_management_statement("SHOW BACKENDS"),
+            "SHOW BACKENDS must not be swallowed as a session no-op"
+        );
     }
 
     #[test]

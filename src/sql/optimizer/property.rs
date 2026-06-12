@@ -572,6 +572,22 @@ mod tests {
     }
 
     #[test]
+    fn ordering_prefix_stays_strict_without_equivalence_helper() {
+        let provided = OrderingSpec::Required(vec![SortKey {
+            column: ColumnId(1),
+            asc: true,
+            nulls_first: false,
+        }]);
+        let required = OrderingSpec::Required(vec![SortKey {
+            column: ColumnId(2),
+            asc: true,
+            nulls_first: false,
+        }]);
+
+        assert!(!provided.satisfies(&required));
+    }
+
+    #[test]
     fn window_ordering_places_partition_keys_before_order_keys() {
         let partition = TypedExpr {
             kind: ExprKind::ColumnRef {

@@ -168,6 +168,11 @@ struct SchemaSource {
 fn schema_sources() -> &'static [SchemaSource] {
     &[
         SchemaSource {
+            subject: "cluster.backend",
+            id: 1,
+            raw_schema: include_str!("schemas/cluster.backend/0001.avsc"),
+        },
+        SchemaSource {
             subject: "dictionary.snapshot",
             id: 1,
             raw_schema: include_str!("schemas/dictionary.snapshot/0001.avsc"),

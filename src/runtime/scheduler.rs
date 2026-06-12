@@ -33,11 +33,11 @@
 //!
 //! # Backend assignment
 //!
-//! - Multi-instance fragments: `backend_idx = instance_index` (instances 0..N
-//!   spread across backends 0..N; this is valid because N == number of
-//!   backends for scan fragments and any consumer that inherits from a scan).
+//! - Multi-instance fragments: instance `i` lands on live backend slot `i`.
+//!   The stored `backend_idx` remains the original configured backend index,
+//!   which may be sparse if the live snapshot filtered some backends out.
 //! - Single-instance fragments (including the root): `backend_idx =
-//!   (query_id.lo as usize) % N`.
+//!   live[(query_id.lo as usize) % N].0`.
 //!
 //! # Scan-split policy (Scheme C)
 //!
@@ -54,8 +54,13 @@ use crate::data_sinks::TPlanFragmentDestination;
 use crate::internal_service::TScanRangeParams;
 use crate::partitions::TPartitionType;
 use crate::runtime_filter::TRuntimeFilterProberParams;
-use crate::sql::codegen::{FragmentBuildResult, FragmentEdge, FragmentId, RuntimeFilterPlanResult};
+use crate::sql::codegen::{
+    FragmentBuildResult, FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind,
+    RuntimeFilterPlanResult,
+};
 use crate::types::{TNetworkAddress, TUniqueId};
+
+type LiveBackend = (usize, SocketAddr);
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -71,7 +76,7 @@ pub(crate) struct FragmentInstancePlacement {
     pub(crate) fragment_id: FragmentId,
     pub(crate) instance_index: usize,
     pub(crate) finst_id: TUniqueId,
-    /// Index into `FragmentScheduler::backends`.
+    /// Original index into `FragmentScheduler::backends`.
     pub(crate) backend_idx: usize,
     /// Scan ranges for this instance, keyed by plan node id.
     pub(crate) scan_ranges: BTreeMap<i32, Vec<TScanRangeParams>>,
@@ -126,9 +131,20 @@ impl FragmentScheduler {
         edges: &[FragmentEdge],
         query_id: TUniqueId,
     ) -> Result<SchedulingPlan, String> {
-        let n = self.backends.len();
+        let live = self.full_live_snapshot();
+        self.assign_with_live(fragments, edges, query_id, &live)
+    }
+
+    pub(crate) fn assign_with_live(
+        &self,
+        fragments: &[FragmentBuildResult],
+        edges: &[FragmentEdge],
+        query_id: TUniqueId,
+        live: &[LiveBackend],
+    ) -> Result<SchedulingPlan, String> {
+        let n = live.len();
         if n == 0 {
-            return Err("scheduler has no backends".into());
+            return Err("no live backend available".into());
         }
 
         // Step 1: topological sort (leaves first, root last).
@@ -142,13 +158,21 @@ impl FragmentScheduler {
             fragments.iter().map(|fr| (fr.fragment_id, fr)).collect();
 
         // Step 3: compute instance counts in topo order.
-        // Incoming edges: target -> [(source, partition_type)]
-        let mut incoming: BTreeMap<FragmentId, Vec<(FragmentId, TPartitionType)>> = BTreeMap::new();
+        // Incoming edges: target -> [(source, partition_type, stream_kind)].
+        let mut incoming: BTreeMap<
+            FragmentId,
+            Vec<(FragmentId, TPartitionType, FragmentStreamKind)>,
+        > = BTreeMap::new();
         for e in edges {
-            incoming
-                .entry(e.target_fragment_id)
-                .or_default()
-                .push((e.source_fragment_id, e.output_partition.type_));
+            let stream_kind = match e.edge_kind {
+                FragmentEdgeKind::Stream => e.stream_kind,
+                FragmentEdgeKind::CteMulticast { .. } => FragmentStreamKind::Broadcast,
+            };
+            incoming.entry(e.target_fragment_id).or_default().push((
+                e.source_fragment_id,
+                e.output_partition.type_,
+                stream_kind,
+            ));
         }
 
         let mut instance_counts: BTreeMap<FragmentId, usize> = BTreeMap::new();
@@ -157,7 +181,17 @@ impl FragmentScheduler {
                 .get(&fid)
                 .ok_or_else(|| format!("fragment {fid} missing from fragment list"))?;
 
-            let count = if !find_scan_plan_nodes(&fr.plan).is_empty() {
+            let has_gather_input = incoming
+                .get(&fid)
+                .map(|ins| {
+                    ins.iter()
+                        .any(|(_, _, stream_kind)| *stream_kind == FragmentStreamKind::Gather)
+                })
+                .unwrap_or(false);
+
+            let count = if has_gather_input {
+                1
+            } else if !find_scan_plan_nodes(&fr.plan).is_empty() {
                 // Scan fragment: one instance per backend.
                 n
             } else {
@@ -166,7 +200,7 @@ impl FragmentScheduler {
                     .get(&fid)
                     .map(|ins| {
                         ins.iter()
-                            .filter_map(|(src_id, ptype)| {
+                            .filter_map(|(src_id, ptype, _)| {
                                 if *ptype == TPartitionType::HASH_PARTITIONED
                                     || *ptype == TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED
                                 {
@@ -187,7 +221,7 @@ impl FragmentScheduler {
         instance_counts.insert(root_fragment_id, 1);
 
         // Step 5: determine root backend index.
-        let root_backend_idx = (query_id.lo as usize) % n;
+        let root_backend_idx = live[(query_id.lo as usize) % n].0;
 
         // Step 6: build placements.
         let mut by_fragment: BTreeMap<FragmentId, Vec<FragmentInstancePlacement>> = BTreeMap::new();
@@ -202,7 +236,7 @@ impl FragmentScheduler {
                     let backend_idx = if count == 1 {
                         root_backend_idx
                     } else {
-                        instance_index
+                        live[instance_index].0
                     };
                     // finst_id encoding: hi = query_id.hi, lo = (fragment_id << 16) | instance_index.
                     // Unique within a query as long as instance_index < 65536 (always true:
@@ -263,6 +297,17 @@ impl FragmentScheduler {
     /// `TPlanFragmentDestination` entries are built, and the full list is
     /// appended to every source-fragment instance's `destinations` vec.
     pub(crate) fn fill_destinations(&self, plan: &mut SchedulingPlan, edges: &[FragmentEdge]) {
+        let live = self.full_live_snapshot();
+        self.fill_destinations_with_live(plan, edges, &live)
+            .expect("configured backend snapshot should resolve all placements");
+    }
+
+    pub(crate) fn fill_destinations_with_live(
+        &self,
+        plan: &mut SchedulingPlan,
+        edges: &[FragmentEdge],
+        live: &[LiveBackend],
+    ) -> Result<(), String> {
         for e in edges {
             // Snapshot target placements to avoid borrow conflict.
             let target_placements: Vec<(TUniqueId, usize)> = plan
@@ -279,8 +324,8 @@ impl FragmentScheduler {
             let dests: Vec<TPlanFragmentDestination> = target_placements
                 .into_iter()
                 .map(|(finst_id, backend_idx)| {
-                    let addr = &self.backends[backend_idx];
-                    TPlanFragmentDestination::new(
+                    let addr = live_backend_addr(live, backend_idx)?;
+                    Ok::<TPlanFragmentDestination, String>(TPlanFragmentDestination::new(
                         finst_id,
                         None::<TNetworkAddress>,
                         Some(TNetworkAddress::new(
@@ -288,9 +333,9 @@ impl FragmentScheduler {
                             addr.port() as i32,
                         )),
                         None::<i32>,
-                    )
+                    ))
                 })
-                .collect();
+                .collect::<Result<Vec<_>, _>>()?;
 
             if let Some(src_instances) = plan.by_fragment.get_mut(&e.source_fragment_id) {
                 for inst in src_instances.iter_mut() {
@@ -298,6 +343,7 @@ impl FragmentScheduler {
                 }
             }
         }
+        Ok(())
     }
 
     /// Fill `runtime_filter_prober_params` on each build-fragment instance.
@@ -309,6 +355,17 @@ impl FragmentScheduler {
         plan: &mut SchedulingPlan,
         rf_plan: &RuntimeFilterPlanResult,
     ) {
+        let live = self.full_live_snapshot();
+        self.fill_runtime_filter_params_with_live(plan, rf_plan, &live)
+            .expect("configured backend snapshot should resolve all placements");
+    }
+
+    pub(crate) fn fill_runtime_filter_params_with_live(
+        &self,
+        plan: &mut SchedulingPlan,
+        rf_plan: &RuntimeFilterPlanResult,
+        live: &[LiveBackend],
+    ) -> Result<(), String> {
         // Collect probe instances per filter_id.
         // probe_side_filters: HashMap<FragmentId, Vec<(filter_id, scan_node_id)>>
         let mut probe_instances_by_filter: BTreeMap<i32, Vec<(TUniqueId, usize)>> = BTreeMap::new();
@@ -336,16 +393,16 @@ impl FragmentScheduler {
                         let probers: Vec<TRuntimeFilterProberParams> = probe_list
                             .iter()
                             .map(|(finst_id, backend_idx)| {
-                                let addr = &self.backends[*backend_idx];
-                                TRuntimeFilterProberParams::new(
+                                let addr = live_backend_addr(live, *backend_idx)?;
+                                Ok(TRuntimeFilterProberParams::new(
                                     Some(finst_id.clone()),
                                     Some(TNetworkAddress::new(
                                         addr.ip().to_string(),
                                         addr.port() as i32,
                                     )),
-                                )
+                                ))
                             })
-                            .collect();
+                            .collect::<Result<Vec<_>, String>>()?;
                         for inst in build_instances.iter_mut() {
                             inst.runtime_filter_prober_params
                                 .insert(*filter_id, probers.clone());
@@ -354,6 +411,7 @@ impl FragmentScheduler {
                 }
             }
         }
+        Ok(())
     }
 
     /// Fill `per_exch_num_senders` on each target-fragment instance.
@@ -382,6 +440,10 @@ impl FragmentScheduler {
                 }
             }
         }
+    }
+
+    fn full_live_snapshot(&self) -> Vec<LiveBackend> {
+        self.backends.iter().copied().enumerate().collect()
     }
 }
 
@@ -473,6 +535,12 @@ pub(crate) fn find_scan_plan_nodes(plan: &crate::plan_nodes::TPlan) -> Vec<i32> 
         .collect()
 }
 
+fn live_backend_addr(live: &[LiveBackend], backend_idx: usize) -> Result<SocketAddr, String> {
+    live.iter()
+        .find_map(|(idx, addr)| (*idx == backend_idx).then_some(*addr))
+        .ok_or_else(|| format!("backend index {backend_idx} missing from live snapshot"))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -491,7 +559,9 @@ mod tests {
     use crate::partitions;
     use crate::plan_nodes;
     use crate::sql::codegen::RuntimeFilterPlanResult;
-    use crate::sql::codegen::{FragmentBuildResult, FragmentEdge, FragmentEdgeKind, OutputColumn};
+    use crate::sql::codegen::{
+        FragmentBuildResult, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
+    };
     use crate::types;
 
     // -----------------------------------------------------------------------
@@ -516,6 +586,10 @@ mod tests {
 
     fn make_query_id(hi: i64, lo: i64) -> types::TUniqueId {
         types::TUniqueId::new(hi, lo)
+    }
+
+    fn dummy_query_id() -> types::TUniqueId {
+        make_query_id(1, 0)
     }
 
     fn minimal_exec_params(
@@ -648,6 +722,34 @@ mod tests {
         ptype: partitions::TPartitionType,
         exch_node_id: i32,
     ) -> FragmentEdge {
+        let stream_kind = match ptype {
+            partitions::TPartitionType::HASH_PARTITIONED
+            | partitions::TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED => {
+                FragmentStreamKind::Partitioned
+            }
+            partitions::TPartitionType::UNPARTITIONED => FragmentStreamKind::Gather,
+            _ => FragmentStreamKind::Other,
+        };
+        fake_stream_edge(src, tgt, ptype, exch_node_id, stream_kind)
+    }
+
+    fn fake_broadcast_edge(src: FragmentId, tgt: FragmentId, exch_node_id: i32) -> FragmentEdge {
+        fake_stream_edge(
+            src,
+            tgt,
+            partitions::TPartitionType::UNPARTITIONED,
+            exch_node_id,
+            FragmentStreamKind::Broadcast,
+        )
+    }
+
+    fn fake_stream_edge(
+        src: FragmentId,
+        tgt: FragmentId,
+        ptype: partitions::TPartitionType,
+        exch_node_id: i32,
+        stream_kind: FragmentStreamKind,
+    ) -> FragmentEdge {
         FragmentEdge {
             source_fragment_id: src,
             target_fragment_id: tgt,
@@ -658,6 +760,7 @@ mod tests {
                 None::<Vec<partitions::TRangePartition>>,
                 None::<Vec<partitions::TBucketProperty>>,
             ),
+            stream_kind,
             edge_kind: FragmentEdgeKind::Stream,
         }
     }
@@ -665,6 +768,57 @@ mod tests {
     // -----------------------------------------------------------------------
     // Tests
     // -----------------------------------------------------------------------
+
+    mod live_filter_tests {
+        use super::*;
+
+        #[test]
+        fn assign_with_empty_live_snapshot_returns_explicit_error() {
+            let scheduler = FragmentScheduler::new(three_backends());
+            let result = scheduler.assign_with_live(&[], &[], dummy_query_id(), &[]);
+            assert!(result.is_err());
+            assert!(
+                result.unwrap_err().contains("no live backend available"),
+                "empty live snapshot should return explicit error"
+            );
+        }
+
+        #[test]
+        fn sparse_live_snapshot_preserves_original_backend_indices() {
+            let scheduler = FragmentScheduler::new(three_backends());
+            let fragments = vec![fake_fragment(0, Some(1), 2), fake_fragment(1, None, 0)];
+            let edges = vec![fake_edge(
+                0,
+                1,
+                partitions::TPartitionType::UNPARTITIONED,
+                10,
+            )];
+            let live = vec![(0usize, be("10.0.0.1:9010")), (2usize, be("10.0.0.3:9010"))];
+
+            let mut plan = scheduler
+                .assign_with_live(&fragments, &edges, make_query_id(7, 1), &live)
+                .expect("assign_with_live");
+            scheduler
+                .fill_destinations_with_live(&mut plan, &edges, &live)
+                .expect("fill_destinations_with_live");
+
+            let placements = &plan.by_fragment[&0];
+            assert_eq!(placements.len(), 2, "live.len() controls instance count");
+            assert_eq!(placements[0].backend_idx, 0);
+            assert_eq!(placements[1].backend_idx, 2);
+            assert_eq!(
+                plan.root_backend_idx, 2,
+                "query_id.lo=1 chooses live slot 1"
+            );
+
+            for inst in placements {
+                let dest = inst.destinations.first().expect("root destination");
+                let brpc = dest.brpc_server.as_ref().expect("destination address");
+                assert_eq!(brpc.hostname, "10.0.0.3");
+                assert_eq!(brpc.port, 9010);
+            }
+        }
+    }
 
     #[test]
     fn scan_root_fragment_forced_to_one_instance() {
@@ -768,9 +922,9 @@ mod tests {
     fn mixed_partition_edges_hash_wins_over_unpartitioned() {
         // Topology:
         //   F0(scan, N=2) -> HASH_PARTITIONED     -> F2(consumer, non-root)
-        //   F1(non-scan)  -> UNPARTITIONED         -> F2
+        //   F1(non-scan)  -> BROADCAST             -> F2
         //   F2            -> UNPARTITIONED         -> F3(root)
-        // F2 should get N=2 instances (HASH edge determines count; UNPARTITIONED is ignored).
+        // F2 should get N=2 instances (HASH edge determines count; broadcast is ignored).
         let backends = two_backends();
         let scheduler = FragmentScheduler::new(backends);
         let fragments = vec![
@@ -781,7 +935,7 @@ mod tests {
         ];
         let edges = vec![
             fake_edge(0, 2, partitions::TPartitionType::HASH_PARTITIONED, 10),
-            fake_edge(1, 2, partitions::TPartitionType::UNPARTITIONED, 20),
+            fake_broadcast_edge(1, 2, 20),
             fake_edge(2, 3, partitions::TPartitionType::UNPARTITIONED, 30),
         ];
         let plan = scheduler
@@ -822,6 +976,29 @@ mod tests {
             plan.by_fragment[&1].len(),
             1,
             "unpartitioned gather -> 1 instance"
+        );
+    }
+
+    #[test]
+    fn incoming_gather_forces_scan_consumer_to_one_instance() {
+        let backends = three_backends();
+        let scheduler = FragmentScheduler::new(backends);
+        let fragments = vec![
+            fake_fragment(0, None, 0),    // gathered producer
+            fake_fragment(1, Some(7), 6), // consumer also owns a scan
+            fake_fragment(2, None, 0),    // root
+        ];
+        let edges = vec![
+            fake_edge(0, 1, partitions::TPartitionType::UNPARTITIONED, 10),
+            fake_edge(1, 2, partitions::TPartitionType::HASH_PARTITIONED, 20),
+        ];
+        let plan = scheduler
+            .assign(&fragments, &edges, make_query_id(1, 7))
+            .expect("assign");
+        assert_eq!(
+            plan.by_fragment[&1].len(),
+            1,
+            "a true Gather input must not be consumed by every scan instance"
         );
     }
 
@@ -1163,7 +1340,7 @@ mod tests {
         let edges: Vec<FragmentEdge> = vec![];
         let result = scheduler.assign(&fragments, &edges, make_query_id(1, 1));
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("scheduler has no backends"));
+        assert!(result.unwrap_err().contains("no live backend available"));
     }
 
     #[test]

@@ -19,6 +19,7 @@ pub(crate) mod runtime_filter_pass;
 pub(crate) mod search;
 pub(crate) mod statistics;
 pub(crate) mod stats;
+pub(crate) mod topn_proof;
 
 pub(crate) use memo::Memo;
 pub(crate) use operator::Operator;
@@ -26,7 +27,7 @@ pub(crate) use physical_plan::PhysicalPlanNode;
 pub(crate) use property::PhysicalPropertySet;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -63,6 +64,7 @@ pub(crate) fn optimize(
     table_stats: &HashMap<String, TableStatistics>,
     factory: ColumnRefFactory,
     dictionary_provider: Option<std::sync::Arc<dyn rewrite::context::QueryDictionaryProvider>>,
+    mv_candidates: Vec<cascades_rules::mv_rewrite::MvRewriteCandidate>,
 ) -> Result<PhysicalPlanNode, String> {
     let deadline = Instant::now() + OPTIMIZE_TIMEOUT;
 
@@ -128,8 +130,15 @@ pub(crate) fn optimize(
 
     check_deadline(deadline)?;
 
-    // 7. Explore: apply transformation rules (logical -> logical).
-    let transform_rules = cascades_rules::all_transformation_rules();
+    // 7. Explore: apply transformation rules (logical -> logical). When the
+    //    caller supplied usable MV candidates, append the MvRewrite rule so it
+    //    can inject MV-scan alternatives alongside the other transformations.
+    let mut transform_rules = cascades_rules::all_transformation_rules();
+    if !mv_candidates.is_empty() {
+        transform_rules.push(Box::new(
+            cascades_rules::mv_rewrite::rule::MvRewriteRule::new(mv_candidates),
+        ));
+    }
     explore(&mut memo, &transform_rules, &options, deadline)?;
 
     check_deadline(deadline)?;
@@ -189,6 +198,7 @@ pub(crate) fn is_known_rule_name(name: &str) -> bool {
             .any(|r| r.name() == name)
         || rewrite::registry::is_known_rewrite_rule_name(name)
         || name == runtime_filter_pass::RUNTIME_FILTER_RULE
+        || name == cascades_rules::mv_rewrite::RULE_NAME
 }
 
 fn check_deadline(deadline: Instant) -> Result<(), String> {
@@ -279,10 +289,16 @@ fn explore(
     Ok(())
 }
 
-/// Apply implementation rules to all groups.
+/// Apply implementation rules to all groups to a fixed point.
 ///
-/// Single pass — each logical expr gets physical alternatives once.
+/// Some implementation rules allocate intermediate groups while lowering one
+/// logical expression. The fixed-point loop visits those new groups, but each
+/// logical expression is implemented by each rule at most once; otherwise rules
+/// that allocate fresh child groups on every apply can keep the loop alive
+/// indefinitely. Physical alternatives are deduplicated by both operator and
+/// children so child-distinct alternatives remain visible to search.
 fn implement(memo: &mut Memo, rules: &[Box<dyn Rule>], options: &options::OptimizerOptions) {
+    let mut implemented_logical_rules = HashSet::new();
     let mut changed = true;
     while changed {
         changed = false;
@@ -295,12 +311,22 @@ fn implement(memo: &mut Memo, rules: &[Box<dyn Rule>], options: &options::Optimi
                         continue;
                     }
                     if rule.matches(&expr.op) {
+                        let application_key = (
+                            group_id,
+                            expr.children.clone(),
+                            format!("{:?}", expr.op),
+                            rule.name().to_string(),
+                        );
+                        if !implemented_logical_rules.insert(application_key) {
+                            continue;
+                        }
                         let new_exprs = rule.apply(expr, memo);
                         for new_expr in new_exprs {
-                            let already_exists = memo.groups[group_id]
-                                .physical_exprs
-                                .iter()
-                                .any(|existing| op_equal(&existing.op, &new_expr.op));
+                            let already_exists =
+                                memo.groups[group_id].physical_exprs.iter().any(|existing| {
+                                    existing.children == new_expr.children
+                                        && op_equal(&existing.op, &new_expr.op)
+                                });
                             if !already_exists {
                                 let mexpr = MExpr {
                                     id: memo.next_expr_id(),
@@ -330,6 +356,13 @@ fn op_equal(a: &Operator, b: &Operator) -> bool {
 #[cfg(test)]
 mod is_known_rule_name_tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::sql::optimizer::memo::{MExpr, Memo};
+    use crate::sql::optimizer::operator::{
+        LogicalLimitOp, LogicalValuesOp, Operator, PhysicalLimitOp, PhysicalValuesOp,
+    };
+    use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
 
     #[test]
     fn optimize_accepts_migrated_query_rewrite_pipeline() {
@@ -344,9 +377,146 @@ mod is_known_rule_name_tests {
             required_output_columns: None,
         });
         let factory = ColumnRefFactory::new();
-        let physical = optimize(plan, &HashMap::new(), factory, None).expect("optimize values");
+        let physical =
+            optimize(plan, &HashMap::new(), factory, None, Vec::new()).expect("optimize values");
         let physical_debug = format!("{physical:?}");
         assert!(physical_debug.contains("PhysicalValues"));
+    }
+
+    struct AllocatingLimitRule {
+        apply_count: AtomicUsize,
+    }
+
+    impl Rule for AllocatingLimitRule {
+        fn name(&self) -> &str {
+            "AllocatingLimitRule"
+        }
+
+        fn rule_type(&self) -> RuleType {
+            RuleType::Implementation
+        }
+
+        fn matches(&self, op: &Operator) -> bool {
+            matches!(op, Operator::LogicalLimit(_))
+        }
+
+        fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
+            let previous_count = self.apply_count.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(
+                previous_count, 0,
+                "same logical expression should not be implemented twice by one rule"
+            );
+            let Operator::LogicalLimit(limit) = &expr.op else {
+                return vec![];
+            };
+            let child_group = memo.new_group(MExpr {
+                id: memo.next_expr_id(),
+                op: Operator::PhysicalValues(PhysicalValuesOp {
+                    rows: vec![],
+                    columns: vec![],
+                }),
+                children: vec![],
+            });
+            vec![NewExpr {
+                op: Operator::PhysicalLimit(PhysicalLimitOp {
+                    limit: limit.limit,
+                    offset: limit.offset,
+                }),
+                children: vec![child_group],
+            }]
+        }
+    }
+
+    struct LimitToPhysicalWithOriginalChildren;
+
+    impl Rule for LimitToPhysicalWithOriginalChildren {
+        fn name(&self) -> &str {
+            "LimitToPhysicalWithOriginalChildren"
+        }
+
+        fn rule_type(&self) -> RuleType {
+            RuleType::Implementation
+        }
+
+        fn matches(&self, op: &Operator) -> bool {
+            matches!(op, Operator::LogicalLimit(_))
+        }
+
+        fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+            let Operator::LogicalLimit(limit) = &expr.op else {
+                return vec![];
+            };
+            vec![NewExpr {
+                op: Operator::PhysicalLimit(PhysicalLimitOp {
+                    limit: limit.limit,
+                    offset: limit.offset,
+                }),
+                children: expr.children.clone(),
+            }]
+        }
+    }
+
+    fn logical_values_group(memo: &mut Memo) -> usize {
+        memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalValues(LogicalValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
+            children: vec![],
+        })
+    }
+
+    fn logical_limit(child: usize) -> MExpr {
+        MExpr {
+            id: 0,
+            op: Operator::LogicalLimit(LogicalLimitOp {
+                limit: Some(1),
+                offset: Some(0),
+            }),
+            children: vec![child],
+        }
+    }
+
+    #[test]
+    fn implement_applies_allocating_rule_once_per_logical_expression() {
+        let mut memo = Memo::new();
+        let child = logical_values_group(&mut memo);
+        let root = memo.new_group(logical_limit(child));
+        let rule: Box<dyn Rule> = Box::new(AllocatingLimitRule {
+            apply_count: AtomicUsize::new(0),
+        });
+        let options = options::OptimizerOptions::default_settings();
+
+        implement(&mut memo, &[rule], &options);
+
+        assert_eq!(memo.groups[root].physical_exprs.len(), 1);
+        assert_eq!(memo.groups.len(), 3);
+    }
+
+    #[test]
+    fn implement_preserves_child_distinct_physical_alternatives() {
+        let mut memo = Memo::new();
+        let child_a = logical_values_group(&mut memo);
+        let child_b = logical_values_group(&mut memo);
+        let root = memo.new_group(logical_limit(child_a));
+        memo.add_expr_to_group(root, logical_limit(child_b));
+        let rule: Box<dyn Rule> = Box::new(LimitToPhysicalWithOriginalChildren);
+        let options = options::OptimizerOptions::default_settings();
+
+        implement(&mut memo, &[rule], &options);
+
+        let physical_children: Vec<_> = memo.groups[root]
+            .physical_exprs
+            .iter()
+            .filter_map(|expr| match expr.op {
+                Operator::PhysicalLimit(_) => Some(expr.children.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(physical_children.len(), 2);
+        assert!(physical_children.contains(&vec![child_a]));
+        assert!(physical_children.contains(&vec![child_b]));
     }
 
     #[test]
@@ -360,6 +530,11 @@ mod is_known_rule_name_tests {
     #[test]
     fn is_known_rule_name_recognizes_split_aggregate_rule() {
         assert!(is_known_rule_name("SplitAggregateRule"));
+    }
+
+    #[test]
+    fn is_known_rule_name_recognizes_mv_rewrite() {
+        assert!(is_known_rule_name("MvRewrite"));
     }
 
     #[test]
@@ -601,8 +776,8 @@ mod is_known_rule_name_tests {
             required_output_columns: None,
         });
         let factory = ColumnRefFactory::new();
-        let physical =
-            optimize(plan, &HashMap::new(), factory, None).expect("optimize assert one row");
+        let physical = optimize(plan, &HashMap::new(), factory, None, Vec::new())
+            .expect("optimize assert one row");
         let physical_debug = format!("{physical:?}");
         assert!(physical_debug.contains("PhysicalAssertOneRow"));
     }
@@ -644,6 +819,7 @@ mod is_known_rule_name_tests {
                 nullable: true,
                 is_internal: true,
             },
+            inner_output_column_id: ColumnId(5),
             correlation_column_ids: vec![],
             correlation_conjuncts: vec![],
             residual_predicate: None,
@@ -653,17 +829,140 @@ mod is_known_rule_name_tests {
             required_output_columns: None,
         });
 
+        // Disable ALL rules that could eliminate the Apply: ApplyException
+        // (the SubqueryRewrite guard) AND the M1b decorrelation rules
+        // (ScalarApplyToJoin, PushDownApplyAggFilter, PushDownApplyFilter).
+        // With all three disabled, the Apply survives the SubqueryRewrite stage
+        // and the non-disableable optimize() backstop (find_residual_apply) fires.
         let settings = crate::sql::optimizer::options::SessionOptimizerSettings {
-            disabled_rules: vec!["ApplyException".to_string()],
+            disabled_rules: vec![
+                "ApplyException".to_string(),
+                "ScalarApplyToJoin".to_string(),
+                "PushDownApplyAggFilter".to_string(),
+                "PushDownApplyFilter".to_string(),
+            ],
             ..Default::default()
         };
         let err = crate::sql::optimizer::options::with_session_optimizer_settings(settings, || {
-            optimize(plan, &HashMap::new(), ColumnRefFactory::new(), None)
+            optimize(
+                plan,
+                &HashMap::new(),
+                ColumnRefFactory::new(),
+                None,
+                Vec::new(),
+            )
         })
         .expect_err("backstop must reject the residual apply");
         assert!(
             err.contains("subquery decorrelation failed"),
             "unexpected error: {err}"
+        );
+    }
+
+    /// End-to-end proof: the full analyze → plan_query → optimize chain in
+    /// apply mode turns a scalar subquery into a `LogicalPlan::Apply`, which
+    /// M1b's `SubqueryRewrite` decorrelation rules (PushDownApplyAggFilter +
+    /// ScalarApplyToJoin) rewrite into a LEFT OUTER JOIN over a vector
+    /// aggregate. The optimized physical plan contains a HashJoin (or NestLoop)
+    /// and no residual Apply node or "subquery decorrelation failed" error.
+    ///
+    /// Both the analyze and optimize calls run inside the same
+    /// `with_session_optimizer_settings` closure so both read the same
+    /// session-level `subquery_unnest_mode = Apply`.
+    #[test]
+    fn apply_mode_scalar_subquery_decorrelates_to_join() {
+        use crate::sql::catalog::{CatalogProvider, ColumnDef, ScanSource, TableDef};
+        use crate::sql::column_id::ColumnRefFactory;
+        use crate::sql::optimizer::options::{
+            SessionOptimizerSettings, SubqueryUnnestMode, with_session_optimizer_settings,
+        };
+
+        // Minimal catalog providing t1(k1, k2) and t2(k1, k2) — the same
+        // shape the planner and analyzer test modules use.
+        struct MinimalCatalog;
+        impl CatalogProvider for MinimalCatalog {
+            fn get_table(&self, _db: &str, table: &str) -> Result<TableDef, String> {
+                match table {
+                    "t1" | "t2" => Ok(TableDef {
+                        name: table.to_string(),
+                        columns: vec![
+                            ColumnDef {
+                                name: "k1".to_string(),
+                                data_type: arrow::datatypes::DataType::Int64,
+                                nullable: true,
+                                write_default: None,
+                                logical_type: None,
+                            },
+                            ColumnDef {
+                                name: "k2".to_string(),
+                                data_type: arrow::datatypes::DataType::Int64,
+                                nullable: true,
+                                write_default: None,
+                                logical_type: None,
+                            },
+                        ],
+                        iceberg_row_lineage_metadata_columns: vec![],
+                        source: ScanSource::StarRocks {
+                            db_id: 0,
+                            table_id: 0,
+                        },
+                    }),
+                    other => Err(format!("table not found: {other}")),
+                }
+            }
+        }
+
+        // A correlated WHERE-clause scalar subquery: aggregate inner with an
+        // outer-column equality predicate. M1b decorrelates this shape into a
+        // LEFT OUTER JOIN over a vector aggregate.
+        let sql = "SELECT k1 FROM t1 WHERE k1 = (SELECT max(k2) FROM t2 WHERE t2.k1 = t1.k1)";
+
+        let settings = SessionOptimizerSettings {
+            subquery_unnest_mode: SubqueryUnnestMode::Apply,
+            ..Default::default()
+        };
+
+        let physical = with_session_optimizer_settings(settings, || {
+            // parse → analyze
+            let dialect = crate::sql::parser::dialect::StarRocksDialect;
+            let mut ast = sqlparser::parser::Parser::parse_sql(&dialect, sql)
+                .map_err(|e| e.to_string())
+                .expect("parse must succeed");
+            let stmt = ast.pop().expect("expected a statement");
+            let query = match stmt {
+                sqlparser::ast::Statement::Query(q) => q,
+                _ => panic!("expected a query"),
+            };
+            let (resolved, cte_registry, mut factory) =
+                crate::sql::analyzer::analyze(&query, &MinimalCatalog, "default")
+                    .expect("analyze in apply mode must succeed");
+
+            // plan_query: turns the ApplyScalarSpec into LogicalPlan::Apply.
+            let plan = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)
+                .expect("plan_query in apply mode must succeed");
+
+            // optimize: M1b's decorrelation rules must rewrite the Apply to a
+            // join; no ApplyException error, no residual Apply.
+            optimize(
+                plan,
+                &HashMap::new(),
+                ColumnRefFactory::new(),
+                None,
+                Vec::new(),
+            )
+        })
+        .expect("optimize must succeed: M1b decorrelates correlated aggregate scalar subquery");
+
+        let physical_debug = format!("{physical:?}");
+        // The correlated aggregate scalar path becomes a LEFT OUTER JOIN (HashJoin or NestLoop).
+        assert!(
+            physical_debug.contains("HashJoin") || physical_debug.contains("NestLoop"),
+            "expected a join in the decorrelated plan; got: {physical_debug}"
+        );
+        // No residual Apply must survive.
+        assert!(
+            !physical_debug.contains("Apply"),
+            "residual Apply must not appear in the decorrelated plan; got: {physical_debug}"
         );
     }
 }

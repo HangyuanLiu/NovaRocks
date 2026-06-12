@@ -5,7 +5,7 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -26,20 +26,29 @@ pub(crate) enum ClusterProcessRole {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BePorts {
     pub(crate) http: u16,
-    pub(crate) starlet: u16,
+    pub(crate) grpc: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CrossProcessRuntime {
     pub(crate) be: Vec<BePorts>,
     pub(crate) fe_http_port: u16,
-    pub(crate) fe_starlet_port: u16,
+    pub(crate) fe_grpc_port: u16,
     pub(crate) fe_mysql_port: u16,
 }
 
-pub(crate) trait ServerHandle {
+pub(crate) trait ServerHandle: Send {
     fn target_host(&self) -> Option<&str>;
     fn target_port(&self) -> Option<u16>;
+    fn supports_fault_injection(&self) -> bool {
+        false
+    }
+    fn kill_be(&mut self, index: usize) -> Result<()> {
+        bail!("BE kill is unsupported by this server mode (index={index})")
+    }
+    fn restart_be(&mut self, index: usize) -> Result<()> {
+        bail!("BE restart is unsupported by this server mode (index={index})")
+    }
 }
 
 pub(crate) fn launch_server(
@@ -64,7 +73,10 @@ pub(crate) fn validate_cluster_args(mode: ClusterMode, cluster_size: usize) -> R
         bail!("--cluster-size must be >= 1");
     }
     if mode == ClusterMode::AllInOne && cluster_size > 1 {
-        bail!("all-in-one mode requires --cluster-size 1 (got {})", cluster_size);
+        bail!(
+            "all-in-one mode requires --cluster-size 1 (got {})",
+            cluster_size
+        );
     }
     Ok(())
 }
@@ -166,20 +178,14 @@ pub(crate) fn render_cross_process_config(
                 Value::Integer(i64::from(runtime.fe_http_port)),
             );
             server.insert(
-                "starlet_port".to_string(),
-                Value::Integer(i64::from(runtime.fe_starlet_port)),
+                "grpc_port".to_string(),
+                Value::Integer(i64::from(runtime.fe_grpc_port)),
             );
         }
         ClusterProcessRole::Be => {
             let be = &runtime.be[be_index];
-            server.insert(
-                "http_port".to_string(),
-                Value::Integer(i64::from(be.http)),
-            );
-            server.insert(
-                "starlet_port".to_string(),
-                Value::Integer(i64::from(be.starlet)),
-            );
+            server.insert("http_port".to_string(), Value::Integer(i64::from(be.http)));
+            server.insert("grpc_port".to_string(), Value::Integer(i64::from(be.grpc)));
         }
     }
 
@@ -205,10 +211,12 @@ pub(crate) fn render_cross_process_config(
     match role {
         ClusterProcessRole::Fe => {
             cluster.insert("role".to_string(), Value::String("fe".to_string()));
+            cluster.insert("heartbeat_interval_ms".to_string(), Value::Integer(500));
+            cluster.insert("heartbeat_timeout_retries".to_string(), Value::Integer(2));
             let backends: Vec<Value> = runtime
                 .be
                 .iter()
-                .map(|be| Value::String(format!("127.0.0.1:{}", be.starlet)))
+                .map(|be| Value::String(format!("127.0.0.1:{}", be.grpc)))
                 .collect();
             cluster.insert("backends".to_string(), Value::Array(backends));
         }
@@ -237,8 +245,8 @@ struct CrossProcessServerHandle {
     target_host: String,
     target_port: u16,
     runtime_dir: PathBuf,
-    _be_config_paths: Vec<PathBuf>,
-    _fe_config_path: PathBuf,
+    novarocks_bin: PathBuf,
+    be_config_paths: Vec<PathBuf>,
     be_processes: Vec<ProcessGuard>,
     fe_process: ProcessGuard,
 }
@@ -283,11 +291,11 @@ impl CrossProcessServerHandle {
                 .iter()
                 .map(|bp| BePorts {
                     http: bp.http.port(),
-                    starlet: bp.starlet.port(),
+                    grpc: bp.grpc.port(),
                 })
                 .collect(),
             fe_http_port: reserved.fe_http_port.port(),
-            fe_starlet_port: reserved.fe_starlet_port.port(),
+            fe_grpc_port: reserved.fe_grpc_port.port(),
             fe_mysql_port: reserved.fe_mysql_port.port(),
         };
 
@@ -306,12 +314,7 @@ impl CrossProcessServerHandle {
             let be_config_path = runtime_dir.path().join(format!("be_{i}.toml"));
             fs::write(
                 &be_config_path,
-                render_cross_process_config(
-                    &base_config,
-                    ClusterProcessRole::Be,
-                    i,
-                    &runtime,
-                )?,
+                render_cross_process_config(&base_config, ClusterProcessRole::Be, i, &runtime)?,
             )
             .with_context(|| format!("write {}", be_config_path.display()))?;
             be_config_paths.push(be_config_path);
@@ -333,9 +336,9 @@ impl CrossProcessServerHandle {
             .zip(be_config_paths.iter())
             .enumerate()
         {
-            let starlet_port = reserved_be.starlet.port();
+            let grpc_port = reserved_be.grpc.port();
             let _ = reserved_be.http.release();
-            let _ = reserved_be.starlet.release();
+            let _ = reserved_be.grpc.release();
             let be_process = ProcessGuard::spawn(
                 &novarocks_bin,
                 "be",
@@ -343,9 +346,9 @@ impl CrossProcessServerHandle {
                 "NOVAROCKS_READY role=be",
             )?;
             println!(
-                "started cross-process BE[{i}] pid={} starlet_port={} config={}",
+                "started cross-process BE[{i}] pid={} grpc_port={} config={}",
                 be_process.pid(),
-                starlet_port,
+                grpc_port,
                 be_config_path.display()
             );
             be_processes.push(be_process);
@@ -353,7 +356,7 @@ impl CrossProcessServerHandle {
 
         // Spawn FE.
         let _ = reserved.fe_http_port.release();
-        let _ = reserved.fe_starlet_port.release();
+        let _ = reserved.fe_grpc_port.release();
         let _ = reserved.fe_mysql_port.release();
         let fe_process = ProcessGuard::spawn(
             &novarocks_bin,
@@ -372,11 +375,22 @@ impl CrossProcessServerHandle {
             target_host: "127.0.0.1".to_string(),
             target_port: runtime.fe_mysql_port,
             runtime_dir: runtime_dir.into_path(),
-            _be_config_paths: be_config_paths,
-            _fe_config_path: fe_config_path,
+            novarocks_bin,
+            be_config_paths,
             be_processes,
             fe_process,
         })
+    }
+
+    fn ensure_be_index(&self, index: usize) -> Result<()> {
+        if index >= self.be_processes.len() {
+            bail!(
+                "BE index {} is out of bounds for cross-process cluster with {} BE(s)",
+                index,
+                self.be_processes.len()
+            );
+        }
+        Ok(())
     }
 }
 
@@ -387,6 +401,58 @@ impl ServerHandle for CrossProcessServerHandle {
 
     fn target_port(&self) -> Option<u16> {
         Some(self.target_port)
+    }
+
+    fn supports_fault_injection(&self) -> bool {
+        true
+    }
+
+    fn kill_be(&mut self, index: usize) -> Result<()> {
+        self.ensure_be_index(index)?;
+        let be_process = self
+            .be_processes
+            .get_mut(index)
+            .expect("BE index checked above");
+        be_process
+            .kill_now()
+            .with_context(|| format!("kill cross-process BE[{index}]"))?;
+        println!("killed cross-process BE[{index}]");
+        Ok(())
+    }
+
+    fn restart_be(&mut self, index: usize) -> Result<()> {
+        self.ensure_be_index(index)?;
+        {
+            let be_process = self
+                .be_processes
+                .get_mut(index)
+                .expect("BE index checked above");
+            be_process
+                .kill_now()
+                .with_context(|| format!("stop old cross-process BE[{index}] before restart"))?;
+        }
+
+        let config_path = self
+            .be_config_paths
+            .get(index)
+            .ok_or_else(|| {
+                anyhow::anyhow!("missing config path for cross-process BE[{index}] during restart")
+            })?
+            .clone();
+        let new_process = ProcessGuard::spawn(
+            &self.novarocks_bin,
+            "be",
+            &config_path,
+            "NOVAROCKS_READY role=be",
+        )
+        .with_context(|| format!("restart cross-process BE[{index}]"))?;
+        println!(
+            "restarted cross-process BE[{index}] pid={} config={}",
+            new_process.pid(),
+            config_path.display()
+        );
+        self.be_processes[index] = new_process;
+        Ok(())
     }
 }
 
@@ -471,6 +537,15 @@ impl ProcessGuard {
         Ok(())
     }
 
+    fn kill_now(&mut self) -> Result<()> {
+        if self.child.try_wait()?.is_none() {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+        self.join_stderr_thread();
+        Ok(())
+    }
+
     fn join_stderr_thread(&mut self) {
         if let Some(stderr_thread) = self.stderr_thread.take() {
             let _ = stderr_thread.join();
@@ -505,17 +580,27 @@ impl ProcessGuard {
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    if self.child.try_wait()?.is_none() {
+                    let status = self.wait_for_exit_after_stdout_disconnect()?;
+                    if status.is_none() {
                         let _ = self.child.kill();
                         let _ = self.child.wait();
                     }
                     self.join_stderr_thread();
                     let stderr = self.read_stderr();
+                    let status_detail = match status {
+                        Some(status) => format!("; child status={status}"),
+                        None => {
+                            "; child was still running after stdout closed and was killed"
+                                .to_string()
+                        }
+                    };
                     bail!(
                         "{}",
                         format_startup_failure(
                             marker,
-                            &format!("stdout closed before readiness marker; stdout={stdout:?}"),
+                            &format!(
+                                "stdout closed before readiness marker{status_detail}; stdout={stdout:?}; stderr={stderr}"
+                            ),
                             &stderr,
                         )
                     );
@@ -546,6 +631,19 @@ impl ProcessGuard {
             .lock()
             .map(|buffer| buffer.clone())
             .unwrap_or_default()
+    }
+
+    fn wait_for_exit_after_stdout_disconnect(&mut self) -> Result<Option<ExitStatus>> {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                return Ok(Some(status));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 
@@ -587,13 +685,13 @@ pub(crate) fn startup_timeout_from_env(raw: Option<&str>) -> Duration {
 
 struct ReservedBePorts {
     http: ReservedPort,
-    starlet: ReservedPort,
+    grpc: ReservedPort,
 }
 
 struct ReservedRuntimePorts {
     be_ports: Vec<ReservedBePorts>,
     fe_http_port: ReservedPort,
-    fe_starlet_port: ReservedPort,
+    fe_grpc_port: ReservedPort,
     fe_mysql_port: ReservedPort,
 }
 
@@ -604,13 +702,13 @@ impl ReservedRuntimePorts {
         for _ in 0..cluster_size {
             be_ports.push(ReservedBePorts {
                 http: ReservedPort::new()?,
-                starlet: ReservedPort::new()?,
+                grpc: ReservedPort::new()?,
             });
         }
         Ok(Self {
             be_ports,
             fe_http_port: ReservedPort::new()?,
-            fe_starlet_port: ReservedPort::new()?,
+            fe_grpc_port: ReservedPort::new()?,
             fe_mysql_port: ReservedPort::new()?,
         })
     }
@@ -713,6 +811,25 @@ mod tests {
     }
 
     #[test]
+    fn noop_server_handle_rejects_be_process_controls() {
+        let mut handle = NoopServerHandle;
+
+        let kill_err = handle.kill_be(0).expect_err("noop kill should fail");
+        assert!(
+            kill_err.to_string().contains("BE kill is unsupported"),
+            "unexpected error: {kill_err}"
+        );
+
+        let restart_err = handle.restart_be(0).expect_err("noop restart should fail");
+        assert!(
+            restart_err
+                .to_string()
+                .contains("BE restart is unsupported"),
+            "unexpected error: {restart_err}"
+        );
+    }
+
+    #[test]
     fn process_guard_disconnected_branch_uses_startup_failure_diagnostics() {
         let source = include_str!("cluster.rs")
             .split("\n#[cfg(test)]")
@@ -739,16 +856,24 @@ mod tests {
             disconnected_branch.contains("self.read_stderr()"),
             "disconnected branch should read stderr before formatting failure"
         );
+        assert!(
+            disconnected_branch.contains("wait_for_exit_after_stdout_disconnect"),
+            "disconnected branch should wait briefly for child exit before killing"
+        );
+        assert!(
+            disconnected_branch.contains("child status="),
+            "disconnected branch should include child exit status when available"
+        );
     }
 
     fn make_runtime_1be() -> CrossProcessRuntime {
         CrossProcessRuntime {
             be: vec![BePorts {
                 http: 18080,
-                starlet: 19070,
+                grpc: 19070,
             }],
             fe_http_port: 28080,
-            fe_starlet_port: 29070,
+            fe_grpc_port: 29070,
             fe_mysql_port: 29030,
         }
     }
@@ -758,15 +883,15 @@ mod tests {
             be: vec![
                 BePorts {
                     http: 18080,
-                    starlet: 19070,
+                    grpc: 19070,
                 },
                 BePorts {
                     http: 18081,
-                    starlet: 19071,
+                    grpc: 19071,
                 },
             ],
             fe_http_port: 28080,
-            fe_starlet_port: 29070,
+            fe_grpc_port: 29070,
             fe_mysql_port: 29030,
         }
     }
@@ -813,22 +938,27 @@ exec_node_output = true
         assert_eq!(fe_value["debug"]["exec_node_output"].as_bool(), Some(true));
         assert_eq!(fe_value["server"]["host"].as_str(), Some("127.0.0.1"));
         assert_eq!(fe_value["server"]["http_port"].as_integer(), Some(28080));
-        assert_eq!(fe_value["server"]["starlet_port"].as_integer(), Some(29070));
+        assert_eq!(fe_value["server"]["grpc_port"].as_integer(), Some(29070));
         assert_eq!(
             fe_value["standalone_server"]["mysql_port"].as_integer(),
             Some(29030)
         );
         assert_eq!(fe_value["standalone_server"]["user"].as_str(), Some("root"));
         assert_eq!(fe_value["cluster"]["role"].as_str(), Some("fe"));
-        // 1-BE: FE backends list has exactly one entry pointing at the single BE's starlet port.
+        assert_eq!(
+            fe_value["cluster"]["heartbeat_interval_ms"].as_integer(),
+            Some(500)
+        );
+        assert_eq!(
+            fe_value["cluster"]["heartbeat_timeout_retries"].as_integer(),
+            Some(2)
+        );
+        // 1-BE: FE backends list has exactly one entry pointing at the single BE's grpc port.
         let fe_backends = fe_value["cluster"]["backends"]
             .as_array()
             .expect("fe backends array");
         assert_eq!(fe_backends.len(), 1);
-        assert_eq!(
-            fe_backends[0].as_str(),
-            Some("127.0.0.1:19070")
-        );
+        assert_eq!(fe_backends[0].as_str(), Some("127.0.0.1:19070"));
 
         assert_eq!(
             be_value["metadata"]["path"].as_str(),
@@ -841,7 +971,7 @@ exec_node_output = true
         assert_eq!(be_value["debug"]["exec_node_output"].as_bool(), Some(true));
         assert_eq!(be_value["server"]["host"].as_str(), Some("127.0.0.1"));
         assert_eq!(be_value["server"]["http_port"].as_integer(), Some(18080));
-        assert_eq!(be_value["server"]["starlet_port"].as_integer(), Some(19070));
+        assert_eq!(be_value["server"]["grpc_port"].as_integer(), Some(19070));
         assert_eq!(be_value["standalone_server"]["user"].as_str(), Some("root"));
         assert!(
             be_value
@@ -856,6 +986,60 @@ exec_node_output = true
                 .and_then(|value| value.get("backends"))
                 .is_none()
         );
+        assert!(
+            be_value
+                .get("cluster")
+                .and_then(|value| value.get("heartbeat_interval_ms"))
+                .is_none()
+        );
+        assert!(
+            be_value
+                .get("cluster")
+                .and_then(|value| value.get("heartbeat_timeout_retries"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn render_cross_process_config_empty_base_patches_fe_heartbeat_only() {
+        let runtime = make_runtime_1be();
+
+        let fe = render_cross_process_config("", ClusterProcessRole::Fe, 0, &runtime)
+            .expect("render fe config");
+        let be = render_cross_process_config("", ClusterProcessRole::Be, 0, &runtime)
+            .expect("render be config");
+
+        let fe_value: toml::Value = fe.parse().expect("parse fe toml");
+        let be_value: toml::Value = be.parse().expect("parse be toml");
+
+        assert_eq!(fe_value["cluster"]["role"].as_str(), Some("fe"));
+        assert_eq!(
+            fe_value["cluster"]["heartbeat_interval_ms"].as_integer(),
+            Some(500)
+        );
+        assert_eq!(
+            fe_value["cluster"]["heartbeat_timeout_retries"].as_integer(),
+            Some(2)
+        );
+        let fe_backends = fe_value["cluster"]["backends"]
+            .as_array()
+            .expect("fe backends array");
+        assert_eq!(fe_backends.len(), 1);
+        assert_eq!(fe_backends[0].as_str(), Some("127.0.0.1:19070"));
+
+        assert_eq!(be_value["cluster"]["role"].as_str(), Some("be"));
+        assert!(
+            be_value
+                .get("cluster")
+                .and_then(|value| value.get("heartbeat_interval_ms"))
+                .is_none()
+        );
+        assert!(
+            be_value
+                .get("cluster")
+                .and_then(|value| value.get("heartbeat_timeout_retries"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -867,6 +1051,14 @@ exec_node_output = true
         let fe_value: toml::Value = fe.parse().expect("parse fe toml");
 
         assert_eq!(fe_value["cluster"]["role"].as_str(), Some("fe"));
+        assert_eq!(
+            fe_value["cluster"]["heartbeat_interval_ms"].as_integer(),
+            Some(500)
+        );
+        assert_eq!(
+            fe_value["cluster"]["heartbeat_timeout_retries"].as_integer(),
+            Some(2)
+        );
         let backends = fe_value["cluster"]["backends"]
             .as_array()
             .expect("fe backends array");
@@ -889,15 +1081,25 @@ exec_node_output = true
 
         // BE[0]
         assert_eq!(be0_value["cluster"]["role"].as_str(), Some("be"));
-        assert!(be0_value.get("cluster").and_then(|c| c.get("backends")).is_none());
+        assert!(
+            be0_value
+                .get("cluster")
+                .and_then(|c| c.get("backends"))
+                .is_none()
+        );
         assert_eq!(be0_value["server"]["http_port"].as_integer(), Some(18080));
-        assert_eq!(be0_value["server"]["starlet_port"].as_integer(), Some(19070));
+        assert_eq!(be0_value["server"]["grpc_port"].as_integer(), Some(19070));
 
         // BE[1]
         assert_eq!(be1_value["cluster"]["role"].as_str(), Some("be"));
-        assert!(be1_value.get("cluster").and_then(|c| c.get("backends")).is_none());
+        assert!(
+            be1_value
+                .get("cluster")
+                .and_then(|c| c.get("backends"))
+                .is_none()
+        );
         assert_eq!(be1_value["server"]["http_port"].as_integer(), Some(18081));
-        assert_eq!(be1_value["server"]["starlet_port"].as_integer(), Some(19071));
+        assert_eq!(be1_value["server"]["grpc_port"].as_integer(), Some(19071));
 
         // Ports must differ between the two BEs.
         assert_ne!(
@@ -905,8 +1107,8 @@ exec_node_output = true
             be1_value["server"]["http_port"].as_integer()
         );
         assert_ne!(
-            be0_value["server"]["starlet_port"].as_integer(),
-            be1_value["server"]["starlet_port"].as_integer()
+            be0_value["server"]["grpc_port"].as_integer(),
+            be1_value["server"]["grpc_port"].as_integer()
         );
     }
 
@@ -915,11 +1117,11 @@ exec_node_output = true
         let reserved = ReservedRuntimePorts::new(2).expect("reserve 2 BE port pairs");
         assert_eq!(reserved.be_ports.len(), 2);
         let http0 = reserved.be_ports[0].http.port();
-        let starlet0 = reserved.be_ports[0].starlet.port();
+        let grpc0 = reserved.be_ports[0].grpc.port();
         let http1 = reserved.be_ports[1].http.port();
-        let starlet1 = reserved.be_ports[1].starlet.port();
+        let grpc1 = reserved.be_ports[1].grpc.port();
         // All four ports must be distinct.
-        let ports = [http0, starlet0, http1, starlet1];
+        let ports = [http0, grpc0, http1, grpc1];
         for i in 0..ports.len() {
             for j in (i + 1)..ports.len() {
                 assert_ne!(
@@ -944,19 +1146,22 @@ exec_node_output = true
     fn validate_cluster_args_all_in_one_with_size_2_rejected() {
         let err = validate_cluster_args(ClusterMode::AllInOne, 2).unwrap_err();
         assert!(
-            err.to_string().contains("all-in-one mode requires --cluster-size 1"),
+            err.to_string()
+                .contains("all-in-one mode requires --cluster-size 1"),
             "unexpected error: {err}"
         );
     }
 
     #[test]
     fn validate_cluster_args_cross_process_size_2_ok() {
-        validate_cluster_args(ClusterMode::CrossProcess, 2).expect("cluster_size=2 should be valid for cross-process");
+        validate_cluster_args(ClusterMode::CrossProcess, 2)
+            .expect("cluster_size=2 should be valid for cross-process");
     }
 
     #[test]
     fn validate_cluster_args_all_in_one_size_1_ok() {
-        validate_cluster_args(ClusterMode::AllInOne, 1).expect("cluster_size=1 should be valid for all-in-one");
+        validate_cluster_args(ClusterMode::AllInOne, 1)
+            .expect("cluster_size=1 should be valid for all-in-one");
     }
 
     #[test]

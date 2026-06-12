@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::collections::{HashMap, HashSet};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
@@ -21,6 +22,7 @@ use crate::connector::{
     iceberg_namespace_exists, register_existing_iceberg_table,
     register_starrocks_tables_in_catalog, runtime_registered,
 };
+use crate::meta::repository::backend::BackendMetaRepository;
 use crate::meta::repository::iceberg_catalog::{
     IcebergCatalogMetaRepository, IcebergCatalogProperties,
 };
@@ -33,6 +35,7 @@ use crate::meta::repository::starrocks_table::StarRocksTableMetaRepository;
 use crate::meta::repository::starrocks_txn::StarRocksTxnRepository;
 
 pub(crate) mod aggregate;
+pub(crate) mod backend_ops;
 pub(crate) mod backend_resolver;
 pub(crate) mod catalog;
 pub(crate) mod catalog_mgr;
@@ -40,12 +43,16 @@ pub(crate) mod dictionary;
 pub(crate) mod iceberg_ctas;
 pub(crate) mod iceberg_maintenance;
 pub(crate) mod iceberg_ref_flow;
+pub(crate) mod iceberg_view;
+pub(crate) mod iceberg_view_rewrite;
 pub(crate) mod information_schema;
 pub(crate) mod insert;
 pub(crate) mod insert_flow;
 pub(crate) mod mutation_flow;
 pub(crate) mod mv;
 pub(crate) mod mv_flow;
+pub(crate) mod mv_maintenance;
+pub(crate) mod mv_rewrite_prep;
 pub(crate) mod mv_scheduler;
 pub(crate) mod name_resolve;
 pub(crate) mod parquet;
@@ -78,11 +85,11 @@ use self::statement::{
     looks_like_alter_table_expire_snapshots, looks_like_alter_table_optimize,
     looks_like_alter_table_remove_orphan_files, looks_like_alter_table_rewrite_manifests,
     looks_like_show_alter_table_optimize, looks_like_show_create_table,
-    parse_add_legacy_range_partition_sql, parse_alter_iceberg_properties_sql,
-    parse_alter_partition_column_sql, parse_alter_table_expire_snapshots_sql,
-    parse_alter_table_optimize_sql, parse_alter_table_remove_orphan_files_sql,
-    parse_alter_table_rewrite_manifests_sql, parse_show_alter_table_optimize_sql,
-    parse_show_create_table,
+    looks_like_show_create_view, looks_like_show_views, parse_add_legacy_range_partition_sql,
+    parse_alter_iceberg_properties_sql, parse_alter_partition_column_sql,
+    parse_alter_table_expire_snapshots_sql, parse_alter_table_optimize_sql,
+    parse_alter_table_remove_orphan_files_sql, parse_alter_table_rewrite_manifests_sql,
+    parse_show_alter_table_optimize_sql, parse_show_create_table,
 };
 use self::stream_load::{
     parse_csv_stream_load_rows, parse_json_stream_load_rows, parse_stream_load_columns,
@@ -110,6 +117,182 @@ pub(crate) fn register_stream_load_engine(engine: StandaloneNovaRocks) {
 
 pub(crate) fn current_stream_load_engine() -> Option<StandaloneNovaRocks> {
     stream_load_engine_cell().get().cloned()
+}
+
+pub(crate) fn recover_starrocks_tablet_paths_from_current_engine(
+    table: &crate::connector::starrocks::fe_v2_meta::LakeTableIdentity,
+    tablet_ids: &[i64],
+) -> Result<HashMap<i64, String>, String> {
+    let Some(engine) = current_stream_load_engine() else {
+        return recover_starrocks_tablet_paths_from_installed_config(table, tablet_ids);
+    };
+    recover_starrocks_tablet_paths_from_state(&engine.inner, table, tablet_ids)
+}
+
+pub(crate) fn recover_starrocks_tablet_paths_from_installed_config(
+    table: &crate::connector::starrocks::fe_v2_meta::LakeTableIdentity,
+    tablet_ids: &[i64],
+) -> Result<HashMap<i64, String>, String> {
+    if tablet_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let cfg = match novarocks_config::config() {
+        Ok(cfg) => cfg,
+        Err(_) => return Ok(HashMap::new()),
+    };
+    let Some(metadata) = cfg.metadata.as_ref() else {
+        return Ok(HashMap::new());
+    };
+    let Some(standalone) = cfg.standalone_server.as_ref() else {
+        return Ok(HashMap::new());
+    };
+    let Some(app_cfg) = standalone.starrocks_table_config()? else {
+        return Ok(HashMap::new());
+    };
+    let starrocks_table_config = StarRocksTableConfig::from_app_config(app_cfg)?;
+    let provider = open_metadata_provider(&ResolvedMetadataBackend {
+        provider: metadata.provider,
+        path: metadata.path.clone(),
+    })?;
+    let read = provider.begin_read().map_err(|e| {
+        format!("open StarRocks table metadata recovery read transaction failed: {e}")
+    })?;
+    let snapshot = StarRocksTableMetaRepository
+        .load_snapshot(read.as_ref())
+        .map_err(|e| {
+            format!("load StarRocks table metadata during tablet path recovery failed: {e}")
+        })?;
+    let rebuilt = StarRocksTableCatalog::rebuild_from_repository(
+        Some(starrocks_table_config.clone()),
+        snapshot,
+    )?;
+    let paths = select_starrocks_tablet_paths_from_catalog(&rebuilt, table, tablet_ids)?;
+    register_starrocks_shard_infos(&starrocks_table_config.s3, &paths);
+    Ok(paths)
+}
+
+pub(crate) fn recover_starrocks_tablet_paths_from_state(
+    state: &Arc<StandaloneState>,
+    table: &crate::connector::starrocks::fe_v2_meta::LakeTableIdentity,
+    tablet_ids: &[i64],
+) -> Result<HashMap<i64, String>, String> {
+    if tablet_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut paths = {
+        let catalog = state
+            .starrocks_table
+            .read()
+            .expect("standalone StarRocks table read lock");
+        select_starrocks_tablet_paths_from_catalog(&catalog, table, tablet_ids)?
+    };
+    if starrocks_tablet_paths_cover(tablet_ids, &paths) {
+        register_starrocks_shard_infos_from_paths(state, &paths);
+        return Ok(paths);
+    }
+
+    let Some(provider) = state.metadata_provider.as_ref() else {
+        register_starrocks_shard_infos_from_paths(state, &paths);
+        return Ok(paths);
+    };
+
+    let read = provider.begin_read().map_err(|e| {
+        format!("open StarRocks table metadata recovery read transaction failed: {e}")
+    })?;
+    let snapshot = state
+        .starrocks_table_repo
+        .load_snapshot(read.as_ref())
+        .map_err(|e| {
+            format!("load StarRocks table metadata during tablet path recovery failed: {e}")
+        })?;
+    let rebuilt = StarRocksTableCatalog::rebuild_from_repository(
+        state.starrocks_table_config.clone(),
+        snapshot.clone(),
+    )?;
+    let recovered = select_starrocks_tablet_paths_from_catalog(&rebuilt, table, tablet_ids)?;
+    if !recovered.is_empty() {
+        register_starrocks_shard_infos_from_paths(state, &recovered);
+        paths.extend(recovered);
+    }
+
+    {
+        let mut catalog = state
+            .catalog
+            .write()
+            .expect("standalone catalog write lock");
+        for database in &snapshot.databases {
+            catalog.create_database(&database.name)?;
+        }
+        register_starrocks_tables_in_catalog(&mut catalog, &rebuilt)?;
+    }
+    let mut guard = state
+        .starrocks_table
+        .write()
+        .expect("standalone StarRocks table write lock");
+    *guard = rebuilt;
+
+    Ok(paths)
+}
+
+fn select_starrocks_tablet_paths_from_catalog(
+    catalog: &StarRocksTableCatalog,
+    table: &crate::connector::starrocks::fe_v2_meta::LakeTableIdentity,
+    tablet_ids: &[i64],
+) -> Result<HashMap<i64, String>, String> {
+    let requested = tablet_ids.iter().copied().collect::<HashSet<_>>();
+    let Some(runtime) = catalog
+        .runtime_by_table_id(table.table_id)
+        .or_else(|| catalog.table(&table.db_name, &table.table_name).ok())
+    else {
+        return Ok(HashMap::new());
+    };
+    let mut paths = HashMap::with_capacity(requested.len());
+    for tablet in &runtime.tablets {
+        if requested.contains(&tablet.tablet_id) {
+            paths.insert(tablet.tablet_id, tablet.tablet_root_path.clone());
+        }
+    }
+    Ok(paths)
+}
+
+fn starrocks_tablet_paths_cover(tablet_ids: &[i64], paths: &HashMap<i64, String>) -> bool {
+    tablet_ids.iter().all(|tablet_id| {
+        paths
+            .get(tablet_id)
+            .is_some_and(|path| !path.trim().is_empty())
+    })
+}
+
+fn register_starrocks_shard_infos_from_paths(
+    state: &StandaloneState,
+    paths: &HashMap<i64, String>,
+) -> usize {
+    let Some(config) = state.starrocks_table_config.as_ref() else {
+        return 0;
+    };
+    register_starrocks_shard_infos(&config.s3, paths)
+}
+
+fn register_starrocks_shard_infos(
+    s3: &crate::runtime::starlet_shard_registry::S3StoreConfig,
+    paths: &HashMap<i64, String>,
+) -> usize {
+    if paths.is_empty() {
+        return 0;
+    }
+    crate::runtime::starlet_shard_registry::upsert_many_infos(paths.iter().map(
+        |(tablet_id, full_path)| {
+            (
+                *tablet_id,
+                crate::runtime::starlet_shard_registry::StarletShardInfo {
+                    full_path: full_path.clone(),
+                    s3: Some(s3.clone()),
+                },
+            )
+        },
+    ))
 }
 
 pub(crate) fn catalog_mgr_snapshot(state: &Arc<StandaloneState>) -> catalog_mgr::CatalogMgr {
@@ -223,6 +406,7 @@ pub(crate) struct StandaloneState {
     pub(crate) connectors: Arc<RwLock<crate::connector::ConnectorRegistry>>,
     pub(crate) starrocks_table_config: Option<StarRocksTableConfig>,
     pub(crate) metadata_provider: Option<Arc<dyn crate::meta::MetaStoreProvider>>,
+    pub(crate) backend_repo: BackendMetaRepository,
     pub(crate) starrocks_table_repo: StarRocksTableMetaRepository,
     pub(crate) starrocks_txn_repo: StarRocksTxnRepository,
     pub(crate) mv_repo: MvMetaRepository,
@@ -231,6 +415,11 @@ pub(crate) struct StandaloneState {
     pub(crate) job_repo: JobMetaRepository,
     pub(crate) dictionary_manager: dictionary::DictionaryManager,
     pub(crate) exchange_port: u16,
+    /// Wake-up channel for the iceberg maintenance coordinator; injected by
+    /// the server after the coordinator thread starts, None otherwise.
+    pub(crate) maintenance_signal_tx: std::sync::Mutex<
+        Option<std::sync::mpsc::Sender<crate::engine::mv_maintenance::MaintenanceSignal>>,
+    >,
     /// In-memory registry of user-defined views, keyed by lowercase
     /// (database, view-name). Each entry stores the analysed `Query` AST
     /// from `CREATE VIEW ... AS <query>`. The analyzer expands these to
@@ -263,6 +452,7 @@ impl Default for StandaloneState {
             connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
             starrocks_table_config: None,
             metadata_provider: None,
+            backend_repo: BackendMetaRepository,
             starrocks_table_repo: StarRocksTableMetaRepository,
             starrocks_txn_repo: StarRocksTxnRepository,
             mv_repo: MvMetaRepository,
@@ -271,6 +461,7 @@ impl Default for StandaloneState {
             job_repo: JobMetaRepository,
             dictionary_manager: dictionary::DictionaryManager::default(),
             exchange_port: 0,
+            maintenance_signal_tx: std::sync::Mutex::new(None),
             views: RwLock::new(std::collections::HashMap::new()),
             virtual_tables: virtual_table::VirtualTableRegistry::with_defaults(),
             #[cfg(test)]
@@ -397,6 +588,7 @@ impl StandaloneNovaRocks {
             )),
             starrocks_table_config,
             metadata_provider,
+            backend_repo: BackendMetaRepository,
             starrocks_table_repo: StarRocksTableMetaRepository,
             starrocks_txn_repo: StarRocksTxnRepository,
             mv_repo: MvMetaRepository,
@@ -409,6 +601,9 @@ impl StandaloneNovaRocks {
         });
         register_connector_backends(&inner);
         restore_metadata_if_needed(&inner)?;
+        if role == crate::common::app_config::ClusterRole::Fe {
+            backend_ops::ensure_backend_registry(&inner)?;
+        }
         if inner.starrocks_table_config.is_some() && inner.metadata_provider.is_some() {
             crate::connector::spawn_starrocks_table_erase_worker(Arc::clone(&inner));
         }
@@ -682,6 +877,9 @@ impl StandaloneSession {
             if let Ok(ref peek_parser) =
                 sqlparser::parser::Parser::new(&sr_dialect).try_with_sql(&normalized)
             {
+                use crate::sql::parser::dialect::backend::{
+                    looks_like_add_backend, looks_like_drop_backend, looks_like_show_backends,
+                };
                 use crate::sql::parser::dialect::materialized_view::{
                     looks_like_create_materialized_view, looks_like_drop_materialized_view,
                     looks_like_refresh_materialized_view, looks_like_show_materialized_views,
@@ -696,6 +894,9 @@ impl StandaloneSession {
                     // instead of falling through to sqlparser-rs's permissive
                     // builtin which would silently accept and bypass our checks.
                     || looks_like_truncate_table(peek_parser)
+                    || looks_like_add_backend(peek_parser)
+                    || looks_like_drop_backend(peek_parser)
+                    || looks_like_show_backends(peek_parser)
                 {
                     let mut statements = crate::sql::parser::parse_sql(&normalized)?;
                     let statement = statements
@@ -812,6 +1013,16 @@ impl StandaloneSession {
             return self.handle_show_create_table(&normalized, current_catalog, current_database);
         }
 
+        // SHOW CREATE VIEW ...
+        if looks_like_show_create_view(&normalized) {
+            return self.handle_show_create_view(&normalized, current_catalog, current_database);
+        }
+
+        // SHOW VIEWS [FROM db]
+        if looks_like_show_views(&normalized) {
+            return self.handle_show_views(&normalized, current_catalog, current_database);
+        }
+
         // ALTER TABLE ... ADD EQUALITY DELETE (...) VALUES (...)
         if looks_like_add_equality_delete(&normalized) {
             return self.handle_add_equality_delete(&normalized, current_catalog, current_database);
@@ -870,6 +1081,7 @@ impl StandaloneSession {
                     &catalog_snapshot,
                     current_database,
                     level,
+                    Some(&self.inner),
                 )?;
                 Ok(StatementResult::Query(result))
             }
@@ -911,6 +1123,7 @@ impl StandaloneSession {
                     current_database,
                     self.inner.exchange_port,
                     None,
+                    Some(&self.inner),
                 )?;
                 Ok(StatementResult::Query(result))
             }
@@ -935,6 +1148,14 @@ impl StandaloneSession {
                     &self.inner.views,
                     current_database,
                 );
+                // Inline iceberg-catalog views (REST only). Runs after session
+                // views so local definitions keep precedence.
+                self::iceberg_view_rewrite::expand_iceberg_views_in_query(
+                    &self.inner,
+                    &mut prepared,
+                    current_catalog,
+                    current_database,
+                )?;
                 // Materialize information_schema virtual tables (e.g. `schemata`)
                 // into VALUES-backed derived tables. Run after view expansion
                 // because a view may project from a virtual table.
@@ -988,6 +1209,7 @@ impl StandaloneSession {
                     current_database,
                     self.inner.exchange_port,
                     query_opts.clone(),
+                    Some(&self.inner),
                 )?;
                 Ok(StatementResult::Query(result))
             }
@@ -1315,6 +1537,126 @@ impl StandaloneSession {
                     logical_type: None,
                 },
             ],
+            chunks: vec![record_batch_to_chunk(batch)?],
+        }))
+    }
+
+    fn handle_show_create_view(
+        &self,
+        sql: &str,
+        current_catalog: Option<&str>,
+        current_database: &str,
+    ) -> Result<StatementResult, String> {
+        let view_name = crate::engine::statement::parse_show_create_view(sql)?;
+        let Some(target) = crate::engine::iceberg_view::resolve_iceberg_view_target_parts(
+            &self.inner,
+            &view_name.parts,
+            current_catalog,
+            current_database,
+        )?
+        else {
+            return Err("SHOW CREATE VIEW only supports views in iceberg catalogs".to_string());
+        };
+        let backend = self
+            .inner
+            .connectors
+            .read()
+            .expect("connector registry read")
+            .catalog_backend("iceberg")?;
+        let view = backend.load_view(&target.catalog, &target.namespace, &target.view)?;
+
+        let columns = view
+            .column_names
+            .iter()
+            .map(|name| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut ddl = format!(
+            "CREATE VIEW `{}`.`{}`.`{}` ({})",
+            target.catalog, target.namespace, target.view, columns
+        );
+        if let Some(comment) = &view.comment {
+            ddl.push_str(&format!("\nCOMMENT \"{}\"", comment.replace('"', "\\\"")));
+        }
+        ddl.push_str(&format!("\nAS {};", view.sql));
+
+        let fields = vec![
+            Field::new("View", DataType::Utf8, false),
+            Field::new("Create View", DataType::Utf8, false),
+        ];
+        let arrays: Vec<Arc<dyn arrow::array::Array>> = vec![
+            Arc::new(StringArray::from(vec![target.view.clone()])),
+            Arc::new(StringArray::from(vec![ddl])),
+        ];
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+            .map_err(|e| format!("build SHOW CREATE VIEW result failed: {e}"))?;
+        Ok(StatementResult::Query(QueryResult {
+            columns: vec![
+                QueryResultColumn {
+                    name: "View".to_string(),
+                    data_type: DataType::Utf8,
+                    nullable: false,
+                    logical_type: None,
+                },
+                QueryResultColumn {
+                    name: "Create View".to_string(),
+                    data_type: DataType::Utf8,
+                    nullable: false,
+                    logical_type: None,
+                },
+            ],
+            chunks: vec![record_batch_to_chunk(batch)?],
+        }))
+    }
+
+    fn handle_show_views(
+        &self,
+        sql: &str,
+        current_catalog: Option<&str>,
+        current_database: &str,
+    ) -> Result<StatementResult, String> {
+        let from_db = crate::engine::statement::parse_show_views(sql)?;
+        let db = from_db.as_deref().unwrap_or(current_database);
+        let session_catalog =
+            current_catalog.filter(|catalog| !catalog.eq_ignore_ascii_case("default_catalog"));
+        let names: Vec<String> = match session_catalog {
+            Some(catalog) => {
+                let backend = self
+                    .inner
+                    .connectors
+                    .read()
+                    .expect("connector registry read")
+                    .catalog_backend("iceberg")?;
+                backend.list_views(catalog, db)?
+            }
+            None => {
+                let views = self
+                    .inner
+                    .views
+                    .read()
+                    .map_err(|e| format!("view registry read lock: {e}"))?;
+                let db_lower = db.to_ascii_lowercase();
+                let mut names: Vec<String> = views
+                    .keys()
+                    .filter(|(database, _)| database == &db_lower)
+                    .map(|(_, view)| view.clone())
+                    .collect();
+                names.sort();
+                names
+            }
+        };
+        let column_name = format!("Views_in_{db}");
+        let fields = vec![Field::new(column_name.clone(), DataType::Utf8, false)];
+        let arrays: Vec<Arc<dyn arrow::array::Array>> = vec![Arc::new(StringArray::from(names))];
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+            .map_err(|e| format!("build SHOW VIEWS result failed: {e}"))?;
+        Ok(StatementResult::Query(QueryResult {
+            columns: vec![QueryResultColumn {
+                name: column_name,
+                data_type: DataType::Utf8,
+                nullable: false,
+                logical_type: None,
+            }],
             chunks: vec![record_batch_to_chunk(batch)?],
         }))
     }
@@ -1913,6 +2255,11 @@ pub(crate) fn dispatch_statement(
                 current_database,
             )
         }
+        Statement::AddBackend(stmt) => crate::engine::backend_ops::execute_add_backend(state, stmt),
+        Statement::DropBackend(stmt) => {
+            crate::engine::backend_ops::execute_drop_backend(state, stmt)
+        }
+        Statement::ShowBackends(_) => crate::engine::backend_ops::execute_show_backends(state),
     }
 }
 
@@ -2563,6 +2910,14 @@ fn prepare_explain_query(
     // Inline any user-defined views before the analyzer sees the query.
     let mut prepared = query.clone();
     self::view_rewrite::expand_views_in_query(&mut prepared, &state.views, current_database);
+    // Inline iceberg-catalog views (REST only). Runs after session
+    // views so local definitions keep precedence.
+    self::iceberg_view_rewrite::expand_iceberg_views_in_query(
+        state,
+        &mut prepared,
+        current_catalog,
+        current_database,
+    )?;
 
     // Time-travel refs become synthetic local tables. Ordinary Iceberg refs
     // remain untouched and resolve through CatalogMgrProvider during analysis.
@@ -2577,6 +2932,7 @@ fn prepare_explain_query(
 /// `Planning: <ms> / Execution: <ms> / Rows: <N>` followed by the Verbose
 /// plan body. Per-operator runtime stats merge is out of scope for OPT-5;
 /// the pipeline has no systematic profile collection yet.
+#[allow(clippy::too_many_arguments)]
 fn explain_analyze_query(
     query: &sqlparser::ast::Query,
     analyzer_catalog: &dyn crate::sql::catalog::CatalogProvider,
@@ -2585,6 +2941,7 @@ fn explain_analyze_query(
     current_database: &str,
     exchange_port: u16,
     query_opts: Option<crate::internal_service::TQueryOptions>,
+    mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
     use crate::sql::explain::{ExplainLevel, explain_physical_plan};
 
@@ -2597,9 +2954,23 @@ fn explain_analyze_query(
     let (resolved, cte_registry, mut factory) =
         crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
-    let table_stats = build_table_stats_from_plan(&logical);
+    let mut table_stats = build_table_stats_from_plan(&logical);
+    // MV query rewrite candidate prep (EXPLAIN ANALYZE has no MV refresh
+    // context, so the gate is only `mv_rewrite_state.is_some()`).
+    let mv_candidates = match mv_rewrite_state {
+        Some(state) => crate::engine::mv_rewrite_prep::prepare_mv_rewrite_candidates(
+            state,
+            analyzer_catalog,
+            current_database,
+            &logical,
+            &mut factory,
+            &mut table_stats,
+        ),
+        None => Vec::new(),
+    };
     // dictionary_provider intentionally None; installed via TLS by execute_in_context.
-    let physical = crate::sql::optimizer::optimize(logical, &table_stats, factory, None)?;
+    let physical =
+        crate::sql::optimizer::optimize(logical, &table_stats, factory, None, mv_candidates)?;
     let planning_ms = t_plan.elapsed().as_millis() as u64;
 
     let t_exec = Instant::now();
@@ -2611,6 +2982,7 @@ fn explain_analyze_query(
         current_database,
         exchange_port,
         query_opts,
+        mv_rewrite_state,
     )?;
     let rows: u64 = executed.chunks.iter().map(|c| c.len() as u64).sum();
     let execution_ms = t_exec.elapsed().as_millis() as u64;
@@ -2631,15 +3003,30 @@ fn explain_query(
     _codegen_catalog: &InMemoryCatalog,
     current_database: &str,
     level: crate::sql::explain::ExplainLevel,
+    mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
     use crate::sql::explain::{ExplainLevel, explain_physical_plan};
 
     let (resolved, cte_registry, mut factory) =
         crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
-    let table_stats = build_table_stats_from_plan(&logical);
+    let mut table_stats = build_table_stats_from_plan(&logical);
+    // MV query rewrite candidate prep (plain EXPLAIN has no MV refresh
+    // context, so the gate is only `mv_rewrite_state.is_some()`).
+    let mv_candidates = match mv_rewrite_state {
+        Some(state) => crate::engine::mv_rewrite_prep::prepare_mv_rewrite_candidates(
+            state,
+            analyzer_catalog,
+            current_database,
+            &logical,
+            &mut factory,
+            &mut table_stats,
+        ),
+        None => Vec::new(),
+    };
     // dictionary_provider intentionally None; installed via TLS by execute_in_context.
-    let physical = crate::sql::optimizer::optimize(logical, &table_stats, factory, None)?;
+    let physical =
+        crate::sql::optimizer::optimize(logical, &table_stats, factory, None, mv_candidates)?;
 
     let mut lines = Vec::new();
     if matches!(level, ExplainLevel::Costs) {
@@ -2671,6 +3058,7 @@ pub(crate) fn execute_query(
         current_database,
         exchange_port,
         query_opts,
+        None,
     )
 }
 
@@ -2707,6 +3095,7 @@ pub(crate) fn execute_query_with_catalog_mgr(
         current_database,
         state.exchange_port,
         query_opts,
+        Some(state),
     )
 }
 
@@ -2747,7 +3136,8 @@ pub(crate) fn execute_query_as_iceberg_write(
         crate::sql::analyzer::analyze(query, &analyzer_provider, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
     let table_stats = build_table_stats_from_plan(&logical);
-    let physical = crate::sql::optimizer::optimize(logical, &table_stats, factory, None)?;
+    let physical =
+        crate::sql::optimizer::optimize(logical, &table_stats, factory, None, Vec::new())?;
     let build_result =
         crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_with_iceberg_sink(
             &physical,
@@ -2767,6 +3157,7 @@ pub(crate) fn execute_query_as_iceberg_write(
     .execute_with_write_outcome()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_query_with_catalog_provider(
     query: &sqlparser::ast::Query,
     analyzer_catalog: &dyn crate::sql::catalog::CatalogProvider,
@@ -2775,6 +3166,7 @@ pub(crate) fn execute_query_with_catalog_provider(
     current_database: &str,
     exchange_port: u16,
     query_opts: Option<crate::internal_service::TQueryOptions>,
+    mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
     execute_query_with_options_and_imv_validator_with_catalog_provider(
         query,
@@ -2788,6 +3180,7 @@ pub(crate) fn execute_query_with_catalog_provider(
         None,
         None,
         None,
+        mv_rewrite_state,
     )
 }
 
@@ -2828,6 +3221,7 @@ pub(crate) fn execute_query_with_options(
         iceberg_catalogs,
         mv_refresh_ctx,
         None,
+        None,
     )
 }
 
@@ -2843,6 +3237,7 @@ pub(crate) fn execute_query_with_options_and_imv_validator(
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
     imv_rewrite_validator: Option<&ImvRewriteValidator<'_>>,
+    mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
     execute_query_with_options_and_imv_validator_with_catalog_provider(
         query,
@@ -2856,6 +3251,7 @@ pub(crate) fn execute_query_with_options_and_imv_validator(
         iceberg_catalogs,
         mv_refresh_ctx,
         imv_rewrite_validator,
+        mv_rewrite_state,
     )
 }
 
@@ -2872,6 +3268,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
     imv_rewrite_validator: Option<&ImvRewriteValidator<'_>>,
+    mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
     let (resolved, cte_registry, mut factory) =
         crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
@@ -2898,9 +3295,27 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
     } else if imv_rewrite_validator.is_some() {
         return Err("IMV rewrite validator requires MV refresh context".to_string());
     }
-    let table_stats = build_table_stats_from_plan(&logical);
+    let mut table_stats = build_table_stats_from_plan(&logical);
+    // MV query rewrite: discover fresh Iceberg MV candidates and inject their
+    // target-table stats. Gated on a standalone-rewrite path (`Some(state)`)
+    // and disabled during MV refresh (`mv_refresh_ctx.is_some()`) so refresh
+    // queries never rewrite onto the MV they are computing.
+    let mv_candidates = match mv_rewrite_state {
+        Some(state) if mv_refresh_ctx.is_none() => {
+            crate::engine::mv_rewrite_prep::prepare_mv_rewrite_candidates(
+                state,
+                analyzer_catalog,
+                current_database,
+                &logical,
+                &mut factory,
+                &mut table_stats,
+            )
+        }
+        _ => Vec::new(),
+    };
     // dictionary_provider intentionally None; installed via TLS by execute_in_context.
-    let mut physical = crate::sql::optimizer::optimize(logical, &table_stats, factory, None)?;
+    let mut physical =
+        crate::sql::optimizer::optimize(logical, &table_stats, factory, None, mv_candidates)?;
     // Unit-test states may not start the standalone exchange server. IVM-A1
     // internal queries also pass runtime-local handles (`terminal_sink` or
     // `iceberg_catalogs`) that coordinated fragments cannot currently clone
@@ -2968,20 +3383,10 @@ fn coordinated_execution_services(
         .map(|c| c.cluster.role)
         .unwrap_or(ClusterRole::AllInOne);
     let dispatcher = dispatcher_for_role(role)?;
-    // Backend list for the scheduler: FE reads cluster.backends; all-in-one
-    // is the local exchange endpoint; pure BE must not coordinate.
+    // Backend list for the scheduler: FE uses the live registry snapshot;
+    // all-in-one is the local exchange endpoint; pure BE must not coordinate.
     let backends: Vec<SocketAddr> = match role {
-        ClusterRole::Fe => {
-            let cfg = crate::novarocks_config::config().map_err(|e| format!("role=fe: {e}"))?;
-            cfg.cluster
-                .backends
-                .iter()
-                .map(|s| {
-                    s.parse::<SocketAddr>()
-                        .map_err(|e| format!("role=fe: invalid backend '{s}': {e}"))
-                })
-                .collect::<Result<_, _>>()?
-        }
+        ClusterRole::Fe => backend_ops::live_backend_scheduler_endpoints()?,
         ClusterRole::AllInOne => vec![
             format!("127.0.0.1:{exchange_port}")
                 .parse()
@@ -3010,21 +3415,10 @@ pub(crate) fn dispatcher_for_role(
             crate::runtime::dispatcher::InProcessDispatcher::new(),
         )),
         ClusterRole::Fe => {
-            let cfg = crate::novarocks_config::config()
-                .map_err(|e| format!("role=fe: cannot read config: {e}"))?;
-            if cfg.cluster.backends.is_empty() {
-                return Err("role=fe: cluster.backends must not be empty".to_string());
-            }
-            let mut addrs = Vec::with_capacity(cfg.cluster.backends.len());
-            for backend_str in &cfg.cluster.backends {
-                let backend: std::net::SocketAddr = backend_str
-                    .parse()
-                    .map_err(|e| format!("role=fe: invalid backend addr '{backend_str}': {e}"))?;
-                addrs.push(backend);
-            }
-            Ok(Arc::new(crate::runtime::dispatcher::RemoteDispatcher::new(
-                &addrs,
-            )?))
+            let entries = backend_ops::live_backend_dispatch_entries()?;
+            Ok(Arc::new(
+                crate::runtime::dispatcher::RemoteDispatcher::new_with_backend_ids(&entries)?,
+            ))
         }
         ClusterRole::Be => Err("role=be must not enter standalone coordinator".to_string()),
     }
@@ -3037,7 +3431,7 @@ fn ensure_standalone_exchange_server() -> Result<u16, String> {
         return Ok(*port);
     }
 
-    let default_port = crate::common::config::http_port();
+    let default_port = crate::common::config::grpc_port();
     let started_port =
         match crate::service::grpc_server::start_grpc_exchange_server("127.0.0.1", default_port) {
             Ok(()) => crate::service::grpc_server::grpc_server_bound_port()
@@ -4007,9 +4401,12 @@ mod build_iceberg_create_table_ddl_tests {
 mod tests {
     use super::{
         QueryResult, StandaloneNovaRocks, StandaloneOptions, StandaloneSession, StandaloneState,
-        StatementResult, dispatch_statement, register_connector_backends,
+        StatementResult, dispatch_statement, recover_starrocks_tablet_paths_from_installed_config,
+        recover_starrocks_tablet_paths_from_state, register_connector_backends,
     };
+    use crate::connector::starrocks::fe_v2_meta::LakeTableIdentity;
     use crate::connector::starrocks::lake::context::lock_runtime_test_state;
+    use crate::connector::starrocks::table::config::StarRocksTableConfig;
     use crate::meta::MetaStoreProvider;
     use arrow::array::{
         Array, FixedSizeBinaryArray, Int32Array, Int64Array, ListArray, StringArray,
@@ -4018,6 +4415,31 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    struct BackendRegistryReset;
+
+    impl BackendRegistryReset {
+        fn new() -> Self {
+            crate::runtime::backend_registry::replace_backend_registry_for_test(None);
+            Self
+        }
+    }
+
+    impl Drop for BackendRegistryReset {
+        fn drop(&mut self) {
+            crate::runtime::backend_registry::replace_backend_registry_for_test(None);
+        }
+    }
+
+    fn string_cell(result: &QueryResult, row: usize, col: usize) -> String {
+        let batch = &result.chunks[0].batch;
+        let array = batch
+            .column(col)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("StringArray column");
+        array.value(row).to_string()
+    }
 
     fn write_test_metadata_config(dir: &TempDir, metadata_path: &str) -> PathBuf {
         let config_path = dir.path().join("novarocks.toml");
@@ -4032,6 +4454,271 @@ path = "{metadata_path}"
         )
         .expect("write metadata config");
         config_path
+    }
+
+    fn test_starrocks_table_config() -> StarRocksTableConfig {
+        StarRocksTableConfig {
+            warehouse_uri: "s3://test/warehouse".to_string(),
+            s3: crate::runtime::starlet_shard_registry::S3StoreConfig {
+                endpoint: "http://127.0.0.1:9000".to_string(),
+                bucket: "test".to_string(),
+                access_key_id: "ak".to_string(),
+                access_key_secret: "sk".to_string(),
+                region: None,
+                enable_path_style_access: Some(true),
+            },
+            mv_default_storage_engine: "starrocks".to_string(),
+        }
+    }
+
+    #[test]
+    fn recovers_starrocks_tablet_paths_from_metadata_after_be_startup() {
+        let _runtime_guard = lock_runtime_test_state();
+        use crate::meta::repository::starrocks_table::{
+            CreateStarRocksTableLayoutRequest, StarRocksTableKind, StarRocksTableMetaRepository,
+        };
+        use crate::service::grpc_client::proto::starrocks::TabletSchemaPb;
+        use prost::Message;
+
+        let dir = TempDir::new().expect("tempdir");
+        let provider =
+            crate::meta::SqliteMetaStoreProvider::open(dir.path().join("standalone.sqlite"))
+                .expect("open provider");
+        let (db_id, table_id, schema_id, tablet_id, expected_path) = {
+            let mut txn = provider
+                .begin_write("seed starrocks table")
+                .expect("write txn");
+            let repo = StarRocksTableMetaRepository::default();
+            let database = repo
+                .get_or_create_database(txn.as_mut(), "analytics")
+                .expect("create database");
+            let created = repo
+                .create_table_layout(
+                    txn.as_mut(),
+                    CreateStarRocksTableLayoutRequest {
+                        db_id: database.db_id,
+                        table_name: "orders".to_string(),
+                        keys_type: "DUP_KEYS".to_string(),
+                        bucket_num: 1,
+                        kind: StarRocksTableKind::Table,
+                        schema_version: 0,
+                        tablet_schema_pb: TabletSchemaPb::default().encode_to_vec(),
+                        columns: Vec::new(),
+                        partition_name: "p0".to_string(),
+                        warehouse_uri: "s3://test/warehouse".to_string(),
+                    },
+                )
+                .expect("create table layout");
+            txn.commit().expect("commit seed");
+            (
+                database.db_id,
+                created.table.table_id,
+                created.schema.schema_id,
+                created.tablets[0].tablet_id,
+                created.tablets[0].tablet_root_path.clone(),
+            )
+        };
+        let state = Arc::new(StandaloneState {
+            starrocks_table_config: Some(test_starrocks_table_config()),
+            metadata_provider: Some(Arc::new(provider)),
+            ..StandaloneState::default()
+        });
+        let table = LakeTableIdentity {
+            catalog: "default_catalog".to_string(),
+            db_name: "analytics".to_string(),
+            table_name: "orders".to_string(),
+            db_id,
+            table_id,
+            schema_id,
+        };
+
+        let paths = recover_starrocks_tablet_paths_from_state(&state, &table, &[tablet_id])
+            .expect("recover tablet paths");
+
+        assert_eq!(
+            paths.get(&tablet_id).map(String::as_str),
+            Some(expected_path.as_str())
+        );
+        let shard = crate::runtime::starlet_shard_registry::select_infos(&[tablet_id]);
+        let info = shard.get(&tablet_id).expect("shard info registered");
+        assert_eq!(info.full_path, expected_path);
+        assert_eq!(
+            info.s3.as_ref().map(|s3| s3.endpoint.as_str()),
+            Some("http://127.0.0.1:9000")
+        );
+    }
+
+    #[test]
+    fn recovers_starrocks_tablet_paths_from_installed_config_without_engine_state() {
+        let _guard = super::acquire_standalone_test_guard();
+        let _runtime_guard = lock_runtime_test_state();
+        use crate::common::app_config::{
+            MetadataConfig, MetadataProviderConfig, NovaRocksConfig, StandaloneObjectStoreConfig,
+            StandaloneServerConfig,
+        };
+        use crate::meta::repository::starrocks_table::{
+            CreateStarRocksTableLayoutRequest, StarRocksTableKind, StarRocksTableMetaRepository,
+        };
+        use crate::service::grpc_client::proto::starrocks::TabletSchemaPb;
+        use prost::Message;
+
+        let dir = TempDir::new().expect("tempdir");
+        let metadata_path = dir.path().join("standalone.sqlite");
+        let provider =
+            crate::meta::SqliteMetaStoreProvider::open(&metadata_path).expect("open provider");
+        let (db_id, table_id, schema_id, tablet_id, expected_path) = {
+            let mut txn = provider
+                .begin_write("seed starrocks table")
+                .expect("write txn");
+            let repo = StarRocksTableMetaRepository::default();
+            let database = repo
+                .get_or_create_database(txn.as_mut(), "analytics")
+                .expect("create database");
+            let created = repo
+                .create_table_layout(
+                    txn.as_mut(),
+                    CreateStarRocksTableLayoutRequest {
+                        db_id: database.db_id,
+                        table_name: "orders".to_string(),
+                        keys_type: "DUP_KEYS".to_string(),
+                        bucket_num: 1,
+                        kind: StarRocksTableKind::Table,
+                        schema_version: 0,
+                        tablet_schema_pb: TabletSchemaPb::default().encode_to_vec(),
+                        columns: Vec::new(),
+                        partition_name: "p0".to_string(),
+                        warehouse_uri: "s3://test/warehouse".to_string(),
+                    },
+                )
+                .expect("create table layout");
+            txn.commit().expect("commit seed");
+            (
+                database.db_id,
+                created.table.table_id,
+                created.schema.schema_id,
+                created.tablets[0].tablet_id,
+                created.tablets[0].tablet_root_path.clone(),
+            )
+        };
+        let mut cfg = NovaRocksConfig::default();
+        cfg.metadata = Some(MetadataConfig {
+            provider: MetadataProviderConfig::Sqlite,
+            path: metadata_path,
+        });
+        cfg.standalone_server = Some(StandaloneServerConfig {
+            warehouse_uri: Some("s3://test/warehouse".to_string()),
+            object_store: Some(StandaloneObjectStoreConfig {
+                endpoint: Some("http://127.0.0.1:9000".to_string()),
+                access_key_id: Some("ak".to_string()),
+                access_key_secret: Some("sk".to_string()),
+                region: None,
+                enable_path_style_access: Some(true),
+            }),
+            ..StandaloneServerConfig::default()
+        });
+        crate::novarocks_config::install_preloaded_config(cfg);
+        let table = LakeTableIdentity {
+            catalog: "default_catalog".to_string(),
+            db_name: "analytics".to_string(),
+            table_name: "orders".to_string(),
+            db_id,
+            table_id,
+            schema_id,
+        };
+
+        let paths = recover_starrocks_tablet_paths_from_installed_config(&table, &[tablet_id])
+            .expect("recover tablet paths");
+
+        assert_eq!(
+            paths.get(&tablet_id).map(String::as_str),
+            Some(expected_path.as_str())
+        );
+        let shard = crate::runtime::starlet_shard_registry::select_infos(&[tablet_id]);
+        let info = shard.get(&tablet_id).expect("shard info registered");
+        assert_eq!(info.full_path, expected_path);
+        assert_eq!(
+            info.s3.as_ref().map(|s3| s3.endpoint.as_str()),
+            Some("http://127.0.0.1:9000")
+        );
+    }
+
+    #[test]
+    fn backend_management_sql_add_show_drop_force() {
+        let _registry = BackendRegistryReset::new();
+        let mut cfg = crate::common::app_config::NovaRocksConfig::default();
+        cfg.cluster.role = crate::common::app_config::ClusterRole::Fe;
+        cfg.cluster.backends.clear();
+        let engine = StandaloneNovaRocks::open_with_config(StandaloneOptions::default(), cfg)
+            .expect("open FE engine");
+        let session = engine.session();
+
+        session
+            .execute("ADD BACKEND '127.0.0.1:19170'")
+            .expect("ADD BACKEND");
+        let result = session.query("SHOW BACKENDS").expect("SHOW BACKENDS");
+        assert_eq!(result.row_count(), 1);
+        assert_eq!(string_cell(&result, 0, 1), "127.0.0.1");
+        assert_eq!(string_cell(&result, 0, 2), "19170");
+        assert_eq!(string_cell(&result, 0, 3), "Registering");
+
+        session
+            .execute("DROP BACKEND '127.0.0.1:19170' FORCE")
+            .expect("DROP BACKEND FORCE");
+        let result = session.query("SHOW BACKENDS").expect("SHOW BACKENDS");
+        assert_eq!(result.row_count(), 0);
+    }
+
+    #[test]
+    fn backend_management_sql_restores_persisted_backend_metadata() {
+        let _registry = BackendRegistryReset::new();
+        let dir = TempDir::new().expect("tempdir");
+        let metadata_path = dir.path().join("meta.sqlite");
+        let mut cfg = crate::common::app_config::NovaRocksConfig::default();
+        cfg.cluster.role = crate::common::app_config::ClusterRole::Fe;
+        cfg.cluster.backends.clear();
+        cfg.metadata = Some(crate::common::app_config::MetadataConfig {
+            provider: crate::common::app_config::MetadataProviderConfig::Sqlite,
+            path: metadata_path.clone(),
+        });
+
+        let engine =
+            StandaloneNovaRocks::open_with_config(StandaloneOptions::default(), cfg.clone())
+                .expect("open FE engine");
+        engine
+            .session()
+            .execute("ADD BACKEND '127.0.0.1:19172'")
+            .expect("ADD BACKEND");
+        drop(engine);
+
+        crate::runtime::backend_registry::replace_backend_registry_for_test(None);
+        let reopened = StandaloneNovaRocks::open_with_config(StandaloneOptions::default(), cfg)
+            .expect("reopen FE engine");
+        let result = reopened
+            .session()
+            .query("SHOW BACKENDS")
+            .expect("SHOW BACKENDS");
+        assert_eq!(result.row_count(), 1);
+        assert_eq!(string_cell(&result, 0, 1), "127.0.0.1");
+        assert_eq!(string_cell(&result, 0, 2), "19172");
+    }
+
+    #[test]
+    fn add_backend_requires_fe_role_but_show_backends_works_in_all_in_one() {
+        let _registry = BackendRegistryReset::new();
+        let mut cfg = crate::common::app_config::NovaRocksConfig::default();
+        cfg.cluster.role = crate::common::app_config::ClusterRole::AllInOne;
+        let engine = StandaloneNovaRocks::open_with_config(StandaloneOptions::default(), cfg)
+            .expect("open all-in-one engine");
+        let session = engine.session();
+
+        let err = session
+            .execute("ADD BACKEND '127.0.0.1:19171'")
+            .expect_err("ADD BACKEND must require FE role");
+        assert!(err.contains("requires role=fe"), "{err}");
+
+        let result = session.query("SHOW BACKENDS").expect("SHOW BACKENDS");
+        assert_eq!(result.row_count(), 1);
+        assert_eq!(string_cell(&result, 0, 3), "Live");
     }
 
     #[test]
@@ -4820,8 +5507,9 @@ enable_path_style_access = true
         let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)
             .expect("plan query");
         let table_stats = super::build_table_stats_from_plan(&logical);
-        let physical = crate::sql::optimizer::optimize(logical, &table_stats, factory, None)
-            .expect("optimize");
+        let physical =
+            crate::sql::optimizer::optimize(logical, &table_stats, factory, None, Vec::new())
+                .expect("optimize");
         crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build(
             &physical, &catalog, &registry, "default",
         )
@@ -5096,6 +5784,7 @@ enable_path_style_access = true
             None,
             Some(&mv_ctx),
             Some(&validator),
+            None,
         )
         .expect_err("validator errors must abort refresh query execution");
 
@@ -8400,6 +9089,25 @@ path = "meta/operations.sqlite"
     }
 
     #[test]
+    fn dispatcher_for_role_fe_uses_live_registry_backend_ids() {
+        let _guard = super::acquire_standalone_test_guard();
+        let _registry = BackendRegistryReset::new();
+        use crate::common::app_config::{ClusterRole, NovaRocksConfig};
+        use crate::runtime::backend_registry::{BackendRegistry, BackendState};
+        let mut cfg = NovaRocksConfig::default();
+        cfg.cluster.role = ClusterRole::Fe;
+        cfg.cluster.backends.clear();
+        crate::common::app_config::install_preloaded_config(cfg);
+
+        let registry = Arc::new(BackendRegistry::new(3));
+        registry.restore_backend(2, "127.0.0.1:19072".parse().unwrap(), BackendState::Live);
+        crate::runtime::backend_registry::replace_backend_registry_for_test(Some(registry));
+
+        let dispatcher = super::dispatcher_for_role(ClusterRole::Fe).expect("dispatcher");
+        assert_eq!(dispatcher.backend_count(), 1);
+    }
+
+    #[test]
     fn parse_explain_refresh_materialized_view_supports_verbose_and_costs() {
         let verbose = super::parse_explain_refresh_materialized_view(
             "EXPLAIN VERBOSE REFRESH MATERIALIZED VIEW mv1",
@@ -8429,5 +9137,558 @@ path = "meta/operations.sqlite"
         .expect("parsed");
         assert_eq!(parsed.1, crate::sql::explain::ExplainLevel::Analyze);
         assert!(parsed.2);
+    }
+
+    // -------------------------------------------------------------------------
+    // Scalar subquery decorrelation — end-to-end correctness tests (Task 5).
+    //
+    // Each test runs the same query in both `legacy` and `apply` modes against
+    // the same Iceberg-backed in-memory tables and asserts identical results,
+    // OR asserts the apply-mode error for the multi-row case (which is the
+    // correct SQL-standard semantics).
+    //
+    // Setup: t1(k BIGINT, v BIGINT) and t2(k BIGINT, v BIGINT) in an Iceberg
+    // in-memory catalog, populated with controlled data per test.
+    //
+    // All engine calls are wrapped in `with_session_optimizer_settings` so the
+    // TLS-stored mode is active for both the analyzer (subquery routing) and the
+    // optimizer (SubqueryRewrite stage).
+    // -------------------------------------------------------------------------
+
+    /// Open an Iceberg-backed test engine and return (engine, session, warehouse_dir).
+    /// Tables are NOT yet created; the caller creates and populates them.
+    fn open_scalar_subquery_test_engine(
+        warehouse: &TempDir,
+    ) -> (StandaloneNovaRocks, StandaloneSession) {
+        let engine = open_test_engine_with_metadata(warehouse);
+        let session = engine.session();
+        let create_catalog_sql = format!(
+            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="memory","iceberg.catalog.warehouse"="{}")"#,
+            warehouse.path().display()
+        );
+        session
+            .execute_in_database(&create_catalog_sql, "default")
+            .expect("create iceberg catalog");
+        session
+            .execute_in_database("create database ice.db1", "default")
+            .expect("create iceberg database");
+        (engine, session)
+    }
+
+    /// Run a SELECT query in the given mode and return the first column's values
+    /// as a `Vec<Option<i64>>` (None = SQL NULL). Expects every row to have
+    /// exactly one column of type BIGINT/INT.
+    fn run_scalar_query_i64(
+        session: &StandaloneSession,
+        sql: &str,
+        mode: crate::sql::optimizer::options::SubqueryUnnestMode,
+    ) -> Result<Vec<Option<i64>>, String> {
+        use crate::sql::optimizer::options::{
+            SessionOptimizerSettings, with_session_optimizer_settings,
+        };
+        let settings = SessionOptimizerSettings {
+            subquery_unnest_mode: mode,
+            ..Default::default()
+        };
+        let result = with_session_optimizer_settings(settings, || {
+            session.execute_in_context(sql, Some("ice"), "db1", None)
+        })?;
+        let qr = match result {
+            StatementResult::Query(qr) => qr,
+            StatementResult::Ok => {
+                return Err("query returned no rows (StatementResult::Ok)".to_string());
+            }
+        };
+        let mut values = Vec::new();
+        for chunk in &qr.chunks {
+            let col = chunk.batch.column(0);
+            // Try Int64 first (BIGINT), then Int32 (INT).
+            if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+                for i in 0..arr.len() {
+                    values.push(if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i))
+                    });
+                }
+            } else if let Some(arr) = col.as_any().downcast_ref::<Int32Array>() {
+                for i in 0..arr.len() {
+                    values.push(if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i) as i64)
+                    });
+                }
+            } else {
+                return Err(format!(
+                    "expected Int64 or Int32 column, got {:?}",
+                    col.data_type()
+                ));
+            }
+        }
+        Ok(values)
+    }
+
+    /// Run a SELECT query in the given mode and return all columns' values as a
+    /// `Vec<Vec<Option<i64>>>` (outer = rows, inner = columns). Expects every
+    /// column to be BIGINT/INT.
+    fn run_scalar_query_multi_col(
+        session: &StandaloneSession,
+        sql: &str,
+        mode: crate::sql::optimizer::options::SubqueryUnnestMode,
+    ) -> Result<Vec<Vec<Option<i64>>>, String> {
+        use crate::sql::optimizer::options::{
+            SessionOptimizerSettings, with_session_optimizer_settings,
+        };
+        let settings = SessionOptimizerSettings {
+            subquery_unnest_mode: mode,
+            ..Default::default()
+        };
+        let result = with_session_optimizer_settings(settings, || {
+            session.execute_in_context(sql, Some("ice"), "db1", None)
+        })?;
+        let qr = match result {
+            StatementResult::Query(qr) => qr,
+            StatementResult::Ok => {
+                return Err("query returned no rows (StatementResult::Ok)".to_string());
+            }
+        };
+        let num_cols = qr.columns.len();
+        // Build row-major result: collect per-column arrays, then transpose.
+        let mut col_values: Vec<Vec<Option<i64>>> = vec![Vec::new(); num_cols];
+        for chunk in &qr.chunks {
+            for col_idx in 0..num_cols {
+                let col = chunk.batch.column(col_idx);
+                if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+                    for i in 0..arr.len() {
+                        col_values[col_idx].push(if arr.is_null(i) {
+                            None
+                        } else {
+                            Some(arr.value(i))
+                        });
+                    }
+                } else if let Some(arr) = col.as_any().downcast_ref::<Int32Array>() {
+                    for i in 0..arr.len() {
+                        col_values[col_idx].push(if arr.is_null(i) {
+                            None
+                        } else {
+                            Some(arr.value(i) as i64)
+                        });
+                    }
+                } else {
+                    return Err(format!(
+                        "col {col_idx}: expected Int64 or Int32, got {:?}",
+                        col.data_type()
+                    ));
+                }
+            }
+        }
+        // Transpose to row-major.
+        let num_rows = col_values.first().map(|v| v.len()).unwrap_or(0);
+        let rows = (0..num_rows)
+            .map(|r| (0..num_cols).map(|c| col_values[c][r]).collect())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Run a SELECT query in apply mode and expect an error containing `needle`.
+    fn expect_apply_error(session: &StandaloneSession, sql: &str, needle: &str) {
+        use crate::sql::optimizer::options::{
+            SessionOptimizerSettings, SubqueryUnnestMode, with_session_optimizer_settings,
+        };
+        let settings = SessionOptimizerSettings {
+            subquery_unnest_mode: SubqueryUnnestMode::Apply,
+            ..Default::default()
+        };
+        let result = with_session_optimizer_settings(settings, || {
+            session.execute_in_context(sql, Some("ice"), "db1", None)
+        });
+        let err = result.expect_err(&format!(
+            "expected apply-mode error containing '{needle}', but query succeeded"
+        ));
+        assert!(
+            err.contains(needle),
+            "expected error containing '{needle}'; got: {err}"
+        );
+    }
+
+    // ---- Test 1: correlated aggregate (q17-shape) — apply == legacy -----------
+
+    /// Correlated aggregate scalar: `WHERE v = (SELECT min(t2.v) FROM t2 WHERE t2.k = t1.k)`.
+    /// Both legacy and apply mode must return the same rows.
+    #[test]
+    fn scalar_subquery_correlated_agg_apply_matches_legacy() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
+
+        session
+            .execute_in_database("create table ice.db1.t1 (k bigint, v bigint)", "default")
+            .expect("create t1");
+        session
+            .execute_in_database("create table ice.db1.t2 (k bigint, v bigint)", "default")
+            .expect("create t2");
+        // t1: (1,10),(2,20),(3,30)
+        // t2: (1,10),(1,5),(2,20),(2,15)  -> min for k=1 is 5, k=2 is 15, k=3 has no match
+        session
+            .execute_in_database(
+                "insert into ice.db1.t1 values (1,10),(2,20),(3,30)",
+                "default",
+            )
+            .expect("insert t1");
+        session
+            .execute_in_database(
+                "insert into ice.db1.t2 values (1,10),(1,5),(2,20),(2,15)",
+                "default",
+            )
+            .expect("insert t2");
+
+        // The subquery: SELECT t1.k FROM t1 WHERE t1.v = (SELECT min(t2.v) FROM t2 WHERE t2.k = t1.k)
+        // k=1: min(t2.v) for k=1 = 5; t1.v=10 != 5 -> not selected
+        // k=2: min(t2.v) for k=2 = 15; t1.v=20 != 15 -> not selected
+        // k=3: no t2 rows -> NULL; t1.v=30 != NULL -> not selected
+        // Result: no rows (empty)
+        //
+        // Alternatively use a query where some rows DO match:
+        // WHERE t1.v = (SELECT min(t2.v) FROM t2 WHERE t2.k = t1.k)
+        // Let's insert a t1 row where v=5 (k=1) so it matches min(t2.v)=5.
+        session
+            .execute_in_database("insert into ice.db1.t1 values (1,5)", "default")
+            .expect("insert matching t1 row");
+
+        let sql = "SELECT t1.k FROM t1 WHERE t1.v = (SELECT min(t2.v) FROM t2 WHERE t2.k = t1.k) ORDER BY 1";
+
+        use crate::sql::optimizer::options::SubqueryUnnestMode;
+        let legacy = run_scalar_query_i64(&session, sql, SubqueryUnnestMode::Legacy)
+            .expect("legacy corr-agg query");
+        let apply = run_scalar_query_i64(&session, sql, SubqueryUnnestMode::Apply)
+            .expect("apply corr-agg query");
+
+        assert_eq!(
+            apply, legacy,
+            "apply mode must return the same result as legacy for correlated-aggregate scalar"
+        );
+        // k=1, v=5 matches min(t2.v for k=1)=5 — exactly one row
+        assert_eq!(legacy, vec![Some(1)]);
+    }
+
+    // ---- Test 2: uncorrelated scalar — apply == legacy -----------------------
+
+    #[test]
+    fn scalar_subquery_uncorrelated_apply_matches_legacy() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
+
+        session
+            .execute_in_database("create table ice.db1.t1 (k bigint, v bigint)", "default")
+            .expect("create t1");
+        session
+            .execute_in_database("create table ice.db1.t2 (k bigint, v bigint)", "default")
+            .expect("create t2");
+        session
+            .execute_in_database(
+                "insert into ice.db1.t1 values (1,10),(2,20),(3,30)",
+                "default",
+            )
+            .expect("insert t1");
+        session
+            .execute_in_database(
+                "insert into ice.db1.t2 values (1,100),(2,200),(3,300)",
+                "default",
+            )
+            .expect("insert t2");
+
+        // Uncorrelated scalar: v > (SELECT min(v) FROM t2). min(t2.v)=100 and all
+        // t1.v are < 100, so the result is empty in BOTH modes — which still
+        // proves apply mode is equivalent to legacy for an uncorrelated scalar.
+        let sql = "SELECT t1.k FROM t1 WHERE t1.v > (SELECT min(v) FROM t2) ORDER BY 1";
+
+        use crate::sql::optimizer::options::SubqueryUnnestMode;
+        let legacy = run_scalar_query_i64(&session, sql, SubqueryUnnestMode::Legacy)
+            .expect("legacy uncorrelated query");
+        let apply = run_scalar_query_i64(&session, sql, SubqueryUnnestMode::Apply)
+            .expect("apply uncorrelated query");
+
+        assert_eq!(
+            apply, legacy,
+            "apply mode must return the same result as legacy for uncorrelated scalar"
+        );
+        // t1.v > 100: v=20 no, v=30 no — wait, t1.v values are 10,20,30; min(t2.v)=100
+        // None qualify. Let's verify.
+        assert_eq!(legacy, vec![]);
+    }
+
+    // ---- Test 3: empty group → NULL — apply == legacy ------------------------
+
+    /// When some outer rows have no matching inner group, the correlated
+    /// aggregate returns NULL (LEFT OUTER JOIN null-extension). Both modes
+    /// must agree.
+    #[test]
+    fn scalar_subquery_empty_group_yields_null_apply_matches_legacy() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
+
+        session
+            .execute_in_database("create table ice.db1.t1 (k bigint, v bigint)", "default")
+            .expect("create t1");
+        session
+            .execute_in_database("create table ice.db1.t2 (k bigint, v bigint)", "default")
+            .expect("create t2");
+        // t1: k=1, k=2, k=3. t2 has only k=1 and k=2.
+        // k=3 has no match → scalar is NULL.
+        session
+            .execute_in_database("insert into ice.db1.t1 values (1,0),(2,0),(3,0)", "default")
+            .expect("insert t1");
+        session
+            .execute_in_database("insert into ice.db1.t2 values (1,10),(2,20)", "default")
+            .expect("insert t2");
+
+        // Project the scalar result (may be NULL) for each t1 row.
+        let sql = "SELECT (SELECT min(t2.v) FROM t2 WHERE t2.k = t1.k) FROM t1 ORDER BY t1.k";
+
+        use crate::sql::optimizer::options::SubqueryUnnestMode;
+        let legacy = run_scalar_query_i64(&session, sql, SubqueryUnnestMode::Legacy)
+            .expect("legacy empty-group query");
+        let apply = run_scalar_query_i64(&session, sql, SubqueryUnnestMode::Apply)
+            .expect("apply empty-group query");
+
+        assert_eq!(
+            apply, legacy,
+            "apply mode must return the same result as legacy for empty-group scalar"
+        );
+        // k=1 → Some(10), k=2 → Some(20), k=3 → None (NULL)
+        assert_eq!(legacy, vec![Some(10), Some(20), None]);
+    }
+
+    // ---- Test 4: count → 0, not NULL — apply mode normalizes correctly -------
+
+    /// Correlated count(*) scalar: apply mode must return 0 (not NULL) for outer
+    /// rows with no matching inner group, thanks to the `ifnull(count,0)`
+    /// normalization in ScalarApplyToJoin.
+    ///
+    /// Note: legacy mode returns NULL for count(*) with no matches (it does not
+    /// apply the ifnull normalization). Apply mode is the *correct* SQL-standard
+    /// behavior here; legacy is a known gap. We assert apply returns 0.
+    #[test]
+    fn scalar_subquery_count_zero_apply_normalizes_correctly() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
+
+        session
+            .execute_in_database("create table ice.db1.t1 (k bigint, v bigint)", "default")
+            .expect("create t1");
+        session
+            .execute_in_database("create table ice.db1.t2 (k bigint, v bigint)", "default")
+            .expect("create t2");
+        session
+            .execute_in_database("insert into ice.db1.t1 values (1,0),(2,0),(3,0)", "default")
+            .expect("insert t1");
+        session
+            .execute_in_database("insert into ice.db1.t2 values (1,10),(1,20)", "default")
+            .expect("insert t2");
+
+        // count(*) for k=1 → 2, k=2 → 0, k=3 → 0 (not NULL)
+        let sql = "SELECT (SELECT count(*) FROM t2 WHERE t2.k = t1.k) FROM t1 ORDER BY t1.k";
+
+        use crate::sql::optimizer::options::SubqueryUnnestMode;
+        let apply = run_scalar_query_i64(&session, sql, SubqueryUnnestMode::Apply)
+            .expect("apply count-zero query");
+
+        assert_eq!(
+            apply,
+            vec![Some(2), Some(0), Some(0)],
+            "apply mode: count(*) must return 0 (not NULL) for unmatched outer rows (ifnull normalization)"
+        );
+    }
+
+    // ---- Test 5: NULL correlation key → NULL scalar — apply == legacy --------
+
+    #[test]
+    fn scalar_subquery_null_correlation_key_yields_null_apply_matches_legacy() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
+
+        session
+            .execute_in_database("create table ice.db1.t1 (k bigint, v bigint)", "default")
+            .expect("create t1");
+        session
+            .execute_in_database("create table ice.db1.t2 (k bigint, v bigint)", "default")
+            .expect("create t2");
+        // t1 has a NULL k; the correlated scalar must also be NULL.
+        session
+            .execute_in_database("insert into ice.db1.t1 values (1,0),(NULL,0)", "default")
+            .expect("insert t1");
+        session
+            .execute_in_database("insert into ice.db1.t2 values (1,10),(1,5)", "default")
+            .expect("insert t2");
+
+        let sql =
+            "SELECT (SELECT min(t2.v) FROM t2 WHERE t2.k = t1.k) FROM t1 ORDER BY t1.k NULLS LAST";
+
+        use crate::sql::optimizer::options::SubqueryUnnestMode;
+        let legacy = run_scalar_query_i64(&session, sql, SubqueryUnnestMode::Legacy)
+            .expect("legacy null-key query");
+        let apply = run_scalar_query_i64(&session, sql, SubqueryUnnestMode::Apply)
+            .expect("apply null-key query");
+
+        assert_eq!(
+            apply, legacy,
+            "apply mode must return the same result as legacy for NULL correlation key"
+        );
+        // k=1 → Some(5), k=NULL → None (NULL: no match because NULL != NULL in the join)
+        assert_eq!(legacy, vec![Some(5), None]);
+    }
+
+    // ---- Test 6: correlated non-agg single-row — apply returns correct value -
+
+    /// Correlated NON-aggregate scalar where the inner key is unique (≤1 row
+    /// per outer key). The with-check path (count(1)/any_value/assert_true)
+    /// must return the correct value without raising the row-check error.
+    #[test]
+    fn scalar_subquery_correlated_nonagg_single_row_ok() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
+
+        session
+            .execute_in_database("create table ice.db1.t1 (k bigint, v bigint)", "default")
+            .expect("create t1");
+        session
+            .execute_in_database("create table ice.db1.t2 (k bigint, v bigint)", "default")
+            .expect("create t2");
+        // t2.k is effectively unique: each k appears exactly once.
+        session
+            .execute_in_database("insert into ice.db1.t1 values (1,0),(2,0),(3,0)", "default")
+            .expect("insert t1");
+        session
+            .execute_in_database("insert into ice.db1.t2 values (1,100),(2,200)", "default")
+            .expect("insert t2");
+
+        // Correlated non-aggregate: (SELECT t2.v FROM t2 WHERE t2.k = t1.k)
+        // k=1 → 100, k=2 → 200, k=3 → NULL (no match)
+        let sql = "SELECT (SELECT t2.v FROM t2 WHERE t2.k = t1.k) FROM t1 ORDER BY t1.k";
+
+        use crate::sql::optimizer::options::SubqueryUnnestMode;
+        let result = run_scalar_query_i64(&session, sql, SubqueryUnnestMode::Apply)
+            .expect("apply non-agg single-row query must succeed");
+
+        assert_eq!(
+            result,
+            vec![Some(100), Some(200), None],
+            "apply non-agg single-row must return correct values"
+        );
+    }
+
+    // ---- Test 7: correlated non-agg MULTI-ROW → apply must ERROR -------------
+    //
+    // This is the most important test: the assert_true(cnt IS NULL OR cnt <= 1,
+    // 'correlate scalar subquery result must 1 row') check must fire at runtime.
+    // Legacy mode does NOT enforce this (known gap); apply mode MUST error.
+
+    #[test]
+    fn scalar_subquery_correlated_nonagg_multirow_errors_in_apply_mode() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
+
+        session
+            .execute_in_database("create table ice.db1.t1 (k bigint, v bigint)", "default")
+            .expect("create t1");
+        session
+            .execute_in_database("create table ice.db1.t2 (k bigint, v bigint)", "default")
+            .expect("create t2");
+        // t2 has TWO rows with k=1, so the correlated scalar for t1.k=1 returns >1 row.
+        session
+            .execute_in_database("insert into ice.db1.t1 values (1,0)", "default")
+            .expect("insert t1");
+        session
+            .execute_in_database("insert into ice.db1.t2 values (1,100),(1,200)", "default")
+            .expect("insert t2");
+
+        // Apply mode must raise the assert_true error.
+        let sql = "SELECT (SELECT t2.v FROM t2 WHERE t2.k = t1.k) FROM t1";
+        expect_apply_error(&session, sql, "correlate scalar subquery result must 1 row");
+    }
+
+    // ---- Test 8: two correlated scalar subqueries in one query — apply == legacy
+
+    /// Two correlated scalar subqueries over different tables in the same SELECT
+    /// list. M1a stacks them as left-deep Apply nodes; M1b decorrelates each one
+    /// to a LEFT OUTER JOIN. This test verifies that both decorrelations succeed
+    /// and that apply-mode results match legacy, including NULL extension for
+    /// outer rows that only match one of the two subqueries.
+    ///
+    /// Schema:
+    ///   t1(k BIGINT, v BIGINT) — outer table
+    ///   t2(k BIGINT, v BIGINT) — has matches for k=1 and k=2, but NOT k=3
+    ///   t3(k BIGINT, v BIGINT) — has matches for k=1 and k=3, but NOT k=2
+    ///
+    /// Query:
+    ///   SELECT t1.k,
+    ///          (SELECT min(t2.v) FROM t2 WHERE t2.k = t1.k),
+    ///          (SELECT max(t3.v) FROM t3 WHERE t3.k = t1.k)
+    ///   FROM t1 ORDER BY t1.k
+    ///
+    /// Expected results (k, min_t2, max_t3):
+    ///   k=1 → (1, 5,  90)   — both subqueries match
+    ///   k=2 → (2, 20, NULL) — only t2 matches; t3 NULL-extends
+    ///   k=3 → (3, NULL, 30) — only t3 matches; t2 NULL-extends
+    #[test]
+    fn scalar_subquery_multiple_in_one_query_apply_matches_legacy() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
+
+        session
+            .execute_in_database("create table ice.db1.t1 (k bigint, v bigint)", "default")
+            .expect("create t1");
+        session
+            .execute_in_database("create table ice.db1.t2 (k bigint, v bigint)", "default")
+            .expect("create t2");
+        session
+            .execute_in_database("create table ice.db1.t3 (k bigint, v bigint)", "default")
+            .expect("create t3");
+
+        // t1: three outer rows with distinct keys
+        session
+            .execute_in_database("insert into ice.db1.t1 values (1,0),(2,0),(3,0)", "default")
+            .expect("insert t1");
+        // t2: k=1 has two rows (min=5), k=2 has one row (min=20), k=3 absent
+        session
+            .execute_in_database(
+                "insert into ice.db1.t2 values (1,5),(1,10),(2,20)",
+                "default",
+            )
+            .expect("insert t2");
+        // t3: k=1 has one row (max=90), k=2 absent, k=3 has one row (max=30)
+        session
+            .execute_in_database("insert into ice.db1.t3 values (1,90),(3,30)", "default")
+            .expect("insert t3");
+
+        let sql = "SELECT t1.k, \
+                   (SELECT min(t2.v) FROM t2 WHERE t2.k = t1.k), \
+                   (SELECT max(t3.v) FROM t3 WHERE t3.k = t1.k) \
+                   FROM t1 ORDER BY t1.k";
+
+        use crate::sql::optimizer::options::SubqueryUnnestMode;
+        let legacy = run_scalar_query_multi_col(&session, sql, SubqueryUnnestMode::Legacy)
+            .expect("legacy multi-scalar query");
+        let apply = run_scalar_query_multi_col(&session, sql, SubqueryUnnestMode::Apply)
+            .expect("apply multi-scalar query");
+
+        assert_eq!(
+            apply, legacy,
+            "apply mode must return the same result as legacy for two correlated scalar subqueries"
+        );
+
+        // Verify the concrete expected values:
+        //   k=1: min(t2.v for k=1)=5,  max(t3.v for k=1)=90
+        //   k=2: min(t2.v for k=2)=20, max(t3.v for k=2)=NULL (no t3 rows)
+        //   k=3: min(t2.v for k=3)=NULL (no t2 rows), max(t3.v for k=3)=30
+        assert_eq!(
+            legacy,
+            vec![
+                vec![Some(1), Some(5), Some(90)],
+                vec![Some(2), Some(20), None],
+                vec![Some(3), None, Some(30)],
+            ],
+            "unexpected result values for multiple scalar subqueries"
+        );
     }
 }

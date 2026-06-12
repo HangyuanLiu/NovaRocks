@@ -246,6 +246,10 @@ impl WriteCoordinator {
         }
     }
 
+    fn contains_writer_key(&self, key: &WriterKey) -> bool {
+        self.writers.contains_key(key)
+    }
+
     pub(crate) fn mark_canceled_except_finished(&mut self, reason: String) {
         self.latch_failed_reason(reason.clone());
         for slot in self.writers.values_mut() {
@@ -365,6 +369,25 @@ fn status_message(status: &status::TStatus) -> String {
         .unwrap_or_else(|| format!("status={:?}", status.status_code))
 }
 
+fn apply_report_to_query_state(report: &FragmentExecStatusReport) {
+    let finst_id = crate::common::types::UniqueId {
+        hi: report.fragment_instance_id.hi,
+        lo: report.fragment_instance_id.lo,
+    };
+    if report.status.status_code != status_code::TStatusCode::OK {
+        crate::runtime::query_state::in_flight_table()
+            .on_fragment_done(finst_id, Err(status_message(&report.status)));
+    } else if report.done {
+        crate::runtime::query_state::in_flight_table().on_fragment_done(finst_id, Ok(()));
+    }
+}
+
+fn report_has_write_metadata(report: &FragmentExecStatusReport) -> bool {
+    !report.sink_commit_infos.is_empty()
+        || !report.tablet_commit_infos.is_empty()
+        || !report.tablet_fail_infos.is_empty()
+}
+
 fn format_writer_key(key: &WriterKey) -> String {
     format!(
         "query={}/{} finst={}/{} backend_num={}",
@@ -426,23 +449,93 @@ pub(crate) fn handle_report_exec_status(
     params: frontend_service::TReportExecStatusParams,
 ) -> Result<ReportOutcome, String> {
     let report = report_from_thrift(params)?;
-    let query_id = report.query_id.clone();
+    apply_report_to_query_state(&report);
+
+    let coord = registry()
+        .queries
+        .lock()
+        .expect("write coordinator registry lock")
+        .get(&query_key(&report.query_id))
+        .cloned();
+
+    let Some(coord) = coord else {
+        if report_has_write_metadata(&report) {
+            return Err(format!(
+                "write coordinator not found for query {}/{}",
+                report.query_id.hi, report.query_id.lo
+            ));
+        }
+        return Ok(ReportOutcome::Accepted);
+    };
+    coord
+        .lock()
+        .expect("write coordinator lock")
+        .apply_report(report)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum WriterReportLookup {
+    Expected,
+    UnknownWriter { query_id: types::TUniqueId },
+    UnknownQuery { query_id: types::TUniqueId },
+}
+
+pub(crate) fn lookup_writer_report(
+    params: &frontend_service::TReportExecStatusParams,
+) -> Result<WriterReportLookup, String> {
+    let query_id = params
+        .query_id
+        .as_ref()
+        .ok_or_else(|| "TReportExecStatusParams missing query_id".to_string())?
+        .clone();
+    let fragment_instance_id = params
+        .fragment_instance_id
+        .as_ref()
+        .ok_or_else(|| "TReportExecStatusParams missing fragment_instance_id".to_string())?
+        .clone();
+    let backend_num = params
+        .backend_num
+        .ok_or_else(|| "TReportExecStatusParams missing backend_num".to_string())?;
+    let key = WriterKey {
+        query_id: query_id.clone(),
+        fragment_instance_id,
+        backend_num,
+    };
     let coord = registry()
         .queries
         .lock()
         .expect("write coordinator registry lock")
         .get(&query_key(&query_id))
-        .cloned()
-        .ok_or_else(|| {
-            format!(
-                "write coordinator not found for query {}/{}",
-                query_id.hi, query_id.lo
-            )
-        })?;
+        .cloned();
+    let Some(coord) = coord else {
+        return Ok(WriterReportLookup::UnknownQuery { query_id });
+    };
+    if coord
+        .lock()
+        .expect("write coordinator lock")
+        .contains_writer_key(&key)
+    {
+        Ok(WriterReportLookup::Expected)
+    } else {
+        Ok(WriterReportLookup::UnknownWriter { query_id })
+    }
+}
+
+pub(crate) fn mark_query_failed(query_id: &types::TUniqueId, reason: String) -> bool {
+    let coord = registry()
+        .queries
+        .lock()
+        .expect("write coordinator registry lock")
+        .get(&query_key(query_id))
+        .cloned();
+    let Some(coord) = coord else {
+        return false;
+    };
     coord
         .lock()
         .expect("write coordinator lock")
-        .apply_report(report)
+        .mark_canceled_except_finished(reason);
+    true
 }
 
 #[cfg(test)]
@@ -507,6 +600,10 @@ mod tests {
 
     fn id(hi: i64, lo: i64) -> types::TUniqueId {
         types::TUniqueId::new(hi, lo)
+    }
+
+    fn runtime_query_id(hi: i64, lo: i64) -> crate::runtime::query_context::QueryId {
+        crate::runtime::query_context::QueryId { hi, lo }
     }
 
     fn key(
@@ -1019,7 +1116,7 @@ mod tests {
             ok_status(),
             "s3://w/late.parquet",
         )))
-        .expect_err("unregistered query must fail");
+        .expect_err("unregistered write-looking report must fail");
         assert!(err.contains("not found"), "{err}");
     }
 
@@ -1191,5 +1288,73 @@ mod tests {
         assert_eq!(report.loaded_rows, 123);
         assert_eq!(report.loaded_bytes, 456);
         assert_eq!(report.filtered_rows, 5);
+    }
+
+    #[test]
+    fn unregistered_done_report_is_accepted_and_finishes_query_state() {
+        let query_id = runtime_query_id(1900, 2900);
+        let finst_id = crate::common::types::UniqueId { hi: 3100, lo: 4100 };
+        crate::runtime::query_state::in_flight_table().register(query_id, finst_id, 7);
+
+        let report = FragmentExecStatusReport {
+            query_id: id(query_id.hi, query_id.lo),
+            fragment_instance_id: id(finst_id.hi, finst_id.lo),
+            backend_num: 7,
+            done: true,
+            status: ok_status(),
+            sink_commit_infos: Vec::new(),
+            tablet_commit_infos: Vec::new(),
+            tablet_fail_infos: Vec::new(),
+            load_counters: Default::default(),
+            loaded_rows: 0,
+            loaded_bytes: 0,
+            filtered_rows: 0,
+        };
+
+        let outcome = handle_report_exec_status(thrift_params(report))
+            .expect("unregistered non-write report should be accepted");
+        assert_eq!(outcome, ReportOutcome::Accepted);
+        assert_eq!(
+            crate::runtime::query_state::in_flight_table().state(query_id),
+            Some(crate::runtime::query_state::QueryState::Finished)
+        );
+
+        crate::runtime::query_state::in_flight_table().forget(query_id);
+    }
+
+    #[test]
+    fn unregistered_failure_report_is_accepted_and_fails_query_state() {
+        let query_id = runtime_query_id(1901, 2901);
+        let finst_id = crate::common::types::UniqueId { hi: 3101, lo: 4101 };
+        crate::runtime::query_state::in_flight_table().register(query_id, finst_id, 8);
+
+        let report = FragmentExecStatusReport {
+            query_id: id(query_id.hi, query_id.lo),
+            fragment_instance_id: id(finst_id.hi, finst_id.lo),
+            backend_num: 8,
+            done: true,
+            status: err_status("select fragment failed"),
+            sink_commit_infos: Vec::new(),
+            tablet_commit_infos: Vec::new(),
+            tablet_fail_infos: Vec::new(),
+            load_counters: Default::default(),
+            loaded_rows: 0,
+            loaded_bytes: 0,
+            filtered_rows: 0,
+        };
+
+        let outcome = handle_report_exec_status(thrift_params(report))
+            .expect("unregistered failure report should still be accepted");
+        assert_eq!(outcome, ReportOutcome::Accepted);
+        assert_eq!(
+            crate::runtime::query_state::in_flight_table().state(query_id),
+            Some(crate::runtime::query_state::QueryState::Failed)
+        );
+        assert_eq!(
+            crate::runtime::query_state::in_flight_table().failure_reason(query_id),
+            Some("select fragment failed".to_string())
+        );
+
+        crate::runtime::query_state::in_flight_table().forget(query_id);
     }
 }

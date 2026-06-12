@@ -1100,6 +1100,65 @@ impl MvMetaRepository {
         Ok(true)
     }
 
+    /// Adopt a new target snapshot produced by a pure compaction (OPTIMIZE /
+    /// rewrite_data_files) of an iceberg MV's own storage table.
+    ///
+    /// A compaction REPLACE snapshot does not change the MV's logical contents
+    /// — it only rewrites the physical data files — so the MV's recorded
+    /// `last_refreshed_iceberg_snapshot_id` (which incremental refresh uses as
+    /// its tamper-detection baseline via `validate_target_snapshot`) can safely
+    /// be advanced to the new snapshot without re-running a refresh. Without
+    /// this, the next incremental refresh would reject the table as "modified
+    /// outside NovaRocks".
+    ///
+    /// Safety:
+    /// * Only adopts when no refresh is in progress (same guard as `drop_*`),
+    ///   so it never races a refresh that is mutating the same field.
+    /// * Only adopts when the recorded snapshot equals `expected_base_snapshot_id`
+    ///   (the snapshot the compaction was based on). If they differ, a refresh
+    ///   advanced the baseline between the compaction and this call, and the new
+    ///   compaction snapshot may not be a pure rewrite of the recorded state —
+    ///   in that case we do NOT adopt (returns `false`) and leave the guard to
+    ///   surface the discrepancy on the next refresh, rather than risk skipping
+    ///   a real data change.
+    ///
+    /// Returns `Ok(true)` if the snapshot was adopted, `Ok(false)` if the MV
+    /// definition was not found, has a refresh in progress, or its recorded
+    /// baseline no longer matches `expected_base_snapshot_id`.
+    pub fn adopt_target_compaction_snapshot(
+        &self,
+        txn: &mut dyn MetaWriteTxn,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        expected_base_snapshot_id: i64,
+        new_snapshot_id: i64,
+    ) -> RepositoryResult<bool> {
+        let target_key = key_by_target(catalog, namespace, table)?;
+        let Some(record) = txn.get(&target_key)? else {
+            return Ok(false);
+        };
+        let lookup: MvTargetLookup = decode_record_payload(&record, MV_TARGET_LOOKUP_KIND)?;
+        let mut definition =
+            self.load_target_lookup_definition(txn, &lookup, catalog, namespace, table)?;
+        if definition.value.refresh_in_progress || definition.value.active_refresh_id.is_some() {
+            return Ok(false);
+        }
+        if definition.value.last_refreshed_iceberg_snapshot_id != Some(expected_base_snapshot_id) {
+            return Ok(false);
+        }
+        if definition.value.last_refreshed_iceberg_snapshot_id == Some(new_snapshot_id) {
+            return Ok(true);
+        }
+        definition.value.last_refreshed_iceberg_snapshot_id = Some(new_snapshot_id);
+        put_definition(
+            txn,
+            &definition,
+            ExpectedRevision::Exact(definition.record_revision.clone()),
+        )?;
+        Ok(true)
+    }
+
     pub fn replace_dependencies_for_mv(
         &self,
         txn: &mut dyn MetaWriteTxn,
@@ -1532,4 +1591,221 @@ fn put_dependency_indexes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::meta::SqliteMetaStoreProvider;
+    use crate::meta::provider::MetaStoreProvider;
+
+    /// Open a fresh in-memory-style SQLite provider backed by a temp directory.
+    fn open_provider() -> (tempfile::TempDir, SqliteMetaStoreProvider) {
+        let dir = tempfile::tempdir().expect("create tempdir for mv tests");
+        let provider = SqliteMetaStoreProvider::open(dir.path().join("mv.sqlite"))
+            .expect("open sqlite metadata provider for mv tests");
+        (dir, provider)
+    }
+
+    /// Build a minimal `CreateMvDefinitionRequest` whose target triple is
+    /// (`catalog`, `namespace`, `table`).  The target triple is required so
+    /// `adopt_target_compaction_snapshot` can look up the definition.
+    fn minimal_create_request(
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) -> CreateMvDefinitionRequest {
+        CreateMvDefinitionRequest {
+            select_sql: "SELECT 1".to_string(),
+            base_table_refs: vec![],
+            primary_key_columns: vec![],
+            storage_engine: "iceberg".to_string(),
+            target_catalog: Some(catalog.to_string()),
+            target_namespace: Some(namespace.to_string()),
+            target_table: Some(table.to_string()),
+            schema_contract: None,
+            partition_spec: None,
+            created_at_ms: 1_700_000_000_000,
+        }
+    }
+
+    /// Patch a stored definition by loading it, applying `f`, then writing it
+    /// back.  Used to seed `last_refreshed_iceberg_snapshot_id`, `refresh_in_progress`,
+    /// and `active_refresh_id` without going through the full refresh state
+    /// machine.
+    fn patch_definition(
+        provider: &SqliteMetaStoreProvider,
+        mv_id: i64,
+        f: impl FnOnce(&mut StoredMvDefinition),
+    ) {
+        let repo = MvMetaRepository;
+        let mut txn = provider.begin_write("patch mv definition").unwrap();
+        let mut versioned = repo
+            .load_versioned_by_id(txn.as_ref(), mv_id)
+            .unwrap()
+            .expect("definition must exist to patch");
+        f(&mut versioned.value);
+        put_definition(
+            txn.as_mut(),
+            &versioned,
+            ExpectedRevision::Exact(versioned.record_revision.clone()),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+    }
+
+    // ── positive path ──────────────────────────────────────────────────────
+
+    #[test]
+    fn adopt_compaction_snapshot_advances_recorded_id_on_clean_baseline() {
+        let (_dir, provider) = open_provider();
+        let repo = MvMetaRepository;
+
+        // Create the MV definition.
+        let mut txn = provider.begin_write("create mv").unwrap();
+        let definition = repo
+            .create_definition(txn.as_mut(), minimal_create_request("cat", "ns", "tbl"))
+            .unwrap();
+        txn.commit().unwrap();
+
+        const BASE: i64 = 1000;
+        const NEW: i64 = 2000;
+
+        // Seed last_refreshed_iceberg_snapshot_id = Some(BASE); no refresh active.
+        patch_definition(&provider, definition.mv_id, |d| {
+            d.last_refreshed_iceberg_snapshot_id = Some(BASE);
+        });
+
+        // Call adopt.
+        let mut txn = provider.begin_write("adopt").unwrap();
+        let adopted = repo
+            .adopt_target_compaction_snapshot(txn.as_mut(), "cat", "ns", "tbl", BASE, NEW)
+            .unwrap();
+        txn.commit().unwrap();
+
+        assert!(adopted, "expected adopt to return true on a clean baseline");
+
+        // Confirm the stored id was advanced to NEW.
+        let read = provider.begin_read().unwrap();
+        let stored = repo
+            .load_by_id(read.as_ref(), definition.mv_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.last_refreshed_iceberg_snapshot_id,
+            Some(NEW),
+            "recorded snapshot id must be advanced to the new compaction snapshot"
+        );
+    }
+
+    // ── negative gates ─────────────────────────────────────────────────────
+
+    #[test]
+    fn adopt_compaction_snapshot_skips_when_refresh_in_progress() {
+        let (_dir, provider) = open_provider();
+        let repo = MvMetaRepository;
+
+        let mut txn = provider.begin_write("create mv").unwrap();
+        let definition = repo
+            .create_definition(txn.as_mut(), minimal_create_request("cat", "ns", "tbl2"))
+            .unwrap();
+        txn.commit().unwrap();
+
+        const BASE: i64 = 1000;
+        const NEW: i64 = 2000;
+
+        // Seed: baseline recorded, refresh currently in progress.
+        patch_definition(&provider, definition.mv_id, |d| {
+            d.last_refreshed_iceberg_snapshot_id = Some(BASE);
+            d.refresh_in_progress = true;
+            d.active_refresh_id = Some(42);
+        });
+
+        let mut txn = provider.begin_write("adopt").unwrap();
+        let adopted = repo
+            .adopt_target_compaction_snapshot(txn.as_mut(), "cat", "ns", "tbl2", BASE, NEW)
+            .unwrap();
+        txn.commit().unwrap();
+
+        assert!(
+            !adopted,
+            "expected adopt to return false when refresh is in progress"
+        );
+
+        // Recorded id must be unchanged.
+        let read = provider.begin_read().unwrap();
+        let stored = repo
+            .load_by_id(read.as_ref(), definition.mv_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.last_refreshed_iceberg_snapshot_id,
+            Some(BASE),
+            "recorded snapshot id must not change when refresh is in progress"
+        );
+    }
+
+    #[test]
+    fn adopt_compaction_snapshot_skips_on_baseline_mismatch() {
+        let (_dir, provider) = open_provider();
+        let repo = MvMetaRepository;
+
+        let mut txn = provider.begin_write("create mv").unwrap();
+        let definition = repo
+            .create_definition(txn.as_mut(), minimal_create_request("cat", "ns", "tbl3"))
+            .unwrap();
+        txn.commit().unwrap();
+
+        const BASE: i64 = 1000;
+        const OTHER: i64 = 999; // recorded id differs from expected_base
+        const NEW: i64 = 2000;
+
+        // Seed: recorded id is OTHER, not BASE.
+        patch_definition(&provider, definition.mv_id, |d| {
+            d.last_refreshed_iceberg_snapshot_id = Some(OTHER);
+        });
+
+        let mut txn = provider.begin_write("adopt").unwrap();
+        let adopted = repo
+            .adopt_target_compaction_snapshot(txn.as_mut(), "cat", "ns", "tbl3", BASE, NEW)
+            .unwrap();
+        txn.commit().unwrap();
+
+        assert!(
+            !adopted,
+            "expected adopt to return false when baseline does not match"
+        );
+
+        // Recorded id must be unchanged.
+        let read = provider.begin_read().unwrap();
+        let stored = repo
+            .load_by_id(read.as_ref(), definition.mv_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.last_refreshed_iceberg_snapshot_id,
+            Some(OTHER),
+            "recorded snapshot id must not change on baseline mismatch"
+        );
+    }
+
+    #[test]
+    fn adopt_compaction_snapshot_skips_when_no_target_record() {
+        let (_dir, provider) = open_provider();
+        let repo = MvMetaRepository;
+
+        // No definition exists for this target triple at all.
+        let mut txn = provider.begin_write("adopt").unwrap();
+        let adopted = repo
+            .adopt_target_compaction_snapshot(
+                txn.as_mut(),
+                "cat",
+                "ns",
+                "nonexistent_table",
+                1000,
+                2000,
+            )
+            .unwrap();
+        txn.commit().unwrap();
+
+        assert!(
+            !adopted,
+            "expected adopt to return false when no target record exists"
+        );
+    }
 }

@@ -125,7 +125,7 @@ pub(crate) enum ApplyKind {
 /// ApplyException rule and the optimize() backstop enforce this, and
 /// memo conversion panics on a leaked Apply as defence in depth.
 /// Field semantics mirror StarRocks LogicalApplyOperator; see the design doc
-/// docs/superpowers/specs/2026-06-10-apply-correlated-subquery-framework-design.md §5.1.
+/// docs/design/specs/2026-06-10-apply-correlated-subquery-framework-design.md §5.1.
 /// M1 consumes the remaining fields; remove the allow then.
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
@@ -141,6 +141,11 @@ pub(crate) struct ApplyNode {
     pub subquery_expr: TypedExpr,
     /// Fresh column standing in for the subquery's value in outer expressions.
     pub output_column: OutputColumn,
+    /// The inner subquery's single scalar output column; the Apply's
+    /// output_column is mapped to this after decorrelation. Captured at
+    /// M1a emission time (before any pushdown), so it is stable across the
+    /// M1b pushdown rules which may add group-by keys to the inner aggregate.
+    pub inner_output_column_id: ColumnId,
     /// Outer-side columns referenced inside the subquery.
     pub correlation_column_ids: Vec<ColumnId>,
     /// Correlated conjuncts hoisted out of the inner plan by the

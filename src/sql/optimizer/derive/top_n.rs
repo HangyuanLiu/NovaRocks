@@ -63,6 +63,7 @@ impl DeriveRequired for PhysicalTopNOp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::analysis::{ExprKind, LiteralValue, SortItem, TypedExpr};
 
     #[test]
     fn top_n_output_is_gather_when_sort_keys_resolve() {
@@ -125,5 +126,29 @@ mod tests {
         let reqs = op.derive_required(&PhysicalPropertySet::gather(), 1);
         assert_eq!(reqs.len(), 1);
         assert!(matches!(reqs[0].distribution, DistributionSpec::Any));
+    }
+
+    #[test]
+    fn top_n_non_column_sort_key_does_not_claim_ordering() {
+        let op = PhysicalTopNOp {
+            items: vec![SortItem {
+                expr: TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::Int(1)),
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: false,
+                },
+                asc: true,
+                nulls_first: false,
+            }],
+            limit: Some(100),
+            offset: None,
+            phase: TopNPhase::Final,
+            is_split: false,
+        };
+
+        let out = op.derive_output(&[]);
+
+        assert_eq!(out.ordering, OrderingSpec::Any);
+        assert_eq!(out.distribution, DistributionSpec::Gather);
     }
 }

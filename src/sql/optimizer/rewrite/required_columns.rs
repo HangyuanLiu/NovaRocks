@@ -13,10 +13,11 @@
 //! This module does **not** prune anything.  Pruning (removing items /
 //! output_columns entries) is done in Phase-2 `Prune*Columns` rules.
 //!
-//! Spec: `docs/superpowers/specs/2026-05-28-oq-1-column-pruning-arch-refactor-design.md` §5.
+//! Spec: `docs/design/specs/2026-05-28-oq-1-column-pruning-arch-refactor-design.md` §5.
 
 use std::collections::{HashMap, HashSet};
 
+use crate::sql::analysis::ExprKind;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
@@ -158,12 +159,24 @@ fn tag_project(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> L
     node.required_output_columns = parent_needed.clone();
     // child_needed = union of ColumnRefs of items whose output_column_id is in
     // parent_needed (or all items when parent_needed is None).
+    //
+    // assert_true items are ALWAYS included in child_needed regardless of
+    // parent_needed: they carry runtime correctness checks (e.g. the per-group
+    // row-check from ScalarApplyToJoin) whose column refs (e.g. the count
+    // column from the grouping aggregate) must remain available to the child.
+    // This mirrors the StarRocks PruneProjectColumnsRule carve-out.
     let child_needed: HashSet<ColumnId> = node
         .items
         .iter()
         .filter(|item| match &parent_needed {
             None => true,
-            Some(n) => n.contains(&item.output_column_id),
+            Some(n) => {
+                n.contains(&item.output_column_id)
+                    || matches!(
+                        &item.expr.kind,
+                        ExprKind::FunctionCall { name, .. } if name == "assert_true"
+                    )
+            }
         })
         .flat_map(|item| collect_column_id_refs(&item.expr))
         .collect();

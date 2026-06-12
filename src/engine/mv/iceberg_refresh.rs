@@ -7060,15 +7060,77 @@ fn normalize_aggregate_state_result_column_names(
     if result.columns.len() != expected_names.len() {
         return Ok(result);
     }
-    for (column, expected_name) in result.columns.iter_mut().zip(expected_names.iter()) {
-        column.name.clone_from(expected_name);
-    }
+    let metadata_permutation =
+        aggregate_state_result_name_permutation(&result.columns, &expected_names)
+            .unwrap_or_else(|| (0..expected_names.len()).collect());
+    let old_columns = std::mem::take(&mut result.columns);
+    result.columns = metadata_permutation
+        .iter()
+        .zip(expected_names.iter())
+        .map(|(old_index, expected_name)| {
+            let mut column = old_columns[*old_index].clone();
+            column.name.clone_from(expected_name);
+            column
+        })
+        .collect();
     result.chunks = result
         .chunks
         .into_iter()
-        .map(|chunk| rename_chunk_columns(chunk, &expected_names))
+        .map(|chunk| {
+            let chunk_permutation =
+                aggregate_state_result_chunk_name_permutation(&chunk, &expected_names)
+                    .unwrap_or_else(|| metadata_permutation.clone());
+            reorder_and_rename_chunk_columns(chunk, &expected_names, &chunk_permutation)
+        })
         .collect::<Result<Vec<_>, String>>()?;
     Ok(result)
+}
+
+fn aggregate_state_result_name_permutation(
+    columns: &[crate::runtime::query_result::QueryResultColumn],
+    expected_names: &[String],
+) -> Option<Vec<usize>> {
+    if columns.len() != expected_names.len() {
+        return None;
+    }
+    let mut used = vec![false; columns.len()];
+    let mut permutation = Vec::with_capacity(expected_names.len());
+    for expected_name in expected_names {
+        let index = columns
+            .iter()
+            .enumerate()
+            .find(|(index, column)| {
+                !used[*index] && column.name.eq_ignore_ascii_case(expected_name)
+            })?
+            .0;
+        used[index] = true;
+        permutation.push(index);
+    }
+    Some(permutation)
+}
+
+fn aggregate_state_result_chunk_name_permutation(
+    chunk: &crate::exec::chunk::Chunk,
+    expected_names: &[String],
+) -> Option<Vec<usize>> {
+    if chunk.batch.num_columns() != expected_names.len() {
+        return None;
+    }
+    let schema = chunk.batch.schema();
+    let mut used = vec![false; chunk.batch.num_columns()];
+    let mut permutation = Vec::with_capacity(expected_names.len());
+    for expected_name in expected_names {
+        let index = (0..chunk.batch.num_columns()).find(|index| {
+            !used[*index]
+                && schema
+                    .field(*index)
+                    .name()
+                    .eq_ignore_ascii_case(expected_name)
+        })?;
+        used[index] = true;
+        permutation.push(index);
+    }
+    Some(permutation)
 }
 
 fn aggregate_state_result_column_names(
@@ -7128,24 +7190,43 @@ fn aggregate_state_result_column_names(
     Ok(names)
 }
 
-fn rename_chunk_columns(
+fn reorder_and_rename_chunk_columns(
     chunk: crate::exec::chunk::Chunk,
     names: &[String],
+    permutation: &[usize],
 ) -> Result<crate::exec::chunk::Chunk, String> {
-    if chunk.batch.num_columns() != names.len() {
+    if chunk.batch.num_columns() != names.len() || permutation.len() != names.len() {
         return Ok(chunk);
     }
-    let fields = chunk
-        .batch
-        .schema()
-        .fields()
+    if permutation
+        .iter()
+        .any(|old_index| *old_index >= chunk.batch.num_columns())
+    {
+        return Err(format!(
+            "aggregate MV state result column permutation out of range: columns={} permutation={permutation:?}",
+            chunk.batch.num_columns()
+        ));
+    }
+    let schema_fields = chunk.batch.schema().fields().clone();
+    let fields = permutation
         .iter()
         .zip(names.iter())
-        .map(|(field, name)| std::sync::Arc::new(field.as_ref().clone().with_name(name.clone())))
+        .map(|(old_index, name)| {
+            std::sync::Arc::new(
+                schema_fields[*old_index]
+                    .as_ref()
+                    .clone()
+                    .with_name(name.clone()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let columns = permutation
+        .iter()
+        .map(|old_index| chunk.batch.column(*old_index).clone())
         .collect::<Vec<_>>();
     let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(fields));
-    let batch = arrow::record_batch::RecordBatch::try_new(schema, chunk.batch.columns().to_vec())
-        .map_err(|e| format!("rename aggregate MV state result columns failed: {e}"))?;
+    let batch = arrow::record_batch::RecordBatch::try_new(schema, columns)
+        .map_err(|e| format!("reorder aggregate MV state result columns failed: {e}"))?;
     crate::engine::record_batch_to_chunk(batch)
 }
 
@@ -7895,7 +7976,7 @@ fn try_rewrite_select_sql_for_strategy_dispatch_rebind(
     }
 }
 
-fn parse_mv_select_query(sql: &str) -> Result<sqlparser::ast::Query, String> {
+pub(crate) fn parse_mv_select_query(sql: &str) -> Result<sqlparser::ast::Query, String> {
     let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)
         .map_err(|e| format!("stored MV SELECT normalize error: {e}"))?;
     let statement = crate::sql::parser::parse_normalized_sql_raw(&normalized)
@@ -10352,6 +10433,9 @@ fn incremental_refresh_iceberg_mv_with_changes(
             Some(&*catalogs_guard),
             Some(&ctx),
             imv_rewrite_validator,
+            // MV refresh must never rewrite onto a materialized view (and the
+            // mv_refresh_ctx gate would block it anyway): no MV rewrite here.
+            None,
         ) {
             drop(catalogs_guard);
             return Err(handle_iceberg_mv_commit_error(
@@ -10683,7 +10767,7 @@ fn arrow_data_type_to_iceberg_primitive(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int32Array, Int64Array, StringArray};
+    use arrow::array::{BinaryArray, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc as StdArc;
@@ -10899,6 +10983,133 @@ mod tests {
                 "__agg_state_s"
             ]
         );
+    }
+
+    #[test]
+    fn normalize_aggregate_state_result_reorders_named_columns() {
+        let query =
+            parse_select_query("select region, count(*) as c from ice.ns.fact group by region");
+        let calls =
+            crate::connector::starrocks::table::aggregate_sql_calls::extract_aggregate_sql_calls(
+                &query,
+            )
+            .expect("aggregate calls");
+        let layout = aggregate_apply_test_helpers::count_layout("region");
+        let schema = StdArc::new(ArrowSchema::new(vec![
+            Field::new("__agg_state_c", DataType::Binary, false),
+            Field::new("region", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            StdArc::clone(&schema),
+            vec![
+                StdArc::new(BinaryArray::from_vec(vec![b"east-state".as_slice()])),
+                StdArc::new(StringArray::from(vec![Some("east")])),
+            ],
+        )
+        .expect("record batch");
+        let result = crate::runtime::query_result::QueryResult {
+            columns: vec![
+                crate::runtime::query_result::QueryResultColumn {
+                    name: "__agg_state_c".to_string(),
+                    data_type: DataType::Binary,
+                    nullable: false,
+                    logical_type: None,
+                },
+                crate::runtime::query_result::QueryResultColumn {
+                    name: "region".to_string(),
+                    data_type: DataType::Utf8,
+                    nullable: true,
+                    logical_type: None,
+                },
+            ],
+            chunks: vec![crate::engine::record_batch_to_chunk(batch).expect("chunk")],
+        };
+
+        let normalized = normalize_aggregate_state_result_column_names(result, &layout, &calls)
+            .expect("normalize");
+
+        let column_names = normalized
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(column_names, vec!["region", "__agg_state_c"]);
+        assert_eq!(normalized.columns[0].data_type, DataType::Utf8);
+        assert_eq!(normalized.columns[1].data_type, DataType::Binary);
+
+        let chunk = &normalized.chunks[0];
+        assert_eq!(chunk.batch.schema().field(0).name(), "region");
+        assert_eq!(chunk.batch.schema().field(0).data_type(), &DataType::Utf8);
+        assert_eq!(chunk.batch.schema().field(1).name(), "__agg_state_c");
+        assert_eq!(chunk.batch.schema().field(1).data_type(), &DataType::Binary);
+        let region = chunk
+            .batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("region column");
+        assert_eq!(region.value(0), "east");
+        let state = chunk
+            .batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("state column");
+        assert_eq!(state.value(0), b"east-state");
+    }
+
+    #[test]
+    fn normalize_aggregate_state_result_reorders_chunk_columns_when_metadata_is_logical() {
+        let query =
+            parse_select_query("select region, count(*) as c from ice.ns.fact group by region");
+        let calls =
+            crate::connector::starrocks::table::aggregate_sql_calls::extract_aggregate_sql_calls(
+                &query,
+            )
+            .expect("aggregate calls");
+        let layout = aggregate_apply_test_helpers::count_layout("region");
+        let schema = StdArc::new(ArrowSchema::new(vec![
+            Field::new("__agg_state_c", DataType::Binary, false),
+            Field::new("region", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            StdArc::clone(&schema),
+            vec![
+                StdArc::new(BinaryArray::from_vec(vec![b"east-state".as_slice()])),
+                StdArc::new(StringArray::from(vec![Some("east")])),
+            ],
+        )
+        .expect("record batch");
+        let result = crate::runtime::query_result::QueryResult {
+            columns: vec![
+                crate::runtime::query_result::QueryResultColumn {
+                    name: "region".to_string(),
+                    data_type: DataType::Utf8,
+                    nullable: true,
+                    logical_type: None,
+                },
+                crate::runtime::query_result::QueryResultColumn {
+                    name: "__agg_state_c".to_string(),
+                    data_type: DataType::Binary,
+                    nullable: false,
+                    logical_type: None,
+                },
+            ],
+            chunks: vec![crate::engine::record_batch_to_chunk(batch).expect("chunk")],
+        };
+
+        let normalized = normalize_aggregate_state_result_column_names(result, &layout, &calls)
+            .expect("normalize");
+
+        assert_eq!(normalized.columns[0].name, "region");
+        assert_eq!(normalized.columns[0].data_type, DataType::Utf8);
+        assert_eq!(normalized.columns[1].name, "__agg_state_c");
+        assert_eq!(normalized.columns[1].data_type, DataType::Binary);
+        let chunk = &normalized.chunks[0];
+        assert_eq!(chunk.batch.schema().field(0).name(), "region");
+        assert_eq!(chunk.batch.schema().field(0).data_type(), &DataType::Utf8);
+        assert_eq!(chunk.batch.schema().field(1).name(), "__agg_state_c");
+        assert_eq!(chunk.batch.schema().field(1).data_type(), &DataType::Binary);
     }
 
     #[test]
@@ -16120,6 +16331,129 @@ mod tests {
             .new_snapshot_id;
             assert!(snapshot_id != 0, "snapshot id must be non-zero");
         });
+    }
+    mod aggregate_apply_test_helpers {
+        use crate::connector::starrocks::table::ddl::starrocks_physical_column;
+        use crate::connector::starrocks::table::mv_agg_state::{
+            AggregateMvLayout, AggregateStateColumn, AggregateStateRole, AggregateVisibleColumn,
+        };
+        use crate::connector::starrocks::table::mv_shape::AggregateFunctionKind;
+        use crate::sql::parser::ast::SqlType;
+        use arrow::datatypes::DataType;
+
+        pub(super) fn count_layout(group_key: &str) -> AggregateMvLayout {
+            let row_id = starrocks_physical_column(
+                "__row_id__".to_string(),
+                SqlType::String,
+                false,
+                false,
+                true,
+            );
+            let group = starrocks_physical_column(
+                group_key.to_string(),
+                SqlType::String,
+                true,
+                true,
+                false,
+            );
+            let counter =
+                starrocks_physical_column("c".to_string(), SqlType::BigInt, false, true, false);
+            let state = starrocks_physical_column(
+                "__agg_state_c".to_string(),
+                SqlType::BigInt,
+                false,
+                false,
+                false,
+            );
+            AggregateMvLayout {
+                row_id_column: row_id.clone(),
+                visible_columns: vec![
+                    AggregateVisibleColumn {
+                        name: group_key.to_string(),
+                        data_type: DataType::Utf8,
+                        sql_type: SqlType::String,
+                        nullable: true,
+                        source_index: 0,
+                    },
+                    AggregateVisibleColumn {
+                        name: "c".to_string(),
+                        data_type: DataType::Int64,
+                        sql_type: SqlType::BigInt,
+                        nullable: false,
+                        source_index: 1,
+                    },
+                ],
+                state_columns: vec![AggregateStateColumn {
+                    name: "__agg_state_c".to_string(),
+                    data_type: DataType::Int64,
+                    sql_type: SqlType::BigInt,
+                    nullable: false,
+                    visible_source_index: 1,
+                    aggregate_index: 0,
+                    function: AggregateFunctionKind::Count,
+                    state_role: AggregateStateRole::Single,
+                    count_star: true,
+                }],
+                aggregate_input_types: vec![None],
+                group_key_source_indexes: vec![0],
+                physical_columns: vec![row_id, group, counter, state],
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_refresh_absorbs_optimize_replace_snapshot() {
+        let env = open_test_state_with_hadoop_iceberg_catalog("ice", "analytics");
+        create_aggregate_fact_table(&env.state, "ice", "sales", "fact");
+        insert_into_aggregate_fact_table(&env.state, "ice", "sales", "fact", &[(1, "east", 10)]);
+
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_fact
+             DISTRIBUTED BY HASH(region) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT region, count(*) AS c, sum(amount) AS s
+                FROM ice.sales.fact GROUP BY region",
+        );
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create incremental MV");
+        execute_iceberg_sql(
+            &env.state,
+            Some("ice"),
+            &env.current_db,
+            "REFRESH MATERIALIZED VIEW mv_fact",
+        );
+
+        // Second append snapshot on the base, then compact the base table.
+        insert_into_aggregate_fact_table(&env.state, "ice", "sales", "fact", &[(2, "west", 5)]);
+        execute_iceberg_sql(
+            &env.state,
+            Some("ice"),
+            &env.current_db,
+            "ALTER TABLE ice.sales.fact OPTIMIZE",
+        );
+        // The optimize worker thread is not spawned under cfg(test); drive the
+        // pending job synchronously so the base table gains a REPLACE snapshot.
+        crate::connector::iceberg::compact::run_optimize_jobs_once(&env.state)
+            .expect("run optimize job");
+
+        // Third append after the replace snapshot, then refresh incrementally.
+        insert_into_aggregate_fact_table(&env.state, "ice", "sales", "fact", &[(3, "east", 7)]);
+        execute_iceberg_sql(
+            &env.state,
+            Some("ice"),
+            &env.current_db,
+            "REFRESH MATERIALIZED VIEW mv_fact",
+        );
+
+        // Lineage walk previous -> current crossed the REPLACE snapshot; rows
+        // must reflect all three appends.
+        assert_aggregate_region_rows(
+            &env.state,
+            "ice",
+            &env.current_db,
+            "mv_fact",
+            &[("east", 2, 17), ("west", 1, 5)],
+        );
     }
 }
 

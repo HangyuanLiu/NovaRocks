@@ -168,6 +168,20 @@ pub(crate) struct ShowMaterializedViewsStmt {
     pub database: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AddBackendStmt {
+    pub addr: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DropBackendStmt {
+    pub addr: String,
+    pub force: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ShowBackendsStmt;
+
 /// Top-level statement variants produced by the custom dialect `parse_sql`
 /// entry point. Phase 1 only covers materialized-view DDL; other statements
 /// still flow through the legacy `parse_sql_raw` path.
@@ -184,6 +198,9 @@ pub(crate) enum Statement {
         /// `"main"` by default; branch name when the SQL uses `t.branch_<name>`.
         target_ref: String,
     },
+    AddBackend(AddBackendStmt),
+    DropBackend(DropBackendStmt),
+    ShowBackends(ShowBackendsStmt),
 }
 
 /// Describes the overwrite semantics of an INSERT statement.

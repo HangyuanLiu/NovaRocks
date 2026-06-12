@@ -6,7 +6,8 @@ use std::sync::{Arc, RwLock};
 use arrow::record_batch::RecordBatch;
 
 use crate::connector::backend::{
-    CatalogBackend, CreateTableRequest, ResolvedTable, TableSink, TableSource,
+    CatalogBackend, CreateTableRequest, CreateViewRequest, ResolvedTable, ResolvedView, TableSink,
+    TableSource,
 };
 use crate::connector::iceberg::catalog::IcebergLoadedTable;
 use crate::sql::catalog::{
@@ -22,6 +23,7 @@ use super::registry::{
     insert_rows as reg_insert_rows, list_tables as reg_list_tables, load_table as reg_load_table,
     namespace_exists as reg_namespace_exists,
 };
+use super::views;
 
 const NOVAROCKS_MV_APPLY_KEY_COLUMN_PROPERTY: &str = "novarocks.mv.apply-key.column";
 const NOVAROCKS_MV_HIDDEN_COLUMNS_PROPERTY: &str = "novarocks.mv.hidden-columns";
@@ -127,6 +129,47 @@ impl CatalogBackend for IcebergCatalogBackend {
         table: &str,
     ) -> Result<Option<i32>, String> {
         reg_current_schema_id(&self.entry(catalog)?, namespace, table).map(Some)
+    }
+
+    fn create_view(&self, req: CreateViewRequest) -> Result<(), String> {
+        let entry = self.entry(&req.catalog)?;
+        views::create_view(
+            &entry,
+            &req.namespace,
+            &req.view,
+            &req.columns,
+            &req.view_sql,
+            req.comment.as_deref(),
+            req.or_replace,
+        )
+    }
+
+    fn drop_view(&self, catalog: &str, namespace: &str, view: &str) -> Result<(), String> {
+        views::drop_view(&self.entry(catalog)?, namespace, view)
+    }
+
+    fn load_view(
+        &self,
+        catalog: &str,
+        namespace: &str,
+        view: &str,
+    ) -> Result<ResolvedView, String> {
+        let loaded = views::load_view(&self.entry(catalog)?, namespace, view)?;
+        Ok(ResolvedView {
+            sql: loaded.sql,
+            dialect: loaded.dialect,
+            default_namespace: loaded.default_namespace,
+            column_names: loaded.column_names,
+            comment: loaded.comment,
+        })
+    }
+
+    fn view_exists(&self, catalog: &str, namespace: &str, view: &str) -> Result<bool, String> {
+        views::view_exists(&self.entry(catalog)?, namespace, view)
+    }
+
+    fn list_views(&self, catalog: &str, namespace: &str) -> Result<Vec<String>, String> {
+        views::list_views(&self.entry(catalog)?, namespace)
     }
 }
 
@@ -567,6 +610,28 @@ fn hide_novarocks_mv_internal_columns_by_property(
                 .any(|hidden| column.name.eq_ignore_ascii_case(hidden))
         })
         .collect())
+}
+
+/// Names of the NovaRocks MV internal columns (the apply-key column plus any
+/// declared hidden aggregate-state columns) that `hide_novarocks_mv_internal_columns`
+/// strips from a table's analyzer-visible schema. Derived from the same table
+/// properties used by the hiding logic, so callers (e.g. the OPTIMIZE rewrite)
+/// can detect whether a table carries hidden physical columns that a plain
+/// `SELECT *` would omit, and react accordingly. An empty result means the
+/// table has no hidden internal columns (plain Iceberg table or non-MV table).
+pub(crate) fn hidden_internal_column_names_from_metadata(
+    metadata: &iceberg::spec::TableMetadata,
+) -> Vec<String> {
+    hidden_internal_column_names(
+        metadata
+            .properties()
+            .get(NOVAROCKS_MV_APPLY_KEY_COLUMN_PROPERTY)
+            .map(String::as_str),
+        metadata
+            .properties()
+            .get(NOVAROCKS_MV_HIDDEN_COLUMNS_PROPERTY)
+            .map(String::as_str),
+    )
 }
 
 fn hidden_internal_column_names(

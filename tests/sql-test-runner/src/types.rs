@@ -32,6 +32,10 @@ pub struct QueryMeta {
     pub skip_result_check: bool,
     pub retry_count: Option<usize>,
     pub retry_interval_ms: Option<u64>,
+    pub kill_be_index: Option<usize>,
+    pub network_partition_be: Option<usize>,
+    pub heartbeat_delay_ms: Option<u64>,
+    pub restart_be_delay_ms: Option<u64>,
     /// After the step SQL executes, poll `SHOW ALTER TABLE COLUMN` until FINISHED.
     /// Value is the table name.
     pub wait_alter_column: Option<String>,

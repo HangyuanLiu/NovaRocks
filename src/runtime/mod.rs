@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 pub mod backend_id;
+pub mod backend_registry;
 pub(crate) mod coordinator;
 pub(crate) mod dispatcher;
 pub mod exchange;
@@ -23,6 +24,7 @@ pub mod exec_env;
 pub(crate) mod exec_params;
 pub mod execution_services;
 pub mod global_async_runtime;
+pub mod heartbeat_mgr;
 pub mod io;
 pub mod load_tracking;
 pub mod lookup;
@@ -31,6 +33,8 @@ pub mod profile;
 pub(crate) mod query_cancel;
 pub mod query_context;
 pub mod query_result;
+pub(crate) mod query_state;
+pub(crate) mod registry_cleanup;
 pub(crate) mod write_coordinator;
 // Result buffer fetch infrastructure is accessed from C++ shim FFI path.
 #[allow(dead_code)]
@@ -42,5 +46,6 @@ pub mod scan_executor;
 pub(crate) mod scheduler;
 pub mod sink_commit;
 pub mod starlet_shard_registry;
+pub mod start_epoch;
 pub mod thread_cpu_time;
 pub(crate) mod write_operation_lifecycle;

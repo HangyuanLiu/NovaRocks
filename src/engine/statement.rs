@@ -1139,7 +1139,21 @@ pub(crate) fn execute_drop_table_statement(
             }
             Ok(StatementResult::Ok)
         }
-        Err(err) => Err(err),
+        Err(err) => {
+            // A DROP TABLE aimed at a view must say so instead of "unknown
+            // table" — views and tables are separate REST resources.
+            if target.backend_name == "iceberg"
+                && backend
+                    .view_exists(&target.catalog, &target.namespace, &target.table)
+                    .unwrap_or(false)
+            {
+                return Err(format!(
+                    "{}.{}.{} is a view, use DROP VIEW",
+                    target.catalog, target.namespace, target.table
+                ));
+            }
+            Err(err)
+        }
     }
 }
 
@@ -1463,6 +1477,80 @@ pub(crate) fn parse_show_create_table(
         .parse_object_name(false)
         .map_err(|e| format!("parse SHOW CREATE TABLE table name: {e}"))?;
     crate::sql::parser::dialect::convert_object_name(obj)
+}
+
+/// Detect `SHOW CREATE VIEW <name>` so the server routes it to the engine.
+pub(crate) fn looks_like_show_create_view(sql: &str) -> bool {
+    let lower = sql.trim_start().to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("show") else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    let Some(rest) = rest.strip_prefix("create") else {
+        return false;
+    };
+    rest.trim_start().starts_with("view")
+}
+
+/// Detect `SHOW VIEWS [FROM db]`. `SHOW MATERIALIZED VIEWS` does not match
+/// because its second token is `materialized`.
+pub(crate) fn looks_like_show_views(sql: &str) -> bool {
+    let lower = sql.trim_start().to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("show") else {
+        return false;
+    };
+    rest.trim_start().starts_with("views")
+}
+
+pub(crate) fn parse_show_create_view(
+    sql: &str,
+) -> Result<crate::sql::parser::ast::ObjectName, String> {
+    use sqlparser::keywords::Keyword;
+    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
+    let mut parser = Parser::new(&StarRocksDialect)
+        .try_with_sql(&normalized)
+        .map_err(|e| format!("parse SHOW CREATE VIEW: {e}"))?;
+    parser
+        .expect_keyword(Keyword::SHOW)
+        .map_err(|e| format!("parse SHOW CREATE VIEW: {e}"))?;
+    parser
+        .expect_keyword(Keyword::CREATE)
+        .map_err(|e| format!("parse SHOW CREATE VIEW: {e}"))?;
+    parser
+        .expect_keyword(Keyword::VIEW)
+        .map_err(|e| format!("parse SHOW CREATE VIEW: {e}"))?;
+    let obj = parser
+        .parse_object_name(false)
+        .map_err(|e| format!("parse SHOW CREATE VIEW view name: {e}"))?;
+    crate::sql::parser::dialect::convert_object_name(obj)
+}
+
+/// Parse `SHOW VIEWS [FROM <db>]` and return the optional `FROM <db>` database.
+/// `LIKE`/`WHERE` filters are not supported.
+pub(crate) fn parse_show_views(sql: &str) -> Result<Option<String>, String> {
+    use sqlparser::keywords::Keyword;
+    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
+    let mut parser = Parser::new(&StarRocksDialect)
+        .try_with_sql(&normalized)
+        .map_err(|e| format!("parse SHOW VIEWS: {e}"))?;
+    parser
+        .expect_keyword(Keyword::SHOW)
+        .map_err(|e| format!("parse SHOW VIEWS: {e}"))?;
+    parser
+        .expect_keyword(Keyword::VIEWS)
+        .map_err(|e| format!("parse SHOW VIEWS: {e}"))?;
+    let database = if parser.parse_keyword(Keyword::FROM) {
+        let ident = parser
+            .parse_identifier()
+            .map_err(|e| format!("parse SHOW VIEWS database after FROM: {e}"))?;
+        Some(ident.value)
+    } else {
+        None
+    };
+    if parser.parse_keyword(Keyword::LIKE) || parser.parse_keyword(Keyword::WHERE) {
+        return Err("SHOW VIEWS LIKE/WHERE is not supported".to_string());
+    }
+    Ok(database)
 }
 
 pub(crate) fn looks_like_alter_table_optimize(sql: &str) -> bool {
@@ -3737,6 +3825,18 @@ mod insert_overwrite_partitions_parser_tests {
                 crate::sql::parser::ast::InsertSource::FromQuery(_)
             ),
             "generate_series INSERT SELECT must use the standard table-function query plan"
+        );
+    }
+
+    #[test]
+    fn convert_insert_values_preserves_escaped_backslash_before_f() {
+        let stmt = parse_insert_overwrite(r"INSERT INTO t VALUES (13, 'e\\f')");
+        let crate::sql::parser::ast::InsertSource::Values(rows) = stmt.source else {
+            panic!("expected VALUES source");
+        };
+        assert_eq!(
+            rows[0][1],
+            crate::sql::parser::ast::Literal::String(r"e\f".to_string())
         );
     }
 

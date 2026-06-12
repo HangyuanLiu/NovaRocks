@@ -61,13 +61,45 @@ impl Default for ClusterRole {
 }
 
 /// Configuration for the `[cluster]` TOML section.
-#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Deserialize)]
 #[serde(default)]
 pub struct ClusterConfig {
     pub role: ClusterRole,
     pub backends: Vec<String>,
     pub advertise_host: String,
     pub advertise_port: u16,
+    #[serde(default = "default_heartbeat_interval_ms")]
+    pub heartbeat_interval_ms: u64,
+    #[serde(default = "default_heartbeat_timeout_retries")]
+    pub heartbeat_timeout_retries: u32,
+    #[serde(default = "default_decommission_timeout_secs")]
+    pub decommission_timeout_secs: u64,
+}
+
+fn default_heartbeat_interval_ms() -> u64 {
+    5000
+}
+
+fn default_heartbeat_timeout_retries() -> u32 {
+    3
+}
+
+fn default_decommission_timeout_secs() -> u64 {
+    300
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            role: ClusterRole::default(),
+            backends: Vec::new(),
+            advertise_host: String::new(),
+            advertise_port: 0,
+            heartbeat_interval_ms: default_heartbeat_interval_ms(),
+            heartbeat_timeout_retries: default_heartbeat_timeout_retries(),
+            decommission_timeout_secs: default_decommission_timeout_secs(),
+        }
+    }
 }
 
 impl ClusterConfig {
@@ -75,11 +107,6 @@ impl ClusterConfig {
     pub fn validate(&self) -> Result<(), String> {
         match self.role {
             ClusterRole::Fe => {
-                if self.backends.is_empty() {
-                    return Err(
-                        "role=fe requires at least one backend in [cluster].backends".into(),
-                    );
-                }
                 let mut seen = std::collections::HashSet::new();
                 for b in &self.backends {
                     let canonical = b
@@ -109,6 +136,33 @@ impl ClusterConfig {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cluster_hb_tests {
+    use super::ClusterConfig;
+
+    #[test]
+    fn cluster_config_heartbeat_defaults() {
+        let c = ClusterConfig::default();
+        assert_eq!(c.heartbeat_interval_ms, 5000);
+        assert_eq!(c.heartbeat_timeout_retries, 3);
+        assert_eq!(c.decommission_timeout_secs, 300);
+    }
+
+    #[test]
+    fn cluster_config_parses_heartbeat_overrides() {
+        let toml = r#"
+            role = "fe"
+            backends = ["127.0.0.1:9070"]
+            heartbeat_interval_ms = 2000
+            heartbeat_timeout_retries = 5
+        "#;
+        let c: ClusterConfig = toml::from_str(toml).unwrap();
+        assert_eq!(c.heartbeat_interval_ms, 2000);
+        assert_eq!(c.heartbeat_timeout_retries, 5);
+        assert_eq!(c.decommission_timeout_secs, 300);
     }
 }
 
@@ -287,6 +341,8 @@ pub struct ServerConfig {
     pub brpc_port: u16,
     #[serde(default = "default_http_port")]
     pub http_port: u16,
+    #[serde(default = "default_grpc_port")]
+    pub grpc_port: u16,
     #[serde(default = "default_starlet_port")]
     pub starlet_port: u16,
 }
@@ -306,6 +362,9 @@ fn default_brpc_port() -> u16 {
 fn default_http_port() -> u16 {
     8040
 }
+fn default_grpc_port() -> u16 {
+    9080
+}
 fn default_starlet_port() -> u16 {
     9070
 }
@@ -319,6 +378,7 @@ impl Default for ServerConfig {
             be_port: default_be_port(),
             brpc_port: default_brpc_port(),
             http_port: default_http_port(),
+            grpc_port: default_grpc_port(),
             starlet_port: default_starlet_port(),
         }
     }
@@ -374,6 +434,20 @@ pub struct StandaloneServerConfig {
     pub mv_refresh_scheduler_failure_backoff_ms: i64,
     #[serde(default = "default_standalone_mv_refresh_scheduler_max_failure_backoff_ms")]
     pub mv_refresh_scheduler_max_failure_backoff_ms: i64,
+    #[serde(default = "default_standalone_iceberg_maintenance_enabled")]
+    pub iceberg_maintenance_enabled: bool,
+    #[serde(default = "default_standalone_iceberg_maintenance_tick_interval_ms")]
+    pub iceberg_maintenance_tick_interval_ms: u64,
+    #[serde(default = "default_standalone_iceberg_maintenance_max_concurrent")]
+    pub iceberg_maintenance_max_concurrent: usize,
+    #[serde(default = "default_standalone_iceberg_maintenance_compaction_min_data_files")]
+    pub iceberg_maintenance_compaction_min_data_files: u64,
+    #[serde(default = "default_standalone_iceberg_maintenance_dv_min_delete_files")]
+    pub iceberg_maintenance_dv_min_delete_files: u64,
+    #[serde(default = "default_standalone_iceberg_maintenance_action_cooldown_ms")]
+    pub iceberg_maintenance_action_cooldown_ms: i64,
+    #[serde(default = "default_standalone_iceberg_maintenance_max_consecutive_failures")]
+    pub iceberg_maintenance_max_consecutive_failures: u32,
 }
 
 fn default_standalone_server_mysql_port() -> u16 {
@@ -400,6 +474,34 @@ fn default_standalone_mv_refresh_scheduler_max_failure_backoff_ms() -> i64 {
     1_800_000
 }
 
+fn default_standalone_iceberg_maintenance_enabled() -> bool {
+    true
+}
+
+fn default_standalone_iceberg_maintenance_tick_interval_ms() -> u64 {
+    600_000
+}
+
+fn default_standalone_iceberg_maintenance_max_concurrent() -> usize {
+    1
+}
+
+fn default_standalone_iceberg_maintenance_compaction_min_data_files() -> u64 {
+    100
+}
+
+fn default_standalone_iceberg_maintenance_dv_min_delete_files() -> u64 {
+    10
+}
+
+fn default_standalone_iceberg_maintenance_action_cooldown_ms() -> i64 {
+    3_600_000
+}
+
+fn default_standalone_iceberg_maintenance_max_consecutive_failures() -> u32 {
+    4
+}
+
 impl Default for StandaloneServerConfig {
     fn default() -> Self {
         Self {
@@ -416,6 +518,19 @@ impl Default for StandaloneServerConfig {
                 default_standalone_mv_refresh_scheduler_failure_backoff_ms(),
             mv_refresh_scheduler_max_failure_backoff_ms:
                 default_standalone_mv_refresh_scheduler_max_failure_backoff_ms(),
+            iceberg_maintenance_enabled: default_standalone_iceberg_maintenance_enabled(),
+            iceberg_maintenance_tick_interval_ms:
+                default_standalone_iceberg_maintenance_tick_interval_ms(),
+            iceberg_maintenance_max_concurrent:
+                default_standalone_iceberg_maintenance_max_concurrent(),
+            iceberg_maintenance_compaction_min_data_files:
+                default_standalone_iceberg_maintenance_compaction_min_data_files(),
+            iceberg_maintenance_dv_min_delete_files:
+                default_standalone_iceberg_maintenance_dv_min_delete_files(),
+            iceberg_maintenance_action_cooldown_ms:
+                default_standalone_iceberg_maintenance_action_cooldown_ms(),
+            iceberg_maintenance_max_consecutive_failures:
+                default_standalone_iceberg_maintenance_max_consecutive_failures(),
         }
     }
 }
@@ -1402,6 +1517,30 @@ starlet_port = 19070
     }
 
     #[test]
+    fn test_server_grpc_port_default_is_9080() {
+        let cfg: NovaRocksConfig = toml::from_str(
+            r#"
+[server]
+http_port = 8040
+"#,
+        )
+        .expect("parse config");
+        assert_eq!(cfg.server.grpc_port, 9080);
+    }
+
+    #[test]
+    fn test_server_grpc_port_can_be_overridden() {
+        let cfg: NovaRocksConfig = toml::from_str(
+            r#"
+[server]
+grpc_port = 19080
+"#,
+        )
+        .expect("parse config");
+        assert_eq!(cfg.server.grpc_port, 19080);
+    }
+
+    #[test]
     fn test_standalone_server_defaults() {
         let cfg: NovaRocksConfig = toml::from_str(
             r#"
@@ -1422,8 +1561,29 @@ starlet_port = 19070
                 mv_refresh_scheduler_max_concurrent: 1,
                 mv_refresh_scheduler_failure_backoff_ms: 60_000,
                 mv_refresh_scheduler_max_failure_backoff_ms: 1_800_000,
+                iceberg_maintenance_enabled: true,
+                iceberg_maintenance_tick_interval_ms: 600_000,
+                iceberg_maintenance_max_concurrent: 1,
+                iceberg_maintenance_compaction_min_data_files: 100,
+                iceberg_maintenance_dv_min_delete_files: 10,
+                iceberg_maintenance_action_cooldown_ms: 3_600_000,
+                iceberg_maintenance_max_consecutive_failures: 4,
             })
         );
+    }
+
+    #[test]
+    fn standalone_server_config_iceberg_maintenance_defaults() {
+        let cfg: StandaloneServerConfig =
+            toml::from_str("").expect("empty standalone_server section parses");
+        assert!(cfg.iceberg_maintenance_enabled);
+        assert_eq!(cfg.iceberg_maintenance_tick_interval_ms, 600_000);
+        assert_eq!(cfg.iceberg_maintenance_max_concurrent, 1);
+        assert_eq!(cfg.iceberg_maintenance_compaction_min_data_files, 100);
+        assert_eq!(cfg.iceberg_maintenance_dv_min_delete_files, 10);
+        assert_eq!(cfg.iceberg_maintenance_action_cooldown_ms, 3_600_000);
+        assert_eq!(cfg.iceberg_maintenance_max_consecutive_failures, 4);
+        assert_eq!(cfg, StandaloneServerConfig::default());
     }
 
     #[test]
@@ -1892,18 +2052,16 @@ backends = ["not-a-socket-addr"]
     }
 
     #[test]
-    fn test_cluster_role_fe_empty_backends_still_rejected() {
+    fn test_cluster_role_fe_empty_backends_allowed() {
         let toml = r#"
 [cluster]
 role = "fe"
 backends = []
 "#;
         let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse");
-        let err = cfg
-            .cluster
+        cfg.cluster
             .validate()
-            .expect_err("empty backends still rejected");
-        assert!(err.contains("at least one") || err.contains("backends"));
+            .expect("role=fe may start with no configured backends");
     }
 
     #[test]

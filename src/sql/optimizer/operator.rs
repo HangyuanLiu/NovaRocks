@@ -82,6 +82,10 @@ pub(crate) struct LogicalScanOp {
     /// `LowCardinalityDictionaryRewrite` rule on the logical side and
     /// propagated to `PhysicalScanOp` by `ScanToPhysical`.
     pub dict_columns: Vec<ScanDictionaryColumn>,
+    /// When this scan was injected by the MvRewrite rule, the source MV name
+    /// (shown in EXPLAIN as `rewritten with mv: <name>`). None for all
+    /// user-written scans.
+    pub mv_rewritten_from: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -195,16 +199,19 @@ pub(crate) struct LogicalWindowOp {
 pub(crate) struct LogicalUnionOp {
     pub all: bool,
     pub output_columns: Vec<OutputColumn>,
+    pub child_output_columns: Vec<Vec<OutputColumn>>,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct LogicalIntersectOp {
     pub output_columns: Vec<OutputColumn>,
+    pub child_output_columns: Vec<Vec<OutputColumn>>,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct LogicalExceptOp {
     pub output_columns: Vec<OutputColumn>,
+    pub child_output_columns: Vec<Vec<OutputColumn>>,
 }
 
 #[derive(Clone, Debug)]
@@ -300,6 +307,10 @@ pub(crate) struct PhysicalScanOp {
     /// production paths today.
     #[allow(dead_code)] // Read by codegen when Task 7 populates it.
     pub dict_columns: Vec<ScanDictionaryColumn>,
+    /// When this scan was injected by the MvRewrite rule, the source MV name
+    /// (shown in EXPLAIN as `rewritten with mv: <name>`). None for all
+    /// user-written scans.
+    pub mv_rewritten_from: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -429,16 +440,19 @@ pub(crate) struct PhysicalRepeatOp {
 pub(crate) struct PhysicalUnionOp {
     pub all: bool,
     pub output_columns: Vec<OutputColumn>,
+    pub child_output_columns: Vec<Vec<OutputColumn>>,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct PhysicalIntersectOp {
     pub output_columns: Vec<OutputColumn>,
+    pub child_output_columns: Vec<Vec<OutputColumn>>,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct PhysicalExceptOp {
     pub output_columns: Vec<OutputColumn>,
+    pub child_output_columns: Vec<Vec<OutputColumn>>,
 }
 
 #[derive(Clone, Debug)]

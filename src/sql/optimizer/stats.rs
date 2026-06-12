@@ -1772,6 +1772,7 @@ mod tests {
                 predicates: scan.predicates,
                 required_columns: scan.required_columns,
                 dict_columns: scan.dict_columns,
+                mv_rewritten_from: None,
             }),
             children: vec![],
         };
@@ -2047,6 +2048,7 @@ mod tests {
             op: Operator::LogicalUnion(LogicalUnionOp {
                 all: true,
                 output_columns: vec![stats_output_column(10, "k")],
+                child_output_columns: vec![],
             }),
             children: vec![left, right],
         };
@@ -2088,6 +2090,7 @@ mod tests {
             op: Operator::LogicalUnion(LogicalUnionOp {
                 all: false,
                 output_columns: vec![stats_output_column(10, "k")],
+                child_output_columns: vec![],
             }),
             children: vec![left, right],
         };
@@ -2124,6 +2127,7 @@ mod tests {
             op: Operator::LogicalUnion(LogicalUnionOp {
                 all: true,
                 output_columns: vec![stats_output_column(10, "k")],
+                child_output_columns: vec![],
             }),
             children: vec![left, right],
         };
@@ -2161,6 +2165,7 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::LogicalIntersect(LogicalIntersectOp {
                 output_columns: vec![stats_output_column(10, "k")],
+                child_output_columns: vec![],
             }),
             children: vec![left, right],
         };
@@ -2201,6 +2206,7 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::LogicalExcept(LogicalExceptOp {
                 output_columns: vec![stats_output_column(10, "k")],
+                child_output_columns: vec![],
             }),
             children: vec![left, right],
         };

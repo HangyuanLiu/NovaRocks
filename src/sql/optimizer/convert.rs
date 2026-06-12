@@ -25,6 +25,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
                 predicates: node.predicates.clone(),
                 required_columns: node.required_columns.clone(),
                 dict_columns: node.dict_columns.clone(),
+                mv_rewritten_from: None,
             });
             let expr = MExpr {
                 id: memo.next_expr_id(),
@@ -120,6 +121,11 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
         }
 
         LogicalPlan::Union(node) => {
+            let child_output_columns = node
+                .inputs
+                .iter()
+                .map(|input| crate::sql::planner::plan_output_columns(input).unwrap_or_default())
+                .collect();
             let children: Vec<GroupId> = node
                 .inputs
                 .iter()
@@ -128,6 +134,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
             let op = Operator::LogicalUnion(LogicalUnionOp {
                 all: node.all,
                 output_columns: node.output_columns.clone(),
+                child_output_columns,
             });
             let expr = MExpr {
                 id: memo.next_expr_id(),
@@ -138,6 +145,11 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
         }
 
         LogicalPlan::Intersect(node) => {
+            let child_output_columns = node
+                .inputs
+                .iter()
+                .map(|input| crate::sql::planner::plan_output_columns(input).unwrap_or_default())
+                .collect();
             let children: Vec<GroupId> = node
                 .inputs
                 .iter()
@@ -145,6 +157,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
                 .collect();
             let op = Operator::LogicalIntersect(LogicalIntersectOp {
                 output_columns: node.output_columns.clone(),
+                child_output_columns,
             });
             let expr = MExpr {
                 id: memo.next_expr_id(),
@@ -155,6 +168,11 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
         }
 
         LogicalPlan::Except(node) => {
+            let child_output_columns = node
+                .inputs
+                .iter()
+                .map(|input| crate::sql::planner::plan_output_columns(input).unwrap_or_default())
+                .collect();
             let children: Vec<GroupId> = node
                 .inputs
                 .iter()
@@ -162,6 +180,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
                 .collect();
             let op = Operator::LogicalExcept(LogicalExceptOp {
                 output_columns: node.output_columns.clone(),
+                child_output_columns,
             });
             let expr = MExpr {
                 id: memo.next_expr_id(),
@@ -447,6 +466,19 @@ mod tests {
         assert_eq!(output_columns[1].name, "dup");
         assert_eq!(output_columns[0].column_id, target[0].column_id);
         assert_eq!(output_columns[1].column_id, target[1].column_id);
+
+        let root_expr = memo.groups[root]
+            .logical_exprs
+            .first()
+            .expect("root logical expression");
+        let Operator::LogicalUnion(op) = &root_expr.op else {
+            panic!("expected logical union");
+        };
+        assert_eq!(op.child_output_columns.len(), 2);
+        assert_eq!(op.child_output_columns[0][0].column_id, ColumnId(10));
+        assert_eq!(op.child_output_columns[0][1].column_id, ColumnId(11));
+        assert_eq!(op.child_output_columns[1][0].column_id, ColumnId(12));
+        assert_eq!(op.child_output_columns[1][1].column_id, ColumnId(13));
     }
 
     #[test]

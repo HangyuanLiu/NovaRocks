@@ -2,17 +2,33 @@
 //!
 //! M0 ships only the ApplyException terminal guard. The decorrelation rules
 //! (push-down normalization, ApplyToWindow, *ApplyToJoin) land with M1+; see
-//! docs/superpowers/specs/2026-06-10-apply-correlated-subquery-framework-design.md §6.
+//! docs/design/specs/2026-06-10-apply-correlated-subquery-framework-design.md §6.
 
 mod apply_exception;
+mod apply_to_window;
+mod decorrelate_util;
+mod push_down_apply_agg_filter;
+mod push_down_apply_filter;
+mod scalar_apply_to_join;
+mod win_magic_util;
 
 pub(crate) use apply_exception::ApplyException;
+pub(crate) use apply_to_window::ApplyToWindow;
+pub(crate) use push_down_apply_agg_filter::PushDownApplyAggFilter;
+pub(crate) use push_down_apply_filter::PushDownApplyFilter;
+pub(crate) use scalar_apply_to_join::ScalarApplyToJoin;
 
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
 use crate::sql::planner::plan::LogicalPlan;
 
 pub(crate) fn subquery_rewrite_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
-    vec![Box::new(ApplyException)]
+    vec![
+        Box::new(PushDownApplyAggFilter),
+        Box::new(PushDownApplyFilter),
+        Box::new(ApplyToWindow), // to-window BEFORE to-join (StarRocks ordering)
+        Box::new(ScalarApplyToJoin),
+        Box::new(ApplyException), // must stay LAST
+    ]
 }
 
 /// Non-disableable backstop used by `optimize()`: returns the ApplyException
@@ -97,6 +113,7 @@ mod tests {
                 nullable: true,
                 is_internal: true,
             },
+            inner_output_column_id: ColumnId(5),
             correlation_column_ids: vec![],
             correlation_conjuncts: vec![],
             residual_predicate: None,
@@ -108,24 +125,34 @@ mod tests {
     }
 
     #[test]
-    fn apply_exception_fails_residual_apply() {
+    fn apply_exception_never_fires_for_decorrelatable_apply() {
+        // M1b: an uncorrelated scalar Apply over empty Values is handled by
+        // ScalarApplyToJoin (CROSS JOIN + pass-through Project). ApplyException
+        // is never reached; the pipeline succeeds.
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
-        let err = query_rewrite_pipeline(&HashMap::new())
+        let result = query_rewrite_pipeline(&HashMap::new())
             .rewrite(apply_over_values(), &mut ctx)
-            .expect_err("residual apply must fail the pipeline");
+            .expect("pipeline must succeed: ScalarApplyToJoin eliminates the Apply");
+        // The Apply must be gone — rewritten to a Project wrapping a CrossJoin.
         assert!(
-            err.contains("subquery decorrelation failed"),
-            "unexpected error: {err}"
+            find_residual_apply(&result).is_none(),
+            "no Apply must survive after ScalarApplyToJoin fires"
         );
-        assert!(err.contains("kind=Scalar"), "unexpected error: {err}");
     }
 
     #[test]
     fn disabled_apply_exception_is_caught_by_backstop() {
-        let mut ctx = RewriteContext::for_query(vec!["ApplyException".to_string()]);
+        // Disable ALL rules that could eliminate the Apply — including the M1b
+        // decorrelation rules — so the Apply survives to the backstop.
+        let mut ctx = RewriteContext::for_query(vec![
+            "ApplyException".to_string(),
+            "ScalarApplyToJoin".to_string(),
+            "PushDownApplyAggFilter".to_string(),
+            "PushDownApplyFilter".to_string(),
+        ]);
         let rewritten = query_rewrite_pipeline(&HashMap::new())
             .rewrite(apply_over_values(), &mut ctx)
-            .expect("pipeline passes with the rule disabled");
+            .expect("pipeline passes with all Apply-handling rules disabled");
         let message = find_residual_apply(&rewritten).expect("backstop must detect the apply");
         assert!(message.contains("subquery decorrelation failed"));
     }

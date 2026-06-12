@@ -938,6 +938,24 @@ impl QueryContextManager {
         finsts
     }
 
+    /// A sender's exchange RPC failed. Map the finst to its query and cancel
+    /// the whole query so blocked receivers abort instead of timing out.
+    pub(crate) fn propagate_sender_error(&self, finst_id: UniqueId, err: String) -> Vec<UniqueId> {
+        match self.query_id_by_finst(finst_id) {
+            Some(qid) => {
+                let finsts = self.cancel_query(qid, format!("exchange send failed: {err}"));
+                for id in &finsts {
+                    crate::runtime::exchange::cancel_fragment(id.hi, id.lo);
+                }
+                finsts
+            }
+            None => {
+                crate::runtime::exchange::cancel_fragment(finst_id.hi, finst_id.lo);
+                vec![finst_id]
+            }
+        }
+    }
+
     pub(crate) fn finish_fragment(&self, query_id: QueryId) {
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
         let Some(mut ctx) = guard.active.remove(&query_id) else {
@@ -962,6 +980,79 @@ pub(crate) fn query_context_manager() -> Arc<QueryContextManager> {
     QUERY_CONTEXT_MANAGER
         .get_or_init(QueryContextManager::new)
         .clone()
+}
+
+#[cfg(test)]
+mod sender_error_tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    use super::{QueryContextManager, QueryContextManagerInner, QueryId};
+    use crate::common::types::UniqueId;
+    use crate::runtime::exchange::{ExchangeKey, set_expected_senders, snapshot_receiver_state};
+
+    fn test_manager() -> QueryContextManager {
+        QueryContextManager {
+            inner: Mutex::new(QueryContextManagerInner::default()),
+            stopped: AtomicBool::new(false),
+        }
+    }
+
+    #[test]
+    fn mapped_finst_cancels_all_query_finsts_and_receivers() {
+        let mgr = test_manager();
+        let qid = QueryId { hi: 11, lo: 22 };
+        let finst_a = UniqueId { hi: 101, lo: 201 };
+        let finst_b = UniqueId { hi: 102, lo: 202 };
+        let key_a = ExchangeKey {
+            finst_id_hi: finst_a.hi,
+            finst_id_lo: finst_a.lo,
+            node_id: 301,
+        };
+        let key_b = ExchangeKey {
+            finst_id_hi: finst_b.hi,
+            finst_id_lo: finst_b.lo,
+            node_id: 302,
+        };
+
+        mgr.get_or_register(qid, false, Duration::from_secs(1), Duration::from_secs(5))
+            .expect("query context must be created");
+        mgr.register_finst(finst_a, qid);
+        mgr.register_finst(finst_b, qid);
+        set_expected_senders(key_a, 1);
+        set_expected_senders(key_b, 1);
+
+        assert!(snapshot_receiver_state(key_a).is_some());
+        assert!(snapshot_receiver_state(key_b).is_some());
+
+        let mut finsts = mgr.propagate_sender_error(finst_a, "connection refused".into());
+        finsts.sort_by_key(|id| (id.hi, id.lo));
+
+        assert_eq!(finsts, vec![finst_a, finst_b]);
+        assert!(mgr.is_query_canceled(qid));
+        assert!(snapshot_receiver_state(key_a).is_none());
+        assert!(snapshot_receiver_state(key_b).is_none());
+    }
+
+    #[test]
+    fn unmapped_finst_cancels_its_own_receiver_only() {
+        let mgr = test_manager();
+        let finst = UniqueId { hi: 201, lo: 202 };
+        let key = ExchangeKey {
+            finst_id_hi: finst.hi,
+            finst_id_lo: finst.lo,
+            node_id: 401,
+        };
+
+        set_expected_senders(key, 1);
+        assert!(snapshot_receiver_state(key).is_some());
+
+        let finsts = mgr.propagate_sender_error(finst, "broken pipe".into());
+
+        assert_eq!(finsts, vec![finst]);
+        assert!(snapshot_receiver_state(key).is_none());
+    }
 }
 
 pub(crate) fn observe_total_fragments(

@@ -27,6 +27,7 @@ orc-rust = { version = "0.8.0", default-features = false }
 apache-avro = "0.21.0"
 iceberg = "0.9.0"
 iceberg-catalog-rest = "0.9.0"
+iceberg-catalog-hms = "0.9.0"
 typetag = "0.2"
 opendal = { version = "0.55", features = ["services-oss", "services-fs", "services-s3", "services-hdfs-native", "services-memory"] }
 futures = "0.3"
@@ -59,6 +60,7 @@ tonic = { version = "0.12", features = ["transport"] }
 axum = "0.7"
 tokio-stream = "0.1"
 ctrlc = "3.4"
+prometheus = "0.13"
 base64 = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 md-5 = "0.10"
@@ -124,3 +126,12 @@ codegen-units = 256
 # and OverwriteFiles actions. See vendor/iceberg-0.9.0/PATCH.md for the diff.
 [patch.crates-io]
 iceberg = { path = "vendor/iceberg-0.9.0" }
+# Vendored to add Iceberg view REST endpoints (create/load/commit/drop/
+# exists/list) that upstream 0.9.0 does not implement. See
+# vendor/iceberg-catalog-rest-0.9.0/PATCH.md.
+iceberg-catalog-rest = { path = "vendor/iceberg-catalog-rest-0.9.0" }
+# Vendored to add a `PrimitiveType::Variant` match arm. The vendored iceberg's
+# PATCH 6 adds that enum member (Iceberg v3 variant), which is not additive for
+# the crate's exhaustive Hive type match, so crates.io 0.9.0 won't compile
+# against it. See vendor/iceberg-catalog-hms-0.9.0/PATCH.md.
+iceberg-catalog-hms = { path = "vendor/iceberg-catalog-hms-0.9.0" }

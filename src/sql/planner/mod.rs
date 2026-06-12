@@ -683,6 +683,69 @@ fn make_nullable(mut columns: Vec<OutputColumn>) -> Vec<OutputColumn> {
 }
 
 // ---------------------------------------------------------------------------
+// Apply spec wrapping helpers
+// ---------------------------------------------------------------------------
+
+/// Wrap `input` in a left-deep chain of `LogicalPlan::Apply` nodes, one per
+/// spec whose clause matches `clause`. Each Apply's right child is the planned
+/// inner subquery. Matching specs are consumed (removed) from `specs`; the
+/// remaining specs are preserved for the other clause insertion points.
+fn wrap_scalar_applies(
+    input: LogicalPlan,
+    specs: &mut Vec<ApplyScalarSpec>,
+    clause: ApplyClause,
+    cte_registry: &CTERegistry,
+    factory: &mut ColumnRefFactory,
+) -> Result<LogicalPlan, String> {
+    let mut current = input;
+    let mut remaining = Vec::new();
+    for spec in specs.drain(..) {
+        if spec.clause != clause {
+            remaining.push(spec);
+            continue;
+        }
+        let right = plan_scoped_query(spec.inner, cte_registry, factory)?;
+        // Capture the inner's single scalar output column id before right is
+        // moved into the ApplyNode. This id is stable across M1b pushdown rules
+        // (which may add group-by keys), so it is the reliable way to find the
+        // scalar result in ScalarApplyToJoin (Task 3).
+        let inner_output_column_id = plan_output_columns(&right)?
+            .first()
+            .map(|c| c.column_id)
+            .ok_or_else(|| "scalar subquery inner has no output column".to_string())?;
+        // Copy output-column fields before spec.output_column is moved into the ApplyNode.
+        let col_id = spec.output_column.column_id;
+        let col_name = spec.output_column.name.clone();
+        let col_type = spec.output_column.data_type.clone();
+        current = LogicalPlan::Apply(ApplyNode {
+            left: Box::new(current),
+            right: Box::new(right),
+            kind: ApplyKind::Scalar,
+            inner_output_column_id,
+            subquery_expr: TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: col_id,
+                    qualifier: None,
+                    column: col_name,
+                },
+                data_type: col_type,
+                nullable: true,
+            },
+            output_column: spec.output_column,
+            correlation_column_ids: spec.correlation_column_ids,
+            correlation_conjuncts: Vec::new(),
+            residual_predicate: None,
+            need_check_max_rows: spec.need_check_max_rows,
+            use_semi_anti: false,
+            uncorrelated_outer_predicate_columns: std::collections::HashSet::new(),
+            required_output_columns: None,
+        });
+    }
+    *specs = remaining;
+    Ok(current)
+}
+
+// ---------------------------------------------------------------------------
 // SELECT planning
 // ---------------------------------------------------------------------------
 
@@ -693,6 +756,11 @@ fn plan_select_scoped(
 ) -> Result<LogicalPlan, String> {
     const REPEAT_GROUP_QUALIFIER: &str = "__repeat_group";
 
+    // Take ownership of all apply specs up-front. The three wrap points below
+    // consume them clause by clause. Legacy mode always delivers an empty vec
+    // here (no behavior change).
+    let mut apply_specs = std::mem::take(&mut select.apply_specs);
+
     let mut current = match select.from.take() {
         Some(relation) => plan_relation_scoped(relation, cte_registry, factory)?,
         None => LogicalPlan::Values(ValuesNode {
@@ -701,6 +769,17 @@ fn plan_select_scoped(
             required_output_columns: None,
         }),
     };
+
+    // WHERE placement: Apply nodes for WHERE-clause scalar subqueries are
+    // inserted between the FROM plan and the WHERE Filter so the output column
+    // is visible when the filter expression evaluates.
+    current = wrap_scalar_applies(
+        current,
+        &mut apply_specs,
+        ApplyClause::Where,
+        cte_registry,
+        factory,
+    )?;
 
     if let Some(predicate) = select.filter.take() {
         current = LogicalPlan::Filter(FilterNode {
@@ -735,9 +814,25 @@ fn plan_select_scoped(
 
     if select.has_aggregation || !select.group_by.is_empty() {
         if let Some(ref having_expr) = select.having {
+            // Collect the output column ids of HAVING apply specs so they are
+            // not mistakenly promoted into the GROUP BY list. Those columns are
+            // produced by Apply nodes that sit ABOVE the Aggregate, so the
+            // Aggregate must not try to pass them through as group keys.
+            let having_apply_col_ids: std::collections::HashSet<ColumnId> = apply_specs
+                .iter()
+                .filter(|s| s.clause == ApplyClause::Having)
+                .map(|s| s.output_column.column_id)
+                .collect();
             let mut extra_gb = Vec::new();
             collect_non_agg_column_refs(having_expr, &select.group_by, &mut extra_gb);
             for col in extra_gb {
+                // Skip output columns of HAVING apply specs — they are
+                // provided by the Apply node above the Aggregate, not below.
+                if let ExprKind::ColumnRef { column_id, .. } = &col.kind
+                    && having_apply_col_ids.contains(column_id)
+                {
+                    continue;
+                }
                 select.group_by.push(col);
             }
         }
@@ -757,6 +852,17 @@ fn plan_select_scoped(
             already_pushed: false,
             required_output_columns: None,
         });
+
+        // HAVING placement: Apply nodes for HAVING-clause scalar subqueries
+        // are inserted above the Aggregate and below the HAVING Filter.
+        current = wrap_scalar_applies(
+            current,
+            &mut apply_specs,
+            ApplyClause::Having,
+            cte_registry,
+            factory,
+        )?;
+
         if let Some(having) = rewritten_having {
             current = LogicalPlan::Filter(FilterNode {
                 input: Box::new(current),
@@ -765,10 +871,36 @@ fn plan_select_scoped(
             });
         }
 
+        // Projection placement (aggregated branch): Apply nodes for
+        // Projection-clause scalar subqueries are inserted before the window
+        // and project so the output column is available for the SELECT list.
+        current = wrap_scalar_applies(
+            current,
+            &mut apply_specs,
+            ApplyClause::Projection,
+            cte_registry,
+            factory,
+        )?;
+
         current = build_window_and_project(current, project_items, factory)?;
     } else {
+        // Projection placement (non-aggregated branch).
+        current = wrap_scalar_applies(
+            current,
+            &mut apply_specs,
+            ApplyClause::Projection,
+            cte_registry,
+            factory,
+        )?;
+
         current = build_window_and_project(current, select.projection.clone(), factory)?;
     }
+
+    debug_assert!(
+        apply_specs.is_empty(),
+        "unplaced scalar apply specs: {:?}",
+        apply_specs.iter().map(|s| s.clause).collect::<Vec<_>>()
+    );
 
     // SELECT DISTINCT → Aggregate on all output columns (deduplication)
     if select.distinct {
@@ -3349,6 +3481,40 @@ mod tests {
                         table_id: 0,
                     },
                 }),
+                "t1" | "t2" => {
+                    let value_col = if table == "t1" { "v1" } else { "v2" };
+                    Ok(TableDef {
+                        name: table.to_string(),
+                        columns: vec![
+                            ColumnDef {
+                                name: "k1".to_string(),
+                                data_type: arrow::datatypes::DataType::Int64,
+                                nullable: true,
+                                write_default: None,
+                                logical_type: None,
+                            },
+                            ColumnDef {
+                                name: "k2".to_string(),
+                                data_type: arrow::datatypes::DataType::Int64,
+                                nullable: true,
+                                write_default: None,
+                                logical_type: None,
+                            },
+                            ColumnDef {
+                                name: value_col.to_string(),
+                                data_type: arrow::datatypes::DataType::Utf8,
+                                nullable: true,
+                                write_default: None,
+                                logical_type: None,
+                            },
+                        ],
+                        iceberg_row_lineage_metadata_columns: vec![],
+                        source: ScanSource::StarRocks {
+                            db_id: 0,
+                            table_id: 0,
+                        },
+                    })
+                }
                 other => Err(format!("unknown test table: {other}")),
             }
         }
@@ -3373,6 +3539,21 @@ mod tests {
             _ => return Err("expected query".into()),
         };
         crate::sql::analyzer::analyze(&query, &TestCatalog, "default")
+    }
+
+    /// Analyze and plan `sql` with `subquery_unnest_mode = Apply`.
+    fn parse_analyze_and_plan_apply(sql: &str) -> Result<LogicalPlan, String> {
+        use crate::sql::optimizer::options::{
+            SessionOptimizerSettings, SubqueryUnnestMode, with_session_optimizer_settings,
+        };
+        let settings = SessionOptimizerSettings {
+            subquery_unnest_mode: SubqueryUnnestMode::Apply,
+            ..Default::default()
+        };
+        with_session_optimizer_settings(settings, || {
+            let (resolved, cte_registry, mut factory) = parse_analyze_query(sql)?;
+            plan_query(resolved, cte_registry, &mut factory)
+        })
     }
 
     fn plan_test_query(sql: &str) -> LogicalPlan {
@@ -4224,6 +4405,31 @@ mod tests {
             k_id, group_ids[0],
             "rollup key projection must bind to the repeat key output"
         );
+    }
+
+    #[test]
+    fn p3_cube_without_grouping_survives_optimizer_id_binding() {
+        let sql = "WITH t AS ( \
+                   SELECT 1 AS a, 'x' AS b \
+                   UNION ALL SELECT 1, 'y' \
+                   UNION ALL SELECT 2, 'z' \
+                   ) \
+                   SELECT a, b FROM t GROUP BY CUBE(a, b) ORDER BY a, b";
+        let (resolved, cte_registry, mut factory) =
+            parse_analyze_query(sql).expect("analyzer should succeed");
+        let logical =
+            plan_query(resolved, cte_registry, &mut factory).expect("planner should succeed");
+        let physical = crate::sql::optimizer::optimize(
+            logical,
+            &std::collections::HashMap::new(),
+            factory,
+            None,
+            Vec::new(),
+        )
+        .expect("optimizer should produce a physical plan");
+
+        crate::sql::codegen::id_binding_verifier::verify_id_binding(&physical)
+            .expect("CUBE synthetic grouping output must survive optimizer extraction");
     }
 
     #[test]
@@ -5293,6 +5499,7 @@ mod tests {
                 nullable: true,
             },
             output_column: out_col.clone(),
+            inner_output_column_id: out_col.column_id,
             correlation_column_ids: vec![],
             correlation_conjuncts: vec![],
             residual_predicate: None,
@@ -5336,5 +5543,148 @@ mod tests {
         let columns = plan_output_columns(&plan).expect("assert output columns");
         assert_eq!(columns.len(), 1);
         assert_eq!(columns[0].column_id, col.column_id);
+    }
+
+    // -------------------------------------------------------------------
+    // Apply spec placement tests (Task 4)
+    // -------------------------------------------------------------------
+
+    /// Recursive helper: returns true if `e` (or any sub-expression) contains a
+    /// `ColumnRef` with the given `ColumnId`.  Used by placement tests to verify
+    /// that filter/projection predicates reference the Apply output column.
+    fn expr_references_col(e: &TypedExpr, id: ColumnId) -> bool {
+        match &e.kind {
+            ExprKind::ColumnRef { column_id, .. } => *column_id == id,
+            ExprKind::BinaryOp { left, right, .. } => {
+                expr_references_col(left, id) || expr_references_col(right, id)
+            }
+            ExprKind::UnaryOp { expr, .. } => expr_references_col(expr, id),
+            ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
+                args.iter().any(|a| expr_references_col(a, id))
+            }
+            ExprKind::Cast { expr, .. } => expr_references_col(expr, id),
+            _ => false,
+        }
+    }
+
+    /// WHERE-clause scalar subquery in apply mode: the plan must contain an
+    /// Apply node between the FROM Scan and the WHERE Filter, and the Apply's
+    /// output_column must appear in the plan's output column set.
+    #[test]
+    fn apply_where_spec_emits_apply_below_where_filter() {
+        // t1.k1 = (SELECT max(k2) FROM t2 WHERE t2.k1 = t1.k1)
+        let sql = "SELECT k1 FROM t1 WHERE k1 = (SELECT max(k2) FROM t2 WHERE t2.k1 = t1.k1)";
+        let plan = parse_analyze_and_plan_apply(sql).expect("apply-mode plan must succeed");
+
+        // Root shape: Project → Filter(WHERE) → Apply → Scan
+        let LogicalPlan::Project(project) = &plan else {
+            panic!("expected Project root, got {plan:?}");
+        };
+        let LogicalPlan::Filter(filter) = project.input.as_ref() else {
+            panic!("expected Filter under Project, got {:?}", project.input);
+        };
+        // The Apply must be directly under the WHERE Filter.
+        let LogicalPlan::Apply(apply) = filter.input.as_ref() else {
+            panic!("expected Apply under WHERE Filter, got {:?}", filter.input);
+        };
+        assert_eq!(
+            apply.kind,
+            crate::sql::planner::plan::ApplyKind::Scalar,
+            "Apply kind must be Scalar"
+        );
+        // Apply.left must be the FROM Scan.
+        assert!(
+            matches!(apply.left.as_ref(), LogicalPlan::Scan(_)),
+            "Apply.left must be the FROM Scan, got {:?}",
+            apply.left
+        );
+        // The WHERE Filter's predicate must reference the Apply output column
+        // so that the filter can consume the scalar value.
+        let apply_col_id = apply.output_column.column_id;
+        assert!(
+            expr_references_col(&filter.predicate, apply_col_id),
+            "WHERE predicate must reference the Apply output column {:?}",
+            apply_col_id
+        );
+    }
+
+    /// HAVING-clause scalar subquery in apply mode: the Apply must appear
+    /// between the Aggregate and the HAVING Filter.
+    #[test]
+    fn apply_having_spec_emits_apply_above_aggregate() {
+        let sql = "SELECT k1, max(k2) FROM t1 GROUP BY k1 \
+                   HAVING max(k2) > (SELECT max(k2) FROM t2 WHERE t2.k1 = t1.k1)";
+        let plan =
+            parse_analyze_and_plan_apply(sql).expect("apply-mode plan must succeed for HAVING");
+
+        // Walk down: Project → Filter(HAVING) → Apply → Aggregate → ...
+        let LogicalPlan::Project(project) = &plan else {
+            panic!("expected Project root, got {plan:?}");
+        };
+        let LogicalPlan::Filter(having_filter) = project.input.as_ref() else {
+            panic!(
+                "expected HAVING Filter under Project, got {:?}",
+                project.input
+            );
+        };
+        let LogicalPlan::Apply(apply) = having_filter.input.as_ref() else {
+            panic!(
+                "expected Apply directly under HAVING Filter, got {:?}",
+                having_filter.input
+            );
+        };
+        assert_eq!(apply.kind, crate::sql::planner::plan::ApplyKind::Scalar);
+        // Apply.left must be the Aggregate.
+        assert!(
+            matches!(apply.left.as_ref(), LogicalPlan::Aggregate(_)),
+            "Apply.left for HAVING spec must be the Aggregate, got {:?}",
+            apply.left
+        );
+        // The HAVING Filter's predicate must reference the Apply output column.
+        let apply_col_id = apply.output_column.column_id;
+        assert!(
+            expr_references_col(&having_filter.predicate, apply_col_id),
+            "HAVING predicate must reference Apply output column {:?}",
+            apply_col_id
+        );
+    }
+
+    /// Projection-clause scalar subquery in apply mode: the Apply must appear
+    /// below the Project node (Project is above Apply).
+    #[test]
+    fn apply_projection_spec_emits_apply_below_project() {
+        let sql = "SELECT k1, (SELECT max(k2) FROM t2 WHERE t2.k1 = t1.k1) AS sub FROM t1";
+        let plan =
+            parse_analyze_and_plan_apply(sql).expect("apply-mode plan must succeed for Projection");
+
+        // Root must be Project; its input must be Apply.
+        let LogicalPlan::Project(project) = &plan else {
+            panic!("expected Project root, got {plan:?}");
+        };
+        let LogicalPlan::Apply(apply) = project.input.as_ref() else {
+            panic!(
+                "expected Apply directly under Project, got {:?}",
+                project.input
+            );
+        };
+        assert_eq!(apply.kind, crate::sql::planner::plan::ApplyKind::Scalar);
+        // Apply.left must be the FROM Scan.
+        assert!(
+            matches!(apply.left.as_ref(), LogicalPlan::Scan(_)),
+            "Apply.left for Projection spec must be FROM Scan, got {:?}",
+            apply.left
+        );
+        // The Apply's output_column must appear in the Project's items.
+        let apply_col_id = apply.output_column.column_id;
+        let projected = project.items.iter().any(|item| {
+            matches!(
+                &item.expr.kind,
+                ExprKind::ColumnRef { column_id, .. } if *column_id == apply_col_id
+            )
+        });
+        assert!(
+            projected,
+            "Projection must reference the Apply output column"
+        );
     }
 }

@@ -70,6 +70,19 @@ pub(crate) fn parse_sql(sql: &str) -> Result<Vec<Statement>, String> {
         return Ok(vec![stmt]);
     }
 
+    if dialect::backend::looks_like_add_backend(&parser) {
+        let stmt = dialect::backend::parse_add_backend(&mut parser)?;
+        return Ok(vec![stmt]);
+    }
+    if dialect::backend::looks_like_drop_backend(&parser) {
+        let stmt = dialect::backend::parse_drop_backend(&mut parser)?;
+        return Ok(vec![stmt]);
+    }
+    if dialect::backend::looks_like_show_backends(&parser) {
+        let stmt = dialect::backend::parse_show_backends(&mut parser)?;
+        return Ok(vec![stmt]);
+    }
+
     Err("parse_sql: only materialized-view DDL is recognized in Phase 1".to_string())
 }
 
@@ -110,6 +123,26 @@ mod tests {
             }
             other => panic!("expected ForSystemTimeAsOf after normalization, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_sql_raw_preserves_escaped_backslash_before_f() {
+        let stmt = parse_sql_raw(r"SELECT 'e\\f'").expect("parse should succeed");
+        let sqlparser::ast::Statement::Query(query) = stmt else {
+            panic!("expected query statement");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected select body");
+        };
+        let sqlparser::ast::SelectItem::UnnamedExpr(sqlparser::ast::Expr::Value(value)) =
+            &select.projection[0]
+        else {
+            panic!("expected string literal projection");
+        };
+        let sqlparser::ast::Value::SingleQuotedString(s) = &value.value else {
+            panic!("expected single-quoted string");
+        };
+        assert_eq!(s, r"e\f");
     }
 
     #[test]
@@ -410,5 +443,64 @@ mod tests {
             func.null_treatment,
         );
         assert!(func.over.is_some(), "OVER clause must still be parsed");
+    }
+
+    #[test]
+    fn parse_sql_recognizes_backend_management_statements() {
+        let add = parse_sql("ADD BACKEND '127.0.0.1:19070'").expect("parse ADD BACKEND");
+        match &add[0] {
+            Statement::AddBackend(stmt) => assert_eq!(stmt.addr, "127.0.0.1:19070"),
+            other => panic!("expected AddBackend, got {other:?}"),
+        }
+
+        let drop =
+            parse_sql("DROP BACKEND '127.0.0.1:19070' FORCE").expect("parse DROP BACKEND FORCE");
+        match &drop[0] {
+            Statement::DropBackend(stmt) => {
+                assert_eq!(stmt.addr, "127.0.0.1:19070");
+                assert!(stmt.force);
+            }
+            other => panic!("expected DropBackend, got {other:?}"),
+        }
+
+        let show = parse_sql("SHOW BACKENDS").expect("parse SHOW BACKENDS");
+        assert!(matches!(show[0], Statement::ShowBackends(_)));
+    }
+
+    #[test]
+    fn parse_sql_raw_parses_insert_select_with_legacy_map_literal() {
+        let stmt = parse_sql_raw(
+            r#"
+INSERT INTO complex_semi_cast.t1
+SELECT
+    idx,
+    idx,
+    json_object('k1', idx, 'k2', idx + 1),
+    [idx, idx + 1, idx + 2, idx + 3],
+    map{0: idx, 1: idx + 1, 2: idx + 2},
+    struct(idx, idx + 1)
+FROM complex_semi_cast.row_util
+"#,
+        )
+        .expect("INSERT SELECT with legacy map literal must parse");
+
+        assert!(
+            matches!(stmt, sqlparser::ast::Statement::Insert(_)),
+            "expected INSERT statement, got {stmt:?}"
+        );
+    }
+
+    #[test]
+    fn parse_sql_raw_parses_insert_select_with_columns_order_limit() {
+        let stmt = parse_sql_raw(
+            "INSERT INTO db_sqlt_ad73acc525f97a33.t1 (k1) \
+             SELECT idx from db_sqlt_ad73acc525f97a33.row_util order by idx limit 1000",
+        )
+        .expect("INSERT SELECT with target columns, ORDER BY, and LIMIT must parse");
+
+        assert!(
+            matches!(stmt, sqlparser::ast::Statement::Insert(_)),
+            "expected INSERT statement, got {stmt:?}"
+        );
     }
 }

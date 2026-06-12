@@ -464,6 +464,9 @@ fn format_physical_node(
                 "{pad}     TABLE: {}.{}",
                 op.database, op.table.name
             ));
+            if let Some(ref mv) = op.mv_rewritten_from {
+                out.push(format!("{pad}     rewritten with mv: {mv}"));
+            }
             if let Some(ref cols) = op.required_columns
                 && matches!(
                     level,
@@ -651,6 +654,10 @@ fn format_physical_node(
             }
         }
         Operator::PhysicalTopN(op) => {
+            let label = match op.phase {
+                crate::sql::optimizer::operator::TopNPhase::Partial => "LOCAL TOP-N",
+                crate::sql::optimizer::operator::TopNPhase::Final => "TOP-N",
+            };
             let items: Vec<String> = op
                 .items
                 .iter()
@@ -672,7 +679,7 @@ fn format_physical_node(
                 parts.push(format!("offset={o}"));
             }
             out.push(format!(
-                "{pad}TOP-N ({}) [{}]{costs_suffix}{stats_suffix}",
+                "{pad}{label} ({}) [{}]{costs_suffix}{stats_suffix}",
                 parts.join(", "),
                 items.join(", ")
             ));
@@ -1142,6 +1149,7 @@ fn format_expr_kind(kind: &ExprKind) -> String {
             LiteralValue::Float(f) => f.to_string(),
             LiteralValue::Decimal(d) => d.clone(),
             LiteralValue::String(s) => format!("'{s}'"),
+            LiteralValue::Binary(bytes) => format!("X'{}'", hex::encode_upper(bytes)),
         },
         ExprKind::BinaryOp { left, op, right } => {
             let op_str = match op {
@@ -1287,11 +1295,12 @@ mod tests {
         ExplainLevel, explain_physical_plan, explain_plan, format_physical_node,
         format_stats_trailer,
     };
-    use crate::sql::analysis::{JoinKind, OutputColumn};
+    use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn, SortItem, TypedExpr};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
         JoinDistribution, Operator, PhysicalDistributionOp, PhysicalHashJoinOp, PhysicalScanOp,
+        PhysicalTopNOp, TopNPhase,
     };
     use crate::sql::optimizer::physical_plan::{
         JoinExecutionDistribution, PhysicalPlanNode, PlanExecutionProps,
@@ -1387,6 +1396,7 @@ mod tests {
                 predicates: Vec::new(),
                 required_columns: Some(vec![column.name.clone()]),
                 dict_columns: vec![],
+                mv_rewritten_from: None,
             }),
             children: Vec::new(),
             stats: Statistics {
@@ -1440,6 +1450,7 @@ mod tests {
                 predicates: Vec::new(),
                 required_columns: Some(vec![column.name.clone()]),
                 dict_columns: vec![],
+                mv_rewritten_from: None,
             }),
             children: Vec::new(),
             stats: Statistics {
@@ -1484,6 +1495,7 @@ mod tests {
                 predicates: Vec::new(),
                 required_columns: None,
                 dict_columns: vec![],
+                mv_rewritten_from: None,
             }),
             children: Vec::new(),
             stats: Statistics {
@@ -1553,6 +1565,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn partial_topn_explain_uses_local_label() {
+        let scan = build_minimal_scan_plan_for_explain_test();
+        let node = PhysicalPlanNode {
+            op: Operator::PhysicalTopN(PhysicalTopNOp {
+                items: vec![SortItem {
+                    expr: TypedExpr {
+                        kind: ExprKind::ColumnRef {
+                            column_id: ColumnId(1),
+                            qualifier: None,
+                            column: "id".to_string(),
+                        },
+                        data_type: DataType::Int64,
+                        nullable: false,
+                    },
+                    asc: true,
+                    nulls_first: false,
+                }],
+                limit: Some(10),
+                offset: Some(0),
+                phase: TopNPhase::Partial,
+                is_split: false,
+            }),
+            children: vec![scan],
+            stats: Statistics {
+                output_row_count: 10.0,
+                column_statistics: HashMap::new(),
+                ..Default::default()
+            },
+            output_columns: Vec::new(),
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+        };
+
+        let output = explain_physical_plan(&node, ExplainLevel::Verbose).join("\n");
+
+        assert!(
+            output.starts_with("LOCAL TOP-N (limit=10, offset=0)"),
+            "explain output was:\n{output}"
+        );
+        assert!(
+            !output.starts_with("TOP-N ("),
+            "partial TopN must not look like a global TOP-N:\n{output}"
+        );
+    }
+
     fn build_minimal_scan_plan_for_explain_test() -> PhysicalPlanNode {
         let column = ColumnDef {
             name: "id".to_string(),
@@ -1584,6 +1643,7 @@ mod tests {
                 predicates: Vec::new(),
                 required_columns: Some(vec![column.name.clone()]),
                 dict_columns: vec![],
+                mv_rewritten_from: None,
             }),
             children: Vec::new(),
             stats: Statistics {
@@ -1657,6 +1717,7 @@ mod tests {
                 predicates: Vec::new(),
                 required_columns: Some(vec![column.name.clone()]),
                 dict_columns: vec![],
+                mv_rewritten_from: None,
             }),
             children: Vec::new(),
             stats: Statistics {
@@ -1996,6 +2057,7 @@ mod rf_explain_tests {
                 nullable: false,
                 is_internal: true,
             },
+            inner_output_column_id: ColumnId(5),
             correlation_column_ids: vec![ColumnId(1)],
             correlation_conjuncts: vec![],
             residual_predicate: None,

@@ -7,6 +7,7 @@ pub(crate) mod hadoop_catalog;
 pub(crate) mod registry;
 pub(crate) mod s3_storage;
 pub(crate) mod schema_update;
+pub(crate) mod views;
 
 // Re-export the same surface the previous `standalone::iceberg::*` module
 // offered, so callers only need to update the module prefix, not each
@@ -14,7 +15,7 @@ pub(crate) mod schema_update;
 pub(crate) use backend::{
     IcebergCatalogBackend, IcebergTableSink, IcebergTableSource,
     build_iceberg_table_def_for_delta_scan, build_iceberg_table_def_with_files,
-    row_lineage_enabled,
+    hidden_internal_column_names_from_metadata, row_lineage_enabled,
 };
 pub(crate) use registry::{
     IcebergCatalogEntry, IcebergCatalogRegistry, IcebergLoadedTable, create_namespace,

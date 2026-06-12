@@ -71,7 +71,36 @@ impl<'a> AnalyzerContext<'a> {
             return Ok(());
         }
 
+        let mode = super::subquery_unnest_mode();
         for sq_info in subqueries {
+            // In apply / apply_strict mode, route scalar subqueries to the Apply
+            // framework instead of the legacy join-rewrite. Non-scalar subqueries
+            // (EXISTS/IN) and scalar subqueries in JOIN-ON clauses always use the
+            // legacy path.
+            let route_to_apply = !matches!(
+                mode,
+                crate::sql::optimizer::options::SubqueryUnnestMode::Legacy
+            ) && matches!(sq_info.kind, SubqueryKind::Scalar);
+            if route_to_apply {
+                match self.collect_scalar_apply_spec(select, scope, &sq_info) {
+                    Ok(true) => continue, // spec recorded; placeholder replaced
+                    Ok(false) => {
+                        // Shape not supported by M1a — fall through to legacy below.
+                    }
+                    Err(e) => {
+                        if matches!(
+                            mode,
+                            crate::sql::optimizer::options::SubqueryUnnestMode::ApplyStrict
+                        ) {
+                            return Err(e);
+                        }
+                        // apply (non-strict): fall back to legacy for this subquery.
+                    }
+                }
+            }
+
+            // Legacy path (unchanged): JOIN-ON detection then rewrite.
+            //
             // Subqueries can appear in three locations:
             //   1. WHERE / HAVING (the original path)
             //   2. JOIN ... ON clauses inside `select.from`
@@ -113,6 +142,88 @@ impl<'a> AnalyzerContext<'a> {
         }
 
         Ok(())
+    }
+
+    // ---------------------------------------------------------------------------
+    // Apply-mode scalar subquery routing
+    // ---------------------------------------------------------------------------
+
+    /// Apply-mode handler for a scalar subquery. Returns Ok(true) if an
+    /// ApplyScalarSpec was recorded and the placeholder replaced; Ok(false) if
+    /// the shape should fall back to the legacy rewrite (e.g. placeholder is
+    /// inside a JOIN-ON clause which M1a does not yet place); Err on a hard
+    /// analysis failure.
+    fn collect_scalar_apply_spec(
+        &self,
+        select: &mut ResolvedSelect,
+        scope: &mut AnalyzerScope,
+        sq_info: &SubqueryInfo,
+    ) -> Result<bool, String> {
+        use crate::sql::analysis::{ApplyScalarSpec, OutputColumn};
+
+        // 1. Determine which clause the placeholder lives in. If it is inside
+        //    a JOIN-ON or nowhere we recognise, fall back to legacy.
+        let clause = match locate_scalar_placeholder_clause(select, sq_info.id) {
+            Some(c) => c,
+            None => return Ok(false),
+        };
+
+        // 2. Analyze the inner subquery with the merged outer scope — the same
+        //    call legacy uses. Outer refs inside it now carry outer ColumnIds.
+        let (resolved_sub, inner_scope) =
+            self.analyze_query_in_scope_with_inner(&sq_info.subquery, scope)?;
+        if resolved_sub.output_columns.len() != 1 {
+            return Err("scalar subquery must produce exactly one output column".to_string());
+        }
+
+        // 3. Collect correlation column ids WITHOUT modifying the inner query.
+        let corr_ids = collect_correlation_column_ids(&resolved_sub, &inner_scope, scope);
+
+        // 4. Mint an output column representing the subquery's scalar value in
+        //    the outer expressions. Always nullable (the inner may produce NULL
+        //    for non-matching rows).
+        let inner_out = &resolved_sub.output_columns[0];
+        let output_name = format!("__scalar_sq_{}", sq_info.id);
+        let output_id =
+            self.alloc_column_id(None, output_name.clone(), inner_out.data_type.clone(), true);
+        let output_column = OutputColumn {
+            column_id: output_id,
+            name: output_name.clone(),
+            data_type: inner_out.data_type.clone(),
+            nullable: true,
+            is_internal: true,
+        };
+
+        // 5. Replace the SubqueryPlaceholder in filter/having/projection with a
+        //    ColumnRef to the minted output column. Reuses the same static
+        //    helpers rewrite_scalar_subquery uses (replace_placeholder_in_filter,
+        //    replace_placeholder_in_projection, replace_placeholder_in_expr).
+        let replacement = crate::sql::analysis::TypedExpr {
+            kind: crate::sql::analysis::ExprKind::ColumnRef {
+                column_id: output_id,
+                qualifier: None,
+                column: output_name.clone(),
+            },
+            data_type: inner_out.data_type.clone(),
+            nullable: true,
+        };
+        Self::replace_placeholder_in_filter(&mut select.filter, sq_info.id, &replacement);
+        Self::replace_placeholder_in_filter(&mut select.having, sq_info.id, &replacement);
+        Self::replace_placeholder_in_projection(&mut select.projection, sq_info.id, &replacement);
+
+        // 6. Record the spec. The inner query is left INTACT — correlation
+        //    predicates remain in its WHERE; M1b's PushDownApplyFilter rule
+        //    extracts them into the Apply node's correlation_conjuncts.
+        select.apply_specs.push(ApplyScalarSpec {
+            subquery_id: sq_info.id,
+            clause,
+            output_column,
+            inner: resolved_sub,
+            correlation_column_ids: corr_ids,
+            need_check_max_rows: true,
+            subquery_text: sq_info.subquery.to_string(),
+        });
+        Ok(true)
     }
 
     /// Walk a Relation tree looking for a JoinRelation whose `condition`
@@ -1956,6 +2067,7 @@ impl<'a> AnalyzerContext<'a> {
             has_aggregation,
             distinct,
             repeat: None,
+            apply_specs: Vec::new(),
         };
 
         // Rewrite nested subqueries within this SELECT if any were collected
@@ -2952,6 +3064,107 @@ fn attach_aux_join(
         join_type: JoinKind::LeftOuter,
         condition,
     }));
+}
+
+// ---------------------------------------------------------------------------
+// Apply-mode helper free functions
+// ---------------------------------------------------------------------------
+
+/// Determine which clause of the SELECT contains the scalar subquery
+/// placeholder. Checks WHERE first, then HAVING, then the projection list.
+/// Returns None if the placeholder is in a JOIN-ON or any other location M1a
+/// does not yet support (caller falls back to legacy in that case).
+fn locate_scalar_placeholder_clause(
+    select: &ResolvedSelect,
+    placeholder_id: usize,
+) -> Option<crate::sql::analysis::ApplyClause> {
+    if select
+        .filter
+        .as_ref()
+        .map(|f| expr_contains_placeholder(f, placeholder_id))
+        .unwrap_or(false)
+    {
+        return Some(crate::sql::analysis::ApplyClause::Where);
+    }
+    if select
+        .having
+        .as_ref()
+        .map(|f| expr_contains_placeholder(f, placeholder_id))
+        .unwrap_or(false)
+    {
+        return Some(crate::sql::analysis::ApplyClause::Having);
+    }
+    if select
+        .projection
+        .iter()
+        .any(|p| expr_contains_placeholder(&p.expr, placeholder_id))
+    {
+        return Some(crate::sql::analysis::ApplyClause::Projection);
+    }
+    None
+}
+
+/// Collect the outer ColumnIds referenced by the correlation predicates of an
+/// analyzed inner subquery. For each CorrelationPred, walks the `outer_col`
+/// expression and collects every ColumnRef id (the outer side can be a wrapped
+/// expression like `coalesce(l.k, 2)`, not just a bare column ref). Returns a
+/// deduplicated Vec. Returns empty if the inner query is not correlated.
+fn collect_correlation_column_ids(
+    resolved_sub: &crate::sql::analysis::ResolvedQuery,
+    inner_scope: &super::scope::AnalyzerScope,
+    outer_scope: &super::scope::AnalyzerScope,
+) -> Vec<crate::sql::column_id::ColumnId> {
+    use crate::sql::analysis::QueryBody;
+    let filter = match &resolved_sub.body {
+        QueryBody::Select(sel) => match &sel.filter {
+            Some(f) => f,
+            None => return Vec::new(),
+        },
+        _ => return Vec::new(),
+    };
+    let preds = extract_correlation_predicates(filter, inner_scope, outer_scope);
+    let mut ids: Vec<crate::sql::column_id::ColumnId> = Vec::new();
+    for pred in &preds {
+        collect_column_ids_in_expr(&pred.outer_col, &mut ids);
+    }
+    let mut seen = std::collections::HashSet::new();
+    ids.retain(|id| seen.insert(*id));
+    ids
+}
+
+/// Recursively collect every ColumnRef column_id appearing in `expr`.
+fn collect_column_ids_in_expr(expr: &TypedExpr, out: &mut Vec<crate::sql::column_id::ColumnId>) {
+    match &expr.kind {
+        ExprKind::ColumnRef { column_id, .. } => {
+            out.push(*column_id);
+        }
+        ExprKind::BinaryOp { left, right, .. } => {
+            collect_column_ids_in_expr(left, out);
+            collect_column_ids_in_expr(right, out);
+        }
+        ExprKind::UnaryOp { expr: inner, .. } => {
+            collect_column_ids_in_expr(inner, out);
+        }
+        ExprKind::IsNull { expr: inner, .. } => {
+            collect_column_ids_in_expr(inner, out);
+        }
+        ExprKind::Cast { expr: inner, .. } => {
+            collect_column_ids_in_expr(inner, out);
+        }
+        ExprKind::Nested(inner) => {
+            collect_column_ids_in_expr(inner, out);
+        }
+        ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
+            for a in args {
+                collect_column_ids_in_expr(a, out);
+            }
+        }
+        // Intentionally limited to the expression kinds a correlation predicate
+        // can wrap (refs, binary ops, casts, function args). Correlation hidden
+        // inside other shapes (CASE/IN/BETWEEN) is not collected — acceptable
+        // for the EQ-comparison correlation M1 supports.
+        _ => {}
+    }
 }
 
 /// Recursively walk a TypedExpr looking for any `SubqueryPlaceholder` whose
