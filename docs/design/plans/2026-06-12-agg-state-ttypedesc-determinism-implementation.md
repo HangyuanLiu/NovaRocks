@@ -77,7 +77,7 @@ fn p5_inferred_intermediate_types_match_standalone_contract() {
 
     let cases = vec![
         ("avg", vec![DataType::Int64], DataType::Float64, Some(DataType::Utf8)),
-        ("avg", vec![DataType::Decimal128(12, 2)], DataType::Decimal128(38, 6), Some(DataType::Utf8)),
+        ("avg", vec![DataType::Decimal128(12, 2)], DataType::Decimal128(38, 8), Some(DataType::Utf8)),
         ("ndv", vec![DataType::Int64], DataType::Int64, Some(DataType::Binary)),
         ("hll_union_agg", vec![DataType::Int64], DataType::Int64, Some(DataType::Binary)),
         ("bitmap_union_count", vec![DataType::Int64], DataType::Int64, Some(DataType::Binary)),
