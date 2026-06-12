@@ -129,12 +129,6 @@ fn merge_exchange_field_type(
             merge_exchange_field(expected_field, actual_field)?,
             *expected_ordered,
         )),
-        (DataType::List(_), DataType::Struct(actual_fields)) if actual_fields.len() == 1 => {
-            Ok(DataType::Struct(actual_fields.clone()))
-        }
-        (DataType::Struct(expected_fields), DataType::List(_)) if expected_fields.len() == 1 => {
-            Ok(expected.clone())
-        }
         (DataType::Struct(expected_fields), DataType::Struct(actual_fields))
             if expected_fields.len() == actual_fields.len() =>
         {

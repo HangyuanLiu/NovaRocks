@@ -24,19 +24,11 @@ use arrow::record_batch::RecordBatch;
 use crate::exec::chunk::type_relation::{CompatibilityPolicy, relate, retag_column};
 
 pub(crate) fn is_execution_data_type_compatible(expected: &DataType, actual: &DataType) -> bool {
-    // List<->Struct<1> is the array_agg intermediate-state shape ambiguity; it is
-    // removed once pillar P5 makes that state deterministic. Until then keep it as
-    // an explicit pre-check. Everything else delegates to the one type relation
-    // (same-scale decimal / timestamp / utf8<->binary / recursive list/map/struct).
-    match (expected, actual) {
-        (DataType::List(_), DataType::Struct(actual_fields)) if actual_fields.len() == 1 => {
-            return is_execution_data_type_compatible(expected, actual_fields[0].data_type());
-        }
-        (DataType::Struct(expected_fields), DataType::List(_)) if expected_fields.len() == 1 => {
-            return is_execution_data_type_compatible(expected_fields[0].data_type(), actual);
-        }
-        _ => {}
-    }
+    // The one type relation governs execution-layer compatibility: same-scale
+    // decimal (precision may differ), timestamp, utf8<->binary, and recursion into
+    // list/largelist/map/struct. The former List<->Struct<1> arm was a StarRocks-FE
+    // intermediate-state bridge (added by #295 for 1FE3BE); NovaRocks owns its own
+    // array_agg intermediate shape, so it is no longer needed.
     relate(expected, actual, CompatibilityPolicy::SameScaleWiden).is_ok()
 }
 
