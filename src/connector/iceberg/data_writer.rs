@@ -2691,7 +2691,8 @@ mod tests {
             table.metadata().default_partition_spec().clone(),
             "file:///tmp/staging".to_string(),
             crate::common::types::UniqueId { hi: 0, lo: 0 },
-        );
+        )
+        .with_table_metadata(table.metadata().clone());
         let committed =
             crate::connector::iceberg::commit::written_file_to_iceberg_data_file(&wf, &collector)
                 .expect("committed");

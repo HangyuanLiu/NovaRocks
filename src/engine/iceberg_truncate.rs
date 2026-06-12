@@ -94,16 +94,19 @@ pub(crate) fn execute_iceberg_truncate_table(
         metadata.location(),
         uuid::Uuid::new_v4()
     );
-    let collector = Arc::new(IcebergCommitCollector::new(
-        CommitOpKind::Truncate,
-        table_ident,
-        metadata.current_snapshot().map(|s| s.snapshot_id()),
-        metadata.last_sequence_number(),
-        metadata.current_schema().clone(),
-        metadata.default_partition_spec().clone(),
-        staging_dir,
-        crate::common::types::UniqueId { hi: 0, lo: 0 },
-    ));
+    let collector = Arc::new(
+        IcebergCommitCollector::new(
+            CommitOpKind::Truncate,
+            table_ident,
+            metadata.current_snapshot().map(|s| s.snapshot_id()),
+            metadata.last_sequence_number(),
+            metadata.current_schema().clone(),
+            metadata.default_partition_spec().clone(),
+            staging_dir,
+            crate::common::types::UniqueId { hi: 0, lo: 0 },
+        )
+        .with_table_metadata(metadata.clone()),
+    );
 
     // 4. Build the OpenDAL Operator + FileIO for abort cleanup.
     let abort_cleanup = build_abort_cleanup_for_catalog_entry(&entry)?;

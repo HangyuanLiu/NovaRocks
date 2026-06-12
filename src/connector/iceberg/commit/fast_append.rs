@@ -584,16 +584,19 @@ mod tests {
             .expect("create_table");
         let table_ident = TableIdent::new(namespace, "t".to_string());
         let metadata = table.metadata();
-        let collector = Arc::new(IcebergCommitCollector::new(
-            CommitOpKind::FastAppend,
-            table_ident,
-            metadata.current_snapshot().map(|s| s.snapshot_id()),
-            metadata.last_sequence_number(),
-            metadata.current_schema().clone(),
-            metadata.default_partition_spec().clone(),
-            format!("{}/staging", metadata.location()),
-            crate::common::types::UniqueId { hi: 0, lo: 0 },
-        ));
+        let collector = Arc::new(
+            IcebergCommitCollector::new(
+                CommitOpKind::FastAppend,
+                table_ident,
+                metadata.current_snapshot().map(|s| s.snapshot_id()),
+                metadata.last_sequence_number(),
+                metadata.current_schema().clone(),
+                metadata.default_partition_spec().clone(),
+                format!("{}/staging", metadata.location()),
+                crate::common::types::UniqueId { hi: 0, lo: 0 },
+            )
+            .with_table_metadata(metadata.clone()),
+        );
         collector.inject_written_file(test_written_data_file(1));
         let file_io = table.file_io().clone();
         let abort_handle = collector.abort_log.clone();

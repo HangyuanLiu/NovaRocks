@@ -272,6 +272,7 @@ impl IcebergSinkPlan {
     ) -> Result<iceberg::spec::TableMetadata, String> {
         let partition_spec = build_staged_partition_spec(
             writer_schema,
+            self.target_partition_spec_id,
             &self.partition_source_column_names,
             &self.partition_column_names,
             &self.transform_exprs,
@@ -293,8 +294,111 @@ impl IcebergSinkPlan {
         .map_err(|e| format!("add staged iceberg partition spec failed: {e}"))?
         .build()
         .map_err(|e| format!("finalize staged iceberg table metadata failed: {e}"))
-        .map(|built| built.metadata)
+        .and_then(|built| {
+            retag_default_partition_spec_id(
+                built.metadata,
+                self.target_partition_spec_id,
+                &self.partition_column_names,
+            )
+        })
     }
+}
+
+fn retag_default_partition_spec_id(
+    metadata: iceberg::spec::TableMetadata,
+    target_spec_id: i32,
+    partition_column_names: &[String],
+) -> Result<iceberg::spec::TableMetadata, String> {
+    // iceberg-rust may assign a fresh spec id when adding a partition spec to
+    // synthetic metadata. Writer reports must carry the target table's real
+    // spec id so the commit collector can decode descriptors against target
+    // metadata.
+    let mut value = serde_json::to_value(metadata)
+        .map_err(|e| format!("serialize staged iceberg table metadata failed: {e}"))?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "staged iceberg table metadata must serialize to an object".to_string())?;
+    object.insert(
+        "default-spec-id".to_string(),
+        serde_json::Value::from(target_spec_id),
+    );
+
+    let specs = object
+        .get_mut("partition-specs")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| "staged iceberg table metadata missing partition-specs array".to_string())?;
+    let desired_idx = specs
+        .iter()
+        .position(|spec| partition_spec_names_match(spec, partition_column_names))
+        .ok_or_else(|| {
+            format!(
+                "staged iceberg table metadata missing partition spec for fields {:?}",
+                partition_column_names
+            )
+        })?;
+    let mut desired_spec = specs[desired_idx].clone();
+    let spec_object = desired_spec
+        .as_object_mut()
+        .ok_or_else(|| "staged iceberg partition spec must serialize to an object".to_string())?;
+    spec_object.insert(
+        "spec-id".to_string(),
+        serde_json::Value::from(target_spec_id),
+    );
+    *specs = vec![desired_spec];
+
+    let metadata = serde_json::from_value::<iceberg::spec::TableMetadata>(value)
+        .map_err(|e| format!("deserialize staged iceberg table metadata failed: {e}"))?;
+    let spec = metadata.partition_spec_by_id(target_spec_id).ok_or_else(|| {
+        format!(
+            "staged iceberg table metadata failed to retag default partition spec id to {target_spec_id}"
+        )
+    })?;
+    if metadata.default_partition_spec_id() != target_spec_id
+        || !partition_spec_ref_names_match(spec, partition_column_names)
+    {
+        return Err(format!(
+            "staged iceberg table metadata default partition spec does not match fields {:?}",
+            partition_column_names
+        ));
+    }
+    Ok(metadata)
+}
+
+fn partition_spec_names_match(spec: &serde_json::Value, partition_column_names: &[String]) -> bool {
+    let Some(spec_object) = spec.as_object() else {
+        return false;
+    };
+    let Some(fields) = spec_object
+        .get("fields")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return partition_column_names.is_empty();
+    };
+    if fields.len() != partition_column_names.len() {
+        return false;
+    }
+    fields
+        .iter()
+        .zip(partition_column_names.iter())
+        .all(|(field, expected)| {
+            field
+                .as_object()
+                .and_then(|object| object.get("name"))
+                .and_then(serde_json::Value::as_str)
+                == Some(expected.as_str())
+        })
+}
+
+fn partition_spec_ref_names_match(
+    spec: &iceberg::spec::PartitionSpecRef,
+    partition_column_names: &[String],
+) -> bool {
+    spec.fields().len() == partition_column_names.len()
+        && spec
+            .fields()
+            .iter()
+            .zip(partition_column_names.iter())
+            .all(|(field, expected)| field.name == *expected)
 }
 
 impl OperatorFactory for IcebergTableSinkFactory {
@@ -371,8 +475,8 @@ impl IcebergTableSinkBackend {
         prefix: &str,
     ) -> Result<(String, String), String> {
         // Preserve the caller-supplied URI scheme in the data file path. The
-        // report partition_path remains Iceberg-relative because the NovaRocks
-        // commit collector decodes partition values from path segments.
+        // report partition_path remains Iceberg-relative for layout/debug
+        // compatibility; commit partition values are descriptor-authoritative.
         let base = self.plan.data_location.trim_end_matches('/').to_string();
         let finst = state
             .fragment_instance_id()
@@ -919,6 +1023,7 @@ fn iceberg_type_from_arrow_type(data_type: &DataType) -> Result<iceberg::spec::T
 
 fn build_staged_partition_spec(
     schema: &iceberg::spec::Schema,
+    partition_spec_id: i32,
     source_column_names: &[String],
     partition_column_names: &[String],
     transform_exprs: &[String],
@@ -934,7 +1039,8 @@ fn build_staged_partition_spec(
         ));
     }
 
-    let mut builder = iceberg::spec::UnboundPartitionSpec::builder().with_spec_id(0);
+    let mut builder =
+        iceberg::spec::UnboundPartitionSpec::builder().with_spec_id(partition_spec_id);
     for ((source_name, partition_name), transform_expr) in source_column_names
         .iter()
         .zip(partition_column_names.iter())
@@ -2279,9 +2385,12 @@ mod tests {
         let target_metadata = plan
             .build_target_table_metadata(&target_writer_schema)
             .expect("target metadata");
+        assert_eq!(target_metadata.default_partition_spec_id(), 7);
         let decoded = crate::connector::iceberg::write_descriptor::decode_partition_descriptor(
             data_file.partition_values_descriptor.clone(),
-            target_metadata.default_partition_spec_id(),
+            data_file
+                .partition_spec_id
+                .expect("writer report partition spec id"),
             &target_metadata,
         )
         .expect("decode descriptor");
@@ -2494,9 +2603,12 @@ mod tests {
             .plan
             .build_target_table_metadata(&target_writer_schema)
             .expect("target metadata");
+        assert_eq!(target_metadata.default_partition_spec_id(), 7);
         let decoded = crate::connector::iceberg::write_descriptor::decode_partition_descriptor(
             data_file.partition_values_descriptor.clone(),
-            target_metadata.default_partition_spec_id(),
+            data_file
+                .partition_spec_id
+                .expect("writer report partition spec id"),
             &target_metadata,
         )
         .expect("decode position-delete descriptor");

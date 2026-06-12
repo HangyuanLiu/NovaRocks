@@ -255,16 +255,19 @@ fn execute_mor_update(
         metadata.location(),
         uuid::Uuid::new_v4()
     );
-    let collector = Arc::new(IcebergCommitCollector::new(
-        CommitOpKind::RowDeltaDv,
-        table_ident,
-        read_snapshot_id,
-        metadata.last_sequence_number(),
-        metadata.current_schema().clone(),
-        metadata.default_partition_spec().clone(),
-        staging_dir,
-        crate::common::types::UniqueId { hi: 0, lo: 0 },
-    ));
+    let collector = Arc::new(
+        IcebergCommitCollector::new(
+            CommitOpKind::RowDeltaDv,
+            table_ident,
+            read_snapshot_id,
+            metadata.last_sequence_number(),
+            metadata.current_schema().clone(),
+            metadata.default_partition_spec().clone(),
+            staging_dir,
+            crate::common::types::UniqueId { hi: 0, lo: 0 },
+        )
+        .with_table_metadata(metadata.clone()),
+    );
     run_mutation_write_transaction(
         state,
         target,
@@ -769,16 +772,19 @@ fn execute_cow_update(
         metadata.location(),
         uuid::Uuid::new_v4()
     );
-    let collector = Arc::new(IcebergCommitCollector::new(
-        CommitOpKind::CowUpdate,
-        table_ident,
-        base_snapshot_id,
-        metadata.last_sequence_number(),
-        metadata.current_schema().clone(),
-        metadata.default_partition_spec().clone(),
-        staging_dir,
-        crate::common::types::UniqueId { hi: 0, lo: 0 },
-    ));
+    let collector = Arc::new(
+        IcebergCommitCollector::new(
+            CommitOpKind::CowUpdate,
+            table_ident,
+            base_snapshot_id,
+            metadata.last_sequence_number(),
+            metadata.current_schema().clone(),
+            metadata.default_partition_spec().clone(),
+            staging_dir,
+            crate::common::types::UniqueId { hi: 0, lo: 0 },
+        )
+        .with_table_metadata(metadata.clone()),
+    );
     run_mutation_write_transaction(
         state,
         target,
@@ -2008,16 +2014,19 @@ fn execute_merge_matched_delete(
         metadata.location(),
         uuid::Uuid::new_v4()
     );
-    let collector = Arc::new(IcebergCommitCollector::new(
-        CommitOpKind::RowDeltaDv,
-        table_ident,
-        current_snapshot_id,
-        metadata.last_sequence_number(),
-        metadata.current_schema().clone(),
-        metadata.default_partition_spec().clone(),
-        staging_dir,
-        crate::common::types::UniqueId { hi: 0, lo: 0 },
-    ));
+    let collector = Arc::new(
+        IcebergCommitCollector::new(
+            CommitOpKind::RowDeltaDv,
+            table_ident,
+            current_snapshot_id,
+            metadata.last_sequence_number(),
+            metadata.current_schema().clone(),
+            metadata.default_partition_spec().clone(),
+            staging_dir,
+            crate::common::types::UniqueId { hi: 0, lo: 0 },
+        )
+        .with_table_metadata(metadata.clone()),
+    );
     run_mutation_write_transaction(
         state,
         target,
@@ -2050,16 +2059,19 @@ fn execute_merge_unmatched_insert(
         metadata.location(),
         uuid::Uuid::new_v4()
     );
-    let collector = Arc::new(IcebergCommitCollector::new(
-        CommitOpKind::FastAppend,
-        table_ident,
-        current_snapshot_id,
-        metadata.last_sequence_number(),
-        metadata.current_schema().clone(),
-        metadata.default_partition_spec().clone(),
-        staging_dir,
-        crate::common::types::UniqueId { hi: 0, lo: 0 },
-    ));
+    let collector = Arc::new(
+        IcebergCommitCollector::new(
+            CommitOpKind::FastAppend,
+            table_ident,
+            current_snapshot_id,
+            metadata.last_sequence_number(),
+            metadata.current_schema().clone(),
+            metadata.default_partition_spec().clone(),
+            staging_dir,
+            crate::common::types::UniqueId { hi: 0, lo: 0 },
+        )
+        .with_table_metadata(metadata.clone()),
+    );
     run_mutation_write_transaction(
         state,
         target,

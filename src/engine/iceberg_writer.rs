@@ -192,16 +192,19 @@ fn execute_iceberg_insert_distributed(
         metadata.location(),
         uuid::Uuid::new_v4()
     );
-    let collector = Arc::new(IcebergCommitCollector::new(
-        commit_op_kind,
-        table_ident,
-        base_snapshot_id,
-        base_sequence_number,
-        current_schema,
-        default_partition_spec,
-        staging_dir,
-        crate::common::types::UniqueId { hi: 0, lo: 0 },
-    ));
+    let collector = Arc::new(
+        IcebergCommitCollector::new(
+            commit_op_kind,
+            table_ident,
+            base_snapshot_id,
+            base_sequence_number,
+            current_schema,
+            default_partition_spec,
+            staging_dir,
+            crate::common::types::UniqueId { hi: 0, lo: 0 },
+        )
+        .with_table_metadata(metadata.clone()),
+    );
 
     let abort_cleanup = build_abort_cleanup_for_catalog_entry(entry)?;
     let commit_executor = IcebergWriteCommitExecutor {

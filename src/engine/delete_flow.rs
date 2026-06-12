@@ -198,16 +198,19 @@ pub(crate) fn execute_delete_statement(
 
     match delete_strategy {
         IcebergSqlDeleteStrategy::PositionDeleteFiles => {
-            let collector = Arc::new(IcebergCommitCollector::new(
-                CommitOpKind::RowDelta,
-                table_ident,
-                base_snapshot_id,
-                metadata.last_sequence_number(),
-                metadata.current_schema().clone(),
-                metadata.default_partition_spec().clone(),
-                staging_dir.clone(),
-                crate::common::types::UniqueId { hi: 0, lo: 0 },
-            ));
+            let collector = Arc::new(
+                IcebergCommitCollector::new(
+                    CommitOpKind::RowDelta,
+                    table_ident,
+                    base_snapshot_id,
+                    metadata.last_sequence_number(),
+                    metadata.current_schema().clone(),
+                    metadata.default_partition_spec().clone(),
+                    staging_dir.clone(),
+                    crate::common::types::UniqueId { hi: 0, lo: 0 },
+                )
+                .with_table_metadata(metadata.clone()),
+            );
             run_delete_write_transaction(
                 state,
                 &target,
@@ -222,16 +225,19 @@ pub(crate) fn execute_delete_statement(
             )?;
         }
         IcebergSqlDeleteStrategy::DeletionVectors => {
-            let collector = Arc::new(IcebergCommitCollector::new(
-                CommitOpKind::RowDeltaDv,
-                table_ident,
-                base_snapshot_id,
-                metadata.last_sequence_number(),
-                metadata.current_schema().clone(),
-                metadata.default_partition_spec().clone(),
-                staging_dir.clone(),
-                crate::common::types::UniqueId { hi: 0, lo: 0 },
-            ));
+            let collector = Arc::new(
+                IcebergCommitCollector::new(
+                    CommitOpKind::RowDeltaDv,
+                    table_ident,
+                    base_snapshot_id,
+                    metadata.last_sequence_number(),
+                    metadata.current_schema().clone(),
+                    metadata.default_partition_spec().clone(),
+                    staging_dir.clone(),
+                    crate::common::types::UniqueId { hi: 0, lo: 0 },
+                )
+                .with_table_metadata(metadata.clone()),
+            );
             run_delete_write_transaction(
                 state,
                 &target,

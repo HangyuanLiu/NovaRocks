@@ -112,16 +112,19 @@ pub(crate) fn execute_add_equality_delete_statement(
     let current_schema = metadata.current_schema().clone();
     let default_partition_spec = metadata.default_partition_spec().clone();
 
-    let collector = Arc::new(IcebergCommitCollector::new(
-        CommitOpKind::RowDelta,
-        table_ident,
-        current_snapshot_id,
-        last_sequence_number,
-        current_schema,
-        default_partition_spec,
-        staging_dir,
-        crate::common::types::UniqueId { hi: 0, lo: 0 },
-    ));
+    let collector = Arc::new(
+        IcebergCommitCollector::new(
+            CommitOpKind::RowDelta,
+            table_ident,
+            current_snapshot_id,
+            last_sequence_number,
+            current_schema,
+            default_partition_spec,
+            staging_dir,
+            crate::common::types::UniqueId { hi: 0, lo: 0 },
+        )
+        .with_table_metadata(metadata.clone()),
+    );
     let abort_cleanup =
         crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
     let commit_executor = IcebergWriteCommitExecutor {

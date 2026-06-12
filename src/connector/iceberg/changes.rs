@@ -3003,16 +3003,19 @@ mod tests {
 
         let metadata = loaded.table.metadata();
         let table_ident = iceberg::TableIdent::from_strs(["ns", "orders"]).expect("ident");
-        let collector = Arc::new(IcebergCommitCollector::new(
-            CommitOpKind::Overwrite,
-            table_ident,
-            metadata.current_snapshot().map(|s| s.snapshot_id()),
-            metadata.last_sequence_number(),
-            metadata.current_schema().clone(),
-            metadata.default_partition_spec().clone(),
-            format!("{}/data/_staging/test-overwrite", metadata.location()),
-            crate::common::types::UniqueId { hi: 0, lo: 0 },
-        ));
+        let collector = Arc::new(
+            IcebergCommitCollector::new(
+                CommitOpKind::Overwrite,
+                table_ident,
+                metadata.current_snapshot().map(|s| s.snapshot_id()),
+                metadata.last_sequence_number(),
+                metadata.current_schema().clone(),
+                metadata.default_partition_spec().clone(),
+                format!("{}/data/_staging/test-overwrite", metadata.location()),
+                crate::common::types::UniqueId { hi: 0, lo: 0 },
+            )
+            .with_table_metadata(metadata.clone()),
+        );
         for df in data_files {
             collector.inject_written_file(
                 crate::engine::iceberg_writer::data_file_to_written_file(
