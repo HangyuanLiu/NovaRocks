@@ -69,7 +69,7 @@ pub(crate) struct IcebergMvRefreshContext {
     pub base_catalog_entries: BTreeMap<String, IcebergCatalogEntry>,
     pub iceberg_catalog: Arc<dyn iceberg::Catalog>,
     pub target_table: iceberg::table::Table,
-    pub affected_partitions: crate::engine::mv::partition::AffectedMvPartitions,
+    pub affected_partitions: crate::engine::mv::partition::AffectedTargetPartitions,
 }
 
 /// Debug-only view of an `IcebergMvRewriteContext`. No `Display` impl — log
@@ -594,7 +594,7 @@ impl IcebergMvRefreshContext {
             target_entry,
             iceberg_catalog,
             target_table,
-            crate::engine::mv::partition::AffectedMvPartitions::unknown(
+            crate::engine::mv::partition::AffectedTargetPartitions::not_derived(
                 "refresh context was constructed without planned affected partitions",
             ),
         )
@@ -614,7 +614,7 @@ impl IcebergMvRefreshContext {
         target_entry: Arc<IcebergCatalogEntry>,
         iceberg_catalog: Arc<dyn iceberg::Catalog>,
         target_table: iceberg::table::Table,
-        affected_partitions: crate::engine::mv::partition::AffectedMvPartitions,
+        affected_partitions: crate::engine::mv::partition::AffectedTargetPartitions,
     ) -> Result<Self, String> {
         let metadata = target_table.metadata();
         let target_snapshot_id = metadata.current_snapshot().map(|s| s.snapshot_id());
@@ -821,16 +821,15 @@ impl IcebergMvRefreshContext {
             }
             crate::sql::catalog::IcebergMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired => {
                 match &self.affected_partitions {
-                    crate::engine::mv::partition::AffectedMvPartitions::Unpartitioned => Ok(None),
-                    crate::engine::mv::partition::AffectedMvPartitions::Known {
-                        new_partitions,
-                        old_partitions,
-                    } => {
-                        let mut allow_list = new_partitions.clone();
-                        allow_list.extend(old_partitions.iter().cloned());
-                        Ok(Some(allow_list))
+                    crate::engine::mv::partition::AffectedTargetPartitions::Unpartitioned => {
+                        Ok(None)
                     }
-                    crate::engine::mv::partition::AffectedMvPartitions::Unknown { reason } => {
+                    crate::engine::mv::partition::AffectedTargetPartitions::Known {
+                        partitions,
+                    } => Ok(Some(partitions.clone())),
+                    crate::engine::mv::partition::AffectedTargetPartitions::NotDerived {
+                        reason,
+                    } => {
                         tracing::warn!(
                             target = %scan.fqn(),
                             reason = %reason,
@@ -2080,9 +2079,8 @@ mod tests {
             base_catalog_entries,
             iceberg_catalog,
             target_table,
-            affected_partitions: crate::engine::mv::partition::AffectedMvPartitions::unknown(
-                "test context",
-            ),
+            affected_partitions:
+                crate::engine::mv::partition::AffectedTargetPartitions::not_derived("test context"),
         };
         let table = IcebergTableInfo {
             catalog: "ice".to_string(),
@@ -2216,9 +2214,8 @@ mod tests {
             base_catalog_entries: BTreeMap::new(),
             iceberg_catalog,
             target_table,
-            affected_partitions: crate::engine::mv::partition::AffectedMvPartitions::unknown(
-                "test context",
-            ),
+            affected_partitions:
+                crate::engine::mv::partition::AffectedTargetPartitions::not_derived("test context"),
         };
         let scan = IcebergMvTargetStateScan {
             catalog: "tgt".to_string(),
@@ -2250,10 +2247,10 @@ mod tests {
 
         let new_key = crate::engine::mv::partition::MvPartitionKey::new(1, Vec::new());
         let old_key = crate::engine::mv::partition::MvPartitionKey::new(2, Vec::new());
-        ctx.affected_partitions = crate::engine::mv::partition::AffectedMvPartitions::known(
-            [new_key.clone()],
-            [old_key.clone()],
-        );
+        ctx.affected_partitions = crate::engine::mv::partition::AffectedTargetPartitions::known([
+            new_key.clone(),
+            old_key.clone(),
+        ]);
         let allow_list = ctx
             .target_state_partition_allow_list(&scan)
             .expect("known affected partitions should satisfy partition contract")

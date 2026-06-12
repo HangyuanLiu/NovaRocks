@@ -95,6 +95,16 @@ impl TargetIdentity {
 // RefreshCapabilities — derived from the persisted MvSchemaContract
 // ---------------------------------------------------------------------------
 
+/// What a NotDerivable partition derivation outcome means for the refresh
+/// (umbrella spec §4.3). v1 (D5): every shape is BestEffort — matching the
+/// pre-existing warn + unpruned-scan behavior. `Required` is defined for
+/// P2/P3, where partitioned aggregates may be tightened to fail fast.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PartitionPruningPolicy {
+    Required,
+    BestEffort,
+}
+
 /// A compact row-identity discriminant used at refresh time. Unlike
 /// `TargetIdentity`, which carries full query-analysis payload (group-key
 /// names, nested join children), this enum only retains the top-level
@@ -140,6 +150,8 @@ pub(crate) struct RefreshCapabilities {
     /// The value type of the apply-key column, used to drive the merge-sink
     /// apply-key reader.
     pub(crate) apply_key_value_type: ApplyKeyValueType,
+    /// Policy applied when partition derivation reports NotDerivable.
+    pub(crate) partition_pruning: PartitionPruningPolicy,
 }
 
 impl RefreshCapabilities {
@@ -245,6 +257,7 @@ pub(crate) fn from_schema_contract(c: &MvSchemaContract) -> Result<RefreshCapabi
         identity,
         apply_key_column,
         apply_key_value_type,
+        partition_pruning: PartitionPruningPolicy::BestEffort,
     })
 }
 
@@ -2862,6 +2875,26 @@ mod tests {
         );
         assert_eq!(caps.apply_key_column, GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME);
         assert_eq!(caps.apply_key_value_type, ApplyKeyValueType::BranchUtf8);
+    }
+
+    /// D5: PartitionPruningPolicy is BestEffort for every v1 shape. Required is
+    /// defined but not assigned to any shape until P2/P3.
+    #[test]
+    fn partition_pruning_policy_is_best_effort_for_every_shape_in_v1() {
+        // D5: Required exists but is not assigned to any shape yet; tightening
+        // partitioned aggregates is deferred to P2/P3.
+        let c = MvSchemaContract {
+            contract_version: 1,
+            base: parity_base("ice.db.orders", "uuid-orders"),
+            bases: vec![],
+            output: parity_output(),
+            join: None,
+            aggregate: None,
+            branch: None,
+            target: parity_target(HIDDEN_APPLY_KEY_COLUMN_NAME, ApplyKeySource::BaseRowId),
+        };
+        let caps = RefreshCapabilities::from_schema_contract(&c).unwrap();
+        assert_eq!(caps.partition_pruning, PartitionPruningPolicy::BestEffort);
     }
 
     /// Unsupported contract shape (join + branch) must return an error.

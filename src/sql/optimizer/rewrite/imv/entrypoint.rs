@@ -89,6 +89,7 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
+    use crate::sql::optimizer::rewrite::imv::annotation::ImvPartitionAnnotation;
     use crate::sql::optimizer::rewrite::imv::marker::{
         ImvVersionNode, ImvVersionRef, plan_contains_imv_marker,
     };
@@ -232,7 +233,9 @@ mod tests {
             .collect()
     }
 
-    fn aggregate_mv_ctx() -> Arc<IcebergMvRewriteContext> {
+    fn aggregate_mv_ctx_customized(
+        mutate: impl FnOnce(&mut crate::meta::repository::mv_contract::MvSchemaContract),
+    ) -> Arc<IcebergMvRewriteContext> {
         let mut mv_def = make_mv_definition();
         let mut contract = make_schema_contract();
         contract.target.hidden_apply_key.column_name = "__row_id__".to_string();
@@ -258,6 +261,10 @@ mod tests {
                 },
             ],
         });
+        // Let the caller mutate the fully-built contract (e.g. attach a
+        // partition spec or perturb output lineage) before it is cloned into
+        // the mv definition and wrapped into the rewrite context.
+        mutate(&mut contract);
         mv_def.schema_contract = Some(contract.clone());
         let target_schema = Arc::new(
             Schema::builder()
@@ -311,6 +318,28 @@ mod tests {
             )
             .expect("aggregate mv context must build"),
         )
+    }
+
+    fn aggregate_mv_ctx() -> Arc<IcebergMvRewriteContext> {
+        aggregate_mv_ctx_customized(|_| {})
+    }
+
+    fn partitioned_aggregate_mv_ctx() -> Arc<IcebergMvRewriteContext> {
+        use crate::meta::repository::mv_contract::{
+            MvPartitionContract, MvPartitionFieldContract, MvPartitionTransformContract,
+        };
+        aggregate_mv_ctx_customized(|contract| {
+            contract.target.partition = Some(MvPartitionContract {
+                target_spec_id: 7,
+                fields: vec![MvPartitionFieldContract {
+                    partition_field_id: 1000,
+                    partition_field_name: "k".to_string(),
+                    source_target_field_id: 100,
+                    source_column_name: "k".to_string(),
+                    transform: MvPartitionTransformContract::Identity,
+                }],
+            });
+        })
     }
 
     fn aggregate_scan_plan() -> LogicalPlan {
@@ -827,7 +856,7 @@ mod tests {
         })
         .expect("unknown disabled rule must not break the pipeline");
 
-        assert_eq!(outcome.trace.stage_names().len(), 11);
+        assert_eq!(outcome.trace.stage_names().len(), 12);
     }
 
     // ── Task-5 helpers ──────────────────────────────────────────────────────
@@ -974,6 +1003,7 @@ mod tests {
                 "imv-scan-binding",
                 "imv-action-propagation",
                 "imv-apply-key",
+                "imv-partition-derivation",
                 "imv-marker-cleanup",
                 "imv-validation",
             ]
@@ -1232,6 +1262,118 @@ mod tests {
                 "branch Project output count must match Union output count"
             );
         }
+    }
+
+    #[test]
+    fn imv_pipeline_annotates_partition_spec_for_partitioned_aggregate() {
+        let outcome = run_imv_rewrite(ImvRewriteInput {
+            plan: aggregate_plan(),
+            mv_ctx: partitioned_aggregate_mv_ctx(),
+            disabled_rules: Vec::new(),
+            deadline: None,
+            next_column_id: 100,
+        })
+        .expect("aggregate IMV pipeline must rewrite and validate");
+
+        let Some(ImvPartitionAnnotation::Derivable { specs }) = &outcome.annotation.partition
+        else {
+            panic!(
+                "expected Derivable partition annotation, got {:?}",
+                outcome.annotation.partition
+            );
+        };
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].target_spec_id, 7);
+        assert_eq!(specs[0].fields.len(), 1);
+        assert_eq!(specs[0].fields[0].partition_field_name, "k");
+        assert_eq!(specs[0].fields[0].source_target_field_id, 100);
+        assert_eq!(specs[0].fields[0].output_index, 0);
+        assert_eq!(
+            specs[0].fields[0].transform,
+            iceberg::spec::Transform::Identity
+        );
+    }
+
+    #[test]
+    fn imv_pipeline_annotates_unpartitioned_for_plain_aggregate() {
+        let outcome = run_imv_rewrite(ImvRewriteInput {
+            plan: aggregate_plan(),
+            mv_ctx: aggregate_mv_ctx(),
+            disabled_rules: Vec::new(),
+            deadline: None,
+            next_column_id: 100,
+        })
+        .expect("aggregate IMV pipeline must rewrite and validate");
+        assert_eq!(
+            outcome.annotation.partition,
+            Some(ImvPartitionAnnotation::Unpartitioned)
+        );
+    }
+
+    #[test]
+    fn imv_pipeline_annotates_not_derivable_for_non_pure_partition_lineage() {
+        use crate::meta::repository::mv_contract::{
+            ExpressionKind, MvPartitionContract, MvPartitionFieldContract,
+            MvPartitionTransformContract,
+        };
+        let ctx = aggregate_mv_ctx_customized(|contract| {
+            contract.target.partition = Some(MvPartitionContract {
+                target_spec_id: 7,
+                fields: vec![MvPartitionFieldContract {
+                    partition_field_id: 1000,
+                    partition_field_name: "k".to_string(),
+                    source_target_field_id: 100,
+                    source_column_name: "k".to_string(),
+                    transform: MvPartitionTransformContract::Identity,
+                }],
+            });
+            contract.output.columns[0].expression.kind = ExpressionKind::Func;
+            contract.output.columns[0]
+                .expression
+                .referenced_base_field_ids = vec![1, 2];
+        });
+        let outcome = run_imv_rewrite(ImvRewriteInput {
+            plan: aggregate_plan(),
+            mv_ctx: ctx,
+            disabled_rules: Vec::new(),
+            deadline: None,
+            next_column_id: 100,
+        })
+        .expect("NotDerivable must not fail the rewrite");
+        let Some(ImvPartitionAnnotation::NotDerivable { reason }) = &outcome.annotation.partition
+        else {
+            panic!(
+                "expected NotDerivable, got {:?}",
+                outcome.annotation.partition
+            );
+        };
+        assert!(reason.contains("k"), "reason must name the field: {reason}");
+    }
+
+    #[test]
+    fn imv_pipeline_leaves_partition_annotation_unset_for_projection_filter() {
+        // Reuses the existing project-over-scan shape: no AggregateStateMerge,
+        // so the rule never matches and the slot stays None (P1 scope).
+        let scan = iceberg_scan_plan();
+        let project = LogicalPlan::Project(ProjectNode {
+            input: Box::new(scan),
+            items: vec![ProjectItem {
+                expr: column_ref(1, "k", DataType::Int64, false),
+                output_name: "k".to_string(),
+                output_column_id: ColumnId(1),
+            }],
+            output_qualifier: None,
+            required_output_columns: None,
+        });
+        let outcome = run_imv_rewrite(ImvRewriteInput {
+            plan: project,
+            mv_ctx: dummy_mv_ctx(),
+            disabled_rules: Vec::new(),
+            deadline: None,
+            next_column_id: 100,
+        })
+        .expect("projection/filter rewrite must succeed");
+        assert!(outcome.annotation.partition.is_none());
     }
 
     #[test]
