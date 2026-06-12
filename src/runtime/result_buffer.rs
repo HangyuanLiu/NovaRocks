@@ -21,6 +21,12 @@ use std::time::Duration;
 use crate::common::types::{FetchResult, UniqueId};
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum ResultBufferMode {
+    Legacy,
+    Typed,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum FetchErrorKind {
     NotFound,
@@ -37,6 +43,8 @@ pub(crate) struct FetchError {
 #[derive(Debug)]
 struct BufferControlBlock {
     queue: VecDeque<TrackedFetchResult>,
+    typed_queue: VecDeque<TrackedTypedFetchResult>,
+    mode: Option<ResultBufferMode>,
     closed_ok: bool,
     eos_sent: bool,
     status_error: Option<String>,
@@ -51,6 +59,8 @@ impl BufferControlBlock {
     fn new() -> Self {
         Self {
             queue: VecDeque::new(),
+            typed_queue: VecDeque::new(),
+            mode: None,
             closed_ok: false,
             eos_sent: false,
             status_error: None,
@@ -75,11 +85,49 @@ impl BufferControlBlock {
         }
     }
 
+    fn make_typed_eos_result(&mut self) -> TypedFetchResult {
+        let seq = self.next_packet_seq;
+        self.next_packet_seq += 1;
+        TypedFetchResult {
+            packet_seq: seq,
+            eos: true,
+            payload: Vec::new(),
+        }
+    }
+
     fn pop_next(&mut self) -> Option<FetchResult> {
         let out = self.queue.pop_front()?;
         let seq = self.next_packet_seq;
         self.next_packet_seq += 1;
         Some(out.into_result(seq))
+    }
+
+    fn pop_next_typed(&mut self) -> Option<TypedFetchResult> {
+        let out = self.typed_queue.pop_front()?;
+        let seq = self.next_packet_seq;
+        self.next_packet_seq += 1;
+        Some(out.into_result(seq))
+    }
+
+    fn set_mode(&mut self, mode: ResultBufferMode) -> Result<(), String> {
+        match self.mode {
+            None => {
+                self.mode = Some(mode);
+                Ok(())
+            }
+            Some(existing) if existing == mode => Ok(()),
+            Some(existing) => Err(format!(
+                "result buffer mode mismatch: existing={existing:?} requested={mode:?}"
+            )),
+        }
+    }
+
+    fn fail_mode_mismatch(&mut self, mode: ResultBufferMode) {
+        if let Err(err) = self.set_mode(mode) {
+            self.status_error = Some(err);
+            self.queue.clear();
+            self.typed_queue.clear();
+        }
     }
 }
 
@@ -131,6 +179,52 @@ fn fetch_result_bytes(result: &FetchResult) -> usize {
     total
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct TypedFetchResult {
+    pub(crate) packet_seq: i64,
+    pub(crate) eos: bool,
+    pub(crate) payload: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct TrackedTypedFetchResult {
+    result: TypedFetchResult,
+    accounting: Option<TrackedBytes>,
+}
+
+impl TrackedTypedFetchResult {
+    fn new(result: TypedFetchResult, tracker: Option<&Arc<MemTracker>>) -> Self {
+        let accounting = tracker.map(|tracker| {
+            let bytes = typed_fetch_result_bytes(&result);
+            TrackedBytes::new(bytes, Arc::clone(tracker))
+        });
+        Self { result, accounting }
+    }
+
+    fn set_mem_tracker(&mut self, tracker: Arc<MemTracker>) {
+        let bytes = typed_fetch_result_bytes(&self.result);
+        match self.accounting.as_mut() {
+            Some(accounting) => accounting.transfer_to(Arc::clone(&tracker)),
+            None => {
+                self.accounting = Some(TrackedBytes::new(bytes, tracker));
+            }
+        }
+    }
+
+    fn into_result(self, seq: i64) -> TypedFetchResult {
+        let TrackedTypedFetchResult {
+            mut result,
+            accounting: _accounting,
+        } = self;
+        result.packet_seq = seq;
+        result
+    }
+}
+
+fn typed_fetch_result_bytes(result: &TypedFetchResult) -> usize {
+    result.payload.capacity().max(result.payload.len())
+}
+
 struct ResultCtx {
     mu: Mutex<HashMap<UniqueId, BufferControlBlock>>,
     cvar: Condvar,
@@ -170,10 +264,34 @@ pub(crate) fn insert(finst_id: UniqueId, result: FetchResult) {
         let block = guard
             .entry(finst_id)
             .or_insert_with(BufferControlBlock::new);
-        let tracked = TrackedFetchResult::new(result, block.mem_tracker.as_ref());
-        block.queue.push_back(tracked);
+        if block.set_mode(ResultBufferMode::Legacy).is_ok() {
+            let tracked = TrackedFetchResult::new(result, block.mem_tracker.as_ref());
+            block.queue.push_back(tracked);
+        } else {
+            block.fail_mode_mismatch(ResultBufferMode::Legacy);
+        }
     }
     notify_fetch_ready(finst_id);
+}
+
+pub(crate) fn insert_typed(finst_id: UniqueId, payload: Vec<u8>) -> Result<(), String> {
+    let c = ctx();
+    {
+        let mut guard = c.mu.lock().expect("ctx lock");
+        let block = guard
+            .entry(finst_id)
+            .or_insert_with(BufferControlBlock::new);
+        block.set_mode(ResultBufferMode::Typed)?;
+        let result = TypedFetchResult {
+            packet_seq: 0,
+            eos: false,
+            payload,
+        };
+        let tracked = TrackedTypedFetchResult::new(result, block.mem_tracker.as_ref());
+        block.typed_queue.push_back(tracked);
+    }
+    notify_fetch_ready(finst_id);
+    Ok(())
 }
 
 pub(crate) fn close_ok(finst_id: UniqueId) {
@@ -197,6 +315,7 @@ pub(crate) fn close_error(finst_id: UniqueId, message: String) {
             .or_insert_with(BufferControlBlock::new);
         block.status_error = Some(message);
         block.queue.clear();
+        block.typed_queue.clear();
     }
     notify_fetch_ready(finst_id);
 }
@@ -213,6 +332,7 @@ pub(crate) fn cancel(finst_id: UniqueId) {
             block.cancel_message = Some("Cancelled".to_string());
         }
         block.queue.clear();
+        block.typed_queue.clear();
     }
     notify_fetch_ready(finst_id);
 }
@@ -220,9 +340,19 @@ pub(crate) fn cancel(finst_id: UniqueId) {
 pub(crate) fn create_sender(finst_id: UniqueId) {
     let c = ctx();
     let mut guard = c.mu.lock().expect("ctx lock");
-    guard
+    let block = guard
         .entry(finst_id)
         .or_insert_with(BufferControlBlock::new);
+    block.fail_mode_mismatch(ResultBufferMode::Legacy);
+}
+
+pub(crate) fn create_typed_sender(finst_id: UniqueId) {
+    let c = ctx();
+    let mut guard = c.mu.lock().expect("ctx lock");
+    let block = guard
+        .entry(finst_id)
+        .or_insert_with(BufferControlBlock::new);
+    block.fail_mode_mismatch(ResultBufferMode::Typed);
 }
 
 pub(crate) fn set_mem_tracker(finst_id: UniqueId, tracker: Arc<MemTracker>) {
@@ -235,6 +365,9 @@ pub(crate) fn set_mem_tracker(finst_id: UniqueId, tracker: Arc<MemTracker>) {
     for result in block.queue.iter_mut() {
         result.set_mem_tracker(Arc::clone(&tracker));
     }
+    for result in block.typed_queue.iter_mut() {
+        result.set_mem_tracker(Arc::clone(&tracker));
+    }
 }
 
 pub(crate) fn set_eos_template(finst_id: UniqueId, template: crate::data::TResultBatch) {
@@ -243,12 +376,20 @@ pub(crate) fn set_eos_template(finst_id: UniqueId, template: crate::data::TResul
     let block = guard
         .entry(finst_id)
         .or_insert_with(BufferControlBlock::new);
+    block.fail_mode_mismatch(ResultBufferMode::Legacy);
     block.eos_template = Some(template);
 }
 
 #[derive(Debug)]
 pub(crate) enum TryFetchResult {
     Ready(FetchResult),
+    NotReady,
+    Error(FetchError),
+}
+
+#[derive(Debug)]
+pub(crate) enum TryFetchTypedResult {
+    Ready(TypedFetchResult),
     NotReady,
     Error(FetchError),
 }
@@ -289,6 +430,12 @@ fn try_fetch_inner(
             message: msg,
         });
     }
+    if block.mode == Some(ResultBufferMode::Typed) {
+        return TryFetchResult::Error(FetchError {
+            kind: FetchErrorKind::Failed,
+            message: "typed result buffer cannot be fetched as legacy TResultBatch".to_string(),
+        });
+    }
     if let Some(result) = block.pop_next() {
         return TryFetchResult::Ready(result);
     }
@@ -304,6 +451,59 @@ fn try_fetch_inner(
         });
     }
     TryFetchResult::NotReady
+}
+
+fn try_fetch_typed_inner(
+    guard: &mut HashMap<UniqueId, BufferControlBlock>,
+    finst_id: UniqueId,
+) -> TryFetchTypedResult {
+    let Some(block) = guard.get_mut(&finst_id) else {
+        return TryFetchTypedResult::Error(FetchError {
+            kind: FetchErrorKind::NotFound,
+            message: "no result for this query".to_string(),
+        });
+    };
+
+    if block.cancelled {
+        let msg = block
+            .cancel_message
+            .clone()
+            .unwrap_or_else(|| "Cancelled".to_string());
+        guard.remove(&finst_id);
+        return TryFetchTypedResult::Error(FetchError {
+            kind: FetchErrorKind::Cancelled,
+            message: msg,
+        });
+    }
+    if let Some(msg) = block.status_error.as_ref() {
+        let msg = msg.clone();
+        guard.remove(&finst_id);
+        return TryFetchTypedResult::Error(FetchError {
+            kind: FetchErrorKind::Failed,
+            message: msg,
+        });
+    }
+    if block.mode == Some(ResultBufferMode::Legacy) {
+        return TryFetchTypedResult::Error(FetchError {
+            kind: FetchErrorKind::Failed,
+            message: "legacy result buffer cannot be fetched as typed Arrow IPC".to_string(),
+        });
+    }
+    if let Some(result) = block.pop_next_typed() {
+        return TryFetchTypedResult::Ready(result);
+    }
+    if block.closed_ok && !block.eos_sent {
+        block.eos_sent = true;
+        return TryFetchTypedResult::Ready(block.make_typed_eos_result());
+    }
+    if block.closed_ok && block.eos_sent {
+        guard.remove(&finst_id);
+        return TryFetchTypedResult::Error(FetchError {
+            kind: FetchErrorKind::NotFound,
+            message: "result stream already reached eos".to_string(),
+        });
+    }
+    TryFetchTypedResult::NotReady
 }
 
 pub(crate) fn try_fetch(finst_id: UniqueId) -> TryFetchResult {
@@ -357,6 +557,40 @@ pub(crate) fn wait_fetch(finst_id: UniqueId, max_wait_ms: i64) -> TryFetchResult
 
         if std::time::Instant::now() >= deadline {
             return TryFetchResult::NotReady;
+        }
+    }
+}
+
+pub(crate) fn wait_fetch_typed(finst_id: UniqueId, max_wait_ms: i64) -> TryFetchTypedResult {
+    let c = ctx();
+    let mut guard = c.mu.lock().expect("ctx lock");
+
+    let initial = try_fetch_typed_inner(&mut guard, finst_id);
+    if !matches!(initial, TryFetchTypedResult::NotReady) || max_wait_ms <= 0 {
+        return initial;
+    }
+
+    let timeout = Duration::from_millis(max_wait_ms as u64);
+    let deadline = std::time::Instant::now() + timeout;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return TryFetchTypedResult::NotReady;
+        }
+
+        let (mut guard2, _timeout_result) =
+            c.cvar.wait_timeout(guard, remaining).expect("condvar wait");
+
+        let result = try_fetch_typed_inner(&mut guard2, finst_id);
+        if !matches!(result, TryFetchTypedResult::NotReady) {
+            return result;
+        }
+
+        guard = guard2;
+
+        if std::time::Instant::now() >= deadline {
+            return TryFetchTypedResult::NotReady;
         }
     }
 }
@@ -535,5 +769,70 @@ mod tests {
             matches!(result, TryFetchResult::Ready(_)),
             "wait_fetch should return Ready after delayed insert; got: {result:?}"
         );
+    }
+
+    #[test]
+    fn typed_fetch_returns_payloads_in_order_and_then_eof() {
+        let finst_id = UniqueId { hi: 701, lo: 702 };
+        create_typed_sender(finst_id);
+        insert_typed(finst_id, vec![1, 2, 3]).expect("insert first typed payload");
+        insert_typed(finst_id, vec![4, 5]).expect("insert second typed payload");
+        close_ok(finst_id);
+
+        let TryFetchTypedResult::Ready(first) = wait_fetch_typed(finst_id, 0) else {
+            panic!("expected first typed payload");
+        };
+        assert_eq!(first.packet_seq, 0);
+        assert!(!first.eos);
+        assert_eq!(first.payload, vec![1, 2, 3]);
+
+        let TryFetchTypedResult::Ready(second) = wait_fetch_typed(finst_id, 0) else {
+            panic!("expected second typed payload");
+        };
+        assert_eq!(second.packet_seq, 1);
+        assert!(!second.eos);
+        assert_eq!(second.payload, vec![4, 5]);
+
+        let TryFetchTypedResult::Ready(eos) = wait_fetch_typed(finst_id, 0) else {
+            panic!("expected typed eos");
+        };
+        assert_eq!(eos.packet_seq, 2);
+        assert!(eos.eos);
+        assert!(eos.payload.is_empty());
+    }
+
+    #[test]
+    fn typed_sender_rejects_legacy_fetch() {
+        let finst_id = UniqueId { hi: 703, lo: 704 };
+        create_typed_sender(finst_id);
+        insert_typed(finst_id, vec![9]).expect("insert typed payload");
+
+        let TryFetchResult::Error(err) = try_fetch(finst_id) else {
+            panic!("expected mode mismatch error");
+        };
+        assert!(matches!(err.kind, FetchErrorKind::Failed));
+        assert!(err.message.contains("typed"));
+        assert!(err.message.contains("legacy"));
+    }
+
+    #[test]
+    fn legacy_sender_rejects_typed_fetch() {
+        let finst_id = UniqueId { hi: 705, lo: 706 };
+        create_sender(finst_id);
+        insert(
+            finst_id,
+            FetchResult {
+                packet_seq: 0,
+                eos: false,
+                result_batch: crate::data::TResultBatch::new(vec![b"row".to_vec()], false, 0, None),
+            },
+        );
+
+        let TryFetchTypedResult::Error(err) = wait_fetch_typed(finst_id, 0) else {
+            panic!("expected mode mismatch error");
+        };
+        assert!(matches!(err.kind, FetchErrorKind::Failed));
+        assert!(err.message.contains("legacy"));
+        assert!(err.message.contains("typed"));
     }
 }

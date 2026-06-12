@@ -29,16 +29,23 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+#[cfg(test)]
 use arrow::array::{ArrayRef, BinaryBuilder};
+#[cfg(test)]
 use arrow::datatypes::{DataType, Field, Schema};
+#[cfg(test)]
 use arrow::record_batch::RecordBatch;
 use thrift::protocol::{TBinaryOutputProtocol, TSerializable};
 use thrift::transport::{TBufferChannel, TIoChannel};
 
+#[cfg(test)]
 use crate::common::ids::SlotId;
+#[cfg(test)]
 use crate::common::thrift::thrift_binary_deserialize;
 use crate::common::types::UniqueId;
 use crate::exec::chunk::Chunk;
+use crate::exec::chunk::ChunkSchemaRef;
+#[cfg(test)]
 use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
 use crate::exec::node::{ExecPlan, push_down_local_runtime_filters};
 use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
@@ -92,6 +99,7 @@ pub trait FragmentDispatcher: Send + Sync + 'static {
         backend_idx: usize,
         finst_id: types::TUniqueId,
         max_wait_ms: i64,
+        expected_chunk_schema: Option<&ChunkSchemaRef>,
     ) -> Result<FetchOutcome, String>;
 
     /// Cancel all listed fragment instances on the given backend.  Idempotent.
@@ -135,6 +143,7 @@ fn serialize_thrift_binary<T: TSerializable>(value: &T) -> Result<Vec<u8>, Strin
     }
 }
 
+#[cfg(test)]
 fn empty_chunk() -> Result<Chunk, String> {
     Chunk::try_new_with_chunk_schema(
         RecordBatch::new_empty(Arc::new(Schema::empty())),
@@ -142,6 +151,7 @@ fn empty_chunk() -> Result<Chunk, String> {
     )
 }
 
+#[cfg(test)]
 fn read_lenenc_len(row: &[u8], cursor: &mut usize) -> Result<Option<usize>, String> {
     let marker = *row
         .get(*cursor)
@@ -183,6 +193,7 @@ fn read_lenenc_len(row: &[u8], cursor: &mut usize) -> Result<Option<usize>, Stri
     }
 }
 
+#[cfg(test)]
 fn parse_all_lenenc_fields(row: &[u8]) -> Result<Vec<Option<Vec<u8>>>, String> {
     let mut fields = Vec::new();
     let mut cursor = 0usize;
@@ -201,6 +212,7 @@ fn parse_all_lenenc_fields(row: &[u8]) -> Result<Vec<Option<Vec<u8>>>, String> {
     Ok(fields)
 }
 
+#[cfg(test)]
 fn decode_result_batch_to_chunk(bytes: &[u8]) -> Result<Chunk, String> {
     if bytes.is_empty() {
         return empty_chunk();
@@ -546,6 +558,7 @@ impl FragmentDispatcher for InProcessDispatcher {
         backend_idx: usize,
         finst_id: types::TUniqueId,
         max_wait_ms: i64,
+        _expected_chunk_schema: Option<&ChunkSchemaRef>,
     ) -> Result<FetchOutcome, String> {
         if backend_idx != 0 {
             return Err(format!(
@@ -719,6 +732,7 @@ impl FragmentDispatcher for RemoteDispatcher {
         backend_idx: usize,
         finst_id: types::TUniqueId,
         max_wait_ms: i64,
+        expected_chunk_schema: Option<&ChunkSchemaRef>,
     ) -> Result<FetchOutcome, String> {
         let (client, addr) = self.client_and_addr(backend_idx)?;
         // Counter increments only after a successful check_idx, so only valid-index
@@ -738,6 +752,7 @@ impl FragmentDispatcher for RemoteDispatcher {
                     lo: finst_id.lo,
                 }),
                 max_wait_ms,
+                typed_result: true,
             })
             .map_err(|e| format!("BE[{backend_idx}] ({addr}): {e}"))?;
         let status = FetchStatus::try_from(resp.status).map_err(|_| {
@@ -748,7 +763,22 @@ impl FragmentDispatcher for RemoteDispatcher {
         })?;
         match status {
             FetchStatus::Ready => {
-                let chunk = decode_result_batch_to_chunk(&resp.result_batch_thrift)?;
+                if resp.result_arrow_ipc.is_empty() {
+                    return Err(format!(
+                        "BE[{backend_idx}] ({addr}): typed fetch_result READY without result_arrow_ipc"
+                    ));
+                }
+                let mut chunks = crate::runtime::exchange::decode_root_result_chunks(
+                    &resp.result_arrow_ipc,
+                    expected_chunk_schema,
+                )?;
+                if chunks.len() != 1 {
+                    return Err(format!(
+                        "BE[{backend_idx}] ({addr}): typed fetch_result decoded {} chunks, expected 1",
+                        chunks.len()
+                    ));
+                }
+                let chunk = chunks.remove(0);
                 Ok(FetchOutcome::Ready(chunk))
             }
             FetchStatus::NotReady => Ok(FetchOutcome::NotReady),
@@ -966,11 +996,11 @@ mod tests {
     use super::*;
 
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
     use crate::common::thrift::thrift_binary_serialize;
     use crate::service::grpc_proto as proto;
-    use arrow::array::Array;
+    use arrow::array::{Array, Int32Array};
     use proto::novarocks::fetch_result_response::Status as FetchStatus;
     use proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc;
     use proto::novarocks::{
@@ -1078,6 +1108,7 @@ mod tests {
             None::<Vec<i32>>,
             None::<i32>,
             None::<types::TNetworkAddress>,
+            None::<bool>,
         )
     }
 
@@ -1129,6 +1160,8 @@ mod tests {
         submit_code: AtomicI32,
         fetch_status: AtomicI32,
         fetch_batch: Mutex<Vec<u8>>,
+        fetch_arrow: Mutex<Vec<u8>>,
+        last_fetch_typed_result: AtomicBool,
         cancel_count: AtomicUsize,
         cancel_delay_ms: AtomicU64,
         report_status_code: AtomicI32,
@@ -1141,6 +1174,8 @@ mod tests {
                 submit_code: AtomicI32::new(0),
                 fetch_status: AtomicI32::new(FetchStatus::Eof as i32),
                 fetch_batch: Mutex::new(Vec::new()),
+                fetch_arrow: Mutex::new(Vec::new()),
+                last_fetch_typed_result: AtomicBool::new(false),
                 cancel_count: AtomicUsize::new(0),
                 cancel_delay_ms: AtomicU64::new(0),
                 report_status_code: AtomicI32::new(0),
@@ -1194,11 +1229,15 @@ mod tests {
 
         async fn fetch_result(
             &self,
-            _request: Request<FetchResultRequest>,
+            request: Request<FetchResultRequest>,
         ) -> Result<Response<FetchResultResponse>, Status> {
+            self.0
+                .last_fetch_typed_result
+                .store(request.into_inner().typed_result, Ordering::SeqCst);
             Ok(Response::new(FetchResultResponse {
                 status: self.0.fetch_status.load(Ordering::SeqCst),
                 result_batch_thrift: self.0.fetch_batch.lock().expect("fetch batch lock").clone(),
+                result_arrow_ipc: self.0.fetch_arrow.lock().expect("fetch arrow lock").clone(),
                 message: "fetch failed".to_string(),
             }))
         }
@@ -1341,26 +1380,35 @@ mod tests {
         let dispatcher = RemoteDispatcher::new(&[addr]).expect("construct");
 
         let outcome = dispatcher
-            .fetch_result(0, make_finst_id(1, 2), 0)
+            .fetch_result(0, make_finst_id(1, 2), 0, None)
             .expect("fetch");
 
         assert!(matches!(outcome, FetchOutcome::Eof));
     }
 
     #[test]
-    fn remote_dispatcher_fetch_ready_decodes_batch() {
+    fn remote_dispatcher_fetch_ready_decodes_typed_payload() {
         let state = Arc::new(MockState::default());
         state
             .fetch_status
             .store(FetchStatus::Ready as i32, Ordering::SeqCst);
-        let batch = crate::data::TResultBatch::new(vec![b"\x011".to_vec()], false, 0, None);
-        *state.fetch_batch.lock().expect("fetch batch lock") =
-            thrift_binary_serialize(&batch).expect("serialize result batch");
+        let schema = Arc::new(Schema::new(vec![Field::new("col", DataType::Int32, true)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![Some(1)]))],
+        )
+        .expect("typed batch");
+        let chunk_schema =
+            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[SlotId::new(7)])
+                .expect("chunk schema");
+        let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk");
+        *state.fetch_arrow.lock().expect("fetch arrow lock") =
+            crate::runtime::exchange::encode_chunks(&[chunk], true).expect("encode typed result");
         let addr = spawn_mock_server(Arc::clone(&state));
         let dispatcher = RemoteDispatcher::new(&[addr]).expect("construct");
 
         let outcome = dispatcher
-            .fetch_result(0, make_finst_id(1, 2), 0)
+            .fetch_result(0, make_finst_id(1, 2), 0, None)
             .expect("fetch");
 
         let FetchOutcome::Ready(chunk) = outcome else {
@@ -1368,6 +1416,25 @@ mod tests {
         };
         assert_eq!(chunk.columns().len(), 1);
         assert_eq!(chunk.len(), 1);
+        assert_eq!(chunk.columns()[0].data_type(), &DataType::Int32);
+        assert!(state.last_fetch_typed_result.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn remote_dispatcher_fetch_ready_requires_typed_payload() {
+        let state = Arc::new(MockState::default());
+        state
+            .fetch_status
+            .store(FetchStatus::Ready as i32, Ordering::SeqCst);
+        let addr = spawn_mock_server(Arc::clone(&state));
+        let dispatcher = RemoteDispatcher::new(&[addr]).expect("construct");
+
+        let err = match dispatcher.fetch_result(0, make_finst_id(1, 2), 0, None) {
+            Ok(_) => panic!("missing typed payload must fail"),
+            Err(err) => err,
+        };
+
+        assert!(err.contains("result_arrow_ipc"), "{err}");
     }
 
     #[test]
@@ -1447,7 +1514,7 @@ mod tests {
     fn fetch_unknown_finst_returns_eof() {
         let dispatcher = InProcessDispatcher::default();
         let finst_id = make_finst_id(999, 888);
-        let outcome = dispatcher.fetch_result(0, finst_id, 10).unwrap();
+        let outcome = dispatcher.fetch_result(0, finst_id, 10, None).unwrap();
         assert!(
             matches!(outcome, FetchOutcome::Eof),
             "expected Eof for unknown finst_id"
@@ -1477,7 +1544,7 @@ mod tests {
         });
 
         let outcome = dispatcher
-            .fetch_result(0, make_finst_id(finst_key.0, finst_key.1), 1)
+            .fetch_result(0, make_finst_id(finst_key.0, finst_key.1), 1, None)
             .expect("fetch root slot");
         let FetchOutcome::Err(message) = outcome else {
             panic!("expected root fragment panic to surface as error");

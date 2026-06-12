@@ -1364,6 +1364,31 @@ pub fn encode_chunks(chunks: &[Chunk], include_slot_ids: bool) -> Result<Vec<u8>
     ))
 }
 
+pub fn decode_root_result_chunks(
+    bytes: &[u8],
+    expected_chunk_schema: Option<&ChunkSchemaRef>,
+) -> Result<Vec<Chunk>, String> {
+    let DecodedExchangePayload {
+        wire_meta,
+        arrow_payload,
+    } = decode_exchange_payload_envelope(bytes)?;
+    if arrow_payload.is_empty() {
+        return Ok(Vec::new());
+    }
+    let wire_meta = wire_meta.ok_or_else(|| {
+        "typed root result payload missing exchange wire slot metadata".to_string()
+    })?;
+    let batches = decode_arrow_ipc_batches(arrow_payload)?;
+    let mut chunks = Vec::with_capacity(batches.len());
+    for batch in batches {
+        let batch = restore_zero_column_batch_if_needed(batch, &wire_meta)?;
+        let (batch, chunk_schema) =
+            materialize_chunk_for_wire_meta(expected_chunk_schema, &batch, &wire_meta)?;
+        chunks.push(Chunk::try_new_with_chunk_schema(batch, chunk_schema)?);
+    }
+    Ok(chunks)
+}
+
 #[cfg(test)]
 pub fn decode_chunks(bytes: &[u8]) -> Result<Vec<Chunk>, String> {
     let DecodedExchangePayload {
@@ -1463,11 +1488,12 @@ mod tests {
 
     use super::{
         ExchangeKey, ExchangePopResult, cancel_exchange_key, decode_chunks,
-        decode_chunks_for_sender, encode_chunks, get_receiver_handle, push_chunks,
-        register_expected_chunk_schema, set_expected_senders, snapshot_receiver_state,
+        decode_chunks_for_sender, decode_root_result_chunks, encode_chunks, get_receiver_handle,
+        push_chunks, register_expected_chunk_schema, set_expected_senders, snapshot_receiver_state,
     };
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::Chunk;
+    use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
+    use crate::types;
 
     const EXCHANGE_TEST_SLOT_IDS: [SlotId; 4] = [
         SlotId::new(33),
@@ -1543,6 +1569,19 @@ mod tests {
         )
         .expect("chunk schema");
         Chunk::new_with_chunk_schema(batch, chunk_schema)
+    }
+
+    fn decimal_type_desc(
+        primitive: types::TPrimitiveType,
+        precision: i32,
+        scale: i32,
+    ) -> types::TTypeDesc {
+        types::TTypeDesc::new(vec![types::TTypeNode::new(
+            types::TTypeNodeType::SCALAR,
+            types::TScalarType::new(primitive, None, Some(precision), Some(scale), None),
+            None,
+            None,
+        )])
     }
 
     #[test]
@@ -1636,6 +1675,57 @@ mod tests {
         assert_eq!(array.data_type(), &DataType::Decimal128(20, 2));
         assert!(!array.is_null(0));
         assert_eq!(array.value(0), value);
+    }
+
+    #[test]
+    fn decode_root_result_chunks_retags_decimal_to_expected_descriptor_type() {
+        let value = 100_000_000_000_000_000_000_i128;
+        let chunk = decimal128_chunk_with_over_precision_value(value);
+        let payload = encode_chunks(&[chunk], true).expect("encode");
+        let expected_schema = Arc::new(
+            ChunkSchema::try_new(vec![
+                ChunkSlotSchema::try_from_type_desc(
+                    SlotId::new(55),
+                    "price",
+                    true,
+                    decimal_type_desc(types::TPrimitiveType::DECIMAL128, 38, 2),
+                    None,
+                )
+                .expect("expected decimal slot"),
+            ])
+            .expect("expected chunk schema"),
+        );
+
+        let decoded =
+            decode_root_result_chunks(&payload, Some(&expected_schema)).expect("decode root");
+
+        assert_eq!(decoded.len(), 1);
+        let array = decoded[0]
+            .batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("decimal128 array");
+        assert_eq!(array.data_type(), &DataType::Decimal128(38, 2));
+        assert_eq!(array.value(0), value);
+        assert_eq!(
+            decoded[0].chunk_schema().slots()[0].slot_id(),
+            SlotId::new(55)
+        );
+    }
+
+    #[test]
+    fn decode_root_result_chunks_preserves_zero_column_row_count() {
+        let chunk = exchange_test_zero_column_chunk(3);
+        let payload = encode_chunks(&[chunk], true).expect("encode");
+        let expected_schema = Arc::new(ChunkSchema::empty());
+
+        let decoded =
+            decode_root_result_chunks(&payload, Some(&expected_schema)).expect("decode root");
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].len(), 3);
+        assert_eq!(decoded[0].batch.num_columns(), 0);
     }
 
     #[test]

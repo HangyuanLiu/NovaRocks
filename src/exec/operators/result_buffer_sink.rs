@@ -55,6 +55,7 @@ pub struct ResultBufferSinkFactory {
     output_exprs: Option<Vec<exprs::TExpr>>,
     result_sink_type: Option<data_sinks::TResultSinkType>,
     result_sink_format: Option<data_sinks::TResultSinkFormatType>,
+    typed_result_sink: bool,
     shared: Arc<ResultBufferSinkShared>,
 }
 
@@ -64,6 +65,7 @@ impl ResultBufferSinkFactory {
         result_sink_type: Option<data_sinks::TResultSinkType>,
         result_sink_format: Option<data_sinks::TResultSinkFormatType>,
         plan_node_id: Option<i32>,
+        typed_result_sink: bool,
     ) -> Self {
         let plan_node_id = match plan_node_id {
             Some(id) if id >= 0 => id,
@@ -74,6 +76,7 @@ impl ResultBufferSinkFactory {
             output_exprs,
             result_sink_type,
             result_sink_format,
+            typed_result_sink,
             shared: Arc::new(ResultBufferSinkShared::new()),
         }
     }
@@ -91,6 +94,7 @@ impl OperatorFactory for ResultBufferSinkFactory {
             output_exprs: self.output_exprs.clone(),
             result_sink_type: self.result_sink_type,
             result_sink_format: self.result_sink_format,
+            typed_result_sink: self.typed_result_sink,
             shared: Arc::clone(&self.shared),
             finished: false,
         })
@@ -106,6 +110,7 @@ struct ResultBufferSinkOperator {
     output_exprs: Option<Vec<exprs::TExpr>>,
     result_sink_type: Option<data_sinks::TResultSinkType>,
     result_sink_format: Option<data_sinks::TResultSinkFormatType>,
+    typed_result_sink: bool,
     shared: Arc<ResultBufferSinkShared>,
     finished: bool,
 }
@@ -119,12 +124,26 @@ impl ResultBufferSinkOperator {
 
     fn ensure_eos_template(&self, state: &RuntimeState) -> Result<UniqueId, String> {
         let finst_id = self.finst_id(state)?;
+        if self.typed_result_sink {
+            return Ok(finst_id);
+        }
         let template = build_empty_fetch_result_batch_template(
             self.result_sink_type,
             self.result_sink_format,
         )?;
         result_buffer::set_eos_template(finst_id, template);
         Ok(finst_id)
+    }
+
+    fn validate_typed_result_sink(&self) -> Result<(), String> {
+        match self.result_sink_type {
+            None => Ok(()),
+            Some(t) if t == data_sinks::TResultSinkType::MYSQL_PROTOCAL => Ok(()),
+            Some(other) => Err(format!(
+                "typed RESULT_SINK only supports MYSQL_PROTOCAL result sink, got {:?}",
+                other
+            )),
+        }
     }
 }
 
@@ -161,6 +180,11 @@ impl ProcessorOperator for ResultBufferSinkOperator {
         }
 
         let finst_id = self.ensure_eos_template(state)?;
+        if self.typed_result_sink {
+            self.validate_typed_result_sink()?;
+            let payload = crate::runtime::exchange::encode_chunks(&[chunk], true)?;
+            return result_buffer::insert_typed(finst_id, payload);
+        }
         let batch = build_fetch_result_batch_for_chunk(
             &chunk,
             self.output_exprs.as_deref(),

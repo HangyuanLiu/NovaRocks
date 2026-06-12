@@ -62,6 +62,7 @@ message PUniqueId {
 message FetchResultRequest {
   PUniqueId finst_id = 1;
   int64 max_wait_ms = 2;
+  bool typed_result = 3;
 }
 
 message FetchResultResponse {
@@ -75,6 +76,8 @@ message FetchResultResponse {
   // Thrift-binary-encoded TResultBatch payload.
   bytes result_batch_thrift = 2;
   string message = 3;
+  // NovaRocks-private exchange-envelope-wrapped Arrow IPC payload.
+  bytes result_arrow_ipc = 4;
 }
 
 message CancelFragmentRequest {

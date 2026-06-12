@@ -1025,6 +1025,7 @@ fn spawn_exec_fragment(
     last_query_id: Option<String>,
     fe_addr: Option<types::TNetworkAddress>,
     mem_tracker: Option<Arc<crate::runtime::mem_tracker::MemTracker>>,
+    typed_result_sink: bool,
     mgr: Arc<QueryContextManager>,
 ) {
     let uses_fetch_result_buffer = matches!(
@@ -1032,7 +1033,11 @@ fn spawn_exec_fragment(
         Some(data_sinks::TDataSinkType::RESULT_SINK)
     );
     if uses_fetch_result_buffer {
-        result_buffer::create_sender(finst_id);
+        if typed_result_sink {
+            result_buffer::create_typed_sender(finst_id);
+        } else {
+            result_buffer::create_sender(finst_id);
+        }
         if let Some(root) = mem_tracker.as_ref() {
             let label = format!("ResultBuffer: finst={}", finst_id);
             let tracker = crate::runtime::mem_tracker::MemTracker::new_child(label, root);
@@ -1059,6 +1064,7 @@ fn spawn_exec_fragment(
                 fe_addr.as_ref(),
                 backend_num,
                 mem_tracker,
+                typed_result_sink,
             )
         }))
         .unwrap_or_else(|payload| {
@@ -1192,6 +1198,10 @@ pub fn submit_exec_batch_plan_fragments(thrift_bytes: &[u8]) -> Result<usize, St
             .novarocks_report_addr
             .clone()
             .or_else(|| common.and_then(|c| c.novarocks_report_addr.clone()));
+        let typed_result_sink = one
+            .novarocks_typed_result_sink
+            .or_else(|| common.and_then(|c| c.novarocks_typed_result_sink))
+            .unwrap_or(false);
         let backend_num = one
             .backend_num
             .or_else(|| common.and_then(|c| c.backend_num));
@@ -1347,6 +1357,7 @@ pub fn submit_exec_batch_plan_fragments(thrift_bytes: &[u8]) -> Result<usize, St
             last_query_id,
             coord.cloned(),
             Some(fragment_mem_tracker),
+            typed_result_sink,
             Arc::clone(&mgr),
         );
         created += 1;
@@ -1394,6 +1405,7 @@ pub fn submit_exec_plan_fragment(thrift_bytes: &[u8]) -> Result<(), String> {
     let fragment = one.fragment.as_ref().expect("checked above");
     let coord = one.coord.as_ref();
     let novarocks_report_addr = one.novarocks_report_addr.clone();
+    let typed_result_sink = one.novarocks_typed_result_sink.unwrap_or(false);
     let backend_num = one.backend_num;
     let finst_id = UniqueId {
         hi: params.fragment_instance_id.hi,
@@ -1511,6 +1523,7 @@ pub fn submit_exec_plan_fragment(thrift_bytes: &[u8]) -> Result<(), String> {
         last_query_id,
         coord.cloned(),
         Some(fragment_mem_tracker),
+        typed_result_sink,
         Arc::clone(&mgr),
     );
     Ok(())
@@ -1570,6 +1583,7 @@ pub(crate) fn execute_plan_fragment_sync(
 
     let pipeline_dop = resolve_pipeline_dop(&one);
     let group_execution_scan_dop = one.group_execution_scan_dop;
+    let typed_result_sink = one.novarocks_typed_result_sink.unwrap_or(false);
     let mut params = params.clone();
     let fragment = fragment.clone();
     backfill_per_node_scan_ranges(&mut params);
@@ -1592,6 +1606,7 @@ pub(crate) fn execute_plan_fragment_sync(
         one.coord.as_ref(),
         one.backend_num,
         Some(fragment_mem_tracker),
+        typed_result_sink,
     );
     exchange::remove_fragment(finst_id.hi, finst_id.lo);
     mgr.finish_fragment(query_id);

@@ -330,6 +330,7 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
                     proto::novarocks::FetchResultResponse {
                         status: FetchStatus::Error as i32,
                         result_batch_thrift: vec![],
+                        result_arrow_ipc: vec![],
                         message: "missing finst_id in FetchResultRequest".to_string(),
                     },
                 ));
@@ -343,6 +344,7 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
                 proto::novarocks::FetchResultResponse {
                     status: FetchStatus::NotReady as i32,
                     result_batch_thrift: vec![],
+                    result_arrow_ipc: vec![],
                     message: String::new(),
                 },
             ));
@@ -351,8 +353,52 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         // wait_fetch uses std::sync::Condvar::wait_timeout, which blocks the OS
         // thread for up to max_wait_ms. Offload to the blocking thread pool so
         // tonic worker threads remain free for I/O.
-        use crate::runtime::result_buffer::{TryFetchResult, wait_fetch};
+        use crate::runtime::result_buffer::{
+            TryFetchResult, TryFetchTypedResult, wait_fetch, wait_fetch_typed,
+        };
         let max_wait_ms = req.max_wait_ms;
+        if req.typed_result {
+            let fetch_result =
+                tokio::task::spawn_blocking(move || wait_fetch_typed(finst_id, max_wait_ms))
+                    .await
+                    .map_err(|e| {
+                        tonic::Status::internal(format!("fetch_result handler panicked: {e}"))
+                    })?;
+            return match fetch_result {
+                TryFetchTypedResult::Ready(result) => {
+                    let status = if result.eos {
+                        FetchStatus::Eof
+                    } else {
+                        FetchStatus::Ready
+                    };
+                    Ok(tonic::Response::new(
+                        proto::novarocks::FetchResultResponse {
+                            status: status as i32,
+                            result_batch_thrift: vec![],
+                            result_arrow_ipc: result.payload,
+                            message: String::new(),
+                        },
+                    ))
+                }
+                TryFetchTypedResult::NotReady => Ok(tonic::Response::new(
+                    proto::novarocks::FetchResultResponse {
+                        status: FetchStatus::NotReady as i32,
+                        result_batch_thrift: vec![],
+                        result_arrow_ipc: vec![],
+                        message: String::new(),
+                    },
+                )),
+                TryFetchTypedResult::Error(err) => Ok(tonic::Response::new(
+                    proto::novarocks::FetchResultResponse {
+                        status: FetchStatus::Error as i32,
+                        result_batch_thrift: vec![],
+                        result_arrow_ipc: vec![],
+                        message: err.message,
+                    },
+                )),
+            };
+        }
+
         let fetch_result = tokio::task::spawn_blocking(move || wait_fetch(finst_id, max_wait_ms))
             .await
             .map_err(|e| tonic::Status::internal(format!("fetch_result handler panicked: {e}")))?;
@@ -371,6 +417,7 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
                     proto::novarocks::FetchResultResponse {
                         status: status as i32,
                         result_batch_thrift: batch_bytes,
+                        result_arrow_ipc: vec![],
                         message: String::new(),
                     },
                 ))
@@ -379,6 +426,7 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
                 proto::novarocks::FetchResultResponse {
                     status: FetchStatus::NotReady as i32,
                     result_batch_thrift: vec![],
+                    result_arrow_ipc: vec![],
                     message: String::new(),
                 },
             )),
@@ -386,6 +434,7 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
                 proto::novarocks::FetchResultResponse {
                     status: FetchStatus::Error as i32,
                     result_batch_thrift: vec![],
+                    result_arrow_ipc: vec![],
                     message: err.message,
                 },
             )),
@@ -1784,6 +1833,7 @@ mod pr3_tests {
         let req = Request::new(FetchResultRequest {
             finst_id: None,
             max_wait_ms: 0,
+            typed_result: false,
         });
         let resp = svc.fetch_result(req).await.expect("RPC level success");
         let body = resp.into_inner();
@@ -1814,6 +1864,7 @@ mod pr3_tests {
                 lo: finst_id.lo,
             }),
             max_wait_ms: 0,
+            typed_result: false,
         });
         let resp = svc.fetch_result(req).await.expect("RPC level success");
         let body = resp.into_inner();
@@ -1857,6 +1908,7 @@ mod pr3_tests {
                 lo: finst_id.lo,
             }),
             max_wait_ms: 1000,
+            typed_result: false,
         });
         let resp = svc.fetch_result(req).await.expect("RPC level success");
         let body = resp.into_inner();
@@ -1869,6 +1921,32 @@ mod pr3_tests {
             !body.result_batch_thrift.is_empty(),
             "result_batch_thrift payload must be non-empty"
         );
+    }
+
+    #[tokio::test]
+    async fn fetch_result_typed_request_returns_arrow_ipc_payload() {
+        use crate::common::types::UniqueId;
+        use crate::runtime::result_buffer::{create_typed_sender, insert_typed};
+
+        let finst_id = UniqueId { hi: 8811, lo: 8812 };
+        create_typed_sender(finst_id);
+        insert_typed(finst_id, vec![1, 2, 3, 4]).expect("insert typed payload");
+
+        let svc = GrpcService::default();
+        let req = Request::new(FetchResultRequest {
+            finst_id: Some(PUniqueId {
+                hi: finst_id.hi,
+                lo: finst_id.lo,
+            }),
+            max_wait_ms: 0,
+            typed_result: true,
+        });
+        let resp = svc.fetch_result(req).await.expect("RPC level success");
+        let body = resp.into_inner();
+
+        assert_eq!(body.status, FetchStatus::Ready as i32);
+        assert_eq!(body.result_arrow_ipc, vec![1, 2, 3, 4]);
+        assert!(body.result_batch_thrift.is_empty());
     }
 
     #[tokio::test]
@@ -1887,6 +1965,7 @@ mod pr3_tests {
                 lo: finst_id.lo,
             }),
             max_wait_ms: 0,
+            typed_result: false,
         });
         let resp = svc.fetch_result(req).await.expect("RPC level success");
         let body = resp.into_inner();
@@ -1918,6 +1997,7 @@ mod pr3_tests {
                 lo: finst_id.lo,
             }),
             max_wait_ms: 0,
+            typed_result: false,
         });
         let resp = svc.fetch_result(req).await.expect("RPC level success");
         let body = resp.into_inner();
