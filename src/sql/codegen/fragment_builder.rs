@@ -255,6 +255,33 @@ fn aggregate_state_shaped_data_type(
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct AggregateSlotContract {
+    data_type: DataType,
+    type_desc: types::TTypeDesc,
+}
+
+fn aggregate_slot_contract_for_phase(
+    need_finalize: bool,
+    result_type: &DataType,
+    intermediate_type: Option<&DataType>,
+    display_name: &str,
+) -> Result<AggregateSlotContract, String> {
+    let data_type = if need_finalize {
+        result_type.clone()
+    } else {
+        intermediate_type
+            .cloned()
+            .unwrap_or_else(|| result_type.clone())
+    };
+    let type_desc = type_infer::arrow_type_to_type_desc(&data_type)
+        .map_err(|e| format!("aggregate `{display_name}` output type descriptor failed: {e}"))?;
+    Ok(AggregateSlotContract {
+        data_type,
+        type_desc,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Scan/join ownership metadata (used by RF planning)
 // ---------------------------------------------------------------------------
@@ -2721,46 +2748,24 @@ impl<'a> PlanFragmentBuilder<'a> {
                 })?
             };
 
-            let data_type = if need_finalize {
-                agg_call.result_type.clone()
-            } else {
-                texpr
-                    .nodes
-                    .first()
-                    .and_then(|root| root.fn_.as_ref())
-                    .and_then(|func| func.aggregate_fn.as_ref())
-                    .and_then(|agg_fn| arrow_type_from_desc(&agg_fn.intermediate_type))
-                    .unwrap_or_else(|| agg_call.result_type.clone())
-            };
             let nullable = true;
             let name = agg_call_display_name(agg_call);
+            let intermediate_type = texpr
+                .nodes
+                .first()
+                .and_then(|root| root.fn_.as_ref())
+                .and_then(|func| func.aggregate_fn.as_ref())
+                .and_then(|agg_fn| arrow_type_from_desc(&agg_fn.intermediate_type));
+            let slot_contract = aggregate_slot_contract_for_phase(
+                need_finalize,
+                &agg_call.result_type,
+                intermediate_type.as_ref(),
+                &name,
+            )?;
+            let data_type = slot_contract.data_type.clone();
+            let slot_type_desc = slot_contract.type_desc.clone();
             let slot_id = self.alloc_slot();
             let col_pos = (agg_start_col + idx) as i32;
-            let slot_type_desc = if need_finalize {
-                texpr
-                    .nodes
-                    .first()
-                    .map(|root| root.type_.clone())
-                    .ok_or_else(|| format!("aggregate `{name}` compiled to empty TExpr"))?
-            } else {
-                texpr
-                    .nodes
-                    .first()
-                    .and_then(|root| root.fn_.as_ref())
-                    .and_then(|func| func.aggregate_fn.as_ref())
-                    .map(|agg_fn| agg_fn.intermediate_type.clone())
-                    .unwrap_or_else(|| {
-                        texpr
-                            .nodes
-                            .first()
-                            .map(|root| root.type_.clone())
-                            .unwrap_or_else(|| {
-                                crate::lower::thrift::type_lowering::scalar_type_desc(
-                                    crate::types::TPrimitiveType::NULL_TYPE,
-                                )
-                            })
-                    })
-            };
             self.desc_builder.add_slot_with_type_desc(
                 slot_id,
                 agg_tuple_id,
@@ -5266,6 +5271,42 @@ mod tests {
     use crate::sql::optimizer::runtime_filter_pass::RuntimeFilterDesc;
     use crate::sql::optimizer::statistics::Statistics;
     use crate::sql::planner::plan::{DecodeMapping, WindowExpr};
+
+    #[test]
+    fn aggregate_slot_contract_uses_intermediate_only_for_non_finalize() {
+        use crate::lower::type_lowering::arrow_type_from_desc;
+        use crate::sql::codegen::expr_compiler::infer_agg_function_types;
+        use arrow::datatypes::DataType;
+
+        let (_, avg_intermediate) =
+            infer_agg_function_types("avg", &[DataType::Int64], false).expect("avg types");
+        let avg_intermediate = avg_intermediate.expect("avg intermediate");
+        let contract = super::aggregate_slot_contract_for_phase(
+            false,
+            &DataType::Float64,
+            Some(&avg_intermediate),
+            "avg",
+        )
+        .expect("local avg contract");
+        assert_eq!(contract.data_type, DataType::Utf8);
+        assert_eq!(
+            arrow_type_from_desc(&contract.type_desc),
+            Some(DataType::Utf8)
+        );
+
+        let final_contract = super::aggregate_slot_contract_for_phase(
+            true,
+            &DataType::Float64,
+            Some(&avg_intermediate),
+            "avg",
+        )
+        .expect("final avg contract");
+        assert_eq!(final_contract.data_type, DataType::Float64);
+        assert_eq!(
+            arrow_type_from_desc(&final_contract.type_desc),
+            Some(DataType::Float64)
+        );
+    }
 
     /// OQ-5 B1: `remap_rf_expr_order` must translate a runtime filter's
     /// pre-demote `op.eq_conditions` index into the post-demote
