@@ -91,30 +91,16 @@ pub(super) fn align_schema_with_arrays(
             arrays.len()
         ));
     }
-    let mut changed = false;
-    let fields = schema
-        .fields()
-        .iter()
-        .zip(arrays.iter())
-        .map(|(field, array)| {
-            if field.data_type() == array.data_type() {
-                Ok(field.as_ref().clone())
-            } else {
-                changed = true;
-                Ok(
-                    Field::new(field.name(), array.data_type().clone(), field.is_nullable())
-                        .with_metadata(field.metadata().clone()),
-                )
-            }
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    if !changed {
-        return Ok(Arc::clone(schema));
+    for (idx, (field, array)) in schema.fields().iter().zip(arrays.iter()).enumerate() {
+        if field.data_type() != array.data_type() {
+            return Err(format!(
+                "{context} type mismatch at column {idx}: descriptor={:?} actual={:?}",
+                field.data_type(),
+                array.data_type()
+            ));
+        }
     }
-    Ok(Arc::new(Schema::new_with_metadata(
-        fields,
-        schema.metadata().clone(),
-    )))
+    Ok(Arc::clone(schema))
 }
 
 pub(super) fn is_compatible_aggregate_data_type(expected: &DataType, actual: &DataType) -> bool {
