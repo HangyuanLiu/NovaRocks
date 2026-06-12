@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::common::ids::SlotId;
-use crate::exec::chunk::type_relation::{CompatibilityPolicy, relate};
+use crate::exec::chunk::type_relation::{relate, CompatibilityPolicy};
 use crate::lower::type_lowering::{arrow_type_from_desc, primitive_type_from_desc};
 use crate::types;
 use arrow::array::ArrayRef;
@@ -444,47 +444,18 @@ fn reconcile_chunk_data_type(expected: &DataType, actual: &DataType) -> Result<D
     if expected == actual {
         return Ok(expected.clone());
     }
-
-    match (expected, actual) {
-        (DataType::Decimal128(_, _), DataType::Decimal128(_, _))
-        | (DataType::Decimal256(_, _), DataType::Decimal256(_, _))
-        | (DataType::Timestamp(_, _), DataType::Timestamp(_, _)) => Ok(actual.clone()),
-        (DataType::Utf8, DataType::Binary) | (DataType::Binary, DataType::Utf8) => {
-            Ok(actual.clone())
-        }
-        (DataType::List(expected_field), DataType::List(actual_field)) => Ok(DataType::List(
-            reconcile_chunk_field_to_field(expected_field, actual_field)?,
-        )),
-        (DataType::LargeList(expected_field), DataType::LargeList(actual_field)) => {
-            Ok(DataType::LargeList(reconcile_chunk_field_to_field(
-                expected_field,
-                actual_field,
-            )?))
-        }
-        (
-            DataType::Map(expected_field, expected_ordered),
-            DataType::Map(actual_field, actual_ordered),
-        ) if expected_ordered == actual_ordered => Ok(DataType::Map(
-            reconcile_chunk_field_to_field(expected_field, actual_field)?,
-            *expected_ordered,
-        )),
-        (DataType::Struct(expected_fields), DataType::Struct(actual_fields))
-            if expected_fields.len() == actual_fields.len() =>
-        {
-            let fields = expected_fields
-                .iter()
-                .zip(actual_fields.iter())
-                .map(|(expected_field, actual_field)| {
-                    reconcile_chunk_field_to_field(expected_field, actual_field)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(DataType::Struct(fields.into()))
-        }
-        _ => Err(format!(
+    crate::exec::chunk::type_relation::relate(
+        expected,
+        actual,
+        crate::exec::chunk::type_relation::CompatibilityPolicy::SameScaleWiden,
+    )
+    .map_err(|_| {
+        format!(
             "chunk schema type mismatch: expected {:?}, got {:?}",
             expected, actual
-        )),
-    }
+        )
+    })?;
+    Ok(expected.clone())
 }
 
 impl ChunkSchema {
@@ -658,7 +629,11 @@ pub(super) fn align_chunk_schema_to_batch(
                 expected.nullable()
             ));
         }
-        slots.push(expected.with_field_and_slot_id(expected.slot_id(), field.as_ref().clone())?);
+        let reconciled_field = reconcile_chunk_field_to_field(expected.field(), field.as_ref())?;
+        slots.push(
+            expected
+                .with_field_and_slot_id(expected.slot_id(), reconciled_field.as_ref().clone())?,
+        );
     }
     Ok(Arc::new(ChunkSchema::try_new(slots)?))
 }
@@ -698,7 +673,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::array::{
-        Array, ArrayRef, BinaryArray, Int8Array, Int32Array, Int64Array, MapArray, StructArray,
+        Array, ArrayRef, BinaryArray, Int32Array, Int64Array, Int8Array, MapArray, StructArray,
     };
     use arrow::buffer::OffsetBuffer;
     use arrow::datatypes::{DataType, Field, Fields, Schema};
@@ -783,13 +758,13 @@ mod tests {
         let chunk = Chunk::try_new_with_chunk_schema(batch, contract).expect("chunk");
 
         assert!(
-            !chunk.chunk_schema().slots()[0].nullable(),
-            "aligned chunk schema should keep the actual batch field metadata"
+            chunk.chunk_schema().slots()[0].nullable(),
+            "aligned chunk schema should keep the descriptor nullability contract"
         );
     }
 
     #[test]
-    fn align_chunk_schema_to_columns_preserves_nullable_map_keys() {
+    fn align_chunk_schema_to_columns_keeps_descriptor_map_key_nullability() {
         let expected_map = DataType::Map(
             Arc::new(Field::new(
                 "entries",
@@ -837,7 +812,10 @@ mod tests {
         let DataType::Struct(entry_fields) = entries_field.data_type() else {
             panic!("expected entry struct");
         };
-        assert!(entry_fields[0].is_nullable(), "map key should be nullable");
+        assert!(
+            !entry_fields[0].is_nullable(),
+            "map key should keep descriptor nullability"
+        );
     }
 
     #[test]
