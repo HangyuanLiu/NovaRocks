@@ -360,6 +360,8 @@ pub(crate) fn build_iceberg_write_sink_spec(
             position_delete_sink_input_columns(metadata, &resolved.columns)?
         }
     };
+    let target_descriptor_columns =
+        write_sink_target_descriptor_columns(mode, &resolved.columns, &target_columns);
     let iceberg_schema = match mode {
         IcebergWriteSinkMode::RowLineageData => {
             row_lineage_iceberg_schema_def_for_codegen(metadata.current_schema())
@@ -386,7 +388,7 @@ pub(crate) fn build_iceberg_write_sink_spec(
     let cloud_properties = entry.cloud_properties_map();
     let target_table = TableDef {
         name: resolved.table.clone(),
-        columns: target_columns.clone(),
+        columns: target_descriptor_columns,
         iceberg_row_lineage_metadata_columns: Vec::new(),
         source: ScanSource::IcebergDataFiles {
             table: iceberg.clone(),
@@ -463,6 +465,19 @@ fn row_lineage_iceberg_schema_def_for_codegen(schema: &iceberg::spec::Schema) ->
         children: Vec::new(),
     });
     out
+}
+
+fn write_sink_target_descriptor_columns(
+    mode: IcebergWriteSinkMode,
+    resolved_columns: &[ColumnDef],
+    sink_input_columns: &[ColumnDef],
+) -> Vec<ColumnDef> {
+    match mode {
+        IcebergWriteSinkMode::PositionDeletes => resolved_columns.to_vec(),
+        IcebergWriteSinkMode::Data | IcebergWriteSinkMode::RowLineageData => {
+            sink_input_columns.to_vec()
+        }
+    }
 }
 
 fn position_delete_sink_input_columns(
@@ -1288,6 +1303,52 @@ mod tests {
         assert!(
             !impl_source.contains("synthetic_write_commit_input"),
             "append executor must not return a synthetic write commit"
+        );
+    }
+
+    #[test]
+    fn position_delete_sink_descriptor_columns_use_target_table_schema() {
+        let resolved_columns = vec![
+            test_column("id", DataType::Int32, None),
+            test_column("v", DataType::Utf8, None),
+        ];
+        let sink_input_columns = vec![
+            test_column("_file", DataType::Utf8, None),
+            test_column("_pos", DataType::Int64, None),
+        ];
+
+        let descriptor_columns = write_sink_target_descriptor_columns(
+            IcebergWriteSinkMode::PositionDeletes,
+            &resolved_columns,
+            &sink_input_columns,
+        );
+
+        assert_eq!(
+            descriptor_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "v"]
+        );
+    }
+
+    #[test]
+    fn row_lineage_data_sink_descriptor_columns_use_sink_input_schema() {
+        let resolved_columns = vec![test_column("id", DataType::Int32, None)];
+        let sink_input_columns = row_lineage_data_sink_input_columns(&resolved_columns);
+
+        let descriptor_columns = write_sink_target_descriptor_columns(
+            IcebergWriteSinkMode::RowLineageData,
+            &resolved_columns,
+            &sink_input_columns,
+        );
+
+        assert_eq!(
+            descriptor_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "_row_id", "_last_updated_sequence_number"]
         );
     }
 

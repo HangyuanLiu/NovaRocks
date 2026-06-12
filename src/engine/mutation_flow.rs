@@ -21,6 +21,7 @@ use crate::engine::write_transaction::{
     IcebergWriteCommitExecutor, IcebergWriteCommitPolicy, IcebergWriteSource,
     IcebergWriteTransactionExecutor, IcebergWriteTransactionRunner, IcebergWriteTransactionSpec,
     IcebergWriteValidationPolicy, local_writer_commit_input, new_local_writer_write_id,
+    write_commit_has_files,
 };
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOperationTarget};
@@ -28,6 +29,7 @@ use crate::runtime::coordinator::CoordinatedQueryResult;
 use crate::runtime::query_result::QueryResult;
 use crate::runtime::write_coordinator::WriteCommitInput;
 use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
+use crate::sql::codegen::iceberg_write_sink::IcebergWriteSinkSpec;
 use crate::sql::parser::ast::{
     MergeMatchedAction, MergeNotMatchedAction, MergeStmt, ObjectName, UpdateStmt,
 };
@@ -135,6 +137,14 @@ pub(crate) fn execute_update_statement(
             matched,
             entry,
             &target_ref,
+            build_update_mor_distributed_write(
+                state,
+                &target,
+                stmt,
+                current_catalog,
+                &target_columns,
+                &target_ref,
+            )?,
         ),
     }
 }
@@ -230,6 +240,264 @@ fn mutation_source_relation_to_sql(
     }
 }
 
+fn build_update_mor_distributed_write(
+    state: &Arc<StandaloneState>,
+    target: &crate::engine::backend_resolver::TargetBackend,
+    stmt: &UpdateStmt,
+    current_catalog: Option<&str>,
+    target_columns: &[crate::engine::catalog::ColumnDef],
+    target_ref: &str,
+) -> Result<MorUpdateDistributedWrite, String> {
+    let entry = {
+        let registry = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+        registry.get(&target.catalog)?
+    };
+    let catalog = build_iceberg_catalog(&entry)?;
+    let table_ident = iceberg::TableIdent::new(
+        iceberg::NamespaceIdent::new(target.namespace.clone()),
+        target.table.clone(),
+    );
+    let table = block_on_iceberg(async { catalog.load_table(&table_ident).await })?
+        .map_err(|e| format!("load iceberg table {}: {e}", &table_ident))?;
+    let resolved = {
+        let registry = state.connectors.read().expect("connector registry read");
+        let backend = registry.catalog_backend("iceberg")?;
+        backend.load_table(&target.catalog, &target.namespace, &target.table)?
+    };
+    let data_sink_spec = crate::engine::iceberg_writer::build_row_lineage_data_sink_spec(
+        target, &resolved, &table, &entry,
+    )?;
+    let target_alias = stmt.alias.as_deref().unwrap_or("__nr_t");
+    let source_sql = mutation_source_to_sql(state, &stmt.source, current_catalog, target)?;
+    let where_sql = stmt.where_clause.as_ref().map(|expr| expr.to_string());
+    let assignments_sql = stmt
+        .assignments
+        .iter()
+        .map(|assignment| (assignment.column.as_str(), assignment.value.to_string()))
+        .collect::<Vec<_>>();
+    let assignments_sql = assignments_sql
+        .iter()
+        .map(|(column, expr)| (*column, expr.as_str()))
+        .collect::<Vec<_>>();
+    let new_sequence_number = table.metadata().last_sequence_number() + 1;
+    let data_query = build_update_mor_data_sink_query(
+        target,
+        target_alias,
+        source_sql.as_deref(),
+        &assignments_sql,
+        where_sql.as_deref(),
+        target_columns,
+        target_ref,
+        new_sequence_number,
+    )?;
+    Ok(MorUpdateDistributedWrite {
+        data_query,
+        data_sink_spec,
+    })
+}
+
+fn build_merge_mor_distributed_write(
+    state: &Arc<StandaloneState>,
+    target: &crate::engine::backend_resolver::TargetBackend,
+    stmt: &MergeStmt,
+    current_catalog: Option<&str>,
+    target_columns: &[crate::engine::catalog::ColumnDef],
+    target_ref: &str,
+) -> Result<MorUpdateDistributedWrite, String> {
+    let entry = {
+        let registry = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+        registry.get(&target.catalog)?
+    };
+    let catalog = build_iceberg_catalog(&entry)?;
+    let table_ident = iceberg::TableIdent::new(
+        iceberg::NamespaceIdent::new(target.namespace.clone()),
+        target.table.clone(),
+    );
+    let table = block_on_iceberg(async { catalog.load_table(&table_ident).await })?
+        .map_err(|e| format!("load iceberg table {}: {e}", &table_ident))?;
+    let resolved = {
+        let registry = state.connectors.read().expect("connector registry read");
+        let backend = registry.catalog_backend("iceberg")?;
+        backend.load_table(&target.catalog, &target.namespace, &target.table)?
+    };
+    let data_sink_spec = crate::engine::iceberg_writer::build_row_lineage_data_sink_spec(
+        target, &resolved, &table, &entry,
+    )?;
+    let target_alias = stmt
+        .target_alias
+        .as_deref()
+        .unwrap_or(MERGE_TARGET_DEFAULT_ALIAS);
+    let source_table_sql =
+        mutation_source_relation_to_sql(state, &stmt.source, current_catalog, target)?;
+    let source_sql = match &stmt.source {
+        crate::sql::parser::ast::MutationSource::Table { alias, .. }
+        | crate::sql::parser::ast::MutationSource::Query { alias, .. } => {
+            if alias.is_some() {
+                source_table_sql
+            } else {
+                format!("{source_table_sql} AS {MERGE_SOURCE_DEFAULT_ALIAS}")
+            }
+        }
+    };
+    let matched = stmt
+        .matched
+        .as_ref()
+        .ok_or_else(|| "MERGE matched UPDATE write requires a matched clause".to_string())?;
+    let assignments = match &matched.action {
+        MergeMatchedAction::Update { assignments } => assignments,
+        MergeMatchedAction::Delete => {
+            return Err("MERGE matched DELETE cannot use MOR UPDATE writer".to_string());
+        }
+    };
+    let assignments_sql = assignments
+        .iter()
+        .map(|assignment| (assignment.column.as_str(), assignment.value.to_string()))
+        .collect::<Vec<_>>();
+    let assignments_sql = assignments_sql
+        .iter()
+        .map(|(column, expr)| (*column, expr.as_str()))
+        .collect::<Vec<_>>();
+    let on_sql = stmt.on.to_string();
+    let matched_predicate_sql = matched.predicate.as_ref().map(|expr| expr.to_string());
+    let where_sql = match matched_predicate_sql.as_deref() {
+        Some(predicate) => format!("({on_sql}) AND ({predicate})"),
+        None => on_sql,
+    };
+    let new_sequence_number = table.metadata().last_sequence_number() + 1;
+    let data_query = build_update_mor_data_sink_query(
+        target,
+        target_alias,
+        Some(&source_sql),
+        &assignments_sql,
+        Some(&where_sql),
+        target_columns,
+        target_ref,
+        new_sequence_number,
+    )?;
+    Ok(MorUpdateDistributedWrite {
+        data_query,
+        data_sink_spec,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_update_mor_data_sink_query(
+    target: &crate::engine::backend_resolver::TargetBackend,
+    target_alias: &str,
+    source_sql: Option<&str>,
+    assignments_sql: &[(&str, &str)],
+    where_sql: Option<&str>,
+    target_columns: &[crate::engine::catalog::ColumnDef],
+    target_ref: &str,
+    new_sequence_number: i64,
+) -> Result<sqlparser::ast::Query, String> {
+    let assignment_by_column = assignments_sql
+        .iter()
+        .map(|(column, expr)| (column.to_ascii_lowercase(), *expr))
+        .collect::<HashMap<_, _>>();
+    let mut select_items = Vec::with_capacity(target_columns.len() + 2);
+    for column in target_columns {
+        let expr = assignment_by_column
+            .get(&column.name.to_ascii_lowercase())
+            .map(|expr| format!("({expr})"))
+            .unwrap_or_else(|| qualify_column(target_alias, &column.name));
+        select_items.push(format!("{expr} AS {}", sql_identifier(&column.name)));
+    }
+    select_items.push(format!(
+        "{} AS {}",
+        qualify_column(target_alias, crate::exec::row_position::ICEBERG_ROW_ID_COL),
+        sql_identifier(crate::exec::row_position::ICEBERG_ROW_ID_COL)
+    ));
+    select_items.push(format!(
+        "{} AS {}",
+        new_sequence_number,
+        sql_identifier(crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL)
+    ));
+    let sql = build_update_distributed_select_sql(
+        target,
+        target_alias,
+        source_sql,
+        where_sql,
+        target_ref,
+        select_items,
+        Some(qualify_column(
+            target_alias,
+            crate::exec::row_position::ICEBERG_ROW_ID_COL,
+        )),
+    );
+    parse_generated_query(&sql, "MOR UPDATE data sink")
+}
+
+fn build_update_distributed_select_sql(
+    target: &crate::engine::backend_resolver::TargetBackend,
+    target_alias: &str,
+    source_sql: Option<&str>,
+    where_sql: Option<&str>,
+    target_ref: &str,
+    select_items: Vec<String>,
+    order_by: Option<String>,
+) -> String {
+    let version_clause = if target_ref == "main" {
+        String::new()
+    } else {
+        format!(" FOR VERSION AS OF {}", sql_string_literal(target_ref))
+    };
+    let mut sql = format!(
+        "SELECT {} FROM {}{} AS {}",
+        select_items.join(", "),
+        qualify_iceberg_table(target),
+        version_clause,
+        sql_identifier(target_alias)
+    );
+    if let Some(source) = source_sql {
+        sql.push_str(" CROSS JOIN ");
+        sql.push_str(source);
+    }
+    if let Some(pred) = where_sql {
+        sql.push_str(" WHERE ");
+        sql.push_str(pred);
+    }
+    if let Some(order_by) = order_by {
+        sql.push_str(" ORDER BY ");
+        sql.push_str(&order_by);
+    }
+    sql
+}
+
+fn parse_generated_query(sql: &str, context: &str) -> Result<sqlparser::ast::Query, String> {
+    match crate::sql::parser::parse_sql_raw(sql)? {
+        sqlparser::ast::Statement::Query(query) => Ok(*query),
+        other => Err(format!("{context} generated non-query statement: {other}")),
+    }
+}
+
+fn qualify_iceberg_table(target: &crate::engine::backend_resolver::TargetBackend) -> String {
+    format!(
+        "{}.{}.{}",
+        sql_identifier(&target.catalog),
+        sql_identifier(&target.namespace),
+        sql_identifier(&target.table)
+    )
+}
+
+fn qualify_column(alias: &str, column: &str) -> String {
+    format!("{}.{}", sql_identifier(alias), sql_identifier(column))
+}
+
+fn sql_identifier(name: &str) -> String {
+    format!("`{}`", name.replace('`', "``"))
+}
+
+fn sql_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 fn execute_mor_update(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
@@ -239,6 +507,7 @@ fn execute_mor_update(
     matched: MatchedUpdateBatch,
     entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
     target_ref: &str,
+    write: MorUpdateDistributedWrite,
 ) -> Result<StatementResult, String> {
     if matched.row_ids.is_empty() {
         return Ok(StatementResult::Ok);
@@ -268,20 +537,145 @@ fn execute_mor_update(
         )
         .with_table_metadata(metadata.clone()),
     );
-    run_mutation_write_transaction(
+    let referenced_partitions =
+        crate::engine::delete_flow::load_referenced_data_file_partitions_at(
+            &table,
+            read_snapshot_id,
+        )?;
+    let delete_groups =
+        build_position_delete_groups_from_matched(&matched, &referenced_partitions)?;
+    run_mor_update_distributed_transaction(
         state,
         target,
         catalog,
         table,
         collector,
         entry,
-        CommitOpKind::RowDeltaDv,
-        IcebergOperationKind::RowDelta,
         read_snapshot_id,
         target_ref,
-        MutationWritePlan::MorUpdate { matched },
+        write,
+        delete_groups,
     )?;
     Ok(StatementResult::Ok)
+}
+
+struct MorUpdateDistributedWrite {
+    data_query: sqlparser::ast::Query,
+    data_sink_spec: IcebergWriteSinkSpec,
+}
+
+struct DistributedMorUpdateExecutor {
+    state: Arc<StandaloneState>,
+    target: crate::engine::backend_resolver::TargetBackend,
+    write: MorUpdateDistributedWrite,
+    commit_executor: IcebergWriteCommitExecutor,
+}
+
+impl IcebergWriteTransactionExecutor for DistributedMorUpdateExecutor {
+    fn run_coordinated_write(
+        &self,
+        _spec: &IcebergWriteTransactionSpec,
+    ) -> Result<CoordinatedQueryResult, String> {
+        let data = crate::engine::execute_query_as_iceberg_write(
+            &self.state,
+            Some(&self.target.catalog),
+            &self.target.namespace,
+            &self.write.data_query,
+            self.write.data_sink_spec.clone(),
+            None,
+        )?;
+        if data.write_abort.is_none()
+            && data
+                .write_commit
+                .as_ref()
+                .is_none_or(|commit| !write_commit_has_files(commit))
+        {
+            return Err(
+                "MOR UPDATE distributed data sink produced no replacement data files".to_string(),
+            );
+        }
+        Ok(data)
+    }
+
+    fn commit(
+        &self,
+        _spec: &IcebergWriteTransactionSpec,
+        write_commit: &WriteCommitInput,
+    ) -> Result<CommitOutcome, CommitServiceError> {
+        self.commit_executor.commit_write_input(write_commit)
+    }
+
+    fn finalize(&self, _spec: &IcebergWriteTransactionSpec) -> Result<(), String> {
+        self.commit_executor.finalize()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_mor_update_distributed_transaction(
+    state: &Arc<StandaloneState>,
+    target: &crate::engine::backend_resolver::TargetBackend,
+    catalog: Arc<dyn Catalog>,
+    table: iceberg::table::Table,
+    collector: Arc<IcebergCommitCollector>,
+    entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    base_snapshot_id: Option<i64>,
+    target_ref: &str,
+    write: MorUpdateDistributedWrite,
+    delete_groups: Vec<crate::connector::iceberg::commit::PositionDeleteGroup>,
+) -> Result<(), String> {
+    let abort_cleanup =
+        crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
+    for group in delete_groups {
+        collector.inject_delete_group(group);
+    }
+    let commit_executor = IcebergWriteCommitExecutor {
+        state: Arc::clone(state),
+        target: target.clone(),
+        catalog,
+        table,
+        collector,
+        fs: abort_cleanup.fs,
+        cleanup_path_mapper: abort_cleanup.path_mapper,
+        cow_update_rewrite: None,
+        target_ref: target_ref.to_string(),
+        snapshot_properties: BTreeMap::new(),
+    };
+    let spec = IcebergWriteTransactionSpec {
+        target: IcebergOperationTarget {
+            catalog: target.catalog.clone(),
+            namespace: target.namespace.clone(),
+            table: target.table.clone(),
+            ref_name: (target_ref != "main").then(|| target_ref.to_string()),
+        },
+        operation_kind: IcebergOperationKind::RowDelta,
+        attempt_id: format!(
+            "{}.{}.{}:mor-update-distributed:{}",
+            target.catalog,
+            target.namespace,
+            target.table,
+            uuid::Uuid::new_v4()
+        ),
+        commit: IcebergWriteCommitPolicy {
+            commit_op_kind: CommitOpKind::RowDeltaDv,
+            base_snapshot_id,
+            base_snapshot_map: BTreeMap::new(),
+            target_ref: target_ref.to_string(),
+            snapshot_properties: BTreeMap::new(),
+        },
+        validation: IcebergWriteValidationPolicy {
+            require_v3_for_branch: target_ref != "main",
+        },
+        source: IcebergWriteSource::CoordinatedPlan,
+    };
+    let executor = DistributedMorUpdateExecutor {
+        state: Arc::clone(state),
+        target: target.clone(),
+        write,
+        commit_executor,
+    };
+    let runner = IcebergWriteTransactionRunner::new(Arc::clone(state), &executor);
+    let _outcome = runner.run(spec)?;
+    Ok(())
 }
 
 struct MorUpdateRun {
@@ -1566,6 +1960,14 @@ pub(crate) fn execute_merge_statement(
                             matched,
                             entry.clone(),
                             "main",
+                            build_merge_mor_distributed_write(
+                                state,
+                                &target,
+                                stmt,
+                                current_catalog,
+                                &target_columns,
+                                "main",
+                            )?,
                         )?,
                     };
                     applied_change = true;
@@ -2104,6 +2506,15 @@ mod tests {
         }
     }
 
+    fn iceberg_target() -> crate::engine::backend_resolver::TargetBackend {
+        crate::engine::backend_resolver::TargetBackend {
+            backend_name: "iceberg",
+            catalog: "ice".to_string(),
+            namespace: "db1".to_string(),
+            table: "t".to_string(),
+        }
+    }
+
     #[test]
     fn reject_reserved_update_columns() {
         let err = validate_update_assignments(
@@ -2154,6 +2565,26 @@ mod tests {
         assert!(sql.contains("t._row_id AS __nr_row_id"), "{sql}");
         assert!(sql.contains("s.v AS __nr_new_v"), "{sql}");
         assert!(sql.contains("WHERE t.id = s.id"), "{sql}");
+    }
+
+    #[test]
+    fn update_mor_data_sink_query_projects_row_lineage_columns() {
+        let query = build_update_mor_data_sink_query(
+            &iceberg_target(),
+            "t",
+            Some("staging.s AS s"),
+            &[("v", "s.v")],
+            Some("t.id = s.id"),
+            &[col("id"), col("v")],
+            "main",
+            42,
+        )
+        .expect("query");
+        let sql = query.to_string();
+        assert!(sql.contains("_row_id"), "{sql}");
+        assert!(sql.contains("_last_updated_sequence_number"), "{sql}");
+        assert!(sql.contains("42"), "{sql}");
+        assert!(sql.contains("ORDER BY"), "{sql}");
     }
 
     #[test]
