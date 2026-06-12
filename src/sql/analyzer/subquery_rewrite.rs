@@ -73,19 +73,21 @@ impl<'a> AnalyzerContext<'a> {
 
         let mode = super::subquery_unnest_mode();
         for sq_info in subqueries {
-            // In apply / apply_strict mode, route scalar subqueries to the Apply
-            // framework instead of the legacy join-rewrite. Non-scalar subqueries
-            // (EXISTS/IN) and scalar subqueries in JOIN-ON clauses always use the
-            // legacy path.
-            let route_to_apply = !matches!(
+            let apply_enabled = !matches!(
                 mode,
                 crate::sql::optimizer::options::SubqueryUnnestMode::Legacy
-            ) && matches!(sq_info.kind, SubqueryKind::Scalar);
-            if route_to_apply {
-                match self.collect_scalar_apply_spec(select, scope, &sq_info) {
+            );
+            if apply_enabled {
+                let routed = match &sq_info.kind {
+                    SubqueryKind::Scalar => self.collect_scalar_apply_spec(select, scope, &sq_info),
+                    SubqueryKind::Exists { .. } | SubqueryKind::InSubquery { .. } => {
+                        self.collect_predicate_apply_spec(select, scope, &sq_info)
+                    }
+                };
+                match routed {
                     Ok(true) => continue, // spec recorded; placeholder replaced
                     Ok(false) => {
-                        // Shape not supported by M1a — fall through to legacy below.
+                        // Shape not supported by Apply yet — fall through to legacy below.
                     }
                     Err(e) => {
                         if matches!(
@@ -221,6 +223,97 @@ impl<'a> AnalyzerContext<'a> {
             inner: resolved_sub,
             correlation_column_ids: corr_ids,
             need_check_max_rows: true,
+            subquery_text: sq_info.subquery.to_string(),
+        });
+        Ok(true)
+    }
+
+    /// Apply-mode handler for an EXISTS / NOT EXISTS / IN / NOT IN subquery.
+    /// Returns Ok(true) if an ApplyPredicateSpec was recorded and the placeholder
+    /// conjunct removed; Ok(false) if the shape should fall back to legacy
+    /// (not a top-level AND of WHERE, HAVING/JOIN-ON/projection position,
+    /// multi-column IN, or a correlated form this milestone does not handle);
+    /// Err on a hard analysis failure.
+    fn collect_predicate_apply_spec(
+        &self,
+        select: &mut ResolvedSelect,
+        scope: &mut AnalyzerScope,
+        sq_info: &SubqueryInfo,
+    ) -> Result<bool, String> {
+        use crate::sql::analysis::{ApplyClause, ApplyPredicateSpec, OutputColumn};
+
+        let top_level_where_conjunct = select
+            .filter
+            .as_ref()
+            .map(|f| is_placeholder_top_level_and_conjunct(f, sq_info.id))
+            .unwrap_or(false);
+        if !top_level_where_conjunct {
+            return Ok(false);
+        }
+        let inside_or = select
+            .filter
+            .as_ref()
+            .map(|f| is_placeholder_inside_or(f, sq_info.id))
+            .unwrap_or(false);
+        if inside_or {
+            return Ok(false);
+        }
+
+        let (resolved_sub, inner_scope) =
+            self.analyze_query_in_scope_with_inner(&sq_info.subquery, scope)?;
+
+        let in_lhs = match &sq_info.kind {
+            SubqueryKind::InSubquery { .. } => {
+                let in_expr = sq_info
+                    .in_expr
+                    .as_ref()
+                    .ok_or_else(|| "IN subquery missing LHS expression".to_string())?;
+                if matches!(in_expr.as_ref(), sqlparser::ast::Expr::Tuple(_))
+                    || matches!(
+                        in_expr.as_ref(),
+                        sqlparser::ast::Expr::Nested(inner)
+                            if matches!(inner.as_ref(), sqlparser::ast::Expr::Tuple(_))
+                    )
+                {
+                    return Ok(false);
+                }
+                if resolved_sub.output_columns.len() != 1 {
+                    return Ok(false);
+                }
+                Some(self.analyze_expr(in_expr, scope)?)
+            }
+            SubqueryKind::Exists { .. } => None,
+            SubqueryKind::Scalar => return Ok(false),
+        };
+
+        let corr_ids =
+            collect_eq_correlation_column_ids_for_apply(&resolved_sub, &inner_scope, scope);
+        let outer_refs = collect_subquery_outer_ref_usage(&resolved_sub, &inner_scope, scope);
+        if outer_refs.outside_filter || (outer_refs.filter && corr_ids.is_empty()) {
+            return Ok(false);
+        }
+
+        let output_name = format!("__pred_sq_{}", sq_info.id);
+        let output_id = self.alloc_column_id(None, output_name.clone(), DataType::Boolean, false);
+        let output_column = OutputColumn {
+            column_id: output_id,
+            name: output_name,
+            data_type: DataType::Boolean,
+            nullable: false,
+            is_internal: true,
+        };
+
+        Self::remove_placeholder_from_filter(&mut select.filter, sq_info.id);
+
+        select.predicate_apply_specs.push(ApplyPredicateSpec {
+            subquery_id: sq_info.id,
+            kind: sq_info.kind.clone(),
+            clause: ApplyClause::Where,
+            output_column,
+            inner: resolved_sub,
+            correlation_column_ids: corr_ids,
+            in_lhs,
+            use_semi_anti: true,
             subquery_text: sq_info.subquery.to_string(),
         });
         Ok(true)
@@ -2641,6 +2734,141 @@ fn expr_references_outer_scope(
     saw_outer
 }
 
+#[derive(Default)]
+struct SubqueryOuterRefUsage {
+    filter: bool,
+    outside_filter: bool,
+}
+
+fn collect_subquery_outer_ref_usage(
+    resolved_sub: &crate::sql::analysis::ResolvedQuery,
+    inner_scope: &AnalyzerScope,
+    outer_scope: &AnalyzerScope,
+) -> SubqueryOuterRefUsage {
+    let mut usage = SubqueryOuterRefUsage::default();
+    if sort_items_reference_outer_scope(&resolved_sub.order_by, inner_scope, outer_scope) {
+        usage.outside_filter = true;
+    }
+
+    match &resolved_sub.body {
+        QueryBody::Select(sel) => {
+            if let Some(f) = &sel.filter {
+                usage.filter = expr_references_outer_scope(f, inner_scope, outer_scope);
+            }
+            if relation_references_outer_scope(&sel.from, inner_scope, outer_scope)
+                || sel
+                    .projection
+                    .iter()
+                    .any(|p| expr_references_outer_scope(&p.expr, inner_scope, outer_scope))
+                || sel
+                    .group_by
+                    .iter()
+                    .any(|g| expr_references_outer_scope(g, inner_scope, outer_scope))
+                || sel
+                    .having
+                    .as_ref()
+                    .is_some_and(|h| expr_references_outer_scope(h, inner_scope, outer_scope))
+            {
+                usage.outside_filter = true;
+            }
+        }
+        QueryBody::SetOperation(set) => {
+            if query_references_outer_scope(&set.left, inner_scope, outer_scope)
+                || query_references_outer_scope(&set.right, inner_scope, outer_scope)
+            {
+                usage.outside_filter = true;
+            }
+        }
+        QueryBody::Values(values) => {
+            if values
+                .rows
+                .iter()
+                .flatten()
+                .any(|expr| expr_references_outer_scope(expr, inner_scope, outer_scope))
+            {
+                usage.outside_filter = true;
+            }
+        }
+    }
+    usage
+}
+
+fn query_references_outer_scope(
+    query: &crate::sql::analysis::ResolvedQuery,
+    inner_scope: &AnalyzerScope,
+    outer_scope: &AnalyzerScope,
+) -> bool {
+    let usage = collect_subquery_outer_ref_usage(query, inner_scope, outer_scope);
+    usage.filter || usage.outside_filter
+}
+
+fn relation_references_outer_scope(
+    relation: &Option<Relation>,
+    inner_scope: &AnalyzerScope,
+    outer_scope: &AnalyzerScope,
+) -> bool {
+    relation
+        .as_ref()
+        .is_some_and(|rel| relation_node_references_outer_scope(rel, inner_scope, outer_scope))
+}
+
+fn relation_node_references_outer_scope(
+    relation: &Relation,
+    inner_scope: &AnalyzerScope,
+    outer_scope: &AnalyzerScope,
+) -> bool {
+    match relation {
+        Relation::Join(join) => {
+            relation_node_references_outer_scope(&join.left, inner_scope, outer_scope)
+                || relation_node_references_outer_scope(&join.right, inner_scope, outer_scope)
+                || join
+                    .condition
+                    .as_ref()
+                    .is_some_and(|cond| expr_references_outer_scope(cond, inner_scope, outer_scope))
+        }
+        Relation::Subquery { query, .. } => {
+            query_references_outer_scope(query, inner_scope, outer_scope)
+        }
+        Relation::Unnest(unnest) => unnest
+            .args
+            .iter()
+            .any(|arg| expr_references_outer_scope(arg, inner_scope, outer_scope)),
+        Relation::Scan(_)
+        | Relation::IcebergMetadataScan(_)
+        | Relation::IcebergDeltaScan(_)
+        | Relation::GenerateSeries(_)
+        | Relation::CTEConsume { .. } => false,
+    }
+}
+
+fn sort_items_reference_outer_scope(
+    items: &[SortItem],
+    inner_scope: &AnalyzerScope,
+    outer_scope: &AnalyzerScope,
+) -> bool {
+    items
+        .iter()
+        .any(|item| expr_references_outer_scope(&item.expr, inner_scope, outer_scope))
+}
+
+fn is_placeholder_top_level_and_conjunct(expr: &TypedExpr, id: usize) -> bool {
+    if is_placeholder(expr, id) {
+        return true;
+    }
+    match &expr.kind {
+        ExprKind::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } => {
+            is_placeholder_top_level_and_conjunct(left, id)
+                || is_placeholder_top_level_and_conjunct(right, id)
+        }
+        ExprKind::Nested(inner) => is_placeholder_top_level_and_conjunct(inner, id),
+        _ => false,
+    }
+}
+
 fn walk_for_outer_ref(
     expr: &TypedExpr,
     inner_scope: &AnalyzerScope,
@@ -2667,13 +2895,24 @@ fn walk_for_outer_ref(
         }
         ExprKind::UnaryOp { expr: inner, .. }
         | ExprKind::IsNull { expr: inner, .. }
+        | ExprKind::IsTruthValue { expr: inner, .. }
         | ExprKind::Cast { expr: inner, .. }
-        | ExprKind::Nested(inner) => {
+        | ExprKind::Nested(inner)
+        | ExprKind::LambdaFunction { body: inner, .. }
+        | ExprKind::Lambda { body: inner, .. } => {
             walk_for_outer_ref(inner, inner_scope, outer_scope, saw_outer);
         }
-        ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
+        ExprKind::FunctionCall { args, .. } => {
             for a in args {
                 walk_for_outer_ref(a, inner_scope, outer_scope, saw_outer);
+            }
+        }
+        ExprKind::AggregateCall { args, order_by, .. } => {
+            for a in args {
+                walk_for_outer_ref(a, inner_scope, outer_scope, saw_outer);
+            }
+            for item in order_by {
+                walk_for_outer_ref(&item.expr, inner_scope, outer_scope, saw_outer);
             }
         }
         ExprKind::Case {
@@ -2698,6 +2937,40 @@ fn walk_for_outer_ref(
             walk_for_outer_ref(inner, inner_scope, outer_scope, saw_outer);
             for v in list {
                 walk_for_outer_ref(v, inner_scope, outer_scope, saw_outer);
+            }
+        }
+        ExprKind::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            walk_for_outer_ref(inner, inner_scope, outer_scope, saw_outer);
+            walk_for_outer_ref(low, inner_scope, outer_scope, saw_outer);
+            walk_for_outer_ref(high, inner_scope, outer_scope, saw_outer);
+        }
+        ExprKind::Like {
+            expr: inner,
+            pattern,
+            ..
+        } => {
+            walk_for_outer_ref(inner, inner_scope, outer_scope, saw_outer);
+            walk_for_outer_ref(pattern, inner_scope, outer_scope, saw_outer);
+        }
+        ExprKind::WindowCall {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for a in args {
+                walk_for_outer_ref(a, inner_scope, outer_scope, saw_outer);
+            }
+            for p in partition_by {
+                walk_for_outer_ref(p, inner_scope, outer_scope, saw_outer);
+            }
+            for item in order_by {
+                walk_for_outer_ref(&item.expr, inner_scope, outer_scope, saw_outer);
             }
         }
         // Literal / LambdaParamRef / SubqueryPlaceholder / etc. — no
@@ -3126,6 +3399,34 @@ fn collect_correlation_column_ids(
     let preds = extract_correlation_predicates(filter, inner_scope, outer_scope);
     let mut ids: Vec<crate::sql::column_id::ColumnId> = Vec::new();
     for pred in &preds {
+        collect_column_ids_in_expr(&pred.outer_col, &mut ids);
+    }
+    let mut seen = std::collections::HashSet::new();
+    ids.retain(|id| seen.insert(*id));
+    ids
+}
+
+/// Collect only equality correlation column ids for predicate Apply routing.
+///
+/// The legacy rewrite uses non-equality correlation predicates too, but M3's
+/// Apply-to-join rules only treat equality correlations as usable keys. Pure
+/// non-EQ outer references therefore fall back to the legacy path.
+fn collect_eq_correlation_column_ids_for_apply(
+    resolved_sub: &crate::sql::analysis::ResolvedQuery,
+    inner_scope: &super::scope::AnalyzerScope,
+    outer_scope: &super::scope::AnalyzerScope,
+) -> Vec<crate::sql::column_id::ColumnId> {
+    use crate::sql::analysis::QueryBody;
+    let filter = match &resolved_sub.body {
+        QueryBody::Select(sel) => match &sel.filter {
+            Some(f) => f,
+            None => return Vec::new(),
+        },
+        _ => return Vec::new(),
+    };
+    let preds = extract_correlation_predicates(filter, inner_scope, outer_scope);
+    let mut ids: Vec<crate::sql::column_id::ColumnId> = Vec::new();
+    for pred in preds.iter().filter(|pred| pred.op == BinOp::Eq) {
         collect_column_ids_in_expr(&pred.outer_col, &mut ids);
     }
     let mut seen = std::collections::HashSet::new();
