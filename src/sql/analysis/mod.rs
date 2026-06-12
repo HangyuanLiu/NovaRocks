@@ -77,6 +77,12 @@ pub(crate) struct ResolvedSelect {
     /// always empty in legacy mode). Consumed by the planner to emit
     /// `LogicalPlan::Apply`.
     pub apply_specs: Vec<ApplyScalarSpec>,
+    /// EXISTS/IN subqueries routed to the Apply framework (apply mode only;
+    /// always empty in legacy mode). Consumed by the planner alongside
+    /// `apply_specs` to emit `LogicalPlan::Apply`.
+    // Read by analyzer collection and planner in Task 2/3.
+    #[allow(dead_code)]
+    pub predicate_apply_specs: Vec<ApplyPredicateSpec>,
 }
 
 /// Metadata for ROLLUP/CUBE/GROUPING SETS repeat execution.
@@ -471,6 +477,38 @@ pub(crate) struct ApplyScalarSpec {
     /// Original subquery SQL text, for the M1b AssertOneRow runtime message.
     /// Read by M1b; unused in M1a production code.
     #[allow(dead_code)]
+    pub subquery_text: String,
+}
+
+/// An EXISTS / NOT EXISTS / IN / NOT IN subquery routed to the Apply framework
+/// (apply mode). Parallel to `ApplyScalarSpec`; the planner consumes these to
+/// emit `LogicalPlan::Apply` with `ApplyKind::Exists` / `ApplyKind::In`. The
+/// inner query is left INTACT — its WHERE (correlation + residual) is read by
+/// the M3 to-join rules (`ExistentialApplyToJoin` / `QuantifiedApplyToJoin`).
+// Constructed and read by analyzer collection and planner in Task 2/3.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct ApplyPredicateSpec {
+    /// Placeholder id this spec replaced (matches the original SubqueryInfo.id).
+    pub subquery_id: usize,
+    /// EXISTS{negated} or InSubquery{negated}. Maps to the planner ApplyKind.
+    pub kind: SubqueryKind,
+    /// Which clause the placeholder lived in. M3 only records `Where`.
+    pub clause: ApplyClause,
+    /// Fresh Boolean indicator column for the subquery in the Apply schema.
+    /// Removed from the outer filter (semantics carried by the semi/anti join),
+    /// so it is never referenced; it disappears when the join replaces the Apply.
+    pub output_column: OutputColumn,
+    /// Fully-analyzed inner subquery (outer refs carry outer column ids).
+    pub inner: ResolvedQuery,
+    /// Outer columns referenced inside the subquery (the correlation keys).
+    pub correlation_column_ids: Vec<ColumnId>,
+    /// For IN/NOT IN: the analyzed single-column LHS. None for EXISTS.
+    pub in_lhs: Option<TypedExpr>,
+    /// True iff the subquery is a top-level AND conjunct of WHERE (always true
+    /// for an M3-recorded spec; carried for the planner and EXPLAIN parity).
+    pub use_semi_anti: bool,
+    /// Original subquery SQL text (diagnostics).
     pub subquery_text: String,
 }
 

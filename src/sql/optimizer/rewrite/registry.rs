@@ -145,6 +145,7 @@ mod tests {
                 "ApplyToWindow",
                 "DeriveJoinNotNullPredicate",
                 "EliminateUniqueAggregate",
+                "ExistentialApplyToJoin",
                 "JoinPredicateMoveAround",
                 "JoinReorder",
                 "LowCardinalityDictionaryRewrite",
@@ -183,6 +184,7 @@ mod tests {
                 "PushSemiAntiRightOnlyCondition",
                 "PushSemiAntiRightOnlyCondition",
                 "PushSemiAntiRightOnlyCondition",
+                "QuantifiedApplyToJoin",
                 "ScalarApplyToJoin",
                 "TagRequiredColumns",
             ]
@@ -232,6 +234,8 @@ mod tests {
         // M2 window decorrelation rule.
         assert!(is_known_rewrite_rule_name("ApplyToWindow"));
         assert!(is_known_rewrite_rule_name("ScalarApplyToJoin"));
+        assert!(is_known_rewrite_rule_name("ExistentialApplyToJoin"));
+        assert!(is_known_rewrite_rule_name("QuantifiedApplyToJoin"));
     }
 
     fn assert_default_phase_trace(ctx: &RewriteContext) {

@@ -745,6 +745,78 @@ fn wrap_scalar_applies(
     Ok(current)
 }
 
+/// Wrap `input` in a left-deep chain of `LogicalPlan::Apply` nodes for each
+/// EXISTS/IN predicate spec whose clause matches `clause`. Mirrors
+/// `wrap_scalar_applies` but builds `ApplyKind::Exists` / `ApplyKind::In`
+/// semi/anti-collapsing applies. The M3 to-join rules read correlation and
+/// residual predicates directly from the inner Filter, so construction leaves
+/// `correlation_conjuncts` empty.
+fn wrap_predicate_applies(
+    input: LogicalPlan,
+    specs: &mut Vec<ApplyPredicateSpec>,
+    clause: ApplyClause,
+    cte_registry: &CTERegistry,
+    factory: &mut ColumnRefFactory,
+) -> Result<LogicalPlan, String> {
+    use crate::sql::analysis::SubqueryKind;
+
+    let mut current = input;
+    let mut remaining = Vec::new();
+    for spec in specs.drain(..) {
+        if spec.clause != clause {
+            remaining.push(spec);
+            continue;
+        }
+        let right = plan_scoped_query(spec.inner, cte_registry, factory)?;
+        let inner_output_column_id = plan_output_columns(&right)?
+            .first()
+            .map(|c| c.column_id)
+            .ok_or_else(|| "EXISTS/IN subquery inner has no output column".to_string())?;
+
+        let kind = match spec.kind {
+            SubqueryKind::Exists { negated } => ApplyKind::Exists { negated },
+            SubqueryKind::InSubquery { negated } => ApplyKind::In { negated },
+            SubqueryKind::Scalar => {
+                return Err("scalar spec routed to wrap_predicate_applies".to_string());
+            }
+        };
+
+        let subquery_expr = match (&kind, spec.in_lhs.clone()) {
+            (ApplyKind::In { .. }, Some(lhs)) => lhs,
+            (ApplyKind::In { .. }, None) => {
+                return Err("IN spec missing analyzed LHS".to_string());
+            }
+            _ => TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: spec.output_column.column_id,
+                    qualifier: None,
+                    column: spec.output_column.name.clone(),
+                },
+                data_type: spec.output_column.data_type.clone(),
+                nullable: spec.output_column.nullable,
+            },
+        };
+
+        current = LogicalPlan::Apply(ApplyNode {
+            left: Box::new(current),
+            right: Box::new(right),
+            kind,
+            subquery_expr,
+            output_column: spec.output_column,
+            inner_output_column_id,
+            correlation_column_ids: spec.correlation_column_ids,
+            correlation_conjuncts: Vec::new(),
+            residual_predicate: None,
+            need_check_max_rows: false,
+            use_semi_anti: spec.use_semi_anti,
+            uncorrelated_outer_predicate_columns: std::collections::HashSet::new(),
+            required_output_columns: None,
+        });
+    }
+    *specs = remaining;
+    Ok(current)
+}
+
 // ---------------------------------------------------------------------------
 // SELECT planning
 // ---------------------------------------------------------------------------
@@ -760,6 +832,7 @@ fn plan_select_scoped(
     // consume them clause by clause. Legacy mode always delivers an empty vec
     // here (no behavior change).
     let mut apply_specs = std::mem::take(&mut select.apply_specs);
+    let mut predicate_apply_specs = std::mem::take(&mut select.predicate_apply_specs);
 
     let mut current = match select.from.take() {
         Some(relation) => plan_relation_scoped(relation, cte_registry, factory)?,
@@ -776,6 +849,13 @@ fn plan_select_scoped(
     current = wrap_scalar_applies(
         current,
         &mut apply_specs,
+        ApplyClause::Where,
+        cte_registry,
+        factory,
+    )?;
+    current = wrap_predicate_applies(
+        current,
+        &mut predicate_apply_specs,
         ApplyClause::Where,
         cte_registry,
         factory,
@@ -897,9 +977,13 @@ fn plan_select_scoped(
     }
 
     debug_assert!(
-        apply_specs.is_empty(),
-        "unplaced scalar apply specs: {:?}",
-        apply_specs.iter().map(|s| s.clause).collect::<Vec<_>>()
+        apply_specs.is_empty() && predicate_apply_specs.is_empty(),
+        "unplaced apply specs: scalar={:?} predicate={:?}",
+        apply_specs.iter().map(|s| s.clause).collect::<Vec<_>>(),
+        predicate_apply_specs
+            .iter()
+            .map(|s| s.clause)
+            .collect::<Vec<_>>()
     );
 
     // SELECT DISTINCT → Aggregate on all output columns (deduplication)
@@ -3541,8 +3625,9 @@ mod tests {
         crate::sql::analyzer::analyze(&query, &TestCatalog, "default")
     }
 
-    /// Analyze and plan `sql` with `subquery_unnest_mode = Apply`.
-    fn parse_analyze_and_plan_apply(sql: &str) -> Result<LogicalPlan, String> {
+    fn parse_analyze_query_apply(
+        sql: &str,
+    ) -> Result<(ResolvedQuery, CTERegistry, ColumnRefFactory), String> {
         use crate::sql::optimizer::options::{
             SessionOptimizerSettings, SubqueryUnnestMode, with_session_optimizer_settings,
         };
@@ -3550,10 +3635,13 @@ mod tests {
             subquery_unnest_mode: SubqueryUnnestMode::Apply,
             ..Default::default()
         };
-        with_session_optimizer_settings(settings, || {
-            let (resolved, cte_registry, mut factory) = parse_analyze_query(sql)?;
-            plan_query(resolved, cte_registry, &mut factory)
-        })
+        with_session_optimizer_settings(settings, || parse_analyze_query(sql))
+    }
+
+    /// Analyze and plan `sql` with `subquery_unnest_mode = Apply`.
+    fn parse_analyze_and_plan_apply(sql: &str) -> Result<LogicalPlan, String> {
+        let (resolved, cte_registry, mut factory) = parse_analyze_query_apply(sql)?;
+        plan_query(resolved, cte_registry, &mut factory)
     }
 
     fn plan_test_query(sql: &str) -> LogicalPlan {
@@ -5685,6 +5773,152 @@ mod tests {
         assert!(
             projected,
             "Projection must reference the Apply output column"
+        );
+    }
+
+    fn plan_apply_mode_with_single_predicate_spec(
+        sql: &str,
+    ) -> (LogicalPlan, crate::sql::analysis::ApplyPredicateSpec) {
+        use crate::sql::analysis::QueryBody;
+
+        let (resolved, cte_registry, mut factory) =
+            parse_analyze_query_apply(sql).expect("apply-mode analyze must succeed");
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("expected SELECT body");
+        };
+        assert_eq!(
+            select.predicate_apply_specs.len(),
+            1,
+            "test query must record exactly one predicate apply spec"
+        );
+        let spec = select.predicate_apply_specs[0].clone();
+        let plan = plan_query(resolved, cte_registry, &mut factory)
+            .expect("planner must consume predicate apply spec");
+        (plan, spec)
+    }
+
+    fn direct_where_apply(plan: &LogicalPlan) -> &ApplyNode {
+        let LogicalPlan::Project(project) = plan else {
+            panic!("expected Project root, got {plan:?}");
+        };
+        match project.input.as_ref() {
+            LogicalPlan::Filter(filter) => {
+                let LogicalPlan::Apply(apply) = filter.input.as_ref() else {
+                    panic!(
+                        "expected Apply directly below WHERE Filter, got {:?}",
+                        filter.input
+                    );
+                };
+                apply
+            }
+            LogicalPlan::Apply(apply) => apply,
+            other => panic!("expected Filter->Apply or Apply below Project, got {other:?}"),
+        }
+    }
+
+    fn assert_same_column_ref_expr(actual: &TypedExpr, expected: &TypedExpr) {
+        assert_eq!(actual.data_type, expected.data_type);
+        assert_eq!(actual.nullable, expected.nullable);
+        let ExprKind::ColumnRef {
+            column_id: actual_id,
+            qualifier: actual_qualifier,
+            column: actual_column,
+        } = &actual.kind
+        else {
+            panic!("actual expression must be a ColumnRef, got {actual:?}");
+        };
+        let ExprKind::ColumnRef {
+            column_id: expected_id,
+            qualifier: expected_qualifier,
+            column: expected_column,
+        } = &expected.kind
+        else {
+            panic!("expected expression must be a ColumnRef, got {expected:?}");
+        };
+        assert_eq!(actual_id, expected_id);
+        assert_eq!(actual_qualifier, expected_qualifier);
+        assert_eq!(actual_column, expected_column);
+    }
+
+    #[test]
+    fn plan_exists_builds_apply_exists() {
+        let sql = "SELECT k1 FROM t1 WHERE k1 > 0 \
+                   AND EXISTS (SELECT 1 FROM t2 WHERE t2.k1 = t1.k1)";
+        let (plan, spec) = plan_apply_mode_with_single_predicate_spec(sql);
+        assert!(
+            !spec.correlation_column_ids.is_empty(),
+            "test query must record a correlated EXISTS predicate spec"
+        );
+
+        let LogicalPlan::Project(project) = &plan else {
+            panic!("expected Project root, got {plan:?}");
+        };
+        let LogicalPlan::Filter(filter) = project.input.as_ref() else {
+            panic!(
+                "expected residual WHERE Filter under Project, got {:?}",
+                project.input
+            );
+        };
+        let LogicalPlan::Apply(apply) = filter.input.as_ref() else {
+            panic!(
+                "expected Apply directly below WHERE Filter, got {:?}",
+                filter.input
+            );
+        };
+        assert_eq!(
+            apply.kind,
+            crate::sql::planner::plan::ApplyKind::Exists { negated: false }
+        );
+        assert_eq!(apply.correlation_column_ids, spec.correlation_column_ids);
+        assert!(apply.use_semi_anti);
+        assert!(!apply.need_check_max_rows);
+        assert!(apply.correlation_conjuncts.is_empty());
+    }
+
+    #[test]
+    fn plan_not_in_builds_apply_in_negated() {
+        let sql = "SELECT k1 FROM t1 WHERE t1.k1 NOT IN (SELECT t2.k2 FROM t2)";
+        let (plan, spec) = plan_apply_mode_with_single_predicate_spec(sql);
+        assert!(
+            spec.correlation_column_ids.is_empty(),
+            "test query must record an uncorrelated NOT IN predicate spec"
+        );
+        let apply = direct_where_apply(&plan);
+
+        assert_eq!(
+            apply.kind,
+            crate::sql::planner::plan::ApplyKind::In { negated: true }
+        );
+        assert!(apply.correlation_column_ids.is_empty());
+        let expected_lhs = spec
+            .in_lhs
+            .expect("IN predicate apply spec must carry analyzed LHS");
+        assert_same_column_ref_expr(&apply.subquery_expr, &expected_lhs);
+    }
+
+    #[test]
+    fn plan_exists_subquery_expr_is_boolean_colref() {
+        let sql = "SELECT k1 FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.k1 = t1.k1)";
+        let (plan, spec) = plan_apply_mode_with_single_predicate_spec(sql);
+        let apply = direct_where_apply(&plan);
+
+        assert_eq!(
+            apply.subquery_expr.data_type,
+            arrow::datatypes::DataType::Boolean
+        );
+        assert_eq!(
+            apply.subquery_expr.nullable, spec.output_column.nullable,
+            "EXISTS subquery_expr must mirror the Boolean predicate output nullability"
+        );
+        let ExprKind::ColumnRef { column_id, .. } = apply.subquery_expr.kind else {
+            panic!(
+                "EXISTS subquery_expr must be a Boolean ColumnRef, got {:?}",
+                apply.subquery_expr
+            );
+        };
+        assert_eq!(
+            column_id, spec.output_column.column_id,
+            "EXISTS subquery_expr must reference the predicate output column"
         );
     }
 }

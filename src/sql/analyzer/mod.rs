@@ -576,6 +576,7 @@ impl<'a> AnalyzerContext<'a> {
             distinct,
             repeat: None,
             apply_specs: Vec::new(),
+            predicate_apply_specs: Vec::new(),
         };
 
         // --- Subquery rewriting ---
@@ -6825,6 +6826,28 @@ mod tests {
     const CORRELATED_SCALAR_SQL: &str =
         "SELECT k1 FROM t1 WHERE k1 = (SELECT max(k2) FROM t2 WHERE t2.k1 = t1.k1)";
 
+    fn parse_and_analyze_with_apply_mode(sql: &str) -> Result<ResolvedQuery, String> {
+        use crate::sql::optimizer::options::{
+            SessionOptimizerSettings, SubqueryUnnestMode, with_session_optimizer_settings,
+        };
+
+        let dialect = sqlparser::dialect::GenericDialect {};
+        let stmts = sqlparser::parser::Parser::parse_sql(&dialect, sql)
+            .map_err(|e| format!("parse error: {e}"))?;
+        let stmt = stmts.into_iter().next().ok_or("empty SQL")?;
+        let query = match stmt {
+            sqlparser::ast::Statement::Query(q) => q,
+            _ => return Err("expected a query".into()),
+        };
+        let settings = SessionOptimizerSettings {
+            subquery_unnest_mode: SubqueryUnnestMode::Apply,
+            ..Default::default()
+        };
+        let (resolved, _cte, _factory) =
+            with_session_optimizer_settings(settings, || analyze(&query, &TestCatalog, "default"))?;
+        Ok(resolved)
+    }
+
     /// In apply mode a correlated scalar WHERE subquery must be recorded as an
     /// ApplyScalarSpec instead of being rewritten into a join.
     #[test]
@@ -6923,6 +6946,256 @@ mod tests {
         assert!(
             matches!(select.from, Some(crate::sql::analysis::Relation::Join(_))),
             "legacy mode must rewrite scalar subquery into a join"
+        );
+    }
+
+    #[test]
+    fn exists_correlated_where_records_predicate_spec() {
+        use crate::sql::analysis::{QueryBody, SubqueryKind};
+
+        let resolved = parse_and_analyze_with_apply_mode(
+            "SELECT k1 FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.k1 = t1.k1)",
+        )
+        .expect("analyze in apply mode");
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("expected select body");
+        };
+        assert_eq!(select.predicate_apply_specs.len(), 1);
+        let spec = &select.predicate_apply_specs[0];
+        assert!(matches!(spec.kind, SubqueryKind::Exists { negated: false }));
+        assert!(spec.use_semi_anti);
+        assert_eq!(spec.correlation_column_ids.len(), 1);
+        assert!(spec.in_lhs.is_none());
+        if let Some(filter) = &select.filter {
+            assert!(
+                !expr_has_subquery_placeholder(filter),
+                "WHERE filter must not contain a SubqueryPlaceholder after apply routing"
+            );
+        }
+    }
+
+    #[test]
+    fn not_exists_sets_negated() {
+        use crate::sql::analysis::{QueryBody, SubqueryKind};
+
+        let resolved = parse_and_analyze_with_apply_mode(
+            "SELECT k1 FROM t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE t2.k1 = t1.k1)",
+        )
+        .expect("analyze in apply mode");
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("expected select body");
+        };
+        assert_eq!(select.predicate_apply_specs.len(), 1);
+        assert!(matches!(
+            select.predicate_apply_specs[0].kind,
+            SubqueryKind::Exists { negated: true }
+        ));
+    }
+
+    #[test]
+    fn in_uncorrelated_records_spec_with_lhs() {
+        use crate::sql::analysis::{QueryBody, SubqueryKind};
+
+        let resolved = parse_and_analyze_with_apply_mode(
+            "SELECT k1 FROM t1 WHERE t1.k1 IN (SELECT t2.k2 FROM t2)",
+        )
+        .expect("analyze in apply mode");
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("expected select body");
+        };
+        assert_eq!(select.predicate_apply_specs.len(), 1);
+        let spec = &select.predicate_apply_specs[0];
+        assert!(matches!(
+            spec.kind,
+            SubqueryKind::InSubquery { negated: false }
+        ));
+        assert!(spec.in_lhs.is_some());
+        assert!(
+            spec.correlation_column_ids.is_empty(),
+            "uncorrelated IN must not record correlation column ids"
+        );
+    }
+
+    #[test]
+    fn not_in_sets_negated() {
+        use crate::sql::analysis::{QueryBody, SubqueryKind};
+
+        let resolved = parse_and_analyze_with_apply_mode(
+            "SELECT k1 FROM t1 WHERE t1.k1 NOT IN (SELECT t2.k2 FROM t2)",
+        )
+        .expect("analyze in apply mode");
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("expected select body");
+        };
+        assert_eq!(select.predicate_apply_specs.len(), 1);
+        assert!(matches!(
+            select.predicate_apply_specs[0].kind,
+            SubqueryKind::InSubquery { negated: true }
+        ));
+    }
+
+    #[test]
+    fn exists_inside_or_falls_back_to_legacy() {
+        use crate::sql::analysis::QueryBody;
+
+        let resolved = parse_and_analyze_with_apply_mode(
+            "SELECT k1 FROM t1 WHERE k1 = 1 OR EXISTS (SELECT 1 FROM t2 WHERE t2.k1 = t1.k1)",
+        )
+        .expect("analyze in apply mode");
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("expected select body");
+        };
+        assert!(select.predicate_apply_specs.is_empty());
+        assert!(
+            matches!(select.from, Some(crate::sql::analysis::Relation::Join(_))),
+            "inside-OR EXISTS should fall back to the legacy join rewrite"
+        );
+    }
+
+    #[test]
+    fn exists_in_having_falls_back_to_legacy() {
+        use crate::sql::analysis::QueryBody;
+
+        let resolved = parse_and_analyze_with_apply_mode(
+            "SELECT k1, count(*) FROM t1 GROUP BY k1 HAVING EXISTS (SELECT 1 FROM t2 WHERE t2.k1 = t1.k1)",
+        )
+        .expect("analyze in apply mode");
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("expected select body");
+        };
+        assert!(select.predicate_apply_specs.is_empty());
+        assert!(
+            matches!(select.from, Some(crate::sql::analysis::Relation::Join(_))),
+            "HAVING EXISTS should fall back to the legacy join rewrite"
+        );
+    }
+
+    #[test]
+    fn multi_column_in_falls_back_to_legacy() {
+        use crate::sql::analysis::QueryBody;
+
+        let resolved = parse_and_analyze_with_apply_mode(
+            "SELECT k1 FROM t1 WHERE (k1, k2) IN (SELECT t2.k1, t2.k2 FROM t2)",
+        )
+        .expect("analyze in apply mode");
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("expected select body");
+        };
+        assert!(select.predicate_apply_specs.is_empty());
+        assert!(
+            matches!(select.from, Some(crate::sql::analysis::Relation::Join(_))),
+            "multi-column IN should fall back to the legacy join rewrite"
+        );
+    }
+
+    #[test]
+    fn mixed_eq_and_non_eq_outer_ref_records_exists_spec() {
+        use crate::sql::analysis::QueryBody;
+
+        let resolved = parse_and_analyze_with_apply_mode(
+            "SELECT k1 FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.v2 = t1.v1 AND t2.k2 > t1.k2)",
+        )
+        .expect("analyze in apply mode");
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("expected select body");
+        };
+        assert_eq!(
+            select.predicate_apply_specs.len(),
+            1,
+            "mixed equality and non-equality correlation should record an EXISTS predicate spec"
+        );
+    }
+
+    #[test]
+    fn pure_between_outer_ref_in_inner_filter_falls_back_to_legacy() {
+        use crate::sql::analysis::QueryBody;
+
+        let resolved = parse_and_analyze_with_apply_mode(
+            "SELECT k1 FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t1.k1 BETWEEN t2.k1 AND t2.k2)",
+        )
+        .expect("analyze in apply mode");
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("expected select body");
+        };
+        assert!(
+            select.predicate_apply_specs.is_empty(),
+            "pure non-EQ outer refs in the inner filter must fall back to legacy"
+        );
+    }
+
+    #[test]
+    fn pure_non_eq_outer_ref_falls_back_to_legacy() {
+        use crate::sql::analysis::QueryBody;
+
+        let resolved = parse_and_analyze_with_apply_mode(
+            "SELECT k1 FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.k2 > t1.k2)",
+        )
+        .expect("analyze in apply mode");
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("expected select body");
+        };
+        assert!(
+            select.predicate_apply_specs.is_empty(),
+            "pure non-EQ outer refs must fall back to legacy"
+        );
+        assert!(
+            matches!(select.from, Some(crate::sql::analysis::Relation::Join(_))),
+            "pure non-EQ EXISTS fallback should use the legacy join rewrite"
+        );
+    }
+
+    #[test]
+    fn in_pure_non_eq_outer_ref_falls_back_to_legacy() {
+        use crate::sql::analysis::QueryBody;
+
+        let resolved = parse_and_analyze_with_apply_mode(
+            "SELECT k1 FROM t1 WHERE t1.k1 IN (SELECT t2.k1 FROM t2 WHERE t2.k2 > t1.k2)",
+        )
+        .expect("analyze in apply mode");
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("expected select body");
+        };
+        assert!(
+            select.predicate_apply_specs.is_empty(),
+            "pure non-EQ IN correlation must fall back to legacy"
+        );
+        assert!(
+            matches!(select.from, Some(crate::sql::analysis::Relation::Join(_))),
+            "pure non-EQ IN fallback should use the legacy join rewrite"
+        );
+    }
+
+    #[test]
+    fn is_true_outer_ref_in_inner_filter_falls_back_to_legacy() {
+        use crate::sql::analysis::QueryBody;
+
+        let resolved = parse_and_analyze_with_apply_mode(
+            "SELECT k1 FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE (t1.k1 = 1) IS TRUE)",
+        )
+        .expect("analyze in apply mode");
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("expected select body");
+        };
+        assert!(
+            select.predicate_apply_specs.is_empty(),
+            "IS TRUE outer refs in the inner filter must fall back to legacy"
+        );
+    }
+
+    #[test]
+    fn in_rhs_projection_outer_ref_falls_back_to_legacy() {
+        use crate::sql::analysis::QueryBody;
+
+        let resolved = parse_and_analyze_with_apply_mode(
+            "SELECT k1 FROM t1 WHERE t1.k1 IN (SELECT t1.k2 FROM t2)",
+        )
+        .expect("analyze in apply mode");
+        let QueryBody::Select(select) = &resolved.body else {
+            panic!("expected select body");
+        };
+        assert!(
+            select.predicate_apply_specs.is_empty(),
+            "outer refs outside the inner filter must fall back to legacy"
         );
     }
 }
