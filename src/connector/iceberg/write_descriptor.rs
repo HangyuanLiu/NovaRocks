@@ -152,6 +152,7 @@ pub(crate) fn decode_partition_descriptor(
                 message: format!("partition field type is not primitive: {field_type:?}"),
             });
         };
+        validate_descriptor_payload_bytes(&bytes, primitive_type, idx)?;
         let datum =
             iceberg::spec::Datum::try_from_bytes(&bytes, primitive_type.clone()).map_err(|e| {
                 IcebergWriteDescriptorError::DecodeFailed {
@@ -159,7 +160,9 @@ pub(crate) fn decode_partition_descriptor(
                     message: e.to_string(),
                 }
             })?;
-        decoded.push(Some(Literal::Primitive(datum.literal().clone())));
+        let literal = datum.literal().clone();
+        validate_decoded_primitive_literal(&literal, primitive_type, idx)?;
+        decoded.push(Some(Literal::Primitive(literal)));
     }
 
     Ok(Struct::from_iter(decoded))
@@ -246,6 +249,52 @@ fn primitive_literal_to_iceberg_bytes(
     };
 
     Ok(bytes)
+}
+
+fn validate_descriptor_payload_bytes(
+    bytes: &[u8],
+    primitive_type: &iceberg::spec::PrimitiveType,
+    index: usize,
+) -> Result<(), IcebergWriteDescriptorError> {
+    if let iceberg::spec::PrimitiveType::Fixed(len) = primitive_type {
+        let expected =
+            usize::try_from(*len).map_err(|_| IcebergWriteDescriptorError::DecodeFailed {
+                index,
+                message: format!("fixed length {len} cannot fit in usize"),
+            })?;
+        if bytes.len() != expected {
+            return Err(IcebergWriteDescriptorError::DecodeFailed {
+                index,
+                message: format!(
+                    "partition descriptor payload length {} does not match fixed length {expected}",
+                    bytes.len()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_decoded_primitive_literal(
+    literal: &PrimitiveLiteral,
+    primitive_type: &iceberg::spec::PrimitiveType,
+    index: usize,
+) -> Result<(), IcebergWriteDescriptorError> {
+    if let (
+        PrimitiveLiteral::Int128(value),
+        iceberg::spec::PrimitiveType::Decimal { precision, .. },
+    ) = (literal, primitive_type)
+    {
+        if !decimal_unscaled_fits_precision(*value, *precision) {
+            return Err(IcebergWriteDescriptorError::DecodeFailed {
+                index,
+                message: format!(
+                    "partition decimal literal {value} exceeds decimal precision {precision}"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn decimal_unscaled_fits_precision(value: i128, precision: u32) -> bool {
@@ -519,6 +568,54 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_decodes_valid_decimal_precision_boundaries() {
+        let metadata = metadata_with_decimal_partition();
+        let spec_id = metadata.default_partition_spec_id();
+        for value in [999_i128, -999_i128] {
+            let desc = encode_partition_descriptor(
+                &Struct::from_iter([Some(Literal::Primitive(PrimitiveLiteral::Int128(value)))]),
+                spec_id,
+                &metadata,
+            )
+            .expect("encode descriptor");
+
+            let decoded =
+                decode_partition_descriptor(Some(desc), spec_id, &metadata).expect("decode");
+
+            assert_eq!(
+                decoded,
+                Struct::from_iter([Some(Literal::Primitive(PrimitiveLiteral::Int128(value)))])
+            );
+        }
+    }
+
+    #[test]
+    fn descriptor_rejects_decoded_decimal_precision_overflow() {
+        let metadata = metadata_with_decimal_partition();
+        let spec_id = metadata.default_partition_spec_id();
+        for (value, bytes) in [
+            (1000_i128, 1000_i128.to_be_bytes().to_vec()),
+            (-1000_i128, (-1000_i128).to_be_bytes().to_vec()),
+        ] {
+            let desc = crate::types::TIcebergPartitionDescriptor {
+                values: Some(vec![crate::types::TIcebergPartitionValue {
+                    is_null: Some(false),
+                    datum_bytes: Some(bytes),
+                }]),
+            };
+
+            let err = decode_partition_descriptor(Some(desc), spec_id, &metadata)
+                .expect_err("expected precision overflow");
+
+            assert_eq!(err.code(), "IcebergWriteDescriptorMismatch");
+            assert!(
+                err.to_string().contains("exceeds decimal precision"),
+                "value {value} should be rejected, got: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn descriptor_rejects_fixed_length_mismatch() {
         let metadata = metadata_with_fixed_partition();
         let spec_id = metadata.default_partition_spec_id();
@@ -527,6 +624,24 @@ mod tests {
         ])))]);
 
         let err = encode_partition_descriptor(&values, spec_id, &metadata)
+            .expect_err("expected fixed length mismatch");
+
+        assert_eq!(err.code(), "IcebergWriteDescriptorMismatch");
+        assert!(err.to_string().contains("fixed length"));
+    }
+
+    #[test]
+    fn descriptor_rejects_decoded_fixed_length_mismatch() {
+        let metadata = metadata_with_fixed_partition();
+        let spec_id = metadata.default_partition_spec_id();
+        let desc = crate::types::TIcebergPartitionDescriptor {
+            values: Some(vec![crate::types::TIcebergPartitionValue {
+                is_null: Some(false),
+                datum_bytes: Some(vec![1, 2, 3]),
+            }]),
+        };
+
+        let err = decode_partition_descriptor(Some(desc), spec_id, &metadata)
             .expect_err("expected fixed length mismatch");
 
         assert_eq!(err.code(), "IcebergWriteDescriptorMismatch");
@@ -563,6 +678,17 @@ mod tests {
 
         assert_eq!(err.code(), "IcebergWriteDescriptorMismatch");
         assert!(err.to_string().contains("has no payload"));
+    }
+
+    #[test]
+    fn descriptor_rejects_missing_descriptor() {
+        let metadata = metadata_with_identity_partition();
+        let spec_id = metadata.default_partition_spec_id();
+
+        let err =
+            decode_partition_descriptor(None, spec_id, &metadata).expect_err("expected error");
+
+        assert_eq!(err, IcebergWriteDescriptorError::MissingDescriptor);
     }
 
     #[test]
