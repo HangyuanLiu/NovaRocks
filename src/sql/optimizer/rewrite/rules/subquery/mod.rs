@@ -5,12 +5,15 @@
 //! docs/design/specs/2026-06-10-apply-correlated-subquery-framework-design.md §6.
 
 mod apply_exception;
+mod apply_to_window;
 mod decorrelate_util;
 mod push_down_apply_agg_filter;
 mod push_down_apply_filter;
 mod scalar_apply_to_join;
+mod win_magic_util;
 
 pub(crate) use apply_exception::ApplyException;
+pub(crate) use apply_to_window::ApplyToWindow;
 pub(crate) use push_down_apply_agg_filter::PushDownApplyAggFilter;
 pub(crate) use push_down_apply_filter::PushDownApplyFilter;
 pub(crate) use scalar_apply_to_join::ScalarApplyToJoin;
@@ -22,6 +25,7 @@ pub(crate) fn subquery_rewrite_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
     vec![
         Box::new(PushDownApplyAggFilter),
         Box::new(PushDownApplyFilter),
+        Box::new(ApplyToWindow), // to-window BEFORE to-join (StarRocks ordering)
         Box::new(ScalarApplyToJoin),
         Box::new(ApplyException), // must stay LAST
     ]
