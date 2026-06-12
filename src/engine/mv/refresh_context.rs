@@ -70,6 +70,41 @@ pub(crate) struct IcebergMvRefreshContext {
     pub iceberg_catalog: Arc<dyn iceberg::Catalog>,
     pub target_table: iceberg::table::Table,
     pub affected_partitions: crate::engine::mv::partition::AffectedTargetPartitions,
+    pub pruning_limits: MvRefreshPruningLimits,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MvRefreshPruningLimits {
+    pub max_touched_groups: usize,
+    pub max_affected_partitions: usize,
+}
+
+impl Default for MvRefreshPruningLimits {
+    fn default() -> Self {
+        Self {
+            max_touched_groups: 100_000,
+            max_affected_partitions: 4_096,
+        }
+    }
+}
+
+impl MvRefreshPruningLimits {
+    pub(crate) fn from_standalone_config(
+        config: &crate::common::app_config::StandaloneServerConfig,
+    ) -> Self {
+        Self {
+            max_touched_groups: config.mv_refresh_max_touched_groups,
+            max_affected_partitions: config.mv_refresh_max_affected_partitions,
+        }
+    }
+
+    pub(crate) fn affected_partition_count_exceeds_limit(&self, partition_count: usize) -> bool {
+        partition_count > self.max_affected_partitions
+    }
+
+    pub(crate) fn touched_group_count_exceeds_limit(&self, touched_group_count: usize) -> bool {
+        touched_group_count > self.max_touched_groups
+    }
 }
 
 /// Debug-only view of an `IcebergMvRewriteContext`. No `Display` impl — log
@@ -581,7 +616,40 @@ impl IcebergMvRefreshContext {
         iceberg_catalog: Arc<dyn iceberg::Catalog>,
         target_table: iceberg::table::Table,
     ) -> Result<Self, String> {
-        Self::new_with_affected_partitions(
+        Self::new_with_pruning_limits(
+            target,
+            mv_id,
+            current_catalog,
+            current_database,
+            mv_definition,
+            canonical_select_query,
+            base_refs,
+            pin,
+            iceberg_catalogs,
+            target_entry,
+            iceberg_catalog,
+            target_table,
+            MvRefreshPruningLimits::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_pruning_limits(
+        target: IcebergMvTarget,
+        mv_id: i64,
+        current_catalog: Option<&str>,
+        current_database: &str,
+        mv_definition: Arc<StoredMvDefinition>,
+        canonical_select_query: Arc<sqlparser::ast::Query>,
+        base_refs: Arc<[IcebergTableRef]>,
+        pin: Arc<RefreshSnapshotPin>,
+        iceberg_catalogs: &IcebergCatalogRegistry,
+        target_entry: Arc<IcebergCatalogEntry>,
+        iceberg_catalog: Arc<dyn iceberg::Catalog>,
+        target_table: iceberg::table::Table,
+        pruning_limits: MvRefreshPruningLimits,
+    ) -> Result<Self, String> {
+        Self::new_with_affected_partitions_and_pruning_limits(
             target,
             mv_id,
             current_catalog,
@@ -597,6 +665,7 @@ impl IcebergMvRefreshContext {
             crate::engine::mv::partition::AffectedTargetPartitions::not_derived(
                 "refresh context was constructed without planned affected partitions",
             ),
+            pruning_limits,
         )
     }
 
@@ -615,6 +684,41 @@ impl IcebergMvRefreshContext {
         iceberg_catalog: Arc<dyn iceberg::Catalog>,
         target_table: iceberg::table::Table,
         affected_partitions: crate::engine::mv::partition::AffectedTargetPartitions,
+    ) -> Result<Self, String> {
+        Self::new_with_affected_partitions_and_pruning_limits(
+            target,
+            mv_id,
+            current_catalog,
+            current_database,
+            mv_definition,
+            canonical_select_query,
+            base_refs,
+            pin,
+            iceberg_catalogs,
+            target_entry,
+            iceberg_catalog,
+            target_table,
+            affected_partitions,
+            MvRefreshPruningLimits::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_affected_partitions_and_pruning_limits(
+        target: IcebergMvTarget,
+        mv_id: i64,
+        current_catalog: Option<&str>,
+        current_database: &str,
+        mv_definition: Arc<StoredMvDefinition>,
+        canonical_select_query: Arc<sqlparser::ast::Query>,
+        base_refs: Arc<[IcebergTableRef]>,
+        pin: Arc<RefreshSnapshotPin>,
+        iceberg_catalogs: &IcebergCatalogRegistry,
+        target_entry: Arc<IcebergCatalogEntry>,
+        iceberg_catalog: Arc<dyn iceberg::Catalog>,
+        target_table: iceberg::table::Table,
+        affected_partitions: crate::engine::mv::partition::AffectedTargetPartitions,
+        pruning_limits: MvRefreshPruningLimits,
     ) -> Result<Self, String> {
         let metadata = target_table.metadata();
         let target_snapshot_id = metadata.current_snapshot().map(|s| s.snapshot_id());
@@ -645,7 +749,38 @@ impl IcebergMvRefreshContext {
             iceberg_catalog,
             target_table,
             affected_partitions,
+            pruning_limits,
         })
+    }
+
+    pub(crate) fn affected_partitions_to_target_partition_filter(
+        &self,
+    ) -> crate::engine::mv::partition::TargetPartitionFilter {
+        match &self.affected_partitions {
+            crate::engine::mv::partition::AffectedTargetPartitions::Known { partitions } => {
+                if self
+                    .pruning_limits
+                    .affected_partition_count_exceeds_limit(partitions.len())
+                {
+                    tracing::warn!(
+                        target = ?self.rewrite.target,
+                        affected_partition_count = partitions.len(),
+                        max_affected_partitions = self.pruning_limits.max_affected_partitions,
+                        fallback_reason = "affected_partition_threshold",
+                        "falling back to unpartitioned target scan because affected partition allow-list exceeds configured threshold"
+                    );
+                    crate::engine::mv::partition::TargetPartitionFilter::None
+                } else {
+                    crate::engine::mv::partition::TargetPartitionFilter::AllowList(
+                        partitions.clone(),
+                    )
+                }
+            }
+            crate::engine::mv::partition::AffectedTargetPartitions::Unpartitioned
+            | crate::engine::mv::partition::AffectedTargetPartitions::NotDerived { .. } => {
+                crate::engine::mv::partition::TargetPartitionFilter::None
+            }
+        }
     }
 
     pub(crate) fn version_scan_source(
@@ -826,7 +961,24 @@ impl IcebergMvRefreshContext {
                     }
                     crate::engine::mv::partition::AffectedTargetPartitions::Known {
                         partitions,
-                    } => Ok(Some(partitions.clone())),
+                    } => {
+                        if self
+                            .pruning_limits
+                            .affected_partition_count_exceeds_limit(partitions.len())
+                        {
+                            tracing::warn!(
+                                target = %scan.fqn(),
+                                affected_partition_count = partitions.len(),
+                                max_affected_partitions =
+                                    self.pruning_limits.max_affected_partitions,
+                                fallback_reason = "affected_partition_threshold",
+                                "falling back to full target-state scan because affected partition allow-list exceeds configured threshold"
+                            );
+                            Ok(None)
+                        } else {
+                            Ok(Some(partitions.clone()))
+                        }
+                    }
                     crate::engine::mv::partition::AffectedTargetPartitions::NotDerived {
                         reason,
                     } => {
@@ -841,6 +993,58 @@ impl IcebergMvRefreshContext {
             }
         }
     }
+}
+
+pub(crate) fn bind_target_state_file_positions(
+    mut source: ScanSource,
+    matched_positions: &[crate::engine::mv::iceberg_target_apply::TargetRowPositionSet],
+    target: &str,
+) -> Result<ScanSource, String> {
+    let ScanSource::IcebergDataFiles { files, .. } = &mut source else {
+        return Err(format!(
+            "Iceberg target-state position binding for {target} requires IcebergDataFiles source"
+        ));
+    };
+
+    if matched_positions.is_empty() {
+        files.clear();
+        return Ok(source);
+    }
+
+    let mut by_file = BTreeMap::<String, Vec<i64>>::new();
+    for set in matched_positions {
+        if set.positions.is_empty() {
+            continue;
+        }
+        by_file
+            .entry(set.referenced_data_file.clone())
+            .or_default()
+            .extend(set.positions.iter().copied());
+    }
+    for positions in by_file.values_mut() {
+        positions.sort_unstable();
+        positions.dedup();
+    }
+    if by_file.is_empty() {
+        files.clear();
+        return Ok(source);
+    }
+
+    let mut bound_files = Vec::new();
+    for mut file in std::mem::take(files) {
+        if let Some(positions) = by_file.remove(&file.path) {
+            file.included_positions = Some(positions);
+            bound_files.push(file);
+        }
+    }
+    if !by_file.is_empty() {
+        let missing = by_file.keys().cloned().collect::<Vec<_>>().join(", ");
+        return Err(format!(
+            "Iceberg target-state scan {target} locator returned positions for files not present in scan source: [{missing}]"
+        ));
+    }
+    *files = bound_files;
+    Ok(source)
 }
 
 fn validate_target_state_branch_scope(
@@ -1073,6 +1277,7 @@ fn data_file_with_stats_to_info(
         first_row_id: file.first_row_id,
         data_sequence_number: file.data_sequence_number,
         ivm_change_op: None,
+        included_positions: None,
         delete_files: file.delete_files,
         manifest_path: file.manifest_path,
         partition_values: file.partition_field_values,
@@ -1286,6 +1491,7 @@ pub(crate) mod tests_support {
             target_table: Some("mv".to_string()),
             schema_contract: Some(make_schema_contract()),
             partition_spec: None,
+            partition_state_complete: false,
             last_refresh_ms: None,
             last_refresh_rows: None,
             last_refresh_snapshots: [("ice.db.b".to_string(), 11i64)].into_iter().collect(),
@@ -2081,6 +2287,7 @@ mod tests {
             target_table,
             affected_partitions:
                 crate::engine::mv::partition::AffectedTargetPartitions::not_derived("test context"),
+            pruning_limits: MvRefreshPruningLimits::default(),
         };
         let table = IcebergTableInfo {
             catalog: "ice".to_string(),
@@ -2155,6 +2362,116 @@ mod tests {
         );
     }
 
+    fn target_state_source_for_binding_test() -> ScanSource {
+        ScanSource::IcebergDataFiles {
+            table: IcebergTableInfo {
+                catalog: "tgt".to_string(),
+                namespace: "db".to_string(),
+                table: "mv".to_string(),
+                table_uuid: Some("uuid-tgt".to_string()),
+                current_snapshot_id: Some(99),
+                schema_id: 1,
+                location: "s3://bucket/mv".to_string(),
+                schema: IcebergSchemaDef { fields: Vec::new() },
+                serialized_metadata: None,
+                serialized_metadata_rows: None,
+            },
+            files: vec![
+                IcebergDataFileInfo {
+                    path: "s3://bucket/mv/data-a.parquet".to_string(),
+                    size: 10,
+                    row_count: Some(10),
+                    column_stats: None,
+                    partition_spec_id: None,
+                    partition_key: None,
+                    first_row_id: None,
+                    data_sequence_number: None,
+                    ivm_change_op: None,
+                    included_positions: None,
+                    delete_files: Vec::new(),
+                    manifest_path: None,
+                    partition_values: Vec::new(),
+                },
+                IcebergDataFileInfo {
+                    path: "s3://bucket/mv/data-b.parquet".to_string(),
+                    size: 20,
+                    row_count: Some(20),
+                    column_stats: None,
+                    partition_spec_id: None,
+                    partition_key: None,
+                    first_row_id: None,
+                    data_sequence_number: None,
+                    ivm_change_op: None,
+                    included_positions: None,
+                    delete_files: Vec::new(),
+                    manifest_path: None,
+                    partition_values: Vec::new(),
+                },
+            ],
+            cloud_properties: BTreeMap::new(),
+            binding: crate::sql::catalog::IcebergDataFileBinding::ExplicitFiles,
+        }
+    }
+
+    #[test]
+    fn bind_target_state_file_positions_keeps_only_matched_files() {
+        let positions = vec![
+            crate::engine::mv::iceberg_target_apply::TargetRowPositionSet {
+                referenced_data_file: "s3://bucket/mv/data-b.parquet".to_string(),
+                positions: vec![2, 8, 13],
+            },
+        ];
+
+        let source = bind_target_state_file_positions(
+            target_state_source_for_binding_test(),
+            &positions,
+            "tgt.db.mv",
+        )
+        .expect("bind positions");
+
+        let ScanSource::IcebergDataFiles { files, .. } = source else {
+            panic!("expected IcebergDataFiles");
+        };
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "s3://bucket/mv/data-b.parquet");
+        assert_eq!(files[0].included_positions, Some(vec![2, 8, 13]));
+    }
+
+    #[test]
+    fn bind_target_state_file_positions_empty_matches_returns_empty_source() {
+        let source = bind_target_state_file_positions(
+            target_state_source_for_binding_test(),
+            &[],
+            "tgt.db.mv",
+        )
+        .expect("bind empty positions");
+
+        let ScanSource::IcebergDataFiles { files, .. } = source else {
+            panic!("expected IcebergDataFiles");
+        };
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn bind_target_state_file_positions_rejects_missing_files() {
+        let positions = vec![
+            crate::engine::mv::iceberg_target_apply::TargetRowPositionSet {
+                referenced_data_file: "s3://bucket/mv/missing.parquet".to_string(),
+                positions: vec![1],
+            },
+        ];
+
+        let err = bind_target_state_file_positions(
+            target_state_source_for_binding_test(),
+            &positions,
+            "tgt.db.mv",
+        )
+        .expect_err("missing target file should fail");
+
+        assert!(err.contains("locator returned positions for files not present"));
+        assert!(err.contains("s3://bucket/mv/missing.parquet"));
+    }
+
     #[test]
     fn target_state_scan_falls_back_without_partition_allow_list() {
         use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
@@ -2216,6 +2533,10 @@ mod tests {
             target_table,
             affected_partitions:
                 crate::engine::mv::partition::AffectedTargetPartitions::not_derived("test context"),
+            pruning_limits: MvRefreshPruningLimits {
+                max_touched_groups: 100_000,
+                max_affected_partitions: 2,
+            },
         };
         let scan = IcebergMvTargetStateScan {
             catalog: "tgt".to_string(),
@@ -2257,5 +2578,19 @@ mod tests {
             .expect("partitioned scan should return an allow-list");
         assert!(allow_list.contains(&new_key));
         assert!(allow_list.contains(&old_key));
+
+        ctx.pruning_limits.max_affected_partitions = 1;
+        let threshold_filter = ctx
+            .target_state_partition_allow_list(&scan)
+            .expect("over-threshold affected partitions should fall back to full target scan");
+        assert!(
+            threshold_filter.is_none(),
+            "over-threshold affected partitions should disable pruning"
+        );
+        assert_eq!(
+            ctx.affected_partitions_to_target_partition_filter(),
+            crate::engine::mv::partition::TargetPartitionFilter::None,
+            "over-threshold affected partitions should disable merge-sink plan-time pruning"
+        );
     }
 }

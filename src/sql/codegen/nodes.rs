@@ -509,6 +509,7 @@ pub(crate) fn build_aggregate_state_merge_exec_node(
     delta_input: crate::exec::node::ExecNode,
     layout: crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
     branch_id: Option<i32>,
+    pruning_limits: crate::engine::mv::refresh_context::MvRefreshPruningLimits,
 ) -> crate::exec::node::ExecNode {
     crate::exec::node::ExecNode {
         kind: crate::exec::node::ExecNodeKind::AggregateStateMerge(
@@ -517,6 +518,7 @@ pub(crate) fn build_aggregate_state_merge_exec_node(
                 delta_input: Box::new(delta_input),
                 layout,
                 branch_id,
+                pruning_limits,
             },
         ),
     }
@@ -1187,6 +1189,7 @@ fn build_iceberg_metadata_scan_range_params() -> internal_service::TScanRangePar
         None::<i32>,
         None::<i64>,
         None::<i64>,
+        None::<Vec<i64>>,
     );
     internal_service::TScanRangeParams::new(
         plan_nodes::TScanRange::new(
@@ -1270,6 +1273,7 @@ mod tests {
             None,
             Some(crate::exec::change_op::CHANGE_OP_INSERT),
             None,
+            None,
             &[],
         )
         .expect("tagged file without __change_op projection should scan ordinary columns");
@@ -1287,6 +1291,7 @@ mod tests {
             None,
             None,
             Some(crate::exec::change_op::CHANGE_OP_DELETE),
+            None,
             Some(9),
             &[],
         )
@@ -1312,6 +1317,7 @@ mod tests {
             first_row_id: None,
             data_sequence_number: None,
             ivm_change_op: Some(crate::exec::change_op::CHANGE_OP_INSERT),
+            included_positions: None,
             delete_files: vec![],
             manifest_path: None,
             partition_values: vec![],
@@ -1480,6 +1486,7 @@ mod tests {
             first_row_id: None,
             data_sequence_number: None,
             ivm_change_op: Some(crate::exec::change_op::CHANGE_OP_INSERT),
+            included_positions: None,
             delete_files: vec![],
             manifest_path: None,
             partition_values: vec![],
