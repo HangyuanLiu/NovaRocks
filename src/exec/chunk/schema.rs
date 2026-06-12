@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::common::ids::SlotId;
+use crate::exec::chunk::type_relation::{CompatibilityPolicy, relate};
 use crate::lower::type_lowering::{arrow_type_from_desc, primitive_type_from_desc};
 use crate::types;
 use arrow::array::ArrayRef;
@@ -407,33 +408,12 @@ fn logical_type_desc_from_field(field: &Field) -> Option<types::TTypeDesc> {
 }
 
 fn is_compatible_chunk_field_type(expected: &DataType, actual: &DataType) -> bool {
-    match (expected, actual) {
-        (DataType::Decimal128(_, _), DataType::Decimal128(_, _)) => true,
-        (DataType::Decimal256(_, _), DataType::Decimal256(_, _)) => true,
-        (DataType::Timestamp(_, _), DataType::Timestamp(_, _)) => true,
-        (DataType::Utf8, DataType::Binary) | (DataType::Binary, DataType::Utf8) => true,
-        (DataType::List(expected_field), DataType::List(actual_field))
-        | (DataType::LargeList(expected_field), DataType::LargeList(actual_field)) => {
-            is_compatible_chunk_field_type(expected_field.data_type(), actual_field.data_type())
-        }
-        (DataType::Map(expected_field, _), DataType::Map(actual_field, _)) => {
-            is_compatible_chunk_field_type(expected_field.data_type(), actual_field.data_type())
-        }
-        (DataType::Struct(expected_fields), DataType::Struct(actual_fields)) => {
-            if expected_fields.len() != actual_fields.len() {
-                return false;
-            }
-            expected_fields.iter().zip(actual_fields.iter()).all(
-                |(expected_field, actual_field)| {
-                    is_compatible_chunk_field_type(
-                        expected_field.data_type(),
-                        actual_field.data_type(),
-                    )
-                },
-            )
-        }
-        _ => expected == actual,
-    }
+    // The one type relation governs chunk-construction compatibility: same-scale
+    // decimal (precision may differ), timestamp, utf8<->binary, and recursion into
+    // list/largelist/map/struct. This tightens the previous any-scale decimal
+    // tolerance to same-scale, failing fast on a real scale mismatch instead of
+    // silently adopting the batch's scale.
+    relate(expected, actual, CompatibilityPolicy::SameScaleWiden).is_ok()
 }
 
 fn reconcile_chunk_field_to_field(expected: &Field, actual: &Field) -> Result<Arc<Field>, String> {
