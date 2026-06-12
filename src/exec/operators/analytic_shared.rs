@@ -258,7 +258,7 @@ impl AnalyticSharedState {
             }
         }
 
-        validate_analytic_output_columns(&columns, &output_chunk_schema)?;
+        validate_analytic_output_columns(&columns, &output_chunk_schema, total_rows)?;
         split_analytic_output_chunks(output_chunk_schema, &columns, input)
     }
 
@@ -283,8 +283,22 @@ impl AnalyticSharedState {
 fn validate_analytic_output_columns(
     columns: &[ArrayRef],
     output_chunk_schema: &crate::exec::chunk::ChunkSchemaRef,
+    total_rows: usize,
 ) -> Result<(), String> {
+    let expected_columns = output_chunk_schema.slots().len();
+    if columns.len() != expected_columns {
+        return Err(format!(
+            "analytic output column count mismatch: descriptor={expected_columns} actual={}",
+            columns.len()
+        ));
+    }
     for (idx, (col, slot)) in columns.iter().zip(output_chunk_schema.slots()).enumerate() {
+        if col.len() != total_rows {
+            return Err(format!(
+                "analytic output length mismatch at column {idx}: expected_rows={total_rows} actual={}",
+                col.len()
+            ));
+        }
         let expected = slot.field();
         if col.data_type() != expected.data_type() {
             return Err(format!(
@@ -2951,6 +2965,26 @@ mod tests {
         )
     }
 
+    fn two_int32_chunk_schema() -> ChunkSchemaRef {
+        Arc::new(
+            ChunkSchema::try_new(vec![
+                ChunkSlotSchema::new_with_field(
+                    SlotId::new(1),
+                    Field::new("v", DataType::Int32, true),
+                    None,
+                    None,
+                ),
+                ChunkSlotSchema::new_with_field(
+                    SlotId::new(2),
+                    Field::new("w", DataType::Int32, true),
+                    None,
+                    None,
+                ),
+            ])
+            .unwrap(),
+        )
+    }
+
     fn int64_chunk(values: Vec<Option<i64>>) -> Chunk {
         Chunk::try_new_with_columns(
             int64_chunk_schema(),
@@ -2979,6 +3013,32 @@ mod tests {
 
         assert!(
             err.contains("analytic output type mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn analytic_output_rejects_column_count_mismatch() {
+        let columns = vec![Arc::new(Int32Array::from(vec![Some(1), Some(2)])) as ArrayRef];
+
+        let err = validate_analytic_output_columns(&columns, &two_int32_chunk_schema(), 2)
+            .expect_err("column count mismatch should be rejected");
+
+        assert!(
+            err.contains("analytic output column count mismatch"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn analytic_output_rejects_length_mismatch() {
+        let columns = vec![Arc::new(Int32Array::from(vec![Some(1)])) as ArrayRef];
+
+        let err = validate_analytic_output_columns(&columns, &int32_chunk_schema(), 2)
+            .expect_err("column length mismatch should be rejected");
+
+        assert!(
+            err.contains("analytic output length mismatch"),
             "unexpected error: {err}"
         );
     }
