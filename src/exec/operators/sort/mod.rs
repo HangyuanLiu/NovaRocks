@@ -70,18 +70,14 @@ fn is_compatible_sort_field_type(expected: &DataType, actual: &DataType) -> bool
     }
 }
 
-fn sort_payload_data_type(data_type: &DataType) -> DataType {
-    match data_type {
-        DataType::Decimal128(_, scale) => DataType::Decimal128(38, *scale),
-        DataType::Decimal256(_, scale) => DataType::Decimal256(76, *scale),
-        _ => data_type.clone(),
-    }
-}
-
 fn sort_field_from_array(field: &Field, array: &ArrayRef) -> Field {
+    // No decimal-precision widening: sort uses the array's own (operator-assigned)
+    // type. Planning (pillar P2) makes cross-fragment decimal types canonical, so
+    // the merged concat schema is the first chunk's actual type and the remaining
+    // chunks are same-scale retagged to it by `normalize_sort_array_for_field`.
     Field::new(
         field.name(),
-        sort_payload_data_type(array.data_type()),
+        array.data_type().clone(),
         field.is_nullable() || array.null_count() > 0,
     )
     .with_metadata(field.metadata().clone())
