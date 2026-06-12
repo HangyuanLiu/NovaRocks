@@ -27,13 +27,14 @@ pub(crate) struct IcebergWriteSinkSpec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum IcebergWriteSinkMode {
     Data,
+    RowLineageData,
     PositionDeletes,
 }
 
 impl IcebergWriteSinkMode {
     fn data_sink_type(self) -> data_sinks::TDataSinkType {
         match self {
-            Self::Data => data_sinks::TDataSinkType::ICEBERG_TABLE_SINK,
+            Self::Data | Self::RowLineageData => data_sinks::TDataSinkType::ICEBERG_TABLE_SINK,
             Self::PositionDeletes => data_sinks::TDataSinkType::ICEBERG_DELETE_SINK,
         }
     }

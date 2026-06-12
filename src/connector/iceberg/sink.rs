@@ -67,6 +67,10 @@ use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::pipeline::async_sink::{AsyncSinkBackend, AsyncSinkOperator};
 use crate::exec::pipeline::operator::Operator;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::exec::row_position::{
+    ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+    ICEBERG_RESERVED_FIELD_ID_ROW_ID, ICEBERG_ROW_ID_COL,
+};
 use crate::lower::expr::lower_t_expr;
 use crate::lower::layout::Layout;
 use crate::runtime::global_async_runtime::data_block_on;
@@ -112,6 +116,10 @@ struct IcebergSinkPlan {
     /// encoding. For DATA sinks this matches `output_schema`; for
     /// POSITION_DELETES sinks `output_schema` is the delete-file parquet schema.
     target_schema: SchemaRef,
+    /// True for DATA sinks whose synthetic target schema carries Iceberg v3
+    /// reserved row-lineage fields. Those files must be split by contiguous
+    /// `_row_id` runs and reported with `first_row_id`.
+    row_lineage_data: bool,
     /// For `DATA` sinks: one expression per iceberg data column.
     /// For `POSITION_DELETES` sinks: `[file_path_expr, pos_expr,
     /// partition_source_expr_0, partition_source_expr_1, ...]` — the partition
@@ -148,6 +156,8 @@ impl IcebergTableSinkFactory {
         ) = build_partition_exprs(&iceberg_table)?;
 
         let target_schema = build_output_schema(&iceberg_table)?;
+        let row_lineage_data = mode == IcebergSinkMode::Data
+            && schema_has_reserved_row_lineage_columns(&target_schema)?;
         let output_schema = match mode {
             IcebergSinkMode::Data => {
                 if output_exprs.len() != target_schema.fields().len() {
@@ -225,6 +235,7 @@ impl IcebergTableSinkFactory {
                 .ok_or_else(|| "iceberg sink missing compression_type".to_string())?,
             output_schema,
             target_schema,
+            row_lineage_data,
             output_exprs: lowered_output_exprs,
             partition_exprs: lowered_partition_exprs,
             partition_source_column_names,
@@ -499,6 +510,10 @@ impl IcebergTableSinkBackend {
     }
 
     async fn push_chunk_data(&mut self, state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+        if self.plan.row_lineage_data {
+            return self.push_chunk_row_lineage_data(state, chunk).await;
+        }
+
         let output_arrays = eval_exprs(&self.arena, &self.plan.output_exprs, &chunk)?;
         let output_arrays = align_arrays_to_schema(output_arrays, &self.plan.output_schema)?;
         let batch = RecordBatch::try_new(Arc::clone(&self.plan.output_schema), output_arrays)
@@ -533,6 +548,106 @@ impl IcebergTableSinkBackend {
                     state.add_iceberg_sketch_set(sketch_set);
                 }
                 state.add_sink_commit_info(commit_info);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn push_chunk_row_lineage_data(
+        &mut self,
+        state: &RuntimeState,
+        chunk: Chunk,
+    ) -> Result<(), String> {
+        let output_arrays = eval_exprs(&self.arena, &self.plan.output_exprs, &chunk)?;
+        let output_arrays = align_arrays_to_schema(output_arrays, &self.plan.output_schema)?;
+        let batch = RecordBatch::try_new(Arc::clone(&self.plan.output_schema), output_arrays)
+            .map_err(|e| format!("iceberg row-lineage sink build batch failed: {e}"))?;
+
+        let row_id_idx = row_lineage_row_id_index(&self.plan.output_schema)?;
+        let row_id_col = batch
+            .column(row_id_idx)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| "iceberg row-lineage sink _row_id column must be Int64".to_string())?;
+        if row_id_col.null_count() > 0 {
+            return Err("iceberg row-lineage sink rejects NULL _row_id".to_string());
+        }
+
+        let partition_groups = self.partition_group_indices(&chunk, batch.num_rows())?;
+        let staged_ctx = self.plan.build_staged_write_context()?;
+        let staged_opts = StagedWriteOptions::default();
+
+        for (key, group) in partition_groups {
+            let mut indices = group.indices;
+            indices.sort_by_key(|idx| row_id_col.value(*idx as usize));
+            let partition_path = self.partition_path_for_key(&key);
+            let mut start = 0usize;
+            while start < indices.len() {
+                let first_idx = indices[start] as usize;
+                let first_row_id = row_id_col.value(first_idx);
+                if first_row_id < 0 {
+                    return Err(format!(
+                        "iceberg row-lineage sink _row_id must be non-negative: {first_row_id}"
+                    ));
+                }
+                let mut end = start + 1;
+                let mut previous = first_row_id;
+                while end < indices.len() {
+                    let row_id = row_id_col.value(indices[end] as usize);
+                    if row_id < 0 {
+                        return Err(format!(
+                            "iceberg row-lineage sink _row_id must be non-negative: {row_id}"
+                        ));
+                    }
+                    if row_id == previous {
+                        return Err(format!(
+                            "iceberg row-lineage sink encountered duplicate _row_id {row_id}"
+                        ));
+                    }
+                    if row_id != previous + 1 {
+                        break;
+                    }
+                    previous = row_id;
+                    end += 1;
+                }
+
+                let run_indices = UInt32Array::from(indices[start..end].to_vec());
+                let part_batch = arrow::compute::take_record_batch(&batch, &run_indices)
+                    .map_err(|e| format!("iceberg row-lineage sink take batch failed: {e}"))?;
+                if part_batch.num_rows() == 0 {
+                    start = end;
+                    continue;
+                }
+                let staged_files = write_record_batches(&staged_ctx, [part_batch], &staged_opts)
+                    .await
+                    .map_err(|e| format!("iceberg row-lineage sink write failed: {e}"))?;
+                let mut first_row_id_cursor = first_row_id;
+                for staged in staged_files {
+                    let (mut commit_info, sketch_set) = to_sink_commit_info(
+                        &staged,
+                        partition_path.clone(),
+                        key.null_fingerprint.clone(),
+                        self.plan.file_format.clone(),
+                        types::TIcebergFileContent::DATA,
+                    )?;
+                    if let Some(data_file) = commit_info.iceberg_data_file.as_mut() {
+                        data_file.first_row_id = Some(first_row_id_cursor);
+                        let record_count = data_file.record_count.ok_or_else(|| {
+                            "iceberg row-lineage sink report missing record_count".to_string()
+                        })?;
+                        first_row_id_cursor = first_row_id_cursor
+                            .checked_add(record_count)
+                            .ok_or_else(|| {
+                                "iceberg row-lineage sink first_row_id overflow".to_string()
+                            })?;
+                    }
+                    if let Some(sketch_set) = sketch_set {
+                        state.add_iceberg_sketch_set(sketch_set);
+                    }
+                    state.add_sink_commit_info(commit_info);
+                }
+                start = end;
             }
         }
 
@@ -950,6 +1065,36 @@ fn arrow_field_id(field: &Field) -> Result<i32, String> {
             field.name()
         )
     })
+}
+
+fn schema_has_reserved_row_lineage_columns(schema: &Schema) -> Result<bool, String> {
+    let mut has_row_id = false;
+    let mut has_last_updated = false;
+    for field in schema.fields() {
+        if field.name().eq_ignore_ascii_case(ICEBERG_ROW_ID_COL) {
+            has_row_id = matches!(arrow_field_id(field), Ok(ICEBERG_RESERVED_FIELD_ID_ROW_ID));
+        } else if field
+            .name()
+            .eq_ignore_ascii_case(ICEBERG_LAST_UPDATED_SEQ_COL)
+        {
+            has_last_updated = matches!(
+                arrow_field_id(field),
+                Ok(ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER)
+            );
+        }
+    }
+    Ok(has_row_id && has_last_updated)
+}
+
+fn row_lineage_row_id_index(schema: &Schema) -> Result<usize, String> {
+    for (idx, field) in schema.fields().iter().enumerate() {
+        if field.name().eq_ignore_ascii_case(ICEBERG_ROW_ID_COL)
+            && arrow_field_id(field)? == ICEBERG_RESERVED_FIELD_ID_ROW_ID
+        {
+            return Ok(idx);
+        }
+    }
+    Err("iceberg row-lineage sink missing reserved _row_id field".to_string())
 }
 
 fn iceberg_type_from_arrow_type(data_type: &DataType) -> Result<iceberg::spec::Type, String> {
@@ -2227,11 +2372,14 @@ mod tests {
     use crate::exec::pipeline::operator::Operator;
 
     use super::{
-        ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID, ICEBERG_POSITION_DELETE_POS_FIELD_ID,
-        IcebergSinkMode, IcebergSinkPlan, IcebergTableSinkBackend, IcebergTableSinkFactory,
-        align_arrays_to_schema, build_column_slot_map, build_position_delete_output_schema,
-        collect_theta_sketches_by_name, iceberg_partition_key_for_row,
-        iceberg_schema_from_arrow_schema, unique_file_path, write_parquet_to_bytes,
+        ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID,
+        ICEBERG_POSITION_DELETE_POS_FIELD_ID,
+        ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, ICEBERG_RESERVED_FIELD_ID_ROW_ID,
+        ICEBERG_ROW_ID_COL, IcebergSinkMode, IcebergSinkPlan, IcebergTableSinkBackend,
+        IcebergTableSinkFactory, align_arrays_to_schema, build_column_slot_map,
+        build_position_delete_output_schema, collect_theta_sketches_by_name,
+        iceberg_partition_key_for_row, iceberg_schema_from_arrow_schema, row_lineage_row_id_index,
+        schema_has_reserved_row_lineage_columns, unique_file_path, write_parquet_to_bytes,
     };
     use crate::connector::iceberg::data_writer::{StagedWriteOptions, write_record_batches};
     use crate::exec::chunk::{Chunk, ChunkSchema};
@@ -2289,6 +2437,41 @@ mod tests {
     }
 
     #[test]
+    fn reserved_row_lineage_schema_detection_requires_field_ids() {
+        let plain = Schema::new(vec![
+            Field::new(ICEBERG_ROW_ID_COL, DataType::Int64, false),
+            Field::new(ICEBERG_LAST_UPDATED_SEQ_COL, DataType::Int64, true),
+        ]);
+        assert!(
+            !schema_has_reserved_row_lineage_columns(&plain).expect("plain schema check"),
+            "names alone must not enable row-lineage sink behavior"
+        );
+
+        let reserved = Schema::new(vec![
+            Field::new(ICEBERG_ROW_ID_COL, DataType::Int64, false).with_metadata(HashMap::from([
+                (
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    ICEBERG_RESERVED_FIELD_ID_ROW_ID.to_string(),
+                ),
+            ])),
+            Field::new(ICEBERG_LAST_UPDATED_SEQ_COL, DataType::Int64, true).with_metadata(
+                HashMap::from([(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER.to_string(),
+                )]),
+            ),
+        ]);
+        assert!(
+            schema_has_reserved_row_lineage_columns(&reserved).expect("reserved schema check"),
+            "reserved row-lineage field ids should enable row-lineage sink behavior"
+        );
+        assert_eq!(
+            row_lineage_row_id_index(&reserved).expect("row id index"),
+            0
+        );
+    }
+
+    #[test]
     fn iceberg_table_sink_factory_creates_async_sink_operator() {
         let schema = Arc::new(Schema::new(vec![Field::new("c0", DataType::Int64, true)]));
         let factory = IcebergTableSinkFactory {
@@ -2304,6 +2487,7 @@ mod tests {
                 compression: crate::types::TCompressionType::SNAPPY,
                 output_schema: Arc::clone(&schema),
                 target_schema: schema,
+                row_lineage_data: false,
                 output_exprs: Vec::new(),
                 partition_exprs: Vec::new(),
                 partition_source_column_names: Vec::new(),
@@ -2340,6 +2524,7 @@ mod tests {
             compression: crate::types::TCompressionType::SNAPPY,
             output_schema: Arc::clone(&schema),
             target_schema: Arc::clone(&schema),
+            row_lineage_data: false,
             output_exprs: Vec::new(),
             partition_exprs: Vec::new(),
             partition_source_column_names: vec!["id".to_string()],
@@ -2431,6 +2616,7 @@ mod tests {
             compression: crate::types::TCompressionType::SNAPPY,
             output_schema: Arc::clone(&schema),
             target_schema: Arc::clone(&schema),
+            row_lineage_data: false,
             output_exprs: vec![id_expr],
             partition_exprs: vec![id_expr],
             partition_source_column_names: vec!["id".to_string()],
@@ -2529,6 +2715,7 @@ mod tests {
                     "42".to_string(),
                 )])),
             ])),
+            row_lineage_data: false,
             output_exprs: vec![file_expr, pos_expr, id_expr],
             partition_exprs: vec![id_expr],
             partition_source_column_names: vec!["id".to_string()],

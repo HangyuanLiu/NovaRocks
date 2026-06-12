@@ -60,7 +60,8 @@ use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOp
 use crate::runtime::coordinator::CoordinatedQueryResult;
 use crate::runtime::write_coordinator::WriteCommitInput;
 use crate::sql::catalog::{
-    ColumnDef, IcebergDataFileBinding, IcebergTableInfo, ScanSource, TableDef,
+    ColumnDef, IcebergDataFileBinding, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
+    ScanSource, TableDef,
 };
 use crate::sql::codegen::iceberg_write_sink::{
     IcebergWriteSinkMode, IcebergWriteSinkSpec, synthetic_iceberg_write_table_id,
@@ -326,6 +327,21 @@ pub(crate) fn build_position_delete_sink_spec(
     )
 }
 
+pub(crate) fn build_row_lineage_data_sink_spec(
+    target: &TargetBackend,
+    resolved: &ResolvedTable,
+    table: &iceberg::table::Table,
+    entry: &IcebergCatalogEntry,
+) -> Result<IcebergWriteSinkSpec, String> {
+    build_iceberg_write_sink_spec(
+        target,
+        resolved,
+        table,
+        entry,
+        IcebergWriteSinkMode::RowLineageData,
+    )
+}
+
 pub(crate) fn build_iceberg_write_sink_spec(
     target: &TargetBackend,
     resolved: &ResolvedTable,
@@ -335,6 +351,23 @@ pub(crate) fn build_iceberg_write_sink_spec(
     target_columns: Vec<ColumnDef>,
 ) -> Result<IcebergWriteSinkSpec, String> {
     let metadata = table.metadata();
+    let target_columns = match mode {
+        IcebergWriteSinkMode::Data => resolved.columns.clone(),
+        IcebergWriteSinkMode::RowLineageData => {
+            row_lineage_data_sink_input_columns(&resolved.columns)
+        }
+        IcebergWriteSinkMode::PositionDeletes => {
+            position_delete_sink_input_columns(metadata, &resolved.columns)?
+        }
+    };
+    let iceberg_schema = match mode {
+        IcebergWriteSinkMode::RowLineageData => {
+            row_lineage_iceberg_schema_def_for_codegen(metadata.current_schema())
+        }
+        IcebergWriteSinkMode::Data | IcebergWriteSinkMode::PositionDeletes => {
+            iceberg_schema_def_for_codegen(metadata.current_schema())
+        }
+    };
     let iceberg = IcebergTableInfo {
         catalog: target.catalog.clone(),
         namespace: target.namespace.clone(),
@@ -343,7 +376,7 @@ pub(crate) fn build_iceberg_write_sink_spec(
         current_snapshot_id: metadata.current_snapshot_id(),
         schema_id: metadata.current_schema_id(),
         location: metadata.location().to_string(),
-        schema: iceberg_schema_def_for_codegen(metadata.current_schema()),
+        schema: iceberg_schema,
         serialized_metadata: Some(
             serde_json::to_string(metadata)
                 .map_err(|err| format!("serialize iceberg table metadata failed: {err}"))?,
@@ -390,6 +423,46 @@ pub(crate) fn build_iceberg_write_sink_spec(
         file_format: "parquet".to_string(),
         compression: crate::types::TCompressionType::SNAPPY,
     })
+}
+
+fn row_lineage_data_sink_input_columns(target_columns: &[ColumnDef]) -> Vec<ColumnDef> {
+    let mut columns = target_columns.to_vec();
+    columns.push(ColumnDef {
+        name: crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+        data_type: arrow::datatypes::DataType::Int64,
+        nullable: false,
+        write_default: None,
+        logical_type: None,
+    });
+    columns.push(ColumnDef {
+        name: crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
+        data_type: arrow::datatypes::DataType::Int64,
+        nullable: true,
+        write_default: None,
+        logical_type: None,
+    });
+    columns
+}
+
+fn row_lineage_iceberg_schema_def_for_codegen(schema: &iceberg::spec::Schema) -> IcebergSchemaDef {
+    let mut out = iceberg_schema_def_for_codegen(schema);
+    out.fields.push(IcebergSchemaFieldDef {
+        field_id: crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_ROW_ID,
+        name: crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+        initial_default: None,
+        write_default: None,
+        initial_default_json: None,
+        children: Vec::new(),
+    });
+    out.fields.push(IcebergSchemaFieldDef {
+        field_id: crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+        name: crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
+        initial_default: None,
+        write_default: None,
+        initial_default_json: None,
+        children: Vec::new(),
+    });
+    out
 }
 
 fn position_delete_sink_input_columns(
