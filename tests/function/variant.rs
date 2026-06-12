@@ -202,3 +202,183 @@ fn test_variant_typeof_int64() {
     let out = out.as_any().downcast_ref::<StringArray>().unwrap();
     assert_eq!(out.value(0), "Int64");
 }
+
+// ---------------------------------------------------------------------------
+// Tests for variant_get / try_variant_get (Task 3)
+// ---------------------------------------------------------------------------
+
+fn utf8_lit(arena: &mut ExprArena, s: &str) -> ExprId {
+    arena.push(ExprNode::Literal(LiteralValue::Utf8(s.to_string())))
+}
+
+#[test]
+fn test_variant_get_bigint_root() {
+    let variant = variant_primitive_serialized(6, &123_i64.to_le_bytes());
+    let (chunk, arg0, mut arena) = make_variant_chunk(variant);
+    let arg1 = utf8_lit(&mut arena, "$");
+    let arg2 = utf8_lit(&mut arena, "bigint");
+    let expr = common::typed_null(&mut arena, DataType::Int64);
+    let out =
+        eval_variant_function("variant_get", &arena, expr, &[arg0, arg1, arg2], &chunk).unwrap();
+    let out = out.as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(out.value(0), 123);
+}
+
+#[test]
+fn test_variant_get_two_arg_returns_variant() {
+    use novarocks::exec::variant::{VariantValue, variant_to_i64};
+    let variant = variant_primitive_serialized(6, &123_i64.to_le_bytes());
+    let (chunk, arg0, mut arena) = make_variant_chunk(variant);
+    let arg1 = utf8_lit(&mut arena, "$");
+    let expr = common::typed_null(&mut arena, DataType::LargeBinary);
+    let out = eval_variant_function("variant_get", &arena, expr, &[arg0, arg1], &chunk).unwrap();
+    let out = out.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+    let v = VariantValue::from_serialized(out.value(0)).unwrap();
+    assert_eq!(variant_to_i64(&v).unwrap(), 123);
+}
+
+#[test]
+fn test_variant_get_numeric_narrowing_truncates_like_spark_cast() {
+    // IV3-6 cast-semantics decision: numeric narrowing follows Spark CAST
+    // semantics — double 1.5 -> bigint truncates to 1 in BOTH strict and try
+    // modes (the upstream kernel and Spark agree; this is not a cast failure).
+    let variant = variant_primitive_serialized(7, &1.5_f64.to_le_bytes());
+    for fn_name in ["variant_get", "try_variant_get"] {
+        let (chunk, arg0, mut arena) = make_variant_chunk(variant.clone());
+        let arg1 = utf8_lit(&mut arena, "$");
+        let arg2 = utf8_lit(&mut arena, "bigint");
+        let expr = common::typed_null(&mut arena, DataType::Int64);
+        let out = eval_variant_function(fn_name, &arena, expr, &[arg0, arg1, arg2], &chunk)
+            .unwrap_or_else(|e| panic!("{fn_name} must truncate, not error: {e}"));
+        let out = out.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(out.value(0), 1, "{fn_name} truncates 1.5 -> 1");
+    }
+}
+
+#[test]
+fn test_try_variant_get_unconvertible_cast_is_null() {
+    // A genuinely unconvertible cast (non-numeric string -> bigint):
+    // try mode yields NULL.
+    let (chunk, arg0, mut arena) = make_json_chunk(r#"{"a": "abc"}"#);
+    let arg1 = utf8_lit(&mut arena, "$.a");
+    let arg2 = utf8_lit(&mut arena, "bigint");
+    let expr = common::typed_null(&mut arena, DataType::Int64);
+    let out = eval_variant_function("try_variant_get", &arena, expr, &[arg0, arg1, arg2], &chunk)
+        .unwrap();
+    let out = out.as_any().downcast_ref::<Int64Array>().unwrap();
+    assert!(out.is_null(0));
+}
+
+#[test]
+fn test_variant_get_unconvertible_cast_errors() {
+    // Strict mode errors on a genuinely unconvertible cast.
+    let (chunk, arg0, mut arena) = make_json_chunk(r#"{"a": "abc"}"#);
+    let arg1 = utf8_lit(&mut arena, "$.a");
+    let arg2 = utf8_lit(&mut arena, "bigint");
+    let expr = common::typed_null(&mut arena, DataType::Int64);
+    let err = eval_variant_function("variant_get", &arena, expr, &[arg0, arg1, arg2], &chunk)
+        .expect_err("strict unconvertible cast must error");
+    assert!(
+        err.to_lowercase().contains("cast"),
+        "error mentions the cast: {err}"
+    );
+}
+
+fn make_json_chunk(json: &str) -> (Chunk, ExprId, ExprArena) {
+    let arr = Arc::new(StringArray::from(vec![Some(json)])) as ArrayRef;
+    let field = Field::new("j", DataType::Utf8, true);
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![arr]).unwrap();
+    let chunk_schema =
+        ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &[SlotId::new(1)])
+            .expect("chunk schema");
+    let chunk = Chunk::new_with_chunk_schema(batch, chunk_schema);
+    let mut arena = ExprArena::default();
+    let arg0 = slot_id_expr(&mut arena, 1, DataType::Utf8);
+    (chunk, arg0, arena)
+}
+
+#[test]
+fn test_variant_get_json_string_input() {
+    let (chunk, arg0, mut arena) = make_json_chunk(r#"{"a": 42}"#);
+    let arg1 = utf8_lit(&mut arena, "$.a");
+    let arg2 = utf8_lit(&mut arena, "bigint");
+    let expr = common::typed_null(&mut arena, DataType::Int64);
+    let out =
+        eval_variant_function("variant_get", &arena, expr, &[arg0, arg1, arg2], &chunk).unwrap();
+    let out = out.as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(out.value(0), 42);
+}
+
+#[test]
+fn test_variant_get_missing_path_is_null() {
+    let (chunk, arg0, mut arena) = make_json_chunk(r#"{"a": 42}"#);
+    let arg1 = utf8_lit(&mut arena, "$.b");
+    let arg2 = utf8_lit(&mut arena, "bigint");
+    let expr = common::typed_null(&mut arena, DataType::Int64);
+    let out =
+        eval_variant_function("variant_get", &arena, expr, &[arg0, arg1, arg2], &chunk).unwrap();
+    let out = out.as_any().downcast_ref::<Int64Array>().unwrap();
+    assert!(out.is_null(0), "missing path is NULL even in strict mode");
+}
+
+#[test]
+fn test_variant_get_non_literal_path_errors() {
+    let variant = variant_primitive_serialized(6, &123_i64.to_le_bytes());
+    let (chunk, arg0, mut arena) = make_variant_chunk(variant);
+    // Path given as a slot ref instead of a literal must be rejected.
+    let arg1 = slot_id_expr(&mut arena, 1, DataType::Utf8);
+    let expr = common::typed_null(&mut arena, DataType::LargeBinary);
+    let err = eval_variant_function("variant_get", &arena, expr, &[arg0, arg1], &chunk)
+        .expect_err("non-literal path must error");
+    assert!(err.contains("constant"), "{err}");
+}
+
+#[test]
+fn test_variant_get_matches_get_variant_int_on_exact_types() {
+    let variant = variant_primitive_serialized(6, &7_i64.to_le_bytes());
+    let (chunk, arg0, mut arena) = make_variant_chunk(variant.clone());
+    let arg1 = utf8_lit(&mut arena, "$");
+    let arg2 = utf8_lit(&mut arena, "bigint");
+    let expr = common::typed_null(&mut arena, DataType::Int64);
+    let via_new =
+        eval_variant_function("variant_get", &arena, expr, &[arg0, arg1, arg2], &chunk).unwrap();
+    let (chunk2, b0, mut arena2) = make_variant_chunk(variant);
+    let b1 = utf8_lit(&mut arena2, "$");
+    let expr2 = common::typed_null(&mut arena2, DataType::Int64);
+    let via_old =
+        eval_variant_function("get_variant_int", &arena2, expr2, &[b0, b1], &chunk2).unwrap();
+    assert_eq!(
+        via_new
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        via_old
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0)
+    );
+}
+
+#[test]
+fn test_variant_get_null_input_row_is_null() {
+    // A SQL-NULL variant input row must yield NULL (not panic, not garbage).
+    // Build a 1-row LargeBinary variant column whose only row is NULL.
+    let arr = Arc::new(LargeBinaryArray::from(vec![None as Option<&[u8]>])) as ArrayRef;
+    let field = Field::new("v", DataType::LargeBinary, true);
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![arr]).unwrap();
+    let chunk_schema =
+        ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &[SlotId::new(1)])
+            .expect("chunk schema");
+    let chunk = Chunk::new_with_chunk_schema(batch, chunk_schema);
+    let mut arena = ExprArena::default();
+    let arg0 = slot_id_expr(&mut arena, 1, DataType::LargeBinary);
+    let arg1 = utf8_lit(&mut arena, "$.a");
+    let arg2 = utf8_lit(&mut arena, "bigint");
+    let expr = common::typed_null(&mut arena, DataType::Int64);
+    let out = eval_variant_function("variant_get", &arena, expr, &[arg0, arg1, arg2], &chunk)
+        .expect("null input row must not error");
+    let out = out.as_any().downcast_ref::<Int64Array>().unwrap();
+    assert!(out.is_null(0), "NULL variant input row yields NULL");
+}
