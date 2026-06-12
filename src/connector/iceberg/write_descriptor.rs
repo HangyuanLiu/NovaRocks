@@ -1,4 +1,4 @@
-use iceberg::spec::{Struct, TableMetadata};
+use iceberg::spec::{Literal, PrimitiveLiteral, Struct, TableMetadata, Type};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum IcebergWriteDescriptorError {
@@ -45,19 +45,207 @@ impl std::fmt::Display for IcebergWriteDescriptorError {
 impl std::error::Error for IcebergWriteDescriptorError {}
 
 pub(crate) fn encode_partition_descriptor(
-    _values: &Struct,
-    _partition_spec_id: i32,
-    _metadata: &TableMetadata,
+    values: &Struct,
+    partition_spec_id: i32,
+    metadata: &TableMetadata,
 ) -> Result<crate::types::TIcebergPartitionDescriptor, IcebergWriteDescriptorError> {
-    panic!("encode_partition_descriptor is implemented in Task 2")
+    let spec = metadata.partition_spec_by_id(partition_spec_id).ok_or(
+        IcebergWriteDescriptorError::UnknownPartitionSpec {
+            spec_id: partition_spec_id,
+        },
+    )?;
+    let partition_type = spec
+        .partition_type(metadata.current_schema().as_ref())
+        .map_err(|e| IcebergWriteDescriptorError::DecodeFailed {
+            index: 0,
+            message: e.to_string(),
+        })?;
+    if values.fields().len() != partition_type.fields().len() {
+        return Err(IcebergWriteDescriptorError::FieldCountMismatch {
+            expected: partition_type.fields().len(),
+            actual: values.fields().len(),
+        });
+    }
+
+    let mut encoded = Vec::with_capacity(values.fields().len());
+    for (idx, value) in values.fields().iter().enumerate() {
+        match value {
+            None => encoded.push(crate::types::TIcebergPartitionValue {
+                is_null: Some(true),
+                datum_bytes: None,
+            }),
+            Some(Literal::Primitive(primitive)) => {
+                let field_type = partition_type.fields()[idx].field_type.as_ref();
+                let iceberg::spec::Type::Primitive(primitive_type) = field_type else {
+                    return Err(IcebergWriteDescriptorError::DecodeFailed {
+                        index: idx,
+                        message: format!("partition field type is not primitive: {field_type:?}"),
+                    });
+                };
+                encoded.push(crate::types::TIcebergPartitionValue {
+                    is_null: Some(false),
+                    datum_bytes: Some(
+                        primitive_literal_to_iceberg_bytes(primitive, primitive_type).map_err(
+                            |message| IcebergWriteDescriptorError::DecodeFailed {
+                                index: idx,
+                                message,
+                            },
+                        )?,
+                    ),
+                });
+            }
+            Some(other) => {
+                return Err(IcebergWriteDescriptorError::DecodeFailed {
+                    index: idx,
+                    message: format!(
+                        "partition descriptor only supports primitive literals, got {other:?}"
+                    ),
+                });
+            }
+        }
+    }
+
+    Ok(crate::types::TIcebergPartitionDescriptor {
+        values: Some(encoded),
+    })
 }
 
 pub(crate) fn decode_partition_descriptor(
-    _desc: Option<crate::types::TIcebergPartitionDescriptor>,
-    _partition_spec_id: i32,
-    _metadata: &TableMetadata,
+    desc: Option<crate::types::TIcebergPartitionDescriptor>,
+    partition_spec_id: i32,
+    metadata: &TableMetadata,
 ) -> Result<Struct, IcebergWriteDescriptorError> {
-    panic!("decode_partition_descriptor is implemented in Task 2")
+    let desc = desc.ok_or(IcebergWriteDescriptorError::MissingDescriptor)?;
+    let values = desc.values.unwrap_or_default();
+    let spec = metadata.partition_spec_by_id(partition_spec_id).ok_or(
+        IcebergWriteDescriptorError::UnknownPartitionSpec {
+            spec_id: partition_spec_id,
+        },
+    )?;
+    let partition_type = spec
+        .partition_type(metadata.current_schema().as_ref())
+        .map_err(|e| IcebergWriteDescriptorError::DecodeFailed {
+            index: 0,
+            message: e.to_string(),
+        })?;
+    if values.len() != partition_type.fields().len() {
+        return Err(IcebergWriteDescriptorError::FieldCountMismatch {
+            expected: partition_type.fields().len(),
+            actual: values.len(),
+        });
+    }
+
+    let mut decoded = Vec::with_capacity(values.len());
+    for (idx, value) in values.into_iter().enumerate() {
+        if value.is_null.unwrap_or(false) {
+            decoded.push(None);
+            continue;
+        }
+
+        let bytes = value
+            .datum_bytes
+            .ok_or(IcebergWriteDescriptorError::MissingPayload { index: idx })?;
+        let field_type = partition_type.fields()[idx].field_type.as_ref();
+        let iceberg::spec::Type::Primitive(primitive_type) = field_type else {
+            return Err(IcebergWriteDescriptorError::DecodeFailed {
+                index: idx,
+                message: format!("partition field type is not primitive: {field_type:?}"),
+            });
+        };
+        let datum =
+            iceberg::spec::Datum::try_from_bytes(&bytes, primitive_type.clone()).map_err(|e| {
+                IcebergWriteDescriptorError::DecodeFailed {
+                    index: idx,
+                    message: e.to_string(),
+                }
+            })?;
+        decoded.push(Some(Literal::Primitive(datum.literal().clone())));
+    }
+
+    Ok(Struct::from_iter(decoded))
+}
+
+fn primitive_literal_to_iceberg_bytes(
+    literal: &PrimitiveLiteral,
+    primitive_type: &iceberg::spec::PrimitiveType,
+) -> Result<Vec<u8>, String> {
+    if !primitive_type.compatible(literal) {
+        return Err(format!(
+            "partition literal {literal:?} is incompatible with type {primitive_type:?}"
+        ));
+    }
+
+    let bytes = match (literal, primitive_type) {
+        (PrimitiveLiteral::Boolean(val), iceberg::spec::PrimitiveType::Boolean) => {
+            vec![u8::from(*val)]
+        }
+        (
+            PrimitiveLiteral::Int(val),
+            iceberg::spec::PrimitiveType::Int | iceberg::spec::PrimitiveType::Date,
+        ) => val.to_le_bytes().to_vec(),
+        (
+            PrimitiveLiteral::Long(val),
+            iceberg::spec::PrimitiveType::Long
+            | iceberg::spec::PrimitiveType::Time
+            | iceberg::spec::PrimitiveType::Timestamp
+            | iceberg::spec::PrimitiveType::Timestamptz
+            | iceberg::spec::PrimitiveType::TimestampNs
+            | iceberg::spec::PrimitiveType::TimestamptzNs,
+        ) => val.to_le_bytes().to_vec(),
+        (PrimitiveLiteral::Float(val), iceberg::spec::PrimitiveType::Float) => {
+            val.0.to_le_bytes().to_vec()
+        }
+        (PrimitiveLiteral::Double(val), iceberg::spec::PrimitiveType::Double) => {
+            val.0.to_le_bytes().to_vec()
+        }
+        (PrimitiveLiteral::String(val), iceberg::spec::PrimitiveType::String) => {
+            val.as_bytes().to_vec()
+        }
+        (
+            PrimitiveLiteral::Binary(val),
+            iceberg::spec::PrimitiveType::Binary | iceberg::spec::PrimitiveType::Fixed(_),
+        ) => val.clone(),
+        (PrimitiveLiteral::UInt128(val), iceberg::spec::PrimitiveType::Uuid) => {
+            val.to_be_bytes().to_vec()
+        }
+        (
+            PrimitiveLiteral::Int128(val),
+            iceberg::spec::PrimitiveType::Decimal { precision, .. },
+        ) => {
+            let required_bytes = Type::decimal_required_bytes(*precision).map_err(|_| {
+                format!("PrimitiveType Decimal must has valid precision but got {precision}")
+            })? as usize;
+            let mut bytes = i128_to_be_bytes_min(*val);
+            bytes.truncate(required_bytes);
+            bytes
+        }
+        _ => {
+            return Err(format!(
+                "partition literal {literal:?} is incompatible with type {primitive_type:?}"
+            ));
+        }
+    };
+
+    Ok(bytes)
+}
+
+fn i128_to_be_bytes_min(value: i128) -> Vec<u8> {
+    let bytes = value.to_be_bytes();
+    let is_negative = value < 0;
+    let skip_byte = if is_negative { 0xFF } else { 0x00 };
+
+    let mut start = 0;
+    while start < 15 && bytes[start] == skip_byte {
+        let next_byte = bytes[start + 1];
+        let next_is_negative = (next_byte & 0x80) != 0;
+        if next_is_negative == is_negative {
+            start += 1;
+        } else {
+            break;
+        }
+    }
+
+    bytes[start..].to_vec()
 }
 
 #[cfg(test)]
@@ -100,16 +288,100 @@ mod tests {
             .metadata
     }
 
+    fn metadata_with_multi_partition_fields() -> TableMetadata {
+        let schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                Arc::new(NestedField::required(
+                    1,
+                    "flag",
+                    Type::Primitive(PrimitiveType::Boolean),
+                )),
+                Arc::new(NestedField::required(
+                    2,
+                    "i",
+                    Type::Primitive(PrimitiveType::Int),
+                )),
+                Arc::new(NestedField::required(
+                    3,
+                    "l",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+                Arc::new(NestedField::required(
+                    4,
+                    "s",
+                    Type::Primitive(PrimitiveType::String),
+                )),
+                Arc::new(NestedField::required(
+                    5,
+                    "b",
+                    Type::Primitive(PrimitiveType::Binary),
+                )),
+            ])
+            .build()
+            .expect("schema");
+        let spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(8)
+            .add_partition_field("flag", "flag", Transform::Identity)
+            .expect("flag partition")
+            .add_partition_field("i", "i", Transform::Identity)
+            .expect("i partition")
+            .add_partition_field("l", "l", Transform::Identity)
+            .expect("l partition")
+            .add_partition_field("s", "s", Transform::Identity)
+            .expect("s partition")
+            .add_partition_field("b", "b", Transform::Identity)
+            .expect("b partition")
+            .build()
+            .expect("partition spec");
+        let creation = TableCreation::builder()
+            .name("t".to_string())
+            .location("file:///warehouse/db/t".to_string())
+            .schema(schema)
+            .partition_spec(spec)
+            .format_version(FormatVersion::V2)
+            .build();
+        TableMetadataBuilder::from_table_creation(creation)
+            .expect("table metadata builder")
+            .build()
+            .expect("table metadata")
+            .metadata
+    }
+
     #[test]
     fn descriptor_round_trips_identity_partition() {
         let metadata = metadata_with_identity_partition();
+        let spec_id = metadata.default_partition_spec_id();
         let values = Struct::from_iter([Some(Literal::Primitive(PrimitiveLiteral::String(
             "us west".to_string(),
         )))]);
 
-        let desc = encode_partition_descriptor(&values, 7, &metadata).expect("encode descriptor");
+        let desc =
+            encode_partition_descriptor(&values, spec_id, &metadata).expect("encode descriptor");
         let decoded =
-            decode_partition_descriptor(Some(desc), 7, &metadata).expect("decode descriptor");
+            decode_partition_descriptor(Some(desc), spec_id, &metadata).expect("decode descriptor");
+
+        assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn descriptor_round_trips_common_primitive_literals() {
+        let metadata = metadata_with_multi_partition_fields();
+        let spec_id = metadata.default_partition_spec_id();
+        let values = Struct::from_iter([
+            Some(Literal::Primitive(PrimitiveLiteral::Boolean(true))),
+            Some(Literal::Primitive(PrimitiveLiteral::Int(7))),
+            Some(Literal::Primitive(PrimitiveLiteral::Long(9))),
+            Some(Literal::Primitive(PrimitiveLiteral::String(
+                "west".to_string(),
+            ))),
+            Some(Literal::Primitive(PrimitiveLiteral::Binary(vec![1, 2, 3]))),
+        ]);
+
+        let desc =
+            encode_partition_descriptor(&values, spec_id, &metadata).expect("encode descriptor");
+        let decoded =
+            decode_partition_descriptor(Some(desc), spec_id, &metadata).expect("decode descriptor");
 
         assert_eq!(decoded, values);
     }
@@ -117,11 +389,13 @@ mod tests {
     #[test]
     fn descriptor_round_trips_null_partition_value() {
         let metadata = metadata_with_identity_partition();
+        let spec_id = metadata.default_partition_spec_id();
         let values = Struct::from_iter([None]);
 
-        let desc = encode_partition_descriptor(&values, 7, &metadata).expect("encode descriptor");
+        let desc =
+            encode_partition_descriptor(&values, spec_id, &metadata).expect("encode descriptor");
         let decoded =
-            decode_partition_descriptor(Some(desc), 7, &metadata).expect("decode descriptor");
+            decode_partition_descriptor(Some(desc), spec_id, &metadata).expect("decode descriptor");
 
         assert_eq!(decoded, values);
     }
@@ -129,6 +403,7 @@ mod tests {
     #[test]
     fn descriptor_rejects_missing_payload_for_non_null_value() {
         let metadata = metadata_with_identity_partition();
+        let spec_id = metadata.default_partition_spec_id();
         let desc = crate::types::TIcebergPartitionDescriptor {
             values: Some(vec![crate::types::TIcebergPartitionValue {
                 is_null: Some(false),
@@ -136,8 +411,8 @@ mod tests {
             }]),
         };
 
-        let err =
-            decode_partition_descriptor(Some(desc), 7, &metadata).expect_err("expected error");
+        let err = decode_partition_descriptor(Some(desc), spec_id, &metadata)
+            .expect_err("expected error");
 
         assert_eq!(err.code(), "IcebergWriteDescriptorMismatch");
         assert!(err.to_string().contains("has no payload"));
@@ -162,12 +437,13 @@ mod tests {
     #[test]
     fn descriptor_rejects_field_count_mismatch() {
         let metadata = metadata_with_identity_partition();
+        let spec_id = metadata.default_partition_spec_id();
         let desc = crate::types::TIcebergPartitionDescriptor {
             values: Some(vec![]),
         };
 
-        let err =
-            decode_partition_descriptor(Some(desc), 7, &metadata).expect_err("expected error");
+        let err = decode_partition_descriptor(Some(desc), spec_id, &metadata)
+            .expect_err("expected error");
 
         assert_eq!(
             err,
