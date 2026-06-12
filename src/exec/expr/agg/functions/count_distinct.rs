@@ -710,6 +710,7 @@ mod tests {
                 output_type: Some(DataType::Int64),
                 input_arg_type: None,
             }),
+            ..Default::default()
         };
         let spec = CountDistinctAgg
             .build_spec_from_type(&func, Some(array.data_type()), false)
@@ -743,6 +744,7 @@ mod tests {
                 output_type: Some(DataType::Int64),
                 input_arg_type: None,
             }),
+            ..Default::default()
         };
         let spec = CountDistinctAgg
             .build_spec_from_type(&func, Some(array.data_type()), false)
@@ -813,6 +815,7 @@ mod tests {
                             output_type: Some(DataType::Int64),
                             input_arg_type: None,
                         }),
+                        ..Default::default()
                     }],
                     need_finalize: true,
                     input_is_intermediate: false,

@@ -16,7 +16,7 @@
 // under the License.
 use crate::exec::expr::ExprArena;
 use crate::exec::node::aggregate::{
-    AggFunction, AggTypeSignature, AggregateNode, StreamingPreaggregationMode,
+    AggFunction, AggOrderSpec, AggTypeSignature, AggregateNode, StreamingPreaggregationMode,
     TopNRuntimeFilterSpec,
 };
 use crate::exec::node::{ExecNode, ExecNodeKind};
@@ -85,7 +85,7 @@ pub(crate) fn lower_aggregate_node(
             .as_ref()
             .map(|f| f.name.function_name.to_lowercase())
             .ok_or_else(|| "agg expr missing function name".to_string())?;
-        let fn_name = encode_aggregate_name(root, &fn_name_raw, query_opts)?;
+        let (fn_name, order) = encode_aggregate(root, &fn_name_raw, query_opts)?;
         let rewrite_ds_hll_merge_to_union =
             !agg.need_finalize && fn_name_raw == "ds_hll_count_distinct_merge";
         let fn_name = if rewrite_ds_hll_merge_to_union {
@@ -120,6 +120,7 @@ pub(crate) fn lower_aggregate_node(
             inputs,
             input_is_intermediate: is_merge,
             types: Some(type_sig),
+            order,
         };
         functions.push(func);
     }
@@ -256,11 +257,16 @@ fn agg_type_signature_from_node(node: &exprs::TExprNode) -> Result<AggTypeSignat
     })
 }
 
-fn encode_aggregate_name(
+/// Resolve an aggregate's execution-layer base name and its structured ORDER BY /
+/// DISTINCT metadata from the thrift node. array_agg's DISTINCT folds into the
+/// base name (`array_agg_distinct`); group_concat's DISTINCT and max-length, and
+/// both functions' ORDER BY, are carried structurally in [`AggOrderSpec`] (no
+/// longer squashed into the function-name string).
+fn encode_aggregate(
     node: &exprs::TExprNode,
     fn_name: &str,
     query_opts: Option<&crate::internal_service::TQueryOptions>,
-) -> Result<String, String> {
+) -> Result<(String, AggOrderSpec), String> {
     if matches!(
         fn_name,
         "array_agg" | "array_agg_distinct" | "array_unique_agg"
@@ -294,16 +300,19 @@ fn encode_aggregate_name(
                 nulls_first.len()
             ));
         }
-        if is_asc_order.is_empty() {
-            return Ok(base.to_string());
-        }
-        let asc = encode_bool_list(&is_asc_order);
-        let nulls = encode_bool_list(&nulls_first);
-        return Ok(format!("{base}|a={asc}|n={nulls}"));
+        return Ok((
+            base.to_string(),
+            AggOrderSpec {
+                is_asc_order,
+                nulls_first,
+                is_distinct: false,
+                group_concat_max_len: None,
+            },
+        ));
     }
 
     if fn_name != "group_concat" && fn_name != "string_agg" {
-        return Ok(fn_name.to_string());
+        return Ok((fn_name.to_string(), AggOrderSpec::default()));
     }
 
     let aggregate_fn = node.fn_.as_ref().and_then(|f| f.aggregate_fn.as_ref());
@@ -323,27 +332,19 @@ fn encode_aggregate_name(
             nulls_first.len()
         ));
     }
-
-    let asc = encode_bool_list(&is_asc_order);
-    let nulls = encode_bool_list(&nulls_first);
     let group_concat_max_len = query_opts
         .and_then(|opts| opts.group_concat_max_len)
         .unwrap_or(1024)
         .max(4);
-    Ok(format!(
-        "{fn_name}|d={}|a={}|n={}|m={}",
-        if is_distinct { 1 } else { 0 },
-        asc,
-        nulls,
-        group_concat_max_len
+    Ok((
+        fn_name.to_string(),
+        AggOrderSpec {
+            is_asc_order,
+            nulls_first,
+            is_distinct,
+            group_concat_max_len: Some(group_concat_max_len),
+        },
     ))
-}
-
-fn encode_bool_list(v: &[bool]) -> String {
-    v.iter()
-        .map(|b| if *b { "1" } else { "0" })
-        .collect::<Vec<_>>()
-        .join(",")
 }
 
 fn select_aggregate_inputs(

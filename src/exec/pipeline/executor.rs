@@ -267,6 +267,7 @@ mod tests {
                             output_type: Some(DataType::Int64),
                             input_arg_type: None,
                         }),
+                        ..Default::default()
                     }],
                     need_finalize: true,
                     input_is_intermediate: false,
@@ -1367,6 +1368,7 @@ mod tests {
                                 output_type: Some(DataType::Int64),
                                 input_arg_type: None,
                             }),
+                            ..Default::default()
                         },
                         AggFunction {
                             name: "sum".to_string(),
@@ -1377,6 +1379,7 @@ mod tests {
                                 output_type: Some(DataType::Int64),
                                 input_arg_type: None,
                             }),
+                            ..Default::default()
                         },
                     ],
                     need_finalize: true,

@@ -961,6 +961,7 @@ fn compute_window_custom_aggregate(
                 output_type: Some(return_type.clone()),
                 input_arg_type: input_array.as_ref().map(|a| a.data_type().clone()),
             }),
+            ..Default::default()
         }],
         &[input_array.as_ref().map(|a| a.data_type().clone())],
     )?;

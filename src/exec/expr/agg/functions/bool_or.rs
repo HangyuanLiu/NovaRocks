@@ -170,6 +170,7 @@ mod tests {
                 output_type: Some(DataType::Boolean),
                 input_arg_type: Some(DataType::Boolean),
             }),
+            ..Default::default()
         };
         let spec = BoolOrAgg
             .build_spec_from_type(&func, Some(&DataType::Boolean), false)
@@ -188,6 +189,7 @@ mod tests {
                 output_type: Some(DataType::Boolean),
                 input_arg_type: Some(DataType::Boolean),
             }),
+            ..Default::default()
         };
         let spec = BoolOrAgg
             .build_spec_from_type(&func, Some(&DataType::Boolean), false)
@@ -223,6 +225,7 @@ mod tests {
                 output_type: Some(DataType::Boolean),
                 input_arg_type: Some(DataType::Boolean),
             }),
+            ..Default::default()
         };
         let spec = super::build_spec_from_type(&func, Some(&DataType::Boolean), false).unwrap();
         assert!(matches!(spec.kind, AggKind::BoolOr));
@@ -239,6 +242,7 @@ mod tests {
                 output_type: Some(DataType::Boolean),
                 input_arg_type: Some(DataType::Boolean),
             }),
+            ..Default::default()
         };
         let spec = BoolOrAgg
             .build_spec_from_type(&func, Some(&DataType::Boolean), false)
@@ -276,6 +280,7 @@ mod tests {
                 output_type: Some(DataType::Boolean),
                 input_arg_type: Some(DataType::Boolean),
             }),
+            ..Default::default()
         };
         let spec = BoolOrAgg
             .build_spec_from_type(&func, Some(&DataType::Boolean), true)

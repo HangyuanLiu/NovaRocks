@@ -137,58 +137,6 @@ fn is_distinct_kind(kind: &AggKind) -> bool {
     }
 }
 
-fn parse_bool_flag(v: &str) -> Result<bool, String> {
-    match v {
-        "1" | "true" | "TRUE" => Ok(true),
-        "0" | "false" | "FALSE" => Ok(false),
-        _ => Err(format!("array_agg metadata bool is invalid: {}", v)),
-    }
-}
-
-fn parse_bool_list(v: &str) -> Result<Vec<bool>, String> {
-    if v.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut out = Vec::new();
-    for token in v.split(',') {
-        out.push(parse_bool_flag(token)?);
-    }
-    Ok(out)
-}
-
-fn parse_array_agg_metadata(name: &str) -> Result<(String, Vec<bool>, Vec<bool>), String> {
-    let base = name.split('|').next().unwrap_or(name).to_string();
-    if base != "array_agg" && base != "array_agg_distinct" && base != "array_unique_agg" {
-        return Err(format!("unsupported array agg function: {}", name));
-    }
-    if !name.contains('|') {
-        return Ok((base, Vec::new(), Vec::new()));
-    }
-
-    let mut is_asc_order = Vec::new();
-    let mut nulls_first = Vec::new();
-    for token in name.split('|').skip(1) {
-        let (k, v) = token
-            .split_once('=')
-            .ok_or_else(|| format!("array_agg metadata token missing '=': {}", token))?;
-        match k {
-            "a" => is_asc_order = parse_bool_list(v)?,
-            "n" => nulls_first = parse_bool_list(v)?,
-            other => {
-                return Err(format!("array_agg metadata key '{}' is unsupported", other));
-            }
-        }
-    }
-    if is_asc_order.len() != nulls_first.len() {
-        return Err(format!(
-            "array_agg metadata length mismatch: is_asc_order={} nulls_first={}",
-            is_asc_order.len(),
-            nulls_first.len()
-        ));
-    }
-    Ok((base, is_asc_order, nulls_first))
-}
-
 fn order_by_kind(kind: &AggKind) -> (&[bool], &[bool]) {
     match kind {
         AggKind::ArrayAgg {
@@ -1175,8 +1123,10 @@ impl AggregateFunction for ArrayAggAgg {
         input_is_intermediate: bool,
     ) -> Result<AggSpec, String> {
         let input_type = input_type.ok_or_else(|| "array_agg input type missing".to_string())?;
-        let (base_name, is_asc_order, nulls_first) = parse_array_agg_metadata(func.name.as_str())?;
-        let kind = match base_name.as_str() {
+        let base_name = func.name.as_str();
+        let is_asc_order = func.order.is_asc_order.clone();
+        let nulls_first = func.order.nulls_first.clone();
+        let kind = match base_name {
             "array_agg" => AggKind::ArrayAgg {
                 is_distinct: false,
                 is_asc_order,
@@ -1546,6 +1496,7 @@ mod tests {
                 output_type: Some(list_i64_type()),
                 input_arg_type: Some(DataType::Int64),
             }),
+            ..Default::default()
         }
     }
 
@@ -1694,6 +1645,7 @@ mod tests {
             inputs: vec![],
             input_is_intermediate: false,
             types: None,
+            ..Default::default()
         };
         let input_type = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
         let spec = ArrayAggAgg
@@ -1750,10 +1702,16 @@ mod tests {
             Arc::new(Field::new("f1", DataType::Int32, true)),
         ]));
         let update_func = AggFunction {
-            name: "array_agg_distinct|a=1|n=0".to_string(),
+            name: "array_agg_distinct".to_string(),
             inputs: vec![],
             input_is_intermediate: false,
             types: Some(array_agg_map_order_types(false)),
+            order: crate::exec::node::aggregate::AggOrderSpec {
+                is_asc_order: vec![true],
+                nulls_first: vec![false],
+                is_distinct: false,
+                group_concat_max_len: None,
+            },
         };
         let update_spec = ArrayAggAgg
             .build_spec_from_type(&update_func, Some(&planned_input_type), false)
@@ -1785,10 +1743,16 @@ mod tests {
         ArrayAggAgg.drop_state(&update_spec, update_state.as_mut_ptr() as *mut u8);
 
         let merge_func = AggFunction {
-            name: "array_agg_distinct|a=1|n=0".to_string(),
+            name: "array_agg_distinct".to_string(),
             inputs: vec![],
             input_is_intermediate: true,
             types: Some(array_agg_map_order_types(false)),
+            order: crate::exec::node::aggregate::AggOrderSpec {
+                is_asc_order: vec![true],
+                nulls_first: vec![false],
+                is_distinct: false,
+                group_concat_max_len: None,
+            },
         };
         let merge_spec = ArrayAggAgg
             .build_spec_from_type(

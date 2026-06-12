@@ -511,6 +511,7 @@ mod tests {
                 output_type: Some(DataType::Int64),
                 input_arg_type: None,
             }),
+            ..Default::default()
         };
         let struct_type = DataType::Struct(
             vec![
@@ -553,6 +554,7 @@ mod tests {
                     output_type: Some(DataType::Utf8),
                     input_arg_type: None,
                 }),
+                ..Default::default()
             };
             let spec = MaxMinByAgg
                 .build_spec_from_type(&func, Some(&struct_type), false)

@@ -108,70 +108,6 @@ impl GroupConcatLayout {
     }
 }
 
-fn parse_group_concat_metadata(name: &str) -> Result<(bool, Vec<bool>, Vec<bool>, i64), String> {
-    let base = name.split('|').next().unwrap_or(name);
-    if base != "group_concat" && base != "string_agg" {
-        return Err(format!("unsupported group_concat function: {}", name));
-    }
-    if !name.contains('|') {
-        return Ok((false, Vec::new(), Vec::new(), 1024));
-    }
-
-    let mut is_distinct = false;
-    let mut is_asc_order = Vec::new();
-    let mut nulls_first = Vec::new();
-    let mut max_len = 1024i64;
-    for token in name.split('|').skip(1) {
-        let (k, v) = token
-            .split_once('=')
-            .ok_or_else(|| format!("group_concat metadata token missing '=': {}", token))?;
-        match k {
-            "d" => is_distinct = parse_bool_flag(v)?,
-            "a" => is_asc_order = parse_bool_list(v)?,
-            "n" => nulls_first = parse_bool_list(v)?,
-            "m" => {
-                max_len = v
-                    .parse::<i64>()
-                    .map_err(|_| format!("group_concat metadata max_len is invalid: {}", v))?;
-            }
-            other => {
-                return Err(format!(
-                    "group_concat metadata key '{}' is unsupported",
-                    other
-                ));
-            }
-        }
-    }
-
-    if is_asc_order.len() != nulls_first.len() {
-        return Err(format!(
-            "group_concat metadata length mismatch: is_asc_order={} nulls_first={}",
-            is_asc_order.len(),
-            nulls_first.len()
-        ));
-    }
-    Ok((is_distinct, is_asc_order, nulls_first, max_len.max(4)))
-}
-
-fn parse_bool_flag(v: &str) -> Result<bool, String> {
-    match v {
-        "1" | "true" | "TRUE" => Ok(true),
-        "0" | "false" | "FALSE" => Ok(false),
-        _ => Err(format!("group_concat metadata bool is invalid: {}", v)),
-    }
-}
-
-fn parse_bool_list(v: &str) -> Result<Vec<bool>, String> {
-    if v.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut out = Vec::new();
-    for token in v.split(',') {
-        out.push(parse_bool_flag(token)?);
-    }
-    Ok(out)
-}
-
 type GroupConcatKind<'a> = (bool, &'a [bool], &'a [bool], i64);
 
 fn group_concat_kind(spec: &AggSpec) -> Result<GroupConcatKind<'_>, String> {
@@ -510,8 +446,10 @@ impl AggregateFunction for GroupConcatAgg {
         input_is_intermediate: bool,
     ) -> Result<AggSpec, String> {
         let input_type = input_type.ok_or_else(|| "group_concat input type missing".to_string())?;
-        let (is_distinct, is_asc_order, nulls_first, max_len) =
-            parse_group_concat_metadata(&func.name)?;
+        let is_distinct = func.order.is_distinct;
+        let is_asc_order = func.order.is_asc_order.clone();
+        let nulls_first = func.order.nulls_first.clone();
+        let max_len = func.order.group_concat_max_len.unwrap_or(1024).max(4);
         let order_by_num = is_asc_order.len();
         let kind = AggKind::GroupConcat {
             is_distinct,
@@ -831,8 +769,29 @@ mod tests {
         intermediate_type: DataType,
         input_arg_type: DataType,
     ) -> AggFunction {
+        // Test shorthand: "group_concat|d=1|a=1|n=0|m=1024" -> base name + structured order.
+        let mut parts = name.split('|');
+        let base = parts.next().unwrap_or(name).to_string();
+        let mut order = crate::exec::node::aggregate::AggOrderSpec::default();
+        let bools = |s: &str| {
+            s.split(',')
+                .filter(|p| !p.is_empty())
+                .map(|p| p == "1")
+                .collect::<Vec<_>>()
+        };
+        for tok in parts {
+            if let Some((k, v)) = tok.split_once('=') {
+                match k {
+                    "d" => order.is_distinct = v == "1",
+                    "a" => order.is_asc_order = bools(v),
+                    "n" => order.nulls_first = bools(v),
+                    "m" => order.group_concat_max_len = v.parse().ok(),
+                    _ => {}
+                }
+            }
+        }
         AggFunction {
-            name: name.to_string(),
+            name: base,
             inputs: vec![],
             input_is_intermediate,
             types: Some(crate::exec::node::aggregate::AggTypeSignature {
@@ -840,6 +799,7 @@ mod tests {
                 output_type: Some(DataType::Utf8),
                 input_arg_type: Some(input_arg_type),
             }),
+            order,
         }
     }
 

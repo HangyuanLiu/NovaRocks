@@ -1436,6 +1436,7 @@ mod tests {
                         output_type: Some(DataType::Int64),
                         input_arg_type: None,
                     }),
+                    ..Default::default()
                 }],
                 need_finalize: true,
                 input_is_intermediate: false,
@@ -1459,6 +1460,7 @@ mod tests {
                         output_type: Some(DataType::Int64),
                         input_arg_type: None,
                     }),
+                    ..Default::default()
                 }],
                 need_finalize: true,
                 input_is_intermediate: false,
@@ -1537,6 +1539,7 @@ mod tests {
                         output_type: Some(DataType::Int64),
                         input_arg_type: Some(DataType::Int32),
                     }),
+                    ..Default::default()
                 }],
                 // "merge serialize" style node: outputs intermediate, but still groups by keys.
                 need_finalize: false,
@@ -1617,6 +1620,7 @@ mod tests {
                         output_type: Some(DataType::Int64),
                         input_arg_type: Some(DataType::Int32),
                     }),
+                    ..Default::default()
                 }],
                 // Outputs intermediate states to be merged/finalized downstream.
                 need_finalize: false,

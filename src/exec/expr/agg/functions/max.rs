@@ -564,6 +564,7 @@ mod tests {
                 output_type: Some(DataType::Int32),
                 input_arg_type: Some(DataType::Int32),
             }),
+            ..Default::default()
         };
 
         let kernels = build_kernel_set(&[func], &[Some(DataType::Int32)]).expect("build kernels");
@@ -599,6 +600,7 @@ mod tests {
                 output_type: Some(DataType::FixedSizeBinary(16)),
                 input_arg_type: Some(DataType::FixedSizeBinary(16)),
             }),
+            ..Default::default()
         };
 
         let kernels = build_kernel_set(&[func], &[Some(DataType::FixedSizeBinary(16))])

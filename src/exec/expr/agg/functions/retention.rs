@@ -235,6 +235,7 @@ mod tests {
                 )),
                 input_arg_type: None,
             }),
+            ..Default::default()
         };
         let input_type = DataType::List(Field::new("item", DataType::Boolean, true).into());
         let spec = RetentionAgg
@@ -256,6 +257,7 @@ mod tests {
                 )),
                 input_arg_type: None,
             }),
+            ..Default::default()
         };
         let input_type = DataType::List(Field::new("item", DataType::Boolean, true).into());
         let spec = RetentionAgg

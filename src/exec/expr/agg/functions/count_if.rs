@@ -178,6 +178,7 @@ mod tests {
                 output_type: Some(DataType::Int64),
                 input_arg_type: Some(DataType::Boolean),
             }),
+            ..Default::default()
         };
         let spec = CountIfAgg
             .build_spec_from_type(&func, Some(&DataType::Boolean), false)
@@ -196,6 +197,7 @@ mod tests {
                 output_type: Some(DataType::Int64),
                 input_arg_type: Some(DataType::Boolean),
             }),
+            ..Default::default()
         };
         let spec = CountIfAgg
             .build_spec_from_type(&func, Some(&DataType::Boolean), false)
@@ -235,6 +237,7 @@ mod tests {
                 output_type: Some(DataType::Int64),
                 input_arg_type: Some(DataType::Int8),
             }),
+            ..Default::default()
         };
         let spec = CountIfAgg
             .build_spec_from_type(&func, Some(&DataType::Int64), true)
