@@ -11,6 +11,7 @@ mod existential_apply_to_join;
 mod predicate_apply_util;
 mod push_down_apply_agg_filter;
 mod push_down_apply_filter;
+mod quantified_apply_to_join;
 mod scalar_apply_to_join;
 mod win_magic_util;
 
@@ -20,6 +21,8 @@ pub(crate) use apply_to_window::ApplyToWindow;
 pub(crate) use existential_apply_to_join::ExistentialApplyToJoin;
 pub(crate) use push_down_apply_agg_filter::PushDownApplyAggFilter;
 pub(crate) use push_down_apply_filter::PushDownApplyFilter;
+#[allow(unused_imports)]
+pub(crate) use quantified_apply_to_join::QuantifiedApplyToJoin;
 pub(crate) use scalar_apply_to_join::ScalarApplyToJoin;
 
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
