@@ -31,7 +31,8 @@ use crate::runtime::write_coordinator::WriteCommitInput;
 use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
 use crate::sql::codegen::iceberg_write_sink::IcebergWriteSinkSpec;
 use crate::sql::parser::ast::{
-    MergeMatchedAction, MergeNotMatchedAction, MergeStmt, ObjectName, UpdateStmt,
+    InsertSource, MergeMatchedAction, MergeNotMatchedAction, MergeStmt, ObjectName, OverwriteMode,
+    UpdateStmt,
 };
 
 pub(crate) fn execute_update_statement(
@@ -302,10 +303,8 @@ fn build_update_mor_distributed_write(
 fn build_merge_mor_distributed_write(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
-    stmt: &MergeStmt,
-    current_catalog: Option<&str>,
+    matched_rows: &MatchedUpdateBatch,
     target_columns: &[crate::engine::catalog::ColumnDef],
-    target_ref: &str,
 ) -> Result<MorUpdateDistributedWrite, String> {
     let entry = {
         let registry = state
@@ -329,55 +328,10 @@ fn build_merge_mor_distributed_write(
     let data_sink_spec = crate::engine::iceberg_writer::build_row_lineage_data_sink_spec(
         target, &resolved, &table, &entry,
     )?;
-    let target_alias = stmt
-        .target_alias
-        .as_deref()
-        .unwrap_or(MERGE_TARGET_DEFAULT_ALIAS);
-    let source_table_sql =
-        mutation_source_relation_to_sql(state, &stmt.source, current_catalog, target)?;
-    let source_sql = match &stmt.source {
-        crate::sql::parser::ast::MutationSource::Table { alias, .. }
-        | crate::sql::parser::ast::MutationSource::Query { alias, .. } => {
-            if alias.is_some() {
-                source_table_sql
-            } else {
-                format!("{source_table_sql} AS {MERGE_SOURCE_DEFAULT_ALIAS}")
-            }
-        }
-    };
-    let matched = stmt
-        .matched
-        .as_ref()
-        .ok_or_else(|| "MERGE matched UPDATE write requires a matched clause".to_string())?;
-    let assignments = match &matched.action {
-        MergeMatchedAction::Update { assignments } => assignments,
-        MergeMatchedAction::Delete => {
-            return Err("MERGE matched DELETE cannot use MOR UPDATE writer".to_string());
-        }
-    };
-    let assignments_sql = assignments
-        .iter()
-        .map(|assignment| (assignment.column.as_str(), assignment.value.to_string()))
-        .collect::<Vec<_>>();
-    let assignments_sql = assignments_sql
-        .iter()
-        .map(|(column, expr)| (*column, expr.as_str()))
-        .collect::<Vec<_>>();
-    let on_sql = stmt.on.to_string();
-    let matched_predicate_sql = matched.predicate.as_ref().map(|expr| expr.to_string());
-    let where_sql = match matched_predicate_sql.as_deref() {
-        Some(predicate) => format!("({on_sql}) AND ({predicate})"),
-        None => on_sql,
-    };
     let new_sequence_number = table.metadata().last_sequence_number() + 1;
-    let data_query = build_update_mor_data_sink_query(
-        target,
-        target_alias,
-        Some(&source_sql),
-        &assignments_sql,
-        Some(&where_sql),
+    let data_query = build_merge_mor_data_sink_query_from_matched(
+        matched_rows,
         target_columns,
-        target_ref,
         new_sequence_number,
     )?;
     Ok(MorUpdateDistributedWrite {
@@ -432,6 +386,104 @@ fn build_update_mor_data_sink_query(
         )),
     );
     parse_generated_query(&sql, "MOR UPDATE data sink")
+}
+
+fn build_merge_mor_data_sink_query_from_matched(
+    matched: &MatchedUpdateBatch,
+    target_columns: &[crate::engine::catalog::ColumnDef],
+    new_sequence_number: i64,
+) -> Result<sqlparser::ast::Query, String> {
+    if matched.row_ids.is_empty() {
+        return Err("MERGE MOR UPDATE data sink requires at least one matched row".to_string());
+    }
+    if matched.new_rows.num_rows() != matched.row_ids.len() {
+        return Err(format!(
+            "MERGE MOR UPDATE matched row count mismatch: new_rows={}, row_ids={}",
+            matched.new_rows.num_rows(),
+            matched.row_ids.len()
+        ));
+    }
+
+    let alias = "__nr_m";
+    let mut value_column_names = target_columns
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect::<Vec<_>>();
+    value_column_names.push(crate::exec::row_position::ICEBERG_ROW_ID_COL);
+    value_column_names.push(crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL);
+
+    let mut rows = Vec::with_capacity(matched.new_rows.num_rows());
+    for row in 0..matched.new_rows.num_rows() {
+        let mut values = Vec::with_capacity(target_columns.len() + 2);
+        for target_column in target_columns {
+            let idx = matched
+                .new_rows
+                .schema()
+                .index_of(&target_column.name)
+                .map_err(|_| {
+                    format!(
+                        "MERGE MOR UPDATE new-row batch missing target column `{}`",
+                        target_column.name
+                    )
+                })?;
+            let literal =
+                crate::engine::sql_expr::literal_from_batch(matched.new_rows.column(idx), row)?;
+            values.push(
+                crate::engine::iceberg_writer::literal_to_sql_for_arrow_type(
+                    &literal,
+                    &target_column.data_type,
+                )?,
+            );
+        }
+        values.push(matched.row_ids[row].to_string());
+        values.push(new_sequence_number.to_string());
+        rows.push(format!("({})", values.join(", ")));
+    }
+
+    let value_columns = value_column_names
+        .iter()
+        .map(|name| sql_identifier(name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let values_sql = format!(
+        "(VALUES {}) AS {}({})",
+        rows.join(", "),
+        sql_identifier(alias),
+        value_columns
+    );
+
+    let mut select_items = Vec::with_capacity(target_columns.len() + 2);
+    for column in target_columns {
+        select_items.push(format!(
+            "{} AS {}",
+            crate::engine::iceberg_writer::target_cast_expr_sql(
+                &qualify_column(alias, &column.name),
+                column,
+            )?,
+            sql_identifier(&column.name)
+        ));
+    }
+    select_items.push(format!(
+        "CAST({} AS BIGINT) AS {}",
+        qualify_column(alias, crate::exec::row_position::ICEBERG_ROW_ID_COL),
+        sql_identifier(crate::exec::row_position::ICEBERG_ROW_ID_COL)
+    ));
+    select_items.push(format!(
+        "CAST({} AS BIGINT) AS {}",
+        qualify_column(
+            alias,
+            crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL
+        ),
+        sql_identifier(crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL)
+    ));
+
+    let sql = format!(
+        "SELECT {} FROM {} ORDER BY {}",
+        select_items.join(", "),
+        values_sql,
+        qualify_column(alias, crate::exec::row_position::ICEBERG_ROW_ID_COL)
+    );
+    parse_generated_query(&sql, "MERGE MOR UPDATE data sink")
 }
 
 fn build_update_distributed_select_sql(
@@ -710,9 +762,6 @@ enum MutationWritePlan {
     MergeMatchedDelete {
         matched: MatchedUpdateBatch,
     },
-    MergeUnmatchedInsert {
-        insert_batch: RecordBatch,
-    },
 }
 
 impl MutationWritePlan {
@@ -720,7 +769,6 @@ impl MutationWritePlan {
         match self {
             Self::CowUpdate { .. } => "cow-update",
             Self::MergeMatchedDelete { .. } => "merge-delete",
-            Self::MergeUnmatchedInsert { .. } => "merge-insert",
         }
     }
 }
@@ -772,34 +820,6 @@ impl IcebergWriteTransactionExecutor for MutationWriteExecutor {
                     build_position_delete_groups_from_matched(&matched, &referenced_partitions)?;
                 for group in delete_groups {
                     self.collector.inject_delete_group(group);
-                }
-            }
-            MutationWritePlan::MergeUnmatchedInsert { insert_batch } => {
-                if insert_batch.num_rows() == 0 {
-                    return Ok(no_mutation_write_result());
-                }
-                let data_files = block_on_iceberg(async {
-                    crate::connector::iceberg::data_writer::write_record_batches_as_data_files(
-                        &self.table,
-                        std::iter::once(insert_batch),
-                    )
-                    .await
-                })??;
-                if data_files.is_empty() {
-                    return Ok(no_mutation_write_result());
-                }
-                let default_spec_id = self.table.metadata().default_partition_spec_id();
-                for df in data_files {
-                    let wf = crate::engine::iceberg_writer::data_file_to_written_file(
-                        &df,
-                        default_spec_id,
-                    )?;
-                    sink_commit_infos.push(
-                        crate::connector::iceberg::data_writer::written_file_to_sink_commit_info(
-                            &wf,
-                            self.table.metadata(),
-                        )?,
-                    );
                 }
             }
         }
@@ -1764,6 +1784,25 @@ pub(crate) fn execute_merge_statement(
     )?;
 
     let mut applied_change = false;
+    if let Some(clause) = stmt.not_matched.as_ref() {
+        let insert_columns = insert_columns_resolved
+            .as_ref()
+            .expect("not_matched populated => insert columns resolved");
+        let insert_batch = match_rows.unmatched_insert_batch(&target_columns, insert_columns)?;
+        if insert_batch.num_rows() > 0 {
+            execute_merge_unmatched_insert(
+                state,
+                &target,
+                stmt,
+                current_catalog,
+                &target_columns,
+                insert_columns,
+            )?;
+            applied_change = true;
+        }
+        let _ = clause;
+    }
+
     if let Some(clause) = stmt.matched.as_ref() {
         let matched = matched_update_batch_from_record_batch(&match_rows.matched_batch()?)?;
         if !matched.row_ids.is_empty() {
@@ -1771,49 +1810,52 @@ pub(crate) fn execute_merge_statement(
             match &clause.action {
                 MergeMatchedAction::Update { .. } => {
                     let mode = select_iceberg_update_mode(&table)?;
+                    let catalog_for_op = build_iceberg_catalog(&entry)?;
                     let table_for_op =
-                        block_on_iceberg(async { catalog.load_table(&table_ident).await })?
+                        block_on_iceberg(async { catalog_for_op.load_table(&table_ident).await })?
                             .map_err(|e| format!("reload iceberg table {}: {e}", &table_ident))?;
                     match mode {
                         IcebergUpdateMode::CopyOnWrite => execute_cow_update(
                             state,
                             &target,
-                            catalog.clone(),
+                            catalog_for_op.clone(),
                             table_ident.clone(),
                             table_for_op,
                             matched,
                             entry.clone(),
                             "main",
                         )?,
-                        IcebergUpdateMode::MergeOnRead => execute_mor_update(
-                            state,
-                            &target,
-                            catalog.clone(),
-                            table_ident.clone(),
-                            table_for_op,
-                            matched,
-                            entry.clone(),
-                            "main",
-                            build_merge_mor_distributed_write(
+                        IcebergUpdateMode::MergeOnRead => {
+                            let write = build_merge_mor_distributed_write(
                                 state,
                                 &target,
-                                stmt,
-                                current_catalog,
+                                &matched,
                                 &target_columns,
+                            )?;
+                            execute_mor_update(
+                                state,
+                                &target,
+                                catalog_for_op.clone(),
+                                table_ident.clone(),
+                                table_for_op,
+                                matched,
+                                entry.clone(),
                                 "main",
-                            )?,
-                        )?,
+                                write,
+                            )?
+                        }
                     };
                     applied_change = true;
                 }
                 MergeMatchedAction::Delete => {
+                    let catalog_for_op = build_iceberg_catalog(&entry)?;
                     let table_for_op =
-                        block_on_iceberg(async { catalog.load_table(&table_ident).await })?
+                        block_on_iceberg(async { catalog_for_op.load_table(&table_ident).await })?
                             .map_err(|e| format!("reload iceberg table {}: {e}", &table_ident))?;
                     execute_merge_matched_delete(
                         state,
                         &target,
-                        catalog.clone(),
+                        catalog_for_op.clone(),
                         table_ident.clone(),
                         table_for_op,
                         matched,
@@ -1823,27 +1865,6 @@ pub(crate) fn execute_merge_statement(
                 }
             }
         }
-    }
-
-    if let Some(clause) = stmt.not_matched.as_ref() {
-        let insert_columns =
-            insert_columns_resolved.expect("not_matched populated => insert columns resolved");
-        let insert_batch = match_rows.unmatched_insert_batch(&target_columns, &insert_columns)?;
-        if insert_batch.num_rows() > 0 {
-            let table_for_op = block_on_iceberg(async { catalog.load_table(&table_ident).await })?
-                .map_err(|e| format!("reload iceberg table {}: {e}", &table_ident))?;
-            execute_merge_unmatched_insert(
-                state,
-                &target,
-                catalog.clone(),
-                table_ident.clone(),
-                table_for_op,
-                insert_batch,
-                entry.clone(),
-            )?;
-            applied_change = true;
-        }
-        let _ = clause;
     }
 
     let _ = applied_change;
@@ -2234,6 +2255,76 @@ fn build_merge_match_query_sql(
     )
 }
 
+fn build_merge_unmatched_insert_query(
+    state: &Arc<StandaloneState>,
+    target: &crate::engine::backend_resolver::TargetBackend,
+    stmt: &MergeStmt,
+    current_catalog: Option<&str>,
+    target_columns: &[crate::engine::catalog::ColumnDef],
+    insert_columns: &MergeInsertColumns,
+) -> Result<sqlparser::ast::Query, String> {
+    let target_alias = stmt
+        .target_alias
+        .as_deref()
+        .unwrap_or(MERGE_TARGET_DEFAULT_ALIAS);
+    let source_table_sql =
+        mutation_source_relation_to_sql(state, &stmt.source, current_catalog, target)?;
+    let source_sql = match &stmt.source {
+        crate::sql::parser::ast::MutationSource::Table { alias, .. }
+        | crate::sql::parser::ast::MutationSource::Query { alias, .. } => {
+            if alias.is_some() {
+                source_table_sql
+            } else {
+                format!("{source_table_sql} AS {MERGE_SOURCE_DEFAULT_ALIAS}")
+            }
+        }
+    };
+    let not_matched = stmt
+        .not_matched
+        .as_ref()
+        .ok_or_else(|| "MERGE unmatched INSERT write requires a not-matched clause".to_string())?;
+    let select_items = target_columns
+        .iter()
+        .zip(insert_columns.iter())
+        .map(|(target_column, insert_column)| {
+            if target_column.name != insert_column.name {
+                return Err(format!(
+                    "MERGE INSERT column order mismatch: target `{}`, insert `{}`",
+                    target_column.name, insert_column.name
+                ));
+            }
+            let raw_expr = match insert_column.value_index {
+                Some(idx) => format!("({})", not_matched.action.values[idx]),
+                None => "NULL".to_string(),
+            };
+            let expr =
+                crate::engine::iceberg_writer::target_cast_expr_sql(&raw_expr, target_column)?;
+            Ok(format!("{expr} AS {}", sql_identifier(&target_column.name)))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let target_sql = format!(
+        "{} AS {}",
+        qualify_iceberg_table(target),
+        sql_identifier(target_alias)
+    );
+    let mut predicates = vec![format!(
+        "{} IS NULL",
+        qualify_column(target_alias, crate::exec::row_position::ICEBERG_ROW_ID_COL)
+    )];
+    if let Some(predicate) = not_matched.predicate.as_ref() {
+        predicates.push(format!("({predicate})"));
+    }
+    let sql = format!(
+        "SELECT {} FROM {} LEFT JOIN {} ON {} WHERE {}",
+        select_items.join(", "),
+        source_sql,
+        target_sql,
+        stmt.on,
+        predicates.join(" AND ")
+    );
+    parse_generated_query(&sql, "MERGE unmatched INSERT sink")
+}
+
 fn execute_merge_matched_delete(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
@@ -2282,46 +2373,33 @@ fn execute_merge_matched_delete(
 fn execute_merge_unmatched_insert(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
-    catalog: Arc<dyn Catalog>,
-    table_ident: iceberg::TableIdent,
-    table: iceberg::table::Table,
-    insert_batch: RecordBatch,
-    entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    stmt: &MergeStmt,
+    current_catalog: Option<&str>,
+    target_columns: &[crate::engine::catalog::ColumnDef],
+    insert_columns: &MergeInsertColumns,
 ) -> Result<StatementResult, String> {
-    let metadata = table.metadata();
-    let current_snapshot_id = metadata.current_snapshot().map(|s| s.snapshot_id());
-    let staging_dir = format!(
-        "{}/data/_staging/{}",
-        metadata.location(),
-        uuid::Uuid::new_v4()
-    );
-    let collector = Arc::new(
-        IcebergCommitCollector::new(
-            CommitOpKind::FastAppend,
-            table_ident,
-            current_snapshot_id,
-            metadata.last_sequence_number(),
-            metadata.current_schema().clone(),
-            metadata.default_partition_spec().clone(),
-            staging_dir,
-            crate::common::types::UniqueId { hi: 0, lo: 0 },
-        )
-        .with_table_metadata(metadata.clone()),
-    );
-    run_mutation_write_transaction(
+    let query = build_merge_unmatched_insert_query(
         state,
         target,
-        catalog,
-        table,
-        collector,
-        entry,
-        CommitOpKind::FastAppend,
-        IcebergOperationKind::InsertAppend,
-        current_snapshot_id,
-        "main",
-        MutationWritePlan::MergeUnmatchedInsert { insert_batch },
+        stmt,
+        current_catalog,
+        target_columns,
+        insert_columns,
     )?;
-    Ok(StatementResult::Ok)
+    let resolved = {
+        let registry = state.connectors.read().expect("connector registry read");
+        let backend = registry.catalog_backend("iceberg")?;
+        backend.load_table(&target.catalog, &target.namespace, &target.table)?
+    };
+    crate::engine::iceberg_writer::execute_iceberg_insert_or_overwrite(
+        state,
+        target,
+        &resolved,
+        &[],
+        &InsertSource::FromQuery(Box::new(query)),
+        OverwriteMode::None,
+        "main",
+    )
 }
 
 #[cfg(test)]
@@ -2422,6 +2500,41 @@ mod tests {
     }
 
     #[test]
+    fn merge_mor_data_sink_query_uses_materialized_matched_rows() {
+        let schema = Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new("id", DataType::Int64, true),
+            arrow::datatypes::Field::new("v", DataType::Int64, true),
+        ]));
+        let new_rows = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::Int64Array::from(vec![2])) as ArrayRef,
+                Arc::new(arrow::array::Int64Array::from(vec![22])) as ArrayRef,
+            ],
+        )
+        .expect("new rows");
+        let old_rows = RecordBatch::new_empty(schema);
+        let matched = MatchedUpdateBatch {
+            row_ids: vec![7],
+            file_paths: vec!["file.parquet".to_string()],
+            row_positions: vec![3],
+            old_rows,
+            new_rows,
+        };
+
+        let query =
+            build_merge_mor_data_sink_query_from_matched(&matched, &[col("id"), col("v")], 42)
+                .expect("query");
+        let sql = query.to_string();
+
+        assert!(sql.contains("VALUES"), "{sql}");
+        assert!(sql.contains("AS `_row_id`"), "{sql}");
+        assert!(sql.contains("_last_updated_sequence_number"), "{sql}");
+        assert!(!sql.contains("JOIN"), "{sql}");
+        assert!(!sql.contains("ice.db1.t"), "{sql}");
+    }
+
+    #[test]
     fn merge_match_query_projects_nullable_target_columns() {
         let sql = build_merge_match_query_sql(
             "ice.db1.t AS t",
@@ -2442,5 +2555,43 @@ mod tests {
         );
         assert!(sql.contains("(s.v) AS __nr_new_v"), "{sql}");
         assert!(sql.contains("(s.id) AS __nr_ins_id"), "{sql}");
+    }
+
+    #[test]
+    fn merge_unmatched_insert_query_uses_distributed_append_shape() {
+        let raw = crate::sql::parser::parse_sql_raw(
+            "MERGE INTO t AS t \
+             USING (SELECT 3 AS id, 4 AS v) AS s \
+             ON t.id = s.id \
+             WHEN NOT MATCHED AND s.id > 0 THEN INSERT (id) VALUES (s.id)",
+        )
+        .expect("parse MERGE");
+        let stmt = crate::engine::statement::convert_sqlparser_merge_to_custom(&raw)
+            .expect("convert MERGE");
+        let target_columns = vec![col("id"), col("v")];
+        let insert_columns = resolve_merge_insert_columns(
+            &stmt.not_matched.as_ref().expect("not matched").action,
+            &target_columns,
+        )
+        .expect("insert columns");
+        let state = Arc::new(StandaloneState::default());
+
+        let query = build_merge_unmatched_insert_query(
+            &state,
+            &iceberg_target(),
+            &stmt,
+            None,
+            &target_columns,
+            &insert_columns,
+        )
+        .expect("query");
+        let sql = query.to_string();
+
+        assert!(sql.contains("LEFT JOIN"), "{sql}");
+        assert!(sql.contains("_row_id"), "{sql}");
+        assert!(sql.contains("IS NULL"), "{sql}");
+        assert!(sql.contains("CAST((s.id) AS BIGINT) AS `id`"), "{sql}");
+        assert!(sql.contains("CAST(NULL AS BIGINT) AS `v`"), "{sql}");
+        assert!(sql.contains("(s.id > 0)"), "{sql}");
     }
 }

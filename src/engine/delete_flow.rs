@@ -55,11 +55,13 @@ use crate::engine::backend_resolver::{TargetBackend, resolve_existing_table_targ
 use crate::engine::write_transaction::{
     IcebergWriteCommitExecutor, IcebergWriteCommitPolicy, IcebergWriteSource,
     IcebergWriteTransactionExecutor, IcebergWriteTransactionRunner, IcebergWriteTransactionSpec,
-    IcebergWriteValidationPolicy, write_commit_has_files,
+    IcebergWriteValidationPolicy, local_writer_commit_input, new_local_writer_write_id,
+    write_commit_has_files,
 };
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOperationTarget};
 use crate::runtime::coordinator::CoordinatedQueryResult;
+use crate::runtime::query_result::QueryResult;
 use crate::runtime::write_coordinator::WriteCommitInput;
 use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
 use crate::sql::catalog::ColumnDef;
@@ -141,13 +143,67 @@ pub(crate) fn execute_delete_statement(
     //    early. The distributed SELECT planner owns scan pruning and existing
     //    delete visibility from this point onward.
     let schema = table.metadata().current_schema();
-    let _ = translate_where(&stmt.where_clause, schema.as_ref())?;
+    let predicate = translate_where(&stmt.where_clause, schema.as_ref())?;
+
+    let metadata = table.metadata();
+    let base_snapshot_id = if target_ref != "main" {
+        resolve_branch_head_snapshot_id(metadata, &target_ref)?
+    } else {
+        metadata.current_snapshot().map(|s| s.snapshot_id())
+    };
 
     if matches!(delete_strategy, IcebergSqlDeleteStrategy::DeletionVectors) {
-        return Err(
-            "UnsupportedDistributedDmlShape: deletion-vector DELETE is not yet representable as a distributed writer output"
-                .to_string(),
+        let existing_deletes_by_file = load_existing_delete_visibility_by_data_file_at(
+            &table,
+            base_snapshot_id,
+            entry.object_store_config(),
+        )?;
+        let referenced_data_file_partitions =
+            load_referenced_data_file_partitions_at(&table, base_snapshot_id)?;
+        let groups = block_on_iceberg(async {
+            scan_for_position_deletes_at(
+                &table,
+                base_snapshot_id,
+                predicate,
+                &stmt.where_clause,
+                &existing_deletes_by_file,
+                &referenced_data_file_partitions,
+            )
+            .await
+        })??;
+        if groups.is_empty() {
+            return Ok(StatementResult::Ok);
+        }
+        let staging_dir = format!(
+            "{}/data/_staging/{}",
+            metadata.location(),
+            uuid::Uuid::new_v4()
         );
+        let collector = Arc::new(
+            IcebergCommitCollector::new(
+                CommitOpKind::RowDeltaDv,
+                table_ident,
+                base_snapshot_id,
+                metadata.last_sequence_number(),
+                metadata.current_schema().clone(),
+                metadata.default_partition_spec().clone(),
+                staging_dir,
+                crate::common::types::UniqueId { hi: 0, lo: 0 },
+            )
+            .with_table_metadata(metadata.clone()),
+        );
+        run_delete_dv_write_transaction(
+            state,
+            &target,
+            catalog,
+            table,
+            collector,
+            entry,
+            base_snapshot_id,
+            &target_ref,
+            groups,
+        )?;
+        return Ok(StatementResult::Ok);
     }
 
     let resolved = {
@@ -165,20 +221,11 @@ pub(crate) fn execute_delete_statement(
         &target_ref,
     )?;
 
-    let metadata = table.metadata();
     let staging_dir = format!(
         "{}/data/_staging/{}",
         metadata.location(),
         uuid::Uuid::new_v4()
     );
-    // Determine the base snapshot for the commit. For branch DML, use the
-    // branch head; for main/default, use the current snapshot.
-    let base_snapshot_id = if target_ref != "main" {
-        resolve_branch_head_snapshot_id(metadata, &target_ref)?
-    } else {
-        metadata.current_snapshot().map(|s| s.snapshot_id())
-    };
-
     let collector = Arc::new(
         IcebergCommitCollector::new(
             CommitOpKind::RowDelta,
@@ -250,6 +297,104 @@ impl IcebergWriteTransactionExecutor for DistributedDeleteWriteExecutor {
     fn finalize(&self, _spec: &IcebergWriteTransactionSpec) -> Result<(), String> {
         self.commit_executor.finalize()
     }
+}
+
+struct InjectedDeleteGroupExecutor {
+    commit_executor: IcebergWriteCommitExecutor,
+}
+
+impl IcebergWriteTransactionExecutor for InjectedDeleteGroupExecutor {
+    fn run_coordinated_write(
+        &self,
+        _spec: &IcebergWriteTransactionSpec,
+    ) -> Result<CoordinatedQueryResult, String> {
+        Ok(CoordinatedQueryResult {
+            query_result: QueryResult::empty(),
+            write_commit: Some(local_writer_commit_input(
+                new_local_writer_write_id(),
+                Vec::new(),
+            )),
+            write_abort: None,
+        })
+    }
+
+    fn commit(
+        &self,
+        _spec: &IcebergWriteTransactionSpec,
+        write_commit: &WriteCommitInput,
+    ) -> Result<CommitOutcome, CommitServiceError> {
+        self.commit_executor.commit_write_input(write_commit)
+    }
+
+    fn finalize(&self, _spec: &IcebergWriteTransactionSpec) -> Result<(), String> {
+        self.commit_executor.finalize()
+    }
+
+    fn has_preloaded_commit_output(&self) -> bool {
+        true
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_delete_dv_write_transaction(
+    state: &Arc<StandaloneState>,
+    target: &crate::engine::backend_resolver::TargetBackend,
+    catalog: Arc<dyn iceberg::Catalog>,
+    table: iceberg::table::Table,
+    collector: Arc<IcebergCommitCollector>,
+    entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    base_snapshot_id: Option<i64>,
+    target_ref: &str,
+    groups: Vec<PositionDeleteGroup>,
+) -> Result<(), String> {
+    let abort_cleanup =
+        crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
+    for group in groups {
+        collector.inject_delete_group(group);
+    }
+    let commit_executor = IcebergWriteCommitExecutor {
+        state: Arc::clone(state),
+        target: target.clone(),
+        catalog,
+        table: table.clone(),
+        collector,
+        fs: abort_cleanup.fs,
+        cleanup_path_mapper: abort_cleanup.path_mapper,
+        cow_update_rewrite: None,
+        target_ref: target_ref.to_string(),
+        snapshot_properties: BTreeMap::new(),
+    };
+    let spec = IcebergWriteTransactionSpec {
+        target: IcebergOperationTarget {
+            catalog: target.catalog.clone(),
+            namespace: target.namespace.clone(),
+            table: target.table.clone(),
+            ref_name: (target_ref != "main").then(|| target_ref.to_string()),
+        },
+        operation_kind: IcebergOperationKind::RowDelta,
+        attempt_id: format!(
+            "{}.{}.{}:delete-dv:{}",
+            target.catalog,
+            target.namespace,
+            target.table,
+            uuid::Uuid::new_v4()
+        ),
+        commit: IcebergWriteCommitPolicy {
+            commit_op_kind: CommitOpKind::RowDeltaDv,
+            base_snapshot_id,
+            base_snapshot_map: BTreeMap::new(),
+            target_ref: target_ref.to_string(),
+            snapshot_properties: BTreeMap::new(),
+        },
+        validation: IcebergWriteValidationPolicy {
+            require_v3_for_branch: target_ref != "main",
+        },
+        source: IcebergWriteSource::CoordinatedPlan,
+    };
+    let executor = InjectedDeleteGroupExecutor { commit_executor };
+    let runner = IcebergWriteTransactionRunner::new(Arc::clone(state), &executor);
+    let _outcome = runner.run(spec)?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

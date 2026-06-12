@@ -794,7 +794,7 @@ fn target_literal_expr_sql(literal: &Literal, column: &ColumnDef) -> Result<Stri
     )
 }
 
-fn target_cast_expr_sql(expr_sql: &str, column: &ColumnDef) -> Result<String, String> {
+pub(crate) fn target_cast_expr_sql(expr_sql: &str, column: &ColumnDef) -> Result<String, String> {
     Ok(format!(
         "CAST({expr_sql} AS {})",
         arrow_data_type_to_sql_type_name(&column.data_type)?
@@ -859,7 +859,7 @@ fn literal_to_sql(literal: &Literal) -> Result<String, String> {
     })
 }
 
-fn literal_to_sql_for_arrow_type(
+pub(crate) fn literal_to_sql_for_arrow_type(
     literal: &Literal,
     data_type: &arrow::datatypes::DataType,
 ) -> Result<String, String> {

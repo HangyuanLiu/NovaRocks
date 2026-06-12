@@ -2,3 +2,6 @@
 id	region	amount
 2	east	20
 3	west	30
+
+-- query 9
+id	region
