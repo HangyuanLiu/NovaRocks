@@ -1375,7 +1375,7 @@ fn materialize_chunk_for_wire_meta(
                 // Receiver is the type authority: materialize the decoded column
                 // to the registered descriptor type (metadata-only retag).
                 out_column =
-                    crate::exec::chunk::type_relation::retag_array(batch.column(idx), &expected_arrow_type)
+                    crate::exec::chunk::type_relation::retag_column(batch.column(idx), &expected_arrow_type)
                         .map_err(|m| {
                             format!(
                                 "exchange decoded arrow type mismatch at index {} for slot {}: batch={:?} expected={:?} ({:?})",

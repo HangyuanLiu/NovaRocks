@@ -214,7 +214,7 @@ fn relate_inner(
 /// Any difference that is not a pure relabel (e.g. a timestamp unit change, or
 /// `Decimal128` <-> `Decimal256`) returns `Err`; under pillar P2 the sender and
 /// receiver descriptors agree by construction so those do not arise.
-pub(crate) fn retag_array(array: &ArrayRef, target: &DataType) -> Result<ArrayRef, TypeMismatch> {
+pub(crate) fn retag_column(array: &ArrayRef, target: &DataType) -> Result<ArrayRef, TypeMismatch> {
     let data = retag_data(array.to_data(), target, &mut Vec::new())?;
     Ok(make_array(data))
 }
@@ -344,7 +344,7 @@ fn map_key_value(entries: &arrow::datatypes::FieldRef) -> Option<(&DataType, &Da
 mod tests {
     use super::CompatibilityPolicy::{ExactArrow, SameScaleWiden};
     use super::TypeMismatchKind::*;
-    use super::{NestedStep, merge_fields_nullability, relate, retag_array};
+    use super::{NestedStep, merge_fields_nullability, relate, retag_column};
     use arrow::array::{
         Array, ArrayRef, BinaryArray, Decimal128Array, Int32Array, Int64Array, ListArray,
         StringArray, StructArray,
@@ -567,16 +567,16 @@ mod tests {
     }
 
     #[test]
-    fn retag_array_identity_is_a_noop() {
+    fn retag_column_identity_is_a_noop() {
         let arr = decimal128(vec![123], 38, 2);
-        let out = retag_array(&arr, &DataType::Decimal128(38, 2)).expect("retag");
+        let out = retag_column(&arr, &DataType::Decimal128(38, 2)).expect("retag");
         assert_eq!(out.data_type(), &DataType::Decimal128(38, 2));
     }
 
     #[test]
-    fn retag_array_decimal_widens_precision_keeps_values() {
+    fn retag_column_decimal_widens_precision_keeps_values() {
         let arr = decimal128(vec![123, -45], 18, 2);
-        let out = retag_array(&arr, &DataType::Decimal128(38, 2)).expect("retag");
+        let out = retag_column(&arr, &DataType::Decimal128(38, 2)).expect("retag");
         assert_eq!(out.data_type(), &DataType::Decimal128(38, 2));
         assert!(relate(&DataType::Decimal128(38, 2), out.data_type(), ExactArrow).is_ok());
         let d = out.as_any().downcast_ref::<Decimal128Array>().unwrap();
@@ -585,23 +585,23 @@ mod tests {
     }
 
     #[test]
-    fn retag_array_decimal_scale_mismatch_errors() {
+    fn retag_column_decimal_scale_mismatch_errors() {
         let arr = decimal128(vec![123], 18, 2);
-        let err = retag_array(&arr, &DataType::Decimal128(38, 3)).unwrap_err();
+        let err = retag_column(&arr, &DataType::Decimal128(38, 3)).unwrap_err();
         assert_eq!(err.kind, DecimalScaleMismatch);
     }
 
     #[test]
-    fn retag_array_decimal_width_cross_errors() {
+    fn retag_column_decimal_width_cross_errors() {
         let arr = decimal128(vec![123], 18, 2);
-        let err = retag_array(&arr, &DataType::Decimal256(40, 2)).unwrap_err();
+        let err = retag_column(&arr, &DataType::Decimal256(40, 2)).unwrap_err();
         assert_eq!(err.kind, DecimalWidthCross);
     }
 
     #[test]
-    fn retag_array_utf8_to_binary_keeps_bytes() {
+    fn retag_column_utf8_to_binary_keeps_bytes() {
         let arr = Arc::new(StringArray::from(vec!["ab", "cd"])) as ArrayRef;
-        let out = retag_array(&arr, &DataType::Binary).expect("retag");
+        let out = retag_column(&arr, &DataType::Binary).expect("retag");
         assert_eq!(out.data_type(), &DataType::Binary);
         let b = out.as_any().downcast_ref::<BinaryArray>().unwrap();
         assert_eq!(b.value(0), b"ab");
@@ -609,7 +609,7 @@ mod tests {
     }
 
     #[test]
-    fn retag_array_recurses_struct_child() {
+    fn retag_column_recurses_struct_child() {
         let d = decimal128(vec![123], 18, 2);
         let i = Arc::new(Int64Array::from(vec![7_i64])) as ArrayRef;
         let src = Arc::new(StructArray::from(vec![
@@ -623,7 +623,7 @@ mod tests {
             Field::new("d", DataType::Decimal128(38, 2), true),
             Field::new("i", DataType::Int64, true),
         ]));
-        let out = retag_array(&src, &target).expect("retag");
+        let out = retag_column(&src, &target).expect("retag");
         assert_eq!(out.data_type(), &target);
         let s = out.as_any().downcast_ref::<StructArray>().unwrap();
         let dcol = s
@@ -636,7 +636,7 @@ mod tests {
     }
 
     #[test]
-    fn retag_array_recurses_list_item() {
+    fn retag_column_recurses_list_item() {
         let values = decimal128(vec![123, 456], 18, 2);
         let src = Arc::new(ListArray::new(
             Arc::new(Field::new("item", DataType::Decimal128(18, 2), true)),
@@ -649,7 +649,7 @@ mod tests {
             DataType::Decimal128(38, 2),
             true,
         )));
-        let out = retag_array(&src, &target).expect("retag");
+        let out = retag_column(&src, &target).expect("retag");
         assert_eq!(out.data_type(), &target);
         let l = out.as_any().downcast_ref::<ListArray>().unwrap();
         let items = l
@@ -662,9 +662,9 @@ mod tests {
     }
 
     #[test]
-    fn retag_array_non_retaggable_scalar_errors() {
+    fn retag_column_non_retaggable_scalar_errors() {
         let arr = Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef;
-        let err = retag_array(&arr, &DataType::Int64).unwrap_err();
+        let err = retag_column(&arr, &DataType::Int64).unwrap_err();
         assert_eq!(err.kind, ScalarMismatch);
     }
 }
