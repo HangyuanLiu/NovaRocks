@@ -755,8 +755,9 @@ fn datetime_to_units<Tz: chrono::TimeZone>(
 mod parity_tests {
     use super::*;
     use iceberg::spec::{
-        DataContentType, DataFileBuilder, DataFileFormat, Datum, NestedField, PrimitiveType,
-        Schema, Struct, Transform, Type,
+        DataContentType, DataFileBuilder, DataFileFormat, Datum, FormatVersion, NestedField,
+        PartitionSpec, PrimitiveType, Schema, Struct, TableMetadata, TableMetadataBuilder,
+        Transform, Type,
     };
 
     fn int_schema() -> SchemaRef {
@@ -805,8 +806,28 @@ mod parity_tests {
         )
     }
 
+    fn table_metadata(schema: SchemaRef, partition_spec: PartitionSpecRef) -> TableMetadata {
+        let creation = iceberg::TableCreation::builder()
+            .name("t".to_string())
+            .location("file:///warehouse/db/t".to_string())
+            .schema(schema.as_ref().clone())
+            .partition_spec(partition_spec.as_ref().clone())
+            .format_version(FormatVersion::V2)
+            .build();
+        TableMetadataBuilder::from_table_creation(creation)
+            .expect("table metadata builder")
+            .build()
+            .expect("table metadata")
+            .metadata
+    }
+
+    fn unpartitioned_metadata(schema: SchemaRef) -> TableMetadata {
+        table_metadata(schema, Arc::new(PartitionSpec::unpartition_spec()))
+    }
+
     #[test]
     fn convert_reproduces_inject_path_for_data_file_stats() {
+        let metadata = unpartitioned_metadata(int_schema());
         let mut b = DataFileBuilder::default();
         b.content(DataContentType::Data)
             .file_path("file:///t/data-1.parquet".to_string())
@@ -832,6 +853,7 @@ mod parity_tests {
             "PARQUET".to_string(),
             crate::types::TIcebergFileContent::DATA,
             Some(0),
+            &metadata,
         )
         .expect("thrift");
 
@@ -843,6 +865,7 @@ mod parity_tests {
 
     #[test]
     fn inject_sink_commit_info_converts_and_drains_written_file() {
+        let metadata = unpartitioned_metadata(int_schema());
         let mut b = DataFileBuilder::default();
         b.content(DataContentType::Data)
             .file_path("file:///t/data-from-sink.parquet".to_string())
@@ -860,6 +883,7 @@ mod parity_tests {
             "PARQUET".to_string(),
             crate::types::TIcebergFileContent::DATA,
             Some(0),
+            &metadata,
         )
         .expect("thrift");
 
@@ -900,6 +924,7 @@ mod parity_tests {
 
     #[test]
     fn inject_sink_commit_infos_is_all_or_nothing() {
+        let metadata = unpartitioned_metadata(int_schema());
         let mut b = DataFileBuilder::default();
         b.content(DataContentType::Data)
             .file_path("file:///t/atomic-data.parquet".to_string())
@@ -916,6 +941,7 @@ mod parity_tests {
             "PARQUET".to_string(),
             crate::types::TIcebergFileContent::DATA,
             Some(0),
+            &metadata,
         )
         .expect("thrift");
 
@@ -951,6 +977,7 @@ mod parity_tests {
 
     #[test]
     fn convert_roundtrips_equality_delete_files() {
+        let metadata = unpartitioned_metadata(int_schema());
         let mut b = DataFileBuilder::default();
         b.content(DataContentType::EqualityDeletes)
             .file_path("file:///t/eq-del-1.parquet".to_string())
@@ -972,6 +999,7 @@ mod parity_tests {
             "PARQUET".to_string(),
             crate::types::TIcebergFileContent::EQUALITY_DELETES,
             Some(0),
+            &metadata,
         )
         .expect("thrift");
 
@@ -1000,6 +1028,7 @@ mod parity_tests {
 
         let schema = int_schema();
         let spec = identity_partition_spec(&schema);
+        let metadata = table_metadata(Arc::clone(&schema), Arc::clone(&spec));
 
         let partition = Struct::from_iter([Some(Literal::int(5))]);
         let mut b = DataFileBuilder::default();
@@ -1022,6 +1051,7 @@ mod parity_tests {
             "PARQUET".to_string(),
             crate::types::TIcebergFileContent::DATA,
             Some(0),
+            &metadata,
         )
         .expect("thrift");
 
@@ -1052,6 +1082,7 @@ mod parity_tests {
                 .build()
                 .expect("partition spec"),
         );
+        let metadata = table_metadata(Arc::clone(&schema), Arc::clone(&spec));
 
         let mut b = DataFileBuilder::default();
         b.content(DataContentType::Data)
@@ -1073,6 +1104,7 @@ mod parity_tests {
             "PARQUET".to_string(),
             crate::types::TIcebergFileContent::DATA,
             Some(0),
+            &metadata,
         )
         .expect("thrift");
 
@@ -1094,6 +1126,7 @@ mod parity_tests {
 
     #[test]
     fn convert_skips_bounds_for_field_ids_absent_from_schema() {
+        let metadata = unpartitioned_metadata(int_schema());
         // int_schema() has only field id 1; a bound for field id 999 simulates
         // stats left behind for a dropped column. convert() must succeed and
         // simply omit field 999 rather than erroring.
@@ -1115,6 +1148,7 @@ mod parity_tests {
             "PARQUET".to_string(),
             crate::types::TIcebergFileContent::DATA,
             Some(0),
+            &metadata,
         )
         .expect("thrift");
 

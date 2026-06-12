@@ -60,6 +60,7 @@ use super::data_writer::{
     StagedWriteContext, StagedWriteOptions, to_sink_commit_info, write_record_batches,
 };
 use super::schema::build_full_output_schema;
+use super::write_descriptor::encode_partition_descriptor;
 use crate::common::config;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
@@ -107,6 +108,10 @@ struct IcebergSinkPlan {
     /// `[file_path, pos]` parquet schema the Iceberg v2 spec mandates; the
     /// writer only materializes the first two entries of `output_exprs`.
     output_schema: SchemaRef,
+    /// Full target table schema used for partition-spec binding and descriptor
+    /// encoding. For DATA sinks this matches `output_schema`; for
+    /// POSITION_DELETES sinks `output_schema` is the delete-file parquet schema.
+    target_schema: SchemaRef,
     /// For `DATA` sinks: one expression per iceberg data column.
     /// For `POSITION_DELETES` sinks: `[file_path_expr, pos_expr,
     /// partition_source_expr_0, partition_source_expr_1, ...]` — the partition
@@ -142,17 +147,17 @@ impl IcebergTableSinkFactory {
             mut partition_exprs,
         ) = build_partition_exprs(&iceberg_table)?;
 
+        let target_schema = build_output_schema(&iceberg_table)?;
         let output_schema = match mode {
             IcebergSinkMode::Data => {
-                let schema = build_output_schema(&iceberg_table)?;
-                if output_exprs.len() != schema.fields().len() {
+                if output_exprs.len() != target_schema.fields().len() {
                     return Err(format!(
                         "iceberg sink output expr count mismatch: exprs={} columns={}",
                         output_exprs.len(),
-                        schema.fields().len()
+                        target_schema.fields().len()
                     ));
                 }
-                schema
+                Arc::clone(&target_schema)
             }
             IcebergSinkMode::PositionDeletes => {
                 let expected = 2 + partition_column_names.len();
@@ -219,6 +224,7 @@ impl IcebergTableSinkFactory {
                 .compression_type
                 .ok_or_else(|| "iceberg sink missing compression_type".to_string())?,
             output_schema,
+            target_schema,
             output_exprs: lowered_output_exprs,
             partition_exprs: lowered_partition_exprs,
             partition_source_column_names,
@@ -243,31 +249,8 @@ impl IcebergSinkPlan {
             ));
         }
 
-        let writer_schema = Arc::new(iceberg_schema_from_arrow_schema(&self.output_schema)?);
-        let partition_spec = build_staged_partition_spec(
-            writer_schema.as_ref(),
-            &self.partition_source_column_names,
-            &self.partition_column_names,
-            &self.transform_exprs,
-        )?;
-        let mut properties = HashMap::new();
-        properties.insert("write.data.path".to_string(), self.data_location.clone());
-        let metadata = iceberg::spec::TableMetadataBuilder::new(
-            writer_schema.as_ref().clone(),
-            iceberg::spec::PartitionSpec::unpartition_spec(),
-            iceberg::spec::SortOrder::unsorted_order(),
-            self.table_location.clone(),
-            iceberg::spec::FormatVersion::V2,
-            properties,
-        )
-        .map_err(|e| format!("build staged iceberg table metadata failed: {e}"))?
-        .add_current_schema(writer_schema.as_ref().clone())
-        .map_err(|e| format!("add staged iceberg writer schema failed: {e}"))?
-        .add_default_partition_spec(partition_spec)
-        .map_err(|e| format!("add staged iceberg partition spec failed: {e}"))?
-        .build()
-        .map_err(|e| format!("finalize staged iceberg table metadata failed: {e}"))?
-        .metadata;
+        let writer_schema = Arc::new(iceberg_schema_from_arrow_schema(&self.target_schema)?);
+        let metadata = self.build_target_table_metadata(writer_schema.as_ref())?;
         let annotated_schema = Arc::new(
             iceberg::arrow::schema_to_arrow_schema(&writer_schema)
                 .map_err(|e| format!("convert staged iceberg schema to arrow failed: {e}"))?,
@@ -281,6 +264,36 @@ impl IcebergSinkPlan {
             annotated_schema,
             self.target_partition_spec_id,
         )
+    }
+
+    fn build_target_table_metadata(
+        &self,
+        writer_schema: &iceberg::spec::Schema,
+    ) -> Result<iceberg::spec::TableMetadata, String> {
+        let partition_spec = build_staged_partition_spec(
+            writer_schema,
+            &self.partition_source_column_names,
+            &self.partition_column_names,
+            &self.transform_exprs,
+        )?;
+        let mut properties = HashMap::new();
+        properties.insert("write.data.path".to_string(), self.data_location.clone());
+        iceberg::spec::TableMetadataBuilder::new(
+            writer_schema.clone(),
+            iceberg::spec::PartitionSpec::unpartition_spec(),
+            iceberg::spec::SortOrder::unsorted_order(),
+            self.table_location.clone(),
+            iceberg::spec::FormatVersion::V2,
+            properties,
+        )
+        .map_err(|e| format!("build staged iceberg table metadata failed: {e}"))?
+        .add_current_schema(writer_schema.clone())
+        .map_err(|e| format!("add staged iceberg writer schema failed: {e}"))?
+        .add_default_partition_spec(partition_spec)
+        .map_err(|e| format!("add staged iceberg partition spec failed: {e}"))?
+        .build()
+        .map_err(|e| format!("finalize staged iceberg table metadata failed: {e}"))
+        .map(|built| built.metadata)
     }
 }
 
@@ -445,6 +458,11 @@ impl IcebergTableSinkBackend {
             .map_err(|e| format!("iceberg position-delete sink build batch failed: {e}"))?;
 
         let partition_groups = self.partition_group_indices(&chunk, batch.num_rows())?;
+        let target_writer_schema = iceberg_schema_from_arrow_schema(&self.plan.target_schema)?;
+        let descriptor_metadata = self
+            .plan
+            .build_target_table_metadata(&target_writer_schema)?;
+        let descriptor_partition_spec_id = descriptor_metadata.default_partition_spec_id();
 
         for (key, group) in partition_groups {
             // Sort indices by (file_path, pos) to produce a well-ordered
@@ -500,6 +518,12 @@ impl IcebergTableSinkBackend {
             // when every position in this delete file points at the same data
             // file. Readers use it to prune delete files at plan time.
             let referenced_data_file = unique_file_path(&part_batch)?;
+            let partition_values_descriptor = encode_partition_descriptor(
+                &group.partition_values,
+                descriptor_partition_spec_id,
+                &descriptor_metadata,
+            )
+            .map_err(|e| e.to_string())?;
 
             let data_file = types::TIcebergDataFile {
                 path: Some(file_path),
@@ -515,8 +539,8 @@ impl IcebergTableSinkBackend {
                 first_row_id: None,
                 equality_ids: None,
                 key_metadata: None,
-                partition_values_descriptor: None,
-                partition_spec_id: None,
+                partition_values_descriptor: Some(partition_values_descriptor),
+                partition_spec_id: Some(self.plan.target_partition_spec_id),
             };
 
             let commit_info = types::TSinkCommitInfo {
@@ -547,13 +571,14 @@ impl IcebergTableSinkBackend {
                 PartitionKey::default(),
                 PartitionGroup {
                     indices: (0..num_rows as u32).collect(),
+                    partition_values: iceberg::spec::Struct::empty(),
                 },
             );
             return Ok(partition_groups);
         }
         let partition_arrays = eval_exprs(&self.arena, &self.plan.partition_exprs, chunk)?;
         for row in 0..num_rows {
-            let (partition, fingerprint) = iceberg_partition_key_for_row(
+            let (partition, fingerprint, partition_values) = iceberg_partition_key_for_row(
                 &self.plan.partition_column_names,
                 &self.plan.transform_exprs,
                 &partition_arrays,
@@ -567,6 +592,7 @@ impl IcebergTableSinkBackend {
                 .entry(key)
                 .or_insert_with(|| PartitionGroup {
                     indices: Vec::new(),
+                    partition_values,
                 })
                 .indices
                 .push(row as u32);
@@ -607,6 +633,7 @@ struct PartitionKey {
 #[derive(Debug)]
 struct PartitionGroup {
     indices: Vec<u32>,
+    partition_values: iceberg::spec::Struct,
 }
 
 struct ParquetWriteResult {
@@ -1729,7 +1756,7 @@ fn iceberg_partition_key_for_row(
     transform_exprs: &[String],
     partition_arrays: &[ArrayRef],
     row: usize,
-) -> Result<(String, String), String> {
+) -> Result<(String, String, iceberg::spec::Struct), String> {
     if partition_column_names.len() != transform_exprs.len()
         || partition_arrays.len() != partition_column_names.len()
     {
@@ -1737,18 +1764,52 @@ fn iceberg_partition_key_for_row(
     }
     let mut path = String::new();
     let mut nulls = String::with_capacity(partition_column_names.len());
+    let mut partition_values = Vec::with_capacity(partition_column_names.len());
     for i in 0..partition_column_names.len() {
         let transform = transform_exprs[i].to_lowercase();
         let base = transform.split('[').next().unwrap_or(transform.as_str());
         let is_null = base == "void" || partition_arrays[i].is_null(row);
         let value = iceberg_partition_value(base, &partition_arrays[i], row)?;
+        let literal = if is_null {
+            None
+        } else {
+            Some(iceberg_partition_literal(base, &partition_arrays[i], row)?)
+        };
         nulls.push(if is_null { '1' } else { '0' });
+        partition_values.push(literal);
         path.push_str(&partition_column_names[i]);
         path.push('=');
         path.push_str(&value);
         path.push('/');
     }
-    Ok((path, nulls))
+    Ok((
+        path,
+        nulls,
+        iceberg::spec::Struct::from_iter(partition_values),
+    ))
+}
+
+fn iceberg_partition_literal(
+    transform: &str,
+    array: &ArrayRef,
+    row: usize,
+) -> Result<iceberg::spec::Literal, String> {
+    match transform {
+        "year" | "month" | "hour" | "bucket" => {
+            let value = array_value_as_i64(array, row)?;
+            let value = i32::try_from(value)
+                .map_err(|_| format!("{transform} transform value out of INT range"))?;
+            Ok(iceberg::spec::Literal::int(value))
+        }
+        "day" => {
+            let value = array_value_as_i64(array, row)?;
+            let days =
+                i32::try_from(value).map_err(|_| "day transform value out of range".to_string())?;
+            Ok(iceberg::spec::Literal::date(days))
+        }
+        "truncate" | "identity" => column_literal(array, row),
+        other => Err(format!("unsupported iceberg partition transform: {other}")),
+    }
 }
 
 fn iceberg_partition_value(
@@ -1903,6 +1964,132 @@ fn column_value(array: &ArrayRef, row: usize) -> Result<String, String> {
     }
 }
 
+fn column_literal(array: &ArrayRef, row: usize) -> Result<iceberg::spec::Literal, String> {
+    match array.data_type() {
+        DataType::Boolean => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::BooleanArray>()
+                .ok_or_else(|| "expected BOOLEAN array".to_string())?;
+            Ok(iceberg::spec::Literal::bool(arr.value(row)))
+        }
+        DataType::Int8 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::Int8Array>()
+                .ok_or_else(|| "expected TINYINT array".to_string())?;
+            Ok(iceberg::spec::Literal::int(i32::from(arr.value(row))))
+        }
+        DataType::Int16 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::Int16Array>()
+                .ok_or_else(|| "expected SMALLINT array".to_string())?;
+            Ok(iceberg::spec::Literal::int(i32::from(arr.value(row))))
+        }
+        DataType::Int32 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| "expected INT array".to_string())?;
+            Ok(iceberg::spec::Literal::int(arr.value(row)))
+        }
+        DataType::Int64 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| "expected BIGINT array".to_string())?;
+            Ok(iceberg::spec::Literal::long(arr.value(row)))
+        }
+        DataType::Float32 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::Float32Array>()
+                .ok_or_else(|| "expected FLOAT array".to_string())?;
+            Ok(iceberg::spec::Literal::float(arr.value(row)))
+        }
+        DataType::Float64 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+                .ok_or_else(|| "expected DOUBLE array".to_string())?;
+            Ok(iceberg::spec::Literal::double(arr.value(row)))
+        }
+        DataType::Date32 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::Date32Array>()
+                .ok_or_else(|| "expected DATE array".to_string())?;
+            Ok(iceberg::spec::Literal::date(arr.value(row)))
+        }
+        DataType::Time64(arrow::datatypes::TimeUnit::Microsecond) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::Time64MicrosecondArray>()
+                .ok_or_else(|| "expected TIME array".to_string())?;
+            Ok(iceberg::spec::Literal::time(arr.value(row)))
+        }
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .ok_or_else(|| "expected DATETIME array".to_string())?;
+            Ok(iceberg::spec::Literal::timestamp(arr.value(row)))
+        }
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some(_)) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .ok_or_else(|| "expected TIMESTAMP array".to_string())?;
+            Ok(iceberg::spec::Literal::timestamptz(arr.value(row)))
+        }
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, _) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::TimestampNanosecondArray>()
+                .ok_or_else(|| "expected TIMESTAMP_NS array".to_string())?;
+            Ok(iceberg::spec::Literal::Primitive(
+                iceberg::spec::PrimitiveLiteral::Long(arr.value(row)),
+            ))
+        }
+        DataType::Utf8 => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| "expected VARCHAR array".to_string())?;
+            Ok(iceberg::spec::Literal::string(arr.value(row)))
+        }
+        DataType::Binary => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| "expected BINARY array".to_string())?;
+            Ok(iceberg::spec::Literal::binary(
+                arr.value(row).iter().copied(),
+            ))
+        }
+        DataType::FixedSizeBinary(_) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+                .ok_or_else(|| "expected FIXED array".to_string())?;
+            Ok(iceberg::spec::Literal::fixed(
+                arr.value(row).iter().copied(),
+            ))
+        }
+        DataType::Decimal128(_, _) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(|| "expected DECIMAL array".to_string())?;
+            Ok(iceberg::spec::Literal::decimal(arr.value(row)))
+        }
+        other => Err(format!(
+            "unsupported iceberg partition column type: {other:?}"
+        )),
+    }
+}
+
 fn url_encode(input: &str) -> String {
     url::form_urlencoded::byte_serialize(input.as_bytes()).collect()
 }
@@ -1937,8 +2124,8 @@ mod tests {
         ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID, ICEBERG_POSITION_DELETE_POS_FIELD_ID,
         IcebergSinkMode, IcebergSinkPlan, IcebergTableSinkBackend, IcebergTableSinkFactory,
         align_arrays_to_schema, build_column_slot_map, build_position_delete_output_schema,
-        collect_theta_sketches_by_name, iceberg_partition_key_for_row, unique_file_path,
-        write_parquet_to_bytes,
+        collect_theta_sketches_by_name, iceberg_partition_key_for_row,
+        iceberg_schema_from_arrow_schema, unique_file_path, write_parquet_to_bytes,
     };
     use crate::connector::iceberg::data_writer::{StagedWriteOptions, write_record_batches};
     use crate::exec::chunk::{Chunk, ChunkSchema};
@@ -2009,7 +2196,8 @@ mod tests {
                 object_store_s3: None,
                 file_format: "parquet".to_string(),
                 compression: crate::types::TCompressionType::SNAPPY,
-                output_schema: schema,
+                output_schema: Arc::clone(&schema),
+                target_schema: schema,
                 output_exprs: Vec::new(),
                 partition_exprs: Vec::new(),
                 partition_source_column_names: Vec::new(),
@@ -2040,11 +2228,12 @@ mod tests {
             mode: IcebergSinkMode::Data,
             table_location: table_location.clone(),
             data_location: data_location.clone(),
-            target_partition_spec_id: 0,
+            target_partition_spec_id: 7,
             object_store_s3: None,
             file_format: "parquet".to_string(),
             compression: crate::types::TCompressionType::SNAPPY,
             output_schema: Arc::clone(&schema),
+            target_schema: Arc::clone(&schema),
             output_exprs: Vec::new(),
             partition_exprs: Vec::new(),
             partition_source_column_names: vec!["id".to_string()],
@@ -2057,7 +2246,7 @@ mod tests {
         assert_eq!(ctx.schema().as_struct().fields()[0].id, 42);
         assert_eq!(
             ctx.partition_spec_id(),
-            0,
+            7,
             "staged sink metadata must preserve the target default partition spec id"
         );
         assert_eq!(ctx.partition_spec().fields().len(), 1);
@@ -2074,6 +2263,35 @@ mod tests {
         assert!(
             path.starts_with(&format!("{data_location}/id_part=7/")),
             "staged sink context should write under FE data_location and partition path, got {path}"
+        );
+        let (commit_info, _) = crate::connector::iceberg::data_writer::to_sink_commit_info(
+            &staged[0],
+            "id_part=7".to_string(),
+            "0".to_string(),
+            "parquet".to_string(),
+            crate::types::TIcebergFileContent::DATA,
+        )
+        .expect("commit info");
+        let data_file = commit_info.iceberg_data_file.expect("iceberg data file");
+        assert_eq!(data_file.partition_spec_id, Some(7));
+        let target_writer_schema =
+            iceberg_schema_from_arrow_schema(&plan.target_schema).expect("target writer schema");
+        let target_metadata = plan
+            .build_target_table_metadata(&target_writer_schema)
+            .expect("target metadata");
+        let decoded = crate::connector::iceberg::write_descriptor::decode_partition_descriptor(
+            data_file.partition_values_descriptor.clone(),
+            target_metadata.default_partition_spec_id(),
+            &target_metadata,
+        )
+        .expect("decode descriptor");
+        assert_eq!(
+            decoded,
+            iceberg::spec::Struct::from_iter([Some(iceberg::spec::Literal::int(7))])
+        );
+        assert!(
+            data_file.partition_values_descriptor.is_some(),
+            "writer report must carry a descriptor for non-zero target spec id"
         );
     }
 
@@ -2103,6 +2321,7 @@ mod tests {
             file_format: "parquet".to_string(),
             compression: crate::types::TCompressionType::SNAPPY,
             output_schema: Arc::clone(&schema),
+            target_schema: Arc::clone(&schema),
             output_exprs: vec![id_expr],
             partition_exprs: vec![id_expr],
             partition_source_column_names: vec!["id".to_string()],
@@ -2190,11 +2409,17 @@ mod tests {
             mode: IcebergSinkMode::PositionDeletes,
             table_location,
             data_location: data_location.clone(),
-            target_partition_spec_id: 0,
+            target_partition_spec_id: 7,
             object_store_s3: None,
             file_format: "parquet".to_string(),
             compression: crate::types::TCompressionType::SNAPPY,
             output_schema: build_position_delete_output_schema(),
+            target_schema: Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    "42".to_string(),
+                )])),
+            ])),
             output_exprs: vec![file_expr, pos_expr, id_expr],
             partition_exprs: vec![id_expr],
             partition_source_column_names: vec!["id".to_string()],
@@ -2258,6 +2483,27 @@ mod tests {
             data_file.file_content,
             Some(crate::types::TIcebergFileContent::POSITION_DELETES)
         );
+        assert_eq!(data_file.partition_spec_id, Some(7));
+        assert!(
+            data_file.partition_values_descriptor.is_some(),
+            "position-delete writer report must carry a partition descriptor"
+        );
+        let target_writer_schema =
+            iceberg_schema_from_arrow_schema(&backend.plan.target_schema).expect("target schema");
+        let target_metadata = backend
+            .plan
+            .build_target_table_metadata(&target_writer_schema)
+            .expect("target metadata");
+        let decoded = crate::connector::iceberg::write_descriptor::decode_partition_descriptor(
+            data_file.partition_values_descriptor.clone(),
+            target_metadata.default_partition_spec_id(),
+            &target_metadata,
+        )
+        .expect("decode position-delete descriptor");
+        assert_eq!(
+            decoded,
+            iceberg::spec::Struct::from_iter([Some(iceberg::spec::Literal::int(7))])
+        );
         assert_eq!(data_file.referenced_data_file.as_deref(), Some(referenced));
     }
 
@@ -2319,12 +2565,20 @@ mod tests {
             Arc::new(Int32Array::from(vec![Some(123)])),
         ];
 
-        let (path, fingerprint) =
+        let (path, fingerprint, partition_values) =
             iceberg_partition_key_for_row(&partition_column_names, &transform_exprs, &arrays, 0)
                 .expect("partition key");
 
         assert_eq!(path, "p_year=1972/p_bucket=7/p_void=null/");
         assert_eq!(fingerprint, "001");
+        assert_eq!(
+            partition_values,
+            iceberg::spec::Struct::from_iter([
+                Some(iceberg::spec::Literal::int(2)),
+                Some(iceberg::spec::Literal::int(7)),
+                None,
+            ])
+        );
     }
 
     #[test]

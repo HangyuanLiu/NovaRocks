@@ -24,6 +24,7 @@ use parquet::file::properties::WriterProperties;
 
 use super::theta_sketch::ThetaSketchHandle;
 use super::variant_write::{transform_variant_columns_for_write, variant_field_indices};
+use super::write_descriptor::encode_partition_descriptor;
 
 type IcebergDataFileWriterBuilder =
     DataFileWriterBuilder<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;
@@ -51,6 +52,8 @@ impl Default for StagedWriteOptions {
 
 pub(crate) struct StagedDataFile {
     pub data_file: DataFile,
+    pub metadata: Arc<TableMetadata>,
+    pub descriptor_partition_spec_id: i32,
     pub partition_spec_id: i32,
     pub theta_sketches: Option<HashMap<i32, ThetaSketchHandle>>,
 }
@@ -289,6 +292,8 @@ pub(crate) async fn write_record_batches(
                         data_file,
                         ctx.partition_spec_id(),
                     )?,
+                    metadata: Arc::clone(&ctx.metadata),
+                    descriptor_partition_spec_id: ctx.partition_spec().spec_id(),
                     partition_spec_id: ctx.partition_spec_id(),
                     theta_sketches: combined_sketches.as_ref().map(clone_theta_sketches),
                 })
@@ -335,6 +340,8 @@ pub(crate) async fn write_record_batches(
                         data_file,
                         ctx.partition_spec_id(),
                     )?,
+                    metadata: Arc::clone(&ctx.metadata),
+                    descriptor_partition_spec_id: ctx.partition_spec().spec_id(),
                     partition_spec_id: ctx.partition_spec_id(),
                     theta_sketches: theta_sketches.as_ref().map(clone_theta_sketches),
                 });
@@ -384,13 +391,15 @@ pub(crate) fn to_sink_commit_info(
     String,
 > {
     let df = &staged.data_file;
-    let data_file = data_file_to_iceberg_thrift(
+    let data_file = data_file_to_iceberg_thrift_with_descriptor_spec(
         df,
         partition_path,
         null_fingerprint,
         format,
         content,
-        Some(staged.partition_spec_id),
+        staged.partition_spec_id,
+        staged.descriptor_partition_spec_id,
+        staged.metadata.as_ref(),
     )?;
     let commit_info = crate::types::TSinkCommitInfo {
         iceberg_data_file: Some(data_file),
@@ -412,10 +421,21 @@ pub(crate) fn to_sink_commit_info(
 
 pub(crate) fn written_file_to_sink_commit_info(
     file: &super::commit::WrittenFile,
-    partition_spec: &PartitionSpecRef,
+    metadata: &TableMetadata,
 ) -> Result<crate::types::TSinkCommitInfo, String> {
+    let partition_spec = metadata
+        .partition_spec_by_id(file.partition_spec_id)
+        .ok_or_else(|| {
+            format!(
+                "iceberg written file `{}` references unknown partition spec id {}",
+                file.path, file.partition_spec_id
+            )
+        })?;
     let (partition_path, null_fingerprint) =
         partition_path_from_struct(&file.partition_values, partition_spec)?;
+    let partition_values_descriptor =
+        encode_partition_descriptor(&file.partition_values, file.partition_spec_id, metadata)
+            .map_err(|e| e.to_string())?;
     let data_file = crate::types::TIcebergDataFile {
         path: Some(file.path.clone()),
         format: Some(file.format.to_string()),
@@ -430,7 +450,7 @@ pub(crate) fn written_file_to_sink_commit_info(
         first_row_id: file.first_row_id,
         equality_ids: file.equality_ids.clone(),
         key_metadata: file.key_metadata.clone(),
-        partition_values_descriptor: None,
+        partition_values_descriptor: Some(partition_values_descriptor),
         partition_spec_id: Some(file.partition_spec_id),
     };
     Ok(crate::types::TSinkCommitInfo {
@@ -446,15 +466,7 @@ pub(crate) fn written_file_to_sink_commit_info_for_metadata(
     file: &super::commit::WrittenFile,
     metadata: &TableMetadata,
 ) -> Result<crate::types::TSinkCommitInfo, String> {
-    let partition_spec = metadata
-        .partition_spec_by_id(file.partition_spec_id)
-        .ok_or_else(|| {
-            format!(
-                "iceberg written file `{}` references unknown partition spec id {}",
-                file.path, file.partition_spec_id
-            )
-        })?;
-    written_file_to_sink_commit_info(file, partition_spec)
+    written_file_to_sink_commit_info(file, metadata)
 }
 
 fn thrift_file_content(content: DataContentType) -> crate::types::TIcebergFileContent {
@@ -564,7 +576,35 @@ pub(crate) fn data_file_to_iceberg_thrift(
     format: String,
     content: crate::types::TIcebergFileContent,
     partition_spec_id: Option<i32>,
+    metadata: &TableMetadata,
 ) -> Result<crate::types::TIcebergDataFile, String> {
+    let partition_spec_id = partition_spec_id
+        .ok_or_else(|| "IcebergWriteDescriptorMismatch: missing partition_spec_id".to_string())?;
+    data_file_to_iceberg_thrift_with_descriptor_spec(
+        df,
+        partition_path,
+        null_fingerprint,
+        format,
+        content,
+        partition_spec_id,
+        partition_spec_id,
+        metadata,
+    )
+}
+
+fn data_file_to_iceberg_thrift_with_descriptor_spec(
+    df: &DataFile,
+    partition_path: String,
+    null_fingerprint: String,
+    format: String,
+    content: crate::types::TIcebergFileContent,
+    partition_spec_id: i32,
+    descriptor_partition_spec_id: i32,
+    metadata: &TableMetadata,
+) -> Result<crate::types::TIcebergDataFile, String> {
+    let partition_values_descriptor =
+        encode_partition_descriptor(df.partition(), descriptor_partition_spec_id, metadata)
+            .map_err(|e| e.to_string())?;
     Ok(crate::types::TIcebergDataFile {
         path: Some(df.file_path().to_string()),
         format: Some(format),
@@ -579,8 +619,8 @@ pub(crate) fn data_file_to_iceberg_thrift(
         first_row_id: df.first_row_id(),
         equality_ids: df.equality_ids(),
         key_metadata: df.key_metadata().map(|k| k.to_vec()),
-        partition_values_descriptor: None,
-        partition_spec_id,
+        partition_values_descriptor: Some(partition_values_descriptor),
+        partition_spec_id: Some(partition_spec_id),
     })
 }
 
@@ -1236,16 +1276,147 @@ fn unique_file_suffix() -> String {
 
 #[cfg(test)]
 mod tests {
-    use iceberg::spec::{DataContentType, Struct};
+    use iceberg::TableCreation;
+    use iceberg::spec::{
+        DataContentType, FormatVersion, NestedField, PartitionSpec, Schema, Struct,
+        TableMetadataBuilder, Transform,
+    };
 
     use super::*;
+
+    fn test_string_partition_metadata(spec_id: i32) -> TableMetadata {
+        let schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "region",
+                Type::Primitive(PrimitiveType::String),
+            ))])
+            .build()
+            .expect("schema");
+        let spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(spec_id)
+            .add_partition_field("region", "region", Transform::Identity)
+            .expect("partition field")
+            .build()
+            .expect("partition spec");
+        let creation = TableCreation::builder()
+            .name("t".to_string())
+            .location("file:///warehouse/db/t".to_string())
+            .schema(schema)
+            .partition_spec(spec)
+            .format_version(FormatVersion::V2)
+            .build();
+        TableMetadataBuilder::from_table_creation(creation)
+            .expect("table metadata builder")
+            .build()
+            .expect("table metadata")
+            .metadata
+    }
+
+    fn test_unpartitioned_metadata() -> TableMetadata {
+        let schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Int),
+            ))])
+            .build()
+            .expect("schema");
+        let creation = TableCreation::builder()
+            .name("t".to_string())
+            .location("file:///warehouse/db/t".to_string())
+            .schema(schema)
+            .partition_spec(PartitionSpec::unpartition_spec())
+            .format_version(FormatVersion::V2)
+            .build();
+        TableMetadataBuilder::from_table_creation(creation)
+            .expect("table metadata builder")
+            .build()
+            .expect("table metadata")
+            .metadata
+    }
+
+    #[test]
+    fn data_file_to_iceberg_thrift_carries_partition_descriptor() {
+        use iceberg::spec::{DataFileBuilder, DataFileFormat};
+
+        let metadata = test_string_partition_metadata(7);
+        let spec_id = metadata.default_partition_spec_id();
+        let partition = Struct::from_iter([Some(Literal::Primitive(PrimitiveLiteral::String(
+            "west".to_string(),
+        )))]);
+        let mut b = DataFileBuilder::default();
+        b.content(DataContentType::Data)
+            .file_path("file:///warehouse/t/data/a.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .partition(partition)
+            .record_count(1)
+            .file_size_in_bytes(12)
+            .partition_spec_id(spec_id);
+        let df = b.build().expect("data file");
+
+        let thrift = data_file_to_iceberg_thrift(
+            &df,
+            "wrong=path".to_string(),
+            "0".to_string(),
+            "PARQUET".to_string(),
+            crate::types::TIcebergFileContent::DATA,
+            Some(spec_id),
+            &metadata,
+        )
+        .expect("thrift");
+
+        let desc = thrift
+            .partition_values_descriptor
+            .expect("partition descriptor must be present");
+        assert_eq!(desc.values.expect("values").len(), 1);
+    }
+
+    #[test]
+    fn written_file_to_sink_commit_info_carries_partition_descriptor() {
+        use iceberg::spec::DataFileFormat;
+
+        let metadata = test_string_partition_metadata(7);
+        let spec_id = metadata.default_partition_spec_id();
+        let file = super::super::commit::WrittenFile {
+            path: "file:///warehouse/t/data/a.parquet".to_string(),
+            format: DataFileFormat::Parquet,
+            content: DataContentType::Data,
+            partition_values: Struct::from_iter([Some(Literal::Primitive(
+                PrimitiveLiteral::String("west".to_string()),
+            ))]),
+            partition_spec_id: spec_id,
+            record_count: 1,
+            file_size_in_bytes: 12,
+            split_offsets: Vec::new(),
+            column_sizes: Default::default(),
+            value_counts: Default::default(),
+            null_value_counts: Default::default(),
+            lower_bounds: Default::default(),
+            upper_bounds: Default::default(),
+            key_metadata: None,
+            referenced_data_file: None,
+            equality_ids: None,
+            first_row_id: None,
+        };
+
+        let info = written_file_to_sink_commit_info(&file, &metadata).expect("commit info");
+        let desc = info
+            .iceberg_data_file
+            .expect("data file")
+            .partition_values_descriptor
+            .expect("partition descriptor must be present");
+
+        assert_eq!(desc.values.expect("values").len(), 1);
+    }
 
     #[test]
     fn written_file_to_sink_commit_info_preserves_position_delete_metadata() {
         use iceberg::spec::{DataFileFormat, PrimitiveLiteral};
 
-        let partition_spec: PartitionSpecRef =
-            Arc::new(iceberg::spec::PartitionSpec::unpartition_spec());
+        let metadata = test_unpartitioned_metadata();
         let file = super::super::commit::WrittenFile {
             path: "file:///t/delete-1.parquet".to_string(),
             format: DataFileFormat::Parquet,
@@ -1266,8 +1437,7 @@ mod tests {
             first_row_id: None,
         };
 
-        let info =
-            written_file_to_sink_commit_info(&file, &partition_spec).expect("sink commit info");
+        let info = written_file_to_sink_commit_info(&file, &metadata).expect("sink commit info");
         let df = info.iceberg_data_file.expect("iceberg data file");
         assert_eq!(df.path.as_deref(), Some("file:///t/delete-1.parquet"));
         assert_eq!(
@@ -1283,27 +1453,14 @@ mod tests {
         assert_eq!(df.split_offsets, Some(vec![4]));
         assert_eq!(df.partition_spec_id, Some(0));
 
-        let partition_spec: PartitionSpecRef = Arc::new(
-            iceberg::spec::PartitionSpec::builder(Arc::new(
-                iceberg::spec::Schema::builder()
-                    .with_fields(vec![Arc::new(iceberg::spec::NestedField::required(
-                        1,
-                        "region",
-                        iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::String),
-                    ))])
-                    .build()
-                    .expect("schema"),
-            ))
-            .add_partition_field("region", "region", iceberg::spec::Transform::Identity)
-            .expect("partition field")
-            .build()
-            .expect("partition spec"),
-        );
+        let metadata = test_string_partition_metadata(7);
+        let spec_id = metadata.default_partition_spec_id();
         let mut partitioned = file.clone();
+        partitioned.partition_spec_id = spec_id;
         partitioned.partition_values = Struct::from_iter([Some(
             iceberg::spec::Literal::Primitive(PrimitiveLiteral::String("us west".to_string())),
         )]);
-        let df = written_file_to_sink_commit_info(&partitioned, &partition_spec)
+        let df = written_file_to_sink_commit_info(&partitioned, &metadata)
             .expect("partitioned sink commit info")
             .iceberg_data_file
             .expect("iceberg data file");
@@ -1314,12 +1471,14 @@ mod tests {
     fn data_file_to_iceberg_thrift_carries_lineage_equality_and_key_metadata() {
         use iceberg::spec::{DataFileBuilder, DataFileFormat};
 
+        let metadata = test_unpartitioned_metadata();
+        let spec_id = metadata.default_partition_spec_id();
         let mut b = DataFileBuilder::default();
         b.content(DataContentType::Data)
             .file_path("file:///t/data-1.parquet".to_string())
             .file_format(DataFileFormat::Parquet)
             .partition(Struct::empty())
-            .partition_spec_id(0)
+            .partition_spec_id(spec_id)
             .record_count(10)
             .file_size_in_bytes(100);
         b.key_metadata(Some(vec![1u8, 2, 3]));
@@ -1332,7 +1491,8 @@ mod tests {
             String::new(),
             "PARQUET".to_string(),
             crate::types::TIcebergFileContent::DATA,
-            Some(0),
+            Some(spec_id),
+            &metadata,
         )
         .expect("thrift");
 
@@ -1675,17 +1835,21 @@ mod tests {
     #[test]
     fn to_sink_commit_info_rejects_overflowing_record_count() {
         let mut builder = DataFileBuilder::default();
+        let metadata = test_unpartitioned_metadata();
+        let spec_id = metadata.default_partition_spec_id();
         builder
             .content(DataContentType::Data)
             .file_path("file:///tmp/overflow.parquet".to_string())
             .file_format(DataFileFormat::Parquet)
             .partition(Struct::empty())
-            .partition_spec_id(0)
+            .partition_spec_id(spec_id)
             .record_count(u64::MAX)
             .file_size_in_bytes(128);
         let staged = StagedDataFile {
             data_file: builder.build().expect("data file"),
-            partition_spec_id: 0,
+            metadata: Arc::new(metadata),
+            descriptor_partition_spec_id: spec_id,
+            partition_spec_id: spec_id,
             theta_sketches: None,
         };
 

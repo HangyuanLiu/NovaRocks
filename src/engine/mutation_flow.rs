@@ -511,7 +511,7 @@ impl IcebergWriteTransactionExecutor for MutationWriteExecutor {
                     sink_commit_infos.push(
                         crate::connector::iceberg::data_writer::written_file_to_sink_commit_info(
                             &wf,
-                            self.table.metadata().default_partition_spec(),
+                            self.table.metadata(),
                         )?,
                     );
                 }
@@ -598,7 +598,7 @@ impl MutationWriteExecutor {
                 sink_commit_infos.push(
                     crate::connector::iceberg::data_writer::written_file_to_sink_commit_info(
                         &wf,
-                        self.table.metadata().default_partition_spec(),
+                        self.table.metadata(),
                     )?,
                 );
             }
@@ -645,7 +645,7 @@ impl MutationWriteExecutor {
             sink_commit_infos.push(
                 crate::connector::iceberg::data_writer::written_file_to_sink_commit_info(
                     &wf,
-                    self.table.metadata().default_partition_spec(),
+                    self.table.metadata(),
                 )?,
             );
         }

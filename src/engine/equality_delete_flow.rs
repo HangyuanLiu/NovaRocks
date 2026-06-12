@@ -213,7 +213,7 @@ impl IcebergWriteTransactionExecutor for EqualityDeleteWriteExecutor {
         let sink_commit_info =
             crate::connector::iceberg::data_writer::written_file_to_sink_commit_info(
                 &written,
-                self.table.metadata().default_partition_spec(),
+                self.table.metadata(),
             )?;
         Ok(CoordinatedQueryResult {
             query_result: QueryResult::empty(),
