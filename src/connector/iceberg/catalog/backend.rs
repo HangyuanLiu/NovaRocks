@@ -27,6 +27,8 @@ use super::views;
 
 const NOVAROCKS_MV_APPLY_KEY_COLUMN_PROPERTY: &str = "novarocks.mv.apply-key.column";
 const NOVAROCKS_MV_HIDDEN_COLUMNS_PROPERTY: &str = "novarocks.mv.hidden-columns";
+pub(crate) const ICEBERG_ROW_IDENTITY_FILE_COLUMN: &str = "_file";
+pub(crate) const ICEBERG_ROW_IDENTITY_POS_COLUMN: &str = "_pos";
 
 pub(crate) struct IcebergCatalogBackend {
     registry: Arc<RwLock<IcebergCatalogRegistry>>,
@@ -303,22 +305,27 @@ pub(crate) fn build_iceberg_table_def_with_files(
     )
 }
 
-fn iceberg_row_lineage_metadata_columns() -> Vec<ColumnDef> {
+fn iceberg_row_identity_metadata_columns() -> Vec<ColumnDef> {
     vec![
         ColumnDef {
-            name: "_file".to_string(),
+            name: ICEBERG_ROW_IDENTITY_FILE_COLUMN.to_string(),
             data_type: arrow::datatypes::DataType::Utf8,
             nullable: false,
             write_default: None,
             logical_type: None,
         },
         ColumnDef {
-            name: "_pos".to_string(),
+            name: ICEBERG_ROW_IDENTITY_POS_COLUMN.to_string(),
             data_type: arrow::datatypes::DataType::Int64,
             nullable: false,
             write_default: None,
             logical_type: None,
         },
+    ]
+}
+
+fn iceberg_v3_row_lineage_metadata_columns() -> Vec<ColumnDef> {
+    vec![
         ColumnDef {
             name: "_row_id".to_string(),
             data_type: arrow::datatypes::DataType::Int64,
@@ -334,6 +341,12 @@ fn iceberg_row_lineage_metadata_columns() -> Vec<ColumnDef> {
             logical_type: None,
         },
     ]
+}
+
+fn iceberg_row_lineage_metadata_columns() -> Vec<ColumnDef> {
+    let mut columns = iceberg_row_identity_metadata_columns();
+    columns.extend(iceberg_v3_row_lineage_metadata_columns());
+    columns
 }
 
 /// IVM-A1 helper: build a `TableDef` for the base table without registering
@@ -520,18 +533,19 @@ fn build_iceberg_table_def_with_data_files_impl(
 
     let iceberg_row_lineage_metadata_columns = match options.mode {
         IcebergTableDefMode::SchemaOnly => {
+            let mut metadata_columns = iceberg_row_identity_metadata_columns();
             if row_lineage_enabled(loaded.table.metadata()) {
-                iceberg_row_lineage_metadata_columns()
-            } else {
-                vec![]
+                metadata_columns.extend(iceberg_v3_row_lineage_metadata_columns());
             }
+            metadata_columns
         }
         IcebergTableDefMode::ScanBinding => {
+            let mut metadata_columns = iceberg_row_identity_metadata_columns();
             if has_data_files
                 && is_v3_row_lineage(loaded.table.metadata())
                 && all_files_have_first_row_id
             {
-                iceberg_row_lineage_metadata_columns()
+                metadata_columns.extend(iceberg_v3_row_lineage_metadata_columns());
             } else {
                 if has_data_files
                     && is_v3_row_lineage(loaded.table.metadata())
@@ -540,13 +554,13 @@ fn build_iceberg_table_def_with_data_files_impl(
                     tracing::warn!(
                         table = %format!("{}.{}", namespace, table_name),
                         "iceberg table declares write.row-lineage=true but at least one data file lacks \
-                         first_row_id; row-lineage metadata columns (_row_id, _last_updated_sequence_number, \
-                         _file, _pos) are hidden; downstream features depending on row lineage \
+                         first_row_id; row-lineage metadata columns (_row_id, _last_updated_sequence_number) \
+                         are hidden; downstream features depending on row lineage \
                          (e.g. IVM apply-key) will not see correct data for those rows"
                     );
                 }
-                vec![]
             }
+            metadata_columns
         }
     };
 

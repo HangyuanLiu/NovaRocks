@@ -1604,12 +1604,10 @@ impl<'a> PlanFragmentBuilder<'a> {
             }
         }
 
-        // Iceberg V3 row-lineage pseudo-columns (_row_id,
-        // _last_updated_sequence_number): register in ExprScope and emit as
-        // output slots so that SELECT _row_id references resolve in codegen
-        // and the slot flows through to the HDFS_SCAN_NODE tuple descriptor.
-        // Lowering picks up the slot by name via `is_iceberg_row_id` /
-        // `is_iceberg_last_updated_sequence_number` to populate
+        // Iceberg metadata pseudo-columns: register in ExprScope and emit as
+        // output slots so SELECT _file/_pos and v3 row-lineage references
+        // resolve in codegen and flow through to the HDFS_SCAN_NODE tuple
+        // descriptor. Lowering picks up the slot by name to populate
         // IcebergVirtualSpec.
         //
         // Note: these pseudo-columns are NOT in `scan.columns`, so the column

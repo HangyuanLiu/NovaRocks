@@ -374,13 +374,12 @@ pub enum IcebergDataFileBinding {
 pub struct TableDef {
     pub name: String,
     pub columns: Vec<ColumnDef>,
-    /// Iceberg V3 row-lineage reserved metadata pseudo-columns. Empty for
-    /// non-Iceberg tables, V2 Iceberg tables, and V3 tables without
-    /// `write.row-lineage=true`. Populated by the iceberg `CatalogProvider`
-    /// implementation when the base table satisfies the row-lineage
-    /// preconditions. The analyzer registers these into the per-relation
-    /// scope as resolvable pseudo-columns but **not** into `SELECT *`
-    /// expansion.
+    /// Iceberg metadata pseudo-columns. `_file` and `_pos` are available for
+    /// Iceberg row-identity scans; `_row_id` and
+    /// `_last_updated_sequence_number` are exposed only when the table
+    /// satisfies v3 row-lineage preconditions. The analyzer registers these
+    /// into the per-relation scope as resolvable pseudo-columns but **not**
+    /// into `SELECT *` expansion.
     pub iceberg_row_lineage_metadata_columns: Vec<ColumnDef>,
     pub source: ScanSource,
 }

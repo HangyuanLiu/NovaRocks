@@ -35,7 +35,10 @@ use iceberg::spec::DataFile;
 use iceberg::{NamespaceIdent, TableIdent};
 
 use crate::connector::backend::ResolvedTable;
-use crate::connector::iceberg::catalog::backend::iceberg_schema_def_for_codegen;
+use crate::connector::iceberg::catalog::backend::{
+    ICEBERG_ROW_IDENTITY_FILE_COLUMN, ICEBERG_ROW_IDENTITY_POS_COLUMN,
+    iceberg_schema_def_for_codegen,
+};
 use crate::connector::iceberg::catalog::registry::{
     IcebergCatalogEntry, block_on_iceberg, build_iceberg_catalog,
 };
@@ -60,7 +63,7 @@ use crate::sql::catalog::{
     ColumnDef, IcebergDataFileBinding, IcebergTableInfo, ScanSource, TableDef,
 };
 use crate::sql::codegen::iceberg_write_sink::{
-    IcebergWriteSinkSpec, synthetic_iceberg_write_table_id,
+    IcebergWriteSinkMode, IcebergWriteSinkSpec, synthetic_iceberg_write_table_id,
 };
 use crate::sql::parser::ast::{InsertSource, Literal, SqlType};
 
@@ -289,12 +292,47 @@ impl IcebergWriteTransactionExecutor for DistributedInsertWriteExecutor {
     }
 }
 
-fn build_insert_write_sink_spec(
+pub(crate) fn build_insert_write_sink_spec(
     target: &TargetBackend,
     resolved: &ResolvedTable,
     table: &iceberg::table::Table,
     entry: &IcebergCatalogEntry,
     write_columns: &[ColumnDef],
+) -> Result<IcebergWriteSinkSpec, String> {
+    build_iceberg_write_sink_spec(
+        target,
+        resolved,
+        table,
+        entry,
+        IcebergWriteSinkMode::Data,
+        write_columns.to_vec(),
+    )
+}
+
+pub(crate) fn build_position_delete_sink_spec(
+    target: &TargetBackend,
+    resolved: &ResolvedTable,
+    table: &iceberg::table::Table,
+    entry: &IcebergCatalogEntry,
+) -> Result<IcebergWriteSinkSpec, String> {
+    let target_columns = position_delete_sink_input_columns(table.metadata(), &resolved.columns)?;
+    build_iceberg_write_sink_spec(
+        target,
+        resolved,
+        table,
+        entry,
+        IcebergWriteSinkMode::PositionDeletes,
+        target_columns,
+    )
+}
+
+pub(crate) fn build_iceberg_write_sink_spec(
+    target: &TargetBackend,
+    resolved: &ResolvedTable,
+    table: &iceberg::table::Table,
+    entry: &IcebergCatalogEntry,
+    mode: IcebergWriteSinkMode,
+    target_columns: Vec<ColumnDef>,
 ) -> Result<IcebergWriteSinkSpec, String> {
     let metadata = table.metadata();
     let iceberg = IcebergTableInfo {
@@ -315,7 +353,7 @@ fn build_insert_write_sink_spec(
     let cloud_properties = entry.cloud_properties_map();
     let target_table = TableDef {
         name: resolved.table.clone(),
-        columns: write_columns.to_vec(),
+        columns: target_columns.clone(),
         iceberg_row_lineage_metadata_columns: Vec::new(),
         source: ScanSource::IcebergDataFiles {
             table: iceberg.clone(),
@@ -340,11 +378,11 @@ fn build_insert_write_sink_spec(
     });
 
     Ok(IcebergWriteSinkSpec {
-        mode: crate::sql::codegen::iceberg_write_sink::IcebergWriteSinkMode::Data,
+        mode,
         target_table_id: synthetic_iceberg_write_table_id(),
         target_table,
         iceberg,
-        target_columns: write_columns.to_vec(),
+        target_columns,
         table_location,
         data_location,
         target_partition_spec_id: metadata.default_partition_spec_id(),
@@ -352,6 +390,48 @@ fn build_insert_write_sink_spec(
         file_format: "parquet".to_string(),
         compression: crate::types::TCompressionType::SNAPPY,
     })
+}
+
+fn position_delete_sink_input_columns(
+    metadata: &iceberg::spec::TableMetadata,
+    target_columns: &[ColumnDef],
+) -> Result<Vec<ColumnDef>, String> {
+    let mut columns = vec![
+        ColumnDef {
+            name: ICEBERG_ROW_IDENTITY_FILE_COLUMN.to_string(),
+            data_type: arrow::datatypes::DataType::Utf8,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        },
+        ColumnDef {
+            name: ICEBERG_ROW_IDENTITY_POS_COLUMN.to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        },
+    ];
+    let schema = metadata.current_schema();
+    for field in metadata.default_partition_spec().fields() {
+        let source = schema.field_by_id(field.source_id).ok_or_else(|| {
+            format!(
+                "iceberg position-delete sink partition source field id {} not found",
+                field.source_id
+            )
+        })?;
+        let column = target_columns
+            .iter()
+            .find(|column| column.name.eq_ignore_ascii_case(&source.name))
+            .ok_or_else(|| {
+                format!(
+                    "iceberg position-delete sink partition source column `{}` not found in target table",
+                    source.name
+                )
+            })?;
+        columns.push(column.clone());
+    }
+    Ok(columns)
 }
 
 fn append_source_to_query(
