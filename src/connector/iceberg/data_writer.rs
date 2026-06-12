@@ -430,6 +430,7 @@ pub(crate) fn written_file_to_sink_commit_info(
         first_row_id: file.first_row_id,
         equality_ids: file.equality_ids.clone(),
         key_metadata: file.key_metadata.clone(),
+        partition_values_descriptor: None,
         partition_spec_id: Some(file.partition_spec_id),
     };
     Ok(crate::types::TSinkCommitInfo {
@@ -578,6 +579,7 @@ pub(crate) fn data_file_to_iceberg_thrift(
         first_row_id: df.first_row_id(),
         equality_ids: df.equality_ids(),
         key_metadata: df.key_metadata().map(|k| k.to_vec()),
+        partition_values_descriptor: None,
         partition_spec_id,
     })
 }

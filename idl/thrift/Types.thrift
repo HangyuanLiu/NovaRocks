@@ -588,6 +588,15 @@ enum TIcebergFileContent {
     EQUALITY_DELETES,
 }
 
+struct TIcebergPartitionValue {
+    1: optional bool is_null;
+    2: optional binary datum_bytes;
+}
+
+struct TIcebergPartitionDescriptor {
+    1: optional list<TIcebergPartitionValue> values;
+}
+
 struct TIcebergDataFile {
     1: optional string path
     2: optional string format
@@ -605,6 +614,7 @@ struct TIcebergDataFile {
     12: optional list<i32> equality_ids;
     13: optional binary key_metadata;
     14: optional i32 partition_spec_id;
+    15: optional TIcebergPartitionDescriptor partition_values_descriptor;
 }
 
 struct THiveFileInfo {

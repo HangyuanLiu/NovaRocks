@@ -40,6 +40,7 @@ pub(crate) mod stats_assembler;
 pub(crate) mod stats_loader;
 pub(crate) mod theta_sketch;
 pub(crate) mod variant_write;
+pub(crate) mod write_descriptor;
 
 pub use metadata::{
     IcebergMetadataOutputColumn, IcebergMetadataScanConfig, IcebergMetadataScanOp,
