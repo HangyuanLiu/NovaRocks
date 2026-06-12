@@ -322,7 +322,7 @@ fn retag_queued_chunks_for_expected_schema(
         };
         let (batch, chunk_schema) =
             materialize_chunk_for_wire_meta(Some(expected_chunk_schema), &chunk.batch, &wire_meta)?;
-        let mut retagged = Chunk::try_new_with_chunk_schema(batch, chunk_schema).map_err(|e| {
+        let mut retagged = chunk_from_exchange_batch(batch, chunk_schema).map_err(|e| {
             format!(
                 "retag queued exchange chunk for late expected schema failed: {}",
                 e
@@ -925,7 +925,7 @@ fn exchange_wire_schema_from_first_chunk(chunks: &[Chunk]) -> Result<SchemaRef, 
     let first = chunks
         .first()
         .ok_or_else(|| "exchange chunks must not be empty".to_string())?;
-    Ok(first.schema())
+    Ok(first.chunk_schema().arrow_schema_ref())
 }
 
 fn normalize_exchange_array_for_field(
@@ -1717,6 +1717,37 @@ mod tests {
             .map(|slot| slot.slot_id())
             .collect::<Vec<_>>();
         assert_eq!(actual_slots, expected_slots);
+
+        cancel_exchange_key(key);
+    }
+
+    #[test]
+    fn late_expected_schema_registration_preserves_queued_zero_column_row_count() {
+        let key = ExchangeKey {
+            finst_id_hi: 205,
+            finst_id_lo: 206,
+            node_id: 23,
+        };
+        let row_count = 3;
+        let payload = encode_chunks(&[exchange_test_zero_column_chunk(row_count)], true)
+            .expect("encode zero-column chunk");
+        let decoded = decode_chunks_for_sender(key, 7, 1, &payload).expect("decode directly");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].len(), row_count);
+        assert_eq!(decoded[0].batch.num_columns(), 0);
+        push_chunks(key, 7, 1, decoded, false);
+
+        register_expected_chunk_schema(key, 1, Arc::new(crate::exec::chunk::ChunkSchema::empty()))
+            .expect("register empty schema");
+
+        let handle = get_receiver_handle(key, 1).expect("receiver handle");
+        let Some(ExchangePopResult::Chunk(chunk)) =
+            handle.try_pop_next_with_stats(1).expect("pop queued chunk")
+        else {
+            panic!("expected queued zero-column chunk");
+        };
+        assert_eq!(chunk.len(), row_count);
+        assert_eq!(chunk.batch.num_columns(), 0);
 
         cancel_exchange_key(key);
     }
