@@ -27,6 +27,7 @@ use super::memory::{ChunkAccounting, chunk_bytes_i64, record_batch_bytes};
 use super::schema::{
     ChunkSchema, ChunkSchemaRef, align_chunk_schema_to_batch, align_chunk_schema_to_columns,
 };
+use super::type_relation::retag_column;
 
 /// A chunk of data, consisting of multiple rows.
 /// Phase 2: Wrapper around Arrow RecordBatch.
@@ -43,9 +44,14 @@ impl Chunk {
         columns: Vec<ArrayRef>,
     ) -> Result<Self, String> {
         let chunk_schema = align_chunk_schema_to_columns(&columns, chunk_schema.as_ref())?;
+        let columns = retag_columns_to_chunk_schema(&columns, chunk_schema.as_ref())?;
         let batch = RecordBatch::try_new(chunk_schema.arrow_schema_ref(), columns)
             .map_err(|e| format!("build chunk record batch failed: {e}"))?;
-        Self::try_new_with_chunk_schema(batch, chunk_schema)
+        Ok(Self {
+            batch,
+            chunk_schema,
+            accounting: None,
+        })
     }
 
     pub fn try_new_like(batch: RecordBatch, source: &Chunk) -> Result<Self, String> {
@@ -64,6 +70,9 @@ impl Chunk {
         chunk_schema: ChunkSchemaRef,
     ) -> Result<Self, String> {
         let chunk_schema = align_chunk_schema_to_batch(&batch, chunk_schema.as_ref())?;
+        let columns = retag_columns_to_chunk_schema(batch.columns(), chunk_schema.as_ref())?;
+        let batch = RecordBatch::try_new(chunk_schema.arrow_schema_ref(), columns)
+            .map_err(|e| format!("build chunk record batch failed: {e}"))?;
         Ok(Self {
             batch,
             chunk_schema,
@@ -159,6 +168,27 @@ impl Chunk {
         }
         self.accounting = Some(Arc::new(ChunkAccounting::new(bytes, tracker)));
     }
+}
+
+fn retag_columns_to_chunk_schema(
+    columns: &[ArrayRef],
+    chunk_schema: &ChunkSchema,
+) -> Result<Vec<ArrayRef>, String> {
+    columns
+        .iter()
+        .zip(chunk_schema.slots())
+        .enumerate()
+        .map(|(idx, (column, slot))| {
+            retag_column(column, slot.data_type()).map_err(|e| {
+                format!(
+                    "retag chunk column {} to target descriptor type {:?} failed: {:?}",
+                    idx,
+                    slot.data_type(),
+                    e
+                )
+            })
+        })
+        .collect()
 }
 
 impl Default for Chunk {

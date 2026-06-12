@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::common::ids::SlotId;
-use crate::exec::chunk::type_relation::{relate, CompatibilityPolicy};
+use crate::exec::chunk::type_relation::{CompatibilityPolicy, relate};
 use crate::lower::type_lowering::{arrow_type_from_desc, primitive_type_from_desc};
 use crate::types;
 use arrow::array::ArrayRef;
@@ -673,10 +673,11 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::array::{
-        Array, ArrayRef, BinaryArray, Int32Array, Int64Array, Int8Array, MapArray, StructArray,
+        Array, ArrayRef, BinaryArray, Int8Array, Int32Array, Int64Array, MapArray, StringArray,
+        StructArray, TimestampMicrosecondArray,
     };
     use arrow::buffer::OffsetBuffer;
-    use arrow::datatypes::{DataType, Field, Fields, Schema};
+    use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
     use arrow::record_batch::RecordBatch;
 
     use super::{ChunkSchema, ChunkSlotSchema};
@@ -832,5 +833,100 @@ mod tests {
         let aligned =
             super::align_chunk_schema_to_columns(&[column], &schema).expect("align schema");
         assert_eq!(aligned.slots()[0].data_type(), &DataType::Binary);
+    }
+
+    #[test]
+    fn try_new_with_columns_retags_utf8_column_to_binary_descriptor() {
+        let chunk_schema = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                SlotId::new(9),
+                Field::new("payload", DataType::Binary, true),
+                None,
+                None,
+            )])
+            .expect("chunk schema"),
+        );
+        let column = Arc::new(StringArray::from(vec![Some("abc"), Some("xyz")])) as ArrayRef;
+
+        let chunk = Chunk::try_new_with_columns(chunk_schema, vec![column]).expect("chunk");
+
+        assert_eq!(chunk.schema().field(0).data_type(), &DataType::Binary);
+        assert_eq!(
+            chunk.chunk_schema().slots()[0].data_type(),
+            &DataType::Binary
+        );
+        let binary = chunk.columns()[0]
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("binary array");
+        assert_eq!(binary.value(0), b"abc");
+        assert_eq!(binary.value(1), b"xyz");
+    }
+
+    #[test]
+    fn try_new_with_chunk_schema_retags_utf8_batch_to_binary_descriptor() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "payload",
+                DataType::Utf8,
+                true,
+            )])),
+            vec![Arc::new(StringArray::from(vec![Some("abc"), Some("xyz")]))],
+        )
+        .expect("record batch");
+        let chunk_schema = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                SlotId::new(9),
+                Field::new("payload", DataType::Binary, true),
+                None,
+                None,
+            )])
+            .expect("chunk schema"),
+        );
+
+        let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk");
+
+        assert_eq!(chunk.schema().field(0).data_type(), &DataType::Binary);
+        assert_eq!(
+            chunk.chunk_schema().slots()[0].data_type(),
+            &DataType::Binary
+        );
+        let binary = chunk.columns()[0]
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("binary array");
+        assert_eq!(binary.value(0), b"abc");
+        assert_eq!(binary.value(1), b"xyz");
+    }
+
+    #[test]
+    fn try_new_with_chunk_schema_rejects_timestamp_metadata_retag() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            )])),
+            vec![Arc::new(TimestampMicrosecondArray::from(vec![
+                Some(1_000_i64),
+                Some(2_000),
+            ]))],
+        )
+        .expect("record batch");
+        let chunk_schema = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                SlotId::new(10),
+                Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), true),
+                None,
+                None,
+            )])
+            .expect("chunk schema"),
+        );
+
+        let err = Chunk::try_new_with_chunk_schema(batch, chunk_schema)
+            .expect_err("timestamp metadata retag should fail");
+
+        assert!(err.contains("column 0"), "err={err}");
+        assert!(err.contains("Timestamp(Nanosecond, None)"), "err={err}");
     }
 }

@@ -43,9 +43,9 @@
 //! nullability reconciliation (and the root-boundary `required -> null`
 //! fail-fast) is a separate concern layered on top when call sites are rewired.
 #![allow(dead_code)] // Staged foundation: wired into exchange/sort/aggregate by the
-                     // descriptor-authoritative migration (P3/P5). Unused until then.
+// descriptor-authoritative migration (P3/P5). Unused until then.
 
-use arrow::array::{make_array, Array, ArrayData, ArrayRef};
+use arrow::array::{Array, ArrayData, ArrayRef, make_array};
 use arrow::datatypes::{DataType, Field};
 
 /// The compatibility policy parameter for [`relate`].
@@ -344,7 +344,7 @@ fn map_key_value(entries: &arrow::datatypes::FieldRef) -> Option<(&DataType, &Da
 mod tests {
     use super::CompatibilityPolicy::{ExactArrow, SameScaleWiden};
     use super::TypeMismatchKind::*;
-    use super::{merge_fields_nullability, relate, retag_column, NestedStep};
+    use super::{NestedStep, merge_fields_nullability, relate, retag_column};
     use arrow::array::{
         Array, ArrayRef, BinaryArray, Decimal128Array, Int32Array, Int64Array, ListArray,
         StringArray, StructArray,
