@@ -839,4 +839,20 @@ mod tests {
         };
         assert!(entry_fields[0].is_nullable(), "map key should be nullable");
     }
+
+    #[test]
+    fn align_chunk_schema_to_columns_keeps_descriptor_type_for_retaggable_columns() {
+        let schema = ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+            SlotId::new(9),
+            Field::new("payload", DataType::Binary, true),
+            None,
+            None,
+        )])
+        .expect("chunk schema");
+        let column = Arc::new(arrow::array::StringArray::from(vec![Some("abc")])) as ArrayRef;
+
+        let aligned =
+            super::align_chunk_schema_to_columns(&[column], &schema).expect("align schema");
+        assert_eq!(aligned.slots()[0].data_type(), &DataType::Binary);
+    }
 }

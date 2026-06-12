@@ -1455,7 +1455,9 @@ pub fn decode_chunks_for_sender(
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::{Array, ArrayRef, Decimal128Array, Int32Array, StringArray, make_array};
+    use arrow::array::{
+        Array, ArrayRef, Decimal128Array, Int32Array, Int64Array, StringArray, make_array,
+    };
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use arrow::record_batch::RecordBatchOptions;
@@ -1750,6 +1752,58 @@ mod tests {
         assert_eq!(decoded.len(), 1);
         assert!(decoded[0].schema().field(3).is_nullable());
         assert!(decoded[0].chunk_schema().slots()[3].nullable());
+
+        cancel_exchange_key(key);
+    }
+
+    #[test]
+    fn decode_chunks_for_sender_rejects_numeric_for_opaque_descriptor() {
+        use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
+        use crate::lower::type_lowering::scalar_type_desc;
+        use crate::types::TPrimitiveType;
+
+        let key = ExchangeKey {
+            finst_id_hi: 501,
+            finst_id_lo: 502,
+            node_id: 31,
+        };
+
+        let wire_schema = Arc::new(Schema::new(vec![Field::new(
+            "__opaque_state",
+            DataType::Int64,
+            true,
+        )]));
+        let wire_batch = RecordBatch::try_new(
+            wire_schema,
+            vec![Arc::new(Int64Array::from(vec![Some(7_i64)])) as ArrayRef],
+        )
+        .expect("wire batch");
+        let wire_chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            wire_batch.schema().as_ref(),
+            &[SlotId::new(41)],
+        )
+        .expect("wire chunk schema");
+        let wire_chunk = Chunk::new_with_chunk_schema(wire_batch, wire_chunk_schema);
+
+        let expected_schema = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new(
+                SlotId::new(41),
+                "__opaque_state",
+                true,
+                Some(scalar_type_desc(TPrimitiveType::VARBINARY)),
+                Some(41),
+            )])
+            .expect("expected chunk schema"),
+        );
+        register_expected_chunk_schema(key, 1, expected_schema).expect("register expected schema");
+
+        let payload = encode_chunks(&[wire_chunk], true).expect("encode drifted chunk");
+        let err = decode_chunks_for_sender(key, 3, 1, &payload)
+            .expect_err("numeric payload must not pass as an opaque aggregate state");
+        assert!(
+            err.contains("exchange decoded arrow type mismatch"),
+            "err={err}"
+        );
 
         cancel_exchange_key(key);
     }

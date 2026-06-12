@@ -1199,4 +1199,26 @@ mod tests {
             &DataType::Decimal128(38, 3)
         ));
     }
+
+    #[test]
+    fn aggregate_output_schema_rejects_runtime_type_drift() {
+        use std::sync::Arc;
+
+        use arrow::array::{ArrayRef, Int64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "__avg_state",
+            DataType::Utf8,
+            true,
+        )]));
+        let arrays: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![Some(10_i64)]))];
+
+        let err = super::align_schema_with_arrays(&schema, &arrays, "p5 aggregate output")
+            .expect_err("aggregate output must not adopt actual array type");
+        assert!(
+            err.contains("p5 aggregate output type mismatch"),
+            "err={err}"
+        );
+    }
 }
