@@ -80,3 +80,38 @@
 - [ ] Step 4-9/6b（P2 wiring + lock）
 - [ ] Step 10-12（GROUP A 原子）
 - [ ] Step 13-16
+
+## type_relation 收口 PR（#300 之后的后续，本分支 claude/p5-type-relation-collapse）
+
+把执行层四处漂移的「类型兼容检查 / 物化 / 字段 nullability 合并」收口到单一权威原语
+`type_relation`（`relate` 检查、`retag_column` 物化、`merge_fields_nullability`），
+并删除 #295 为 StarRocks-1FE3BE 加的 List↔Struct 中间态桥接（= 计划里的 Step 15，
+现已可做：验收标准改为 NovaRocks coordinator+3BE，不再需要兼容 StarRocks FE 的 Struct 中间类型）。
+
+提交（基于 origin/main）：
+- `retag_array` → `retag_column` 重命名（向量列物化，非 Arrow Array 专指）。
+- sort：删 `is_compatible_sort_field_type` + `retag_decimal128/256_array_for_sort`，
+  检查走 `relate(SameScaleWiden)`、物化走 `retag_column`。
+- exchange：编码侧 `normalize_exchange_array_for_field` → `retag_column`，
+  `merge_exchange_field` nullability → `merge_fields_nullability`。
+- schema_compat：`is_execution_data_type_compatible` → `relate`，
+  `normalize_array_to_data_type` → `retag_column`，删本地 decimal retag helper。
+- chunk（全局每个 Chunk）：`is_compatible_chunk_field_type` → `relate(SameScaleWiden)`，
+  把「任意 scale 容忍」收紧为「同 scale」（fail-fast，scale 不符不再静默采用 batch scale）。
+- List↔Struct 桥接删除（Step 15）：schema_compat 检查 + exchange 合并两处的 StarRocks-FE 中间态桥接。
+
+验收（NovaRocks coordinator + 3 BE 跨进程，用户指定标准）：
+aggregate 78/79、complex-type 34/34、complex-type-native 3/3、analytic 33/35、sort 13/13、ssb 13/13；
+**零新增回归，零 `chunk schema field mismatch`、零 List/Struct 类型错误**。
+所有失败均为预存的 `sort_tuple_slot_exprs is missing` SORT lowering 缺口（来自 first commit
+13b48493，本分支对 sort codegen/lowering 零改动；单进程与跨进程完全一致）+ debug 构建 tpc-h 超时。
+`cargo fmt` 无 diff、`cargo clippy` 对改动文件无新增告警。
+
+刻意作为后续（非本 PR）：
+- **P5a：把 array_agg/group_concat 的 order/distinct 从函数名字符串改为 AggFunction 结构化字段**。
+  纯重构、无行为变更，但波及 ~86 处 AggFunction 构造点（多为测试夹具），与本 PR 的 type_relation
+  主题正交 → 独立聚焦 PR 更易审查。encode 集中在 `lower/node/aggregate.rs::encode_aggregate_name`
+  （standalone 经 thrift 也汇入此处），decode 在 array_agg/group_concat 的 `build_spec`。
+- Step 14（root typed exchange，#300 已记录的高风险零收益项）。
+- `sort_tuple_slot_exprs is missing` 的 standalone sort lowering 缺口（独立 bug，影响
+  join/aggregate/analytic 多套件的 sort-over-X 形状）。
