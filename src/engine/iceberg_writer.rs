@@ -340,6 +340,7 @@ fn build_insert_write_sink_spec(
     });
 
     Ok(IcebergWriteSinkSpec {
+        mode: crate::sql::codegen::iceberg_write_sink::IcebergWriteSinkMode::Data,
         target_table_id: synthetic_iceberg_write_table_id(),
         target_table,
         iceberg,

@@ -8628,6 +8628,38 @@ mod tests {
     }
 
     #[test]
+    fn build_with_iceberg_sink_preserves_delete_sink_mode() {
+        let plan = values_plan_for_test(vec![output_col_for_test(1, "id", DataType::Int32, false)]);
+        let connectors = crate::connector::ConnectorRegistry::new();
+        let mut spec = crate::sql::codegen::iceberg_write_sink::test_support::simple_sink_spec();
+        spec.mode = crate::sql::codegen::iceberg_write_sink::IcebergWriteSinkMode::PositionDeletes;
+        spec.iceberg.serialized_metadata = Some(
+            crate::sql::codegen::iceberg_write_sink::test_support::single_bucket_partition_metadata_json(),
+        );
+
+        let build = PlanFragmentBuilder::build_with_iceberg_sink(
+            &plan,
+            &DummyCatalog,
+            &connectors,
+            "default",
+            None,
+            &spec,
+        )
+        .expect("build with iceberg delete sink");
+
+        let root = build
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == build.root_fragment_id)
+            .expect("root fragment");
+        assert_eq!(
+            root.output_sink.type_,
+            data_sinks::TDataSinkType::ICEBERG_DELETE_SINK
+        );
+        assert!(root.output_sink.iceberg_table_sink.is_some());
+    }
+
+    #[test]
     fn mixed_starrocks_and_iceberg_scan_table_ids_do_not_collide() {
         let starrocks_layout = PhysicalTableLayout {
             db_id: 11,
