@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, RecordBatch};
+use arrow::array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow::datatypes::{Schema, SchemaRef};
 
 use crate::common::ids::SlotId;
@@ -43,10 +43,10 @@ impl Chunk {
         chunk_schema: ChunkSchemaRef,
         columns: Vec<ArrayRef>,
     ) -> Result<Self, String> {
+        let row_count = columns.first().map(|col| col.len()).unwrap_or(0);
         let chunk_schema = align_chunk_schema_to_columns(&columns, chunk_schema.as_ref())?;
         let columns = retag_columns_to_chunk_schema(&columns, chunk_schema.as_ref())?;
-        let batch = RecordBatch::try_new(chunk_schema.arrow_schema_ref(), columns)
-            .map_err(|e| format!("build chunk record batch failed: {e}"))?;
+        let batch = build_record_batch(chunk_schema.arrow_schema_ref(), columns, row_count)?;
         Ok(Self {
             batch,
             chunk_schema,
@@ -69,10 +69,10 @@ impl Chunk {
         batch: RecordBatch,
         chunk_schema: ChunkSchemaRef,
     ) -> Result<Self, String> {
+        let row_count = batch.num_rows();
         let chunk_schema = align_chunk_schema_to_batch(&batch, chunk_schema.as_ref())?;
         let columns = retag_columns_to_chunk_schema(batch.columns(), chunk_schema.as_ref())?;
-        let batch = RecordBatch::try_new(chunk_schema.arrow_schema_ref(), columns)
-            .map_err(|e| format!("build chunk record batch failed: {e}"))?;
+        let batch = build_record_batch(chunk_schema.arrow_schema_ref(), columns, row_count)?;
         Ok(Self {
             batch,
             chunk_schema,
@@ -189,6 +189,20 @@ fn retag_columns_to_chunk_schema(
             })
         })
         .collect()
+}
+
+fn build_record_batch(
+    schema: SchemaRef,
+    columns: Vec<ArrayRef>,
+    row_count: usize,
+) -> Result<RecordBatch, String> {
+    let result = if columns.is_empty() {
+        let options = RecordBatchOptions::new().with_row_count(Some(row_count));
+        RecordBatch::try_new_with_options(schema, columns, &options)
+    } else {
+        RecordBatch::try_new(schema, columns)
+    };
+    result.map_err(|e| format!("build chunk record batch failed: {e}"))
 }
 
 impl Default for Chunk {

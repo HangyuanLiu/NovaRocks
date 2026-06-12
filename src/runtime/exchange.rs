@@ -1107,6 +1107,13 @@ fn materialize_chunk_for_wire_meta(
         )?;
         return Ok((batch.clone(), chunk_schema));
     };
+    if wire_meta.slot_ids_by_index.len() != expected_chunk_schema.slots().len() {
+        return Err(format!(
+            "exchange expected schema column count mismatch: wire_columns={} expected_columns={}",
+            wire_meta.slot_ids_by_index.len(),
+            expected_chunk_schema.slots().len()
+        ));
+    }
     let batch_schema = batch.schema();
 
     // Check whether wire slot IDs match the expected schema. If not (e.g. CTE
@@ -1554,6 +1561,40 @@ mod tests {
             SlotId::new(32)
         );
         assert_eq!(second_decoded[0].schema().field(3).name(), "_cse_2");
+
+        cancel_exchange_key(key);
+    }
+
+    #[test]
+    fn decode_chunks_for_sender_rejects_partial_expected_schema_match() {
+        let key = ExchangeKey {
+            finst_id_hi: 1099,
+            finst_id_lo: 1100,
+            node_id: 77,
+        };
+        let expected_chunk_schema = exchange_test_chunk("_cse_0").chunk_schema_ref();
+        register_expected_chunk_schema(key, 1, expected_chunk_schema).expect("register schema");
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v1", DataType::Int32, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![Some(1)])) as ArrayRef],
+        )
+        .expect("record batch");
+        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(33)],
+        )
+        .expect("chunk schema");
+        let payload = encode_chunks(&[Chunk::new_with_chunk_schema(batch, chunk_schema)], true)
+            .expect("encode");
+
+        let err = decode_chunks_for_sender(key, 3, 1, &payload)
+            .expect_err("partial wire schema must not match registered expected schema");
+        assert!(
+            err.contains("exchange expected schema column count mismatch"),
+            "err={err}"
+        );
 
         cancel_exchange_key(key);
     }

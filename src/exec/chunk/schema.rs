@@ -740,6 +740,19 @@ mod tests {
     }
 
     #[test]
+    fn try_new_with_chunk_schema_preserves_zero_column_row_count() {
+        let options = arrow::array::RecordBatchOptions::new().with_row_count(Some(3));
+        let batch = RecordBatch::try_new_with_options(Arc::new(Schema::empty()), vec![], &options)
+            .expect("zero-column record batch");
+        let chunk_schema = Arc::new(ChunkSchema::try_new(vec![]).expect("chunk schema"));
+
+        let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk");
+
+        assert_eq!(chunk.batch.num_columns(), 0);
+        assert_eq!(chunk.batch.num_rows(), 3);
+    }
+
+    #[test]
     fn align_chunk_schema_accepts_non_nullable_batch_for_nullable_contract() {
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("c13", DataType::Int8, false)])),
