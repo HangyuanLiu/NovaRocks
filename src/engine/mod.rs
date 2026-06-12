@@ -9311,6 +9311,49 @@ path = "meta/operations.sqlite"
         );
     }
 
+    fn create_kv_tables(session: &StandaloneSession, t1_values: &str, t2_values: &str) {
+        session
+            .execute_in_database("create table ice.db1.t1 (k bigint, v bigint)", "default")
+            .expect("create t1");
+        session
+            .execute_in_database("create table ice.db1.t2 (k bigint, v bigint)", "default")
+            .expect("create t2");
+        if !t1_values.trim().is_empty() {
+            session
+                .execute_in_database(
+                    &format!("insert into ice.db1.t1 values {t1_values}"),
+                    "default",
+                )
+                .expect("insert t1");
+        }
+        if !t2_values.trim().is_empty() {
+            session
+                .execute_in_database(
+                    &format!("insert into ice.db1.t2 values {t2_values}"),
+                    "default",
+                )
+                .expect("insert t2");
+        }
+    }
+
+    fn assert_apply_matches_legacy_i64(
+        session: &StandaloneSession,
+        sql: &str,
+        expected: Vec<Option<i64>>,
+    ) {
+        use crate::sql::optimizer::options::SubqueryUnnestMode;
+        let legacy = run_scalar_query_i64(session, sql, SubqueryUnnestMode::Legacy)
+            .expect("legacy subquery query");
+        let apply = run_scalar_query_i64(session, sql, SubqueryUnnestMode::Apply)
+            .expect("apply subquery query");
+
+        assert_eq!(
+            apply, legacy,
+            "apply mode must return the same result as legacy for query: {sql}"
+        );
+        assert_eq!(legacy, expected, "unexpected SQL result for query: {sql}");
+    }
+
     // ---- Test 1: correlated aggregate (q17-shape) — apply == legacy -----------
 
     /// Correlated aggregate scalar: `WHERE v = (SELECT min(t2.v) FROM t2 WHERE t2.k = t1.k)`.
@@ -9688,6 +9731,172 @@ path = "meta/operations.sqlite"
                 vec![Some(3), None, Some(30)],
             ],
             "unexpected result values for multiple scalar subqueries"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // EXISTS / IN Apply-to-Join — end-to-end parity tests (Task 7).
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn exists_correlated_apply_matches_legacy() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
+        create_kv_tables(
+            &session,
+            "(1,10),(2,20),(3,30),(NULL,40)",
+            "(1,100),(1,101),(3,300),(NULL,999)",
+        );
+
+        assert_apply_matches_legacy_i64(
+            &session,
+            "SELECT t1.k FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.k = t1.k) ORDER BY 1",
+            vec![Some(1), Some(3)],
+        );
+    }
+
+    #[test]
+    fn not_exists_correlated_apply_matches_legacy() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
+        create_kv_tables(
+            &session,
+            "(1,10),(2,20),(3,30),(NULL,40)",
+            "(1,100),(3,300),(NULL,999)",
+        );
+
+        assert_apply_matches_legacy_i64(
+            &session,
+            "SELECT t1.k FROM t1 WHERE NOT EXISTS (SELECT 1 FROM t2 WHERE t2.k = t1.k) ORDER BY t1.k NULLS LAST",
+            vec![Some(2), None],
+        );
+    }
+
+    #[test]
+    fn exists_uncorrelated_apply_matches_legacy() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
+        create_kv_tables(&session, "(1,10),(2,20),(3,30)", "(1,101),(2,200)");
+
+        assert_apply_matches_legacy_i64(
+            &session,
+            "SELECT t1.k FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.v > 100) ORDER BY 1",
+            vec![Some(1), Some(2), Some(3)],
+        );
+        assert_apply_matches_legacy_i64(
+            &session,
+            "SELECT t1.k FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.v > 1000) ORDER BY 1",
+            vec![],
+        );
+    }
+
+    #[test]
+    fn in_correlated_apply_matches_legacy() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
+        create_kv_tables(
+            &session,
+            "(1,10),(2,20),(3,30),(4,NULL)",
+            "(1,10),(1,11),(2,99),(3,30),(4,NULL)",
+        );
+
+        assert_apply_matches_legacy_i64(
+            &session,
+            "SELECT t1.k FROM t1 WHERE t1.v IN (SELECT t2.v FROM t2 WHERE t2.k = t1.k) ORDER BY 1",
+            vec![Some(1), Some(3)],
+        );
+    }
+
+    #[test]
+    fn in_uncorrelated_apply_matches_legacy() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
+        create_kv_tables(
+            &session,
+            "(1,10),(2,20),(3,30),(4,NULL)",
+            "(9,10),(9,30),(9,NULL)",
+        );
+
+        assert_apply_matches_legacy_i64(
+            &session,
+            "SELECT t1.k FROM t1 WHERE t1.v IN (SELECT t2.v FROM t2) ORDER BY 1",
+            vec![Some(1), Some(3)],
+        );
+    }
+
+    #[test]
+    fn not_in_uncorrelated_no_null() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
+        create_kv_tables(&session, "(1,10),(2,20),(3,30)", "(9,20),(9,40)");
+
+        assert_apply_matches_legacy_i64(
+            &session,
+            "SELECT t1.k FROM t1 WHERE t1.v NOT IN (SELECT t2.v FROM t2) ORDER BY 1",
+            vec![Some(1), Some(3)],
+        );
+    }
+
+    #[test]
+    fn not_in_uncorrelated_build_null() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
+        create_kv_tables(&session, "(1,10),(2,20),(3,30)", "(9,20),(9,NULL)");
+
+        assert_apply_matches_legacy_i64(
+            &session,
+            "SELECT t1.k FROM t1 WHERE t1.v NOT IN (SELECT t2.v FROM t2) ORDER BY 1",
+            vec![],
+        );
+    }
+
+    #[test]
+    fn not_in_uncorrelated_probe_null() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
+        create_kv_tables(&session, "(1,10),(2,NULL),(3,30)", "(9,20),(9,40)");
+
+        assert_apply_matches_legacy_i64(
+            &session,
+            "SELECT t1.k FROM t1 WHERE t1.v NOT IN (SELECT t2.v FROM t2) ORDER BY 1",
+            vec![Some(1), Some(3)],
+        );
+    }
+
+    #[test]
+    fn not_in_correlated_conjunct() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
+        create_kv_tables(
+            &session,
+            "(1,10),(2,20),(3,30),(4,40)",
+            "(1,20),(1,30),(2,20),(2,NULL),(3,NULL),(3,40)",
+        );
+
+        assert_apply_matches_legacy_i64(
+            &session,
+            "SELECT t1.k FROM t1 WHERE t1.v NOT IN (SELECT t2.v FROM t2 WHERE t2.k = t1.k) ORDER BY 1",
+            vec![Some(1), Some(4)],
+        );
+    }
+
+    #[test]
+    fn multi_subquery_in_and_exists_apply_matches_legacy() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
+        create_kv_tables(
+            &session,
+            "(1,10),(2,20),(3,30),(4,40)",
+            "(1,10),(1,150),(2,20),(2,99),(3,300),(4,400)",
+        );
+
+        assert_apply_matches_legacy_i64(
+            &session,
+            "SELECT t1.k FROM t1 \
+             WHERE t1.v IN (SELECT t2.v FROM t2 WHERE t2.k = t1.k) \
+               AND EXISTS (SELECT 1 FROM t2 WHERE t2.k = t1.k AND t2.v > 100) \
+             ORDER BY 1",
+            vec![Some(1)],
         );
     }
 }
