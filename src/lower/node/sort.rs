@@ -25,7 +25,7 @@ use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::common::ids::SlotId;
 use crate::descriptors;
 use crate::lower::expr::lower_t_expr;
-use crate::lower::layout::{chunk_schema_for_layout, Layout};
+use crate::lower::layout::{Layout, chunk_schema_for_layout};
 use crate::lower::node::Lowered;
 use crate::lower::type_lowering::arrow_type_from_desc;
 
