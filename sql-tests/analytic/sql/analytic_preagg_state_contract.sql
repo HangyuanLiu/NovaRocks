@@ -14,7 +14,9 @@ INSERT INTO ${case_db}.analytic_preagg_state_contract VALUES
     (2, 80, 200, 0.50),
     (2, 70, NULL, NULL);
 
-SELECT grp, score, avg_v, bitmap_v
+-- @explain_contains=predicate: rk <= 2
+-- @explain_contains=WINDOW [avg(v); bitmap_union_count(to_bitmap(v)); rank()]
+SELECT grp, score, avg_v, bitmap_v, rk
 FROM (
     SELECT
         grp,
@@ -29,4 +31,4 @@ FROM (
     FROM ${case_db}.analytic_preagg_state_contract
 ) t
 WHERE rk <= 2
-ORDER BY grp, score DESC, avg_v;
+ORDER BY grp, score DESC, rk, avg_v;
