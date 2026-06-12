@@ -2752,26 +2752,19 @@ pub(crate) fn infer_agg_function_types(
                 DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
                     DataType::FixedSizeBinary(*width)
                 }
-                DataType::Decimal128(_p, s) => DataType::Decimal128(38, *s),
+                DataType::Decimal128(..) => {
+                    crate::sql::types::canonical_agg_decimal_type("sum", &first_arg)
+                        .expect("sum decimal canonical type")
+                }
                 _ => DataType::Float64,
             };
             Ok((out.clone(), Some(out)))
         }
         "avg" => {
-            // avg(decimal(p,s)) uses division scale rule (sum/count):
-            // s <= 6  => result_scale = s + 6
-            // s <= 12 => result_scale = 12
-            // else    => result_scale = s
             let out = match &first_arg {
-                DataType::Decimal128(_p, s) => {
-                    let new_scale = if *s <= 6 {
-                        *s + 6
-                    } else if *s <= 12 {
-                        12
-                    } else {
-                        *s
-                    };
-                    DataType::Decimal128(38, new_scale)
+                DataType::Decimal128(..) => {
+                    crate::sql::types::canonical_agg_decimal_type("avg", &first_arg)
+                        .expect("avg decimal canonical type")
                 }
                 _ => DataType::Float64,
             };
@@ -2878,7 +2871,10 @@ pub(crate) fn infer_agg_function_types(
                 DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
                     DataType::FixedSizeBinary(*width)
                 }
-                DataType::Decimal128(p, s) => DataType::Decimal128(*p, *s),
+                DataType::Decimal128(..) => {
+                    crate::sql::types::canonical_agg_decimal_type("multi_distinct_sum", &first_arg)
+                        .expect("multi_distinct_sum decimal canonical type")
+                }
                 _ => DataType::Float64,
             };
             Ok((out, Some(DataType::Binary)))
@@ -3096,6 +3092,30 @@ mod tests {
     use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
     use crate::sql::codegen::resolve::{ColumnBinding, ExprScope};
     use crate::sql::column_id::ColumnId;
+
+    #[test]
+    fn infer_agg_decimal_uses_canonical_widening() {
+        // sum / multi_distinct_sum widen precision to 38 keeping scale; avg
+        // applies the division scale rule (s<=6 => s+6).
+        assert_eq!(
+            infer_agg_function_types("sum", &[DataType::Decimal128(20, 2)], false)
+                .unwrap()
+                .0,
+            DataType::Decimal128(38, 2)
+        );
+        assert_eq!(
+            infer_agg_function_types("multi_distinct_sum", &[DataType::Decimal128(20, 2)], false)
+                .unwrap()
+                .0,
+            DataType::Decimal128(38, 2)
+        );
+        assert_eq!(
+            infer_agg_function_types("avg", &[DataType::Decimal128(10, 3)], false)
+                .unwrap()
+                .0,
+            DataType::Decimal128(38, 9)
+        );
+    }
 
     fn test_binding(slot_id: i32, data_type: DataType) -> ColumnBinding {
         ColumnBinding {

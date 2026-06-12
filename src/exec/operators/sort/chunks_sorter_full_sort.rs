@@ -209,7 +209,11 @@ mod tests {
             .as_any()
             .downcast_ref::<Decimal128Array>()
             .expect("price decimal");
-        assert_eq!(prices.data_type(), &DataType::Decimal128(38, 2));
+        // Sort no longer widens decimal precision (it uses the array's own type;
+        // planning makes cross-fragment decimals canonical). The i128 payload is
+        // preserved regardless of the precision tag, so the over-precision value
+        // survives the sort/concat round trip with the declared Decimal128(20, 2).
+        assert_eq!(prices.data_type(), &DataType::Decimal128(20, 2));
         assert_eq!(prices.value(0), 12_345_i128);
         assert!(!prices.is_null(1));
         assert_eq!(prices.value(1), overflow);

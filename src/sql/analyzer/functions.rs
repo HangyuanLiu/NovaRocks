@@ -4,7 +4,7 @@ use arrow::datatypes::DataType;
 
 use crate::common::largeint;
 use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
-use crate::sql::types::wider_type;
+use crate::sql::types::{canonical_agg_decimal_type, wider_type};
 
 pub(super) fn is_window_only_function(name: &str) -> bool {
     matches!(
@@ -1414,24 +1414,15 @@ pub(super) fn infer_agg_return_type(name: &str, arg_types: &[DataType]) -> DataT
             DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
                 DataType::FixedSizeBinary(*width)
             }
-            DataType::Decimal128(_p, s) => DataType::Decimal128(38, *s),
+            DataType::Decimal128(..) => {
+                canonical_agg_decimal_type("sum", &first_arg).expect("sum decimal canonical type")
+            }
             _ => DataType::Float64,
         },
 
         "avg" => match &first_arg {
-            DataType::Decimal128(_p, s) => {
-                // StarRocks computes avg as sum/count. Division scale rule:
-                // s <= 6  => result_scale = s + 6
-                // s <= 12 => result_scale = 12
-                // else    => result_scale = s
-                let new_scale = if *s <= 6 {
-                    *s + 6
-                } else if *s <= 12 {
-                    12
-                } else {
-                    *s
-                };
-                DataType::Decimal128(38, new_scale)
+            DataType::Decimal128(..) => {
+                canonical_agg_decimal_type("avg", &first_arg).expect("avg decimal canonical type")
             }
             _ => DataType::Float64,
         },
@@ -1507,6 +1498,18 @@ pub(super) fn infer_agg_return_type(name: &str, arg_types: &[DataType]) -> DataT
 mod tests {
     use super::*;
     use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
+
+    #[test]
+    fn infer_agg_return_type_decimal_is_canonical() {
+        assert_eq!(
+            infer_agg_return_type("sum", &[DataType::Decimal128(20, 2)]),
+            DataType::Decimal128(38, 2)
+        );
+        assert_eq!(
+            infer_agg_return_type("avg", &[DataType::Decimal128(10, 3)]),
+            DataType::Decimal128(38, 9)
+        );
+    }
 
     fn array_type(item_type: DataType) -> DataType {
         DataType::List(Arc::new(arrow::datatypes::Field::new(

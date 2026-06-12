@@ -16,6 +16,7 @@
 // under the License.
 use arrow::datatypes::DataType;
 
+use crate::exec::chunk::type_relation::{CompatibilityPolicy, relate};
 use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
 
 use super::functions;
@@ -39,39 +40,6 @@ pub(super) fn agg_type_signature(func: &AggFunction) -> Option<&AggTypeSignature
     func.types.as_ref()
 }
 
-fn is_compatible_signature_type(expected: &DataType, sig_type: &DataType) -> bool {
-    match (expected, sig_type) {
-        (DataType::Decimal128(_, _), DataType::Decimal128(_, _)) => true,
-        (DataType::Decimal256(_, _), DataType::Decimal256(_, _)) => true,
-        (DataType::Timestamp(_, _), DataType::Timestamp(_, _)) => true,
-        (DataType::Utf8, DataType::Binary) | (DataType::Binary, DataType::Utf8) => true,
-        (DataType::List(expected_field), DataType::List(sig_field)) => {
-            is_compatible_signature_type(expected_field.data_type(), sig_field.data_type())
-        }
-        (DataType::Map(expected_field, _), DataType::Map(sig_field, _)) => {
-            is_compatible_signature_type(expected_field.data_type(), sig_field.data_type())
-        }
-        (DataType::List(_), DataType::Struct(sig_fields)) if sig_fields.len() == 1 => {
-            is_compatible_signature_type(expected, sig_fields[0].data_type())
-        }
-        (DataType::Struct(expected_fields), DataType::List(_)) if expected_fields.len() == 1 => {
-            is_compatible_signature_type(expected_fields[0].data_type(), sig_type)
-        }
-        (DataType::Struct(expected_fields), DataType::Struct(sig_fields)) => {
-            if expected_fields.len() != sig_fields.len() {
-                return false;
-            }
-            expected_fields
-                .iter()
-                .zip(sig_fields.iter())
-                .all(|(expected, sig)| {
-                    is_compatible_signature_type(expected.data_type(), sig.data_type())
-                })
-        }
-        _ => expected == sig_type,
-    }
-}
-
 fn apply_type_signature(
     spec: AggSpec,
     func: &AggFunction,
@@ -90,7 +58,13 @@ fn apply_type_signature(
         output_type,
         sig.intermediate_type.as_ref(),
     )?;
-    if !is_compatible_signature_type(&out.output_type, output_type) {
+    if relate(
+        &out.output_type,
+        output_type,
+        CompatibilityPolicy::SameScaleWiden,
+    )
+    .is_err()
+    {
         return Err(format!(
             "aggregate output type signature mismatch for {}: expected {:?}, got {:?}",
             func.name, out.output_type, output_type
@@ -100,7 +74,13 @@ fn apply_type_signature(
 
     let _ = input_is_intermediate;
     if let Some(intermediate_type) = sig.intermediate_type.as_ref() {
-        if !is_compatible_signature_type(&out.intermediate_type, intermediate_type) {
+        if relate(
+            &out.intermediate_type,
+            intermediate_type,
+            CompatibilityPolicy::SameScaleWiden,
+        )
+        .is_err()
+        {
             return Err(format!(
                 "aggregate intermediate type signature mismatch for {}: expected {:?}, got {:?}",
                 func.name, out.intermediate_type, intermediate_type

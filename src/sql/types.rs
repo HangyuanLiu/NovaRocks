@@ -52,6 +52,40 @@ pub(crate) fn decimal_arithmetic_result_type(p1: u8, s1: i8, p2: u8, s2: i8, op:
     DataType::Decimal128(precision, scale)
 }
 
+/// Canonical decimal output type for the decimal-preserving aggregates — the
+/// single source of truth (pillar P2) shared by the analyzer, the standalone
+/// codegen, and the runtime agg spec builders, so the same logical aggregate
+/// slot carries an identical descriptor in every fragment by construction.
+///
+/// Returns `None` for non-decimal inputs and for aggregates that do not
+/// canonicalize a decimal result, so callers keep their existing non-decimal
+/// arms. `Decimal256` is intentionally out of scope: the analyzer canonicalizes
+/// only `Decimal128`, and callers retain their own `Decimal256` arms.
+pub(crate) fn canonical_agg_decimal_type(agg_name: &str, input: &DataType) -> Option<DataType> {
+    let scale = match input {
+        DataType::Decimal128(_, s) => *s,
+        _ => return None,
+    };
+    let out_scale = match agg_name {
+        "sum" | "multi_distinct_sum" => scale,
+        "avg" => avg_decimal_scale(scale),
+        _ => return None,
+    };
+    Some(DataType::Decimal128(38, out_scale))
+}
+
+/// AVG over a decimal is computed as `sum / count`; the StarRocks division scale
+/// rule sets the result scale from the input scale.
+fn avg_decimal_scale(scale: i8) -> i8 {
+    if scale <= 6 {
+        scale + 6
+    } else if scale <= 12 {
+        12
+    } else {
+        scale
+    }
+}
+
 /// Determine the result type for binary arithmetic operations (default: add/sub rules).
 #[allow(dead_code)] // used by legacy ExprCompiler methods, keeping for type-system completeness
 pub(crate) fn arithmetic_result_type(left: &DataType, right: &DataType) -> DataType {
@@ -396,5 +430,50 @@ mod tests {
         };
         assert_eq!(fields[0].data_type(), &DataType::Int64);
         assert_eq!(fields[1].data_type(), &DataType::Int64);
+    }
+
+    #[test]
+    fn canonical_agg_decimal_sum_widens_precision_keeps_scale() {
+        assert_eq!(
+            canonical_agg_decimal_type("sum", &DataType::Decimal128(20, 2)),
+            Some(DataType::Decimal128(38, 2))
+        );
+        assert_eq!(
+            canonical_agg_decimal_type("multi_distinct_sum", &DataType::Decimal128(20, 2)),
+            Some(DataType::Decimal128(38, 2))
+        );
+    }
+
+    #[test]
+    fn canonical_agg_decimal_avg_applies_division_scale_rule() {
+        // s <= 6  => s + 6
+        assert_eq!(
+            canonical_agg_decimal_type("avg", &DataType::Decimal128(10, 3)),
+            Some(DataType::Decimal128(38, 9))
+        );
+        // s <= 12 => 12
+        assert_eq!(
+            canonical_agg_decimal_type("avg", &DataType::Decimal128(20, 10)),
+            Some(DataType::Decimal128(38, 12))
+        );
+        // else    => s
+        assert_eq!(
+            canonical_agg_decimal_type("avg", &DataType::Decimal128(38, 13)),
+            Some(DataType::Decimal128(38, 13))
+        );
+    }
+
+    #[test]
+    fn canonical_agg_decimal_none_for_non_decimal_or_other_agg() {
+        assert_eq!(canonical_agg_decimal_type("sum", &DataType::Int64), None);
+        assert_eq!(
+            canonical_agg_decimal_type("min", &DataType::Decimal128(10, 2)),
+            None
+        );
+        // Decimal256 is out of scope for canonicalization.
+        assert_eq!(
+            canonical_agg_decimal_type("sum", &DataType::Decimal256(40, 2)),
+            None
+        );
     }
 }
