@@ -7,6 +7,8 @@
 mod apply_exception;
 mod apply_to_window;
 mod decorrelate_util;
+mod existential_apply_to_join;
+mod predicate_apply_util;
 mod push_down_apply_agg_filter;
 mod push_down_apply_filter;
 mod scalar_apply_to_join;
@@ -14,6 +16,8 @@ mod win_magic_util;
 
 pub(crate) use apply_exception::ApplyException;
 pub(crate) use apply_to_window::ApplyToWindow;
+#[allow(unused_imports)]
+pub(crate) use existential_apply_to_join::ExistentialApplyToJoin;
 pub(crate) use push_down_apply_agg_filter::PushDownApplyAggFilter;
 pub(crate) use push_down_apply_filter::PushDownApplyFilter;
 pub(crate) use scalar_apply_to_join::ScalarApplyToJoin;
