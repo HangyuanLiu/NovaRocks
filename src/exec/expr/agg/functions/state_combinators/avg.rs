@@ -178,6 +178,7 @@ mod tests {
                 output_type: Some(DataType::Binary),
                 input_arg_type: None,
             }),
+            ..Default::default()
         }
     }
 
@@ -207,6 +208,7 @@ mod tests {
                 output_type: Some(output_type),
                 input_arg_type,
             }),
+            ..Default::default()
         }
     }
 

@@ -1327,6 +1327,7 @@ mod tests {
                 output_type: Some(DataType::Utf8),
                 input_arg_type: Some(DataType::Int64),
             }),
+            ..Default::default()
         };
 
         let spec = HistogramAgg
@@ -1373,6 +1374,7 @@ mod tests {
                 output_type: Some(DataType::Utf8),
                 input_arg_type: Some(DataType::Int64),
             }),
+            ..Default::default()
         };
 
         let spec = HistogramHllNdvAgg
@@ -1408,6 +1410,7 @@ mod tests {
                 output_type: Some(DataType::Utf8),
                 input_arg_type: Some(DataType::Int64),
             }),
+            ..Default::default()
         };
         let input_type = DataType::Struct(Fields::from(vec![
             Field::new("f0", DataType::Int64, true),
@@ -1494,6 +1497,7 @@ mod tests {
                 output_type: Some(DataType::Utf8),
                 input_arg_type: Some(DataType::Int64),
             }),
+            ..Default::default()
         };
         let raw_input_type = DataType::Struct(Fields::from(vec![
             Field::new("f0", DataType::Int64, true),

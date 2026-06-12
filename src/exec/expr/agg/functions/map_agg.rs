@@ -344,6 +344,7 @@ mod tests {
                 output_type: Some(map_type_i64_i64()),
                 input_arg_type: None,
             }),
+            ..Default::default()
         };
         let input_type = DataType::Struct(arrow::datatypes::Fields::from(vec![
             Arc::new(Field::new("k", DataType::Int64, true)),
@@ -367,6 +368,7 @@ mod tests {
                 output_type: Some(map_type_i64_i64()),
                 input_arg_type: None,
             }),
+            ..Default::default()
         };
         let input_type = DataType::Struct(arrow::datatypes::Fields::from(vec![
             Arc::new(Field::new("k", DataType::Int64, true)),
@@ -427,6 +429,7 @@ mod tests {
                 output_type: Some(map_type_i64_i64()),
                 input_arg_type: None,
             }),
+            ..Default::default()
         };
         let spec = MapAggAgg
             .build_spec_from_type(&func, Some(&map_type_i64_i64()), true)

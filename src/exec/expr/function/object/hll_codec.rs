@@ -97,6 +97,7 @@ pub fn eval_hll_cardinality(
                 output_type: Some(arrow::datatypes::DataType::Int64),
                 input_arg_type: Some(input.data_type().clone()),
             }),
+            ..Default::default()
         }],
         &[Some(input.data_type().clone())],
     )?;

@@ -29,7 +29,25 @@ pub struct AggTypeSignature {
     pub input_arg_type: Option<DataType>,
 }
 
-#[derive(Clone, Debug)]
+/// Structured ORDER BY / DISTINCT metadata for ordered aggregates
+/// (array_agg / group_concat). Replaces the former function-name string encoding
+/// (e.g. `array_agg|a=1,0|n=0,1`, `group_concat|d=1|a=..|n=..|m=1024`). Default
+/// (empty / false / None) means no ORDER BY and not DISTINCT — the common case.
+/// array_agg's DISTINCT stays folded into the base name `array_agg_distinct`;
+/// `is_distinct` here carries group_concat's DISTINCT.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AggOrderSpec {
+    /// ORDER BY direction per sort key (true = ASC).
+    pub is_asc_order: Vec<bool>,
+    /// NULLS FIRST per sort key (true = NULLS FIRST).
+    pub nulls_first: Vec<bool>,
+    /// group_concat DISTINCT (array_agg uses the `array_agg_distinct` base name).
+    pub is_distinct: bool,
+    /// group_concat max output length (group_concat_max_len); None otherwise.
+    pub group_concat_max_len: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct AggFunction {
     /// Lowercased function name from FE (e.g. "sum", "count").
     pub name: String,
@@ -39,6 +57,9 @@ pub struct AggFunction {
     /// This corresponds to StarRocks FE's `is_merge_agg`.
     pub input_is_intermediate: bool,
     pub types: Option<AggTypeSignature>,
+    /// ORDER BY / DISTINCT metadata for ordered aggregates (array_agg / group_concat).
+    /// Replaces the former function-name string encoding.
+    pub order: AggOrderSpec,
 }
 
 /// Spec for a TopN runtime filter built by the AGG operator.

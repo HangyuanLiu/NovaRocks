@@ -165,6 +165,7 @@ mod tests {
                 output_type: Some(DataType::Int64),
                 input_arg_type: Some(DataType::Int64),
             }),
+            ..Default::default()
         };
         let spec = AnyValueAgg
             .build_spec_from_type(&func, Some(&DataType::Int64), false)
@@ -184,6 +185,7 @@ mod tests {
                 output_type: Some(DataType::Int64),
                 input_arg_type: Some(DataType::Int64),
             }),
+            ..Default::default()
         };
         let spec = AnyValueAgg
             .build_spec_from_type(&func, Some(&DataType::Int64), false)

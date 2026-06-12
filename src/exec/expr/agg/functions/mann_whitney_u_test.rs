@@ -605,6 +605,7 @@ mod tests {
                 output_type: Some(DataType::Utf8),
                 input_arg_type: Some(DataType::Float64),
             }),
+            ..Default::default()
         };
 
         let spec = MannWhitneyUTestAgg
@@ -656,6 +657,7 @@ mod tests {
                 output_type: Some(DataType::Utf8),
                 input_arg_type: Some(DataType::Float64),
             }),
+            ..Default::default()
         };
 
         let spec = MannWhitneyUTestAgg

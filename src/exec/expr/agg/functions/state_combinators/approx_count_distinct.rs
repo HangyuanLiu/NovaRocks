@@ -29,6 +29,7 @@ mod tests {
                 output_type: Some(DataType::Binary),
                 input_arg_type,
             }),
+            ..Default::default()
         }
     }
 

@@ -803,6 +803,7 @@ mod tests {
                 output_type: Some(DataType::Int32),
                 input_arg_type: Some(DataType::Int64),
             }),
+            ..Default::default()
         };
 
         let spec = WindowFunnelAgg
