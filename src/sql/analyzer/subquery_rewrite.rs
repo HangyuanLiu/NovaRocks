@@ -2068,6 +2068,7 @@ impl<'a> AnalyzerContext<'a> {
             distinct,
             repeat: None,
             apply_specs: Vec::new(),
+            predicate_apply_specs: Vec::new(),
         };
 
         // Rewrite nested subqueries within this SELECT if any were collected

@@ -576,6 +576,7 @@ impl<'a> AnalyzerContext<'a> {
             distinct,
             repeat: None,
             apply_specs: Vec::new(),
+            predicate_apply_specs: Vec::new(),
         };
 
         // --- Subquery rewriting ---
