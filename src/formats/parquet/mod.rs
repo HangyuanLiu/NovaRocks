@@ -47,7 +47,8 @@ use std::sync::Arc;
 
 use crate::cache::{CachedRangeReader, DataCacheContext};
 use crate::common::config;
-use crate::exec::chunk::{Chunk, ChunkSchemaRef};
+use crate::common::ids::SlotId;
+use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::cast_with_special_rules;
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::RuntimeFilterContext;
@@ -64,6 +65,7 @@ pub(crate) use reader::ParquetCachedReader;
 use row_group_selector::select_row_groups_for_range;
 use variant_read::{
     collapse_variant_struct_to_largebinary, convert_variant_columns, is_variant_struct_data_type,
+    materialize_variant_path_columns,
 };
 
 static PARQUET_COALESCE_CONTROLLER: AdaptiveCoalesceController = AdaptiveCoalesceController::new();
@@ -196,6 +198,20 @@ fn runtime_filters_to_min_max_predicates(
 }
 
 #[derive(Clone, Debug)]
+pub struct VariantPathSpec {
+    pub source_slot_id: SlotId,
+    pub source_read_slot_id: SlotId,
+    pub output_slot_id: SlotId,
+    pub source_name: String,
+    pub output_name: String,
+    pub source_field: Field,
+    pub output_field: Field,
+    pub canonical_path: String,
+    pub requested_type: DataType,
+    pub strict: bool,
+}
+
+#[derive(Clone, Debug)]
 pub struct ParquetScanConfig {
     pub columns: Vec<String>,
     pub chunk_schema: ChunkSchemaRef,
@@ -208,10 +224,80 @@ pub struct ParquetScanConfig {
     pub cache_policy: ParquetReadCachePolicy,
     pub profile_label: Option<String>,
     pub iceberg_output_schema: Option<SchemaRef>,
+    pub variant_path_columns: Vec<VariantPathSpec>,
     /// Per-slot global dictionary encode maps. Non-empty only for dict-encoded
     /// scans. When set, the iterator reads the dict columns as Utf8 and maps
     /// them to Int32 dict ids.
     pub query_global_dicts: crate::exec::dict_encode::QueryGlobalDictEncodeMap,
+}
+
+fn materialized_variant_path_schema_and_slot_types(
+    cfg: &ParquetScanConfig,
+) -> Result<(ChunkSchemaRef, Vec<types::TPrimitiveType>), String> {
+    if cfg.variant_path_columns.is_empty() {
+        return Ok((cfg.chunk_schema.clone(), cfg.slot_types.clone()));
+    }
+    if cfg.chunk_schema.slot_ids().len() != cfg.slot_types.len() {
+        return Err(format!(
+            "variant path scan schema/slot_types mismatch: slots={} slot_types={}",
+            cfg.chunk_schema.slot_ids().len(),
+            cfg.slot_types.len()
+        ));
+    }
+
+    let hidden_source_reads = cfg
+        .variant_path_columns
+        .iter()
+        .filter_map(|spec| {
+            (spec.source_read_slot_id != spec.source_slot_id).then_some(spec.source_read_slot_id)
+        })
+        .collect::<HashSet<_>>();
+
+    let slot_type_by_id = cfg
+        .chunk_schema
+        .slot_ids()
+        .iter()
+        .copied()
+        .zip(cfg.slot_types.iter().copied())
+        .collect::<HashMap<_, _>>();
+    let mut materialized_slots = Vec::new();
+    let mut materialized_slot_types = Vec::new();
+    let mut seen = HashSet::new();
+
+    for slot in cfg.chunk_schema.slots() {
+        let slot_id = slot.slot_id();
+        if hidden_source_reads.contains(&slot_id) {
+            continue;
+        }
+        seen.insert(slot_id);
+        materialized_slots.push(slot.clone());
+        materialized_slot_types.push(
+            *slot_type_by_id
+                .get(&slot_id)
+                .unwrap_or(&types::TPrimitiveType::INVALID_TYPE),
+        );
+    }
+
+    for spec in &cfg.variant_path_columns {
+        if !seen.insert(spec.output_slot_id) {
+            return Err(format!(
+                "duplicate variant path materialized output_slot_id={}",
+                spec.output_slot_id
+            ));
+        }
+        materialized_slots.push(ChunkSlotSchema::try_new_with_field(
+            spec.output_slot_id,
+            spec.output_field.clone(),
+            None,
+            None,
+        )?);
+        materialized_slot_types.push(types::TPrimitiveType::INVALID_TYPE);
+    }
+
+    Ok((
+        Arc::new(ChunkSchema::try_new(materialized_slots)?),
+        materialized_slot_types,
+    ))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -353,6 +439,8 @@ struct ParquetScanIter {
     profile: Option<RuntimeProfile>,
     runtime_filters: Option<RuntimeFilterContext>,
     scan_read_chunk_schema: ChunkSchemaRef,
+    materialized_chunk_schema: ChunkSchemaRef,
+    materialized_slot_types: Vec<types::TPrimitiveType>,
     has_dict_encoded_output: bool,
 }
 
@@ -487,25 +575,27 @@ impl ParquetScanIter {
         runtime_filters: Option<RuntimeFilterContext>,
     ) -> Result<Self, String> {
         let remaining = limit.unwrap_or(usize::MAX);
+        let (materialized_chunk_schema, materialized_slot_types) =
+            materialized_variant_path_schema_and_slot_types(&cfg)?;
         let (scan_read_chunk_schema, has_dict_encoded_output) = if cfg.query_global_dicts.is_empty()
         {
-            (cfg.chunk_schema.clone(), false)
+            (materialized_chunk_schema.clone(), false)
         } else {
-            let out_arrow = cfg.chunk_schema.arrow_schema_ref();
+            let out_arrow = materialized_chunk_schema.arrow_schema_ref();
             let (scan_arrow, has_dict) =
                 crate::exec::dict_encode::build_scan_schema_for_global_dict_encoding(
                     &out_arrow,
-                    &cfg.chunk_schema,
+                    &materialized_chunk_schema,
                     &cfg.query_global_dicts,
                 )?;
             if has_dict {
                 let scan_chunk = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
                     scan_arrow.as_ref(),
-                    cfg.chunk_schema.slot_ids(),
+                    materialized_chunk_schema.slot_ids(),
                 )?;
                 (scan_chunk, true)
             } else {
-                (cfg.chunk_schema.clone(), false)
+                (materialized_chunk_schema.clone(), false)
             }
         };
         Ok(Self {
@@ -519,6 +609,8 @@ impl ParquetScanIter {
             profile,
             runtime_filters,
             scan_read_chunk_schema,
+            materialized_chunk_schema,
+            materialized_slot_types,
             has_dict_encoded_output,
         })
     }
@@ -1012,7 +1104,15 @@ impl Iterator for ParquetScanIter {
                         continue;
                     }
                     let batch = match reorder_batch(&self.cfg, batch)
-                        .and_then(|b| convert_variant_columns(&self.cfg.slot_types, b))
+                        .and_then(|b| {
+                            materialize_variant_path_columns(
+                                b,
+                                self.cfg.chunk_schema.slot_ids(),
+                                self.scan_read_chunk_schema.slot_ids(),
+                                &self.cfg.variant_path_columns,
+                            )
+                        })
+                        .and_then(|b| convert_variant_columns(&self.materialized_slot_types, b))
                         .and_then(|b| {
                             normalize_batch_to_chunk_schema(b, &self.scan_read_chunk_schema)
                         })
@@ -1020,8 +1120,8 @@ impl Iterator for ParquetScanIter {
                             if self.has_dict_encoded_output {
                                 crate::exec::dict_encode::encode_batch_with_query_global_dicts(
                                     b,
-                                    &self.cfg.chunk_schema.arrow_schema_ref(),
-                                    &self.cfg.chunk_schema,
+                                    &self.materialized_chunk_schema.arrow_schema_ref(),
+                                    &self.materialized_chunk_schema,
                                     &self.cfg.query_global_dicts,
                                 )
                             } else {
@@ -1051,7 +1151,7 @@ impl Iterator for ParquetScanIter {
                             clamp_u128_to_i64(to_take as u128),
                         );
                     }
-                    let chunk_schema = match self.cfg.chunk_schema.with_fields_in_order(
+                    let chunk_schema = match self.materialized_chunk_schema.with_fields_in_order(
                         batch
                             .schema()
                             .fields()
@@ -2097,6 +2197,7 @@ mod tests {
             cache_policy: ParquetReadCachePolicy::with_flags(false, false, None),
             profile_label: None,
             iceberg_output_schema: iceberg_output_schema.map(Arc::new),
+            variant_path_columns: Vec::new(),
             query_global_dicts: Default::default(),
         }
     }
