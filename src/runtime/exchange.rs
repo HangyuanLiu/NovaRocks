@@ -28,7 +28,7 @@ use arrow::record_batch::RecordBatch;
 
 use crate::common::ids::SlotId;
 use crate::common::types::format_uuid;
-use crate::exec::chunk::type_relation::{merge_fields_nullability, retag_column};
+use crate::exec::chunk::type_relation::retag_column;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::lower::type_lowering::arrow_type_from_desc;
@@ -103,86 +103,6 @@ fn is_key_canceled(key: &ExchangeKey) -> bool {
     guard.contains_key(key)
 }
 
-fn merge_exchange_field_type(
-    expected: &arrow::datatypes::DataType,
-    actual: &arrow::datatypes::DataType,
-) -> Result<arrow::datatypes::DataType, String> {
-    use arrow::datatypes::DataType;
-
-    if expected == actual {
-        return Ok(expected.clone());
-    }
-
-    match (expected, actual) {
-        (DataType::Decimal128(_, _), DataType::Decimal128(_, _))
-        | (DataType::Decimal256(_, _), DataType::Decimal256(_, _))
-        | (DataType::Timestamp(_, _), DataType::Timestamp(_, _))
-        | (DataType::Utf8, DataType::Binary)
-        | (DataType::Binary, DataType::Utf8) => Ok(actual.clone()),
-        (DataType::List(expected_field), DataType::List(actual_field)) => Ok(DataType::List(
-            merge_exchange_field(expected_field, actual_field)?,
-        )),
-        (
-            DataType::Map(expected_field, expected_ordered),
-            DataType::Map(actual_field, actual_ordered),
-        ) if expected_ordered == actual_ordered => Ok(DataType::Map(
-            merge_exchange_field(expected_field, actual_field)?,
-            *expected_ordered,
-        )),
-        (DataType::Struct(expected_fields), DataType::Struct(actual_fields))
-            if expected_fields.len() == actual_fields.len() =>
-        {
-            let fields = expected_fields
-                .iter()
-                .zip(actual_fields.iter())
-                .map(|(expected_field, actual_field)| {
-                    merge_exchange_field(expected_field, actual_field)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(DataType::Struct(fields.into()))
-        }
-        _ => Err(format!(
-            "exchange schema merge type mismatch: expected {:?}, got {:?}",
-            expected, actual
-        )),
-    }
-}
-
-fn merge_exchange_field(
-    expected: &Arc<arrow::datatypes::Field>,
-    actual: &Arc<arrow::datatypes::Field>,
-) -> Result<Arc<arrow::datatypes::Field>, String> {
-    let data_type = merge_exchange_field_type(expected.data_type(), actual.data_type())?;
-    let nullable = merge_fields_nullability(expected, actual);
-    if &data_type == expected.data_type() && nullable == expected.is_nullable() {
-        Ok(expected.clone())
-    } else {
-        Ok(Arc::new(
-            arrow::datatypes::Field::new(expected.name(), data_type, nullable)
-                .with_metadata(expected.metadata().clone()),
-        ))
-    }
-}
-
-fn exchange_field_from_array(
-    field: &Arc<arrow::datatypes::Field>,
-    array: &ArrayRef,
-) -> Arc<arrow::datatypes::Field> {
-    // The sender writes its own (operator-assigned) types verbatim — it does
-    // NOT widen decimal precision. Type authority belongs to the RECEIVER, which
-    // materializes each decoded column to its registered descriptor type
-    // (see `materialize_chunk_for_wire_meta`). This is the descriptor-authoritative
-    // exchange model (pillar P3): no sender-side widening.
-    Arc::new(
-        arrow::datatypes::Field::new(
-            field.name(),
-            array.data_type().clone(),
-            field.is_nullable() || array.null_count() > 0,
-        )
-        .with_metadata(field.metadata().clone()),
-    )
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ExchangeWireMeta {
     slot_ids_by_index: Vec<SlotId>,
@@ -208,7 +128,7 @@ impl ExchangeWireMeta {
                 .collect::<Vec<_>>();
             if slot_ids != slot_ids_by_index {
                 return Err(format!(
-                    "exchange wire slot id mismatch at chunk index {}: expected={:?} actual={:?}",
+                    "exchange encode schema mismatch at chunk index {}: wire slot id mismatch expected={:?} actual={:?}",
                     idx, slot_ids_by_index, slot_ids
                 ));
             }
@@ -402,7 +322,7 @@ fn retag_queued_chunks_for_expected_schema(
         };
         let (batch, chunk_schema) =
             materialize_chunk_for_wire_meta(Some(expected_chunk_schema), &chunk.batch, &wire_meta)?;
-        let mut retagged = Chunk::try_new_with_chunk_schema(batch, chunk_schema).map_err(|e| {
+        let mut retagged = chunk_from_exchange_batch(batch, chunk_schema).map_err(|e| {
             format!(
                 "retag queued exchange chunk for late expected schema failed: {}",
                 e
@@ -1001,84 +921,18 @@ fn decode_exchange_payload_envelope(bytes: &[u8]) -> Result<DecodedExchangePaylo
     })
 }
 
-fn exchange_schema_compatible(expected: &Chunk, actual: &Chunk) -> Result<bool, String> {
-    if expected.schema().fields().len() != actual.schema().fields().len() {
-        return Ok(false);
-    }
-    if expected.chunk_schema().slots().len() != actual.chunk_schema().slots().len() {
-        return Ok(false);
-    }
-
-    for ((expected_field, actual_field), (expected_slot, actual_slot)) in expected
-        .schema()
-        .fields()
-        .iter()
-        .zip(actual.schema().fields().iter())
-        .zip(
-            expected
-                .chunk_schema()
-                .slots()
-                .iter()
-                .zip(actual.chunk_schema().slots().iter()),
-        )
-    {
-        if expected_slot.slot_id() != actual_slot.slot_id()
-            || expected_field.data_type() != actual_field.data_type()
-        {
-            return Ok(false);
-        }
-    }
-
-    Ok(true)
-}
-
-fn merged_exchange_schema(chunks: &[Chunk]) -> Result<SchemaRef, String> {
+fn exchange_wire_schema_from_first_chunk(chunks: &[Chunk]) -> Result<SchemaRef, String> {
     let first = chunks
         .first()
         .ok_or_else(|| "exchange chunks must not be empty".to_string())?;
-    let mut fields = first
-        .schema()
-        .fields()
-        .iter()
-        .zip(first.batch.columns().iter())
-        .map(|(field, array)| exchange_field_from_array(field, array))
-        .collect::<Vec<_>>();
-
-    for (chunk_idx, chunk) in chunks.iter().enumerate().skip(1) {
-        if !exchange_schema_compatible(first, chunk)? {
-            return Err(format!(
-                "exchange encode schema mismatch at chunk index {}: expected={:?} actual={:?}",
-                chunk_idx,
-                first.schema(),
-                chunk.schema()
-            ));
-        }
-        for (field_idx, (actual_field, actual_array)) in chunk
-            .schema()
-            .fields()
-            .iter()
-            .zip(chunk.batch.columns().iter())
-            .enumerate()
-        {
-            let merged = fields.get_mut(field_idx).ok_or_else(|| {
-                format!(
-                    "exchange merged schema missing field {} for chunk index {}",
-                    field_idx, chunk_idx
-                )
-            })?;
-            let actual_field = exchange_field_from_array(actual_field, actual_array);
-            *merged = merge_exchange_field(merged, &actual_field)?;
-        }
-    }
-
-    Ok(Arc::new(Schema::new(fields)))
+    Ok(first.chunk_schema().arrow_schema_ref())
 }
 
 fn normalize_exchange_array_for_field(
     array: &ArrayRef,
     field: &arrow::datatypes::Field,
 ) -> Result<ArrayRef, String> {
-    // Metadata-only retag of the column to the merged wire schema's type, via
+    // Metadata-only retag of the column to the wire contract schema's type, via
     // the single type-relation primitive (same-scale decimal / utf8<->binary /
     // recursive). Replaces the exchange-local decimal retag helpers.
     retag_column(array, field.data_type()).map_err(|m| {
@@ -1126,7 +980,7 @@ fn encode_arrow_ipc_chunks(chunks: &[Chunk]) -> Result<Vec<u8>, String> {
     }
 
     let mut buffer = Vec::new();
-    let schema = merged_exchange_schema(chunks)?;
+    let schema = exchange_wire_schema_from_first_chunk(chunks)?;
     let mut batches = Vec::with_capacity(chunks.len());
     let writer_schema = if schema.fields().is_empty() {
         for chunk in chunks {
@@ -1215,6 +1069,18 @@ fn restore_zero_column_batch_if_needed(
         .map_err(|e| e.to_string())
 }
 
+fn chunk_from_exchange_batch(
+    batch: RecordBatch,
+    chunk_schema: ChunkSchemaRef,
+) -> Result<Chunk, String> {
+    if batch.num_columns() == 0 && chunk_schema.slots().is_empty() {
+        let mut chunk = Chunk::default();
+        chunk.batch = batch;
+        return Ok(chunk);
+    }
+    Chunk::try_new_with_chunk_schema(batch, chunk_schema)
+}
+
 /// Descriptor-authoritative decode (pillar P3): the RECEIVER is the type
 /// authority. Each decoded column is materialized (metadata-only retag) to the
 /// Arrow type derived from the receiver's registered descriptor, so downstream
@@ -1241,6 +1107,13 @@ fn materialize_chunk_for_wire_meta(
         )?;
         return Ok((batch.clone(), chunk_schema));
     };
+    if wire_meta.slot_ids_by_index.len() != expected_chunk_schema.slots().len() {
+        return Err(format!(
+            "exchange expected schema column count mismatch: wire_columns={} expected_columns={}",
+            wire_meta.slot_ids_by_index.len(),
+            expected_chunk_schema.slots().len()
+        ));
+    }
     let batch_schema = batch.schema();
 
     // Check whether wire slot IDs match the expected schema. If not (e.g. CTE
@@ -1287,46 +1160,25 @@ fn materialize_chunk_for_wire_meta(
             && let Some(expected_arrow_type) = arrow_type_from_desc(type_desc)
             && field.data_type() != &expected_arrow_type
         {
-            // PARTITION-TOP-N opaque-binary passthrough: a numeric column may
-            // legitimately flow where an avg/hll/percentile VARBINARY intermediate
-            // slot is declared (the analytic window operator accepts numeric inputs
-            // for these functions). Leave it un-materialized — gated on pillar P5
-            // making the pre-agg state TTypeDesc deterministic.
-            use arrow::datatypes::DataType;
-            let is_opaque_binary_expected = matches!(
-                expected_arrow_type,
-                DataType::Binary | DataType::LargeBinary
-            );
-            let is_numeric_actual = matches!(
-                field.data_type(),
-                DataType::Int8
-                    | DataType::Int16
-                    | DataType::Int32
-                    | DataType::Int64
-                    | DataType::Float32
-                    | DataType::Float64
-            );
-            if is_opaque_binary_expected && is_numeric_actual {
-                // passthrough: keep the wire column and field as-is
-            } else {
-                // Receiver is the type authority: materialize the decoded column
-                // to the registered descriptor type (metadata-only retag).
-                out_column =
-                    crate::exec::chunk::type_relation::retag_column(batch.column(idx), &expected_arrow_type)
-                        .map_err(|m| {
-                            format!(
-                                "exchange decoded arrow type mismatch at index {} for slot {}: batch={:?} expected={:?} ({:?})",
-                                idx, slot_id, field.data_type(), expected_arrow_type, m.kind
-                            )
-                        })?;
-                out_field = arrow::datatypes::Field::new(
-                    field.name(),
-                    expected_arrow_type,
-                    field.is_nullable(),
+            // Receiver is the type authority: materialize the decoded column
+            // to the registered descriptor type (metadata-only retag).
+            out_column = crate::exec::chunk::type_relation::retag_column(
+                batch.column(idx),
+                &expected_arrow_type,
+            )
+            .map_err(|m| {
+                format!(
+                    "exchange decoded arrow type mismatch at index {} for slot {}: batch={:?} expected={:?} ({:?})",
+                    idx, slot_id, field.data_type(), expected_arrow_type, m.kind
                 )
-                .with_metadata(field.metadata().clone());
-                any_materialized = true;
-            }
+            })?;
+            out_field = arrow::datatypes::Field::new(
+                field.name(),
+                expected_arrow_type,
+                field.is_nullable(),
+            )
+            .with_metadata(field.metadata().clone());
+            any_materialized = true;
         }
 
         // Use the expected schema's slot ID (not the wire ID) so the decoded
@@ -1404,7 +1256,7 @@ pub fn decode_chunks(bytes: &[u8]) -> Result<Vec<Chunk>, String> {
             batch.schema().as_ref(),
             &wire_meta.slot_ids_by_index,
         )?;
-        chunks.push(Chunk::try_new_with_chunk_schema(batch, chunk_schema)?);
+        chunks.push(chunk_from_exchange_batch(batch, chunk_schema)?);
     }
     Ok(chunks)
 }
@@ -1473,14 +1325,16 @@ pub fn decode_chunks_for_sender(
         let batch = restore_zero_column_batch_if_needed(batch, &wire_meta)?;
         let (batch, chunk_schema) =
             materialize_chunk_for_wire_meta(expected_chunk_schema.as_ref(), &batch, &wire_meta)?;
-        chunks.push(Chunk::try_new_with_chunk_schema(batch, chunk_schema)?);
+        chunks.push(chunk_from_exchange_batch(batch, chunk_schema)?);
     }
     Ok(chunks)
 }
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::{Array, ArrayRef, Decimal128Array, Int32Array, StringArray, make_array};
+    use arrow::array::{
+        Array, ArrayRef, Decimal128Array, Int32Array, Int64Array, StringArray, make_array,
+    };
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use arrow::record_batch::RecordBatchOptions;
@@ -1543,7 +1397,9 @@ mod tests {
         let options = RecordBatchOptions::new().with_row_count(Some(row_count));
         let batch = RecordBatch::try_new_with_options(Arc::new(Schema::empty()), vec![], &options)
             .expect("empty batch");
-        Chunk::new_with_chunk_schema(batch, Arc::new(crate::exec::chunk::ChunkSchema::empty()))
+        let mut chunk = Chunk::default();
+        chunk.batch = batch;
+        chunk
     }
 
     fn decimal128_chunk_with_over_precision_value(value: i128) -> Chunk {
@@ -1800,6 +1656,40 @@ mod tests {
     }
 
     #[test]
+    fn decode_chunks_for_sender_rejects_partial_expected_schema_match() {
+        let key = ExchangeKey {
+            finst_id_hi: 1099,
+            finst_id_lo: 1100,
+            node_id: 77,
+        };
+        let expected_chunk_schema = exchange_test_chunk("_cse_0").chunk_schema_ref();
+        register_expected_chunk_schema(key, 1, expected_chunk_schema).expect("register schema");
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v1", DataType::Int32, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![Some(1)])) as ArrayRef],
+        )
+        .expect("record batch");
+        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(33)],
+        )
+        .expect("chunk schema");
+        let payload = encode_chunks(&[Chunk::new_with_chunk_schema(batch, chunk_schema)], true)
+            .expect("encode");
+
+        let err = decode_chunks_for_sender(key, 3, 1, &payload)
+            .expect_err("partial wire schema must not match registered expected schema");
+        assert!(
+            err.contains("exchange expected schema column count mismatch"),
+            "err={err}"
+        );
+
+        cancel_exchange_key(key);
+    }
+
+    #[test]
     fn decode_chunks_for_sender_accepts_runtime_nullable_widening() {
         let key = ExchangeKey {
             finst_id_hi: 199,
@@ -1840,6 +1730,58 @@ mod tests {
         assert_eq!(decoded.len(), 1);
         assert!(decoded[0].schema().field(3).is_nullable());
         assert!(decoded[0].chunk_schema().slots()[3].nullable());
+
+        cancel_exchange_key(key);
+    }
+
+    #[test]
+    fn decode_chunks_for_sender_rejects_numeric_for_opaque_descriptor() {
+        use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
+        use crate::lower::type_lowering::scalar_type_desc;
+        use crate::types::TPrimitiveType;
+
+        let key = ExchangeKey {
+            finst_id_hi: 501,
+            finst_id_lo: 502,
+            node_id: 31,
+        };
+
+        let wire_schema = Arc::new(Schema::new(vec![Field::new(
+            "__opaque_state",
+            DataType::Int64,
+            true,
+        )]));
+        let wire_batch = RecordBatch::try_new(
+            wire_schema,
+            vec![Arc::new(Int64Array::from(vec![Some(7_i64)])) as ArrayRef],
+        )
+        .expect("wire batch");
+        let wire_chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            wire_batch.schema().as_ref(),
+            &[SlotId::new(41)],
+        )
+        .expect("wire chunk schema");
+        let wire_chunk = Chunk::new_with_chunk_schema(wire_batch, wire_chunk_schema);
+
+        let expected_schema = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new(
+                SlotId::new(41),
+                "__opaque_state",
+                true,
+                Some(scalar_type_desc(TPrimitiveType::VARBINARY)),
+                Some(41),
+            )])
+            .expect("expected chunk schema"),
+        );
+        register_expected_chunk_schema(key, 1, expected_schema).expect("register expected schema");
+
+        let payload = encode_chunks(&[wire_chunk], true).expect("encode drifted chunk");
+        let err = decode_chunks_for_sender(key, 3, 1, &payload)
+            .expect_err("numeric payload must not pass as an opaque aggregate state");
+        assert!(
+            err.contains("exchange decoded arrow type mismatch"),
+            "err={err}"
+        );
 
         cancel_exchange_key(key);
     }
@@ -1906,6 +1848,37 @@ mod tests {
             .map(|slot| slot.slot_id())
             .collect::<Vec<_>>();
         assert_eq!(actual_slots, expected_slots);
+
+        cancel_exchange_key(key);
+    }
+
+    #[test]
+    fn late_expected_schema_registration_preserves_queued_zero_column_row_count() {
+        let key = ExchangeKey {
+            finst_id_hi: 205,
+            finst_id_lo: 206,
+            node_id: 23,
+        };
+        let row_count = 3;
+        let payload = encode_chunks(&[exchange_test_zero_column_chunk(row_count)], true)
+            .expect("encode zero-column chunk");
+        let decoded = decode_chunks_for_sender(key, 7, 1, &payload).expect("decode directly");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].len(), row_count);
+        assert_eq!(decoded[0].batch.num_columns(), 0);
+        push_chunks(key, 7, 1, decoded, false);
+
+        register_expected_chunk_schema(key, 1, Arc::new(crate::exec::chunk::ChunkSchema::empty()))
+            .expect("register empty schema");
+
+        let handle = get_receiver_handle(key, 1).expect("receiver handle");
+        let Some(ExchangePopResult::Chunk(chunk)) =
+            handle.try_pop_next_with_stats(1).expect("pop queued chunk")
+        else {
+            panic!("expected queued zero-column chunk");
+        };
+        assert_eq!(chunk.len(), row_count);
+        assert_eq!(chunk.batch.num_columns(), 0);
 
         cancel_exchange_key(key);
     }

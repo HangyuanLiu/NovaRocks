@@ -444,47 +444,18 @@ fn reconcile_chunk_data_type(expected: &DataType, actual: &DataType) -> Result<D
     if expected == actual {
         return Ok(expected.clone());
     }
-
-    match (expected, actual) {
-        (DataType::Decimal128(_, _), DataType::Decimal128(_, _))
-        | (DataType::Decimal256(_, _), DataType::Decimal256(_, _))
-        | (DataType::Timestamp(_, _), DataType::Timestamp(_, _)) => Ok(actual.clone()),
-        (DataType::Utf8, DataType::Binary) | (DataType::Binary, DataType::Utf8) => {
-            Ok(actual.clone())
-        }
-        (DataType::List(expected_field), DataType::List(actual_field)) => Ok(DataType::List(
-            reconcile_chunk_field_to_field(expected_field, actual_field)?,
-        )),
-        (DataType::LargeList(expected_field), DataType::LargeList(actual_field)) => {
-            Ok(DataType::LargeList(reconcile_chunk_field_to_field(
-                expected_field,
-                actual_field,
-            )?))
-        }
-        (
-            DataType::Map(expected_field, expected_ordered),
-            DataType::Map(actual_field, actual_ordered),
-        ) if expected_ordered == actual_ordered => Ok(DataType::Map(
-            reconcile_chunk_field_to_field(expected_field, actual_field)?,
-            *expected_ordered,
-        )),
-        (DataType::Struct(expected_fields), DataType::Struct(actual_fields))
-            if expected_fields.len() == actual_fields.len() =>
-        {
-            let fields = expected_fields
-                .iter()
-                .zip(actual_fields.iter())
-                .map(|(expected_field, actual_field)| {
-                    reconcile_chunk_field_to_field(expected_field, actual_field)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(DataType::Struct(fields.into()))
-        }
-        _ => Err(format!(
+    crate::exec::chunk::type_relation::relate(
+        expected,
+        actual,
+        crate::exec::chunk::type_relation::CompatibilityPolicy::SameScaleWiden,
+    )
+    .map_err(|_| {
+        format!(
             "chunk schema type mismatch: expected {:?}, got {:?}",
             expected, actual
-        )),
-    }
+        )
+    })?;
+    Ok(expected.clone())
 }
 
 impl ChunkSchema {
@@ -658,7 +629,11 @@ pub(super) fn align_chunk_schema_to_batch(
                 expected.nullable()
             ));
         }
-        slots.push(expected.with_field_and_slot_id(expected.slot_id(), field.as_ref().clone())?);
+        let reconciled_field = reconcile_chunk_field_to_field(expected.field(), field.as_ref())?;
+        slots.push(
+            expected
+                .with_field_and_slot_id(expected.slot_id(), reconciled_field.as_ref().clone())?,
+        );
     }
     Ok(Arc::new(ChunkSchema::try_new(slots)?))
 }
@@ -698,10 +673,11 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::array::{
-        Array, ArrayRef, BinaryArray, Int8Array, Int32Array, Int64Array, MapArray, StructArray,
+        Array, ArrayRef, BinaryArray, Int8Array, Int32Array, Int64Array, MapArray, StringArray,
+        StructArray, TimestampMicrosecondArray,
     };
     use arrow::buffer::OffsetBuffer;
-    use arrow::datatypes::{DataType, Field, Fields, Schema};
+    use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
     use arrow::record_batch::RecordBatch;
 
     use super::{ChunkSchema, ChunkSlotSchema};
@@ -764,6 +740,19 @@ mod tests {
     }
 
     #[test]
+    fn try_new_with_chunk_schema_preserves_zero_column_row_count() {
+        let options = arrow::array::RecordBatchOptions::new().with_row_count(Some(3));
+        let batch = RecordBatch::try_new_with_options(Arc::new(Schema::empty()), vec![], &options)
+            .expect("zero-column record batch");
+        let chunk_schema = Arc::new(ChunkSchema::try_new(vec![]).expect("chunk schema"));
+
+        let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk");
+
+        assert_eq!(chunk.batch.num_columns(), 0);
+        assert_eq!(chunk.batch.num_rows(), 3);
+    }
+
+    #[test]
     fn align_chunk_schema_accepts_non_nullable_batch_for_nullable_contract() {
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("c13", DataType::Int8, false)])),
@@ -783,13 +772,13 @@ mod tests {
         let chunk = Chunk::try_new_with_chunk_schema(batch, contract).expect("chunk");
 
         assert!(
-            !chunk.chunk_schema().slots()[0].nullable(),
-            "aligned chunk schema should keep the actual batch field metadata"
+            chunk.chunk_schema().slots()[0].nullable(),
+            "aligned chunk schema should keep the descriptor nullability contract"
         );
     }
 
     #[test]
-    fn align_chunk_schema_to_columns_preserves_nullable_map_keys() {
+    fn align_chunk_schema_to_columns_keeps_descriptor_map_key_nullability() {
         let expected_map = DataType::Map(
             Arc::new(Field::new(
                 "entries",
@@ -837,6 +826,120 @@ mod tests {
         let DataType::Struct(entry_fields) = entries_field.data_type() else {
             panic!("expected entry struct");
         };
-        assert!(entry_fields[0].is_nullable(), "map key should be nullable");
+        assert!(
+            !entry_fields[0].is_nullable(),
+            "map key should keep descriptor nullability"
+        );
+    }
+
+    #[test]
+    fn align_chunk_schema_to_columns_keeps_descriptor_type_for_retaggable_columns() {
+        let schema = ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+            SlotId::new(9),
+            Field::new("payload", DataType::Binary, true),
+            None,
+            None,
+        )])
+        .expect("chunk schema");
+        let column = Arc::new(arrow::array::StringArray::from(vec![Some("abc")])) as ArrayRef;
+
+        let aligned =
+            super::align_chunk_schema_to_columns(&[column], &schema).expect("align schema");
+        assert_eq!(aligned.slots()[0].data_type(), &DataType::Binary);
+    }
+
+    #[test]
+    fn try_new_with_columns_retags_utf8_column_to_binary_descriptor() {
+        let chunk_schema = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                SlotId::new(9),
+                Field::new("payload", DataType::Binary, true),
+                None,
+                None,
+            )])
+            .expect("chunk schema"),
+        );
+        let column = Arc::new(StringArray::from(vec![Some("abc"), Some("xyz")])) as ArrayRef;
+
+        let chunk = Chunk::try_new_with_columns(chunk_schema, vec![column]).expect("chunk");
+
+        assert_eq!(chunk.schema().field(0).data_type(), &DataType::Binary);
+        assert_eq!(
+            chunk.chunk_schema().slots()[0].data_type(),
+            &DataType::Binary
+        );
+        let binary = chunk.columns()[0]
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("binary array");
+        assert_eq!(binary.value(0), b"abc");
+        assert_eq!(binary.value(1), b"xyz");
+    }
+
+    #[test]
+    fn try_new_with_chunk_schema_retags_utf8_batch_to_binary_descriptor() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "payload",
+                DataType::Utf8,
+                true,
+            )])),
+            vec![Arc::new(StringArray::from(vec![Some("abc"), Some("xyz")]))],
+        )
+        .expect("record batch");
+        let chunk_schema = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                SlotId::new(9),
+                Field::new("payload", DataType::Binary, true),
+                None,
+                None,
+            )])
+            .expect("chunk schema"),
+        );
+
+        let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk");
+
+        assert_eq!(chunk.schema().field(0).data_type(), &DataType::Binary);
+        assert_eq!(
+            chunk.chunk_schema().slots()[0].data_type(),
+            &DataType::Binary
+        );
+        let binary = chunk.columns()[0]
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("binary array");
+        assert_eq!(binary.value(0), b"abc");
+        assert_eq!(binary.value(1), b"xyz");
+    }
+
+    #[test]
+    fn try_new_with_chunk_schema_rejects_timestamp_metadata_retag() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            )])),
+            vec![Arc::new(TimestampMicrosecondArray::from(vec![
+                Some(1_000_i64),
+                Some(2_000),
+            ]))],
+        )
+        .expect("record batch");
+        let chunk_schema = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                SlotId::new(10),
+                Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), true),
+                None,
+                None,
+            )])
+            .expect("chunk schema"),
+        );
+
+        let err = Chunk::try_new_with_chunk_schema(batch, chunk_schema)
+            .expect_err("timestamp metadata retag should fail");
+
+        assert!(err.contains("column 0"), "err={err}");
+        assert!(err.contains("Timestamp(Nanosecond, None)"), "err={err}");
     }
 }

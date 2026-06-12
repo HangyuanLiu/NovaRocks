@@ -323,8 +323,8 @@ fn retag_mismatch(
 /// boundaries: a merged field is nullable if EITHER side is (OR). This is the
 /// single source of truth replacing the scattered `expected || actual` sites.
 ///
-/// Note: `array_agg`'s "actual-wins" nullability rule is a known outlier left
-/// untouched until pillar P5 — do not route it through this helper yet.
+/// Descriptor nullability is the contract; runtime nullability may widen it
+/// when a producer observes NULL values. Type selection stays descriptor-led.
 pub(crate) fn merge_fields_nullability(expected: &Field, actual: &Field) -> bool {
     expected.is_nullable() || actual.is_nullable()
 }

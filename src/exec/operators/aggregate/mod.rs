@@ -91,30 +91,16 @@ pub(super) fn align_schema_with_arrays(
             arrays.len()
         ));
     }
-    let mut changed = false;
-    let fields = schema
-        .fields()
-        .iter()
-        .zip(arrays.iter())
-        .map(|(field, array)| {
-            if field.data_type() == array.data_type() {
-                Ok(field.as_ref().clone())
-            } else {
-                changed = true;
-                Ok(
-                    Field::new(field.name(), array.data_type().clone(), field.is_nullable())
-                        .with_metadata(field.metadata().clone()),
-                )
-            }
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    if !changed {
-        return Ok(Arc::clone(schema));
+    for (idx, (field, array)) in schema.fields().iter().zip(arrays.iter()).enumerate() {
+        if field.data_type() != array.data_type() {
+            return Err(format!(
+                "{context} type mismatch at column {idx}: descriptor={:?} actual={:?}",
+                field.data_type(),
+                array.data_type()
+            ));
+        }
     }
-    Ok(Arc::new(Schema::new_with_metadata(
-        fields,
-        schema.metadata().clone(),
-    )))
+    Ok(Arc::clone(schema))
 }
 
 pub(super) fn is_compatible_aggregate_data_type(expected: &DataType, actual: &DataType) -> bool {
@@ -1198,5 +1184,27 @@ mod tests {
             &DataType::Decimal128(10, 2),
             &DataType::Decimal128(38, 3)
         ));
+    }
+
+    #[test]
+    fn aggregate_output_schema_rejects_runtime_type_drift() {
+        use std::sync::Arc;
+
+        use arrow::array::{ArrayRef, Int64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "__avg_state",
+            DataType::Utf8,
+            true,
+        )]));
+        let arrays: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![Some(10_i64)]))];
+
+        let err = super::align_schema_with_arrays(&schema, &arrays, "p5 aggregate output")
+            .expect_err("aggregate output must not adopt actual array type");
+        assert!(
+            err.contains("p5 aggregate output type mismatch"),
+            "err={err}"
+        );
     }
 }
