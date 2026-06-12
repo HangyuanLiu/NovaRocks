@@ -25,7 +25,7 @@ use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::common::ids::SlotId;
 use crate::descriptors;
 use crate::lower::expr::lower_t_expr;
-use crate::lower::layout::{Layout, chunk_schema_for_layout};
+use crate::lower::layout::{chunk_schema_for_layout, Layout};
 use crate::lower::node::Lowered;
 use crate::lower::type_lowering::arrow_type_from_desc;
 
@@ -465,18 +465,21 @@ fn lower_pre_agg_fallback_expr(
     // For example, sum(INT) has BIGINT output type but the raw passthrough is INT.
     // The exchange receiver uses the slot descriptor type (BIGINT), so we must upcast here.
     //
-    // Skip the cast for opaque binary types (e.g., avg/hll intermediate states declared as
-    // VARBINARY). Those cannot be meaningfully cast from numeric input; the exchange decode
-    // is responsible for tolerating the type mismatch in that case.
     if let Some(agg_output_type) = arrow_type_from_desc(&root.type_) {
         let child_type = arena.data_type(child_id).cloned().unwrap_or(DataType::Null);
-        if child_type != agg_output_type
-            && !matches!(
+        if child_type != agg_output_type {
+            if matches!(
                 agg_output_type,
-                DataType::Null | DataType::Binary | DataType::LargeBinary
-            )
-        {
-            return Ok(arena.push_typed(ExprNode::Cast(child_id), agg_output_type));
+                DataType::Binary | DataType::LargeBinary | DataType::Utf8 | DataType::LargeUtf8
+            ) {
+                return Err(format!(
+                    "SORT_NODE node_id={node_id} pre-agg passthrough declares opaque aggregate state {:?} but child expression is {:?}; source descriptor must be raw/return-typed or runtime must serialize",
+                    agg_output_type, child_type
+                ));
+            }
+            if !matches!(agg_output_type, DataType::Null) {
+                return Ok(arena.push_typed(ExprNode::Cast(child_id), agg_output_type));
+            }
         }
     }
 
@@ -526,6 +529,7 @@ mod tests {
     use crate::exec::chunk::Chunk;
     use crate::exec::node::values::ValuesNode;
     use crate::exprs::{TExpr, TExprNode, TExprNodeType, TSlotRef};
+    use crate::lower::type_lowering::scalar_type_desc;
     use crate::types::{TTypeDesc, TTypeNode, TTypeNodeType};
     use std::collections::HashMap;
 
@@ -599,6 +603,71 @@ mod tests {
         }
     }
 
+    fn avg_pre_agg_expr_with_opaque_varchar_state(tuple_id: i32, slot_id: i32) -> TExpr {
+        let varchar_type = scalar_type_desc(types::TPrimitiveType::VARCHAR);
+        let bigint_type = scalar_type_desc(types::TPrimitiveType::BIGINT);
+
+        TExpr {
+            nodes: vec![
+                TExprNode {
+                    node_type: TExprNodeType::FUNCTION_CALL,
+                    type_: varchar_type.clone(),
+                    num_children: 1,
+                    agg_expr: Some(exprs::TAggregateExpr {
+                        is_merge_agg: false,
+                    }),
+                    fn_: Some(types::TFunction {
+                        name: types::TFunctionName {
+                            db_name: None,
+                            function_name: "avg".to_string(),
+                        },
+                        binary_type: types::TFunctionBinaryType::BUILTIN,
+                        arg_types: vec![bigint_type.clone()],
+                        ret_type: varchar_type.clone(),
+                        has_var_args: false,
+                        comment: None,
+                        signature: None,
+                        hdfs_location: None,
+                        scalar_fn: None,
+                        aggregate_fn: Some(types::TAggregateFunction {
+                            intermediate_type: varchar_type.clone(),
+                            update_fn_symbol: None,
+                            init_fn_symbol: None,
+                            serialize_fn_symbol: None,
+                            merge_fn_symbol: None,
+                            finalize_fn_symbol: None,
+                            get_value_fn_symbol: None,
+                            remove_fn_symbol: None,
+                            is_analytic_only_fn: None,
+                            symbol: None,
+                            is_asc_order: None,
+                            nulls_first: None,
+                            is_distinct: None,
+                        }),
+                        id: None,
+                        checksum: None,
+                        agg_state_desc: None,
+                        fid: None,
+                        table_fn: None,
+                        could_apply_dict_optimize: None,
+                        ignore_nulls: None,
+                        isolated: None,
+                        input_type: None,
+                        content: None,
+                    }),
+                    ..default_expr_node()
+                },
+                TExprNode {
+                    node_type: TExprNodeType::SLOT_REF,
+                    type_: bigint_type,
+                    num_children: 0,
+                    slot_ref: Some(TSlotRef { slot_id, tuple_id }),
+                    ..default_expr_node()
+                },
+            ],
+        }
+    }
+
     fn single_slot_layout(tuple_id: i32, slot_id: i32) -> Layout {
         let mut index = HashMap::new();
         index.insert((tuple_id, slot_id), 0);
@@ -667,6 +736,21 @@ mod tests {
             None,
             None,
         )
+    }
+
+    #[test]
+    fn lower_pre_agg_fallback_rejects_opaque_passthrough_type_drift() {
+        let input_layout = single_slot_layout(0, 1);
+        let agg_expr = avg_pre_agg_expr_with_opaque_varchar_state(0, 1);
+        let mut arena = ExprArena::default();
+
+        let err =
+            lower_pre_agg_fallback_expr(&agg_expr, &mut arena, &input_layout, None, None, 7001)
+                .expect_err("opaque pre-agg passthrough must fail until descriptor is raw");
+        assert!(
+            err.contains("pre-agg passthrough declares opaque aggregate state"),
+            "err={err}"
+        );
     }
 
     #[test]
