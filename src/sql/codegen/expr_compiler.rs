@@ -3118,6 +3118,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn p5_inferred_intermediate_types_match_standalone_contract() {
+        use arrow::datatypes::{DataType, Field};
+        use std::sync::Arc;
+
+        let cases = vec![
+            (
+                "avg",
+                vec![DataType::Int64],
+                DataType::Float64,
+                Some(DataType::Utf8),
+            ),
+            (
+                "avg",
+                vec![DataType::Decimal128(12, 2)],
+                DataType::Decimal128(38, 8),
+                Some(DataType::Utf8),
+            ),
+            (
+                "ndv",
+                vec![DataType::Int64],
+                DataType::Int64,
+                Some(DataType::Binary),
+            ),
+            (
+                "hll_union_agg",
+                vec![DataType::Int64],
+                DataType::Int64,
+                Some(DataType::Binary),
+            ),
+            (
+                "bitmap_union_count",
+                vec![DataType::Int64],
+                DataType::Int64,
+                Some(DataType::Binary),
+            ),
+            (
+                "percentile_approx",
+                vec![DataType::Float64],
+                DataType::Float64,
+                Some(DataType::Binary),
+            ),
+            (
+                "array_agg",
+                vec![DataType::Int64],
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                Some(DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::Int64,
+                    true,
+                )))),
+            ),
+        ];
+
+        for (name, args, expected_output, expected_intermediate) in cases {
+            let (output, intermediate) =
+                super::infer_agg_function_types(name, &args, false).expect(name);
+            assert_eq!(output, expected_output, "{name} output type");
+            assert_eq!(
+                intermediate, expected_intermediate,
+                "{name} intermediate type"
+            );
+        }
+    }
+
     fn test_binding(slot_id: i32, data_type: DataType) -> ColumnBinding {
         ColumnBinding {
             tuple_id: 1,

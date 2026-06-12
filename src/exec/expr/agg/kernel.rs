@@ -233,3 +233,114 @@ impl AggKernelEntry {
         functions::drop_state(&self.spec, ptr);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use arrow::datatypes::{DataType, Field};
+    use std::sync::Arc;
+
+    use super::build_kernel_set;
+    use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
+
+    fn agg_func(
+        name: &str,
+        input_is_intermediate: bool,
+        intermediate_type: DataType,
+        output_type: DataType,
+        input_arg_type: Option<DataType>,
+    ) -> AggFunction {
+        AggFunction {
+            name: name.to_string(),
+            inputs: vec![],
+            input_is_intermediate,
+            types: Some(AggTypeSignature {
+                intermediate_type: Some(intermediate_type),
+                output_type: Some(output_type),
+                input_arg_type,
+            }),
+            order: Default::default(),
+        }
+    }
+
+    #[test]
+    fn p5_runtime_kernel_output_types_match_descriptor_contract() {
+        let cases = vec![
+            (
+                agg_func(
+                    "avg",
+                    false,
+                    DataType::Utf8,
+                    DataType::Float64,
+                    Some(DataType::Int64),
+                ),
+                Some(DataType::Int64),
+                DataType::Utf8,
+                DataType::Float64,
+            ),
+            (
+                agg_func(
+                    "ndv",
+                    false,
+                    DataType::Binary,
+                    DataType::Int64,
+                    Some(DataType::Int64),
+                ),
+                Some(DataType::Int64),
+                DataType::Binary,
+                DataType::Int64,
+            ),
+            (
+                agg_func(
+                    "hll_union_agg",
+                    false,
+                    DataType::Binary,
+                    DataType::Int64,
+                    Some(DataType::Int64),
+                ),
+                Some(DataType::Int64),
+                DataType::Binary,
+                DataType::Int64,
+            ),
+            (
+                agg_func(
+                    "percentile_approx",
+                    false,
+                    DataType::Binary,
+                    DataType::Float64,
+                    Some(DataType::Float64),
+                ),
+                Some(DataType::Float64),
+                DataType::Binary,
+                DataType::Float64,
+            ),
+            (
+                agg_func(
+                    "array_agg",
+                    false,
+                    DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                    DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                    Some(DataType::Int64),
+                ),
+                Some(DataType::Int64),
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+            ),
+        ];
+
+        for (func, input_type, expected_intermediate, expected_final) in cases {
+            let kernels = build_kernel_set(&[func.clone()], &[input_type]).expect(&func.name);
+            assert_eq!(
+                kernels.entries[0].output_type(true),
+                expected_intermediate,
+                "{} intermediate",
+                func.name
+            );
+            assert_eq!(
+                kernels.entries[0].output_type(false),
+                expected_final,
+                "{} final",
+                func.name
+            );
+        }
+    }
+}
