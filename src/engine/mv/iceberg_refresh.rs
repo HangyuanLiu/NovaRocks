@@ -8134,26 +8134,29 @@ async fn commit_iceberg_mv_target_files_with_ref(
         metadata.location(),
         uuid::Uuid::new_v4()
     );
-    let collector = Arc::new(IcebergCommitCollector::new(
-        op_kind,
-        ident.clone(),
-        metadata
-            .refs()
-            .get(target_ref)
-            .map(|r| r.snapshot_id)
-            .or_else(|| {
-                if target_ref == "main" {
-                    metadata.current_snapshot().map(|s| s.snapshot_id())
-                } else {
-                    None
-                }
-            }),
-        metadata.last_sequence_number(),
-        metadata.current_schema().clone(),
-        metadata.default_partition_spec().clone(),
-        staging_dir,
-        crate::common::types::UniqueId { hi: 0, lo: 0 },
-    ));
+    let collector = Arc::new(
+        IcebergCommitCollector::new(
+            op_kind,
+            ident.clone(),
+            metadata
+                .refs()
+                .get(target_ref)
+                .map(|r| r.snapshot_id)
+                .or_else(|| {
+                    if target_ref == "main" {
+                        metadata.current_snapshot().map(|s| s.snapshot_id())
+                    } else {
+                        None
+                    }
+                }),
+            metadata.last_sequence_number(),
+            metadata.current_schema().clone(),
+            metadata.default_partition_spec().clone(),
+            staging_dir,
+            crate::common::types::UniqueId { hi: 0, lo: 0 },
+        )
+        .with_table_metadata(metadata.clone()),
+    );
     inject_iceberg_mv_data_file_reports(&collector, metadata, data_files)?;
 
     let abort_cleanup =
@@ -8324,16 +8327,19 @@ pub(crate) fn new_iceberg_mv_commit_collector(
                 None
             }
         });
-    Arc::new(IcebergCommitCollector::new(
-        op_kind,
-        ident.clone(),
-        base_snapshot_id,
-        metadata.last_sequence_number(),
-        metadata.current_schema().clone(),
-        metadata.default_partition_spec().clone(),
-        staging_dir,
-        crate::common::types::UniqueId { hi: 0, lo: 0 },
-    ))
+    Arc::new(
+        IcebergCommitCollector::new(
+            op_kind,
+            ident.clone(),
+            base_snapshot_id,
+            metadata.last_sequence_number(),
+            metadata.current_schema().clone(),
+            metadata.default_partition_spec().clone(),
+            staging_dir,
+            crate::common::types::UniqueId { hi: 0, lo: 0 },
+        )
+        .with_table_metadata(metadata.clone()),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8367,26 +8373,29 @@ async fn commit_iceberg_mv_apply_with_ref(
         metadata.location(),
         uuid::Uuid::new_v4()
     );
-    let collector = Arc::new(IcebergCommitCollector::new(
-        CommitOpKind::RowDeltaDv,
-        ident.clone(),
-        metadata
-            .refs()
-            .get(target_ref)
-            .map(|r| r.snapshot_id)
-            .or_else(|| {
-                if target_ref == "main" {
-                    metadata.current_snapshot().map(|s| s.snapshot_id())
-                } else {
-                    None
-                }
-            }),
-        metadata.last_sequence_number(),
-        metadata.current_schema().clone(),
-        metadata.default_partition_spec().clone(),
-        staging_dir,
-        crate::common::types::UniqueId { hi: 0, lo: 0 },
-    ));
+    let collector = Arc::new(
+        IcebergCommitCollector::new(
+            CommitOpKind::RowDeltaDv,
+            ident.clone(),
+            metadata
+                .refs()
+                .get(target_ref)
+                .map(|r| r.snapshot_id)
+                .or_else(|| {
+                    if target_ref == "main" {
+                        metadata.current_snapshot().map(|s| s.snapshot_id())
+                    } else {
+                        None
+                    }
+                }),
+            metadata.last_sequence_number(),
+            metadata.current_schema().clone(),
+            metadata.default_partition_spec().clone(),
+            staging_dir,
+            crate::common::types::UniqueId { hi: 0, lo: 0 },
+        )
+        .with_table_metadata(metadata.clone()),
+    );
     inject_iceberg_mv_data_file_reports(&collector, metadata, data_files)?;
     for group in delete_groups {
         collector.inject_delete_group(group);

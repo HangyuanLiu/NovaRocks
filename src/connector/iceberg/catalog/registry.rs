@@ -1095,7 +1095,8 @@ async fn commit_v3_insert_rows_with_fast_append(
             uuid::Uuid::new_v4()
         ),
         UniqueId { hi: 0, lo: 0 },
-    );
+    )
+    .with_table_metadata(metadata.clone());
     for data_file in data_files {
         collector.inject_written_file(data_file_to_written_file(
             &data_file,

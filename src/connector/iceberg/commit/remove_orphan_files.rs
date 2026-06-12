@@ -572,16 +572,19 @@ mod tests {
         for i in 0..n {
             let table_location = current_table.metadata().location().to_string();
             let metadata = current_table.metadata();
-            let collector = Arc::new(IcebergCommitCollector::new(
-                CommitOpKind::FastAppend,
-                table_ident.clone(),
-                metadata.current_snapshot().map(|s| s.snapshot_id()),
-                metadata.last_sequence_number(),
-                metadata.current_schema().clone(),
-                metadata.default_partition_spec().clone(),
-                format!("{table_location}/staging"),
-                crate::common::types::UniqueId { hi: 0, lo: 0 },
-            ));
+            let collector = Arc::new(
+                IcebergCommitCollector::new(
+                    CommitOpKind::FastAppend,
+                    table_ident.clone(),
+                    metadata.current_snapshot().map(|s| s.snapshot_id()),
+                    metadata.last_sequence_number(),
+                    metadata.current_schema().clone(),
+                    metadata.default_partition_spec().clone(),
+                    format!("{table_location}/staging"),
+                    crate::common::types::UniqueId { hi: 0, lo: 0 },
+                )
+                .with_table_metadata(metadata.clone()),
+            );
             collector.inject_written_file(WrittenFile {
                 path: format!("{table_location}/data/file-{i}.parquet"),
                 format: DataFileFormat::Parquet,

@@ -35,7 +35,10 @@ use iceberg::spec::DataFile;
 use iceberg::{NamespaceIdent, TableIdent};
 
 use crate::connector::backend::ResolvedTable;
-use crate::connector::iceberg::catalog::backend::iceberg_schema_def_for_codegen;
+use crate::connector::iceberg::catalog::backend::{
+    ICEBERG_ROW_IDENTITY_FILE_COLUMN, ICEBERG_ROW_IDENTITY_POS_COLUMN,
+    iceberg_schema_def_for_codegen,
+};
 use crate::connector::iceberg::catalog::registry::{
     IcebergCatalogEntry, block_on_iceberg, build_iceberg_catalog,
 };
@@ -57,10 +60,11 @@ use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOp
 use crate::runtime::coordinator::CoordinatedQueryResult;
 use crate::runtime::write_coordinator::WriteCommitInput;
 use crate::sql::catalog::{
-    ColumnDef, IcebergDataFileBinding, IcebergTableInfo, ScanSource, TableDef,
+    ColumnDef, IcebergDataFileBinding, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
+    ScanSource, TableDef,
 };
 use crate::sql::codegen::iceberg_write_sink::{
-    IcebergWriteSinkSpec, synthetic_iceberg_write_table_id,
+    IcebergWriteSinkMode, IcebergWriteSinkSpec, synthetic_iceberg_write_table_id,
 };
 use crate::sql::parser::ast::{InsertSource, Literal, SqlType};
 
@@ -192,16 +196,19 @@ fn execute_iceberg_insert_distributed(
         metadata.location(),
         uuid::Uuid::new_v4()
     );
-    let collector = Arc::new(IcebergCommitCollector::new(
-        commit_op_kind,
-        table_ident,
-        base_snapshot_id,
-        base_sequence_number,
-        current_schema,
-        default_partition_spec,
-        staging_dir,
-        crate::common::types::UniqueId { hi: 0, lo: 0 },
-    ));
+    let collector = Arc::new(
+        IcebergCommitCollector::new(
+            commit_op_kind,
+            table_ident,
+            base_snapshot_id,
+            base_sequence_number,
+            current_schema,
+            default_partition_spec,
+            staging_dir,
+            crate::common::types::UniqueId { hi: 0, lo: 0 },
+        )
+        .with_table_metadata(metadata.clone()),
+    );
 
     let abort_cleanup = build_abort_cleanup_for_catalog_entry(entry)?;
     let commit_executor = IcebergWriteCommitExecutor {
@@ -286,14 +293,76 @@ impl IcebergWriteTransactionExecutor for DistributedInsertWriteExecutor {
     }
 }
 
-fn build_insert_write_sink_spec(
+pub(crate) fn build_insert_write_sink_spec(
     target: &TargetBackend,
     resolved: &ResolvedTable,
     table: &iceberg::table::Table,
     entry: &IcebergCatalogEntry,
     write_columns: &[ColumnDef],
 ) -> Result<IcebergWriteSinkSpec, String> {
+    build_iceberg_write_sink_spec(
+        target,
+        resolved,
+        table,
+        entry,
+        IcebergWriteSinkMode::Data,
+        write_columns.to_vec(),
+    )
+}
+
+pub(crate) fn build_position_delete_sink_spec(
+    target: &TargetBackend,
+    resolved: &ResolvedTable,
+    table: &iceberg::table::Table,
+    entry: &IcebergCatalogEntry,
+) -> Result<IcebergWriteSinkSpec, String> {
+    let target_columns = position_delete_sink_input_columns(table.metadata(), &resolved.columns)?;
+    build_iceberg_write_sink_spec(
+        target,
+        resolved,
+        table,
+        entry,
+        IcebergWriteSinkMode::PositionDeletes,
+        target_columns,
+    )
+}
+
+pub(crate) fn build_row_lineage_data_sink_spec(
+    target: &TargetBackend,
+    resolved: &ResolvedTable,
+    table: &iceberg::table::Table,
+    entry: &IcebergCatalogEntry,
+) -> Result<IcebergWriteSinkSpec, String> {
+    let target_columns = row_lineage_data_sink_input_columns(&resolved.columns);
+    build_iceberg_write_sink_spec(
+        target,
+        resolved,
+        table,
+        entry,
+        IcebergWriteSinkMode::RowLineageData,
+        target_columns,
+    )
+}
+
+pub(crate) fn build_iceberg_write_sink_spec(
+    target: &TargetBackend,
+    resolved: &ResolvedTable,
+    table: &iceberg::table::Table,
+    entry: &IcebergCatalogEntry,
+    mode: IcebergWriteSinkMode,
+    target_columns: Vec<ColumnDef>,
+) -> Result<IcebergWriteSinkSpec, String> {
     let metadata = table.metadata();
+    let target_descriptor_columns =
+        write_sink_target_descriptor_columns(mode, &resolved.columns, &target_columns);
+    let iceberg_schema = match mode {
+        IcebergWriteSinkMode::RowLineageData => {
+            row_lineage_iceberg_schema_def_for_codegen(metadata.current_schema())
+        }
+        IcebergWriteSinkMode::Data | IcebergWriteSinkMode::PositionDeletes => {
+            iceberg_schema_def_for_codegen(metadata.current_schema())
+        }
+    };
     let iceberg = IcebergTableInfo {
         catalog: target.catalog.clone(),
         namespace: target.namespace.clone(),
@@ -302,7 +371,7 @@ fn build_insert_write_sink_spec(
         current_snapshot_id: metadata.current_snapshot_id(),
         schema_id: metadata.current_schema_id(),
         location: metadata.location().to_string(),
-        schema: iceberg_schema_def_for_codegen(metadata.current_schema()),
+        schema: iceberg_schema,
         serialized_metadata: Some(
             serde_json::to_string(metadata)
                 .map_err(|err| format!("serialize iceberg table metadata failed: {err}"))?,
@@ -312,7 +381,7 @@ fn build_insert_write_sink_spec(
     let cloud_properties = entry.cloud_properties_map();
     let target_table = TableDef {
         name: resolved.table.clone(),
-        columns: write_columns.to_vec(),
+        columns: target_descriptor_columns,
         iceberg_row_lineage_metadata_columns: Vec::new(),
         source: ScanSource::IcebergDataFiles {
             table: iceberg.clone(),
@@ -337,10 +406,11 @@ fn build_insert_write_sink_spec(
     });
 
     Ok(IcebergWriteSinkSpec {
+        mode,
         target_table_id: synthetic_iceberg_write_table_id(),
         target_table,
         iceberg,
-        target_columns: write_columns.to_vec(),
+        target_columns,
         table_location,
         data_location,
         target_partition_spec_id: metadata.default_partition_spec_id(),
@@ -348,6 +418,101 @@ fn build_insert_write_sink_spec(
         file_format: "parquet".to_string(),
         compression: crate::types::TCompressionType::SNAPPY,
     })
+}
+
+fn row_lineage_data_sink_input_columns(target_columns: &[ColumnDef]) -> Vec<ColumnDef> {
+    let mut columns = target_columns.to_vec();
+    columns.push(ColumnDef {
+        name: crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+        data_type: arrow::datatypes::DataType::Int64,
+        nullable: false,
+        write_default: None,
+        logical_type: None,
+    });
+    columns.push(ColumnDef {
+        name: crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
+        data_type: arrow::datatypes::DataType::Int64,
+        nullable: true,
+        write_default: None,
+        logical_type: None,
+    });
+    columns
+}
+
+fn row_lineage_iceberg_schema_def_for_codegen(schema: &iceberg::spec::Schema) -> IcebergSchemaDef {
+    let mut out = iceberg_schema_def_for_codegen(schema);
+    out.fields.push(IcebergSchemaFieldDef {
+        field_id: crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_ROW_ID,
+        name: crate::exec::row_position::ICEBERG_ROW_ID_COL.to_string(),
+        initial_default: None,
+        write_default: None,
+        initial_default_json: None,
+        children: Vec::new(),
+    });
+    out.fields.push(IcebergSchemaFieldDef {
+        field_id: crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+        name: crate::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
+        initial_default: None,
+        write_default: None,
+        initial_default_json: None,
+        children: Vec::new(),
+    });
+    out
+}
+
+fn write_sink_target_descriptor_columns(
+    mode: IcebergWriteSinkMode,
+    resolved_columns: &[ColumnDef],
+    sink_input_columns: &[ColumnDef],
+) -> Vec<ColumnDef> {
+    match mode {
+        IcebergWriteSinkMode::PositionDeletes => resolved_columns.to_vec(),
+        IcebergWriteSinkMode::Data | IcebergWriteSinkMode::RowLineageData => {
+            sink_input_columns.to_vec()
+        }
+    }
+}
+
+fn position_delete_sink_input_columns(
+    metadata: &iceberg::spec::TableMetadata,
+    target_columns: &[ColumnDef],
+) -> Result<Vec<ColumnDef>, String> {
+    let mut columns = vec![
+        ColumnDef {
+            name: ICEBERG_ROW_IDENTITY_FILE_COLUMN.to_string(),
+            data_type: arrow::datatypes::DataType::Utf8,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        },
+        ColumnDef {
+            name: ICEBERG_ROW_IDENTITY_POS_COLUMN.to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        },
+    ];
+    let schema = metadata.current_schema();
+    for field in metadata.default_partition_spec().fields() {
+        let source = schema.field_by_id(field.source_id).ok_or_else(|| {
+            format!(
+                "iceberg position-delete sink partition source field id {} not found",
+                field.source_id
+            )
+        })?;
+        let column = target_columns
+            .iter()
+            .find(|column| column.name.eq_ignore_ascii_case(&source.name))
+            .ok_or_else(|| {
+                format!(
+                    "iceberg position-delete sink partition source column `{}` not found in target table",
+                    source.name
+                )
+            })?;
+        columns.push(column.clone());
+    }
+    Ok(columns)
 }
 
 fn append_source_to_query(
@@ -622,7 +787,7 @@ fn target_literal_expr_sql(literal: &Literal, column: &ColumnDef) -> Result<Stri
     )
 }
 
-fn target_cast_expr_sql(expr_sql: &str, column: &ColumnDef) -> Result<String, String> {
+pub(crate) fn target_cast_expr_sql(expr_sql: &str, column: &ColumnDef) -> Result<String, String> {
     Ok(format!(
         "CAST({expr_sql} AS {})",
         arrow_data_type_to_sql_type_name(&column.data_type)?
@@ -687,7 +852,7 @@ fn literal_to_sql(literal: &Literal) -> Result<String, String> {
     })
 }
 
-fn literal_to_sql_for_arrow_type(
+pub(crate) fn literal_to_sql_for_arrow_type(
     literal: &Literal,
     data_type: &arrow::datatypes::DataType,
 ) -> Result<String, String> {
@@ -1131,6 +1296,52 @@ mod tests {
         assert!(
             !impl_source.contains("synthetic_write_commit_input"),
             "append executor must not return a synthetic write commit"
+        );
+    }
+
+    #[test]
+    fn position_delete_sink_descriptor_columns_use_target_table_schema() {
+        let resolved_columns = vec![
+            test_column("id", DataType::Int32, None),
+            test_column("v", DataType::Utf8, None),
+        ];
+        let sink_input_columns = vec![
+            test_column("_file", DataType::Utf8, None),
+            test_column("_pos", DataType::Int64, None),
+        ];
+
+        let descriptor_columns = write_sink_target_descriptor_columns(
+            IcebergWriteSinkMode::PositionDeletes,
+            &resolved_columns,
+            &sink_input_columns,
+        );
+
+        assert_eq!(
+            descriptor_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "v"]
+        );
+    }
+
+    #[test]
+    fn row_lineage_data_sink_descriptor_columns_use_sink_input_schema() {
+        let resolved_columns = vec![test_column("id", DataType::Int32, None)];
+        let sink_input_columns = row_lineage_data_sink_input_columns(&resolved_columns);
+
+        let descriptor_columns = write_sink_target_descriptor_columns(
+            IcebergWriteSinkMode::RowLineageData,
+            &resolved_columns,
+            &sink_input_columns,
+        );
+
+        assert_eq!(
+            descriptor_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "_row_id", "_last_updated_sequence_number"]
         );
     }
 

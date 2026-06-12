@@ -34,7 +34,7 @@ use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime};
 use iceberg::TableIdent;
 use iceberg::spec::{
     Datum, Literal, PartitionSpecRef, PrimitiveLiteral, PrimitiveType, SchemaRef, Struct,
-    Transform, Type,
+    TableMetadata, Transform, Type,
 };
 use std::collections::{BTreeMap, HashMap};
 
@@ -54,6 +54,7 @@ pub struct IcebergCommitCollector {
     pub base_sequence_number: i64,
     pub schema: SchemaRef,
     pub partition_spec: PartitionSpecRef,
+    metadata: Option<TableMetadata>,
     pub staging_dir: String,
     pub finst_id: UniqueId,
     pub abort_log: Arc<AbortLog>,
@@ -104,6 +105,7 @@ impl IcebergCommitCollector {
             base_sequence_number,
             schema,
             partition_spec,
+            metadata: None,
             staging_dir,
             finst_id,
             abort_log: Arc::new(AbortLog::new()),
@@ -113,6 +115,11 @@ impl IcebergCommitCollector {
             preserve_row_lineage: AtomicBool::new(false),
             committed: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn with_table_metadata(mut self, metadata: TableMetadata) -> Self {
+        self.metadata = Some(metadata);
+        self
     }
 
     /// Mark that the data files injected via [`inject_written_file`] carry
@@ -303,14 +310,13 @@ impl IcebergCommitCollector {
 
     /// Reconstruct a [`WrittenFile`] from a writer-reported `TIcebergDataFile`.
     ///
-    /// As of PR-0 this is lossless against the inject path
+    /// As of P6 this is descriptor-authoritative for Iceberg partition values
+    /// and lossless against the inject path
     /// (`engine::iceberg_writer::data_file_to_written_file`) for data and
     /// delete files: column statistics (`column_stats`), `first_row_id`,
-    /// `equality_ids`, and `key_metadata` all round-trip. Three boundaries
+    /// `equality_ids`, and `key_metadata` all round-trip. Two boundaries
     /// are intentional and handled (or deferred) elsewhere:
     ///
-    /// - Partition values are decoded from `partition_path`; transform
-    ///   directory values are converted back to Iceberg partition literals.
     /// - Column-stat bounds for field-ids absent from the table schema (e.g.
     ///   stats left behind for a dropped column) are skipped rather than
     ///   decoded, matching the inject path's tolerance for stale stats.
@@ -339,15 +345,20 @@ impl IcebergCommitCollector {
             }
         };
 
-        let partition_spec_id = df
-            .partition_spec_id
-            .unwrap_or(self.partition_spec.spec_id());
-        let partition_values = parse_partition_path(
-            df.partition_path.as_deref().unwrap_or(""),
-            &self.partition_spec,
-            &self.schema,
-            df.partition_null_fingerprint.as_deref(),
-        )?;
+        let partition_spec_id = df.partition_spec_id.ok_or_else(|| {
+            "IcebergWriteDescriptorMismatch: TIcebergDataFile missing partition_spec_id".to_string()
+        })?;
+        let metadata = self.metadata.as_ref().ok_or_else(|| {
+            "IcebergWriteDescriptorMismatch: IcebergCommitCollector missing table metadata"
+                .to_string()
+        })?;
+        let partition_values =
+            crate::connector::iceberg::write_descriptor::decode_partition_descriptor(
+                df.partition_values_descriptor,
+                partition_spec_id,
+                metadata,
+            )
+            .map_err(|e| e.to_string())?;
 
         let stats = df.column_stats.unwrap_or_default();
         let column_sizes = i64_map_to_u64(stats.column_sizes, "column_sizes")?;
@@ -443,8 +454,10 @@ fn i64_map_to_u64(
         .collect()
 }
 
-/// Decode an Iceberg v2-style partition path (e.g. `p=1/q=A`) into a
-/// [`Struct`] keyed by the partition spec's field order.
+/// Legacy compatibility parser for Iceberg v2-style partition paths
+/// (e.g. `p=1/q=A`). P6 commit conversion is descriptor-authoritative; keep
+/// this private helper only for explicit legacy parser tests.
+#[allow(dead_code)]
 fn parse_partition_path(
     path: &str,
     spec: &PartitionSpecRef,
@@ -529,6 +542,7 @@ fn parse_partition_path(
     Ok(Struct::from_iter(values))
 }
 
+#[allow(dead_code)]
 fn parse_literal_for_partition_field(
     raw: &str,
     transform: &Transform,
@@ -543,6 +557,7 @@ fn parse_literal_for_partition_field(
     }
 }
 
+#[allow(dead_code)]
 fn parse_year_partition_literal(raw: &str, ty: &Type) -> Result<Literal, String> {
     let decoded = decode_partition_value(raw);
     let value = decoded.parse::<i64>().map_err(|e| e.to_string())?;
@@ -552,6 +567,7 @@ fn parse_year_partition_literal(raw: &str, ty: &Type) -> Result<Literal, String>
     partition_integer_literal(value - 1970, ty)
 }
 
+#[allow(dead_code)]
 fn parse_month_partition_literal(raw: &str, ty: &Type) -> Result<Literal, String> {
     let decoded = decode_partition_value(raw);
     if let Ok(date) = NaiveDate::parse_from_str(&format!("{decoded}-01"), "%Y-%m-%d") {
@@ -561,6 +577,7 @@ fn parse_month_partition_literal(raw: &str, ty: &Type) -> Result<Literal, String
     parse_literal_for_type(raw, ty)
 }
 
+#[allow(dead_code)]
 fn parse_hour_partition_literal(raw: &str, ty: &Type) -> Result<Literal, String> {
     let decoded = decode_partition_value(raw);
     if let Ok(dt) = NaiveDateTime::parse_from_str(&decoded, "%Y-%m-%d-%H") {
@@ -570,6 +587,7 @@ fn parse_hour_partition_literal(raw: &str, ty: &Type) -> Result<Literal, String>
     parse_literal_for_type(raw, ty)
 }
 
+#[allow(dead_code)]
 fn partition_integer_literal(value: i64, ty: &Type) -> Result<Literal, String> {
     match ty {
         Type::Primitive(PrimitiveType::Int) => i32::try_from(value)
@@ -586,10 +604,12 @@ fn partition_integer_literal(value: i64, ty: &Type) -> Result<Literal, String> {
 /// partition values when building the partition path. The sink uses the
 /// Iceberg-spec subset (`%XX` for filesystem-unsafe characters); decode by
 /// walking the input rather than pulling in the `urlencoding` crate.
+#[allow(dead_code)]
 fn decode_partition_value(raw: &str) -> String {
     String::from_utf8_lossy(&decode_partition_value_bytes(raw)).into_owned()
 }
 
+#[allow(dead_code)]
 fn decode_partition_value_bytes(raw: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(raw.len());
     let bytes = raw.as_bytes();
@@ -614,6 +634,7 @@ fn decode_partition_value_bytes(raw: &str) -> Vec<u8> {
     out
 }
 
+#[allow(dead_code)]
 fn hex_nibble(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
@@ -623,6 +644,7 @@ fn hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
+#[allow(dead_code)]
 fn parse_literal_for_type(raw: &str, ty: &Type) -> Result<Literal, String> {
     let prim = match ty {
         Type::Primitive(p) => p,
@@ -677,12 +699,14 @@ fn parse_literal_for_type(raw: &str, ty: &Type) -> Result<Literal, String> {
     }
 }
 
+#[allow(dead_code)]
 fn parse_date_literal(raw: &str) -> Result<Literal, String> {
     raw.parse::<i32>()
         .map(Literal::date)
         .or_else(|_| Literal::date_from_str(decode_partition_value(raw)).map_err(|e| e.to_string()))
 }
 
+#[allow(dead_code)]
 fn parse_time_literal(raw: &str) -> Result<Literal, String> {
     raw.parse::<i64>()
         .map(Literal::time)
@@ -690,11 +714,13 @@ fn parse_time_literal(raw: &str) -> Result<Literal, String> {
 }
 
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 enum TimestampUnit {
     Micros,
     Nanos,
 }
 
+#[allow(dead_code)]
 fn parse_timestamp_literal(
     raw: &str,
     unit: TimestampUnit,
@@ -708,6 +734,7 @@ fn parse_timestamp_literal(
     Ok(timestamp_literal_from_units(value, unit, with_timezone))
 }
 
+#[allow(dead_code)]
 fn timestamp_literal_from_units(value: i64, unit: TimestampUnit, with_timezone: bool) -> Literal {
     match (unit, with_timezone) {
         (TimestampUnit::Micros, false) => Literal::timestamp(value),
@@ -716,6 +743,7 @@ fn timestamp_literal_from_units(value: i64, unit: TimestampUnit, with_timezone: 
     }
 }
 
+#[allow(dead_code)]
 fn parse_timestamp_string_to_units(raw: &str, unit: TimestampUnit) -> Result<i64, String> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
         return datetime_to_units(dt, unit);
@@ -739,6 +767,7 @@ fn parse_timestamp_string_to_units(raw: &str, unit: TimestampUnit) -> Result<i64
     Err(format!("can't parse timestamp `{raw}`"))
 }
 
+#[allow(dead_code)]
 fn datetime_to_units<Tz: chrono::TimeZone>(
     dt: DateTime<Tz>,
     unit: TimestampUnit,
@@ -755,8 +784,9 @@ fn datetime_to_units<Tz: chrono::TimeZone>(
 mod parity_tests {
     use super::*;
     use iceberg::spec::{
-        DataContentType, DataFileBuilder, DataFileFormat, Datum, NestedField, PrimitiveType,
-        Schema, Struct, Transform, Type,
+        DataContentType, DataFileBuilder, DataFileFormat, Datum, FormatVersion, NestedField,
+        PartitionSpec, PrimitiveType, Schema, Struct, TableMetadata, TableMetadataBuilder,
+        Transform, Type,
     };
 
     fn int_schema() -> SchemaRef {
@@ -793,6 +823,7 @@ mod parity_tests {
     }
 
     fn unpartitioned_collector(schema: SchemaRef) -> IcebergCommitCollector {
+        let metadata = unpartitioned_metadata(Arc::clone(&schema));
         IcebergCommitCollector::new(
             CommitOpKind::FastAppend,
             TableIdent::from_strs(["db", "t"]).expect("ident"),
@@ -803,10 +834,205 @@ mod parity_tests {
             "file:///tmp/staging".to_string(),
             UniqueId { hi: 0, lo: 0 },
         )
+        .with_table_metadata(metadata)
+    }
+
+    fn table_metadata(schema: SchemaRef, partition_spec: PartitionSpecRef) -> TableMetadata {
+        let creation = iceberg::TableCreation::builder()
+            .name("t".to_string())
+            .location("file:///warehouse/db/t".to_string())
+            .schema(schema.as_ref().clone())
+            .partition_spec(partition_spec.as_ref().clone())
+            .format_version(FormatVersion::V2)
+            .build();
+        TableMetadataBuilder::from_table_creation(creation)
+            .expect("table metadata builder")
+            .build()
+            .expect("table metadata")
+            .metadata
+    }
+
+    fn unpartitioned_metadata(schema: SchemaRef) -> TableMetadata {
+        table_metadata(schema, Arc::new(PartitionSpec::unpartition_spec()))
+    }
+
+    fn string_partition_collector() -> (IcebergCommitCollector, TableMetadata, i32) {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::required(
+                    1,
+                    "region",
+                    Type::Primitive(PrimitiveType::String),
+                ))])
+                .build()
+                .expect("schema"),
+        );
+        let requested_spec = Arc::new(
+            PartitionSpec::builder(Arc::clone(&schema))
+                .with_spec_id(7)
+                .add_partition_field("region", "region", Transform::Identity)
+                .expect("partition field")
+                .build()
+                .expect("partition spec"),
+        );
+        let metadata = table_metadata(Arc::clone(&schema), requested_spec);
+        let spec_id = metadata.default_partition_spec_id();
+        let collector = IcebergCommitCollector::new(
+            CommitOpKind::FastAppend,
+            TableIdent::from_strs(["db", "t"]).expect("ident"),
+            None,
+            metadata.last_sequence_number(),
+            schema,
+            metadata
+                .partition_spec_by_id(spec_id)
+                .expect("partition spec")
+                .clone(),
+            "file:///tmp/staging".to_string(),
+            UniqueId { hi: 1, lo: 2 },
+        )
+        .with_table_metadata(metadata.clone());
+        (collector, metadata, spec_id)
+    }
+
+    #[test]
+    fn convert_uses_partition_descriptor_not_partition_path() {
+        let (collector, metadata, spec_id) = string_partition_collector();
+        let values = Struct::from_iter([Some(Literal::string("west"))]);
+        let descriptor = crate::connector::iceberg::write_descriptor::encode_partition_descriptor(
+            &values, spec_id, &metadata,
+        )
+        .expect("descriptor");
+        let thrift = crate::types::TIcebergDataFile {
+            path: Some("file:///warehouse/t/data/a.parquet".to_string()),
+            format: Some("PARQUET".to_string()),
+            record_count: Some(1),
+            file_size_in_bytes: Some(12),
+            partition_path: Some("region=east".to_string()),
+            split_offsets: None,
+            column_stats: None,
+            partition_null_fingerprint: Some("0".to_string()),
+            file_content: Some(crate::types::TIcebergFileContent::DATA),
+            referenced_data_file: None,
+            first_row_id: None,
+            equality_ids: None,
+            key_metadata: None,
+            partition_values_descriptor: Some(descriptor),
+            partition_spec_id: Some(spec_id),
+        };
+
+        let written = collector.convert(thrift).expect("convert");
+
+        assert_eq!(written.partition_values, values);
+        assert_eq!(written.partition_spec_id, spec_id);
+    }
+
+    #[test]
+    fn convert_rejects_missing_partition_descriptor() {
+        let (collector, _metadata, spec_id) = string_partition_collector();
+        let thrift = crate::types::TIcebergDataFile {
+            path: Some("file:///warehouse/t/data/a.parquet".to_string()),
+            format: Some("PARQUET".to_string()),
+            record_count: Some(1),
+            file_size_in_bytes: Some(12),
+            partition_path: Some("region=west".to_string()),
+            split_offsets: None,
+            column_stats: None,
+            partition_null_fingerprint: Some("0".to_string()),
+            file_content: Some(crate::types::TIcebergFileContent::DATA),
+            referenced_data_file: None,
+            first_row_id: None,
+            equality_ids: None,
+            key_metadata: None,
+            partition_values_descriptor: None,
+            partition_spec_id: Some(spec_id),
+        };
+
+        let err = collector
+            .convert(thrift)
+            .expect_err("missing descriptor should fail");
+
+        assert!(err.contains("IcebergWriteDescriptorMismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn convert_rejects_missing_partition_spec_id() {
+        let (collector, metadata, spec_id) = string_partition_collector();
+        let values = Struct::from_iter([Some(Literal::string("west"))]);
+        let descriptor = crate::connector::iceberg::write_descriptor::encode_partition_descriptor(
+            &values, spec_id, &metadata,
+        )
+        .expect("descriptor");
+        let thrift = crate::types::TIcebergDataFile {
+            path: Some("file:///warehouse/t/data/a.parquet".to_string()),
+            format: Some("PARQUET".to_string()),
+            record_count: Some(1),
+            file_size_in_bytes: Some(12),
+            partition_path: Some("region=west".to_string()),
+            split_offsets: None,
+            column_stats: None,
+            partition_null_fingerprint: Some("0".to_string()),
+            file_content: Some(crate::types::TIcebergFileContent::DATA),
+            referenced_data_file: None,
+            first_row_id: None,
+            equality_ids: None,
+            key_metadata: None,
+            partition_values_descriptor: Some(descriptor),
+            partition_spec_id: None,
+        };
+
+        let err = collector
+            .convert(thrift)
+            .expect_err("missing partition spec id should fail");
+
+        assert!(err.contains("missing partition_spec_id"), "got: {err}");
+    }
+
+    #[test]
+    fn convert_rejects_missing_collector_metadata() {
+        let (collector_with_metadata, metadata, spec_id) = string_partition_collector();
+        let values = Struct::from_iter([Some(Literal::string("west"))]);
+        let descriptor = crate::connector::iceberg::write_descriptor::encode_partition_descriptor(
+            &values, spec_id, &metadata,
+        )
+        .expect("descriptor");
+        let thrift = crate::types::TIcebergDataFile {
+            path: Some("file:///warehouse/t/data/a.parquet".to_string()),
+            format: Some("PARQUET".to_string()),
+            record_count: Some(1),
+            file_size_in_bytes: Some(12),
+            partition_path: Some("region=west".to_string()),
+            split_offsets: None,
+            column_stats: None,
+            partition_null_fingerprint: Some("0".to_string()),
+            file_content: Some(crate::types::TIcebergFileContent::DATA),
+            referenced_data_file: None,
+            first_row_id: None,
+            equality_ids: None,
+            key_metadata: None,
+            partition_values_descriptor: Some(descriptor),
+            partition_spec_id: Some(spec_id),
+        };
+        let collector = IcebergCommitCollector::new(
+            CommitOpKind::FastAppend,
+            TableIdent::from_strs(["db", "t"]).expect("ident"),
+            None,
+            metadata.last_sequence_number(),
+            Arc::clone(&collector_with_metadata.schema),
+            Arc::clone(&collector_with_metadata.partition_spec),
+            "file:///tmp/staging".to_string(),
+            UniqueId { hi: 1, lo: 2 },
+        );
+
+        let err = collector
+            .convert(thrift)
+            .expect_err("missing collector metadata should fail");
+
+        assert!(err.contains("missing table metadata"), "got: {err}");
     }
 
     #[test]
     fn convert_reproduces_inject_path_for_data_file_stats() {
+        let metadata = unpartitioned_metadata(int_schema());
         let mut b = DataFileBuilder::default();
         b.content(DataContentType::Data)
             .file_path("file:///t/data-1.parquet".to_string())
@@ -832,6 +1058,7 @@ mod parity_tests {
             "PARQUET".to_string(),
             crate::types::TIcebergFileContent::DATA,
             Some(0),
+            &metadata,
         )
         .expect("thrift");
 
@@ -843,6 +1070,7 @@ mod parity_tests {
 
     #[test]
     fn inject_sink_commit_info_converts_and_drains_written_file() {
+        let metadata = unpartitioned_metadata(int_schema());
         let mut b = DataFileBuilder::default();
         b.content(DataContentType::Data)
             .file_path("file:///t/data-from-sink.parquet".to_string())
@@ -860,6 +1088,7 @@ mod parity_tests {
             "PARQUET".to_string(),
             crate::types::TIcebergFileContent::DATA,
             Some(0),
+            &metadata,
         )
         .expect("thrift");
 
@@ -900,6 +1129,7 @@ mod parity_tests {
 
     #[test]
     fn inject_sink_commit_infos_is_all_or_nothing() {
+        let metadata = unpartitioned_metadata(int_schema());
         let mut b = DataFileBuilder::default();
         b.content(DataContentType::Data)
             .file_path("file:///t/atomic-data.parquet".to_string())
@@ -916,6 +1146,7 @@ mod parity_tests {
             "PARQUET".to_string(),
             crate::types::TIcebergFileContent::DATA,
             Some(0),
+            &metadata,
         )
         .expect("thrift");
 
@@ -951,6 +1182,7 @@ mod parity_tests {
 
     #[test]
     fn convert_roundtrips_equality_delete_files() {
+        let metadata = unpartitioned_metadata(int_schema());
         let mut b = DataFileBuilder::default();
         b.content(DataContentType::EqualityDeletes)
             .file_path("file:///t/eq-del-1.parquet".to_string())
@@ -972,6 +1204,7 @@ mod parity_tests {
             "PARQUET".to_string(),
             crate::types::TIcebergFileContent::EQUALITY_DELETES,
             Some(0),
+            &metadata,
         )
         .expect("thrift");
 
@@ -1000,6 +1233,7 @@ mod parity_tests {
 
         let schema = int_schema();
         let spec = identity_partition_spec(&schema);
+        let metadata = table_metadata(Arc::clone(&schema), Arc::clone(&spec));
 
         let partition = Struct::from_iter([Some(Literal::int(5))]);
         let mut b = DataFileBuilder::default();
@@ -1022,6 +1256,7 @@ mod parity_tests {
             "PARQUET".to_string(),
             crate::types::TIcebergFileContent::DATA,
             Some(0),
+            &metadata,
         )
         .expect("thrift");
 
@@ -1034,7 +1269,8 @@ mod parity_tests {
             spec,
             "file:///tmp/staging".to_string(),
             UniqueId { hi: 0, lo: 0 },
-        );
+        )
+        .with_table_metadata(metadata.clone());
         let actual = collector.convert(thrift).expect("convert");
 
         assert_eq!(expected.partition_values, actual.partition_values);
@@ -1052,6 +1288,7 @@ mod parity_tests {
                 .build()
                 .expect("partition spec"),
         );
+        let metadata = table_metadata(Arc::clone(&schema), Arc::clone(&spec));
 
         let mut b = DataFileBuilder::default();
         b.content(DataContentType::Data)
@@ -1073,6 +1310,7 @@ mod parity_tests {
             "PARQUET".to_string(),
             crate::types::TIcebergFileContent::DATA,
             Some(0),
+            &metadata,
         )
         .expect("thrift");
 
@@ -1085,7 +1323,8 @@ mod parity_tests {
             spec,
             "file:///tmp/staging".to_string(),
             UniqueId { hi: 0, lo: 0 },
-        );
+        )
+        .with_table_metadata(metadata.clone());
         let actual = collector.convert(thrift).expect("convert");
 
         assert_eq!(expected.partition_values, actual.partition_values);
@@ -1094,6 +1333,7 @@ mod parity_tests {
 
     #[test]
     fn convert_skips_bounds_for_field_ids_absent_from_schema() {
+        let metadata = unpartitioned_metadata(int_schema());
         // int_schema() has only field id 1; a bound for field id 999 simulates
         // stats left behind for a dropped column. convert() must succeed and
         // simply omit field 999 rather than erroring.
@@ -1115,6 +1355,7 @@ mod parity_tests {
             "PARQUET".to_string(),
             crate::types::TIcebergFileContent::DATA,
             Some(0),
+            &metadata,
         )
         .expect("thrift");
 
@@ -1131,6 +1372,15 @@ mod parity_tests {
 
     #[test]
     fn convert_skips_bounds_for_variant_field_ids() {
+        let metadata = unpartitioned_metadata(int_variant_schema());
+        let partition_spec_id = metadata.default_partition_spec_id();
+        let partition_values_descriptor =
+            crate::connector::iceberg::write_descriptor::encode_partition_descriptor(
+                &Struct::empty(),
+                partition_spec_id,
+                &metadata,
+            )
+            .expect("descriptor");
         let thrift = crate::types::TIcebergDataFile {
             path: Some("file:///t/data-variant.parquet".to_string()),
             format: Some("PARQUET".to_string()),
@@ -1147,7 +1397,8 @@ mod parity_tests {
             }),
             partition_null_fingerprint: Some(String::new()),
             file_content: Some(crate::types::TIcebergFileContent::DATA),
-            partition_spec_id: Some(0),
+            partition_values_descriptor: Some(partition_values_descriptor),
+            partition_spec_id: Some(partition_spec_id),
             ..Default::default()
         };
 

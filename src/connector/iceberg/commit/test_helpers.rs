@@ -116,16 +116,19 @@ where
 {
     let metadata = fixture.table.metadata();
     let staging_dir = format!("{}/staging", metadata.location());
-    let collector = Arc::new(IcebergCommitCollector::new(
-        op_kind,
-        fixture.table_ident.clone(),
-        metadata.current_snapshot().map(|s| s.snapshot_id()),
-        metadata.last_sequence_number(),
-        metadata.current_schema().clone(),
-        metadata.default_partition_spec().clone(),
-        staging_dir,
-        crate::common::types::UniqueId { hi: 0, lo: 0 },
-    ));
+    let collector = Arc::new(
+        IcebergCommitCollector::new(
+            op_kind,
+            fixture.table_ident.clone(),
+            metadata.current_snapshot().map(|s| s.snapshot_id()),
+            metadata.last_sequence_number(),
+            metadata.current_schema().clone(),
+            metadata.default_partition_spec().clone(),
+            staging_dir,
+            crate::common::types::UniqueId { hi: 0, lo: 0 },
+        )
+        .with_table_metadata(metadata.clone()),
+    );
 
     let file_io = fixture.table.file_io().clone();
     let abort_handle = collector.abort_log.clone();
@@ -182,16 +185,19 @@ pub(crate) async fn v3_table_with_n_data_files(n: usize) -> IcebergTestFixture {
     // picks them up via `take_written_files` rather than draining
     // `runtime::sink_commit`.
     let metadata = fixture.table.metadata();
-    let collector = Arc::new(IcebergCommitCollector::new(
-        CommitOpKind::FastAppend,
-        fixture.table_ident.clone(),
-        metadata.current_snapshot().map(|s| s.snapshot_id()),
-        metadata.last_sequence_number(),
-        metadata.current_schema().clone(),
-        metadata.default_partition_spec().clone(),
-        format!("{table_location}/staging"),
-        crate::common::types::UniqueId { hi: 0, lo: 0 },
-    ));
+    let collector = Arc::new(
+        IcebergCommitCollector::new(
+            CommitOpKind::FastAppend,
+            fixture.table_ident.clone(),
+            metadata.current_snapshot().map(|s| s.snapshot_id()),
+            metadata.last_sequence_number(),
+            metadata.current_schema().clone(),
+            metadata.default_partition_spec().clone(),
+            format!("{table_location}/staging"),
+            crate::common::types::UniqueId { hi: 0, lo: 0 },
+        )
+        .with_table_metadata(metadata.clone()),
+    );
     for wf in written {
         collector.inject_written_file(wf);
     }
@@ -237,16 +243,19 @@ pub(crate) async fn v3_table_with_multi_batch_appends(batches: &[usize]) -> Iceb
     for &n in batches {
         let table_location = fixture.table.metadata().location().to_string();
         let metadata = fixture.table.metadata();
-        let collector = Arc::new(IcebergCommitCollector::new(
-            CommitOpKind::FastAppend,
-            fixture.table_ident.clone(),
-            metadata.current_snapshot().map(|s| s.snapshot_id()),
-            metadata.last_sequence_number(),
-            metadata.current_schema().clone(),
-            metadata.default_partition_spec().clone(),
-            format!("{table_location}/staging"),
-            crate::common::types::UniqueId { hi: 0, lo: 0 },
-        ));
+        let collector = Arc::new(
+            IcebergCommitCollector::new(
+                CommitOpKind::FastAppend,
+                fixture.table_ident.clone(),
+                metadata.current_snapshot().map(|s| s.snapshot_id()),
+                metadata.last_sequence_number(),
+                metadata.current_schema().clone(),
+                metadata.default_partition_spec().clone(),
+                format!("{table_location}/staging"),
+                crate::common::types::UniqueId { hi: 0, lo: 0 },
+            )
+            .with_table_metadata(metadata.clone()),
+        );
         for _ in 0..n {
             collector.inject_written_file(WrittenFile {
                 path: format!("{table_location}/data/file-{global_idx}.parquet"),
@@ -427,16 +436,19 @@ pub(crate) async fn v3_partitioned_table_with_data() -> IcebergTestFixture {
     ];
 
     let metadata = fixture.table.metadata();
-    let collector = Arc::new(IcebergCommitCollector::new(
-        CommitOpKind::FastAppend,
-        fixture.table_ident.clone(),
-        metadata.current_snapshot().map(|s| s.snapshot_id()),
-        metadata.last_sequence_number(),
-        metadata.current_schema().clone(),
-        metadata.default_partition_spec().clone(),
-        format!("{table_location}/staging"),
-        crate::common::types::UniqueId { hi: 0, lo: 0 },
-    ));
+    let collector = Arc::new(
+        IcebergCommitCollector::new(
+            CommitOpKind::FastAppend,
+            fixture.table_ident.clone(),
+            metadata.current_snapshot().map(|s| s.snapshot_id()),
+            metadata.last_sequence_number(),
+            metadata.current_schema().clone(),
+            metadata.default_partition_spec().clone(),
+            format!("{table_location}/staging"),
+            crate::common::types::UniqueId { hi: 0, lo: 0 },
+        )
+        .with_table_metadata(metadata.clone()),
+    );
     for wf in written {
         collector.inject_written_file(wf);
     }
@@ -474,16 +486,19 @@ pub(crate) async fn run_overwrite_partitions_commit(
 ) -> Result<CommitOutcome, String> {
     let metadata = fixture.table.metadata();
     let staging_dir = format!("{}/staging", metadata.location());
-    let collector = Arc::new(IcebergCommitCollector::new(
-        CommitOpKind::OverwritePartitions,
-        fixture.table_ident.clone(),
-        metadata.current_snapshot().map(|s| s.snapshot_id()),
-        metadata.last_sequence_number(),
-        metadata.current_schema().clone(),
-        metadata.default_partition_spec().clone(),
-        staging_dir,
-        crate::common::types::UniqueId { hi: 0, lo: 0 },
-    ));
+    let collector = Arc::new(
+        IcebergCommitCollector::new(
+            CommitOpKind::OverwritePartitions,
+            fixture.table_ident.clone(),
+            metadata.current_snapshot().map(|s| s.snapshot_id()),
+            metadata.last_sequence_number(),
+            metadata.current_schema().clone(),
+            metadata.default_partition_spec().clone(),
+            staging_dir,
+            crate::common::types::UniqueId { hi: 0, lo: 0 },
+        )
+        .with_table_metadata(metadata.clone()),
+    );
     for wf in written {
         collector.inject_written_file(wf);
     }

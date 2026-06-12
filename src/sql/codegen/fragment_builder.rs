@@ -1604,12 +1604,10 @@ impl<'a> PlanFragmentBuilder<'a> {
             }
         }
 
-        // Iceberg V3 row-lineage pseudo-columns (_row_id,
-        // _last_updated_sequence_number): register in ExprScope and emit as
-        // output slots so that SELECT _row_id references resolve in codegen
-        // and the slot flows through to the HDFS_SCAN_NODE tuple descriptor.
-        // Lowering picks up the slot by name via `is_iceberg_row_id` /
-        // `is_iceberg_last_updated_sequence_number` to populate
+        // Iceberg metadata pseudo-columns: register in ExprScope and emit as
+        // output slots so SELECT _file/_pos and v3 row-lineage references
+        // resolve in codegen and flow through to the HDFS_SCAN_NODE tuple
+        // descriptor. Lowering picks up the slot by name to populate
         // IcebergVirtualSpec.
         //
         // Note: these pseudo-columns are NOT in `scan.columns`, so the column
@@ -8625,6 +8623,38 @@ mod tests {
             partition_info[0].transform_expr.as_deref(),
             Some("bucket[16]")
         );
+    }
+
+    #[test]
+    fn build_with_iceberg_sink_preserves_delete_sink_mode() {
+        let plan = values_plan_for_test(vec![output_col_for_test(1, "id", DataType::Int32, false)]);
+        let connectors = crate::connector::ConnectorRegistry::new();
+        let mut spec = crate::sql::codegen::iceberg_write_sink::test_support::simple_sink_spec();
+        spec.mode = crate::sql::codegen::iceberg_write_sink::IcebergWriteSinkMode::PositionDeletes;
+        spec.iceberg.serialized_metadata = Some(
+            crate::sql::codegen::iceberg_write_sink::test_support::single_bucket_partition_metadata_json(),
+        );
+
+        let build = PlanFragmentBuilder::build_with_iceberg_sink(
+            &plan,
+            &DummyCatalog,
+            &connectors,
+            "default",
+            None,
+            &spec,
+        )
+        .expect("build with iceberg delete sink");
+
+        let root = build
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == build.root_fragment_id)
+            .expect("root fragment");
+        assert_eq!(
+            root.output_sink.type_,
+            data_sinks::TDataSinkType::ICEBERG_DELETE_SINK
+        );
+        assert!(root.output_sink.iceberg_table_sink.is_some());
     }
 
     #[test]

@@ -11,6 +11,7 @@ use super::type_infer::arrow_type_to_type_desc;
 
 #[derive(Clone, Debug)]
 pub(crate) struct IcebergWriteSinkSpec {
+    pub mode: IcebergWriteSinkMode,
     pub target_table_id: i64,
     pub target_table: TableDef,
     pub iceberg: IcebergTableInfo,
@@ -23,6 +24,22 @@ pub(crate) struct IcebergWriteSinkSpec {
     pub compression: types::TCompressionType,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IcebergWriteSinkMode {
+    Data,
+    RowLineageData,
+    PositionDeletes,
+}
+
+impl IcebergWriteSinkMode {
+    fn data_sink_type(self) -> data_sinks::TDataSinkType {
+        match self {
+            Self::Data | Self::RowLineageData => data_sinks::TDataSinkType::ICEBERG_TABLE_SINK,
+            Self::PositionDeletes => data_sinks::TDataSinkType::ICEBERG_DELETE_SINK,
+        }
+    }
+}
+
 pub(crate) fn synthetic_iceberg_write_table_id() -> i64 {
     -9_000_000_001
 }
@@ -30,7 +47,7 @@ pub(crate) fn synthetic_iceberg_write_table_id() -> i64 {
 impl IcebergWriteSinkSpec {
     pub(crate) fn build_sink(&self, tuple_id: i32) -> data_sinks::TDataSink {
         data_sinks::TDataSink::new(
-            data_sinks::TDataSinkType::ICEBERG_TABLE_SINK,
+            self.mode.data_sink_type(),
             None::<data_sinks::TDataStreamSink>,
             None::<data_sinks::TResultSink>,
             None::<data_sinks::TMysqlTableSink>,
@@ -307,6 +324,7 @@ pub(crate) mod test_support {
         };
 
         IcebergWriteSinkSpec {
+            mode: IcebergWriteSinkMode::Data,
             target_table_id: 99,
             target_table,
             iceberg,
@@ -440,6 +458,17 @@ mod tests {
             transform_to_thrift_string(&iceberg::spec::Transform::Day),
             "day"
         );
+    }
+
+    #[test]
+    fn build_sink_uses_delete_sink_type_for_position_deletes() {
+        let mut spec = test_support::simple_sink_spec();
+        spec.mode = IcebergWriteSinkMode::PositionDeletes;
+
+        let sink = spec.build_sink(3);
+
+        assert_eq!(sink.type_, data_sinks::TDataSinkType::ICEBERG_DELETE_SINK);
+        assert!(sink.iceberg_table_sink.is_some());
     }
 
     #[test]

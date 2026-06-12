@@ -510,16 +510,19 @@ pub(crate) fn execute_whole_table_rewrite_with_metrics_for_target(
         metadata.location(),
         uuid::Uuid::new_v4()
     );
-    let collector = Arc::new(IcebergCommitCollector::new(
-        CommitOpKind::RewriteDataFiles,
-        table_ident.clone(),
-        metadata.current_snapshot().map(|s| s.snapshot_id()),
-        metadata.last_sequence_number(),
-        metadata.current_schema().clone(),
-        metadata.default_partition_spec().clone(),
-        staging_dir,
-        UniqueId { hi: 0, lo: 0 },
-    ));
+    let collector = Arc::new(
+        IcebergCommitCollector::new(
+            CommitOpKind::RewriteDataFiles,
+            table_ident.clone(),
+            metadata.current_snapshot().map(|s| s.snapshot_id()),
+            metadata.last_sequence_number(),
+            metadata.current_schema().clone(),
+            metadata.default_partition_spec().clone(),
+            staging_dir,
+            UniqueId { hi: 0, lo: 0 },
+        )
+        .with_table_metadata(metadata.clone()),
+    );
     if preserve_row_lineage {
         collector.mark_preserve_row_lineage();
     }
