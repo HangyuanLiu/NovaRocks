@@ -137,7 +137,19 @@ pub(crate) fn decode_partition_descriptor(
 
     let mut decoded = Vec::with_capacity(values.len());
     for (idx, value) in values.into_iter().enumerate() {
-        if value.is_null.unwrap_or(false) {
+        let is_null = value
+            .is_null
+            .ok_or_else(|| IcebergWriteDescriptorError::DecodeFailed {
+                index: idx,
+                message: "partition descriptor value is missing null marker".to_string(),
+            })?;
+        if is_null {
+            if value.datum_bytes.is_some() {
+                return Err(IcebergWriteDescriptorError::DecodeFailed {
+                    index: idx,
+                    message: "partition descriptor null value must not carry payload".to_string(),
+                });
+            }
             decoded.push(None);
             continue;
         }
@@ -257,6 +269,50 @@ fn validate_descriptor_payload_bytes(
     index: usize,
 ) -> Result<(), IcebergWriteDescriptorError> {
     match primitive_type {
+        iceberg::spec::PrimitiveType::Boolean => {
+            if bytes.len() != 1 {
+                return Err(IcebergWriteDescriptorError::DecodeFailed {
+                    index,
+                    message: format!(
+                        "partition descriptor boolean payload length {} is invalid; expected 1",
+                        bytes.len()
+                    ),
+                });
+            }
+            if !matches!(bytes[0], 0 | 1) {
+                return Err(IcebergWriteDescriptorError::DecodeFailed {
+                    index,
+                    message: format!(
+                        "partition descriptor boolean payload must be 0 or 1, got {}",
+                        bytes[0]
+                    ),
+                });
+            }
+        }
+        iceberg::spec::PrimitiveType::Int
+        | iceberg::spec::PrimitiveType::Date
+        | iceberg::spec::PrimitiveType::Float => {
+            validate_exact_payload_len(bytes, 4, index)?;
+        }
+        iceberg::spec::PrimitiveType::Long
+        | iceberg::spec::PrimitiveType::Time
+        | iceberg::spec::PrimitiveType::Timestamp
+        | iceberg::spec::PrimitiveType::Timestamptz
+        | iceberg::spec::PrimitiveType::TimestampNs
+        | iceberg::spec::PrimitiveType::TimestamptzNs
+        | iceberg::spec::PrimitiveType::Double => {
+            validate_exact_payload_len(bytes, 8, index)?;
+        }
+        iceberg::spec::PrimitiveType::Uuid => {
+            validate_exact_payload_len(bytes, 16, index)?;
+        }
+        iceberg::spec::PrimitiveType::String | iceberg::spec::PrimitiveType::Binary => {}
+        iceberg::spec::PrimitiveType::Variant => {
+            return Err(IcebergWriteDescriptorError::DecodeFailed {
+                index,
+                message: "partition descriptor does not support variant payload".to_string(),
+            });
+        }
         iceberg::spec::PrimitiveType::Fixed(len) => {
             let expected =
                 usize::try_from(*len).map_err(|_| IcebergWriteDescriptorError::DecodeFailed {
@@ -292,7 +348,23 @@ fn validate_descriptor_payload_bytes(
                 });
             }
         }
-        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_exact_payload_len(
+    bytes: &[u8],
+    expected: usize,
+    index: usize,
+) -> Result<(), IcebergWriteDescriptorError> {
+    if bytes.len() != expected {
+        return Err(IcebergWriteDescriptorError::DecodeFailed {
+            index,
+            message: format!(
+                "partition descriptor payload length {} is not canonical; expected {expected}",
+                bytes.len()
+            ),
+        });
     }
     Ok(())
 }
@@ -368,6 +440,40 @@ mod tests {
         let spec = PartitionSpec::builder(schema.clone())
             .with_spec_id(7)
             .add_partition_field("region", "region", Transform::Identity)
+            .expect("partition field")
+            .build()
+            .expect("partition spec");
+        let creation = TableCreation::builder()
+            .name("t".to_string())
+            .location("file:///warehouse/db/t".to_string())
+            .schema(schema)
+            .partition_spec(spec)
+            .format_version(FormatVersion::V2)
+            .build();
+        TableMetadataBuilder::from_table_creation(creation)
+            .expect("table metadata builder")
+            .build()
+            .expect("table metadata")
+            .metadata
+    }
+
+    fn metadata_with_single_primitive_partition(
+        field_name: &str,
+        primitive_type: PrimitiveType,
+        spec_id: i32,
+    ) -> TableMetadata {
+        let schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                field_name,
+                Type::Primitive(primitive_type),
+            ))])
+            .build()
+            .expect("schema");
+        let spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(spec_id)
+            .add_partition_field(field_name, field_name, Transform::Identity)
             .expect("partition field")
             .build()
             .expect("partition spec");
@@ -741,6 +847,113 @@ mod tests {
 
         assert_eq!(err.code(), "IcebergWriteDescriptorMismatch");
         assert!(err.to_string().contains("has no payload"));
+    }
+
+    #[test]
+    fn descriptor_rejects_payload_for_null_value() {
+        let metadata = metadata_with_identity_partition();
+        let spec_id = metadata.default_partition_spec_id();
+        let desc = crate::types::TIcebergPartitionDescriptor {
+            values: Some(vec![crate::types::TIcebergPartitionValue {
+                is_null: Some(true),
+                datum_bytes: Some(b"west".to_vec()),
+            }]),
+        };
+
+        let err = decode_partition_descriptor(Some(desc), spec_id, &metadata)
+            .expect_err("expected malformed null payload");
+
+        assert_eq!(err.code(), "IcebergWriteDescriptorMismatch");
+        assert!(
+            err.to_string().contains("null value"),
+            "null value payload should be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn descriptor_rejects_missing_null_marker() {
+        let metadata = metadata_with_identity_partition();
+        let spec_id = metadata.default_partition_spec_id();
+        let desc = crate::types::TIcebergPartitionDescriptor {
+            values: Some(vec![crate::types::TIcebergPartitionValue {
+                is_null: None,
+                datum_bytes: Some(b"west".to_vec()),
+            }]),
+        };
+
+        let err = decode_partition_descriptor(Some(desc), spec_id, &metadata)
+            .expect_err("expected missing null marker");
+
+        assert_eq!(err.code(), "IcebergWriteDescriptorMismatch");
+        assert!(
+            err.to_string().contains("null marker"),
+            "missing null marker should be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn descriptor_rejects_malformed_boolean_payload() {
+        let metadata = metadata_with_single_primitive_partition("flag", PrimitiveType::Boolean, 11);
+        let spec_id = metadata.default_partition_spec_id();
+        for bytes in [vec![], vec![2], vec![0, 0]] {
+            let desc = crate::types::TIcebergPartitionDescriptor {
+                values: Some(vec![crate::types::TIcebergPartitionValue {
+                    is_null: Some(false),
+                    datum_bytes: Some(bytes.clone()),
+                }]),
+            };
+
+            let err = decode_partition_descriptor(Some(desc), spec_id, &metadata)
+                .expect_err("expected malformed boolean payload");
+
+            assert_eq!(err.code(), "IcebergWriteDescriptorMismatch");
+            assert!(
+                err.to_string().contains("boolean payload"),
+                "payload {bytes:?} should be rejected, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn descriptor_rejects_promoted_long_payload() {
+        let metadata = metadata_with_single_primitive_partition("l", PrimitiveType::Long, 12);
+        let spec_id = metadata.default_partition_spec_id();
+        let desc = crate::types::TIcebergPartitionDescriptor {
+            values: Some(vec![crate::types::TIcebergPartitionValue {
+                is_null: Some(false),
+                datum_bytes: Some(7_i32.to_le_bytes().to_vec()),
+            }]),
+        };
+
+        let err = decode_partition_descriptor(Some(desc), spec_id, &metadata)
+            .expect_err("expected non-canonical long payload");
+
+        assert_eq!(err.code(), "IcebergWriteDescriptorMismatch");
+        assert!(
+            err.to_string().contains("payload length"),
+            "4-byte long payload should be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn descriptor_rejects_promoted_double_payload() {
+        let metadata = metadata_with_single_primitive_partition("d", PrimitiveType::Double, 13);
+        let spec_id = metadata.default_partition_spec_id();
+        let desc = crate::types::TIcebergPartitionDescriptor {
+            values: Some(vec![crate::types::TIcebergPartitionValue {
+                is_null: Some(false),
+                datum_bytes: Some(7.0_f32.to_le_bytes().to_vec()),
+            }]),
+        };
+
+        let err = decode_partition_descriptor(Some(desc), spec_id, &metadata)
+            .expect_err("expected non-canonical double payload");
+
+        assert_eq!(err.code(), "IcebergWriteDescriptorMismatch");
+        assert!(
+            err.to_string().contains("payload length"),
+            "4-byte double payload should be rejected, got: {err}"
+        );
     }
 
     #[test]
