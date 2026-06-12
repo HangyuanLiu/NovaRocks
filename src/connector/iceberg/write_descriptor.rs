@@ -201,10 +201,18 @@ fn primitive_literal_to_iceberg_bytes(
         (PrimitiveLiteral::String(val), iceberg::spec::PrimitiveType::String) => {
             val.as_bytes().to_vec()
         }
-        (
-            PrimitiveLiteral::Binary(val),
-            iceberg::spec::PrimitiveType::Binary | iceberg::spec::PrimitiveType::Fixed(_),
-        ) => val.clone(),
+        (PrimitiveLiteral::Binary(val), iceberg::spec::PrimitiveType::Binary) => val.clone(),
+        (PrimitiveLiteral::Binary(val), iceberg::spec::PrimitiveType::Fixed(len)) => {
+            let expected = usize::try_from(*len)
+                .map_err(|_| format!("fixed length {len} cannot fit in usize"))?;
+            if val.len() != expected {
+                return Err(format!(
+                    "partition binary literal length {} does not match fixed length {expected}",
+                    val.len()
+                ));
+            }
+            val.clone()
+        }
         (PrimitiveLiteral::UInt128(val), iceberg::spec::PrimitiveType::Uuid) => {
             val.to_be_bytes().to_vec()
         }
@@ -215,7 +223,18 @@ fn primitive_literal_to_iceberg_bytes(
             let required_bytes = Type::decimal_required_bytes(*precision).map_err(|_| {
                 format!("PrimitiveType Decimal must has valid precision but got {precision}")
             })? as usize;
+            if !decimal_unscaled_fits_precision(*val, *precision) {
+                return Err(format!(
+                    "partition decimal literal {val} exceeds decimal precision {precision}"
+                ));
+            }
             let mut bytes = i128_to_be_bytes_min(*val);
+            if bytes.len() > required_bytes {
+                return Err(format!(
+                    "partition decimal literal {val} requires {} bytes but precision {precision} allows {required_bytes}",
+                    bytes.len()
+                ));
+            }
             bytes.truncate(required_bytes);
             bytes
         }
@@ -227,6 +246,13 @@ fn primitive_literal_to_iceberg_bytes(
     };
 
     Ok(bytes)
+}
+
+fn decimal_unscaled_fits_precision(value: i128, precision: u32) -> bool {
+    let Some(limit) = 10_i128.checked_pow(precision) else {
+        return false;
+    };
+    value < limit && value > -limit
 }
 
 fn i128_to_be_bytes_min(value: i128) -> Vec<u8> {
@@ -348,6 +374,69 @@ mod tests {
             .metadata
     }
 
+    fn metadata_with_decimal_partition() -> TableMetadata {
+        let schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "amount",
+                Type::Primitive(PrimitiveType::Decimal {
+                    precision: 3,
+                    scale: 0,
+                }),
+            ))])
+            .build()
+            .expect("schema");
+        let spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(9)
+            .add_partition_field("amount", "amount", Transform::Identity)
+            .expect("amount partition")
+            .build()
+            .expect("partition spec");
+        let creation = TableCreation::builder()
+            .name("t".to_string())
+            .location("file:///warehouse/db/t".to_string())
+            .schema(schema)
+            .partition_spec(spec)
+            .format_version(FormatVersion::V2)
+            .build();
+        TableMetadataBuilder::from_table_creation(creation)
+            .expect("table metadata builder")
+            .build()
+            .expect("table metadata")
+            .metadata
+    }
+
+    fn metadata_with_fixed_partition() -> TableMetadata {
+        let schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "token",
+                Type::Primitive(PrimitiveType::Fixed(4)),
+            ))])
+            .build()
+            .expect("schema");
+        let spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(10)
+            .add_partition_field("token", "token", Transform::Identity)
+            .expect("token partition")
+            .build()
+            .expect("partition spec");
+        let creation = TableCreation::builder()
+            .name("t".to_string())
+            .location("file:///warehouse/db/t".to_string())
+            .schema(schema)
+            .partition_spec(spec)
+            .format_version(FormatVersion::V2)
+            .build();
+        TableMetadataBuilder::from_table_creation(creation)
+            .expect("table metadata builder")
+            .build()
+            .expect("table metadata")
+            .metadata
+    }
+
     #[test]
     fn descriptor_round_trips_identity_partition() {
         let metadata = metadata_with_identity_partition();
@@ -384,6 +473,64 @@ mod tests {
             decode_partition_descriptor(Some(desc), spec_id, &metadata).expect("decode descriptor");
 
         assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn descriptor_round_trips_decimal_partition_value() {
+        let metadata = metadata_with_decimal_partition();
+        let spec_id = metadata.default_partition_spec_id();
+        let values = Struct::from_iter([Some(Literal::Primitive(PrimitiveLiteral::Int128(-123)))]);
+
+        let desc =
+            encode_partition_descriptor(&values, spec_id, &metadata).expect("encode descriptor");
+        let decoded =
+            decode_partition_descriptor(Some(desc), spec_id, &metadata).expect("decode descriptor");
+
+        assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn descriptor_round_trips_fixed_partition_value() {
+        let metadata = metadata_with_fixed_partition();
+        let spec_id = metadata.default_partition_spec_id();
+        let values = Struct::from_iter([Some(Literal::Primitive(PrimitiveLiteral::Binary(vec![
+            1, 2, 3, 4,
+        ])))]);
+
+        let desc =
+            encode_partition_descriptor(&values, spec_id, &metadata).expect("encode descriptor");
+        let decoded =
+            decode_partition_descriptor(Some(desc), spec_id, &metadata).expect("decode descriptor");
+
+        assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn descriptor_rejects_decimal_precision_overflow() {
+        let metadata = metadata_with_decimal_partition();
+        let spec_id = metadata.default_partition_spec_id();
+        let values = Struct::from_iter([Some(Literal::Primitive(PrimitiveLiteral::Int128(1000)))]);
+
+        let err = encode_partition_descriptor(&values, spec_id, &metadata)
+            .expect_err("expected precision overflow");
+
+        assert_eq!(err.code(), "IcebergWriteDescriptorMismatch");
+        assert!(err.to_string().contains("exceeds decimal precision"));
+    }
+
+    #[test]
+    fn descriptor_rejects_fixed_length_mismatch() {
+        let metadata = metadata_with_fixed_partition();
+        let spec_id = metadata.default_partition_spec_id();
+        let values = Struct::from_iter([Some(Literal::Primitive(PrimitiveLiteral::Binary(vec![
+            1, 2, 3,
+        ])))]);
+
+        let err = encode_partition_descriptor(&values, spec_id, &metadata)
+            .expect_err("expected fixed length mismatch");
+
+        assert_eq!(err.code(), "IcebergWriteDescriptorMismatch");
+        assert!(err.to_string().contains("fixed length"));
     }
 
     #[test]
