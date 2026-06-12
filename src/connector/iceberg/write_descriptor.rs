@@ -1,5 +1,7 @@
 use iceberg::spec::{Literal, PrimitiveLiteral, Struct, TableMetadata, Type};
 
+const MAX_TIME_MICROS: i64 = 24 * 60 * 60 * 1_000_000 - 1;
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum IcebergWriteDescriptorError {
     MissingDescriptor,
@@ -198,10 +200,17 @@ fn primitive_literal_to_iceberg_bytes(
             PrimitiveLiteral::Int(val),
             iceberg::spec::PrimitiveType::Int | iceberg::spec::PrimitiveType::Date,
         ) => val.to_le_bytes().to_vec(),
+        (PrimitiveLiteral::Long(val), iceberg::spec::PrimitiveType::Time) => {
+            if !time_micros_in_range(*val) {
+                return Err(format!(
+                    "partition time literal {val} is outside valid Iceberg time range 0..={MAX_TIME_MICROS}"
+                ));
+            }
+            val.to_le_bytes().to_vec()
+        }
         (
             PrimitiveLiteral::Long(val),
             iceberg::spec::PrimitiveType::Long
-            | iceberg::spec::PrimitiveType::Time
             | iceberg::spec::PrimitiveType::Timestamp
             | iceberg::spec::PrimitiveType::Timestamptz
             | iceberg::spec::PrimitiveType::TimestampNs
@@ -294,8 +303,25 @@ fn validate_descriptor_payload_bytes(
         | iceberg::spec::PrimitiveType::Float => {
             validate_exact_payload_len(bytes, 4, index)?;
         }
+        iceberg::spec::PrimitiveType::Time => {
+            validate_exact_payload_len(bytes, 8, index)?;
+            let value = i64::from_le_bytes(bytes.try_into().map_err(|_| {
+                IcebergWriteDescriptorError::DecodeFailed {
+                    index,
+                    message: "partition descriptor time payload must be exactly 8 bytes"
+                        .to_string(),
+                }
+            })?);
+            if !time_micros_in_range(value) {
+                return Err(IcebergWriteDescriptorError::DecodeFailed {
+                    index,
+                    message: format!(
+                        "partition time literal {value} is outside valid Iceberg time range 0..={MAX_TIME_MICROS}"
+                    ),
+                });
+            }
+        }
         iceberg::spec::PrimitiveType::Long
-        | iceberg::spec::PrimitiveType::Time
         | iceberg::spec::PrimitiveType::Timestamp
         | iceberg::spec::PrimitiveType::Timestamptz
         | iceberg::spec::PrimitiveType::TimestampNs
@@ -367,6 +393,10 @@ fn validate_exact_payload_len(
         });
     }
     Ok(())
+}
+
+fn time_micros_in_range(value: i64) -> bool {
+    (0..=MAX_TIME_MICROS).contains(&value)
 }
 
 fn validate_decoded_primitive_literal(
@@ -954,6 +984,65 @@ mod tests {
             err.to_string().contains("payload length"),
             "4-byte double payload should be rejected, got: {err}"
         );
+    }
+
+    #[test]
+    fn descriptor_round_trips_valid_time_boundaries() {
+        let metadata = metadata_with_single_primitive_partition("t", PrimitiveType::Time, 14);
+        let spec_id = metadata.default_partition_spec_id();
+        for value in [0_i64, MAX_TIME_MICROS] {
+            let values =
+                Struct::from_iter([Some(Literal::Primitive(PrimitiveLiteral::Long(value)))]);
+
+            let desc =
+                encode_partition_descriptor(&values, spec_id, &metadata).expect("encode time");
+            let decoded =
+                decode_partition_descriptor(Some(desc), spec_id, &metadata).expect("decode time");
+
+            assert_eq!(decoded, values);
+        }
+    }
+
+    #[test]
+    fn descriptor_rejects_out_of_range_time_literal() {
+        let metadata = metadata_with_single_primitive_partition("t", PrimitiveType::Time, 14);
+        let spec_id = metadata.default_partition_spec_id();
+        for value in [-1_i64, MAX_TIME_MICROS + 1] {
+            let values =
+                Struct::from_iter([Some(Literal::Primitive(PrimitiveLiteral::Long(value)))]);
+
+            let err = encode_partition_descriptor(&values, spec_id, &metadata)
+                .expect_err("expected out-of-range time");
+
+            assert_eq!(err.code(), "IcebergWriteDescriptorMismatch");
+            assert!(
+                err.to_string().contains("time literal"),
+                "value {value} should be rejected, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn descriptor_rejects_decoded_out_of_range_time_payload() {
+        let metadata = metadata_with_single_primitive_partition("t", PrimitiveType::Time, 14);
+        let spec_id = metadata.default_partition_spec_id();
+        for value in [-1_i64, MAX_TIME_MICROS + 1] {
+            let desc = crate::types::TIcebergPartitionDescriptor {
+                values: Some(vec![crate::types::TIcebergPartitionValue {
+                    is_null: Some(false),
+                    datum_bytes: Some(value.to_le_bytes().to_vec()),
+                }]),
+            };
+
+            let err = decode_partition_descriptor(Some(desc), spec_id, &metadata)
+                .expect_err("expected out-of-range time payload");
+
+            assert_eq!(err.code(), "IcebergWriteDescriptorMismatch");
+            assert!(
+                err.to_string().contains("time literal"),
+                "value {value} should be rejected, got: {err}"
+            );
+        }
     }
 
     #[test]
