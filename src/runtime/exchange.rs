@@ -20,14 +20,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use arrow::array::{Array, ArrayRef, Decimal128Array, Decimal256Array, Int8Array, make_array};
-use arrow::datatypes::{DataType, Schema, SchemaRef};
+use arrow::array::{Array, ArrayRef, Int8Array};
+use arrow::datatypes::{Schema, SchemaRef};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 
 use crate::common::ids::SlotId;
 use crate::common::types::format_uuid;
+use crate::exec::chunk::type_relation::{merge_fields_nullability, retag_column};
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::lower::type_lowering::arrow_type_from_desc;
@@ -158,7 +159,7 @@ fn merge_exchange_field(
     actual: &Arc<arrow::datatypes::Field>,
 ) -> Result<Arc<arrow::datatypes::Field>, String> {
     let data_type = merge_exchange_field_type(expected.data_type(), actual.data_type())?;
-    let nullable = expected.is_nullable() || actual.is_nullable();
+    let nullable = merge_fields_nullability(expected, actual);
     if &data_type == expected.data_type() && nullable == expected.is_nullable() {
         Ok(expected.clone())
     } else {
@@ -1079,80 +1080,22 @@ fn merged_exchange_schema(chunks: &[Chunk]) -> Result<SchemaRef, String> {
     Ok(Arc::new(Schema::new(fields)))
 }
 
-fn retag_decimal128_array_for_exchange(
-    array: &Decimal128Array,
-    target_precision: u8,
-    target_scale: i8,
-) -> Result<ArrayRef, String> {
-    let data = array
-        .to_data()
-        .into_builder()
-        .data_type(DataType::Decimal128(target_precision, target_scale))
-        .build()
-        .map_err(|e| e.to_string())?;
-    Ok(make_array(data))
-}
-
-fn retag_decimal256_array_for_exchange(
-    array: &Decimal256Array,
-    target_precision: u8,
-    target_scale: i8,
-) -> Result<ArrayRef, String> {
-    let data = array
-        .to_data()
-        .into_builder()
-        .data_type(DataType::Decimal256(target_precision, target_scale))
-        .build()
-        .map_err(|e| e.to_string())?;
-    Ok(make_array(data))
-}
-
 fn normalize_exchange_array_for_field(
     array: &ArrayRef,
     field: &arrow::datatypes::Field,
 ) -> Result<ArrayRef, String> {
-    if array.data_type() == field.data_type() {
-        return Ok(array.clone());
-    }
-
-    match (array.data_type(), field.data_type()) {
-        (
-            DataType::Decimal128(_, source_scale),
-            DataType::Decimal128(target_precision, target_scale),
-        ) if source_scale == target_scale => {
-            let decimal = array
-                .as_any()
-                .downcast_ref::<Decimal128Array>()
-                .ok_or_else(|| {
-                    format!(
-                        "exchange decimal128 array downcast failed: array_type={:?}",
-                        array.data_type()
-                    )
-                })?;
-            retag_decimal128_array_for_exchange(decimal, *target_precision, *target_scale)
-        }
-        (
-            DataType::Decimal256(_, source_scale),
-            DataType::Decimal256(target_precision, target_scale),
-        ) if source_scale == target_scale => {
-            let decimal = array
-                .as_any()
-                .downcast_ref::<Decimal256Array>()
-                .ok_or_else(|| {
-                    format!(
-                        "exchange decimal256 array downcast failed: array_type={:?}",
-                        array.data_type()
-                    )
-                })?;
-            retag_decimal256_array_for_exchange(decimal, *target_precision, *target_scale)
-        }
-        _ => Err(format!(
-            "exchange array type mismatch for field {}: array={:?} field={:?}",
+    // Metadata-only retag of the column to the merged wire schema's type, via
+    // the single type-relation primitive (same-scale decimal / utf8<->binary /
+    // recursive). Replaces the exchange-local decimal retag helpers.
+    retag_column(array, field.data_type()).map_err(|m| {
+        format!(
+            "exchange array retag failed for field {}: array={:?} field={:?} ({:?})",
             field.name(),
             array.data_type(),
-            field.data_type()
-        )),
-    }
+            field.data_type(),
+            m.kind
+        )
+    })
 }
 
 fn normalize_exchange_batch_for_schema(
