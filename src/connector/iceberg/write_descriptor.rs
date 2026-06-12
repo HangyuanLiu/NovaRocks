@@ -256,21 +256,43 @@ fn validate_descriptor_payload_bytes(
     primitive_type: &iceberg::spec::PrimitiveType,
     index: usize,
 ) -> Result<(), IcebergWriteDescriptorError> {
-    if let iceberg::spec::PrimitiveType::Fixed(len) = primitive_type {
-        let expected =
-            usize::try_from(*len).map_err(|_| IcebergWriteDescriptorError::DecodeFailed {
-                index,
-                message: format!("fixed length {len} cannot fit in usize"),
-            })?;
-        if bytes.len() != expected {
-            return Err(IcebergWriteDescriptorError::DecodeFailed {
-                index,
-                message: format!(
-                    "partition descriptor payload length {} does not match fixed length {expected}",
-                    bytes.len()
-                ),
-            });
+    match primitive_type {
+        iceberg::spec::PrimitiveType::Fixed(len) => {
+            let expected =
+                usize::try_from(*len).map_err(|_| IcebergWriteDescriptorError::DecodeFailed {
+                    index,
+                    message: format!("fixed length {len} cannot fit in usize"),
+                })?;
+            if bytes.len() != expected {
+                return Err(IcebergWriteDescriptorError::DecodeFailed {
+                    index,
+                    message: format!(
+                        "partition descriptor payload length {} does not match fixed length {expected}",
+                        bytes.len()
+                    ),
+                });
+            }
         }
+        iceberg::spec::PrimitiveType::Decimal { precision, .. } => {
+            let required_bytes = Type::decimal_required_bytes(*precision).map_err(|_| {
+                IcebergWriteDescriptorError::DecodeFailed {
+                    index,
+                    message: format!(
+                        "PrimitiveType Decimal must has valid precision but got {precision}"
+                    ),
+                }
+            })? as usize;
+            if bytes.is_empty() || bytes.len() > required_bytes {
+                return Err(IcebergWriteDescriptorError::DecodeFailed {
+                    index,
+                    message: format!(
+                        "partition descriptor decimal payload length {} is invalid for precision {precision}; expected 1..={required_bytes}",
+                        bytes.len()
+                    ),
+                });
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -590,13 +612,31 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_decodes_minimal_negative_decimal_payload() {
+        let metadata = metadata_with_decimal_partition();
+        let spec_id = metadata.default_partition_spec_id();
+        let desc = crate::types::TIcebergPartitionDescriptor {
+            values: Some(vec![crate::types::TIcebergPartitionValue {
+                is_null: Some(false),
+                datum_bytes: Some(vec![0xff]),
+            }]),
+        };
+
+        let decoded = decode_partition_descriptor(Some(desc), spec_id, &metadata)
+            .expect("minimal negative payload should decode");
+
+        assert_eq!(
+            decoded,
+            Struct::from_iter([Some(Literal::Primitive(PrimitiveLiteral::Int128(-1)))])
+        );
+    }
+
+    #[test]
     fn descriptor_rejects_decoded_decimal_precision_overflow() {
         let metadata = metadata_with_decimal_partition();
         let spec_id = metadata.default_partition_spec_id();
-        for (value, bytes) in [
-            (1000_i128, 1000_i128.to_be_bytes().to_vec()),
-            (-1000_i128, (-1000_i128).to_be_bytes().to_vec()),
-        ] {
+        for value in [1000_i128, -1000_i128] {
+            let bytes = i128_to_be_bytes_min(value);
             let desc = crate::types::TIcebergPartitionDescriptor {
                 values: Some(vec![crate::types::TIcebergPartitionValue {
                     is_null: Some(false),
@@ -611,6 +651,29 @@ mod tests {
             assert!(
                 err.to_string().contains("exceeds decimal precision"),
                 "value {value} should be rejected, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn descriptor_rejects_malformed_decimal_payload_width() {
+        let metadata = metadata_with_decimal_partition();
+        let spec_id = metadata.default_partition_spec_id();
+        for bytes in [vec![], vec![0x00, 0x00, 0x01], vec![0xff, 0xff, 0xff]] {
+            let desc = crate::types::TIcebergPartitionDescriptor {
+                values: Some(vec![crate::types::TIcebergPartitionValue {
+                    is_null: Some(false),
+                    datum_bytes: Some(bytes.clone()),
+                }]),
+            };
+
+            let err = decode_partition_descriptor(Some(desc), spec_id, &metadata)
+                .expect_err("expected malformed decimal payload");
+
+            assert_eq!(err.code(), "IcebergWriteDescriptorMismatch");
+            assert!(
+                err.to_string().contains("decimal payload"),
+                "payload {bytes:?} should be rejected, got: {err}"
             );
         }
     }
