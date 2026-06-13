@@ -6,6 +6,10 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
 
+#[path = "../../../src/common/engine_error_codes.rs"]
+mod engine_error_codes;
+use engine_error_codes::EngineErrorCode;
+
 /// Scan raw SQL content (before placeholder substitution) for `${case_db}` and
 /// `${case_db_N}` references.  Returns the resolved database names in order.
 /// Index 0 is the primary `${case_db}`, index 1 is `${case_db_2}`, etc.
@@ -92,6 +96,12 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
             }
             "expect_error" => {
                 meta.expect_error = Some(raw_value);
+            }
+            "expect_error_code" => {
+                if EngineErrorCode::parse(&raw_value).is_none() {
+                    bail!("unknown expect_error_code: {}", raw_value);
+                }
+                meta.expect_error_code = Some(raw_value);
             }
             "result_contains" => {
                 meta.result_contains.push(raw_value);
@@ -193,6 +203,10 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
             .expect_error
             .clone()
             .or_else(|| base.expect_error.clone()),
+        expect_error_code: override_meta
+            .expect_error_code
+            .clone()
+            .or_else(|| base.expect_error_code.clone()),
         result_contains: if override_meta.result_contains.is_empty() {
             base.result_contains.clone()
         } else {
@@ -630,6 +644,64 @@ mod opt5_directive_tests {
         assert_eq!(meta.network_partition_be, Some(2));
         assert_eq!(meta.heartbeat_delay_ms, Some(250));
         assert_eq!(meta.restart_be_delay_ms, Some(500));
+    }
+
+    #[test]
+    fn parse_expect_error_code_meta() {
+        let re = meta_re();
+        let lines = vec!["-- @expect_error_code=IcebergWriteDescriptorMismatch".to_string()];
+
+        let meta = parse_meta(&lines, &re).expect("parse ok");
+
+        assert_eq!(
+            meta.expect_error_code,
+            Some("IcebergWriteDescriptorMismatch".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_expect_error_code_rejects_unknown_code() {
+        let re = meta_re();
+        let lines = vec!["-- @expect_error_code=NotARealCode".to_string()];
+
+        let err = parse_meta(&lines, &re).expect_err("unknown code should fail");
+
+        assert!(
+            err.to_string()
+                .contains("unknown expect_error_code: NotARealCode"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn merge_meta_overrides_expect_error_code_when_present() {
+        let base = QueryMeta {
+            expect_error_code: Some("CommitUnknown".to_string()),
+            ..QueryMeta::default()
+        };
+        let override_meta = QueryMeta {
+            expect_error_code: Some("ProtocolDecodeError".to_string()),
+            ..QueryMeta::default()
+        };
+
+        let merged = merge_meta(&base, &override_meta);
+
+        assert_eq!(
+            merged.expect_error_code,
+            Some("ProtocolDecodeError".to_string())
+        );
+    }
+
+    #[test]
+    fn merge_meta_inherits_expect_error_code_when_override_empty() {
+        let base = QueryMeta {
+            expect_error_code: Some("CommitUnknown".to_string()),
+            ..QueryMeta::default()
+        };
+
+        let merged = merge_meta(&base, &QueryMeta::default());
+
+        assert_eq!(merged.expect_error_code, Some("CommitUnknown".to_string()));
     }
 
     #[test]

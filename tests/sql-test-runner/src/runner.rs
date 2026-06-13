@@ -2,6 +2,10 @@ use crate::types::ConnectionConfig;
 use anyhow::{Result, bail};
 use std::collections::HashSet;
 
+#[path = "../../../src/common/engine_error_codes.rs"]
+mod engine_error_codes;
+use engine_error_codes::EngineErrorCode;
+
 pub fn error_message_matches(actual: &str, expected_substring: &str) -> bool {
     if expected_substring.trim().is_empty() {
         return false;
@@ -9,6 +13,76 @@ pub fn error_message_matches(actual: &str, expected_substring: &str) -> bool {
     actual
         .to_ascii_lowercase()
         .contains(&expected_substring.to_ascii_lowercase())
+}
+
+pub fn extract_engine_error_code(actual: &str) -> Option<String> {
+    let message = engine_error_message_body(actual);
+    let Some(candidate_start) = message.strip_prefix('[') else {
+        return None;
+    };
+    let close_idx = candidate_start.find(']')?;
+    let candidate = &candidate_start[..close_idx];
+    if EngineErrorCode::parse(candidate).is_some() {
+        Some(candidate.to_string())
+    } else {
+        None
+    }
+}
+
+fn engine_error_message_body(actual: &str) -> &str {
+    let mut rest = actual.trim_start();
+    loop {
+        if let Some(stripped) = strip_runner_error_prefix(rest) {
+            rest = stripped.trim_start();
+            continue;
+        }
+        if let Some(stripped) = strip_mysql_error_debug_wrapper(rest) {
+            rest = stripped.trim_start();
+            continue;
+        }
+        if let Some(stripped) = strip_mysql_error_prefix(rest) {
+            rest = stripped.trim_start();
+            continue;
+        }
+        return rest;
+    }
+}
+
+fn strip_runner_error_prefix(message: &str) -> Option<&str> {
+    for prefix in ["ERROR (", "FAIL ("] {
+        let Some(rest) = message.strip_prefix(prefix) else {
+            continue;
+        };
+        let close_idx = rest.find("): ")?;
+        return Some(&rest[close_idx + "): ".len()..]);
+    }
+    None
+}
+
+fn strip_mysql_error_debug_wrapper(message: &str) -> Option<&str> {
+    let rest = message.strip_prefix("MySqlError { ")?;
+    let rest = rest.strip_suffix(" }").unwrap_or(rest);
+    if rest.starts_with("ERROR ") {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
+fn strip_mysql_error_prefix(message: &str) -> Option<&str> {
+    let rest = message.strip_prefix("ERROR ")?;
+    let mut rest = rest.strip_prefix(|ch: char| ch.is_ascii_digit())?;
+    while let Some(stripped) = rest.strip_prefix(|ch: char| ch.is_ascii_digit()) {
+        rest = stripped;
+    }
+    let rest = rest.strip_prefix(" (")?;
+    let close_idx = rest.find("): ")?;
+    let sql_state = &rest[..close_idx];
+    if sql_state.len() == 5 && sql_state.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+        Some(&rest[close_idx + "): ".len()..])
+    } else {
+        None
+    }
 }
 
 pub fn is_transient_iceberg_commit_error(message: &str) -> bool {
@@ -59,4 +133,85 @@ pub fn summarize_connection(label: &str, conn: &ConnectionConfig) -> String {
         "{}: mysql={}, host={}:{}, user={}, catalog={}, db={}",
         label, conn.mysql, conn.host, conn.port, conn.user, catalog, db
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_engine_error_code_reads_bracket_prefix() {
+        let actual =
+            "ERROR 1105 (HY000): [IcebergWriteDescriptorMismatch] missing partition descriptor";
+
+        assert_eq!(
+            extract_engine_error_code(actual),
+            Some("IcebergWriteDescriptorMismatch".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_engine_error_code_reads_plain_bracket_prefix() {
+        assert_eq!(
+            extract_engine_error_code("[CommitUnknown] commit outcome unavailable"),
+            Some("CommitUnknown".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_engine_error_code_reads_mysql_error_debug_wrapper() {
+        let actual = "FAIL (0.00s): MySqlError { ERROR 1235 (42000): [UnsupportedDistributedDmlShape] ADMIN RAISE ENGINE ERROR: forced P8 SQL runner error-code smoke }";
+
+        assert_eq!(
+            extract_engine_error_code(actual),
+            Some("UnsupportedDistributedDmlShape".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_engine_error_code_rejects_malformed_mysql_error_debug_wrapper() {
+        let actual = "FAIL (0.00s): MySqlError { [CommitUnknown] bare wrapper }";
+
+        assert_eq!(extract_engine_error_code(actual), None);
+    }
+
+    #[test]
+    fn extract_engine_error_code_rejects_non_prefix_brackets() {
+        assert_eq!(
+            extract_engine_error_code("ERROR 1105 (HY000): validation failed near [CommitUnknown]"),
+            None
+        );
+        assert_eq!(
+            extract_engine_error_code("plain context [CommitUnknown]"),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_engine_error_code_returns_none_for_plain_error() {
+        assert_eq!(
+            extract_engine_error_code("ERROR 1105 (HY000): plain error"),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_engine_error_code_rejects_lowercase_and_punctuation() {
+        assert_eq!(
+            extract_engine_error_code("ERROR 1105 (HY000): [icebergWriteDescriptorMismatch] bad"),
+            None
+        );
+        assert_eq!(
+            extract_engine_error_code("ERROR 1105 (HY000): [Iceberg-Write] bad"),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_engine_error_code_rejects_unknown_code_name() {
+        assert_eq!(
+            extract_engine_error_code("ERROR 1105 (HY000): [NotARealCode] bad"),
+            None
+        );
+    }
 }

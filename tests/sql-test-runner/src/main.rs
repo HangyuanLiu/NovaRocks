@@ -25,7 +25,9 @@ use crate::results::{
     step_has_implicit_skip_result, step_requires_recorded_result, step_retry_count,
     step_retry_interval, verify_text_assertions, write_mismatch_artifacts, write_result_file,
 };
-use crate::runner::{error_message_matches, parse_selector_list, summarize_connection};
+use crate::runner::{
+    error_message_matches, extract_engine_error_code, parse_selector_list, summarize_connection,
+};
 use crate::session::{MysqlSession, drop_case_database, execute_suite_hook, reset_case_database};
 use crate::types::*;
 use anyhow::{Context, Result, bail};
@@ -75,6 +77,92 @@ enum CaseStatus {
     Pass,
     Fail,
     Skipped,
+}
+
+fn expected_engine_error_code_result(err_msg: &str, expected_code: &str) -> Result<(), String> {
+    let actual_code = extract_engine_error_code(err_msg);
+    if actual_code.as_deref() == Some(expected_code) {
+        Ok(())
+    } else {
+        Err(format!(
+            "expected engine error code {:?}, got {:?}: {}",
+            expected_code, actual_code, err_msg
+        ))
+    }
+}
+
+fn evaluate_expected_error_branch(
+    meta: &QueryMeta,
+    ok: bool,
+    err_msg: &str,
+) -> Option<Result<(), String>> {
+    if let Some(expected_code) = meta.expect_error_code.as_deref() {
+        return Some(if ok {
+            Err(format!(
+                "expected engine error code {:?}, but query succeeded",
+                expected_code
+            ))
+        } else {
+            expected_engine_error_code_result(err_msg, expected_code)
+        });
+    }
+
+    let expected_error = meta.expect_error.as_deref()?;
+    Some(if ok {
+        Err(format!(
+            "expected error containing {:?}, but query succeeded",
+            expected_error
+        ))
+    } else if error_message_matches(err_msg, expected_error) {
+        Ok(())
+    } else {
+        Err(format!(
+            "expected error containing {:?}, got: {}",
+            expected_error, err_msg
+        ))
+    })
+}
+
+fn annotate_failure_with_engine_error_code(message: &str, source: &str) -> String {
+    if message.contains("engine_error_code=") {
+        return message.to_string();
+    }
+    extract_engine_error_code(source)
+        .or_else(|| extract_engine_error_code(message))
+        .or_else(|| {
+            message
+                .strip_prefix("target execute failed: ")
+                .and_then(extract_engine_error_code)
+        })
+        .map(|code| format!("engine_error_code={} {}", code, message))
+        .unwrap_or_else(|| message.to_string())
+}
+
+fn expected_engine_error_code_diff_result(
+    expected_code: &str,
+    target_ok: bool,
+    target_err: &str,
+    reference_ok: bool,
+    reference_err: &str,
+) -> Result<(), String> {
+    let target_code = extract_engine_error_code(target_err);
+    let reference_code = extract_engine_error_code(reference_err);
+    let target_matched = !target_ok && target_code.as_deref() == Some(expected_code);
+    let reference_matched = !reference_ok && reference_code.as_deref() == Some(expected_code);
+    if target_matched && reference_matched {
+        Ok(())
+    } else {
+        Err(format!(
+            "expected engine error code {:?} (target_ok={}, target_code={:?}, target_err={}, reference_ok={}, reference_code={:?}, reference_err={})",
+            expected_code,
+            target_ok,
+            target_code,
+            target_err,
+            reference_ok,
+            reference_code,
+            reference_err
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -939,24 +1027,22 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     case_elapsed += elapsed;
                     last_execution = execution.clone();
 
-                    if let Some(expected_error) = step.meta.expect_error.as_deref() {
-                        if ok {
-                            last_failure = format!(
-                                "expected error containing {:?}, but query succeeded",
-                                expected_error
-                            );
-                        } else if error_message_matches(&err_msg, expected_error) {
+                    if let Some(expected_result) =
+                        evaluate_expected_error_branch(&step.meta, ok, &err_msg)
+                    {
+                        if let Err(reason) = expected_result {
+                            last_failure =
+                                annotate_failure_with_engine_error_code(&reason, &err_msg);
+                        } else {
                             matched_expected_error = true;
                             last_failure = err_msg.clone();
                             break;
-                        } else {
-                            last_failure = format!(
-                                "expected error containing {:?}, got: {}",
-                                expected_error, err_msg
-                            );
                         }
                     } else if !ok || execution.is_none() {
-                        last_failure = format!("target execute failed: {}", err_msg);
+                        last_failure = annotate_failure_with_engine_error_code(
+                            &format!("target execute failed: {}", err_msg),
+                            &err_msg,
+                        );
                     } else {
                         let execution = execution.expect("checked above");
                         let (assertions_ok, assertions_reason) =
@@ -1028,7 +1114,22 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     }
                 }
 
-                if let Some(expected_error) = step.meta.expect_error.as_deref() {
+                if let Some(expected_code) = step.meta.expect_error_code.as_deref() {
+                    if matched_expected_error {
+                        let _ = writeln!(
+                            log,
+                            "    ✅ PASS (expected error matched): engine_error_code={} {}",
+                            expected_code, last_failure
+                        );
+                    } else {
+                        case_failed = true;
+                        let _ = writeln!(
+                            log,
+                            "    ❌ {}",
+                            annotate_failure_with_engine_error_code(&last_failure, &last_failure)
+                        );
+                    }
+                } else if let Some(expected_error) = step.meta.expect_error.as_deref() {
                     if matched_expected_error {
                         let _ = writeln!(
                             log,
@@ -1037,7 +1138,11 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         );
                     } else {
                         case_failed = true;
-                        let _ = writeln!(log, "    ❌ {}", last_failure);
+                        let _ = writeln!(
+                            log,
+                            "    ❌ {}",
+                            annotate_failure_with_engine_error_code(&last_failure, &last_failure)
+                        );
                         let _ = expected_error;
                     }
                 } else if let Some(execution) = passed_execution {
@@ -1113,7 +1218,11 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     }
                 } else {
                     case_failed = true;
-                    let _ = writeln!(log, "    ❌ {}", last_failure);
+                    let _ = writeln!(
+                        log,
+                        "    ❌ {}",
+                        annotate_failure_with_engine_error_code(&last_failure, &last_failure)
+                    );
                     if let (Some(root), Some(expected), Some(execution)) = (
                         ctx.actual_artifact_dir.as_ref(),
                         expected_results
@@ -1193,21 +1302,15 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         .unwrap_or_default();
                     case_elapsed += elapsed;
 
-                    if let Some(expected_error) = step.meta.expect_error.as_deref() {
-                        if ok {
-                            last_failure = format!(
-                                "expected error containing {:?}, but query succeeded",
-                                expected_error
-                            );
-                        } else if error_message_matches(&err_msg, expected_error) {
+                    if let Some(expected_result) =
+                        evaluate_expected_error_branch(&step.meta, ok, &err_msg)
+                    {
+                        if let Err(reason) = expected_result {
+                            last_failure = reason;
+                        } else {
                             matched_expected_error = true;
                             last_failure = err_msg.clone();
                             break;
-                        } else {
-                            last_failure = format!(
-                                "expected error containing {:?}, got: {}",
-                                expected_error, err_msg
-                            );
                         }
                     } else if !ok || execution.is_none() {
                         last_failure = format!("record source execute failed: {}", err_msg);
@@ -1236,7 +1339,18 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     }
                 }
 
-                if step.meta.expect_error.is_some() {
+                if let Some(expected_code) = step.meta.expect_error_code.as_deref() {
+                    if matched_expected_error {
+                        let _ = writeln!(
+                            log,
+                            "    ✅ RECORDED EXPECTED ERROR: engine_error_code={} {}",
+                            expected_code, last_failure
+                        );
+                    } else {
+                        case_failed = true;
+                        let _ = writeln!(log, "    ❌ {}", last_failure);
+                    }
+                } else if step.meta.expect_error.is_some() {
                     if matched_expected_error {
                         let _ = writeln!(log, "    ✅ RECORDED EXPECTED ERROR: {}", last_failure);
                     } else {
@@ -1313,7 +1427,64 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                 }
             }
             Mode::Diff => {
-                if let Some(expected_error) = step.meta.expect_error.as_deref() {
+                if let Some(expected_code) = step.meta.expect_error_code.as_deref() {
+                    let (ok_t, execution_t, err_t) = if shell::is_shell_step(&step.sql) {
+                        let cmd = step
+                            .sql
+                            .trim_start()
+                            .strip_prefix("shell:")
+                            .unwrap_or("")
+                            .trim();
+                        let exec = shell::execute_shell_command(cmd);
+                        (true, Some(exec), String::new())
+                    } else {
+                        target_session.execute_query(
+                            ctx.query_timeout,
+                            &step.sql,
+                            step.meta.db.as_deref(),
+                        )
+                    };
+                    let (ok_r, execution_r, err_r) = if shell::is_shell_step(&step.sql) {
+                        let cmd = step
+                            .sql
+                            .trim_start()
+                            .strip_prefix("shell:")
+                            .unwrap_or("")
+                            .trim();
+                        let exec = shell::execute_shell_command(cmd);
+                        (true, Some(exec), String::new())
+                    } else {
+                        reference_session
+                            .as_mut()
+                            .expect("reference session required in diff mode")
+                            .execute_query(ctx.query_timeout, &step.sql, step.meta.db.as_deref())
+                    };
+                    let elapsed = execution_t.as_ref().map(|r| r.elapsed).unwrap_or_default()
+                        + execution_r.as_ref().map(|r| r.elapsed).unwrap_or_default();
+                    case_elapsed += elapsed;
+
+                    let expected_code_result = expected_engine_error_code_diff_result(
+                        expected_code,
+                        ok_t,
+                        &err_t,
+                        ok_r,
+                        &err_r,
+                    );
+                    if expected_code_result.is_ok() {
+                        let _ = writeln!(
+                            log,
+                            "    ✅ DIFF PASS (both sides matched expected error: engine_error_code={})",
+                            expected_code
+                        );
+                    } else {
+                        case_failed = true;
+                        let _ = writeln!(
+                            log,
+                            "    ❌ DIFF FAILED {}",
+                            expected_code_result.expect_err("checked mismatch above")
+                        );
+                    }
+                } else if let Some(expected_error) = step.meta.expect_error.as_deref() {
                     let (ok_t, execution_t, err_t) = if shell::is_shell_step(&step.sql) {
                         let cmd = step
                             .sql
@@ -1384,7 +1555,11 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     };
                     if !ok_t || execution_t.is_none() {
                         case_failed = true;
-                        let _ = writeln!(log, "    ❌ target execute failed: {}", err_t);
+                        let failure = annotate_failure_with_engine_error_code(
+                            &format!("target execute failed: {}", err_t),
+                            &err_t,
+                        );
+                        let _ = writeln!(log, "    ❌ {}", failure);
                     } else {
                         let execution_t = execution_t.expect("checked above");
                         let (ok_r, execution_r, err_r) = if shell::is_shell_step(&step.sql) {
@@ -2414,7 +2589,11 @@ mod tests {
     use crate::results::{load_expected_results, parse_output, write_result_file};
     use crate::runner::{is_transient_iceberg_commit_error, parse_selector_list};
     use crate::types::{QueryMeta, ResultSet, SqlCase, SqlStep};
-    use crate::{Cli, validate_fault_injection_jobs};
+    use crate::{
+        Cli, annotate_failure_with_engine_error_code, evaluate_expected_error_branch,
+        expected_engine_error_code_diff_result, expected_engine_error_code_result,
+        validate_fault_injection_jobs,
+    };
     use clap::Parser;
     use regex::Regex;
     use std::collections::BTreeMap;
@@ -2489,6 +2668,165 @@ mod tests {
         validate_fault_injection_jobs(&cases, 1).expect("serial jobs should be accepted");
         validate_fault_injection_jobs(&[test_case_with_meta(QueryMeta::default())], 8)
             .expect("cases without fault directives should allow parallel jobs");
+    }
+
+    #[test]
+    fn expect_error_code_result_accepts_matching_code() {
+        expected_engine_error_code_result(
+            "ERROR (0.01s): ERROR 1105 (HY000): [CommitUnknown] commit outcome unavailable",
+            "CommitUnknown",
+        )
+        .expect("matching code should pass");
+    }
+
+    #[test]
+    fn expect_error_code_result_reports_missing_code() {
+        let err = expected_engine_error_code_result(
+            "ERROR (0.01s): ERROR 1105 (HY000): plain error",
+            "CommitUnknown",
+        )
+        .expect_err("missing code should fail");
+
+        assert!(
+            err.contains("expected engine error code \"CommitUnknown\", got None"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn expect_error_code_takes_precedence_over_expect_error() {
+        let meta = QueryMeta {
+            expect_error: Some("different substring".to_string()),
+            expect_error_code: Some("CommitUnknown".to_string()),
+            ..QueryMeta::default()
+        };
+
+        let result = evaluate_expected_error_branch(
+            &meta,
+            false,
+            "ERROR (0.01s): ERROR 1105 (HY000): [CommitUnknown] commit outcome unavailable",
+        )
+        .expect("expected branch should be active");
+
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn expect_error_code_branch_fails_when_query_succeeds() {
+        let meta = QueryMeta {
+            expect_error_code: Some("CommitUnknown".to_string()),
+            ..QueryMeta::default()
+        };
+
+        let err = evaluate_expected_error_branch(&meta, true, "")
+            .expect("expected branch should be active")
+            .expect_err("success should fail an expected code branch");
+
+        assert!(
+            err.contains("expected engine error code \"CommitUnknown\", but query succeeded"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn expect_error_code_branch_reports_mismatched_code() {
+        let meta = QueryMeta {
+            expect_error_code: Some("CommitUnknown".to_string()),
+            ..QueryMeta::default()
+        };
+
+        let err = evaluate_expected_error_branch(
+            &meta,
+            false,
+            "ERROR (0.01s): ERROR 1105 (HY000): [ProtocolDecodeError] bad payload",
+        )
+        .expect("expected branch should be active")
+        .expect_err("wrong code should fail");
+
+        assert!(
+            err.contains(
+                "expected engine error code \"CommitUnknown\", got Some(\"ProtocolDecodeError\")"
+            ),
+            "unexpected error: {err}"
+        );
+        assert!(err.contains("[ProtocolDecodeError] bad payload"));
+    }
+
+    #[test]
+    fn expect_error_code_branch_reports_missing_code() {
+        let meta = QueryMeta {
+            expect_error_code: Some("CommitUnknown".to_string()),
+            ..QueryMeta::default()
+        };
+
+        let err = evaluate_expected_error_branch(
+            &meta,
+            false,
+            "ERROR (0.01s): ERROR 1105 (HY000): plain error",
+        )
+        .expect("expected branch should be active")
+        .expect_err("missing code should fail");
+
+        assert!(
+            err.contains("expected engine error code \"CommitUnknown\", got None"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn expect_error_code_diff_requires_both_sides_to_match() {
+        expected_engine_error_code_diff_result(
+            "CommitUnknown",
+            false,
+            "ERROR (0.01s): ERROR 1105 (HY000): [CommitUnknown] target",
+            false,
+            "ERROR (0.01s): ERROR 1105 (HY000): [CommitUnknown] reference",
+        )
+        .expect("both sides should match");
+
+        let one_side_success = expected_engine_error_code_diff_result(
+            "CommitUnknown",
+            true,
+            "",
+            false,
+            "ERROR (0.01s): ERROR 1105 (HY000): [CommitUnknown] reference",
+        )
+        .expect_err("target success should fail");
+        assert!(
+            one_side_success.contains("target_ok=true"),
+            "unexpected error: {one_side_success}"
+        );
+
+        let wrong_code = expected_engine_error_code_diff_result(
+            "CommitUnknown",
+            false,
+            "ERROR (0.01s): ERROR 1105 (HY000): [ProtocolDecodeError] target",
+            false,
+            "ERROR (0.01s): ERROR 1105 (HY000): [CommitUnknown] reference",
+        )
+        .expect_err("wrong target code should fail");
+        assert!(
+            wrong_code.contains("target_code=Some(\"ProtocolDecodeError\")"),
+            "unexpected error: {wrong_code}"
+        );
+    }
+
+    #[test]
+    fn failure_log_includes_engine_error_code_when_available() {
+        let msg =
+            "target execute failed: FAIL (0.00s): ERROR 1105 (HY000): [QueryTimeout] slow query";
+
+        assert_eq!(
+            annotate_failure_with_engine_error_code(msg, msg),
+            "engine_error_code=QueryTimeout target execute failed: FAIL (0.00s): ERROR 1105 (HY000): [QueryTimeout] slow query"
+        );
+    }
+
+    #[test]
+    fn failure_log_leaves_plain_errors_unclassified() {
+        let msg = "target execute failed: plain execution error";
+
+        assert_eq!(annotate_failure_with_engine_error_code(msg, msg), msg);
     }
 
     #[test]
