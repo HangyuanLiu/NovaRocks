@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use crate::types::RunnerConfig;
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -454,5 +454,59 @@ mod tests {
             .collect();
 
         assert!(!args.iter().any(|arg| arg == "--mysql-password"));
+    }
+
+    #[test]
+    fn spark_bootstrap_writes_benchmark_tables_as_iceberg_v3() {
+        let loader = include_str!("../../../sql-tests/bootstrap/spark/write_standard_benchmark.py");
+
+        assert!(
+            loader.contains(r#"ICEBERG_FORMAT_VERSION = "3""#),
+            "benchmark Spark loader must bind the benchmark Iceberg format version to v3"
+        );
+        assert!(
+            loader.contains(r#".tableProperty("format-version", ICEBERG_FORMAT_VERSION)"#),
+            "benchmark Spark loader must create Iceberg format-version=3 tables"
+        );
+    }
+
+    #[test]
+    fn spark_bootstrap_computes_puffin_ndv_with_iceberg_procedure() {
+        let script = include_str!("../../../sql-tests/bootstrap/bootstrap_benchmark_data.sh");
+        let loader = include_str!("../../../sql-tests/bootstrap/spark/write_standard_benchmark.py");
+
+        assert!(
+            loader.contains("compute_table_stats"),
+            "benchmark Spark loader must use Iceberg Spark procedure to compute NDV stats"
+        );
+        assert!(
+            loader.contains("statistics_file"),
+            "benchmark Spark loader must capture the generated Puffin statistics file"
+        );
+        assert!(
+            script
+                .rfind("run_spark_loader")
+                .zip(script.rfind("check_readiness"))
+                .is_some_and(|(load, check)| load < check),
+            "readiness must run after Spark writes Iceberg tables and stats"
+        );
+    }
+
+    #[test]
+    fn bootstrap_readiness_requires_v3_manifest_and_statistics_files() {
+        let script = include_str!("../../../sql-tests/bootstrap/bootstrap_benchmark_data.sh");
+
+        assert!(
+            script.contains("check_table_format_version"),
+            "readiness check must reject old format-version=2 benchmark tables"
+        );
+        assert!(
+            script.contains(r#""iceberg_format_version": "3""#),
+            "readiness check must reject manifests not generated as Iceberg v3"
+        );
+        assert!(
+            script.contains(r#""statistics_file""#),
+            "readiness check must reject manifests without Spark-generated Puffin stats files"
+        );
     }
 }

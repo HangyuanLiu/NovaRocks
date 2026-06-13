@@ -195,6 +195,8 @@ PARQUET_WRITE_PROPERTIES = {
     "write.parquet.page-row-limit": str(1_048_576),
 }
 
+ICEBERG_FORMAT_VERSION = "3"
+
 PARQUET_HADOOP_PROPERTIES = {
     "parquet.block.size": str(128 * 1024 * 1024),
     "parquet.page.size": str(16 * 1024 * 1024),
@@ -388,6 +390,26 @@ def qualified_name(*parts):
     return ".".join(sql_ident(part) for part in parts)
 
 
+def sql_string(value):
+    return "'" + value.replace("'", "''") + "'"
+
+
+def compute_table_stats(spark, catalog, database, table):
+    procedure = qualified_name(catalog, "system", "compute_table_stats")
+    table_name = f"{database}.{table}"
+    rows = spark.sql(f"CALL {procedure}(table => {sql_string(table_name)})").collect()
+    if not rows:
+        raise RuntimeError(f"compute_table_stats returned no rows for {table_name}")
+
+    row = rows[0].asDict(recursive=True)
+    statistics_file = row.get("statistics_file")
+    if not statistics_file:
+        raise RuntimeError(
+            f"compute_table_stats did not return statistics_file for {table_name}: {row}"
+        )
+    return statistics_file
+
+
 def main():
     args = parse_args()
     if args.suite not in SUITE_DATABASES:
@@ -436,7 +458,9 @@ def main():
 
             spark.sql(f"DROP TABLE IF EXISTS {target}")
             writer = (
-                df.writeTo(target).using("iceberg").tableProperty("format-version", "2")
+                df.writeTo(target)
+                .using("iceberg")
+                .tableProperty("format-version", ICEBERG_FORMAT_VERSION)
             )
             for key, value in PARQUET_WRITE_PROPERTIES.items():
                 writer = writer.tableProperty(key, value)
@@ -453,10 +477,13 @@ def main():
                     )
                 )
             writer.create()
+            statistics_file = compute_table_stats(spark, args.catalog, args.database, table)
             row_counts.append(
                 {
                     "name": table,
                     "rows": row_count,
+                    "format_version": ICEBERG_FORMAT_VERSION,
+                    "statistics_file": statistics_file,
                     "layout": layout or None,
                 }
             )
@@ -469,6 +496,8 @@ def main():
             "generator": args.generator,
             "generator_version": args.generator_version,
             "schema_version": "2026-05-26",
+            "iceberg_format_version": ICEBERG_FORMAT_VERSION,
+            "puffin_ndv": "spark_compute_table_stats",
             "raw_text_encoding": raw_text_encoding,
             "warehouse": args.warehouse,
             "parquet_write_properties": PARQUET_WRITE_PROPERTIES,
