@@ -917,23 +917,35 @@ fn greedy_join_reorder(
                 let combined = group_mask | atom_mask;
 
                 let connecting = collect_join_predicates(&graph, group_mask, atom_mask);
-                let is_cross = connecting.is_empty();
+                if connecting.is_empty() {
+                    // Keep Greedy as a connected-join enumerator. If a full
+                    // plan genuinely requires CROSS components, Greedy will
+                    // fail to produce the full mask and the caller falls back
+                    // to the left-deep builder, which has explicit cross
+                    // handling. This avoids polluting the memo with bushy
+                    // dimension CROSS subtrees inside otherwise connected
+                    // join graphs.
+                    continue;
+                }
 
-                let condition = if is_cross {
-                    None
-                } else {
-                    let preds: Vec<TypedExpr> = connecting.into_iter().map(|(e, _)| e).collect();
-                    Some(combine_and(preds))
-                };
+                let preds: Vec<TypedExpr> = connecting.into_iter().map(|(e, _)| e).collect();
+                let condition = Some(combine_and(preds));
 
                 // A join is effectively a NEST LOOP (quadratic cost) when:
-                // (a) there are no connecting predicates at all (cross join), OR
-                // (b) all connecting predicates are non-equijoin conditions — the
+                // all connecting predicates are non-equijoin conditions — the
                 //     join cannot use hashing and will fall back to NEST LOOP.
-                let is_nest_loop = is_cross
-                    || condition
-                        .as_ref()
-                        .is_some_and(|c| !has_equijoin_predicate(c));
+                let is_nest_loop = condition
+                    .as_ref()
+                    .is_some_and(|c| !has_equijoin_predicate(c));
+                if is_nest_loop {
+                    // Match the DP enumerator: do not create a direct join
+                    // whose only connection is non-equality. If the same
+                    // relation set has an equi-join path, the predicate will
+                    // be attached later as a residual condition; otherwise
+                    // Greedy can fail and the left-deep fallback still handles
+                    // true non-equi-only join graphs.
+                    continue;
+                }
 
                 let (group_entry, atom_entry) = match (memo.get(&group_mask), memo.get(&atom_mask))
                 {
@@ -963,15 +975,10 @@ fn greedy_join_reorder(
                         )
                     };
 
-                let join_type = if condition.is_some() {
-                    JoinKind::Inner
-                } else {
-                    JoinKind::Cross
-                };
                 let join_plan = LogicalPlan::Join(JoinNode {
                     left: Box::new(left_plan.clone()),
                     right: Box::new(right_plan.clone()),
-                    join_type,
+                    join_type: JoinKind::Inner,
                     condition: condition.clone(),
                     required_output_columns: None,
                 });
@@ -998,12 +1005,7 @@ fn greedy_join_reorder(
                     &[left_stats, right_stats],
                 );
 
-                let mut total_cost = left_cost + right_cost + join_self_cost.total_cost();
-
-                // Additional cross join penalty for completely unconnected tables.
-                if is_cross {
-                    total_cost *= 10.0;
-                }
+                let total_cost = left_cost + right_cost + join_self_cost.total_cost();
 
                 let dominated = memo
                     .get(&combined)
@@ -1078,7 +1080,7 @@ fn left_deep_join_reorder(
     for _ in 1..n {
         // Find the best next table to join.
         let mut best_idx: Option<usize> = None;
-        let mut best_has_equi = false;
+        let mut best_join_class = 0u8;
         let mut best_row_count = u64::MAX;
 
         for (i, rs) in rel_stats.iter().enumerate() {
@@ -1088,20 +1090,27 @@ fn left_deep_join_reorder(
             }
 
             let connecting = collect_join_predicates(&graph, current_mask, atom_mask);
-            let has_equi = !connecting.is_empty();
+            let has_equi = connecting
+                .iter()
+                .any(|(condition, _)| has_equijoin_predicate(condition));
+            let join_class = if has_equi {
+                2
+            } else if connecting.is_empty() {
+                0
+            } else {
+                1
+            };
             let rc = rs.output_row_count as u64;
 
-            // Prefer tables with equi-join predicates. Among those (or among
-            // tables without predicates), prefer the smallest.
-            let is_better = match (has_equi, best_has_equi) {
-                (true, false) => true,
-                (false, true) => false,
-                _ => rc < best_row_count,
-            };
+            // Prefer hashable equi-join candidates over connected non-equi
+            // candidates, and prefer connected non-equi joins over pure cross
+            // joins. Among candidates in the same class, build the smallest.
+            let is_better = join_class > best_join_class
+                || (join_class == best_join_class && rc < best_row_count);
 
             if best_idx.is_none() || is_better {
                 best_idx = Some(i);
-                best_has_equi = has_equi;
+                best_join_class = join_class;
                 best_row_count = rc;
             }
         }
@@ -1870,6 +1879,44 @@ mod tests {
         }
     }
 
+    fn qualified_gt(left_q: &str, right_q: &str) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        column_id: ColumnId::UNSET,
+                        qualifier: Some(left_q.to_string()),
+                        column: "id".to_string(),
+                    },
+                    data_type: DataType::Int32,
+                    nullable: false,
+                }),
+                op: BinOp::Gt,
+                right: Box::new(TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        column_id: ColumnId::UNSET,
+                        qualifier: Some(right_q.to_string()),
+                        column: "id".to_string(),
+                    },
+                    data_type: DataType::Int32,
+                    nullable: false,
+                }),
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        }
+    }
+
+    fn inner_join(left: LogicalPlan, right: LogicalPlan, condition: TypedExpr) -> LogicalPlan {
+        LogicalPlan::Join(JoinNode {
+            left: Box::new(left),
+            right: Box::new(right),
+            join_type: JoinKind::Inner,
+            condition: Some(condition),
+            required_output_columns: None,
+        })
+    }
+
     /// Extract all table names from a plan tree in join order (left-to-right DFS).
     fn collect_table_names(plan: &LogicalPlan) -> Vec<String> {
         match plan {
@@ -1885,6 +1932,87 @@ mod tests {
             LogicalPlan::Project(p) => collect_table_names(&p.input),
             _ => vec![],
         }
+    }
+
+    fn has_direct_non_equi_join_between(plan: &LogicalPlan, a: &str, b: &str) -> bool {
+        match plan {
+            LogicalPlan::Join(j) => {
+                let names: std::collections::HashSet<_> =
+                    collect_table_names(plan).into_iter().collect();
+                if names.len() == 2
+                    && names.contains(a)
+                    && names.contains(b)
+                    && j.condition
+                        .as_ref()
+                        .is_some_and(|condition| !has_equijoin_predicate(condition))
+                {
+                    return true;
+                }
+                has_direct_non_equi_join_between(&j.left, a, b)
+                    || has_direct_non_equi_join_between(&j.right, a, b)
+            }
+            LogicalPlan::Filter(f) => has_direct_non_equi_join_between(&f.input, a, b),
+            LogicalPlan::Project(p) => has_direct_non_equi_join_between(&p.input, a, b),
+            _ => false,
+        }
+    }
+
+    fn has_direct_cross_join_between(plan: &LogicalPlan, a: &str, b: &str) -> bool {
+        match plan {
+            LogicalPlan::Join(j) => {
+                let names: std::collections::HashSet<_> =
+                    collect_table_names(plan).into_iter().collect();
+                if names.len() == 2
+                    && names.contains(a)
+                    && names.contains(b)
+                    && j.condition.is_none()
+                {
+                    return true;
+                }
+                has_direct_cross_join_between(&j.left, a, b)
+                    || has_direct_cross_join_between(&j.right, a, b)
+            }
+            LogicalPlan::Filter(f) => has_direct_cross_join_between(&f.input, a, b),
+            LogicalPlan::Project(p) => has_direct_cross_join_between(&p.input, a, b),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn left_deep_prefers_equi_candidate_over_smaller_non_equi_candidate() {
+        let fact = s3_table_with_rows("fact", 8_000_000, 1_000_000);
+        let equi_dim = s3_table_with_rows("equi_dim", 4_000_000, 500_000);
+        let range_dim = s3_table_with_rows("range_dim", 80_000, 10_000);
+
+        let mut table_stats = HashMap::new();
+        for (name, rows) in [
+            ("fact", 1_000_000),
+            ("equi_dim", 500_000),
+            ("range_dim", 10_000),
+        ] {
+            let (stats_name, stats) = make_table_stats(name, rows, rows as f64);
+            table_stats.insert(stats_name, stats);
+        }
+
+        let graph = JoinGraph {
+            relations: vec![
+                scan_with_alias(&fact, "fact"),
+                scan_with_alias(&equi_dim, "equi_dim"),
+                scan_with_alias(&range_dim, "range_dim"),
+            ],
+            predicates: vec![
+                (qualified_eq("fact", "equi_dim"), 0b011),
+                (qualified_gt("fact", "range_dim"), 0b101),
+            ],
+        };
+
+        let reordered =
+            left_deep_join_reorder(graph, &table_stats).expect("left-deep plan expected");
+
+        assert!(
+            !has_direct_non_equi_join_between(&reordered, "fact", "range_dim"),
+            "left-deep must not prefer a smaller non-equi-only candidate over an available equi candidate: {reordered:#?}"
+        );
     }
 
     #[test]
@@ -1980,6 +2108,103 @@ mod tests {
             names.contains(&"customer".to_string()),
             "missing customer in {:?}",
             names
+        );
+    }
+
+    #[test]
+    fn greedy_join_reorder_avoids_direct_non_equi_dimension_join() {
+        let mut table_stats = HashMap::new();
+        let mut scan = |name: &str, rows: u64| {
+            let table = s3_table_with_rows(name, rows as i64 * 8, rows as i64);
+            let (stats_name, stats) = make_table_stats(name, rows, rows as f64);
+            table_stats.insert(stats_name, stats);
+            scan_with_alias(&table, name)
+        };
+
+        let mut plan = scan("fact", 1_000_000);
+        plan = inner_join(plan, scan("d1", 16_000), qualified_eq("fact", "d1"));
+        plan = inner_join(plan, scan("d2", 65_000), qualified_eq("d1", "d2"));
+        plan = inner_join(
+            plan,
+            scan("d3", 73_000),
+            combine_and(vec![qualified_eq("fact", "d3"), qualified_gt("d3", "d1")]),
+        );
+        for idx in 4..=8 {
+            let name = format!("x{idx}");
+            plan = inner_join(plan, scan(&name, 500_000), qualified_eq("fact", &name));
+        }
+
+        let reordered = reorder_joins_cbo(plan, &table_stats);
+
+        assert!(
+            !has_direct_non_equi_join_between(&reordered, "d1", "d3"),
+            "Greedy join reorder must not form the q72-style d1 x d3 NEST LOOP before either side reaches an equi-join path: {reordered:#?}"
+        );
+    }
+
+    #[test]
+    fn greedy_join_reorder_avoids_cross_dimension_subtree_in_connected_graph() {
+        let mut table_stats = HashMap::new();
+        let mut scan = |name: &str, rows: u64| {
+            let table = s3_table_with_rows(name, rows as i64 * 8, rows as i64);
+            let (stats_name, stats) = make_table_stats(name, rows, rows as f64);
+            table_stats.insert(stats_name, stats);
+            scan_with_alias(&table, name)
+        };
+
+        let relations = vec![
+            scan("cs", 1_441_548),
+            scan("inv", 11_745_000),
+            scan("cd", 480_200),
+            scan("hd", 1_800),
+            scan("d1", 327),
+            scan("d2", 65_744),
+            scan("d3", 73_049),
+            scan("item", 18_000),
+            scan("warehouse", 5),
+        ];
+        let graph = JoinGraph {
+            relations,
+            predicates: vec![
+                (qualified_eq("cs", "inv"), 0b000000011),
+                (qualified_eq("cs", "cd"), 0b000000101),
+                (qualified_eq("cs", "hd"), 0b000001001),
+                (qualified_eq("cs", "d1"), 0b000010001),
+                (qualified_eq("inv", "d2"), 0b000100010),
+                (qualified_eq("d1", "d2"), 0b000110000),
+                (qualified_eq("cs", "d3"), 0b001000001),
+                (qualified_gt("d3", "d1"), 0b001010000),
+                (qualified_eq("cs", "item"), 0b010000001),
+                (qualified_eq("inv", "warehouse"), 0b100000010),
+            ],
+        };
+
+        let reordered = greedy_join_reorder(graph, &table_stats).expect("greedy plan expected");
+
+        assert!(
+            !has_direct_cross_join_between(&reordered, "cd", "hd"),
+            "Greedy join reorder must not form a q72-style dimension CROSS subtree in a connected join graph: {reordered:#?}"
+        );
+    }
+
+    #[test]
+    fn greedy_join_reorder_defers_disconnected_cross_components() {
+        let mut table_stats = HashMap::new();
+        let mut scan = |name: &str, rows: u64| {
+            let table = s3_table_with_rows(name, rows as i64 * 8, rows as i64);
+            let (stats_name, stats) = make_table_stats(name, rows, rows as f64);
+            table_stats.insert(stats_name, stats);
+            scan_with_alias(&table, name)
+        };
+
+        let graph = JoinGraph {
+            relations: vec![scan("a", 1_000_000), scan("b", 1_000), scan("c", 100)],
+            predicates: vec![(qualified_eq("a", "b"), 0b011)],
+        };
+
+        assert!(
+            greedy_join_reorder(graph, &table_stats).is_none(),
+            "Greedy should only enumerate connected joins; disconnected CROSS components are handled by left-deep fallback"
         );
     }
 

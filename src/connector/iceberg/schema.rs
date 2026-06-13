@@ -130,6 +130,23 @@ pub fn build_projected_output_schema(
 fn build_reserved_row_lineage_projected_field(
     column: &IcebergArrowColumn,
 ) -> Result<Option<Field>, String> {
+    if column
+        .name
+        .eq_ignore_ascii_case(crate::exec::change_op::CHANGE_OP_COLUMN)
+    {
+        if !matches!(column.data_type, DataType::Int8) {
+            return Err(format!(
+                "iceberg internal column {} expects Int8, got {:?}",
+                column.name, column.data_type
+            ));
+        }
+        return Ok(Some(Field::new(
+            column.name.clone(),
+            DataType::Int8,
+            column.nullable,
+        )));
+    }
+
     let field_id = if column.name.eq_ignore_ascii_case(ICEBERG_ROW_ID_COL) {
         ICEBERG_RESERVED_FIELD_ID_ROW_ID
     } else if column
@@ -277,6 +294,49 @@ mod tests {
         assert_eq!(
             updated.metadata().get(ICEBERG_INITIAL_DEFAULT_META_KEY),
             None
+        );
+    }
+
+    #[test]
+    fn projected_schema_accepts_internal_change_op_column() {
+        let mut physical_field = crate::descriptors::TIcebergSchemaField::default();
+        physical_field.field_id = Some(1);
+        physical_field.name = Some("id".to_string());
+
+        let mut schema = crate::descriptors::TIcebergSchema::default();
+        schema.fields = Some(vec![physical_field]);
+
+        let mut iceberg = crate::descriptors::TIcebergTable::default();
+        iceberg.iceberg_schema = Some(schema);
+
+        let projected = build_projected_output_schema(
+            &iceberg,
+            &[
+                IcebergArrowColumn {
+                    name: "id".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                },
+                IcebergArrowColumn {
+                    name: crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
+                    data_type: DataType::Int8,
+                    nullable: false,
+                },
+            ],
+        )
+        .expect("projected schema")
+        .expect("schema");
+
+        let change_op = projected
+            .field_with_name(crate::exec::change_op::CHANGE_OP_COLUMN)
+            .expect("change op field");
+        assert_eq!(change_op.data_type(), &DataType::Int8);
+        assert!(!change_op.is_nullable());
+        assert!(
+            !change_op
+                .metadata()
+                .contains_key(parquet::arrow::PARQUET_FIELD_ID_META_KEY),
+            "__change_op is synthetic and must not claim an Iceberg field id"
         );
     }
 }

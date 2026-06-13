@@ -43,7 +43,17 @@ fn real_expr_ndv(
         && let Some(cs) = column_stats.get(&column_id)
         && cs.distinct_values_count > 1.0
     {
-        return Some((cs.distinct_values_count, cs.confidence));
+        let confidence = if cs.confidence == Confidence::Fallback {
+            // Fallback column NDV here still came from table metadata
+            // (currently sqrt(non_null) * 10), which is materially different
+            // from having no key statistics and using DEFAULT_JOIN_KEY_NDV.
+            // Join cardinality treats true defaulted NDVs conservatively; keep
+            // heuristic column NDVs usable as estimated inputs.
+            Confidence::Estimated
+        } else {
+            cs.confidence
+        };
+        return Some((cs.distinct_values_count, confidence));
     }
     None
 }
@@ -201,6 +211,27 @@ mod tests {
         let (ndv, confidence) = get_join_key_ndv_with_confidence(&real_expr, &column_stats);
         assert_eq!(ndv, 50.0);
         assert_eq!(confidence, Confidence::Exact);
+    }
+
+    #[test]
+    fn join_key_ndv_treats_heuristic_column_stats_as_estimated() {
+        let mut column_stats: HashMap<ColumnId, ColumnStatistic> = HashMap::new();
+        column_stats.insert(
+            test_col_id("real_col"),
+            ColumnStatistic {
+                min_value: 1.0,
+                max_value: 10_000.0,
+                distinct_values_count: 1_000.0,
+                confidence: Confidence::Fallback,
+                ..Default::default()
+            },
+        );
+
+        let expr = col_ref("real_col");
+        let (ndv, confidence) = get_join_key_ndv_with_confidence(&expr, &column_stats);
+
+        assert_eq!(ndv, 1_000.0);
+        assert_eq!(confidence, Confidence::Estimated);
     }
 
     #[test]

@@ -631,7 +631,9 @@ SELECT k1, k2, v1, v2
 FROM ${case_db}.t1 FULL OUTER JOIN ${case_db}.t2 USING(k1, k2)
 WHERE k1 IN (SELECT k1 FROM ${case_db}.t3 WHERE v3 IS NOT NULL)
    OR k1 IS NULL
-ORDER BY k1, k2;
+ORDER BY k1, k2,
+         CASE WHEN v1 IS NULL THEN 1 ELSE 0 END, v1,
+         CASE WHEN v2 IS NULL THEN 1 ELSE 0 END, v2;
 
 -- query 65
 -- Inline VALUES: single-key FULL OUTER JOIN USING

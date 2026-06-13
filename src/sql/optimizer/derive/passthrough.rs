@@ -11,17 +11,19 @@
 //!    canonical: `Gather → Project → Scan` rather than `Project → Gather →
 //!    Scan`).
 //!
-//! 2. **Full-passthrough** (Limit / TableFunction): the parent's required
-//!    distribution is propagated to the child. For Limit this is required
-//!    for correctness — a global `LIMIT 10` must run on a single instance,
-//!    so the child must already be Gather-ed before Limit fires.
-//!    TableFunction's semantics are operator-specific and not generally
-//!    distribution-blind; we keep the safe pass-through here.
+//! 2. **Global barrier** (Limit): a global `LIMIT 10` must produce one query-wide
+//!    row stream, not one stream per worker. It therefore requires a Gather child
+//!    and reports Gather output even when the parent requirement is Any.
+//!
+//! 3. **Full-passthrough** (TableFunction): the parent's required distribution
+//!    is propagated to the child. TableFunction's semantics are operator-specific
+//!    and not generally distribution-blind; we keep the safe pass-through here.
 //!
 //! For both flavours `derive_output` is the single child's output (via
 //! `passthrough_output`).
 
-use crate::sql::optimizer::property::PhysicalPropertySet;
+use crate::sql::optimizer::property::OrderingSpec;
+use crate::sql::optimizer::property::{DistributionSpec, PhysicalPropertySet};
 
 /// Output of a passthrough operator equals its single child's output.
 pub(crate) fn passthrough_output(children_outputs: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
@@ -138,7 +140,32 @@ macro_rules! passthrough_full_impls {
     };
 }
 
-passthrough_full_impls!(PhysicalLimitOp, PhysicalTableFunctionOp);
+impl DeriveOutput for PhysicalLimitOp {
+    fn derive_output(&self, children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
+        PhysicalPropertySet {
+            distribution: DistributionSpec::Gather,
+            ordering: children
+                .first()
+                .map(|child| child.ordering.clone())
+                .unwrap_or(OrderingSpec::Any),
+        }
+    }
+}
+
+impl DeriveRequired for PhysicalLimitOp {
+    fn derive_required(
+        &self,
+        parent_required: &PhysicalPropertySet,
+        _n: usize,
+    ) -> Vec<PhysicalPropertySet> {
+        vec![PhysicalPropertySet {
+            distribution: DistributionSpec::Gather,
+            ordering: parent_required.ordering.clone(),
+        }]
+    }
+}
+
+passthrough_full_impls!(PhysicalTableFunctionOp);
 
 #[cfg(test)]
 mod tests {
@@ -207,14 +234,13 @@ mod tests {
     }
 
     #[test]
-    fn limit_required_forwards_parent() {
-        // Limit is a *full-passthrough*: a global LIMIT must run on a single
-        // instance, so the child must already satisfy the parent's
-        // distribution (typically Gather) before Limit fires.
+    fn limit_required_forces_gather_child() {
+        // Limit is a global barrier: even when the parent accepts Any
+        // distribution, LIMIT must run on one query-wide stream.
         let op = make_minimal_limit_op();
-        let parent = PhysicalPropertySet::gather();
+        let parent = PhysicalPropertySet::any();
         let reqs = op.derive_required(&parent, 1);
-        assert_eq!(reqs, vec![parent]);
+        assert_eq!(reqs, vec![PhysicalPropertySet::gather()]);
     }
 
     // --- Output derivation (follows single child) ---
@@ -240,6 +266,16 @@ mod tests {
         };
         let out = op.derive_output(&[&child]);
         assert_eq!(out, child);
+    }
+
+    #[test]
+    fn limit_output_is_gather_barrier() {
+        let op = make_minimal_limit_op();
+        let child = hash_one();
+        let out = op.derive_output(&[&child]);
+
+        assert_eq!(out.distribution, DistributionSpec::Gather);
+        assert_eq!(out.ordering, child.ordering);
     }
 
     #[test]
