@@ -277,6 +277,8 @@ cache_dir=$cache_dir
 source_dir=$source_dir
 schema_ddl_file=$schema_ddl_file
 spark_loader=$spark_loader
+iceberg_format_version=3
+puffin_ndv=spark_compute_table_stats
 compose_project=$NOVA_ENV_COMPOSE_PROJECT
 EOF
 }
@@ -330,6 +332,13 @@ check_manifest() {
   if [[ "$suite" == "tpc-ds" ]]; then
     required_encoding='"raw_text_encoding": "ISO-8859-1"'
   fi
+  local required_format_version='"iceberg_format_version": "3"'
+  local required_table_format='"format_version": "3"'
+  local required_puffin_ndv='"puffin_ndv": "spark_compute_table_stats"'
+  local required_statistics='"statistics_file"'
+  local required_statistics_prefix='"statistics_file": "'
+  local required_empty_statistics='"statistics_file": ""'
+  local required_statistics_count="${#suite_tables[@]}"
   "${compose_args[@]}" run --rm -T \
     -e "MINIO_ROOT_USER=$AWS_S3_ACCESS_KEY_ID" \
     -e "MINIO_ROOT_PASSWORD=$AWS_S3_SECRET_ACCESS_KEY" \
@@ -337,10 +346,67 @@ check_manifest() {
     set -eu
     /usr/bin/mc alias set minio http://minio:9000 \"\$MINIO_ROOT_USER\" \"\$MINIO_ROOT_PASSWORD\" >/dev/null
     /usr/bin/mc stat '$path/_SUCCESS' >/dev/null
+    manifest_file=\$(/usr/bin/mc find '$path' --name 'part-*' | head -n 1)
+    [ -n \"\$manifest_file\" ]
+    manifest_json=\$(/usr/bin/mc cat \"\$manifest_file\")
+    count_occurrences() {
+      value=\$1
+      needle=\$2
+      count=0
+      while :; do
+        case \"\$value\" in
+          *\"\$needle\"*)
+            value=\${value#*\"\$needle\"}
+            count=\$((count + 1))
+            ;;
+          *) break ;;
+        esac
+      done
+      printf '%s' \"\$count\"
+    }
+    check_table_format_version() {
+      case \"\$manifest_json\" in
+        *'$required_format_version'*) ;;
+        *) exit 1 ;;
+      esac
+      table_format_count=\$(count_occurrences \"\$manifest_json\" '$required_table_format')
+      [ \"\$table_format_count\" -ge '$required_statistics_count' ]
+    }
+    check_statistics_files() {
+      case \"\$manifest_json\" in
+        *'$required_puffin_ndv'*) ;;
+        *) exit 1 ;;
+      esac
+      case \"\$manifest_json\" in
+        *'$required_empty_statistics'*) exit 1 ;;
+        *) ;;
+      esac
+      statistics_count=\$(count_occurrences \"\$manifest_json\" '$required_statistics')
+      [ \"\$statistics_count\" -ge '$required_statistics_count' ]
+      remaining=\$manifest_json
+      checked_statistics_count=0
+      while :; do
+        case \"\$remaining\" in
+          *'$required_statistics_prefix'*)
+            remaining=\${remaining#*'$required_statistics_prefix'}
+            stats_uri=\${remaining%%\\\"*}
+            ;;
+          *) break ;;
+        esac
+        [ -n \"\$stats_uri\" ]
+        case \"\$stats_uri\" in
+          s3a://*) stats_path=\"minio/\${stats_uri#s3a://}\" ;;
+          s3://*) stats_path=\"minio/\${stats_uri#s3://}\" ;;
+          *) exit 1 ;;
+        esac
+        /usr/bin/mc stat \"\$stats_path\" >/dev/null
+        checked_statistics_count=\$((checked_statistics_count + 1))
+      done
+      [ \"\$checked_statistics_count\" -ge '$required_statistics_count' ]
+    }
+    check_table_format_version
+    check_statistics_files
     if [ -n '$required_encoding' ]; then
-      manifest_file=\$(/usr/bin/mc find '$path' --name 'part-*' | head -n 1)
-      [ -n \"\$manifest_file\" ]
-      manifest_json=\$(/usr/bin/mc cat \"\$manifest_file\")
       case \"\$manifest_json\" in
         *'$required_encoding'*) ;;
         *) exit 1 ;;

@@ -4704,6 +4704,14 @@ impl<'a> PlanFragmentBuilder<'a> {
             ));
         }
 
+        if matches!(
+            op.spec,
+            crate::sql::optimizer::property::DistributionSpec::Gather
+        ) && let Operator::PhysicalLimit(limit_op) = &node.children[0].op
+        {
+            return self.visit_gather_distribution_over_limit(limit_op, &node.children[0]);
+        }
+
         let parent_fragment_id = self.current_fragment_id()?;
         let child_fragment_id = self.alloc_fragment_id();
         self.fragment_stack.push(child_fragment_id);
@@ -4762,6 +4770,92 @@ impl<'a> PlanFragmentBuilder<'a> {
             exchange_node_id,
             output_partition,
             Self::stream_kind_for_distribution(&op.spec),
+            FragmentEdgeKind::Stream,
+            &edge_output_columns,
+        );
+
+        Ok(VisitResult {
+            plan_nodes: vec![exchange_node],
+            scope,
+            tuple_ids,
+            cte_exchange_nodes: Vec::new(),
+            ordering: OrderingSpec::Any,
+        })
+    }
+
+    fn visit_gather_distribution_over_limit(
+        &mut self,
+        limit_op: &PhysicalLimitOp,
+        limit_node: &PhysicalPlanNode,
+    ) -> Result<VisitResult, String> {
+        if limit_node.children.len() != 1 {
+            return Err(format!(
+                "PhysicalLimit below Gather expected exactly 1 child, got {}",
+                limit_node.children.len()
+            ));
+        }
+
+        let parent_fragment_id = self.current_fragment_id()?;
+        let child_fragment_id = self.alloc_fragment_id();
+        self.fragment_stack.push(child_fragment_id);
+        let child_result = self.visit(&limit_node.children[0]);
+        self.fragment_stack.pop();
+        let child = child_result?;
+        let VisitResult {
+            plan_nodes,
+            scope,
+            tuple_ids,
+            cte_exchange_nodes,
+            ordering: _,
+        } = child;
+
+        let gather_spec = crate::sql::optimizer::property::DistributionSpec::Gather;
+        let output_partition =
+            self.build_output_partition(&gather_spec, &scope, &limit_node.output_columns)?;
+        let exchange_partition_type = output_partition.type_;
+
+        let child_dicts = self
+            .query_global_dicts_per_fragment
+            .remove(&child_fragment_id)
+            .filter(|v| !v.is_empty());
+        let child_root_node_id = plan_nodes.first().map(|node| node.node_id).unwrap_or(-1);
+        let edge_output_columns = output_columns_for_boundary(&limit_node.output_columns);
+        let boundary_schemas = vec![result_root_boundary_schema_report(
+            child_fragment_id,
+            child_root_node_id,
+            &edge_output_columns,
+        )];
+        self.completed_fragments.push(FragmentBuildResult {
+            fragment_id: child_fragment_id,
+            plan: plan_nodes::TPlan::new(plan_nodes),
+            desc_tbl: DescriptorTableBuilder::new().build(),
+            exec_params: nodes::build_exec_params_multi(self.connectors, &[])?,
+            output_sink: build_noop_sink(),
+            output_exprs: None,
+            output_columns: edge_output_columns.clone(),
+            direct_exec: None,
+            boundary_schemas,
+            cte_id: None,
+            cte_exchange_nodes,
+            query_global_dicts: child_dicts,
+            query_global_dict_exprs: None,
+        });
+
+        let exchange_node_id = self.alloc_node();
+        let exchange_node = nodes::build_limit_exchange_node(
+            exchange_node_id,
+            tuple_ids.clone(),
+            exchange_partition_type,
+            limit_op.limit,
+            limit_op.offset,
+        );
+
+        self.record_completed_edge(
+            child_fragment_id,
+            parent_fragment_id,
+            exchange_node_id,
+            output_partition,
+            FragmentStreamKind::Gather,
             FragmentEdgeKind::Stream,
             &edge_output_columns,
         );
@@ -5432,9 +5526,9 @@ mod tests {
     use crate::sql::optimizer::operator::{
         AggregateStateMergeOp, JoinDistribution, Operator, PhysicalDecodeOp,
         PhysicalDistributionOp, PhysicalGenerateSeriesOp, PhysicalHashJoinEqCondition,
-        PhysicalHashJoinOp, PhysicalProjectOp, PhysicalRepeatOp, PhysicalScanOp, PhysicalSortOp,
-        PhysicalTopNOp, PhysicalUnionOp, PhysicalValuesOp, PhysicalWindowOp, ScanDictionaryColumn,
-        ScanVariantColumn, TopNPhase,
+        PhysicalHashJoinOp, PhysicalLimitOp, PhysicalProjectOp, PhysicalRepeatOp, PhysicalScanOp,
+        PhysicalSortOp, PhysicalTopNOp, PhysicalUnionOp, PhysicalValuesOp, PhysicalWindowOp,
+        ScanDictionaryColumn, ScanVariantColumn, TopNPhase,
     };
     use crate::sql::optimizer::physical_plan::{
         JoinExecutionDistribution, PhysicalPlanNode, PlanExecutionProps,
@@ -7569,6 +7663,72 @@ mod tests {
                 .nodes
                 .iter()
                 .any(|node| { node.node_type == plan_nodes::TPlanNodeType::EXCHANGE_NODE })
+        );
+    }
+
+    #[test]
+    fn gather_over_limit_applies_limit_on_exchange_receiver() {
+        let file = NamedTempFile::new().expect("temp parquet path");
+        let output = output_columns();
+        let plan = physical_node_for_test(
+            Operator::PhysicalSort(PhysicalSortOp {
+                items: vec![SortItem {
+                    expr: id_expr(),
+                    asc: true,
+                    nulls_first: false,
+                }],
+                analytic_partition_exprs: Vec::new(),
+            }),
+            vec![physical_node_for_test(
+                Operator::PhysicalDistribution(PhysicalDistributionOp {
+                    spec: DistributionSpec::Gather,
+                }),
+                vec![physical_node_for_test(
+                    Operator::PhysicalLimit(PhysicalLimitOp {
+                        limit: Some(1),
+                        offset: None,
+                    }),
+                    vec![scan_plan(file.path().to_path_buf())],
+                    output.clone(),
+                )],
+                output.clone(),
+            )],
+            output,
+        );
+
+        let build =
+            PlanFragmentBuilder::build(&plan, &DummyCatalog, &mock_iceberg_registry(), "default")
+                .expect("build");
+
+        assert_eq!(build.fragment_results.len(), 2);
+        assert_eq!(build.edges.len(), 1);
+        let root = build
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == build.root_fragment_id)
+            .expect("root fragment");
+        let exchange = root
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.node_type == plan_nodes::TPlanNodeType::EXCHANGE_NODE)
+            .expect("root fragment should receive gathered rows");
+        assert_eq!(exchange.limit, 1);
+
+        let child = build
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id != build.root_fragment_id)
+            .expect("child fragment");
+        let scan = child
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.node_type == plan_nodes::TPlanNodeType::HDFS_SCAN_NODE)
+            .expect("child fragment should scan");
+        assert_eq!(
+            scan.limit, -1,
+            "global LIMIT must not be pushed into the per-BE sender fragment"
         );
     }
 

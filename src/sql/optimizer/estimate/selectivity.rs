@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 
+use arrow::datatypes::DataType;
+
 use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr, UnOp};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::statistics::{
@@ -151,16 +153,38 @@ fn estimate_eq_selectivity(
     right: &TypedExpr,
     column_stats: &HashMap<ColumnId, ColumnStatistic>,
 ) -> f64 {
-    // col = literal: use 1/ndv
-    let col_id = extract_column_id(left).or_else(|| extract_column_id(right));
-
-    if let Some(column_id) = col_id
+    // col = literal: prefer trusted NDV, then finite min/max for discrete
+    // numeric domains when NDV is only a fallback heuristic.
+    if let Some((column_id, column_expr, literal_expr)) = extract_column_literal_pair(left, right)
         && let Some(cs) = column_stats.get(&column_id)
-        && let Some(ndv) = trusted_distinct_values_count(cs)
     {
-        return 1.0 / ndv;
+        if let Some(ndv) = trusted_distinct_values_count(cs) {
+            return 1.0 / ndv;
+        }
+        if let Some(selectivity) =
+            discrete_domain_equality_selectivity(column_expr, literal_expr, cs)
+        {
+            return selectivity;
+        }
     }
     PREDICATE_UNKNOWN_FILTER
+}
+
+fn extract_column_literal_pair<'a>(
+    left: &'a TypedExpr,
+    right: &'a TypedExpr,
+) -> Option<(ColumnId, &'a TypedExpr, &'a TypedExpr)> {
+    if let Some(column_id) = extract_column_id(left)
+        && extract_literal_f64(right).is_some()
+    {
+        return Some((column_id, left, right));
+    }
+    if let Some(column_id) = extract_column_id(right)
+        && extract_literal_f64(left).is_some()
+    {
+        return Some((column_id, right, left));
+    }
+    None
 }
 
 fn trusted_distinct_values_count(stat: &ColumnStatistic) -> Option<f64> {
@@ -172,6 +196,43 @@ fn trusted_distinct_values_count(stat: &ColumnStatistic) -> Option<f64> {
     } else {
         None
     }
+}
+
+fn discrete_domain_equality_selectivity(
+    column_expr: &TypedExpr,
+    literal_expr: &TypedExpr,
+    stat: &ColumnStatistic,
+) -> Option<f64> {
+    if !is_discrete_numeric_domain(&column_expr.data_type) {
+        return None;
+    }
+    let min = stat.min_value;
+    let max = stat.max_value;
+    if !min.is_finite() || !max.is_finite() || max < min {
+        return None;
+    }
+    let value = extract_literal_f64(literal_expr)?;
+    if value < min || value > max {
+        return Some(0.0);
+    }
+    let domain_width = (max.floor() - min.ceil() + 1.0).max(1.0);
+    Some((1.0 / domain_width).clamp(0.0, 1.0))
+}
+
+fn is_discrete_numeric_domain(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Date32
+    )
 }
 
 fn estimate_range_selectivity(
@@ -365,6 +426,29 @@ mod tests {
         assert_eq!(
             estimate_selectivity(&predicate, &stats),
             PREDICATE_UNKNOWN_FILTER
+        );
+    }
+
+    #[test]
+    fn numeric_bounds_drive_equality_when_ndv_is_fallback() {
+        let mut stats = HashMap::new();
+        stats.insert(
+            ColumnId::new_for_test(1),
+            ColumnStatistic {
+                min_value: 1900.0,
+                max_value: 2100.0,
+                distinct_values_count: 10_000.0,
+                confidence: Confidence::Fallback,
+                ..ColumnStatistic::unknown()
+            },
+        );
+        let predicate = eq(col("d_year", 1), int_lit(1999));
+
+        let selectivity = estimate_selectivity(&predicate, &stats);
+
+        assert!(
+            (selectivity - (1.0 / 201.0)).abs() < 1e-12,
+            "expected inclusive numeric-domain selectivity, got {selectivity}"
         );
     }
 

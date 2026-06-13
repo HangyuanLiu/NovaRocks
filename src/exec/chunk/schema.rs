@@ -753,6 +753,27 @@ mod tests {
     }
 
     #[test]
+    fn try_new_with_chunk_schema_reuses_exact_schema_batch_arrays() {
+        let column = Arc::new(Int32Array::from(vec![1_i32, 2, 3])) as ArrayRef;
+        let schema = Arc::new(Schema::new(vec![Field::new("c1", DataType::Int32, false)]));
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::clone(&column)]).expect("batch");
+        let chunk_schema = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                SlotId::new(1),
+                Field::new("c1", DataType::Int32, false),
+                None,
+                None,
+            )])
+            .expect("chunk schema"),
+        );
+
+        let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).expect("chunk");
+
+        assert!(Arc::ptr_eq(&chunk.columns()[0], &column));
+    }
+
+    #[test]
     fn align_chunk_schema_accepts_non_nullable_batch_for_nullable_contract() {
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("c13", DataType::Int8, false)])),

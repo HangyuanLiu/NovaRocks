@@ -5,7 +5,7 @@ use crate::sql::optimizer::statistics::{
     UNKNOWN_GROUP_BY_CORRELATION,
 };
 
-const INEXACT_KEY_FACT_DIM_SCALE_THRESHOLD: f64 = 32.0;
+const INEXACT_KEY_FACT_DIM_SCALE_THRESHOLD: f64 = 16.0;
 
 pub struct JoinCardInput {
     pub left: (f64, Confidence),
@@ -476,6 +476,25 @@ mod tests {
 
         assert_eq!(conf, Confidence::Fallback);
         assert!((rows - 4_861_000.0).abs() < 1.0, "got {rows}");
+    }
+
+    #[test]
+    fn fallback_inner_mid_scale_dimension_key_keeps_fact_side_scale() {
+        let input = JoinCardInput {
+            left: (1_441_548.0, Confidence::Estimated),
+            right: (73_049.0, Confidence::Estimated),
+            kind: JoinKind::Inner,
+            eq_key_ndvs: vec![(12_006.0, 2_702.0, Confidence::Fallback)],
+            non_equi_selectivity: None,
+        };
+
+        let (rows, conf) = estimate_join_cardinality(&input);
+
+        assert_eq!(conf, Confidence::Fallback);
+        assert!(
+            rows <= 1_441_548.0,
+            "single fallback key with a 20x fact/dimension scale must not inflate to many-to-many rows, got {rows}"
+        );
     }
 
     #[test]

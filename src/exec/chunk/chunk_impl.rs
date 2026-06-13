@@ -69,6 +69,14 @@ impl Chunk {
         batch: RecordBatch,
         chunk_schema: ChunkSchemaRef,
     ) -> Result<Self, String> {
+        let arrow_schema = chunk_schema.arrow_schema_ref();
+        if batch.schema().as_ref() == arrow_schema.as_ref() {
+            return Ok(Self {
+                batch,
+                chunk_schema,
+                accounting: None,
+            });
+        }
         let row_count = batch.num_rows();
         let chunk_schema = align_chunk_schema_to_batch(&batch, chunk_schema.as_ref())?;
         let columns = retag_columns_to_chunk_schema(batch.columns(), chunk_schema.as_ref())?;
