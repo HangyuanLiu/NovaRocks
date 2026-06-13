@@ -336,6 +336,7 @@ check_manifest() {
   local required_table_format='"format_version": "3"'
   local required_puffin_ndv='"puffin_ndv": "spark_compute_table_stats"'
   local required_statistics='"statistics_file"'
+  local required_statistics_prefix='"statistics_file": "'
   local required_empty_statistics='"statistics_file": ""'
   local required_statistics_count="${#suite_tables[@]}"
   "${compose_args[@]}" run --rm -T \
@@ -348,12 +349,27 @@ check_manifest() {
     manifest_file=\$(/usr/bin/mc find '$path' --name 'part-*' | head -n 1)
     [ -n \"\$manifest_file\" ]
     manifest_json=\$(/usr/bin/mc cat \"\$manifest_file\")
+    count_occurrences() {
+      value=\$1
+      needle=\$2
+      count=0
+      while :; do
+        case \"\$value\" in
+          *\"\$needle\"*)
+            value=\${value#*\"\$needle\"}
+            count=\$((count + 1))
+            ;;
+          *) break ;;
+        esac
+      done
+      printf '%s' \"\$count\"
+    }
     check_table_format_version() {
       case \"\$manifest_json\" in
         *'$required_format_version'*) ;;
         *) exit 1 ;;
       esac
-      table_format_count=\$(printf '%s' \"\$manifest_json\" | grep -o '$required_table_format' | wc -l | tr -d ' ')
+      table_format_count=\$(count_occurrences \"\$manifest_json\" '$required_table_format')
       [ \"\$table_format_count\" -ge '$required_statistics_count' ]
     }
     check_statistics_files() {
@@ -365,20 +381,28 @@ check_manifest() {
         *'$required_empty_statistics'*) exit 1 ;;
         *) ;;
       esac
-      statistics_count=\$(printf '%s' \"\$manifest_json\" | grep -o '$required_statistics' | wc -l | tr -d ' ')
+      statistics_count=\$(count_occurrences \"\$manifest_json\" '$required_statistics')
       [ \"\$statistics_count\" -ge '$required_statistics_count' ]
-      statistics_entries=\$(printf '%s' \"\$manifest_json\" | grep -o '\"statistics_file\": \"[^\"]*\"' || true)
-      [ -n \"\$statistics_entries\" ]
-      printf '%s\n' \"\$statistics_entries\" | while IFS= read -r entry; do
-        stats_uri=\${entry#'\"statistics_file\": \"'}
-        stats_uri=\${stats_uri%'\"'}
+      remaining=\$manifest_json
+      checked_statistics_count=0
+      while :; do
+        case \"\$remaining\" in
+          *'$required_statistics_prefix'*)
+            remaining=\${remaining#*'$required_statistics_prefix'}
+            stats_uri=\${remaining%%\\\"*}
+            ;;
+          *) break ;;
+        esac
+        [ -n \"\$stats_uri\" ]
         case \"\$stats_uri\" in
           s3a://*) stats_path=\"minio/\${stats_uri#s3a://}\" ;;
           s3://*) stats_path=\"minio/\${stats_uri#s3://}\" ;;
           *) exit 1 ;;
         esac
         /usr/bin/mc stat \"\$stats_path\" >/dev/null
+        checked_statistics_count=\$((checked_statistics_count + 1))
       done
+      [ \"\$checked_statistics_count\" -ge '$required_statistics_count' ]
     }
     check_table_format_version
     check_statistics_files
