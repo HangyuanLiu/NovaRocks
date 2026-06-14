@@ -295,28 +295,15 @@ fn could_bound(node: &PhysicalPlanNode, probe_expr: &TypedExpr) -> bool {
     needed.iter().all(|id| have.contains(id))
 }
 
-/// Returns true for non-crossable exchange boundaries (Gather / Any distribution).
-/// These remain hard fragment boundaries that probe runtime filters cannot cross.
 fn is_exchange(node: &PhysicalPlanNode) -> bool {
     matches!(node.op, Operator::PhysicalDistribution(_))
 }
 
-/// A `PhysicalDistribution` whose spec is a shuffle/hash partition is the kind
-/// of boundary a probe runtime filter may cross when the build RF is complete.
-/// Gather / Any are never crossable.
-fn distribution_is_crossable(node: &PhysicalPlanNode) -> bool {
-    use crate::sql::optimizer::property::DistributionSpec;
-    matches!(
-        &node.op,
-        Operator::PhysicalDistribution(op)
-            if matches!(op.spec, DistributionSpec::HashPartitioned { .. })
-    )
-}
-
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct ProbePushPolicy {
     allow_cross_exchange: bool,
-    cross_exchange_build_complete: bool,
+    distribution: JoinDistribution,
+    equal_count: usize,
 }
 
 fn join_is_outer_or_anti_boundary(kind: JoinKind) -> bool {
@@ -338,15 +325,50 @@ fn is_probe_semantic_boundary(node: &PhysicalPlanNode) -> bool {
     )
 }
 
+fn probe_matches_single_partition_column(
+    probe: &RuntimeFilterProbe,
+    partition_col: ColumnId,
+) -> bool {
+    let ids = column_id_vec(&probe.probe_expr);
+    ids.len() == 1 && ids[0] == partition_col
+}
+
+/// StarRocks ExchangeNode.canCrossExchangeNode:
+/// - broadcast RFs can cross any exchange;
+/// - single-key RFs can cross any exchange;
+/// - multi-key partitioned RFs can cross only when this RF's probe column is
+///   the single partition column. NovaRocks keeps StarRocks' multi-column
+///   global RF session switch disabled for now, so multi-column partition
+///   expressions are not crossed.
+fn can_cross_exchange(
+    node: &PhysicalPlanNode,
+    probe: &RuntimeFilterProbe,
+    policy: &ProbePushPolicy,
+) -> bool {
+    if !policy.allow_cross_exchange {
+        return false;
+    }
+    let Operator::PhysicalDistribution(op) = &node.op else {
+        return false;
+    };
+    if matches!(policy.distribution, JoinDistribution::Broadcast) || policy.equal_count == 1 {
+        return true;
+    }
+
+    let crate::sql::optimizer::property::DistributionSpec::HashPartitioned { cols, .. } = &op.spec
+    else {
+        return false;
+    };
+    cols.len() == 1 && probe_matches_single_partition_column(probe, cols[0])
+}
+
 /// Descend into `node` and attach `probe` at the DEEPEST descendant that can
 /// bind the probe expression. Returns `true` when the probe has been placed.
 ///
 /// Rules:
-/// 1. Crossable exchange (HashPartitioned/shuffle): descend transparently only
-///    when the policy allows it and the build RF is complete. Shuffle exchanges
-///    preserve column ids and carry no projection, so no exchange bind check is
-///    needed in that case.
-/// 2. Non-crossable exchange (Gather/Any): hard fragment boundary — stop.
+/// 1. Crossable exchange: descend transparently when it matches StarRocks'
+///    RuntimeFilterDescription/ExchangeNode cross-exchange rules.
+/// 2. Non-crossable exchange: hard fragment boundary — stop.
 /// 3. If `node` cannot bind the probe, stop (return false) — do not descend.
 /// 4. Outer/anti/null-preserving joins are semantic boundaries: place there.
 /// 5. Try each child recursively; if a child accepts the probe, we are done.
@@ -355,12 +377,9 @@ fn is_probe_semantic_boundary(node: &PhysicalPlanNode) -> bool {
 fn push_probe_down(
     node: &mut PhysicalPlanNode,
     probe: &RuntimeFilterProbe,
-    policy: ProbePushPolicy,
+    policy: &ProbePushPolicy,
 ) -> bool {
-    if policy.allow_cross_exchange
-        && policy.cross_exchange_build_complete
-        && distribution_is_crossable(node)
-    {
+    if can_cross_exchange(node, probe, policy) {
         if let Some(child) = node.children.first_mut() {
             return push_probe_down(child, probe, policy);
         }
@@ -501,11 +520,13 @@ fn annotate_node(
     }
 
     // Push each probe descriptor down to the deepest binding descendant within
-    // the true probe child. Stops at exchange (fragment) boundaries.
+    // the true probe child. Exchange boundaries are crossed only when the
+    // policy can prove StarRocks-compatible remote RF semantics.
     // If no binding node is found the RF is build-only (probe remains unplaced).
     let policy = ProbePushPolicy {
         allow_cross_exchange: options.allow_cross_exchange_rf,
-        cross_exchange_build_complete: matches!(distribution, JoinDistribution::Broadcast),
+        distribution: distribution.clone(),
+        equal_count: eq_conditions.len(),
     };
     for d in &descs {
         let probe = RuntimeFilterProbe {
@@ -513,7 +534,7 @@ fn annotate_node(
             probe_expr: d.probe_expr.clone(),
         };
         // Descend into the true probe side to the deepest binding node.
-        let _ = push_probe_down(&mut node.children[sides.probe_child], &probe, policy);
+        let _ = push_probe_down(&mut node.children[sides.probe_child], &probe, &policy);
     }
 
     node.build_runtime_filters = descs;
@@ -563,6 +584,10 @@ pub(crate) mod test_support {
     }
 
     fn leaf(rows: f64, oc: OutputColumn) -> PhysicalPlanNode {
+        leaf_many(rows, vec![oc])
+    }
+
+    fn leaf_many(rows: f64, output_columns: Vec<OutputColumn>) -> PhysicalPlanNode {
         PhysicalPlanNode {
             op: Operator::PhysicalValues(PhysicalValuesOp {
                 rows: vec![],
@@ -574,7 +599,7 @@ pub(crate) mod test_support {
                 column_statistics: Default::default(),
                 ..Default::default()
             },
-            output_columns: vec![oc],
+            output_columns,
             execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
@@ -773,6 +798,66 @@ pub(crate) mod test_support {
                 ..Default::default()
             },
             output_columns: vec![loc, roc],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        }
+    }
+
+    pub(crate) fn two_key_shuffle_join_with_single_partition_probe_exchange() -> PhysicalPlanNode {
+        use crate::sql::optimizer::operator::PhysicalDistributionOp;
+        use crate::sql::optimizer::property::{DistributionSpec, HashSource};
+        let (l1, l1_expr) = col(1, "l1"); // probe partition column
+        let (l2, l2_expr) = col(2, "l2"); // probe non-partition join column
+        let (r1, r1_expr) = col(3, "r1");
+        let (r2, r2_expr) = col(4, "r2");
+        let scan = leaf_many(1_000_000.0, vec![l1.clone(), l2.clone()]);
+        let exch = PhysicalPlanNode {
+            op: Operator::PhysicalDistribution(PhysicalDistributionOp {
+                spec: DistributionSpec::HashPartitioned {
+                    cols: vec![l1.column_id],
+                    source: HashSource::ShuffleJoin,
+                },
+            }),
+            children: vec![scan],
+            stats: Statistics {
+                output_row_count: 1_000_000.0,
+                row_count_confidence: crate::sql::optimizer::statistics::Confidence::Estimated,
+                column_statistics: Default::default(),
+                ..Default::default()
+            },
+            output_columns: vec![l1.clone(), l2.clone()],
+            execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+        let build = leaf_many(100.0, vec![r1.clone(), r2.clone()]);
+        PhysicalPlanNode {
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![
+                    PhysicalHashJoinEqCondition {
+                        left: l1_expr,
+                        right: r1_expr,
+                        null_safe: false,
+                    },
+                    PhysicalHashJoinEqCondition {
+                        left: l2_expr,
+                        right: r2_expr,
+                        null_safe: false,
+                    },
+                ],
+                other_condition: None,
+                distribution: JoinDistribution::Shuffle,
+            }),
+            children: vec![exch, build],
+            stats: Statistics {
+                output_row_count: 100.0,
+                row_count_confidence: crate::sql::optimizer::statistics::Confidence::Estimated,
+                column_statistics: Default::default(),
+                ..Default::default()
+            },
+            output_columns: vec![l1, l2, r1, r2],
             execution_props: crate::sql::optimizer::physical_plan::PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
@@ -1009,7 +1094,7 @@ mod tests {
     }
 
     #[test]
-    fn partitioned_rf_does_not_cross_exchange_even_when_flag_enabled() {
+    fn partitioned_rf_crosses_hash_exchange_for_single_key_when_flag_enabled() {
         let mut j = super::test_support::shuffle_join_with_probe_exchange();
         let mut opts = OptimizerOptions::default_settings();
         opts.allow_cross_exchange_rf = true;
@@ -1020,11 +1105,40 @@ mod tests {
         let exch = &j.children[0];
         assert!(
             exch.probe_runtime_filters.is_empty(),
-            "partitioned probe RF must not be placed on the exchange"
+            "partitioned probe RF should not stop at the exchange"
         );
+        assert_eq!(
+            exch.children[0].probe_runtime_filters.len(),
+            1,
+            "single-key partitioned probe RF should cross a hash exchange to the probe scan"
+        );
+    }
+
+    #[test]
+    fn partitioned_rf_crosses_exchange_only_for_matching_partition_key() {
+        let mut j =
+            super::test_support::two_key_shuffle_join_with_single_partition_probe_exchange();
+        let mut opts = OptimizerOptions::default_settings();
+        opts.allow_cross_exchange_rf = true;
+
+        annotate(&mut j, &opts);
+
+        assert_eq!(j.build_runtime_filters.len(), 2, "two build RFs expected");
+        let exch = &j.children[0];
         assert!(
-            exch.children[0].probe_runtime_filters.is_empty(),
-            "partitioned probe RF must not cross the exchange"
+            exch.probe_runtime_filters.is_empty(),
+            "partitioned probe RF should not stop at the exchange"
+        );
+        let scan_filters = &exch.children[0].probe_runtime_filters;
+        assert_eq!(
+            scan_filters.len(),
+            1,
+            "only the RF whose probe key matches the single hash partition column should cross"
+        );
+        assert_eq!(
+            column_id_vec(&scan_filters[0].probe_expr),
+            vec![ColumnId::new_for_test(1)],
+            "the partition-key RF should be the one that crosses"
         );
     }
 
@@ -1069,12 +1183,12 @@ mod tests {
     }
 
     #[test]
-    fn probe_stays_within_fragment_by_default() {
-        // Default: partial partitioned RF must not cross the shuffle exchange.
-        // It falls back to build-only — the probe stays unplaced above the
-        // exchange.
+    fn probe_stays_within_fragment_when_cross_exchange_disabled() {
         let mut j = super::test_support::shuffle_join_with_probe_exchange();
-        annotate(&mut j, &OptimizerOptions::default_settings());
+        let mut opts = OptimizerOptions::default_settings();
+        opts.allow_cross_exchange_rf = false;
+
+        annotate(&mut j, &opts);
         assert_eq!(j.build_runtime_filters.len(), 1, "build RF still expected");
         let exch = &j.children[0];
         assert!(

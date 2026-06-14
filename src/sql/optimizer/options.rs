@@ -90,12 +90,11 @@ pub(crate) struct OptimizerOptions {
     /// Hard cap on runtime-filter descriptors emitted by one optimize call.
     /// Prevents complex plans from producing unbounded RF lists.
     pub rf_max_count: usize,
-    /// Whether probe runtime filters may be placed across shuffle exchanges
-    /// when placement is conservative. Cross-exchange placement requires a
-    /// complete build RF; currently that means broadcast joins only. Partial
-    /// partitioned RFs still stop at exchange boundaries even when this flag is
-    /// true, and probe pushdown stops at outer/anti/null-preserving semantic
-    /// boundaries.
+    /// Whether probe runtime filters may be placed across exchange boundaries
+    /// using StarRocks-compatible safety rules. Broadcast and single-key RFs
+    /// may cross; multi-key partitioned RFs cross only when the probe key
+    /// matches the single partition column. Probe pushdown still stops at
+    /// outer/anti/null-preserving semantic boundaries.
     pub allow_cross_exchange_rf: bool,
 }
 
@@ -141,7 +140,8 @@ impl OptimizerOptions {
             opts.rf_probe_min_selectivity = v;
         }
         // `allow_cross_exchange_rf` has no session override; the default is safe
-        // because placement rejects partial partitioned RF.
+        // because placement follows StarRocks-compatible exchange crossing
+        // rules and still stops at semantic boundaries.
         opts
     }
 }

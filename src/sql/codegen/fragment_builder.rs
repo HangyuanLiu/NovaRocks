@@ -5534,7 +5534,7 @@ mod tests {
         JoinExecutionDistribution, PhysicalPlanNode, PlanExecutionProps,
     };
     use crate::sql::optimizer::property::DistributionSpec;
-    use crate::sql::optimizer::runtime_filter_pass::RuntimeFilterDesc;
+    use crate::sql::optimizer::runtime_filter_pass::{RuntimeFilterDesc, RuntimeFilterProbe};
     use crate::sql::optimizer::statistics::Statistics;
     use crate::sql::planner::plan::{DecodeMapping, WindowExpr};
 
@@ -7898,10 +7898,14 @@ mod tests {
         };
         let eq = op.eq_conditions[0].clone();
         plan.execution_props.join_distribution = Some(JoinExecutionDistribution::Partitioned);
+        plan.children[0].probe_runtime_filters = vec![RuntimeFilterProbe {
+            filter_id: 7,
+            probe_expr: eq.left.clone(),
+        }];
         plan.build_runtime_filters = vec![RuntimeFilterDesc {
             filter_id: 7,
-            build_expr: eq.right,
-            probe_expr: eq.left,
+            build_expr: eq.right.clone(),
+            probe_expr: eq.left.clone(),
             expr_order: 0,
             distribution: JoinDistribution::Broadcast,
         }];
@@ -7943,9 +7947,16 @@ mod tests {
             rf.build_join_mode,
             Some(crate::runtime_filter::TRuntimeFilterBuildJoinMode::PARTITIONED)
         );
+        assert_eq!(rf.has_remote_targets, Some(false));
         assert_eq!(
             rf.layout.as_ref().and_then(|layout| layout.global_layout),
             Some(crate::runtime_filter::TRuntimeFilterLayoutMode::GLOBAL_SHUFFLE_1L)
+        );
+        assert!(
+            rf.plan_node_id_to_target_expr
+                .as_ref()
+                .is_some_and(|targets| !targets.is_empty()),
+            "runtime filter descriptor must retain probe target expressions"
         );
     }
 

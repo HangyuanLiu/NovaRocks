@@ -866,11 +866,9 @@ fn local_coordinator_report_addr() -> Result<types::TNetworkAddress, String> {
 /// prober params plus the global builder-number map.
 ///
 /// `instance_counts` maps fragment id to the number of instances the scheduler
-/// assigned to it. For each build fragment, every filter id it produces must
-/// wait for exactly that many partial filters before the merge node broadcasts.
-/// Hardcoding 1 here would cause the merge to broadcast after the first
-/// partial, silently dropping N-1 partials and producing an incomplete bloom
-/// filter at N > 1 instances (wrong join results).
+/// assigned to it. Partitioned filters must wait for every build instance
+/// before the merge node broadcasts; broadcast filters are complete from a
+/// single builder and follow StarRocks' builder-count semantics.
 fn build_instance_runtime_filter_params(
     rf_plan: &RuntimeFilterPlanResult,
     id_to_prober_params: &BTreeMap<i32, Vec<runtime_filter::TRuntimeFilterProberParams>>,
@@ -878,11 +876,20 @@ fn build_instance_runtime_filter_params(
 ) -> runtime_filter::TRuntimeFilterParams {
     let mut builder_number: BTreeMap<i32, i32> = BTreeMap::new();
     for (build_frag_id, filter_ids) in &rf_plan.build_side_filters {
-        let n_builders = instance_counts
+        let fragment_builders = instance_counts
             .get(build_frag_id)
             .map(|&n| n as i32)
             .unwrap_or(1);
         for fid in filter_ids {
+            let n_builders = rf_plan
+                .all_filters
+                .get(fid)
+                .and_then(|desc| desc.build_join_mode)
+                .map(|mode| match mode {
+                    runtime_filter::TRuntimeFilterBuildJoinMode::BORADCAST => 1,
+                    _ => fragment_builders,
+                })
+                .unwrap_or(fragment_builders);
             builder_number.insert(*fid, n_builders);
         }
     }
@@ -1481,6 +1488,91 @@ mod tests {
                 .expect_err("binary mysql text must not be coerced at typed root");
             assert!(err.contains("type mismatch"), "{err}");
         }
+    }
+
+    #[test]
+    fn runtime_filter_builder_number_follows_join_distribution() {
+        let mut all_filters = std::collections::HashMap::new();
+        all_filters.insert(
+            10,
+            runtime_filter::TRuntimeFilterDescription {
+                filter_id: Some(10),
+                build_expr: None,
+                expr_order: None,
+                plan_node_id_to_target_expr: None,
+                has_remote_targets: Some(true),
+                bloom_filter_size: None,
+                runtime_filter_merge_nodes: None,
+                build_join_mode: Some(runtime_filter::TRuntimeFilterBuildJoinMode::BORADCAST),
+                sender_finst_id: None,
+                build_plan_node_id: None,
+                broadcast_grf_senders: None,
+                broadcast_grf_destinations: None,
+                bucketseq_to_instance: None,
+                plan_node_id_to_partition_by_exprs: None,
+                filter_type: None,
+                layout: None,
+                build_from_group_execution: None,
+                is_broad_cast_join_in_skew: None,
+                skew_shuffle_filter_id: None,
+                is_asc: None,
+                is_nulls_first: None,
+                limit: None,
+            },
+        );
+        all_filters.insert(
+            20,
+            runtime_filter::TRuntimeFilterDescription {
+                filter_id: Some(20),
+                build_expr: None,
+                expr_order: None,
+                plan_node_id_to_target_expr: None,
+                has_remote_targets: Some(true),
+                bloom_filter_size: None,
+                runtime_filter_merge_nodes: None,
+                build_join_mode: Some(runtime_filter::TRuntimeFilterBuildJoinMode::PARTITIONED),
+                sender_finst_id: None,
+                build_plan_node_id: None,
+                broadcast_grf_senders: None,
+                broadcast_grf_destinations: None,
+                bucketseq_to_instance: None,
+                plan_node_id_to_partition_by_exprs: None,
+                filter_type: None,
+                layout: None,
+                build_from_group_execution: None,
+                is_broad_cast_join_in_skew: None,
+                skew_shuffle_filter_id: None,
+                is_asc: None,
+                is_nulls_first: None,
+                limit: None,
+            },
+        );
+
+        let rf_plan = RuntimeFilterPlanResult {
+            all_filters,
+            build_side_filters: std::collections::HashMap::from([(3, vec![10, 20])]),
+            probe_side_filters: std::collections::HashMap::new(),
+        };
+        let params = build_instance_runtime_filter_params(
+            &rf_plan,
+            &BTreeMap::new(),
+            &BTreeMap::from([(3, 3)]),
+        );
+        let builder_number = params
+            .runtime_filter_builder_number
+            .as_ref()
+            .expect("builder number map");
+
+        assert_eq!(
+            builder_number.get(&10),
+            Some(&1),
+            "broadcast runtime filters are complete per builder and should not wait for all instances"
+        );
+        assert_eq!(
+            builder_number.get(&20),
+            Some(&3),
+            "partitioned runtime filters must wait for every build instance"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -296,3 +296,37 @@ fn encode_membership_filter(filter: &RuntimeMembershipFilter) -> Result<Vec<u8>,
         RuntimeMembershipFilter::Bitset(bitset) => encode_starrocks_bitset_filter(bitset),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exec::pipeline::dependency::DependencyManager;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    fn worker_with_builder_numbers(
+        builder_number: Option<BTreeMap<i32, i32>>,
+    ) -> RuntimeFilterWorker {
+        RuntimeFilterWorker::new(
+            crate::runtime::query_context::QueryId { hi: 1, lo: 2 },
+            runtime_filter::TRuntimeFilterParams {
+                id_to_prober_params: None,
+                runtime_filter_builder_number: builder_number,
+                runtime_filter_max_size: Some(16_i64 * 1024 * 1024),
+                skew_join_runtime_filters: None,
+            },
+            Arc::new(RuntimeFilterHub::new(DependencyManager::new())),
+        )
+    }
+
+    #[test]
+    fn expected_builders_defaults_to_one_and_respects_params() {
+        let worker = worker_with_builder_numbers(None);
+        assert_eq!(worker.expected_builders(7), 1);
+
+        let worker = worker_with_builder_numbers(Some(BTreeMap::from([(7, 3), (8, 0)])));
+        assert_eq!(worker.expected_builders(7), 3);
+        assert_eq!(worker.expected_builders(8), 1);
+        assert_eq!(worker.expected_builders(9), 1);
+    }
+}
