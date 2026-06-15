@@ -1,11 +1,11 @@
-//! The one-shot in-memo join-reorder pass (Phase 4).
+//! The one-shot in-memo join-reorder pass.
 //!
 //! Walks the memo, finds inner/cross join-chain roots, and for each chain larger
 //! than the exhaustive threshold injects multiple candidate orders (LeftDeep +
 //! DP + Greedy-TopK) as alternative expressions in the chain's group, for the
 //! cost search to choose. Faithful to StarRocks `ReorderJoinRule.transform` +
-//! `Memo.copyIn` (a single imperative pass, not a fixpoint rule). NOT wired into
-//! `optimize()` yet — Phase 5 invokes it after `derive_group_statistics`.
+//! `Memo.copyIn` (a single imperative pass, not a fixpoint rule). Invoked from
+//! `optimize()` after `derive_group_statistics`.
 
 use std::collections::{HashMap, HashSet};
 

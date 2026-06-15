@@ -41,8 +41,8 @@ pub(crate) fn flatten_join_chain(memo: &Memo, root: GroupId) -> Option<MultiJoin
         if mask.count_ones() < 2 {
             // A single-relation or constant predicate left inside a join
             // condition (rare after predicate pushdown). Bail rather than risk
-            // dropping it during materialization — the original order (and the
-            // RBO reorder path, still active) handles this chain.
+            // dropping it during materialization — this chain keeps its
+            // original (un-reordered) join order.
             return None;
         }
         predicates.push((pred, mask));

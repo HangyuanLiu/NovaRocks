@@ -133,8 +133,9 @@ pub(crate) fn optimize(
     //     inject alternative join orders into each reorderable inner/cross
     //     chain so the cost search chooses among them with distribution
     //     awareness. Gated by the "MultiJoinReorder" name so
-    //     `SET disable_optimizer_rules='MultiJoinReorder'` reverts to the
-    //     pre-existing RBO reorder path (still active during transition).
+    //     `SET disable_optimizer_rules='MultiJoinReorder'` turns the pass off
+    //     entirely; the legacy RBO reorder was retired, so this is now the only
+    //     join-reorder mechanism.
     if options.is_enabled("MultiJoinReorder") {
         cascades_rules::multi_join_reorder::run_multi_join_reorder(
             &mut memo,
