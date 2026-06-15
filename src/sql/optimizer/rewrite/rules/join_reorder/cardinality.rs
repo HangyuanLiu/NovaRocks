@@ -786,7 +786,11 @@ mod tests {
                 nulls_fraction: 0.0,
                 average_row_size: 4.0,
                 distinct_values_count: 4.0,
-                ..Default::default()
+                // NDV is only trusted when confidence > Fallback; without this
+                // the equality falls back to the discrete min/max domain width
+                // (1/101 for [0,100]) instead of 1/NDV. Matches the convention
+                // in `and_selectivity_uses_damped_conjunction`.
+                confidence: Confidence::Exact,
             },
         )]
         .into_iter()
@@ -797,7 +801,8 @@ mod tests {
             eq_expr(col_ref("a"), int_lit(2)),
         );
         let sel = estimate_selectivity(&pred, &col_stats);
-        // 0.25 + 0.25 - 0.25*0.25 = 0.4375
+        // Trusted NDV(a)=4 -> 1/4 = 0.25 per equality;
+        // OR combines via l + r - l*r = 0.25 + 0.25 - 0.25*0.25 = 0.4375.
         assert!((sel - 0.4375).abs() < 0.001);
     }
 
