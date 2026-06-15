@@ -115,6 +115,41 @@ pub(crate) fn lower_sort_node(
     let max_buffered_bytes =
         parse_optional_positive_i64(sort.max_buffered_bytes, node.node_id, "max_buffered_bytes")?;
 
+    // Per-partition TopN (StarRocks PartitionSort). partition_exprs are grouping
+    // keys; partition_limit caps rows per group. Compiled like ordering exprs but
+    // grouping-only — we mark them asc/nulls_first so exec makes groups adjacent.
+    let partition_exprs = match sort.partition_exprs.as_ref() {
+        None => Vec::new(),
+        Some(exprs) => {
+            let mut out = Vec::with_capacity(exprs.len());
+            for e in exprs {
+                let expr_id = lower_t_expr(e, arena, &sort_input_layout, last_query_id, fe_addr)?;
+                out.push(SortExpression {
+                    expr: expr_id,
+                    asc: true,
+                    nulls_first: true,
+                });
+            }
+            out
+        }
+    };
+    let partition_limit = match sort.partition_limit {
+        None => None,
+        Some(v) if v < 0 => {
+            return Err(format!(
+                "SORT_NODE node_id={} partition_limit must be >= 0, got {v}",
+                node.node_id
+            ));
+        }
+        Some(v) => Some(v as usize),
+    };
+    if partition_limit.is_some() && !use_top_n {
+        return Err(format!(
+            "SORT_NODE node_id={} partition_limit requires use_top_n=true",
+            node.node_id
+        ));
+    }
+
     Ok(Lowered {
         node: ExecNode {
             kind: ExecNodeKind::Sort(SortNode {
@@ -127,8 +162,8 @@ pub(crate) fn lower_sort_node(
                 topn_type,
                 max_buffered_rows,
                 max_buffered_bytes,
-                partition_exprs: Vec::new(),
-                partition_limit: None,
+                partition_exprs,
+                partition_limit,
             }),
         },
         layout: sort_output_layout,
@@ -955,5 +990,32 @@ mod tests {
         };
         assert!(sort.use_top_n);
         assert_eq!(sort.topn_type, SortTopNType::DenseRank);
+    }
+
+    #[test]
+    fn lower_sort_node_reads_partition_limit_and_exprs() {
+        let layout = single_slot_layout(0, 1);
+        let sort_info = plan_nodes::TSortInfo {
+            ordering_exprs: vec![slot_ref_expr(0, 1)],
+            is_asc_order: vec![true],
+            nulls_first: vec![true],
+            sort_tuple_slot_exprs: None,
+        };
+        let mut node = sort_plan_node(sort_info);
+        {
+            let sort_node = node.sort_node.as_mut().expect("sort node");
+            sort_node.use_top_n = true;
+            sort_node.topn_type = Some(plan_nodes::TTopNType::RANK);
+            sort_node.partition_limit = Some(3);
+            sort_node.partition_exprs = Some(vec![slot_ref_expr(0, 1)]);
+        }
+        node.limit = 10;
+
+        let lowered = lower_sort_from_node(&node, layout).expect("lower sort");
+        let ExecNodeKind::Sort(sort) = lowered.node.kind else {
+            panic!("expected sort node");
+        };
+        assert_eq!(sort.partition_limit, Some(3));
+        assert_eq!(sort.partition_exprs.len(), 1);
     }
 }
