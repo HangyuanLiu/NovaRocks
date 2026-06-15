@@ -1,0 +1,323 @@
+//! Flatten a contiguous inner/cross join chain in the memo into a
+//! [`MultiJoinGraph`]. Ported from `join_reorder/reorder.rs::extract_join_graph`,
+//! re-expressed over memo `GroupId`s.
+
+use std::collections::{HashMap, HashSet};
+
+use crate::sql::analysis::{JoinKind, TypedExpr};
+use crate::sql::column_id::ColumnId;
+use crate::sql::optimizer::memo::{GroupId, Memo};
+use crate::sql::optimizer::operator::{LogicalJoinOp, Operator};
+use crate::sql::optimizer::rewrite::rules::utils::{collect_column_id_refs, split_and};
+use crate::sql::optimizer::statistics::{Confidence, Statistics};
+
+use super::super::implement::get_group_column_ids;
+use super::MultiJoinGraph;
+
+/// Flatten the inner/cross join chain rooted at `root`. Descends only through
+/// inner/cross `LogicalJoin` groups (and a `LogicalFilter` sitting directly on
+/// such a join, whose predicate is absorbed); every other group — outer/semi
+/// joins, `LogicalProject`, scans, aggregates, CTE consumes, etc. — is an opaque
+/// atom (M4: the chain never descends through a projection or a non-inner/cross
+/// join). Returns `None` for fewer than two atoms or more than 32 (mask cap).
+pub(crate) fn flatten_join_chain(memo: &Memo, root: GroupId) -> Option<MultiJoinGraph> {
+    let mut atoms: Vec<GroupId> = Vec::new();
+    let mut raw_predicates: Vec<TypedExpr> = Vec::new();
+    collect_chain(memo, root, &mut atoms, &mut raw_predicates);
+
+    if atoms.len() < 2 || atoms.len() > 32 {
+        return None;
+    }
+
+    let atom_cols: Vec<HashSet<ColumnId>> = atoms
+        .iter()
+        .map(|&g| get_group_column_ids(memo, g))
+        .collect();
+    let atom_stats: Vec<Statistics> = atoms.iter().map(|&g| group_stats(memo, g)).collect();
+    let mut predicates: Vec<(TypedExpr, u32)> = Vec::new();
+
+    for pred in raw_predicates {
+        let mask = relation_mask(&pred, &atom_cols);
+        if mask.count_ones() < 2 {
+            // A single-relation or constant predicate left inside a join
+            // condition (rare after predicate pushdown). Bail rather than risk
+            // dropping it during materialization — the original order (and the
+            // RBO reorder path, still active) handles this chain.
+            return None;
+        }
+        predicates.push((pred, mask));
+    }
+
+    Some(MultiJoinGraph {
+        atoms,
+        atom_stats,
+        predicates,
+    })
+}
+
+fn collect_chain(
+    memo: &Memo,
+    group: GroupId,
+    atoms: &mut Vec<GroupId>,
+    predicates: &mut Vec<TypedExpr>,
+) {
+    let Some(expr) = memo.groups.get(group).and_then(|g| g.logical_exprs.first()) else {
+        atoms.push(group);
+        return;
+    };
+    match &expr.op {
+        Operator::LogicalJoin(LogicalJoinOp {
+            join_type,
+            condition,
+        }) if matches!(join_type, JoinKind::Inner | JoinKind::Cross)
+            && expr.children.len() == 2 =>
+        {
+            collect_chain(memo, expr.children[0], atoms, predicates);
+            collect_chain(memo, expr.children[1], atoms, predicates);
+            if let Some(cond) = condition {
+                predicates.extend(split_and(cond.clone()));
+            }
+        }
+        Operator::LogicalFilter(f)
+            if expr.children.len() == 1 && is_inner_cross_join(memo, expr.children[0]) =>
+        {
+            // Absorb a filter sitting directly on an inner/cross join.
+            predicates.extend(split_and(f.predicate.clone()));
+            collect_chain(memo, expr.children[0], atoms, predicates);
+        }
+        // Any other operator (incl. LogicalProject and outer/semi joins) is an
+        // opaque atom — the chain stops here.
+        _ => atoms.push(group),
+    }
+}
+
+fn is_inner_cross_join(memo: &Memo, group: GroupId) -> bool {
+    memo.groups
+        .get(group)
+        .and_then(|g| g.logical_exprs.first())
+        .is_some_and(|e| {
+            matches!(
+                &e.op,
+                Operator::LogicalJoin(LogicalJoinOp { join_type, .. })
+                    if matches!(join_type, JoinKind::Inner | JoinKind::Cross)
+            )
+        })
+}
+
+fn group_stats(memo: &Memo, group: GroupId) -> Statistics {
+    memo.groups
+        .get(group)
+        .and_then(|g| g.logical_props.as_ref())
+        .map(|p| Statistics {
+            output_row_count: p.row_count,
+            row_count_confidence: p.row_count_confidence,
+            column_statistics: p.column_statistics.clone(),
+        })
+        .unwrap_or_else(|| Statistics {
+            output_row_count: 1.0,
+            row_count_confidence: Confidence::Fallback,
+            column_statistics: HashMap::new(),
+        })
+}
+
+/// Bitmask of atom indices whose columns the predicate references.
+fn relation_mask(pred: &TypedExpr, atom_cols: &[HashSet<ColumnId>]) -> u32 {
+    let ids = collect_column_id_refs(pred);
+    let mut mask = 0u32;
+    for id in ids {
+        for (i, cols) in atom_cols.iter().enumerate() {
+            if cols.contains(&id) {
+                mask |= 1u32 << i;
+            }
+        }
+    }
+    mask
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn};
+    use crate::sql::optimizer::memo::{JoinTree, LogicalProperties, MExpr};
+    use crate::sql::optimizer::operator::LogicalValuesOp;
+    use crate::sql::optimizer::statistics::ColumnStatistic;
+    use crate::sql::optimizer::stats::copy_in_join_tree;
+    use std::collections::HashMap as Map;
+
+    fn col(id: u32) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId::new_for_test(id),
+                qualifier: None,
+                column: format!("c{id}"),
+            },
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+        }
+    }
+
+    fn int_lit(v: i64) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Int(v)),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+        }
+    }
+
+    fn eq(l: TypedExpr, r: TypedExpr) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(l),
+                op: BinOp::Eq,
+                right: Box::new(r),
+            },
+            data_type: arrow::datatypes::DataType::Boolean,
+            nullable: false,
+        }
+    }
+
+    fn and(l: TypedExpr, r: TypedExpr) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(l),
+                op: BinOp::And,
+                right: Box::new(r),
+            },
+            data_type: arrow::datatypes::DataType::Boolean,
+            nullable: false,
+        }
+    }
+
+    fn out_col(id: u32) -> OutputColumn {
+        OutputColumn {
+            column_id: ColumnId::new_for_test(id),
+            name: format!("c{id}"),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        }
+    }
+
+    fn leaf(memo: &mut Memo, col_id: u32, rows: f64) -> GroupId {
+        let g = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalValues(LogicalValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
+            children: vec![],
+        });
+        let mut props = LogicalProperties::new(vec![out_col(col_id)], rows);
+        props.row_count_confidence = Confidence::Estimated;
+        props.column_statistics.insert(
+            ColumnId::new_for_test(col_id),
+            ColumnStatistic {
+                min_value: 0.0,
+                max_value: rows,
+                nulls_fraction: 0.0,
+                average_row_size: 8.0,
+                distinct_values_count: rows,
+                confidence: Confidence::Estimated,
+            },
+        );
+        memo.groups[g].logical_props = Some(props);
+        g
+    }
+
+    fn inner(cond: TypedExpr) -> LogicalJoinOp {
+        LogicalJoinOp {
+            join_type: JoinKind::Inner,
+            condition: Some(cond),
+        }
+    }
+
+    #[test]
+    fn flatten_collects_atoms_and_classifies_predicates() {
+        let mut memo = Memo::new();
+        let a = leaf(&mut memo, 1, 1000.0);
+        let b = leaf(&mut memo, 2, 100.0);
+        let c = leaf(&mut memo, 3, 50.0);
+        // (A ⋈[c1=c2] B) ⋈[c1=c3] C
+        let tree = JoinTree::Join {
+            left: Box::new(JoinTree::Join {
+                left: Box::new(JoinTree::Leaf(a)),
+                right: Box::new(JoinTree::Leaf(b)),
+                op: inner(eq(col(1), col(2))),
+            }),
+            right: Box::new(JoinTree::Leaf(c)),
+            op: inner(eq(col(1), col(3))),
+        };
+        let root = copy_in_join_tree(&mut memo, &tree, &Map::new());
+
+        let graph = flatten_join_chain(&memo, root).expect("3-atom chain flattens");
+        assert_eq!(graph.atoms, vec![a, b, c], "left-to-right atom order");
+        assert_eq!(graph.predicates.len(), 2, "two multi-relation join edges");
+        let masks: std::collections::HashSet<u32> =
+            graph.predicates.iter().map(|(_, m)| *m).collect();
+        assert!(masks.contains(&0b011), "c1=c2 touches atoms A,B");
+        assert!(masks.contains(&0b101), "c1=c3 touches atoms A,C");
+    }
+
+    #[test]
+    fn flatten_does_not_descend_through_non_inner_join() {
+        // A LEFT OUTER join inside the chain is an opaque atom boundary — the
+        // same code path that stops at a LogicalProject (M4).
+        let mut memo = Memo::new();
+        let a = leaf(&mut memo, 1, 1000.0);
+        let b = leaf(&mut memo, 2, 100.0);
+        let c = leaf(&mut memo, 3, 50.0);
+        let lo = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalJoin(LogicalJoinOp {
+                join_type: JoinKind::LeftOuter,
+                condition: Some(eq(col(1), col(2))),
+            }),
+            children: vec![a, b],
+        });
+        let mut lo_props = LogicalProperties::new(vec![out_col(1), out_col(2)], 1000.0);
+        lo_props.row_count_confidence = Confidence::Estimated;
+        memo.groups[lo].logical_props = Some(lo_props);
+
+        let tree = JoinTree::Join {
+            left: Box::new(JoinTree::Leaf(lo)),
+            right: Box::new(JoinTree::Leaf(c)),
+            op: inner(eq(col(1), col(3))),
+        };
+        let root = copy_in_join_tree(&mut memo, &tree, &Map::new());
+
+        let graph = flatten_join_chain(&memo, root).expect("chain over {LO, C}");
+        assert_eq!(
+            graph.atoms.len(),
+            2,
+            "LEFT OUTER join is an atom, not descended"
+        );
+        assert!(graph.atoms.contains(&lo), "the outer-join group is an atom");
+        assert!(
+            !graph.atoms.contains(&a) && !graph.atoms.contains(&b),
+            "must not descend into the outer join's inputs"
+        );
+    }
+
+    #[test]
+    fn flatten_bails_on_single_side_predicate() {
+        let mut memo = Memo::new();
+        let a = leaf(&mut memo, 1, 1000.0);
+        let b = leaf(&mut memo, 2, 100.0);
+        // condition: c1 = c2  AND  c1 = 5  (the second conjunct is single-side on A)
+        let cond = and(eq(col(1), col(2)), eq(col(1), int_lit(5)));
+        let tree = JoinTree::Join {
+            left: Box::new(JoinTree::Leaf(a)),
+            right: Box::new(JoinTree::Leaf(b)),
+            op: inner(cond),
+        };
+        let root = copy_in_join_tree(&mut memo, &tree, &Map::new());
+
+        // A single-relation predicate inside the join condition makes the chain
+        // non-reorderable (we never drop predicates); flatten returns None and
+        // the original order / RBO path handles this chain.
+        assert!(
+            flatten_join_chain(&memo, root).is_none(),
+            "chain with a single-side join-condition predicate must not be reordered"
+        );
+    }
+}

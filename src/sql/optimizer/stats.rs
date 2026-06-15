@@ -12,7 +12,7 @@ use super::estimate::ndv::{
 };
 use super::estimate::selectivity::apply_filter;
 pub(crate) use super::estimate::selectivity::{estimate_selectivity, extract_column_id};
-use super::memo::{MExpr, Memo};
+use super::memo::{GroupId, JoinTree, MExpr, Memo};
 use super::operator::Operator;
 use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, TypedExpr};
 use crate::sql::column_id::ColumnId;
@@ -705,36 +705,92 @@ pub(crate) fn derive_group_statistics(
     table_stats: &HashMap<String, TableStatistics>,
 ) {
     for group_idx in 0..memo.groups.len() {
-        // Derive stats from the first logical expression in the group.
-        let stats = if let Some(first_expr) = memo.groups[group_idx].logical_exprs.first() {
-            let expr_clone = first_expr.clone();
-            derive_statistics(&expr_clone, memo, table_stats)
-        } else {
-            // No logical expression; fall back to first physical expression.
-            if let Some(first_expr) = memo.groups[group_idx].physical_exprs.first() {
-                let expr_clone = first_expr.clone();
-                derive_statistics(&expr_clone, memo, table_stats)
-            } else {
-                // Empty group: use defaults.
-                Statistics {
-                    output_row_count: 1.0,
-                    row_count_confidence: Confidence::Fallback,
-                    column_statistics: HashMap::new(),
-                }
+        derive_group_statistics_for(memo, group_idx, table_stats);
+    }
+}
+
+/// Derive and store [`super::memo::LogicalProperties`] for a single group. The
+/// group's child groups must already have their `logical_props` set (the
+/// bottom-up allocation invariant the bulk pass relies on). Used both by
+/// [`derive_group_statistics`] and by [`copy_in_join_tree`] to stamp each
+/// newly-created join group immediately, before `implement()` runs — otherwise
+/// a bushy join's children have no column ids and `JoinToHashJoin` degrades the
+/// join to a NestLoop.
+pub(crate) fn derive_group_statistics_for(
+    memo: &mut Memo,
+    group_idx: usize,
+    table_stats: &HashMap<String, TableStatistics>,
+) {
+    // Derive stats from the first logical expression, else the first physical.
+    let stats = if let Some(first_expr) = memo.groups[group_idx].logical_exprs.first() {
+        let expr_clone = first_expr.clone();
+        derive_statistics(&expr_clone, memo, table_stats)
+    } else if let Some(first_expr) = memo.groups[group_idx].physical_exprs.first() {
+        let expr_clone = first_expr.clone();
+        derive_statistics(&expr_clone, memo, table_stats)
+    } else {
+        // Empty group: use defaults.
+        Statistics {
+            output_row_count: 1.0,
+            row_count_confidence: Confidence::Fallback,
+            column_statistics: HashMap::new(),
+        }
+    };
+
+    let output_columns = derive_output_columns(memo, group_idx);
+
+    memo.groups[group_idx].logical_props = Some(super::logical_props::derive_for_group(
+        memo,
+        group_idx,
+        output_columns,
+        stats.output_row_count,
+        stats.row_count_confidence,
+        stats.column_statistics,
+    ));
+}
+
+/// Materialize a [`JoinTree`] candidate order bottom-up into the memo, returning
+/// the group id of its root. Leaves reuse their existing group; each internal
+/// join is deduplicated against `memo.join_group_index` and, when newly
+/// created, has its statistics stamped immediately via
+/// [`derive_group_statistics_for`].
+pub(crate) fn copy_in_join_tree(
+    memo: &mut Memo,
+    tree: &JoinTree,
+    table_stats: &HashMap<String, TableStatistics>,
+) -> GroupId {
+    match tree {
+        JoinTree::Leaf(group_id) => *group_id,
+        JoinTree::Join { left, right, op } => {
+            // Recurse children first so child group ids are always allocated
+            // before the parent (the bottom-up invariant M2 relies on).
+            let left_id = copy_in_join_tree(memo, left, table_stats);
+            let right_id = copy_in_join_tree(memo, right, table_stats);
+            let operator = Operator::LogicalJoin(op.clone());
+            // Dedup: reuse an existing group for the same operator + child
+            // groups, so candidates sharing intermediate sub-joins do not mint
+            // duplicate groups.
+            let key = (format!("{operator:?}"), vec![left_id, right_id]);
+            if let Some(&existing) = memo.join_group_index.get(&key) {
+                return existing;
             }
-        };
-
-        // Derive output columns from the operator.
-        let output_columns = derive_output_columns(memo, group_idx);
-
-        memo.groups[group_idx].logical_props = Some(super::logical_props::derive_for_group(
-            memo,
-            group_idx,
-            output_columns,
-            stats.output_row_count,
-            stats.row_count_confidence,
-            stats.column_statistics,
-        ));
+            let id = memo.next_expr_id();
+            let group_id = memo.new_group(MExpr {
+                id,
+                op: operator,
+                children: vec![left_id, right_id],
+            });
+            debug_assert!(
+                left_id < group_id && right_id < group_id,
+                "copy_in_join_tree must allocate bottom-up (child < parent)"
+            );
+            // Stamp statistics immediately: implement() runs before the bulk
+            // re-derive (mod.rs), and JoinToHashJoin reads child column ids from
+            // logical_props — without this a bushy join degrades to NestLoop (M1).
+            derive_group_statistics_for(memo, group_id, table_stats);
+            memo.join_group_index.insert(key, group_id);
+            group_id
+        }
     }
 }
 
@@ -4243,6 +4299,96 @@ mod tests {
             cs.distinct_values_count >= 100.0,
             "merged NDV should be >= max child NDV, got {}",
             cs.distinct_values_count
+        );
+    }
+
+    /// Build a leaf memo group exposing one column with the given NDV/row count.
+    fn join_leaf_group(memo: &mut Memo, col_id: u32, ndv: f64, rows: f64) -> usize {
+        use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
+        use crate::sql::optimizer::operator::{LogicalValuesOp, Operator};
+        let g = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalValues(LogicalValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
+            children: vec![],
+        });
+        let mut props = LogicalProperties::new(vec![stats_output_column(col_id, "c")], rows);
+        props.row_count_confidence = Confidence::Estimated;
+        props.column_statistics.insert(
+            ColumnId::new_for_test(col_id),
+            set_op_column_stat(0.0, ndv, 0.0, 8.0, ndv, Confidence::Estimated),
+        );
+        memo.groups[g].logical_props = Some(props);
+        g
+    }
+
+    /// `(A join B) join C` over the three leaf groups, inner joins (no explicit
+    /// condition — irrelevant for materialization/dedup tests).
+    fn abc_join_tree(a: usize, b: usize, c: usize) -> crate::sql::optimizer::memo::JoinTree {
+        use crate::sql::optimizer::memo::JoinTree;
+        use crate::sql::optimizer::operator::LogicalJoinOp;
+        let inner = || LogicalJoinOp {
+            join_type: JoinKind::Inner,
+            condition: None,
+        };
+        JoinTree::Join {
+            left: Box::new(JoinTree::Join {
+                left: Box::new(JoinTree::Leaf(a)),
+                right: Box::new(JoinTree::Leaf(b)),
+                op: inner(),
+            }),
+            right: Box::new(JoinTree::Leaf(c)),
+            op: inner(),
+        }
+    }
+
+    #[test]
+    fn copy_in_join_tree_stamps_stats_on_new_groups() {
+        let mut memo = Memo::new();
+        let a = join_leaf_group(&mut memo, 1, 100.0, 1000.0);
+        let b = join_leaf_group(&mut memo, 2, 100.0, 1000.0);
+        let c = join_leaf_group(&mut memo, 3, 50.0, 500.0);
+        let tree = abc_join_tree(a, b, c);
+
+        let groups_before = memo.groups.len();
+        let root = copy_in_join_tree(&mut memo, &tree, &HashMap::new());
+
+        // Two new groups materialized: (A join B) and the root.
+        assert_eq!(memo.groups.len(), groups_before + 2);
+        // Each new join group must have stamped logical_props at creation time;
+        // otherwise implement() runs before the re-derive and bushy joins
+        // degrade to NestLoop (M1).
+        for gid in groups_before..memo.groups.len() {
+            let props = memo.groups[gid].logical_props.as_ref();
+            assert!(
+                props.is_some(),
+                "new join group {gid} must have stamped logical_props"
+            );
+            assert!(props.unwrap().row_count > 0.0);
+        }
+        assert!(memo.groups[root].logical_props.is_some());
+    }
+
+    #[test]
+    fn copy_in_join_tree_dedups_repeated_subtrees() {
+        let mut memo = Memo::new();
+        let a = join_leaf_group(&mut memo, 1, 100.0, 1000.0);
+        let b = join_leaf_group(&mut memo, 2, 100.0, 1000.0);
+        let c = join_leaf_group(&mut memo, 3, 50.0, 500.0);
+        let tree = abc_join_tree(a, b, c);
+
+        let r1 = copy_in_join_tree(&mut memo, &tree, &HashMap::new());
+        let after_first = memo.groups.len();
+        // Re-materializing the identical tree reuses every group: same root,
+        // zero new groups (dedup via join_group_index).
+        let r2 = copy_in_join_tree(&mut memo, &tree, &HashMap::new());
+        assert_eq!(r1, r2, "identical tree must dedup to the same root group");
+        assert_eq!(
+            memo.groups.len(),
+            after_first,
+            "re-copying an identical tree must not mint new groups"
         );
     }
 

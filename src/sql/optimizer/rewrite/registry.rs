@@ -29,11 +29,6 @@ pub(crate) fn query_rewrite_pipeline(
             rules::predicate_pushdown_rules(),
         ),
         RewriteStage::new(
-            "JoinReorder",
-            RewritePhase::StructuralRewrite,
-            rules::join_reorder_rules(table_stats),
-        ),
-        RewriteStage::new(
             "PredicatePushdownPostJoin",
             RewritePhase::StructuralRewrite,
             {
@@ -128,7 +123,6 @@ mod tests {
             vec![
                 "SubqueryRewrite",
                 "PredicatePushdownPreJoin",
-                "JoinReorder",
                 "PredicatePushdownPostJoin",
                 "PredicateMoveAround",
                 "PredicatePushdownAfterMoveAround",
@@ -153,7 +147,6 @@ mod tests {
                 "EliminateUniqueAggregate",
                 "ExistentialApplyToJoin",
                 "JoinPredicateMoveAround",
-                "JoinReorder",
                 "LowCardinalityDictionaryRewrite",
                 "PruneAggregateColumns",
                 "PruneCTEAnchorColumns",

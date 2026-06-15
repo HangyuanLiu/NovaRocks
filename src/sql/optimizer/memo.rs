@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use super::operator::Operator;
+use super::operator::{LogicalJoinOp, Operator};
 use super::property::{ColumnIdSet, EquivalenceClasses};
 use super::statistics::{ColumnStatistic, Confidence};
 use crate::sql::analysis::OutputColumn;
@@ -19,6 +19,22 @@ use crate::sql::column_id::{ColumnId, ColumnRefFactory};
 pub(crate) type GroupId = usize;
 pub(crate) type MExprId = usize;
 pub(crate) type Cost = f64;
+
+/// A candidate join order produced by the reorder enumerator, expressed over
+/// existing memo groups (leaves) and new join operators (internal nodes).
+/// [`crate::sql::optimizer::stats::copy_in_join_tree`] materializes it
+/// bottom-up into the memo.
+#[derive(Clone, Debug)]
+pub(crate) enum JoinTree {
+    /// An existing memo group — an "atom" of the flattened join chain.
+    Leaf(GroupId),
+    /// A join of two subtrees under the given logical join operator.
+    Join {
+        left: Box<JoinTree>,
+        right: Box<JoinTree>,
+        op: LogicalJoinOp,
+    },
+}
 
 // ---------------------------------------------------------------------------
 // Memo
@@ -36,6 +52,12 @@ pub(crate) struct Memo {
     /// and qualifiers from [`ColumnId`]s in distribution specs,
     /// sort keys, and equivalence classes.
     pub(crate) factory: ColumnRefFactory,
+    /// Deduplication index for join groups materialized by
+    /// [`crate::sql::optimizer::stats::copy_in_join_tree`]. Maps a structural
+    /// key `(op debug string, child group ids)` to the existing group, so that
+    /// multiple reorder candidates sharing intermediate sub-joins reuse one
+    /// group instead of minting duplicates (StarRocks `Memo.groupExpressions`).
+    pub(crate) join_group_index: HashMap<(String, Vec<GroupId>), GroupId>,
 }
 
 impl Memo {
@@ -44,6 +66,7 @@ impl Memo {
             groups: Vec::new(),
             cte_produce_groups: HashMap::new(),
             factory: ColumnRefFactory::new(),
+            join_group_index: HashMap::new(),
         }
     }
 
