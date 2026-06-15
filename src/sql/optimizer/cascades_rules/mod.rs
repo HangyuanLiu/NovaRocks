@@ -4,6 +4,7 @@ pub(crate) mod equivalence_predicate;
 pub(crate) mod implement;
 pub(crate) mod join_associativity;
 pub(crate) mod join_commutativity;
+pub(crate) mod multi_join_reorder;
 pub(crate) mod mv_rewrite;
 pub(crate) mod sort_limit_to_top_n;
 pub(crate) mod split_aggregate;
