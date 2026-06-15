@@ -1,0 +1,264 @@
+-- @tags=sort,oq13,ranking_window_topn_correctness
+-- Test Objective: Verify RankingWindowPredicatePushdown correctness — results must be
+-- IDENTICAL whether the rule is ON (default) or OFF (SET disable_optimizer_rules=...).
+-- Covers: rank()=1, rank()<=k with tie at boundary, dense_rank()<=k with ties,
+--         row_number()<=k, NULL ORDER BY values, single-row partition,
+--         and a scalar subquery with a rank window.
+-- The rule fires by inserting partition_limit=K into the analytic Sort; the Filter and
+-- Window nodes are preserved, so per-partition truncation must not alter the result set.
+
+CREATE DATABASE IF NOT EXISTS ${case_db};
+USE ${case_db};
+
+DROP TABLE IF EXISTS ${case_db}.rw_c;
+CREATE TABLE ${case_db}.rw_c (
+    grp   VARCHAR(10),
+    oid   INT,
+    score INT
+);
+INSERT INTO ${case_db}.rw_c VALUES
+    -- group A: 4 rows, top-1 is score=400
+    ('A', 1, 400),
+    ('A', 2, 300),
+    ('A', 3, 300),
+    ('A', 4, 100),
+    -- group B: 3 rows, tie at rank 2 (scores 90,90); rank()<=2 must return all 3
+    ('B', 5, 200),
+    ('B', 6, 90),
+    ('B', 7, 90),
+    -- group C: 1 row only (single-row partition)
+    ('C', 8, 50),
+    -- group D: rows with NULL score
+    ('D', 9,  NULL),
+    ('D', 10, 500),
+    ('D', 11, 400);
+
+ANALYZE TABLE ${case_db}.rw_c;
+
+-- ===========================================================================
+-- Case 1: rank() = 1 (top-1 per partition, rule ON)
+-- @explain_contains=partition_limit=
+-- ===========================================================================
+SELECT grp, oid, score, rk
+FROM (
+    SELECT grp, oid, score,
+           rank() OVER (PARTITION BY grp ORDER BY score DESC NULLS LAST) AS rk
+    FROM ${case_db}.rw_c
+) t
+WHERE rk = 1
+ORDER BY grp, oid;
+
+SET disable_optimizer_rules='RankingWindowPredicatePushdown';
+
+-- Case 1 rule OFF — must produce identical rows as Case 1 rule ON.
+SELECT grp, oid, score, rk
+FROM (
+    SELECT grp, oid, score,
+           rank() OVER (PARTITION BY grp ORDER BY score DESC NULLS LAST) AS rk
+    FROM ${case_db}.rw_c
+) t
+WHERE rk = 1
+ORDER BY grp, oid;
+
+SET disable_optimizer_rules='';
+
+-- ===========================================================================
+-- Case 2: rank() <= 2 with tie AT boundary (group B has 2 rows at rank 2).
+-- Rule ON: partition_limit must expand to cover ties.
+-- ===========================================================================
+SELECT grp, oid, score, rk
+FROM (
+    SELECT grp, oid, score,
+           rank() OVER (PARTITION BY grp ORDER BY score DESC NULLS LAST) AS rk
+    FROM ${case_db}.rw_c
+) t
+WHERE rk <= 2
+ORDER BY grp, rk, oid;
+
+SET disable_optimizer_rules='RankingWindowPredicatePushdown';
+
+-- Case 2 rule OFF — must produce identical rows as Case 2 rule ON.
+SELECT grp, oid, score, rk
+FROM (
+    SELECT grp, oid, score,
+           rank() OVER (PARTITION BY grp ORDER BY score DESC NULLS LAST) AS rk
+    FROM ${case_db}.rw_c
+) t
+WHERE rk <= 2
+ORDER BY grp, rk, oid;
+
+SET disable_optimizer_rules='';
+
+-- ===========================================================================
+-- Case 3: dense_rank() <= 2 with ties (group B has two rows at dense_rank=2).
+-- ===========================================================================
+SELECT grp, oid, score, drk
+FROM (
+    SELECT grp, oid, score,
+           dense_rank() OVER (PARTITION BY grp ORDER BY score DESC NULLS LAST) AS drk
+    FROM ${case_db}.rw_c
+) t
+WHERE drk <= 2
+ORDER BY grp, drk, oid;
+
+SET disable_optimizer_rules='RankingWindowPredicatePushdown';
+
+-- Case 3 rule OFF — must produce identical rows as Case 3 rule ON.
+SELECT grp, oid, score, drk
+FROM (
+    SELECT grp, oid, score,
+           dense_rank() OVER (PARTITION BY grp ORDER BY score DESC NULLS LAST) AS drk
+    FROM ${case_db}.rw_c
+) t
+WHERE drk <= 2
+ORDER BY grp, drk, oid;
+
+SET disable_optimizer_rules='';
+
+-- ===========================================================================
+-- Case 4: row_number() <= 2 (exactly 2 rows per partition, no tie expansion).
+-- ===========================================================================
+SELECT grp, oid, score, rn
+FROM (
+    SELECT grp, oid, score,
+           row_number() OVER (PARTITION BY grp ORDER BY score DESC NULLS LAST, oid) AS rn
+    FROM ${case_db}.rw_c
+) t
+WHERE rn <= 2
+ORDER BY grp, rn;
+
+SET disable_optimizer_rules='RankingWindowPredicatePushdown';
+
+-- Case 4 rule OFF — must produce identical rows as Case 4 rule ON.
+SELECT grp, oid, score, rn
+FROM (
+    SELECT grp, oid, score,
+           row_number() OVER (PARTITION BY grp ORDER BY score DESC NULLS LAST, oid) AS rn
+    FROM ${case_db}.rw_c
+) t
+WHERE rn <= 2
+ORDER BY grp, rn;
+
+SET disable_optimizer_rules='';
+
+-- ===========================================================================
+-- Case 5: NULL in ORDER BY key — group D has one NULL score.
+-- NULLS LAST puts NULL at the bottom; rank()<=1 should return the non-NULL top row.
+-- ===========================================================================
+SELECT grp, oid, score, rk
+FROM (
+    SELECT grp, oid, score,
+           rank() OVER (PARTITION BY grp ORDER BY score DESC NULLS LAST) AS rk
+    FROM ${case_db}.rw_c
+    WHERE grp = 'D'
+) t
+WHERE rk <= 1
+ORDER BY grp, oid;
+
+SET disable_optimizer_rules='RankingWindowPredicatePushdown';
+
+-- Case 5 rule OFF — must produce identical rows as Case 5 rule ON.
+SELECT grp, oid, score, rk
+FROM (
+    SELECT grp, oid, score,
+           rank() OVER (PARTITION BY grp ORDER BY score DESC NULLS LAST) AS rk
+    FROM ${case_db}.rw_c
+    WHERE grp = 'D'
+) t
+WHERE rk <= 1
+ORDER BY grp, oid;
+
+SET disable_optimizer_rules='';
+
+-- ===========================================================================
+-- Case 6: Single-row partition (group C). rank()<=1 must still return that row.
+-- ===========================================================================
+SELECT grp, oid, score, rk
+FROM (
+    SELECT grp, oid, score,
+           rank() OVER (PARTITION BY grp ORDER BY score DESC) AS rk
+    FROM ${case_db}.rw_c
+    WHERE grp = 'C'
+) t
+WHERE rk <= 1
+ORDER BY grp, oid;
+
+SET disable_optimizer_rules='RankingWindowPredicatePushdown';
+
+-- Case 6 rule OFF — must produce identical rows as Case 6 rule ON.
+SELECT grp, oid, score, rk
+FROM (
+    SELECT grp, oid, score,
+           rank() OVER (PARTITION BY grp ORDER BY score DESC) AS rk
+    FROM ${case_db}.rw_c
+    WHERE grp = 'C'
+) t
+WHERE rk <= 1
+ORDER BY grp, oid;
+
+SET disable_optimizer_rules='';
+
+-- ===========================================================================
+-- Case 7: Scalar subquery with rank window — returns exactly 1 row (OK path).
+-- Uses group C (single row) so the scalar always succeeds with the rule ON or OFF.
+-- ===========================================================================
+SELECT (
+    SELECT score
+    FROM (
+        SELECT score,
+               rank() OVER (PARTITION BY grp ORDER BY score DESC) AS rk
+        FROM ${case_db}.rw_c
+        WHERE grp = 'C'
+    ) sub
+    WHERE rk <= 1
+) AS top_c_score;
+
+SET disable_optimizer_rules='RankingWindowPredicatePushdown';
+
+-- Case 7 rule OFF — scalar subquery still returns the same single value.
+SELECT (
+    SELECT score
+    FROM (
+        SELECT score,
+               rank() OVER (PARTITION BY grp ORDER BY score DESC) AS rk
+        FROM ${case_db}.rw_c
+        WHERE grp = 'C'
+    ) sub
+    WHERE rk <= 1
+) AS top_c_score;
+
+SET disable_optimizer_rules='';
+
+-- ===========================================================================
+-- Case 8: Scalar subquery that returns >1 row must error identically rule ON and OFF.
+-- Groups A and B both have rank()=1 (one row each), so selecting across both groups
+-- WITHOUT a partition filter makes the scalar return 2 rows → AssertOneRow error.
+-- ===========================================================================
+-- @expect_error=assert_num_rows failed
+SELECT (
+    SELECT score
+    FROM (
+        SELECT score,
+               rank() OVER (PARTITION BY grp ORDER BY score DESC) AS rk
+        FROM ${case_db}.rw_c
+        WHERE grp IN ('A', 'B')
+    ) sub
+    WHERE rk = 1
+);
+
+SET disable_optimizer_rules='RankingWindowPredicatePushdown';
+
+-- Case 8 rule OFF — same error must fire.
+-- @expect_error=assert_num_rows failed
+SELECT (
+    SELECT score
+    FROM (
+        SELECT score,
+               rank() OVER (PARTITION BY grp ORDER BY score DESC) AS rk
+        FROM ${case_db}.rw_c
+        WHERE grp IN ('A', 'B')
+    ) sub
+    WHERE rk = 1
+);
+
+SET disable_optimizer_rules='';
