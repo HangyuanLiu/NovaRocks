@@ -728,6 +728,19 @@ impl<'a> PlanFragmentBuilder<'a> {
         _current_database: &str,
     ) -> Result<MultiFragmentBuildResult, String> {
         super::id_binding_verifier::verify_id_binding(plan)?;
+        let plan = match &plan.op {
+            Operator::PhysicalDistribution(op)
+                if matches!(
+                    op.spec,
+                    crate::sql::optimizer::property::DistributionSpec::Gather
+                ) =>
+            {
+                plan.children
+                    .first()
+                    .ok_or_else(|| "root PhysicalDistribution(Gather) missing child".to_string())?
+            }
+            _ => plan,
+        };
         let dp = crate::sql::codegen::ir::build_distributed_plan(plan)?;
         crate::sql::codegen::ir::lower_distributed_plan(&dp, catalog, connectors)
     }

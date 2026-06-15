@@ -30,16 +30,7 @@ pub(crate) fn lower_distributed_plan(
     connectors: &crate::connector::ConnectorRegistry,
 ) -> Result<MultiFragmentBuildResult, String> {
     let _ = catalog;
-    let root_fragment = dp
-        .fragments
-        .iter()
-        .find(|fragment| fragment.fragment_id == dp.root_fragment_id)
-        .ok_or_else(|| {
-            format!(
-                "DistributedPlan root fragment id={} not found",
-                dp.root_fragment_id
-            )
-        })?;
+    let root_fragment = validate_m0_root_fragment(dp)?;
 
     let mut state = OwnedLoweringState::new(connectors, None, dp.root_fragment_id);
     let lowered = {
@@ -92,6 +83,51 @@ pub(crate) fn lower_distributed_plan(
         boundary_schemas,
         rf_plan: None,
     })
+}
+
+fn validate_m0_root_fragment(
+    dp: &super::fragment::DistributedPlan,
+) -> Result<&super::fragment::PlanFragment, String> {
+    if dp.fragments.len() != 1 {
+        return Err(format!(
+            "lower_distributed_plan M0 supports exactly one fragment, got {}",
+            dp.fragments.len()
+        ));
+    }
+
+    let fragment = &dp.fragments[0];
+    if fragment.fragment_id != dp.root_fragment_id {
+        return Err(format!(
+            "lower_distributed_plan M0 root fragment id={} does not match only fragment id={}",
+            dp.root_fragment_id, fragment.fragment_id
+        ));
+    }
+    if !matches!(fragment.sink, super::fragment::DataSink::Result) {
+        return Err("lower_distributed_plan M0 supports only result sink".to_string());
+    }
+    ensure_unpartitioned("data_partition", &fragment.data_partition)?;
+    ensure_unpartitioned("output_partition", &fragment.output_partition)?;
+    if fragment.output_exprs.is_some() {
+        return Err("lower_distributed_plan M0 does not support fragment output_exprs".to_string());
+    }
+
+    Ok(fragment)
+}
+
+fn ensure_unpartitioned(
+    label: &str,
+    partition: &super::fragment::DataPartition,
+) -> Result<(), String> {
+    if !matches!(
+        partition.kind,
+        super::fragment::PartitionKind::Unpartitioned
+    ) || !partition.exprs.is_empty()
+    {
+        return Err(format!(
+            "lower_distributed_plan M0 supports only unpartitioned {label}"
+        ));
+    }
+    Ok(())
 }
 
 pub(in crate::sql::codegen) trait LoweringStateAccess<'a> {
@@ -1037,6 +1073,9 @@ mod tests {
         CatalogProvider, ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
     use crate::sql::codegen::fragment_builder::PlanFragmentBuilder;
+    use crate::sql::codegen::ir::{
+        DataPartition, DataSink, DistributedPlan, PartitionKind, build_distributed_plan,
+    };
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{Operator, PhysicalProjectOp, PhysicalScanOp};
     use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, PlanExecutionProps};
@@ -1082,12 +1121,72 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lower_distributed_plan_rejects_non_m0_fragment_shape() {
+        let mut extra_fragment = distributed_project_scan_plan();
+        let mut duplicate = extra_fragment.fragments[0].clone();
+        duplicate.fragment_id = 1;
+        extra_fragment.fragments.push(duplicate);
+        assert_lowering_err(
+            &extra_fragment,
+            "lower_distributed_plan M0 supports exactly one fragment",
+        );
+
+        let mut root_mismatch = distributed_project_scan_plan();
+        root_mismatch.root_fragment_id = 99;
+        assert_lowering_err(
+            &root_mismatch,
+            "lower_distributed_plan M0 root fragment id=99 does not match only fragment id=0",
+        );
+
+        let mut noop_sink = distributed_project_scan_plan();
+        noop_sink.fragments[0].sink = DataSink::Noop;
+        assert_lowering_err(
+            &noop_sink,
+            "lower_distributed_plan M0 supports only result sink",
+        );
+
+        let mut random_partition = distributed_project_scan_plan();
+        random_partition.fragments[0].data_partition = DataPartition {
+            kind: PartitionKind::Random,
+            exprs: vec![],
+        };
+        assert_lowering_err(
+            &random_partition,
+            "lower_distributed_plan M0 supports only unpartitioned data_partition",
+        );
+
+        let mut output_exprs = distributed_project_scan_plan();
+        output_exprs.fragments[0].output_exprs = Some(vec![]);
+        assert_lowering_err(
+            &output_exprs,
+            "lower_distributed_plan M0 does not support fragment output_exprs",
+        );
+    }
+
     struct DummyCatalog;
 
     impl CatalogProvider for DummyCatalog {
         fn get_table(&self, _database: &str, _table: &str) -> Result<TableDef, String> {
             Err("not used by distributed-plan lowering test".to_string())
         }
+    }
+
+    fn distributed_project_scan_plan() -> DistributedPlan {
+        build_distributed_plan(&project_over_metadata_scan_plan()).expect("build DistributedPlan")
+    }
+
+    fn assert_lowering_err(dp: &DistributedPlan, expected: &str) {
+        let catalog = DummyCatalog;
+        let connectors = ConnectorRegistry::new();
+        let err = match super::lower_distributed_plan(dp, &catalog, &connectors) {
+            Ok(_) => panic!("expected lowering error containing `{expected}`"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains(expected),
+            "expected `{expected}` in lowering error `{err}`"
+        );
     }
 
     fn project_over_metadata_scan_plan() -> PhysicalPlanNode {
