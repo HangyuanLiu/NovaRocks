@@ -409,7 +409,7 @@ pub(crate) fn sort_chunks_partition_topn(
     if partition_limit == 0 || chunks.is_empty() {
         return Ok(None);
     }
-    // Build a combined sort key: partition keys first (ASC), then order keys.
+    // Build a combined sort key: partition keys first (preserving their sort direction), then order keys.
     let mut combined: Vec<SortExpression> = partition_exprs.to_vec();
     combined.extend_from_slice(order_by);
     let sorted = sort_chunks_by_order(arena, &combined, chunks)?;
@@ -681,6 +681,70 @@ mod tests {
             vec![Some(1), Some(1), Some(1), Some(2), Some(2), Some(2)],
             vec![Some(10), Some(20), Some(30), Some(5), Some(6), Some(7)],
         )];
+
+        let out = sort_chunks_partition_topn(
+            &arena,
+            &partition_exprs,
+            &order_by,
+            SortTopNType::Rank,
+            2,
+            &chunks,
+        )
+        .expect("partition_topn")
+        .expect("non-empty result");
+
+        assert_eq!(out.len(), 4);
+        assert_eq!(
+            collect_col_i32(&out, 1),
+            vec![Some(10), Some(20), Some(5), Some(6)]
+        );
+    }
+
+    #[test]
+    fn partition_topn_limit_exceeds_partition_size_keeps_entire_partition() {
+        // p=[1,1,2,2,2], o=[10,20,5,6,7], Rank, partition_limit=10
+        // Partition 1 has 2 rows (< 10); all 2 rows must be kept.
+        // Partition 2 has 3 rows (< 10); all 3 rows must be kept.
+        let (arena, partition_exprs, order_by) = two_col_sort_exprs(true, true);
+        let chunks = vec![make_two_col_chunk(
+            vec![Some(1), Some(1), Some(2), Some(2), Some(2)],
+            vec![Some(10), Some(20), Some(5), Some(6), Some(7)],
+        )];
+
+        let out = sort_chunks_partition_topn(
+            &arena,
+            &partition_exprs,
+            &order_by,
+            SortTopNType::Rank,
+            10,
+            &chunks,
+        )
+        .expect("partition_topn")
+        .expect("non-empty result");
+
+        // All 5 rows must be kept — the limit is larger than either partition.
+        assert_eq!(out.len(), 5);
+        assert_eq!(
+            collect_col_i32(&out, 1),
+            vec![Some(10), Some(20), Some(5), Some(6), Some(7)]
+        );
+    }
+
+    #[test]
+    fn partition_topn_handles_multiple_input_chunks() {
+        // Two separate Chunks; rows of the same partition are split across them:
+        //   chunk1: (p=1,o=10), (p=2,o=5)
+        //   chunk2: (p=1,o=20), (p=1,o=30), (p=2,o=6)
+        // Rank limit=2:
+        //   Partition 1: sorted o=[10,20,30] → rank sequence [1,2,3] → keep [10,20]
+        //   Partition 2: sorted o=[5,6]      → rank sequence [1,2]   → keep [5,6]
+        let (arena, partition_exprs, order_by) = two_col_sort_exprs(true, true);
+        let chunk1 = make_two_col_chunk(vec![Some(1), Some(2)], vec![Some(10), Some(5)]);
+        let chunk2 = make_two_col_chunk(
+            vec![Some(1), Some(1), Some(2)],
+            vec![Some(20), Some(30), Some(6)],
+        );
+        let chunks = vec![chunk1, chunk2];
 
         let out = sort_chunks_partition_topn(
             &arena,
