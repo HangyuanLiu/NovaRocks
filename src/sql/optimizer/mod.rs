@@ -129,6 +129,20 @@ pub(crate) fn optimize(
     // 6. Derive initial statistics.
     stats::derive_group_statistics(&mut memo, table_stats);
 
+    // 6b. In-memo multi-candidate join reorder (StarRocks-aligned, one-shot):
+    //     inject alternative join orders into each reorderable inner/cross
+    //     chain so the cost search chooses among them with distribution
+    //     awareness. Gated by the "MultiJoinReorder" name so
+    //     `SET disable_optimizer_rules='MultiJoinReorder'` reverts to the
+    //     pre-existing RBO reorder path (still active during transition).
+    if options.is_enabled("MultiJoinReorder") {
+        cascades_rules::multi_join_reorder::run_multi_join_reorder(
+            &mut memo,
+            &cascades_rules::multi_join_reorder::ReorderOptions::default(),
+            table_stats,
+        );
+    }
+
     check_deadline(deadline)?;
 
     // 7. Explore: apply transformation rules (logical -> logical). When the

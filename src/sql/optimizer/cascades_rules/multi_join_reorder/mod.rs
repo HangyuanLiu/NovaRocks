@@ -24,15 +24,14 @@ pub(crate) use pass::{ReorderOptions, run_multi_join_reorder};
 /// with their cached output statistics) plus the multi-relation predicates that
 /// connect them, each tagged with the bitmask of atom indices it references.
 ///
-/// `atoms`, `atom_stats`, and `atom_filters` are parallel: `atom_stats[i]` is
-/// the (filtered) output statistics of the group `atoms[i]`, and
-/// `atom_filters[i]` are the single-relation predicates that must be applied on
-/// top of `atoms[i]` when the reorder pass materializes it (Phase 4). The
-/// single-side selectivity is already reflected in `atom_stats[i]`.
+/// `atoms` and `atom_stats` are parallel: `atom_stats[i]` is the output
+/// statistics of the group `atoms[i]`. The flattener only accepts chains whose
+/// extracted predicates are all multi-relation (it bails on single-side or
+/// constant predicates), so every predicate here is a genuine join edge and
+/// materialization never has to re-attach a single-relation filter.
 pub(crate) struct MultiJoinGraph {
     pub(crate) atoms: Vec<GroupId>,
     pub(crate) atom_stats: Vec<Statistics>,
-    pub(crate) atom_filters: Vec<Vec<TypedExpr>>,
     /// `(predicate, bitmask of atom indices it references)`. `u32` supports up
     /// to 32 atoms, matching the chain caps.
     pub(crate) predicates: Vec<(TypedExpr, u32)>,

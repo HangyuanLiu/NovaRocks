@@ -6,12 +6,10 @@ use std::collections::{HashMap, HashSet};
 
 use crate::sql::analysis::{JoinKind, TypedExpr};
 use crate::sql::column_id::ColumnId;
-use crate::sql::optimizer::estimate::selectivity::apply_filter;
 use crate::sql::optimizer::memo::{GroupId, Memo};
 use crate::sql::optimizer::operator::{LogicalJoinOp, Operator};
 use crate::sql::optimizer::rewrite::rules::utils::{collect_column_id_refs, split_and};
 use crate::sql::optimizer::statistics::{Confidence, Statistics};
-use crate::sql::optimizer::stats::estimate_selectivity;
 
 use super::super::implement::get_group_column_ids;
 use super::MultiJoinGraph;
@@ -35,29 +33,24 @@ pub(crate) fn flatten_join_chain(memo: &Memo, root: GroupId) -> Option<MultiJoin
         .iter()
         .map(|&g| get_group_column_ids(memo, g))
         .collect();
-    let mut atom_stats: Vec<Statistics> = atoms.iter().map(|&g| group_stats(memo, g)).collect();
-    let mut atom_filters: Vec<Vec<TypedExpr>> = vec![Vec::new(); atoms.len()];
+    let atom_stats: Vec<Statistics> = atoms.iter().map(|&g| group_stats(memo, g)).collect();
     let mut predicates: Vec<(TypedExpr, u32)> = Vec::new();
 
     for pred in raw_predicates {
         let mask = relation_mask(&pred, &atom_cols);
-        match mask.count_ones() {
-            // Constant predicate: attach to the first atom.
-            0 => apply_single_side(&pred, 0, &mut atom_stats, &mut atom_filters),
-            // Single-relation predicate: push down onto that atom.
-            1 => {
-                let idx = mask.trailing_zeros() as usize;
-                apply_single_side(&pred, idx, &mut atom_stats, &mut atom_filters);
-            }
-            // Multi-relation predicate: a join-graph edge.
-            _ => predicates.push((pred, mask)),
+        if mask.count_ones() < 2 {
+            // A single-relation or constant predicate left inside a join
+            // condition (rare after predicate pushdown). Bail rather than risk
+            // dropping it during materialization — the original order (and the
+            // RBO reorder path, still active) handles this chain.
+            return None;
         }
+        predicates.push((pred, mask));
     }
 
     Some(MultiJoinGraph {
         atoms,
         atom_stats,
-        atom_filters,
         predicates,
     })
 }
@@ -139,25 +132,6 @@ fn relation_mask(pred: &TypedExpr, atom_cols: &[HashSet<ColumnId>]) -> u32 {
         }
     }
     mask
-}
-
-/// Push a single-relation predicate onto an atom: reflect its selectivity in the
-/// atom's statistics and record it for the materialization pass (Phase 4).
-fn apply_single_side(
-    pred: &TypedExpr,
-    idx: usize,
-    atom_stats: &mut [Statistics],
-    atom_filters: &mut [Vec<TypedExpr>],
-) {
-    let selectivity = estimate_selectivity(pred, &atom_stats[idx].column_statistics);
-    let (rows, confidence) = apply_filter(
-        atom_stats[idx].output_row_count,
-        atom_stats[idx].row_count_confidence,
-        selectivity,
-    );
-    atom_stats[idx].output_row_count = rows;
-    atom_stats[idx].row_count_confidence = confidence;
-    atom_filters[idx].push(pred.clone());
 }
 
 #[cfg(test)]
@@ -325,11 +299,11 @@ mod tests {
     }
 
     #[test]
-    fn flatten_pushes_single_side_predicate_onto_atom() {
+    fn flatten_bails_on_single_side_predicate() {
         let mut memo = Memo::new();
         let a = leaf(&mut memo, 1, 1000.0);
         let b = leaf(&mut memo, 2, 100.0);
-        // condition: c1 = c2  AND  c1 = 5  (second conjunct is single-side on A)
+        // condition: c1 = c2  AND  c1 = 5  (the second conjunct is single-side on A)
         let cond = and(eq(col(1), col(2)), eq(col(1), int_lit(5)));
         let tree = JoinTree::Join {
             left: Box::new(JoinTree::Leaf(a)),
@@ -338,21 +312,12 @@ mod tests {
         };
         let root = copy_in_join_tree(&mut memo, &tree, &Map::new());
 
-        let graph = flatten_join_chain(&memo, root).expect("2-atom chain");
-        assert_eq!(
-            graph.predicates.len(),
-            1,
-            "only the multi-relation c1=c2 remains a graph edge"
-        );
-        let a_idx = graph.atoms.iter().position(|&g| g == a).unwrap();
-        assert_eq!(
-            graph.atom_filters[a_idx].len(),
-            1,
-            "c1=5 pushed onto atom A"
-        );
+        // A single-relation predicate inside the join condition makes the chain
+        // non-reorderable (we never drop predicates); flatten returns None and
+        // the original order / RBO path handles this chain.
         assert!(
-            graph.atom_stats[a_idx].output_row_count < 1000.0,
-            "single-side selectivity reflected in atom stats"
+            flatten_join_chain(&memo, root).is_none(),
+            "chain with a single-side join-condition predicate must not be reordered"
         );
     }
 }

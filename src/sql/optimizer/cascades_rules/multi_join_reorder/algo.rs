@@ -574,7 +574,6 @@ mod tests {
                 atom_stats(1, 100.0, 100.0),             // dim1
                 atom_stats(2, 50.0, 50.0),               // dim2
             ],
-            atom_filters: vec![Vec::new(), Vec::new(), Vec::new()],
             // fact.c0 = dim1.c1 (atoms 0,1) ; fact.c0b = dim2.c2 (atoms 0,2)
             predicates: vec![
                 (eq(col_ref(0), col_ref(1)), 0b011),
