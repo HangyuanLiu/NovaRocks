@@ -60,6 +60,7 @@ impl DistributedPlanBuilder {
                 let child_plan = expect_single_child(node, "PhysicalFilter")?;
                 let mut child = self.visit(child_plan, fragment_id)?;
                 fold_filter_into_scan(&mut child, &op.predicate)?;
+                child.stats = PlanNodeStats::from_statistics(&node.stats);
                 Ok(child)
             }
             Operator::PhysicalProject(op) => {
@@ -187,6 +188,19 @@ mod tests {
     }
 
     #[test]
+    fn build_distributed_plan_folded_filter_uses_filter_stats() {
+        let physical = project_plan(filter_plan_with_row_count(
+            scan_plan_with_row_count(100.0),
+            5.0,
+        ));
+        let dp = build_distributed_plan(&physical).expect("build_distributed_plan");
+        let folded_scan = &dp.fragments[0].root.children[0];
+
+        assert!(matches!(folded_scan.body, DistributedPlanNodeBody::Scan(_)));
+        assert_eq!(folded_scan.stats.output_row_count, 5.0);
+    }
+
+    #[test]
     fn build_distributed_plan_rejects_filter_over_project() {
         let physical = filter_over_project_plan();
         let err = build_distributed_plan(&physical).expect_err("filter over project should fail");
@@ -209,9 +223,13 @@ mod tests {
     }
 
     fn scan_plan() -> PhysicalPlanNode {
+        scan_plan_with_row_count(3.0)
+    }
+
+    fn scan_plan_with_row_count(row_count: f64) -> PhysicalPlanNode {
         let k = output_col(1, "k", DataType::Int64, false);
         let v = output_col(2, "v", DataType::Int64, true);
-        physical_node(
+        physical_node_with_row_count(
             Operator::PhysicalScan(PhysicalScanOp {
                 database: "test_db".to_string(),
                 table: table_def(),
@@ -229,12 +247,17 @@ mod tests {
             }),
             vec![],
             vec![k, v],
+            row_count,
         )
     }
 
     fn filter_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
+        filter_plan_with_row_count(child, 3.0)
+    }
+
+    fn filter_plan_with_row_count(child: PhysicalPlanNode, row_count: f64) -> PhysicalPlanNode {
         let output_columns = child.output_columns.clone();
-        physical_node(
+        physical_node_with_row_count(
             Operator::PhysicalFilter(PhysicalFilterOp {
                 predicate: and_expr(
                     cmp_expr(
@@ -251,6 +274,7 @@ mod tests {
             }),
             vec![child],
             output_columns,
+            row_count,
         )
     }
 
@@ -275,10 +299,19 @@ mod tests {
         children: Vec<PhysicalPlanNode>,
         output_columns: Vec<OutputColumn>,
     ) -> PhysicalPlanNode {
+        physical_node_with_row_count(op, children, output_columns, 3.0)
+    }
+
+    fn physical_node_with_row_count(
+        op: Operator,
+        children: Vec<PhysicalPlanNode>,
+        output_columns: Vec<OutputColumn>,
+        row_count: f64,
+    ) -> PhysicalPlanNode {
         PhysicalPlanNode {
             op,
             children,
-            stats: stats(),
+            stats: stats(row_count),
             output_columns,
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
@@ -286,9 +319,9 @@ mod tests {
         }
     }
 
-    fn stats() -> Statistics {
+    fn stats(row_count: f64) -> Statistics {
         Statistics {
-            output_row_count: 3.0,
+            output_row_count: row_count,
             ..Default::default()
         }
     }
