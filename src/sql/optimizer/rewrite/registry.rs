@@ -55,6 +55,11 @@ pub(crate) fn query_rewrite_pipeline(
             rules::variant_path_pushdown_rules(),
         ),
         RewriteStage::new(
+            "RankingWindowPredicatePushdown",
+            RewritePhase::StructuralRewrite,
+            rules::ranking_window_predicate_pushdown::ranking_window_predicate_pushdown_rules(),
+        ),
+        RewriteStage::new(
             "AggregatePushdown",
             RewritePhase::StructuralRewrite,
             rules::aggregate_pushdown::aggregate_pushdown_rules(table_stats),
@@ -127,6 +132,7 @@ mod tests {
                 "PredicateMoveAround",
                 "PredicatePushdownAfterMoveAround",
                 "VariantPathPushdown",
+                "RankingWindowPredicatePushdown",
                 "AggregatePushdown",
                 "TagRequiredColumns",
                 "ColumnPruning",
@@ -184,6 +190,7 @@ mod tests {
                 "PushSemiAntiRightOnlyCondition",
                 "PushSemiAntiRightOnlyCondition",
                 "QuantifiedApplyToJoin",
+                "RankingWindowPredicatePushdown",
                 "ScalarApplyToJoin",
                 "TagRequiredColumns",
                 "VariantPathPushdown",
@@ -237,6 +244,8 @@ mod tests {
         assert!(is_known_rewrite_rule_name("ScalarApplyToJoin"));
         assert!(is_known_rewrite_rule_name("ExistentialApplyToJoin"));
         assert!(is_known_rewrite_rule_name("QuantifiedApplyToJoin"));
+        // Ranking window predicate pushdown skeleton (Tasks 4.1+4.2).
+        assert!(is_known_rewrite_rule_name("RankingWindowPredicatePushdown"));
     }
 
     fn assert_default_phase_trace(ctx: &RewriteContext) {
