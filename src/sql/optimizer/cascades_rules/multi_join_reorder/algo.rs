@@ -73,6 +73,18 @@ pub(crate) fn enumerate_orders(graph: &MultiJoinGraph, caps: ReorderCaps) -> Vec
 /// `u32` relation masks cap the chain at 32 atoms.
 const MAX_MASK_ATOMS: usize = 32;
 
+/// Safety ceiling on the bushy DP's atom count. DP is O(3^n); 12 (≈531k
+/// partition probes) is the largest chain we let the exhaustive DP build even if
+/// a session raises `max_reorder_node_use_dp` higher. The default cap (10,
+/// StarRocks `cbo_max_reorder_node_use_dp`) stays well under it.
+const MAX_DP_ATOMS: usize = 12;
+
+/// Per-level width cap for the bushy greedy: keep only this many cheapest masks
+/// at each level so a dense join graph cannot blow the enumeration up. LeftDeep
+/// always supplies a full-chain plan, so capping greedy never drops the only
+/// full candidate.
+const GREEDY_LEVEL_WIDTH: usize = 256;
+
 // ---------------------------------------------------------------------------
 // Per-candidate statistics and cost (cached-stats versions of the kernels)
 // ---------------------------------------------------------------------------
@@ -263,7 +275,7 @@ fn left_deep(graph: &MultiJoinGraph) -> Option<JoinTree> {
 
 fn dp(graph: &MultiJoinGraph) -> Option<JoinTree> {
     let n = graph.atom_count();
-    if !(2..=8).contains(&n) {
+    if !(2..=MAX_DP_ATOMS).contains(&n) {
         return None;
     }
     let mut memo: std::collections::HashMap<u32, Cell> = std::collections::HashMap::new();
@@ -333,46 +345,68 @@ fn greedy_topk(graph: &MultiJoinGraph, k: usize) -> Vec<JoinTree> {
     }
     let full_mask = (1u32 << n) - 1;
 
-    let mut memo: std::collections::HashMap<u32, Cell> = std::collections::HashMap::new();
+    // best[mask] = cheapest sub-plan found for that atom set so far.
+    let mut best: std::collections::HashMap<u32, Cell> = std::collections::HashMap::new();
+    // levels[L] = masks of popcount L kept as building blocks for higher levels.
+    let mut levels: Vec<Vec<u32>> = vec![Vec::new(); n + 1];
     for i in 0..n {
-        memo.insert(1u32 << i, atom_cell(graph, i));
+        let m = 1u32 << i;
+        best.insert(m, atom_cell(graph, i));
+        levels[1].push(m);
     }
 
     // Bounded Top-K of full-mask plans, kept sorted ascending by cost.
     let mut full_topk: Vec<Cell> = Vec::new();
-    let mut prev_level: Vec<u32> = (0..n).map(|i| 1u32 << i).collect();
 
-    for _level in 2..=n {
-        let mut next_level: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        for &group_mask in &prev_level {
-            for i in 0..n {
-                let atom_mask = 1u32 << i;
-                if group_mask & atom_mask != 0 {
-                    continue;
-                }
-                let combined = group_mask | atom_mask;
-                let Some(cell) = try_partition(&memo, &graph.predicates, group_mask, atom_mask)
-                else {
-                    continue;
-                };
-                let improved = memo
-                    .get(&combined)
-                    .is_none_or(|existing| cell.cost < existing.cost);
-                if improved {
-                    if combined == full_mask {
-                        insert_topk(&mut full_topk, cell.clone(), k);
+    for target in 2..=n {
+        // Build target-level plans bushily: join a size-(target-r) sub-plan with
+        // a disjoint, connected size-r sub-plan. r = 1 is the left-deep
+        // extension; r >= 2 yields bushy trees. Keep the cheapest per mask.
+        let mut produced: std::collections::HashMap<u32, Cell> = std::collections::HashMap::new();
+        for r in 1..=(target / 2) {
+            let l = target - r;
+            for &lm in &levels[l] {
+                for &rm in &levels[r] {
+                    if lm & rm != 0 {
+                        continue; // overlapping atom sets
                     }
-                    memo.insert(combined, cell);
-                    next_level.insert(combined);
-                } else if combined == full_mask {
-                    insert_topk(&mut full_topk, cell, k);
+                    if l == r && lm >= rm {
+                        continue; // same-size symmetric pair handled once
+                    }
+                    let Some(cell) = try_partition(&best, &graph.predicates, lm, rm) else {
+                        continue;
+                    };
+                    let combined = lm | rm;
+                    if combined == full_mask {
+                        // Collect every full-chain candidate (bushy and left-deep)
+                        // so the memo cost search can pick among them — not just
+                        // the cheapest per mask.
+                        insert_topk(&mut full_topk, cell, k);
+                    } else if produced.get(&combined).is_none_or(|e| cell.cost < e.cost) {
+                        produced.insert(combined, cell);
+                    }
                 }
             }
         }
-        if next_level.is_empty() {
-            break;
+
+        // Commit intermediate plans as building blocks for the next levels.
+        let mut target_masks: Vec<u32> = Vec::with_capacity(produced.len());
+        for (mask, cell) in produced {
+            best.insert(mask, cell);
+            target_masks.push(mask);
         }
-        prev_level = next_level.into_iter().collect();
+        if target_masks.is_empty() {
+            break; // no connected plan reaches this level
+        }
+        // Cap level width so a dense graph cannot blow up the enumeration.
+        target_masks.sort_by(|&a, &b| {
+            best[&a]
+                .cost
+                .partial_cmp(&best[&b].cost)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        target_masks.truncate(GREEDY_LEVEL_WIDTH);
+        levels[target] = target_masks;
     }
 
     full_topk.into_iter().map(|c| c.tree).collect()
@@ -492,7 +526,7 @@ fn smallest_k_subset(universe: u32, k: u32) -> Option<u32> {
 fn next_k_subset(current: u32, universe: u32) -> Option<u32> {
     // Walk submasks of `universe` ascending and return the next one with the
     // same popcount as `current`. `universe` has at most `MAX_MASK_ATOMS` bits
-    // and SubsetIter is only used by DP (n <= 8), so this is cheap.
+    // and SubsetIter is only used by DP (n <= MAX_DP_ATOMS), so this is cheap.
     let k = current.count_ones();
     let mut candidate = current;
     loop {
@@ -563,6 +597,88 @@ mod tests {
             row_count_confidence: Confidence::Estimated,
             column_statistics: cs,
         }
+    }
+
+    /// Left-deep path chain over `n` atoms: c_i = c_{i+1} for i in 0..n-1.
+    fn path_graph(n: usize) -> MultiJoinGraph {
+        let atoms: Vec<usize> = (0..n).map(|i| 100 + i).collect();
+        let atom_stats: Vec<Statistics> = (0..n)
+            .map(|i| atom_stats(i as u32, 10_000.0, 1_000.0))
+            .collect();
+        let predicates: Vec<(TypedExpr, u32)> = (0..n.saturating_sub(1))
+            .map(|i| {
+                (
+                    eq(col_ref(i as u32), col_ref(i as u32 + 1)),
+                    (1u32 << i) | (1u32 << (i + 1)),
+                )
+            })
+            .collect();
+        MultiJoinGraph {
+            atoms,
+            atom_stats,
+            predicates,
+            chain_join_groups: vec![],
+        }
+    }
+
+    /// Two equi-join pairs (0,1) and (2,3) bridged by 1=2, so the only way to
+    /// join the two pairs without a cross join is the bushy (0⋈1)⋈(2⋈3).
+    fn two_pairs_graph() -> MultiJoinGraph {
+        MultiJoinGraph {
+            atoms: vec![100, 101, 102, 103],
+            atom_stats: vec![
+                atom_stats(0, 1_000_000.0, 1_000_000.0),
+                atom_stats(1, 1_000_000.0, 1_000_000.0),
+                atom_stats(2, 1_000_000.0, 1_000_000.0),
+                atom_stats(3, 1_000_000.0, 1_000_000.0),
+            ],
+            predicates: vec![
+                (eq(col_ref(0), col_ref(1)), 0b0011),
+                (eq(col_ref(2), col_ref(3)), 0b1100),
+                (eq(col_ref(1), col_ref(2)), 0b0110),
+            ],
+            chain_join_groups: vec![],
+        }
+    }
+
+    fn is_bushy(tree: &JoinTree) -> bool {
+        matches!(
+            tree,
+            JoinTree::Join { left, right, .. }
+                if matches!(**left, JoinTree::Join { .. })
+                    && matches!(**right, JoinTree::Join { .. })
+        )
+    }
+
+    #[test]
+    fn dp_covers_chains_up_to_ten_atoms() {
+        // The DP internal ceiling must honor the configured max_dp (10), not the
+        // old hardcoded 8. A 10-atom connected chain must produce a DP plan.
+        assert!(
+            dp(&path_graph(10)).is_some(),
+            "DP must enumerate a 10-atom chain (was capped at 8)"
+        );
+        assert!(
+            dp(&path_graph(9)).is_some(),
+            "DP must enumerate a 9-atom chain"
+        );
+        // Beyond the safety ceiling (12) DP bails (greedy/left-deep take over).
+        assert!(
+            dp(&path_graph(13)).is_none(),
+            "DP bails past the 12-atom ceiling"
+        );
+    }
+
+    #[test]
+    fn greedy_produces_bushy_orders() {
+        // Greedy must enumerate bushy shapes (two join sub-trees), not only
+        // left-deep spines, so it can find (0⋈1)⋈(2⋈3).
+        let trees = greedy_topk(&two_pairs_graph(), 10);
+        assert!(
+            trees.iter().any(is_bushy),
+            "greedy must produce at least one bushy order; got {} trees",
+            trees.len()
+        );
     }
 
     /// Star schema: a big fact atom (0) equi-joined to two small dim atoms (1,2).
