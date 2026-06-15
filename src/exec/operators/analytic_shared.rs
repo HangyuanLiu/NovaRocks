@@ -311,7 +311,10 @@ fn validate_analytic_output_columns(
     Ok(())
 }
 
-pub(crate) fn compute_partitions(keys: &[ArrayRef], rows: usize) -> Result<Vec<(usize, usize)>, String> {
+pub(crate) fn compute_partitions(
+    keys: &[ArrayRef],
+    rows: usize,
+) -> Result<Vec<(usize, usize)>, String> {
     if rows == 0 {
         return Ok(Vec::new());
     }
@@ -526,7 +529,11 @@ fn compute_peer_groups(
     Ok(groups)
 }
 
-pub(crate) fn row_equal_on_keys(keys: &[ArrayRef], left: usize, right: usize) -> Result<bool, String> {
+pub(crate) fn row_equal_on_keys(
+    keys: &[ArrayRef],
+    left: usize,
+    right: usize,
+) -> Result<bool, String> {
     for a in keys {
         if !value_equal_or_both_null(a.as_ref(), left, right)? {
             return Ok(false);
