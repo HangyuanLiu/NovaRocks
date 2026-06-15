@@ -176,6 +176,10 @@ pub(crate) struct LogicalSortOp {
     /// them back to wire-level `TExpr`s; the optimizer converts to
     /// `ColumnRef` on demand for distribution-property matching.
     pub analytic_partition_exprs: Vec<crate::sql::analysis::TypedExpr>,
+    /// Set by RankingWindowPredicatePushdown: per-partition rank cap + ranking
+    /// kind. `None` ⇒ ordinary sort. See OQ-13 ranking-window design spec §4.
+    pub partition_limit: Option<usize>,
+    pub topn_type: Option<crate::exec::node::sort::SortTopNType>,
 }
 
 #[derive(Clone, Debug)]
@@ -372,6 +376,9 @@ pub(crate) struct PhysicalSortOp {
     /// Propagated from `LogicalSortOp::analytic_partition_exprs`. See the
     /// LogicalSortOp doc-comment for semantics.
     pub analytic_partition_exprs: Vec<crate::sql::analysis::TypedExpr>,
+    /// Propagated from `LogicalSortOp::partition_limit`. See OQ-13 §4.
+    pub partition_limit: Option<usize>,
+    pub topn_type: Option<crate::exec::node::sort::SortTopNType>,
 }
 
 #[derive(Clone, Debug)]

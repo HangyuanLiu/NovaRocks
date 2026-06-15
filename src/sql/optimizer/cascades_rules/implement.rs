@@ -733,6 +733,8 @@ impl Rule for SortToPhysical {
                 // Propagate the analytic-partition tag through Logical→Physical
                 // so the optimizer's required-distribution logic can see it.
                 analytic_partition_exprs: op.analytic_partition_exprs.clone(),
+                partition_limit: op.partition_limit,
+                topn_type: op.topn_type,
             }),
             children: expr.children.clone(),
         }]

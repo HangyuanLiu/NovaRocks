@@ -686,8 +686,18 @@ fn format_physical_node(
                     format!("{} {dir}{nulls}", format_expr(&s.expr))
                 })
                 .collect();
+            let mut suffix = String::new();
+            if let Some(limit) = op.partition_limit {
+                let tt = match op.topn_type {
+                    Some(crate::exec::node::sort::SortTopNType::RowNumber) => "ROW_NUMBER",
+                    Some(crate::exec::node::sort::SortTopNType::Rank) => "RANK",
+                    Some(crate::exec::node::sort::SortTopNType::DenseRank) => "DENSE_RANK",
+                    None => "ROW_NUMBER",
+                };
+                suffix = format!(" partition_limit={limit} topn_type={tt}");
+            }
             out.push(format!(
-                "{pad}SORT BY [{}]{costs_suffix}{stats_suffix}",
+                "{pad}SORT BY [{}]{suffix}{costs_suffix}{stats_suffix}",
                 items.join(", ")
             ));
             for child in &node.children {
@@ -1379,7 +1389,7 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
         JoinDistribution, Operator, PhysicalDistributionOp, PhysicalHashJoinOp, PhysicalScanOp,
-        PhysicalTopNOp, TopNPhase,
+        PhysicalSortOp, PhysicalTopNOp, TopNPhase,
     };
     use crate::sql::optimizer::physical_plan::{
         JoinExecutionDistribution, PhysicalPlanNode, PlanExecutionProps,
@@ -2048,6 +2058,83 @@ mod tests {
                 "Normal level must not include stats trailer: {line}"
             );
         }
+    }
+
+    #[test]
+    fn physical_sort_with_partition_limit_emits_topn_type_token() {
+        use crate::exec::node::sort::SortTopNType;
+        let node = PhysicalPlanNode {
+            op: Operator::PhysicalSort(PhysicalSortOp {
+                items: vec![SortItem {
+                    expr: TypedExpr {
+                        kind: ExprKind::ColumnRef {
+                            column_id: ColumnId(1),
+                            qualifier: None,
+                            column: "k".to_string(),
+                        },
+                        data_type: arrow::datatypes::DataType::Int64,
+                        nullable: false,
+                    },
+                    asc: true,
+                    nulls_first: false,
+                }],
+                analytic_partition_exprs: Vec::new(),
+                partition_limit: Some(3),
+                topn_type: Some(SortTopNType::Rank),
+            }),
+            children: Vec::new(),
+            stats: Statistics::default(),
+            output_columns: Vec::new(),
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+        };
+
+        let mut lines = Vec::new();
+        format_physical_node(&node, ExplainLevel::Normal, 0, &mut lines);
+        let output = lines.join("\n");
+        assert!(
+            output.contains("partition_limit=3 topn_type=RANK"),
+            "expected partition_limit=3 topn_type=RANK in explain output:\n{output}"
+        );
+    }
+
+    #[test]
+    fn physical_sort_without_partition_limit_emits_no_topn_token() {
+        let node = PhysicalPlanNode {
+            op: Operator::PhysicalSort(PhysicalSortOp {
+                items: vec![SortItem {
+                    expr: TypedExpr {
+                        kind: ExprKind::ColumnRef {
+                            column_id: ColumnId(1),
+                            qualifier: None,
+                            column: "k".to_string(),
+                        },
+                        data_type: arrow::datatypes::DataType::Int64,
+                        nullable: false,
+                    },
+                    asc: true,
+                    nulls_first: false,
+                }],
+                analytic_partition_exprs: Vec::new(),
+                partition_limit: None,
+                topn_type: None,
+            }),
+            children: Vec::new(),
+            stats: Statistics::default(),
+            output_columns: Vec::new(),
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: Vec::new(),
+            probe_runtime_filters: Vec::new(),
+        };
+
+        let mut lines = Vec::new();
+        format_physical_node(&node, ExplainLevel::Normal, 0, &mut lines);
+        let output = lines.join("\n");
+        assert!(
+            !output.contains("partition_limit"),
+            "expected no partition_limit token in plain sort:\n{output}"
+        );
     }
 }
 

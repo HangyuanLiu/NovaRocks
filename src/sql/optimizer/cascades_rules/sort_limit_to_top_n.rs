@@ -111,6 +111,8 @@ mod tests {
             op: Operator::LogicalSort(LogicalSortOp {
                 items: vec![],
                 analytic_partition_exprs: Vec::new(),
+                partition_limit: None,
+                topn_type: None,
             }),
             children: vec![scan_group],
         };
@@ -175,6 +177,8 @@ mod tests {
             op: Operator::LogicalSort(LogicalSortOp {
                 items: vec![],
                 analytic_partition_exprs: Vec::new(),
+                partition_limit: None,
+                topn_type: None,
             }),
             children: vec![scan_group],
         };

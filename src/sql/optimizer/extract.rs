@@ -134,6 +134,8 @@ pub(crate) fn extract_best(
                 Operator::PhysicalSort(PhysicalSortOp {
                     items,
                     analytic_partition_exprs: Vec::new(),
+                    partition_limit: None,
+                    topn_type: None,
                 })
             }
         };

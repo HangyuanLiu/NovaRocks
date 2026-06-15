@@ -240,6 +240,8 @@ fn apply_query_modifiers(
                 items: sort_items,
                 // Top-level ORDER BY — no analytic partition.
                 analytic_partition_by: Vec::new(),
+                partition_limit: None,
+                topn_type: None,
                 required_output_columns: None,
             });
 
@@ -296,6 +298,8 @@ fn apply_query_modifiers(
                 items: sort_items,
                 // Top-level ORDER BY — no analytic partition.
                 analytic_partition_by: Vec::new(),
+                partition_limit: None,
+                topn_type: None,
                 required_output_columns: None,
             });
         }
@@ -1436,6 +1440,8 @@ fn build_window_and_project(
                 input: Box::new(input),
                 items: sort_items,
                 analytic_partition_by,
+                partition_limit: None,
+                topn_type: None,
                 required_output_columns: None,
             })
         };

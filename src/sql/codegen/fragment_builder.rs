@@ -6323,6 +6323,8 @@ mod tests {
                     nulls_first: false,
                 }],
                 analytic_partition_exprs: Vec::new(),
+                partition_limit: None,
+                topn_type: None,
             }),
             children: vec![PhysicalPlanNode {
                 op: Operator::PhysicalDistribution(PhysicalDistributionOp {
@@ -6383,6 +6385,8 @@ mod tests {
                     nulls_first: false,
                 }],
                 analytic_partition_exprs: Vec::new(),
+                partition_limit: None,
+                topn_type: None,
             }),
             vec![physical_node_for_test(
                 Operator::PhysicalDistribution(PhysicalDistributionOp {
@@ -6444,6 +6448,8 @@ mod tests {
             Operator::PhysicalSort(PhysicalSortOp {
                 items: vec![sort_item],
                 analytic_partition_exprs: Vec::new(),
+                partition_limit: None,
+                topn_type: None,
             }),
             vec![join],
             output_columns,
@@ -6807,6 +6813,8 @@ mod tests {
                 op: Operator::PhysicalSort(PhysicalSortOp {
                     items: order_by,
                     analytic_partition_exprs: Vec::new(),
+                    partition_limit: None,
+                    topn_type: None,
                 }),
                 children: vec![scan_plan(file.path().to_path_buf())],
                 stats: stats(),
@@ -6964,6 +6972,8 @@ mod tests {
                     nulls_first: false,
                 }],
                 analytic_partition_exprs: Vec::new(),
+                partition_limit: None,
+                topn_type: None,
             }),
             children: vec![PhysicalPlanNode {
                 op: Operator::PhysicalDistribution(PhysicalDistributionOp {

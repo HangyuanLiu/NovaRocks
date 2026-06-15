@@ -281,6 +281,8 @@ mod tests {
                 nulls_first: false,
             }],
             analytic_partition_by: vec![],
+            partition_limit: None,
+            topn_type: None,
             required_output_columns: None,
         });
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
