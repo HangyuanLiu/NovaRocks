@@ -22,16 +22,18 @@ mod tests {
     };
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
-        AggMode, JoinDistribution, Operator, PhysicalDistributionOp, PhysicalFilterOp,
-        PhysicalHashAggregateOp, PhysicalHashJoinEqCondition, PhysicalHashJoinOp, PhysicalLimitOp,
-        PhysicalNestLoopJoinOp, PhysicalProjectOp, PhysicalScanOp, PhysicalSortOp, PhysicalTopNOp,
+        AggMode, JoinDistribution, Operator, PhysicalAssertOneRowOp, PhysicalDecodeOp,
+        PhysicalDistributionOp, PhysicalExceptOp, PhysicalFilterOp, PhysicalHashAggregateOp,
+        PhysicalHashJoinEqCondition, PhysicalHashJoinOp, PhysicalIntersectOp, PhysicalLimitOp,
+        PhysicalNestLoopJoinOp, PhysicalProjectOp, PhysicalRepeatOp, PhysicalScanOp,
+        PhysicalSortOp, PhysicalTopNOp, PhysicalUnionOp, PhysicalValuesOp, ScanDictionaryColumn,
         TopNPhase,
     };
     use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, PlanExecutionProps};
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::runtime_filter_pass::{RuntimeFilterDesc, RuntimeFilterProbe};
     use crate::sql::optimizer::statistics::Statistics;
-    use crate::sql::planner::plan::AggregateCall;
+    use crate::sql::planner::plan::{AggregateCall, DecodeMapping};
 
     #[test]
     fn scan_matches_direct_fragment_builder() {
@@ -251,6 +253,70 @@ mod tests {
             "nest_loop_null_aware_left_anti",
             nest_loop_surviving_side_plan(JoinKind::NullAwareLeftAnti),
         );
+    }
+
+    #[test]
+    fn union_all_two_scans_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "union_all_two_scans",
+            union_plan(
+                true,
+                aliased_scan_plan("l", 1, 2),
+                aliased_scan_plan("r", 3, 4),
+            ),
+        );
+    }
+
+    #[test]
+    fn union_distinct_fails_fast_in_distributed_plan() {
+        assert_distributed_plan_error_contains(
+            "union_distinct_fails_fast",
+            union_plan(
+                false,
+                aliased_scan_plan("l", 1, 2),
+                aliased_scan_plan("r", 3, 4),
+            ),
+            "UNION DISTINCT is Phase 2",
+        );
+    }
+
+    #[test]
+    fn intersect_two_scans_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "intersect_two_scans",
+            intersect_plan(aliased_scan_plan("l", 1, 2), aliased_scan_plan("r", 3, 4)),
+        );
+    }
+
+    #[test]
+    fn except_two_scans_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "except_two_scans",
+            except_plan(aliased_scan_plan("l", 1, 2), aliased_scan_plan("r", 3, 4)),
+        );
+    }
+
+    #[test]
+    fn values_rows_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent("values_rows", values_rows_plan());
+    }
+
+    #[test]
+    fn assert_one_row_over_scan_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "assert_one_row_over_scan",
+            assert_one_row_plan(scan_plan()),
+        );
+    }
+
+    #[test]
+    fn decode_over_scan_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent("decode_over_scan", decode_over_scan_plan());
+    }
+
+    #[test]
+    fn repeat_grouping_sets_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent("repeat_grouping_sets", repeat_grouping_sets_plan());
     }
 
     #[test]
@@ -868,6 +934,156 @@ mod tests {
         )
     }
 
+    fn union_plan(all: bool, left: PhysicalPlanNode, right: PhysicalPlanNode) -> PhysicalPlanNode {
+        let output_columns = set_op_output_columns();
+        physical_node(
+            Operator::PhysicalUnion(PhysicalUnionOp {
+                all,
+                output_columns: output_columns.clone(),
+                child_output_columns: vec![
+                    left.output_columns.clone(),
+                    right.output_columns.clone(),
+                ],
+            }),
+            vec![left, right],
+            output_columns,
+        )
+    }
+
+    fn intersect_plan(left: PhysicalPlanNode, right: PhysicalPlanNode) -> PhysicalPlanNode {
+        let output_columns = set_op_output_columns();
+        physical_node(
+            Operator::PhysicalIntersect(PhysicalIntersectOp {
+                output_columns: output_columns.clone(),
+                child_output_columns: vec![
+                    left.output_columns.clone(),
+                    right.output_columns.clone(),
+                ],
+            }),
+            vec![left, right],
+            output_columns,
+        )
+    }
+
+    fn except_plan(left: PhysicalPlanNode, right: PhysicalPlanNode) -> PhysicalPlanNode {
+        let output_columns = set_op_output_columns();
+        physical_node(
+            Operator::PhysicalExcept(PhysicalExceptOp {
+                output_columns: output_columns.clone(),
+                child_output_columns: vec![
+                    left.output_columns.clone(),
+                    right.output_columns.clone(),
+                ],
+            }),
+            vec![left, right],
+            output_columns,
+        )
+    }
+
+    fn set_op_output_columns() -> Vec<OutputColumn> {
+        vec![
+            output_col(501, "k", DataType::Int64, false),
+            output_col(502, "v", DataType::Int64, true),
+        ]
+    }
+
+    fn values_rows_plan() -> PhysicalPlanNode {
+        let k = output_col(601, "k", DataType::Int64, false);
+        let v = output_col(602, "v", DataType::Int64, true);
+        physical_node(
+            Operator::PhysicalValues(PhysicalValuesOp {
+                rows: vec![
+                    vec![int_lit(1), int_lit(10)],
+                    vec![int_lit(2), null_int_lit()],
+                ],
+                columns: vec![k.clone(), v.clone()],
+            }),
+            vec![],
+            vec![k, v],
+        )
+    }
+
+    fn assert_one_row_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
+        let output_columns = child.output_columns.clone();
+        physical_node(
+            Operator::PhysicalAssertOneRow(PhysicalAssertOneRowOp {
+                subquery_text: "select k from t".to_string(),
+            }),
+            vec![child],
+            output_columns,
+        )
+    }
+
+    fn decode_over_scan_plan() -> PhysicalPlanNode {
+        let source_id = ColumnId::new_for_test(701);
+        let output_id = ColumnId::new_for_test(702);
+        let scan = physical_node(
+            Operator::PhysicalScan(PhysicalScanOp {
+                database: "test_db".to_string(),
+                table: dict_metadata_table_def(),
+                alias: Some("t".to_string()),
+                columns: vec![OutputColumn {
+                    column_id: source_id,
+                    name: "s".to_string(),
+                    data_type: DataType::Utf8,
+                    nullable: false,
+                    is_internal: false,
+                }],
+                predicates: vec![],
+                required_columns: Some(vec!["s_dict".to_string()]),
+                dict_columns: vec![ScanDictionaryColumn {
+                    source_column: "s".to_string(),
+                    dict_column: "s_dict".to_string(),
+                    dictionary: dict_snapshot_a_b(),
+                }],
+                variant_columns: vec![],
+                mv_rewritten_from: None,
+            }),
+            vec![],
+            vec![OutputColumn {
+                column_id: source_id,
+                name: "s_dict".to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+                is_internal: false,
+            }],
+        );
+        let decoded = output_col(output_id.0, "s", DataType::Utf8, false);
+        physical_node(
+            Operator::PhysicalDecode(PhysicalDecodeOp {
+                mappings: vec![DecodeMapping {
+                    source_column_id: source_id,
+                    output_column_id: output_id,
+                    dict_column: "s_dict".to_string(),
+                    string_column: "s".to_string(),
+                }],
+                output_columns: vec![decoded.clone()],
+            }),
+            vec![scan],
+            vec![decoded],
+        )
+    }
+
+    fn repeat_grouping_sets_plan() -> PhysicalPlanNode {
+        let k = output_col(801, "k", DataType::Int64, false);
+        let grouping_col = output_col(802, "__grouping_fn_0", DataType::Int64, false);
+        physical_node(
+            Operator::PhysicalRepeat(PhysicalRepeatOp {
+                repeat_column_ref_list: vec![vec!["k".to_string()], vec![]],
+                repeat_column_ref_ids: vec![vec![k.column_id], vec![]],
+                grouping_ids: vec![0, 1],
+                all_rollup_columns: vec!["k".to_string()],
+                all_rollup_column_ids: vec![k.column_id],
+                grouping_key_aliases: vec![],
+                grouping_fn_args: vec![("__grouping_fn_0".to_string(), vec!["k".to_string()])],
+                grouping_fn_arg_ids: vec![vec![k.column_id]],
+                grouping_fn_ids: vec![("__grouping_fn_0".to_string(), grouping_col.column_id)],
+            }),
+            vec![single_column_scan_plan(k.clone())],
+            vec![k, grouping_col],
+        )
+    }
+
     fn aliased_scan_plan(alias: &str, key_id: u32, value_id: u32) -> PhysicalPlanNode {
         let k = output_col(key_id, "k", DataType::Int64, false);
         let v = output_col(value_id, "v", DataType::Int64, true);
@@ -885,6 +1101,24 @@ mod tests {
             }),
             vec![],
             vec![k, v],
+        )
+    }
+
+    fn single_column_scan_plan(column: OutputColumn) -> PhysicalPlanNode {
+        physical_node(
+            Operator::PhysicalScan(PhysicalScanOp {
+                database: "test_db".to_string(),
+                table: single_column_metadata_table_def(&column),
+                alias: Some("t".to_string()),
+                columns: vec![column.clone()],
+                predicates: vec![],
+                required_columns: Some(vec![column.name.clone()]),
+                dict_columns: vec![],
+                variant_columns: vec![],
+                mv_rewritten_from: None,
+            }),
+            vec![],
+            vec![column],
         )
     }
 
@@ -912,6 +1146,40 @@ mod tests {
                 column_def("v", DataType::Int64, true),
                 column_def("unused", DataType::Int64, true),
             ],
+            iceberg_row_lineage_metadata_columns: vec![],
+            source: ScanSource::IcebergMetadataTable {
+                table: iceberg_table_info(),
+                metadata_table_type: IcebergMetadataTableType::Snapshots,
+                serialized_table: "{}".to_string(),
+                cloud_properties: Default::default(),
+                metadata_payload: None,
+            },
+        }
+    }
+
+    fn single_column_metadata_table_def(column: &OutputColumn) -> TableDef {
+        TableDef {
+            name: "t$snapshots".to_string(),
+            columns: vec![column_def(
+                &column.name,
+                column.data_type.clone(),
+                column.nullable,
+            )],
+            iceberg_row_lineage_metadata_columns: vec![],
+            source: ScanSource::IcebergMetadataTable {
+                table: iceberg_table_info(),
+                metadata_table_type: IcebergMetadataTableType::Snapshots,
+                serialized_table: "{}".to_string(),
+                cloud_properties: Default::default(),
+                metadata_payload: None,
+            },
+        }
+    }
+
+    fn dict_metadata_table_def() -> TableDef {
+        TableDef {
+            name: "dict_t$snapshots".to_string(),
+            columns: vec![column_def("s", DataType::Utf8, false)],
             iceberg_row_lineage_metadata_columns: vec![],
             source: ScanSource::IcebergMetadataTable {
                 table: iceberg_table_info(),
@@ -1021,6 +1289,52 @@ mod tests {
             data_type: DataType::Int64,
             nullable: false,
         }
+    }
+
+    fn null_int_lit() -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Null),
+            data_type: DataType::Int64,
+            nullable: true,
+        }
+    }
+
+    fn dict_snapshot_a_b() -> Arc<crate::engine::dictionary::model::DictionarySnapshot> {
+        use crate::engine::dictionary::model::{
+            DictionaryOwner, DictionarySnapshot, DictionaryState, DictionaryValue,
+            DictionaryWatermark,
+        };
+
+        Arc::new(DictionarySnapshot {
+            dictionary_id: 1,
+            owner: DictionaryOwner::IcebergTable {
+                catalog: "test_catalog".to_string(),
+                namespace: "test_db".to_string(),
+                table: "dict_t".to_string(),
+                table_uuid: Some("00000000-0000-0000-0000-000000000001".to_string()),
+            },
+            column_id: None,
+            column_name: "s".to_string(),
+            data_type: DataType::Int32,
+            version: 1,
+            watermark: DictionaryWatermark::Iceberg {
+                snapshot_id: Some(7),
+                schema_id: 1,
+            },
+            values: vec![
+                DictionaryValue {
+                    id: 1,
+                    bytes: b"a".to_vec(),
+                },
+                DictionaryValue {
+                    id: 2,
+                    bytes: b"b".to_vec(),
+                },
+            ],
+            null_id: 0,
+            state: DictionaryState::Active,
+            order_preserving: true,
+        })
     }
 
     fn cmp_expr(left: TypedExpr, op: BinOp, right: TypedExpr) -> TypedExpr {

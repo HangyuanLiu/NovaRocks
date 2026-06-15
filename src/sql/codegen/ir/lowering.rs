@@ -34,9 +34,9 @@ use crate::sql::codegen::{
     FragmentBuildResult, FragmentId, MultiFragmentBuildResult, OutputColumn,
 };
 use crate::sql::optimizer::operator::{
-    AggMode, PhysicalHashAggregateOp, PhysicalHashJoinOp, PhysicalNestLoopJoinOp,
-    PhysicalProjectOp, PhysicalScanOp, PhysicalSortOp, PhysicalTopNOp, ScanDictionaryColumn,
-    TopNPhase,
+    AggMode, PhysicalAssertOneRowOp, PhysicalDecodeOp, PhysicalHashAggregateOp, PhysicalHashJoinOp,
+    PhysicalNestLoopJoinOp, PhysicalProjectOp, PhysicalRepeatOp, PhysicalScanOp, PhysicalSortOp,
+    PhysicalTopNOp, PhysicalValuesOp, ScanDictionaryColumn, TopNPhase,
 };
 use crate::sql::optimizer::physical_plan::JoinExecutionDistribution;
 use crate::types;
@@ -637,6 +637,130 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     scope,
                     tuple_ids,
                     output_columns: Vec::new(),
+                }
+            }
+            super::node::DistributedPlanNodeBody::Values(values) => {
+                if !node.children.is_empty() {
+                    return Err(format!(
+                        "DistributedPlan Values node_id={} expected 0 children, got {}",
+                        node.node_id,
+                        node.children.len()
+                    ));
+                }
+                let tuple_id = first_tuple_id(node, "Values")?;
+                let op = values_body_to_physical_op(values);
+                let (plan_node, scope) = self.lower_values(node.node_id, tuple_id, &op)?;
+                LoweredDistributedNode {
+                    plan_nodes: vec![plan_node],
+                    scope,
+                    tuple_ids: vec![tuple_id],
+                    output_columns: values.columns.clone(),
+                }
+            }
+            super::node::DistributedPlanNodeBody::AssertOneRow(assert_one_row) => {
+                if node.children.len() != 1 {
+                    return Err(format!(
+                        "DistributedPlan AssertOneRow node_id={} expected 1 child, got {}",
+                        node.node_id,
+                        node.children.len()
+                    ));
+                }
+                let child = self.lower_node(&node.children[0])?;
+                let op = assert_one_row_body_to_physical_op(assert_one_row);
+                let plan_node = self.lower_assert_one_row(node.node_id, &op, &child.tuple_ids);
+                let mut plan_nodes = vec![plan_node];
+                plan_nodes.extend(child.plan_nodes);
+                LoweredDistributedNode {
+                    plan_nodes,
+                    scope: child.scope,
+                    tuple_ids: child.tuple_ids,
+                    output_columns: child.output_columns,
+                }
+            }
+            super::node::DistributedPlanNodeBody::Decode(decode) => {
+                if node.children.len() != 1 {
+                    return Err(format!(
+                        "DistributedPlan Decode node_id={} expected 1 child, got {}",
+                        node.node_id,
+                        node.children.len()
+                    ));
+                }
+                let child = self.lower_node(&node.children[0])?;
+                let tuple_id = first_tuple_id(node, "Decode")?;
+                let op = decode_body_to_physical_op(decode);
+                let (plan_node, scope) =
+                    self.lower_decode(node.node_id, tuple_id, &op, &child.scope)?;
+                let mut plan_nodes = vec![plan_node];
+                plan_nodes.extend(child.plan_nodes);
+                LoweredDistributedNode {
+                    plan_nodes,
+                    scope,
+                    tuple_ids: vec![tuple_id],
+                    output_columns: decode.output_columns.clone(),
+                }
+            }
+            super::node::DistributedPlanNodeBody::Repeat(repeat) => {
+                if node.children.len() != 1 {
+                    return Err(format!(
+                        "DistributedPlan Repeat node_id={} expected 1 child, got {}",
+                        node.node_id,
+                        node.children.len()
+                    ));
+                }
+                let child = self.lower_node(&node.children[0])?;
+                let op = repeat_body_to_physical_op(repeat);
+                let (plan_node, scope, tuple_ids, output_columns) = self.lower_repeat(
+                    node.node_id,
+                    repeat.virtual_tuple_id,
+                    &op,
+                    child.scope,
+                    child.tuple_ids,
+                    child.output_columns,
+                )?;
+                let mut plan_nodes = vec![plan_node];
+                plan_nodes.extend(child.plan_nodes);
+                LoweredDistributedNode {
+                    plan_nodes,
+                    scope,
+                    tuple_ids,
+                    output_columns,
+                }
+            }
+            super::node::DistributedPlanNodeBody::SetOp(set_op) => {
+                if node.children.is_empty() {
+                    return Err("DistributedPlan SetOp has no inputs".to_string());
+                }
+                if !set_op.child_output_columns.is_empty()
+                    && set_op.child_output_columns.len() != node.children.len()
+                {
+                    return Err(format!(
+                        "DistributedPlan SetOp node_id={} child_output_columns has {}, children has {}",
+                        node.node_id,
+                        set_op.child_output_columns.len(),
+                        node.children.len()
+                    ));
+                }
+                let mut children = Vec::with_capacity(node.children.len());
+                for child_node in &node.children {
+                    children.push(self.lower_node(child_node)?);
+                }
+                let tuple_id = first_tuple_id(node, "SetOp")?;
+                let (plan_node, scope) = self.lower_set_op(
+                    node.node_id,
+                    tuple_id,
+                    set_op.kind,
+                    &set_op.output_columns,
+                    &children,
+                )?;
+                let mut plan_nodes = vec![plan_node];
+                for child in children {
+                    plan_nodes.extend(child.plan_nodes);
+                }
+                LoweredDistributedNode {
+                    plan_nodes,
+                    scope,
+                    tuple_ids: vec![tuple_id],
+                    output_columns: set_op.output_columns.clone(),
                 }
             }
         };
@@ -1927,6 +2051,534 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
         Ok(sort_plan_node)
     }
+
+    pub(crate) fn lower_values(
+        &mut self,
+        values_node_id: i32,
+        output_tuple_id: i32,
+        op: &PhysicalValuesOp,
+    ) -> Result<(plan_nodes::TPlanNode, ExprScope), String> {
+        let state = &mut *self.state;
+
+        let mut scope = ExprScope::new();
+        for (idx, col) in op.columns.iter().enumerate() {
+            let slot_id = state.alloc_slot();
+            state.desc_builder().add_slot(
+                slot_id,
+                output_tuple_id,
+                &col.name,
+                &col.data_type,
+                col.nullable,
+                idx as i32,
+            );
+            scope.add_column_with_id(
+                col.column_id,
+                None,
+                col.name.clone(),
+                ColumnBinding {
+                    tuple_id: output_tuple_id,
+                    slot_id,
+                    data_type: col.data_type.clone(),
+                    type_desc: None,
+                    nullable: col.nullable,
+                },
+            );
+        }
+        state.desc_builder().add_tuple(output_tuple_id, None);
+
+        let empty_scope = ExprScope::new();
+        let mut const_expr_lists = Vec::with_capacity(op.rows.len());
+        for row in &op.rows {
+            if row.len() != op.columns.len() {
+                return Err(format!(
+                    "VALUES row column count mismatch: expected {}, got {}",
+                    op.columns.len(),
+                    row.len()
+                ));
+            }
+            let mut exprs = Vec::with_capacity(row.len());
+            for expr in row {
+                let mut compiler = ExprCompiler::new(state.slot_allocator(), &empty_scope);
+                exprs.push(compiler.compile_typed(expr)?);
+            }
+            const_expr_lists.push(exprs);
+        }
+
+        let mut plan_node = nodes::default_plan_node();
+        plan_node.node_id = values_node_id;
+        plan_node.node_type = plan_nodes::TPlanNodeType::UNION_NODE;
+        plan_node.num_children = 0;
+        plan_node.row_tuples = vec![output_tuple_id];
+        plan_node.nullable_tuples = vec![];
+        plan_node.union_node = Some(plan_nodes::TUnionNode {
+            tuple_id: output_tuple_id,
+            result_expr_lists: vec![],
+            const_expr_lists,
+            first_materialized_child_idx: 0,
+            pass_through_slot_maps: None,
+            local_exchanger_type: None,
+            local_partition_by_exprs: None,
+        });
+
+        Ok((plan_node, scope))
+    }
+
+    pub(crate) fn lower_assert_one_row(
+        &mut self,
+        assert_node_id: i32,
+        op: &PhysicalAssertOneRowOp,
+        child_tuple_ids: &[i32],
+    ) -> plan_nodes::TPlanNode {
+        let mut plan_node = nodes::default_plan_node();
+        plan_node.node_id = assert_node_id;
+        plan_node.node_type = plan_nodes::TPlanNodeType::ASSERT_NUM_ROWS_NODE;
+        plan_node.num_children = 1;
+        plan_node.limit = -1;
+        plan_node.row_tuples = child_tuple_ids.to_vec();
+        plan_node.nullable_tuples = vec![];
+        plan_node.compact_data = true;
+        plan_node.assert_num_rows_node = Some(plan_nodes::TAssertNumRowsNode {
+            desired_num_rows: Some(1),
+            subquery_string: Some(op.subquery_text.clone()),
+            assertion: Some(plan_nodes::TAssertion::LE),
+        });
+        plan_node
+    }
+
+    pub(crate) fn lower_decode(
+        &mut self,
+        decode_node_id: i32,
+        decode_tuple_id: i32,
+        op: &PhysicalDecodeOp,
+        child_scope: &ExprScope,
+    ) -> Result<(plan_nodes::TPlanNode, ExprScope), String> {
+        let child_columns: Vec<(String, ColumnBinding)> = child_scope
+            .iter_columns()
+            .map(|(name, binding)| (name.clone(), binding.clone()))
+            .collect();
+        let child_ids_by_slot: Vec<(crate::sql::column_id::ColumnId, ColumnBinding)> = child_scope
+            .iter_id_bindings()
+            .map(|(column_id, binding)| (*column_id, binding.clone()))
+            .collect();
+
+        let dict_target_meta: BTreeMap<
+            i32,
+            (String, DataType, bool, crate::sql::column_id::ColumnId),
+        > = op
+            .mappings
+            .iter()
+            .map(|item| {
+                let dict_binding = child_scope
+                    .resolve_by_id(item.source_column_id)
+                    .ok_or_else(|| {
+                        format!(
+                            "decode source ColumnId({}) for `{}` is not in child scope",
+                            item.source_column_id.0, item.dict_column
+                        )
+                    })?;
+                let declared = op
+                    .output_columns
+                    .iter()
+                    .find(|c| c.column_id == item.output_column_id);
+                let data_type = declared
+                    .map(|c| c.data_type.clone())
+                    .unwrap_or(DataType::Utf8);
+                let nullable = declared.map(|c| c.nullable).unwrap_or(true);
+                let output_name = declared
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| item.string_column.clone());
+                Ok::<_, String>((
+                    dict_binding.slot_id,
+                    (output_name, data_type, nullable, item.output_column_id),
+                ))
+            })
+            .collect::<Result<_, _>>()?;
+
+        let state = &mut *self.state;
+        let mut decode_scope = ExprScope::new();
+        let mut mapping: BTreeMap<i32, i32> = BTreeMap::new();
+        let mut consumed_dict_slots: BTreeSet<i32> = Default::default();
+
+        let mut col_pos: i32 = 0;
+        for (child_name, child_binding) in &child_columns {
+            if let Some((string_name, data_type, nullable, output_column_id)) =
+                dict_target_meta.get(&child_binding.slot_id)
+            {
+                let string_slot_id = state.alloc_slot();
+                state.desc_builder().add_slot(
+                    string_slot_id,
+                    decode_tuple_id,
+                    string_name,
+                    data_type,
+                    *nullable,
+                    col_pos,
+                );
+                if consumed_dict_slots.insert(child_binding.slot_id) {
+                    mapping.insert(child_binding.slot_id, string_slot_id);
+                }
+                decode_scope.add_column_with_id(
+                    *output_column_id,
+                    None,
+                    string_name.clone(),
+                    ColumnBinding {
+                        tuple_id: decode_tuple_id,
+                        slot_id: string_slot_id,
+                        data_type: data_type.clone(),
+                        type_desc: None,
+                        nullable: *nullable,
+                    },
+                );
+            } else {
+                state.desc_builder().add_slot(
+                    child_binding.slot_id,
+                    decode_tuple_id,
+                    child_name,
+                    &child_binding.data_type,
+                    child_binding.nullable,
+                    col_pos,
+                );
+                let output_binding = ColumnBinding {
+                    tuple_id: decode_tuple_id,
+                    slot_id: child_binding.slot_id,
+                    data_type: child_binding.data_type.clone(),
+                    type_desc: child_binding.type_desc.clone(),
+                    nullable: child_binding.nullable,
+                };
+                decode_scope.add_column(None, child_name.clone(), output_binding.clone());
+                for (column_id, id_binding) in &child_ids_by_slot {
+                    if id_binding.tuple_id == child_binding.tuple_id
+                        && id_binding.slot_id == child_binding.slot_id
+                    {
+                        decode_scope.add_id_alias(*column_id, output_binding.clone());
+                    }
+                }
+            }
+            col_pos += 1;
+        }
+
+        if mapping.len() != op.mappings.len() {
+            return Err(format!(
+                "decode mappings unresolved: declared {} entries, materialized {}",
+                op.mappings.len(),
+                mapping.len()
+            ));
+        }
+
+        state.desc_builder().add_tuple(decode_tuple_id, None);
+        let decode_node = nodes::build_decode_node(decode_node_id, vec![decode_tuple_id], mapping);
+
+        Ok((decode_node, decode_scope))
+    }
+
+    pub(crate) fn lower_repeat(
+        &mut self,
+        repeat_node_id: i32,
+        virtual_tuple_id: i32,
+        op: &PhysicalRepeatOp,
+        child_scope: ExprScope,
+        child_tuple_ids: Vec<i32>,
+        child_output_columns: Vec<AnalysisOutputColumn>,
+    ) -> Result<
+        (
+            plan_nodes::TPlanNode,
+            ExprScope,
+            Vec<i32>,
+            Vec<AnalysisOutputColumn>,
+        ),
+        String,
+    > {
+        let state = &mut *self.state;
+        let has_grouping_fns = !op.grouping_fn_args.is_empty();
+        let mut output_scope = child_scope;
+        let mut output_columns = child_output_columns;
+
+        let num_virtual = 1 + op.grouping_fn_args.len();
+        let mut virtual_slot_ids = Vec::with_capacity(num_virtual);
+
+        let grouping_id_slot = state.alloc_slot();
+        state.desc_builder().add_slot(
+            grouping_id_slot,
+            virtual_tuple_id,
+            "__grouping_id",
+            &DataType::Int64,
+            false,
+            0,
+        );
+        if !op.grouping_fn_args.is_empty() {
+            output_scope.add_column(
+                None,
+                "__grouping_id".to_string(),
+                ColumnBinding {
+                    tuple_id: virtual_tuple_id,
+                    slot_id: grouping_id_slot,
+                    data_type: DataType::Int64,
+                    type_desc: None,
+                    nullable: false,
+                },
+            );
+        }
+        virtual_slot_ids.push(grouping_id_slot);
+
+        for (fn_idx, (fn_name, _)) in op.grouping_fn_args.iter().enumerate() {
+            let slot = state.alloc_slot();
+            state.desc_builder().add_slot(
+                slot,
+                virtual_tuple_id,
+                fn_name,
+                &DataType::Int64,
+                false,
+                1 + fn_idx as i32,
+            );
+            let binding = ColumnBinding {
+                tuple_id: virtual_tuple_id,
+                slot_id: slot,
+                data_type: DataType::Int64,
+                type_desc: None,
+                nullable: false,
+            };
+            if let Some((_, column_id)) = op.grouping_fn_ids.get(fn_idx) {
+                output_scope.add_column_with_id(*column_id, None, fn_name.clone(), binding);
+                output_columns.push(AnalysisOutputColumn {
+                    column_id: *column_id,
+                    name: fn_name.clone(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    is_internal: false,
+                });
+            } else {
+                output_scope.add_internal_column(fn_name.clone(), binding);
+            }
+            virtual_slot_ids.push(slot);
+        }
+
+        state.desc_builder().add_tuple(virtual_tuple_id, None);
+
+        let mut all_rollup_slot_ids = BTreeSet::new();
+        for column_id in &op.all_rollup_column_ids {
+            let binding = output_scope.resolve_by_id(*column_id).ok_or_else(|| {
+                format!(
+                    "Repeat rollup ColumnId({}) is not in output scope",
+                    column_id.0
+                )
+            })?;
+            all_rollup_slot_ids.insert(binding.slot_id);
+        }
+
+        let slot_id_set_list: Vec<BTreeSet<i32>> = op
+            .repeat_column_ref_ids
+            .iter()
+            .map(|non_null_cols| {
+                let mut slot_ids = BTreeSet::new();
+                for column_id in non_null_cols {
+                    let binding = output_scope.resolve_by_id(*column_id).ok_or_else(|| {
+                        format!(
+                            "Repeat non-null ColumnId({}) is not in output scope",
+                            column_id.0
+                        )
+                    })?;
+                    slot_ids.insert(binding.slot_id);
+                }
+                Ok(slot_ids)
+            })
+            .collect::<Result<_, String>>()?;
+
+        let repeat_times = op.grouping_ids.len();
+        let mut grouping_list: Vec<Vec<i64>> = Vec::with_capacity(num_virtual);
+        grouping_list.push(op.grouping_ids.iter().map(|g| *g as i64).collect());
+
+        for fn_args in &op.grouping_fn_arg_ids {
+            let mut values = Vec::with_capacity(repeat_times);
+            for non_null_cols in &op.repeat_column_ref_ids {
+                let mut bits: u64 = 0;
+                for (bit_pos, arg_col) in fn_args.iter().enumerate() {
+                    let is_null = !non_null_cols.iter().any(|column_id| column_id == arg_col);
+                    if is_null {
+                        let reverse_bit_pos = fn_args.len() - 1 - bit_pos;
+                        bits |= 1 << reverse_bit_pos;
+                    }
+                }
+                values.push(bits as i64);
+            }
+            grouping_list.push(values);
+        }
+
+        let repeat_id_list: Vec<i64> = op.grouping_ids.iter().map(|g| *g as i64).collect();
+
+        let mut row_tuples = child_tuple_ids.clone();
+        if has_grouping_fns {
+            row_tuples.push(virtual_tuple_id);
+        }
+
+        let mut plan_node = nodes::default_plan_node();
+        plan_node.node_id = repeat_node_id;
+        plan_node.node_type = plan_nodes::TPlanNodeType::REPEAT_NODE;
+        plan_node.num_children = 1;
+        plan_node.limit = -1;
+        plan_node.row_tuples = row_tuples;
+        plan_node.nullable_tuples = vec![];
+        plan_node.compact_data = true;
+        plan_node.repeat_node = Some(plan_nodes::TRepeatNode {
+            output_tuple_id: virtual_tuple_id,
+            slot_id_set_list,
+            repeat_id_list,
+            grouping_list,
+            all_slot_ids: all_rollup_slot_ids,
+        });
+
+        let mut output_tuple_ids = child_tuple_ids;
+        if has_grouping_fns {
+            output_tuple_ids.push(virtual_tuple_id);
+        }
+
+        Ok((plan_node, output_scope, output_tuple_ids, output_columns))
+    }
+
+    fn lower_set_op(
+        &mut self,
+        set_op_node_id: i32,
+        output_tuple_id: i32,
+        kind: super::body::SetOpKind,
+        explicit_output_columns: &[AnalysisOutputColumn],
+        child_results: &[LoweredDistributedNode],
+    ) -> Result<(plan_nodes::TPlanNode, ExprScope), String> {
+        if child_results.is_empty() {
+            return Err("set operation node has no inputs".to_string());
+        }
+
+        let state = &mut *self.state;
+        let output_columns: Vec<AnalysisOutputColumn> = if !explicit_output_columns.is_empty() {
+            explicit_output_columns.to_vec()
+        } else {
+            child_results[0]
+                .scope
+                .iter_columns()
+                .map(|(name, binding)| AnalysisOutputColumn {
+                    column_id: crate::sql::column_id::ColumnId::UNSET,
+                    name: name.clone(),
+                    data_type: binding.data_type.clone(),
+                    nullable: binding.nullable,
+                    is_internal: false,
+                })
+                .collect()
+        };
+
+        let mut output_scope = ExprScope::new();
+        let first_child_cols: Vec<(String, ColumnBinding)> = child_results[0]
+            .scope
+            .iter_columns()
+            .map(|(name, binding)| (name.clone(), binding.clone()))
+            .collect();
+
+        if first_child_cols.len() != output_columns.len() {
+            return Err(format!(
+                "set operation column count mismatch during codegen: child has {}, output has {}",
+                first_child_cols.len(),
+                output_columns.len()
+            ));
+        }
+
+        for (idx, output_col) in output_columns.iter().enumerate() {
+            let slot_id = state.alloc_slot();
+            state.desc_builder().add_slot(
+                slot_id,
+                output_tuple_id,
+                &output_col.name,
+                &output_col.data_type,
+                output_col.nullable,
+                idx as i32,
+            );
+            output_scope.add_column_with_id(
+                output_col.column_id,
+                None,
+                output_col.name.clone(),
+                ColumnBinding {
+                    tuple_id: output_tuple_id,
+                    slot_id,
+                    data_type: output_col.data_type.clone(),
+                    type_desc: None,
+                    nullable: output_col.nullable,
+                },
+            );
+        }
+        state.desc_builder().add_tuple(output_tuple_id, None);
+
+        let mut result_expr_lists = Vec::with_capacity(child_results.len());
+        for child_result in child_results {
+            let mut expr_list = Vec::new();
+            for (col_idx, (_, child_binding)) in child_result.scope.iter_columns().enumerate() {
+                let output_col = output_columns.get(col_idx).ok_or_else(|| {
+                    format!("missing output column {} for set operation", col_idx)
+                })?;
+                let needs_cast = child_binding.data_type != output_col.data_type;
+                if needs_cast {
+                    let target_desc = type_infer::arrow_type_to_type_desc(&output_col.data_type)?;
+                    let child_desc = expr_compiler::binding_type_desc(child_binding)?;
+                    let slot_ref = expr_compiler::build_slot_ref_texpr(
+                        child_binding.slot_id,
+                        child_binding.tuple_id,
+                        child_desc,
+                    );
+                    expr_list.push(expr_compiler::build_cast_texpr(slot_ref, target_desc));
+                } else {
+                    let type_desc = expr_compiler::binding_type_desc(child_binding)?;
+                    expr_list.push(expr_compiler::build_slot_ref_texpr(
+                        child_binding.slot_id,
+                        child_binding.tuple_id,
+                        type_desc,
+                    ));
+                }
+            }
+            result_expr_lists.push(expr_list);
+        }
+
+        let tnode = plan_nodes::TUnionNode {
+            tuple_id: output_tuple_id,
+            result_expr_lists,
+            const_expr_lists: vec![],
+            first_materialized_child_idx: 0,
+            pass_through_slot_maps: None,
+            local_exchanger_type: None,
+            local_partition_by_exprs: None,
+        };
+
+        let mut plan_node = nodes::default_plan_node();
+        plan_node.node_id = set_op_node_id;
+        plan_node.node_type = match kind {
+            super::body::SetOpKind::UnionAll => plan_nodes::TPlanNodeType::UNION_NODE,
+            super::body::SetOpKind::Intersect => plan_nodes::TPlanNodeType::INTERSECT_NODE,
+            super::body::SetOpKind::Except => plan_nodes::TPlanNodeType::EXCEPT_NODE,
+        };
+        plan_node.row_tuples = vec![output_tuple_id];
+        plan_node.nullable_tuples = vec![];
+        plan_node.num_children = child_results.len() as i32;
+
+        match kind {
+            super::body::SetOpKind::UnionAll => {
+                plan_node.union_node = Some(tnode);
+            }
+            super::body::SetOpKind::Intersect => {
+                plan_node.intersect_node = Some(plan_nodes::TIntersectNode {
+                    tuple_id: tnode.tuple_id,
+                    result_expr_lists: tnode.result_expr_lists,
+                    const_expr_lists: tnode.const_expr_lists,
+                    first_materialized_child_idx: tnode.first_materialized_child_idx,
+                    has_outer_join_child: None,
+                    local_partition_by_exprs: None,
+                });
+            }
+            super::body::SetOpKind::Except => {
+                plan_node.except_node = Some(plan_nodes::TExceptNode {
+                    tuple_id: tnode.tuple_id,
+                    result_expr_lists: tnode.result_expr_lists,
+                    const_expr_lists: tnode.const_expr_lists,
+                    first_materialized_child_idx: tnode.first_materialized_child_idx,
+                    local_partition_by_exprs: None,
+                });
+            }
+        }
+
+        Ok((plan_node, output_scope))
+    }
 }
 
 fn first_tuple_id(
@@ -2026,6 +2678,42 @@ fn nest_loop_join_body_to_physical_op(
     PhysicalNestLoopJoinOp {
         join_type: body.join_type,
         condition: body.condition.clone(),
+    }
+}
+
+fn values_body_to_physical_op(body: &super::body::ValuesBody) -> PhysicalValuesOp {
+    PhysicalValuesOp {
+        rows: body.rows.clone(),
+        columns: body.columns.clone(),
+    }
+}
+
+fn assert_one_row_body_to_physical_op(
+    body: &super::body::AssertOneRowBody,
+) -> PhysicalAssertOneRowOp {
+    PhysicalAssertOneRowOp {
+        subquery_text: body.subquery_text.clone(),
+    }
+}
+
+fn decode_body_to_physical_op(body: &super::body::DecodeBody) -> PhysicalDecodeOp {
+    PhysicalDecodeOp {
+        mappings: body.mappings.clone(),
+        output_columns: body.output_columns.clone(),
+    }
+}
+
+fn repeat_body_to_physical_op(body: &super::body::RepeatBody) -> PhysicalRepeatOp {
+    PhysicalRepeatOp {
+        repeat_column_ref_list: body.repeat_column_ref_list.clone(),
+        repeat_column_ref_ids: body.repeat_column_ref_ids.clone(),
+        grouping_ids: body.grouping_ids.clone(),
+        all_rollup_columns: body.all_rollup_columns.clone(),
+        all_rollup_column_ids: body.all_rollup_column_ids.clone(),
+        grouping_key_aliases: body.grouping_key_aliases.clone(),
+        grouping_fn_args: body.grouping_fn_args.clone(),
+        grouping_fn_arg_ids: body.grouping_fn_arg_ids.clone(),
+        grouping_fn_ids: body.grouping_fn_ids.clone(),
     }
 }
 

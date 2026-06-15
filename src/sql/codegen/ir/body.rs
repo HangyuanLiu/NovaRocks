@@ -1,9 +1,10 @@
 use crate::sql::analysis::{JoinKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
 use crate::sql::catalog::TableDef;
+use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::{
     AggMode, JoinDistribution, PhysicalHashJoinEqCondition, TopNPhase,
 };
-use crate::sql::planner::plan::AggregateCall;
+use crate::sql::planner::plan::{AggregateCall, DecodeMapping};
 use crate::sql::planner::plan::{ScanDictionaryColumn, ScanVariantColumn};
 
 #[derive(Clone, Debug)]
@@ -64,4 +65,49 @@ pub(crate) struct HashJoinBody {
 pub(crate) struct NestLoopJoinBody {
     pub join_type: JoinKind,
     pub condition: Option<TypedExpr>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ValuesBody {
+    pub rows: Vec<Vec<TypedExpr>>,
+    pub columns: Vec<OutputColumn>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AssertOneRowBody {
+    pub subquery_text: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DecodeBody {
+    pub mappings: Vec<DecodeMapping>,
+    pub output_columns: Vec<OutputColumn>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RepeatBody {
+    pub virtual_tuple_id: i32,
+    pub repeat_column_ref_list: Vec<Vec<String>>,
+    pub repeat_column_ref_ids: Vec<Vec<ColumnId>>,
+    pub grouping_ids: Vec<u64>,
+    pub all_rollup_columns: Vec<String>,
+    pub all_rollup_column_ids: Vec<ColumnId>,
+    pub grouping_key_aliases: Vec<(String, String)>,
+    pub grouping_fn_args: Vec<(String, Vec<String>)>,
+    pub grouping_fn_arg_ids: Vec<Vec<ColumnId>>,
+    pub grouping_fn_ids: Vec<(String, ColumnId)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SetOpKind {
+    UnionAll,
+    Intersect,
+    Except,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SetOpBody {
+    pub kind: SetOpKind,
+    pub output_columns: Vec<OutputColumn>,
+    pub child_output_columns: Vec<Vec<OutputColumn>>,
 }
