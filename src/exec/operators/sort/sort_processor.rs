@@ -992,7 +992,7 @@ impl SortProcessorOperator {
 ///
 /// `peer_equal(i, j)` returns whether sorted row `i` and `j` belong to the same
 /// ORDER BY peer group.
-fn rank_like_cutoff<F>(
+pub(crate) fn rank_like_cutoff<F>(
     topn_type: SortTopNType,
     rank_limit: usize,
     total_rows: usize,
