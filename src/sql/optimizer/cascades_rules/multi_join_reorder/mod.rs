@@ -10,6 +10,7 @@
 
 mod algo;
 mod flatten;
+mod pass;
 
 use crate::sql::analysis::TypedExpr;
 use crate::sql::optimizer::memo::GroupId;
@@ -17,6 +18,7 @@ use crate::sql::optimizer::statistics::Statistics;
 
 pub(crate) use algo::{ReorderCaps, enumerate_orders};
 pub(crate) use flatten::flatten_join_chain;
+pub(crate) use pass::{ReorderOptions, run_multi_join_reorder};
 
 /// A flattened inner/cross join chain: the leaf atoms (existing memo groups,
 /// with their cached output statistics) plus the multi-relation predicates that
