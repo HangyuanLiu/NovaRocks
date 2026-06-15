@@ -9,7 +9,7 @@ use crate::sql::planner::plan::{AggregateCall, DecodeMapping};
 use crate::sql::planner::plan::{ScanDictionaryColumn, ScanVariantColumn};
 
 #[derive(Clone, Debug)]
-pub(crate) struct ScanBody {
+pub(crate) struct DistributedScanNode {
     pub database: String,
     pub table: TableDef,
     pub alias: Option<String>,
@@ -23,13 +23,13 @@ pub(crate) struct ScanBody {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ProjectBody {
+pub(crate) struct DistributedProjectNode {
     pub items: Vec<ProjectItem>,
     pub output_qualifier: Option<String>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct SortBody {
+pub(crate) struct DistributedSortNode {
     pub items: Vec<SortItem>,
     pub analytic_partition_exprs: Vec<TypedExpr>,
     pub output_columns: Vec<OutputColumn>,
@@ -37,7 +37,7 @@ pub(crate) struct SortBody {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct TopNBody {
+pub(crate) struct DistributedTopNNode {
     pub items: Vec<SortItem>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
@@ -46,7 +46,7 @@ pub(crate) struct TopNBody {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct HashAggregateBody {
+pub(crate) struct DistributedHashAggregateNode {
     pub mode: AggMode,
     pub group_by: Vec<TypedExpr>,
     pub aggregates: Vec<AggregateCall>,
@@ -55,7 +55,7 @@ pub(crate) struct HashAggregateBody {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct HashJoinBody {
+pub(crate) struct DistributedHashJoinNode {
     pub join_type: JoinKind,
     pub eq_conditions: Vec<PhysicalHashJoinEqCondition>,
     pub other_condition: Option<TypedExpr>,
@@ -63,30 +63,30 @@ pub(crate) struct HashJoinBody {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct NestLoopJoinBody {
+pub(crate) struct DistributedNestLoopJoinNode {
     pub join_type: JoinKind,
     pub condition: Option<TypedExpr>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ValuesBody {
+pub(crate) struct DistributedValuesNode {
     pub rows: Vec<Vec<TypedExpr>>,
     pub columns: Vec<OutputColumn>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct AssertOneRowBody {
+pub(crate) struct DistributedAssertOneRowNode {
     pub subquery_text: String,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct DecodeBody {
+pub(crate) struct DistributedDecodeNode {
     pub mappings: Vec<DecodeMapping>,
     pub output_columns: Vec<OutputColumn>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct RepeatBody {
+pub(crate) struct DistributedRepeatNode {
     pub virtual_tuple_id: i32,
     pub repeat_column_ref_list: Vec<Vec<String>>,
     pub repeat_column_ref_ids: Vec<Vec<ColumnId>>,
@@ -107,20 +107,20 @@ pub(crate) enum SetOpKind {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct SetOpBody {
+pub(crate) struct DistributedSetOpNode {
     pub kind: SetOpKind,
     pub output_columns: Vec<OutputColumn>,
     pub child_output_columns: Vec<Vec<OutputColumn>>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct WindowBody {
+pub(crate) struct DistributedWindowNode {
     pub window_exprs: Vec<WindowExpr>,
     pub output_columns: Vec<OutputColumn>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct GenerateSeriesBody {
+pub(crate) struct DistributedGenerateSeriesNode {
     pub start: i64,
     pub end: i64,
     pub step: i64,
@@ -130,7 +130,7 @@ pub(crate) struct GenerateSeriesBody {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct TableFunctionBody {
+pub(crate) struct DistributedTableFunctionNode {
     pub function_name: String,
     pub args: Vec<TypedExpr>,
     pub output_columns: Vec<OutputColumn>,
@@ -143,12 +143,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn multi_node_bodies_carry_only_semantic_fields() {
-        let _window = WindowBody {
+    fn multi_node_kinds_carry_only_semantic_fields() {
+        let _window = DistributedWindowNode {
             window_exprs: Vec::new(),
             output_columns: Vec::new(),
         };
-        let _generate_series = GenerateSeriesBody {
+        let _generate_series = DistributedGenerateSeriesNode {
             start: 1,
             end: 3,
             step: 1,
@@ -156,7 +156,7 @@ mod tests {
             alias: Some("gs".to_string()),
             output_column_id: ColumnId::new_for_test(1),
         };
-        let _table_function = TableFunctionBody {
+        let _table_function = DistributedTableFunctionNode {
             function_name: "unnest".to_string(),
             args: Vec::new(),
             output_columns: Vec::new(),

@@ -457,8 +457,8 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         &mut self,
         node: &super::node::DistributedPlanNode,
     ) -> Result<LoweredDistributedNode, String> {
-        let mut lowered = match &node.body {
-            super::node::DistributedPlanNodeBody::Scan(scan) => {
+        let mut lowered = match &node.kind {
+            super::node::DistributedPlanNodeKind::Scan(scan) => {
                 if !node.children.is_empty() {
                     return Err(format!(
                         "DistributedPlan Scan node_id={} expected 0 children, got {}",
@@ -467,7 +467,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     ));
                 }
                 let scan_tuple_id = first_tuple_id(node, "Scan")?;
-                let op = scan_body_to_physical_op(scan);
+                let op = scan_node_to_physical_op(scan);
                 let (scan_plan_node, scope) = self.lower_scan(node.node_id, scan_tuple_id, &op)?;
                 LoweredDistributedNode {
                     plan_nodes: vec![scan_plan_node],
@@ -477,7 +477,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     ordering: OrderingSpec::Any,
                 }
             }
-            super::node::DistributedPlanNodeBody::Project(project) => {
+            super::node::DistributedPlanNodeKind::Project(project) => {
                 if node.children.len() != 1 {
                     return Err(format!(
                         "DistributedPlan Project node_id={} expected 1 child, got {}",
@@ -487,7 +487,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 }
                 let child = self.lower_node(&node.children[0])?;
                 let project_tuple_id = first_tuple_id(node, "Project")?;
-                let op = project_body_to_physical_op(project);
+                let op = project_node_to_physical_op(project);
                 let (project_plan_node, scope, _output_columns) =
                     self.lower_project(node.node_id, project_tuple_id, &op, &child.scope)?;
                 let mut plan_nodes = vec![project_plan_node];
@@ -496,11 +496,11 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     plan_nodes,
                     scope,
                     tuple_ids: vec![project_tuple_id],
-                    output_columns: project_body_output_columns(project),
+                    output_columns: project_node_output_columns(project),
                     ordering: OrderingSpec::Any,
                 }
             }
-            super::node::DistributedPlanNodeBody::Sort(sort) => {
+            super::node::DistributedPlanNodeKind::Sort(sort) => {
                 if node.children.len() != 1 {
                     return Err(format!(
                         "DistributedPlan Sort node_id={} expected 1 child, got {}",
@@ -509,7 +509,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     ));
                 }
                 let child = self.lower_node(&node.children[0])?;
-                let op = sort_body_to_physical_op(sort);
+                let op = sort_node_to_physical_op(sort);
                 let sort_plan_node = self.lower_sort(
                     node.node_id,
                     &op,
@@ -528,7 +528,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     ordering: OrderingSpec::from_sort_items(&sort.items),
                 }
             }
-            super::node::DistributedPlanNodeBody::TopN(topn) => {
+            super::node::DistributedPlanNodeKind::TopN(topn) => {
                 if node.children.len() != 1 {
                     return Err(format!(
                         "DistributedPlan TopN node_id={} expected 1 child, got {}",
@@ -537,7 +537,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     ));
                 }
                 let child = self.lower_node(&node.children[0])?;
-                let op = top_n_body_to_physical_op(topn);
+                let op = top_n_node_to_physical_op(topn);
                 let top_n_plan_node = self.lower_top_n_single_or_partial(
                     node.node_id,
                     &op,
@@ -554,7 +554,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     ordering: OrderingSpec::from_sort_items(&topn.items),
                 }
             }
-            super::node::DistributedPlanNodeBody::HashAggregate(agg) => {
+            super::node::DistributedPlanNodeKind::HashAggregate(agg) => {
                 if node.children.len() != 1 {
                     return Err(format!(
                         "DistributedPlan HashAggregate node_id={} expected 1 child, got {}",
@@ -564,7 +564,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 }
                 let child = self.lower_node(&node.children[0])?;
                 let agg_tuple_id = first_tuple_id(node, "HashAggregate")?;
-                let op = hash_aggregate_body_to_physical_op(agg);
+                let op = hash_aggregate_node_to_physical_op(agg);
                 let (agg_plan_node, scope) =
                     self.lower_hash_aggregate(node.node_id, agg_tuple_id, &op, &child.scope)?;
                 let mut plan_nodes = vec![agg_plan_node];
@@ -577,7 +577,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     ordering: OrderingSpec::Any,
                 }
             }
-            super::node::DistributedPlanNodeBody::HashJoin(hash_join) => {
+            super::node::DistributedPlanNodeKind::HashJoin(hash_join) => {
                 let (left_node, right_node) = binary_children(node, "HashJoin")?;
                 let left = self.lower_node(left_node)?;
                 let right = self.lower_node(right_node)?;
@@ -593,7 +593,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     tuple_ids: right_tuple_ids,
                     ..
                 } = right;
-                let op = hash_join_body_to_physical_op(hash_join);
+                let op = hash_join_node_to_physical_op(hash_join);
                 let (join_plan_node, scope, tuple_ids) = self.lower_hash_join(
                     node.node_id,
                     &left_tuple_ids,
@@ -615,7 +615,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     ordering: OrderingSpec::Any,
                 }
             }
-            super::node::DistributedPlanNodeBody::NestLoopJoin(nest_loop) => {
+            super::node::DistributedPlanNodeKind::NestLoopJoin(nest_loop) => {
                 let (left_node, right_node) = binary_children(node, "NestLoopJoin")?;
                 let left = self.lower_node(left_node)?;
                 let right = self.lower_node(right_node)?;
@@ -631,7 +631,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     tuple_ids: right_tuple_ids,
                     ..
                 } = right;
-                let op = nest_loop_join_body_to_physical_op(nest_loop);
+                let op = nest_loop_join_node_to_physical_op(nest_loop);
                 let (join_plan_node, scope, tuple_ids) = self.lower_nest_loop_join(
                     node.node_id,
                     &left_tuple_ids,
@@ -651,7 +651,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     ordering: OrderingSpec::Any,
                 }
             }
-            super::node::DistributedPlanNodeBody::Values(values) => {
+            super::node::DistributedPlanNodeKind::Values(values) => {
                 if !node.children.is_empty() {
                     return Err(format!(
                         "DistributedPlan Values node_id={} expected 0 children, got {}",
@@ -660,7 +660,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     ));
                 }
                 let tuple_id = first_tuple_id(node, "Values")?;
-                let op = values_body_to_physical_op(values);
+                let op = values_node_to_physical_op(values);
                 let (plan_node, scope) = self.lower_values(node.node_id, tuple_id, &op)?;
                 LoweredDistributedNode {
                     plan_nodes: vec![plan_node],
@@ -670,7 +670,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     ordering: OrderingSpec::Any,
                 }
             }
-            super::node::DistributedPlanNodeBody::AssertOneRow(assert_one_row) => {
+            super::node::DistributedPlanNodeKind::AssertOneRow(assert_one_row) => {
                 if node.children.len() != 1 {
                     return Err(format!(
                         "DistributedPlan AssertOneRow node_id={} expected 1 child, got {}",
@@ -679,7 +679,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     ));
                 }
                 let child = self.lower_node(&node.children[0])?;
-                let op = assert_one_row_body_to_physical_op(assert_one_row);
+                let op = assert_one_row_node_to_physical_op(assert_one_row);
                 let plan_node = self.lower_assert_one_row(node.node_id, &op, &child.tuple_ids);
                 let mut plan_nodes = vec![plan_node];
                 plan_nodes.extend(child.plan_nodes);
@@ -691,7 +691,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     ordering: child.ordering,
                 }
             }
-            super::node::DistributedPlanNodeBody::Decode(decode) => {
+            super::node::DistributedPlanNodeKind::Decode(decode) => {
                 if node.children.len() != 1 {
                     return Err(format!(
                         "DistributedPlan Decode node_id={} expected 1 child, got {}",
@@ -701,7 +701,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 }
                 let child = self.lower_node(&node.children[0])?;
                 let tuple_id = first_tuple_id(node, "Decode")?;
-                let op = decode_body_to_physical_op(decode);
+                let op = decode_node_to_physical_op(decode);
                 let (plan_node, scope) =
                     self.lower_decode(node.node_id, tuple_id, &op, &child.scope)?;
                 let mut plan_nodes = vec![plan_node];
@@ -714,7 +714,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     ordering: OrderingSpec::Any,
                 }
             }
-            super::node::DistributedPlanNodeBody::Repeat(repeat) => {
+            super::node::DistributedPlanNodeKind::Repeat(repeat) => {
                 if node.children.len() != 1 {
                     return Err(format!(
                         "DistributedPlan Repeat node_id={} expected 1 child, got {}",
@@ -723,7 +723,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     ));
                 }
                 let child = self.lower_node(&node.children[0])?;
-                let op = repeat_body_to_physical_op(repeat);
+                let op = repeat_node_to_physical_op(repeat);
                 let (plan_node, scope, tuple_ids, output_columns) = self.lower_repeat(
                     node.node_id,
                     repeat.virtual_tuple_id,
@@ -742,7 +742,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     ordering: OrderingSpec::Any,
                 }
             }
-            super::node::DistributedPlanNodeBody::SetOp(set_op) => {
+            super::node::DistributedPlanNodeKind::SetOp(set_op) => {
                 if node.children.is_empty() {
                     return Err("DistributedPlan SetOp has no inputs".to_string());
                 }
@@ -781,7 +781,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     ordering: OrderingSpec::Any,
                 }
             }
-            super::node::DistributedPlanNodeBody::Window(window) => {
+            super::node::DistributedPlanNodeKind::Window(window) => {
                 if node.children.len() != 1 {
                     return Err(format!(
                         "DistributedPlan Window node_id={} expected 1 child, got {}",
@@ -807,7 +807,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     ordering,
                 }
             }
-            super::node::DistributedPlanNodeBody::GenerateSeries(generate_series) => {
+            super::node::DistributedPlanNodeKind::GenerateSeries(generate_series) => {
                 if !node.children.is_empty() {
                     return Err(format!(
                         "DistributedPlan GenerateSeries node_id={} expected 0 children, got {}",
@@ -816,7 +816,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     ));
                 }
                 let output_tuple_id = first_tuple_id(node, "GenerateSeries")?;
-                let op = generate_series_body_to_physical_op(generate_series);
+                let op = generate_series_node_to_physical_op(generate_series);
                 let (plan_nodes, scope) =
                     self.lower_generate_series(node.node_id, output_tuple_id, &op)?;
                 LoweredDistributedNode {
@@ -833,7 +833,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     ordering: OrderingSpec::Any,
                 }
             }
-            super::node::DistributedPlanNodeBody::TableFunction(table_function) => {
+            super::node::DistributedPlanNodeKind::TableFunction(table_function) => {
                 if node.children.len() != 1 {
                     return Err(format!(
                         "DistributedPlan TableFunction node_id={} expected 1 child, got {}",
@@ -843,7 +843,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 }
                 let child = self.lower_node(&node.children[0])?;
                 let output_tuple_id = first_tuple_id(node, "TableFunction")?;
-                let op = table_function_body_to_physical_op(table_function);
+                let op = table_function_node_to_physical_op(table_function);
                 let (table_fn_nodes, scope) =
                     self.lower_table_function(node.node_id, output_tuple_id, &op, &child.scope)?;
                 let mut plan_nodes = table_fn_nodes;
@@ -2247,7 +2247,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         &mut self,
         window_node_id: i32,
         node_tuple_ids: &[i32],
-        body: &super::body::WindowBody,
+        kind: &super::kind::DistributedWindowNode,
         child_scope: &ExprScope,
         child_tuple_ids: &[i32],
         child_ordering: &OrderingSpec,
@@ -2260,7 +2260,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         ),
         String,
     > {
-        let groups = group_win_exprs_by_sig(&body.window_exprs);
+        let groups = group_win_exprs_by_sig(&kind.window_exprs);
         if groups.is_empty() {
             return Err("DistributedPlan Window has no window expressions".to_string());
         }
@@ -2290,7 +2290,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             })?;
             let group_exprs: Vec<_> = group_indices
                 .iter()
-                .map(|&i| body.window_exprs[i].clone())
+                .map(|&i| kind.window_exprs[i].clone())
                 .collect();
             let first_win = group_exprs
                 .first()
@@ -3166,7 +3166,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         &mut self,
         set_op_node_id: i32,
         output_tuple_id: i32,
-        kind: super::body::SetOpKind,
+        kind: super::kind::SetOpKind,
         explicit_output_columns: &[AnalysisOutputColumn],
         child_output_columns: &[Vec<AnalysisOutputColumn>],
         child_results: &[LoweredDistributedNode],
@@ -3331,19 +3331,19 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         let mut plan_node = nodes::default_plan_node();
         plan_node.node_id = set_op_node_id;
         plan_node.node_type = match kind {
-            super::body::SetOpKind::UnionAll => plan_nodes::TPlanNodeType::UNION_NODE,
-            super::body::SetOpKind::Intersect => plan_nodes::TPlanNodeType::INTERSECT_NODE,
-            super::body::SetOpKind::Except => plan_nodes::TPlanNodeType::EXCEPT_NODE,
+            super::kind::SetOpKind::UnionAll => plan_nodes::TPlanNodeType::UNION_NODE,
+            super::kind::SetOpKind::Intersect => plan_nodes::TPlanNodeType::INTERSECT_NODE,
+            super::kind::SetOpKind::Except => plan_nodes::TPlanNodeType::EXCEPT_NODE,
         };
         plan_node.row_tuples = vec![output_tuple_id];
         plan_node.nullable_tuples = vec![];
         plan_node.num_children = child_results.len() as i32;
 
         match kind {
-            super::body::SetOpKind::UnionAll => {
+            super::kind::SetOpKind::UnionAll => {
                 plan_node.union_node = Some(tnode);
             }
-            super::body::SetOpKind::Intersect => {
+            super::kind::SetOpKind::Intersect => {
                 plan_node.intersect_node = Some(plan_nodes::TIntersectNode {
                     tuple_id: tnode.tuple_id,
                     result_expr_lists: tnode.result_expr_lists,
@@ -3353,7 +3353,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     local_partition_by_exprs: None,
                 });
             }
-            super::body::SetOpKind::Except => {
+            super::kind::SetOpKind::Except => {
                 plan_node.except_node = Some(plan_nodes::TExceptNode {
                     tuple_id: tnode.tuple_id,
                     result_expr_lists: tnode.result_expr_lists,
@@ -3465,145 +3465,150 @@ fn apply_ignore_nulls_to_root_fn(texpr: &mut exprs::TExpr, ignore_nulls: bool) {
     }
 }
 
-fn scan_body_to_physical_op(body: &super::body::ScanBody) -> PhysicalScanOp {
+fn scan_node_to_physical_op(kind: &super::kind::DistributedScanNode) -> PhysicalScanOp {
     PhysicalScanOp {
-        database: body.database.clone(),
-        table: body.table.clone(),
-        alias: body.alias.clone(),
-        columns: body.columns.clone(),
-        predicates: body.predicates.clone(),
-        required_columns: body.required_columns.clone(),
-        dict_columns: body.dict_columns.clone(),
-        variant_columns: body.variant_columns.clone(),
-        mv_rewritten_from: body.mv_rewritten_from.clone(),
+        database: kind.database.clone(),
+        table: kind.table.clone(),
+        alias: kind.alias.clone(),
+        columns: kind.columns.clone(),
+        predicates: kind.predicates.clone(),
+        required_columns: kind.required_columns.clone(),
+        dict_columns: kind.dict_columns.clone(),
+        variant_columns: kind.variant_columns.clone(),
+        mv_rewritten_from: kind.mv_rewritten_from.clone(),
     }
 }
 
-fn project_body_to_physical_op(body: &super::body::ProjectBody) -> PhysicalProjectOp {
+fn project_node_to_physical_op(kind: &super::kind::DistributedProjectNode) -> PhysicalProjectOp {
     PhysicalProjectOp {
-        items: body.items.clone(),
-        output_qualifier: body.output_qualifier.clone(),
+        items: kind.items.clone(),
+        output_qualifier: kind.output_qualifier.clone(),
     }
 }
 
-fn sort_body_to_physical_op(body: &super::body::SortBody) -> PhysicalSortOp {
+fn sort_node_to_physical_op(kind: &super::kind::DistributedSortNode) -> PhysicalSortOp {
     PhysicalSortOp {
-        items: body.items.clone(),
-        analytic_partition_exprs: body.analytic_partition_exprs.clone(),
-        // The distributed-plan IR `SortBody` does not yet carry per-partition
-        // TopN (partition_limit/topn_type). The standalone ranking-window
-        // pushdown path lowers PhysicalSortOp directly via `lower_sort` and
-        // never round-trips through SortBody, so None is correct here. If the
-        // distributed path later supports ranking-window pushdown, SortBody
-        // must be extended to carry these.
+        items: kind.items.clone(),
+        analytic_partition_exprs: kind.analytic_partition_exprs.clone(),
+        // The distributed-plan IR `DistributedSortNode` does not yet carry
+        // per-partition TopN (partition_limit/topn_type). The standalone
+        // ranking-window pushdown path lowers PhysicalSortOp directly via
+        // `lower_sort` and never round-trips through DistributedSortNode, so
+        // None is correct here. If the distributed path later supports
+        // ranking-window pushdown, DistributedSortNode must be extended to
+        // carry these.
         partition_limit: None,
         topn_type: None,
     }
 }
 
-fn top_n_body_to_physical_op(body: &super::body::TopNBody) -> PhysicalTopNOp {
+fn top_n_node_to_physical_op(kind: &super::kind::DistributedTopNNode) -> PhysicalTopNOp {
     PhysicalTopNOp {
-        items: body.items.clone(),
-        limit: body.limit,
-        offset: body.offset,
-        phase: body.phase,
-        is_split: body.is_split,
+        items: kind.items.clone(),
+        limit: kind.limit,
+        offset: kind.offset,
+        phase: kind.phase,
+        is_split: kind.is_split,
     }
 }
 
-fn hash_aggregate_body_to_physical_op(
-    body: &super::body::HashAggregateBody,
+fn hash_aggregate_node_to_physical_op(
+    kind: &super::kind::DistributedHashAggregateNode,
 ) -> PhysicalHashAggregateOp {
     PhysicalHashAggregateOp {
-        mode: body.mode,
-        group_by: body.group_by.clone(),
-        aggregates: body.aggregates.clone(),
-        output_columns: body.output_columns.clone(),
-        is_merge: body.is_merge.clone(),
+        mode: kind.mode,
+        group_by: kind.group_by.clone(),
+        aggregates: kind.aggregates.clone(),
+        output_columns: kind.output_columns.clone(),
+        is_merge: kind.is_merge.clone(),
     }
 }
 
-fn hash_join_body_to_physical_op(body: &super::body::HashJoinBody) -> PhysicalHashJoinOp {
+fn hash_join_node_to_physical_op(
+    kind: &super::kind::DistributedHashJoinNode,
+) -> PhysicalHashJoinOp {
     PhysicalHashJoinOp {
-        join_type: body.join_type,
-        eq_conditions: body.eq_conditions.clone(),
-        other_condition: body.other_condition.clone(),
-        distribution: body.distribution.clone(),
+        join_type: kind.join_type,
+        eq_conditions: kind.eq_conditions.clone(),
+        other_condition: kind.other_condition.clone(),
+        distribution: kind.distribution.clone(),
     }
 }
 
-fn nest_loop_join_body_to_physical_op(
-    body: &super::body::NestLoopJoinBody,
+fn nest_loop_join_node_to_physical_op(
+    kind: &super::kind::DistributedNestLoopJoinNode,
 ) -> PhysicalNestLoopJoinOp {
     PhysicalNestLoopJoinOp {
-        join_type: body.join_type,
-        condition: body.condition.clone(),
+        join_type: kind.join_type,
+        condition: kind.condition.clone(),
     }
 }
 
-fn values_body_to_physical_op(body: &super::body::ValuesBody) -> PhysicalValuesOp {
+fn values_node_to_physical_op(kind: &super::kind::DistributedValuesNode) -> PhysicalValuesOp {
     PhysicalValuesOp {
-        rows: body.rows.clone(),
-        columns: body.columns.clone(),
+        rows: kind.rows.clone(),
+        columns: kind.columns.clone(),
     }
 }
 
-fn assert_one_row_body_to_physical_op(
-    body: &super::body::AssertOneRowBody,
+fn assert_one_row_node_to_physical_op(
+    kind: &super::kind::DistributedAssertOneRowNode,
 ) -> PhysicalAssertOneRowOp {
     PhysicalAssertOneRowOp {
-        subquery_text: body.subquery_text.clone(),
+        subquery_text: kind.subquery_text.clone(),
     }
 }
 
-fn decode_body_to_physical_op(body: &super::body::DecodeBody) -> PhysicalDecodeOp {
+fn decode_node_to_physical_op(kind: &super::kind::DistributedDecodeNode) -> PhysicalDecodeOp {
     PhysicalDecodeOp {
-        mappings: body.mappings.clone(),
-        output_columns: body.output_columns.clone(),
+        mappings: kind.mappings.clone(),
+        output_columns: kind.output_columns.clone(),
     }
 }
 
-fn repeat_body_to_physical_op(body: &super::body::RepeatBody) -> PhysicalRepeatOp {
+fn repeat_node_to_physical_op(kind: &super::kind::DistributedRepeatNode) -> PhysicalRepeatOp {
     PhysicalRepeatOp {
-        repeat_column_ref_list: body.repeat_column_ref_list.clone(),
-        repeat_column_ref_ids: body.repeat_column_ref_ids.clone(),
-        grouping_ids: body.grouping_ids.clone(),
-        all_rollup_columns: body.all_rollup_columns.clone(),
-        all_rollup_column_ids: body.all_rollup_column_ids.clone(),
-        grouping_key_aliases: body.grouping_key_aliases.clone(),
-        grouping_fn_args: body.grouping_fn_args.clone(),
-        grouping_fn_arg_ids: body.grouping_fn_arg_ids.clone(),
-        grouping_fn_ids: body.grouping_fn_ids.clone(),
+        repeat_column_ref_list: kind.repeat_column_ref_list.clone(),
+        repeat_column_ref_ids: kind.repeat_column_ref_ids.clone(),
+        grouping_ids: kind.grouping_ids.clone(),
+        all_rollup_columns: kind.all_rollup_columns.clone(),
+        all_rollup_column_ids: kind.all_rollup_column_ids.clone(),
+        grouping_key_aliases: kind.grouping_key_aliases.clone(),
+        grouping_fn_args: kind.grouping_fn_args.clone(),
+        grouping_fn_arg_ids: kind.grouping_fn_arg_ids.clone(),
+        grouping_fn_ids: kind.grouping_fn_ids.clone(),
     }
 }
 
-fn generate_series_body_to_physical_op(
-    body: &super::body::GenerateSeriesBody,
+fn generate_series_node_to_physical_op(
+    kind: &super::kind::DistributedGenerateSeriesNode,
 ) -> PhysicalGenerateSeriesOp {
     PhysicalGenerateSeriesOp {
-        start: body.start,
-        end: body.end,
-        step: body.step,
-        column_name: body.column_name.clone(),
-        alias: body.alias.clone(),
-        output_column_id: body.output_column_id,
+        start: kind.start,
+        end: kind.end,
+        step: kind.step,
+        column_name: kind.column_name.clone(),
+        alias: kind.alias.clone(),
+        output_column_id: kind.output_column_id,
     }
 }
 
-fn table_function_body_to_physical_op(
-    body: &super::body::TableFunctionBody,
+fn table_function_node_to_physical_op(
+    kind: &super::kind::DistributedTableFunctionNode,
 ) -> PhysicalTableFunctionOp {
     PhysicalTableFunctionOp {
-        function_name: body.function_name.clone(),
-        args: body.args.clone(),
-        output_columns: body.output_columns.clone(),
-        alias: body.alias.clone(),
-        is_left_join: body.is_left_join,
+        function_name: kind.function_name.clone(),
+        args: kind.args.clone(),
+        output_columns: kind.output_columns.clone(),
+        alias: kind.alias.clone(),
+        is_left_join: kind.is_left_join,
     }
 }
 
-fn project_body_output_columns(body: &super::body::ProjectBody) -> Vec<AnalysisOutputColumn> {
-    body.items
+fn project_node_output_columns(
+    kind: &super::kind::DistributedProjectNode,
+) -> Vec<AnalysisOutputColumn> {
+    kind.items
         .iter()
         .map(|item| AnalysisOutputColumn {
             column_id: item.output_column_id,
