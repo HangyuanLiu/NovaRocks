@@ -1,0 +1,21 @@
+-- query 5
+region	amount	rk	avg_amt
+A	200	1	200
+A	100	2	150
+B	400	1	400
+B	300	2	350
+C	20	1	20
+C	10	2	15
+
+-- query 6
+region	amount	rk
+A	100	2
+A	50	3
+B	300	2
+B	150	3
+C	10	2
+
+-- query 7
+region	amount	rk
+B	400	1
+B	300	2

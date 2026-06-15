@@ -1,0 +1,23 @@
+-- query 5
+region	amount	rk
+A	200	1
+A	100	2
+B	400	1
+B	300	2
+C	20	1
+C	10	2
+
+-- query 7
+region	amount	rk
+A	200	1
+A	100	2
+B	400	1
+B	300	2
+C	20	1
+C	10	2
+
+-- query 9
+region	amount	rn
+A	200	1
+B	400	1
+C	20	1
