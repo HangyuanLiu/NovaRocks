@@ -125,7 +125,8 @@ impl DistributedPlanBuilder {
                     }
                     if !limit_child_can_apply_offset_locally(child_plan) {
                         return Err(
-                            "LIMIT/OFFSET without a SORT child is not supported".to_string()
+                            "LIMIT/OFFSET without a local SORT/TOPN child is not supported"
+                                .to_string(),
                         );
                     }
                 }
@@ -138,11 +139,13 @@ impl DistributedPlanBuilder {
                         sort.offset = op.offset;
                     }
                     DistributedPlanNodeBody::TopN(topn) => {
+                        topn.limit = op.limit;
                         topn.offset = op.offset;
                     }
                     _ if offset > 0 => {
                         return Err(
-                            "LIMIT/OFFSET without a SORT child is not supported".to_string()
+                            "LIMIT/OFFSET without a local SORT/TOPN child is not supported"
+                                .to_string(),
                         );
                     }
                     _ => {}

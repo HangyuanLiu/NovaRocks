@@ -86,6 +86,34 @@ mod tests {
     }
 
     #[test]
+    fn limit_over_top_n_overrides_top_n_limit_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "limit_over_top_n_overrides_top_n_limit",
+            limit_plan(
+                top_n_plan(scan_plan(), TopNPhase::Final, false, Some(10), Some(0)),
+                Some(5),
+                Some(2),
+            ),
+        );
+    }
+
+    #[test]
+    fn limit_over_aggregate_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "limit_over_aggregate",
+            limit_plan(aggregate_count_plan(scan_plan()), Some(3), None),
+        );
+    }
+
+    #[test]
+    fn limit_over_hash_join_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "limit_over_hash_join",
+            limit_plan(inner_hash_join_two_scans_plan(), Some(4), None),
+        );
+    }
+
+    #[test]
     fn top_n_final_single_over_scan_matches_direct_fragment_builder() {
         assert_distributed_plan_equivalent(
             "top_n_final_single_over_scan",
@@ -115,7 +143,7 @@ mod tests {
         assert_distributed_plan_error_contains(
             "limit_offset_without_sort_child",
             limit_plan(project_plan(scan_plan()), Some(5), Some(1)),
-            "LIMIT/OFFSET without a SORT child is not supported",
+            "LIMIT/OFFSET without a local SORT/TOPN child is not supported",
         );
     }
 
