@@ -28,7 +28,8 @@ use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
 use crate::sql::optimizer::rewrite::rules::utils::combine_and;
 use crate::sql::planner::plan::{
-    AggregateCall, AggregateNode, ApplyKind, AssertOneRowNode, JoinNode, LogicalPlan, ProjectNode,
+    AggregateCall, ApplyKind, LogicalAggregateNode, LogicalAssertOneRowNode, LogicalJoinNode,
+    LogicalPlanNode, LogicalPlanNodeKind, LogicalProjectNode,
 };
 use crate::sql::planner::plan_output_columns;
 
@@ -43,42 +44,59 @@ impl LogicalRewriteRule for ScalarApplyToJoin {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
-        matches!(plan, LogicalPlan::Apply(a) if a.kind == ApplyKind::Scalar)
+    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+        matches!(&plan.kind, LogicalPlanNodeKind::Apply(a) if a.kind == ApplyKind::Scalar)
     }
 
-    fn apply(&self, plan: LogicalPlan, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
-        let LogicalPlan::Apply(a) = plan else {
+    fn apply(
+        &self,
+        plan: LogicalPlanNode,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, String> {
+        let LogicalPlanNode {
+            kind,
+            mut children,
+            required_output_columns: _,
+        } = plan;
+        let LogicalPlanNodeKind::Apply(a) = &kind else {
             return Ok(RewriteResult::Unchanged);
         };
+        if children.len() != 2 {
+            return Ok(RewriteResult::Unchanged);
+        }
+        let right = children.remove(1);
+        let left = children.remove(0);
 
         // --- Uncorrelated arm ---
         if a.correlation_column_ids.is_empty() {
-            let provably_le_one_row = inner_is_provably_le_one_row(&a.right);
+            let provably_le_one_row = inner_is_provably_le_one_row(&right);
             // Capture info needed for output project before consuming a.
-            let left_ref = a.left.clone();
+            let left_ref = left.clone();
             let inner_output_column_id = a.inner_output_column_id;
             let output_col = a.output_column.clone();
-            let is_count = is_count_aggregate_result(&a.right, inner_output_column_id);
+            let is_count = is_count_aggregate_result(&right, inner_output_column_id);
             let inner_out_type =
-                find_column_type(&a.right, inner_output_column_id).unwrap_or(DataType::Null);
+                find_column_type(&right, inner_output_column_id).unwrap_or(DataType::Null);
 
             let inner_plan = if provably_le_one_row {
-                *a.right
+                right
             } else {
-                LogicalPlan::AssertOneRow(AssertOneRowNode {
-                    input: a.right,
-                    subquery_text: String::new(),
-                    required_output_columns: None,
-                })
+                LogicalPlanNode::new(
+                    LogicalPlanNodeKind::AssertOneRow(LogicalAssertOneRowNode {
+                        subquery_text: String::new(),
+                    }),
+                    vec![right],
+                    None,
+                )
             };
-            let join = LogicalPlan::Join(JoinNode {
-                left: a.left,
-                right: Box::new(inner_plan),
-                join_type: crate::sql::analysis::JoinKind::Cross,
-                condition: None,
-                required_output_columns: None,
-            });
+            let join = LogicalPlanNode::new(
+                LogicalPlanNodeKind::Join(LogicalJoinNode {
+                    join_type: crate::sql::analysis::JoinKind::Cross,
+                    condition: None,
+                }),
+                vec![left, inner_plan],
+                None,
+            );
             let project = build_output_project_from_parts(
                 join,
                 &left_ref,
@@ -101,20 +119,21 @@ impl LogicalRewriteRule for ScalarApplyToJoin {
         if !a.need_check_max_rows {
             let cond = combine_and(a.correlation_conjuncts.clone());
             // Capture info needed before consuming a.
-            let left_ref = a.left.clone();
+            let left_ref = left.clone();
             let inner_output_column_id = a.inner_output_column_id;
             let output_col = a.output_column.clone();
-            let is_count = is_count_aggregate_result(&a.right, inner_output_column_id);
+            let is_count = is_count_aggregate_result(&right, inner_output_column_id);
             let inner_out_type =
-                find_column_type(&a.right, inner_output_column_id).unwrap_or(DataType::Null);
+                find_column_type(&right, inner_output_column_id).unwrap_or(DataType::Null);
 
-            let join = LogicalPlan::Join(JoinNode {
-                left: a.left,
-                right: a.right,
-                join_type: crate::sql::analysis::JoinKind::LeftOuter,
-                condition: Some(cond),
-                required_output_columns: None,
-            });
+            let join = LogicalPlanNode::new(
+                LogicalPlanNodeKind::Join(LogicalJoinNode {
+                    join_type: crate::sql::analysis::JoinKind::LeftOuter,
+                    condition: Some(cond),
+                }),
+                vec![left, right],
+                None,
+            );
             let project = build_output_project_from_parts(
                 join,
                 &left_ref,
@@ -153,7 +172,7 @@ impl LogicalRewriteRule for ScalarApplyToJoin {
 
         // Find the inner scalar column's type from the inner plan.
         let inner_scalar_type =
-            find_column_type(&a.right, a.inner_output_column_id).unwrap_or(DataType::Null);
+            find_column_type(&right, a.inner_output_column_id).unwrap_or(DataType::Null);
 
         let cnt_id = factory.create(None, "count(1)".to_string(), DataType::Int64, false);
         let anyval_id = factory.create(
@@ -176,7 +195,7 @@ impl LogicalRewriteRule for ScalarApplyToJoin {
         // The analyzer's leading Project always selects the inner scalar column,
         // so any_value's arg (a.inner_output_column_id) always resolves without
         // needing explicit enforcement here.
-        let agg_input = ensure_exposes_columns(&a.right, &gk_exprs)?;
+        let agg_input = ensure_exposes_columns(&right, &gk_exprs)?;
 
         // Build group-key OutputColumns (reuse existing column ids, do NOT mint).
         let gk_output_cols: Vec<OutputColumn> = gk_exprs
@@ -247,29 +266,32 @@ impl LogicalRewriteRule for ScalarApplyToJoin {
             is_internal: false,
         });
 
-        let vector_agg = LogicalPlan::Aggregate(AggregateNode {
-            input: Box::new(agg_input),
-            group_by: gk_exprs,
-            aggregates: vec![cnt_agg, anyval_agg],
-            output_columns: agg_output_cols,
-            already_pushed: false,
-            required_output_columns: None,
-        });
+        let vector_agg = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: gk_exprs,
+                aggregates: vec![cnt_agg, anyval_agg],
+                output_columns: agg_output_cols,
+                already_pushed: false,
+            }),
+            vec![agg_input],
+            None,
+        );
 
         // LEFT OUTER JOIN on the correlation conjuncts.
         let cond = combine_and(a.correlation_conjuncts.clone());
-        let join = LogicalPlan::Join(JoinNode {
-            left: a.left.clone(),
-            right: Box::new(vector_agg),
-            join_type: crate::sql::analysis::JoinKind::LeftOuter,
-            condition: Some(cond),
-            required_output_columns: None,
-        });
+        let join = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: crate::sql::analysis::JoinKind::LeftOuter,
+                condition: Some(cond),
+            }),
+            vec![left.clone(), vector_agg],
+            None,
+        );
 
         // Build the output project.
         // Items: all left columns (pass-through) + anyval item (scalar output) +
         // internal assert_true item (row-check).
-        let left_cols = plan_output_columns(&a.left)?;
+        let left_cols = plan_output_columns(&left)?;
         let mut items: Vec<ProjectItem> = left_cols
             .iter()
             .map(|c| ProjectItem {
@@ -366,12 +388,14 @@ impl LogicalRewriteRule for ScalarApplyToJoin {
             output_column_id: assert_id,
         });
 
-        let project = LogicalPlan::Project(ProjectNode {
-            input: Box::new(join),
-            items,
-            output_qualifier: None,
-            required_output_columns: None,
-        });
+        let project = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items,
+                output_qualifier: None,
+            }),
+            vec![join],
+            None,
+        );
 
         // The assertion project item is a regular Project item. PruneProjectColumns
         // preserves it via the assert_true carve-out: items whose expr is an
@@ -387,11 +411,11 @@ impl LogicalRewriteRule for ScalarApplyToJoin {
 /// Returns true iff the plan is provably at most 1 row:
 /// - A global aggregate (empty group_by), possibly under a leading Project.
 /// - A Values node with at most 1 row.
-fn inner_is_provably_le_one_row(plan: &LogicalPlan) -> bool {
-    match plan {
-        LogicalPlan::Aggregate(agg) => agg.group_by.is_empty(),
-        LogicalPlan::Project(p) => inner_is_provably_le_one_row(&p.input),
-        LogicalPlan::Values(v) => v.rows.len() <= 1,
+fn inner_is_provably_le_one_row(plan: &LogicalPlanNode) -> bool {
+    match &plan.kind {
+        LogicalPlanNodeKind::Aggregate(agg) => agg.group_by.is_empty(),
+        LogicalPlanNodeKind::Project(_) => inner_is_provably_le_one_row(plan.unary_input()),
+        LogicalPlanNodeKind::Values(v) => v.rows.len() <= 1,
         _ => false,
     }
 }
@@ -406,13 +430,13 @@ fn inner_is_provably_le_one_row(plan: &LogicalPlan) -> bool {
 ///   (if true, wrap in `ifnull(..., 0)`)
 /// - `output_col` — the Apply's minted output column (id and name)
 fn build_output_project_from_parts(
-    child: LogicalPlan,
-    left: &LogicalPlan,
+    child: LogicalPlanNode,
+    left: &LogicalPlanNode,
     inner_output_column_id: ColumnId,
     inner_out_type: &DataType,
     is_count: bool,
     output_col: &OutputColumn,
-) -> Result<LogicalPlan, String> {
+) -> Result<LogicalPlanNode, String> {
     let left_cols = plan_output_columns(left)?;
     let mut items: Vec<ProjectItem> = left_cols
         .iter()
@@ -470,19 +494,21 @@ fn build_output_project_from_parts(
         output_column_id: output_col.column_id,
     });
 
-    Ok(LogicalPlan::Project(ProjectNode {
-        input: Box::new(child),
-        items,
-        output_qualifier: None,
-        required_output_columns: None,
-    }))
+    Ok(LogicalPlanNode::new(
+        LogicalPlanNodeKind::Project(LogicalProjectNode {
+            items,
+            output_qualifier: None,
+        }),
+        vec![child],
+        None,
+    ))
 }
 
 /// Walk the plan to find the data type of a column with the given id.
 /// Looks at Aggregate output_columns, Project items, Scan columns, and Values columns.
-fn find_column_type(plan: &LogicalPlan, col_id: ColumnId) -> Option<DataType> {
-    match plan {
-        LogicalPlan::Aggregate(agg) => {
+fn find_column_type(plan: &LogicalPlanNode, col_id: ColumnId) -> Option<DataType> {
+    match &plan.kind {
+        LogicalPlanNodeKind::Aggregate(agg) => {
             // Check output_columns.
             for oc in &agg.output_columns {
                 if oc.column_id == col_id {
@@ -490,18 +516,18 @@ fn find_column_type(plan: &LogicalPlan, col_id: ColumnId) -> Option<DataType> {
                 }
             }
             // Also check input for column type (for group-key sourced columns).
-            find_column_type(&agg.input, col_id)
+            find_column_type(plan.unary_input(), col_id)
         }
-        LogicalPlan::Project(p) => {
+        LogicalPlanNodeKind::Project(p) => {
             for item in &p.items {
                 if item.output_column_id == col_id {
                     return Some(item.expr.data_type.clone());
                 }
             }
-            find_column_type(&p.input, col_id)
+            find_column_type(plan.unary_input(), col_id)
         }
-        LogicalPlan::Filter(f) => find_column_type(&f.input, col_id),
-        LogicalPlan::Scan(s) => {
+        LogicalPlanNodeKind::Filter(_) => find_column_type(plan.unary_input(), col_id),
+        LogicalPlanNodeKind::Scan(s) => {
             for oc in &s.columns {
                 if oc.column_id == col_id {
                     return Some(oc.data_type.clone());
@@ -509,7 +535,7 @@ fn find_column_type(plan: &LogicalPlan, col_id: ColumnId) -> Option<DataType> {
             }
             None
         }
-        LogicalPlan::Values(v) => {
+        LogicalPlanNodeKind::Values(v) => {
             for oc in &v.columns {
                 if oc.column_id == col_id {
                     return Some(oc.data_type.clone());
@@ -517,13 +543,13 @@ fn find_column_type(plan: &LogicalPlan, col_id: ColumnId) -> Option<DataType> {
             }
             None
         }
-        LogicalPlan::AssertOneRow(n) => find_column_type(&n.input, col_id),
+        LogicalPlanNodeKind::AssertOneRow(_) => find_column_type(plan.unary_input(), col_id),
         // Note: does not model outer-join null-extension (nullability may be
         // understated for columns from the null-extended side). This function
         // is only called on the inner subquery plan, never on a join, so this
         // is not a live issue in the current call sites.
-        LogicalPlan::Join(j) => {
-            find_column_type(&j.left, col_id).or_else(|| find_column_type(&j.right, col_id))
+        LogicalPlanNodeKind::Join(_) => {
+            find_column_type(plan.left(), col_id).or_else(|| find_column_type(plan.right(), col_id))
         }
         _ => None,
     }
@@ -535,13 +561,13 @@ fn find_column_type(plan: &LogicalPlan, col_id: ColumnId) -> Option<DataType> {
 /// When traversing a Project, the outer `col_id` must be mapped to the
 /// inner column id via the Project's items (a Project may rename a count
 /// aggregate output from id X to outer id Y; the Aggregate carries X, not Y).
-fn is_count_aggregate_result(plan: &LogicalPlan, col_id: ColumnId) -> bool {
-    match plan {
-        LogicalPlan::Aggregate(agg) => agg
+fn is_count_aggregate_result(plan: &LogicalPlanNode, col_id: ColumnId) -> bool {
+    match &plan.kind {
+        LogicalPlanNodeKind::Aggregate(agg) => agg
             .aggregates
             .iter()
             .any(|call| call.output_column_id == col_id && call.name == "count"),
-        LogicalPlan::Project(p) => {
+        LogicalPlanNodeKind::Project(p) => {
             // Translate col_id through the Project: find the ProjectItem whose
             // output_column_id == col_id, then follow its expr ColumnRef into
             // the child. This is necessary because apply_query_modifiers wraps
@@ -558,12 +584,12 @@ fn is_count_aggregate_result(plan: &LogicalPlan, col_id: ColumnId) -> bool {
                 }
             });
             if let Some(translated_id) = inner_id {
-                is_count_aggregate_result(&p.input, translated_id)
+                is_count_aggregate_result(plan.unary_input(), translated_id)
             } else {
                 false
             }
         }
-        LogicalPlan::Filter(f) => is_count_aggregate_result(&f.input, col_id),
+        LogicalPlanNodeKind::Filter(_) => is_count_aggregate_result(plan.unary_input(), col_id),
         _ => false,
     }
 }
@@ -579,11 +605,11 @@ fn is_count_aggregate_result(plan: &LogicalPlan, col_id: ColumnId) -> bool {
 /// leading Project always selects it, so any_value's arg resolves without
 /// explicit enforcement.
 fn ensure_exposes_columns(
-    plan: &LogicalPlan,
+    plan: &LogicalPlanNode,
     gk_exprs: &[TypedExpr],
-) -> Result<LogicalPlan, String> {
-    match plan {
-        LogicalPlan::Project(proj) => {
+) -> Result<LogicalPlanNode, String> {
+    match &plan.kind {
+        LogicalPlanNodeKind::Project(proj) => {
             let projected_ids: HashSet<ColumnId> =
                 proj.items.iter().map(|i| i.output_column_id).collect();
 
@@ -610,21 +636,24 @@ fn ensure_exposes_columns(
                 // Nothing added — return original.
                 Ok(plan.clone())
             } else {
-                Ok(LogicalPlan::Project(ProjectNode {
-                    input: proj.input.clone(),
-                    items: new_items,
-                    output_qualifier: proj.output_qualifier.clone(),
-                    required_output_columns: None,
-                }))
+                Ok(LogicalPlanNode::new(
+                    LogicalPlanNodeKind::Project(LogicalProjectNode {
+                        items: new_items,
+                        output_qualifier: proj.output_qualifier.clone(),
+                    }),
+                    vec![plan.unary_input().clone()],
+                    None,
+                ))
             }
         }
         // No leading Project: Scan/Filter already expose all columns.
-        other => Ok(other.clone()),
+        _ => Ok(plan.clone()),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::sql::planner::plan::*;
     use std::cell::RefCell;
     use std::collections::HashSet;
     use std::rc::Rc;
@@ -639,8 +668,8 @@ mod tests {
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rules::utils::collect_column_id_refs;
     use crate::sql::planner::plan::{
-        AggregateCall, AggregateNode, ApplyKind, ApplyNode, FilterNode, LogicalPlan, ScanNode,
-        ValuesNode,
+        AggregateCall, ApplyKind, LogicalAggregateNode, LogicalApplyNode, LogicalPlanNode,
+        LogicalPlanNodeKind, LogicalScanNode, LogicalValuesNode,
     };
 
     // ---- Column ID constants --------------------------------------------------
@@ -686,80 +715,88 @@ mod tests {
         }
     }
 
-    fn make_left_values() -> LogicalPlan {
-        LogicalPlan::Values(ValuesNode {
-            rows: vec![],
-            columns: vec![OutputColumn {
-                column_id: T1_K,
-                name: "k".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
-                is_internal: false,
-            }],
-            required_output_columns: None,
-        })
-    }
-
-    fn make_t2_scan() -> LogicalPlan {
-        LogicalPlan::Scan(ScanNode {
-            database: "default".to_string(),
-            table: TableDef {
-                name: "t2".to_string(),
-                columns: vec![],
-                iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::StarRocks {
-                    db_id: 0,
-                    table_id: 0,
-                },
-            },
-            alias: None,
-            columns: vec![
-                OutputColumn {
-                    column_id: T2_K,
+    fn make_left_values() -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Values(LogicalValuesNode {
+                rows: vec![],
+                columns: vec![OutputColumn {
+                    column_id: T1_K,
                     name: "k".to_string(),
                     data_type: DataType::Int64,
                     nullable: false,
                     is_internal: false,
+                }],
+            }),
+            vec![],
+            None,
+        )
+    }
+
+    fn make_t2_scan() -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "default".to_string(),
+                table: TableDef {
+                    name: "t2".to_string(),
+                    columns: vec![],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 0,
+                    },
                 },
-                OutputColumn {
-                    column_id: T2_V2,
-                    name: "v2".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
-                    is_internal: false,
-                },
-            ],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        })
+                alias: None,
+                columns: vec![
+                    OutputColumn {
+                        column_id: T2_K,
+                        name: "k".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        is_internal: false,
+                    },
+                    OutputColumn {
+                        column_id: T2_V2,
+                        name: "v2".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        is_internal: false,
+                    },
+                ],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        )
     }
 
     /// Build a scalar-aggregate inner: `Aggregate{group_by:[], max(v2)}(Scan t2)`.
-    fn make_scalar_agg_inner() -> LogicalPlan {
-        LogicalPlan::Aggregate(AggregateNode {
-            input: Box::new(make_t2_scan()),
-            group_by: vec![],
-            aggregates: vec![AggregateCall {
-                name: "max".to_string(),
-                args: vec![col_ref(T2_V2, "v2", DataType::Int64)],
-                distinct: false,
-                result_type: DataType::Int64,
-                order_by: vec![],
-                output_column_id: MAX_RESULT,
-            }],
-            output_columns: vec![OutputColumn {
-                column_id: MAX_RESULT,
-                name: "max(v2)".to_string(),
-                data_type: DataType::Int64,
-                nullable: true,
-                is_internal: false,
-            }],
-            already_pushed: false,
-            required_output_columns: None,
-        })
+    fn make_scalar_agg_inner() -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![],
+                aggregates: vec![AggregateCall {
+                    name: "max".to_string(),
+                    args: vec![col_ref(T2_V2, "v2", DataType::Int64)],
+                    distinct: false,
+                    result_type: DataType::Int64,
+                    order_by: vec![],
+                    output_column_id: MAX_RESULT,
+                }],
+                output_columns: vec![OutputColumn {
+                    column_id: MAX_RESULT,
+                    name: "max(v2)".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    is_internal: false,
+                }],
+                already_pushed: false,
+            }),
+            vec![make_t2_scan()],
+            None,
+        )
     }
 
     fn ctx_with_factory() -> RewriteContext {
@@ -778,27 +815,29 @@ mod tests {
         let rule = ScalarApplyToJoin;
         let mut ctx = ctx_with_factory();
 
-        let apply = LogicalPlan::Apply(ApplyNode {
-            left: Box::new(make_left_values()),
-            right: Box::new(make_scalar_agg_inner()),
-            kind: ApplyKind::Scalar,
-            subquery_expr: col_ref_nullable(APPLY_OUT, "subq", DataType::Int64),
-            output_column: OutputColumn {
-                column_id: APPLY_OUT,
-                name: "subq".to_string(),
-                data_type: DataType::Int64,
-                nullable: true,
-                is_internal: true,
-            },
-            inner_output_column_id: MAX_RESULT,
-            correlation_column_ids: vec![], // uncorrelated
-            correlation_conjuncts: vec![],
-            residual_predicate: None,
-            need_check_max_rows: true,
-            use_semi_anti: false,
-            uncorrelated_outer_predicate_columns: HashSet::new(),
-            required_output_columns: None,
-        });
+        let apply = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Apply(LogicalApplyNode {
+                kind: ApplyKind::Scalar,
+                subquery_expr: col_ref_nullable(APPLY_OUT, "subq", DataType::Int64),
+                output_column: OutputColumn {
+                    column_id: APPLY_OUT,
+                    name: "subq".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    is_internal: true,
+                },
+                inner_output_column_id: MAX_RESULT,
+                correlation_column_ids: vec![],
+                // uncorrelated
+                correlation_conjuncts: vec![],
+                residual_predicate: None,
+                need_check_max_rows: true,
+                use_semi_anti: false,
+                uncorrelated_outer_predicate_columns: HashSet::new(),
+            }),
+            vec![make_left_values(), make_scalar_agg_inner()],
+            None,
+        );
 
         assert!(rule.matches(&apply, &ctx));
         let result = rule.apply(apply, &mut ctx).expect("apply must not error");
@@ -809,13 +848,14 @@ mod tests {
         };
 
         // Outer shape: Project
-        let LogicalPlan::Project(proj) = &plan else {
+        let LogicalPlanNodeKind::Project(proj) = &plan.kind else {
             panic!("expected Project, got: {plan:?}");
         };
 
         // Project input: CrossJoin
-        let LogicalPlan::Join(join) = proj.input.as_ref() else {
-            panic!("expected Join under Project, got: {:?}", proj.input);
+        let join_plan = plan.unary_input();
+        let LogicalPlanNodeKind::Join(join) = &join_plan.kind else {
+            panic!("expected Join under Project, got: {:?}", join_plan);
         };
         assert_eq!(join.join_type, JoinKind::Cross, "must be CROSS JOIN");
         assert!(
@@ -825,9 +865,9 @@ mod tests {
 
         // The join's right side must be the Aggregate directly (no AssertOneRow).
         assert!(
-            matches!(join.right.as_ref(), LogicalPlan::Aggregate(_)),
+            matches!(&join_plan.right().kind, LogicalPlanNodeKind::Aggregate(_)),
             "right side must be Aggregate (no AssertOneRow for scalar agg); got: {:?}",
-            join.right
+            join_plan.right()
         );
 
         // Project items: T1_K (pass-through) + APPLY_OUT → MAX_RESULT
@@ -853,38 +893,42 @@ mod tests {
         let mut ctx = ctx_with_factory();
 
         // Inner: Project(v2) over Scan — not provably ≤1 row.
-        let inner = LogicalPlan::Project(ProjectNode {
-            input: Box::new(make_t2_scan()),
-            items: vec![ProjectItem {
-                expr: col_ref(T2_V2, "v2", DataType::Int64),
-                output_name: "v2".to_string(),
-                output_column_id: T2_V2,
-            }],
-            output_qualifier: None,
-            required_output_columns: None,
-        });
+        let inner = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![ProjectItem {
+                    expr: col_ref(T2_V2, "v2", DataType::Int64),
+                    output_name: "v2".to_string(),
+                    output_column_id: T2_V2,
+                }],
+                output_qualifier: None,
+            }),
+            vec![make_t2_scan()],
+            None,
+        );
 
-        let apply = LogicalPlan::Apply(ApplyNode {
-            left: Box::new(make_left_values()),
-            right: Box::new(inner),
-            kind: ApplyKind::Scalar,
-            subquery_expr: col_ref_nullable(APPLY_OUT, "subq", DataType::Int64),
-            output_column: OutputColumn {
-                column_id: APPLY_OUT,
-                name: "subq".to_string(),
-                data_type: DataType::Int64,
-                nullable: true,
-                is_internal: true,
-            },
-            inner_output_column_id: T2_V2,
-            correlation_column_ids: vec![], // uncorrelated
-            correlation_conjuncts: vec![],
-            residual_predicate: None,
-            need_check_max_rows: true,
-            use_semi_anti: false,
-            uncorrelated_outer_predicate_columns: HashSet::new(),
-            required_output_columns: None,
-        });
+        let apply = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Apply(LogicalApplyNode {
+                kind: ApplyKind::Scalar,
+                subquery_expr: col_ref_nullable(APPLY_OUT, "subq", DataType::Int64),
+                output_column: OutputColumn {
+                    column_id: APPLY_OUT,
+                    name: "subq".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    is_internal: true,
+                },
+                inner_output_column_id: T2_V2,
+                correlation_column_ids: vec![],
+                // uncorrelated
+                correlation_conjuncts: vec![],
+                residual_predicate: None,
+                need_check_max_rows: true,
+                use_semi_anti: false,
+                uncorrelated_outer_predicate_columns: HashSet::new(),
+            }),
+            vec![make_left_values(), inner],
+            None,
+        );
 
         assert!(rule.matches(&apply, &ctx));
         let result = rule.apply(apply, &mut ctx).expect("apply must not error");
@@ -894,23 +938,28 @@ mod tests {
             other => panic!("expected Changed, got: {other:?}"),
         };
 
-        let LogicalPlan::Project(proj) = &plan else {
+        let LogicalPlanNodeKind::Project(proj) = &plan.kind else {
             panic!("expected Project, got: {plan:?}");
         };
 
-        let LogicalPlan::Join(join) = proj.input.as_ref() else {
-            panic!("expected Join, got: {:?}", proj.input);
+        let join_plan = plan.unary_input();
+        let LogicalPlanNodeKind::Join(join) = &join_plan.kind else {
+            panic!("expected Join, got: {:?}", join_plan);
         };
         assert_eq!(join.join_type, JoinKind::Cross, "must be CROSS JOIN");
 
         // The right side must be AssertOneRow wrapping the Project.
-        let LogicalPlan::AssertOneRow(assert_node) = join.right.as_ref() else {
-            panic!("right side must be AssertOneRow; got: {:?}", join.right);
+        let assert_plan = join_plan.right();
+        let LogicalPlanNodeKind::AssertOneRow(_assert_node) = &assert_plan.kind else {
+            panic!("right side must be AssertOneRow; got: {:?}", assert_plan);
         };
         assert!(
-            matches!(assert_node.input.as_ref(), LogicalPlan::Project(_)),
+            matches!(
+                &assert_plan.unary_input().kind,
+                LogicalPlanNodeKind::Project(_)
+            ),
             "AssertOneRow input must be Project; got: {:?}",
-            assert_node.input
+            assert_plan.unary_input()
         );
 
         // Project items: T1_K + APPLY_OUT → T2_V2
@@ -933,36 +982,38 @@ mod tests {
 
         // The vector aggregate after PushDownApplyAggFilter:
         // Aggregate{group_by:[t2.k], max(v2)}(Scan t2)
-        let vector_agg = LogicalPlan::Aggregate(AggregateNode {
-            input: Box::new(make_t2_scan()),
-            group_by: vec![col_ref(T2_K, "k", DataType::Int64)],
-            aggregates: vec![AggregateCall {
-                name: "max".to_string(),
-                args: vec![col_ref(T2_V2, "v2", DataType::Int64)],
-                distinct: false,
-                result_type: DataType::Int64,
-                order_by: vec![],
-                output_column_id: MAX_RESULT,
-            }],
-            output_columns: vec![
-                OutputColumn {
-                    column_id: T2_K,
-                    name: "k".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
-                    is_internal: false,
-                },
-                OutputColumn {
-                    column_id: MAX_RESULT,
-                    name: "max(v2)".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: true,
-                    is_internal: false,
-                },
-            ],
-            already_pushed: false,
-            required_output_columns: None,
-        });
+        let vector_agg = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![col_ref(T2_K, "k", DataType::Int64)],
+                aggregates: vec![AggregateCall {
+                    name: "max".to_string(),
+                    args: vec![col_ref(T2_V2, "v2", DataType::Int64)],
+                    distinct: false,
+                    result_type: DataType::Int64,
+                    order_by: vec![],
+                    output_column_id: MAX_RESULT,
+                }],
+                output_columns: vec![
+                    OutputColumn {
+                        column_id: T2_K,
+                        name: "k".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        is_internal: false,
+                    },
+                    OutputColumn {
+                        column_id: MAX_RESULT,
+                        name: "max(v2)".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: true,
+                        is_internal: false,
+                    },
+                ],
+                already_pushed: false,
+            }),
+            vec![make_t2_scan()],
+            None,
+        );
 
         // Correlation conjunct: T1_K == T2_K
         let corr_conjunct = eq_expr(
@@ -970,27 +1021,29 @@ mod tests {
             col_ref(T2_K, "k", DataType::Int64),
         );
 
-        let apply = LogicalPlan::Apply(ApplyNode {
-            left: Box::new(make_left_values()),
-            right: Box::new(vector_agg),
-            kind: ApplyKind::Scalar,
-            subquery_expr: col_ref_nullable(APPLY_OUT, "subq", DataType::Int64),
-            output_column: OutputColumn {
-                column_id: APPLY_OUT,
-                name: "subq".to_string(),
-                data_type: DataType::Int64,
-                nullable: true,
-                is_internal: true,
-            },
-            inner_output_column_id: MAX_RESULT,
-            correlation_column_ids: vec![T1_K],
-            correlation_conjuncts: vec![corr_conjunct],
-            residual_predicate: None,
-            need_check_max_rows: false, // PushDownApplyAggFilter already ran
-            use_semi_anti: false,
-            uncorrelated_outer_predicate_columns: HashSet::new(),
-            required_output_columns: None,
-        });
+        let apply = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Apply(LogicalApplyNode {
+                kind: ApplyKind::Scalar,
+                subquery_expr: col_ref_nullable(APPLY_OUT, "subq", DataType::Int64),
+                output_column: OutputColumn {
+                    column_id: APPLY_OUT,
+                    name: "subq".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    is_internal: true,
+                },
+                inner_output_column_id: MAX_RESULT,
+                correlation_column_ids: vec![T1_K],
+                correlation_conjuncts: vec![corr_conjunct],
+                residual_predicate: None,
+                need_check_max_rows: false,
+                // PushDownApplyAggFilter already ran
+                use_semi_anti: false,
+                uncorrelated_outer_predicate_columns: HashSet::new(),
+            }),
+            vec![make_left_values(), vector_agg],
+            None,
+        );
 
         assert!(rule.matches(&apply, &ctx));
         let result = rule.apply(apply, &mut ctx).expect("apply must not error");
@@ -1000,12 +1053,13 @@ mod tests {
             other => panic!("expected Changed, got: {other:?}"),
         };
 
-        let LogicalPlan::Project(proj) = &plan else {
+        let LogicalPlanNodeKind::Project(proj) = &plan.kind else {
             panic!("expected Project, got: {plan:?}");
         };
 
-        let LogicalPlan::Join(join) = proj.input.as_ref() else {
-            panic!("expected Join, got: {:?}", proj.input);
+        let join_plan = plan.unary_input();
+        let LogicalPlanNodeKind::Join(join) = &join_plan.kind else {
+            panic!("expected Join, got: {:?}", join_plan);
         };
         assert_eq!(
             join.join_type,
@@ -1056,27 +1110,30 @@ mod tests {
             col_ref(T2_K, "k", DataType::Int64),
         );
 
-        let apply = LogicalPlan::Apply(ApplyNode {
-            left: Box::new(make_left_values()),
-            right: Box::new(make_t2_scan()), // simple scan, no agg
-            kind: ApplyKind::Scalar,
-            subquery_expr: col_ref_nullable(APPLY_OUT, "subq", DataType::Int64),
-            output_column: OutputColumn {
-                column_id: APPLY_OUT,
-                name: "subq".to_string(),
-                data_type: DataType::Int64,
-                nullable: true,
-                is_internal: true,
-            },
-            inner_output_column_id: T2_V2,
-            correlation_column_ids: vec![T1_K],
-            correlation_conjuncts: vec![corr_conjunct],
-            residual_predicate: None,
-            need_check_max_rows: true, // PushDownApplyFilter ran; non-agg needs row check
-            use_semi_anti: false,
-            uncorrelated_outer_predicate_columns: HashSet::new(),
-            required_output_columns: None,
-        });
+        let apply = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Apply(LogicalApplyNode {
+                // simple scan, no agg
+                kind: ApplyKind::Scalar,
+                subquery_expr: col_ref_nullable(APPLY_OUT, "subq", DataType::Int64),
+                output_column: OutputColumn {
+                    column_id: APPLY_OUT,
+                    name: "subq".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    is_internal: true,
+                },
+                inner_output_column_id: T2_V2,
+                correlation_column_ids: vec![T1_K],
+                correlation_conjuncts: vec![corr_conjunct],
+                residual_predicate: None,
+                need_check_max_rows: true,
+                // PushDownApplyFilter ran; non-agg needs row check
+                use_semi_anti: false,
+                uncorrelated_outer_predicate_columns: HashSet::new(),
+            }),
+            vec![make_left_values(), make_t2_scan()],
+            None,
+        );
 
         assert!(rule.matches(&apply, &ctx));
         let result = rule.apply(apply, &mut ctx).expect("apply must not error");
@@ -1087,13 +1144,14 @@ mod tests {
         };
 
         // Outer shape: Project
-        let LogicalPlan::Project(proj) = &plan else {
+        let LogicalPlanNodeKind::Project(proj) = &plan.kind else {
             panic!("expected Project, got: {plan:?}");
         };
 
         // Join: LeftOuter
-        let LogicalPlan::Join(join) = proj.input.as_ref() else {
-            panic!("expected Join, got: {:?}", proj.input);
+        let join_plan = plan.unary_input();
+        let LogicalPlanNodeKind::Join(join) = &join_plan.kind else {
+            panic!("expected Join, got: {:?}", join_plan);
         };
         assert_eq!(
             join.join_type,
@@ -1108,8 +1166,8 @@ mod tests {
         assert!(cond_ids.contains(&T2_K), "condition must reference T2_K");
 
         // Right side: Aggregate with group_by=[T2_K], count(1), any_value(T2_V2)
-        let LogicalPlan::Aggregate(agg) = join.right.as_ref() else {
-            panic!("right side must be Aggregate; got: {:?}", join.right);
+        let LogicalPlanNodeKind::Aggregate(agg) = &join_plan.right().kind else {
+            panic!("right side must be Aggregate; got: {:?}", join_plan.right());
         };
 
         // group_by must contain T2_K.
@@ -1262,29 +1320,30 @@ mod tests {
         let rule = ScalarApplyToJoin;
         let mut ctx = ctx_with_factory();
 
-        let apply = LogicalPlan::Apply(ApplyNode {
-            left: Box::new(make_left_values()),
-            right: Box::new(make_t2_scan()),
-            kind: ApplyKind::Scalar,
-            subquery_expr: col_ref_nullable(APPLY_OUT, "subq", DataType::Int64),
-            output_column: OutputColumn {
-                column_id: APPLY_OUT,
-                name: "subq".to_string(),
-                data_type: DataType::Int64,
-                nullable: true,
-                is_internal: true,
-            },
-            inner_output_column_id: T2_V2,
-            // correlation_column_ids non-empty but correlation_conjuncts is empty
-            // (push-down rule hasn't run yet)
-            correlation_column_ids: vec![T1_K],
-            correlation_conjuncts: vec![],
-            residual_predicate: None,
-            need_check_max_rows: true,
-            use_semi_anti: false,
-            uncorrelated_outer_predicate_columns: HashSet::new(),
-            required_output_columns: None,
-        });
+        let apply = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Apply(LogicalApplyNode {
+                kind: ApplyKind::Scalar,
+                subquery_expr: col_ref_nullable(APPLY_OUT, "subq", DataType::Int64),
+                output_column: OutputColumn {
+                    column_id: APPLY_OUT,
+                    name: "subq".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    is_internal: true,
+                },
+                inner_output_column_id: T2_V2,
+                // correlation_column_ids non-empty but correlation_conjuncts is empty
+                // (push-down rule hasn't run yet)
+                correlation_column_ids: vec![T1_K],
+                correlation_conjuncts: vec![],
+                residual_predicate: None,
+                need_check_max_rows: true,
+                use_semi_anti: false,
+                uncorrelated_outer_predicate_columns: HashSet::new(),
+            }),
+            vec![make_left_values(), make_t2_scan()],
+            None,
+        );
 
         assert!(rule.matches(&apply, &ctx));
         let result = rule.apply(apply, &mut ctx).expect("apply must not error");

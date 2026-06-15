@@ -13,7 +13,7 @@ use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::planner::plan::LogicalPlan;
+use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind};
 
 pub(crate) struct PruneFilterColumns;
 
@@ -26,13 +26,13 @@ impl LogicalRewriteRule for PruneFilterColumns {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
-        matches!(plan, LogicalPlan::Filter(_))
+    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+        matches!(&plan.kind, LogicalPlanNodeKind::Filter(_))
     }
 
     fn apply(
         &self,
-        _plan: LogicalPlan,
+        _plan: LogicalPlanNode,
         _ctx: &mut RewriteContext,
     ) -> Result<RewriteResult, String> {
         // No-op: Filter has no own output metadata to prune; column needs were
@@ -47,7 +47,8 @@ mod tests {
     use super::*;
     use crate::sql::analysis::TypedExpr;
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
-    use crate::sql::planner::plan::{FilterNode, ValuesNode};
+    use crate::sql::planner::plan::*;
+    use crate::sql::planner::plan::{LogicalFilterNode, LogicalPlanNodeKind, LogicalValuesNode};
 
     fn ctx() -> RewriteContext {
         RewriteContext::new(RewriteConsumer::Query)
@@ -65,17 +66,20 @@ mod tests {
 
     #[test]
     fn prune_filter_is_always_unchanged() {
-        let node = FilterNode {
-            input: Box::new(LogicalPlan::Values(ValuesNode {
-                rows: vec![],
-                columns: vec![],
-                required_output_columns: None,
-            })),
-            predicate: bool_literal(),
-            required_output_columns: None,
-        };
-
-        let plan = LogicalPlan::Filter(node);
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: bool_literal(),
+            }),
+            vec![LogicalPlanNode::new(
+                LogicalPlanNodeKind::Values(LogicalValuesNode {
+                    rows: vec![],
+                    columns: vec![],
+                }),
+                vec![],
+                None,
+            )],
+            None,
+        );
         let rule = PruneFilterColumns;
 
         // matches the right variant

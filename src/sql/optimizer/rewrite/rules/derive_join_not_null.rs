@@ -39,30 +39,40 @@ impl PlanRewriteRule for DeriveJoinNotNullPredicate {
         "DeriveJoinNotNullPredicate"
     }
 
-    fn matches(&self, plan: &LogicalPlan) -> bool {
-        matches!(plan, LogicalPlan::Join(_))
+    fn matches(&self, plan: &LogicalPlanNode) -> bool {
+        matches!(&plan.kind, LogicalPlanNodeKind::Join(_))
     }
 
-    fn apply(&self, plan: LogicalPlan) -> Option<LogicalPlan> {
-        let LogicalPlan::Join(join) = plan else {
+    fn apply(&self, plan: LogicalPlanNode) -> Option<LogicalPlanNode> {
+        let LogicalPlanNode {
+            kind,
+            mut children,
+            required_output_columns,
+        } = plan;
+        let LogicalPlanNodeKind::Join(join) = kind else {
             return None;
         };
+        if children.len() != 2 {
+            return None;
+        }
+        let right = children.remove(1);
+        let left = children.remove(0);
         let (derive_left, derive_right) = safe_sides(join.join_type);
         if !derive_left && !derive_right {
             return None;
         }
-        let keys = join_equi_keys(&join);
+        let keys = join_equi_keys(&join, &left, &right);
         if keys.is_empty() {
             return None;
         }
 
         let left_preds = if derive_left {
-            eligible_not_null(&join.left, keys.iter().map(|k| &k.left))
+            eligible_not_null(&left, keys.iter().map(|k| &k.left))
         } else {
             Vec::new()
         };
         let right_preds = if derive_right {
-            eligible_not_null(&join.right, keys.iter().map(|k| &k.right))
+            eligible_not_null(&right, keys.iter().map(|k| &k.right))
         } else {
             Vec::new()
         };
@@ -70,20 +80,17 @@ impl PlanRewriteRule for DeriveJoinNotNullPredicate {
             return None;
         }
 
-        let JoinNode {
-            left,
-            right,
-            join_type,
-            condition,
+        Some(LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: join.join_type,
+                condition: join.condition,
+            }),
+            vec![
+                wrap_not_null(left, left_preds),
+                wrap_not_null(right, right_preds),
+            ],
             required_output_columns,
-        } = join;
-        Some(LogicalPlan::Join(JoinNode {
-            left: Box::new(wrap_not_null(*left, left_preds)),
-            right: Box::new(wrap_not_null(*right, right_preds)),
-            join_type,
-            condition,
-            required_output_columns,
-        }))
+        ))
     }
 }
 
@@ -92,7 +99,7 @@ impl PlanRewriteRule for DeriveJoinNotNullPredicate {
 /// (b) not already guaranteed non-null by `child`'s predicate spine. Dedupe by
 /// column identity within the side.
 fn eligible_not_null<'a>(
-    child: &LogicalPlan,
+    child: &LogicalPlanNode,
     operands: impl Iterator<Item = &'a TypedExpr>,
 ) -> Vec<TypedExpr> {
     let guaranteed_ids = spine_not_null(child);
@@ -131,44 +138,46 @@ fn is_not_null(operand: TypedExpr) -> TypedExpr {
     }
 }
 
-fn wrap_not_null(child: LogicalPlan, preds: Vec<TypedExpr>) -> LogicalPlan {
+fn wrap_not_null(child: LogicalPlanNode, preds: Vec<TypedExpr>) -> LogicalPlanNode {
     if preds.is_empty() {
         return child;
     }
-    LogicalPlan::Filter(FilterNode {
-        input: Box::new(child),
-        predicate: combine_and(preds),
-        required_output_columns: None,
-    })
+    LogicalPlanNode::new(
+        LogicalPlanNodeKind::Filter(LogicalFilterNode {
+            predicate: combine_and(preds),
+        }),
+        vec![child],
+        None,
+    )
 }
 
 /// Walk `plan`'s predicate spine (passthrough single-input nodes down to the
 /// root scan) collecting column identities already guaranteed non-null by an
 /// `IS NOT NULL` conjunct. Used for idempotency / redundant-filter avoidance.
-fn spine_not_null(plan: &LogicalPlan) -> HashSet<ColumnId> {
+fn spine_not_null(plan: &LogicalPlanNode) -> HashSet<ColumnId> {
     let mut ids = HashSet::new();
     spine_not_null_inner(plan, &mut ids);
     ids
 }
 
-fn spine_not_null_inner(plan: &LogicalPlan, ids: &mut HashSet<ColumnId>) {
-    match plan {
-        LogicalPlan::Filter(f) => {
+fn spine_not_null_inner(plan: &LogicalPlanNode, ids: &mut HashSet<ColumnId>) {
+    match &plan.kind {
+        LogicalPlanNodeKind::Filter(f) => {
             for conj in split_and(f.predicate.clone()) {
                 record_not_null(&conj, ids);
             }
-            spine_not_null_inner(&f.input, ids);
+            spine_not_null_inner(plan.unary_input(), ids);
         }
-        LogicalPlan::Scan(s) => {
+        LogicalPlanNodeKind::Scan(s) => {
             for p in &s.predicates {
                 record_not_null(p, ids);
             }
         }
         // Project may rename columns; id-based matching remains valid through
         // passthrough projections and intentionally ignores name-only matches.
-        LogicalPlan::Project(p) => spine_not_null_inner(&p.input, ids),
-        LogicalPlan::Sort(s) => spine_not_null_inner(&s.input, ids),
-        LogicalPlan::Limit(l) => spine_not_null_inner(&l.input, ids),
+        LogicalPlanNodeKind::Project(_)
+        | LogicalPlanNodeKind::Sort(_)
+        | LogicalPlanNodeKind::Limit(_) => spine_not_null_inner(plan.unary_input(), ids),
         _ => {}
     }
 }
@@ -192,45 +201,49 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{BinOp, OutputColumn};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
+    use crate::sql::planner::plan::*;
 
-    fn scan(alias: &str, table: &str, cols: &[(&str, u32, bool)]) -> LogicalPlan {
-        LogicalPlan::Scan(ScanNode {
-            database: "default".to_string(),
-            table: TableDef {
-                name: table.to_string(),
+    fn scan(alias: &str, table: &str, cols: &[(&str, u32, bool)]) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "default".to_string(),
+                table: TableDef {
+                    name: table.to_string(),
+                    columns: cols
+                        .iter()
+                        .map(|(name, _, nullable)| ColumnDef {
+                            name: name.to_string(),
+                            data_type: DataType::Int32,
+                            nullable: *nullable,
+                            write_default: None,
+                            logical_type: None,
+                        })
+                        .collect(),
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 0,
+                    },
+                },
+                alias: Some(alias.to_string()),
                 columns: cols
                     .iter()
-                    .map(|(name, _, nullable)| ColumnDef {
+                    .map(|(name, id, nullable)| OutputColumn {
+                        column_id: ColumnId::new_for_test(*id),
                         name: name.to_string(),
                         data_type: DataType::Int32,
                         nullable: *nullable,
-                        write_default: None,
-                        logical_type: None,
+                        is_internal: false,
                     })
                     .collect(),
-                iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::StarRocks {
-                    db_id: 0,
-                    table_id: 0,
-                },
-            },
-            alias: Some(alias.to_string()),
-            columns: cols
-                .iter()
-                .map(|(name, id, nullable)| OutputColumn {
-                    column_id: ColumnId::new_for_test(*id),
-                    name: name.to_string(),
-                    data_type: DataType::Int32,
-                    nullable: *nullable,
-                    is_internal: false,
-                })
-                .collect(),
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        })
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        )
     }
 
     fn col(qualifier: &str, name: &str, id: u32, nullable: bool) -> TypedExpr {
@@ -271,34 +284,39 @@ mod tests {
 
     fn join(
         jt: JoinKind,
-        left: LogicalPlan,
-        right: LogicalPlan,
+        left: LogicalPlanNode,
+        right: LogicalPlanNode,
         cond: Option<TypedExpr>,
-    ) -> LogicalPlan {
-        LogicalPlan::Join(JoinNode {
-            left: Box::new(left),
-            right: Box::new(right),
-            join_type: jt,
-            condition: cond,
-            required_output_columns: None,
-        })
+    ) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: jt,
+                condition: cond,
+            }),
+            vec![left, right],
+            None,
+        )
     }
 
     /// (left_child_is_filter, right_child_is_filter) for the rule's output.
-    fn side_filters(out: Option<LogicalPlan>) -> (bool, bool) {
+    fn side_filters(out: Option<LogicalPlanNode>) -> (bool, bool) {
         match out {
             None => (false, false),
-            Some(LogicalPlan::Join(j)) => (
-                matches!(*j.left, LogicalPlan::Filter(_)),
-                matches!(*j.right, LogicalPlan::Filter(_)),
-            ),
-            Some(_) => panic!("rule must return a Join"),
+            Some(plan) => {
+                let LogicalPlanNodeKind::Join(_) = &plan.kind else {
+                    panic!("rule must return a Join");
+                };
+                (
+                    matches!(&plan.left().kind, LogicalPlanNodeKind::Filter(_)),
+                    matches!(&plan.right().kind, LogicalPlanNodeKind::Filter(_)),
+                )
+            }
         }
     }
 
     /// Count IS NOT NULL conjuncts in a Filter's predicate (0 if not a Filter).
-    fn not_null_count(plan: &LogicalPlan) -> usize {
-        let LogicalPlan::Filter(f) = plan else {
+    fn not_null_count(plan: &LogicalPlanNode) -> usize {
+        let LogicalPlanNodeKind::Filter(f) = &plan.kind else {
             return 0;
         };
         split_and(f.predicate.clone())
@@ -307,7 +325,7 @@ mod tests {
             .count()
     }
 
-    fn inner_eq_join(left_nullable: bool, right_nullable: bool) -> LogicalPlan {
+    fn inner_eq_join(left_nullable: bool, right_nullable: bool) -> LogicalPlanNode {
         join(
             JoinKind::Inner,
             scan("l", "tl", &[("a", 1, left_nullable)]),
@@ -377,11 +395,14 @@ mod tests {
                 eq(col("l", "a2", 3, true), col("r", "b2", 4, true)),
             )),
         );
-        let Some(LogicalPlan::Join(j)) = DeriveJoinNotNullPredicate.apply(plan) else {
+        let Some(rewritten) = DeriveJoinNotNullPredicate.apply(plan) else {
             panic!("expected join");
         };
-        assert_eq!(not_null_count(&j.left), 2);
-        assert_eq!(not_null_count(&j.right), 2);
+        let LogicalPlanNodeKind::Join(_) = &rewritten.kind else {
+            panic!("expected join");
+        };
+        assert_eq!(not_null_count(rewritten.left()), 2);
+        assert_eq!(not_null_count(rewritten.right()), 2);
     }
 
     #[test]
@@ -409,10 +430,10 @@ mod tests {
         }
         let mut left = scan("l", "tl", &[("a", 1, true)]);
         let mut right = scan("r", "tr", &[("b", 2, true)]);
-        if let LogicalPlan::Scan(s) = &mut left {
+        if let LogicalPlanNodeKind::Scan(s) = &mut left.kind {
             s.predicates.push(not_null(col("l", "a", 1, true)));
         }
-        if let LogicalPlan::Scan(s) = &mut right {
+        if let LogicalPlanNodeKind::Scan(s) = &mut right.kind {
             s.predicates.push(not_null(col("r", "b", 2, true)));
         }
         let plan = join(

@@ -1,4 +1,4 @@
-//! Converts a `LogicalPlan` tree into Memo groups.
+//! Converts a `LogicalPlanNode` tree into Memo groups.
 
 use super::memo::{GroupId, MExpr, Memo};
 use super::operator::{
@@ -8,15 +8,15 @@ use super::operator::{
     LogicalRepeatOp, LogicalScanOp, LogicalSortOp, LogicalTableFunctionOp, LogicalUnionOp,
     LogicalValuesOp, LogicalWindowOp, Operator,
 };
-use crate::sql::planner::plan::LogicalPlan;
+use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind};
 
-/// Recursively convert a `LogicalPlan` tree into Memo groups.
+/// Recursively convert a `LogicalPlanNode` tree into Memo groups.
 ///
 /// Each plan node becomes a new Group containing a single logical MExpr.
 /// Child plan references become child `GroupId`s.
-pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> GroupId {
-    match plan {
-        LogicalPlan::Scan(node) => {
+pub(crate) fn logical_plan_to_memo(plan: &LogicalPlanNode, memo: &mut Memo) -> GroupId {
+    match &plan.kind {
+        LogicalPlanNodeKind::Scan(node) => {
             let op = Operator::LogicalScan(LogicalScanOp {
                 database: node.database.clone(),
                 table: node.table.clone(),
@@ -36,8 +36,8 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
             memo.new_group(expr)
         }
 
-        LogicalPlan::Filter(node) => {
-            let child = logical_plan_to_memo(&node.input, memo);
+        LogicalPlanNodeKind::Filter(node) => {
+            let child = logical_plan_to_memo(plan.unary_input(), memo);
             let op = Operator::LogicalFilter(LogicalFilterOp {
                 predicate: node.predicate.clone(),
             });
@@ -49,8 +49,8 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
             memo.new_group(expr)
         }
 
-        LogicalPlan::Project(node) => {
-            let child = logical_plan_to_memo(&node.input, memo);
+        LogicalPlanNodeKind::Project(node) => {
+            let child = logical_plan_to_memo(plan.unary_input(), memo);
             let op = Operator::LogicalProject(LogicalProjectOp {
                 items: node.items.clone(),
                 output_qualifier: node.output_qualifier.clone(),
@@ -63,8 +63,8 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
             memo.new_group(expr)
         }
 
-        LogicalPlan::Aggregate(node) => {
-            let child = logical_plan_to_memo(&node.input, memo);
+        LogicalPlanNodeKind::Aggregate(node) => {
+            let child = logical_plan_to_memo(plan.unary_input(), memo);
             let op = Operator::LogicalAggregate(LogicalAggregateOp::single(
                 node.group_by.clone(),
                 node.aggregates.clone(),
@@ -78,9 +78,9 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
             memo.new_group(expr)
         }
 
-        LogicalPlan::Join(node) => {
-            let left = logical_plan_to_memo(&node.left, memo);
-            let right = logical_plan_to_memo(&node.right, memo);
+        LogicalPlanNodeKind::Join(node) => {
+            let left = logical_plan_to_memo(plan.left(), memo);
+            let right = logical_plan_to_memo(plan.right(), memo);
             let op = Operator::LogicalJoin(LogicalJoinOp {
                 join_type: node.join_type,
                 condition: node.condition.clone(),
@@ -93,8 +93,8 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
             memo.new_group(expr)
         }
 
-        LogicalPlan::Sort(node) => {
-            let child = logical_plan_to_memo(&node.input, memo);
+        LogicalPlanNodeKind::Sort(node) => {
+            let child = logical_plan_to_memo(plan.unary_input(), memo);
             let op = Operator::LogicalSort(LogicalSortOp {
                 items: node.items.clone(),
                 analytic_partition_exprs: node.analytic_partition_by.clone(),
@@ -109,8 +109,8 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
             memo.new_group(expr)
         }
 
-        LogicalPlan::Limit(node) => {
-            let child = logical_plan_to_memo(&node.input, memo);
+        LogicalPlanNodeKind::Limit(node) => {
+            let child = logical_plan_to_memo(plan.unary_input(), memo);
             let op = Operator::LogicalLimit(LogicalLimitOp {
                 limit: node.limit,
                 offset: node.offset,
@@ -123,14 +123,14 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
             memo.new_group(expr)
         }
 
-        LogicalPlan::Union(node) => {
-            let child_output_columns = node
-                .inputs
+        LogicalPlanNodeKind::Union(node) => {
+            let child_output_columns = plan
+                .children
                 .iter()
                 .map(|input| crate::sql::planner::plan_output_columns(input).unwrap_or_default())
                 .collect();
-            let children: Vec<GroupId> = node
-                .inputs
+            let children: Vec<GroupId> = plan
+                .children
                 .iter()
                 .map(|input| logical_plan_to_memo(input, memo))
                 .collect();
@@ -147,14 +147,14 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
             memo.new_group(expr)
         }
 
-        LogicalPlan::Intersect(node) => {
-            let child_output_columns = node
-                .inputs
+        LogicalPlanNodeKind::Intersect(node) => {
+            let child_output_columns = plan
+                .children
                 .iter()
                 .map(|input| crate::sql::planner::plan_output_columns(input).unwrap_or_default())
                 .collect();
-            let children: Vec<GroupId> = node
-                .inputs
+            let children: Vec<GroupId> = plan
+                .children
                 .iter()
                 .map(|input| logical_plan_to_memo(input, memo))
                 .collect();
@@ -170,14 +170,14 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
             memo.new_group(expr)
         }
 
-        LogicalPlan::Except(node) => {
-            let child_output_columns = node
-                .inputs
+        LogicalPlanNodeKind::Except(node) => {
+            let child_output_columns = plan
+                .children
                 .iter()
                 .map(|input| crate::sql::planner::plan_output_columns(input).unwrap_or_default())
                 .collect();
-            let children: Vec<GroupId> = node
-                .inputs
+            let children: Vec<GroupId> = plan
+                .children
                 .iter()
                 .map(|input| logical_plan_to_memo(input, memo))
                 .collect();
@@ -193,7 +193,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
             memo.new_group(expr)
         }
 
-        LogicalPlan::Values(node) => {
+        LogicalPlanNodeKind::Values(node) => {
             let op = Operator::LogicalValues(LogicalValuesOp {
                 rows: node.rows.clone(),
                 columns: node.columns.clone(),
@@ -206,7 +206,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
             memo.new_group(expr)
         }
 
-        LogicalPlan::GenerateSeries(node) => {
+        LogicalPlanNodeKind::GenerateSeries(node) => {
             let op = Operator::LogicalGenerateSeries(LogicalGenerateSeriesOp {
                 start: node.start,
                 end: node.end,
@@ -223,8 +223,8 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
             memo.new_group(expr)
         }
 
-        LogicalPlan::TableFunction(node) => {
-            let child = logical_plan_to_memo(&node.input, memo);
+        LogicalPlanNodeKind::TableFunction(node) => {
+            let child = logical_plan_to_memo(plan.unary_input(), memo);
             let op = Operator::LogicalTableFunction(LogicalTableFunctionOp {
                 function_name: node.function_name.clone(),
                 args: node.args.clone(),
@@ -240,8 +240,8 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
             memo.new_group(expr)
         }
 
-        LogicalPlan::Window(node) => {
-            let child = logical_plan_to_memo(&node.input, memo);
+        LogicalPlanNodeKind::Window(node) => {
+            let child = logical_plan_to_memo(plan.unary_input(), memo);
             let op = Operator::LogicalWindow(LogicalWindowOp {
                 window_exprs: node.window_exprs.clone(),
                 output_columns: node.output_columns.clone(),
@@ -254,8 +254,8 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
             memo.new_group(expr)
         }
 
-        LogicalPlan::Repeat(node) => {
-            let child = logical_plan_to_memo(&node.input, memo);
+        LogicalPlanNodeKind::Repeat(node) => {
+            let child = logical_plan_to_memo(plan.unary_input(), memo);
             let op = Operator::LogicalRepeat(LogicalRepeatOp {
                 repeat_column_ref_list: node.repeat_column_ref_list.clone(),
                 repeat_column_ref_ids: node.repeat_column_ref_ids.clone(),
@@ -275,7 +275,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
             memo.new_group(expr)
         }
 
-        LogicalPlan::CTEConsume(node) => {
+        LogicalPlanNodeKind::CTEConsume(node) => {
             let op = Operator::LogicalCTEConsume(LogicalCTEConsumeOp {
                 cte_id: node.cte_id,
                 alias: node.alias.clone(),
@@ -289,9 +289,9 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
             memo.new_group(expr)
         }
 
-        LogicalPlan::CTEAnchor(node) => {
-            let produce = logical_plan_to_memo(&node.produce, memo);
-            let consumer = logical_plan_to_memo(&node.consumer, memo);
+        LogicalPlanNodeKind::CTEAnchor(node) => {
+            let produce = logical_plan_to_memo(plan.child(0), memo);
+            let consumer = logical_plan_to_memo(plan.child(1), memo);
             let expr = MExpr {
                 id: memo.next_expr_id(),
                 op: Operator::LogicalCTEAnchor(LogicalCTEAnchorOp {
@@ -302,8 +302,8 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
             memo.new_group(expr)
         }
 
-        LogicalPlan::CTEProduce(node) => {
-            let child = logical_plan_to_memo(&node.input, memo);
+        LogicalPlanNodeKind::CTEProduce(node) => {
+            let child = logical_plan_to_memo(plan.unary_input(), memo);
             let op = Operator::LogicalCTEProduce(LogicalCTEProduceOp {
                 cte_id: node.cte_id,
                 output_columns: node.output_columns.clone(),
@@ -319,8 +319,8 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
             group_id
         }
 
-        LogicalPlan::Decode(node) => {
-            let child = logical_plan_to_memo(&node.input, memo);
+        LogicalPlanNodeKind::Decode(node) => {
+            let child = logical_plan_to_memo(plan.unary_input(), memo);
             let op = Operator::LogicalDecode(LogicalDecodeOp {
                 mappings: node.mappings.clone(),
                 output_columns: node.output_columns.clone(),
@@ -333,9 +333,9 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
             memo.new_group(expr)
         }
 
-        LogicalPlan::AggregateStateMerge(node) => {
-            let old_input = logical_plan_to_memo(&node.old_input, memo);
-            let delta_input = logical_plan_to_memo(&node.delta_input, memo);
+        LogicalPlanNodeKind::AggregateStateMerge(node) => {
+            let old_input = logical_plan_to_memo(plan.left(), memo);
+            let delta_input = logical_plan_to_memo(plan.right(), memo);
             let op = Operator::LogicalAggregateStateMerge(AggregateStateMergeOp {
                 group_key_names: node.group_key_names.clone(),
                 aggregate_state_names: node.aggregate_state_names.clone(),
@@ -350,8 +350,8 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
             memo.new_group(expr)
         }
 
-        LogicalPlan::AssertOneRow(node) => {
-            let child = logical_plan_to_memo(&node.input, memo);
+        LogicalPlanNodeKind::AssertOneRow(node) => {
+            let child = logical_plan_to_memo(plan.unary_input(), memo);
             let op = Operator::LogicalAssertOneRow(LogicalAssertOneRowOp {
                 subquery_text: node.subquery_text.clone(),
             });
@@ -362,7 +362,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
             };
             memo.new_group(expr)
         }
-        LogicalPlan::Apply(_) => {
+        LogicalPlanNodeKind::Apply(_) => {
             // Defence in depth: the SubqueryRewrite stage's ApplyException
             // rule and the optimize() residual-Apply backstop eliminate every
             // Apply before this point. Reaching here means a planner bug, so
@@ -371,7 +371,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
                 "apply operator must be eliminated by the SubqueryRewrite stage before memo conversion"
             );
         }
-        LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
+        LogicalPlanNodeKind::ImvDelta(_) | LogicalPlanNodeKind::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
         }
     }
@@ -385,8 +385,10 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::cascades_rules::implement::ScanToPhysical;
     use crate::sql::optimizer::rule::Rule;
+    use crate::sql::planner::plan::*;
     use crate::sql::planner::plan::{
-        FilterNode, ScanNode, ScanVariantColumn, UnionNode, ValuesNode,
+        LogicalFilterNode, LogicalPlanNodeKind, LogicalScanNode, LogicalUnionNode,
+        LogicalValuesNode, ScanVariantColumn,
     };
     use arrow::datatypes::DataType;
     use std::path::PathBuf;
@@ -429,19 +431,26 @@ mod tests {
         }
     }
 
-    fn values_with_columns(columns: Vec<OutputColumn>) -> LogicalPlan {
-        LogicalPlan::Values(ValuesNode {
-            rows: vec![],
-            columns,
-            required_output_columns: None,
-        })
+    fn values_with_columns(columns: Vec<OutputColumn>) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Values(LogicalValuesNode {
+                rows: vec![],
+                columns: columns,
+            }),
+            vec![],
+            None,
+        )
     }
 
     #[test]
     fn set_op_output_columns_survive_memo_stats_with_duplicate_names() {
         let target = vec![test_output_column(20, "dup"), test_output_column(21, "dup")];
-        let plan = LogicalPlan::Union(UnionNode {
-            inputs: vec![
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Union(LogicalUnionNode {
+                all: true,
+                output_columns: target.clone(),
+            }),
+            vec![
                 values_with_columns(vec![
                     test_output_column(10, "dup"),
                     test_output_column(11, "dup"),
@@ -451,10 +460,8 @@ mod tests {
                     test_output_column(13, "dup"),
                 ]),
             ],
-            all: true,
-            output_columns: target.clone(),
-            required_output_columns: None,
-        });
+            None,
+        );
 
         let mut memo = Memo::new();
         let root = logical_plan_to_memo(&plan, &mut memo);
@@ -490,17 +497,20 @@ mod tests {
 
     #[test]
     fn test_scan_to_memo() {
-        let scan = LogicalPlan::Scan(ScanNode {
-            database: "db".to_string(),
-            table: dummy_table_def(),
-            alias: None,
-            columns: dummy_output_columns(),
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        });
+        let scan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: dummy_table_def(),
+                alias: None,
+                columns: dummy_output_columns(),
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        );
 
         let mut memo = Memo::new();
         let gid = logical_plan_to_memo(&scan, &mut memo);
@@ -530,32 +540,35 @@ mod tests {
             strict: true,
         };
 
-        let scan = LogicalPlan::Scan(ScanNode {
-            database: "db".to_string(),
-            table: dummy_table_def(),
-            alias: None,
-            columns: vec![
-                OutputColumn {
-                    column_id: source_column_id,
-                    name: "payload".to_string(),
-                    data_type: DataType::LargeBinary,
-                    nullable: true,
-                    is_internal: false,
-                },
-                OutputColumn {
-                    column_id: synthetic_column_id,
-                    name: "__nr_var_payload_0".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: true,
-                    is_internal: true,
-                },
-            ],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![variant_descriptor.clone()],
-            required_output_columns: None,
-        });
+        let scan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: dummy_table_def(),
+                alias: None,
+                columns: vec![
+                    OutputColumn {
+                        column_id: source_column_id,
+                        name: "payload".to_string(),
+                        data_type: DataType::LargeBinary,
+                        nullable: true,
+                        is_internal: false,
+                    },
+                    OutputColumn {
+                        column_id: synthetic_column_id,
+                        name: "__nr_var_payload_0".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: true,
+                        is_internal: true,
+                    },
+                ],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![variant_descriptor.clone()],
+            }),
+            vec![],
+            None,
+        );
 
         let mut memo = Memo::new();
         let gid = logical_plan_to_memo(&scan, &mut memo);
@@ -583,17 +596,20 @@ mod tests {
 
     #[test]
     fn test_filter_scan_to_memo() {
-        let scan = LogicalPlan::Scan(ScanNode {
-            database: "db".to_string(),
-            table: dummy_table_def(),
-            alias: None,
-            columns: dummy_output_columns(),
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        });
+        let scan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: dummy_table_def(),
+                alias: None,
+                columns: dummy_output_columns(),
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        );
 
         let predicate = TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Bool(true)),
@@ -601,11 +617,13 @@ mod tests {
             nullable: false,
         };
 
-        let filter = LogicalPlan::Filter(FilterNode {
-            input: Box::new(scan),
-            predicate,
-            required_output_columns: None,
-        });
+        let filter = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: predicate,
+            }),
+            vec![scan],
+            None,
+        );
 
         let mut memo = Memo::new();
         let gid = logical_plan_to_memo(&filter, &mut memo);
@@ -633,38 +651,45 @@ mod tests {
 
     #[test]
     fn test_cte_anchor_to_memo() {
-        let scan = LogicalPlan::Scan(ScanNode {
-            database: "db".to_string(),
-            table: dummy_table_def(),
-            alias: None,
-            columns: dummy_output_columns(),
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        });
+        let scan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: dummy_table_def(),
+                alias: None,
+                columns: dummy_output_columns(),
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        );
 
-        let produce = LogicalPlan::CTEProduce(crate::sql::planner::plan::CTEProduceNode {
-            cte_id: 7,
-            input: Box::new(scan.clone()),
-            output_columns: dummy_output_columns(),
-            required_output_columns: None,
-        });
+        let produce = LogicalPlanNode::new(
+            LogicalPlanNodeKind::CTEProduce(LogicalCTEProduceNode {
+                cte_id: 7,
+                output_columns: dummy_output_columns(),
+            }),
+            vec![scan.clone()],
+            None,
+        );
 
-        let consume = LogicalPlan::CTEConsume(crate::sql::planner::plan::CTEConsumeNode {
-            cte_id: 7,
-            alias: "t".to_string(),
-            output_columns: dummy_output_columns(),
-            required_output_columns: None,
-        });
+        let consume = LogicalPlanNode::new(
+            LogicalPlanNodeKind::CTEConsume(LogicalCTEConsumeNode {
+                cte_id: 7,
+                alias: "t".to_string(),
+                output_columns: dummy_output_columns(),
+            }),
+            vec![],
+            None,
+        );
 
-        let anchor = LogicalPlan::CTEAnchor(crate::sql::planner::plan::CTEAnchorNode {
-            cte_id: 7,
-            produce: Box::new(produce),
-            consumer: Box::new(consume),
-            required_output_columns: None,
-        });
+        let anchor = LogicalPlanNode::new(
+            LogicalPlanNodeKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: 7 }),
+            vec![produce, consume],
+            None,
+        );
 
         let mut memo = Memo::new();
         let gid = logical_plan_to_memo(&anchor, &mut memo);

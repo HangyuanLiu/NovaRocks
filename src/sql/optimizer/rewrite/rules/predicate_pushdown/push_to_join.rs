@@ -13,24 +13,54 @@ impl RewriteRule for PushDownPredicateJoin {
         "PushDownPredicateJoin"
     }
 
-    fn matches(&self, plan: &LogicalPlan) -> bool {
-        matches!(
-            plan,
-            LogicalPlan::Filter(f) if matches!(*f.input, LogicalPlan::Join(_))
-        ) || matches!(plan, LogicalPlan::Join(join) if join.condition.is_some())
+    fn matches(&self, plan: &LogicalPlanNode) -> bool {
+        matches!(&plan.kind, LogicalPlanNodeKind::Filter(_))
+            && matches!(&plan.unary_input().kind, LogicalPlanNodeKind::Join(_))
+            || matches!(&plan.kind, LogicalPlanNodeKind::Join(join) if join.condition.is_some())
     }
 
-    fn apply(&self, plan: LogicalPlan) -> Option<LogicalPlan> {
-        match plan {
-            LogicalPlan::Filter(filter) => {
-                let LogicalPlan::Join(join) = *filter.input else {
+    fn apply(&self, plan: LogicalPlanNode) -> Option<LogicalPlanNode> {
+        let LogicalPlanNode {
+            kind,
+            mut children,
+            required_output_columns,
+        } = plan;
+        match kind {
+            LogicalPlanNodeKind::Filter(filter) => {
+                if children.len() != 1 {
+                    return None;
+                }
+                let join_plan = children.remove(0);
+                let LogicalPlanNode {
+                    kind,
+                    mut children,
+                    required_output_columns,
+                } = join_plan;
+                let LogicalPlanNodeKind::Join(join) = kind else {
                     return None;
                 };
-                let (rewritten, changed) =
-                    push_filter_predicates_through_join(filter.predicate, join);
+                if children.len() != 2 {
+                    return None;
+                }
+                let right = children.remove(1);
+                let left = children.remove(0);
+                let (rewritten, changed) = push_filter_predicates_through_join(
+                    filter.predicate,
+                    join,
+                    left,
+                    right,
+                    required_output_columns,
+                );
                 changed.then_some(rewritten)
             }
-            LogicalPlan::Join(join) => push_join_condition_predicates(join),
+            LogicalPlanNodeKind::Join(join) => {
+                if children.len() != 2 {
+                    return None;
+                }
+                let right = children.remove(1);
+                let left = children.remove(0);
+                push_join_condition_predicates(join, left, right, required_output_columns)
+            }
             _ => None,
         }
     }

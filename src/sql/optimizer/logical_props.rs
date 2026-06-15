@@ -307,6 +307,7 @@ mod tests {
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::optimizer::memo::MExpr;
     use crate::sql::optimizer::operator::{LogicalFilterOp, LogicalJoinOp, LogicalScanOp};
+    use crate::sql::planner::plan::*;
     use std::path::PathBuf;
 
     fn col(id: u32, name: &str) -> TypedExpr {

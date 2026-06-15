@@ -26,21 +26,40 @@ impl RewriteRule for PushDownPredicateAggregate {
         "PushDownPredicateAggregate"
     }
 
-    fn matches(&self, plan: &LogicalPlan) -> bool {
-        matches!(
-            plan,
-            LogicalPlan::Filter(f)
-                if matches!(*f.input, LogicalPlan::Aggregate(ref a) if !aggregate_child_is_repeat(&a.input))
-        )
+    fn matches(&self, plan: &LogicalPlanNode) -> bool {
+        let LogicalPlanNodeKind::Filter(_) = &plan.kind else {
+            return false;
+        };
+        let input = plan.unary_input();
+        matches!(&input.kind, LogicalPlanNodeKind::Aggregate(_))
+            && !aggregate_child_is_repeat(input.unary_input())
     }
 
-    fn apply(&self, plan: LogicalPlan) -> Option<LogicalPlan> {
-        let LogicalPlan::Filter(filter) = plan else {
+    fn apply(&self, plan: LogicalPlanNode) -> Option<LogicalPlanNode> {
+        let LogicalPlanNode {
+            kind,
+            mut children,
+            required_output_columns: _,
+        } = plan;
+        let LogicalPlanNodeKind::Filter(filter) = kind else {
             return None;
         };
-        let LogicalPlan::Aggregate(agg) = *filter.input else {
+        if children.len() != 1 {
+            return None;
+        }
+        let aggregate_plan = children.remove(0);
+        let LogicalPlanNode {
+            kind,
+            mut children,
+            required_output_columns: aggregate_required_output_columns,
+        } = aggregate_plan;
+        let LogicalPlanNodeKind::Aggregate(agg) = kind else {
             return None;
         };
+        if children.len() != 1 {
+            return None;
+        }
+        let aggregate_input = children.remove(0);
 
         // ROLLUP/CUBE/GROUPING SETS guard: a Repeat below the aggregate
         // synthesizes subtotal rows where GROUP BY key columns are NULL in the
@@ -50,7 +69,7 @@ impl RewriteRule for PushDownPredicateAggregate {
         // (wrong results). It also breaks DeriveJoinNotNull idempotency
         // (spine_not_null stops at Aggregate), causing unbounded re-derivation
         // of the same filter and cardinality blowup.
-        if aggregate_child_is_repeat(&agg.input) {
+        if aggregate_child_is_repeat(&aggregate_input) {
             return None;
         }
 
@@ -90,15 +109,16 @@ impl RewriteRule for PushDownPredicateAggregate {
         }
 
         let pushed = combine_and(pushable);
-        let new_child = LogicalPlan::Filter(FilterNode {
-            input: agg.input,
-            predicate: pushed,
-            required_output_columns: None,
-        });
-        let new_agg = LogicalPlan::Aggregate(AggregateNode {
-            input: Box::new(new_child),
-            ..agg
-        });
+        let new_child = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode { predicate: pushed }),
+            vec![aggregate_input],
+            None,
+        );
+        let new_agg = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Aggregate(agg),
+            vec![new_child],
+            aggregate_required_output_columns,
+        );
         Some(wrap_remaining_filter(new_agg, remaining))
     }
 }
@@ -107,11 +127,12 @@ impl RewriteRule for PushDownPredicateAggregate {
 /// i.e. this is a ROLLUP / CUBE / GROUPING SETS aggregate whose GROUP BY keys
 /// can be NULL in its output, so output-level predicates must not be pushed
 /// below it.
-fn aggregate_child_is_repeat(plan: &LogicalPlan) -> bool {
-    match plan {
-        LogicalPlan::Repeat(_) => true,
-        LogicalPlan::Filter(f) => aggregate_child_is_repeat(&f.input),
-        LogicalPlan::Project(p) => aggregate_child_is_repeat(&p.input),
+fn aggregate_child_is_repeat(plan: &LogicalPlanNode) -> bool {
+    match &plan.kind {
+        LogicalPlanNodeKind::Repeat(_) => true,
+        LogicalPlanNodeKind::Filter(_) | LogicalPlanNodeKind::Project(_) => {
+            aggregate_child_is_repeat(plan.unary_input())
+        }
         _ => false,
     }
 }
@@ -122,6 +143,7 @@ mod tests {
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::planner::plan::*;
     use arrow::datatypes::DataType;
 
     fn test_col_id(name: &str) -> ColumnId {
@@ -169,78 +191,83 @@ mod tests {
         }
     }
 
-    fn scan_with_cols(cols: &[&str]) -> LogicalPlan {
-        LogicalPlan::Scan(ScanNode {
-            database: "db".into(),
-            table: TableDef {
-                name: "t".into(),
+    fn scan_with_cols(cols: &[&str]) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".into(),
+                table: TableDef {
+                    name: "t".into(),
+                    columns: cols
+                        .iter()
+                        .map(|n| ColumnDef {
+                            name: (*n).into(),
+                            data_type: DataType::Int64,
+                            nullable: true,
+                            write_default: None,
+                            logical_type: None,
+                        })
+                        .collect(),
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 0,
+                    },
+                },
+                alias: None,
                 columns: cols
                     .iter()
-                    .map(|n| ColumnDef {
+                    .map(|n| OutputColumn {
+                        column_id: test_col_id(n),
                         name: (*n).into(),
                         data_type: DataType::Int64,
                         nullable: true,
-                        write_default: None,
-                        logical_type: None,
+                        is_internal: false,
                     })
                     .collect(),
-                iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::StarRocks {
-                    db_id: 0,
-                    table_id: 0,
-                },
-            },
-            alias: None,
-            columns: cols
-                .iter()
-                .map(|n| OutputColumn {
-                    column_id: test_col_id(n),
-                    name: (*n).into(),
-                    data_type: DataType::Int64,
-                    nullable: true,
-                    is_internal: false,
-                })
-                .collect(),
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        })
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        )
     }
 
     /// Build Aggregate(Scan) with GROUP BY `a` and SUM(b).
-    fn agg_sum_b_group_by_a(input: LogicalPlan) -> LogicalPlan {
-        LogicalPlan::Aggregate(AggregateNode {
-            input: Box::new(input),
-            group_by: vec![col("a")],
-            aggregates: vec![AggregateCall {
-                name: "sum".into(),
-                args: vec![col("b")],
-                distinct: false,
-                result_type: DataType::Int64,
-                order_by: vec![],
-                output_column_id: test_col_id("sum_b"),
-            }],
-            output_columns: vec![
-                OutputColumn {
-                    column_id: test_col_id("a"),
-                    name: "a".into(),
-                    data_type: DataType::Int64,
-                    nullable: true,
-                    is_internal: false,
-                },
-                OutputColumn {
-                    column_id: test_col_id("sum_b"),
-                    name: "sum_b".into(),
-                    data_type: DataType::Int64,
-                    nullable: true,
-                    is_internal: false,
-                },
-            ],
-            already_pushed: false,
-            required_output_columns: None,
-        })
+    fn agg_sum_b_group_by_a(input: LogicalPlanNode) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![col("a")],
+                aggregates: vec![AggregateCall {
+                    name: "sum".into(),
+                    args: vec![col("b")],
+                    distinct: false,
+                    result_type: DataType::Int64,
+                    order_by: vec![],
+                    output_column_id: test_col_id("sum_b"),
+                }],
+                output_columns: vec![
+                    OutputColumn {
+                        column_id: test_col_id("a"),
+                        name: "a".into(),
+                        data_type: DataType::Int64,
+                        nullable: true,
+                        is_internal: false,
+                    },
+                    OutputColumn {
+                        column_id: test_col_id("sum_b"),
+                        name: "sum_b".into(),
+                        data_type: DataType::Int64,
+                        nullable: true,
+                        is_internal: false,
+                    },
+                ],
+                already_pushed: false,
+            }),
+            vec![input],
+            None,
+        )
     }
 
     // Test 1: WHERE a = 1, GROUP BY a, SUM(b)
@@ -250,21 +277,23 @@ mod tests {
     fn pushes_group_by_column_predicate() {
         let scan = scan_with_cols(&["a", "b"]);
         let agg = agg_sum_b_group_by_a(scan);
-        let filter = LogicalPlan::Filter(FilterNode {
-            input: Box::new(agg),
-            predicate: eq(col("a"), int_lit(1)),
-            required_output_columns: None,
-        });
+        let filter = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: eq(col("a"), int_lit(1)),
+            }),
+            vec![agg],
+            None,
+        );
 
         let rule = PushDownPredicateAggregate;
         assert!(rule.matches(&filter));
         let out = rule.apply(filter).expect("should rewrite");
 
         // Expected: Aggregate(Filter(Scan))
-        match out {
-            LogicalPlan::Aggregate(a) => match *a.input {
-                LogicalPlan::Filter(f) => match *f.input {
-                    LogicalPlan::Scan(_) => {}
+        match &out.kind {
+            LogicalPlanNodeKind::Aggregate(_) => match &out.unary_input().kind {
+                LogicalPlanNodeKind::Filter(_) => match &out.unary_input().unary_input().kind {
+                    LogicalPlanNodeKind::Scan(_) => {}
                     other => panic!("expected Scan under Filter, got {:?}", other),
                 },
                 other => panic!("expected Filter under Aggregate, got {:?}", other),
@@ -280,11 +309,13 @@ mod tests {
     fn does_not_push_aggregate_output_predicate() {
         let scan = scan_with_cols(&["a", "b"]);
         let agg = agg_sum_b_group_by_a(scan);
-        let filter = LogicalPlan::Filter(FilterNode {
-            input: Box::new(agg),
-            predicate: eq(col("sum_b"), int_lit(100)),
-            required_output_columns: None,
-        });
+        let filter = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: eq(col("sum_b"), int_lit(100)),
+            }),
+            vec![agg],
+            None,
+        );
 
         let rule = PushDownPredicateAggregate;
         assert!(rule.matches(&filter));
@@ -301,11 +332,13 @@ mod tests {
     fn does_not_push_constant_predicate() {
         let scan = scan_with_cols(&["a", "b"]);
         let agg = agg_sum_b_group_by_a(scan);
-        let filter = LogicalPlan::Filter(FilterNode {
-            input: Box::new(agg),
-            predicate: eq(int_lit(1), int_lit(1)),
-            required_output_columns: None,
-        });
+        let filter = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: eq(int_lit(1), int_lit(1)),
+            }),
+            vec![agg],
+            None,
+        );
 
         let rule = PushDownPredicateAggregate;
         assert!(rule.matches(&filter));

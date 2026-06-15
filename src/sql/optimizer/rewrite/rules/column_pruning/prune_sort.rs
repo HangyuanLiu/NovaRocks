@@ -13,7 +13,7 @@ use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::planner::plan::LogicalPlan;
+use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind};
 
 pub(crate) struct PruneSortColumns;
 
@@ -26,13 +26,13 @@ impl LogicalRewriteRule for PruneSortColumns {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
-        matches!(plan, LogicalPlan::Sort(_))
+    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+        matches!(&plan.kind, LogicalPlanNodeKind::Sort(_))
     }
 
     fn apply(
         &self,
-        _plan: LogicalPlan,
+        _plan: LogicalPlanNode,
         _ctx: &mut RewriteContext,
     ) -> Result<RewriteResult, String> {
         // No-op: Sort has no own output metadata to prune; column needs were
@@ -46,7 +46,8 @@ impl LogicalRewriteRule for PruneSortColumns {
 mod tests {
     use super::*;
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
-    use crate::sql::planner::plan::{SortNode, ValuesNode};
+    use crate::sql::planner::plan::*;
+    use crate::sql::planner::plan::{LogicalPlanNodeKind, LogicalSortNode, LogicalValuesNode};
 
     fn ctx() -> RewriteContext {
         RewriteContext::new(RewriteConsumer::Query)
@@ -54,20 +55,23 @@ mod tests {
 
     #[test]
     fn prune_sort_is_always_unchanged() {
-        let node = SortNode {
-            input: Box::new(LogicalPlan::Values(ValuesNode {
-                rows: vec![],
-                columns: vec![],
-                required_output_columns: None,
-            })),
-            items: vec![],
-            analytic_partition_by: vec![],
-            partition_limit: None,
-            topn_type: None,
-            required_output_columns: None,
-        };
-
-        let plan = LogicalPlan::Sort(node);
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Sort(LogicalSortNode {
+                items: vec![],
+                analytic_partition_by: vec![],
+                partition_limit: None,
+                topn_type: None,
+            }),
+            vec![LogicalPlanNode::new(
+                LogicalPlanNodeKind::Values(LogicalValuesNode {
+                    rows: vec![],
+                    columns: vec![],
+                }),
+                vec![],
+                None,
+            )],
+            None,
+        );
         let rule = PruneSortColumns;
 
         // matches the right variant

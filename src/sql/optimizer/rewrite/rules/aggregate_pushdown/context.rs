@@ -1,7 +1,7 @@
 //! Aggregate pushdown collector/rewriter shared state.
 
 use crate::sql::analysis::TypedExpr;
-use crate::sql::planner::plan::{AggregateCall, LogicalPlan};
+use crate::sql::planner::plan::{AggregateCall, LogicalPlanNode};
 
 pub(crate) type ColumnRefIdentity = (Option<String>, String);
 
@@ -29,8 +29,8 @@ pub(crate) struct AggregatePushDownContext {
 pub(crate) struct PushPlan {
     /// Which side of the original join the partial aggregate wraps.
     pub side: Side,
-    /// The chosen side's subtree (a `LogicalPlan::Scan` in v1).
-    pub target_subtree: LogicalPlan,
+    /// The chosen side's subtree (a `LogicalPlanNodeKind::Scan` in v1).
+    pub target_subtree: LogicalPlanNode,
     /// Group-by columns for the partial aggregate.
     pub partial_groupby: Vec<TypedExpr>,
     /// Aggregate calls to use at the partial stage. For v1 these are

@@ -26,7 +26,7 @@ pub(crate) use quantified_apply_to_join::QuantifiedApplyToJoin;
 pub(crate) use scalar_apply_to_join::ScalarApplyToJoin;
 
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::planner::plan::LogicalPlan;
+use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind};
 
 pub(crate) fn subquery_rewrite_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
     vec![
@@ -45,43 +45,16 @@ pub(crate) fn subquery_rewrite_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
 /// disabled the ApplyException rule via `disable_optimizer_rules`); a leaked
 /// Apply must surface as a user-readable error, never as the memo-conversion
 /// panic.
-pub(crate) fn find_residual_apply(plan: &LogicalPlan) -> Option<String> {
-    match plan {
-        LogicalPlan::Apply(node) => Some(apply_exception::apply_exception_message(node)),
-        LogicalPlan::Scan(_)
-        | LogicalPlan::Values(_)
-        | LogicalPlan::GenerateSeries(_)
-        | LogicalPlan::CTEConsume(_) => None,
-        LogicalPlan::Filter(n) => find_residual_apply(&n.input),
-        LogicalPlan::Project(n) => find_residual_apply(&n.input),
-        LogicalPlan::Aggregate(n) => find_residual_apply(&n.input),
-        LogicalPlan::Join(n) => {
-            find_residual_apply(&n.left).or_else(|| find_residual_apply(&n.right))
-        }
-        LogicalPlan::Sort(n) => find_residual_apply(&n.input),
-        LogicalPlan::Limit(n) => find_residual_apply(&n.input),
-        LogicalPlan::Union(n) => n.inputs.iter().find_map(find_residual_apply),
-        LogicalPlan::Intersect(n) => n.inputs.iter().find_map(find_residual_apply),
-        LogicalPlan::Except(n) => n.inputs.iter().find_map(find_residual_apply),
-        LogicalPlan::TableFunction(n) => find_residual_apply(&n.input),
-        LogicalPlan::Window(n) => find_residual_apply(&n.input),
-        LogicalPlan::Repeat(n) => find_residual_apply(&n.input),
-        LogicalPlan::CTEAnchor(n) => {
-            find_residual_apply(&n.produce).or_else(|| find_residual_apply(&n.consumer))
-        }
-        LogicalPlan::CTEProduce(n) => find_residual_apply(&n.input),
-        LogicalPlan::Decode(n) => find_residual_apply(&n.input),
-        LogicalPlan::AggregateStateMerge(n) => {
-            find_residual_apply(&n.old_input).or_else(|| find_residual_apply(&n.delta_input))
-        }
-        LogicalPlan::AssertOneRow(n) => find_residual_apply(&n.input),
-        LogicalPlan::ImvDelta(n) => find_residual_apply(&n.input),
-        LogicalPlan::ImvVersion(n) => find_residual_apply(&n.input),
+pub(crate) fn find_residual_apply(plan: &LogicalPlanNode) -> Option<String> {
+    match &plan.kind {
+        LogicalPlanNodeKind::Apply(node) => Some(apply_exception::apply_exception_message(node)),
+        _ => plan.children.iter().find_map(find_residual_apply),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::sql::planner::plan::*;
     use std::collections::HashMap;
     use std::collections::HashSet;
 
@@ -92,74 +65,81 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::registry::query_rewrite_pipeline;
-    use crate::sql::planner::plan::{ApplyKind, ApplyNode, LimitNode, ValuesNode};
+    use crate::sql::planner::plan::{
+        ApplyKind, LogicalApplyNode, LogicalLimitNode, LogicalPlanNodeKind, LogicalValuesNode,
+    };
 
-    fn empty_values() -> LogicalPlan {
-        LogicalPlan::Values(ValuesNode {
-            rows: vec![],
-            columns: vec![],
-            required_output_columns: None,
-        })
+    fn empty_values() -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Values(LogicalValuesNode {
+                rows: vec![],
+                columns: vec![],
+            }),
+            vec![],
+            None,
+        )
     }
 
-    fn apply_over_values() -> LogicalPlan {
-        LogicalPlan::Apply(ApplyNode {
-            left: Box::new(empty_values()),
-            right: Box::new(empty_values()),
-            kind: ApplyKind::Scalar,
-            subquery_expr: TypedExpr {
-                kind: ExprKind::ColumnRef {
-                    column_id: ColumnId(5),
-                    qualifier: None,
-                    column: "sq".to_string(),
+    fn apply_over_values() -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Apply(LogicalApplyNode {
+                kind: ApplyKind::Scalar,
+                subquery_expr: TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        column_id: ColumnId(5),
+                        qualifier: None,
+                        column: "sq".to_string(),
+                    },
+                    data_type: DataType::Int64,
+                    nullable: true,
                 },
-                data_type: DataType::Int64,
-                nullable: true,
-            },
-            output_column: OutputColumn {
-                column_id: ColumnId(5),
-                name: "sq".to_string(),
-                data_type: DataType::Int64,
-                nullable: true,
-                is_internal: true,
-            },
-            inner_output_column_id: ColumnId(5),
-            correlation_column_ids: vec![],
-            correlation_conjuncts: vec![],
-            residual_predicate: None,
-            need_check_max_rows: true,
-            use_semi_anti: false,
-            uncorrelated_outer_predicate_columns: HashSet::new(),
-            required_output_columns: None,
-        })
+                output_column: OutputColumn {
+                    column_id: ColumnId(5),
+                    name: "sq".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    is_internal: true,
+                },
+                inner_output_column_id: ColumnId(5),
+                correlation_column_ids: vec![],
+                correlation_conjuncts: vec![],
+                residual_predicate: None,
+                need_check_max_rows: true,
+                use_semi_anti: false,
+                uncorrelated_outer_predicate_columns: HashSet::new(),
+            }),
+            vec![empty_values(), empty_values()],
+            None,
+        )
     }
 
-    fn exists_apply_over_values() -> LogicalPlan {
-        LogicalPlan::Apply(ApplyNode {
-            left: Box::new(empty_values()),
-            right: Box::new(empty_values()),
-            kind: ApplyKind::Exists { negated: false },
-            subquery_expr: TypedExpr {
-                kind: ExprKind::Literal(LiteralValue::Bool(true)),
-                data_type: DataType::Boolean,
-                nullable: false,
-            },
-            output_column: OutputColumn {
-                column_id: ColumnId(6),
-                name: "exists".to_string(),
-                data_type: DataType::Boolean,
-                nullable: false,
-                is_internal: true,
-            },
-            inner_output_column_id: ColumnId(7),
-            correlation_column_ids: vec![],
-            correlation_conjuncts: vec![],
-            residual_predicate: None,
-            need_check_max_rows: false,
-            use_semi_anti: true,
-            uncorrelated_outer_predicate_columns: HashSet::new(),
-            required_output_columns: None,
-        })
+    fn exists_apply_over_values() -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Apply(LogicalApplyNode {
+                kind: ApplyKind::Exists { negated: false },
+                subquery_expr: TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::Bool(true)),
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                },
+                output_column: OutputColumn {
+                    column_id: ColumnId(6),
+                    name: "exists".to_string(),
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                    is_internal: true,
+                },
+                inner_output_column_id: ColumnId(7),
+                correlation_column_ids: vec![],
+                correlation_conjuncts: vec![],
+                residual_predicate: None,
+                need_check_max_rows: false,
+                use_semi_anti: true,
+                uncorrelated_outer_predicate_columns: HashSet::new(),
+            }),
+            vec![empty_values(), empty_values()],
+            None,
+        )
     }
 
     fn int_output_column(id: ColumnId, name: &str) -> OutputColumn {
@@ -184,39 +164,49 @@ mod tests {
         }
     }
 
-    fn in_apply_over_values() -> LogicalPlan {
+    fn in_apply_over_values() -> LogicalPlanNode {
         let outer_col = int_output_column(ColumnId(8), "outer_v");
         let inner_col = int_output_column(ColumnId(9), "inner_v");
 
-        LogicalPlan::Apply(ApplyNode {
-            left: Box::new(LogicalPlan::Values(ValuesNode {
-                rows: vec![],
-                columns: vec![outer_col.clone()],
-                required_output_columns: None,
-            })),
-            right: Box::new(LogicalPlan::Values(ValuesNode {
-                rows: vec![],
-                columns: vec![inner_col.clone()],
-                required_output_columns: None,
-            })),
-            kind: ApplyKind::In { negated: false },
-            subquery_expr: int_column_ref(outer_col.column_id, &outer_col.name),
-            output_column: OutputColumn {
-                column_id: ColumnId(10),
-                name: "in_result".to_string(),
-                data_type: DataType::Boolean,
-                nullable: false,
-                is_internal: true,
-            },
-            inner_output_column_id: inner_col.column_id,
-            correlation_column_ids: vec![],
-            correlation_conjuncts: vec![],
-            residual_predicate: None,
-            need_check_max_rows: false,
-            use_semi_anti: true,
-            uncorrelated_outer_predicate_columns: HashSet::new(),
-            required_output_columns: None,
-        })
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Apply(LogicalApplyNode {
+                kind: ApplyKind::In { negated: false },
+                subquery_expr: int_column_ref(outer_col.column_id, &outer_col.name),
+                output_column: OutputColumn {
+                    column_id: ColumnId(10),
+                    name: "in_result".to_string(),
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                    is_internal: true,
+                },
+                inner_output_column_id: inner_col.column_id,
+                correlation_column_ids: vec![],
+                correlation_conjuncts: vec![],
+                residual_predicate: None,
+                need_check_max_rows: false,
+                use_semi_anti: true,
+                uncorrelated_outer_predicate_columns: HashSet::new(),
+            }),
+            vec![
+                LogicalPlanNode::new(
+                    LogicalPlanNodeKind::Values(LogicalValuesNode {
+                        rows: vec![],
+                        columns: vec![outer_col.clone()],
+                    }),
+                    vec![],
+                    None,
+                ),
+                LogicalPlanNode::new(
+                    LogicalPlanNodeKind::Values(LogicalValuesNode {
+                        rows: vec![],
+                        columns: vec![inner_col.clone()],
+                    }),
+                    vec![],
+                    None,
+                ),
+            ],
+            None,
+        )
     }
 
     #[test]
@@ -282,11 +272,14 @@ mod tests {
 
     #[test]
     fn find_residual_apply_ignores_plain_plans() {
-        let plan = LogicalPlan::Values(ValuesNode {
-            rows: vec![],
-            columns: vec![],
-            required_output_columns: None,
-        });
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Values(LogicalValuesNode {
+                rows: vec![],
+                columns: vec![],
+            }),
+            vec![],
+            None,
+        );
         assert!(find_residual_apply(&plan).is_none());
     }
 
@@ -294,12 +287,14 @@ mod tests {
     fn find_residual_apply_finds_apply_nested_under_unary() {
         // Apply one level below a unary container: exercises the walker's
         // recursive descent, not just the root case.
-        let plan = LogicalPlan::Limit(LimitNode {
-            input: Box::new(apply_over_values()),
-            limit: Some(1),
-            offset: None,
-            required_output_columns: None,
-        });
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Limit(LogicalLimitNode {
+                limit: Some(1),
+                offset: None,
+            }),
+            vec![apply_over_values()],
+            None,
+        );
         let message = find_residual_apply(&plan).expect("walker must find the nested apply");
         assert!(
             message.contains("subquery decorrelation failed"),

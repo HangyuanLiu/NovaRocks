@@ -24,8 +24,8 @@ use crate::sql::optimizer::rewrite::rules::utils::{
     collect_column_id_refs, combine_and, split_and,
 };
 use crate::sql::planner::plan::{
-    AggregateCall, AggregateNode, ApplyKind, ApplyNode, FilterNode, LogicalPlan, SortNode,
-    WindowExpr, WindowNode,
+    AggregateCall, ApplyKind, LogicalAggregateNode, LogicalApplyNode, LogicalFilterNode,
+    LogicalPlanNode, LogicalPlanNodeKind, LogicalSortNode, LogicalWindowNode, WindowExpr,
 };
 use crate::sql::planner::plan_output_columns;
 
@@ -55,41 +55,48 @@ impl LogicalRewriteRule for ApplyToWindow {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
-        let LogicalPlan::Filter(f) = plan else {
+    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+        let LogicalPlanNodeKind::Filter(_) = &plan.kind else {
             return false;
         };
-        let LogicalPlan::Apply(a) = f.input.as_ref() else {
+        let apply = plan.unary_input();
+        let LogicalPlanNodeKind::Apply(a) = &apply.kind else {
             return false;
         };
         a.kind == ApplyKind::Scalar && !a.need_check_max_rows && !a.correlation_conjuncts.is_empty()
     }
 
-    fn apply(&self, plan: LogicalPlan, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
-        let LogicalPlan::Filter(f) = &plan else {
-            return Ok(RewriteResult::Unchanged);
-        };
-        let LogicalPlan::Apply(a) = f.input.as_ref() else {
-            return Ok(RewriteResult::Unchanged);
-        };
-        let Some(m) = check_preconditions(&f.predicate, a) else {
+    fn apply(
+        &self,
+        plan: LogicalPlanNode,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, String> {
+        let Some(m) = ({
+            let LogicalPlanNodeKind::Filter(f) = &plan.kind else {
+                return Ok(RewriteResult::Unchanged);
+            };
+            let apply = plan.unary_input();
+            let LogicalPlanNodeKind::Apply(a) = &apply.kind else {
+                return Ok(RewriteResult::Unchanged);
+            };
+            check_preconditions(&f.predicate, a, apply.left(), apply.right())
+        }) else {
             return Ok(RewriteResult::Unchanged);
         };
 
         // Re-own the pieces. (matches() guaranteed Filter(Apply).)
-        let LogicalPlan::Filter(f) = plan else {
-            unreachable!()
-        };
-        let LogicalPlan::Apply(a) = *f.input else {
+        let mut apply_plan = plan.into_single_child();
+        let (outer_subtree, apply_right) = apply_plan.take_two_children();
+        let LogicalPlanNodeKind::Apply(a) = apply_plan.kind else {
             unreachable!()
         };
 
         // --- 1. Remap the inner aggregate's args to the outer instance of the same physical column. ---
-        let outer_map = collect_scan_column_map(&a.left);
-        let inner_map = collect_scan_column_map(&a.right);
+        let outer_map = collect_scan_column_map(&outer_subtree);
+        let inner_map = collect_scan_column_map(&apply_right);
         // Collect the set of inner-scan ColumnIds upfront; used by post-condition guards.
         let inner_ids: HashSet<ColumnId> = inner_map.keys().copied().collect();
-        let outer_cols = plan_output_columns(&a.left)?;
+        let outer_cols = plan_output_columns(&outer_subtree)?;
         let mut phys_to_outer: HashMap<(TableIdentity, String), OutputColumn> = HashMap::new();
         for oc in &outer_cols {
             if let Some((tab, name)) = outer_map.get(&oc.column_id) {
@@ -141,15 +148,16 @@ impl LogicalRewriteRule for ApplyToWindow {
             .filter(|oc| !expr_struct_eq(oc, &m.subquery_conjunct))
             .cloned()
             .collect();
-        let outer_subtree = *a.left;
         let before_filtered = if before.is_empty() {
             outer_subtree
         } else {
-            LogicalPlan::Filter(FilterNode {
-                predicate: combine_and(before),
-                input: Box::new(outer_subtree),
-                required_output_columns: None,
-            })
+            LogicalPlanNode::new(
+                LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                    predicate: combine_and(before),
+                }),
+                vec![outer_subtree],
+                None,
+            )
         };
 
         // --- 4. Sort(partition keys) under the Window. ---
@@ -162,14 +170,16 @@ impl LogicalRewriteRule for ApplyToWindow {
                 nulls_first: true,
             })
             .collect();
-        let sorted = LogicalPlan::Sort(SortNode {
-            input: Box::new(before_filtered),
-            items: sort_items,
-            analytic_partition_by: m.partition_by.clone(),
-            partition_limit: None,
-            topn_type: None,
-            required_output_columns: None,
-        });
+        let sorted = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Sort(LogicalSortNode {
+                items: sort_items,
+                analytic_partition_by: m.partition_by.clone(),
+                partition_limit: None,
+                topn_type: None,
+            }),
+            vec![before_filtered],
+            None,
+        );
 
         // --- 5. Window node: output = base outer columns + the window column. ---
         let mut window_output = plan_output_columns(&sorted)?;
@@ -180,16 +190,18 @@ impl LogicalRewriteRule for ApplyToWindow {
             nullable: true,
             is_internal: true,
         });
-        let window = LogicalPlan::Window(WindowNode {
-            input: Box::new(sorted),
-            window_exprs: vec![win_expr],
-            output_columns: window_output,
-            required_output_columns: None,
-        });
+        let window = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Window(LogicalWindowNode {
+                window_exprs: vec![win_expr],
+                output_columns: window_output,
+            }),
+            vec![sorted],
+            None,
+        );
 
         // --- 6. after-window Filter = subquery comparison with APPLY_OUT replaced by the value expr. ---
         let value_expr = build_value_expr(
-            &a.right,
+            &apply_right,
             a.inner_output_column_id,
             m.inner_agg.output_column_id,
             win_id,
@@ -208,11 +220,13 @@ impl LogicalRewriteRule for ApplyToWindow {
         if collect_column_id_refs(&after_pred).contains(&a.output_column.column_id) {
             return Ok(RewriteResult::Unchanged); // APPLY_OUT survived (comparison used an unhandled node)
         }
-        let after = LogicalPlan::Filter(FilterNode {
-            predicate: after_pred,
-            input: Box::new(window),
-            required_output_columns: None,
-        });
+        let after = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: after_pred,
+            }),
+            vec![window],
+            None,
+        );
 
         Ok(RewriteResult::Changed(after))
     }
@@ -383,7 +397,7 @@ fn remap_inner_to_outer(
 /// `WIN_ID`. If there is no leading Project (bare aggregate, `inner_output_col_id
 /// == agg_out_col_id`), return a bare `ColumnRef(WIN_ID)`.
 fn build_value_expr(
-    apply_right: &LogicalPlan,
+    apply_right: &LogicalPlanNode,
     inner_output_col_id: ColumnId,
     agg_out_col_id: ColumnId,
     win_id: ColumnId,
@@ -392,7 +406,7 @@ fn build_value_expr(
     let win_ref = col_ref_expr(win_id, win_type);
     // Peel exactly one optional leading Project (single-leading-Project assumption:
     // PushDownApplyAggFilter inserts at most one Project above the Aggregate).
-    if let LogicalPlan::Project(proj) = apply_right {
+    if let LogicalPlanNodeKind::Project(proj) = &apply_right.kind {
         // Look for the Project item whose output id matches inner_output_col_id.
         for item in &proj.items {
             if item.output_column_id == inner_output_col_id {
@@ -558,10 +572,15 @@ fn expr_struct_eq(a: &TypedExpr, b: &TypedExpr) -> bool {
 
 /// Port of StarRocks ScalarApply2AnalyticRule's check() family. Returns the
 /// validated match data, or None if any precondition fails (-> caller Unchanged).
-pub(super) fn check_preconditions(where_pred: &TypedExpr, a: &ApplyNode) -> Option<WinMagicMatch> {
+pub(super) fn check_preconditions(
+    where_pred: &TypedExpr,
+    a: &LogicalApplyNode,
+    apply_left: &LogicalPlanNode,
+    apply_right: &LogicalPlanNode,
+) -> Option<WinMagicMatch> {
     // (0) Inner: peel optional leading Project, require a vector Aggregate with a
     // single non-DISTINCT whitelisted aggregate.
-    let agg = peel_to_aggregate(&a.right)?;
+    let agg = peel_to_aggregate(apply_right)?;
     if agg.aggregates.len() != 1 {
         return None;
     }
@@ -574,17 +593,17 @@ pub(super) fn check_preconditions(where_pred: &TypedExpr, a: &ApplyNode) -> Opti
     }
 
     // (1) No LIMIT and only whitelisted operators in either subtree.
-    if !operator_whitelist_ok(&a.left, false) {
+    if !operator_whitelist_ok(apply_left, false) {
         return None;
     }
-    if !operator_whitelist_ok(&a.right, true) {
+    if !operator_whitelist_ok(apply_right, true) {
         return None;
     }
 
     // (2) Table-set identity: outerTables == subqueryTables + exactly 1 extra;
     // no duplicate physical table on either side (rejects self-joins).
-    let outer_tabs = collect_table_ids(&a.left);
-    let sub_tabs = collect_table_ids(&a.right);
+    let outer_tabs = collect_table_ids(apply_left);
+    let sub_tabs = collect_table_ids(apply_right);
     let outer_set: HashSet<TableIdentity> = outer_tabs.iter().cloned().collect();
     let sub_set: HashSet<TableIdentity> = sub_tabs.iter().cloned().collect();
     if outer_tabs.len() != outer_set.len() || sub_tabs.len() != sub_set.len() {
@@ -605,7 +624,7 @@ pub(super) fn check_preconditions(where_pred: &TypedExpr, a: &ApplyNode) -> Opti
     // (3) Partition-by keys = outer side of each correlation conjunct. Verify each
     // outer side is a ColumnRef of `correlated_outer_table`.
     let corr_ids: HashSet<ColumnId> = a.correlation_column_ids.iter().copied().collect();
-    let col_map = collect_scan_column_map(&a.left);
+    let col_map = collect_scan_column_map(apply_left);
     let mut partition_by = Vec::new();
     for conj in &a.correlation_conjuncts {
         let (outer_side, _inner) = super::decorrelate_util::orient_eq(conj, &corr_ids)?;
@@ -622,8 +641,8 @@ pub(super) fn check_preconditions(where_pred: &TypedExpr, a: &ApplyNode) -> Opti
     // (4) Predicate identity (StarRocks checkPredicate, 4 steps). Use a phys map
     // spanning BOTH subtrees so inner/outer instances unify.
     let full_map = {
-        let mut m = collect_scan_column_map(&a.left);
-        m.extend(collect_scan_column_map(&a.right));
+        let mut m = collect_scan_column_map(apply_left);
+        m.extend(collect_scan_column_map(apply_right));
         m
     };
     let mut outer_conjuncts = split_and(where_pred.clone());
@@ -669,7 +688,7 @@ pub(super) fn check_preconditions(where_pred: &TypedExpr, a: &ApplyNode) -> Opti
     });
 
     // 4d. Remaining outer conjuncts must 1:1 phys-match the subquery's residual Filter conjuncts.
-    let mut sub_residual = subquery_residual_conjuncts(&a.right);
+    let mut sub_residual = subquery_residual_conjuncts(apply_right);
     if outer_conjuncts.len() != sub_residual.len() {
         return None;
     }
@@ -693,11 +712,11 @@ pub(super) fn check_preconditions(where_pred: &TypedExpr, a: &ApplyNode) -> Opti
     })
 }
 
-/// Peel optional leading Project and return the underlying AggregateNode, if any.
-fn peel_to_aggregate(plan: &LogicalPlan) -> Option<&AggregateNode> {
-    match plan {
-        LogicalPlan::Aggregate(agg) => Some(agg),
-        LogicalPlan::Project(p) => peel_to_aggregate(&p.input),
+/// Peel optional leading Project and return the underlying aggregate payload, if any.
+fn peel_to_aggregate(plan: &LogicalPlanNode) -> Option<&LogicalAggregateNode> {
+    match &plan.kind {
+        LogicalPlanNodeKind::Aggregate(agg) => Some(agg),
+        LogicalPlanNodeKind::Project(_) => peel_to_aggregate(plan.unary_input()),
         _ => None,
     }
 }
@@ -710,20 +729,21 @@ fn peel_to_aggregate(plan: &LogicalPlan) -> Option<&AggregateNode> {
 /// Aggregate.
 ///
 /// Any other node (Limit, Sort, Window, Union, Apply, …) returns `false`.
-fn operator_whitelist_ok(plan: &LogicalPlan, is_subquery: bool) -> bool {
-    match plan {
-        LogicalPlan::Scan(_) => true,
-        LogicalPlan::Filter(f) => operator_whitelist_ok(&f.input, is_subquery),
-        LogicalPlan::Project(p) => operator_whitelist_ok(&p.input, is_subquery),
-        LogicalPlan::Join(j) => {
+fn operator_whitelist_ok(plan: &LogicalPlanNode, is_subquery: bool) -> bool {
+    match &plan.kind {
+        LogicalPlanNodeKind::Scan(_) => true,
+        LogicalPlanNodeKind::Filter(_) | LogicalPlanNodeKind::Project(_) => {
+            operator_whitelist_ok(plan.unary_input(), is_subquery)
+        }
+        LogicalPlanNodeKind::Join(j) => {
             if j.join_type != crate::sql::analysis::JoinKind::Cross {
                 return false;
             }
-            operator_whitelist_ok(&j.left, is_subquery)
-                && operator_whitelist_ok(&j.right, is_subquery)
+            operator_whitelist_ok(plan.left(), is_subquery)
+                && operator_whitelist_ok(plan.right(), is_subquery)
         }
-        LogicalPlan::Aggregate(agg) if is_subquery => {
-            operator_whitelist_ok(&agg.input, is_subquery)
+        LogicalPlanNodeKind::Aggregate(_) if is_subquery => {
+            operator_whitelist_ok(plan.unary_input(), is_subquery)
         }
         _ => false,
     }
@@ -731,19 +751,22 @@ fn operator_whitelist_ok(plan: &LogicalPlan, is_subquery: bool) -> bool {
 
 /// Collect the residual (non-correlation) Filter conjuncts from the subquery's
 /// aggregate input, if a Filter is present.
-fn subquery_residual_conjuncts(apply_right: &LogicalPlan) -> Vec<TypedExpr> {
+fn subquery_residual_conjuncts(apply_right: &LogicalPlanNode) -> Vec<TypedExpr> {
     // Peel optional leading Project, then the Aggregate.
-    let agg = match apply_right {
-        LogicalPlan::Aggregate(a) => a,
-        LogicalPlan::Project(p) => match p.input.as_ref() {
-            LogicalPlan::Aggregate(a) => a,
-            _ => return vec![],
-        },
+    let aggregate_plan = match &apply_right.kind {
+        LogicalPlanNodeKind::Aggregate(_) => apply_right,
+        LogicalPlanNodeKind::Project(_) => {
+            let input = apply_right.unary_input();
+            match &input.kind {
+                LogicalPlanNodeKind::Aggregate(_) => input,
+                _ => return vec![],
+            }
+        }
         _ => return vec![],
     };
     // If the aggregate's input is a Filter, split its predicate into conjuncts.
-    match agg.input.as_ref() {
-        LogicalPlan::Filter(f) => split_and(f.predicate.clone()),
+    match &aggregate_plan.unary_input().kind {
+        LogicalPlanNodeKind::Filter(f) => split_and(f.predicate.clone()),
         _ => vec![],
     }
 }
@@ -766,8 +789,9 @@ mod tests {
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
     use crate::sql::planner::plan::{
-        AggregateCall, AggregateNode, ApplyKind, ApplyNode, FilterNode, JoinNode, LimitNode,
-        LogicalPlan, ProjectNode, ScanNode,
+        AggregateCall, ApplyKind, LogicalAggregateNode, LogicalApplyNode, LogicalFilterNode,
+        LogicalJoinNode, LogicalLimitNode, LogicalPlanNode, LogicalPlanNodeKind,
+        LogicalProjectNode, LogicalScanNode,
     };
 
     // ---- Column ID constants -------------------------------------------------
@@ -875,170 +899,182 @@ mod tests {
     }
 
     /// Build `Scan(lineitem, table_id=1)` for the outer left side (first instance).
-    fn make_outer_lineitem_scan() -> LogicalPlan {
-        LogicalPlan::Scan(ScanNode {
-            database: "default".to_string(),
-            table: TableDef {
-                name: "lineitem".to_string(),
-                columns: vec![],
-                iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::StarRocks {
-                    db_id: 0,
-                    table_id: 1,
+    fn make_outer_lineitem_scan() -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "default".to_string(),
+                table: TableDef {
+                    name: "lineitem".to_string(),
+                    columns: vec![],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 1,
+                    },
                 },
-            },
-            alias: None,
-            columns: vec![
-                OutputColumn {
-                    column_id: L_ORDERKEY,
-                    name: "l_orderkey".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
-                    is_internal: false,
-                },
-                OutputColumn {
-                    column_id: L_PARTKEY,
-                    name: "l_partkey".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
-                    is_internal: false,
-                },
-                OutputColumn {
-                    column_id: L_QUANTITY,
-                    name: "l_quantity".to_string(),
-                    data_type: DataType::Float64,
-                    nullable: false,
-                    is_internal: false,
-                },
-            ],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        })
+                alias: None,
+                columns: vec![
+                    OutputColumn {
+                        column_id: L_ORDERKEY,
+                        name: "l_orderkey".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        is_internal: false,
+                    },
+                    OutputColumn {
+                        column_id: L_PARTKEY,
+                        name: "l_partkey".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        is_internal: false,
+                    },
+                    OutputColumn {
+                        column_id: L_QUANTITY,
+                        name: "l_quantity".to_string(),
+                        data_type: DataType::Float64,
+                        nullable: false,
+                        is_internal: false,
+                    },
+                ],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        )
     }
 
     /// Build `Scan(part, table_id=2)`.
-    fn make_part_scan() -> LogicalPlan {
-        LogicalPlan::Scan(ScanNode {
-            database: "default".to_string(),
-            table: TableDef {
-                name: "part".to_string(),
-                columns: vec![],
-                iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::StarRocks {
-                    db_id: 0,
-                    table_id: 2,
+    fn make_part_scan() -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "default".to_string(),
+                table: TableDef {
+                    name: "part".to_string(),
+                    columns: vec![],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 2,
+                    },
                 },
-            },
-            alias: None,
-            columns: vec![
-                OutputColumn {
-                    column_id: P_PARTKEY,
-                    name: "p_partkey".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
-                    is_internal: false,
-                },
-                OutputColumn {
-                    column_id: P_BRAND,
-                    name: "p_brand".to_string(),
-                    data_type: DataType::Utf8,
-                    nullable: false,
-                    is_internal: false,
-                },
-            ],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        })
+                alias: None,
+                columns: vec![
+                    OutputColumn {
+                        column_id: P_PARTKEY,
+                        name: "p_partkey".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        is_internal: false,
+                    },
+                    OutputColumn {
+                        column_id: P_BRAND,
+                        name: "p_brand".to_string(),
+                        data_type: DataType::Utf8,
+                        nullable: false,
+                        is_internal: false,
+                    },
+                ],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        )
     }
 
     /// Build inner `Scan(lineitem, table_id=1)` — second instance with INNER_ ColumnIds.
-    fn make_inner_lineitem_scan() -> LogicalPlan {
-        LogicalPlan::Scan(ScanNode {
-            database: "default".to_string(),
-            table: TableDef {
-                name: "lineitem".to_string(),
-                columns: vec![],
-                iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::StarRocks {
-                    db_id: 0,
-                    table_id: 1,
+    fn make_inner_lineitem_scan() -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "default".to_string(),
+                table: TableDef {
+                    name: "lineitem".to_string(),
+                    columns: vec![],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 1,
+                    },
                 },
-            },
-            alias: None,
-            columns: vec![
-                OutputColumn {
-                    column_id: INNER_L_PARTKEY,
-                    name: "l_partkey".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
-                    is_internal: false,
-                },
-                OutputColumn {
-                    column_id: INNER_L_QUANTITY,
-                    name: "l_quantity".to_string(),
-                    data_type: DataType::Float64,
-                    nullable: false,
-                    is_internal: false,
-                },
-            ],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        })
+                alias: None,
+                columns: vec![
+                    OutputColumn {
+                        column_id: INNER_L_PARTKEY,
+                        name: "l_partkey".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        is_internal: false,
+                    },
+                    OutputColumn {
+                        column_id: INNER_L_QUANTITY,
+                        name: "l_quantity".to_string(),
+                        data_type: DataType::Float64,
+                        nullable: false,
+                        is_internal: false,
+                    },
+                ],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        )
     }
 
     /// Build outer left plan: `CrossJoin(lineitem_scan, part_scan)`.
-    fn make_outer_join() -> LogicalPlan {
-        LogicalPlan::Join(JoinNode {
-            left: Box::new(make_outer_lineitem_scan()),
-            right: Box::new(make_part_scan()),
-            join_type: JoinKind::Cross,
-            condition: None,
-            required_output_columns: None,
-        })
+    fn make_outer_join() -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: JoinKind::Cross,
+                condition: None,
+            }),
+            vec![make_outer_lineitem_scan(), make_part_scan()],
+            None,
+        )
     }
 
     /// Build inner aggregate: `Agg{group_by:[inner_l_partkey], avg(l_quantity)}(inner_scan)`.
     /// This is the post-PushDownApplyAggFilter shape.
-    fn make_inner_avg_agg() -> LogicalPlan {
-        LogicalPlan::Aggregate(AggregateNode {
-            input: Box::new(make_inner_lineitem_scan()),
-            group_by: vec![col_ref(INNER_L_PARTKEY, "l_partkey", DataType::Int64)],
-            aggregates: vec![AggregateCall {
-                name: "avg".to_string(),
-                args: vec![col_ref(INNER_L_QUANTITY, "l_quantity", DataType::Float64)],
-                distinct: false,
-                result_type: DataType::Float64,
-                order_by: vec![],
-                output_column_id: AVG_RESULT,
-            }],
-            output_columns: vec![
-                OutputColumn {
-                    column_id: INNER_L_PARTKEY,
-                    name: "l_partkey".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
-                    is_internal: false,
-                },
-                OutputColumn {
-                    column_id: AVG_RESULT,
-                    name: "avg(l_quantity)".to_string(),
-                    data_type: DataType::Float64,
-                    nullable: true,
-                    is_internal: false,
-                },
-            ],
-            already_pushed: false,
-            required_output_columns: None,
-        })
+    fn make_inner_avg_agg() -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![col_ref(INNER_L_PARTKEY, "l_partkey", DataType::Int64)],
+                aggregates: vec![AggregateCall {
+                    name: "avg".to_string(),
+                    args: vec![col_ref(INNER_L_QUANTITY, "l_quantity", DataType::Float64)],
+                    distinct: false,
+                    result_type: DataType::Float64,
+                    order_by: vec![],
+                    output_column_id: AVG_RESULT,
+                }],
+                output_columns: vec![
+                    OutputColumn {
+                        column_id: INNER_L_PARTKEY,
+                        name: "l_partkey".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        is_internal: false,
+                    },
+                    OutputColumn {
+                        column_id: AVG_RESULT,
+                        name: "avg(l_quantity)".to_string(),
+                        data_type: DataType::Float64,
+                        nullable: true,
+                        is_internal: false,
+                    },
+                ],
+                already_pushed: false,
+            }),
+            vec![make_inner_lineitem_scan()],
+            None,
+        )
     }
 
     /// Build the q17-shaped `Filter(Apply(...))` plan.
@@ -1051,34 +1087,35 @@ mod tests {
     /// Apply: left = CrossJoin(lineitem, part), right = avg_agg(inner_lineitem),
     ///        correlation_conjuncts = [part.p_partkey == inner.l_partkey],
     ///        need_check_max_rows = false.
-    fn winmagic_filter_apply() -> LogicalPlan {
+    fn winmagic_filter_apply() -> LogicalPlanNode {
         // Correlation conjunct: part.p_partkey == inner.l_partkey
         let corr_conj = eq_expr(
             col_ref(P_PARTKEY, "p_partkey", DataType::Int64),
             col_ref(INNER_L_PARTKEY, "l_partkey", DataType::Int64),
         );
 
-        let apply = LogicalPlan::Apply(ApplyNode {
-            left: Box::new(make_outer_join()),
-            right: Box::new(make_inner_avg_agg()),
-            kind: ApplyKind::Scalar,
-            subquery_expr: col_ref_nullable(APPLY_OUT, "avg_subq", DataType::Float64),
-            output_column: OutputColumn {
-                column_id: APPLY_OUT,
-                name: "avg_subq".to_string(),
-                data_type: DataType::Float64,
-                nullable: true,
-                is_internal: true,
-            },
-            inner_output_column_id: AVG_RESULT,
-            correlation_column_ids: vec![P_PARTKEY],
-            correlation_conjuncts: vec![corr_conj],
-            residual_predicate: None,
-            need_check_max_rows: false,
-            use_semi_anti: false,
-            uncorrelated_outer_predicate_columns: HashSet::new(),
-            required_output_columns: None,
-        });
+        let apply = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Apply(LogicalApplyNode {
+                kind: ApplyKind::Scalar,
+                subquery_expr: col_ref_nullable(APPLY_OUT, "avg_subq", DataType::Float64),
+                output_column: OutputColumn {
+                    column_id: APPLY_OUT,
+                    name: "avg_subq".to_string(),
+                    data_type: DataType::Float64,
+                    nullable: true,
+                    is_internal: true,
+                },
+                inner_output_column_id: AVG_RESULT,
+                correlation_column_ids: vec![P_PARTKEY],
+                correlation_conjuncts: vec![corr_conj],
+                residual_predicate: None,
+                need_check_max_rows: false,
+                use_semi_anti: false,
+                uncorrelated_outer_predicate_columns: HashSet::new(),
+            }),
+            vec![make_outer_join(), make_inner_avg_agg()],
+            None,
+        );
 
         // WHERE: (p_partkey == l_partkey) AND (p_brand == 'x') AND (l_quantity < APPLY_OUT)
         let pred = and_expr(
@@ -1098,17 +1135,17 @@ mod tests {
             ),
         );
 
-        LogicalPlan::Filter(FilterNode {
-            input: Box::new(apply),
-            predicate: pred,
-            required_output_columns: None,
-        })
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode { predicate: pred }),
+            vec![apply],
+            None,
+        )
     }
 
     /// Variant of the base fixture but with a leading Project above the agg:
     /// `Project[inner_output_col_id := 2.0 * AVG_RESULT](Agg)`.
     /// Here `inner_output_column_id` is VAL_ID (100), not AVG_RESULT.
-    fn winmagic_filter_apply_with_project() -> (LogicalPlan, ColumnId) {
+    fn winmagic_filter_apply_with_project() -> (LogicalPlanNode, ColumnId) {
         const VAL_ID: ColumnId = ColumnId(100);
         let corr_conj = eq_expr(
             col_ref(P_PARTKEY, "p_partkey", DataType::Int64),
@@ -1119,46 +1156,49 @@ mod tests {
             float_lit(2.0),
             col_ref_nullable(AVG_RESULT, "avg(l_quantity)", DataType::Float64),
         );
-        let projected_right = LogicalPlan::Project(ProjectNode {
-            input: Box::new(make_inner_avg_agg()),
-            items: vec![
-                // passthrough: l_partkey
-                ProjectItem {
-                    expr: col_ref(INNER_L_PARTKEY, "l_partkey", DataType::Int64),
-                    output_name: "l_partkey".to_string(),
-                    output_column_id: INNER_L_PARTKEY,
+        let projected_right = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![
+                    // passthrough: l_partkey
+                    ProjectItem {
+                        expr: col_ref(INNER_L_PARTKEY, "l_partkey", DataType::Int64),
+                        output_name: "l_partkey".to_string(),
+                        output_column_id: INNER_L_PARTKEY,
+                    },
+                    // computed: 2.0 * avg -> VAL_ID
+                    ProjectItem {
+                        expr: project_expr,
+                        output_name: "val".to_string(),
+                        output_column_id: VAL_ID,
+                    },
+                ],
+                output_qualifier: None,
+            }),
+            vec![make_inner_avg_agg()],
+            None,
+        );
+        let apply = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Apply(LogicalApplyNode {
+                kind: ApplyKind::Scalar,
+                subquery_expr: col_ref_nullable(APPLY_OUT, "val_subq", DataType::Float64),
+                output_column: OutputColumn {
+                    column_id: APPLY_OUT,
+                    name: "val_subq".to_string(),
+                    data_type: DataType::Float64,
+                    nullable: true,
+                    is_internal: true,
                 },
-                // computed: 2.0 * avg -> VAL_ID
-                ProjectItem {
-                    expr: project_expr,
-                    output_name: "val".to_string(),
-                    output_column_id: VAL_ID,
-                },
-            ],
-            output_qualifier: None,
-            required_output_columns: None,
-        });
-        let apply = LogicalPlan::Apply(ApplyNode {
-            left: Box::new(make_outer_join()),
-            right: Box::new(projected_right),
-            kind: ApplyKind::Scalar,
-            subquery_expr: col_ref_nullable(APPLY_OUT, "val_subq", DataType::Float64),
-            output_column: OutputColumn {
-                column_id: APPLY_OUT,
-                name: "val_subq".to_string(),
-                data_type: DataType::Float64,
-                nullable: true,
-                is_internal: true,
-            },
-            inner_output_column_id: VAL_ID,
-            correlation_column_ids: vec![P_PARTKEY],
-            correlation_conjuncts: vec![corr_conj],
-            residual_predicate: None,
-            need_check_max_rows: false,
-            use_semi_anti: false,
-            uncorrelated_outer_predicate_columns: HashSet::new(),
-            required_output_columns: None,
-        });
+                inner_output_column_id: VAL_ID,
+                correlation_column_ids: vec![P_PARTKEY],
+                correlation_conjuncts: vec![corr_conj],
+                residual_predicate: None,
+                need_check_max_rows: false,
+                use_semi_anti: false,
+                uncorrelated_outer_predicate_columns: HashSet::new(),
+            }),
+            vec![make_outer_join(), projected_right],
+            None,
+        );
         let pred = and_expr(
             and_expr(
                 eq_expr(
@@ -1173,11 +1213,11 @@ mod tests {
             ),
         );
         (
-            LogicalPlan::Filter(FilterNode {
-                input: Box::new(apply),
-                predicate: pred,
-                required_output_columns: None,
-            }),
+            LogicalPlanNode::new(
+                LogicalPlanNodeKind::Filter(LogicalFilterNode { predicate: pred }),
+                vec![apply],
+                None,
+            ),
             VAL_ID,
         )
     }
@@ -1205,30 +1245,31 @@ mod tests {
     fn matches_returns_false_for_bare_apply() {
         let rule = ApplyToWindow;
         // Apply without Filter wrapper → should not match
-        let apply = LogicalPlan::Apply(ApplyNode {
-            left: Box::new(make_outer_join()),
-            right: Box::new(make_inner_avg_agg()),
-            kind: ApplyKind::Scalar,
-            subquery_expr: col_ref_nullable(APPLY_OUT, "subq", DataType::Float64),
-            output_column: OutputColumn {
-                column_id: APPLY_OUT,
-                name: "subq".to_string(),
-                data_type: DataType::Float64,
-                nullable: true,
-                is_internal: true,
-            },
-            inner_output_column_id: AVG_RESULT,
-            correlation_column_ids: vec![P_PARTKEY],
-            correlation_conjuncts: vec![eq_expr(
-                col_ref(P_PARTKEY, "p_partkey", DataType::Int64),
-                col_ref(INNER_L_PARTKEY, "l_partkey", DataType::Int64),
-            )],
-            residual_predicate: None,
-            need_check_max_rows: false,
-            use_semi_anti: false,
-            uncorrelated_outer_predicate_columns: HashSet::new(),
-            required_output_columns: None,
-        });
+        let apply = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Apply(LogicalApplyNode {
+                kind: ApplyKind::Scalar,
+                subquery_expr: col_ref_nullable(APPLY_OUT, "subq", DataType::Float64),
+                output_column: OutputColumn {
+                    column_id: APPLY_OUT,
+                    name: "subq".to_string(),
+                    data_type: DataType::Float64,
+                    nullable: true,
+                    is_internal: true,
+                },
+                inner_output_column_id: AVG_RESULT,
+                correlation_column_ids: vec![P_PARTKEY],
+                correlation_conjuncts: vec![eq_expr(
+                    col_ref(P_PARTKEY, "p_partkey", DataType::Int64),
+                    col_ref(INNER_L_PARTKEY, "l_partkey", DataType::Int64),
+                )],
+                residual_predicate: None,
+                need_check_max_rows: false,
+                use_semi_anti: false,
+                uncorrelated_outer_predicate_columns: HashSet::new(),
+            }),
+            vec![make_outer_join(), make_inner_avg_agg()],
+            None,
+        );
         assert!(!rule.matches(&apply, &ctx()));
     }
 
@@ -1256,12 +1297,13 @@ mod tests {
         );
 
         // after-window Filter at the top.
-        let LogicalPlan::Filter(after_filter) = &result else {
+        let LogicalPlanNodeKind::Filter(_after_filter) = &result.kind else {
             panic!("expected after-window Filter at root, got: {:?}", result);
         };
 
         // Window inside.
-        let LogicalPlan::Window(window_node) = after_filter.input.as_ref() else {
+        let window_plan = result.unary_input();
+        let LogicalPlanNodeKind::Window(window_node) = &window_plan.kind else {
             panic!("expected Window under after-filter");
         };
         assert_eq!(window_node.window_exprs.len(), 1);
@@ -1295,14 +1337,16 @@ mod tests {
         );
 
         // Sort under Window.
-        let LogicalPlan::Sort(sort_node) = window_node.input.as_ref() else {
+        let sort_plan = window_plan.unary_input();
+        let LogicalPlanNodeKind::Sort(sort_node) = &sort_plan.kind else {
             panic!("expected Sort under Window");
         };
         assert_eq!(sort_node.items.len(), 1);
         assert_eq!(sort_node.analytic_partition_by.len(), 1);
 
         // before-window Filter under Sort.
-        let LogicalPlan::Filter(before_filter) = sort_node.input.as_ref() else {
+        let before_filter_plan = sort_plan.unary_input();
+        let LogicalPlanNodeKind::Filter(before_filter) = &before_filter_plan.kind else {
             panic!("expected before-window Filter under Sort");
         };
         // before-filter predicate must contain p_partkey == l_partkey AND p_brand == 'x'
@@ -1318,7 +1362,10 @@ mod tests {
         }
         // before-filter input is the original CrossJoin.
         assert!(
-            matches!(before_filter.input.as_ref(), LogicalPlan::Join(_)),
+            matches!(
+                &before_filter_plan.unary_input().kind,
+                LogicalPlanNodeKind::Join(_)
+            ),
             "before-window filter input must be the original Join"
         );
     }
@@ -1341,10 +1388,10 @@ mod tests {
             let RewriteResult::Changed(result) = result else {
                 panic!("expected Changed")
             };
-            let LogicalPlan::Filter(after) = &result else {
+            let LogicalPlanNodeKind::Filter(after) = &result.kind else {
                 panic!("expected Filter")
             };
-            let LogicalPlan::Window(win) = after.input.as_ref() else {
+            let LogicalPlanNodeKind::Window(win) = &result.unary_input().kind else {
                 panic!("expected Window")
             };
             let win_id = win.window_exprs[0].output_column_id;
@@ -1373,10 +1420,10 @@ mod tests {
             let RewriteResult::Changed(result) = result else {
                 panic!("expected Changed")
             };
-            let LogicalPlan::Filter(after) = &result else {
+            let LogicalPlanNodeKind::Filter(after) = &result.kind else {
                 panic!("expected Filter")
             };
-            let LogicalPlan::Window(win) = after.input.as_ref() else {
+            let LogicalPlanNodeKind::Window(win) = &result.unary_input().kind else {
                 panic!("expected Window")
             };
             let win_id = win.window_exprs[0].output_column_id;
@@ -1429,20 +1476,16 @@ mod tests {
         let rule = ApplyToWindow;
         // Self-join outer: CrossJoin(lineitem(table_id=1), lineitem(table_id=1))
         let plan = winmagic_filter_apply();
-        let (pred, a_orig) = extract_filter_apply(&plan);
-        let mut a = a_orig.clone();
-        a.left = Box::new(LogicalPlan::Join(JoinNode {
-            left: Box::new(make_outer_lineitem_scan()),
-            right: Box::new(make_outer_lineitem_scan()),
-            join_type: JoinKind::Cross,
-            condition: None,
-            required_output_columns: None,
-        }));
-        let bad_plan = LogicalPlan::Filter(FilterNode {
-            input: Box::new(LogicalPlan::Apply(a)),
-            predicate: pred.clone(),
-            required_output_columns: None,
-        });
+        let (pred, a_orig, _, right) = extract_filter_apply(&plan);
+        let bad_left = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: JoinKind::Cross,
+                condition: None,
+            }),
+            vec![make_outer_lineitem_scan(), make_outer_lineitem_scan()],
+            None,
+        );
+        let bad_plan = make_filter_apply(pred.clone(), a_orig.clone(), bad_left, right.clone());
 
         let mut ctx = ctx_with_factory();
         let result = rule.apply(bad_plan, &mut ctx).expect("must not error");
@@ -1454,23 +1497,60 @@ mod tests {
 
     // ---- precondition tests -----------------------------------------------------
 
-    /// Helper: extract the ApplyNode and predicate from the canonical Filter(Apply) fixture.
-    fn extract_filter_apply(plan: &LogicalPlan) -> (&TypedExpr, &ApplyNode) {
-        let LogicalPlan::Filter(f) = plan else {
+    /// Helper: extract the LogicalApplyNode and predicate from the canonical Filter(Apply) fixture.
+    fn extract_filter_apply(
+        plan: &LogicalPlanNode,
+    ) -> (
+        &TypedExpr,
+        &LogicalApplyNode,
+        &LogicalPlanNode,
+        &LogicalPlanNode,
+    ) {
+        let LogicalPlanNodeKind::Filter(f) = &plan.kind else {
             panic!("expected Filter")
         };
-        let LogicalPlan::Apply(a) = f.input.as_ref() else {
+        let apply_plan = plan.unary_input();
+        let LogicalPlanNodeKind::Apply(a) = &apply_plan.kind else {
             panic!("expected Apply")
         };
-        (&f.predicate, a)
+        (&f.predicate, a, apply_plan.left(), apply_plan.right())
+    }
+
+    fn make_apply_plan(
+        apply: LogicalApplyNode,
+        left: LogicalPlanNode,
+        right: LogicalPlanNode,
+    ) -> LogicalPlanNode {
+        LogicalPlanNode::new(LogicalPlanNodeKind::Apply(apply), vec![left, right], None)
+    }
+
+    fn make_filter_apply(
+        predicate: TypedExpr,
+        apply: LogicalApplyNode,
+        left: LogicalPlanNode,
+        right: LogicalPlanNode,
+    ) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode { predicate }),
+            vec![make_apply_plan(apply, left, right)],
+            None,
+        )
+    }
+
+    fn with_kind_like(original: &LogicalPlanNode, kind: LogicalPlanNodeKind) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            kind,
+            original.children.clone(),
+            original.required_output_columns.clone(),
+        )
     }
 
     #[test]
     fn precond_accepts_q17_shape() {
         let plan = winmagic_filter_apply();
-        let (pred, a) = extract_filter_apply(&plan);
+        let (pred, a, left, right) = extract_filter_apply(&plan);
         assert!(
-            check_preconditions(pred, a).is_some(),
+            check_preconditions(pred, a, left, right).is_some(),
             "q17-shaped Filter(Apply) must pass all preconditions"
         );
     }
@@ -1478,19 +1558,20 @@ mod tests {
     #[test]
     fn precond_rejects_non_whitelist_agg() {
         let plan = winmagic_filter_apply();
-        let (pred, a_orig) = extract_filter_apply(&plan);
+        let (pred, a_orig, left, right) = extract_filter_apply(&plan);
         // Replace avg with array_agg (not in whitelist)
-        let mut a = a_orig.clone();
-        let bad_agg = AggregateNode {
+        let a = a_orig.clone();
+        let orig_agg = right.as_aggregate().unwrap();
+        let bad_agg = LogicalAggregateNode {
             aggregates: vec![AggregateCall {
                 name: "array_agg".to_string(),
-                ..a_orig.right.as_ref().as_aggregate().unwrap().aggregates[0].clone()
+                ..orig_agg.aggregates[0].clone()
             }],
-            ..a_orig.right.as_ref().as_aggregate().unwrap().clone()
+            ..orig_agg.clone()
         };
-        a.right = Box::new(LogicalPlan::Aggregate(bad_agg));
+        let bad_right = with_kind_like(right, LogicalPlanNodeKind::Aggregate(bad_agg));
         assert!(
-            check_preconditions(pred, &a).is_none(),
+            check_preconditions(pred, &a, left, &bad_right).is_none(),
             "non-whitelist agg must reject"
         );
     }
@@ -1498,18 +1579,19 @@ mod tests {
     #[test]
     fn precond_rejects_distinct_agg() {
         let plan = winmagic_filter_apply();
-        let (pred, a_orig) = extract_filter_apply(&plan);
-        let mut a = a_orig.clone();
-        let bad_agg = AggregateNode {
+        let (pred, a_orig, left, right) = extract_filter_apply(&plan);
+        let a = a_orig.clone();
+        let orig_agg = right.as_aggregate().unwrap();
+        let bad_agg = LogicalAggregateNode {
             aggregates: vec![AggregateCall {
                 distinct: true,
-                ..a_orig.right.as_ref().as_aggregate().unwrap().aggregates[0].clone()
+                ..orig_agg.aggregates[0].clone()
             }],
-            ..a_orig.right.as_ref().as_aggregate().unwrap().clone()
+            ..orig_agg.clone()
         };
-        a.right = Box::new(LogicalPlan::Aggregate(bad_agg));
+        let bad_right = with_kind_like(right, LogicalPlanNodeKind::Aggregate(bad_agg));
         assert!(
-            check_preconditions(pred, &a).is_none(),
+            check_preconditions(pred, &a, left, &bad_right).is_none(),
             "distinct agg must reject"
         );
     }
@@ -1517,10 +1599,10 @@ mod tests {
     #[test]
     fn precond_rejects_two_aggregates() {
         let plan = winmagic_filter_apply();
-        let (pred, a_orig) = extract_filter_apply(&plan);
-        let mut a = a_orig.clone();
-        let orig_agg = a_orig.right.as_ref().as_aggregate().unwrap();
-        let two_agg = AggregateNode {
+        let (pred, a_orig, left, right) = extract_filter_apply(&plan);
+        let a = a_orig.clone();
+        let orig_agg = right.as_aggregate().unwrap();
+        let two_agg = LogicalAggregateNode {
             aggregates: vec![
                 orig_agg.aggregates[0].clone(),
                 AggregateCall {
@@ -1531,9 +1613,9 @@ mod tests {
             ],
             ..orig_agg.clone()
         };
-        a.right = Box::new(LogicalPlan::Aggregate(two_agg));
+        let bad_right = with_kind_like(right, LogicalPlanNodeKind::Aggregate(two_agg));
         assert!(
-            check_preconditions(pred, &a).is_none(),
+            check_preconditions(pred, &a, left, &bad_right).is_none(),
             "two aggregates must reject"
         );
     }
@@ -1542,19 +1624,20 @@ mod tests {
     fn precond_rejects_self_join_outer() {
         // Outer: CrossJoin(lineitem(table_id=1), lineitem(table_id=1)) — two same-table scans
         let plan = winmagic_filter_apply();
-        let (pred, a_orig) = extract_filter_apply(&plan);
-        let mut a = a_orig.clone();
+        let (pred, a_orig, _, right) = extract_filter_apply(&plan);
+        let a = a_orig.clone();
         // Replace part scan with another lineitem scan (same table_id=1)
         let dup_lineitem = make_outer_lineitem_scan();
-        a.left = Box::new(LogicalPlan::Join(JoinNode {
-            left: Box::new(make_outer_lineitem_scan()),
-            right: Box::new(dup_lineitem),
-            join_type: JoinKind::Cross,
-            condition: None,
-            required_output_columns: None,
-        }));
+        let bad_left = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: JoinKind::Cross,
+                condition: None,
+            }),
+            vec![make_outer_lineitem_scan(), dup_lineitem],
+            None,
+        );
         assert!(
-            check_preconditions(pred, &a).is_none(),
+            check_preconditions(pred, &a, &bad_left, right).is_none(),
             "self-join (duplicate table) on outer must reject"
         );
     }
@@ -1563,51 +1646,55 @@ mod tests {
     fn precond_rejects_table_set_mismatch() {
         // Subquery scans a table_id=99 absent from outer (outer has table_id=1 and 2)
         let plan = winmagic_filter_apply();
-        let (pred, a_orig) = extract_filter_apply(&plan);
-        let mut a = a_orig.clone();
+        let (pred, a_orig, left, right) = extract_filter_apply(&plan);
+        let a = a_orig.clone();
         // Replace inner scan with one from table_id=99
-        let foreign_scan = LogicalPlan::Scan(ScanNode {
-            database: "default".to_string(),
-            table: TableDef {
-                name: "other".to_string(),
-                columns: vec![],
-                iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::StarRocks {
-                    db_id: 0,
-                    table_id: 99,
+        let foreign_scan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "default".to_string(),
+                table: TableDef {
+                    name: "other".to_string(),
+                    columns: vec![],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 99,
+                    },
                 },
-            },
-            alias: None,
-            columns: vec![
-                OutputColumn {
-                    column_id: INNER_L_PARTKEY,
-                    name: "l_partkey".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
-                    is_internal: false,
-                },
-                OutputColumn {
-                    column_id: INNER_L_QUANTITY,
-                    name: "l_quantity".to_string(),
-                    data_type: DataType::Float64,
-                    nullable: false,
-                    is_internal: false,
-                },
-            ],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        });
-        let orig_agg = a_orig.right.as_ref().as_aggregate().unwrap();
-        let foreign_agg = AggregateNode {
-            input: Box::new(foreign_scan),
-            ..orig_agg.clone()
-        };
-        a.right = Box::new(LogicalPlan::Aggregate(foreign_agg));
+                alias: None,
+                columns: vec![
+                    OutputColumn {
+                        column_id: INNER_L_PARTKEY,
+                        name: "l_partkey".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        is_internal: false,
+                    },
+                    OutputColumn {
+                        column_id: INNER_L_QUANTITY,
+                        name: "l_quantity".to_string(),
+                        data_type: DataType::Float64,
+                        nullable: false,
+                        is_internal: false,
+                    },
+                ],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        );
+        let orig_agg = right.as_aggregate().unwrap();
+        let foreign_agg = LogicalAggregateNode { ..orig_agg.clone() };
+        let bad_right = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Aggregate(foreign_agg),
+            vec![foreign_scan],
+            right.required_output_columns.clone(),
+        );
         assert!(
-            check_preconditions(pred, &a).is_none(),
+            check_preconditions(pred, &a, left, &bad_right).is_none(),
             "subquery with foreign table must reject"
         );
     }
@@ -1616,16 +1703,18 @@ mod tests {
     fn precond_rejects_limit_in_subtree() {
         // Wrap outer left in a Limit node (not whitelisted)
         let plan = winmagic_filter_apply();
-        let (pred, a_orig) = extract_filter_apply(&plan);
-        let mut a = a_orig.clone();
-        a.left = Box::new(LogicalPlan::Limit(LimitNode {
-            input: a_orig.left.clone(),
-            limit: Some(10),
-            offset: None,
-            required_output_columns: None,
-        }));
+        let (pred, a_orig, left, right) = extract_filter_apply(&plan);
+        let a = a_orig.clone();
+        let bad_left = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Limit(LogicalLimitNode {
+                limit: Some(10),
+                offset: None,
+            }),
+            vec![left.clone()],
+            None,
+        );
         assert!(
-            check_preconditions(pred, &a).is_none(),
+            check_preconditions(pred, &a, &bad_left, right).is_none(),
             "Limit in outer subtree must reject"
         );
     }
@@ -1635,8 +1724,8 @@ mod tests {
         // Add a residual Filter inside the subquery aggregate's input that
         // has no twin in the outer WHERE predicate.
         let plan = winmagic_filter_apply();
-        let (pred, a_orig) = extract_filter_apply(&plan);
-        let mut a = a_orig.clone();
+        let (pred, a_orig, left, right) = extract_filter_apply(&plan);
+        let a = a_orig.clone();
         // Add a Filter below the aggregate input: l_quantity > 0
         let residual_pred = TypedExpr {
             kind: ExprKind::BinaryOp {
@@ -1651,19 +1740,22 @@ mod tests {
             data_type: DataType::Boolean,
             nullable: false,
         };
-        let inner_with_filter = LogicalPlan::Filter(FilterNode {
-            input: Box::new(make_inner_lineitem_scan()),
-            predicate: residual_pred,
-            required_output_columns: None,
-        });
-        let orig_agg = a_orig.right.as_ref().as_aggregate().unwrap();
-        let agg_with_residual = AggregateNode {
-            input: Box::new(inner_with_filter),
-            ..orig_agg.clone()
-        };
-        a.right = Box::new(LogicalPlan::Aggregate(agg_with_residual));
+        let inner_with_filter = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: residual_pred,
+            }),
+            vec![make_inner_lineitem_scan()],
+            None,
+        );
+        let orig_agg = right.as_aggregate().unwrap();
+        let agg_with_residual = LogicalAggregateNode { ..orig_agg.clone() };
+        let bad_right = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Aggregate(agg_with_residual),
+            vec![inner_with_filter],
+            right.required_output_columns.clone(),
+        );
         assert!(
-            check_preconditions(pred, &a).is_none(),
+            check_preconditions(pred, &a, left, &bad_right).is_none(),
             "residual Filter conjunct without outer twin must reject"
         );
     }
@@ -1672,14 +1764,14 @@ mod tests {
     fn precond_rejects_no_subquery_conjunct() {
         // WHERE predicate doesn't reference APPLY_OUT at all
         let plan = winmagic_filter_apply();
-        let (_, a) = extract_filter_apply(&plan);
+        let (_, a, left, right) = extract_filter_apply(&plan);
         // Build a predicate that has no APPLY_OUT reference
         let pred_without_apply = eq_expr(
             col_ref(P_PARTKEY, "p_partkey", DataType::Int64),
             col_ref(L_PARTKEY, "l_partkey", DataType::Int64),
         );
         assert!(
-            check_preconditions(&pred_without_apply, a).is_none(),
+            check_preconditions(&pred_without_apply, a, left, right).is_none(),
             "WHERE predicate without APPLY_OUT reference must reject"
         );
     }
@@ -1713,13 +1805,14 @@ mod tests {
             data_type: DataType::Boolean,
             nullable: false,
         };
-        let inner_with_filter = LogicalPlan::Filter(FilterNode {
-            input: Box::new(make_inner_lineitem_scan()),
-            predicate: inner_residual,
-            required_output_columns: None,
-        });
-        let agg_with_residual = AggregateNode {
-            input: Box::new(inner_with_filter),
+        let inner_with_filter = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: inner_residual,
+            }),
+            vec![make_inner_lineitem_scan()],
+            None,
+        );
+        let agg_with_residual = LogicalAggregateNode {
             group_by: vec![col_ref(INNER_L_PARTKEY, "l_partkey", DataType::Int64)],
             aggregates: vec![AggregateCall {
                 name: "avg".to_string(),
@@ -1746,11 +1839,13 @@ mod tests {
                 },
             ],
             already_pushed: false,
-            required_output_columns: None,
         };
-        let apply = ApplyNode {
-            left: Box::new(make_outer_join()),
-            right: Box::new(LogicalPlan::Aggregate(agg_with_residual)),
+        let right = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Aggregate(agg_with_residual),
+            vec![inner_with_filter],
+            None,
+        );
+        let apply = LogicalApplyNode {
             kind: ApplyKind::Scalar,
             subquery_expr: col_ref_nullable(APPLY_OUT, "avg_subq", DataType::Float64),
             output_column: OutputColumn {
@@ -1767,8 +1862,8 @@ mod tests {
             need_check_max_rows: false,
             use_semi_anti: false,
             uncorrelated_outer_predicate_columns: HashSet::new(),
-            required_output_columns: None,
         };
+        let left = make_outer_join();
         // Outer WHERE: (p_partkey == l_partkey) AND (l_orderkey > 100) AND (l_quantity < APPLY_OUT)
         // l_orderkey > 100 references outer lineitem (not only "part"), so 4c does NOT drop it.
         // After 4a (removes corr-twin) and 4b (removes subquery-comparison), outer_conjuncts = [l_orderkey > 100].
@@ -1800,7 +1895,7 @@ mod tests {
             ),
         );
         assert!(
-            check_preconditions(&pred, &apply).is_none(),
+            check_preconditions(&pred, &apply, &left, &right).is_none(),
             "differing residual conjunct (same count, non-phys-eq) must reject (4d branch)"
         );
     }
@@ -1853,27 +1948,28 @@ mod tests {
             col_ref(P_PARTKEY, "p_partkey", DataType::Int64),
             col_ref(INNER_L_PARTKEY, "l_partkey", DataType::Int64),
         );
-        let apply = LogicalPlan::Apply(ApplyNode {
-            left: Box::new(make_outer_join()),
-            right: Box::new(make_inner_avg_agg()),
-            kind: ApplyKind::Scalar,
-            subquery_expr: col_ref_nullable(APPLY_OUT, "avg_subq", DataType::Float64),
-            output_column: OutputColumn {
-                column_id: APPLY_OUT,
-                name: "avg_subq".to_string(),
-                data_type: DataType::Float64,
-                nullable: true,
-                is_internal: true,
-            },
-            inner_output_column_id: AVG_RESULT,
-            correlation_column_ids: vec![P_PARTKEY],
-            correlation_conjuncts: vec![corr_conj],
-            residual_predicate: None,
-            need_check_max_rows: false,
-            use_semi_anti: false,
-            uncorrelated_outer_predicate_columns: HashSet::new(),
-            required_output_columns: None,
-        });
+        let apply = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Apply(LogicalApplyNode {
+                kind: ApplyKind::Scalar,
+                subquery_expr: col_ref_nullable(APPLY_OUT, "avg_subq", DataType::Float64),
+                output_column: OutputColumn {
+                    column_id: APPLY_OUT,
+                    name: "avg_subq".to_string(),
+                    data_type: DataType::Float64,
+                    nullable: true,
+                    is_internal: true,
+                },
+                inner_output_column_id: AVG_RESULT,
+                correlation_column_ids: vec![P_PARTKEY],
+                correlation_conjuncts: vec![corr_conj],
+                residual_predicate: None,
+                need_check_max_rows: false,
+                use_semi_anti: false,
+                uncorrelated_outer_predicate_columns: HashSet::new(),
+            }),
+            vec![make_outer_join(), make_inner_avg_agg()],
+            None,
+        );
 
         // WHERE: (p_partkey == l_partkey) AND (p_brand == 'x') AND BETWEEN(...)
         let pred = and_expr(
@@ -1886,11 +1982,11 @@ mod tests {
             ),
             between_conjunct.clone(),
         );
-        let plan = LogicalPlan::Filter(FilterNode {
-            input: Box::new(apply),
-            predicate: pred,
-            required_output_columns: None,
-        });
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode { predicate: pred }),
+            vec![apply],
+            None,
+        );
 
         let rule = ApplyToWindow;
         let mut ctx = ctx_with_factory();
@@ -1904,11 +2000,11 @@ mod tests {
             super::super::find_residual_apply(&result).is_none(),
             "Apply must be gone after transform"
         );
-        let LogicalPlan::Filter(after_filter) = &result else {
+        let LogicalPlanNodeKind::Filter(after_filter) = &result.kind else {
             panic!("expected after-window Filter at root");
         };
         assert!(
-            matches!(after_filter.input.as_ref(), LogicalPlan::Window(_)),
+            matches!(&result.unary_input().kind, LogicalPlanNodeKind::Window(_)),
             "expected Window under after-filter"
         );
 
@@ -1919,7 +2015,7 @@ mod tests {
             "after-window predicate must NOT reference APPLY_OUT after Between rewrite"
         );
         // win_id is present instead.
-        let LogicalPlan::Window(win) = after_filter.input.as_ref() else {
+        let LogicalPlanNodeKind::Window(win) = &result.unary_input().kind else {
             unreachable!()
         };
         let win_id = win.window_exprs[0].output_column_id;
@@ -1935,63 +2031,69 @@ mod tests {
     /// correlation_column_ids=[P_PARTKEY], correlation_conjuncts=[]} where the inner
     /// is Agg{group_by:[]}(Filter(inner.l_partkey==outer.p_partkey)(inner_scan)).
     /// This is the shape the planner emits before PushDownApplyAggFilter fires.
-    fn winmagic_pre_pushdown_filter_apply() -> LogicalPlan {
+    fn winmagic_pre_pushdown_filter_apply() -> LogicalPlanNode {
         // Correlation predicate inside the inner filter: inner.l_partkey == outer.p_partkey
         let inner_corr_pred = eq_expr(
             col_ref(INNER_L_PARTKEY, "l_partkey", DataType::Int64),
             col_ref(P_PARTKEY, "p_partkey", DataType::Int64),
         );
         // Inner: Agg{group_by:[]}(Filter(corr_pred)(inner_scan))
-        let inner_filter = LogicalPlan::Filter(FilterNode {
-            input: Box::new(make_inner_lineitem_scan()),
-            predicate: inner_corr_pred,
-            required_output_columns: None,
-        });
-        let inner_agg = LogicalPlan::Aggregate(AggregateNode {
-            input: Box::new(inner_filter),
-            group_by: vec![],
-            aggregates: vec![AggregateCall {
-                name: "avg".to_string(),
-                args: vec![col_ref(INNER_L_QUANTITY, "l_quantity", DataType::Float64)],
-                distinct: false,
-                result_type: DataType::Float64,
-                order_by: vec![],
-                output_column_id: AVG_RESULT,
-            }],
-            output_columns: vec![OutputColumn {
-                column_id: AVG_RESULT,
-                name: "avg(l_quantity)".to_string(),
-                data_type: DataType::Float64,
-                nullable: true,
-                is_internal: false,
-            }],
-            already_pushed: false,
-            required_output_columns: None,
-        });
+        let inner_filter = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: inner_corr_pred,
+            }),
+            vec![make_inner_lineitem_scan()],
+            None,
+        );
+        let inner_agg = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![],
+                aggregates: vec![AggregateCall {
+                    name: "avg".to_string(),
+                    args: vec![col_ref(INNER_L_QUANTITY, "l_quantity", DataType::Float64)],
+                    distinct: false,
+                    result_type: DataType::Float64,
+                    order_by: vec![],
+                    output_column_id: AVG_RESULT,
+                }],
+                output_columns: vec![OutputColumn {
+                    column_id: AVG_RESULT,
+                    name: "avg(l_quantity)".to_string(),
+                    data_type: DataType::Float64,
+                    nullable: true,
+                    is_internal: false,
+                }],
+                already_pushed: false,
+            }),
+            vec![inner_filter],
+            None,
+        );
 
-        let apply = LogicalPlan::Apply(ApplyNode {
-            left: Box::new(make_outer_join()),
-            right: Box::new(inner_agg),
-            kind: ApplyKind::Scalar,
-            subquery_expr: col_ref_nullable(APPLY_OUT, "avg_subq", DataType::Float64),
-            output_column: OutputColumn {
-                column_id: APPLY_OUT,
-                name: "avg_subq".to_string(),
-                data_type: DataType::Float64,
-                nullable: true,
-                is_internal: true,
-            },
-            // inner_output_column_id == AVG_RESULT (no leading Project)
-            inner_output_column_id: AVG_RESULT,
-            correlation_column_ids: vec![P_PARTKEY],
-            // correlation_conjuncts is EMPTY — PushDownApplyAggFilter has not run yet
-            correlation_conjuncts: vec![],
-            residual_predicate: None,
-            need_check_max_rows: true, // pre-pushdown flag
-            use_semi_anti: false,
-            uncorrelated_outer_predicate_columns: HashSet::new(),
-            required_output_columns: None,
-        });
+        let apply = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Apply(LogicalApplyNode {
+                kind: ApplyKind::Scalar,
+                subquery_expr: col_ref_nullable(APPLY_OUT, "avg_subq", DataType::Float64),
+                output_column: OutputColumn {
+                    column_id: APPLY_OUT,
+                    name: "avg_subq".to_string(),
+                    data_type: DataType::Float64,
+                    nullable: true,
+                    is_internal: true,
+                },
+                // inner_output_column_id == AVG_RESULT (no leading Project)
+                inner_output_column_id: AVG_RESULT,
+                correlation_column_ids: vec![P_PARTKEY],
+                // correlation_conjuncts is EMPTY — PushDownApplyAggFilter has not run yet
+                correlation_conjuncts: vec![],
+                residual_predicate: None,
+                need_check_max_rows: true,
+                // pre-pushdown flag
+                use_semi_anti: false,
+                uncorrelated_outer_predicate_columns: HashSet::new(),
+            }),
+            vec![make_outer_join(), inner_agg],
+            None,
+        );
 
         // WHERE: (p_partkey == l_partkey) AND (p_brand == 'x') AND (l_quantity < APPLY_OUT)
         let pred = and_expr(
@@ -2008,11 +2110,11 @@ mod tests {
             ),
         );
 
-        LogicalPlan::Filter(FilterNode {
-            input: Box::new(apply),
-            predicate: pred,
-            required_output_columns: None,
-        })
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode { predicate: pred }),
+            vec![apply],
+            None,
+        )
     }
 
     /// Recursively find any Window node in the plan tree.
@@ -2022,15 +2124,15 @@ mod tests {
     /// intentionally omitted: every caller asserts `find_residual_apply(..).is_none()`
     /// first, so no Apply is present when this runs. Extend if a future rule emits a
     /// Window under a variant not traversed here.
-    fn find_window(plan: &LogicalPlan) -> bool {
-        match plan {
-            LogicalPlan::Window(_) => true,
-            LogicalPlan::Filter(n) => find_window(&n.input),
-            LogicalPlan::Sort(n) => find_window(&n.input),
-            LogicalPlan::Project(n) => find_window(&n.input),
-            LogicalPlan::Aggregate(n) => find_window(&n.input),
-            LogicalPlan::Join(n) => find_window(&n.left) || find_window(&n.right),
-            LogicalPlan::Limit(n) => find_window(&n.input),
+    fn find_window(plan: &LogicalPlanNode) -> bool {
+        match &plan.kind {
+            LogicalPlanNodeKind::Window(_) => true,
+            LogicalPlanNodeKind::Filter(_)
+            | LogicalPlanNodeKind::Sort(_)
+            | LogicalPlanNodeKind::Project(_)
+            | LogicalPlanNodeKind::Aggregate(_)
+            | LogicalPlanNodeKind::Limit(_) => find_window(plan.unary_input()),
+            LogicalPlanNodeKind::Join(_) => find_window(plan.left()) || find_window(plan.right()),
             _ => false,
         }
     }
@@ -2042,16 +2144,18 @@ mod tests {
     /// is intentionally omitted: every caller asserts `find_residual_apply(..).is_none()`
     /// first, so no Apply is present when this runs. Extend if a future rule emits a
     /// LeftOuter join under a variant not traversed here.
-    fn find_left_outer_join(plan: &LogicalPlan) -> bool {
-        match plan {
-            LogicalPlan::Join(n) if n.join_type == JoinKind::LeftOuter => true,
-            LogicalPlan::Join(n) => find_left_outer_join(&n.left) || find_left_outer_join(&n.right),
-            LogicalPlan::Filter(n) => find_left_outer_join(&n.input),
-            LogicalPlan::Sort(n) => find_left_outer_join(&n.input),
-            LogicalPlan::Project(n) => find_left_outer_join(&n.input),
-            LogicalPlan::Aggregate(n) => find_left_outer_join(&n.input),
-            LogicalPlan::Limit(n) => find_left_outer_join(&n.input),
-            LogicalPlan::Window(n) => find_left_outer_join(&n.input),
+    fn find_left_outer_join(plan: &LogicalPlanNode) -> bool {
+        match &plan.kind {
+            LogicalPlanNodeKind::Join(n) if n.join_type == JoinKind::LeftOuter => true,
+            LogicalPlanNodeKind::Join(_) => {
+                find_left_outer_join(plan.left()) || find_left_outer_join(plan.right())
+            }
+            LogicalPlanNodeKind::Filter(_)
+            | LogicalPlanNodeKind::Sort(_)
+            | LogicalPlanNodeKind::Project(_)
+            | LogicalPlanNodeKind::Aggregate(_)
+            | LogicalPlanNodeKind::Limit(_)
+            | LogicalPlanNodeKind::Window(_) => find_left_outer_join(plan.unary_input()),
             _ => false,
         }
     }
@@ -2143,15 +2247,15 @@ mod tests {
         );
     }
 
-    // Helper trait to make test code more readable — extracts AggregateNode from plan.
+    // Helper trait to make test code more readable — extracts LogicalAggregateNode from plan.
     trait AsAggregate {
-        fn as_aggregate(&self) -> Option<&AggregateNode>;
+        fn as_aggregate(&self) -> Option<&LogicalAggregateNode>;
     }
 
-    impl AsAggregate for LogicalPlan {
-        fn as_aggregate(&self) -> Option<&AggregateNode> {
-            match self {
-                LogicalPlan::Aggregate(a) => Some(a),
+    impl AsAggregate for LogicalPlanNode {
+        fn as_aggregate(&self) -> Option<&LogicalAggregateNode> {
+            match &self.kind {
+                LogicalPlanNodeKind::Aggregate(a) => Some(a),
                 _ => None,
             }
         }

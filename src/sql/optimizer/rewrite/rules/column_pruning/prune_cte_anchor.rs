@@ -14,7 +14,7 @@ use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::planner::plan::LogicalPlan;
+use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind};
 
 pub(crate) struct PruneCTEAnchorColumns;
 
@@ -27,13 +27,13 @@ impl LogicalRewriteRule for PruneCTEAnchorColumns {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
-        matches!(plan, LogicalPlan::CTEAnchor(_))
+    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+        matches!(&plan.kind, LogicalPlanNodeKind::CTEAnchor(_))
     }
 
     fn apply(
         &self,
-        _plan: LogicalPlan,
+        _plan: LogicalPlanNode,
         _ctx: &mut RewriteContext,
     ) -> Result<RewriteResult, String> {
         // No-op: CTEAnchor is a scope wrapper with no own output metadata to
@@ -48,30 +48,32 @@ impl LogicalRewriteRule for PruneCTEAnchorColumns {
 mod tests {
     use super::*;
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
-    use crate::sql::planner::plan::{CTEAnchorNode, ValuesNode};
+    use crate::sql::planner::plan::*;
+    use crate::sql::planner::plan::{LogicalCTEAnchorNode, LogicalPlanNodeKind, LogicalValuesNode};
 
     fn ctx() -> RewriteContext {
         RewriteContext::new(RewriteConsumer::Query)
     }
 
-    fn dummy_input() -> Box<LogicalPlan> {
-        Box::new(LogicalPlan::Values(ValuesNode {
-            rows: vec![],
-            columns: vec![],
-            required_output_columns: None,
-        }))
+    fn dummy_input() -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Values(LogicalValuesNode {
+                rows: vec![],
+                columns: vec![],
+            }),
+            vec![],
+            None,
+        )
     }
 
     #[test]
     fn prune_cte_anchor_is_always_unchanged() {
-        let node = CTEAnchorNode {
-            cte_id: 1u32,
-            produce: dummy_input(),
-            consumer: dummy_input(),
-            required_output_columns: None,
-        };
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: 1u32 }),
+            vec![dummy_input(), dummy_input()],
+            None,
+        );
 
-        let plan = LogicalPlan::CTEAnchor(node);
         let rule = PruneCTEAnchorColumns;
 
         // matches the right variant

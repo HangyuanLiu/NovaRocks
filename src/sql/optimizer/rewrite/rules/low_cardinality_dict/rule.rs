@@ -4,7 +4,7 @@ use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
-use crate::sql::planner::plan::LogicalPlan;
+use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind};
 
 use super::{collector, rewriter};
 
@@ -23,11 +23,15 @@ impl LogicalRewriteRule for LowCardinalityDictionaryRewriteRule {
         RewriteTraversal::TopDown
     }
 
-    fn matches(&self, plan: &LogicalPlan, ctx: &RewriteContext) -> bool {
+    fn matches(&self, plan: &LogicalPlanNode, ctx: &RewriteContext) -> bool {
         ctx.dictionary_provider().is_some() && contains_scan(plan)
     }
 
-    fn apply(&self, plan: LogicalPlan, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        plan: LogicalPlanNode,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, String> {
         let mut dict_ctx = collector::collect(&plan, ctx)?;
         if !dict_ctx.has_any_scan_column() {
             return Ok(RewriteResult::Unchanged);
@@ -41,42 +45,19 @@ impl LogicalRewriteRule for LowCardinalityDictionaryRewriteRule {
     }
 }
 
-fn contains_scan(plan: &LogicalPlan) -> bool {
-    match plan {
-        LogicalPlan::Scan(_) => true,
-        LogicalPlan::Filter(node) => contains_scan(&node.input),
-        LogicalPlan::Project(node) => contains_scan(&node.input),
-        LogicalPlan::Aggregate(node) => contains_scan(&node.input),
-        LogicalPlan::Sort(node) => contains_scan(&node.input),
-        LogicalPlan::Limit(node) => contains_scan(&node.input),
-        LogicalPlan::Window(node) => contains_scan(&node.input),
-        LogicalPlan::TableFunction(node) => contains_scan(&node.input),
-        LogicalPlan::Repeat(node) => contains_scan(&node.input),
-        LogicalPlan::CTEProduce(node) => contains_scan(&node.input),
-        LogicalPlan::Decode(node) => contains_scan(&node.input),
-        LogicalPlan::Join(node) => contains_scan(&node.left) || contains_scan(&node.right),
-        LogicalPlan::CTEAnchor(node) => {
-            contains_scan(&node.produce) || contains_scan(&node.consumer)
-        }
-        LogicalPlan::AggregateStateMerge(node) => {
-            contains_scan(&node.old_input) || contains_scan(&node.delta_input)
-        }
-        LogicalPlan::Union(node) => node.inputs.iter().any(contains_scan),
-        LogicalPlan::Intersect(node) => node.inputs.iter().any(contains_scan),
-        LogicalPlan::Except(node) => node.inputs.iter().any(contains_scan),
-        LogicalPlan::Apply(node) => contains_scan(&node.left) || contains_scan(&node.right),
-        LogicalPlan::AssertOneRow(node) => contains_scan(&node.input),
-        LogicalPlan::Values(_) | LogicalPlan::GenerateSeries(_) | LogicalPlan::CTEConsume(_) => {
-            false
-        }
-        LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
+fn contains_scan(plan: &LogicalPlanNode) -> bool {
+    match &plan.kind {
+        LogicalPlanNodeKind::Scan(_) => true,
+        LogicalPlanNodeKind::ImvDelta(_) | LogicalPlanNodeKind::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
         }
+        _ => plan.children.iter().any(contains_scan),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::sql::planner::plan::*;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -91,7 +72,8 @@ mod tests {
     use crate::sql::optimizer::rewrite::context::{QueryDictionaryProvider, RewriteContext};
     use crate::sql::optimizer::rewrite::registry::query_rewrite_pipeline;
     use crate::sql::planner::plan::{
-        AggregateCall, AggregateNode, DecodeNode, LogicalPlan, ScanNode, SortNode,
+        AggregateCall, LogicalAggregateNode, LogicalDecodeNode, LogicalPlanNode,
+        LogicalPlanNodeKind, LogicalScanNode, LogicalSortNode,
     };
 
     struct StaticProvider {
@@ -189,53 +171,59 @@ mod tests {
 
     #[test]
     fn group_by_string_rewrites_to_dict_column_and_decode() {
-        let scan = LogicalPlan::Scan(ScanNode {
-            database: "db".to_string(),
-            table: make_table(),
-            alias: None,
-            columns: vec![s_output_column()],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        });
-        let aggregate = LogicalPlan::Aggregate(AggregateNode {
-            input: Box::new(scan),
-            group_by: vec![s_column_ref()],
-            aggregates: vec![AggregateCall {
-                name: "count".to_string(),
-                args: vec![],
-                distinct: false,
-                result_type: DataType::Int64,
-                order_by: vec![],
-                output_column_id: ColumnId::UNSET,
-            }],
-            output_columns: vec![
-                s_output_column(),
-                OutputColumn {
-                    column_id: ColumnId::UNSET,
-                    name: "cnt".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
-                    is_internal: false,
-                },
-            ],
-            already_pushed: false,
-            required_output_columns: None,
-        });
+        let scan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: make_table(),
+                alias: None,
+                columns: vec![s_output_column()],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        );
+        let aggregate = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![s_column_ref()],
+                aggregates: vec![AggregateCall {
+                    name: "count".to_string(),
+                    args: vec![],
+                    distinct: false,
+                    result_type: DataType::Int64,
+                    order_by: vec![],
+                    output_column_id: ColumnId::UNSET,
+                }],
+                output_columns: vec![
+                    s_output_column(),
+                    OutputColumn {
+                        column_id: ColumnId::UNSET,
+                        name: "cnt".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        is_internal: false,
+                    },
+                ],
+                already_pushed: false,
+            }),
+            vec![scan],
+            None,
+        );
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         install_provider(&mut ctx, true);
         let table_stats = HashMap::new();
         let pipeline = query_rewrite_pipeline(&table_stats);
         let rewritten = pipeline.rewrite(aggregate, &mut ctx).unwrap();
-        let LogicalPlan::Decode(decode) = rewritten else {
+        let LogicalPlanNodeKind::Decode(decode) = &rewritten.kind else {
             panic!("expected decode root, got {rewritten:?}");
         };
         assert_eq!(decode.mappings.len(), 1);
         assert_eq!(decode.mappings[0].dict_column, "__nr_dict_t_s");
         assert_eq!(decode.mappings[0].string_column, "s");
-        let LogicalPlan::Aggregate(agg) = *decode.input else {
+        let aggregate_plan = rewritten.unary_input();
+        let LogicalPlanNodeKind::Aggregate(agg) = &aggregate_plan.kind else {
             panic!("expected aggregate under decode");
         };
         // Group-by must reference the dict column now.
@@ -247,7 +235,7 @@ mod tests {
         assert_eq!(key.data_type, DataType::Int32);
         // Scan must carry the dict_columns hint and a hidden Int32
         // OutputColumn.
-        let LogicalPlan::Scan(scan) = *agg.input else {
+        let LogicalPlanNodeKind::Scan(scan) = &aggregate_plan.unary_input().kind else {
             panic!("expected scan under aggregate");
         };
         assert_eq!(scan.dict_columns.len(), 1);
@@ -262,40 +250,45 @@ mod tests {
 
     #[test]
     fn topn_non_order_preserving_decodes_before_sort() {
-        let scan = LogicalPlan::Scan(ScanNode {
-            database: "db".to_string(),
-            table: make_table(),
-            alias: None,
-            columns: vec![s_output_column()],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        });
-        let sort = LogicalPlan::Sort(SortNode {
-            input: Box::new(scan),
-            items: vec![SortItem {
-                expr: s_column_ref(),
-                asc: true,
-                nulls_first: false,
-            }],
-            analytic_partition_by: vec![],
-            partition_limit: None,
-            topn_type: None,
-            required_output_columns: None,
-        });
+        let scan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: make_table(),
+                alias: None,
+                columns: vec![s_output_column()],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        );
+        let sort = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Sort(LogicalSortNode {
+                items: vec![SortItem {
+                    expr: s_column_ref(),
+                    asc: true,
+                    nulls_first: false,
+                }],
+                analytic_partition_by: vec![],
+                partition_limit: None,
+                topn_type: None,
+            }),
+            vec![scan],
+            None,
+        );
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         // Non-order-preserving snapshot — sort must decode first.
         install_provider(&mut ctx, false);
         let table_stats = HashMap::new();
         let pipeline = query_rewrite_pipeline(&table_stats);
         let rewritten = pipeline.rewrite(sort, &mut ctx).unwrap();
-        let LogicalPlan::Sort(sort) = rewritten else {
+        let LogicalPlanNodeKind::Sort(sort) = &rewritten.kind else {
             panic!("expected sort root, got {rewritten:?}");
         };
         // Sort's input is a Decode now.
-        let LogicalPlan::Decode(decode) = *sort.input else {
+        let LogicalPlanNodeKind::Decode(decode) = &rewritten.unary_input().kind else {
             panic!("expected decode under sort");
         };
         assert_eq!(decode.mappings.len(), 1);
@@ -304,41 +297,46 @@ mod tests {
 
     #[test]
     fn disable_rule_skips_dictionary_rewrite() {
-        let scan = LogicalPlan::Scan(ScanNode {
-            database: "db".to_string(),
-            table: make_table(),
-            alias: None,
-            columns: vec![s_output_column()],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        });
-        let aggregate = LogicalPlan::Aggregate(AggregateNode {
-            input: Box::new(scan),
-            group_by: vec![s_column_ref()],
-            aggregates: vec![AggregateCall {
-                name: "count".to_string(),
-                args: vec![],
-                distinct: false,
-                result_type: DataType::Int64,
-                order_by: vec![],
-                output_column_id: ColumnId::UNSET,
-            }],
-            output_columns: vec![
-                s_output_column(),
-                OutputColumn {
-                    column_id: ColumnId::UNSET,
-                    name: "cnt".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
-                    is_internal: false,
-                },
-            ],
-            already_pushed: false,
-            required_output_columns: None,
-        });
+        let scan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: make_table(),
+                alias: None,
+                columns: vec![s_output_column()],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        );
+        let aggregate = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![s_column_ref()],
+                aggregates: vec![AggregateCall {
+                    name: "count".to_string(),
+                    args: vec![],
+                    distinct: false,
+                    result_type: DataType::Int64,
+                    order_by: vec![],
+                    output_column_id: ColumnId::UNSET,
+                }],
+                output_columns: vec![
+                    s_output_column(),
+                    OutputColumn {
+                        column_id: ColumnId::UNSET,
+                        name: "cnt".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        is_internal: false,
+                    },
+                ],
+                already_pushed: false,
+            }),
+            vec![scan],
+            None,
+        );
         let mut ctx =
             RewriteContext::for_query(vec!["LowCardinalityDictionaryRewrite".to_string()]);
         install_provider(&mut ctx, true);
@@ -348,13 +346,13 @@ mod tests {
         // With the rule disabled the plan must not contain a Decode
         // boundary or any dict-encoded scan output.
         assert!(
-            !matches!(rewritten, LogicalPlan::Decode(_)),
+            !matches!(&rewritten.kind, LogicalPlanNodeKind::Decode(_)),
             "expected rule disabled to suppress Decode insertion"
         );
-        let LogicalPlan::Aggregate(agg) = rewritten else {
+        let LogicalPlanNodeKind::Aggregate(agg) = &rewritten.kind else {
             panic!("expected aggregate root");
         };
-        let LogicalPlan::Scan(scan) = *agg.input else {
+        let LogicalPlanNodeKind::Scan(scan) = &rewritten.unary_input().kind else {
             panic!("expected scan child");
         };
         assert!(scan.dict_columns.is_empty());
@@ -428,35 +426,42 @@ mod tests {
         // Only `t1` has an active dictionary; `t2` has none. After the
         // rewrite, ONLY the `t1` branch must wear a Decode boundary,
         // and the `t2` branch must be untouched.
-        let scan_t1 = LogicalPlan::Scan(ScanNode {
-            database: "db".to_string(),
-            table: make_named_table("t1", "name"),
-            alias: None,
-            columns: vec![named_output_column("name")],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        });
-        let scan_t2 = LogicalPlan::Scan(ScanNode {
-            database: "db".to_string(),
-            table: make_named_table("t2", "name"),
-            alias: None,
-            columns: vec![named_output_column("name")],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        });
-        let join = LogicalPlan::Join(crate::sql::planner::plan::JoinNode {
-            left: Box::new(scan_t1),
-            right: Box::new(scan_t2),
-            join_type: crate::sql::analysis::JoinKind::Cross,
-            condition: None,
-            required_output_columns: None,
-        });
+        let scan_t1 = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: make_named_table("t1", "name"),
+                alias: None,
+                columns: vec![named_output_column("name")],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        );
+        let scan_t2 = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: make_named_table("t2", "name"),
+                alias: None,
+                columns: vec![named_output_column("name")],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        );
+        let join = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: crate::sql::analysis::JoinKind::Cross,
+                condition: None,
+            }),
+            vec![scan_t1, scan_t2],
+            None,
+        );
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         ctx.set_dictionary_provider(Arc::new(PerTableProvider {
             snapshot: named_snapshot("name", true),
@@ -465,25 +470,24 @@ mod tests {
         let table_stats = HashMap::new();
         let pipeline = query_rewrite_pipeline(&table_stats);
         let rewritten = pipeline.rewrite(join, &mut ctx).unwrap();
-        let LogicalPlan::Join(join) = rewritten else {
+        let LogicalPlanNodeKind::Join(join) = &rewritten.kind else {
             panic!("expected join root, got {rewritten:?}");
         };
         // Left side: must be Decode(Scan with dict_columns).
-        let LogicalPlan::Decode(left_decode) = *join.left else {
-            panic!("expected left side to be Decode, got {:?}", *join.left);
+        let left_plan = rewritten.left();
+        let LogicalPlanNodeKind::Decode(left_decode) = &left_plan.kind else {
+            panic!("expected left side to be Decode, got {:?}", left_plan);
         };
         assert_eq!(left_decode.mappings.len(), 1);
         assert_eq!(left_decode.mappings[0].dict_column, "__nr_dict_t1_name");
-        let LogicalPlan::Scan(left_scan) = *left_decode.input else {
+        let LogicalPlanNodeKind::Scan(left_scan) = &left_plan.unary_input().kind else {
             panic!("expected scan under left decode");
         };
         assert_eq!(left_scan.dict_columns.len(), 1);
         // Right side: must be a plain Scan, no Decode, no dict_columns.
-        let LogicalPlan::Scan(right_scan) = *join.right else {
-            panic!(
-                "expected right side to be plain Scan, got {:?}",
-                *join.right
-            );
+        let right_plan = rewritten.right();
+        let LogicalPlanNodeKind::Scan(right_scan) = &right_plan.kind else {
+            panic!("expected right side to be plain Scan, got {:?}", right_plan);
         };
         assert!(
             right_scan.dict_columns.is_empty(),
@@ -502,60 +506,70 @@ mod tests {
         // SELECT s AS t FROM dict_table feeding a cross join into a
         // no-dict scan. After rewrite, the alias-side branch must wrap
         // the Project with a Decode driven by the dict slot.
-        let scan_left = LogicalPlan::Scan(ScanNode {
-            database: "db".to_string(),
-            table: make_table(),
-            alias: None,
-            columns: vec![s_output_column()],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        });
+        let scan_left = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: make_table(),
+                alias: None,
+                columns: vec![s_output_column()],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        );
         // Project: SELECT s AS t.
-        let project = LogicalPlan::Project(crate::sql::planner::plan::ProjectNode {
-            input: Box::new(scan_left),
-            items: vec![ProjectItem {
-                expr: s_column_ref(),
-                output_name: "t".to_string(),
-                output_column_id: crate::sql::column_id::ColumnId::UNSET,
-            }],
-            output_qualifier: None,
-            required_output_columns: None,
-        });
+        let project = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![ProjectItem {
+                    expr: s_column_ref(),
+                    output_name: "t".to_string(),
+                    output_column_id: crate::sql::column_id::ColumnId::UNSET,
+                }],
+                output_qualifier: None,
+            }),
+            vec![scan_left],
+            None,
+        );
         // Right side: a no-dict scan over a different table.
-        let scan_right = LogicalPlan::Scan(ScanNode {
-            database: "db".to_string(),
-            table: make_named_table("other", "x"),
-            alias: None,
-            columns: vec![named_output_column("x")],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        });
-        let join = LogicalPlan::Join(crate::sql::planner::plan::JoinNode {
-            left: Box::new(project),
-            right: Box::new(scan_right),
-            join_type: crate::sql::analysis::JoinKind::Cross,
-            condition: None,
-            required_output_columns: None,
-        });
+        let scan_right = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: make_named_table("other", "x"),
+                alias: None,
+                columns: vec![named_output_column("x")],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        );
+        let join = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: crate::sql::analysis::JoinKind::Cross,
+                condition: None,
+            }),
+            vec![project, scan_right],
+            None,
+        );
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         install_provider(&mut ctx, true);
         let table_stats = HashMap::new();
         let pipeline = query_rewrite_pipeline(&table_stats);
         let rewritten = pipeline.rewrite(join, &mut ctx).unwrap();
-        let LogicalPlan::Join(join) = rewritten else {
+        let LogicalPlanNodeKind::Join(join) = &rewritten.kind else {
             panic!("expected join root, got {rewritten:?}");
         };
         // Left side: Decode wrapping a Project wrapping the dict-enabled Scan.
-        let LogicalPlan::Decode(left_decode) = *join.left else {
+        let left_plan = rewritten.left();
+        let LogicalPlanNodeKind::Decode(left_decode) = &left_plan.kind else {
             panic!(
                 "expected left to be Decode(Project(Scan)), got {:?}",
-                *join.left
+                left_plan
             );
         };
         assert_eq!(left_decode.mappings.len(), 1);
@@ -575,35 +589,42 @@ mod tests {
         // `__nr_dict_t_s` slot. Without it the Aggregate's rewritten
         // group-by ColumnRef on `__nr_dict_t_s` fails to resolve
         // (`Column '__nr_dict_t_s' cannot be resolved`).
-        let scan = LogicalPlan::Scan(ScanNode {
-            database: "db".to_string(),
-            table: make_table(),
-            alias: None,
-            columns: vec![s_output_column()],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        });
-        let project = LogicalPlan::Project(crate::sql::planner::plan::ProjectNode {
-            input: Box::new(scan),
-            items: vec![ProjectItem {
-                expr: s_column_ref(),
-                output_name: "s".to_string(),
-                output_column_id: crate::sql::column_id::ColumnId::UNSET,
-            }],
-            output_qualifier: None,
-            required_output_columns: None,
-        });
-        let aggregate = LogicalPlan::Aggregate(AggregateNode {
-            input: Box::new(project),
-            group_by: vec![s_column_ref()],
-            aggregates: vec![],
-            output_columns: vec![s_output_column()],
-            already_pushed: false,
-            required_output_columns: None,
-        });
+        let scan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: make_table(),
+                alias: None,
+                columns: vec![s_output_column()],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        );
+        let project = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![ProjectItem {
+                    expr: s_column_ref(),
+                    output_name: "s".to_string(),
+                    output_column_id: crate::sql::column_id::ColumnId::UNSET,
+                }],
+                output_qualifier: None,
+            }),
+            vec![scan],
+            None,
+        );
+        let aggregate = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![s_column_ref()],
+                aggregates: vec![],
+                output_columns: vec![s_output_column()],
+                already_pushed: false,
+            }),
+            vec![project],
+            None,
+        );
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         install_provider(&mut ctx, true);
         let table_stats = HashMap::new();
@@ -614,10 +635,11 @@ mod tests {
         // BOTH the original `s` item AND a pass-through `__nr_dict_t_s`
         // item — that's what makes the Aggregate's dict-slot group-by
         // resolvable at codegen time.
-        let LogicalPlan::Decode(decode) = rewritten else {
+        let LogicalPlanNodeKind::Decode(decode) = &rewritten.kind else {
             panic!("expected decode root, got {rewritten:?}");
         };
-        let LogicalPlan::Aggregate(agg) = *decode.input else {
+        let aggregate_plan = rewritten.unary_input();
+        let LogicalPlanNodeKind::Aggregate(agg) = &aggregate_plan.kind else {
             panic!("expected aggregate under decode");
         };
         let key = agg.group_by.first().expect("group by present");
@@ -625,7 +647,7 @@ mod tests {
             panic!("group-by must be a column ref");
         };
         assert_eq!(column, "__nr_dict_t_s");
-        let LogicalPlan::Project(proj) = *agg.input else {
+        let LogicalPlanNodeKind::Project(proj) = &aggregate_plan.unary_input().kind else {
             panic!("expected project under aggregate");
         };
         let item_names: Vec<&str> = proj.items.iter().map(|i| i.output_name.as_str()).collect();
@@ -656,7 +678,7 @@ mod tests {
     // -------------------------------------------------------------------
 
     use crate::sql::analysis::{BinOp, ExprKind as Ek};
-    use crate::sql::planner::plan::{JoinNode, UnionNode};
+    use crate::sql::planner::plan::{LogicalJoinNode, LogicalUnionNode};
 
     /// Provider that exposes the same snapshot for ANY (table, column)
     /// query — used to model a logical column whose dict mapping is
@@ -731,35 +753,42 @@ mod tests {
         // (shared) dictionary snapshot. The equi-join predicate must be
         // rewritten to compare the dict id slots — and NO Decode must
         // appear between the join and either scan.
-        let scan_t1 = LogicalPlan::Scan(ScanNode {
-            database: "db".to_string(),
-            table: make_named_table("t1", "name"),
-            alias: None,
-            columns: vec![named_output_column("name")],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        });
-        let scan_t2 = LogicalPlan::Scan(ScanNode {
-            database: "db".to_string(),
-            table: make_named_table("t2", "name"),
-            alias: None,
-            columns: vec![named_output_column("name")],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        });
-        let join = LogicalPlan::Join(JoinNode {
-            left: Box::new(scan_t1),
-            right: Box::new(scan_t2),
-            join_type: crate::sql::analysis::JoinKind::Inner,
-            condition: Some(eq(col_ref(Some("t1"), "name"), col_ref(Some("t2"), "name"))),
-            required_output_columns: None,
-        });
+        let scan_t1 = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: make_named_table("t1", "name"),
+                alias: None,
+                columns: vec![named_output_column("name")],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        );
+        let scan_t2 = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: make_named_table("t2", "name"),
+                alias: None,
+                columns: vec![named_output_column("name")],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        );
+        let join = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: crate::sql::analysis::JoinKind::Inner,
+                condition: Some(eq(col_ref(Some("t1"), "name"), col_ref(Some("t2"), "name"))),
+            }),
+            vec![scan_t1, scan_t2],
+            None,
+        );
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         ctx.set_dictionary_provider(Arc::new(SharedSnapshotProvider {
             snapshot: named_snapshot("name", true),
@@ -767,35 +796,41 @@ mod tests {
         let table_stats = HashMap::new();
         let pipeline = query_rewrite_pipeline(&table_stats);
         let rewritten = pipeline.rewrite(join, &mut ctx).unwrap();
-        let LogicalPlan::Join(join) = rewritten else {
+        let LogicalPlanNodeKind::Join(join) = &rewritten.kind else {
             panic!("expected join root, got {rewritten:?}");
         };
         // Both sides must be plain Scans (no Decode) since the dict
         // columns are kept through the equi-join.
-        let LogicalPlan::Scan(left_scan) = *join.left else {
-            panic!("expected left scan kept dict-encoded, got {:?}", *join.left);
+        let LogicalPlanNodeKind::Scan(left_scan) = &rewritten.left().kind else {
+            panic!(
+                "expected left scan kept dict-encoded, got {:?}",
+                rewritten.left()
+            );
         };
         assert_eq!(left_scan.dict_columns.len(), 1);
-        let LogicalPlan::Scan(right_scan) = *join.right else {
+        let LogicalPlanNodeKind::Scan(right_scan) = &rewritten.right().kind else {
             panic!(
                 "expected right scan kept dict-encoded, got {:?}",
-                *join.right
+                rewritten.right()
             );
         };
         assert_eq!(right_scan.dict_columns.len(), 1);
         // The condition must now compare dict columns directly.
-        let cond = join.condition.expect("equi-join keeps a condition");
+        let cond = join
+            .condition
+            .as_ref()
+            .expect("equi-join keeps a condition");
         let Ek::BinaryOp {
             left, op, right, ..
-        } = cond.kind
+        } = &cond.kind
         else {
             panic!("expected BinaryOp condition");
         };
         assert!(matches!(op, BinOp::Eq));
-        let Ek::ColumnRef { column: l_col, .. } = left.kind else {
+        let Ek::ColumnRef { column: l_col, .. } = &left.kind else {
             panic!("expected left ColumnRef in condition");
         };
-        let Ek::ColumnRef { column: r_col, .. } = right.kind else {
+        let Ek::ColumnRef { column: r_col, .. } = &right.kind else {
             panic!("expected right ColumnRef in condition");
         };
         assert_eq!(l_col, "__nr_dict_t1_name");
@@ -806,36 +841,43 @@ mod tests {
     /// `same_dictionary_join_uses_dict_keys`, parameterized on
     /// `JoinKind`. Returns the rewritten plan for the caller to assert
     /// on.
-    fn run_same_dict_join_with_kind(kind: crate::sql::analysis::JoinKind) -> LogicalPlan {
-        let scan_t1 = LogicalPlan::Scan(ScanNode {
-            database: "db".to_string(),
-            table: make_named_table("t1", "name"),
-            alias: None,
-            columns: vec![named_output_column("name")],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        });
-        let scan_t2 = LogicalPlan::Scan(ScanNode {
-            database: "db".to_string(),
-            table: make_named_table("t2", "name"),
-            alias: None,
-            columns: vec![named_output_column("name")],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        });
-        let join = LogicalPlan::Join(JoinNode {
-            left: Box::new(scan_t1),
-            right: Box::new(scan_t2),
-            join_type: kind,
-            condition: Some(eq(col_ref(Some("t1"), "name"), col_ref(Some("t2"), "name"))),
-            required_output_columns: None,
-        });
+    fn run_same_dict_join_with_kind(kind: crate::sql::analysis::JoinKind) -> LogicalPlanNode {
+        let scan_t1 = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: make_named_table("t1", "name"),
+                alias: None,
+                columns: vec![named_output_column("name")],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        );
+        let scan_t2 = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: make_named_table("t2", "name"),
+                alias: None,
+                columns: vec![named_output_column("name")],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        );
+        let join = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: kind,
+                condition: Some(eq(col_ref(Some("t1"), "name"), col_ref(Some("t2"), "name"))),
+            }),
+            vec![scan_t1, scan_t2],
+            None,
+        );
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         ctx.set_dictionary_provider(Arc::new(SharedSnapshotProvider {
             snapshot: named_snapshot("name", true),
@@ -848,33 +890,39 @@ mod tests {
     /// Assert that the rewritten plan is a `Join` whose left/right
     /// inputs are plain `Scan`s (no decode wrappers) and whose equi
     /// condition compares the dict id slots on each side.
-    fn assert_dict_id_equi_join(rewritten: LogicalPlan) {
-        let LogicalPlan::Join(join) = rewritten else {
+    fn assert_dict_id_equi_join(rewritten: LogicalPlanNode) {
+        let LogicalPlanNodeKind::Join(join) = &rewritten.kind else {
             panic!("expected join root, got {rewritten:?}");
         };
-        let LogicalPlan::Scan(left_scan) = *join.left else {
-            panic!("expected left scan kept dict-encoded, got {:?}", *join.left);
+        let LogicalPlanNodeKind::Scan(left_scan) = &rewritten.left().kind else {
+            panic!(
+                "expected left scan kept dict-encoded, got {:?}",
+                rewritten.left()
+            );
         };
         assert_eq!(left_scan.dict_columns.len(), 1);
-        let LogicalPlan::Scan(right_scan) = *join.right else {
+        let LogicalPlanNodeKind::Scan(right_scan) = &rewritten.right().kind else {
             panic!(
                 "expected right scan kept dict-encoded, got {:?}",
-                *join.right
+                rewritten.right()
             );
         };
         assert_eq!(right_scan.dict_columns.len(), 1);
-        let cond = join.condition.expect("equi-join keeps a condition");
+        let cond = join
+            .condition
+            .as_ref()
+            .expect("equi-join keeps a condition");
         let Ek::BinaryOp {
             left, op, right, ..
-        } = cond.kind
+        } = &cond.kind
         else {
             panic!("expected BinaryOp condition");
         };
         assert!(matches!(op, BinOp::Eq));
-        let Ek::ColumnRef { column: l_col, .. } = left.kind else {
+        let Ek::ColumnRef { column: l_col, .. } = &left.kind else {
             panic!("expected left ColumnRef in condition");
         };
-        let Ek::ColumnRef { column: r_col, .. } = right.kind else {
+        let Ek::ColumnRef { column: r_col, .. } = &right.kind else {
             panic!("expected right ColumnRef in condition");
         };
         assert_eq!(l_col, "__nr_dict_t1_name");
@@ -907,35 +955,42 @@ mod tests {
         // Two scans with disagreeing dict versions per table: the
         // rewriter must decode each side before the join (matching
         // Task 7's conservative boundary).
-        let scan_t1 = LogicalPlan::Scan(ScanNode {
-            database: "db".to_string(),
-            table: make_named_table("t1", "name"),
-            alias: None,
-            columns: vec![named_output_column("name")],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        });
-        let scan_t2 = LogicalPlan::Scan(ScanNode {
-            database: "db".to_string(),
-            table: make_named_table("t2", "name"),
-            alias: None,
-            columns: vec![named_output_column("name")],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        });
-        let join = LogicalPlan::Join(JoinNode {
-            left: Box::new(scan_t1),
-            right: Box::new(scan_t2),
-            join_type: crate::sql::analysis::JoinKind::Inner,
-            condition: Some(eq(col_ref(Some("t1"), "name"), col_ref(Some("t2"), "name"))),
-            required_output_columns: None,
-        });
+        let scan_t1 = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: make_named_table("t1", "name"),
+                alias: None,
+                columns: vec![named_output_column("name")],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        );
+        let scan_t2 = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: make_named_table("t2", "name"),
+                alias: None,
+                columns: vec![named_output_column("name")],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        );
+        let join = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: crate::sql::analysis::JoinKind::Inner,
+                condition: Some(eq(col_ref(Some("t1"), "name"), col_ref(Some("t2"), "name"))),
+            }),
+            vec![scan_t1, scan_t2],
+            None,
+        );
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         ctx.set_dictionary_provider(Arc::new(PerTableVersionProvider {
             base: named_snapshot("name", true),
@@ -943,21 +998,21 @@ mod tests {
         let table_stats = HashMap::new();
         let pipeline = query_rewrite_pipeline(&table_stats);
         let rewritten = pipeline.rewrite(join, &mut ctx).unwrap();
-        let LogicalPlan::Join(join) = rewritten else {
+        let LogicalPlanNodeKind::Join(join) = &rewritten.kind else {
             panic!("expected join root, got {rewritten:?}");
         };
         // Both sides must be wrapped in Decode because the snapshots
         // differ on `version`.
-        let LogicalPlan::Decode(_) = *join.left else {
+        let LogicalPlanNodeKind::Decode(_) = &rewritten.left().kind else {
             panic!(
                 "expected left Decode for version-mismatched dicts, got {:?}",
-                *join.left
+                rewritten.left()
             );
         };
-        let LogicalPlan::Decode(_) = *join.right else {
+        let LogicalPlanNodeKind::Decode(_) = &rewritten.right().kind else {
             panic!(
                 "expected right Decode for version-mismatched dicts, got {:?}",
-                *join.right
+                rewritten.right()
             );
         };
     }
@@ -968,34 +1023,42 @@ mod tests {
         // that share a single dict snapshot for their `name` column.
         // The union output must carry the dict binding upward (no
         // Decode immediately below either input).
-        let scan_t1 = LogicalPlan::Scan(ScanNode {
-            database: "db".to_string(),
-            table: make_named_table("t1", "name"),
-            alias: None,
-            columns: vec![named_output_column("name")],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        });
-        let scan_t2 = LogicalPlan::Scan(ScanNode {
-            database: "db".to_string(),
-            table: make_named_table("t2", "name"),
-            alias: None,
-            columns: vec![named_output_column("name")],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        });
-        let union = LogicalPlan::Union(UnionNode {
-            inputs: vec![scan_t1, scan_t2],
-            all: true,
-            output_columns: vec![],
-            required_output_columns: None,
-        });
+        let scan_t1 = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: make_named_table("t1", "name"),
+                alias: None,
+                columns: vec![named_output_column("name")],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        );
+        let scan_t2 = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: make_named_table("t2", "name"),
+                alias: None,
+                columns: vec![named_output_column("name")],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        );
+        let union = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Union(LogicalUnionNode {
+                all: true,
+                output_columns: vec![],
+            }),
+            vec![scan_t1, scan_t2],
+            None,
+        );
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         ctx.set_dictionary_provider(Arc::new(SharedSnapshotProvider {
             snapshot: named_snapshot("name", true),
@@ -1003,12 +1066,12 @@ mod tests {
         let table_stats = HashMap::new();
         let pipeline = query_rewrite_pipeline(&table_stats);
         let rewritten = pipeline.rewrite(union, &mut ctx).unwrap();
-        let LogicalPlan::Union(union) = rewritten else {
+        let LogicalPlanNodeKind::Union(union) = &rewritten.kind else {
             panic!("expected union root, got {rewritten:?}");
         };
         assert!(union.all, "must preserve UNION ALL semantics");
-        for (i, input) in union.inputs.iter().enumerate() {
-            let LogicalPlan::Scan(scan) = input else {
+        for (i, input) in rewritten.children.iter().enumerate() {
+            let LogicalPlanNodeKind::Scan(scan) = &input.kind else {
                 panic!("expected union input {i} to remain a Scan, got {:?}", input);
             };
             assert_eq!(scan.dict_columns.len(), 1);
@@ -1026,34 +1089,42 @@ mod tests {
         // UNION DISTINCT must decode every input regardless of snapshot
         // compatibility, because set-distinct semantics hash on the
         // string value.
-        let scan_t1 = LogicalPlan::Scan(ScanNode {
-            database: "db".to_string(),
-            table: make_named_table("t1", "name"),
-            alias: None,
-            columns: vec![named_output_column("name")],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        });
-        let scan_t2 = LogicalPlan::Scan(ScanNode {
-            database: "db".to_string(),
-            table: make_named_table("t2", "name"),
-            alias: None,
-            columns: vec![named_output_column("name")],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        });
-        let union = LogicalPlan::Union(UnionNode {
-            inputs: vec![scan_t1, scan_t2],
-            all: false,
-            output_columns: vec![],
-            required_output_columns: None,
-        });
+        let scan_t1 = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: make_named_table("t1", "name"),
+                alias: None,
+                columns: vec![named_output_column("name")],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        );
+        let scan_t2 = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: make_named_table("t2", "name"),
+                alias: None,
+                columns: vec![named_output_column("name")],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        );
+        let union = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Union(LogicalUnionNode {
+                all: false,
+                output_columns: vec![],
+            }),
+            vec![scan_t1, scan_t2],
+            None,
+        );
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         ctx.set_dictionary_provider(Arc::new(SharedSnapshotProvider {
             snapshot: named_snapshot("name", true),
@@ -1061,13 +1132,13 @@ mod tests {
         let table_stats = HashMap::new();
         let pipeline = query_rewrite_pipeline(&table_stats);
         let rewritten = pipeline.rewrite(union, &mut ctx).unwrap();
-        let LogicalPlan::Union(union) = rewritten else {
+        let LogicalPlanNodeKind::Union(union) = &rewritten.kind else {
             panic!("expected union root, got {rewritten:?}");
         };
         assert!(!union.all);
-        for input in &union.inputs {
+        for input in &rewritten.children {
             assert!(
-                matches!(input, LogicalPlan::Decode(_)),
+                matches!(&input.kind, LogicalPlanNodeKind::Decode(_)),
                 "UNION DISTINCT input must be wrapped in Decode, got {:?}",
                 input
             );
@@ -1079,45 +1150,50 @@ mod tests {
         // COUNT(s) on a dict-encoded column: the aggregate's arg must
         // be rewritten to the dict slot, without inserting a Decode
         // below the aggregate for that argument path.
-        let scan = LogicalPlan::Scan(ScanNode {
-            database: "db".to_string(),
-            table: make_table(),
-            alias: None,
-            columns: vec![s_output_column()],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        });
-        let aggregate = LogicalPlan::Aggregate(AggregateNode {
-            input: Box::new(scan),
-            group_by: vec![],
-            aggregates: vec![AggregateCall {
-                name: "count".to_string(),
-                args: vec![s_column_ref()],
-                distinct: false,
-                result_type: DataType::Int64,
-                order_by: vec![],
-                output_column_id: ColumnId::UNSET,
-            }],
-            output_columns: vec![OutputColumn {
-                column_id: ColumnId::UNSET,
-                name: "cnt".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
-                is_internal: false,
-            }],
-            already_pushed: false,
-            required_output_columns: None,
-        });
+        let scan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: make_table(),
+                alias: None,
+                columns: vec![s_output_column()],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        );
+        let aggregate = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![],
+                aggregates: vec![AggregateCall {
+                    name: "count".to_string(),
+                    args: vec![s_column_ref()],
+                    distinct: false,
+                    result_type: DataType::Int64,
+                    order_by: vec![],
+                    output_column_id: ColumnId::UNSET,
+                }],
+                output_columns: vec![OutputColumn {
+                    column_id: ColumnId::UNSET,
+                    name: "cnt".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    is_internal: false,
+                }],
+                already_pushed: false,
+            }),
+            vec![scan],
+            None,
+        );
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         install_provider(&mut ctx, true);
         let table_stats = HashMap::new();
         let pipeline = query_rewrite_pipeline(&table_stats);
         let rewritten = pipeline.rewrite(aggregate, &mut ctx).unwrap();
         // No string group-by → no top-level Decode wrapper.
-        let LogicalPlan::Aggregate(agg) = rewritten else {
+        let LogicalPlanNodeKind::Aggregate(agg) = &rewritten.kind else {
             panic!(
                 "expected aggregate root (no group-by string keys), got {:?}",
                 rewritten
@@ -1131,7 +1207,7 @@ mod tests {
         assert_eq!(column, "__nr_dict_t_s");
         assert_eq!(arg.data_type, DataType::Int32);
         // The scan itself must still be intact under the aggregate.
-        let LogicalPlan::Scan(scan) = *agg.input else {
+        let LogicalPlanNodeKind::Scan(scan) = &rewritten.unary_input().kind else {
             panic!("expected scan under aggregate");
         };
         assert_eq!(scan.dict_columns.len(), 1);
@@ -1147,45 +1223,50 @@ mod tests {
         // the scan and NO Decode. (Encoding `s` would have made `min`
         // operate on Int32 dict ids — a latent wrong-result bug; not
         // encoding is the fix.)
-        let scan = LogicalPlan::Scan(ScanNode {
-            database: "db".to_string(),
-            table: make_table(),
-            alias: None,
-            columns: vec![s_output_column()],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        });
-        let aggregate = LogicalPlan::Aggregate(AggregateNode {
-            input: Box::new(scan),
-            group_by: vec![],
-            aggregates: vec![AggregateCall {
-                name: "min".to_string(),
-                args: vec![s_column_ref()],
-                distinct: false,
-                result_type: DataType::Utf8,
-                order_by: vec![],
-                output_column_id: ColumnId::UNSET,
-            }],
-            output_columns: vec![OutputColumn {
-                column_id: ColumnId::UNSET,
-                name: "m".to_string(),
-                data_type: DataType::Utf8,
-                nullable: false,
-                is_internal: false,
-            }],
-            already_pushed: false,
-            required_output_columns: None,
-        });
+        let scan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: make_table(),
+                alias: None,
+                columns: vec![s_output_column()],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        );
+        let aggregate = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![],
+                aggregates: vec![AggregateCall {
+                    name: "min".to_string(),
+                    args: vec![s_column_ref()],
+                    distinct: false,
+                    result_type: DataType::Utf8,
+                    order_by: vec![],
+                    output_column_id: ColumnId::UNSET,
+                }],
+                output_columns: vec![OutputColumn {
+                    column_id: ColumnId::UNSET,
+                    name: "m".to_string(),
+                    data_type: DataType::Utf8,
+                    nullable: false,
+                    is_internal: false,
+                }],
+                already_pushed: false,
+            }),
+            vec![scan],
+            None,
+        );
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         install_provider(&mut ctx, false); // non-order-preserving
         let table_stats = HashMap::new();
         let pipeline = query_rewrite_pipeline(&table_stats);
         let rewritten = pipeline.rewrite(aggregate, &mut ctx).unwrap();
         // No Decode anywhere: the scan keeps emitting the plain string.
-        let LogicalPlan::Aggregate(agg) = rewritten else {
+        let LogicalPlanNodeKind::Aggregate(agg) = &rewritten.kind else {
             panic!("expected aggregate root, got {rewritten:?}");
         };
         let arg = agg.aggregates[0].args.first().expect("min(s) has 1 arg");
@@ -1200,7 +1281,7 @@ mod tests {
         assert_eq!(arg.data_type, DataType::Utf8);
         // NEW correct shape: `s` was blocklisted (only consumed by the
         // non-allowlisted `min`), so the scan has NO dict encoding.
-        let LogicalPlan::Scan(scan) = *agg.input else {
+        let LogicalPlanNodeKind::Scan(scan) = &rewritten.unary_input().kind else {
             panic!("expected scan directly under aggregate (no Decode)");
         };
         assert!(
@@ -1225,44 +1306,49 @@ mod tests {
         // dict-encodes it and the plan is unchanged: a plain
         // `Aggregate(min(s))` over the string column, with NO dict slot on
         // the scan and NO Decode. See `DICT_AGG_FUNCTIONS`.
-        let scan = LogicalPlan::Scan(ScanNode {
-            database: "db".to_string(),
-            table: make_table(),
-            alias: None,
-            columns: vec![s_output_column()],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        });
-        let aggregate = LogicalPlan::Aggregate(AggregateNode {
-            input: Box::new(scan),
-            group_by: vec![],
-            aggregates: vec![AggregateCall {
-                name: "min".to_string(),
-                args: vec![s_column_ref()],
-                distinct: false,
-                result_type: DataType::Utf8,
-                order_by: vec![],
-                output_column_id: ColumnId::UNSET,
-            }],
-            output_columns: vec![OutputColumn {
-                column_id: ColumnId::UNSET,
-                name: "m".to_string(),
-                data_type: DataType::Utf8,
-                nullable: false,
-                is_internal: false,
-            }],
-            already_pushed: false,
-            required_output_columns: None,
-        });
+        let scan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: make_table(),
+                alias: None,
+                columns: vec![s_output_column()],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        );
+        let aggregate = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![],
+                aggregates: vec![AggregateCall {
+                    name: "min".to_string(),
+                    args: vec![s_column_ref()],
+                    distinct: false,
+                    result_type: DataType::Utf8,
+                    order_by: vec![],
+                    output_column_id: ColumnId::UNSET,
+                }],
+                output_columns: vec![OutputColumn {
+                    column_id: ColumnId::UNSET,
+                    name: "m".to_string(),
+                    data_type: DataType::Utf8,
+                    nullable: false,
+                    is_internal: false,
+                }],
+                already_pushed: false,
+            }),
+            vec![scan],
+            None,
+        );
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         install_provider(&mut ctx, true); // order-preserving
         let table_stats = HashMap::new();
         let pipeline = query_rewrite_pipeline(&table_stats);
         let rewritten = pipeline.rewrite(aggregate, &mut ctx).unwrap();
-        let LogicalPlan::Aggregate(agg) = rewritten else {
+        let LogicalPlanNodeKind::Aggregate(agg) = &rewritten.kind else {
             panic!("expected aggregate root, got {rewritten:?}");
         };
         let arg = agg.aggregates[0].args.first().expect("min(s) has 1 arg");
@@ -1279,7 +1365,7 @@ mod tests {
         assert_eq!(arg.data_type, DataType::Utf8);
         // NEW correct shape: `s` was blocklisted (only consumed by the
         // non-allowlisted `min`), so the scan has NO dict encoding.
-        let LogicalPlan::Scan(scan) = *agg.input else {
+        let LogicalPlanNodeKind::Scan(scan) = &rewritten.unary_input().kind else {
             panic!("expected scan directly under aggregate (no Decode)");
         };
         assert!(
@@ -1303,49 +1389,52 @@ mod tests {
         // and the plan is otherwise unchanged. This is the regression for
         // the grf_broadcast wrong-fingerprint bug: hashing the dict id
         // produced a different fingerprint than hashing the string.
-        let scan = LogicalPlan::Scan(ScanNode {
-            database: "db".to_string(),
-            table: TableDef {
-                name: "t".to_string(),
-                columns: vec![
-                    ColumnDef {
-                        name: "s".to_string(),
-                        data_type: DataType::Utf8,
-                        nullable: false,
-                        write_default: None,
-                        logical_type: None,
+        let scan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: TableDef {
+                    name: "t".to_string(),
+                    columns: vec![
+                        ColumnDef {
+                            name: "s".to_string(),
+                            data_type: DataType::Utf8,
+                            nullable: false,
+                            write_default: None,
+                            logical_type: None,
+                        },
+                        ColumnDef {
+                            name: "k".to_string(),
+                            data_type: DataType::Int32,
+                            nullable: false,
+                            write_default: None,
+                            logical_type: None,
+                        },
+                    ],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 0,
                     },
-                    ColumnDef {
+                },
+                alias: None,
+                columns: vec![
+                    s_output_column(),
+                    OutputColumn {
+                        column_id: ColumnId::UNSET,
                         name: "k".to_string(),
                         data_type: DataType::Int32,
                         nullable: false,
-                        write_default: None,
-                        logical_type: None,
+                        is_internal: false,
                     },
                 ],
-                iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::StarRocks {
-                    db_id: 0,
-                    table_id: 0,
-                },
-            },
-            alias: None,
-            columns: vec![
-                s_output_column(),
-                OutputColumn {
-                    column_id: ColumnId::UNSET,
-                    name: "k".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
-                    is_internal: false,
-                },
-            ],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        });
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        );
         // murmur_hash3_32(s)
         let murmur = TypedExpr {
             kind: ExprKind::FunctionCall {
@@ -1365,43 +1454,45 @@ mod tests {
             data_type: DataType::Int32,
             nullable: false,
         };
-        let aggregate = LogicalPlan::Aggregate(AggregateNode {
-            input: Box::new(scan),
-            group_by: vec![k_ref],
-            aggregates: vec![AggregateCall {
-                name: "sum".to_string(),
-                args: vec![murmur],
-                distinct: false,
-                result_type: DataType::Int64,
-                order_by: vec![],
-                output_column_id: ColumnId::UNSET,
-            }],
-            output_columns: vec![
-                OutputColumn {
-                    column_id: ColumnId::UNSET,
-                    name: "k".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
-                    is_internal: false,
-                },
-                OutputColumn {
-                    column_id: ColumnId::UNSET,
-                    name: "h".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
-                    is_internal: false,
-                },
-            ],
-            already_pushed: false,
-            required_output_columns: None,
-        });
+        let aggregate = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![k_ref],
+                aggregates: vec![AggregateCall {
+                    name: "sum".to_string(),
+                    args: vec![murmur],
+                    distinct: false,
+                    result_type: DataType::Int64,
+                    order_by: vec![],
+                    output_column_id: ColumnId::UNSET,
+                }],
+                output_columns: vec![
+                    OutputColumn {
+                        column_id: ColumnId::UNSET,
+                        name: "k".to_string(),
+                        data_type: DataType::Int32,
+                        nullable: false,
+                        is_internal: false,
+                    },
+                    OutputColumn {
+                        column_id: ColumnId::UNSET,
+                        name: "h".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        is_internal: false,
+                    },
+                ],
+                already_pushed: false,
+            }),
+            vec![scan],
+            None,
+        );
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         install_provider(&mut ctx, true);
         let table_stats = HashMap::new();
         let pipeline = query_rewrite_pipeline(&table_stats);
         let rewritten = pipeline.rewrite(aggregate, &mut ctx).unwrap();
         // Plan must be unchanged: Aggregate over a plain Scan, no Decode.
-        let LogicalPlan::Aggregate(agg) = rewritten else {
+        let LogicalPlanNodeKind::Aggregate(agg) = &rewritten.kind else {
             panic!("expected aggregate root (no Decode), got {rewritten:?}");
         };
         // The aggregate arg must still hash the STRING column `s`.
@@ -1418,7 +1509,7 @@ mod tests {
             "murmur must hash the string column, not the dict id"
         );
         // CRITICAL: the scan must not dict-encode `s`.
-        let LogicalPlan::Scan(scan) = *agg.input else {
+        let LogicalPlanNodeKind::Scan(scan) = &rewritten.unary_input().kind else {
             panic!("expected scan directly under aggregate (no Decode)");
         };
         assert!(
@@ -1446,44 +1537,49 @@ mod tests {
         // distinct-on-string. The arg must be rewritten to the Int32
         // dict slot, and the aggregate's BIGINT result is independent
         // of the input encoding — no output-type mismatch.
-        let scan = LogicalPlan::Scan(ScanNode {
-            database: "db".to_string(),
-            table: make_table(),
-            alias: None,
-            columns: vec![s_output_column()],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        });
-        let aggregate = LogicalPlan::Aggregate(AggregateNode {
-            input: Box::new(scan),
-            group_by: vec![],
-            aggregates: vec![AggregateCall {
-                name: "count".to_string(),
-                args: vec![s_column_ref()],
-                distinct: true,
-                result_type: DataType::Int64,
-                order_by: vec![],
-                output_column_id: ColumnId::UNSET,
-            }],
-            output_columns: vec![OutputColumn {
-                column_id: ColumnId::UNSET,
-                name: "cnt".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
-                is_internal: false,
-            }],
-            already_pushed: false,
-            required_output_columns: None,
-        });
+        let scan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: make_table(),
+                alias: None,
+                columns: vec![s_output_column()],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        );
+        let aggregate = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![],
+                aggregates: vec![AggregateCall {
+                    name: "count".to_string(),
+                    args: vec![s_column_ref()],
+                    distinct: true,
+                    result_type: DataType::Int64,
+                    order_by: vec![],
+                    output_column_id: ColumnId::UNSET,
+                }],
+                output_columns: vec![OutputColumn {
+                    column_id: ColumnId::UNSET,
+                    name: "cnt".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    is_internal: false,
+                }],
+                already_pushed: false,
+            }),
+            vec![scan],
+            None,
+        );
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         install_provider(&mut ctx, true);
         let table_stats = HashMap::new();
         let pipeline = query_rewrite_pipeline(&table_stats);
         let rewritten = pipeline.rewrite(aggregate, &mut ctx).unwrap();
-        let LogicalPlan::Aggregate(agg) = rewritten else {
+        let LogicalPlanNodeKind::Aggregate(agg) = &rewritten.kind else {
             panic!("expected aggregate root, got {rewritten:?}");
         };
         assert_eq!(agg.aggregates.len(), 1);
@@ -1523,37 +1619,46 @@ mod tests {
         //
         // This test pins the current behaviour so a future relaxation
         // is a deliberate change rather than an accidental one.
-        use crate::sql::planner::plan::{CTEAnchorNode, CTEConsumeNode, CTEProduceNode};
-        let scan = LogicalPlan::Scan(ScanNode {
-            database: "db".to_string(),
-            table: make_table(),
-            alias: None,
-            columns: vec![s_output_column()],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        });
+        use crate::sql::planner::plan::{
+            LogicalCTEAnchorNode, LogicalCTEConsumeNode, LogicalCTEProduceNode, LogicalPlanNodeKind,
+        };
+        let scan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: make_table(),
+                alias: None,
+                columns: vec![s_output_column()],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        );
         let cte_id: crate::sql::analysis::cte::CteId = 7;
-        let produce = LogicalPlan::CTEProduce(CTEProduceNode {
-            cte_id,
-            input: Box::new(scan),
-            output_columns: vec![s_output_column()],
-            required_output_columns: None,
-        });
-        let consumer = LogicalPlan::CTEConsume(CTEConsumeNode {
-            cte_id,
-            alias: "c".to_string(),
-            output_columns: vec![s_output_column()],
-            required_output_columns: None,
-        });
-        let anchor = LogicalPlan::CTEAnchor(CTEAnchorNode {
-            cte_id,
-            produce: Box::new(produce),
-            consumer: Box::new(consumer),
-            required_output_columns: None,
-        });
+        let produce = LogicalPlanNode::new(
+            LogicalPlanNodeKind::CTEProduce(LogicalCTEProduceNode {
+                cte_id: cte_id,
+                output_columns: vec![s_output_column()],
+            }),
+            vec![scan],
+            None,
+        );
+        let consumer = LogicalPlanNode::new(
+            LogicalPlanNodeKind::CTEConsume(LogicalCTEConsumeNode {
+                cte_id: cte_id,
+                alias: "c".to_string(),
+                output_columns: vec![s_output_column()],
+            }),
+            vec![],
+            None,
+        );
+        let anchor = LogicalPlanNode::new(
+            LogicalPlanNodeKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: cte_id }),
+            vec![produce, consumer],
+            None,
+        );
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         install_provider(&mut ctx, true);
         let table_stats = HashMap::new();
@@ -1563,16 +1668,20 @@ mod tests {
         // producer subtree (between the producer and its scan), so the
         // producer output is all strings. Task 8 keeps this Task 7
         // behaviour — no dict columns leak past the producer.
-        let LogicalPlan::CTEAnchor(anchor) = rewritten else {
+        let LogicalPlanNodeKind::CTEAnchor(_) = &rewritten.kind else {
             panic!("expected CTEAnchor root, got {rewritten:?}");
         };
-        let LogicalPlan::CTEProduce(produce) = *anchor.produce else {
+        let produce_plan = rewritten.child(0);
+        let LogicalPlanNodeKind::CTEProduce(_) = &produce_plan.kind else {
             panic!("expected CTEProduce under anchor");
         };
         assert!(
-            matches!(*produce.input, LogicalPlan::Decode(_)),
+            matches!(
+                &produce_plan.unary_input().kind,
+                LogicalPlanNodeKind::Decode(_)
+            ),
             "Task 8 keeps the conservative CTE producer-side Decode; got {:?}",
-            produce.input
+            produce_plan.unary_input()
         );
     }
 }

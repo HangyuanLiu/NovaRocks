@@ -157,16 +157,16 @@ fn collect_column_refs_inner<'a>(expr: &'a TypedExpr, out: &mut Vec<&'a str>) {
 ///
 /// This is used by predicate pushdown to determine which side of a join a
 /// predicate references.
-pub(crate) fn collect_output_columns(plan: &LogicalPlan) -> HashSet<String> {
-    match plan {
-        LogicalPlan::Scan(s) => s.columns.iter().map(|c| c.name.to_lowercase()).collect(),
-        LogicalPlan::Filter(f) => collect_output_columns(&f.input),
-        LogicalPlan::Project(p) => p
+pub(crate) fn collect_output_columns(plan: &LogicalPlanNode) -> HashSet<String> {
+    match &plan.kind {
+        LogicalPlanNodeKind::Scan(s) => s.columns.iter().map(|c| c.name.to_lowercase()).collect(),
+        LogicalPlanNodeKind::Filter(_) => collect_output_columns(plan.unary_input()),
+        LogicalPlanNodeKind::Project(p) => p
             .items
             .iter()
             .map(|item| item.output_name.to_lowercase())
             .collect(),
-        LogicalPlan::Join(j) => {
+        LogicalPlanNodeKind::Join(j) => {
             let left_only = matches!(
                 j.join_type,
                 crate::sql::analysis::JoinKind::LeftSemi
@@ -175,91 +175,91 @@ pub(crate) fn collect_output_columns(plan: &LogicalPlan) -> HashSet<String> {
                     | crate::sql::analysis::JoinKind::RightAnti
             );
             if left_only {
-                collect_output_columns(&j.left)
+                collect_output_columns(plan.left())
             } else {
-                let mut cols = collect_output_columns(&j.left);
-                cols.extend(collect_output_columns(&j.right));
+                let mut cols = collect_output_columns(plan.left());
+                cols.extend(collect_output_columns(plan.right()));
                 cols
             }
         }
-        LogicalPlan::Aggregate(a) => a
+        LogicalPlanNodeKind::Aggregate(a) => a
             .output_columns
             .iter()
             .map(|c| c.name.to_lowercase())
             .collect(),
-        LogicalPlan::AggregateStateMerge(a) => a
+        LogicalPlanNodeKind::AggregateStateMerge(a) => a
             .output_columns
             .iter()
             .map(|c| c.name.to_lowercase())
             .collect(),
-        LogicalPlan::Sort(s) => collect_output_columns(&s.input),
-        LogicalPlan::Limit(l) => collect_output_columns(&l.input),
-        LogicalPlan::Window(w) => w
+        LogicalPlanNodeKind::Sort(_) => collect_output_columns(plan.unary_input()),
+        LogicalPlanNodeKind::Limit(_) => collect_output_columns(plan.unary_input()),
+        LogicalPlanNodeKind::Window(w) => w
             .output_columns
             .iter()
             .map(|c| c.name.to_lowercase())
             .collect(),
-        LogicalPlan::Union(u) => {
-            if let Some(first) = u.inputs.first() {
+        LogicalPlanNodeKind::Union(_) => {
+            if let Some(first) = plan.children.first() {
                 collect_output_columns(first)
             } else {
                 HashSet::new()
             }
         }
-        LogicalPlan::Intersect(i) => {
-            if let Some(first) = i.inputs.first() {
+        LogicalPlanNodeKind::Intersect(_) => {
+            if let Some(first) = plan.children.first() {
                 collect_output_columns(first)
             } else {
                 HashSet::new()
             }
         }
-        LogicalPlan::Except(e) => {
-            if let Some(first) = e.inputs.first() {
+        LogicalPlanNodeKind::Except(_) => {
+            if let Some(first) = plan.children.first() {
                 collect_output_columns(first)
             } else {
                 HashSet::new()
             }
         }
-        LogicalPlan::Values(v) => v.columns.iter().map(|c| c.name.to_lowercase()).collect(),
-        LogicalPlan::GenerateSeries(g) => {
+        LogicalPlanNodeKind::Values(v) => v.columns.iter().map(|c| c.name.to_lowercase()).collect(),
+        LogicalPlanNodeKind::GenerateSeries(g) => {
             let mut cols = HashSet::new();
             cols.insert(g.column_name.to_lowercase());
             cols
         }
-        LogicalPlan::TableFunction(t) => {
-            let mut cols = collect_output_columns(&t.input);
+        LogicalPlanNodeKind::TableFunction(t) => {
+            let mut cols = collect_output_columns(plan.unary_input());
             cols.extend(t.output_columns.iter().map(|c| c.name.to_lowercase()));
             cols
         }
-        LogicalPlan::CTEAnchor(a) => collect_output_columns(&a.consumer),
-        LogicalPlan::CTEProduce(p) => p
+        LogicalPlanNodeKind::CTEAnchor(_) => collect_output_columns(plan.child(1)),
+        LogicalPlanNodeKind::CTEProduce(p) => p
             .output_columns
             .iter()
             .map(|col| col.name.to_lowercase())
             .collect(),
-        LogicalPlan::Repeat(r) => collect_output_columns(&r.input),
-        LogicalPlan::CTEConsume(c) => c
+        LogicalPlanNodeKind::Repeat(_) => collect_output_columns(plan.unary_input()),
+        LogicalPlanNodeKind::CTEConsume(c) => c
             .output_columns
             .iter()
             .map(|col| col.name.to_lowercase())
             .collect(),
-        LogicalPlan::Decode(d) => {
+        LogicalPlanNodeKind::Decode(d) => {
             // Decode replaces dict columns with their string counterparts
             // but otherwise passes through the child's output set.
-            let mut cols = collect_output_columns(&d.input);
+            let mut cols = collect_output_columns(plan.unary_input());
             for mapping in &d.mappings {
                 cols.remove(&mapping.dict_column.to_lowercase());
                 cols.insert(mapping.string_column.to_lowercase());
             }
             cols
         }
-        LogicalPlan::Apply(a) => {
-            let mut out = collect_output_columns(&a.left);
+        LogicalPlanNodeKind::Apply(a) => {
+            let mut out = collect_output_columns(plan.left());
             out.insert(a.output_column.name.to_lowercase());
             out
         }
-        LogicalPlan::AssertOneRow(a) => collect_output_columns(&a.input),
-        LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
+        LogicalPlanNodeKind::AssertOneRow(_) => collect_output_columns(plan.unary_input()),
+        LogicalPlanNodeKind::ImvDelta(_) | LogicalPlanNodeKind::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
         }
     }
@@ -378,29 +378,33 @@ fn collect_column_id_refs_inner(
 /// used by the Phase-1 column-pruning tagging pass to split a parent's needed set
 /// across join/set-op children.
 pub(crate) fn collect_output_ids_ordered(
-    plan: &LogicalPlan,
+    plan: &LogicalPlanNode,
 ) -> Vec<crate::sql::column_id::ColumnId> {
-    match plan {
-        LogicalPlan::Scan(s) => s.columns.iter().map(|c| c.column_id).collect(),
-        LogicalPlan::Project(p) => p
+    match &plan.kind {
+        LogicalPlanNodeKind::Scan(s) => s.columns.iter().map(|c| c.column_id).collect(),
+        LogicalPlanNodeKind::Project(p) => p
             .items
             .iter()
             .map(|item| item.output_column_id)
             .filter(|id| *id != crate::sql::column_id::ColumnId::UNSET)
             .collect(),
-        LogicalPlan::Aggregate(a) => a.output_columns.iter().map(|c| c.column_id).collect(),
-        LogicalPlan::Window(w) => w.output_columns.iter().map(|c| c.column_id).collect(),
-        LogicalPlan::CTEProduce(p) => p.output_columns.iter().map(|c| c.column_id).collect(),
-        LogicalPlan::CTEConsume(c) => c.output_columns.iter().map(|c| c.column_id).collect(),
-        LogicalPlan::Union(u) => u.output_columns.iter().map(|c| c.column_id).collect(),
-        LogicalPlan::Intersect(i) => i.output_columns.iter().map(|c| c.column_id).collect(),
-        LogicalPlan::Except(e) => e.output_columns.iter().map(|c| c.column_id).collect(),
-        LogicalPlan::Decode(d) => d.output_columns.iter().map(|c| c.column_id).collect(),
-        LogicalPlan::AggregateStateMerge(a) => {
+        LogicalPlanNodeKind::Aggregate(a) => a.output_columns.iter().map(|c| c.column_id).collect(),
+        LogicalPlanNodeKind::Window(w) => w.output_columns.iter().map(|c| c.column_id).collect(),
+        LogicalPlanNodeKind::CTEProduce(p) => {
+            p.output_columns.iter().map(|c| c.column_id).collect()
+        }
+        LogicalPlanNodeKind::CTEConsume(c) => {
+            c.output_columns.iter().map(|c| c.column_id).collect()
+        }
+        LogicalPlanNodeKind::Union(u) => u.output_columns.iter().map(|c| c.column_id).collect(),
+        LogicalPlanNodeKind::Intersect(i) => i.output_columns.iter().map(|c| c.column_id).collect(),
+        LogicalPlanNodeKind::Except(e) => e.output_columns.iter().map(|c| c.column_id).collect(),
+        LogicalPlanNodeKind::Decode(d) => d.output_columns.iter().map(|c| c.column_id).collect(),
+        LogicalPlanNodeKind::AggregateStateMerge(a) => {
             a.output_columns.iter().map(|c| c.column_id).collect()
         }
-        LogicalPlan::Values(v) => v.columns.iter().map(|c| c.column_id).collect(),
-        LogicalPlan::GenerateSeries(g) => {
+        LogicalPlanNodeKind::Values(v) => v.columns.iter().map(|c| c.column_id).collect(),
+        LogicalPlanNodeKind::GenerateSeries(g) => {
             if g.output_column_id == crate::sql::column_id::ColumnId::UNSET {
                 vec![]
             } else {
@@ -408,30 +412,30 @@ pub(crate) fn collect_output_ids_ordered(
             }
         }
         // Passthrough: the node does not add or rename output ColumnIds.
-        LogicalPlan::Filter(f) => collect_output_ids_ordered(&f.input),
-        LogicalPlan::Sort(s) => collect_output_ids_ordered(&s.input),
-        LogicalPlan::Limit(l) => collect_output_ids_ordered(&l.input),
-        LogicalPlan::Repeat(r) => collect_output_ids_ordered(&r.input),
-        LogicalPlan::TableFunction(t) => {
+        LogicalPlanNodeKind::Filter(_)
+        | LogicalPlanNodeKind::Sort(_)
+        | LogicalPlanNodeKind::Limit(_)
+        | LogicalPlanNodeKind::Repeat(_) => collect_output_ids_ordered(plan.unary_input()),
+        LogicalPlanNodeKind::TableFunction(t) => {
             // TableFunction extends the input's output with its own output columns.
-            let mut ids = collect_output_ids_ordered(&t.input);
+            let mut ids = collect_output_ids_ordered(plan.unary_input());
             ids.extend(t.output_columns.iter().map(|c| c.column_id));
             ids
         }
-        LogicalPlan::Join(j) => {
+        LogicalPlanNodeKind::Join(_) => {
             // Join output = left output ids ++ right output ids (left first).
-            let mut ids = collect_output_ids_ordered(&j.left);
-            ids.extend(collect_output_ids_ordered(&j.right));
+            let mut ids = collect_output_ids_ordered(plan.left());
+            ids.extend(collect_output_ids_ordered(plan.right()));
             ids
         }
-        LogicalPlan::CTEAnchor(a) => collect_output_ids_ordered(&a.consumer),
-        LogicalPlan::Apply(a) => {
-            let mut ids = collect_output_ids_ordered(&a.left);
+        LogicalPlanNodeKind::CTEAnchor(_) => collect_output_ids_ordered(plan.child(1)),
+        LogicalPlanNodeKind::Apply(a) => {
+            let mut ids = collect_output_ids_ordered(plan.left());
             ids.push(a.output_column.column_id);
             ids
         }
-        LogicalPlan::AssertOneRow(a) => collect_output_ids_ordered(&a.input),
-        LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
+        LogicalPlanNodeKind::AssertOneRow(_) => collect_output_ids_ordered(plan.unary_input()),
+        LogicalPlanNodeKind::ImvDelta(_) | LogicalPlanNodeKind::ImvVersion(_) => {
             panic!("imv marker should not appear in non-IMV pruning")
         }
     }
@@ -440,7 +444,9 @@ pub(crate) fn collect_output_ids_ordered(
 /// Return the set of [`ColumnId`]s in the output schema of a plan node.
 ///
 /// `collect_output_ids(plan) = collect_output_ids_ordered(plan).into_iter().collect()`.
-pub(crate) fn collect_output_ids(plan: &LogicalPlan) -> HashSet<crate::sql::column_id::ColumnId> {
+pub(crate) fn collect_output_ids(
+    plan: &LogicalPlanNode,
+) -> HashSet<crate::sql::column_id::ColumnId> {
     collect_output_ids_ordered(plan).into_iter().collect()
 }
 
@@ -564,15 +570,20 @@ pub(crate) fn merge_needed(parent: Option<&HashSet<String>>, extra: &[&str]) -> 
 }
 
 /// Wrap a plan in a Filter if there are remaining (un-pushed) predicates.
-pub(crate) fn wrap_remaining_filter(plan: LogicalPlan, remaining: Vec<TypedExpr>) -> LogicalPlan {
+pub(crate) fn wrap_remaining_filter(
+    plan: LogicalPlanNode,
+    remaining: Vec<TypedExpr>,
+) -> LogicalPlanNode {
     if remaining.is_empty() {
         plan
     } else {
-        LogicalPlan::Filter(FilterNode {
-            input: Box::new(plan),
-            predicate: combine_and(remaining),
-            required_output_columns: None,
-        })
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: combine_and(remaining),
+            }),
+            vec![plan],
+            None,
+        )
     }
 }
 
@@ -697,15 +708,15 @@ fn collect_qualified_column_refs_inner(expr: &TypedExpr, out: &mut Vec<Qualified
 /// Returns `(qualifier, column_name)` pairs where `qualifier` is the table
 /// alias (for Scan nodes with an alias) or `None`.  Each column also yields a
 /// bare `(None, column_name)` entry so that unqualified references still match.
-pub(crate) fn collect_qualified_output_columns(plan: &LogicalPlan) -> HashSet<QualifiedRef> {
+pub(crate) fn collect_qualified_output_columns(plan: &LogicalPlanNode) -> HashSet<QualifiedRef> {
     let mut out = HashSet::new();
     collect_qualified_output_columns_inner(plan, &mut out);
     out
 }
 
-fn collect_qualified_output_columns_inner(plan: &LogicalPlan, out: &mut HashSet<QualifiedRef>) {
-    match plan {
-        LogicalPlan::Scan(s) => {
+fn collect_qualified_output_columns_inner(plan: &LogicalPlanNode, out: &mut HashSet<QualifiedRef>) {
+    match &plan.kind {
+        LogicalPlanNodeKind::Scan(s) => {
             let alias = s
                 .alias
                 .as_ref()
@@ -721,58 +732,61 @@ fn collect_qualified_output_columns_inner(plan: &LogicalPlan, out: &mut HashSet<
                 out.insert((None, col));
             }
         }
-        LogicalPlan::Filter(f) => collect_qualified_output_columns_inner(&f.input, out),
-        LogicalPlan::Project(p) => {
+        LogicalPlanNodeKind::Filter(_) => {
+            collect_qualified_output_columns_inner(plan.unary_input(), out)
+        }
+        LogicalPlanNodeKind::Project(p) => {
             for item in &p.items {
                 out.insert((None, item.output_name.to_lowercase()));
             }
         }
-        LogicalPlan::Join(j) => {
-            collect_qualified_output_columns_inner(&j.left, out);
-            collect_qualified_output_columns_inner(&j.right, out);
+        LogicalPlanNodeKind::Join(_) => {
+            collect_qualified_output_columns_inner(plan.left(), out);
+            collect_qualified_output_columns_inner(plan.right(), out);
         }
-        LogicalPlan::Aggregate(a) => {
+        LogicalPlanNodeKind::Aggregate(a) => {
             for c in &a.output_columns {
                 out.insert((None, c.name.to_lowercase()));
             }
         }
-        LogicalPlan::AggregateStateMerge(a) => {
+        LogicalPlanNodeKind::AggregateStateMerge(a) => {
             for c in &a.output_columns {
                 out.insert((None, c.name.to_lowercase()));
             }
         }
-        LogicalPlan::Sort(s) => collect_qualified_output_columns_inner(&s.input, out),
-        LogicalPlan::Limit(l) => collect_qualified_output_columns_inner(&l.input, out),
-        LogicalPlan::Window(w) => {
+        LogicalPlanNodeKind::Sort(_) | LogicalPlanNodeKind::Limit(_) => {
+            collect_qualified_output_columns_inner(plan.unary_input(), out)
+        }
+        LogicalPlanNodeKind::Window(w) => {
             for c in &w.output_columns {
                 out.insert((None, c.name.to_lowercase()));
             }
         }
-        LogicalPlan::Union(u) => {
-            if let Some(first) = u.inputs.first() {
+        LogicalPlanNodeKind::Union(_) => {
+            if let Some(first) = plan.children.first() {
                 collect_qualified_output_columns_inner(first, out);
             }
         }
-        LogicalPlan::Intersect(i) => {
-            if let Some(first) = i.inputs.first() {
+        LogicalPlanNodeKind::Intersect(_) => {
+            if let Some(first) = plan.children.first() {
                 collect_qualified_output_columns_inner(first, out);
             }
         }
-        LogicalPlan::Except(e) => {
-            if let Some(first) = e.inputs.first() {
+        LogicalPlanNodeKind::Except(_) => {
+            if let Some(first) = plan.children.first() {
                 collect_qualified_output_columns_inner(first, out);
             }
         }
-        LogicalPlan::Values(v) => {
+        LogicalPlanNodeKind::Values(v) => {
             for c in &v.columns {
                 out.insert((None, c.name.to_lowercase()));
             }
         }
-        LogicalPlan::GenerateSeries(g) => {
+        LogicalPlanNodeKind::GenerateSeries(g) => {
             out.insert((None, g.column_name.to_lowercase()));
         }
-        LogicalPlan::TableFunction(t) => {
-            collect_qualified_output_columns_inner(&t.input, out);
+        LogicalPlanNodeKind::TableFunction(t) => {
+            collect_qualified_output_columns_inner(plan.unary_input(), out);
             for col in &t.output_columns {
                 out.insert((
                     t.alias.as_ref().map(|alias| alias.to_lowercase()),
@@ -780,16 +794,18 @@ fn collect_qualified_output_columns_inner(plan: &LogicalPlan, out: &mut HashSet<
                 ));
             }
         }
-        LogicalPlan::CTEAnchor(a) => {
-            collect_qualified_output_columns_inner(&a.consumer, out);
+        LogicalPlanNodeKind::CTEAnchor(_) => {
+            collect_qualified_output_columns_inner(plan.child(1), out);
         }
-        LogicalPlan::CTEProduce(p) => {
+        LogicalPlanNodeKind::CTEProduce(p) => {
             for col in &p.output_columns {
                 out.insert((None, col.name.to_lowercase()));
             }
         }
-        LogicalPlan::Repeat(r) => collect_qualified_output_columns_inner(&r.input, out),
-        LogicalPlan::CTEConsume(c) => {
+        LogicalPlanNodeKind::Repeat(_) => {
+            collect_qualified_output_columns_inner(plan.unary_input(), out)
+        }
+        LogicalPlanNodeKind::CTEConsume(c) => {
             let alias_lower = c.alias.to_lowercase();
             for col in &c.output_columns {
                 let col_name = col.name.to_lowercase();
@@ -797,8 +813,8 @@ fn collect_qualified_output_columns_inner(plan: &LogicalPlan, out: &mut HashSet<
                 out.insert((None, col_name));
             }
         }
-        LogicalPlan::Decode(d) => {
-            collect_qualified_output_columns_inner(&d.input, out);
+        LogicalPlanNodeKind::Decode(d) => {
+            collect_qualified_output_columns_inner(plan.unary_input(), out);
             // Decode adds string output columns alongside the dict inputs.
             for mapping in &d.mappings {
                 out.insert((None, mapping.string_column.to_lowercase()));
@@ -808,9 +824,11 @@ fn collect_qualified_output_columns_inner(plan: &LogicalPlan, out: &mut HashSet<
         // side contributes qualified refs.
         // Apply's right child (the subquery) is in a nested scope; its table
         // qualifications are not visible in the outer query.
-        LogicalPlan::Apply(a) => collect_qualified_output_columns_inner(&a.left, out),
-        LogicalPlan::AssertOneRow(a) => collect_qualified_output_columns_inner(&a.input, out),
-        LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
+        LogicalPlanNodeKind::Apply(_) => collect_qualified_output_columns_inner(plan.left(), out),
+        LogicalPlanNodeKind::AssertOneRow(_) => {
+            collect_qualified_output_columns_inner(plan.unary_input(), out)
+        }
+        LogicalPlanNodeKind::ImvDelta(_) | LogicalPlanNodeKind::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
         }
     }
@@ -881,14 +899,18 @@ fn classify_operand(
 /// Extract equi-join key pairs from a join's ON condition (lenient: walks the
 /// top-level AND chain and keeps every `col = col` conjunct it can orient,
 /// ignoring other conjuncts). Returns empty when there is no usable equi key.
-pub(crate) fn join_equi_keys(join: &JoinNode) -> Vec<JoinEquiKey> {
+pub(crate) fn join_equi_keys(
+    join: &LogicalJoinNode,
+    left: &LogicalPlanNode,
+    right: &LogicalPlanNode,
+) -> Vec<JoinEquiKey> {
     let Some(condition) = join.condition.as_ref() else {
         return Vec::new();
     };
-    let left_cols = collect_qualified_output_columns(&join.left);
-    let right_cols = collect_qualified_output_columns(&join.right);
-    let left_ids = collect_output_ids(&join.left);
-    let right_ids = collect_output_ids(&join.right);
+    let left_cols = collect_qualified_output_columns(left);
+    let right_cols = collect_qualified_output_columns(right);
+    let left_ids = collect_output_ids(left);
+    let right_ids = collect_output_ids(right);
     let mut keys = Vec::new();
     collect_join_equi_keys(
         condition,
@@ -1015,7 +1037,7 @@ mod column_id_helper_tests {
         }
     }
 
-    fn three_col_scan(ids: [ColumnId; 3]) -> LogicalPlan {
+    fn three_col_scan(ids: [ColumnId; 3]) -> LogicalPlanNode {
         let table = TableDef {
             name: "t".to_string(),
             columns: vec![
@@ -1047,21 +1069,24 @@ mod column_id_helper_tests {
                 table_id: 0,
             },
         };
-        LogicalPlan::Scan(ScanNode {
-            database: "default".to_string(),
-            table,
-            alias: None,
-            columns: vec![
-                make_output_column(ids[0], "a"),
-                make_output_column(ids[1], "b"),
-                make_output_column(ids[2], "c"),
-            ],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        })
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "default".to_string(),
+                table: table,
+                alias: None,
+                columns: vec![
+                    make_output_column(ids[0], "a"),
+                    make_output_column(ids[1], "b"),
+                    make_output_column(ids[2], "c"),
+                ],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        )
     }
 
     #[test]
@@ -1103,13 +1128,14 @@ mod column_id_helper_tests {
             ColumnId::new_for_test(5),
             ColumnId::new_for_test(6),
         ];
-        let plan = LogicalPlan::Join(JoinNode {
-            left: Box::new(three_col_scan(left_ids)),
-            right: Box::new(three_col_scan(right_ids)),
-            join_type: crate::sql::analysis::JoinKind::Inner,
-            condition: None,
-            required_output_columns: None,
-        });
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: crate::sql::analysis::JoinKind::Inner,
+                condition: None,
+            }),
+            vec![three_col_scan(left_ids), three_col_scan(right_ids)],
+            None,
+        );
         let ordered = collect_output_ids_ordered(&plan);
         let expected: Vec<ColumnId> = left_ids.iter().chain(right_ids.iter()).copied().collect();
         assert_eq!(ordered, expected);
@@ -1154,12 +1180,14 @@ mod column_id_helper_tests {
             output_column_id: comp_id,
         };
 
-        let plan = LogicalPlan::Project(ProjectNode {
-            input: Box::new(scan),
-            items: vec![passthrough_item, computed_item],
-            output_qualifier: None,
-            required_output_columns: None,
-        });
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![passthrough_item, computed_item],
+                output_qualifier: None,
+            }),
+            vec![scan],
+            None,
+        );
 
         let ordered = collect_output_ids_ordered(&plan);
         assert_eq!(
@@ -1193,12 +1221,14 @@ mod column_id_helper_tests {
             output_column_id: ColumnId::UNSET,
         };
 
-        let plan = LogicalPlan::Project(ProjectNode {
-            input: Box::new(scan),
-            items: vec![real_item, unset_item],
-            output_qualifier: None,
-            required_output_columns: None,
-        });
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![real_item, unset_item],
+                output_qualifier: None,
+            }),
+            vec![scan],
+            None,
+        );
 
         let ordered = collect_output_ids_ordered(&plan);
         assert_eq!(ordered, vec![real_id], "UNSET items must be filtered out");
@@ -1206,18 +1236,21 @@ mod column_id_helper_tests {
 
     #[test]
     fn generate_series_output_id_is_collected() {
-        use crate::sql::planner::plan::GenerateSeriesNode;
+        use crate::sql::planner::plan::LogicalGenerateSeriesNode;
 
         let output_id = ColumnId::new_for_test(88);
-        let plan = LogicalPlan::GenerateSeries(GenerateSeriesNode {
-            start: 1,
-            end: 3,
-            step: 1,
-            column_name: "x".to_string(),
-            alias: Some("gs".to_string()),
-            output_column_id: output_id,
-            required_output_columns: None,
-        });
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::GenerateSeries(LogicalGenerateSeriesNode {
+                start: 1,
+                end: 3,
+                step: 1,
+                column_name: "x".to_string(),
+                alias: Some("gs".to_string()),
+                output_column_id: output_id,
+            }),
+            vec![],
+            None,
+        );
 
         let ordered = collect_output_ids_ordered(&plan);
         assert_eq!(
@@ -1234,7 +1267,7 @@ mod column_id_helper_tests {
     // join_equi_keys tests
     // ---------------------------------------------------------------------
 
-    fn nullable_scan(alias: &str, table: &str, cols: &[(&str, u32)]) -> LogicalPlan {
+    fn nullable_scan(alias: &str, table: &str, cols: &[(&str, u32)]) -> LogicalPlanNode {
         let column_defs = cols
             .iter()
             .map(|(name, _)| ColumnDef {
@@ -1255,25 +1288,28 @@ mod column_id_helper_tests {
                 is_internal: false,
             })
             .collect();
-        LogicalPlan::Scan(ScanNode {
-            database: "default".to_string(),
-            table: TableDef {
-                name: table.to_string(),
-                columns: column_defs,
-                iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::StarRocks {
-                    db_id: 0,
-                    table_id: 0,
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "default".to_string(),
+                table: TableDef {
+                    name: table.to_string(),
+                    columns: column_defs,
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 0,
+                    },
                 },
-            },
-            alias: Some(alias.to_string()),
-            columns: output,
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        })
+                alias: Some(alias.to_string()),
+                columns: output,
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        )
     }
 
     fn qcol(qualifier: &str, name: &str, id: u32) -> TypedExpr {
@@ -1312,20 +1348,31 @@ mod column_id_helper_tests {
         }
     }
 
-    fn two_table_join(condition: Option<TypedExpr>) -> JoinNode {
-        JoinNode {
-            left: Box::new(nullable_scan("l", "tl", &[("a", 1), ("a2", 3)])),
-            right: Box::new(nullable_scan("r", "tr", &[("b", 2), ("b2", 4)])),
-            join_type: crate::sql::analysis::JoinKind::Inner,
-            condition,
-            required_output_columns: None,
-        }
+    fn two_table_join(condition: Option<TypedExpr>) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: crate::sql::analysis::JoinKind::Inner,
+                condition,
+            }),
+            vec![
+                nullable_scan("l", "tl", &[("a", 1), ("a2", 3)]),
+                nullable_scan("r", "tr", &[("b", 2), ("b2", 4)]),
+            ],
+            None,
+        )
+    }
+
+    fn test_join_equi_keys(join_plan: &LogicalPlanNode) -> Vec<JoinEquiKey> {
+        let LogicalPlanNodeKind::Join(join) = &join_plan.kind else {
+            panic!("expected Join test plan");
+        };
+        join_equi_keys(join, join_plan.left(), join_plan.right())
     }
 
     #[test]
     fn join_equi_keys_extracts_single_pair_oriented_left_right() {
         let join = two_table_join(Some(eq_expr(qcol("l", "a", 1), qcol("r", "b", 2))));
-        let keys = join_equi_keys(&join);
+        let keys = test_join_equi_keys(&join);
         assert_eq!(keys.len(), 1);
         // left operand belongs to join.left, right operand to join.right.
         assert!(matches!(&keys[0].left.kind, ExprKind::ColumnRef { column, .. } if column == "a"));
@@ -1336,7 +1383,7 @@ mod column_id_helper_tests {
     fn join_equi_keys_orients_reversed_pair() {
         // r.b = l.a  -> still left=a, right=b
         let join = two_table_join(Some(eq_expr(qcol("r", "b", 2), qcol("l", "a", 1))));
-        let keys = join_equi_keys(&join);
+        let keys = test_join_equi_keys(&join);
         assert_eq!(keys.len(), 1);
         assert!(matches!(&keys[0].left.kind, ExprKind::ColumnRef { column, .. } if column == "a"));
         assert!(matches!(&keys[0].right.kind, ExprKind::ColumnRef { column, .. } if column == "b"));
@@ -1348,13 +1395,13 @@ mod column_id_helper_tests {
             eq_expr(qcol("l", "a", 1), qcol("r", "b", 2)),
             eq_expr(qcol("l", "a2", 3), qcol("r", "b2", 4)),
         )));
-        let keys = join_equi_keys(&join);
+        let keys = test_join_equi_keys(&join);
         assert_eq!(keys.len(), 2);
     }
 
     #[test]
     fn join_equi_keys_skips_non_equi_and_missing_condition() {
-        assert!(join_equi_keys(&two_table_join(None)).is_empty());
+        assert!(test_join_equi_keys(&two_table_join(None)).is_empty());
         let gt = TypedExpr {
             kind: ExprKind::BinaryOp {
                 left: Box::new(qcol("l", "a", 1)),
@@ -1364,7 +1411,7 @@ mod column_id_helper_tests {
             data_type: DataType::Boolean,
             nullable: true,
         };
-        assert!(join_equi_keys(&two_table_join(Some(gt))).is_empty());
+        assert!(test_join_equi_keys(&two_table_join(Some(gt))).is_empty());
     }
 
     #[test]
@@ -1378,7 +1425,7 @@ mod column_id_helper_tests {
             nullable: true,
         };
         let join = two_table_join(Some(eq_expr(cast_col, qcol("r", "b", 2))));
-        let keys = join_equi_keys(&join);
+        let keys = test_join_equi_keys(&join);
         assert_eq!(keys.len(), 1);
         assert!(matches!(&keys[0].left.kind, ExprKind::ColumnRef { column, .. } if column == "a"));
     }
@@ -1394,20 +1441,24 @@ mod column_id_helper_tests {
             data_type: DataType::Boolean,
             nullable: false,
         };
-        assert!(join_equi_keys(&two_table_join(Some(cond))).is_empty());
+        assert!(test_join_equi_keys(&two_table_join(Some(cond))).is_empty());
     }
 
     #[test]
     fn join_equi_keys_disambiguates_self_join_by_qualifier() {
         // q22 shape: same column name on both sides, distinct aliases.
-        let join = JoinNode {
-            left: Box::new(nullable_scan("a", "t", &[("k", 1)])),
-            right: Box::new(nullable_scan("b", "t", &[("k", 2)])),
-            join_type: crate::sql::analysis::JoinKind::LeftSemi,
-            condition: Some(eq_expr(qcol("a", "k", 1), qcol("b", "k", 2))),
-            required_output_columns: None,
-        };
-        let keys = join_equi_keys(&join);
+        let join = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: crate::sql::analysis::JoinKind::LeftSemi,
+                condition: Some(eq_expr(qcol("a", "k", 1), qcol("b", "k", 2))),
+            }),
+            vec![
+                nullable_scan("a", "t", &[("k", 1)]),
+                nullable_scan("b", "t", &[("k", 2)]),
+            ],
+            None,
+        );
+        let keys = test_join_equi_keys(&join);
         assert_eq!(keys.len(), 1);
         assert!(
             matches!(&keys[0].left.kind, ExprKind::ColumnRef { qualifier: Some(q), .. } if q == "a")
@@ -1417,48 +1468,61 @@ mod column_id_helper_tests {
         );
     }
 
-    fn derived_project_with_output_id(name: &str, source_id: u32, output_id: u32) -> LogicalPlan {
-        LogicalPlan::Project(ProjectNode {
-            input: Box::new(LogicalPlan::Values(ValuesNode {
-                rows: vec![],
-                columns: vec![OutputColumn {
-                    column_id: ColumnId::new_for_test(source_id),
-                    name: format!("{name}_source"),
-                    data_type: DataType::Int32,
-                    nullable: true,
-                    is_internal: false,
-                }],
-                required_output_columns: None,
-            })),
-            items: vec![ProjectItem {
-                expr: TypedExpr {
-                    kind: ExprKind::ColumnRef {
-                        column_id: ColumnId::new_for_test(source_id),
-                        qualifier: None,
-                        column: format!("{name}_source"),
+    fn derived_project_with_output_id(
+        name: &str,
+        source_id: u32,
+        output_id: u32,
+    ) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![ProjectItem {
+                    expr: TypedExpr {
+                        kind: ExprKind::ColumnRef {
+                            column_id: ColumnId::new_for_test(source_id),
+                            qualifier: None,
+                            column: format!("{name}_source"),
+                        },
+                        data_type: DataType::Int32,
+                        nullable: true,
                     },
-                    data_type: DataType::Int32,
-                    nullable: true,
-                },
-                output_name: "k".to_string(),
-                output_column_id: ColumnId::new_for_test(output_id),
-            }],
-            output_qualifier: None,
-            required_output_columns: None,
-        })
+                    output_name: "k".to_string(),
+                    output_column_id: ColumnId::new_for_test(output_id),
+                }],
+                output_qualifier: None,
+            }),
+            vec![LogicalPlanNode::new(
+                LogicalPlanNodeKind::Values(LogicalValuesNode {
+                    rows: vec![],
+                    columns: vec![OutputColumn {
+                        column_id: ColumnId::new_for_test(source_id),
+                        name: format!("{name}_source"),
+                        data_type: DataType::Int32,
+                        nullable: true,
+                        is_internal: false,
+                    }],
+                }),
+                vec![],
+                None,
+            )],
+            None,
+        )
     }
 
     #[test]
     fn join_equi_keys_classifies_alias_free_project_outputs_by_column_id() {
-        let join = JoinNode {
-            left: Box::new(derived_project_with_output_id("left", 11, 101)),
-            right: Box::new(derived_project_with_output_id("right", 22, 202)),
-            join_type: crate::sql::analysis::JoinKind::Inner,
-            condition: Some(eq_expr(qcol("a", "k", 101), qcol("b", "k", 202))),
-            required_output_columns: None,
-        };
+        let join = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: crate::sql::analysis::JoinKind::Inner,
+                condition: Some(eq_expr(qcol("a", "k", 101), qcol("b", "k", 202))),
+            }),
+            vec![
+                derived_project_with_output_id("left", 11, 101),
+                derived_project_with_output_id("right", 22, 202),
+            ],
+            None,
+        );
 
-        let keys = join_equi_keys(&join);
+        let keys = test_join_equi_keys(&join);
         assert_eq!(keys.len(), 1);
         assert!(
             matches!(&keys[0].left.kind, ExprKind::ColumnRef { column_id, qualifier: Some(q), column, .. }

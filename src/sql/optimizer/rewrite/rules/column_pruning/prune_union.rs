@@ -1,6 +1,6 @@
 //! PruneUnionColumns — Phase 2 rule for Union nodes.
 //!
-//! Filters `UnionNode.output_columns` to only those whose `column_id`
+//! Filters `LogicalUnionNode.output_columns` to only those whose `column_id`
 //! is in `required_output_columns`. Keeps at least one column to preserve
 //! a valid output schema (Gap 4).
 //!
@@ -32,12 +32,21 @@ impl LogicalRewriteRule for PruneUnionColumns {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
-        matches!(plan, LogicalPlan::Union(_))
+    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+        matches!(&plan.kind, LogicalPlanNodeKind::Union(_))
     }
 
-    fn apply(&self, plan: LogicalPlan, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
-        let LogicalPlan::Union(mut node) = plan else {
+    fn apply(
+        &self,
+        plan: LogicalPlanNode,
+        _ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, String> {
+        let LogicalPlanNode {
+            kind,
+            children,
+            required_output_columns,
+        } = plan;
+        let LogicalPlanNodeKind::Union(mut node) = kind else {
             unreachable!()
         };
 
@@ -46,7 +55,7 @@ impl LogicalRewriteRule for PruneUnionColumns {
         }
 
         // None means Phase 1 hasn't tagged this node — no-op.
-        let Some(needed) = node.required_output_columns.clone() else {
+        let Some(needed) = required_output_columns.clone() else {
             return Ok(RewriteResult::Unchanged);
         };
 
@@ -79,7 +88,11 @@ impl LogicalRewriteRule for PruneUnionColumns {
         }
 
         node.output_columns = new_output_columns;
-        Ok(RewriteResult::Changed(LogicalPlan::Union(node)))
+        Ok(RewriteResult::Changed(LogicalPlanNode::new(
+            LogicalPlanNodeKind::Union(node),
+            children,
+            required_output_columns,
+        )))
     }
 }
 
@@ -89,7 +102,8 @@ mod tests {
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
-    use crate::sql::planner::plan::{UnionNode, ValuesNode};
+    use crate::sql::planner::plan::*;
+    use crate::sql::planner::plan::{LogicalPlanNodeKind, LogicalUnionNode, LogicalValuesNode};
     use arrow::datatypes::DataType;
 
     fn ctx() -> RewriteContext {
@@ -106,12 +120,15 @@ mod tests {
         }
     }
 
-    fn dummy_input() -> LogicalPlan {
-        LogicalPlan::Values(ValuesNode {
-            rows: vec![],
-            columns: vec![],
-            required_output_columns: None,
-        })
+    fn dummy_input() -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Values(LogicalValuesNode {
+                rows: vec![],
+                columns: vec![],
+            }),
+            vec![],
+            None,
+        )
     }
 
     #[test]
@@ -123,18 +140,19 @@ mod tests {
         let mut needed = HashSet::new();
         needed.insert(id_b);
 
-        let node = UnionNode {
-            inputs: vec![dummy_input(), dummy_input()],
-            all: true,
-            output_columns: vec![
-                make_output_column(id_a, "a"),
-                make_output_column(id_b, "b"),
-                make_output_column(id_c, "c"),
-            ],
-            required_output_columns: Some(needed),
-        };
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Union(LogicalUnionNode {
+                all: true,
+                output_columns: vec![
+                    make_output_column(id_a, "a"),
+                    make_output_column(id_b, "b"),
+                    make_output_column(id_c, "c"),
+                ],
+            }),
+            vec![dummy_input(), dummy_input()],
+            Some(needed),
+        );
 
-        let plan = LogicalPlan::Union(node);
         let rule = PruneUnionColumns;
         let result = rule.apply(plan, &mut ctx()).unwrap();
 
@@ -142,28 +160,29 @@ mod tests {
             RewriteResult::Changed(p) => p,
             other => panic!("expected Changed, got {:?}", other),
         };
-        let LogicalPlan::Union(pruned) = changed else {
+        let LogicalPlanNodeKind::Union(pruned) = &changed.kind else {
             panic!("expected Union");
         };
 
         assert_eq!(pruned.output_columns.len(), 1);
         assert_eq!(pruned.output_columns[0].column_id, id_b);
         // inputs are untouched
-        assert_eq!(pruned.inputs.len(), 2);
+        assert_eq!(changed.children.len(), 2);
     }
 
     #[test]
     fn prune_union_noop_when_required_output_columns_is_none() {
         let id_a = ColumnId::new_for_test(1);
 
-        let node = UnionNode {
-            inputs: vec![dummy_input()],
-            all: false,
-            output_columns: vec![make_output_column(id_a, "a")],
-            required_output_columns: None, // not tagged
-        };
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Union(LogicalUnionNode {
+                all: false,
+                output_columns: vec![make_output_column(id_a, "a")],
+            }),
+            vec![dummy_input()],
+            None, // not tagged
+        );
 
-        let plan = LogicalPlan::Union(node);
         let rule = PruneUnionColumns;
         let result = rule.apply(plan, &mut ctx()).unwrap();
 
@@ -179,14 +198,15 @@ mod tests {
         let id_b = ColumnId::new_for_test(2);
 
         // needed is empty — must keep first column.
-        let node = UnionNode {
-            inputs: vec![dummy_input()],
-            all: true,
-            output_columns: vec![make_output_column(id_a, "a"), make_output_column(id_b, "b")],
-            required_output_columns: Some(HashSet::new()),
-        };
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Union(LogicalUnionNode {
+                all: true,
+                output_columns: vec![make_output_column(id_a, "a"), make_output_column(id_b, "b")],
+            }),
+            vec![dummy_input()],
+            Some(HashSet::new()),
+        );
 
-        let plan = LogicalPlan::Union(node);
         let rule = PruneUnionColumns;
         let result = rule.apply(plan, &mut ctx()).unwrap();
 
@@ -194,7 +214,7 @@ mod tests {
             RewriteResult::Changed(p) => p,
             other => panic!("expected Changed, got {:?}", other),
         };
-        let LogicalPlan::Union(pruned) = changed else {
+        let LogicalPlanNodeKind::Union(pruned) = &changed.kind else {
             panic!("expected Union");
         };
 

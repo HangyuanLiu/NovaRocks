@@ -21,12 +21,16 @@ impl LogicalRewriteRule for PruneExceptColumns {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
-        matches!(plan, LogicalPlan::Except(_))
+    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+        matches!(&plan.kind, LogicalPlanNodeKind::Except(_))
     }
 
-    fn apply(&self, plan: LogicalPlan, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
-        let LogicalPlan::Except(_) = plan else {
+    fn apply(
+        &self,
+        plan: LogicalPlanNode,
+        _ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, String> {
+        let LogicalPlanNodeKind::Except(_) = plan.kind else {
             unreachable!()
         };
 
@@ -40,7 +44,8 @@ mod tests {
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
-    use crate::sql::planner::plan::{ExceptNode, ValuesNode};
+    use crate::sql::planner::plan::*;
+    use crate::sql::planner::plan::{LogicalExceptNode, LogicalPlanNodeKind, LogicalValuesNode};
     use arrow::datatypes::DataType;
     use std::collections::HashSet;
 
@@ -58,12 +63,15 @@ mod tests {
         }
     }
 
-    fn dummy_input() -> LogicalPlan {
-        LogicalPlan::Values(ValuesNode {
-            rows: vec![],
-            columns: vec![],
-            required_output_columns: None,
-        })
+    fn dummy_input() -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Values(LogicalValuesNode {
+                rows: vec![],
+                columns: vec![],
+            }),
+            vec![],
+            None,
+        )
     }
 
     #[test]
@@ -75,17 +83,18 @@ mod tests {
         let mut needed = HashSet::new();
         needed.insert(id_b);
 
-        let node = ExceptNode {
-            inputs: vec![dummy_input(), dummy_input()],
-            output_columns: vec![
-                make_output_column(id_a, "a"),
-                make_output_column(id_b, "b"),
-                make_output_column(id_c, "c"),
-            ],
-            required_output_columns: Some(needed),
-        };
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Except(LogicalExceptNode {
+                output_columns: vec![
+                    make_output_column(id_a, "a"),
+                    make_output_column(id_b, "b"),
+                    make_output_column(id_c, "c"),
+                ],
+            }),
+            vec![dummy_input(), dummy_input()],
+            Some(needed),
+        );
 
-        let plan = LogicalPlan::Except(node);
         let rule = PruneExceptColumns;
         let result = rule.apply(plan, &mut ctx()).unwrap();
 
@@ -99,13 +108,14 @@ mod tests {
     fn prune_except_noop_when_required_output_columns_is_none() {
         let id_a = ColumnId::new_for_test(1);
 
-        let node = ExceptNode {
-            inputs: vec![dummy_input()],
-            output_columns: vec![make_output_column(id_a, "a")],
-            required_output_columns: None, // not tagged
-        };
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Except(LogicalExceptNode {
+                output_columns: vec![make_output_column(id_a, "a")],
+            }),
+            vec![dummy_input()],
+            None, // not tagged
+        );
 
-        let plan = LogicalPlan::Except(node);
         let rule = PruneExceptColumns;
         let result = rule.apply(plan, &mut ctx()).unwrap();
 
@@ -121,13 +131,14 @@ mod tests {
         let id_b = ColumnId::new_for_test(2);
 
         // needed is empty — must keep first column.
-        let node = ExceptNode {
-            inputs: vec![dummy_input()],
-            output_columns: vec![make_output_column(id_a, "a"), make_output_column(id_b, "b")],
-            required_output_columns: Some(HashSet::new()),
-        };
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Except(LogicalExceptNode {
+                output_columns: vec![make_output_column(id_a, "a"), make_output_column(id_b, "b")],
+            }),
+            vec![dummy_input()],
+            Some(HashSet::new()),
+        );
 
-        let plan = LogicalPlan::Except(node);
         let rule = PruneExceptColumns;
         let result = rule.apply(plan, &mut ctx()).unwrap();
 

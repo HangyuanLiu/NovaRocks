@@ -1,7 +1,7 @@
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
-use crate::sql::planner::plan::LogicalPlan;
+use crate::sql::planner::plan::LogicalPlanNode;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RewriteTraversal {
@@ -15,11 +15,15 @@ pub(crate) trait LogicalRewriteRule: Send + Sync {
     fn traversal(&self) -> RewriteTraversal {
         RewriteTraversal::BottomUp
     }
-    fn matches(&self, plan: &LogicalPlan, ctx: &RewriteContext) -> bool;
-    fn apply(&self, plan: LogicalPlan, ctx: &mut RewriteContext) -> Result<RewriteResult, String>;
+    fn matches(&self, plan: &LogicalPlanNode, ctx: &RewriteContext) -> bool;
+    fn apply(
+        &self,
+        plan: LogicalPlanNode,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, String>;
 }
 
-/// Convenience trait for local `LogicalPlan -> LogicalPlan` rules.
+/// Convenience trait for local `LogicalPlanNode -> LogicalPlanNode` rules.
 ///
 /// The pipeline still consumes `LogicalRewriteRule`. This trait keeps simple
 /// query rewrite rules focused on one-node matching and rewriting while the
@@ -36,9 +40,9 @@ pub(crate) trait PlanRewriteRule: Send + Sync {
         RewriteTraversal::BottomUp
     }
 
-    fn matches(&self, plan: &LogicalPlan) -> bool;
+    fn matches(&self, plan: &LogicalPlanNode) -> bool;
 
-    fn apply(&self, plan: LogicalPlan) -> Option<LogicalPlan>;
+    fn apply(&self, plan: LogicalPlanNode) -> Option<LogicalPlanNode>;
 }
 
 impl<T> LogicalRewriteRule for T
@@ -57,11 +61,15 @@ where
         PlanRewriteRule::traversal(self)
     }
 
-    fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
+    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
         PlanRewriteRule::matches(self, plan)
     }
 
-    fn apply(&self, plan: LogicalPlan, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        plan: LogicalPlanNode,
+        _ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, String> {
         Ok(match PlanRewriteRule::apply(self, plan) {
             Some(rewritten) => RewriteResult::Changed(rewritten),
             None => RewriteResult::Unchanged,

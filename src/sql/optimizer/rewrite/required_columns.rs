@@ -27,7 +27,7 @@ use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal}
 use crate::sql::optimizer::rewrite::rules::utils::{
     collect_column_id_refs, collect_output_ids, collect_output_ids_ordered,
 };
-use crate::sql::planner::plan::LogicalPlan;
+use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind};
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -39,102 +39,123 @@ use crate::sql::planner::plan::LogicalPlan;
 /// required).  Each operator type computes its own child's needed set and
 /// recurses.
 pub(crate) fn tag_required_columns(
-    plan: LogicalPlan,
+    plan: LogicalPlanNode,
     parent_needed: Option<HashSet<ColumnId>>,
-) -> LogicalPlan {
-    match plan {
-        LogicalPlan::Scan(_) => tag_scan(plan, parent_needed),
-        LogicalPlan::Values(_) => tag_values(plan, parent_needed),
-        LogicalPlan::GenerateSeries(_) => tag_generate_series(plan, parent_needed),
-        LogicalPlan::Project(_) => tag_project(plan, parent_needed),
-        LogicalPlan::Filter(_) => tag_filter(plan, parent_needed),
-        LogicalPlan::Sort(_) => tag_sort(plan, parent_needed),
-        LogicalPlan::Limit(_) => tag_limit(plan, parent_needed),
-        LogicalPlan::Aggregate(_) => tag_aggregate(plan, parent_needed),
-        LogicalPlan::Join(_) => tag_join(plan, parent_needed),
-        LogicalPlan::Union(_) => tag_union(plan, parent_needed),
-        LogicalPlan::Intersect(_) => tag_intersect(plan, parent_needed),
-        LogicalPlan::Except(_) => tag_except(plan, parent_needed),
-        LogicalPlan::CTEAnchor(_) => tag_cte_anchor(plan, parent_needed),
-        LogicalPlan::CTEConsume(_) => tag_cte_consume(plan, parent_needed),
-        LogicalPlan::CTEProduce(_) => tag_cte_produce(plan, parent_needed),
-        LogicalPlan::Window(_) => tag_window(plan, parent_needed),
-        LogicalPlan::Repeat(_) => tag_repeat(plan, parent_needed),
-        LogicalPlan::Decode(_) => tag_decode(plan, parent_needed),
-        LogicalPlan::AggregateStateMerge(_) => tag_aggregate_state_merge(plan, parent_needed),
-        LogicalPlan::TableFunction(_) => tag_table_function(plan, parent_needed),
-        LogicalPlan::Apply(_) => tag_apply(plan, parent_needed),
-        LogicalPlan::AssertOneRow(_) => tag_assert_one_row(plan, parent_needed),
-        LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
+) -> LogicalPlanNode {
+    match &plan.kind {
+        LogicalPlanNodeKind::Scan(_) => tag_scan(plan, parent_needed),
+        LogicalPlanNodeKind::Values(_) => tag_values(plan, parent_needed),
+        LogicalPlanNodeKind::GenerateSeries(_) => tag_generate_series(plan, parent_needed),
+        LogicalPlanNodeKind::Project(_) => tag_project(plan, parent_needed),
+        LogicalPlanNodeKind::Filter(_) => tag_filter(plan, parent_needed),
+        LogicalPlanNodeKind::Sort(_) => tag_sort(plan, parent_needed),
+        LogicalPlanNodeKind::Limit(_) => tag_limit(plan, parent_needed),
+        LogicalPlanNodeKind::Aggregate(_) => tag_aggregate(plan, parent_needed),
+        LogicalPlanNodeKind::Join(_) => tag_join(plan, parent_needed),
+        LogicalPlanNodeKind::Union(_) => tag_union(plan, parent_needed),
+        LogicalPlanNodeKind::Intersect(_) => tag_intersect(plan, parent_needed),
+        LogicalPlanNodeKind::Except(_) => tag_except(plan, parent_needed),
+        LogicalPlanNodeKind::CTEAnchor(_) => tag_cte_anchor(plan, parent_needed),
+        LogicalPlanNodeKind::CTEConsume(_) => tag_cte_consume(plan, parent_needed),
+        LogicalPlanNodeKind::CTEProduce(_) => tag_cte_produce(plan, parent_needed),
+        LogicalPlanNodeKind::Window(_) => tag_window(plan, parent_needed),
+        LogicalPlanNodeKind::Repeat(_) => tag_repeat(plan, parent_needed),
+        LogicalPlanNodeKind::Decode(_) => tag_decode(plan, parent_needed),
+        LogicalPlanNodeKind::AggregateStateMerge(_) => {
+            tag_aggregate_state_merge(plan, parent_needed)
+        }
+        LogicalPlanNodeKind::TableFunction(_) => tag_table_function(plan, parent_needed),
+        LogicalPlanNodeKind::Apply(_) => tag_apply(plan, parent_needed),
+        LogicalPlanNodeKind::AssertOneRow(_) => tag_assert_one_row(plan, parent_needed),
+        LogicalPlanNodeKind::ImvDelta(_) | LogicalPlanNodeKind::ImvVersion(_) => {
             panic!("imv marker should not appear in non-IMV column pruning")
         }
     }
 }
 
 fn tag_aggregate_state_merge(
-    plan: LogicalPlan,
+    mut plan: LogicalPlanNode,
     _parent_needed: Option<HashSet<ColumnId>>,
-) -> LogicalPlan {
-    let LogicalPlan::AggregateStateMerge(mut node) = plan else {
-        unreachable!()
-    };
-    node.old_input = Box::new(tag_required_columns(*node.old_input, None));
-    node.delta_input = Box::new(tag_required_columns(*node.delta_input, None));
-    LogicalPlan::AggregateStateMerge(node)
+) -> LogicalPlanNode {
+    assert!(matches!(
+        plan.kind,
+        LogicalPlanNodeKind::AggregateStateMerge(_)
+    ));
+    let (old_input, delta_input) = plan.take_two_children();
+    plan.children = vec![
+        tag_required_columns(old_input, None),
+        tag_required_columns(delta_input, None),
+    ];
+    plan
 }
 
 /// Apply is eliminated by the SubqueryRewrite stage, which runs before column
 /// pruning, so pruning never sees it in production plans. Tag conservatively:
 /// require everything below, prune nothing.
-fn tag_apply(plan: LogicalPlan, _parent_needed: Option<HashSet<ColumnId>>) -> LogicalPlan {
-    let LogicalPlan::Apply(mut node) = plan else {
-        unreachable!()
-    };
-    node.required_output_columns = None;
-    node.left = Box::new(tag_required_columns(*node.left, None));
-    node.right = Box::new(tag_required_columns(*node.right, None));
-    LogicalPlan::Apply(node)
+fn tag_apply(
+    mut plan: LogicalPlanNode,
+    _parent_needed: Option<HashSet<ColumnId>>,
+) -> LogicalPlanNode {
+    assert!(matches!(plan.kind, LogicalPlanNodeKind::Apply(_)));
+    plan.required_output_columns = None;
+    let (left, right) = plan.take_two_children();
+    plan.children = vec![
+        tag_required_columns(left, None),
+        tag_required_columns(right, None),
+    ];
+    plan
 }
 
 /// Conservative: no pruning through AssertOneRow in M0. Tighten when M1
 /// starts producing this node in real plans.
-fn tag_assert_one_row(plan: LogicalPlan, _parent_needed: Option<HashSet<ColumnId>>) -> LogicalPlan {
-    let LogicalPlan::AssertOneRow(mut node) = plan else {
-        unreachable!()
-    };
-    node.required_output_columns = None;
-    node.input = Box::new(tag_required_columns(*node.input, None));
-    LogicalPlan::AssertOneRow(node)
+fn tag_assert_one_row(
+    mut plan: LogicalPlanNode,
+    _parent_needed: Option<HashSet<ColumnId>>,
+) -> LogicalPlanNode {
+    assert!(matches!(plan.kind, LogicalPlanNodeKind::AssertOneRow(_)));
+    plan.required_output_columns = None;
+    let input = plan.take_single_child();
+    plan.children = vec![tag_required_columns(input, None)];
+    plan
 }
 
 // ---------------------------------------------------------------------------
 // Leaf handlers
 // ---------------------------------------------------------------------------
 
-fn tag_scan(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> LogicalPlan {
-    let LogicalPlan::Scan(mut scan) = plan else {
+fn tag_scan(
+    mut plan: LogicalPlanNode,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> LogicalPlanNode {
+    let LogicalPlanNodeKind::Scan(scan) = &plan.kind else {
         unreachable!()
     };
     let needed =
         parent_needed.unwrap_or_else(|| scan.columns.iter().map(|c| c.column_id).collect());
-    scan.required_output_columns = Some(needed);
-    LogicalPlan::Scan(scan)
+    plan.required_output_columns = Some(needed);
+    plan
 }
 
-fn tag_values(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> LogicalPlan {
-    let LogicalPlan::Values(mut node) = plan else {
+fn tag_values(
+    mut plan: LogicalPlanNode,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> LogicalPlanNode {
+    let LogicalPlanNodeKind::Values(node) = &plan.kind else {
         unreachable!()
     };
     let needed =
         parent_needed.unwrap_or_else(|| node.columns.iter().map(|c| c.column_id).collect());
-    node.required_output_columns = Some(needed);
-    LogicalPlan::Values(node)
+    plan.required_output_columns = Some(needed);
+    plan
 }
 
 /// GenerateSeries is a leaf with one output ColumnId.  Like Scan/Values, a
 /// `None` parent means all leaf outputs are required.
-fn tag_generate_series(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> LogicalPlan {
-    let LogicalPlan::GenerateSeries(mut node) = plan else {
+fn tag_generate_series(
+    mut plan: LogicalPlanNode,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> LogicalPlanNode {
+    let LogicalPlanNodeKind::GenerateSeries(node) = &plan.kind else {
         unreachable!()
     };
     let needed = parent_needed.unwrap_or_else(|| {
@@ -144,19 +165,22 @@ fn tag_generate_series(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId
             HashSet::from([node.output_column_id])
         }
     });
-    node.required_output_columns = Some(needed);
-    LogicalPlan::GenerateSeries(node)
+    plan.required_output_columns = Some(needed);
+    plan
 }
 
 // ---------------------------------------------------------------------------
 // Unary handlers
 // ---------------------------------------------------------------------------
 
-fn tag_project(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> LogicalPlan {
-    let LogicalPlan::Project(mut node) = plan else {
+fn tag_project(
+    mut plan: LogicalPlanNode,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> LogicalPlanNode {
+    let LogicalPlanNodeKind::Project(node) = &plan.kind else {
         unreachable!()
     };
-    node.required_output_columns = parent_needed.clone();
+    plan.required_output_columns = parent_needed.clone();
     // child_needed = union of ColumnRefs of items whose output_column_id is in
     // parent_needed (or all items when parent_needed is None).
     //
@@ -180,15 +204,19 @@ fn tag_project(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> L
         })
         .flat_map(|item| collect_column_id_refs(&item.expr))
         .collect();
-    node.input = Box::new(tag_required_columns(*node.input, Some(child_needed)));
-    LogicalPlan::Project(node)
+    let input = plan.take_single_child();
+    plan.children = vec![tag_required_columns(input, Some(child_needed))];
+    plan
 }
 
-fn tag_filter(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> LogicalPlan {
-    let LogicalPlan::Filter(mut node) = plan else {
+fn tag_filter(
+    mut plan: LogicalPlanNode,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> LogicalPlanNode {
+    let LogicalPlanNodeKind::Filter(node) = &plan.kind else {
         unreachable!()
     };
-    node.required_output_columns = parent_needed.clone();
+    plan.required_output_columns = parent_needed.clone();
     // Child needs everything the parent needs PLUS all columns referenced in
     // the predicate.  When parent_needed is None (keep all), propagate None so
     // the child also keeps all columns instead of collapsing to just the
@@ -197,15 +225,19 @@ fn tag_filter(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> Lo
         needed.extend(collect_column_id_refs(&node.predicate));
         needed
     });
-    node.input = Box::new(tag_required_columns(*node.input, child_needed));
-    LogicalPlan::Filter(node)
+    let input = plan.take_single_child();
+    plan.children = vec![tag_required_columns(input, child_needed)];
+    plan
 }
 
-fn tag_sort(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> LogicalPlan {
-    let LogicalPlan::Sort(mut node) = plan else {
+fn tag_sort(
+    mut plan: LogicalPlanNode,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> LogicalPlanNode {
+    let LogicalPlanNodeKind::Sort(node) = &plan.kind else {
         unreachable!()
     };
-    node.required_output_columns = parent_needed.clone();
+    plan.required_output_columns = parent_needed.clone();
     // When parent_needed is None (keep all), propagate None so the child also
     // keeps all columns instead of collapsing to just the sort-key refs.
     let child_needed = parent_needed.map(|mut needed| {
@@ -217,25 +249,31 @@ fn tag_sort(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> Logi
         }
         needed
     });
-    node.input = Box::new(tag_required_columns(*node.input, child_needed));
-    LogicalPlan::Sort(node)
+    let input = plan.take_single_child();
+    plan.children = vec![tag_required_columns(input, child_needed)];
+    plan
 }
 
-fn tag_limit(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> LogicalPlan {
-    let LogicalPlan::Limit(mut node) = plan else {
-        unreachable!()
-    };
-    node.required_output_columns = parent_needed.clone();
+fn tag_limit(
+    mut plan: LogicalPlanNode,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> LogicalPlanNode {
+    assert!(matches!(plan.kind, LogicalPlanNodeKind::Limit(_)));
+    plan.required_output_columns = parent_needed.clone();
     // Limit is transparent: passes parent_needed straight through.
-    node.input = Box::new(tag_required_columns(*node.input, parent_needed));
-    LogicalPlan::Limit(node)
+    let input = plan.take_single_child();
+    plan.children = vec![tag_required_columns(input, parent_needed)];
+    plan
 }
 
-fn tag_aggregate(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> LogicalPlan {
-    let LogicalPlan::Aggregate(mut node) = plan else {
+fn tag_aggregate(
+    mut plan: LogicalPlanNode,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> LogicalPlanNode {
+    let LogicalPlanNodeKind::Aggregate(node) = &plan.kind else {
         unreachable!()
     };
-    node.required_output_columns = parent_needed.clone();
+    plan.required_output_columns = parent_needed.clone();
 
     // Conservative keep-all-aggregate-inputs strategy.
     //
@@ -270,28 +308,34 @@ fn tag_aggregate(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) ->
         needed
     });
 
-    node.input = Box::new(tag_required_columns(*node.input, child_needed));
-    LogicalPlan::Aggregate(node)
+    let input = plan.take_single_child();
+    plan.children = vec![tag_required_columns(input, child_needed)];
+    plan
 }
 
-fn tag_window(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> LogicalPlan {
-    let LogicalPlan::Window(mut node) = plan else {
-        unreachable!()
-    };
-    node.required_output_columns = parent_needed;
+fn tag_window(
+    mut plan: LogicalPlanNode,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> LogicalPlanNode {
+    assert!(matches!(plan.kind, LogicalPlanNodeKind::Window(_)));
+    plan.required_output_columns = parent_needed;
     // Window output columns carry fresh ColumnIds (allocated by the planner)
     // that are distinct from the child's ids, so we cannot reliably map
     // parent_needed back to child column ids.  Pass None to the child so all
     // input columns are preserved and no column is spuriously dropped.
-    node.input = Box::new(tag_required_columns(*node.input, None));
-    LogicalPlan::Window(node)
+    let input = plan.take_single_child();
+    plan.children = vec![tag_required_columns(input, None)];
+    plan
 }
 
-fn tag_repeat(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> LogicalPlan {
-    let LogicalPlan::Repeat(mut node) = plan else {
+fn tag_repeat(
+    mut plan: LogicalPlanNode,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> LogicalPlanNode {
+    let LogicalPlanNodeKind::Repeat(node) = &plan.kind else {
         unreachable!()
     };
-    node.required_output_columns = parent_needed.clone();
+    plan.required_output_columns = parent_needed.clone();
     let child_needed = if parent_needed.is_none() {
         None
     } else if node.all_rollup_column_ids.len() == node.all_rollup_columns.len() {
@@ -307,8 +351,9 @@ fn tag_repeat(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> Lo
     } else {
         None
     };
-    node.input = Box::new(tag_required_columns(*node.input, child_needed));
-    LogicalPlan::Repeat(node)
+    let input = plan.take_single_child();
+    plan.children = vec![tag_required_columns(input, child_needed)];
+    plan
 }
 
 /// Decode node translates `string_column` references (in parent_needed) to
@@ -335,36 +380,43 @@ fn tag_repeat(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> Lo
 ///
 /// Therefore no id translation is needed; parent_needed can be passed to
 /// the child unchanged.
-fn tag_decode(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> LogicalPlan {
-    let LogicalPlan::Decode(mut node) = plan else {
-        unreachable!()
-    };
-    node.required_output_columns = parent_needed.clone();
-    node.input = Box::new(tag_required_columns(*node.input, parent_needed));
-    LogicalPlan::Decode(node)
+fn tag_decode(
+    mut plan: LogicalPlanNode,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> LogicalPlanNode {
+    assert!(matches!(plan.kind, LogicalPlanNodeKind::Decode(_)));
+    plan.required_output_columns = parent_needed.clone();
+    let input = plan.take_single_child();
+    plan.children = vec![tag_required_columns(input, parent_needed)];
+    plan
 }
 
-fn tag_table_function(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> LogicalPlan {
-    let LogicalPlan::TableFunction(mut node) = plan else {
-        unreachable!()
-    };
-    node.required_output_columns = parent_needed;
+fn tag_table_function(
+    mut plan: LogicalPlanNode,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> LogicalPlanNode {
+    assert!(matches!(plan.kind, LogicalPlanNodeKind::TableFunction(_)));
+    plan.required_output_columns = parent_needed;
     // The function's args reference INPUT columns that may not appear in
     // parent_needed (e.g. UNNEST(t.arr) where parent only sees the exploded
     // output).  Pass None to the child so no input column is spuriously dropped.
-    node.input = Box::new(tag_required_columns(*node.input, None));
-    LogicalPlan::TableFunction(node)
+    let input = plan.take_single_child();
+    plan.children = vec![tag_required_columns(input, None)];
+    plan
 }
 
 // ---------------------------------------------------------------------------
 // Binary / n-ary handlers
 // ---------------------------------------------------------------------------
 
-fn tag_join(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> LogicalPlan {
-    let LogicalPlan::Join(mut node) = plan else {
+fn tag_join(
+    mut plan: LogicalPlanNode,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> LogicalPlanNode {
+    let LogicalPlanNodeKind::Join(node) = &plan.kind else {
         unreachable!()
     };
-    node.required_output_columns = parent_needed.clone();
+    plan.required_output_columns = parent_needed.clone();
 
     // When parent_needed is None (keep all), propagate None to both children so
     // they also keep all columns.  When Some, compute combined = parent_needed ∪
@@ -375,8 +427,8 @@ fn tag_join(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> Logi
             if let Some(cond) = &node.condition {
                 combined.extend(collect_column_id_refs(cond));
             }
-            let left_outputs = collect_output_ids(&node.left);
-            let right_outputs = collect_output_ids(&node.right);
+            let left_outputs = collect_output_ids(plan.left());
+            let right_outputs = collect_output_ids(plan.right());
             let left: HashSet<ColumnId> = combined
                 .iter()
                 .filter(|id| left_outputs.contains(id))
@@ -391,28 +443,34 @@ fn tag_join(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> Logi
         }
     };
 
-    node.left = Box::new(tag_required_columns(*node.left, left_needed));
-    node.right = Box::new(tag_required_columns(*node.right, right_needed));
-    LogicalPlan::Join(node)
+    let (left, right) = plan.take_two_children();
+    plan.children = vec![
+        tag_required_columns(left, left_needed),
+        tag_required_columns(right, right_needed),
+    ];
+    plan
 }
 
 // ---------------------------------------------------------------------------
 // Set operation handlers (Gap 4)
 // ---------------------------------------------------------------------------
 
-fn tag_union(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> LogicalPlan {
-    let LogicalPlan::Union(mut node) = plan else {
+fn tag_union(
+    mut plan: LogicalPlanNode,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> LogicalPlanNode {
+    let LogicalPlanNodeKind::Union(node) = &plan.kind else {
         unreachable!()
     };
 
     if !node.all {
-        node.required_output_columns = parent_needed;
-        node.inputs = node
-            .inputs
+        plan.required_output_columns = parent_needed;
+        plan.children = plan
+            .children
             .into_iter()
             .map(|child| tag_required_columns(child, None))
             .collect();
-        return LogicalPlan::Union(node);
+        return plan;
     }
 
     // Resolve which positions in the output schema are needed.
@@ -426,9 +484,9 @@ fn tag_union(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> Log
             .collect(),
     };
 
-    node.required_output_columns = parent_needed;
-    node.inputs = node
-        .inputs
+    plan.required_output_columns = parent_needed;
+    plan.children = plan
+        .children
         .into_iter()
         .map(|child| {
             let child_outputs = collect_output_ids_ordered(&child);
@@ -439,75 +497,85 @@ fn tag_union(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> Log
             tag_required_columns(child, Some(child_needed))
         })
         .collect();
-    LogicalPlan::Union(node)
+    plan
 }
 
-fn tag_intersect(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> LogicalPlan {
-    let LogicalPlan::Intersect(mut node) = plan else {
-        unreachable!()
-    };
+fn tag_intersect(
+    mut plan: LogicalPlanNode,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> LogicalPlanNode {
+    assert!(matches!(plan.kind, LogicalPlanNodeKind::Intersect(_)));
 
-    node.required_output_columns = parent_needed;
-    node.inputs = node
-        .inputs
+    plan.required_output_columns = parent_needed;
+    plan.children = plan
+        .children
         .into_iter()
         .map(|child| tag_required_columns(child, None))
         .collect();
-    LogicalPlan::Intersect(node)
+    plan
 }
 
-fn tag_except(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> LogicalPlan {
-    let LogicalPlan::Except(mut node) = plan else {
-        unreachable!()
-    };
+fn tag_except(
+    mut plan: LogicalPlanNode,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> LogicalPlanNode {
+    assert!(matches!(plan.kind, LogicalPlanNodeKind::Except(_)));
 
-    node.required_output_columns = parent_needed;
-    node.inputs = node
-        .inputs
+    plan.required_output_columns = parent_needed;
+    plan.children = plan
+        .children
         .into_iter()
         .map(|child| tag_required_columns(child, None))
         .collect();
-    LogicalPlan::Except(node)
+    plan
 }
 
 // ---------------------------------------------------------------------------
 // CTE handlers (Gap 3 — two-walk pattern)
 // ---------------------------------------------------------------------------
 
-fn tag_cte_consume(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> LogicalPlan {
-    let LogicalPlan::CTEConsume(mut node) = plan else {
+fn tag_cte_consume(
+    mut plan: LogicalPlanNode,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> LogicalPlanNode {
+    let LogicalPlanNodeKind::CTEConsume(node) = &plan.kind else {
         unreachable!()
     };
     // Leaf in this walk — always store Some(_) so that subtree_untagged
     // returns false after tagging.  When parent_needed is None (no restriction
     // from above), default to keeping all of this node's own output ids, which
     // is the correct "keep-all" signal for the CTE two-walk.
-    node.required_output_columns = Some(
+    plan.required_output_columns = Some(
         parent_needed.unwrap_or_else(|| node.output_columns.iter().map(|c| c.column_id).collect()),
     );
-    LogicalPlan::CTEConsume(node)
+    plan
 }
 
-fn tag_cte_produce(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> LogicalPlan {
-    let LogicalPlan::CTEProduce(mut node) = plan else {
-        unreachable!()
-    };
-    node.required_output_columns = parent_needed.clone();
+fn tag_cte_produce(
+    mut plan: LogicalPlanNode,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> LogicalPlanNode {
+    assert!(matches!(plan.kind, LogicalPlanNodeKind::CTEProduce(_)));
+    plan.required_output_columns = parent_needed.clone();
     // The produce-side needed ids are already in the producer's output id
     // space (translate_consume_to_produce_ids mapped them).  Pass them
     // straight through to the CTE body.
-    node.input = Box::new(tag_required_columns(*node.input, parent_needed));
-    LogicalPlan::CTEProduce(node)
+    let input = plan.take_single_child();
+    plan.children = vec![tag_required_columns(input, parent_needed)];
+    plan
 }
 
-fn tag_cte_anchor(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -> LogicalPlan {
-    let LogicalPlan::CTEAnchor(mut node) = plan else {
-        unreachable!()
-    };
+fn tag_cte_anchor(
+    mut plan: LogicalPlanNode,
+    parent_needed: Option<HashSet<ColumnId>>,
+) -> LogicalPlanNode {
+    assert!(matches!(plan.kind, LogicalPlanNodeKind::CTEAnchor(_)));
 
     // --- Walk 1: tag the consumer subtree with parent_needed. ---
     // This stamps required_output_columns on every CTEConsume for this cte_id.
-    let consumer = tag_required_columns(*node.consumer, parent_needed.clone());
+    let produce = plan.take_child(0);
+    let consumer = plan.take_child(0);
+    let consumer = tag_required_columns(consumer, parent_needed.clone());
 
     // --- Tag the producer subtree with None (keep all). ---
     //
@@ -523,12 +591,11 @@ fn tag_cte_anchor(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -
     // still produce ALL columns that the produce's output_columns list names.
     // Passing None ensures the scan's required_output_columns == all columns,
     // which is the safe invariant until Gap-3 is implemented.
-    let produce = tag_required_columns(*node.produce, None);
+    let produce = tag_required_columns(produce, None);
 
-    node.consumer = Box::new(consumer);
-    node.produce = Box::new(produce);
-    node.required_output_columns = parent_needed;
-    LogicalPlan::CTEAnchor(node)
+    plan.children = vec![produce, consumer];
+    plan.required_output_columns = parent_needed;
+    plan
 }
 
 // ---------------------------------------------------------------------------
@@ -537,65 +604,52 @@ fn tag_cte_anchor(plan: LogicalPlan, parent_needed: Option<HashSet<ColumnId>>) -
 
 /// Recursively traverse `plan` and union all `required_output_columns` sets
 /// from `CTEConsume` nodes whose `cte_id` matches `target_id` into `acc`.
-fn collect_cte_consumer_needs(plan: &LogicalPlan, target_id: CteId, acc: &mut HashSet<ColumnId>) {
-    match plan {
-        LogicalPlan::CTEConsume(c) if c.cte_id == target_id => {
-            if let Some(req) = &c.required_output_columns {
+fn collect_cte_consumer_needs(
+    plan: &LogicalPlanNode,
+    target_id: CteId,
+    acc: &mut HashSet<ColumnId>,
+) {
+    match &plan.kind {
+        LogicalPlanNodeKind::CTEConsume(c) if c.cte_id == target_id => {
+            if let Some(req) = &plan.required_output_columns {
                 acc.extend(req.iter().copied());
             }
             // A CTEConsume is a leaf; do not recurse further.
         }
-        LogicalPlan::CTEConsume(_) => {
+        LogicalPlanNodeKind::CTEConsume(_) => {
             // Different cte_id — skip.
         }
-        LogicalPlan::Scan(_) | LogicalPlan::Values(_) | LogicalPlan::GenerateSeries(_) => {}
-        LogicalPlan::Filter(f) => collect_cte_consumer_needs(&f.input, target_id, acc),
-        LogicalPlan::Project(p) => collect_cte_consumer_needs(&p.input, target_id, acc),
-        LogicalPlan::Aggregate(a) => collect_cte_consumer_needs(&a.input, target_id, acc),
-        LogicalPlan::Sort(s) => collect_cte_consumer_needs(&s.input, target_id, acc),
-        LogicalPlan::Limit(l) => collect_cte_consumer_needs(&l.input, target_id, acc),
-        LogicalPlan::Window(w) => collect_cte_consumer_needs(&w.input, target_id, acc),
-        LogicalPlan::Join(j) => {
-            collect_cte_consumer_needs(&j.left, target_id, acc);
-            collect_cte_consumer_needs(&j.right, target_id, acc);
-        }
-        LogicalPlan::Union(u) => {
-            for child in &u.inputs {
+        LogicalPlanNodeKind::Scan(_)
+        | LogicalPlanNodeKind::Values(_)
+        | LogicalPlanNodeKind::GenerateSeries(_) => {}
+        LogicalPlanNodeKind::Filter(_)
+        | LogicalPlanNodeKind::Project(_)
+        | LogicalPlanNodeKind::Aggregate(_)
+        | LogicalPlanNodeKind::Sort(_)
+        | LogicalPlanNodeKind::Limit(_)
+        | LogicalPlanNodeKind::Window(_)
+        | LogicalPlanNodeKind::TableFunction(_)
+        | LogicalPlanNodeKind::Repeat(_)
+        | LogicalPlanNodeKind::Decode(_)
+        | LogicalPlanNodeKind::CTEProduce(_)
+        | LogicalPlanNodeKind::AssertOneRow(_)
+        | LogicalPlanNodeKind::ImvDelta(_)
+        | LogicalPlanNodeKind::ImvVersion(_) => {
+            for child in &plan.children {
                 collect_cte_consumer_needs(child, target_id, acc);
             }
         }
-        LogicalPlan::Intersect(i) => {
-            for child in &i.inputs {
+        LogicalPlanNodeKind::Join(_)
+        | LogicalPlanNodeKind::Union(_)
+        | LogicalPlanNodeKind::Intersect(_)
+        | LogicalPlanNodeKind::Except(_)
+        | LogicalPlanNodeKind::AggregateStateMerge(_)
+        | LogicalPlanNodeKind::Apply(_)
+        | LogicalPlanNodeKind::CTEAnchor(_) => {
+            for child in &plan.children {
                 collect_cte_consumer_needs(child, target_id, acc);
             }
         }
-        LogicalPlan::Except(e) => {
-            for child in &e.inputs {
-                collect_cte_consumer_needs(child, target_id, acc);
-            }
-        }
-        LogicalPlan::TableFunction(t) => collect_cte_consumer_needs(&t.input, target_id, acc),
-        LogicalPlan::Repeat(r) => collect_cte_consumer_needs(&r.input, target_id, acc),
-        LogicalPlan::Decode(d) => collect_cte_consumer_needs(&d.input, target_id, acc),
-        LogicalPlan::AggregateStateMerge(n) => {
-            collect_cte_consumer_needs(&n.old_input, target_id, acc);
-            collect_cte_consumer_needs(&n.delta_input, target_id, acc);
-        }
-        LogicalPlan::Apply(n) => {
-            collect_cte_consumer_needs(&n.left, target_id, acc);
-            collect_cte_consumer_needs(&n.right, target_id, acc);
-        }
-        LogicalPlan::AssertOneRow(n) => collect_cte_consumer_needs(&n.input, target_id, acc),
-        LogicalPlan::CTEProduce(p) => collect_cte_consumer_needs(&p.input, target_id, acc),
-        LogicalPlan::CTEAnchor(a) => {
-            // Recurse into the consumer side of nested CTEAnchors to find any
-            // matching CTEConsume nodes there.
-            collect_cte_consumer_needs(&a.consumer, target_id, acc);
-            // Also recurse into the nested produce side in case an inner CTE
-            // body references the outer CTE.
-            collect_cte_consumer_needs(&a.produce, target_id, acc);
-        }
-        LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {}
     }
 }
 
@@ -605,19 +659,19 @@ fn collect_cte_consumer_needs(plan: &LogicalPlan, target_id: CteId, acc: &mut Ha
 /// All consumers with the same `cte_id` share the same positional schema, so
 /// we stop at the first match.  The position is the index into
 /// `CTEConsume.output_columns`, which aligns with `CTEProduce.output_columns`.
-fn find_consume_position_map(plan: &LogicalPlan, target_id: CteId) -> HashMap<ColumnId, usize> {
+fn find_consume_position_map(plan: &LogicalPlanNode, target_id: CteId) -> HashMap<ColumnId, usize> {
     let mut map = HashMap::new();
     walk_consume_position_map(plan, target_id, &mut map);
     map
 }
 
 fn walk_consume_position_map(
-    plan: &LogicalPlan,
+    plan: &LogicalPlanNode,
     target_id: CteId,
     map: &mut HashMap<ColumnId, usize>,
 ) {
-    match plan {
-        LogicalPlan::CTEConsume(c) if c.cte_id == target_id => {
+    match &plan.kind {
+        LogicalPlanNodeKind::CTEConsume(c) if c.cte_id == target_id => {
             // Record consume_side_column_id -> position for each output column.
             // Use `or_insert` so that if multiple consumers exist (multi-consumer
             // case), the first one wins — positions are identical across all
@@ -626,51 +680,15 @@ fn walk_consume_position_map(
                 map.entry(col.column_id).or_insert(i);
             }
         }
-        LogicalPlan::CTEConsume(_) => {} // different cte_id
-        LogicalPlan::Scan(_) | LogicalPlan::Values(_) | LogicalPlan::GenerateSeries(_) => {}
-        LogicalPlan::Filter(f) => walk_consume_position_map(&f.input, target_id, map),
-        LogicalPlan::Project(p) => walk_consume_position_map(&p.input, target_id, map),
-        LogicalPlan::Aggregate(a) => walk_consume_position_map(&a.input, target_id, map),
-        LogicalPlan::Sort(s) => walk_consume_position_map(&s.input, target_id, map),
-        LogicalPlan::Limit(l) => walk_consume_position_map(&l.input, target_id, map),
-        LogicalPlan::Window(w) => walk_consume_position_map(&w.input, target_id, map),
-        LogicalPlan::Join(j) => {
-            walk_consume_position_map(&j.left, target_id, map);
-            walk_consume_position_map(&j.right, target_id, map);
-        }
-        LogicalPlan::Union(u) => {
-            for child in &u.inputs {
+        LogicalPlanNodeKind::CTEConsume(_)
+        | LogicalPlanNodeKind::Scan(_)
+        | LogicalPlanNodeKind::Values(_)
+        | LogicalPlanNodeKind::GenerateSeries(_) => {}
+        _ => {
+            for child in &plan.children {
                 walk_consume_position_map(child, target_id, map);
             }
         }
-        LogicalPlan::Intersect(i) => {
-            for child in &i.inputs {
-                walk_consume_position_map(child, target_id, map);
-            }
-        }
-        LogicalPlan::Except(e) => {
-            for child in &e.inputs {
-                walk_consume_position_map(child, target_id, map);
-            }
-        }
-        LogicalPlan::TableFunction(t) => walk_consume_position_map(&t.input, target_id, map),
-        LogicalPlan::Repeat(r) => walk_consume_position_map(&r.input, target_id, map),
-        LogicalPlan::Decode(d) => walk_consume_position_map(&d.input, target_id, map),
-        LogicalPlan::AggregateStateMerge(n) => {
-            walk_consume_position_map(&n.old_input, target_id, map);
-            walk_consume_position_map(&n.delta_input, target_id, map);
-        }
-        LogicalPlan::Apply(n) => {
-            walk_consume_position_map(&n.left, target_id, map);
-            walk_consume_position_map(&n.right, target_id, map);
-        }
-        LogicalPlan::AssertOneRow(n) => walk_consume_position_map(&n.input, target_id, map),
-        LogicalPlan::CTEProduce(p) => walk_consume_position_map(&p.input, target_id, map),
-        LogicalPlan::CTEAnchor(a) => {
-            walk_consume_position_map(&a.consumer, target_id, map);
-            walk_consume_position_map(&a.produce, target_id, map);
-        }
-        LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {}
     }
 }
 
@@ -696,44 +714,38 @@ fn walk_consume_position_map(
 ///
 /// `ImvDelta` / `ImvVersion` lack `required_output_columns` and must not
 /// be subject to column pruning.  Return `false` so the rule never fires.
-fn subtree_untagged(plan: &LogicalPlan) -> bool {
-    match plan {
+fn subtree_untagged(plan: &LogicalPlanNode) -> bool {
+    match &plan.kind {
         // Leaves: always get `Some(_)` after tagging.
-        LogicalPlan::Scan(n) => n.required_output_columns.is_none(),
-        LogicalPlan::Values(n) => n.required_output_columns.is_none(),
-        LogicalPlan::GenerateSeries(n) => n.required_output_columns.is_none(),
-        LogicalPlan::CTEConsume(n) => n.required_output_columns.is_none(),
+        LogicalPlanNodeKind::Scan(_)
+        | LogicalPlanNodeKind::Values(_)
+        | LogicalPlanNodeKind::GenerateSeries(_)
+        | LogicalPlanNodeKind::CTEConsume(_) => plan.required_output_columns.is_none(),
         // Non-leaves: check the first child (which will itself be a leaf or
         // recurse further until a leaf is reached).
-        LogicalPlan::Filter(n) => subtree_untagged(&n.input),
-        LogicalPlan::Project(n) => subtree_untagged(&n.input),
-        LogicalPlan::Aggregate(n) => subtree_untagged(&n.input),
-        LogicalPlan::Join(n) => subtree_untagged(&n.left),
-        LogicalPlan::Sort(n) => subtree_untagged(&n.input),
-        LogicalPlan::Limit(n) => subtree_untagged(&n.input),
-        LogicalPlan::Window(n) => subtree_untagged(&n.input),
-        LogicalPlan::Repeat(n) => subtree_untagged(&n.input),
-        LogicalPlan::CTEAnchor(n) => subtree_untagged(&n.consumer),
-        LogicalPlan::CTEProduce(n) => subtree_untagged(&n.input),
-        LogicalPlan::Decode(n) => subtree_untagged(&n.input),
-        LogicalPlan::AggregateStateMerge(n) => subtree_untagged(&n.old_input),
-        LogicalPlan::Apply(n) => subtree_untagged(&n.left),
-        LogicalPlan::AssertOneRow(n) => subtree_untagged(&n.input),
-        LogicalPlan::TableFunction(n) => subtree_untagged(&n.input),
-        LogicalPlan::Union(n) => n
-            .inputs
-            .first()
-            .map_or(false, |child| subtree_untagged(child)),
-        LogicalPlan::Intersect(n) => n
-            .inputs
-            .first()
-            .map_or(false, |child| subtree_untagged(child)),
-        LogicalPlan::Except(n) => n
-            .inputs
+        LogicalPlanNodeKind::Filter(_)
+        | LogicalPlanNodeKind::Project(_)
+        | LogicalPlanNodeKind::Aggregate(_)
+        | LogicalPlanNodeKind::Join(_)
+        | LogicalPlanNodeKind::Sort(_)
+        | LogicalPlanNodeKind::Limit(_)
+        | LogicalPlanNodeKind::Window(_)
+        | LogicalPlanNodeKind::Repeat(_)
+        | LogicalPlanNodeKind::CTEAnchor(_)
+        | LogicalPlanNodeKind::CTEProduce(_)
+        | LogicalPlanNodeKind::Decode(_)
+        | LogicalPlanNodeKind::AggregateStateMerge(_)
+        | LogicalPlanNodeKind::Apply(_)
+        | LogicalPlanNodeKind::AssertOneRow(_)
+        | LogicalPlanNodeKind::TableFunction(_)
+        | LogicalPlanNodeKind::Union(_)
+        | LogicalPlanNodeKind::Intersect(_)
+        | LogicalPlanNodeKind::Except(_) => plan
+            .children
             .first()
             .map_or(false, |child| subtree_untagged(child)),
         // ImvDelta and ImvVersion are not subject to column pruning.
-        LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => false,
+        LogicalPlanNodeKind::ImvDelta(_) | LogicalPlanNodeKind::ImvVersion(_) => false,
     }
 }
 
@@ -774,11 +786,15 @@ impl LogicalRewriteRule for TagRequiredColumns {
         RewriteTraversal::TopDown
     }
 
-    fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
+    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
         subtree_untagged(plan)
     }
 
-    fn apply(&self, plan: LogicalPlan, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        plan: LogicalPlanNode,
+        _ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, String> {
         let tagged = tag_required_columns(plan, None);
         Ok(RewriteResult::Changed(tagged))
     }
@@ -795,10 +811,13 @@ mod tests {
         BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, SortItem, TypedExpr,
     };
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
+    use crate::sql::planner::plan::*;
     use crate::sql::planner::plan::{
-        AggregateCall, AggregateNode, CTEAnchorNode, CTEConsumeNode, CTEProduceNode, ExceptNode,
-        FilterNode, IntersectNode, JoinNode, LimitNode, ProjectNode, ScanNode, SortNode, UnionNode,
-        ValuesNode, WindowExpr, WindowNode,
+        AggregateCall, LogicalAggregateNode, LogicalCTEAnchorNode, LogicalCTEConsumeNode,
+        LogicalCTEProduceNode, LogicalExceptNode, LogicalFilterNode, LogicalIntersectNode,
+        LogicalJoinNode, LogicalLimitNode, LogicalPlanNodeKind, LogicalProjectNode,
+        LogicalScanNode, LogicalSortNode, LogicalUnionNode, LogicalValuesNode, LogicalWindowNode,
+        WindowExpr,
     };
     use arrow::datatypes::DataType;
 
@@ -836,7 +855,7 @@ mod tests {
         }
     }
 
-    fn make_scan_with_ids(id_a: u32, id_b: u32, id_c: u32) -> LogicalPlan {
+    fn make_scan_with_ids(id_a: u32, id_b: u32, id_c: u32) -> LogicalPlanNode {
         let table = TableDef {
             name: "t".to_string(),
             columns: vec![
@@ -868,29 +887,47 @@ mod tests {
                 table_id: 0,
             },
         };
-        LogicalPlan::Scan(ScanNode {
-            database: "d".to_string(),
-            table,
-            alias: None,
-            columns: vec![
-                make_output_column(ColumnId::new_for_test(id_a), "a"),
-                make_output_column(ColumnId::new_for_test(id_b), "b"),
-                make_output_column(ColumnId::new_for_test(id_c), "c"),
-            ],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        })
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "d".to_string(),
+                table: table,
+                alias: None,
+                columns: vec![
+                    make_output_column(ColumnId::new_for_test(id_a), "a"),
+                    make_output_column(ColumnId::new_for_test(id_b), "b"),
+                    make_output_column(ColumnId::new_for_test(id_c), "c"),
+                ],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        )
     }
 
-    fn scan_with_3_cols() -> LogicalPlan {
+    fn scan_with_3_cols() -> LogicalPlanNode {
         make_scan_with_ids(1, 2, 3)
     }
 
     fn needed_set(ids: &[u32]) -> HashSet<ColumnId> {
         ids.iter().map(|&id| ColumnId::new_for_test(id)).collect()
+    }
+
+    fn required_columns(plan: &LogicalPlanNode) -> &HashSet<ColumnId> {
+        plan.required_output_columns
+            .as_ref()
+            .expect("expected required_output_columns to be tagged")
+    }
+
+    fn scan_required_columns(plan: &LogicalPlanNode) -> &HashSet<ColumnId> {
+        assert!(
+            matches!(&plan.kind, LogicalPlanNodeKind::Scan(_)),
+            "expected Scan node, got {:?}",
+            plan.kind
+        );
+        required_columns(plan)
     }
 
     // -----------------------------------------------------------------------
@@ -900,10 +937,10 @@ mod tests {
     #[test]
     fn tag_scan_with_none_keeps_all_cols() {
         let tagged = tag_required_columns(scan_with_3_cols(), None);
-        let LogicalPlan::Scan(s) = tagged else {
+        let LogicalPlanNodeKind::Scan(_) = &tagged.kind else {
             panic!()
         };
-        let req = s.required_output_columns.unwrap();
+        let req = required_columns(&tagged);
         assert_eq!(req.len(), 3);
         assert!(req.contains(&ColumnId::new_for_test(1)));
         assert!(req.contains(&ColumnId::new_for_test(2)));
@@ -914,10 +951,10 @@ mod tests {
     fn tag_scan_with_subset_keeps_only_those() {
         let subset = needed_set(&[2]);
         let tagged = tag_required_columns(scan_with_3_cols(), Some(subset.clone()));
-        let LogicalPlan::Scan(s) = tagged else {
+        let LogicalPlanNodeKind::Scan(_) = &tagged.kind else {
             panic!()
         };
-        assert_eq!(s.required_output_columns.unwrap(), subset);
+        assert_eq!(required_columns(&tagged), &subset);
     }
 
     // -----------------------------------------------------------------------
@@ -929,35 +966,38 @@ mod tests {
         // Project[a→101, b→102] <- Scan[a@1, b@2, c@3]
         // parent_needed = {102 (b)}
         // Expected: scan.required_output_columns = {2}  (only b from scan)
-        let project = LogicalPlan::Project(ProjectNode {
-            input: Box::new(scan_with_3_cols()),
-            items: vec![
-                ProjectItem {
-                    output_column_id: ColumnId::new_for_test(101),
-                    output_name: "a".to_string(),
-                    expr: col_ref_expr(ColumnId::new_for_test(1)),
-                },
-                ProjectItem {
-                    output_column_id: ColumnId::new_for_test(102),
-                    output_name: "b".to_string(),
-                    expr: col_ref_expr(ColumnId::new_for_test(2)),
-                },
-            ],
-            output_qualifier: None,
-            required_output_columns: None,
-        });
+        let project = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![
+                    ProjectItem {
+                        output_column_id: ColumnId::new_for_test(101),
+                        output_name: "a".to_string(),
+                        expr: col_ref_expr(ColumnId::new_for_test(1)),
+                    },
+                    ProjectItem {
+                        output_column_id: ColumnId::new_for_test(102),
+                        output_name: "b".to_string(),
+                        expr: col_ref_expr(ColumnId::new_for_test(2)),
+                    },
+                ],
+                output_qualifier: None,
+            }),
+            vec![scan_with_3_cols()],
+            None,
+        );
         let needed = needed_set(&[102]);
         let tagged = tag_required_columns(project, Some(needed.clone()));
 
-        let LogicalPlan::Project(p) = tagged else {
+        let LogicalPlanNodeKind::Project(_) = &tagged.kind else {
             panic!()
         };
-        assert_eq!(p.required_output_columns.unwrap(), needed);
+        assert_eq!(tagged.required_output_columns.as_ref().unwrap(), &needed);
 
-        let LogicalPlan::Scan(s) = *p.input else {
+        let input = tagged.unary_input();
+        let LogicalPlanNodeKind::Scan(_) = &input.kind else {
             panic!()
         };
-        let scan_req = s.required_output_columns.unwrap();
+        let scan_req = required_columns(input);
         assert!(
             scan_req.contains(&ColumnId::new_for_test(2)),
             "scan should keep b"
@@ -971,33 +1011,36 @@ mod tests {
     #[test]
     fn tag_project_with_none_parent_includes_all_item_refs() {
         // parent_needed=None: child_needed = union of all items' column refs
-        let project = LogicalPlan::Project(ProjectNode {
-            input: Box::new(scan_with_3_cols()),
-            items: vec![
-                ProjectItem {
-                    output_column_id: ColumnId::new_for_test(101),
-                    output_name: "a".to_string(),
-                    expr: col_ref_expr(ColumnId::new_for_test(1)),
-                },
-                ProjectItem {
-                    output_column_id: ColumnId::new_for_test(102),
-                    output_name: "b".to_string(),
-                    expr: col_ref_expr(ColumnId::new_for_test(2)),
-                },
-            ],
-            output_qualifier: None,
-            required_output_columns: None,
-        });
+        let project = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![
+                    ProjectItem {
+                        output_column_id: ColumnId::new_for_test(101),
+                        output_name: "a".to_string(),
+                        expr: col_ref_expr(ColumnId::new_for_test(1)),
+                    },
+                    ProjectItem {
+                        output_column_id: ColumnId::new_for_test(102),
+                        output_name: "b".to_string(),
+                        expr: col_ref_expr(ColumnId::new_for_test(2)),
+                    },
+                ],
+                output_qualifier: None,
+            }),
+            vec![scan_with_3_cols()],
+            None,
+        );
         let tagged = tag_required_columns(project, None);
-        let LogicalPlan::Project(p) = tagged else {
+        let LogicalPlanNodeKind::Project(_) = &tagged.kind else {
             panic!()
         };
         // required_output_columns should be None (transparent)
-        assert!(p.required_output_columns.is_none());
-        let LogicalPlan::Scan(s) = *p.input else {
+        assert!(tagged.required_output_columns.is_none());
+        let input = tagged.unary_input();
+        let LogicalPlanNodeKind::Scan(_) = &input.kind else {
             panic!()
         };
-        let scan_req = s.required_output_columns.unwrap();
+        let scan_req = required_columns(input);
         // Both a(1) and b(2) referenced; c(3) not in any item expr
         assert!(scan_req.contains(&ColumnId::new_for_test(1)));
         assert!(scan_req.contains(&ColumnId::new_for_test(2)));
@@ -1013,27 +1056,30 @@ mod tests {
         // Filter(c@3 > 0) <- Scan[a@1, b@2, c@3]
         // parent_needed = {1}
         // Expected: child_needed = {1, 3}
-        let filter = LogicalPlan::Filter(FilterNode {
-            input: Box::new(scan_with_3_cols()),
-            predicate: TypedExpr {
-                kind: ExprKind::BinaryOp {
-                    left: Box::new(col_ref_expr(ColumnId::new_for_test(3))),
-                    op: BinOp::Gt,
-                    right: Box::new(int_literal(0)),
+        let filter = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: TypedExpr {
+                    kind: ExprKind::BinaryOp {
+                        left: Box::new(col_ref_expr(ColumnId::new_for_test(3))),
+                        op: BinOp::Gt,
+                        right: Box::new(int_literal(0)),
+                    },
+                    data_type: DataType::Boolean,
+                    nullable: false,
                 },
-                data_type: DataType::Boolean,
-                nullable: false,
-            },
-            required_output_columns: None,
-        });
+            }),
+            vec![scan_with_3_cols()],
+            None,
+        );
         let tagged = tag_required_columns(filter, Some(needed_set(&[1])));
-        let LogicalPlan::Filter(f) = tagged else {
+        let LogicalPlanNodeKind::Filter(_) = &tagged.kind else {
             panic!()
         };
-        let LogicalPlan::Scan(s) = *f.input else {
+        let input = tagged.unary_input();
+        let LogicalPlanNodeKind::Scan(_) = &input.kind else {
             panic!()
         };
-        let req = s.required_output_columns.unwrap();
+        let req = required_columns(input);
         assert!(
             req.contains(&ColumnId::new_for_test(1)),
             "a needed by parent"
@@ -1070,43 +1116,46 @@ mod tests {
         //   child_needed = {1, 10}  (group_by y@1 + ALL aggregate args: x@10)
         //   c@3 (not referenced by any group_by or agg arg) is NOT needed.
         //
-        let agg = LogicalPlan::Aggregate(AggregateNode {
-            input: Box::new(scan_with_3_cols()),
-            group_by: vec![col_ref_expr(ColumnId::new_for_test(1))],
-            aggregates: vec![
-                AggregateCall {
-                    name: "count".to_string(),
-                    args: vec![],
-                    distinct: false,
-                    result_type: DataType::Int64,
-                    order_by: vec![],
-                    output_column_id: ColumnId::UNSET,
-                },
-                AggregateCall {
-                    name: "sum".to_string(),
-                    args: vec![col_ref_expr(ColumnId::new_for_test(2))],
-                    distinct: false,
-                    result_type: DataType::Int64,
-                    order_by: vec![],
-                    output_column_id: ColumnId::UNSET,
-                },
-            ],
-            output_columns: vec![
-                make_output_column(ColumnId::new_for_test(1), "y"),
-                make_output_column(ColumnId::new_for_test(301), "count"),
-                make_output_column(ColumnId::new_for_test(302), "sum_x"),
-            ],
-            already_pushed: false,
-            required_output_columns: None,
-        });
+        let agg = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![col_ref_expr(ColumnId::new_for_test(1))],
+                aggregates: vec![
+                    AggregateCall {
+                        name: "count".to_string(),
+                        args: vec![],
+                        distinct: false,
+                        result_type: DataType::Int64,
+                        order_by: vec![],
+                        output_column_id: ColumnId::UNSET,
+                    },
+                    AggregateCall {
+                        name: "sum".to_string(),
+                        args: vec![col_ref_expr(ColumnId::new_for_test(2))],
+                        distinct: false,
+                        result_type: DataType::Int64,
+                        order_by: vec![],
+                        output_column_id: ColumnId::UNSET,
+                    },
+                ],
+                output_columns: vec![
+                    make_output_column(ColumnId::new_for_test(1), "y"),
+                    make_output_column(ColumnId::new_for_test(301), "count"),
+                    make_output_column(ColumnId::new_for_test(302), "sum_x"),
+                ],
+                already_pushed: false,
+            }),
+            vec![scan_with_3_cols()],
+            None,
+        );
         let tagged = tag_required_columns(agg, Some(needed_set(&[301])));
-        let LogicalPlan::Aggregate(a) = tagged else {
+        let LogicalPlanNodeKind::Aggregate(_) = &tagged.kind else {
             panic!()
         };
-        let LogicalPlan::Scan(s) = *a.input else {
+        let input = tagged.unary_input();
+        let LogicalPlanNodeKind::Scan(_) = &input.kind else {
             panic!()
         };
-        let req = s.required_output_columns.unwrap();
+        let req = required_columns(input);
         // group_by y@1 must always be in child_needed.
         assert!(req.contains(&ColumnId::new_for_test(1)), "group_by y@1");
         // sum(x) arg x@2 must be in child_needed even though parent only needs count.
@@ -1122,32 +1171,35 @@ mod tests {
     /// (None-propagation discipline — child keeps all its columns).
     #[test]
     fn tag_aggregate_none_parent_propagates_none_to_child() {
-        let agg = LogicalPlan::Aggregate(AggregateNode {
-            input: Box::new(scan_with_3_cols()),
-            group_by: vec![col_ref_expr(ColumnId::new_for_test(1))],
-            aggregates: vec![AggregateCall {
-                name: "sum".to_string(),
-                args: vec![col_ref_expr(ColumnId::new_for_test(2))],
-                distinct: false,
-                result_type: DataType::Int64,
-                order_by: vec![],
-                output_column_id: ColumnId::UNSET,
-            }],
-            output_columns: vec![make_output_column(ColumnId::new_for_test(301), "sum_x")],
-            already_pushed: false,
-            required_output_columns: None,
-        });
+        let agg = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![col_ref_expr(ColumnId::new_for_test(1))],
+                aggregates: vec![AggregateCall {
+                    name: "sum".to_string(),
+                    args: vec![col_ref_expr(ColumnId::new_for_test(2))],
+                    distinct: false,
+                    result_type: DataType::Int64,
+                    order_by: vec![],
+                    output_column_id: ColumnId::UNSET,
+                }],
+                output_columns: vec![make_output_column(ColumnId::new_for_test(301), "sum_x")],
+                already_pushed: false,
+            }),
+            vec![scan_with_3_cols()],
+            None,
+        );
         let tagged = tag_required_columns(agg, None);
-        let LogicalPlan::Aggregate(a) = tagged else {
+        let LogicalPlanNodeKind::Aggregate(_) = &tagged.kind else {
             panic!()
         };
         // Aggregate receives None → keeps None on itself.
-        assert!(a.required_output_columns.is_none());
-        let LogicalPlan::Scan(s) = *a.input else {
+        assert!(tagged.required_output_columns.is_none());
+        let input = tagged.unary_input();
+        let LogicalPlanNodeKind::Scan(_) = &input.kind else {
             panic!()
         };
         // Child got None → Scan expands to all columns.
-        let req = s.required_output_columns.unwrap();
+        let req = required_columns(input);
         assert_eq!(req.len(), 3, "scan keeps all 3 columns");
     }
 
@@ -1162,33 +1214,36 @@ mod tests {
         // Expected:
         //   left_needed  = {1, 2}  (join cond a + parent b)
         //   right_needed = {4, 6}  (join cond d + parent f)
-        let join = LogicalPlan::Join(JoinNode {
-            left: Box::new(make_scan_with_ids(1, 2, 3)),
-            right: Box::new(make_scan_with_ids(4, 5, 6)),
-            join_type: JoinKind::Inner,
-            condition: Some(TypedExpr {
-                kind: ExprKind::BinaryOp {
-                    left: Box::new(col_ref_expr(ColumnId::new_for_test(1))),
-                    op: BinOp::Eq,
-                    right: Box::new(col_ref_expr(ColumnId::new_for_test(4))),
-                },
-                data_type: DataType::Boolean,
-                nullable: false,
+        let join = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: JoinKind::Inner,
+                condition: Some(TypedExpr {
+                    kind: ExprKind::BinaryOp {
+                        left: Box::new(col_ref_expr(ColumnId::new_for_test(1))),
+                        op: BinOp::Eq,
+                        right: Box::new(col_ref_expr(ColumnId::new_for_test(4))),
+                    },
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                }),
             }),
-            required_output_columns: None,
-        });
+            vec![make_scan_with_ids(1, 2, 3), make_scan_with_ids(4, 5, 6)],
+            None,
+        );
         let tagged = tag_required_columns(join, Some(needed_set(&[2, 6])));
-        let LogicalPlan::Join(j) = tagged else {
+        let LogicalPlanNodeKind::Join(_) = &tagged.kind else {
             panic!()
         };
-        let LogicalPlan::Scan(l) = *j.left else {
+        let left = tagged.left();
+        let LogicalPlanNodeKind::Scan(_) = &left.kind else {
             panic!()
         };
-        let LogicalPlan::Scan(r) = *j.right else {
+        let right = tagged.right();
+        let LogicalPlanNodeKind::Scan(_) = &right.kind else {
             panic!()
         };
-        let lreq = l.required_output_columns.unwrap();
-        let rreq = r.required_output_columns.unwrap();
+        let lreq = required_columns(left);
+        let rreq = required_columns(right);
         assert_eq!(lreq.len(), 2);
         assert!(lreq.contains(&ColumnId::new_for_test(1)));
         assert!(lreq.contains(&ColumnId::new_for_test(2)));
@@ -1210,28 +1265,24 @@ mod tests {
         // Expected:
         //   Scan_a: {2}  (position 1 = b@2)
         //   Scan_b: {5}  (position 1 = e@5)
-        let union = LogicalPlan::Union(UnionNode {
-            inputs: vec![make_scan_with_ids(1, 2, 3), make_scan_with_ids(4, 5, 6)],
-            all: true,
-            output_columns: vec![
-                make_output_column(ColumnId::new_for_test(1001), "x"),
-                make_output_column(ColumnId::new_for_test(1002), "y"),
-                make_output_column(ColumnId::new_for_test(1003), "z"),
-            ],
-            required_output_columns: None,
-        });
+        let union = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Union(LogicalUnionNode {
+                all: true,
+                output_columns: vec![
+                    make_output_column(ColumnId::new_for_test(1001), "x"),
+                    make_output_column(ColumnId::new_for_test(1002), "y"),
+                    make_output_column(ColumnId::new_for_test(1003), "z"),
+                ],
+            }),
+            vec![make_scan_with_ids(1, 2, 3), make_scan_with_ids(4, 5, 6)],
+            None,
+        );
         let tagged = tag_required_columns(union, Some(needed_set(&[1002])));
-        let LogicalPlan::Union(u) = tagged else {
+        let LogicalPlanNodeKind::Union(_) = &tagged.kind else {
             panic!()
         };
-        let LogicalPlan::Scan(a) = &u.inputs[0] else {
-            panic!()
-        };
-        let LogicalPlan::Scan(b) = &u.inputs[1] else {
-            panic!()
-        };
-        let a_req = a.required_output_columns.as_ref().unwrap();
-        let b_req = b.required_output_columns.as_ref().unwrap();
+        let a_req = scan_required_columns(tagged.child(0));
+        let b_req = scan_required_columns(tagged.child(1));
         assert_eq!(a_req.len(), 1);
         assert!(
             a_req.contains(&ColumnId::new_for_test(2)),
@@ -1246,28 +1297,24 @@ mod tests {
 
     #[test]
     fn tag_union_distinct_preserves_all_child_columns() {
-        let union = LogicalPlan::Union(UnionNode {
-            inputs: vec![make_scan_with_ids(1, 2, 3), make_scan_with_ids(4, 5, 6)],
-            all: false,
-            output_columns: vec![
-                make_output_column(ColumnId::new_for_test(1001), "x"),
-                make_output_column(ColumnId::new_for_test(1002), "y"),
-                make_output_column(ColumnId::new_for_test(1003), "z"),
-            ],
-            required_output_columns: None,
-        });
+        let union = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Union(LogicalUnionNode {
+                all: false,
+                output_columns: vec![
+                    make_output_column(ColumnId::new_for_test(1001), "x"),
+                    make_output_column(ColumnId::new_for_test(1002), "y"),
+                    make_output_column(ColumnId::new_for_test(1003), "z"),
+                ],
+            }),
+            vec![make_scan_with_ids(1, 2, 3), make_scan_with_ids(4, 5, 6)],
+            None,
+        );
         let tagged = tag_required_columns(union, Some(needed_set(&[1002])));
-        let LogicalPlan::Union(u) = tagged else {
+        let LogicalPlanNodeKind::Union(_) = &tagged.kind else {
             panic!()
         };
-        let LogicalPlan::Scan(a) = &u.inputs[0] else {
-            panic!()
-        };
-        let LogicalPlan::Scan(b) = &u.inputs[1] else {
-            panic!()
-        };
-        let a_req = a.required_output_columns.as_ref().unwrap();
-        let b_req = b.required_output_columns.as_ref().unwrap();
+        let a_req = scan_required_columns(tagged.child(0));
+        let b_req = scan_required_columns(tagged.child(1));
         assert_eq!(a_req.len(), 3);
         assert_eq!(b_req.len(), 3);
         for id in [1, 2, 3] {
@@ -1280,52 +1327,44 @@ mod tests {
 
     #[test]
     fn tag_intersect_preserves_all_child_columns() {
-        let intersect = LogicalPlan::Intersect(IntersectNode {
-            inputs: vec![make_scan_with_ids(1, 2, 3), make_scan_with_ids(4, 5, 6)],
-            output_columns: vec![
-                make_output_column(ColumnId::new_for_test(1001), "x"),
-                make_output_column(ColumnId::new_for_test(1002), "y"),
-                make_output_column(ColumnId::new_for_test(1003), "z"),
-            ],
-            required_output_columns: None,
-        });
+        let intersect = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Intersect(LogicalIntersectNode {
+                output_columns: vec![
+                    make_output_column(ColumnId::new_for_test(1001), "x"),
+                    make_output_column(ColumnId::new_for_test(1002), "y"),
+                    make_output_column(ColumnId::new_for_test(1003), "z"),
+                ],
+            }),
+            vec![make_scan_with_ids(1, 2, 3), make_scan_with_ids(4, 5, 6)],
+            None,
+        );
         let tagged = tag_required_columns(intersect, Some(needed_set(&[1002])));
-        let LogicalPlan::Intersect(i) = tagged else {
+        let LogicalPlanNodeKind::Intersect(_) = &tagged.kind else {
             panic!()
         };
-        let LogicalPlan::Scan(a) = &i.inputs[0] else {
-            panic!()
-        };
-        let LogicalPlan::Scan(b) = &i.inputs[1] else {
-            panic!()
-        };
-        assert_eq!(a.required_output_columns.as_ref().unwrap().len(), 3);
-        assert_eq!(b.required_output_columns.as_ref().unwrap().len(), 3);
+        assert_eq!(scan_required_columns(tagged.child(0)).len(), 3);
+        assert_eq!(scan_required_columns(tagged.child(1)).len(), 3);
     }
 
     #[test]
     fn tag_except_preserves_all_child_columns() {
-        let except = LogicalPlan::Except(ExceptNode {
-            inputs: vec![make_scan_with_ids(1, 2, 3), make_scan_with_ids(4, 5, 6)],
-            output_columns: vec![
-                make_output_column(ColumnId::new_for_test(1001), "x"),
-                make_output_column(ColumnId::new_for_test(1002), "y"),
-                make_output_column(ColumnId::new_for_test(1003), "z"),
-            ],
-            required_output_columns: None,
-        });
+        let except = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Except(LogicalExceptNode {
+                output_columns: vec![
+                    make_output_column(ColumnId::new_for_test(1001), "x"),
+                    make_output_column(ColumnId::new_for_test(1002), "y"),
+                    make_output_column(ColumnId::new_for_test(1003), "z"),
+                ],
+            }),
+            vec![make_scan_with_ids(1, 2, 3), make_scan_with_ids(4, 5, 6)],
+            None,
+        );
         let tagged = tag_required_columns(except, Some(needed_set(&[1002])));
-        let LogicalPlan::Except(e) = tagged else {
+        let LogicalPlanNodeKind::Except(_) = &tagged.kind else {
             panic!()
         };
-        let LogicalPlan::Scan(a) = &e.inputs[0] else {
-            panic!()
-        };
-        let LogicalPlan::Scan(b) = &e.inputs[1] else {
-            panic!()
-        };
-        assert_eq!(a.required_output_columns.as_ref().unwrap().len(), 3);
-        assert_eq!(b.required_output_columns.as_ref().unwrap().len(), 3);
+        assert_eq!(scan_required_columns(tagged.child(0)).len(), 3);
+        assert_eq!(scan_required_columns(tagged.child(1)).len(), 3);
     }
 
     // -----------------------------------------------------------------------
@@ -1346,47 +1385,53 @@ mod tests {
 
         let scan = make_scan_with_ids(10, 20, 30);
 
-        let produce = LogicalPlan::CTEProduce(CTEProduceNode {
-            cte_id,
-            input: Box::new(scan),
-            output_columns: vec![
-                make_output_column(ColumnId::new_for_test(10), "c0"),
-                make_output_column(ColumnId::new_for_test(20), "c1"),
-                make_output_column(ColumnId::new_for_test(30), "c2"),
-            ],
-            required_output_columns: None,
-        });
+        let produce = LogicalPlanNode::new(
+            LogicalPlanNodeKind::CTEProduce(LogicalCTEProduceNode {
+                cte_id: cte_id,
+                output_columns: vec![
+                    make_output_column(ColumnId::new_for_test(10), "c0"),
+                    make_output_column(ColumnId::new_for_test(20), "c1"),
+                    make_output_column(ColumnId::new_for_test(30), "c2"),
+                ],
+            }),
+            vec![scan],
+            None,
+        );
 
-        let consume = LogicalPlan::CTEConsume(CTEConsumeNode {
-            cte_id,
-            alias: "u1".to_string(),
-            output_columns: vec![
-                make_output_column(ColumnId::new_for_test(101), "k0"),
-                make_output_column(ColumnId::new_for_test(102), "k1"),
-                make_output_column(ColumnId::new_for_test(103), "k2"),
-            ],
-            required_output_columns: None,
-        });
+        let consume = LogicalPlanNode::new(
+            LogicalPlanNodeKind::CTEConsume(LogicalCTEConsumeNode {
+                cte_id: cte_id,
+                alias: "u1".to_string(),
+                output_columns: vec![
+                    make_output_column(ColumnId::new_for_test(101), "k0"),
+                    make_output_column(ColumnId::new_for_test(102), "k1"),
+                    make_output_column(ColumnId::new_for_test(103), "k2"),
+                ],
+            }),
+            vec![],
+            None,
+        );
 
-        let anchor = LogicalPlan::CTEAnchor(CTEAnchorNode {
-            cte_id,
-            produce: Box::new(produce),
-            consumer: Box::new(consume),
-            required_output_columns: None,
-        });
+        let anchor = LogicalPlanNode::new(
+            LogicalPlanNodeKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: cte_id }),
+            vec![produce, consume],
+            None,
+        );
 
         let tagged = tag_required_columns(anchor, Some(needed_set(&[102])));
 
-        let LogicalPlan::CTEAnchor(a) = tagged else {
+        let LogicalPlanNodeKind::CTEAnchor(_) = &tagged.kind else {
             panic!()
         };
-        let LogicalPlan::CTEProduce(p) = *a.produce else {
+        let produce = tagged.child(0);
+        let LogicalPlanNodeKind::CTEProduce(_) = &produce.kind else {
             panic!()
         };
-        let LogicalPlan::Scan(s) = *p.input else {
+        let produce_input = produce.unary_input();
+        let LogicalPlanNodeKind::Scan(_) = &produce_input.kind else {
             panic!()
         };
-        let req = s.required_output_columns.unwrap();
+        let req = required_columns(produce_input);
         // Conservative keep-all: produce body scan keeps all 3 columns.
         assert_eq!(
             req.len(),
@@ -1410,67 +1455,77 @@ mod tests {
         let cte_id: CteId = 42;
 
         let scan = make_scan_with_ids(10, 20, 30);
-        let produce = LogicalPlan::CTEProduce(CTEProduceNode {
-            cte_id,
-            input: Box::new(scan),
-            output_columns: vec![
-                make_output_column(ColumnId::new_for_test(10), "c0"),
-                make_output_column(ColumnId::new_for_test(20), "c1"),
-                make_output_column(ColumnId::new_for_test(30), "c2"),
-            ],
-            required_output_columns: None,
-        });
+        let produce = LogicalPlanNode::new(
+            LogicalPlanNodeKind::CTEProduce(LogicalCTEProduceNode {
+                cte_id: cte_id,
+                output_columns: vec![
+                    make_output_column(ColumnId::new_for_test(10), "c0"),
+                    make_output_column(ColumnId::new_for_test(20), "c1"),
+                    make_output_column(ColumnId::new_for_test(30), "c2"),
+                ],
+            }),
+            vec![scan],
+            None,
+        );
 
-        let consume1 = LogicalPlan::CTEConsume(CTEConsumeNode {
-            cte_id,
-            alias: "u1".to_string(),
-            output_columns: vec![
-                make_output_column(ColumnId::new_for_test(101), "k0"),
-                make_output_column(ColumnId::new_for_test(102), "k1"),
-                make_output_column(ColumnId::new_for_test(103), "k2"),
-            ],
-            required_output_columns: None,
-        });
-        let consume2 = LogicalPlan::CTEConsume(CTEConsumeNode {
-            cte_id,
-            alias: "u2".to_string(),
-            output_columns: vec![
-                make_output_column(ColumnId::new_for_test(201), "m0"),
-                make_output_column(ColumnId::new_for_test(202), "m1"),
-                make_output_column(ColumnId::new_for_test(203), "m2"),
-            ],
-            required_output_columns: None,
-        });
+        let consume1 = LogicalPlanNode::new(
+            LogicalPlanNodeKind::CTEConsume(LogicalCTEConsumeNode {
+                cte_id: cte_id,
+                alias: "u1".to_string(),
+                output_columns: vec![
+                    make_output_column(ColumnId::new_for_test(101), "k0"),
+                    make_output_column(ColumnId::new_for_test(102), "k1"),
+                    make_output_column(ColumnId::new_for_test(103), "k2"),
+                ],
+            }),
+            vec![],
+            None,
+        );
+        let consume2 = LogicalPlanNode::new(
+            LogicalPlanNodeKind::CTEConsume(LogicalCTEConsumeNode {
+                cte_id: cte_id,
+                alias: "u2".to_string(),
+                output_columns: vec![
+                    make_output_column(ColumnId::new_for_test(201), "m0"),
+                    make_output_column(ColumnId::new_for_test(202), "m1"),
+                    make_output_column(ColumnId::new_for_test(203), "m2"),
+                ],
+            }),
+            vec![],
+            None,
+        );
 
         // Consumer subtree: Join of consume1 and consume2.
         // parent_needed for the anchor = {102, 203}
-        let consumer = LogicalPlan::Join(JoinNode {
-            left: Box::new(consume1),
-            right: Box::new(consume2),
-            join_type: JoinKind::Inner,
-            condition: None,
-            required_output_columns: None,
-        });
+        let consumer = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: JoinKind::Inner,
+                condition: None,
+            }),
+            vec![consume1, consume2],
+            None,
+        );
 
-        let anchor = LogicalPlan::CTEAnchor(CTEAnchorNode {
-            cte_id,
-            produce: Box::new(produce),
-            consumer: Box::new(consumer),
-            required_output_columns: None,
-        });
+        let anchor = LogicalPlanNode::new(
+            LogicalPlanNodeKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: cte_id }),
+            vec![produce, consumer],
+            None,
+        );
 
         let tagged = tag_required_columns(anchor, Some(needed_set(&[102, 203])));
 
-        let LogicalPlan::CTEAnchor(a) = tagged else {
+        let LogicalPlanNodeKind::CTEAnchor(_) = &tagged.kind else {
             panic!()
         };
-        let LogicalPlan::CTEProduce(p) = *a.produce else {
+        let produce = tagged.child(0);
+        let LogicalPlanNodeKind::CTEProduce(_) = &produce.kind else {
             panic!()
         };
-        let LogicalPlan::Scan(s) = *p.input else {
+        let produce_input = produce.unary_input();
+        let LogicalPlanNodeKind::Scan(_) = &produce_input.kind else {
             panic!()
         };
-        let req = s.required_output_columns.unwrap();
+        let req = required_columns(produce_input);
         // Conservative keep-all: produce body scan keeps all 3 columns.
         assert_eq!(
             req.len(),
@@ -1498,45 +1553,48 @@ mod tests {
         // Expected: window.required_output_columns = {1}
         //           child scan gets required_output_columns = all of {1,2,3}
         //           because the handler passes None to the child.
-        let window = LogicalPlan::Window(WindowNode {
-            input: Box::new(scan_with_3_cols()),
-            window_exprs: vec![WindowExpr {
-                name: "row_number".to_string(),
-                args: vec![],
-                distinct: false,
-                partition_by: vec![col_ref_expr(ColumnId::new_for_test(2))],
-                order_by: vec![SortItem {
-                    expr: col_ref_expr(ColumnId::new_for_test(3)),
-                    asc: true,
-                    nulls_first: false,
+        let window = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Window(LogicalWindowNode {
+                window_exprs: vec![WindowExpr {
+                    name: "row_number".to_string(),
+                    args: vec![],
+                    distinct: false,
+                    partition_by: vec![col_ref_expr(ColumnId::new_for_test(2))],
+                    order_by: vec![SortItem {
+                        expr: col_ref_expr(ColumnId::new_for_test(3)),
+                        asc: true,
+                        nulls_first: false,
+                    }],
+                    window_frame: None,
+                    result_type: DataType::Int64,
+                    output_name: "row_number".to_string(),
+                    output_column_id: ColumnId::new_for_test(301),
+                    ignore_nulls: false,
                 }],
-                window_frame: None,
-                result_type: DataType::Int64,
-                output_name: "row_number".to_string(),
-                output_column_id: ColumnId::new_for_test(301),
-                ignore_nulls: false,
-            }],
-            output_columns: vec![
-                make_output_column(ColumnId::new_for_test(1), "a"),
-                make_output_column(ColumnId::new_for_test(2), "b"),
-                make_output_column(ColumnId::new_for_test(301), "row_number"),
-            ],
-            required_output_columns: None,
-        });
+                output_columns: vec![
+                    make_output_column(ColumnId::new_for_test(1), "a"),
+                    make_output_column(ColumnId::new_for_test(2), "b"),
+                    make_output_column(ColumnId::new_for_test(301), "row_number"),
+                ],
+            }),
+            vec![scan_with_3_cols()],
+            None,
+        );
         let tagged = tag_required_columns(window, Some(needed_set(&[1])));
-        let LogicalPlan::Window(w) = tagged else {
+        let LogicalPlanNodeKind::Window(_) = &tagged.kind else {
             panic!()
         };
         // The window node itself records the parent's request.
         assert_eq!(
-            w.required_output_columns.as_ref().unwrap(),
+            tagged.required_output_columns.as_ref().unwrap(),
             &needed_set(&[1])
         );
-        let LogicalPlan::Scan(s) = *w.input else {
+        let input = tagged.unary_input();
+        let LogicalPlanNodeKind::Scan(_) = &input.kind else {
             panic!()
         };
         // Child got None → Scan expands to all its columns.
-        let req = s.required_output_columns.unwrap();
+        let req = required_columns(input);
         assert_eq!(req.len(), 3, "scan keeps all 3 input columns");
         assert!(req.contains(&ColumnId::new_for_test(1)));
         assert!(req.contains(&ColumnId::new_for_test(2)));
@@ -1547,41 +1605,44 @@ mod tests {
     fn tag_window_with_none_parent_child_also_keeps_all() {
         // When parent_needed is None, Window propagates None to the child
         // (no-op: child keeps all columns too).
-        let window = LogicalPlan::Window(WindowNode {
-            input: Box::new(scan_with_3_cols()),
-            window_exprs: vec![WindowExpr {
-                name: "row_number".to_string(),
-                args: vec![],
-                distinct: false,
-                partition_by: vec![col_ref_expr(ColumnId::new_for_test(2))],
-                order_by: vec![SortItem {
-                    expr: col_ref_expr(ColumnId::new_for_test(3)),
-                    asc: true,
-                    nulls_first: false,
+        let window = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Window(LogicalWindowNode {
+                window_exprs: vec![WindowExpr {
+                    name: "row_number".to_string(),
+                    args: vec![],
+                    distinct: false,
+                    partition_by: vec![col_ref_expr(ColumnId::new_for_test(2))],
+                    order_by: vec![SortItem {
+                        expr: col_ref_expr(ColumnId::new_for_test(3)),
+                        asc: true,
+                        nulls_first: false,
+                    }],
+                    window_frame: None,
+                    result_type: DataType::Int64,
+                    output_name: "row_number".to_string(),
+                    output_column_id: ColumnId::new_for_test(301),
+                    ignore_nulls: false,
                 }],
-                window_frame: None,
-                result_type: DataType::Int64,
-                output_name: "row_number".to_string(),
-                output_column_id: ColumnId::new_for_test(301),
-                ignore_nulls: false,
-            }],
-            output_columns: vec![
-                make_output_column(ColumnId::new_for_test(1), "a"),
-                make_output_column(ColumnId::new_for_test(2), "b"),
-                make_output_column(ColumnId::new_for_test(301), "row_number"),
-            ],
-            required_output_columns: None,
-        });
+                output_columns: vec![
+                    make_output_column(ColumnId::new_for_test(1), "a"),
+                    make_output_column(ColumnId::new_for_test(2), "b"),
+                    make_output_column(ColumnId::new_for_test(301), "row_number"),
+                ],
+            }),
+            vec![scan_with_3_cols()],
+            None,
+        );
         let tagged = tag_required_columns(window, None);
-        let LogicalPlan::Window(w) = tagged else {
+        let LogicalPlanNodeKind::Window(_) = &tagged.kind else {
             panic!()
         };
-        assert!(w.required_output_columns.is_none());
-        let LogicalPlan::Scan(s) = *w.input else {
+        assert!(tagged.required_output_columns.is_none());
+        let input = tagged.unary_input();
+        let LogicalPlanNodeKind::Scan(_) = &input.kind else {
             panic!()
         };
         // None propagated → Scan keeps all columns.
-        let req = s.required_output_columns.unwrap();
+        let req = required_columns(input);
         assert_eq!(req.len(), 3);
     }
 
@@ -1591,26 +1652,29 @@ mod tests {
 
     #[test]
     fn tag_sort_adds_key_cols_to_child_needed() {
-        let sort = LogicalPlan::Sort(SortNode {
-            input: Box::new(scan_with_3_cols()),
-            items: vec![SortItem {
-                expr: col_ref_expr(ColumnId::new_for_test(3)),
-                asc: true,
-                nulls_first: false,
-            }],
-            analytic_partition_by: vec![],
-            partition_limit: None,
-            topn_type: None,
-            required_output_columns: None,
-        });
+        let sort = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Sort(LogicalSortNode {
+                items: vec![SortItem {
+                    expr: col_ref_expr(ColumnId::new_for_test(3)),
+                    asc: true,
+                    nulls_first: false,
+                }],
+                analytic_partition_by: vec![],
+                partition_limit: None,
+                topn_type: None,
+            }),
+            vec![scan_with_3_cols()],
+            None,
+        );
         let tagged = tag_required_columns(sort, Some(needed_set(&[1])));
-        let LogicalPlan::Sort(s) = tagged else {
+        let LogicalPlanNodeKind::Sort(_) = &tagged.kind else {
             panic!()
         };
-        let LogicalPlan::Scan(scan) = *s.input else {
+        let input = tagged.unary_input();
+        let LogicalPlanNodeKind::Scan(_) = &input.kind else {
             panic!()
         };
-        let req = scan.required_output_columns.unwrap();
+        let req = required_columns(input);
         assert!(req.contains(&ColumnId::new_for_test(1)), "parent needed a");
         assert!(
             req.contains(&ColumnId::new_for_test(3)),
@@ -1621,23 +1685,26 @@ mod tests {
 
     #[test]
     fn tag_limit_passes_needed_through() {
-        let limit = LogicalPlan::Limit(LimitNode {
-            input: Box::new(scan_with_3_cols()),
-            limit: Some(10),
-            offset: None,
-            required_output_columns: None,
-        });
+        let limit = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Limit(LogicalLimitNode {
+                limit: Some(10),
+                offset: None,
+            }),
+            vec![scan_with_3_cols()],
+            None,
+        );
         let needed = needed_set(&[2]);
         let tagged = tag_required_columns(limit, Some(needed.clone()));
-        let LogicalPlan::Limit(l) = tagged else {
+        let LogicalPlanNodeKind::Limit(_) = &tagged.kind else {
             panic!()
         };
-        assert_eq!(l.required_output_columns.unwrap(), needed);
-        let LogicalPlan::Scan(s) = *l.input else {
+        assert_eq!(tagged.required_output_columns.as_ref().unwrap(), &needed);
+        let input = tagged.unary_input();
+        let LogicalPlanNodeKind::Scan(_) = &input.kind else {
             panic!()
         };
         // Exactly the parent needed set passed through.
-        assert_eq!(s.required_output_columns.unwrap(), needed_set(&[2]));
+        assert_eq!(required_columns(input), &needed_set(&[2]));
     }
 
     // -----------------------------------------------------------------------
@@ -1646,19 +1713,22 @@ mod tests {
 
     #[test]
     fn tag_values_with_none_stamps_all_ids() {
-        let values = LogicalPlan::Values(ValuesNode {
-            rows: vec![],
-            columns: vec![
-                make_output_column(ColumnId::new_for_test(5), "x"),
-                make_output_column(ColumnId::new_for_test(6), "y"),
-            ],
-            required_output_columns: None,
-        });
+        let values = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Values(LogicalValuesNode {
+                rows: vec![],
+                columns: vec![
+                    make_output_column(ColumnId::new_for_test(5), "x"),
+                    make_output_column(ColumnId::new_for_test(6), "y"),
+                ],
+            }),
+            vec![],
+            None,
+        );
         let tagged = tag_required_columns(values, None);
-        let LogicalPlan::Values(v) = tagged else {
+        let LogicalPlanNodeKind::Values(_) = &tagged.kind else {
             panic!()
         };
-        let req = v.required_output_columns.unwrap();
+        let req = required_columns(&tagged);
         assert_eq!(req.len(), 2);
         assert!(req.contains(&ColumnId::new_for_test(5)));
         assert!(req.contains(&ColumnId::new_for_test(6)));
@@ -1675,32 +1745,35 @@ mod tests {
         // parent_needed = None
         // BUG before fix: collapsed to Some({3}), losing a@1 and b@2.
         // Correct: child gets None → Scan keeps all {1,2,3}.
-        let filter = LogicalPlan::Filter(FilterNode {
-            input: Box::new(scan_with_3_cols()),
-            predicate: TypedExpr {
-                kind: ExprKind::BinaryOp {
-                    left: Box::new(col_ref_expr(ColumnId::new_for_test(3))),
-                    op: BinOp::Gt,
-                    right: Box::new(int_literal(0)),
+        let filter = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: TypedExpr {
+                    kind: ExprKind::BinaryOp {
+                        left: Box::new(col_ref_expr(ColumnId::new_for_test(3))),
+                        op: BinOp::Gt,
+                        right: Box::new(int_literal(0)),
+                    },
+                    data_type: DataType::Boolean,
+                    nullable: false,
                 },
-                data_type: DataType::Boolean,
-                nullable: false,
-            },
-            required_output_columns: None,
-        });
+            }),
+            vec![scan_with_3_cols()],
+            None,
+        );
         let tagged = tag_required_columns(filter, None);
-        let LogicalPlan::Filter(f) = tagged else {
+        let LogicalPlanNodeKind::Filter(_) = &tagged.kind else {
             panic!()
         };
         assert!(
-            f.required_output_columns.is_none(),
+            tagged.required_output_columns.is_none(),
             "filter keeps None on itself"
         );
-        let LogicalPlan::Scan(s) = *f.input else {
+        let input = tagged.unary_input();
+        let LogicalPlanNodeKind::Scan(_) = &input.kind else {
             panic!()
         };
         // None propagated → Scan expands to all columns.
-        let req = s.required_output_columns.unwrap();
+        let req = required_columns(input);
         assert_eq!(
             req.len(),
             3,
@@ -1717,31 +1790,34 @@ mod tests {
         // parent_needed = None
         // BUG before fix: collapsed to Some({3}), losing a@1 and b@2.
         // Correct: child gets None → Scan keeps all {1,2,3}.
-        let sort = LogicalPlan::Sort(SortNode {
-            input: Box::new(scan_with_3_cols()),
-            items: vec![SortItem {
-                expr: col_ref_expr(ColumnId::new_for_test(3)),
-                asc: true,
-                nulls_first: false,
-            }],
-            analytic_partition_by: vec![col_ref_expr(ColumnId::new_for_test(2))],
-            partition_limit: None,
-            topn_type: None,
-            required_output_columns: None,
-        });
+        let sort = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Sort(LogicalSortNode {
+                items: vec![SortItem {
+                    expr: col_ref_expr(ColumnId::new_for_test(3)),
+                    asc: true,
+                    nulls_first: false,
+                }],
+                analytic_partition_by: vec![col_ref_expr(ColumnId::new_for_test(2))],
+                partition_limit: None,
+                topn_type: None,
+            }),
+            vec![scan_with_3_cols()],
+            None,
+        );
         let tagged = tag_required_columns(sort, None);
-        let LogicalPlan::Sort(s) = tagged else {
+        let LogicalPlanNodeKind::Sort(_) = &tagged.kind else {
             panic!()
         };
         assert!(
-            s.required_output_columns.is_none(),
+            tagged.required_output_columns.is_none(),
             "sort keeps None on itself"
         );
-        let LogicalPlan::Scan(scan) = *s.input else {
+        let input = tagged.unary_input();
+        let LogicalPlanNodeKind::Scan(_) = &input.kind else {
             panic!()
         };
         // None propagated → Scan expands to all columns.
-        let req = scan.required_output_columns.unwrap();
+        let req = required_columns(input);
         assert_eq!(
             req.len(),
             3,
@@ -1758,38 +1834,41 @@ mod tests {
         // parent_needed = None
         // BUG before fix: collapsed to Some({1,4}), losing b,c and e,f.
         // Correct: both children get None → each Scan keeps all its columns.
-        let join = LogicalPlan::Join(JoinNode {
-            left: Box::new(make_scan_with_ids(1, 2, 3)),
-            right: Box::new(make_scan_with_ids(4, 5, 6)),
-            join_type: JoinKind::Inner,
-            condition: Some(TypedExpr {
-                kind: ExprKind::BinaryOp {
-                    left: Box::new(col_ref_expr(ColumnId::new_for_test(1))),
-                    op: BinOp::Eq,
-                    right: Box::new(col_ref_expr(ColumnId::new_for_test(4))),
-                },
-                data_type: DataType::Boolean,
-                nullable: false,
+        let join = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: JoinKind::Inner,
+                condition: Some(TypedExpr {
+                    kind: ExprKind::BinaryOp {
+                        left: Box::new(col_ref_expr(ColumnId::new_for_test(1))),
+                        op: BinOp::Eq,
+                        right: Box::new(col_ref_expr(ColumnId::new_for_test(4))),
+                    },
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                }),
             }),
-            required_output_columns: None,
-        });
+            vec![make_scan_with_ids(1, 2, 3), make_scan_with_ids(4, 5, 6)],
+            None,
+        );
         let tagged = tag_required_columns(join, None);
-        let LogicalPlan::Join(j) = tagged else {
+        let LogicalPlanNodeKind::Join(_) = &tagged.kind else {
             panic!()
         };
         assert!(
-            j.required_output_columns.is_none(),
+            tagged.required_output_columns.is_none(),
             "join keeps None on itself"
         );
-        let LogicalPlan::Scan(l) = *j.left else {
+        let left = tagged.left();
+        let LogicalPlanNodeKind::Scan(_) = &left.kind else {
             panic!()
         };
-        let LogicalPlan::Scan(r) = *j.right else {
+        let right = tagged.right();
+        let LogicalPlanNodeKind::Scan(_) = &right.kind else {
             panic!()
         };
         // None propagated → each Scan expands to all its columns.
-        let lreq = l.required_output_columns.unwrap();
-        let rreq = r.required_output_columns.unwrap();
+        let lreq = required_columns(left);
+        let rreq = required_columns(right);
         assert_eq!(lreq.len(), 3, "left scan keeps all 3 columns");
         assert!(lreq.contains(&ColumnId::new_for_test(1)));
         assert!(lreq.contains(&ColumnId::new_for_test(2)));
@@ -1808,37 +1887,40 @@ mod tests {
 
     #[test]
     fn tag_repeat_maps_parent_needed_and_rollup_keys_to_child_ids() {
-        use crate::sql::planner::plan::RepeatPlanNode;
+        use crate::sql::planner::plan::LogicalRepeatNode;
         // Repeat node referencing rollup columns b@2 by ColumnId.
         // parent_needed = {1}  (only a — does NOT include the rollup column b@2).
         // The handler sends {1,2} to the child: parent output a@1 plus
         // rollup key b@2 needed by Repeat's nulling/grouping logic.
-        let repeat = LogicalPlan::Repeat(RepeatPlanNode {
-            input: Box::new(scan_with_3_cols()),
-            repeat_column_ref_list: vec![vec!["b".to_string()]],
-            repeat_column_ref_ids: vec![vec![ColumnId::new_for_test(2)]],
-            grouping_ids: vec![1],
-            all_rollup_columns: vec!["b".to_string()],
-            all_rollup_column_ids: vec![ColumnId::new_for_test(2)],
-            grouping_key_aliases: vec![],
-            grouping_fn_args: vec![],
-            grouping_fn_arg_ids: vec![],
-            grouping_fn_ids: vec![],
-            required_output_columns: None,
-        });
+        let repeat = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Repeat(LogicalRepeatNode {
+                repeat_column_ref_list: vec![vec!["b".to_string()]],
+                repeat_column_ref_ids: vec![vec![ColumnId::new_for_test(2)]],
+                grouping_ids: vec![1],
+                all_rollup_columns: vec!["b".to_string()],
+                all_rollup_column_ids: vec![ColumnId::new_for_test(2)],
+                grouping_key_aliases: vec![],
+                grouping_fn_args: vec![],
+                grouping_fn_arg_ids: vec![],
+                grouping_fn_ids: vec![],
+            }),
+            vec![scan_with_3_cols()],
+            None,
+        );
         let tagged = tag_required_columns(repeat, Some(needed_set(&[1])));
-        let LogicalPlan::Repeat(r) = tagged else {
+        let LogicalPlanNodeKind::Repeat(_) = &tagged.kind else {
             panic!()
         };
         // Repeat records parent_needed on itself.
         assert_eq!(
-            r.required_output_columns.as_ref().unwrap(),
+            tagged.required_output_columns.as_ref().unwrap(),
             &needed_set(&[1])
         );
-        let LogicalPlan::Scan(s) = *r.input else {
+        let input = tagged.unary_input();
+        let LogicalPlanNodeKind::Scan(_) = &input.kind else {
             panic!()
         };
-        let req = s.required_output_columns.unwrap();
+        let req = required_columns(input);
         assert_eq!(req.len(), 2, "scan keeps parent-needed and rollup key ids");
         assert!(req.contains(&ColumnId::new_for_test(1)));
         assert!(req.contains(&ColumnId::new_for_test(2)));
@@ -1847,34 +1929,37 @@ mod tests {
 
     #[test]
     fn tag_repeat_parent_none_preserves_all_child_outputs() {
-        use crate::sql::planner::plan::RepeatPlanNode;
+        use crate::sql::planner::plan::LogicalRepeatNode;
 
-        let repeat = LogicalPlan::Repeat(RepeatPlanNode {
-            input: Box::new(scan_with_3_cols()),
-            repeat_column_ref_list: vec![vec!["b".to_string()]],
-            repeat_column_ref_ids: vec![vec![ColumnId::new_for_test(2)]],
-            grouping_ids: vec![1],
-            all_rollup_columns: vec!["b".to_string()],
-            all_rollup_column_ids: vec![ColumnId::new_for_test(2)],
-            grouping_key_aliases: vec![],
-            grouping_fn_args: vec![],
-            grouping_fn_arg_ids: vec![],
-            grouping_fn_ids: vec![],
-            required_output_columns: None,
-        });
+        let repeat = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Repeat(LogicalRepeatNode {
+                repeat_column_ref_list: vec![vec!["b".to_string()]],
+                repeat_column_ref_ids: vec![vec![ColumnId::new_for_test(2)]],
+                grouping_ids: vec![1],
+                all_rollup_columns: vec!["b".to_string()],
+                all_rollup_column_ids: vec![ColumnId::new_for_test(2)],
+                grouping_key_aliases: vec![],
+                grouping_fn_args: vec![],
+                grouping_fn_arg_ids: vec![],
+                grouping_fn_ids: vec![],
+            }),
+            vec![scan_with_3_cols()],
+            None,
+        );
 
         let tagged = tag_required_columns(repeat, None);
-        let LogicalPlan::Repeat(r) = tagged else {
+        let LogicalPlanNodeKind::Repeat(_) = &tagged.kind else {
             panic!()
         };
         assert!(
-            r.required_output_columns.is_none(),
+            tagged.required_output_columns.is_none(),
             "Repeat root should keep the all-required None marker"
         );
-        let LogicalPlan::Scan(s) = *r.input else {
+        let input = tagged.unary_input();
+        let LogicalPlanNodeKind::Scan(_) = &input.kind else {
             panic!()
         };
-        let req = s.required_output_columns.unwrap();
+        let req = required_columns(input);
         assert_eq!(req.len(), 3, "child scan must keep all outputs");
         assert!(req.contains(&ColumnId::new_for_test(1)));
         assert!(req.contains(&ColumnId::new_for_test(2)));
@@ -1883,62 +1968,68 @@ mod tests {
 
     #[test]
     fn tag_generate_series_parent_none_requires_output_id() {
-        use crate::sql::planner::plan::GenerateSeriesNode;
+        use crate::sql::planner::plan::LogicalGenerateSeriesNode;
 
         let output_id = ColumnId::new_for_test(301);
         let tagged = tag_required_columns(
-            LogicalPlan::GenerateSeries(GenerateSeriesNode {
-                start: 1,
-                end: 3,
-                step: 1,
-                column_name: "x".to_string(),
-                alias: Some("gs".to_string()),
-                output_column_id: output_id,
-                required_output_columns: None,
-            }),
+            LogicalPlanNode::new(
+                LogicalPlanNodeKind::GenerateSeries(LogicalGenerateSeriesNode {
+                    start: 1,
+                    end: 3,
+                    step: 1,
+                    column_name: "x".to_string(),
+                    alias: Some("gs".to_string()),
+                    output_column_id: output_id,
+                }),
+                vec![],
+                None,
+            ),
             None,
         );
 
-        let LogicalPlan::GenerateSeries(node) = tagged else {
+        let LogicalPlanNodeKind::GenerateSeries(_) = &tagged.kind else {
             panic!()
         };
-        let req = node.required_output_columns.unwrap();
+        let req = required_columns(&tagged);
         assert_eq!(req.len(), 1);
         assert!(req.contains(&output_id));
     }
 
     #[test]
     fn tag_table_function_passes_none_to_child_even_when_parent_needed_is_narrow() {
-        use crate::sql::planner::plan::TableFunctionNode;
+        use crate::sql::planner::plan::LogicalTableFunctionNode;
         // TableFunction: UNNEST(arr@2) → exploded_col@401
         // parent_needed = {401}  (only the function output — does NOT include arr@2).
         // The handler must pass None to the child so arr@2 (the arg) is not dropped.
-        let tf = LogicalPlan::TableFunction(TableFunctionNode {
-            input: Box::new(scan_with_3_cols()),
-            function_name: "unnest".to_string(),
-            args: vec![col_ref_expr(ColumnId::new_for_test(2))],
-            output_columns: vec![
-                make_output_column(ColumnId::new_for_test(1), "a"),
-                make_output_column(ColumnId::new_for_test(401), "unnested"),
-            ],
-            alias: None,
-            is_left_join: false,
-            required_output_columns: None,
-        });
+        let tf = LogicalPlanNode::new(
+            LogicalPlanNodeKind::TableFunction(LogicalTableFunctionNode {
+                function_name: "unnest".to_string(),
+                args: vec![col_ref_expr(ColumnId::new_for_test(2))],
+                output_columns: vec![
+                    make_output_column(ColumnId::new_for_test(1), "a"),
+                    make_output_column(ColumnId::new_for_test(401), "unnested"),
+                ],
+                alias: None,
+                is_left_join: false,
+            }),
+            vec![scan_with_3_cols()],
+            None,
+        );
         let tagged = tag_required_columns(tf, Some(needed_set(&[401])));
-        let LogicalPlan::TableFunction(t) = tagged else {
+        let LogicalPlanNodeKind::TableFunction(_) = &tagged.kind else {
             panic!()
         };
         // TableFunction records parent_needed on itself.
         assert_eq!(
-            t.required_output_columns.as_ref().unwrap(),
+            tagged.required_output_columns.as_ref().unwrap(),
             &needed_set(&[401])
         );
-        let LogicalPlan::Scan(s) = *t.input else {
+        let input = tagged.unary_input();
+        let LogicalPlanNodeKind::Scan(_) = &input.kind else {
             panic!()
         };
         // Child got None → Scan expands to all columns, including arr@2.
-        let req = s.required_output_columns.unwrap();
+        let req = required_columns(input);
         assert_eq!(
             req.len(),
             3,
@@ -1965,40 +2056,45 @@ mod tests {
         use crate::sql::optimizer::rewrite::registry::query_rewrite_pipeline;
         use std::collections::HashMap;
 
-        let plan = LogicalPlan::Project(ProjectNode {
-            input: Box::new(LogicalPlan::Scan(ScanNode {
-                database: "db".to_string(),
-                table: crate::sql::catalog::TableDef {
-                    name: "t".to_string(),
-                    columns: vec![crate::sql::catalog::ColumnDef {
-                        name: "a".to_string(),
-                        data_type: arrow::datatypes::DataType::Int32,
-                        nullable: false,
-                        write_default: None,
-                        logical_type: None,
-                    }],
-                    iceberg_row_lineage_metadata_columns: vec![],
-                    source: crate::sql::catalog::ScanSource::StarRocks {
-                        db_id: 0,
-                        table_id: 0,
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![crate::sql::analysis::ProjectItem {
+                    output_column_id: ColumnId::new_for_test(101),
+                    output_name: "a".to_string(),
+                    expr: col_ref_expr(ColumnId::new_for_test(1)),
+                }],
+                output_qualifier: None,
+            }),
+            vec![LogicalPlanNode::new(
+                LogicalPlanNodeKind::Scan(LogicalScanNode {
+                    database: "db".to_string(),
+                    table: crate::sql::catalog::TableDef {
+                        name: "t".to_string(),
+                        columns: vec![crate::sql::catalog::ColumnDef {
+                            name: "a".to_string(),
+                            data_type: arrow::datatypes::DataType::Int32,
+                            nullable: false,
+                            write_default: None,
+                            logical_type: None,
+                        }],
+                        iceberg_row_lineage_metadata_columns: vec![],
+                        source: crate::sql::catalog::ScanSource::StarRocks {
+                            db_id: 0,
+                            table_id: 0,
+                        },
                     },
-                },
-                alias: None,
-                columns: vec![make_output_column(ColumnId::new_for_test(1), "a")],
-                predicates: vec![],
-                required_columns: None,
-                dict_columns: vec![],
-                variant_columns: vec![],
-                required_output_columns: None,
-            })),
-            items: vec![crate::sql::analysis::ProjectItem {
-                output_column_id: ColumnId::new_for_test(101),
-                output_name: "a".to_string(),
-                expr: col_ref_expr(ColumnId::new_for_test(1)),
-            }],
-            output_qualifier: None,
-            required_output_columns: None,
-        });
+                    alias: None,
+                    columns: vec![make_output_column(ColumnId::new_for_test(1), "a")],
+                    predicates: vec![],
+                    required_columns: None,
+                    dict_columns: vec![],
+                    variant_columns: vec![],
+                }),
+                vec![],
+                None,
+            )],
+            None,
+        );
 
         let table_stats = HashMap::new();
         let pipeline = query_rewrite_pipeline(&table_stats);
@@ -2013,15 +2109,16 @@ mod tests {
         // because it was called as the tree root (parent_needed = None), which
         // is the correct metadata: "no parent restriction on the root".
         // Only leaf nodes are guaranteed to hold `Some(_)` after tagging.
-        let LogicalPlan::Project(p) = result else {
+        let LogicalPlanNodeKind::Project(_) = &result.kind else {
             panic!("expected Project at root after pipeline rewrite");
         };
 
-        let LogicalPlan::Scan(s) = *p.input else {
+        let input = result.unary_input();
+        let LogicalPlanNodeKind::Scan(_) = &input.kind else {
             panic!("expected Scan child after pipeline rewrite");
         };
         assert!(
-            s.required_output_columns.is_some(),
+            input.required_output_columns.is_some(),
             "Scan.required_output_columns must be Some(_) after TagRequiredColumns stage ran"
         );
     }
@@ -2037,24 +2134,28 @@ mod tests {
         // subtree_untagged returns false after the first tagging pass, so
         // TagRequiredColumns terminates in one iteration for CTE plans.
         let cte_id: CteId = 99;
-        let consume = LogicalPlan::CTEConsume(CTEConsumeNode {
-            cte_id,
-            alias: "c".to_string(),
-            output_columns: vec![
-                make_output_column(ColumnId::new_for_test(10), "x"),
-                make_output_column(ColumnId::new_for_test(20), "y"),
-                make_output_column(ColumnId::new_for_test(30), "z"),
-            ],
-            required_output_columns: None,
-        });
+        let consume = LogicalPlanNode::new(
+            LogicalPlanNodeKind::CTEConsume(LogicalCTEConsumeNode {
+                cte_id: cte_id,
+                alias: "c".to_string(),
+                output_columns: vec![
+                    make_output_column(ColumnId::new_for_test(10), "x"),
+                    make_output_column(ColumnId::new_for_test(20), "y"),
+                    make_output_column(ColumnId::new_for_test(30), "z"),
+                ],
+            }),
+            vec![],
+            None,
+        );
 
         let tagged = tag_cte_consume(consume, None);
 
-        let LogicalPlan::CTEConsume(n) = tagged else {
+        let LogicalPlanNodeKind::CTEConsume(_) = &tagged.kind else {
             panic!("expected CTEConsume");
         };
-        let req = n
+        let req = tagged
             .required_output_columns
+            .as_ref()
             .expect("required_output_columns must be Some(_) after tagging with None parent");
         assert!(
             req.contains(&ColumnId::new_for_test(10)),
@@ -2080,49 +2181,54 @@ mod tests {
         let cte_id: CteId = 88;
 
         let scan = make_scan_with_ids(10, 20, 30);
-        let produce = LogicalPlan::CTEProduce(CTEProduceNode {
-            cte_id,
-            input: Box::new(scan),
-            output_columns: vec![
-                make_output_column(ColumnId::new_for_test(10), "a"),
-                make_output_column(ColumnId::new_for_test(20), "b"),
-                make_output_column(ColumnId::new_for_test(30), "c"),
-            ],
-            required_output_columns: None,
-        });
+        let produce = LogicalPlanNode::new(
+            LogicalPlanNodeKind::CTEProduce(LogicalCTEProduceNode {
+                cte_id: cte_id,
+                output_columns: vec![
+                    make_output_column(ColumnId::new_for_test(10), "a"),
+                    make_output_column(ColumnId::new_for_test(20), "b"),
+                    make_output_column(ColumnId::new_for_test(30), "c"),
+                ],
+            }),
+            vec![scan],
+            None,
+        );
 
-        let consume = LogicalPlan::CTEConsume(CTEConsumeNode {
-            cte_id,
-            alias: "u".to_string(),
-            output_columns: vec![
-                make_output_column(ColumnId::new_for_test(101), "p"),
-                make_output_column(ColumnId::new_for_test(102), "q"),
-            ],
-            required_output_columns: None,
-        });
+        let consume = LogicalPlanNode::new(
+            LogicalPlanNodeKind::CTEConsume(LogicalCTEConsumeNode {
+                cte_id: cte_id,
+                alias: "u".to_string(),
+                output_columns: vec![
+                    make_output_column(ColumnId::new_for_test(101), "p"),
+                    make_output_column(ColumnId::new_for_test(102), "q"),
+                ],
+            }),
+            vec![],
+            None,
+        );
 
-        let anchor = LogicalPlan::CTEAnchor(CTEAnchorNode {
-            cte_id,
-            produce: Box::new(produce),
-            consumer: Box::new(consume),
-            required_output_columns: None,
-        });
+        let anchor = LogicalPlanNode::new(
+            LogicalPlanNodeKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: cte_id }),
+            vec![produce, consume],
+            None,
+        );
 
         let tagged = tag_required_columns(anchor, None);
 
-        let LogicalPlan::CTEAnchor(a) = tagged else {
+        let LogicalPlanNodeKind::CTEAnchor(_) = &tagged.kind else {
             panic!("expected CTEAnchor");
         };
-        let LogicalPlan::CTEConsume(c) = *a.consumer else {
+        let consumer = tagged.child(1);
+        let LogicalPlanNodeKind::CTEConsume(_) = &consumer.kind else {
             panic!("expected CTEConsume consumer");
         };
         // The leaf must be Some(_) — not None — so subtree_untagged is false.
         assert!(
-            c.required_output_columns.is_some(),
+            consumer.required_output_columns.is_some(),
             "CTEConsume.required_output_columns must be Some(_) after tagging with None parent"
         );
         // All output ids must be present (keep-all semantics).
-        let req = c.required_output_columns.unwrap();
+        let req = required_columns(consumer);
         assert!(req.contains(&ColumnId::new_for_test(101)), "p@101 kept");
         assert!(req.contains(&ColumnId::new_for_test(102)), "q@102 kept");
         assert_eq!(req.len(), 2, "both output ids kept");

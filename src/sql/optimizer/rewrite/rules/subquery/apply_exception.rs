@@ -5,7 +5,7 @@ use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::planner::plan::{ApplyNode, LogicalPlan};
+use crate::sql::planner::plan::{LogicalApplyNode, LogicalPlanNode, LogicalPlanNodeKind};
 
 pub(crate) struct ApplyException;
 
@@ -18,19 +18,23 @@ impl LogicalRewriteRule for ApplyException {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
-        matches!(plan, LogicalPlan::Apply(_))
+    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+        matches!(&plan.kind, LogicalPlanNodeKind::Apply(_))
     }
 
-    fn apply(&self, plan: LogicalPlan, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
-        match &plan {
-            LogicalPlan::Apply(node) => Err(apply_exception_message(node)),
+    fn apply(
+        &self,
+        plan: LogicalPlanNode,
+        _ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, String> {
+        match &plan.kind {
+            LogicalPlanNodeKind::Apply(node) => Err(apply_exception_message(node)),
             _ => Ok(RewriteResult::Unchanged),
         }
     }
 }
 
-pub(super) fn apply_exception_message(node: &ApplyNode) -> String {
+pub(super) fn apply_exception_message(node: &LogicalApplyNode) -> String {
     format!(
         "subquery decorrelation failed: a residual Apply node (kind={:?}, correlated={}) \
          survived the SubqueryRewrite stage; this subquery shape is not yet supported",

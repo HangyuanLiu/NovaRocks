@@ -1,5 +1,3 @@
-use arrow::datatypes::DataType;
-
 use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
 use crate::sql::codegen::helpers::group_win_exprs_by_sig;
 use crate::sql::column_id::ColumnId;
@@ -8,7 +6,7 @@ use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
 use crate::sql::optimizer::rewrite::rules::utils::split_and;
-use crate::sql::planner::plan::{FilterNode, LogicalPlan, ProjectNode, SortNode, WindowNode};
+use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind, LogicalSortNode};
 
 pub(crate) struct RankingWindowPredicatePushdownRule;
 
@@ -33,37 +31,51 @@ impl LogicalRewriteRule for RankingWindowPredicatePushdownRule {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
-        let LogicalPlan::Filter(f) = plan else {
+    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+        let LogicalPlanNodeKind::Filter(_) = &plan.kind else {
             return false;
         };
-        let win = match f.input.as_ref() {
-            LogicalPlan::Window(w) => w,
-            LogicalPlan::Project(p) => match p.input.as_ref() {
-                LogicalPlan::Window(w) => w,
+        let window_plan = match &plan.unary_input().kind {
+            LogicalPlanNodeKind::Window(_) => plan.unary_input(),
+            LogicalPlanNodeKind::Project(_) => match &plan.unary_input().unary_input().kind {
+                LogicalPlanNodeKind::Window(_) => plan.unary_input().unary_input(),
                 _ => return false,
             },
             _ => return false,
         };
-        matches!(win.input.as_ref(), LogicalPlan::Sort(s) if !s.analytic_partition_by.is_empty())
+        matches!(
+            &window_plan.unary_input().kind,
+            LogicalPlanNodeKind::Sort(sort) if !sort.analytic_partition_by.is_empty()
+        )
     }
 
-    fn apply(&self, plan: LogicalPlan, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        plan: LogicalPlanNode,
+        _ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, String> {
         // --- Step 1: Destructure Filter -> optional Project -> Window -> Sort ---
-        let LogicalPlan::Filter(filter) = &plan else {
+        let LogicalPlanNodeKind::Filter(filter) = &plan.kind else {
             return Ok(RewriteResult::Unchanged);
         };
 
-        let (project_opt, window) = match filter.input.as_ref() {
-            LogicalPlan::Window(w) => (None::<&ProjectNode>, w),
-            LogicalPlan::Project(p) => match p.input.as_ref() {
-                LogicalPlan::Window(w) => (Some(p), w),
+        let filter_input = plan.unary_input();
+        let (project_plan_opt, project_opt, window_plan, window) = match &filter_input.kind {
+            LogicalPlanNodeKind::Window(window) => (None, None, filter_input, window),
+            LogicalPlanNodeKind::Project(project) => match &filter_input.unary_input().kind {
+                LogicalPlanNodeKind::Window(window) => (
+                    Some(filter_input),
+                    Some(project),
+                    filter_input.unary_input(),
+                    window,
+                ),
                 _ => return Ok(RewriteResult::Unchanged),
             },
             _ => return Ok(RewriteResult::Unchanged),
         };
 
-        let LogicalPlan::Sort(sort) = window.input.as_ref() else {
+        let sort_plan = window_plan.unary_input();
+        let LogicalPlanNodeKind::Sort(sort) = &sort_plan.kind else {
             return Ok(RewriteResult::Unchanged);
         };
 
@@ -137,33 +149,41 @@ impl LogicalRewriteRule for RankingWindowPredicatePushdownRule {
         let topn_type = ranking_topn_type(&matched_w_expr.name).unwrap();
 
         // Clone and mutate the Sort.
-        let new_sort = LogicalPlan::Sort(SortNode {
-            partition_limit: Some(k),
-            topn_type: Some(topn_type),
-            ..sort.clone()
-        });
+        let new_sort = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Sort(LogicalSortNode {
+                items: sort.items.clone(),
+                analytic_partition_by: sort.analytic_partition_by.clone(),
+                partition_limit: Some(k),
+                topn_type: Some(topn_type),
+            }),
+            sort_plan.children.clone(),
+            sort_plan.required_output_columns.clone(),
+        );
 
         // Rebuild Window over the new Sort.
-        let new_window = LogicalPlan::Window(WindowNode {
-            input: Box::new(new_sort),
-            ..window.clone()
-        });
+        let new_window = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Window(window.clone()),
+            vec![new_sort],
+            window_plan.required_output_columns.clone(),
+        );
 
         // Rebuild Project (if present) over the new Window.
-        let mid = if let Some(proj) = project_opt {
-            LogicalPlan::Project(ProjectNode {
-                input: Box::new(new_window),
-                ..proj.clone()
-            })
+        let mid = if let Some(project_plan) = project_plan_opt {
+            LogicalPlanNode::new(
+                project_plan.kind.clone(),
+                vec![new_window],
+                project_plan.required_output_columns.clone(),
+            )
         } else {
             new_window
         };
 
         // Rebuild Filter over mid.
-        let new_filter = LogicalPlan::Filter(FilterNode {
-            input: Box::new(mid),
-            ..filter.clone()
-        });
+        let new_filter = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(filter.clone()),
+            vec![mid],
+            plan.required_output_columns,
+        );
 
         Ok(RewriteResult::Changed(new_filter))
     }
@@ -387,7 +407,8 @@ mod tests {
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
     use crate::sql::planner::plan::{
-        FilterNode, LogicalPlan, ProjectNode, SortNode, ValuesNode, WindowExpr, WindowNode,
+        LogicalFilterNode, LogicalPlanNode, LogicalPlanNodeKind, LogicalProjectNode,
+        LogicalSortNode, LogicalValuesNode, LogicalWindowNode, WindowExpr,
     };
 
     fn col_ref(id: ColumnId) -> TypedExpr {
@@ -412,12 +433,15 @@ mod tests {
         }
     }
 
-    fn empty_values() -> LogicalPlan {
-        LogicalPlan::Values(ValuesNode {
-            rows: vec![],
-            columns: vec![],
-            required_output_columns: None,
-        })
+    fn empty_values() -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Values(LogicalValuesNode {
+                rows: vec![],
+                columns: vec![],
+            }),
+            vec![],
+            None,
+        )
     }
 
     fn sort_item(e: TypedExpr) -> SortItem {
@@ -429,37 +453,43 @@ mod tests {
     }
 
     /// Build Sort(partition_by=[p_col], items=[p_col]) over an empty Values.
-    fn make_sort(p_id: ColumnId) -> LogicalPlan {
-        LogicalPlan::Sort(SortNode {
-            input: Box::new(empty_values()),
-            items: vec![sort_item(col_ref(p_id))],
-            analytic_partition_by: vec![col_ref(p_id)],
-            partition_limit: None,
-            topn_type: None,
-            required_output_columns: None,
-        })
+    fn make_sort(p_id: ColumnId) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Sort(LogicalSortNode {
+                items: vec![sort_item(col_ref(p_id))],
+                analytic_partition_by: vec![col_ref(p_id)],
+                partition_limit: None,
+                topn_type: None,
+            }),
+            vec![empty_values()],
+            None,
+        )
     }
 
-    fn make_sort_with_limit(p_id: ColumnId, limit: usize) -> LogicalPlan {
-        LogicalPlan::Sort(SortNode {
-            input: Box::new(empty_values()),
-            items: vec![sort_item(col_ref(p_id))],
-            analytic_partition_by: vec![col_ref(p_id)],
-            partition_limit: Some(limit),
-            topn_type: Some(SortTopNType::Rank),
-            required_output_columns: None,
-        })
+    fn make_sort_with_limit(p_id: ColumnId, limit: usize) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Sort(LogicalSortNode {
+                items: vec![sort_item(col_ref(p_id))],
+                analytic_partition_by: vec![col_ref(p_id)],
+                partition_limit: Some(limit),
+                topn_type: Some(SortTopNType::Rank),
+            }),
+            vec![empty_values()],
+            None,
+        )
     }
 
-    fn make_sort_no_partition(p_id: ColumnId) -> LogicalPlan {
-        LogicalPlan::Sort(SortNode {
-            input: Box::new(empty_values()),
-            items: vec![sort_item(col_ref(p_id))],
-            analytic_partition_by: vec![],
-            partition_limit: None,
-            topn_type: None,
-            required_output_columns: None,
-        })
+    fn make_sort_no_partition(p_id: ColumnId) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Sort(LogicalSortNode {
+                items: vec![sort_item(col_ref(p_id))],
+                analytic_partition_by: vec![],
+                partition_limit: None,
+                topn_type: None,
+            }),
+            vec![empty_values()],
+            None,
+        )
     }
 
     fn make_window_expr(fn_name: &str, output_id: ColumnId, p_id: ColumnId) -> WindowExpr {
@@ -477,47 +507,88 @@ mod tests {
         }
     }
 
+    fn window_over(
+        input: LogicalPlanNode,
+        window_exprs: Vec<WindowExpr>,
+        output_columns: Vec<OutputColumn>,
+    ) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Window(LogicalWindowNode {
+                window_exprs,
+                output_columns,
+            }),
+            vec![input],
+            None,
+        )
+    }
+
+    fn filter_over(input: LogicalPlanNode, predicate: TypedExpr) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode { predicate }),
+            vec![input],
+            None,
+        )
+    }
+
+    fn project_over(input: LogicalPlanNode, items: Vec<ProjectItem>) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items,
+                output_qualifier: None,
+            }),
+            vec![input],
+            None,
+        )
+    }
+
     /// Build Filter(rk_col <= k) -> Window(fn_name, out=rk_id, partition=[p_id]) -> Sort -> Values
     fn make_filter_window_sort(
         fn_name: &str,
         rk_id: ColumnId,
         p_id: ColumnId,
         k: i64,
-    ) -> LogicalPlan {
+    ) -> LogicalPlanNode {
         let sort = make_sort(p_id);
-        let window = LogicalPlan::Window(WindowNode {
-            input: Box::new(sort),
-            window_exprs: vec![make_window_expr(fn_name, rk_id, p_id)],
-            output_columns: vec![output_col(rk_id, fn_name)],
-            required_output_columns: None,
-        });
-        LogicalPlan::Filter(FilterNode {
-            input: Box::new(window),
-            predicate: binop(col_ref(rk_id), BinOp::Le, int(k)),
-            required_output_columns: None,
-        })
+        let window = window_over(
+            sort,
+            vec![make_window_expr(fn_name, rk_id, p_id)],
+            vec![output_col(rk_id, fn_name)],
+        );
+        filter_over(window, binop(col_ref(rk_id), BinOp::Le, int(k)))
     }
 
-    fn apply_rule(plan: LogicalPlan) -> RewriteResult {
+    fn apply_rule(plan: LogicalPlanNode) -> RewriteResult {
         let rule = RankingWindowPredicatePushdownRule;
         let mut ctx = RewriteContext::new(RewriteConsumer::Query);
         rule.apply(plan, &mut ctx).unwrap()
     }
 
-    fn extract_sort_from_changed(result: RewriteResult) -> SortNode {
-        if let RewriteResult::Changed(LogicalPlan::Filter(f)) = result {
-            let window = match *f.input {
-                LogicalPlan::Window(w) => w,
-                LogicalPlan::Project(p) => match *p.input {
-                    LogicalPlan::Window(w) => w,
-                    other => panic!("expected Window under Project, got {:?}", other),
-                },
-                other => panic!("expected Window or Project under Filter, got {:?}", other),
+    fn extract_sort_from_changed(result: RewriteResult) -> LogicalSortNode {
+        if let RewriteResult::Changed(plan) = result {
+            let LogicalPlanNodeKind::Filter(_) = &plan.kind else {
+                panic!("expected Changed(Filter(...)), got {:?}", plan);
             };
-            match *window.input {
-                LogicalPlan::Sort(s) => s,
-                other => panic!("expected Sort under Window, got {:?}", other),
-            }
+            let filter_input = plan.unary_input();
+            let window_plan = match &filter_input.kind {
+                LogicalPlanNodeKind::Window(_) => filter_input,
+                LogicalPlanNodeKind::Project(_) => {
+                    let window_plan = filter_input.unary_input();
+                    if matches!(&window_plan.kind, LogicalPlanNodeKind::Window(_)) {
+                        window_plan
+                    } else {
+                        panic!("expected Window under Project, got {:?}", window_plan);
+                    }
+                }
+                _ => panic!(
+                    "expected Window or Project under Filter, got {:?}",
+                    filter_input
+                ),
+            };
+            let sort_plan = window_plan.unary_input();
+            let LogicalPlanNodeKind::Sort(sort) = &sort_plan.kind else {
+                panic!("expected Sort under Window, got {:?}", sort_plan);
+            };
+            sort.clone()
         } else {
             panic!("expected Changed(Filter(...)), got {:?}", result);
         }
@@ -577,20 +648,15 @@ mod tests {
 
         // Window has both rank() AND avg() — avg is not a ranking fn, so we must reject.
         let avg_id = ColumnId::new_for_test(22);
-        let window = LogicalPlan::Window(WindowNode {
-            input: Box::new(sort),
-            window_exprs: vec![
+        let window = window_over(
+            sort,
+            vec![
                 make_window_expr("rank", rk_id, p_id),
                 make_window_expr("avg", avg_id, p_id),
             ],
-            output_columns: vec![output_col(rk_id, "rank"), output_col(avg_id, "avg")],
-            required_output_columns: None,
-        });
-        let plan = LogicalPlan::Filter(FilterNode {
-            input: Box::new(window),
-            predicate: binop(col_ref(rk_id), BinOp::Le, int(2)),
-            required_output_columns: None,
-        });
+            vec![output_col(rk_id, "rank"), output_col(avg_id, "avg")],
+        );
+        let plan = filter_over(window, binop(col_ref(rk_id), BinOp::Le, int(2)));
 
         assert!(matches!(apply_rule(plan), RewriteResult::Unchanged));
     }
@@ -604,20 +670,15 @@ mod tests {
         let rk_id = ColumnId::new_for_test(30);
         let p_id = ColumnId::new_for_test(31);
         let sort = make_sort_no_partition(p_id);
-        let window = LogicalPlan::Window(WindowNode {
-            input: Box::new(sort),
-            window_exprs: vec![make_window_expr("rank", rk_id, p_id)],
-            output_columns: vec![output_col(rk_id, "rank")],
-            required_output_columns: None,
-        });
-        let plan = LogicalPlan::Filter(FilterNode {
-            input: Box::new(window),
-            predicate: binop(col_ref(rk_id), BinOp::Le, int(2)),
-            required_output_columns: None,
-        });
+        let window = window_over(
+            sort,
+            vec![make_window_expr("rank", rk_id, p_id)],
+            vec![output_col(rk_id, "rank")],
+        );
+        let plan = filter_over(window, binop(col_ref(rk_id), BinOp::Le, int(2)));
 
         let rule = RankingWindowPredicatePushdownRule;
-        let mut ctx = RewriteContext::new(RewriteConsumer::Query);
+        let ctx = RewriteContext::new(RewriteConsumer::Query);
         // matches() should return false because analytic_partition_by is empty
         assert!(!rule.matches(&plan, &ctx));
         assert!(matches!(apply_rule(plan), RewriteResult::Unchanged));
@@ -632,18 +693,13 @@ mod tests {
         let rk_id = ColumnId::new_for_test(40);
         let p_id = ColumnId::new_for_test(41);
         let sort = make_sort(p_id);
-        let window = LogicalPlan::Window(WindowNode {
-            input: Box::new(sort),
-            window_exprs: vec![make_window_expr("rank", rk_id, p_id)],
-            output_columns: vec![output_col(rk_id, "rank")],
-            required_output_columns: None,
-        });
+        let window = window_over(
+            sort,
+            vec![make_window_expr("rank", rk_id, p_id)],
+            vec![output_col(rk_id, "rank")],
+        );
         // Filter: rk >= 2 (lower bound only — no upper bound)
-        let plan = LogicalPlan::Filter(FilterNode {
-            input: Box::new(window),
-            predicate: binop(col_ref(rk_id), BinOp::Ge, int(2)),
-            required_output_columns: None,
-        });
+        let plan = filter_over(window, binop(col_ref(rk_id), BinOp::Ge, int(2)));
 
         assert!(matches!(apply_rule(plan), RewriteResult::Unchanged));
     }
@@ -657,17 +713,12 @@ mod tests {
         let rk_id = ColumnId::new_for_test(50);
         let p_id = ColumnId::new_for_test(51);
         let sort = make_sort_with_limit(p_id, 2);
-        let window = LogicalPlan::Window(WindowNode {
-            input: Box::new(sort),
-            window_exprs: vec![make_window_expr("rank", rk_id, p_id)],
-            output_columns: vec![output_col(rk_id, "rank")],
-            required_output_columns: None,
-        });
-        let plan = LogicalPlan::Filter(FilterNode {
-            input: Box::new(window),
-            predicate: binop(col_ref(rk_id), BinOp::Le, int(2)),
-            required_output_columns: None,
-        });
+        let window = window_over(
+            sort,
+            vec![make_window_expr("rank", rk_id, p_id)],
+            vec![output_col(rk_id, "rank")],
+        );
+        let plan = filter_over(window, binop(col_ref(rk_id), BinOp::Le, int(2)));
 
         assert!(matches!(apply_rule(plan), RewriteResult::Unchanged));
     }
@@ -683,31 +734,24 @@ mod tests {
         let p_id = ColumnId::new_for_test(62);
 
         let sort = make_sort(p_id);
-        let window = LogicalPlan::Window(WindowNode {
-            input: Box::new(sort),
-            window_exprs: vec![make_window_expr("rank", rk_id, p_id)],
-            output_columns: vec![output_col(rk_id, "rank")],
-            required_output_columns: None,
-        });
+        let window = window_over(
+            sort,
+            vec![make_window_expr("rank", rk_id, p_id)],
+            vec![output_col(rk_id, "rank")],
+        );
 
         // Project: proj_rk_id <- rk_id (identity/passthrough)
-        let project = LogicalPlan::Project(ProjectNode {
-            input: Box::new(window),
-            items: vec![ProjectItem {
+        let project = project_over(
+            window,
+            vec![ProjectItem {
                 expr: col_ref(rk_id), // bare ColumnRef to window output
                 output_name: "rk".to_string(),
                 output_column_id: proj_rk_id,
             }],
-            output_qualifier: None,
-            required_output_columns: None,
-        });
+        );
 
         // Filter references the projected column (proj_rk_id), not rk_id directly
-        let plan = LogicalPlan::Filter(FilterNode {
-            input: Box::new(project),
-            predicate: binop(col_ref(proj_rk_id), BinOp::Le, int(3)),
-            required_output_columns: None,
-        });
+        let plan = filter_over(project, binop(col_ref(proj_rk_id), BinOp::Le, int(3)));
 
         let rule = RankingWindowPredicatePushdownRule;
         let mut ctx = RewriteContext::new(RewriteConsumer::Query);
@@ -738,24 +782,19 @@ mod tests {
         let p_id = ColumnId::new_for_test(82);
 
         let sort = make_sort(p_id); // analytic_partition_by is non-empty
-        let window = LogicalPlan::Window(WindowNode {
-            input: Box::new(sort),
-            window_exprs: vec![
+        let window = window_over(
+            sort,
+            vec![
                 make_window_expr("rank", rk_id, p_id),
                 make_window_expr("avg", avg_id, p_id),
             ],
-            output_columns: vec![output_col(rk_id, "rank"), output_col(avg_id, "avg")],
-            required_output_columns: None,
-        });
+            vec![output_col(rk_id, "rank"), output_col(avg_id, "avg")],
+        );
         // Filter on the rank column only (rk_id <= 2).
-        let plan = LogicalPlan::Filter(FilterNode {
-            input: Box::new(window),
-            predicate: binop(col_ref(rk_id), BinOp::Le, int(2)),
-            required_output_columns: None,
-        });
+        let plan = filter_over(window, binop(col_ref(rk_id), BinOp::Le, int(2)));
 
         let rule = RankingWindowPredicatePushdownRule;
-        let mut ctx = RewriteContext::new(RewriteConsumer::Query);
+        let ctx = RewriteContext::new(RewriteConsumer::Query);
         // matches() sees Filter -> Window -> Sort(non-empty partition) and fires.
         assert!(
             rule.matches(&plan, &ctx),
@@ -779,31 +818,24 @@ mod tests {
         let p_id = ColumnId::new_for_test(72);
 
         let sort = make_sort(p_id);
-        let window = LogicalPlan::Window(WindowNode {
-            input: Box::new(sort),
-            window_exprs: vec![make_window_expr("rank", rk_id, p_id)],
-            output_columns: vec![output_col(rk_id, "rank")],
-            required_output_columns: None,
-        });
+        let window = window_over(
+            sort,
+            vec![make_window_expr("rank", rk_id, p_id)],
+            vec![output_col(rk_id, "rank")],
+        );
 
         // Project: proj_rk_id <- rk_id + 1 (NOT a bare passthrough)
-        let project = LogicalPlan::Project(ProjectNode {
-            input: Box::new(window),
-            items: vec![ProjectItem {
+        let project = project_over(
+            window,
+            vec![ProjectItem {
                 expr: binop(col_ref(rk_id), BinOp::Add, int(1)),
                 output_name: "rk_plus_one".to_string(),
                 output_column_id: proj_rk_id,
             }],
-            output_qualifier: None,
-            required_output_columns: None,
-        });
+        );
 
         // Filter references the projected column
-        let plan = LogicalPlan::Filter(FilterNode {
-            input: Box::new(project),
-            predicate: binop(col_ref(proj_rk_id), BinOp::Le, int(3)),
-            required_output_columns: None,
-        });
+        let plan = filter_over(project, binop(col_ref(proj_rk_id), BinOp::Le, int(3)));
 
         assert!(matches!(apply_rule(plan), RewriteResult::Unchanged));
     }
@@ -846,37 +878,34 @@ mod tests {
         let b_id = ColumnId::new_for_test(94);
 
         // Sort keyed on partition=[p_id], order=[a_id] (first window's order)
-        let sort = LogicalPlan::Sort(SortNode {
-            input: Box::new(empty_values()),
-            items: vec![sort_item(col_ref(p_id)), sort_item(col_ref(a_id))],
-            analytic_partition_by: vec![col_ref(p_id)],
-            partition_limit: None,
-            topn_type: None,
-            required_output_columns: None,
-        });
+        let sort = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Sort(LogicalSortNode {
+                items: vec![sort_item(col_ref(p_id)), sort_item(col_ref(a_id))],
+                analytic_partition_by: vec![col_ref(p_id)],
+                partition_limit: None,
+                topn_type: None,
+            }),
+            vec![empty_values()],
+            None,
+        );
 
         // Window has TWO ranking exprs with different ORDER BY signatures.
-        let window = LogicalPlan::Window(WindowNode {
-            input: Box::new(sort),
-            window_exprs: vec![
+        let window = window_over(
+            sort,
+            vec![
                 make_window_expr_with_order("rank", rka_id, p_id, a_id),
                 make_window_expr_with_order("rank", rkb_id, p_id, b_id),
             ],
-            output_columns: vec![output_col(rka_id, "rka"), output_col(rkb_id, "rkb")],
-            required_output_columns: None,
-        });
+            vec![output_col(rka_id, "rka"), output_col(rkb_id, "rkb")],
+        );
 
         // Filter on the SECOND ranking expr's column (rkb <= 2) — the one that
         // would be corrupted if partition_limit were set on the first-order Sort.
-        let plan = LogicalPlan::Filter(FilterNode {
-            input: Box::new(window),
-            predicate: binop(col_ref(rkb_id), BinOp::Le, int(2)),
-            required_output_columns: None,
-        });
+        let plan = filter_over(window, binop(col_ref(rkb_id), BinOp::Le, int(2)));
 
         // matches() fires (structural shape is valid)
         let rule = RankingWindowPredicatePushdownRule;
-        let mut ctx = RewriteContext::new(RewriteConsumer::Query);
+        let ctx = RewriteContext::new(RewriteConsumer::Query);
         assert!(
             rule.matches(&plan, &ctx),
             "matches() should fire on this structural shape"
@@ -903,32 +932,29 @@ mod tests {
         let p_id = ColumnId::new_for_test(102);
         let o_id = ColumnId::new_for_test(103);
 
-        let sort = LogicalPlan::Sort(SortNode {
-            input: Box::new(empty_values()),
-            items: vec![sort_item(col_ref(p_id)), sort_item(col_ref(o_id))],
-            analytic_partition_by: vec![col_ref(p_id)],
-            partition_limit: None,
-            topn_type: None,
-            required_output_columns: None,
-        });
+        let sort = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Sort(LogicalSortNode {
+                items: vec![sort_item(col_ref(p_id)), sort_item(col_ref(o_id))],
+                analytic_partition_by: vec![col_ref(p_id)],
+                partition_limit: None,
+                topn_type: None,
+            }),
+            vec![empty_values()],
+            None,
+        );
 
         // Both exprs share PARTITION BY p ORDER BY o → same signature.
-        let window = LogicalPlan::Window(WindowNode {
-            input: Box::new(sort),
-            window_exprs: vec![
+        let window = window_over(
+            sort,
+            vec![
                 make_window_expr_with_order("rank", rk_id, p_id, o_id),
                 make_window_expr_with_order("dense_rank", drk_id, p_id, o_id),
             ],
-            output_columns: vec![output_col(rk_id, "rk"), output_col(drk_id, "drk")],
-            required_output_columns: None,
-        });
+            vec![output_col(rk_id, "rk"), output_col(drk_id, "drk")],
+        );
 
         // Filter on the rank column (rk <= 3).
-        let plan = LogicalPlan::Filter(FilterNode {
-            input: Box::new(window),
-            predicate: binop(col_ref(rk_id), BinOp::Le, int(3)),
-            required_output_columns: None,
-        });
+        let plan = filter_over(window, binop(col_ref(rk_id), BinOp::Le, int(3)));
 
         // Rule must FIRE — single signature, both are ranking fns, non-empty partition.
         let sort_node = extract_sort_from_changed(apply_rule(plan));

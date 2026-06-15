@@ -10,11 +10,10 @@ use crate::sql::catalog::{IcebergTableInfo, ScanSource};
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
 use crate::sql::optimizer::rewrite::imv::annotation::ImvExtension;
-use crate::sql::optimizer::rewrite::imv::marker::{ImvDeltaNode, ImvVersionNode};
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
-use crate::sql::planner::plan::{LogicalPlan, ScanNode};
+use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind, LogicalScanNode};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ImvVersionRole {
@@ -45,25 +44,38 @@ impl LogicalRewriteRule for BindIcebergScanRule {
         RewriteTraversal::BottomUp
     }
 
-    fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
+    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
         matches!(
-            plan,
-            LogicalPlan::ImvDelta(ImvDeltaNode { input, .. })
-                if matches!(input.as_ref(), LogicalPlan::Scan(_))
-        ) || matches!(
-            plan,
-            LogicalPlan::ImvVersion(ImvVersionNode { input, .. })
-                if matches!(input.as_ref(), LogicalPlan::Scan(_))
-        )
+            &plan.kind,
+            LogicalPlanNodeKind::ImvDelta(_) | LogicalPlanNodeKind::ImvVersion(_)
+        ) && matches!(&plan.unary_input().kind, LogicalPlanNodeKind::Scan(_))
     }
 
-    fn apply(&self, plan: LogicalPlan, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        plan: LogicalPlanNode,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, String> {
         let ext = ctx
             .extension::<ImvExtension>()
             .ok_or_else(|| "BindIcebergScan requires ImvExtension in RewriteContext".to_string())?;
-        match plan {
-            LogicalPlan::ImvDelta(node) => {
-                let LogicalPlan::Scan(scan) = *node.input else {
+        let LogicalPlanNode {
+            kind,
+            mut children,
+            required_output_columns: _,
+        } = plan;
+        if children.len() != 1 {
+            return Ok(RewriteResult::Unchanged);
+        }
+        let scan_plan = children.remove(0);
+        let LogicalPlanNode {
+            kind: scan_kind,
+            required_output_columns,
+            ..
+        } = scan_plan;
+        match &kind {
+            LogicalPlanNodeKind::ImvDelta(node) => {
+                let LogicalPlanNodeKind::Scan(scan) = scan_kind else {
                     return Ok(RewriteResult::Unchanged);
                 };
                 let mut bound = bind_delta_scan(scan, &ext.mv_ctx)?;
@@ -75,14 +87,22 @@ impl LogicalRewriteRule for BindIcebergScanRule {
                         .columns
                         .push(ImvActionColumn::output_column(column_id));
                 }
-                Ok(RewriteResult::Changed(LogicalPlan::Scan(bound)))
+                Ok(RewriteResult::Changed(LogicalPlanNode::new(
+                    LogicalPlanNodeKind::Scan(bound),
+                    vec![],
+                    required_output_columns,
+                )))
             }
-            LogicalPlan::ImvVersion(node) => {
-                let LogicalPlan::Scan(scan) = *node.input else {
+            LogicalPlanNodeKind::ImvVersion(node) => {
+                let LogicalPlanNodeKind::Scan(scan) = scan_kind else {
                     return Ok(RewriteResult::Unchanged);
                 };
                 let bound = bind_version_scan(scan, &ext.mv_ctx, node.version_ref.role)?;
-                Ok(RewriteResult::Changed(LogicalPlan::Scan(bound)))
+                Ok(RewriteResult::Changed(LogicalPlanNode::new(
+                    LogicalPlanNodeKind::Scan(bound),
+                    vec![],
+                    required_output_columns,
+                )))
             }
             _ => Ok(RewriteResult::Unchanged),
         }
@@ -90,9 +110,9 @@ impl LogicalRewriteRule for BindIcebergScanRule {
 }
 
 fn bind_delta_scan(
-    mut scan: ScanNode,
+    mut scan: LogicalScanNode,
     mv_ctx: &IcebergMvRewriteContext,
-) -> Result<ScanNode, String> {
+) -> Result<LogicalScanNode, String> {
     let table = iceberg_table_info_from_source(&scan.table.source)?.clone();
     let window = resolve_snapshot_window(mv_ctx, &table)?;
     scan.table.source = ScanSource::IcebergDeltaTable {
@@ -104,10 +124,10 @@ fn bind_delta_scan(
 }
 
 fn bind_version_scan(
-    mut scan: ScanNode,
+    mut scan: LogicalScanNode,
     mv_ctx: &IcebergMvRewriteContext,
     role: ImvVersionRole,
-) -> Result<ScanNode, String> {
+) -> Result<LogicalScanNode, String> {
     let table = iceberg_table_info_from_source(&scan.table.source)?.clone();
     let window = resolve_snapshot_window(mv_ctx, &table)?;
     let snapshot_id = match role {
@@ -198,6 +218,7 @@ fn find_base_ref<'a>(
 
 #[cfg(test)]
 mod tests {
+    use crate::sql::planner::plan::*;
     use std::collections::BTreeMap;
 
     use arrow::datatypes::DataType;
@@ -231,7 +252,7 @@ mod tests {
         }
     }
 
-    fn iceberg_scan(uuid: Option<&str>) -> ScanNode {
+    fn iceberg_scan(uuid: Option<&str>) -> LogicalScanNode {
         let column = ColumnDef {
             name: "k".to_string(),
             data_type: DataType::Int64,
@@ -239,7 +260,7 @@ mod tests {
             write_default: None,
             logical_type: None,
         };
-        ScanNode {
+        LogicalScanNode {
             database: "db".to_string(),
             table: TableDef {
                 name: "b".to_string(),
@@ -264,7 +285,6 @@ mod tests {
             required_columns: None,
             dict_columns: Vec::new(),
             variant_columns: Vec::new(),
-            required_output_columns: None,
         }
     }
 
@@ -314,16 +334,26 @@ mod tests {
             annotation: ImvPlanAnnotation::default(),
             next_column_id: Arc::new(AtomicU32::new(1000)),
         });
-        let plan = LogicalPlan::ImvDelta(ImvDeltaNode {
-            input: Box::new(LogicalPlan::Scan(iceberg_scan(Some("uuid-b")))),
-            is_root: false,
-            action_column: Some(ColumnId::new_for_test(77)),
-            branch_scope: None,
-        });
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+                is_root: false,
+                action_column: Some(ColumnId::new_for_test(77)),
+                branch_scope: None,
+            }),
+            vec![LogicalPlanNode::new(
+                LogicalPlanNodeKind::Scan(iceberg_scan(Some("uuid-b"))),
+                vec![],
+                None,
+            )],
+            None,
+        );
         let bind = BindIcebergScanRule;
-        let RewriteResult::Changed(LogicalPlan::Scan(bound)) =
+        let RewriteResult::Changed(changed) =
             bind.apply(plan, &mut ctx).expect("bind must succeed")
         else {
+            panic!("expected changed scan");
+        };
+        let LogicalPlanNodeKind::Scan(bound) = &changed.kind else {
             panic!("expected changed scan");
         };
         let action = bound
@@ -335,7 +365,7 @@ mod tests {
 
         let inject = InjectActionColumnRule;
         assert!(
-            !inject.matches(&LogicalPlan::Scan(bound), &ctx),
+            !inject.matches(&changed, &ctx),
             "inject action must skip a scan that already carries the marker action id"
         );
     }
@@ -356,17 +386,27 @@ mod tests {
             nullable: false,
             is_internal: false,
         });
-        let plan = LogicalPlan::ImvDelta(ImvDeltaNode {
-            input: Box::new(LogicalPlan::Scan(scan)),
-            is_root: false,
-            action_column: Some(ColumnId::new_for_test(77)),
-            branch_scope: None,
-        });
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+                is_root: false,
+                action_column: Some(ColumnId::new_for_test(77)),
+                branch_scope: None,
+            }),
+            vec![LogicalPlanNode::new(
+                LogicalPlanNodeKind::Scan(scan),
+                vec![],
+                None,
+            )],
+            None,
+        );
 
         let bind = BindIcebergScanRule;
-        let RewriteResult::Changed(LogicalPlan::Scan(bound)) =
+        let RewriteResult::Changed(changed) =
             bind.apply(plan, &mut ctx).expect("bind must succeed")
         else {
+            panic!("expected changed scan");
+        };
+        let LogicalPlanNodeKind::Scan(bound) = &changed.kind else {
             panic!("expected changed scan");
         };
         let actions = bound

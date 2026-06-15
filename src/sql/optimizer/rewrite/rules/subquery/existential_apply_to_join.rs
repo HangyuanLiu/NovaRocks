@@ -11,7 +11,7 @@ use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::planner::plan::{ApplyKind, JoinNode, LogicalPlan};
+use crate::sql::planner::plan::{ApplyKind, LogicalJoinNode, LogicalPlanNode, LogicalPlanNodeKind};
 
 #[allow(dead_code)] // Registered by Task 6.
 pub(crate) struct ExistentialApplyToJoin;
@@ -25,14 +25,28 @@ impl LogicalRewriteRule for ExistentialApplyToJoin {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
-        matches!(plan, LogicalPlan::Apply(a) if matches!(a.kind, ApplyKind::Exists { .. }))
+    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+        matches!(&plan.kind, LogicalPlanNodeKind::Apply(a) if matches!(a.kind, ApplyKind::Exists { .. }))
     }
 
-    fn apply(&self, plan: LogicalPlan, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
-        let LogicalPlan::Apply(a) = plan else {
+    fn apply(
+        &self,
+        plan: LogicalPlanNode,
+        _ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, String> {
+        let LogicalPlanNode {
+            kind,
+            mut children,
+            required_output_columns: _,
+        } = plan;
+        let LogicalPlanNodeKind::Apply(a) = &kind else {
             return Ok(RewriteResult::Unchanged);
         };
+        if children.len() != 2 {
+            return Ok(RewriteResult::Unchanged);
+        }
+        let apply_right = children.remove(1);
+        let apply_left = children.remove(0);
         let negated = match a.kind {
             ApplyKind::Exists { negated } => negated,
             _ => return Ok(RewriteResult::Unchanged),
@@ -44,9 +58,9 @@ impl LogicalRewriteRule for ExistentialApplyToJoin {
         };
 
         let (right, condition) = if a.correlation_column_ids.is_empty() {
-            (*a.right, literal_true())
+            (apply_right, literal_true())
         } else {
-            let Some(lifted) = lift_correlated_inner(*a.right, &a.correlation_column_ids) else {
+            let Some(lifted) = lift_correlated_inner(apply_right, &a.correlation_column_ids) else {
                 return Ok(RewriteResult::Unchanged);
             };
             let Some(pred) = lifted.on_predicate else {
@@ -55,18 +69,20 @@ impl LogicalRewriteRule for ExistentialApplyToJoin {
             (lifted.right, pred)
         };
 
-        Ok(RewriteResult::Changed(LogicalPlan::Join(JoinNode {
-            left: a.left,
-            right: Box::new(right),
-            join_type,
-            condition: Some(condition),
-            required_output_columns: None,
-        })))
+        Ok(RewriteResult::Changed(LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type,
+                condition: Some(condition),
+            }),
+            vec![apply_left, right],
+            None,
+        )))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::sql::planner::plan::*;
     use std::collections::HashSet;
 
     use arrow::datatypes::DataType;
@@ -79,7 +95,8 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::planner::plan::{
-        ApplyKind, ApplyNode, FilterNode, JoinNode, ProjectNode, ScanNode,
+        ApplyKind, LogicalApplyNode, LogicalFilterNode, LogicalJoinNode, LogicalPlanNodeKind,
+        LogicalProjectNode, LogicalScanNode,
     };
 
     const OUTER_K: ColumnId = ColumnId(1);
@@ -113,18 +130,21 @@ mod tests {
         }
     }
 
-    fn scan(table: &str, id: ColumnId) -> LogicalPlan {
-        LogicalPlan::Scan(ScanNode {
-            database: "default".to_string(),
-            table: table_def(table),
-            alias: None,
-            columns: vec![output_column(id, "k", DataType::Int64)],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        })
+    fn scan(table: &str, id: ColumnId) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "default".to_string(),
+                table: table_def(table),
+                alias: None,
+                columns: vec![output_column(id, "k", DataType::Int64)],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        )
     }
 
     fn col_ref(id: ColumnId, name: &str) -> TypedExpr {
@@ -169,76 +189,87 @@ mod tests {
         }
     }
 
-    fn correlated_inner() -> LogicalPlan {
-        LogicalPlan::Project(ProjectNode {
-            input: Box::new(LogicalPlan::Filter(FilterNode {
-                input: Box::new(scan("inner", INNER_K)),
-                predicate: correlation_predicate(),
-                required_output_columns: None,
-            })),
-            items: vec![ProjectItem {
-                expr: col_ref(INNER_K, "k"),
-                output_name: "k".to_string(),
-                output_column_id: INNER_K,
-            }],
-            output_qualifier: None,
-            required_output_columns: None,
-        })
+    fn correlated_inner() -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![ProjectItem {
+                    expr: col_ref(INNER_K, "k"),
+                    output_name: "k".to_string(),
+                    output_column_id: INNER_K,
+                }],
+                output_qualifier: None,
+            }),
+            vec![LogicalPlanNode::new(
+                LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                    predicate: correlation_predicate(),
+                }),
+                vec![scan("inner", INNER_K)],
+                None,
+            )],
+            None,
+        )
     }
 
-    fn correlated_select_one_inner() -> LogicalPlan {
-        LogicalPlan::Project(ProjectNode {
-            input: Box::new(LogicalPlan::Filter(FilterNode {
-                input: Box::new(scan("inner", INNER_K)),
-                predicate: correlation_predicate(),
-                required_output_columns: None,
-            })),
-            items: vec![ProjectItem {
-                expr: TypedExpr {
-                    kind: ExprKind::Literal(LiteralValue::Int(1)),
-                    data_type: DataType::Int64,
-                    nullable: false,
-                },
-                output_name: "1".to_string(),
-                output_column_id: CONST_ONE,
-            }],
-            output_qualifier: None,
-            required_output_columns: None,
-        })
+    fn correlated_select_one_inner() -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![ProjectItem {
+                    expr: TypedExpr {
+                        kind: ExprKind::Literal(LiteralValue::Int(1)),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                    },
+                    output_name: "1".to_string(),
+                    output_column_id: CONST_ONE,
+                }],
+                output_qualifier: None,
+            }),
+            vec![LogicalPlanNode::new(
+                LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                    predicate: correlation_predicate(),
+                }),
+                vec![scan("inner", INNER_K)],
+                None,
+            )],
+            None,
+        )
     }
 
-    fn correlated_project_scan_inner() -> LogicalPlan {
-        LogicalPlan::Project(ProjectNode {
-            input: Box::new(scan("inner", INNER_K)),
-            items: vec![ProjectItem {
-                expr: col_ref(INNER_K, "k"),
-                output_name: "k".to_string(),
-                output_column_id: INNER_K,
-            }],
-            output_qualifier: None,
-            required_output_columns: None,
-        })
+    fn correlated_project_scan_inner() -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![ProjectItem {
+                    expr: col_ref(INNER_K, "k"),
+                    output_name: "k".to_string(),
+                    output_column_id: INNER_K,
+                }],
+                output_qualifier: None,
+            }),
+            vec![scan("inner", INNER_K)],
+            None,
+        )
     }
 
-    fn exists_apply(negated: bool, right: LogicalPlan, correlated: bool) -> LogicalPlan {
-        LogicalPlan::Apply(ApplyNode {
-            left: Box::new(scan("outer", OUTER_K)),
-            right: Box::new(right),
-            kind: ApplyKind::Exists { negated },
-            subquery_expr: bool_expr(),
-            output_column: exists_output(),
-            inner_output_column_id: INNER_K,
-            correlation_column_ids: if correlated { vec![OUTER_K] } else { vec![] },
-            correlation_conjuncts: vec![],
-            residual_predicate: None,
-            need_check_max_rows: false,
-            use_semi_anti: true,
-            uncorrelated_outer_predicate_columns: HashSet::new(),
-            required_output_columns: None,
-        })
+    fn exists_apply(negated: bool, right: LogicalPlanNode, correlated: bool) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Apply(LogicalApplyNode {
+                kind: ApplyKind::Exists { negated },
+                subquery_expr: bool_expr(),
+                output_column: exists_output(),
+                inner_output_column_id: INNER_K,
+                correlation_column_ids: if correlated { vec![OUTER_K] } else { vec![] },
+                correlation_conjuncts: vec![],
+                residual_predicate: None,
+                need_check_max_rows: false,
+                use_semi_anti: true,
+                uncorrelated_outer_predicate_columns: HashSet::new(),
+            }),
+            vec![scan("outer", OUTER_K), right],
+            None,
+        )
     }
 
-    fn rewrite(plan: LogicalPlan) -> LogicalPlan {
+    fn rewrite(plan: LogicalPlanNode) -> LogicalPlanNode {
         let rule = ExistentialApplyToJoin;
         let mut ctx = ctx();
         assert!(rule.matches(&plan, &ctx));
@@ -248,12 +279,12 @@ mod tests {
         }
     }
 
-    fn assert_join(plan: LogicalPlan, expected_kind: JoinKind) -> JoinNode {
+    fn assert_join(plan: &LogicalPlanNode, expected_kind: JoinKind) -> &LogicalJoinNode {
         assert!(
-            !contains_apply(&plan),
+            !contains_apply(plan),
             "result must not contain Apply: {plan:?}"
         );
-        let LogicalPlan::Join(join) = plan else {
+        let LogicalPlanNodeKind::Join(join) = &plan.kind else {
             panic!("expected Join, got: {plan:?}");
         };
         assert_eq!(join.join_type, expected_kind);
@@ -286,18 +317,21 @@ mod tests {
         assert_eq!(*column_id, expected);
     }
 
-    fn contains_apply(plan: &LogicalPlan) -> bool {
-        match plan {
-            LogicalPlan::Apply(_) => true,
-            LogicalPlan::Filter(n) => contains_apply(&n.input),
-            LogicalPlan::Project(n) => contains_apply(&n.input),
-            LogicalPlan::Join(n) => contains_apply(&n.left) || contains_apply(&n.right),
+    fn contains_apply(plan: &LogicalPlanNode) -> bool {
+        match &plan.kind {
+            LogicalPlanNodeKind::Apply(_) => true,
+            LogicalPlanNodeKind::Filter(_) | LogicalPlanNodeKind::Project(_) => {
+                contains_apply(plan.unary_input())
+            }
+            LogicalPlanNodeKind::Join(_) => {
+                contains_apply(plan.left()) || contains_apply(plan.right())
+            }
             _ => false,
         }
     }
 
-    fn project_outputs_column(plan: &LogicalPlan, expected: ColumnId) -> bool {
-        let LogicalPlan::Project(project) = plan else {
+    fn project_outputs_column(plan: &LogicalPlanNode, expected: ColumnId) -> bool {
+        let LogicalPlanNodeKind::Project(project) = &plan.kind else {
             return false;
         };
         project
@@ -309,23 +343,27 @@ mod tests {
     #[test]
     fn exists_correlated_emits_left_semi() {
         let plan = rewrite(exists_apply(false, correlated_inner(), true));
-        let join = assert_join(plan, JoinKind::LeftSemi);
+        let join = assert_join(&plan, JoinKind::LeftSemi);
 
         assert_correlation_condition(join.condition.as_ref().unwrap());
-        let LogicalPlan::Project(project) = join.right.as_ref() else {
-            panic!("expected Project right, got: {:?}", join.right);
+        let right = plan.right();
+        let LogicalPlanNodeKind::Project(_project) = &right.kind else {
+            panic!("expected Project right, got: {:?}", right);
         };
-        assert!(matches!(project.input.as_ref(), LogicalPlan::Scan(_)));
+        assert!(matches!(
+            &right.unary_input().kind,
+            LogicalPlanNodeKind::Scan(_)
+        ));
     }
 
     #[test]
     fn exists_correlated_select_one_exposes_inner_key_for_join_on() {
         let plan = rewrite(exists_apply(false, correlated_select_one_inner(), true));
-        let join = assert_join(plan, JoinKind::LeftSemi);
+        let join = assert_join(&plan, JoinKind::LeftSemi);
 
         assert_correlation_condition(join.condition.as_ref().unwrap());
         assert!(
-            project_outputs_column(join.right.as_ref(), INNER_K),
+            project_outputs_column(plan.right(), INNER_K),
             "right child must expose INNER_K referenced by the join ON"
         );
     }
@@ -344,30 +382,34 @@ mod tests {
     #[test]
     fn not_exists_correlated_emits_left_anti() {
         let plan = rewrite(exists_apply(true, correlated_inner(), true));
-        let join = assert_join(plan, JoinKind::LeftAnti);
+        let join = assert_join(&plan, JoinKind::LeftAnti);
 
         assert_correlation_condition(join.condition.as_ref().unwrap());
-        let LogicalPlan::Project(project) = join.right.as_ref() else {
-            panic!("expected Project right, got: {:?}", join.right);
+        let right = plan.right();
+        let LogicalPlanNodeKind::Project(_project) = &right.kind else {
+            panic!("expected Project right, got: {:?}", right);
         };
-        assert!(matches!(project.input.as_ref(), LogicalPlan::Scan(_)));
+        assert!(matches!(
+            &right.unary_input().kind,
+            LogicalPlanNodeKind::Scan(_)
+        ));
     }
 
     #[test]
     fn exists_uncorrelated_emits_left_semi_on_true() {
         let plan = rewrite(exists_apply(false, scan("inner", INNER_K), false));
-        let join = assert_join(plan, JoinKind::LeftSemi);
+        let join = assert_join(&plan, JoinKind::LeftSemi);
 
         assert_true_condition(join.condition.as_ref().unwrap());
-        assert!(matches!(join.right.as_ref(), LogicalPlan::Scan(_)));
+        assert!(matches!(&plan.right().kind, LogicalPlanNodeKind::Scan(_)));
     }
 
     #[test]
     fn not_exists_uncorrelated_emits_left_anti_on_true() {
         let plan = rewrite(exists_apply(true, scan("inner", INNER_K), false));
-        let join = assert_join(plan, JoinKind::LeftAnti);
+        let join = assert_join(&plan, JoinKind::LeftAnti);
 
         assert_true_condition(join.condition.as_ref().unwrap());
-        assert!(matches!(join.right.as_ref(), LogicalPlan::Scan(_)));
+        assert!(matches!(&plan.right().kind, LogicalPlanNodeKind::Scan(_)));
     }
 }

@@ -1,10 +1,10 @@
 //! PushDownPredicateScan — `Filter(Scan)` rewrite.
 //!
-//! Pushes filter conjuncts into `ScanNode.predicates` when every column
+//! Pushes filter conjuncts into `LogicalScanNode.predicates` when every column
 //! the conjunct references is present in the scan's output. Unpushable
 //! conjuncts are wrapped back as a residual `Filter` above the scan.
 //!
-//! Mirrors the `LogicalPlan::Scan(mut scan)` arm of legacy
+//! Mirrors the `LogicalPlanNodeKind::Scan(mut scan)` arm of legacy
 //! `predicate_pushdown::push_filter_into`.
 
 use std::collections::HashSet;
@@ -25,23 +25,40 @@ impl RewriteRule for PushDownPredicateScan {
         "PushDownPredicateScan"
     }
 
-    fn matches(&self, plan: &LogicalPlan) -> bool {
-        matches!(
-            plan,
-            LogicalPlan::Filter(f) if matches!(*f.input, LogicalPlan::Scan(_))
-        )
+    fn matches(&self, plan: &LogicalPlanNode) -> bool {
+        matches!(&plan.kind, LogicalPlanNodeKind::Filter(_))
+            && matches!(&plan.unary_input().kind, LogicalPlanNodeKind::Scan(_))
     }
 
-    fn apply(&self, plan: LogicalPlan) -> Option<LogicalPlan> {
-        let LogicalPlan::Filter(filter) = plan else {
+    fn apply(&self, plan: LogicalPlanNode) -> Option<LogicalPlanNode> {
+        let LogicalPlanNode {
+            kind,
+            mut children,
+            required_output_columns: _,
+        } = plan;
+        let LogicalPlanNodeKind::Filter(filter) = kind else {
             return None;
         };
-        let LogicalPlan::Scan(mut scan) = *filter.input else {
+        if children.len() != 1 {
+            return None;
+        }
+        let scan_plan = children.remove(0);
+        let LogicalPlanNode {
+            kind,
+            required_output_columns,
+            ..
+        } = scan_plan;
+        let LogicalPlanNodeKind::Scan(mut scan) = kind else {
             return None;
         };
 
         let conjuncts = split_and(filter.predicate);
-        let mut scan_ids = collect_output_ids(&LogicalPlan::Scan(scan.clone()));
+        let scan_for_ids = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(scan.clone()),
+            vec![],
+            required_output_columns.clone(),
+        );
+        let mut scan_ids = collect_output_ids(&scan_for_ids);
         scan_ids.remove(&ColumnId::UNSET);
 
         // Canonical keys of predicates already on the scan, so we never append a
@@ -79,7 +96,14 @@ impl RewriteRule for PushDownPredicateScan {
             return None;
         }
 
-        Some(wrap_remaining_filter(LogicalPlan::Scan(scan), remaining))
+        Some(wrap_remaining_filter(
+            LogicalPlanNode::new(
+                LogicalPlanNodeKind::Scan(scan),
+                vec![],
+                required_output_columns,
+            ),
+            remaining,
+        ))
     }
 }
 
@@ -96,6 +120,7 @@ mod tests {
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::planner::plan::*;
     use arrow::datatypes::DataType;
 
     fn test_col_id(name: &str) -> ColumnId {
@@ -143,59 +168,64 @@ mod tests {
         }
     }
 
-    fn scan_with_cols(cols: &[&str]) -> LogicalPlan {
-        LogicalPlan::Scan(ScanNode {
-            database: "db".into(),
-            table: TableDef {
-                name: "t".into(),
+    fn scan_with_cols(cols: &[&str]) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".into(),
+                table: TableDef {
+                    name: "t".into(),
+                    columns: cols
+                        .iter()
+                        .map(|n| ColumnDef {
+                            name: (*n).into(),
+                            data_type: DataType::Int64,
+                            nullable: true,
+                            write_default: None,
+                            logical_type: None,
+                        })
+                        .collect(),
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 0,
+                    },
+                },
+                alias: None,
                 columns: cols
                     .iter()
-                    .map(|n| ColumnDef {
+                    .map(|n| OutputColumn {
+                        column_id: test_col_id(n),
                         name: (*n).into(),
                         data_type: DataType::Int64,
                         nullable: true,
-                        write_default: None,
-                        logical_type: None,
+                        is_internal: false,
                     })
                     .collect(),
-                iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::StarRocks {
-                    db_id: 0,
-                    table_id: 0,
-                },
-            },
-            alias: None,
-            columns: cols
-                .iter()
-                .map(|n| OutputColumn {
-                    column_id: test_col_id(n),
-                    name: (*n).into(),
-                    data_type: DataType::Int64,
-                    nullable: true,
-                    is_internal: false,
-                })
-                .collect(),
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        })
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        )
     }
 
     #[test]
     fn pushes_single_scan_column_predicate() {
         let scan = scan_with_cols(&["a", "b"]);
-        let filter = LogicalPlan::Filter(FilterNode {
-            input: Box::new(scan),
-            predicate: eq(col("a"), int_lit(1)),
-            required_output_columns: None,
-        });
+        let filter = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: eq(col("a"), int_lit(1)),
+            }),
+            vec![scan],
+            None,
+        );
         let rule = PushDownPredicateScan;
         assert!(rule.matches(&filter));
         let out = rule.apply(filter).expect("should rewrite");
-        match out {
-            LogicalPlan::Scan(s) => {
+        match &out.kind {
+            LogicalPlanNodeKind::Scan(s) => {
                 assert_eq!(s.predicates.len(), 1);
             }
             other => panic!("expected bare Scan after full pushdown, got {:?}", other),
@@ -215,11 +245,13 @@ mod tests {
         // is pushable; rule must return None so the pipeline's fixed-point
         // terminates on this shape.
         let scan = scan_with_cols(&["a"]);
-        let filter = LogicalPlan::Filter(FilterNode {
-            input: Box::new(scan),
-            predicate: eq(col("zz"), int_lit(1)),
-            required_output_columns: None,
-        });
+        let filter = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: eq(col("zz"), int_lit(1)),
+            }),
+            vec![scan],
+            None,
+        );
         let rule = PushDownPredicateScan;
         assert!(rule.apply(filter).is_none());
     }
@@ -227,11 +259,13 @@ mod tests {
     #[test]
     fn p4_scan_does_not_push_same_name_with_different_column_id() {
         let scan = scan_with_cols(&["a"]);
-        let filter = LogicalPlan::Filter(FilterNode {
-            input: Box::new(scan),
-            predicate: eq(col_with_id("a", ColumnId::new_for_test(77)), int_lit(1)),
-            required_output_columns: None,
-        });
+        let filter = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: eq(col_with_id("a", ColumnId::new_for_test(77)), int_lit(1)),
+            }),
+            vec![scan],
+            None,
+        );
         let rule = PushDownPredicateScan;
         assert!(
             rule.apply(filter).is_none(),
@@ -258,15 +292,15 @@ mod tests {
         // on the scan and the residual conjunct above.
         let scan = scan_with_cols(&["a"]);
         let pred = and(eq(col("a"), int_lit(1)), eq(col("zz"), int_lit(2)));
-        let filter = LogicalPlan::Filter(FilterNode {
-            input: Box::new(scan),
-            predicate: pred,
-            required_output_columns: None,
-        });
+        let filter = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode { predicate: pred }),
+            vec![scan],
+            None,
+        );
         let out = PushDownPredicateScan.apply(filter).expect("should rewrite");
-        match out {
-            LogicalPlan::Filter(f) => match *f.input {
-                LogicalPlan::Scan(s) => assert_eq!(s.predicates.len(), 1),
+        match &out.kind {
+            LogicalPlanNodeKind::Filter(_) => match &out.unary_input().kind {
+                LogicalPlanNodeKind::Scan(s) => assert_eq!(s.predicates.len(), 1),
                 other => panic!("expected Scan under residual Filter, got {:?}", other),
             },
             other => panic!(
@@ -295,16 +329,18 @@ mod tests {
     fn repeated_identical_predicate_dedups_to_one() {
         // Round 1: Filter(a IS NOT NULL, Scan) -> Scan with one predicate.
         let scan = scan_with_cols(&["a", "b"]);
-        let filter = LogicalPlan::Filter(FilterNode {
-            input: Box::new(scan),
-            predicate: is_not_null(col("a")),
-            required_output_columns: None,
-        });
+        let filter = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: is_not_null(col("a")),
+            }),
+            vec![scan],
+            None,
+        );
         let after_round1 = PushDownPredicateScan
             .apply(filter)
             .expect("first push should rewrite");
-        let scan_after_round1 = match after_round1 {
-            LogicalPlan::Scan(s) => {
+        let scan_after_round1 = match &after_round1.kind {
+            LogicalPlanNodeKind::Scan(s) => {
                 assert_eq!(s.predicates.len(), 1, "first push lands one predicate");
                 s
             }
@@ -314,16 +350,22 @@ mod tests {
         // Round 2: an upstream rule re-derives the same conjunct above the scan
         // that already carries it. The duplicate must be dropped — the scan
         // still holds exactly one copy, and the redundant Filter is removed.
-        let filter2 = LogicalPlan::Filter(FilterNode {
-            input: Box::new(LogicalPlan::Scan(scan_after_round1)),
-            predicate: is_not_null(col("a")),
-            required_output_columns: None,
-        });
+        let filter2 = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: is_not_null(col("a")),
+            }),
+            vec![LogicalPlanNode::new(
+                LogicalPlanNodeKind::Scan(scan_after_round1.clone()),
+                vec![],
+                None,
+            )],
+            None,
+        );
         let after_round2 = PushDownPredicateScan
             .apply(filter2)
             .expect("redundant Filter removal is a structural change -> Some");
-        match after_round2 {
-            LogicalPlan::Scan(s) => assert_eq!(
+        match &after_round2.kind {
+            LogicalPlanNodeKind::Scan(s) => assert_eq!(
                 s.predicates.len(),
                 1,
                 "re-pushing an identical predicate must not accumulate"
@@ -337,14 +379,14 @@ mod tests {
     fn duplicate_conjuncts_in_one_filter_dedup() {
         let scan = scan_with_cols(&["a"]);
         let pred = and(is_not_null(col("a")), is_not_null(col("a")));
-        let filter = LogicalPlan::Filter(FilterNode {
-            input: Box::new(scan),
-            predicate: pred,
-            required_output_columns: None,
-        });
+        let filter = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode { predicate: pred }),
+            vec![scan],
+            None,
+        );
         let out = PushDownPredicateScan.apply(filter).expect("should rewrite");
-        match out {
-            LogicalPlan::Scan(s) => assert_eq!(s.predicates.len(), 1),
+        match &out.kind {
+            LogicalPlanNodeKind::Scan(s) => assert_eq!(s.predicates.len(), 1),
             other => panic!("expected bare Scan, got {:?}", other),
         }
     }
@@ -356,14 +398,14 @@ mod tests {
         let scan = scan_with_cols(&["a"]);
         // a IS NOT NULL AND a = 1 -> two distinct predicates.
         let pred = and(is_not_null(col("a")), eq(col("a"), int_lit(1)));
-        let filter = LogicalPlan::Filter(FilterNode {
-            input: Box::new(scan),
-            predicate: pred,
-            required_output_columns: None,
-        });
+        let filter = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode { predicate: pred }),
+            vec![scan],
+            None,
+        );
         let out = PushDownPredicateScan.apply(filter).expect("should rewrite");
-        match out {
-            LogicalPlan::Scan(s) => assert_eq!(
+        match &out.kind {
+            LogicalPlanNodeKind::Scan(s) => assert_eq!(
                 s.predicates.len(),
                 2,
                 "distinct predicates on the same column must be preserved"

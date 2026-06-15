@@ -3401,7 +3401,7 @@ pub(crate) fn execute_query_with_catalog_mgr(
 
 pub(crate) type IcebergWriteRootDistributionResolver = Box<
     dyn FnOnce(
-        &crate::sql::planner::plan::LogicalPlan,
+        &crate::sql::planner::plan::LogicalPlanNode,
     ) -> Result<Option<crate::sql::optimizer::property::DistributionSpec>, String>,
 >;
 
@@ -3868,7 +3868,7 @@ fn wait_for_standalone_exchange_server(port: u16) -> Result<(), String> {
 /// Walk the logical plan tree and collect table-level statistics for all scan
 /// nodes that reference IcebergDataFiles storage.
 fn build_table_stats_from_plan(
-    plan: &crate::sql::planner::plan::LogicalPlan,
+    plan: &crate::sql::planner::plan::LogicalPlanNode,
 ) -> std::collections::HashMap<String, crate::sql::optimizer::statistics::TableStatistics> {
     let mut stats = std::collections::HashMap::new();
     collect_scan_stats(plan, &mut stats);
@@ -3877,13 +3877,13 @@ fn build_table_stats_from_plan(
 
 /// Recursively visit plan nodes and collect statistics from Scan leaves.
 fn collect_scan_stats(
-    plan: &crate::sql::planner::plan::LogicalPlan,
+    plan: &crate::sql::planner::plan::LogicalPlanNode,
     out: &mut std::collections::HashMap<String, crate::sql::optimizer::statistics::TableStatistics>,
 ) {
-    use crate::sql::planner::plan::LogicalPlan;
+    use crate::sql::planner::plan::LogicalPlanNodeKind;
 
-    match plan {
-        LogicalPlan::Scan(s) => {
+    match &plan.kind {
+        LogicalPlanNodeKind::Scan(s) => {
             if let crate::sql::catalog::ScanSource::IcebergDataFiles {
                 table,
                 files,
@@ -3911,52 +3911,13 @@ fn collect_scan_stats(
                 }
             }
         }
-        LogicalPlan::Filter(n) => collect_scan_stats(&n.input, out),
-        LogicalPlan::Project(n) => collect_scan_stats(&n.input, out),
-        LogicalPlan::Aggregate(n) => collect_scan_stats(&n.input, out),
-        LogicalPlan::Sort(n) => collect_scan_stats(&n.input, out),
-        LogicalPlan::Limit(n) => collect_scan_stats(&n.input, out),
-        LogicalPlan::Window(n) => collect_scan_stats(&n.input, out),
-        LogicalPlan::TableFunction(n) => collect_scan_stats(&n.input, out),
-        LogicalPlan::CTEAnchor(n) => {
-            collect_scan_stats(&n.produce, out);
-            collect_scan_stats(&n.consumer, out);
-        }
-        LogicalPlan::CTEProduce(n) => collect_scan_stats(&n.input, out),
-        LogicalPlan::Join(n) => {
-            collect_scan_stats(&n.left, out);
-            collect_scan_stats(&n.right, out);
-        }
-        LogicalPlan::Union(n) => {
-            for input in &n.inputs {
-                collect_scan_stats(input, out);
-            }
-        }
-        LogicalPlan::Intersect(n) => {
-            for input in &n.inputs {
-                collect_scan_stats(input, out);
-            }
-        }
-        LogicalPlan::Except(n) => {
-            for input in &n.inputs {
-                collect_scan_stats(input, out);
-            }
-        }
-        LogicalPlan::Repeat(n) => collect_scan_stats(&n.input, out),
-        LogicalPlan::Decode(n) => collect_scan_stats(&n.input, out),
-        LogicalPlan::AggregateStateMerge(n) => {
-            collect_scan_stats(&n.old_input, out);
-            collect_scan_stats(&n.delta_input, out);
-        }
-        LogicalPlan::Apply(n) => {
-            collect_scan_stats(&n.left, out);
-            collect_scan_stats(&n.right, out);
-        }
-        LogicalPlan::AssertOneRow(n) => collect_scan_stats(&n.input, out),
-        LogicalPlan::Values(_) | LogicalPlan::GenerateSeries(_) | LogicalPlan::CTEConsume(_) => {}
-        LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
+        LogicalPlanNodeKind::ImvDelta(_) | LogicalPlanNodeKind::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
         }
+        _ => {}
+    }
+    for child in &plan.children {
+        collect_scan_stats(child, out);
     }
 }
 
@@ -4796,6 +4757,7 @@ mod tests {
     use crate::connector::starrocks::lake::context::lock_runtime_test_state;
     use crate::connector::starrocks::table::config::StarRocksTableConfig;
     use crate::meta::MetaStoreProvider;
+    use crate::sql::planner::plan::*;
     use arrow::array::{
         Array, FixedSizeBinaryArray, Int32Array, Int64Array, ListArray, StringArray,
     };

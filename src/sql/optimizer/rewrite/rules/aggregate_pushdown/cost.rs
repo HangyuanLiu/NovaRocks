@@ -9,7 +9,7 @@ use crate::sql::optimizer::stats::derive_logical_plan_statistics;
 #[cfg(test)]
 use crate::sql::analysis::TypedExpr;
 #[cfg(test)]
-use crate::sql::planner::plan::LogicalPlan;
+use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind};
 
 use super::context::PushPlan;
 
@@ -66,7 +66,8 @@ mod tests {
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence};
-    use crate::sql::planner::plan::ScanNode;
+    use crate::sql::planner::plan::LogicalScanNode;
+    use crate::sql::planner::plan::*;
     use arrow::datatypes::DataType;
 
     fn col_ref(name: &str) -> TypedExpr {
@@ -86,32 +87,35 @@ mod tests {
         row_count: u64,
         col: &str,
         ndv: f64,
-    ) -> (LogicalPlan, HashMap<String, TableStatistics>) {
-        let scan = LogicalPlan::Scan(ScanNode {
-            database: "db".into(),
-            table: TableDef {
-                name: table.into(),
-                columns: vec![],
-                iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::StarRocks {
-                    db_id: 0,
-                    table_id: 0,
+    ) -> (LogicalPlanNode, HashMap<String, TableStatistics>) {
+        let scan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".into(),
+                table: TableDef {
+                    name: table.into(),
+                    columns: vec![],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 0,
+                    },
                 },
-            },
-            alias: None,
-            columns: vec![OutputColumn {
-                column_id: ColumnId::UNSET,
-                name: col.into(),
-                data_type: DataType::Int64,
-                nullable: false,
-                is_internal: false,
-            }],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        });
+                alias: None,
+                columns: vec![OutputColumn {
+                    column_id: ColumnId::UNSET,
+                    name: col.into(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    is_internal: false,
+                }],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        );
         let mut col_stats = HashMap::new();
         let confidence = if ndv.is_finite() {
             Confidence::Exact
@@ -141,9 +145,9 @@ mod tests {
         (scan, table_stats)
     }
 
-    fn scan_without_stats_with_predicate() -> LogicalPlan {
-        let (LogicalPlan::Scan(mut scan), _) = scan_with_stats("unknown_table", 1, "k", f64::NAN)
-        else {
+    fn scan_without_stats_with_predicate() -> LogicalPlanNode {
+        let (scan_plan, _) = scan_with_stats("unknown_table", 1, "k", f64::NAN);
+        let LogicalPlanNodeKind::Scan(mut scan) = scan_plan.kind else {
             unreachable!("scan_with_stats returns a scan");
         };
         scan.predicates = vec![TypedExpr {
@@ -159,7 +163,7 @@ mod tests {
             data_type: DataType::Boolean,
             nullable: false,
         }];
-        LogicalPlan::Scan(scan)
+        LogicalPlanNode::new(LogicalPlanNodeKind::Scan(scan), vec![], None)
     }
 
     #[test]

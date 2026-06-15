@@ -2,7 +2,7 @@
 //!
 //! Ported faithfully from the RBO `join_reorder/reorder.rs` mask cores, with
 //! two changes: leaves are existing memo groups (`JoinTree::Leaf(GroupId)`)
-//! instead of cloned `LogicalPlan`s, and per-candidate statistics are computed
+//! instead of cloned `LogicalPlanNode`s, and per-candidate statistics are computed
 //! from the cached child `Statistics` via the shared `estimate::cardinality`
 //! kernel (no plan re-walk). Cost is an *enumeration-internal pruning proxy*
 //! only; the authoritative cost is the memo search (Phase 5).

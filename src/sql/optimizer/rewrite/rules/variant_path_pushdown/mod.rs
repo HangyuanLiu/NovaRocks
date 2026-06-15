@@ -4,6 +4,7 @@ pub(crate) use rule::VariantPathPushdownRule;
 
 #[cfg(test)]
 mod tests {
+    use crate::sql::planner::plan::*;
     use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::rc::Rc;
@@ -20,7 +21,10 @@ mod tests {
     use crate::sql::column_id::{ColumnId, ColumnRefFactory};
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::tree::rewrite_with_rule;
-    use crate::sql::planner::plan::{FilterNode, LogicalPlan, ProjectNode, ScanNode};
+    use crate::sql::planner::plan::{
+        LogicalFilterNode, LogicalPlanNode, LogicalPlanNodeKind, LogicalProjectNode,
+        LogicalScanNode,
+    };
 
     fn add_column(
         factory: &Rc<RefCell<ColumnRefFactory>>,
@@ -92,20 +96,23 @@ mod tests {
         factory: &Rc<RefCell<ColumnRefFactory>>,
         source: ScanSource,
         source_type: DataType,
-    ) -> (LogicalPlan, OutputColumn) {
+    ) -> (LogicalPlanNode, OutputColumn) {
         let source_column = add_column(factory, "v", source_type.clone(), true, false);
         (
-            LogicalPlan::Scan(ScanNode {
-                database: "db".to_string(),
-                table: table_def(source, source_type),
-                alias: None,
-                columns: vec![source_column.clone()],
-                predicates: vec![],
-                required_columns: None,
-                dict_columns: vec![],
-                variant_columns: vec![],
-                required_output_columns: None,
-            }),
+            LogicalPlanNode::new(
+                LogicalPlanNodeKind::Scan(LogicalScanNode {
+                    database: "db".to_string(),
+                    table: table_def(source, source_type),
+                    alias: None,
+                    columns: vec![source_column.clone()],
+                    predicates: vec![],
+                    required_columns: None,
+                    dict_columns: vec![],
+                    variant_columns: vec![],
+                }),
+                vec![],
+                None,
+            ),
             source_column,
         )
     }
@@ -186,17 +193,21 @@ mod tests {
         }
     }
 
-    fn rewrite(plan: LogicalPlan, factory: Rc<RefCell<ColumnRefFactory>>) -> (LogicalPlan, bool) {
+    fn rewrite(
+        plan: LogicalPlanNode,
+        factory: Rc<RefCell<ColumnRefFactory>>,
+    ) -> (LogicalPlanNode, bool) {
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         ctx.set_column_ref_factory(factory);
         rewrite_with_rule(plan, &VariantPathPushdownRule, &mut ctx).unwrap()
     }
 
-    fn scan_from_plan(plan: &LogicalPlan) -> &ScanNode {
-        match plan {
-            LogicalPlan::Scan(scan) => scan,
-            LogicalPlan::Filter(filter) => scan_from_plan(&filter.input),
-            LogicalPlan::Project(project) => scan_from_plan(&project.input),
+    fn scan_from_plan(plan: &LogicalPlanNode) -> &LogicalScanNode {
+        match &plan.kind {
+            LogicalPlanNodeKind::Scan(scan) => scan,
+            LogicalPlanNodeKind::Filter(_) | LogicalPlanNodeKind::Project(_) => {
+                scan_from_plan(plan.unary_input())
+            }
             other => panic!("expected plan with scan leaf, got {other:?}"),
         }
     }
@@ -220,21 +231,23 @@ mod tests {
         let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
         let (scan, source_column) =
             scan_with_source(&factory, iceberg_source(), DataType::LargeBinary);
-        let plan = LogicalPlan::Filter(FilterNode {
-            input: Box::new(scan),
-            predicate: equality_with_ten(variant_get(
-                "variant_get",
-                &source_column,
-                "$.a",
-                "bigint",
-            )),
-            required_output_columns: None,
-        });
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: equality_with_ten(variant_get(
+                    "variant_get",
+                    &source_column,
+                    "$.a",
+                    "bigint",
+                )),
+            }),
+            vec![scan],
+            None,
+        );
 
         let (rewritten, changed) = rewrite(plan, Rc::clone(&factory));
 
         assert!(changed);
-        let LogicalPlan::Filter(filter) = &rewritten else {
+        let LogicalPlanNodeKind::Filter(filter) = &rewritten.kind else {
             panic!("expected filter");
         };
         let scan = scan_from_plan(&rewritten);
@@ -273,21 +286,23 @@ mod tests {
         let (scan, source_column) =
             scan_with_source(&factory, iceberg_source(), DataType::LargeBinary);
         let project_output = add_column(&factory, "a", DataType::Int64, true, false).column_id;
-        let plan = LogicalPlan::Project(ProjectNode {
-            input: Box::new(scan),
-            items: vec![ProjectItem {
-                expr: variant_get("variant_get", &source_column, "$.a", "bigint"),
-                output_name: "a".to_string(),
-                output_column_id: project_output,
-            }],
-            output_qualifier: None,
-            required_output_columns: None,
-        });
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![ProjectItem {
+                    expr: variant_get("variant_get", &source_column, "$.a", "bigint"),
+                    output_name: "a".to_string(),
+                    output_column_id: project_output,
+                }],
+                output_qualifier: None,
+            }),
+            vec![scan],
+            None,
+        );
 
         let (rewritten, changed) = rewrite(plan, Rc::clone(&factory));
 
         assert!(changed);
-        let LogicalPlan::Project(project) = &rewritten else {
+        let LogicalPlanNodeKind::Project(project) = &rewritten.kind else {
             panic!("expected project");
         };
         let scan = scan_from_plan(&rewritten);
@@ -306,21 +321,26 @@ mod tests {
         let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
         let (scan, source_column) =
             scan_with_source(&factory, iceberg_source(), DataType::LargeBinary);
-        let filter = LogicalPlan::Filter(FilterNode {
-            input: Box::new(scan),
-            predicate: bool_literal(true),
-            required_output_columns: None,
-        });
-        let plan = LogicalPlan::Project(ProjectNode {
-            input: Box::new(filter),
-            items: vec![ProjectItem {
-                expr: variant_get("variant_get", &source_column, "$.a", "bigint"),
-                output_name: "a".to_string(),
-                output_column_id: add_column(&factory, "a", DataType::Int64, true, false).column_id,
-            }],
-            output_qualifier: None,
-            required_output_columns: None,
-        });
+        let filter = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: bool_literal(true),
+            }),
+            vec![scan],
+            None,
+        );
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![ProjectItem {
+                    expr: variant_get("variant_get", &source_column, "$.a", "bigint"),
+                    output_name: "a".to_string(),
+                    output_column_id: add_column(&factory, "a", DataType::Int64, true, false)
+                        .column_id,
+                }],
+                output_qualifier: None,
+            }),
+            vec![filter],
+            None,
+        );
         let before = format!("{plan:?}");
 
         let (rewritten, changed) = rewrite(plan, Rc::clone(&factory));
@@ -335,20 +355,23 @@ mod tests {
         let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
         let (mut scan, source_column) =
             scan_with_source(&factory, iceberg_source(), DataType::LargeBinary);
-        let LogicalPlan::Scan(scan_node) = &mut scan else {
+        let LogicalPlanNodeKind::Scan(scan_node) = &mut scan.kind else {
             panic!("expected scan");
         };
         scan_node.predicates.push(bool_literal(true));
-        let plan = LogicalPlan::Project(ProjectNode {
-            input: Box::new(scan),
-            items: vec![ProjectItem {
-                expr: variant_get("variant_get", &source_column, "$.a", "bigint"),
-                output_name: "a".to_string(),
-                output_column_id: add_column(&factory, "a", DataType::Int64, true, false).column_id,
-            }],
-            output_qualifier: None,
-            required_output_columns: None,
-        });
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![ProjectItem {
+                    expr: variant_get("variant_get", &source_column, "$.a", "bigint"),
+                    output_name: "a".to_string(),
+                    output_column_id: add_column(&factory, "a", DataType::Int64, true, false)
+                        .column_id,
+                }],
+                output_qualifier: None,
+            }),
+            vec![scan],
+            None,
+        );
         let before = format!("{plan:?}");
 
         let (rewritten, changed) = rewrite(plan, Rc::clone(&factory));
@@ -363,35 +386,39 @@ mod tests {
         let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
         let (scan, source_column) =
             scan_with_source(&factory, iceberg_source(), DataType::LargeBinary);
-        let filter = LogicalPlan::Filter(FilterNode {
-            input: Box::new(scan),
-            predicate: equality_with_ten(variant_get(
-                "variant_get",
-                &source_column,
-                "$.a",
-                "bigint",
-            )),
-            required_output_columns: None,
-        });
+        let filter = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: equality_with_ten(variant_get(
+                    "variant_get",
+                    &source_column,
+                    "$.a",
+                    "bigint",
+                )),
+            }),
+            vec![scan],
+            None,
+        );
         let project_output = add_column(&factory, "a", DataType::Int64, true, false).column_id;
-        let plan = LogicalPlan::Project(ProjectNode {
-            input: Box::new(filter),
-            items: vec![ProjectItem {
-                expr: variant_get("variant_get", &source_column, "$.a", "bigint"),
-                output_name: "a".to_string(),
-                output_column_id: project_output,
-            }],
-            output_qualifier: None,
-            required_output_columns: None,
-        });
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![ProjectItem {
+                    expr: variant_get("variant_get", &source_column, "$.a", "bigint"),
+                    output_name: "a".to_string(),
+                    output_column_id: project_output,
+                }],
+                output_qualifier: None,
+            }),
+            vec![filter],
+            None,
+        );
 
         let (rewritten, changed) = rewrite(plan, Rc::clone(&factory));
 
         assert!(changed);
-        let LogicalPlan::Project(project) = &rewritten else {
+        let LogicalPlanNodeKind::Project(project) = &rewritten.kind else {
             panic!("expected project");
         };
-        let LogicalPlan::Filter(filter) = project.input.as_ref() else {
+        let LogicalPlanNodeKind::Filter(filter) = &rewritten.unary_input().kind else {
             panic!("expected filter child");
         };
         let scan = scan_from_plan(&rewritten);
@@ -406,26 +433,31 @@ mod tests {
         let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
         let (scan, source_column) =
             scan_with_source(&factory, iceberg_source(), DataType::LargeBinary);
-        let filter = LogicalPlan::Filter(FilterNode {
-            input: Box::new(scan),
-            predicate: equality_with_ten(variant_get(
-                "variant_get",
-                &source_column,
-                "$.a",
-                "bigint",
-            )),
-            required_output_columns: None,
-        });
-        let plan = LogicalPlan::Project(ProjectNode {
-            input: Box::new(filter),
-            items: vec![ProjectItem {
-                expr: variant_get("variant_get", &source_column, "$.a", "bigint"),
-                output_name: "a".to_string(),
-                output_column_id: add_column(&factory, "a", DataType::Int64, true, false).column_id,
-            }],
-            output_qualifier: None,
-            required_output_columns: None,
-        });
+        let filter = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: equality_with_ten(variant_get(
+                    "variant_get",
+                    &source_column,
+                    "$.a",
+                    "bigint",
+                )),
+            }),
+            vec![scan],
+            None,
+        );
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![ProjectItem {
+                    expr: variant_get("variant_get", &source_column, "$.a", "bigint"),
+                    output_name: "a".to_string(),
+                    output_column_id: add_column(&factory, "a", DataType::Int64, true, false)
+                        .column_id,
+                }],
+                output_qualifier: None,
+            }),
+            vec![filter],
+            None,
+        );
 
         let (rewritten_once, changed_once) = rewrite(plan, Rc::clone(&factory));
         assert!(changed_once);
@@ -451,16 +483,19 @@ mod tests {
         let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
         let (scan, source_column) =
             scan_with_source(&factory, iceberg_source(), DataType::LargeBinary);
-        let plan = LogicalPlan::Project(ProjectNode {
-            input: Box::new(scan),
-            items: vec![ProjectItem {
-                expr: variant_get("try_variant_get", &source_column, "$.a", "bigint"),
-                output_name: "a".to_string(),
-                output_column_id: add_column(&factory, "a", DataType::Int64, true, false).column_id,
-            }],
-            output_qualifier: None,
-            required_output_columns: None,
-        });
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![ProjectItem {
+                    expr: variant_get("try_variant_get", &source_column, "$.a", "bigint"),
+                    output_name: "a".to_string(),
+                    output_column_id: add_column(&factory, "a", DataType::Int64, true, false)
+                        .column_id,
+                }],
+                output_qualifier: None,
+            }),
+            vec![scan],
+            None,
+        );
 
         let (rewritten, changed) = rewrite(plan, Rc::clone(&factory));
 
@@ -475,7 +510,7 @@ mod tests {
         let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
         let (mut scan, source_column) =
             scan_with_source(&factory, iceberg_source(), DataType::LargeBinary);
-        let LogicalPlan::Scan(scan_node) = &mut scan else {
+        let LogicalPlanNodeKind::Scan(scan_node) = &mut scan.kind else {
             panic!("expected scan");
         };
         scan_node.predicates.push(equality_with_ten(variant_get(
@@ -488,7 +523,7 @@ mod tests {
         let (rewritten, changed) = rewrite(scan, Rc::clone(&factory));
 
         assert!(changed);
-        let LogicalPlan::Scan(scan) = &rewritten else {
+        let LogicalPlanNodeKind::Scan(scan) = &rewritten.kind else {
             panic!("expected scan");
         };
         assert_eq!(scan.variant_columns.len(), 1);
@@ -508,27 +543,33 @@ mod tests {
             nullable: true,
             is_internal: false,
         };
-        let scan = LogicalPlan::Scan(ScanNode {
-            database: "db".to_string(),
-            table: table_def(iceberg_source(), DataType::LargeBinary),
-            alias: None,
-            columns: vec![source_column.clone()],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        });
-        let plan = LogicalPlan::Project(ProjectNode {
-            input: Box::new(scan),
-            items: vec![ProjectItem {
-                expr: variant_get("variant_get", &source_column, "$.a", "bigint"),
-                output_name: "a".to_string(),
-                output_column_id: add_column(&factory, "a", DataType::Int64, true, false).column_id,
-            }],
-            output_qualifier: None,
-            required_output_columns: None,
-        });
+        let scan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: table_def(iceberg_source(), DataType::LargeBinary),
+                alias: None,
+                columns: vec![source_column.clone()],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        );
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![ProjectItem {
+                    expr: variant_get("variant_get", &source_column, "$.a", "bigint"),
+                    output_name: "a".to_string(),
+                    output_column_id: add_column(&factory, "a", DataType::Int64, true, false)
+                        .column_id,
+                }],
+                output_qualifier: None,
+            }),
+            vec![scan],
+            None,
+        );
         let before = format!("{plan:?}");
 
         let (rewritten, changed) = rewrite(plan, Rc::clone(&factory));
@@ -542,17 +583,25 @@ mod tests {
         let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
         let (scan, source_column) =
             scan_with_source(&factory, iceberg_source(), DataType::LargeBinary);
-        let plan = LogicalPlan::Project(ProjectNode {
-            input: Box::new(scan),
-            items: vec![ProjectItem {
-                expr: variant_get("variant_get", &source_column, "$", "bigint"),
-                output_name: "root_path".to_string(),
-                output_column_id: add_column(&factory, "root_path", DataType::Int64, true, false)
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![ProjectItem {
+                    expr: variant_get("variant_get", &source_column, "$", "bigint"),
+                    output_name: "root_path".to_string(),
+                    output_column_id: add_column(
+                        &factory,
+                        "root_path",
+                        DataType::Int64,
+                        true,
+                        false,
+                    )
                     .column_id,
-            }],
-            output_qualifier: None,
-            required_output_columns: None,
-        });
+                }],
+                output_qualifier: None,
+            }),
+            vec![scan],
+            None,
+        );
         let before = format!("{plan:?}");
 
         let (rewritten, changed) = rewrite(plan, Rc::clone(&factory));
@@ -566,17 +615,25 @@ mod tests {
         let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
         let (scan, source_column) =
             scan_with_source(&factory, iceberg_source(), DataType::LargeBinary);
-        let plan = LogicalPlan::Project(ProjectNode {
-            input: Box::new(scan),
-            items: vec![ProjectItem {
-                expr: variant_get("variant_get", &source_column, "", "bigint"),
-                output_name: "empty_path".to_string(),
-                output_column_id: add_column(&factory, "empty_path", DataType::Int64, true, false)
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![ProjectItem {
+                    expr: variant_get("variant_get", &source_column, "", "bigint"),
+                    output_name: "empty_path".to_string(),
+                    output_column_id: add_column(
+                        &factory,
+                        "empty_path",
+                        DataType::Int64,
+                        true,
+                        false,
+                    )
                     .column_id,
-            }],
-            output_qualifier: None,
-            required_output_columns: None,
-        });
+                }],
+                output_qualifier: None,
+            }),
+            vec![scan],
+            None,
+        );
         let before = format!("{plan:?}");
 
         let (rewritten, changed) = rewrite(plan, Rc::clone(&factory));
@@ -650,17 +707,19 @@ mod tests {
                 }
                 _ => unreachable!(),
             };
-            let plan = LogicalPlan::Project(ProjectNode {
-                input: Box::new(scan),
-                items: vec![ProjectItem {
-                    expr,
-                    output_name: name.to_string(),
-                    output_column_id: add_column(&factory, name, DataType::Int64, true, false)
-                        .column_id,
-                }],
-                output_qualifier: None,
-                required_output_columns: None,
-            });
+            let plan = LogicalPlanNode::new(
+                LogicalPlanNodeKind::Project(LogicalProjectNode {
+                    items: vec![ProjectItem {
+                        expr,
+                        output_name: name.to_string(),
+                        output_column_id: add_column(&factory, name, DataType::Int64, true, false)
+                            .column_id,
+                    }],
+                    output_qualifier: None,
+                }),
+                vec![scan],
+                None,
+            );
             let before = format!("{plan:?}");
 
             let (rewritten, changed) = rewrite(plan, Rc::clone(&factory));

@@ -20,13 +20,13 @@ impl LogicalRewriteRule for PruneCTEProduceColumns {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
-        matches!(plan, LogicalPlan::CTEProduce(_))
+    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+        matches!(&plan.kind, LogicalPlanNodeKind::CTEProduce(_))
     }
 
     fn apply(
         &self,
-        _plan: LogicalPlan,
+        _plan: LogicalPlanNode,
         _ctx: &mut RewriteContext,
     ) -> Result<RewriteResult, String> {
         // Conservative no-op: do not prune CTE produce output columns.
@@ -52,7 +52,10 @@ mod tests {
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
-    use crate::sql::planner::plan::{CTEProduceNode, ValuesNode};
+    use crate::sql::planner::plan::*;
+    use crate::sql::planner::plan::{
+        LogicalCTEProduceNode, LogicalPlanNodeKind, LogicalValuesNode,
+    };
     use arrow::datatypes::DataType;
     use std::collections::HashSet;
 
@@ -70,12 +73,15 @@ mod tests {
         }
     }
 
-    fn dummy_input() -> Box<LogicalPlan> {
-        Box::new(LogicalPlan::Values(ValuesNode {
-            rows: vec![],
-            columns: vec![],
-            required_output_columns: None,
-        }))
+    fn dummy_input() -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Values(LogicalValuesNode {
+                rows: vec![],
+                columns: vec![],
+            }),
+            vec![],
+            None,
+        )
     }
 
     /// PruneCTEProduceColumns is a conservative no-op (Gap-3 deferred).
@@ -92,18 +98,19 @@ mod tests {
         needed.insert(id_a);
         needed.insert(id_c);
 
-        let node = CTEProduceNode {
-            cte_id: 42,
-            input: dummy_input(),
-            output_columns: vec![
-                make_output_column(id_a, "a"),
-                make_output_column(id_b, "b"),
-                make_output_column(id_c, "c"),
-            ],
-            required_output_columns: Some(needed),
-        };
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::CTEProduce(LogicalCTEProduceNode {
+                cte_id: 42,
+                output_columns: vec![
+                    make_output_column(id_a, "a"),
+                    make_output_column(id_b, "b"),
+                    make_output_column(id_c, "c"),
+                ],
+            }),
+            vec![dummy_input()],
+            Some(needed),
+        );
 
-        let plan = LogicalPlan::CTEProduce(node);
         let rule = PruneCTEProduceColumns;
         let result = rule.apply(plan, &mut ctx()).unwrap();
 
@@ -117,14 +124,15 @@ mod tests {
     #[test]
     fn prune_cte_produce_noop_when_required_output_columns_is_none() {
         let id_a = ColumnId::new_for_test(1);
-        let node = CTEProduceNode {
-            cte_id: 5,
-            input: dummy_input(),
-            output_columns: vec![make_output_column(id_a, "a")],
-            required_output_columns: None, // not tagged
-        };
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::CTEProduce(LogicalCTEProduceNode {
+                cte_id: 5,
+                output_columns: vec![make_output_column(id_a, "a")],
+            }),
+            vec![dummy_input()],
+            None, // not tagged
+        );
 
-        let plan = LogicalPlan::CTEProduce(node);
         let rule = PruneCTEProduceColumns;
         let result = rule.apply(plan, &mut ctx()).unwrap();
 
@@ -139,14 +147,15 @@ mod tests {
         let id_a = ColumnId::new_for_test(1);
         let id_b = ColumnId::new_for_test(2);
 
-        let node = CTEProduceNode {
-            cte_id: 7,
-            input: dummy_input(),
-            output_columns: vec![make_output_column(id_a, "a"), make_output_column(id_b, "b")],
-            required_output_columns: Some(HashSet::new()),
-        };
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::CTEProduce(LogicalCTEProduceNode {
+                cte_id: 7,
+                output_columns: vec![make_output_column(id_a, "a"), make_output_column(id_b, "b")],
+            }),
+            vec![dummy_input()],
+            Some(HashSet::new()),
+        );
 
-        let plan = LogicalPlan::CTEProduce(node);
         let rule = PruneCTEProduceColumns;
         let result = rule.apply(plan, &mut ctx()).unwrap();
 

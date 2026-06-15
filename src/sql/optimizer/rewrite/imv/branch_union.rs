@@ -10,7 +10,10 @@ use crate::sql::optimizer::rewrite::imv::marker::plan_contains_imv_marker;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
-use crate::sql::planner::plan::{AggregateNode, LogicalPlan, ProjectNode, UnionNode};
+use crate::sql::planner::plan::{
+    LogicalAggregateNode, LogicalImvDeltaNode, LogicalPlanNode, LogicalPlanNodeKind,
+    LogicalProjectNode, LogicalUnionNode,
+};
 
 pub(crate) struct RewriteBranchUnionRule;
 
@@ -27,48 +30,63 @@ impl LogicalRewriteRule for RewriteBranchUnionRule {
         RewriteTraversal::TopDown
     }
 
-    fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
+    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+        let LogicalPlanNodeKind::ImvDelta(delta) = &plan.kind else {
+            return false;
+        };
+        if !delta.is_root {
+            return false;
+        }
+        let input = plan.unary_input();
         matches!(
-            plan,
-            LogicalPlan::ImvDelta(delta)
-                if delta.is_root
-                    && matches!(
-                        delta.input.as_ref(),
-                        LogicalPlan::Union(union)
-                            if union.all
-                                && union.inputs.iter().all(is_branch_union_aggregate_branch)
-                                && !plan_contains_imv_marker(delta.input.as_ref())
-                    )
+            &input.kind,
+            LogicalPlanNodeKind::Union(union)
+                if union.all
+                    && input.children.iter().all(is_branch_union_aggregate_branch)
+                    && !plan_contains_imv_marker(input)
         )
     }
 
-    fn apply(&self, plan: LogicalPlan, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
-        let LogicalPlan::ImvDelta(delta) = plan else {
+    fn apply(
+        &self,
+        plan: LogicalPlanNode,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, String> {
+        let LogicalPlanNode {
+            kind,
+            mut children,
+            required_output_columns: _,
+        } = plan;
+        let LogicalPlanNodeKind::ImvDelta(delta) = kind else {
             return Ok(RewriteResult::Unchanged);
         };
         if !delta.is_root {
             return Ok(RewriteResult::Unchanged);
         }
         let action_column = delta.action_column;
-        let LogicalPlan::Union(union) = *delta.input else {
+        if children.len() != 1 {
+            return Ok(RewriteResult::Unchanged);
+        }
+        let union_plan = children.remove(0);
+        let LogicalPlanNode {
+            kind,
+            children: inputs,
+            required_output_columns,
+        } = union_plan;
+        let LogicalPlanNodeKind::Union(union) = kind else {
             return Ok(RewriteResult::Unchanged);
         };
         if !union.all {
             return Err("Iceberg IMV branch UNION rewrite supports UNION ALL only".to_string());
         }
-        if union.inputs.len() < 2 {
+        if inputs.len() < 2 {
             return Err(
                 "Iceberg IMV branch UNION rewrite requires at least two aggregate branches"
                     .to_string(),
             );
         }
 
-        let UnionNode {
-            inputs,
-            all: _,
-            output_columns,
-            required_output_columns,
-        } = union;
+        let output_columns = union.output_columns;
         for branch in &inputs {
             if !is_branch_union_aggregate_branch(branch) {
                 return Err(format!(
@@ -106,40 +124,44 @@ impl LogicalRewriteRule for RewriteBranchUnionRule {
                 branch_id_column_name: ICEBERG_MV_BRANCH_ID_COLUMN.to_string(),
                 branch_id,
             };
-            let core =
-                LogicalPlan::ImvDelta(crate::sql::optimizer::rewrite::imv::marker::ImvDeltaNode {
-                    input: Box::new(LogicalPlan::Aggregate(branch.aggregate)),
+            let aggregate = LogicalPlanNode::new(
+                LogicalPlanNodeKind::Aggregate(branch.aggregate),
+                vec![branch.aggregate_input],
+                branch.aggregate_required_output_columns,
+            );
+            let core = LogicalPlanNode::new(
+                LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
                     is_root: true,
                     action_column,
                     branch_scope: Some(scope),
-                });
+                }),
+                vec![aggregate],
+                None,
+            );
             let rewritten = match branch.post_project {
-                Some(project) => append_branch_id_to_project(
-                    ProjectNode {
-                        input: Box::new(core),
-                        items: project.items,
-                        output_qualifier: project.output_qualifier,
-                        required_output_columns: None,
-                    },
-                    branch_id,
-                    branch_id_column,
-                ),
+                Some(project) => {
+                    append_branch_id_to_project(project, core, branch_id, branch_id_column)
+                }
                 None => append_branch_id_project(core, branch_id, branch_id_column),
             }?;
             rewritten_inputs.push(rewritten);
         }
 
-        Ok(RewriteResult::Changed(LogicalPlan::Union(UnionNode {
-            inputs: rewritten_inputs,
-            all: true,
-            output_columns: branch_union_output_columns(output_columns, branch_id_column),
+        Ok(RewriteResult::Changed(LogicalPlanNode::new(
+            LogicalPlanNodeKind::Union(LogicalUnionNode {
+                all: true,
+                output_columns: branch_union_output_columns(output_columns, branch_id_column),
+            }),
+            rewritten_inputs,
             required_output_columns,
-        })))
+        )))
     }
 }
 
 struct BranchUnionAggregateBranch {
-    aggregate: AggregateNode,
+    aggregate: LogicalAggregateNode,
+    aggregate_input: LogicalPlanNode,
+    aggregate_required_output_columns: Option<std::collections::HashSet<ColumnId>>,
     post_project: Option<BranchUnionAggregateProject>,
 }
 
@@ -148,36 +170,49 @@ struct BranchUnionAggregateProject {
     output_qualifier: Option<String>,
 }
 
-fn is_branch_union_aggregate_branch(plan: &LogicalPlan) -> bool {
-    match plan {
-        LogicalPlan::Aggregate(_) => true,
-        LogicalPlan::Project(project) => {
-            matches!(project.input.as_ref(), LogicalPlan::Aggregate(_))
+fn is_branch_union_aggregate_branch(plan: &LogicalPlanNode) -> bool {
+    match &plan.kind {
+        LogicalPlanNodeKind::Aggregate(_) => true,
+        LogicalPlanNodeKind::Project(_) => {
+            matches!(&plan.unary_input().kind, LogicalPlanNodeKind::Aggregate(_))
         }
         _ => false,
     }
 }
 
 fn extract_branch_union_aggregate_branch(
-    branch: LogicalPlan,
+    branch: LogicalPlanNode,
 ) -> Option<BranchUnionAggregateBranch> {
-    match branch {
-        LogicalPlan::Aggregate(aggregate) => Some(BranchUnionAggregateBranch {
+    let LogicalPlanNode {
+        kind,
+        mut children,
+        required_output_columns,
+    } = branch;
+    match kind {
+        LogicalPlanNodeKind::Aggregate(aggregate) => Some(BranchUnionAggregateBranch {
             aggregate,
+            aggregate_input: single_child(&mut children)?,
+            aggregate_required_output_columns: required_output_columns,
             post_project: None,
         }),
-        LogicalPlan::Project(project) => {
-            let ProjectNode {
-                input,
+        LogicalPlanNodeKind::Project(project) => {
+            let LogicalProjectNode {
                 items,
                 output_qualifier,
-                required_output_columns: _,
             } = project;
-            let LogicalPlan::Aggregate(aggregate) = *input else {
+            let aggregate_plan = single_child(&mut children)?;
+            let LogicalPlanNode {
+                kind,
+                mut children,
+                required_output_columns: aggregate_required_output_columns,
+            } = aggregate_plan;
+            let LogicalPlanNodeKind::Aggregate(aggregate) = kind else {
                 return None;
             };
             Some(BranchUnionAggregateBranch {
                 aggregate,
+                aggregate_input: single_child(&mut children)?,
+                aggregate_required_output_columns,
                 post_project: Some(BranchUnionAggregateProject {
                     items,
                     output_qualifier,
@@ -188,15 +223,30 @@ fn extract_branch_union_aggregate_branch(
     }
 }
 
+fn single_child(children: &mut Vec<LogicalPlanNode>) -> Option<LogicalPlanNode> {
+    if children.len() == 1 {
+        Some(children.remove(0))
+    } else {
+        None
+    }
+}
+
 fn append_branch_id_to_project(
-    mut project: ProjectNode,
+    project: BranchUnionAggregateProject,
+    input: LogicalPlanNode,
     branch_id: i32,
     branch_id_column: ColumnId,
-) -> Result<LogicalPlan, String> {
-    project
-        .items
-        .push(branch_id_project_item(branch_id, branch_id_column));
-    Ok(LogicalPlan::Project(project))
+) -> Result<LogicalPlanNode, String> {
+    let mut items = project.items;
+    items.push(branch_id_project_item(branch_id, branch_id_column));
+    Ok(LogicalPlanNode::new(
+        LogicalPlanNodeKind::Project(LogicalProjectNode {
+            items,
+            output_qualifier: project.output_qualifier,
+        }),
+        vec![input],
+        None,
+    ))
 }
 
 fn branch_id_project_item(branch_id: i32, branch_id_column: ColumnId) -> ProjectItem {
@@ -219,10 +269,10 @@ fn branch_id_project_item(branch_id: i32, branch_id_column: ColumnId) -> Project
 }
 
 fn append_branch_id_project(
-    input: LogicalPlan,
+    input: LogicalPlanNode,
     branch_id: i32,
     branch_id_column: ColumnId,
-) -> Result<LogicalPlan, String> {
+) -> Result<LogicalPlanNode, String> {
     let mut items = plan_output_columns(&input)?
         .into_iter()
         .map(|column| ProjectItem {
@@ -240,12 +290,14 @@ fn append_branch_id_project(
         })
         .collect::<Vec<_>>();
     items.push(branch_id_project_item(branch_id, branch_id_column));
-    Ok(LogicalPlan::Project(ProjectNode {
-        input: Box::new(input),
-        items,
-        output_qualifier: None,
-        required_output_columns: None,
-    }))
+    Ok(LogicalPlanNode::new(
+        LogicalPlanNodeKind::Project(LogicalProjectNode {
+            items,
+            output_qualifier: None,
+        }),
+        vec![input],
+        None,
+    ))
 }
 fn branch_union_output_columns(
     mut output_columns: Vec<OutputColumn>,
@@ -261,20 +313,21 @@ fn branch_union_output_columns(
     output_columns
 }
 
-fn plan_kind(plan: &LogicalPlan) -> &'static str {
-    match plan {
-        LogicalPlan::Scan(_) => "Scan",
-        LogicalPlan::Filter(_) => "Filter",
-        LogicalPlan::Project(_) => "Project",
-        LogicalPlan::Aggregate(_) => "Aggregate",
-        LogicalPlan::Join(_) => "Join",
-        LogicalPlan::Union(_) => "Union",
+fn plan_kind(plan: &LogicalPlanNode) -> &'static str {
+    match &plan.kind {
+        LogicalPlanNodeKind::Scan(_) => "Scan",
+        LogicalPlanNodeKind::Filter(_) => "Filter",
+        LogicalPlanNodeKind::Project(_) => "Project",
+        LogicalPlanNodeKind::Aggregate(_) => "Aggregate",
+        LogicalPlanNodeKind::Join(_) => "Join",
+        LogicalPlanNodeKind::Union(_) => "Union",
         _ => "Other",
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::sql::planner::plan::*;
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::sync::atomic::AtomicU32;
@@ -300,38 +353,40 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::imv::annotation::{ImvExtension, ImvPlanAnnotation};
-    use crate::sql::optimizer::rewrite::imv::marker::ImvDeltaNode;
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
     use crate::sql::planner::plan::{
-        AggregateCall, AggregateNode, FilterNode, JoinNode, LogicalPlan, ProjectNode, ScanNode,
-        UnionNode,
+        AggregateCall, LogicalAggregateNode, LogicalFilterNode, LogicalJoinNode, LogicalPlanNode,
+        LogicalPlanNodeKind, LogicalProjectNode, LogicalScanNode, LogicalUnionNode,
     };
 
     #[test]
     fn rewrites_top_union_of_aggregates_into_branch_scoped_merges() {
         let rule = RewriteBranchUnionRule;
         let mut ctx = build_ctx();
-        let plan = root_delta(LogicalPlan::Union(UnionNode {
-            inputs: vec![
+        let plan = root_delta(LogicalPlanNode::new(
+            LogicalPlanNodeKind::Union(LogicalUnionNode {
+                all: true,
+                output_columns: vec![output_column(1, "region"), output_column(3, "s")],
+            }),
+            vec![
                 aggregate_over(scan("t1", 1)),
                 aggregate_over(scan("t2", 10)),
             ],
-            all: true,
-            output_columns: vec![output_column(1, "region"), output_column(3, "s")],
-            required_output_columns: None,
-        }));
+            None,
+        ));
 
         assert!(rule.matches(&plan, &ctx));
-        let RewriteResult::Changed(LogicalPlan::Union(union)) =
-            rule.apply(plan, &mut ctx).expect("rewrite")
-        else {
+        let RewriteResult::Changed(rewritten) = rule.apply(plan, &mut ctx).expect("rewrite") else {
             panic!("expected Changed(Union)");
         };
+        let LogicalPlanNodeKind::Union(_) = &rewritten.kind else {
+            panic!("expected Changed(Union), got {rewritten:?}");
+        };
 
-        assert_eq!(union.inputs.len(), 2);
-        for (idx, branch) in union.inputs.iter().enumerate() {
-            let LogicalPlan::Project(project) = branch else {
+        assert_eq!(rewritten.children.len(), 2);
+        for (idx, branch) in rewritten.children.iter().enumerate() {
+            let LogicalPlanNodeKind::Project(project) = &branch.kind else {
                 panic!("expected Project branch");
             };
             let branch_item = project
@@ -340,10 +395,11 @@ mod tests {
                 .find(|item| item.output_name.eq_ignore_ascii_case("__branch_id__"))
                 .expect("branch id item");
             assert_branch_id_cast(branch_item, idx as i64);
-            let LogicalPlan::ImvDelta(d) = project.input.as_ref() else {
+            let delta_plan = branch.unary_input();
+            let LogicalPlanNodeKind::ImvDelta(d) = &delta_plan.kind else {
                 panic!(
                     "branch core must be a delegated ImvDelta, got {:?}",
-                    project.input
+                    delta_plan
                 )
             };
             assert!(d.is_root, "branch sub-problem delta must be a root delta");
@@ -352,7 +408,10 @@ mod tests {
                 Some(idx as i32)
             );
             assert!(
-                matches!(d.input.as_ref(), LogicalPlan::Aggregate(_)),
+                matches!(
+                    &delta_plan.unary_input().kind,
+                    LogicalPlanNodeKind::Aggregate(_)
+                ),
                 "delta must sit directly over the Aggregate core"
             );
         }
@@ -362,32 +421,36 @@ mod tests {
     fn rewrites_project_over_aggregate_branches_into_branch_scoped_merges() {
         let rule = RewriteBranchUnionRule;
         let mut ctx = build_ctx();
-        let plan = root_delta(LogicalPlan::Union(UnionNode {
-            inputs: vec![
+        let plan = root_delta(LogicalPlanNode::new(
+            LogicalPlanNodeKind::Union(LogicalUnionNode {
+                all: true,
+                output_columns: vec![output_column(1, "region"), output_column(30, "total")],
+            }),
+            vec![
                 project_over_aggregate(scan("t1", 1)),
                 project_over_aggregate(scan("t2", 10)),
             ],
-            all: true,
-            output_columns: vec![output_column(1, "region"), output_column(30, "total")],
-            required_output_columns: None,
-        }));
+            None,
+        ));
 
         assert!(rule.matches(&plan, &ctx));
-        let RewriteResult::Changed(LogicalPlan::Union(union)) =
-            rule.apply(plan, &mut ctx).expect("rewrite")
-        else {
+        let RewriteResult::Changed(rewritten) = rule.apply(plan, &mut ctx).expect("rewrite") else {
             panic!("expected Changed(Union)");
         };
+        let LogicalPlanNodeKind::Union(_) = &rewritten.kind else {
+            panic!("expected Changed(Union), got {rewritten:?}");
+        };
 
-        assert_eq!(union.inputs.len(), 2);
-        for (idx, branch) in union.inputs.iter().enumerate() {
-            let LogicalPlan::Project(project) = branch else {
+        assert_eq!(rewritten.children.len(), 2);
+        for (idx, branch) in rewritten.children.iter().enumerate() {
+            let LogicalPlanNodeKind::Project(project) = &branch.kind else {
                 panic!("expected Project branch");
             };
-            let LogicalPlan::ImvDelta(d) = project.input.as_ref() else {
+            let delta_plan = branch.unary_input();
+            let LogicalPlanNodeKind::ImvDelta(d) = &delta_plan.kind else {
                 panic!(
                     "branch core must be a delegated ImvDelta, got {:?}",
-                    project.input
+                    delta_plan
                 )
             };
             assert!(d.is_root, "branch sub-problem delta must be a root delta");
@@ -396,7 +459,10 @@ mod tests {
                 Some(idx as i32)
             );
             assert!(
-                matches!(d.input.as_ref(), LogicalPlan::Aggregate(_)),
+                matches!(
+                    &delta_plan.unary_input().kind,
+                    LogicalPlanNodeKind::Aggregate(_)
+                ),
                 "delta must sit directly over the Aggregate core"
             );
             assert!(project.items.iter().any(|item| {
@@ -415,12 +481,14 @@ mod tests {
     fn rejects_non_aggregate_branch() {
         let rule = RewriteBranchUnionRule;
         let mut ctx = build_ctx();
-        let plan = root_delta(LogicalPlan::Union(UnionNode {
-            inputs: vec![aggregate_over(scan("t1", 1)), scan("t2", 10)],
-            all: true,
-            output_columns: vec![output_column(1, "region"), output_column(3, "s")],
-            required_output_columns: None,
-        }));
+        let plan = root_delta(LogicalPlanNode::new(
+            LogicalPlanNodeKind::Union(LogicalUnionNode {
+                all: true,
+                output_columns: vec![output_column(1, "region"), output_column(3, "s")],
+            }),
+            vec![aggregate_over(scan("t1", 1)), scan("t2", 10)],
+            None,
+        ));
 
         let err = rule
             .apply(plan, &mut ctx)
@@ -435,20 +503,25 @@ mod tests {
     fn does_not_match_marked_union() {
         let rule = RewriteBranchUnionRule;
         let ctx = build_ctx();
-        let plan = root_delta(LogicalPlan::Union(UnionNode {
-            inputs: vec![
-                LogicalPlan::ImvDelta(crate::sql::optimizer::rewrite::imv::marker::ImvDeltaNode {
-                    input: Box::new(aggregate_over(scan("t1", 1))),
-                    is_root: false,
-                    action_column: None,
-                    branch_scope: None,
-                }),
+        let plan = root_delta(LogicalPlanNode::new(
+            LogicalPlanNodeKind::Union(LogicalUnionNode {
+                all: true,
+                output_columns: vec![output_column(1, "region"), output_column(3, "s")],
+            }),
+            vec![
+                LogicalPlanNode::new(
+                    LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+                        is_root: false,
+                        action_column: None,
+                        branch_scope: None,
+                    }),
+                    vec![aggregate_over(scan("t1", 1))],
+                    None,
+                ),
                 aggregate_over(scan("t2", 10)),
             ],
-            all: true,
-            output_columns: vec![output_column(1, "region"), output_column(3, "s")],
-            required_output_columns: None,
-        }));
+            None,
+        ));
 
         assert!(!rule.matches(&plan, &ctx));
     }
@@ -457,12 +530,14 @@ mod tests {
     fn does_not_match_projection_filter_union() {
         let rule = RewriteBranchUnionRule;
         let ctx = build_ctx();
-        let plan = root_delta(LogicalPlan::Union(UnionNode {
-            inputs: vec![project_over_filter("t1", 1), project_over_filter("t2", 10)],
-            all: true,
-            output_columns: vec![output_column(1, "region"), output_column(2, "amount")],
-            required_output_columns: None,
-        }));
+        let plan = root_delta(LogicalPlanNode::new(
+            LogicalPlanNodeKind::Union(LogicalUnionNode {
+                all: true,
+                output_columns: vec![output_column(1, "region"), output_column(2, "amount")],
+            }),
+            vec![project_over_filter("t1", 1), project_over_filter("t2", 10)],
+            None,
+        ));
 
         assert!(!rule.matches(&plan, &ctx));
     }
@@ -475,12 +550,14 @@ mod tests {
         let mut ctx = build_ctx();
         // build_ctx() registers ice.db.b as the only known base table; both
         // branches must reference that same table so scan binding succeeds.
-        let plan = LogicalPlan::Union(UnionNode {
-            inputs: vec![aggregate_over(scan("b", 1)), aggregate_over(scan("b", 10))],
-            all: true,
-            output_columns: vec![output_column(1, "region"), output_column(3, "s")],
-            required_output_columns: None,
-        });
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Union(LogicalUnionNode {
+                all: true,
+                output_columns: vec![output_column(1, "region"), output_column(3, "s")],
+            }),
+            vec![aggregate_over(scan("b", 1)), aggregate_over(scan("b", 10))],
+            None,
+        );
 
         let out = build_imv_pipeline()
             .rewrite(plan, &mut ctx)
@@ -492,10 +569,10 @@ mod tests {
             !plan_contains_imv_marker(&out),
             "no marker may survive validation"
         );
-        let LogicalPlan::Union(union) = &out else {
+        let LogicalPlanNodeKind::Union(union) = &out.kind else {
             panic!("expected top Union, got {out:?}")
         };
-        assert_eq!(union.inputs.len(), 2);
+        assert_eq!(out.children.len(), 2);
         assert!(
             union
                 .output_columns
@@ -503,14 +580,17 @@ mod tests {
                 .any(|c| c.name.eq_ignore_ascii_case("__branch_id__")),
             "union output must expose __branch_id__"
         );
-        for branch in &union.inputs {
-            let LogicalPlan::Project(p) = branch else {
+        for branch in &out.children {
+            let LogicalPlanNodeKind::Project(p) = &branch.kind else {
                 panic!("expected Project branch, got {branch:?}")
             };
             assert!(
-                matches!(p.input.as_ref(), LogicalPlan::AggregateStateMerge(_)),
+                matches!(
+                    &branch.unary_input().kind,
+                    LogicalPlanNodeKind::AggregateStateMerge(_)
+                ),
                 "expected Project over AggregateStateMerge, got {:?}",
-                p.input
+                branch.unary_input()
             );
             assert!(
                 p.items
@@ -654,130 +734,144 @@ mod tests {
         ctx
     }
 
-    fn root_delta(input: LogicalPlan) -> LogicalPlan {
-        LogicalPlan::ImvDelta(ImvDeltaNode {
-            input: Box::new(input),
-            is_root: true,
-            action_column: None,
-            branch_scope: None,
-        })
+    fn root_delta(input: LogicalPlanNode) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+                is_root: true,
+                action_column: None,
+                branch_scope: None,
+            }),
+            vec![input],
+            None,
+        )
     }
 
-    fn aggregate_over(input: LogicalPlan) -> LogicalPlan {
-        LogicalPlan::Aggregate(AggregateNode {
-            input: Box::new(input),
-            group_by: vec![col_expr(1, "region")],
-            aggregates: vec![AggregateCall {
-                name: "sum".to_string(),
-                args: vec![col_expr(2, "amount")],
-                distinct: false,
-                result_type: DataType::Int64,
-                order_by: Vec::new(),
-                output_column_id: ColumnId::UNSET,
-            }],
-            output_columns: vec![output_column(1, "region"), output_column(3, "s")],
-            already_pushed: false,
-            required_output_columns: None,
-        })
+    fn aggregate_over(input: LogicalPlanNode) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![col_expr(1, "region")],
+                aggregates: vec![AggregateCall {
+                    name: "sum".to_string(),
+                    args: vec![col_expr(2, "amount")],
+                    distinct: false,
+                    result_type: DataType::Int64,
+                    order_by: Vec::new(),
+                    output_column_id: ColumnId::UNSET,
+                }],
+                output_columns: vec![output_column(1, "region"), output_column(3, "s")],
+                already_pushed: false,
+            }),
+            vec![input],
+            None,
+        )
     }
 
-    fn project_over_aggregate(input: LogicalPlan) -> LogicalPlan {
-        LogicalPlan::Project(ProjectNode {
-            input: Box::new(aggregate_over(input)),
-            items: vec![
-                ProjectItem {
-                    expr: col_expr(1, "region"),
-                    output_name: "region".to_string(),
-                    output_column_id: ColumnId::new_for_test(1),
-                },
-                ProjectItem {
-                    expr: col_expr(3, "s"),
-                    output_name: "total".to_string(),
-                    output_column_id: ColumnId::new_for_test(30),
-                },
-            ],
-            output_qualifier: None,
-            required_output_columns: None,
-        })
-    }
-
-    fn scan(name: &str, first_id: u32) -> LogicalPlan {
-        let columns = vec![column_def("region"), column_def("amount")];
-        LogicalPlan::Scan(ScanNode {
-            database: "db".to_string(),
-            table: TableDef {
-                name: name.to_string(),
-                columns,
-                iceberg_row_lineage_metadata_columns: Vec::new(),
-                source: ScanSource::IcebergDataFiles {
-                    table: IcebergTableInfo {
-                        catalog: "ice".to_string(),
-                        namespace: "db".to_string(),
-                        table: name.to_string(),
-                        table_uuid: Some(format!("uuid-{name}")),
-                        current_snapshot_id: Some(22),
-                        schema_id: 7,
-                        location: format!("file:///tmp/ice/db/{name}"),
-                        schema: IcebergSchemaDef { fields: Vec::new() },
-                        serialized_metadata: None,
-                        serialized_metadata_rows: None,
+    fn project_over_aggregate(input: LogicalPlanNode) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![
+                    ProjectItem {
+                        expr: col_expr(1, "region"),
+                        output_name: "region".to_string(),
+                        output_column_id: ColumnId::new_for_test(1),
                     },
-                    files: Vec::new(),
-                    cloud_properties: BTreeMap::new(),
-                    binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
-                },
-            },
-            alias: None,
-            columns: vec![
-                output_column(first_id, "region"),
-                output_column(first_id + 1, "amount"),
-            ],
-            predicates: Vec::new(),
-            required_columns: None,
-            dict_columns: Vec::new(),
-            variant_columns: Vec::new(),
-            required_output_columns: None,
-        })
+                    ProjectItem {
+                        expr: col_expr(3, "s"),
+                        output_name: "total".to_string(),
+                        output_column_id: ColumnId::new_for_test(30),
+                    },
+                ],
+                output_qualifier: None,
+            }),
+            vec![aggregate_over(input)],
+            None,
+        )
     }
 
-    fn project_over_filter(name: &str, first_id: u32) -> LogicalPlan {
-        LogicalPlan::Project(ProjectNode {
-            input: Box::new(filter_over(scan(name, first_id), first_id, "region")),
-            items: vec![
-                ProjectItem {
-                    expr: col_expr(first_id, "region"),
-                    output_name: "region".to_string(),
-                    output_column_id: ColumnId::new_for_test(first_id),
+    fn scan(name: &str, first_id: u32) -> LogicalPlanNode {
+        let columns = vec![column_def("region"), column_def("amount")];
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: TableDef {
+                    name: name.to_string(),
+                    columns,
+                    iceberg_row_lineage_metadata_columns: Vec::new(),
+                    source: ScanSource::IcebergDataFiles {
+                        table: IcebergTableInfo {
+                            catalog: "ice".to_string(),
+                            namespace: "db".to_string(),
+                            table: name.to_string(),
+                            table_uuid: Some(format!("uuid-{name}")),
+                            current_snapshot_id: Some(22),
+                            schema_id: 7,
+                            location: format!("file:///tmp/ice/db/{name}"),
+                            schema: IcebergSchemaDef { fields: Vec::new() },
+                            serialized_metadata: None,
+                            serialized_metadata_rows: None,
+                        },
+                        files: Vec::new(),
+                        cloud_properties: BTreeMap::new(),
+                        binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+                    },
                 },
-                ProjectItem {
-                    expr: col_expr(first_id + 1, "amount"),
-                    output_name: "amount".to_string(),
-                    output_column_id: ColumnId::new_for_test(first_id + 1),
-                },
-            ],
-            output_qualifier: None,
-            required_output_columns: None,
-        })
+                alias: None,
+                columns: vec![
+                    output_column(first_id, "region"),
+                    output_column(first_id + 1, "amount"),
+                ],
+                predicates: Vec::new(),
+                required_columns: None,
+                dict_columns: Vec::new(),
+                variant_columns: Vec::new(),
+            }),
+            vec![],
+            None,
+        )
     }
 
-    fn filter_over(input: LogicalPlan, column_id: u32, column: &str) -> LogicalPlan {
-        LogicalPlan::Filter(FilterNode {
-            input: Box::new(input),
-            predicate: TypedExpr {
-                kind: ExprKind::BinaryOp {
-                    left: Box::new(col_expr(column_id, column)),
-                    op: BinOp::Ge,
-                    right: Box::new(TypedExpr {
-                        kind: ExprKind::Literal(LiteralValue::Int(0)),
-                        data_type: DataType::Int32,
-                        nullable: false,
-                    }),
+    fn project_over_filter(name: &str, first_id: u32) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![
+                    ProjectItem {
+                        expr: col_expr(first_id, "region"),
+                        output_name: "region".to_string(),
+                        output_column_id: ColumnId::new_for_test(first_id),
+                    },
+                    ProjectItem {
+                        expr: col_expr(first_id + 1, "amount"),
+                        output_name: "amount".to_string(),
+                        output_column_id: ColumnId::new_for_test(first_id + 1),
+                    },
+                ],
+                output_qualifier: None,
+            }),
+            vec![filter_over(scan(name, first_id), first_id, "region")],
+            None,
+        )
+    }
+
+    fn filter_over(input: LogicalPlanNode, column_id: u32, column: &str) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: TypedExpr {
+                    kind: ExprKind::BinaryOp {
+                        left: Box::new(col_expr(column_id, column)),
+                        op: BinOp::Ge,
+                        right: Box::new(TypedExpr {
+                            kind: ExprKind::Literal(LiteralValue::Int(0)),
+                            data_type: DataType::Int32,
+                            nullable: false,
+                        }),
+                    },
+                    data_type: DataType::Boolean,
+                    nullable: false,
                 },
-                data_type: DataType::Boolean,
-                nullable: false,
-            },
-            required_output_columns: None,
-        })
+            }),
+            vec![input],
+            None,
+        )
     }
 
     fn column_def(name: &str) -> ColumnDef {
@@ -812,16 +906,16 @@ mod tests {
         }
     }
 
-    fn join_of(left: LogicalPlan, right: LogicalPlan) -> LogicalPlan {
+    fn join_of(left: LogicalPlanNode, right: LogicalPlanNode) -> LogicalPlanNode {
         join_of_on(left, right, 1, 10)
     }
 
     fn join_of_on(
-        left: LogicalPlan,
-        right: LogicalPlan,
+        left: LogicalPlanNode,
+        right: LogicalPlanNode,
         left_region_id: u32,
         right_region_id: u32,
-    ) -> LogicalPlan {
+    ) -> LogicalPlanNode {
         // An inner equi-join on caller-selected region column ids.
         let condition = TypedExpr {
             kind: ExprKind::BinaryOp {
@@ -832,13 +926,14 @@ mod tests {
             data_type: DataType::Boolean,
             nullable: false,
         };
-        LogicalPlan::Join(JoinNode {
-            left: Box::new(left),
-            right: Box::new(right),
-            join_type: JoinKind::Inner,
-            condition: Some(condition),
-            required_output_columns: None,
-        })
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: JoinKind::Inner,
+                condition: Some(condition),
+            }),
+            vec![left, right],
+            None,
+        )
     }
 
     fn assert_rule_changed(ctx: &RewriteContext, rule_name: &str) {
@@ -903,15 +998,17 @@ mod tests {
         let mut ctx = build_ctx();
         // project_over_aggregate outputs: region (id=1) and total (id=30).
         // Both branches reference the registered base "ice.db.b" so scan binding succeeds.
-        let plan = LogicalPlan::Union(UnionNode {
-            inputs: vec![
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Union(LogicalUnionNode {
+                all: true,
+                output_columns: vec![output_column(1, "region"), output_column(30, "total")],
+            }),
+            vec![
                 project_over_aggregate(scan("b", 1)),
                 project_over_aggregate(scan("b", 10)),
             ],
-            all: true,
-            output_columns: vec![output_column(1, "region"), output_column(30, "total")],
-            required_output_columns: None,
-        });
+            None,
+        );
 
         let out = build_imv_pipeline()
             .rewrite(plan, &mut ctx)
@@ -920,10 +1017,10 @@ mod tests {
             !plan_contains_imv_marker(&out),
             "no marker may survive: each Project-over-Aggregate branch must fully decompose"
         );
-        let LogicalPlan::Union(union) = &out else {
+        let LogicalPlanNodeKind::Union(union) = &out.kind else {
             panic!("expected top Union, got {out:?}")
         };
-        assert_eq!(union.inputs.len(), 2);
+        assert_eq!(out.children.len(), 2);
         assert!(
             union
                 .output_columns
@@ -931,14 +1028,17 @@ mod tests {
                 .any(|c| c.name.eq_ignore_ascii_case("__branch_id__")),
             "union output must expose __branch_id__"
         );
-        for branch in &union.inputs {
-            let LogicalPlan::Project(p) = branch else {
+        for branch in &out.children {
+            let LogicalPlanNodeKind::Project(p) = &branch.kind else {
                 panic!("expected Project branch, got {branch:?}")
             };
             assert!(
-                matches!(p.input.as_ref(), LogicalPlan::AggregateStateMerge(_)),
+                matches!(
+                    &branch.unary_input().kind,
+                    LogicalPlanNodeKind::AggregateStateMerge(_)
+                ),
                 "Project-over-Aggregate branch must land on AggregateStateMerge, got {:?}",
-                p.input
+                branch.unary_input()
             );
             assert!(
                 p.items
@@ -956,15 +1056,17 @@ mod tests {
         use crate::sql::optimizer::rewrite::imv::pipeline::build_imv_pipeline;
 
         let mut ctx = build_ctx();
-        let plan = LogicalPlan::Union(UnionNode {
-            inputs: vec![
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Union(LogicalUnionNode {
+                all: true,
+                output_columns: vec![output_column(1, "region"), output_column(3, "s")],
+            }),
+            vec![
                 aggregate_over(join_of(scan("b", 1), scan("b", 10))),
                 aggregate_over(join_of(scan("b", 20), scan("b", 30))),
             ],
-            all: true,
-            output_columns: vec![output_column(1, "region"), output_column(3, "s")],
-            required_output_columns: None,
-        });
+            None,
+        );
 
         let out = build_imv_pipeline()
             .rewrite(plan, &mut ctx)

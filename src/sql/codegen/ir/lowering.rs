@@ -2043,7 +2043,9 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     Some(crate::exec::node::sort::SortTopNType::RowNumber) => {
                         plan_nodes::TTopNType::ROW_NUMBER
                     }
-                    Some(crate::exec::node::sort::SortTopNType::Rank) => plan_nodes::TTopNType::RANK,
+                    Some(crate::exec::node::sort::SortTopNType::Rank) => {
+                        plan_nodes::TTopNType::RANK
+                    }
                     Some(crate::exec::node::sort::SortTopNType::DenseRank) => {
                         plan_nodes::TTopNType::DENSE_RANK
                     }
