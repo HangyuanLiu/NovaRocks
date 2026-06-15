@@ -28,6 +28,30 @@ use crate::sql::planner::plan::LogicalPlan;
 // Public API
 // ---------------------------------------------------------------------------
 
+/// Remap a CTE producer group's column statistics onto a consume's output
+/// columns. Producer and consume output columns line up positionally (the
+/// consume re-exposes the producer's projection under fresh column ids), so a
+/// producer stat at position `i` is rekeyed to the consume column at the same
+/// position. Without this, join keys on a CTE consume carry no NDV and a
+/// self-join of the same CTE (tpc-ds q4/q11/q31/q74) degrades to a
+/// cross-product, exploding the row-count estimate.
+fn remap_cte_consume_column_statistics(
+    props: &super::memo::LogicalProperties,
+    consume_output_columns: &[OutputColumn],
+) -> HashMap<ColumnId, ColumnStatistic> {
+    let mut remapped = HashMap::with_capacity(consume_output_columns.len());
+    for (producer_col, consume_col) in props
+        .output_columns
+        .iter()
+        .zip(consume_output_columns.iter())
+    {
+        if let Some(stat) = props.column_statistics.get(&producer_col.column_id) {
+            remapped.insert(consume_col.column_id, stat.clone());
+        }
+    }
+    remapped
+}
+
 /// Derive [`Statistics`] for a single `MExpr` using child group statistics
 /// already stored in `memo.groups[child].logical_props`.
 pub(crate) fn derive_statistics(
@@ -58,7 +82,10 @@ pub(crate) fn derive_statistics(
                     Statistics {
                         output_row_count: props.row_count,
                         row_count_confidence: Confidence::Estimated,
-                        column_statistics: HashMap::new(),
+                        column_statistics: remap_cte_consume_column_statistics(
+                            props,
+                            &cte.output_columns,
+                        ),
                     }
                 } else {
                     // CTEProduce group not yet derived (should not happen in bottom-up order).
@@ -478,7 +505,10 @@ pub(crate) fn derive_statistics(
                     Statistics {
                         output_row_count: props.row_count,
                         row_count_confidence: Confidence::Estimated,
-                        column_statistics: HashMap::new(),
+                        column_statistics: remap_cte_consume_column_statistics(
+                            props,
+                            &cte.output_columns,
+                        ),
                     }
                 } else {
                     Statistics {
@@ -3617,6 +3647,247 @@ mod tests {
         // Group 3: CTEAnchor (passthrough from consumer = 250000)
         let anchor_props = memo.groups[3].logical_props.as_ref().unwrap();
         assert!((anchor_props.row_count - 250_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn cte_consume_remaps_produce_column_statistics_to_consume_columns() {
+        use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
+        use crate::sql::optimizer::operator::{LogicalCTEConsumeOp, LogicalValuesOp, Operator};
+
+        let cte_id: crate::sql::analysis::cte::CteId = 1;
+        let mut memo = Memo::new();
+
+        // Producer group: output column id 1 ("customer_id"), NDV 50_000, 100_000 rows.
+        let produce_group = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalValues(LogicalValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
+            children: vec![],
+        });
+        let mut produce_props =
+            LogicalProperties::new(vec![stats_output_column(1, "customer_id")], 100_000.0);
+        produce_props.row_count_confidence = Confidence::Estimated;
+        produce_props.column_statistics.insert(
+            ColumnId::new_for_test(1),
+            set_op_column_stat(0.0, 50_000.0, 0.0, 8.0, 50_000.0, Confidence::Estimated),
+        );
+        memo.groups[produce_group].logical_props = Some(produce_props);
+        memo.cte_produce_groups.insert(cte_id, produce_group);
+
+        // Consume re-exposes the producer column under a DIFFERENT column id (7),
+        // exactly as a second `year_total` reference would in tpc-ds q4.
+        let consume = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalCTEConsume(LogicalCTEConsumeOp {
+                cte_id,
+                alias: "t_s_firstyear".to_string(),
+                output_columns: vec![stats_output_column(7, "customer_id")],
+            }),
+            children: vec![],
+        };
+
+        let stats = derive_statistics(&consume, &memo, &HashMap::new());
+
+        assert!(
+            (stats.output_row_count - 100_000.0).abs() < 1.0,
+            "row count should still propagate from producer, got {}",
+            stats.output_row_count
+        );
+
+        // The producer NDV must reach the consume keyed by the CONSUME column id (7).
+        // Without this, a self-join on the CTE key sees no NDV and the join estimator
+        // falls back to a cross-product, exploding cardinality (tpc-ds q4/q11/q31/q74).
+        let stat = stats
+            .column_statistics
+            .get(&ColumnId::new_for_test(7))
+            .expect("consume must carry producer column stats remapped to its own column id");
+        assert!(
+            (stat.distinct_values_count - 50_000.0).abs() < 1.0,
+            "expected propagated NDV 50000, got {}",
+            stat.distinct_values_count
+        );
+        // The producer-side column id must not leak into the consume's statistics.
+        assert!(
+            !stats
+                .column_statistics
+                .contains_key(&ColumnId::new_for_test(1)),
+            "producer column id must not leak into consume stats"
+        );
+    }
+
+    #[test]
+    fn cte_self_join_on_key_does_not_explode_to_cross_product() {
+        // Reproduces the tpc-ds q4/q11/q31/q74 shape: a `year_total`-style CTE
+        // consumed twice and self-joined on its grouping key (customer_id).
+        // Before producer column stats reached the consume, the join keys had
+        // no NDV and the estimator cross-producted the two consumes:
+        // 250_000 * 250_000 * 0.25 ~= 1.56e10. With the producer NDV propagated,
+        // the equi-join collapses to |L|*|R|/ndv ~= 694k.
+        use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
+        use crate::sql::optimizer::operator::{
+            JoinDistribution, LogicalCTEConsumeOp, LogicalValuesOp, Operator,
+            PhysicalHashJoinEqCondition, PhysicalHashJoinOp,
+        };
+
+        fn col_ref_id(id: u32, name: &str) -> TypedExpr {
+            TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: ColumnId::new_for_test(id),
+                    qualifier: None,
+                    column: name.to_string(),
+                },
+                data_type: DataType::Int32,
+                nullable: false,
+            }
+        }
+
+        let cte_id: crate::sql::analysis::cte::CteId = 1;
+        let mut memo = Memo::new();
+
+        // Producer: 250_000 rows grouped by customer_id (NDV 90_000), id 100.
+        let produce_group = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalValues(LogicalValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
+            children: vec![],
+        });
+        let mut produce_props =
+            LogicalProperties::new(vec![stats_output_column(100, "customer_id")], 250_000.0);
+        produce_props.row_count_confidence = Confidence::Estimated;
+        produce_props.column_statistics.insert(
+            ColumnId::new_for_test(100),
+            set_op_column_stat(0.0, 90_000.0, 0.0, 8.0, 90_000.0, Confidence::Estimated),
+        );
+        memo.groups[produce_group].logical_props = Some(produce_props);
+        memo.cte_produce_groups.insert(cte_id, produce_group);
+
+        // Two consumes re-expose customer_id under distinct ids (701, 801),
+        // each derived through the real consume path then stored on its group.
+        let mut consume_group = |col_id: u32, alias: &str| -> usize {
+            let expr = MExpr {
+                id: memo.next_expr_id(),
+                op: Operator::LogicalCTEConsume(LogicalCTEConsumeOp {
+                    cte_id,
+                    alias: alias.to_string(),
+                    output_columns: vec![stats_output_column(col_id, "customer_id")],
+                }),
+                children: vec![],
+            };
+            let derived = derive_statistics(&expr, &memo, &HashMap::new());
+            let group = memo.new_group(expr);
+            let mut props = LogicalProperties::new(
+                vec![stats_output_column(col_id, "customer_id")],
+                derived.output_row_count,
+            );
+            props.row_count_confidence = derived.row_count_confidence;
+            props.column_statistics = derived.column_statistics;
+            memo.groups[group].logical_props = Some(props);
+            group
+        };
+        let left = consume_group(701, "t_s_firstyear");
+        let right = consume_group(801, "t_s_secyear");
+
+        let join = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: col_ref_id(701, "customer_id"),
+                    right: col_ref_id(801, "customer_id"),
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+            }),
+            children: vec![left, right],
+        };
+
+        let stats = derive_statistics(&join, &memo, &HashMap::new());
+
+        // Bounded: nowhere near the ~1.56e10 cross-product. A loose upper bound
+        // keeps the test robust to estimator-constant tuning while still failing
+        // hard if the cross-product regression returns.
+        assert!(
+            stats.output_row_count < 2_000_000.0,
+            "CTE self-join on a key must not cross-product; got {}",
+            stats.output_row_count
+        );
+        assert!(
+            stats.output_row_count > 100_000.0,
+            "equi-join on the CTE key should stay in a sane range, got {}",
+            stats.output_row_count
+        );
+    }
+
+    #[test]
+    fn cte_consume_propagates_produce_column_statistics_through_real_pipeline() {
+        // End-to-end through logical_plan_to_memo + derive_group_statistics:
+        // the producer's column NDV must reach the consume group, so a join on
+        // the CTE key sees real key statistics instead of a Fallback NDV. The
+        // hand-built unit test exercises the remap directly; this one proves the
+        // real conversion + derivation pipeline populates and forwards the stats.
+        let (name, ts) = make_table_stats("orders", 250_000, &[("id", 100_000.0)]);
+        let mut table_stats = HashMap::new();
+        table_stats.insert(name, ts);
+
+        let scan = scan_plan("orders", &["id"]);
+        let produce = LogicalPlan::CTEProduce(CTEProduceNode {
+            cte_id: 1,
+            input: Box::new(scan),
+            output_columns: vec![OutputColumn {
+                column_id: test_col_id("id"),
+                name: "id".to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+                is_internal: false,
+            }],
+            required_output_columns: None,
+        });
+        let consume = LogicalPlan::CTEConsume(CTEConsumeNode {
+            cte_id: 1,
+            alias: "cte_orders".to_string(),
+            output_columns: vec![OutputColumn {
+                column_id: test_col_id("consume_id"),
+                name: "id".to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+                is_internal: false,
+            }],
+            required_output_columns: None,
+        });
+        let anchor = LogicalPlan::CTEAnchor(CTEAnchorNode {
+            cte_id: 1,
+            produce: Box::new(produce),
+            consumer: Box::new(consume),
+            required_output_columns: None,
+        });
+
+        let mut memo = Memo::new();
+        logical_plan_to_memo(&anchor, &mut memo);
+        derive_group_statistics(&mut memo, &table_stats);
+
+        // Group 2: CTEConsume — must now carry the producer's column statistics.
+        let consume_props = memo.groups[2].logical_props.as_ref().unwrap();
+        assert!((consume_props.row_count - 250_000.0).abs() < 1.0);
+        assert!(
+            !consume_props.column_statistics.is_empty(),
+            "consume must carry producer column statistics through the real pipeline"
+        );
+        // The scan caps NDV(id) at its row count: min(100_000, 250_000) = 100_000.
+        let propagated_ndv = consume_props
+            .column_statistics
+            .values()
+            .map(|s| s.distinct_values_count)
+            .fold(0.0_f64, f64::max);
+        assert!(
+            (propagated_ndv - 100_000.0).abs() < 1.0,
+            "consume should see the producer NDV (100000), got {}",
+            propagated_ndv
+        );
     }
 
     #[test]
