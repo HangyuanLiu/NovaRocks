@@ -139,12 +139,12 @@ fn ensure_unpartitioned(
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(in crate::sql::codegen) struct AggregateSlotContract {
-    pub(in crate::sql::codegen) data_type: DataType,
-    pub(in crate::sql::codegen) type_desc: types::TTypeDesc,
+struct AggregateSlotContract {
+    data_type: DataType,
+    type_desc: types::TTypeDesc,
 }
 
-pub(in crate::sql::codegen) fn aggregate_slot_contract_for_phase(
+fn aggregate_slot_contract_for_phase(
     need_finalize: bool,
     result_type: &DataType,
     intermediate_type: Option<&DataType>,
@@ -368,6 +368,7 @@ pub(in crate::sql::codegen) struct LoweringCtx<'s, 'a, S: LoweringStateAccess<'a
 struct LoweredDistributedNode {
     plan_nodes: Vec<plan_nodes::TPlanNode>,
     scope: ExprScope,
+    tuple_ids: Vec<i32>,
     #[allow(dead_code)]
     output_columns: Vec<AnalysisOutputColumn>,
 }
@@ -399,6 +400,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 Ok(LoweredDistributedNode {
                     plan_nodes: vec![scan_plan_node],
                     scope,
+                    tuple_ids: vec![scan_tuple_id],
                     output_columns: op.columns.clone(),
                 })
             }
@@ -420,6 +422,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 Ok(LoweredDistributedNode {
                     plan_nodes,
                     scope,
+                    tuple_ids: vec![project_tuple_id],
                     output_columns: project_body_output_columns(project),
                 })
             }
@@ -437,7 +440,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     node.node_id,
                     &op,
                     &child.scope,
-                    &node.children[0].tuple_ids,
+                    &child.tuple_ids,
                     &sort.output_columns,
                     sort.offset,
                 )?;
@@ -446,6 +449,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 Ok(LoweredDistributedNode {
                     plan_nodes,
                     scope: child.scope,
+                    tuple_ids: child.tuple_ids,
                     output_columns: sort.output_columns.clone(),
                 })
             }
@@ -467,6 +471,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 Ok(LoweredDistributedNode {
                     plan_nodes,
                     scope,
+                    tuple_ids: vec![agg_tuple_id],
                     output_columns: agg.output_columns.clone(),
                 })
             }
@@ -1447,11 +1452,13 @@ mod tests {
 
     use crate::connector::ConnectorRegistry;
     use crate::connector::iceberg::IcebergMetadataTableType;
+    use crate::lower::type_lowering::arrow_type_from_desc;
     use crate::plan_nodes::TPlanNodeType;
     use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
     use crate::sql::catalog::{
         CatalogProvider, ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
+    use crate::sql::codegen::expr_compiler::infer_agg_function_types;
     use crate::sql::codegen::fragment_builder::PlanFragmentBuilder;
     use crate::sql::codegen::ir::{
         DataPartition, DataSink, DistributedPlan, PartitionKind, build_distributed_plan,
@@ -1460,6 +1467,38 @@ mod tests {
     use crate::sql::optimizer::operator::{Operator, PhysicalProjectOp, PhysicalScanOp};
     use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, PlanExecutionProps};
     use crate::sql::optimizer::statistics::Statistics;
+
+    #[test]
+    fn aggregate_slot_contract_uses_intermediate_only_for_non_finalize() {
+        let (_, avg_intermediate) =
+            infer_agg_function_types("avg", &[DataType::Int64], false).expect("avg types");
+        let avg_intermediate = avg_intermediate.expect("avg intermediate");
+        let contract = super::aggregate_slot_contract_for_phase(
+            false,
+            &DataType::Float64,
+            Some(&avg_intermediate),
+            "avg",
+        )
+        .expect("local avg contract");
+        assert_eq!(contract.data_type, DataType::Utf8);
+        assert_eq!(
+            arrow_type_from_desc(&contract.type_desc),
+            Some(DataType::Utf8)
+        );
+
+        let final_contract = super::aggregate_slot_contract_for_phase(
+            true,
+            &DataType::Float64,
+            Some(&avg_intermediate),
+            "avg",
+        )
+        .expect("final avg contract");
+        assert_eq!(final_contract.data_type, DataType::Float64);
+        assert_eq!(
+            arrow_type_from_desc(&final_contract.type_desc),
+            Some(DataType::Float64)
+        );
+    }
 
     #[test]
     fn build_via_distributed_plan_lowers_project_over_scan() {

@@ -4774,42 +4774,6 @@ mod tests {
     use crate::sql::optimizer::statistics::Statistics;
     use crate::sql::planner::plan::{DecodeMapping, WindowExpr};
 
-    #[test]
-    fn aggregate_slot_contract_uses_intermediate_only_for_non_finalize() {
-        use crate::lower::type_lowering::arrow_type_from_desc;
-        use crate::sql::codegen::expr_compiler::infer_agg_function_types;
-        use arrow::datatypes::DataType;
-
-        let (_, avg_intermediate) =
-            infer_agg_function_types("avg", &[DataType::Int64], false).expect("avg types");
-        let avg_intermediate = avg_intermediate.expect("avg intermediate");
-        let contract = crate::sql::codegen::ir::lowering::aggregate_slot_contract_for_phase(
-            false,
-            &DataType::Float64,
-            Some(&avg_intermediate),
-            "avg",
-        )
-        .expect("local avg contract");
-        assert_eq!(contract.data_type, DataType::Utf8);
-        assert_eq!(
-            arrow_type_from_desc(&contract.type_desc),
-            Some(DataType::Utf8)
-        );
-
-        let final_contract = crate::sql::codegen::ir::lowering::aggregate_slot_contract_for_phase(
-            true,
-            &DataType::Float64,
-            Some(&avg_intermediate),
-            "avg",
-        )
-        .expect("final avg contract");
-        assert_eq!(final_contract.data_type, DataType::Float64);
-        assert_eq!(
-            arrow_type_from_desc(&final_contract.type_desc),
-            Some(DataType::Float64)
-        );
-    }
-
     /// OQ-5 B1: `remap_rf_expr_order` must translate a runtime filter's
     /// pre-demote `op.eq_conditions` index into the post-demote
     /// `eq_join_conjuncts` index that BE lowering uses, and drop (return
