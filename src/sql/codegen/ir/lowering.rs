@@ -5,8 +5,11 @@ use std::rc::Rc;
 use arrow::datatypes::DataType;
 
 use crate::exprs;
+use crate::lower::type_lowering::arrow_type_from_desc;
 use crate::plan_nodes;
-use crate::sql::analysis::{ExprKind, OutputColumn as AnalysisOutputColumn};
+use crate::sql::analysis::{
+    BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn as AnalysisOutputColumn, TypedExpr,
+};
 use crate::sql::catalog::{CatalogProvider, ScanSource, TableDef};
 use crate::sql::codegen::descriptors::DescriptorTableBuilder;
 use crate::sql::codegen::expr_compiler::{self, ExprCompiler};
@@ -15,14 +18,32 @@ use crate::sql::codegen::fragment_builder::{
     effective_iceberg_scan_column_names, iceberg_scan_table_handle_for_codegen, iceberg_table_info,
     output_columns_for_boundary, result_root_boundary_schema_report, synthetic_iceberg_table_id,
 };
-use crate::sql::codegen::helpers::typed_expr_display_name_without_qualifiers;
+use crate::sql::codegen::helpers::{
+    agg_call_display_name, agg_call_display_name_without_qualifiers, group_win_exprs_by_sig,
+    join_kind_to_op, split_and_conjuncts_typed, typed_expr_display_name,
+    typed_expr_display_name_without_qualifiers,
+};
 use crate::sql::codegen::nodes;
 use crate::sql::codegen::resolve::{ColumnBinding, ExprScope, ResolvedTable};
+use crate::sql::codegen::runtime_filter_lowering::{
+    RfProbeTarget, join_distribution_mode_from_execution, legacy_rf_distribution_to_execution,
+    remap_rf_expr_order, rf_build_expr_matches_join_build_expr,
+    rf_layout_for_execution_distribution, rf_pipeline_dop,
+};
 use crate::sql::codegen::type_infer;
 use crate::sql::codegen::{
     FragmentBuildResult, FragmentId, MultiFragmentBuildResult, OutputColumn,
 };
-use crate::sql::optimizer::operator::{PhysicalProjectOp, PhysicalScanOp, ScanDictionaryColumn};
+use crate::sql::optimizer::operator::{
+    AggMode, PhysicalAssertOneRowOp, PhysicalDecodeOp, PhysicalGenerateSeriesOp,
+    PhysicalHashAggregateOp, PhysicalHashJoinOp, PhysicalNestLoopJoinOp, PhysicalProjectOp,
+    PhysicalRepeatOp, PhysicalScanOp, PhysicalSortOp, PhysicalTableFunctionOp, PhysicalTopNOp,
+    PhysicalValuesOp, ScanDictionaryColumn, TopNPhase,
+};
+use crate::sql::optimizer::physical_plan::JoinExecutionDistribution;
+use crate::sql::optimizer::property::{OrderingSpec, window_ordering_spec};
+use crate::sql::planner::plan::{AggregateCall, WindowExpr};
+use crate::types;
 
 pub(crate) fn lower_distributed_plan(
     dp: &super::fragment::DistributedPlan,
@@ -81,7 +102,15 @@ pub(crate) fn lower_distributed_plan(
         root_fragment_id: dp.root_fragment_id,
         edges: Vec::new(),
         boundary_schemas,
-        rf_plan: None,
+        rf_plan: if state.rf_all_filters.is_empty() {
+            None
+        } else {
+            Some(crate::sql::codegen::RuntimeFilterPlanResult {
+                all_filters: state.rf_all_filters,
+                build_side_filters: state.rf_build_side_filters,
+                probe_side_filters: state.rf_probe_side_filters,
+            })
+        },
     })
 }
 
@@ -130,6 +159,33 @@ fn ensure_unpartitioned(
     Ok(())
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct AggregateSlotContract {
+    data_type: DataType,
+    type_desc: types::TTypeDesc,
+}
+
+fn aggregate_slot_contract_for_phase(
+    need_finalize: bool,
+    result_type: &DataType,
+    intermediate_type: Option<&DataType>,
+    display_name: &str,
+) -> Result<AggregateSlotContract, String> {
+    let data_type = if need_finalize {
+        result_type.clone()
+    } else {
+        intermediate_type
+            .cloned()
+            .unwrap_or_else(|| result_type.clone())
+    };
+    let type_desc = type_infer::arrow_type_to_type_desc(&data_type)
+        .map_err(|e| format!("aggregate `{display_name}` output type descriptor failed: {e}"))?;
+    Ok(AggregateSlotContract {
+        data_type,
+        type_desc,
+    })
+}
+
 pub(in crate::sql::codegen) trait LoweringStateAccess<'a> {
     fn connectors(&self) -> &'a crate::connector::ConnectorRegistry;
     fn mv_refresh_ctx(
@@ -143,6 +199,12 @@ pub(in crate::sql::codegen) trait LoweringStateAccess<'a> {
     ) -> &mut HashMap<FragmentId, Vec<crate::data::TGlobalDict>>;
     fn slot_to_global_dict(&self) -> &HashMap<i32, crate::data::TGlobalDict>;
     fn slot_to_global_dict_mut(&mut self) -> &mut HashMap<i32, crate::data::TGlobalDict>;
+    fn rf_probe_targets(&mut self) -> &mut HashMap<i32, RfProbeTarget>;
+    fn rf_all_filters(
+        &mut self,
+    ) -> &mut HashMap<i32, crate::runtime_filter::TRuntimeFilterDescription>;
+    fn rf_build_side_filters(&mut self) -> &mut HashMap<FragmentId, Vec<i32>>;
+    fn rf_probe_side_filters(&mut self) -> &mut HashMap<FragmentId, Vec<(i32, i32)>>;
     fn alloc_slot(&mut self) -> i32;
     fn slot_allocator(&self) -> expr_compiler::SlotAllocator;
 
@@ -225,6 +287,24 @@ impl<'a> LoweringStateAccess<'a> for PlanFragmentBuilder<'a> {
         &mut self.slot_to_global_dict
     }
 
+    fn rf_probe_targets(&mut self) -> &mut HashMap<i32, RfProbeTarget> {
+        &mut self.rf_probe_targets
+    }
+
+    fn rf_all_filters(
+        &mut self,
+    ) -> &mut HashMap<i32, crate::runtime_filter::TRuntimeFilterDescription> {
+        &mut self.rf_all_filters
+    }
+
+    fn rf_build_side_filters(&mut self) -> &mut HashMap<FragmentId, Vec<i32>> {
+        &mut self.rf_build_side_filters
+    }
+
+    fn rf_probe_side_filters(&mut self) -> &mut HashMap<FragmentId, Vec<(i32, i32)>> {
+        &mut self.rf_probe_side_filters
+    }
+
     fn alloc_slot(&mut self) -> i32 {
         PlanFragmentBuilder::alloc_slot(self)
     }
@@ -255,6 +335,10 @@ pub(crate) struct OwnedLoweringState<'a> {
     fragment_stack: Vec<FragmentId>,
     query_global_dicts_per_fragment: HashMap<FragmentId, Vec<crate::data::TGlobalDict>>,
     slot_to_global_dict: HashMap<i32, crate::data::TGlobalDict>,
+    rf_probe_targets: HashMap<i32, RfProbeTarget>,
+    rf_all_filters: HashMap<i32, crate::runtime_filter::TRuntimeFilterDescription>,
+    rf_build_side_filters: HashMap<FragmentId, Vec<i32>>,
+    rf_probe_side_filters: HashMap<FragmentId, Vec<(i32, i32)>>,
 }
 
 impl<'a> OwnedLoweringState<'a> {
@@ -272,6 +356,10 @@ impl<'a> OwnedLoweringState<'a> {
             fragment_stack: vec![root_fragment_id],
             query_global_dicts_per_fragment: HashMap::new(),
             slot_to_global_dict: HashMap::new(),
+            rf_probe_targets: HashMap::new(),
+            rf_all_filters: HashMap::new(),
+            rf_build_side_filters: HashMap::new(),
+            rf_probe_side_filters: HashMap::new(),
         }
     }
 }
@@ -313,6 +401,24 @@ impl<'a> LoweringStateAccess<'a> for OwnedLoweringState<'a> {
         &mut self.slot_to_global_dict
     }
 
+    fn rf_probe_targets(&mut self) -> &mut HashMap<i32, RfProbeTarget> {
+        &mut self.rf_probe_targets
+    }
+
+    fn rf_all_filters(
+        &mut self,
+    ) -> &mut HashMap<i32, crate::runtime_filter::TRuntimeFilterDescription> {
+        &mut self.rf_all_filters
+    }
+
+    fn rf_build_side_filters(&mut self) -> &mut HashMap<FragmentId, Vec<i32>> {
+        &mut self.rf_build_side_filters
+    }
+
+    fn rf_probe_side_filters(&mut self) -> &mut HashMap<FragmentId, Vec<(i32, i32)>> {
+        &mut self.rf_probe_side_filters
+    }
+
     fn alloc_slot(&mut self) -> i32 {
         let mut next = self.next_slot_id.borrow_mut();
         let slot_id = *next;
@@ -333,8 +439,10 @@ pub(in crate::sql::codegen) struct LoweringCtx<'s, 'a, S: LoweringStateAccess<'a
 struct LoweredDistributedNode {
     plan_nodes: Vec<plan_nodes::TPlanNode>,
     scope: ExprScope,
+    tuple_ids: Vec<i32>,
     #[allow(dead_code)]
     output_columns: Vec<AnalysisOutputColumn>,
+    ordering: OrderingSpec,
 }
 
 impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
@@ -349,7 +457,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         &mut self,
         node: &super::node::DistributedPlanNode,
     ) -> Result<LoweredDistributedNode, String> {
-        match &node.body {
+        let mut lowered = match &node.body {
             super::node::DistributedPlanNodeBody::Scan(scan) => {
                 if !node.children.is_empty() {
                     return Err(format!(
@@ -361,11 +469,13 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 let scan_tuple_id = first_tuple_id(node, "Scan")?;
                 let op = scan_body_to_physical_op(scan);
                 let (scan_plan_node, scope) = self.lower_scan(node.node_id, scan_tuple_id, &op)?;
-                Ok(LoweredDistributedNode {
+                LoweredDistributedNode {
                     plan_nodes: vec![scan_plan_node],
                     scope,
+                    tuple_ids: vec![scan_tuple_id],
                     output_columns: op.columns.clone(),
-                })
+                    ordering: OrderingSpec::Any,
+                }
             }
             super::node::DistributedPlanNodeBody::Project(project) => {
                 if node.children.len() != 1 {
@@ -382,13 +492,775 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     self.lower_project(node.node_id, project_tuple_id, &op, &child.scope)?;
                 let mut plan_nodes = vec![project_plan_node];
                 plan_nodes.extend(child.plan_nodes);
-                Ok(LoweredDistributedNode {
+                LoweredDistributedNode {
                     plan_nodes,
                     scope,
+                    tuple_ids: vec![project_tuple_id],
                     output_columns: project_body_output_columns(project),
-                })
+                    ordering: OrderingSpec::Any,
+                }
+            }
+            super::node::DistributedPlanNodeBody::Sort(sort) => {
+                if node.children.len() != 1 {
+                    return Err(format!(
+                        "DistributedPlan Sort node_id={} expected 1 child, got {}",
+                        node.node_id,
+                        node.children.len()
+                    ));
+                }
+                let child = self.lower_node(&node.children[0])?;
+                let op = sort_body_to_physical_op(sort);
+                let sort_plan_node = self.lower_sort(
+                    node.node_id,
+                    &op,
+                    &child.scope,
+                    &child.tuple_ids,
+                    &sort.output_columns,
+                    sort.offset,
+                )?;
+                let mut plan_nodes = vec![sort_plan_node];
+                plan_nodes.extend(child.plan_nodes);
+                LoweredDistributedNode {
+                    plan_nodes,
+                    scope: child.scope,
+                    tuple_ids: child.tuple_ids,
+                    output_columns: sort.output_columns.clone(),
+                    ordering: OrderingSpec::from_sort_items(&sort.items),
+                }
+            }
+            super::node::DistributedPlanNodeBody::TopN(topn) => {
+                if node.children.len() != 1 {
+                    return Err(format!(
+                        "DistributedPlan TopN node_id={} expected 1 child, got {}",
+                        node.node_id,
+                        node.children.len()
+                    ));
+                }
+                let child = self.lower_node(&node.children[0])?;
+                let op = top_n_body_to_physical_op(topn);
+                let top_n_plan_node = self.lower_top_n_single_or_partial(
+                    node.node_id,
+                    &op,
+                    &child.scope,
+                    &child.tuple_ids,
+                )?;
+                let mut plan_nodes = vec![top_n_plan_node];
+                plan_nodes.extend(child.plan_nodes);
+                LoweredDistributedNode {
+                    plan_nodes,
+                    scope: child.scope,
+                    tuple_ids: child.tuple_ids,
+                    output_columns: child.output_columns,
+                    ordering: OrderingSpec::from_sort_items(&topn.items),
+                }
+            }
+            super::node::DistributedPlanNodeBody::HashAggregate(agg) => {
+                if node.children.len() != 1 {
+                    return Err(format!(
+                        "DistributedPlan HashAggregate node_id={} expected 1 child, got {}",
+                        node.node_id,
+                        node.children.len()
+                    ));
+                }
+                let child = self.lower_node(&node.children[0])?;
+                let agg_tuple_id = first_tuple_id(node, "HashAggregate")?;
+                let op = hash_aggregate_body_to_physical_op(agg);
+                let (agg_plan_node, scope) =
+                    self.lower_hash_aggregate(node.node_id, agg_tuple_id, &op, &child.scope)?;
+                let mut plan_nodes = vec![agg_plan_node];
+                plan_nodes.extend(child.plan_nodes);
+                LoweredDistributedNode {
+                    plan_nodes,
+                    scope,
+                    tuple_ids: vec![agg_tuple_id],
+                    output_columns: agg.output_columns.clone(),
+                    ordering: OrderingSpec::Any,
+                }
+            }
+            super::node::DistributedPlanNodeBody::HashJoin(hash_join) => {
+                let (left_node, right_node) = binary_children(node, "HashJoin")?;
+                let left = self.lower_node(left_node)?;
+                let right = self.lower_node(right_node)?;
+                let LoweredDistributedNode {
+                    plan_nodes: left_plan_nodes,
+                    scope: left_scope,
+                    tuple_ids: left_tuple_ids,
+                    ..
+                } = left;
+                let LoweredDistributedNode {
+                    plan_nodes: right_plan_nodes,
+                    scope: right_scope,
+                    tuple_ids: right_tuple_ids,
+                    ..
+                } = right;
+                let op = hash_join_body_to_physical_op(hash_join);
+                let (join_plan_node, scope, tuple_ids) = self.lower_hash_join(
+                    node.node_id,
+                    &left_tuple_ids,
+                    &right_tuple_ids,
+                    &op,
+                    left_scope,
+                    right_scope,
+                    node.execution_join_distribution,
+                    &node.build_runtime_filters,
+                )?;
+                let mut plan_nodes = vec![join_plan_node];
+                plan_nodes.extend(left_plan_nodes);
+                plan_nodes.extend(right_plan_nodes);
+                LoweredDistributedNode {
+                    plan_nodes,
+                    scope,
+                    tuple_ids,
+                    output_columns: Vec::new(),
+                    ordering: OrderingSpec::Any,
+                }
+            }
+            super::node::DistributedPlanNodeBody::NestLoopJoin(nest_loop) => {
+                let (left_node, right_node) = binary_children(node, "NestLoopJoin")?;
+                let left = self.lower_node(left_node)?;
+                let right = self.lower_node(right_node)?;
+                let LoweredDistributedNode {
+                    plan_nodes: left_plan_nodes,
+                    scope: left_scope,
+                    tuple_ids: left_tuple_ids,
+                    ..
+                } = left;
+                let LoweredDistributedNode {
+                    plan_nodes: right_plan_nodes,
+                    scope: right_scope,
+                    tuple_ids: right_tuple_ids,
+                    ..
+                } = right;
+                let op = nest_loop_join_body_to_physical_op(nest_loop);
+                let (join_plan_node, scope, tuple_ids) = self.lower_nest_loop_join(
+                    node.node_id,
+                    &left_tuple_ids,
+                    &right_tuple_ids,
+                    &op,
+                    left_scope,
+                    right_scope,
+                )?;
+                let mut plan_nodes = vec![join_plan_node];
+                plan_nodes.extend(left_plan_nodes);
+                plan_nodes.extend(right_plan_nodes);
+                LoweredDistributedNode {
+                    plan_nodes,
+                    scope,
+                    tuple_ids,
+                    output_columns: Vec::new(),
+                    ordering: OrderingSpec::Any,
+                }
+            }
+            super::node::DistributedPlanNodeBody::Values(values) => {
+                if !node.children.is_empty() {
+                    return Err(format!(
+                        "DistributedPlan Values node_id={} expected 0 children, got {}",
+                        node.node_id,
+                        node.children.len()
+                    ));
+                }
+                let tuple_id = first_tuple_id(node, "Values")?;
+                let op = values_body_to_physical_op(values);
+                let (plan_node, scope) = self.lower_values(node.node_id, tuple_id, &op)?;
+                LoweredDistributedNode {
+                    plan_nodes: vec![plan_node],
+                    scope,
+                    tuple_ids: vec![tuple_id],
+                    output_columns: values.columns.clone(),
+                    ordering: OrderingSpec::Any,
+                }
+            }
+            super::node::DistributedPlanNodeBody::AssertOneRow(assert_one_row) => {
+                if node.children.len() != 1 {
+                    return Err(format!(
+                        "DistributedPlan AssertOneRow node_id={} expected 1 child, got {}",
+                        node.node_id,
+                        node.children.len()
+                    ));
+                }
+                let child = self.lower_node(&node.children[0])?;
+                let op = assert_one_row_body_to_physical_op(assert_one_row);
+                let plan_node = self.lower_assert_one_row(node.node_id, &op, &child.tuple_ids);
+                let mut plan_nodes = vec![plan_node];
+                plan_nodes.extend(child.plan_nodes);
+                LoweredDistributedNode {
+                    plan_nodes,
+                    scope: child.scope,
+                    tuple_ids: child.tuple_ids,
+                    output_columns: child.output_columns,
+                    ordering: child.ordering,
+                }
+            }
+            super::node::DistributedPlanNodeBody::Decode(decode) => {
+                if node.children.len() != 1 {
+                    return Err(format!(
+                        "DistributedPlan Decode node_id={} expected 1 child, got {}",
+                        node.node_id,
+                        node.children.len()
+                    ));
+                }
+                let child = self.lower_node(&node.children[0])?;
+                let tuple_id = first_tuple_id(node, "Decode")?;
+                let op = decode_body_to_physical_op(decode);
+                let (plan_node, scope) =
+                    self.lower_decode(node.node_id, tuple_id, &op, &child.scope)?;
+                let mut plan_nodes = vec![plan_node];
+                plan_nodes.extend(child.plan_nodes);
+                LoweredDistributedNode {
+                    plan_nodes,
+                    scope,
+                    tuple_ids: vec![tuple_id],
+                    output_columns: decode.output_columns.clone(),
+                    ordering: OrderingSpec::Any,
+                }
+            }
+            super::node::DistributedPlanNodeBody::Repeat(repeat) => {
+                if node.children.len() != 1 {
+                    return Err(format!(
+                        "DistributedPlan Repeat node_id={} expected 1 child, got {}",
+                        node.node_id,
+                        node.children.len()
+                    ));
+                }
+                let child = self.lower_node(&node.children[0])?;
+                let op = repeat_body_to_physical_op(repeat);
+                let (plan_node, scope, tuple_ids, output_columns) = self.lower_repeat(
+                    node.node_id,
+                    repeat.virtual_tuple_id,
+                    &op,
+                    child.scope,
+                    child.tuple_ids,
+                    child.output_columns,
+                )?;
+                let mut plan_nodes = vec![plan_node];
+                plan_nodes.extend(child.plan_nodes);
+                LoweredDistributedNode {
+                    plan_nodes,
+                    scope,
+                    tuple_ids,
+                    output_columns,
+                    ordering: OrderingSpec::Any,
+                }
+            }
+            super::node::DistributedPlanNodeBody::SetOp(set_op) => {
+                if node.children.is_empty() {
+                    return Err("DistributedPlan SetOp has no inputs".to_string());
+                }
+                if !set_op.child_output_columns.is_empty()
+                    && set_op.child_output_columns.len() != node.children.len()
+                {
+                    return Err(format!(
+                        "DistributedPlan SetOp node_id={} child_output_columns has {}, children has {}",
+                        node.node_id,
+                        set_op.child_output_columns.len(),
+                        node.children.len()
+                    ));
+                }
+                let mut children = Vec::with_capacity(node.children.len());
+                for child_node in &node.children {
+                    children.push(self.lower_node(child_node)?);
+                }
+                let tuple_id = first_tuple_id(node, "SetOp")?;
+                let (plan_node, scope) = self.lower_set_op(
+                    node.node_id,
+                    tuple_id,
+                    set_op.kind,
+                    &set_op.output_columns,
+                    &set_op.child_output_columns,
+                    &children,
+                )?;
+                let mut plan_nodes = vec![plan_node];
+                for child in children {
+                    plan_nodes.extend(child.plan_nodes);
+                }
+                LoweredDistributedNode {
+                    plan_nodes,
+                    scope,
+                    tuple_ids: vec![tuple_id],
+                    output_columns: set_op.output_columns.clone(),
+                    ordering: OrderingSpec::Any,
+                }
+            }
+            super::node::DistributedPlanNodeBody::Window(window) => {
+                if node.children.len() != 1 {
+                    return Err(format!(
+                        "DistributedPlan Window node_id={} expected 1 child, got {}",
+                        node.node_id,
+                        node.children.len()
+                    ));
+                }
+                let child = self.lower_node(&node.children[0])?;
+                let (mut plan_nodes, scope, tuple_ids, ordering) = self.lower_window(
+                    node.node_id,
+                    &node.tuple_ids,
+                    window,
+                    &child.scope,
+                    &child.tuple_ids,
+                    &child.ordering,
+                )?;
+                plan_nodes.extend(child.plan_nodes);
+                LoweredDistributedNode {
+                    plan_nodes,
+                    scope,
+                    tuple_ids,
+                    output_columns: window.output_columns.clone(),
+                    ordering,
+                }
+            }
+            super::node::DistributedPlanNodeBody::GenerateSeries(generate_series) => {
+                if !node.children.is_empty() {
+                    return Err(format!(
+                        "DistributedPlan GenerateSeries node_id={} expected 0 children, got {}",
+                        node.node_id,
+                        node.children.len()
+                    ));
+                }
+                let output_tuple_id = first_tuple_id(node, "GenerateSeries")?;
+                let op = generate_series_body_to_physical_op(generate_series);
+                let (plan_nodes, scope) =
+                    self.lower_generate_series(node.node_id, output_tuple_id, &op)?;
+                LoweredDistributedNode {
+                    plan_nodes,
+                    scope,
+                    tuple_ids: vec![output_tuple_id],
+                    output_columns: vec![AnalysisOutputColumn {
+                        column_id: generate_series.output_column_id,
+                        name: generate_series.column_name.clone(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        is_internal: false,
+                    }],
+                    ordering: OrderingSpec::Any,
+                }
+            }
+            super::node::DistributedPlanNodeBody::TableFunction(table_function) => {
+                if node.children.len() != 1 {
+                    return Err(format!(
+                        "DistributedPlan TableFunction node_id={} expected 1 child, got {}",
+                        node.node_id,
+                        node.children.len()
+                    ));
+                }
+                let child = self.lower_node(&node.children[0])?;
+                let output_tuple_id = first_tuple_id(node, "TableFunction")?;
+                let op = table_function_body_to_physical_op(table_function);
+                let (table_fn_nodes, scope) =
+                    self.lower_table_function(node.node_id, output_tuple_id, &op, &child.scope)?;
+                let mut plan_nodes = table_fn_nodes;
+                plan_nodes.extend(child.plan_nodes);
+                LoweredDistributedNode {
+                    plan_nodes,
+                    scope,
+                    tuple_ids: vec![output_tuple_id],
+                    output_columns: table_function.output_columns.clone(),
+                    ordering: OrderingSpec::Any,
+                }
+            }
+        };
+        if let Some(root) = lowered.plan_nodes.first_mut() {
+            root.limit = node.limit;
+        }
+        self.record_probe_targets(node, &lowered);
+        Ok(lowered)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn lower_hash_join(
+        &mut self,
+        join_node_id: i32,
+        left_tuple_ids: &[i32],
+        right_tuple_ids: &[i32],
+        op: &PhysicalHashJoinOp,
+        left_scope: ExprScope,
+        right_scope: ExprScope,
+        execution_distribution: Option<JoinExecutionDistribution>,
+        build_runtime_filters: &[crate::sql::optimizer::runtime_filter_pass::RuntimeFilterDesc],
+    ) -> Result<(plan_nodes::TPlanNode, ExprScope, Vec<i32>), String> {
+        let join_op = join_kind_to_op(op.join_type);
+
+        let mut eq_join_conjuncts = Vec::new();
+        let mut demoted_eq_exprs: Vec<TypedExpr> = Vec::new();
+        let mut surviving_eq_origin: Vec<usize> = Vec::new();
+        let mut surviving_eq_build_exprs: Vec<TypedExpr> = Vec::new();
+        for (eq_index, eq) in op.eq_conditions.iter().enumerate() {
+            let expr_a = &eq.left;
+            let expr_b = &eq.right;
+            let natural = ExprCompiler::new_strict_id(self.state.slot_allocator(), &left_scope)
+                .compile_typed(expr_a)
+                .ok()
+                .and_then(|lt| {
+                    ExprCompiler::new_strict_id(self.state.slot_allocator(), &right_scope)
+                        .compile_typed(expr_b)
+                        .ok()
+                        .map(|rt| (lt, rt, expr_b.clone()))
+                });
+            let result = natural.or_else(|| {
+                ExprCompiler::new_strict_id(self.state.slot_allocator(), &left_scope)
+                    .compile_typed(expr_b)
+                    .ok()
+                    .and_then(|lt| {
+                        ExprCompiler::new_strict_id(self.state.slot_allocator(), &right_scope)
+                            .compile_typed(expr_a)
+                            .ok()
+                            .map(|rt| (lt, rt, expr_a.clone()))
+                    })
+            });
+            if let Some((lt, rt, build_expr)) = result {
+                eq_join_conjuncts.push(plan_nodes::TEqJoinCondition {
+                    left: lt,
+                    right: rt,
+                    opcode: Some(if eq.null_safe {
+                        crate::opcodes::TExprOpcode::EQ_FOR_NULL
+                    } else {
+                        crate::opcodes::TExprOpcode::EQ
+                    }),
+                });
+                surviving_eq_origin.push(eq_index);
+                surviving_eq_build_exprs.push(build_expr);
+            } else {
+                demoted_eq_exprs.push(TypedExpr {
+                    kind: ExprKind::BinaryOp {
+                        left: Box::new(expr_a.clone()),
+                        op: if eq.null_safe {
+                            BinOp::EqForNull
+                        } else {
+                            BinOp::Eq
+                        },
+                        right: Box::new(expr_b.clone()),
+                    },
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                });
             }
         }
+
+        let mut other_join_conjuncts = Vec::new();
+        {
+            let mut merged = ExprScope::new();
+            merged.merge(&left_scope);
+            merged.merge(&right_scope);
+            let mut compiler = ExprCompiler::new(self.state.slot_allocator(), &merged);
+            for demoted in &demoted_eq_exprs {
+                other_join_conjuncts.push(compiler.compile_typed(demoted)?);
+            }
+            if let Some(ref cond) = op.other_condition {
+                other_join_conjuncts.push(compiler.compile_typed(cond)?);
+            }
+        }
+
+        let distribution_mode =
+            join_distribution_mode_from_execution(execution_distribution, &op.distribution);
+        let mut join_plan_node = nodes::build_hash_join_node(
+            join_node_id,
+            left_tuple_ids,
+            right_tuple_ids,
+            join_op,
+            distribution_mode,
+            eq_join_conjuncts,
+            other_join_conjuncts,
+        );
+
+        let rf_descs = self.build_rf_descriptors(
+            build_runtime_filters,
+            join_node_id,
+            &right_scope,
+            &surviving_eq_origin,
+            &surviving_eq_build_exprs,
+            execution_distribution,
+        )?;
+        if !rf_descs.is_empty()
+            && let Some(hj) = join_plan_node.hash_join_node.as_mut()
+        {
+            hj.build_runtime_filters = Some(rf_descs);
+        }
+
+        self.widen_hash_join_nullable_tuples(op.join_type, left_tuple_ids, right_tuple_ids);
+
+        let mut merged_tuple_ids = left_tuple_ids.to_vec();
+        merged_tuple_ids.extend_from_slice(right_tuple_ids);
+
+        let merged_scope = match op.join_type {
+            JoinKind::LeftSemi | JoinKind::LeftAnti | JoinKind::NullAwareLeftAnti => left_scope,
+            JoinKind::RightSemi | JoinKind::RightAnti => right_scope,
+            _ => {
+                let mut scope = left_scope;
+                scope.merge(&right_scope);
+                scope
+            }
+        };
+
+        Ok((join_plan_node, merged_scope, merged_tuple_ids))
+    }
+
+    pub(crate) fn lower_nest_loop_join(
+        &mut self,
+        join_node_id: i32,
+        left_tuple_ids: &[i32],
+        right_tuple_ids: &[i32],
+        op: &PhysicalNestLoopJoinOp,
+        left_scope: ExprScope,
+        right_scope: ExprScope,
+    ) -> Result<(plan_nodes::TPlanNode, ExprScope, Vec<i32>), String> {
+        let join_op = join_kind_to_op(op.join_type);
+
+        let join_conjuncts = if let Some(ref cond) = op.condition {
+            let mut merged = ExprScope::new();
+            merged.merge(&left_scope);
+            merged.merge(&right_scope);
+            let conjuncts = split_and_conjuncts_typed(cond);
+            let mut results = Vec::new();
+            for conj in conjuncts {
+                let mut compiler = ExprCompiler::new(self.state.slot_allocator(), &merged);
+                results.push(compiler.compile_typed(conj)?);
+            }
+            results
+        } else {
+            Vec::new()
+        };
+
+        let join_plan_node = nodes::build_nestloop_join_node(
+            join_node_id,
+            left_tuple_ids,
+            right_tuple_ids,
+            join_op,
+            join_conjuncts,
+        );
+
+        self.widen_nest_loop_join_nullable_tuples(op.join_type, left_tuple_ids, right_tuple_ids);
+
+        let mut merged_tuple_ids = left_tuple_ids.to_vec();
+        merged_tuple_ids.extend_from_slice(right_tuple_ids);
+
+        let merged_scope = match op.join_type {
+            JoinKind::LeftSemi | JoinKind::LeftAnti | JoinKind::NullAwareLeftAnti => left_scope,
+            JoinKind::RightSemi | JoinKind::RightAnti => right_scope,
+            _ => {
+                let mut scope = left_scope;
+                scope.merge(&right_scope);
+                scope
+            }
+        };
+
+        Ok((join_plan_node, merged_scope, merged_tuple_ids))
+    }
+
+    fn widen_hash_join_nullable_tuples(
+        &mut self,
+        join_type: JoinKind,
+        left_tuple_ids: &[i32],
+        right_tuple_ids: &[i32],
+    ) {
+        match join_type {
+            JoinKind::LeftOuter
+            | JoinKind::LeftAnti
+            | JoinKind::LeftSemi
+            | JoinKind::NullAwareLeftAnti => {
+                for &tid in right_tuple_ids {
+                    self.state.desc_builder().widen_tuple_nullable(tid);
+                }
+            }
+            JoinKind::RightOuter | JoinKind::RightAnti | JoinKind::RightSemi => {
+                for &tid in left_tuple_ids {
+                    self.state.desc_builder().widen_tuple_nullable(tid);
+                }
+            }
+            JoinKind::FullOuter => {
+                for &tid in left_tuple_ids {
+                    self.state.desc_builder().widen_tuple_nullable(tid);
+                }
+                for &tid in right_tuple_ids {
+                    self.state.desc_builder().widen_tuple_nullable(tid);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn widen_nest_loop_join_nullable_tuples(
+        &mut self,
+        join_type: JoinKind,
+        left_tuple_ids: &[i32],
+        right_tuple_ids: &[i32],
+    ) {
+        match join_type {
+            JoinKind::LeftOuter | JoinKind::LeftAnti | JoinKind::NullAwareLeftAnti => {
+                for &tid in right_tuple_ids {
+                    self.state.desc_builder().widen_tuple_nullable(tid);
+                }
+            }
+            JoinKind::RightOuter | JoinKind::RightAnti => {
+                for &tid in left_tuple_ids {
+                    self.state.desc_builder().widen_tuple_nullable(tid);
+                }
+            }
+            JoinKind::FullOuter => {
+                for &tid in left_tuple_ids {
+                    self.state.desc_builder().widen_tuple_nullable(tid);
+                }
+                for &tid in right_tuple_ids {
+                    self.state.desc_builder().widen_tuple_nullable(tid);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn record_probe_targets(
+        &mut self,
+        node: &super::node::DistributedPlanNode,
+        result: &LoweredDistributedNode,
+    ) {
+        if node.probe_runtime_filters.is_empty() {
+            return;
+        }
+        let Some(target_node) = result.plan_nodes.first() else {
+            return;
+        };
+        let thrift_node_id = target_node.node_id;
+        let Ok(fragment_id) = self.state.current_fragment_id() else {
+            return;
+        };
+        for probe in &node.probe_runtime_filters {
+            let mut compiler = ExprCompiler::new(self.state.slot_allocator(), &result.scope);
+            let Ok(probe_texpr) = compiler.compile_typed(&probe.probe_expr) else {
+                continue;
+            };
+            self.state.rf_probe_targets().insert(
+                probe.filter_id,
+                RfProbeTarget {
+                    thrift_node_id,
+                    probe_texpr,
+                    fragment_id,
+                },
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_rf_descriptors(
+        &mut self,
+        build_runtime_filters: &[crate::sql::optimizer::runtime_filter_pass::RuntimeFilterDesc],
+        join_node_id: i32,
+        build_scope: &ExprScope,
+        surviving_eq_origin: &[usize],
+        surviving_eq_build_exprs: &[TypedExpr],
+        execution_distribution: Option<JoinExecutionDistribution>,
+    ) -> Result<Vec<crate::runtime_filter::TRuntimeFilterDescription>, String> {
+        use crate::runtime_filter;
+
+        if build_runtime_filters.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let pipeline_dop = rf_pipeline_dop();
+        let join_fragment = self.state.current_fragment_id()?;
+        let mut descs: Vec<runtime_filter::TRuntimeFilterDescription> =
+            Vec::with_capacity(build_runtime_filters.len());
+
+        for rf in build_runtime_filters {
+            let filter_id = rf.filter_id;
+            let Some(post_demote_expr_order) =
+                remap_rf_expr_order(surviving_eq_origin, rf.expr_order)
+            else {
+                continue;
+            };
+            if post_demote_expr_order >= surviving_eq_origin.len() {
+                continue;
+            }
+            let Some(expected_build_expr) = surviving_eq_build_exprs.get(post_demote_expr_order)
+            else {
+                continue;
+            };
+            if !rf_build_expr_matches_join_build_expr(&rf.build_expr, expected_build_expr) {
+                tracing::debug!(
+                    "skip runtime filter {filter_id}: build expr does not match join build key"
+                );
+                continue;
+            }
+
+            let build_texpr = match ExprCompiler::new(self.state.slot_allocator(), build_scope)
+                .compile_typed(&rf.build_expr)
+            {
+                Ok(t) => t,
+                Err(err) => {
+                    tracing::debug!(
+                        "skip runtime filter {filter_id}: build expr does not bind build scope: {err}"
+                    );
+                    continue;
+                }
+            };
+
+            let probe_target = self.state.rf_probe_targets().get(&filter_id).cloned();
+            let has_remote_targets = probe_target
+                .as_ref()
+                .map(|t| t.fragment_id != join_fragment)
+                .unwrap_or(false);
+
+            let effective_distribution = execution_distribution
+                .unwrap_or_else(|| legacy_rf_distribution_to_execution(&rf.distribution));
+            let (build_join_mode, local_layout, global_layout) =
+                rf_layout_for_execution_distribution(effective_distribution);
+
+            let layout = runtime_filter::TRuntimeFilterLayout::new(
+                filter_id,
+                local_layout,
+                global_layout,
+                false,
+                1_i32,
+                pipeline_dop,
+                None::<Vec<i32>>,
+                None::<Vec<i32>>,
+                None::<Vec<i32>>,
+                None::<Vec<crate::partitions::TBucketProperty>>,
+            );
+
+            let mut target_map = BTreeMap::new();
+            if let Some(target) = &probe_target {
+                target_map.insert(target.thrift_node_id, target.probe_texpr.clone());
+            }
+
+            let desc = runtime_filter::TRuntimeFilterDescription::new(
+                filter_id,
+                build_texpr,
+                post_demote_expr_order as i32,
+                target_map,
+                has_remote_targets,
+                None::<i64>,
+                None::<Vec<crate::types::TNetworkAddress>>,
+                build_join_mode,
+                None::<crate::types::TUniqueId>,
+                join_node_id,
+                None::<Vec<crate::types::TUniqueId>>,
+                None::<Vec<runtime_filter::TRuntimeFilterDestination>>,
+                None::<Vec<i32>>,
+                None::<BTreeMap<i32, Vec<exprs::TExpr>>>,
+                runtime_filter::TRuntimeFilterBuildType::JOIN_FILTER,
+                layout,
+                None::<bool>,
+                None::<bool>,
+                None::<i32>,
+                None::<bool>,
+                None::<bool>,
+                None::<i64>,
+            );
+
+            descs.push(desc.clone());
+            self.state.rf_all_filters().insert(filter_id, desc);
+            self.state
+                .rf_build_side_filters()
+                .entry(join_fragment)
+                .or_default()
+                .push(filter_id);
+            if let Some(target) = &probe_target {
+                self.state
+                    .rf_probe_side_filters()
+                    .entry(target.fragment_id)
+                    .or_default()
+                    .push((filter_id, target.thrift_node_id));
+            }
+        }
+
+        Ok(descs)
     }
 
     pub(crate) fn lower_scan(
@@ -930,6 +1802,1543 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
         Ok((project_plan_node, project_scope, output_columns))
     }
+
+    pub(crate) fn lower_hash_aggregate(
+        &mut self,
+        agg_node_id: i32,
+        agg_tuple_id: i32,
+        op: &PhysicalHashAggregateOp,
+        child_scope: &ExprScope,
+    ) -> Result<(plan_nodes::TPlanNode, ExprScope), String> {
+        let state = &mut *self.state;
+        let need_finalize = matches!(op.mode, AggMode::Single | AggMode::Global);
+
+        let mut agg_scope = ExprScope::new();
+        let mut grouping_exprs = Vec::new();
+
+        // Compile GROUP BY expressions (same for all modes — the child scope
+        // has the correct columns for both scan-level and Local-output contexts).
+        for (idx, gb_expr) in op.group_by.iter().enumerate() {
+            let mut compiler = ExprCompiler::new(state.slot_allocator(), child_scope);
+            let texpr = compiler.compile_typed(gb_expr)?;
+            let data_type = gb_expr.data_type.clone();
+            let nullable = gb_expr.nullable;
+            let name = typed_expr_display_name(gb_expr);
+            let slot_id = state.alloc_slot();
+            let slot_type_desc = texpr
+                .nodes
+                .first()
+                .map(|root| root.type_.clone())
+                .ok_or_else(|| format!("group by expr `{name}` compiled to empty TExpr"))?;
+            state.desc_builder().add_slot_with_type_desc(
+                slot_id,
+                agg_tuple_id,
+                &name,
+                slot_type_desc.clone(),
+                nullable,
+                idx as i32,
+            );
+            let binding = ColumnBinding {
+                tuple_id: agg_tuple_id,
+                slot_id,
+                data_type: data_type.clone(),
+                type_desc: Some(slot_type_desc),
+                nullable,
+            };
+            let gb_column_id = op
+                .output_columns
+                .get(idx)
+                .map(|col| col.column_id)
+                .unwrap_or_else(|| match &gb_expr.kind {
+                    ExprKind::ColumnRef { column_id, .. } => *column_id,
+                    _ => crate::sql::column_id::ColumnId::UNSET,
+                });
+            agg_scope.add_column_with_id(gb_column_id, None, name, binding.clone());
+            if let ExprKind::ColumnRef {
+                qualifier: Some(ref q),
+                ref column,
+                ..
+            } = gb_expr.kind
+            {
+                let _ = (q, column, binding);
+            }
+            // Propagate dict registration through the aggregate's group-
+            // by output: when the group-by is a passthrough ColumnRef of
+            // a dict-encoded source slot, the new agg output slot also
+            // carries dict ids. Re-register the TGlobalDict on the new
+            // slot so a downstream Decode (in this or a parent fragment
+            // post-exchange) resolves its `dict_id_to_string_ids` key.
+            if let ExprKind::ColumnRef { column_id, .. } = gb_expr.kind
+                && let Some(child_binding) = child_scope.resolve_by_id(column_id)
+            {
+                let source_slot_id = child_binding.slot_id;
+                state.propagate_dict_to_slot(source_slot_id, slot_id);
+            }
+            grouping_exprs.push(texpr);
+        }
+
+        // Compile aggregate function expressions — mode-dependent.
+        let agg_start_col = op.group_by.len();
+        let mut aggregate_functions = Vec::new();
+
+        debug_assert_eq!(
+            op.is_merge.len(),
+            op.aggregates.len(),
+            "PhysicalHashAggregate (node_id={}): is_merge.len() = {}, aggregates.len() = {}",
+            agg_node_id,
+            op.is_merge.len(),
+            op.aggregates.len(),
+        );
+
+        for (idx, agg_call) in op.aggregates.iter().enumerate() {
+            let texpr = if op.is_merge[idx] {
+                // Global (merge) phase: the child scope contains the Local's
+                // output.  Each intermediate aggregate column sits at position
+                // group_by.len() + idx in the child scope's ordered columns.
+                let child_columns: Vec<_> = child_scope.iter_columns().collect();
+                let child_col_idx = agg_start_col + idx;
+                let (_, binding) = child_columns.get(child_col_idx).ok_or_else(|| {
+                    format!(
+                        "Global agg: child scope missing intermediate column at index {}",
+                        child_col_idx
+                    )
+                })?;
+                let mut compiler = ExprCompiler::new(state.slot_allocator(), child_scope);
+                compiler.compile_merge_aggregate_call(
+                    agg_call,
+                    binding.slot_id,
+                    binding.tuple_id,
+                    &binding.data_type,
+                )?
+            } else {
+                // Single or Local: compile against child scope normally.
+                let mut compiler = ExprCompiler::new(state.slot_allocator(), child_scope);
+                compiler.compile_aggregate_call_typed(agg_call).map_err(|err| {
+                    let available = child_scope
+                        .iter_columns()
+                        .map(|(name, _)| name.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!(
+                        "failed to compile aggregate `{}` in {:?} mode against child scope [{}]: {}",
+                        agg_call_display_name(agg_call),
+                        op.mode,
+                        available,
+                        err
+                    )
+                })?
+            };
+
+            let nullable = true;
+            let name = agg_call_display_name(agg_call);
+            let intermediate_type = texpr
+                .nodes
+                .first()
+                .and_then(|root| root.fn_.as_ref())
+                .and_then(|func| func.aggregate_fn.as_ref())
+                .and_then(|agg_fn| arrow_type_from_desc(&agg_fn.intermediate_type));
+            let slot_contract = aggregate_slot_contract_for_phase(
+                need_finalize,
+                &agg_call.result_type,
+                intermediate_type.as_ref(),
+                &name,
+            )?;
+            let data_type = slot_contract.data_type.clone();
+            let slot_type_desc = slot_contract.type_desc.clone();
+            let slot_id = state.alloc_slot();
+            let col_pos = (agg_start_col + idx) as i32;
+            state.desc_builder().add_slot_with_type_desc(
+                slot_id,
+                agg_tuple_id,
+                &name,
+                slot_type_desc.clone(),
+                nullable,
+                col_pos,
+            );
+            let binding = ColumnBinding {
+                tuple_id: agg_tuple_id,
+                slot_id,
+                data_type,
+                type_desc: Some(slot_type_desc),
+                nullable,
+            };
+            agg_scope.add_column_with_id(
+                agg_call.output_column_id,
+                None,
+                name.clone(),
+                binding.clone(),
+            );
+            let unqualified_name = agg_call_display_name_without_qualifiers(agg_call);
+            if !unqualified_name.eq_ignore_ascii_case(&name) {
+                let _ = unqualified_name;
+            }
+            aggregate_functions.push(texpr);
+        }
+
+        state.desc_builder().add_tuple(agg_tuple_id, None);
+        let agg_plan_node = nodes::build_aggregation_node(
+            agg_node_id,
+            agg_tuple_id,
+            agg_tuple_id,
+            grouping_exprs,
+            aggregate_functions,
+            need_finalize,
+        );
+
+        Ok((agg_plan_node, agg_scope))
+    }
+
+    pub(crate) fn lower_sort(
+        &mut self,
+        sort_node_id: i32,
+        op: &PhysicalSortOp,
+        child_scope: &ExprScope,
+        child_tuple_ids: &[i32],
+        output_columns: &[AnalysisOutputColumn],
+        offset: Option<i64>,
+    ) -> Result<plan_nodes::TPlanNode, String> {
+        let state = &mut *self.state;
+
+        let mut ordering_exprs = Vec::new();
+        let mut is_asc = Vec::new();
+        let mut nulls_first_list = Vec::new();
+
+        for item in &op.items {
+            let mut compiler = ExprCompiler::new(state.slot_allocator(), child_scope);
+            let texpr = compiler.compile_typed(&item.expr)?;
+            ordering_exprs.push(texpr);
+            is_asc.push(item.asc);
+            nulls_first_list.push(item.nulls_first);
+        }
+
+        // Compile analytic-partition exprs (set when this Sort precedes a
+        // Window). Emitting them as TSortNode.analytic_partition_exprs tells
+        // the pipeline engine to run sort locally per partition instead of
+        // doing a global merge — matching StarRocks's parallel analytic
+        // sort behaviour. Empty for plain ORDER BY.
+        let analytic_partition_exprs = if op.analytic_partition_exprs.is_empty() {
+            None
+        } else {
+            let mut out = Vec::with_capacity(op.analytic_partition_exprs.len());
+            for expr in &op.analytic_partition_exprs {
+                let mut compiler = ExprCompiler::new(state.slot_allocator(), child_scope);
+                out.push(compiler.compile_typed(expr)?);
+            }
+            Some(out)
+        };
+
+        let sort_info = plan_nodes::TSortInfo::new(
+            ordering_exprs,
+            is_asc,
+            nulls_first_list,
+            slot_ref_exprs_for_columns(child_scope, output_columns, "Sort")?,
+        );
+        let sort_tuple_slot_exprs = sort_info.sort_tuple_slot_exprs.clone();
+
+        let mut sort_plan_node = nodes::default_plan_node();
+        sort_plan_node.node_id = sort_node_id;
+        sort_plan_node.node_type = plan_nodes::TPlanNodeType::SORT_NODE;
+        sort_plan_node.num_children = 1;
+        sort_plan_node.limit = -1;
+        sort_plan_node.row_tuples = child_tuple_ids.to_vec();
+        sort_plan_node.nullable_tuples = vec![];
+        sort_plan_node.compact_data = true;
+        sort_plan_node.sort_node = Some(plan_nodes::TSortNode {
+            sort_info,
+            use_top_n: false,
+            offset,
+            ordering_exprs: None,
+            is_asc_order: None,
+            is_default_limit: None,
+            nulls_first: None,
+            sort_tuple_slot_exprs,
+            has_outer_join_child: None,
+            sql_sort_keys: None,
+            analytic_partition_exprs,
+            partition_exprs: None,
+            partition_limit: None,
+            topn_type: None,
+            build_runtime_filters: None,
+            max_buffered_rows: None,
+            max_buffered_bytes: None,
+            late_materialization: None,
+            enable_parallel_merge: None,
+            analytic_partition_skewed: None,
+            pre_agg_exprs: None,
+            pre_agg_output_slot_id: None,
+            pre_agg_insert_local_shuffle: None,
+            parallel_merge_late_materialize_mode: None,
+            per_pipeline: None,
+        });
+
+        Ok(sort_plan_node)
+    }
+
+    pub(crate) fn lower_top_n_single_or_partial(
+        &mut self,
+        top_n_node_id: i32,
+        op: &PhysicalTopNOp,
+        child_scope: &ExprScope,
+        child_tuple_ids: &[i32],
+    ) -> Result<plan_nodes::TPlanNode, String> {
+        match (op.phase, op.is_split) {
+            (TopNPhase::Final, true) => return Err("TopN split is Phase 2".to_string()),
+            (TopNPhase::Final, false) | (TopNPhase::Partial, _) => {}
+        }
+
+        let state = &mut *self.state;
+        let mut ordering_exprs = Vec::new();
+        let mut is_asc = Vec::new();
+        let mut nulls_first_list = Vec::new();
+
+        for item in &op.items {
+            let mut compiler = ExprCompiler::new(state.slot_allocator(), child_scope);
+            let texpr = compiler.compile_typed(&item.expr)?;
+            ordering_exprs.push(texpr);
+            is_asc.push(item.asc);
+            nulls_first_list.push(item.nulls_first);
+        }
+
+        let sort_info = plan_nodes::TSortInfo::new(
+            ordering_exprs,
+            is_asc,
+            nulls_first_list,
+            None::<Vec<exprs::TExpr>>,
+        );
+
+        let mut sort_plan_node = nodes::default_plan_node();
+        sort_plan_node.node_id = top_n_node_id;
+        sort_plan_node.node_type = plan_nodes::TPlanNodeType::SORT_NODE;
+        sort_plan_node.num_children = 1;
+        sort_plan_node.limit = op.limit.unwrap_or(-1);
+        sort_plan_node.row_tuples = child_tuple_ids.to_vec();
+        sort_plan_node.nullable_tuples = vec![];
+        sort_plan_node.compact_data = true;
+        sort_plan_node.sort_node = Some(plan_nodes::TSortNode {
+            sort_info,
+            use_top_n: true,
+            offset: op.offset,
+            ordering_exprs: None,
+            is_asc_order: None,
+            is_default_limit: None,
+            nulls_first: None,
+            sort_tuple_slot_exprs: None,
+            has_outer_join_child: None,
+            sql_sort_keys: None,
+            analytic_partition_exprs: None,
+            partition_exprs: None,
+            partition_limit: None,
+            topn_type: None,
+            build_runtime_filters: None,
+            max_buffered_rows: None,
+            max_buffered_bytes: None,
+            late_materialization: None,
+            enable_parallel_merge: None,
+            analytic_partition_skewed: None,
+            pre_agg_exprs: None,
+            pre_agg_output_slot_id: None,
+            pre_agg_insert_local_shuffle: None,
+            parallel_merge_late_materialize_mode: None,
+            per_pipeline: None,
+        });
+
+        Ok(sort_plan_node)
+    }
+
+    pub(crate) fn lower_values(
+        &mut self,
+        values_node_id: i32,
+        output_tuple_id: i32,
+        op: &PhysicalValuesOp,
+    ) -> Result<(plan_nodes::TPlanNode, ExprScope), String> {
+        let state = &mut *self.state;
+
+        let mut scope = ExprScope::new();
+        for (idx, col) in op.columns.iter().enumerate() {
+            let slot_id = state.alloc_slot();
+            state.desc_builder().add_slot(
+                slot_id,
+                output_tuple_id,
+                &col.name,
+                &col.data_type,
+                col.nullable,
+                idx as i32,
+            );
+            scope.add_column_with_id(
+                col.column_id,
+                None,
+                col.name.clone(),
+                ColumnBinding {
+                    tuple_id: output_tuple_id,
+                    slot_id,
+                    data_type: col.data_type.clone(),
+                    type_desc: None,
+                    nullable: col.nullable,
+                },
+            );
+        }
+        state.desc_builder().add_tuple(output_tuple_id, None);
+
+        let empty_scope = ExprScope::new();
+        let mut const_expr_lists = Vec::with_capacity(op.rows.len());
+        for row in &op.rows {
+            if row.len() != op.columns.len() {
+                return Err(format!(
+                    "VALUES row column count mismatch: expected {}, got {}",
+                    op.columns.len(),
+                    row.len()
+                ));
+            }
+            let mut exprs = Vec::with_capacity(row.len());
+            for expr in row {
+                let mut compiler = ExprCompiler::new(state.slot_allocator(), &empty_scope);
+                exprs.push(compiler.compile_typed(expr)?);
+            }
+            const_expr_lists.push(exprs);
+        }
+
+        let mut plan_node = nodes::default_plan_node();
+        plan_node.node_id = values_node_id;
+        plan_node.node_type = plan_nodes::TPlanNodeType::UNION_NODE;
+        plan_node.num_children = 0;
+        plan_node.row_tuples = vec![output_tuple_id];
+        plan_node.nullable_tuples = vec![];
+        plan_node.union_node = Some(plan_nodes::TUnionNode {
+            tuple_id: output_tuple_id,
+            result_expr_lists: vec![],
+            const_expr_lists,
+            first_materialized_child_idx: 0,
+            pass_through_slot_maps: None,
+            local_exchanger_type: None,
+            local_partition_by_exprs: None,
+        });
+
+        Ok((plan_node, scope))
+    }
+
+    fn lower_window(
+        &mut self,
+        window_node_id: i32,
+        node_tuple_ids: &[i32],
+        body: &super::body::WindowBody,
+        child_scope: &ExprScope,
+        child_tuple_ids: &[i32],
+        child_ordering: &OrderingSpec,
+    ) -> Result<
+        (
+            Vec<plan_nodes::TPlanNode>,
+            ExprScope,
+            Vec<i32>,
+            OrderingSpec,
+        ),
+        String,
+    > {
+        let groups = group_win_exprs_by_sig(&body.window_exprs);
+        if groups.is_empty() {
+            return Err("DistributedPlan Window has no window expressions".to_string());
+        }
+        let expected_tuple_count = child_tuple_ids.len() + groups.len();
+        if node_tuple_ids.len() != expected_tuple_count {
+            return Err(format!(
+                "DistributedPlan Window tuple count mismatch: expected {}, got {}",
+                expected_tuple_count,
+                node_tuple_ids.len()
+            ));
+        }
+
+        let mut op_nodes = Vec::new();
+        let mut current_scope = ExprScope::new();
+        current_scope.merge(child_scope);
+        let mut current_tuple_ids = child_tuple_ids.to_vec();
+        let mut current_ordering = child_ordering.clone();
+        let mut next_node_id = window_node_id;
+
+        for (group_idx, group_indices) in groups.iter().enumerate() {
+            let output_tuple_id = node_tuple_ids[child_tuple_ids.len() + group_idx];
+            let intermediate_tuple_id = output_tuple_id.checked_sub(1).ok_or_else(|| {
+                format!(
+                    "DistributedPlan Window output tuple id {} cannot derive intermediate tuple id",
+                    output_tuple_id
+                )
+            })?;
+            let group_exprs: Vec<_> = group_indices
+                .iter()
+                .map(|&i| body.window_exprs[i].clone())
+                .collect();
+            let first_win = group_exprs
+                .first()
+                .ok_or_else(|| "DistributedPlan Window group is empty".to_string())?;
+
+            if groups.len() > 1 {
+                let required_ordering =
+                    window_ordering_spec(&first_win.partition_by, &first_win.order_by);
+                let has_sort_keys =
+                    !first_win.partition_by.is_empty() || !first_win.order_by.is_empty();
+                let ordering_is_representable = !matches!(required_ordering, OrderingSpec::Any);
+                let needs_sort = has_sort_keys
+                    && (!ordering_is_representable
+                        || !current_ordering.satisfies(&required_ordering));
+                if needs_sort {
+                    let sort_node_id = next_node_id;
+                    next_node_id += 1;
+                    let mut sort_ordering = Vec::new();
+                    let mut sort_is_asc = Vec::new();
+                    let mut sort_nulls_first_list = Vec::new();
+                    for expr in &first_win.partition_by {
+                        let mut compiler =
+                            ExprCompiler::new(self.state.slot_allocator(), &current_scope);
+                        sort_ordering.push(compiler.compile_typed(expr)?);
+                        sort_is_asc.push(true);
+                        sort_nulls_first_list.push(true);
+                    }
+                    for item in &first_win.order_by {
+                        let mut compiler =
+                            ExprCompiler::new(self.state.slot_allocator(), &current_scope);
+                        sort_ordering.push(compiler.compile_typed(&item.expr)?);
+                        sort_is_asc.push(item.asc);
+                        sort_nulls_first_list.push(item.nulls_first);
+                    }
+                    let sort_plan = nodes::build_sort_node_raw(
+                        sort_node_id,
+                        current_tuple_ids.clone(),
+                        sort_ordering,
+                        sort_is_asc,
+                        sort_nulls_first_list,
+                        -1,
+                        None,
+                    );
+                    op_nodes.insert(0, sort_plan);
+                    current_ordering = required_ordering;
+                }
+            }
+
+            let analytic_node_id = next_node_id;
+            next_node_id += 1;
+
+            let mut partition_exprs = Vec::new();
+            for expr in &first_win.partition_by {
+                let mut compiler = ExprCompiler::new(self.state.slot_allocator(), &current_scope);
+                partition_exprs.push(compiler.compile_typed(expr)?);
+            }
+            let mut order_by_exprs = Vec::new();
+            for item in &first_win.order_by {
+                let mut compiler = ExprCompiler::new(self.state.slot_allocator(), &current_scope);
+                order_by_exprs.push(compiler.compile_typed(&item.expr)?);
+            }
+
+            let mut analytic_functions = Vec::new();
+            for win_expr in &group_exprs {
+                let mut compiler = ExprCompiler::new(self.state.slot_allocator(), &current_scope);
+                let agg_call = AggregateCall {
+                    name: win_expr.name.clone(),
+                    args: win_expr.args.clone(),
+                    distinct: win_expr.distinct,
+                    result_type: win_expr.result_type.clone(),
+                    order_by: vec![],
+                    output_column_id: crate::sql::column_id::ColumnId::UNSET,
+                };
+                let mut texpr = compiler.compile_aggregate_call_typed(&agg_call)?;
+                apply_ignore_nulls_to_root_fn(&mut texpr, win_expr.ignore_nulls);
+                analytic_functions.push(texpr);
+            }
+
+            for (idx, win_expr) in group_exprs.iter().enumerate() {
+                let slot_id = self.state.alloc_slot();
+                self.state.desc_builder().add_slot(
+                    slot_id,
+                    intermediate_tuple_id,
+                    &format!("__win_intermediate_{idx}"),
+                    &win_expr.result_type,
+                    true,
+                    idx as i32,
+                );
+            }
+            self.state
+                .desc_builder()
+                .add_tuple(intermediate_tuple_id, None);
+
+            let mut output_scope = ExprScope::new();
+            output_scope.merge(&current_scope);
+            for (idx, win_expr) in group_exprs.iter().enumerate() {
+                let slot_id = self.state.alloc_slot();
+                self.state.desc_builder().add_slot(
+                    slot_id,
+                    output_tuple_id,
+                    &win_expr.output_name,
+                    &win_expr.result_type,
+                    true,
+                    idx as i32,
+                );
+                output_scope.add_column_with_id(
+                    win_expr.output_column_id,
+                    None,
+                    win_expr.output_name.clone(),
+                    ColumnBinding {
+                        tuple_id: output_tuple_id,
+                        slot_id,
+                        data_type: win_expr.result_type.clone(),
+                        type_desc: None,
+                        nullable: true,
+                    },
+                );
+            }
+            self.state.desc_builder().add_tuple(output_tuple_id, None);
+
+            let analytic_tnode = plan_nodes::TAnalyticNode {
+                partition_exprs,
+                order_by_exprs,
+                analytic_functions,
+                window: analytic_window_from_expr(first_win),
+                intermediate_tuple_id,
+                output_tuple_id,
+                buffered_tuple_id: None,
+                partition_by_eq: None,
+                order_by_eq: None,
+                sql_partition_keys: None,
+                sql_aggregate_functions: None,
+                has_outer_join_child: None,
+                use_hash_based_partition: None,
+                is_skewed: None,
+            };
+
+            let mut plan_node = nodes::default_plan_node();
+            plan_node.node_id = analytic_node_id;
+            plan_node.node_type = plan_nodes::TPlanNodeType::ANALYTIC_EVAL_NODE;
+            plan_node.num_children = 1;
+            plan_node.limit = -1;
+            let mut new_tuple_ids = current_tuple_ids.clone();
+            new_tuple_ids.push(output_tuple_id);
+            plan_node.row_tuples = new_tuple_ids.clone();
+            plan_node.nullable_tuples = vec![];
+            plan_node.analytic_node = Some(analytic_tnode);
+
+            op_nodes.insert(0, plan_node);
+            current_scope = output_scope;
+            current_tuple_ids = new_tuple_ids;
+        }
+
+        Ok((op_nodes, current_scope, current_tuple_ids, current_ordering))
+    }
+
+    fn lower_generate_series(
+        &mut self,
+        table_fn_node_id: i32,
+        output_tuple_id: i32,
+        op: &PhysicalGenerateSeriesOp,
+    ) -> Result<(Vec<plan_nodes::TPlanNode>, ExprScope), String> {
+        let derived_param_values_node = table_fn_node_id - 1;
+        let derived_param_tuple = output_tuple_id - 1;
+        if op.step == 0 {
+            return Err("generate_series step size cannot equal zero".to_string());
+        }
+
+        let int64_type_desc = type_infer::arrow_type_to_type_desc(&DataType::Int64)?;
+        let empty_scope = ExprScope::new();
+        let mut param_slots = Vec::with_capacity(3);
+        let mut param_exprs = Vec::with_capacity(3);
+        for (idx, (name, value)) in [
+            ("__gs_start", op.start),
+            ("__gs_end", op.end),
+            ("__gs_step", op.step),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let slot_id = self.state.alloc_slot();
+            self.state.desc_builder().add_slot_with_type_desc(
+                slot_id,
+                derived_param_tuple,
+                name,
+                int64_type_desc.clone(),
+                false,
+                idx as i32,
+            );
+            param_slots.push(slot_id);
+            param_exprs.push(self.compile_int64_literal(value, &empty_scope)?);
+        }
+        self.state
+            .desc_builder()
+            .add_tuple(derived_param_tuple, None);
+
+        let mut param_values_node = nodes::default_plan_node();
+        param_values_node.node_id = derived_param_values_node;
+        param_values_node.node_type = plan_nodes::TPlanNodeType::UNION_NODE;
+        param_values_node.num_children = 0;
+        param_values_node.row_tuples = vec![derived_param_tuple];
+        param_values_node.nullable_tuples = vec![];
+        param_values_node.union_node = Some(plan_nodes::TUnionNode {
+            tuple_id: derived_param_tuple,
+            result_expr_lists: vec![],
+            const_expr_lists: vec![param_exprs],
+            first_materialized_child_idx: 0,
+            pass_through_slot_maps: None,
+            local_exchanger_type: None,
+            local_partition_by_exprs: None,
+        });
+
+        let slot_id = self.state.alloc_slot();
+        self.state.desc_builder().add_slot_with_type_desc(
+            slot_id,
+            output_tuple_id,
+            &op.column_name,
+            int64_type_desc.clone(),
+            false,
+            0,
+        );
+        self.state.desc_builder().add_tuple(output_tuple_id, None);
+
+        let mut scope = ExprScope::new();
+        let qualifier = op
+            .alias
+            .clone()
+            .unwrap_or_else(|| "generate_series".to_string());
+        scope.add_column_with_id(
+            op.output_column_id,
+            Some(qualifier),
+            op.column_name.clone(),
+            ColumnBinding {
+                tuple_id: output_tuple_id,
+                slot_id,
+                data_type: DataType::Int64,
+                type_desc: Some(int64_type_desc.clone()),
+                nullable: false,
+            },
+        );
+
+        let table_function_expr = exprs::TExpr::new(vec![exprs::TExprNode {
+            node_type: exprs::TExprNodeType::FUNCTION_CALL,
+            type_: int64_type_desc.clone(),
+            num_children: 0,
+            fn_: Some(types::TFunction {
+                name: types::TFunctionName {
+                    db_name: None,
+                    function_name: "generate_series".to_string(),
+                },
+                binary_type: types::TFunctionBinaryType::BUILTIN,
+                arg_types: vec![
+                    int64_type_desc.clone(),
+                    int64_type_desc.clone(),
+                    int64_type_desc.clone(),
+                ],
+                ret_type: int64_type_desc.clone(),
+                has_var_args: false,
+                comment: None,
+                signature: None,
+                hdfs_location: None,
+                scalar_fn: None,
+                aggregate_fn: None,
+                id: None,
+                checksum: None,
+                agg_state_desc: None,
+                fid: None,
+                table_fn: Some(types::TTableFunction::new(
+                    vec![int64_type_desc.clone()],
+                    None::<String>,
+                    Some(false),
+                )),
+                could_apply_dict_optimize: None,
+                ignore_nulls: None,
+                isolated: None,
+                input_type: None,
+                content: None,
+            }),
+            ..expr_compiler::default_expr_node()
+        }]);
+
+        let mut table_fn_plan_node = nodes::default_plan_node();
+        table_fn_plan_node.node_id = table_fn_node_id;
+        table_fn_plan_node.node_type = plan_nodes::TPlanNodeType::TABLE_FUNCTION_NODE;
+        table_fn_plan_node.num_children = 1;
+        table_fn_plan_node.limit = -1;
+        table_fn_plan_node.row_tuples = vec![output_tuple_id];
+        table_fn_plan_node.nullable_tuples = vec![];
+        table_fn_plan_node.compact_data = true;
+        table_fn_plan_node.table_function_node = Some(plan_nodes::TTableFunctionNode::new(
+            Some(table_function_expr),
+            Some(param_slots),
+            Some(Vec::new()),
+            Some(vec![slot_id]),
+            Some(true),
+        ));
+
+        Ok((vec![table_fn_plan_node, param_values_node], scope))
+    }
+
+    fn compile_int64_literal(
+        &mut self,
+        value: i64,
+        empty_scope: &ExprScope,
+    ) -> Result<exprs::TExpr, String> {
+        let typed = TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Int(value)),
+            data_type: DataType::Int64,
+            nullable: false,
+        };
+        let mut compiler = ExprCompiler::new(self.state.slot_allocator(), empty_scope);
+        compiler.compile_typed(&typed)
+    }
+
+    fn lower_table_function(
+        &mut self,
+        table_fn_node_id: i32,
+        output_tuple_id: i32,
+        op: &PhysicalTableFunctionOp,
+        child_scope: &ExprScope,
+    ) -> Result<(Vec<plan_nodes::TPlanNode>, ExprScope), String> {
+        let derived_project_node = table_fn_node_id - 1;
+        let derived_project_tuple = output_tuple_id - 1;
+        if !op.function_name.eq_ignore_ascii_case("unnest") {
+            return Err(format!(
+                "unsupported standalone table function: {}",
+                op.function_name
+            ));
+        }
+        if op.args.len() != op.output_columns.len() {
+            return Err(format!(
+                "table function output column count mismatch: args={} outputs={}",
+                op.args.len(),
+                op.output_columns.len()
+            ));
+        }
+
+        let mut slot_map = BTreeMap::new();
+        let mut project_scope = ExprScope::new();
+        let mut remapped_child_bindings = HashMap::new();
+        let mut outer_columns = Vec::new();
+        let mut outer_slots = Vec::new();
+
+        let child_cols: Vec<(String, ColumnBinding)> = child_scope
+            .iter_columns()
+            .map(|(name, binding)| (name.clone(), binding.clone()))
+            .collect();
+        for (idx, (name, binding)) in child_cols.iter().enumerate() {
+            let slot_id = self.state.alloc_slot();
+            let type_desc = expr_compiler::binding_type_desc(binding)?;
+            self.state.desc_builder().add_slot_with_type_desc(
+                slot_id,
+                derived_project_tuple,
+                name,
+                type_desc.clone(),
+                binding.nullable,
+                idx as i32,
+            );
+            slot_map.insert(
+                slot_id,
+                expr_compiler::build_slot_ref_texpr(
+                    binding.slot_id,
+                    binding.tuple_id,
+                    type_desc.clone(),
+                ),
+            );
+            let new_binding = ColumnBinding {
+                tuple_id: derived_project_tuple,
+                slot_id,
+                data_type: binding.data_type.clone(),
+                type_desc: Some(type_desc),
+                nullable: binding.nullable,
+            };
+            project_scope.add_column(None, name.clone(), new_binding.clone());
+            remapped_child_bindings
+                .insert((binding.tuple_id, binding.slot_id), new_binding.clone());
+            outer_slots.push(slot_id);
+            outer_columns.push((name.clone(), new_binding));
+        }
+        for (column_id, binding) in child_scope.iter_id_bindings() {
+            if let Some(new_binding) =
+                remapped_child_bindings.get(&(binding.tuple_id, binding.slot_id))
+            {
+                project_scope.add_id_alias(*column_id, new_binding.clone());
+            }
+        }
+
+        let mut param_slots = Vec::with_capacity(op.args.len());
+        let mut param_type_descs = Vec::with_capacity(op.args.len());
+        for (idx, arg) in op.args.iter().enumerate() {
+            let mut compiler = ExprCompiler::new(self.state.slot_allocator(), child_scope);
+            let texpr = compiler.compile_typed(arg)?;
+            let type_desc = texpr
+                .nodes
+                .first()
+                .map(|root| root.type_.clone())
+                .ok_or_else(|| format!("table function arg {idx} compiled to empty TExpr"))?;
+            let slot_id = self.state.alloc_slot();
+            self.state.desc_builder().add_slot_with_type_desc(
+                slot_id,
+                derived_project_tuple,
+                &format!("__tf_arg_{idx}"),
+                type_desc.clone(),
+                arg.nullable,
+                (child_cols.len() + idx) as i32,
+            );
+            slot_map.insert(slot_id, texpr);
+            param_slots.push(slot_id);
+            param_type_descs.push(type_desc);
+        }
+        self.state
+            .desc_builder()
+            .add_tuple(derived_project_tuple, None);
+        let project_plan_node =
+            nodes::build_project_node(derived_project_node, derived_project_tuple, slot_map);
+
+        let mut output_scope = ExprScope::new();
+        let mut output_outer_by_project_slot = HashMap::new();
+        for (idx, (name, binding)) in outer_columns.iter().enumerate() {
+            let type_desc = expr_compiler::binding_type_desc(binding)?;
+            self.state.desc_builder().add_slot_with_type_desc(
+                binding.slot_id,
+                output_tuple_id,
+                name,
+                type_desc.clone(),
+                binding.nullable,
+                idx as i32,
+            );
+            let output_binding = ColumnBinding {
+                tuple_id: output_tuple_id,
+                slot_id: binding.slot_id,
+                data_type: binding.data_type.clone(),
+                type_desc: Some(type_desc),
+                nullable: binding.nullable,
+            };
+            output_scope.add_column(None, name.clone(), output_binding.clone());
+            output_outer_by_project_slot.insert(binding.slot_id, output_binding);
+        }
+        let output_id_aliases: Vec<_> = project_scope
+            .iter_id_bindings()
+            .filter_map(|(column_id, binding)| {
+                output_outer_by_project_slot
+                    .get(&binding.slot_id)
+                    .map(|output_binding| (*column_id, output_binding.clone()))
+            })
+            .collect();
+        for (column_id, output_binding) in output_id_aliases {
+            output_scope.add_id_alias(column_id, output_binding);
+        }
+
+        let mut fn_result_slots = Vec::with_capacity(op.output_columns.len());
+        let mut ret_type_descs = Vec::with_capacity(op.output_columns.len());
+        let result_qualifier = op.alias.clone().or_else(|| Some(op.function_name.clone()));
+        for (idx, col) in op.output_columns.iter().enumerate() {
+            let DataType::List(item_field) = &op.args[idx].data_type else {
+                return Err(format!(
+                    "UNNEST argument {} must be ARRAY, got {:?}",
+                    idx + 1,
+                    op.args[idx].data_type
+                ));
+            };
+            if item_field.data_type() != &col.data_type {
+                return Err(format!(
+                    "UNNEST result type mismatch for column {}: arg item={:?} output={:?}",
+                    col.name,
+                    item_field.data_type(),
+                    col.data_type
+                ));
+            }
+            let slot_id = self.state.alloc_slot();
+            let type_desc = type_infer::arrow_type_to_type_desc(&col.data_type)?;
+            self.state.desc_builder().add_slot_with_type_desc(
+                slot_id,
+                output_tuple_id,
+                &col.name,
+                type_desc.clone(),
+                true,
+                (outer_columns.len() + idx) as i32,
+            );
+            let binding = ColumnBinding {
+                tuple_id: output_tuple_id,
+                slot_id,
+                data_type: col.data_type.clone(),
+                type_desc: Some(type_desc.clone()),
+                nullable: true,
+            };
+            output_scope.add_column_with_id(
+                col.column_id,
+                result_qualifier.clone(),
+                col.name.clone(),
+                binding,
+            );
+            fn_result_slots.push(slot_id);
+            ret_type_descs.push(type_desc);
+        }
+        self.state.desc_builder().add_tuple(output_tuple_id, None);
+
+        let ret_type = ret_type_descs
+            .first()
+            .cloned()
+            .ok_or_else(|| "table function requires at least one return type".to_string())?;
+        let table_function_expr = exprs::TExpr::new(vec![exprs::TExprNode {
+            node_type: exprs::TExprNodeType::FUNCTION_CALL,
+            type_: ret_type.clone(),
+            num_children: 0,
+            fn_: Some(types::TFunction {
+                name: types::TFunctionName {
+                    db_name: None,
+                    function_name: op.function_name.clone(),
+                },
+                binary_type: types::TFunctionBinaryType::BUILTIN,
+                arg_types: param_type_descs,
+                ret_type,
+                has_var_args: false,
+                comment: None,
+                signature: None,
+                hdfs_location: None,
+                scalar_fn: None,
+                aggregate_fn: None,
+                id: None,
+                checksum: None,
+                agg_state_desc: None,
+                fid: None,
+                table_fn: Some(types::TTableFunction::new(
+                    ret_type_descs,
+                    None::<String>,
+                    Some(op.is_left_join),
+                )),
+                could_apply_dict_optimize: None,
+                ignore_nulls: None,
+                isolated: None,
+                input_type: None,
+                content: None,
+            }),
+            ..expr_compiler::default_expr_node()
+        }]);
+
+        let mut table_fn_plan_node = nodes::default_plan_node();
+        table_fn_plan_node.node_id = table_fn_node_id;
+        table_fn_plan_node.node_type = plan_nodes::TPlanNodeType::TABLE_FUNCTION_NODE;
+        table_fn_plan_node.num_children = 1;
+        table_fn_plan_node.limit = -1;
+        table_fn_plan_node.row_tuples = vec![output_tuple_id];
+        table_fn_plan_node.nullable_tuples = vec![];
+        table_fn_plan_node.compact_data = true;
+        table_fn_plan_node.table_function_node = Some(plan_nodes::TTableFunctionNode::new(
+            Some(table_function_expr),
+            Some(param_slots),
+            Some(outer_slots),
+            Some(fn_result_slots),
+            Some(true),
+        ));
+
+        Ok((vec![table_fn_plan_node, project_plan_node], output_scope))
+    }
+
+    pub(crate) fn lower_assert_one_row(
+        &mut self,
+        assert_node_id: i32,
+        op: &PhysicalAssertOneRowOp,
+        child_tuple_ids: &[i32],
+    ) -> plan_nodes::TPlanNode {
+        let mut plan_node = nodes::default_plan_node();
+        plan_node.node_id = assert_node_id;
+        plan_node.node_type = plan_nodes::TPlanNodeType::ASSERT_NUM_ROWS_NODE;
+        plan_node.num_children = 1;
+        plan_node.limit = -1;
+        plan_node.row_tuples = child_tuple_ids.to_vec();
+        plan_node.nullable_tuples = vec![];
+        plan_node.compact_data = true;
+        plan_node.assert_num_rows_node = Some(plan_nodes::TAssertNumRowsNode {
+            desired_num_rows: Some(1),
+            subquery_string: Some(op.subquery_text.clone()),
+            assertion: Some(plan_nodes::TAssertion::LE),
+        });
+        plan_node
+    }
+
+    pub(crate) fn lower_decode(
+        &mut self,
+        decode_node_id: i32,
+        decode_tuple_id: i32,
+        op: &PhysicalDecodeOp,
+        child_scope: &ExprScope,
+    ) -> Result<(plan_nodes::TPlanNode, ExprScope), String> {
+        let child_columns: Vec<(String, ColumnBinding)> = child_scope
+            .iter_columns()
+            .map(|(name, binding)| (name.clone(), binding.clone()))
+            .collect();
+        let child_ids_by_slot: Vec<(crate::sql::column_id::ColumnId, ColumnBinding)> = child_scope
+            .iter_id_bindings()
+            .map(|(column_id, binding)| (*column_id, binding.clone()))
+            .collect();
+
+        let dict_target_meta: BTreeMap<
+            i32,
+            (String, DataType, bool, crate::sql::column_id::ColumnId),
+        > = op
+            .mappings
+            .iter()
+            .map(|item| {
+                let dict_binding = child_scope
+                    .resolve_by_id(item.source_column_id)
+                    .ok_or_else(|| {
+                        format!(
+                            "decode source ColumnId({}) for `{}` is not in child scope",
+                            item.source_column_id.0, item.dict_column
+                        )
+                    })?;
+                let declared = op
+                    .output_columns
+                    .iter()
+                    .find(|c| c.column_id == item.output_column_id);
+                let data_type = declared
+                    .map(|c| c.data_type.clone())
+                    .unwrap_or(DataType::Utf8);
+                let nullable = declared.map(|c| c.nullable).unwrap_or(true);
+                let output_name = declared
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| item.string_column.clone());
+                Ok::<_, String>((
+                    dict_binding.slot_id,
+                    (output_name, data_type, nullable, item.output_column_id),
+                ))
+            })
+            .collect::<Result<_, _>>()?;
+
+        let state = &mut *self.state;
+        let mut decode_scope = ExprScope::new();
+        let mut mapping: BTreeMap<i32, i32> = BTreeMap::new();
+        let mut materialized_dict_slots: BTreeMap<i32, ColumnBinding> = BTreeMap::new();
+
+        let mut col_pos: i32 = 0;
+        for (child_name, child_binding) in &child_columns {
+            if let Some((string_name, data_type, nullable, output_column_id)) =
+                dict_target_meta.get(&child_binding.slot_id)
+            {
+                if let Some(binding) = materialized_dict_slots.get(&child_binding.slot_id) {
+                    decode_scope.add_id_alias(*output_column_id, binding.clone());
+                    continue;
+                }
+                let string_slot_id = state.alloc_slot();
+                state.desc_builder().add_slot(
+                    string_slot_id,
+                    decode_tuple_id,
+                    string_name,
+                    data_type,
+                    *nullable,
+                    col_pos,
+                );
+                mapping.insert(child_binding.slot_id, string_slot_id);
+                let output_binding = ColumnBinding {
+                    tuple_id: decode_tuple_id,
+                    slot_id: string_slot_id,
+                    data_type: data_type.clone(),
+                    type_desc: None,
+                    nullable: *nullable,
+                };
+                materialized_dict_slots.insert(child_binding.slot_id, output_binding.clone());
+                decode_scope.add_column_with_id(
+                    *output_column_id,
+                    None,
+                    string_name.clone(),
+                    output_binding,
+                );
+                col_pos += 1;
+            } else {
+                state.desc_builder().add_slot(
+                    child_binding.slot_id,
+                    decode_tuple_id,
+                    child_name,
+                    &child_binding.data_type,
+                    child_binding.nullable,
+                    col_pos,
+                );
+                let output_binding = ColumnBinding {
+                    tuple_id: decode_tuple_id,
+                    slot_id: child_binding.slot_id,
+                    data_type: child_binding.data_type.clone(),
+                    type_desc: child_binding.type_desc.clone(),
+                    nullable: child_binding.nullable,
+                };
+                decode_scope.add_column(None, child_name.clone(), output_binding.clone());
+                for (column_id, id_binding) in &child_ids_by_slot {
+                    if id_binding.tuple_id == child_binding.tuple_id
+                        && id_binding.slot_id == child_binding.slot_id
+                    {
+                        decode_scope.add_id_alias(*column_id, output_binding.clone());
+                    }
+                }
+                col_pos += 1;
+            }
+        }
+
+        if mapping.len() != op.mappings.len() {
+            return Err(format!(
+                "decode mappings unresolved: declared {} entries, materialized {}",
+                op.mappings.len(),
+                mapping.len()
+            ));
+        }
+
+        state.desc_builder().add_tuple(decode_tuple_id, None);
+        let decode_node = nodes::build_decode_node(decode_node_id, vec![decode_tuple_id], mapping);
+
+        Ok((decode_node, decode_scope))
+    }
+
+    pub(crate) fn lower_repeat(
+        &mut self,
+        repeat_node_id: i32,
+        virtual_tuple_id: i32,
+        op: &PhysicalRepeatOp,
+        child_scope: ExprScope,
+        child_tuple_ids: Vec<i32>,
+        child_output_columns: Vec<AnalysisOutputColumn>,
+    ) -> Result<
+        (
+            plan_nodes::TPlanNode,
+            ExprScope,
+            Vec<i32>,
+            Vec<AnalysisOutputColumn>,
+        ),
+        String,
+    > {
+        let state = &mut *self.state;
+        let has_grouping_fns = !op.grouping_fn_args.is_empty();
+        let mut output_scope = child_scope;
+        let mut output_columns = child_output_columns;
+
+        let num_virtual = 1 + op.grouping_fn_args.len();
+        let mut virtual_slot_ids = Vec::with_capacity(num_virtual);
+
+        let grouping_id_slot = state.alloc_slot();
+        state.desc_builder().add_slot(
+            grouping_id_slot,
+            virtual_tuple_id,
+            "__grouping_id",
+            &DataType::Int64,
+            false,
+            0,
+        );
+        if !op.grouping_fn_args.is_empty() {
+            output_scope.add_column(
+                None,
+                "__grouping_id".to_string(),
+                ColumnBinding {
+                    tuple_id: virtual_tuple_id,
+                    slot_id: grouping_id_slot,
+                    data_type: DataType::Int64,
+                    type_desc: None,
+                    nullable: false,
+                },
+            );
+        }
+        virtual_slot_ids.push(grouping_id_slot);
+
+        for (fn_idx, (fn_name, _)) in op.grouping_fn_args.iter().enumerate() {
+            let slot = state.alloc_slot();
+            state.desc_builder().add_slot(
+                slot,
+                virtual_tuple_id,
+                fn_name,
+                &DataType::Int64,
+                false,
+                1 + fn_idx as i32,
+            );
+            let binding = ColumnBinding {
+                tuple_id: virtual_tuple_id,
+                slot_id: slot,
+                data_type: DataType::Int64,
+                type_desc: None,
+                nullable: false,
+            };
+            if let Some((_, column_id)) = op.grouping_fn_ids.get(fn_idx) {
+                output_scope.add_column_with_id(*column_id, None, fn_name.clone(), binding);
+                output_columns.push(AnalysisOutputColumn {
+                    column_id: *column_id,
+                    name: fn_name.clone(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    is_internal: false,
+                });
+            } else {
+                output_scope.add_internal_column(fn_name.clone(), binding);
+            }
+            virtual_slot_ids.push(slot);
+        }
+
+        state.desc_builder().add_tuple(virtual_tuple_id, None);
+
+        let mut all_rollup_slot_ids = BTreeSet::new();
+        for column_id in &op.all_rollup_column_ids {
+            let binding = output_scope.resolve_by_id(*column_id).ok_or_else(|| {
+                format!(
+                    "Repeat rollup ColumnId({}) is not in output scope",
+                    column_id.0
+                )
+            })?;
+            all_rollup_slot_ids.insert(binding.slot_id);
+        }
+
+        let slot_id_set_list: Vec<BTreeSet<i32>> = op
+            .repeat_column_ref_ids
+            .iter()
+            .map(|non_null_cols| {
+                let mut slot_ids = BTreeSet::new();
+                for column_id in non_null_cols {
+                    let binding = output_scope.resolve_by_id(*column_id).ok_or_else(|| {
+                        format!(
+                            "Repeat non-null ColumnId({}) is not in output scope",
+                            column_id.0
+                        )
+                    })?;
+                    slot_ids.insert(binding.slot_id);
+                }
+                Ok(slot_ids)
+            })
+            .collect::<Result<_, String>>()?;
+
+        let repeat_times = op.grouping_ids.len();
+        let mut grouping_list: Vec<Vec<i64>> = Vec::with_capacity(num_virtual);
+        grouping_list.push(op.grouping_ids.iter().map(|g| *g as i64).collect());
+
+        for fn_args in &op.grouping_fn_arg_ids {
+            let mut values = Vec::with_capacity(repeat_times);
+            for non_null_cols in &op.repeat_column_ref_ids {
+                let mut bits: u64 = 0;
+                for (bit_pos, arg_col) in fn_args.iter().enumerate() {
+                    let is_null = !non_null_cols.iter().any(|column_id| column_id == arg_col);
+                    if is_null {
+                        let reverse_bit_pos = fn_args.len() - 1 - bit_pos;
+                        bits |= 1 << reverse_bit_pos;
+                    }
+                }
+                values.push(bits as i64);
+            }
+            grouping_list.push(values);
+        }
+
+        let repeat_id_list: Vec<i64> = op.grouping_ids.iter().map(|g| *g as i64).collect();
+
+        let mut row_tuples = child_tuple_ids.clone();
+        if has_grouping_fns {
+            row_tuples.push(virtual_tuple_id);
+        }
+
+        let mut plan_node = nodes::default_plan_node();
+        plan_node.node_id = repeat_node_id;
+        plan_node.node_type = plan_nodes::TPlanNodeType::REPEAT_NODE;
+        plan_node.num_children = 1;
+        plan_node.limit = -1;
+        plan_node.row_tuples = row_tuples;
+        plan_node.nullable_tuples = vec![];
+        plan_node.compact_data = true;
+        plan_node.repeat_node = Some(plan_nodes::TRepeatNode {
+            output_tuple_id: virtual_tuple_id,
+            slot_id_set_list,
+            repeat_id_list,
+            grouping_list,
+            all_slot_ids: all_rollup_slot_ids,
+        });
+
+        let mut output_tuple_ids = child_tuple_ids;
+        if has_grouping_fns {
+            output_tuple_ids.push(virtual_tuple_id);
+        }
+
+        Ok((plan_node, output_scope, output_tuple_ids, output_columns))
+    }
+
+    fn lower_set_op(
+        &mut self,
+        set_op_node_id: i32,
+        output_tuple_id: i32,
+        kind: super::body::SetOpKind,
+        explicit_output_columns: &[AnalysisOutputColumn],
+        child_output_columns: &[Vec<AnalysisOutputColumn>],
+        child_results: &[LoweredDistributedNode],
+    ) -> Result<(plan_nodes::TPlanNode, ExprScope), String> {
+        if child_results.is_empty() {
+            return Err("set operation node has no inputs".to_string());
+        }
+
+        let state = &mut *self.state;
+        let output_columns: Vec<AnalysisOutputColumn> = if !explicit_output_columns.is_empty() {
+            explicit_output_columns.to_vec()
+        } else {
+            child_results[0]
+                .scope
+                .iter_columns()
+                .map(|(name, binding)| AnalysisOutputColumn {
+                    column_id: crate::sql::column_id::ColumnId::UNSET,
+                    name: name.clone(),
+                    data_type: binding.data_type.clone(),
+                    nullable: binding.nullable,
+                    is_internal: false,
+                })
+                .collect()
+        };
+
+        let mut output_scope = ExprScope::new();
+        let first_child_cols: Vec<(String, ColumnBinding)> = child_results[0]
+            .scope
+            .iter_columns()
+            .map(|(name, binding)| (name.clone(), binding.clone()))
+            .collect();
+
+        if first_child_cols.len() != output_columns.len() {
+            return Err(format!(
+                "set operation column count mismatch during codegen: child has {}, output has {}",
+                first_child_cols.len(),
+                output_columns.len()
+            ));
+        }
+
+        for (idx, output_col) in output_columns.iter().enumerate() {
+            let slot_id = state.alloc_slot();
+            state.desc_builder().add_slot(
+                slot_id,
+                output_tuple_id,
+                &output_col.name,
+                &output_col.data_type,
+                output_col.nullable,
+                idx as i32,
+            );
+            output_scope.add_column_with_id(
+                output_col.column_id,
+                None,
+                output_col.name.clone(),
+                ColumnBinding {
+                    tuple_id: output_tuple_id,
+                    slot_id,
+                    data_type: output_col.data_type.clone(),
+                    type_desc: None,
+                    nullable: output_col.nullable,
+                },
+            );
+        }
+        state.desc_builder().add_tuple(output_tuple_id, None);
+
+        if !child_output_columns.is_empty() && child_output_columns.len() != child_results.len() {
+            return Err(format!(
+                "set operation child_output_columns has {}, inputs has {}",
+                child_output_columns.len(),
+                child_results.len()
+            ));
+        }
+
+        let mut result_expr_lists = Vec::with_capacity(child_results.len());
+        for (child_idx, child_result) in child_results.iter().enumerate() {
+            let fallback_child_columns: Vec<AnalysisOutputColumn>;
+            let expected_child_columns = if child_output_columns.is_empty() {
+                fallback_child_columns = child_result
+                    .scope
+                    .iter_columns()
+                    .map(|(name, binding)| AnalysisOutputColumn {
+                        column_id: crate::sql::column_id::ColumnId::UNSET,
+                        name: name.clone(),
+                        data_type: binding.data_type.clone(),
+                        nullable: binding.nullable,
+                        is_internal: false,
+                    })
+                    .collect();
+                &fallback_child_columns
+            } else {
+                &child_output_columns[child_idx]
+            };
+            if expected_child_columns.len() != output_columns.len() {
+                return Err(format!(
+                    "set operation child {} column count mismatch during codegen: child has {}, output has {}",
+                    child_idx,
+                    expected_child_columns.len(),
+                    output_columns.len()
+                ));
+            }
+            let ordered_child_bindings: Vec<_> = child_result.scope.iter_columns().collect();
+            let mut expr_list = Vec::new();
+            for (col_idx, expected_child_col) in expected_child_columns.iter().enumerate() {
+                let output_col = &output_columns[col_idx];
+                let child_binding = if expected_child_col.column_id
+                    != crate::sql::column_id::ColumnId::UNSET
+                {
+                    child_result
+                        .scope
+                        .resolve_by_id(expected_child_col.column_id)
+                        .ok_or_else(|| {
+                            format!(
+                                "set operation child {} output column `{}` id={} is not in child scope",
+                                child_idx,
+                                expected_child_col.name,
+                                expected_child_col.column_id.0
+                            )
+                        })?
+                } else {
+                    ordered_child_bindings
+                        .get(col_idx)
+                        .map(|(_, binding)| *binding)
+                        .ok_or_else(|| {
+                            format!(
+                                "set operation child {} missing positional column {}",
+                                child_idx, col_idx
+                            )
+                        })?
+                };
+                let needs_cast = child_binding.data_type != output_col.data_type;
+                if needs_cast {
+                    let target_desc = type_infer::arrow_type_to_type_desc(&output_col.data_type)?;
+                    let child_desc = expr_compiler::binding_type_desc(child_binding)?;
+                    let slot_ref = expr_compiler::build_slot_ref_texpr(
+                        child_binding.slot_id,
+                        child_binding.tuple_id,
+                        child_desc,
+                    );
+                    expr_list.push(expr_compiler::build_cast_texpr(slot_ref, target_desc));
+                } else {
+                    let type_desc = expr_compiler::binding_type_desc(child_binding)?;
+                    expr_list.push(expr_compiler::build_slot_ref_texpr(
+                        child_binding.slot_id,
+                        child_binding.tuple_id,
+                        type_desc,
+                    ));
+                }
+            }
+            result_expr_lists.push(expr_list);
+        }
+
+        let tnode = plan_nodes::TUnionNode {
+            tuple_id: output_tuple_id,
+            result_expr_lists,
+            const_expr_lists: vec![],
+            first_materialized_child_idx: 0,
+            pass_through_slot_maps: None,
+            local_exchanger_type: None,
+            local_partition_by_exprs: None,
+        };
+
+        let mut plan_node = nodes::default_plan_node();
+        plan_node.node_id = set_op_node_id;
+        plan_node.node_type = match kind {
+            super::body::SetOpKind::UnionAll => plan_nodes::TPlanNodeType::UNION_NODE,
+            super::body::SetOpKind::Intersect => plan_nodes::TPlanNodeType::INTERSECT_NODE,
+            super::body::SetOpKind::Except => plan_nodes::TPlanNodeType::EXCEPT_NODE,
+        };
+        plan_node.row_tuples = vec![output_tuple_id];
+        plan_node.nullable_tuples = vec![];
+        plan_node.num_children = child_results.len() as i32;
+
+        match kind {
+            super::body::SetOpKind::UnionAll => {
+                plan_node.union_node = Some(tnode);
+            }
+            super::body::SetOpKind::Intersect => {
+                plan_node.intersect_node = Some(plan_nodes::TIntersectNode {
+                    tuple_id: tnode.tuple_id,
+                    result_expr_lists: tnode.result_expr_lists,
+                    const_expr_lists: tnode.const_expr_lists,
+                    first_materialized_child_idx: tnode.first_materialized_child_idx,
+                    has_outer_join_child: None,
+                    local_partition_by_exprs: None,
+                });
+            }
+            super::body::SetOpKind::Except => {
+                plan_node.except_node = Some(plan_nodes::TExceptNode {
+                    tuple_id: tnode.tuple_id,
+                    result_expr_lists: tnode.result_expr_lists,
+                    const_expr_lists: tnode.const_expr_lists,
+                    first_materialized_child_idx: tnode.first_materialized_child_idx,
+                    local_partition_by_exprs: None,
+                });
+            }
+        }
+
+        Ok((plan_node, output_scope))
+    }
 }
 
 fn first_tuple_id(
@@ -942,6 +3351,91 @@ fn first_tuple_id(
             node.node_id
         )
     })
+}
+
+fn binary_children<'a>(
+    node: &'a super::node::DistributedPlanNode,
+    operator_name: &str,
+) -> Result<
+    (
+        &'a super::node::DistributedPlanNode,
+        &'a super::node::DistributedPlanNode,
+    ),
+    String,
+> {
+    if node.children.len() != 2 {
+        return Err(format!(
+            "DistributedPlan {operator_name} node_id={} expected 2 children, got {}",
+            node.node_id,
+            node.children.len()
+        ));
+    }
+    Ok((&node.children[0], &node.children[1]))
+}
+
+fn analytic_window_from_expr(win_expr: &WindowExpr) -> Option<plan_nodes::TAnalyticWindow> {
+    use crate::sql::analysis::{WindowBound, WindowFrameType};
+
+    win_expr.window_frame.as_ref().map(|frame| {
+        let window_type = match frame.frame_type {
+            WindowFrameType::Rows => plan_nodes::TAnalyticWindowType::ROWS,
+            WindowFrameType::Range => plan_nodes::TAnalyticWindowType::RANGE,
+        };
+        let window_start = match &frame.start {
+            WindowBound::UnboundedPreceding => None,
+            WindowBound::CurrentRow => Some(plan_nodes::TAnalyticWindowBoundary {
+                type_: plan_nodes::TAnalyticWindowBoundaryType::CURRENT_ROW,
+                range_offset_predicate: None,
+                rows_offset_value: None,
+            }),
+            WindowBound::Preceding(n) => Some(plan_nodes::TAnalyticWindowBoundary {
+                type_: plan_nodes::TAnalyticWindowBoundaryType::PRECEDING,
+                range_offset_predicate: None,
+                rows_offset_value: Some(*n),
+            }),
+            WindowBound::Following(n) => Some(plan_nodes::TAnalyticWindowBoundary {
+                type_: plan_nodes::TAnalyticWindowBoundaryType::FOLLOWING,
+                range_offset_predicate: None,
+                rows_offset_value: Some(*n),
+            }),
+            WindowBound::UnboundedFollowing => None,
+        };
+        let window_end = match &frame.end {
+            WindowBound::UnboundedFollowing => None,
+            WindowBound::CurrentRow => Some(plan_nodes::TAnalyticWindowBoundary {
+                type_: plan_nodes::TAnalyticWindowBoundaryType::CURRENT_ROW,
+                range_offset_predicate: None,
+                rows_offset_value: None,
+            }),
+            WindowBound::Following(n) => Some(plan_nodes::TAnalyticWindowBoundary {
+                type_: plan_nodes::TAnalyticWindowBoundaryType::FOLLOWING,
+                range_offset_predicate: None,
+                rows_offset_value: Some(*n),
+            }),
+            WindowBound::Preceding(n) => Some(plan_nodes::TAnalyticWindowBoundary {
+                type_: plan_nodes::TAnalyticWindowBoundaryType::PRECEDING,
+                range_offset_predicate: None,
+                rows_offset_value: Some(*n),
+            }),
+            WindowBound::UnboundedPreceding => None,
+        };
+        plan_nodes::TAnalyticWindow {
+            type_: window_type,
+            window_start,
+            window_end,
+        }
+    })
+}
+
+fn apply_ignore_nulls_to_root_fn(texpr: &mut exprs::TExpr, ignore_nulls: bool) {
+    if !ignore_nulls {
+        return;
+    }
+    if let Some(root) = texpr.nodes.first_mut()
+        && let Some(fn_) = root.fn_.as_mut()
+    {
+        fn_.ignore_nulls = Some(true);
+    }
 }
 
 fn scan_body_to_physical_op(body: &super::body::ScanBody) -> PhysicalScanOp {
@@ -965,6 +3459,114 @@ fn project_body_to_physical_op(body: &super::body::ProjectBody) -> PhysicalProje
     }
 }
 
+fn sort_body_to_physical_op(body: &super::body::SortBody) -> PhysicalSortOp {
+    PhysicalSortOp {
+        items: body.items.clone(),
+        analytic_partition_exprs: body.analytic_partition_exprs.clone(),
+    }
+}
+
+fn top_n_body_to_physical_op(body: &super::body::TopNBody) -> PhysicalTopNOp {
+    PhysicalTopNOp {
+        items: body.items.clone(),
+        limit: body.limit,
+        offset: body.offset,
+        phase: body.phase,
+        is_split: body.is_split,
+    }
+}
+
+fn hash_aggregate_body_to_physical_op(
+    body: &super::body::HashAggregateBody,
+) -> PhysicalHashAggregateOp {
+    PhysicalHashAggregateOp {
+        mode: body.mode,
+        group_by: body.group_by.clone(),
+        aggregates: body.aggregates.clone(),
+        output_columns: body.output_columns.clone(),
+        is_merge: body.is_merge.clone(),
+    }
+}
+
+fn hash_join_body_to_physical_op(body: &super::body::HashJoinBody) -> PhysicalHashJoinOp {
+    PhysicalHashJoinOp {
+        join_type: body.join_type,
+        eq_conditions: body.eq_conditions.clone(),
+        other_condition: body.other_condition.clone(),
+        distribution: body.distribution.clone(),
+    }
+}
+
+fn nest_loop_join_body_to_physical_op(
+    body: &super::body::NestLoopJoinBody,
+) -> PhysicalNestLoopJoinOp {
+    PhysicalNestLoopJoinOp {
+        join_type: body.join_type,
+        condition: body.condition.clone(),
+    }
+}
+
+fn values_body_to_physical_op(body: &super::body::ValuesBody) -> PhysicalValuesOp {
+    PhysicalValuesOp {
+        rows: body.rows.clone(),
+        columns: body.columns.clone(),
+    }
+}
+
+fn assert_one_row_body_to_physical_op(
+    body: &super::body::AssertOneRowBody,
+) -> PhysicalAssertOneRowOp {
+    PhysicalAssertOneRowOp {
+        subquery_text: body.subquery_text.clone(),
+    }
+}
+
+fn decode_body_to_physical_op(body: &super::body::DecodeBody) -> PhysicalDecodeOp {
+    PhysicalDecodeOp {
+        mappings: body.mappings.clone(),
+        output_columns: body.output_columns.clone(),
+    }
+}
+
+fn repeat_body_to_physical_op(body: &super::body::RepeatBody) -> PhysicalRepeatOp {
+    PhysicalRepeatOp {
+        repeat_column_ref_list: body.repeat_column_ref_list.clone(),
+        repeat_column_ref_ids: body.repeat_column_ref_ids.clone(),
+        grouping_ids: body.grouping_ids.clone(),
+        all_rollup_columns: body.all_rollup_columns.clone(),
+        all_rollup_column_ids: body.all_rollup_column_ids.clone(),
+        grouping_key_aliases: body.grouping_key_aliases.clone(),
+        grouping_fn_args: body.grouping_fn_args.clone(),
+        grouping_fn_arg_ids: body.grouping_fn_arg_ids.clone(),
+        grouping_fn_ids: body.grouping_fn_ids.clone(),
+    }
+}
+
+fn generate_series_body_to_physical_op(
+    body: &super::body::GenerateSeriesBody,
+) -> PhysicalGenerateSeriesOp {
+    PhysicalGenerateSeriesOp {
+        start: body.start,
+        end: body.end,
+        step: body.step,
+        column_name: body.column_name.clone(),
+        alias: body.alias.clone(),
+        output_column_id: body.output_column_id,
+    }
+}
+
+fn table_function_body_to_physical_op(
+    body: &super::body::TableFunctionBody,
+) -> PhysicalTableFunctionOp {
+    PhysicalTableFunctionOp {
+        function_name: body.function_name.clone(),
+        args: body.args.clone(),
+        output_columns: body.output_columns.clone(),
+        alias: body.alias.clone(),
+        is_left_join: body.is_left_join,
+    }
+}
+
 fn project_body_output_columns(body: &super::body::ProjectBody) -> Vec<AnalysisOutputColumn> {
     body.items
         .iter()
@@ -982,6 +3584,14 @@ fn result_output_exprs_for_columns(
     scope: &ExprScope,
     output_columns: &[AnalysisOutputColumn],
 ) -> Result<Option<Vec<exprs::TExpr>>, String> {
+    slot_ref_exprs_for_columns(scope, output_columns, "result sink")
+}
+
+pub(in crate::sql::codegen) fn slot_ref_exprs_for_columns(
+    scope: &ExprScope,
+    output_columns: &[AnalysisOutputColumn],
+    context: &str,
+) -> Result<Option<Vec<exprs::TExpr>>, String> {
     if output_columns.is_empty() {
         return Ok(None);
     }
@@ -990,8 +3600,8 @@ fn result_output_exprs_for_columns(
     for column in output_columns {
         let binding = scope.resolve_by_id(column.column_id).ok_or_else(|| {
             format!(
-                "result sink cannot resolve output column `{}` id={}",
-                column.name, column.column_id.0
+                "{} cannot resolve output column `{}` id={}",
+                context, column.name, column.column_id.0
             )
         })?;
         let type_desc = expr_compiler::binding_type_desc(binding)?;
@@ -1067,19 +3677,57 @@ mod tests {
 
     use crate::connector::ConnectorRegistry;
     use crate::connector::iceberg::IcebergMetadataTableType;
+    use crate::lower::type_lowering::arrow_type_from_desc;
     use crate::plan_nodes::TPlanNodeType;
-    use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
+    use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn, ProjectItem, TypedExpr};
     use crate::sql::catalog::{
         CatalogProvider, ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
+    use crate::sql::codegen::expr_compiler::infer_agg_function_types;
     use crate::sql::codegen::fragment_builder::PlanFragmentBuilder;
     use crate::sql::codegen::ir::{
         DataPartition, DataSink, DistributedPlan, PartitionKind, build_distributed_plan,
     };
+    use crate::sql::codegen::resolve::{ColumnBinding, ExprScope};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::operator::{Operator, PhysicalProjectOp, PhysicalScanOp};
+    use crate::sql::optimizer::operator::{
+        JoinDistribution, Operator, PhysicalHashJoinEqCondition, PhysicalHashJoinOp,
+        PhysicalNestLoopJoinOp, PhysicalProjectOp, PhysicalScanOp,
+    };
     use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, PlanExecutionProps};
     use crate::sql::optimizer::statistics::Statistics;
+
+    #[test]
+    fn aggregate_slot_contract_uses_intermediate_only_for_non_finalize() {
+        let (_, avg_intermediate) =
+            infer_agg_function_types("avg", &[DataType::Int64], false).expect("avg types");
+        let avg_intermediate = avg_intermediate.expect("avg intermediate");
+        let contract = super::aggregate_slot_contract_for_phase(
+            false,
+            &DataType::Float64,
+            Some(&avg_intermediate),
+            "avg",
+        )
+        .expect("local avg contract");
+        assert_eq!(contract.data_type, DataType::Utf8);
+        assert_eq!(
+            arrow_type_from_desc(&contract.type_desc),
+            Some(DataType::Utf8)
+        );
+
+        let final_contract = super::aggregate_slot_contract_for_phase(
+            true,
+            &DataType::Float64,
+            Some(&avg_intermediate),
+            "avg",
+        )
+        .expect("final avg contract");
+        assert_eq!(final_contract.data_type, DataType::Float64);
+        assert_eq!(
+            arrow_type_from_desc(&final_contract.type_desc),
+            Some(DataType::Float64)
+        );
+    }
 
     #[test]
     fn build_via_distributed_plan_lowers_project_over_scan() {
@@ -1119,6 +3767,206 @@ mod tests {
                 >= 2,
             "project and scan slots should be registered"
         );
+    }
+
+    #[test]
+    fn null_aware_left_anti_hash_join_exposes_left_scope_and_widens_build_side() {
+        let connectors = ConnectorRegistry::new();
+        let mut state = super::OwnedLoweringState::new(&connectors, None, 0);
+        let (left_column_id, right_column_id, left_key, right_key, left_scope, right_scope) =
+            hash_join_test_inputs(&mut state);
+        let op = PhysicalHashJoinOp {
+            join_type: JoinKind::NullAwareLeftAnti,
+            eq_conditions: vec![PhysicalHashJoinEqCondition {
+                left: left_key,
+                right: right_key,
+                null_safe: false,
+            }],
+            other_condition: None,
+            distribution: JoinDistribution::Broadcast,
+        };
+
+        let (plan_node, scope, tuple_ids) = {
+            let mut ctx = super::LoweringCtx::new(&mut state);
+            ctx.lower_hash_join(10, &[1], &[2], &op, left_scope, right_scope, None, &[])
+                .expect("lower hash join")
+        };
+
+        assert_eq!(tuple_ids, vec![1, 2]);
+        assert!(
+            scope.resolve_by_id(left_column_id).is_some(),
+            "left side should remain visible"
+        );
+        assert!(
+            scope.resolve_by_id(right_column_id).is_none(),
+            "build side should not be visible"
+        );
+        assert_eq!(plan_node.nullable_tuples, vec![false, true]);
+
+        let desc_tbl = state.desc_builder.build();
+        let slots = desc_tbl.slot_descriptors.expect("slot descriptors");
+        let left_slot = slots
+            .iter()
+            .find(|slot| slot.id == Some(11))
+            .expect("left slot descriptor");
+        let right_slot = slots
+            .iter()
+            .find(|slot| slot.id == Some(22))
+            .expect("right slot descriptor");
+        assert_eq!(left_slot.is_nullable, Some(false));
+        assert_eq!(right_slot.is_nullable, Some(true));
+    }
+
+    #[test]
+    fn hash_join_demotes_unbound_eq_to_other_conjunct() {
+        let connectors = ConnectorRegistry::new();
+        let mut state = super::OwnedLoweringState::new(&connectors, None, 0);
+        let (left_column_id, _, _, _, left_scope, right_scope) = hash_join_test_inputs(&mut state);
+        let op = PhysicalHashJoinOp {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![PhysicalHashJoinEqCondition {
+                left: qualified_column_ref(left_column_id, "l", "k", false),
+                right: qualified_column_ref(left_column_id, "l", "k", false),
+                null_safe: false,
+            }],
+            other_condition: None,
+            distribution: JoinDistribution::Broadcast,
+        };
+
+        let plan_node = {
+            let mut ctx = super::LoweringCtx::new(&mut state);
+            ctx.lower_hash_join(10, &[1], &[2], &op, left_scope, right_scope, None, &[])
+                .expect("lower hash join")
+                .0
+        };
+        let hash_join = plan_node.hash_join_node.expect("hash join node");
+        assert!(hash_join.eq_join_conjuncts.is_empty());
+        assert_eq!(
+            hash_join
+                .other_join_conjuncts
+                .as_ref()
+                .expect("demoted conjunct")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn hash_join_compiles_swapped_eq_as_join_conjunct() {
+        let connectors = ConnectorRegistry::new();
+        let mut state = super::OwnedLoweringState::new(&connectors, None, 0);
+        let (_, _, left_key, right_key, left_scope, right_scope) =
+            hash_join_test_inputs(&mut state);
+
+        let op = PhysicalHashJoinOp {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![PhysicalHashJoinEqCondition {
+                left: right_key,
+                right: left_key,
+                null_safe: false,
+            }],
+            other_condition: None,
+            distribution: JoinDistribution::Broadcast,
+        };
+
+        let plan_node = {
+            let mut ctx = super::LoweringCtx::new(&mut state);
+            ctx.lower_hash_join(10, &[1], &[2], &op, left_scope, right_scope, None, &[])
+                .expect("lower hash join")
+                .0
+        };
+        let hash_join = plan_node.hash_join_node.expect("hash join node");
+        assert_eq!(hash_join.eq_join_conjuncts.len(), 1);
+        assert!(hash_join.other_join_conjuncts.is_none());
+    }
+
+    #[test]
+    fn null_aware_left_anti_nest_loop_join_exposes_left_scope_and_widens_build_side() {
+        let connectors = ConnectorRegistry::new();
+        let mut state = super::OwnedLoweringState::new(&connectors, None, 0);
+        let (left_column_id, right_column_id, _, _, left_scope, right_scope) =
+            hash_join_test_inputs(&mut state);
+        let op = PhysicalNestLoopJoinOp {
+            join_type: JoinKind::NullAwareLeftAnti,
+            condition: None,
+        };
+
+        let (plan_node, scope, tuple_ids) = {
+            let mut ctx = super::LoweringCtx::new(&mut state);
+            ctx.lower_nest_loop_join(10, &[1], &[2], &op, left_scope, right_scope)
+                .expect("lower nest loop join")
+        };
+
+        assert_eq!(tuple_ids, vec![1, 2]);
+        assert!(
+            scope.resolve_by_id(left_column_id).is_some(),
+            "left side should remain visible"
+        );
+        assert!(
+            scope.resolve_by_id(right_column_id).is_none(),
+            "build side should not be visible"
+        );
+        assert_eq!(plan_node.nullable_tuples, vec![false, true]);
+
+        let desc_tbl = state.desc_builder.build();
+        let slots = desc_tbl.slot_descriptors.expect("slot descriptors");
+        let left_slot = slots
+            .iter()
+            .find(|slot| slot.id == Some(11))
+            .expect("left slot descriptor");
+        let right_slot = slots
+            .iter()
+            .find(|slot| slot.id == Some(22))
+            .expect("right slot descriptor");
+        assert_eq!(left_slot.is_nullable, Some(false));
+        assert_eq!(right_slot.is_nullable, Some(true));
+    }
+
+    fn hash_join_test_inputs(
+        state: &mut super::OwnedLoweringState<'_>,
+    ) -> (
+        ColumnId,
+        ColumnId,
+        TypedExpr,
+        TypedExpr,
+        ExprScope,
+        ExprScope,
+    ) {
+        state.desc_builder.add_tuple(1, None);
+        state
+            .desc_builder
+            .add_slot(11, 1, "left_k", &DataType::Int64, false, 0);
+        state.desc_builder.add_tuple(2, None);
+        state
+            .desc_builder
+            .add_slot(22, 2, "right_k", &DataType::Int64, false, 0);
+
+        let left_column_id = ColumnId::new_for_test(1);
+        let right_column_id = ColumnId::new_for_test(3);
+        let left_key = qualified_column_ref(left_column_id, "l", "k", false);
+        let right_key = qualified_column_ref(right_column_id, "r", "k", false);
+        let mut left_scope = ExprScope::new();
+        left_scope.add_column_with_id(
+            left_column_id,
+            Some("l".to_string()),
+            "k".to_string(),
+            column_binding(1, 11, false),
+        );
+        let mut right_scope = ExprScope::new();
+        right_scope.add_column_with_id(
+            right_column_id,
+            Some("r".to_string()),
+            "k".to_string(),
+            column_binding(2, 22, false),
+        );
+        (
+            left_column_id,
+            right_column_id,
+            left_key,
+            right_key,
+            left_scope,
+            right_scope,
+        )
     }
 
     #[test]
@@ -1187,6 +4035,33 @@ mod tests {
             err.contains(expected),
             "expected `{expected}` in lowering error `{err}`"
         );
+    }
+
+    fn column_binding(tuple_id: i32, slot_id: i32, nullable: bool) -> ColumnBinding {
+        ColumnBinding {
+            tuple_id,
+            slot_id,
+            data_type: DataType::Int64,
+            type_desc: None,
+            nullable,
+        }
+    }
+
+    fn qualified_column_ref(
+        column_id: ColumnId,
+        qualifier: &str,
+        column: &str,
+        nullable: bool,
+    ) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id,
+                qualifier: Some(qualifier.to_string()),
+                column: column.to_string(),
+            },
+            data_type: DataType::Int64,
+            nullable,
+        }
     }
 
     fn project_over_metadata_scan_plan() -> PhysicalPlanNode {

@@ -1,7 +1,11 @@
 use crate::sql::optimizer::statistics::{Confidence, Statistics};
 
 use super::FragmentId;
-use super::body::{ProjectBody, ScanBody};
+use super::body::{
+    AssertOneRowBody, DecodeBody, GenerateSeriesBody, HashAggregateBody, HashJoinBody,
+    NestLoopJoinBody, ProjectBody, RepeatBody, ScanBody, SetOpBody, SortBody, TableFunctionBody,
+    TopNBody, ValuesBody, WindowBody,
+};
 
 /// Self-contained copy of the estimated stats this node carries, so EXPLAIN /
 /// ANALYZE never reach back into `PhysicalPlanNode`.
@@ -23,8 +27,8 @@ impl PlanNodeStats {
 #[derive(Clone, Debug)]
 pub(crate) struct DistributedPlanNode {
     /// Allocated once in Pass 1; never reallocated. In a thrift-lowered
-    /// fragment every DistributedPlanNode produces exactly one TPlanNode, so
-    /// `node_id == TPlanNode.node_id == profile plan_node_id`.
+    /// fragment most DistributedPlanNode bodies produce exactly one TPlanNode.
+    /// Multi-node bodies use this as the root emitted TPlanNode id.
     pub node_id: i32,
     pub fragment_id: FragmentId,
     /// Output tuples (thrift `row_tuples`). Allocated in Pass 1.
@@ -33,6 +37,10 @@ pub(crate) struct DistributedPlanNode {
     pub nullable_tuple_ids: Vec<i32>,
     /// -1 == no limit.
     pub limit: i64,
+    pub execution_join_distribution:
+        Option<crate::sql::optimizer::physical_plan::JoinExecutionDistribution>,
+    pub build_runtime_filters: Vec<crate::sql::optimizer::runtime_filter_pass::RuntimeFilterDesc>,
+    pub probe_runtime_filters: Vec<crate::sql::optimizer::runtime_filter_pass::RuntimeFilterProbe>,
     pub children: Vec<DistributedPlanNode>,
     pub stats: PlanNodeStats,
     pub body: DistributedPlanNodeBody,
@@ -44,6 +52,19 @@ pub(crate) struct DistributedPlanNode {
 pub(crate) enum DistributedPlanNodeBody {
     Scan(Box<ScanBody>),
     Project(ProjectBody),
+    Sort(SortBody),
+    TopN(TopNBody),
+    HashAggregate(Box<HashAggregateBody>),
+    HashJoin(Box<HashJoinBody>),
+    NestLoopJoin(NestLoopJoinBody),
+    Values(ValuesBody),
+    AssertOneRow(AssertOneRowBody),
+    Decode(DecodeBody),
+    Repeat(Box<RepeatBody>),
+    SetOp(SetOpBody),
+    Window(Box<WindowBody>),
+    GenerateSeries(GenerateSeriesBody),
+    TableFunction(Box<TableFunctionBody>),
 }
 
 #[cfg(test)]

@@ -15,7 +15,6 @@ use arrow::datatypes::DataType;
 
 use crate::data_sinks;
 use crate::exprs;
-use crate::lower::type_lowering::arrow_type_from_desc;
 use crate::partitions;
 use crate::plan_nodes;
 use crate::types;
@@ -28,16 +27,14 @@ use crate::sql::codegen::boundary_schema::{
 };
 use crate::sql::codegen::descriptors::DescriptorTableBuilder;
 use crate::sql::codegen::expr_compiler::{self, ExprCompiler};
-use crate::sql::codegen::helpers::{
-    agg_call_display_name, agg_call_display_name_without_qualifiers, join_kind_to_op,
-    split_and_conjuncts_typed, typed_expr_display_name,
-};
+use crate::sql::codegen::helpers::split_and_conjuncts_typed;
 use crate::sql::codegen::iceberg_write_sink::{
     IcebergWriteSinkSpec, partition_info_from_serialized_metadata,
 };
-use crate::sql::codegen::ir::lowering::LoweringCtx;
+use crate::sql::codegen::ir::lowering::{LoweringCtx, slot_ref_exprs_for_columns};
 use crate::sql::codegen::nodes;
 use crate::sql::codegen::resolve::{ColumnBinding, ExprScope};
+use crate::sql::codegen::runtime_filter_lowering::{RfProbeTarget, remap_rf_expr_order};
 use crate::sql::codegen::type_infer;
 use crate::sql::codegen::{
     DirectExecPlan, FragmentBuildResult, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
@@ -46,17 +43,17 @@ use crate::sql::codegen::{
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::operator::{
-    AggMode, PhysicalAssertOneRowOp, PhysicalCTEAnchorOp, PhysicalCTEConsumeOp,
-    PhysicalCTEProduceOp, PhysicalDecodeOp, PhysicalDistributionOp, PhysicalExceptOp,
-    PhysicalFilterOp, PhysicalGenerateSeriesOp, PhysicalHashAggregateOp, PhysicalHashJoinOp,
-    PhysicalIntersectOp, PhysicalLimitOp, PhysicalNestLoopJoinOp, PhysicalProjectOp,
-    PhysicalRepeatOp, PhysicalScanOp, PhysicalSortOp, PhysicalTableFunctionOp, PhysicalTopNOp,
-    PhysicalUnionOp, PhysicalValuesOp, PhysicalWindowOp,
+    PhysicalAssertOneRowOp, PhysicalCTEAnchorOp, PhysicalCTEConsumeOp, PhysicalCTEProduceOp,
+    PhysicalDecodeOp, PhysicalDistributionOp, PhysicalExceptOp, PhysicalFilterOp,
+    PhysicalGenerateSeriesOp, PhysicalHashAggregateOp, PhysicalHashJoinOp, PhysicalIntersectOp,
+    PhysicalLimitOp, PhysicalNestLoopJoinOp, PhysicalProjectOp, PhysicalRepeatOp, PhysicalScanOp,
+    PhysicalSortOp, PhysicalTableFunctionOp, PhysicalTopNOp, PhysicalUnionOp, PhysicalValuesOp,
+    PhysicalWindowOp,
 };
 use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
 use crate::sql::optimizer::property::{OrderingSpec, window_ordering_spec};
 
-use crate::sql::analysis::{ExprKind, JoinKind, LiteralValue, TypedExpr};
+use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
 use crate::sql::planner::plan::AggregateCall;
 
 // ---------------------------------------------------------------------------
@@ -295,239 +292,6 @@ fn aggregate_state_shaped_data_type(
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-struct AggregateSlotContract {
-    data_type: DataType,
-    type_desc: types::TTypeDesc,
-}
-
-fn aggregate_slot_contract_for_phase(
-    need_finalize: bool,
-    result_type: &DataType,
-    intermediate_type: Option<&DataType>,
-    display_name: &str,
-) -> Result<AggregateSlotContract, String> {
-    let data_type = if need_finalize {
-        result_type.clone()
-    } else {
-        intermediate_type
-            .cloned()
-            .unwrap_or_else(|| result_type.clone())
-    };
-    let type_desc = type_infer::arrow_type_to_type_desc(&data_type)
-        .map_err(|e| format!("aggregate `{display_name}` output type descriptor failed: {e}"))?;
-    Ok(AggregateSlotContract {
-        data_type,
-        type_desc,
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Scan/join ownership metadata (used by RF planning)
-// ---------------------------------------------------------------------------
-
-/// Probe-side target recorded while visiting a node that carries a
-/// `RuntimeFilterProbe` annotation. The build-side hash join (visited AFTER
-/// its probe descendants) looks this up by `filter_id` to wire the RF's
-/// `plan_node_id_to_target_expr` and the probe-side prober params.
-#[derive(Clone, Debug)]
-struct RfProbeTarget {
-    /// Thrift node id of the node that consumes the probe (scan or the
-    /// root thrift node of an intermediate operator's subtree).
-    thrift_node_id: i32,
-    /// Probe key expression compiled against the target node's output scope.
-    probe_texpr: exprs::TExpr,
-    /// Fragment that owns the probe target node.
-    fragment_id: FragmentId,
-}
-
-/// Standalone-mode pipeline DOP used for the RF layout's
-/// `num_drivers_per_instance`. Mirrors the historical post-pass computation.
-fn rf_pipeline_dop() -> i32 {
-    std::thread::available_parallelism()
-        .map(|p| p.get().min(4))
-        .unwrap_or(4) as i32
-}
-
-/// Remap a runtime filter's `expr_order` from the join's PRE-demote
-/// `op.eq_conditions` index space to the POST-demote `eq_join_conjuncts`
-/// index space that BE lowering indexes (`src/lower/node/hash_join.rs`).
-///
-/// `surviving_eq_origin[j]` is the original `op.eq_conditions` index of the
-/// `j`-th surviving (non-demoted) `eq_join_conjuncts` entry — built in
-/// `visit_hash_join` as eq conditions are compiled and kept. Demoted
-/// conditions never get an entry, so the vec is the post-demote conjunct list
-/// keyed by its source index.
-///
-/// Returns:
-/// - `Some(j)` when the RF's original conjunct survived demotion, where `j`
-///   is its post-demote index.
-/// - `None` when the RF's conjunct was demoted to `other_join_conjuncts` (it
-///   is no longer an equi-join key at execution) — the caller MUST drop the RF.
-fn remap_rf_expr_order(
-    surviving_eq_origin: &[usize],
-    pre_demote_expr_order: usize,
-) -> Option<usize> {
-    surviving_eq_origin
-        .iter()
-        .position(|&origin| origin == pre_demote_expr_order)
-}
-
-fn collect_rf_column_refs(expr: &TypedExpr, refs: &mut Vec<(ColumnId, Option<String>, String)>) {
-    match &expr.kind {
-        ExprKind::ColumnRef {
-            column_id,
-            qualifier,
-            column,
-        } => refs.push((*column_id, qualifier.clone(), column.clone())),
-        ExprKind::BinaryOp { left, right, .. } => {
-            collect_rf_column_refs(left, refs);
-            collect_rf_column_refs(right, refs);
-        }
-        ExprKind::UnaryOp { expr, .. }
-        | ExprKind::Cast { expr, .. }
-        | ExprKind::IsNull { expr, .. }
-        | ExprKind::IsTruthValue { expr, .. }
-        | ExprKind::Nested(expr)
-        | ExprKind::LambdaFunction { body: expr, .. }
-        | ExprKind::Lambda { body: expr, .. } => collect_rf_column_refs(expr, refs),
-        ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
-            for arg in args {
-                collect_rf_column_refs(arg, refs);
-            }
-        }
-        ExprKind::InList { expr, list, .. } => {
-            collect_rf_column_refs(expr, refs);
-            for item in list {
-                collect_rf_column_refs(item, refs);
-            }
-        }
-        ExprKind::Between {
-            expr, low, high, ..
-        } => {
-            collect_rf_column_refs(expr, refs);
-            collect_rf_column_refs(low, refs);
-            collect_rf_column_refs(high, refs);
-        }
-        ExprKind::Like { expr, pattern, .. } => {
-            collect_rf_column_refs(expr, refs);
-            collect_rf_column_refs(pattern, refs);
-        }
-        ExprKind::Case {
-            operand,
-            when_then,
-            else_expr,
-            ..
-        } => {
-            if let Some(operand) = operand {
-                collect_rf_column_refs(operand, refs);
-            }
-            for (when, then) in when_then {
-                collect_rf_column_refs(when, refs);
-                collect_rf_column_refs(then, refs);
-            }
-            if let Some(else_expr) = else_expr {
-                collect_rf_column_refs(else_expr, refs);
-            }
-        }
-        ExprKind::WindowCall {
-            args,
-            partition_by,
-            order_by,
-            ..
-        } => {
-            for arg in args {
-                collect_rf_column_refs(arg, refs);
-            }
-            for partition_expr in partition_by {
-                collect_rf_column_refs(partition_expr, refs);
-            }
-            for item in order_by {
-                collect_rf_column_refs(&item.expr, refs);
-            }
-        }
-        ExprKind::Literal(_)
-        | ExprKind::LambdaParamRef { .. }
-        | ExprKind::SubqueryPlaceholder { .. } => {}
-    }
-}
-
-fn rf_build_expr_matches_join_build_expr(candidate: &TypedExpr, expected: &TypedExpr) -> bool {
-    let mut candidate_refs = Vec::new();
-    let mut expected_refs = Vec::new();
-    collect_rf_column_refs(candidate, &mut candidate_refs);
-    collect_rf_column_refs(expected, &mut expected_refs);
-    !expected_refs.is_empty() && candidate_refs == expected_refs
-}
-
-fn join_distribution_mode(
-    node: &PhysicalPlanNode,
-    fallback: &crate::sql::optimizer::operator::JoinDistribution,
-) -> plan_nodes::TJoinDistributionMode {
-    use crate::sql::optimizer::operator::JoinDistribution;
-    use crate::sql::optimizer::physical_plan::JoinExecutionDistribution;
-
-    match node.execution_props.join_distribution {
-        Some(JoinExecutionDistribution::Broadcast) => plan_nodes::TJoinDistributionMode::BROADCAST,
-        Some(JoinExecutionDistribution::Partitioned) => {
-            plan_nodes::TJoinDistributionMode::PARTITIONED
-        }
-        Some(JoinExecutionDistribution::Colocate) => plan_nodes::TJoinDistributionMode::COLOCATE,
-        None => match fallback {
-            JoinDistribution::Broadcast => plan_nodes::TJoinDistributionMode::BROADCAST,
-            JoinDistribution::Shuffle => plan_nodes::TJoinDistributionMode::PARTITIONED,
-            JoinDistribution::Colocate => plan_nodes::TJoinDistributionMode::COLOCATE,
-            JoinDistribution::Unknown => plan_nodes::TJoinDistributionMode::BROADCAST,
-        },
-    }
-}
-
-fn legacy_rf_distribution_to_execution(
-    distribution: &crate::sql::optimizer::operator::JoinDistribution,
-) -> crate::sql::optimizer::physical_plan::JoinExecutionDistribution {
-    use crate::sql::optimizer::operator::JoinDistribution;
-    use crate::sql::optimizer::physical_plan::JoinExecutionDistribution;
-
-    match distribution {
-        JoinDistribution::Broadcast | JoinDistribution::Unknown => {
-            JoinExecutionDistribution::Broadcast
-        }
-        JoinDistribution::Shuffle => JoinExecutionDistribution::Partitioned,
-        JoinDistribution::Colocate => JoinExecutionDistribution::Colocate,
-    }
-}
-
-/// Map execution join distribution to the thrift RF
-/// `(build_join_mode, local_layout, global_layout)` triple.
-fn rf_layout_for_execution_distribution(
-    distribution: crate::sql::optimizer::physical_plan::JoinExecutionDistribution,
-) -> (
-    crate::runtime_filter::TRuntimeFilterBuildJoinMode,
-    crate::runtime_filter::TRuntimeFilterLayoutMode,
-    crate::runtime_filter::TRuntimeFilterLayoutMode,
-) {
-    use crate::runtime_filter::{TRuntimeFilterBuildJoinMode, TRuntimeFilterLayoutMode};
-    use crate::sql::optimizer::physical_plan::JoinExecutionDistribution;
-
-    match distribution {
-        JoinExecutionDistribution::Broadcast => (
-            TRuntimeFilterBuildJoinMode::BORADCAST,
-            TRuntimeFilterLayoutMode::SINGLETON,
-            TRuntimeFilterLayoutMode::SINGLETON,
-        ),
-        JoinExecutionDistribution::Partitioned => (
-            TRuntimeFilterBuildJoinMode::PARTITIONED,
-            TRuntimeFilterLayoutMode::SINGLETON,
-            TRuntimeFilterLayoutMode::GLOBAL_SHUFFLE_1L,
-        ),
-        JoinExecutionDistribution::Colocate => (
-            TRuntimeFilterBuildJoinMode::COLOCATE,
-            TRuntimeFilterLayoutMode::SINGLETON,
-            TRuntimeFilterLayoutMode::GLOBAL_BUCKET_1L,
-        ),
-    }
-}
-
 pub(in crate::sql::codegen) fn iceberg_table_info(
     source: &crate::sql::catalog::ScanSource,
 ) -> Option<&crate::sql::catalog::IcebergTableInfo> {
@@ -698,13 +462,14 @@ pub(crate) struct PlanFragmentBuilder<'a> {
     /// `visit_hash_join` to wire each build descriptor to its probe node.
     /// Probe descendants are always visited before the owning join (children
     /// first), so the lookup is populated by the time the join needs it.
-    rf_probe_targets: HashMap<i32, RfProbeTarget>,
+    pub(in crate::sql::codegen) rf_probe_targets: HashMap<i32, RfProbeTarget>,
     /// Accumulated `filter_id -> TRuntimeFilterDescription` across all joins.
-    rf_all_filters: HashMap<i32, crate::runtime_filter::TRuntimeFilterDescription>,
+    pub(in crate::sql::codegen) rf_all_filters:
+        HashMap<i32, crate::runtime_filter::TRuntimeFilterDescription>,
     /// Accumulated build-side filter ids per fragment (the join's fragment).
-    rf_build_side_filters: HashMap<FragmentId, Vec<i32>>,
+    pub(in crate::sql::codegen) rf_build_side_filters: HashMap<FragmentId, Vec<i32>>,
     /// Accumulated probe-side `(filter_id, probe_target_node_id)` per fragment.
-    rf_probe_side_filters: HashMap<FragmentId, Vec<(i32, i32)>>,
+    pub(in crate::sql::codegen) rf_probe_side_filters: HashMap<FragmentId, Vec<(i32, i32)>>,
 }
 
 impl<'a> PlanFragmentBuilder<'a> {
@@ -1705,7 +1470,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         let decode_tuple_id = self.alloc_tuple();
         let mut decode_scope = ExprScope::new();
         let mut mapping: BTreeMap<i32, i32> = BTreeMap::new();
-        let mut consumed_dict_slots: std::collections::BTreeSet<i32> = Default::default();
+        let mut materialized_dict_slots: BTreeMap<i32, ColumnBinding> = BTreeMap::new();
 
         // Iterate the child's ordered columns. For each child column whose
         // slot id matches a declared dict source slot (`mappings.dict_column`),
@@ -1725,6 +1490,10 @@ impl<'a> PlanFragmentBuilder<'a> {
             if let Some((string_name, data_type, nullable, output_column_id)) =
                 dict_target_meta.get(&child_binding.slot_id)
             {
+                if let Some(binding) = materialized_dict_slots.get(&child_binding.slot_id) {
+                    decode_scope.add_id_alias(*output_column_id, binding.clone());
+                    continue;
+                }
                 // Decoded string output: allocate a NEW slot in the
                 // decode's tuple. The mapping pairs the child's dict
                 // slot with this new string slot.
@@ -1737,21 +1506,22 @@ impl<'a> PlanFragmentBuilder<'a> {
                     *nullable,
                     col_pos,
                 );
-                if consumed_dict_slots.insert(child_binding.slot_id) {
-                    mapping.insert(child_binding.slot_id, string_slot_id);
-                }
+                mapping.insert(child_binding.slot_id, string_slot_id);
+                let output_binding = ColumnBinding {
+                    tuple_id: decode_tuple_id,
+                    slot_id: string_slot_id,
+                    data_type: data_type.clone(),
+                    type_desc: None,
+                    nullable: *nullable,
+                };
+                materialized_dict_slots.insert(child_binding.slot_id, output_binding.clone());
                 decode_scope.add_column_with_id(
                     *output_column_id,
                     None,
                     string_name.clone(),
-                    ColumnBinding {
-                        tuple_id: decode_tuple_id,
-                        slot_id: string_slot_id,
-                        data_type: data_type.clone(),
-                        type_desc: None,
-                        nullable: *nullable,
-                    },
+                    output_binding,
                 );
+                col_pos += 1;
             } else {
                 // Passthrough: re-register the child's slot id under
                 // the decode's new tuple, matching the StarRocks BE
@@ -1780,8 +1550,8 @@ impl<'a> PlanFragmentBuilder<'a> {
                         decode_scope.add_id_alias(*column_id, output_binding.clone());
                     }
                 }
+                col_pos += 1;
             }
-            col_pos += 1;
         }
 
         if mapping.len() != op.mappings.len() {
@@ -1851,184 +1621,39 @@ impl<'a> PlanFragmentBuilder<'a> {
     ) -> Result<VisitResult, String> {
         let left = self.visit(&node.children[0])?;
         let right = self.visit(&node.children[1])?;
-
-        let join_op = join_kind_to_op(op.join_type);
         let join_node_id = self.alloc_node();
-
-        // Compile eq conditions.  Pairs are pre-oriented by JoinToHashJoin so
-        // that pair.0 references the left child and pair.1 references the right
-        // in the common case.  However, orientation can fail when the same
-        // column name appears in both children (e.g. self-join on a CTE) or
-        // when logical_props is missing for a child group.  We therefore try
-        // the natural order first, then the swapped order as a fallback, and
-        // demote only when neither compiles successfully.
-        let mut eq_join_conjuncts = Vec::new();
-        let mut demoted_eq_exprs: Vec<crate::sql::analysis::TypedExpr> = Vec::new();
-        // Parallel to `eq_join_conjuncts`: `surviving_eq_origin[j]` is the
-        // original `op.eq_conditions` index of the j-th surviving conjunct.
-        // Demoted conditions get no entry, so this lets runtime-filter lowering
-        // remap the physical pass's pre-demote `expr_order` onto the post-demote
-        // conjunct index that BE lowering uses. See `remap_rf_expr_order`.
-        let mut surviving_eq_origin: Vec<usize> = Vec::new();
-        let mut surviving_eq_build_exprs: Vec<TypedExpr> = Vec::new();
-        for (eq_index, eq) in op.eq_conditions.iter().enumerate() {
-            let expr_a = &eq.left;
-            let expr_b = &eq.right;
-            // Try natural order: expr_a on left, expr_b on right.
-            let natural = ExprCompiler::new_strict_id(self.slot_allocator(), &left.scope)
-                .compile_typed(expr_a)
-                .ok()
-                .and_then(|lt| {
-                    ExprCompiler::new_strict_id(self.slot_allocator(), &right.scope)
-                        .compile_typed(expr_b)
-                        .ok()
-                        .map(|rt| (lt, rt, expr_b.clone()))
-                });
-            // Try swapped order: expr_b on left, expr_a on right.
-            // Needed when JoinCommutativity swapped children but the
-            // eq_condition columns still reference the original order.
-            let result = natural.or_else(|| {
-                ExprCompiler::new_strict_id(self.slot_allocator(), &left.scope)
-                    .compile_typed(expr_b)
-                    .ok()
-                    .and_then(|lt| {
-                        ExprCompiler::new_strict_id(self.slot_allocator(), &right.scope)
-                            .compile_typed(expr_a)
-                            .ok()
-                            .map(|rt| (lt, rt, expr_a.clone()))
-                    })
-            });
-            if let Some((lt, rt, build_expr)) = result {
-                eq_join_conjuncts.push(plan_nodes::TEqJoinCondition {
-                    left: lt,
-                    right: rt,
-                    opcode: Some(if eq.null_safe {
-                        crate::opcodes::TExprOpcode::EQ_FOR_NULL
-                    } else {
-                        crate::opcodes::TExprOpcode::EQ
-                    }),
-                });
-                surviving_eq_origin.push(eq_index);
-                surviving_eq_build_exprs.push(build_expr);
-            } else {
-                // Both sides belong to the same child — demote to other_condition
-                // compiled with a merged scope.
-                demoted_eq_exprs.push(crate::sql::analysis::TypedExpr {
-                    kind: crate::sql::analysis::ExprKind::BinaryOp {
-                        left: Box::new(expr_a.clone()),
-                        op: if eq.null_safe {
-                            crate::sql::analysis::BinOp::EqForNull
-                        } else {
-                            crate::sql::analysis::BinOp::Eq
-                        },
-                        right: Box::new(expr_b.clone()),
-                    },
-                    data_type: arrow::datatypes::DataType::Boolean,
-                    nullable: false,
-                });
-            }
-        }
-
-        // Compile other conditions (including any eq pairs demoted above).
-        let mut other_join_conjuncts = Vec::new();
-        {
-            let mut merged = ExprScope::new();
-            merged.merge(&left.scope);
-            merged.merge(&right.scope);
-            let mut compiler = ExprCompiler::new(self.slot_allocator(), &merged);
-            for demoted in &demoted_eq_exprs {
-                other_join_conjuncts.push(compiler.compile_typed(demoted)?);
-            }
-            if let Some(ref cond) = op.other_condition {
-                other_join_conjuncts.push(compiler.compile_typed(cond)?);
-            }
-        }
-
-        let distribution_mode = join_distribution_mode(node, &op.distribution);
-        let mut join_plan_node = nodes::build_hash_join_node(
-            join_node_id,
-            &left.tuple_ids,
-            &right.tuple_ids,
-            join_op,
-            distribution_mode,
-            eq_join_conjuncts,
-            other_join_conjuncts,
-        );
-
-        // OQ-5: lower the runtime-filter annotations the physical-tree pass
-        // attached to this join into thrift `TRuntimeFilterDescription`s and
-        // patch them onto the join node. Compiled here while `right.scope`
-        // (the build side) is still available — it is moved into the merged
-        // output scope further below. `surviving_eq_origin` remaps each RF's
-        // pre-demote `expr_order` onto the post-demote `eq_join_conjuncts`
-        // index that BE lowering indexes.
-        let rf_descs = self.build_rf_descriptors(
-            node,
-            join_node_id,
-            &right.scope,
-            &surviving_eq_origin,
-            &surviving_eq_build_exprs,
-        )?;
-        if !rf_descs.is_empty()
-            && let Some(hj) = join_plan_node.hash_join_node.as_mut()
-        {
-            hj.build_runtime_filters = Some(rf_descs);
-        }
-
-        // Widen nullable flags on the join's null-producing side(s). Note: this
-        // is the tuple-level widening needed by the descriptor table and the
-        // runtime's null-padding for SEMI/ANTI pruned columns. The authoritative
-        // source of column-level nullability is `node.output_columns`, populated
-        // by stats::derive_output_columns via widen_for_join_kind. This match
-        // intentionally mirrors that widening at the tuple level — a per-slot
-        // nullability mechanism would let us drive both from output_columns,
-        // but is out of scope here.
-        match op.join_type {
-            JoinKind::LeftOuter | JoinKind::LeftAnti | JoinKind::LeftSemi => {
-                for &tid in &right.tuple_ids {
-                    self.desc_builder.widen_tuple_nullable(tid);
-                }
-            }
-            JoinKind::RightOuter | JoinKind::RightAnti | JoinKind::RightSemi => {
-                for &tid in &left.tuple_ids {
-                    self.desc_builder.widen_tuple_nullable(tid);
-                }
-            }
-            JoinKind::FullOuter => {
-                for &tid in &left.tuple_ids {
-                    self.desc_builder.widen_tuple_nullable(tid);
-                }
-                for &tid in &right.tuple_ids {
-                    self.desc_builder.widen_tuple_nullable(tid);
-                }
-            }
-            _ => {}
-        }
-
-        // tuple_ids always includes both sides — the join node's row_tuples
-        // must reference all probe and build tuples.
-        let mut merged_tuple_ids = left.tuple_ids.clone();
-        merged_tuple_ids.extend(&right.tuple_ids);
-
-        // Output scope: SEMI/ANTI joins only expose the surviving side's
-        // columns to downstream operators (preventing stale column
-        // references when multiple SEMI joins are chained).
-        let merged_scope = match op.join_type {
-            JoinKind::LeftSemi | JoinKind::LeftAnti => left.scope,
-            JoinKind::RightSemi | JoinKind::RightAnti => right.scope,
-            _ => {
-                let mut scope = left.scope;
-                scope.merge(&right.scope);
-                scope
-            }
-        };
+        let VisitResult {
+            plan_nodes: left_plan_nodes,
+            scope: left_scope,
+            tuple_ids: left_tuple_ids,
+            cte_exchange_nodes: left_cte_exchange_nodes,
+            ..
+        } = left;
+        let VisitResult {
+            plan_nodes: right_plan_nodes,
+            scope: right_scope,
+            tuple_ids: right_tuple_ids,
+            cte_exchange_nodes: right_cte_exchange_nodes,
+            ..
+        } = right;
+        let (join_plan_node, merged_scope, merged_tuple_ids) =
+            self.lowering_ctx().lower_hash_join(
+                join_node_id,
+                &left_tuple_ids,
+                &right_tuple_ids,
+                op,
+                left_scope,
+                right_scope,
+                node.execution_props.join_distribution,
+                &node.build_runtime_filters,
+            )?;
 
         // Pre-order: join node, then left subtree, then right subtree
         let mut plan_nodes = vec![join_plan_node];
-        plan_nodes.extend(left.plan_nodes);
-        plan_nodes.extend(right.plan_nodes);
-        let mut cte_exchange_nodes = left.cte_exchange_nodes;
-        cte_exchange_nodes.extend(right.cte_exchange_nodes);
+        plan_nodes.extend(left_plan_nodes);
+        plan_nodes.extend(right_plan_nodes);
+        let mut cte_exchange_nodes = left_cte_exchange_nodes;
+        cte_exchange_nodes.extend(right_cte_exchange_nodes);
 
         Ok(VisitResult {
             plan_nodes,
@@ -2037,176 +1662,6 @@ impl<'a> PlanFragmentBuilder<'a> {
             cte_exchange_nodes,
             ordering: OrderingSpec::Any,
         })
-    }
-
-    // -------------------------------------------------------------------
-    // Runtime filter lowering (OQ-5)
-    // -------------------------------------------------------------------
-
-    /// Lower the build-side runtime-filter annotations on `node` into thrift
-    /// `TRuntimeFilterDescription`s and accumulate the coordinator-facing RF
-    /// maps. Each build key is compiled fresh against `build_scope` (the join's
-    /// right child scope) to avoid index drift with the eq-conjunct demote
-    /// dance. The probe target (node id + compiled probe expr) is looked up
-    /// from `rf_probe_targets`, populated while visiting the probe descendants
-    /// before this join. A descriptor with no recorded probe target is a
-    /// build-only RF (empty `plan_node_id_to_target_expr`).
-    ///
-    /// `surviving_eq_origin` is the parallel vec from `visit_hash_join` that
-    /// maps each surviving `eq_join_conjuncts` entry back to its source
-    /// `op.eq_conditions` index. The physical pass records `rf.expr_order` in
-    /// the PRE-demote `op.eq_conditions` space, but BE lowering indexes the
-    /// POST-demote `eq_join_conjuncts` (and the build/probe key + null-safe
-    /// vectors derived from it). We therefore remap every descriptor's
-    /// `expr_order` through `surviving_eq_origin` and DROP any RF whose source
-    /// conjunct was demoted to `other_join_conjuncts` (no longer an equi-key).
-    fn build_rf_descriptors(
-        &mut self,
-        node: &PhysicalPlanNode,
-        join_node_id: i32,
-        build_scope: &ExprScope,
-        surviving_eq_origin: &[usize],
-        surviving_eq_build_exprs: &[TypedExpr],
-    ) -> Result<Vec<crate::runtime_filter::TRuntimeFilterDescription>, String> {
-        use crate::runtime_filter;
-
-        if node.build_runtime_filters.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let pipeline_dop = rf_pipeline_dop();
-        let join_fragment = self.current_fragment_id()?;
-        let mut descs: Vec<runtime_filter::TRuntimeFilterDescription> =
-            Vec::with_capacity(node.build_runtime_filters.len());
-
-        for rf in &node.build_runtime_filters {
-            let filter_id = rf.filter_id;
-
-            // Remap the physical pass's pre-demote `expr_order` onto the
-            // post-demote `eq_join_conjuncts` index that BE lowering indexes.
-            // If the source conjunct was demoted to `other_join_conjuncts`,
-            // it is no longer an equi-join key at execution — drop the RF
-            // entirely rather than emit a descriptor BE cannot align.
-            let Some(post_demote_expr_order) =
-                remap_rf_expr_order(surviving_eq_origin, rf.expr_order)
-            else {
-                continue;
-            };
-            // Defensive: never emit a descriptor whose `expr_order` is out of
-            // range for the join's `eq_join_conjuncts` (BE would Err on it).
-            // `remap_rf_expr_order` returns a position within
-            // `surviving_eq_origin`, whose length equals `eq_join_conjuncts`,
-            // so this can only trip on a future invariant break.
-            if post_demote_expr_order >= surviving_eq_origin.len() {
-                continue;
-            }
-            let Some(expected_build_expr) = surviving_eq_build_exprs.get(post_demote_expr_order)
-            else {
-                continue;
-            };
-            if !rf_build_expr_matches_join_build_expr(&rf.build_expr, expected_build_expr) {
-                tracing::debug!(
-                    "skip runtime filter {filter_id}: build expr does not match join build key"
-                );
-                continue;
-            }
-
-            // The build key MUST be the equi-join side that binds the build
-            // (right) child's scope. Invalid RF descriptors are skipped rather
-            // than reinterpreted with the probe key, because the optimizer RF
-            // descriptor is the source of truth for build/probe semantics.
-            let build_texpr = match ExprCompiler::new(self.slot_allocator(), build_scope)
-                .compile_typed(&rf.build_expr)
-            {
-                Ok(t) => t,
-                Err(err) => {
-                    tracing::debug!(
-                        "skip runtime filter {filter_id}: build expr does not bind build scope: {err}"
-                    );
-                    continue;
-                }
-            };
-
-            // Probe target recorded while visiting the probe descendants. When
-            // children were swapped relative to the eq labeling, the annotation
-            // pass pushed the probe expr down the wrong child (it could not bind
-            // by ColumnId), so no target was recorded — the descriptor is then
-            // build-only with an empty target map (matches StarRocks "no probe
-            // target").
-            let probe_target = self.rf_probe_targets.get(&filter_id).cloned();
-            let has_remote_targets = probe_target
-                .as_ref()
-                .map(|t| t.fragment_id != join_fragment)
-                .unwrap_or(false);
-
-            let execution_distribution = node
-                .execution_props
-                .join_distribution
-                .unwrap_or_else(|| legacy_rf_distribution_to_execution(&rf.distribution));
-            let (build_join_mode, local_layout, global_layout) =
-                rf_layout_for_execution_distribution(execution_distribution);
-
-            let layout = runtime_filter::TRuntimeFilterLayout::new(
-                filter_id,
-                local_layout,
-                global_layout,
-                false,            // pipeline_level_multi_partitioned
-                1_i32,            // num_instances
-                pipeline_dop,     // num_drivers_per_instance
-                None::<Vec<i32>>, // bucketseq_to_instance
-                None::<Vec<i32>>, // bucketseq_to_driverseq
-                None::<Vec<i32>>, // bucketseq_to_partition
-                None::<Vec<crate::partitions::TBucketProperty>>, // bucket_properties
-            );
-
-            // Probe targets: one entry per placed probe; empty for build-only.
-            let mut target_map = BTreeMap::new();
-            if let Some(target) = &probe_target {
-                target_map.insert(target.thrift_node_id, target.probe_texpr.clone());
-            }
-
-            let desc = runtime_filter::TRuntimeFilterDescription::new(
-                filter_id,                                              // filter_id
-                build_texpr,                                            // build_expr
-                post_demote_expr_order as i32,                          // expr_order
-                target_map,                                 // plan_node_id_to_target_expr
-                has_remote_targets,                         // has_remote_targets
-                None::<i64>,                                // bloom_filter_size
-                None::<Vec<crate::types::TNetworkAddress>>, // runtime_filter_merge_nodes
-                build_join_mode,                            // build_join_mode
-                None::<crate::types::TUniqueId>,            // sender_finst_id
-                join_node_id,                               // build_plan_node_id
-                None::<Vec<crate::types::TUniqueId>>,       // broadcast_grf_senders
-                None::<Vec<runtime_filter::TRuntimeFilterDestination>>, // broadcast_grf_destinations
-                None::<Vec<i32>>,                                       // bucketseq_to_instance
-                None::<BTreeMap<i32, Vec<exprs::TExpr>>>, // plan_node_id_to_partition_by_exprs
-                runtime_filter::TRuntimeFilterBuildType::JOIN_FILTER, // filter_type
-                layout,                                   // layout
-                None::<bool>,                             // build_from_group_execution
-                None::<bool>,                             // is_broad_cast_join_in_skew
-                None::<i32>,                              // skew_shuffle_filter_id
-                None::<bool>,                             // is_asc
-                None::<bool>,                             // is_nulls_first
-                None::<i64>,                              // limit
-            );
-
-            descs.push(desc.clone());
-
-            // Accumulate coordinator-facing RF maps.
-            self.rf_all_filters.insert(filter_id, desc);
-            self.rf_build_side_filters
-                .entry(join_fragment)
-                .or_default()
-                .push(filter_id);
-            if let Some(target) = &probe_target {
-                self.rf_probe_side_filters
-                    .entry(target.fragment_id)
-                    .or_default()
-                    .push((filter_id, target.thrift_node_id));
-            }
-        }
-
-        Ok(descs)
     }
 
     // -------------------------------------------------------------------
@@ -2220,76 +1675,36 @@ impl<'a> PlanFragmentBuilder<'a> {
     ) -> Result<VisitResult, String> {
         let left = self.visit(&node.children[0])?;
         let right = self.visit(&node.children[1])?;
-
-        let join_op = join_kind_to_op(op.join_type);
         let join_node_id = self.alloc_node();
-
-        let join_conjuncts = if let Some(ref cond) = op.condition {
-            let mut merged = ExprScope::new();
-            merged.merge(&left.scope);
-            merged.merge(&right.scope);
-            let conjuncts = split_and_conjuncts_typed(cond);
-            let mut results = Vec::new();
-            for conj in conjuncts {
-                let mut compiler = ExprCompiler::new(self.slot_allocator(), &merged);
-                results.push(compiler.compile_typed(conj)?);
-            }
-            results
-        } else {
-            vec![]
-        };
-
-        let join_plan_node = nodes::build_nestloop_join_node(
-            join_node_id,
-            &left.tuple_ids,
-            &right.tuple_ids,
-            join_op,
-            join_conjuncts,
-        );
-
-        // Widen nullable for outer/anti join nullable side tuples.
-        match op.join_type {
-            JoinKind::LeftOuter | JoinKind::LeftAnti => {
-                for &tid in &right.tuple_ids {
-                    self.desc_builder.widen_tuple_nullable(tid);
-                }
-            }
-            JoinKind::RightOuter | JoinKind::RightAnti => {
-                for &tid in &left.tuple_ids {
-                    self.desc_builder.widen_tuple_nullable(tid);
-                }
-            }
-            JoinKind::FullOuter => {
-                for &tid in &left.tuple_ids {
-                    self.desc_builder.widen_tuple_nullable(tid);
-                }
-                for &tid in &right.tuple_ids {
-                    self.desc_builder.widen_tuple_nullable(tid);
-                }
-            }
-            _ => {}
-        }
-
-        // tuple_ids always includes both sides for the join node.
-        let mut merged_tuple_ids = left.tuple_ids.clone();
-        merged_tuple_ids.extend(&right.tuple_ids);
-
-        // Output scope: SEMI/ANTI only expose surviving side.
-        let merged_scope = match op.join_type {
-            JoinKind::LeftSemi | JoinKind::LeftAnti => left.scope,
-            JoinKind::RightSemi | JoinKind::RightAnti => right.scope,
-            _ => {
-                let mut scope = left.scope;
-                scope.merge(&right.scope);
-                scope
-            }
-        };
+        let VisitResult {
+            plan_nodes: left_plan_nodes,
+            scope: left_scope,
+            tuple_ids: left_tuple_ids,
+            cte_exchange_nodes: left_cte_exchange_nodes,
+            ..
+        } = left;
+        let VisitResult {
+            plan_nodes: right_plan_nodes,
+            scope: right_scope,
+            tuple_ids: right_tuple_ids,
+            cte_exchange_nodes: right_cte_exchange_nodes,
+            ..
+        } = right;
+        let (join_plan_node, merged_scope, merged_tuple_ids) =
+            self.lowering_ctx().lower_nest_loop_join(
+                join_node_id,
+                &left_tuple_ids,
+                &right_tuple_ids,
+                op,
+                left_scope,
+                right_scope,
+            )?;
 
         let mut plan_nodes = vec![join_plan_node];
-        plan_nodes.extend(left.plan_nodes);
-        plan_nodes.extend(right.plan_nodes);
-        let mut cte_exchange_nodes = left.cte_exchange_nodes;
-        cte_exchange_nodes.extend(right.cte_exchange_nodes);
+        plan_nodes.extend(left_plan_nodes);
+        plan_nodes.extend(right_plan_nodes);
+        let mut cte_exchange_nodes = left_cte_exchange_nodes;
+        cte_exchange_nodes.extend(right_cte_exchange_nodes);
 
         Ok(VisitResult {
             plan_nodes,
@@ -2310,183 +1725,15 @@ impl<'a> PlanFragmentBuilder<'a> {
         node: &PhysicalPlanNode,
     ) -> Result<VisitResult, String> {
         let child = self.visit(&node.children[0])?;
-        let need_finalize = matches!(op.mode, AggMode::Single | AggMode::Global);
 
         let agg_tuple_id = self.alloc_tuple();
         let agg_node_id = self.alloc_node();
-
-        let mut agg_scope = ExprScope::new();
-        let mut grouping_exprs = Vec::new();
-
-        // Compile GROUP BY expressions (same for all modes — the child scope
-        // has the correct columns for both scan-level and Local-output contexts).
-        for (idx, gb_expr) in op.group_by.iter().enumerate() {
-            let mut compiler = ExprCompiler::new(self.slot_allocator(), &child.scope);
-            let texpr = compiler.compile_typed(gb_expr)?;
-            let data_type = gb_expr.data_type.clone();
-            let nullable = gb_expr.nullable;
-            let name = typed_expr_display_name(gb_expr);
-            let slot_id = self.alloc_slot();
-            let slot_type_desc = texpr
-                .nodes
-                .first()
-                .map(|root| root.type_.clone())
-                .ok_or_else(|| format!("group by expr `{name}` compiled to empty TExpr"))?;
-            self.desc_builder.add_slot_with_type_desc(
-                slot_id,
-                agg_tuple_id,
-                &name,
-                slot_type_desc.clone(),
-                nullable,
-                idx as i32,
-            );
-            let binding = ColumnBinding {
-                tuple_id: agg_tuple_id,
-                slot_id,
-                data_type: data_type.clone(),
-                type_desc: Some(slot_type_desc),
-                nullable,
-            };
-            let gb_column_id = op
-                .output_columns
-                .get(idx)
-                .map(|col| col.column_id)
-                .unwrap_or_else(|| match &gb_expr.kind {
-                    ExprKind::ColumnRef { column_id, .. } => *column_id,
-                    _ => crate::sql::column_id::ColumnId::UNSET,
-                });
-            agg_scope.add_column_with_id(gb_column_id, None, name, binding.clone());
-            if let ExprKind::ColumnRef {
-                qualifier: Some(ref q),
-                ref column,
-                ..
-            } = gb_expr.kind
-            {
-                let _ = (q, column, binding);
-            }
-            // Propagate dict registration through the aggregate's group-
-            // by output: when the group-by is a passthrough ColumnRef of
-            // a dict-encoded source slot, the new agg output slot also
-            // carries dict ids. Re-register the TGlobalDict on the new
-            // slot so a downstream Decode (in this or a parent fragment
-            // post-exchange) resolves its `dict_id_to_string_ids` key.
-            if let ExprKind::ColumnRef { column_id, .. } = gb_expr.kind
-                && let Some(child_binding) = child.scope.resolve_by_id(column_id)
-            {
-                let source_slot_id = child_binding.slot_id;
-                self.propagate_dict_to_slot(source_slot_id, slot_id);
-            }
-            grouping_exprs.push(texpr);
-        }
-
-        // Compile aggregate function expressions — mode-dependent.
-        let agg_start_col = op.group_by.len();
-        let mut aggregate_functions = Vec::new();
-
-        debug_assert_eq!(
-            op.is_merge.len(),
-            op.aggregates.len(),
-            "PhysicalHashAggregate (node_id={}): is_merge.len() = {}, aggregates.len() = {}",
-            agg_node_id,
-            op.is_merge.len(),
-            op.aggregates.len(),
-        );
-
-        for (idx, agg_call) in op.aggregates.iter().enumerate() {
-            let texpr = if op.is_merge[idx] {
-                // Global (merge) phase: the child scope contains the Local's
-                // output.  Each intermediate aggregate column sits at position
-                // group_by.len() + idx in the child scope's ordered columns.
-                let child_columns: Vec<_> = child.scope.iter_columns().collect();
-                let child_col_idx = agg_start_col + idx;
-                let (_, binding) = child_columns.get(child_col_idx).ok_or_else(|| {
-                    format!(
-                        "Global agg: child scope missing intermediate column at index {}",
-                        child_col_idx
-                    )
-                })?;
-                let mut compiler = ExprCompiler::new(self.slot_allocator(), &child.scope);
-                compiler.compile_merge_aggregate_call(
-                    agg_call,
-                    binding.slot_id,
-                    binding.tuple_id,
-                    &binding.data_type,
-                )?
-            } else {
-                // Single or Local: compile against child scope normally.
-                let mut compiler = ExprCompiler::new(self.slot_allocator(), &child.scope);
-                compiler.compile_aggregate_call_typed(agg_call).map_err(|err| {
-                    let available = child
-                        .scope
-                        .iter_columns()
-                        .map(|(name, _)| name.clone())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    format!(
-                        "failed to compile aggregate `{}` in {:?} mode against child scope [{}]: {}",
-                        agg_call_display_name(agg_call),
-                        op.mode,
-                        available,
-                        err
-                    )
-                })?
-            };
-
-            let nullable = true;
-            let name = agg_call_display_name(agg_call);
-            let intermediate_type = texpr
-                .nodes
-                .first()
-                .and_then(|root| root.fn_.as_ref())
-                .and_then(|func| func.aggregate_fn.as_ref())
-                .and_then(|agg_fn| arrow_type_from_desc(&agg_fn.intermediate_type));
-            let slot_contract = aggregate_slot_contract_for_phase(
-                need_finalize,
-                &agg_call.result_type,
-                intermediate_type.as_ref(),
-                &name,
-            )?;
-            let data_type = slot_contract.data_type.clone();
-            let slot_type_desc = slot_contract.type_desc.clone();
-            let slot_id = self.alloc_slot();
-            let col_pos = (agg_start_col + idx) as i32;
-            self.desc_builder.add_slot_with_type_desc(
-                slot_id,
-                agg_tuple_id,
-                &name,
-                slot_type_desc.clone(),
-                nullable,
-                col_pos,
-            );
-            let binding = ColumnBinding {
-                tuple_id: agg_tuple_id,
-                slot_id,
-                data_type,
-                type_desc: Some(slot_type_desc),
-                nullable,
-            };
-            agg_scope.add_column_with_id(
-                agg_call.output_column_id,
-                None,
-                name.clone(),
-                binding.clone(),
-            );
-            let unqualified_name = agg_call_display_name_without_qualifiers(agg_call);
-            if !unqualified_name.eq_ignore_ascii_case(&name) {
-                let _ = unqualified_name;
-            }
-            aggregate_functions.push(texpr);
-        }
-
-        self.desc_builder.add_tuple(agg_tuple_id, None);
-        let agg_plan_node = nodes::build_aggregation_node(
+        let (agg_plan_node, agg_scope) = self.lowering_ctx().lower_hash_aggregate(
             agg_node_id,
             agg_tuple_id,
-            agg_tuple_id,
-            grouping_exprs,
-            aggregate_functions,
-            need_finalize,
-        );
+            op,
+            &child.scope,
+        )?;
 
         // Pre-order: agg first, then child nodes
         let mut plan_nodes = vec![agg_plan_node];
@@ -2521,78 +1768,14 @@ impl<'a> PlanFragmentBuilder<'a> {
         // output (no Gather), we must pass every tuple through, otherwise
         // the lowering layout-match check at `lower/node/sort.rs:306` fails
         // with `output column count mismatch`.
-
-        let mut ordering_exprs = Vec::new();
-        let mut is_asc = Vec::new();
-        let mut nulls_first_list = Vec::new();
-
-        for item in &op.items {
-            let mut compiler = ExprCompiler::new(self.slot_allocator(), &child.scope);
-            let texpr = compiler.compile_typed(&item.expr)?;
-            ordering_exprs.push(texpr);
-            is_asc.push(item.asc);
-            nulls_first_list.push(item.nulls_first);
-        }
-
-        // Compile analytic-partition exprs (set when this Sort precedes a
-        // Window). Emitting them as TSortNode.analytic_partition_exprs tells
-        // the pipeline engine to run sort locally per partition instead of
-        // doing a global merge — matching StarRocks's parallel analytic
-        // sort behaviour. Empty for plain ORDER BY.
-        let analytic_partition_exprs = if op.analytic_partition_exprs.is_empty() {
-            None
-        } else {
-            let mut out = Vec::with_capacity(op.analytic_partition_exprs.len());
-            for expr in &op.analytic_partition_exprs {
-                let mut compiler = ExprCompiler::new(self.slot_allocator(), &child.scope);
-                out.push(compiler.compile_typed(expr)?);
-            }
-            Some(out)
-        };
-
-        let sort_info = plan_nodes::TSortInfo::new(
-            ordering_exprs,
-            is_asc,
-            nulls_first_list,
-            self.slot_ref_exprs_for_columns(&child.scope, &node.output_columns, "Sort")?,
-        );
-        let sort_tuple_slot_exprs = sort_info.sort_tuple_slot_exprs.clone();
-
-        let mut sort_plan_node = nodes::default_plan_node();
-        sort_plan_node.node_id = sort_node_id;
-        sort_plan_node.node_type = plan_nodes::TPlanNodeType::SORT_NODE;
-        sort_plan_node.num_children = 1;
-        sort_plan_node.limit = -1;
-        sort_plan_node.row_tuples = child.tuple_ids.clone();
-        sort_plan_node.nullable_tuples = vec![];
-        sort_plan_node.compact_data = true;
-        sort_plan_node.sort_node = Some(plan_nodes::TSortNode {
-            sort_info,
-            use_top_n: false,
-            offset: None,
-            ordering_exprs: None,
-            is_asc_order: None,
-            is_default_limit: None,
-            nulls_first: None,
-            sort_tuple_slot_exprs,
-            has_outer_join_child: None,
-            sql_sort_keys: None,
-            analytic_partition_exprs,
-            partition_exprs: None,
-            partition_limit: None,
-            topn_type: None,
-            build_runtime_filters: None,
-            max_buffered_rows: None,
-            max_buffered_bytes: None,
-            late_materialization: None,
-            enable_parallel_merge: None,
-            analytic_partition_skewed: None,
-            pre_agg_exprs: None,
-            pre_agg_output_slot_id: None,
-            pre_agg_insert_local_shuffle: None,
-            parallel_merge_late_materialize_mode: None,
-            per_pipeline: None,
-        });
+        let sort_plan_node = self.lowering_ctx().lower_sort(
+            sort_node_id,
+            op,
+            &child.scope,
+            &child.tuple_ids,
+            &node.output_columns,
+            None,
+        )?;
 
         // Pre-order: sort first, then child
         let mut plan_nodes = vec![sort_plan_node];
@@ -4188,35 +3371,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         scope: &ExprScope,
         output_columns: &[crate::sql::analysis::OutputColumn],
     ) -> Result<Option<Vec<exprs::TExpr>>, String> {
-        self.slot_ref_exprs_for_columns(scope, output_columns, "result sink")
-    }
-
-    fn slot_ref_exprs_for_columns(
-        &self,
-        scope: &ExprScope,
-        output_columns: &[crate::sql::analysis::OutputColumn],
-        context: &str,
-    ) -> Result<Option<Vec<exprs::TExpr>>, String> {
-        if output_columns.is_empty() {
-            return Ok(None);
-        }
-
-        let mut exprs = Vec::with_capacity(output_columns.len());
-        for column in output_columns {
-            let binding = scope.resolve_by_id(column.column_id).ok_or_else(|| {
-                format!(
-                    "{} cannot resolve output column `{}` id={}",
-                    context, column.name, column.column_id.0
-                )
-            })?;
-            let type_desc = expr_compiler::binding_type_desc(binding)?;
-            exprs.push(expr_compiler::build_slot_ref_texpr(
-                binding.slot_id,
-                binding.tuple_id,
-                type_desc,
-            ));
-        }
-        Ok(Some(exprs))
+        slot_ref_exprs_for_columns(scope, output_columns, "result sink")
     }
 
     fn visit_distribution(
@@ -4409,6 +3564,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             return self.visit_set_op_common(
                 node,
                 &op.output_columns,
+                &op.child_output_columns,
                 plan_nodes::TPlanNodeType::UNION_NODE,
                 |plan_node, tnode| {
                     plan_node.union_node = Some(tnode);
@@ -4466,6 +3622,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         self.visit_set_op_common(
             node,
             &op.output_columns,
+            &op.child_output_columns,
             plan_nodes::TPlanNodeType::INTERSECT_NODE,
             |plan_node, tnode| {
                 plan_node.intersect_node = Some(plan_nodes::TIntersectNode {
@@ -4488,6 +3645,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         self.visit_set_op_common(
             node,
             &op.output_columns,
+            &op.child_output_columns,
             plan_nodes::TPlanNodeType::EXCEPT_NODE,
             |plan_node, tnode| {
                 plan_node.except_node = Some(plan_nodes::TExceptNode {
@@ -4505,6 +3663,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         &mut self,
         node: &PhysicalPlanNode,
         explicit_output_columns: &[crate::sql::analysis::OutputColumn],
+        child_output_columns: &[Vec<crate::sql::analysis::OutputColumn>],
         node_type: plan_nodes::TPlanNodeType,
         apply_payload: impl FnOnce(&mut plan_nodes::TPlanNode, plan_nodes::TUnionNode),
     ) -> Result<VisitResult, String> {
@@ -4579,13 +3738,68 @@ impl<'a> PlanFragmentBuilder<'a> {
         }
         self.desc_builder.add_tuple(output_tuple_id, None);
 
+        if !child_output_columns.is_empty() && child_output_columns.len() != child_results.len() {
+            return Err(format!(
+                "set operation child_output_columns has {}, inputs has {}",
+                child_output_columns.len(),
+                child_results.len()
+            ));
+        }
+
         let mut result_expr_lists = Vec::with_capacity(child_results.len());
-        for child_result in &child_results {
+        for (child_idx, child_result) in child_results.iter().enumerate() {
+            let fallback_child_columns: Vec<crate::sql::analysis::OutputColumn>;
+            let expected_child_columns = if child_output_columns.is_empty() {
+                fallback_child_columns = child_result
+                    .scope
+                    .iter_columns()
+                    .map(|(name, binding)| crate::sql::analysis::OutputColumn {
+                        column_id: ColumnId::UNSET,
+                        name: name.clone(),
+                        data_type: binding.data_type.clone(),
+                        nullable: binding.nullable,
+                        is_internal: false,
+                    })
+                    .collect();
+                &fallback_child_columns
+            } else {
+                &child_output_columns[child_idx]
+            };
+            if expected_child_columns.len() != output_columns.len() {
+                return Err(format!(
+                    "set operation child {} column count mismatch during codegen: child has {}, output has {}",
+                    child_idx,
+                    expected_child_columns.len(),
+                    output_columns.len()
+                ));
+            }
+            let ordered_child_bindings: Vec<_> = child_result.scope.iter_columns().collect();
             let mut expr_list = Vec::new();
-            for (col_idx, (_, child_binding)) in child_result.scope.iter_columns().enumerate() {
-                let output_col = output_columns.get(col_idx).ok_or_else(|| {
-                    format!("missing output column {} for set operation", col_idx)
-                })?;
+            for (col_idx, expected_child_col) in expected_child_columns.iter().enumerate() {
+                let output_col = &output_columns[col_idx];
+                let child_binding = if expected_child_col.column_id != ColumnId::UNSET {
+                    child_result
+                        .scope
+                        .resolve_by_id(expected_child_col.column_id)
+                        .ok_or_else(|| {
+                            format!(
+                                "set operation child {} output column `{}` id={} is not in child scope",
+                                child_idx,
+                                expected_child_col.name,
+                                expected_child_col.column_id.0
+                            )
+                        })?
+                } else {
+                    ordered_child_bindings
+                        .get(col_idx)
+                        .map(|(_, binding)| *binding)
+                        .ok_or_else(|| {
+                            format!(
+                                "set operation child {} missing positional column {}",
+                                child_idx, col_idx
+                            )
+                        })?
+                };
                 let needs_cast = child_binding.data_type != output_col.data_type;
                 if needs_cast {
                     let target_desc = type_infer::arrow_type_to_type_desc(&output_col.data_type)?;
@@ -5064,42 +4278,6 @@ mod tests {
     use crate::sql::optimizer::runtime_filter_pass::RuntimeFilterDesc;
     use crate::sql::optimizer::statistics::Statistics;
     use crate::sql::planner::plan::{DecodeMapping, WindowExpr};
-
-    #[test]
-    fn aggregate_slot_contract_uses_intermediate_only_for_non_finalize() {
-        use crate::lower::type_lowering::arrow_type_from_desc;
-        use crate::sql::codegen::expr_compiler::infer_agg_function_types;
-        use arrow::datatypes::DataType;
-
-        let (_, avg_intermediate) =
-            infer_agg_function_types("avg", &[DataType::Int64], false).expect("avg types");
-        let avg_intermediate = avg_intermediate.expect("avg intermediate");
-        let contract = super::aggregate_slot_contract_for_phase(
-            false,
-            &DataType::Float64,
-            Some(&avg_intermediate),
-            "avg",
-        )
-        .expect("local avg contract");
-        assert_eq!(contract.data_type, DataType::Utf8);
-        assert_eq!(
-            arrow_type_from_desc(&contract.type_desc),
-            Some(DataType::Utf8)
-        );
-
-        let final_contract = super::aggregate_slot_contract_for_phase(
-            true,
-            &DataType::Float64,
-            Some(&avg_intermediate),
-            "avg",
-        )
-        .expect("final avg contract");
-        assert_eq!(final_contract.data_type, DataType::Float64);
-        assert_eq!(
-            arrow_type_from_desc(&final_contract.type_desc),
-            Some(DataType::Float64)
-        );
-    }
 
     /// OQ-5 B1: `remap_rf_expr_order` must translate a runtime filter's
     /// pre-demote `op.eq_conditions` index into the post-demote
