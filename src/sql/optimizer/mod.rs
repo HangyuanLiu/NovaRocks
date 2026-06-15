@@ -139,7 +139,7 @@ pub(crate) fn optimize(
     if options.is_enabled("MultiJoinReorder") {
         cascades_rules::multi_join_reorder::run_multi_join_reorder(
             &mut memo,
-            &cascades_rules::multi_join_reorder::ReorderOptions::default(),
+            &options.reorder,
             table_stats,
         );
     }

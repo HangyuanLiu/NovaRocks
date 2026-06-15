@@ -4,6 +4,8 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::time::Duration;
 
+use crate::sql::optimizer::cascades_rules::multi_join_reorder::ReorderOptions;
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct SessionOptimizerSettings {
     pub enable_ukfk_opt: bool,
@@ -27,6 +29,18 @@ pub(crate) struct SessionOptimizerSettings {
     /// Session override for transparent MV query rewrite.
     /// `None` means the default (enabled).
     pub enable_materialized_view_rewrite: Option<bool>,
+    /// Session override for `cbo_enable_dp_join_reorder` (None = default true).
+    pub enable_dp_join_reorder: Option<bool>,
+    /// Session override for `cbo_enable_greedy_join_reorder` (None = default true).
+    pub enable_greedy_join_reorder: Option<bool>,
+    /// Session override for `cbo_max_reorder_node_use_exhaustive` (None = default 4).
+    pub max_reorder_node_use_exhaustive: Option<usize>,
+    /// Session override for `cbo_max_reorder_node_use_dp` (None = default 10).
+    pub max_reorder_node_use_dp: Option<usize>,
+    /// Session override for `cbo_max_reorder_node_use_greedy` (None = default 16).
+    pub max_reorder_node_use_greedy: Option<usize>,
+    /// Session override for `cbo_max_reorder_node` (None = default 50).
+    pub max_reorder_node: Option<usize>,
 }
 
 impl SessionOptimizerSettings {
@@ -97,6 +111,10 @@ pub(crate) struct OptimizerOptions {
     /// true, and probe pushdown stops at outer/anti/null-preserving semantic
     /// boundaries.
     pub allow_cross_exchange_rf: bool,
+    /// In-memo join-reorder knobs (algorithm toggles + size cutoffs). Defaults
+    /// match StarRocks; overridable via the `cbo_enable_dp/greedy_join_reorder`
+    /// and `cbo_max_reorder_node*` session variables.
+    pub reorder: ReorderOptions,
 }
 
 impl OptimizerOptions {
@@ -112,6 +130,7 @@ impl OptimizerOptions {
             rf_probe_min_selectivity: 0.5,
             rf_max_count: 1024,
             allow_cross_exchange_rf: true,
+            reorder: ReorderOptions::default(),
         }
     }
 
@@ -142,6 +161,24 @@ impl OptimizerOptions {
         }
         // `allow_cross_exchange_rf` has no session override; the default is safe
         // because placement rejects partial partitioned RF.
+        if let Some(v) = settings.enable_dp_join_reorder {
+            opts.reorder.enable_dp = v;
+        }
+        if let Some(v) = settings.enable_greedy_join_reorder {
+            opts.reorder.enable_greedy = v;
+        }
+        if let Some(v) = settings.max_reorder_node_use_exhaustive {
+            opts.reorder.max_reorder_node_use_exhaustive = v;
+        }
+        if let Some(v) = settings.max_reorder_node_use_dp {
+            opts.reorder.max_reorder_node_use_dp = v;
+        }
+        if let Some(v) = settings.max_reorder_node_use_greedy {
+            opts.reorder.max_reorder_node_use_greedy = v;
+        }
+        if let Some(v) = settings.max_reorder_node {
+            opts.reorder.max_reorder_node = v;
+        }
         opts
     }
 }
@@ -218,6 +255,45 @@ mod tests {
         let o = OptimizerOptions::from_session(&s);
         assert_eq!(o.rf_build_max_bytes, 1);
         assert!((o.rf_probe_min_selectivity - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn reorder_knobs_default_to_starrocks() {
+        let o = OptimizerOptions::default_settings();
+        assert!(o.reorder.enable_dp);
+        assert!(o.reorder.enable_greedy);
+        assert_eq!(o.reorder.max_reorder_node_use_exhaustive, 4);
+        assert_eq!(o.reorder.max_reorder_node_use_dp, 10);
+        assert_eq!(o.reorder.max_reorder_node_use_greedy, 16);
+        assert_eq!(o.reorder.max_reorder_node, 50);
+    }
+
+    #[test]
+    fn from_session_overrides_reorder_knobs() {
+        let s = SessionOptimizerSettings {
+            enable_dp_join_reorder: Some(false),
+            enable_greedy_join_reorder: Some(false),
+            max_reorder_node_use_exhaustive: Some(2),
+            max_reorder_node_use_dp: Some(7),
+            max_reorder_node_use_greedy: Some(9),
+            max_reorder_node: Some(40),
+            ..Default::default()
+        };
+        let o = OptimizerOptions::from_session(&s);
+        assert!(!o.reorder.enable_dp);
+        assert!(!o.reorder.enable_greedy);
+        assert_eq!(o.reorder.max_reorder_node_use_exhaustive, 2);
+        assert_eq!(o.reorder.max_reorder_node_use_dp, 7);
+        assert_eq!(o.reorder.max_reorder_node_use_greedy, 9);
+        assert_eq!(o.reorder.max_reorder_node, 40);
+    }
+
+    #[test]
+    fn from_session_reorder_knobs_default_when_unset() {
+        // No session override → ReorderOptions stays at StarRocks defaults.
+        let o = OptimizerOptions::from_session(&SessionOptimizerSettings::default());
+        assert!(o.reorder.enable_dp);
+        assert_eq!(o.reorder.max_reorder_node_use_dp, 10);
     }
 
     #[test]
