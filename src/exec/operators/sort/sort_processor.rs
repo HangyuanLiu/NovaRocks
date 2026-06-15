@@ -409,10 +409,10 @@ impl SortProcessorOperator {
                     rows_to_keep,
                 ))
             }
-        } else if let Some(partition_limit) = self
-            .partition_limit
-            .filter(|_| !self.partition_exprs.is_empty())
-        {
+        } else if self.is_partition_topn() {
+            let partition_limit = self
+                .partition_limit
+                .expect("is_partition_topn implies Some");
             Box::new(ChunksSorterPartitionTopN::new(
                 Arc::clone(&self.arena),
                 self.partition_exprs.clone(),
@@ -638,6 +638,9 @@ impl SortProcessorOperator {
             return Ok(out);
         }
 
+        // Partition-TopN does not set topn_cutoff_base(), so it falls through to the
+        // full-sort restore path below; the partition limit is applied in
+        // build_final_output_from_chunks.
         if self.topn_cutoff_base().is_some() {
             let out = self.build_final_topn_output_with_spill(&mut spill)?;
             self.clear_buffered();
@@ -811,6 +814,9 @@ impl SortProcessorOperator {
                 .sort_chunks_for_topn_mode(chunks)?
                 .ok_or_else(|| "topn sorted run expected non-empty output".to_string());
         }
+        // Partition-TopN intermediate spill runs are written full-sorted (no per-partition
+        // pre-pruning); build_final_output_from_chunks applies the partition limit across
+        // all restored runs at the end.
         ChunksSorterFullSort::new(Arc::clone(&self.arena), self.order_by.clone())
             .sort_chunks(chunks)?
             .ok_or_else(|| "full sort run expected non-empty output".to_string())
@@ -824,7 +830,8 @@ impl SortProcessorOperator {
         if chunks.is_empty() {
             return Ok(None);
         }
-        // Per-partition TopN path: overrides the ordinary topn/sort paths.
+        // Per-partition TopN: must return early before the ordinary limit/rank/full-sort
+        // fallbacks below, none of which know about partition grouping.
         if self.is_partition_topn() {
             return self.sort_chunks_for_topn_mode(chunks);
         }
