@@ -1,33 +1,358 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::rc::Rc;
 
 use arrow::datatypes::DataType;
 
+use crate::exprs;
 use crate::plan_nodes;
-use crate::sql::analysis::ExprKind;
-use crate::sql::codegen::expr_compiler::ExprCompiler;
+use crate::sql::analysis::{ExprKind, OutputColumn as AnalysisOutputColumn};
+use crate::sql::catalog::{CatalogProvider, ScanSource, TableDef};
+use crate::sql::codegen::descriptors::DescriptorTableBuilder;
+use crate::sql::codegen::expr_compiler::{self, ExprCompiler};
 use crate::sql::codegen::fragment_builder::{
-    PlanFragmentBuilder, add_iceberg_equality_delete_required_columns,
+    PlanFragmentBuilder, add_iceberg_equality_delete_required_columns, build_result_sink,
     effective_iceberg_scan_column_names, iceberg_scan_table_handle_for_codegen, iceberg_table_info,
-    synthetic_iceberg_table_id,
+    output_columns_for_boundary, result_root_boundary_schema_report, synthetic_iceberg_table_id,
 };
 use crate::sql::codegen::helpers::typed_expr_display_name_without_qualifiers;
 use crate::sql::codegen::nodes;
 use crate::sql::codegen::resolve::{ColumnBinding, ExprScope, ResolvedTable};
 use crate::sql::codegen::type_infer;
-use crate::sql::codegen::{FragmentId, OutputColumn};
+use crate::sql::codegen::{
+    FragmentBuildResult, FragmentId, MultiFragmentBuildResult, OutputColumn,
+};
 use crate::sql::optimizer::operator::{PhysicalProjectOp, PhysicalScanOp, ScanDictionaryColumn};
 
-pub(crate) fn lower_distributed_plan() {
-    unimplemented!("lower_distributed_plan is added by a later IR slice")
+pub(crate) fn lower_distributed_plan(
+    dp: &super::fragment::DistributedPlan,
+    catalog: &dyn CatalogProvider,
+    connectors: &crate::connector::ConnectorRegistry,
+) -> Result<MultiFragmentBuildResult, String> {
+    let _ = catalog;
+    let root_fragment = dp
+        .fragments
+        .iter()
+        .find(|fragment| fragment.fragment_id == dp.root_fragment_id)
+        .ok_or_else(|| {
+            format!(
+                "DistributedPlan root fragment id={} not found",
+                dp.root_fragment_id
+            )
+        })?;
+
+    let mut state = OwnedLoweringState::new(connectors, None, dp.root_fragment_id);
+    let lowered = {
+        let mut ctx = LoweringCtx::new(&mut state);
+        ctx.lower_node(&root_fragment.root)?
+    };
+
+    let desc_tbl =
+        std::mem::replace(&mut state.desc_builder, DescriptorTableBuilder::new()).build();
+    let exec_params =
+        nodes::build_exec_params_multi_with_refresh_context(connectors, &state.scan_tables, None)?;
+    let output_exprs =
+        result_output_exprs_for_columns(&lowered.scope, &root_fragment.output_columns)?;
+    let output_columns = output_columns_for_boundary(&root_fragment.output_columns);
+    let root_node_id = lowered
+        .plan_nodes
+        .first()
+        .map(|node| node.node_id)
+        .unwrap_or(-1);
+    let boundary_schemas = vec![result_root_boundary_schema_report(
+        dp.root_fragment_id,
+        root_node_id,
+        &output_columns,
+    )];
+    let root_dicts = state
+        .query_global_dicts_per_fragment
+        .remove(&dp.root_fragment_id)
+        .filter(|dicts| !dicts.is_empty());
+
+    let root_fragment = FragmentBuildResult {
+        fragment_id: dp.root_fragment_id,
+        plan: plan_nodes::TPlan::new(lowered.plan_nodes),
+        desc_tbl: desc_tbl.clone(),
+        exec_params: exec_params.clone(),
+        output_sink: build_result_sink(),
+        output_exprs,
+        output_columns,
+        direct_exec: None,
+        boundary_schemas: boundary_schemas.clone(),
+        cte_id: None,
+        cte_exchange_nodes: Vec::new(),
+        query_global_dicts: root_dicts,
+        query_global_dict_exprs: None,
+    };
+
+    Ok(MultiFragmentBuildResult {
+        fragment_results: vec![root_fragment],
+        root_fragment_id: dp.root_fragment_id,
+        edges: Vec::new(),
+        boundary_schemas,
+        rf_plan: None,
+    })
 }
 
-pub(crate) struct LoweringCtx<'b, 'a> {
-    builder: &'b mut PlanFragmentBuilder<'a>,
+pub(in crate::sql::codegen) trait LoweringStateAccess<'a> {
+    fn connectors(&self) -> &'a crate::connector::ConnectorRegistry;
+    fn mv_refresh_ctx(
+        &self,
+    ) -> Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>;
+    fn desc_builder(&mut self) -> &mut DescriptorTableBuilder;
+    fn scan_tables(&mut self) -> &mut Vec<nodes::PlannedScanTable>;
+    fn fragment_stack(&self) -> &[FragmentId];
+    fn query_global_dicts_per_fragment(
+        &mut self,
+    ) -> &mut HashMap<FragmentId, Vec<crate::data::TGlobalDict>>;
+    fn slot_to_global_dict(&self) -> &HashMap<i32, crate::data::TGlobalDict>;
+    fn slot_to_global_dict_mut(&mut self) -> &mut HashMap<i32, crate::data::TGlobalDict>;
+    fn alloc_slot(&mut self) -> i32;
+    fn slot_allocator(&self) -> expr_compiler::SlotAllocator;
+
+    fn current_fragment_id(&self) -> Result<FragmentId, String> {
+        self.fragment_stack()
+            .last()
+            .copied()
+            .ok_or_else(|| "no active fragment id in lowering state".to_string())
+    }
+
+    fn refresh_scan_table_for_codegen(&self, table: &TableDef) -> Result<TableDef, String> {
+        refresh_scan_table_for_codegen(self.mv_refresh_ctx(), table)
+    }
+
+    fn propagate_dict_to_slot(&mut self, source_slot_id: i32, new_slot_id: i32) {
+        if source_slot_id == new_slot_id {
+            return;
+        }
+        let Some(source_dict) = self.slot_to_global_dict().get(&source_slot_id).cloned() else {
+            return;
+        };
+        let new_dict = crate::data::TGlobalDict::new(
+            Some(new_slot_id),
+            source_dict.strings.clone(),
+            source_dict.ids.clone(),
+            source_dict.version,
+        );
+        let fragments: Vec<FragmentId> = if self.fragment_stack().is_empty() {
+            self.current_fragment_id()
+                .ok()
+                .map(|fragment_id| vec![fragment_id])
+                .unwrap_or_default()
+        } else {
+            self.fragment_stack().to_vec()
+        };
+        for fragment_id in fragments {
+            self.query_global_dicts_per_fragment()
+                .entry(fragment_id)
+                .or_default()
+                .push(new_dict.clone());
+        }
+        self.slot_to_global_dict_mut().insert(new_slot_id, new_dict);
+    }
 }
 
-impl<'b, 'a> LoweringCtx<'b, 'a> {
-    pub(crate) fn new(builder: &'b mut PlanFragmentBuilder<'a>) -> Self {
-        Self { builder }
+impl<'a> LoweringStateAccess<'a> for PlanFragmentBuilder<'a> {
+    fn connectors(&self) -> &'a crate::connector::ConnectorRegistry {
+        self.connectors
+    }
+
+    fn mv_refresh_ctx(
+        &self,
+    ) -> Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext> {
+        self.mv_refresh_ctx
+    }
+
+    fn desc_builder(&mut self) -> &mut DescriptorTableBuilder {
+        &mut self.desc_builder
+    }
+
+    fn scan_tables(&mut self) -> &mut Vec<nodes::PlannedScanTable> {
+        &mut self.scan_tables
+    }
+
+    fn fragment_stack(&self) -> &[FragmentId] {
+        &self.fragment_stack
+    }
+
+    fn query_global_dicts_per_fragment(
+        &mut self,
+    ) -> &mut HashMap<FragmentId, Vec<crate::data::TGlobalDict>> {
+        &mut self.query_global_dicts_per_fragment
+    }
+
+    fn slot_to_global_dict(&self) -> &HashMap<i32, crate::data::TGlobalDict> {
+        &self.slot_to_global_dict
+    }
+
+    fn slot_to_global_dict_mut(&mut self) -> &mut HashMap<i32, crate::data::TGlobalDict> {
+        &mut self.slot_to_global_dict
+    }
+
+    fn alloc_slot(&mut self) -> i32 {
+        PlanFragmentBuilder::alloc_slot(self)
+    }
+
+    fn slot_allocator(&self) -> expr_compiler::SlotAllocator {
+        PlanFragmentBuilder::slot_allocator(self)
+    }
+
+    fn current_fragment_id(&self) -> Result<FragmentId, String> {
+        PlanFragmentBuilder::current_fragment_id(self)
+    }
+
+    fn refresh_scan_table_for_codegen(&self, table: &TableDef) -> Result<TableDef, String> {
+        PlanFragmentBuilder::refresh_scan_table_for_codegen(self, table)
+    }
+
+    fn propagate_dict_to_slot(&mut self, source_slot_id: i32, new_slot_id: i32) {
+        PlanFragmentBuilder::propagate_dict_to_slot(self, source_slot_id, new_slot_id)
+    }
+}
+
+pub(crate) struct OwnedLoweringState<'a> {
+    connectors: &'a crate::connector::ConnectorRegistry,
+    mv_refresh_ctx: Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+    desc_builder: DescriptorTableBuilder,
+    scan_tables: Vec<nodes::PlannedScanTable>,
+    next_slot_id: Rc<RefCell<i32>>,
+    fragment_stack: Vec<FragmentId>,
+    query_global_dicts_per_fragment: HashMap<FragmentId, Vec<crate::data::TGlobalDict>>,
+    slot_to_global_dict: HashMap<i32, crate::data::TGlobalDict>,
+}
+
+impl<'a> OwnedLoweringState<'a> {
+    fn new(
+        connectors: &'a crate::connector::ConnectorRegistry,
+        mv_refresh_ctx: Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+        root_fragment_id: FragmentId,
+    ) -> Self {
+        Self {
+            connectors,
+            mv_refresh_ctx,
+            desc_builder: DescriptorTableBuilder::new(),
+            scan_tables: Vec::new(),
+            next_slot_id: Rc::new(RefCell::new(1)),
+            fragment_stack: vec![root_fragment_id],
+            query_global_dicts_per_fragment: HashMap::new(),
+            slot_to_global_dict: HashMap::new(),
+        }
+    }
+}
+
+impl<'a> LoweringStateAccess<'a> for OwnedLoweringState<'a> {
+    fn connectors(&self) -> &'a crate::connector::ConnectorRegistry {
+        self.connectors
+    }
+
+    fn mv_refresh_ctx(
+        &self,
+    ) -> Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext> {
+        self.mv_refresh_ctx
+    }
+
+    fn desc_builder(&mut self) -> &mut DescriptorTableBuilder {
+        &mut self.desc_builder
+    }
+
+    fn scan_tables(&mut self) -> &mut Vec<nodes::PlannedScanTable> {
+        &mut self.scan_tables
+    }
+
+    fn fragment_stack(&self) -> &[FragmentId] {
+        &self.fragment_stack
+    }
+
+    fn query_global_dicts_per_fragment(
+        &mut self,
+    ) -> &mut HashMap<FragmentId, Vec<crate::data::TGlobalDict>> {
+        &mut self.query_global_dicts_per_fragment
+    }
+
+    fn slot_to_global_dict(&self) -> &HashMap<i32, crate::data::TGlobalDict> {
+        &self.slot_to_global_dict
+    }
+
+    fn slot_to_global_dict_mut(&mut self) -> &mut HashMap<i32, crate::data::TGlobalDict> {
+        &mut self.slot_to_global_dict
+    }
+
+    fn alloc_slot(&mut self) -> i32 {
+        let mut next = self.next_slot_id.borrow_mut();
+        let slot_id = *next;
+        *next += 1;
+        slot_id
+    }
+
+    fn slot_allocator(&self) -> expr_compiler::SlotAllocator {
+        Rc::clone(&self.next_slot_id)
+    }
+}
+
+pub(in crate::sql::codegen) struct LoweringCtx<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> {
+    state: &'s mut S,
+    _marker: std::marker::PhantomData<&'a ()>,
+}
+
+struct LoweredDistributedNode {
+    plan_nodes: Vec<plan_nodes::TPlanNode>,
+    scope: ExprScope,
+    #[allow(dead_code)]
+    output_columns: Vec<AnalysisOutputColumn>,
+}
+
+impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
+    pub(crate) fn new(state: &'s mut S) -> Self {
+        Self {
+            state,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    fn lower_node(
+        &mut self,
+        node: &super::node::DistributedPlanNode,
+    ) -> Result<LoweredDistributedNode, String> {
+        match &node.body {
+            super::node::DistributedPlanNodeBody::Scan(scan) => {
+                if !node.children.is_empty() {
+                    return Err(format!(
+                        "DistributedPlan Scan node_id={} expected 0 children, got {}",
+                        node.node_id,
+                        node.children.len()
+                    ));
+                }
+                let scan_tuple_id = first_tuple_id(node, "Scan")?;
+                let op = scan_body_to_physical_op(scan);
+                let (scan_plan_node, scope) = self.lower_scan(node.node_id, scan_tuple_id, &op)?;
+                Ok(LoweredDistributedNode {
+                    plan_nodes: vec![scan_plan_node],
+                    scope,
+                    output_columns: op.columns.clone(),
+                })
+            }
+            super::node::DistributedPlanNodeBody::Project(project) => {
+                if node.children.len() != 1 {
+                    return Err(format!(
+                        "DistributedPlan Project node_id={} expected 1 child, got {}",
+                        node.node_id,
+                        node.children.len()
+                    ));
+                }
+                let child = self.lower_node(&node.children[0])?;
+                let project_tuple_id = first_tuple_id(node, "Project")?;
+                let op = project_body_to_physical_op(project);
+                let (project_plan_node, scope, _output_columns) =
+                    self.lower_project(node.node_id, project_tuple_id, &op, &child.scope)?;
+                let mut plan_nodes = vec![project_plan_node];
+                plan_nodes.extend(child.plan_nodes);
+                Ok(LoweredDistributedNode {
+                    plan_nodes,
+                    scope,
+                    output_columns: project_body_output_columns(project),
+                })
+            }
+        }
     }
 
     pub(crate) fn lower_scan(
@@ -36,8 +361,8 @@ impl<'b, 'a> LoweringCtx<'b, 'a> {
         scan_tuple_id: i32,
         op: &PhysicalScanOp,
     ) -> Result<(plan_nodes::TPlanNode, ExprScope), String> {
-        let builder = &mut *self.builder;
-        let table = builder.refresh_scan_table_for_codegen(&op.table)?;
+        let state = &mut *self.state;
+        let table = state.refresh_scan_table_for_codegen(&op.table)?;
 
         let mut scope = ExprScope::new();
         let qualifier = op.alias.as_deref().or(Some(&table.name));
@@ -47,7 +372,7 @@ impl<'b, 'a> LoweringCtx<'b, 'a> {
         // Determine which columns to emit
         let planned_scan = match &table.source {
             crate::sql::catalog::ScanSource::StarRocks { db_id, table_id } => {
-                let planner = builder.connectors.scan_planner("starrocks")?;
+                let planner = state.connectors().scan_planner("starrocks")?;
                 let table_handle =
                     crate::connector::starrocks::table::StarRocksTableScanPlanner::table_handle_from_source(
                         &op.database,
@@ -68,7 +393,7 @@ impl<'b, 'a> LoweringCtx<'b, 'a> {
                 files,
                 ..
             } => {
-                let planner = builder.connectors.scan_planner("iceberg")?;
+                let planner = state.connectors().scan_planner("iceberg")?;
                 let column_names = effective_iceberg_scan_column_names(&table);
                 let table_handle = iceberg_scan_table_handle_for_codegen(
                     &op.table.source,
@@ -103,8 +428,8 @@ impl<'b, 'a> LoweringCtx<'b, 'a> {
                 .then_some(synthetic_iceberg_table_id(scan_node_id)),
         };
         if let Some(table_id) = scan_table_id {
-            builder
-                .desc_builder
+            state
+                .desc_builder()
                 .add_table_for_scan(table_id, &op.database, &table);
         }
 
@@ -144,7 +469,7 @@ impl<'b, 'a> LoweringCtx<'b, 'a> {
                     continue;
                 }
             }
-            let slot_id = builder.alloc_slot();
+            let slot_id = state.alloc_slot();
             // Bug B contract: slot keeps the SOURCE column's storage
             // name (so the lake scan finds the column by name in the
             // tablet schema) and Int32 type (the BE reads it as Utf8 via
@@ -158,7 +483,7 @@ impl<'b, 'a> LoweringCtx<'b, 'a> {
                 None => col.data_type.clone(),
             };
             let nullable = col.nullable;
-            builder.desc_builder.add_slot(
+            state.desc_builder().add_slot(
                 slot_id,
                 scan_tuple_id,
                 &col.name,
@@ -235,8 +560,8 @@ impl<'b, 'a> LoweringCtx<'b, 'a> {
             .enumerate()
         {
             let col_pos = (meta_col_offset + meta_idx) as i32;
-            let slot_id = builder.alloc_slot();
-            builder.desc_builder.add_slot(
+            let slot_id = state.alloc_slot();
+            state.desc_builder().add_slot(
                 slot_id,
                 scan_tuple_id,
                 &col.name,
@@ -280,7 +605,7 @@ impl<'b, 'a> LoweringCtx<'b, 'a> {
                         op.database, table.name, variant_column.source_column
                     )
                 })?;
-            let output_slot_id = builder.alloc_slot();
+            let output_slot_id = state.alloc_slot();
             let requested_type = type_infer::arrow_type_to_type_desc(
                 &variant_column.requested_type,
             )
@@ -299,7 +624,7 @@ impl<'b, 'a> LoweringCtx<'b, 'a> {
                 .find(|column| column.column_id == variant_column.synthetic_column_id)
                 .map(|column| column.nullable)
                 .unwrap_or(true);
-            builder.desc_builder.add_slot_with_type_desc(
+            state.desc_builder().add_slot_with_type_desc(
                 output_slot_id,
                 scan_tuple_id,
                 &variant_column.synthetic_column,
@@ -337,7 +662,7 @@ impl<'b, 'a> LoweringCtx<'b, 'a> {
         } else {
             let mut conjuncts = Vec::new();
             for pred in &op.predicates {
-                let mut compiler = ExprCompiler::new(builder.slot_allocator(), &scope);
+                let mut compiler = ExprCompiler::new(state.slot_allocator(), &scope);
                 conjuncts.push(compiler.compile_typed(pred)?);
             }
             conjuncts
@@ -382,7 +707,7 @@ impl<'b, 'a> LoweringCtx<'b, 'a> {
             planned_scan,
             alias: op.alias.clone(),
         };
-        builder.desc_builder.add_tuple(scan_tuple_id, scan_table_id);
+        state.desc_builder().add_tuple(scan_tuple_id, scan_table_id);
 
         let min_max_predicates =
             nodes::scan_file_min_max_predicates_from_state(&pushed_conjuncts, &slot_to_column);
@@ -391,7 +716,7 @@ impl<'b, 'a> LoweringCtx<'b, 'a> {
             &slot_to_column,
         );
         let mut scan_plan_node = nodes::build_scan_node(
-            builder.connectors,
+            state.connectors(),
             scan_node_id,
             scan_tuple_id,
             &resolved,
@@ -442,11 +767,11 @@ impl<'b, 'a> LoweringCtx<'b, 'a> {
         // `lower_decode_node` fails with `missing query global dict for
         // encoded slot_id=<N>` (each fragment builds its own
         // QueryGlobalDictMap from its own TGlobalDict list).
-        let current_frag = builder.current_fragment_id()?;
-        let dict_fragments: Vec<FragmentId> = if builder.fragment_stack.is_empty() {
+        let current_frag = state.current_fragment_id()?;
+        let dict_fragments: Vec<FragmentId> = if state.fragment_stack().is_empty() {
             vec![current_frag]
         } else {
-            builder.fragment_stack.clone()
+            state.fragment_stack().to_vec()
         };
         for (dict_slot_id, dict_col) in &dict_slot_to_dict {
             let snapshot = dict_col.dictionary.as_ref();
@@ -463,8 +788,8 @@ impl<'b, 'a> LoweringCtx<'b, 'a> {
                 Some(snapshot.version),
             );
             for fragment_id in &dict_fragments {
-                builder
-                    .query_global_dicts_per_fragment
+                state
+                    .query_global_dicts_per_fragment()
                     .entry(*fragment_id)
                     .or_default()
                     .push(global_dict.clone());
@@ -476,12 +801,12 @@ impl<'b, 'a> LoweringCtx<'b, 'a> {
             // `Decode` resolves by NAME against the new slot, then the
             // BE's `lower_decode_node` needs a TGlobalDict keyed by that
             // new slot id — registered via `propagate_dict_to_slot`.
-            builder
-                .slot_to_global_dict
+            state
+                .slot_to_global_dict_mut()
                 .insert(*dict_slot_id, global_dict);
         }
 
-        builder.scan_tables.push(nodes::PlannedScanTable {
+        state.scan_tables().push(nodes::PlannedScanTable {
             scan_node_id,
             scan_tuple_id,
             resolved,
@@ -500,24 +825,24 @@ impl<'b, 'a> LoweringCtx<'b, 'a> {
         op: &PhysicalProjectOp,
         child_scope: &ExprScope,
     ) -> Result<(plan_nodes::TPlanNode, ExprScope, Vec<OutputColumn>), String> {
-        let builder = &mut *self.builder;
+        let state = &mut *self.state;
         let mut output_columns = Vec::new();
         let mut slot_map = BTreeMap::new();
         let mut project_scope = ExprScope::new();
 
         for item in &op.items {
-            let mut compiler = ExprCompiler::new(builder.slot_allocator(), child_scope);
+            let mut compiler = ExprCompiler::new(state.slot_allocator(), child_scope);
             let texpr = compiler.compile_typed(&item.expr)?;
             let data_type = item.expr.data_type.clone();
             let nullable = item.expr.nullable;
             let name = item.output_name.clone();
-            let slot_id = builder.alloc_slot();
+            let slot_id = state.alloc_slot();
             let slot_type_desc = texpr
                 .nodes
                 .first()
                 .map(|root| root.type_.clone())
                 .ok_or_else(|| format!("project expr `{name}` compiled to empty TExpr"))?;
-            builder.desc_builder.add_slot_with_type_desc(
+            state.desc_builder().add_slot_with_type_desc(
                 slot_id,
                 project_tuple_id,
                 &name,
@@ -559,14 +884,320 @@ impl<'b, 'a> LoweringCtx<'b, 'a> {
                 && let Some(child_binding) = child_scope.resolve_by_id(column_id)
             {
                 let source_slot_id = child_binding.slot_id;
-                builder.propagate_dict_to_slot(source_slot_id, slot_id);
+                state.propagate_dict_to_slot(source_slot_id, slot_id);
             }
         }
 
-        builder.desc_builder.add_tuple(project_tuple_id, None);
+        state.desc_builder().add_tuple(project_tuple_id, None);
         let project_plan_node =
             nodes::build_project_node(project_node_id, project_tuple_id, slot_map);
 
         Ok((project_plan_node, project_scope, output_columns))
+    }
+}
+
+fn first_tuple_id(
+    node: &super::node::DistributedPlanNode,
+    operator_name: &str,
+) -> Result<i32, String> {
+    node.tuple_ids.first().copied().ok_or_else(|| {
+        format!(
+            "DistributedPlan {operator_name} node_id={} has no output tuple id",
+            node.node_id
+        )
+    })
+}
+
+fn scan_body_to_physical_op(body: &super::body::ScanBody) -> PhysicalScanOp {
+    PhysicalScanOp {
+        database: body.database.clone(),
+        table: body.table.clone(),
+        alias: body.alias.clone(),
+        columns: body.columns.clone(),
+        predicates: body.predicates.clone(),
+        required_columns: body.required_columns.clone(),
+        dict_columns: body.dict_columns.clone(),
+        variant_columns: body.variant_columns.clone(),
+        mv_rewritten_from: body.mv_rewritten_from.clone(),
+    }
+}
+
+fn project_body_to_physical_op(body: &super::body::ProjectBody) -> PhysicalProjectOp {
+    PhysicalProjectOp {
+        items: body.items.clone(),
+        output_qualifier: body.output_qualifier.clone(),
+    }
+}
+
+fn project_body_output_columns(body: &super::body::ProjectBody) -> Vec<AnalysisOutputColumn> {
+    body.items
+        .iter()
+        .map(|item| AnalysisOutputColumn {
+            column_id: item.output_column_id,
+            name: item.output_name.clone(),
+            data_type: item.expr.data_type.clone(),
+            nullable: item.expr.nullable,
+            is_internal: false,
+        })
+        .collect()
+}
+
+fn result_output_exprs_for_columns(
+    scope: &ExprScope,
+    output_columns: &[AnalysisOutputColumn],
+) -> Result<Option<Vec<exprs::TExpr>>, String> {
+    if output_columns.is_empty() {
+        return Ok(None);
+    }
+
+    let mut exprs = Vec::with_capacity(output_columns.len());
+    for column in output_columns {
+        let binding = scope.resolve_by_id(column.column_id).ok_or_else(|| {
+            format!(
+                "result sink cannot resolve output column `{}` id={}",
+                column.name, column.column_id.0
+            )
+        })?;
+        let type_desc = expr_compiler::binding_type_desc(binding)?;
+        exprs.push(expr_compiler::build_slot_ref_texpr(
+            binding.slot_id,
+            binding.tuple_id,
+            type_desc,
+        ));
+    }
+    Ok(Some(exprs))
+}
+
+fn refresh_scan_table_for_codegen(
+    mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+    table: &TableDef,
+) -> Result<TableDef, String> {
+    match &table.source {
+        ScanSource::IcebergVersionTable {
+            table: iceberg_table,
+            snapshot_id,
+        } => {
+            let refresh_ctx = mv_refresh_ctx
+                .ok_or_else(|| "Iceberg version scan requires MV refresh context".to_string())?;
+            let mut out = table.clone();
+            out.source = refresh_ctx.version_scan_source(iceberg_table, *snapshot_id)?;
+            Ok(out)
+        }
+        ScanSource::IcebergMvTargetState(scan) => {
+            let refresh_ctx = mv_refresh_ctx.ok_or_else(|| {
+                "Iceberg target-state scan requires MV refresh context".to_string()
+            })?;
+            let mut out = table.clone();
+            let projected = nodes::projected_target_state_column_names(scan);
+            out.columns.retain(|column| {
+                projected
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(&column.name))
+            });
+            out.iceberg_row_lineage_metadata_columns.retain(|column| {
+                projected
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(&column.name))
+            });
+            if projected
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case("_row_id"))
+                && !out
+                    .columns
+                    .iter()
+                    .chain(out.iceberg_row_lineage_metadata_columns.iter())
+                    .any(|column| column.name.eq_ignore_ascii_case("_row_id"))
+            {
+                out.iceberg_row_lineage_metadata_columns
+                    .push(crate::sql::catalog::ColumnDef {
+                        name: "_row_id".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        write_default: None,
+                        logical_type: None,
+                    });
+            }
+            out.source = refresh_ctx.target_state_scan_source(scan)?;
+            nodes::reject_target_state_equality_deletes(&out.source)?;
+            Ok(out)
+        }
+        _ => Ok(table.clone()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow::datatypes::DataType;
+
+    use crate::connector::ConnectorRegistry;
+    use crate::connector::iceberg::IcebergMetadataTableType;
+    use crate::plan_nodes::TPlanNodeType;
+    use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
+    use crate::sql::catalog::{
+        CatalogProvider, ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
+    };
+    use crate::sql::codegen::fragment_builder::PlanFragmentBuilder;
+    use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::operator::{Operator, PhysicalProjectOp, PhysicalScanOp};
+    use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, PlanExecutionProps};
+    use crate::sql::optimizer::statistics::Statistics;
+
+    #[test]
+    fn build_via_distributed_plan_lowers_project_over_scan() {
+        let catalog = DummyCatalog;
+        let connectors = ConnectorRegistry::new();
+        let result = PlanFragmentBuilder::build_via_distributed_plan(
+            &project_over_metadata_scan_plan(),
+            &catalog,
+            &connectors,
+            "test_db",
+        )
+        .expect("build_via_distributed_plan");
+
+        assert_eq!(result.root_fragment_id, 0);
+        assert_eq!(result.fragment_results.len(), 1);
+        let root = result
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == result.root_fragment_id)
+            .expect("root fragment");
+        let node_types: Vec<TPlanNodeType> =
+            root.plan.nodes.iter().map(|node| node.node_type).collect();
+        assert_eq!(
+            node_types,
+            vec![TPlanNodeType::PROJECT_NODE, TPlanNodeType::HDFS_SCAN_NODE]
+        );
+        assert!(
+            root.desc_tbl.tuple_descriptors.len() >= 2,
+            "project and scan tuples should be registered"
+        );
+        assert!(
+            root.desc_tbl
+                .slot_descriptors
+                .as_ref()
+                .expect("slot descriptors")
+                .len()
+                >= 2,
+            "project and scan slots should be registered"
+        );
+    }
+
+    struct DummyCatalog;
+
+    impl CatalogProvider for DummyCatalog {
+        fn get_table(&self, _database: &str, _table: &str) -> Result<TableDef, String> {
+            Err("not used by distributed-plan lowering test".to_string())
+        }
+    }
+
+    fn project_over_metadata_scan_plan() -> PhysicalPlanNode {
+        let k = output_col(1, "k", DataType::Int64, false);
+        let scan = physical_node(
+            Operator::PhysicalScan(PhysicalScanOp {
+                database: "test_db".to_string(),
+                table: metadata_table_def(),
+                alias: Some("t".to_string()),
+                columns: vec![k.clone()],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+                mv_rewritten_from: None,
+            }),
+            vec![],
+            vec![k],
+        );
+
+        let project_output = output_col(1, "k", DataType::Int64, false);
+        physical_node(
+            Operator::PhysicalProject(PhysicalProjectOp {
+                items: vec![ProjectItem {
+                    expr: column_ref_expr(1, "k", DataType::Int64, false),
+                    output_name: "k".to_string(),
+                    output_column_id: ColumnId::new_for_test(1),
+                }],
+                output_qualifier: None,
+            }),
+            vec![scan],
+            vec![project_output],
+        )
+    }
+
+    fn physical_node(
+        op: Operator,
+        children: Vec<PhysicalPlanNode>,
+        output_columns: Vec<OutputColumn>,
+    ) -> PhysicalPlanNode {
+        PhysicalPlanNode {
+            op,
+            children,
+            stats: Statistics::default(),
+            output_columns,
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        }
+    }
+
+    fn metadata_table_def() -> TableDef {
+        TableDef {
+            name: "t$snapshots".to_string(),
+            columns: vec![column_def("k", DataType::Int64, false)],
+            iceberg_row_lineage_metadata_columns: vec![],
+            source: ScanSource::IcebergMetadataTable {
+                table: iceberg_table_info(),
+                metadata_table_type: IcebergMetadataTableType::Snapshots,
+                serialized_table: "{}".to_string(),
+                cloud_properties: Default::default(),
+                metadata_payload: None,
+            },
+        }
+    }
+
+    fn iceberg_table_info() -> IcebergTableInfo {
+        IcebergTableInfo {
+            catalog: "test_catalog".to_string(),
+            namespace: "test_db".to_string(),
+            table: "t".to_string(),
+            table_uuid: Some("00000000-0000-0000-0000-000000000001".to_string()),
+            current_snapshot_id: Some(7),
+            schema_id: 1,
+            location: "file:///warehouse/t".to_string(),
+            schema: IcebergSchemaDef { fields: vec![] },
+            serialized_metadata: None,
+            serialized_metadata_rows: None,
+        }
+    }
+
+    fn column_def(name: &str, data_type: DataType, nullable: bool) -> ColumnDef {
+        ColumnDef {
+            name: name.to_string(),
+            data_type,
+            nullable,
+            write_default: None,
+            logical_type: None,
+        }
+    }
+
+    fn output_col(id: u32, name: &str, data_type: DataType, nullable: bool) -> OutputColumn {
+        OutputColumn {
+            column_id: ColumnId::new_for_test(id),
+            name: name.to_string(),
+            data_type,
+            nullable,
+            is_internal: false,
+        }
+    }
+
+    fn column_ref_expr(id: u32, column: &str, data_type: DataType, nullable: bool) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId::new_for_test(id),
+                qualifier: Some("t".to_string()),
+                column: column.to_string(),
+            },
+            data_type,
+            nullable,
+        }
     }
 }

@@ -107,7 +107,7 @@ fn single_fragment_child_plan(
     }))
 }
 
-fn output_columns_for_boundary(
+pub(in crate::sql::codegen) fn output_columns_for_boundary(
     columns: &[crate::sql::analysis::OutputColumn],
 ) -> Vec<OutputColumn> {
     columns
@@ -120,7 +120,7 @@ fn output_columns_for_boundary(
         .collect()
 }
 
-fn result_root_boundary_schema_report(
+pub(in crate::sql::codegen) fn result_root_boundary_schema_report(
     fragment_id: FragmentId,
     root_node_id: i32,
     output_columns: &[OutputColumn],
@@ -651,7 +651,8 @@ pub(crate) struct PlanFragmentBuilder<'a> {
     #[allow(dead_code)]
     catalog: &'a dyn CatalogProvider,
     pub(in crate::sql::codegen) connectors: &'a crate::connector::ConnectorRegistry,
-    mv_refresh_ctx: Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+    pub(in crate::sql::codegen) mv_refresh_ctx:
+        Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
     pub(in crate::sql::codegen) desc_builder: DescriptorTableBuilder,
     pub(in crate::sql::codegen) scan_tables: Vec<nodes::PlannedScanTable>,
     next_node_id: i32,
@@ -718,6 +719,17 @@ impl<'a> PlanFragmentBuilder<'a> {
         _current_database: &str,
     ) -> Result<MultiFragmentBuildResult, String> {
         Self::build_with_mv_refresh_ctx(plan, catalog, connectors, _current_database, None)
+    }
+
+    pub(crate) fn build_via_distributed_plan(
+        plan: &PhysicalPlanNode,
+        catalog: &'a dyn CatalogProvider,
+        connectors: &'a crate::connector::ConnectorRegistry,
+        _current_database: &str,
+    ) -> Result<MultiFragmentBuildResult, String> {
+        super::id_binding_verifier::verify_id_binding(plan)?;
+        let dp = crate::sql::codegen::ir::build_distributed_plan(plan)?;
+        crate::sql::codegen::ir::lower_distributed_plan(&dp, catalog, connectors)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1371,7 +1383,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             .ok_or_else(|| "no active fragment id in builder".to_string())
     }
 
-    pub(in crate::sql::codegen) fn lowering_ctx(&mut self) -> LoweringCtx<'_, 'a> {
+    pub(in crate::sql::codegen) fn lowering_ctx(&mut self) -> LoweringCtx<'_, 'a, Self> {
         LoweringCtx::new(self)
     }
 
@@ -4955,7 +4967,7 @@ fn unpartitioned_stream_partition() -> partitions::TDataPartition {
     )
 }
 
-fn build_result_sink() -> data_sinks::TDataSink {
+pub(in crate::sql::codegen) fn build_result_sink() -> data_sinks::TDataSink {
     data_sinks::TDataSink::new(
         data_sinks::TDataSinkType::RESULT_SINK,
         None::<data_sinks::TDataStreamSink>,
