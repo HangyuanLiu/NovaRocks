@@ -1,6 +1,7 @@
 use arrow::datatypes::DataType;
 
 use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
+use crate::sql::codegen::helpers::group_win_exprs_by_sig;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
@@ -80,6 +81,17 @@ impl LogicalRewriteRule for RankingWindowPredicatePushdownRule {
                 .iter()
                 .any(|w| ranking_topn_type(&w.name).is_none())
         {
+            return Ok(RewriteResult::Unchanged);
+        }
+
+        // --- Step 3b: Single-signature guard ---
+        // All ranking window exprs must share ONE (partition_by, order_by, frame)
+        // signature.  When two ranking fns have DIFFERENT ORDER BY, the analytic Sort
+        // is keyed on window_exprs[0]'s order — setting partition_limit truncates
+        // every partition by that first order, corrupting results for any window expr
+        // with a different ORDER BY.  The safe case (same PARTITION+ORDER, e.g.
+        // rank()+dense_rank() over the same spec) produces exactly one group.
+        if group_win_exprs_by_sig(&window.window_exprs).len() != 1 {
             return Ok(RewriteResult::Unchanged);
         }
 
@@ -794,5 +806,141 @@ mod tests {
         });
 
         assert!(matches!(apply_rule(plan), RewriteResult::Unchanged));
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: rejects multiple ranking fns with DIFFERENT ORDER BY (C1 bug shape)
+    //
+    // Window has rank() ORDER BY a AND rank() ORDER BY b (same PARTITION BY p,
+    // different ORDER BY).  group_win_exprs_by_sig returns 2 groups → Unchanged.
+    // This is exactly the bug shape: the analytic Sort is keyed on exprs[0]'s
+    // order, so setting partition_limit would corrupt exprs[1]'s result.
+    // -----------------------------------------------------------------------
+
+    fn make_window_expr_with_order(
+        fn_name: &str,
+        output_id: ColumnId,
+        p_id: ColumnId,
+        order_id: ColumnId,
+    ) -> WindowExpr {
+        WindowExpr {
+            name: fn_name.to_string(),
+            args: vec![],
+            distinct: false,
+            partition_by: vec![col_ref(p_id)],
+            order_by: vec![sort_item(col_ref(order_id))],
+            window_frame: None,
+            result_type: DataType::Int64,
+            output_name: fn_name.to_string(),
+            output_column_id: output_id,
+            ignore_nulls: false,
+        }
+    }
+
+    #[test]
+    fn rejects_multiple_ranking_signatures_different_order() {
+        let rka_id = ColumnId::new_for_test(90); // rank() ORDER BY a
+        let rkb_id = ColumnId::new_for_test(91); // rank() ORDER BY b
+        let p_id = ColumnId::new_for_test(92);
+        let a_id = ColumnId::new_for_test(93);
+        let b_id = ColumnId::new_for_test(94);
+
+        // Sort keyed on partition=[p_id], order=[a_id] (first window's order)
+        let sort = LogicalPlan::Sort(SortNode {
+            input: Box::new(empty_values()),
+            items: vec![sort_item(col_ref(p_id)), sort_item(col_ref(a_id))],
+            analytic_partition_by: vec![col_ref(p_id)],
+            partition_limit: None,
+            topn_type: None,
+            required_output_columns: None,
+        });
+
+        // Window has TWO ranking exprs with different ORDER BY signatures.
+        let window = LogicalPlan::Window(WindowNode {
+            input: Box::new(sort),
+            window_exprs: vec![
+                make_window_expr_with_order("rank", rka_id, p_id, a_id),
+                make_window_expr_with_order("rank", rkb_id, p_id, b_id),
+            ],
+            output_columns: vec![output_col(rka_id, "rka"), output_col(rkb_id, "rkb")],
+            required_output_columns: None,
+        });
+
+        // Filter on the SECOND ranking expr's column (rkb <= 2) — the one that
+        // would be corrupted if partition_limit were set on the first-order Sort.
+        let plan = LogicalPlan::Filter(FilterNode {
+            input: Box::new(window),
+            predicate: binop(col_ref(rkb_id), BinOp::Le, int(2)),
+            required_output_columns: None,
+        });
+
+        // matches() fires (structural shape is valid)
+        let rule = RankingWindowPredicatePushdownRule;
+        let mut ctx = RewriteContext::new(RewriteConsumer::Query);
+        assert!(
+            rule.matches(&plan, &ctx),
+            "matches() should fire on this structural shape"
+        );
+
+        // apply() must return Unchanged — different ORDER BY signatures detected.
+        assert!(
+            matches!(apply_rule(plan), RewriteResult::Unchanged),
+            "apply() must return Unchanged when ranking fns have different ORDER BY"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: fires when two ranking fns share the SAME (partition_by, order_by)
+    //
+    // rank() + dense_rank() over PARTITION p ORDER o → single signature group →
+    // group_win_exprs_by_sig returns 1 group → rule fires and sets partition_limit.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fires_for_same_signature_multi_fn() {
+        let rk_id = ColumnId::new_for_test(100); // rank() output
+        let drk_id = ColumnId::new_for_test(101); // dense_rank() output
+        let p_id = ColumnId::new_for_test(102);
+        let o_id = ColumnId::new_for_test(103);
+
+        let sort = LogicalPlan::Sort(SortNode {
+            input: Box::new(empty_values()),
+            items: vec![sort_item(col_ref(p_id)), sort_item(col_ref(o_id))],
+            analytic_partition_by: vec![col_ref(p_id)],
+            partition_limit: None,
+            topn_type: None,
+            required_output_columns: None,
+        });
+
+        // Both exprs share PARTITION BY p ORDER BY o → same signature.
+        let window = LogicalPlan::Window(WindowNode {
+            input: Box::new(sort),
+            window_exprs: vec![
+                make_window_expr_with_order("rank", rk_id, p_id, o_id),
+                make_window_expr_with_order("dense_rank", drk_id, p_id, o_id),
+            ],
+            output_columns: vec![output_col(rk_id, "rk"), output_col(drk_id, "drk")],
+            required_output_columns: None,
+        });
+
+        // Filter on the rank column (rk <= 3).
+        let plan = LogicalPlan::Filter(FilterNode {
+            input: Box::new(window),
+            predicate: binop(col_ref(rk_id), BinOp::Le, int(3)),
+            required_output_columns: None,
+        });
+
+        // Rule must FIRE — single signature, both are ranking fns, non-empty partition.
+        let sort_node = extract_sort_from_changed(apply_rule(plan));
+        assert_eq!(
+            sort_node.partition_limit,
+            Some(3),
+            "partition_limit must be set to 3 for same-signature rank+dense_rank"
+        );
+        assert_eq!(
+            sort_node.topn_type,
+            Some(SortTopNType::Rank),
+            "topn_type must reflect the matched ranking function (rank)"
+        );
     }
 }

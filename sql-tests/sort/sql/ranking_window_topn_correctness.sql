@@ -262,3 +262,40 @@ SELECT (
 );
 
 SET disable_optimizer_rules='';
+
+-- ===========================================================================
+-- Case 9: Two ranking fns with DIFFERENT ORDER BY — rule must NOT fire.
+-- rank() ORDER BY a DESC ranks by value; rank() ORDER BY b DESC ranks by row order.
+-- Filter rkb <= 2 should return the 2 rows with the largest b (b=4 and b=3).
+-- With the bug, rule ON would corrupt results; with the fix, rule ON is a no-op
+-- for this shape and results must match rule OFF exactly.
+-- ===========================================================================
+DROP TABLE IF EXISTS ${case_db}.rw_c9;
+CREATE TABLE ${case_db}.rw_c9 (grp INT, a INT, b INT);
+INSERT INTO ${case_db}.rw_c9 VALUES (1,40,1),(1,30,2),(1,20,3),(1,10,4);
+
+-- @explain_not_contains=partition_limit=
+SELECT grp,a,b,rka,rkb
+FROM (
+    SELECT grp, a, b,
+           rank() OVER (PARTITION BY grp ORDER BY a DESC) AS rka,
+           rank() OVER (PARTITION BY grp ORDER BY b DESC) AS rkb
+    FROM ${case_db}.rw_c9
+) x
+WHERE rkb <= 2
+ORDER BY b DESC;
+
+SET disable_optimizer_rules='RankingWindowPredicatePushdown';
+
+-- Case 9 rule OFF — must produce identical rows as Case 9 rule ON.
+SELECT grp,a,b,rka,rkb
+FROM (
+    SELECT grp, a, b,
+           rank() OVER (PARTITION BY grp ORDER BY a DESC) AS rka,
+           rank() OVER (PARTITION BY grp ORDER BY b DESC) AS rkb
+    FROM ${case_db}.rw_c9
+) x
+WHERE rkb <= 2
+ORDER BY b DESC;
+
+SET disable_optimizer_rules='';
