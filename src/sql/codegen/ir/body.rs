@@ -114,18 +114,9 @@ pub(crate) struct SetOpBody {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct WindowGroupPlan {
-    pub sort_node_id: Option<i32>,
-    pub analytic_node_id: i32,
-    pub intermediate_tuple_id: i32,
-    pub output_tuple_id: i32,
-}
-
-#[derive(Clone, Debug)]
 pub(crate) struct WindowBody {
     pub window_exprs: Vec<WindowExpr>,
     pub output_columns: Vec<OutputColumn>,
-    pub groups: Vec<WindowGroupPlan>,
 }
 
 #[derive(Clone, Debug)]
@@ -136,8 +127,6 @@ pub(crate) struct GenerateSeriesBody {
     pub column_name: String,
     pub alias: Option<String>,
     pub output_column_id: ColumnId,
-    pub param_tuple_id: i32,
-    pub param_values_node_id: i32,
 }
 
 #[derive(Clone, Debug)]
@@ -147,6 +136,32 @@ pub(crate) struct TableFunctionBody {
     pub output_columns: Vec<OutputColumn>,
     pub alias: Option<String>,
     pub is_left_join: bool,
-    pub project_tuple_id: i32,
-    pub project_node_id: i32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multi_node_bodies_carry_only_semantic_fields() {
+        let _window = WindowBody {
+            window_exprs: Vec::new(),
+            output_columns: Vec::new(),
+        };
+        let _generate_series = GenerateSeriesBody {
+            start: 1,
+            end: 3,
+            step: 1,
+            column_name: "value".to_string(),
+            alias: Some("gs".to_string()),
+            output_column_id: ColumnId::new_for_test(1),
+        };
+        let _table_function = TableFunctionBody {
+            function_name: "unnest".to_string(),
+            args: Vec::new(),
+            output_columns: Vec::new(),
+            alias: Some("u".to_string()),
+            is_left_join: false,
+        };
+    }
 }

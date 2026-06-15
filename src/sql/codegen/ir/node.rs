@@ -27,8 +27,8 @@ impl PlanNodeStats {
 #[derive(Clone, Debug)]
 pub(crate) struct DistributedPlanNode {
     /// Allocated once in Pass 1; never reallocated. In a thrift-lowered
-    /// fragment every DistributedPlanNode produces exactly one TPlanNode, so
-    /// `node_id == TPlanNode.node_id == profile plan_node_id`.
+    /// fragment most DistributedPlanNode bodies produce exactly one TPlanNode.
+    /// Multi-node bodies use this as the root emitted TPlanNode id.
     pub node_id: i32,
     pub fragment_id: FragmentId,
     /// Output tuples (thrift `row_tuples`). Allocated in Pass 1.

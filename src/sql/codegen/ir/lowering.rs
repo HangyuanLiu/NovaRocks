@@ -790,13 +790,21 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     ));
                 }
                 let child = self.lower_node(&node.children[0])?;
-                let lowered_window = self.lower_window(window, child)?;
+                let (mut plan_nodes, scope, tuple_ids, ordering) = self.lower_window(
+                    node.node_id,
+                    &node.tuple_ids,
+                    window,
+                    &child.scope,
+                    &child.tuple_ids,
+                    &child.ordering,
+                )?;
+                plan_nodes.extend(child.plan_nodes);
                 LoweredDistributedNode {
-                    plan_nodes: lowered_window.plan_nodes,
-                    scope: lowered_window.scope,
-                    tuple_ids: lowered_window.tuple_ids,
+                    plan_nodes,
+                    scope,
+                    tuple_ids,
                     output_columns: window.output_columns.clone(),
-                    ordering: lowered_window.ordering,
+                    ordering,
                 }
             }
             super::node::DistributedPlanNodeBody::GenerateSeries(generate_series) => {
@@ -809,13 +817,8 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 }
                 let output_tuple_id = first_tuple_id(node, "GenerateSeries")?;
                 let op = generate_series_body_to_physical_op(generate_series);
-                let (plan_nodes, scope) = self.lower_generate_series(
-                    node.node_id,
-                    output_tuple_id,
-                    generate_series.param_values_node_id,
-                    generate_series.param_tuple_id,
-                    &op,
-                )?;
+                let (plan_nodes, scope) =
+                    self.lower_generate_series(node.node_id, output_tuple_id, &op)?;
                 LoweredDistributedNode {
                     plan_nodes,
                     scope,
@@ -841,14 +844,8 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 let child = self.lower_node(&node.children[0])?;
                 let output_tuple_id = first_tuple_id(node, "TableFunction")?;
                 let op = table_function_body_to_physical_op(table_function);
-                let (table_fn_nodes, scope) = self.lower_table_function(
-                    node.node_id,
-                    output_tuple_id,
-                    table_function.project_node_id,
-                    table_function.project_tuple_id,
-                    &op,
-                    &child,
-                )?;
+                let (table_fn_nodes, scope) =
+                    self.lower_table_function(node.node_id, output_tuple_id, &op, &child.scope)?;
                 let mut plan_nodes = table_fn_nodes;
                 plan_nodes.extend(child.plan_nodes);
                 LoweredDistributedNode {
@@ -2221,23 +2218,49 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_window(
         &mut self,
+        window_node_id: i32,
+        node_tuple_ids: &[i32],
         body: &super::body::WindowBody,
-        child: LoweredDistributedNode,
-    ) -> Result<LoweredDistributedNode, String> {
+        child_scope: &ExprScope,
+        child_tuple_ids: &[i32],
+        child_ordering: &OrderingSpec,
+    ) -> Result<
+        (
+            Vec<plan_nodes::TPlanNode>,
+            ExprScope,
+            Vec<i32>,
+            OrderingSpec,
+        ),
+        String,
+    > {
         let groups = group_win_exprs_by_sig(&body.window_exprs);
         if groups.is_empty() {
             return Err("DistributedPlan Window has no window expressions".to_string());
         }
-        if groups.len() != body.groups.len() {
+        let expected_tuple_count = child_tuple_ids.len() + groups.len();
+        if node_tuple_ids.len() != expected_tuple_count {
             return Err(format!(
-                "DistributedPlan Window group count mismatch: expressions grouped to {}, body has {}",
-                groups.len(),
-                body.groups.len()
+                "DistributedPlan Window tuple count mismatch: expected {}, got {}",
+                expected_tuple_count,
+                node_tuple_ids.len()
             ));
         }
 
-        let mut current = child;
-        for (group_indices, group_plan) in groups.iter().zip(&body.groups) {
+        let mut op_nodes = Vec::new();
+        let mut current_scope = ExprScope::new();
+        current_scope.merge(child_scope);
+        let mut current_tuple_ids = child_tuple_ids.to_vec();
+        let mut current_ordering = child_ordering.clone();
+        let mut next_node_id = window_node_id;
+
+        for (group_idx, group_indices) in groups.iter().enumerate() {
+            let output_tuple_id = node_tuple_ids[child_tuple_ids.len() + group_idx];
+            let intermediate_tuple_id = output_tuple_id.checked_sub(1).ok_or_else(|| {
+                format!(
+                    "DistributedPlan Window output tuple id {} cannot derive intermediate tuple id",
+                    output_tuple_id
+                )
+            })?;
             let group_exprs: Vec<_> = group_indices
                 .iter()
                 .map(|&i| body.window_exprs[i].clone())
@@ -2246,54 +2269,66 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 .first()
                 .ok_or_else(|| "DistributedPlan Window group is empty".to_string())?;
 
-            if let Some(sort_node_id) = group_plan.sort_node_id {
-                let mut sort_ordering = Vec::new();
-                let mut sort_is_asc = Vec::new();
-                let mut sort_nulls_first_list = Vec::new();
-                for expr in &first_win.partition_by {
-                    let mut compiler =
-                        ExprCompiler::new(self.state.slot_allocator(), &current.scope);
-                    sort_ordering.push(compiler.compile_typed(expr)?);
-                    sort_is_asc.push(true);
-                    sort_nulls_first_list.push(true);
-                }
-                for item in &first_win.order_by {
-                    let mut compiler =
-                        ExprCompiler::new(self.state.slot_allocator(), &current.scope);
-                    sort_ordering.push(compiler.compile_typed(&item.expr)?);
-                    sort_is_asc.push(item.asc);
-                    sort_nulls_first_list.push(item.nulls_first);
-                }
-                let sort_plan = nodes::build_sort_node_raw(
-                    sort_node_id,
-                    current.tuple_ids.clone(),
-                    sort_ordering,
-                    sort_is_asc,
-                    sort_nulls_first_list,
-                    -1,
-                    None,
-                );
-                let mut pnodes = vec![sort_plan];
-                pnodes.extend(current.plan_nodes);
-                current.plan_nodes = pnodes;
-                current.ordering =
+            if groups.len() > 1 {
+                let required_ordering =
                     window_ordering_spec(&first_win.partition_by, &first_win.order_by);
+                let has_sort_keys =
+                    !first_win.partition_by.is_empty() || !first_win.order_by.is_empty();
+                let ordering_is_representable = !matches!(required_ordering, OrderingSpec::Any);
+                let needs_sort = has_sort_keys
+                    && (!ordering_is_representable
+                        || !current_ordering.satisfies(&required_ordering));
+                if needs_sort {
+                    let sort_node_id = next_node_id;
+                    next_node_id += 1;
+                    let mut sort_ordering = Vec::new();
+                    let mut sort_is_asc = Vec::new();
+                    let mut sort_nulls_first_list = Vec::new();
+                    for expr in &first_win.partition_by {
+                        let mut compiler =
+                            ExprCompiler::new(self.state.slot_allocator(), &current_scope);
+                        sort_ordering.push(compiler.compile_typed(expr)?);
+                        sort_is_asc.push(true);
+                        sort_nulls_first_list.push(true);
+                    }
+                    for item in &first_win.order_by {
+                        let mut compiler =
+                            ExprCompiler::new(self.state.slot_allocator(), &current_scope);
+                        sort_ordering.push(compiler.compile_typed(&item.expr)?);
+                        sort_is_asc.push(item.asc);
+                        sort_nulls_first_list.push(item.nulls_first);
+                    }
+                    let sort_plan = nodes::build_sort_node_raw(
+                        sort_node_id,
+                        current_tuple_ids.clone(),
+                        sort_ordering,
+                        sort_is_asc,
+                        sort_nulls_first_list,
+                        -1,
+                        None,
+                    );
+                    op_nodes.insert(0, sort_plan);
+                    current_ordering = required_ordering;
+                }
             }
+
+            let analytic_node_id = next_node_id;
+            next_node_id += 1;
 
             let mut partition_exprs = Vec::new();
             for expr in &first_win.partition_by {
-                let mut compiler = ExprCompiler::new(self.state.slot_allocator(), &current.scope);
+                let mut compiler = ExprCompiler::new(self.state.slot_allocator(), &current_scope);
                 partition_exprs.push(compiler.compile_typed(expr)?);
             }
             let mut order_by_exprs = Vec::new();
             for item in &first_win.order_by {
-                let mut compiler = ExprCompiler::new(self.state.slot_allocator(), &current.scope);
+                let mut compiler = ExprCompiler::new(self.state.slot_allocator(), &current_scope);
                 order_by_exprs.push(compiler.compile_typed(&item.expr)?);
             }
 
             let mut analytic_functions = Vec::new();
             for win_expr in &group_exprs {
-                let mut compiler = ExprCompiler::new(self.state.slot_allocator(), &current.scope);
+                let mut compiler = ExprCompiler::new(self.state.slot_allocator(), &current_scope);
                 let agg_call = AggregateCall {
                     name: win_expr.name.clone(),
                     args: win_expr.args.clone(),
@@ -2311,7 +2346,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 let slot_id = self.state.alloc_slot();
                 self.state.desc_builder().add_slot(
                     slot_id,
-                    group_plan.intermediate_tuple_id,
+                    intermediate_tuple_id,
                     &format!("__win_intermediate_{idx}"),
                     &win_expr.result_type,
                     true,
@@ -2320,15 +2355,15 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             }
             self.state
                 .desc_builder()
-                .add_tuple(group_plan.intermediate_tuple_id, None);
+                .add_tuple(intermediate_tuple_id, None);
 
             let mut output_scope = ExprScope::new();
-            output_scope.merge(&current.scope);
+            output_scope.merge(&current_scope);
             for (idx, win_expr) in group_exprs.iter().enumerate() {
                 let slot_id = self.state.alloc_slot();
                 self.state.desc_builder().add_slot(
                     slot_id,
-                    group_plan.output_tuple_id,
+                    output_tuple_id,
                     &win_expr.output_name,
                     &win_expr.result_type,
                     true,
@@ -2339,7 +2374,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     None,
                     win_expr.output_name.clone(),
                     ColumnBinding {
-                        tuple_id: group_plan.output_tuple_id,
+                        tuple_id: output_tuple_id,
                         slot_id,
                         data_type: win_expr.result_type.clone(),
                         type_desc: None,
@@ -2347,17 +2382,15 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     },
                 );
             }
-            self.state
-                .desc_builder()
-                .add_tuple(group_plan.output_tuple_id, None);
+            self.state.desc_builder().add_tuple(output_tuple_id, None);
 
             let analytic_tnode = plan_nodes::TAnalyticNode {
                 partition_exprs,
                 order_by_exprs,
                 analytic_functions,
                 window: analytic_window_from_expr(first_win),
-                intermediate_tuple_id: group_plan.intermediate_tuple_id,
-                output_tuple_id: group_plan.output_tuple_id,
+                intermediate_tuple_id,
+                output_tuple_id,
                 buffered_tuple_id: None,
                 partition_by_eq: None,
                 order_by_eq: None,
@@ -2369,38 +2402,32 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             };
 
             let mut plan_node = nodes::default_plan_node();
-            plan_node.node_id = group_plan.analytic_node_id;
+            plan_node.node_id = analytic_node_id;
             plan_node.node_type = plan_nodes::TPlanNodeType::ANALYTIC_EVAL_NODE;
             plan_node.num_children = 1;
             plan_node.limit = -1;
-            let mut new_tuple_ids = current.tuple_ids.clone();
-            new_tuple_ids.push(group_plan.output_tuple_id);
+            let mut new_tuple_ids = current_tuple_ids.clone();
+            new_tuple_ids.push(output_tuple_id);
             plan_node.row_tuples = new_tuple_ids.clone();
             plan_node.nullable_tuples = vec![];
             plan_node.analytic_node = Some(analytic_tnode);
 
-            let mut pnodes = vec![plan_node];
-            pnodes.extend(current.plan_nodes);
-            current = LoweredDistributedNode {
-                plan_nodes: pnodes,
-                scope: output_scope,
-                tuple_ids: new_tuple_ids,
-                output_columns: body.output_columns.clone(),
-                ordering: current.ordering,
-            };
+            op_nodes.insert(0, plan_node);
+            current_scope = output_scope;
+            current_tuple_ids = new_tuple_ids;
         }
 
-        Ok(current)
+        Ok((op_nodes, current_scope, current_tuple_ids, current_ordering))
     }
 
     fn lower_generate_series(
         &mut self,
         table_fn_node_id: i32,
         output_tuple_id: i32,
-        param_values_node_id: i32,
-        param_tuple_id: i32,
         op: &PhysicalGenerateSeriesOp,
     ) -> Result<(Vec<plan_nodes::TPlanNode>, ExprScope), String> {
+        let derived_param_values_node = table_fn_node_id - 1;
+        let derived_param_tuple = output_tuple_id - 1;
         if op.step == 0 {
             return Err("generate_series step size cannot equal zero".to_string());
         }
@@ -2420,7 +2447,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             let slot_id = self.state.alloc_slot();
             self.state.desc_builder().add_slot_with_type_desc(
                 slot_id,
-                param_tuple_id,
+                derived_param_tuple,
                 name,
                 int64_type_desc.clone(),
                 false,
@@ -2429,16 +2456,18 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             param_slots.push(slot_id);
             param_exprs.push(self.compile_int64_literal(value, &empty_scope)?);
         }
-        self.state.desc_builder().add_tuple(param_tuple_id, None);
+        self.state
+            .desc_builder()
+            .add_tuple(derived_param_tuple, None);
 
         let mut param_values_node = nodes::default_plan_node();
-        param_values_node.node_id = param_values_node_id;
+        param_values_node.node_id = derived_param_values_node;
         param_values_node.node_type = plan_nodes::TPlanNodeType::UNION_NODE;
         param_values_node.num_children = 0;
-        param_values_node.row_tuples = vec![param_tuple_id];
+        param_values_node.row_tuples = vec![derived_param_tuple];
         param_values_node.nullable_tuples = vec![];
         param_values_node.union_node = Some(plan_nodes::TUnionNode {
-            tuple_id: param_tuple_id,
+            tuple_id: derived_param_tuple,
             result_expr_lists: vec![],
             const_expr_lists: vec![param_exprs],
             first_materialized_child_idx: 0,
@@ -2553,11 +2582,11 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         &mut self,
         table_fn_node_id: i32,
         output_tuple_id: i32,
-        project_node_id: i32,
-        project_tuple_id: i32,
         op: &PhysicalTableFunctionOp,
-        child: &LoweredDistributedNode,
+        child_scope: &ExprScope,
     ) -> Result<(Vec<plan_nodes::TPlanNode>, ExprScope), String> {
+        let derived_project_node = table_fn_node_id - 1;
+        let derived_project_tuple = output_tuple_id - 1;
         if !op.function_name.eq_ignore_ascii_case("unnest") {
             return Err(format!(
                 "unsupported standalone table function: {}",
@@ -2578,8 +2607,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         let mut outer_columns = Vec::new();
         let mut outer_slots = Vec::new();
 
-        let child_cols: Vec<(String, ColumnBinding)> = child
-            .scope
+        let child_cols: Vec<(String, ColumnBinding)> = child_scope
             .iter_columns()
             .map(|(name, binding)| (name.clone(), binding.clone()))
             .collect();
@@ -2588,7 +2616,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             let type_desc = expr_compiler::binding_type_desc(binding)?;
             self.state.desc_builder().add_slot_with_type_desc(
                 slot_id,
-                project_tuple_id,
+                derived_project_tuple,
                 name,
                 type_desc.clone(),
                 binding.nullable,
@@ -2603,7 +2631,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 ),
             );
             let new_binding = ColumnBinding {
-                tuple_id: project_tuple_id,
+                tuple_id: derived_project_tuple,
                 slot_id,
                 data_type: binding.data_type.clone(),
                 type_desc: Some(type_desc),
@@ -2615,7 +2643,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             outer_slots.push(slot_id);
             outer_columns.push((name.clone(), new_binding));
         }
-        for (column_id, binding) in child.scope.iter_id_bindings() {
+        for (column_id, binding) in child_scope.iter_id_bindings() {
             if let Some(new_binding) =
                 remapped_child_bindings.get(&(binding.tuple_id, binding.slot_id))
             {
@@ -2626,7 +2654,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         let mut param_slots = Vec::with_capacity(op.args.len());
         let mut param_type_descs = Vec::with_capacity(op.args.len());
         for (idx, arg) in op.args.iter().enumerate() {
-            let mut compiler = ExprCompiler::new(self.state.slot_allocator(), &child.scope);
+            let mut compiler = ExprCompiler::new(self.state.slot_allocator(), child_scope);
             let texpr = compiler.compile_typed(arg)?;
             let type_desc = texpr
                 .nodes
@@ -2636,7 +2664,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             let slot_id = self.state.alloc_slot();
             self.state.desc_builder().add_slot_with_type_desc(
                 slot_id,
-                project_tuple_id,
+                derived_project_tuple,
                 &format!("__tf_arg_{idx}"),
                 type_desc.clone(),
                 arg.nullable,
@@ -2646,9 +2674,11 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             param_slots.push(slot_id);
             param_type_descs.push(type_desc);
         }
-        self.state.desc_builder().add_tuple(project_tuple_id, None);
+        self.state
+            .desc_builder()
+            .add_tuple(derived_project_tuple, None);
         let project_plan_node =
-            nodes::build_project_node(project_node_id, project_tuple_id, slot_map);
+            nodes::build_project_node(derived_project_node, derived_project_tuple, slot_map);
 
         let mut output_scope = ExprScope::new();
         let mut output_outer_by_project_slot = HashMap::new();

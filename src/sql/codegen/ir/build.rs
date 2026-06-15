@@ -8,7 +8,7 @@ use super::FragmentId;
 use super::body::{
     AssertOneRowBody, DecodeBody, GenerateSeriesBody, HashAggregateBody, HashJoinBody,
     NestLoopJoinBody, ProjectBody, RepeatBody, ScanBody, SetOpBody, SetOpKind, SortBody,
-    TableFunctionBody, TopNBody, ValuesBody, WindowBody, WindowGroupPlan,
+    TableFunctionBody, TopNBody, ValuesBody, WindowBody,
 };
 use super::fragment::{DataPartition, DataSink, DistributedPlan, PlanFragment};
 use super::node::{DistributedPlanNode, DistributedPlanNodeBody, PlanNodeStats};
@@ -372,7 +372,7 @@ impl DistributedPlanBuilder {
                     );
                 }
 
-                let mut group_plans = Vec::with_capacity(groups.len());
+                let mut first_node_id = None;
                 let mut tuple_ids = child.tuple_ids.clone();
                 let mut current_ordering = distributed_node_ordering(&child);
                 for group_indices in &groups {
@@ -380,7 +380,7 @@ impl DistributedPlanBuilder {
                         continue;
                     };
                     let first_win = &op.window_exprs[first_idx];
-                    let sort_node_id = if groups.len() > 1 {
+                    if groups.len() > 1 {
                         let required_ordering =
                             window_ordering_spec(&first_win.partition_by, &first_win.order_by);
                         let has_sort_keys =
@@ -392,30 +392,20 @@ impl DistributedPlanBuilder {
                                 || !current_ordering.satisfies(&required_ordering));
                         if needs_sort {
                             let sort_node_id = self.alloc_node();
+                            first_node_id.get_or_insert(sort_node_id);
                             current_ordering = required_ordering;
-                            Some(sort_node_id)
-                        } else {
-                            None
                         }
-                    } else {
-                        None
-                    };
+                    }
                     let analytic_node_id = self.alloc_node();
-                    let intermediate_tuple_id = self.alloc_tuple();
+                    first_node_id.get_or_insert(analytic_node_id);
+                    let _ = self.alloc_tuple();
                     let output_tuple_id = self.alloc_tuple();
                     tuple_ids.push(output_tuple_id);
-                    group_plans.push(WindowGroupPlan {
-                        sort_node_id,
-                        analytic_node_id,
-                        intermediate_tuple_id,
-                        output_tuple_id,
-                    });
                 }
 
-                let node_id = group_plans
-                    .first()
-                    .and_then(|group| group.sort_node_id)
-                    .unwrap_or_else(|| group_plans[0].analytic_node_id);
+                let node_id = first_node_id.ok_or_else(|| {
+                    "build_distributed_plan M0: PhysicalWindow produced no thrift node".to_string()
+                })?;
                 Ok(DistributedPlanNode {
                     node_id,
                     fragment_id,
@@ -430,7 +420,6 @@ impl DistributedPlanBuilder {
                     body: DistributedPlanNodeBody::Window(Box::new(WindowBody {
                         window_exprs: op.window_exprs.clone(),
                         output_columns: op.output_columns.clone(),
-                        groups: group_plans,
                     })),
                 })
             }
@@ -470,8 +459,8 @@ impl DistributedPlanBuilder {
                 if op.step == 0 {
                     return Err("generate_series step size cannot equal zero".to_string());
                 }
-                let param_tuple_id = self.alloc_tuple();
-                let param_values_node_id = self.alloc_node();
+                let _ = self.alloc_tuple();
+                let _ = self.alloc_node();
                 let output_tuple_id = self.alloc_tuple();
                 let table_fn_node_id = self.alloc_node();
                 Ok(DistributedPlanNode {
@@ -492,16 +481,14 @@ impl DistributedPlanBuilder {
                         column_name: op.column_name.clone(),
                         alias: op.alias.clone(),
                         output_column_id: op.output_column_id,
-                        param_tuple_id,
-                        param_values_node_id,
                     }),
                 })
             }
             Operator::PhysicalTableFunction(op) => {
                 let child_plan = expect_single_child(node, "PhysicalTableFunction")?;
                 let child = self.visit(child_plan, fragment_id)?;
-                let project_tuple_id = self.alloc_tuple();
-                let project_node_id = self.alloc_node();
+                let _ = self.alloc_tuple();
+                let _ = self.alloc_node();
                 let output_tuple_id = self.alloc_tuple();
                 let table_fn_node_id = self.alloc_node();
                 Ok(DistributedPlanNode {
@@ -521,8 +508,6 @@ impl DistributedPlanBuilder {
                         output_columns: op.output_columns.clone(),
                         alias: op.alias.clone(),
                         is_left_join: op.is_left_join,
-                        project_tuple_id,
-                        project_node_id,
                     })),
                 })
             }
