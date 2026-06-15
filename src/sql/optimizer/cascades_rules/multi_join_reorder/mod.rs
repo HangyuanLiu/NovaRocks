@@ -1,12 +1,11 @@
-//! In-memo multi-candidate join reorder — enumeration cores (Phase 3).
+//! In-memo multi-candidate join reorder — enumeration cores.
 //!
 //! Pure enumeration over a flattened inner/cross join chain. Produces candidate
 //! [`crate::sql::optimizer::memo::JoinTree`] orders (LeftDeep always; DP and
-//! Greedy-TopK subject to caps) that a later one-shot pass materializes into the
-//! memo via `stats::copy_in_join_tree`. Nothing here is wired into `optimize()`
-//! yet (Phase 4/5).
-#![allow(dead_code)] // Phase 3: enumeration cores are built and unit-tested here;
-// they become live when the one-shot reorder pass is added in Phase 4.
+//! Greedy-TopK subject to caps) that the one-shot [`pass`] materializes into the
+//! memo via `stats::copy_in_join_tree`. The pass runs from `optimize()` right
+//! after `derive_group_statistics` and is the only join-reorder mechanism (the
+//! legacy RBO reorder was retired).
 
 mod algo;
 mod flatten;

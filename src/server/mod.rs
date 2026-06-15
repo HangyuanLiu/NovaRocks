@@ -1025,6 +1025,12 @@ async fn execute_statement_text(
             "enable_materialized_view_rewrite" => {
                 shim.optimizer_settings.enable_materialized_view_rewrite = Some(enabled)
             }
+            "cbo_enable_dp_join_reorder" => {
+                shim.optimizer_settings.enable_dp_join_reorder = Some(enabled)
+            }
+            "cbo_enable_greedy_join_reorder" => {
+                shim.optimizer_settings.enable_greedy_join_reorder = Some(enabled)
+            }
             _ => return Ok(StatementResult::Ok),
         }
         return Ok(StatementResult::Ok);
@@ -1057,6 +1063,27 @@ async fn execute_statement_text(
     if let Some(v) = parse_set_non_negative_integer(trimmed, "global_runtime_filter_probe_min_size")
     {
         shim.optimizer_settings.rf_probe_min_bytes = Some(v);
+        return Ok(StatementResult::Ok);
+    }
+
+    // In-memo join-reorder size cutoffs (StarRocks `cbo_max_reorder_node*`).
+    // Exact keyword match, so the `_use_*` variants never collide with the
+    // shorter `cbo_max_reorder_node`.
+    if let Some(v) = parse_set_non_negative_integer(trimmed, "cbo_max_reorder_node_use_exhaustive")
+    {
+        shim.optimizer_settings.max_reorder_node_use_exhaustive = Some(v as usize);
+        return Ok(StatementResult::Ok);
+    }
+    if let Some(v) = parse_set_non_negative_integer(trimmed, "cbo_max_reorder_node_use_dp") {
+        shim.optimizer_settings.max_reorder_node_use_dp = Some(v as usize);
+        return Ok(StatementResult::Ok);
+    }
+    if let Some(v) = parse_set_non_negative_integer(trimmed, "cbo_max_reorder_node_use_greedy") {
+        shim.optimizer_settings.max_reorder_node_use_greedy = Some(v as usize);
+        return Ok(StatementResult::Ok);
+    }
+    if let Some(v) = parse_set_non_negative_integer(trimmed, "cbo_max_reorder_node") {
+        shim.optimizer_settings.max_reorder_node = Some(v as usize);
         return Ok(StatementResult::Ok);
     }
 
