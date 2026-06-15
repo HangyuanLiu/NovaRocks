@@ -786,7 +786,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         merged_tuple_ids.extend_from_slice(right_tuple_ids);
 
         let merged_scope = match op.join_type {
-            JoinKind::LeftSemi | JoinKind::LeftAnti => left_scope,
+            JoinKind::LeftSemi | JoinKind::LeftAnti | JoinKind::NullAwareLeftAnti => left_scope,
             JoinKind::RightSemi | JoinKind::RightAnti => right_scope,
             _ => {
                 let mut scope = left_scope;
@@ -837,7 +837,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         right_tuple_ids: &[i32],
     ) {
         match join_type {
-            JoinKind::LeftOuter | JoinKind::LeftAnti => {
+            JoinKind::LeftOuter | JoinKind::LeftAnti | JoinKind::NullAwareLeftAnti => {
                 for &tid in right_tuple_ids {
                     self.state.desc_builder().widen_tuple_nullable(tid);
                 }
@@ -2044,7 +2044,7 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
         JoinDistribution, Operator, PhysicalHashJoinEqCondition, PhysicalHashJoinOp,
-        PhysicalProjectOp, PhysicalScanOp,
+        PhysicalNestLoopJoinOp, PhysicalProjectOp, PhysicalScanOp,
     };
     use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, PlanExecutionProps};
     use crate::sql::optimizer::statistics::Statistics;
@@ -2230,6 +2230,48 @@ mod tests {
         let hash_join = plan_node.hash_join_node.expect("hash join node");
         assert_eq!(hash_join.eq_join_conjuncts.len(), 1);
         assert!(hash_join.other_join_conjuncts.is_none());
+    }
+
+    #[test]
+    fn null_aware_left_anti_nest_loop_join_exposes_left_scope_and_widens_build_side() {
+        let connectors = ConnectorRegistry::new();
+        let mut state = super::OwnedLoweringState::new(&connectors, None, 0);
+        let (left_column_id, right_column_id, _, _, left_scope, right_scope) =
+            hash_join_test_inputs(&mut state);
+        let op = PhysicalNestLoopJoinOp {
+            join_type: JoinKind::NullAwareLeftAnti,
+            condition: None,
+        };
+
+        let (plan_node, scope, tuple_ids) = {
+            let mut ctx = super::LoweringCtx::new(&mut state);
+            ctx.lower_nest_loop_join(10, &[1], &[2], &op, left_scope, right_scope)
+                .expect("lower nest loop join")
+        };
+
+        assert_eq!(tuple_ids, vec![1, 2]);
+        assert!(
+            scope.resolve_by_id(left_column_id).is_some(),
+            "left side should remain visible"
+        );
+        assert!(
+            scope.resolve_by_id(right_column_id).is_none(),
+            "build side should not be visible"
+        );
+        assert_eq!(plan_node.nullable_tuples, vec![false, true]);
+
+        let desc_tbl = state.desc_builder.build();
+        let slots = desc_tbl.slot_descriptors.expect("slot descriptors");
+        let left_slot = slots
+            .iter()
+            .find(|slot| slot.id == Some(11))
+            .expect("left slot descriptor");
+        let right_slot = slots
+            .iter()
+            .find(|slot| slot.id == Some(22))
+            .expect("right slot descriptor");
+        assert_eq!(left_slot.is_nullable, Some(false));
+        assert_eq!(right_slot.is_nullable, Some(true));
     }
 
     fn hash_join_test_inputs(

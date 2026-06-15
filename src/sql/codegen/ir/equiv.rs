@@ -167,6 +167,14 @@ mod tests {
     }
 
     #[test]
+    fn nest_loop_null_aware_left_anti_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "nest_loop_null_aware_left_anti",
+            nest_loop_surviving_side_plan(JoinKind::NullAwareLeftAnti),
+        );
+    }
+
+    #[test]
     fn iceberg_data_file_scan_ranges_match_direct_fragment_builder() {
         let mut connectors = ConnectorRegistry::new();
         connectors.register_scan_planner(Arc::new(IcebergConnectorScanPlanner::new()));

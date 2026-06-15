@@ -424,7 +424,8 @@ pub(crate) fn build_nestloop_join_node(
     let (left_nullable, right_nullable) = match join_op {
         plan_nodes::TJoinOp::LEFT_OUTER_JOIN
         | plan_nodes::TJoinOp::LEFT_ANTI_JOIN
-        | plan_nodes::TJoinOp::LEFT_SEMI_JOIN => (false, true),
+        | plan_nodes::TJoinOp::LEFT_SEMI_JOIN
+        | plan_nodes::TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN => (false, true),
         plan_nodes::TJoinOp::RIGHT_OUTER_JOIN
         | plan_nodes::TJoinOp::RIGHT_ANTI_JOIN
         | plan_nodes::TJoinOp::RIGHT_SEMI_JOIN => (true, false),
