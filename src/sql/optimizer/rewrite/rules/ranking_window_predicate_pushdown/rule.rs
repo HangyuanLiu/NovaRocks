@@ -100,10 +100,10 @@ impl LogicalRewriteRule for RankingWindowPredicatePushdownRule {
                 // w_expr.output_column_id.
                 proj.items.iter().find_map(|item| {
                     // Is this item a bare passthrough of w_expr.output_column_id?
-                    if let ExprKind::ColumnRef { column_id, .. } = &item.expr.kind {
-                        if *column_id == w_expr.output_column_id {
-                            return Some(item.output_column_id);
-                        }
+                    if let ExprKind::ColumnRef { column_id, .. } = &item.expr.kind
+                        && *column_id == w_expr.output_column_id
+                    {
+                        return Some(item.output_column_id);
                     }
                     None
                 })?
@@ -708,6 +708,52 @@ mod tests {
         let sort = extract_sort_from_changed(result);
         assert_eq!(sort.partition_limit, Some(3));
         assert_eq!(sort.topn_type, Some(SortTopNType::Rank));
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: rejects mixed ranking+aggregate window (tpc-ds q47/q57 shape)
+    //
+    // Window has rank() OVER w AND avg(x) OVER w.  The filter is on the rank
+    // column, and the Sort has a non-empty analytic_partition_by — so matches()
+    // fires — but apply() must return Unchanged because truncating the partition
+    // would corrupt the avg result (Step 3 all-ranking guard).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rejects_mixed_ranking_and_aggregate_window() {
+        let rk_id = ColumnId::new_for_test(80); // rank() output
+        let avg_id = ColumnId::new_for_test(81); // avg() output
+        let p_id = ColumnId::new_for_test(82);
+
+        let sort = make_sort(p_id); // analytic_partition_by is non-empty
+        let window = LogicalPlan::Window(WindowNode {
+            input: Box::new(sort),
+            window_exprs: vec![
+                make_window_expr("rank", rk_id, p_id),
+                make_window_expr("avg", avg_id, p_id),
+            ],
+            output_columns: vec![output_col(rk_id, "rank"), output_col(avg_id, "avg")],
+            required_output_columns: None,
+        });
+        // Filter on the rank column only (rk_id <= 2).
+        let plan = LogicalPlan::Filter(FilterNode {
+            input: Box::new(window),
+            predicate: binop(col_ref(rk_id), BinOp::Le, int(2)),
+            required_output_columns: None,
+        });
+
+        let rule = RankingWindowPredicatePushdownRule;
+        let mut ctx = RewriteContext::new(RewriteConsumer::Query);
+        // matches() sees Filter -> Window -> Sort(non-empty partition) and fires.
+        assert!(
+            rule.matches(&plan, &ctx),
+            "matches() should fire — the structural shape is valid"
+        );
+        // apply() must reject because avg is not a ranking function.
+        assert!(
+            matches!(apply_rule(plan), RewriteResult::Unchanged),
+            "apply() must return Unchanged when window contains a non-ranking expr"
+        );
     }
 
     // -----------------------------------------------------------------------
