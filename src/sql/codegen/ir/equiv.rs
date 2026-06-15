@@ -9,7 +9,7 @@ mod tests {
     use crate::connector::iceberg::IcebergMetadataTableType;
     use crate::connector::{ConnectorRegistry, iceberg::IcebergConnectorScanPlanner};
     use crate::sql::analysis::{
-        BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
+        BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, SortItem, TypedExpr,
     };
     use crate::sql::catalog::{
         CatalogProvider, ColumnDef, IcebergDataFileBinding, IcebergDataFileInfo, IcebergSchemaDef,
@@ -22,11 +22,13 @@ mod tests {
     };
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
-        Operator, PhysicalDistributionOp, PhysicalFilterOp, PhysicalProjectOp, PhysicalScanOp,
+        AggMode, Operator, PhysicalDistributionOp, PhysicalFilterOp, PhysicalHashAggregateOp,
+        PhysicalProjectOp, PhysicalScanOp, PhysicalSortOp,
     };
     use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, PlanExecutionProps};
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::statistics::Statistics;
+    use crate::sql::planner::plan::AggregateCall;
 
     #[test]
     fn scan_matches_direct_fragment_builder() {
@@ -56,6 +58,35 @@ mod tests {
         assert_distributed_plan_equivalent(
             "root_gather_scan_filter_project",
             root_gather_plan(project_plan(filter_plan(scan_plan()))),
+        );
+    }
+
+    #[test]
+    fn sort_over_scan_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent("sort_over_scan", sort_plan(scan_plan()));
+    }
+
+    #[test]
+    fn aggregate_single_over_scan_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "aggregate_single_over_scan",
+            aggregate_group_by_plan(scan_plan()),
+        );
+    }
+
+    #[test]
+    fn aggregate_with_count_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "aggregate_with_count",
+            aggregate_count_plan(scan_plan()),
+        );
+    }
+
+    #[test]
+    fn sort_over_project_over_scan_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "sort_over_project_over_scan",
+            sort_plan(project_plan(scan_plan())),
         );
     }
 
@@ -395,6 +426,66 @@ mod tests {
             }),
             vec![child],
             output_columns,
+        )
+    }
+
+    fn sort_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
+        let sort_col = child.output_columns[0].clone();
+        let output_columns = child.output_columns.clone();
+        physical_node(
+            Operator::PhysicalSort(PhysicalSortOp {
+                items: vec![SortItem {
+                    expr: column_ref_expr(
+                        sort_col.column_id.0,
+                        &sort_col.name,
+                        sort_col.data_type.clone(),
+                        sort_col.nullable,
+                    ),
+                    asc: true,
+                    nulls_first: false,
+                }],
+                analytic_partition_exprs: vec![],
+            }),
+            vec![child],
+            output_columns,
+        )
+    }
+
+    fn aggregate_group_by_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
+        let k = output_col(1, "k", DataType::Int64, false);
+        physical_node(
+            Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+                mode: AggMode::Single,
+                group_by: vec![column_ref_expr(1, "k", DataType::Int64, false)],
+                aggregates: vec![],
+                output_columns: vec![k.clone()],
+                is_merge: vec![],
+            }),
+            vec![child],
+            vec![k],
+        )
+    }
+
+    fn aggregate_count_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
+        let k = output_col(1, "k", DataType::Int64, false);
+        let count = output_col(201, "count(*)", DataType::Int64, true);
+        physical_node(
+            Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+                mode: AggMode::Single,
+                group_by: vec![column_ref_expr(1, "k", DataType::Int64, false)],
+                aggregates: vec![AggregateCall {
+                    name: "count".to_string(),
+                    args: vec![],
+                    distinct: false,
+                    result_type: DataType::Int64,
+                    order_by: vec![],
+                    output_column_id: ColumnId::new_for_test(201),
+                }],
+                output_columns: vec![k.clone(), count.clone()],
+                is_merge: vec![false],
+            }),
+            vec![child],
+            vec![k, count],
         )
     }
 

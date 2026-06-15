@@ -4,7 +4,7 @@ use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
 
 use super::FragmentId;
-use super::body::{ProjectBody, ScanBody};
+use super::body::{HashAggregateBody, ProjectBody, ScanBody, SortBody};
 use super::fragment::{DataPartition, DataSink, DistributedPlan, PlanFragment};
 use super::node::{DistributedPlanNode, DistributedPlanNodeBody, PlanNodeStats};
 
@@ -80,6 +80,48 @@ impl DistributedPlanBuilder {
                         items: op.items.clone(),
                         output_qualifier: op.output_qualifier.clone(),
                     }),
+                })
+            }
+            Operator::PhysicalSort(op) => {
+                let child_plan = expect_single_child(node, "PhysicalSort")?;
+                let child = self.visit(child_plan, fragment_id)?;
+                let node_id = self.alloc_node();
+                Ok(DistributedPlanNode {
+                    node_id,
+                    fragment_id,
+                    tuple_ids: child.tuple_ids.clone(),
+                    nullable_tuple_ids: vec![],
+                    limit: -1,
+                    children: vec![child],
+                    stats: PlanNodeStats::from_statistics(&node.stats),
+                    body: DistributedPlanNodeBody::Sort(SortBody {
+                        items: op.items.clone(),
+                        analytic_partition_exprs: op.analytic_partition_exprs.clone(),
+                        output_columns: node.output_columns.clone(),
+                        offset: None,
+                    }),
+                })
+            }
+            Operator::PhysicalHashAggregate(op) => {
+                let child_plan = expect_single_child(node, "PhysicalHashAggregate")?;
+                let child = self.visit(child_plan, fragment_id)?;
+                let agg_tuple_id = self.alloc_tuple();
+                let agg_node_id = self.alloc_node();
+                Ok(DistributedPlanNode {
+                    node_id: agg_node_id,
+                    fragment_id,
+                    tuple_ids: vec![agg_tuple_id],
+                    nullable_tuple_ids: vec![],
+                    limit: -1,
+                    children: vec![child],
+                    stats: PlanNodeStats::from_statistics(&node.stats),
+                    body: DistributedPlanNodeBody::HashAggregate(Box::new(HashAggregateBody {
+                        mode: op.mode,
+                        group_by: op.group_by.clone(),
+                        aggregates: op.aggregates.clone(),
+                        is_merge: op.is_merge.clone(),
+                        output_columns: op.output_columns.clone(),
+                    })),
                 })
             }
             other => Err(format!(

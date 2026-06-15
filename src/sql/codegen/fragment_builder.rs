@@ -15,7 +15,6 @@ use arrow::datatypes::DataType;
 
 use crate::data_sinks;
 use crate::exprs;
-use crate::lower::type_lowering::arrow_type_from_desc;
 use crate::partitions;
 use crate::plan_nodes;
 use crate::types;
@@ -28,14 +27,11 @@ use crate::sql::codegen::boundary_schema::{
 };
 use crate::sql::codegen::descriptors::DescriptorTableBuilder;
 use crate::sql::codegen::expr_compiler::{self, ExprCompiler};
-use crate::sql::codegen::helpers::{
-    agg_call_display_name, agg_call_display_name_without_qualifiers, join_kind_to_op,
-    split_and_conjuncts_typed, typed_expr_display_name,
-};
+use crate::sql::codegen::helpers::{join_kind_to_op, split_and_conjuncts_typed};
 use crate::sql::codegen::iceberg_write_sink::{
     IcebergWriteSinkSpec, partition_info_from_serialized_metadata,
 };
-use crate::sql::codegen::ir::lowering::LoweringCtx;
+use crate::sql::codegen::ir::lowering::{LoweringCtx, slot_ref_exprs_for_columns};
 use crate::sql::codegen::nodes;
 use crate::sql::codegen::resolve::{ColumnBinding, ExprScope};
 use crate::sql::codegen::type_infer;
@@ -46,12 +42,12 @@ use crate::sql::codegen::{
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::operator::{
-    AggMode, PhysicalAssertOneRowOp, PhysicalCTEAnchorOp, PhysicalCTEConsumeOp,
-    PhysicalCTEProduceOp, PhysicalDecodeOp, PhysicalDistributionOp, PhysicalExceptOp,
-    PhysicalFilterOp, PhysicalGenerateSeriesOp, PhysicalHashAggregateOp, PhysicalHashJoinOp,
-    PhysicalIntersectOp, PhysicalLimitOp, PhysicalNestLoopJoinOp, PhysicalProjectOp,
-    PhysicalRepeatOp, PhysicalScanOp, PhysicalSortOp, PhysicalTableFunctionOp, PhysicalTopNOp,
-    PhysicalUnionOp, PhysicalValuesOp, PhysicalWindowOp,
+    PhysicalAssertOneRowOp, PhysicalCTEAnchorOp, PhysicalCTEConsumeOp, PhysicalCTEProduceOp,
+    PhysicalDecodeOp, PhysicalDistributionOp, PhysicalExceptOp, PhysicalFilterOp,
+    PhysicalGenerateSeriesOp, PhysicalHashAggregateOp, PhysicalHashJoinOp, PhysicalIntersectOp,
+    PhysicalLimitOp, PhysicalNestLoopJoinOp, PhysicalProjectOp, PhysicalRepeatOp, PhysicalScanOp,
+    PhysicalSortOp, PhysicalTableFunctionOp, PhysicalTopNOp, PhysicalUnionOp, PhysicalValuesOp,
+    PhysicalWindowOp,
 };
 use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
 use crate::sql::optimizer::property::{OrderingSpec, window_ordering_spec};
@@ -293,33 +289,6 @@ fn aggregate_state_shaped_data_type(
             state_column.data_type.clone()
         }
     }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct AggregateSlotContract {
-    data_type: DataType,
-    type_desc: types::TTypeDesc,
-}
-
-fn aggregate_slot_contract_for_phase(
-    need_finalize: bool,
-    result_type: &DataType,
-    intermediate_type: Option<&DataType>,
-    display_name: &str,
-) -> Result<AggregateSlotContract, String> {
-    let data_type = if need_finalize {
-        result_type.clone()
-    } else {
-        intermediate_type
-            .cloned()
-            .unwrap_or_else(|| result_type.clone())
-    };
-    let type_desc = type_infer::arrow_type_to_type_desc(&data_type)
-        .map_err(|e| format!("aggregate `{display_name}` output type descriptor failed: {e}"))?;
-    Ok(AggregateSlotContract {
-        data_type,
-        type_desc,
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2310,183 +2279,15 @@ impl<'a> PlanFragmentBuilder<'a> {
         node: &PhysicalPlanNode,
     ) -> Result<VisitResult, String> {
         let child = self.visit(&node.children[0])?;
-        let need_finalize = matches!(op.mode, AggMode::Single | AggMode::Global);
 
         let agg_tuple_id = self.alloc_tuple();
         let agg_node_id = self.alloc_node();
-
-        let mut agg_scope = ExprScope::new();
-        let mut grouping_exprs = Vec::new();
-
-        // Compile GROUP BY expressions (same for all modes — the child scope
-        // has the correct columns for both scan-level and Local-output contexts).
-        for (idx, gb_expr) in op.group_by.iter().enumerate() {
-            let mut compiler = ExprCompiler::new(self.slot_allocator(), &child.scope);
-            let texpr = compiler.compile_typed(gb_expr)?;
-            let data_type = gb_expr.data_type.clone();
-            let nullable = gb_expr.nullable;
-            let name = typed_expr_display_name(gb_expr);
-            let slot_id = self.alloc_slot();
-            let slot_type_desc = texpr
-                .nodes
-                .first()
-                .map(|root| root.type_.clone())
-                .ok_or_else(|| format!("group by expr `{name}` compiled to empty TExpr"))?;
-            self.desc_builder.add_slot_with_type_desc(
-                slot_id,
-                agg_tuple_id,
-                &name,
-                slot_type_desc.clone(),
-                nullable,
-                idx as i32,
-            );
-            let binding = ColumnBinding {
-                tuple_id: agg_tuple_id,
-                slot_id,
-                data_type: data_type.clone(),
-                type_desc: Some(slot_type_desc),
-                nullable,
-            };
-            let gb_column_id = op
-                .output_columns
-                .get(idx)
-                .map(|col| col.column_id)
-                .unwrap_or_else(|| match &gb_expr.kind {
-                    ExprKind::ColumnRef { column_id, .. } => *column_id,
-                    _ => crate::sql::column_id::ColumnId::UNSET,
-                });
-            agg_scope.add_column_with_id(gb_column_id, None, name, binding.clone());
-            if let ExprKind::ColumnRef {
-                qualifier: Some(ref q),
-                ref column,
-                ..
-            } = gb_expr.kind
-            {
-                let _ = (q, column, binding);
-            }
-            // Propagate dict registration through the aggregate's group-
-            // by output: when the group-by is a passthrough ColumnRef of
-            // a dict-encoded source slot, the new agg output slot also
-            // carries dict ids. Re-register the TGlobalDict on the new
-            // slot so a downstream Decode (in this or a parent fragment
-            // post-exchange) resolves its `dict_id_to_string_ids` key.
-            if let ExprKind::ColumnRef { column_id, .. } = gb_expr.kind
-                && let Some(child_binding) = child.scope.resolve_by_id(column_id)
-            {
-                let source_slot_id = child_binding.slot_id;
-                self.propagate_dict_to_slot(source_slot_id, slot_id);
-            }
-            grouping_exprs.push(texpr);
-        }
-
-        // Compile aggregate function expressions — mode-dependent.
-        let agg_start_col = op.group_by.len();
-        let mut aggregate_functions = Vec::new();
-
-        debug_assert_eq!(
-            op.is_merge.len(),
-            op.aggregates.len(),
-            "PhysicalHashAggregate (node_id={}): is_merge.len() = {}, aggregates.len() = {}",
-            agg_node_id,
-            op.is_merge.len(),
-            op.aggregates.len(),
-        );
-
-        for (idx, agg_call) in op.aggregates.iter().enumerate() {
-            let texpr = if op.is_merge[idx] {
-                // Global (merge) phase: the child scope contains the Local's
-                // output.  Each intermediate aggregate column sits at position
-                // group_by.len() + idx in the child scope's ordered columns.
-                let child_columns: Vec<_> = child.scope.iter_columns().collect();
-                let child_col_idx = agg_start_col + idx;
-                let (_, binding) = child_columns.get(child_col_idx).ok_or_else(|| {
-                    format!(
-                        "Global agg: child scope missing intermediate column at index {}",
-                        child_col_idx
-                    )
-                })?;
-                let mut compiler = ExprCompiler::new(self.slot_allocator(), &child.scope);
-                compiler.compile_merge_aggregate_call(
-                    agg_call,
-                    binding.slot_id,
-                    binding.tuple_id,
-                    &binding.data_type,
-                )?
-            } else {
-                // Single or Local: compile against child scope normally.
-                let mut compiler = ExprCompiler::new(self.slot_allocator(), &child.scope);
-                compiler.compile_aggregate_call_typed(agg_call).map_err(|err| {
-                    let available = child
-                        .scope
-                        .iter_columns()
-                        .map(|(name, _)| name.clone())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    format!(
-                        "failed to compile aggregate `{}` in {:?} mode against child scope [{}]: {}",
-                        agg_call_display_name(agg_call),
-                        op.mode,
-                        available,
-                        err
-                    )
-                })?
-            };
-
-            let nullable = true;
-            let name = agg_call_display_name(agg_call);
-            let intermediate_type = texpr
-                .nodes
-                .first()
-                .and_then(|root| root.fn_.as_ref())
-                .and_then(|func| func.aggregate_fn.as_ref())
-                .and_then(|agg_fn| arrow_type_from_desc(&agg_fn.intermediate_type));
-            let slot_contract = aggregate_slot_contract_for_phase(
-                need_finalize,
-                &agg_call.result_type,
-                intermediate_type.as_ref(),
-                &name,
-            )?;
-            let data_type = slot_contract.data_type.clone();
-            let slot_type_desc = slot_contract.type_desc.clone();
-            let slot_id = self.alloc_slot();
-            let col_pos = (agg_start_col + idx) as i32;
-            self.desc_builder.add_slot_with_type_desc(
-                slot_id,
-                agg_tuple_id,
-                &name,
-                slot_type_desc.clone(),
-                nullable,
-                col_pos,
-            );
-            let binding = ColumnBinding {
-                tuple_id: agg_tuple_id,
-                slot_id,
-                data_type,
-                type_desc: Some(slot_type_desc),
-                nullable,
-            };
-            agg_scope.add_column_with_id(
-                agg_call.output_column_id,
-                None,
-                name.clone(),
-                binding.clone(),
-            );
-            let unqualified_name = agg_call_display_name_without_qualifiers(agg_call);
-            if !unqualified_name.eq_ignore_ascii_case(&name) {
-                let _ = unqualified_name;
-            }
-            aggregate_functions.push(texpr);
-        }
-
-        self.desc_builder.add_tuple(agg_tuple_id, None);
-        let agg_plan_node = nodes::build_aggregation_node(
+        let (agg_plan_node, agg_scope) = self.lowering_ctx().lower_hash_aggregate(
             agg_node_id,
             agg_tuple_id,
-            agg_tuple_id,
-            grouping_exprs,
-            aggregate_functions,
-            need_finalize,
-        );
+            op,
+            &child.scope,
+        )?;
 
         // Pre-order: agg first, then child nodes
         let mut plan_nodes = vec![agg_plan_node];
@@ -2521,78 +2322,14 @@ impl<'a> PlanFragmentBuilder<'a> {
         // output (no Gather), we must pass every tuple through, otherwise
         // the lowering layout-match check at `lower/node/sort.rs:306` fails
         // with `output column count mismatch`.
-
-        let mut ordering_exprs = Vec::new();
-        let mut is_asc = Vec::new();
-        let mut nulls_first_list = Vec::new();
-
-        for item in &op.items {
-            let mut compiler = ExprCompiler::new(self.slot_allocator(), &child.scope);
-            let texpr = compiler.compile_typed(&item.expr)?;
-            ordering_exprs.push(texpr);
-            is_asc.push(item.asc);
-            nulls_first_list.push(item.nulls_first);
-        }
-
-        // Compile analytic-partition exprs (set when this Sort precedes a
-        // Window). Emitting them as TSortNode.analytic_partition_exprs tells
-        // the pipeline engine to run sort locally per partition instead of
-        // doing a global merge — matching StarRocks's parallel analytic
-        // sort behaviour. Empty for plain ORDER BY.
-        let analytic_partition_exprs = if op.analytic_partition_exprs.is_empty() {
-            None
-        } else {
-            let mut out = Vec::with_capacity(op.analytic_partition_exprs.len());
-            for expr in &op.analytic_partition_exprs {
-                let mut compiler = ExprCompiler::new(self.slot_allocator(), &child.scope);
-                out.push(compiler.compile_typed(expr)?);
-            }
-            Some(out)
-        };
-
-        let sort_info = plan_nodes::TSortInfo::new(
-            ordering_exprs,
-            is_asc,
-            nulls_first_list,
-            self.slot_ref_exprs_for_columns(&child.scope, &node.output_columns, "Sort")?,
-        );
-        let sort_tuple_slot_exprs = sort_info.sort_tuple_slot_exprs.clone();
-
-        let mut sort_plan_node = nodes::default_plan_node();
-        sort_plan_node.node_id = sort_node_id;
-        sort_plan_node.node_type = plan_nodes::TPlanNodeType::SORT_NODE;
-        sort_plan_node.num_children = 1;
-        sort_plan_node.limit = -1;
-        sort_plan_node.row_tuples = child.tuple_ids.clone();
-        sort_plan_node.nullable_tuples = vec![];
-        sort_plan_node.compact_data = true;
-        sort_plan_node.sort_node = Some(plan_nodes::TSortNode {
-            sort_info,
-            use_top_n: false,
-            offset: None,
-            ordering_exprs: None,
-            is_asc_order: None,
-            is_default_limit: None,
-            nulls_first: None,
-            sort_tuple_slot_exprs,
-            has_outer_join_child: None,
-            sql_sort_keys: None,
-            analytic_partition_exprs,
-            partition_exprs: None,
-            partition_limit: None,
-            topn_type: None,
-            build_runtime_filters: None,
-            max_buffered_rows: None,
-            max_buffered_bytes: None,
-            late_materialization: None,
-            enable_parallel_merge: None,
-            analytic_partition_skewed: None,
-            pre_agg_exprs: None,
-            pre_agg_output_slot_id: None,
-            pre_agg_insert_local_shuffle: None,
-            parallel_merge_late_materialize_mode: None,
-            per_pipeline: None,
-        });
+        let sort_plan_node = self.lowering_ctx().lower_sort(
+            sort_node_id,
+            op,
+            &child.scope,
+            &child.tuple_ids,
+            &node.output_columns,
+            None,
+        )?;
 
         // Pre-order: sort first, then child
         let mut plan_nodes = vec![sort_plan_node];
@@ -4188,35 +3925,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         scope: &ExprScope,
         output_columns: &[crate::sql::analysis::OutputColumn],
     ) -> Result<Option<Vec<exprs::TExpr>>, String> {
-        self.slot_ref_exprs_for_columns(scope, output_columns, "result sink")
-    }
-
-    fn slot_ref_exprs_for_columns(
-        &self,
-        scope: &ExprScope,
-        output_columns: &[crate::sql::analysis::OutputColumn],
-        context: &str,
-    ) -> Result<Option<Vec<exprs::TExpr>>, String> {
-        if output_columns.is_empty() {
-            return Ok(None);
-        }
-
-        let mut exprs = Vec::with_capacity(output_columns.len());
-        for column in output_columns {
-            let binding = scope.resolve_by_id(column.column_id).ok_or_else(|| {
-                format!(
-                    "{} cannot resolve output column `{}` id={}",
-                    context, column.name, column.column_id.0
-                )
-            })?;
-            let type_desc = expr_compiler::binding_type_desc(binding)?;
-            exprs.push(expr_compiler::build_slot_ref_texpr(
-                binding.slot_id,
-                binding.tuple_id,
-                type_desc,
-            ));
-        }
-        Ok(Some(exprs))
+        slot_ref_exprs_for_columns(scope, output_columns, "result sink")
     }
 
     fn visit_distribution(
@@ -5074,7 +4783,7 @@ mod tests {
         let (_, avg_intermediate) =
             infer_agg_function_types("avg", &[DataType::Int64], false).expect("avg types");
         let avg_intermediate = avg_intermediate.expect("avg intermediate");
-        let contract = super::aggregate_slot_contract_for_phase(
+        let contract = crate::sql::codegen::ir::lowering::aggregate_slot_contract_for_phase(
             false,
             &DataType::Float64,
             Some(&avg_intermediate),
@@ -5087,7 +4796,7 @@ mod tests {
             Some(DataType::Utf8)
         );
 
-        let final_contract = super::aggregate_slot_contract_for_phase(
+        let final_contract = crate::sql::codegen::ir::lowering::aggregate_slot_contract_for_phase(
             true,
             &DataType::Float64,
             Some(&avg_intermediate),

@@ -1,7 +1,7 @@
 use crate::sql::optimizer::statistics::{Confidence, Statistics};
 
 use super::FragmentId;
-use super::body::{ProjectBody, ScanBody};
+use super::body::{HashAggregateBody, ProjectBody, ScanBody, SortBody};
 
 /// Self-contained copy of the estimated stats this node carries, so EXPLAIN /
 /// ANALYZE never reach back into `PhysicalPlanNode`.
@@ -44,6 +44,8 @@ pub(crate) struct DistributedPlanNode {
 pub(crate) enum DistributedPlanNodeBody {
     Scan(Box<ScanBody>),
     Project(ProjectBody),
+    Sort(SortBody),
+    HashAggregate(Box<HashAggregateBody>),
 }
 
 #[cfg(test)]

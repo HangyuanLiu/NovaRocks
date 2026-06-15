@@ -5,6 +5,7 @@ use std::rc::Rc;
 use arrow::datatypes::DataType;
 
 use crate::exprs;
+use crate::lower::type_lowering::arrow_type_from_desc;
 use crate::plan_nodes;
 use crate::sql::analysis::{ExprKind, OutputColumn as AnalysisOutputColumn};
 use crate::sql::catalog::{CatalogProvider, ScanSource, TableDef};
@@ -15,14 +16,21 @@ use crate::sql::codegen::fragment_builder::{
     effective_iceberg_scan_column_names, iceberg_scan_table_handle_for_codegen, iceberg_table_info,
     output_columns_for_boundary, result_root_boundary_schema_report, synthetic_iceberg_table_id,
 };
-use crate::sql::codegen::helpers::typed_expr_display_name_without_qualifiers;
+use crate::sql::codegen::helpers::{
+    agg_call_display_name, agg_call_display_name_without_qualifiers, typed_expr_display_name,
+    typed_expr_display_name_without_qualifiers,
+};
 use crate::sql::codegen::nodes;
 use crate::sql::codegen::resolve::{ColumnBinding, ExprScope, ResolvedTable};
 use crate::sql::codegen::type_infer;
 use crate::sql::codegen::{
     FragmentBuildResult, FragmentId, MultiFragmentBuildResult, OutputColumn,
 };
-use crate::sql::optimizer::operator::{PhysicalProjectOp, PhysicalScanOp, ScanDictionaryColumn};
+use crate::sql::optimizer::operator::{
+    AggMode, PhysicalHashAggregateOp, PhysicalProjectOp, PhysicalScanOp, PhysicalSortOp,
+    ScanDictionaryColumn,
+};
+use crate::types;
 
 pub(crate) fn lower_distributed_plan(
     dp: &super::fragment::DistributedPlan,
@@ -128,6 +136,33 @@ fn ensure_unpartitioned(
         ));
     }
     Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(in crate::sql::codegen) struct AggregateSlotContract {
+    pub(in crate::sql::codegen) data_type: DataType,
+    pub(in crate::sql::codegen) type_desc: types::TTypeDesc,
+}
+
+pub(in crate::sql::codegen) fn aggregate_slot_contract_for_phase(
+    need_finalize: bool,
+    result_type: &DataType,
+    intermediate_type: Option<&DataType>,
+    display_name: &str,
+) -> Result<AggregateSlotContract, String> {
+    let data_type = if need_finalize {
+        result_type.clone()
+    } else {
+        intermediate_type
+            .cloned()
+            .unwrap_or_else(|| result_type.clone())
+    };
+    let type_desc = type_infer::arrow_type_to_type_desc(&data_type)
+        .map_err(|e| format!("aggregate `{display_name}` output type descriptor failed: {e}"))?;
+    Ok(AggregateSlotContract {
+        data_type,
+        type_desc,
+    })
 }
 
 pub(in crate::sql::codegen) trait LoweringStateAccess<'a> {
@@ -386,6 +421,53 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     plan_nodes,
                     scope,
                     output_columns: project_body_output_columns(project),
+                })
+            }
+            super::node::DistributedPlanNodeBody::Sort(sort) => {
+                if node.children.len() != 1 {
+                    return Err(format!(
+                        "DistributedPlan Sort node_id={} expected 1 child, got {}",
+                        node.node_id,
+                        node.children.len()
+                    ));
+                }
+                let child = self.lower_node(&node.children[0])?;
+                let op = sort_body_to_physical_op(sort);
+                let sort_plan_node = self.lower_sort(
+                    node.node_id,
+                    &op,
+                    &child.scope,
+                    &node.children[0].tuple_ids,
+                    &sort.output_columns,
+                    sort.offset,
+                )?;
+                let mut plan_nodes = vec![sort_plan_node];
+                plan_nodes.extend(child.plan_nodes);
+                Ok(LoweredDistributedNode {
+                    plan_nodes,
+                    scope: child.scope,
+                    output_columns: sort.output_columns.clone(),
+                })
+            }
+            super::node::DistributedPlanNodeBody::HashAggregate(agg) => {
+                if node.children.len() != 1 {
+                    return Err(format!(
+                        "DistributedPlan HashAggregate node_id={} expected 1 child, got {}",
+                        node.node_id,
+                        node.children.len()
+                    ));
+                }
+                let child = self.lower_node(&node.children[0])?;
+                let agg_tuple_id = first_tuple_id(node, "HashAggregate")?;
+                let op = hash_aggregate_body_to_physical_op(agg);
+                let (agg_plan_node, scope) =
+                    self.lower_hash_aggregate(node.node_id, agg_tuple_id, &op, &child.scope)?;
+                let mut plan_nodes = vec![agg_plan_node];
+                plan_nodes.extend(child.plan_nodes);
+                Ok(LoweredDistributedNode {
+                    plan_nodes,
+                    scope,
+                    output_columns: agg.output_columns.clone(),
                 })
             }
         }
@@ -930,6 +1012,277 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
         Ok((project_plan_node, project_scope, output_columns))
     }
+
+    pub(crate) fn lower_hash_aggregate(
+        &mut self,
+        agg_node_id: i32,
+        agg_tuple_id: i32,
+        op: &PhysicalHashAggregateOp,
+        child_scope: &ExprScope,
+    ) -> Result<(plan_nodes::TPlanNode, ExprScope), String> {
+        let state = &mut *self.state;
+        let need_finalize = matches!(op.mode, AggMode::Single | AggMode::Global);
+
+        let mut agg_scope = ExprScope::new();
+        let mut grouping_exprs = Vec::new();
+
+        // Compile GROUP BY expressions (same for all modes — the child scope
+        // has the correct columns for both scan-level and Local-output contexts).
+        for (idx, gb_expr) in op.group_by.iter().enumerate() {
+            let mut compiler = ExprCompiler::new(state.slot_allocator(), child_scope);
+            let texpr = compiler.compile_typed(gb_expr)?;
+            let data_type = gb_expr.data_type.clone();
+            let nullable = gb_expr.nullable;
+            let name = typed_expr_display_name(gb_expr);
+            let slot_id = state.alloc_slot();
+            let slot_type_desc = texpr
+                .nodes
+                .first()
+                .map(|root| root.type_.clone())
+                .ok_or_else(|| format!("group by expr `{name}` compiled to empty TExpr"))?;
+            state.desc_builder().add_slot_with_type_desc(
+                slot_id,
+                agg_tuple_id,
+                &name,
+                slot_type_desc.clone(),
+                nullable,
+                idx as i32,
+            );
+            let binding = ColumnBinding {
+                tuple_id: agg_tuple_id,
+                slot_id,
+                data_type: data_type.clone(),
+                type_desc: Some(slot_type_desc),
+                nullable,
+            };
+            let gb_column_id = op
+                .output_columns
+                .get(idx)
+                .map(|col| col.column_id)
+                .unwrap_or_else(|| match &gb_expr.kind {
+                    ExprKind::ColumnRef { column_id, .. } => *column_id,
+                    _ => crate::sql::column_id::ColumnId::UNSET,
+                });
+            agg_scope.add_column_with_id(gb_column_id, None, name, binding.clone());
+            if let ExprKind::ColumnRef {
+                qualifier: Some(ref q),
+                ref column,
+                ..
+            } = gb_expr.kind
+            {
+                let _ = (q, column, binding);
+            }
+            // Propagate dict registration through the aggregate's group-
+            // by output: when the group-by is a passthrough ColumnRef of
+            // a dict-encoded source slot, the new agg output slot also
+            // carries dict ids. Re-register the TGlobalDict on the new
+            // slot so a downstream Decode (in this or a parent fragment
+            // post-exchange) resolves its `dict_id_to_string_ids` key.
+            if let ExprKind::ColumnRef { column_id, .. } = gb_expr.kind
+                && let Some(child_binding) = child_scope.resolve_by_id(column_id)
+            {
+                let source_slot_id = child_binding.slot_id;
+                state.propagate_dict_to_slot(source_slot_id, slot_id);
+            }
+            grouping_exprs.push(texpr);
+        }
+
+        // Compile aggregate function expressions — mode-dependent.
+        let agg_start_col = op.group_by.len();
+        let mut aggregate_functions = Vec::new();
+
+        debug_assert_eq!(
+            op.is_merge.len(),
+            op.aggregates.len(),
+            "PhysicalHashAggregate (node_id={}): is_merge.len() = {}, aggregates.len() = {}",
+            agg_node_id,
+            op.is_merge.len(),
+            op.aggregates.len(),
+        );
+
+        for (idx, agg_call) in op.aggregates.iter().enumerate() {
+            let texpr = if op.is_merge[idx] {
+                // Global (merge) phase: the child scope contains the Local's
+                // output.  Each intermediate aggregate column sits at position
+                // group_by.len() + idx in the child scope's ordered columns.
+                let child_columns: Vec<_> = child_scope.iter_columns().collect();
+                let child_col_idx = agg_start_col + idx;
+                let (_, binding) = child_columns.get(child_col_idx).ok_or_else(|| {
+                    format!(
+                        "Global agg: child scope missing intermediate column at index {}",
+                        child_col_idx
+                    )
+                })?;
+                let mut compiler = ExprCompiler::new(state.slot_allocator(), child_scope);
+                compiler.compile_merge_aggregate_call(
+                    agg_call,
+                    binding.slot_id,
+                    binding.tuple_id,
+                    &binding.data_type,
+                )?
+            } else {
+                // Single or Local: compile against child scope normally.
+                let mut compiler = ExprCompiler::new(state.slot_allocator(), child_scope);
+                compiler.compile_aggregate_call_typed(agg_call).map_err(|err| {
+                    let available = child_scope
+                        .iter_columns()
+                        .map(|(name, _)| name.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!(
+                        "failed to compile aggregate `{}` in {:?} mode against child scope [{}]: {}",
+                        agg_call_display_name(agg_call),
+                        op.mode,
+                        available,
+                        err
+                    )
+                })?
+            };
+
+            let nullable = true;
+            let name = agg_call_display_name(agg_call);
+            let intermediate_type = texpr
+                .nodes
+                .first()
+                .and_then(|root| root.fn_.as_ref())
+                .and_then(|func| func.aggregate_fn.as_ref())
+                .and_then(|agg_fn| arrow_type_from_desc(&agg_fn.intermediate_type));
+            let slot_contract = aggregate_slot_contract_for_phase(
+                need_finalize,
+                &agg_call.result_type,
+                intermediate_type.as_ref(),
+                &name,
+            )?;
+            let data_type = slot_contract.data_type.clone();
+            let slot_type_desc = slot_contract.type_desc.clone();
+            let slot_id = state.alloc_slot();
+            let col_pos = (agg_start_col + idx) as i32;
+            state.desc_builder().add_slot_with_type_desc(
+                slot_id,
+                agg_tuple_id,
+                &name,
+                slot_type_desc.clone(),
+                nullable,
+                col_pos,
+            );
+            let binding = ColumnBinding {
+                tuple_id: agg_tuple_id,
+                slot_id,
+                data_type,
+                type_desc: Some(slot_type_desc),
+                nullable,
+            };
+            agg_scope.add_column_with_id(
+                agg_call.output_column_id,
+                None,
+                name.clone(),
+                binding.clone(),
+            );
+            let unqualified_name = agg_call_display_name_without_qualifiers(agg_call);
+            if !unqualified_name.eq_ignore_ascii_case(&name) {
+                let _ = unqualified_name;
+            }
+            aggregate_functions.push(texpr);
+        }
+
+        state.desc_builder().add_tuple(agg_tuple_id, None);
+        let agg_plan_node = nodes::build_aggregation_node(
+            agg_node_id,
+            agg_tuple_id,
+            agg_tuple_id,
+            grouping_exprs,
+            aggregate_functions,
+            need_finalize,
+        );
+
+        Ok((agg_plan_node, agg_scope))
+    }
+
+    pub(crate) fn lower_sort(
+        &mut self,
+        sort_node_id: i32,
+        op: &PhysicalSortOp,
+        child_scope: &ExprScope,
+        child_tuple_ids: &[i32],
+        output_columns: &[AnalysisOutputColumn],
+        offset: Option<i64>,
+    ) -> Result<plan_nodes::TPlanNode, String> {
+        let state = &mut *self.state;
+
+        let mut ordering_exprs = Vec::new();
+        let mut is_asc = Vec::new();
+        let mut nulls_first_list = Vec::new();
+
+        for item in &op.items {
+            let mut compiler = ExprCompiler::new(state.slot_allocator(), child_scope);
+            let texpr = compiler.compile_typed(&item.expr)?;
+            ordering_exprs.push(texpr);
+            is_asc.push(item.asc);
+            nulls_first_list.push(item.nulls_first);
+        }
+
+        // Compile analytic-partition exprs (set when this Sort precedes a
+        // Window). Emitting them as TSortNode.analytic_partition_exprs tells
+        // the pipeline engine to run sort locally per partition instead of
+        // doing a global merge — matching StarRocks's parallel analytic
+        // sort behaviour. Empty for plain ORDER BY.
+        let analytic_partition_exprs = if op.analytic_partition_exprs.is_empty() {
+            None
+        } else {
+            let mut out = Vec::with_capacity(op.analytic_partition_exprs.len());
+            for expr in &op.analytic_partition_exprs {
+                let mut compiler = ExprCompiler::new(state.slot_allocator(), child_scope);
+                out.push(compiler.compile_typed(expr)?);
+            }
+            Some(out)
+        };
+
+        let sort_info = plan_nodes::TSortInfo::new(
+            ordering_exprs,
+            is_asc,
+            nulls_first_list,
+            slot_ref_exprs_for_columns(child_scope, output_columns, "Sort")?,
+        );
+        let sort_tuple_slot_exprs = sort_info.sort_tuple_slot_exprs.clone();
+
+        let mut sort_plan_node = nodes::default_plan_node();
+        sort_plan_node.node_id = sort_node_id;
+        sort_plan_node.node_type = plan_nodes::TPlanNodeType::SORT_NODE;
+        sort_plan_node.num_children = 1;
+        sort_plan_node.limit = -1;
+        sort_plan_node.row_tuples = child_tuple_ids.to_vec();
+        sort_plan_node.nullable_tuples = vec![];
+        sort_plan_node.compact_data = true;
+        sort_plan_node.sort_node = Some(plan_nodes::TSortNode {
+            sort_info,
+            use_top_n: false,
+            offset,
+            ordering_exprs: None,
+            is_asc_order: None,
+            is_default_limit: None,
+            nulls_first: None,
+            sort_tuple_slot_exprs,
+            has_outer_join_child: None,
+            sql_sort_keys: None,
+            analytic_partition_exprs,
+            partition_exprs: None,
+            partition_limit: None,
+            topn_type: None,
+            build_runtime_filters: None,
+            max_buffered_rows: None,
+            max_buffered_bytes: None,
+            late_materialization: None,
+            enable_parallel_merge: None,
+            analytic_partition_skewed: None,
+            pre_agg_exprs: None,
+            pre_agg_output_slot_id: None,
+            pre_agg_insert_local_shuffle: None,
+            parallel_merge_late_materialize_mode: None,
+            per_pipeline: None,
+        });
+
+        Ok(sort_plan_node)
+    }
 }
 
 fn first_tuple_id(
@@ -965,6 +1318,25 @@ fn project_body_to_physical_op(body: &super::body::ProjectBody) -> PhysicalProje
     }
 }
 
+fn sort_body_to_physical_op(body: &super::body::SortBody) -> PhysicalSortOp {
+    PhysicalSortOp {
+        items: body.items.clone(),
+        analytic_partition_exprs: body.analytic_partition_exprs.clone(),
+    }
+}
+
+fn hash_aggregate_body_to_physical_op(
+    body: &super::body::HashAggregateBody,
+) -> PhysicalHashAggregateOp {
+    PhysicalHashAggregateOp {
+        mode: body.mode,
+        group_by: body.group_by.clone(),
+        aggregates: body.aggregates.clone(),
+        output_columns: body.output_columns.clone(),
+        is_merge: body.is_merge.clone(),
+    }
+}
+
 fn project_body_output_columns(body: &super::body::ProjectBody) -> Vec<AnalysisOutputColumn> {
     body.items
         .iter()
@@ -982,6 +1354,14 @@ fn result_output_exprs_for_columns(
     scope: &ExprScope,
     output_columns: &[AnalysisOutputColumn],
 ) -> Result<Option<Vec<exprs::TExpr>>, String> {
+    slot_ref_exprs_for_columns(scope, output_columns, "result sink")
+}
+
+pub(in crate::sql::codegen) fn slot_ref_exprs_for_columns(
+    scope: &ExprScope,
+    output_columns: &[AnalysisOutputColumn],
+    context: &str,
+) -> Result<Option<Vec<exprs::TExpr>>, String> {
     if output_columns.is_empty() {
         return Ok(None);
     }
@@ -990,8 +1370,8 @@ fn result_output_exprs_for_columns(
     for column in output_columns {
         let binding = scope.resolve_by_id(column.column_id).ok_or_else(|| {
             format!(
-                "result sink cannot resolve output column `{}` id={}",
-                column.name, column.column_id.0
+                "{} cannot resolve output column `{}` id={}",
+                context, column.name, column.column_id.0
             )
         })?;
         let type_desc = expr_compiler::binding_type_desc(binding)?;
