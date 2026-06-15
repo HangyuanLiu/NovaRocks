@@ -14,12 +14,9 @@ use crate::sql::catalog::{CatalogProvider, ScanSource, TableDef};
 use crate::sql::codegen::descriptors::DescriptorTableBuilder;
 use crate::sql::codegen::expr_compiler::{self, ExprCompiler};
 use crate::sql::codegen::fragment_builder::{
-    PlanFragmentBuilder, RfProbeTarget, add_iceberg_equality_delete_required_columns,
-    build_result_sink, effective_iceberg_scan_column_names, iceberg_scan_table_handle_for_codegen,
-    iceberg_table_info, join_distribution_mode_from_execution, legacy_rf_distribution_to_execution,
-    output_columns_for_boundary, remap_rf_expr_order, result_root_boundary_schema_report,
-    rf_build_expr_matches_join_build_expr, rf_layout_for_execution_distribution, rf_pipeline_dop,
-    synthetic_iceberg_table_id,
+    PlanFragmentBuilder, add_iceberg_equality_delete_required_columns, build_result_sink,
+    effective_iceberg_scan_column_names, iceberg_scan_table_handle_for_codegen, iceberg_table_info,
+    output_columns_for_boundary, result_root_boundary_schema_report, synthetic_iceberg_table_id,
 };
 use crate::sql::codegen::helpers::{
     agg_call_display_name, agg_call_display_name_without_qualifiers, join_kind_to_op,
@@ -27,6 +24,11 @@ use crate::sql::codegen::helpers::{
 };
 use crate::sql::codegen::nodes;
 use crate::sql::codegen::resolve::{ColumnBinding, ExprScope, ResolvedTable};
+use crate::sql::codegen::runtime_filter_lowering::{
+    RfProbeTarget, join_distribution_mode_from_execution, legacy_rf_distribution_to_execution,
+    remap_rf_expr_order, rf_build_expr_matches_join_build_expr,
+    rf_layout_for_execution_distribution, rf_pipeline_dop,
+};
 use crate::sql::codegen::type_infer;
 use crate::sql::codegen::{
     FragmentBuildResult, FragmentId, MultiFragmentBuildResult, OutputColumn,
@@ -732,7 +734,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         merged_tuple_ids.extend_from_slice(right_tuple_ids);
 
         let merged_scope = match op.join_type {
-            JoinKind::LeftSemi | JoinKind::LeftAnti => left_scope,
+            JoinKind::LeftSemi | JoinKind::LeftAnti | JoinKind::NullAwareLeftAnti => left_scope,
             JoinKind::RightSemi | JoinKind::RightAnti => right_scope,
             _ => {
                 let mut scope = left_scope;
@@ -803,7 +805,10 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         right_tuple_ids: &[i32],
     ) {
         match join_type {
-            JoinKind::LeftOuter | JoinKind::LeftAnti | JoinKind::LeftSemi => {
+            JoinKind::LeftOuter
+            | JoinKind::LeftAnti
+            | JoinKind::LeftSemi
+            | JoinKind::NullAwareLeftAnti => {
                 for &tid in right_tuple_ids {
                     self.state.desc_builder().widen_tuple_nullable(tid);
                 }
@@ -2026,7 +2031,7 @@ mod tests {
     use crate::connector::iceberg::IcebergMetadataTableType;
     use crate::lower::type_lowering::arrow_type_from_desc;
     use crate::plan_nodes::TPlanNodeType;
-    use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
+    use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn, ProjectItem, TypedExpr};
     use crate::sql::catalog::{
         CatalogProvider, ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
@@ -2035,8 +2040,12 @@ mod tests {
     use crate::sql::codegen::ir::{
         DataPartition, DataSink, DistributedPlan, PartitionKind, build_distributed_plan,
     };
+    use crate::sql::codegen::resolve::{ColumnBinding, ExprScope};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::operator::{Operator, PhysicalProjectOp, PhysicalScanOp};
+    use crate::sql::optimizer::operator::{
+        JoinDistribution, Operator, PhysicalHashJoinEqCondition, PhysicalHashJoinOp,
+        PhysicalProjectOp, PhysicalScanOp,
+    };
     use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, PlanExecutionProps};
     use crate::sql::optimizer::statistics::Statistics;
 
@@ -2113,6 +2122,164 @@ mod tests {
     }
 
     #[test]
+    fn null_aware_left_anti_hash_join_exposes_left_scope_and_widens_build_side() {
+        let connectors = ConnectorRegistry::new();
+        let mut state = super::OwnedLoweringState::new(&connectors, None, 0);
+        let (left_column_id, right_column_id, left_key, right_key, left_scope, right_scope) =
+            hash_join_test_inputs(&mut state);
+        let op = PhysicalHashJoinOp {
+            join_type: JoinKind::NullAwareLeftAnti,
+            eq_conditions: vec![PhysicalHashJoinEqCondition {
+                left: left_key,
+                right: right_key,
+                null_safe: false,
+            }],
+            other_condition: None,
+            distribution: JoinDistribution::Broadcast,
+        };
+
+        let (plan_node, scope, tuple_ids) = {
+            let mut ctx = super::LoweringCtx::new(&mut state);
+            ctx.lower_hash_join(10, &[1], &[2], &op, left_scope, right_scope, None, &[])
+                .expect("lower hash join")
+        };
+
+        assert_eq!(tuple_ids, vec![1, 2]);
+        assert!(
+            scope.resolve_by_id(left_column_id).is_some(),
+            "left side should remain visible"
+        );
+        assert!(
+            scope.resolve_by_id(right_column_id).is_none(),
+            "build side should not be visible"
+        );
+        assert_eq!(plan_node.nullable_tuples, vec![false, true]);
+
+        let desc_tbl = state.desc_builder.build();
+        let slots = desc_tbl.slot_descriptors.expect("slot descriptors");
+        let left_slot = slots
+            .iter()
+            .find(|slot| slot.id == Some(11))
+            .expect("left slot descriptor");
+        let right_slot = slots
+            .iter()
+            .find(|slot| slot.id == Some(22))
+            .expect("right slot descriptor");
+        assert_eq!(left_slot.is_nullable, Some(false));
+        assert_eq!(right_slot.is_nullable, Some(true));
+    }
+
+    #[test]
+    fn hash_join_demotes_unbound_eq_to_other_conjunct() {
+        let connectors = ConnectorRegistry::new();
+        let mut state = super::OwnedLoweringState::new(&connectors, None, 0);
+        let (left_column_id, _, _, _, left_scope, right_scope) = hash_join_test_inputs(&mut state);
+        let op = PhysicalHashJoinOp {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![PhysicalHashJoinEqCondition {
+                left: qualified_column_ref(left_column_id, "l", "k", false),
+                right: qualified_column_ref(left_column_id, "l", "k", false),
+                null_safe: false,
+            }],
+            other_condition: None,
+            distribution: JoinDistribution::Broadcast,
+        };
+
+        let plan_node = {
+            let mut ctx = super::LoweringCtx::new(&mut state);
+            ctx.lower_hash_join(10, &[1], &[2], &op, left_scope, right_scope, None, &[])
+                .expect("lower hash join")
+                .0
+        };
+        let hash_join = plan_node.hash_join_node.expect("hash join node");
+        assert!(hash_join.eq_join_conjuncts.is_empty());
+        assert_eq!(
+            hash_join
+                .other_join_conjuncts
+                .as_ref()
+                .expect("demoted conjunct")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn hash_join_compiles_swapped_eq_as_join_conjunct() {
+        let connectors = ConnectorRegistry::new();
+        let mut state = super::OwnedLoweringState::new(&connectors, None, 0);
+        let (_, _, left_key, right_key, left_scope, right_scope) =
+            hash_join_test_inputs(&mut state);
+
+        let op = PhysicalHashJoinOp {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![PhysicalHashJoinEqCondition {
+                left: right_key,
+                right: left_key,
+                null_safe: false,
+            }],
+            other_condition: None,
+            distribution: JoinDistribution::Broadcast,
+        };
+
+        let plan_node = {
+            let mut ctx = super::LoweringCtx::new(&mut state);
+            ctx.lower_hash_join(10, &[1], &[2], &op, left_scope, right_scope, None, &[])
+                .expect("lower hash join")
+                .0
+        };
+        let hash_join = plan_node.hash_join_node.expect("hash join node");
+        assert_eq!(hash_join.eq_join_conjuncts.len(), 1);
+        assert!(hash_join.other_join_conjuncts.is_none());
+    }
+
+    fn hash_join_test_inputs(
+        state: &mut super::OwnedLoweringState<'_>,
+    ) -> (
+        ColumnId,
+        ColumnId,
+        TypedExpr,
+        TypedExpr,
+        ExprScope,
+        ExprScope,
+    ) {
+        state.desc_builder.add_tuple(1, None);
+        state
+            .desc_builder
+            .add_slot(11, 1, "left_k", &DataType::Int64, false, 0);
+        state.desc_builder.add_tuple(2, None);
+        state
+            .desc_builder
+            .add_slot(22, 2, "right_k", &DataType::Int64, false, 0);
+
+        let left_column_id = ColumnId::new_for_test(1);
+        let right_column_id = ColumnId::new_for_test(3);
+        let left_key = qualified_column_ref(left_column_id, "l", "k", false);
+        let right_key = qualified_column_ref(right_column_id, "r", "k", false);
+        let mut left_scope = ExprScope::new();
+        left_scope.add_column_with_id(
+            left_column_id,
+            Some("l".to_string()),
+            "k".to_string(),
+            column_binding(1, 11, false),
+        );
+        let mut right_scope = ExprScope::new();
+        right_scope.add_column_with_id(
+            right_column_id,
+            Some("r".to_string()),
+            "k".to_string(),
+            column_binding(2, 22, false),
+        );
+        (
+            left_column_id,
+            right_column_id,
+            left_key,
+            right_key,
+            left_scope,
+            right_scope,
+        )
+    }
+
+    #[test]
     fn lower_distributed_plan_rejects_non_m0_fragment_shape() {
         let mut extra_fragment = distributed_project_scan_plan();
         let mut duplicate = extra_fragment.fragments[0].clone();
@@ -2178,6 +2345,33 @@ mod tests {
             err.contains(expected),
             "expected `{expected}` in lowering error `{err}`"
         );
+    }
+
+    fn column_binding(tuple_id: i32, slot_id: i32, nullable: bool) -> ColumnBinding {
+        ColumnBinding {
+            tuple_id,
+            slot_id,
+            data_type: DataType::Int64,
+            type_desc: None,
+            nullable,
+        }
+    }
+
+    fn qualified_column_ref(
+        column_id: ColumnId,
+        qualifier: &str,
+        column: &str,
+        nullable: bool,
+    ) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id,
+                qualifier: Some(qualifier.to_string()),
+                column: column.to_string(),
+            },
+            data_type: DataType::Int64,
+            nullable,
+        }
     }
 
     fn project_over_metadata_scan_plan() -> PhysicalPlanNode {

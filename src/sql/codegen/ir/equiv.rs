@@ -106,8 +106,64 @@ mod tests {
     }
 
     #[test]
+    fn hash_join_other_condition_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "hash_join_other_condition",
+            hash_join_other_condition_plan(),
+        );
+    }
+
+    #[test]
+    fn left_semi_hash_join_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "left_semi_hash_join",
+            hash_join_surviving_side_plan(JoinKind::LeftSemi),
+        );
+    }
+
+    #[test]
+    fn right_anti_hash_join_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "right_anti_hash_join",
+            hash_join_surviving_side_plan(JoinKind::RightAnti),
+        );
+    }
+
+    #[test]
+    fn null_aware_left_anti_hash_join_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "null_aware_left_anti_hash_join",
+            hash_join_surviving_side_plan(JoinKind::NullAwareLeftAnti),
+        );
+    }
+
+    #[test]
     fn nest_loop_cross_join_matches_direct_fragment_builder() {
         assert_distributed_plan_equivalent("nest_loop_cross_join", nest_loop_cross_join_plan());
+    }
+
+    #[test]
+    fn nest_loop_inner_condition_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "nest_loop_inner_condition",
+            nest_loop_condition_plan(JoinKind::Inner),
+        );
+    }
+
+    #[test]
+    fn nest_loop_left_outer_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "nest_loop_left_outer",
+            nest_loop_condition_plan(JoinKind::LeftOuter),
+        );
+    }
+
+    #[test]
+    fn nest_loop_left_anti_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "nest_loop_left_anti",
+            nest_loop_surviving_side_plan(JoinKind::LeftAnti),
+        );
     }
 
     #[test]
@@ -542,12 +598,44 @@ mod tests {
     }
 
     fn hash_join_plan(join_type: JoinKind) -> (PhysicalPlanNode, TypedExpr, TypedExpr) {
+        hash_join_plan_with_options(join_type, None, JoinOutput::Both)
+    }
+
+    fn hash_join_other_condition_plan() -> PhysicalPlanNode {
+        let left_value = column_ref_expr_with_qualifier(2, "l", "v", DataType::Int64, true);
+        let right_value = column_ref_expr_with_qualifier(4, "r", "v", DataType::Int64, true);
+        let other_condition = cmp_expr(left_value, BinOp::Gt, right_value);
+        let (join, _, _) =
+            hash_join_plan_with_options(JoinKind::Inner, Some(other_condition), JoinOutput::Both);
+        join
+    }
+
+    fn hash_join_surviving_side_plan(join_type: JoinKind) -> PhysicalPlanNode {
+        let output = match join_type {
+            JoinKind::RightSemi | JoinKind::RightAnti => JoinOutput::RightOnly,
+            _ => JoinOutput::LeftOnly,
+        };
+        let (join, _, _) = hash_join_plan_with_options(join_type, None, output);
+        join
+    }
+
+    #[derive(Clone, Copy)]
+    enum JoinOutput {
+        Both,
+        LeftOnly,
+        RightOnly,
+    }
+
+    fn hash_join_plan_with_options(
+        join_type: JoinKind,
+        other_condition: Option<TypedExpr>,
+        output: JoinOutput,
+    ) -> (PhysicalPlanNode, TypedExpr, TypedExpr) {
         let left = aliased_scan_plan("l", 1, 2);
         let right = aliased_scan_plan("r", 3, 4);
         let left_key = column_ref_expr_with_qualifier(1, "l", "k", DataType::Int64, false);
         let right_key = column_ref_expr_with_qualifier(3, "r", "k", DataType::Int64, false);
-        let mut output_columns = left.output_columns.clone();
-        output_columns.extend(right.output_columns.clone());
+        let output_columns = join_output_columns(&left, &right, output);
         let node = physical_node(
             Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type,
@@ -556,7 +644,7 @@ mod tests {
                     right: right_key.clone(),
                     null_safe: false,
                 }],
-                other_condition: None,
+                other_condition,
                 distribution: JoinDistribution::Broadcast,
             }),
             vec![left, right],
@@ -565,15 +653,62 @@ mod tests {
         (node, left_key, right_key)
     }
 
+    fn join_output_columns(
+        left: &PhysicalPlanNode,
+        right: &PhysicalPlanNode,
+        output: JoinOutput,
+    ) -> Vec<OutputColumn> {
+        match output {
+            JoinOutput::Both => {
+                let mut output_columns = left.output_columns.clone();
+                output_columns.extend(right.output_columns.clone());
+                output_columns
+            }
+            JoinOutput::LeftOnly => left.output_columns.clone(),
+            JoinOutput::RightOnly => right.output_columns.clone(),
+        }
+    }
+
     fn nest_loop_cross_join_plan() -> PhysicalPlanNode {
+        nest_loop_plan(JoinKind::Cross, None, JoinOutput::Both)
+    }
+
+    fn nest_loop_condition_plan(join_type: JoinKind) -> PhysicalPlanNode {
+        let left_value = column_ref_expr_with_qualifier(2, "l", "v", DataType::Int64, true);
+        let right_value = column_ref_expr_with_qualifier(4, "r", "v", DataType::Int64, true);
+        nest_loop_plan(
+            join_type,
+            Some(cmp_expr(left_value, BinOp::Gt, right_value)),
+            JoinOutput::Both,
+        )
+    }
+
+    fn nest_loop_surviving_side_plan(join_type: JoinKind) -> PhysicalPlanNode {
+        let output = match join_type {
+            JoinKind::RightSemi | JoinKind::RightAnti => JoinOutput::RightOnly,
+            _ => JoinOutput::LeftOnly,
+        };
+        let left_value = column_ref_expr_with_qualifier(2, "l", "v", DataType::Int64, true);
+        let right_value = column_ref_expr_with_qualifier(4, "r", "v", DataType::Int64, true);
+        nest_loop_plan(
+            join_type,
+            Some(cmp_expr(left_value, BinOp::Gt, right_value)),
+            output,
+        )
+    }
+
+    fn nest_loop_plan(
+        join_type: JoinKind,
+        condition: Option<TypedExpr>,
+        output: JoinOutput,
+    ) -> PhysicalPlanNode {
         let left = aliased_scan_plan("l", 1, 2);
         let right = aliased_scan_plan("r", 3, 4);
-        let mut output_columns = left.output_columns.clone();
-        output_columns.extend(right.output_columns.clone());
+        let output_columns = join_output_columns(&left, &right, output);
         physical_node(
             Operator::PhysicalNestLoopJoin(PhysicalNestLoopJoinOp {
-                join_type: JoinKind::Cross,
-                condition: None,
+                join_type,
+                condition,
             }),
             vec![left, right],
             output_columns,

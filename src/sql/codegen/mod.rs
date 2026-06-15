@@ -15,6 +15,7 @@ pub(crate) mod id_binding_verifier;
 pub(crate) mod ir;
 pub(crate) mod nodes;
 pub(crate) mod resolve;
+pub(crate) mod runtime_filter_lowering;
 pub(crate) mod type_infer;
 
 use arrow::datatypes::DataType;
