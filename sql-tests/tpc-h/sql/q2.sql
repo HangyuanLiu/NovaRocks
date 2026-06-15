@@ -1,3 +1,4 @@
+-- @explain_contains=WINDOW
 select
     s_acctbal,
     s_name,
