@@ -3,23 +3,13 @@
 //! Scan/Filter/Project; later slices add the remaining operators.
 
 pub(crate) mod body;
+pub(crate) mod build;
 pub(crate) mod fragment;
+pub(crate) mod lowering;
 pub(crate) mod node;
 
-pub(crate) mod build {
-    pub(crate) fn build_distributed_plan() {
-        unimplemented!("build_distributed_plan is added by a later IR slice")
-    }
-}
-
-pub(crate) mod lowering {
-    pub(crate) fn lower_distributed_plan() {
-        unimplemented!("lower_distributed_plan is added by a later IR slice")
-    }
-}
-
 #[cfg(test)]
-pub(crate) mod equiv {}
+pub(crate) mod equiv;
 
 pub(crate) use build::build_distributed_plan;
 pub(crate) use fragment::{DataPartition, DataSink, DistributedPlan, PartitionKind, PlanFragment};
@@ -27,3 +17,18 @@ pub(crate) use lowering::lower_distributed_plan;
 pub(crate) use node::{DistributedPlanNode, DistributedPlanNodeBody, PlanNodeStats};
 
 pub(crate) type FragmentId = u32;
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    #[test]
+    fn placeholder_modules_are_split_into_files() {
+        for module_file in ["build.rs", "lowering.rs", "equiv.rs"] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/sql/codegen/ir")
+                .join(module_file);
+            assert!(path.is_file(), "{} should exist", path.display());
+        }
+    }
+}
