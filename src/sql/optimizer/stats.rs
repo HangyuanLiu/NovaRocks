@@ -14,7 +14,7 @@ use super::estimate::selectivity::apply_filter;
 pub(crate) use super::estimate::selectivity::{estimate_selectivity, extract_column_id};
 use super::memo::{MExpr, Memo};
 use super::operator::Operator;
-use crate::sql::analysis::{BinOp, ExprKind, JoinKind, OutputColumn, TypedExpr};
+use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::estimate::arith::sat_add;
 use crate::sql::optimizer::estimate::cardinality::{
@@ -65,12 +65,17 @@ pub(crate) fn derive_statistics(
         Operator::LogicalValues(vals) => Statistics {
             output_row_count: vals.rows.len() as f64,
             row_count_confidence: Confidence::Exact,
-            column_statistics: HashMap::new(),
+            column_statistics: values_column_statistics(&vals.rows, &vals.columns),
         },
         Operator::LogicalGenerateSeries(gs) => Statistics {
             output_row_count: generate_series_row_count_f64(gs.start, gs.end, gs.step),
             row_count_confidence: Confidence::Exact,
-            column_statistics: HashMap::new(),
+            column_statistics: generate_series_column_statistics(
+                gs.output_column_id,
+                gs.start,
+                gs.end,
+                gs.step,
+            ),
         },
         Operator::LogicalTableFunction(tf) => {
             derive_table_function_stats(tf.is_left_join, expr, memo)
@@ -237,14 +242,25 @@ pub(crate) fn derive_statistics(
             child_statistics(memo, &expr.children, 0)
         }
 
-        Operator::LogicalAggregateStateMerge(_) => {
+        Operator::LogicalAggregateStateMerge(merge) => {
             let old_stats = child_statistics(memo, &expr.children, 0);
             let delta_stats = child_statistics(memo, &expr.children, 1);
+            let output_rows = (old_stats.output_row_count + delta_stats.output_row_count).max(1.0);
+            // The merge is a union-all of the old and delta aggregate states:
+            // merge old/delta child column statistics positionally onto the
+            // merge's output columns instead of dropping them.
+            let column_statistics = merge_set_op_column_statistics(
+                memo,
+                &expr.children,
+                &merge.output_columns,
+                &[old_stats, delta_stats],
+                output_rows,
+                SetOpKind::Union { all: true },
+            );
             Statistics {
-                output_row_count: (old_stats.output_row_count + delta_stats.output_row_count)
-                    .max(1.0),
+                output_row_count: output_rows,
                 row_count_confidence: Confidence::Estimated,
-                column_statistics: HashMap::new(),
+                column_statistics,
             }
         }
 
@@ -562,13 +578,18 @@ pub(crate) fn derive_statistics(
         Operator::PhysicalValues(vals) => Statistics {
             output_row_count: vals.rows.len() as f64,
             row_count_confidence: Confidence::Exact,
-            column_statistics: HashMap::new(),
+            column_statistics: values_column_statistics(&vals.rows, &vals.columns),
         },
 
         Operator::PhysicalGenerateSeries(gs) => Statistics {
             output_row_count: generate_series_row_count_f64(gs.start, gs.end, gs.step),
             row_count_confidence: Confidence::Exact,
-            column_statistics: HashMap::new(),
+            column_statistics: generate_series_column_statistics(
+                gs.output_column_id,
+                gs.start,
+                gs.end,
+                gs.step,
+            ),
         },
         Operator::PhysicalTableFunction(tf) => {
             derive_table_function_stats(tf.is_left_join, expr, memo)
@@ -579,14 +600,22 @@ pub(crate) fn derive_statistics(
             child_statistics(memo, &expr.children, 0)
         }
 
-        Operator::PhysicalAggregateStateMerge(_) => {
+        Operator::PhysicalAggregateStateMerge(merge) => {
             let old_stats = child_statistics(memo, &expr.children, 0);
             let delta_stats = child_statistics(memo, &expr.children, 1);
+            let output_rows = (old_stats.output_row_count + delta_stats.output_row_count).max(1.0);
+            let column_statistics = merge_set_op_column_statistics(
+                memo,
+                &expr.children,
+                &merge.output_columns,
+                &[old_stats, delta_stats],
+                output_rows,
+                SetOpKind::Union { all: true },
+            );
             Statistics {
-                output_row_count: (old_stats.output_row_count + delta_stats.output_row_count)
-                    .max(1.0),
+                output_row_count: output_rows,
                 row_count_confidence: Confidence::Estimated,
-                column_statistics: HashMap::new(),
+                column_statistics,
             }
         }
         Operator::LogicalAssertOneRow(_) | Operator::PhysicalAssertOneRow(_) => {
@@ -738,17 +767,129 @@ fn child_statistics(memo: &Memo, children: &[super::memo::GroupId], index: usize
     }
 }
 
+fn is_null_literal(expr: &TypedExpr) -> bool {
+    matches!(&expr.kind, ExprKind::Literal(LiteralValue::Null))
+}
+
+/// Extract a numeric `f64` from a literal value expression (the only kind
+/// `VALUES` rows that we synthesize statistics for). Returns `None` for
+/// non-numeric literals so such columns are left without statistics.
+fn values_literal_f64(expr: &TypedExpr) -> Option<f64> {
+    match &expr.kind {
+        ExprKind::Literal(LiteralValue::Int(v)) => Some(*v as f64),
+        ExprKind::Literal(LiteralValue::LargeInt(v)) => Some(*v as f64),
+        ExprKind::Literal(LiteralValue::Float(v)) => Some(*v),
+        ExprKind::Literal(LiteralValue::Decimal(s)) => s.parse::<f64>().ok(),
+        ExprKind::Cast { expr, .. } => values_literal_f64(expr),
+        ExprKind::Nested(inner) => values_literal_f64(inner),
+        _ => None,
+    }
+}
+
+/// Exact per-column statistics for a `VALUES` relation, synthesized from the
+/// literal rows. A column gets stats only when every value is a numeric literal
+/// (or NULL); non-numeric columns are left unknown. NDV is the exact distinct
+/// count, bounded by the literal min/max. Without this, a join on a `VALUES`
+/// column (e.g. an `IN`-list lowered to a values join) has no NDV.
+fn values_column_statistics(
+    rows: &[Vec<TypedExpr>],
+    columns: &[OutputColumn],
+) -> HashMap<ColumnId, ColumnStatistic> {
+    let mut out = HashMap::new();
+    let row_count = rows.len() as f64;
+    if row_count == 0.0 {
+        return out;
+    }
+    for (col_idx, column) in columns.iter().enumerate() {
+        if column.column_id == ColumnId::UNSET {
+            continue;
+        }
+        let mut values: Vec<f64> = Vec::with_capacity(rows.len());
+        let mut nulls = 0usize;
+        let mut all_numeric_or_null = true;
+        for row in rows {
+            match row.get(col_idx) {
+                Some(expr) if is_null_literal(expr) => nulls += 1,
+                Some(expr) => match values_literal_f64(expr) {
+                    Some(v) => values.push(v),
+                    None => {
+                        all_numeric_or_null = false;
+                        break;
+                    }
+                },
+                None => {
+                    all_numeric_or_null = false;
+                    break;
+                }
+            }
+        }
+        if !all_numeric_or_null || values.is_empty() {
+            continue;
+        }
+        let mut sorted = values;
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        sorted.dedup();
+        let ndv = sorted.len() as f64;
+        out.insert(
+            column.column_id,
+            ColumnStatistic {
+                min_value: *sorted.first().expect("non-empty after check"),
+                max_value: *sorted.last().expect("non-empty after check"),
+                nulls_fraction: nulls as f64 / row_count,
+                average_row_size: 8.0,
+                distinct_values_count: ndv.max(1.0),
+                confidence: Confidence::Exact,
+            },
+        );
+    }
+    out
+}
+
+/// Exact per-column statistics for a `generate_series` output column. Every
+/// value in the arithmetic sequence is distinct, so NDV equals the row count,
+/// bounded by `[min(start,end), max(start,end)]`. Without this the series
+/// column has no NDV and a join on it falls back to `DEFAULT_JOIN_KEY_NDV`.
+fn generate_series_column_statistics(
+    output_column_id: ColumnId,
+    start: i64,
+    end: i64,
+    step: i64,
+) -> HashMap<ColumnId, ColumnStatistic> {
+    let mut column_statistics = HashMap::new();
+    if output_column_id == ColumnId::UNSET {
+        return column_statistics;
+    }
+    let rows = generate_series_row_count_f64(start, end, step);
+    column_statistics.insert(
+        output_column_id,
+        ColumnStatistic {
+            min_value: start.min(end) as f64,
+            max_value: start.max(end) as f64,
+            nulls_fraction: 0.0,
+            average_row_size: 8.0,
+            distinct_values_count: rows.max(1.0),
+            confidence: Confidence::Exact,
+        },
+    );
+    column_statistics
+}
+
 fn derive_table_function_stats(is_left_join: bool, expr: &MExpr, memo: &Memo) -> Statistics {
     let child = child_statistics(memo, &expr.children, 0);
     let estimated_rows = child.output_row_count * 3.0;
+    let output_row_count = if is_left_join {
+        estimated_rows.max(child.output_row_count)
+    } else {
+        estimated_rows.max(1.0)
+    };
     Statistics {
-        output_row_count: if is_left_join {
-            estimated_rows.max(child.output_row_count)
-        } else {
-            estimated_rows.max(1.0)
-        },
+        output_row_count,
         row_count_confidence: Confidence::Estimated,
-        column_statistics: HashMap::new(),
+        // Pass through child column statistics; the table function's generated
+        // columns stay unknown (absent). The child columns survive on the
+        // output (see `derive_output_columns`), so without this a left-join
+        // table function silently drops the left side's NDVs.
+        column_statistics: child.column_statistics,
     }
 }
 
@@ -3938,6 +4079,171 @@ mod tests {
         let props = memo.groups[0].logical_props.as_ref().unwrap();
         assert!((props.row_count - 3.0).abs() < 0.01);
         assert_eq!(props.output_columns.len(), 1);
+    }
+
+    #[test]
+    fn generate_series_synthesizes_exact_column_statistics() {
+        use crate::sql::optimizer::memo::MExpr;
+        use crate::sql::optimizer::operator::{LogicalGenerateSeriesOp, Operator};
+
+        let col = ColumnId::new_for_test(42);
+        let memo = Memo::new();
+        let expr = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalGenerateSeries(LogicalGenerateSeriesOp {
+                start: 1,
+                end: 1000,
+                step: 1,
+                column_name: "gs".to_string(),
+                alias: None,
+                output_column_id: col,
+            }),
+            children: vec![],
+        };
+
+        let stats = derive_statistics(&expr, &memo, &HashMap::new());
+
+        assert!((stats.output_row_count - 1000.0).abs() < 1.0);
+        // start=1, end=1000, step=1 -> 1000 distinct values in [1, 1000], all unique.
+        let cs = stats
+            .column_statistics
+            .get(&col)
+            .expect("generate_series output column must carry exact statistics");
+        assert!(
+            (cs.distinct_values_count - 1000.0).abs() < 1.0,
+            "NDV should equal row count, got {}",
+            cs.distinct_values_count
+        );
+        assert!((cs.min_value - 1.0).abs() < 1e-9, "min should be start");
+        assert!((cs.max_value - 1000.0).abs() < 1e-9, "max should be end");
+        assert_eq!(cs.confidence, Confidence::Exact);
+    }
+
+    #[test]
+    fn values_synthesizes_exact_column_statistics_from_literals() {
+        use crate::sql::optimizer::memo::MExpr;
+        use crate::sql::optimizer::operator::{LogicalValuesOp, Operator};
+
+        let col = ColumnId::new_for_test(7);
+        let memo = Memo::new();
+        let expr = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalValues(LogicalValuesOp {
+                rows: vec![vec![int_lit(1)], vec![int_lit(2)], vec![int_lit(3)]],
+                columns: vec![stats_output_column(7, "v")],
+            }),
+            children: vec![],
+        };
+        let stats = derive_statistics(&expr, &memo, &HashMap::new());
+        assert!((stats.output_row_count - 3.0).abs() < 1e-9);
+        let cs = stats
+            .column_statistics
+            .get(&col)
+            .expect("values column must carry literal-derived statistics");
+        assert!(
+            (cs.distinct_values_count - 3.0).abs() < 1e-9,
+            "3 distinct literals -> NDV 3, got {}",
+            cs.distinct_values_count
+        );
+        assert!((cs.min_value - 1.0).abs() < 1e-9);
+        assert!((cs.max_value - 3.0).abs() < 1e-9);
+        assert_eq!(cs.confidence, Confidence::Exact);
+    }
+
+    #[test]
+    fn table_function_passes_through_child_column_statistics() {
+        use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
+        use crate::sql::optimizer::operator::{LogicalTableFunctionOp, LogicalValuesOp, Operator};
+
+        let base = ColumnId::new_for_test(3);
+        let mut memo = Memo::new();
+        let child = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalValues(LogicalValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
+            children: vec![],
+        });
+        let mut props = LogicalProperties::new(vec![stats_output_column(3, "base")], 1000.0);
+        props.row_count_confidence = Confidence::Estimated;
+        props.column_statistics.insert(
+            base,
+            set_op_column_stat(0.0, 50.0, 0.0, 8.0, 50.0, Confidence::Estimated),
+        );
+        memo.groups[child].logical_props = Some(props);
+
+        let tf = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalTableFunction(LogicalTableFunctionOp {
+                function_name: "unnest".to_string(),
+                args: vec![],
+                output_columns: vec![],
+                alias: None,
+                is_left_join: true,
+            }),
+            children: vec![child],
+        };
+        let stats = derive_statistics(&tf, &memo, &HashMap::new());
+        let cs = stats
+            .column_statistics
+            .get(&base)
+            .expect("table function must pass through child column statistics");
+        assert!(
+            (cs.distinct_values_count - 50.0).abs() < 1e-9,
+            "child NDV should pass through, got {}",
+            cs.distinct_values_count
+        );
+    }
+
+    #[test]
+    fn aggregate_state_merge_merges_child_column_statistics() {
+        use crate::sql::optimizer::memo::{LogicalProperties, MExpr};
+        use crate::sql::optimizer::operator::{AggregateStateMergeOp, LogicalValuesOp, Operator};
+
+        fn child_with_key(memo: &mut Memo, col_id: u32, ndv: f64, rows: f64) -> usize {
+            let g = memo.new_group(MExpr {
+                id: memo.next_expr_id(),
+                op: Operator::LogicalValues(LogicalValuesOp {
+                    rows: vec![],
+                    columns: vec![],
+                }),
+                children: vec![],
+            });
+            let mut props = LogicalProperties::new(vec![stats_output_column(col_id, "k")], rows);
+            props.row_count_confidence = Confidence::Estimated;
+            props.column_statistics.insert(
+                ColumnId::new_for_test(col_id),
+                set_op_column_stat(0.0, ndv, 0.0, 8.0, ndv, Confidence::Estimated),
+            );
+            memo.groups[g].logical_props = Some(props);
+            g
+        }
+
+        let mut memo = Memo::new();
+        let old = child_with_key(&mut memo, 1, 100.0, 1000.0);
+        let delta = child_with_key(&mut memo, 2, 30.0, 200.0);
+        let merge = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalAggregateStateMerge(AggregateStateMergeOp {
+                group_key_names: vec!["k".to_string()],
+                aggregate_state_names: vec![],
+                change_op_column: "op".to_string(),
+                output_columns: vec![stats_output_column(9, "k")],
+            }),
+            children: vec![old, delta],
+        };
+        let stats = derive_statistics(&merge, &memo, &HashMap::new());
+        let cs = stats
+            .column_statistics
+            .get(&ColumnId::new_for_test(9))
+            .expect("aggregate-state-merge must carry merged child column statistics");
+        // union-all merge of NDV 100 and 30 -> >= max child NDV.
+        assert!(
+            cs.distinct_values_count >= 100.0,
+            "merged NDV should be >= max child NDV, got {}",
+            cs.distinct_values_count
+        );
     }
 
     #[test]
