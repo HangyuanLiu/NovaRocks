@@ -320,6 +320,78 @@ mod tests {
     }
 
     #[test]
+    fn decode_output_expr_uses_materialized_string_slot() {
+        let build = build_distributed_plan_only("decode_output_expr_slot", decode_over_scan_plan());
+        let root = fragment_by_id("decode_output_expr_slot", &build, build.root_fragment_id);
+        let decode = root
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.node_type == crate::plan_nodes::TPlanNodeType::DECODE_NODE)
+            .expect("decode node");
+        let decode_payload = decode.decode_node.as_ref().expect("decode payload");
+        let mapping = decode_payload
+            .dict_id_to_string_ids
+            .as_ref()
+            .expect("decode mapping");
+        let string_slot_id = *mapping.values().next().expect("one decode mapping");
+        let output_exprs = root.output_exprs.as_ref().expect("root output exprs");
+        let slot_ref = output_exprs[0].nodes[0]
+            .slot_ref
+            .as_ref()
+            .expect("decode output slot ref");
+        assert_eq!(
+            slot_ref.slot_id, string_slot_id,
+            "decode result sink must read the materialized string slot"
+        );
+    }
+
+    #[test]
+    fn set_op_uses_declared_child_output_order() {
+        let build =
+            build_distributed_plan_only("set_op_child_output_order", reordered_union_values_plan());
+        let root = fragment_by_id("set_op_child_output_order", &build, build.root_fragment_id);
+        let union = root.plan.nodes.first().expect("set op root");
+        assert_eq!(
+            union.node_type,
+            crate::plan_nodes::TPlanNodeType::UNION_NODE
+        );
+        assert_eq!(union.num_children, 2);
+        let first_expr = &union
+            .union_node
+            .as_ref()
+            .expect("union payload")
+            .result_expr_lists[0][0];
+        assert_eq!(
+            first_expr.nodes[0].node_type,
+            crate::exprs::TExprNodeType::SLOT_REF,
+            "first set-op expression should read the declared string child column directly"
+        );
+    }
+
+    #[test]
+    fn set_op_child_arity_mismatch_fails_fast() {
+        assert_distributed_plan_error_contains(
+            "set_op_child_arity_mismatch",
+            union_plan(
+                true,
+                aliased_scan_plan("l", 1, 2),
+                single_column_scan_plan(output_col(901, "k", DataType::Int64, false)),
+            ),
+            "set operation child 1 column count mismatch",
+        );
+    }
+
+    #[test]
+    fn values_row_length_mismatch_fails_fast() {
+        assert_distributed_plan_error_contains(
+            "values_row_length_mismatch",
+            bad_values_row_length_plan(),
+            "VALUES row column count mismatch",
+        );
+    }
+
+    #[test]
     fn iceberg_data_file_scan_ranges_match_direct_fragment_builder() {
         let mut connectors = ConnectorRegistry::new();
         connectors.register_scan_planner(Arc::new(IcebergConnectorScanPlanner::new()));
@@ -360,6 +432,16 @@ mod tests {
         .unwrap_or_else(|err| panic!("{case_name}: DistributedPlan build failed: {err}"));
 
         (direct, distributed)
+    }
+
+    fn build_distributed_plan_only(
+        case_name: &str,
+        plan: PhysicalPlanNode,
+    ) -> MultiFragmentBuildResult {
+        let catalog = DummyCatalog;
+        let connectors = ConnectorRegistry::new();
+        PlanFragmentBuilder::build_via_distributed_plan(&plan, &catalog, &connectors, "test_db")
+            .unwrap_or_else(|err| panic!("{case_name}: DistributedPlan build failed: {err}"))
     }
 
     fn assert_distributed_plan_error_contains(
@@ -1000,6 +1082,60 @@ mod tests {
             }),
             vec![],
             vec![k, v],
+        )
+    }
+
+    fn bad_values_row_length_plan() -> PhysicalPlanNode {
+        let k = output_col(611, "k", DataType::Int64, false);
+        let v = output_col(612, "v", DataType::Int64, true);
+        physical_node(
+            Operator::PhysicalValues(PhysicalValuesOp {
+                rows: vec![vec![int_lit(1)]],
+                columns: vec![k.clone(), v.clone()],
+            }),
+            vec![],
+            vec![k, v],
+        )
+    }
+
+    fn reordered_union_values_plan() -> PhysicalPlanNode {
+        let left = two_column_values_plan(621, 622);
+        let right = two_column_values_plan(623, 624);
+        let output_columns = vec![
+            output_col(625, "s", DataType::Utf8, true),
+            output_col(626, "k", DataType::Int64, false),
+        ];
+        let child_output_columns = vec![
+            vec![
+                left.output_columns[1].clone(),
+                left.output_columns[0].clone(),
+            ],
+            vec![
+                right.output_columns[1].clone(),
+                right.output_columns[0].clone(),
+            ],
+        ];
+        physical_node(
+            Operator::PhysicalUnion(PhysicalUnionOp {
+                all: true,
+                output_columns: output_columns.clone(),
+                child_output_columns,
+            }),
+            vec![left, right],
+            output_columns,
+        )
+    }
+
+    fn two_column_values_plan(k_id: u32, s_id: u32) -> PhysicalPlanNode {
+        let k = output_col(k_id, "k", DataType::Int64, false);
+        let s = output_col(s_id, "s", DataType::Utf8, true);
+        physical_node(
+            Operator::PhysicalValues(PhysicalValuesOp {
+                rows: vec![],
+                columns: vec![k.clone(), s.clone()],
+            }),
+            vec![],
+            vec![k, s],
         )
     }
 

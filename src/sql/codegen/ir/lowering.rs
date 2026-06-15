@@ -750,6 +750,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     tuple_id,
                     set_op.kind,
                     &set_op.output_columns,
+                    &set_op.child_output_columns,
                     &children,
                 )?;
                 let mut plan_nodes = vec![plan_node];
@@ -2197,13 +2198,17 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         let state = &mut *self.state;
         let mut decode_scope = ExprScope::new();
         let mut mapping: BTreeMap<i32, i32> = BTreeMap::new();
-        let mut consumed_dict_slots: BTreeSet<i32> = Default::default();
+        let mut materialized_dict_slots: BTreeMap<i32, ColumnBinding> = BTreeMap::new();
 
         let mut col_pos: i32 = 0;
         for (child_name, child_binding) in &child_columns {
             if let Some((string_name, data_type, nullable, output_column_id)) =
                 dict_target_meta.get(&child_binding.slot_id)
             {
+                if let Some(binding) = materialized_dict_slots.get(&child_binding.slot_id) {
+                    decode_scope.add_id_alias(*output_column_id, binding.clone());
+                    continue;
+                }
                 let string_slot_id = state.alloc_slot();
                 state.desc_builder().add_slot(
                     string_slot_id,
@@ -2213,21 +2218,22 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     *nullable,
                     col_pos,
                 );
-                if consumed_dict_slots.insert(child_binding.slot_id) {
-                    mapping.insert(child_binding.slot_id, string_slot_id);
-                }
+                mapping.insert(child_binding.slot_id, string_slot_id);
+                let output_binding = ColumnBinding {
+                    tuple_id: decode_tuple_id,
+                    slot_id: string_slot_id,
+                    data_type: data_type.clone(),
+                    type_desc: None,
+                    nullable: *nullable,
+                };
+                materialized_dict_slots.insert(child_binding.slot_id, output_binding.clone());
                 decode_scope.add_column_with_id(
                     *output_column_id,
                     None,
                     string_name.clone(),
-                    ColumnBinding {
-                        tuple_id: decode_tuple_id,
-                        slot_id: string_slot_id,
-                        data_type: data_type.clone(),
-                        type_desc: None,
-                        nullable: *nullable,
-                    },
+                    output_binding,
                 );
+                col_pos += 1;
             } else {
                 state.desc_builder().add_slot(
                     child_binding.slot_id,
@@ -2252,8 +2258,8 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                         decode_scope.add_id_alias(*column_id, output_binding.clone());
                     }
                 }
+                col_pos += 1;
             }
-            col_pos += 1;
         }
 
         if mapping.len() != op.mappings.len() {
@@ -2439,6 +2445,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         output_tuple_id: i32,
         kind: super::body::SetOpKind,
         explicit_output_columns: &[AnalysisOutputColumn],
+        child_output_columns: &[Vec<AnalysisOutputColumn>],
         child_results: &[LoweredDistributedNode],
     ) -> Result<(plan_nodes::TPlanNode, ExprScope), String> {
         if child_results.is_empty() {
@@ -2502,13 +2509,70 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         }
         state.desc_builder().add_tuple(output_tuple_id, None);
 
+        if !child_output_columns.is_empty() && child_output_columns.len() != child_results.len() {
+            return Err(format!(
+                "set operation child_output_columns has {}, inputs has {}",
+                child_output_columns.len(),
+                child_results.len()
+            ));
+        }
+
         let mut result_expr_lists = Vec::with_capacity(child_results.len());
-        for child_result in child_results {
+        for (child_idx, child_result) in child_results.iter().enumerate() {
+            let fallback_child_columns: Vec<AnalysisOutputColumn>;
+            let expected_child_columns = if child_output_columns.is_empty() {
+                fallback_child_columns = child_result
+                    .scope
+                    .iter_columns()
+                    .map(|(name, binding)| AnalysisOutputColumn {
+                        column_id: crate::sql::column_id::ColumnId::UNSET,
+                        name: name.clone(),
+                        data_type: binding.data_type.clone(),
+                        nullable: binding.nullable,
+                        is_internal: false,
+                    })
+                    .collect();
+                &fallback_child_columns
+            } else {
+                &child_output_columns[child_idx]
+            };
+            if expected_child_columns.len() != output_columns.len() {
+                return Err(format!(
+                    "set operation child {} column count mismatch during codegen: child has {}, output has {}",
+                    child_idx,
+                    expected_child_columns.len(),
+                    output_columns.len()
+                ));
+            }
+            let ordered_child_bindings: Vec<_> = child_result.scope.iter_columns().collect();
             let mut expr_list = Vec::new();
-            for (col_idx, (_, child_binding)) in child_result.scope.iter_columns().enumerate() {
-                let output_col = output_columns.get(col_idx).ok_or_else(|| {
-                    format!("missing output column {} for set operation", col_idx)
-                })?;
+            for (col_idx, expected_child_col) in expected_child_columns.iter().enumerate() {
+                let output_col = &output_columns[col_idx];
+                let child_binding = if expected_child_col.column_id
+                    != crate::sql::column_id::ColumnId::UNSET
+                {
+                    child_result
+                        .scope
+                        .resolve_by_id(expected_child_col.column_id)
+                        .ok_or_else(|| {
+                            format!(
+                                "set operation child {} output column `{}` id={} is not in child scope",
+                                child_idx,
+                                expected_child_col.name,
+                                expected_child_col.column_id.0
+                            )
+                        })?
+                } else {
+                    ordered_child_bindings
+                        .get(col_idx)
+                        .map(|(_, binding)| *binding)
+                        .ok_or_else(|| {
+                            format!(
+                                "set operation child {} missing positional column {}",
+                                child_idx, col_idx
+                            )
+                        })?
+                };
                 let needs_cast = child_binding.data_type != output_col.data_type;
                 if needs_cast {
                     let target_desc = type_infer::arrow_type_to_type_desc(&output_col.data_type)?;
