@@ -80,8 +80,9 @@ pub(crate) struct OptimizerOptions {
     disabled_rules: HashSet<String>,
     /// Hard cap on each logical rewrite stage's tree-level fixed-point loop.
     pub rewrite_max_iterations: usize,
-    /// Hard cap on the CBO Memo group count (existing constant; documented here).
-    #[allow(dead_code)]
+    /// Hard cap on the CBO Memo group count. Exploration stops early (and logs a
+    /// truncation warning) once the memo exceeds this, bounding join-enumeration
+    /// blowup. Defaults to 5000.
     pub cbo_max_groups: usize,
     /// Wall-clock budget for the entire `optimize()` call (existing constant; documented here).
     pub optimize_timeout: Duration,

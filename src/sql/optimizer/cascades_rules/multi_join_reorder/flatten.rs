@@ -23,7 +23,14 @@ use super::MultiJoinGraph;
 pub(crate) fn flatten_join_chain(memo: &Memo, root: GroupId) -> Option<MultiJoinGraph> {
     let mut atoms: Vec<GroupId> = Vec::new();
     let mut raw_predicates: Vec<TypedExpr> = Vec::new();
-    collect_chain(memo, root, &mut atoms, &mut raw_predicates);
+    let mut chain_joins: Vec<GroupId> = Vec::new();
+    collect_chain(
+        memo,
+        root,
+        &mut atoms,
+        &mut raw_predicates,
+        &mut chain_joins,
+    );
 
     if atoms.len() < 2 || atoms.len() > 32 {
         return None;
@@ -52,6 +59,7 @@ pub(crate) fn flatten_join_chain(memo: &Memo, root: GroupId) -> Option<MultiJoin
         atoms,
         atom_stats,
         predicates,
+        chain_join_groups: chain_joins,
     })
 }
 
@@ -60,6 +68,7 @@ fn collect_chain(
     group: GroupId,
     atoms: &mut Vec<GroupId>,
     predicates: &mut Vec<TypedExpr>,
+    chain_joins: &mut Vec<GroupId>,
 ) {
     let Some(expr) = memo.groups.get(group).and_then(|g| g.logical_exprs.first()) else {
         atoms.push(group);
@@ -72,8 +81,11 @@ fn collect_chain(
         }) if matches!(join_type, JoinKind::Inner | JoinKind::Cross)
             && expr.children.len() == 2 =>
         {
-            collect_chain(memo, expr.children[0], atoms, predicates);
-            collect_chain(memo, expr.children[1], atoms, predicates);
+            // This inner/cross join is part of the chain; record it so the
+            // reorder pass can mark it reorder-owned (D2).
+            chain_joins.push(group);
+            collect_chain(memo, expr.children[0], atoms, predicates, chain_joins);
+            collect_chain(memo, expr.children[1], atoms, predicates, chain_joins);
             if let Some(cond) = condition {
                 predicates.extend(split_and(cond.clone()));
             }
@@ -81,9 +93,11 @@ fn collect_chain(
         Operator::LogicalFilter(f)
             if expr.children.len() == 1 && is_inner_cross_join(memo, expr.children[0]) =>
         {
-            // Absorb a filter sitting directly on an inner/cross join.
+            // Absorb a filter sitting directly on an inner/cross join. The filter
+            // group itself is not a join (JoinAssociativity never matches it), so
+            // only the join below it is recorded as a chain join.
             predicates.extend(split_and(f.predicate.clone()));
-            collect_chain(memo, expr.children[0], atoms, predicates);
+            collect_chain(memo, expr.children[0], atoms, predicates, chain_joins);
         }
         // Any other operator (incl. LogicalProject and outer/semi joins) is an
         // opaque atom — the chain stops here.

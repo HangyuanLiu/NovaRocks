@@ -3,7 +3,7 @@
 //! The Memo stores equivalence classes (Groups) of expressions (MExprs).
 //! Each MExpr holds an Operator and references its children as GroupIds.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::operator::{LogicalJoinOp, Operator};
 use super::property::{ColumnIdSet, EquivalenceClasses};
@@ -58,6 +58,12 @@ pub(crate) struct Memo {
     /// multiple reorder candidates sharing intermediate sub-joins reuse one
     /// group instead of minting duplicates (StarRocks `Memo.groupExpressions`).
     pub(crate) join_group_index: HashMap<(String, Vec<GroupId>), GroupId>,
+    /// Join groups that the in-memo reorder pass took ownership of (chains
+    /// larger than the exhaustive threshold, for which it injected
+    /// multi-candidate orders). `explore` skips `JoinAssociativity` on these so
+    /// it does not redundantly re-enumerate orders the reorder pass already
+    /// produced (D2: reorder/associativity mutual exclusion).
+    pub(crate) reorder_owned_groups: HashSet<GroupId>,
 }
 
 impl Memo {
@@ -67,6 +73,7 @@ impl Memo {
             cte_produce_groups: HashMap::new(),
             factory: ColumnRefFactory::new(),
             join_group_index: HashMap::new(),
+            reorder_owned_groups: HashSet::new(),
         }
     }
 

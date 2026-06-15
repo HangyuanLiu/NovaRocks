@@ -86,6 +86,11 @@ fn reorder_chain(
     if n <= opts.max_reorder_node_use_exhaustive || n > opts.max_reorder_node {
         return;
     }
+    // This chain is reorder-owned: record its join groups so explore's
+    // JoinAssociativity skips them and does not re-enumerate the orders we are
+    // about to inject (D2: reorder/associativity mutual exclusion).
+    memo.reorder_owned_groups
+        .extend(graph.chain_join_groups.iter().copied());
     // Degrade to LeftDeep-only when base statistics are unknown (StarRocks
     // `Utils.hasUnknownColumnsStats`).
     let mut caps = opts.caps();
@@ -292,6 +297,38 @@ mod tests {
                 "group {gid} must have stamped logical_props after the pass"
             );
         }
+    }
+
+    #[test]
+    fn reorder_marks_owned_groups_for_large_chain() {
+        // A chain larger than the exhaustive threshold is reorder-owned: its
+        // join groups are recorded so explore's JoinAssociativity skips them (D2).
+        let mut memo = Memo::new();
+        let root = build_path_chain(&mut memo, 6, Confidence::Estimated);
+        run_multi_join_reorder(&mut memo, &ReorderOptions::default(), &HashMap::new());
+        assert!(
+            memo.reorder_owned_groups.contains(&root),
+            "the chain root must be marked reorder-owned"
+        );
+        assert_eq!(
+            memo.reorder_owned_groups.len(),
+            5,
+            "a 6-atom left-deep chain has 5 join groups (root + 4 internal); all marked"
+        );
+    }
+
+    #[test]
+    fn reorder_does_not_mark_small_chain() {
+        // A chain <= the exhaustive threshold is left to JoinAssociativity, so it
+        // must NOT be marked reorder-owned.
+        let mut memo = Memo::new();
+        build_path_chain(&mut memo, 3, Confidence::Estimated);
+        run_multi_join_reorder(&mut memo, &ReorderOptions::default(), &HashMap::new());
+        assert!(
+            memo.reorder_owned_groups.is_empty(),
+            "small chain must not be reorder-owned, got {:?}",
+            memo.reorder_owned_groups
+        );
     }
 
     #[test]
