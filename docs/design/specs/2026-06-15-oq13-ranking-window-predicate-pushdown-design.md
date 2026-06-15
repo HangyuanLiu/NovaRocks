@@ -14,13 +14,14 @@ OQ-13 的 analytic/window parity 含两个子项：
 
 本设计的目标：当查询用 `ROW_NUMBER()/RANK()/DENSE_RANK() OVER (PARTITION BY p ORDER BY o)` 配外层 `rank_col <= k`（top-per-group）表达时，让优化器把每分区的输入提前裁剪到「rank ≤ K 的超集」，从而减少进入 analytic 算子的行数、提升 plan 紧凑度与执行效率，**且查询结果逐行不变**。
 
-对标 StarRocks 的 `PushDownPredicateRankingWindowRule`（ranking-window 谓词下推）。注意 StarRocks FE 自身只对 ROW_NUMBER/RANK 下推、未覆盖 DENSE_RANK；NovaRocks 的 exec 底座（`SortTopNType::DenseRank`）已支持三种，本设计三种都覆盖。
+对标 StarRocks 的 `PushDownPredicateRankingWindowRule`（ranking-window 谓词下推）。注意 StarRocks FE 自身只对 ROW_NUMBER/RANK 下推、未覆盖 DENSE_RANK；NovaRocks 已有 `SortTopNType{RowNumber,Rank,DenseRank}` 三种枚举值，但截断逻辑当前仅全局可执行——本设计在 exec 层把三种都推广到 per-partition（见 §3 修正）。
 
 ## 2. 范围与非目标
 
 **范围**
 - 新增逻辑重写规则 `RankingWindowPredicatePushdown`。
 - 给 `LogicalSortOp` / `PhysicalSortOp` 增加 `partition_limit: Option<usize>` 与 `topn_type: Option<SortTopNType>` 字段（`None` = 非 partition-topn 的普通 Sort，与 `TSortNode` 的 Option 字段一致），并贯通 convert/implement/codegen/explain。
+- **新建 exec 层 per-partition TopN 执行能力**（关键，见 §3 调研修正）：exec `SortNode` 增加 `partition_exprs` / `partition_limit`、lowering（`src/lower/node/sort.rs`）读取 `TSortNode.partition_exprs/partition_limit`、sort 算子在 partition-key group 边界**重置 rank 计数**做按分区截断 + exec 单测。现成 `chunks_sorter_topn` 只做全局，需推广到分区。
 - 覆盖 ROW_NUMBER / RANK / DENSE_RANK，PARTITION BY 非空（per-group）。
 - 补齐 OQ-13 完整收尾所需测试产物（见 §8）。
 
@@ -30,11 +31,12 @@ OQ-13 的 analytic/window parity 含两个子项：
 - 不覆盖全局无 PARTITION BY 的 ranking（与既有 `sort_limit_to_top_n` 路径重叠，列为 future）。
 - 不依赖 seed tpc-ds 数据或 FE plan-diff 基线作为硬验收（见 §8 验证基准）。
 
-## 3. 当前状态调研（2026-06-15）
+## 3. 当前状态调研（2026-06-15，含前期误判修正）
 
-- **exec 底座已存在**：`src/exec/operators/sort/chunks_sorter_topn.rs` 实现 RANK/DENSE_RANK/ROW_NUMBER 的 per-partition 截断边界（含 tie 处理）；`src/exec/node/sort.rs` 定义 `SortTopNType{RowNumber,Rank,DenseRank}`；`TSortNode` 已有 `partition_exprs`/`partition_limit`/`topn_type` 字段。
-- **标准优化器从不生成它**：`PhysicalSortOp`（`src/sql/optimizer/operator.rs:370`）目前只携带 `analytic_partition_exprs`，**没有** `partition_limit`/`topn_type`；`src/sql/codegen/fragment_builder.rs:2580` 把 `TSortNode.partition_exprs/partition_limit/topn_type` 写死为 `None`；优化器无任何规则消费 ranking 谓词。故该能力今天只能从 FE 下发的 plan 触达，standalone 路径完全缺失。
-- **挂载点已就位**：planner 在 Window 下面已放一个带分区键的 Sort——`analytic_partition_exprs` 在 `src/sql/optimizer/convert.rs:100` 由 `node.analytic_partition_by` 填充，这正是要标注 `partition_limit` 的节点。`cascades_rules/implement.rs:735` 已把 `analytic_partition_exprs` 从 logical 透传到 physical。
+- **⚠️ exec 只支持「全局」rank-TopN，per-partition 不可执行（修正先前判断）**：`src/exec/operators/sort/chunks_sorter_topn.rs` 的 RANK/DENSE_RANK/ROW_NUMBER 边界逻辑是**全局**的（peer-group = tie 组，不是 PARTITION BY 组），exec `SortNode`（`src/exec/node/sort.rs:42-54`）**没有** `partition_exprs`/`partition_limit` 字段，全 repo **没有** PartitionTopN/analytic-topn 算子。更关键：**lowering `src/lower/node/sort.rs:103` 只解析 `topn_type` 和 `limit`，完全忽略 `TSortNode.partition_limit`/`partition_exprs`**——连 FE 下发的 partition-TopN 也被静默丢弃。且 `analytic_partition_exprs` 的 hash-shuffle 后单 driver 内多分区交错，全局 limit 不能凑合代替分区截断。→ **per-group rank-TopN 必须新建 exec 执行能力**（§2 范围）。
+- **`TSortNode`（thrift）已有字段但无人消费**：`partition_exprs`/`partition_limit`/`topn_type` 在 `idl/thrift/PlanNodes.thrift` 已定义；但 codegen `src/sql/codegen/fragment_builder.rs:2580` 把它们写死 `None`，lowering 又不读 partition_*。`SortTopNType{RowNumber,Rank,DenseRank}` 已存在于 `src/exec/node/sort.rs`，可复用为 topn_type 类型。
+- **标准优化器从不生成它**：`PhysicalSortOp`（`src/sql/optimizer/operator.rs:370`）只携带 `analytic_partition_exprs`，**没有** `partition_limit`/`topn_type`；无任何规则消费 ranking 谓词。
+- **挂载点已就位**：planner 在 Window 下面已放一个带分区键的 Sort——`analytic_partition_exprs` 在 `src/sql/optimizer/convert.rs:100` 由 `node.analytic_partition_by` 填充，这正是要标注 `partition_limit` 的节点。`cascades_rules/implement.rs:735` 已把 `analytic_partition_exprs` 从 logical 透传到 physical（新字段照此透传）。
 
 ## 4. 架构与挂载点
 
@@ -54,13 +56,19 @@ LogicalFilter(pred 引用 rank_col)
 - `partition_limit = K`（从谓词推出的每分区 rank 上界，见 §5）
 - `topn_type = RowNumber | Rank | DenseRank`（从 ranking_fn 推出）
 
-**到 exec 的链路**（仅差填值）：
-1. `LogicalSortOp` + `PhysicalSortOp` 新增 `partition_limit: Option<usize>` 与 `topn_type: Option<SortTopNType>`（`None` = 非 partition-topn）。`partition_limit.is_some()` 为是否 partition-topn 的判定门。
-2. `convert.rs`：logical→optimizer 转换透传新字段（默认 `None` / 既有缺省）。
-3. `cascades_rules/implement.rs`：把新字段从 logical 透传到 physical（仿现有 `analytic_partition_exprs` 透传）。
-4. `codegen/fragment_builder.rs`：把 `TSortNode.partition_exprs/partition_limit/topn_type` 改为读 `PhysicalSortOp` 的值。
-5. `src/sql/explain.rs`：Sort 节点渲染追加 `partition_limit=K topn_type=Rank` token（golden 断言所需）。
-6. exec 侧 `chunks_sorter_topn` + `TSortNode.partition_limit` 零改动。
+**到 exec 的链路**（优化器接线 + 新建 exec 能力两段）：
+
+*优化器/codegen 段*：
+1. planner `SortNode` + memo `LogicalSortOp` + `PhysicalSortOp` 新增 `partition_limit: Option<usize>` 与 `topn_type: Option<SortTopNType>`（`None` = 非 partition-topn）。`partition_limit.is_some()` 为是否 partition-topn 的判定门。规则写 planner `SortNode`。
+2. `convert.rs:100`：planner→memo 透传新字段（仿 `analytic_partition_by`）。
+3. `cascades_rules/implement.rs:735`：memo logical→physical 透传新字段（仿 `analytic_partition_exprs`）。
+4. `codegen/fragment_builder.rs:2580`：`partition_limit.is_some()` 时，把 `TSortNode.partition_exprs`（= 编译后的 partition 键）/`partition_limit`/`topn_type` 改为读 `PhysicalSortOp` 的值（否则保持 `None`）。
+5. `src/sql/explain.rs:675`：Sort 节点渲染追加 `partition_limit=K topn_type=Rank` token（golden 断言所需）。
+
+*新建 exec 能力段*（关键，先前误判为零改动）：
+6. exec `SortNode`（`src/exec/node/sort.rs`）新增 `partition_exprs: Vec<SortExpression>`（或等价 expr 引用）与 `partition_limit: Option<usize>`。
+7. lowering `src/lower/node/sort.rs`：解析 `TSortNode.partition_exprs`/`partition_limit`，编译并填到 exec `SortNode`（现仅解析 `topn_type`/`limit`）。
+8. sort 算子 / `chunks_sorter_topn`：当 `partition_limit` 存在时，按 `partition_exprs` 排序为 (partition 键, order 键),在每个 partition-key group 边界**重置 rank 计数**并对该组套用既有 RowNumber/Rank/DenseRank 边界逻辑——即把现有「全局单组」推广为「逐分区组」。+ exec 单测覆盖分区边界、每分区 tie、分区键 NULL。
 
 **为何逻辑重写而非 cascades 规则**：匹配需跨 Filter→[Project]→Window→Sort 多层识别 ranking 函数与谓词，逻辑树重写匹配多层形态更稳；`partition_limit` 虽是物理细节，但挂在 Logical/Physical 两侧都已存在的 Sort 上，透传路径已通。
 
@@ -108,9 +116,11 @@ LogicalFilter(pred 引用 rank_col)
 4. **补 Apply 半边缺失产物**：
    - tpc-h q2/q17 plan golden / `@explain_contains=WINDOW`（锁 WinMagic 收益）。
    - scalar 子查询多行 `@expect_error`（Apply 设计文档 §8.3 已规定但当前缺失）。
-5. **单测**：谓词→K 提取、topn_type 映射、各护栏拒绝路径（聚合窗口 / 无上界 / 无分区 / AssertOneRow / 幂等）。
-6. **kill switch + 注册**：`RankingWindowPredicatePushdown` 进 `registry.rs` known-rules。
-7. **验证基准**（已选定）：新 golden 在 rule on/off 下结果一致 + `optimizer`/`join`/`filter`/`sort`/`cte` 套件无新增失败。不硬依赖 FE/tpc-ds seeding；如数据可用则 best-effort 跑 q47/q49/q57、q2/q17 观察形态，不阻塞交付。
+5. **优化器单测**：谓词→K 提取、topn_type 映射、各护栏拒绝路径（聚合窗口 / 无上界 / 无分区 / AssertOneRow / 幂等）。
+6. **exec 单测**（新建能力）：partition-key group 边界正确重置 rank 计数；每分区独立的 RowNumber 精确 K / Rank 边界 tie / DenseRank；分区键含 NULL 的分组；多分区交错输入；与全局（无 partition_exprs）行为回归不变。
+7. **lowering 单测**：`TSortNode.partition_exprs`/`partition_limit` 正确解析到 exec `SortNode`（仿 `lower_sort_node_accepts_rank_topn_type`）。
+8. **kill switch + 注册**：`RankingWindowPredicatePushdown` 进 `registry.rs` known-rules。
+9. **验证基准**（已选定）：新 golden 在 rule on/off 下结果一致 + `optimizer`/`join`/`filter`/`sort`/`cte` 套件无新增失败。不硬依赖 FE/tpc-ds seeding；如数据可用则 best-effort 跑 q47/q49/q57、q2/q17 观察形态，不阻塞交付。
 
 ## 9. 风险与未决
 
@@ -118,6 +128,8 @@ LogicalFilter(pred 引用 rank_col)
 2. **tie 行数估计**：RANK/DENSE_RANK 截断后行数可能略超 K，stats 取保守值，避免下游 cost 低估。
 3. **与 `topn_compactness` / `sort_limit_to_top_n` 协调**：这些 cascades 规则也读/写 Sort 字段且检查 `analytic_partition_exprs`（`topn_compactness.rs:235`）；需确认它们不会清掉或误处理新设的 `partition_limit`，并补一条「带 analytic 分区的 Sort 已携 partition_limit 时」的回归。
 4. **planner 是否总在 Window 下产出 analytic Sort**：实现期确认；若存在无 feeding-sort 的 Window 形态，规则需自行插入或保守放弃。
+5. **新建 exec per-partition 截断的正确性面（本设计最大风险）**：分区边界重置 rank、每分区 tie、分区键 NULL 分组、分区键与 order 键的排序前缀，以及与 `analytic_partition_exprs` 并存时的语义（同一 Sort 既要按分区并行又要按分区截断）。须以 exec 单测矩阵锁死，且「无 partition_exprs 时」行为必须与今天全局 topn 逐字节回归不变。
+6. **同一 Sort 双重职责**：该 Sort 同时承载 `analytic_partition_exprs`（并行分区排序）与 `partition_exprs`/`partition_limit`（分区截断）。需确认 codegen 两组字段一致（同为 window 的 PARTITION BY 键）且 exec 先按分区分组再截断；若实现上更清晰，可让 codegen 在 `partition_limit.is_some()` 时直接复用 analytic 分区键填 `partition_exprs`。
 
 ## 10. 验收标准（对接 OQ-13）
 
