@@ -27,7 +27,7 @@ use crate::sql::codegen::boundary_schema::{
 };
 use crate::sql::codegen::descriptors::DescriptorTableBuilder;
 use crate::sql::codegen::expr_compiler::{self, ExprCompiler};
-use crate::sql::codegen::helpers::{join_kind_to_op, split_and_conjuncts_typed};
+use crate::sql::codegen::helpers::split_and_conjuncts_typed;
 use crate::sql::codegen::iceberg_write_sink::{
     IcebergWriteSinkSpec, partition_info_from_serialized_metadata,
 };
@@ -52,7 +52,7 @@ use crate::sql::optimizer::operator::{
 use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
 use crate::sql::optimizer::property::{OrderingSpec, window_ordering_spec};
 
-use crate::sql::analysis::{ExprKind, JoinKind, LiteralValue, TypedExpr};
+use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
 use crate::sql::planner::plan::AggregateCall;
 
 // ---------------------------------------------------------------------------
@@ -300,19 +300,19 @@ fn aggregate_state_shaped_data_type(
 /// its probe descendants) looks this up by `filter_id` to wire the RF's
 /// `plan_node_id_to_target_expr` and the probe-side prober params.
 #[derive(Clone, Debug)]
-struct RfProbeTarget {
+pub(in crate::sql::codegen) struct RfProbeTarget {
     /// Thrift node id of the node that consumes the probe (scan or the
     /// root thrift node of an intermediate operator's subtree).
-    thrift_node_id: i32,
+    pub(in crate::sql::codegen) thrift_node_id: i32,
     /// Probe key expression compiled against the target node's output scope.
-    probe_texpr: exprs::TExpr,
+    pub(in crate::sql::codegen) probe_texpr: exprs::TExpr,
     /// Fragment that owns the probe target node.
-    fragment_id: FragmentId,
+    pub(in crate::sql::codegen) fragment_id: FragmentId,
 }
 
 /// Standalone-mode pipeline DOP used for the RF layout's
 /// `num_drivers_per_instance`. Mirrors the historical post-pass computation.
-fn rf_pipeline_dop() -> i32 {
+pub(in crate::sql::codegen) fn rf_pipeline_dop() -> i32 {
     std::thread::available_parallelism()
         .map(|p| p.get().min(4))
         .unwrap_or(4) as i32
@@ -333,7 +333,7 @@ fn rf_pipeline_dop() -> i32 {
 ///   is its post-demote index.
 /// - `None` when the RF's conjunct was demoted to `other_join_conjuncts` (it
 ///   is no longer an equi-join key at execution) — the caller MUST drop the RF.
-fn remap_rf_expr_order(
+pub(in crate::sql::codegen) fn remap_rf_expr_order(
     surviving_eq_origin: &[usize],
     pre_demote_expr_order: usize,
 ) -> Option<usize> {
@@ -421,7 +421,10 @@ fn collect_rf_column_refs(expr: &TypedExpr, refs: &mut Vec<(ColumnId, Option<Str
     }
 }
 
-fn rf_build_expr_matches_join_build_expr(candidate: &TypedExpr, expected: &TypedExpr) -> bool {
+pub(in crate::sql::codegen) fn rf_build_expr_matches_join_build_expr(
+    candidate: &TypedExpr,
+    expected: &TypedExpr,
+) -> bool {
     let mut candidate_refs = Vec::new();
     let mut expected_refs = Vec::new();
     collect_rf_column_refs(candidate, &mut candidate_refs);
@@ -429,14 +432,14 @@ fn rf_build_expr_matches_join_build_expr(candidate: &TypedExpr, expected: &Typed
     !expected_refs.is_empty() && candidate_refs == expected_refs
 }
 
-fn join_distribution_mode(
-    node: &PhysicalPlanNode,
+pub(in crate::sql::codegen) fn join_distribution_mode_from_execution(
+    execution_distribution: Option<crate::sql::optimizer::physical_plan::JoinExecutionDistribution>,
     fallback: &crate::sql::optimizer::operator::JoinDistribution,
 ) -> plan_nodes::TJoinDistributionMode {
     use crate::sql::optimizer::operator::JoinDistribution;
     use crate::sql::optimizer::physical_plan::JoinExecutionDistribution;
 
-    match node.execution_props.join_distribution {
+    match execution_distribution {
         Some(JoinExecutionDistribution::Broadcast) => plan_nodes::TJoinDistributionMode::BROADCAST,
         Some(JoinExecutionDistribution::Partitioned) => {
             plan_nodes::TJoinDistributionMode::PARTITIONED
@@ -451,7 +454,7 @@ fn join_distribution_mode(
     }
 }
 
-fn legacy_rf_distribution_to_execution(
+pub(in crate::sql::codegen) fn legacy_rf_distribution_to_execution(
     distribution: &crate::sql::optimizer::operator::JoinDistribution,
 ) -> crate::sql::optimizer::physical_plan::JoinExecutionDistribution {
     use crate::sql::optimizer::operator::JoinDistribution;
@@ -468,7 +471,7 @@ fn legacy_rf_distribution_to_execution(
 
 /// Map execution join distribution to the thrift RF
 /// `(build_join_mode, local_layout, global_layout)` triple.
-fn rf_layout_for_execution_distribution(
+pub(in crate::sql::codegen) fn rf_layout_for_execution_distribution(
     distribution: crate::sql::optimizer::physical_plan::JoinExecutionDistribution,
 ) -> (
     crate::runtime_filter::TRuntimeFilterBuildJoinMode,
@@ -667,13 +670,14 @@ pub(crate) struct PlanFragmentBuilder<'a> {
     /// `visit_hash_join` to wire each build descriptor to its probe node.
     /// Probe descendants are always visited before the owning join (children
     /// first), so the lookup is populated by the time the join needs it.
-    rf_probe_targets: HashMap<i32, RfProbeTarget>,
+    pub(in crate::sql::codegen) rf_probe_targets: HashMap<i32, RfProbeTarget>,
     /// Accumulated `filter_id -> TRuntimeFilterDescription` across all joins.
-    rf_all_filters: HashMap<i32, crate::runtime_filter::TRuntimeFilterDescription>,
+    pub(in crate::sql::codegen) rf_all_filters:
+        HashMap<i32, crate::runtime_filter::TRuntimeFilterDescription>,
     /// Accumulated build-side filter ids per fragment (the join's fragment).
-    rf_build_side_filters: HashMap<FragmentId, Vec<i32>>,
+    pub(in crate::sql::codegen) rf_build_side_filters: HashMap<FragmentId, Vec<i32>>,
     /// Accumulated probe-side `(filter_id, probe_target_node_id)` per fragment.
-    rf_probe_side_filters: HashMap<FragmentId, Vec<(i32, i32)>>,
+    pub(in crate::sql::codegen) rf_probe_side_filters: HashMap<FragmentId, Vec<(i32, i32)>>,
 }
 
 impl<'a> PlanFragmentBuilder<'a> {
@@ -1820,184 +1824,39 @@ impl<'a> PlanFragmentBuilder<'a> {
     ) -> Result<VisitResult, String> {
         let left = self.visit(&node.children[0])?;
         let right = self.visit(&node.children[1])?;
-
-        let join_op = join_kind_to_op(op.join_type);
         let join_node_id = self.alloc_node();
-
-        // Compile eq conditions.  Pairs are pre-oriented by JoinToHashJoin so
-        // that pair.0 references the left child and pair.1 references the right
-        // in the common case.  However, orientation can fail when the same
-        // column name appears in both children (e.g. self-join on a CTE) or
-        // when logical_props is missing for a child group.  We therefore try
-        // the natural order first, then the swapped order as a fallback, and
-        // demote only when neither compiles successfully.
-        let mut eq_join_conjuncts = Vec::new();
-        let mut demoted_eq_exprs: Vec<crate::sql::analysis::TypedExpr> = Vec::new();
-        // Parallel to `eq_join_conjuncts`: `surviving_eq_origin[j]` is the
-        // original `op.eq_conditions` index of the j-th surviving conjunct.
-        // Demoted conditions get no entry, so this lets runtime-filter lowering
-        // remap the physical pass's pre-demote `expr_order` onto the post-demote
-        // conjunct index that BE lowering uses. See `remap_rf_expr_order`.
-        let mut surviving_eq_origin: Vec<usize> = Vec::new();
-        let mut surviving_eq_build_exprs: Vec<TypedExpr> = Vec::new();
-        for (eq_index, eq) in op.eq_conditions.iter().enumerate() {
-            let expr_a = &eq.left;
-            let expr_b = &eq.right;
-            // Try natural order: expr_a on left, expr_b on right.
-            let natural = ExprCompiler::new_strict_id(self.slot_allocator(), &left.scope)
-                .compile_typed(expr_a)
-                .ok()
-                .and_then(|lt| {
-                    ExprCompiler::new_strict_id(self.slot_allocator(), &right.scope)
-                        .compile_typed(expr_b)
-                        .ok()
-                        .map(|rt| (lt, rt, expr_b.clone()))
-                });
-            // Try swapped order: expr_b on left, expr_a on right.
-            // Needed when JoinCommutativity swapped children but the
-            // eq_condition columns still reference the original order.
-            let result = natural.or_else(|| {
-                ExprCompiler::new_strict_id(self.slot_allocator(), &left.scope)
-                    .compile_typed(expr_b)
-                    .ok()
-                    .and_then(|lt| {
-                        ExprCompiler::new_strict_id(self.slot_allocator(), &right.scope)
-                            .compile_typed(expr_a)
-                            .ok()
-                            .map(|rt| (lt, rt, expr_a.clone()))
-                    })
-            });
-            if let Some((lt, rt, build_expr)) = result {
-                eq_join_conjuncts.push(plan_nodes::TEqJoinCondition {
-                    left: lt,
-                    right: rt,
-                    opcode: Some(if eq.null_safe {
-                        crate::opcodes::TExprOpcode::EQ_FOR_NULL
-                    } else {
-                        crate::opcodes::TExprOpcode::EQ
-                    }),
-                });
-                surviving_eq_origin.push(eq_index);
-                surviving_eq_build_exprs.push(build_expr);
-            } else {
-                // Both sides belong to the same child — demote to other_condition
-                // compiled with a merged scope.
-                demoted_eq_exprs.push(crate::sql::analysis::TypedExpr {
-                    kind: crate::sql::analysis::ExprKind::BinaryOp {
-                        left: Box::new(expr_a.clone()),
-                        op: if eq.null_safe {
-                            crate::sql::analysis::BinOp::EqForNull
-                        } else {
-                            crate::sql::analysis::BinOp::Eq
-                        },
-                        right: Box::new(expr_b.clone()),
-                    },
-                    data_type: arrow::datatypes::DataType::Boolean,
-                    nullable: false,
-                });
-            }
-        }
-
-        // Compile other conditions (including any eq pairs demoted above).
-        let mut other_join_conjuncts = Vec::new();
-        {
-            let mut merged = ExprScope::new();
-            merged.merge(&left.scope);
-            merged.merge(&right.scope);
-            let mut compiler = ExprCompiler::new(self.slot_allocator(), &merged);
-            for demoted in &demoted_eq_exprs {
-                other_join_conjuncts.push(compiler.compile_typed(demoted)?);
-            }
-            if let Some(ref cond) = op.other_condition {
-                other_join_conjuncts.push(compiler.compile_typed(cond)?);
-            }
-        }
-
-        let distribution_mode = join_distribution_mode(node, &op.distribution);
-        let mut join_plan_node = nodes::build_hash_join_node(
-            join_node_id,
-            &left.tuple_ids,
-            &right.tuple_ids,
-            join_op,
-            distribution_mode,
-            eq_join_conjuncts,
-            other_join_conjuncts,
-        );
-
-        // OQ-5: lower the runtime-filter annotations the physical-tree pass
-        // attached to this join into thrift `TRuntimeFilterDescription`s and
-        // patch them onto the join node. Compiled here while `right.scope`
-        // (the build side) is still available — it is moved into the merged
-        // output scope further below. `surviving_eq_origin` remaps each RF's
-        // pre-demote `expr_order` onto the post-demote `eq_join_conjuncts`
-        // index that BE lowering indexes.
-        let rf_descs = self.build_rf_descriptors(
-            node,
-            join_node_id,
-            &right.scope,
-            &surviving_eq_origin,
-            &surviving_eq_build_exprs,
-        )?;
-        if !rf_descs.is_empty()
-            && let Some(hj) = join_plan_node.hash_join_node.as_mut()
-        {
-            hj.build_runtime_filters = Some(rf_descs);
-        }
-
-        // Widen nullable flags on the join's null-producing side(s). Note: this
-        // is the tuple-level widening needed by the descriptor table and the
-        // runtime's null-padding for SEMI/ANTI pruned columns. The authoritative
-        // source of column-level nullability is `node.output_columns`, populated
-        // by stats::derive_output_columns via widen_for_join_kind. This match
-        // intentionally mirrors that widening at the tuple level — a per-slot
-        // nullability mechanism would let us drive both from output_columns,
-        // but is out of scope here.
-        match op.join_type {
-            JoinKind::LeftOuter | JoinKind::LeftAnti | JoinKind::LeftSemi => {
-                for &tid in &right.tuple_ids {
-                    self.desc_builder.widen_tuple_nullable(tid);
-                }
-            }
-            JoinKind::RightOuter | JoinKind::RightAnti | JoinKind::RightSemi => {
-                for &tid in &left.tuple_ids {
-                    self.desc_builder.widen_tuple_nullable(tid);
-                }
-            }
-            JoinKind::FullOuter => {
-                for &tid in &left.tuple_ids {
-                    self.desc_builder.widen_tuple_nullable(tid);
-                }
-                for &tid in &right.tuple_ids {
-                    self.desc_builder.widen_tuple_nullable(tid);
-                }
-            }
-            _ => {}
-        }
-
-        // tuple_ids always includes both sides — the join node's row_tuples
-        // must reference all probe and build tuples.
-        let mut merged_tuple_ids = left.tuple_ids.clone();
-        merged_tuple_ids.extend(&right.tuple_ids);
-
-        // Output scope: SEMI/ANTI joins only expose the surviving side's
-        // columns to downstream operators (preventing stale column
-        // references when multiple SEMI joins are chained).
-        let merged_scope = match op.join_type {
-            JoinKind::LeftSemi | JoinKind::LeftAnti => left.scope,
-            JoinKind::RightSemi | JoinKind::RightAnti => right.scope,
-            _ => {
-                let mut scope = left.scope;
-                scope.merge(&right.scope);
-                scope
-            }
-        };
+        let VisitResult {
+            plan_nodes: left_plan_nodes,
+            scope: left_scope,
+            tuple_ids: left_tuple_ids,
+            cte_exchange_nodes: left_cte_exchange_nodes,
+            ..
+        } = left;
+        let VisitResult {
+            plan_nodes: right_plan_nodes,
+            scope: right_scope,
+            tuple_ids: right_tuple_ids,
+            cte_exchange_nodes: right_cte_exchange_nodes,
+            ..
+        } = right;
+        let (join_plan_node, merged_scope, merged_tuple_ids) =
+            self.lowering_ctx().lower_hash_join(
+                join_node_id,
+                &left_tuple_ids,
+                &right_tuple_ids,
+                op,
+                left_scope,
+                right_scope,
+                node.execution_props.join_distribution,
+                &node.build_runtime_filters,
+            )?;
 
         // Pre-order: join node, then left subtree, then right subtree
         let mut plan_nodes = vec![join_plan_node];
-        plan_nodes.extend(left.plan_nodes);
-        plan_nodes.extend(right.plan_nodes);
-        let mut cte_exchange_nodes = left.cte_exchange_nodes;
-        cte_exchange_nodes.extend(right.cte_exchange_nodes);
+        plan_nodes.extend(left_plan_nodes);
+        plan_nodes.extend(right_plan_nodes);
+        let mut cte_exchange_nodes = left_cte_exchange_nodes;
+        cte_exchange_nodes.extend(right_cte_exchange_nodes);
 
         Ok(VisitResult {
             plan_nodes,
@@ -2006,176 +1865,6 @@ impl<'a> PlanFragmentBuilder<'a> {
             cte_exchange_nodes,
             ordering: OrderingSpec::Any,
         })
-    }
-
-    // -------------------------------------------------------------------
-    // Runtime filter lowering (OQ-5)
-    // -------------------------------------------------------------------
-
-    /// Lower the build-side runtime-filter annotations on `node` into thrift
-    /// `TRuntimeFilterDescription`s and accumulate the coordinator-facing RF
-    /// maps. Each build key is compiled fresh against `build_scope` (the join's
-    /// right child scope) to avoid index drift with the eq-conjunct demote
-    /// dance. The probe target (node id + compiled probe expr) is looked up
-    /// from `rf_probe_targets`, populated while visiting the probe descendants
-    /// before this join. A descriptor with no recorded probe target is a
-    /// build-only RF (empty `plan_node_id_to_target_expr`).
-    ///
-    /// `surviving_eq_origin` is the parallel vec from `visit_hash_join` that
-    /// maps each surviving `eq_join_conjuncts` entry back to its source
-    /// `op.eq_conditions` index. The physical pass records `rf.expr_order` in
-    /// the PRE-demote `op.eq_conditions` space, but BE lowering indexes the
-    /// POST-demote `eq_join_conjuncts` (and the build/probe key + null-safe
-    /// vectors derived from it). We therefore remap every descriptor's
-    /// `expr_order` through `surviving_eq_origin` and DROP any RF whose source
-    /// conjunct was demoted to `other_join_conjuncts` (no longer an equi-key).
-    fn build_rf_descriptors(
-        &mut self,
-        node: &PhysicalPlanNode,
-        join_node_id: i32,
-        build_scope: &ExprScope,
-        surviving_eq_origin: &[usize],
-        surviving_eq_build_exprs: &[TypedExpr],
-    ) -> Result<Vec<crate::runtime_filter::TRuntimeFilterDescription>, String> {
-        use crate::runtime_filter;
-
-        if node.build_runtime_filters.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let pipeline_dop = rf_pipeline_dop();
-        let join_fragment = self.current_fragment_id()?;
-        let mut descs: Vec<runtime_filter::TRuntimeFilterDescription> =
-            Vec::with_capacity(node.build_runtime_filters.len());
-
-        for rf in &node.build_runtime_filters {
-            let filter_id = rf.filter_id;
-
-            // Remap the physical pass's pre-demote `expr_order` onto the
-            // post-demote `eq_join_conjuncts` index that BE lowering indexes.
-            // If the source conjunct was demoted to `other_join_conjuncts`,
-            // it is no longer an equi-join key at execution — drop the RF
-            // entirely rather than emit a descriptor BE cannot align.
-            let Some(post_demote_expr_order) =
-                remap_rf_expr_order(surviving_eq_origin, rf.expr_order)
-            else {
-                continue;
-            };
-            // Defensive: never emit a descriptor whose `expr_order` is out of
-            // range for the join's `eq_join_conjuncts` (BE would Err on it).
-            // `remap_rf_expr_order` returns a position within
-            // `surviving_eq_origin`, whose length equals `eq_join_conjuncts`,
-            // so this can only trip on a future invariant break.
-            if post_demote_expr_order >= surviving_eq_origin.len() {
-                continue;
-            }
-            let Some(expected_build_expr) = surviving_eq_build_exprs.get(post_demote_expr_order)
-            else {
-                continue;
-            };
-            if !rf_build_expr_matches_join_build_expr(&rf.build_expr, expected_build_expr) {
-                tracing::debug!(
-                    "skip runtime filter {filter_id}: build expr does not match join build key"
-                );
-                continue;
-            }
-
-            // The build key MUST be the equi-join side that binds the build
-            // (right) child's scope. Invalid RF descriptors are skipped rather
-            // than reinterpreted with the probe key, because the optimizer RF
-            // descriptor is the source of truth for build/probe semantics.
-            let build_texpr = match ExprCompiler::new(self.slot_allocator(), build_scope)
-                .compile_typed(&rf.build_expr)
-            {
-                Ok(t) => t,
-                Err(err) => {
-                    tracing::debug!(
-                        "skip runtime filter {filter_id}: build expr does not bind build scope: {err}"
-                    );
-                    continue;
-                }
-            };
-
-            // Probe target recorded while visiting the probe descendants. When
-            // children were swapped relative to the eq labeling, the annotation
-            // pass pushed the probe expr down the wrong child (it could not bind
-            // by ColumnId), so no target was recorded — the descriptor is then
-            // build-only with an empty target map (matches StarRocks "no probe
-            // target").
-            let probe_target = self.rf_probe_targets.get(&filter_id).cloned();
-            let has_remote_targets = probe_target
-                .as_ref()
-                .map(|t| t.fragment_id != join_fragment)
-                .unwrap_or(false);
-
-            let execution_distribution = node
-                .execution_props
-                .join_distribution
-                .unwrap_or_else(|| legacy_rf_distribution_to_execution(&rf.distribution));
-            let (build_join_mode, local_layout, global_layout) =
-                rf_layout_for_execution_distribution(execution_distribution);
-
-            let layout = runtime_filter::TRuntimeFilterLayout::new(
-                filter_id,
-                local_layout,
-                global_layout,
-                false,            // pipeline_level_multi_partitioned
-                1_i32,            // num_instances
-                pipeline_dop,     // num_drivers_per_instance
-                None::<Vec<i32>>, // bucketseq_to_instance
-                None::<Vec<i32>>, // bucketseq_to_driverseq
-                None::<Vec<i32>>, // bucketseq_to_partition
-                None::<Vec<crate::partitions::TBucketProperty>>, // bucket_properties
-            );
-
-            // Probe targets: one entry per placed probe; empty for build-only.
-            let mut target_map = BTreeMap::new();
-            if let Some(target) = &probe_target {
-                target_map.insert(target.thrift_node_id, target.probe_texpr.clone());
-            }
-
-            let desc = runtime_filter::TRuntimeFilterDescription::new(
-                filter_id,                                              // filter_id
-                build_texpr,                                            // build_expr
-                post_demote_expr_order as i32,                          // expr_order
-                target_map,                                 // plan_node_id_to_target_expr
-                has_remote_targets,                         // has_remote_targets
-                None::<i64>,                                // bloom_filter_size
-                None::<Vec<crate::types::TNetworkAddress>>, // runtime_filter_merge_nodes
-                build_join_mode,                            // build_join_mode
-                None::<crate::types::TUniqueId>,            // sender_finst_id
-                join_node_id,                               // build_plan_node_id
-                None::<Vec<crate::types::TUniqueId>>,       // broadcast_grf_senders
-                None::<Vec<runtime_filter::TRuntimeFilterDestination>>, // broadcast_grf_destinations
-                None::<Vec<i32>>,                                       // bucketseq_to_instance
-                None::<BTreeMap<i32, Vec<exprs::TExpr>>>, // plan_node_id_to_partition_by_exprs
-                runtime_filter::TRuntimeFilterBuildType::JOIN_FILTER, // filter_type
-                layout,                                   // layout
-                None::<bool>,                             // build_from_group_execution
-                None::<bool>,                             // is_broad_cast_join_in_skew
-                None::<i32>,                              // skew_shuffle_filter_id
-                None::<bool>,                             // is_asc
-                None::<bool>,                             // is_nulls_first
-                None::<i64>,                              // limit
-            );
-
-            descs.push(desc.clone());
-
-            // Accumulate coordinator-facing RF maps.
-            self.rf_all_filters.insert(filter_id, desc);
-            self.rf_build_side_filters
-                .entry(join_fragment)
-                .or_default()
-                .push(filter_id);
-            if let Some(target) = &probe_target {
-                self.rf_probe_side_filters
-                    .entry(target.fragment_id)
-                    .or_default()
-                    .push((filter_id, target.thrift_node_id));
-            }
-        }
-
-        Ok(descs)
     }
 
     // -------------------------------------------------------------------
@@ -2189,76 +1878,36 @@ impl<'a> PlanFragmentBuilder<'a> {
     ) -> Result<VisitResult, String> {
         let left = self.visit(&node.children[0])?;
         let right = self.visit(&node.children[1])?;
-
-        let join_op = join_kind_to_op(op.join_type);
         let join_node_id = self.alloc_node();
-
-        let join_conjuncts = if let Some(ref cond) = op.condition {
-            let mut merged = ExprScope::new();
-            merged.merge(&left.scope);
-            merged.merge(&right.scope);
-            let conjuncts = split_and_conjuncts_typed(cond);
-            let mut results = Vec::new();
-            for conj in conjuncts {
-                let mut compiler = ExprCompiler::new(self.slot_allocator(), &merged);
-                results.push(compiler.compile_typed(conj)?);
-            }
-            results
-        } else {
-            vec![]
-        };
-
-        let join_plan_node = nodes::build_nestloop_join_node(
-            join_node_id,
-            &left.tuple_ids,
-            &right.tuple_ids,
-            join_op,
-            join_conjuncts,
-        );
-
-        // Widen nullable for outer/anti join nullable side tuples.
-        match op.join_type {
-            JoinKind::LeftOuter | JoinKind::LeftAnti => {
-                for &tid in &right.tuple_ids {
-                    self.desc_builder.widen_tuple_nullable(tid);
-                }
-            }
-            JoinKind::RightOuter | JoinKind::RightAnti => {
-                for &tid in &left.tuple_ids {
-                    self.desc_builder.widen_tuple_nullable(tid);
-                }
-            }
-            JoinKind::FullOuter => {
-                for &tid in &left.tuple_ids {
-                    self.desc_builder.widen_tuple_nullable(tid);
-                }
-                for &tid in &right.tuple_ids {
-                    self.desc_builder.widen_tuple_nullable(tid);
-                }
-            }
-            _ => {}
-        }
-
-        // tuple_ids always includes both sides for the join node.
-        let mut merged_tuple_ids = left.tuple_ids.clone();
-        merged_tuple_ids.extend(&right.tuple_ids);
-
-        // Output scope: SEMI/ANTI only expose surviving side.
-        let merged_scope = match op.join_type {
-            JoinKind::LeftSemi | JoinKind::LeftAnti => left.scope,
-            JoinKind::RightSemi | JoinKind::RightAnti => right.scope,
-            _ => {
-                let mut scope = left.scope;
-                scope.merge(&right.scope);
-                scope
-            }
-        };
+        let VisitResult {
+            plan_nodes: left_plan_nodes,
+            scope: left_scope,
+            tuple_ids: left_tuple_ids,
+            cte_exchange_nodes: left_cte_exchange_nodes,
+            ..
+        } = left;
+        let VisitResult {
+            plan_nodes: right_plan_nodes,
+            scope: right_scope,
+            tuple_ids: right_tuple_ids,
+            cte_exchange_nodes: right_cte_exchange_nodes,
+            ..
+        } = right;
+        let (join_plan_node, merged_scope, merged_tuple_ids) =
+            self.lowering_ctx().lower_nest_loop_join(
+                join_node_id,
+                &left_tuple_ids,
+                &right_tuple_ids,
+                op,
+                left_scope,
+                right_scope,
+            )?;
 
         let mut plan_nodes = vec![join_plan_node];
-        plan_nodes.extend(left.plan_nodes);
-        plan_nodes.extend(right.plan_nodes);
-        let mut cte_exchange_nodes = left.cte_exchange_nodes;
-        cte_exchange_nodes.extend(right.cte_exchange_nodes);
+        plan_nodes.extend(left_plan_nodes);
+        plan_nodes.extend(right_plan_nodes);
+        let mut cte_exchange_nodes = left_cte_exchange_nodes;
+        cte_exchange_nodes.extend(right_cte_exchange_nodes);
 
         Ok(VisitResult {
             plan_nodes,

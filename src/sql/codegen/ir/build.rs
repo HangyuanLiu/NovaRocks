@@ -4,7 +4,9 @@ use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
 
 use super::FragmentId;
-use super::body::{HashAggregateBody, ProjectBody, ScanBody, SortBody};
+use super::body::{
+    HashAggregateBody, HashJoinBody, NestLoopJoinBody, ProjectBody, ScanBody, SortBody,
+};
 use super::fragment::{DataPartition, DataSink, DistributedPlan, PlanFragment};
 use super::node::{DistributedPlanNode, DistributedPlanNodeBody, PlanNodeStats};
 
@@ -41,6 +43,9 @@ impl DistributedPlanBuilder {
                     tuple_ids: vec![tuple_id],
                     nullable_tuple_ids: vec![],
                     limit: -1,
+                    execution_join_distribution: node.execution_props.join_distribution,
+                    build_runtime_filters: node.build_runtime_filters.clone(),
+                    probe_runtime_filters: node.probe_runtime_filters.clone(),
                     children: vec![],
                     stats: PlanNodeStats::from_statistics(&node.stats),
                     body: DistributedPlanNodeBody::Scan(Box::new(ScanBody {
@@ -61,6 +66,9 @@ impl DistributedPlanBuilder {
                 let mut child = self.visit(child_plan, fragment_id)?;
                 fold_filter_into_scan(&mut child, &op.predicate)?;
                 child.stats = PlanNodeStats::from_statistics(&node.stats);
+                child
+                    .probe_runtime_filters
+                    .extend(node.probe_runtime_filters.clone());
                 Ok(child)
             }
             Operator::PhysicalProject(op) => {
@@ -74,6 +82,9 @@ impl DistributedPlanBuilder {
                     tuple_ids: vec![tuple_id],
                     nullable_tuple_ids: vec![],
                     limit: -1,
+                    execution_join_distribution: node.execution_props.join_distribution,
+                    build_runtime_filters: node.build_runtime_filters.clone(),
+                    probe_runtime_filters: node.probe_runtime_filters.clone(),
                     children: vec![child],
                     stats: PlanNodeStats::from_statistics(&node.stats),
                     body: DistributedPlanNodeBody::Project(ProjectBody {
@@ -92,6 +103,9 @@ impl DistributedPlanBuilder {
                     tuple_ids: child.tuple_ids.clone(),
                     nullable_tuple_ids: vec![],
                     limit: -1,
+                    execution_join_distribution: node.execution_props.join_distribution,
+                    build_runtime_filters: node.build_runtime_filters.clone(),
+                    probe_runtime_filters: node.probe_runtime_filters.clone(),
                     children: vec![child],
                     stats: PlanNodeStats::from_statistics(&node.stats),
                     body: DistributedPlanNodeBody::Sort(SortBody {
@@ -113,6 +127,9 @@ impl DistributedPlanBuilder {
                     tuple_ids: vec![agg_tuple_id],
                     nullable_tuple_ids: vec![],
                     limit: -1,
+                    execution_join_distribution: node.execution_props.join_distribution,
+                    build_runtime_filters: node.build_runtime_filters.clone(),
+                    probe_runtime_filters: node.probe_runtime_filters.clone(),
                     children: vec![child],
                     stats: PlanNodeStats::from_statistics(&node.stats),
                     body: DistributedPlanNodeBody::HashAggregate(Box::new(HashAggregateBody {
@@ -124,11 +141,74 @@ impl DistributedPlanBuilder {
                     })),
                 })
             }
+            Operator::PhysicalHashJoin(op) => {
+                let (left_plan, right_plan) = expect_binary_children(node, "PhysicalHashJoin")?;
+                let left = self.visit(left_plan, fragment_id)?;
+                let right = self.visit(right_plan, fragment_id)?;
+                let node_id = self.alloc_node();
+                let mut tuple_ids = left.tuple_ids.clone();
+                tuple_ids.extend(right.tuple_ids.iter().copied());
+                Ok(DistributedPlanNode {
+                    node_id,
+                    fragment_id,
+                    tuple_ids,
+                    nullable_tuple_ids: vec![],
+                    limit: -1,
+                    execution_join_distribution: node.execution_props.join_distribution,
+                    build_runtime_filters: node.build_runtime_filters.clone(),
+                    probe_runtime_filters: node.probe_runtime_filters.clone(),
+                    children: vec![left, right],
+                    stats: PlanNodeStats::from_statistics(&node.stats),
+                    body: DistributedPlanNodeBody::HashJoin(Box::new(HashJoinBody {
+                        join_type: op.join_type,
+                        eq_conditions: op.eq_conditions.clone(),
+                        other_condition: op.other_condition.clone(),
+                        distribution: op.distribution.clone(),
+                    })),
+                })
+            }
+            Operator::PhysicalNestLoopJoin(op) => {
+                let (left_plan, right_plan) = expect_binary_children(node, "PhysicalNestLoopJoin")?;
+                let left = self.visit(left_plan, fragment_id)?;
+                let right = self.visit(right_plan, fragment_id)?;
+                let node_id = self.alloc_node();
+                let mut tuple_ids = left.tuple_ids.clone();
+                tuple_ids.extend(right.tuple_ids.iter().copied());
+                Ok(DistributedPlanNode {
+                    node_id,
+                    fragment_id,
+                    tuple_ids,
+                    nullable_tuple_ids: vec![],
+                    limit: -1,
+                    execution_join_distribution: node.execution_props.join_distribution,
+                    build_runtime_filters: node.build_runtime_filters.clone(),
+                    probe_runtime_filters: node.probe_runtime_filters.clone(),
+                    children: vec![left, right],
+                    stats: PlanNodeStats::from_statistics(&node.stats),
+                    body: DistributedPlanNodeBody::NestLoopJoin(NestLoopJoinBody {
+                        join_type: op.join_type,
+                        condition: op.condition.clone(),
+                    }),
+                })
+            }
             other => Err(format!(
                 "build_distributed_plan slice 1 does not handle operator {other:?}"
             )),
         }
     }
+}
+
+fn expect_binary_children<'a>(
+    node: &'a PhysicalPlanNode,
+    operator_name: &str,
+) -> Result<(&'a PhysicalPlanNode, &'a PhysicalPlanNode), String> {
+    if node.children.len() != 2 {
+        return Err(format!(
+            "build_distributed_plan M0: {operator_name} expected 2 children, got {}",
+            node.children.len()
+        ));
+    }
+    Ok((&node.children[0], &node.children[1]))
 }
 
 fn expect_single_child<'a>(

@@ -7,18 +7,23 @@ use arrow::datatypes::DataType;
 use crate::exprs;
 use crate::lower::type_lowering::arrow_type_from_desc;
 use crate::plan_nodes;
-use crate::sql::analysis::{ExprKind, OutputColumn as AnalysisOutputColumn};
+use crate::sql::analysis::{
+    BinOp, ExprKind, JoinKind, OutputColumn as AnalysisOutputColumn, TypedExpr,
+};
 use crate::sql::catalog::{CatalogProvider, ScanSource, TableDef};
 use crate::sql::codegen::descriptors::DescriptorTableBuilder;
 use crate::sql::codegen::expr_compiler::{self, ExprCompiler};
 use crate::sql::codegen::fragment_builder::{
-    PlanFragmentBuilder, add_iceberg_equality_delete_required_columns, build_result_sink,
-    effective_iceberg_scan_column_names, iceberg_scan_table_handle_for_codegen, iceberg_table_info,
-    output_columns_for_boundary, result_root_boundary_schema_report, synthetic_iceberg_table_id,
+    PlanFragmentBuilder, RfProbeTarget, add_iceberg_equality_delete_required_columns,
+    build_result_sink, effective_iceberg_scan_column_names, iceberg_scan_table_handle_for_codegen,
+    iceberg_table_info, join_distribution_mode_from_execution, legacy_rf_distribution_to_execution,
+    output_columns_for_boundary, remap_rf_expr_order, result_root_boundary_schema_report,
+    rf_build_expr_matches_join_build_expr, rf_layout_for_execution_distribution, rf_pipeline_dop,
+    synthetic_iceberg_table_id,
 };
 use crate::sql::codegen::helpers::{
-    agg_call_display_name, agg_call_display_name_without_qualifiers, typed_expr_display_name,
-    typed_expr_display_name_without_qualifiers,
+    agg_call_display_name, agg_call_display_name_without_qualifiers, join_kind_to_op,
+    split_and_conjuncts_typed, typed_expr_display_name, typed_expr_display_name_without_qualifiers,
 };
 use crate::sql::codegen::nodes;
 use crate::sql::codegen::resolve::{ColumnBinding, ExprScope, ResolvedTable};
@@ -27,9 +32,10 @@ use crate::sql::codegen::{
     FragmentBuildResult, FragmentId, MultiFragmentBuildResult, OutputColumn,
 };
 use crate::sql::optimizer::operator::{
-    AggMode, PhysicalHashAggregateOp, PhysicalProjectOp, PhysicalScanOp, PhysicalSortOp,
-    ScanDictionaryColumn,
+    AggMode, PhysicalHashAggregateOp, PhysicalHashJoinOp, PhysicalNestLoopJoinOp,
+    PhysicalProjectOp, PhysicalScanOp, PhysicalSortOp, ScanDictionaryColumn,
 };
+use crate::sql::optimizer::physical_plan::JoinExecutionDistribution;
 use crate::types;
 
 pub(crate) fn lower_distributed_plan(
@@ -89,7 +95,15 @@ pub(crate) fn lower_distributed_plan(
         root_fragment_id: dp.root_fragment_id,
         edges: Vec::new(),
         boundary_schemas,
-        rf_plan: None,
+        rf_plan: if state.rf_all_filters.is_empty() {
+            None
+        } else {
+            Some(crate::sql::codegen::RuntimeFilterPlanResult {
+                all_filters: state.rf_all_filters,
+                build_side_filters: state.rf_build_side_filters,
+                probe_side_filters: state.rf_probe_side_filters,
+            })
+        },
     })
 }
 
@@ -178,6 +192,12 @@ pub(in crate::sql::codegen) trait LoweringStateAccess<'a> {
     ) -> &mut HashMap<FragmentId, Vec<crate::data::TGlobalDict>>;
     fn slot_to_global_dict(&self) -> &HashMap<i32, crate::data::TGlobalDict>;
     fn slot_to_global_dict_mut(&mut self) -> &mut HashMap<i32, crate::data::TGlobalDict>;
+    fn rf_probe_targets(&mut self) -> &mut HashMap<i32, RfProbeTarget>;
+    fn rf_all_filters(
+        &mut self,
+    ) -> &mut HashMap<i32, crate::runtime_filter::TRuntimeFilterDescription>;
+    fn rf_build_side_filters(&mut self) -> &mut HashMap<FragmentId, Vec<i32>>;
+    fn rf_probe_side_filters(&mut self) -> &mut HashMap<FragmentId, Vec<(i32, i32)>>;
     fn alloc_slot(&mut self) -> i32;
     fn slot_allocator(&self) -> expr_compiler::SlotAllocator;
 
@@ -260,6 +280,24 @@ impl<'a> LoweringStateAccess<'a> for PlanFragmentBuilder<'a> {
         &mut self.slot_to_global_dict
     }
 
+    fn rf_probe_targets(&mut self) -> &mut HashMap<i32, RfProbeTarget> {
+        &mut self.rf_probe_targets
+    }
+
+    fn rf_all_filters(
+        &mut self,
+    ) -> &mut HashMap<i32, crate::runtime_filter::TRuntimeFilterDescription> {
+        &mut self.rf_all_filters
+    }
+
+    fn rf_build_side_filters(&mut self) -> &mut HashMap<FragmentId, Vec<i32>> {
+        &mut self.rf_build_side_filters
+    }
+
+    fn rf_probe_side_filters(&mut self) -> &mut HashMap<FragmentId, Vec<(i32, i32)>> {
+        &mut self.rf_probe_side_filters
+    }
+
     fn alloc_slot(&mut self) -> i32 {
         PlanFragmentBuilder::alloc_slot(self)
     }
@@ -290,6 +328,10 @@ pub(crate) struct OwnedLoweringState<'a> {
     fragment_stack: Vec<FragmentId>,
     query_global_dicts_per_fragment: HashMap<FragmentId, Vec<crate::data::TGlobalDict>>,
     slot_to_global_dict: HashMap<i32, crate::data::TGlobalDict>,
+    rf_probe_targets: HashMap<i32, RfProbeTarget>,
+    rf_all_filters: HashMap<i32, crate::runtime_filter::TRuntimeFilterDescription>,
+    rf_build_side_filters: HashMap<FragmentId, Vec<i32>>,
+    rf_probe_side_filters: HashMap<FragmentId, Vec<(i32, i32)>>,
 }
 
 impl<'a> OwnedLoweringState<'a> {
@@ -307,6 +349,10 @@ impl<'a> OwnedLoweringState<'a> {
             fragment_stack: vec![root_fragment_id],
             query_global_dicts_per_fragment: HashMap::new(),
             slot_to_global_dict: HashMap::new(),
+            rf_probe_targets: HashMap::new(),
+            rf_all_filters: HashMap::new(),
+            rf_build_side_filters: HashMap::new(),
+            rf_probe_side_filters: HashMap::new(),
         }
     }
 }
@@ -348,6 +394,24 @@ impl<'a> LoweringStateAccess<'a> for OwnedLoweringState<'a> {
         &mut self.slot_to_global_dict
     }
 
+    fn rf_probe_targets(&mut self) -> &mut HashMap<i32, RfProbeTarget> {
+        &mut self.rf_probe_targets
+    }
+
+    fn rf_all_filters(
+        &mut self,
+    ) -> &mut HashMap<i32, crate::runtime_filter::TRuntimeFilterDescription> {
+        &mut self.rf_all_filters
+    }
+
+    fn rf_build_side_filters(&mut self) -> &mut HashMap<FragmentId, Vec<i32>> {
+        &mut self.rf_build_side_filters
+    }
+
+    fn rf_probe_side_filters(&mut self) -> &mut HashMap<FragmentId, Vec<(i32, i32)>> {
+        &mut self.rf_probe_side_filters
+    }
+
     fn alloc_slot(&mut self) -> i32 {
         let mut next = self.next_slot_id.borrow_mut();
         let slot_id = *next;
@@ -385,7 +449,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         &mut self,
         node: &super::node::DistributedPlanNode,
     ) -> Result<LoweredDistributedNode, String> {
-        match &node.body {
+        let lowered = match &node.body {
             super::node::DistributedPlanNodeBody::Scan(scan) => {
                 if !node.children.is_empty() {
                     return Err(format!(
@@ -397,12 +461,12 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 let scan_tuple_id = first_tuple_id(node, "Scan")?;
                 let op = scan_body_to_physical_op(scan);
                 let (scan_plan_node, scope) = self.lower_scan(node.node_id, scan_tuple_id, &op)?;
-                Ok(LoweredDistributedNode {
+                LoweredDistributedNode {
                     plan_nodes: vec![scan_plan_node],
                     scope,
                     tuple_ids: vec![scan_tuple_id],
                     output_columns: op.columns.clone(),
-                })
+                }
             }
             super::node::DistributedPlanNodeBody::Project(project) => {
                 if node.children.len() != 1 {
@@ -419,12 +483,12 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     self.lower_project(node.node_id, project_tuple_id, &op, &child.scope)?;
                 let mut plan_nodes = vec![project_plan_node];
                 plan_nodes.extend(child.plan_nodes);
-                Ok(LoweredDistributedNode {
+                LoweredDistributedNode {
                     plan_nodes,
                     scope,
                     tuple_ids: vec![project_tuple_id],
                     output_columns: project_body_output_columns(project),
-                })
+                }
             }
             super::node::DistributedPlanNodeBody::Sort(sort) => {
                 if node.children.len() != 1 {
@@ -446,12 +510,12 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 )?;
                 let mut plan_nodes = vec![sort_plan_node];
                 plan_nodes.extend(child.plan_nodes);
-                Ok(LoweredDistributedNode {
+                LoweredDistributedNode {
                     plan_nodes,
                     scope: child.scope,
                     tuple_ids: child.tuple_ids,
                     output_columns: sort.output_columns.clone(),
-                })
+                }
             }
             super::node::DistributedPlanNodeBody::HashAggregate(agg) => {
                 if node.children.len() != 1 {
@@ -468,14 +532,484 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     self.lower_hash_aggregate(node.node_id, agg_tuple_id, &op, &child.scope)?;
                 let mut plan_nodes = vec![agg_plan_node];
                 plan_nodes.extend(child.plan_nodes);
-                Ok(LoweredDistributedNode {
+                LoweredDistributedNode {
                     plan_nodes,
                     scope,
                     tuple_ids: vec![agg_tuple_id],
                     output_columns: agg.output_columns.clone(),
-                })
+                }
+            }
+            super::node::DistributedPlanNodeBody::HashJoin(hash_join) => {
+                let (left_node, right_node) = binary_children(node, "HashJoin")?;
+                let left = self.lower_node(left_node)?;
+                let right = self.lower_node(right_node)?;
+                let LoweredDistributedNode {
+                    plan_nodes: left_plan_nodes,
+                    scope: left_scope,
+                    tuple_ids: left_tuple_ids,
+                    ..
+                } = left;
+                let LoweredDistributedNode {
+                    plan_nodes: right_plan_nodes,
+                    scope: right_scope,
+                    tuple_ids: right_tuple_ids,
+                    ..
+                } = right;
+                let op = hash_join_body_to_physical_op(hash_join);
+                let (join_plan_node, scope, tuple_ids) = self.lower_hash_join(
+                    node.node_id,
+                    &left_tuple_ids,
+                    &right_tuple_ids,
+                    &op,
+                    left_scope,
+                    right_scope,
+                    node.execution_join_distribution,
+                    &node.build_runtime_filters,
+                )?;
+                let mut plan_nodes = vec![join_plan_node];
+                plan_nodes.extend(left_plan_nodes);
+                plan_nodes.extend(right_plan_nodes);
+                LoweredDistributedNode {
+                    plan_nodes,
+                    scope,
+                    tuple_ids,
+                    output_columns: Vec::new(),
+                }
+            }
+            super::node::DistributedPlanNodeBody::NestLoopJoin(nest_loop) => {
+                let (left_node, right_node) = binary_children(node, "NestLoopJoin")?;
+                let left = self.lower_node(left_node)?;
+                let right = self.lower_node(right_node)?;
+                let LoweredDistributedNode {
+                    plan_nodes: left_plan_nodes,
+                    scope: left_scope,
+                    tuple_ids: left_tuple_ids,
+                    ..
+                } = left;
+                let LoweredDistributedNode {
+                    plan_nodes: right_plan_nodes,
+                    scope: right_scope,
+                    tuple_ids: right_tuple_ids,
+                    ..
+                } = right;
+                let op = nest_loop_join_body_to_physical_op(nest_loop);
+                let (join_plan_node, scope, tuple_ids) = self.lower_nest_loop_join(
+                    node.node_id,
+                    &left_tuple_ids,
+                    &right_tuple_ids,
+                    &op,
+                    left_scope,
+                    right_scope,
+                )?;
+                let mut plan_nodes = vec![join_plan_node];
+                plan_nodes.extend(left_plan_nodes);
+                plan_nodes.extend(right_plan_nodes);
+                LoweredDistributedNode {
+                    plan_nodes,
+                    scope,
+                    tuple_ids,
+                    output_columns: Vec::new(),
+                }
+            }
+        };
+        self.record_probe_targets(node, &lowered);
+        Ok(lowered)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn lower_hash_join(
+        &mut self,
+        join_node_id: i32,
+        left_tuple_ids: &[i32],
+        right_tuple_ids: &[i32],
+        op: &PhysicalHashJoinOp,
+        left_scope: ExprScope,
+        right_scope: ExprScope,
+        execution_distribution: Option<JoinExecutionDistribution>,
+        build_runtime_filters: &[crate::sql::optimizer::runtime_filter_pass::RuntimeFilterDesc],
+    ) -> Result<(plan_nodes::TPlanNode, ExprScope, Vec<i32>), String> {
+        let join_op = join_kind_to_op(op.join_type);
+
+        let mut eq_join_conjuncts = Vec::new();
+        let mut demoted_eq_exprs: Vec<TypedExpr> = Vec::new();
+        let mut surviving_eq_origin: Vec<usize> = Vec::new();
+        let mut surviving_eq_build_exprs: Vec<TypedExpr> = Vec::new();
+        for (eq_index, eq) in op.eq_conditions.iter().enumerate() {
+            let expr_a = &eq.left;
+            let expr_b = &eq.right;
+            let natural = ExprCompiler::new_strict_id(self.state.slot_allocator(), &left_scope)
+                .compile_typed(expr_a)
+                .ok()
+                .and_then(|lt| {
+                    ExprCompiler::new_strict_id(self.state.slot_allocator(), &right_scope)
+                        .compile_typed(expr_b)
+                        .ok()
+                        .map(|rt| (lt, rt, expr_b.clone()))
+                });
+            let result = natural.or_else(|| {
+                ExprCompiler::new_strict_id(self.state.slot_allocator(), &left_scope)
+                    .compile_typed(expr_b)
+                    .ok()
+                    .and_then(|lt| {
+                        ExprCompiler::new_strict_id(self.state.slot_allocator(), &right_scope)
+                            .compile_typed(expr_a)
+                            .ok()
+                            .map(|rt| (lt, rt, expr_a.clone()))
+                    })
+            });
+            if let Some((lt, rt, build_expr)) = result {
+                eq_join_conjuncts.push(plan_nodes::TEqJoinCondition {
+                    left: lt,
+                    right: rt,
+                    opcode: Some(if eq.null_safe {
+                        crate::opcodes::TExprOpcode::EQ_FOR_NULL
+                    } else {
+                        crate::opcodes::TExprOpcode::EQ
+                    }),
+                });
+                surviving_eq_origin.push(eq_index);
+                surviving_eq_build_exprs.push(build_expr);
+            } else {
+                demoted_eq_exprs.push(TypedExpr {
+                    kind: ExprKind::BinaryOp {
+                        left: Box::new(expr_a.clone()),
+                        op: if eq.null_safe {
+                            BinOp::EqForNull
+                        } else {
+                            BinOp::Eq
+                        },
+                        right: Box::new(expr_b.clone()),
+                    },
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                });
             }
         }
+
+        let mut other_join_conjuncts = Vec::new();
+        {
+            let mut merged = ExprScope::new();
+            merged.merge(&left_scope);
+            merged.merge(&right_scope);
+            let mut compiler = ExprCompiler::new(self.state.slot_allocator(), &merged);
+            for demoted in &demoted_eq_exprs {
+                other_join_conjuncts.push(compiler.compile_typed(demoted)?);
+            }
+            if let Some(ref cond) = op.other_condition {
+                other_join_conjuncts.push(compiler.compile_typed(cond)?);
+            }
+        }
+
+        let distribution_mode =
+            join_distribution_mode_from_execution(execution_distribution, &op.distribution);
+        let mut join_plan_node = nodes::build_hash_join_node(
+            join_node_id,
+            left_tuple_ids,
+            right_tuple_ids,
+            join_op,
+            distribution_mode,
+            eq_join_conjuncts,
+            other_join_conjuncts,
+        );
+
+        let rf_descs = self.build_rf_descriptors(
+            build_runtime_filters,
+            join_node_id,
+            &right_scope,
+            &surviving_eq_origin,
+            &surviving_eq_build_exprs,
+            execution_distribution,
+        )?;
+        if !rf_descs.is_empty()
+            && let Some(hj) = join_plan_node.hash_join_node.as_mut()
+        {
+            hj.build_runtime_filters = Some(rf_descs);
+        }
+
+        self.widen_hash_join_nullable_tuples(op.join_type, left_tuple_ids, right_tuple_ids);
+
+        let mut merged_tuple_ids = left_tuple_ids.to_vec();
+        merged_tuple_ids.extend_from_slice(right_tuple_ids);
+
+        let merged_scope = match op.join_type {
+            JoinKind::LeftSemi | JoinKind::LeftAnti => left_scope,
+            JoinKind::RightSemi | JoinKind::RightAnti => right_scope,
+            _ => {
+                let mut scope = left_scope;
+                scope.merge(&right_scope);
+                scope
+            }
+        };
+
+        Ok((join_plan_node, merged_scope, merged_tuple_ids))
+    }
+
+    pub(crate) fn lower_nest_loop_join(
+        &mut self,
+        join_node_id: i32,
+        left_tuple_ids: &[i32],
+        right_tuple_ids: &[i32],
+        op: &PhysicalNestLoopJoinOp,
+        left_scope: ExprScope,
+        right_scope: ExprScope,
+    ) -> Result<(plan_nodes::TPlanNode, ExprScope, Vec<i32>), String> {
+        let join_op = join_kind_to_op(op.join_type);
+
+        let join_conjuncts = if let Some(ref cond) = op.condition {
+            let mut merged = ExprScope::new();
+            merged.merge(&left_scope);
+            merged.merge(&right_scope);
+            let conjuncts = split_and_conjuncts_typed(cond);
+            let mut results = Vec::new();
+            for conj in conjuncts {
+                let mut compiler = ExprCompiler::new(self.state.slot_allocator(), &merged);
+                results.push(compiler.compile_typed(conj)?);
+            }
+            results
+        } else {
+            Vec::new()
+        };
+
+        let join_plan_node = nodes::build_nestloop_join_node(
+            join_node_id,
+            left_tuple_ids,
+            right_tuple_ids,
+            join_op,
+            join_conjuncts,
+        );
+
+        self.widen_nest_loop_join_nullable_tuples(op.join_type, left_tuple_ids, right_tuple_ids);
+
+        let mut merged_tuple_ids = left_tuple_ids.to_vec();
+        merged_tuple_ids.extend_from_slice(right_tuple_ids);
+
+        let merged_scope = match op.join_type {
+            JoinKind::LeftSemi | JoinKind::LeftAnti => left_scope,
+            JoinKind::RightSemi | JoinKind::RightAnti => right_scope,
+            _ => {
+                let mut scope = left_scope;
+                scope.merge(&right_scope);
+                scope
+            }
+        };
+
+        Ok((join_plan_node, merged_scope, merged_tuple_ids))
+    }
+
+    fn widen_hash_join_nullable_tuples(
+        &mut self,
+        join_type: JoinKind,
+        left_tuple_ids: &[i32],
+        right_tuple_ids: &[i32],
+    ) {
+        match join_type {
+            JoinKind::LeftOuter | JoinKind::LeftAnti | JoinKind::LeftSemi => {
+                for &tid in right_tuple_ids {
+                    self.state.desc_builder().widen_tuple_nullable(tid);
+                }
+            }
+            JoinKind::RightOuter | JoinKind::RightAnti | JoinKind::RightSemi => {
+                for &tid in left_tuple_ids {
+                    self.state.desc_builder().widen_tuple_nullable(tid);
+                }
+            }
+            JoinKind::FullOuter => {
+                for &tid in left_tuple_ids {
+                    self.state.desc_builder().widen_tuple_nullable(tid);
+                }
+                for &tid in right_tuple_ids {
+                    self.state.desc_builder().widen_tuple_nullable(tid);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn widen_nest_loop_join_nullable_tuples(
+        &mut self,
+        join_type: JoinKind,
+        left_tuple_ids: &[i32],
+        right_tuple_ids: &[i32],
+    ) {
+        match join_type {
+            JoinKind::LeftOuter | JoinKind::LeftAnti => {
+                for &tid in right_tuple_ids {
+                    self.state.desc_builder().widen_tuple_nullable(tid);
+                }
+            }
+            JoinKind::RightOuter | JoinKind::RightAnti => {
+                for &tid in left_tuple_ids {
+                    self.state.desc_builder().widen_tuple_nullable(tid);
+                }
+            }
+            JoinKind::FullOuter => {
+                for &tid in left_tuple_ids {
+                    self.state.desc_builder().widen_tuple_nullable(tid);
+                }
+                for &tid in right_tuple_ids {
+                    self.state.desc_builder().widen_tuple_nullable(tid);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn record_probe_targets(
+        &mut self,
+        node: &super::node::DistributedPlanNode,
+        result: &LoweredDistributedNode,
+    ) {
+        if node.probe_runtime_filters.is_empty() {
+            return;
+        }
+        let Some(target_node) = result.plan_nodes.first() else {
+            return;
+        };
+        let thrift_node_id = target_node.node_id;
+        let Ok(fragment_id) = self.state.current_fragment_id() else {
+            return;
+        };
+        for probe in &node.probe_runtime_filters {
+            let mut compiler = ExprCompiler::new(self.state.slot_allocator(), &result.scope);
+            let Ok(probe_texpr) = compiler.compile_typed(&probe.probe_expr) else {
+                continue;
+            };
+            self.state.rf_probe_targets().insert(
+                probe.filter_id,
+                RfProbeTarget {
+                    thrift_node_id,
+                    probe_texpr,
+                    fragment_id,
+                },
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_rf_descriptors(
+        &mut self,
+        build_runtime_filters: &[crate::sql::optimizer::runtime_filter_pass::RuntimeFilterDesc],
+        join_node_id: i32,
+        build_scope: &ExprScope,
+        surviving_eq_origin: &[usize],
+        surviving_eq_build_exprs: &[TypedExpr],
+        execution_distribution: Option<JoinExecutionDistribution>,
+    ) -> Result<Vec<crate::runtime_filter::TRuntimeFilterDescription>, String> {
+        use crate::runtime_filter;
+
+        if build_runtime_filters.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let pipeline_dop = rf_pipeline_dop();
+        let join_fragment = self.state.current_fragment_id()?;
+        let mut descs: Vec<runtime_filter::TRuntimeFilterDescription> =
+            Vec::with_capacity(build_runtime_filters.len());
+
+        for rf in build_runtime_filters {
+            let filter_id = rf.filter_id;
+            let Some(post_demote_expr_order) =
+                remap_rf_expr_order(surviving_eq_origin, rf.expr_order)
+            else {
+                continue;
+            };
+            if post_demote_expr_order >= surviving_eq_origin.len() {
+                continue;
+            }
+            let Some(expected_build_expr) = surviving_eq_build_exprs.get(post_demote_expr_order)
+            else {
+                continue;
+            };
+            if !rf_build_expr_matches_join_build_expr(&rf.build_expr, expected_build_expr) {
+                tracing::debug!(
+                    "skip runtime filter {filter_id}: build expr does not match join build key"
+                );
+                continue;
+            }
+
+            let build_texpr = match ExprCompiler::new(self.state.slot_allocator(), build_scope)
+                .compile_typed(&rf.build_expr)
+            {
+                Ok(t) => t,
+                Err(err) => {
+                    tracing::debug!(
+                        "skip runtime filter {filter_id}: build expr does not bind build scope: {err}"
+                    );
+                    continue;
+                }
+            };
+
+            let probe_target = self.state.rf_probe_targets().get(&filter_id).cloned();
+            let has_remote_targets = probe_target
+                .as_ref()
+                .map(|t| t.fragment_id != join_fragment)
+                .unwrap_or(false);
+
+            let effective_distribution = execution_distribution
+                .unwrap_or_else(|| legacy_rf_distribution_to_execution(&rf.distribution));
+            let (build_join_mode, local_layout, global_layout) =
+                rf_layout_for_execution_distribution(effective_distribution);
+
+            let layout = runtime_filter::TRuntimeFilterLayout::new(
+                filter_id,
+                local_layout,
+                global_layout,
+                false,
+                1_i32,
+                pipeline_dop,
+                None::<Vec<i32>>,
+                None::<Vec<i32>>,
+                None::<Vec<i32>>,
+                None::<Vec<crate::partitions::TBucketProperty>>,
+            );
+
+            let mut target_map = BTreeMap::new();
+            if let Some(target) = &probe_target {
+                target_map.insert(target.thrift_node_id, target.probe_texpr.clone());
+            }
+
+            let desc = runtime_filter::TRuntimeFilterDescription::new(
+                filter_id,
+                build_texpr,
+                post_demote_expr_order as i32,
+                target_map,
+                has_remote_targets,
+                None::<i64>,
+                None::<Vec<crate::types::TNetworkAddress>>,
+                build_join_mode,
+                None::<crate::types::TUniqueId>,
+                join_node_id,
+                None::<Vec<crate::types::TUniqueId>>,
+                None::<Vec<runtime_filter::TRuntimeFilterDestination>>,
+                None::<Vec<i32>>,
+                None::<BTreeMap<i32, Vec<exprs::TExpr>>>,
+                runtime_filter::TRuntimeFilterBuildType::JOIN_FILTER,
+                layout,
+                None::<bool>,
+                None::<bool>,
+                None::<i32>,
+                None::<bool>,
+                None::<bool>,
+                None::<i64>,
+            );
+
+            descs.push(desc.clone());
+            self.state.rf_all_filters().insert(filter_id, desc);
+            self.state
+                .rf_build_side_filters()
+                .entry(join_fragment)
+                .or_default()
+                .push(filter_id);
+            if let Some(target) = &probe_target {
+                self.state
+                    .rf_probe_side_filters()
+                    .entry(target.fragment_id)
+                    .or_default()
+                    .push((filter_id, target.thrift_node_id));
+            }
+        }
+
+        Ok(descs)
     }
 
     pub(crate) fn lower_scan(
@@ -1302,6 +1836,26 @@ fn first_tuple_id(
     })
 }
 
+fn binary_children<'a>(
+    node: &'a super::node::DistributedPlanNode,
+    operator_name: &str,
+) -> Result<
+    (
+        &'a super::node::DistributedPlanNode,
+        &'a super::node::DistributedPlanNode,
+    ),
+    String,
+> {
+    if node.children.len() != 2 {
+        return Err(format!(
+            "DistributedPlan {operator_name} node_id={} expected 2 children, got {}",
+            node.node_id,
+            node.children.len()
+        ));
+    }
+    Ok((&node.children[0], &node.children[1]))
+}
+
 fn scan_body_to_physical_op(body: &super::body::ScanBody) -> PhysicalScanOp {
     PhysicalScanOp {
         database: body.database.clone(),
@@ -1339,6 +1893,24 @@ fn hash_aggregate_body_to_physical_op(
         aggregates: body.aggregates.clone(),
         output_columns: body.output_columns.clone(),
         is_merge: body.is_merge.clone(),
+    }
+}
+
+fn hash_join_body_to_physical_op(body: &super::body::HashJoinBody) -> PhysicalHashJoinOp {
+    PhysicalHashJoinOp {
+        join_type: body.join_type,
+        eq_conditions: body.eq_conditions.clone(),
+        other_condition: body.other_condition.clone(),
+        distribution: body.distribution.clone(),
+    }
+}
+
+fn nest_loop_join_body_to_physical_op(
+    body: &super::body::NestLoopJoinBody,
+) -> PhysicalNestLoopJoinOp {
+    PhysicalNestLoopJoinOp {
+        join_type: body.join_type,
+        condition: body.condition.clone(),
     }
 }
 

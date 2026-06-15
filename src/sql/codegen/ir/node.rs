@@ -1,7 +1,9 @@
 use crate::sql::optimizer::statistics::{Confidence, Statistics};
 
 use super::FragmentId;
-use super::body::{HashAggregateBody, ProjectBody, ScanBody, SortBody};
+use super::body::{
+    HashAggregateBody, HashJoinBody, NestLoopJoinBody, ProjectBody, ScanBody, SortBody,
+};
 
 /// Self-contained copy of the estimated stats this node carries, so EXPLAIN /
 /// ANALYZE never reach back into `PhysicalPlanNode`.
@@ -33,6 +35,10 @@ pub(crate) struct DistributedPlanNode {
     pub nullable_tuple_ids: Vec<i32>,
     /// -1 == no limit.
     pub limit: i64,
+    pub execution_join_distribution:
+        Option<crate::sql::optimizer::physical_plan::JoinExecutionDistribution>,
+    pub build_runtime_filters: Vec<crate::sql::optimizer::runtime_filter_pass::RuntimeFilterDesc>,
+    pub probe_runtime_filters: Vec<crate::sql::optimizer::runtime_filter_pass::RuntimeFilterProbe>,
     pub children: Vec<DistributedPlanNode>,
     pub stats: PlanNodeStats,
     pub body: DistributedPlanNodeBody,
@@ -46,6 +52,8 @@ pub(crate) enum DistributedPlanNodeBody {
     Project(ProjectBody),
     Sort(SortBody),
     HashAggregate(Box<HashAggregateBody>),
+    HashJoin(Box<HashJoinBody>),
+    NestLoopJoin(NestLoopJoinBody),
 }
 
 #[cfg(test)]

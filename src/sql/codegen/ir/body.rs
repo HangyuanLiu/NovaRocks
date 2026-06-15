@@ -1,6 +1,6 @@
-use crate::sql::analysis::{OutputColumn, ProjectItem, SortItem, TypedExpr};
+use crate::sql::analysis::{JoinKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
 use crate::sql::catalog::TableDef;
-use crate::sql::optimizer::operator::AggMode;
+use crate::sql::optimizer::operator::{AggMode, JoinDistribution, PhysicalHashJoinEqCondition};
 use crate::sql::planner::plan::AggregateCall;
 use crate::sql::planner::plan::{ScanDictionaryColumn, ScanVariantColumn};
 
@@ -39,4 +39,18 @@ pub(crate) struct HashAggregateBody {
     pub aggregates: Vec<AggregateCall>,
     pub is_merge: Vec<bool>,
     pub output_columns: Vec<OutputColumn>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct HashJoinBody {
+    pub join_type: JoinKind,
+    pub eq_conditions: Vec<PhysicalHashJoinEqCondition>,
+    pub other_condition: Option<TypedExpr>,
+    pub distribution: JoinDistribution,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NestLoopJoinBody {
+    pub join_type: JoinKind,
+    pub condition: Option<TypedExpr>,
 }

@@ -9,7 +9,7 @@ mod tests {
     use crate::connector::iceberg::IcebergMetadataTableType;
     use crate::connector::{ConnectorRegistry, iceberg::IcebergConnectorScanPlanner};
     use crate::sql::analysis::{
-        BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, SortItem, TypedExpr,
+        BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, SortItem, TypedExpr,
     };
     use crate::sql::catalog::{
         CatalogProvider, ColumnDef, IcebergDataFileBinding, IcebergDataFileInfo, IcebergSchemaDef,
@@ -22,11 +22,13 @@ mod tests {
     };
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
-        AggMode, Operator, PhysicalDistributionOp, PhysicalFilterOp, PhysicalHashAggregateOp,
-        PhysicalProjectOp, PhysicalScanOp, PhysicalSortOp,
+        AggMode, JoinDistribution, Operator, PhysicalDistributionOp, PhysicalFilterOp,
+        PhysicalHashAggregateOp, PhysicalHashJoinEqCondition, PhysicalHashJoinOp,
+        PhysicalNestLoopJoinOp, PhysicalProjectOp, PhysicalScanOp, PhysicalSortOp,
     };
     use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, PlanExecutionProps};
     use crate::sql::optimizer::property::DistributionSpec;
+    use crate::sql::optimizer::runtime_filter_pass::{RuntimeFilterDesc, RuntimeFilterProbe};
     use crate::sql::optimizer::statistics::Statistics;
     use crate::sql::planner::plan::AggregateCall;
 
@@ -88,6 +90,24 @@ mod tests {
             "sort_over_project_over_scan",
             sort_plan(project_plan(scan_plan())),
         );
+    }
+
+    #[test]
+    fn inner_hash_join_two_scans_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "inner_hash_join_two_scans",
+            inner_hash_join_two_scans_plan(),
+        );
+    }
+
+    #[test]
+    fn left_outer_hash_join_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent("left_outer_hash_join", left_outer_hash_join_plan());
+    }
+
+    #[test]
+    fn nest_loop_cross_join_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent("nest_loop_cross_join", nest_loop_cross_join_plan());
     }
 
     #[test]
@@ -500,6 +520,86 @@ mod tests {
         )
     }
 
+    fn inner_hash_join_two_scans_plan() -> PhysicalPlanNode {
+        let (mut join, left_key, right_key) = hash_join_plan(JoinKind::Inner);
+        join.children[0].probe_runtime_filters = vec![RuntimeFilterProbe {
+            filter_id: 7,
+            probe_expr: left_key.clone(),
+        }];
+        join.build_runtime_filters = vec![RuntimeFilterDesc {
+            filter_id: 7,
+            build_expr: right_key,
+            probe_expr: left_key,
+            expr_order: 0,
+            distribution: JoinDistribution::Broadcast,
+        }];
+        join
+    }
+
+    fn left_outer_hash_join_plan() -> PhysicalPlanNode {
+        let (join, _, _) = hash_join_plan(JoinKind::LeftOuter);
+        join
+    }
+
+    fn hash_join_plan(join_type: JoinKind) -> (PhysicalPlanNode, TypedExpr, TypedExpr) {
+        let left = aliased_scan_plan("l", 1, 2);
+        let right = aliased_scan_plan("r", 3, 4);
+        let left_key = column_ref_expr_with_qualifier(1, "l", "k", DataType::Int64, false);
+        let right_key = column_ref_expr_with_qualifier(3, "r", "k", DataType::Int64, false);
+        let mut output_columns = left.output_columns.clone();
+        output_columns.extend(right.output_columns.clone());
+        let node = physical_node(
+            Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: left_key.clone(),
+                    right: right_key.clone(),
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+            }),
+            vec![left, right],
+            output_columns,
+        );
+        (node, left_key, right_key)
+    }
+
+    fn nest_loop_cross_join_plan() -> PhysicalPlanNode {
+        let left = aliased_scan_plan("l", 1, 2);
+        let right = aliased_scan_plan("r", 3, 4);
+        let mut output_columns = left.output_columns.clone();
+        output_columns.extend(right.output_columns.clone());
+        physical_node(
+            Operator::PhysicalNestLoopJoin(PhysicalNestLoopJoinOp {
+                join_type: JoinKind::Cross,
+                condition: None,
+            }),
+            vec![left, right],
+            output_columns,
+        )
+    }
+
+    fn aliased_scan_plan(alias: &str, key_id: u32, value_id: u32) -> PhysicalPlanNode {
+        let k = output_col(key_id, "k", DataType::Int64, false);
+        let v = output_col(value_id, "v", DataType::Int64, true);
+        physical_node(
+            Operator::PhysicalScan(PhysicalScanOp {
+                database: "test_db".to_string(),
+                table: metadata_table_def(),
+                alias: Some(alias.to_string()),
+                columns: vec![k.clone(), v.clone()],
+                predicates: vec![],
+                required_columns: Some(vec!["k".to_string(), "v".to_string()]),
+                dict_columns: vec![],
+                variant_columns: vec![],
+                mv_rewritten_from: None,
+            }),
+            vec![],
+            vec![k, v],
+        )
+    }
+
     fn physical_node(
         op: Operator,
         children: Vec<PhysicalPlanNode>,
@@ -606,10 +706,20 @@ mod tests {
     }
 
     fn column_ref_expr(id: u32, column: &str, data_type: DataType, nullable: bool) -> TypedExpr {
+        column_ref_expr_with_qualifier(id, "t", column, data_type, nullable)
+    }
+
+    fn column_ref_expr_with_qualifier(
+        id: u32,
+        qualifier: &str,
+        column: &str,
+        data_type: DataType,
+        nullable: bool,
+    ) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
                 column_id: ColumnId::new_for_test(id),
-                qualifier: Some("t".to_string()),
+                qualifier: Some(qualifier.to_string()),
                 column: column.to_string(),
             },
             data_type,
