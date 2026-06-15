@@ -579,6 +579,7 @@ mod tests {
                 (eq(col_ref(0), col_ref(1)), 0b011),
                 (eq(col_ref(0), col_ref(2)), 0b101),
             ],
+            chain_join_groups: vec![],
         }
     }
 

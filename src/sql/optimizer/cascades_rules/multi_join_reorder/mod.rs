@@ -34,6 +34,11 @@ pub(crate) struct MultiJoinGraph {
     /// `(predicate, bitmask of atom indices it references)`. `u32` supports up
     /// to 32 atoms, matching the chain caps.
     pub(crate) predicates: Vec<(TypedExpr, u32)>,
+    /// The inner/cross join groups this chain is built from (the root plus every
+    /// internal join the flattener descended through). The reorder pass records
+    /// these in `Memo::reorder_owned_groups` so `explore` skips
+    /// `JoinAssociativity` on them (D2).
+    pub(crate) chain_join_groups: Vec<GroupId>,
 }
 
 impl MultiJoinGraph {

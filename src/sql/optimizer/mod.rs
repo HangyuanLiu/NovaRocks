@@ -49,10 +49,6 @@ use rule::Rule;
 /// rule will surface rather than silently spin.
 const OPTIMIZE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Maximum number of memo groups allowed during exploration.
-/// Prevents exponential blowup from join associativity on large join graphs.
-const EXPLORE_MAX_GROUPS: usize = 5000;
-
 /// Main entry point for the Cascades optimizer.
 ///
 /// Takes a logical plan and table statistics, applies query logical rewrites,
@@ -264,10 +260,16 @@ fn explore(
                     if !options.is_enabled(rule.name()) {
                         continue;
                     }
-                    // Skip JoinAssociativity when the memo has grown large
-                    // to prevent combinatorial explosion. The query rewrite
-                    // join reorder stage already handles large join graphs.
-                    if rule.name() == "JoinAssociativity" && memo.groups.len() > 200 {
+                    // D2 (reorder/associativity mutual exclusion): skip
+                    // JoinAssociativity on chains the in-memo reorder pass owns —
+                    // it already injected multi-candidate orders for them, so
+                    // re-associating here is redundant double-enumeration. The
+                    // group-count throttle stays as a backstop for chains the
+                    // pass did not own (bailed, or beyond its size cap).
+                    if rule.name() == "JoinAssociativity"
+                        && (memo.reorder_owned_groups.contains(&group_id)
+                            || memo.groups.len() > 200)
+                    {
                         continue;
                     }
                     if rule.matches(&expr.op) {
@@ -293,8 +295,17 @@ fn explore(
                     }
                 }
             }
-            // Stop if memo grew too large (exponential join enumeration).
-            if memo.groups.len() > EXPLORE_MAX_GROUPS {
+            // Stop if memo grew too large (exponential join enumeration). This
+            // is a hard cap, not an error: explore returns early and the best
+            // plan is extracted from whatever groups exist. Log it so the
+            // truncation is observable instead of silent.
+            if memo.groups.len() > options.cbo_max_groups {
+                tracing::warn!(
+                    groups = memo.groups.len(),
+                    cap = options.cbo_max_groups,
+                    "optimizer exploration truncated at memo group cap; some \
+                     transformation rules may not have fired on this query"
+                );
                 return Ok(());
             }
         }
