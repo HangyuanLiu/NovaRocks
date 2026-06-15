@@ -277,6 +277,7 @@ impl IcebergWriteTransactionExecutor for DistributedInsertWriteExecutor {
             &self.query,
             self.sink_spec.clone(),
             None,
+            None,
         )
     }
 
@@ -359,7 +360,9 @@ pub(crate) fn build_iceberg_write_sink_spec(
         IcebergWriteSinkMode::RowLineageData => {
             row_lineage_iceberg_schema_def_for_codegen(metadata.current_schema())
         }
-        IcebergWriteSinkMode::Data | IcebergWriteSinkMode::PositionDeletes => {
+        IcebergWriteSinkMode::Data
+        | IcebergWriteSinkMode::PositionDeletes
+        | IcebergWriteSinkMode::DeletionVectors => {
             iceberg_schema_def_for_codegen(metadata.current_schema())
         }
     };
@@ -466,7 +469,9 @@ fn write_sink_target_descriptor_columns(
     sink_input_columns: &[ColumnDef],
 ) -> Vec<ColumnDef> {
     match mode {
-        IcebergWriteSinkMode::PositionDeletes => resolved_columns.to_vec(),
+        IcebergWriteSinkMode::PositionDeletes | IcebergWriteSinkMode::DeletionVectors => {
+            resolved_columns.to_vec()
+        }
         IcebergWriteSinkMode::Data | IcebergWriteSinkMode::RowLineageData => {
             sink_input_columns.to_vec()
         }
@@ -1086,6 +1091,9 @@ pub(crate) fn data_file_to_written_file(
         referenced_data_file: df.referenced_data_file().map(|s| s.to_string()),
         equality_ids: df.equality_ids(),
         first_row_id: df.first_row_id(),
+        content_offset: None,
+        content_size_in_bytes: None,
+        cardinality: None,
     })
 }
 

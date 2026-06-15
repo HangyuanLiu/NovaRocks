@@ -29,6 +29,9 @@ pub enum CommitOpKind {
     /// rewrites touched delete manifests instead of producing v2 Parquet
     /// position-delete files.
     RowDeltaDv,
+    /// Iceberg v3 row-lineage DELETE where BE writers already produced merged
+    /// Puffin deletion-vector files; the FE commit registers metadata only.
+    RowDeltaDvFromFiles,
     /// Iceberg OPTIMIZE whole-table rewrite: replaces all current live data
     /// files with compacted data files and drops all current delete files.
     RewriteDataFiles,
@@ -127,6 +130,12 @@ pub struct WrittenFile {
     /// manifest-level first_row_id and `df.first_row_id()` propagates without
     /// triggering fresh row-id allocation. `None` for normal INSERT writes.
     pub first_row_id: Option<i64>,
+    /// Puffin DV blob offset (set only for Puffin DV files).
+    pub content_offset: Option<i64>,
+    /// Puffin DV blob size in bytes (set only for Puffin DV files).
+    pub content_size_in_bytes: Option<i64>,
+    /// Puffin DV cardinality (set only for Puffin DV files).
+    pub cardinality: Option<u64>,
 }
 
 /// Result returned by a successful commit action.
@@ -162,6 +171,9 @@ mod tests {
             referenced_data_file: None,
             equality_ids: None,
             first_row_id: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            cardinality: None,
         };
         assert_eq!(f.record_count, 100);
         assert_eq!(f.content, DataContentType::Data);
@@ -174,6 +186,7 @@ mod tests {
             CommitOpKind::Overwrite,
             CommitOpKind::RowDelta,
             CommitOpKind::RowDeltaDv,
+            CommitOpKind::RowDeltaDvFromFiles,
             CommitOpKind::RewriteDataFiles,
             CommitOpKind::CowUpdate,
             CommitOpKind::Truncate,

@@ -34,7 +34,9 @@ use crate::exec::operators::{
     DataStreamSinkFactory, IcebergTableSinkFactory, MultiCastDataStreamSinkFactory,
     NoopSinkFactory, OlapTableSinkFactory, ResultBufferSinkFactory, SplitDataStreamSinkFactory,
 };
-use crate::exec::pipeline::executor::execute_plan_with_pipeline;
+use crate::exec::pipeline::executor::{
+    execute_plan_with_pipeline, execute_plan_with_pipeline_with_root_sink_dop,
+};
 use crate::lower::layout::{build_tuple_slot_order, infer_tuple_slot_order, reorder_tuple_slots};
 use crate::lower::thrift::{Lowered, lower_plan};
 use crate::runtime::profile::Profiler;
@@ -143,6 +145,26 @@ fn collect_glm_metadata(
         }
     }
     Ok(())
+}
+
+fn iceberg_sink_mode_for_type(
+    t: data_sinks::TDataSinkType,
+) -> crate::connector::iceberg::sink::IcebergSinkMode {
+    use crate::connector::iceberg::sink::IcebergSinkMode;
+
+    match t {
+        data_sinks::TDataSinkType::ICEBERG_DELETE_SINK => IcebergSinkMode::PositionDeletes,
+        data_sinks::TDataSinkType::ICEBERG_DV_SINK => IcebergSinkMode::DeletionVectors,
+        _ => IcebergSinkMode::Data,
+    }
+}
+
+fn iceberg_sink_type_name(t: data_sinks::TDataSinkType) -> &'static str {
+    match t {
+        data_sinks::TDataSinkType::ICEBERG_DELETE_SINK => "ICEBERG_DELETE_SINK",
+        data_sinks::TDataSinkType::ICEBERG_DV_SINK => "ICEBERG_DV_SINK",
+        _ => "ICEBERG_TABLE_SINK",
+    }
 }
 
 pub(crate) fn execute_fragment(
@@ -510,13 +532,9 @@ pub(crate) fn execute_fragment(
                 )?;
             }
             data_sinks::TDataSinkType::ICEBERG_TABLE_SINK
-            | data_sinks::TDataSinkType::ICEBERG_DELETE_SINK => {
-                let sink_type_name = if sink.type_ == data_sinks::TDataSinkType::ICEBERG_DELETE_SINK
-                {
-                    "ICEBERG_DELETE_SINK"
-                } else {
-                    "ICEBERG_TABLE_SINK"
-                };
+            | data_sinks::TDataSinkType::ICEBERG_DELETE_SINK
+            | data_sinks::TDataSinkType::ICEBERG_DV_SINK => {
+                let sink_type_name = iceberg_sink_type_name(sink.type_);
                 let iceberg_sink = sink.iceberg_table_sink.as_ref().ok_or_else(|| {
                     format!("{sink_type_name} missing iceberg_table_sink payload")
                 })?;
@@ -527,15 +545,10 @@ pub(crate) fn execute_fragment(
                 let desc_tbl = desc_tbl
                     .ok_or_else(|| format!("{sink_type_name} requires descriptor table"))?;
 
-                let mode = if sink.type_ == data_sinks::TDataSinkType::ICEBERG_DELETE_SINK {
-                    crate::connector::iceberg::sink::IcebergSinkMode::PositionDeletes
-                } else {
-                    crate::connector::iceberg::sink::IcebergSinkMode::Data
-                };
-
+                let sink_mode = iceberg_sink_mode_for_type(sink.type_);
                 let sink_factory = IcebergTableSinkFactory::try_new(
                     iceberg_sink.clone(),
-                    mode,
+                    sink_mode,
                     output_exprs,
                     &lowered.layout,
                     desc_tbl,
@@ -545,7 +558,10 @@ pub(crate) fn execute_fragment(
                 let _exec_timer = profiler
                     .as_ref()
                     .map(|p| p.scoped_timer("PipelineExecuteTime"));
-                execute_plan_with_pipeline(
+                let root_sink_dop = (sink_mode
+                    == crate::connector::iceberg::sink::IcebergSinkMode::DeletionVectors)
+                    .then_some(1);
+                execute_plan_with_pipeline_with_root_sink_dop(
                     exec_plan,
                     debug_exec_node_output(),
                     Duration::from_millis(50),
@@ -557,6 +573,7 @@ pub(crate) fn execute_fragment(
                     query_id,
                     fe_addr.cloned(),
                     backend_num,
+                    root_sink_dop,
                 )?;
             }
             data_sinks::TDataSinkType::OLAP_TABLE_SINK => {
@@ -592,7 +609,7 @@ pub(crate) fn execute_fragment(
             }
             other => {
                 return Err(format!(
-                    "unsupported sink type: {:?}. Only DATA_STREAM_SINK, MULTI_CAST_DATA_STREAM_SINK, SPLIT_DATA_STREAM_SINK, RESULT_SINK, NOOP_SINK, SCHEMA_TABLE_SINK, ICEBERG_TABLE_SINK, and OLAP_TABLE_SINK are supported",
+                    "unsupported sink type: {:?}. Only DATA_STREAM_SINK, MULTI_CAST_DATA_STREAM_SINK, SPLIT_DATA_STREAM_SINK, RESULT_SINK, NOOP_SINK, SCHEMA_TABLE_SINK, ICEBERG_TABLE_SINK, ICEBERG_DELETE_SINK, ICEBERG_DV_SINK, and OLAP_TABLE_SINK are supported",
                     other
                 ));
             }
@@ -601,4 +618,23 @@ pub(crate) fn execute_fragment(
     }
 
     Err("unsupported fragment: missing plan".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::data_sinks;
+
+    #[test]
+    fn iceberg_dv_sink_lowers_to_deletion_vectors_mode() {
+        let mode = super::iceberg_sink_mode_for_type(data_sinks::TDataSinkType::ICEBERG_DV_SINK);
+
+        assert_eq!(
+            mode,
+            crate::connector::iceberg::sink::IcebergSinkMode::DeletionVectors
+        );
+        assert_eq!(
+            super::iceberg_sink_mode_for_type(data_sinks::TDataSinkType::ICEBERG_DELETE_SINK),
+            crate::connector::iceberg::sink::IcebergSinkMode::PositionDeletes
+        );
+    }
 }

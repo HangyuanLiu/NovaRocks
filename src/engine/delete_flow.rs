@@ -39,8 +39,6 @@ use arrow::array::{
 };
 use arrow::datatypes::DataType;
 use chrono::NaiveDateTime;
-use futures::StreamExt;
-use iceberg::arrow::ArrowReaderBuilder;
 use iceberg::expr::{Predicate, Reference};
 use iceberg::spec::{Datum, PrimitiveType, Type};
 use sqlparser::ast as sqlast;
@@ -48,24 +46,22 @@ use sqlparser::ast as sqlast;
 use crate::connector::iceberg::catalog::registry::{self, block_on_iceberg, build_iceberg_catalog};
 use crate::connector::iceberg::commit::{
     CommitOpKind, CommitOutcome, CommitServiceError, IcebergCommitCollector,
-    IcebergSqlDeleteStrategy, PositionDeleteGroup, classify_sql_delete_strategy,
+    IcebergSqlDeleteStrategy, classify_sql_delete_strategy,
     ensure_no_variant_columns_for_row_level_mutation,
 };
 use crate::engine::backend_resolver::{TargetBackend, resolve_existing_table_target};
 use crate::engine::write_transaction::{
     IcebergWriteCommitExecutor, IcebergWriteCommitPolicy, IcebergWriteSource,
     IcebergWriteTransactionExecutor, IcebergWriteTransactionRunner, IcebergWriteTransactionSpec,
-    IcebergWriteValidationPolicy, local_writer_commit_input, new_local_writer_write_id,
-    write_commit_has_files,
+    IcebergWriteValidationPolicy, write_commit_has_files,
 };
 use crate::engine::{StandaloneState, StatementResult};
 use crate::meta::repository::iceberg_operation::{IcebergOperationKind, IcebergOperationTarget};
 use crate::runtime::coordinator::CoordinatedQueryResult;
-use crate::runtime::query_result::QueryResult;
 use crate::runtime::write_coordinator::WriteCommitInput;
 use crate::sql::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
 use crate::sql::catalog::ColumnDef;
-use crate::sql::codegen::iceberg_write_sink::IcebergWriteSinkSpec;
+use crate::sql::codegen::iceberg_write_sink::{IcebergWriteSinkMode, IcebergWriteSinkSpec};
 use crate::sql::parser::ast::{DeleteStmt, ObjectName};
 
 pub(crate) fn execute_delete_statement(
@@ -143,7 +139,7 @@ pub(crate) fn execute_delete_statement(
     //    early. The distributed SELECT planner owns scan pruning and existing
     //    delete visibility from this point onward.
     let schema = table.metadata().current_schema();
-    let predicate = translate_where(&stmt.where_clause, schema.as_ref())?;
+    let _predicate = translate_where(&stmt.where_clause, schema.as_ref())?;
 
     let metadata = table.metadata();
     let base_snapshot_id = if target_ref != "main" {
@@ -153,55 +149,15 @@ pub(crate) fn execute_delete_statement(
     };
 
     if matches!(delete_strategy, IcebergSqlDeleteStrategy::DeletionVectors) {
-        let existing_deletes_by_file = load_existing_delete_visibility_by_data_file_at(
-            &table,
-            base_snapshot_id,
-            entry.object_store_config(),
-        )?;
-        let referenced_data_file_partitions =
-            load_referenced_data_file_partitions_at(&table, base_snapshot_id)?;
-        let groups = block_on_iceberg(async {
-            scan_for_position_deletes_at(
-                &table,
-                base_snapshot_id,
-                predicate,
-                &stmt.where_clause,
-                &existing_deletes_by_file,
-                &referenced_data_file_partitions,
-            )
-            .await
-        })??;
-        if groups.is_empty() {
-            return Ok(StatementResult::Ok);
-        }
-        let staging_dir = format!(
-            "{}/data/_staging/{}",
-            metadata.location(),
-            uuid::Uuid::new_v4()
-        );
-        let collector = Arc::new(
-            IcebergCommitCollector::new(
-                CommitOpKind::RowDeltaDv,
-                table_ident,
-                base_snapshot_id,
-                metadata.last_sequence_number(),
-                metadata.current_schema().clone(),
-                metadata.default_partition_spec().clone(),
-                staging_dir,
-                crate::common::types::UniqueId { hi: 0, lo: 0 },
-            )
-            .with_table_metadata(metadata.clone()),
-        );
         run_delete_dv_write_transaction(
             state,
             &target,
             catalog,
             table,
-            collector,
             entry,
             base_snapshot_id,
             &target_ref,
-            groups,
+            &stmt.where_clause,
         )?;
         return Ok(StatementResult::Ok);
     }
@@ -275,6 +231,7 @@ impl IcebergWriteTransactionExecutor for DistributedDeleteWriteExecutor {
             &self.delete_query,
             self.sink_spec.clone(),
             None,
+            None,
         )?;
         if result
             .write_commit
@@ -299,23 +256,36 @@ impl IcebergWriteTransactionExecutor for DistributedDeleteWriteExecutor {
     }
 }
 
-struct InjectedDeleteGroupExecutor {
+struct DistributedDvDeleteWriteExecutor {
+    state: Arc<StandaloneState>,
+    target: TargetBackend,
+    delete_query: sqlparser::ast::Query,
+    sink_spec: IcebergWriteSinkSpec,
     commit_executor: IcebergWriteCommitExecutor,
 }
 
-impl IcebergWriteTransactionExecutor for InjectedDeleteGroupExecutor {
+impl IcebergWriteTransactionExecutor for DistributedDvDeleteWriteExecutor {
     fn run_coordinated_write(
         &self,
         _spec: &IcebergWriteTransactionSpec,
     ) -> Result<CoordinatedQueryResult, String> {
-        Ok(CoordinatedQueryResult {
-            query_result: QueryResult::empty(),
-            write_commit: Some(local_writer_commit_input(
-                new_local_writer_write_id(),
-                Vec::new(),
-            )),
-            write_abort: None,
-        })
+        let mut result = crate::engine::execute_query_as_iceberg_write(
+            &self.state,
+            Some(&self.target.catalog),
+            &self.target.namespace,
+            &self.delete_query,
+            self.sink_spec.clone(),
+            None,
+            Some(crate::engine::iceberg_write_shuffle_by_output_index(0)),
+        )?;
+        if result
+            .write_commit
+            .as_ref()
+            .is_some_and(|commit| !write_commit_has_files(commit))
+        {
+            result.write_commit = None;
+        }
+        Ok(result)
     }
 
     fn commit(
@@ -329,10 +299,6 @@ impl IcebergWriteTransactionExecutor for InjectedDeleteGroupExecutor {
     fn finalize(&self, _spec: &IcebergWriteTransactionSpec) -> Result<(), String> {
         self.commit_executor.finalize()
     }
-
-    fn has_preloaded_commit_output(&self) -> bool {
-        true
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -341,17 +307,53 @@ fn run_delete_dv_write_transaction(
     target: &crate::engine::backend_resolver::TargetBackend,
     catalog: Arc<dyn iceberg::Catalog>,
     table: iceberg::table::Table,
-    collector: Arc<IcebergCommitCollector>,
     entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
     base_snapshot_id: Option<i64>,
     target_ref: &str,
-    groups: Vec<PositionDeleteGroup>,
+    where_clause: &sqlast::Expr,
 ) -> Result<(), String> {
+    let resolved = {
+        let registry = state.connectors.read().expect("connector registry read");
+        let backend = registry.catalog_backend("iceberg")?;
+        backend.load_table(&target.catalog, &target.namespace, &target.table)?
+    };
+    let mut sink_spec = crate::engine::iceberg_writer::build_position_delete_sink_spec(
+        target, &resolved, &table, &entry,
+    )?;
+    sink_spec.mode = IcebergWriteSinkMode::DeletionVectors;
+    sink_spec.set_planned_snapshot_id(base_snapshot_id)?;
+    let delete_query = build_delete_position_sink_query(
+        target,
+        where_clause,
+        &sink_spec.target_columns,
+        target_ref,
+    )?;
+
+    let metadata = table.metadata();
+    let table_ident = iceberg::TableIdent::new(
+        iceberg::NamespaceIdent::new(target.namespace.clone()),
+        target.table.clone(),
+    );
+    let staging_dir = format!(
+        "{}/data/_staging/{}",
+        metadata.location(),
+        uuid::Uuid::new_v4()
+    );
+    let collector = Arc::new(
+        IcebergCommitCollector::new(
+            CommitOpKind::RowDeltaDvFromFiles,
+            table_ident,
+            base_snapshot_id,
+            metadata.last_sequence_number(),
+            metadata.current_schema().clone(),
+            metadata.default_partition_spec().clone(),
+            staging_dir,
+            crate::common::types::UniqueId { hi: 0, lo: 0 },
+        )
+        .with_table_metadata(metadata.clone()),
+    );
     let abort_cleanup =
         crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(&entry)?;
-    for group in groups {
-        collector.inject_delete_group(group);
-    }
     let commit_executor = IcebergWriteCommitExecutor {
         state: Arc::clone(state),
         target: target.clone(),
@@ -380,7 +382,7 @@ fn run_delete_dv_write_transaction(
             uuid::Uuid::new_v4()
         ),
         commit: IcebergWriteCommitPolicy {
-            commit_op_kind: CommitOpKind::RowDeltaDv,
+            commit_op_kind: CommitOpKind::RowDeltaDvFromFiles,
             base_snapshot_id,
             base_snapshot_map: BTreeMap::new(),
             target_ref: target_ref.to_string(),
@@ -391,7 +393,13 @@ fn run_delete_dv_write_transaction(
         },
         source: IcebergWriteSource::CoordinatedPlan,
     };
-    let executor = InjectedDeleteGroupExecutor { commit_executor };
+    let executor = DistributedDvDeleteWriteExecutor {
+        state: Arc::clone(state),
+        target: target.clone(),
+        delete_query,
+        sink_spec,
+        commit_executor,
+    };
     let runner = IcebergWriteTransactionRunner::new(Arc::clone(state), &executor);
     let _outcome = runner.run(spec)?;
     Ok(())
@@ -1071,98 +1079,6 @@ fn literal_to_datum(
             "phase 1 DELETE WHERE primitive type {other:?} not yet supported (column `{column_name}`)"
         )),
     }
-}
-
-async fn scan_for_position_deletes_at(
-    table: &iceberg::table::Table,
-    snapshot_id: Option<i64>,
-    predicate: Predicate,
-    where_expr: &sqlast::Expr,
-    existing_deletes_by_file: &ExistingDeleteVisibilityByDataFile,
-    referenced_data_file_partitions: &ReferencedDataFilePartitions,
-) -> Result<Vec<PositionDeleteGroup>, String> {
-    let schema = table.metadata().current_schema();
-
-    let mut select_cols: Vec<String> = vec!["_file".to_string(), "_pos".to_string()];
-    for f in schema.as_struct().fields() {
-        select_cols.push(f.name.clone());
-    }
-
-    let _ = predicate;
-    let mut scan_builder = table.scan().select(select_cols);
-    if let Some(snap_id) = snapshot_id {
-        scan_builder = scan_builder.snapshot_id(snap_id);
-    }
-    let scan = scan_builder
-        .build()
-        .map_err(|e| format!("build TableScan failed: {e}"))?;
-    let task_stream = scan
-        .plan_files()
-        .await
-        .map_err(|e| format!("TableScan::plan_files failed: {e}"))?;
-    let cleaned_tasks = task_stream.map(|task_result| {
-        task_result.map(|mut task| {
-            task.deletes.clear();
-            task.predicate = None;
-            task
-        })
-    });
-    let arrow_reader = ArrowReaderBuilder::new(table.file_io().clone())
-        .with_row_group_filtering_enabled(false)
-        .with_row_selection_enabled(false)
-        .build();
-    let mut stream = arrow_reader
-        .read(Box::pin(cleaned_tasks))
-        .map_err(|e| format!("ArrowReader::read failed: {e}"))?;
-
-    let mut by_file: BTreeMap<String, Vec<i64>> = BTreeMap::new();
-    while let Some(batch_result) = stream.next().await {
-        let batch = batch_result.map_err(|e| format!("scan stream error: {e}"))?;
-        collect_position_deletes_from_batch(
-            &batch,
-            where_expr,
-            schema.as_ref(),
-            existing_deletes_by_file,
-            &mut by_file,
-        )?;
-    }
-
-    by_file
-        .into_iter()
-        .map(|(referenced_data_file, positions)| {
-            let partition = referenced_data_file_partitions
-                .get(&referenced_data_file)
-                .ok_or_else(|| {
-                    format!(
-                        "matched iceberg data file `{referenced_data_file}` is missing partition metadata"
-                    )
-                })?;
-            Ok(PositionDeleteGroup {
-                referenced_data_file,
-                partition_spec_id: partition.partition_spec_id,
-                partition_values: partition.partition_values.clone(),
-                positions,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()
-}
-
-async fn scan_for_position_deletes(
-    table: &iceberg::table::Table,
-    predicate: Predicate,
-    where_expr: &sqlast::Expr,
-    existing_deletes_by_file: &ExistingDeleteVisibilityByDataFile,
-    referenced_data_file_partitions: &ReferencedDataFilePartitions,
-) -> Result<Vec<PositionDeleteGroup>, String> {
-    scan_for_position_deletes_at(
-        table,
-        None,
-        predicate,
-        where_expr,
-        existing_deletes_by_file,
-        referenced_data_file_partitions,
-    )
-    .await
 }
 
 pub(crate) struct ReferencedDataFilePartition {
@@ -1949,6 +1865,102 @@ mod tests {
         let rendered = query.to_string();
         assert!(rendered.contains("FROM `ice`.`db`.`orders`"));
         assert!(rendered.contains("FOR SYSTEM_TIME AS OF '__nr_ref:dev'"));
+    }
+
+    #[test]
+    fn dv_delete_uses_distributed_dv_sink_not_local_collect() {
+        let source = include_str!("delete_flow.rs");
+        let branch = source
+            .split("IcebergSqlDeleteStrategy::DeletionVectors")
+            .nth(1)
+            .expect("DV branch")
+            .split("let resolved = {")
+            .next()
+            .expect("DV branch body");
+        assert!(
+            branch.contains("run_delete_dv_write_transaction"),
+            "v3 DV-delete branch must route through the DV write transaction"
+        );
+        assert!(
+            !branch.contains("scan_for_position_deletes_at"),
+            "v3 DV-delete must not collect position deletes in the coordinator"
+        );
+        assert!(
+            !branch.contains("load_existing_delete_visibility_by_data_file_at"),
+            "v3 DV-delete must not preload existing delete visibility in the coordinator"
+        );
+        assert!(
+            !branch.contains("load_referenced_data_file_partitions_at"),
+            "v3 DV-delete must not preload referenced data-file partitions in the coordinator"
+        );
+
+        let transaction = source
+            .split("fn run_delete_dv_write_transaction")
+            .nth(1)
+            .expect("DV transaction helper")
+            .split("fn run_delete_write_transaction")
+            .next()
+            .expect("DV transaction helper body");
+        assert!(
+            transaction.contains("IcebergWriteSinkMode::DeletionVectors"),
+            "v3 DV-delete transaction must use the DeletionVectors sink mode"
+        );
+        assert!(
+            transaction.contains("set_planned_snapshot_id(base_snapshot_id)"),
+            "v3 DV-delete transaction must pass the planned target snapshot to the sink"
+        );
+        assert!(
+            transaction.contains("CommitOpKind::RowDeltaDvFromFiles"),
+            "v3 DV-delete transaction must commit BE-written Puffin DV files"
+        );
+        assert!(
+            transaction.contains("DistributedDvDeleteWriteExecutor"),
+            "v3 DV-delete transaction must use the distributed executor"
+        );
+        assert!(
+            !transaction.contains("inject_delete_group"),
+            "v3 DV-delete transaction must not inject coordinator-local delete groups"
+        );
+        assert!(
+            !branch.contains("InjectedDeleteGroupExecutor"),
+            "v3 DV-delete must not use the local injected-delete-group executor"
+        );
+
+        let executor = source
+            .split("struct DistributedDvDeleteWriteExecutor")
+            .nth(1)
+            .expect("DV distributed executor")
+            .split("#[allow(clippy::too_many_arguments)]")
+            .next()
+            .expect("DV distributed executor body");
+        assert!(
+            executor.contains("execute_query_as_iceberg_write"),
+            "v3 DV-delete executor must use the distributed iceberg write path"
+        );
+        assert!(
+            executor.contains("iceberg_write_shuffle_by_output_index(0)"),
+            "v3 DV-delete executor must shuffle by the first sink output column (_file)"
+        );
+    }
+
+    #[test]
+    fn dv_delete_local_scan_and_injected_executor_are_removed() {
+        let source = include_str!("delete_flow.rs");
+        let injected_executor = concat!("struct ", "InjectedDeleteGroupExecutor");
+        let scan_at_helper = concat!("fn ", "scan_for_position_deletes_at");
+        let scan_helper = concat!("fn ", "scan_for_position_deletes(");
+        assert!(
+            !source.contains(injected_executor),
+            "v3 DV-delete must not keep the coordinator-local injected executor"
+        );
+        assert!(
+            !source.contains(scan_at_helper),
+            "v3 DV-delete must not keep the coordinator-local snapshot scan helper"
+        );
+        assert!(
+            !source.contains(scan_helper),
+            "v3 DV-delete must not keep the coordinator-local current-snapshot scan helper"
+        );
     }
 
     #[test]
