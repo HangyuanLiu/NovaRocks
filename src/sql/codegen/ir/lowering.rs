@@ -8,7 +8,7 @@ use crate::exprs;
 use crate::lower::type_lowering::arrow_type_from_desc;
 use crate::plan_nodes;
 use crate::sql::analysis::{
-    BinOp, ExprKind, JoinKind, OutputColumn as AnalysisOutputColumn, TypedExpr,
+    BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn as AnalysisOutputColumn, TypedExpr,
 };
 use crate::sql::catalog::{CatalogProvider, ScanSource, TableDef};
 use crate::sql::codegen::descriptors::DescriptorTableBuilder;
@@ -19,8 +19,9 @@ use crate::sql::codegen::fragment_builder::{
     output_columns_for_boundary, result_root_boundary_schema_report, synthetic_iceberg_table_id,
 };
 use crate::sql::codegen::helpers::{
-    agg_call_display_name, agg_call_display_name_without_qualifiers, join_kind_to_op,
-    split_and_conjuncts_typed, typed_expr_display_name, typed_expr_display_name_without_qualifiers,
+    agg_call_display_name, agg_call_display_name_without_qualifiers, group_win_exprs_by_sig,
+    join_kind_to_op, split_and_conjuncts_typed, typed_expr_display_name,
+    typed_expr_display_name_without_qualifiers,
 };
 use crate::sql::codegen::nodes;
 use crate::sql::codegen::resolve::{ColumnBinding, ExprScope, ResolvedTable};
@@ -34,11 +35,14 @@ use crate::sql::codegen::{
     FragmentBuildResult, FragmentId, MultiFragmentBuildResult, OutputColumn,
 };
 use crate::sql::optimizer::operator::{
-    AggMode, PhysicalAssertOneRowOp, PhysicalDecodeOp, PhysicalHashAggregateOp, PhysicalHashJoinOp,
-    PhysicalNestLoopJoinOp, PhysicalProjectOp, PhysicalRepeatOp, PhysicalScanOp, PhysicalSortOp,
-    PhysicalTopNOp, PhysicalValuesOp, ScanDictionaryColumn, TopNPhase,
+    AggMode, PhysicalAssertOneRowOp, PhysicalDecodeOp, PhysicalGenerateSeriesOp,
+    PhysicalHashAggregateOp, PhysicalHashJoinOp, PhysicalNestLoopJoinOp, PhysicalProjectOp,
+    PhysicalRepeatOp, PhysicalScanOp, PhysicalSortOp, PhysicalTableFunctionOp, PhysicalTopNOp,
+    PhysicalValuesOp, ScanDictionaryColumn, TopNPhase,
 };
 use crate::sql::optimizer::physical_plan::JoinExecutionDistribution;
+use crate::sql::optimizer::property::{OrderingSpec, window_ordering_spec};
+use crate::sql::planner::plan::{AggregateCall, WindowExpr};
 use crate::types;
 
 pub(crate) fn lower_distributed_plan(
@@ -438,6 +442,7 @@ struct LoweredDistributedNode {
     tuple_ids: Vec<i32>,
     #[allow(dead_code)]
     output_columns: Vec<AnalysisOutputColumn>,
+    ordering: OrderingSpec,
 }
 
 impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
@@ -469,6 +474,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     scope,
                     tuple_ids: vec![scan_tuple_id],
                     output_columns: op.columns.clone(),
+                    ordering: OrderingSpec::Any,
                 }
             }
             super::node::DistributedPlanNodeBody::Project(project) => {
@@ -491,6 +497,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     scope,
                     tuple_ids: vec![project_tuple_id],
                     output_columns: project_body_output_columns(project),
+                    ordering: OrderingSpec::Any,
                 }
             }
             super::node::DistributedPlanNodeBody::Sort(sort) => {
@@ -518,6 +525,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     scope: child.scope,
                     tuple_ids: child.tuple_ids,
                     output_columns: sort.output_columns.clone(),
+                    ordering: OrderingSpec::from_sort_items(&sort.items),
                 }
             }
             super::node::DistributedPlanNodeBody::TopN(topn) => {
@@ -543,6 +551,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     scope: child.scope,
                     tuple_ids: child.tuple_ids,
                     output_columns: child.output_columns,
+                    ordering: OrderingSpec::from_sort_items(&topn.items),
                 }
             }
             super::node::DistributedPlanNodeBody::HashAggregate(agg) => {
@@ -565,6 +574,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     scope,
                     tuple_ids: vec![agg_tuple_id],
                     output_columns: agg.output_columns.clone(),
+                    ordering: OrderingSpec::Any,
                 }
             }
             super::node::DistributedPlanNodeBody::HashJoin(hash_join) => {
@@ -602,6 +612,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     scope,
                     tuple_ids,
                     output_columns: Vec::new(),
+                    ordering: OrderingSpec::Any,
                 }
             }
             super::node::DistributedPlanNodeBody::NestLoopJoin(nest_loop) => {
@@ -637,6 +648,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     scope,
                     tuple_ids,
                     output_columns: Vec::new(),
+                    ordering: OrderingSpec::Any,
                 }
             }
             super::node::DistributedPlanNodeBody::Values(values) => {
@@ -655,6 +667,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     scope,
                     tuple_ids: vec![tuple_id],
                     output_columns: values.columns.clone(),
+                    ordering: OrderingSpec::Any,
                 }
             }
             super::node::DistributedPlanNodeBody::AssertOneRow(assert_one_row) => {
@@ -675,6 +688,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     scope: child.scope,
                     tuple_ids: child.tuple_ids,
                     output_columns: child.output_columns,
+                    ordering: child.ordering,
                 }
             }
             super::node::DistributedPlanNodeBody::Decode(decode) => {
@@ -697,6 +711,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     scope,
                     tuple_ids: vec![tuple_id],
                     output_columns: decode.output_columns.clone(),
+                    ordering: OrderingSpec::Any,
                 }
             }
             super::node::DistributedPlanNodeBody::Repeat(repeat) => {
@@ -724,6 +739,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     scope,
                     tuple_ids,
                     output_columns,
+                    ordering: OrderingSpec::Any,
                 }
             }
             super::node::DistributedPlanNodeBody::SetOp(set_op) => {
@@ -762,6 +778,85 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     scope,
                     tuple_ids: vec![tuple_id],
                     output_columns: set_op.output_columns.clone(),
+                    ordering: OrderingSpec::Any,
+                }
+            }
+            super::node::DistributedPlanNodeBody::Window(window) => {
+                if node.children.len() != 1 {
+                    return Err(format!(
+                        "DistributedPlan Window node_id={} expected 1 child, got {}",
+                        node.node_id,
+                        node.children.len()
+                    ));
+                }
+                let child = self.lower_node(&node.children[0])?;
+                let lowered_window = self.lower_window(window, child)?;
+                LoweredDistributedNode {
+                    plan_nodes: lowered_window.plan_nodes,
+                    scope: lowered_window.scope,
+                    tuple_ids: lowered_window.tuple_ids,
+                    output_columns: window.output_columns.clone(),
+                    ordering: lowered_window.ordering,
+                }
+            }
+            super::node::DistributedPlanNodeBody::GenerateSeries(generate_series) => {
+                if !node.children.is_empty() {
+                    return Err(format!(
+                        "DistributedPlan GenerateSeries node_id={} expected 0 children, got {}",
+                        node.node_id,
+                        node.children.len()
+                    ));
+                }
+                let output_tuple_id = first_tuple_id(node, "GenerateSeries")?;
+                let op = generate_series_body_to_physical_op(generate_series);
+                let (plan_nodes, scope) = self.lower_generate_series(
+                    node.node_id,
+                    output_tuple_id,
+                    generate_series.param_values_node_id,
+                    generate_series.param_tuple_id,
+                    &op,
+                )?;
+                LoweredDistributedNode {
+                    plan_nodes,
+                    scope,
+                    tuple_ids: vec![output_tuple_id],
+                    output_columns: vec![AnalysisOutputColumn {
+                        column_id: generate_series.output_column_id,
+                        name: generate_series.column_name.clone(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        is_internal: false,
+                    }],
+                    ordering: OrderingSpec::Any,
+                }
+            }
+            super::node::DistributedPlanNodeBody::TableFunction(table_function) => {
+                if node.children.len() != 1 {
+                    return Err(format!(
+                        "DistributedPlan TableFunction node_id={} expected 1 child, got {}",
+                        node.node_id,
+                        node.children.len()
+                    ));
+                }
+                let child = self.lower_node(&node.children[0])?;
+                let output_tuple_id = first_tuple_id(node, "TableFunction")?;
+                let op = table_function_body_to_physical_op(table_function);
+                let (table_fn_nodes, scope) = self.lower_table_function(
+                    node.node_id,
+                    output_tuple_id,
+                    table_function.project_node_id,
+                    table_function.project_tuple_id,
+                    &op,
+                    &child,
+                )?;
+                let mut plan_nodes = table_fn_nodes;
+                plan_nodes.extend(child.plan_nodes);
+                LoweredDistributedNode {
+                    plan_nodes,
+                    scope,
+                    tuple_ids: vec![output_tuple_id],
+                    output_columns: table_function.output_columns.clone(),
+                    ordering: OrderingSpec::Any,
                 }
             }
         };
@@ -2124,6 +2219,577 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         Ok((plan_node, scope))
     }
 
+    fn lower_window(
+        &mut self,
+        body: &super::body::WindowBody,
+        child: LoweredDistributedNode,
+    ) -> Result<LoweredDistributedNode, String> {
+        let groups = group_win_exprs_by_sig(&body.window_exprs);
+        if groups.is_empty() {
+            return Err("DistributedPlan Window has no window expressions".to_string());
+        }
+        if groups.len() != body.groups.len() {
+            return Err(format!(
+                "DistributedPlan Window group count mismatch: expressions grouped to {}, body has {}",
+                groups.len(),
+                body.groups.len()
+            ));
+        }
+
+        let mut current = child;
+        for (group_indices, group_plan) in groups.iter().zip(&body.groups) {
+            let group_exprs: Vec<_> = group_indices
+                .iter()
+                .map(|&i| body.window_exprs[i].clone())
+                .collect();
+            let first_win = group_exprs
+                .first()
+                .ok_or_else(|| "DistributedPlan Window group is empty".to_string())?;
+
+            if let Some(sort_node_id) = group_plan.sort_node_id {
+                let mut sort_ordering = Vec::new();
+                let mut sort_is_asc = Vec::new();
+                let mut sort_nulls_first_list = Vec::new();
+                for expr in &first_win.partition_by {
+                    let mut compiler =
+                        ExprCompiler::new(self.state.slot_allocator(), &current.scope);
+                    sort_ordering.push(compiler.compile_typed(expr)?);
+                    sort_is_asc.push(true);
+                    sort_nulls_first_list.push(true);
+                }
+                for item in &first_win.order_by {
+                    let mut compiler =
+                        ExprCompiler::new(self.state.slot_allocator(), &current.scope);
+                    sort_ordering.push(compiler.compile_typed(&item.expr)?);
+                    sort_is_asc.push(item.asc);
+                    sort_nulls_first_list.push(item.nulls_first);
+                }
+                let sort_plan = nodes::build_sort_node_raw(
+                    sort_node_id,
+                    current.tuple_ids.clone(),
+                    sort_ordering,
+                    sort_is_asc,
+                    sort_nulls_first_list,
+                    -1,
+                    None,
+                );
+                let mut pnodes = vec![sort_plan];
+                pnodes.extend(current.plan_nodes);
+                current.plan_nodes = pnodes;
+                current.ordering =
+                    window_ordering_spec(&first_win.partition_by, &first_win.order_by);
+            }
+
+            let mut partition_exprs = Vec::new();
+            for expr in &first_win.partition_by {
+                let mut compiler = ExprCompiler::new(self.state.slot_allocator(), &current.scope);
+                partition_exprs.push(compiler.compile_typed(expr)?);
+            }
+            let mut order_by_exprs = Vec::new();
+            for item in &first_win.order_by {
+                let mut compiler = ExprCompiler::new(self.state.slot_allocator(), &current.scope);
+                order_by_exprs.push(compiler.compile_typed(&item.expr)?);
+            }
+
+            let mut analytic_functions = Vec::new();
+            for win_expr in &group_exprs {
+                let mut compiler = ExprCompiler::new(self.state.slot_allocator(), &current.scope);
+                let agg_call = AggregateCall {
+                    name: win_expr.name.clone(),
+                    args: win_expr.args.clone(),
+                    distinct: win_expr.distinct,
+                    result_type: win_expr.result_type.clone(),
+                    order_by: vec![],
+                    output_column_id: crate::sql::column_id::ColumnId::UNSET,
+                };
+                let mut texpr = compiler.compile_aggregate_call_typed(&agg_call)?;
+                apply_ignore_nulls_to_root_fn(&mut texpr, win_expr.ignore_nulls);
+                analytic_functions.push(texpr);
+            }
+
+            for (idx, win_expr) in group_exprs.iter().enumerate() {
+                let slot_id = self.state.alloc_slot();
+                self.state.desc_builder().add_slot(
+                    slot_id,
+                    group_plan.intermediate_tuple_id,
+                    &format!("__win_intermediate_{idx}"),
+                    &win_expr.result_type,
+                    true,
+                    idx as i32,
+                );
+            }
+            self.state
+                .desc_builder()
+                .add_tuple(group_plan.intermediate_tuple_id, None);
+
+            let mut output_scope = ExprScope::new();
+            output_scope.merge(&current.scope);
+            for (idx, win_expr) in group_exprs.iter().enumerate() {
+                let slot_id = self.state.alloc_slot();
+                self.state.desc_builder().add_slot(
+                    slot_id,
+                    group_plan.output_tuple_id,
+                    &win_expr.output_name,
+                    &win_expr.result_type,
+                    true,
+                    idx as i32,
+                );
+                output_scope.add_column_with_id(
+                    win_expr.output_column_id,
+                    None,
+                    win_expr.output_name.clone(),
+                    ColumnBinding {
+                        tuple_id: group_plan.output_tuple_id,
+                        slot_id,
+                        data_type: win_expr.result_type.clone(),
+                        type_desc: None,
+                        nullable: true,
+                    },
+                );
+            }
+            self.state
+                .desc_builder()
+                .add_tuple(group_plan.output_tuple_id, None);
+
+            let analytic_tnode = plan_nodes::TAnalyticNode {
+                partition_exprs,
+                order_by_exprs,
+                analytic_functions,
+                window: analytic_window_from_expr(first_win),
+                intermediate_tuple_id: group_plan.intermediate_tuple_id,
+                output_tuple_id: group_plan.output_tuple_id,
+                buffered_tuple_id: None,
+                partition_by_eq: None,
+                order_by_eq: None,
+                sql_partition_keys: None,
+                sql_aggregate_functions: None,
+                has_outer_join_child: None,
+                use_hash_based_partition: None,
+                is_skewed: None,
+            };
+
+            let mut plan_node = nodes::default_plan_node();
+            plan_node.node_id = group_plan.analytic_node_id;
+            plan_node.node_type = plan_nodes::TPlanNodeType::ANALYTIC_EVAL_NODE;
+            plan_node.num_children = 1;
+            plan_node.limit = -1;
+            let mut new_tuple_ids = current.tuple_ids.clone();
+            new_tuple_ids.push(group_plan.output_tuple_id);
+            plan_node.row_tuples = new_tuple_ids.clone();
+            plan_node.nullable_tuples = vec![];
+            plan_node.analytic_node = Some(analytic_tnode);
+
+            let mut pnodes = vec![plan_node];
+            pnodes.extend(current.plan_nodes);
+            current = LoweredDistributedNode {
+                plan_nodes: pnodes,
+                scope: output_scope,
+                tuple_ids: new_tuple_ids,
+                output_columns: body.output_columns.clone(),
+                ordering: current.ordering,
+            };
+        }
+
+        Ok(current)
+    }
+
+    fn lower_generate_series(
+        &mut self,
+        table_fn_node_id: i32,
+        output_tuple_id: i32,
+        param_values_node_id: i32,
+        param_tuple_id: i32,
+        op: &PhysicalGenerateSeriesOp,
+    ) -> Result<(Vec<plan_nodes::TPlanNode>, ExprScope), String> {
+        if op.step == 0 {
+            return Err("generate_series step size cannot equal zero".to_string());
+        }
+
+        let int64_type_desc = type_infer::arrow_type_to_type_desc(&DataType::Int64)?;
+        let empty_scope = ExprScope::new();
+        let mut param_slots = Vec::with_capacity(3);
+        let mut param_exprs = Vec::with_capacity(3);
+        for (idx, (name, value)) in [
+            ("__gs_start", op.start),
+            ("__gs_end", op.end),
+            ("__gs_step", op.step),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let slot_id = self.state.alloc_slot();
+            self.state.desc_builder().add_slot_with_type_desc(
+                slot_id,
+                param_tuple_id,
+                name,
+                int64_type_desc.clone(),
+                false,
+                idx as i32,
+            );
+            param_slots.push(slot_id);
+            param_exprs.push(self.compile_int64_literal(value, &empty_scope)?);
+        }
+        self.state.desc_builder().add_tuple(param_tuple_id, None);
+
+        let mut param_values_node = nodes::default_plan_node();
+        param_values_node.node_id = param_values_node_id;
+        param_values_node.node_type = plan_nodes::TPlanNodeType::UNION_NODE;
+        param_values_node.num_children = 0;
+        param_values_node.row_tuples = vec![param_tuple_id];
+        param_values_node.nullable_tuples = vec![];
+        param_values_node.union_node = Some(plan_nodes::TUnionNode {
+            tuple_id: param_tuple_id,
+            result_expr_lists: vec![],
+            const_expr_lists: vec![param_exprs],
+            first_materialized_child_idx: 0,
+            pass_through_slot_maps: None,
+            local_exchanger_type: None,
+            local_partition_by_exprs: None,
+        });
+
+        let slot_id = self.state.alloc_slot();
+        self.state.desc_builder().add_slot_with_type_desc(
+            slot_id,
+            output_tuple_id,
+            &op.column_name,
+            int64_type_desc.clone(),
+            false,
+            0,
+        );
+        self.state.desc_builder().add_tuple(output_tuple_id, None);
+
+        let mut scope = ExprScope::new();
+        let qualifier = op
+            .alias
+            .clone()
+            .unwrap_or_else(|| "generate_series".to_string());
+        scope.add_column_with_id(
+            op.output_column_id,
+            Some(qualifier),
+            op.column_name.clone(),
+            ColumnBinding {
+                tuple_id: output_tuple_id,
+                slot_id,
+                data_type: DataType::Int64,
+                type_desc: Some(int64_type_desc.clone()),
+                nullable: false,
+            },
+        );
+
+        let table_function_expr = exprs::TExpr::new(vec![exprs::TExprNode {
+            node_type: exprs::TExprNodeType::FUNCTION_CALL,
+            type_: int64_type_desc.clone(),
+            num_children: 0,
+            fn_: Some(types::TFunction {
+                name: types::TFunctionName {
+                    db_name: None,
+                    function_name: "generate_series".to_string(),
+                },
+                binary_type: types::TFunctionBinaryType::BUILTIN,
+                arg_types: vec![
+                    int64_type_desc.clone(),
+                    int64_type_desc.clone(),
+                    int64_type_desc.clone(),
+                ],
+                ret_type: int64_type_desc.clone(),
+                has_var_args: false,
+                comment: None,
+                signature: None,
+                hdfs_location: None,
+                scalar_fn: None,
+                aggregate_fn: None,
+                id: None,
+                checksum: None,
+                agg_state_desc: None,
+                fid: None,
+                table_fn: Some(types::TTableFunction::new(
+                    vec![int64_type_desc.clone()],
+                    None::<String>,
+                    Some(false),
+                )),
+                could_apply_dict_optimize: None,
+                ignore_nulls: None,
+                isolated: None,
+                input_type: None,
+                content: None,
+            }),
+            ..expr_compiler::default_expr_node()
+        }]);
+
+        let mut table_fn_plan_node = nodes::default_plan_node();
+        table_fn_plan_node.node_id = table_fn_node_id;
+        table_fn_plan_node.node_type = plan_nodes::TPlanNodeType::TABLE_FUNCTION_NODE;
+        table_fn_plan_node.num_children = 1;
+        table_fn_plan_node.limit = -1;
+        table_fn_plan_node.row_tuples = vec![output_tuple_id];
+        table_fn_plan_node.nullable_tuples = vec![];
+        table_fn_plan_node.compact_data = true;
+        table_fn_plan_node.table_function_node = Some(plan_nodes::TTableFunctionNode::new(
+            Some(table_function_expr),
+            Some(param_slots),
+            Some(Vec::new()),
+            Some(vec![slot_id]),
+            Some(true),
+        ));
+
+        Ok((vec![table_fn_plan_node, param_values_node], scope))
+    }
+
+    fn compile_int64_literal(
+        &mut self,
+        value: i64,
+        empty_scope: &ExprScope,
+    ) -> Result<exprs::TExpr, String> {
+        let typed = TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Int(value)),
+            data_type: DataType::Int64,
+            nullable: false,
+        };
+        let mut compiler = ExprCompiler::new(self.state.slot_allocator(), empty_scope);
+        compiler.compile_typed(&typed)
+    }
+
+    fn lower_table_function(
+        &mut self,
+        table_fn_node_id: i32,
+        output_tuple_id: i32,
+        project_node_id: i32,
+        project_tuple_id: i32,
+        op: &PhysicalTableFunctionOp,
+        child: &LoweredDistributedNode,
+    ) -> Result<(Vec<plan_nodes::TPlanNode>, ExprScope), String> {
+        if !op.function_name.eq_ignore_ascii_case("unnest") {
+            return Err(format!(
+                "unsupported standalone table function: {}",
+                op.function_name
+            ));
+        }
+        if op.args.len() != op.output_columns.len() {
+            return Err(format!(
+                "table function output column count mismatch: args={} outputs={}",
+                op.args.len(),
+                op.output_columns.len()
+            ));
+        }
+
+        let mut slot_map = BTreeMap::new();
+        let mut project_scope = ExprScope::new();
+        let mut remapped_child_bindings = HashMap::new();
+        let mut outer_columns = Vec::new();
+        let mut outer_slots = Vec::new();
+
+        let child_cols: Vec<(String, ColumnBinding)> = child
+            .scope
+            .iter_columns()
+            .map(|(name, binding)| (name.clone(), binding.clone()))
+            .collect();
+        for (idx, (name, binding)) in child_cols.iter().enumerate() {
+            let slot_id = self.state.alloc_slot();
+            let type_desc = expr_compiler::binding_type_desc(binding)?;
+            self.state.desc_builder().add_slot_with_type_desc(
+                slot_id,
+                project_tuple_id,
+                name,
+                type_desc.clone(),
+                binding.nullable,
+                idx as i32,
+            );
+            slot_map.insert(
+                slot_id,
+                expr_compiler::build_slot_ref_texpr(
+                    binding.slot_id,
+                    binding.tuple_id,
+                    type_desc.clone(),
+                ),
+            );
+            let new_binding = ColumnBinding {
+                tuple_id: project_tuple_id,
+                slot_id,
+                data_type: binding.data_type.clone(),
+                type_desc: Some(type_desc),
+                nullable: binding.nullable,
+            };
+            project_scope.add_column(None, name.clone(), new_binding.clone());
+            remapped_child_bindings
+                .insert((binding.tuple_id, binding.slot_id), new_binding.clone());
+            outer_slots.push(slot_id);
+            outer_columns.push((name.clone(), new_binding));
+        }
+        for (column_id, binding) in child.scope.iter_id_bindings() {
+            if let Some(new_binding) =
+                remapped_child_bindings.get(&(binding.tuple_id, binding.slot_id))
+            {
+                project_scope.add_id_alias(*column_id, new_binding.clone());
+            }
+        }
+
+        let mut param_slots = Vec::with_capacity(op.args.len());
+        let mut param_type_descs = Vec::with_capacity(op.args.len());
+        for (idx, arg) in op.args.iter().enumerate() {
+            let mut compiler = ExprCompiler::new(self.state.slot_allocator(), &child.scope);
+            let texpr = compiler.compile_typed(arg)?;
+            let type_desc = texpr
+                .nodes
+                .first()
+                .map(|root| root.type_.clone())
+                .ok_or_else(|| format!("table function arg {idx} compiled to empty TExpr"))?;
+            let slot_id = self.state.alloc_slot();
+            self.state.desc_builder().add_slot_with_type_desc(
+                slot_id,
+                project_tuple_id,
+                &format!("__tf_arg_{idx}"),
+                type_desc.clone(),
+                arg.nullable,
+                (child_cols.len() + idx) as i32,
+            );
+            slot_map.insert(slot_id, texpr);
+            param_slots.push(slot_id);
+            param_type_descs.push(type_desc);
+        }
+        self.state.desc_builder().add_tuple(project_tuple_id, None);
+        let project_plan_node =
+            nodes::build_project_node(project_node_id, project_tuple_id, slot_map);
+
+        let mut output_scope = ExprScope::new();
+        let mut output_outer_by_project_slot = HashMap::new();
+        for (idx, (name, binding)) in outer_columns.iter().enumerate() {
+            let type_desc = expr_compiler::binding_type_desc(binding)?;
+            self.state.desc_builder().add_slot_with_type_desc(
+                binding.slot_id,
+                output_tuple_id,
+                name,
+                type_desc.clone(),
+                binding.nullable,
+                idx as i32,
+            );
+            let output_binding = ColumnBinding {
+                tuple_id: output_tuple_id,
+                slot_id: binding.slot_id,
+                data_type: binding.data_type.clone(),
+                type_desc: Some(type_desc),
+                nullable: binding.nullable,
+            };
+            output_scope.add_column(None, name.clone(), output_binding.clone());
+            output_outer_by_project_slot.insert(binding.slot_id, output_binding);
+        }
+        let output_id_aliases: Vec<_> = project_scope
+            .iter_id_bindings()
+            .filter_map(|(column_id, binding)| {
+                output_outer_by_project_slot
+                    .get(&binding.slot_id)
+                    .map(|output_binding| (*column_id, output_binding.clone()))
+            })
+            .collect();
+        for (column_id, output_binding) in output_id_aliases {
+            output_scope.add_id_alias(column_id, output_binding);
+        }
+
+        let mut fn_result_slots = Vec::with_capacity(op.output_columns.len());
+        let mut ret_type_descs = Vec::with_capacity(op.output_columns.len());
+        let result_qualifier = op.alias.clone().or_else(|| Some(op.function_name.clone()));
+        for (idx, col) in op.output_columns.iter().enumerate() {
+            let DataType::List(item_field) = &op.args[idx].data_type else {
+                return Err(format!(
+                    "UNNEST argument {} must be ARRAY, got {:?}",
+                    idx + 1,
+                    op.args[idx].data_type
+                ));
+            };
+            if item_field.data_type() != &col.data_type {
+                return Err(format!(
+                    "UNNEST result type mismatch for column {}: arg item={:?} output={:?}",
+                    col.name,
+                    item_field.data_type(),
+                    col.data_type
+                ));
+            }
+            let slot_id = self.state.alloc_slot();
+            let type_desc = type_infer::arrow_type_to_type_desc(&col.data_type)?;
+            self.state.desc_builder().add_slot_with_type_desc(
+                slot_id,
+                output_tuple_id,
+                &col.name,
+                type_desc.clone(),
+                true,
+                (outer_columns.len() + idx) as i32,
+            );
+            let binding = ColumnBinding {
+                tuple_id: output_tuple_id,
+                slot_id,
+                data_type: col.data_type.clone(),
+                type_desc: Some(type_desc.clone()),
+                nullable: true,
+            };
+            output_scope.add_column_with_id(
+                col.column_id,
+                result_qualifier.clone(),
+                col.name.clone(),
+                binding,
+            );
+            fn_result_slots.push(slot_id);
+            ret_type_descs.push(type_desc);
+        }
+        self.state.desc_builder().add_tuple(output_tuple_id, None);
+
+        let ret_type = ret_type_descs
+            .first()
+            .cloned()
+            .ok_or_else(|| "table function requires at least one return type".to_string())?;
+        let table_function_expr = exprs::TExpr::new(vec![exprs::TExprNode {
+            node_type: exprs::TExprNodeType::FUNCTION_CALL,
+            type_: ret_type.clone(),
+            num_children: 0,
+            fn_: Some(types::TFunction {
+                name: types::TFunctionName {
+                    db_name: None,
+                    function_name: op.function_name.clone(),
+                },
+                binary_type: types::TFunctionBinaryType::BUILTIN,
+                arg_types: param_type_descs,
+                ret_type,
+                has_var_args: false,
+                comment: None,
+                signature: None,
+                hdfs_location: None,
+                scalar_fn: None,
+                aggregate_fn: None,
+                id: None,
+                checksum: None,
+                agg_state_desc: None,
+                fid: None,
+                table_fn: Some(types::TTableFunction::new(
+                    ret_type_descs,
+                    None::<String>,
+                    Some(op.is_left_join),
+                )),
+                could_apply_dict_optimize: None,
+                ignore_nulls: None,
+                isolated: None,
+                input_type: None,
+                content: None,
+            }),
+            ..expr_compiler::default_expr_node()
+        }]);
+
+        let mut table_fn_plan_node = nodes::default_plan_node();
+        table_fn_plan_node.node_id = table_fn_node_id;
+        table_fn_plan_node.node_type = plan_nodes::TPlanNodeType::TABLE_FUNCTION_NODE;
+        table_fn_plan_node.num_children = 1;
+        table_fn_plan_node.limit = -1;
+        table_fn_plan_node.row_tuples = vec![output_tuple_id];
+        table_fn_plan_node.nullable_tuples = vec![];
+        table_fn_plan_node.compact_data = true;
+        table_fn_plan_node.table_function_node = Some(plan_nodes::TTableFunctionNode::new(
+            Some(table_function_expr),
+            Some(param_slots),
+            Some(outer_slots),
+            Some(fn_result_slots),
+            Some(true),
+        ));
+
+        Ok((vec![table_fn_plan_node, project_plan_node], output_scope))
+    }
+
     pub(crate) fn lower_assert_one_row(
         &mut self,
         assert_node_id: i32,
@@ -2677,6 +3343,71 @@ fn binary_children<'a>(
     Ok((&node.children[0], &node.children[1]))
 }
 
+fn analytic_window_from_expr(win_expr: &WindowExpr) -> Option<plan_nodes::TAnalyticWindow> {
+    use crate::sql::analysis::{WindowBound, WindowFrameType};
+
+    win_expr.window_frame.as_ref().map(|frame| {
+        let window_type = match frame.frame_type {
+            WindowFrameType::Rows => plan_nodes::TAnalyticWindowType::ROWS,
+            WindowFrameType::Range => plan_nodes::TAnalyticWindowType::RANGE,
+        };
+        let window_start = match &frame.start {
+            WindowBound::UnboundedPreceding => None,
+            WindowBound::CurrentRow => Some(plan_nodes::TAnalyticWindowBoundary {
+                type_: plan_nodes::TAnalyticWindowBoundaryType::CURRENT_ROW,
+                range_offset_predicate: None,
+                rows_offset_value: None,
+            }),
+            WindowBound::Preceding(n) => Some(plan_nodes::TAnalyticWindowBoundary {
+                type_: plan_nodes::TAnalyticWindowBoundaryType::PRECEDING,
+                range_offset_predicate: None,
+                rows_offset_value: Some(*n),
+            }),
+            WindowBound::Following(n) => Some(plan_nodes::TAnalyticWindowBoundary {
+                type_: plan_nodes::TAnalyticWindowBoundaryType::FOLLOWING,
+                range_offset_predicate: None,
+                rows_offset_value: Some(*n),
+            }),
+            WindowBound::UnboundedFollowing => None,
+        };
+        let window_end = match &frame.end {
+            WindowBound::UnboundedFollowing => None,
+            WindowBound::CurrentRow => Some(plan_nodes::TAnalyticWindowBoundary {
+                type_: plan_nodes::TAnalyticWindowBoundaryType::CURRENT_ROW,
+                range_offset_predicate: None,
+                rows_offset_value: None,
+            }),
+            WindowBound::Following(n) => Some(plan_nodes::TAnalyticWindowBoundary {
+                type_: plan_nodes::TAnalyticWindowBoundaryType::FOLLOWING,
+                range_offset_predicate: None,
+                rows_offset_value: Some(*n),
+            }),
+            WindowBound::Preceding(n) => Some(plan_nodes::TAnalyticWindowBoundary {
+                type_: plan_nodes::TAnalyticWindowBoundaryType::PRECEDING,
+                range_offset_predicate: None,
+                rows_offset_value: Some(*n),
+            }),
+            WindowBound::UnboundedPreceding => None,
+        };
+        plan_nodes::TAnalyticWindow {
+            type_: window_type,
+            window_start,
+            window_end,
+        }
+    })
+}
+
+fn apply_ignore_nulls_to_root_fn(texpr: &mut exprs::TExpr, ignore_nulls: bool) {
+    if !ignore_nulls {
+        return;
+    }
+    if let Some(root) = texpr.nodes.first_mut()
+        && let Some(fn_) = root.fn_.as_mut()
+    {
+        fn_.ignore_nulls = Some(true);
+    }
+}
+
 fn scan_body_to_physical_op(body: &super::body::ScanBody) -> PhysicalScanOp {
     PhysicalScanOp {
         database: body.database.clone(),
@@ -2778,6 +3509,31 @@ fn repeat_body_to_physical_op(body: &super::body::RepeatBody) -> PhysicalRepeatO
         grouping_fn_args: body.grouping_fn_args.clone(),
         grouping_fn_arg_ids: body.grouping_fn_arg_ids.clone(),
         grouping_fn_ids: body.grouping_fn_ids.clone(),
+    }
+}
+
+fn generate_series_body_to_physical_op(
+    body: &super::body::GenerateSeriesBody,
+) -> PhysicalGenerateSeriesOp {
+    PhysicalGenerateSeriesOp {
+        start: body.start,
+        end: body.end,
+        step: body.step,
+        column_name: body.column_name.clone(),
+        alias: body.alias.clone(),
+        output_column_id: body.output_column_id,
+    }
+}
+
+fn table_function_body_to_physical_op(
+    body: &super::body::TableFunctionBody,
+) -> PhysicalTableFunctionOp {
+    PhysicalTableFunctionOp {
+        function_name: body.function_name.clone(),
+        args: body.args.clone(),
+        output_columns: body.output_columns.clone(),
+        alias: body.alias.clone(),
+        is_left_join: body.is_left_join,
     }
 }
 

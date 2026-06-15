@@ -2,8 +2,9 @@ use crate::sql::optimizer::statistics::{Confidence, Statistics};
 
 use super::FragmentId;
 use super::body::{
-    AssertOneRowBody, DecodeBody, HashAggregateBody, HashJoinBody, NestLoopJoinBody, ProjectBody,
-    RepeatBody, ScanBody, SetOpBody, SortBody, TopNBody, ValuesBody,
+    AssertOneRowBody, DecodeBody, GenerateSeriesBody, HashAggregateBody, HashJoinBody,
+    NestLoopJoinBody, ProjectBody, RepeatBody, ScanBody, SetOpBody, SortBody, TableFunctionBody,
+    TopNBody, ValuesBody, WindowBody,
 };
 
 /// Self-contained copy of the estimated stats this node carries, so EXPLAIN /
@@ -61,6 +62,9 @@ pub(crate) enum DistributedPlanNodeBody {
     Decode(DecodeBody),
     Repeat(Box<RepeatBody>),
     SetOp(SetOpBody),
+    Window(Box<WindowBody>),
+    GenerateSeries(GenerateSeriesBody),
+    TableFunction(Box<TableFunctionBody>),
 }
 
 #[cfg(test)]

@@ -23,17 +23,17 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
         AggMode, JoinDistribution, Operator, PhysicalAssertOneRowOp, PhysicalDecodeOp,
-        PhysicalDistributionOp, PhysicalExceptOp, PhysicalFilterOp, PhysicalHashAggregateOp,
-        PhysicalHashJoinEqCondition, PhysicalHashJoinOp, PhysicalIntersectOp, PhysicalLimitOp,
-        PhysicalNestLoopJoinOp, PhysicalProjectOp, PhysicalRepeatOp, PhysicalScanOp,
-        PhysicalSortOp, PhysicalTopNOp, PhysicalUnionOp, PhysicalValuesOp, ScanDictionaryColumn,
-        TopNPhase,
+        PhysicalDistributionOp, PhysicalExceptOp, PhysicalFilterOp, PhysicalGenerateSeriesOp,
+        PhysicalHashAggregateOp, PhysicalHashJoinEqCondition, PhysicalHashJoinOp,
+        PhysicalIntersectOp, PhysicalLimitOp, PhysicalNestLoopJoinOp, PhysicalProjectOp,
+        PhysicalRepeatOp, PhysicalScanOp, PhysicalSortOp, PhysicalTableFunctionOp, PhysicalTopNOp,
+        PhysicalUnionOp, PhysicalValuesOp, PhysicalWindowOp, ScanDictionaryColumn, TopNPhase,
     };
     use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, PlanExecutionProps};
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::runtime_filter_pass::{RuntimeFilterDesc, RuntimeFilterProbe};
     use crate::sql::optimizer::statistics::Statistics;
-    use crate::sql::planner::plan::{AggregateCall, DecodeMapping};
+    use crate::sql::planner::plan::{AggregateCall, DecodeMapping, WindowExpr};
 
     #[test]
     fn scan_matches_direct_fragment_builder() {
@@ -317,6 +317,27 @@ mod tests {
     #[test]
     fn repeat_grouping_sets_matches_direct_fragment_builder() {
         assert_distributed_plan_equivalent("repeat_grouping_sets", repeat_grouping_sets_plan());
+    }
+
+    #[test]
+    fn window_row_number_over_scan_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "window_row_number_over_scan",
+            window_row_number_over_scan_plan(),
+        );
+    }
+
+    #[test]
+    fn generate_series_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent("generate_series", generate_series_plan());
+    }
+
+    #[test]
+    fn unnest_table_function_over_scan_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "unnest_table_function_over_scan",
+            unnest_table_function_over_scan_plan(),
+        );
     }
 
     #[test]
@@ -1217,6 +1238,67 @@ mod tests {
             }),
             vec![single_column_scan_plan(k.clone())],
             vec![k, grouping_col],
+        )
+    }
+
+    fn window_row_number_over_scan_plan() -> PhysicalPlanNode {
+        let k = output_col(901, "k", DataType::Int64, false);
+        let row_number = output_col(902, "rn", DataType::Int64, false);
+        physical_node(
+            Operator::PhysicalWindow(PhysicalWindowOp {
+                window_exprs: vec![WindowExpr {
+                    name: "row_number".to_string(),
+                    args: vec![],
+                    distinct: false,
+                    partition_by: vec![],
+                    order_by: vec![],
+                    window_frame: None,
+                    result_type: DataType::Int64,
+                    output_name: row_number.name.clone(),
+                    output_column_id: row_number.column_id,
+                    ignore_nulls: false,
+                }],
+                output_columns: vec![k.clone(), row_number.clone()],
+            }),
+            vec![single_column_scan_plan(k.clone())],
+            vec![k, row_number],
+        )
+    }
+
+    fn generate_series_plan() -> PhysicalPlanNode {
+        let value = output_col(911, "value", DataType::Int64, false);
+        physical_node(
+            Operator::PhysicalGenerateSeries(PhysicalGenerateSeriesOp {
+                start: 1,
+                end: 3,
+                step: 1,
+                column_name: value.name.clone(),
+                alias: Some("gs".to_string()),
+                output_column_id: value.column_id,
+            }),
+            vec![],
+            vec![value],
+        )
+    }
+
+    fn unnest_table_function_over_scan_plan() -> PhysicalPlanNode {
+        let array_type = DataType::List(Arc::new(arrow::datatypes::Field::new(
+            "item",
+            DataType::Int64,
+            true,
+        )));
+        let arr = output_col(921, "arr", array_type.clone(), true);
+        let item = output_col(922, "item", DataType::Int64, true);
+        physical_node(
+            Operator::PhysicalTableFunction(PhysicalTableFunctionOp {
+                function_name: "unnest".to_string(),
+                args: vec![column_ref_expr(921, "arr", array_type, true)],
+                output_columns: vec![item.clone()],
+                alias: Some("u".to_string()),
+                is_left_join: false,
+            }),
+            vec![single_column_scan_plan(arr.clone())],
+            vec![arr, item],
         )
     }
 

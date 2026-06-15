@@ -1,12 +1,14 @@
 use crate::sql::analysis::TypedExpr;
-use crate::sql::codegen::helpers::split_and_conjuncts_typed;
+use crate::sql::codegen::helpers::{group_win_exprs_by_sig, split_and_conjuncts_typed};
 use crate::sql::optimizer::operator::{Operator, TopNPhase};
 use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
+use crate::sql::optimizer::property::{OrderingSpec, window_ordering_spec};
 
 use super::FragmentId;
 use super::body::{
-    AssertOneRowBody, DecodeBody, HashAggregateBody, HashJoinBody, NestLoopJoinBody, ProjectBody,
-    RepeatBody, ScanBody, SetOpBody, SetOpKind, SortBody, TopNBody, ValuesBody,
+    AssertOneRowBody, DecodeBody, GenerateSeriesBody, HashAggregateBody, HashJoinBody,
+    NestLoopJoinBody, ProjectBody, RepeatBody, ScanBody, SetOpBody, SetOpKind, SortBody,
+    TableFunctionBody, TopNBody, ValuesBody, WindowBody, WindowGroupPlan,
 };
 use super::fragment::{DataPartition, DataSink, DistributedPlan, PlanFragment};
 use super::node::{DistributedPlanNode, DistributedPlanNodeBody, PlanNodeStats};
@@ -359,6 +361,79 @@ impl DistributedPlanBuilder {
                     })),
                 })
             }
+            Operator::PhysicalWindow(op) => {
+                let child_plan = expect_single_child(node, "PhysicalWindow")?;
+                let child = self.visit(child_plan, fragment_id)?;
+                let groups = group_win_exprs_by_sig(&op.window_exprs);
+                if groups.is_empty() {
+                    return Err(
+                        "build_distributed_plan M0: PhysicalWindow has no window expressions"
+                            .to_string(),
+                    );
+                }
+
+                let mut group_plans = Vec::with_capacity(groups.len());
+                let mut tuple_ids = child.tuple_ids.clone();
+                let mut current_ordering = distributed_node_ordering(&child);
+                for group_indices in &groups {
+                    let Some(first_idx) = group_indices.first().copied() else {
+                        continue;
+                    };
+                    let first_win = &op.window_exprs[first_idx];
+                    let sort_node_id = if groups.len() > 1 {
+                        let required_ordering =
+                            window_ordering_spec(&first_win.partition_by, &first_win.order_by);
+                        let has_sort_keys =
+                            !first_win.partition_by.is_empty() || !first_win.order_by.is_empty();
+                        let ordering_is_representable =
+                            !matches!(required_ordering, OrderingSpec::Any);
+                        let needs_sort = has_sort_keys
+                            && (!ordering_is_representable
+                                || !current_ordering.satisfies(&required_ordering));
+                        if needs_sort {
+                            let sort_node_id = self.alloc_node();
+                            current_ordering = required_ordering;
+                            Some(sort_node_id)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    let analytic_node_id = self.alloc_node();
+                    let intermediate_tuple_id = self.alloc_tuple();
+                    let output_tuple_id = self.alloc_tuple();
+                    tuple_ids.push(output_tuple_id);
+                    group_plans.push(WindowGroupPlan {
+                        sort_node_id,
+                        analytic_node_id,
+                        intermediate_tuple_id,
+                        output_tuple_id,
+                    });
+                }
+
+                let node_id = group_plans
+                    .first()
+                    .and_then(|group| group.sort_node_id)
+                    .unwrap_or_else(|| group_plans[0].analytic_node_id);
+                Ok(DistributedPlanNode {
+                    node_id,
+                    fragment_id,
+                    tuple_ids,
+                    nullable_tuple_ids: vec![],
+                    limit: -1,
+                    execution_join_distribution: node.execution_props.join_distribution,
+                    build_runtime_filters: node.build_runtime_filters.clone(),
+                    probe_runtime_filters: node.probe_runtime_filters.clone(),
+                    children: vec![child],
+                    stats: PlanNodeStats::from_statistics(&node.stats),
+                    body: DistributedPlanNodeBody::Window(Box::new(WindowBody {
+                        window_exprs: op.window_exprs.clone(),
+                        output_columns: op.output_columns.clone(),
+                        groups: group_plans,
+                    })),
+                })
+            }
             Operator::PhysicalUnion(op) => {
                 if !op.all {
                     return Err("UNION DISTINCT is Phase 2".to_string());
@@ -385,6 +460,72 @@ impl DistributedPlanBuilder {
                 &op.output_columns,
                 &op.child_output_columns,
             ),
+            Operator::PhysicalGenerateSeries(op) => {
+                if !node.children.is_empty() {
+                    return Err(format!(
+                        "build_distributed_plan M0: PhysicalGenerateSeries expected 0 children, got {}",
+                        node.children.len()
+                    ));
+                }
+                if op.step == 0 {
+                    return Err("generate_series step size cannot equal zero".to_string());
+                }
+                let param_tuple_id = self.alloc_tuple();
+                let param_values_node_id = self.alloc_node();
+                let output_tuple_id = self.alloc_tuple();
+                let table_fn_node_id = self.alloc_node();
+                Ok(DistributedPlanNode {
+                    node_id: table_fn_node_id,
+                    fragment_id,
+                    tuple_ids: vec![output_tuple_id],
+                    nullable_tuple_ids: vec![],
+                    limit: -1,
+                    execution_join_distribution: node.execution_props.join_distribution,
+                    build_runtime_filters: node.build_runtime_filters.clone(),
+                    probe_runtime_filters: node.probe_runtime_filters.clone(),
+                    children: vec![],
+                    stats: PlanNodeStats::from_statistics(&node.stats),
+                    body: DistributedPlanNodeBody::GenerateSeries(GenerateSeriesBody {
+                        start: op.start,
+                        end: op.end,
+                        step: op.step,
+                        column_name: op.column_name.clone(),
+                        alias: op.alias.clone(),
+                        output_column_id: op.output_column_id,
+                        param_tuple_id,
+                        param_values_node_id,
+                    }),
+                })
+            }
+            Operator::PhysicalTableFunction(op) => {
+                let child_plan = expect_single_child(node, "PhysicalTableFunction")?;
+                let child = self.visit(child_plan, fragment_id)?;
+                let project_tuple_id = self.alloc_tuple();
+                let project_node_id = self.alloc_node();
+                let output_tuple_id = self.alloc_tuple();
+                let table_fn_node_id = self.alloc_node();
+                Ok(DistributedPlanNode {
+                    node_id: table_fn_node_id,
+                    fragment_id,
+                    tuple_ids: vec![output_tuple_id],
+                    nullable_tuple_ids: vec![],
+                    limit: -1,
+                    execution_join_distribution: node.execution_props.join_distribution,
+                    build_runtime_filters: node.build_runtime_filters.clone(),
+                    probe_runtime_filters: node.probe_runtime_filters.clone(),
+                    children: vec![child],
+                    stats: PlanNodeStats::from_statistics(&node.stats),
+                    body: DistributedPlanNodeBody::TableFunction(Box::new(TableFunctionBody {
+                        function_name: op.function_name.clone(),
+                        args: op.args.clone(),
+                        output_columns: op.output_columns.clone(),
+                        alias: op.alias.clone(),
+                        is_left_join: op.is_left_join,
+                        project_tuple_id,
+                        project_node_id,
+                    })),
+                })
+            }
             other => Err(format!(
                 "build_distributed_plan slice 1 does not handle operator {other:?}"
             )),
@@ -435,6 +576,14 @@ impl DistributedPlanBuilder {
                 child_output_columns: child_output_columns.to_vec(),
             }),
         })
+    }
+}
+
+fn distributed_node_ordering(node: &DistributedPlanNode) -> OrderingSpec {
+    match &node.body {
+        DistributedPlanNodeBody::Sort(sort) => OrderingSpec::from_sort_items(&sort.items),
+        DistributedPlanNodeBody::TopN(topn) => OrderingSpec::from_sort_items(&topn.items),
+        _ => OrderingSpec::Any,
     }
 }
 

@@ -4,6 +4,7 @@ use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::{
     AggMode, JoinDistribution, PhysicalHashJoinEqCondition, TopNPhase,
 };
+use crate::sql::planner::plan::WindowExpr;
 use crate::sql::planner::plan::{AggregateCall, DecodeMapping};
 use crate::sql::planner::plan::{ScanDictionaryColumn, ScanVariantColumn};
 
@@ -110,4 +111,42 @@ pub(crate) struct SetOpBody {
     pub kind: SetOpKind,
     pub output_columns: Vec<OutputColumn>,
     pub child_output_columns: Vec<Vec<OutputColumn>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct WindowGroupPlan {
+    pub sort_node_id: Option<i32>,
+    pub analytic_node_id: i32,
+    pub intermediate_tuple_id: i32,
+    pub output_tuple_id: i32,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct WindowBody {
+    pub window_exprs: Vec<WindowExpr>,
+    pub output_columns: Vec<OutputColumn>,
+    pub groups: Vec<WindowGroupPlan>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct GenerateSeriesBody {
+    pub start: i64,
+    pub end: i64,
+    pub step: i64,
+    pub column_name: String,
+    pub alias: Option<String>,
+    pub output_column_id: ColumnId,
+    pub param_tuple_id: i32,
+    pub param_values_node_id: i32,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TableFunctionBody {
+    pub function_name: String,
+    pub args: Vec<TypedExpr>,
+    pub output_columns: Vec<OutputColumn>,
+    pub alias: Option<String>,
+    pub is_left_join: bool,
+    pub project_tuple_id: i32,
+    pub project_node_id: i32,
 }
