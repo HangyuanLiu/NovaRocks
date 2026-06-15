@@ -23,8 +23,9 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
         AggMode, JoinDistribution, Operator, PhysicalDistributionOp, PhysicalFilterOp,
-        PhysicalHashAggregateOp, PhysicalHashJoinEqCondition, PhysicalHashJoinOp,
-        PhysicalNestLoopJoinOp, PhysicalProjectOp, PhysicalScanOp, PhysicalSortOp,
+        PhysicalHashAggregateOp, PhysicalHashJoinEqCondition, PhysicalHashJoinOp, PhysicalLimitOp,
+        PhysicalNestLoopJoinOp, PhysicalProjectOp, PhysicalScanOp, PhysicalSortOp, PhysicalTopNOp,
+        TopNPhase,
     };
     use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, PlanExecutionProps};
     use crate::sql::optimizer::property::DistributionSpec;
@@ -66,6 +67,56 @@ mod tests {
     #[test]
     fn sort_over_scan_matches_direct_fragment_builder() {
         assert_distributed_plan_equivalent("sort_over_scan", sort_plan(scan_plan()));
+    }
+
+    #[test]
+    fn limit_over_scan_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "limit_over_scan",
+            limit_plan(scan_plan(), Some(5), None),
+        );
+    }
+
+    #[test]
+    fn limit_over_sort_with_offset_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "limit_over_sort_with_offset",
+            limit_plan(sort_plan(scan_plan()), Some(5), Some(2)),
+        );
+    }
+
+    #[test]
+    fn top_n_final_single_over_scan_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "top_n_final_single_over_scan",
+            top_n_plan(scan_plan(), TopNPhase::Final, false, Some(5), Some(1)),
+        );
+    }
+
+    #[test]
+    fn top_n_partial_over_scan_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "top_n_partial_over_scan",
+            top_n_plan(scan_plan(), TopNPhase::Partial, false, Some(7), Some(0)),
+        );
+    }
+
+    #[test]
+    fn top_n_split_fails_fast_in_distributed_plan() {
+        assert_distributed_plan_error_contains(
+            "top_n_split",
+            top_n_plan(scan_plan(), TopNPhase::Final, true, Some(5), Some(0)),
+            "TopN split is Phase 2",
+        );
+    }
+
+    #[test]
+    fn limit_offset_without_sort_child_fails_fast_in_distributed_plan() {
+        assert_distributed_plan_error_contains(
+            "limit_offset_without_sort_child",
+            limit_plan(project_plan(scan_plan()), Some(5), Some(1)),
+            "LIMIT/OFFSET without a SORT child is not supported",
+        );
     }
 
     #[test]
@@ -215,6 +266,28 @@ mod tests {
         .unwrap_or_else(|err| panic!("{case_name}: DistributedPlan build failed: {err}"));
 
         (direct, distributed)
+    }
+
+    fn assert_distributed_plan_error_contains(
+        case_name: &str,
+        plan: PhysicalPlanNode,
+        expected: &str,
+    ) {
+        let catalog = DummyCatalog;
+        let connectors = ConnectorRegistry::new();
+        let err = match PlanFragmentBuilder::build_via_distributed_plan(
+            &plan,
+            &catalog,
+            &connectors,
+            "test_db",
+        ) {
+            Ok(_) => panic!("{case_name}: DistributedPlan build unexpectedly succeeded"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains(expected),
+            "{case_name}: expected error to contain `{expected}`, got `{err}`"
+        );
     }
 
     fn assert_multi_fragment_equivalent(
@@ -529,6 +602,50 @@ mod tests {
                     nulls_first: false,
                 }],
                 analytic_partition_exprs: vec![],
+            }),
+            vec![child],
+            output_columns,
+        )
+    }
+
+    fn limit_plan(
+        child: PhysicalPlanNode,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> PhysicalPlanNode {
+        let output_columns = child.output_columns.clone();
+        physical_node(
+            Operator::PhysicalLimit(PhysicalLimitOp { limit, offset }),
+            vec![child],
+            output_columns,
+        )
+    }
+
+    fn top_n_plan(
+        child: PhysicalPlanNode,
+        phase: TopNPhase,
+        is_split: bool,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> PhysicalPlanNode {
+        let sort_col = child.output_columns[0].clone();
+        let output_columns = child.output_columns.clone();
+        physical_node(
+            Operator::PhysicalTopN(PhysicalTopNOp {
+                items: vec![SortItem {
+                    expr: column_ref_expr(
+                        sort_col.column_id.0,
+                        &sort_col.name,
+                        sort_col.data_type.clone(),
+                        sort_col.nullable,
+                    ),
+                    asc: true,
+                    nulls_first: false,
+                }],
+                limit,
+                offset,
+                phase,
+                is_split,
             }),
             vec![child],
             output_columns,

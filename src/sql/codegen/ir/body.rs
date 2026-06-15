@@ -1,6 +1,8 @@
 use crate::sql::analysis::{JoinKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
 use crate::sql::catalog::TableDef;
-use crate::sql::optimizer::operator::{AggMode, JoinDistribution, PhysicalHashJoinEqCondition};
+use crate::sql::optimizer::operator::{
+    AggMode, JoinDistribution, PhysicalHashJoinEqCondition, TopNPhase,
+};
 use crate::sql::planner::plan::AggregateCall;
 use crate::sql::planner::plan::{ScanDictionaryColumn, ScanVariantColumn};
 
@@ -30,6 +32,15 @@ pub(crate) struct SortBody {
     pub analytic_partition_exprs: Vec<TypedExpr>,
     pub output_columns: Vec<OutputColumn>,
     pub offset: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TopNBody {
+    pub items: Vec<SortItem>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+    pub phase: TopNPhase,
+    pub is_split: bool,
 }
 
 #[derive(Clone, Debug)]

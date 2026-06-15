@@ -35,7 +35,8 @@ use crate::sql::codegen::{
 };
 use crate::sql::optimizer::operator::{
     AggMode, PhysicalHashAggregateOp, PhysicalHashJoinOp, PhysicalNestLoopJoinOp,
-    PhysicalProjectOp, PhysicalScanOp, PhysicalSortOp, ScanDictionaryColumn,
+    PhysicalProjectOp, PhysicalScanOp, PhysicalSortOp, PhysicalTopNOp, ScanDictionaryColumn,
+    TopNPhase,
 };
 use crate::sql::optimizer::physical_plan::JoinExecutionDistribution;
 use crate::types;
@@ -451,7 +452,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         &mut self,
         node: &super::node::DistributedPlanNode,
     ) -> Result<LoweredDistributedNode, String> {
-        let lowered = match &node.body {
+        let mut lowered = match &node.body {
             super::node::DistributedPlanNodeBody::Scan(scan) => {
                 if !node.children.is_empty() {
                     return Err(format!(
@@ -517,6 +518,31 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     scope: child.scope,
                     tuple_ids: child.tuple_ids,
                     output_columns: sort.output_columns.clone(),
+                }
+            }
+            super::node::DistributedPlanNodeBody::TopN(topn) => {
+                if node.children.len() != 1 {
+                    return Err(format!(
+                        "DistributedPlan TopN node_id={} expected 1 child, got {}",
+                        node.node_id,
+                        node.children.len()
+                    ));
+                }
+                let child = self.lower_node(&node.children[0])?;
+                let op = top_n_body_to_physical_op(topn);
+                let top_n_plan_node = self.lower_top_n_single_or_partial(
+                    node.node_id,
+                    &op,
+                    &child.scope,
+                    &child.tuple_ids,
+                )?;
+                let mut plan_nodes = vec![top_n_plan_node];
+                plan_nodes.extend(child.plan_nodes);
+                LoweredDistributedNode {
+                    plan_nodes,
+                    scope: child.scope,
+                    tuple_ids: child.tuple_ids,
+                    output_columns: child.output_columns,
                 }
             }
             super::node::DistributedPlanNodeBody::HashAggregate(agg) => {
@@ -614,6 +640,9 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 }
             }
         };
+        if let Some(root) = lowered.plan_nodes.first_mut() {
+            root.limit = node.limit;
+        }
         self.record_probe_targets(node, &lowered);
         Ok(lowered)
     }
@@ -1827,6 +1856,77 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
         Ok(sort_plan_node)
     }
+
+    pub(crate) fn lower_top_n_single_or_partial(
+        &mut self,
+        top_n_node_id: i32,
+        op: &PhysicalTopNOp,
+        child_scope: &ExprScope,
+        child_tuple_ids: &[i32],
+    ) -> Result<plan_nodes::TPlanNode, String> {
+        match (op.phase, op.is_split) {
+            (TopNPhase::Final, true) => return Err("TopN split is Phase 2".to_string()),
+            (TopNPhase::Final, false) | (TopNPhase::Partial, _) => {}
+        }
+
+        let state = &mut *self.state;
+        let mut ordering_exprs = Vec::new();
+        let mut is_asc = Vec::new();
+        let mut nulls_first_list = Vec::new();
+
+        for item in &op.items {
+            let mut compiler = ExprCompiler::new(state.slot_allocator(), child_scope);
+            let texpr = compiler.compile_typed(&item.expr)?;
+            ordering_exprs.push(texpr);
+            is_asc.push(item.asc);
+            nulls_first_list.push(item.nulls_first);
+        }
+
+        let sort_info = plan_nodes::TSortInfo::new(
+            ordering_exprs,
+            is_asc,
+            nulls_first_list,
+            None::<Vec<exprs::TExpr>>,
+        );
+
+        let mut sort_plan_node = nodes::default_plan_node();
+        sort_plan_node.node_id = top_n_node_id;
+        sort_plan_node.node_type = plan_nodes::TPlanNodeType::SORT_NODE;
+        sort_plan_node.num_children = 1;
+        sort_plan_node.limit = op.limit.unwrap_or(-1);
+        sort_plan_node.row_tuples = child_tuple_ids.to_vec();
+        sort_plan_node.nullable_tuples = vec![];
+        sort_plan_node.compact_data = true;
+        sort_plan_node.sort_node = Some(plan_nodes::TSortNode {
+            sort_info,
+            use_top_n: true,
+            offset: op.offset,
+            ordering_exprs: None,
+            is_asc_order: None,
+            is_default_limit: None,
+            nulls_first: None,
+            sort_tuple_slot_exprs: None,
+            has_outer_join_child: None,
+            sql_sort_keys: None,
+            analytic_partition_exprs: None,
+            partition_exprs: None,
+            partition_limit: None,
+            topn_type: None,
+            build_runtime_filters: None,
+            max_buffered_rows: None,
+            max_buffered_bytes: None,
+            late_materialization: None,
+            enable_parallel_merge: None,
+            analytic_partition_skewed: None,
+            pre_agg_exprs: None,
+            pre_agg_output_slot_id: None,
+            pre_agg_insert_local_shuffle: None,
+            parallel_merge_late_materialize_mode: None,
+            per_pipeline: None,
+        });
+
+        Ok(sort_plan_node)
+    }
 }
 
 fn first_tuple_id(
@@ -1886,6 +1986,16 @@ fn sort_body_to_physical_op(body: &super::body::SortBody) -> PhysicalSortOp {
     PhysicalSortOp {
         items: body.items.clone(),
         analytic_partition_exprs: body.analytic_partition_exprs.clone(),
+    }
+}
+
+fn top_n_body_to_physical_op(body: &super::body::TopNBody) -> PhysicalTopNOp {
+    PhysicalTopNOp {
+        items: body.items.clone(),
+        limit: body.limit,
+        offset: body.offset,
+        phase: body.phase,
+        is_split: body.is_split,
     }
 }
 

@@ -1,11 +1,11 @@
 use crate::sql::analysis::TypedExpr;
 use crate::sql::codegen::helpers::split_and_conjuncts_typed;
-use crate::sql::optimizer::operator::Operator;
+use crate::sql::optimizer::operator::{Operator, TopNPhase};
 use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
 
 use super::FragmentId;
 use super::body::{
-    HashAggregateBody, HashJoinBody, NestLoopJoinBody, ProjectBody, ScanBody, SortBody,
+    HashAggregateBody, HashJoinBody, NestLoopJoinBody, ProjectBody, ScanBody, SortBody, TopNBody,
 };
 use super::fragment::{DataPartition, DataSink, DistributedPlan, PlanFragment};
 use super::node::{DistributedPlanNode, DistributedPlanNodeBody, PlanNodeStats};
@@ -116,6 +116,68 @@ impl DistributedPlanBuilder {
                     }),
                 })
             }
+            Operator::PhysicalLimit(op) => {
+                let child_plan = expect_single_child(node, "PhysicalLimit")?;
+                let offset = op.offset.unwrap_or(0);
+                if offset > 0 {
+                    if matches!(&child_plan.op, Operator::PhysicalDistribution(_)) {
+                        return Err("limit-offset-exchange is Phase 2".to_string());
+                    }
+                    if !limit_child_can_apply_offset_locally(child_plan) {
+                        return Err(
+                            "LIMIT/OFFSET without a SORT child is not supported".to_string()
+                        );
+                    }
+                }
+
+                let mut child = self.visit(child_plan, fragment_id)?;
+                child.limit = op.limit.unwrap_or(-1);
+                child.stats = PlanNodeStats::from_statistics(&node.stats);
+                match &mut child.body {
+                    DistributedPlanNodeBody::Sort(sort) => {
+                        sort.offset = op.offset;
+                    }
+                    DistributedPlanNodeBody::TopN(topn) => {
+                        topn.offset = op.offset;
+                    }
+                    _ if offset > 0 => {
+                        return Err(
+                            "LIMIT/OFFSET without a SORT child is not supported".to_string()
+                        );
+                    }
+                    _ => {}
+                }
+                Ok(child)
+            }
+            Operator::PhysicalTopN(op) => {
+                let child_plan = expect_single_child(node, "PhysicalTopN")?;
+                match (op.phase, op.is_split) {
+                    (TopNPhase::Final, true) => Err("TopN split is Phase 2".to_string()),
+                    (TopNPhase::Final, false) | (TopNPhase::Partial, _) => {
+                        let child = self.visit(child_plan, fragment_id)?;
+                        let node_id = self.alloc_node();
+                        Ok(DistributedPlanNode {
+                            node_id,
+                            fragment_id,
+                            tuple_ids: child.tuple_ids.clone(),
+                            nullable_tuple_ids: vec![],
+                            limit: op.limit.unwrap_or(-1),
+                            execution_join_distribution: node.execution_props.join_distribution,
+                            build_runtime_filters: node.build_runtime_filters.clone(),
+                            probe_runtime_filters: node.probe_runtime_filters.clone(),
+                            children: vec![child],
+                            stats: PlanNodeStats::from_statistics(&node.stats),
+                            body: DistributedPlanNodeBody::TopN(TopNBody {
+                                items: op.items.clone(),
+                                limit: op.limit,
+                                offset: op.offset,
+                                phase: op.phase,
+                                is_split: op.is_split,
+                            }),
+                        })
+                    }
+                }
+            }
             Operator::PhysicalHashAggregate(op) => {
                 let child_plan = expect_single_child(node, "PhysicalHashAggregate")?;
                 let child = self.visit(child_plan, fragment_id)?;
@@ -222,6 +284,13 @@ fn expect_single_child<'a>(
         ));
     }
     Ok(&node.children[0])
+}
+
+fn limit_child_can_apply_offset_locally(child: &PhysicalPlanNode) -> bool {
+    matches!(
+        &child.op,
+        Operator::PhysicalSort(_) | Operator::PhysicalTopN(_)
+    )
 }
 
 fn fold_filter_into_scan(
