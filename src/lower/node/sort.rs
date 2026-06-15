@@ -93,13 +93,6 @@ pub(crate) fn lower_sort_node(
     };
 
     let use_top_n = sort.use_top_n;
-    if use_top_n && limit.is_none() {
-        return Err(format!(
-            "SORT_NODE node_id={} use_top_n=true requires node.limit >= 0",
-            node.node_id
-        ));
-    }
-
     let topn_type = parse_sort_topn_type(sort, node.node_id)?;
     // StarRocks enforces `offset == 0` for rank-based topn semantics.
     // Keep the same invariant so execution does not need fallback behavior.
@@ -146,6 +139,16 @@ pub(crate) fn lower_sort_node(
     if partition_limit.is_some() && !use_top_n {
         return Err(format!(
             "SORT_NODE node_id={} partition_limit requires use_top_n=true",
+            node.node_id
+        ));
+    }
+    // Partition-TopN is intentionally decoupled from the global limit: the per-partition
+    // cap (partition_limit) replaces the global row cap, so use_top_n=true is valid even
+    // when there is no global limit. Only reject the combination when BOTH partition_limit
+    // and global limit are absent — that would be an unconstrained TopN with no limit at all.
+    if use_top_n && limit.is_none() && partition_limit.is_none() {
+        return Err(format!(
+            "SORT_NODE node_id={} use_top_n=true requires node.limit >= 0",
             node.node_id
         ));
     }
@@ -1016,6 +1019,41 @@ mod tests {
             panic!("expected sort node");
         };
         assert_eq!(sort.partition_limit, Some(3));
+        assert_eq!(sort.partition_exprs.len(), 1);
+    }
+
+    /// Partition-TopN with use_top_n=true and NO global limit must be accepted.
+    /// The per-partition cap (partition_limit) replaces the global limit, so
+    /// node.limit=-1 is valid when partition_limit is set.
+    #[test]
+    fn lower_sort_node_accepts_partition_topn_without_global_limit() {
+        let layout = single_slot_layout(0, 1);
+        let sort_info = plan_nodes::TSortInfo {
+            ordering_exprs: vec![slot_ref_expr(0, 1)],
+            is_asc_order: vec![true],
+            nulls_first: vec![true],
+            sort_tuple_slot_exprs: None,
+        };
+        let mut node = sort_plan_node(sort_info);
+        {
+            let sort_node = node.sort_node.as_mut().expect("sort node");
+            sort_node.use_top_n = true;
+            sort_node.topn_type = Some(plan_nodes::TTopNType::RANK);
+            sort_node.partition_limit = Some(2);
+            sort_node.partition_exprs = Some(vec![slot_ref_expr(0, 1)]);
+        }
+        // Intentionally leave node.limit = -1 (no global limit) — this is the
+        // partition-topn decoupled-from-global-limit contract.
+        assert_eq!(node.limit, -1, "test precondition: no global limit");
+
+        let lowered = lower_sort_from_node(&node, layout)
+            .expect("partition-topn without global limit must be accepted");
+        let ExecNodeKind::Sort(sort) = lowered.node.kind else {
+            panic!("expected sort node");
+        };
+        assert!(sort.use_top_n);
+        assert_eq!(sort.limit, None, "global limit must remain None");
+        assert_eq!(sort.partition_limit, Some(2));
         assert_eq!(sort.partition_exprs.len(), 1);
     }
 }

@@ -393,8 +393,24 @@ impl SortProcessorOperator {
     }
 
     fn build_topn_sorter(&self) -> Option<SpillableChunksSorter> {
-        let sorter: Box<dyn ChunksSorter> = if let Some(rows_to_keep) = self.rows_to_keep_for_topn()
-        {
+        // Partition-TopN must be checked FIRST: a partition-topn node has
+        // use_top_n=true and no global limit, so rows_to_keep_for_topn() /
+        // rank_like_limit_for_topn() both return None and would fall through
+        // to the `None` arm, silently bypassing per-partition truncation.
+        // Checking is_partition_topn() first ensures the correct path always
+        // fires regardless of global-limit and topn_type combinations.
+        let sorter: Box<dyn ChunksSorter> = if self.is_partition_topn() {
+            let partition_limit = self
+                .partition_limit
+                .expect("is_partition_topn implies Some");
+            Box::new(ChunksSorterPartitionTopN::new(
+                Arc::clone(&self.arena),
+                self.partition_exprs.clone(),
+                self.order_by.clone(),
+                self.topn_type,
+                partition_limit,
+            ))
+        } else if let Some(rows_to_keep) = self.rows_to_keep_for_topn() {
             if rows_to_keep <= Self::HEAP_SORTER_LIMIT {
                 Box::new(ChunksSorterHeapSort::new(
                     Arc::clone(&self.arena),
@@ -409,17 +425,6 @@ impl SortProcessorOperator {
                     rows_to_keep,
                 ))
             }
-        } else if self.is_partition_topn() {
-            let partition_limit = self
-                .partition_limit
-                .expect("is_partition_topn implies Some");
-            Box::new(ChunksSorterPartitionTopN::new(
-                Arc::clone(&self.arena),
-                self.partition_exprs.clone(),
-                self.order_by.clone(),
-                self.topn_type,
-                partition_limit,
-            ))
         } else if let Some(rank_limit) = self.rank_like_limit_for_topn() {
             Box::new(ChunksSorterTopN::new(
                 Arc::clone(&self.arena),
@@ -1111,6 +1116,139 @@ mod tests {
             groups[l] == groups[r]
         });
         assert_eq!(cutoff, 3);
+    }
+
+    /// End-to-end integration test: per-partition TopN with topn_type=Rank,
+    /// partition_limit=Some(2), and NO global limit (limit=None).
+    ///
+    /// This proves the CONTRACT:
+    ///  - use_top_n=true + limit=None + partition_limit=Some(2) routes to the
+    ///    partition sorter, not the global sort path.
+    ///  - Output is 4 rows (per-partition top-2), NOT all 6 (limit=None=all)
+    ///    and NOT global top-2 rows.
+    ///
+    /// Input:  p=[1,1,1,2,2,2], o=[10,20,30,5,6,7]
+    /// Expected: partition 1 keeps o=[10,20], partition 2 keeps o=[5,6]  → 4 rows
+    #[test]
+    fn partition_topn_rank_limit_none_routes_per_partition_not_global() {
+        use crate::common::ids::SlotId;
+        use crate::exec::chunk::{Chunk, ChunkSchema};
+        use crate::exec::expr::{ExprArena, ExprNode};
+        use crate::exec::node::sort::{SortExpression, SortTopNType};
+        use arrow::array::{Array, Int32Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("p", DataType::Int32, true),
+            Field::new("o", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![
+                    Some(1),
+                    Some(1),
+                    Some(1),
+                    Some(2),
+                    Some(2),
+                    Some(2),
+                ])),
+                Arc::new(Int32Array::from(vec![
+                    Some(10),
+                    Some(20),
+                    Some(30),
+                    Some(5),
+                    Some(6),
+                    Some(7),
+                ])),
+            ],
+        )
+        .expect("record batch");
+        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(1), SlotId::new(2)],
+        )
+        .expect("chunk schema");
+        let chunk = Chunk::new_with_chunk_schema(batch, chunk_schema);
+
+        let mut arena = ExprArena::default();
+        let p_expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        let o_expr = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), DataType::Int32);
+        let partition_exprs = vec![SortExpression {
+            expr: p_expr,
+            asc: true,
+            nulls_first: true,
+        }];
+        let order_by = vec![SortExpression {
+            expr: o_expr,
+            asc: true,
+            nulls_first: true,
+        }];
+        let arena = Arc::new(arena);
+
+        // KEY ASPECT: use_top_n=true, limit=None, topn_type=Rank, partition_limit=Some(2)
+        let factory = SortProcessorFactory::new_topn(
+            -1,
+            Arc::clone(&arena),
+            order_by,
+            None, // NO global limit — partition-topn is decoupled from global limit
+            0,
+            SortTopNType::Rank, // Rank type — exercises the partition branch precedence
+            None,
+            None,
+            partition_exprs,
+            Some(2), // per-partition cap = 2
+        );
+
+        use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+        let mut op = factory.create(1, 0);
+        let proc = op.as_processor_mut().expect("processor");
+        let state = crate::runtime::runtime_state::RuntimeState::default();
+
+        proc.push_chunk(&state, chunk).expect("push chunk");
+        proc.set_finishing(&state).expect("set finishing");
+
+        let result = proc
+            .pull_chunk(&state)
+            .expect("pull chunk")
+            .expect("non-empty output");
+
+        // Must be exactly 4 rows: top-2 from each of 2 partitions.
+        // Proves it is PER-PARTITION (4), not global (all 6 since limit=None),
+        // and not global top-2 (which would be 2 rows).
+        assert_eq!(
+            result.len(),
+            4,
+            "expected 4 rows (per-partition top-2 with Rank), got {}",
+            result.len()
+        );
+
+        let o_col = result
+            .batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int32 order column");
+        let o_vals: Vec<Option<i32>> = (0..o_col.len())
+            .map(|i| {
+                if o_col.is_null(i) {
+                    None
+                } else {
+                    Some(o_col.value(i))
+                }
+            })
+            .collect();
+
+        // Partition 1 (p=1): Rank top-2 ascending → o=[10,20]
+        // Partition 2 (p=2): Rank top-2 ascending → o=[5,6]
+        assert_eq!(
+            o_vals,
+            vec![Some(10), Some(20), Some(5), Some(6)],
+            "per-partition Rank order values mismatch: {:?}",
+            o_vals
+        );
     }
 
     /// Verify that `build_topn_sorter` selects the partition path when

@@ -9062,4 +9062,91 @@ mod tests {
         assert_eq!(payload.assertion, Some(plan_nodes::TAssertion::LE));
         assert_eq!(payload.subquery_string.as_deref(), Some("select 1"));
     }
+
+    /// Codegen unit test: visit_sort with partition_limit set must emit
+    /// TSortNode with partition_exprs, partition_limit, topn_type, use_top_n=true,
+    /// and NO global limit (node.limit == -1).
+    ///
+    /// This validates Change A of the partition-topn end-to-end contract: the
+    /// codegen layer correctly serializes all three partition-topn fields and
+    /// leaves the global limit untouched.
+    #[test]
+    fn visit_sort_partition_topn_emits_correct_tsortnode_fields() {
+        use tempfile::NamedTempFile;
+
+        let file = NamedTempFile::new().expect("temp parquet path");
+        let output = output_columns();
+
+        // Build a PhysicalSort with partition_limit=Some(2) + Rank topn_type
+        // + analytic_partition_exprs = [id_expr] (the partition key).
+        let plan = physical_node_for_test(
+            Operator::PhysicalSort(PhysicalSortOp {
+                items: vec![SortItem {
+                    expr: id_expr(),
+                    asc: true,
+                    nulls_first: false,
+                }],
+                analytic_partition_exprs: vec![id_expr()],
+                partition_limit: Some(2),
+                topn_type: Some(crate::exec::node::sort::SortTopNType::Rank),
+            }),
+            vec![scan_plan(file.path().to_path_buf())],
+            output,
+        );
+
+        let build =
+            PlanFragmentBuilder::build(&plan, &DummyCatalog, &mock_iceberg_registry(), "default")
+                .expect("build");
+
+        let root = build
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == build.root_fragment_id)
+            .expect("root fragment");
+
+        let sort_plan_node = root
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.node_type == plan_nodes::TPlanNodeType::SORT_NODE)
+            .expect("sort node in root fragment");
+
+        // Global limit must remain -1 (not set) — partition-topn is decoupled
+        // from the global limit mechanism.
+        assert_eq!(
+            sort_plan_node.limit, -1,
+            "partition-topn must NOT set a global limit"
+        );
+
+        let sort = sort_plan_node.sort_node.as_ref().expect("sort payload");
+
+        // use_top_n must be true for partition-topn routing in lowering/exec.
+        assert!(
+            sort.use_top_n,
+            "visit_sort with partition_limit must set use_top_n=true"
+        );
+
+        // partition_limit must be emitted as the per-partition row cap.
+        assert_eq!(
+            sort.partition_limit,
+            Some(2),
+            "partition_limit must be emitted"
+        );
+
+        // topn_type must be RANK.
+        assert_eq!(
+            sort.topn_type,
+            Some(plan_nodes::TTopNType::RANK),
+            "topn_type must be RANK"
+        );
+
+        // partition_exprs must be non-empty (compiled from analytic_partition_exprs).
+        assert!(
+            sort.partition_exprs
+                .as_ref()
+                .map(|v| !v.is_empty())
+                .unwrap_or(false),
+            "partition_exprs must be emitted from analytic_partition_exprs"
+        );
+    }
 }
