@@ -568,6 +568,39 @@ fn distributed_node_ordering(node: &DistributedPlanNode) -> OrderingSpec {
     match &node.body {
         DistributedPlanNodeBody::Sort(sort) => OrderingSpec::from_sort_items(&sort.items),
         DistributedPlanNodeBody::TopN(topn) => OrderingSpec::from_sort_items(&topn.items),
+        DistributedPlanNodeBody::AssertOneRow(_) => node
+            .children
+            .first()
+            .map(distributed_node_ordering)
+            .unwrap_or(OrderingSpec::Any),
+        DistributedPlanNodeBody::Window(window) => {
+            let mut current_ordering = node
+                .children
+                .first()
+                .map(distributed_node_ordering)
+                .unwrap_or(OrderingSpec::Any);
+            let groups = group_win_exprs_by_sig(&window.window_exprs);
+            for group_indices in &groups {
+                let Some(first_idx) = group_indices.first().copied() else {
+                    continue;
+                };
+                let first_win = &window.window_exprs[first_idx];
+                if groups.len() > 1 {
+                    let required_ordering =
+                        window_ordering_spec(&first_win.partition_by, &first_win.order_by);
+                    let has_sort_keys =
+                        !first_win.partition_by.is_empty() || !first_win.order_by.is_empty();
+                    let ordering_is_representable = !matches!(required_ordering, OrderingSpec::Any);
+                    let needs_sort = has_sort_keys
+                        && (!ordering_is_representable
+                            || !current_ordering.satisfies(&required_ordering));
+                    if needs_sort {
+                        current_ordering = required_ordering;
+                    }
+                }
+            }
+            current_ordering
+        }
         _ => OrderingSpec::Any,
     }
 }
@@ -645,16 +678,18 @@ mod tests {
 
     use super::build_distributed_plan;
     use crate::sql::analysis::{
-        BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
+        BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, SortItem, TypedExpr,
     };
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::codegen::ir::DistributedPlanNodeBody;
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
-        Operator, PhysicalFilterOp, PhysicalProjectOp, PhysicalScanOp,
+        Operator, PhysicalAssertOneRowOp, PhysicalFilterOp, PhysicalProjectOp, PhysicalScanOp,
+        PhysicalSortOp, PhysicalWindowOp,
     };
     use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, PlanExecutionProps};
     use crate::sql::optimizer::statistics::Statistics;
+    use crate::sql::planner::plan::WindowExpr;
 
     #[test]
     fn build_distributed_plan_scan_project_shapes_one_fragment() {
@@ -713,6 +748,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn window_pass_one_preserves_child_ordering_through_assert_for_parent_ids() {
+        let physical = project_plan(multi_group_window_plan(assert_one_row_plan(sort_plan(
+            scan_plan(),
+        ))));
+        let dp = build_distributed_plan(&physical).expect("build_distributed_plan");
+        let root = &dp.fragments[0].root;
+
+        assert_eq!(
+            root.node_id, 7,
+            "Project above the window must not be shifted by a phantom pre-window Sort"
+        );
+        assert!(matches!(root.body, DistributedPlanNodeBody::Project(_)));
+        assert_eq!(root.children[0].node_id, 4);
+        assert!(matches!(
+            root.children[0].body,
+            DistributedPlanNodeBody::Window(_)
+        ));
+    }
+
     fn scan_then_project_plan() -> PhysicalPlanNode {
         project_plan(scan_plan())
     }
@@ -723,6 +778,81 @@ mod tests {
 
     fn filter_over_project_plan() -> PhysicalPlanNode {
         filter_plan(project_plan(scan_plan()))
+    }
+
+    fn sort_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
+        let output_columns = child.output_columns.clone();
+        physical_node(
+            Operator::PhysicalSort(PhysicalSortOp {
+                items: vec![SortItem {
+                    expr: column_ref_expr(1, "k", DataType::Int64, false),
+                    asc: true,
+                    nulls_first: false,
+                }],
+                analytic_partition_exprs: vec![],
+            }),
+            vec![child],
+            output_columns,
+        )
+    }
+
+    fn assert_one_row_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
+        let output_columns = child.output_columns.clone();
+        physical_node(
+            Operator::PhysicalAssertOneRow(PhysicalAssertOneRowOp {
+                subquery_text: "select k from t".to_string(),
+            }),
+            vec![child],
+            output_columns,
+        )
+    }
+
+    fn multi_group_window_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
+        let k = output_col(1, "k", DataType::Int64, false);
+        let v = output_col(2, "v", DataType::Int64, true);
+        let rn_by_k = output_col(3, "rn_by_k", DataType::Int64, false);
+        let rn_by_v = output_col(4, "rn_by_v", DataType::Int64, false);
+        physical_node(
+            Operator::PhysicalWindow(PhysicalWindowOp {
+                window_exprs: vec![
+                    WindowExpr {
+                        name: "row_number".to_string(),
+                        args: vec![],
+                        distinct: false,
+                        partition_by: vec![],
+                        order_by: vec![SortItem {
+                            expr: column_ref_expr(1, "k", DataType::Int64, false),
+                            asc: true,
+                            nulls_first: false,
+                        }],
+                        window_frame: None,
+                        result_type: DataType::Int64,
+                        output_name: rn_by_k.name.clone(),
+                        output_column_id: rn_by_k.column_id,
+                        ignore_nulls: false,
+                    },
+                    WindowExpr {
+                        name: "row_number".to_string(),
+                        args: vec![],
+                        distinct: false,
+                        partition_by: vec![],
+                        order_by: vec![SortItem {
+                            expr: column_ref_expr(2, "v", DataType::Int64, true),
+                            asc: true,
+                            nulls_first: false,
+                        }],
+                        window_frame: None,
+                        result_type: DataType::Int64,
+                        output_name: rn_by_v.name.clone(),
+                        output_column_id: rn_by_v.column_id,
+                        ignore_nulls: false,
+                    },
+                ],
+                output_columns: vec![k.clone(), v.clone(), rn_by_k.clone(), rn_by_v.clone()],
+            }),
+            vec![child],
+            vec![k, v, rn_by_k, rn_by_v],
+        )
     }
 
     fn scan_plan() -> PhysicalPlanNode {
