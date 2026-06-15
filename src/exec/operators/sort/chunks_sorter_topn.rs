@@ -213,6 +213,49 @@ pub(crate) fn sort_chunks_dense_rank(
     Ok(Some(sorted.slice(0, cutoff)))
 }
 
+/// Per-partition rank-TopN sorter.
+///
+/// Groups input rows by `partition_exprs`, then within each group keeps the top
+/// `partition_limit` rows according to `topn_type` and `order_by`.
+pub(crate) struct ChunksSorterPartitionTopN {
+    arena: Arc<ExprArena>,
+    partition_exprs: Vec<SortExpression>,
+    order_by: Vec<SortExpression>,
+    topn_type: SortTopNType,
+    partition_limit: usize,
+}
+
+impl ChunksSorterPartitionTopN {
+    pub(crate) fn new(
+        arena: Arc<ExprArena>,
+        partition_exprs: Vec<SortExpression>,
+        order_by: Vec<SortExpression>,
+        topn_type: SortTopNType,
+        partition_limit: usize,
+    ) -> Self {
+        Self {
+            arena,
+            partition_exprs,
+            order_by,
+            topn_type,
+            partition_limit,
+        }
+    }
+}
+
+impl ChunksSorter for ChunksSorterPartitionTopN {
+    fn sort_chunks(&self, chunks: &[Chunk]) -> Result<Option<Chunk>, String> {
+        sort_chunks_partition_topn(
+            self.arena.as_ref(),
+            &self.partition_exprs,
+            &self.order_by,
+            self.topn_type,
+            self.partition_limit,
+            chunks,
+        )
+    }
+}
+
 /// Topn sorter implementation that supports ROW_NUMBER, RANK and DENSE_RANK modes.
 pub(crate) struct ChunksSorterTopN {
     arena: Arc<ExprArena>,

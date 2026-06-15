@@ -127,6 +127,8 @@ pub(crate) fn lower_sort_node(
                 topn_type,
                 max_buffered_rows,
                 max_buffered_bytes,
+                partition_exprs: Vec::new(),
+                partition_limit: None,
             }),
         },
         layout: sort_output_layout,

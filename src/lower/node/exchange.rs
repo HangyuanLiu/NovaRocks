@@ -136,6 +136,8 @@ pub(crate) fn lower_exchange_node(
                         topn_type: SortTopNType::RowNumber,
                         max_buffered_rows: None,
                         max_buffered_bytes: None,
+                        partition_exprs: Vec::new(),
+                        partition_limit: None,
                     }),
                 };
             } else if node.limit >= 0 || offset > 0 {
