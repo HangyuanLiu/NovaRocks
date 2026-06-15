@@ -1,8 +1,8 @@
-# PlanNode IR — M0 Slice 1 (Scan / Filter / Project) Implementation Plan
+# DistributedPlan IR — M0 Slice 1 (Scan / Filter / Project) Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Introduce the owned `PlanNode`/`PlanFragment` IR and a parallel `build_via_ir` path that lowers Scan/Filter/Project through a two-pass `build_ir` (structure) + `lower_fragmented` (binding), producing a `MultiFragmentBuildResult` provably equivalent to today's `PlanFragmentBuilder::build` for those operators.
+**Goal:** Introduce the owned `DistributedPlanNode`/`PlanFragment` IR and a parallel `build_via_distributed_plan` path that lowers Scan/Filter/Project through a two-pass `build_distributed_plan` (structure) + `lower_distributed_plan` (binding), producing a `MultiFragmentBuildResult` provably equivalent to today's `PlanFragmentBuilder::build` for those operators.
 
 **Architecture:** Spec `docs/superpowers/specs/2026-06-15-plannode-ir-explain-observability-design.md`. This slice is the foundation of milestone **M0** (behavior-preserving IR introduction). It does **not** change the execution path: the engine keeps calling the old `build`; the new path runs only inside equivalence tests. Strategy = **extract-and-share**: each operator's lowering core moves out of `visit_*` into a `LoweringCtx` method that both the old builder and the new Pass-2 call, so Pass-2 behavior is identical by construction.
 
@@ -23,14 +23,14 @@
 ## File Structure
 
 - **Create** `src/sql/codegen/ir/mod.rs` — IR module root, re-exports.
-- **Create** `src/sql/codegen/ir/node.rs` — `PlanNode`, `PlanNodeStats`, `PlanNodeBody` (Scan/Project variants this slice; more variants added by later slices).
+- **Create** `src/sql/codegen/ir/node.rs` — `DistributedPlanNode`, `PlanNodeStats`, `DistributedPlanNodeBody` (Scan/Project variants this slice; more variants added by later slices).
 - **Create** `src/sql/codegen/ir/body.rs` — `ScanBody`, `ProjectBody`.
-- **Create** `src/sql/codegen/ir/fragment.rs` — `PlanFragment`, `FragmentedPlan`, `DataSink`, `DataPartition`, `PartitionKind`.
-- **Create** `src/sql/codegen/ir/build.rs` — Pass 1 `build_ir` (PhysicalPlanNode → FragmentedPlan) for Scan/Filter/Project.
-- **Create** `src/sql/codegen/ir/lowering.rs` — `LoweringCtx` + Pass 2 `lower_fragmented` (FragmentedPlan → MultiFragmentBuildResult) + the extracted `lower_scan`/`lower_project` cores.
+- **Create** `src/sql/codegen/ir/fragment.rs` — `PlanFragment`, `DistributedPlan`, `DataSink`, `DataPartition`, `PartitionKind`.
+- **Create** `src/sql/codegen/ir/build.rs` — Pass 1 `build_distributed_plan` (PhysicalPlanNode → DistributedPlan) for Scan/Filter/Project.
+- **Create** `src/sql/codegen/ir/lowering.rs` — `LoweringCtx` + Pass 2 `lower_distributed_plan` (DistributedPlan → MultiFragmentBuildResult) + the extracted `lower_scan`/`lower_project` cores.
 - **Create** `src/sql/codegen/ir/equiv.rs` — `#[cfg(test)]` canonicalization + equivalence assertion helpers.
 - **Modify** `src/sql/codegen/mod.rs` — `pub(crate) mod ir;`.
-- **Modify** `src/sql/codegen/fragment_builder.rs` — extract `lower_scan`/`lower_project` cores onto `LoweringCtx`; `visit_scan`/`visit_project` delegate to them (behavior unchanged). Add `pub(crate) fn build_via_ir(...)`.
+- **Modify** `src/sql/codegen/fragment_builder.rs` — extract `lower_scan`/`lower_project` cores onto `LoweringCtx`; `visit_scan`/`visit_project` delegate to them (behavior unchanged). Add `pub(crate) fn build_via_distributed_plan(...)`.
 
 The two passes are deliberately split into `build.rs` and `lowering.rs` so each file has one responsibility and stays small.
 
@@ -53,7 +53,7 @@ pub(crate) mod ir;
 - [ ] **Step 2: Write `ir/mod.rs`**
 
 ```rust
-//! Owned PlanNode/PlanFragment IR (spec 2026-06-15-plannode-ir-explain-observability).
+//! Owned DistributedPlanNode/PlanFragment IR (spec 2026-06-15-plannode-ir-explain-observability).
 //! Single source from which both EXPLAIN and thrift derive. This slice covers
 //! Scan/Filter/Project; later slices add the remaining operators.
 
@@ -66,10 +66,10 @@ pub(crate) mod node;
 #[cfg(test)]
 pub(crate) mod equiv;
 
-pub(crate) use build::build_ir;
-pub(crate) use fragment::{DataPartition, DataSink, FragmentedPlan, PartitionKind, PlanFragment};
-pub(crate) use lowering::lower_fragmented;
-pub(crate) use node::{PlanNode, PlanNodeBody, PlanNodeStats};
+pub(crate) use build::build_distributed_plan;
+pub(crate) use fragment::{DataPartition, DataSink, DistributedPlan, PartitionKind, PlanFragment};
+pub(crate) use lowering::lower_distributed_plan;
+pub(crate) use node::{DistributedPlanNode, DistributedPlanNodeBody, PlanNodeStats};
 
 pub(crate) type FragmentId = u32;
 ```
@@ -101,9 +101,9 @@ impl PlanNodeStats {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct PlanNode {
+pub(crate) struct DistributedPlanNode {
     /// Allocated once in Pass 1; never reallocated. In a thrift-lowered
-    /// fragment every PlanNode produces exactly one TPlanNode, so
+    /// fragment every DistributedPlanNode produces exactly one TPlanNode, so
     /// `node_id == TPlanNode.node_id == profile plan_node_id`.
     pub node_id: i32,
     pub fragment_id: FragmentId,
@@ -113,15 +113,15 @@ pub(crate) struct PlanNode {
     pub nullable_tuple_ids: Vec<i32>,
     /// -1 == no limit.
     pub limit: i64,
-    pub children: Vec<PlanNode>,
+    pub children: Vec<DistributedPlanNode>,
     pub stats: PlanNodeStats,
-    pub body: PlanNodeBody,
+    pub body: DistributedPlanNodeBody,
 }
 
 /// Operator-specific payload. Grows one variant per operator as slices land.
 /// Filter has no variant: its predicate folds into the child's `ScanBody.predicates`.
 #[derive(Clone, Debug)]
-pub(crate) enum PlanNodeBody {
+pub(crate) enum DistributedPlanNodeBody {
     Scan(Box<ScanBody>),
     Project(ProjectBody),
 }
@@ -143,7 +143,7 @@ pub(crate) struct ScanBody {
     pub table: TableDef,
     pub alias: Option<String>,
     pub columns: Vec<crate::sql::analysis::OutputColumn>,
-    /// Scan predicates plus any folded Filter conjuncts (see build_ir filter handling).
+    /// Scan predicates plus any folded Filter conjuncts (see build_distributed_plan filter handling).
     pub predicates: Vec<TypedExpr>,
     pub required_columns: Option<Vec<String>>,
     pub dict_columns: Vec<ScanDictionaryColumn>,
@@ -166,7 +166,7 @@ pub(crate) struct ProjectBody {
 use crate::sql::analysis::{OutputColumn, TypedExpr};
 
 use super::FragmentId;
-use super::node::PlanNode;
+use super::node::DistributedPlanNode;
 
 #[derive(Clone, Debug)]
 pub(crate) enum PartitionKind {
@@ -198,7 +198,7 @@ pub(crate) enum DataSink {
 #[derive(Clone, Debug)]
 pub(crate) struct PlanFragment {
     pub fragment_id: FragmentId,
-    pub root: PlanNode,
+    pub root: DistributedPlanNode,
     pub data_partition: DataPartition,
     pub output_partition: DataPartition,
     pub sink: DataSink,
@@ -207,7 +207,7 @@ pub(crate) struct PlanFragment {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct FragmentedPlan {
+pub(crate) struct DistributedPlan {
     pub fragments: Vec<PlanFragment>,
     pub root_fragment_id: FragmentId,
 }
@@ -239,7 +239,7 @@ Expected: compiles; the one test PASSES. (Unused-field warnings on IR types are 
 
 ```bash
 git add src/sql/codegen/ir/ src/sql/codegen/mod.rs
-git commit -m "codegen/ir: add PlanNode/PlanFragment IR core types (scan/project slice)"
+git commit -m "codegen/ir: add DistributedPlanNode/PlanFragment IR core types (scan/project slice)"
 ```
 
 ---
@@ -333,7 +333,7 @@ fn visit_scan(
 
 For this to compile, `PlanFragmentBuilder` must expose its mutable state as a `LoweringCtx`. Simplest path: give `PlanFragmentBuilder` a `fn lowering_ctx(&mut self) -> LoweringCtx<'_>` that borrows its existing fields into a `LoweringCtx`. Because both structs hold the *same* `Rc<RefCell<i32>>` slot allocator and move the `DescriptorTableBuilder`/`scan_tables` by `&mut`, allocations stay shared.
 
-> Note: borrowing several disjoint fields of `PlanFragmentBuilder` into a `LoweringCtx` requires a struct-of-references form, or making `LoweringCtx` borrow `&mut PlanFragmentBuilder` directly. If the borrow checker fights the disjoint-field approach, define `LoweringCtx` over `&mut PlanFragmentBuilder` for now (it owns all the fields) and move to owned state in Task 4 where `lower_fragmented` constructs a standalone `LoweringCtx`. Pick whichever compiles cleanly; the cores' bodies are identical either way.
+> Note: borrowing several disjoint fields of `PlanFragmentBuilder` into a `LoweringCtx` requires a struct-of-references form, or making `LoweringCtx` borrow `&mut PlanFragmentBuilder` directly. If the borrow checker fights the disjoint-field approach, define `LoweringCtx` over `&mut PlanFragmentBuilder` for now (it owns all the fields) and move to owned state in Task 4 where `lower_distributed_plan` constructs a standalone `LoweringCtx`. Pick whichever compiles cleanly; the cores' bodies are identical either way.
 
 - [ ] **Step 4: Move the project body into `LoweringCtx::lower_project`**
 
@@ -394,11 +394,11 @@ git commit -m "codegen/ir: extract lower_scan/lower_project cores; visit_* deleg
 
 ---
 
-## Task 3: Pass 1 — `build_ir` for Scan/Filter/Project
+## Task 3: Pass 1 — `build_distributed_plan` for Scan/Filter/Project
 
 **Files:** `src/sql/codegen/ir/build.rs`
 
-Pass 1 walks `PhysicalPlanNode`, allocates `node_id`/`fragment_id`/`tuple_id` (NOT slots), translates ops into IR bodies, and folds Filter into the child scan's `predicates`. It produces a single-fragment `FragmentedPlan` (this slice has no exchange).
+Pass 1 walks `PhysicalPlanNode`, allocates `node_id`/`fragment_id`/`tuple_id` (NOT slots), translates ops into IR bodies, and folds Filter into the child scan's `predicates`. It produces a single-fragment `DistributedPlan` (this slice has no exchange).
 
 - [ ] **Step 1: Write the failing test (hand-built scan→project plan)**
 
@@ -408,49 +408,49 @@ Add `#[cfg(test)] mod tests` in `ir/build.rs`. Reuse the test construction patte
 #[test]
 fn build_ir_scan_project_shapes_one_fragment() {
     let physical = scan_then_project_plan(); // helper: Project over Scan, hand-built
-    let fp = build_ir(&physical).expect("build_ir");
+    let fp = build_distributed_plan(&physical).expect("build_distributed_plan");
     assert_eq!(fp.fragments.len(), 1);
     let root = &fp.fragments[0].root;
     // node ids allocated top-down from 1: project=1, scan=2 (mirrors alloc_node order)
-    assert!(matches!(root.body, crate::sql::codegen::ir::PlanNodeBody::Project(_)));
+    assert!(matches!(root.body, crate::sql::codegen::ir::DistributedPlanNodeBody::Project(_)));
     assert_eq!(root.children.len(), 1);
-    assert!(matches!(root.children[0].body, crate::sql::codegen::ir::PlanNodeBody::Scan(_)));
+    assert!(matches!(root.children[0].body, crate::sql::codegen::ir::DistributedPlanNodeBody::Scan(_)));
 }
 ```
 
 - [ ] **Step 2: Run it to confirm it fails**
 
 Run: `cargo test --lib sql::codegen::ir::build`
-Expected: FAIL — `build_ir` not yet implemented / `scan_then_project_plan` undefined.
+Expected: FAIL — `build_distributed_plan` not yet implemented / `scan_then_project_plan` undefined.
 
-- [ ] **Step 3: Implement `build_ir`**
+- [ ] **Step 3: Implement `build_distributed_plan`**
 
 ```rust
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
 
 use super::body::{ProjectBody, ScanBody};
-use super::fragment::{DataPartition, DataSink, FragmentedPlan, PlanFragment};
-use super::node::{PlanNode, PlanNodeBody, PlanNodeStats};
+use super::fragment::{DataPartition, DataSink, DistributedPlan, PlanFragment};
+use super::node::{DistributedPlanNode, DistributedPlanNodeBody, PlanNodeStats};
 use super::FragmentId;
 
-struct IrBuilder {
+struct DistributedPlanBuilder {
     next_node_id: i32,
     next_tuple_id: i32,
 }
 
-impl IrBuilder {
+impl DistributedPlanBuilder {
     fn alloc_node(&mut self) -> i32 { let id = self.next_node_id; self.next_node_id += 1; id }
     fn alloc_tuple(&mut self) -> i32 { let id = self.next_tuple_id; self.next_tuple_id += 1; id }
 
     /// Returns the IR subtree root for this physical node. Filter returns its
     /// child's subtree after folding the predicate (no node of its own).
-    fn visit(&mut self, node: &PhysicalPlanNode, fragment_id: FragmentId) -> Result<PlanNode, String> {
+    fn visit(&mut self, node: &PhysicalPlanNode, fragment_id: FragmentId) -> Result<DistributedPlanNode, String> {
         match &node.op {
             Operator::PhysicalScan(op) => {
                 let node_id = self.alloc_node();
                 let tuple_id = self.alloc_tuple();
-                Ok(PlanNode {
+                Ok(DistributedPlanNode {
                     node_id,
                     fragment_id,
                     tuple_ids: vec![tuple_id],
@@ -458,7 +458,7 @@ impl IrBuilder {
                     limit: -1,
                     children: vec![],
                     stats: PlanNodeStats::from_statistics(&node.stats),
-                    body: PlanNodeBody::Scan(Box::new(ScanBody {
+                    body: DistributedPlanNodeBody::Scan(Box::new(ScanBody {
                         database: op.database.clone(),
                         table: op.table.clone(),
                         alias: op.alias.clone(),
@@ -485,7 +485,7 @@ impl IrBuilder {
                 let child = self.visit(&node.children[0], fragment_id)?;
                 let node_id = self.alloc_node();
                 let tuple_id = self.alloc_tuple();
-                Ok(PlanNode {
+                Ok(DistributedPlanNode {
                     node_id,
                     fragment_id,
                     tuple_ids: vec![tuple_id],
@@ -493,20 +493,20 @@ impl IrBuilder {
                     limit: -1,
                     children: vec![child],
                     stats: PlanNodeStats::from_statistics(&node.stats),
-                    body: PlanNodeBody::Project(ProjectBody {
+                    body: DistributedPlanNodeBody::Project(ProjectBody {
                         items: op.items.clone(),
                         output_qualifier: op.output_qualifier.clone(),
                     }),
                 })
             }
-            other => Err(format!("build_ir slice 1 does not handle operator {other:?}")),
+            other => Err(format!("build_distributed_plan slice 1 does not handle operator {other:?}")),
         }
     }
 }
 
 /// Append the filter's AND-split conjuncts to the child scan's `predicates`.
 /// Mirrors visit_filter, which pushes filter conjuncts onto the scan node.
-fn fold_filter_into_scan(child: &mut PlanNode, predicate: &crate::sql::analysis::TypedExpr) -> Result<(), String> {
+fn fold_filter_into_scan(child: &mut DistributedPlanNode, predicate: &crate::sql::analysis::TypedExpr) -> Result<(), String> {
     use crate::sql::codegen::helpers::split_and_conjuncts_typed;
     let target = scan_body_mut(child)
         .ok_or_else(|| "slice 1: Filter child is not a Scan".to_string())?;
@@ -516,15 +516,15 @@ fn fold_filter_into_scan(child: &mut PlanNode, predicate: &crate::sql::analysis:
     Ok(())
 }
 
-fn scan_body_mut(node: &mut PlanNode) -> Option<&mut ScanBody> {
+fn scan_body_mut(node: &mut DistributedPlanNode) -> Option<&mut ScanBody> {
     match &mut node.body {
-        PlanNodeBody::Scan(b) => Some(b),
+        DistributedPlanNodeBody::Scan(b) => Some(b),
         _ => node.children.first_mut().and_then(scan_body_mut),
     }
 }
 
-pub(crate) fn build_ir(plan: &PhysicalPlanNode) -> Result<FragmentedPlan, String> {
-    let mut b = IrBuilder { next_node_id: 1, next_tuple_id: 1 };
+pub(crate) fn build_distributed_plan(plan: &PhysicalPlanNode) -> Result<DistributedPlan, String> {
+    let mut b = DistributedPlanBuilder { next_node_id: 1, next_tuple_id: 1 };
     let root_fragment_id: FragmentId = 0;
     let root = b.visit(plan, root_fragment_id)?;
     let fragment = PlanFragment {
@@ -536,7 +536,7 @@ pub(crate) fn build_ir(plan: &PhysicalPlanNode) -> Result<FragmentedPlan, String
         output_exprs: None,
         output_columns: plan.output_columns.clone(),
     };
-    Ok(FragmentedPlan { fragments: vec![fragment], root_fragment_id })
+    Ok(DistributedPlan { fragments: vec![fragment], root_fragment_id })
 }
 ```
 
@@ -551,16 +551,16 @@ Expected: PASS.
 
 ```bash
 git add src/sql/codegen/ir/build.rs
-git commit -m "codegen/ir: Pass 1 build_ir for scan/filter/project"
+git commit -m "codegen/ir: Pass 1 build_distributed_plan for scan/filter/project"
 ```
 
 ---
 
-## Task 4: Pass 2 — `lower_fragmented` + `build_via_ir`
+## Task 4: Pass 2 — `lower_distributed_plan` + `build_via_distributed_plan`
 
-**Files:** `src/sql/codegen/ir/lowering.rs`; `src/sql/codegen/fragment_builder.rs` (add `build_via_ir`)
+**Files:** `src/sql/codegen/ir/lowering.rs`; `src/sql/codegen/fragment_builder.rs` (add `build_via_distributed_plan`)
 
-Pass 2 walks the `FragmentedPlan`, calls the extracted `lower_scan`/`lower_project` cores (children-first) to allocate slots/build desc_tbl/compile exprs, then assembles a `MultiFragmentBuildResult` identical in shape to `build_with_mv_refresh_ctx`'s single-fragment output (`fragment_builder.rs:873-941`).
+Pass 2 walks the `DistributedPlan`, calls the extracted `lower_scan`/`lower_project` cores (children-first) to allocate slots/build desc_tbl/compile exprs, then assembles a `MultiFragmentBuildResult` identical in shape to `build_with_mv_refresh_ctx`'s single-fragment output (`fragment_builder.rs:873-941`).
 
 - [ ] **Step 1: Write `lower_node` (DFS, children-first)**
 
@@ -570,17 +570,17 @@ impl<'a> LoweringCtx<'a> {
     /// returning (pre_order_nodes, output_scope, output_columns).
     fn lower_node(
         &mut self,
-        node: &super::node::PlanNode,
+        node: &super::node::DistributedPlanNode,
     ) -> Result<(Vec<crate::plan_nodes::TPlanNode>, crate::sql::codegen::resolve::ExprScope, Vec<crate::sql::analysis::OutputColumn>), String> {
         match &node.body {
-            super::node::PlanNodeBody::Scan(scan) => {
+            super::node::DistributedPlanNodeBody::Scan(scan) => {
                 let op = scan_body_to_op(scan); // reconstruct PhysicalScanOp view for the core
                 let (tnode, scope) =
                     self.lower_scan(node.node_id, node.tuple_ids[0], &op)?;
                 let out_cols = op.columns.clone();
                 Ok((vec![tnode], scope, out_cols))
             }
-            super::node::PlanNodeBody::Project(proj) => {
+            super::node::DistributedPlanNodeBody::Project(proj) => {
                 let child = &node.children[0];
                 let (mut child_nodes, child_scope, _child_cols) = self.lower_node(child)?;
                 let op = project_body_to_op(proj);
@@ -595,20 +595,20 @@ impl<'a> LoweringCtx<'a> {
 }
 ```
 
-> `scan_body_to_op`/`project_body_to_op` build a `PhysicalScanOp`/`PhysicalProjectOp` from the IR body (the inverse of build_ir's clone). Since the cores were written against the op types in Task 2, this keeps the cores untouched. (A later cleanup can change the cores to take `&ScanBody` directly and delete these adapters — out of scope for slice 1.)
+> `scan_body_to_op`/`project_body_to_op` build a `PhysicalScanOp`/`PhysicalProjectOp` from the IR body (the inverse of build_distributed_plan's clone). Since the cores were written against the op types in Task 2, this keeps the cores untouched. (A later cleanup can change the cores to take `&ScanBody` directly and delete these adapters — out of scope for slice 1.)
 
-- [ ] **Step 2: Write `lower_fragmented` assembling the result**
+- [ ] **Step 2: Write `lower_distributed_plan` assembling the result**
 
 Mirror the assembly at `fragment_builder.rs:873-941` exactly (root fragment, shared `desc_tbl`, `exec_params`, result sink, output exprs/columns, boundary schema). Reuse `nodes::build_exec_params_multi_with_refresh_context`, `build_result_sink`, `result_root_boundary_schema_report`, `result_output_exprs_for_columns`, `output_columns_for_boundary`.
 
 ```rust
-pub(crate) fn lower_fragmented(
-    fp: &super::fragment::FragmentedPlan,
+pub(crate) fn lower_distributed_plan(
+    fp: &super::fragment::DistributedPlan,
     catalog: &dyn crate::sql::catalog::CatalogProvider,
     connectors: &crate::connector::ConnectorRegistry,
 ) -> Result<crate::sql::codegen::MultiFragmentBuildResult, String> {
     let root = fp.fragments.iter().find(|f| f.fragment_id == fp.root_fragment_id)
-        .ok_or("lower_fragmented: missing root fragment")?;
+        .ok_or("lower_distributed_plan: missing root fragment")?;
     let mut ctx = LoweringCtx {
         catalog,
         connectors,
@@ -631,32 +631,32 @@ pub(crate) fn lower_fragmented(
 }
 ```
 
-- [ ] **Step 3: Add `build_via_ir` on `PlanFragmentBuilder`**
+- [ ] **Step 3: Add `build_via_distributed_plan` on `PlanFragmentBuilder`**
 
 ```rust
 // fragment_builder.rs
 impl<'a> PlanFragmentBuilder<'a> {
-    /// Slice-1 IR path: build_ir + lower_fragmented. Parallel to `build`;
+    /// Slice-1 IR path: build_distributed_plan + lower_distributed_plan. Parallel to `build`;
     /// used only by equivalence tests until M0 cutover.
-    pub(crate) fn build_via_ir(
+    pub(crate) fn build_via_distributed_plan(
         plan: &PhysicalPlanNode,
         catalog: &'a dyn CatalogProvider,
         connectors: &'a crate::connector::ConnectorRegistry,
         _current_database: &str,
     ) -> Result<MultiFragmentBuildResult, String> {
-        let fp = crate::sql::codegen::ir::build_ir(plan)?;
-        crate::sql::codegen::ir::lower_fragmented(&fp, catalog, connectors)
+        let fp = crate::sql::codegen::ir::build_distributed_plan(plan)?;
+        crate::sql::codegen::ir::lower_distributed_plan(&fp, catalog, connectors)
     }
 }
 ```
 
-- [ ] **Step 4: Unit test — `build_via_ir` produces a scan node**
+- [ ] **Step 4: Unit test — `build_via_distributed_plan` produces a scan node**
 
 ```rust
 #[test]
 fn build_via_ir_lowers_scan_project_to_thrift() {
     let physical = scan_then_project_plan();
-    let build = PlanFragmentBuilder::build_via_ir(&physical, &DummyCatalog, &ConnectorRegistry::new(), "default").expect("build_via_ir");
+    let build = PlanFragmentBuilder::build_via_distributed_plan(&physical, &DummyCatalog, &ConnectorRegistry::new(), "default").expect("build_via_distributed_plan");
     let root = build.fragment_results.iter().find(|f| f.fragment_id == build.root_fragment_id).unwrap();
     assert!(root.plan.nodes.iter().any(|n| n.node_type == plan_nodes::TPlanNodeType::PROJECT_NODE));
     assert!(root.plan.nodes.iter().any(|n| matches!(n.node_type,
@@ -671,7 +671,7 @@ Expected: PASS.
 
 ```bash
 git add src/sql/codegen/ir/lowering.rs src/sql/codegen/fragment_builder.rs
-git commit -m "codegen/ir: Pass 2 lower_fragmented + build_via_ir (scan/project slice)"
+git commit -m "codegen/ir: Pass 2 lower_distributed_plan + build_via_distributed_plan (scan/project slice)"
 ```
 
 ---
@@ -685,7 +685,7 @@ Prove the IR path matches the old builder for scan/filter/project. Because thrif
 - [ ] **Step 1: Write the canonicalizer**
 
 ```rust
-//! Test-only equivalence checks between the old `build` and new `build_via_ir`.
+//! Test-only equivalence checks between the old `build` and new `build_via_distributed_plan`.
 use crate::plan_nodes::TPlan;
 
 /// Relabel node ids by first occurrence in pre-order so two structurally-equal
@@ -703,7 +703,7 @@ fn canonical_node_ids(plan: &TPlan) -> Vec<i32> {
 fn ir_path_matches_old_builder_scan_filter_project() {
     for physical in [scan_plan(), scan_filter_plan(), scan_then_project_plan(), scan_filter_project_plan()] {
         let old = PlanFragmentBuilder::build(&physical, &DummyCatalog, &ConnectorRegistry::new(), "default").unwrap();
-        let new = PlanFragmentBuilder::build_via_ir(&physical, &DummyCatalog, &ConnectorRegistry::new(), "default").unwrap();
+        let new = PlanFragmentBuilder::build_via_distributed_plan(&physical, &DummyCatalog, &ConnectorRegistry::new(), "default").unwrap();
         let oroot = old.fragment_results.iter().find(|f| f.fragment_id == old.root_fragment_id).unwrap();
         let nroot = new.fragment_results.iter().find(|f| f.fragment_id == new.root_fragment_id).unwrap();
         assert_eq!(oroot.plan, nroot.plan, "thrift TPlan must match for {physical:?}");
@@ -718,7 +718,7 @@ fn ir_path_matches_old_builder_scan_filter_project() {
 - [ ] **Step 3: Run the equivalence tests**
 
 Run: `cargo test --lib sql::codegen::ir::equiv`
-Expected: PASS. If `plan` inequality appears, diff the two `TPlan`s (they `Debug`-print) to find where the IR path diverges; the most likely cause is id allocation order — fix by matching `build_ir`'s alloc order to the old visitor's (node before tuple, parent before child), not by loosening the assertion.
+Expected: PASS. If `plan` inequality appears, diff the two `TPlan`s (they `Debug`-print) to find where the IR path diverges; the most likely cause is id allocation order — fix by matching `build_distributed_plan`'s alloc order to the old visitor's (node before tuple, parent before child), not by loosening the assertion.
 
 - [ ] **Step 4: Run the full codegen suite to confirm no regression**
 
@@ -729,14 +729,14 @@ Expected: PASS (old fragment_builder tests + new ir tests).
 
 ```bash
 git add src/sql/codegen/ir/equiv.rs
-git commit -m "codegen/ir: equivalence harness proving build_via_ir == build for scan/filter/project"
+git commit -m "codegen/ir: equivalence harness proving build_via_distributed_plan == build for scan/filter/project"
 ```
 
 ---
 
 ## Self-review notes (carried into later slices)
 
-- **Scope covered vs spec M0-S1/S2:** IR core types (subset), extract-and-share cores, build_ir + lower_fragmented + build_via_ir for Scan/Filter/Project, equivalence harness. The engine cutover/flag (spec M0-S6) and the remaining operator slices (Sort/Agg, Joins/SetOps, Fragmentation) are **out of scope** for this plan and get their own plans.
-- **No runtime flag this slice:** the engine keeps calling old `build`; `build_via_ir` runs only in tests. This is deliberate — cutover is a later, separately-verified slice.
-- **`scan_body_to_op`/`project_body_to_op` adapters** are interim. Once all slices land, the cores should take `&ScanBody`/`&ProjectBody` directly and the adapters + the op clones in `build_ir` collapse. Tracked as cleanup, not this slice.
+- **Scope covered vs spec M0-S1/S2:** IR core types (subset), extract-and-share cores, build_distributed_plan + lower_distributed_plan + build_via_distributed_plan for Scan/Filter/Project, equivalence harness. The engine cutover/flag (spec M0-S6) and the remaining operator slices (Sort/Agg, Joins/SetOps, Fragmentation) are **out of scope** for this plan and get their own plans.
+- **No runtime flag this slice:** the engine keeps calling old `build`; `build_via_distributed_plan` runs only in tests. This is deliberate — cutover is a later, separately-verified slice.
+- **`scan_body_to_op`/`project_body_to_op` adapters** are interim. Once all slices land, the cores should take `&ScanBody`/`&ProjectBody` directly and the adapters + the op clones in `build_distributed_plan` collapse. Tracked as cleanup, not this slice.
 - **Borrow-checker fallback** (Task 2 Step 3): if disjoint-field borrowing of `PlanFragmentBuilder` into `LoweringCtx` is awkward, make `LoweringCtx` wrap `&mut PlanFragmentBuilder`. Either compiles; the core bodies are identical.
