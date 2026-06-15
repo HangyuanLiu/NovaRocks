@@ -120,8 +120,8 @@ pub(crate) fn inline_single_use_ctes(
             input: Box::new(inline_single_use_ctes(*node.input, ctx)?),
             items: node.items,
             analytic_partition_by: node.analytic_partition_by,
-            partition_limit: None,
-            topn_type: None,
+            partition_limit: node.partition_limit,
+            topn_type: node.topn_type,
             required_output_columns: node.required_output_columns,
         })),
         LogicalPlan::Limit(node) => Ok(LogicalPlan::Limit(LimitNode {
@@ -294,8 +294,8 @@ fn replace_cte_consume(
             input: Box::new(replace_cte_consume(*node.input, cte_id, replacement)?),
             items: node.items,
             analytic_partition_by: node.analytic_partition_by,
-            partition_limit: None,
-            topn_type: None,
+            partition_limit: node.partition_limit,
+            topn_type: node.topn_type,
             required_output_columns: node.required_output_columns,
         })),
         LogicalPlan::Limit(node) => Ok(LogicalPlan::Limit(LimitNode {
