@@ -105,19 +105,12 @@ fn fold_filter_into_scan(
     node: &mut DistributedPlanNode,
     predicate: &TypedExpr,
 ) -> Result<(), String> {
-    if let DistributedPlanNodeBody::Scan(scan) = &mut node.body {
-        scan.predicates
-            .extend(split_and_conjuncts_typed(predicate).into_iter().cloned());
-        return Ok(());
-    }
-
-    for child in &mut node.children {
-        if fold_filter_into_scan(child, predicate).is_ok() {
-            return Ok(());
-        }
-    }
-
-    Err("build_distributed_plan slice 1: Filter child is not a Scan".to_string())
+    let DistributedPlanNodeBody::Scan(scan) = &mut node.body else {
+        return Err("build_distributed_plan slice 1: Filter child is not a Scan".to_string());
+    };
+    scan.predicates
+        .extend(split_and_conjuncts_typed(predicate).into_iter().cloned());
+    Ok(())
 }
 
 pub(crate) fn build_distributed_plan(plan: &PhysicalPlanNode) -> Result<DistributedPlan, String> {
@@ -166,8 +159,12 @@ mod tests {
         assert_eq!(dp.fragments.len(), 1);
         assert_eq!(dp.root_fragment_id, 0);
         let root = &dp.fragments[0].root;
+        assert_eq!(root.node_id, 2);
+        assert_eq!(root.tuple_ids, vec![2]);
         assert!(matches!(root.body, DistributedPlanNodeBody::Project(_)));
         assert_eq!(root.children.len(), 1);
+        assert_eq!(root.children[0].node_id, 1);
+        assert_eq!(root.children[0].tuple_ids, vec![1]);
         assert!(matches!(
             root.children[0].body,
             DistributedPlanNodeBody::Scan(_)
@@ -183,7 +180,20 @@ mod tests {
         let DistributedPlanNodeBody::Scan(scan) = &root.children[0].body else {
             panic!("project child should be scan");
         };
-        assert_eq!(scan.predicates.len(), 2);
+        assert_eq!(scan.predicates.len(), 3);
+        assert_binary_predicate(&scan.predicates[0], "k", BinOp::Eq, 7);
+        assert_binary_predicate(&scan.predicates[1], "k", BinOp::Gt, 10);
+        assert_binary_predicate(&scan.predicates[2], "v", BinOp::Lt, 20);
+    }
+
+    #[test]
+    fn build_distributed_plan_rejects_filter_over_project() {
+        let physical = filter_over_project_plan();
+        let err = build_distributed_plan(&physical).expect_err("filter over project should fail");
+        assert_eq!(
+            err,
+            "build_distributed_plan slice 1: Filter child is not a Scan"
+        );
     }
 
     fn scan_then_project_plan() -> PhysicalPlanNode {
@@ -192,6 +202,10 @@ mod tests {
 
     fn filter_then_project_plan() -> PhysicalPlanNode {
         project_plan(filter_plan(scan_plan()))
+    }
+
+    fn filter_over_project_plan() -> PhysicalPlanNode {
+        filter_plan(project_plan(scan_plan()))
     }
 
     fn scan_plan() -> PhysicalPlanNode {
@@ -203,7 +217,11 @@ mod tests {
                 table: table_def(),
                 alias: Some("t".to_string()),
                 columns: vec![k.clone(), v.clone()],
-                predicates: vec![],
+                predicates: vec![cmp_expr(
+                    column_ref_expr(1, "k", DataType::Int64, false),
+                    BinOp::Eq,
+                    int_lit(7),
+                )],
                 required_columns: None,
                 dict_columns: vec![],
                 variant_columns: vec![],
@@ -352,5 +370,29 @@ mod tests {
             data_type: DataType::Boolean,
             nullable: false,
         }
+    }
+
+    fn assert_binary_predicate(expr: &TypedExpr, column: &str, op: BinOp, value: i64) {
+        let ExprKind::BinaryOp {
+            left,
+            op: actual_op,
+            right,
+        } = &expr.kind
+        else {
+            panic!("expected binary predicate, got {expr:?}");
+        };
+        assert_eq!(*actual_op, op);
+        let ExprKind::ColumnRef {
+            column: actual_column,
+            ..
+        } = &left.kind
+        else {
+            panic!("expected column ref left predicate, got {left:?}");
+        };
+        assert_eq!(actual_column, column);
+        let ExprKind::Literal(LiteralValue::Int(actual_value)) = &right.kind else {
+            panic!("expected int literal right predicate, got {right:?}");
+        };
+        assert_eq!(*actual_value, value);
     }
 }
