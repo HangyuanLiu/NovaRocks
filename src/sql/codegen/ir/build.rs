@@ -1243,7 +1243,7 @@ mod tests {
         PhysicalSortOp, PhysicalWindowOp,
     };
     use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, PlanExecutionProps};
-    use crate::sql::optimizer::statistics::Statistics;
+    use crate::sql::optimizer::statistics::{ColumnStatistic, Statistics};
     use crate::sql::planner::plan::WindowExpr;
 
     #[test]
@@ -1291,6 +1291,34 @@ mod tests {
 
         assert!(matches!(folded_scan.kind, DistributedPlanNodeKind::Scan(_)));
         assert_eq!(folded_scan.stats.output_row_count, 5.0);
+    }
+
+    #[test]
+    fn build_distributed_plan_copies_scan_column_statistics() {
+        let column_id = ColumnId::new_for_test(1);
+        let mut physical = scan_plan();
+        physical.stats.column_statistics.insert(
+            column_id,
+            ColumnStatistic {
+                min_value: 1.0,
+                max_value: 9.0,
+                distinct_values_count: 4.0,
+                ..Default::default()
+            },
+        );
+
+        let dp = build_distributed_plan(&physical).expect("build_distributed_plan");
+        let root = &dp.fragments[0].root;
+
+        assert!(matches!(root.kind, DistributedPlanNodeKind::Scan(_)));
+        let stat = root
+            .stats
+            .column_statistics
+            .get(&column_id)
+            .expect("column statistics for k");
+        assert_eq!(stat.min_value, 1.0);
+        assert_eq!(stat.max_value, 9.0);
+        assert_eq!(stat.distinct_values_count, 4.0);
     }
 
     #[test]
