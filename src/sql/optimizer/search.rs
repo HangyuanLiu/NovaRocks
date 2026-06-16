@@ -121,18 +121,15 @@ impl SearchContext {
         let mut best_child_props = Vec::new();
         let mut best_child_outputs = Vec::new();
 
-        // own_stats is the operator's own output statistic. All physical
-        // members of a group are logically equivalent, and the operators whose
-        // cost reads own_stats (scan/filter/project/sort/distribution/union,
-        // and NestLoopJoin via avg_row_size) get value-identical own_stats
-        // across members; the operators whose own_stats can vary among members
-        // (hash join reorder shapes, aggregate) are costed from child_stats and
-        // do not read own_stats. So the single per-group collapsed statistic is
-        // the correct, value-identical input — read it once per group.
-        let own_stats = stats_for_group(&memo.groups[group_id], memo, &self.table_stats);
-
         for expr_idx in 0..num_physical {
             let expr = &memo.groups[group_id].physical_exprs[expr_idx];
+
+            // own_stats is the cardinality of THIS physical expr; it does not
+            // depend on the property alternative, so derive it once per expr
+            // instead of once per (expr, alt). Kept per-expr (not the group
+            // cache) because same-group exprs can have different own_stats
+            // (see physical_hash_aggregate_own_stats_are_per_expr_not_per_group).
+            let own_stats = derive_statistics(expr, memo, &self.table_stats);
 
             let alternatives = super::derive::derive_required_alternatives(
                 &expr.op,
