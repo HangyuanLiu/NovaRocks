@@ -243,7 +243,22 @@ fn materialize_sort_key(arena: &ScalarArena, key: &SortKey) -> SortItem {
 /// Recursively intern an analyzer `TypedExpr` into the arena, returning its id.
 pub(crate) fn intern_typed(arena: &mut ScalarArena, expr: &TypedExpr) -> ScalarId {
     let node = match &expr.kind {
-        ExprKind::ColumnRef { column_id, .. } => ScalarNode::ColumnRef(*column_id),
+        ExprKind::ColumnRef {
+            column_id,
+            qualifier,
+            column,
+        } => {
+            if *column_id == ColumnId::UNSET {
+                let display_name = qualifier
+                    .as_deref()
+                    .map(|qualifier| format!("{qualifier}.{column}"))
+                    .unwrap_or_else(|| column.clone());
+                panic!(
+                    "ColumnId::UNSET cannot be interned into ScalarArena; resolve column '{display_name}' before optimizer scalar interning"
+                );
+            }
+            ScalarNode::ColumnRef(*column_id)
+        }
         ExprKind::LambdaParamRef { name, slot_id } => ScalarNode::LambdaParamRef {
             name: name.clone(),
             slot_id: *slot_id,
@@ -742,6 +757,45 @@ mod bridge_tests {
         );
         assert_eq!(a.data_type(int8), &DataType::Int8);
         assert_eq!(a.data_type(int64), &DataType::Int64);
+    }
+
+    #[test]
+    #[should_panic(expected = "ColumnId::UNSET cannot be interned")]
+    fn intern_typed_rejects_unset_column_ref() {
+        let mut a = ScalarArena::new();
+        let expr = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId::UNSET,
+                qualifier: Some("q".into()),
+                column: "name_a".into(),
+            },
+            data_type: DataType::Int64,
+            nullable: false,
+        };
+
+        intern_typed(&mut a, &expr);
+    }
+
+    #[test]
+    fn intern_distinguishes_nullable_metadata() {
+        let mut a = ScalarArena::new();
+        let not_nullable = a.intern(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Int(1))),
+            DataType::Int64,
+            false,
+        );
+        let nullable = a.intern(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Int(1))),
+            DataType::Int64,
+            true,
+        );
+
+        assert_ne!(
+            not_nullable, nullable,
+            "same node and type with different nullability must not share one ScalarId"
+        );
+        assert!(!a.nullable(not_nullable));
+        assert!(a.nullable(nullable));
     }
 
     #[test]
