@@ -9,7 +9,9 @@ use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
-use crate::sql::planner::plan::{LogicalPlan, ProjectNode, ScanNode, ScanVariantColumn};
+use crate::sql::planner::plan::{
+    LogicalPlanNode, LogicalPlanNodeKind, LogicalProjectNode, LogicalScanNode, ScanVariantColumn,
+};
 
 #[derive(Default)]
 pub(crate) struct VariantPathPushdownRule;
@@ -35,30 +37,45 @@ impl LogicalRewriteRule for VariantPathPushdownRule {
         RewriteTraversal::TopDown
     }
 
-    fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
-        match plan {
-            LogicalPlan::Filter(node) => contains_variant_get_candidate(&node.predicate),
-            LogicalPlan::Project(node) => node
+    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+        match &plan.kind {
+            LogicalPlanNodeKind::Filter(node) => contains_variant_get_candidate(&node.predicate),
+            LogicalPlanNodeKind::Project(node) => node
                 .items
                 .iter()
                 .any(|item| contains_variant_get_candidate(&item.expr)),
-            LogicalPlan::Scan(node) => node.predicates.iter().any(contains_variant_get_candidate),
+            LogicalPlanNodeKind::Scan(node) => {
+                node.predicates.iter().any(contains_variant_get_candidate)
+            }
             _ => false,
         }
     }
 
-    fn apply(&self, plan: LogicalPlan, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        plan: LogicalPlanNode,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, String> {
         let Some(factory) = ctx.column_ref_factory().cloned() else {
             return Ok(RewriteResult::Unchanged);
         };
         let mut factory = factory.borrow_mut();
         let mut plan = plan;
-        let changed = match &mut plan {
-            LogicalPlan::Filter(node) => {
-                rewrite_expr(&mut node.predicate, &mut node.input, &mut factory)?
+        let LogicalPlanNode { kind, children, .. } = &mut plan;
+        let changed = match kind {
+            LogicalPlanNodeKind::Filter(node) => {
+                let Some(input) = children.get_mut(0) else {
+                    return Ok(RewriteResult::Unchanged);
+                };
+                rewrite_expr(&mut node.predicate, input, &mut factory)?
             }
-            LogicalPlan::Project(node) => rewrite_project(node, &mut factory)?,
-            LogicalPlan::Scan(node) => rewrite_scan_predicates(node, &mut factory)?,
+            LogicalPlanNodeKind::Project(node) => {
+                let Some(input) = children.get_mut(0) else {
+                    return Ok(RewriteResult::Unchanged);
+                };
+                rewrite_project(node, input, &mut factory)?
+            }
+            LogicalPlanNodeKind::Scan(node) => rewrite_scan_predicates(node, &mut factory)?,
             _ => false,
         };
 
@@ -70,16 +87,20 @@ impl LogicalRewriteRule for VariantPathPushdownRule {
     }
 }
 
-fn rewrite_project(node: &mut ProjectNode, factory: &mut ColumnRefFactory) -> Result<bool, String> {
+fn rewrite_project(
+    node: &mut LogicalProjectNode,
+    input: &mut LogicalPlanNode,
+    factory: &mut ColumnRefFactory,
+) -> Result<bool, String> {
     let mut changed = false;
     for item in &mut node.items {
-        changed |= rewrite_expr(&mut item.expr, &mut node.input, factory)?;
+        changed |= rewrite_expr(&mut item.expr, input, factory)?;
     }
     Ok(changed)
 }
 
 fn rewrite_scan_predicates(
-    scan: &mut ScanNode,
+    scan: &mut LogicalScanNode,
     factory: &mut ColumnRefFactory,
 ) -> Result<bool, String> {
     let mut predicates = std::mem::take(&mut scan.predicates);
@@ -93,7 +114,7 @@ fn rewrite_scan_predicates(
 
 fn rewrite_expr(
     expr: &mut TypedExpr,
-    scan_root: &mut LogicalPlan,
+    scan_root: &mut LogicalPlanNode,
     factory: &mut ColumnRefFactory,
 ) -> Result<bool, String> {
     if let Some(replacement) = replacement_for_variant_get(expr, scan_root, factory)? {
@@ -183,7 +204,7 @@ fn rewrite_expr(
 
 fn rewrite_expr_against_scan(
     expr: &mut TypedExpr,
-    scan: &mut ScanNode,
+    scan: &mut LogicalScanNode,
     factory: &mut ColumnRefFactory,
 ) -> Result<bool, String> {
     if let Some(replacement) = replacement_for_variant_get_against_scan(expr, scan, factory)? {
@@ -273,7 +294,7 @@ fn rewrite_expr_against_scan(
 
 fn rewrite_expr_list(
     exprs: &mut [TypedExpr],
-    scan_root: &mut LogicalPlan,
+    scan_root: &mut LogicalPlanNode,
     factory: &mut ColumnRefFactory,
 ) -> Result<bool, String> {
     let mut changed = false;
@@ -285,7 +306,7 @@ fn rewrite_expr_list(
 
 fn rewrite_expr_list_against_scan(
     exprs: &mut [TypedExpr],
-    scan: &mut ScanNode,
+    scan: &mut LogicalScanNode,
     factory: &mut ColumnRefFactory,
 ) -> Result<bool, String> {
     let mut changed = false;
@@ -297,7 +318,7 @@ fn rewrite_expr_list_against_scan(
 
 fn rewrite_sort_items(
     items: &mut [SortItem],
-    scan_root: &mut LogicalPlan,
+    scan_root: &mut LogicalPlanNode,
     factory: &mut ColumnRefFactory,
 ) -> Result<bool, String> {
     let mut changed = false;
@@ -309,7 +330,7 @@ fn rewrite_sort_items(
 
 fn rewrite_sort_items_against_scan(
     items: &mut [SortItem],
-    scan: &mut ScanNode,
+    scan: &mut LogicalScanNode,
     factory: &mut ColumnRefFactory,
 ) -> Result<bool, String> {
     let mut changed = false;
@@ -321,7 +342,7 @@ fn rewrite_sort_items_against_scan(
 
 fn replacement_for_variant_get(
     expr: &TypedExpr,
-    scan_root: &mut LogicalPlan,
+    scan_root: &mut LogicalPlanNode,
     factory: &mut ColumnRefFactory,
 ) -> Result<Option<TypedExpr>, String> {
     let Some(request) = variant_request(expr) else {
@@ -332,7 +353,7 @@ fn replacement_for_variant_get(
 
 fn replacement_for_variant_get_against_scan(
     expr: &TypedExpr,
-    scan: &mut ScanNode,
+    scan: &mut LogicalScanNode,
     factory: &mut ColumnRefFactory,
 ) -> Result<Option<TypedExpr>, String> {
     let Some(request) = variant_request(expr) else {
@@ -437,12 +458,13 @@ fn is_plain_path_key(key: &str) -> bool {
 }
 
 fn find_or_create_slot(
-    plan: &mut LogicalPlan,
+    plan: &mut LogicalPlanNode,
     request: &VariantRequest,
     factory: &mut ColumnRefFactory,
 ) -> Option<TypedExpr> {
-    match plan {
-        LogicalPlan::Scan(scan)
+    let LogicalPlanNode { kind, children, .. } = plan;
+    match kind {
+        LogicalPlanNodeKind::Scan(scan)
             if !request.strict
                 || scan.predicates.is_empty()
                 || scan
@@ -452,10 +474,14 @@ fn find_or_create_slot(
         {
             find_or_create_slot_on_scan(scan, request, factory)
         }
-        LogicalPlan::Filter(node)
-            if !request.strict || expr_contains_variant_request(&node.predicate, request) =>
-        {
-            find_or_create_slot(&mut node.input, request, factory)
+        LogicalPlanNodeKind::Filter(node) => {
+            if !request.strict || expr_contains_variant_request(&node.predicate, request) {
+                children
+                    .get_mut(0)
+                    .and_then(|input| find_or_create_slot(input, request, factory))
+            } else {
+                None
+            }
         }
         _ => None,
     }
@@ -545,7 +571,7 @@ fn expr_contains_variant_request(expr: &TypedExpr, request: &VariantRequest) -> 
 }
 
 fn find_or_create_slot_on_scan(
-    scan: &mut ScanNode,
+    scan: &mut LogicalScanNode,
     request: &VariantRequest,
     factory: &mut ColumnRefFactory,
 ) -> Option<TypedExpr> {
@@ -613,7 +639,7 @@ fn column_ref_for_variant_slot(descriptor: &ScanVariantColumn) -> TypedExpr {
     }
 }
 
-fn next_synthetic_column_name(scan: &ScanNode, source_column: &str) -> String {
+fn next_synthetic_column_name(scan: &LogicalScanNode, source_column: &str) -> String {
     let source = sanitize_column_name(source_column);
     let mut ordinal = scan.variant_columns.len();
     loop {

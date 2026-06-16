@@ -9609,7 +9609,7 @@ fn register_join_snapshot_side(
         .map_err(|e| format!("register join snapshot table {}: {e}", base.fqn()))
 }
 
-/// Re-plan ctx.rewrite.canonical_select_query into a LogicalPlan suitable
+/// Re-plan ctx.rewrite.canonical_select_query into a LogicalPlanNode suitable
 /// for handing to `run_imv_rewrite`.
 ///
 /// Failure here is fail-fast: if the canonical SELECT cannot be analyzed
@@ -9619,7 +9619,7 @@ fn register_join_snapshot_side(
 fn plan_canonical_select_for_imv(
     state: &Arc<StandaloneState>,
     ctx: &IcebergMvRefreshContext,
-) -> Result<(crate::sql::planner::plan::LogicalPlan, u32), RefreshError> {
+) -> Result<(crate::sql::planner::plan::LogicalPlanNode, u32), RefreshError> {
     let catalog = build_iceberg_mv_planning_catalog(state, ctx).map_err(|e| {
         RefreshError::user(format!(
             "imv plan failed for {}.{}.{}: build planning catalog: {e}",
@@ -9651,21 +9651,47 @@ fn plan_canonical_select_for_imv(
 }
 
 pub(crate) fn normalize_imv_rewrite_root_project(
-    plan: crate::sql::planner::plan::LogicalPlan,
-) -> crate::sql::planner::plan::LogicalPlan {
-    let crate::sql::planner::plan::LogicalPlan::Project(mut project) = plan else {
-        return plan;
+    plan: crate::sql::planner::plan::LogicalPlanNode,
+) -> crate::sql::planner::plan::LogicalPlanNode {
+    use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind};
+
+    let LogicalPlanNode {
+        kind,
+        mut children,
+        required_output_columns,
+    } = plan;
+    let LogicalPlanNodeKind::Project(project) = kind else {
+        return LogicalPlanNode::new(kind, children, required_output_columns);
     };
-    let mut aggregate = match *project.input {
-        crate::sql::planner::plan::LogicalPlan::Aggregate(aggregate) => aggregate,
-        other => {
-            project.input = Box::new(other);
-            return crate::sql::planner::plan::LogicalPlan::Project(project);
-        }
+    let input = children.remove(0);
+    let LogicalPlanNode {
+        kind: input_kind,
+        children: aggregate_children,
+        required_output_columns: aggregate_required_output_columns,
+    } = input;
+    let LogicalPlanNodeKind::Aggregate(mut aggregate) = input_kind else {
+        let input = LogicalPlanNode::new(
+            input_kind,
+            aggregate_children,
+            aggregate_required_output_columns,
+        );
+        return LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(project),
+            vec![input],
+            required_output_columns,
+        );
     };
     if project.items.len() != aggregate.output_columns.len() {
-        project.input = Box::new(crate::sql::planner::plan::LogicalPlan::Aggregate(aggregate));
-        return crate::sql::planner::plan::LogicalPlan::Project(project);
+        let input = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Aggregate(aggregate),
+            aggregate_children,
+            aggregate_required_output_columns,
+        );
+        return LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(project),
+            vec![input],
+            required_output_columns,
+        );
     }
     aggregate.output_columns = project
         .items
@@ -9678,7 +9704,11 @@ pub(crate) fn normalize_imv_rewrite_root_project(
             is_internal: false,
         })
         .collect();
-    crate::sql::planner::plan::LogicalPlan::Aggregate(aggregate)
+    LogicalPlanNode::new(
+        LogicalPlanNodeKind::Aggregate(aggregate),
+        aggregate_children,
+        aggregate_required_output_columns,
+    )
 }
 
 /// Run the IMV optimizer pipeline for EXPLAIN. Refresh execution wires the
@@ -9775,54 +9805,15 @@ fn rewrite_outcome_rule_changed(
 }
 
 fn logical_plan_contains_aggregate_state_merge(
-    plan: &crate::sql::planner::plan::LogicalPlan,
+    plan: &crate::sql::planner::plan::LogicalPlanNode,
 ) -> bool {
-    use crate::sql::planner::plan::LogicalPlan;
-
-    match plan {
-        LogicalPlan::AggregateStateMerge(_) => true,
-        LogicalPlan::Filter(n) => logical_plan_contains_aggregate_state_merge(&n.input),
-        LogicalPlan::Project(n) => logical_plan_contains_aggregate_state_merge(&n.input),
-        LogicalPlan::Aggregate(n) => logical_plan_contains_aggregate_state_merge(&n.input),
-        LogicalPlan::Sort(n) => logical_plan_contains_aggregate_state_merge(&n.input),
-        LogicalPlan::Limit(n) => logical_plan_contains_aggregate_state_merge(&n.input),
-        LogicalPlan::Window(n) => logical_plan_contains_aggregate_state_merge(&n.input),
-        LogicalPlan::TableFunction(n) => logical_plan_contains_aggregate_state_merge(&n.input),
-        LogicalPlan::CTEAnchor(n) => {
-            logical_plan_contains_aggregate_state_merge(&n.produce)
-                || logical_plan_contains_aggregate_state_merge(&n.consumer)
-        }
-        LogicalPlan::CTEProduce(n) => logical_plan_contains_aggregate_state_merge(&n.input),
-        LogicalPlan::Join(n) => {
-            logical_plan_contains_aggregate_state_merge(&n.left)
-                || logical_plan_contains_aggregate_state_merge(&n.right)
-        }
-        LogicalPlan::Union(n) => n
-            .inputs
-            .iter()
-            .any(logical_plan_contains_aggregate_state_merge),
-        LogicalPlan::Intersect(n) => n
-            .inputs
-            .iter()
-            .any(logical_plan_contains_aggregate_state_merge),
-        LogicalPlan::Except(n) => n
-            .inputs
-            .iter()
-            .any(logical_plan_contains_aggregate_state_merge),
-        LogicalPlan::Repeat(n) => logical_plan_contains_aggregate_state_merge(&n.input),
-        LogicalPlan::Decode(n) => logical_plan_contains_aggregate_state_merge(&n.input),
-        LogicalPlan::ImvDelta(n) => logical_plan_contains_aggregate_state_merge(&n.input),
-        LogicalPlan::ImvVersion(n) => logical_plan_contains_aggregate_state_merge(&n.input),
-        LogicalPlan::Apply(n) => {
-            logical_plan_contains_aggregate_state_merge(&n.left)
-                || logical_plan_contains_aggregate_state_merge(&n.right)
-        }
-        LogicalPlan::AssertOneRow(n) => logical_plan_contains_aggregate_state_merge(&n.input),
-        LogicalPlan::Scan(_)
-        | LogicalPlan::Values(_)
-        | LogicalPlan::GenerateSeries(_)
-        | LogicalPlan::CTEConsume(_) => false,
-    }
+    matches!(
+        &plan.kind,
+        crate::sql::planner::plan::LogicalPlanNodeKind::AggregateStateMerge(_)
+    ) || plan
+        .children
+        .iter()
+        .any(logical_plan_contains_aggregate_state_merge)
 }
 
 #[cfg(test)]
@@ -10011,28 +10002,35 @@ mod aggregate_refresh_rewrite_validation_tests {
     use crate::sql::optimizer::rewrite::imv::entrypoint::ImvRewriteOutcome;
     use crate::sql::optimizer::rewrite::phase::RewritePhase;
     use crate::sql::optimizer::rewrite::trace::RewriteTrace;
-    use crate::sql::planner::plan::{AggregateStateMergeNode, LogicalPlan, ValuesNode};
+    use crate::sql::planner::plan::{
+        LogicalAggregateStateMergeNode, LogicalPlanNode, LogicalPlanNodeKind, LogicalValuesNode,
+    };
 
-    fn empty_values_plan() -> LogicalPlan {
-        LogicalPlan::Values(ValuesNode {
-            rows: Vec::new(),
-            columns: Vec::new(),
-            required_output_columns: None,
-        })
+    fn empty_values_plan() -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Values(LogicalValuesNode {
+                rows: Vec::new(),
+                columns: Vec::new(),
+            }),
+            vec![],
+            None,
+        )
     }
 
-    fn aggregate_state_merge_plan() -> LogicalPlan {
-        LogicalPlan::AggregateStateMerge(AggregateStateMergeNode {
-            old_input: Box::new(empty_values_plan()),
-            delta_input: Box::new(empty_values_plan()),
-            group_key_names: Vec::new(),
-            aggregate_state_names: Vec::new(),
-            change_op_column: crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
-            output_columns: Vec::new(),
-        })
+    fn aggregate_state_merge_plan() -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::AggregateStateMerge(LogicalAggregateStateMergeNode {
+                group_key_names: Vec::new(),
+                aggregate_state_names: Vec::new(),
+                change_op_column: crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
+                output_columns: Vec::new(),
+            }),
+            vec![empty_values_plan(), empty_values_plan()],
+            None,
+        )
     }
 
-    fn outcome(plan: LogicalPlan, changed_rules: &[&'static str]) -> ImvRewriteOutcome {
+    fn outcome(plan: LogicalPlanNode, changed_rules: &[&'static str]) -> ImvRewriteOutcome {
         let mut trace = RewriteTrace::default();
         for rule in changed_rules {
             trace.rule_changed(RewritePhase::SemanticRewrite, rule, 0);
@@ -11627,6 +11625,7 @@ fn arrow_data_type_to_iceberg_primitive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::planner::plan::*;
     use arrow::array::{BinaryArray, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use arrow::record_batch::RecordBatch;

@@ -32,8 +32,8 @@ impl RewriteRule for PushSemiAntiRightOnlyCondition {
         "PushSemiAntiRightOnlyCondition"
     }
 
-    fn matches(&self, plan: &LogicalPlan) -> bool {
-        let LogicalPlan::Join(j) = plan else {
+    fn matches(&self, plan: &LogicalPlanNode) -> bool {
+        let LogicalPlanNodeKind::Join(j) = &plan.kind else {
             return false;
         };
         matches!(
@@ -42,16 +42,26 @@ impl RewriteRule for PushSemiAntiRightOnlyCondition {
         ) && j.condition.is_some()
     }
 
-    fn apply(&self, plan: LogicalPlan) -> Option<LogicalPlan> {
-        let LogicalPlan::Join(join) = plan else {
+    fn apply(&self, plan: LogicalPlanNode) -> Option<LogicalPlanNode> {
+        let LogicalPlanNode {
+            kind,
+            mut children,
+            required_output_columns,
+        } = plan;
+        let LogicalPlanNodeKind::Join(join) = &kind else {
             return None;
         };
+        if children.len() != 2 {
+            return None;
+        }
+        let right = children.remove(1);
+        let left = children.remove(0);
         let condition = join.condition.as_ref()?;
 
         // Port of push_semi_condition_into_children logic (legacy lines 374-431).
         let conjuncts = split_and(condition.clone());
-        let mut right_ids = collect_output_ids(&join.right);
-        let mut left_ids = collect_output_ids(&join.left);
+        let mut right_ids = collect_output_ids(&right);
+        let mut left_ids = collect_output_ids(&left);
         right_ids.remove(&ColumnId::UNSET);
         left_ids.remove(&ColumnId::UNSET);
 
@@ -79,18 +89,19 @@ impl RewriteRule for PushSemiAntiRightOnlyCondition {
             Some(combine_and(keep_in_condition))
         };
         let pushed = combine_and(push_to_right);
-        let new_right = LogicalPlan::Filter(FilterNode {
-            input: join.right,
-            predicate: pushed,
-            required_output_columns: None,
-        });
-        Some(LogicalPlan::Join(JoinNode {
-            left: join.left,
-            right: Box::new(new_right),
-            join_type: join.join_type,
-            condition: new_condition,
-            required_output_columns: join.required_output_columns,
-        }))
+        let new_right = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode { predicate: pushed }),
+            vec![right],
+            None,
+        );
+        Some(LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: join.join_type,
+                condition: new_condition,
+            }),
+            vec![left, new_right],
+            required_output_columns,
+        ))
     }
 }
 
@@ -121,6 +132,7 @@ mod tests {
     };
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::planner::plan::*;
     use arrow::datatypes::DataType;
 
     fn test_col_id(name: &str) -> ColumnId {
@@ -193,72 +205,77 @@ mod tests {
         }
     }
 
-    fn scan(table_name: &str, cols: &[&str]) -> LogicalPlan {
-        LogicalPlan::Scan(ScanNode {
-            database: "db".into(),
-            table: TableDef {
-                name: table_name.into(),
+    fn scan(table_name: &str, cols: &[&str]) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".into(),
+                table: TableDef {
+                    name: table_name.into(),
+                    columns: cols
+                        .iter()
+                        .map(|n| ColumnDef {
+                            name: (*n).into(),
+                            data_type: DataType::Int64,
+                            nullable: true,
+                            write_default: None,
+                            logical_type: None,
+                        })
+                        .collect(),
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 0,
+                    },
+                },
+                alias: Some(table_name.into()),
                 columns: cols
                     .iter()
-                    .map(|n| ColumnDef {
+                    .map(|n| OutputColumn {
+                        column_id: test_col_id(n),
                         name: (*n).into(),
                         data_type: DataType::Int64,
                         nullable: true,
-                        write_default: None,
-                        logical_type: None,
+                        is_internal: false,
                     })
                     .collect(),
-                iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::StarRocks {
-                    db_id: 0,
-                    table_id: 0,
-                },
-            },
-            alias: Some(table_name.into()),
-            columns: cols
-                .iter()
-                .map(|n| OutputColumn {
-                    column_id: test_col_id(n),
-                    name: (*n).into(),
-                    data_type: DataType::Int64,
-                    nullable: true,
-                    is_internal: false,
-                })
-                .collect(),
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        })
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        )
     }
 
     fn semi_join(
-        left: LogicalPlan,
-        right: LogicalPlan,
+        left: LogicalPlanNode,
+        right: LogicalPlanNode,
         condition: Option<TypedExpr>,
-    ) -> LogicalPlan {
-        LogicalPlan::Join(JoinNode {
-            left: Box::new(left),
-            right: Box::new(right),
-            join_type: JoinKind::LeftSemi,
-            condition,
-            required_output_columns: None,
-        })
+    ) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: JoinKind::LeftSemi,
+                condition: condition,
+            }),
+            vec![left, right],
+            None,
+        )
     }
 
     fn inner_join(
-        left: LogicalPlan,
-        right: LogicalPlan,
+        left: LogicalPlanNode,
+        right: LogicalPlanNode,
         condition: Option<TypedExpr>,
-    ) -> LogicalPlan {
-        LogicalPlan::Join(JoinNode {
-            left: Box::new(left),
-            right: Box::new(right),
-            join_type: JoinKind::Inner,
-            condition,
-            required_output_columns: None,
-        })
+    ) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: JoinKind::Inner,
+                condition: condition,
+            }),
+            vec![left, right],
+            None,
+        )
     }
 
     fn col_with_id(qualifier: &str, name: &str, id: u32) -> TypedExpr {
@@ -273,39 +290,44 @@ mod tests {
         }
     }
 
-    fn values_with_output(name: &str, id: u32) -> LogicalPlan {
-        LogicalPlan::Values(ValuesNode {
-            rows: vec![],
-            columns: vec![OutputColumn {
-                column_id: ColumnId::new_for_test(id),
-                name: name.to_string(),
-                data_type: DataType::Int64,
-                nullable: true,
-                is_internal: false,
-            }],
-            required_output_columns: None,
-        })
-    }
-
-    fn derived_project_with_output_id(source_id: u32, output_id: u32) -> LogicalPlan {
-        LogicalPlan::Project(ProjectNode {
-            input: Box::new(values_with_output("right_source", source_id)),
-            items: vec![ProjectItem {
-                expr: TypedExpr {
+    fn values_with_output(name: &str, id: u32) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Values(LogicalValuesNode {
+                rows: vec![],
+                columns: vec![OutputColumn {
+                    column_id: ColumnId::new_for_test(id),
+                    name: name.to_string(),
                     data_type: DataType::Int64,
                     nullable: true,
-                    kind: ExprKind::ColumnRef {
-                        column_id: ColumnId::new_for_test(source_id),
-                        qualifier: None,
-                        column: "right_source".to_string(),
+                    is_internal: false,
+                }],
+            }),
+            vec![],
+            None,
+        )
+    }
+
+    fn derived_project_with_output_id(source_id: u32, output_id: u32) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![ProjectItem {
+                    expr: TypedExpr {
+                        data_type: DataType::Int64,
+                        nullable: true,
+                        kind: ExprKind::ColumnRef {
+                            column_id: ColumnId::new_for_test(source_id),
+                            qualifier: None,
+                            column: "right_source".to_string(),
+                        },
                     },
-                },
-                output_name: "k".to_string(),
-                output_column_id: ColumnId::new_for_test(output_id),
-            }],
-            output_qualifier: None,
-            required_output_columns: None,
-        })
+                    output_name: "k".to_string(),
+                    output_column_id: ColumnId::new_for_test(output_id),
+                }],
+                output_qualifier: None,
+            }),
+            vec![values_with_output("right_source", source_id)],
+            None,
+        )
     }
 
     #[test]
@@ -321,7 +343,7 @@ mod tests {
             .apply(join)
             .expect("right-only derived output predicate should push");
 
-        let LogicalPlan::Join(j) = out else {
+        let LogicalPlanNodeKind::Join(j) = &out.kind else {
             panic!("expected Join");
         };
         assert_eq!(j.join_type, JoinKind::LeftSemi);
@@ -329,7 +351,7 @@ mod tests {
             j.condition.as_ref().map(|expr| &expr.kind),
             Some(ExprKind::BinaryOp { op: BinOp::Eq, .. })
         ));
-        let LogicalPlan::Filter(filter) = *j.right else {
+        let LogicalPlanNodeKind::Filter(filter) = &out.right().kind else {
             panic!("expected Filter on right child");
         };
         assert!(matches!(
@@ -344,7 +366,10 @@ mod tests {
                     if *column_id == ColumnId::new_for_test(202) && q == "r" && column == "k"
             )
         ));
-        assert!(matches!(*filter.input, LogicalPlan::Project(_)));
+        assert!(matches!(
+            &out.right().unary_input().kind,
+            LogicalPlanNodeKind::Project(_)
+        ));
     }
 
     #[test]
@@ -389,16 +414,19 @@ mod tests {
 
         // Expected shape: LeftSemi(store_sales, Filter(date_dim))
         // with the join condition containing corr AND equi (d_year=2002 pushed down)
-        match out {
-            LogicalPlan::Join(j) => {
+        match &out.kind {
+            LogicalPlanNodeKind::Join(j) => {
                 assert_eq!(j.join_type, JoinKind::LeftSemi);
                 // Left child should remain an unmodified scan
-                assert!(matches!(*j.left, LogicalPlan::Scan(_)));
+                assert!(matches!(&out.left().kind, LogicalPlanNodeKind::Scan(_)));
                 // Right child should be a Filter wrapping the date_dim scan
-                match *j.right {
-                    LogicalPlan::Filter(f) => {
+                match &out.right().kind {
+                    LogicalPlanNodeKind::Filter(_) => {
                         assert!(
-                            matches!(*f.input, LogicalPlan::Scan(_)),
+                            matches!(
+                                &out.right().unary_input().kind,
+                                LogicalPlanNodeKind::Scan(_)
+                            ),
                             "Filter should wrap the Scan"
                         );
                     }

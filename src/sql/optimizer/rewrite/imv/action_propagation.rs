@@ -21,7 +21,7 @@ use crate::sql::optimizer::rewrite::imv::row_id_column::ImvRowIdColumn;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
-use crate::sql::planner::plan::{AggregateNode, LogicalPlan};
+use crate::sql::planner::plan::{LogicalAggregateNode, LogicalPlanNode, LogicalPlanNodeKind};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -29,11 +29,11 @@ use crate::sql::planner::plan::{AggregateNode, LogicalPlan};
 
 /// Returns true iff the plan's effective output schema contains the IMV
 /// action column. Used by `matches()` predicates and validation.
-pub(crate) fn output_has_action_column(plan: &LogicalPlan) -> bool {
-    match plan {
-        LogicalPlan::Scan(scan) => scan.columns.iter().any(ImvActionColumn::matches),
-        LogicalPlan::Filter(node) => output_has_action_column(&node.input),
-        LogicalPlan::Project(node) => {
+pub(crate) fn output_has_action_column(plan: &LogicalPlanNode) -> bool {
+    match &plan.kind {
+        LogicalPlanNodeKind::Scan(scan) => scan.columns.iter().any(ImvActionColumn::matches),
+        LogicalPlanNodeKind::Filter(_) => output_has_action_column(plan.unary_input()),
+        LogicalPlanNodeKind::Project(node) => {
             // NOTE: ProjectItem carries no `is_internal` flag (unlike
             // OutputColumn), so we can only detect the propagated action
             // column by its reserved name `__change_op`. Phase 2 assumes no
@@ -45,11 +45,14 @@ pub(crate) fn output_has_action_column(plan: &LogicalPlan) -> bool {
                 .iter()
                 .any(|item| item.output_name.eq_ignore_ascii_case(ImvActionColumn::NAME))
         }
-        LogicalPlan::ImvDelta(node) => output_has_action_column(&node.input),
-        LogicalPlan::ImvVersion(node) => output_has_action_column(&node.input),
-        LogicalPlan::Union(node) => node.output_columns.iter().any(ImvActionColumn::matches),
-        LogicalPlan::AggregateStateMerge(node) => {
-            output_has_action_column(&node.old_input) || output_has_action_column(&node.delta_input)
+        LogicalPlanNodeKind::ImvDelta(_) | LogicalPlanNodeKind::ImvVersion(_) => {
+            output_has_action_column(plan.unary_input())
+        }
+        LogicalPlanNodeKind::Union(node) => {
+            node.output_columns.iter().any(ImvActionColumn::matches)
+        }
+        LogicalPlanNodeKind::AggregateStateMerge(_) => {
+            output_has_action_column(plan.child(0)) || output_has_action_column(plan.child(1))
         }
         _ => false,
     }
@@ -57,44 +60,31 @@ pub(crate) fn output_has_action_column(plan: &LogicalPlan) -> bool {
 
 /// Returns the action column descriptor from the first descendant Scan/Project
 /// in the subtree that exposes one, or `None` if no descendant carries it.
-pub(crate) fn find_action_column(plan: &LogicalPlan) -> Option<OutputColumn> {
-    match plan {
-        LogicalPlan::Scan(scan) => scan
+pub(crate) fn find_action_column(plan: &LogicalPlanNode) -> Option<OutputColumn> {
+    match &plan.kind {
+        LogicalPlanNodeKind::Scan(scan) => scan
             .columns
             .iter()
             .find(|c| ImvActionColumn::matches(c))
             .cloned(),
-        LogicalPlan::Filter(node) => find_action_column(&node.input),
-        LogicalPlan::Project(node) => find_action_column(&node.input),
-        LogicalPlan::Union(node) => node
+        LogicalPlanNodeKind::Filter(_) | LogicalPlanNodeKind::Project(_) => {
+            find_action_column(plan.unary_input())
+        }
+        LogicalPlanNodeKind::Union(node) => node
             .output_columns
             .iter()
             .find(|c| ImvActionColumn::matches(c))
             .cloned(),
-        LogicalPlan::AggregateStateMerge(node) => {
-            find_action_column(&node.old_input).or_else(|| find_action_column(&node.delta_input))
+        LogicalPlanNodeKind::AggregateStateMerge(_) => {
+            find_action_column(plan.child(0)).or_else(|| find_action_column(plan.child(1)))
         }
         _ => None,
     }
 }
 
 /// Whether any descendant of the plan exposes an action column.
-pub(crate) fn subtree_has_action_column(plan: &LogicalPlan) -> bool {
-    output_has_action_column(plan)
-        || match plan {
-            LogicalPlan::Filter(node) => subtree_has_action_column(&node.input),
-            LogicalPlan::Project(node) => subtree_has_action_column(&node.input),
-            LogicalPlan::Aggregate(node) => subtree_has_action_column(&node.input),
-            LogicalPlan::AggregateStateMerge(node) => {
-                subtree_has_action_column(&node.old_input)
-                    || subtree_has_action_column(&node.delta_input)
-            }
-            LogicalPlan::Join(node) => {
-                subtree_has_action_column(&node.left) || subtree_has_action_column(&node.right)
-            }
-            LogicalPlan::Union(node) => node.inputs.iter().any(subtree_has_action_column),
-            _ => false,
-        }
+pub(crate) fn subtree_has_action_column(plan: &LogicalPlanNode) -> bool {
+    output_has_action_column(plan) || plan.children.iter().any(subtree_has_action_column)
 }
 
 /// Returns the fully-qualified name of the first `IcebergDeltaTable`-backed
@@ -102,27 +92,16 @@ pub(crate) fn subtree_has_action_column(plan: &LogicalPlan) -> bool {
 /// Recurses through every child-bearing variant (unlike the action-column
 /// helpers, which only need Scan/Filter/Project), because an unsupported
 /// Join/Union/Aggregate node's delta scan can sit under any branch.
-pub(crate) fn first_delta_base_fqn(plan: &LogicalPlan) -> Option<String> {
-    match plan {
-        LogicalPlan::Scan(scan) => match &scan.table.source {
+pub(crate) fn first_delta_base_fqn(plan: &LogicalPlanNode) -> Option<String> {
+    match &plan.kind {
+        LogicalPlanNodeKind::Scan(scan) => match &scan.table.source {
             ScanSource::IcebergDeltaTable { table, .. } => Some(format!(
                 "{}.{}.{}",
                 table.catalog, table.namespace, table.table
             )),
             _ => None,
         },
-        LogicalPlan::Filter(node) => first_delta_base_fqn(&node.input),
-        LogicalPlan::Project(node) => first_delta_base_fqn(&node.input),
-        LogicalPlan::Aggregate(node) => first_delta_base_fqn(&node.input),
-        LogicalPlan::AggregateStateMerge(node) => first_delta_base_fqn(&node.old_input)
-            .or_else(|| first_delta_base_fqn(&node.delta_input)),
-        LogicalPlan::Join(node) => {
-            first_delta_base_fqn(&node.left).or_else(|| first_delta_base_fqn(&node.right))
-        }
-        LogicalPlan::Union(node) => node.inputs.iter().find_map(first_delta_base_fqn),
-        LogicalPlan::ImvDelta(node) => first_delta_base_fqn(&node.input),
-        LogicalPlan::ImvVersion(node) => first_delta_base_fqn(&node.input),
-        _ => None,
+        _ => plan.children.iter().find_map(first_delta_base_fqn),
     }
 }
 
@@ -130,32 +109,33 @@ pub(crate) fn first_delta_base_fqn(plan: &LogicalPlan) -> Option<String> {
 /// descendant Scan, threaded up through Filter/Project. Used by the generalized
 /// propagation rule to carry `__change_op`, `_row_id`, and any future internal
 /// column through the unary chain.
-pub(crate) fn descendant_internal_columns(plan: &LogicalPlan) -> Vec<OutputColumn> {
-    match plan {
-        LogicalPlan::Scan(scan) => scan
+pub(crate) fn descendant_internal_columns(plan: &LogicalPlanNode) -> Vec<OutputColumn> {
+    match &plan.kind {
+        LogicalPlanNodeKind::Scan(scan) => scan
             .columns
             .iter()
             .filter(|c| c.is_internal)
             .cloned()
             .collect(),
-        LogicalPlan::Filter(node) => descendant_internal_columns(&node.input),
-        LogicalPlan::Project(node) => descendant_internal_columns(&node.input),
-        LogicalPlan::Union(node) => node
+        LogicalPlanNodeKind::Filter(_) | LogicalPlanNodeKind::Project(_) => {
+            descendant_internal_columns(plan.unary_input())
+        }
+        LogicalPlanNodeKind::Union(node) => node
             .output_columns
             .iter()
             .filter(|c| c.is_internal)
             .cloned()
             .collect(),
-        LogicalPlan::AggregateStateMerge(node) => {
-            let mut columns = descendant_internal_columns(&node.old_input);
-            columns.extend(descendant_internal_columns(&node.delta_input));
+        LogicalPlanNodeKind::AggregateStateMerge(_) => {
+            let mut columns = descendant_internal_columns(plan.child(0));
+            columns.extend(descendant_internal_columns(plan.child(1)));
             columns
         }
         _ => Vec::new(),
     }
 }
 
-fn is_signed_state_aggregate(node: &AggregateNode) -> bool {
+fn is_signed_state_aggregate(node: &LogicalAggregateNode) -> bool {
     !node.aggregates.is_empty()
         && node
             .aggregates
@@ -195,9 +175,9 @@ impl LogicalRewriteRule for InjectActionColumnRule {
         RewriteTraversal::BottomUp
     }
 
-    fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
-        match plan {
-            LogicalPlan::Scan(scan) => {
+    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+        match &plan.kind {
+            LogicalPlanNodeKind::Scan(scan) => {
                 matches!(scan.table.source, ScanSource::IcebergDeltaTable { .. })
                     && !scan.columns.iter().any(ImvActionColumn::matches)
             }
@@ -205,8 +185,12 @@ impl LogicalRewriteRule for InjectActionColumnRule {
         }
     }
 
-    fn apply(&self, plan: LogicalPlan, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
-        let LogicalPlan::Scan(mut scan) = plan else {
+    fn apply(
+        &self,
+        mut plan: LogicalPlanNode,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, String> {
+        let LogicalPlanNodeKind::Scan(scan) = &mut plan.kind else {
             return Ok(RewriteResult::Unchanged);
         };
         let ext = ctx.extension::<ImvExtension>().ok_or_else(|| {
@@ -216,7 +200,7 @@ impl LogicalRewriteRule for InjectActionColumnRule {
         scan.columns
             .retain(|column| !is_action_column_name(&column.name));
         scan.columns.push(ImvActionColumn::output_column(column_id));
-        Ok(RewriteResult::Changed(LogicalPlan::Scan(scan)))
+        Ok(RewriteResult::Changed(plan))
     }
 }
 
@@ -240,13 +224,13 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
         RewriteTraversal::BottomUp
     }
 
-    fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
-        match plan {
-            LogicalPlan::Project(p) => {
+    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+        match &plan.kind {
+            LogicalPlanNodeKind::Project(p) => {
                 if is_supported_branch_union_project(plan) {
                     false
                 } else {
-                    let internal = descendant_internal_columns(&p.input);
+                    let internal = descendant_internal_columns(plan.unary_input());
                     !internal.is_empty()
                         && internal.iter().any(|c| {
                             !p.items
@@ -258,31 +242,35 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
             // Filter is a schema-passthrough node: it exposes its child's
             // schema verbatim, so once the child has the action column the
             // Filter's effective output also has it. No work needed.
-            LogicalPlan::Filter(_) => false,
+            LogicalPlanNodeKind::Filter(_) => false,
             // Unsupported Aggregate / Join / Union shapes above a delta subtree
             // match here so `apply` can fail-fast with a clear error.
-            LogicalPlan::Aggregate(a) => {
-                subtree_has_action_column(&a.input) && !is_signed_state_aggregate(a)
+            LogicalPlanNodeKind::Aggregate(a) => {
+                subtree_has_action_column(plan.unary_input()) && !is_signed_state_aggregate(a)
             }
-            LogicalPlan::Join(j) => {
-                (subtree_has_action_column(&j.left) || subtree_has_action_column(&j.right))
-                    && !is_supported_join_delta_branch(j)
+            LogicalPlanNodeKind::Join(_) => {
+                (subtree_has_action_column(plan.left()) || subtree_has_action_column(plan.right()))
+                    && !is_supported_join_delta_branch(plan)
             }
-            LogicalPlan::Union(u) => {
-                if branch_delta_union_needs_row_id_output(u) {
+            LogicalPlanNodeKind::Union(_) => {
+                if branch_delta_union_needs_row_id_output(plan) {
                     true
                 } else {
-                    u.inputs.iter().any(subtree_has_action_column)
-                        && !is_supported_join_delta_union(u)
-                        && !is_supported_fan_in_delta_union(u)
-                        && !is_supported_branch_union(u)
+                    plan.children.iter().any(subtree_has_action_column)
+                        && !is_supported_join_delta_union(plan)
+                        && !is_supported_fan_in_delta_union(plan)
+                        && !is_supported_branch_union(plan)
                 }
             }
             _ => false,
         }
     }
 
-    fn apply(&self, plan: LogicalPlan, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        mut plan: LogicalPlanNode,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, String> {
         // Diagnostic: the delta base under an unsupported node, if any. Computed
         // up-front from `&plan` so the fail-fast arms can name the offending
         // base table; harmless for the Project happy path.
@@ -290,56 +278,64 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
         if is_supported_branch_union_project(&plan) {
             return Ok(RewriteResult::Unchanged);
         }
-        match plan {
-            LogicalPlan::Project(mut p) => {
-                let internal = descendant_internal_columns(&p.input);
-                for col in internal {
-                    let already = p
-                        .items
-                        .iter()
-                        .any(|item| item.output_name.eq_ignore_ascii_case(&col.name));
-                    if already {
-                        continue;
-                    }
-                    p.items.push(ProjectItem {
-                        expr: TypedExpr {
-                            kind: ExprKind::ColumnRef {
-                                column_id: col.column_id,
-                                qualifier: None,
-                                column: col.name.clone(),
-                            },
-                            data_type: col.data_type.clone(),
-                            nullable: col.nullable,
-                        },
-                        output_name: col.name.clone(),
-                        output_column_id: col.column_id,
-                    });
+        if matches!(plan.kind, LogicalPlanNodeKind::Project(_)) {
+            let internal = descendant_internal_columns(plan.unary_input());
+            let LogicalPlanNodeKind::Project(p) = &mut plan.kind else {
+                unreachable!()
+            };
+            for col in internal {
+                let already = p
+                    .items
+                    .iter()
+                    .any(|item| item.output_name.eq_ignore_ascii_case(&col.name));
+                if already {
+                    continue;
                 }
-                Ok(RewriteResult::Changed(LogicalPlan::Project(p)))
+                p.items.push(ProjectItem {
+                    expr: TypedExpr {
+                        kind: ExprKind::ColumnRef {
+                            column_id: col.column_id,
+                            qualifier: None,
+                            column: col.name.clone(),
+                        },
+                        data_type: col.data_type.clone(),
+                        nullable: col.nullable,
+                    },
+                    output_name: col.name.clone(),
+                    output_column_id: col.column_id,
+                });
             }
-            LogicalPlan::Aggregate(_) => Err(format!(
+            return Ok(RewriteResult::Changed(plan));
+        }
+
+        if branch_delta_union_needs_row_id_output(&plan) {
+            let ext = ctx.extension::<ImvExtension>().ok_or_else(|| {
+                "PropagateActionColumn requires ImvExtension in RewriteContext".to_string()
+            })?;
+            let row_id_column = ext.allocate_column_id();
+            for input in &mut plan.children {
+                normalize_branch_row_id_output(input, row_id_column)?;
+            }
+            let LogicalPlanNodeKind::Union(u) = &mut plan.kind else {
+                unreachable!()
+            };
+            u.output_columns
+                .push(ImvRowIdColumn::output_column(row_id_column));
+            return Ok(RewriteResult::Changed(plan));
+        }
+
+        match &plan.kind {
+            LogicalPlanNodeKind::Aggregate(_) => Err(format!(
                 "IMV action column propagation does not support Aggregate above \
                  delta-bound scan {base} in Phase 2; aggregate state rewrite is \
                  scheduled for Phase 4"
             )),
-            LogicalPlan::Join(_) => Err(format!(
+            LogicalPlanNodeKind::Join(_) => Err(format!(
                 "IMV action column propagation does not support Join above \
                  delta-bound scan {base} in Phase 2; join delta algebra is \
                  handled by the delta-pushdown fixpoint"
             )),
-            LogicalPlan::Union(mut u) if branch_delta_union_needs_row_id_output(&u) => {
-                let ext = ctx.extension::<ImvExtension>().ok_or_else(|| {
-                    "PropagateActionColumn requires ImvExtension in RewriteContext".to_string()
-                })?;
-                let row_id_column = ext.allocate_column_id();
-                for input in &mut u.inputs {
-                    normalize_branch_row_id_output(input, row_id_column)?;
-                }
-                u.output_columns
-                    .push(ImvRowIdColumn::output_column(row_id_column));
-                Ok(RewriteResult::Changed(LogicalPlan::Union(u)))
-            }
-            LogicalPlan::Union(_) => Err(format!(
+            LogicalPlanNodeKind::Union(_) => Err(format!(
                 "IMV action column propagation does not support UNION above \
                  delta-bound scan {base} in Phase 2; union delta rewrite is \
                  scheduled for Phase 6"
@@ -349,14 +345,20 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
     }
 }
 
-fn branch_delta_union_needs_row_id_output(node: &crate::sql::planner::plan::UnionNode) -> bool {
-    is_branch_delta_union(node)
+fn branch_delta_union_needs_row_id_output(plan: &LogicalPlanNode) -> bool {
+    let LogicalPlanNodeKind::Union(node) = &plan.kind else {
+        return false;
+    };
+    is_branch_delta_union(plan)
         && !node.output_columns.iter().any(ImvRowIdColumn::matches)
-        && node.inputs.iter().all(branch_project_has_row_id)
+        && plan.children.iter().all(branch_project_has_row_id)
 }
 
-fn is_branch_delta_union(node: &crate::sql::planner::plan::UnionNode) -> bool {
-    is_supported_fan_in_delta_union(node)
+fn is_branch_delta_union(plan: &LogicalPlanNode) -> bool {
+    let LogicalPlanNodeKind::Union(node) = &plan.kind else {
+        return false;
+    };
+    is_supported_fan_in_delta_union(plan)
         && node.output_columns.iter().any(|column| {
             column
                 .name
@@ -364,22 +366,21 @@ fn is_branch_delta_union(node: &crate::sql::planner::plan::UnionNode) -> bool {
         })
 }
 
-fn branch_project_has_row_id(plan: &LogicalPlan) -> bool {
-    matches!(
-        plan,
-        LogicalPlan::Project(project)
-            if project
-                .items
-                .iter()
-                .any(|item| item.output_name.eq_ignore_ascii_case(ImvRowIdColumn::NAME))
-    )
+fn branch_project_has_row_id(plan: &LogicalPlanNode) -> bool {
+    match &plan.kind {
+        LogicalPlanNodeKind::Project(project) => project
+            .items
+            .iter()
+            .any(|item| item.output_name.eq_ignore_ascii_case(ImvRowIdColumn::NAME)),
+        _ => false,
+    }
 }
 
 fn normalize_branch_row_id_output(
-    plan: &mut LogicalPlan,
+    plan: &mut LogicalPlanNode,
     row_id_column: crate::sql::column_id::ColumnId,
 ) -> Result<(), String> {
-    let LogicalPlan::Project(project) = plan else {
+    let LogicalPlanNodeKind::Project(project) = &mut plan.kind else {
         return Err(
             "IMV branch UNION row-id propagation expected normalized Project branch".to_string(),
         );
@@ -396,31 +397,37 @@ fn normalize_branch_row_id_output(
     Ok(())
 }
 
-pub(crate) fn is_supported_fan_in_delta_union(node: &crate::sql::planner::plan::UnionNode) -> bool {
-    if !node.all || node.inputs.is_empty() {
+pub(crate) fn is_supported_fan_in_delta_union(plan: &LogicalPlanNode) -> bool {
+    let LogicalPlanNodeKind::Union(node) = &plan.kind else {
+        return false;
+    };
+    if !node.all || plan.children.is_empty() {
         return false;
     }
-    node.inputs.iter().all(|branch| {
+    plan.children.iter().all(|branch| {
         subtree_has_delta_scan(branch)
             && !subtree_has_version_scan(branch)
             && branch_output_action_column_id(branch).is_some()
     })
 }
 
-pub(crate) fn is_supported_branch_union(node: &crate::sql::planner::plan::UnionNode) -> bool {
+pub(crate) fn is_supported_branch_union(plan: &LogicalPlanNode) -> bool {
+    let LogicalPlanNodeKind::Union(node) = &plan.kind else {
+        return false;
+    };
     node.all
-        && !node.inputs.is_empty()
+        && !plan.children.is_empty()
         && node.output_columns.iter().any(|column| {
             column
                 .name
                 .eq_ignore_ascii_case(ICEBERG_MV_BRANCH_ID_COLUMN)
                 && column.is_internal
         })
-        && node.inputs.iter().all(is_supported_branch_union_project)
+        && plan.children.iter().all(is_supported_branch_union_project)
 }
 
-fn is_supported_branch_union_project(plan: &LogicalPlan) -> bool {
-    let LogicalPlan::Project(project) = plan else {
+fn is_supported_branch_union_project(plan: &LogicalPlanNode) -> bool {
+    let LogicalPlanNodeKind::Project(project) = &plan.kind else {
         return false;
     };
     let has_branch_id = project.items.iter().any(|item| {
@@ -428,7 +435,11 @@ fn is_supported_branch_union_project(plan: &LogicalPlan) -> bool {
             .eq_ignore_ascii_case(ICEBERG_MV_BRANCH_ID_COLUMN)
             && is_branch_id_literal_expr(&item.expr)
     });
-    has_branch_id && matches!(project.input.as_ref(), LogicalPlan::AggregateStateMerge(_))
+    has_branch_id
+        && matches!(
+            plan.unary_input().kind,
+            LogicalPlanNodeKind::AggregateStateMerge(_)
+        )
 }
 
 fn is_branch_id_literal_expr(expr: &TypedExpr) -> bool {
@@ -442,15 +453,17 @@ fn is_branch_id_literal_expr(expr: &TypedExpr) -> bool {
     }
 }
 
-fn branch_output_action_column_id(plan: &LogicalPlan) -> Option<crate::sql::column_id::ColumnId> {
-    match plan {
-        LogicalPlan::Scan(scan) => scan
+fn branch_output_action_column_id(
+    plan: &LogicalPlanNode,
+) -> Option<crate::sql::column_id::ColumnId> {
+    match &plan.kind {
+        LogicalPlanNodeKind::Scan(scan) => scan
             .columns
             .iter()
             .find(|column| ImvActionColumn::matches(column))
             .map(|column| column.column_id),
-        LogicalPlan::Filter(node) => branch_output_action_column_id(&node.input),
-        LogicalPlan::Project(project) => project
+        LogicalPlanNodeKind::Filter(_) => branch_output_action_column_id(plan.unary_input()),
+        LogicalPlanNodeKind::Project(project) => project
             .items
             .iter()
             .find(|item| item.output_name.eq_ignore_ascii_case(ImvActionColumn::NAME))
@@ -463,8 +476,9 @@ fn branch_output_action_column_id(plan: &LogicalPlan) -> Option<crate::sql::colu
                     && !item.expr.nullable)
                     .then_some(item.output_column_id)
             }),
-        LogicalPlan::ImvDelta(node) => branch_output_action_column_id(&node.input),
-        LogicalPlan::ImvVersion(node) => branch_output_action_column_id(&node.input),
+        LogicalPlanNodeKind::ImvDelta(_) | LogicalPlanNodeKind::ImvVersion(_) => {
+            branch_output_action_column_id(plan.unary_input())
+        }
         _ => None,
     }
 }
@@ -473,42 +487,39 @@ fn is_action_column_name(name: &str) -> bool {
     name.eq_ignore_ascii_case(ImvActionColumn::NAME)
 }
 
-fn subtree_has_delta_scan(plan: &LogicalPlan) -> bool {
-    match plan {
-        LogicalPlan::Scan(scan) => {
+fn subtree_has_delta_scan(plan: &LogicalPlanNode) -> bool {
+    match &plan.kind {
+        LogicalPlanNodeKind::Scan(scan) => {
             matches!(scan.table.source, ScanSource::IcebergDeltaTable { .. })
         }
-        LogicalPlan::Filter(node) => subtree_has_delta_scan(&node.input),
-        LogicalPlan::Project(node) => subtree_has_delta_scan(&node.input),
-        LogicalPlan::Join(node) => {
-            subtree_has_delta_scan(&node.left) || subtree_has_delta_scan(&node.right)
-        }
-        LogicalPlan::Union(node) => node.inputs.iter().any(subtree_has_delta_scan),
-        LogicalPlan::ImvDelta(_) => true,
-        LogicalPlan::ImvVersion(node) => subtree_has_delta_scan(&node.input),
+        LogicalPlanNodeKind::ImvDelta(_) => true,
+        LogicalPlanNodeKind::Filter(_)
+        | LogicalPlanNodeKind::Project(_)
+        | LogicalPlanNodeKind::Join(_)
+        | LogicalPlanNodeKind::Union(_)
+        | LogicalPlanNodeKind::ImvVersion(_) => plan.children.iter().any(subtree_has_delta_scan),
         _ => false,
     }
 }
 
-fn subtree_has_version_scan(plan: &LogicalPlan) -> bool {
-    match plan {
-        LogicalPlan::Scan(scan) => {
+fn subtree_has_version_scan(plan: &LogicalPlanNode) -> bool {
+    match &plan.kind {
+        LogicalPlanNodeKind::Scan(scan) => {
             matches!(scan.table.source, ScanSource::IcebergVersionTable { .. })
         }
-        LogicalPlan::Filter(node) => subtree_has_version_scan(&node.input),
-        LogicalPlan::Project(node) => subtree_has_version_scan(&node.input),
-        LogicalPlan::Join(node) => {
-            subtree_has_version_scan(&node.left) || subtree_has_version_scan(&node.right)
-        }
-        LogicalPlan::Union(node) => node.inputs.iter().any(subtree_has_version_scan),
-        LogicalPlan::ImvDelta(node) => subtree_has_version_scan(&node.input),
-        LogicalPlan::ImvVersion(_) => true,
+        LogicalPlanNodeKind::ImvVersion(_) => true,
+        LogicalPlanNodeKind::Filter(_)
+        | LogicalPlanNodeKind::Project(_)
+        | LogicalPlanNodeKind::Join(_)
+        | LogicalPlanNodeKind::Union(_)
+        | LogicalPlanNodeKind::ImvDelta(_) => plan.children.iter().any(subtree_has_version_scan),
         _ => false,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::sql::planner::plan::*;
     use std::sync::Arc;
     use std::sync::atomic::AtomicU32;
 
@@ -524,10 +535,9 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::imv::annotation::{ImvExtension, ImvPlanAnnotation};
-    use crate::sql::optimizer::rewrite::imv::marker::ImvDeltaNode;
     use crate::sql::planner::plan::{
-        AggregateCall, AggregateNode, AggregateStateMergeNode, FilterNode, JoinNode, LogicalPlan,
-        ScanNode, UnionNode,
+        AggregateCall, LogicalAggregateNode, LogicalAggregateStateMergeNode, LogicalFilterNode,
+        LogicalJoinNode, LogicalPlanNode, LogicalPlanNodeKind, LogicalScanNode, LogicalUnionNode,
     };
 
     fn build_ctx() -> RewriteContext {
@@ -540,8 +550,8 @@ mod tests {
         ctx
     }
 
-    fn delta_scan() -> ScanNode {
-        ScanNode {
+    fn delta_scan() -> LogicalScanNode {
+        LogicalScanNode {
             database: "db".to_string(),
             table: TableDef {
                 name: "b".to_string(),
@@ -582,11 +592,10 @@ mod tests {
             required_columns: None,
             dict_columns: Vec::new(),
             variant_columns: Vec::new(),
-            required_output_columns: None,
         }
     }
 
-    fn version_scan() -> ScanNode {
+    fn version_scan() -> LogicalScanNode {
         let mut s = delta_scan();
         s.table.source = ScanSource::IcebergVersionTable {
             table: match &delta_scan().table.source {
@@ -598,7 +607,7 @@ mod tests {
         s
     }
 
-    fn starrocks_scan() -> ScanNode {
+    fn starrocks_scan() -> LogicalScanNode {
         let mut s = delta_scan();
         s.table.source = ScanSource::StarRocks {
             db_id: 0,
@@ -607,15 +616,22 @@ mod tests {
         s
     }
 
+    fn scan_plan(scan: LogicalScanNode) -> LogicalPlanNode {
+        LogicalPlanNode::new(LogicalPlanNodeKind::Scan(scan), vec![], None)
+    }
+
     #[test]
     fn inject_action_column_on_delta_scan() {
         let rule = InjectActionColumnRule;
         let mut ctx = build_ctx();
-        let plan = LogicalPlan::Scan(delta_scan());
+        let plan = scan_plan(delta_scan());
         assert!(rule.matches(&plan, &ctx));
         let result = rule.apply(plan, &mut ctx).expect("apply must succeed");
-        let RewriteResult::Changed(LogicalPlan::Scan(scan)) = result else {
+        let RewriteResult::Changed(changed) = result else {
             panic!("expected Changed(Scan), got {:?}", result);
+        };
+        let LogicalPlanNodeKind::Scan(scan) = changed.kind else {
+            panic!("expected Changed(Scan)");
         };
         let action = scan
             .columns
@@ -640,12 +656,13 @@ mod tests {
             false,
             false,
         ));
-        let plan = LogicalPlan::Scan(scan);
+        let plan = scan_plan(scan);
 
         assert!(rule.matches(&plan, &ctx));
-        let RewriteResult::Changed(LogicalPlan::Scan(scan)) =
-            rule.apply(plan, &mut ctx).expect("apply")
-        else {
+        let RewriteResult::Changed(changed) = rule.apply(plan, &mut ctx).expect("apply") else {
+            panic!("expected Changed(Scan)");
+        };
+        let LogicalPlanNodeKind::Scan(scan) = changed.kind else {
             panic!("expected Changed(Scan)");
         };
         let action_columns = scan
@@ -662,7 +679,7 @@ mod tests {
     fn inject_does_not_touch_version_scan() {
         let rule = InjectActionColumnRule;
         let ctx = build_ctx();
-        let plan = LogicalPlan::Scan(version_scan());
+        let plan = scan_plan(version_scan());
         assert!(!rule.matches(&plan, &ctx));
     }
 
@@ -673,7 +690,7 @@ mod tests {
         let mut scan = delta_scan();
         scan.columns
             .push(ImvActionColumn::output_column(ColumnId(9)));
-        let plan = LogicalPlan::Scan(scan);
+        let plan = scan_plan(scan);
         assert!(!rule.matches(&plan, &ctx));
     }
 
@@ -681,51 +698,95 @@ mod tests {
     fn inject_skips_starrocks_scan() {
         let rule = InjectActionColumnRule;
         let ctx = build_ctx();
-        let plan = LogicalPlan::Scan(starrocks_scan());
+        let plan = scan_plan(starrocks_scan());
         assert!(!rule.matches(&plan, &ctx));
     }
 
-    use crate::sql::planner::plan::ProjectNode;
+    use crate::sql::planner::plan::LogicalProjectNode;
 
-    fn project_over(input: LogicalPlan, projected_user_col_id: ColumnId) -> LogicalPlan {
-        LogicalPlan::Project(ProjectNode {
-            input: Box::new(input),
-            items: vec![ProjectItem {
-                expr: TypedExpr {
-                    kind: ExprKind::ColumnRef {
-                        column_id: projected_user_col_id,
-                        qualifier: None,
-                        column: "k".to_string(),
+    fn project_over(input: LogicalPlanNode, projected_user_col_id: ColumnId) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![ProjectItem {
+                    expr: TypedExpr {
+                        kind: ExprKind::ColumnRef {
+                            column_id: projected_user_col_id,
+                            qualifier: None,
+                            column: "k".to_string(),
+                        },
+                        data_type: DataType::Int64,
+                        nullable: false,
                     },
-                    data_type: DataType::Int64,
-                    nullable: false,
-                },
-                output_name: "k".to_string(),
-                output_column_id: projected_user_col_id,
-            }],
-            output_qualifier: None,
-            required_output_columns: None,
-        })
+                    output_name: "k".to_string(),
+                    output_column_id: projected_user_col_id,
+                }],
+                output_qualifier: None,
+            }),
+            vec![input],
+            None,
+        )
     }
 
-    fn delta_scan_with_action(action_id: ColumnId) -> ScanNode {
+    fn delta_scan_with_action(action_id: ColumnId) -> LogicalScanNode {
         let mut s = delta_scan();
         s.columns.push(ImvActionColumn::output_column(action_id));
         s
     }
 
-    fn normalized_delta_project(action_id: ColumnId, user_col_id: ColumnId) -> LogicalPlan {
+    fn normalized_delta_project(action_id: ColumnId, user_col_id: ColumnId) -> LogicalPlanNode {
         let mut scan = delta_scan_with_action(action_id);
         scan.columns[0].column_id = user_col_id;
-        LogicalPlan::Project(ProjectNode {
-            input: Box::new(LogicalPlan::ImvDelta(ImvDeltaNode {
-                input: Box::new(LogicalPlan::Scan(scan)),
-                is_root: false,
-                action_column: Some(action_id),
-                branch_scope: None,
-            })),
-            items: vec![
-                ProjectItem {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![
+                    ProjectItem {
+                        expr: TypedExpr {
+                            kind: ExprKind::ColumnRef {
+                                column_id: user_col_id,
+                                qualifier: None,
+                                column: "k".to_string(),
+                            },
+                            data_type: DataType::Int64,
+                            nullable: false,
+                        },
+                        output_name: "k".to_string(),
+                        output_column_id: user_col_id,
+                    },
+                    ProjectItem {
+                        expr: TypedExpr {
+                            kind: ExprKind::ColumnRef {
+                                column_id: action_id,
+                                qualifier: None,
+                                column: ImvActionColumn::NAME.to_string(),
+                            },
+                            data_type: DataType::Int8,
+                            nullable: false,
+                        },
+                        output_name: ImvActionColumn::NAME.to_string(),
+                        output_column_id: action_id,
+                    },
+                ],
+                output_qualifier: None,
+            }),
+            vec![LogicalPlanNode::new(
+                LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+                    is_root: false,
+                    action_column: Some(action_id),
+                    branch_scope: None,
+                }),
+                vec![scan_plan(scan)],
+                None,
+            )],
+            None,
+        )
+    }
+
+    fn normalized_delta_project_without_action(user_col_id: ColumnId) -> LogicalPlanNode {
+        let mut scan = delta_scan();
+        scan.columns[0].column_id = user_col_id;
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![ProjectItem {
                     expr: TypedExpr {
                         kind: ExprKind::ColumnRef {
                             column_id: user_col_id,
@@ -737,131 +798,117 @@ mod tests {
                     },
                     output_name: "k".to_string(),
                     output_column_id: user_col_id,
-                },
-                ProjectItem {
-                    expr: TypedExpr {
-                        kind: ExprKind::ColumnRef {
-                            column_id: action_id,
-                            qualifier: None,
-                            column: ImvActionColumn::NAME.to_string(),
-                        },
-                        data_type: DataType::Int8,
-                        nullable: false,
-                    },
-                    output_name: ImvActionColumn::NAME.to_string(),
-                    output_column_id: action_id,
-                },
-            ],
-            output_qualifier: None,
-            required_output_columns: None,
-        })
+                }],
+                output_qualifier: None,
+            }),
+            vec![LogicalPlanNode::new(
+                LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+                    is_root: false,
+                    action_column: None,
+                    branch_scope: None,
+                }),
+                vec![scan_plan(scan)],
+                None,
+            )],
+            None,
+        )
     }
 
-    fn normalized_delta_project_without_action(user_col_id: ColumnId) -> LogicalPlan {
-        let mut scan = delta_scan();
-        scan.columns[0].column_id = user_col_id;
-        LogicalPlan::Project(ProjectNode {
-            input: Box::new(LogicalPlan::ImvDelta(ImvDeltaNode {
-                input: Box::new(LogicalPlan::Scan(scan)),
-                is_root: false,
-                action_column: None,
-                branch_scope: None,
-            })),
-            items: vec![ProjectItem {
-                expr: TypedExpr {
-                    kind: ExprKind::ColumnRef {
-                        column_id: user_col_id,
-                        qualifier: None,
-                        column: "k".to_string(),
-                    },
-                    data_type: DataType::Int64,
-                    nullable: false,
-                },
-                output_name: "k".to_string(),
-                output_column_id: user_col_id,
-            }],
-            output_qualifier: None,
-            required_output_columns: None,
-        })
-    }
-
-    fn normalized_version_project(user_col_id: ColumnId) -> LogicalPlan {
+    fn normalized_version_project(user_col_id: ColumnId) -> LogicalPlanNode {
         let mut scan = version_scan();
         scan.columns[0].column_id = user_col_id;
-        LogicalPlan::Project(ProjectNode {
-            input: Box::new(LogicalPlan::Scan(scan)),
-            items: vec![ProjectItem {
-                expr: TypedExpr {
-                    kind: ExprKind::ColumnRef {
-                        column_id: user_col_id,
-                        qualifier: None,
-                        column: "k".to_string(),
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![ProjectItem {
+                    expr: TypedExpr {
+                        kind: ExprKind::ColumnRef {
+                            column_id: user_col_id,
+                            qualifier: None,
+                            column: "k".to_string(),
+                        },
+                        data_type: DataType::Int64,
+                        nullable: false,
                     },
-                    data_type: DataType::Int64,
-                    nullable: false,
-                },
-                output_name: "k".to_string(),
-                output_column_id: user_col_id,
-            }],
-            output_qualifier: None,
-            required_output_columns: None,
-        })
+                    output_name: "k".to_string(),
+                    output_column_id: user_col_id,
+                }],
+                output_qualifier: None,
+            }),
+            vec![scan_plan(scan)],
+            None,
+        )
     }
 
-    fn join_plan(left: LogicalPlan, right: LogicalPlan) -> LogicalPlan {
-        LogicalPlan::Join(JoinNode {
-            left: Box::new(left),
-            right: Box::new(right),
-            join_type: JoinKind::Inner,
-            condition: None,
-            required_output_columns: None,
-        })
+    fn join_plan(left: LogicalPlanNode, right: LogicalPlanNode) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: JoinKind::Inner,
+                condition: None,
+            }),
+            vec![left, right],
+            None,
+        )
     }
 
     fn normalized_join_delta_branch(
-        left: LogicalPlan,
-        right: LogicalPlan,
+        left: LogicalPlanNode,
+        right: LogicalPlanNode,
         action_id: ColumnId,
         user_col_id: ColumnId,
-    ) -> LogicalPlan {
-        LogicalPlan::Project(ProjectNode {
-            input: Box::new(join_plan(left, right)),
-            items: vec![
-                ProjectItem {
-                    expr: TypedExpr {
-                        kind: ExprKind::ColumnRef {
-                            column_id: user_col_id,
-                            qualifier: None,
-                            column: "k".to_string(),
+    ) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![
+                    ProjectItem {
+                        expr: TypedExpr {
+                            kind: ExprKind::ColumnRef {
+                                column_id: user_col_id,
+                                qualifier: None,
+                                column: "k".to_string(),
+                            },
+                            data_type: DataType::Int64,
+                            nullable: false,
                         },
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        output_name: "k".to_string(),
+                        output_column_id: user_col_id,
                     },
-                    output_name: "k".to_string(),
-                    output_column_id: user_col_id,
-                },
-                ProjectItem {
-                    expr: TypedExpr {
-                        kind: ExprKind::ColumnRef {
-                            column_id: action_id,
-                            qualifier: None,
-                            column: ImvActionColumn::NAME.to_string(),
+                    ProjectItem {
+                        expr: TypedExpr {
+                            kind: ExprKind::ColumnRef {
+                                column_id: action_id,
+                                qualifier: None,
+                                column: ImvActionColumn::NAME.to_string(),
+                            },
+                            data_type: DataType::Int8,
+                            nullable: false,
                         },
-                        data_type: DataType::Int8,
-                        nullable: false,
+                        output_name: ImvActionColumn::NAME.to_string(),
+                        output_column_id: action_id,
                     },
-                    output_name: ImvActionColumn::NAME.to_string(),
-                    output_column_id: action_id,
-                },
-            ],
-            output_qualifier: None,
-            required_output_columns: None,
-        })
+                ],
+                output_qualifier: None,
+            }),
+            vec![join_plan(left, right)],
+            None,
+        )
     }
 
-    fn recursive_join_delta_union(action_id: ColumnId) -> LogicalPlan {
-        LogicalPlan::Union(UnionNode {
-            inputs: vec![
+    fn recursive_join_delta_union(action_id: ColumnId) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Union(LogicalUnionNode {
+                all: true,
+                output_columns: vec![
+                    OutputColumn {
+                        column_id: ColumnId(1),
+                        name: "k".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        is_internal: false,
+                    },
+                    ImvActionColumn::output_column(action_id),
+                ],
+            }),
+            vec![
                 normalized_join_delta_branch(
                     normalized_delta_project(action_id, ColumnId(1)),
                     normalized_version_project(ColumnId(10)),
@@ -875,65 +922,59 @@ mod tests {
                     ColumnId(1),
                 ),
             ],
-            all: true,
-            output_columns: vec![
-                OutputColumn {
-                    column_id: ColumnId(1),
-                    name: "k".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
-                    is_internal: false,
-                },
-                ImvActionColumn::output_column(action_id),
-            ],
-            required_output_columns: None,
-        })
+            None,
+        )
     }
 
     fn malformed_delta_project_with_action_name(
         action_id: ColumnId,
         user_col_id: ColumnId,
-    ) -> LogicalPlan {
+    ) -> LogicalPlanNode {
         let mut scan = delta_scan_with_action(action_id);
         scan.columns[0].column_id = user_col_id;
-        LogicalPlan::Project(ProjectNode {
-            input: Box::new(LogicalPlan::ImvDelta(ImvDeltaNode {
-                input: Box::new(LogicalPlan::Scan(scan)),
-                is_root: false,
-                action_column: Some(action_id),
-                branch_scope: None,
-            })),
-            items: vec![
-                ProjectItem {
-                    expr: TypedExpr {
-                        kind: ExprKind::ColumnRef {
-                            column_id: user_col_id,
-                            qualifier: None,
-                            column: "k".to_string(),
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![
+                    ProjectItem {
+                        expr: TypedExpr {
+                            kind: ExprKind::ColumnRef {
+                                column_id: user_col_id,
+                                qualifier: None,
+                                column: "k".to_string(),
+                            },
+                            data_type: DataType::Int64,
+                            nullable: false,
                         },
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        output_name: "k".to_string(),
+                        output_column_id: user_col_id,
                     },
-                    output_name: "k".to_string(),
-                    output_column_id: user_col_id,
-                },
-                ProjectItem {
-                    expr: TypedExpr {
-                        kind: ExprKind::ColumnRef {
-                            column_id: user_col_id,
-                            qualifier: None,
-                            column: "k".to_string(),
+                    ProjectItem {
+                        expr: TypedExpr {
+                            kind: ExprKind::ColumnRef {
+                                column_id: user_col_id,
+                                qualifier: None,
+                                column: "k".to_string(),
+                            },
+                            data_type: DataType::Int64,
+                            nullable: false,
                         },
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        output_name: ImvActionColumn::NAME.to_string(),
+                        output_column_id: action_id,
                     },
-                    output_name: ImvActionColumn::NAME.to_string(),
-                    output_column_id: action_id,
-                },
-            ],
-            output_qualifier: None,
-            required_output_columns: None,
-        })
+                ],
+                output_qualifier: None,
+            }),
+            vec![LogicalPlanNode::new(
+                LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+                    is_root: false,
+                    action_column: Some(action_id),
+                    branch_scope: None,
+                }),
+                vec![scan_plan(scan)],
+                None,
+            )],
+            None,
+        )
     }
 
     fn output_column(
@@ -952,7 +993,7 @@ mod tests {
         }
     }
 
-    fn aggregate_state_merge_stub() -> LogicalPlan {
+    fn aggregate_state_merge_stub() -> LogicalPlanNode {
         let mut old_input = starrocks_scan();
         old_input
             .columns
@@ -972,116 +1013,130 @@ mod tests {
             true,
         ));
 
-        LogicalPlan::AggregateStateMerge(AggregateStateMergeNode {
-            old_input: Box::new(LogicalPlan::Scan(old_input)),
-            delta_input: Box::new(LogicalPlan::Aggregate(AggregateNode {
-                input: Box::new(LogicalPlan::Scan(delta_scan_with_action(ColumnId(100)))),
-                group_by: Vec::new(),
-                aggregates: vec![AggregateCall {
-                    name: "sum_state_signed".to_string(),
-                    args: Vec::new(),
-                    distinct: false,
-                    result_type: DataType::Binary,
-                    order_by: Vec::new(),
-                    output_column_id: ColumnId::UNSET,
-                }],
-                output_columns: vec![output_column(2, "s", DataType::Int64, true, false)],
-                already_pushed: false,
-                required_output_columns: None,
-            })),
-            group_key_names: vec!["region".to_string()],
-            aggregate_state_names: vec!["__agg_state_s".to_string()],
-            change_op_column: ImvActionColumn::NAME.to_string(),
-            output_columns: vec![
-                output_column(1, "region", DataType::Utf8, false, false),
-                output_column(2, "s", DataType::Int64, true, false),
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::AggregateStateMerge(LogicalAggregateStateMergeNode {
+                group_key_names: vec!["region".to_string()],
+                aggregate_state_names: vec!["__agg_state_s".to_string()],
+                change_op_column: ImvActionColumn::NAME.to_string(),
+                output_columns: vec![
+                    output_column(1, "region", DataType::Utf8, false, false),
+                    output_column(2, "s", DataType::Int64, true, false),
+                ],
+            }),
+            vec![
+                scan_plan(old_input),
+                LogicalPlanNode::new(
+                    LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+                        group_by: Vec::new(),
+                        aggregates: vec![AggregateCall {
+                            name: "sum_state_signed".to_string(),
+                            args: Vec::new(),
+                            distinct: false,
+                            result_type: DataType::Binary,
+                            order_by: Vec::new(),
+                            output_column_id: ColumnId::UNSET,
+                        }],
+                        output_columns: vec![output_column(2, "s", DataType::Int64, true, false)],
+                        already_pushed: false,
+                    }),
+                    vec![scan_plan(delta_scan_with_action(ColumnId(100)))],
+                    None,
+                ),
             ],
-        })
+            None,
+        )
     }
 
-    fn project_with_branch_id(input: LogicalPlan, branch_id: i32) -> LogicalPlan {
-        LogicalPlan::Project(ProjectNode {
-            input: Box::new(input),
-            items: vec![
-                ProjectItem {
-                    expr: TypedExpr {
-                        kind: ExprKind::ColumnRef {
-                            column_id: ColumnId(1),
-                            qualifier: None,
-                            column: "region".to_string(),
+    fn project_with_branch_id(input: LogicalPlanNode, branch_id: i32) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![
+                    ProjectItem {
+                        expr: TypedExpr {
+                            kind: ExprKind::ColumnRef {
+                                column_id: ColumnId(1),
+                                qualifier: None,
+                                column: "region".to_string(),
+                            },
+                            data_type: DataType::Utf8,
+                            nullable: false,
                         },
-                        data_type: DataType::Utf8,
-                        nullable: false,
+                        output_name: "region".to_string(),
+                        output_column_id: ColumnId(1),
                     },
-                    output_name: "region".to_string(),
-                    output_column_id: ColumnId(1),
-                },
-                ProjectItem {
-                    expr: TypedExpr {
-                        kind: ExprKind::ColumnRef {
-                            column_id: ColumnId(2),
-                            qualifier: None,
-                            column: "s".to_string(),
+                    ProjectItem {
+                        expr: TypedExpr {
+                            kind: ExprKind::ColumnRef {
+                                column_id: ColumnId(2),
+                                qualifier: None,
+                                column: "s".to_string(),
+                            },
+                            data_type: DataType::Int64,
+                            nullable: true,
                         },
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        output_name: "s".to_string(),
+                        output_column_id: ColumnId(2),
                     },
-                    output_name: "s".to_string(),
-                    output_column_id: ColumnId(2),
-                },
-                ProjectItem {
-                    expr: TypedExpr {
-                        kind: ExprKind::Cast {
-                            expr: Box::new(TypedExpr {
-                                kind: ExprKind::Literal(LiteralValue::Int(branch_id as i64)),
-                                data_type: DataType::Int64,
-                                nullable: false,
-                            }),
-                            target: DataType::Int32,
+                    ProjectItem {
+                        expr: TypedExpr {
+                            kind: ExprKind::Cast {
+                                expr: Box::new(TypedExpr {
+                                    kind: ExprKind::Literal(LiteralValue::Int(branch_id as i64)),
+                                    data_type: DataType::Int64,
+                                    nullable: false,
+                                }),
+                                target: DataType::Int32,
+                            },
+                            data_type: DataType::Int32,
+                            nullable: false,
                         },
-                        data_type: DataType::Int32,
-                        nullable: false,
+                        output_name: ICEBERG_MV_BRANCH_ID_COLUMN.to_string(),
+                        output_column_id: ColumnId(100),
                     },
-                    output_name: ICEBERG_MV_BRANCH_ID_COLUMN.to_string(),
-                    output_column_id: ColumnId(100),
-                },
-            ],
-            output_qualifier: None,
-            required_output_columns: None,
-        })
+                ],
+                output_qualifier: None,
+            }),
+            vec![input],
+            None,
+        )
     }
 
-    fn branch_union_with_aggregate_state_merge() -> LogicalPlan {
-        LogicalPlan::Union(UnionNode {
-            inputs: vec![
+    fn branch_union_with_aggregate_state_merge() -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Union(LogicalUnionNode {
+                all: true,
+                output_columns: vec![
+                    output_column(1, "region", DataType::Utf8, false, false),
+                    output_column(2, "s", DataType::Int64, true, false),
+                    output_column(
+                        100,
+                        ICEBERG_MV_BRANCH_ID_COLUMN,
+                        DataType::Int32,
+                        false,
+                        true,
+                    ),
+                ],
+            }),
+            vec![
                 project_with_branch_id(aggregate_state_merge_stub(), 0),
                 project_with_branch_id(aggregate_state_merge_stub(), 1),
             ],
-            all: true,
-            output_columns: vec![
-                output_column(1, "region", DataType::Utf8, false, false),
-                output_column(2, "s", DataType::Int64, true, false),
-                output_column(
-                    100,
-                    ICEBERG_MV_BRANCH_ID_COLUMN,
-                    DataType::Int32,
-                    false,
-                    true,
-                ),
-            ],
-            required_output_columns: None,
-        })
+            None,
+        )
     }
 
     #[test]
     fn propagate_through_project() {
         let rule = PropagateActionColumnRule;
         let mut ctx = build_ctx();
-        let scan = LogicalPlan::Scan(delta_scan_with_action(ColumnId(100)));
+        let scan = scan_plan(delta_scan_with_action(ColumnId(100)));
         let plan = project_over(scan, ColumnId(1));
         assert!(rule.matches(&plan, &ctx));
         let result = rule.apply(plan, &mut ctx).expect("apply must succeed");
-        let RewriteResult::Changed(LogicalPlan::Project(project)) = result else {
+        let RewriteResult::Changed(changed) = result else {
+            panic!("expected Changed(Project)");
+        };
+        let LogicalPlanNodeKind::Project(project) = changed.kind else {
             panic!("expected Changed(Project)");
         };
         assert_eq!(project.items.len(), 2);
@@ -1099,9 +1154,9 @@ mod tests {
     fn propagate_is_idempotent_on_project_with_action() {
         let rule = PropagateActionColumnRule;
         let ctx = build_ctx();
-        let scan = LogicalPlan::Scan(delta_scan_with_action(ColumnId(100)));
+        let scan = scan_plan(delta_scan_with_action(ColumnId(100)));
         let mut plan = project_over(scan, ColumnId(1));
-        if let LogicalPlan::Project(p) = &mut plan {
+        if let LogicalPlanNodeKind::Project(p) = &mut plan.kind {
             p.items.push(ProjectItem {
                 expr: TypedExpr {
                     kind: ExprKind::ColumnRef {
@@ -1124,7 +1179,7 @@ mod tests {
         // A bare Scan is not a Project; the rule should not match.
         let rule = PropagateActionColumnRule;
         let ctx = build_ctx();
-        let plan = LogicalPlan::Scan(delta_scan_with_action(ColumnId(100)));
+        let plan = scan_plan(delta_scan_with_action(ColumnId(100)));
         assert!(!rule.matches(&plan, &ctx));
     }
 
@@ -1132,15 +1187,17 @@ mod tests {
     fn propagate_rejects_aggregate() {
         let rule = PropagateActionColumnRule;
         let mut ctx = build_ctx();
-        let scan = LogicalPlan::Scan(delta_scan_with_action(ColumnId(100)));
-        let plan = LogicalPlan::Aggregate(AggregateNode {
-            input: Box::new(scan),
-            group_by: Vec::new(),
-            aggregates: Vec::new(),
-            output_columns: Vec::new(),
-            already_pushed: false,
-            required_output_columns: None,
-        });
+        let scan = scan_plan(delta_scan_with_action(ColumnId(100)));
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: Vec::new(),
+                aggregates: Vec::new(),
+                output_columns: Vec::new(),
+                already_pushed: false,
+            }),
+            vec![scan],
+            None,
+        );
         assert!(rule.matches(&plan, &ctx));
         let err = rule.apply(plan, &mut ctx).expect_err("Aggregate must fail");
         assert!(err.contains("Phase 4"), "unexpected error: {err}");
@@ -1151,15 +1208,16 @@ mod tests {
     fn propagate_rejects_join() {
         let rule = PropagateActionColumnRule;
         let mut ctx = build_ctx();
-        let left = LogicalPlan::Scan(delta_scan_with_action(ColumnId(100)));
-        let right = LogicalPlan::Scan(delta_scan());
-        let plan = LogicalPlan::Join(JoinNode {
-            left: Box::new(left),
-            right: Box::new(right),
-            join_type: JoinKind::Inner,
-            condition: None,
-            required_output_columns: None,
-        });
+        let left = scan_plan(delta_scan_with_action(ColumnId(100)));
+        let right = scan_plan(delta_scan());
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: JoinKind::Inner,
+                condition: None,
+            }),
+            vec![left, right],
+            None,
+        );
         assert!(rule.matches(&plan, &ctx));
         let err = rule.apply(plan, &mut ctx).expect_err("Join must fail");
         assert!(
@@ -1173,15 +1231,17 @@ mod tests {
     fn propagate_rejects_union() {
         let rule = PropagateActionColumnRule;
         let mut ctx = build_ctx();
-        let plan = LogicalPlan::Union(UnionNode {
-            inputs: vec![
-                LogicalPlan::Scan(delta_scan_with_action(ColumnId(100))),
-                LogicalPlan::Scan(starrocks_scan()),
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Union(LogicalUnionNode {
+                all: true,
+                output_columns: Vec::new(),
+            }),
+            vec![
+                scan_plan(delta_scan_with_action(ColumnId(100))),
+                scan_plan(starrocks_scan()),
             ],
-            all: true,
-            output_columns: Vec::new(),
-            required_output_columns: None,
-        });
+            None,
+        );
         assert!(rule.matches(&plan, &ctx));
         let err = rule.apply(plan, &mut ctx).expect_err("Union must fail");
         assert!(err.contains("Phase 6"), "unexpected error: {err}");
@@ -1193,26 +1253,28 @@ mod tests {
         let rule = PropagateActionColumnRule;
         let ctx = build_ctx();
         let action_id = ColumnId(100);
-        let nested_delta_side = LogicalPlan::Filter(FilterNode {
-            input: Box::new(recursive_join_delta_union(action_id)),
-            predicate: TypedExpr {
-                kind: ExprKind::Literal(LiteralValue::Bool(true)),
-                data_type: DataType::Boolean,
-                nullable: false,
-            },
-            required_output_columns: None,
-        });
+        let nested_delta_side = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::Bool(true)),
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                },
+            }),
+            vec![recursive_join_delta_union(action_id)],
+            None,
+        );
         let version_side = join_plan(
             normalized_version_project(ColumnId(20)),
             normalized_version_project(ColumnId(30)),
         );
         let plan = join_plan(nested_delta_side, version_side);
 
-        let LogicalPlan::Join(join) = &plan else {
+        let LogicalPlanNodeKind::Join(_) = &plan.kind else {
             panic!("expected Join");
         };
         assert!(
-            is_supported_join_delta_branch(join),
+            is_supported_join_delta_branch(&plan),
             "recursive join-delta union should classify as the delta-like side"
         );
         assert!(
@@ -1226,24 +1288,26 @@ mod tests {
         let rule = PropagateActionColumnRule;
         let ctx = build_ctx();
         let action_id = ColumnId(100);
-        let union = LogicalPlan::Union(UnionNode {
-            inputs: vec![
+        let union = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Union(LogicalUnionNode {
+                all: true,
+                output_columns: vec![
+                    OutputColumn {
+                        column_id: ColumnId(1),
+                        name: "k".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        is_internal: false,
+                    },
+                    ImvActionColumn::output_column(action_id),
+                ],
+            }),
+            vec![
                 normalized_delta_project(action_id, ColumnId(1)),
                 normalized_delta_project(action_id, ColumnId(10)),
             ],
-            all: true,
-            output_columns: vec![
-                OutputColumn {
-                    column_id: ColumnId(1),
-                    name: "k".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
-                    is_internal: false,
-                },
-                ImvActionColumn::output_column(action_id),
-            ],
-            required_output_columns: None,
-        });
+            None,
+        );
 
         assert!(!rule.matches(&union, &ctx));
     }
@@ -1253,15 +1317,17 @@ mod tests {
         let rule = PropagateActionColumnRule;
         let ctx = build_ctx();
         let action_id = ColumnId(100);
-        let union = LogicalPlan::Union(UnionNode {
-            inputs: vec![
-                LogicalPlan::Scan(delta_scan_with_action(action_id)),
-                LogicalPlan::Scan(delta_scan_with_action(action_id)),
+        let union = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Union(LogicalUnionNode {
+                all: true,
+                output_columns: Vec::new(),
+            }),
+            vec![
+                scan_plan(delta_scan_with_action(action_id)),
+                scan_plan(delta_scan_with_action(action_id)),
             ],
-            all: true,
-            output_columns: Vec::new(),
-            required_output_columns: None,
-        });
+            None,
+        );
 
         assert!(!rule.matches(&union, &ctx));
     }
@@ -1273,10 +1339,10 @@ mod tests {
         let plan = branch_union_with_aggregate_state_merge();
 
         assert!(!rule.matches(&plan, &ctx));
-        let LogicalPlan::Union(union) = &plan else {
+        let LogicalPlanNodeKind::Union(_) = &plan.kind else {
             panic!("expected union");
         };
-        assert!(is_supported_branch_union(union));
+        assert!(is_supported_branch_union(&plan));
     }
 
     #[test]
@@ -1284,19 +1350,13 @@ mod tests {
         let rule = PropagateActionColumnRule;
         let ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
         let plan = branch_union_with_aggregate_state_merge();
-        let LogicalPlan::Union(union) = &plan else {
+        let LogicalPlanNodeKind::Union(_) = &plan.kind else {
             panic!("expected union");
         };
-        let branch_project = &union.inputs[0];
+        let branch_project = &plan.children[0];
 
         assert!(is_supported_branch_union_project(branch_project));
-        assert!(
-            !descendant_internal_columns(match branch_project {
-                LogicalPlan::Project(project) => project.input.as_ref(),
-                _ => unreachable!(),
-            })
-            .is_empty()
-        );
+        assert!(!descendant_internal_columns(branch_project.unary_input()).is_empty());
         assert!(!rule.matches(branch_project, &ctx));
     }
 
@@ -1304,15 +1364,17 @@ mod tests {
     fn rejects_fan_in_delta_union_missing_branch_action_column() {
         let rule = PropagateActionColumnRule;
         let mut ctx = build_ctx();
-        let union = LogicalPlan::Union(UnionNode {
-            inputs: vec![
+        let union = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Union(LogicalUnionNode {
+                all: true,
+                output_columns: Vec::new(),
+            }),
+            vec![
                 normalized_delta_project(ColumnId(100), ColumnId(1)),
                 normalized_delta_project_without_action(ColumnId(10)),
             ],
-            all: true,
-            output_columns: Vec::new(),
-            required_output_columns: None,
-        });
+            None,
+        );
 
         assert!(rule.matches(&union, &ctx));
         let err = rule.apply(union, &mut ctx).expect_err("Union must fail");
@@ -1324,15 +1386,17 @@ mod tests {
     fn accepts_fan_in_delta_union_with_mismatched_branch_action_column_ids() {
         let rule = PropagateActionColumnRule;
         let ctx = build_ctx();
-        let union = LogicalPlan::Union(UnionNode {
-            inputs: vec![
+        let union = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Union(LogicalUnionNode {
+                all: true,
+                output_columns: Vec::new(),
+            }),
+            vec![
                 normalized_delta_project(ColumnId(100), ColumnId(1)),
                 normalized_delta_project(ColumnId(101), ColumnId(10)),
             ],
-            all: true,
-            output_columns: Vec::new(),
-            required_output_columns: None,
-        });
+            None,
+        );
 
         assert!(!rule.matches(&union, &ctx));
     }
@@ -1341,15 +1405,17 @@ mod tests {
     fn rejects_fan_in_delta_union_with_malformed_project_action_item() {
         let rule = PropagateActionColumnRule;
         let mut ctx = build_ctx();
-        let union = LogicalPlan::Union(UnionNode {
-            inputs: vec![
+        let union = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Union(LogicalUnionNode {
+                all: true,
+                output_columns: Vec::new(),
+            }),
+            vec![
                 normalized_delta_project(ColumnId(100), ColumnId(1)),
                 malformed_delta_project_with_action_name(ColumnId(100), ColumnId(10)),
             ],
-            all: true,
-            output_columns: Vec::new(),
-            required_output_columns: None,
-        });
+            None,
+        );
 
         assert!(rule.matches(&union, &ctx));
         let err = rule.apply(union, &mut ctx).expect_err("Union must fail");
@@ -1366,11 +1432,12 @@ mod tests {
         let mut scan = delta_scan_with_action(ColumnId(100));
         scan.columns
             .push(ImvRowIdColumn::output_column(ColumnId(101)));
-        let plan = project_over(LogicalPlan::Scan(scan), ColumnId(1));
+        let plan = project_over(scan_plan(scan), ColumnId(1));
         assert!(rule.matches(&plan, &ctx));
-        let RewriteResult::Changed(LogicalPlan::Project(project)) =
-            rule.apply(plan, &mut ctx).expect("apply")
-        else {
+        let RewriteResult::Changed(changed) = rule.apply(plan, &mut ctx).expect("apply") else {
+            panic!("expected Changed(Project)");
+        };
+        let LogicalPlanNodeKind::Project(project) = changed.kind else {
             panic!("expected Changed(Project)");
         };
         // k + __change_op + _row_id
@@ -1386,16 +1453,18 @@ mod tests {
         // so the Project above can propagate it.
         let rule = PropagateActionColumnRule;
         let mut ctx = build_ctx();
-        let scan = LogicalPlan::Scan(delta_scan_with_action(ColumnId(100)));
-        let filter = LogicalPlan::Filter(FilterNode {
-            input: Box::new(scan),
-            predicate: TypedExpr {
-                kind: ExprKind::Literal(LiteralValue::Bool(true)),
-                data_type: DataType::Boolean,
-                nullable: false,
-            },
-            required_output_columns: None,
-        });
+        let scan = scan_plan(delta_scan_with_action(ColumnId(100)));
+        let filter = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::Bool(true)),
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                },
+            }),
+            vec![scan],
+            None,
+        );
         // Filter itself must not match (schema-passthrough, no work).
         assert!(!rule.matches(&filter, &ctx));
         // find_action_column traverses the Filter to the Scan.
@@ -1404,7 +1473,10 @@ mod tests {
         let project = project_over(filter, ColumnId(1));
         assert!(rule.matches(&project, &ctx));
         let result = rule.apply(project, &mut ctx).expect("apply must succeed");
-        let RewriteResult::Changed(LogicalPlan::Project(p)) = result else {
+        let RewriteResult::Changed(changed) = result else {
+            panic!("expected Changed(Project)");
+        };
+        let LogicalPlanNodeKind::Project(p) = changed.kind else {
             panic!("expected Changed(Project)");
         };
         assert!(p.items.iter().any(|i| i.output_name == "__change_op"));

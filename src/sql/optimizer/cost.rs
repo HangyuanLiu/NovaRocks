@@ -293,6 +293,7 @@ mod tests {
     use crate::sql::optimizer::operator::*;
     use crate::sql::optimizer::property::{DistributionSpec, OrderingSpec};
     use crate::sql::optimizer::statistics::ColumnStatistic;
+    use crate::sql::planner::plan::*;
     use std::collections::HashMap;
 
     fn stats(rows: f64, avg_size: f64) -> Statistics {

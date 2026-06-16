@@ -14,7 +14,7 @@ use crate::sql::optimizer::rewrite::imv::annotation::{
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
-use crate::sql::planner::plan::LogicalPlan;
+use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind};
 
 pub(crate) struct DerivePartitionSpecRule;
 
@@ -31,15 +31,19 @@ impl LogicalRewriteRule for DerivePartitionSpecRule {
         RewriteTraversal::TopDown
     }
 
-    fn matches(&self, plan: &LogicalPlan, ctx: &RewriteContext) -> bool {
-        if !matches!(plan, LogicalPlan::AggregateStateMerge(_)) {
+    fn matches(&self, plan: &LogicalPlanNode, ctx: &RewriteContext) -> bool {
+        if !matches!(&plan.kind, LogicalPlanNodeKind::AggregateStateMerge(_)) {
             return false;
         }
         ctx.extension::<ImvExtension>()
             .is_some_and(|ext| ext.annotation.partition.is_none())
     }
 
-    fn apply(&self, _plan: LogicalPlan, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        _plan: LogicalPlanNode,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, String> {
         let ext = ctx
             .extension::<ImvExtension>()
             .ok_or("DerivePartitionSpec requires ImvExtension")?

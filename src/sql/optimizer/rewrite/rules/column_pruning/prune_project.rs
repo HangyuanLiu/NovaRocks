@@ -1,6 +1,6 @@
 //! PruneProjectColumns — Phase 2 rule for Project nodes.
 //!
-//! Filters `ProjectNode.items` to only those whose `output_column_id` is in
+//! Filters `LogicalProjectNode.items` to only those whose `output_column_id` is in
 //! `required_output_columns`. When all items would be filtered out, an
 //! auto-fill placeholder item (`const 1 AS auto_fill_<id>`) is inserted using
 //! a freshly minted ColumnId from the ColumnRefFactory in context (Gap 2).
@@ -40,17 +40,26 @@ impl LogicalRewriteRule for PruneProjectColumns {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
-        matches!(plan, LogicalPlan::Project(_))
+    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+        matches!(&plan.kind, LogicalPlanNodeKind::Project(_))
     }
 
-    fn apply(&self, plan: LogicalPlan, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
-        let LogicalPlan::Project(mut node) = plan else {
+    fn apply(
+        &self,
+        plan: LogicalPlanNode,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, String> {
+        let LogicalPlanNode {
+            kind,
+            children,
+            required_output_columns,
+        } = plan;
+        let LogicalPlanNodeKind::Project(mut node) = kind else {
             unreachable!()
         };
 
         // None means Phase 1 hasn't tagged this node — no-op.
-        let Some(needed) = node.required_output_columns.clone() else {
+        let Some(needed) = required_output_columns.clone() else {
             return Ok(RewriteResult::Unchanged);
         };
 
@@ -99,7 +108,11 @@ impl LogicalRewriteRule for PruneProjectColumns {
         }
 
         node.items = new_items;
-        Ok(RewriteResult::Changed(LogicalPlan::Project(node)))
+        Ok(RewriteResult::Changed(LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(node),
+            children,
+            required_output_columns,
+        )))
     }
 }
 
@@ -110,12 +123,13 @@ mod tests {
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnRefFactory;
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
+    use crate::sql::planner::plan::*;
     use arrow::datatypes::DataType;
     use std::cell::RefCell;
     use std::collections::HashSet;
     use std::rc::Rc;
 
-    fn make_scan(id_a: ColumnId, id_b: ColumnId, id_c: ColumnId) -> LogicalPlan {
+    fn make_scan(id_a: ColumnId, id_b: ColumnId, id_c: ColumnId) -> LogicalPlanNode {
         let table = TableDef {
             name: "t".to_string(),
             columns: vec![
@@ -147,39 +161,42 @@ mod tests {
                 table_id: 0,
             },
         };
-        LogicalPlan::Scan(ScanNode {
-            database: "db".to_string(),
-            table,
-            alias: None,
-            columns: vec![
-                OutputColumn {
-                    column_id: id_a,
-                    name: "a".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
-                    is_internal: false,
-                },
-                OutputColumn {
-                    column_id: id_b,
-                    name: "b".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
-                    is_internal: false,
-                },
-                OutputColumn {
-                    column_id: id_c,
-                    name: "c".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
-                    is_internal: false,
-                },
-            ],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        })
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: table,
+                alias: None,
+                columns: vec![
+                    OutputColumn {
+                        column_id: id_a,
+                        name: "a".to_string(),
+                        data_type: DataType::Int32,
+                        nullable: false,
+                        is_internal: false,
+                    },
+                    OutputColumn {
+                        column_id: id_b,
+                        name: "b".to_string(),
+                        data_type: DataType::Int32,
+                        nullable: false,
+                        is_internal: false,
+                    },
+                    OutputColumn {
+                        column_id: id_c,
+                        name: "c".to_string(),
+                        data_type: DataType::Int32,
+                        nullable: false,
+                        is_internal: false,
+                    },
+                ],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        )
     }
 
     fn col_ref_item(id: ColumnId, name: &str) -> ProjectItem {
@@ -205,29 +222,38 @@ mod tests {
         ctx
     }
 
+    fn project_plan(
+        input: LogicalPlanNode,
+        items: Vec<ProjectItem>,
+        required_output_columns: Option<HashSet<ColumnId>>,
+    ) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items,
+                output_qualifier: None,
+            }),
+            vec![input],
+            required_output_columns,
+        )
+    }
+
     #[test]
     fn prune_project_filters_items_to_needed_subset() {
         let id_a = ColumnId::new_for_test(1);
         let id_b = ColumnId::new_for_test(2);
         let id_c = ColumnId::new_for_test(3);
 
-        let mut node = ProjectNode {
-            input: Box::new(make_scan(id_a, id_b, id_c)),
-            items: vec![
-                col_ref_item(id_a, "a"),
-                col_ref_item(id_b, "b"),
-                col_ref_item(id_c, "c"),
-            ],
-            output_qualifier: None,
-            required_output_columns: None,
-        };
+        let items = vec![
+            col_ref_item(id_a, "a"),
+            col_ref_item(id_b, "b"),
+            col_ref_item(id_c, "c"),
+        ];
 
         // Only b is needed.
         let mut needed = HashSet::new();
         needed.insert(id_b);
-        node.required_output_columns = Some(needed);
 
-        let plan = LogicalPlan::Project(node);
+        let plan = project_plan(make_scan(id_a, id_b, id_c), items, Some(needed));
         let rule = PruneProjectColumns;
         let result = rule.apply(plan, &mut ctx_with_factory()).unwrap();
 
@@ -235,7 +261,7 @@ mod tests {
             RewriteResult::Changed(p) => p,
             other => panic!("expected Changed, got {:?}", other),
         };
-        let LogicalPlan::Project(pruned) = changed else {
+        let LogicalPlanNodeKind::Project(pruned) = &changed.kind else {
             panic!("expected Project");
         };
 
@@ -249,18 +275,16 @@ mod tests {
         let id_b = ColumnId::new_for_test(2);
         let id_c = ColumnId::new_for_test(3);
 
-        let node = ProjectNode {
-            input: Box::new(make_scan(id_a, id_b, id_c)),
-            items: vec![
+        let plan = project_plan(
+            make_scan(id_a, id_b, id_c),
+            vec![
                 col_ref_item(id_a, "a"),
                 col_ref_item(id_b, "b"),
                 col_ref_item(id_c, "c"),
             ],
-            output_qualifier: None,
-            required_output_columns: None, // No Phase-1 tag
-        };
+            None,
+        );
 
-        let plan = LogicalPlan::Project(node);
         let rule = PruneProjectColumns;
         let result = rule.apply(plan, &mut ctx_with_factory()).unwrap();
 
@@ -278,19 +302,13 @@ mod tests {
         let id_c = ColumnId::new_for_test(3);
         let id_unknown = ColumnId::new_for_test(999);
 
-        let mut node = ProjectNode {
-            input: Box::new(make_scan(id_a, id_b, id_c)),
-            items: vec![col_ref_item(id_a, "a"), col_ref_item(id_b, "b")],
-            output_qualifier: None,
-            required_output_columns: None,
-        };
+        let items = vec![col_ref_item(id_a, "a"), col_ref_item(id_b, "b")];
 
         // Needed is {999} — not present in any item's output_column_id.
         let mut needed = HashSet::new();
         needed.insert(id_unknown);
-        node.required_output_columns = Some(needed);
 
-        let plan = LogicalPlan::Project(node);
+        let plan = project_plan(make_scan(id_a, id_b, id_c), items, Some(needed));
         let rule = PruneProjectColumns;
         let mut ctx = ctx_with_factory();
         let result = rule.apply(plan, &mut ctx).unwrap();
@@ -299,7 +317,7 @@ mod tests {
             RewriteResult::Changed(p) => p,
             other => panic!("expected Changed, got {:?}", other),
         };
-        let LogicalPlan::Project(pruned) = changed else {
+        let LogicalPlanNodeKind::Project(pruned) = &changed.kind else {
             panic!("expected Project");
         };
 
@@ -327,19 +345,13 @@ mod tests {
         let id_b = ColumnId::new_for_test(2);
         let id_c = ColumnId::new_for_test(3);
 
-        let mut node = ProjectNode {
-            input: Box::new(make_scan(id_a, id_b, id_c)),
-            items: vec![col_ref_item(id_a, "a")], // single item, NOT in needed
-            output_qualifier: None,
-            required_output_columns: None,
-        };
+        let items = vec![col_ref_item(id_a, "a")]; // single item, NOT in needed
 
         // needed = {999} — not present in the single item's output_column_id.
         let mut needed = HashSet::new();
         needed.insert(id_unknown);
-        node.required_output_columns = Some(needed);
 
-        let plan = LogicalPlan::Project(node);
+        let plan = project_plan(make_scan(id_a, id_b, id_c), items, Some(needed));
         let rule = PruneProjectColumns;
         let mut ctx = ctx_with_factory();
         let result = rule.apply(plan, &mut ctx).unwrap();
@@ -352,7 +364,7 @@ mod tests {
                 other
             ),
         };
-        let LogicalPlan::Project(pruned) = changed else {
+        let LogicalPlanNodeKind::Project(pruned) = &changed.kind else {
             panic!("expected Project");
         };
 
@@ -477,19 +489,21 @@ mod tests {
             output_name: "x".to_string(),
             output_column_id: out_x,
         };
-        let inner_project = LogicalPlan::Project(ProjectNode {
-            input: Box::new(scan),
-            items: vec![
-                inner_x_item,
-                ProjectItem {
-                    expr: assert_true_expr,
-                    output_name: "__assert".to_string(),
-                    output_column_id: assert_id,
-                },
-            ],
-            output_qualifier: None,
-            required_output_columns: None,
-        });
+        let inner_project = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![
+                    inner_x_item,
+                    ProjectItem {
+                        expr: assert_true_expr,
+                        output_name: "__assert".to_string(),
+                        output_column_id: assert_id,
+                    },
+                ],
+                output_qualifier: None,
+            }),
+            vec![scan],
+            None,
+        );
 
         // Project_outer: [x→out_x] — only references out_x, does NOT reference assert_id.
         let outer_x_item = ProjectItem {
@@ -505,12 +519,14 @@ mod tests {
             output_name: "x".to_string(),
             output_column_id: out_x,
         };
-        let outer_project = LogicalPlan::Project(ProjectNode {
-            input: Box::new(inner_project),
-            items: vec![outer_x_item],
-            output_qualifier: None,
-            required_output_columns: None,
-        });
+        let outer_project = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![outer_x_item],
+                output_qualifier: None,
+            }),
+            vec![inner_project],
+            None,
+        );
 
         // Phase 1: tag_required_columns with parent_needed = None (root).
         // After tagging, inner Project's required_output_columns = Some({out_x})
@@ -523,16 +539,14 @@ mod tests {
         let mut ctx = ctx_with_factory();
 
         // Pull out the tagged outer Project node and apply the rule.
-        let LogicalPlan::Project(outer_node) = tagged else {
+        let LogicalPlanNodeKind::Project(_) = &tagged.kind else {
             panic!("expected outer Project after tagging");
         };
-        let outer_result = rule
-            .apply(LogicalPlan::Project(outer_node.clone()), &mut ctx)
-            .unwrap();
+        let outer_result = rule.apply(tagged.clone(), &mut ctx).unwrap();
         // Outer has 1 item (out_x) which is in needed — result is Unchanged.
-        let outer_after_node = match outer_result {
-            RewriteResult::Changed(LogicalPlan::Project(p)) => p,
-            RewriteResult::Unchanged => outer_node,
+        let outer_after_plan = match outer_result {
+            RewriteResult::Changed(p) => p,
+            RewriteResult::Unchanged => tagged,
             other => panic!("unexpected outer result: {:?}", other),
         };
 
@@ -540,22 +554,19 @@ mod tests {
         // With the carve-out both items survive (x ∈ needed, assert_true via carve-out),
         // so lengths are equal and the rule returns Unchanged.
         // Without the carve-out the assert_true item would be dropped → Changed with 1 item.
-        // Either way we need the inner ProjectNode to inspect items; carry it along.
-        let inner_plan = *outer_after_node.input;
+        // Either way we need the inner LogicalProjectNode to inspect items; carry it along.
+        let inner_plan = outer_after_plan.unary_input().clone();
         // Clone the plan so we can inspect items regardless of Changed/Unchanged.
         let inner_plan_clone = inner_plan.clone();
         let inner_result = rule.apply(inner_plan, &mut ctx).unwrap();
 
-        let inner_pruned_node = match inner_result {
-            RewriteResult::Changed(LogicalPlan::Project(p)) => p,
-            RewriteResult::Unchanged => {
-                // Carve-out preserved both items → no change → extract from clone.
-                let LogicalPlan::Project(p) = inner_plan_clone else {
-                    panic!("expected inner Project in clone");
-                };
-                p
-            }
+        let inner_pruned_plan = match inner_result {
+            RewriteResult::Changed(p) => p,
+            RewriteResult::Unchanged => inner_plan_clone,
             other => panic!("unexpected inner result: {:?}", other),
+        };
+        let LogicalPlanNodeKind::Project(inner_pruned_node) = &inner_pruned_plan.kind else {
+            panic!("expected inner Project in clone");
         };
 
         // The assert_true item MUST survive even though assert_id ∉ {out_x}.
@@ -570,10 +581,11 @@ mod tests {
         // The cnt column must appear in the child Scan's required_output_columns.
         // tag_required_columns unions assert_true item's column refs (id_cnt) into
         // child_needed, so the Scan must expose cnt even though out_x doesn't reference it.
-        let LogicalPlan::Scan(scan_node) = inner_pruned_node.input.as_ref() else {
+        let scan_plan = inner_pruned_plan.unary_input();
+        let LogicalPlanNodeKind::Scan(_) = &scan_plan.kind else {
             panic!("expected Scan under inner Project");
         };
-        let scan_req = scan_node
+        let scan_req = scan_plan
             .required_output_columns
             .as_ref()
             .expect("Scan must have required_output_columns after tagging");

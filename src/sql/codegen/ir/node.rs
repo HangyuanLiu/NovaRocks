@@ -1,10 +1,12 @@
 use crate::sql::optimizer::statistics::{Confidence, Statistics};
 
 use super::FragmentId;
-use super::body::{
-    AssertOneRowBody, DecodeBody, GenerateSeriesBody, HashAggregateBody, HashJoinBody,
-    NestLoopJoinBody, ProjectBody, RepeatBody, ScanBody, SetOpBody, SortBody, TableFunctionBody,
-    TopNBody, ValuesBody, WindowBody,
+use super::kind::{
+    DistributedAssertOneRowNode, DistributedDecodeNode, DistributedGenerateSeriesNode,
+    DistributedHashAggregateNode, DistributedHashJoinNode, DistributedNestLoopJoinNode,
+    DistributedProjectNode, DistributedRepeatNode, DistributedScanNode, DistributedSetOpNode,
+    DistributedSortNode, DistributedTableFunctionNode, DistributedTopNNode, DistributedValuesNode,
+    DistributedWindowNode,
 };
 
 /// Self-contained copy of the estimated stats this node carries, so EXPLAIN /
@@ -27,8 +29,8 @@ impl PlanNodeStats {
 #[derive(Clone, Debug)]
 pub(crate) struct DistributedPlanNode {
     /// Allocated once in Pass 1; never reallocated. In a thrift-lowered
-    /// fragment most DistributedPlanNode bodies produce exactly one TPlanNode.
-    /// Multi-node bodies use this as the root emitted TPlanNode id.
+    /// fragment most DistributedPlanNode kinds produce exactly one TPlanNode.
+    /// Multi-node kinds use this as the root emitted TPlanNode id.
     pub node_id: i32,
     pub fragment_id: FragmentId,
     /// Output tuples (thrift `row_tuples`). Allocated in Pass 1.
@@ -43,28 +45,28 @@ pub(crate) struct DistributedPlanNode {
     pub probe_runtime_filters: Vec<crate::sql::optimizer::runtime_filter_pass::RuntimeFilterProbe>,
     pub children: Vec<DistributedPlanNode>,
     pub stats: PlanNodeStats,
-    pub body: DistributedPlanNodeBody,
+    pub kind: DistributedPlanNodeKind,
 }
 
 /// Operator-specific payload. Grows one variant per operator as slices land.
-/// Filter has no variant: its predicate folds into the child's `ScanBody.predicates`.
+/// Filter has no variant: its predicate folds into the child's `DistributedScanNode.predicates`.
 #[derive(Clone, Debug)]
-pub(crate) enum DistributedPlanNodeBody {
-    Scan(Box<ScanBody>),
-    Project(ProjectBody),
-    Sort(SortBody),
-    TopN(TopNBody),
-    HashAggregate(Box<HashAggregateBody>),
-    HashJoin(Box<HashJoinBody>),
-    NestLoopJoin(NestLoopJoinBody),
-    Values(ValuesBody),
-    AssertOneRow(AssertOneRowBody),
-    Decode(DecodeBody),
-    Repeat(Box<RepeatBody>),
-    SetOp(SetOpBody),
-    Window(Box<WindowBody>),
-    GenerateSeries(GenerateSeriesBody),
-    TableFunction(Box<TableFunctionBody>),
+pub(crate) enum DistributedPlanNodeKind {
+    Scan(Box<DistributedScanNode>),
+    Project(DistributedProjectNode),
+    Sort(DistributedSortNode),
+    TopN(DistributedTopNNode),
+    HashAggregate(Box<DistributedHashAggregateNode>),
+    HashJoin(Box<DistributedHashJoinNode>),
+    NestLoopJoin(DistributedNestLoopJoinNode),
+    Values(DistributedValuesNode),
+    AssertOneRow(DistributedAssertOneRowNode),
+    Decode(DistributedDecodeNode),
+    Repeat(Box<DistributedRepeatNode>),
+    SetOp(DistributedSetOpNode),
+    Window(Box<DistributedWindowNode>),
+    GenerateSeries(DistributedGenerateSeriesNode),
+    TableFunction(Box<DistributedTableFunctionNode>),
 }
 
 #[cfg(test)]
@@ -80,5 +82,28 @@ mod tests {
         };
         let s = PlanNodeStats::from_statistics(&stats);
         assert_eq!(s.output_row_count, 7.0);
+    }
+
+    #[test]
+    fn distributed_plan_node_exposes_kind_and_children_uniformly() {
+        let node = DistributedPlanNode {
+            node_id: 1,
+            fragment_id: 0,
+            tuple_ids: vec![1],
+            nullable_tuple_ids: vec![],
+            limit: -1,
+            execution_join_distribution: None,
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+            children: vec![],
+            stats: PlanNodeStats::from_statistics(&Statistics::default()),
+            kind: DistributedPlanNodeKind::Values(DistributedValuesNode {
+                rows: vec![],
+                columns: vec![],
+            }),
+        };
+
+        assert!(matches!(node.kind, DistributedPlanNodeKind::Values(_)));
+        assert!(node.children.is_empty());
     }
 }

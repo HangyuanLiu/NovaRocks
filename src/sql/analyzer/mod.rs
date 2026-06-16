@@ -5578,7 +5578,7 @@ mod tests {
                 .expect("ROLLUP should produce RepeatInfo");
             // GROUPING(o_orderstatus) should be recorded. The name is an internal
             // placeholder (__grouping_fn_N) rather than the user alias — the alias
-            // mapping is handled later by the planner when constructing RepeatPlanNode.
+            // mapping is handled later by the planner when constructing LogicalRepeatNode.
             assert_eq!(repeat.grouping_fn_args.len(), 1);
             assert_eq!(repeat.grouping_fn_args[0].0, "__grouping_fn_0");
             assert_eq!(repeat.grouping_fn_args[0].1, vec!["o_orderstatus"]);

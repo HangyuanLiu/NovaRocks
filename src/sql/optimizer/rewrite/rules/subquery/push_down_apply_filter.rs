@@ -19,7 +19,10 @@ use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
 use crate::sql::optimizer::rewrite::rules::utils::combine_and;
-use crate::sql::planner::plan::{ApplyKind, ApplyNode, FilterNode, LogicalPlan, ProjectNode};
+use crate::sql::planner::plan::{
+    ApplyKind, LogicalApplyNode, LogicalFilterNode, LogicalPlanNode, LogicalPlanNodeKind,
+    LogicalProjectNode,
+};
 
 pub(crate) struct PushDownApplyFilter;
 
@@ -32,8 +35,8 @@ impl LogicalRewriteRule for PushDownApplyFilter {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
-        let LogicalPlan::Apply(a) = plan else {
+    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+        let LogicalPlanNodeKind::Apply(a) = &plan.kind else {
             return false;
         };
         if a.kind != ApplyKind::Scalar {
@@ -43,21 +46,35 @@ impl LogicalRewriteRule for PushDownApplyFilter {
             return false;
         }
         let corr_ids: HashSet<ColumnId> = a.correlation_column_ids.iter().copied().collect();
-        inner_has_correlated_nonagg_filter(&a.right, &corr_ids)
+        inner_has_correlated_nonagg_filter(plan.right(), &corr_ids)
     }
 
-    fn apply(&self, plan: LogicalPlan, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
-        let LogicalPlan::Apply(a) = plan else {
+    fn apply(
+        &self,
+        plan: LogicalPlanNode,
+        _ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, String> {
+        let LogicalPlanNode {
+            kind,
+            mut children,
+            required_output_columns,
+        } = plan;
+        let LogicalPlanNodeKind::Apply(a) = kind else {
             return Ok(RewriteResult::Unchanged);
         };
+        if children.len() != 2 {
+            return Ok(RewriteResult::Unchanged);
+        }
+        let right = children.remove(1);
+        let left = children.remove(0);
         let corr_ids: HashSet<ColumnId> = a.correlation_column_ids.iter().copied().collect();
 
         // Peel the optional leading Project and extract the filter node.
-        let (leading_project, filter_node) = peel_inner(&a.right, &corr_ids)
+        let peeled = peel_inner(&right, &corr_ids)
             .ok_or_else(|| "PushDownApplyFilter: inner shape mismatch".to_string())?;
 
         // Split the Filter predicate into (correlated, residual).
-        let predicate = filter_node.predicate.clone();
+        let predicate = peeled.filter.predicate.clone();
         let (correlated, residual) = partition_conjuncts(predicate, &corr_ids);
 
         // If nothing to hoist, leave unchanged.
@@ -83,24 +100,28 @@ impl LogicalRewriteRule for PushDownApplyFilter {
 
         // Rebuild the filter input: drop the Filter if all conjuncts were correlated,
         // or keep a Filter with only the residual conjuncts.
-        let new_filter_input: LogicalPlan = if residual.is_empty() {
-            *filter_node.input.clone()
+        let new_filter_input: LogicalPlanNode = if residual.is_empty() {
+            peeled.filter_input.clone()
         } else {
-            LogicalPlan::Filter(FilterNode {
-                predicate: combine_and(residual),
-                input: filter_node.input.clone(),
-                required_output_columns: None,
-            })
+            LogicalPlanNode::new(
+                LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                    predicate: combine_and(residual),
+                }),
+                vec![peeled.filter_input.clone()],
+                None,
+            )
         };
 
         // Re-wrap in the leading Project if present (input is updated to the new filter input).
-        let new_inner: LogicalPlan = if let Some(proj) = leading_project {
-            LogicalPlan::Project(ProjectNode {
-                input: Box::new(new_filter_input),
-                items: proj.items.clone(),
-                output_qualifier: proj.output_qualifier.clone(),
-                required_output_columns: None,
-            })
+        let new_inner: LogicalPlanNode = if let Some(proj) = peeled.leading_project {
+            LogicalPlanNode::new(
+                LogicalPlanNodeKind::Project(LogicalProjectNode {
+                    items: proj.items.clone(),
+                    output_qualifier: proj.output_qualifier.clone(),
+                }),
+                vec![new_filter_input],
+                None,
+            )
         } else {
             new_filter_input
         };
@@ -110,13 +131,16 @@ impl LogicalRewriteRule for PushDownApplyFilter {
         let mut new_correlation = a.correlation_conjuncts.clone();
         new_correlation.extend(correlated);
 
-        Ok(RewriteResult::Changed(LogicalPlan::Apply(ApplyNode {
-            right: Box::new(new_inner),
-            correlation_conjuncts: new_correlation,
-            // need_check_max_rows stays true: no aggregate → ScalarApplyToJoin
-            // must add the count(1)/any_value/assert_true row-check.
-            ..a
-        })))
+        Ok(RewriteResult::Changed(LogicalPlanNode::new(
+            LogicalPlanNodeKind::Apply(LogicalApplyNode {
+                correlation_conjuncts: new_correlation,
+                // need_check_max_rows stays true: no aggregate → ScalarApplyToJoin
+                // must add the count(1)/any_value/assert_true row-check.
+                ..a
+            }),
+            vec![left, new_inner],
+            required_output_columns,
+        )))
     }
 }
 
@@ -127,16 +151,20 @@ impl LogicalRewriteRule for PushDownApplyFilter {
 ///
 /// If the inner is `Aggregate(Filter(...))` this returns false so that
 /// `PushDownApplyAggFilter` can own it (mutual exclusion guarantee).
-fn inner_has_correlated_nonagg_filter(plan: &LogicalPlan, corr_ids: &HashSet<ColumnId>) -> bool {
-    let after_project = match plan {
-        LogicalPlan::Project(p) => p.input.as_ref(),
-        other => other,
+fn inner_has_correlated_nonagg_filter(
+    plan: &LogicalPlanNode,
+    corr_ids: &HashSet<ColumnId>,
+) -> bool {
+    let after_project = if matches!(&plan.kind, LogicalPlanNodeKind::Project(_)) {
+        plan.unary_input()
+    } else {
+        plan
     };
     // The node after the optional project must be a Filter, NOT an Aggregate.
     // An Aggregate (possibly over a Filter) belongs to PushDownApplyAggFilter.
-    match after_project {
-        LogicalPlan::Aggregate(_) => false,
-        LogicalPlan::Filter(f) => {
+    match &after_project.kind {
+        LogicalPlanNodeKind::Aggregate(_) => false,
+        LogicalPlanNodeKind::Filter(f) => {
             // At least one conjunct must reference a corr_id.
             use crate::sql::optimizer::rewrite::rules::utils::{collect_column_id_refs, split_and};
             split_and(f.predicate.clone())
@@ -147,31 +175,45 @@ fn inner_has_correlated_nonagg_filter(plan: &LogicalPlan, corr_ids: &HashSet<Col
     }
 }
 
-/// Destructures the inner plan into `(leading_project, filter_node)`.
+struct PeeledFilter<'a> {
+    leading_project: Option<&'a LogicalProjectNode>,
+    filter: &'a LogicalFilterNode,
+    filter_input: &'a LogicalPlanNode,
+}
+
+/// Destructures the inner plan into `[Project?] Filter(input)`.
 /// Returns `None` if the shape doesn't match (non-agg Filter required).
 fn peel_inner<'a>(
-    plan: &'a LogicalPlan,
+    plan: &'a LogicalPlanNode,
     corr_ids: &HashSet<ColumnId>,
-) -> Option<(Option<&'a ProjectNode>, &'a FilterNode)> {
-    match plan {
-        LogicalPlan::Project(proj) => {
-            let filter = peel_corr_filter(&proj.input, corr_ids)?;
-            Some((Some(proj), filter))
+) -> Option<PeeledFilter<'a>> {
+    match &plan.kind {
+        LogicalPlanNodeKind::Project(proj) => {
+            let (filter, filter_input) = peel_corr_filter(plan.unary_input(), corr_ids)?;
+            Some(PeeledFilter {
+                leading_project: Some(proj),
+                filter,
+                filter_input,
+            })
         }
-        other => {
-            let filter = peel_corr_filter(other, corr_ids)?;
-            Some((None, filter))
+        _ => {
+            let (filter, filter_input) = peel_corr_filter(plan, corr_ids)?;
+            Some(PeeledFilter {
+                leading_project: None,
+                filter,
+                filter_input,
+            })
         }
     }
 }
 
 fn peel_corr_filter<'a>(
-    plan: &'a LogicalPlan,
+    plan: &'a LogicalPlanNode,
     corr_ids: &HashSet<ColumnId>,
-) -> Option<&'a FilterNode> {
+) -> Option<(&'a LogicalFilterNode, &'a LogicalPlanNode)> {
     // Only match a Filter that is NOT an Aggregate-over-Filter (that's PushDownApplyAggFilter).
     // A plain Filter node with a correlated predicate is what we want.
-    let LogicalPlan::Filter(f) = plan else {
+    let LogicalPlanNodeKind::Filter(f) = &plan.kind else {
         return None;
     };
     // Verify at least one conjunct references a corr_id.
@@ -179,11 +221,16 @@ fn peel_corr_filter<'a>(
     let has_corr = split_and(f.predicate.clone())
         .iter()
         .any(|c| !collect_column_id_refs(c).is_disjoint(corr_ids));
-    if has_corr { Some(f) } else { None }
+    if has_corr {
+        Some((f, plan.unary_input()))
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::sql::planner::plan::*;
     use std::collections::HashSet;
 
     use arrow::datatypes::DataType;
@@ -197,8 +244,8 @@ mod tests {
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::planner::plan::{
-        AggregateCall, AggregateNode, ApplyKind, ApplyNode, FilterNode, LogicalPlan, ScanNode,
-        ValuesNode,
+        AggregateCall, ApplyKind, LogicalAggregateNode, LogicalApplyNode, LogicalFilterNode,
+        LogicalPlanNode, LogicalPlanNodeKind, LogicalScanNode, LogicalValuesNode,
     };
 
     // ---- Column ID constants -------------------------------------------------
@@ -267,46 +314,49 @@ mod tests {
         }
     }
 
-    fn make_t2_scan() -> LogicalPlan {
-        LogicalPlan::Scan(ScanNode {
-            database: "default".to_string(),
-            table: TableDef {
-                name: "t2".to_string(),
-                columns: vec![],
-                iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::StarRocks {
-                    db_id: 0,
-                    table_id: 0,
+    fn make_t2_scan() -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "default".to_string(),
+                table: TableDef {
+                    name: "t2".to_string(),
+                    columns: vec![],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 0,
+                    },
                 },
-            },
-            alias: None,
-            columns: vec![
-                OutputColumn {
-                    column_id: T2_K,
-                    name: "k".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
-                    is_internal: false,
-                },
-                OutputColumn {
-                    column_id: T2_V2,
-                    name: "v2".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
-                    is_internal: false,
-                },
-            ],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        })
+                alias: None,
+                columns: vec![
+                    OutputColumn {
+                        column_id: T2_K,
+                        name: "k".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        is_internal: false,
+                    },
+                    OutputColumn {
+                        column_id: T2_V2,
+                        name: "v2".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        is_internal: false,
+                    },
+                ],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        )
     }
 
     /// Build the inner plan with a leading Project:
     ///   Project(v2) -> Filter(t2.k == OUTER AND v2 > 5)(Scan t2)
-    fn inner_project_over_corr_filter_with_residual() -> LogicalPlan {
+    fn inner_project_over_corr_filter_with_residual() -> LogicalPlanNode {
         let corr_pred = eq_expr(
             col_ref(T2_K, "k", DataType::Int64),
             col_ref(OUTER_K, "k", DataType::Int64),
@@ -321,58 +371,66 @@ mod tests {
         );
         let combined_pred = and_expr(corr_pred, residual_pred);
 
-        let filter = LogicalPlan::Filter(FilterNode {
-            input: Box::new(make_t2_scan()),
-            predicate: combined_pred,
-            required_output_columns: None,
-        });
+        let filter = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: combined_pred,
+            }),
+            vec![make_t2_scan()],
+            None,
+        );
 
-        LogicalPlan::Project(ProjectNode {
-            input: Box::new(filter),
-            items: vec![ProjectItem {
-                expr: col_ref(T2_V2, "v2", DataType::Int64),
-                output_name: "v2".to_string(),
-                output_column_id: T2_V2,
-            }],
-            output_qualifier: None,
-            required_output_columns: None,
-        })
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![ProjectItem {
+                    expr: col_ref(T2_V2, "v2", DataType::Int64),
+                    output_name: "v2".to_string(),
+                    output_column_id: T2_V2,
+                }],
+                output_qualifier: None,
+            }),
+            vec![filter],
+            None,
+        )
     }
 
-    fn correlated_nonagg_apply() -> LogicalPlan {
-        let outer_values = LogicalPlan::Values(ValuesNode {
-            rows: vec![],
-            columns: vec![OutputColumn {
-                column_id: OUTER_K,
-                name: "k".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
-                is_internal: false,
-            }],
-            required_output_columns: None,
-        });
+    fn correlated_nonagg_apply() -> LogicalPlanNode {
+        let outer_values = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Values(LogicalValuesNode {
+                rows: vec![],
+                columns: vec![OutputColumn {
+                    column_id: OUTER_K,
+                    name: "k".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    is_internal: false,
+                }],
+            }),
+            vec![],
+            None,
+        );
 
-        LogicalPlan::Apply(ApplyNode {
-            left: Box::new(outer_values),
-            right: Box::new(inner_project_over_corr_filter_with_residual()),
-            kind: ApplyKind::Scalar,
-            subquery_expr: col_ref_nullable(APPLY_OUT, "subq", DataType::Int64),
-            output_column: OutputColumn {
-                column_id: APPLY_OUT,
-                name: "subq".to_string(),
-                data_type: DataType::Int64,
-                nullable: true,
-                is_internal: true,
-            },
-            inner_output_column_id: T2_V2,
-            correlation_column_ids: vec![OUTER_K],
-            correlation_conjuncts: vec![],
-            residual_predicate: None,
-            need_check_max_rows: true,
-            use_semi_anti: false,
-            uncorrelated_outer_predicate_columns: HashSet::new(),
-            required_output_columns: None,
-        })
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Apply(LogicalApplyNode {
+                kind: ApplyKind::Scalar,
+                subquery_expr: col_ref_nullable(APPLY_OUT, "subq", DataType::Int64),
+                output_column: OutputColumn {
+                    column_id: APPLY_OUT,
+                    name: "subq".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    is_internal: true,
+                },
+                inner_output_column_id: T2_V2,
+                correlation_column_ids: vec![OUTER_K],
+                correlation_conjuncts: vec![],
+                residual_predicate: None,
+                need_check_max_rows: true,
+                use_semi_anti: false,
+                uncorrelated_outer_predicate_columns: HashSet::new(),
+            }),
+            vec![outer_values, inner_project_over_corr_filter_with_residual()],
+            None,
+        )
     }
 
     /// Core correctness test: the rule hoists the correlated EQ and keeps the residual.
@@ -403,7 +461,7 @@ mod tests {
             other => panic!("expected Changed, got: {other:?}"),
         };
 
-        let LogicalPlan::Apply(new_apply) = &new_plan else {
+        let LogicalPlanNodeKind::Apply(new_apply) = &new_plan.kind else {
             panic!("expected Apply, got: {new_plan:?}");
         };
 
@@ -436,18 +494,20 @@ mod tests {
         assert!(all_ids.contains(&T2_K), "must reference T2_K");
 
         // The inner is Project(v2)(Filter(v2>5)(Scan t2)).
-        let LogicalPlan::Project(proj) = new_apply.right.as_ref() else {
-            panic!("right child must be Project, got: {:?}", new_apply.right);
+        let right_plan = new_plan.right();
+        let LogicalPlanNodeKind::Project(proj) = &right_plan.kind else {
+            panic!("right child must be Project, got: {:?}", right_plan);
         };
         // Project passes v2 through.
         assert_eq!(proj.items.len(), 1);
         assert_eq!(proj.items[0].output_column_id, T2_V2);
 
         // Project's input: Filter with residual only (v2 > 5).
-        let LogicalPlan::Filter(residual_filter) = proj.input.as_ref() else {
+        let residual_plan = right_plan.unary_input();
+        let LogicalPlanNodeKind::Filter(residual_filter) = &residual_plan.kind else {
             panic!(
                 "project input must be Filter (residual), got: {:?}",
-                proj.input
+                residual_plan
             );
         };
         // The residual filter predicate must NOT reference OUTER_K.
@@ -459,7 +519,10 @@ mod tests {
 
         // Residual filter's input must be the Scan.
         assert!(
-            matches!(residual_filter.input.as_ref(), LogicalPlan::Scan(_)),
+            matches!(
+                &residual_plan.unary_input().kind,
+                LogicalPlanNodeKind::Scan(_)
+            ),
             "residual filter input must be Scan"
         );
     }
@@ -474,54 +537,65 @@ mod tests {
             col_ref(OUTER_K, "k", DataType::Int64),
         );
 
-        let filter = LogicalPlan::Filter(FilterNode {
-            input: Box::new(make_t2_scan()),
-            predicate: corr_pred,
-            required_output_columns: None,
-        });
+        let filter = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: corr_pred,
+            }),
+            vec![make_t2_scan()],
+            None,
+        );
 
-        let inner = LogicalPlan::Project(ProjectNode {
-            input: Box::new(filter),
-            items: vec![ProjectItem {
-                expr: col_ref(T2_V2, "v2", DataType::Int64),
-                output_name: "v2".to_string(),
-                output_column_id: T2_V2,
-            }],
-            output_qualifier: None,
-            required_output_columns: None,
-        });
-
-        let apply = LogicalPlan::Apply(ApplyNode {
-            left: Box::new(LogicalPlan::Values(ValuesNode {
-                rows: vec![],
-                columns: vec![OutputColumn {
-                    column_id: OUTER_K,
-                    name: "k".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
-                    is_internal: false,
+        let inner = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![ProjectItem {
+                    expr: col_ref(T2_V2, "v2", DataType::Int64),
+                    output_name: "v2".to_string(),
+                    output_column_id: T2_V2,
                 }],
-                required_output_columns: None,
-            })),
-            right: Box::new(inner),
-            kind: ApplyKind::Scalar,
-            subquery_expr: col_ref_nullable(APPLY_OUT, "subq", DataType::Int64),
-            output_column: OutputColumn {
-                column_id: APPLY_OUT,
-                name: "subq".to_string(),
-                data_type: DataType::Int64,
-                nullable: true,
-                is_internal: true,
-            },
-            inner_output_column_id: T2_V2,
-            correlation_column_ids: vec![OUTER_K],
-            correlation_conjuncts: vec![],
-            residual_predicate: None,
-            need_check_max_rows: true,
-            use_semi_anti: false,
-            uncorrelated_outer_predicate_columns: HashSet::new(),
-            required_output_columns: None,
-        });
+                output_qualifier: None,
+            }),
+            vec![filter],
+            None,
+        );
+
+        let apply = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Apply(LogicalApplyNode {
+                kind: ApplyKind::Scalar,
+                subquery_expr: col_ref_nullable(APPLY_OUT, "subq", DataType::Int64),
+                output_column: OutputColumn {
+                    column_id: APPLY_OUT,
+                    name: "subq".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    is_internal: true,
+                },
+                inner_output_column_id: T2_V2,
+                correlation_column_ids: vec![OUTER_K],
+                correlation_conjuncts: vec![],
+                residual_predicate: None,
+                need_check_max_rows: true,
+                use_semi_anti: false,
+                uncorrelated_outer_predicate_columns: HashSet::new(),
+            }),
+            vec![
+                LogicalPlanNode::new(
+                    LogicalPlanNodeKind::Values(LogicalValuesNode {
+                        rows: vec![],
+                        columns: vec![OutputColumn {
+                            column_id: OUTER_K,
+                            name: "k".to_string(),
+                            data_type: DataType::Int64,
+                            nullable: false,
+                            is_internal: false,
+                        }],
+                    }),
+                    vec![],
+                    None,
+                ),
+                inner,
+            ],
+            None,
+        );
 
         let rule = PushDownApplyFilter;
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
@@ -534,7 +608,7 @@ mod tests {
             other => panic!("expected Changed, got: {other:?}"),
         };
 
-        let LogicalPlan::Apply(new_apply) = &new_plan else {
+        let LogicalPlanNodeKind::Apply(new_apply) = &new_plan.kind else {
             panic!("expected Apply");
         };
 
@@ -544,13 +618,14 @@ mod tests {
         assert_eq!(new_apply.correlation_conjuncts.len(), 1);
 
         // Inner: Project sits directly over the Scan (Filter removed).
-        let LogicalPlan::Project(proj) = new_apply.right.as_ref() else {
+        let right_plan = new_plan.right();
+        let LogicalPlanNodeKind::Project(_) = &right_plan.kind else {
             panic!("right child must be Project");
         };
         assert!(
-            matches!(proj.input.as_ref(), LogicalPlan::Scan(_)),
+            matches!(&right_plan.unary_input().kind, LogicalPlanNodeKind::Scan(_)),
             "project input must be Scan when all filter conjuncts were correlated; got: {:?}",
-            proj.input
+            right_plan.unary_input()
         );
     }
 
@@ -566,58 +641,69 @@ mod tests {
             col_ref(T2_K, "k", DataType::Int64),
             col_ref(OUTER_K, "k", DataType::Int64),
         );
-        let filter = LogicalPlan::Filter(FilterNode {
-            input: Box::new(make_t2_scan()),
-            predicate: corr_pred,
-            required_output_columns: None,
-        });
-        let inner = LogicalPlan::Aggregate(AggregateNode {
-            input: Box::new(filter),
-            group_by: vec![],
-            aggregates: vec![AggregateCall {
-                name: "max".to_string(),
-                args: vec![col_ref(T2_V2, "v2", DataType::Int64)],
-                distinct: false,
-                result_type: DataType::Int64,
-                order_by: vec![],
-                output_column_id: MAX_RESULT,
-            }],
-            output_columns: vec![OutputColumn {
-                column_id: MAX_RESULT,
-                name: "max(v2)".to_string(),
-                data_type: DataType::Int64,
-                nullable: true,
-                is_internal: false,
-            }],
-            already_pushed: false,
-            required_output_columns: None,
-        });
+        let filter = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: corr_pred,
+            }),
+            vec![make_t2_scan()],
+            None,
+        );
+        let inner = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![],
+                aggregates: vec![AggregateCall {
+                    name: "max".to_string(),
+                    args: vec![col_ref(T2_V2, "v2", DataType::Int64)],
+                    distinct: false,
+                    result_type: DataType::Int64,
+                    order_by: vec![],
+                    output_column_id: MAX_RESULT,
+                }],
+                output_columns: vec![OutputColumn {
+                    column_id: MAX_RESULT,
+                    name: "max(v2)".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    is_internal: false,
+                }],
+                already_pushed: false,
+            }),
+            vec![filter],
+            None,
+        );
 
-        let apply = LogicalPlan::Apply(ApplyNode {
-            left: Box::new(LogicalPlan::Values(ValuesNode {
-                rows: vec![],
-                columns: vec![],
-                required_output_columns: None,
-            })),
-            right: Box::new(inner),
-            kind: ApplyKind::Scalar,
-            subquery_expr: col_ref_nullable(APPLY_OUT, "subq", DataType::Int64),
-            output_column: OutputColumn {
-                column_id: APPLY_OUT,
-                name: "subq".to_string(),
-                data_type: DataType::Int64,
-                nullable: true,
-                is_internal: true,
-            },
-            inner_output_column_id: MAX_RESULT,
-            correlation_column_ids: vec![OUTER_K],
-            correlation_conjuncts: vec![],
-            residual_predicate: None,
-            need_check_max_rows: true,
-            use_semi_anti: false,
-            uncorrelated_outer_predicate_columns: HashSet::new(),
-            required_output_columns: None,
-        });
+        let apply = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Apply(LogicalApplyNode {
+                kind: ApplyKind::Scalar,
+                subquery_expr: col_ref_nullable(APPLY_OUT, "subq", DataType::Int64),
+                output_column: OutputColumn {
+                    column_id: APPLY_OUT,
+                    name: "subq".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    is_internal: true,
+                },
+                inner_output_column_id: MAX_RESULT,
+                correlation_column_ids: vec![OUTER_K],
+                correlation_conjuncts: vec![],
+                residual_predicate: None,
+                need_check_max_rows: true,
+                use_semi_anti: false,
+                uncorrelated_outer_predicate_columns: HashSet::new(),
+            }),
+            vec![
+                LogicalPlanNode::new(
+                    LogicalPlanNodeKind::Values(LogicalValuesNode {
+                        rows: vec![],
+                        columns: vec![],
+                    }),
+                    vec![],
+                    None,
+                ),
+                inner,
+            ],
+            None,
+        );
 
         let rule = PushDownApplyFilter;
         let ctx = RewriteContext::for_query(Vec::<String>::new());
@@ -635,35 +721,46 @@ mod tests {
         let rule = PushDownApplyFilter;
         let ctx = RewriteContext::for_query(Vec::<String>::new());
 
-        let plan = LogicalPlan::Apply(ApplyNode {
-            left: Box::new(LogicalPlan::Values(ValuesNode {
-                rows: vec![],
-                columns: vec![],
-                required_output_columns: None,
-            })),
-            right: Box::new(LogicalPlan::Values(ValuesNode {
-                rows: vec![],
-                columns: vec![],
-                required_output_columns: None,
-            })),
-            kind: ApplyKind::Scalar,
-            subquery_expr: col_ref(APPLY_OUT, "subq", DataType::Int64),
-            output_column: OutputColumn {
-                column_id: APPLY_OUT,
-                name: "subq".to_string(),
-                data_type: DataType::Int64,
-                nullable: true,
-                is_internal: true,
-            },
-            inner_output_column_id: APPLY_OUT,
-            correlation_column_ids: vec![], // uncorrelated
-            correlation_conjuncts: vec![],
-            residual_predicate: None,
-            need_check_max_rows: true,
-            use_semi_anti: false,
-            uncorrelated_outer_predicate_columns: HashSet::new(),
-            required_output_columns: None,
-        });
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Apply(LogicalApplyNode {
+                kind: ApplyKind::Scalar,
+                subquery_expr: col_ref(APPLY_OUT, "subq", DataType::Int64),
+                output_column: OutputColumn {
+                    column_id: APPLY_OUT,
+                    name: "subq".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    is_internal: true,
+                },
+                inner_output_column_id: APPLY_OUT,
+                correlation_column_ids: vec![],
+                // uncorrelated
+                correlation_conjuncts: vec![],
+                residual_predicate: None,
+                need_check_max_rows: true,
+                use_semi_anti: false,
+                uncorrelated_outer_predicate_columns: HashSet::new(),
+            }),
+            vec![
+                LogicalPlanNode::new(
+                    LogicalPlanNodeKind::Values(LogicalValuesNode {
+                        rows: vec![],
+                        columns: vec![],
+                    }),
+                    vec![],
+                    None,
+                ),
+                LogicalPlanNode::new(
+                    LogicalPlanNodeKind::Values(LogicalValuesNode {
+                        rows: vec![],
+                        columns: vec![],
+                    }),
+                    vec![],
+                    None,
+                ),
+            ],
+            None,
+        );
 
         assert!(
             !rule.matches(&plan, &ctx),

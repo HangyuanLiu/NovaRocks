@@ -423,8 +423,10 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::convert::logical_plan_to_memo;
     use crate::sql::optimizer::memo::Memo;
+    use crate::sql::planner::plan::*;
     use crate::sql::planner::plan::{
-        AggregateCall, AggregateNode, FilterNode, LogicalPlan, ScanNode,
+        AggregateCall, LogicalAggregateNode, LogicalFilterNode, LogicalPlanNode,
+        LogicalPlanNodeKind, LogicalScanNode,
     };
     use arrow::datatypes::DataType;
 
@@ -515,19 +517,22 @@ mod tests {
     }
 
     /// `Scan` over the base table identity `cat.ns.t` exposing `columns`.
-    fn base_scan(columns: &[OutputColumn]) -> LogicalPlan {
+    fn base_scan(columns: &[OutputColumn]) -> LogicalPlanNode {
         let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
-        LogicalPlan::Scan(ScanNode {
-            database: "ns".to_string(),
-            table: iceberg_table("cat", "ns", "t", &names),
-            alias: None,
-            columns: columns.to_vec(),
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        })
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "ns".to_string(),
+                table: iceberg_table("cat", "ns", "t", &names),
+                alias: None,
+                columns: columns.to_vec(),
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        )
     }
 
     fn sum_call(arg: &OutputColumn, out: &OutputColumn) -> AggregateCall {
@@ -574,18 +579,22 @@ mod tests {
         let b = col(101, "b");
         let v = col(102, "v");
         let s = col(110, "s");
-        let plan = LogicalPlan::Aggregate(AggregateNode {
-            input: Box::new(LogicalPlan::Filter(FilterNode {
-                input: Box::new(base_scan(&[a.clone(), b.clone(), v.clone()])),
-                predicate: ge(col_ref(&a), mv_low),
-                required_output_columns: None,
-            })),
-            group_by: vec![col_ref(&a), col_ref(&b)],
-            aggregates: vec![sum_call(&v, &s)],
-            output_columns: vec![a.clone(), b.clone(), s.clone()],
-            already_pushed: false,
-            required_output_columns: None,
-        });
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![col_ref(&a), col_ref(&b)],
+                aggregates: vec![sum_call(&v, &s)],
+                output_columns: vec![a.clone(), b.clone(), s.clone()],
+                already_pushed: false,
+            }),
+            vec![LogicalPlanNode::new(
+                LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                    predicate: ge(col_ref(&a), mv_low),
+                }),
+                vec![base_scan(&[a.clone(), b.clone(), v.clone()])],
+                None,
+            )],
+            None,
+        );
         SpjgDescriptor::from_logical_plan(&plan).expect("mv spjg")
     }
 
@@ -632,18 +641,22 @@ mod tests {
         let a = col(1, "a");
         let v = col(2, "v");
         let s = col(3, "s"); // original aggregate sum output id
-        let query_plan = LogicalPlan::Aggregate(AggregateNode {
-            input: Box::new(LogicalPlan::Filter(FilterNode {
-                input: Box::new(base_scan(&[a.clone(), v.clone()])),
-                predicate: ge(col_ref(&a), 10),
-                required_output_columns: None,
-            })),
-            group_by: vec![col_ref(&a)],
-            aggregates: vec![sum_call(&v, &s)],
-            output_columns: vec![a.clone(), s.clone()],
-            already_pushed: false,
-            required_output_columns: None,
-        });
+        let query_plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![col_ref(&a)],
+                aggregates: vec![sum_call(&v, &s)],
+                output_columns: vec![a.clone(), s.clone()],
+                already_pushed: false,
+            }),
+            vec![LogicalPlanNode::new(
+                LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                    predicate: ge(col_ref(&a), 10),
+                }),
+                vec![base_scan(&[a.clone(), v.clone()])],
+                None,
+            )],
+            None,
+        );
 
         let mut memo = Memo::new();
         let root = logical_plan_to_memo(&query_plan, &mut memo);
@@ -684,18 +697,22 @@ mod tests {
         let a = col(1, "a");
         let v = col(2, "v");
         let s = col(3, "s");
-        let query_plan = LogicalPlan::Aggregate(AggregateNode {
-            input: Box::new(LogicalPlan::Filter(FilterNode {
-                input: Box::new(base_scan(&[a.clone(), v.clone()])),
-                predicate: ge(col_ref(&a), 10),
-                required_output_columns: None,
-            })),
-            group_by: vec![col_ref(&a)],
-            aggregates: vec![sum_call(&v, &s)],
-            output_columns: vec![a.clone(), s.clone()],
-            already_pushed: false,
-            required_output_columns: None,
-        });
+        let query_plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![col_ref(&a)],
+                aggregates: vec![sum_call(&v, &s)],
+                output_columns: vec![a.clone(), s.clone()],
+                already_pushed: false,
+            }),
+            vec![LogicalPlanNode::new(
+                LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                    predicate: ge(col_ref(&a), 10),
+                }),
+                vec![base_scan(&[a.clone(), v.clone()])],
+                None,
+            )],
+            None,
+        );
 
         let mut memo = Memo::new();
         let root = logical_plan_to_memo(&query_plan, &mut memo);
@@ -715,11 +732,13 @@ mod tests {
         let mv_a = col(100, "a");
         let mv_b = col(101, "b");
         let mv_v = col(102, "v");
-        let mv_plan = LogicalPlan::Filter(FilterNode {
-            input: Box::new(base_scan(&[mv_a.clone(), mv_b.clone(), mv_v.clone()])),
-            predicate: ge(col_ref(&mv_a), 0),
-            required_output_columns: None,
-        });
+        let mv_plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: ge(col_ref(&mv_a), 0),
+            }),
+            vec![base_scan(&[mv_a.clone(), mv_b.clone(), mv_v.clone()])],
+            None,
+        );
         let mv = SpjgDescriptor::from_logical_plan(&mv_plan).expect("mv spjg");
         let candidate = MvRewriteCandidate {
             mv_name: "spj_mv".to_string(),
@@ -732,11 +751,13 @@ mod tests {
         let a = col(1, "a");
         let b = col(2, "b");
         let v = col(3, "v");
-        let query_plan = LogicalPlan::Filter(FilterNode {
-            input: Box::new(base_scan(&[a.clone(), b.clone(), v.clone()])),
-            predicate: ge(col_ref(&a), 10),
-            required_output_columns: None,
-        });
+        let query_plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: ge(col_ref(&a), 10),
+            }),
+            vec![base_scan(&[a.clone(), b.clone(), v.clone()])],
+            None,
+        );
 
         let mut memo = Memo::new();
         let root = logical_plan_to_memo(&query_plan, &mut memo);
@@ -770,18 +791,22 @@ mod tests {
         // empty MV result is NULL where COUNT must be 0 -> COALESCE(sum, 0).
         let mv_a = col(100, "a");
         let mv_c = col(110, "c");
-        let mv_plan = LogicalPlan::Aggregate(AggregateNode {
-            input: Box::new(LogicalPlan::Filter(FilterNode {
-                input: Box::new(base_scan(std::slice::from_ref(&mv_a))),
-                predicate: ge(col_ref(&mv_a), 0),
-                required_output_columns: None,
-            })),
-            group_by: vec![col_ref(&mv_a)],
-            aggregates: vec![count_star(&mv_c)],
-            output_columns: vec![mv_a.clone(), mv_c.clone()],
-            already_pushed: false,
-            required_output_columns: None,
-        });
+        let mv_plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![col_ref(&mv_a)],
+                aggregates: vec![count_star(&mv_c)],
+                output_columns: vec![mv_a.clone(), mv_c.clone()],
+                already_pushed: false,
+            }),
+            vec![LogicalPlanNode::new(
+                LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                    predicate: ge(col_ref(&mv_a), 0),
+                }),
+                vec![base_scan(std::slice::from_ref(&mv_a))],
+                None,
+            )],
+            None,
+        );
         let mv = SpjgDescriptor::from_logical_plan(&mv_plan).expect("mv spjg");
         let candidate = MvRewriteCandidate {
             mv_name: "cnt_mv".to_string(),
@@ -792,18 +817,22 @@ mod tests {
 
         let a = col(1, "a");
         let cnt = col(3, "cnt"); // original scalar count output id
-        let query_plan = LogicalPlan::Aggregate(AggregateNode {
-            input: Box::new(LogicalPlan::Filter(FilterNode {
-                input: Box::new(base_scan(std::slice::from_ref(&a))),
-                predicate: ge(col_ref(&a), 0),
-                required_output_columns: None,
-            })),
-            group_by: vec![],
-            aggregates: vec![count_star(&cnt)],
-            output_columns: vec![cnt.clone()],
-            already_pushed: false,
-            required_output_columns: None,
-        });
+        let query_plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![],
+                aggregates: vec![count_star(&cnt)],
+                output_columns: vec![cnt.clone()],
+                already_pushed: false,
+            }),
+            vec![LogicalPlanNode::new(
+                LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                    predicate: ge(col_ref(&a), 0),
+                }),
+                vec![base_scan(std::slice::from_ref(&a))],
+                None,
+            )],
+            None,
+        );
 
         let mut memo = Memo::new();
         let root = logical_plan_to_memo(&query_plan, &mut memo);

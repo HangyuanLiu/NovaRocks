@@ -4,14 +4,18 @@ use std::collections::HashMap;
 
 use crate::sql::analysis::{ExprKind, TypedExpr};
 use crate::sql::optimizer::statistics::TableStatistics;
-use crate::sql::planner::plan::{AggregateNode, LogicalPlan};
+use crate::sql::planner::plan::{
+    LogicalAggregateNode, LogicalJoinNode, LogicalPlanNode, LogicalPlanNodeKind,
+};
 
 use super::context::{AggregatePushDownContext, ColumnRefIdentity, PushPlan, Side};
 
-/// Examine the AggregateNode for entry-level rejections.
+/// Examine the LogicalAggregateNode for entry-level rejections.
 /// Returns Some(ctx) when the aggregate is a candidate to push;
 /// returns None when an entry-level filter rejects it.
-pub(crate) fn entry_safety_check(aggregate: &AggregateNode) -> Option<AggregatePushDownContext> {
+pub(crate) fn entry_safety_check(
+    aggregate: &LogicalAggregateNode,
+) -> Option<AggregatePushDownContext> {
     // Idempotency guard.
     if aggregate.already_pushed {
         return None;
@@ -58,7 +62,7 @@ pub(crate) fn entry_safety_check(aggregate: &AggregateNode) -> Option<AggregateP
     })
 }
 
-fn collect_required_column_refs(aggregate: &AggregateNode) -> Vec<ColumnRefIdentity> {
+fn collect_required_column_refs(aggregate: &LogicalAggregateNode) -> Vec<ColumnRefIdentity> {
     let mut out = Vec::new();
     for gb in &aggregate.group_by {
         collect_column_ref_identities_into(gb, &mut out);
@@ -113,19 +117,22 @@ fn expr_uses_nondeterministic(expr: &TypedExpr) -> bool {
 /// Top-level collector entry.
 #[allow(dead_code)]
 pub(crate) fn collect_push_plan(
-    aggregate: &AggregateNode,
+    aggregate: &LogicalAggregateNode,
+    aggregate_input: &LogicalPlanNode,
     _table_stats: &HashMap<String, TableStatistics>,
 ) -> Option<PushPlan> {
     let ctx = entry_safety_check(aggregate)?;
-    let join = match aggregate.input.as_ref() {
-        LogicalPlan::Join(j) => j,
+    let join = match &aggregate_input.kind {
+        LogicalPlanNodeKind::Join(j) => j,
         _ => return None,
     };
-    split_at_join(join, ctx)
+    split_at_join(join, aggregate_input.left(), aggregate_input.right(), ctx)
 }
 
 fn split_at_join(
-    join: &crate::sql::planner::plan::JoinNode,
+    join: &LogicalJoinNode,
+    left: &LogicalPlanNode,
+    right: &LogicalPlanNode,
     ctx: AggregatePushDownContext,
 ) -> Option<PushPlan> {
     use crate::sql::analysis::JoinKind;
@@ -142,8 +149,8 @@ fn split_at_join(
     }
 
     // Step 2: per-side column visibility.
-    let left_qcols = collect_qualified_output_names(&join.left);
-    let right_qcols = collect_qualified_output_names(&join.right);
+    let left_qcols = collect_qualified_output_names(left);
+    let right_qcols = collect_qualified_output_names(right);
 
     let side = if ctx
         .required_column_refs
@@ -171,10 +178,10 @@ fn split_at_join(
     // Step 4: chosen-side subtree MUST be a Scan in v1 (no nested joins,
     // no intermediate Filter/Project on the side).
     let side_subtree = match side {
-        Side::Left => &join.left,
-        Side::Right => &join.right,
+        Side::Left => left,
+        Side::Right => right,
     };
-    if !matches!(side_subtree.as_ref(), LogicalPlan::Scan(_)) {
+    if !matches!(&side_subtree.kind, LogicalPlanNodeKind::Scan(_)) {
         return None;
     }
     // Qualified columns of the chosen side (a bare Scan per Step 4), used to
@@ -218,7 +225,7 @@ fn split_at_join(
 
     Some(PushPlan {
         side,
-        target_subtree: (**side_subtree).clone(),
+        target_subtree: side_subtree.clone(),
         partial_groupby,
         partial_aggregates: ctx.original_aggregates,
     })
@@ -267,9 +274,9 @@ fn column_ref_belongs_to_side(
 /// Qualified output column identities `(qualifier, name)` for a plan subtree.
 /// Scans contribute their alias (or table name) as the qualifier so equi-join
 /// keys that share a bare name across sides can be told apart.
-fn collect_qualified_output_names(plan: &LogicalPlan) -> Vec<(Option<String>, String)> {
-    match plan {
-        LogicalPlan::Scan(s) => {
+fn collect_qualified_output_names(plan: &LogicalPlanNode) -> Vec<(Option<String>, String)> {
+    match &plan.kind {
+        LogicalPlanNodeKind::Scan(s) => {
             // Each column is acceptable unqualified, by alias, and by table
             // name — the equi-key operand may be written any of these ways. A
             // `Some(qualifier)` operand only matches the side whose alias/table
@@ -286,18 +293,18 @@ fn collect_qualified_output_names(plan: &LogicalPlan) -> Vec<(Option<String>, St
             }
             out
         }
-        LogicalPlan::Filter(f) => collect_qualified_output_names(&f.input),
-        LogicalPlan::Project(p) => p
+        LogicalPlanNodeKind::Filter(_) => collect_qualified_output_names(plan.unary_input()),
+        LogicalPlanNodeKind::Project(p) => p
             .items
             .iter()
             .map(|i| (None, i.output_name.clone()))
             .collect(),
-        LogicalPlan::Join(j) => {
-            let mut l = collect_qualified_output_names(&j.left);
-            l.extend(collect_qualified_output_names(&j.right));
+        LogicalPlanNodeKind::Join(_) => {
+            let mut l = collect_qualified_output_names(plan.left());
+            l.extend(collect_qualified_output_names(plan.right()));
             l
         }
-        LogicalPlan::Aggregate(a) => a
+        LogicalPlanNodeKind::Aggregate(a) => a
             .output_columns
             .iter()
             .map(|c| (None, c.name.clone()))
@@ -351,7 +358,11 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{ExprKind, OutputColumn};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::planner::plan::{AggregateCall, AggregateNode, LogicalPlan, ValuesNode};
+    use crate::sql::planner::plan::*;
+    use crate::sql::planner::plan::{
+        AggregateCall, LogicalAggregateNode, LogicalPlanNode, LogicalPlanNodeKind,
+        LogicalValuesNode,
+    };
     use arrow::datatypes::DataType;
 
     fn col_ref(name: &str, ty: DataType) -> TypedExpr {
@@ -382,19 +393,39 @@ mod tests {
         group_by: Vec<TypedExpr>,
         aggregates: Vec<AggregateCall>,
         already_pushed: bool,
-    ) -> AggregateNode {
-        AggregateNode {
-            input: Box::new(LogicalPlan::Values(ValuesNode {
-                rows: vec![],
-                columns: vec![],
-                required_output_columns: None,
-            })),
+    ) -> LogicalAggregateNode {
+        LogicalAggregateNode {
             group_by,
             aggregates,
             output_columns: vec![],
-            required_output_columns: None,
             already_pushed,
         }
+    }
+
+    fn aggregate_plan(
+        input: LogicalPlanNode,
+        group_by: Vec<TypedExpr>,
+        aggregates: Vec<AggregateCall>,
+    ) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by,
+                aggregates,
+                output_columns: vec![],
+                already_pushed: false,
+            }),
+            vec![input],
+            None,
+        )
+    }
+
+    fn collect_test_push_plan(
+        aggregate_plan: &LogicalPlanNode,
+    ) -> Option<super::super::context::PushPlan> {
+        let LogicalPlanNodeKind::Aggregate(aggregate) = &aggregate_plan.kind else {
+            panic!("expected Aggregate test plan");
+        };
+        collect_push_plan(aggregate, aggregate_plan.unary_input(), &HashMap::new())
     }
 
     fn sum_call(col: &str) -> AggregateCall {
@@ -524,41 +555,46 @@ mod tests {
 
     use crate::sql::analysis::{JoinKind, ProjectItem};
     use crate::sql::catalog::{ScanSource, TableDef};
-    use crate::sql::planner::plan::{FilterNode, JoinNode, ProjectNode, ScanNode};
+    use crate::sql::planner::plan::{
+        LogicalFilterNode, LogicalJoinNode, LogicalProjectNode, LogicalScanNode,
+    };
 
-    fn dummy_scan_with_cols(cols: &[(&str, DataType)]) -> LogicalPlan {
+    fn dummy_scan_with_cols(cols: &[(&str, DataType)]) -> LogicalPlanNode {
         dummy_scan_with_alias(None, cols)
     }
 
-    fn dummy_scan_with_alias(alias: Option<&str>, cols: &[(&str, DataType)]) -> LogicalPlan {
-        LogicalPlan::Scan(ScanNode {
-            database: "db".into(),
-            table: TableDef {
-                name: "t".into(),
-                columns: vec![],
-                iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::StarRocks {
-                    db_id: 0,
-                    table_id: 0,
+    fn dummy_scan_with_alias(alias: Option<&str>, cols: &[(&str, DataType)]) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".into(),
+                table: TableDef {
+                    name: "t".into(),
+                    columns: vec![],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 0,
+                    },
                 },
-            },
-            alias: alias.map(str::to_string),
-            columns: cols
-                .iter()
-                .map(|(n, ty)| OutputColumn {
-                    column_id: ColumnId::UNSET,
-                    name: (*n).into(),
-                    data_type: ty.clone(),
-                    nullable: false,
-                    is_internal: false,
-                })
-                .collect(),
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        })
+                alias: alias.map(str::to_string),
+                columns: cols
+                    .iter()
+                    .map(|(n, ty)| OutputColumn {
+                        column_id: ColumnId::UNSET,
+                        name: (*n).into(),
+                        data_type: ty.clone(),
+                        nullable: false,
+                        is_internal: false,
+                    })
+                    .collect(),
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        )
     }
 
     #[test]
@@ -566,15 +602,12 @@ mod tests {
         // No Join means no work to do — would just wrap the scan with an
         // identity partial that buys nothing. v1 rejects.
         let scan = dummy_scan_with_cols(&[("k", DataType::Int64), ("v", DataType::Int64)]);
-        let agg = AggregateNode {
-            input: Box::new(scan),
-            group_by: vec![col_ref("k", DataType::Int64)],
-            aggregates: vec![sum_call("v")],
-            output_columns: vec![],
-            already_pushed: false,
-            required_output_columns: None,
-        };
-        assert!(collect_push_plan(&agg, &HashMap::new()).is_none());
+        let agg = aggregate_plan(
+            scan,
+            vec![col_ref("k", DataType::Int64)],
+            vec![sum_call("v")],
+        );
+        assert!(collect_test_push_plan(&agg).is_none());
     }
 
     #[test]
@@ -583,59 +616,59 @@ mod tests {
         // follow-up. v1 rejects.
         let scan_a = dummy_scan_with_cols(&[("k", DataType::Int64), ("v", DataType::Int64)]);
         let scan_b = dummy_scan_with_cols(&[("k", DataType::Int64)]);
-        let join = LogicalPlan::Join(JoinNode {
-            left: Box::new(scan_a),
-            right: Box::new(scan_b),
-            join_type: JoinKind::Inner,
-            condition: Some(col_ref("k", DataType::Boolean)),
-            required_output_columns: None,
-        });
-        let filter = LogicalPlan::Filter(FilterNode {
-            input: Box::new(join),
-            predicate: col_ref("k", DataType::Boolean),
-            required_output_columns: None,
-        });
-        let agg = AggregateNode {
-            input: Box::new(filter),
-            group_by: vec![col_ref("k", DataType::Int64)],
-            aggregates: vec![sum_call("v")],
-            output_columns: vec![],
-            already_pushed: false,
-            required_output_columns: None,
-        };
-        assert!(collect_push_plan(&agg, &HashMap::new()).is_none());
+        let join = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: JoinKind::Inner,
+                condition: Some(col_ref("k", DataType::Boolean)),
+            }),
+            vec![scan_a, scan_b],
+            None,
+        );
+        let filter = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: col_ref("k", DataType::Boolean),
+            }),
+            vec![join],
+            None,
+        );
+        let agg = aggregate_plan(
+            filter,
+            vec![col_ref("k", DataType::Int64)],
+            vec![sum_call("v")],
+        );
+        assert!(collect_test_push_plan(&agg).is_none());
     }
 
     #[test]
     fn rejects_when_input_is_project_above_join() {
         let scan_a = dummy_scan_with_cols(&[("k", DataType::Int64), ("v", DataType::Int64)]);
         let scan_b = dummy_scan_with_cols(&[("k", DataType::Int64)]);
-        let join = LogicalPlan::Join(JoinNode {
-            left: Box::new(scan_a),
-            right: Box::new(scan_b),
-            join_type: JoinKind::Inner,
-            condition: Some(col_ref("k", DataType::Boolean)),
-            required_output_columns: None,
-        });
-        let project = LogicalPlan::Project(ProjectNode {
-            input: Box::new(join),
-            items: vec![ProjectItem {
-                expr: col_ref("k", DataType::Int64),
-                output_name: "k".into(),
-                output_column_id: crate::sql::column_id::ColumnId::UNSET,
-            }],
-            output_qualifier: None,
-            required_output_columns: None,
-        });
-        let agg = AggregateNode {
-            input: Box::new(project),
-            group_by: vec![col_ref("k", DataType::Int64)],
-            aggregates: vec![sum_call("v")],
-            output_columns: vec![],
-            already_pushed: false,
-            required_output_columns: None,
-        };
-        assert!(collect_push_plan(&agg, &HashMap::new()).is_none());
+        let join = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: JoinKind::Inner,
+                condition: Some(col_ref("k", DataType::Boolean)),
+            }),
+            vec![scan_a, scan_b],
+            None,
+        );
+        let project = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![ProjectItem {
+                    expr: col_ref("k", DataType::Int64),
+                    output_name: "k".into(),
+                    output_column_id: crate::sql::column_id::ColumnId::UNSET,
+                }],
+                output_qualifier: None,
+            }),
+            vec![join],
+            None,
+        );
+        let agg = aggregate_plan(
+            project,
+            vec![col_ref("k", DataType::Int64)],
+            vec![sum_call("v")],
+        );
+        assert!(collect_test_push_plan(&agg).is_none());
     }
 
     use crate::sql::analysis::BinOp;
@@ -673,46 +706,45 @@ mod tests {
     fn pushes_sum_under_inner_join_to_left() {
         let a = dummy_scan_with_cols(&[("lk", DataType::Int64), ("v", DataType::Int64)]);
         let b = dummy_scan_with_cols(&[("rk", DataType::Int64)]);
-        let join = LogicalPlan::Join(JoinNode {
-            left: Box::new(a),
-            right: Box::new(b),
-            join_type: JoinKind::Inner,
-            condition: Some(eq("lk", "rk")),
-            required_output_columns: None,
-        });
-        let agg = AggregateNode {
-            input: Box::new(join),
-            group_by: vec![col_ref("lk", DataType::Int64)],
-            aggregates: vec![sum_call("v")],
-            output_columns: vec![],
-            already_pushed: false,
-            required_output_columns: None,
-        };
-        let plan = collect_push_plan(&agg, &HashMap::new()).expect("should push to left");
+        let join = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: JoinKind::Inner,
+                condition: Some(eq("lk", "rk")),
+            }),
+            vec![a, b],
+            None,
+        );
+        let agg = aggregate_plan(
+            join,
+            vec![col_ref("lk", DataType::Int64)],
+            vec![sum_call("v")],
+        );
+        let plan = collect_test_push_plan(&agg).expect("should push to left");
         assert_eq!(plan.side, super::super::context::Side::Left);
-        assert!(matches!(plan.target_subtree, LogicalPlan::Scan(_)));
+        assert!(matches!(
+            &plan.target_subtree.kind,
+            LogicalPlanNodeKind::Scan(_)
+        ));
     }
 
     #[test]
     fn orients_reversed_join_key_to_target_side() {
         let a = dummy_scan_with_cols(&[("lk", DataType::Int64), ("v", DataType::Int64)]);
         let b = dummy_scan_with_cols(&[("rk", DataType::Int64)]);
-        let join = LogicalPlan::Join(JoinNode {
-            left: Box::new(a),
-            right: Box::new(b),
-            join_type: JoinKind::Inner,
-            condition: Some(eq("rk", "lk")),
-            required_output_columns: None,
-        });
-        let agg = AggregateNode {
-            input: Box::new(join),
-            group_by: vec![col_ref("lk", DataType::Int64)],
-            aggregates: vec![sum_call("v")],
-            output_columns: vec![],
-            already_pushed: false,
-            required_output_columns: None,
-        };
-        let plan = collect_push_plan(&agg, &HashMap::new()).expect("should push to left");
+        let join = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: JoinKind::Inner,
+                condition: Some(eq("rk", "lk")),
+            }),
+            vec![a, b],
+            None,
+        );
+        let agg = aggregate_plan(
+            join,
+            vec![col_ref("lk", DataType::Int64)],
+            vec![sum_call("v")],
+        );
+        let plan = collect_test_push_plan(&agg).expect("should push to left");
         let group_columns: Vec<_> = plan
             .partial_groupby
             .iter()
@@ -727,91 +759,86 @@ mod tests {
         let a = dummy_scan_with_cols(&[("lk", DataType::Int64)]);
         let b = dummy_scan_with_cols(&[("rk", DataType::Int64), ("v", DataType::Int64)]);
         // LEFT OUTER JOIN; aggregate on right (amplifier) — must reject.
-        let join = LogicalPlan::Join(JoinNode {
-            left: Box::new(a),
-            right: Box::new(b),
-            join_type: JoinKind::LeftOuter,
-            condition: Some(eq("lk", "rk")),
-            required_output_columns: None,
-        });
-        let agg = AggregateNode {
-            input: Box::new(join),
-            group_by: vec![col_ref("rk", DataType::Int64)],
-            aggregates: vec![sum_call("v")],
-            output_columns: vec![],
-            already_pushed: false,
-            required_output_columns: None,
-        };
-        assert!(collect_push_plan(&agg, &HashMap::new()).is_none());
+        let join = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: JoinKind::LeftOuter,
+                condition: Some(eq("lk", "rk")),
+            }),
+            vec![a, b],
+            None,
+        );
+        let agg = aggregate_plan(
+            join,
+            vec![col_ref("rk", DataType::Int64)],
+            vec![sum_call("v")],
+        );
+        assert!(collect_test_push_plan(&agg).is_none());
     }
 
     #[test]
     fn accepts_left_outer_when_agg_on_preserved_left() {
         let a = dummy_scan_with_cols(&[("lk", DataType::Int64), ("v", DataType::Int64)]);
         let b = dummy_scan_with_cols(&[("rk", DataType::Int64)]);
-        let join = LogicalPlan::Join(JoinNode {
-            left: Box::new(a),
-            right: Box::new(b),
-            join_type: JoinKind::LeftOuter,
-            condition: Some(eq("rk", "lk")),
-            required_output_columns: None,
-        });
-        let agg = AggregateNode {
-            input: Box::new(join),
-            group_by: vec![col_ref("lk", DataType::Int64)],
-            aggregates: vec![sum_call("v")],
-            output_columns: vec![],
-            already_pushed: false,
-            required_output_columns: None,
-        };
-        let plan = collect_push_plan(&agg, &HashMap::new()).expect("push to preserved left");
-        assert!(matches!(plan.target_subtree, LogicalPlan::Scan(_)));
+        let join = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: JoinKind::LeftOuter,
+                condition: Some(eq("rk", "lk")),
+            }),
+            vec![a, b],
+            None,
+        );
+        let agg = aggregate_plan(
+            join,
+            vec![col_ref("lk", DataType::Int64)],
+            vec![sum_call("v")],
+        );
+        let plan = collect_test_push_plan(&agg).expect("push to preserved left");
+        assert!(matches!(
+            &plan.target_subtree.kind,
+            LogicalPlanNodeKind::Scan(_)
+        ));
     }
 
     #[test]
     fn rejects_cross_join() {
         let a = dummy_scan_with_cols(&[("k", DataType::Int64), ("v", DataType::Int64)]);
         let b = dummy_scan_with_cols(&[("x", DataType::Int64)]);
-        let join = LogicalPlan::Join(JoinNode {
-            left: Box::new(a),
-            right: Box::new(b),
-            join_type: JoinKind::Cross,
-            condition: None,
-            required_output_columns: None,
-        });
-        let agg = AggregateNode {
-            input: Box::new(join),
-            group_by: vec![col_ref("k", DataType::Int64)],
-            aggregates: vec![sum_call("v")],
-            output_columns: vec![],
-            already_pushed: false,
-            required_output_columns: None,
-        };
-        assert!(collect_push_plan(&agg, &HashMap::new()).is_none());
+        let join = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: JoinKind::Cross,
+                condition: None,
+            }),
+            vec![a, b],
+            None,
+        );
+        let agg = aggregate_plan(
+            join,
+            vec![col_ref("k", DataType::Int64)],
+            vec![sum_call("v")],
+        );
+        assert!(collect_test_push_plan(&agg).is_none());
     }
 
     #[test]
     fn rejects_aggregate_columns_across_sides() {
         let a = dummy_scan_with_cols(&[("k", DataType::Int64), ("v", DataType::Int64)]);
         let b = dummy_scan_with_cols(&[("k", DataType::Int64), ("w", DataType::Int64)]);
-        let join = LogicalPlan::Join(JoinNode {
-            left: Box::new(a),
-            right: Box::new(b),
-            join_type: JoinKind::Inner,
-            condition: Some(eq("k", "k")),
-            required_output_columns: None,
-        });
+        let join = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: JoinKind::Inner,
+                condition: Some(eq("k", "k")),
+            }),
+            vec![a, b],
+            None,
+        );
         // sum(v) is on left; sum(w) is on right. Required = {k, v, w}.
         // Neither side covers all required cols → reject.
-        let agg = AggregateNode {
-            input: Box::new(join),
-            group_by: vec![col_ref("k", DataType::Int64)],
-            aggregates: vec![sum_call("v"), sum_call("w")],
-            output_columns: vec![],
-            already_pushed: false,
-            required_output_columns: None,
-        };
-        assert!(collect_push_plan(&agg, &HashMap::new()).is_none());
+        let agg = aggregate_plan(
+            join,
+            vec![col_ref("k", DataType::Int64)],
+            vec![sum_call("v"), sum_call("w")],
+        );
+        assert!(collect_test_push_plan(&agg).is_none());
     }
 
     #[test]
@@ -834,30 +861,31 @@ mod tests {
                 ("c3", DataType::Int64),
             ],
         );
-        let join = LogicalPlan::Join(JoinNode {
-            left: Box::new(a),
-            right: Box::new(b),
-            join_type: JoinKind::Inner,
-            condition: Some(TypedExpr {
-                kind: ExprKind::BinaryOp {
-                    left: Box::new(eq_qualified("l", "c0", "r", "c0")),
-                    op: BinOp::And,
-                    right: Box::new(eq_qualified("l", "c1", "r", "c1")),
-                },
-                data_type: DataType::Boolean,
-                nullable: false,
+        let join = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: JoinKind::Inner,
+                condition: Some(TypedExpr {
+                    kind: ExprKind::BinaryOp {
+                        left: Box::new(eq_qualified("l", "c0", "r", "c0")),
+                        op: BinOp::And,
+                        right: Box::new(eq_qualified("l", "c1", "r", "c1")),
+                    },
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                }),
             }),
-            required_output_columns: None,
-        });
-        let agg = AggregateNode {
-            input: Box::new(join),
-            group_by: vec![
+            vec![a, b],
+            None,
+        );
+        let agg = aggregate_plan(
+            join,
+            vec![
                 qualified_col_ref("l", "c0", DataType::Int64),
                 qualified_col_ref("r", "c1", DataType::Utf8),
                 qualified_col_ref("r", "c2", DataType::Utf8),
                 qualified_col_ref("r", "c3", DataType::Int64),
             ],
-            aggregates: vec![AggregateCall {
+            vec![AggregateCall {
                 name: "count".into(),
                 args: vec![qualified_col_ref("l", "c0", DataType::Int64)],
                 distinct: false,
@@ -865,64 +893,58 @@ mod tests {
                 order_by: vec![],
                 output_column_id: ColumnId::UNSET,
             }],
-            output_columns: vec![],
-            already_pushed: false,
-            required_output_columns: None,
-        };
-        assert!(collect_push_plan(&agg, &HashMap::new()).is_none());
+        );
+        assert!(collect_test_push_plan(&agg).is_none());
     }
 
     #[test]
     fn rejects_semi_anti_join() {
         let a = dummy_scan_with_cols(&[("k", DataType::Int64), ("v", DataType::Int64)]);
         let b = dummy_scan_with_cols(&[("k", DataType::Int64)]);
-        let join = LogicalPlan::Join(JoinNode {
-            left: Box::new(a),
-            right: Box::new(b),
-            join_type: JoinKind::LeftSemi,
-            condition: Some(eq("k", "k")),
-            required_output_columns: None,
-        });
-        let agg = AggregateNode {
-            input: Box::new(join),
-            group_by: vec![col_ref("k", DataType::Int64)],
-            aggregates: vec![sum_call("v")],
-            output_columns: vec![],
-            already_pushed: false,
-            required_output_columns: None,
-        };
-        assert!(collect_push_plan(&agg, &HashMap::new()).is_none());
+        let join = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: JoinKind::LeftSemi,
+                condition: Some(eq("k", "k")),
+            }),
+            vec![a, b],
+            None,
+        );
+        let agg = aggregate_plan(
+            join,
+            vec![col_ref("k", DataType::Int64)],
+            vec![sum_call("v")],
+        );
+        assert!(collect_test_push_plan(&agg).is_none());
     }
 
     #[test]
     fn rejects_nested_join_on_target_side() {
         // v1 only handles direct-Scan sides. A nested join on the
         // chosen side must be rejected; multi-table is OPT-1 follow-up.
-        let inner_join = LogicalPlan::Join(JoinNode {
-            left: Box::new(dummy_scan_with_cols(&[
-                ("k", DataType::Int64),
-                ("v", DataType::Int64),
-            ])),
-            right: Box::new(dummy_scan_with_cols(&[("k", DataType::Int64)])),
-            join_type: JoinKind::Inner,
-            condition: Some(eq("k", "k")),
-            required_output_columns: None,
-        });
-        let outer_join = LogicalPlan::Join(JoinNode {
-            left: Box::new(inner_join),
-            right: Box::new(dummy_scan_with_cols(&[("k", DataType::Int64)])),
-            join_type: JoinKind::Inner,
-            condition: Some(eq("k", "k")),
-            required_output_columns: None,
-        });
-        let agg = AggregateNode {
-            input: Box::new(outer_join),
-            group_by: vec![col_ref("k", DataType::Int64)],
-            aggregates: vec![sum_call("v")],
-            output_columns: vec![],
-            already_pushed: false,
-            required_output_columns: None,
-        };
-        assert!(collect_push_plan(&agg, &HashMap::new()).is_none());
+        let inner_join = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: JoinKind::Inner,
+                condition: Some(eq("k", "k")),
+            }),
+            vec![
+                dummy_scan_with_cols(&[("k", DataType::Int64), ("v", DataType::Int64)]),
+                dummy_scan_with_cols(&[("k", DataType::Int64)]),
+            ],
+            None,
+        );
+        let outer_join = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: JoinKind::Inner,
+                condition: Some(eq("k", "k")),
+            }),
+            vec![inner_join, dummy_scan_with_cols(&[("k", DataType::Int64)])],
+            None,
+        );
+        let agg = aggregate_plan(
+            outer_join,
+            vec![col_ref("k", DataType::Int64)],
+            vec![sum_call("v")],
+        );
+        assert!(collect_test_push_plan(&agg).is_none());
     }
 }

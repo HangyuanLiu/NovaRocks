@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
 use crate::sql::catalog::ScanSource;
 use crate::sql::column_id::ColumnId;
-use crate::sql::planner::plan::{LogicalPlan, ScanNode};
+use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind, LogicalScanNode};
 
 /// Physical identity of a scanned table. Two scans of the same physical table
 /// (e.g. a self-join's two legs, or an outer table re-scanned in a subquery)
@@ -29,7 +29,7 @@ pub(super) enum TableIdentity {
 
 impl TableIdentity {
     #[allow(dead_code)]
-    pub(super) fn from_scan(scan: &ScanNode) -> Self {
+    pub(super) fn from_scan(scan: &LogicalScanNode) -> Self {
         match &scan.table.source {
             ScanSource::StarRocks { db_id, table_id } => TableIdentity::StarRocks {
                 db_id: *db_id,
@@ -63,34 +63,37 @@ impl TableIdentity {
 /// left-to-right order, WITH duplicates preserved (so callers can detect a
 /// self-join / duplicate-table by comparing `Vec::len()` against the set size).
 #[allow(dead_code)]
-pub(super) fn collect_table_ids(plan: &LogicalPlan) -> Vec<TableIdentity> {
+pub(super) fn collect_table_ids(plan: &LogicalPlanNode) -> Vec<TableIdentity> {
     let mut out = Vec::new();
     collect_table_ids_inner(plan, &mut out);
     out
 }
 
-fn collect_table_ids_inner(plan: &LogicalPlan, out: &mut Vec<TableIdentity>) {
-    match plan {
-        LogicalPlan::Scan(s) => out.push(TableIdentity::from_scan(s)),
-        LogicalPlan::Join(j) => {
-            collect_table_ids_inner(&j.left, out);
-            collect_table_ids_inner(&j.right, out);
+fn collect_table_ids_inner(plan: &LogicalPlanNode, out: &mut Vec<TableIdentity>) {
+    if let LogicalPlanNodeKind::Scan(s) = &plan.kind {
+        out.push(TableIdentity::from_scan(s));
+        return;
+    }
+
+    if matches!(
+        plan.kind,
+        LogicalPlanNodeKind::Join(_)
+            | LogicalPlanNodeKind::Filter(_)
+            | LogicalPlanNodeKind::Project(_)
+            | LogicalPlanNodeKind::Aggregate(_)
+            | LogicalPlanNodeKind::Sort(_)
+            | LogicalPlanNodeKind::Window(_)
+            | LogicalPlanNodeKind::AssertOneRow(_)
+            | LogicalPlanNodeKind::Apply(_)
+    ) {
+        for child in &plan.children {
+            collect_table_ids_inner(child, out);
         }
-        LogicalPlan::Filter(n) => collect_table_ids_inner(&n.input, out),
-        LogicalPlan::Project(n) => collect_table_ids_inner(&n.input, out),
-        LogicalPlan::Aggregate(n) => collect_table_ids_inner(&n.input, out),
-        LogicalPlan::Sort(n) => collect_table_ids_inner(&n.input, out),
-        LogicalPlan::Window(n) => collect_table_ids_inner(&n.input, out),
-        LogicalPlan::AssertOneRow(n) => collect_table_ids_inner(&n.input, out),
-        LogicalPlan::Apply(a) => {
-            collect_table_ids_inner(&a.left, out);
-            collect_table_ids_inner(&a.right, out);
-        }
+    } else {
         // Nodes not reachable through a WinMagic-eligible plan (Limit, Union,
         // CTEAnchor/Produce/Consume, Values, Repeat, Decode, IMV markers, …)
         // contribute no Scan children. The operator whitelist (a later task)
         // rejects any plan containing them before these helpers are called.
-        _ => {}
     }
 }
 
@@ -100,7 +103,7 @@ fn collect_table_ids_inner(plan: &LogicalPlan, out: &mut Vec<TableIdentity>) {
 /// the predicate-identity check only compares base-table column references.
 #[allow(dead_code)]
 pub(super) fn collect_scan_column_map(
-    plan: &LogicalPlan,
+    plan: &LogicalPlanNode,
 ) -> HashMap<ColumnId, (TableIdentity, String)> {
     let mut map = HashMap::new();
     collect_scan_column_map_inner(plan, &mut map);
@@ -108,35 +111,36 @@ pub(super) fn collect_scan_column_map(
 }
 
 fn collect_scan_column_map_inner(
-    plan: &LogicalPlan,
+    plan: &LogicalPlanNode,
     map: &mut HashMap<ColumnId, (TableIdentity, String)>,
 ) {
-    match plan {
-        LogicalPlan::Scan(s) => {
-            let id = TableIdentity::from_scan(s);
-            for c in &s.columns {
-                map.insert(c.column_id, (id.clone(), c.name.clone()));
-            }
+    if let LogicalPlanNodeKind::Scan(s) = &plan.kind {
+        let id = TableIdentity::from_scan(s);
+        for c in &s.columns {
+            map.insert(c.column_id, (id.clone(), c.name.clone()));
         }
-        LogicalPlan::Join(j) => {
-            collect_scan_column_map_inner(&j.left, map);
-            collect_scan_column_map_inner(&j.right, map);
+        return;
+    }
+
+    if matches!(
+        plan.kind,
+        LogicalPlanNodeKind::Join(_)
+            | LogicalPlanNodeKind::Filter(_)
+            | LogicalPlanNodeKind::Project(_)
+            | LogicalPlanNodeKind::Aggregate(_)
+            | LogicalPlanNodeKind::Sort(_)
+            | LogicalPlanNodeKind::Window(_)
+            | LogicalPlanNodeKind::AssertOneRow(_)
+            | LogicalPlanNodeKind::Apply(_)
+    ) {
+        for child in &plan.children {
+            collect_scan_column_map_inner(child, map);
         }
-        LogicalPlan::Filter(n) => collect_scan_column_map_inner(&n.input, map),
-        LogicalPlan::Project(n) => collect_scan_column_map_inner(&n.input, map),
-        LogicalPlan::Aggregate(n) => collect_scan_column_map_inner(&n.input, map),
-        LogicalPlan::Sort(n) => collect_scan_column_map_inner(&n.input, map),
-        LogicalPlan::Window(n) => collect_scan_column_map_inner(&n.input, map),
-        LogicalPlan::AssertOneRow(n) => collect_scan_column_map_inner(&n.input, map),
-        LogicalPlan::Apply(a) => {
-            collect_scan_column_map_inner(&a.left, map);
-            collect_scan_column_map_inner(&a.right, map);
-        }
+    } else {
         // Nodes not reachable through a WinMagic-eligible plan (Limit, Union,
         // CTEAnchor/Produce/Consume, Values, Repeat, Decode, IMV markers, …)
         // contribute no Scan children. The operator whitelist (a later task)
         // rejects any plan containing them before these helpers are called.
-        _ => {}
     }
 }
 
@@ -214,6 +218,7 @@ fn literal_eq(a: &LiteralValue, b: &LiteralValue) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::sql::planner::plan::*;
     use std::collections::HashSet;
 
     use arrow::datatypes::DataType;
@@ -222,34 +227,39 @@ mod tests {
     use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, TypedExpr};
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::planner::plan::{JoinNode, LogicalPlan, ScanNode};
+    use crate::sql::planner::plan::{
+        LogicalJoinNode, LogicalPlanNode, LogicalPlanNodeKind, LogicalScanNode,
+    };
 
-    fn make_scan(table_id: i64, cols: Vec<(ColumnId, &str)>) -> LogicalPlan {
-        LogicalPlan::Scan(ScanNode {
-            database: "default".to_string(),
-            table: TableDef {
-                name: format!("t{table_id}"),
-                columns: vec![],
-                iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::StarRocks { db_id: 0, table_id },
-            },
-            alias: None,
-            columns: cols
-                .into_iter()
-                .map(|(cid, name)| OutputColumn {
-                    column_id: cid,
-                    name: name.to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
-                    is_internal: false,
-                })
-                .collect(),
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        })
+    fn make_scan(table_id: i64, cols: Vec<(ColumnId, &str)>) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "default".to_string(),
+                table: TableDef {
+                    name: format!("t{table_id}"),
+                    columns: vec![],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: ScanSource::StarRocks { db_id: 0, table_id },
+                },
+                alias: None,
+                columns: cols
+                    .into_iter()
+                    .map(|(cid, name)| OutputColumn {
+                        column_id: cid,
+                        name: name.to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        is_internal: false,
+                    })
+                    .collect(),
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        )
     }
 
     fn col_ref(cid: ColumnId, name: &str) -> TypedExpr {
@@ -289,7 +299,7 @@ mod tests {
     // -----------------------------------------------------------------
     #[test]
     fn table_identity_from_starrocks_scan() {
-        let scan_node = ScanNode {
+        let scan_node = LogicalScanNode {
             database: "default".to_string(),
             table: TableDef {
                 name: "t".to_string(),
@@ -306,7 +316,6 @@ mod tests {
             required_columns: None,
             dict_columns: vec![],
             variant_columns: vec![],
-            required_output_columns: None,
         };
         let id = TableIdentity::from_scan(&scan_node);
         assert_eq!(
@@ -325,13 +334,14 @@ mod tests {
     fn collect_table_ids_two_scans_under_join() {
         let left = make_scan(1, vec![]);
         let right = make_scan(2, vec![]);
-        let join = LogicalPlan::Join(JoinNode {
-            left: Box::new(left),
-            right: Box::new(right),
-            join_type: JoinKind::Cross,
-            condition: None,
-            required_output_columns: None,
-        });
+        let join = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: JoinKind::Cross,
+                condition: None,
+            }),
+            vec![left, right],
+            None,
+        );
         let ids = collect_table_ids(&join);
         assert_eq!(ids.len(), 2);
         let set: HashSet<_> = ids.iter().collect();
@@ -353,13 +363,14 @@ mod tests {
     fn collect_table_ids_self_join_detects_dup() {
         let left = make_scan(1, vec![]);
         let right = make_scan(1, vec![]);
-        let join = LogicalPlan::Join(JoinNode {
-            left: Box::new(left),
-            right: Box::new(right),
-            join_type: JoinKind::Cross,
-            condition: None,
-            required_output_columns: None,
-        });
+        let join = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: JoinKind::Cross,
+                condition: None,
+            }),
+            vec![left, right],
+            None,
+        );
         let ids = collect_table_ids(&join);
         assert_eq!(ids.len(), 2, "dup-preserving: should have 2 entries");
         let set: HashSet<_> = ids.iter().collect();

@@ -27,17 +27,26 @@ impl LogicalRewriteRule for PruneScanColumns {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
-        matches!(plan, LogicalPlan::Scan(_))
+    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+        matches!(&plan.kind, LogicalPlanNodeKind::Scan(_))
     }
 
-    fn apply(&self, plan: LogicalPlan, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
-        let LogicalPlan::Scan(mut node) = plan else {
+    fn apply(
+        &self,
+        plan: LogicalPlanNode,
+        _ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, String> {
+        let LogicalPlanNode {
+            kind,
+            required_output_columns,
+            ..
+        } = plan;
+        let LogicalPlanNodeKind::Scan(mut node) = kind else {
             unreachable!()
         };
 
         // None means Phase 1 hasn't tagged this node — no-op.
-        let Some(needed) = node.required_output_columns.clone() else {
+        let Some(needed) = required_output_columns.clone() else {
             return Ok(RewriteResult::Unchanged);
         };
 
@@ -100,7 +109,11 @@ impl LogicalRewriteRule for PruneScanColumns {
         }
 
         node.required_columns = Some(required_names);
-        Ok(RewriteResult::Changed(LogicalPlan::Scan(node)))
+        Ok(RewriteResult::Changed(LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(node),
+            vec![],
+            required_output_columns,
+        )))
     }
 }
 
@@ -111,9 +124,10 @@ mod tests {
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
+    use crate::sql::planner::plan::*;
     use arrow::datatypes::DataType;
 
-    fn make_scan(cols: &[(&str, ColumnId)]) -> ScanNode {
+    fn make_scan(cols: &[(&str, ColumnId)]) -> LogicalScanNode {
         let table = TableDef {
             name: "t".to_string(),
             columns: cols
@@ -132,7 +146,7 @@ mod tests {
                 table_id: 0,
             },
         };
-        ScanNode {
+        LogicalScanNode {
             database: "db".to_string(),
             table,
             alias: None,
@@ -150,8 +164,18 @@ mod tests {
             required_columns: None,
             dict_columns: vec![],
             variant_columns: vec![],
-            required_output_columns: None,
         }
+    }
+
+    fn scan_plan(
+        scan: LogicalScanNode,
+        required_output_columns: Option<HashSet<ColumnId>>,
+    ) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(scan),
+            vec![],
+            required_output_columns,
+        )
     }
 
     fn col_ref_expr(id: ColumnId, name: &str) -> TypedExpr {
@@ -176,13 +200,12 @@ mod tests {
         let id_b = ColumnId::new_for_test(2);
         let id_c = ColumnId::new_for_test(3);
 
-        let mut scan = make_scan(&[("a", id_a), ("b", id_b), ("c", id_c)]);
+        let scan = make_scan(&[("a", id_a), ("b", id_b), ("c", id_c)]);
         // Tag: only column b needed.
         let mut needed = HashSet::new();
         needed.insert(id_b);
-        scan.required_output_columns = Some(needed);
 
-        let plan = LogicalPlan::Scan(scan);
+        let plan = scan_plan(scan, Some(needed));
         let rule = PruneScanColumns;
         let result = rule.apply(plan, &mut ctx()).unwrap();
 
@@ -190,12 +213,13 @@ mod tests {
             RewriteResult::Changed(p) => p,
             other => panic!("expected Changed, got {:?}", other),
         };
-        let LogicalPlan::Scan(pruned) = changed else {
+        let LogicalPlanNodeKind::Scan(pruned) = &changed.kind else {
             panic!("expected Scan");
         };
 
         let req = pruned
             .required_columns
+            .as_ref()
             .expect("required_columns must be set");
         assert_eq!(req.len(), 1);
         assert_eq!(req[0], "b");
@@ -204,11 +228,10 @@ mod tests {
     #[test]
     fn prune_scan_noop_when_required_output_columns_is_none() {
         let id_a = ColumnId::new_for_test(1);
-        let mut scan = make_scan(&[("a", id_a)]);
+        let scan = make_scan(&[("a", id_a)]);
         // No Phase-1 tag (None).
-        scan.required_output_columns = None;
 
-        let plan = LogicalPlan::Scan(scan);
+        let plan = scan_plan(scan, None);
         let rule = PruneScanColumns;
         let result = rule.apply(plan, &mut ctx()).unwrap();
 
@@ -245,9 +268,8 @@ mod tests {
 
         let mut needed = HashSet::new();
         needed.insert(id_a);
-        scan.required_output_columns = Some(needed);
 
-        let plan = LogicalPlan::Scan(scan);
+        let plan = scan_plan(scan, Some(needed));
         let rule = PruneScanColumns;
         let result = rule.apply(plan, &mut ctx()).unwrap();
 
@@ -255,12 +277,13 @@ mod tests {
             RewriteResult::Changed(p) => p,
             _ => panic!("expected Changed"),
         };
-        let LogicalPlan::Scan(pruned) = changed else {
+        let LogicalPlanNodeKind::Scan(pruned) = &changed.kind else {
             panic!("expected Scan");
         };
 
         let req = pruned
             .required_columns
+            .as_ref()
             .expect("required_columns must be set");
         let req_set: HashSet<&str> = req.iter().map(|s| s.as_str()).collect();
         assert!(req_set.contains("a"), "a must be kept (in needed)");
@@ -286,21 +309,23 @@ mod tests {
 
         let mut needed = HashSet::new();
         needed.insert(id_a);
-        scan.required_output_columns = Some(needed);
 
         let rule = PruneScanColumns;
-        let result = rule.apply(LogicalPlan::Scan(scan), &mut ctx()).unwrap();
+        let result = rule
+            .apply(scan_plan(scan, Some(needed)), &mut ctx())
+            .unwrap();
 
         let changed = match result {
             RewriteResult::Changed(p) => p,
             _ => panic!("expected Changed"),
         };
-        let LogicalPlan::Scan(pruned) = changed else {
+        let LogicalPlanNodeKind::Scan(pruned) = &changed.kind else {
             panic!("expected Scan");
         };
 
         let req = pruned
             .required_columns
+            .as_ref()
             .expect("required_columns must be set");
         let req_set: HashSet<&str> = req.iter().map(|s| s.as_str()).collect();
         assert!(req_set.contains("a"), "requested column must be kept");
@@ -321,9 +346,8 @@ mod tests {
         let id_b = ColumnId::new_for_test(2);
 
         let mut scan = make_scan(&[("a", id_a), ("b", id_b)]);
-        scan.required_output_columns = Some(HashSet::new());
 
-        let plan = LogicalPlan::Scan(scan);
+        let plan = scan_plan(scan, Some(HashSet::new()));
         let rule = PruneScanColumns;
         let result = rule.apply(plan, &mut ctx()).unwrap();
 
@@ -331,12 +355,13 @@ mod tests {
             RewriteResult::Changed(p) => p,
             _ => panic!("expected Changed"),
         };
-        let LogicalPlan::Scan(pruned) = changed else {
+        let LogicalPlanNodeKind::Scan(pruned) = &changed.kind else {
             panic!("expected Scan");
         };
 
         let req = pruned
             .required_columns
+            .as_ref()
             .expect("required_columns must be set");
         assert_eq!(req.len(), 1, "at least one column must survive");
     }

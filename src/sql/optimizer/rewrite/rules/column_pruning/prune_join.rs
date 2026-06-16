@@ -13,7 +13,7 @@ use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::planner::plan::LogicalPlan;
+use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind};
 
 pub(crate) struct PruneJoinColumns;
 
@@ -26,13 +26,13 @@ impl LogicalRewriteRule for PruneJoinColumns {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
-        matches!(plan, LogicalPlan::Join(_))
+    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+        matches!(&plan.kind, LogicalPlanNodeKind::Join(_))
     }
 
     fn apply(
         &self,
-        _plan: LogicalPlan,
+        _plan: LogicalPlanNode,
         _ctx: &mut RewriteContext,
     ) -> Result<RewriteResult, String> {
         // No-op: Join has no own output metadata to prune; column needs were
@@ -47,31 +47,35 @@ mod tests {
     use super::*;
     use crate::sql::analysis::JoinKind;
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
-    use crate::sql::planner::plan::{JoinNode, ValuesNode};
+    use crate::sql::planner::plan::*;
+    use crate::sql::planner::plan::{LogicalJoinNode, LogicalPlanNodeKind, LogicalValuesNode};
 
     fn ctx() -> RewriteContext {
         RewriteContext::new(RewriteConsumer::Query)
     }
 
-    fn dummy_input() -> Box<LogicalPlan> {
-        Box::new(LogicalPlan::Values(ValuesNode {
-            rows: vec![],
-            columns: vec![],
-            required_output_columns: None,
-        }))
+    fn dummy_input() -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Values(LogicalValuesNode {
+                rows: vec![],
+                columns: vec![],
+            }),
+            vec![],
+            None,
+        )
     }
 
     #[test]
     fn prune_join_is_always_unchanged() {
-        let node = JoinNode {
-            left: dummy_input(),
-            right: dummy_input(),
-            join_type: JoinKind::Inner,
-            condition: None,
-            required_output_columns: None,
-        };
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: JoinKind::Inner,
+                condition: None,
+            }),
+            vec![dummy_input(), dummy_input()],
+            None,
+        );
 
-        let plan = LogicalPlan::Join(node);
         let rule = PruneJoinColumns;
 
         // matches the right variant

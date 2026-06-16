@@ -1,6 +1,6 @@
 //! Operator enum for the Cascades optimizer.
 //!
-//! Logical operators mirror `LogicalPlan` node fields minus child references
+//! Logical operators mirror `LogicalPlanNode` node fields minus child references
 //! (children are represented as `GroupId`s in `MExpr`).
 //! Physical operators add physical execution decisions (distribution, agg mode).
 

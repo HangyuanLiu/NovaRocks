@@ -1393,7 +1393,7 @@ impl<'a> PlanFragmentBuilder<'a> {
     ///   that materializes the decoded string value.
     /// All other child slots pass through the decode unchanged: the new
     /// tuple "borrows" their slot ids verbatim (matches the StarRocks
-    /// `DecodeNode` codegen, where a new `TupleDescriptor` reuses the
+    /// `LogicalDecodeNode` codegen, where a new `TupleDescriptor` reuses the
     /// child's slot ids for passthrough columns and adds a fresh slot
     /// id per decoded column).
     ///

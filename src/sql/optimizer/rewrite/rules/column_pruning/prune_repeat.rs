@@ -4,7 +4,7 @@
 //! assigned by the Phase-1 tagging pass: all input columns are needed because
 //! the ROLLUP/CUBE/GROUPING SETS grouping logic references arbitrary subsets
 //! of columns at runtime. No `output_columns` list is maintained on
-//! `RepeatPlanNode` — pruning is not applicable here.
+//! `LogicalRepeatNode` — pruning is not applicable here.
 //!
 //! Kept for architectural symmetry and to allow per-operator
 //! `disable_optimizer_rules` control in the future.
@@ -13,7 +13,7 @@ use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::planner::plan::LogicalPlan;
+use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind};
 
 pub(crate) struct PruneRepeatColumns;
 
@@ -26,13 +26,13 @@ impl LogicalRewriteRule for PruneRepeatColumns {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
-        matches!(plan, LogicalPlan::Repeat(_))
+    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+        matches!(&plan.kind, LogicalPlanNodeKind::Repeat(_))
     }
 
     fn apply(
         &self,
-        _plan: LogicalPlan,
+        _plan: LogicalPlanNode,
         _ctx: &mut RewriteContext,
     ) -> Result<RewriteResult, String> {
         // No-op: Repeat (ROLLUP/CUBE/GROUPING SETS) was assigned keep-all-child
@@ -47,7 +47,8 @@ impl LogicalRewriteRule for PruneRepeatColumns {
 mod tests {
     use super::*;
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
-    use crate::sql::planner::plan::{RepeatPlanNode, ValuesNode};
+    use crate::sql::planner::plan::*;
+    use crate::sql::planner::plan::{LogicalPlanNodeKind, LogicalRepeatNode, LogicalValuesNode};
 
     fn ctx() -> RewriteContext {
         RewriteContext::new(RewriteConsumer::Query)
@@ -55,25 +56,29 @@ mod tests {
 
     #[test]
     fn prune_repeat_is_always_unchanged() {
-        let node = RepeatPlanNode {
-            input: Box::new(LogicalPlan::Values(ValuesNode {
-                rows: vec![],
-                columns: vec![],
-                required_output_columns: None,
-            })),
-            repeat_column_ref_list: vec![],
-            repeat_column_ref_ids: vec![],
-            grouping_ids: vec![],
-            all_rollup_columns: vec![],
-            all_rollup_column_ids: vec![],
-            grouping_key_aliases: vec![],
-            grouping_fn_args: vec![],
-            grouping_fn_arg_ids: vec![],
-            grouping_fn_ids: vec![],
-            required_output_columns: None,
-        };
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Repeat(LogicalRepeatNode {
+                repeat_column_ref_list: vec![],
+                repeat_column_ref_ids: vec![],
+                grouping_ids: vec![],
+                all_rollup_columns: vec![],
+                all_rollup_column_ids: vec![],
+                grouping_key_aliases: vec![],
+                grouping_fn_args: vec![],
+                grouping_fn_arg_ids: vec![],
+                grouping_fn_ids: vec![],
+            }),
+            vec![LogicalPlanNode::new(
+                LogicalPlanNodeKind::Values(LogicalValuesNode {
+                    rows: vec![],
+                    columns: vec![],
+                }),
+                vec![],
+                None,
+            )],
+            None,
+        );
 
-        let plan = LogicalPlan::Repeat(node);
         let rule = PruneRepeatColumns;
 
         // matches the right variant

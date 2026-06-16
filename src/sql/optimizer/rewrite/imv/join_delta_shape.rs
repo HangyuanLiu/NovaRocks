@@ -6,7 +6,7 @@ use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn, ProjectItem};
 use crate::sql::catalog::ScanSource;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
-use crate::sql::planner::plan::{JoinNode, LogicalPlan, UnionNode};
+use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum JoinDeltaOrientation {
@@ -20,17 +20,20 @@ struct JoinDeltaBranchShape {
     action_column_id: ColumnId,
 }
 
-pub(crate) fn is_supported_join_delta_union(node: &UnionNode) -> bool {
-    supported_join_delta_union_action_column_id(node).is_some()
+pub(crate) fn is_supported_join_delta_union(plan: &LogicalPlanNode) -> bool {
+    supported_join_delta_union_action_column_id(plan).is_some()
 }
 
-fn supported_join_delta_union_action_column_id(node: &UnionNode) -> Option<ColumnId> {
-    if !node.all || node.inputs.len() != 2 {
+fn supported_join_delta_union_action_column_id(plan: &LogicalPlanNode) -> Option<ColumnId> {
+    let LogicalPlanNodeKind::Union(node) = &plan.kind else {
+        return None;
+    };
+    if !node.all || plan.children.len() != 2 {
         return None;
     }
     let action_column_id = unique_action_output_column_id(&node.output_columns)?;
-    let left = normalized_join_delta_branch_shape(&node.inputs[0], action_column_id)?;
-    let right = normalized_join_delta_branch_shape(&node.inputs[1], action_column_id)?;
+    let left = normalized_join_delta_branch_shape(&plan.children[0], action_column_id)?;
+    let right = normalized_join_delta_branch_shape(&plan.children[1], action_column_id)?;
     match (left.orientation, right.orientation) {
         (JoinDeltaOrientation::LeftDelta, JoinDeltaOrientation::RightDelta)
         | (JoinDeltaOrientation::RightDelta, JoinDeltaOrientation::LeftDelta) => {
@@ -40,24 +43,21 @@ fn supported_join_delta_union_action_column_id(node: &UnionNode) -> Option<Colum
     }
 }
 
-pub(crate) fn is_supported_join_delta_branch(node: &JoinNode) -> bool {
-    supported_join_delta_branch_shape(node).is_some()
+pub(crate) fn is_supported_join_delta_branch(plan: &LogicalPlanNode) -> bool {
+    supported_join_delta_branch_shape(plan).is_some()
 }
 
 fn normalized_join_delta_branch_shape(
-    plan: &LogicalPlan,
+    plan: &LogicalPlanNode,
     action_column_id: ColumnId,
 ) -> Option<JoinDeltaBranchShape> {
-    match plan {
-        LogicalPlan::Project(project) => {
+    match &plan.kind {
+        LogicalPlanNodeKind::Project(project) => {
             let projected_action_id = unique_project_action_column_id(&project.items)?;
             if projected_action_id != action_column_id {
                 return None;
             }
-            let shape = match project.input.as_ref() {
-                LogicalPlan::Join(join) => supported_join_delta_branch_shape(join)?,
-                _ => return None,
-            };
+            let shape = supported_join_delta_branch_shape(plan.unary_input())?;
             (shape.action_column_id == action_column_id).then_some(shape)
         }
         _ => None,
@@ -66,20 +66,23 @@ fn normalized_join_delta_branch_shape(
 
 #[cfg(test)]
 fn is_supported_normalized_join_delta_branch(
-    plan: &LogicalPlan,
+    plan: &LogicalPlanNode,
     action_column_id: ColumnId,
 ) -> bool {
     normalized_join_delta_branch_shape(plan, action_column_id).is_some()
 }
 
-fn supported_join_delta_branch_shape(node: &JoinNode) -> Option<JoinDeltaBranchShape> {
+fn supported_join_delta_branch_shape(plan: &LogicalPlanNode) -> Option<JoinDeltaBranchShape> {
+    let LogicalPlanNodeKind::Join(node) = &plan.kind else {
+        return None;
+    };
     if !matches!(node.join_type, JoinKind::Inner | JoinKind::Cross) {
         return None;
     }
-    let left_delta_action = join_delta_delta_action_column_id(&node.left);
-    let right_delta_action = join_delta_delta_action_column_id(&node.right);
-    let left_version = is_join_delta_version_like(&node.left);
-    let right_version = is_join_delta_version_like(&node.right);
+    let left_delta_action = join_delta_delta_action_column_id(plan.left());
+    let right_delta_action = join_delta_delta_action_column_id(plan.right());
+    let left_version = is_join_delta_version_like(plan.left());
+    let right_version = is_join_delta_version_like(plan.right());
     match (
         left_delta_action,
         right_delta_action,
@@ -153,119 +156,112 @@ fn has_reserved_action_project_output_name(item: &ProjectItem) -> bool {
     item.output_name.eq_ignore_ascii_case(ImvActionColumn::NAME)
 }
 
-fn join_delta_delta_action_column_id(plan: &LogicalPlan) -> Option<ColumnId> {
-    match plan {
-        LogicalPlan::Scan(scan)
+fn join_delta_delta_action_column_id(plan: &LogicalPlanNode) -> Option<ColumnId> {
+    match &plan.kind {
+        LogicalPlanNodeKind::Scan(scan)
             if matches!(scan.table.source, ScanSource::IcebergDeltaTable { .. }) =>
         {
             unique_action_output_column_id(&scan.columns)
         }
-        LogicalPlan::Filter(node) => join_delta_delta_action_column_id(&node.input),
-        LogicalPlan::Project(project) => {
-            let input_action_id = join_delta_delta_action_column_id(&project.input)?;
+        LogicalPlanNodeKind::Filter(_) => join_delta_delta_action_column_id(plan.unary_input()),
+        LogicalPlanNodeKind::Project(project) => {
+            let input_action_id = join_delta_delta_action_column_id(plan.unary_input())?;
             let projected_action_id = unique_project_action_column_id(&project.items)?;
             (projected_action_id == input_action_id).then_some(input_action_id)
         }
-        LogicalPlan::Join(join) => {
-            supported_join_delta_branch_shape(join).map(|shape| shape.action_column_id)
+        LogicalPlanNodeKind::Join(_) => {
+            supported_join_delta_branch_shape(plan).map(|shape| shape.action_column_id)
         }
-        LogicalPlan::Union(union) => supported_join_delta_union_action_column_id(union),
-        LogicalPlan::ImvDelta(node) => join_delta_delta_action_column_id(&node.input),
+        LogicalPlanNodeKind::Union(_) => supported_join_delta_union_action_column_id(plan),
+        LogicalPlanNodeKind::ImvDelta(_) => join_delta_delta_action_column_id(plan.unary_input()),
         _ => None,
     }
 }
 
-fn is_join_delta_version_like(plan: &LogicalPlan) -> bool {
-    match plan {
-        LogicalPlan::Scan(scan) => {
+fn is_join_delta_version_like(plan: &LogicalPlanNode) -> bool {
+    match &plan.kind {
+        LogicalPlanNodeKind::Scan(scan) => {
             matches!(scan.table.source, ScanSource::IcebergVersionTable { .. })
                 && !scan.columns.iter().any(has_reserved_action_output_name)
         }
-        LogicalPlan::Filter(node) => is_join_delta_version_like(&node.input),
-        LogicalPlan::Project(node) => {
+        LogicalPlanNodeKind::Filter(_) => is_join_delta_version_like(plan.unary_input()),
+        LogicalPlanNodeKind::Project(node) => {
             !node
                 .items
                 .iter()
                 .any(has_reserved_action_project_output_name)
-                && is_join_delta_version_like(&node.input)
+                && is_join_delta_version_like(plan.unary_input())
         }
-        LogicalPlan::Join(node) => {
+        LogicalPlanNodeKind::Join(node) => {
             matches!(node.join_type, JoinKind::Inner | JoinKind::Cross)
-                && is_join_delta_version_like(&node.left)
-                && is_join_delta_version_like(&node.right)
+                && is_join_delta_version_like(plan.left())
+                && is_join_delta_version_like(plan.right())
         }
-        LogicalPlan::ImvVersion(node) => {
-            is_supported_marker_input(&node.input)
-                && !subtree_has_delta_marker_or_scan(&node.input)
-                && !subtree_has_reserved_action_output(&node.input)
+        LogicalPlanNodeKind::ImvVersion(_) => {
+            is_supported_marker_input(plan.unary_input())
+                && !subtree_has_delta_marker_or_scan(plan.unary_input())
+                && !subtree_has_reserved_action_output(plan.unary_input())
         }
         _ => false,
     }
 }
 
-fn subtree_has_reserved_action_output(plan: &LogicalPlan) -> bool {
-    match plan {
-        LogicalPlan::Scan(scan) => scan.columns.iter().any(has_reserved_action_output_name),
-        LogicalPlan::Filter(node) => subtree_has_reserved_action_output(&node.input),
-        LogicalPlan::Project(node) => {
+fn subtree_has_reserved_action_output(plan: &LogicalPlanNode) -> bool {
+    match &plan.kind {
+        LogicalPlanNodeKind::Scan(scan) => scan.columns.iter().any(has_reserved_action_output_name),
+        LogicalPlanNodeKind::Filter(_) => subtree_has_reserved_action_output(plan.unary_input()),
+        LogicalPlanNodeKind::Project(node) => {
             node.items
                 .iter()
                 .any(has_reserved_action_project_output_name)
-                || subtree_has_reserved_action_output(&node.input)
+                || subtree_has_reserved_action_output(plan.unary_input())
         }
-        LogicalPlan::Aggregate(node) => subtree_has_reserved_action_output(&node.input),
-        LogicalPlan::AggregateStateMerge(node) => {
-            subtree_has_reserved_action_output(&node.old_input)
-                || subtree_has_reserved_action_output(&node.delta_input)
+        LogicalPlanNodeKind::Aggregate(_) => subtree_has_reserved_action_output(plan.unary_input()),
+        LogicalPlanNodeKind::AggregateStateMerge(_) | LogicalPlanNodeKind::Join(_) => {
+            plan.children.iter().any(subtree_has_reserved_action_output)
         }
-        LogicalPlan::Join(node) => {
-            subtree_has_reserved_action_output(&node.left)
-                || subtree_has_reserved_action_output(&node.right)
-        }
-        LogicalPlan::Union(node) => {
+        LogicalPlanNodeKind::Union(node) => {
             node.output_columns
                 .iter()
                 .any(has_reserved_action_output_name)
-                || node.inputs.iter().any(subtree_has_reserved_action_output)
+                || plan.children.iter().any(subtree_has_reserved_action_output)
         }
-        LogicalPlan::ImvDelta(node) => subtree_has_reserved_action_output(&node.input),
-        LogicalPlan::ImvVersion(node) => subtree_has_reserved_action_output(&node.input),
+        LogicalPlanNodeKind::ImvDelta(_) | LogicalPlanNodeKind::ImvVersion(_) => {
+            subtree_has_reserved_action_output(plan.unary_input())
+        }
         _ => false,
     }
 }
 
-fn subtree_has_delta_marker_or_scan(plan: &LogicalPlan) -> bool {
-    match plan {
-        LogicalPlan::Scan(scan) => {
+fn subtree_has_delta_marker_or_scan(plan: &LogicalPlanNode) -> bool {
+    match &plan.kind {
+        LogicalPlanNodeKind::Scan(scan) => {
             matches!(scan.table.source, ScanSource::IcebergDeltaTable { .. })
         }
-        LogicalPlan::Filter(node) => subtree_has_delta_marker_or_scan(&node.input),
-        LogicalPlan::Project(node) => subtree_has_delta_marker_or_scan(&node.input),
-        LogicalPlan::Aggregate(node) => subtree_has_delta_marker_or_scan(&node.input),
-        LogicalPlan::AggregateStateMerge(node) => {
-            subtree_has_delta_marker_or_scan(&node.old_input)
-                || subtree_has_delta_marker_or_scan(&node.delta_input)
+        LogicalPlanNodeKind::ImvDelta(_) => true,
+        LogicalPlanNodeKind::Filter(_)
+        | LogicalPlanNodeKind::Project(_)
+        | LogicalPlanNodeKind::Aggregate(_)
+        | LogicalPlanNodeKind::AggregateStateMerge(_)
+        | LogicalPlanNodeKind::Join(_)
+        | LogicalPlanNodeKind::Union(_)
+        | LogicalPlanNodeKind::ImvVersion(_) => {
+            plan.children.iter().any(subtree_has_delta_marker_or_scan)
         }
-        LogicalPlan::Join(node) => {
-            subtree_has_delta_marker_or_scan(&node.left)
-                || subtree_has_delta_marker_or_scan(&node.right)
-        }
-        LogicalPlan::Union(node) => node.inputs.iter().any(subtree_has_delta_marker_or_scan),
-        LogicalPlan::ImvDelta(_) => true,
-        LogicalPlan::ImvVersion(node) => subtree_has_delta_marker_or_scan(&node.input),
         _ => false,
     }
 }
 
-fn is_supported_marker_input(plan: &LogicalPlan) -> bool {
-    match plan {
-        LogicalPlan::Scan(_) => true,
-        LogicalPlan::Filter(node) => is_supported_marker_input(&node.input),
-        LogicalPlan::Project(node) => is_supported_marker_input(&node.input),
-        LogicalPlan::Join(node) => {
+fn is_supported_marker_input(plan: &LogicalPlanNode) -> bool {
+    match &plan.kind {
+        LogicalPlanNodeKind::Scan(_) => true,
+        LogicalPlanNodeKind::Filter(_) | LogicalPlanNodeKind::Project(_) => {
+            is_supported_marker_input(plan.unary_input())
+        }
+        LogicalPlanNodeKind::Join(node) => {
             matches!(node.join_type, JoinKind::Inner | JoinKind::Cross)
-                && is_supported_marker_input(&node.left)
-                && is_supported_marker_input(&node.right)
+                && is_supported_marker_input(plan.left())
+                && is_supported_marker_input(plan.right())
         }
         _ => false,
     }
@@ -274,12 +270,13 @@ fn is_supported_marker_input(plan: &LogicalPlan) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::planner::plan::*;
     use arrow::datatypes::DataType;
 
     use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
     use crate::sql::catalog::{ColumnDef, IcebergSchemaDef, IcebergTableInfo, TableDef};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::planner::plan::{ProjectNode, ScanNode};
+    use crate::sql::planner::plan::{LogicalPlanNodeKind, LogicalProjectNode, LogicalScanNode};
 
     fn table_info(table: &str) -> IcebergTableInfo {
         IcebergTableInfo {
@@ -296,38 +293,41 @@ mod tests {
         }
     }
 
-    fn scan(table: &str, column_id: ColumnId, source: ScanSource) -> LogicalPlan {
-        LogicalPlan::Scan(ScanNode {
-            database: "db".to_string(),
-            table: TableDef {
-                name: table.to_string(),
-                columns: vec![ColumnDef {
+    fn scan(table: &str, column_id: ColumnId, source: ScanSource) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: TableDef {
+                    name: table.to_string(),
+                    columns: vec![ColumnDef {
+                        name: "k".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        write_default: None,
+                        logical_type: None,
+                    }],
+                    iceberg_row_lineage_metadata_columns: Vec::new(),
+                    source,
+                },
+                alias: None,
+                columns: vec![OutputColumn {
+                    column_id,
                     name: "k".to_string(),
                     data_type: DataType::Int64,
                     nullable: false,
-                    write_default: None,
-                    logical_type: None,
+                    is_internal: false,
                 }],
-                iceberg_row_lineage_metadata_columns: Vec::new(),
-                source,
-            },
-            alias: None,
-            columns: vec![OutputColumn {
-                column_id,
-                name: "k".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
-                is_internal: false,
-            }],
-            predicates: Vec::new(),
-            required_columns: None,
-            dict_columns: Vec::new(),
-            variant_columns: Vec::new(),
-            required_output_columns: None,
-        })
+                predicates: Vec::new(),
+                required_columns: None,
+                dict_columns: Vec::new(),
+                variant_columns: Vec::new(),
+            }),
+            vec![],
+            None,
+        )
     }
 
-    fn delta_scan(table: &str, column_id: ColumnId) -> LogicalPlan {
+    fn delta_scan(table: &str, column_id: ColumnId) -> LogicalPlanNode {
         scan(
             table,
             column_id,
@@ -343,16 +343,16 @@ mod tests {
         table: &str,
         column_id: ColumnId,
         action_id: ColumnId,
-    ) -> LogicalPlan {
+    ) -> LogicalPlanNode {
         let mut plan = delta_scan(table, column_id);
-        let LogicalPlan::Scan(scan) = &mut plan else {
+        let LogicalPlanNodeKind::Scan(scan) = &mut plan.kind else {
             unreachable!();
         };
         scan.columns.push(ImvActionColumn::output_column(action_id));
         plan
     }
 
-    fn version_scan(table: &str, column_id: ColumnId) -> LogicalPlan {
+    fn version_scan(table: &str, column_id: ColumnId) -> LogicalPlanNode {
         scan(
             table,
             column_id,
@@ -367,9 +367,9 @@ mod tests {
         table: &str,
         column_id: ColumnId,
         action_id: ColumnId,
-    ) -> LogicalPlan {
+    ) -> LogicalPlanNode {
         let mut plan = version_scan(table, column_id);
-        let LogicalPlan::Scan(scan) = &mut plan else {
+        let LogicalPlanNodeKind::Scan(scan) = &mut plan.kind else {
             unreachable!();
         };
         scan.columns.push(OutputColumn {
@@ -410,30 +410,33 @@ mod tests {
         }
     }
 
-    fn join_plan(left: LogicalPlan, right: LogicalPlan) -> LogicalPlan {
-        LogicalPlan::Join(JoinNode {
-            left: Box::new(left),
-            right: Box::new(right),
-            join_type: JoinKind::Inner,
-            condition: None,
-            required_output_columns: None,
-        })
+    fn join_plan(left: LogicalPlanNode, right: LogicalPlanNode) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: JoinKind::Inner,
+                condition: None,
+            }),
+            vec![left, right],
+            None,
+        )
     }
 
-    fn project_with_items(input: LogicalPlan, items: Vec<ProjectItem>) -> LogicalPlan {
-        LogicalPlan::Project(ProjectNode {
-            input: Box::new(input),
-            items,
-            output_qualifier: None,
-            required_output_columns: None,
-        })
+    fn project_with_items(input: LogicalPlanNode, items: Vec<ProjectItem>) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: items,
+                output_qualifier: None,
+            }),
+            vec![input],
+            None,
+        )
     }
 
     fn normalized_join_delta_branch(
-        left: LogicalPlan,
-        right: LogicalPlan,
+        left: LogicalPlanNode,
+        right: LogicalPlanNode,
         action_item: ProjectItem,
-    ) -> LogicalPlan {
+    ) -> LogicalPlanNode {
         project_with_items(
             join_plan(left, right),
             vec![
@@ -443,7 +446,7 @@ mod tests {
         )
     }
 
-    fn left_delta_branch(action_id: ColumnId) -> LogicalPlan {
+    fn left_delta_branch(action_id: ColumnId) -> LogicalPlanNode {
         normalized_join_delta_branch(
             delta_scan_with_action("a", ColumnId(1), action_id),
             version_scan("b", ColumnId(10)),
@@ -451,7 +454,7 @@ mod tests {
         )
     }
 
-    fn right_delta_branch(action_id: ColumnId) -> LogicalPlan {
+    fn right_delta_branch(action_id: ColumnId) -> LogicalPlanNode {
         normalized_join_delta_branch(
             version_scan("a", ColumnId(1)),
             delta_scan_with_action("b", ColumnId(10), action_id),
@@ -460,18 +463,20 @@ mod tests {
     }
 
     fn join_delta_union_with_inputs(
-        inputs: Vec<LogicalPlan>,
+        inputs: Vec<LogicalPlanNode>,
         output_columns: Vec<OutputColumn>,
-    ) -> UnionNode {
-        UnionNode {
+    ) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Union(LogicalUnionNode {
+                all: true,
+                output_columns,
+            }),
             inputs,
-            all: true,
-            output_columns,
-            required_output_columns: None,
-        }
+            None,
+        )
     }
 
-    fn join_delta_union(output_columns: Vec<OutputColumn>) -> UnionNode {
+    fn join_delta_union(output_columns: Vec<OutputColumn>) -> LogicalPlanNode {
         join_delta_union_with_inputs(
             vec![
                 left_delta_branch(ColumnId(100)),

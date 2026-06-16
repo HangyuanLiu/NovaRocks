@@ -33,15 +33,12 @@ impl RewriteRule for PruneUkFkJoin {
         "PruneUkFkJoin"
     }
 
-    fn matches(&self, plan: &LogicalPlan) -> bool {
-        matches!(
-            plan,
-            LogicalPlan::Project(ProjectNode { input, .. })
-                if matches!(input.as_ref(), LogicalPlan::Join(_))
-        )
+    fn matches(&self, plan: &LogicalPlanNode) -> bool {
+        matches!(&plan.kind, LogicalPlanNodeKind::Project(_))
+            && matches!(&plan.unary_input().kind, LogicalPlanNodeKind::Join(_))
     }
 
-    fn apply(&self, plan: LogicalPlan) -> Option<LogicalPlan> {
+    fn apply(&self, plan: LogicalPlanNode) -> Option<LogicalPlanNode> {
         let settings = current_session_optimizer_settings();
         let table_prune_enabled = settings.enable_query_rewrite_table_prune
             || settings.enable_cbo_table_prune
@@ -50,60 +47,73 @@ impl RewriteRule for PruneUkFkJoin {
             return None;
         }
 
-        let LogicalPlan::Project(project) = plan else {
+        let LogicalPlanNode {
+            kind,
+            mut children,
+            required_output_columns,
+        } = plan;
+        let LogicalPlanNodeKind::Project(project) = kind else {
             return None;
         };
-        let LogicalPlan::Join(join) = *project.input else {
+        if children.len() != 1 {
+            return None;
+        }
+        let join_plan = children.remove(0);
+        let LogicalPlanNode {
+            kind,
+            mut children,
+            required_output_columns: _,
+        } = join_plan;
+        let LogicalPlanNodeKind::Join(join) = kind else {
             return None;
         };
+        if children.len() != 2 {
+            return None;
+        }
+        let right = children.remove(1);
+        let left = children.remove(0);
 
-        let retained_side = project_referenced_side(&project.items, &join.left, &join.right)?;
-        let eq_pairs = join_equality_pairs(&join)?;
+        let retained_side = project_referenced_side(&project.items, &left, &right)?;
+        let eq_pairs = join_equality_pairs(&join, &left, &right)?;
         let left_cols: Vec<String> = eq_pairs.iter().map(|(left, _)| left.clone()).collect();
         let right_cols: Vec<String> = eq_pairs.iter().map(|(_, right)| right.clone()).collect();
-        let left_scan = root_scan(&join.left)?;
-        let right_scan = root_scan(&join.right)?;
+        let left_scan = root_scan(&left)?;
+        let right_scan = root_scan(&right)?;
 
         let retained = match (join.join_type, retained_side) {
             (JoinKind::LeftOuter, Side::Left)
                 if table_prune_enabled && table_has_unique_key(right_scan, &right_cols) =>
             {
-                Some(join.left.as_ref().clone())
+                Some(left.clone())
             }
             (JoinKind::RightOuter, Side::Right)
                 if table_prune_enabled && table_has_unique_key(left_scan, &left_cols) =>
             {
-                Some(join.right.as_ref().clone())
+                Some(right.clone())
             }
             (JoinKind::Inner, Side::Left)
                 if settings.enable_ukfk_opt
                     && foreign_key_matches(left_scan, right_scan, &left_cols, &right_cols) =>
             {
-                Some(add_not_null_filter(
-                    join.left.as_ref().clone(),
-                    left_scan,
-                    &left_cols,
-                ))
+                Some(add_not_null_filter(left.clone(), left_scan, &left_cols))
             }
             (JoinKind::Inner, Side::Right)
                 if settings.enable_ukfk_opt
                     && foreign_key_matches(right_scan, left_scan, &right_cols, &left_cols) =>
             {
-                Some(add_not_null_filter(
-                    join.right.as_ref().clone(),
-                    right_scan,
-                    &right_cols,
-                ))
+                Some(add_not_null_filter(right.clone(), right_scan, &right_cols))
             }
             _ => None,
         }?;
 
-        Some(LogicalPlan::Project(ProjectNode {
-            input: Box::new(retained),
-            items: project.items,
-            output_qualifier: project.output_qualifier,
-            required_output_columns: project.required_output_columns,
-        }))
+        Some(LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: project.items,
+                output_qualifier: project.output_qualifier,
+            }),
+            vec![retained],
+            required_output_columns,
+        ))
     }
 }
 
@@ -114,27 +124,42 @@ impl RewriteRule for EliminateUniqueAggregate {
         "EliminateUniqueAggregate"
     }
 
-    fn matches(&self, plan: &LogicalPlan) -> bool {
-        matches!(
-            plan,
-            LogicalPlan::Project(ProjectNode { input, .. })
-                if matches!(input.as_ref(), LogicalPlan::Aggregate(_))
-        )
+    fn matches(&self, plan: &LogicalPlanNode) -> bool {
+        matches!(&plan.kind, LogicalPlanNodeKind::Project(_))
+            && matches!(&plan.unary_input().kind, LogicalPlanNodeKind::Aggregate(_))
     }
 
-    fn apply(&self, plan: LogicalPlan) -> Option<LogicalPlan> {
+    fn apply(&self, plan: LogicalPlanNode) -> Option<LogicalPlanNode> {
         let settings = current_session_optimizer_settings();
         if !settings.enable_eliminate_agg {
             return None;
         }
 
-        let LogicalPlan::Project(project) = plan else {
+        let LogicalPlanNode {
+            kind,
+            mut children,
+            required_output_columns,
+        } = plan;
+        let LogicalPlanNodeKind::Project(project) = kind else {
             return None;
         };
-        let LogicalPlan::Aggregate(aggregate) = *project.input else {
+        if children.len() != 1 {
+            return None;
+        }
+        let aggregate_plan = children.remove(0);
+        let LogicalPlanNode {
+            kind,
+            mut children,
+            required_output_columns: _,
+        } = aggregate_plan;
+        let LogicalPlanNodeKind::Aggregate(aggregate) = kind else {
             return None;
         };
-        let scan = root_scan(&aggregate.input)?;
+        if children.len() != 1 {
+            return None;
+        }
+        let aggregate_input = children.remove(0);
+        let scan = root_scan(&aggregate_input)?;
         let group_columns = group_by_columns(&aggregate.group_by)?;
         if group_columns.is_empty() || !table_has_unique_key(scan, &group_columns) {
             return None;
@@ -149,27 +174,29 @@ impl RewriteRule for EliminateUniqueAggregate {
             .map(rewrite_eliminated_aggregate_project_item)
             .collect::<Option<Vec<_>>>()?;
 
-        Some(LogicalPlan::Project(ProjectNode {
-            input: aggregate.input,
-            items,
-            output_qualifier: project.output_qualifier,
-            required_output_columns: project.required_output_columns,
-        }))
+        Some(LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items,
+                output_qualifier: project.output_qualifier,
+            }),
+            vec![aggregate_input],
+            required_output_columns,
+        ))
     }
 }
 
-fn root_scan(plan: &LogicalPlan) -> Option<&ScanNode> {
-    match plan {
-        LogicalPlan::Scan(scan) => Some(scan),
-        LogicalPlan::Filter(filter) => root_scan(&filter.input),
+fn root_scan(plan: &LogicalPlanNode) -> Option<&LogicalScanNode> {
+    match &plan.kind {
+        LogicalPlanNodeKind::Scan(scan) => Some(scan),
+        LogicalPlanNodeKind::Filter(_) => root_scan(plan.unary_input()),
         _ => None,
     }
 }
 
 fn project_referenced_side(
     items: &[ProjectItem],
-    left: &LogicalPlan,
-    right: &LogicalPlan,
+    left: &LogicalPlanNode,
+    right: &LogicalPlanNode,
 ) -> Option<Side> {
     let mut left_ids = collect_output_ids(left);
     let mut right_ids = collect_output_ids(right);
@@ -193,10 +220,14 @@ fn project_referenced_side(
     side
 }
 
-fn join_equality_pairs(join: &JoinNode) -> Option<Vec<(String, String)>> {
+fn join_equality_pairs(
+    join: &LogicalJoinNode,
+    left: &LogicalPlanNode,
+    right: &LogicalPlanNode,
+) -> Option<Vec<(String, String)>> {
     let condition = join.condition.as_ref()?;
-    let mut left_ids = collect_output_ids(&join.left);
-    let mut right_ids = collect_output_ids(&join.right);
+    let mut left_ids = collect_output_ids(left);
+    let mut right_ids = collect_output_ids(right);
     left_ids.remove(&ColumnId::UNSET);
     right_ids.remove(&ColumnId::UNSET);
     let mut pairs = Vec::new();
@@ -300,15 +331,15 @@ fn group_by_columns(group_by: &[TypedExpr]) -> Option<Vec<String>> {
         .collect()
 }
 
-fn table_has_unique_key(scan: &ScanNode, columns: &[String]) -> bool {
+fn table_has_unique_key(scan: &LogicalScanNode, columns: &[String]) -> bool {
     unique_constraints(scan)
         .into_iter()
         .any(|constraint| same_columns(&constraint, columns))
 }
 
 fn foreign_key_matches(
-    local_scan: &ScanNode,
-    referenced_scan: &ScanNode,
+    local_scan: &LogicalScanNode,
+    referenced_scan: &LogicalScanNode,
     local_columns: &[String],
     referenced_columns: &[String],
 ) -> bool {
@@ -322,14 +353,14 @@ fn foreign_key_matches(
     })
 }
 
-fn unique_constraints(scan: &ScanNode) -> Vec<Vec<String>> {
+fn unique_constraints(scan: &LogicalScanNode) -> Vec<Vec<String>> {
     let Some(value) = table_properties(scan).remove("unique_constraints") else {
         return Vec::new();
     };
     value.split(';').filter_map(parse_column_list).collect()
 }
 
-fn foreign_key_constraints(scan: &ScanNode) -> Vec<ForeignKeyConstraint> {
+fn foreign_key_constraints(scan: &LogicalScanNode) -> Vec<ForeignKeyConstraint> {
     let Some(value) = table_properties(scan).remove("foreign_key_constraints") else {
         return Vec::new();
     };
@@ -339,7 +370,7 @@ fn foreign_key_constraints(scan: &ScanNode) -> Vec<ForeignKeyConstraint> {
         .collect()
 }
 
-fn table_properties(scan: &ScanNode) -> HashMap<String, String> {
+fn table_properties(scan: &LogicalScanNode) -> HashMap<String, String> {
     let Some(serialized_metadata) =
         iceberg_table_info(&scan.table.source).and_then(|table| table.serialized_metadata.as_ref())
     else {
@@ -414,7 +445,7 @@ fn same_columns(left: &[String], right: &[String]) -> bool {
     right.iter().all(|column| left.contains(column.as_str()))
 }
 
-fn table_name_matches(scan: &ScanNode, raw_table: &str) -> bool {
+fn table_name_matches(scan: &LogicalScanNode, raw_table: &str) -> bool {
     let table = normalize_table_name(raw_table);
     if table.eq_ignore_ascii_case(&scan.table.name) {
         return true;
@@ -442,7 +473,11 @@ fn normalize_table_name(raw: &str) -> String {
     normalize_identifier(raw)
 }
 
-fn add_not_null_filter(plan: LogicalPlan, scan: &ScanNode, columns: &[String]) -> LogicalPlan {
+fn add_not_null_filter(
+    plan: LogicalPlanNode,
+    scan: &LogicalScanNode,
+    columns: &[String],
+) -> LogicalPlanNode {
     let qualifier = scan
         .alias
         .clone()
@@ -475,11 +510,13 @@ fn add_not_null_filter(plan: LogicalPlan, scan: &ScanNode, columns: &[String]) -
     if predicates.is_empty() {
         return plan;
     }
-    LogicalPlan::Filter(FilterNode {
-        input: Box::new(plan),
-        predicate: combine_and(predicates),
-        required_output_columns: None,
-    })
+    LogicalPlanNode::new(
+        LogicalPlanNodeKind::Filter(LogicalFilterNode {
+            predicate: combine_and(predicates),
+        }),
+        vec![plan],
+        None,
+    )
 }
 
 fn is_eliminable_count(aggregate: &AggregateCall) -> bool {

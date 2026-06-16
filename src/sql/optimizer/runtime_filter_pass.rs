@@ -385,7 +385,7 @@ fn push_probe_down(
     true
 }
 
-/// StarRocks JoinNode.java: only Shuffle/Partitioned gate on build size.
+/// StarRocks LogicalJoinNode.java: only Shuffle/Partitioned gate on build size.
 fn build_gate_passes(distribution: &JoinDistribution, build_size: f64, build_max: f64) -> bool {
     match distribution {
         JoinDistribution::Shuffle => !(build_size <= 0.0 || build_size > build_max),

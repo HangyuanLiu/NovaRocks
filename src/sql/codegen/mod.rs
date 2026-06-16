@@ -1,4 +1,4 @@
-//! Physical plan layer — converts [`LogicalPlan`] into Thrift execution plans.
+//! Physical plan layer — converts [`LogicalPlanNode`] into Thrift execution plans.
 //!
 //! This layer allocates physical resources (tuple_id, slot_id, node_id),
 //! compiles `TypedExpr` into Thrift `TExpr`, and assembles the Thrift

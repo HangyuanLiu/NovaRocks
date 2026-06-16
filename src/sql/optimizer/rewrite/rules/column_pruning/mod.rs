@@ -99,11 +99,12 @@ pub(crate) fn keep_at_least_one(
 
 #[cfg(test)]
 mod tests {
-    //! Pipeline-level integration tests that verify the Phase-1 (TagRequiredColumns)
-    //! + Phase-2 (v2 Prune* rules) combination sets `Scan.required_columns` correctly.
-    //!
-    //! These tests mirror the behavioral coverage of the four tests that lived in
-    //! the old `column_pruning.rs` before the v1→v2 switch.
+    use crate::sql::planner::plan::*;
+    // Pipeline-level integration tests that verify the Phase-1 (TagRequiredColumns)
+    // + Phase-2 (v2 Prune* rules) combination sets `Scan.required_columns` correctly.
+    //
+    // These tests mirror the behavioral coverage of the four tests that lived in
+    // the old `column_pruning.rs` before the v1→v2 switch.
 
     use std::collections::HashMap;
 
@@ -154,7 +155,7 @@ mod tests {
         }
     }
 
-    fn make_scan(cols: &[(ColumnId, &str)]) -> LogicalPlan {
+    fn make_scan(cols: &[(ColumnId, &str)]) -> LogicalPlanNode {
         let table = TableDef {
             name: "t1".to_string(),
             columns: cols.iter().map(|(_, name)| col_def(name)).collect(),
@@ -164,36 +165,39 @@ mod tests {
                 table_id: 0,
             },
         };
-        LogicalPlan::Scan(ScanNode {
-            database: "default".to_string(),
-            table,
-            alias: None,
-            columns: cols
-                .iter()
-                .map(|(id, name)| output_col(*id, name))
-                .collect(),
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        })
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "default".to_string(),
+                table: table,
+                alias: None,
+                columns: cols
+                    .iter()
+                    .map(|(id, name)| output_col(*id, name))
+                    .collect(),
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        )
     }
 
-    fn run_pipeline(plan: LogicalPlan) -> LogicalPlan {
+    fn run_pipeline(plan: LogicalPlanNode) -> LogicalPlanNode {
         let table_stats = HashMap::new();
         let pipeline = query_rewrite_pipeline(&table_stats);
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         pipeline.rewrite(plan, &mut ctx).unwrap()
     }
 
-    fn extract_scan(plan: &LogicalPlan) -> &ScanNode {
+    fn extract_scan(plan: &LogicalPlanNode) -> &LogicalScanNode {
         // Walk down through Project/Filter/Aggregate to reach the Scan leaf.
-        match plan {
-            LogicalPlan::Scan(s) => s,
-            LogicalPlan::Project(p) => extract_scan(&p.input),
-            LogicalPlan::Filter(f) => extract_scan(&f.input),
-            LogicalPlan::Aggregate(a) => extract_scan(&a.input),
+        match &plan.kind {
+            LogicalPlanNodeKind::Scan(s) => s,
+            LogicalPlanNodeKind::Project(_)
+            | LogicalPlanNodeKind::Filter(_)
+            | LogicalPlanNodeKind::Aggregate(_) => extract_scan(plan.unary_input()),
             _ => panic!("unexpected plan node, expected to find Scan"),
         }
     }
@@ -212,7 +216,7 @@ mod tests {
         let plan = make_scan(&[(id_a, "a"), (id_b, "b"), (id_c, "c")]);
         let result = run_pipeline(plan);
 
-        let LogicalPlan::Scan(s) = result else {
+        let LogicalPlanNodeKind::Scan(s) = &result.kind else {
             panic!("expected Scan at root");
         };
         // Phase-1 tags all columns when there is no parent restriction; Phase-2
@@ -220,6 +224,7 @@ mod tests {
         // keeping every column is the correct behavior.
         let req = s
             .required_columns
+            .as_ref()
             .expect("required_columns must be set after pipeline");
         let req_set: std::collections::HashSet<&str> = req.iter().map(|s| s.as_str()).collect();
         assert!(req_set.contains("a"), "a must be kept");
@@ -241,16 +246,18 @@ mod tests {
         let out_a = ColumnId::new_for_test(101);
 
         let scan = make_scan(&[(id_a, "a"), (id_b, "b"), (id_c, "c")]);
-        let project = LogicalPlan::Project(ProjectNode {
-            input: Box::new(scan),
-            items: vec![ProjectItem {
-                expr: col_ref(id_a, "a"),
-                output_name: "a".to_string(),
-                output_column_id: out_a,
-            }],
-            output_qualifier: None,
-            required_output_columns: None,
-        });
+        let project = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![ProjectItem {
+                    expr: col_ref(id_a, "a"),
+                    output_name: "a".to_string(),
+                    output_column_id: out_a,
+                }],
+                output_qualifier: None,
+            }),
+            vec![scan],
+            None,
+        );
 
         let result = run_pipeline(project);
         let scan_node = extract_scan(&result);
@@ -276,33 +283,37 @@ mod tests {
         let out_a = ColumnId::new_for_test(101);
 
         let scan = make_scan(&[(id_a, "a"), (id_b, "b"), (id_c, "c")]);
-        let filter = LogicalPlan::Filter(FilterNode {
-            input: Box::new(scan),
-            predicate: TypedExpr {
-                kind: ExprKind::BinaryOp {
-                    left: Box::new(col_ref(id_b, "b")),
-                    op: BinOp::Eq,
-                    right: Box::new(TypedExpr {
-                        kind: ExprKind::Literal(LiteralValue::String("x".to_string())),
-                        data_type: DataType::Utf8,
-                        nullable: false,
-                    }),
+        let filter = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: TypedExpr {
+                    kind: ExprKind::BinaryOp {
+                        left: Box::new(col_ref(id_b, "b")),
+                        op: BinOp::Eq,
+                        right: Box::new(TypedExpr {
+                            kind: ExprKind::Literal(LiteralValue::String("x".to_string())),
+                            data_type: DataType::Utf8,
+                            nullable: false,
+                        }),
+                    },
+                    data_type: DataType::Boolean,
+                    nullable: false,
                 },
-                data_type: DataType::Boolean,
-                nullable: false,
-            },
-            required_output_columns: None,
-        });
-        let project = LogicalPlan::Project(ProjectNode {
-            input: Box::new(filter),
-            items: vec![ProjectItem {
-                expr: col_ref(id_a, "a"),
-                output_name: "a".to_string(),
-                output_column_id: out_a,
-            }],
-            output_qualifier: None,
-            required_output_columns: None,
-        });
+            }),
+            vec![scan],
+            None,
+        );
+        let project = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![ProjectItem {
+                    expr: col_ref(id_a, "a"),
+                    output_name: "a".to_string(),
+                    output_column_id: out_a,
+                }],
+                output_qualifier: None,
+            }),
+            vec![filter],
+            None,
+        );
 
         let result = run_pipeline(project);
         let scan_node = extract_scan(&result);
@@ -345,50 +356,54 @@ mod tests {
         let out_sum = ColumnId::new_for_test(202);
 
         let scan = make_scan(&[(id_a, "a"), (id_b, "b"), (id_c, "c")]);
-        let agg = LogicalPlan::Aggregate(AggregateNode {
-            input: Box::new(scan),
-            group_by: vec![col_ref(id_b, "b")],
-            aggregates: vec![AggregateCall {
-                name: "sum".to_string(),
-                args: vec![col_ref(id_c, "c")],
-                distinct: false,
-                result_type: DataType::Int64,
-                order_by: vec![],
-                output_column_id: ColumnId::UNSET,
-            }],
-            output_columns: vec![
-                OutputColumn {
-                    column_id: out_b,
-                    name: "b".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
-                    is_internal: false,
-                },
-                OutputColumn {
-                    column_id: out_sum,
-                    name: "sum_c".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: true,
-                    is_internal: false,
-                },
-            ],
-            already_pushed: false,
-            required_output_columns: None,
-        });
+        let agg = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![col_ref(id_b, "b")],
+                aggregates: vec![AggregateCall {
+                    name: "sum".to_string(),
+                    args: vec![col_ref(id_c, "c")],
+                    distinct: false,
+                    result_type: DataType::Int64,
+                    order_by: vec![],
+                    output_column_id: ColumnId::UNSET,
+                }],
+                output_columns: vec![
+                    OutputColumn {
+                        column_id: out_b,
+                        name: "b".to_string(),
+                        data_type: DataType::Int32,
+                        nullable: false,
+                        is_internal: false,
+                    },
+                    OutputColumn {
+                        column_id: out_sum,
+                        name: "sum_c".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: true,
+                        is_internal: false,
+                    },
+                ],
+                already_pushed: false,
+            }),
+            vec![scan],
+            None,
+        );
 
         // Wrap in a Project that selects only out_b (b) so tag_project provides
         // a non-None parent_needed to tag_aggregate. tag_aggregate then passes
         // child_needed = ALL group-by ∪ ALL agg args = {b@2, c@3} to the Scan.
-        let proj = LogicalPlan::Project(ProjectNode {
-            input: Box::new(agg),
-            items: vec![ProjectItem {
-                output_column_id: ColumnId::new_for_test(901),
-                output_name: "b".to_string(),
-                expr: col_ref(out_b, "b"),
-            }],
-            output_qualifier: None,
-            required_output_columns: None,
-        });
+        let proj = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![ProjectItem {
+                    output_column_id: ColumnId::new_for_test(901),
+                    output_name: "b".to_string(),
+                    expr: col_ref(out_b, "b"),
+                }],
+                output_qualifier: None,
+            }),
+            vec![agg],
+            None,
+        );
 
         let result = run_pipeline(proj);
         let scan_node = extract_scan(&result);

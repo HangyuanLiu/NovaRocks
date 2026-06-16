@@ -1,4 +1,4 @@
-//! EXPLAIN plan formatter — produces text from LogicalPlan or PhysicalPlan.
+//! EXPLAIN plan formatter — produces text from LogicalPlanNode or PhysicalPlan.
 
 use std::fmt::Write;
 
@@ -10,7 +10,9 @@ use crate::sql::optimizer::estimate::arith::MAX_ROW_COUNT;
 use crate::sql::optimizer::operator::{AggMode, JoinDistribution, Operator, PhysicalScanOp};
 use crate::sql::optimizer::physical_plan::{JoinExecutionDistribution, PhysicalPlanNode};
 use crate::sql::optimizer::property::DistributionSpec;
-use crate::sql::planner::plan::{ApplyKind, LogicalPlan, ScanVariantColumn};
+use crate::sql::planner::plan::{
+    ApplyKind, LogicalPlanNode, LogicalPlanNodeKind, ScanVariantColumn,
+};
 
 /// Build the per-node `stats={...}` trailer surfaced under
 /// `Verbose | Costs | Analyze` levels. Future PRs (OPT-3 NDV, OPT-4
@@ -107,19 +109,19 @@ pub(crate) enum ExplainLevel {
     Analyze,
 }
 
-/// Format a single LogicalPlan tree as EXPLAIN text lines.
+/// Format a single LogicalPlanNode tree as EXPLAIN text lines.
 #[allow(dead_code)]
-pub(crate) fn explain_plan(plan: &LogicalPlan, level: ExplainLevel) -> Vec<String> {
+pub(crate) fn explain_plan(plan: &LogicalPlanNode, level: ExplainLevel) -> Vec<String> {
     let mut out = Vec::new();
     format_node(plan, level, 0, &mut out);
     out
 }
 
 #[allow(dead_code)]
-fn format_node(plan: &LogicalPlan, level: ExplainLevel, indent: usize, out: &mut Vec<String>) {
+fn format_node(plan: &LogicalPlanNode, level: ExplainLevel, indent: usize, out: &mut Vec<String>) {
     let pad = "  ".repeat(indent);
-    match plan {
-        LogicalPlan::Scan(node) => {
+    match &plan.kind {
+        LogicalPlanNodeKind::Scan(node) => {
             let alias = node
                 .alias
                 .as_deref()
@@ -150,15 +152,15 @@ fn format_node(plan: &LogicalPlan, level: ExplainLevel, indent: usize, out: &mut
                 out.push(format!("{pad}     predicates: {}", preds.join(" AND ")));
             }
         }
-        LogicalPlan::Filter(node) => {
+        LogicalPlanNodeKind::Filter(node) => {
             out.push(format!("{pad}FILTER"));
             out.push(format!(
                 "{pad}  predicate: {}",
                 format_expr(&node.predicate)
             ));
-            format_node(&node.input, level, indent + 1, out);
+            format_node(plan.unary_input(), level, indent + 1, out);
         }
-        LogicalPlan::Project(node) => {
+        LogicalPlanNodeKind::Project(node) => {
             let items: Vec<String> = node
                 .items
                 .iter()
@@ -172,9 +174,9 @@ fn format_node(plan: &LogicalPlan, level: ExplainLevel, indent: usize, out: &mut
                 })
                 .collect();
             out.push(format!("{pad}PROJECT [{}]", items.join(", ")));
-            format_node(&node.input, level, indent + 1, out);
+            format_node(plan.unary_input(), level, indent + 1, out);
         }
-        LogicalPlan::Aggregate(node) => {
+        LogicalPlanNodeKind::Aggregate(node) => {
             let groups: Vec<String> = node.group_by.iter().map(format_expr).collect();
             let aggs: Vec<String> = node
                 .aggregates
@@ -192,9 +194,9 @@ fn format_node(plan: &LogicalPlan, level: ExplainLevel, indent: usize, out: &mut
             if !aggs.is_empty() {
                 out.push(format!("{pad}  aggregations: {}", aggs.join(", ")));
             }
-            format_node(&node.input, level, indent + 1, out);
+            format_node(plan.unary_input(), level, indent + 1, out);
         }
-        LogicalPlan::Join(node) => {
+        LogicalPlanNodeKind::Join(node) => {
             let join_str = match node.join_type {
                 JoinKind::Inner => "INNER JOIN",
                 JoinKind::LeftOuter => "LEFT OUTER JOIN",
@@ -211,10 +213,10 @@ fn format_node(plan: &LogicalPlan, level: ExplainLevel, indent: usize, out: &mut
             if let Some(ref cond) = node.condition {
                 out.push(format!("{pad}  on: {}", format_expr(cond)));
             }
-            format_node(&node.left, level, indent + 1, out);
-            format_node(&node.right, level, indent + 1, out);
+            format_node(plan.left(), level, indent + 1, out);
+            format_node(plan.right(), level, indent + 1, out);
         }
-        LogicalPlan::Sort(node) => {
+        LogicalPlanNodeKind::Sort(node) => {
             let items: Vec<String> = node
                 .items
                 .iter()
@@ -229,9 +231,9 @@ fn format_node(plan: &LogicalPlan, level: ExplainLevel, indent: usize, out: &mut
                 })
                 .collect();
             out.push(format!("{pad}SORT BY [{}]", items.join(", ")));
-            format_node(&node.input, level, indent + 1, out);
+            format_node(plan.unary_input(), level, indent + 1, out);
         }
-        LogicalPlan::Limit(node) => {
+        LogicalPlanNodeKind::Limit(node) => {
             let mut parts = Vec::new();
             if let Some(limit) = node.limit {
                 parts.push(format!("limit={limit}"));
@@ -240,28 +242,28 @@ fn format_node(plan: &LogicalPlan, level: ExplainLevel, indent: usize, out: &mut
                 parts.push(format!("offset={offset}"));
             }
             out.push(format!("{pad}LIMIT [{}]", parts.join(", ")));
-            format_node(&node.input, level, indent + 1, out);
+            format_node(plan.unary_input(), level, indent + 1, out);
         }
-        LogicalPlan::Union(node) => {
+        LogicalPlanNodeKind::Union(node) => {
             let kind = if node.all { "UNION ALL" } else { "UNION" };
             out.push(format!("{pad}{kind}"));
-            for input in &node.inputs {
+            for input in &plan.children {
                 format_node(input, level, indent + 1, out);
             }
         }
-        LogicalPlan::Intersect(node) => {
+        LogicalPlanNodeKind::Intersect(_) => {
             out.push(format!("{pad}INTERSECT"));
-            for input in &node.inputs {
+            for input in &plan.children {
                 format_node(input, level, indent + 1, out);
             }
         }
-        LogicalPlan::Except(node) => {
+        LogicalPlanNodeKind::Except(_) => {
             out.push(format!("{pad}EXCEPT"));
-            for input in &node.inputs {
+            for input in &plan.children {
                 format_node(input, level, indent + 1, out);
             }
         }
-        LogicalPlan::Window(node) => {
+        LogicalPlanNodeKind::Window(node) => {
             let fns: Vec<String> = node
                 .window_exprs
                 .iter()
@@ -292,55 +294,55 @@ fn format_node(plan: &LogicalPlan, level: ExplainLevel, indent: usize, out: &mut
                 })
                 .collect();
             out.push(format!("{pad}WINDOW [{}]", fns.join("; ")));
-            format_node(&node.input, level, indent + 1, out);
+            format_node(plan.unary_input(), level, indent + 1, out);
         }
-        LogicalPlan::Values(node) => {
+        LogicalPlanNodeKind::Values(node) => {
             out.push(format!("{pad}VALUES ({} rows)", node.rows.len()));
         }
-        LogicalPlan::GenerateSeries(node) => {
+        LogicalPlanNodeKind::GenerateSeries(node) => {
             out.push(format!(
                 "{pad}GENERATE_SERIES({}, {}, {})",
                 node.start, node.end, node.step
             ));
         }
-        LogicalPlan::TableFunction(node) => {
+        LogicalPlanNodeKind::TableFunction(node) => {
             let join_type = if node.is_left_join { "LEFT" } else { "CROSS" };
             out.push(format!(
                 "{pad}TABLE_FUNCTION [{} {}]",
                 join_type,
                 node.function_name.to_uppercase()
             ));
-            format_node(&node.input, level, indent + 1, out);
+            format_node(plan.unary_input(), level, indent + 1, out);
         }
-        LogicalPlan::Repeat(node) => {
+        LogicalPlanNodeKind::Repeat(node) => {
             out.push(format!(
                 "{pad}REPEAT ({} grouping sets)",
                 node.grouping_ids.len()
             ));
-            format_node(&node.input, level, indent + 1, out);
+            format_node(plan.unary_input(), level, indent + 1, out);
         }
-        LogicalPlan::CTEAnchor(node) => {
+        LogicalPlanNodeKind::CTEAnchor(node) => {
             out.push(format!("{pad}CTE_ANCHOR(cte_id={})", node.cte_id));
-            format_node(&node.produce, level, indent + 1, out);
-            format_node(&node.consumer, level, indent + 1, out);
+            format_node(plan.child(0), level, indent + 1, out);
+            format_node(plan.child(1), level, indent + 1, out);
         }
-        LogicalPlan::CTEProduce(node) => {
+        LogicalPlanNodeKind::CTEProduce(node) => {
             out.push(format!("{pad}CTE_PRODUCE(cte_id={})", node.cte_id));
-            format_node(&node.input, level, indent + 1, out);
+            format_node(plan.unary_input(), level, indent + 1, out);
         }
-        LogicalPlan::CTEConsume(node) => {
+        LogicalPlanNodeKind::CTEConsume(node) => {
             out.push(format!("{pad}CTE_CONSUME(cte_id={})", node.cte_id));
         }
-        LogicalPlan::Decode(node) => {
+        LogicalPlanNodeKind::Decode(node) => {
             let pairs: Vec<String> = node
                 .mappings
                 .iter()
                 .map(|m| format!("{}->{}", m.dict_column, m.string_column))
                 .collect();
             out.push(format!("{pad}DECODE [{}]", pairs.join(", ")));
-            format_node(&node.input, level, indent + 1, out);
+            format_node(plan.unary_input(), level, indent + 1, out);
         }
-        LogicalPlan::AggregateStateMerge(node) => {
+        LogicalPlanNodeKind::AggregateStateMerge(node) => {
             out.push(format!(
                 "{}AggregateStateMerge keys=[{}] states=[{}] change_op={}",
                 pad,
@@ -348,10 +350,10 @@ fn format_node(plan: &LogicalPlan, level: ExplainLevel, indent: usize, out: &mut
                 node.aggregate_state_names.join(","),
                 node.change_op_column
             ));
-            format_node(&node.old_input, level, indent + 1, out);
-            format_node(&node.delta_input, level, indent + 1, out);
+            format_node(plan.left(), level, indent + 1, out);
+            format_node(plan.right(), level, indent + 1, out);
         }
-        LogicalPlan::Apply(node) => {
+        LogicalPlanNodeKind::Apply(node) => {
             let kind = match node.kind {
                 ApplyKind::Scalar => "SCALAR",
                 ApplyKind::Exists { negated: false } => "EXISTS",
@@ -364,14 +366,14 @@ fn format_node(plan: &LogicalPlan, level: ExplainLevel, indent: usize, out: &mut
                 !node.correlation_column_ids.is_empty(),
                 node.use_semi_anti
             ));
-            format_node(&node.left, level, indent + 1, out);
-            format_node(&node.right, level, indent + 1, out);
+            format_node(plan.left(), level, indent + 1, out);
+            format_node(plan.right(), level, indent + 1, out);
         }
-        LogicalPlan::AssertOneRow(node) => {
+        LogicalPlanNodeKind::AssertOneRow(_) => {
             out.push(format!("{pad}ASSERT ONE ROW"));
-            format_node(&node.input, level, indent + 1, out);
+            format_node(plan.unary_input(), level, indent + 1, out);
         }
-        LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
+        LogicalPlanNodeKind::ImvDelta(_) | LogicalPlanNodeKind::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
         }
     }
@@ -1372,6 +1374,7 @@ fn format_expr_kind(kind: &ExprKind) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::sql::planner::plan::*;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -1398,10 +1401,11 @@ mod tests {
     use crate::sql::optimizer::property::PhysicalPropertySet;
     use crate::sql::optimizer::statistics::{Confidence, Statistics};
     use crate::sql::planner::plan::{
-        AggregateStateMergeNode, LogicalPlan, ScanVariantColumn, ValuesNode,
+        LogicalAggregateStateMergeNode, LogicalPlanNode, LogicalPlanNodeKind, LogicalValuesNode,
+        ScanVariantColumn,
     };
 
-    fn explain_logical_plan_for_test(plan: &LogicalPlan) -> String {
+    fn explain_logical_plan_for_test(plan: &LogicalPlanNode) -> String {
         explain_plan(plan, ExplainLevel::Normal).join("\n")
     }
 
@@ -1460,22 +1464,27 @@ mod tests {
 
     #[test]
     fn explain_prints_aggregate_state_merge_evidence() {
-        fn empty_values_for_test() -> LogicalPlan {
-            LogicalPlan::Values(ValuesNode {
-                rows: vec![],
-                columns: vec![],
-                required_output_columns: None,
-            })
+        fn empty_values_for_test() -> LogicalPlanNode {
+            LogicalPlanNode::new(
+                LogicalPlanNodeKind::Values(LogicalValuesNode {
+                    rows: vec![],
+                    columns: vec![],
+                }),
+                vec![],
+                None,
+            )
         }
 
-        let plan = LogicalPlan::AggregateStateMerge(AggregateStateMergeNode {
-            old_input: Box::new(empty_values_for_test()),
-            delta_input: Box::new(empty_values_for_test()),
-            group_key_names: vec!["region".to_string()],
-            aggregate_state_names: vec!["c".to_string()],
-            change_op_column: "__change_op".to_string(),
-            output_columns: vec![],
-        });
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::AggregateStateMerge(LogicalAggregateStateMergeNode {
+                group_key_names: vec!["region".to_string()],
+                aggregate_state_names: vec!["c".to_string()],
+                change_op_column: "__change_op".to_string(),
+                output_columns: vec![],
+            }),
+            vec![empty_values_for_test(), empty_values_for_test()],
+            None,
+        );
         let text = explain_logical_plan_for_test(&plan);
         assert!(text.contains("AggregateStateMerge"), "{text}");
         assert!(text.contains("keys=[region]"), "{text}");
@@ -2260,49 +2269,59 @@ mod rf_explain_tests {
         use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
         use crate::sql::column_id::ColumnId;
         use crate::sql::planner::plan::{
-            ApplyKind, ApplyNode, AssertOneRowNode, LogicalPlan, ValuesNode,
+            ApplyKind, LogicalApplyNode, LogicalAssertOneRowNode, LogicalPlanNode,
+            LogicalPlanNodeKind, LogicalValuesNode,
         };
 
         let values = || {
-            LogicalPlan::Values(ValuesNode {
-                rows: vec![],
-                columns: vec![],
-                required_output_columns: None,
-            })
+            LogicalPlanNode::new(
+                LogicalPlanNodeKind::Values(LogicalValuesNode {
+                    rows: vec![],
+                    columns: vec![],
+                }),
+                vec![],
+                None,
+            )
         };
-        let plan = LogicalPlan::Apply(ApplyNode {
-            left: Box::new(values()),
-            right: Box::new(LogicalPlan::AssertOneRow(AssertOneRowNode {
-                input: Box::new(values()),
-                subquery_text: "select 1".to_string(),
-                required_output_columns: None,
-            })),
-            kind: ApplyKind::Exists { negated: true },
-            subquery_expr: TypedExpr {
-                kind: ExprKind::ColumnRef {
-                    column_id: ColumnId(5),
-                    qualifier: None,
-                    column: "sq".to_string(),
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Apply(LogicalApplyNode {
+                kind: ApplyKind::Exists { negated: true },
+                subquery_expr: TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        column_id: ColumnId(5),
+                        qualifier: None,
+                        column: "sq".to_string(),
+                    },
+                    data_type: DataType::Boolean,
+                    nullable: false,
                 },
-                data_type: DataType::Boolean,
-                nullable: false,
-            },
-            output_column: OutputColumn {
-                column_id: ColumnId(5),
-                name: "sq".to_string(),
-                data_type: DataType::Boolean,
-                nullable: false,
-                is_internal: true,
-            },
-            inner_output_column_id: ColumnId(5),
-            correlation_column_ids: vec![ColumnId(1)],
-            correlation_conjuncts: vec![],
-            residual_predicate: None,
-            need_check_max_rows: false,
-            use_semi_anti: true,
-            uncorrelated_outer_predicate_columns: HashSet::new(),
-            required_output_columns: None,
-        });
+                output_column: OutputColumn {
+                    column_id: ColumnId(5),
+                    name: "sq".to_string(),
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                    is_internal: true,
+                },
+                inner_output_column_id: ColumnId(5),
+                correlation_column_ids: vec![ColumnId(1)],
+                correlation_conjuncts: vec![],
+                residual_predicate: None,
+                need_check_max_rows: false,
+                use_semi_anti: true,
+                uncorrelated_outer_predicate_columns: HashSet::new(),
+            }),
+            vec![
+                values(),
+                LogicalPlanNode::new(
+                    LogicalPlanNodeKind::AssertOneRow(LogicalAssertOneRowNode {
+                        subquery_text: "select 1".to_string(),
+                    }),
+                    vec![values()],
+                    None,
+                ),
+            ],
+            None,
+        );
 
         let mut out = Vec::new();
         super::format_node(&plan, super::ExplainLevel::Normal, 0, &mut out);

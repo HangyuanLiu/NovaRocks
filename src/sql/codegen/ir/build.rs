@@ -5,13 +5,15 @@ use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
 use crate::sql::optimizer::property::{OrderingSpec, window_ordering_spec};
 
 use super::FragmentId;
-use super::body::{
-    AssertOneRowBody, DecodeBody, GenerateSeriesBody, HashAggregateBody, HashJoinBody,
-    NestLoopJoinBody, ProjectBody, RepeatBody, ScanBody, SetOpBody, SetOpKind, SortBody,
-    TableFunctionBody, TopNBody, ValuesBody, WindowBody,
-};
 use super::fragment::{DataPartition, DataSink, DistributedPlan, PlanFragment};
-use super::node::{DistributedPlanNode, DistributedPlanNodeBody, PlanNodeStats};
+use super::kind::{
+    DistributedAssertOneRowNode, DistributedDecodeNode, DistributedGenerateSeriesNode,
+    DistributedHashAggregateNode, DistributedHashJoinNode, DistributedNestLoopJoinNode,
+    DistributedProjectNode, DistributedRepeatNode, DistributedScanNode, DistributedSetOpNode,
+    DistributedSortNode, DistributedTableFunctionNode, DistributedTopNNode, DistributedValuesNode,
+    DistributedWindowNode, SetOpKind,
+};
+use super::node::{DistributedPlanNode, DistributedPlanNodeKind, PlanNodeStats};
 
 struct DistributedPlanBuilder {
     next_node_id: i32,
@@ -51,7 +53,7 @@ impl DistributedPlanBuilder {
                     probe_runtime_filters: node.probe_runtime_filters.clone(),
                     children: vec![],
                     stats: PlanNodeStats::from_statistics(&node.stats),
-                    body: DistributedPlanNodeBody::Scan(Box::new(ScanBody {
+                    kind: DistributedPlanNodeKind::Scan(Box::new(DistributedScanNode {
                         database: op.database.clone(),
                         table: op.table.clone(),
                         alias: op.alias.clone(),
@@ -90,7 +92,7 @@ impl DistributedPlanBuilder {
                     probe_runtime_filters: node.probe_runtime_filters.clone(),
                     children: vec![child],
                     stats: PlanNodeStats::from_statistics(&node.stats),
-                    body: DistributedPlanNodeBody::Project(ProjectBody {
+                    kind: DistributedPlanNodeKind::Project(DistributedProjectNode {
                         items: op.items.clone(),
                         output_qualifier: op.output_qualifier.clone(),
                     }),
@@ -111,7 +113,7 @@ impl DistributedPlanBuilder {
                     probe_runtime_filters: node.probe_runtime_filters.clone(),
                     children: vec![child],
                     stats: PlanNodeStats::from_statistics(&node.stats),
-                    body: DistributedPlanNodeBody::Sort(SortBody {
+                    kind: DistributedPlanNodeKind::Sort(DistributedSortNode {
                         items: op.items.clone(),
                         analytic_partition_exprs: op.analytic_partition_exprs.clone(),
                         output_columns: node.output_columns.clone(),
@@ -137,11 +139,11 @@ impl DistributedPlanBuilder {
                 let mut child = self.visit(child_plan, fragment_id)?;
                 child.limit = op.limit.unwrap_or(-1);
                 child.stats = PlanNodeStats::from_statistics(&node.stats);
-                match &mut child.body {
-                    DistributedPlanNodeBody::Sort(sort) => {
+                match &mut child.kind {
+                    DistributedPlanNodeKind::Sort(sort) => {
                         sort.offset = op.offset;
                     }
-                    DistributedPlanNodeBody::TopN(topn) => {
+                    DistributedPlanNodeKind::TopN(topn) => {
                         topn.limit = op.limit;
                         topn.offset = op.offset;
                     }
@@ -173,7 +175,7 @@ impl DistributedPlanBuilder {
                             probe_runtime_filters: node.probe_runtime_filters.clone(),
                             children: vec![child],
                             stats: PlanNodeStats::from_statistics(&node.stats),
-                            body: DistributedPlanNodeBody::TopN(TopNBody {
+                            kind: DistributedPlanNodeKind::TopN(DistributedTopNNode {
                                 items: op.items.clone(),
                                 limit: op.limit,
                                 offset: op.offset,
@@ -200,13 +202,15 @@ impl DistributedPlanBuilder {
                     probe_runtime_filters: node.probe_runtime_filters.clone(),
                     children: vec![child],
                     stats: PlanNodeStats::from_statistics(&node.stats),
-                    body: DistributedPlanNodeBody::HashAggregate(Box::new(HashAggregateBody {
-                        mode: op.mode,
-                        group_by: op.group_by.clone(),
-                        aggregates: op.aggregates.clone(),
-                        is_merge: op.is_merge.clone(),
-                        output_columns: op.output_columns.clone(),
-                    })),
+                    kind: DistributedPlanNodeKind::HashAggregate(Box::new(
+                        DistributedHashAggregateNode {
+                            mode: op.mode,
+                            group_by: op.group_by.clone(),
+                            aggregates: op.aggregates.clone(),
+                            is_merge: op.is_merge.clone(),
+                            output_columns: op.output_columns.clone(),
+                        },
+                    )),
                 })
             }
             Operator::PhysicalHashJoin(op) => {
@@ -227,7 +231,7 @@ impl DistributedPlanBuilder {
                     probe_runtime_filters: node.probe_runtime_filters.clone(),
                     children: vec![left, right],
                     stats: PlanNodeStats::from_statistics(&node.stats),
-                    body: DistributedPlanNodeBody::HashJoin(Box::new(HashJoinBody {
+                    kind: DistributedPlanNodeKind::HashJoin(Box::new(DistributedHashJoinNode {
                         join_type: op.join_type,
                         eq_conditions: op.eq_conditions.clone(),
                         other_condition: op.other_condition.clone(),
@@ -253,7 +257,7 @@ impl DistributedPlanBuilder {
                     probe_runtime_filters: node.probe_runtime_filters.clone(),
                     children: vec![left, right],
                     stats: PlanNodeStats::from_statistics(&node.stats),
-                    body: DistributedPlanNodeBody::NestLoopJoin(NestLoopJoinBody {
+                    kind: DistributedPlanNodeKind::NestLoopJoin(DistributedNestLoopJoinNode {
                         join_type: op.join_type,
                         condition: op.condition.clone(),
                     }),
@@ -279,7 +283,7 @@ impl DistributedPlanBuilder {
                     probe_runtime_filters: node.probe_runtime_filters.clone(),
                     children: vec![],
                     stats: PlanNodeStats::from_statistics(&node.stats),
-                    body: DistributedPlanNodeBody::Values(ValuesBody {
+                    kind: DistributedPlanNodeKind::Values(DistributedValuesNode {
                         rows: op.rows.clone(),
                         columns: op.columns.clone(),
                     }),
@@ -300,7 +304,7 @@ impl DistributedPlanBuilder {
                     probe_runtime_filters: node.probe_runtime_filters.clone(),
                     children: vec![child],
                     stats: PlanNodeStats::from_statistics(&node.stats),
-                    body: DistributedPlanNodeBody::AssertOneRow(AssertOneRowBody {
+                    kind: DistributedPlanNodeKind::AssertOneRow(DistributedAssertOneRowNode {
                         subquery_text: op.subquery_text.clone(),
                     }),
                 })
@@ -321,7 +325,7 @@ impl DistributedPlanBuilder {
                     probe_runtime_filters: node.probe_runtime_filters.clone(),
                     children: vec![child],
                     stats: PlanNodeStats::from_statistics(&node.stats),
-                    body: DistributedPlanNodeBody::Decode(DecodeBody {
+                    kind: DistributedPlanNodeKind::Decode(DistributedDecodeNode {
                         mappings: op.mappings.clone(),
                         output_columns: op.output_columns.clone(),
                     }),
@@ -347,7 +351,7 @@ impl DistributedPlanBuilder {
                     probe_runtime_filters: node.probe_runtime_filters.clone(),
                     children: vec![child],
                     stats: PlanNodeStats::from_statistics(&node.stats),
-                    body: DistributedPlanNodeBody::Repeat(Box::new(RepeatBody {
+                    kind: DistributedPlanNodeKind::Repeat(Box::new(DistributedRepeatNode {
                         virtual_tuple_id,
                         repeat_column_ref_list: op.repeat_column_ref_list.clone(),
                         repeat_column_ref_ids: op.repeat_column_ref_ids.clone(),
@@ -417,7 +421,7 @@ impl DistributedPlanBuilder {
                     probe_runtime_filters: node.probe_runtime_filters.clone(),
                     children: vec![child],
                     stats: PlanNodeStats::from_statistics(&node.stats),
-                    body: DistributedPlanNodeBody::Window(Box::new(WindowBody {
+                    kind: DistributedPlanNodeKind::Window(Box::new(DistributedWindowNode {
                         window_exprs: op.window_exprs.clone(),
                         output_columns: op.output_columns.clone(),
                     })),
@@ -474,7 +478,7 @@ impl DistributedPlanBuilder {
                     probe_runtime_filters: node.probe_runtime_filters.clone(),
                     children: vec![],
                     stats: PlanNodeStats::from_statistics(&node.stats),
-                    body: DistributedPlanNodeBody::GenerateSeries(GenerateSeriesBody {
+                    kind: DistributedPlanNodeKind::GenerateSeries(DistributedGenerateSeriesNode {
                         start: op.start,
                         end: op.end,
                         step: op.step,
@@ -502,13 +506,15 @@ impl DistributedPlanBuilder {
                     probe_runtime_filters: node.probe_runtime_filters.clone(),
                     children: vec![child],
                     stats: PlanNodeStats::from_statistics(&node.stats),
-                    body: DistributedPlanNodeBody::TableFunction(Box::new(TableFunctionBody {
-                        function_name: op.function_name.clone(),
-                        args: op.args.clone(),
-                        output_columns: op.output_columns.clone(),
-                        alias: op.alias.clone(),
-                        is_left_join: op.is_left_join,
-                    })),
+                    kind: DistributedPlanNodeKind::TableFunction(Box::new(
+                        DistributedTableFunctionNode {
+                            function_name: op.function_name.clone(),
+                            args: op.args.clone(),
+                            output_columns: op.output_columns.clone(),
+                            alias: op.alias.clone(),
+                            is_left_join: op.is_left_join,
+                        },
+                    )),
                 })
             }
             other => Err(format!(
@@ -555,7 +561,7 @@ impl DistributedPlanBuilder {
             probe_runtime_filters: node.probe_runtime_filters.clone(),
             children,
             stats: PlanNodeStats::from_statistics(&node.stats),
-            body: DistributedPlanNodeBody::SetOp(SetOpBody {
+            kind: DistributedPlanNodeKind::SetOp(DistributedSetOpNode {
                 kind,
                 output_columns,
                 child_output_columns: child_output_columns.to_vec(),
@@ -565,15 +571,15 @@ impl DistributedPlanBuilder {
 }
 
 fn distributed_node_ordering(node: &DistributedPlanNode) -> OrderingSpec {
-    match &node.body {
-        DistributedPlanNodeBody::Sort(sort) => OrderingSpec::from_sort_items(&sort.items),
-        DistributedPlanNodeBody::TopN(topn) => OrderingSpec::from_sort_items(&topn.items),
-        DistributedPlanNodeBody::AssertOneRow(_) => node
+    match &node.kind {
+        DistributedPlanNodeKind::Sort(sort) => OrderingSpec::from_sort_items(&sort.items),
+        DistributedPlanNodeKind::TopN(topn) => OrderingSpec::from_sort_items(&topn.items),
+        DistributedPlanNodeKind::AssertOneRow(_) => node
             .children
             .first()
             .map(distributed_node_ordering)
             .unwrap_or(OrderingSpec::Any),
-        DistributedPlanNodeBody::Window(window) => {
+        DistributedPlanNodeKind::Window(window) => {
             let mut current_ordering = node
                 .children
                 .first()
@@ -642,7 +648,7 @@ fn fold_filter_into_scan(
     node: &mut DistributedPlanNode,
     predicate: &TypedExpr,
 ) -> Result<(), String> {
-    let DistributedPlanNodeBody::Scan(scan) = &mut node.body else {
+    let DistributedPlanNodeKind::Scan(scan) = &mut node.kind else {
         return Err("build_distributed_plan slice 1: Filter child is not a Scan".to_string());
     };
     scan.predicates
@@ -681,7 +687,7 @@ mod tests {
         BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, SortItem, TypedExpr,
     };
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
-    use crate::sql::codegen::ir::DistributedPlanNodeBody;
+    use crate::sql::codegen::ir::DistributedPlanNodeKind;
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
         Operator, PhysicalAssertOneRowOp, PhysicalFilterOp, PhysicalProjectOp, PhysicalScanOp,
@@ -700,13 +706,13 @@ mod tests {
         let root = &dp.fragments[0].root;
         assert_eq!(root.node_id, 2);
         assert_eq!(root.tuple_ids, vec![2]);
-        assert!(matches!(root.body, DistributedPlanNodeBody::Project(_)));
+        assert!(matches!(root.kind, DistributedPlanNodeKind::Project(_)));
         assert_eq!(root.children.len(), 1);
         assert_eq!(root.children[0].node_id, 1);
         assert_eq!(root.children[0].tuple_ids, vec![1]);
         assert!(matches!(
-            root.children[0].body,
-            DistributedPlanNodeBody::Scan(_)
+            root.children[0].kind,
+            DistributedPlanNodeKind::Scan(_)
         ));
     }
 
@@ -715,8 +721,8 @@ mod tests {
         let physical = filter_then_project_plan();
         let dp = build_distributed_plan(&physical).expect("build_distributed_plan");
         let root = &dp.fragments[0].root;
-        assert!(matches!(root.body, DistributedPlanNodeBody::Project(_)));
-        let DistributedPlanNodeBody::Scan(scan) = &root.children[0].body else {
+        assert!(matches!(root.kind, DistributedPlanNodeKind::Project(_)));
+        let DistributedPlanNodeKind::Scan(scan) = &root.children[0].kind else {
             panic!("project child should be scan");
         };
         assert_eq!(scan.predicates.len(), 3);
@@ -734,7 +740,7 @@ mod tests {
         let dp = build_distributed_plan(&physical).expect("build_distributed_plan");
         let folded_scan = &dp.fragments[0].root.children[0];
 
-        assert!(matches!(folded_scan.body, DistributedPlanNodeBody::Scan(_)));
+        assert!(matches!(folded_scan.kind, DistributedPlanNodeKind::Scan(_)));
         assert_eq!(folded_scan.stats.output_row_count, 5.0);
     }
 
@@ -760,11 +766,11 @@ mod tests {
             root.node_id, 7,
             "Project above the window must not be shifted by a phantom pre-window Sort"
         );
-        assert!(matches!(root.body, DistributedPlanNodeBody::Project(_)));
+        assert!(matches!(root.kind, DistributedPlanNodeKind::Project(_)));
         assert_eq!(root.children[0].node_id, 4);
         assert!(matches!(
-            root.children[0].body,
-            DistributedPlanNodeBody::Window(_)
+            root.children[0].kind,
+            DistributedPlanNodeKind::Window(_)
         ));
     }
 

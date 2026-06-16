@@ -3,17 +3,13 @@ use std::time::Instant;
 use crate::sql::optimizer::rewrite::context::{RewriteContext, RewriteFailurePolicy};
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
-use crate::sql::planner::plan::{
-    AggregateNode, AggregateStateMergeNode, ApplyNode, AssertOneRowNode, CTEAnchorNode,
-    CTEProduceNode, DecodeNode, ExceptNode, FilterNode, IntersectNode, JoinNode, LimitNode,
-    LogicalPlan, ProjectNode, RepeatPlanNode, SortNode, TableFunctionNode, UnionNode, WindowNode,
-};
+use crate::sql::planner::plan::LogicalPlanNode;
 
 pub(crate) fn rewrite_with_rule(
-    plan: LogicalPlan,
+    plan: LogicalPlanNode,
     rule: &dyn LogicalRewriteRule,
     ctx: &mut RewriteContext,
-) -> Result<(LogicalPlan, bool), String> {
+) -> Result<(LogicalPlanNode, bool), String> {
     match rule.traversal() {
         RewriteTraversal::TopDown => rewrite_top_down(plan, rule, ctx),
         RewriteTraversal::BottomUp => rewrite_bottom_up(plan, rule, ctx),
@@ -21,30 +17,30 @@ pub(crate) fn rewrite_with_rule(
 }
 
 fn rewrite_top_down(
-    plan: LogicalPlan,
+    plan: LogicalPlanNode,
     rule: &dyn LogicalRewriteRule,
     ctx: &mut RewriteContext,
-) -> Result<(LogicalPlan, bool), String> {
+) -> Result<(LogicalPlanNode, bool), String> {
     let (plan, node_changed) = apply_rule_to_node(plan, rule, ctx)?;
     let (plan, child_changed) = rewrite_children(plan, rule, ctx)?;
     Ok((plan, node_changed || child_changed))
 }
 
 fn rewrite_bottom_up(
-    plan: LogicalPlan,
+    plan: LogicalPlanNode,
     rule: &dyn LogicalRewriteRule,
     ctx: &mut RewriteContext,
-) -> Result<(LogicalPlan, bool), String> {
+) -> Result<(LogicalPlanNode, bool), String> {
     let (plan, child_changed) = rewrite_children(plan, rule, ctx)?;
     let (plan, node_changed) = apply_rule_to_node(plan, rule, ctx)?;
     Ok((plan, child_changed || node_changed))
 }
 
 fn apply_rule_to_node(
-    plan: LogicalPlan,
+    plan: LogicalPlanNode,
     rule: &dyn LogicalRewriteRule,
     ctx: &mut RewriteContext,
-) -> Result<(LogicalPlan, bool), String> {
+) -> Result<(LogicalPlanNode, bool), String> {
     if !rule.matches(&plan, ctx) {
         return Ok((plan, false));
     }
@@ -80,244 +76,20 @@ fn apply_rule_to_node(
 }
 
 fn rewrite_children(
-    plan: LogicalPlan,
+    mut plan: LogicalPlanNode,
     rule: &dyn LogicalRewriteRule,
     ctx: &mut RewriteContext,
-) -> Result<(LogicalPlan, bool), String> {
-    match plan {
-        leaf @ (LogicalPlan::Scan(_)
-        | LogicalPlan::Values(_)
-        | LogicalPlan::GenerateSeries(_)
-        | LogicalPlan::CTEConsume(_)) => Ok((leaf, false)),
-        LogicalPlan::Filter(node) => {
-            let (input, changed) = rewrite_with_rule(*node.input, rule, ctx)?;
-            Ok((
-                LogicalPlan::Filter(FilterNode {
-                    input: Box::new(input),
-                    ..node
-                }),
-                changed,
-            ))
-        }
-        LogicalPlan::Project(node) => {
-            let (input, changed) = rewrite_with_rule(*node.input, rule, ctx)?;
-            Ok((
-                LogicalPlan::Project(ProjectNode {
-                    input: Box::new(input),
-                    ..node
-                }),
-                changed,
-            ))
-        }
-        LogicalPlan::Aggregate(node) => {
-            let (input, changed) = rewrite_with_rule(*node.input, rule, ctx)?;
-            Ok((
-                LogicalPlan::Aggregate(AggregateNode {
-                    input: Box::new(input),
-                    ..node
-                }),
-                changed,
-            ))
-        }
-        LogicalPlan::Sort(node) => {
-            let (input, changed) = rewrite_with_rule(*node.input, rule, ctx)?;
-            Ok((
-                LogicalPlan::Sort(SortNode {
-                    input: Box::new(input),
-                    ..node
-                }),
-                changed,
-            ))
-        }
-        LogicalPlan::Limit(node) => {
-            let (input, changed) = rewrite_with_rule(*node.input, rule, ctx)?;
-            Ok((
-                LogicalPlan::Limit(LimitNode {
-                    input: Box::new(input),
-                    ..node
-                }),
-                changed,
-            ))
-        }
-        LogicalPlan::Window(node) => {
-            let (input, changed) = rewrite_with_rule(*node.input, rule, ctx)?;
-            Ok((
-                LogicalPlan::Window(WindowNode {
-                    input: Box::new(input),
-                    ..node
-                }),
-                changed,
-            ))
-        }
-        LogicalPlan::TableFunction(node) => {
-            let (input, changed) = rewrite_with_rule(*node.input, rule, ctx)?;
-            Ok((
-                LogicalPlan::TableFunction(TableFunctionNode {
-                    input: Box::new(input),
-                    ..node
-                }),
-                changed,
-            ))
-        }
-        LogicalPlan::Repeat(node) => {
-            let (input, changed) = rewrite_with_rule(*node.input, rule, ctx)?;
-            Ok((
-                LogicalPlan::Repeat(RepeatPlanNode {
-                    input: Box::new(input),
-                    ..node
-                }),
-                changed,
-            ))
-        }
-        LogicalPlan::CTEProduce(node) => {
-            let (input, changed) = rewrite_with_rule(*node.input, rule, ctx)?;
-            Ok((
-                LogicalPlan::CTEProduce(CTEProduceNode {
-                    input: Box::new(input),
-                    ..node
-                }),
-                changed,
-            ))
-        }
-        LogicalPlan::Join(node) => {
-            let (left, left_changed) = rewrite_with_rule(*node.left, rule, ctx)?;
-            let (right, right_changed) = rewrite_with_rule(*node.right, rule, ctx)?;
-            Ok((
-                LogicalPlan::Join(JoinNode {
-                    left: Box::new(left),
-                    right: Box::new(right),
-                    ..node
-                }),
-                left_changed || right_changed,
-            ))
-        }
-        LogicalPlan::CTEAnchor(node) => {
-            let (produce, produce_changed) = rewrite_with_rule(*node.produce, rule, ctx)?;
-            let (consumer, consumer_changed) = rewrite_with_rule(*node.consumer, rule, ctx)?;
-            Ok((
-                LogicalPlan::CTEAnchor(CTEAnchorNode {
-                    produce: Box::new(produce),
-                    consumer: Box::new(consumer),
-                    ..node
-                }),
-                produce_changed || consumer_changed,
-            ))
-        }
-        LogicalPlan::Union(node) => {
-            let all = node.all;
-            let output_columns = node.output_columns;
-            let required_output_columns = node.required_output_columns;
-            let (inputs, changed) = rewrite_plan_list(node.inputs, rule, ctx)?;
-            Ok((
-                LogicalPlan::Union(UnionNode {
-                    inputs,
-                    all,
-                    output_columns,
-                    required_output_columns,
-                }),
-                changed,
-            ))
-        }
-        LogicalPlan::Intersect(node) => {
-            let output_columns = node.output_columns;
-            let required_output_columns = node.required_output_columns;
-            let (inputs, changed) = rewrite_plan_list(node.inputs, rule, ctx)?;
-            Ok((
-                LogicalPlan::Intersect(IntersectNode {
-                    inputs,
-                    output_columns,
-                    required_output_columns,
-                }),
-                changed,
-            ))
-        }
-        LogicalPlan::Except(node) => {
-            let output_columns = node.output_columns;
-            let required_output_columns = node.required_output_columns;
-            let (inputs, changed) = rewrite_plan_list(node.inputs, rule, ctx)?;
-            Ok((
-                LogicalPlan::Except(ExceptNode {
-                    inputs,
-                    output_columns,
-                    required_output_columns,
-                }),
-                changed,
-            ))
-        }
-        LogicalPlan::Decode(node) => {
-            let (input, changed) = rewrite_with_rule(*node.input, rule, ctx)?;
-            Ok((
-                LogicalPlan::Decode(DecodeNode {
-                    input: Box::new(input),
-                    ..node
-                }),
-                changed,
-            ))
-        }
-        LogicalPlan::AggregateStateMerge(node) => {
-            let (old_input, old_changed) = rewrite_with_rule(*node.old_input, rule, ctx)?;
-            let (delta_input, delta_changed) = rewrite_with_rule(*node.delta_input, rule, ctx)?;
-            Ok((
-                LogicalPlan::AggregateStateMerge(AggregateStateMergeNode {
-                    old_input: Box::new(old_input),
-                    delta_input: Box::new(delta_input),
-                    ..node
-                }),
-                old_changed || delta_changed,
-            ))
-        }
-        LogicalPlan::Apply(node) => {
-            let (left, left_changed) = rewrite_with_rule(*node.left, rule, ctx)?;
-            let (right, right_changed) = rewrite_with_rule(*node.right, rule, ctx)?;
-            Ok((
-                LogicalPlan::Apply(ApplyNode {
-                    left: Box::new(left),
-                    right: Box::new(right),
-                    ..node
-                }),
-                left_changed || right_changed,
-            ))
-        }
-        LogicalPlan::AssertOneRow(node) => {
-            let (input, changed) = rewrite_with_rule(*node.input, rule, ctx)?;
-            Ok((
-                LogicalPlan::AssertOneRow(AssertOneRowNode {
-                    input: Box::new(input),
-                    ..node
-                }),
-                changed,
-            ))
-        }
-        LogicalPlan::ImvDelta(node) => {
-            let (input, changed) = rewrite_with_rule(*node.input, rule, ctx)?;
-            Ok((
-                LogicalPlan::ImvDelta(crate::sql::optimizer::rewrite::imv::marker::ImvDeltaNode {
-                    input: Box::new(input),
-                    ..node
-                }),
-                changed,
-            ))
-        }
-        LogicalPlan::ImvVersion(node) => {
-            let (input, changed) = rewrite_with_rule(*node.input, rule, ctx)?;
-            Ok((
-                LogicalPlan::ImvVersion(
-                    crate::sql::optimizer::rewrite::imv::marker::ImvVersionNode {
-                        input: Box::new(input),
-                        ..node
-                    },
-                ),
-                changed,
-            ))
-        }
-    }
+) -> Result<(LogicalPlanNode, bool), String> {
+    let (children, changed) = rewrite_plan_list(std::mem::take(&mut plan.children), rule, ctx)?;
+    plan.children = children;
+    Ok((plan, changed))
 }
 
 fn rewrite_plan_list(
-    inputs: Vec<LogicalPlan>,
+    inputs: Vec<LogicalPlanNode>,
     rule: &dyn LogicalRewriteRule,
     ctx: &mut RewriteContext,
-) -> Result<(Vec<LogicalPlan>, bool), String> {
+) -> Result<(Vec<LogicalPlanNode>, bool), String> {
     let mut changed = false;
     let mut rewritten = Vec::with_capacity(inputs.len());
     for input in inputs {
@@ -330,6 +102,7 @@ fn rewrite_plan_list(
 
 #[cfg(test)]
 mod tests {
+    use crate::sql::planner::plan::*;
     use arrow::datatypes::DataType;
 
     use super::rewrite_with_rule;
@@ -341,7 +114,9 @@ mod tests {
     use crate::sql::optimizer::rewrite::result::{RewriteDiagnostic, RewriteResult};
     use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
     use crate::sql::optimizer::rewrite::trace::RewriteTraceEvent;
-    use crate::sql::planner::plan::{LogicalPlan, ProjectNode, ScanNode};
+    use crate::sql::planner::plan::{
+        LogicalPlanNode, LogicalPlanNodeKind, LogicalProjectNode, LogicalScanNode,
+    };
 
     struct RenameScanRule;
 
@@ -354,20 +129,29 @@ mod tests {
             RewritePhase::StructuralRewrite
         }
 
-        fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
-            matches!(plan, LogicalPlan::Scan(node) if node.table.name == "before")
+        fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+            matches!(&plan.kind, LogicalPlanNodeKind::Scan(node) if node.table.name == "before")
         }
 
         fn apply(
             &self,
-            plan: LogicalPlan,
+            plan: LogicalPlanNode,
             _ctx: &mut RewriteContext,
         ) -> Result<RewriteResult, String> {
-            let LogicalPlan::Scan(mut node) = plan else {
+            let LogicalPlanNode {
+                kind,
+                required_output_columns,
+                ..
+            } = plan;
+            let LogicalPlanNodeKind::Scan(mut node) = kind else {
                 return Ok(RewriteResult::Unchanged);
             };
             node.table.name = "after".to_string();
-            Ok(RewriteResult::Changed(LogicalPlan::Scan(node)))
+            Ok(RewriteResult::Changed(LogicalPlanNode::new(
+                LogicalPlanNodeKind::Scan(node),
+                vec![],
+                required_output_columns,
+            )))
         }
     }
 
@@ -386,13 +170,13 @@ mod tests {
             RewriteTraversal::TopDown
         }
 
-        fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
-            matches!(plan, LogicalPlan::Project(_))
+        fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+            matches!(&plan.kind, LogicalPlanNodeKind::Project(_))
         }
 
         fn apply(
             &self,
-            _plan: LogicalPlan,
+            _plan: LogicalPlanNode,
             _ctx: &mut RewriteContext,
         ) -> Result<RewriteResult, String> {
             Ok(RewriteResult::Rejected(RewriteDiagnostic::rejected(
@@ -410,10 +194,10 @@ mod tests {
         let (rewritten, changed) = rewrite_with_rule(plan, &RenameScanRule, &mut ctx).unwrap();
 
         assert!(changed);
-        let LogicalPlan::Project(project) = rewritten else {
+        let LogicalPlanNodeKind::Project(_) = &rewritten.kind else {
             panic!("expected project root");
         };
-        let LogicalPlan::Scan(scan) = *project.input else {
+        let LogicalPlanNodeKind::Scan(scan) = &rewritten.unary_input().kind else {
             panic!("expected rewritten scan child");
         };
         assert_eq!(scan.table.name, "after");
@@ -441,28 +225,33 @@ mod tests {
         }));
     }
 
-    fn project_over_scan(table_name: &str) -> LogicalPlan {
+    fn project_over_scan(table_name: &str) -> LogicalPlanNode {
         let output = output_column("c1");
-        LogicalPlan::Project(ProjectNode {
-            input: Box::new(LogicalPlan::Scan(ScanNode {
-                database: "db".to_string(),
-                table: table_def(table_name),
-                alias: None,
-                columns: vec![output.clone()],
-                predicates: vec![],
-                required_columns: None,
-                dict_columns: vec![],
-                variant_columns: vec![],
-                required_output_columns: None,
-            })),
-            items: vec![ProjectItem {
-                expr: column_ref(output.column_id, "c1"),
-                output_name: "c1".to_string(),
-                output_column_id: output.column_id,
-            }],
-            output_qualifier: None,
-            required_output_columns: None,
-        })
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![ProjectItem {
+                    expr: column_ref(output.column_id, "c1"),
+                    output_name: "c1".to_string(),
+                    output_column_id: output.column_id,
+                }],
+                output_qualifier: None,
+            }),
+            vec![LogicalPlanNode::new(
+                LogicalPlanNodeKind::Scan(LogicalScanNode {
+                    database: "db".to_string(),
+                    table: table_def(table_name),
+                    alias: None,
+                    columns: vec![output.clone()],
+                    predicates: vec![],
+                    required_columns: None,
+                    dict_columns: vec![],
+                    variant_columns: vec![],
+                }),
+                vec![],
+                None,
+            )],
+            None,
+        )
     }
 
     fn table_def(name: &str) -> TableDef {
@@ -507,36 +296,43 @@ mod tests {
 
     #[test]
     fn rewrite_traverses_into_imv_delta_child() {
-        use crate::sql::optimizer::rewrite::imv::marker::ImvDeltaNode;
-        use crate::sql::planner::plan::{LogicalPlan, ScanNode};
+        use crate::sql::planner::plan::{
+            LogicalImvDeltaNode, LogicalPlanNode, LogicalPlanNodeKind, LogicalScanNode,
+        };
 
-        let inner = LogicalPlan::Scan(ScanNode {
-            database: "db".to_string(),
-            table: table_def("before"),
-            alias: None,
-            columns: vec![output_column("c1")],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        });
+        let inner = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: table_def("before"),
+                alias: None,
+                columns: vec![output_column("c1")],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        );
 
-        let plan = LogicalPlan::ImvDelta(ImvDeltaNode {
-            input: Box::new(inner),
-            is_root: true,
-            action_column: None,
-            branch_scope: None,
-        });
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+                is_root: true,
+                action_column: None,
+                branch_scope: None,
+            }),
+            vec![inner],
+            None,
+        );
 
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         let (rewritten, changed) = rewrite_with_rule(plan, &RenameScanRule, &mut ctx).unwrap();
 
         assert!(changed, "RenameScanRule should rewrite the wrapped Scan");
-        let LogicalPlan::ImvDelta(delta) = rewritten else {
+        let LogicalPlanNodeKind::ImvDelta(delta) = &rewritten.kind else {
             panic!("expected ImvDelta to remain at root after child rewrite");
         };
-        let LogicalPlan::Scan(scan) = *delta.input else {
+        let LogicalPlanNodeKind::Scan(scan) = &rewritten.children[0].kind else {
             panic!("expected Scan inside ImvDelta");
         };
         assert_eq!(scan.table.name, "after");
@@ -566,53 +362,56 @@ mod tests {
             fn traversal(&self) -> RewriteTraversal {
                 RewriteTraversal::TopDown
             }
-            fn matches(&self, _plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
+            fn matches(&self, _plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
                 self.count.fetch_add(1, Ordering::SeqCst);
                 false
             }
             fn apply(
                 &self,
-                _plan: LogicalPlan,
+                _plan: LogicalPlanNode,
                 _ctx: &mut RewriteContext,
             ) -> Result<RewriteResult, String> {
                 Ok(RewriteResult::Unchanged)
             }
         }
 
-        let leaf = LogicalPlan::Values(ValuesNode {
-            rows: vec![],
-            columns: vec![],
-            required_output_columns: None,
-        });
+        let leaf = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Values(LogicalValuesNode {
+                rows: vec![],
+                columns: vec![],
+            }),
+            vec![],
+            None,
+        );
 
-        // Exhaustive match on &LogicalPlan. This is the intentional trip-wire:
-        // if a new variant lands in LogicalPlan, this test fails to compile.
-        fn assert_variant_handled(variant: &LogicalPlan) {
-            match variant {
-                LogicalPlan::Scan(_)
-                | LogicalPlan::Filter(_)
-                | LogicalPlan::Project(_)
-                | LogicalPlan::Aggregate(_)
-                | LogicalPlan::Join(_)
-                | LogicalPlan::Sort(_)
-                | LogicalPlan::Limit(_)
-                | LogicalPlan::Union(_)
-                | LogicalPlan::Intersect(_)
-                | LogicalPlan::Except(_)
-                | LogicalPlan::Values(_)
-                | LogicalPlan::GenerateSeries(_)
-                | LogicalPlan::TableFunction(_)
-                | LogicalPlan::Window(_)
-                | LogicalPlan::Repeat(_)
-                | LogicalPlan::CTEAnchor(_)
-                | LogicalPlan::CTEProduce(_)
-                | LogicalPlan::CTEConsume(_)
-                | LogicalPlan::Decode(_)
-                | LogicalPlan::AggregateStateMerge(_)
-                | LogicalPlan::Apply(_)
-                | LogicalPlan::AssertOneRow(_)
-                | LogicalPlan::ImvDelta(_)
-                | LogicalPlan::ImvVersion(_) => {}
+        // Exhaustive match on &LogicalPlanNode. This is the intentional trip-wire:
+        // if a new variant lands in LogicalPlanNode, this test fails to compile.
+        fn assert_variant_handled(variant: &LogicalPlanNode) {
+            match &variant.kind {
+                LogicalPlanNodeKind::Scan(_)
+                | LogicalPlanNodeKind::Filter(_)
+                | LogicalPlanNodeKind::Project(_)
+                | LogicalPlanNodeKind::Aggregate(_)
+                | LogicalPlanNodeKind::Join(_)
+                | LogicalPlanNodeKind::Sort(_)
+                | LogicalPlanNodeKind::Limit(_)
+                | LogicalPlanNodeKind::Union(_)
+                | LogicalPlanNodeKind::Intersect(_)
+                | LogicalPlanNodeKind::Except(_)
+                | LogicalPlanNodeKind::Values(_)
+                | LogicalPlanNodeKind::GenerateSeries(_)
+                | LogicalPlanNodeKind::TableFunction(_)
+                | LogicalPlanNodeKind::Window(_)
+                | LogicalPlanNodeKind::Repeat(_)
+                | LogicalPlanNodeKind::CTEAnchor(_)
+                | LogicalPlanNodeKind::CTEProduce(_)
+                | LogicalPlanNodeKind::CTEConsume(_)
+                | LogicalPlanNodeKind::Decode(_)
+                | LogicalPlanNodeKind::AggregateStateMerge(_)
+                | LogicalPlanNodeKind::Apply(_)
+                | LogicalPlanNodeKind::AssertOneRow(_)
+                | LogicalPlanNodeKind::ImvDelta(_)
+                | LogicalPlanNodeKind::ImvVersion(_) => {}
             }
         }
         assert_variant_handled(&leaf);
@@ -635,41 +434,42 @@ mod tests {
     fn bottom_up_rewrite_rebuilds_apply_children() {
         use std::collections::HashSet;
 
-        use crate::sql::planner::plan::{ApplyKind, ApplyNode};
+        use crate::sql::planner::plan::{ApplyKind, LogicalApplyNode, LogicalPlanNodeKind};
 
         let outer = project_over_scan("outer");
-        let LogicalPlan::Project(outer_project) = outer else {
+        let LogicalPlanNodeKind::Project(_) = &outer.kind else {
             panic!("helper returns project");
         };
         let inner = project_over_scan("before");
-        let LogicalPlan::Project(inner_project) = inner else {
+        let LogicalPlanNodeKind::Project(_) = &inner.kind else {
             panic!("helper returns project");
         };
 
-        let plan = LogicalPlan::Apply(ApplyNode {
-            left: outer_project.input,
-            right: inner_project.input,
-            kind: ApplyKind::Scalar,
-            subquery_expr: column_ref(ColumnId(7), "sq"),
-            output_column: output_column("sq"),
-            inner_output_column_id: ColumnId(7),
-            correlation_column_ids: vec![],
-            correlation_conjuncts: vec![],
-            residual_predicate: None,
-            need_check_max_rows: true,
-            use_semi_anti: false,
-            uncorrelated_outer_predicate_columns: HashSet::new(),
-            required_output_columns: None,
-        });
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Apply(LogicalApplyNode {
+                kind: ApplyKind::Scalar,
+                subquery_expr: column_ref(ColumnId(7), "sq"),
+                output_column: output_column("sq"),
+                inner_output_column_id: ColumnId(7),
+                correlation_column_ids: vec![],
+                correlation_conjuncts: vec![],
+                residual_predicate: None,
+                need_check_max_rows: true,
+                use_semi_anti: false,
+                uncorrelated_outer_predicate_columns: HashSet::new(),
+            }),
+            vec![outer.into_single_child(), inner.into_single_child()],
+            None,
+        );
 
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         let (rewritten, changed) = rewrite_with_rule(plan, &RenameScanRule, &mut ctx).unwrap();
 
         assert!(changed);
-        let LogicalPlan::Apply(apply) = rewritten else {
+        let LogicalPlanNodeKind::Apply(_) = &rewritten.kind else {
             panic!("expected apply root");
         };
-        let LogicalPlan::Scan(right_scan) = *apply.right else {
+        let LogicalPlanNodeKind::Scan(right_scan) = &rewritten.right().kind else {
             panic!("expected scan on apply right side");
         };
         assert_eq!(right_scan.table.name, "after");

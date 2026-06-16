@@ -13,7 +13,7 @@ use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::planner::plan::LogicalPlan;
+use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind};
 
 pub(crate) struct PruneTableFunctionColumns;
 
@@ -26,13 +26,13 @@ impl LogicalRewriteRule for PruneTableFunctionColumns {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
-        matches!(plan, LogicalPlan::TableFunction(_))
+    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+        matches!(&plan.kind, LogicalPlanNodeKind::TableFunction(_))
     }
 
     fn apply(
         &self,
-        _plan: LogicalPlan,
+        _plan: LogicalPlanNode,
         _ctx: &mut RewriteContext,
     ) -> Result<RewriteResult, String> {
         // No-op: TableFunction was assigned keep-all-child semantics by the
@@ -48,7 +48,10 @@ mod tests {
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
-    use crate::sql::planner::plan::{TableFunctionNode, ValuesNode};
+    use crate::sql::planner::plan::*;
+    use crate::sql::planner::plan::{
+        LogicalPlanNodeKind, LogicalTableFunctionNode, LogicalValuesNode,
+    };
     use arrow::datatypes::DataType;
 
     fn ctx() -> RewriteContext {
@@ -57,27 +60,31 @@ mod tests {
 
     #[test]
     fn prune_table_function_is_always_unchanged() {
-        let node = TableFunctionNode {
-            input: Box::new(LogicalPlan::Values(ValuesNode {
-                rows: vec![],
-                columns: vec![],
-                required_output_columns: None,
-            })),
-            function_name: "generate_series".to_string(),
-            args: vec![],
-            output_columns: vec![OutputColumn {
-                column_id: ColumnId::new_for_test(1),
-                name: "v".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
-                is_internal: false,
-            }],
-            alias: None,
-            is_left_join: false,
-            required_output_columns: None,
-        };
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::TableFunction(LogicalTableFunctionNode {
+                function_name: "generate_series".to_string(),
+                args: vec![],
+                output_columns: vec![OutputColumn {
+                    column_id: ColumnId::new_for_test(1),
+                    name: "v".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    is_internal: false,
+                }],
+                alias: None,
+                is_left_join: false,
+            }),
+            vec![LogicalPlanNode::new(
+                LogicalPlanNodeKind::Values(LogicalValuesNode {
+                    rows: vec![],
+                    columns: vec![],
+                }),
+                vec![],
+                None,
+            )],
+            None,
+        );
 
-        let plan = LogicalPlan::TableFunction(node);
         let rule = PruneTableFunctionColumns;
 
         // matches the right variant

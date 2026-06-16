@@ -15,7 +15,7 @@ use crate::sql::optimizer::rewrite::imv::annotation::ImvExtension;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
-use crate::sql::planner::plan::LogicalPlan;
+use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind};
 
 pub(crate) struct ImvRowIdColumn;
 
@@ -55,9 +55,9 @@ impl LogicalRewriteRule for InjectRowIdRule {
         RewriteTraversal::BottomUp
     }
 
-    fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
-        match plan {
-            LogicalPlan::Scan(scan) => {
+    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+        match &plan.kind {
+            LogicalPlanNodeKind::Scan(scan) => {
                 matches!(scan.table.source, ScanSource::IcebergDeltaTable { .. })
                     && !scan.columns.iter().any(ImvRowIdColumn::matches)
             }
@@ -65,8 +65,17 @@ impl LogicalRewriteRule for InjectRowIdRule {
         }
     }
 
-    fn apply(&self, plan: LogicalPlan, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
-        let LogicalPlan::Scan(mut scan) = plan else {
+    fn apply(
+        &self,
+        plan: LogicalPlanNode,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, String> {
+        let LogicalPlanNode {
+            kind,
+            children,
+            required_output_columns,
+        } = plan;
+        let LogicalPlanNodeKind::Scan(mut scan) = kind else {
             return Ok(RewriteResult::Unchanged);
         };
         let ext = ctx
@@ -76,12 +85,17 @@ impl LogicalRewriteRule for InjectRowIdRule {
         scan.columns
             .retain(|column| !column.name.eq_ignore_ascii_case(ImvRowIdColumn::NAME));
         scan.columns.push(ImvRowIdColumn::output_column(column_id));
-        Ok(RewriteResult::Changed(LogicalPlan::Scan(scan)))
+        Ok(RewriteResult::Changed(LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(scan),
+            children,
+            required_output_columns,
+        )))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::sql::planner::plan::*;
     use std::sync::Arc;
     use std::sync::atomic::AtomicU32;
 
@@ -98,7 +112,7 @@ mod tests {
     use crate::sql::optimizer::rewrite::imv::annotation::{ImvExtension, ImvPlanAnnotation};
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-    use crate::sql::planner::plan::{LogicalPlan, ScanNode};
+    use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind, LogicalScanNode};
 
     fn build_ctx() -> RewriteContext {
         let mut ctx = RewriteContext::for_mv_refresh(Vec::new());
@@ -110,8 +124,8 @@ mod tests {
         ctx
     }
 
-    fn delta_scan() -> ScanNode {
-        ScanNode {
+    fn delta_scan() -> LogicalScanNode {
+        LogicalScanNode {
             database: "db".to_string(),
             table: TableDef {
                 name: "b".to_string(),
@@ -152,8 +166,11 @@ mod tests {
             required_columns: None,
             dict_columns: Vec::new(),
             variant_columns: Vec::new(),
-            required_output_columns: None,
         }
+    }
+
+    fn scan_plan(scan: LogicalScanNode) -> LogicalPlanNode {
+        LogicalPlanNode::new(LogicalPlanNodeKind::Scan(scan), vec![], None)
     }
 
     #[test]
@@ -169,11 +186,12 @@ mod tests {
     fn inject_row_id_on_delta_scan() {
         let rule = InjectRowIdRule;
         let mut ctx = build_ctx();
-        let plan = LogicalPlan::Scan(delta_scan());
+        let plan = scan_plan(delta_scan());
         assert!(rule.matches(&plan, &ctx));
-        let RewriteResult::Changed(LogicalPlan::Scan(scan)) =
-            rule.apply(plan, &mut ctx).expect("apply")
-        else {
+        let RewriteResult::Changed(changed) = rule.apply(plan, &mut ctx).expect("apply") else {
+            panic!("expected Changed(Scan)");
+        };
+        let LogicalPlanNodeKind::Scan(scan) = changed.kind else {
             panic!("expected Changed(Scan)");
         };
         assert!(scan.columns.iter().any(ImvRowIdColumn::matches));
@@ -191,12 +209,13 @@ mod tests {
             nullable: false,
             is_internal: false,
         });
-        let plan = LogicalPlan::Scan(scan);
+        let plan = scan_plan(scan);
 
         assert!(rule.matches(&plan, &ctx));
-        let RewriteResult::Changed(LogicalPlan::Scan(scan)) =
-            rule.apply(plan, &mut ctx).expect("apply")
-        else {
+        let RewriteResult::Changed(changed) = rule.apply(plan, &mut ctx).expect("apply") else {
+            panic!("expected Changed(Scan)");
+        };
+        let LogicalPlanNodeKind::Scan(scan) = changed.kind else {
             panic!("expected Changed(Scan)");
         };
         let row_id_columns = scan
@@ -216,6 +235,6 @@ mod tests {
         let mut scan = delta_scan();
         scan.columns
             .push(ImvRowIdColumn::output_column(ColumnId(9)));
-        assert!(!rule.matches(&LogicalPlan::Scan(scan), &ctx));
+        assert!(!rule.matches(&scan_plan(scan), &ctx));
     }
 }

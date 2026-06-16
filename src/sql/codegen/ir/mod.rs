@@ -2,9 +2,9 @@
 //! Single source from which both EXPLAIN and thrift derive. This slice covers
 //! Scan/Filter/Project; later slices add the remaining operators.
 
-pub(crate) mod body;
 pub(crate) mod build;
 pub(crate) mod fragment;
+pub(crate) mod kind;
 pub(crate) mod lowering;
 pub(crate) mod node;
 
@@ -14,7 +14,7 @@ pub(crate) mod equiv;
 pub(crate) use build::build_distributed_plan;
 pub(crate) use fragment::{DataPartition, DataSink, DistributedPlan, PartitionKind, PlanFragment};
 pub(crate) use lowering::lower_distributed_plan;
-pub(crate) use node::{DistributedPlanNode, DistributedPlanNodeBody, PlanNodeStats};
+pub(crate) use node::{DistributedPlanNode, DistributedPlanNodeKind, PlanNodeStats};
 
 pub(crate) type FragmentId = u32;
 

@@ -6,7 +6,7 @@
 //! only — the rewrite pipeline's bottom-up walker will push further at the next
 //! round.
 //!
-//! Mirrors the `LogicalPlan::Project(proj)` arm of legacy
+//! Mirrors the `LogicalPlanNodeKind::Project(proj)` arm of legacy
 //! `predicate_pushdown::push_filter_into`, with the difference that this
 //! rule does NOT recurse; the rewrite framework owns traversal.
 
@@ -23,20 +23,36 @@ impl RewriteRule for PushDownPredicateProject {
         "PushDownPredicateProject"
     }
 
-    fn matches(&self, plan: &LogicalPlan) -> bool {
-        matches!(
-            plan,
-            LogicalPlan::Filter(f) if matches!(*f.input, LogicalPlan::Project(_))
-        )
+    fn matches(&self, plan: &LogicalPlanNode) -> bool {
+        matches!(&plan.kind, LogicalPlanNodeKind::Filter(_))
+            && matches!(&plan.unary_input().kind, LogicalPlanNodeKind::Project(_))
     }
 
-    fn apply(&self, plan: LogicalPlan) -> Option<LogicalPlan> {
-        let LogicalPlan::Filter(filter) = plan else {
+    fn apply(&self, plan: LogicalPlanNode) -> Option<LogicalPlanNode> {
+        let LogicalPlanNode {
+            kind,
+            mut children,
+            required_output_columns: _,
+        } = plan;
+        let LogicalPlanNodeKind::Filter(filter) = kind else {
             return None;
         };
-        let LogicalPlan::Project(proj) = *filter.input else {
+        if children.len() != 1 {
+            return None;
+        }
+        let project_plan = children.remove(0);
+        let LogicalPlanNode {
+            kind,
+            mut children,
+            required_output_columns,
+        } = project_plan;
+        let LogicalPlanNodeKind::Project(proj) = kind else {
             return None;
         };
+        if children.len() != 1 {
+            return None;
+        }
+        let project_input = children.remove(0);
 
         let conjuncts = split_and(filter.predicate);
         let mut pushable = Vec::new();
@@ -54,22 +70,27 @@ impl RewriteRule for PushDownPredicateProject {
 
         // Build Filter(child) below the Project.
         let pushed = combine_and(pushable);
-        let new_child = LogicalPlan::Filter(FilterNode {
-            input: proj.input,
-            predicate: pushed,
-            required_output_columns: None,
-        });
-        let new_project = LogicalPlan::Project(ProjectNode {
-            input: Box::new(new_child),
-            items: proj.items,
-            output_qualifier: proj.output_qualifier,
-            required_output_columns: proj.required_output_columns,
-        });
+        let new_child = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode { predicate: pushed }),
+            vec![project_input],
+            None,
+        );
+        let new_project = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: proj.items,
+                output_qualifier: proj.output_qualifier,
+            }),
+            vec![new_child],
+            required_output_columns,
+        );
         Some(wrap_remaining_filter(new_project, remaining))
     }
 }
 
-fn rewrite_predicate_through_project(expr: &TypedExpr, proj: &ProjectNode) -> Option<TypedExpr> {
+fn rewrite_predicate_through_project(
+    expr: &TypedExpr,
+    proj: &LogicalProjectNode,
+) -> Option<TypedExpr> {
     match &expr.kind {
         ExprKind::ColumnRef {
             column_id,
@@ -295,7 +316,7 @@ fn rewrite_predicate_through_project(expr: &TypedExpr, proj: &ProjectNode) -> Op
 
 fn rewrite_expr_list_through_project(
     exprs: &[TypedExpr],
-    proj: &ProjectNode,
+    proj: &LogicalProjectNode,
 ) -> Option<Vec<TypedExpr>> {
     exprs
         .iter()
@@ -307,7 +328,7 @@ fn lookup_passthrough_projection(
     column_id: ColumnId,
     qualifier: Option<&str>,
     column: &str,
-    proj: &ProjectNode,
+    proj: &LogicalProjectNode,
 ) -> Option<TypedExpr> {
     for item in &proj.items {
         if !matches!(item.expr.kind, ExprKind::ColumnRef { .. }) {
@@ -338,6 +359,7 @@ mod tests {
     };
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::planner::plan::*;
     use arrow::datatypes::DataType;
 
     fn col(name: &str) -> TypedExpr {
@@ -407,61 +429,66 @@ mod tests {
         }
     }
 
-    fn scan_with_cols(cols: &[&str]) -> LogicalPlan {
-        LogicalPlan::Scan(ScanNode {
-            database: "db".into(),
-            table: TableDef {
-                name: "t".into(),
+    fn scan_with_cols(cols: &[&str]) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".into(),
+                table: TableDef {
+                    name: "t".into(),
+                    columns: cols
+                        .iter()
+                        .map(|n| ColumnDef {
+                            name: (*n).into(),
+                            data_type: DataType::Int64,
+                            nullable: true,
+                            write_default: None,
+                            logical_type: None,
+                        })
+                        .collect(),
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: ScanSource::StarRocks {
+                        db_id: 0,
+                        table_id: 0,
+                    },
+                },
+                alias: None,
                 columns: cols
                     .iter()
-                    .map(|n| ColumnDef {
+                    .map(|n| OutputColumn {
+                        column_id: ColumnId::UNSET,
                         name: (*n).into(),
                         data_type: DataType::Int64,
                         nullable: true,
-                        write_default: None,
-                        logical_type: None,
+                        is_internal: false,
                     })
                     .collect(),
-                iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::StarRocks {
-                    db_id: 0,
-                    table_id: 0,
-                },
-            },
-            alias: None,
-            columns: cols
-                .iter()
-                .map(|n| OutputColumn {
-                    column_id: ColumnId::UNSET,
-                    name: (*n).into(),
-                    data_type: DataType::Int64,
-                    nullable: true,
-                    is_internal: false,
-                })
-                .collect(),
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        })
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        )
     }
 
     /// Build a pass-through Project that forwards the named columns unchanged.
-    fn passthrough_project(cols: &[&str], input: LogicalPlan) -> LogicalPlan {
-        LogicalPlan::Project(ProjectNode {
-            input: Box::new(input),
-            items: cols
-                .iter()
-                .map(|n| ProjectItem {
-                    expr: col(n),
-                    output_name: (*n).into(),
-                    output_column_id: crate::sql::column_id::ColumnId::UNSET,
-                })
-                .collect(),
-            output_qualifier: None,
-            required_output_columns: None,
-        })
+    fn passthrough_project(cols: &[&str], input: LogicalPlanNode) -> LogicalPlanNode {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: cols
+                    .iter()
+                    .map(|n| ProjectItem {
+                        expr: col(n),
+                        output_name: (*n).into(),
+                        output_column_id: crate::sql::column_id::ColumnId::UNSET,
+                    })
+                    .collect(),
+                output_qualifier: None,
+            }),
+            vec![input],
+            None,
+        )
     }
 
     // Test 1: SELECT a, b FROM (SELECT a, b FROM t) WHERE a = 1
@@ -470,21 +497,23 @@ mod tests {
     fn pushes_through_passthrough_project() {
         let scan = scan_with_cols(&["a", "b"]);
         let project = passthrough_project(&["a", "b"], scan);
-        let filter = LogicalPlan::Filter(FilterNode {
-            input: Box::new(project),
-            predicate: eq(col("a"), int_lit(1)),
-            required_output_columns: None,
-        });
+        let filter = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: eq(col("a"), int_lit(1)),
+            }),
+            vec![project],
+            None,
+        );
 
         let rule = PushDownPredicateProject;
         assert!(rule.matches(&filter));
         let out = rule.apply(filter).expect("should rewrite");
 
         // Expected shape: Project(Filter(Scan))
-        match out {
-            LogicalPlan::Project(p) => match *p.input {
-                LogicalPlan::Filter(f) => match *f.input {
-                    LogicalPlan::Scan(_) => {}
+        match &out.kind {
+            LogicalPlanNodeKind::Project(_) => match &out.unary_input().kind {
+                LogicalPlanNodeKind::Filter(_) => match &out.unary_input().unary_input().kind {
+                    LogicalPlanNodeKind::Scan(_) => {}
                     other => panic!("expected Scan under Filter, got {:?}", other),
                 },
                 other => panic!("expected Filter under Project, got {:?}", other),
@@ -497,35 +526,37 @@ mod tests {
     fn rewrites_qualified_alias_predicate_before_pushdown() {
         let scan = scan_with_cols(&["item_sk"]);
         let mut project = passthrough_project(&["item_sk"], scan);
-        if let LogicalPlan::Project(ref mut p) = project {
+        if let LogicalPlanNodeKind::Project(ref mut p) = project.kind {
             p.output_qualifier = Some("asceding".into());
         }
-        let filter = LogicalPlan::Filter(FilterNode {
-            input: Box::new(project),
-            predicate: is_not_null(qualified_col("asceding", "item_sk")),
-            required_output_columns: None,
-        });
+        let filter = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: is_not_null(qualified_col("asceding", "item_sk")),
+            }),
+            vec![project],
+            None,
+        );
 
         let rule = PushDownPredicateProject;
         let out = rule.apply(filter).expect("should rewrite");
 
-        let LogicalPlan::Project(project) = out else {
+        let LogicalPlanNodeKind::Project(project) = &out.kind else {
             panic!("expected Project at top");
         };
-        let LogicalPlan::Filter(inner_filter) = *project.input else {
+        let LogicalPlanNodeKind::Filter(inner_filter) = &out.unary_input().kind else {
             panic!("expected pushed Filter below Project");
         };
-        let ExprKind::IsNull { expr, negated } = inner_filter.predicate.kind else {
+        let ExprKind::IsNull { expr, negated } = &inner_filter.predicate.kind else {
             panic!("expected pushed IS NOT NULL predicate");
         };
-        assert!(negated);
+        assert!(*negated);
         let ExprKind::ColumnRef {
             qualifier, column, ..
-        } = expr.kind
+        } = &expr.kind
         else {
             panic!("expected pushed predicate to reference the Project input column");
         };
-        assert_eq!(qualifier, None);
+        assert!(qualifier.is_none());
         assert_eq!(column, "item_sk");
     }
 
@@ -545,21 +576,25 @@ mod tests {
                 right: Box::new(int_lit(1)),
             },
         };
-        let project = LogicalPlan::Project(ProjectNode {
-            input: Box::new(scan),
-            items: vec![ProjectItem {
-                expr: computed_expr,
-                output_name: "x".into(),
-                output_column_id: crate::sql::column_id::ColumnId::UNSET,
-            }],
-            output_qualifier: None,
-            required_output_columns: None,
-        });
-        let filter = LogicalPlan::Filter(FilterNode {
-            input: Box::new(project),
-            predicate: eq(col("x"), int_lit(5)),
-            required_output_columns: None,
-        });
+        let project = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![ProjectItem {
+                    expr: computed_expr,
+                    output_name: "x".into(),
+                    output_column_id: crate::sql::column_id::ColumnId::UNSET,
+                }],
+                output_qualifier: None,
+            }),
+            vec![scan],
+            None,
+        );
+        let filter = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: eq(col("x"), int_lit(5)),
+            }),
+            vec![project],
+            None,
+        );
 
         let rule = PushDownPredicateProject;
         assert!(rule.matches(&filter));
@@ -581,16 +616,21 @@ mod tests {
         let scan = scan_with_cols(&["a"]);
         let project = passthrough_project(&["a"], scan);
         let one_eq_one = eq(int_lit(1), int_lit(1));
-        let filter = LogicalPlan::Filter(FilterNode {
-            input: Box::new(project),
-            predicate: one_eq_one,
-            required_output_columns: None,
-        });
+        let filter = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: one_eq_one,
+            }),
+            vec![project],
+            None,
+        );
         let rule = PushDownPredicateProject;
         let out = rule.apply(filter).expect("should push vacuous constant");
-        match out {
-            LogicalPlan::Project(p) => {
-                assert!(matches!(*p.input, LogicalPlan::Filter(_)));
+        match &out.kind {
+            LogicalPlanNodeKind::Project(_) => {
+                assert!(matches!(
+                    &out.unary_input().kind,
+                    LogicalPlanNodeKind::Filter(_)
+                ));
             }
             other => panic!(
                 "expected Project(Filter(Scan)) for pushed constant, got {:?}",
@@ -616,42 +656,46 @@ mod tests {
                 right: Box::new(int_lit(1)),
             },
         };
-        let project = LogicalPlan::Project(ProjectNode {
-            input: Box::new(scan),
-            items: vec![
-                ProjectItem {
-                    expr: col("a"),
-                    output_name: "a".into(),
-                    output_column_id: crate::sql::column_id::ColumnId::UNSET,
-                },
-                ProjectItem {
-                    expr: computed_expr,
-                    output_name: "x".into(),
-                    output_column_id: crate::sql::column_id::ColumnId::UNSET,
-                },
-            ],
-            output_qualifier: None,
-            required_output_columns: None,
-        });
+        let project = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![
+                    ProjectItem {
+                        expr: col("a"),
+                        output_name: "a".into(),
+                        output_column_id: crate::sql::column_id::ColumnId::UNSET,
+                    },
+                    ProjectItem {
+                        expr: computed_expr,
+                        output_name: "x".into(),
+                        output_column_id: crate::sql::column_id::ColumnId::UNSET,
+                    },
+                ],
+                output_qualifier: None,
+            }),
+            vec![scan],
+            None,
+        );
         // Filter: a=1 AND x=5
         let pred = and(eq(col("a"), int_lit(1)), eq(col("x"), int_lit(5)));
-        let filter = LogicalPlan::Filter(FilterNode {
-            input: Box::new(project),
-            predicate: pred,
-            required_output_columns: None,
-        });
+        let filter = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode { predicate: pred }),
+            vec![project],
+            None,
+        );
 
         let rule = PushDownPredicateProject;
         let out = rule.apply(filter).expect("should produce partial rewrite");
 
         // Expected: Filter(Project(Filter(Scan)))
-        match out {
-            LogicalPlan::Filter(outer_f) => match *outer_f.input {
-                LogicalPlan::Project(p) => match *p.input {
-                    LogicalPlan::Filter(inner_f) => match *inner_f.input {
-                        LogicalPlan::Scan(_) => {}
-                        other => panic!("expected Scan at bottom, got {:?}", other),
-                    },
+        match &out.kind {
+            LogicalPlanNodeKind::Filter(_) => match &out.unary_input().kind {
+                LogicalPlanNodeKind::Project(_) => match &out.unary_input().unary_input().kind {
+                    LogicalPlanNodeKind::Filter(_) => {
+                        match &out.unary_input().unary_input().unary_input().kind {
+                            LogicalPlanNodeKind::Scan(_) => {}
+                            other => panic!("expected Scan at bottom, got {:?}", other),
+                        }
+                    }
                     other => panic!("expected Filter under Project, got {:?}", other),
                 },
                 other => panic!("expected Project under outer Filter, got {:?}", other),

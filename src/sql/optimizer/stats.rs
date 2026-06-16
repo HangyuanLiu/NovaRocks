@@ -2,7 +2,7 @@
 //!
 //! Mirrors the logic in `sql::optimizer::cardinality` but operates on
 //! Memo operators (`MExpr`) and reads child statistics from group logical
-//! properties instead of recursing the `LogicalPlan` tree.
+//! properties instead of recursing the `LogicalPlanNode` tree.
 
 use std::collections::HashMap;
 
@@ -22,7 +22,7 @@ use crate::sql::optimizer::estimate::cardinality::{
     union_distinct_rows,
 };
 use crate::sql::optimizer::statistics::*;
-use crate::sql::planner::plan::LogicalPlan;
+use crate::sql::planner::plan::LogicalPlanNode;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -647,7 +647,7 @@ pub(crate) fn derive_statistics(
 }
 
 pub(crate) fn derive_logical_plan_statistics(
-    plan: &LogicalPlan,
+    plan: &LogicalPlanNode,
     table_stats: &HashMap<String, TableStatistics>,
 ) -> Statistics {
     let mut memo = Memo::new();
@@ -1797,6 +1797,7 @@ mod tests {
     use crate::sql::optimizer::convert::logical_plan_to_memo;
     use crate::sql::optimizer::memo::Memo;
     use crate::sql::planner::plan::*;
+    use crate::sql::planner::plan::*;
     use arrow::datatypes::DataType;
 
     fn test_iceberg_table_info() -> IcebergTableInfo {
@@ -1873,7 +1874,7 @@ mod tests {
         stats.contains_key(&test_col_id(name))
     }
 
-    fn scan_plan(name: &str, cols: &[&str]) -> LogicalPlan {
+    fn scan_plan(name: &str, cols: &[&str]) -> LogicalPlanNode {
         let columns: Vec<OutputColumn> = cols
             .iter()
             .map(|c| OutputColumn {
@@ -1894,53 +1895,57 @@ mod tests {
                 logical_type: None,
             })
             .collect();
-        LogicalPlan::Scan(ScanNode {
-            database: "db".to_string(),
-            table: TableDef {
-                name: name.to_string(),
-                columns: col_defs,
-                iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::IcebergDataFiles {
-                    table: test_iceberg_table_info(),
-                    files: vec![IcebergDataFileInfo {
-                        path: format!("s3://bucket/{}.parquet", name),
-                        size: 1000,
-                        row_count: Some(1000),
-                        column_stats: None,
-                        partition_spec_id: None,
-                        partition_key: None,
-                        first_row_id: None,
-                        data_sequence_number: None,
-                        ivm_change_op: None,
-                        included_positions: None,
-                        delete_files: vec![],
-                        manifest_path: None,
-                        partition_values: vec![],
-                    }],
-                    cloud_properties: Default::default(),
-                    binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: TableDef {
+                    name: name.to_string(),
+                    columns: col_defs,
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: ScanSource::IcebergDataFiles {
+                        table: test_iceberg_table_info(),
+                        files: vec![IcebergDataFileInfo {
+                            path: format!("s3://bucket/{}.parquet", name),
+                            size: 1000,
+                            row_count: Some(1000),
+                            column_stats: None,
+                            partition_spec_id: None,
+                            partition_key: None,
+                            first_row_id: None,
+                            data_sequence_number: None,
+                            ivm_change_op: None,
+                            included_positions: None,
+                            delete_files: vec![],
+                            manifest_path: None,
+                            partition_values: vec![],
+                        }],
+                        cloud_properties: Default::default(),
+                        binding: crate::sql::catalog::IcebergDataFileBinding::CurrentSnapshot,
+                    },
                 },
-            },
-            alias: None,
-            columns,
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        })
+                alias: None,
+                columns: columns,
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        )
     }
 
     fn scan_plan_with_predicates(
         name: &str,
         cols: &[&str],
         predicates: Vec<TypedExpr>,
-    ) -> LogicalPlan {
-        let LogicalPlan::Scan(mut node) = scan_plan(name, cols) else {
+    ) -> LogicalPlanNode {
+        let mut plan = scan_plan(name, cols);
+        let LogicalPlanNodeKind::Scan(node) = &mut plan.kind else {
             unreachable!("scan_plan always returns a Scan");
         };
         node.predicates = predicates;
-        LogicalPlan::Scan(node)
+        plan
     }
 
     #[test]
@@ -2047,9 +2052,9 @@ mod tests {
         let (name, ts) = make_table_stats("orders", 100_000, &[("id", 100.0)]);
         let mut table_stats = HashMap::new();
         table_stats.insert(name, ts);
-        let LogicalPlan::Scan(scan) =
-            scan_plan_with_predicates("orders", &["id"], vec![eq_expr(col_ref("id"), int_lit(42))])
-        else {
+        let scan_plan =
+            scan_plan_with_predicates("orders", &["id"], vec![eq_expr(col_ref("id"), int_lit(42))]);
+        let LogicalPlanNodeKind::Scan(scan) = scan_plan.kind else {
             unreachable!("scan_plan_with_predicates always returns a Scan");
         };
         let memo = Memo::new();
@@ -2908,11 +2913,11 @@ mod tests {
 
         let scan = scan_plan("t", &["a"]);
         let pred = eq_expr(col_ref("a"), int_lit(42));
-        let plan = LogicalPlan::Filter(FilterNode {
-            input: Box::new(scan),
-            predicate: pred,
-            required_output_columns: None,
-        });
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode { predicate: pred }),
+            vec![scan],
+            None,
+        );
 
         let mut memo = Memo::new();
         logical_plan_to_memo(&plan, &mut memo);
@@ -3769,13 +3774,14 @@ mod tests {
         let right = scan_plan("orders", &["o_orderkey"]);
         let cond = eq_expr(col_ref("l_orderkey"), col_ref("o_orderkey"));
 
-        let plan = LogicalPlan::Join(JoinNode {
-            left: Box::new(left),
-            right: Box::new(right),
-            join_type: JoinKind::Inner,
-            condition: Some(cond),
-            required_output_columns: None,
-        });
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Join(LogicalJoinNode {
+                join_type: JoinKind::Inner,
+                condition: Some(cond),
+            }),
+            vec![left, right],
+            None,
+        );
 
         let mut memo = Memo::new();
         logical_plan_to_memo(&plan, &mut memo);
@@ -3795,20 +3801,22 @@ mod tests {
         table_stats.insert(name, ts);
 
         let scan = scan_plan("t", &["status"]);
-        let plan = LogicalPlan::Aggregate(AggregateNode {
-            input: Box::new(scan),
-            group_by: vec![col_ref("status")],
-            aggregates: vec![],
-            output_columns: vec![OutputColumn {
-                column_id: ColumnId::UNSET,
-                name: "status".to_string(),
-                data_type: DataType::Int32,
-                nullable: false,
-                is_internal: false,
-            }],
-            already_pushed: false,
-            required_output_columns: None,
-        });
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![col_ref("status")],
+                aggregates: vec![],
+                output_columns: vec![OutputColumn {
+                    column_id: ColumnId::UNSET,
+                    name: "status".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    is_internal: false,
+                }],
+                already_pushed: false,
+            }),
+            vec![scan],
+            None,
+        );
 
         let mut memo = Memo::new();
         logical_plan_to_memo(&plan, &mut memo);
@@ -3827,12 +3835,14 @@ mod tests {
         table_stats.insert(name, ts);
 
         let scan = scan_plan("t", &["a"]);
-        let plan = LogicalPlan::Limit(LimitNode {
-            input: Box::new(scan),
-            limit: Some(10),
-            offset: None,
-            required_output_columns: None,
-        });
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Limit(LogicalLimitNode {
+                limit: Some(10),
+                offset: None,
+            }),
+            vec![scan],
+            None,
+        );
 
         let mut memo = Memo::new();
         logical_plan_to_memo(&plan, &mut memo);
@@ -3852,36 +3862,40 @@ mod tests {
         table_stats.insert(name, ts);
 
         let scan = scan_plan("orders", &["id"]);
-        let produce = LogicalPlan::CTEProduce(CTEProduceNode {
-            cte_id: 1,
-            input: Box::new(scan),
-            output_columns: vec![OutputColumn {
-                column_id: ColumnId::UNSET,
-                name: "id".to_string(),
-                data_type: DataType::Int32,
-                nullable: false,
-                is_internal: false,
-            }],
-            required_output_columns: None,
-        });
-        let consume = LogicalPlan::CTEConsume(CTEConsumeNode {
-            cte_id: 1,
-            alias: "cte_orders".to_string(),
-            output_columns: vec![OutputColumn {
-                column_id: ColumnId::UNSET,
-                name: "id".to_string(),
-                data_type: DataType::Int32,
-                nullable: false,
-                is_internal: false,
-            }],
-            required_output_columns: None,
-        });
-        let anchor = LogicalPlan::CTEAnchor(CTEAnchorNode {
-            cte_id: 1,
-            produce: Box::new(produce),
-            consumer: Box::new(consume),
-            required_output_columns: None,
-        });
+        let produce = LogicalPlanNode::new(
+            LogicalPlanNodeKind::CTEProduce(LogicalCTEProduceNode {
+                cte_id: 1,
+                output_columns: vec![OutputColumn {
+                    column_id: ColumnId::UNSET,
+                    name: "id".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    is_internal: false,
+                }],
+            }),
+            vec![scan],
+            None,
+        );
+        let consume = LogicalPlanNode::new(
+            LogicalPlanNodeKind::CTEConsume(LogicalCTEConsumeNode {
+                cte_id: 1,
+                alias: "cte_orders".to_string(),
+                output_columns: vec![OutputColumn {
+                    column_id: ColumnId::UNSET,
+                    name: "id".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    is_internal: false,
+                }],
+            }),
+            vec![],
+            None,
+        );
+        let anchor = LogicalPlanNode::new(
+            LogicalPlanNodeKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: 1 }),
+            vec![produce, consume],
+            None,
+        );
 
         let mut memo = Memo::new();
         logical_plan_to_memo(&anchor, &mut memo);
@@ -4094,36 +4108,40 @@ mod tests {
         table_stats.insert(name, ts);
 
         let scan = scan_plan("orders", &["id"]);
-        let produce = LogicalPlan::CTEProduce(CTEProduceNode {
-            cte_id: 1,
-            input: Box::new(scan),
-            output_columns: vec![OutputColumn {
-                column_id: test_col_id("id"),
-                name: "id".to_string(),
-                data_type: DataType::Int32,
-                nullable: false,
-                is_internal: false,
-            }],
-            required_output_columns: None,
-        });
-        let consume = LogicalPlan::CTEConsume(CTEConsumeNode {
-            cte_id: 1,
-            alias: "cte_orders".to_string(),
-            output_columns: vec![OutputColumn {
-                column_id: test_col_id("consume_id"),
-                name: "id".to_string(),
-                data_type: DataType::Int32,
-                nullable: false,
-                is_internal: false,
-            }],
-            required_output_columns: None,
-        });
-        let anchor = LogicalPlan::CTEAnchor(CTEAnchorNode {
-            cte_id: 1,
-            produce: Box::new(produce),
-            consumer: Box::new(consume),
-            required_output_columns: None,
-        });
+        let produce = LogicalPlanNode::new(
+            LogicalPlanNodeKind::CTEProduce(LogicalCTEProduceNode {
+                cte_id: 1,
+                output_columns: vec![OutputColumn {
+                    column_id: test_col_id("id"),
+                    name: "id".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    is_internal: false,
+                }],
+            }),
+            vec![scan],
+            None,
+        );
+        let consume = LogicalPlanNode::new(
+            LogicalPlanNodeKind::CTEConsume(LogicalCTEConsumeNode {
+                cte_id: 1,
+                alias: "cte_orders".to_string(),
+                output_columns: vec![OutputColumn {
+                    column_id: test_col_id("consume_id"),
+                    name: "id".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    is_internal: false,
+                }],
+            }),
+            vec![],
+            None,
+        );
+        let anchor = LogicalPlanNode::new(
+            LogicalPlanNodeKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: 1 }),
+            vec![produce, consume],
+            None,
+        );
 
         let mut memo = Memo::new();
         logical_plan_to_memo(&anchor, &mut memo);
@@ -4178,17 +4196,20 @@ mod tests {
 
     #[test]
     fn values_group_stats() {
-        let plan = LogicalPlan::Values(ValuesNode {
-            rows: vec![vec![], vec![], vec![]],
-            columns: vec![OutputColumn {
-                column_id: ColumnId::UNSET,
-                name: "x".to_string(),
-                data_type: DataType::Int32,
-                nullable: false,
-                is_internal: false,
-            }],
-            required_output_columns: None,
-        });
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Values(LogicalValuesNode {
+                rows: vec![vec![], vec![], vec![]],
+                columns: vec![OutputColumn {
+                    column_id: ColumnId::UNSET,
+                    name: "x".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    is_internal: false,
+                }],
+            }),
+            vec![],
+            None,
+        );
 
         let mut memo = Memo::new();
         logical_plan_to_memo(&plan, &mut memo);
@@ -4457,24 +4478,29 @@ mod tests {
     #[test]
     fn project_group_stats_preserve_project_item_output_column_id() {
         let out_id = ColumnId::new_for_test(42);
-        let plan = LogicalPlan::Project(ProjectNode {
-            input: Box::new(LogicalPlan::Values(ValuesNode {
-                rows: vec![vec![]],
-                columns: vec![],
-                required_output_columns: None,
-            })),
-            items: vec![ProjectItem {
-                expr: TypedExpr {
-                    kind: ExprKind::Literal(LiteralValue::Int(1)),
-                    data_type: DataType::Int64,
-                    nullable: false,
-                },
-                output_name: "col1".to_string(),
-                output_column_id: out_id,
-            }],
-            output_qualifier: None,
-            required_output_columns: None,
-        });
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: vec![ProjectItem {
+                    expr: TypedExpr {
+                        kind: ExprKind::Literal(LiteralValue::Int(1)),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                    },
+                    output_name: "col1".to_string(),
+                    output_column_id: out_id,
+                }],
+                output_qualifier: None,
+            }),
+            vec![LogicalPlanNode::new(
+                LogicalPlanNodeKind::Values(LogicalValuesNode {
+                    rows: vec![vec![]],
+                    columns: vec![],
+                }),
+                vec![],
+                None,
+            )],
+            None,
+        );
 
         let mut memo = Memo::new();
         logical_plan_to_memo(&plan, &mut memo);
@@ -4496,23 +4522,25 @@ mod tests {
         table_stats.insert(name, ts);
 
         let scan = scan_plan("t", &["a"]);
-        let plan = LogicalPlan::Decode(DecodeNode {
-            input: Box::new(scan),
-            mappings: vec![DecodeMapping {
-                source_column_id: ColumnId::new_for_test(1),
-                output_column_id: ColumnId::new_for_test(2),
-                dict_column: "a".to_string(),
-                string_column: "a_str".to_string(),
-            }],
-            output_columns: vec![OutputColumn {
-                column_id: ColumnId::UNSET,
-                name: "a_str".to_string(),
-                data_type: DataType::Utf8,
-                nullable: false,
-                is_internal: false,
-            }],
-            required_output_columns: None,
-        });
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Decode(LogicalDecodeNode {
+                mappings: vec![DecodeMapping {
+                    source_column_id: ColumnId::new_for_test(1),
+                    output_column_id: ColumnId::new_for_test(2),
+                    dict_column: "a".to_string(),
+                    string_column: "a_str".to_string(),
+                }],
+                output_columns: vec![OutputColumn {
+                    column_id: ColumnId::UNSET,
+                    name: "a_str".to_string(),
+                    data_type: DataType::Utf8,
+                    nullable: false,
+                    is_internal: false,
+                }],
+            }),
+            vec![scan],
+            None,
+        );
 
         let mut memo = Memo::new();
         logical_plan_to_memo(&plan, &mut memo);

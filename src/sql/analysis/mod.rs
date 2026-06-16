@@ -74,10 +74,10 @@ pub(crate) struct ResolvedSelect {
     /// Repeat metadata for ROLLUP/CUBE/GROUPING SETS expansion.
     pub repeat: Option<RepeatInfo>,
     /// Scalar subqueries routed to the Apply framework. Consumed by the
-    /// planner to emit `LogicalPlan::Apply`.
+    /// planner to emit `LogicalPlanNodeKind::Apply`.
     pub apply_specs: Vec<ApplyScalarSpec>,
     /// EXISTS/IN subqueries routed to the Apply framework. Consumed by the
-    /// planner alongside `apply_specs` to emit `LogicalPlan::Apply`.
+    /// planner alongside `apply_specs` to emit `LogicalPlanNodeKind::Apply`.
     #[allow(dead_code)]
     pub predicate_apply_specs: Vec<ApplyPredicateSpec>,
 }
@@ -202,7 +202,7 @@ pub(crate) struct IcebergMetadataScanRelation {
 /// `__nr_ivm_delta('cat.ns.tbl', from_snap, to_snap)` table function call.
 /// Carries the base table's `TableDef` (with v3 row-lineage metadata
 /// columns already populated by the catalog) so the planner can emit a
-/// synthetic `LogicalPlan::Scan` whose storage tag dispatches codegen to
+/// synthetic `LogicalPlanNodeKind::Scan` whose storage tag dispatches codegen to
 /// `ICEBERG_DELTA_SCAN_NODE`.
 #[derive(Clone, Debug)]
 pub(crate) struct IcebergDeltaScanRelation {
@@ -440,7 +440,7 @@ pub(crate) enum ApplyClause {
 }
 
 /// A scalar subquery the analyzer routed to the Apply framework.
-/// The planner consumes these to emit `LogicalPlan::Apply`. The inner query is
+/// The planner consumes these to emit `LogicalPlanNodeKind::Apply`. The inner query is
 /// left INTACT — correlation predicates remain in its WHERE; M1b's
 /// PushDownApplyFilter rule extracts them into the Apply's correlation_conjuncts.
 // All fields are consumed by the M1a planner (Task 4) and M1b runtime (Task 5+).
@@ -479,7 +479,7 @@ pub(crate) struct ApplyScalarSpec {
 
 /// An EXISTS / NOT EXISTS / IN / NOT IN subquery routed to the Apply framework
 /// Parallel to `ApplyScalarSpec`; the planner consumes these to
-/// emit `LogicalPlan::Apply` with `ApplyKind::Exists` / `ApplyKind::In`. The
+/// emit `LogicalPlanNodeKind::Apply` with `ApplyKind::Exists` / `ApplyKind::In`. The
 /// inner query is left INTACT — its WHERE (correlation + residual) is read by
 /// the M3 to-join rules (`ExistentialApplyToJoin` / `QuantifiedApplyToJoin`).
 // Constructed and read by analyzer collection and planner in Task 2/3.

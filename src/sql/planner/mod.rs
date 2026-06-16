@@ -1,4 +1,4 @@
-//! Logical Planner — converts [`ResolvedQuery`] into [`LogicalPlan`].
+//! Logical Planner — converts [`ResolvedQuery`] into [`LogicalPlanNode`].
 //!
 //! This is a structural transformation that builds a relational algebra tree
 //! from the analyzed query IR.  A future optimizer would rewrite this tree
@@ -40,7 +40,7 @@ pub(crate) fn plan_query(
     resolved: ResolvedQuery,
     cte_registry: CTERegistry,
     factory: &mut ColumnRefFactory,
-) -> Result<LogicalPlan, String> {
+) -> Result<LogicalPlanNode, String> {
     plan_scoped_query(resolved, &cte_registry, factory)
 }
 
@@ -48,7 +48,7 @@ fn plan_scoped_query(
     resolved: ResolvedQuery,
     cte_registry: &CTERegistry,
     factory: &mut ColumnRefFactory,
-) -> Result<LogicalPlan, String> {
+) -> Result<LogicalPlanNode, String> {
     let ResolvedQuery {
         body,
         order_by,
@@ -68,14 +68,14 @@ fn plan_scoped_query(
     // planner previously left branch-side ColumnIds in those fields, which
     // disagreed with the fresh IDs that the parent scope uses to reference
     // the set-op output.
-    match &mut body_plan {
-        LogicalPlan::Union(node) => {
+    match &mut body_plan.kind {
+        LogicalPlanNodeKind::Union(node) => {
             node.output_columns = output_columns.clone();
         }
-        LogicalPlan::Intersect(node) => {
+        LogicalPlanNodeKind::Intersect(node) => {
             node.output_columns = output_columns.clone();
         }
-        LogicalPlan::Except(node) => {
+        LogicalPlanNodeKind::Except(node) => {
             node.output_columns = output_columns.clone();
         }
         _ => {}
@@ -90,31 +90,32 @@ fn plan_scoped_query(
             .ok_or_else(|| format!("missing CTE entry for id {cte_id}"))?;
         let produce_input = plan_scoped_query(entry.resolved_query.clone(), cte_registry, factory)?;
         let produce_input = adapt_plan_output(produce_input, &entry.output_columns)?;
-        let produce = LogicalPlan::CTEProduce(CTEProduceNode {
-            cte_id: entry.id,
-            input: Box::new(produce_input),
-            output_columns: entry.output_columns.clone(),
-            required_output_columns: None,
-        });
-        root = LogicalPlan::CTEAnchor(CTEAnchorNode {
-            cte_id: entry.id,
-            produce: Box::new(produce),
-            consumer: Box::new(root),
-            required_output_columns: None,
-        });
+        let produce = LogicalPlanNode::new(
+            LogicalPlanNodeKind::CTEProduce(LogicalCTEProduceNode {
+                cte_id: entry.id,
+                output_columns: entry.output_columns.clone(),
+            }),
+            vec![produce_input],
+            None,
+        );
+        root = LogicalPlanNode::new(
+            LogicalPlanNodeKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: entry.id }),
+            vec![produce, root],
+            None,
+        );
     }
 
     Ok(root)
 }
 
 fn apply_query_modifiers(
-    mut body_plan: LogicalPlan,
+    mut body_plan: LogicalPlanNode,
     order_by: Vec<SortItem>,
     output_columns: Vec<OutputColumn>,
     limit: Option<i64>,
     offset: Option<i64>,
     factory: &mut ColumnRefFactory,
-) -> LogicalPlan {
+) -> LogicalPlanNode {
     let mut final_projection: Option<Vec<ProjectItem>> = None;
 
     // Wrap with Sort if ORDER BY is present.
@@ -147,8 +148,15 @@ fn apply_query_modifiers(
             // reference the same ColumnId that the inner Project produces, preserving id
             // continuity through the double-Project barrier for the Phase-1 tagging pass.
             let user_select: Option<Vec<(String, arrow::datatypes::DataType, bool, ColumnId)>> =
-                if let LogicalPlan::Project(ref mut proj) = body_plan {
-                    if let LogicalPlan::Aggregate(ref mut agg) = *proj.input {
+                if let LogicalPlanNode {
+                    kind: LogicalPlanNodeKind::Project(proj),
+                    children,
+                    ..
+                } = &mut body_plan
+                {
+                    if let Some(child) = children.get_mut(0)
+                        && let LogicalPlanNodeKind::Aggregate(agg) = &mut child.kind
+                    {
                         for extra in &extra_items {
                             collect_aggregates(&extra.expr, &mut agg.aggregates, factory);
                         }
@@ -235,15 +243,17 @@ fn apply_query_modifiers(
             };
 
             // Sort with extended scope
-            body_plan = LogicalPlan::Sort(SortNode {
-                input: Box::new(body_plan),
-                items: sort_items,
-                // Top-level ORDER BY — no analytic partition.
-                analytic_partition_by: Vec::new(),
-                partition_limit: None,
-                topn_type: None,
-                required_output_columns: None,
-            });
+            body_plan = LogicalPlanNode::new(
+                LogicalPlanNodeKind::Sort(LogicalSortNode {
+                    items: sort_items,
+                    // Top-level ORDER BY — no analytic partition.
+                    analytic_partition_by: Vec::new(),
+                    partition_limit: None,
+                    topn_type: None,
+                }),
+                vec![body_plan],
+                None,
+            );
 
             // Strip synthetic sort-only columns after LIMIT/OFFSET so the
             // limit stays directly above Sort and can be rewritten to TopN.
@@ -293,35 +303,41 @@ fn apply_query_modifiers(
                     .collect()
             });
         } else {
-            body_plan = LogicalPlan::Sort(SortNode {
-                input: Box::new(body_plan),
-                items: sort_items,
-                // Top-level ORDER BY — no analytic partition.
-                analytic_partition_by: Vec::new(),
-                partition_limit: None,
-                topn_type: None,
-                required_output_columns: None,
-            });
+            body_plan = LogicalPlanNode::new(
+                LogicalPlanNodeKind::Sort(LogicalSortNode {
+                    items: sort_items,
+                    // Top-level ORDER BY — no analytic partition.
+                    analytic_partition_by: Vec::new(),
+                    partition_limit: None,
+                    topn_type: None,
+                }),
+                vec![body_plan],
+                None,
+            );
         }
     }
 
     // Wrap with Limit if LIMIT/OFFSET is present.
     if limit.is_some() || offset.is_some() {
-        body_plan = LogicalPlan::Limit(LimitNode {
-            input: Box::new(body_plan),
-            limit,
-            offset,
-            required_output_columns: None,
-        });
+        body_plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Limit(LogicalLimitNode {
+                limit: limit,
+                offset: offset,
+            }),
+            vec![body_plan],
+            None,
+        );
     }
 
     if let Some(items) = final_projection {
-        body_plan = LogicalPlan::Project(ProjectNode {
-            input: Box::new(body_plan),
-            items,
-            output_qualifier: None,
-            required_output_columns: None,
-        });
+        body_plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: items,
+                output_qualifier: None,
+            }),
+            vec![body_plan],
+            None,
+        );
     }
 
     body_plan
@@ -504,7 +520,7 @@ fn plan_body_scoped(
     body: QueryBody,
     cte_registry: &CTERegistry,
     factory: &mut ColumnRefFactory,
-) -> Result<LogicalPlan, String> {
+) -> Result<LogicalPlanNode, String> {
     match body {
         QueryBody::Select(select) => plan_select_scoped(select, cte_registry, factory),
         QueryBody::SetOperation(set_op) => plan_set_operation_scoped(set_op, cte_registry, factory),
@@ -512,11 +528,11 @@ fn plan_body_scoped(
     }
 }
 
-pub(crate) fn plan_output_columns(plan: &LogicalPlan) -> Result<Vec<OutputColumn>, String> {
-    match plan {
-        LogicalPlan::Scan(node) => Ok(node.columns.clone()),
-        LogicalPlan::Filter(node) => plan_output_columns(&node.input),
-        LogicalPlan::Project(node) => Ok(node
+pub(crate) fn plan_output_columns(plan: &LogicalPlanNode) -> Result<Vec<OutputColumn>, String> {
+    match &plan.kind {
+        LogicalPlanNodeKind::Scan(node) => Ok(node.columns.clone()),
+        LogicalPlanNodeKind::Filter(_) => plan_output_columns(plan.unary_input()),
+        LogicalPlanNodeKind::Project(node) => Ok(node
             .items
             .iter()
             .map(|item| OutputColumn {
@@ -527,61 +543,61 @@ pub(crate) fn plan_output_columns(plan: &LogicalPlan) -> Result<Vec<OutputColumn
                 is_internal: false,
             })
             .collect()),
-        LogicalPlan::Aggregate(node) => Ok(node.output_columns.clone()),
-        LogicalPlan::Join(node) => {
-            let left = plan_output_columns(&node.left)?;
-            let right = plan_output_columns(&node.right)?;
+        LogicalPlanNodeKind::Aggregate(node) => Ok(node.output_columns.clone()),
+        LogicalPlanNodeKind::Join(node) => {
+            let left = plan_output_columns(plan.left())?;
+            let right = plan_output_columns(plan.right())?;
             Ok(join_output_columns(node.join_type, left, right))
         }
-        LogicalPlan::Sort(node) => plan_output_columns(&node.input),
-        LogicalPlan::Limit(node) => plan_output_columns(&node.input),
-        LogicalPlan::Union(node) => Ok(node.output_columns.clone()),
-        LogicalPlan::Intersect(node) => Ok(node.output_columns.clone()),
-        LogicalPlan::Except(node) => Ok(node.output_columns.clone()),
-        LogicalPlan::Values(node) => Ok(node.columns.clone()),
-        LogicalPlan::GenerateSeries(node) => Ok(vec![OutputColumn {
+        LogicalPlanNodeKind::Sort(_) => plan_output_columns(plan.unary_input()),
+        LogicalPlanNodeKind::Limit(_) => plan_output_columns(plan.unary_input()),
+        LogicalPlanNodeKind::Union(node) => Ok(node.output_columns.clone()),
+        LogicalPlanNodeKind::Intersect(node) => Ok(node.output_columns.clone()),
+        LogicalPlanNodeKind::Except(node) => Ok(node.output_columns.clone()),
+        LogicalPlanNodeKind::Values(node) => Ok(node.columns.clone()),
+        LogicalPlanNodeKind::GenerateSeries(node) => Ok(vec![OutputColumn {
             column_id: node.output_column_id,
             name: node.column_name.clone(),
             data_type: arrow::datatypes::DataType::Int64,
             nullable: false,
             is_internal: false,
         }]),
-        LogicalPlan::TableFunction(node) => {
-            let mut columns = plan_output_columns(&node.input)?;
+        LogicalPlanNodeKind::TableFunction(node) => {
+            let mut columns = plan_output_columns(plan.unary_input())?;
             columns.extend(node.output_columns.clone());
             Ok(columns)
         }
-        LogicalPlan::Window(node) => Ok(node.output_columns.clone()),
-        LogicalPlan::Repeat(node) => plan_output_columns(&node.input),
-        LogicalPlan::CTEAnchor(node) => plan_output_columns(&node.consumer),
-        LogicalPlan::CTEProduce(node) => Ok(node.output_columns.clone()),
-        LogicalPlan::CTEConsume(node) => Ok(node.output_columns.clone()),
-        LogicalPlan::Decode(node) => Ok(node.output_columns.clone()),
-        LogicalPlan::AggregateStateMerge(node) => Ok(node.output_columns.clone()),
-        LogicalPlan::Apply(node) => {
-            let mut columns = plan_output_columns(&node.left)?;
+        LogicalPlanNodeKind::Window(node) => Ok(node.output_columns.clone()),
+        LogicalPlanNodeKind::Repeat(_) => plan_output_columns(plan.unary_input()),
+        LogicalPlanNodeKind::CTEAnchor(_) => plan_output_columns(plan.child(1)),
+        LogicalPlanNodeKind::CTEProduce(node) => Ok(node.output_columns.clone()),
+        LogicalPlanNodeKind::CTEConsume(node) => Ok(node.output_columns.clone()),
+        LogicalPlanNodeKind::Decode(node) => Ok(node.output_columns.clone()),
+        LogicalPlanNodeKind::AggregateStateMerge(node) => Ok(node.output_columns.clone()),
+        LogicalPlanNodeKind::Apply(node) => {
+            let mut columns = plan_output_columns(plan.left())?;
             columns.push(node.output_column.clone());
             Ok(columns)
         }
-        LogicalPlan::AssertOneRow(node) => plan_output_columns(&node.input),
-        LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
+        LogicalPlanNodeKind::AssertOneRow(_) => plan_output_columns(plan.unary_input()),
+        LogicalPlanNodeKind::ImvDelta(_) | LogicalPlanNodeKind::ImvVersion(_) => {
             Err("imv marker leaked into non-IMV planner output adaptation".to_string())
         }
     }
 }
 
 pub(crate) fn adapt_plan_output(
-    input: LogicalPlan,
+    input: LogicalPlanNode,
     target_output_columns: &[OutputColumn],
-) -> Result<LogicalPlan, String> {
+) -> Result<LogicalPlanNode, String> {
     adapt_plan_output_with_qualifier(input, target_output_columns, None)
 }
 
 pub(crate) fn adapt_plan_output_with_qualifier(
-    input: LogicalPlan,
+    input: LogicalPlanNode,
     target_output_columns: &[OutputColumn],
     output_qualifier: Option<&str>,
-) -> Result<LogicalPlan, String> {
+) -> Result<LogicalPlanNode, String> {
     let source_output_columns = plan_output_columns(&input)?;
     if source_output_columns.len() != target_output_columns.len() {
         return Err(format!(
@@ -632,12 +648,14 @@ pub(crate) fn adapt_plan_output_with_qualifier(
         });
     }
 
-    Ok(LogicalPlan::Project(ProjectNode {
-        input: Box::new(input),
-        items,
-        output_qualifier: output_qualifier.map(str::to_string),
-        required_output_columns: None,
-    }))
+    Ok(LogicalPlanNode::new(
+        LogicalPlanNodeKind::Project(LogicalProjectNode {
+            items: items,
+            output_qualifier: output_qualifier.map(str::to_string),
+        }),
+        vec![input],
+        None,
+    ))
 }
 
 fn output_column_metadata_equal(left: &OutputColumn, right: &OutputColumn) -> bool {
@@ -690,17 +708,17 @@ fn make_nullable(mut columns: Vec<OutputColumn>) -> Vec<OutputColumn> {
 // Apply spec wrapping helpers
 // ---------------------------------------------------------------------------
 
-/// Wrap `input` in a left-deep chain of `LogicalPlan::Apply` nodes, one per
+/// Wrap `input` in a left-deep chain of `LogicalPlanNodeKind::Apply` nodes, one per
 /// spec whose clause matches `clause`. Each Apply's right child is the planned
 /// inner subquery. Matching specs are consumed (removed) from `specs`; the
 /// remaining specs are preserved for the other clause insertion points.
 fn wrap_scalar_applies(
-    input: LogicalPlan,
+    input: LogicalPlanNode,
     specs: &mut Vec<ApplyScalarSpec>,
     clause: ApplyClause,
     cte_registry: &CTERegistry,
     factory: &mut ColumnRefFactory,
-) -> Result<LogicalPlan, String> {
+) -> Result<LogicalPlanNode, String> {
     let mut current = input;
     let mut remaining = Vec::new();
     for spec in specs.drain(..) {
@@ -710,58 +728,59 @@ fn wrap_scalar_applies(
         }
         let right = plan_scoped_query(spec.inner, cte_registry, factory)?;
         // Capture the inner's single scalar output column id before right is
-        // moved into the ApplyNode. This id is stable across M1b pushdown rules
+        // moved into the LogicalApplyNode. This id is stable across M1b pushdown rules
         // (which may add group-by keys), so it is the reliable way to find the
         // scalar result in ScalarApplyToJoin (Task 3).
         let inner_output_column_id = plan_output_columns(&right)?
             .first()
             .map(|c| c.column_id)
             .ok_or_else(|| "scalar subquery inner has no output column".to_string())?;
-        // Copy output-column fields before spec.output_column is moved into the ApplyNode.
+        // Copy output-column fields before spec.output_column is moved into the LogicalApplyNode.
         let col_id = spec.output_column.column_id;
         let col_name = spec.output_column.name.clone();
         let col_type = spec.output_column.data_type.clone();
-        current = LogicalPlan::Apply(ApplyNode {
-            left: Box::new(current),
-            right: Box::new(right),
-            kind: ApplyKind::Scalar,
-            inner_output_column_id,
-            subquery_expr: TypedExpr {
-                kind: ExprKind::ColumnRef {
-                    column_id: col_id,
-                    qualifier: None,
-                    column: col_name,
+        current = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Apply(LogicalApplyNode {
+                kind: ApplyKind::Scalar,
+                inner_output_column_id: inner_output_column_id,
+                subquery_expr: TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        column_id: col_id,
+                        qualifier: None,
+                        column: col_name,
+                    },
+                    data_type: col_type,
+                    nullable: true,
                 },
-                data_type: col_type,
-                nullable: true,
-            },
-            output_column: spec.output_column,
-            correlation_column_ids: spec.correlation_column_ids,
-            correlation_conjuncts: Vec::new(),
-            residual_predicate: None,
-            need_check_max_rows: spec.need_check_max_rows,
-            use_semi_anti: false,
-            uncorrelated_outer_predicate_columns: std::collections::HashSet::new(),
-            required_output_columns: None,
-        });
+                output_column: spec.output_column,
+                correlation_column_ids: spec.correlation_column_ids,
+                correlation_conjuncts: Vec::new(),
+                residual_predicate: None,
+                need_check_max_rows: spec.need_check_max_rows,
+                use_semi_anti: false,
+                uncorrelated_outer_predicate_columns: std::collections::HashSet::new(),
+            }),
+            vec![current, right],
+            None,
+        );
     }
     *specs = remaining;
     Ok(current)
 }
 
-/// Wrap `input` in a left-deep chain of `LogicalPlan::Apply` nodes for each
+/// Wrap `input` in a left-deep chain of `LogicalPlanNodeKind::Apply` nodes for each
 /// EXISTS/IN predicate spec whose clause matches `clause`. Mirrors
 /// `wrap_scalar_applies` but builds `ApplyKind::Exists` / `ApplyKind::In`
 /// semi/anti-collapsing applies. The M3 to-join rules read correlation and
 /// residual predicates directly from the inner Filter, so construction leaves
 /// `correlation_conjuncts` empty.
 fn wrap_predicate_applies(
-    input: LogicalPlan,
+    input: LogicalPlanNode,
     specs: &mut Vec<ApplyPredicateSpec>,
     clause: ApplyClause,
     cte_registry: &CTERegistry,
     factory: &mut ColumnRefFactory,
-) -> Result<LogicalPlan, String> {
+) -> Result<LogicalPlanNode, String> {
     use crate::sql::analysis::SubqueryKind;
 
     let mut current = input;
@@ -801,21 +820,22 @@ fn wrap_predicate_applies(
             },
         };
 
-        current = LogicalPlan::Apply(ApplyNode {
-            left: Box::new(current),
-            right: Box::new(right),
-            kind,
-            subquery_expr,
-            output_column: spec.output_column,
-            inner_output_column_id,
-            correlation_column_ids: spec.correlation_column_ids,
-            correlation_conjuncts: Vec::new(),
-            residual_predicate: None,
-            need_check_max_rows: false,
-            use_semi_anti: spec.use_semi_anti,
-            uncorrelated_outer_predicate_columns: std::collections::HashSet::new(),
-            required_output_columns: None,
-        });
+        current = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Apply(LogicalApplyNode {
+                kind: kind,
+                subquery_expr: subquery_expr,
+                output_column: spec.output_column,
+                inner_output_column_id: inner_output_column_id,
+                correlation_column_ids: spec.correlation_column_ids,
+                correlation_conjuncts: Vec::new(),
+                residual_predicate: None,
+                need_check_max_rows: false,
+                use_semi_anti: spec.use_semi_anti,
+                uncorrelated_outer_predicate_columns: std::collections::HashSet::new(),
+            }),
+            vec![current, right],
+            None,
+        );
     }
     *specs = remaining;
     Ok(current)
@@ -829,7 +849,7 @@ fn plan_select_scoped(
     mut select: ResolvedSelect,
     cte_registry: &CTERegistry,
     factory: &mut ColumnRefFactory,
-) -> Result<LogicalPlan, String> {
+) -> Result<LogicalPlanNode, String> {
     const REPEAT_GROUP_QUALIFIER: &str = "__repeat_group";
 
     // Take ownership of all apply specs up-front. The wrap points below consume
@@ -839,11 +859,14 @@ fn plan_select_scoped(
 
     let mut current = match select.from.take() {
         Some(relation) => plan_relation_scoped(relation, cte_registry, factory)?,
-        None => LogicalPlan::Values(ValuesNode {
-            rows: vec![vec![]],
-            columns: vec![],
-            required_output_columns: None,
-        }),
+        None => LogicalPlanNode::new(
+            LogicalPlanNodeKind::Values(LogicalValuesNode {
+                rows: vec![vec![]],
+                columns: vec![],
+            }),
+            vec![],
+            None,
+        ),
     };
 
     // WHERE placement: Apply nodes for WHERE-clause scalar subqueries are
@@ -865,11 +888,13 @@ fn plan_select_scoped(
     )?;
 
     if let Some(predicate) = select.filter.take() {
-        current = LogicalPlan::Filter(FilterNode {
-            input: Box::new(current),
-            predicate,
-            required_output_columns: None,
-        });
+        current = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: predicate,
+            }),
+            vec![current],
+            None,
+        );
     }
 
     if let Some(mut repeat_info) = select.repeat.take() {
@@ -880,19 +905,21 @@ fn plan_select_scoped(
             REPEAT_GROUP_QUALIFIER,
             factory,
         );
-        current = LogicalPlan::Repeat(RepeatPlanNode {
-            input: Box::new(current),
-            repeat_column_ref_list: repeat_info.repeat_column_ref_list,
-            repeat_column_ref_ids: repeat_info.repeat_column_ref_ids,
-            grouping_ids: repeat_info.grouping_ids,
-            all_rollup_columns: repeat_info.all_rollup_columns,
-            all_rollup_column_ids: repeat_info.all_rollup_column_ids,
-            grouping_key_aliases,
-            grouping_fn_args: repeat_info.grouping_fn_args,
-            grouping_fn_arg_ids: repeat_info.grouping_fn_arg_ids,
-            grouping_fn_ids: repeat_info.grouping_fn_ids,
-            required_output_columns: None,
-        });
+        current = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Repeat(LogicalRepeatNode {
+                repeat_column_ref_list: repeat_info.repeat_column_ref_list,
+                repeat_column_ref_ids: repeat_info.repeat_column_ref_ids,
+                grouping_ids: repeat_info.grouping_ids,
+                all_rollup_columns: repeat_info.all_rollup_columns,
+                all_rollup_column_ids: repeat_info.all_rollup_column_ids,
+                grouping_key_aliases: grouping_key_aliases,
+                grouping_fn_args: repeat_info.grouping_fn_args,
+                grouping_fn_arg_ids: repeat_info.grouping_fn_arg_ids,
+                grouping_fn_ids: repeat_info.grouping_fn_ids,
+            }),
+            vec![current],
+            None,
+        );
     }
 
     if select.has_aggregation || !select.group_by.is_empty() {
@@ -933,14 +960,16 @@ fn plan_select_scoped(
                 select.having.as_ref(),
                 factory,
             );
-        current = LogicalPlan::Aggregate(AggregateNode {
-            input: Box::new(current),
-            group_by: select.group_by,
-            aggregates: agg_calls,
-            output_columns,
-            already_pushed: false,
-            required_output_columns: None,
-        });
+        current = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by: select.group_by,
+                aggregates: agg_calls,
+                output_columns: output_columns,
+                already_pushed: false,
+            }),
+            vec![current],
+            None,
+        );
 
         // HAVING placement: Apply nodes for HAVING-clause scalar subqueries
         // are inserted above the Aggregate and below the HAVING Filter.
@@ -960,11 +989,11 @@ fn plan_select_scoped(
         )?;
 
         if let Some(having) = rewritten_having {
-            current = LogicalPlan::Filter(FilterNode {
-                input: Box::new(current),
-                predicate: having,
-                required_output_columns: None,
-            });
+            current = LogicalPlanNode::new(
+                LogicalPlanNodeKind::Filter(LogicalFilterNode { predicate: having }),
+                vec![current],
+                None,
+            );
         }
 
         // Projection placement (aggregated branch): Apply nodes for
@@ -1011,7 +1040,7 @@ fn plan_select_scoped(
 }
 
 fn prepare_repeat_input(
-    current: &mut LogicalPlan,
+    current: &mut LogicalPlanNode,
     select: &mut ResolvedSelect,
     repeat_info: &mut crate::sql::analysis::RepeatInfo,
     repeat_group_qualifier: &str,
@@ -1147,12 +1176,14 @@ fn prepare_repeat_input(
         })
         .collect();
 
-    *current = LogicalPlan::Project(ProjectNode {
-        input: Box::new(current.clone()),
-        items: project_items,
-        output_qualifier: None,
-        required_output_columns: None,
-    });
+    *current = LogicalPlanNode::new(
+        LogicalPlanNodeKind::Project(LogicalProjectNode {
+            items: project_items,
+            output_qualifier: None,
+        }),
+        vec![current.clone()],
+        None,
+    );
 
     // Apply substitutions to group_by, projection, having so that every
     // place the original rollup-key expression appeared now reads from
@@ -1352,10 +1383,10 @@ fn collect_repeat_input_refs(
 /// Build a deduplication Aggregate for SELECT DISTINCT.
 /// Uses all projection columns as GROUP BY keys with no aggregate functions.
 fn build_distinct(
-    input: LogicalPlan,
+    input: LogicalPlanNode,
     projection: &[ProjectItem],
     factory: &mut ColumnRefFactory,
-) -> LogicalPlan {
+) -> LogicalPlanNode {
     let mut group_by = Vec::new();
     let mut output_columns = Vec::new();
     for item in projection {
@@ -1385,24 +1416,26 @@ fn build_distinct(
             is_internal: false,
         });
     }
-    LogicalPlan::Aggregate(AggregateNode {
-        input: Box::new(input),
-        group_by,
-        aggregates: vec![],
-        output_columns,
-        already_pushed: false,
-        required_output_columns: None,
-    })
+    LogicalPlanNode::new(
+        LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+            group_by: group_by,
+            aggregates: vec![],
+            output_columns: output_columns,
+            already_pushed: false,
+        }),
+        vec![input],
+        None,
+    )
 }
 
 /// Check if an expression contains any WindowCall.
 /// Build Window + Project nodes if the projection contains window functions,
 /// otherwise just a Project node.
 fn build_window_and_project(
-    input: LogicalPlan,
+    input: LogicalPlanNode,
     project_items: Vec<ProjectItem>,
     factory: &mut ColumnRefFactory,
-) -> Result<LogicalPlan, String> {
+) -> Result<LogicalPlanNode, String> {
     let has_window = project_items.iter().any(|item| has_window_call(&item.expr));
     if has_window {
         let mut output_columns = plan_output_columns(&input)?;
@@ -1436,57 +1469,69 @@ fn build_window_and_project(
         let sorted_input = if sort_items.is_empty() || input_already_ordered {
             input
         } else {
-            LogicalPlan::Sort(SortNode {
-                input: Box::new(input),
-                items: sort_items,
-                analytic_partition_by,
-                partition_limit: None,
-                topn_type: None,
-                required_output_columns: None,
-            })
+            LogicalPlanNode::new(
+                LogicalPlanNodeKind::Sort(LogicalSortNode {
+                    items: sort_items,
+                    analytic_partition_by: analytic_partition_by,
+                    partition_limit: None,
+                    topn_type: None,
+                }),
+                vec![input],
+                None,
+            )
         };
 
-        let windowed = LogicalPlan::Window(WindowNode {
-            input: Box::new(sorted_input),
-            window_exprs,
-            output_columns,
-            required_output_columns: None,
-        });
-        Ok(LogicalPlan::Project(ProjectNode {
-            input: Box::new(windowed),
-            items: rewritten_items,
-            output_qualifier: None,
-            required_output_columns: None,
-        }))
+        let windowed = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Window(LogicalWindowNode {
+                window_exprs: window_exprs,
+                output_columns: output_columns,
+            }),
+            vec![sorted_input],
+            None,
+        );
+        Ok(LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: rewritten_items,
+                output_qualifier: None,
+            }),
+            vec![windowed],
+            None,
+        ))
     } else if !project_items.is_empty() {
-        Ok(LogicalPlan::Project(ProjectNode {
-            input: Box::new(input),
-            items: project_items,
-            output_qualifier: None,
-            required_output_columns: None,
-        }))
+        Ok(LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: project_items,
+                output_qualifier: None,
+            }),
+            vec![input],
+            None,
+        ))
     } else {
         Ok(input)
     }
 }
 
 fn logical_plan_satisfies_window_ordering(
-    input: &LogicalPlan,
+    input: &LogicalPlanNode,
     required_items: &[SortItem],
     partition_by: &[TypedExpr],
 ) -> bool {
-    match input {
-        LogicalPlan::Project(project) if project_preserves_column_identity(project) => {
-            logical_plan_satisfies_window_ordering(&project.input, required_items, partition_by)
+    match &input.kind {
+        LogicalPlanNodeKind::Project(project) if project_preserves_column_identity(project) => {
+            logical_plan_satisfies_window_ordering(
+                input.unary_input(),
+                required_items,
+                partition_by,
+            )
         }
-        LogicalPlan::Sort(sort) => {
+        LogicalPlanNodeKind::Sort(sort) => {
             logical_sort_satisfies_window_ordering(sort, required_items, partition_by)
         }
         _ => false,
     }
 }
 
-fn project_preserves_column_identity(project: &ProjectNode) -> bool {
+fn project_preserves_column_identity(project: &LogicalProjectNode) -> bool {
     project.items.iter().all(|item| {
         matches!(
             &item.expr.kind,
@@ -1496,7 +1541,7 @@ fn project_preserves_column_identity(project: &ProjectNode) -> bool {
 }
 
 fn logical_sort_satisfies_window_ordering(
-    sort: &SortNode,
+    sort: &LogicalSortNode,
     required_items: &[SortItem],
     partition_by: &[TypedExpr],
 ) -> bool {
@@ -2905,7 +2950,7 @@ fn plan_relation_scoped(
     relation: Relation,
     cte_registry: &CTERegistry,
     factory: &mut ColumnRefFactory,
-) -> Result<LogicalPlan, String> {
+) -> Result<LogicalPlanNode, String> {
     match relation {
         Relation::Scan(scan) => {
             // G1: reuse the ColumnIds the analyzer already minted for this
@@ -2957,17 +3002,20 @@ fn plan_relation_scoped(
                     is_internal: false,
                 });
             }
-            Ok(LogicalPlan::Scan(ScanNode {
-                database: scan.database,
-                table: scan.table,
-                alias: scan.alias,
-                columns,
-                predicates: vec![],
-                required_columns: None,
-                dict_columns: vec![],
-                variant_columns: vec![],
-                required_output_columns: None,
-            }))
+            Ok(LogicalPlanNode::new(
+                LogicalPlanNodeKind::Scan(LogicalScanNode {
+                    database: scan.database,
+                    table: scan.table,
+                    alias: scan.alias,
+                    columns: columns,
+                    predicates: vec![],
+                    required_columns: None,
+                    dict_columns: vec![],
+                    variant_columns: vec![],
+                }),
+                vec![],
+                None,
+            ))
         }
         Relation::Subquery {
             query,
@@ -3001,49 +3049,58 @@ fn plan_relation_scoped(
                         );
                     }
                     let left = plan_relation_scoped(left, cte_registry, factory)?;
-                    Ok(LogicalPlan::TableFunction(TableFunctionNode {
-                        input: Box::new(left),
-                        function_name: "unnest".to_string(),
-                        args: unnest.args,
-                        output_columns: unnest.output_columns,
-                        alias: unnest.alias,
-                        is_left_join,
-                        required_output_columns: None,
-                    }))
+                    Ok(LogicalPlanNode::new(
+                        LogicalPlanNodeKind::TableFunction(LogicalTableFunctionNode {
+                            function_name: "unnest".to_string(),
+                            args: unnest.args,
+                            output_columns: unnest.output_columns,
+                            alias: unnest.alias,
+                            is_left_join: is_left_join,
+                        }),
+                        vec![left],
+                        None,
+                    ))
                 }
                 right => {
                     let left = plan_relation_scoped(left, cte_registry, factory)?;
                     let right = plan_relation_scoped(right, cte_registry, factory)?;
-                    Ok(LogicalPlan::Join(JoinNode {
-                        left: Box::new(left),
-                        right: Box::new(right),
-                        join_type,
-                        condition,
-                        required_output_columns: None,
-                    }))
+                    Ok(LogicalPlanNode::new(
+                        LogicalPlanNodeKind::Join(LogicalJoinNode {
+                            join_type: join_type,
+                            condition: condition,
+                        }),
+                        vec![left, right],
+                        None,
+                    ))
                 }
             }
         }
-        Relation::GenerateSeries(gs) => Ok(LogicalPlan::GenerateSeries(GenerateSeriesNode {
-            start: gs.start,
-            end: gs.end,
-            step: gs.step,
-            column_name: gs.column_name,
-            alias: gs.alias,
-            output_column_id: gs.output_column_id,
-            required_output_columns: None,
-        })),
+        Relation::GenerateSeries(gs) => Ok(LogicalPlanNode::new(
+            LogicalPlanNodeKind::GenerateSeries(LogicalGenerateSeriesNode {
+                start: gs.start,
+                end: gs.end,
+                step: gs.step,
+                column_name: gs.column_name,
+                alias: gs.alias,
+                output_column_id: gs.output_column_id,
+            }),
+            vec![],
+            None,
+        )),
         Relation::Unnest(_) => Err("UNNEST is currently supported only in LATERAL JOIN".into()),
         Relation::CTEConsume {
             cte_id,
             alias,
             output_columns,
-        } => Ok(LogicalPlan::CTEConsume(CTEConsumeNode {
-            cte_id,
-            alias,
-            output_columns,
-            required_output_columns: None,
-        })),
+        } => Ok(LogicalPlanNode::new(
+            LogicalPlanNodeKind::CTEConsume(LogicalCTEConsumeNode {
+                cte_id: cte_id,
+                alias: alias,
+                output_columns: output_columns,
+            }),
+            vec![],
+            None,
+        )),
         Relation::IcebergMetadataScan(rel) => plan_iceberg_metadata_scan(rel, factory),
         Relation::IcebergDeltaScan(rel) => plan_iceberg_delta_scan(rel, factory),
     }
@@ -3060,7 +3117,7 @@ fn is_lateral_unnest_condition_supported(condition: &Option<TypedExpr>) -> bool 
 }
 
 /// Lower an analyzer-built `IcebergMetadataScanRelation` into a regular
-/// `LogicalPlan::Scan` whose `TableDef` carries the synthetic
+/// `LogicalPlanNodeKind::Scan` whose `TableDef` carries the synthetic
 /// `ScanSource::IcebergMetadataTable` source. The optimizer treats it
 /// like any other Scan; codegen branches on the source variant to emit
 /// an `HDFS_SCAN_NODE` whose lowering wires up the native-Rust
@@ -3069,7 +3126,7 @@ fn is_lateral_unnest_condition_supported(condition: &Option<TypedExpr>) -> bool 
 fn plan_iceberg_metadata_scan(
     rel: IcebergMetadataScanRelation,
     factory: &mut ColumnRefFactory,
-) -> Result<LogicalPlan, String> {
+) -> Result<LogicalPlanNode, String> {
     use crate::sql::analyzer::iceberg_metadata::metadata_table_schema;
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
 
@@ -3145,17 +3202,20 @@ fn plan_iceberg_metadata_scan(
             metadata_payload,
         },
     };
-    Ok(LogicalPlan::Scan(ScanNode {
-        database: rel.database,
-        table: synthetic_table,
-        alias: rel.alias,
-        columns: output_columns,
-        predicates: vec![],
-        required_columns: None,
-        dict_columns: vec![],
-        variant_columns: vec![],
-        required_output_columns: None,
-    }))
+    Ok(LogicalPlanNode::new(
+        LogicalPlanNodeKind::Scan(LogicalScanNode {
+            database: rel.database,
+            table: synthetic_table,
+            alias: rel.alias,
+            columns: output_columns,
+            predicates: vec![],
+            required_columns: None,
+            dict_columns: vec![],
+            variant_columns: vec![],
+        }),
+        vec![],
+        None,
+    ))
 }
 
 #[derive(Default)]
@@ -3283,7 +3343,7 @@ fn build_iceberg_partitions_payload(files: &[IcebergDataFileInfo]) -> Result<Str
 }
 
 /// Lower an analyzer-built `IcebergDeltaScanRelation` into a regular
-/// `LogicalPlan::Scan` whose `TableDef` carries the synthetic
+/// `LogicalPlanNodeKind::Scan` whose `TableDef` carries the synthetic
 /// `ScanSource::IcebergDeltaTable` storage. Codegen recognizes this
 /// storage variant and emits `TPlanNodeType::ICEBERG_DELTA_SCAN_NODE`
 /// (rather than `HDFS_SCAN_NODE`); the lowering layer resolves the
@@ -3291,7 +3351,7 @@ fn build_iceberg_partitions_payload(files: &[IcebergDataFileInfo]) -> Result<Str
 fn plan_iceberg_delta_scan(
     rel: IcebergDeltaScanRelation,
     factory: &mut ColumnRefFactory,
-) -> Result<LogicalPlan, String> {
+) -> Result<LogicalPlanNode, String> {
     use crate::sql::catalog::{ScanSource, TableDef};
 
     // Output schema: base columns + iceberg v3 row-lineage metadata columns.
@@ -3357,17 +3417,20 @@ fn plan_iceberg_delta_scan(
             to_snapshot_id: rel.to_snapshot_id,
         },
     };
-    Ok(LogicalPlan::Scan(ScanNode {
-        database: rel.namespace,
-        table: synthetic_table,
-        alias: rel.alias,
-        columns: output_columns,
-        predicates: vec![],
-        required_columns: None,
-        dict_columns: vec![],
-        variant_columns: vec![],
-        required_output_columns: None,
-    }))
+    Ok(LogicalPlanNode::new(
+        LogicalPlanNodeKind::Scan(LogicalScanNode {
+            database: rel.namespace,
+            table: synthetic_table,
+            alias: rel.alias,
+            columns: output_columns,
+            predicates: vec![],
+            required_columns: None,
+            dict_columns: vec![],
+            variant_columns: vec![],
+        }),
+        vec![],
+        None,
+    ))
 }
 
 fn iceberg_table_info(
@@ -3391,7 +3454,7 @@ fn plan_set_operation_scoped(
     set_op: ResolvedSetOp,
     cte_registry: &CTERegistry,
     factory: &mut ColumnRefFactory,
-) -> Result<LogicalPlan, String> {
+) -> Result<LogicalPlanNode, String> {
     // Build position-aligned output schema before consuming the branches.
     // For each position we widen the type across left/right (matching
     // the analyzer's wider_type logic), keep the left branch ColumnId and
@@ -3418,22 +3481,28 @@ fn plan_set_operation_scoped(
     let right = plan_scoped_query(*set_op.right, cte_registry, factory)?;
 
     match set_op.kind {
-        SetOpKind::Union => Ok(LogicalPlan::Union(UnionNode {
-            inputs: vec![left, right],
-            all: set_op.all,
-            output_columns,
-            required_output_columns: None,
-        })),
-        SetOpKind::Intersect => Ok(LogicalPlan::Intersect(IntersectNode {
-            inputs: vec![left, right],
-            output_columns,
-            required_output_columns: None,
-        })),
-        SetOpKind::Except => Ok(LogicalPlan::Except(ExceptNode {
-            inputs: vec![left, right],
-            output_columns,
-            required_output_columns: None,
-        })),
+        SetOpKind::Union => Ok(LogicalPlanNode::new(
+            LogicalPlanNodeKind::Union(LogicalUnionNode {
+                all: set_op.all,
+                output_columns: output_columns,
+            }),
+            vec![left, right],
+            None,
+        )),
+        SetOpKind::Intersect => Ok(LogicalPlanNode::new(
+            LogicalPlanNodeKind::Intersect(LogicalIntersectNode {
+                output_columns: output_columns,
+            }),
+            vec![left, right],
+            None,
+        )),
+        SetOpKind::Except => Ok(LogicalPlanNode::new(
+            LogicalPlanNodeKind::Except(LogicalExceptNode {
+                output_columns: output_columns,
+            }),
+            vec![left, right],
+            None,
+        )),
     }
 }
 
@@ -3444,19 +3513,23 @@ fn plan_set_operation_scoped(
 fn plan_values(
     values: ResolvedValues,
     _factory: &mut ColumnRefFactory,
-) -> Result<LogicalPlan, String> {
+) -> Result<LogicalPlanNode, String> {
     let columns = values.output_columns;
-    Ok(LogicalPlan::Values(ValuesNode {
-        rows: values.rows,
-        columns,
-        required_output_columns: None,
-    }))
+    Ok(LogicalPlanNode::new(
+        LogicalPlanNodeKind::Values(LogicalValuesNode {
+            rows: values.rows,
+            columns: columns,
+        }),
+        vec![],
+        None,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sql::catalog::{CatalogProvider, ColumnDef, ScanSource, TableDef};
+    use crate::sql::planner::plan::*;
 
     struct TestCatalog;
 
@@ -3625,7 +3698,7 @@ mod tests {
         }
     }
 
-    fn parse_analyze_and_plan(sql: &str) -> Result<LogicalPlan, String> {
+    fn parse_analyze_and_plan(sql: &str) -> Result<LogicalPlanNode, String> {
         let (resolved, cte_registry, mut factory) = parse_analyze_query(sql)?;
         plan_query(resolved, cte_registry, &mut factory)
     }
@@ -3653,108 +3726,69 @@ mod tests {
     }
 
     /// Analyze and plan `sql` with the Apply subquery framework.
-    fn parse_analyze_and_plan_apply(sql: &str) -> Result<LogicalPlan, String> {
+    fn parse_analyze_and_plan_apply(sql: &str) -> Result<LogicalPlanNode, String> {
         let (resolved, cte_registry, mut factory) = parse_analyze_query_apply(sql)?;
         plan_query(resolved, cte_registry, &mut factory)
     }
 
-    fn plan_test_query(sql: &str) -> LogicalPlan {
+    fn plan_test_query(sql: &str) -> LogicalPlanNode {
         parse_analyze_and_plan(sql).expect("planner should succeed")
     }
 
-    fn first_aggregate_calls(plan: &LogicalPlan) -> Vec<AggregateCall> {
-        fn visit(plan: &LogicalPlan) -> Option<Vec<AggregateCall>> {
-            match plan {
-                LogicalPlan::Aggregate(node) => Some(node.aggregates.clone()),
-                LogicalPlan::Filter(node) => visit(&node.input),
-                LogicalPlan::Project(node) => visit(&node.input),
-                LogicalPlan::Join(node) => visit(&node.left).or_else(|| visit(&node.right)),
-                LogicalPlan::Sort(node) => visit(&node.input),
-                LogicalPlan::Limit(node) => visit(&node.input),
-                LogicalPlan::Union(node) => node.inputs.iter().find_map(visit),
-                LogicalPlan::Intersect(node) => node.inputs.iter().find_map(visit),
-                LogicalPlan::Except(node) => node.inputs.iter().find_map(visit),
-                LogicalPlan::TableFunction(node) => visit(&node.input),
-                LogicalPlan::Window(node) => visit(&node.input),
-                LogicalPlan::Repeat(node) => visit(&node.input),
-                LogicalPlan::CTEAnchor(node) => {
-                    visit(&node.consumer).or_else(|| visit(&node.produce))
-                }
-                LogicalPlan::CTEProduce(node) => visit(&node.input),
-                LogicalPlan::Decode(node) => visit(&node.input),
-                LogicalPlan::AggregateStateMerge(node) => {
-                    visit(&node.old_input).or_else(|| visit(&node.delta_input))
-                }
-                LogicalPlan::Apply(node) => visit(&node.left).or_else(|| visit(&node.right)),
-                LogicalPlan::AssertOneRow(node) => visit(&node.input),
-                LogicalPlan::Scan(_)
-                | LogicalPlan::Values(_)
-                | LogicalPlan::GenerateSeries(_)
-                | LogicalPlan::CTEConsume(_)
-                | LogicalPlan::ImvDelta(_)
-                | LogicalPlan::ImvVersion(_) => None,
+    fn first_aggregate_calls(plan: &LogicalPlanNode) -> Vec<AggregateCall> {
+        fn visit(plan: &LogicalPlanNode) -> Option<Vec<AggregateCall>> {
+            match &plan.kind {
+                LogicalPlanNodeKind::Aggregate(node) => Some(node.aggregates.clone()),
+                _ => plan.children.iter().find_map(visit),
             }
         }
 
         visit(plan).unwrap_or_default()
     }
 
-    fn root_project_over_aggregate(plan: &LogicalPlan) -> (&ProjectNode, &AggregateNode) {
-        let LogicalPlan::Project(project) = plan else {
+    fn root_project_over_aggregate(
+        plan: &LogicalPlanNode,
+    ) -> (&LogicalProjectNode, &LogicalAggregateNode) {
+        let LogicalPlanNodeKind::Project(project) = &plan.kind else {
             panic!("expected Project root, got {plan:?}");
         };
-        let LogicalPlan::Aggregate(aggregate) = project.input.as_ref() else {
-            panic!("expected Aggregate under Project, got {:?}", project.input);
+        let LogicalPlanNodeKind::Aggregate(aggregate) = &plan.unary_input().kind else {
+            panic!(
+                "expected Aggregate under Project, got {:?}",
+                plan.unary_input()
+            );
         };
         (project, aggregate)
     }
 
     fn root_project_filter_aggregate(
-        plan: &LogicalPlan,
-    ) -> (&ProjectNode, &FilterNode, &AggregateNode) {
-        let LogicalPlan::Project(project) = plan else {
+        plan: &LogicalPlanNode,
+    ) -> (
+        &LogicalProjectNode,
+        &LogicalFilterNode,
+        &LogicalAggregateNode,
+    ) {
+        let LogicalPlanNodeKind::Project(project) = &plan.kind else {
             panic!("expected Project root, got {plan:?}");
         };
-        let LogicalPlan::Filter(filter) = project.input.as_ref() else {
-            panic!("expected Filter under Project, got {:?}", project.input);
+        let filter_plan = plan.unary_input();
+        let LogicalPlanNodeKind::Filter(filter) = &filter_plan.kind else {
+            panic!("expected Filter under Project, got {:?}", filter_plan);
         };
-        let LogicalPlan::Aggregate(aggregate) = filter.input.as_ref() else {
-            panic!("expected Aggregate under Filter, got {:?}", filter.input);
+        let LogicalPlanNodeKind::Aggregate(aggregate) = &filter_plan.unary_input().kind else {
+            panic!(
+                "expected Aggregate under Filter, got {:?}",
+                filter_plan.unary_input()
+            );
         };
         (project, filter, aggregate)
     }
 
-    fn first_repeat_node(plan: &LogicalPlan) -> &RepeatPlanNode {
-        fn visit(plan: &LogicalPlan) -> Option<&RepeatPlanNode> {
-            match plan {
-                LogicalPlan::Repeat(node) => Some(node),
-                LogicalPlan::Filter(node) => visit(&node.input),
-                LogicalPlan::Project(node) => visit(&node.input),
-                LogicalPlan::Aggregate(node) => visit(&node.input),
-                LogicalPlan::Join(node) => visit(&node.left).or_else(|| visit(&node.right)),
-                LogicalPlan::Sort(node) => visit(&node.input),
-                LogicalPlan::Limit(node) => visit(&node.input),
-                LogicalPlan::Union(node) => node.inputs.iter().find_map(visit),
-                LogicalPlan::Intersect(node) => node.inputs.iter().find_map(visit),
-                LogicalPlan::Except(node) => node.inputs.iter().find_map(visit),
-                LogicalPlan::TableFunction(node) => visit(&node.input),
-                LogicalPlan::Window(node) => visit(&node.input),
-                LogicalPlan::CTEAnchor(node) => {
-                    visit(&node.consumer).or_else(|| visit(&node.produce))
-                }
-                LogicalPlan::CTEProduce(node) => visit(&node.input),
-                LogicalPlan::Decode(node) => visit(&node.input),
-                LogicalPlan::AggregateStateMerge(node) => {
-                    visit(&node.old_input).or_else(|| visit(&node.delta_input))
-                }
-                LogicalPlan::Apply(node) => visit(&node.left).or_else(|| visit(&node.right)),
-                LogicalPlan::AssertOneRow(node) => visit(&node.input),
-                LogicalPlan::Scan(_)
-                | LogicalPlan::Values(_)
-                | LogicalPlan::GenerateSeries(_)
-                | LogicalPlan::CTEConsume(_)
-                | LogicalPlan::ImvDelta(_)
-                | LogicalPlan::ImvVersion(_) => None,
+    fn first_repeat_node(plan: &LogicalPlanNode) -> (&LogicalPlanNode, &LogicalRepeatNode) {
+        fn visit(plan: &LogicalPlanNode) -> Option<(&LogicalPlanNode, &LogicalRepeatNode)> {
+            match &plan.kind {
+                LogicalPlanNodeKind::Repeat(node) => Some((plan, node)),
+                _ => plan.children.iter().find_map(visit),
             }
         }
 
@@ -3768,30 +3802,36 @@ mod tests {
         *column_id
     }
 
-    fn root_project_over_window(plan: &LogicalPlan) -> (&ProjectNode, &WindowNode) {
-        let LogicalPlan::Project(project) = plan else {
+    fn root_project_over_window(
+        plan: &LogicalPlanNode,
+    ) -> (&LogicalProjectNode, &LogicalWindowNode) {
+        let LogicalPlanNodeKind::Project(project) = &plan.kind else {
             panic!("expected Project root, got {plan:?}");
         };
-        let LogicalPlan::Window(window) = project.input.as_ref() else {
-            panic!("expected Window under Project, got {:?}", project.input);
+        let LogicalPlanNodeKind::Window(window) = &plan.unary_input().kind else {
+            panic!(
+                "expected Window under Project, got {:?}",
+                plan.unary_input()
+            );
         };
         (project, window)
     }
 
     fn root_strip_sort_inner_project(
-        plan: &LogicalPlan,
-    ) -> (&ProjectNode, &SortNode, &ProjectNode) {
-        let LogicalPlan::Project(outer_proj) = plan else {
+        plan: &LogicalPlanNode,
+    ) -> (&LogicalProjectNode, &LogicalSortNode, &LogicalProjectNode) {
+        let LogicalPlanNodeKind::Project(outer_proj) = &plan.kind else {
             panic!("expected outer strip Project, got {plan:?}");
         };
-        let LogicalPlan::Sort(sort) = outer_proj.input.as_ref() else {
-            panic!(
-                "expected Sort under outer Project, got {:?}",
-                outer_proj.input
-            );
+        let sort_plan = plan.unary_input();
+        let LogicalPlanNodeKind::Sort(sort) = &sort_plan.kind else {
+            panic!("expected Sort under outer Project, got {:?}", sort_plan);
         };
-        let LogicalPlan::Project(inner_proj) = sort.input.as_ref() else {
-            panic!("expected inner Project under Sort, got {:?}", sort.input);
+        let LogicalPlanNodeKind::Project(inner_proj) = &sort_plan.unary_input().kind else {
+            panic!(
+                "expected inner Project under Sort, got {:?}",
+                sort_plan.unary_input()
+            );
         };
         (outer_proj, sort, inner_proj)
     }
@@ -3809,81 +3849,29 @@ mod tests {
         *column_id
     }
 
-    fn first_window_exprs(plan: &LogicalPlan) -> Vec<WindowExpr> {
-        fn visit(plan: &LogicalPlan) -> Option<Vec<WindowExpr>> {
-            match plan {
-                LogicalPlan::Window(node) => Some(node.window_exprs.clone()),
-                LogicalPlan::Filter(node) => visit(&node.input),
-                LogicalPlan::Project(node) => visit(&node.input),
-                LogicalPlan::Aggregate(node) => visit(&node.input),
-                LogicalPlan::Join(node) => visit(&node.left).or_else(|| visit(&node.right)),
-                LogicalPlan::Sort(node) => visit(&node.input),
-                LogicalPlan::Limit(node) => visit(&node.input),
-                LogicalPlan::Union(node) => node.inputs.iter().find_map(visit),
-                LogicalPlan::Intersect(node) => node.inputs.iter().find_map(visit),
-                LogicalPlan::Except(node) => node.inputs.iter().find_map(visit),
-                LogicalPlan::TableFunction(node) => visit(&node.input),
-                LogicalPlan::Repeat(node) => visit(&node.input),
-                LogicalPlan::CTEAnchor(node) => {
-                    visit(&node.consumer).or_else(|| visit(&node.produce))
-                }
-                LogicalPlan::CTEProduce(node) => visit(&node.input),
-                LogicalPlan::Decode(node) => visit(&node.input),
-                LogicalPlan::AggregateStateMerge(node) => {
-                    visit(&node.old_input).or_else(|| visit(&node.delta_input))
-                }
-                LogicalPlan::Apply(node) => visit(&node.left).or_else(|| visit(&node.right)),
-                LogicalPlan::AssertOneRow(node) => visit(&node.input),
-                LogicalPlan::Scan(_)
-                | LogicalPlan::Values(_)
-                | LogicalPlan::GenerateSeries(_)
-                | LogicalPlan::CTEConsume(_)
-                | LogicalPlan::ImvDelta(_)
-                | LogicalPlan::ImvVersion(_) => None,
+    fn first_window_exprs(plan: &LogicalPlanNode) -> Vec<WindowExpr> {
+        fn visit(plan: &LogicalPlanNode) -> Option<Vec<WindowExpr>> {
+            match &plan.kind {
+                LogicalPlanNodeKind::Window(node) => Some(node.window_exprs.clone()),
+                _ => plan.children.iter().find_map(visit),
             }
         }
 
         visit(plan).unwrap_or_default()
     }
 
-    fn first_window_output_columns(plan: &LogicalPlan) -> Vec<OutputColumn> {
-        fn visit(plan: &LogicalPlan) -> Option<Vec<OutputColumn>> {
-            match plan {
-                LogicalPlan::Window(node) => Some(node.output_columns.clone()),
-                LogicalPlan::Filter(node) => visit(&node.input),
-                LogicalPlan::Project(node) => visit(&node.input),
-                LogicalPlan::Aggregate(node) => visit(&node.input),
-                LogicalPlan::Join(node) => visit(&node.left).or_else(|| visit(&node.right)),
-                LogicalPlan::Sort(node) => visit(&node.input),
-                LogicalPlan::Limit(node) => visit(&node.input),
-                LogicalPlan::Union(node) => node.inputs.iter().find_map(visit),
-                LogicalPlan::Intersect(node) => node.inputs.iter().find_map(visit),
-                LogicalPlan::Except(node) => node.inputs.iter().find_map(visit),
-                LogicalPlan::TableFunction(node) => visit(&node.input),
-                LogicalPlan::Repeat(node) => visit(&node.input),
-                LogicalPlan::CTEAnchor(node) => {
-                    visit(&node.consumer).or_else(|| visit(&node.produce))
-                }
-                LogicalPlan::CTEProduce(node) => visit(&node.input),
-                LogicalPlan::Decode(node) => visit(&node.input),
-                LogicalPlan::AggregateStateMerge(node) => {
-                    visit(&node.old_input).or_else(|| visit(&node.delta_input))
-                }
-                LogicalPlan::Apply(node) => visit(&node.left).or_else(|| visit(&node.right)),
-                LogicalPlan::AssertOneRow(node) => visit(&node.input),
-                LogicalPlan::Scan(_)
-                | LogicalPlan::Values(_)
-                | LogicalPlan::GenerateSeries(_)
-                | LogicalPlan::CTEConsume(_)
-                | LogicalPlan::ImvDelta(_)
-                | LogicalPlan::ImvVersion(_) => None,
+    fn first_window_output_columns(plan: &LogicalPlanNode) -> Vec<OutputColumn> {
+        fn visit(plan: &LogicalPlanNode) -> Option<Vec<OutputColumn>> {
+            match &plan.kind {
+                LogicalPlanNodeKind::Window(node) => Some(node.output_columns.clone()),
+                _ => plan.children.iter().find_map(visit),
             }
         }
 
         visit(plan).unwrap_or_default()
     }
 
-    fn assert_window_expr_ids_are_real_unique_and_backed_by_output_columns(plan: &LogicalPlan) {
+    fn assert_window_expr_ids_are_real_unique_and_backed_by_output_columns(plan: &LogicalPlanNode) {
         let wins = first_window_exprs(plan);
         let output_columns = first_window_output_columns(plan);
         assert!(!wins.is_empty(), "expected at least one WindowExpr");
@@ -3908,7 +3896,7 @@ mod tests {
             );
             assert!(
                 output_ids.contains(&w.output_column_id),
-                "WindowExpr {} output_column_id {} missing from WindowNode.output_columns",
+                "WindowExpr {} output_column_id {} missing from LogicalWindowNode.output_columns",
                 w.output_name,
                 w.output_column_id
             );
@@ -3931,35 +3919,35 @@ mod tests {
             .unwrap_or_else(|| panic!("missing visible Window output column {name}"))
     }
 
-    fn strip_project_sort_limit(plan: &LogicalPlan) -> &LogicalPlan {
-        match plan {
-            LogicalPlan::Project(node) => strip_project_sort_limit(&node.input),
-            LogicalPlan::Sort(node) => strip_project_sort_limit(&node.input),
-            LogicalPlan::Limit(node) => strip_project_sort_limit(&node.input),
-            other => other,
+    fn strip_project_sort_limit(plan: &LogicalPlanNode) -> &LogicalPlanNode {
+        match &plan.kind {
+            LogicalPlanNodeKind::Project(_)
+            | LogicalPlanNodeKind::Sort(_)
+            | LogicalPlanNodeKind::Limit(_) => strip_project_sort_limit(plan.unary_input()),
+            _ => plan,
         }
     }
 
-    fn unwrap_project_input(plan: &LogicalPlan) -> &LogicalPlan {
+    fn unwrap_project_input(plan: &LogicalPlanNode) -> &LogicalPlanNode {
         // Peel any chain of Project adapters to reach the underlying logical
         // node. Besides the outer identity adapter, a subquery alias is now
         // represented as a Project carrying `output_qualifier` (added by the
         // predicate-pushdown work), so more than one Project layer may sit
         // above the set-op.
         let mut current = plan;
-        while let LogicalPlan::Project(project) = current {
-            current = project.input.as_ref();
+        while let LogicalPlanNodeKind::Project(_) = &current.kind {
+            current = current.unary_input();
         }
         current
     }
 
     fn contains_identity_project_adapter(
-        plan: &LogicalPlan,
+        plan: &LogicalPlanNode,
         source_column: &str,
         output_name: &str,
     ) -> bool {
-        match plan {
-            LogicalPlan::Project(project) => {
+        match &plan.kind {
+            LogicalPlanNodeKind::Project(project) => {
                 project.items.iter().any(|item| {
                     item.output_name == output_name
                         && matches!(
@@ -3967,35 +3955,34 @@ mod tests {
                             ExprKind::ColumnRef { column_id, column, .. }
                                 if column == source_column && item.output_column_id == *column_id
                         )
-                }) || contains_identity_project_adapter(&project.input, source_column, output_name)
+                }) || plan.children.iter().any(|child| {
+                    contains_identity_project_adapter(child, source_column, output_name)
+                })
             }
-            LogicalPlan::Filter(node) => {
-                contains_identity_project_adapter(&node.input, source_column, output_name)
-            }
-            LogicalPlan::Sort(node) => {
-                contains_identity_project_adapter(&node.input, source_column, output_name)
-            }
-            LogicalPlan::Limit(node) => {
-                contains_identity_project_adapter(&node.input, source_column, output_name)
-            }
-            _ => false,
+            _ => plan
+                .children
+                .iter()
+                .any(|child| contains_identity_project_adapter(child, source_column, output_name)),
         }
     }
 
     #[test]
     fn adapt_plan_output_passthrough_when_outputs_match() {
         let source_id = ColumnId::new_for_test(10);
-        let input = LogicalPlan::Values(ValuesNode {
-            rows: vec![],
-            columns: vec![OutputColumn {
-                column_id: source_id,
-                name: "k".to_string(),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
-                is_internal: false,
-            }],
-            required_output_columns: None,
-        });
+        let input = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Values(LogicalValuesNode {
+                rows: vec![],
+                columns: vec![OutputColumn {
+                    column_id: source_id,
+                    name: "k".to_string(),
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: false,
+                    is_internal: false,
+                }],
+            }),
+            vec![],
+            None,
+        );
         let target = vec![OutputColumn {
             column_id: source_id,
             name: "k".to_string(),
@@ -4005,24 +3992,27 @@ mod tests {
         }];
 
         let adapted = adapt_plan_output(input, &target).expect("adapter should succeed");
-        assert!(matches!(adapted, LogicalPlan::Values(_)));
+        assert!(matches!(&adapted.kind, LogicalPlanNodeKind::Values(_)));
     }
 
     #[test]
     fn adapt_plan_output_renames_and_rebinds_with_project() {
         let source_id = ColumnId::new_for_test(10);
         let target_id = ColumnId::new_for_test(20);
-        let input = LogicalPlan::Values(ValuesNode {
-            rows: vec![],
-            columns: vec![OutputColumn {
-                column_id: source_id,
-                name: "k".to_string(),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
-                is_internal: false,
-            }],
-            required_output_columns: None,
-        });
+        let input = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Values(LogicalValuesNode {
+                rows: vec![],
+                columns: vec![OutputColumn {
+                    column_id: source_id,
+                    name: "k".to_string(),
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: false,
+                    is_internal: false,
+                }],
+            }),
+            vec![],
+            None,
+        );
         let target = vec![OutputColumn {
             column_id: target_id,
             name: "alias_k".to_string(),
@@ -4032,7 +4022,7 @@ mod tests {
         }];
 
         let adapted = adapt_plan_output(input, &target).expect("adapter should succeed");
-        let LogicalPlan::Project(project) = adapted else {
+        let LogicalPlanNodeKind::Project(project) = &adapted.kind else {
             panic!("expected Project adapter");
         };
         assert_eq!(project.items.len(), 1);
@@ -4052,17 +4042,20 @@ mod tests {
     fn adapt_plan_output_with_qualifier_preserves_cte_alias_lookup() {
         let source_id = ColumnId::new_for_test(10);
         let target_id = ColumnId::new_for_test(20);
-        let input = LogicalPlan::Values(ValuesNode {
-            rows: vec![],
-            columns: vec![OutputColumn {
-                column_id: source_id,
-                name: "k1".to_string(),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
-                is_internal: false,
-            }],
-            required_output_columns: None,
-        });
+        let input = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Values(LogicalValuesNode {
+                rows: vec![],
+                columns: vec![OutputColumn {
+                    column_id: source_id,
+                    name: "k1".to_string(),
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: false,
+                    is_internal: false,
+                }],
+            }),
+            vec![],
+            None,
+        );
         let target = vec![OutputColumn {
             column_id: target_id,
             name: "k1".to_string(),
@@ -4073,7 +4066,7 @@ mod tests {
 
         let adapted = adapt_plan_output_with_qualifier(input, &target, Some("w1"))
             .expect("adapter should succeed");
-        let LogicalPlan::Project(project) = adapted else {
+        let LogicalPlanNodeKind::Project(project) = &adapted.kind else {
             panic!("expected Project adapter");
         };
         assert_eq!(project.items[0].output_column_id, target_id);
@@ -4094,17 +4087,20 @@ mod tests {
     #[test]
     fn adapt_plan_output_with_qualifier_inserts_project_when_outputs_match() {
         let source_id = ColumnId::new_for_test(10);
-        let input = LogicalPlan::Values(ValuesNode {
-            rows: vec![],
-            columns: vec![OutputColumn {
-                column_id: source_id,
-                name: "rnk".to_string(),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
-                is_internal: false,
-            }],
-            required_output_columns: None,
-        });
+        let input = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Values(LogicalValuesNode {
+                rows: vec![],
+                columns: vec![OutputColumn {
+                    column_id: source_id,
+                    name: "rnk".to_string(),
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: false,
+                    is_internal: false,
+                }],
+            }),
+            vec![],
+            None,
+        );
         let target = vec![OutputColumn {
             column_id: source_id,
             name: "rnk".to_string(),
@@ -4115,7 +4111,7 @@ mod tests {
 
         let adapted = adapt_plan_output_with_qualifier(input, &target, Some("asceding"))
             .expect("adapter should insert alias project");
-        let LogicalPlan::Project(project) = adapted else {
+        let LogicalPlanNodeKind::Project(project) = &adapted.kind else {
             panic!("expected Project adapter for qualified subquery output");
         };
         assert_eq!(project.items[0].output_name, "rnk");
@@ -4137,17 +4133,20 @@ mod tests {
     fn adapt_plan_output_allows_nullable_widening() {
         let source_id = ColumnId::new_for_test(10);
         let target_id = ColumnId::new_for_test(20);
-        let input = LogicalPlan::Values(ValuesNode {
-            rows: vec![],
-            columns: vec![OutputColumn {
-                column_id: source_id,
-                name: "k".to_string(),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
-                is_internal: false,
-            }],
-            required_output_columns: None,
-        });
+        let input = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Values(LogicalValuesNode {
+                rows: vec![],
+                columns: vec![OutputColumn {
+                    column_id: source_id,
+                    name: "k".to_string(),
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: false,
+                    is_internal: false,
+                }],
+            }),
+            vec![],
+            None,
+        );
         let target = vec![OutputColumn {
             column_id: target_id,
             name: "nullable_k".to_string(),
@@ -4157,7 +4156,7 @@ mod tests {
         }];
 
         let adapted = adapt_plan_output(input, &target).expect("adapter should widen nullability");
-        let LogicalPlan::Project(project) = adapted else {
+        let LogicalPlanNodeKind::Project(project) = &adapted.kind else {
             panic!("expected Project adapter");
         };
         assert_eq!(project.items.len(), 1);
@@ -4167,17 +4166,20 @@ mod tests {
 
     #[test]
     fn adapt_plan_output_rejects_nullable_narrowing() {
-        let input = LogicalPlan::Values(ValuesNode {
-            rows: vec![],
-            columns: vec![OutputColumn {
-                column_id: ColumnId::new_for_test(10),
-                name: "k".to_string(),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: true,
-                is_internal: false,
-            }],
-            required_output_columns: None,
-        });
+        let input = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Values(LogicalValuesNode {
+                rows: vec![],
+                columns: vec![OutputColumn {
+                    column_id: ColumnId::new_for_test(10),
+                    name: "k".to_string(),
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: true,
+                    is_internal: false,
+                }],
+            }),
+            vec![],
+            None,
+        );
         let target = vec![OutputColumn {
             column_id: ColumnId::new_for_test(20),
             name: "not_null_k".to_string(),
@@ -4196,11 +4198,14 @@ mod tests {
 
     #[test]
     fn adapt_plan_output_rejects_shape_mismatch() {
-        let input = LogicalPlan::Values(ValuesNode {
-            rows: vec![],
-            columns: vec![],
-            required_output_columns: None,
-        });
+        let input = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Values(LogicalValuesNode {
+                rows: vec![],
+                columns: vec![],
+            }),
+            vec![],
+            None,
+        );
         let target = vec![OutputColumn {
             column_id: ColumnId::new_for_test(20),
             name: "alias_k".to_string(),
@@ -4224,10 +4229,13 @@ mod tests {
         )
         .expect("planner should succeed");
 
-        match plan {
-            LogicalPlan::CTEAnchor(anchor) => {
+        match &plan.kind {
+            LogicalPlanNodeKind::CTEAnchor(anchor) => {
                 assert_eq!(anchor.cte_id, 0);
-                assert!(matches!(*anchor.produce, LogicalPlan::CTEProduce(_)));
+                assert!(matches!(
+                    &plan.child(0).kind,
+                    LogicalPlanNodeKind::CTEProduce(_)
+                ));
             }
             other => panic!("expected CTEAnchor, got {other:?}"),
         }
@@ -4609,7 +4617,7 @@ mod tests {
                 .output_columns
                 .iter()
                 .any(|col| col.column_id == passthrough_id),
-            "WindowNode output_columns must expose child passthrough ColumnIds"
+            "LogicalWindowNode output_columns must expose child passthrough ColumnIds"
         );
         let rn = window_expr_by_function_name(&window.window_exprs, "row_number");
         assert!(
@@ -4617,7 +4625,7 @@ mod tests {
                 .output_columns
                 .iter()
                 .any(|col| col.column_id == rn.output_column_id),
-            "WindowNode output_columns must include window result ColumnIds"
+            "LogicalWindowNode output_columns must include window result ColumnIds"
         );
     }
 
@@ -4668,9 +4676,9 @@ mod tests {
         )
         .expect("planner should succeed");
 
-        match plan {
-            LogicalPlan::CTEAnchor(anchor_a) => match *anchor_a.consumer {
-                LogicalPlan::CTEAnchor(anchor_b) => {
+        match &plan.kind {
+            LogicalPlanNodeKind::CTEAnchor(anchor_a) => match &plan.child(1).kind {
+                LogicalPlanNodeKind::CTEAnchor(anchor_b) => {
                     assert_eq!(anchor_a.cte_id, 0);
                     assert_eq!(anchor_b.cte_id, 1);
                 }
@@ -4685,9 +4693,9 @@ mod tests {
         let plan = parse_analyze_and_plan("SELECT sum_map(m)[1] FROM maps")
             .expect("planner should succeed");
 
-        match plan {
-            LogicalPlan::Project(project) => match *project.input {
-                LogicalPlan::Aggregate(agg) => {
+        match &plan.kind {
+            LogicalPlanNodeKind::Project(_) => match &plan.unary_input().kind {
+                LogicalPlanNodeKind::Aggregate(agg) => {
                     assert_eq!(agg.aggregates.len(), 1);
                     assert_eq!(agg.aggregates[0].name, "sum_map");
                 }
@@ -4704,10 +4712,10 @@ mod tests {
         )
         .expect("planner should succeed");
 
-        let LogicalPlan::Sort(sort) = plan else {
+        let LogicalPlanNodeKind::Sort(sort) = &plan.kind else {
             panic!("expected Sort root");
         };
-        let LogicalPlan::Project(project) = *sort.input else {
+        let LogicalPlanNodeKind::Project(project) = &plan.unary_input().kind else {
             panic!("expected Project under Sort");
         };
         let ExprKind::ColumnRef {
@@ -4762,12 +4770,12 @@ mod tests {
         )
         .expect("planner should succeed");
 
-        match plan {
-            LogicalPlan::CTEAnchor(outer_anchor) => {
+        match &plan.kind {
+            LogicalPlanNodeKind::CTEAnchor(outer_anchor) => {
                 assert_eq!(outer_anchor.cte_id, 0);
-                let subquery_input = strip_project_sort_limit(&outer_anchor.consumer);
-                match subquery_input {
-                    LogicalPlan::CTEAnchor(inner_anchor) => {
+                let subquery_input = strip_project_sort_limit(plan.child(1));
+                match &subquery_input.kind {
+                    LogicalPlanNodeKind::CTEAnchor(inner_anchor) => {
                         assert_eq!(inner_anchor.cte_id, 1);
                     }
                     other => panic!("expected inner CTEAnchor inside subquery, got {other:?}"),
@@ -4786,12 +4794,12 @@ mod tests {
         )
         .expect("planner should succeed");
 
-        match plan {
-            LogicalPlan::CTEAnchor(outer_anchor) => {
+        match &plan.kind {
+            LogicalPlanNodeKind::CTEAnchor(outer_anchor) => {
                 assert_eq!(outer_anchor.cte_id, 1);
-                match *outer_anchor.produce {
-                    LogicalPlan::CTEProduce(outer_produce) => match *outer_produce.input {
-                        LogicalPlan::CTEAnchor(inner_anchor) => {
+                match &plan.child(0).kind {
+                    LogicalPlanNodeKind::CTEProduce(_) => match &plan.child(0).unary_input().kind {
+                        LogicalPlanNodeKind::CTEAnchor(inner_anchor) => {
                             assert_eq!(inner_anchor.cte_id, 0);
                         }
                         other => {
@@ -4889,11 +4897,11 @@ mod tests {
         )
         .expect("planner should succeed");
 
-        match plan {
-            LogicalPlan::Union(node) => {
-                assert_eq!(node.inputs.len(), 2);
-                match &node.inputs[1] {
-                    LogicalPlan::CTEAnchor(anchor) => assert_eq!(anchor.cte_id, 0),
+        match &plan.kind {
+            LogicalPlanNodeKind::Union(_) => {
+                assert_eq!(plan.children.len(), 2);
+                match &plan.child(1).kind {
+                    LogicalPlanNodeKind::CTEAnchor(anchor) => assert_eq!(anchor.cte_id, 0),
                     other => {
                         panic!("expected branch-local CTEAnchor in union input, got {other:?}")
                     }
@@ -4929,7 +4937,7 @@ mod tests {
         );
     }
 
-    /// Regression test for the ColumnId-correctness bug where UnionNode.output_columns
+    /// Regression test for the ColumnId-correctness bug where LogicalUnionNode.output_columns
     /// carried left-branch ColumnIds instead of the fresh set-op output ColumnIds.
     #[test]
     fn output_columns_carry_fresh_set_op_ids() {
@@ -4949,8 +4957,8 @@ mod tests {
             "set-op derived table must not create alias operator: {debug}"
         );
 
-        let union_node = match unwrap_project_input(&plan) {
-            LogicalPlan::Union(n) => n,
+        let union_node = match &unwrap_project_input(&plan).kind {
+            LogicalPlanNodeKind::Union(n) => n,
             other => panic!("expected Union below adapter, got {other:?}"),
         };
         let visible_columns = plan_output_columns(&plan).expect("plan output should be known");
@@ -4993,9 +5001,9 @@ mod tests {
             );
 
             let visible_columns = plan_output_columns(&plan).expect("plan output should be known");
-            let set_op_cols = match unwrap_project_input(&plan) {
-                LogicalPlan::Intersect(n) => &n.output_columns,
-                LogicalPlan::Except(n) => &n.output_columns,
+            let set_op_cols = match &unwrap_project_input(&plan).kind {
+                LogicalPlanNodeKind::Intersect(n) => &n.output_columns,
+                LogicalPlanNodeKind::Except(n) => &n.output_columns,
                 other => panic!("expected Intersect/Except below adapter, got {other:?}"),
             };
 
@@ -5038,14 +5046,14 @@ mod tests {
             .expect("planner should succeed");
 
         // Expected shape: Aggregate(group_by=[ColumnRef(cid)]) <- Project(item.output_column_id=cid)
-        let (agg_group_by_cid, inner_proj_output_cid) = match &plan {
-            LogicalPlan::Aggregate(agg) => {
+        let (agg_group_by_cid, inner_proj_output_cid) = match &plan.kind {
+            LogicalPlanNodeKind::Aggregate(agg) => {
                 let gb_cid = match &agg.group_by[0].kind {
                     ExprKind::ColumnRef { column_id, .. } => *column_id,
                     other => panic!("expected ColumnRef group_by, got {other:?}"),
                 };
-                let inner_proj = match agg.input.as_ref() {
-                    LogicalPlan::Project(p) => p,
+                let inner_proj = match &plan.unary_input().kind {
+                    LogicalPlanNodeKind::Project(p) => p,
                     other => panic!("expected Project under Aggregate, got {other:?}"),
                 };
                 let item_cid = inner_proj.items[0].output_column_id;
@@ -5096,8 +5104,8 @@ mod tests {
 
         // Walk down to find the outer and inner Projects.
         // Shape: outer-Project? <- Sort <- inner-Project <- Scan
-        let outer_proj = match &plan {
-            LogicalPlan::Project(p) => p,
+        let outer_proj = match &plan.kind {
+            LogicalPlanNodeKind::Project(p) => p,
             other => {
                 // If there is no outer Project (no extra items triggered), skip.
                 // The test is only meaningful when the strip-projection was built.
@@ -5109,9 +5117,10 @@ mod tests {
             }
         };
 
-        let inner_proj = match outer_proj.input.as_ref() {
-            LogicalPlan::Sort(s) => match s.input.as_ref() {
-                LogicalPlan::Project(p) => p,
+        let sort_plan = plan.unary_input();
+        let inner_proj = match &sort_plan.kind {
+            LogicalPlanNodeKind::Sort(_) => match &sort_plan.unary_input().kind {
+                LogicalPlanNodeKind::Project(p) => p,
                 other => panic!("expected inner Project under Sort, got {other:?}"),
             },
             other => panic!("expected Sort under outer Project, got {other:?}"),
@@ -5159,16 +5168,17 @@ mod tests {
         )
         .expect("planner should succeed");
 
-        let outer_proj = match &plan {
-            LogicalPlan::Project(p) => p,
+        let outer_proj = match &plan.kind {
+            LogicalPlanNodeKind::Project(p) => p,
             other => panic!("expected outer strip Project, got {other:?}"),
         };
-        let sort = match outer_proj.input.as_ref() {
-            LogicalPlan::Sort(s) => s,
+        let sort_plan = plan.unary_input();
+        let sort = match &sort_plan.kind {
+            LogicalPlanNodeKind::Sort(s) => s,
             other => panic!("expected Sort under outer Project, got {other:?}"),
         };
-        let inner_proj = match sort.input.as_ref() {
-            LogicalPlan::Project(p) => p,
+        let inner_proj = match &sort_plan.unary_input().kind {
+            LogicalPlanNodeKind::Project(p) => p,
             other => panic!("expected inner Project under Sort, got {other:?}"),
         };
 
@@ -5202,12 +5212,12 @@ mod tests {
             parse_analyze_and_plan("SELECT o_orderkey * 2 AS revenue FROM orders ORDER BY revenue")
                 .expect("planner should succeed");
 
-        let sort = match &plan {
-            LogicalPlan::Sort(s) => s,
+        let sort = match &plan.kind {
+            LogicalPlanNodeKind::Sort(s) => s,
             other => panic!("expected Sort root, got {other:?}"),
         };
-        let project = match sort.input.as_ref() {
-            LogicalPlan::Project(p) => p,
+        let project = match &plan.unary_input().kind {
+            LogicalPlanNodeKind::Project(p) => p,
             other => panic!("expected Project under Sort, got {other:?}"),
         };
         let project_output_id = project.items[0].output_column_id;
@@ -5236,16 +5246,17 @@ mod tests {
             parse_analyze_and_plan("SELECT o_orderkey AS x FROM orders ORDER BY x, o_custkey")
                 .expect("planner should succeed");
 
-        let outer_proj = match &plan {
-            LogicalPlan::Project(p) => p,
+        let outer_proj = match &plan.kind {
+            LogicalPlanNodeKind::Project(p) => p,
             other => panic!("expected outer strip Project, got {other:?}"),
         };
-        let sort = match outer_proj.input.as_ref() {
-            LogicalPlan::Sort(s) => s,
+        let sort_plan = plan.unary_input();
+        let sort = match &sort_plan.kind {
+            LogicalPlanNodeKind::Sort(s) => s,
             other => panic!("expected Sort under outer Project, got {other:?}"),
         };
-        let inner_proj = match sort.input.as_ref() {
-            LogicalPlan::Project(p) => p,
+        let inner_proj = match &sort_plan.unary_input().kind {
+            LogicalPlanNodeKind::Project(p) => p,
             other => panic!("expected inner Project under Sort, got {other:?}"),
         };
 
@@ -5278,8 +5289,9 @@ mod tests {
                 .expect("planner should succeed");
 
         let (_, _, inner_proj) = root_strip_sort_inner_project(&plan);
-        let child_output_columns =
-            plan_output_columns(&inner_proj.input).expect("VALUES child output should be known");
+        let inner_proj_plan = plan.unary_input().unary_input();
+        let child_output_columns = plan_output_columns(inner_proj_plan.unary_input())
+            .expect("VALUES child output should be known");
         assert_eq!(
             child_output_columns.len(),
             2,
@@ -5311,7 +5323,8 @@ mod tests {
         .expect("planner should succeed");
 
         let (_, _, inner_proj) = root_strip_sort_inner_project(&plan);
-        let child_output_columns = plan_output_columns(&inner_proj.input)
+        let inner_proj_plan = plan.unary_input().unary_input();
+        let child_output_columns = plan_output_columns(inner_proj_plan.unary_input())
             .expect("GenerateSeries child output should be known");
         assert_eq!(
             child_output_columns.len(),
@@ -5343,13 +5356,13 @@ mod tests {
         let analyzer_output_columns = resolved.output_columns.clone();
         let plan =
             plan_query(resolved, cte_registry, &mut factory).expect("planner should succeed");
-        let LogicalPlan::Values(values) = plan else {
+        let LogicalPlanNodeKind::Values(values) = &plan.kind else {
             panic!("expected Values root");
         };
         assert_eq!(
             values.columns.len(),
             analyzer_output_columns.len(),
-            "ValuesNode should expose the analyzer output columns"
+            "LogicalValuesNode should expose the analyzer output columns"
         );
         for (value_column, analyzer_column) in
             values.columns.iter().zip(analyzer_output_columns.iter())
@@ -5361,7 +5374,7 @@ mod tests {
             );
             assert_eq!(
                 value_column.column_id, analyzer_column.column_id,
-                "ValuesNode column id must reuse the analyzer query output id"
+                "LogicalValuesNode column id must reuse the analyzer query output id"
             );
         }
     }
@@ -5370,11 +5383,11 @@ mod tests {
     fn p2_generate_series_output_has_column_id_through_planner() {
         let plan = parse_analyze_and_plan("SELECT x FROM TABLE(generate_series(1, 3, 1)) AS gs(x)")
             .expect("planner should succeed");
-        let LogicalPlan::Project(project) = &plan else {
+        let LogicalPlanNodeKind::Project(project) = &plan.kind else {
             panic!("expected Project root, got {plan:?}");
         };
-        let child_output_columns =
-            plan_output_columns(&project.input).expect("generate_series output should be known");
+        let child_output_columns = plan_output_columns(plan.unary_input())
+            .expect("generate_series output should be known");
         assert_eq!(
             child_output_columns.len(),
             1,
@@ -5403,18 +5416,18 @@ mod tests {
     fn p2_base_scan_row_lineage_metadata_preserves_column_id_through_planner() {
         let plan = parse_analyze_and_plan("SELECT _row_id FROM iv_orders AS t")
             .expect("planner should succeed");
-        let LogicalPlan::Project(project) = &plan else {
+        let LogicalPlanNodeKind::Project(project) = &plan.kind else {
             panic!("expected Project root, got {plan:?}");
         };
-        let LogicalPlan::Scan(scan) = project.input.as_ref() else {
-            panic!("expected Scan under Project, got {:?}", project.input);
+        let LogicalPlanNodeKind::Scan(scan) = &plan.unary_input().kind else {
+            panic!("expected Scan under Project, got {:?}", plan.unary_input());
         };
 
         let row_id_output = scan
             .columns
             .iter()
             .find(|col| col.name == "_row_id")
-            .expect("ScanNode must expose _row_id metadata output");
+            .expect("LogicalScanNode must expose _row_id metadata output");
         assert_ne!(row_id_output.column_id, ColumnId::UNSET);
 
         let ExprKind::ColumnRef { column_id, .. } = project.items[0].expr.kind else {
@@ -5422,11 +5435,11 @@ mod tests {
         };
         assert_eq!(
             column_id, row_id_output.column_id,
-            "Project must read the _row_id ColumnId exposed by the ScanNode"
+            "Project must read the _row_id ColumnId exposed by the LogicalScanNode"
         );
         assert_eq!(
             project.items[0].output_column_id, row_id_output.column_id,
-            "visible _row_id output should preserve the ScanNode metadata ColumnId"
+            "visible _row_id output should preserve the LogicalScanNode metadata ColumnId"
         );
     }
 
@@ -5435,9 +5448,13 @@ mod tests {
         let plan = parse_analyze_and_plan("SELECT a + 1 AS k FROM t GROUP BY ROLLUP(a + 1)")
             .expect("planner should succeed");
         let (_project, aggregate) = root_project_over_aggregate(&plan);
-        let repeat = first_repeat_node(&plan);
-        let LogicalPlan::Project(repeat_input_project) = repeat.input.as_ref() else {
-            panic!("expected Repeat input Project, got {:?}", repeat.input);
+        let (repeat_plan, repeat) = first_repeat_node(&plan);
+        let LogicalPlanNodeKind::Project(repeat_input_project) = &repeat_plan.unary_input().kind
+        else {
+            panic!(
+                "expected Repeat input Project, got {:?}",
+                repeat_plan.unary_input()
+            );
         };
         let repeat_key = repeat_input_project
             .items
@@ -5460,13 +5477,15 @@ mod tests {
     fn p2_subquery_alias_reexposes_producing_id() {
         let plan = parse_analyze_and_plan("SELECT x FROM (SELECT a AS x FROM t) s WHERE x > 1")
             .expect("planner should succeed");
-        let LogicalPlan::Project(project) = &plan else {
+        let LogicalPlanNodeKind::Project(project) = &plan.kind else {
             panic!("expected Project root, got {plan:?}");
         };
-        let LogicalPlan::Filter(filter) = project.input.as_ref() else {
-            panic!("expected Filter under Project, got {:?}", project.input);
+        let filter_plan = plan.unary_input();
+        let LogicalPlanNodeKind::Filter(filter) = &filter_plan.kind else {
+            panic!("expected Filter under Project, got {:?}", filter_plan);
         };
-        let child_output = plan_output_columns(&filter.input).expect("child output columns");
+        let child_output =
+            plan_output_columns(filter_plan.unary_input()).expect("child output columns");
         let producing_id = child_output
             .iter()
             .find(|col| col.name == "x")
@@ -5501,11 +5520,11 @@ mod tests {
             "SELECT a AS merged FROM t l FULL OUTER JOIN t r USING(a) ORDER BY merged",
         )
         .expect("planner should succeed");
-        let LogicalPlan::Sort(sort) = &plan else {
+        let LogicalPlanNodeKind::Sort(sort) = &plan.kind else {
             panic!("expected Sort root, got {plan:?}");
         };
-        let LogicalPlan::Project(project) = sort.input.as_ref() else {
-            panic!("expected Project under Sort, got {:?}", sort.input);
+        let LogicalPlanNodeKind::Project(project) = &plan.unary_input().kind else {
+            panic!("expected Project under Sort, got {:?}", plan.unary_input());
         };
         let merged_output_id = project.items[0].output_column_id;
         assert_ne!(
@@ -5527,14 +5546,14 @@ mod tests {
         )
         .expect("planner should succeed");
 
-        let sort = match &plan {
-            LogicalPlan::Sort(s) => s,
+        let sort = match &plan.kind {
+            LogicalPlanNodeKind::Sort(s) => s,
             other => {
                 panic!("qualified ORDER BY selected column must not add strip Project: {other:?}")
             }
         };
-        let project = match sort.input.as_ref() {
-            LogicalPlan::Project(p) => p,
+        let project = match &plan.unary_input().kind {
+            LogicalPlanNodeKind::Project(p) => p,
             other => panic!("expected SELECT Project under Sort, got {other:?}"),
         };
         assert_eq!(
@@ -5563,7 +5582,9 @@ mod tests {
 
         use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
         use crate::sql::column_id::ColumnId;
-        use crate::sql::planner::plan::{ApplyKind, ApplyNode, ValuesNode};
+        use crate::sql::planner::plan::{
+            ApplyKind, LogicalApplyNode, LogicalPlanNodeKind, LogicalValuesNode,
+        };
 
         let left_col = OutputColumn {
             column_id: ColumnId(11),
@@ -5579,37 +5600,47 @@ mod tests {
             nullable: true,
             is_internal: true,
         };
-        let plan = LogicalPlan::Apply(ApplyNode {
-            left: Box::new(LogicalPlan::Values(ValuesNode {
-                rows: vec![],
-                columns: vec![left_col.clone()],
-                required_output_columns: None,
-            })),
-            right: Box::new(LogicalPlan::Values(ValuesNode {
-                rows: vec![],
-                columns: vec![],
-                required_output_columns: None,
-            })),
-            kind: ApplyKind::Scalar,
-            subquery_expr: TypedExpr {
-                kind: ExprKind::ColumnRef {
-                    column_id: ColumnId(12),
-                    qualifier: None,
-                    column: "__sq_1".to_string(),
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Apply(LogicalApplyNode {
+                kind: ApplyKind::Scalar,
+                subquery_expr: TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        column_id: ColumnId(12),
+                        qualifier: None,
+                        column: "__sq_1".to_string(),
+                    },
+                    data_type: DataType::Int64,
+                    nullable: true,
                 },
-                data_type: DataType::Int64,
-                nullable: true,
-            },
-            output_column: out_col.clone(),
-            inner_output_column_id: out_col.column_id,
-            correlation_column_ids: vec![],
-            correlation_conjuncts: vec![],
-            residual_predicate: None,
-            need_check_max_rows: true,
-            use_semi_anti: false,
-            uncorrelated_outer_predicate_columns: HashSet::new(),
-            required_output_columns: None,
-        });
+                output_column: out_col.clone(),
+                inner_output_column_id: out_col.column_id,
+                correlation_column_ids: vec![],
+                correlation_conjuncts: vec![],
+                residual_predicate: None,
+                need_check_max_rows: true,
+                use_semi_anti: false,
+                uncorrelated_outer_predicate_columns: HashSet::new(),
+            }),
+            vec![
+                LogicalPlanNode::new(
+                    LogicalPlanNodeKind::Values(LogicalValuesNode {
+                        rows: vec![],
+                        columns: vec![left_col.clone()],
+                    }),
+                    vec![],
+                    None,
+                ),
+                LogicalPlanNode::new(
+                    LogicalPlanNodeKind::Values(LogicalValuesNode {
+                        rows: vec![],
+                        columns: vec![],
+                    }),
+                    vec![],
+                    None,
+                ),
+            ],
+            None,
+        );
 
         let columns = plan_output_columns(&plan).expect("apply output columns");
         assert_eq!(columns.len(), 2);
@@ -5623,7 +5654,9 @@ mod tests {
 
         use crate::sql::analysis::OutputColumn;
         use crate::sql::column_id::ColumnId;
-        use crate::sql::planner::plan::{AssertOneRowNode, ValuesNode};
+        use crate::sql::planner::plan::{
+            LogicalAssertOneRowNode, LogicalPlanNodeKind, LogicalValuesNode,
+        };
 
         let col = OutputColumn {
             column_id: ColumnId(21),
@@ -5632,15 +5665,20 @@ mod tests {
             nullable: false,
             is_internal: false,
         };
-        let plan = LogicalPlan::AssertOneRow(AssertOneRowNode {
-            input: Box::new(LogicalPlan::Values(ValuesNode {
-                rows: vec![],
-                columns: vec![col.clone()],
-                required_output_columns: None,
-            })),
-            subquery_text: "select 1".to_string(),
-            required_output_columns: None,
-        });
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::AssertOneRow(LogicalAssertOneRowNode {
+                subquery_text: "select 1".to_string(),
+            }),
+            vec![LogicalPlanNode::new(
+                LogicalPlanNodeKind::Values(LogicalValuesNode {
+                    rows: vec![],
+                    columns: vec![col.clone()],
+                }),
+                vec![],
+                None,
+            )],
+            None,
+        );
 
         let columns = plan_output_columns(&plan).expect("assert output columns");
         assert_eq!(columns.len(), 1);
@@ -5679,15 +5717,17 @@ mod tests {
         let plan = parse_analyze_and_plan_apply(sql).expect("Apply framework plan must succeed");
 
         // Root shape: Project → Filter(WHERE) → Apply → Scan
-        let LogicalPlan::Project(project) = &plan else {
+        let LogicalPlanNodeKind::Project(project) = &plan.kind else {
             panic!("expected Project root, got {plan:?}");
         };
-        let LogicalPlan::Filter(filter) = project.input.as_ref() else {
-            panic!("expected Filter under Project, got {:?}", project.input);
+        let filter_plan = plan.unary_input();
+        let LogicalPlanNodeKind::Filter(filter) = &filter_plan.kind else {
+            panic!("expected Filter under Project, got {:?}", filter_plan);
         };
         // The Apply must be directly under the WHERE Filter.
-        let LogicalPlan::Apply(apply) = filter.input.as_ref() else {
-            panic!("expected Apply under WHERE Filter, got {:?}", filter.input);
+        let apply_plan = filter_plan.unary_input();
+        let LogicalPlanNodeKind::Apply(apply) = &apply_plan.kind else {
+            panic!("expected Apply under WHERE Filter, got {:?}", apply_plan);
         };
         assert_eq!(
             apply.kind,
@@ -5696,9 +5736,9 @@ mod tests {
         );
         // Apply.left must be the FROM Scan.
         assert!(
-            matches!(apply.left.as_ref(), LogicalPlan::Scan(_)),
+            matches!(&apply_plan.left().kind, LogicalPlanNodeKind::Scan(_)),
             "Apply.left must be the FROM Scan, got {:?}",
-            apply.left
+            apply_plan.left()
         );
         // The WHERE Filter's predicate must reference the Apply output column
         // so that the filter can consume the scalar value.
@@ -5720,27 +5760,29 @@ mod tests {
             .expect("Apply framework plan must succeed for HAVING");
 
         // Walk down: Project → Filter(HAVING) → Apply → Aggregate → ...
-        let LogicalPlan::Project(project) = &plan else {
+        let LogicalPlanNodeKind::Project(project) = &plan.kind else {
             panic!("expected Project root, got {plan:?}");
         };
-        let LogicalPlan::Filter(having_filter) = project.input.as_ref() else {
+        let having_filter_plan = plan.unary_input();
+        let LogicalPlanNodeKind::Filter(having_filter) = &having_filter_plan.kind else {
             panic!(
                 "expected HAVING Filter under Project, got {:?}",
-                project.input
+                having_filter_plan
             );
         };
-        let LogicalPlan::Apply(apply) = having_filter.input.as_ref() else {
+        let apply_plan = having_filter_plan.unary_input();
+        let LogicalPlanNodeKind::Apply(apply) = &apply_plan.kind else {
             panic!(
                 "expected Apply directly under HAVING Filter, got {:?}",
-                having_filter.input
+                apply_plan
             );
         };
         assert_eq!(apply.kind, crate::sql::planner::plan::ApplyKind::Scalar);
         // Apply.left must be the Aggregate.
         assert!(
-            matches!(apply.left.as_ref(), LogicalPlan::Aggregate(_)),
+            matches!(&apply_plan.left().kind, LogicalPlanNodeKind::Aggregate(_)),
             "Apply.left for HAVING spec must be the Aggregate, got {:?}",
-            apply.left
+            apply_plan.left()
         );
         // The HAVING Filter's predicate must reference the Apply output column.
         let apply_col_id = apply.output_column.column_id;
@@ -5760,21 +5802,22 @@ mod tests {
             .expect("Apply framework plan must succeed for Projection");
 
         // Root must be Project; its input must be Apply.
-        let LogicalPlan::Project(project) = &plan else {
+        let LogicalPlanNodeKind::Project(project) = &plan.kind else {
             panic!("expected Project root, got {plan:?}");
         };
-        let LogicalPlan::Apply(apply) = project.input.as_ref() else {
+        let apply_plan = plan.unary_input();
+        let LogicalPlanNodeKind::Apply(apply) = &apply_plan.kind else {
             panic!(
                 "expected Apply directly under Project, got {:?}",
-                project.input
+                apply_plan
             );
         };
         assert_eq!(apply.kind, crate::sql::planner::plan::ApplyKind::Scalar);
         // Apply.left must be the FROM Scan.
         assert!(
-            matches!(apply.left.as_ref(), LogicalPlan::Scan(_)),
+            matches!(&apply_plan.left().kind, LogicalPlanNodeKind::Scan(_)),
             "Apply.left for Projection spec must be FROM Scan, got {:?}",
-            apply.left
+            apply_plan.left()
         );
         // The Apply's output_column must appear in the Project's items.
         let apply_col_id = apply.output_column.column_id;
@@ -5792,7 +5835,7 @@ mod tests {
 
     fn plan_with_single_predicate_apply_spec(
         sql: &str,
-    ) -> (LogicalPlan, crate::sql::analysis::ApplyPredicateSpec) {
+    ) -> (LogicalPlanNode, crate::sql::analysis::ApplyPredicateSpec) {
         use crate::sql::analysis::QueryBody;
 
         let (resolved, cte_registry, mut factory) =
@@ -5811,21 +5854,23 @@ mod tests {
         (plan, spec)
     }
 
-    fn direct_where_apply(plan: &LogicalPlan) -> &ApplyNode {
-        let LogicalPlan::Project(project) = plan else {
+    fn direct_where_apply(plan: &LogicalPlanNode) -> &LogicalApplyNode {
+        let LogicalPlanNodeKind::Project(_) = &plan.kind else {
             panic!("expected Project root, got {plan:?}");
         };
-        match project.input.as_ref() {
-            LogicalPlan::Filter(filter) => {
-                let LogicalPlan::Apply(apply) = filter.input.as_ref() else {
+        let project_input = plan.unary_input();
+        match &project_input.kind {
+            LogicalPlanNodeKind::Filter(_) => {
+                let apply_plan = project_input.unary_input();
+                let LogicalPlanNodeKind::Apply(apply) = &apply_plan.kind else {
                     panic!(
                         "expected Apply directly below WHERE Filter, got {:?}",
-                        filter.input
+                        apply_plan
                     );
                 };
                 apply
             }
-            LogicalPlan::Apply(apply) => apply,
+            LogicalPlanNodeKind::Apply(apply) => apply,
             other => panic!("expected Filter->Apply or Apply below Project, got {other:?}"),
         }
     }
@@ -5864,19 +5909,21 @@ mod tests {
             "test query must record a correlated EXISTS predicate spec"
         );
 
-        let LogicalPlan::Project(project) = &plan else {
+        let LogicalPlanNodeKind::Project(project) = &plan.kind else {
             panic!("expected Project root, got {plan:?}");
         };
-        let LogicalPlan::Filter(filter) = project.input.as_ref() else {
+        let filter_plan = plan.unary_input();
+        let LogicalPlanNodeKind::Filter(filter) = &filter_plan.kind else {
             panic!(
                 "expected residual WHERE Filter under Project, got {:?}",
-                project.input
+                filter_plan
             );
         };
-        let LogicalPlan::Apply(apply) = filter.input.as_ref() else {
+        let apply_plan = filter_plan.unary_input();
+        let LogicalPlanNodeKind::Apply(apply) = &apply_plan.kind else {
             panic!(
                 "expected Apply directly below WHERE Filter, got {:?}",
-                filter.input
+                apply_plan
             );
         };
         assert_eq!(

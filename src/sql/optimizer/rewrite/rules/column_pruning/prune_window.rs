@@ -2,10 +2,10 @@
 //!
 //! ## Gap-5: Window output pruning is intentionally deferred (NO-OP)
 //!
-//! `WindowNode.output_columns` is built by `build_window_and_project` in the
+//! `LogicalWindowNode.output_columns` is built by `build_window_and_project` in the
 //! planner. Window function outputs now carry stable
 //! `WindowExpr.output_column_id` values that correspond to entries in
-//! `WindowNode.output_columns`, including internal synthetic slots for
+//! `LogicalWindowNode.output_columns`, including internal synthetic slots for
 //! compound SELECT expressions.
 //!
 //! Safe pruning is still deferred because the parent Project currently reads
@@ -38,13 +38,13 @@ impl LogicalRewriteRule for PruneWindowColumns {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, plan: &LogicalPlan, _ctx: &RewriteContext) -> bool {
-        matches!(plan, LogicalPlan::Window(_))
+    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+        matches!(&plan.kind, LogicalPlanNodeKind::Window(_))
     }
 
     fn apply(
         &self,
-        _plan: LogicalPlan,
+        _plan: LogicalPlanNode,
         _ctx: &mut RewriteContext,
     ) -> Result<RewriteResult, String> {
         // NO-OP: Window output pruning is deferred (Gap-5).
@@ -62,6 +62,7 @@ mod tests {
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
+    use crate::sql::planner::plan::*;
     use arrow::datatypes::DataType;
     use std::collections::HashSet;
 
@@ -94,7 +95,7 @@ mod tests {
         }
     }
 
-    fn dummy_input() -> Box<LogicalPlan> {
+    fn dummy_input() -> LogicalPlanNode {
         let table = TableDef {
             name: "t".to_string(),
             columns: vec![ColumnDef {
@@ -110,23 +111,26 @@ mod tests {
                 table_id: 0,
             },
         };
-        Box::new(LogicalPlan::Scan(ScanNode {
-            database: "db".to_string(),
-            table,
-            alias: None,
-            columns: vec![OutputColumn {
-                column_id: ColumnId::new_for_test(99),
-                name: "x".to_string(),
-                data_type: DataType::Int32,
-                nullable: false,
-                is_internal: false,
-            }],
-            predicates: vec![],
-            required_columns: None,
-            dict_columns: vec![],
-            variant_columns: vec![],
-            required_output_columns: None,
-        }))
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Scan(LogicalScanNode {
+                database: "db".to_string(),
+                table: table,
+                alias: None,
+                columns: vec![OutputColumn {
+                    column_id: ColumnId::new_for_test(99),
+                    name: "x".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    is_internal: false,
+                }],
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+            }),
+            vec![],
+            None,
+        )
     }
 
     /// PruneWindowColumns is always a NO-OP regardless of required_output_columns.
@@ -142,18 +146,19 @@ mod tests {
         needed.insert(id_a);
         needed.insert(id_rn1);
 
-        let node = WindowNode {
-            input: dummy_input(),
-            window_exprs: vec![make_window_expr("rn1"), make_window_expr("rn2")],
-            output_columns: vec![
-                make_output_column(id_a, "a"),
-                make_output_column(id_rn1, "rn1"),
-                make_output_column(id_rn2, "rn2"),
-            ],
-            required_output_columns: Some(needed),
-        };
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Window(LogicalWindowNode {
+                window_exprs: vec![make_window_expr("rn1"), make_window_expr("rn2")],
+                output_columns: vec![
+                    make_output_column(id_a, "a"),
+                    make_output_column(id_rn1, "rn1"),
+                    make_output_column(id_rn2, "rn2"),
+                ],
+            }),
+            vec![dummy_input()],
+            Some(needed),
+        );
 
-        let plan = LogicalPlan::Window(node);
         let rule = PruneWindowColumns;
         let result = rule.apply(plan, &mut ctx()).unwrap();
 
@@ -168,17 +173,18 @@ mod tests {
         let id_a = ColumnId::new_for_test(1);
         let id_rn = ColumnId::new_for_test(101);
 
-        let node = WindowNode {
-            input: dummy_input(),
-            window_exprs: vec![make_window_expr("rn")],
-            output_columns: vec![
-                make_output_column(id_a, "a"),
-                make_output_column(id_rn, "rn"),
-            ],
-            required_output_columns: None,
-        };
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Window(LogicalWindowNode {
+                window_exprs: vec![make_window_expr("rn")],
+                output_columns: vec![
+                    make_output_column(id_a, "a"),
+                    make_output_column(id_rn, "rn"),
+                ],
+            }),
+            vec![dummy_input()],
+            None,
+        );
 
-        let plan = LogicalPlan::Window(node);
         let rule = PruneWindowColumns;
         let result = rule.apply(plan, &mut ctx()).unwrap();
 
@@ -194,17 +200,18 @@ mod tests {
         let id_a = ColumnId::new_for_test(1);
         let id_rn = ColumnId::new_for_test(101);
 
-        let node = WindowNode {
-            input: dummy_input(),
-            window_exprs: vec![make_window_expr("rn")],
-            output_columns: vec![
-                make_output_column(id_a, "a"),
-                make_output_column(id_rn, "rn"),
-            ],
-            required_output_columns: Some(HashSet::new()),
-        };
+        let plan = LogicalPlanNode::new(
+            LogicalPlanNodeKind::Window(LogicalWindowNode {
+                window_exprs: vec![make_window_expr("rn")],
+                output_columns: vec![
+                    make_output_column(id_a, "a"),
+                    make_output_column(id_rn, "rn"),
+                ],
+            }),
+            vec![dummy_input()],
+            Some(HashSet::new()),
+        );
 
-        let plan = LogicalPlan::Window(node);
         let rule = PruneWindowColumns;
         let result = rule.apply(plan, &mut ctx()).unwrap();
 

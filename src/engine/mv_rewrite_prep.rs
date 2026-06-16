@@ -15,7 +15,7 @@ use crate::sql::optimizer::cascades_rules::mv_rewrite::{
     MvRewriteCandidate, descriptor::SpjgDescriptor,
 };
 use crate::sql::optimizer::statistics::TableStatistics;
-use crate::sql::planner::plan::LogicalPlan;
+use crate::sql::planner::plan::LogicalPlanNode;
 
 use super::StandaloneState;
 
@@ -27,7 +27,7 @@ pub(crate) fn prepare_mv_rewrite_candidates(
     state: &Arc<StandaloneState>,
     analyzer_catalog: &dyn CatalogProvider,
     current_database: &str,
-    logical: &LogicalPlan,
+    logical: &LogicalPlanNode,
     factory: &mut ColumnRefFactory,
     table_stats: &mut HashMap<String, TableStatistics>,
 ) -> Vec<MvRewriteCandidate> {
@@ -54,7 +54,7 @@ fn try_prepare(
     state: &Arc<StandaloneState>,
     analyzer_catalog: &dyn CatalogProvider,
     current_database: &str,
-    logical: &LogicalPlan,
+    logical: &LogicalPlanNode,
     factory: &mut ColumnRefFactory,
     table_stats: &mut HashMap<String, TableStatistics>,
 ) -> Result<Vec<MvRewriteCandidate>, String> {
@@ -227,9 +227,9 @@ fn build_candidate(
 
 /// Recursively collect "cat.ns.tbl" FQNs of every Iceberg data-file scan in
 /// the plan. Mirrors `collect_scan_stats` (engine/mod.rs) node coverage.
-fn collect_iceberg_fqns(plan: &LogicalPlan, out: &mut Vec<String>) {
-    match plan {
-        LogicalPlan::Scan(s) => {
+fn collect_iceberg_fqns(plan: &LogicalPlanNode, out: &mut Vec<String>) {
+    match &plan.kind {
+        crate::sql::planner::plan::LogicalPlanNodeKind::Scan(s) => {
             if let ScanSource::IcebergDataFiles { table, .. } = &s.table.source {
                 let fqn = format!("{}.{}.{}", table.catalog, table.namespace, table.table);
                 if !out.contains(&fqn) {
@@ -237,52 +237,14 @@ fn collect_iceberg_fqns(plan: &LogicalPlan, out: &mut Vec<String>) {
                 }
             }
         }
-        LogicalPlan::Filter(n) => collect_iceberg_fqns(&n.input, out),
-        LogicalPlan::Project(n) => collect_iceberg_fqns(&n.input, out),
-        LogicalPlan::Aggregate(n) => collect_iceberg_fqns(&n.input, out),
-        LogicalPlan::Sort(n) => collect_iceberg_fqns(&n.input, out),
-        LogicalPlan::Limit(n) => collect_iceberg_fqns(&n.input, out),
-        LogicalPlan::Window(n) => collect_iceberg_fqns(&n.input, out),
-        LogicalPlan::TableFunction(n) => collect_iceberg_fqns(&n.input, out),
-        LogicalPlan::CTEAnchor(n) => {
-            collect_iceberg_fqns(&n.produce, out);
-            collect_iceberg_fqns(&n.consumer, out);
-        }
-        LogicalPlan::CTEProduce(n) => collect_iceberg_fqns(&n.input, out),
-        LogicalPlan::Join(n) => {
-            collect_iceberg_fqns(&n.left, out);
-            collect_iceberg_fqns(&n.right, out);
-        }
-        LogicalPlan::Union(n) => {
-            for input in &n.inputs {
-                collect_iceberg_fqns(input, out);
-            }
-        }
-        LogicalPlan::Intersect(n) => {
-            for input in &n.inputs {
-                collect_iceberg_fqns(input, out);
-            }
-        }
-        LogicalPlan::Except(n) => {
-            for input in &n.inputs {
-                collect_iceberg_fqns(input, out);
-            }
-        }
-        LogicalPlan::Repeat(n) => collect_iceberg_fqns(&n.input, out),
-        LogicalPlan::Decode(n) => collect_iceberg_fqns(&n.input, out),
-        LogicalPlan::AggregateStateMerge(n) => {
-            collect_iceberg_fqns(&n.old_input, out);
-            collect_iceberg_fqns(&n.delta_input, out);
-        }
-        LogicalPlan::Apply(n) => {
-            collect_iceberg_fqns(&n.left, out);
-            collect_iceberg_fqns(&n.right, out);
-        }
-        LogicalPlan::AssertOneRow(n) => collect_iceberg_fqns(&n.input, out),
-        LogicalPlan::Values(_) | LogicalPlan::GenerateSeries(_) | LogicalPlan::CTEConsume(_) => {}
-        LogicalPlan::ImvDelta(_) | LogicalPlan::ImvVersion(_) => {
+        crate::sql::planner::plan::LogicalPlanNodeKind::ImvDelta(_)
+        | crate::sql::planner::plan::LogicalPlanNodeKind::ImvVersion(_) => {
             // IMV markers never appear on the standalone query path; ignore.
         }
+        _ => {}
+    }
+    for child in &plan.children {
+        collect_iceberg_fqns(child, out);
     }
 }
 
