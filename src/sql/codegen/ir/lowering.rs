@@ -11,12 +11,16 @@ use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn as AnalysisOutputColumn, TypedExpr,
 };
 use crate::sql::catalog::{CatalogProvider, ScanSource, TableDef};
+use crate::sql::codegen::boundary_schema::{
+    BoundaryKind, BoundarySchemaReport, output_columns_to_boundary_columns,
+};
 use crate::sql::codegen::descriptors::DescriptorTableBuilder;
 use crate::sql::codegen::expr_compiler::{self, ExprCompiler};
 use crate::sql::codegen::fragment_builder::{
-    PlanFragmentBuilder, add_iceberg_equality_delete_required_columns, build_result_sink,
-    effective_iceberg_scan_column_names, iceberg_scan_table_handle_for_codegen, iceberg_table_info,
-    output_columns_for_boundary, result_root_boundary_schema_report, synthetic_iceberg_table_id,
+    PlanFragmentBuilder, add_iceberg_equality_delete_required_columns, build_noop_sink,
+    build_result_sink, effective_iceberg_scan_column_names, iceberg_scan_table_handle_for_codegen,
+    iceberg_table_info, output_columns_for_boundary, result_root_boundary_schema_report,
+    synthetic_iceberg_table_id,
 };
 use crate::sql::codegen::helpers::{
     agg_call_display_name, agg_call_display_name_without_qualifiers, group_win_exprs_by_sig,
@@ -51,56 +55,82 @@ pub(crate) fn lower_distributed_plan(
     connectors: &crate::connector::ConnectorRegistry,
 ) -> Result<MultiFragmentBuildResult, String> {
     let _ = catalog;
-    let root_fragment = validate_m0_root_fragment(dp)?;
+    let fragments = validate_distributed_plan(dp)?;
 
     let mut state = OwnedLoweringState::new(connectors, None, dp.root_fragment_id);
-    let lowered = {
-        let mut ctx = LoweringCtx::new(&mut state);
-        ctx.lower_node(&root_fragment.root)?
-    };
+    let mut lowered_fragments = Vec::with_capacity(fragments.len());
+    for fragment in fragments {
+        state.fragment_stack.clear();
+        state.fragment_stack.push(fragment.fragment_id);
+        let lowered = {
+            let mut ctx = LoweringCtx::new(&mut state);
+            ctx.lower_node(&fragment.root)?
+        };
+        lowered_fragments.push((fragment, lowered));
+    }
+    state.fragment_stack.clear();
 
     let desc_tbl =
         std::mem::replace(&mut state.desc_builder, DescriptorTableBuilder::new()).build();
     let exec_params =
         nodes::build_exec_params_multi_with_refresh_context(connectors, &state.scan_tables, None)?;
-    let output_exprs =
-        result_output_exprs_for_columns(&lowered.scope, &root_fragment.output_columns)?;
-    let output_columns = output_columns_for_boundary(&root_fragment.output_columns);
-    let root_node_id = lowered
-        .plan_nodes
-        .first()
-        .map(|node| node.node_id)
-        .unwrap_or(-1);
-    let boundary_schemas = vec![result_root_boundary_schema_report(
-        dp.root_fragment_id,
-        root_node_id,
-        &output_columns,
-    )];
-    let root_dicts = state
-        .query_global_dicts_per_fragment
-        .remove(&dp.root_fragment_id)
-        .filter(|dicts| !dicts.is_empty());
 
-    let root_fragment = FragmentBuildResult {
-        fragment_id: dp.root_fragment_id,
-        plan: plan_nodes::TPlan::new(lowered.plan_nodes),
-        desc_tbl: desc_tbl.clone(),
-        exec_params: exec_params.clone(),
-        output_sink: build_result_sink(),
-        output_exprs,
-        output_columns,
-        direct_exec: None,
-        boundary_schemas: boundary_schemas.clone(),
-        cte_id: None,
-        cte_exchange_nodes: Vec::new(),
-        query_global_dicts: root_dicts,
-        query_global_dict_exprs: None,
-    };
+    let mut fragment_results = Vec::with_capacity(lowered_fragments.len());
+    for (fragment, lowered) in lowered_fragments {
+        let output_columns = output_columns_for_boundary(&fragment.output_columns);
+        let root_node_id = lowered
+            .plan_nodes
+            .first()
+            .map(|node| node.node_id)
+            .unwrap_or(-1);
+        let boundary_schemas = vec![result_root_boundary_schema_report(
+            fragment.fragment_id,
+            root_node_id,
+            &output_columns,
+        )];
+        let query_global_dicts = state
+            .query_global_dicts_per_fragment
+            .remove(&fragment.fragment_id)
+            .filter(|dicts| !dicts.is_empty());
+        let is_root = fragment.fragment_id == dp.root_fragment_id;
+        let output_exprs = if is_root {
+            result_output_exprs_for_columns(&lowered.scope, &fragment.output_columns)?
+        } else {
+            None
+        };
+        let output_sink = if is_root {
+            build_result_sink()
+        } else {
+            build_noop_sink()
+        };
+
+        fragment_results.push(FragmentBuildResult {
+            fragment_id: fragment.fragment_id,
+            plan: plan_nodes::TPlan::new(lowered.plan_nodes),
+            desc_tbl: desc_tbl.clone(),
+            exec_params: exec_params.clone(),
+            output_sink,
+            output_exprs,
+            output_columns,
+            direct_exec: None,
+            boundary_schemas,
+            cte_id: fragment.cte_id,
+            cte_exchange_nodes: fragment.cte_exchange_nodes.clone(),
+            query_global_dicts,
+            query_global_dict_exprs: None,
+        });
+    }
+
+    let mut boundary_schemas = Vec::new();
+    for fragment in &fragment_results {
+        boundary_schemas.extend(fragment.boundary_schemas.clone());
+    }
+    boundary_schemas.extend(edge_boundary_schemas(dp)?);
 
     Ok(MultiFragmentBuildResult {
-        fragment_results: vec![root_fragment],
+        fragment_results,
         root_fragment_id: dp.root_fragment_id,
-        edges: Vec::new(),
+        edges: dp.edges.clone(),
         boundary_schemas,
         rf_plan: if state.rf_all_filters.is_empty() {
             None
@@ -114,33 +144,258 @@ pub(crate) fn lower_distributed_plan(
     })
 }
 
-fn validate_m0_root_fragment(
+fn validate_distributed_plan(
     dp: &super::fragment::DistributedPlan,
-) -> Result<&super::fragment::PlanFragment, String> {
-    if dp.fragments.len() != 1 {
+) -> Result<Vec<&super::fragment::PlanFragment>, String> {
+    if dp.fragments.is_empty() {
+        return Err("lower_distributed_plan requires at least one fragment".to_string());
+    }
+
+    let mut fragments_by_id = BTreeMap::new();
+    let mut input_index_by_id = BTreeMap::new();
+    for (idx, fragment) in dp.fragments.iter().enumerate() {
+        if fragments_by_id
+            .insert(fragment.fragment_id, fragment)
+            .is_some()
+        {
+            return Err(format!(
+                "lower_distributed_plan duplicate fragment id={}",
+                fragment.fragment_id
+            ));
+        }
+        input_index_by_id.insert(fragment.fragment_id, idx);
+    }
+
+    for fragment in &dp.fragments {
+        ensure_unpartitioned("data_partition", &fragment.data_partition)?;
+        if fragment.output_exprs.is_some() {
+            return Err(format!(
+                "lower_distributed_plan does not support fragment output_exprs for fragment id={}",
+                fragment.fragment_id
+            ));
+        }
+        validate_node_fragment_ownership(fragment.fragment_id, &fragment.root)?;
+
+        if fragment.fragment_id == dp.root_fragment_id {
+            if !matches!(fragment.sink, super::fragment::DataSink::Result) {
+                return Err(format!(
+                    "lower_distributed_plan root fragment id={} must use result sink",
+                    fragment.fragment_id
+                ));
+            }
+            ensure_unpartitioned("root output_partition", &fragment.output_partition)?;
+        } else {
+            if !matches!(fragment.sink, super::fragment::DataSink::Noop) {
+                return Err(format!(
+                    "lower_distributed_plan non-root fragment id={} must use noop sink",
+                    fragment.fragment_id
+                ));
+            }
+        }
+    }
+
+    if !fragments_by_id.contains_key(&dp.root_fragment_id) {
         return Err(format!(
-            "lower_distributed_plan M0 supports exactly one fragment, got {}",
-            dp.fragments.len()
+            "lower_distributed_plan root fragment id={} was not found",
+            dp.root_fragment_id
         ));
     }
 
-    let fragment = &dp.fragments[0];
-    if fragment.fragment_id != dp.root_fragment_id {
+    let ordered_ids = topological_fragment_order(dp, &fragments_by_id, &input_index_by_id)?;
+    Ok(ordered_ids
+        .into_iter()
+        .map(|fragment_id| {
+            *fragments_by_id
+                .get(&fragment_id)
+                .expect("topological order references validated fragment id")
+        })
+        .collect())
+}
+
+fn validate_node_fragment_ownership(
+    fragment_id: FragmentId,
+    node: &super::node::DistributedPlanNode,
+) -> Result<(), String> {
+    if node.fragment_id != fragment_id {
         return Err(format!(
-            "lower_distributed_plan M0 root fragment id={} does not match only fragment id={}",
-            dp.root_fragment_id, fragment.fragment_id
+            "lower_distributed_plan fragment id={} contains node_id={} with fragment_id={}",
+            fragment_id, node.node_id, node.fragment_id
         ));
     }
-    if !matches!(fragment.sink, super::fragment::DataSink::Result) {
-        return Err("lower_distributed_plan M0 supports only result sink".to_string());
+    for child in &node.children {
+        validate_node_fragment_ownership(fragment_id, child)?;
     }
-    ensure_unpartitioned("data_partition", &fragment.data_partition)?;
-    ensure_unpartitioned("output_partition", &fragment.output_partition)?;
-    if fragment.output_exprs.is_some() {
-        return Err("lower_distributed_plan M0 does not support fragment output_exprs".to_string());
+    Ok(())
+}
+
+fn topological_fragment_order(
+    dp: &super::fragment::DistributedPlan,
+    fragments_by_id: &BTreeMap<FragmentId, &super::fragment::PlanFragment>,
+    input_index_by_id: &BTreeMap<FragmentId, usize>,
+) -> Result<Vec<FragmentId>, String> {
+    let mut adjacency: BTreeMap<FragmentId, Vec<FragmentId>> = fragments_by_id
+        .keys()
+        .map(|fragment_id| (*fragment_id, Vec::new()))
+        .collect();
+    let mut indegree: BTreeMap<FragmentId, usize> = fragments_by_id
+        .keys()
+        .map(|fragment_id| (*fragment_id, 0))
+        .collect();
+    let mut reverse_adjacency: BTreeMap<FragmentId, Vec<FragmentId>> = fragments_by_id
+        .keys()
+        .map(|fragment_id| (*fragment_id, Vec::new()))
+        .collect();
+
+    for edge in &dp.edges {
+        if !fragments_by_id.contains_key(&edge.source_fragment_id) {
+            return Err(format!(
+                "lower_distributed_plan edge references missing source fragment id={}",
+                edge.source_fragment_id
+            ));
+        }
+        let target = fragments_by_id
+            .get(&edge.target_fragment_id)
+            .ok_or_else(|| {
+                format!(
+                    "lower_distributed_plan edge references missing target fragment id={}",
+                    edge.target_fragment_id
+                )
+            })?;
+        validate_edge_target_node(target, edge.target_exchange_node_id)?;
+        adjacency
+            .get_mut(&edge.source_fragment_id)
+            .expect("validated source fragment id")
+            .push(edge.target_fragment_id);
+        reverse_adjacency
+            .get_mut(&edge.target_fragment_id)
+            .expect("validated target fragment id")
+            .push(edge.source_fragment_id);
+        *indegree
+            .get_mut(&edge.target_fragment_id)
+            .expect("validated target fragment id") += 1;
     }
 
-    Ok(fragment)
+    validate_non_root_connectivity(
+        dp.root_fragment_id,
+        fragments_by_id,
+        &adjacency,
+        &reverse_adjacency,
+    )?;
+
+    let non_root_count = fragments_by_id
+        .keys()
+        .filter(|fragment_id| **fragment_id != dp.root_fragment_id)
+        .count();
+    let mut emitted = BTreeSet::new();
+    let mut order = Vec::with_capacity(fragments_by_id.len());
+    while order.len() < non_root_count {
+        let next = fragments_by_id
+            .keys()
+            .filter(|fragment_id| **fragment_id != dp.root_fragment_id)
+            .filter(|fragment_id| !emitted.contains(*fragment_id))
+            .filter(|fragment_id| indegree.get(fragment_id).copied().unwrap_or_default() == 0)
+            .min_by_key(|fragment_id| {
+                input_index_by_id
+                    .get(fragment_id)
+                    .copied()
+                    .unwrap_or(usize::MAX)
+            })
+            .copied()
+            .ok_or_else(|| {
+                "lower_distributed_plan cycle in DistributedPlan fragment edges".to_string()
+            })?;
+
+        emitted.insert(next);
+        order.push(next);
+        for target in adjacency.get(&next).into_iter().flatten() {
+            let target_indegree = indegree
+                .get_mut(target)
+                .expect("adjacency references validated target fragment id");
+            *target_indegree -= 1;
+        }
+    }
+
+    if indegree
+        .get(&dp.root_fragment_id)
+        .copied()
+        .unwrap_or_default()
+        != 0
+    {
+        return Err("lower_distributed_plan cycle in DistributedPlan fragment edges".to_string());
+    }
+    order.push(dp.root_fragment_id);
+    Ok(order)
+}
+
+fn validate_non_root_connectivity(
+    root_fragment_id: FragmentId,
+    fragments_by_id: &BTreeMap<FragmentId, &super::fragment::PlanFragment>,
+    adjacency: &BTreeMap<FragmentId, Vec<FragmentId>>,
+    reverse_adjacency: &BTreeMap<FragmentId, Vec<FragmentId>>,
+) -> Result<(), String> {
+    for fragment_id in fragments_by_id
+        .keys()
+        .copied()
+        .filter(|fragment_id| *fragment_id != root_fragment_id)
+    {
+        if adjacency
+            .get(&fragment_id)
+            .map(|targets| targets.is_empty())
+            .unwrap_or(true)
+        {
+            return Err(format!(
+                "lower_distributed_plan disconnected non-root fragment id={} has no outgoing edge toward root fragment id={}",
+                fragment_id, root_fragment_id
+            ));
+        }
+    }
+
+    let mut reaches_root = BTreeSet::new();
+    let mut stack = vec![root_fragment_id];
+    while let Some(fragment_id) = stack.pop() {
+        if !reaches_root.insert(fragment_id) {
+            continue;
+        }
+        for source in reverse_adjacency.get(&fragment_id).into_iter().flatten() {
+            stack.push(*source);
+        }
+    }
+
+    for fragment_id in fragments_by_id
+        .keys()
+        .copied()
+        .filter(|fragment_id| *fragment_id != root_fragment_id)
+    {
+        if !reaches_root.contains(&fragment_id) {
+            return Err(format!(
+                "lower_distributed_plan disconnected non-root fragment id={} is not connected to root fragment id={}",
+                fragment_id, root_fragment_id
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_edge_target_node(
+    target_fragment: &super::fragment::PlanFragment,
+    target_exchange_node_id: i32,
+) -> Result<(), String> {
+    if !node_tree_contains_node_id(&target_fragment.root, target_exchange_node_id) {
+        Err(format!(
+            "lower_distributed_plan edge target_exchange_node_id={} not found in target fragment id={}",
+            target_exchange_node_id, target_fragment.fragment_id
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn node_tree_contains_node_id(node: &super::node::DistributedPlanNode, node_id: i32) -> bool {
+    node.node_id == node_id
+        || node
+            .children
+            .iter()
+            .any(|child| node_tree_contains_node_id(child, node_id))
 }
 
 fn ensure_unpartitioned(
@@ -153,10 +408,52 @@ fn ensure_unpartitioned(
     ) || !partition.exprs.is_empty()
     {
         return Err(format!(
-            "lower_distributed_plan M0 supports only unpartitioned {label}"
+            "lower_distributed_plan supports only unpartitioned {label}"
         ));
     }
     Ok(())
+}
+
+fn edge_boundary_schemas(
+    dp: &super::fragment::DistributedPlan,
+) -> Result<Vec<BoundarySchemaReport>, String> {
+    let fragments_by_id: BTreeMap<FragmentId, &super::fragment::PlanFragment> = dp
+        .fragments
+        .iter()
+        .map(|fragment| (fragment.fragment_id, fragment))
+        .collect();
+    let mut reports = Vec::with_capacity(dp.edges.len() * 2);
+    for edge in &dp.edges {
+        let source = fragments_by_id
+            .get(&edge.source_fragment_id)
+            .ok_or_else(|| {
+                format!(
+                    "lower_distributed_plan edge references missing source fragment id={}",
+                    edge.source_fragment_id
+                )
+            })?;
+        if !fragments_by_id.contains_key(&edge.target_fragment_id) {
+            return Err(format!(
+                "lower_distributed_plan edge references missing target fragment id={}",
+                edge.target_fragment_id
+            ));
+        }
+        let output_columns = output_columns_for_boundary(&source.output_columns);
+        let columns = output_columns_to_boundary_columns(&output_columns);
+        reports.push(BoundarySchemaReport {
+            fragment_id: Some(edge.source_fragment_id as i32),
+            node_id: edge.target_exchange_node_id,
+            boundary_kind: BoundaryKind::ExchangeSender,
+            columns: columns.clone(),
+        });
+        reports.push(BoundarySchemaReport {
+            fragment_id: Some(edge.target_fragment_id as i32),
+            node_id: edge.target_exchange_node_id,
+            boundary_kind: BoundaryKind::ExchangeReceiver,
+            columns,
+        });
+    }
+    Ok(reports)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -3725,12 +4022,16 @@ mod tests {
     use crate::sql::catalog::{
         CatalogProvider, ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
+    use crate::sql::codegen::boundary_schema::BoundaryKind;
     use crate::sql::codegen::expr_compiler::infer_agg_function_types;
     use crate::sql::codegen::fragment_builder::PlanFragmentBuilder;
+    use crate::sql::codegen::ir::kind::DistributedValuesNode;
     use crate::sql::codegen::ir::{
-        DataPartition, DataSink, DistributedPlan, PartitionKind, build_distributed_plan,
+        DataPartition, DataSink, DistributedPlan, DistributedPlanNode, DistributedPlanNodeKind,
+        PartitionKind, PlanFragment, PlanNodeStats, build_distributed_plan,
     };
     use crate::sql::codegen::resolve::{ColumnBinding, ExprScope};
+    use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentStreamKind};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
         JoinDistribution, Operator, PhysicalHashJoinEqCondition, PhysicalHashJoinOp,
@@ -3923,6 +4224,89 @@ mod tests {
     }
 
     #[test]
+    fn lower_distributed_plan_accepts_multi_fragment_result_and_noop_children() {
+        let catalog = DummyCatalog;
+        let connectors = ConnectorRegistry::new();
+        let dp = distributed_values_multi_fragment_plan();
+
+        let result = super::lower_distributed_plan(&dp, &catalog, &connectors)
+            .expect("multi fragment lower");
+
+        assert_eq!(result.root_fragment_id, 1);
+        assert_eq!(result.fragment_results.len(), 2);
+        let root = result
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == 1)
+            .expect("root fragment");
+        let child = result
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == 0)
+            .expect("child fragment");
+        assert_eq!(
+            root.output_sink.type_,
+            crate::data_sinks::TDataSinkType::RESULT_SINK
+        );
+        assert_eq!(
+            child.output_sink.type_,
+            crate::data_sinks::TDataSinkType::NOOP_SINK
+        );
+        assert_eq!(root.desc_tbl, child.desc_tbl);
+        assert_eq!(root.exec_params, child.exec_params);
+        assert_eq!(result.edges.len(), 1);
+        assert_eq!(result.edges[0].source_fragment_id, 0);
+        assert_eq!(result.edges[0].target_fragment_id, 1);
+        assert_eq!(result.edges[0].target_exchange_node_id, 20);
+        assert_eq!(result.boundary_schemas.len(), 4);
+        assert_eq!(result.boundary_schemas[0].fragment_id, Some(0));
+        assert_eq!(result.boundary_schemas[0].node_id, 10);
+        assert_eq!(
+            result.boundary_schemas[0].boundary_kind,
+            BoundaryKind::ResultRoot
+        );
+        assert_eq!(result.boundary_schemas[1].fragment_id, Some(1));
+        assert_eq!(result.boundary_schemas[1].node_id, 20);
+        assert_eq!(
+            result.boundary_schemas[1].boundary_kind,
+            BoundaryKind::ResultRoot
+        );
+        assert_eq!(result.boundary_schemas[2].fragment_id, Some(0));
+        assert_eq!(result.boundary_schemas[2].node_id, 20);
+        assert_eq!(
+            result.boundary_schemas[2].boundary_kind,
+            BoundaryKind::ExchangeSender
+        );
+        assert_eq!(result.boundary_schemas[2].columns.len(), 1);
+        assert_eq!(result.boundary_schemas[2].columns[0].name, "child_k");
+        assert_eq!(result.boundary_schemas[3].fragment_id, Some(1));
+        assert_eq!(result.boundary_schemas[3].node_id, 20);
+        assert_eq!(
+            result.boundary_schemas[3].boundary_kind,
+            BoundaryKind::ExchangeReceiver
+        );
+        assert_eq!(result.boundary_schemas[3].columns.len(), 1);
+        assert_eq!(result.boundary_schemas[3].columns[0].name, "child_k");
+    }
+
+    #[test]
+    fn lower_distributed_plan_lowers_fragments_in_edge_topological_order() {
+        let catalog = DummyCatalog;
+        let connectors = ConnectorRegistry::new();
+        let dp = distributed_values_three_fragment_chain_reverse_input();
+
+        let result = super::lower_distributed_plan(&dp, &catalog, &connectors)
+            .expect("multi fragment lower");
+        let order: Vec<u32> = result
+            .fragment_results
+            .iter()
+            .map(|fragment| fragment.fragment_id)
+            .collect();
+
+        assert_eq!(order, vec![0, 1, 2]);
+    }
+
+    #[test]
     fn null_aware_left_anti_nest_loop_join_exposes_left_scope_and_widens_build_side() {
         let connectors = ConnectorRegistry::new();
         let mut state = super::OwnedLoweringState::new(&connectors, None, 0);
@@ -4013,27 +4397,19 @@ mod tests {
 
     #[test]
     fn lower_distributed_plan_rejects_non_m0_fragment_shape() {
-        let mut extra_fragment = distributed_project_scan_plan();
-        let mut duplicate = extra_fragment.fragments[0].clone();
-        duplicate.fragment_id = 1;
-        extra_fragment.fragments.push(duplicate);
-        assert_lowering_err(
-            &extra_fragment,
-            "lower_distributed_plan M0 supports exactly one fragment",
-        );
-
         let mut root_mismatch = distributed_project_scan_plan();
         root_mismatch.root_fragment_id = 99;
+        root_mismatch.fragments[0].sink = DataSink::Noop;
         assert_lowering_err(
             &root_mismatch,
-            "lower_distributed_plan M0 root fragment id=99 does not match only fragment id=0",
+            "lower_distributed_plan root fragment id=99 was not found",
         );
 
         let mut noop_sink = distributed_project_scan_plan();
         noop_sink.fragments[0].sink = DataSink::Noop;
         assert_lowering_err(
             &noop_sink,
-            "lower_distributed_plan M0 supports only result sink",
+            "lower_distributed_plan root fragment id=0 must use result sink",
         );
 
         let mut random_partition = distributed_project_scan_plan();
@@ -4043,14 +4419,39 @@ mod tests {
         };
         assert_lowering_err(
             &random_partition,
-            "lower_distributed_plan M0 supports only unpartitioned data_partition",
+            "lower_distributed_plan supports only unpartitioned data_partition",
         );
 
         let mut output_exprs = distributed_project_scan_plan();
         output_exprs.fragments[0].output_exprs = Some(vec![]);
         assert_lowering_err(
             &output_exprs,
-            "lower_distributed_plan M0 does not support fragment output_exprs",
+            "lower_distributed_plan does not support fragment output_exprs",
+        );
+
+        let mut wrong_owner = distributed_project_scan_plan();
+        wrong_owner.fragments[0].root.children[0].fragment_id = 42;
+        assert_lowering_err(
+            &wrong_owner,
+            "fragment id=0 contains node_id=1 with fragment_id=42",
+        );
+
+        let mut missing_target_node = distributed_values_multi_fragment_plan();
+        missing_target_node.edges[0].target_exchange_node_id = 99;
+        assert_lowering_err(
+            &missing_target_node,
+            "edge target_exchange_node_id=99 not found in target fragment id=1",
+        );
+
+        let mut cyclic = distributed_values_multi_fragment_plan();
+        cyclic.edges.push(fragment_edge(1, 0, 10));
+        assert_lowering_err(&cyclic, "cycle in DistributedPlan fragment edges");
+
+        let mut disconnected_noop = distributed_values_multi_fragment_plan();
+        disconnected_noop.edges.clear();
+        assert_lowering_err(
+            &disconnected_noop,
+            "disconnected non-root fragment id=0 has no outgoing edge toward root fragment id=1",
         );
     }
 
@@ -4064,6 +4465,137 @@ mod tests {
 
     fn distributed_project_scan_plan() -> DistributedPlan {
         build_distributed_plan(&project_over_metadata_scan_plan()).expect("build DistributedPlan")
+    }
+
+    fn distributed_values_multi_fragment_plan() -> DistributedPlan {
+        let child_columns = vec![output_col(1, "child_k", DataType::Int64, false)];
+        let root_columns = vec![output_col(2, "root_k", DataType::Int64, false)];
+        DistributedPlan {
+            fragments: vec![
+                PlanFragment {
+                    fragment_id: 0,
+                    root: distributed_values_node(10, 0, 10, child_columns.clone()),
+                    data_partition: DataPartition::unpartitioned(),
+                    output_partition: DataPartition {
+                        kind: PartitionKind::Random,
+                        exprs: vec![],
+                    },
+                    sink: DataSink::Noop,
+                    output_exprs: None,
+                    output_columns: child_columns,
+                    cte_id: None,
+                    cte_exchange_nodes: Vec::new(),
+                },
+                PlanFragment {
+                    fragment_id: 1,
+                    root: distributed_values_node(20, 1, 20, root_columns.clone()),
+                    data_partition: DataPartition::unpartitioned(),
+                    output_partition: DataPartition::unpartitioned(),
+                    sink: DataSink::Result,
+                    output_exprs: None,
+                    output_columns: root_columns,
+                    cte_id: None,
+                    cte_exchange_nodes: Vec::new(),
+                },
+            ],
+            root_fragment_id: 1,
+            edges: vec![fragment_edge(0, 1, 20)],
+        }
+    }
+
+    fn distributed_values_three_fragment_chain_reverse_input() -> DistributedPlan {
+        let source_columns = vec![output_col(1, "source_k", DataType::Int64, false)];
+        let middle_columns = vec![output_col(2, "middle_k", DataType::Int64, false)];
+        let root_columns = vec![output_col(3, "root_k", DataType::Int64, false)];
+        DistributedPlan {
+            fragments: vec![
+                PlanFragment {
+                    fragment_id: 2,
+                    root: distributed_values_node(20, 2, 20, root_columns.clone()),
+                    data_partition: DataPartition::unpartitioned(),
+                    output_partition: DataPartition::unpartitioned(),
+                    sink: DataSink::Result,
+                    output_exprs: None,
+                    output_columns: root_columns,
+                    cte_id: None,
+                    cte_exchange_nodes: Vec::new(),
+                },
+                PlanFragment {
+                    fragment_id: 1,
+                    root: distributed_values_node(30, 1, 30, middle_columns.clone()),
+                    data_partition: DataPartition::unpartitioned(),
+                    output_partition: DataPartition {
+                        kind: PartitionKind::Random,
+                        exprs: vec![],
+                    },
+                    sink: DataSink::Noop,
+                    output_exprs: None,
+                    output_columns: middle_columns,
+                    cte_id: None,
+                    cte_exchange_nodes: Vec::new(),
+                },
+                PlanFragment {
+                    fragment_id: 0,
+                    root: distributed_values_node(10, 0, 10, source_columns.clone()),
+                    data_partition: DataPartition::unpartitioned(),
+                    output_partition: DataPartition {
+                        kind: PartitionKind::Random,
+                        exprs: vec![],
+                    },
+                    sink: DataSink::Noop,
+                    output_exprs: None,
+                    output_columns: source_columns,
+                    cte_id: None,
+                    cte_exchange_nodes: Vec::new(),
+                },
+            ],
+            root_fragment_id: 2,
+            edges: vec![fragment_edge(0, 1, 30), fragment_edge(1, 2, 20)],
+        }
+    }
+
+    fn fragment_edge(
+        source_fragment_id: u32,
+        target_fragment_id: u32,
+        target_exchange_node_id: i32,
+    ) -> FragmentEdge {
+        FragmentEdge {
+            source_fragment_id,
+            target_fragment_id,
+            target_exchange_node_id,
+            output_partition: crate::partitions::TDataPartition::new(
+                crate::partitions::TPartitionType::UNPARTITIONED,
+                None::<Vec<crate::exprs::TExpr>>,
+                None::<Vec<crate::partitions::TRangePartition>>,
+                None::<Vec<crate::partitions::TBucketProperty>>,
+            ),
+            stream_kind: FragmentStreamKind::Gather,
+            edge_kind: FragmentEdgeKind::Stream,
+        }
+    }
+
+    fn distributed_values_node(
+        node_id: i32,
+        fragment_id: u32,
+        tuple_id: i32,
+        columns: Vec<OutputColumn>,
+    ) -> DistributedPlanNode {
+        DistributedPlanNode {
+            node_id,
+            fragment_id,
+            tuple_ids: vec![tuple_id],
+            nullable_tuple_ids: vec![],
+            limit: -1,
+            execution_join_distribution: None,
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+            children: vec![],
+            stats: PlanNodeStats::from_statistics(&Statistics::default()),
+            kind: DistributedPlanNodeKind::Values(DistributedValuesNode {
+                rows: vec![],
+                columns,
+            }),
+        }
     }
 
     fn assert_lowering_err(dp: &DistributedPlan, expected: &str) {

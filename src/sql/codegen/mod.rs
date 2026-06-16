@@ -97,6 +97,7 @@ pub(crate) struct OutputColumn {
 }
 
 /// Result of emitting a multi-fragment plan.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FragmentEdgeKind {
     Stream,
     CteMulticast { cte_id: CteId },
@@ -110,6 +111,7 @@ pub(crate) enum FragmentStreamKind {
     Other,
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct FragmentEdge {
     pub source_fragment_id: FragmentId,
     pub target_fragment_id: FragmentId,

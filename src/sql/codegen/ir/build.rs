@@ -673,8 +673,11 @@ pub(crate) fn build_distributed_plan(plan: &PhysicalPlanNode) -> Result<Distribu
             sink: DataSink::Result,
             output_exprs: None,
             output_columns: plan.output_columns.clone(),
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
         }],
         root_fragment_id,
+        edges: Vec::new(),
     })
 }
 
