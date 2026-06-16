@@ -298,7 +298,7 @@ pub(crate) struct TypedExpr {
     pub nullable: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct LambdaParam {
     pub name: String,
     pub slot_id: i32,
@@ -523,20 +523,20 @@ pub(crate) struct SubqueryInfo {
 }
 
 /// Window frame specification for analytic functions.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct WindowFrame {
     pub frame_type: WindowFrameType,
     pub start: WindowBound,
     pub end: WindowBound,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum WindowFrameType {
     Rows,
     Range,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum WindowBound {
     UnboundedPreceding,
     Preceding(i64),

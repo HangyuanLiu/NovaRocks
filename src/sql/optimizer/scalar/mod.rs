@@ -14,7 +14,9 @@ use std::hash::{Hash, Hasher};
 
 use arrow::datatypes::DataType;
 
-use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
+use crate::sql::analysis::{
+    BinOp, ExprKind, LambdaParam, LiteralValue, SortItem, TypedExpr, UnOp, WindowFrame,
+};
 use crate::sql::column_id::ColumnId;
 
 /// `LiteralValue` is only `PartialEq` (it holds `Float(f64)` / `Decimal(String)`),
@@ -54,23 +56,95 @@ impl Hash for HashableLiteral {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct ScalarId(u32);
 
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct SortKey {
+    pub expr: ScalarId,
+    pub asc: bool,
+    pub nulls_first: bool,
+}
+
 /// One scalar node. Children are referenced by `ScalarId` (never inlined), so a
 /// node is cheap to hash/compare. Type metadata is part of `ScalarKey`; semantic
 /// operation details that are not implied by children still belong in the node.
-/// More variants are added in Task 5.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum ScalarNode {
     ColumnRef(ColumnId),
+    LambdaParamRef {
+        name: String,
+        slot_id: i32,
+    },
     Literal(HashableLiteral),
     BinaryOp {
         op: BinOp,
         left: ScalarId,
         right: ScalarId,
     },
+    UnaryOp {
+        op: UnOp,
+        child: ScalarId,
+    },
     FunctionCall {
         name: String,
         args: Vec<ScalarId>,
         distinct: bool,
+    },
+    LambdaFunction {
+        params: Vec<LambdaParam>,
+        body: ScalarId,
+    },
+    AggregateCall {
+        name: String,
+        args: Vec<ScalarId>,
+        distinct: bool,
+        order_by: Vec<SortKey>,
+    },
+    Cast {
+        child: ScalarId,
+        target: DataType,
+    },
+    IsNull {
+        child: ScalarId,
+        negated: bool,
+    },
+    InList {
+        child: ScalarId,
+        list: Vec<ScalarId>,
+        negated: bool,
+    },
+    Between {
+        child: ScalarId,
+        low: ScalarId,
+        high: ScalarId,
+        negated: bool,
+    },
+    Like {
+        child: ScalarId,
+        pattern: ScalarId,
+        negated: bool,
+    },
+    Case {
+        operand: Option<ScalarId>,
+        when_then: Vec<(ScalarId, ScalarId)>,
+        else_expr: Option<ScalarId>,
+    },
+    IsTruthValue {
+        child: ScalarId,
+        value: bool,
+        negated: bool,
+    },
+    Nested(ScalarId),
+    WindowCall {
+        name: String,
+        args: Vec<ScalarId>,
+        distinct: bool,
+        partition_by: Vec<ScalarId>,
+        order_by: Vec<SortKey>,
+        window_frame: Option<WindowFrame>,
+        ignore_nulls: bool,
+    },
+    Lambda {
+        params: Vec<String>,
+        body: ScalarId,
     },
 }
 
@@ -150,12 +224,30 @@ impl ScalarArena {
     }
 }
 
+fn intern_sort_key(arena: &mut ScalarArena, item: &SortItem) -> SortKey {
+    SortKey {
+        expr: intern_typed(arena, &item.expr),
+        asc: item.asc,
+        nulls_first: item.nulls_first,
+    }
+}
+
+fn materialize_sort_key(arena: &ScalarArena, key: &SortKey) -> SortItem {
+    SortItem {
+        expr: materialize(arena, key.expr),
+        asc: key.asc,
+        nulls_first: key.nulls_first,
+    }
+}
+
 /// Recursively intern an analyzer `TypedExpr` into the arena, returning its id.
-/// M0 covers ColumnRef / Literal / BinaryOp / FunctionCall; Task 5 extends to
-/// every remaining `ExprKind` variant.
 pub(crate) fn intern_typed(arena: &mut ScalarArena, expr: &TypedExpr) -> ScalarId {
     let node = match &expr.kind {
         ExprKind::ColumnRef { column_id, .. } => ScalarNode::ColumnRef(*column_id),
+        ExprKind::LambdaParamRef { name, slot_id } => ScalarNode::LambdaParamRef {
+            name: name.clone(),
+            slot_id: *slot_id,
+        },
         ExprKind::Literal(v) => ScalarNode::Literal(HashableLiteral(v.clone())),
         ExprKind::BinaryOp { left, op, right } => {
             let l = intern_typed(arena, left);
@@ -166,6 +258,10 @@ pub(crate) fn intern_typed(arena: &mut ScalarArena, expr: &TypedExpr) -> ScalarI
                 right: r,
             }
         }
+        ExprKind::UnaryOp { op, expr } => ScalarNode::UnaryOp {
+            op: *op,
+            child: intern_typed(arena, expr),
+        },
         ExprKind::FunctionCall {
             name,
             args,
@@ -178,7 +274,113 @@ pub(crate) fn intern_typed(arena: &mut ScalarArena, expr: &TypedExpr) -> ScalarI
                 distinct: *distinct,
             }
         }
-        other => unimplemented!("intern_typed: ExprKind variant not covered in M0: {other:?}"),
+        ExprKind::LambdaFunction { params, body } => ScalarNode::LambdaFunction {
+            params: params.clone(),
+            body: intern_typed(arena, body),
+        },
+        ExprKind::AggregateCall {
+            name,
+            args,
+            distinct,
+            order_by,
+        } => ScalarNode::AggregateCall {
+            name: name.clone(),
+            args: args.iter().map(|a| intern_typed(arena, a)).collect(),
+            distinct: *distinct,
+            order_by: order_by
+                .iter()
+                .map(|item| intern_sort_key(arena, item))
+                .collect(),
+        },
+        ExprKind::Cast { expr, target } => ScalarNode::Cast {
+            child: intern_typed(arena, expr),
+            target: target.clone(),
+        },
+        ExprKind::IsNull { expr, negated } => ScalarNode::IsNull {
+            child: intern_typed(arena, expr),
+            negated: *negated,
+        },
+        ExprKind::InList {
+            expr,
+            list,
+            negated,
+        } => ScalarNode::InList {
+            child: intern_typed(arena, expr),
+            list: list.iter().map(|item| intern_typed(arena, item)).collect(),
+            negated: *negated,
+        },
+        ExprKind::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => ScalarNode::Between {
+            child: intern_typed(arena, expr),
+            low: intern_typed(arena, low),
+            high: intern_typed(arena, high),
+            negated: *negated,
+        },
+        ExprKind::Like {
+            expr,
+            pattern,
+            negated,
+        } => ScalarNode::Like {
+            child: intern_typed(arena, expr),
+            pattern: intern_typed(arena, pattern),
+            negated: *negated,
+        },
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => ScalarNode::Case {
+            operand: operand.as_ref().map(|item| intern_typed(arena, item)),
+            when_then: when_then
+                .iter()
+                .map(|(when, then)| (intern_typed(arena, when), intern_typed(arena, then)))
+                .collect(),
+            else_expr: else_expr.as_ref().map(|item| intern_typed(arena, item)),
+        },
+        ExprKind::IsTruthValue {
+            expr,
+            value,
+            negated,
+        } => ScalarNode::IsTruthValue {
+            child: intern_typed(arena, expr),
+            value: *value,
+            negated: *negated,
+        },
+        ExprKind::Nested(expr) => ScalarNode::Nested(intern_typed(arena, expr)),
+        ExprKind::WindowCall {
+            name,
+            args,
+            distinct,
+            partition_by,
+            order_by,
+            window_frame,
+            ignore_nulls,
+        } => ScalarNode::WindowCall {
+            name: name.clone(),
+            args: args.iter().map(|a| intern_typed(arena, a)).collect(),
+            distinct: *distinct,
+            partition_by: partition_by
+                .iter()
+                .map(|expr| intern_typed(arena, expr))
+                .collect(),
+            order_by: order_by
+                .iter()
+                .map(|item| intern_sort_key(arena, item))
+                .collect(),
+            window_frame: window_frame.clone(),
+            ignore_nulls: *ignore_nulls,
+        },
+        ExprKind::SubqueryPlaceholder { .. } => {
+            unreachable!("SubqueryPlaceholder must be rewritten before the optimizer")
+        }
+        ExprKind::Lambda { params, body } => ScalarNode::Lambda {
+            params: params.clone(),
+            body: intern_typed(arena, body),
+        },
     };
     arena.intern(node, expr.data_type.clone(), expr.nullable)
 }
@@ -186,7 +388,7 @@ pub(crate) fn intern_typed(arena: &mut ScalarArena, expr: &TypedExpr) -> ScalarI
 /// Rebuild an analyzer `TypedExpr` from an interned id.
 ///
 /// This is a transient view for codegen/EXPLAIN and the staged-migration bridge,
-/// not a long-lived optimizer type. M0 covers the core variants; Task 5 extends.
+/// not a long-lived optimizer type.
 pub(crate) fn materialize(arena: &ScalarArena, id: ScalarId) -> TypedExpr {
     let kind = match arena.node(id) {
         ScalarNode::ColumnRef(cid) => ExprKind::ColumnRef {
@@ -196,11 +398,19 @@ pub(crate) fn materialize(arena: &ScalarArena, id: ScalarId) -> TypedExpr {
             qualifier: None,
             column: format!("col{}", cid.0),
         },
+        ScalarNode::LambdaParamRef { name, slot_id } => ExprKind::LambdaParamRef {
+            name: name.clone(),
+            slot_id: *slot_id,
+        },
         ScalarNode::Literal(HashableLiteral(v)) => ExprKind::Literal(v.clone()),
         ScalarNode::BinaryOp { op, left, right } => ExprKind::BinaryOp {
             left: Box::new(materialize(arena, *left)),
             op: *op,
             right: Box::new(materialize(arena, *right)),
+        },
+        ScalarNode::UnaryOp { op, child } => ExprKind::UnaryOp {
+            op: *op,
+            expr: Box::new(materialize(arena, *child)),
         },
         ScalarNode::FunctionCall {
             name,
@@ -210,6 +420,110 @@ pub(crate) fn materialize(arena: &ScalarArena, id: ScalarId) -> TypedExpr {
             name: name.clone(),
             args: args.iter().map(|a| materialize(arena, *a)).collect(),
             distinct: *distinct,
+        },
+        ScalarNode::LambdaFunction { params, body } => ExprKind::LambdaFunction {
+            params: params.clone(),
+            body: Box::new(materialize(arena, *body)),
+        },
+        ScalarNode::AggregateCall {
+            name,
+            args,
+            distinct,
+            order_by,
+        } => ExprKind::AggregateCall {
+            name: name.clone(),
+            args: args.iter().map(|a| materialize(arena, *a)).collect(),
+            distinct: *distinct,
+            order_by: order_by
+                .iter()
+                .map(|key| materialize_sort_key(arena, key))
+                .collect(),
+        },
+        ScalarNode::Cast { child, target } => ExprKind::Cast {
+            expr: Box::new(materialize(arena, *child)),
+            target: target.clone(),
+        },
+        ScalarNode::IsNull { child, negated } => ExprKind::IsNull {
+            expr: Box::new(materialize(arena, *child)),
+            negated: *negated,
+        },
+        ScalarNode::InList {
+            child,
+            list,
+            negated,
+        } => ExprKind::InList {
+            expr: Box::new(materialize(arena, *child)),
+            list: list.iter().map(|item| materialize(arena, *item)).collect(),
+            negated: *negated,
+        },
+        ScalarNode::Between {
+            child,
+            low,
+            high,
+            negated,
+        } => ExprKind::Between {
+            expr: Box::new(materialize(arena, *child)),
+            low: Box::new(materialize(arena, *low)),
+            high: Box::new(materialize(arena, *high)),
+            negated: *negated,
+        },
+        ScalarNode::Like {
+            child,
+            pattern,
+            negated,
+        } => ExprKind::Like {
+            expr: Box::new(materialize(arena, *child)),
+            pattern: Box::new(materialize(arena, *pattern)),
+            negated: *negated,
+        },
+        ScalarNode::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => ExprKind::Case {
+            operand: operand.map(|item| Box::new(materialize(arena, item))),
+            when_then: when_then
+                .iter()
+                .map(|(when, then)| (materialize(arena, *when), materialize(arena, *then)))
+                .collect(),
+            else_expr: else_expr.map(|item| Box::new(materialize(arena, item))),
+        },
+        ScalarNode::IsTruthValue {
+            child,
+            value,
+            negated,
+        } => ExprKind::IsTruthValue {
+            expr: Box::new(materialize(arena, *child)),
+            value: *value,
+            negated: *negated,
+        },
+        ScalarNode::Nested(child) => ExprKind::Nested(Box::new(materialize(arena, *child))),
+        ScalarNode::WindowCall {
+            name,
+            args,
+            distinct,
+            partition_by,
+            order_by,
+            window_frame,
+            ignore_nulls,
+        } => ExprKind::WindowCall {
+            name: name.clone(),
+            args: args.iter().map(|a| materialize(arena, *a)).collect(),
+            distinct: *distinct,
+            partition_by: partition_by
+                .iter()
+                .map(|expr| materialize(arena, *expr))
+                .collect(),
+            order_by: order_by
+                .iter()
+                .map(|key| materialize_sort_key(arena, key))
+                .collect(),
+            window_frame: window_frame.clone(),
+            ignore_nulls: *ignore_nulls,
+        },
+        ScalarNode::Lambda { params, body } => ExprKind::Lambda {
+            params: params.clone(),
+            body: Box::new(materialize(arena, *body)),
         },
     };
     TypedExpr {
@@ -321,7 +635,10 @@ mod tests {
 #[cfg(test)]
 mod bridge_tests {
     use super::*;
-    use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
+    use crate::sql::analysis::{
+        BinOp, ExprKind, LambdaParam, LiteralValue, SortItem, TypedExpr, UnOp, WindowBound,
+        WindowFrame, WindowFrameType,
+    };
     use crate::sql::column_id::ColumnId;
     use arrow::datatypes::DataType;
 
@@ -362,6 +679,38 @@ mod bridge_tests {
             },
             data_type: DataType::Boolean,
             nullable: false,
+        }
+    }
+
+    fn typed(kind: ExprKind, data_type: DataType, nullable: bool) -> TypedExpr {
+        TypedExpr {
+            kind,
+            data_type,
+            nullable,
+        }
+    }
+
+    fn lit_bool(v: bool) -> TypedExpr {
+        typed(
+            ExprKind::Literal(LiteralValue::Bool(v)),
+            DataType::Boolean,
+            false,
+        )
+    }
+
+    fn lit_string(v: &str) -> TypedExpr {
+        typed(
+            ExprKind::Literal(LiteralValue::String(v.to_string())),
+            DataType::Utf8,
+            false,
+        )
+    }
+
+    fn sort(expr: TypedExpr, asc: bool, nulls_first: bool) -> SortItem {
+        SortItem {
+            expr,
+            asc,
+            nulls_first,
         }
     }
 
@@ -406,5 +755,189 @@ mod bridge_tests {
             format!("{:?}", original),
             "intern_typed then materialize must reproduce the expression"
         );
+    }
+
+    #[test]
+    fn all_variants_round_trip_and_dedup() {
+        let mut a = ScalarArena::new();
+        let lambda_param = LambdaParam {
+            name: "x".to_string(),
+            slot_id: 10,
+            data_type: DataType::Int64,
+            nullable: false,
+        };
+        let lambda_param_ref = typed(
+            ExprKind::LambdaParamRef {
+                name: "x".to_string(),
+                slot_id: 10,
+            },
+            DataType::Int64,
+            false,
+        );
+        let lambda_function = typed(
+            ExprKind::LambdaFunction {
+                params: vec![lambda_param],
+                body: Box::new(typed(
+                    ExprKind::BinaryOp {
+                        left: Box::new(lambda_param_ref.clone()),
+                        op: BinOp::Add,
+                        right: Box::new(lit_int(1)),
+                    },
+                    DataType::Int64,
+                    false,
+                )),
+            },
+            DataType::Int64,
+            false,
+        );
+        let lambda = typed(
+            ExprKind::Lambda {
+                params: vec!["y".to_string()],
+                body: Box::new(typed(
+                    ExprKind::UnaryOp {
+                        op: UnOp::Negate,
+                        expr: Box::new(typed(
+                            ExprKind::LambdaParamRef {
+                                name: "y".to_string(),
+                                slot_id: 11,
+                            },
+                            DataType::Int64,
+                            false,
+                        )),
+                    },
+                    DataType::Int64,
+                    false,
+                )),
+            },
+            DataType::Int64,
+            false,
+        );
+
+        let e = typed(
+            ExprKind::FunctionCall {
+                name: "combo".to_string(),
+                args: vec![
+                    typed(
+                        ExprKind::Cast {
+                            expr: Box::new(col(1, DataType::Int64)),
+                            target: DataType::Utf8,
+                        },
+                        DataType::Utf8,
+                        true,
+                    ),
+                    typed(
+                        ExprKind::IsNull {
+                            expr: Box::new(col(2, DataType::Utf8)),
+                            negated: true,
+                        },
+                        DataType::Boolean,
+                        false,
+                    ),
+                    typed(
+                        ExprKind::InList {
+                            expr: Box::new(col(3, DataType::Int64)),
+                            list: vec![lit_int(7), lit_int(8)],
+                            negated: true,
+                        },
+                        DataType::Boolean,
+                        false,
+                    ),
+                    typed(
+                        ExprKind::Case {
+                            operand: Some(Box::new(col(4, DataType::Int64))),
+                            when_then: vec![
+                                (lit_int(1), lit_string("one")),
+                                (lit_int(2), lit_string("two")),
+                            ],
+                            else_expr: Some(Box::new(lit_string("other"))),
+                        },
+                        DataType::Utf8,
+                        true,
+                    ),
+                    typed(
+                        ExprKind::AggregateCall {
+                            name: "sum".to_string(),
+                            args: vec![col(5, DataType::Int64)],
+                            distinct: true,
+                            order_by: vec![sort(col(6, DataType::Int64), false, true)],
+                        },
+                        DataType::Int64,
+                        true,
+                    ),
+                    typed(
+                        ExprKind::Nested(Box::new(typed(
+                            ExprKind::UnaryOp {
+                                op: UnOp::Not,
+                                expr: Box::new(lit_bool(false)),
+                            },
+                            DataType::Boolean,
+                            false,
+                        ))),
+                        DataType::Boolean,
+                        false,
+                    ),
+                    typed(
+                        ExprKind::Between {
+                            expr: Box::new(col(7, DataType::Int64)),
+                            low: Box::new(lit_int(3)),
+                            high: Box::new(lit_int(9)),
+                            negated: false,
+                        },
+                        DataType::Boolean,
+                        false,
+                    ),
+                    typed(
+                        ExprKind::Like {
+                            expr: Box::new(col(8, DataType::Utf8)),
+                            pattern: Box::new(lit_string("ab%")),
+                            negated: true,
+                        },
+                        DataType::Boolean,
+                        false,
+                    ),
+                    typed(
+                        ExprKind::IsTruthValue {
+                            expr: Box::new(lit_bool(true)),
+                            value: true,
+                            negated: true,
+                        },
+                        DataType::Boolean,
+                        false,
+                    ),
+                    lambda_function,
+                    lambda,
+                    lambda_param_ref,
+                    typed(
+                        ExprKind::WindowCall {
+                            name: "first_value".to_string(),
+                            args: vec![col(9, DataType::Int64)],
+                            distinct: false,
+                            partition_by: vec![col(10, DataType::Utf8)],
+                            order_by: vec![sort(col(11, DataType::Int64), true, false)],
+                            window_frame: Some(WindowFrame {
+                                frame_type: WindowFrameType::Rows,
+                                start: WindowBound::Preceding(1),
+                                end: WindowBound::CurrentRow,
+                            }),
+                            ignore_nulls: true,
+                        },
+                        DataType::Int64,
+                        true,
+                    ),
+                ],
+                distinct: true,
+            },
+            DataType::Utf8,
+            true,
+        );
+        let id1 = intern_typed(&mut a, &e);
+        let back = materialize(&a, id1);
+        assert_eq!(
+            format!("{back:?}"),
+            format!("{e:?}"),
+            "complex expr must round-trip"
+        );
+        let id2 = intern_typed(&mut a, &e);
+        assert_eq!(id1, id2, "complex expr must dedup to one id");
     }
 }
