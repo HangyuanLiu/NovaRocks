@@ -3069,6 +3069,7 @@ fn bind_aggregate_old_input_positions_from_delta_preview(
         query_opts.cloned(),
         None,
         iceberg_catalogs,
+        None,
     ) {
         Ok(preview) => preview,
         Err(err) => {
@@ -3215,10 +3216,10 @@ fn prepare_explain_query(
     Ok(prepared)
 }
 
-/// Execute the query, then produce an EXPLAIN-style result whose first row is
-/// `Planning: <ms> / Execution: <ms> / Rows: <N>` followed by the Verbose
-/// plan body. Per-operator runtime stats merge is out of scope for OPT-5;
-/// the pipeline has no systematic profile collection yet.
+/// Execute the collapsed single-fragment DistributedPlan, then produce an
+/// EXPLAIN-style result whose first row is
+/// `Planning: <ms> / Execution: <ms> / Rows: <N>` followed by the profiled
+/// plan body.
 #[allow(clippy::too_many_arguments)]
 fn explain_analyze_query(
     query: &sqlparser::ast::Query,
@@ -3226,18 +3227,17 @@ fn explain_analyze_query(
     codegen_catalog: &InMemoryCatalog,
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
-    exchange_port: u16,
+    _exchange_port: u16,
     query_opts: Option<crate::internal_service::TQueryOptions>,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
-    use crate::sql::codegen::ir::{build_distributed_plan, explain_distributed_plan};
+    use crate::runtime::profile::Profiler;
+    use crate::runtime::profile_correlate::collect_actuals_by_plan_node_id;
+    use crate::sql::codegen::ir::{
+        build_distributed_plan, explain_distributed_plan_analyze, lower_distributed_plan,
+    };
     use crate::sql::explain::ExplainLevel;
 
-    // NOTE: planning_ms covers only the outer analyze + plan_query +
-    // optimize call below; execute_query re-plans internally and its
-    // planning work is charged to execution_ms. This double-count is
-    // an acknowledged limitation; per-operator profile merge in a
-    // follow-up PR will replace the query-level timing summary.
     let t_plan = Instant::now();
     let (resolved, cte_registry, mut factory) =
         crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
@@ -3259,19 +3259,24 @@ fn explain_analyze_query(
     // dictionary_provider intentionally None; installed via TLS by execute_in_context.
     let physical =
         crate::sql::optimizer::optimize(logical, &table_stats, factory, None, mv_candidates)?;
+    let physical = collapse_distribution_enforcers_for_single_fragment(physical);
+    let dp = build_distributed_plan(&physical)?;
+    let build_result = lower_distributed_plan(&dp, codegen_catalog, connectors)?;
     let planning_ms = t_plan.elapsed().as_millis() as u64;
 
     let t_exec = Instant::now();
-    let executed = execute_query_with_catalog_provider(
-        query,
-        analyzer_catalog,
-        codegen_catalog,
-        connectors,
-        current_database,
-        exchange_port,
-        query_opts,
-        mv_rewrite_state,
-    )?;
+    let single = match choose_standalone_execution(build_result) {
+        StandaloneExecutionPlan::SingleFragment(plan) => *plan,
+        StandaloneExecutionPlan::Coordinated(build_result) => {
+            return Err(format!(
+                "EXPLAIN ANALYZE requires a single-fragment DistributedPlan; lowered plan has {} \
+                 fragments",
+                build_result.fragment_results.len()
+            ));
+        }
+    };
+    let profiler = Profiler::new("explain_analyze");
+    let executed = execute_plan(single, query_opts, None, None, Some(profiler.clone()))?;
     let rows: u64 = executed.chunks.iter().map(|c| c.len() as u64).sum();
     let execution_ms = t_exec.elapsed().as_millis() as u64;
 
@@ -3279,8 +3284,12 @@ fn explain_analyze_query(
     lines.push(format!(
         "Planning: {planning_ms} ms / Execution: {execution_ms} ms / Rows: {rows}"
     ));
-    let dp = build_distributed_plan(&physical)?;
-    lines.extend(explain_distributed_plan(&dp, ExplainLevel::Analyze));
+    let actuals = collect_actuals_by_plan_node_id(&profiler);
+    lines.extend(explain_distributed_plan_analyze(
+        &dp,
+        ExplainLevel::Analyze,
+        &actuals,
+    ));
 
     build_string_query_result("Explain String", lines)
 }
@@ -3731,7 +3740,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
 
     match execution_plan {
         StandaloneExecutionPlan::SingleFragment(plan) => {
-            execute_plan(*plan, query_opts, terminal_sink, iceberg_catalogs)
+            execute_plan(*plan, query_opts, terminal_sink, iceberg_catalogs, None)
         }
         StandaloneExecutionPlan::Coordinated(build_result) => {
             if terminal_sink.is_some() {
@@ -4189,6 +4198,7 @@ fn execute_plan(
     query_opts: Option<crate::internal_service::TQueryOptions>,
     terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
     iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
+    profiler: Option<crate::runtime::profile::Profiler>,
 ) -> Result<QueryResult, String> {
     use crate::exec::expr::ExprArena;
     use crate::exec::node::{ExecPlan, push_down_local_runtime_filters};
@@ -4223,7 +4233,7 @@ fn execute_plan(
         std::time::Duration::from_millis(10),
         sink,
         None,
-        None,
+        profiler,
         pipeline_dop as _,
         std::sync::Arc::new(RuntimeState::new(
             query_opts, None, None, None, None, None, None, None, None,
@@ -6681,6 +6691,32 @@ enable_path_style_access = true
             .query("SELECT SQRT(-1.0) AS v")
             .expect("execute math function with negative decimal literal");
         assert_eq!(result.row_count(), 1);
+    }
+
+    #[test]
+    fn explain_analyze_populates_per_operator_profile() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
+        create_kv_tables(&session, "(1,10),(2,20),(3,30)", "(1,100),(2,200),(3,300)");
+
+        let result = session
+            .execute_in_context(
+                "EXPLAIN ANALYZE \
+                 SELECT count(*) \
+                 FROM t1 JOIN t2 ON t1.k = t2.k",
+                Some("ice"),
+                "db1",
+                None,
+            )
+            .expect("explain analyze");
+        let StatementResult::Query(result) = result else {
+            panic!("EXPLAIN ANALYZE must return a query result");
+        };
+
+        assert!(
+            query_result_contains_string(&result, "act={rows="),
+            "EXPLAIN ANALYZE output must contain per-operator actual row counts"
+        );
     }
 
     /// OQ-5 Task 6: codegen must lower the runtime-filter annotations the
