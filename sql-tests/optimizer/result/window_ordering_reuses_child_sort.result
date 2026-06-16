@@ -1,28 +1,25 @@
 Explain String
-PROJECT [running_sum] stats={rows=3}
-  WINDOW [sum(v)] stats={rows=3}
-    PROJECT [id, v] stats={rows=3}
-      SORT BY [id ASC NULLS FIRST] stats={rows=3}
-        GATHER EXCHANGE stats={rows=3}
-          PROJECT [id, v] stats={rows=3}
-            PROJECT [id, v] stats={rows=3}
-              UNION ALL stats={rows=3}
-                UNION ALL stats={rows=2}
-                  PROJECT [2 AS id, 20 AS v] stats={rows=1}
-                    VALUES (1 rows) stats={rows=1}
-                  PROJECT [1 AS id, 10 AS v] stats={rows=1}
-                    VALUES (1 rows) stats={rows=1}
-                PROJECT [3 AS id, 30 AS v] stats={rows=1}
-                  VALUES (1 rows) stats={rows=1}
-Boundary Schemas:
-  Fragment 1 RESULT_ROOT node=10:
-    slot=1 name=id arrow=Int64 logical=<none> nullable=false
-    slot=2 name=v arrow=Int64 logical=<none> nullable=false
-  Fragment 0 RESULT_ROOT node=15:
-    slot=1 name=running_sum arrow=Int64 logical=<none> nullable=true
-  Fragment 1 EXCHANGE_SEND node=11:
-    slot=1 name=id arrow=Int64 logical=<none> nullable=false
-    slot=2 name=v arrow=Int64 logical=<none> nullable=false
-  Fragment 0 EXCHANGE_RECV node=11:
-    slot=1 name=id arrow=Int64 logical=<none> nullable=false
-    slot=2 name=v arrow=Int64 logical=<none> nullable=false
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+15:PROJECT [running_sum] stats={rows=3}
+  14:WINDOW [sum(v)] stats={rows=3}
+    13:PROJECT [id, v] stats={rows=3}
+      12:SORT BY [id ASC NULLS FIRST] stats={rows=3}
+        11:GATHER stats={rows=3}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 11
+    PARTITION: UNPARTITIONED
+10:PROJECT [id, v] stats={rows=3}
+  9:PROJECT [id, v] stats={rows=3}
+    8:UNION ALL stats={rows=3}
+      5:UNION ALL stats={rows=2}
+        2:PROJECT [2 AS id, 20 AS v] stats={rows=1}
+          1:VALUES (1 rows) stats={rows=1}
+        4:PROJECT [1 AS id, 10 AS v] stats={rows=1}
+          3:VALUES (1 rows) stats={rows=1}
+      7:PROJECT [3 AS id, 30 AS v] stats={rows=1}
+        6:VALUES (1 rows) stats={rows=1}

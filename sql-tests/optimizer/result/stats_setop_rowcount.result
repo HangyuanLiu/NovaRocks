@@ -1,119 +1,117 @@
 -- query 9
 Explain String
-GATHER EXCHANGE stats={rows=1600}
-  UNION ALL stats={rows=1600}
-    PROJECT [k] stats={rows=1000}
-      SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l stats={rows=1000}
-           TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l
-           columns: k
-           min-max stats
-    PROJECT [k] stats={rows=600}
-      SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r stats={rows=600}
-           TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r
-           columns: k
-           min-max stats
-Boundary Schemas:
-  Fragment 0 RESULT_ROOT node=5:
-    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+5:UNION ALL stats={rows=1600}
+  2:PROJECT [k] stats={rows=1000}
+    1:SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l stats={rows=1000}
+         TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l
+         columns: k
+         min-max stats
+  4:PROJECT [k] stats={rows=600}
+    3:SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r stats={rows=600}
+         TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r
+         columns: k
+         min-max stats
 
 -- query 10
 Explain String
-GATHER EXCHANGE stats={rows=1200}
-  UNION stats={rows=1200}
-    HASH EXCHANGE (source: ShuffleJoin, hash: [c1]) stats={rows=1000}
-      PROJECT [k] stats={rows=1000}
-        SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l stats={rows=1000}
-             TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l
-             columns: k
-             min-max stats
-    HASH EXCHANGE (source: ShuffleJoin, hash: [c4]) stats={rows=600}
-      PROJECT [k] stats={rows=600}
-        SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r stats={rows=600}
-             TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r
-             columns: k
-             min-max stats
-Boundary Schemas:
-  Fragment 2 RESULT_ROOT node=2:
-    slot=1 name=k arrow=Int32 logical=<none> nullable=true
-  Fragment 3 RESULT_ROOT node=5:
-    slot=1 name=k arrow=Int32 logical=<none> nullable=true
-  Fragment 1 RESULT_ROOT node=7:
-    slot=1 name=k arrow=Int32 logical=<none> nullable=true
-  Fragment 0 RESULT_ROOT node=9:
-    slot=1 name=k arrow=Int32 logical=<none> nullable=true
-  Fragment 2 EXCHANGE_SEND node=3:
-    slot=1 name=k arrow=Int32 logical=<none> nullable=true
-  Fragment 1 EXCHANGE_RECV node=3:
-    slot=1 name=k arrow=Int32 logical=<none> nullable=true
-  Fragment 3 EXCHANGE_SEND node=6:
-    slot=1 name=k arrow=Int32 logical=<none> nullable=true
-  Fragment 1 EXCHANGE_RECV node=6:
-    slot=1 name=k arrow=Int32 logical=<none> nullable=true
-  Fragment 1 EXCHANGE_SEND node=8:
-    slot=1 name=k arrow=Int32 logical=<none> nullable=true
-  Fragment 0 EXCHANGE_RECV node=8:
-    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+9:HASH AGGREGATE (SINGLE, group by: [k]) stats={rows=1200}
+  8:GATHER stats={rows=1200}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 8
+    PARTITION: UNPARTITIONED
+7:UNION ALL stats={rows=1200}
+  3:HASH EXCHANGE stats={rows=1000}
+  6:HASH EXCHANGE stats={rows=600}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 6
+    PARTITION: HASH_PARTITIONED (k)
+5:PROJECT [k] stats={rows=600}
+  4:SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r stats={rows=600}
+       TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r
+       columns: k
+       min-max stats
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: HASH_PARTITIONED (k)
+2:PROJECT [k] stats={rows=1000}
+  1:SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l stats={rows=1000}
+       TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l
+       columns: k
+       min-max stats
 
 -- query 11
 Explain String
-GATHER EXCHANGE stats={rows=300}
-  INTERSECT stats={rows=300}
-    HASH EXCHANGE (source: ShuffleJoin, hash: [c1]) stats={rows=1000}
-      PROJECT [k] stats={rows=1000}
-        SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l stats={rows=1000}
-             TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l
-             columns: k
-             min-max stats
-    HASH EXCHANGE (source: ShuffleJoin, hash: [c4]) stats={rows=600}
-      PROJECT [k] stats={rows=600}
-        SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r stats={rows=600}
-             TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r
-             columns: k
-             min-max stats
-Boundary Schemas:
-  Fragment 1 RESULT_ROOT node=2:
-    slot=1 name=k arrow=Int32 logical=<none> nullable=true
-  Fragment 2 RESULT_ROOT node=5:
-    slot=1 name=k arrow=Int32 logical=<none> nullable=true
-  Fragment 0 RESULT_ROOT node=7:
-    slot=1 name=k arrow=Int32 logical=<none> nullable=true
-  Fragment 1 EXCHANGE_SEND node=3:
-    slot=1 name=k arrow=Int32 logical=<none> nullable=true
-  Fragment 0 EXCHANGE_RECV node=3:
-    slot=1 name=k arrow=Int32 logical=<none> nullable=true
-  Fragment 2 EXCHANGE_SEND node=6:
-    slot=1 name=k arrow=Int32 logical=<none> nullable=true
-  Fragment 0 EXCHANGE_RECV node=6:
-    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+7:INTERSECT stats={rows=300}
+  3:HASH EXCHANGE stats={rows=1000}
+  6:HASH EXCHANGE stats={rows=600}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 6
+    PARTITION: HASH_PARTITIONED (k)
+5:PROJECT [k] stats={rows=600}
+  4:SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r stats={rows=600}
+       TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r
+       columns: k
+       min-max stats
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: HASH_PARTITIONED (k)
+2:PROJECT [k] stats={rows=1000}
+  1:SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l stats={rows=1000}
+       TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l
+       columns: k
+       min-max stats
 
 -- query 12
 Explain String
-GATHER EXCHANGE stats={rows=500}
-  EXCEPT stats={rows=500}
-    HASH EXCHANGE (source: ShuffleJoin, hash: [c1]) stats={rows=1000}
-      PROJECT [k] stats={rows=1000}
-        SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l stats={rows=1000}
-             TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l
-             columns: k
-             min-max stats
-    HASH EXCHANGE (source: ShuffleJoin, hash: [c4]) stats={rows=600}
-      PROJECT [k] stats={rows=600}
-        SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r stats={rows=600}
-             TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r
-             columns: k
-             min-max stats
-Boundary Schemas:
-  Fragment 1 RESULT_ROOT node=2:
-    slot=1 name=k arrow=Int32 logical=<none> nullable=true
-  Fragment 2 RESULT_ROOT node=5:
-    slot=1 name=k arrow=Int32 logical=<none> nullable=true
-  Fragment 0 RESULT_ROOT node=7:
-    slot=1 name=k arrow=Int32 logical=<none> nullable=true
-  Fragment 1 EXCHANGE_SEND node=3:
-    slot=1 name=k arrow=Int32 logical=<none> nullable=true
-  Fragment 0 EXCHANGE_RECV node=3:
-    slot=1 name=k arrow=Int32 logical=<none> nullable=true
-  Fragment 2 EXCHANGE_SEND node=6:
-    slot=1 name=k arrow=Int32 logical=<none> nullable=true
-  Fragment 0 EXCHANGE_RECV node=6:
-    slot=1 name=k arrow=Int32 logical=<none> nullable=true
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+7:EXCEPT stats={rows=500}
+  3:HASH EXCHANGE stats={rows=1000}
+  6:HASH EXCHANGE stats={rows=600}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 6
+    PARTITION: HASH_PARTITIONED (k)
+5:PROJECT [k] stats={rows=600}
+  4:SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r stats={rows=600}
+       TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r
+       columns: k
+       min-max stats
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: HASH_PARTITIONED (k)
+2:PROJECT [k] stats={rows=1000}
+  1:SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l stats={rows=1000}
+       TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l
+       columns: k
+       min-max stats

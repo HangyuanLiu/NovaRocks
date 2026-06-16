@@ -15,10 +15,11 @@ use crate::sql::planner::plan::ScanVariantColumn;
 use super::fragment::{DistributedPlan, PlanFragment};
 use super::kind::{
     DistributedAssertOneRowNode, DistributedDecodeNode, DistributedExchangeNode,
-    DistributedGenerateSeriesNode, DistributedHashAggregateNode, DistributedHashJoinNode,
-    DistributedNestLoopJoinNode, DistributedProjectNode, DistributedRepeatNode,
-    DistributedScanNode, DistributedSetOpNode, DistributedSortNode, DistributedTableFunctionNode,
-    DistributedTopNNode, DistributedValuesNode, DistributedWindowNode, ExchangeFlavor, SetOpKind,
+    DistributedFilterNode, DistributedGenerateSeriesNode, DistributedHashAggregateNode,
+    DistributedHashJoinNode, DistributedNestLoopJoinNode, DistributedProjectNode,
+    DistributedRepeatNode, DistributedScanNode, DistributedSetOpNode, DistributedSortNode,
+    DistributedTableFunctionNode, DistributedTopNNode, DistributedValuesNode,
+    DistributedWindowNode, ExchangeFlavor, SetOpKind,
 };
 use super::node::{DistributedPlanNode, DistributedPlanNodeKind, PlanNodeStats};
 
@@ -29,9 +30,6 @@ pub(crate) fn explain_distributed_plan(dp: &DistributedPlan, level: ExplainLevel
 
     for (display_id, fragment) in fragments.iter().enumerate() {
         if detailed {
-            if !out.is_empty() {
-                out.push(String::new());
-            }
             out.push(format!("PLAN FRAGMENT {display_id}"));
             out.push(format!(
                 "  OUTPUT EXPRS: {}",
@@ -115,6 +113,11 @@ fn format_distributed_node(
         }
         DistributedPlanNodeKind::Project(project) => {
             format_project_node(node, project, &pad, &costs_suffix, &stats_suffix, out);
+            push_probe_rf_lines(&node.probe_runtime_filters, level, &pad, out);
+            format_children(node, level, indent, out);
+        }
+        DistributedPlanNodeKind::Filter(filter) => {
+            format_filter_node(node, filter, &pad, &costs_suffix, &stats_suffix, out);
             push_probe_rf_lines(&node.probe_runtime_filters, level, &pad, out);
             format_children(node, level, indent, out);
         }
@@ -280,6 +283,24 @@ fn format_project_node(
         "{pad}{}PROJECT [{}]{costs_suffix}{stats_suffix}",
         node_prefix(node),
         items.join(", ")
+    ));
+}
+
+fn format_filter_node(
+    node: &DistributedPlanNode,
+    filter: &DistributedFilterNode,
+    pad: &str,
+    costs_suffix: &str,
+    stats_suffix: &str,
+    out: &mut Vec<String>,
+) {
+    out.push(format!(
+        "{pad}{}FILTER{costs_suffix}{stats_suffix}",
+        node_prefix(node)
+    ));
+    out.push(format!(
+        "{pad}  predicate: {}",
+        format_expr(&filter.predicate)
     ));
 }
 

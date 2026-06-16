@@ -1,79 +1,57 @@
 -- query 5
 Explain String
-GATHER EXCHANGE stats={rows=126562500}
-  PROJECT [l.lk AS lk, r.rk AS rk] stats={rows=126562500}
-    HASH JOIN (BROADCAST, INNER, eq: [l.lk = r.rk]) stats={rows=126562500}
-      build runtime filters:
-      - filter_id = 0, build_expr = (r.rk)
-      SCAN db_sqlt_78546de01468a3d3.g7_l (alias=l) stats={rows=22500}
-           TABLE: db_sqlt_78546de01468a3d3.g7_l
-           columns: lk
-           min-max stats
-           predicates: l.lk = 10 AND l.lk IS NOT NULL
-          probe runtime filters:
-          - filter_id = 0, probe_expr = (l.lk)
-      BROADCAST EXCHANGE stats={rows=22500}
-        SCAN db_sqlt_78546de01468a3d3.g7_r (alias=r) stats={rows=22500}
-             TABLE: db_sqlt_78546de01468a3d3.g7_r
-             columns: rk
-             min-max stats
-             predicates: r.rk = 10 AND r.rk IS NOT NULL
-Boundary Schemas:
-  Fragment 1 RESULT_ROOT node=2:
-    slot=1 name=rk arrow=Int64 logical=<none> nullable=true
-    slot=2 name=payload arrow=Int64 logical=<none> nullable=true
-    slot=3 name=_file arrow=Utf8 logical=<none> nullable=false
-    slot=4 name=_pos arrow=Int64 logical=<none> nullable=false
-  Fragment 0 RESULT_ROOT node=5:
-    slot=1 name=lk arrow=Int64 logical=<none> nullable=true
-    slot=2 name=rk arrow=Int64 logical=<none> nullable=true
-  Fragment 1 EXCHANGE_SEND node=3:
-    slot=1 name=rk arrow=Int64 logical=<none> nullable=true
-    slot=2 name=payload arrow=Int64 logical=<none> nullable=true
-    slot=3 name=_file arrow=Utf8 logical=<none> nullable=false
-    slot=4 name=_pos arrow=Int64 logical=<none> nullable=false
-  Fragment 0 EXCHANGE_RECV node=3:
-    slot=1 name=rk arrow=Int64 logical=<none> nullable=true
-    slot=2 name=payload arrow=Int64 logical=<none> nullable=true
-    slot=3 name=_file arrow=Utf8 logical=<none> nullable=false
-    slot=4 name=_pos arrow=Int64 logical=<none> nullable=false
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+5:PROJECT [l.lk AS lk, r.rk AS rk] stats={rows=126562500}
+  4:HASH JOIN (BROADCAST, INNER, eq: [l.lk = r.rk]) stats={rows=126562500}
+    build runtime filters:
+    - filter_id = 0, build_expr = (r.rk)
+    1:SCAN db_sqlt_78546de01468a3d3.g7_l (alias=l) stats={rows=22500}
+         TABLE: db_sqlt_78546de01468a3d3.g7_l
+         columns: lk
+         min-max stats
+         predicates: l.lk = 10 AND l.lk IS NOT NULL
+        probe runtime filters:
+        - filter_id = 0, probe_expr = (l.lk)
+    3:GATHER stats={rows=22500}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: UNPARTITIONED
+2:SCAN db_sqlt_78546de01468a3d3.g7_r (alias=r) stats={rows=22500}
+     TABLE: db_sqlt_78546de01468a3d3.g7_r
+     columns: rk
+     min-max stats
+     predicates: r.rk = 10 AND r.rk IS NOT NULL
 
 -- query 6
 Explain String
-GATHER EXCHANGE stats={rows=126562500}
-  PROJECT [l.lk AS lk, r.rk AS rk] stats={rows=126562500}
-    HASH JOIN (BROADCAST, INNER, eq: [l.lk = r.rk]) stats={rows=126562500}
-      build runtime filters:
-      - filter_id = 0, build_expr = (r.rk)
-      SCAN db_sqlt_78546de01468a3d3.g7_l (alias=l) stats={rows=22500}
-           TABLE: db_sqlt_78546de01468a3d3.g7_l
-           columns: lk
-           min-max stats
-           predicates: l.lk = 20 AND l.lk IS NOT NULL
-          probe runtime filters:
-          - filter_id = 0, probe_expr = (l.lk)
-      BROADCAST EXCHANGE stats={rows=22500}
-        SCAN db_sqlt_78546de01468a3d3.g7_r (alias=r) stats={rows=22500}
-             TABLE: db_sqlt_78546de01468a3d3.g7_r
-             columns: rk
-             min-max stats
-             predicates: r.rk = 20 AND r.rk IS NOT NULL
-Boundary Schemas:
-  Fragment 1 RESULT_ROOT node=2:
-    slot=1 name=rk arrow=Int64 logical=<none> nullable=true
-    slot=2 name=payload arrow=Int64 logical=<none> nullable=true
-    slot=3 name=_file arrow=Utf8 logical=<none> nullable=false
-    slot=4 name=_pos arrow=Int64 logical=<none> nullable=false
-  Fragment 0 RESULT_ROOT node=5:
-    slot=1 name=lk arrow=Int64 logical=<none> nullable=true
-    slot=2 name=rk arrow=Int64 logical=<none> nullable=true
-  Fragment 1 EXCHANGE_SEND node=3:
-    slot=1 name=rk arrow=Int64 logical=<none> nullable=true
-    slot=2 name=payload arrow=Int64 logical=<none> nullable=true
-    slot=3 name=_file arrow=Utf8 logical=<none> nullable=false
-    slot=4 name=_pos arrow=Int64 logical=<none> nullable=false
-  Fragment 0 EXCHANGE_RECV node=3:
-    slot=1 name=rk arrow=Int64 logical=<none> nullable=true
-    slot=2 name=payload arrow=Int64 logical=<none> nullable=true
-    slot=3 name=_file arrow=Utf8 logical=<none> nullable=false
-    slot=4 name=_pos arrow=Int64 logical=<none> nullable=false
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+5:PROJECT [l.lk AS lk, r.rk AS rk] stats={rows=126562500}
+  4:HASH JOIN (BROADCAST, INNER, eq: [l.lk = r.rk]) stats={rows=126562500}
+    build runtime filters:
+    - filter_id = 0, build_expr = (r.rk)
+    1:SCAN db_sqlt_78546de01468a3d3.g7_l (alias=l) stats={rows=22500}
+         TABLE: db_sqlt_78546de01468a3d3.g7_l
+         columns: lk
+         min-max stats
+         predicates: l.lk = 20 AND l.lk IS NOT NULL
+        probe runtime filters:
+        - filter_id = 0, probe_expr = (l.lk)
+    3:GATHER stats={rows=22500}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: UNPARTITIONED
+2:SCAN db_sqlt_78546de01468a3d3.g7_r (alias=r) stats={rows=22500}
+     TABLE: db_sqlt_78546de01468a3d3.g7_r
+     columns: rk
+     min-max stats
+     predicates: r.rk = 20 AND r.rk IS NOT NULL

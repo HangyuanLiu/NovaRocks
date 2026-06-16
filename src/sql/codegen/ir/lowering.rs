@@ -1133,6 +1133,50 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     ordering: OrderingSpec::Any,
                 }
             }
+            super::node::DistributedPlanNodeKind::Filter(filter) => {
+                if node.children.len() != 1 {
+                    return Err(format!(
+                        "DistributedPlan Filter node_id={} expected 1 child, got {}",
+                        node.node_id,
+                        node.children.len()
+                    ));
+                }
+                let mut child = self.lower_node(&node.children[0])?;
+                let conjunct_refs = split_and_conjuncts_typed(&filter.predicate);
+                let mut conjuncts = Vec::with_capacity(conjunct_refs.len());
+                let mut compiler = ExprCompiler::new(self.state.slot_allocator(), &child.scope);
+                for conjunct in conjunct_refs {
+                    conjuncts.push(compiler.compile_typed(conjunct)?);
+                }
+
+                if !conjuncts.is_empty() {
+                    if let Some(first_node) = child.plan_nodes.first_mut() {
+                        let node_id = first_node.node_id;
+                        let extra_conjuncts = conjuncts.clone();
+                        first_node
+                            .conjuncts
+                            .get_or_insert_with(Vec::new)
+                            .extend(conjuncts);
+                        nodes::append_hdfs_scan_min_max_conjuncts(first_node, &extra_conjuncts);
+                        if let Some(planned) = self
+                            .state
+                            .scan_tables()
+                            .iter_mut()
+                            .find(|planned| planned.scan_node_id == node_id)
+                        {
+                            planned.min_max_conjuncts.extend(extra_conjuncts);
+                        }
+                    }
+                }
+
+                LoweredDistributedNode {
+                    plan_nodes: child.plan_nodes,
+                    scope: child.scope,
+                    tuple_ids: child.tuple_ids,
+                    output_columns: child.output_columns,
+                    ordering: child.ordering,
+                }
+            }
             super::node::DistributedPlanNodeKind::Sort(sort) => {
                 if node.children.len() != 1 {
                     return Err(format!(

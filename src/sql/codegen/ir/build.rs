@@ -16,10 +16,11 @@ use super::FragmentId;
 use super::fragment::{DataPartition, DataSink, DistributedPlan, PartitionKind, PlanFragment};
 use super::kind::{
     DistributedAssertOneRowNode, DistributedDecodeNode, DistributedExchangeNode,
-    DistributedGenerateSeriesNode, DistributedHashAggregateNode, DistributedHashJoinNode,
-    DistributedNestLoopJoinNode, DistributedProjectNode, DistributedRepeatNode,
-    DistributedScanNode, DistributedSetOpNode, DistributedSortNode, DistributedTableFunctionNode,
-    DistributedTopNNode, DistributedValuesNode, DistributedWindowNode, ExchangeFlavor, SetOpKind,
+    DistributedFilterNode, DistributedGenerateSeriesNode, DistributedHashAggregateNode,
+    DistributedHashJoinNode, DistributedNestLoopJoinNode, DistributedProjectNode,
+    DistributedRepeatNode, DistributedScanNode, DistributedSetOpNode, DistributedSortNode,
+    DistributedTableFunctionNode, DistributedTopNNode, DistributedValuesNode,
+    DistributedWindowNode, ExchangeFlavor, SetOpKind,
 };
 use super::node::{DistributedPlanNode, DistributedPlanNodeKind, PlanNodeStats};
 
@@ -93,12 +94,30 @@ impl DistributedPlanBuilder {
             Operator::PhysicalFilter(op) => {
                 let child_plan = expect_single_child(node, "PhysicalFilter")?;
                 let mut child = self.visit(child_plan)?;
-                fold_filter_into_scan(&mut child, &op.predicate)?;
-                child.stats = PlanNodeStats::from_statistics(&node.stats);
-                child
-                    .probe_runtime_filters
-                    .extend(node.probe_runtime_filters.clone());
-                Ok(child)
+                if fold_filter_into_scan(&mut child, &op.predicate) {
+                    child.stats = PlanNodeStats::from_statistics(&node.stats);
+                    child
+                        .probe_runtime_filters
+                        .extend(node.probe_runtime_filters.clone());
+                    Ok(child)
+                } else {
+                    let node_id = self.alloc_node();
+                    Ok(DistributedPlanNode {
+                        node_id,
+                        fragment_id,
+                        tuple_ids: child.tuple_ids.clone(),
+                        nullable_tuple_ids: vec![],
+                        limit: -1,
+                        execution_join_distribution: node.execution_props.join_distribution,
+                        build_runtime_filters: node.build_runtime_filters.clone(),
+                        probe_runtime_filters: node.probe_runtime_filters.clone(),
+                        children: vec![child],
+                        stats: PlanNodeStats::from_statistics(&node.stats),
+                        kind: DistributedPlanNodeKind::Filter(DistributedFilterNode {
+                            predicate: op.predicate.clone(),
+                        }),
+                    })
+                }
             }
             Operator::PhysicalProject(op) => {
                 let child_plan = expect_single_child(node, "PhysicalProject")?;
@@ -1080,16 +1099,14 @@ fn limit_child_can_apply_offset_locally(child: &PhysicalPlanNode) -> bool {
     )
 }
 
-fn fold_filter_into_scan(
-    node: &mut DistributedPlanNode,
-    predicate: &TypedExpr,
-) -> Result<(), String> {
-    let DistributedPlanNodeKind::Scan(scan) = &mut node.kind else {
-        return Err("build_distributed_plan slice 1: Filter child is not a Scan".to_string());
-    };
-    scan.predicates
-        .extend(split_and_conjuncts_typed(predicate).into_iter().cloned());
-    Ok(())
+fn fold_filter_into_scan(node: &mut DistributedPlanNode, predicate: &TypedExpr) -> bool {
+    if let DistributedPlanNodeKind::Scan(scan) = &mut node.kind {
+        scan.predicates
+            .extend(split_and_conjuncts_typed(predicate).into_iter().cloned());
+        true
+    } else {
+        false
+    }
 }
 
 fn data_partition_for_distribution_spec(
@@ -1324,13 +1341,17 @@ mod tests {
     }
 
     #[test]
-    fn build_distributed_plan_rejects_filter_over_project() {
+    fn build_distributed_plan_preserves_filter_over_project() {
         let physical = filter_over_project_plan();
-        let err = build_distributed_plan(&physical).expect_err("filter over project should fail");
-        assert_eq!(
-            err,
-            "build_distributed_plan slice 1: Filter child is not a Scan"
-        );
+        let dp = build_distributed_plan(&physical).expect("build_distributed_plan");
+        let root = &dp.fragments[0].root;
+
+        assert!(matches!(root.kind, DistributedPlanNodeKind::Filter(_)));
+        assert_eq!(root.children.len(), 1);
+        assert!(matches!(
+            root.children[0].kind,
+            DistributedPlanNodeKind::Project(_)
+        ));
     }
 
     #[test]

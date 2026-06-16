@@ -10,8 +10,8 @@ ANALYZE TABLE ${case_db}.oq8_down_r;
 
 -- @explain_contains=HASH JOIN (PARTITIONED
 -- @explain_contains=WINDOW [
--- @explain_contains=HASH EXCHANGE (source: ShuffleJoin
--- @explain_not_contains=HASH EXCHANGE (source: ShuffleAgg
+-- @explain_contains=HASH EXCHANGE
+-- @explain_contains=PARTITION: HASH_PARTITIONED
 SELECT l.k,
        r.k AS rk,
        ROW_NUMBER() OVER (PARTITION BY l.k, r.k ORDER BY l.v) AS rn

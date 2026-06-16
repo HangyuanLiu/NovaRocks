@@ -32,6 +32,11 @@ pub(crate) struct DistributedProjectNode {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct DistributedFilterNode {
+    pub predicate: TypedExpr,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct DistributedSortNode {
     pub items: Vec<SortItem>,
     pub analytic_partition_exprs: Vec<TypedExpr>,

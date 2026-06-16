@@ -6,10 +6,11 @@ use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence, Statistics}
 use super::FragmentId;
 use super::kind::{
     DistributedAssertOneRowNode, DistributedDecodeNode, DistributedExchangeNode,
-    DistributedGenerateSeriesNode, DistributedHashAggregateNode, DistributedHashJoinNode,
-    DistributedNestLoopJoinNode, DistributedProjectNode, DistributedRepeatNode,
-    DistributedScanNode, DistributedSetOpNode, DistributedSortNode, DistributedTableFunctionNode,
-    DistributedTopNNode, DistributedValuesNode, DistributedWindowNode,
+    DistributedFilterNode, DistributedGenerateSeriesNode, DistributedHashAggregateNode,
+    DistributedHashJoinNode, DistributedNestLoopJoinNode, DistributedProjectNode,
+    DistributedRepeatNode, DistributedScanNode, DistributedSetOpNode, DistributedSortNode,
+    DistributedTableFunctionNode, DistributedTopNNode, DistributedValuesNode,
+    DistributedWindowNode,
 };
 
 /// Self-contained copy of the estimated stats this node carries, so EXPLAIN /
@@ -54,11 +55,11 @@ pub(crate) struct DistributedPlanNode {
 }
 
 /// Operator-specific payload. Grows one variant per operator as slices land.
-/// Filter has no variant: its predicate folds into the child's `DistributedScanNode.predicates`.
 #[derive(Clone, Debug)]
 pub(crate) enum DistributedPlanNodeKind {
     Scan(Box<DistributedScanNode>),
     Project(DistributedProjectNode),
+    Filter(DistributedFilterNode),
     Sort(DistributedSortNode),
     TopN(DistributedTopNNode),
     Exchange(DistributedExchangeNode),

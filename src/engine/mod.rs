@@ -3224,10 +3224,8 @@ fn explain_analyze_query(
     query_opts: Option<crate::internal_service::TQueryOptions>,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
-    use crate::sql::codegen::fragment_builder::PlanFragmentBuilder;
-    use crate::sql::explain::{
-        ExplainLevel, explain_physical_plan, format_boundary_schema_reports,
-    };
+    use crate::sql::codegen::ir::{build_distributed_plan, explain_distributed_plan};
+    use crate::sql::explain::ExplainLevel;
 
     // NOTE: planning_ms covers only the outer analyze + plan_query +
     // optimize call below; execute_query re-plans internally and its
@@ -3275,12 +3273,8 @@ fn explain_analyze_query(
     lines.push(format!(
         "Planning: {planning_ms} ms / Execution: {execution_ms} ms / Rows: {rows}"
     ));
-    lines.extend(explain_physical_plan(&physical, ExplainLevel::Analyze));
-    let build_result =
-        PlanFragmentBuilder::build(&physical, codegen_catalog, connectors, current_database)?;
-    lines.extend(format_boundary_schema_reports(
-        &build_result.boundary_schemas,
-    ));
+    let dp = build_distributed_plan(&physical)?;
+    lines.extend(explain_distributed_plan(&dp, ExplainLevel::Analyze));
 
     build_string_query_result("Explain String", lines)
 }
@@ -3289,16 +3283,14 @@ fn explain_analyze_query(
 fn explain_query(
     query: &sqlparser::ast::Query,
     analyzer_catalog: &dyn crate::sql::catalog::CatalogProvider,
-    codegen_catalog: &InMemoryCatalog,
-    connectors: &crate::connector::ConnectorRegistry,
+    _codegen_catalog: &InMemoryCatalog,
+    _connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     level: crate::sql::explain::ExplainLevel,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
-    use crate::sql::codegen::fragment_builder::PlanFragmentBuilder;
-    use crate::sql::explain::{
-        ExplainLevel, explain_physical_plan, format_boundary_schema_reports,
-    };
+    use crate::sql::codegen::ir::{build_distributed_plan, explain_distributed_plan};
+    use crate::sql::explain::ExplainLevel;
 
     let (resolved, cte_registry, mut factory) =
         crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
@@ -3330,14 +3322,8 @@ fn explain_query(
             ));
         }
     }
-    lines.extend(explain_physical_plan(&physical, level));
-    if matches!(level, ExplainLevel::Verbose | ExplainLevel::Analyze) {
-        let build_result =
-            PlanFragmentBuilder::build(&physical, codegen_catalog, connectors, current_database)?;
-        lines.extend(format_boundary_schema_reports(
-            &build_result.boundary_schemas,
-        ));
-    }
+    let dp = build_distributed_plan(&physical)?;
+    lines.extend(explain_distributed_plan(&dp, level));
 
     build_string_query_result("Explain String", lines)
 }
