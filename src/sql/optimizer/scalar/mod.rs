@@ -13,7 +13,7 @@ use std::hash::{Hash, Hasher};
 
 use arrow::datatypes::DataType;
 
-use crate::sql::analysis::{BinOp, LiteralValue};
+use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
 use crate::sql::column_id::ColumnId;
 
 /// `LiteralValue` is only `PartialEq` (it holds `Float(f64)` / `Decimal(String)`),
@@ -143,6 +143,39 @@ impl ScalarArena {
     }
 }
 
+/// Recursively intern an analyzer `TypedExpr` into the arena, returning its id.
+/// M0 covers ColumnRef / Literal / BinaryOp / FunctionCall; Task 5 extends to
+/// every remaining `ExprKind` variant.
+pub(crate) fn intern_typed(arena: &mut ScalarArena, expr: &TypedExpr) -> ScalarId {
+    let node = match &expr.kind {
+        ExprKind::ColumnRef { column_id, .. } => ScalarNode::ColumnRef(*column_id),
+        ExprKind::Literal(v) => ScalarNode::Literal(HashableLiteral(v.clone())),
+        ExprKind::BinaryOp { left, op, right } => {
+            let l = intern_typed(arena, left);
+            let r = intern_typed(arena, right);
+            ScalarNode::BinaryOp {
+                op: *op,
+                left: l,
+                right: r,
+            }
+        }
+        ExprKind::FunctionCall {
+            name,
+            args,
+            distinct,
+        } => {
+            let arg_ids: Vec<ScalarId> = args.iter().map(|a| intern_typed(arena, a)).collect();
+            ScalarNode::FunctionCall {
+                name: name.clone(),
+                args: arg_ids,
+                distinct: *distinct,
+            }
+        }
+        other => unimplemented!("intern_typed: ExprKind variant not covered in M0: {other:?}"),
+    };
+    arena.intern(node, expr.data_type.clone(), expr.nullable)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,5 +272,61 @@ mod tests {
             false,
         );
         assert_ne!(sub_xy, sub_yx, "Sub must NOT be normalized");
+    }
+}
+
+#[cfg(test)]
+mod bridge_tests {
+    use super::*;
+    use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
+    use crate::sql::column_id::ColumnId;
+    use arrow::datatypes::DataType;
+
+    fn col(id: u32, ty: DataType) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId(id),
+                qualifier: None,
+                column: format!("c{id}"),
+            },
+            data_type: ty,
+            nullable: false,
+        }
+    }
+
+    fn lit_int(v: i64) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Int(v)),
+            data_type: DataType::Int64,
+            nullable: false,
+        }
+    }
+
+    fn eq(l: TypedExpr, r: TypedExpr) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(l),
+                op: BinOp::Eq,
+                right: Box::new(r),
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        }
+    }
+
+    #[test]
+    fn intern_typed_dedups_independent_identical_exprs() {
+        let mut a = ScalarArena::new();
+        // Independently constructed but structurally identical TypedExpr trees
+        // must intern to the same ScalarId.
+        let id1 = intern_typed(&mut a, &eq(col(1, DataType::Int64), lit_int(5)));
+        let id2 = intern_typed(&mut a, &eq(col(1, DataType::Int64), lit_int(5)));
+        assert_eq!(
+            id1, id2,
+            "structurally-identical TypedExprs must intern to one ScalarId"
+        );
+
+        let id3 = intern_typed(&mut a, &eq(col(1, DataType::Int64), lit_int(6)));
+        assert_ne!(id1, id3);
     }
 }
