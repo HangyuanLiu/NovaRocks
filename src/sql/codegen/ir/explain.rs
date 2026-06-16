@@ -658,7 +658,12 @@ fn is_detailed(level: ExplainLevel) -> bool {
 
 fn costs_suffix(stats: &PlanNodeStats, level: ExplainLevel) -> String {
     if matches!(level, ExplainLevel::Costs) {
-        format!(" (rows={:.0})", stats.output_row_count)
+        let colstats = format_column_stats_costs(stats);
+        if colstats.is_empty() {
+            format!(" (rows={:.0})", stats.output_row_count)
+        } else {
+            format!(" (rows={:.0}) {colstats}", stats.output_row_count)
+        }
     } else {
         String::new()
     }
@@ -695,6 +700,49 @@ fn format_stats_trailer(stats: &PlanNodeStats, show_conf: bool) -> String {
         ""
     };
     format!("stats={{rows={rows_str}{conf}}}")
+}
+
+fn format_column_stats_costs(stats: &PlanNodeStats) -> String {
+    if stats.column_statistics.is_empty() {
+        return String::new();
+    }
+    let mut ids: Vec<_> = stats.column_statistics.keys().copied().collect();
+    ids.sort_by_key(|id| id.0);
+    let parts = ids
+        .into_iter()
+        .map(|column_id| {
+            let c = &stats.column_statistics[&column_id];
+            let ndv = if c.distinct_values_count.is_finite() {
+                (c.distinct_values_count.round() as i64).to_string()
+            } else {
+                "?".to_string()
+            };
+            format!(
+                "col#{}[min={} max={} ndv={ndv} null_frac={}]",
+                column_id.0,
+                fmt_f64(c.min_value),
+                fmt_f64(c.max_value),
+                fmt_f64(c.nulls_fraction),
+            )
+        })
+        .collect::<Vec<_>>();
+    format!("colstats={{{}}}", parts.join(", "))
+}
+
+fn fmt_f64(v: f64) -> String {
+    if v.is_nan() {
+        "?".to_string()
+    } else if v.is_infinite() {
+        if v > 0.0 {
+            "+inf".to_string()
+        } else {
+            "-inf".to_string()
+        }
+    } else if v.fract() == 0.0 {
+        format!("{}", v as i64)
+    } else {
+        format!("{v:.4}")
+    }
 }
 
 fn push_build_rf_lines(
@@ -1005,9 +1053,11 @@ mod tests {
         AggMode, Operator, PhysicalDistributionOp, PhysicalHashAggregateOp, PhysicalProjectOp,
         PhysicalScanOp,
     };
+    use crate::sql::optimizer::options::OptimizerOptions;
     use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, PlanExecutionProps};
     use crate::sql::optimizer::property::DistributionSpec;
-    use crate::sql::optimizer::statistics::Statistics;
+    use crate::sql::optimizer::runtime_filter_pass::{self, test_support};
+    use crate::sql::optimizer::statistics::{ColumnStatistic, Statistics};
     use crate::sql::planner::plan::AggregateCall;
 
     #[test]
@@ -1049,6 +1099,73 @@ mod tests {
         assert!(
             text.contains("2:SORT BY [t.k ASC NULLS LAST] partition_limit=3 topn_type=RANK"),
             "expected ranking-window sort suffix in IR explain output:\n{text}"
+        );
+    }
+
+    #[test]
+    fn costs_renders_colstats_from_ir_stats_only_at_costs_level() {
+        let mut scan = scan_plan();
+        scan.stats.column_statistics.insert(
+            ColumnId::new_for_test(1),
+            ColumnStatistic {
+                min_value: 0.0,
+                max_value: 1000.0,
+                nulls_fraction: 0.0,
+                average_row_size: 8.0,
+                distinct_values_count: 1000.0,
+                ..Default::default()
+            },
+        );
+        let dp = build_distributed_plan(&scan).expect("build DistributedPlan");
+
+        let normal = explain_distributed_plan(&dp, ExplainLevel::Normal).join("\n");
+        let verbose = explain_distributed_plan(&dp, ExplainLevel::Verbose).join("\n");
+        let costs = explain_distributed_plan(&dp, ExplainLevel::Costs).join("\n");
+
+        assert!(
+            !normal.contains("colstats="),
+            "Normal must hide colstats:\n{normal}"
+        );
+        assert!(
+            !verbose.contains("colstats="),
+            "Verbose must hide colstats:\n{verbose}"
+        );
+        assert!(
+            costs.contains("colstats={col#1[min=0 max=1000 ndv=1000 null_frac=0]}"),
+            "Costs must render colstats copied into PlanNodeStats:\n{costs}"
+        );
+    }
+
+    #[test]
+    fn detailed_ir_explain_shows_build_and_probe_rf_but_normal_hides_them() {
+        let mut join = test_support::inner_join_two_scans();
+        runtime_filter_pass::annotate(&mut join, &OptimizerOptions::default_settings());
+        let dp = build_distributed_plan(&join).expect("build DistributedPlan");
+
+        for level in [
+            ExplainLevel::Verbose,
+            ExplainLevel::Costs,
+            ExplainLevel::Analyze,
+        ] {
+            let text = explain_distributed_plan(&dp, level).join("\n");
+            assert!(
+                text.contains("build runtime filters:"),
+                "missing build RF at {level:?}:\n{text}"
+            );
+            assert!(
+                text.contains("filter_id = 0"),
+                "missing RF id at {level:?}:\n{text}"
+            );
+            assert!(
+                text.contains("probe runtime filters:"),
+                "missing probe RF at {level:?}:\n{text}"
+            );
+        }
+
+        let normal = explain_distributed_plan(&dp, ExplainLevel::Normal).join("\n");
+        assert!(
+            !normal.contains("runtime filters:"),
+            "Normal must hide RF lines:\n{normal}"
         );
     }
 
