@@ -2,11 +2,11 @@ use crate::sql::optimizer::statistics::{Confidence, Statistics};
 
 use super::FragmentId;
 use super::kind::{
-    DistributedAssertOneRowNode, DistributedDecodeNode, DistributedGenerateSeriesNode,
-    DistributedHashAggregateNode, DistributedHashJoinNode, DistributedNestLoopJoinNode,
-    DistributedProjectNode, DistributedRepeatNode, DistributedScanNode, DistributedSetOpNode,
-    DistributedSortNode, DistributedTableFunctionNode, DistributedTopNNode, DistributedValuesNode,
-    DistributedWindowNode,
+    DistributedAssertOneRowNode, DistributedDecodeNode, DistributedExchangeNode,
+    DistributedGenerateSeriesNode, DistributedHashAggregateNode, DistributedHashJoinNode,
+    DistributedNestLoopJoinNode, DistributedProjectNode, DistributedRepeatNode,
+    DistributedScanNode, DistributedSetOpNode, DistributedSortNode, DistributedTableFunctionNode,
+    DistributedTopNNode, DistributedValuesNode, DistributedWindowNode,
 };
 
 /// Self-contained copy of the estimated stats this node carries, so EXPLAIN /
@@ -56,6 +56,7 @@ pub(crate) enum DistributedPlanNodeKind {
     Project(DistributedProjectNode),
     Sort(DistributedSortNode),
     TopN(DistributedTopNNode),
+    Exchange(DistributedExchangeNode),
     HashAggregate(Box<DistributedHashAggregateNode>),
     HashJoin(Box<DistributedHashJoinNode>),
     NestLoopJoin(DistributedNestLoopJoinNode),

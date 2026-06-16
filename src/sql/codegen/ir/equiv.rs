@@ -150,6 +150,18 @@ mod tests {
     }
 
     #[test]
+    fn gather_over_limit_fails_fast_until_limit_exchange() {
+        assert_distributed_plan_error_contains(
+            "gather_over_limit",
+            sort_plan(distribution_plan(
+                limit_plan(scan_plan(), Some(5), None),
+                DistributionSpec::Gather,
+            )),
+            "Gather over Limit is Task A4",
+        );
+    }
+
+    #[test]
     fn aggregate_single_over_scan_matches_direct_fragment_builder() {
         assert_distributed_plan_equivalent(
             "aggregate_single_over_scan",
@@ -166,6 +178,25 @@ mod tests {
     }
 
     #[test]
+    fn shuffle_agg_exchange_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "shuffle_agg_exchange",
+            aggregate_group_by_plan(distribution_plan(
+                scan_plan(),
+                DistributionSpec::shuffle_agg([ColumnId::new_for_test(1)]),
+            )),
+        );
+    }
+
+    #[test]
+    fn nested_gather_exchange_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "nested_gather_exchange",
+            sort_plan(distribution_plan(scan_plan(), DistributionSpec::Gather)),
+        );
+    }
+
+    #[test]
     fn sort_over_project_over_scan_matches_direct_fragment_builder() {
         assert_distributed_plan_equivalent(
             "sort_over_project_over_scan",
@@ -178,6 +209,30 @@ mod tests {
         assert_distributed_plan_equivalent(
             "inner_hash_join_two_scans",
             inner_hash_join_two_scans_plan(),
+        );
+    }
+
+    #[test]
+    fn broadcast_join_exchange_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "broadcast_join_exchange",
+            broadcast_join_exchange_plan(),
+        );
+    }
+
+    #[test]
+    fn two_sided_shuffle_join_exchange_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "two_sided_shuffle_join_exchange",
+            two_sided_shuffle_join_exchange_plan(),
+        );
+    }
+
+    #[test]
+    fn gather_root_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "gather_root",
+            root_gather_plan(project_plan(filter_plan(scan_plan()))),
         );
     }
 
@@ -900,6 +955,15 @@ mod tests {
         )
     }
 
+    fn distribution_plan(child: PhysicalPlanNode, spec: DistributionSpec) -> PhysicalPlanNode {
+        let output_columns = child.output_columns.clone();
+        physical_node(
+            Operator::PhysicalDistribution(PhysicalDistributionOp { spec }),
+            vec![child],
+            output_columns,
+        )
+    }
+
     fn inner_hash_join_two_scans_plan() -> PhysicalPlanNode {
         let (mut join, left_key, right_key) = hash_join_plan(JoinKind::Inner);
         join.children[0].probe_runtime_filters = vec![RuntimeFilterProbe {
@@ -914,6 +978,56 @@ mod tests {
             distribution: JoinDistribution::Broadcast,
         }];
         join
+    }
+
+    fn broadcast_join_exchange_plan() -> PhysicalPlanNode {
+        let left = aliased_scan_plan("l", 1, 2);
+        let right = distribution_plan(aliased_scan_plan("r", 3, 4), DistributionSpec::Broadcast);
+        let left_key = column_ref_expr_with_qualifier(1, "l", "k", DataType::Int64, false);
+        let right_key = column_ref_expr_with_qualifier(3, "r", "k", DataType::Int64, false);
+        let output_columns = join_output_columns(&left, &right, JoinOutput::Both);
+        physical_node(
+            Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: left_key,
+                    right: right_key,
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+            }),
+            vec![left, right],
+            output_columns,
+        )
+    }
+
+    fn two_sided_shuffle_join_exchange_plan() -> PhysicalPlanNode {
+        let left = distribution_plan(
+            aliased_scan_plan("l", 1, 2),
+            DistributionSpec::shuffle_agg([ColumnId::new_for_test(1)]),
+        );
+        let right = distribution_plan(
+            aliased_scan_plan("r", 3, 4),
+            DistributionSpec::shuffle_agg([ColumnId::new_for_test(3)]),
+        );
+        let left_key = column_ref_expr_with_qualifier(1, "l", "k", DataType::Int64, false);
+        let right_key = column_ref_expr_with_qualifier(3, "r", "k", DataType::Int64, false);
+        let output_columns = join_output_columns(&left, &right, JoinOutput::Both);
+        physical_node(
+            Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: left_key,
+                    right: right_key,
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Shuffle,
+            }),
+            vec![left, right],
+            output_columns,
+        )
     }
 
     fn left_outer_hash_join_plan() -> PhysicalPlanNode {

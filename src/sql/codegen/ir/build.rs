@@ -1,23 +1,34 @@
-use crate::sql::analysis::TypedExpr;
+use std::collections::HashMap;
+
+use crate::partitions;
+use crate::sql::analysis::cte::CteId;
+use crate::sql::analysis::{ExprKind, TypedExpr};
 use crate::sql::codegen::helpers::{group_win_exprs_by_sig, split_and_conjuncts_typed};
-use crate::sql::optimizer::operator::{Operator, TopNPhase};
+use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentStreamKind};
+use crate::sql::optimizer::operator::{Operator, PhysicalDistributionOp, TopNPhase};
 use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
-use crate::sql::optimizer::property::{OrderingSpec, window_ordering_spec};
+use crate::sql::optimizer::property::{DistributionSpec, OrderingSpec, window_ordering_spec};
 
 use super::FragmentId;
-use super::fragment::{DataPartition, DataSink, DistributedPlan, PlanFragment};
+use super::fragment::{DataPartition, DataSink, DistributedPlan, PartitionKind, PlanFragment};
 use super::kind::{
-    DistributedAssertOneRowNode, DistributedDecodeNode, DistributedGenerateSeriesNode,
-    DistributedHashAggregateNode, DistributedHashJoinNode, DistributedNestLoopJoinNode,
-    DistributedProjectNode, DistributedRepeatNode, DistributedScanNode, DistributedSetOpNode,
-    DistributedSortNode, DistributedTableFunctionNode, DistributedTopNNode, DistributedValuesNode,
-    DistributedWindowNode, SetOpKind,
+    DistributedAssertOneRowNode, DistributedDecodeNode, DistributedExchangeNode,
+    DistributedGenerateSeriesNode, DistributedHashAggregateNode, DistributedHashJoinNode,
+    DistributedNestLoopJoinNode, DistributedProjectNode, DistributedRepeatNode,
+    DistributedScanNode, DistributedSetOpNode, DistributedSortNode, DistributedTableFunctionNode,
+    DistributedTopNNode, DistributedValuesNode, DistributedWindowNode, ExchangeFlavor, SetOpKind,
 };
 use super::node::{DistributedPlanNode, DistributedPlanNodeKind, PlanNodeStats};
 
 struct DistributedPlanBuilder {
     next_node_id: i32,
     next_tuple_id: i32,
+    next_fragment_id: FragmentId,
+    fragment_stack: Vec<FragmentId>,
+    completed_fragments: Vec<PlanFragment>,
+    edges: Vec<FragmentEdge>,
+    #[allow(dead_code)]
+    cte_fragments: HashMap<CteId, usize>,
 }
 
 impl DistributedPlanBuilder {
@@ -33,11 +44,21 @@ impl DistributedPlanBuilder {
         tuple_id
     }
 
-    fn visit(
-        &mut self,
-        node: &PhysicalPlanNode,
-        fragment_id: FragmentId,
-    ) -> Result<DistributedPlanNode, String> {
+    fn alloc_fragment_id(&mut self) -> FragmentId {
+        let fragment_id = self.next_fragment_id;
+        self.next_fragment_id += 1;
+        fragment_id
+    }
+
+    fn current_fragment_id(&self) -> Result<FragmentId, String> {
+        self.fragment_stack
+            .last()
+            .copied()
+            .ok_or_else(|| "build_distributed_plan has no active fragment id".to_string())
+    }
+
+    fn visit(&mut self, node: &PhysicalPlanNode) -> Result<DistributedPlanNode, String> {
+        let fragment_id = self.current_fragment_id()?;
         match &node.op {
             Operator::PhysicalScan(op) => {
                 let node_id = self.alloc_node();
@@ -68,7 +89,7 @@ impl DistributedPlanBuilder {
             }
             Operator::PhysicalFilter(op) => {
                 let child_plan = expect_single_child(node, "PhysicalFilter")?;
-                let mut child = self.visit(child_plan, fragment_id)?;
+                let mut child = self.visit(child_plan)?;
                 fold_filter_into_scan(&mut child, &op.predicate)?;
                 child.stats = PlanNodeStats::from_statistics(&node.stats);
                 child
@@ -78,7 +99,7 @@ impl DistributedPlanBuilder {
             }
             Operator::PhysicalProject(op) => {
                 let child_plan = expect_single_child(node, "PhysicalProject")?;
-                let child = self.visit(child_plan, fragment_id)?;
+                let child = self.visit(child_plan)?;
                 let node_id = self.alloc_node();
                 let tuple_id = self.alloc_tuple();
                 Ok(DistributedPlanNode {
@@ -100,7 +121,7 @@ impl DistributedPlanBuilder {
             }
             Operator::PhysicalSort(op) => {
                 let child_plan = expect_single_child(node, "PhysicalSort")?;
-                let child = self.visit(child_plan, fragment_id)?;
+                let child = self.visit(child_plan)?;
                 let node_id = self.alloc_node();
                 Ok(DistributedPlanNode {
                     node_id,
@@ -136,7 +157,7 @@ impl DistributedPlanBuilder {
                     }
                 }
 
-                let mut child = self.visit(child_plan, fragment_id)?;
+                let mut child = self.visit(child_plan)?;
                 child.limit = op.limit.unwrap_or(-1);
                 child.stats = PlanNodeStats::from_statistics(&node.stats);
                 match &mut child.kind {
@@ -162,7 +183,7 @@ impl DistributedPlanBuilder {
                 match (op.phase, op.is_split) {
                     (TopNPhase::Final, true) => Err("TopN split is Phase 2".to_string()),
                     (TopNPhase::Final, false) | (TopNPhase::Partial, _) => {
-                        let child = self.visit(child_plan, fragment_id)?;
+                        let child = self.visit(child_plan)?;
                         let node_id = self.alloc_node();
                         Ok(DistributedPlanNode {
                             node_id,
@@ -188,7 +209,7 @@ impl DistributedPlanBuilder {
             }
             Operator::PhysicalHashAggregate(op) => {
                 let child_plan = expect_single_child(node, "PhysicalHashAggregate")?;
-                let child = self.visit(child_plan, fragment_id)?;
+                let child = self.visit(child_plan)?;
                 let agg_tuple_id = self.alloc_tuple();
                 let agg_node_id = self.alloc_node();
                 Ok(DistributedPlanNode {
@@ -213,10 +234,11 @@ impl DistributedPlanBuilder {
                     )),
                 })
             }
+            Operator::PhysicalDistribution(op) => self.visit_distribution(op, node),
             Operator::PhysicalHashJoin(op) => {
                 let (left_plan, right_plan) = expect_binary_children(node, "PhysicalHashJoin")?;
-                let left = self.visit(left_plan, fragment_id)?;
-                let right = self.visit(right_plan, fragment_id)?;
+                let left = self.visit(left_plan)?;
+                let right = self.visit(right_plan)?;
                 let node_id = self.alloc_node();
                 let mut tuple_ids = left.tuple_ids.clone();
                 tuple_ids.extend(right.tuple_ids.iter().copied());
@@ -241,8 +263,8 @@ impl DistributedPlanBuilder {
             }
             Operator::PhysicalNestLoopJoin(op) => {
                 let (left_plan, right_plan) = expect_binary_children(node, "PhysicalNestLoopJoin")?;
-                let left = self.visit(left_plan, fragment_id)?;
-                let right = self.visit(right_plan, fragment_id)?;
+                let left = self.visit(left_plan)?;
+                let right = self.visit(right_plan)?;
                 let node_id = self.alloc_node();
                 let mut tuple_ids = left.tuple_ids.clone();
                 tuple_ids.extend(right.tuple_ids.iter().copied());
@@ -291,7 +313,7 @@ impl DistributedPlanBuilder {
             }
             Operator::PhysicalAssertOneRow(op) => {
                 let child_plan = expect_single_child(node, "PhysicalAssertOneRow")?;
-                let child = self.visit(child_plan, fragment_id)?;
+                let child = self.visit(child_plan)?;
                 let node_id = self.alloc_node();
                 Ok(DistributedPlanNode {
                     node_id,
@@ -311,7 +333,7 @@ impl DistributedPlanBuilder {
             }
             Operator::PhysicalDecode(op) => {
                 let child_plan = expect_single_child(node, "PhysicalDecode")?;
-                let child = self.visit(child_plan, fragment_id)?;
+                let child = self.visit(child_plan)?;
                 let tuple_id = self.alloc_tuple();
                 let node_id = self.alloc_node();
                 Ok(DistributedPlanNode {
@@ -333,7 +355,7 @@ impl DistributedPlanBuilder {
             }
             Operator::PhysicalRepeat(op) => {
                 let child_plan = expect_single_child(node, "PhysicalRepeat")?;
-                let child = self.visit(child_plan, fragment_id)?;
+                let child = self.visit(child_plan)?;
                 let node_id = self.alloc_node();
                 let virtual_tuple_id = self.alloc_tuple();
                 let mut tuple_ids = child.tuple_ids.clone();
@@ -367,7 +389,7 @@ impl DistributedPlanBuilder {
             }
             Operator::PhysicalWindow(op) => {
                 let child_plan = expect_single_child(node, "PhysicalWindow")?;
-                let child = self.visit(child_plan, fragment_id)?;
+                let child = self.visit(child_plan)?;
                 let groups = group_win_exprs_by_sig(&op.window_exprs);
                 if groups.is_empty() {
                     return Err(
@@ -433,7 +455,6 @@ impl DistributedPlanBuilder {
                 }
                 self.visit_set_op(
                     node,
-                    fragment_id,
                     SetOpKind::UnionAll,
                     &op.output_columns,
                     &op.child_output_columns,
@@ -441,14 +462,12 @@ impl DistributedPlanBuilder {
             }
             Operator::PhysicalIntersect(op) => self.visit_set_op(
                 node,
-                fragment_id,
                 SetOpKind::Intersect,
                 &op.output_columns,
                 &op.child_output_columns,
             ),
             Operator::PhysicalExcept(op) => self.visit_set_op(
                 node,
-                fragment_id,
                 SetOpKind::Except,
                 &op.output_columns,
                 &op.child_output_columns,
@@ -490,7 +509,7 @@ impl DistributedPlanBuilder {
             }
             Operator::PhysicalTableFunction(op) => {
                 let child_plan = expect_single_child(node, "PhysicalTableFunction")?;
-                let child = self.visit(child_plan, fragment_id)?;
+                let child = self.visit(child_plan)?;
                 let _ = self.alloc_tuple();
                 let _ = self.alloc_node();
                 let output_tuple_id = self.alloc_tuple();
@@ -523,10 +542,80 @@ impl DistributedPlanBuilder {
         }
     }
 
+    fn visit_distribution(
+        &mut self,
+        op: &PhysicalDistributionOp,
+        node: &PhysicalPlanNode,
+    ) -> Result<DistributedPlanNode, String> {
+        if node.children.len() != 1 {
+            return Err(format!(
+                "PhysicalDistribution expected exactly 1 child, got {}",
+                node.children.len()
+            ));
+        }
+        if matches!(op.spec, DistributionSpec::Gather)
+            && matches!(node.children[0].op, Operator::PhysicalLimit(_))
+        {
+            return Err("Gather over Limit is Task A4".to_string());
+        }
+
+        let parent_fragment_id = self.current_fragment_id()?;
+        let child_fragment_id = self.alloc_fragment_id();
+        self.fragment_stack.push(child_fragment_id);
+        let child_result = self.visit(&node.children[0]);
+        self.fragment_stack.pop();
+        let child = child_result?;
+
+        let output_partition =
+            data_partition_for_distribution_spec(&op.spec, &node.children[0].output_columns)?;
+        let partition_type = partition_type_for_data_partition(&output_partition);
+        let exchange_node_id = self.alloc_node();
+        let edge_output_columns = node.children[0].output_columns.clone();
+
+        self.completed_fragments.push(PlanFragment {
+            fragment_id: child_fragment_id,
+            root: child.clone(),
+            data_partition: DataPartition::unpartitioned(),
+            output_partition: output_partition.clone(),
+            sink: DataSink::Noop,
+            output_exprs: None,
+            output_columns: edge_output_columns.clone(),
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+        });
+
+        self.edges.push(FragmentEdge {
+            source_fragment_id: child_fragment_id,
+            target_fragment_id: parent_fragment_id,
+            target_exchange_node_id: exchange_node_id,
+            output_partition: tdata_partition_placeholder(partition_type),
+            stream_kind: stream_kind_for_distribution(&op.spec),
+            edge_kind: FragmentEdgeKind::Stream,
+        });
+
+        Ok(DistributedPlanNode {
+            node_id: exchange_node_id,
+            fragment_id: parent_fragment_id,
+            tuple_ids: child.tuple_ids.clone(),
+            nullable_tuple_ids: vec![],
+            limit: -1,
+            execution_join_distribution: node.execution_props.join_distribution,
+            build_runtime_filters: node.build_runtime_filters.clone(),
+            probe_runtime_filters: node.probe_runtime_filters.clone(),
+            children: vec![],
+            stats: PlanNodeStats::from_statistics(&node.stats),
+            kind: DistributedPlanNodeKind::Exchange(DistributedExchangeNode {
+                partition_type,
+                partition_exprs: output_partition.exprs.clone(),
+                source_fragment_id: child_fragment_id,
+                flavor: ExchangeFlavor::Distribution,
+            }),
+        })
+    }
+
     fn visit_set_op(
         &mut self,
         node: &PhysicalPlanNode,
-        fragment_id: FragmentId,
         kind: SetOpKind,
         explicit_output_columns: &[crate::sql::analysis::OutputColumn],
         child_output_columns: &[Vec<crate::sql::analysis::OutputColumn>],
@@ -534,10 +623,11 @@ impl DistributedPlanBuilder {
         if node.children.is_empty() {
             return Err("set operation node has no inputs".to_string());
         }
+        let fragment_id = self.current_fragment_id()?;
 
         let mut children = Vec::with_capacity(node.children.len());
         for child in &node.children {
-            children.push(self.visit(child, fragment_id)?);
+            children.push(self.visit(child)?);
         }
 
         let output_columns = if !explicit_output_columns.is_empty() {
@@ -656,28 +746,122 @@ fn fold_filter_into_scan(
     Ok(())
 }
 
+fn data_partition_for_distribution_spec(
+    spec: &DistributionSpec,
+    output_columns: &[crate::sql::analysis::OutputColumn],
+) -> Result<DataPartition, String> {
+    match spec {
+        DistributionSpec::Gather | DistributionSpec::Broadcast => {
+            Ok(DataPartition::unpartitioned())
+        }
+        DistributionSpec::HashPartitioned { cols, .. } => {
+            let exprs = partition_exprs_for_columns(cols, output_columns);
+            if exprs.is_empty() {
+                Ok(DataPartition::unpartitioned())
+            } else {
+                Ok(DataPartition {
+                    kind: PartitionKind::Hash,
+                    exprs,
+                })
+            }
+        }
+        DistributionSpec::Any => {
+            Err("PhysicalDistribution(Any) is not supported in DistributedPlan builder".to_string())
+        }
+    }
+}
+
+fn partition_exprs_for_columns(
+    cols: &[crate::sql::column_id::ColumnId],
+    output_columns: &[crate::sql::analysis::OutputColumn],
+) -> Vec<TypedExpr> {
+    cols.iter()
+        .filter_map(|col_id| {
+            output_columns
+                .iter()
+                .find(|column| column.column_id == *col_id)
+                .map(|column| TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        column_id: column.column_id,
+                        qualifier: None,
+                        column: column.name.clone(),
+                    },
+                    data_type: column.data_type.clone(),
+                    nullable: column.nullable,
+                })
+        })
+        .collect()
+}
+
+fn partition_type_for_data_partition(partition: &DataPartition) -> partitions::TPartitionType {
+    match partition.kind {
+        PartitionKind::Unpartitioned => partitions::TPartitionType::UNPARTITIONED,
+        PartitionKind::Random => partitions::TPartitionType::RANDOM,
+        PartitionKind::Hash => partitions::TPartitionType::HASH_PARTITIONED,
+    }
+}
+
+fn tdata_partition_placeholder(
+    partition_type: partitions::TPartitionType,
+) -> partitions::TDataPartition {
+    partitions::TDataPartition::new(
+        partition_type,
+        None::<Vec<crate::exprs::TExpr>>,
+        None::<Vec<partitions::TRangePartition>>,
+        None::<Vec<partitions::TBucketProperty>>,
+    )
+}
+
+fn stream_kind_for_distribution(spec: &DistributionSpec) -> FragmentStreamKind {
+    match spec {
+        DistributionSpec::Gather => FragmentStreamKind::Gather,
+        DistributionSpec::Broadcast => FragmentStreamKind::Broadcast,
+        DistributionSpec::HashPartitioned { .. } => FragmentStreamKind::Partitioned,
+        DistributionSpec::Any => FragmentStreamKind::Other,
+    }
+}
+
 pub(crate) fn build_distributed_plan(plan: &PhysicalPlanNode) -> Result<DistributedPlan, String> {
     let mut builder = DistributedPlanBuilder {
         next_node_id: 1,
         next_tuple_id: 1,
+        next_fragment_id: 0,
+        fragment_stack: Vec::new(),
+        completed_fragments: Vec::new(),
+        edges: Vec::new(),
+        cte_fragments: HashMap::new(),
     };
-    let root_fragment_id = 0;
-    let root = builder.visit(plan, root_fragment_id)?;
+
+    let plan = match &plan.op {
+        Operator::PhysicalDistribution(op) if matches!(op.spec, DistributionSpec::Gather) => plan
+            .children
+            .first()
+            .ok_or_else(|| "root PhysicalDistribution(Gather) missing child".to_string())?,
+        _ => plan,
+    };
+
+    let root_fragment_id = builder.alloc_fragment_id();
+    builder.fragment_stack.push(root_fragment_id);
+    let root = builder.visit(plan)?;
+    builder.fragment_stack.pop();
+
+    let mut fragments = builder.completed_fragments;
+    fragments.push(PlanFragment {
+        fragment_id: root_fragment_id,
+        root,
+        data_partition: DataPartition::unpartitioned(),
+        output_partition: DataPartition::unpartitioned(),
+        sink: DataSink::Result,
+        output_exprs: None,
+        output_columns: plan.output_columns.clone(),
+        cte_id: None,
+        cte_exchange_nodes: Vec::new(),
+    });
 
     Ok(DistributedPlan {
-        fragments: vec![PlanFragment {
-            fragment_id: root_fragment_id,
-            root,
-            data_partition: DataPartition::unpartitioned(),
-            output_partition: DataPartition::unpartitioned(),
-            sink: DataSink::Result,
-            output_exprs: None,
-            output_columns: plan.output_columns.clone(),
-            cte_id: None,
-            cte_exchange_nodes: Vec::new(),
-        }],
+        fragments,
         root_fragment_id,
-        edges: Vec::new(),
+        edges: builder.edges,
     })
 }
 

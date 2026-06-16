@@ -6,6 +6,7 @@ use arrow::datatypes::DataType;
 
 use crate::exprs;
 use crate::lower::type_lowering::arrow_type_from_desc;
+use crate::partitions;
 use crate::plan_nodes;
 use crate::sql::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn as AnalysisOutputColumn, TypedExpr,
@@ -55,20 +56,19 @@ pub(crate) fn lower_distributed_plan(
     connectors: &crate::connector::ConnectorRegistry,
 ) -> Result<MultiFragmentBuildResult, String> {
     let _ = catalog;
-    let fragments = validate_distributed_plan(dp)?;
+    validate_distributed_plan(dp)?;
 
-    let mut state = OwnedLoweringState::new(connectors, None, dp.root_fragment_id);
-    let mut lowered_fragments = Vec::with_capacity(fragments.len());
-    for fragment in fragments {
-        state.fragment_stack.clear();
-        state.fragment_stack.push(fragment.fragment_id);
-        let lowered = {
-            let mut ctx = LoweringCtx::new(&mut state);
-            ctx.lower_node(&fragment.root)?
-        };
-        lowered_fragments.push((fragment, lowered));
-    }
+    let mut state = OwnedLoweringState::new_with_fragments(
+        connectors,
+        None,
+        dp.root_fragment_id,
+        &dp.fragments,
+    );
+    state.lower_fragment_by_id(dp.root_fragment_id)?;
     state.fragment_stack.clear();
+
+    let edges = lower_fragment_edges(dp, &mut state)?;
+    let lowered_fragments = std::mem::take(&mut state.lowered_fragments);
 
     let desc_tbl =
         std::mem::replace(&mut state.desc_builder, DescriptorTableBuilder::new()).build();
@@ -130,7 +130,7 @@ pub(crate) fn lower_distributed_plan(
     Ok(MultiFragmentBuildResult {
         fragment_results,
         root_fragment_id: dp.root_fragment_id,
-        edges: dp.edges.clone(),
+        edges,
         boundary_schemas,
         rf_plan: if state.rf_all_filters.is_empty() {
             None
@@ -261,7 +261,7 @@ fn topological_fragment_order(
                     edge.target_fragment_id
                 )
             })?;
-        validate_edge_target_node(target, edge.target_exchange_node_id)?;
+        validate_edge_target_node(target, edge)?;
         adjacency
             .get_mut(&edge.source_fragment_id)
             .expect("validated source fragment id")
@@ -378,24 +378,55 @@ fn validate_non_root_connectivity(
 
 fn validate_edge_target_node(
     target_fragment: &super::fragment::PlanFragment,
-    target_exchange_node_id: i32,
+    edge: &crate::sql::codegen::FragmentEdge,
 ) -> Result<(), String> {
-    if !node_tree_contains_node_id(&target_fragment.root, target_exchange_node_id) {
-        Err(format!(
+    let target_node = find_node_by_id(&target_fragment.root, edge.target_exchange_node_id)
+        .ok_or_else(|| {
+            format!(
             "lower_distributed_plan edge target_exchange_node_id={} not found in target fragment id={}",
-            target_exchange_node_id, target_fragment.fragment_id
-        ))
+            edge.target_exchange_node_id, target_fragment.fragment_id
+        )
+        })?;
+
+    if matches!(
+        edge.edge_kind,
+        crate::sql::codegen::FragmentEdgeKind::Stream
+    ) {
+        match &target_node.kind {
+            super::node::DistributedPlanNodeKind::Exchange(exchange)
+                if matches!(exchange.flavor, super::kind::ExchangeFlavor::Distribution) =>
+            {
+                if edge.source_fragment_id != exchange.source_fragment_id {
+                    return Err(format!(
+                        "lower_distributed_plan stream edge source_fragment_id={} does not match Exchange source_fragment_id={} for target_exchange_node_id={} in target fragment id={}",
+                        edge.source_fragment_id,
+                        exchange.source_fragment_id,
+                        edge.target_exchange_node_id,
+                        target_fragment.fragment_id
+                    ));
+                }
+                Ok(())
+            }
+            _ => Err(format!(
+                "lower_distributed_plan stream edge target_exchange_node_id={} in target fragment id={} must target Exchange(Distribution)",
+                edge.target_exchange_node_id, target_fragment.fragment_id
+            )),
+        }
     } else {
         Ok(())
     }
 }
 
-fn node_tree_contains_node_id(node: &super::node::DistributedPlanNode, node_id: i32) -> bool {
-    node.node_id == node_id
-        || node
-            .children
-            .iter()
-            .any(|child| node_tree_contains_node_id(child, node_id))
+fn find_node_by_id(
+    node: &super::node::DistributedPlanNode,
+    node_id: i32,
+) -> Option<&super::node::DistributedPlanNode> {
+    if node.node_id == node_id {
+        return Some(node);
+    }
+    node.children
+        .iter()
+        .find_map(|child| find_node_by_id(child, node_id))
 }
 
 fn ensure_unpartitioned(
@@ -412,6 +443,112 @@ fn ensure_unpartitioned(
         ));
     }
     Ok(())
+}
+
+fn lower_fragment_edges(
+    dp: &super::fragment::DistributedPlan,
+    state: &mut OwnedLoweringState<'_>,
+) -> Result<Vec<crate::sql::codegen::FragmentEdge>, String> {
+    let fragments_by_id: BTreeMap<FragmentId, &super::fragment::PlanFragment> = dp
+        .fragments
+        .iter()
+        .map(|fragment| (fragment.fragment_id, fragment))
+        .collect();
+    let mut lowered_edges = Vec::with_capacity(dp.edges.len());
+
+    for edge in &dp.edges {
+        let mut lowered_edge = edge.clone();
+        if matches!(
+            edge.edge_kind,
+            crate::sql::codegen::FragmentEdgeKind::Stream
+        ) {
+            let target_fragment =
+                fragments_by_id
+                    .get(&edge.target_fragment_id)
+                    .ok_or_else(|| {
+                        format!(
+                            "lower_distributed_plan edge references missing target fragment id={}",
+                            edge.target_fragment_id
+                        )
+                    })?;
+            let target_node = find_node_by_id(&target_fragment.root, edge.target_exchange_node_id)
+                .ok_or_else(|| {
+                    format!(
+                        "lower_distributed_plan edge target_exchange_node_id={} not found in target fragment id={}",
+                        edge.target_exchange_node_id, target_fragment.fragment_id
+                    )
+                })?;
+            let super::node::DistributedPlanNodeKind::Exchange(exchange) = &target_node.kind else {
+                return Err(format!(
+                    "lower_distributed_plan stream edge target_exchange_node_id={} in target fragment id={} must target Exchange(Distribution)",
+                    edge.target_exchange_node_id, target_fragment.fragment_id
+                ));
+            };
+            if !matches!(exchange.flavor, super::kind::ExchangeFlavor::Distribution) {
+                return Err(format!(
+                    "lower_distributed_plan stream edge target_exchange_node_id={} in target fragment id={} must target Exchange(Distribution)",
+                    edge.target_exchange_node_id, target_fragment.fragment_id
+                ));
+            }
+            let source = state
+                .lowered_fragment_output(edge.source_fragment_id)
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "lower_distributed_plan edge references source fragment id={} before it was lowered",
+                        edge.source_fragment_id
+                    )
+                })?;
+            lowered_edge.output_partition =
+                lower_exchange_output_partition(exchange, &source.scope, state.slot_allocator())?;
+        }
+        lowered_edges.push(lowered_edge);
+    }
+
+    Ok(lowered_edges)
+}
+
+fn lower_exchange_output_partition(
+    exchange: &super::kind::DistributedExchangeNode,
+    source_scope: &ExprScope,
+    slot_allocator: expr_compiler::SlotAllocator,
+) -> Result<partitions::TDataPartition, String> {
+    if exchange.partition_type == partitions::TPartitionType::UNPARTITIONED
+        || exchange.partition_type == partitions::TPartitionType::RANDOM
+    {
+        return Ok(partitions::TDataPartition::new(
+            exchange.partition_type,
+            None::<Vec<exprs::TExpr>>,
+            None::<Vec<partitions::TRangePartition>>,
+            None::<Vec<partitions::TBucketProperty>>,
+        ));
+    }
+
+    if exchange.partition_type != partitions::TPartitionType::HASH_PARTITIONED {
+        return Ok(partitions::TDataPartition::new(
+            exchange.partition_type,
+            None::<Vec<exprs::TExpr>>,
+            None::<Vec<partitions::TRangePartition>>,
+            None::<Vec<partitions::TBucketProperty>>,
+        ));
+    }
+
+    if exchange.partition_exprs.is_empty() {
+        return Err("DistributedPlan HASH Exchange has no partition expressions".to_string());
+    }
+
+    let mut partition_exprs = Vec::with_capacity(exchange.partition_exprs.len());
+    for expr in &exchange.partition_exprs {
+        let mut compiler = ExprCompiler::new(Rc::clone(&slot_allocator), source_scope);
+        partition_exprs.push(compiler.compile_typed(expr)?);
+    }
+
+    Ok(partitions::TDataPartition::new(
+        partitions::TPartitionType::HASH_PARTITIONED,
+        Some(partition_exprs),
+        None::<Vec<partitions::TRangePartition>>,
+        None::<Vec<partitions::TBucketProperty>>,
+    ))
 }
 
 fn edge_boundary_schemas(
@@ -462,6 +599,13 @@ struct AggregateSlotContract {
     type_desc: types::TTypeDesc,
 }
 
+#[derive(Clone)]
+pub(in crate::sql::codegen) struct LoweredFragmentOutput {
+    scope: ExprScope,
+    tuple_ids: Vec<i32>,
+    output_columns: Vec<AnalysisOutputColumn>,
+}
+
 fn aggregate_slot_contract_for_phase(
     need_finalize: bool,
     result_type: &DataType,
@@ -504,6 +648,21 @@ pub(in crate::sql::codegen) trait LoweringStateAccess<'a> {
     fn rf_probe_side_filters(&mut self) -> &mut HashMap<FragmentId, Vec<(i32, i32)>>;
     fn alloc_slot(&mut self) -> i32;
     fn slot_allocator(&self) -> expr_compiler::SlotAllocator;
+    fn lowered_fragment_output(&self, _fragment_id: FragmentId) -> Option<&LoweredFragmentOutput> {
+        None
+    }
+    fn remember_lowered_fragment_output(
+        &mut self,
+        _fragment_id: FragmentId,
+        _output: LoweredFragmentOutput,
+    ) {
+    }
+    fn ensure_fragment_lowered(&mut self, fragment_id: FragmentId) -> Result<(), String> {
+        Err(format!(
+            "DistributedPlan Exchange cannot lower source fragment id={} in this lowering context",
+            fragment_id
+        ))
+    }
 
     fn current_fragment_id(&self) -> Result<FragmentId, String> {
         self.fragment_stack()
@@ -636,13 +795,26 @@ pub(crate) struct OwnedLoweringState<'a> {
     rf_all_filters: HashMap<i32, crate::runtime_filter::TRuntimeFilterDescription>,
     rf_build_side_filters: HashMap<FragmentId, Vec<i32>>,
     rf_probe_side_filters: HashMap<FragmentId, Vec<(i32, i32)>>,
+    lowered_fragment_outputs: HashMap<FragmentId, LoweredFragmentOutput>,
+    fragments_by_id: HashMap<FragmentId, super::fragment::PlanFragment>,
+    lowered_fragments: Vec<(super::fragment::PlanFragment, LoweredDistributedNode)>,
+    lowering_fragments: BTreeSet<FragmentId>,
 }
 
 impl<'a> OwnedLoweringState<'a> {
     fn new(
         connectors: &'a crate::connector::ConnectorRegistry,
         mv_refresh_ctx: Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
-        root_fragment_id: FragmentId,
+        _root_fragment_id: FragmentId,
+    ) -> Self {
+        Self::new_with_fragments(connectors, mv_refresh_ctx, _root_fragment_id, &[])
+    }
+
+    fn new_with_fragments(
+        connectors: &'a crate::connector::ConnectorRegistry,
+        mv_refresh_ctx: Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+        _root_fragment_id: FragmentId,
+        fragments: &[super::fragment::PlanFragment],
     ) -> Self {
         Self {
             connectors,
@@ -650,14 +822,70 @@ impl<'a> OwnedLoweringState<'a> {
             desc_builder: DescriptorTableBuilder::new(),
             scan_tables: Vec::new(),
             next_slot_id: Rc::new(RefCell::new(1)),
-            fragment_stack: vec![root_fragment_id],
+            fragment_stack: Vec::new(),
             query_global_dicts_per_fragment: HashMap::new(),
             slot_to_global_dict: HashMap::new(),
             rf_probe_targets: HashMap::new(),
             rf_all_filters: HashMap::new(),
             rf_build_side_filters: HashMap::new(),
             rf_probe_side_filters: HashMap::new(),
+            lowered_fragment_outputs: HashMap::new(),
+            fragments_by_id: fragments
+                .iter()
+                .cloned()
+                .map(|fragment| (fragment.fragment_id, fragment))
+                .collect(),
+            lowered_fragments: Vec::new(),
+            lowering_fragments: BTreeSet::new(),
         }
+    }
+
+    fn lower_fragment_by_id(&mut self, fragment_id: FragmentId) -> Result<(), String> {
+        if self.lowered_fragment_outputs.contains_key(&fragment_id) {
+            return Ok(());
+        }
+        if !self.lowering_fragments.insert(fragment_id) {
+            return Err(format!(
+                "lower_distributed_plan cycle while lowering fragment id={}",
+                fragment_id
+            ));
+        }
+
+        let fragment = self
+            .fragments_by_id
+            .get(&fragment_id)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "lower_distributed_plan cannot lower missing fragment id={}",
+                    fragment_id
+                )
+            })?;
+        self.fragment_stack.push(fragment_id);
+        let lowered_result = {
+            let mut ctx = LoweringCtx::new(self);
+            ctx.lower_node(&fragment.root)
+        };
+        self.fragment_stack.pop();
+        let lowered = match lowered_result {
+            Ok(lowered) => lowered,
+            Err(err) => {
+                self.lowering_fragments.remove(&fragment_id);
+                return Err(err);
+            }
+        };
+
+        self.remember_lowered_fragment_output(
+            fragment_id,
+            LoweredFragmentOutput {
+                scope: lowered.scope.clone(),
+                tuple_ids: lowered.tuple_ids.clone(),
+                output_columns: lowered.output_columns.clone(),
+            },
+        );
+        self.lowered_fragments.push((fragment, lowered));
+        self.lowering_fragments.remove(&fragment_id);
+        Ok(())
     }
 }
 
@@ -725,6 +953,22 @@ impl<'a> LoweringStateAccess<'a> for OwnedLoweringState<'a> {
 
     fn slot_allocator(&self) -> expr_compiler::SlotAllocator {
         Rc::clone(&self.next_slot_id)
+    }
+
+    fn lowered_fragment_output(&self, fragment_id: FragmentId) -> Option<&LoweredFragmentOutput> {
+        self.lowered_fragment_outputs.get(&fragment_id)
+    }
+
+    fn remember_lowered_fragment_output(
+        &mut self,
+        fragment_id: FragmentId,
+        output: LoweredFragmentOutput,
+    ) {
+        self.lowered_fragment_outputs.insert(fragment_id, output);
+    }
+
+    fn ensure_fragment_lowered(&mut self, fragment_id: FragmentId) -> Result<(), String> {
+        self.lower_fragment_by_id(fragment_id)
     }
 }
 
@@ -849,6 +1093,75 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     tuple_ids: child.tuple_ids,
                     output_columns: child.output_columns,
                     ordering: OrderingSpec::from_sort_items(&topn.items),
+                }
+            }
+            super::node::DistributedPlanNodeKind::Exchange(exchange) => {
+                if !node.children.is_empty() {
+                    return Err(format!(
+                        "DistributedPlan Exchange node_id={} expected 0 children, got {}",
+                        node.node_id,
+                        node.children.len()
+                    ));
+                }
+                match &exchange.flavor {
+                    super::kind::ExchangeFlavor::Distribution => {
+                        if self
+                            .state
+                            .lowered_fragment_output(exchange.source_fragment_id)
+                            .is_none()
+                        {
+                            self.state
+                                .ensure_fragment_lowered(exchange.source_fragment_id)?;
+                        }
+                        let source = self
+                            .state
+                            .lowered_fragment_output(exchange.source_fragment_id)
+                            .cloned()
+                            .ok_or_else(|| {
+                                format!(
+                                    "DistributedPlan Exchange node_id={} references source fragment id={} before it was lowered",
+                                    node.node_id, exchange.source_fragment_id
+                                )
+                            })?;
+                        if source.tuple_ids != node.tuple_ids {
+                            return Err(format!(
+                                "DistributedPlan Exchange node_id={} tuple_ids {:?} do not match source fragment id={} tuple_ids {:?}",
+                                node.node_id,
+                                node.tuple_ids,
+                                exchange.source_fragment_id,
+                                source.tuple_ids
+                            ));
+                        }
+                        LoweredDistributedNode {
+                            plan_nodes: vec![nodes::build_exchange_node(
+                                node.node_id,
+                                source.tuple_ids.clone(),
+                                exchange.partition_type,
+                            )],
+                            scope: source.scope,
+                            tuple_ids: source.tuple_ids,
+                            output_columns: source.output_columns,
+                            ordering: OrderingSpec::Any,
+                        }
+                    }
+                    super::kind::ExchangeFlavor::LimitOffset { .. } => {
+                        return Err(
+                            "DistributedPlan Exchange LimitOffset flavor is not implemented until Task A4"
+                                .to_string(),
+                        );
+                    }
+                    super::kind::ExchangeFlavor::TopNSplit => {
+                        return Err(
+                            "DistributedPlan Exchange TopNSplit flavor is not implemented until Task A4"
+                                .to_string(),
+                        );
+                    }
+                    super::kind::ExchangeFlavor::CteMulticast { .. } => {
+                        return Err(
+                            "DistributedPlan Exchange CteMulticast flavor is not implemented until Task A3"
+                                .to_string(),
+                        );
+                    }
                 }
             }
             super::node::DistributedPlanNodeKind::HashAggregate(agg) => {
@@ -4025,7 +4338,9 @@ mod tests {
     use crate::sql::codegen::boundary_schema::BoundaryKind;
     use crate::sql::codegen::expr_compiler::infer_agg_function_types;
     use crate::sql::codegen::fragment_builder::PlanFragmentBuilder;
-    use crate::sql::codegen::ir::kind::DistributedValuesNode;
+    use crate::sql::codegen::ir::kind::{
+        DistributedExchangeNode, DistributedValuesNode, ExchangeFlavor,
+    };
     use crate::sql::codegen::ir::{
         DataPartition, DataSink, DistributedPlan, DistributedPlanNode, DistributedPlanNodeKind,
         PartitionKind, PlanFragment, PlanNodeStats, build_distributed_plan,
@@ -4443,7 +4758,20 @@ mod tests {
             "edge target_exchange_node_id=99 not found in target fragment id=1",
         );
 
+        let mut mismatched_source = distributed_values_multi_fragment_plan();
+        let DistributedPlanNodeKind::Exchange(exchange) =
+            &mut mismatched_source.fragments[1].root.kind
+        else {
+            panic!("root should be exchange");
+        };
+        exchange.source_fragment_id = 42;
+        assert_lowering_err(
+            &mismatched_source,
+            "stream edge source_fragment_id=0 does not match Exchange source_fragment_id=42",
+        );
+
         let mut cyclic = distributed_values_multi_fragment_plan();
+        cyclic.fragments[0].root = distributed_exchange_node(10, 0, 10, 1);
         cyclic.edges.push(fragment_edge(1, 0, 10));
         assert_lowering_err(&cyclic, "cycle in DistributedPlan fragment edges");
 
@@ -4469,7 +4797,6 @@ mod tests {
 
     fn distributed_values_multi_fragment_plan() -> DistributedPlan {
         let child_columns = vec![output_col(1, "child_k", DataType::Int64, false)];
-        let root_columns = vec![output_col(2, "root_k", DataType::Int64, false)];
         DistributedPlan {
             fragments: vec![
                 PlanFragment {
@@ -4482,18 +4809,18 @@ mod tests {
                     },
                     sink: DataSink::Noop,
                     output_exprs: None,
-                    output_columns: child_columns,
+                    output_columns: child_columns.clone(),
                     cte_id: None,
                     cte_exchange_nodes: Vec::new(),
                 },
                 PlanFragment {
                     fragment_id: 1,
-                    root: distributed_values_node(20, 1, 20, root_columns.clone()),
+                    root: distributed_exchange_node(20, 1, 10, 0),
                     data_partition: DataPartition::unpartitioned(),
                     output_partition: DataPartition::unpartitioned(),
                     sink: DataSink::Result,
                     output_exprs: None,
-                    output_columns: root_columns,
+                    output_columns: child_columns.clone(),
                     cte_id: None,
                     cte_exchange_nodes: Vec::new(),
                 },
@@ -4505,24 +4832,22 @@ mod tests {
 
     fn distributed_values_three_fragment_chain_reverse_input() -> DistributedPlan {
         let source_columns = vec![output_col(1, "source_k", DataType::Int64, false)];
-        let middle_columns = vec![output_col(2, "middle_k", DataType::Int64, false)];
-        let root_columns = vec![output_col(3, "root_k", DataType::Int64, false)];
         DistributedPlan {
             fragments: vec![
                 PlanFragment {
                     fragment_id: 2,
-                    root: distributed_values_node(20, 2, 20, root_columns.clone()),
+                    root: distributed_exchange_node(20, 2, 10, 1),
                     data_partition: DataPartition::unpartitioned(),
                     output_partition: DataPartition::unpartitioned(),
                     sink: DataSink::Result,
                     output_exprs: None,
-                    output_columns: root_columns,
+                    output_columns: source_columns.clone(),
                     cte_id: None,
                     cte_exchange_nodes: Vec::new(),
                 },
                 PlanFragment {
                     fragment_id: 1,
-                    root: distributed_values_node(30, 1, 30, middle_columns.clone()),
+                    root: distributed_exchange_node(30, 1, 10, 0),
                     data_partition: DataPartition::unpartitioned(),
                     output_partition: DataPartition {
                         kind: PartitionKind::Random,
@@ -4530,7 +4855,7 @@ mod tests {
                     },
                     sink: DataSink::Noop,
                     output_exprs: None,
-                    output_columns: middle_columns,
+                    output_columns: source_columns.clone(),
                     cte_id: None,
                     cte_exchange_nodes: Vec::new(),
                 },
@@ -4594,6 +4919,32 @@ mod tests {
             kind: DistributedPlanNodeKind::Values(DistributedValuesNode {
                 rows: vec![],
                 columns,
+            }),
+        }
+    }
+
+    fn distributed_exchange_node(
+        node_id: i32,
+        fragment_id: u32,
+        source_tuple_id: i32,
+        source_fragment_id: u32,
+    ) -> DistributedPlanNode {
+        DistributedPlanNode {
+            node_id,
+            fragment_id,
+            tuple_ids: vec![source_tuple_id],
+            nullable_tuple_ids: vec![],
+            limit: -1,
+            execution_join_distribution: None,
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+            children: vec![],
+            stats: PlanNodeStats::from_statistics(&Statistics::default()),
+            kind: DistributedPlanNodeKind::Exchange(DistributedExchangeNode {
+                partition_type: crate::partitions::TPartitionType::UNPARTITIONED,
+                partition_exprs: vec![],
+                source_fragment_id,
+                flavor: ExchangeFlavor::Distribution,
             }),
         }
     }
