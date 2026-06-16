@@ -183,6 +183,42 @@ pub(crate) fn intern_typed(arena: &mut ScalarArena, expr: &TypedExpr) -> ScalarI
     arena.intern(node, expr.data_type.clone(), expr.nullable)
 }
 
+/// Rebuild an analyzer `TypedExpr` from an interned id.
+///
+/// This is a transient view for codegen/EXPLAIN and the staged-migration bridge,
+/// not a long-lived optimizer type. M0 covers the core variants; Task 5 extends.
+pub(crate) fn materialize(arena: &ScalarArena, id: ScalarId) -> TypedExpr {
+    let kind = match arena.node(id) {
+        ScalarNode::ColumnRef(cid) => ExprKind::ColumnRef {
+            column_id: *cid,
+            // ColumnRef name/qualifier are display-only; the optimizer addresses
+            // columns by ColumnId. Resolve original display names at the boundary.
+            qualifier: None,
+            column: format!("col{}", cid.0),
+        },
+        ScalarNode::Literal(HashableLiteral(v)) => ExprKind::Literal(v.clone()),
+        ScalarNode::BinaryOp { op, left, right } => ExprKind::BinaryOp {
+            left: Box::new(materialize(arena, *left)),
+            op: *op,
+            right: Box::new(materialize(arena, *right)),
+        },
+        ScalarNode::FunctionCall {
+            name,
+            args,
+            distinct,
+        } => ExprKind::FunctionCall {
+            name: name.clone(),
+            args: args.iter().map(|a| materialize(arena, *a)).collect(),
+            distinct: *distinct,
+        },
+    };
+    TypedExpr {
+        kind,
+        data_type: arena.data_type(id).clone(),
+        nullable: arena.nullable(id),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,7 +330,7 @@ mod bridge_tests {
             kind: ExprKind::ColumnRef {
                 column_id: ColumnId(id),
                 qualifier: None,
-                column: format!("c{id}"),
+                column: format!("col{id}"),
             },
             data_type: ty,
             nullable: false,
@@ -357,5 +393,18 @@ mod bridge_tests {
         );
         assert_eq!(a.data_type(int8), &DataType::Int8);
         assert_eq!(a.data_type(int64), &DataType::Int64);
+    }
+
+    #[test]
+    fn materialize_round_trips_core_variants() {
+        let mut a = ScalarArena::new();
+        let original = eq(col(1, DataType::Int64), lit_int(5));
+        let id = intern_typed(&mut a, &original);
+        let back = materialize(&a, id);
+        assert_eq!(
+            format!("{:?}", back),
+            format!("{:?}", original),
+            "intern_typed then materialize must reproduce the expression"
+        );
     }
 }
