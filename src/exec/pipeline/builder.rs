@@ -570,6 +570,8 @@ fn build_pipeline_for_node(
             topn_type,
             max_buffered_rows,
             max_buffered_bytes,
+            partition_exprs,
+            partition_limit,
         }) => {
             let build = build_pipeline_for_node(input, ctx)?;
             let mut build = gather_to_one(build, ctx, *node_id);
@@ -586,6 +588,8 @@ fn build_pipeline_for_node(
                         *topn_type,
                         *max_buffered_rows,
                         *max_buffered_bytes,
+                        partition_exprs.clone(),
+                        *partition_limit,
                     )));
             } else {
                 build
@@ -600,6 +604,8 @@ fn build_pipeline_for_node(
                         *topn_type,
                         *max_buffered_rows,
                         *max_buffered_bytes,
+                        partition_exprs.clone(),
+                        *partition_limit,
                     )));
             }
             build.stream = StreamDesc::single();

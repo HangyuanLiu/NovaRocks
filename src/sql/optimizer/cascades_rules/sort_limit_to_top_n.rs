@@ -49,6 +49,14 @@ impl Rule for SortLimitToTopN {
             let Operator::LogicalSort(sort_op) = &child_mexpr.op else {
                 continue;
             };
+            // A partition-topn Sort carries per-partition truncation semantics
+            // (partition_limit / topn_type set by RankingWindowPredicatePushdown).
+            // Converting it to a plain LogicalTopN would silently discard the
+            // partition_limit, producing wrong results. Skip such sorts; the
+            // partition-topn path handles them independently.
+            if sort_op.partition_limit.is_some() {
+                continue;
+            }
             if child_mexpr.children.len() != 1 {
                 continue;
             }
@@ -111,6 +119,8 @@ mod tests {
             op: Operator::LogicalSort(LogicalSortOp {
                 items: vec![],
                 analytic_partition_exprs: Vec::new(),
+                partition_limit: None,
+                topn_type: None,
             }),
             children: vec![scan_group],
         };
@@ -175,6 +185,8 @@ mod tests {
             op: Operator::LogicalSort(LogicalSortOp {
                 items: vec![],
                 analytic_partition_exprs: Vec::new(),
+                partition_limit: None,
+                topn_type: None,
             }),
             children: vec![scan_group],
         };
@@ -192,5 +204,55 @@ mod tests {
         let rule = SortLimitToTopN;
         let out = rule.apply(&limit_mexpr, &mut memo);
         assert!(out.is_empty(), "expected no rewrite when limit is None");
+    }
+
+    #[test]
+    fn does_not_fire_when_sort_has_partition_limit() {
+        // Regression: a Sort with partition_limit.is_some() is a partition-topn
+        // Sort placed by RankingWindowPredicatePushdown.  Converting it to a plain
+        // LogicalTopN would silently discard the per-partition truncation semantics.
+        // The rule must skip such a Sort and return no alternatives.
+        let mut memo = Memo::new();
+        let scan_mexpr = mk_scan_mexpr(&mut memo);
+        let scan_group = memo.new_group(scan_mexpr);
+
+        let sort_mexpr = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalSort(LogicalSortOp {
+                items: vec![],
+                analytic_partition_exprs: vec![
+                    // non-empty: partition-topn Sort always carries these
+                    crate::sql::analysis::TypedExpr {
+                        kind: crate::sql::analysis::ExprKind::ColumnRef {
+                            column_id: crate::sql::column_id::ColumnId(1),
+                            qualifier: None,
+                            column: "p".into(),
+                        },
+                        data_type: arrow::datatypes::DataType::Int64,
+                        nullable: true,
+                    },
+                ],
+                partition_limit: Some(2),
+                topn_type: Some(crate::exec::node::sort::SortTopNType::Rank),
+            }),
+            children: vec![scan_group],
+        };
+        let sort_group = memo.new_group(sort_mexpr);
+
+        let limit_mexpr = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalLimit(LogicalLimitOp {
+                limit: Some(10),
+                offset: None,
+            }),
+            children: vec![sort_group],
+        };
+
+        let rule = SortLimitToTopN;
+        let out = rule.apply(&limit_mexpr, &mut memo);
+        assert!(
+            out.is_empty(),
+            "SortLimitToTopN must not rewrite a partition-topn Sort (partition_limit.is_some())"
+        );
     }
 }

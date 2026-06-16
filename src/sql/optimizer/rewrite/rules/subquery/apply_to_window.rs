@@ -166,6 +166,8 @@ impl LogicalRewriteRule for ApplyToWindow {
             input: Box::new(before_filtered),
             items: sort_items,
             analytic_partition_by: m.partition_by.clone(),
+            partition_limit: None,
+            topn_type: None,
             required_output_columns: None,
         });
 

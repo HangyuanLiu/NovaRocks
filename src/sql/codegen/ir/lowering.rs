@@ -2027,6 +2027,33 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             Some(out)
         };
 
+        // Per-partition TopN fields (set by RankingWindowPredicatePushdown). For a
+        // ranking-window pushdown the partition keys ARE the analytic partition keys,
+        // so reuse analytic_partition_exprs as the key source. CONTRACT: partition-topn
+        // is DECOUPLED from the global limit — `limit` stays -1 (None) and `use_top_n`
+        // is set true ONLY via partition_limit.
+        let (partition_exprs_t, partition_limit_t, topn_type_t, use_top_n_for_partition) =
+            if let Some(limit) = op.partition_limit {
+                let mut keys = Vec::with_capacity(op.analytic_partition_exprs.len());
+                for expr in &op.analytic_partition_exprs {
+                    let mut compiler = ExprCompiler::new(state.slot_allocator(), child_scope);
+                    keys.push(compiler.compile_typed(expr)?);
+                }
+                let tt = match op.topn_type {
+                    Some(crate::exec::node::sort::SortTopNType::RowNumber) => {
+                        plan_nodes::TTopNType::ROW_NUMBER
+                    }
+                    Some(crate::exec::node::sort::SortTopNType::Rank) => plan_nodes::TTopNType::RANK,
+                    Some(crate::exec::node::sort::SortTopNType::DenseRank) => {
+                        plan_nodes::TTopNType::DENSE_RANK
+                    }
+                    None => plan_nodes::TTopNType::ROW_NUMBER,
+                };
+                (Some(keys), Some(limit as i64), Some(tt), true)
+            } else {
+                (None, None, None, false)
+            };
+
         let sort_info = plan_nodes::TSortInfo::new(
             ordering_exprs,
             is_asc,
@@ -2045,7 +2072,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         sort_plan_node.compact_data = true;
         sort_plan_node.sort_node = Some(plan_nodes::TSortNode {
             sort_info,
-            use_top_n: false,
+            use_top_n: use_top_n_for_partition,
             offset,
             ordering_exprs: None,
             is_asc_order: None,
@@ -2055,9 +2082,9 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             has_outer_join_child: None,
             sql_sort_keys: None,
             analytic_partition_exprs,
-            partition_exprs: None,
-            partition_limit: None,
-            topn_type: None,
+            partition_exprs: partition_exprs_t,
+            partition_limit: partition_limit_t,
+            topn_type: topn_type_t,
             build_runtime_filters: None,
             max_buffered_rows: None,
             max_buffered_bytes: None,
@@ -3463,6 +3490,14 @@ fn sort_body_to_physical_op(body: &super::body::SortBody) -> PhysicalSortOp {
     PhysicalSortOp {
         items: body.items.clone(),
         analytic_partition_exprs: body.analytic_partition_exprs.clone(),
+        // The distributed-plan IR `SortBody` does not yet carry per-partition
+        // TopN (partition_limit/topn_type). The standalone ranking-window
+        // pushdown path lowers PhysicalSortOp directly via `lower_sort` and
+        // never round-trips through SortBody, so None is correct here. If the
+        // distributed path later supports ranking-window pushdown, SortBody
+        // must be extended to carry these.
+        partition_limit: None,
+        topn_type: None,
     }
 }
 

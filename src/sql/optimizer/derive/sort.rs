@@ -68,6 +68,8 @@ mod tests {
                 nulls_first: false,
             }],
             analytic_partition_exprs: Vec::new(),
+            partition_limit: None,
+            topn_type: None,
         };
         let props = op.derive_output(&[]);
         assert_eq!(props.distribution, DistributionSpec::Gather);
@@ -88,6 +90,8 @@ mod tests {
         let op = PhysicalSortOp {
             items: vec![],
             analytic_partition_exprs: vec![partition],
+            partition_limit: None,
+            topn_type: None,
         };
 
         let reqs = op.derive_required(&PhysicalPropertySet::any(), 1);

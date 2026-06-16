@@ -25,7 +25,9 @@ use std::sync::Arc;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::sort::{SortExpression, SortTopNType};
+use crate::exec::operators::analytic_shared::{compute_partitions, row_equal_on_keys};
 use crate::exec::operators::sort::chunks_sorter_heap_sort::sort_chunks_topn_heap;
+use crate::exec::operators::sort::sort_processor::rank_like_cutoff;
 use crate::exec::operators::sort::{ChunksSorter, concat_sort_chunks};
 use crate::exec::operators::sort::{
     append_stable_row_index_sort_column, merged_sort_schema_for_chunks,
@@ -211,6 +213,49 @@ pub(crate) fn sort_chunks_dense_rank(
     Ok(Some(sorted.slice(0, cutoff)))
 }
 
+/// Per-partition rank-TopN sorter.
+///
+/// Groups input rows by `partition_exprs`, then within each group keeps the top
+/// `partition_limit` rows according to `topn_type` and `order_by`.
+pub(crate) struct ChunksSorterPartitionTopN {
+    arena: Arc<ExprArena>,
+    partition_exprs: Vec<SortExpression>,
+    order_by: Vec<SortExpression>,
+    topn_type: SortTopNType,
+    partition_limit: usize,
+}
+
+impl ChunksSorterPartitionTopN {
+    pub(crate) fn new(
+        arena: Arc<ExprArena>,
+        partition_exprs: Vec<SortExpression>,
+        order_by: Vec<SortExpression>,
+        topn_type: SortTopNType,
+        partition_limit: usize,
+    ) -> Self {
+        Self {
+            arena,
+            partition_exprs,
+            order_by,
+            topn_type,
+            partition_limit,
+        }
+    }
+}
+
+impl ChunksSorter for ChunksSorterPartitionTopN {
+    fn sort_chunks(&self, chunks: &[Chunk]) -> Result<Option<Chunk>, String> {
+        sort_chunks_partition_topn(
+            self.arena.as_ref(),
+            &self.partition_exprs,
+            &self.order_by,
+            self.topn_type,
+            self.partition_limit,
+            chunks,
+        )
+    }
+}
+
 /// Topn sorter implementation that supports ROW_NUMBER, RANK and DENSE_RANK modes.
 pub(crate) struct ChunksSorterTopN {
     arena: Arc<ExprArena>,
@@ -359,8 +404,21 @@ fn filter_chunk_by_boundary(
     if indices.len() == chunk.len() {
         return Ok(Some(chunk.clone()));
     }
+    take_rows(chunk, &indices)
+}
 
-    let selection = UInt32Array::from(indices);
+/// Take selected rows from `chunk` by absolute row indices.
+///
+/// Returns `None` if `indices` is empty; returns a clone of `chunk` if all
+/// rows are selected; otherwise performs a physical take and rebuilds the chunk.
+fn take_rows(chunk: &Chunk, indices: &[u32]) -> Result<Option<Chunk>, String> {
+    if indices.is_empty() {
+        return Ok(None);
+    }
+    if indices.len() == chunk.len() {
+        return Ok(Some(chunk.clone()));
+    }
+    let selection = UInt32Array::from(indices.to_vec());
     let schema = merged_sort_schema_for_chunks(std::slice::from_ref(chunk))?;
     let batch = normalize_sort_batch_for_schema(chunk, &schema, 0)?;
     let columns = batch
@@ -375,6 +433,61 @@ fn filter_chunk_by_boundary(
         .map_err(|e| e.to_string())
 }
 
+/// Per-partition rank-TopN.
+///
+/// Sorts by `(partition_exprs ASC, order_by)` so rows of the same partition are
+/// adjacent and ordered, then keeps, within each partition segment, the rows
+/// whose `RowNumber`/`Rank`/`DenseRank` is `<= partition_limit`.
+///
+/// Output stays sorted by `(partition, order)`. Empty `partition_exprs` behaves
+/// like a single global group, identical to `sort_chunks_rank`/`sort_chunks_topn`.
+pub(crate) fn sort_chunks_partition_topn(
+    arena: &ExprArena,
+    partition_exprs: &[SortExpression],
+    order_by: &[SortExpression],
+    topn_type: SortTopNType,
+    partition_limit: usize,
+    chunks: &[Chunk],
+) -> Result<Option<Chunk>, String> {
+    if partition_limit == 0 || chunks.is_empty() {
+        return Ok(None);
+    }
+    // Build a combined sort key: partition keys first (preserving their sort direction), then order keys.
+    let mut combined: Vec<SortExpression> = partition_exprs.to_vec();
+    combined.extend_from_slice(order_by);
+    let sorted = sort_chunks_by_order(arena, &combined, chunks)?;
+    if sorted.is_empty() {
+        return Ok(None);
+    }
+    // Materialize partition-key columns from the sorted chunk for grouping.
+    let part_keys = eval_order_by_columns(arena, partition_exprs, &sorted)?;
+    // Materialize order-key columns for peer-equality comparisons inside each partition.
+    let order_keys = eval_order_by_columns(arena, order_by, &sorted)?;
+    let partitions = compute_partitions(&part_keys, sorted.len())?;
+    let mut keep_indices = Vec::<u32>::new();
+    for (start, end) in partitions {
+        let seg_rows = end - start;
+        // peer_equal compares ORDER-BY columns at ABSOLUTE indices within the sorted chunk.
+        let cutoff = rank_like_cutoff(topn_type, partition_limit, seg_rows, |a, b| {
+            row_equal_on_keys(&order_keys, start + a, start + b).unwrap_or(false)
+        });
+        for local in 0..cutoff {
+            keep_indices.push(
+                u32::try_from(start + local).map_err(|_| {
+                    format!("row index {} exceeds UInt32Array range", start + local)
+                })?,
+            );
+        }
+    }
+    if keep_indices.is_empty() {
+        return Ok(None);
+    }
+    if keep_indices.len() == sorted.len() {
+        return Ok(Some(sorted));
+    }
+    take_rows(&sorted, &keep_indices)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,6 +497,315 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
+
+    /// Build a two-column Chunk: col 0 = partition key (SlotId 1), col 1 = order key (SlotId 2).
+    fn make_two_col_chunk(p_values: Vec<Option<i32>>, o_values: Vec<Option<i32>>) -> Chunk {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("p", DataType::Int32, true),
+            Field::new("o", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(p_values)),
+                Arc::new(Int32Array::from(o_values)),
+            ],
+        )
+        .expect("record batch");
+        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(1), SlotId::new(2)],
+        )
+        .expect("chunk schema");
+        Chunk::new_with_chunk_schema(batch, chunk_schema)
+    }
+
+    /// Build partition + order SortExpressions for the two-column chunk.
+    fn two_col_sort_exprs(
+        asc: bool,
+        nulls_first: bool,
+    ) -> (ExprArena, Vec<SortExpression>, Vec<SortExpression>) {
+        let mut arena = ExprArena::default();
+        let p_expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        let o_expr = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), DataType::Int32);
+        let partition_exprs = vec![SortExpression {
+            expr: p_expr,
+            asc,
+            nulls_first,
+        }];
+        let order_exprs = vec![SortExpression {
+            expr: o_expr,
+            asc,
+            nulls_first,
+        }];
+        (arena, partition_exprs, order_exprs)
+    }
+
+    fn collect_col_i32(chunk: &Chunk, col_idx: usize) -> Vec<Option<i32>> {
+        let col = chunk
+            .batch
+            .column(col_idx)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int32");
+        (0..col.len())
+            .map(|i| {
+                if col.is_null(i) {
+                    None
+                } else {
+                    Some(col.value(i))
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn partition_topn_row_number_keeps_exactly_k_per_partition() {
+        // p=[1,1,2,2,2], o=[10,20,5,6,7]; limit=1 (ROW_NUMBER)
+        // Partition 1: row 10 kept (row_number=1 <= 1)
+        // Partition 2: row 5 kept (row_number=1 <= 1)
+        let (arena, partition_exprs, order_by) = two_col_sort_exprs(true, true);
+        let chunks = vec![make_two_col_chunk(
+            vec![Some(1), Some(1), Some(2), Some(2), Some(2)],
+            vec![Some(10), Some(20), Some(5), Some(6), Some(7)],
+        )];
+
+        let out = sort_chunks_partition_topn(
+            &arena,
+            &partition_exprs,
+            &order_by,
+            SortTopNType::RowNumber,
+            1,
+            &chunks,
+        )
+        .expect("partition_topn")
+        .expect("non-empty result");
+
+        // Sorted by (partition, order): p=1 → o=10, p=2 → o=5
+        assert_eq!(out.len(), 2);
+        assert_eq!(collect_col_i32(&out, 1), vec![Some(10), Some(5)]);
+    }
+
+    #[test]
+    fn partition_topn_dense_rank_keeps_distinct_peer_groups_per_partition() {
+        // p=[1,1,1,1,2,2,2], o=[10,10,20,30,5,5,7]
+        // Partition 1: dense_ranks = [1,1,2,3] → dense_rank<=2 keeps [10,10,20] (3 rows)
+        // Partition 2: dense_ranks = [1,1,2] → dense_rank<=2 keeps [5,5,7] (3 rows)
+        let (arena, partition_exprs, order_by) = two_col_sort_exprs(true, true);
+        let chunks = vec![make_two_col_chunk(
+            vec![
+                Some(1),
+                Some(1),
+                Some(1),
+                Some(1),
+                Some(2),
+                Some(2),
+                Some(2),
+            ],
+            vec![
+                Some(10),
+                Some(10),
+                Some(20),
+                Some(30),
+                Some(5),
+                Some(5),
+                Some(7),
+            ],
+        )];
+
+        let out = sort_chunks_partition_topn(
+            &arena,
+            &partition_exprs,
+            &order_by,
+            SortTopNType::DenseRank,
+            2,
+            &chunks,
+        )
+        .expect("partition_topn")
+        .expect("non-empty result");
+
+        assert_eq!(out.len(), 6);
+        // Partition 1 o=[10,10,20], Partition 2 o=[5,5,7]
+        assert_eq!(
+            collect_col_i32(&out, 1),
+            vec![Some(10), Some(10), Some(20), Some(5), Some(5), Some(7)]
+        );
+    }
+
+    #[test]
+    fn partition_topn_null_partition_key_groups_nulls_together() {
+        // p=[None,None,1], o=[5,10,20]
+        // NULL partition key rows grouped together: rank<=1 → o=5 kept from null-group
+        // Partition p=1: rank<=1 → o=20 kept
+        let (arena, partition_exprs, order_by) = two_col_sort_exprs(true, true);
+        let chunks = vec![make_two_col_chunk(
+            vec![None, None, Some(1)],
+            vec![Some(5), Some(10), Some(20)],
+        )];
+
+        let out = sort_chunks_partition_topn(
+            &arena,
+            &partition_exprs,
+            &order_by,
+            SortTopNType::RowNumber,
+            1,
+            &chunks,
+        )
+        .expect("partition_topn")
+        .expect("non-empty result");
+
+        // Null-key group keeps first row (o=5), p=1 group keeps o=20
+        assert_eq!(out.len(), 2);
+        let o_vals = collect_col_i32(&out, 1);
+        assert!(
+            o_vals.contains(&Some(5)),
+            "expected o=5 from null-key partition, got {:?}",
+            o_vals
+        );
+        assert!(
+            o_vals.contains(&Some(20)),
+            "expected o=20 from p=1 partition, got {:?}",
+            o_vals
+        );
+    }
+
+    #[test]
+    fn partition_topn_empty_partition_exprs_matches_global() {
+        // Empty partition_exprs → one global group; same result as sort_chunks_rank global.
+        let mut arena = ExprArena::default();
+        let o_expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        let order_by = vec![SortExpression {
+            expr: o_expr,
+            asc: true,
+            nulls_first: true,
+        }];
+
+        let chunks = vec![make_chunk(vec![
+            Some(10),
+            Some(10),
+            Some(9),
+            Some(8),
+            Some(8),
+            Some(7),
+        ])];
+
+        // Global rank with limit=4 keeps [7,8,8,9,10,10] minus rank>4 → [7,8,8,9] = 4 rows
+        // rank sequence asc: [1,2,2,4,4,6] → rank<=4 keeps rows 7,8,8,9 (5 rows incl boundary ties)
+        // Actually: sorted asc = [7,8,8,9,10,10], rank = [1,2,2,4,4,6]
+        // rank<=4 keeps [7,8,8,9] = 4 rows
+        let global_out = sort_chunks_rank(&arena, &order_by, 4, &chunks)
+            .expect("global rank")
+            .expect("non-empty");
+
+        let partition_out = sort_chunks_partition_topn(
+            &arena,
+            &[], // no partition keys → one global group
+            &order_by,
+            SortTopNType::Rank,
+            4,
+            &chunks,
+        )
+        .expect("partition_topn")
+        .expect("non-empty result");
+
+        assert_eq!(partition_out.len(), global_out.len());
+        assert_eq!(collect_i32(&partition_out), collect_i32(&global_out));
+    }
+
+    #[test]
+    fn partition_topn_resets_rank_per_partition() {
+        // p=[1,1,1,2,2,2], o=[10,20,30,5,6,7]
+        // After partition sort: p=[1,1,1,2,2,2], o=[10,20,30,5,6,7] (already sorted)
+        // Partition 1 ranks: 1,2,3 → keep rank<=2 → rows (1,10),(1,20)
+        // Partition 2 ranks: 1,2,3 → keep rank<=2 → rows (2,5),(2,6)
+        // Expected o values: [10,20,5,6]
+        let (arena, partition_exprs, order_by) = two_col_sort_exprs(true, true);
+        let chunks = vec![make_two_col_chunk(
+            vec![Some(1), Some(1), Some(1), Some(2), Some(2), Some(2)],
+            vec![Some(10), Some(20), Some(30), Some(5), Some(6), Some(7)],
+        )];
+
+        let out = sort_chunks_partition_topn(
+            &arena,
+            &partition_exprs,
+            &order_by,
+            SortTopNType::Rank,
+            2,
+            &chunks,
+        )
+        .expect("partition_topn")
+        .expect("non-empty result");
+
+        assert_eq!(out.len(), 4);
+        assert_eq!(
+            collect_col_i32(&out, 1),
+            vec![Some(10), Some(20), Some(5), Some(6)]
+        );
+    }
+
+    #[test]
+    fn partition_topn_limit_exceeds_partition_size_keeps_entire_partition() {
+        // p=[1,1,2,2,2], o=[10,20,5,6,7], Rank, partition_limit=10
+        // Partition 1 has 2 rows (< 10); all 2 rows must be kept.
+        // Partition 2 has 3 rows (< 10); all 3 rows must be kept.
+        let (arena, partition_exprs, order_by) = two_col_sort_exprs(true, true);
+        let chunks = vec![make_two_col_chunk(
+            vec![Some(1), Some(1), Some(2), Some(2), Some(2)],
+            vec![Some(10), Some(20), Some(5), Some(6), Some(7)],
+        )];
+
+        let out = sort_chunks_partition_topn(
+            &arena,
+            &partition_exprs,
+            &order_by,
+            SortTopNType::Rank,
+            10,
+            &chunks,
+        )
+        .expect("partition_topn")
+        .expect("non-empty result");
+
+        // All 5 rows must be kept — the limit is larger than either partition.
+        assert_eq!(out.len(), 5);
+        assert_eq!(
+            collect_col_i32(&out, 1),
+            vec![Some(10), Some(20), Some(5), Some(6), Some(7)]
+        );
+    }
+
+    #[test]
+    fn partition_topn_handles_multiple_input_chunks() {
+        // Two separate Chunks; rows of the same partition are split across them:
+        //   chunk1: (p=1,o=10), (p=2,o=5)
+        //   chunk2: (p=1,o=20), (p=1,o=30), (p=2,o=6)
+        // Rank limit=2:
+        //   Partition 1: sorted o=[10,20,30] → rank sequence [1,2,3] → keep [10,20]
+        //   Partition 2: sorted o=[5,6]      → rank sequence [1,2]   → keep [5,6]
+        let (arena, partition_exprs, order_by) = two_col_sort_exprs(true, true);
+        let chunk1 = make_two_col_chunk(vec![Some(1), Some(2)], vec![Some(10), Some(5)]);
+        let chunk2 = make_two_col_chunk(
+            vec![Some(1), Some(1), Some(2)],
+            vec![Some(20), Some(30), Some(6)],
+        );
+        let chunks = vec![chunk1, chunk2];
+
+        let out = sort_chunks_partition_topn(
+            &arena,
+            &partition_exprs,
+            &order_by,
+            SortTopNType::Rank,
+            2,
+            &chunks,
+        )
+        .expect("partition_topn")
+        .expect("non-empty result");
+
+        assert_eq!(out.len(), 4);
+        assert_eq!(
+            collect_col_i32(&out, 1),
+            vec![Some(10), Some(20), Some(5), Some(6)]
+        );
+    }
 
     fn make_chunk(values: Vec<Option<i32>>) -> Chunk {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, true)]));

@@ -62,6 +62,8 @@ mod tests {
             })),
             items: vec![],
             analytic_partition_by: vec![],
+            partition_limit: None,
+            topn_type: None,
             required_output_columns: None,
         };
 

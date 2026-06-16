@@ -51,4 +51,9 @@ pub struct SortNode {
     pub topn_type: SortTopNType,
     pub max_buffered_rows: Option<usize>,
     pub max_buffered_bytes: Option<usize>,
+    /// Partition keys for per-partition TopN. Empty for non-partition sorts.
+    pub partition_exprs: Vec<SortExpression>,
+    /// Per-partition row cap. `Some` ⇒ truncate each `partition_exprs` group to
+    /// the top-`partition_limit` by `topn_type`. `None` ⇒ ordinary sort/topn.
+    pub partition_limit: Option<usize>,
 }

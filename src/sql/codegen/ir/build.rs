@@ -790,6 +790,8 @@ mod tests {
                     nulls_first: false,
                 }],
                 analytic_partition_exprs: vec![],
+                partition_limit: None,
+                topn_type: None,
             }),
             vec![child],
             output_columns,

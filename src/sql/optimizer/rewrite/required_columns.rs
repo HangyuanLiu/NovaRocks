@@ -1599,6 +1599,8 @@ mod tests {
                 nulls_first: false,
             }],
             analytic_partition_by: vec![],
+            partition_limit: None,
+            topn_type: None,
             required_output_columns: None,
         });
         let tagged = tag_required_columns(sort, Some(needed_set(&[1])));
@@ -1723,6 +1725,8 @@ mod tests {
                 nulls_first: false,
             }],
             analytic_partition_by: vec![col_ref_expr(ColumnId::new_for_test(2))],
+            partition_limit: None,
+            topn_type: None,
             required_output_columns: None,
         });
         let tagged = tag_required_columns(sort, None);

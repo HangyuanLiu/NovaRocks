@@ -955,6 +955,8 @@ mod tests {
             input: Box::new(LogicalPlan::Scan(scan(std::slice::from_ref(&a)))),
             items: vec![],
             analytic_partition_by: vec![],
+            partition_limit: None,
+            topn_type: None,
             required_output_columns: None,
         });
         assert!(SpjgDescriptor::from_logical_plan(&plan).is_err());

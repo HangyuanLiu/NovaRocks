@@ -240,6 +240,8 @@ fn apply_query_modifiers(
                 items: sort_items,
                 // Top-level ORDER BY — no analytic partition.
                 analytic_partition_by: Vec::new(),
+                partition_limit: None,
+                topn_type: None,
                 required_output_columns: None,
             });
 
@@ -296,6 +298,8 @@ fn apply_query_modifiers(
                 items: sort_items,
                 // Top-level ORDER BY — no analytic partition.
                 analytic_partition_by: Vec::new(),
+                partition_limit: None,
+                topn_type: None,
                 required_output_columns: None,
             });
         }
@@ -1408,7 +1412,7 @@ fn build_window_and_project(
         // Insert a Sort node before the Window node using the first window
         // function's sort keys.  When window functions have different
         // partition/order signatures, the physical emitter splits them into
-        // separate Sort + Analytic nodes (see emit_window).
+        // separate Sort + Analytic nodes (see fragment_builder.rs::visit_window_multi_group).
         let first_win = &window_exprs[0];
         let mut sort_items = Vec::new();
         for p in &first_win.partition_by {
@@ -1436,6 +1440,8 @@ fn build_window_and_project(
                 input: Box::new(input),
                 items: sort_items,
                 analytic_partition_by,
+                partition_limit: None,
+                topn_type: None,
                 required_output_columns: None,
             })
         };

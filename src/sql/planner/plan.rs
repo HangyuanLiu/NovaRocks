@@ -410,6 +410,10 @@ pub(crate) struct SortNode {
     /// tag on the downstream LogicalSortOp / PhysicalSortOp / TSortNode.
     /// Empty for top-level `ORDER BY` sorts.
     pub analytic_partition_by: Vec<TypedExpr>,
+    /// Set by RankingWindowPredicatePushdown: per-partition rank cap + ranking
+    /// kind. `None` ⇒ ordinary sort. See OQ-13 ranking-window design spec §4.
+    pub partition_limit: Option<usize>,
+    pub topn_type: Option<crate::exec::node::sort::SortTopNType>,
     /// Set by the Phase-1 column-pruning tagging pass; `None` means all columns required.
     pub required_output_columns: Option<HashSet<ColumnId>>,
 }

@@ -322,6 +322,6 @@ pub(crate) fn append_stable_row_index_sort_column(
 
 pub(crate) use chunks_sorter_full_sort::ChunksSorterFullSort;
 pub(crate) use chunks_sorter_heap_sort::ChunksSorterHeapSort;
-pub(crate) use chunks_sorter_topn::ChunksSorterTopN;
+pub(crate) use chunks_sorter_topn::{ChunksSorterPartitionTopN, ChunksSorterTopN};
 pub use sort_processor::SortProcessorFactory;
 pub(crate) use spillable_chunks_sorter::SpillableChunksSorter;

@@ -722,6 +722,8 @@ mod tests {
             op: Operator::LogicalSort(LogicalSortOp {
                 items,
                 analytic_partition_exprs: Vec::new(),
+                partition_limit: None,
+                topn_type: None,
             }),
             children: vec![child_group],
         }
@@ -808,6 +810,21 @@ mod tests {
             op: Operator::LogicalSort(LogicalSortOp {
                 items,
                 analytic_partition_exprs: vec![col(2)],
+                partition_limit: None,
+                topn_type: None,
+            }),
+            children: vec![child_group],
+        }
+    }
+
+    fn partition_topn_sort(memo: &Memo, items: Vec<SortItem>, child_group: usize) -> MExpr {
+        MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalSort(LogicalSortOp {
+                items,
+                analytic_partition_exprs: vec![col(2)],
+                partition_limit: Some(2),
+                topn_type: Some(crate::exec::node::sort::SortTopNType::Rank),
             }),
             children: vec![child_group],
         }
@@ -968,6 +985,41 @@ mod tests {
             out.is_empty(),
             "analytic partition sort carries distribution semantics and must not be elided"
         );
+    }
+
+    #[test]
+    fn does_not_remove_partition_topn_sort_under_topn() {
+        // Regression: a Sort with partition_limit=Some(k) / topn_type=Some(Rank) is a
+        // partition-topn Sort set by RankingWindowPredicatePushdown.
+        // RemoveRedundantSortUnderTopN is already guarded by
+        //   `if !sort.analytic_partition_exprs.is_empty() { continue; }`
+        // (topn_compactness.rs line 235), which fires here because such a Sort always
+        // has non-empty analytic_partition_exprs.  This test locks that invariant
+        // explicitly: the partition_limit / topn_type fields must survive untouched.
+        let mut memo = Memo::new();
+        let scan_group = scan_group(&mut memo);
+        let sort_group = memo.new_group(partition_topn_sort(&memo, vec![sort_item(1)], scan_group));
+        let topn = topn(&memo, 10, 0, TopNPhase::Final, false, sort_group);
+
+        let out = RemoveRedundantSortUnderTopN.apply(&topn, &mut memo);
+
+        assert!(
+            out.is_empty(),
+            "partition-topn Sort (partition_limit.is_some()) must not be elided by RemoveRedundantSortUnderTopN"
+        );
+        // Confirm the Sort operator in the memo still carries partition_limit/topn_type.
+        let sort_expr = &memo.groups[sort_group].logical_exprs[0];
+        match &sort_expr.op {
+            Operator::LogicalSort(s) => {
+                assert_eq!(
+                    s.partition_limit,
+                    Some(2),
+                    "partition_limit must be preserved"
+                );
+                assert!(s.topn_type.is_some(), "topn_type must be preserved");
+            }
+            other => panic!("expected LogicalSort in sort_group, got {other:?}"),
+        }
     }
 
     #[test]

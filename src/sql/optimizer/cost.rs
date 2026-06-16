@@ -567,6 +567,8 @@ mod tests {
         let op = Operator::PhysicalSort(PhysicalSortOp {
             items: vec![],
             analytic_partition_exprs: Vec::new(),
+            partition_limit: None,
+            topn_type: None,
         });
         let cost = compute_cost(&op, &s, &[]);
         // 1024 * log2(1024) = 1024 * 10 = 10240
@@ -629,6 +631,8 @@ mod tests {
         let sort = Operator::PhysicalSort(PhysicalSortOp {
             items: vec![],
             analytic_partition_exprs: Vec::new(),
+            partition_limit: None,
+            topn_type: None,
         });
         let top_n = Operator::PhysicalTopN(PhysicalTopNOp {
             items: vec![],
@@ -657,6 +661,8 @@ mod tests {
         let sort = Operator::PhysicalSort(PhysicalSortOp {
             items: vec![],
             analytic_partition_exprs: Vec::new(),
+            partition_limit: None,
+            topn_type: None,
         });
         let top_n = Operator::PhysicalTopN(PhysicalTopNOp {
             items: vec![],

@@ -528,6 +528,8 @@ fn rewrite_sort(
             input: Box::new(input),
             items: sort_items,
             analytic_partition_by: node.analytic_partition_by,
+            partition_limit: node.partition_limit,
+            topn_type: node.topn_type,
             required_output_columns: node.required_output_columns,
         }),
         output_scope,
