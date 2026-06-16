@@ -3,9 +3,10 @@
 //! Operators will reference scalar expressions by a Copy `ScalarId` handle
 //! instead of owning analyzer `TypedExpr` by value, so cloning an operator /
 //! memo expression is O(1). `intern` hash-conses: structurally-identical nodes
-//! share one id, giving id-equality == structural-equality (the property the
-//! dedup sites and future CSE rely on). M0 builds the type + the TypedExpr
-//! bridge only; no operator field uses it yet.
+//! with identical type metadata share one id, giving id-equality == typed
+//! structural-equality (the property the dedup sites and future CSE rely on).
+//! M0 builds the type + the TypedExpr bridge only; no operator field uses it
+//! yet.
 #![allow(dead_code)] // wired into operators in M1.
 
 use std::collections::HashMap;
@@ -54,9 +55,9 @@ impl Hash for HashableLiteral {
 pub(crate) struct ScalarId(u32);
 
 /// One scalar node. Children are referenced by `ScalarId` (never inlined), so a
-/// node is cheap to hash/compare. Type-determining info that is NOT a function
-/// of `(op, children)` MUST live in the node (e.g. `Cast.target`), so that
-/// `node` alone is a correct intern key. More variants are added in Task 5.
+/// node is cheap to hash/compare. Type metadata is part of `ScalarKey`; semantic
+/// operation details that are not implied by children still belong in the node.
+/// More variants are added in Task 5.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum ScalarNode {
     ColumnRef(ColumnId),
@@ -73,12 +74,19 @@ pub(crate) enum ScalarNode {
     },
 }
 
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct ScalarKey {
+    node: ScalarNode,
+    data_type: DataType,
+    nullable: bool,
+}
+
 /// Owns all scalar nodes for one optimize() call; interns (hash-conses) on push.
 pub(crate) struct ScalarArena {
     nodes: Vec<ScalarNode>,
     types: Vec<DataType>,
     nullable: Vec<bool>,
-    intern: HashMap<ScalarNode, ScalarId>,
+    intern: HashMap<ScalarKey, ScalarId>,
 }
 
 impl ScalarArena {
@@ -91,24 +99,23 @@ impl ScalarArena {
         }
     }
 
-    /// Intern a node. Returns the existing id for a structurally-identical node.
-    /// `ty`/`nullable` are the computed properties of the expression; they MUST
-    /// be a function of the node (debug-asserted on a dedup hit).
+    /// Intern a typed node. Returns the existing id for a structurally-identical
+    /// node with the same type and nullability metadata.
     pub(crate) fn intern(&mut self, node: ScalarNode, ty: DataType, nullable: bool) -> ScalarId {
         let node = Self::normalize(node);
-        if let Some(&id) = self.intern.get(&node) {
-            debug_assert!(
-                self.types[id.0 as usize] == ty && self.nullable[id.0 as usize] == nullable,
-                "interned node has divergent type/nullable; node must fully determine its type \
-                 (put type-discriminating info, e.g. Cast.target, inside the node)"
-            );
+        let key = ScalarKey {
+            node: node.clone(),
+            data_type: ty.clone(),
+            nullable,
+        };
+        if let Some(&id) = self.intern.get(&key) {
             return id;
         }
         let id = ScalarId(self.nodes.len() as u32);
-        self.nodes.push(node.clone());
+        self.nodes.push(node);
         self.types.push(ty);
         self.nullable.push(nullable);
-        self.intern.insert(node, id);
+        self.intern.insert(key, id);
         id
     }
 
@@ -302,6 +309,14 @@ mod bridge_tests {
         }
     }
 
+    fn lit_int_as(v: i64, ty: DataType) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Int(v)),
+            data_type: ty,
+            nullable: false,
+        }
+    }
+
     fn eq(l: TypedExpr, r: TypedExpr) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::BinaryOp {
@@ -328,5 +343,19 @@ mod bridge_tests {
 
         let id3 = intern_typed(&mut a, &eq(col(1, DataType::Int64), lit_int(6)));
         assert_ne!(id1, id3);
+    }
+
+    #[test]
+    fn intern_typed_separates_literals_by_type_metadata() {
+        let mut a = ScalarArena::new();
+        let int8 = intern_typed(&mut a, &lit_int_as(1, DataType::Int8));
+        let int64 = intern_typed(&mut a, &lit_int_as(1, DataType::Int64));
+
+        assert_ne!(
+            int8, int64,
+            "same literal value with different types must not share one ScalarId"
+        );
+        assert_eq!(a.data_type(int8), &DataType::Int8);
+        assert_eq!(a.data_type(int64), &DataType::Int64);
     }
 }
