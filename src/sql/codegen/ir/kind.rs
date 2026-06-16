@@ -37,6 +37,8 @@ pub(crate) struct DistributedSortNode {
     pub analytic_partition_exprs: Vec<TypedExpr>,
     pub output_columns: Vec<OutputColumn>,
     pub offset: Option<i64>,
+    pub partition_limit: Option<usize>,
+    pub topn_type: Option<crate::exec::node::sort::SortTopNType>,
 }
 
 #[derive(Clone, Debug)]

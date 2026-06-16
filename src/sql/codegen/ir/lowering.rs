@@ -4299,15 +4299,8 @@ fn sort_node_to_physical_op(kind: &super::kind::DistributedSortNode) -> Physical
     PhysicalSortOp {
         items: kind.items.clone(),
         analytic_partition_exprs: kind.analytic_partition_exprs.clone(),
-        // The distributed-plan IR `DistributedSortNode` does not yet carry
-        // per-partition TopN (partition_limit/topn_type). The standalone
-        // ranking-window pushdown path lowers PhysicalSortOp directly via
-        // `lower_sort` and never round-trips through DistributedSortNode, so
-        // None is correct here. If the distributed path later supports
-        // ranking-window pushdown, DistributedSortNode must be extended to
-        // carry these.
-        partition_limit: None,
-        topn_type: None,
+        partition_limit: kind.partition_limit,
+        topn_type: kind.topn_type,
     }
 }
 

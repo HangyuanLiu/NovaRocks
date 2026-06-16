@@ -24,6 +24,25 @@ impl DataPartition {
             exprs: Vec::new(),
         }
     }
+
+    pub(crate) fn explain_label(&self) -> String {
+        match self.kind {
+            PartitionKind::Unpartitioned => "UNPARTITIONED".to_string(),
+            PartitionKind::Random => "RANDOM".to_string(),
+            PartitionKind::Hash => {
+                if self.exprs.is_empty() {
+                    "HASH_PARTITIONED".to_string()
+                } else {
+                    let exprs = self
+                        .exprs
+                        .iter()
+                        .map(crate::sql::explain::format_expr)
+                        .collect::<Vec<_>>();
+                    format!("HASH_PARTITIONED ({})", exprs.join(", "))
+                }
+            }
+        }
+    }
 }
 
 /// Sink intent. This slice only produces the root result sink.

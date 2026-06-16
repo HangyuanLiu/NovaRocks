@@ -142,6 +142,8 @@ impl DistributedPlanBuilder {
                         analytic_partition_exprs: op.analytic_partition_exprs.clone(),
                         output_columns: node.output_columns.clone(),
                         offset: None,
+                        partition_limit: op.partition_limit,
+                        topn_type: op.topn_type,
                     }),
                 })
             }

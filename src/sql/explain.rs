@@ -1216,7 +1216,7 @@ fn supports_scan_decode_hint(data_type: &DataType) -> bool {
     )
 }
 
-fn format_expr(expr: &TypedExpr) -> String {
+pub(crate) fn format_expr(expr: &TypedExpr) -> String {
     format_expr_kind(&expr.kind)
 }
 
