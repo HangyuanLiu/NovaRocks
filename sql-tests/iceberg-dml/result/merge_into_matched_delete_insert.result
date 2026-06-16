@@ -14,9 +14,8 @@ snaps_after
 -- query 6
 id	v
 1	a
-2	bb
 3	c
 
 -- query 7
 distinct_row_ids	total_rows
-3	3
+2	2

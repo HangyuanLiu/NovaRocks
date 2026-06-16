@@ -3476,6 +3476,19 @@ pub(crate) fn execute_query_as_iceberg_write(
     query_opts: Option<crate::internal_service::TQueryOptions>,
     root_distribution_resolver: Option<IcebergWriteRootDistributionResolver>,
 ) -> Result<crate::runtime::coordinator::CoordinatedQueryResult, String> {
+    // Time-travel: a branch DML write's scan carries `FOR VERSION AS OF '<branch>'`
+    // (delete_flow's DV position scan; the MOR-UPDATE branch row scan). Resolve those
+    // version-bearing refs to synthetic per-snapshot tables bound to the BRANCH head
+    // BEFORE snapshotting the catalog, exactly as the read path does. Without this the
+    // analyzer silently drops the version clause and the scan reads the table's current
+    // (main) snapshot, so a branch DELETE/UPDATE finds rows in the wrong data files and
+    // no-ops on the branch. No-op when the query has no version ref (INSERT / main
+    // writes), so those paths are unchanged.
+    let mut prepared = query.clone();
+    if has_time_travel_refs(&prepared) {
+        rewrite_time_travel_refs(state, current_catalog, current_database, &mut prepared)?;
+    }
+
     let exchange_port = if state.exchange_port == 0 {
         ensure_standalone_exchange_server()?
     } else {
@@ -3501,7 +3514,7 @@ pub(crate) fn execute_query_as_iceberg_write(
     );
 
     let (resolved, cte_registry, mut factory) =
-        crate::sql::analyzer::analyze(query, &analyzer_provider, current_database)?;
+        crate::sql::analyzer::analyze(&prepared, &analyzer_provider, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
     let table_stats = build_table_stats_from_plan(&logical);
     let root_distribution = match root_distribution_resolver {
@@ -8216,6 +8229,24 @@ path = "meta/operations.sqlite"
         snapshot_id
     }
 
+    fn assert_iceberg_operation_absent(engine: &StandaloneNovaRocks, operation_id: i64) {
+        let provider = engine
+            .inner
+            .metadata_provider
+            .as_ref()
+            .expect("metadata provider");
+        let read = provider.begin_read().expect("read operation metadata");
+        let operation = engine
+            .inner
+            .iceberg_operation_repo
+            .load_operation(read.as_ref(), operation_id)
+            .expect("load iceberg operation");
+        assert!(
+            operation.is_none(),
+            "expected no iceberg operation #{operation_id}, found {operation:?}"
+        );
+    }
+
     fn current_iceberg_default_spec_fields(
         engine: &StandaloneNovaRocks,
         catalog: &str,
@@ -9000,18 +9031,27 @@ path = "meta/operations.sqlite"
                 (3, "c".to_string())
             ]
         );
-        assert_iceberg_operation_finalized_any_snapshot(
-            &engine,
-            3,
-            crate::meta::repository::iceberg_operation::IcebergOperationKind::InsertAppend,
-        );
+        // Phase 3 (commit 6e21eab0) folds all MERGE branches into one
+        // collector + one commit, so an upsert MERGE
+        // (WHEN MATCHED UPDATE / WHEN NOT MATCHED INSERT) now produces a
+        // SINGLE iceberg operation: one folded RowDelta commit. Pre-fold it
+        // produced two operations — a separate InsertAppend (not-matched
+        // INSERT FastAppend) plus a RowDelta (matched UPDATE).
+        //
+        // Here the two preceding inserts take operation ids #1 and #2
+        // (InsertAppend each), so the folded MERGE occupies the single
+        // operation id #3 — the slot the not-matched INSERT branch used to
+        // take — and no operation #4 exists.
         let snap_after = current_iceberg_snapshot_id(&engine, "ice", "db1", "t");
         assert_iceberg_operation_finalized(
             &engine,
-            4,
+            3,
             crate::meta::repository::iceberg_operation::IcebergOperationKind::RowDelta,
             snap_after,
         );
+        // Prove the fold: the MERGE committed exactly one operation, so the
+        // pre-fold second operation (#4) must not exist.
+        assert_iceberg_operation_absent(&engine, 4);
     }
 
     #[test]
