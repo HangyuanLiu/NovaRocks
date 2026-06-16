@@ -133,32 +133,30 @@ mod tests {
     }
 
     #[test]
-    fn top_n_split_fails_fast_in_distributed_plan() {
-        assert_distributed_plan_error_contains(
+    fn top_n_split_matches_direct_fragment_builder() {
+        let partial = top_n_plan(scan_plan(), TopNPhase::Partial, false, Some(5), Some(0));
+        assert_distributed_plan_equivalent(
             "top_n_split",
-            top_n_plan(scan_plan(), TopNPhase::Final, true, Some(5), Some(0)),
-            "TopN split is Phase 2",
+            top_n_plan(partial, TopNPhase::Final, true, Some(5), Some(0)),
         );
     }
 
     #[test]
-    fn limit_offset_without_sort_child_fails_fast_in_distributed_plan() {
-        assert_distributed_plan_error_contains(
-            "limit_offset_without_sort_child",
-            limit_plan(project_plan(scan_plan()), Some(5), Some(1)),
-            "LIMIT/OFFSET without a local SORT/TOPN child is not supported",
+    fn limit_offset_exchange_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "limit_offset_exchange",
+            limit_plan(scan_plan(), Some(5), Some(1)),
         );
     }
 
     #[test]
-    fn gather_over_limit_fails_fast_until_limit_exchange() {
-        assert_distributed_plan_error_contains(
+    fn gather_over_limit_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
             "gather_over_limit",
             sort_plan(distribution_plan(
                 limit_plan(scan_plan(), Some(5), None),
                 DistributionSpec::Gather,
             )),
-            "Gather over Limit is Task A4",
         );
     }
 
@@ -329,15 +327,14 @@ mod tests {
     }
 
     #[test]
-    fn union_distinct_fails_fast_in_distributed_plan() {
-        assert_distributed_plan_error_contains(
-            "union_distinct_fails_fast",
+    fn union_distinct_two_scans_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent_with_large_stack(
+            "union_distinct_two_scans",
             union_plan(
                 false,
                 aliased_scan_plan("l", 1, 2),
                 aliased_scan_plan("r", 3, 4),
             ),
-            "UNION DISTINCT is Phase 2",
         );
     }
 
@@ -495,6 +492,19 @@ mod tests {
         let connectors = ConnectorRegistry::new();
         let (direct, distributed) = build_both_paths(case_name, plan, &connectors);
         assert_multi_fragment_equivalent(case_name, &direct, &distributed);
+    }
+
+    fn assert_distributed_plan_equivalent_with_large_stack(
+        case_name: &'static str,
+        plan: PhysicalPlanNode,
+    ) {
+        std::thread::Builder::new()
+            .name(format!("{case_name}_equiv"))
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || assert_distributed_plan_equivalent(case_name, plan))
+            .expect("spawn equivalence test thread")
+            .join()
+            .expect("equivalence test thread panicked");
     }
 
     fn build_both_paths(

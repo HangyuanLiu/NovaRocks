@@ -399,6 +399,14 @@ fn validate_edge_target_node(
         (
             crate::sql::codegen::FragmentEdgeKind::Stream,
             super::kind::ExchangeFlavor::Distribution,
+        )
+        | (
+            crate::sql::codegen::FragmentEdgeKind::Stream,
+            super::kind::ExchangeFlavor::LimitOffset { .. },
+        )
+        | (
+            crate::sql::codegen::FragmentEdgeKind::Stream,
+            super::kind::ExchangeFlavor::TopNSplit { .. },
         ) => {
             if edge.source_fragment_id != exchange.source_fragment_id {
                 return Err(format!(
@@ -438,7 +446,7 @@ fn validate_edge_target_node(
             Ok(())
         }
         (crate::sql::codegen::FragmentEdgeKind::Stream, _) => Err(format!(
-            "lower_distributed_plan stream edge target_exchange_node_id={} in target fragment id={} must target Exchange(Distribution)",
+            "lower_distributed_plan stream edge target_exchange_node_id={} in target fragment id={} must target stream Exchange",
             edge.target_exchange_node_id, target_fragment.fragment_id
         )),
         (crate::sql::codegen::FragmentEdgeKind::CteMulticast { .. }, _) => Err(format!(
@@ -646,11 +654,19 @@ fn target_exchange_for_edge<'a>(
             super::kind::ExchangeFlavor::Distribution,
         )
         | (
+            crate::sql::codegen::FragmentEdgeKind::Stream,
+            super::kind::ExchangeFlavor::LimitOffset { .. },
+        )
+        | (
+            crate::sql::codegen::FragmentEdgeKind::Stream,
+            super::kind::ExchangeFlavor::TopNSplit { .. },
+        )
+        | (
             crate::sql::codegen::FragmentEdgeKind::CteMulticast { .. },
             super::kind::ExchangeFlavor::CteMulticast { .. },
         ) => Ok(exchange),
         (crate::sql::codegen::FragmentEdgeKind::Stream, _) => Err(format!(
-            "lower_distributed_plan stream edge target_exchange_node_id={} in target fragment id={} must target Exchange(Distribution)",
+            "lower_distributed_plan stream edge target_exchange_node_id={} in target fragment id={} must target stream Exchange",
             edge.target_exchange_node_id, target_fragment.fragment_id
         )),
         (crate::sql::codegen::FragmentEdgeKind::CteMulticast { .. }, _) => Err(format!(
@@ -671,6 +687,9 @@ pub(in crate::sql::codegen) struct LoweredFragmentOutput {
     scope: ExprScope,
     tuple_ids: Vec<i32>,
     output_columns: Vec<AnalysisOutputColumn>,
+    root_node_id: Option<i32>,
+    root_node_type: Option<plan_nodes::TPlanNodeType>,
+    root_sort_info: Option<plan_nodes::TSortInfo>,
 }
 
 fn aggregate_slot_contract_for_phase(
@@ -942,12 +961,18 @@ impl<'a> OwnedLoweringState<'a> {
             }
         };
 
+        let root_plan_node = lowered.plan_nodes.first();
         self.remember_lowered_fragment_output(
             fragment_id,
             LoweredFragmentOutput {
                 scope: lowered.scope.clone(),
                 tuple_ids: lowered.tuple_ids.clone(),
                 output_columns: lowered.output_columns.clone(),
+                root_node_id: root_plan_node.map(|node| node.node_id),
+                root_node_type: root_plan_node.map(|node| node.node_type),
+                root_sort_info: root_plan_node
+                    .and_then(|node| node.sort_node.as_ref())
+                    .map(|sort| sort.sort_info.clone()),
             },
         );
         self.lowered_fragments.push((fragment, lowered));
@@ -1172,33 +1197,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                 }
                 match &exchange.flavor {
                     super::kind::ExchangeFlavor::Distribution => {
-                        if self
-                            .state
-                            .lowered_fragment_output(exchange.source_fragment_id)
-                            .is_none()
-                        {
-                            self.state
-                                .ensure_fragment_lowered(exchange.source_fragment_id)?;
-                        }
-                        let source = self
-                            .state
-                            .lowered_fragment_output(exchange.source_fragment_id)
-                            .cloned()
-                            .ok_or_else(|| {
-                                format!(
-                                    "DistributedPlan Exchange node_id={} references source fragment id={} before it was lowered",
-                                    node.node_id, exchange.source_fragment_id
-                                )
-                            })?;
-                        if source.tuple_ids != node.tuple_ids {
-                            return Err(format!(
-                                "DistributedPlan Exchange node_id={} tuple_ids {:?} do not match source fragment id={} tuple_ids {:?}",
-                                node.node_id,
-                                node.tuple_ids,
-                                exchange.source_fragment_id,
-                                source.tuple_ids
-                            ));
-                        }
+                        let source = self.lower_stream_exchange_source(node, exchange)?;
                         LoweredDistributedNode {
                             plan_nodes: vec![nodes::build_exchange_node(
                                 node.node_id,
@@ -1211,17 +1210,54 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                             ordering: OrderingSpec::Any,
                         }
                     }
-                    super::kind::ExchangeFlavor::LimitOffset { .. } => {
-                        return Err(
-                            "DistributedPlan Exchange LimitOffset flavor is not implemented until Task A4"
-                                .to_string(),
-                        );
+                    super::kind::ExchangeFlavor::LimitOffset { limit, offset } => {
+                        let source = self.lower_stream_exchange_source(node, exchange)?;
+                        LoweredDistributedNode {
+                            plan_nodes: vec![nodes::build_limit_exchange_node(
+                                node.node_id,
+                                source.tuple_ids.clone(),
+                                exchange.partition_type,
+                                *limit,
+                                *offset,
+                            )],
+                            scope: source.scope,
+                            tuple_ids: source.tuple_ids,
+                            output_columns: source.output_columns,
+                            ordering: OrderingSpec::Any,
+                        }
                     }
-                    super::kind::ExchangeFlavor::TopNSplit => {
-                        return Err(
-                            "DistributedPlan Exchange TopNSplit flavor is not implemented until Task A4"
-                                .to_string(),
-                        );
+                    super::kind::ExchangeFlavor::TopNSplit {
+                        items,
+                        limit,
+                        offset,
+                    } => {
+                        let source = self.lower_stream_exchange_source(node, exchange)?;
+                        let partial_sort_info =
+                            source.root_sort_info.clone().ok_or_else(|| {
+                                let got = source
+                                    .root_node_type
+                                    .map(|node_type| format!("{node_type:?}"))
+                                    .unwrap_or_else(|| "<empty>".to_string());
+                                format!(
+                                    "FINAL+split TopN (node_id={}): expected PARTIAL child's root to be SORT_NODE, got {}",
+                                    source.root_node_id.unwrap_or(-1),
+                                    got
+                                )
+                            })?;
+                        LoweredDistributedNode {
+                            plan_nodes: vec![nodes::build_merging_exchange_node(
+                                node.node_id,
+                                source.tuple_ids.clone(),
+                                exchange.partition_type,
+                                partial_sort_info,
+                                *limit,
+                                *offset,
+                            )],
+                            scope: source.scope,
+                            tuple_ids: source.tuple_ids,
+                            output_columns: source.output_columns,
+                            ordering: OrderingSpec::from_sort_items(items),
+                        }
                     }
                     super::kind::ExchangeFlavor::CteMulticast { .. } => {
                         if self
@@ -1560,6 +1596,38 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         }
         self.record_probe_targets(node, &lowered);
         Ok(lowered)
+    }
+
+    fn lower_stream_exchange_source(
+        &mut self,
+        node: &super::node::DistributedPlanNode,
+        exchange: &super::kind::DistributedExchangeNode,
+    ) -> Result<LoweredFragmentOutput, String> {
+        if self
+            .state
+            .lowered_fragment_output(exchange.source_fragment_id)
+            .is_none()
+        {
+            self.state
+                .ensure_fragment_lowered(exchange.source_fragment_id)?;
+        }
+        let source = self
+            .state
+            .lowered_fragment_output(exchange.source_fragment_id)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "DistributedPlan Exchange node_id={} references source fragment id={} before it was lowered",
+                    node.node_id, exchange.source_fragment_id
+                )
+            })?;
+        if source.tuple_ids != node.tuple_ids {
+            return Err(format!(
+                "DistributedPlan Exchange node_id={} tuple_ids {:?} do not match source fragment id={} tuple_ids {:?}",
+                node.node_id, node.tuple_ids, exchange.source_fragment_id, source.tuple_ids
+            ));
+        }
+        Ok(source)
     }
 
     fn lower_cte_multicast_exchange_scope(

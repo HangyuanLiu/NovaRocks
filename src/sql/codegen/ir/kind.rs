@@ -66,7 +66,11 @@ pub(crate) enum ExchangeFlavor {
         limit: Option<i64>,
         offset: Option<i64>,
     },
-    TopNSplit,
+    TopNSplit {
+        items: Vec<SortItem>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    },
     CteMulticast {
         cte_id: CteId,
     },
