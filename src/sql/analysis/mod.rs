@@ -563,7 +563,7 @@ pub(crate) enum LiteralValue {
     Binary(Vec<u8>),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum BinOp {
     // Arithmetic
     Add,
@@ -584,7 +584,7 @@ pub(crate) enum BinOp {
     Or,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum UnOp {
     Not,
     Negate,
