@@ -922,11 +922,13 @@ impl StandaloneSession {
                 .ok_or_else(|| "custom parser returned no statements".to_string())?;
             return dispatch_statement(&self.inner, current_catalog, current_database, statement);
         }
-        let (parse_sql, forced_explain_level) =
-            if let Some((rewritten, level)) = split_explain_costs_sql(&normalized) {
-                (rewritten, Some(level))
+        let (parse_sql, forced_explain_level, force_logical_explain) =
+            if let Some((rewritten, level)) = split_explain_logical_sql(&normalized) {
+                (rewritten, Some(level), true)
+            } else if let Some((rewritten, level)) = split_explain_costs_sql(&normalized) {
+                (rewritten, Some(level), false)
             } else {
-                (normalized.clone(), None)
+                (normalized.clone(), None, false)
             };
 
         if let Some(parsed) = parse_explain_refresh_materialized_view(&normalized) {
@@ -1080,15 +1082,19 @@ impl StandaloneSession {
                     &connectors_snapshot,
                     crate::sql::catalog::TableLookupMode::ExplainStats,
                 );
-                let result = explain_query(
-                    &prepared,
-                    &analyzer_provider,
-                    &catalog_snapshot,
-                    &connectors_snapshot,
-                    current_database,
-                    level,
-                    Some(&self.inner),
-                )?;
+                let result = if force_logical_explain {
+                    explain_logical_query(&prepared, &analyzer_provider, current_database, level)?
+                } else {
+                    explain_query(
+                        &prepared,
+                        &analyzer_provider,
+                        &catalog_snapshot,
+                        &connectors_snapshot,
+                        current_database,
+                        level,
+                        Some(&self.inner),
+                    )?
+                };
                 Ok(StatementResult::Query(result))
             }
             sqlast::Statement::Explain {
@@ -3224,10 +3230,8 @@ fn explain_analyze_query(
     query_opts: Option<crate::internal_service::TQueryOptions>,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
-    use crate::sql::codegen::fragment_builder::PlanFragmentBuilder;
-    use crate::sql::explain::{
-        ExplainLevel, explain_physical_plan, format_boundary_schema_reports,
-    };
+    use crate::sql::codegen::ir::{build_distributed_plan, explain_distributed_plan};
+    use crate::sql::explain::ExplainLevel;
 
     // NOTE: planning_ms covers only the outer analyze + plan_query +
     // optimize call below; execute_query re-plans internally and its
@@ -3275,13 +3279,24 @@ fn explain_analyze_query(
     lines.push(format!(
         "Planning: {planning_ms} ms / Execution: {execution_ms} ms / Rows: {rows}"
     ));
-    lines.extend(explain_physical_plan(&physical, ExplainLevel::Analyze));
-    let build_result =
-        PlanFragmentBuilder::build(&physical, codegen_catalog, connectors, current_database)?;
-    lines.extend(format_boundary_schema_reports(
-        &build_result.boundary_schemas,
-    ));
+    let dp = build_distributed_plan(&physical)?;
+    lines.extend(explain_distributed_plan(&dp, ExplainLevel::Analyze));
 
+    build_string_query_result("Explain String", lines)
+}
+
+/// Produce non-distributed logical EXPLAIN output for a query without
+/// optimizing or building the DistributedPlan IR.
+fn explain_logical_query(
+    query: &sqlparser::ast::Query,
+    analyzer_catalog: &dyn crate::sql::catalog::CatalogProvider,
+    current_database: &str,
+    level: crate::sql::explain::ExplainLevel,
+) -> Result<QueryResult, String> {
+    let (resolved, cte_registry, mut factory) =
+        crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
+    let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
+    let lines = crate::sql::explain::explain_plan(&logical, level);
     build_string_query_result("Explain String", lines)
 }
 
@@ -3289,16 +3304,14 @@ fn explain_analyze_query(
 fn explain_query(
     query: &sqlparser::ast::Query,
     analyzer_catalog: &dyn crate::sql::catalog::CatalogProvider,
-    codegen_catalog: &InMemoryCatalog,
-    connectors: &crate::connector::ConnectorRegistry,
+    _codegen_catalog: &InMemoryCatalog,
+    _connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     level: crate::sql::explain::ExplainLevel,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
-    use crate::sql::codegen::fragment_builder::PlanFragmentBuilder;
-    use crate::sql::explain::{
-        ExplainLevel, explain_physical_plan, format_boundary_schema_reports,
-    };
+    use crate::sql::codegen::ir::{build_distributed_plan, explain_distributed_plan};
+    use crate::sql::explain::ExplainLevel;
 
     let (resolved, cte_registry, mut factory) =
         crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
@@ -3330,14 +3343,8 @@ fn explain_query(
             ));
         }
     }
-    lines.extend(explain_physical_plan(&physical, level));
-    if matches!(level, ExplainLevel::Verbose | ExplainLevel::Analyze) {
-        let build_result =
-            PlanFragmentBuilder::build(&physical, codegen_catalog, connectors, current_database)?;
-        lines.extend(format_boundary_schema_reports(
-            &build_result.boundary_schemas,
-        ));
-    }
+    let dp = build_distributed_plan(&physical)?;
+    lines.extend(explain_distributed_plan(&dp, level));
 
     build_string_query_result("Explain String", lines)
 }
@@ -4497,21 +4504,46 @@ fn format_parser_error(raw: &str) -> String {
 }
 
 fn split_explain_costs_sql(sql: &str) -> Option<(String, crate::sql::explain::ExplainLevel)> {
-    let trimmed = sql.trim_start();
-    let prefix = "EXPLAIN COSTS ";
-    if trimmed
-        .as_bytes()
-        .get(..prefix.len())
-        .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
-    {
-        let body = trimmed[prefix.len()..].trim_start();
-        Some((
-            format!("EXPLAIN {body}"),
-            crate::sql::explain::ExplainLevel::Costs,
-        ))
-    } else {
-        None
+    let body = consume_leading_keyword(consume_leading_keyword(sql, "EXPLAIN")?, "COSTS")?;
+    Some((
+        format!("EXPLAIN {}", body.trim_start()),
+        crate::sql::explain::ExplainLevel::Costs,
+    ))
+}
+
+fn split_explain_logical_sql(sql: &str) -> Option<(String, crate::sql::explain::ExplainLevel)> {
+    let mut body = consume_leading_keyword(consume_leading_keyword(sql, "EXPLAIN")?, "LOGICAL")?;
+    let mut level = crate::sql::explain::ExplainLevel::Normal;
+    for (keyword, candidate) in [
+        ("VERBOSE", crate::sql::explain::ExplainLevel::Verbose),
+        ("COSTS", crate::sql::explain::ExplainLevel::Costs),
+    ] {
+        if let Some(rest) = consume_leading_keyword(body, keyword) {
+            level = candidate;
+            body = rest;
+            break;
+        }
     }
+
+    Some((format!("EXPLAIN {}", body.trim_start()), level))
+}
+
+fn consume_leading_keyword<'a>(sql: &'a str, keyword: &str) -> Option<&'a str> {
+    let trimmed = sql.trim_start();
+    let head = trimmed.as_bytes().get(..keyword.len())?;
+    if !head.eq_ignore_ascii_case(keyword.as_bytes()) {
+        return None;
+    }
+
+    let rest = &trimmed[keyword.len()..];
+    if rest
+        .chars()
+        .next()
+        .is_some_and(|ch| !ch.is_ascii_whitespace())
+    {
+        return None;
+    }
+    Some(rest)
 }
 
 fn parse_explain_refresh_materialized_view(
@@ -9633,6 +9665,27 @@ path = "meta/operations.sqlite"
         .expect("parsed");
         assert_eq!(parsed.1, crate::sql::explain::ExplainLevel::Analyze);
         assert!(parsed.2);
+    }
+
+    #[test]
+    fn split_explain_logical_sql_rewrites_to_plain_explain() {
+        let (rewritten, level) =
+            super::split_explain_logical_sql(" EXPLAIN LOGICAL SELECT * FROM t")
+                .expect("recognized");
+        assert_eq!(rewritten, "EXPLAIN SELECT * FROM t");
+        assert_eq!(level, crate::sql::explain::ExplainLevel::Normal);
+
+        let (rewritten, level) =
+            super::split_explain_logical_sql("explain logical verbose select k from t")
+                .expect("recognized");
+        assert_eq!(rewritten, "EXPLAIN select k from t");
+        assert_eq!(level, crate::sql::explain::ExplainLevel::Verbose);
+
+        let (rewritten, level) =
+            super::split_explain_logical_sql("EXPLAIN\nLOGICAL\nSELECT k FROM t")
+                .expect("recognized");
+        assert_eq!(rewritten, "EXPLAIN SELECT k FROM t");
+        assert_eq!(level, crate::sql::explain::ExplainLevel::Normal);
     }
 
     // -------------------------------------------------------------------------

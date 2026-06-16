@@ -1,66 +1,58 @@
 -- query 2
 Explain String
-PROJECT [s.id AS id, s.score AS score] stats={rows=2}
-  PROJECT [id, score] stats={rows=2}
-    PROJECT [id, score] stats={rows=2}
-      PROJECT [id, score] stats={rows=2}
-        TOP-N (limit=2) [score DESC NULLS LAST, id ASC NULLS FIRST] stats={rows=2}
-          GATHER EXCHANGE stats={rows=4}
-            UNION ALL stats={rows=4}
-              UNION ALL stats={rows=3}
-                UNION ALL stats={rows=2}
-                  PROJECT [1 AS id, 10 AS score] stats={rows=1}
-                    VALUES (1 rows) stats={rows=1}
-                  PROJECT [2 AS id, 20 AS score] stats={rows=1}
-                    VALUES (1 rows) stats={rows=1}
-                PROJECT [3 AS id, 20 AS score] stats={rows=1}
-                  VALUES (1 rows) stats={rows=1}
-              PROJECT [4 AS id, 5 AS score] stats={rows=1}
-                VALUES (1 rows) stats={rows=1}
-Boundary Schemas:
-  Fragment 1 RESULT_ROOT node=11:
-    slot=1 name=id arrow=Int64 logical=<none> nullable=false
-    slot=2 name=score arrow=Int64 logical=<none> nullable=false
-  Fragment 0 RESULT_ROOT node=17:
-    slot=1 name=id arrow=Int64 logical=<none> nullable=false
-    slot=2 name=score arrow=Int64 logical=<none> nullable=false
-  Fragment 1 EXCHANGE_SEND node=12:
-    slot=1 name=id arrow=Int64 logical=<none> nullable=false
-    slot=2 name=score arrow=Int64 logical=<none> nullable=false
-  Fragment 0 EXCHANGE_RECV node=12:
-    slot=1 name=id arrow=Int64 logical=<none> nullable=false
-    slot=2 name=score arrow=Int64 logical=<none> nullable=false
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+17:PROJECT [s.id AS id, s.score AS score] stats={rows=2}
+  16:PROJECT [id, score] stats={rows=2}
+    15:PROJECT [id, score] stats={rows=2}
+      14:PROJECT [id, score] stats={rows=2}
+        13:TOP-N (limit=2) [score DESC NULLS LAST, id ASC NULLS FIRST] stats={rows=2}
+          12:GATHER stats={rows=4}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 12
+    PARTITION: UNPARTITIONED
+11:UNION ALL stats={rows=4}
+  8:UNION ALL stats={rows=3}
+    5:UNION ALL stats={rows=2}
+      2:PROJECT [1 AS id, 10 AS score] stats={rows=1}
+        1:VALUES (1 rows) stats={rows=1}
+      4:PROJECT [2 AS id, 20 AS score] stats={rows=1}
+        3:VALUES (1 rows) stats={rows=1}
+    7:PROJECT [3 AS id, 20 AS score] stats={rows=1}
+      6:VALUES (1 rows) stats={rows=1}
+  10:PROJECT [4 AS id, 5 AS score] stats={rows=1}
+    9:VALUES (1 rows) stats={rows=1}
 
 -- query 4
 Explain String
-TOP-N (limit=2) [s.score DESC NULLS LAST, id ASC NULLS FIRST] stats={rows=2}
-  PROJECT [s.id AS id, s.score AS score] stats={rows=3}
-    PROJECT [id, score] stats={rows=3}
-      TOP-N (limit=3) [score DESC NULLS LAST, id ASC NULLS FIRST] stats={rows=3}
-        GATHER EXCHANGE stats={rows=4}
-          PROJECT [id, score] stats={rows=4}
-            PROJECT [id, score] stats={rows=4}
-              UNION ALL stats={rows=4}
-                UNION ALL stats={rows=3}
-                  UNION ALL stats={rows=2}
-                    PROJECT [1 AS id, 10 AS score] stats={rows=1}
-                      VALUES (1 rows) stats={rows=1}
-                    PROJECT [2 AS id, 20 AS score] stats={rows=1}
-                      VALUES (1 rows) stats={rows=1}
-                  PROJECT [3 AS id, 20 AS score] stats={rows=1}
-                    VALUES (1 rows) stats={rows=1}
-                PROJECT [4 AS id, 5 AS score] stats={rows=1}
-                  VALUES (1 rows) stats={rows=1}
-Boundary Schemas:
-  Fragment 1 RESULT_ROOT node=13:
-    slot=1 name=id arrow=Int64 logical=<none> nullable=false
-    slot=2 name=score arrow=Int64 logical=<none> nullable=false
-  Fragment 0 RESULT_ROOT node=18:
-    slot=1 name=id arrow=Int64 logical=<none> nullable=false
-    slot=2 name=score arrow=Int64 logical=<none> nullable=false
-  Fragment 1 EXCHANGE_SEND node=14:
-    slot=1 name=id arrow=Int64 logical=<none> nullable=false
-    slot=2 name=score arrow=Int64 logical=<none> nullable=false
-  Fragment 0 EXCHANGE_RECV node=14:
-    slot=1 name=id arrow=Int64 logical=<none> nullable=false
-    slot=2 name=score arrow=Int64 logical=<none> nullable=false
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+18:TOP-N (limit=2) [s.score DESC NULLS LAST, id ASC NULLS FIRST] stats={rows=2}
+  17:PROJECT [s.id AS id, s.score AS score] stats={rows=3}
+    16:PROJECT [id, score] stats={rows=3}
+      15:TOP-N (limit=3) [score DESC NULLS LAST, id ASC NULLS FIRST] stats={rows=3}
+        14:GATHER stats={rows=4}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 14
+    PARTITION: UNPARTITIONED
+13:PROJECT [id, score] stats={rows=4}
+  12:PROJECT [id, score] stats={rows=4}
+    11:UNION ALL stats={rows=4}
+      8:UNION ALL stats={rows=3}
+        5:UNION ALL stats={rows=2}
+          2:PROJECT [1 AS id, 10 AS score] stats={rows=1}
+            1:VALUES (1 rows) stats={rows=1}
+          4:PROJECT [2 AS id, 20 AS score] stats={rows=1}
+            3:VALUES (1 rows) stats={rows=1}
+        7:PROJECT [3 AS id, 20 AS score] stats={rows=1}
+          6:VALUES (1 rows) stats={rows=1}
+      10:PROJECT [4 AS id, 5 AS score] stats={rows=1}
+        9:VALUES (1 rows) stats={rows=1}

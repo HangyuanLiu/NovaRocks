@@ -1,4 +1,4 @@
--- @tags=optimizer,p8,boundary_schema
+-- @tags=optimizer,p8,distributed_ir_explain
 EXPLAIN VERBOSE
 SELECT k, SUM(v) AS total_v
 FROM (
@@ -9,8 +9,9 @@ FROM (
 GROUP BY k;
 
 -- @normalize_explain_timing=true
--- @explain_contains=Boundary Schemas:
--- @explain_contains=EXCHANGE_
+-- @explain_contains=PLAN FRAGMENT
+-- @explain_contains=EXCHANGE ID:
+-- @explain_not_contains=Boundary Schemas:
 EXPLAIN ANALYZE SELECT k, SUM(v) AS total_v
 FROM (
     SELECT 1 AS k, 10 AS v
@@ -19,8 +20,9 @@ FROM (
 ) t
 GROUP BY k;
 
--- @explain_contains=Boundary Schemas:
--- @explain_contains=EXCHANGE_
+-- @explain_contains=PLAN FRAGMENT
+-- @explain_contains=EXCHANGE ID:
+-- @explain_not_contains=Boundary Schemas:
 SELECT k, SUM(v) AS total_v
 FROM (
     SELECT 1 AS k, 10 AS v

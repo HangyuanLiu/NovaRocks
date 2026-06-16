@@ -1,11 +1,10 @@
 Explain String
-GATHER EXCHANGE stats={rows=20}
-  PROJECT [b] stats={rows=20}
-    SCAN db_sqlt_bbe2afdec0e97ad3.oq12_stats_or stats={rows=20}
-         TABLE: db_sqlt_bbe2afdec0e97ad3.oq12_stats_or
-         columns: b, a
-         min-max stats
-         predicates: a = 1 OR a = 2
-Boundary Schemas:
-  Fragment 0 RESULT_ROOT node=2:
-    slot=1 name=b arrow=Int32 logical=<none> nullable=true
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+2:PROJECT [b] stats={rows=20}
+  1:SCAN db_sqlt_bbe2afdec0e97ad3.oq12_stats_or stats={rows=20}
+       TABLE: db_sqlt_bbe2afdec0e97ad3.oq12_stats_or
+       columns: b, a
+       min-max stats
+       predicates: a = 1 OR a = 2

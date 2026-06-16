@@ -22,12 +22,13 @@ mod tests {
     };
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
-        AggMode, JoinDistribution, Operator, PhysicalAssertOneRowOp, PhysicalDecodeOp,
-        PhysicalDistributionOp, PhysicalExceptOp, PhysicalFilterOp, PhysicalGenerateSeriesOp,
-        PhysicalHashAggregateOp, PhysicalHashJoinEqCondition, PhysicalHashJoinOp,
-        PhysicalIntersectOp, PhysicalLimitOp, PhysicalNestLoopJoinOp, PhysicalProjectOp,
-        PhysicalRepeatOp, PhysicalScanOp, PhysicalSortOp, PhysicalTableFunctionOp, PhysicalTopNOp,
-        PhysicalUnionOp, PhysicalValuesOp, PhysicalWindowOp, ScanDictionaryColumn, TopNPhase,
+        AggMode, JoinDistribution, Operator, PhysicalAssertOneRowOp, PhysicalCTEAnchorOp,
+        PhysicalCTEConsumeOp, PhysicalCTEProduceOp, PhysicalDecodeOp, PhysicalDistributionOp,
+        PhysicalExceptOp, PhysicalFilterOp, PhysicalGenerateSeriesOp, PhysicalHashAggregateOp,
+        PhysicalHashJoinEqCondition, PhysicalHashJoinOp, PhysicalIntersectOp, PhysicalLimitOp,
+        PhysicalNestLoopJoinOp, PhysicalProjectOp, PhysicalRepeatOp, PhysicalScanOp,
+        PhysicalSortOp, PhysicalTableFunctionOp, PhysicalTopNOp, PhysicalUnionOp, PhysicalValuesOp,
+        PhysicalWindowOp, ScanDictionaryColumn, TopNPhase,
     };
     use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, PlanExecutionProps};
     use crate::sql::optimizer::property::DistributionSpec;
@@ -132,20 +133,30 @@ mod tests {
     }
 
     #[test]
-    fn top_n_split_fails_fast_in_distributed_plan() {
-        assert_distributed_plan_error_contains(
+    fn top_n_split_matches_direct_fragment_builder() {
+        let partial = top_n_plan(scan_plan(), TopNPhase::Partial, false, Some(5), Some(0));
+        assert_distributed_plan_equivalent(
             "top_n_split",
-            top_n_plan(scan_plan(), TopNPhase::Final, true, Some(5), Some(0)),
-            "TopN split is Phase 2",
+            top_n_plan(partial, TopNPhase::Final, true, Some(5), Some(0)),
         );
     }
 
     #[test]
-    fn limit_offset_without_sort_child_fails_fast_in_distributed_plan() {
-        assert_distributed_plan_error_contains(
-            "limit_offset_without_sort_child",
-            limit_plan(project_plan(scan_plan()), Some(5), Some(1)),
-            "LIMIT/OFFSET without a local SORT/TOPN child is not supported",
+    fn limit_offset_exchange_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "limit_offset_exchange",
+            limit_plan(scan_plan(), Some(5), Some(1)),
+        );
+    }
+
+    #[test]
+    fn gather_over_limit_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "gather_over_limit",
+            sort_plan(distribution_plan(
+                limit_plan(scan_plan(), Some(5), None),
+                DistributionSpec::Gather,
+            )),
         );
     }
 
@@ -166,6 +177,30 @@ mod tests {
     }
 
     #[test]
+    fn shuffle_agg_exchange_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "shuffle_agg_exchange",
+            aggregate_group_by_plan(distribution_plan(
+                scan_plan(),
+                DistributionSpec::shuffle_agg([ColumnId::new_for_test(1)]),
+            )),
+        );
+    }
+
+    #[test]
+    fn nested_gather_exchange_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "nested_gather_exchange",
+            sort_plan(distribution_plan(scan_plan(), DistributionSpec::Gather)),
+        );
+    }
+
+    #[test]
+    fn cte_produce_consume_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent("cte_produce_consume", cte_produce_consume_plan());
+    }
+
+    #[test]
     fn sort_over_project_over_scan_matches_direct_fragment_builder() {
         assert_distributed_plan_equivalent(
             "sort_over_project_over_scan",
@@ -178,6 +213,30 @@ mod tests {
         assert_distributed_plan_equivalent(
             "inner_hash_join_two_scans",
             inner_hash_join_two_scans_plan(),
+        );
+    }
+
+    #[test]
+    fn broadcast_join_exchange_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "broadcast_join_exchange",
+            broadcast_join_exchange_plan(),
+        );
+    }
+
+    #[test]
+    fn two_sided_shuffle_join_exchange_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "two_sided_shuffle_join_exchange",
+            two_sided_shuffle_join_exchange_plan(),
+        );
+    }
+
+    #[test]
+    fn gather_root_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent(
+            "gather_root",
+            root_gather_plan(project_plan(filter_plan(scan_plan()))),
         );
     }
 
@@ -268,15 +327,14 @@ mod tests {
     }
 
     #[test]
-    fn union_distinct_fails_fast_in_distributed_plan() {
-        assert_distributed_plan_error_contains(
-            "union_distinct_fails_fast",
+    fn union_distinct_two_scans_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent_with_large_stack(
+            "union_distinct_two_scans",
             union_plan(
                 false,
                 aliased_scan_plan("l", 1, 2),
                 aliased_scan_plan("r", 3, 4),
             ),
-            "UNION DISTINCT is Phase 2",
         );
     }
 
@@ -434,6 +492,19 @@ mod tests {
         let connectors = ConnectorRegistry::new();
         let (direct, distributed) = build_both_paths(case_name, plan, &connectors);
         assert_multi_fragment_equivalent(case_name, &direct, &distributed);
+    }
+
+    fn assert_distributed_plan_equivalent_with_large_stack(
+        case_name: &'static str,
+        plan: PhysicalPlanNode,
+    ) {
+        std::thread::Builder::new()
+            .name(format!("{case_name}_equiv"))
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || assert_distributed_plan_equivalent(case_name, plan))
+            .expect("spawn equivalence test thread")
+            .join()
+            .expect("equivalence test thread panicked");
     }
 
     fn build_both_paths(
@@ -900,6 +971,44 @@ mod tests {
         )
     }
 
+    fn distribution_plan(child: PhysicalPlanNode, spec: DistributionSpec) -> PhysicalPlanNode {
+        let output_columns = child.output_columns.clone();
+        physical_node(
+            Operator::PhysicalDistribution(PhysicalDistributionOp { spec }),
+            vec![child],
+            output_columns,
+        )
+    }
+
+    fn cte_produce_consume_plan() -> PhysicalPlanNode {
+        let cte_id = 7;
+        let produce = single_column_scan_plan(output_col(1101, "k", DataType::Int64, false));
+        let produce_output_columns = produce.output_columns.clone();
+        let consume_output_columns = vec![output_col(1102, "k", DataType::Int64, false)];
+        let produce = physical_node(
+            Operator::PhysicalCTEProduce(PhysicalCTEProduceOp {
+                cte_id,
+                output_columns: produce_output_columns.clone(),
+            }),
+            vec![produce],
+            produce_output_columns,
+        );
+        let consume = physical_node(
+            Operator::PhysicalCTEConsume(PhysicalCTEConsumeOp {
+                cte_id,
+                alias: "cte".to_string(),
+                output_columns: consume_output_columns.clone(),
+            }),
+            vec![],
+            consume_output_columns.clone(),
+        );
+        physical_node(
+            Operator::PhysicalCTEAnchor(PhysicalCTEAnchorOp { cte_id }),
+            vec![produce, consume],
+            consume_output_columns,
+        )
+    }
+
     fn inner_hash_join_two_scans_plan() -> PhysicalPlanNode {
         let (mut join, left_key, right_key) = hash_join_plan(JoinKind::Inner);
         join.children[0].probe_runtime_filters = vec![RuntimeFilterProbe {
@@ -914,6 +1023,56 @@ mod tests {
             distribution: JoinDistribution::Broadcast,
         }];
         join
+    }
+
+    fn broadcast_join_exchange_plan() -> PhysicalPlanNode {
+        let left = aliased_scan_plan("l", 1, 2);
+        let right = distribution_plan(aliased_scan_plan("r", 3, 4), DistributionSpec::Broadcast);
+        let left_key = column_ref_expr_with_qualifier(1, "l", "k", DataType::Int64, false);
+        let right_key = column_ref_expr_with_qualifier(3, "r", "k", DataType::Int64, false);
+        let output_columns = join_output_columns(&left, &right, JoinOutput::Both);
+        physical_node(
+            Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: left_key,
+                    right: right_key,
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Broadcast,
+            }),
+            vec![left, right],
+            output_columns,
+        )
+    }
+
+    fn two_sided_shuffle_join_exchange_plan() -> PhysicalPlanNode {
+        let left = distribution_plan(
+            aliased_scan_plan("l", 1, 2),
+            DistributionSpec::shuffle_agg([ColumnId::new_for_test(1)]),
+        );
+        let right = distribution_plan(
+            aliased_scan_plan("r", 3, 4),
+            DistributionSpec::shuffle_agg([ColumnId::new_for_test(3)]),
+        );
+        let left_key = column_ref_expr_with_qualifier(1, "l", "k", DataType::Int64, false);
+        let right_key = column_ref_expr_with_qualifier(3, "r", "k", DataType::Int64, false);
+        let output_columns = join_output_columns(&left, &right, JoinOutput::Both);
+        physical_node(
+            Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: left_key,
+                    right: right_key,
+                    null_safe: false,
+                }],
+                other_condition: None,
+                distribution: JoinDistribution::Shuffle,
+            }),
+            vec![left, right],
+            output_columns,
+        )
     }
 
     fn left_outer_hash_join_plan() -> PhysicalPlanNode {

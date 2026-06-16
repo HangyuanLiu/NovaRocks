@@ -1,3 +1,4 @@
+use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{JoinKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
 use crate::sql::catalog::TableDef;
 use crate::sql::column_id::ColumnId;
@@ -7,6 +8,8 @@ use crate::sql::optimizer::operator::{
 use crate::sql::planner::plan::WindowExpr;
 use crate::sql::planner::plan::{AggregateCall, DecodeMapping};
 use crate::sql::planner::plan::{ScanDictionaryColumn, ScanVariantColumn};
+
+use super::FragmentId;
 
 #[derive(Clone, Debug)]
 pub(crate) struct DistributedScanNode {
@@ -29,11 +32,18 @@ pub(crate) struct DistributedProjectNode {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct DistributedFilterNode {
+    pub predicate: TypedExpr,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct DistributedSortNode {
     pub items: Vec<SortItem>,
     pub analytic_partition_exprs: Vec<TypedExpr>,
     pub output_columns: Vec<OutputColumn>,
     pub offset: Option<i64>,
+    pub partition_limit: Option<usize>,
+    pub topn_type: Option<crate::exec::node::sort::SortTopNType>,
 }
 
 #[derive(Clone, Debug)]
@@ -43,6 +53,34 @@ pub(crate) struct DistributedTopNNode {
     pub offset: Option<i64>,
     pub phase: TopNPhase,
     pub is_split: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DistributedExchangeNode {
+    pub partition_type: crate::partitions::TPartitionType,
+    pub partition_exprs: Vec<TypedExpr>,
+    pub source_fragment_id: FragmentId,
+    pub output_columns: Vec<OutputColumn>,
+    pub output_qualifier: Option<String>,
+    pub flavor: ExchangeFlavor,
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub(crate) enum ExchangeFlavor {
+    Distribution,
+    LimitOffset {
+        limit: Option<i64>,
+        offset: Option<i64>,
+    },
+    TopNSplit {
+        items: Vec<SortItem>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    },
+    CteMulticast {
+        cte_id: CteId,
+    },
 }
 
 #[derive(Clone, Debug)]

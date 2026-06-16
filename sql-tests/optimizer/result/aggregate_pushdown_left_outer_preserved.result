@@ -1,58 +1,44 @@
 Explain String
-GATHER EXCHANGE stats={rows=50}
-  PROJECT [a.k AS k, sum(a.v)] stats={rows=50}
-    PROJECT [a.k, sum(sum(a.v)) AS sum(a.v)] stats={rows=50}
-      HASH AGGREGATE (GLOBAL, group by: [a.k]) stats={rows=50}
-        aggregations: sum(sum(a.v))
-        HASH EXCHANGE (source: ShuffleAgg, hash: [c1]) stats={rows=50}
-          HASH AGGREGATE (LOCAL, group by: [a.k]) stats={rows=50}
-            aggregations: sum(sum(a.v))
-            HASH JOIN (PARTITIONED, LEFT OUTER, eq: [a.k = b.k]) stats={rows=100}
-              HASH AGGREGATE (GLOBAL, group by: [a.k]) stats={rows=100}
-                aggregations: sum(a.v)
-                HASH EXCHANGE (source: ShuffleAgg, hash: [c1]) stats={rows=100}
-                  HASH AGGREGATE (LOCAL, group by: [a.k]) stats={rows=100}
-                    aggregations: sum(a.v)
-                    SCAN db_sqlt_437af06dfdaad5eb.t_agg_pd_lo_a (alias=a) stats={rows=20000}
-                         TABLE: db_sqlt_437af06dfdaad5eb.t_agg_pd_lo_a
-                         columns: k, v
-                         min-max stats
-              HASH EXCHANGE (source: ShuffleJoin, hash: [c5]) stats={rows=50}
-                SCAN db_sqlt_437af06dfdaad5eb.t_agg_pd_lo_b (alias=b) stats={rows=50}
-                     TABLE: db_sqlt_437af06dfdaad5eb.t_agg_pd_lo_b
-                     columns: k
-                     min-max stats
-Boundary Schemas:
-  Fragment 2 RESULT_ROOT node=2:
-    slot=1 name=a.k arrow=Int32 logical=<none> nullable=true
-    slot=2 name=sum(a.v) arrow=Int64 logical=<none> nullable=true
-  Fragment 3 RESULT_ROOT node=5:
-    slot=1 name=k arrow=Int32 logical=<none> nullable=true
-    slot=2 name=_file arrow=Utf8 logical=<none> nullable=false
-    slot=3 name=_pos arrow=Int64 logical=<none> nullable=false
-  Fragment 1 RESULT_ROOT node=8:
-    slot=1 name=a.k arrow=Int32 logical=<none> nullable=true
-    slot=2 name=sum(sum(a.v)) arrow=Int64 logical=<none> nullable=true
-  Fragment 0 RESULT_ROOT node=12:
-    slot=1 name=k arrow=Int32 logical=<none> nullable=true
-    slot=2 name=sum(a.v) arrow=Int64 logical=<none> nullable=true
-  Fragment 2 EXCHANGE_SEND node=3:
-    slot=1 name=a.k arrow=Int32 logical=<none> nullable=true
-    slot=2 name=sum(a.v) arrow=Int64 logical=<none> nullable=true
-  Fragment 1 EXCHANGE_RECV node=3:
-    slot=1 name=a.k arrow=Int32 logical=<none> nullable=true
-    slot=2 name=sum(a.v) arrow=Int64 logical=<none> nullable=true
-  Fragment 3 EXCHANGE_SEND node=6:
-    slot=1 name=k arrow=Int32 logical=<none> nullable=true
-    slot=2 name=_file arrow=Utf8 logical=<none> nullable=false
-    slot=3 name=_pos arrow=Int64 logical=<none> nullable=false
-  Fragment 1 EXCHANGE_RECV node=6:
-    slot=1 name=k arrow=Int32 logical=<none> nullable=true
-    slot=2 name=_file arrow=Utf8 logical=<none> nullable=false
-    slot=3 name=_pos arrow=Int64 logical=<none> nullable=false
-  Fragment 1 EXCHANGE_SEND node=9:
-    slot=1 name=a.k arrow=Int32 logical=<none> nullable=true
-    slot=2 name=sum(sum(a.v)) arrow=Int64 logical=<none> nullable=true
-  Fragment 0 EXCHANGE_RECV node=9:
-    slot=1 name=a.k arrow=Int32 logical=<none> nullable=true
-    slot=2 name=sum(sum(a.v)) arrow=Int64 logical=<none> nullable=true
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+12:PROJECT [a.k AS k, sum(a.v)] stats={rows=50}
+  11:PROJECT [a.k, sum(sum(a.v)) AS sum(a.v)] stats={rows=50}
+    10:HASH AGGREGATE (GLOBAL, group by: [a.k]) stats={rows=50}
+      aggregations: sum(sum(a.v))
+      9:HASH EXCHANGE stats={rows=50}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 9
+    PARTITION: HASH_PARTITIONED (a.k)
+8:HASH AGGREGATE (LOCAL, group by: [a.k]) stats={rows=50}
+  aggregations: sum(sum(a.v))
+  7:HASH JOIN (PARTITIONED, LEFT OUTER, eq: [a.k = b.k]) stats={rows=100}
+    4:HASH AGGREGATE (GLOBAL, group by: [a.k]) stats={rows=100}
+      aggregations: sum(a.v)
+      3:HASH EXCHANGE stats={rows=100}
+    6:HASH EXCHANGE stats={rows=50}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 6
+    PARTITION: HASH_PARTITIONED (k)
+5:SCAN db_sqlt_437af06dfdaad5eb.t_agg_pd_lo_b (alias=b) stats={rows=50}
+     TABLE: db_sqlt_437af06dfdaad5eb.t_agg_pd_lo_b
+     columns: k
+     min-max stats
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: HASH_PARTITIONED (a.k)
+2:HASH AGGREGATE (LOCAL, group by: [a.k]) stats={rows=100}
+  aggregations: sum(a.v)
+  1:SCAN db_sqlt_437af06dfdaad5eb.t_agg_pd_lo_a (alias=a) stats={rows=20000}
+       TABLE: db_sqlt_437af06dfdaad5eb.t_agg_pd_lo_a
+       columns: k, v
+       min-max stats

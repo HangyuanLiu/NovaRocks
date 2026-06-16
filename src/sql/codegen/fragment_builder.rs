@@ -4218,7 +4218,7 @@ pub(in crate::sql::codegen) fn build_result_sink() -> data_sinks::TDataSink {
 /// Placeholder sink for child / CTE fragments.  The coordinator replaces
 /// this with the real DataStreamSink or MultiCastDataStreamSink after
 /// fragment instance IDs are assigned.
-fn build_noop_sink() -> data_sinks::TDataSink {
+pub(in crate::sql::codegen) fn build_noop_sink() -> data_sinks::TDataSink {
     data_sinks::TDataSink::new(
         data_sinks::TDataSinkType::NOOP_SINK,
         None::<data_sinks::TDataStreamSink>,

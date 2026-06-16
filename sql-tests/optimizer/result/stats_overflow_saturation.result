@@ -1,42 +1,30 @@
 Explain String
-PROJECT [count(*)] stats={rows=1}
-  HASH AGGREGATE (SINGLE) stats={rows=1}
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+7:PROJECT [count(*)] stats={rows=1}
+  6:HASH AGGREGATE (SINGLE) stats={rows=1}
     aggregations: count()
-    NEST LOOP JOIN (CROSS) stats={rows=10000}
-      GATHER EXCHANGE stats={rows=100}
-        SCAN db_sqlt_2413581ae9aba85a.oq12_stats_big_a (alias=a) stats={rows=100}
-             TABLE: db_sqlt_2413581ae9aba85a.oq12_stats_big_a
-             columns: k
-             min-max stats
-      GATHER EXCHANGE stats={rows=100}
-        SCAN db_sqlt_2413581ae9aba85a.oq12_stats_big_b (alias=b) stats={rows=100}
-             TABLE: db_sqlt_2413581ae9aba85a.oq12_stats_big_b
-             columns: k
-             min-max stats
-Boundary Schemas:
-  Fragment 1 RESULT_ROOT node=1:
-    slot=1 name=k arrow=Int32 logical=<none> nullable=true
-    slot=2 name=_file arrow=Utf8 logical=<none> nullable=false
-    slot=3 name=_pos arrow=Int64 logical=<none> nullable=false
-  Fragment 2 RESULT_ROOT node=3:
-    slot=1 name=k arrow=Int32 logical=<none> nullable=true
-    slot=2 name=_file arrow=Utf8 logical=<none> nullable=false
-    slot=3 name=_pos arrow=Int64 logical=<none> nullable=false
-  Fragment 0 RESULT_ROOT node=7:
-    slot=1 name=count(*) arrow=Int64 logical=<none> nullable=true
-  Fragment 1 EXCHANGE_SEND node=2:
-    slot=1 name=k arrow=Int32 logical=<none> nullable=true
-    slot=2 name=_file arrow=Utf8 logical=<none> nullable=false
-    slot=3 name=_pos arrow=Int64 logical=<none> nullable=false
-  Fragment 0 EXCHANGE_RECV node=2:
-    slot=1 name=k arrow=Int32 logical=<none> nullable=true
-    slot=2 name=_file arrow=Utf8 logical=<none> nullable=false
-    slot=3 name=_pos arrow=Int64 logical=<none> nullable=false
-  Fragment 2 EXCHANGE_SEND node=4:
-    slot=1 name=k arrow=Int32 logical=<none> nullable=true
-    slot=2 name=_file arrow=Utf8 logical=<none> nullable=false
-    slot=3 name=_pos arrow=Int64 logical=<none> nullable=false
-  Fragment 0 EXCHANGE_RECV node=4:
-    slot=1 name=k arrow=Int32 logical=<none> nullable=true
-    slot=2 name=_file arrow=Utf8 logical=<none> nullable=false
-    slot=3 name=_pos arrow=Int64 logical=<none> nullable=false
+    5:NEST LOOP JOIN (CROSS) stats={rows=10000}
+      2:GATHER stats={rows=100}
+      4:GATHER stats={rows=100}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 4
+    PARTITION: UNPARTITIONED
+3:SCAN db_sqlt_2413581ae9aba85a.oq12_stats_big_b (alias=b) stats={rows=100}
+     TABLE: db_sqlt_2413581ae9aba85a.oq12_stats_big_b
+     columns: k
+     min-max stats
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 2
+    PARTITION: UNPARTITIONED
+1:SCAN db_sqlt_2413581ae9aba85a.oq12_stats_big_a (alias=a) stats={rows=100}
+     TABLE: db_sqlt_2413581ae9aba85a.oq12_stats_big_a
+     columns: k
+     min-max stats

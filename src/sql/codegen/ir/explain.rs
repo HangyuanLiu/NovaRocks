@@ -1,0 +1,1344 @@
+use std::fmt::Write;
+
+use arrow::datatypes::DataType;
+
+use crate::partitions;
+use crate::sql::analysis::{JoinKind, SortItem, TypedExpr};
+use crate::sql::catalog::{ScanSource, TableDef};
+use crate::sql::explain::{ExplainLevel, format_expr};
+use crate::sql::optimizer::estimate::arith::MAX_ROW_COUNT;
+use crate::sql::optimizer::operator::{AggMode, JoinDistribution, TopNPhase};
+use crate::sql::optimizer::physical_plan::JoinExecutionDistribution;
+use crate::sql::optimizer::runtime_filter_pass::{RuntimeFilterDesc, RuntimeFilterProbe};
+use crate::sql::planner::plan::ScanVariantColumn;
+
+use super::fragment::{DistributedPlan, PlanFragment};
+use super::kind::{
+    DistributedAssertOneRowNode, DistributedDecodeNode, DistributedExchangeNode,
+    DistributedFilterNode, DistributedGenerateSeriesNode, DistributedHashAggregateNode,
+    DistributedHashJoinNode, DistributedNestLoopJoinNode, DistributedProjectNode,
+    DistributedRepeatNode, DistributedScanNode, DistributedSetOpNode, DistributedSortNode,
+    DistributedTableFunctionNode, DistributedTopNNode, DistributedValuesNode,
+    DistributedWindowNode, ExchangeFlavor, SetOpKind,
+};
+use super::node::{DistributedPlanNode, DistributedPlanNodeKind, PlanNodeStats};
+
+pub(crate) fn explain_distributed_plan(dp: &DistributedPlan, level: ExplainLevel) -> Vec<String> {
+    let mut out = Vec::new();
+    let fragments = explain_fragment_order(dp);
+    let detailed = is_detailed(level);
+
+    for (display_id, fragment) in fragments.iter().enumerate() {
+        if detailed {
+            out.push(format!("PLAN FRAGMENT {display_id}"));
+            out.push(format!(
+                "  OUTPUT EXPRS: {}",
+                format_output_exprs(fragment.output_exprs.as_deref())
+            ));
+            out.push(format!(
+                "  PARTITION: {}",
+                fragment.data_partition.explain_label()
+            ));
+            if fragment.fragment_id != dp.root_fragment_id {
+                let source_edges = dp
+                    .edges
+                    .iter()
+                    .filter(|edge| edge.source_fragment_id == fragment.fragment_id)
+                    .collect::<Vec<_>>();
+                if source_edges.is_empty() {
+                    out.push("  STREAM DATA SINK".to_string());
+                    out.push(format!(
+                        "    PARTITION: {}",
+                        fragment.output_partition.explain_label()
+                    ));
+                } else {
+                    for edge in source_edges {
+                        out.push("  STREAM DATA SINK".to_string());
+                        out.push(format!("    EXCHANGE ID: {}", edge.target_exchange_node_id));
+                        out.push(format!(
+                            "    PARTITION: {}",
+                            fragment.output_partition.explain_label()
+                        ));
+                    }
+                }
+            }
+        }
+
+        format_distributed_node(&fragment.root, level, 0, &mut out);
+    }
+
+    out
+}
+
+fn explain_fragment_order(dp: &DistributedPlan) -> Vec<&PlanFragment> {
+    let mut ordered = Vec::with_capacity(dp.fragments.len());
+    if let Some(root) = dp
+        .fragments
+        .iter()
+        .find(|fragment| fragment.fragment_id == dp.root_fragment_id)
+    {
+        ordered.push(root);
+    }
+    ordered.extend(
+        dp.fragments
+            .iter()
+            .rev()
+            .filter(|fragment| fragment.fragment_id != dp.root_fragment_id),
+    );
+    ordered
+}
+
+fn format_output_exprs(exprs: Option<&[TypedExpr]>) -> String {
+    match exprs {
+        Some(exprs) if !exprs.is_empty() => {
+            exprs.iter().map(format_expr).collect::<Vec<_>>().join(", ")
+        }
+        _ => "*".to_string(),
+    }
+}
+
+fn format_distributed_node(
+    node: &DistributedPlanNode,
+    level: ExplainLevel,
+    indent: usize,
+    out: &mut Vec<String>,
+) {
+    let pad = "  ".repeat(indent);
+    let costs_suffix = costs_suffix(&node.stats, level);
+    let stats_suffix = stats_suffix(&node.stats, level);
+
+    match &node.kind {
+        DistributedPlanNodeKind::Scan(scan) => {
+            format_scan_node(node, scan, level, &pad, &costs_suffix, &stats_suffix, out);
+        }
+        DistributedPlanNodeKind::Project(project) => {
+            format_project_node(node, project, &pad, &costs_suffix, &stats_suffix, out);
+            push_probe_rf_lines(&node.probe_runtime_filters, level, &pad, out);
+            format_children(node, level, indent, out);
+        }
+        DistributedPlanNodeKind::Filter(filter) => {
+            format_filter_node(node, filter, &pad, &costs_suffix, &stats_suffix, out);
+            push_probe_rf_lines(&node.probe_runtime_filters, level, &pad, out);
+            format_children(node, level, indent, out);
+        }
+        DistributedPlanNodeKind::HashJoin(join) => {
+            format_hash_join_node(node, join, level, &pad, &costs_suffix, &stats_suffix, out);
+            format_children(node, level, indent, out);
+        }
+        DistributedPlanNodeKind::NestLoopJoin(join) => {
+            format_nest_loop_join_node(node, join, &pad, &costs_suffix, &stats_suffix, out);
+            format_children(node, level, indent, out);
+        }
+        DistributedPlanNodeKind::HashAggregate(agg) => {
+            format_hash_aggregate_node(node, agg, &pad, &costs_suffix, &stats_suffix, out);
+            push_probe_rf_lines(&node.probe_runtime_filters, level, &pad, out);
+            format_children(node, level, indent, out);
+        }
+        DistributedPlanNodeKind::Sort(sort) => {
+            format_sort_node(node, sort, &pad, &costs_suffix, &stats_suffix, out);
+            format_children(node, level, indent, out);
+        }
+        DistributedPlanNodeKind::TopN(topn) => {
+            format_topn_node(node, topn, &pad, &costs_suffix, &stats_suffix, out);
+            format_children(node, level, indent, out);
+        }
+        DistributedPlanNodeKind::Exchange(exchange) => {
+            format_exchange_node(node, exchange, &pad, &costs_suffix, &stats_suffix, out);
+        }
+        DistributedPlanNodeKind::Values(values) => {
+            format_values_node(node, values, &pad, &costs_suffix, &stats_suffix, out);
+            push_probe_rf_lines(&node.probe_runtime_filters, level, &pad, out);
+        }
+        DistributedPlanNodeKind::AssertOneRow(assert) => {
+            format_assert_one_row_node(node, assert, &pad, &costs_suffix, &stats_suffix, out);
+            format_children(node, level, indent, out);
+        }
+        DistributedPlanNodeKind::Decode(decode) => {
+            format_decode_node(node, decode, &pad, &costs_suffix, &stats_suffix, out);
+            format_children(node, level, indent, out);
+        }
+        DistributedPlanNodeKind::Repeat(repeat) => {
+            format_repeat_node(node, repeat, &pad, &costs_suffix, &stats_suffix, out);
+            format_children(node, level, indent, out);
+        }
+        DistributedPlanNodeKind::SetOp(set_op) => {
+            format_set_op_node(node, set_op, &pad, &costs_suffix, &stats_suffix, out);
+            format_children(node, level, indent, out);
+        }
+        DistributedPlanNodeKind::Window(window) => {
+            format_window_node(node, window, &pad, &costs_suffix, &stats_suffix, out);
+            format_children(node, level, indent, out);
+        }
+        DistributedPlanNodeKind::GenerateSeries(generate) => {
+            format_generate_series_node(node, generate, &pad, &costs_suffix, &stats_suffix, out);
+        }
+        DistributedPlanNodeKind::TableFunction(table_function) => {
+            format_table_function_node(
+                node,
+                table_function,
+                &pad,
+                &costs_suffix,
+                &stats_suffix,
+                out,
+            );
+            format_children(node, level, indent, out);
+        }
+    }
+}
+
+fn format_children(
+    node: &DistributedPlanNode,
+    level: ExplainLevel,
+    indent: usize,
+    out: &mut Vec<String>,
+) {
+    for child in &node.children {
+        format_distributed_node(child, level, indent + 1, out);
+    }
+}
+
+fn node_prefix(node: &DistributedPlanNode) -> String {
+    format!("{}:", node.node_id)
+}
+
+fn format_scan_node(
+    node: &DistributedPlanNode,
+    scan: &DistributedScanNode,
+    level: ExplainLevel,
+    pad: &str,
+    costs_suffix: &str,
+    stats_suffix: &str,
+    out: &mut Vec<String>,
+) {
+    let alias = scan
+        .alias
+        .as_deref()
+        .map(|a| format!(" (alias={a})"))
+        .unwrap_or_default();
+    out.push(format!(
+        "{pad}{}SCAN {}.{}{alias}{costs_suffix}{stats_suffix}",
+        node_prefix(node),
+        scan.database,
+        scan.table.name
+    ));
+    out.push(format!(
+        "{pad}     TABLE: {}.{}",
+        scan.database, scan.table.name
+    ));
+    if let Some(ref mv) = scan.mv_rewritten_from {
+        out.push(format!("{pad}     rewritten with mv: {mv}"));
+    }
+    if let Some(ref cols) = scan.required_columns
+        && is_detailed(level)
+    {
+        out.push(format!("{pad}     columns: {}", cols.join(", ")));
+        if matches!(level, ExplainLevel::Verbose | ExplainLevel::Analyze) {
+            for line in scan_pruned_type_lines(scan, cols) {
+                out.push(format!("{pad}     {line}"));
+            }
+        }
+    }
+    if is_detailed(level)
+        && let Some(line) = scan_variant_column_line(scan)
+    {
+        out.push(format!("{pad}     {line}"));
+    }
+    let local_hints = explain_hints_for_scan(scan);
+    if matches!(level, ExplainLevel::Costs) && local_hints.has_decode {
+        out.push(format!("{pad}     Decode"));
+    }
+    if matches!(level, ExplainLevel::Verbose | ExplainLevel::Analyze)
+        && local_hints.has_min_max_stats
+    {
+        out.push(format!("{pad}     min-max stats"));
+    }
+    if !scan.predicates.is_empty() {
+        let preds = scan.predicates.iter().map(format_expr).collect::<Vec<_>>();
+        out.push(format!("{pad}     predicates: {}", preds.join(" AND ")));
+    }
+    push_probe_rf_lines(&node.probe_runtime_filters, level, pad, out);
+}
+
+fn format_project_node(
+    node: &DistributedPlanNode,
+    project: &DistributedProjectNode,
+    pad: &str,
+    costs_suffix: &str,
+    stats_suffix: &str,
+    out: &mut Vec<String>,
+) {
+    let items = project
+        .items
+        .iter()
+        .map(|item| {
+            let expr_str = format_expr(&item.expr);
+            if item.output_name != expr_str {
+                format!("{expr_str} AS {}", item.output_name)
+            } else {
+                expr_str
+            }
+        })
+        .collect::<Vec<_>>();
+    out.push(format!(
+        "{pad}{}PROJECT [{}]{costs_suffix}{stats_suffix}",
+        node_prefix(node),
+        items.join(", ")
+    ));
+}
+
+fn format_filter_node(
+    node: &DistributedPlanNode,
+    filter: &DistributedFilterNode,
+    pad: &str,
+    costs_suffix: &str,
+    stats_suffix: &str,
+    out: &mut Vec<String>,
+) {
+    out.push(format!(
+        "{pad}{}FILTER{costs_suffix}{stats_suffix}",
+        node_prefix(node)
+    ));
+    out.push(format!(
+        "{pad}  predicate: {}",
+        format_expr(&filter.predicate)
+    ));
+}
+
+fn format_hash_join_node(
+    node: &DistributedPlanNode,
+    join: &DistributedHashJoinNode,
+    level: ExplainLevel,
+    pad: &str,
+    costs_suffix: &str,
+    stats_suffix: &str,
+    out: &mut Vec<String>,
+) {
+    let dist = join_distribution_label(node.execution_join_distribution, &join.distribution);
+    let join_str = join_kind_label(join.join_type);
+    let eq = join
+        .eq_conditions
+        .iter()
+        .map(|eq| {
+            format!(
+                "{} {} {}",
+                format_expr(&eq.left),
+                if eq.null_safe { "<=>" } else { "=" },
+                format_expr(&eq.right)
+            )
+        })
+        .collect::<Vec<_>>();
+    out.push(format!(
+        "{pad}{}HASH JOIN ({dist}, {join_str}, eq: [{}]){costs_suffix}{stats_suffix}",
+        node_prefix(node),
+        eq.join(", ")
+    ));
+    if let Some(ref other) = join.other_condition {
+        out.push(format!("{pad}  other: {}", format_expr(other)));
+    }
+    push_build_rf_lines(&node.build_runtime_filters, level, pad, out);
+}
+
+fn format_nest_loop_join_node(
+    node: &DistributedPlanNode,
+    join: &DistributedNestLoopJoinNode,
+    pad: &str,
+    costs_suffix: &str,
+    stats_suffix: &str,
+    out: &mut Vec<String>,
+) {
+    out.push(format!(
+        "{pad}{}NEST LOOP JOIN ({}){costs_suffix}{stats_suffix}",
+        node_prefix(node),
+        join_kind_label(join.join_type)
+    ));
+    if let Some(ref cond) = join.condition {
+        out.push(format!("{pad}  on: {}", format_expr(cond)));
+    }
+}
+
+fn format_hash_aggregate_node(
+    node: &DistributedPlanNode,
+    agg: &DistributedHashAggregateNode,
+    pad: &str,
+    costs_suffix: &str,
+    stats_suffix: &str,
+    out: &mut Vec<String>,
+) {
+    let mode = match agg.mode {
+        AggMode::Single => "SINGLE",
+        AggMode::Local => "LOCAL",
+        AggMode::Global => "GLOBAL",
+        AggMode::DistinctGlobal => "DISTINCT_GLOBAL",
+        AggMode::DistinctLocal => "DISTINCT_LOCAL",
+    };
+    let groups = agg.group_by.iter().map(format_expr).collect::<Vec<_>>();
+    let aggs = agg
+        .aggregates
+        .iter()
+        .map(|a| {
+            let args = a.args.iter().map(format_expr).collect::<Vec<_>>();
+            let distinct = if a.distinct { "DISTINCT " } else { "" };
+            format!("{}({}{})", a.name, distinct, args.join(", "))
+        })
+        .collect::<Vec<_>>();
+    let mut detail = format!("{pad}{}HASH AGGREGATE ({mode}", node_prefix(node));
+    if !groups.is_empty() {
+        let _ = write!(detail, ", group by: [{}]", groups.join(", "));
+    }
+    let _ = write!(detail, "){costs_suffix}{stats_suffix}");
+    out.push(detail);
+    if !aggs.is_empty() {
+        out.push(format!("{pad}  aggregations: {}", aggs.join(", ")));
+    }
+}
+
+fn format_sort_node(
+    node: &DistributedPlanNode,
+    sort: &DistributedSortNode,
+    pad: &str,
+    costs_suffix: &str,
+    stats_suffix: &str,
+    out: &mut Vec<String>,
+) {
+    let items = format_sort_items(&sort.items);
+    let mut suffix = String::new();
+    if let Some(limit) = sort.partition_limit {
+        let topn_type = match sort.topn_type {
+            Some(crate::exec::node::sort::SortTopNType::RowNumber) => "ROW_NUMBER",
+            Some(crate::exec::node::sort::SortTopNType::Rank) => "RANK",
+            Some(crate::exec::node::sort::SortTopNType::DenseRank) => "DENSE_RANK",
+            None => "ROW_NUMBER",
+        };
+        suffix = format!(" partition_limit={limit} topn_type={topn_type}");
+    }
+    out.push(format!(
+        "{pad}{}SORT BY [{}]{suffix}{costs_suffix}{stats_suffix}",
+        node_prefix(node),
+        items.join(", ")
+    ));
+}
+
+fn format_topn_node(
+    node: &DistributedPlanNode,
+    topn: &DistributedTopNNode,
+    pad: &str,
+    costs_suffix: &str,
+    stats_suffix: &str,
+    out: &mut Vec<String>,
+) {
+    let label = match topn.phase {
+        TopNPhase::Partial => "LOCAL TOP-N",
+        TopNPhase::Final => "TOP-N",
+    };
+    let items = format_sort_items(&topn.items);
+    let mut parts = Vec::new();
+    if let Some(l) = topn.limit {
+        parts.push(format!("limit={l}"));
+    }
+    if let Some(o) = topn.offset {
+        parts.push(format!("offset={o}"));
+    }
+    out.push(format!(
+        "{pad}{}{label} ({}) [{}]{costs_suffix}{stats_suffix}",
+        node_prefix(node),
+        parts.join(", "),
+        items.join(", ")
+    ));
+}
+
+fn format_exchange_node(
+    node: &DistributedPlanNode,
+    exchange: &DistributedExchangeNode,
+    pad: &str,
+    costs_suffix: &str,
+    stats_suffix: &str,
+    out: &mut Vec<String>,
+) {
+    let label = exchange_label(exchange);
+    out.push(format!(
+        "{pad}{}{label}{costs_suffix}{stats_suffix}",
+        node_prefix(node)
+    ));
+}
+
+fn format_values_node(
+    node: &DistributedPlanNode,
+    values: &DistributedValuesNode,
+    pad: &str,
+    costs_suffix: &str,
+    stats_suffix: &str,
+    out: &mut Vec<String>,
+) {
+    out.push(format!(
+        "{pad}{}VALUES ({} rows){costs_suffix}{stats_suffix}",
+        node_prefix(node),
+        values.rows.len()
+    ));
+}
+
+fn format_assert_one_row_node(
+    node: &DistributedPlanNode,
+    _assert: &DistributedAssertOneRowNode,
+    pad: &str,
+    costs_suffix: &str,
+    stats_suffix: &str,
+    out: &mut Vec<String>,
+) {
+    out.push(format!(
+        "{pad}{}ASSERT NUM ROWS (<= 1){costs_suffix}{stats_suffix}",
+        node_prefix(node)
+    ));
+}
+
+fn format_decode_node(
+    node: &DistributedPlanNode,
+    decode: &DistributedDecodeNode,
+    pad: &str,
+    costs_suffix: &str,
+    stats_suffix: &str,
+    out: &mut Vec<String>,
+) {
+    let pairs = decode
+        .mappings
+        .iter()
+        .map(|m| format!("{}->{}", m.dict_column, m.string_column))
+        .collect::<Vec<_>>();
+    out.push(format!(
+        "{pad}{}DECODE [{}]{costs_suffix}{stats_suffix}",
+        node_prefix(node),
+        pairs.join(", ")
+    ));
+}
+
+fn format_repeat_node(
+    node: &DistributedPlanNode,
+    repeat: &DistributedRepeatNode,
+    pad: &str,
+    costs_suffix: &str,
+    stats_suffix: &str,
+    out: &mut Vec<String>,
+) {
+    out.push(format!(
+        "{pad}{}REPEAT ({} grouping sets){costs_suffix}{stats_suffix}",
+        node_prefix(node),
+        repeat.grouping_ids.len()
+    ));
+}
+
+fn format_set_op_node(
+    node: &DistributedPlanNode,
+    set_op: &DistributedSetOpNode,
+    pad: &str,
+    costs_suffix: &str,
+    stats_suffix: &str,
+    out: &mut Vec<String>,
+) {
+    let label = match set_op.kind {
+        SetOpKind::UnionAll => "UNION ALL",
+        SetOpKind::Intersect => "INTERSECT",
+        SetOpKind::Except => "EXCEPT",
+    };
+    out.push(format!(
+        "{pad}{}{label}{costs_suffix}{stats_suffix}",
+        node_prefix(node)
+    ));
+}
+
+fn format_window_node(
+    node: &DistributedPlanNode,
+    window: &DistributedWindowNode,
+    pad: &str,
+    costs_suffix: &str,
+    stats_suffix: &str,
+    out: &mut Vec<String>,
+) {
+    let fns = window
+        .window_exprs
+        .iter()
+        .map(|w| {
+            let args = w.args.iter().map(format_expr).collect::<Vec<_>>();
+            format!("{}({})", w.name, args.join(", "))
+        })
+        .collect::<Vec<_>>();
+    out.push(format!(
+        "{pad}{}WINDOW [{}]{costs_suffix}{stats_suffix}",
+        node_prefix(node),
+        fns.join("; ")
+    ));
+}
+
+fn format_generate_series_node(
+    node: &DistributedPlanNode,
+    generate: &DistributedGenerateSeriesNode,
+    pad: &str,
+    costs_suffix: &str,
+    stats_suffix: &str,
+    out: &mut Vec<String>,
+) {
+    out.push(format!(
+        "{pad}{}GENERATE_SERIES({}, {}, {}){costs_suffix}{stats_suffix}",
+        node_prefix(node),
+        generate.start,
+        generate.end,
+        generate.step
+    ));
+}
+
+fn format_table_function_node(
+    node: &DistributedPlanNode,
+    table_function: &DistributedTableFunctionNode,
+    pad: &str,
+    costs_suffix: &str,
+    stats_suffix: &str,
+    out: &mut Vec<String>,
+) {
+    let join_type = if table_function.is_left_join {
+        "LEFT"
+    } else {
+        "CROSS"
+    };
+    out.push(format!(
+        "{pad}{}TABLE_FUNCTION [{} {}]{costs_suffix}{stats_suffix}",
+        node_prefix(node),
+        join_type,
+        table_function.function_name.to_uppercase()
+    ));
+}
+
+fn format_sort_items(items: &[SortItem]) -> Vec<String> {
+    items
+        .iter()
+        .map(|s| {
+            let dir = if s.asc { "ASC" } else { "DESC" };
+            let nulls = if s.nulls_first {
+                " NULLS FIRST"
+            } else {
+                " NULLS LAST"
+            };
+            format!("{} {dir}{nulls}", format_expr(&s.expr))
+        })
+        .collect()
+}
+
+fn exchange_label(exchange: &DistributedExchangeNode) -> String {
+    match exchange.flavor {
+        ExchangeFlavor::TopNSplit { .. } => "MERGING-EXCHANGE".to_string(),
+        ExchangeFlavor::CteMulticast { .. } => "EXCHANGE".to_string(),
+        ExchangeFlavor::Distribution | ExchangeFlavor::LimitOffset { .. } => {
+            match exchange.partition_type {
+                partitions::TPartitionType::HASH_PARTITIONED
+                | partitions::TPartitionType::BUCKET_SHUFFLE_HASH_PARTITIONED => {
+                    "HASH EXCHANGE".to_string()
+                }
+                partitions::TPartitionType::UNPARTITIONED => "GATHER".to_string(),
+                partitions::TPartitionType::RANDOM => "EXCHANGE".to_string(),
+                _ => "EXCHANGE".to_string(),
+            }
+        }
+    }
+}
+
+fn join_kind_label(join_type: JoinKind) -> &'static str {
+    match join_type {
+        JoinKind::Inner => "INNER",
+        JoinKind::LeftOuter => "LEFT OUTER",
+        JoinKind::RightOuter => "RIGHT OUTER",
+        JoinKind::FullOuter => "FULL OUTER",
+        JoinKind::Cross => "CROSS",
+        JoinKind::LeftSemi => "LEFT SEMI",
+        JoinKind::RightSemi => "RIGHT SEMI",
+        JoinKind::LeftAnti => "LEFT ANTI",
+        JoinKind::RightAnti => "RIGHT ANTI",
+        JoinKind::NullAwareLeftAnti => "NULL AWARE LEFT ANTI",
+    }
+}
+
+fn join_distribution_label(
+    execution_distribution: Option<JoinExecutionDistribution>,
+    fallback: &JoinDistribution,
+) -> &'static str {
+    match execution_distribution {
+        Some(JoinExecutionDistribution::Broadcast) => "BROADCAST",
+        Some(JoinExecutionDistribution::Partitioned) => "PARTITIONED",
+        Some(JoinExecutionDistribution::Colocate) => "COLOCATE",
+        None => match fallback {
+            JoinDistribution::Broadcast => "BROADCAST",
+            JoinDistribution::Shuffle => "PARTITIONED",
+            JoinDistribution::Colocate => "COLOCATE",
+            JoinDistribution::Unknown => "UNKNOWN",
+        },
+    }
+}
+
+fn is_detailed(level: ExplainLevel) -> bool {
+    matches!(
+        level,
+        ExplainLevel::Verbose | ExplainLevel::Costs | ExplainLevel::Analyze
+    )
+}
+
+fn costs_suffix(stats: &PlanNodeStats, level: ExplainLevel) -> String {
+    if matches!(level, ExplainLevel::Costs) {
+        let colstats = format_column_stats_costs(stats);
+        if colstats.is_empty() {
+            format!(" (rows={:.0})", stats.output_row_count)
+        } else {
+            format!(" (rows={:.0}) {colstats}", stats.output_row_count)
+        }
+    } else {
+        String::new()
+    }
+}
+
+fn stats_suffix(stats: &PlanNodeStats, level: ExplainLevel) -> String {
+    if is_detailed(level) {
+        let trailer = format_stats_trailer(
+            stats,
+            matches!(level, ExplainLevel::Costs | ExplainLevel::Analyze),
+        );
+        format!(" {trailer}")
+    } else {
+        String::new()
+    }
+}
+
+fn format_stats_trailer(stats: &PlanNodeStats, show_conf: bool) -> String {
+    let rows = stats.output_row_count;
+    let rows_str = if rows.is_nan() || rows <= 0.0 {
+        "?".to_string()
+    } else if rows.is_infinite() || rows >= MAX_ROW_COUNT {
+        ">=1e15".to_string()
+    } else {
+        (rows.round() as i64).to_string()
+    };
+    let conf = if show_conf {
+        match stats.row_count_confidence {
+            crate::sql::optimizer::statistics::Confidence::Estimated => " conf=estimated",
+            crate::sql::optimizer::statistics::Confidence::Fallback => " conf=fallback",
+            crate::sql::optimizer::statistics::Confidence::Exact => "",
+        }
+    } else {
+        ""
+    };
+    format!("stats={{rows={rows_str}{conf}}}")
+}
+
+fn format_column_stats_costs(stats: &PlanNodeStats) -> String {
+    if stats.column_statistics.is_empty() {
+        return String::new();
+    }
+    let mut ids: Vec<_> = stats.column_statistics.keys().copied().collect();
+    ids.sort_by_key(|id| id.0);
+    let parts = ids
+        .into_iter()
+        .map(|column_id| {
+            let c = &stats.column_statistics[&column_id];
+            let ndv = if c.distinct_values_count.is_finite() {
+                (c.distinct_values_count.round() as i64).to_string()
+            } else {
+                "?".to_string()
+            };
+            format!(
+                "col#{}[min={} max={} ndv={ndv} null_frac={}]",
+                column_id.0,
+                fmt_f64(c.min_value),
+                fmt_f64(c.max_value),
+                fmt_f64(c.nulls_fraction),
+            )
+        })
+        .collect::<Vec<_>>();
+    format!("colstats={{{}}}", parts.join(", "))
+}
+
+fn fmt_f64(v: f64) -> String {
+    if v.is_nan() {
+        "?".to_string()
+    } else if v.is_infinite() {
+        if v > 0.0 {
+            "+inf".to_string()
+        } else {
+            "-inf".to_string()
+        }
+    } else if v.fract() == 0.0 {
+        format!("{}", v as i64)
+    } else {
+        format!("{v:.4}")
+    }
+}
+
+fn push_build_rf_lines(
+    filters: &[RuntimeFilterDesc],
+    level: ExplainLevel,
+    pad: &str,
+    out: &mut Vec<String>,
+) {
+    if !is_detailed(level) || filters.is_empty() {
+        return;
+    }
+    out.push(format!("{pad}  build runtime filters:"));
+    for rf in filters {
+        out.push(format!(
+            "{pad}  - filter_id = {}, build_expr = ({})",
+            rf.filter_id,
+            format_expr(&rf.build_expr),
+        ));
+    }
+}
+
+fn push_probe_rf_lines(
+    filters: &[RuntimeFilterProbe],
+    level: ExplainLevel,
+    pad: &str,
+    out: &mut Vec<String>,
+) {
+    if !is_detailed(level) || filters.is_empty() {
+        return;
+    }
+    out.push(format!("{pad}    probe runtime filters:"));
+    for rf in filters {
+        out.push(format!(
+            "{pad}    - filter_id = {}, probe_expr = ({})",
+            rf.filter_id,
+            format_expr(&rf.probe_expr),
+        ));
+    }
+}
+
+#[derive(Default)]
+struct LocalScanExplainHints {
+    has_decode: bool,
+    has_min_max_stats: bool,
+}
+
+fn explain_hints_for_scan(scan: &DistributedScanNode) -> LocalScanExplainHints {
+    let Some(required_columns) = scan.required_columns.as_ref() else {
+        return LocalScanExplainHints::default();
+    };
+    if required_columns.is_empty() {
+        return LocalScanExplainHints::default();
+    }
+
+    let resolved = required_columns
+        .iter()
+        .map(|required| {
+            scan.dict_columns
+                .iter()
+                .find(|d| d.dict_column.eq_ignore_ascii_case(required))
+                .map(|d| d.source_column.clone())
+                .unwrap_or_else(|| required.clone())
+        })
+        .collect::<Vec<_>>();
+
+    LocalScanExplainHints {
+        has_decode: scan_supports_decode_hint(&scan.table, &resolved),
+        has_min_max_stats: scan_supports_min_max_stats(&scan.table, &resolved),
+    }
+}
+
+fn scan_pruned_type_lines(scan: &DistributedScanNode, required_columns: &[String]) -> Vec<String> {
+    required_columns
+        .iter()
+        .filter_map(|required| {
+            let (slot, data_type) = scan_required_column_type(scan, required)?;
+            if !is_complex_type(data_type) {
+                return None;
+            }
+            Some(format!(
+                "Pruned type: {slot} <-> [{}]",
+                format_scan_pruned_type(data_type, true)
+            ))
+        })
+        .collect()
+}
+
+fn scan_variant_column_line(scan: &DistributedScanNode) -> Option<String> {
+    if scan.variant_columns.is_empty() {
+        return None;
+    }
+    let columns = scan
+        .variant_columns
+        .iter()
+        .map(format_scan_variant_column)
+        .collect::<Vec<_>>();
+    Some(format!("variant columns: {}", columns.join(", ")))
+}
+
+fn format_scan_variant_column(col: &ScanVariantColumn) -> String {
+    let function_name = if col.strict {
+        "variant_get"
+    } else {
+        "try_variant_get"
+    };
+    format!(
+        "{} := {function_name}({}, '{}', '{}')",
+        col.synthetic_column,
+        col.source_column,
+        col.canonical_path,
+        format_variant_requested_type(&col.requested_type)
+    )
+}
+
+fn format_variant_requested_type(data_type: &DataType) -> &'static str {
+    match data_type {
+        DataType::Boolean => "boolean",
+        DataType::Int64 => "bigint",
+        DataType::Float64 => "double",
+        DataType::Utf8 => "string",
+        DataType::Date32 => "date",
+        _ => "unsupported",
+    }
+}
+
+fn scan_required_column_type<'a>(
+    scan: &'a DistributedScanNode,
+    required: &str,
+) -> Option<(usize, &'a DataType)> {
+    let table_pos = scan
+        .table
+        .columns
+        .iter()
+        .position(|column| column.name.eq_ignore_ascii_case(required))?;
+    let data_type = scan
+        .columns
+        .iter()
+        .find(|column| column.name.eq_ignore_ascii_case(required))
+        .map(|column| &column.data_type)
+        .or_else(|| {
+            scan.table
+                .columns
+                .get(table_pos)
+                .map(|column| &column.data_type)
+        })?;
+    Some((table_pos + 1, data_type))
+}
+
+fn is_complex_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::FixedSizeList(_, _)
+            | DataType::Map(_, _)
+            | DataType::Struct(_)
+    )
+}
+
+fn format_scan_pruned_type(data_type: &DataType, top_level: bool) -> String {
+    match data_type {
+        DataType::Null => "null_type".to_string(),
+        DataType::Boolean => "boolean".to_string(),
+        DataType::Int8 => "tinyint".to_string(),
+        DataType::Int16 => "smallint".to_string(),
+        DataType::Int32 => "int".to_string(),
+        DataType::Int64 => "bigint".to_string(),
+        DataType::UInt8 => "tinyint unsigned".to_string(),
+        DataType::UInt16 => "smallint unsigned".to_string(),
+        DataType::UInt32 => "int unsigned".to_string(),
+        DataType::UInt64 => "bigint unsigned".to_string(),
+        DataType::Float32 => "float".to_string(),
+        DataType::Float64 => "double".to_string(),
+        DataType::Utf8 | DataType::LargeUtf8 => "varchar(1073741824)".to_string(),
+        DataType::Binary | DataType::LargeBinary => "varbinary".to_string(),
+        DataType::Date32 => "date".to_string(),
+        DataType::Timestamp(_, _) => "datetime".to_string(),
+        DataType::Time32(_) | DataType::Time64(_) => "time".to_string(),
+        DataType::Decimal128(precision, scale) | DataType::Decimal256(precision, scale) => {
+            format!("decimal({precision},{scale})")
+        }
+        DataType::List(field) | DataType::LargeList(field) => {
+            let inner = format_scan_pruned_type(field.data_type(), false);
+            if top_level {
+                format!("ARRAY<{inner}>")
+            } else {
+                format!("array<{inner}>")
+            }
+        }
+        DataType::FixedSizeList(field, _) => {
+            let inner = format_scan_pruned_type(field.data_type(), false);
+            if top_level {
+                format!("ARRAY<{inner}>")
+            } else {
+                format!("array<{inner}>")
+            }
+        }
+        DataType::Map(entries, _) => {
+            let DataType::Struct(fields) = entries.data_type() else {
+                return "map<unknown,unknown>".to_string();
+            };
+            if fields.len() != 2 {
+                return "map<unknown,unknown>".to_string();
+            }
+            format!(
+                "map<{},{}>",
+                format_scan_pruned_type(fields[0].data_type(), false),
+                format_scan_pruned_type(fields[1].data_type(), false)
+            )
+        }
+        DataType::Struct(fields) => {
+            let fields = fields
+                .iter()
+                .map(|field| {
+                    format!(
+                        "`{}` {}",
+                        field.name(),
+                        format_scan_pruned_type(field.data_type(), false)
+                    )
+                })
+                .collect::<Vec<_>>();
+            format!("struct<{}>", fields.join(", "))
+        }
+        other => format!("{other:?}").to_lowercase(),
+    }
+}
+
+fn scan_supports_decode_hint(table: &TableDef, required_columns: &[String]) -> bool {
+    match &table.source {
+        ScanSource::IcebergDataFiles { .. } | ScanSource::StarRocks { .. } => {
+            required_columns.iter().any(|required| {
+                table
+                    .columns
+                    .iter()
+                    .find(|column| column.name.eq_ignore_ascii_case(required))
+                    .map(|column| supports_scan_decode_hint(&column.data_type))
+                    .unwrap_or(false)
+            })
+        }
+        ScanSource::IcebergMetadataTable { .. } => false,
+        ScanSource::IcebergDeltaTable { .. }
+        | ScanSource::IcebergVersionTable { .. }
+        | ScanSource::IcebergMvTargetState { .. } => false,
+    }
+}
+
+fn scan_supports_min_max_stats(table: &TableDef, required_columns: &[String]) -> bool {
+    match &table.source {
+        ScanSource::IcebergDataFiles { .. } | ScanSource::StarRocks { .. } => {}
+        ScanSource::IcebergMetadataTable { .. } => return false,
+        ScanSource::IcebergDeltaTable { .. }
+        | ScanSource::IcebergVersionTable { .. }
+        | ScanSource::IcebergMvTargetState { .. } => return false,
+    }
+    required_columns.iter().all(|required| {
+        table
+            .columns
+            .iter()
+            .find(|column| column.name.eq_ignore_ascii_case(required))
+            .map(|column| supports_scan_min_max_stats(&column.data_type))
+            .unwrap_or(false)
+    })
+}
+
+fn supports_scan_min_max_stats(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal128(_, _)
+            | DataType::Date32
+            | DataType::Timestamp(_, _)
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::FixedSizeBinary(_)
+    )
+}
+
+fn supports_scan_decode_hint(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow::datatypes::DataType;
+
+    use crate::exec::node::sort::SortTopNType;
+    use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
+    use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
+    use crate::sql::codegen::ir::{build_distributed_plan, explain_distributed_plan};
+    use crate::sql::column_id::ColumnId;
+    use crate::sql::explain::ExplainLevel;
+    use crate::sql::optimizer::operator::{
+        AggMode, Operator, PhysicalDistributionOp, PhysicalHashAggregateOp, PhysicalProjectOp,
+        PhysicalScanOp,
+    };
+    use crate::sql::optimizer::options::OptimizerOptions;
+    use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, PlanExecutionProps};
+    use crate::sql::optimizer::property::DistributionSpec;
+    use crate::sql::optimizer::runtime_filter_pass::{self, test_support};
+    use crate::sql::optimizer::statistics::{ColumnStatistic, Statistics};
+    use crate::sql::planner::plan::AggregateCall;
+
+    #[test]
+    fn normal_scan_project_agg_renders_node_id_prefixes() {
+        let dp = build_distributed_plan(&aggregate_count_plan(project_plan(scan_plan())))
+            .expect("build DistributedPlan");
+
+        let text = explain_distributed_plan(&dp, ExplainLevel::Normal).join("\n");
+
+        assert!(!text.contains("PLAN FRAGMENT"));
+        assert!(text.contains("3:HASH AGGREGATE"));
+        assert!(text.contains("2:PROJECT"));
+        assert!(text.contains("1:SCAN"));
+    }
+
+    #[test]
+    fn verbose_shuffle_agg_renders_fragments_and_exchange() {
+        let dp = build_distributed_plan(&aggregate_count_plan(distribution_plan(
+            scan_plan(),
+            DistributionSpec::shuffle_agg([ColumnId::new_for_test(1)]),
+        )))
+        .expect("build DistributedPlan");
+
+        let text = explain_distributed_plan(&dp, ExplainLevel::Verbose).join("\n");
+
+        assert!(text.contains("PLAN FRAGMENT 0"));
+        assert!(text.contains("PLAN FRAGMENT 1"));
+        assert!(text.contains("EXCHANGE"));
+        assert!(text.contains("HASH_PARTITIONED"));
+    }
+
+    #[test]
+    fn sort_with_partition_limit_renders_topn_suffix() {
+        let dp = build_distributed_plan(&sort_with_partition_limit_plan(scan_plan()))
+            .expect("build DistributedPlan");
+
+        let text = explain_distributed_plan(&dp, ExplainLevel::Normal).join("\n");
+
+        assert!(
+            text.contains("2:SORT BY [t.k ASC NULLS LAST] partition_limit=3 topn_type=RANK"),
+            "expected ranking-window sort suffix in IR explain output:\n{text}"
+        );
+    }
+
+    #[test]
+    fn costs_renders_colstats_from_ir_stats_only_at_costs_level() {
+        let mut scan = scan_plan();
+        scan.stats.column_statistics.insert(
+            ColumnId::new_for_test(1),
+            ColumnStatistic {
+                min_value: 0.0,
+                max_value: 1000.0,
+                nulls_fraction: 0.0,
+                average_row_size: 8.0,
+                distinct_values_count: 1000.0,
+                ..Default::default()
+            },
+        );
+        let dp = build_distributed_plan(&scan).expect("build DistributedPlan");
+
+        let normal = explain_distributed_plan(&dp, ExplainLevel::Normal).join("\n");
+        let verbose = explain_distributed_plan(&dp, ExplainLevel::Verbose).join("\n");
+        let costs = explain_distributed_plan(&dp, ExplainLevel::Costs).join("\n");
+
+        assert!(
+            !normal.contains("colstats="),
+            "Normal must hide colstats:\n{normal}"
+        );
+        assert!(
+            !verbose.contains("colstats="),
+            "Verbose must hide colstats:\n{verbose}"
+        );
+        assert!(
+            costs.contains("colstats={col#1[min=0 max=1000 ndv=1000 null_frac=0]}"),
+            "Costs must render colstats copied into PlanNodeStats:\n{costs}"
+        );
+    }
+
+    #[test]
+    fn detailed_ir_explain_shows_build_and_probe_rf_but_normal_hides_them() {
+        let mut join = test_support::inner_join_two_scans();
+        runtime_filter_pass::annotate(&mut join, &OptimizerOptions::default_settings());
+        let dp = build_distributed_plan(&join).expect("build DistributedPlan");
+
+        for level in [
+            ExplainLevel::Verbose,
+            ExplainLevel::Costs,
+            ExplainLevel::Analyze,
+        ] {
+            let text = explain_distributed_plan(&dp, level).join("\n");
+            assert!(
+                text.contains("build runtime filters:"),
+                "missing build RF at {level:?}:\n{text}"
+            );
+            assert!(
+                text.contains("filter_id = 0"),
+                "missing RF id at {level:?}:\n{text}"
+            );
+            assert!(
+                text.contains("probe runtime filters:"),
+                "missing probe RF at {level:?}:\n{text}"
+            );
+        }
+
+        let normal = explain_distributed_plan(&dp, ExplainLevel::Normal).join("\n");
+        assert!(
+            !normal.contains("runtime filters:"),
+            "Normal must hide RF lines:\n{normal}"
+        );
+    }
+
+    fn scan_plan() -> PhysicalPlanNode {
+        let k = output_col(1, "k", DataType::Int64, false);
+        let v = output_col(2, "v", DataType::Int64, true);
+        physical_node(
+            Operator::PhysicalScan(PhysicalScanOp {
+                database: "test_db".to_string(),
+                table: table_def(),
+                alias: Some("t".to_string()),
+                columns: vec![k.clone(), v.clone()],
+                predicates: vec![],
+                required_columns: Some(vec!["k".to_string(), "v".to_string()]),
+                dict_columns: vec![],
+                variant_columns: vec![],
+                mv_rewritten_from: None,
+            }),
+            vec![],
+            vec![k, v],
+        )
+    }
+
+    fn project_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
+        let output_columns = vec![output_col(1, "k", DataType::Int64, false)];
+        physical_node(
+            Operator::PhysicalProject(PhysicalProjectOp {
+                items: vec![ProjectItem {
+                    expr: column_ref_expr(1, "k", DataType::Int64, false),
+                    output_name: "k".to_string(),
+                    output_column_id: ColumnId::new_for_test(1),
+                }],
+                output_qualifier: None,
+            }),
+            vec![child],
+            output_columns,
+        )
+    }
+
+    fn aggregate_count_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
+        let k = output_col(1, "k", DataType::Int64, false);
+        let count = output_col(3, "count(*)", DataType::Int64, true);
+        physical_node(
+            Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+                mode: AggMode::Single,
+                group_by: vec![column_ref_expr(1, "k", DataType::Int64, false)],
+                aggregates: vec![AggregateCall {
+                    name: "count".to_string(),
+                    args: vec![],
+                    distinct: false,
+                    result_type: DataType::Int64,
+                    order_by: vec![],
+                    output_column_id: ColumnId::new_for_test(3),
+                }],
+                output_columns: vec![k.clone(), count.clone()],
+                is_merge: vec![false],
+            }),
+            vec![child],
+            vec![k, count],
+        )
+    }
+
+    fn sort_with_partition_limit_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
+        let output_columns = child.output_columns.clone();
+        physical_node(
+            Operator::PhysicalSort(crate::sql::optimizer::operator::PhysicalSortOp {
+                items: vec![SortItem {
+                    expr: column_ref_expr(1, "k", DataType::Int64, false),
+                    asc: true,
+                    nulls_first: false,
+                }],
+                analytic_partition_exprs: vec![],
+                partition_limit: Some(3),
+                topn_type: Some(SortTopNType::Rank),
+            }),
+            vec![child],
+            output_columns,
+        )
+    }
+
+    fn distribution_plan(child: PhysicalPlanNode, spec: DistributionSpec) -> PhysicalPlanNode {
+        let output_columns = child.output_columns.clone();
+        physical_node(
+            Operator::PhysicalDistribution(PhysicalDistributionOp { spec }),
+            vec![child],
+            output_columns,
+        )
+    }
+
+    fn physical_node(
+        op: Operator,
+        children: Vec<PhysicalPlanNode>,
+        output_columns: Vec<OutputColumn>,
+    ) -> PhysicalPlanNode {
+        PhysicalPlanNode {
+            op,
+            children,
+            stats: Statistics {
+                output_row_count: 3.0,
+                ..Default::default()
+            },
+            output_columns,
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        }
+    }
+
+    fn table_def() -> TableDef {
+        TableDef {
+            name: "t".to_string(),
+            columns: vec![
+                column_def("k", DataType::Int64, false),
+                column_def("v", DataType::Int64, true),
+            ],
+            iceberg_row_lineage_metadata_columns: vec![],
+            source: ScanSource::StarRocks {
+                db_id: 1,
+                table_id: 2,
+            },
+        }
+    }
+
+    fn column_def(name: &str, data_type: DataType, nullable: bool) -> ColumnDef {
+        ColumnDef {
+            name: name.to_string(),
+            data_type,
+            nullable,
+            write_default: None,
+            logical_type: None,
+        }
+    }
+
+    fn output_col(id: u32, name: &str, data_type: DataType, nullable: bool) -> OutputColumn {
+        OutputColumn {
+            column_id: ColumnId::new_for_test(id),
+            name: name.to_string(),
+            data_type,
+            nullable,
+            is_internal: false,
+        }
+    }
+
+    fn column_ref_expr(id: u32, column: &str, data_type: DataType, nullable: bool) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId::new_for_test(id),
+                qualifier: Some("t".to_string()),
+                column: column.to_string(),
+            },
+            data_type,
+            nullable,
+        }
+    }
+}

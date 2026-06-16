@@ -1,3 +1,4 @@
+use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{OutputColumn, TypedExpr};
 
 use super::FragmentId;
@@ -23,6 +24,25 @@ impl DataPartition {
             exprs: Vec::new(),
         }
     }
+
+    pub(crate) fn explain_label(&self) -> String {
+        match self.kind {
+            PartitionKind::Unpartitioned => "UNPARTITIONED".to_string(),
+            PartitionKind::Random => "RANDOM".to_string(),
+            PartitionKind::Hash => {
+                if self.exprs.is_empty() {
+                    "HASH_PARTITIONED".to_string()
+                } else {
+                    let exprs = self
+                        .exprs
+                        .iter()
+                        .map(crate::sql::explain::format_expr)
+                        .collect::<Vec<_>>();
+                    format!("HASH_PARTITIONED ({})", exprs.join(", "))
+                }
+            }
+        }
+    }
 }
 
 /// Sink intent. This slice only produces the root result sink.
@@ -41,10 +61,13 @@ pub(crate) struct PlanFragment {
     pub sink: DataSink,
     pub output_exprs: Option<Vec<TypedExpr>>,
     pub output_columns: Vec<OutputColumn>,
+    pub cte_id: Option<CteId>,
+    pub cte_exchange_nodes: Vec<(CteId, i32)>,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct DistributedPlan {
     pub fragments: Vec<PlanFragment>,
     pub root_fragment_id: FragmentId,
+    pub edges: Vec<crate::sql::codegen::FragmentEdge>,
 }

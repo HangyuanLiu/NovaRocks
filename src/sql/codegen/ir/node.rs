@@ -1,11 +1,15 @@
-use crate::sql::optimizer::statistics::{Confidence, Statistics};
+use std::collections::HashMap;
+
+use crate::sql::column_id::ColumnId;
+use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence, Statistics};
 
 use super::FragmentId;
 use super::kind::{
-    DistributedAssertOneRowNode, DistributedDecodeNode, DistributedGenerateSeriesNode,
-    DistributedHashAggregateNode, DistributedHashJoinNode, DistributedNestLoopJoinNode,
-    DistributedProjectNode, DistributedRepeatNode, DistributedScanNode, DistributedSetOpNode,
-    DistributedSortNode, DistributedTableFunctionNode, DistributedTopNNode, DistributedValuesNode,
+    DistributedAssertOneRowNode, DistributedDecodeNode, DistributedExchangeNode,
+    DistributedFilterNode, DistributedGenerateSeriesNode, DistributedHashAggregateNode,
+    DistributedHashJoinNode, DistributedNestLoopJoinNode, DistributedProjectNode,
+    DistributedRepeatNode, DistributedScanNode, DistributedSetOpNode, DistributedSortNode,
+    DistributedTableFunctionNode, DistributedTopNNode, DistributedValuesNode,
     DistributedWindowNode,
 };
 
@@ -15,6 +19,7 @@ use super::kind::{
 pub(crate) struct PlanNodeStats {
     pub output_row_count: f64,
     pub row_count_confidence: Confidence,
+    pub column_statistics: HashMap<ColumnId, ColumnStatistic>,
 }
 
 impl PlanNodeStats {
@@ -22,6 +27,7 @@ impl PlanNodeStats {
         Self {
             output_row_count: stats.output_row_count,
             row_count_confidence: stats.row_count_confidence,
+            column_statistics: stats.column_statistics.clone(),
         }
     }
 }
@@ -49,13 +55,14 @@ pub(crate) struct DistributedPlanNode {
 }
 
 /// Operator-specific payload. Grows one variant per operator as slices land.
-/// Filter has no variant: its predicate folds into the child's `DistributedScanNode.predicates`.
 #[derive(Clone, Debug)]
 pub(crate) enum DistributedPlanNodeKind {
     Scan(Box<DistributedScanNode>),
     Project(DistributedProjectNode),
+    Filter(DistributedFilterNode),
     Sort(DistributedSortNode),
     TopN(DistributedTopNNode),
+    Exchange(DistributedExchangeNode),
     HashAggregate(Box<DistributedHashAggregateNode>),
     HashJoin(Box<DistributedHashJoinNode>),
     NestLoopJoin(DistributedNestLoopJoinNode),
@@ -72,16 +79,26 @@ pub(crate) enum DistributedPlanNodeKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::optimizer::statistics::Statistics;
+    use crate::sql::optimizer::statistics::{ColumnStatistic, Statistics};
 
     #[test]
-    fn plan_node_stats_copies_row_count() {
-        let stats = Statistics {
+    fn plan_node_stats_copies_statistics() {
+        let column_id = ColumnId::new_for_test(11);
+        let mut stats = Statistics {
             output_row_count: 7.0,
             ..Default::default()
         };
+        stats.column_statistics.insert(
+            column_id,
+            ColumnStatistic {
+                distinct_values_count: 3.0,
+                ..Default::default()
+            },
+        );
+
         let s = PlanNodeStats::from_statistics(&stats);
         assert_eq!(s.output_row_count, 7.0);
+        assert_eq!(s.column_statistics[&column_id].distinct_values_count, 3.0);
     }
 
     #[test]

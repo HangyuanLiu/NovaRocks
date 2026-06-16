@@ -33,6 +33,7 @@ pub(crate) struct ColumnBinding {
 }
 
 /// Tracks which columns are in scope for expression compilation.
+#[derive(Clone)]
 pub(crate) struct ExprScope {
     /// Ordered list of (column_name, binding) for wildcard expansion
     ordered: Vec<(String, ColumnBinding)>,
