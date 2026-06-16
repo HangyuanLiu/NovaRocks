@@ -95,6 +95,7 @@ impl ScalarArena {
     /// `ty`/`nullable` are the computed properties of the expression; they MUST
     /// be a function of the node (debug-asserted on a dedup hit).
     pub(crate) fn intern(&mut self, node: ScalarNode, ty: DataType, nullable: bool) -> ScalarId {
+        let node = Self::normalize(node);
         if let Some(&id) = self.intern.get(&node) {
             debug_assert!(
                 self.types[id.0 as usize] == ty && self.nullable[id.0 as usize] == nullable,
@@ -109,6 +110,24 @@ impl ScalarArena {
         self.nullable.push(nullable);
         self.intern.insert(node, id);
         id
+    }
+
+    /// Canonicalize commutative binary ops by ordering operands by ScalarId, so
+    /// `a AND b` and `b AND a` intern to one id. Mirrors StarRocks
+    /// normalizeChildrenGroup.
+    fn normalize(node: ScalarNode) -> ScalarNode {
+        if let ScalarNode::BinaryOp { op, left, right } = node {
+            let commutative = matches!(op, BinOp::And | BinOp::Or | BinOp::Eq);
+            if commutative && left.0 > right.0 {
+                return ScalarNode::BinaryOp {
+                    op,
+                    left: right,
+                    right: left,
+                };
+            }
+            return ScalarNode::BinaryOp { op, left, right };
+        }
+        node
     }
 
     pub(crate) fn node(&self, id: ScalarId) -> &ScalarNode {
@@ -173,5 +192,52 @@ mod tests {
         );
         assert_eq!(a.data_type(add1), &int());
         assert!(!a.nullable(add1));
+    }
+
+    #[test]
+    fn commutative_ops_normalize_to_one_id() {
+        let mut a = ScalarArena::new();
+        let x = a.intern(ScalarNode::ColumnRef(ColumnId(1)), int(), false);
+        let y = a.intern(ScalarNode::ColumnRef(ColumnId(2)), int(), false);
+        let b = DataType::Boolean;
+        let xy = a.intern(
+            ScalarNode::BinaryOp {
+                op: BinOp::And,
+                left: x,
+                right: y,
+            },
+            b.clone(),
+            false,
+        );
+        let yx = a.intern(
+            ScalarNode::BinaryOp {
+                op: BinOp::And,
+                left: y,
+                right: x,
+            },
+            b.clone(),
+            false,
+        );
+        assert_eq!(xy, yx, "AND must be commutative-normalized to one id");
+
+        let sub_xy = a.intern(
+            ScalarNode::BinaryOp {
+                op: BinOp::Sub,
+                left: x,
+                right: y,
+            },
+            int(),
+            false,
+        );
+        let sub_yx = a.intern(
+            ScalarNode::BinaryOp {
+                op: BinOp::Sub,
+                left: y,
+                right: x,
+            },
+            int(),
+            false,
+        );
+        assert_ne!(sub_xy, sub_yx, "Sub must NOT be normalized");
     }
 }
