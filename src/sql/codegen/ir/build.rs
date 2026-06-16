@@ -5,7 +5,10 @@ use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{ExprKind, TypedExpr};
 use crate::sql::codegen::helpers::{group_win_exprs_by_sig, split_and_conjuncts_typed};
 use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentStreamKind};
-use crate::sql::optimizer::operator::{Operator, PhysicalDistributionOp, TopNPhase};
+use crate::sql::optimizer::operator::{
+    Operator, PhysicalCTEAnchorOp, PhysicalCTEConsumeOp, PhysicalCTEProduceOp,
+    PhysicalDistributionOp, TopNPhase,
+};
 use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
 use crate::sql::optimizer::property::{DistributionSpec, OrderingSpec, window_ordering_spec};
 
@@ -234,6 +237,15 @@ impl DistributedPlanBuilder {
                     )),
                 })
             }
+            Operator::PhysicalCTEAnchor(op) => self.visit_cte_anchor(op, node),
+            Operator::PhysicalCTEProduce(op) => {
+                self.visit_cte_produce(op, node)?;
+                Err(
+                    "PhysicalCTEProduce emits no DistributedPlan node outside CTEAnchor"
+                        .to_string(),
+                )
+            }
+            Operator::PhysicalCTEConsume(op) => self.visit_cte_consume(op, node),
             Operator::PhysicalDistribution(op) => self.visit_distribution(op, node),
             Operator::PhysicalHashJoin(op) => {
                 let (left_plan, right_plan) = expect_binary_children(node, "PhysicalHashJoin")?;
@@ -581,7 +593,7 @@ impl DistributedPlanBuilder {
             output_exprs: None,
             output_columns: edge_output_columns.clone(),
             cte_id: None,
-            cte_exchange_nodes: Vec::new(),
+            cte_exchange_nodes: collect_cte_exchange_nodes(&child),
         });
 
         self.edges.push(FragmentEdge {
@@ -608,7 +620,105 @@ impl DistributedPlanBuilder {
                 partition_type,
                 partition_exprs: output_partition.exprs.clone(),
                 source_fragment_id: child_fragment_id,
+                output_columns: Vec::new(),
+                output_qualifier: None,
                 flavor: ExchangeFlavor::Distribution,
+            }),
+        })
+    }
+
+    fn visit_cte_anchor(
+        &mut self,
+        _op: &PhysicalCTEAnchorOp,
+        node: &PhysicalPlanNode,
+    ) -> Result<DistributedPlanNode, String> {
+        let (produce, consume) = expect_binary_children(node, "PhysicalCTEAnchor")?;
+        let Operator::PhysicalCTEProduce(produce_op) = &produce.op else {
+            return Err("PhysicalCTEAnchor first child must be PhysicalCTEProduce".to_string());
+        };
+        self.visit_cte_produce(produce_op, produce)?;
+        self.visit(consume)
+    }
+
+    fn visit_cte_produce(
+        &mut self,
+        op: &PhysicalCTEProduceOp,
+        node: &PhysicalPlanNode,
+    ) -> Result<(), String> {
+        let child_plan = expect_single_child(node, "PhysicalCTEProduce")?;
+        let cte_fragment_id = self.alloc_fragment_id();
+        self.fragment_stack.push(cte_fragment_id);
+        let child_result = self.visit(child_plan);
+        self.fragment_stack.pop();
+        let child = child_result?;
+
+        let idx = self.completed_fragments.len();
+        self.completed_fragments.push(PlanFragment {
+            fragment_id: cte_fragment_id,
+            root: child.clone(),
+            data_partition: DataPartition::unpartitioned(),
+            output_partition: DataPartition::unpartitioned(),
+            sink: DataSink::Noop,
+            output_exprs: None,
+            output_columns: op.output_columns.clone(),
+            cte_id: Some(op.cte_id),
+            cte_exchange_nodes: collect_cte_exchange_nodes(&child),
+        });
+        self.cte_fragments.insert(op.cte_id, idx);
+        Ok(())
+    }
+
+    fn visit_cte_consume(
+        &mut self,
+        op: &PhysicalCTEConsumeOp,
+        node: &PhysicalPlanNode,
+    ) -> Result<DistributedPlanNode, String> {
+        if !node.children.is_empty() {
+            return Err(format!(
+                "build_distributed_plan M0: PhysicalCTEConsume expected 0 children, got {}",
+                node.children.len()
+            ));
+        }
+        let cte_frag_idx = self
+            .cte_fragments
+            .get(&op.cte_id)
+            .copied()
+            .ok_or_else(|| format!("CTE consume references unknown cte_id={}", op.cte_id))?;
+        let cte_fragment_id = self.completed_fragments[cte_frag_idx].fragment_id;
+
+        let exchange_node_id = self.alloc_node();
+        let exchange_tuple_id = self.alloc_tuple();
+        let target_fragment_id = self.current_fragment_id()?;
+
+        self.edges.push(FragmentEdge {
+            source_fragment_id: cte_fragment_id,
+            target_fragment_id,
+            target_exchange_node_id: exchange_node_id,
+            output_partition: tdata_partition_placeholder(
+                partitions::TPartitionType::UNPARTITIONED,
+            ),
+            stream_kind: FragmentStreamKind::Broadcast,
+            edge_kind: FragmentEdgeKind::CteMulticast { cte_id: op.cte_id },
+        });
+
+        Ok(DistributedPlanNode {
+            node_id: exchange_node_id,
+            fragment_id: target_fragment_id,
+            tuple_ids: vec![exchange_tuple_id],
+            nullable_tuple_ids: vec![],
+            limit: -1,
+            execution_join_distribution: node.execution_props.join_distribution,
+            build_runtime_filters: node.build_runtime_filters.clone(),
+            probe_runtime_filters: node.probe_runtime_filters.clone(),
+            children: vec![],
+            stats: PlanNodeStats::from_statistics(&node.stats),
+            kind: DistributedPlanNodeKind::Exchange(DistributedExchangeNode {
+                partition_type: partitions::TPartitionType::UNPARTITIONED,
+                partition_exprs: Vec::new(),
+                source_fragment_id: cte_fragment_id,
+                output_columns: op.output_columns.clone(),
+                output_qualifier: Some(op.alias.clone()),
+                flavor: ExchangeFlavor::CteMulticast { cte_id: op.cte_id },
             }),
         })
     }
@@ -844,6 +954,7 @@ pub(crate) fn build_distributed_plan(plan: &PhysicalPlanNode) -> Result<Distribu
     builder.fragment_stack.push(root_fragment_id);
     let root = builder.visit(plan)?;
     builder.fragment_stack.pop();
+    let root_cte_exchange_nodes = collect_cte_exchange_nodes(&root);
 
     let mut fragments = builder.completed_fragments;
     fragments.push(PlanFragment {
@@ -855,7 +966,7 @@ pub(crate) fn build_distributed_plan(plan: &PhysicalPlanNode) -> Result<Distribu
         output_exprs: None,
         output_columns: plan.output_columns.clone(),
         cte_id: None,
-        cte_exchange_nodes: Vec::new(),
+        cte_exchange_nodes: root_cte_exchange_nodes,
     });
 
     Ok(DistributedPlan {
@@ -863,6 +974,23 @@ pub(crate) fn build_distributed_plan(plan: &PhysicalPlanNode) -> Result<Distribu
         root_fragment_id,
         edges: builder.edges,
     })
+}
+
+fn collect_cte_exchange_nodes(node: &DistributedPlanNode) -> Vec<(CteId, i32)> {
+    let mut nodes = Vec::new();
+    collect_cte_exchange_nodes_inner(node, &mut nodes);
+    nodes
+}
+
+fn collect_cte_exchange_nodes_inner(node: &DistributedPlanNode, nodes: &mut Vec<(CteId, i32)>) {
+    if let DistributedPlanNodeKind::Exchange(exchange) = &node.kind
+        && let ExchangeFlavor::CteMulticast { cte_id } = exchange.flavor
+    {
+        nodes.push((cte_id, node.node_id));
+    }
+    for child in &node.children {
+        collect_cte_exchange_nodes_inner(child, nodes);
+    }
 }
 
 #[cfg(test)]

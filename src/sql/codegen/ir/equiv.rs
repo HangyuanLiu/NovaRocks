@@ -22,12 +22,13 @@ mod tests {
     };
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
-        AggMode, JoinDistribution, Operator, PhysicalAssertOneRowOp, PhysicalDecodeOp,
-        PhysicalDistributionOp, PhysicalExceptOp, PhysicalFilterOp, PhysicalGenerateSeriesOp,
-        PhysicalHashAggregateOp, PhysicalHashJoinEqCondition, PhysicalHashJoinOp,
-        PhysicalIntersectOp, PhysicalLimitOp, PhysicalNestLoopJoinOp, PhysicalProjectOp,
-        PhysicalRepeatOp, PhysicalScanOp, PhysicalSortOp, PhysicalTableFunctionOp, PhysicalTopNOp,
-        PhysicalUnionOp, PhysicalValuesOp, PhysicalWindowOp, ScanDictionaryColumn, TopNPhase,
+        AggMode, JoinDistribution, Operator, PhysicalAssertOneRowOp, PhysicalCTEAnchorOp,
+        PhysicalCTEConsumeOp, PhysicalCTEProduceOp, PhysicalDecodeOp, PhysicalDistributionOp,
+        PhysicalExceptOp, PhysicalFilterOp, PhysicalGenerateSeriesOp, PhysicalHashAggregateOp,
+        PhysicalHashJoinEqCondition, PhysicalHashJoinOp, PhysicalIntersectOp, PhysicalLimitOp,
+        PhysicalNestLoopJoinOp, PhysicalProjectOp, PhysicalRepeatOp, PhysicalScanOp,
+        PhysicalSortOp, PhysicalTableFunctionOp, PhysicalTopNOp, PhysicalUnionOp, PhysicalValuesOp,
+        PhysicalWindowOp, ScanDictionaryColumn, TopNPhase,
     };
     use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, PlanExecutionProps};
     use crate::sql::optimizer::property::DistributionSpec;
@@ -194,6 +195,11 @@ mod tests {
             "nested_gather_exchange",
             sort_plan(distribution_plan(scan_plan(), DistributionSpec::Gather)),
         );
+    }
+
+    #[test]
+    fn cte_produce_consume_matches_direct_fragment_builder() {
+        assert_distributed_plan_equivalent("cte_produce_consume", cte_produce_consume_plan());
     }
 
     #[test]
@@ -961,6 +967,35 @@ mod tests {
             Operator::PhysicalDistribution(PhysicalDistributionOp { spec }),
             vec![child],
             output_columns,
+        )
+    }
+
+    fn cte_produce_consume_plan() -> PhysicalPlanNode {
+        let cte_id = 7;
+        let produce = single_column_scan_plan(output_col(1101, "k", DataType::Int64, false));
+        let produce_output_columns = produce.output_columns.clone();
+        let consume_output_columns = vec![output_col(1102, "k", DataType::Int64, false)];
+        let produce = physical_node(
+            Operator::PhysicalCTEProduce(PhysicalCTEProduceOp {
+                cte_id,
+                output_columns: produce_output_columns.clone(),
+            }),
+            vec![produce],
+            produce_output_columns,
+        );
+        let consume = physical_node(
+            Operator::PhysicalCTEConsume(PhysicalCTEConsumeOp {
+                cte_id,
+                alias: "cte".to_string(),
+                output_columns: consume_output_columns.clone(),
+            }),
+            vec![],
+            consume_output_columns.clone(),
+        );
+        physical_node(
+            Operator::PhysicalCTEAnchor(PhysicalCTEAnchorOp { cte_id }),
+            vec![produce, consume],
+            consume_output_columns,
         )
     }
 

@@ -388,32 +388,63 @@ fn validate_edge_target_node(
         )
         })?;
 
-    if matches!(
-        edge.edge_kind,
-        crate::sql::codegen::FragmentEdgeKind::Stream
-    ) {
-        match &target_node.kind {
-            super::node::DistributedPlanNodeKind::Exchange(exchange)
-                if matches!(exchange.flavor, super::kind::ExchangeFlavor::Distribution) =>
-            {
-                if edge.source_fragment_id != exchange.source_fragment_id {
-                    return Err(format!(
-                        "lower_distributed_plan stream edge source_fragment_id={} does not match Exchange source_fragment_id={} for target_exchange_node_id={} in target fragment id={}",
-                        edge.source_fragment_id,
-                        exchange.source_fragment_id,
-                        edge.target_exchange_node_id,
-                        target_fragment.fragment_id
-                    ));
-                }
-                Ok(())
+    let super::node::DistributedPlanNodeKind::Exchange(exchange) = &target_node.kind else {
+        return Err(format!(
+            "lower_distributed_plan edge target_exchange_node_id={} in target fragment id={} must target Exchange",
+            edge.target_exchange_node_id, target_fragment.fragment_id
+        ));
+    };
+
+    match (&edge.edge_kind, &exchange.flavor) {
+        (
+            crate::sql::codegen::FragmentEdgeKind::Stream,
+            super::kind::ExchangeFlavor::Distribution,
+        ) => {
+            if edge.source_fragment_id != exchange.source_fragment_id {
+                return Err(format!(
+                    "lower_distributed_plan stream edge source_fragment_id={} does not match Exchange source_fragment_id={} for target_exchange_node_id={} in target fragment id={}",
+                    edge.source_fragment_id,
+                    exchange.source_fragment_id,
+                    edge.target_exchange_node_id,
+                    target_fragment.fragment_id
+                ));
             }
-            _ => Err(format!(
-                "lower_distributed_plan stream edge target_exchange_node_id={} in target fragment id={} must target Exchange(Distribution)",
-                edge.target_exchange_node_id, target_fragment.fragment_id
-            )),
+            Ok(())
         }
-    } else {
-        Ok(())
+        (
+            crate::sql::codegen::FragmentEdgeKind::CteMulticast { cte_id },
+            super::kind::ExchangeFlavor::CteMulticast {
+                cte_id: exchange_cte_id,
+            },
+        ) => {
+            if cte_id != exchange_cte_id {
+                return Err(format!(
+                    "lower_distributed_plan CTE multicast edge cte_id={} does not match Exchange cte_id={} for target_exchange_node_id={} in target fragment id={}",
+                    cte_id,
+                    exchange_cte_id,
+                    edge.target_exchange_node_id,
+                    target_fragment.fragment_id
+                ));
+            }
+            if edge.source_fragment_id != exchange.source_fragment_id {
+                return Err(format!(
+                    "lower_distributed_plan CTE multicast edge source_fragment_id={} does not match Exchange source_fragment_id={} for target_exchange_node_id={} in target fragment id={}",
+                    edge.source_fragment_id,
+                    exchange.source_fragment_id,
+                    edge.target_exchange_node_id,
+                    target_fragment.fragment_id
+                ));
+            }
+            Ok(())
+        }
+        (crate::sql::codegen::FragmentEdgeKind::Stream, _) => Err(format!(
+            "lower_distributed_plan stream edge target_exchange_node_id={} in target fragment id={} must target Exchange(Distribution)",
+            edge.target_exchange_node_id, target_fragment.fragment_id
+        )),
+        (crate::sql::codegen::FragmentEdgeKind::CteMulticast { .. }, _) => Err(format!(
+            "lower_distributed_plan CTE multicast edge target_exchange_node_id={} in target fragment id={} must target Exchange(CteMulticast)",
+            edge.target_exchange_node_id, target_fragment.fragment_id
+        )),
     }
 }
 
@@ -461,34 +492,14 @@ fn lower_fragment_edges(
         if matches!(
             edge.edge_kind,
             crate::sql::codegen::FragmentEdgeKind::Stream
+                | crate::sql::codegen::FragmentEdgeKind::CteMulticast { .. }
         ) {
-            let target_fragment =
-                fragments_by_id
-                    .get(&edge.target_fragment_id)
-                    .ok_or_else(|| {
-                        format!(
-                            "lower_distributed_plan edge references missing target fragment id={}",
-                            edge.target_fragment_id
-                        )
-                    })?;
-            let target_node = find_node_by_id(&target_fragment.root, edge.target_exchange_node_id)
-                .ok_or_else(|| {
-                    format!(
-                        "lower_distributed_plan edge target_exchange_node_id={} not found in target fragment id={}",
-                        edge.target_exchange_node_id, target_fragment.fragment_id
-                    )
-                })?;
-            let super::node::DistributedPlanNodeKind::Exchange(exchange) = &target_node.kind else {
-                return Err(format!(
-                    "lower_distributed_plan stream edge target_exchange_node_id={} in target fragment id={} must target Exchange(Distribution)",
-                    edge.target_exchange_node_id, target_fragment.fragment_id
-                ));
-            };
-            if !matches!(exchange.flavor, super::kind::ExchangeFlavor::Distribution) {
-                return Err(format!(
-                    "lower_distributed_plan stream edge target_exchange_node_id={} in target fragment id={} must target Exchange(Distribution)",
-                    edge.target_exchange_node_id, target_fragment.fragment_id
-                ));
+            let exchange = target_exchange_for_edge(&fragments_by_id, edge)?;
+            if state
+                .lowered_fragment_output(edge.source_fragment_id)
+                .is_none()
+            {
+                state.ensure_fragment_lowered(edge.source_fragment_id)?;
             }
             let source = state
                 .lowered_fragment_output(edge.source_fragment_id)
@@ -575,7 +586,18 @@ fn edge_boundary_schemas(
                 edge.target_fragment_id
             ));
         }
-        let output_columns = output_columns_for_boundary(&source.output_columns);
+        let exchange = target_exchange_for_edge(&fragments_by_id, edge)?;
+        let edge_output_columns = match edge.edge_kind {
+            crate::sql::codegen::FragmentEdgeKind::CteMulticast { .. } => {
+                if exchange.output_columns.is_empty() {
+                    &source.output_columns
+                } else {
+                    &exchange.output_columns
+                }
+            }
+            crate::sql::codegen::FragmentEdgeKind::Stream => &source.output_columns,
+        };
+        let output_columns = output_columns_for_boundary(edge_output_columns);
         let columns = output_columns_to_boundary_columns(&output_columns);
         reports.push(BoundarySchemaReport {
             fragment_id: Some(edge.source_fragment_id as i32),
@@ -591,6 +613,51 @@ fn edge_boundary_schemas(
         });
     }
     Ok(reports)
+}
+
+fn target_exchange_for_edge<'a>(
+    fragments_by_id: &'a BTreeMap<FragmentId, &super::fragment::PlanFragment>,
+    edge: &crate::sql::codegen::FragmentEdge,
+) -> Result<&'a super::kind::DistributedExchangeNode, String> {
+    let target_fragment = fragments_by_id
+        .get(&edge.target_fragment_id)
+        .ok_or_else(|| {
+            format!(
+                "lower_distributed_plan edge references missing target fragment id={}",
+                edge.target_fragment_id
+            )
+        })?;
+    let target_node = find_node_by_id(&target_fragment.root, edge.target_exchange_node_id)
+        .ok_or_else(|| {
+            format!(
+                "lower_distributed_plan edge target_exchange_node_id={} not found in target fragment id={}",
+                edge.target_exchange_node_id, target_fragment.fragment_id
+            )
+        })?;
+    let super::node::DistributedPlanNodeKind::Exchange(exchange) = &target_node.kind else {
+        return Err(format!(
+            "lower_distributed_plan edge target_exchange_node_id={} in target fragment id={} must target Exchange",
+            edge.target_exchange_node_id, target_fragment.fragment_id
+        ));
+    };
+    match (&edge.edge_kind, &exchange.flavor) {
+        (
+            crate::sql::codegen::FragmentEdgeKind::Stream,
+            super::kind::ExchangeFlavor::Distribution,
+        )
+        | (
+            crate::sql::codegen::FragmentEdgeKind::CteMulticast { .. },
+            super::kind::ExchangeFlavor::CteMulticast { .. },
+        ) => Ok(exchange),
+        (crate::sql::codegen::FragmentEdgeKind::Stream, _) => Err(format!(
+            "lower_distributed_plan stream edge target_exchange_node_id={} in target fragment id={} must target Exchange(Distribution)",
+            edge.target_exchange_node_id, target_fragment.fragment_id
+        )),
+        (crate::sql::codegen::FragmentEdgeKind::CteMulticast { .. }, _) => Err(format!(
+            "lower_distributed_plan CTE multicast edge target_exchange_node_id={} in target fragment id={} must target Exchange(CteMulticast)",
+            edge.target_exchange_node_id, target_fragment.fragment_id
+        )),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1157,10 +1224,31 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                         );
                     }
                     super::kind::ExchangeFlavor::CteMulticast { .. } => {
-                        return Err(
-                            "DistributedPlan Exchange CteMulticast flavor is not implemented until Task A3"
-                                .to_string(),
-                        );
+                        if self
+                            .state
+                            .lowered_fragment_output(exchange.source_fragment_id)
+                            .is_none()
+                        {
+                            self.state
+                                .ensure_fragment_lowered(exchange.source_fragment_id)?;
+                        }
+                        let exchange_tuple_id = first_tuple_id(node, "Exchange")?;
+                        let (scope, output_columns) = self.lower_cte_multicast_exchange_scope(
+                            exchange_tuple_id,
+                            node.node_id,
+                            exchange,
+                        )?;
+                        LoweredDistributedNode {
+                            plan_nodes: vec![nodes::build_exchange_node(
+                                node.node_id,
+                                vec![exchange_tuple_id],
+                                exchange.partition_type,
+                            )],
+                            scope,
+                            tuple_ids: vec![exchange_tuple_id],
+                            output_columns,
+                            ordering: OrderingSpec::Any,
+                        }
                     }
                 }
             }
@@ -1472,6 +1560,47 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         }
         self.record_probe_targets(node, &lowered);
         Ok(lowered)
+    }
+
+    fn lower_cte_multicast_exchange_scope(
+        &mut self,
+        exchange_tuple_id: i32,
+        exchange_node_id: i32,
+        exchange: &super::kind::DistributedExchangeNode,
+    ) -> Result<(ExprScope, Vec<AnalysisOutputColumn>), String> {
+        if exchange.output_columns.is_empty() {
+            return Err(format!(
+                "DistributedPlan CTE multicast Exchange node_id={} has no output columns",
+                exchange_node_id
+            ));
+        }
+        let mut scope = ExprScope::new();
+        for (idx, col) in exchange.output_columns.iter().enumerate() {
+            let slot_id = self.state.alloc_slot();
+            self.state.desc_builder().add_slot(
+                slot_id,
+                exchange_tuple_id,
+                &col.name,
+                &col.data_type,
+                col.nullable,
+                idx as i32,
+            );
+            let binding = ColumnBinding {
+                tuple_id: exchange_tuple_id,
+                slot_id,
+                data_type: col.data_type.clone(),
+                type_desc: None,
+                nullable: col.nullable,
+            };
+            scope.add_column_with_id(
+                col.column_id,
+                exchange.output_qualifier.clone(),
+                col.name.clone(),
+                binding,
+            );
+        }
+        self.state.desc_builder().add_tuple(exchange_tuple_id, None);
+        Ok((scope, exchange.output_columns.clone()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4944,6 +5073,8 @@ mod tests {
                 partition_type: crate::partitions::TPartitionType::UNPARTITIONED,
                 partition_exprs: vec![],
                 source_fragment_id,
+                output_columns: Vec::new(),
+                output_qualifier: None,
                 flavor: ExchangeFlavor::Distribution,
             }),
         }

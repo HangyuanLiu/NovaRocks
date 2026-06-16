@@ -53,6 +53,8 @@ pub(crate) struct DistributedExchangeNode {
     pub partition_type: crate::partitions::TPartitionType,
     pub partition_exprs: Vec<TypedExpr>,
     pub source_fragment_id: FragmentId,
+    pub output_columns: Vec<OutputColumn>,
+    pub output_qualifier: Option<String>,
     pub flavor: ExchangeFlavor,
 }
 
