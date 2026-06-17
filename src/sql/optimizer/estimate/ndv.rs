@@ -2,9 +2,7 @@ use std::collections::HashMap;
 
 use crate::sql::analysis::TypedExpr;
 use crate::sql::column_id::ColumnId;
-use crate::sql::optimizer::statistics::{
-    ColumnStatistic, Confidence, UNKNOWN_GROUP_BY_CORRELATION,
-};
+use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence};
 
 use super::arith::sat_mul;
 use super::selectivity::extract_column_id;
@@ -75,7 +73,7 @@ pub(crate) fn cap_ndv_at_rows(ndv: f64, rows: f64) -> f64 {
 }
 
 /// Estimate grouped-aggregate output rows from group-key NDVs. Uses a damped
-/// product (so many keys don't explode) capped at child_rows * correlation.
+/// product (so many keys don't explode) capped at child_rows (one row per group).
 pub(crate) fn agg_group_rows(group_key_ndvs: &[f64], child_rows: f64) -> f64 {
     if group_key_ndvs.is_empty() {
         return 1.0;
@@ -96,8 +94,14 @@ pub(crate) fn agg_group_rows(group_key_ndvs: &[f64], child_rows: f64) -> f64 {
         }
         product
     };
+    // The output has one row per distinct group, so the hard upper bound is the
+    // input row count, NOT input * correlation. Capping at child_rows * 0.75 would
+    // double-discount a two-phase aggregate's GLOBAL phase (whose input is the
+    // already-reduced LOCAL output), making the estimate stage-DEPENDENT. child_rows
+    // is the stage-idempotent cap. The 0.75 UNKNOWN_GROUP_BY_CORRELATION belongs to
+    // multi-column NDV combination / unknown-NDV fallback, not to this row-count cap.
     let capped = if child_rows.is_finite() && child_rows > 0.0 {
-        sat_mul(child_rows, UNKNOWN_GROUP_BY_CORRELATION).0
+        child_rows
     } else {
         1.0
     };
@@ -274,7 +278,7 @@ mod tests {
     #[test]
     fn agg_group_rows_damped_and_capped() {
         let rows = agg_group_rows(&[1_000_000.0, 1_000_000.0], 10_000.0);
-        assert_eq!(rows, 10_000.0 * 0.75);
+        assert_eq!(rows, 10_000.0);
         assert!(rows > 1.0);
     }
 
@@ -291,5 +295,25 @@ mod tests {
         assert!(rows.is_finite());
         assert!(rows <= MAX_ROW_COUNT);
         assert_eq!(rows, MAX_ROW_COUNT);
+    }
+
+    #[test]
+    fn agg_group_rows_is_stage_idempotent_when_cap_binds() {
+        // High NDV (1000) over few rows (200): combined_ndv (1000) > input_rows (200),
+        // so the row-count cap BINDS (the case the old child_rows*0.75 cap got wrong).
+        // A two-phase aggregate must equal a single-phase one: re-aggregating an
+        // already-grouped input must NOT shrink it further (stage-idempotent).
+        let ndvs = [1000.0];
+        let input = 200.0;
+
+        let single = agg_group_rows(&ndvs, input);
+        let local = agg_group_rows(&ndvs, input);
+        let global = agg_group_rows(&ndvs, local); // GLOBAL agg runs over LOCAL's output
+
+        assert_eq!(
+            single, global,
+            "two-phase agg (global over local) must equal single-phase: stage-idempotent"
+        );
+        assert_eq!(single, input, "row-count cap must bind at input_rows, not input*0.75");
     }
 }
