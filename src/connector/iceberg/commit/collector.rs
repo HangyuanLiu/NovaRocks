@@ -242,14 +242,6 @@ impl IcebergCommitCollector {
         }
     }
 
-    pub(crate) fn has_injected_written_files(&self) -> bool {
-        !self
-            .injected
-            .lock()
-            .expect("collector injected lock poisoned")
-            .is_empty()
-    }
-
     /// Pre-load net-new INSERT data files (folded MERGE not-matched branch) into
     /// the fresh-row-lineage channel. These rows carry NO preserved `_row_id`
     /// and MUST draw fresh ids at commit time. Kept distinct from
@@ -277,9 +269,12 @@ impl IcebergCommitCollector {
         std::mem::take(&mut *guard)
     }
 
-    pub(crate) fn has_injected_appended_files(&self) -> bool {
-        !self
-            .appended
+    /// Read-only check that no net-new INSERT data files were registered via
+    /// [`inject_appended_files`]. Used by `CowUpdateCommit` to assert it routes
+    /// appended rows through the rewrite set, NOT this channel. Non-draining, so
+    /// it is safe inside `debug_assert!` (no debug/release state divergence).
+    pub(crate) fn appended_is_empty(&self) -> bool {
+        self.appended
             .lock()
             .expect("collector appended lock poisoned")
             .is_empty()

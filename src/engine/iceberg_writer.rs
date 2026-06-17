@@ -43,9 +43,10 @@ use crate::connector::iceberg::catalog::registry::{
     IcebergCatalogEntry, block_on_iceberg, build_iceberg_catalog,
 };
 use crate::connector::iceberg::commit::{
-    CleanupPathMapper, CommitOpKind, CommitOutcome, CommitServiceError, IcebergCommitCollector,
-    WrittenFile, ensure_iceberg_write_supported, ensure_no_equality_deletes,
-    ensure_no_variant_columns_for_row_level_mutation, ensure_overwrite_single_partition_spec,
+    CleanupPathMapper, CommitOpKind, CommitOutcome, CommitServiceError, EqualityDeleteColumn,
+    IcebergCommitCollector, WrittenFile, ensure_iceberg_write_supported,
+    ensure_no_equality_deletes, ensure_no_variant_columns_for_row_level_mutation,
+    ensure_overwrite_single_partition_spec,
 };
 use crate::connector::starrocks::table::mv_refresh::query_result_to_chunks;
 use crate::engine::backend_resolver::TargetBackend;
@@ -364,6 +365,38 @@ pub(crate) fn build_row_lineage_data_sink_spec(
     )
 }
 
+pub(crate) fn build_equality_delete_sink_spec(
+    target: &TargetBackend,
+    resolved: &ResolvedTable,
+    table: &iceberg::table::Table,
+    entry: &IcebergCatalogEntry,
+    equality_columns: &[EqualityDeleteColumn],
+) -> Result<IcebergWriteSinkSpec, String> {
+    if equality_columns.is_empty() {
+        return Err(
+            "iceberg equality-delete sink requires at least one equality column".to_string(),
+        );
+    }
+    let target_columns = equality_columns
+        .iter()
+        .map(|column| ColumnDef {
+            name: column.name.clone(),
+            data_type: column.data_type.clone(),
+            nullable: column.nullable,
+            write_default: None,
+            logical_type: None,
+        })
+        .collect::<Vec<_>>();
+    build_iceberg_write_sink_spec(
+        target,
+        resolved,
+        table,
+        entry,
+        IcebergWriteSinkMode::EqualityDeletes,
+        target_columns,
+    )
+}
+
 pub(crate) fn build_iceberg_write_sink_spec(
     target: &TargetBackend,
     resolved: &ResolvedTable,
@@ -374,14 +407,15 @@ pub(crate) fn build_iceberg_write_sink_spec(
 ) -> Result<IcebergWriteSinkSpec, String> {
     let metadata = table.metadata();
     let target_descriptor_columns =
-        write_sink_target_descriptor_columns(mode, &resolved.columns, &target_columns);
+        write_sink_target_descriptor_columns(mode, &resolved.columns, &target_columns)?;
     let iceberg_schema = match mode {
         IcebergWriteSinkMode::RowLineageData => {
             row_lineage_iceberg_schema_def_for_codegen(metadata.current_schema())
         }
         IcebergWriteSinkMode::Data
         | IcebergWriteSinkMode::PositionDeletes
-        | IcebergWriteSinkMode::DeletionVectors => {
+        | IcebergWriteSinkMode::DeletionVectors
+        | IcebergWriteSinkMode::EqualityDeletes => {
             iceberg_schema_def_for_codegen(metadata.current_schema())
         }
     };
@@ -486,15 +520,16 @@ fn write_sink_target_descriptor_columns(
     mode: IcebergWriteSinkMode,
     resolved_columns: &[ColumnDef],
     sink_input_columns: &[ColumnDef],
-) -> Vec<ColumnDef> {
-    match mode {
+) -> Result<Vec<ColumnDef>, String> {
+    Ok(match mode {
         IcebergWriteSinkMode::PositionDeletes | IcebergWriteSinkMode::DeletionVectors => {
             resolved_columns.to_vec()
         }
         IcebergWriteSinkMode::Data | IcebergWriteSinkMode::RowLineageData => {
             sink_input_columns.to_vec()
         }
-    }
+        IcebergWriteSinkMode::EqualityDeletes => sink_input_columns.to_vec(),
+    })
 }
 
 fn position_delete_sink_input_columns(
@@ -1341,7 +1376,8 @@ mod tests {
             IcebergWriteSinkMode::PositionDeletes,
             &resolved_columns,
             &sink_input_columns,
-        );
+        )
+        .expect("descriptor columns");
 
         assert_eq!(
             descriptor_columns
@@ -1361,7 +1397,8 @@ mod tests {
             IcebergWriteSinkMode::RowLineageData,
             &resolved_columns,
             &sink_input_columns,
-        );
+        )
+        .expect("descriptor columns");
 
         assert_eq!(
             descriptor_columns
