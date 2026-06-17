@@ -51,7 +51,8 @@ mod tests {
             ),
         ] {
             let op = PhysicalDistributionOp { spec };
-            let props = op.derive_output(&[]);
+            let scalars = ScalarArena::new();
+            let props = op.derive_output(&scalars, &[]);
             match props.distribution {
                 DistributionSpec::HashPartitioned { cols, source } => {
                     assert_eq!(source, expected_source);

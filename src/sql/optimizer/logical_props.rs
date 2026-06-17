@@ -314,6 +314,7 @@ mod tests {
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::optimizer::memo::MExpr;
     use crate::sql::optimizer::operator::{LogicalFilterOp, LogicalJoinOp, LogicalScanOp};
+    use crate::sql::optimizer::scalar::intern_typed;
     use crate::sql::planner::plan::*;
     use std::path::PathBuf;
 
@@ -415,11 +416,10 @@ mod tests {
             vec![output(1, "a"), output(2, "b")],
             100.0,
         ));
+        let predicate = intern_typed(&mut memo.scalars, &eq(col(1, "a"), col(2, "b")));
         let filter = memo.new_group(MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalFilter(LogicalFilterOp {
-                predicate: eq(col(1, "a"), col(2, "b")),
-            }),
+            op: Operator::LogicalFilter(LogicalFilterOp { predicate }),
             children: vec![child],
         });
         let props = derive_for_group(
@@ -448,11 +448,12 @@ mod tests {
         memo.groups[left].logical_props = Some(LogicalProperties::new(vec![output(1, "lk")], 10.0));
         memo.groups[right].logical_props =
             Some(LogicalProperties::new(vec![output(2, "rk")], 10.0));
+        let condition = intern_typed(&mut memo.scalars, &eq(col(1, "lk"), col(2, "rk")));
         let join = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
-                condition: Some(eq(col(1, "lk"), col(2, "rk"))),
+                condition: Some(condition),
             }),
             children: vec![left, right],
         });
@@ -482,11 +483,12 @@ mod tests {
         memo.groups[left].logical_props = Some(LogicalProperties::new(vec![output(1, "lk")], 10.0));
         memo.groups[right].logical_props =
             Some(LogicalProperties::new(vec![output(2, "rk")], 10.0));
+        let condition = intern_typed(&mut memo.scalars, &eq(col(1, "lk"), col(2, "rk")));
         let join = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::LeftOuter,
-                condition: Some(eq(col(1, "lk"), col(2, "rk"))),
+                condition: Some(condition),
             }),
             children: vec![left, right],
         });

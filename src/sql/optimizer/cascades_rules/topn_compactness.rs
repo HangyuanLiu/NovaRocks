@@ -540,6 +540,10 @@ mod tests {
         LogicalTopNOp, LogicalUnionOp, LogicalValuesOp, TopNPhase,
     };
     use crate::sql::optimizer::rule::NewExpr;
+    use crate::sql::optimizer::scalar_bridge::{
+        intern_aggregate_calls, intern_exprs, intern_project_items, intern_sort_items,
+        materialize_sort_key,
+    };
     use crate::sql::planner::plan::AggregateCall;
     use arrow::datatypes::DataType;
 
@@ -646,18 +650,23 @@ mod tests {
     }
 
     fn aggregate_group(memo: &mut Memo, child_group: usize) -> usize {
+        let group_by = intern_exprs(&mut memo.scalars, &[col(1)]);
+        let aggregates = intern_aggregate_calls(
+            &mut memo.scalars,
+            &[AggregateCall {
+                name: "array_agg".to_string(),
+                args: vec![col(2)],
+                distinct: false,
+                result_type: DataType::Int64,
+                order_by: vec![sort_item(2)],
+                output_column_id: ColumnId(10),
+            }],
+        );
         memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalAggregate(LogicalAggregateOp::single(
-                vec![col(1)],
-                vec![AggregateCall {
-                    name: "array_agg".to_string(),
-                    args: vec![col(2)],
-                    distinct: false,
-                    result_type: DataType::Int64,
-                    order_by: vec![sort_item(2)],
-                    output_column_id: ColumnId(10),
-                }],
+                group_by,
+                aggregates,
                 vec![output_column(1, "c1"), output_column(10, "array_agg")],
             )),
             children: vec![child_group],
@@ -690,7 +699,7 @@ mod tests {
     }
 
     fn topn_with_item(
-        memo: &Memo,
+        memo: &mut Memo,
         item: SortItem,
         limit: i64,
         offset: i64,
@@ -701,7 +710,7 @@ mod tests {
         MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalTopN(LogicalTopNOp {
-                items: vec![item],
+                items: intern_sort_items(&mut memo.scalars, &[item]),
                 limit: Some(limit),
                 offset: Some(offset),
                 phase,
@@ -712,7 +721,7 @@ mod tests {
     }
 
     fn topn(
-        memo: &Memo,
+        memo: &mut Memo,
         limit: i64,
         offset: i64,
         phase: TopNPhase,
@@ -730,11 +739,36 @@ mod tests {
         )
     }
 
-    fn sort_with_items(memo: &Memo, items: Vec<SortItem>, child_group: usize) -> MExpr {
+    fn topn_group(
+        memo: &mut Memo,
+        limit: i64,
+        offset: i64,
+        phase: TopNPhase,
+        is_split: bool,
+        child_group: usize,
+    ) -> usize {
+        let expr = topn(memo, limit, offset, phase, is_split, child_group);
+        memo.new_group(expr)
+    }
+
+    fn topn_with_item_group(
+        memo: &mut Memo,
+        item: SortItem,
+        limit: i64,
+        offset: i64,
+        phase: TopNPhase,
+        is_split: bool,
+        child_group: usize,
+    ) -> usize {
+        let expr = topn_with_item(memo, item, limit, offset, phase, is_split, child_group);
+        memo.new_group(expr)
+    }
+
+    fn sort_with_items(memo: &mut Memo, items: Vec<SortItem>, child_group: usize) -> MExpr {
         MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalSort(LogicalSortOp {
-                items,
+                items: intern_sort_items(&mut memo.scalars, &items),
                 analytic_partition_exprs: Vec::new(),
                 partition_limit: None,
                 topn_type: None,
@@ -743,15 +777,29 @@ mod tests {
         }
     }
 
-    fn project_with_items(memo: &Memo, items: Vec<ProjectItem>, child_group: usize) -> MExpr {
+    fn sort_group_with_items(memo: &mut Memo, items: Vec<SortItem>, child_group: usize) -> usize {
+        let expr = sort_with_items(memo, items, child_group);
+        memo.new_group(expr)
+    }
+
+    fn project_with_items(memo: &mut Memo, items: Vec<ProjectItem>, child_group: usize) -> MExpr {
         MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalProject(LogicalProjectOp {
-                items,
+                items: intern_project_items(&mut memo.scalars, &items),
                 output_qualifier: None,
             }),
             children: vec![child_group],
         }
+    }
+
+    fn project_group_with_items(
+        memo: &mut Memo,
+        items: Vec<ProjectItem>,
+        child_group: usize,
+    ) -> usize {
+        let expr = project_with_items(memo, items, child_group);
+        memo.new_group(expr)
     }
 
     fn project_item(expr: TypedExpr, output_id: u32, output_name: &str) -> ProjectItem {
@@ -807,7 +855,8 @@ mod tests {
                 assert_eq!(branch_topn.limit, Some(expected_limit));
                 assert_eq!(branch_topn.offset, Some(expected_offset));
                 assert_eq!(branch_topn.items.len(), 1);
-                match &branch_topn.items[0].expr.kind {
+                let item = materialize_sort_key(&memo.scalars, &branch_topn.items[0]);
+                match &item.expr.kind {
                     ExprKind::ColumnRef { column_id, .. } => {
                         assert_eq!(*column_id, ColumnId(expected_sort_column_id));
                     }
@@ -818,12 +867,16 @@ mod tests {
         }
     }
 
-    fn analytic_sort_with_items(memo: &Memo, items: Vec<SortItem>, child_group: usize) -> MExpr {
+    fn analytic_sort_with_items(
+        memo: &mut Memo,
+        items: Vec<SortItem>,
+        child_group: usize,
+    ) -> MExpr {
         MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalSort(LogicalSortOp {
-                items,
-                analytic_partition_exprs: vec![col(2)],
+                items: intern_sort_items(&mut memo.scalars, &items),
+                analytic_partition_exprs: intern_exprs(&mut memo.scalars, &[col(2)]),
                 partition_limit: None,
                 topn_type: None,
             }),
@@ -831,12 +884,21 @@ mod tests {
         }
     }
 
-    fn partition_topn_sort(memo: &Memo, items: Vec<SortItem>, child_group: usize) -> MExpr {
+    fn analytic_sort_group_with_items(
+        memo: &mut Memo,
+        items: Vec<SortItem>,
+        child_group: usize,
+    ) -> usize {
+        let expr = analytic_sort_with_items(memo, items, child_group);
+        memo.new_group(expr)
+    }
+
+    fn partition_topn_sort(memo: &mut Memo, items: Vec<SortItem>, child_group: usize) -> MExpr {
         MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalSort(LogicalSortOp {
-                items,
-                analytic_partition_exprs: vec![col(2)],
+                items: intern_sort_items(&mut memo.scalars, &items),
+                analytic_partition_exprs: intern_exprs(&mut memo.scalars, &[col(2)]),
                 partition_limit: Some(2),
                 topn_type: Some(crate::exec::node::sort::SortTopNType::Rank),
             }),
@@ -844,12 +906,21 @@ mod tests {
         }
     }
 
+    fn partition_topn_sort_group(
+        memo: &mut Memo,
+        items: Vec<SortItem>,
+        child_group: usize,
+    ) -> usize {
+        let expr = partition_topn_sort(memo, items, child_group);
+        memo.new_group(expr)
+    }
+
     #[test]
     fn merges_consecutive_topn_when_inner_window_covers_outer() {
         let mut memo = Memo::new();
         let scan_group = scan_group(&mut memo);
-        let inner_group = memo.new_group(topn(&memo, 20, 0, TopNPhase::Final, false, scan_group));
-        let outer = topn(&memo, 5, 10, TopNPhase::Final, false, inner_group);
+        let inner_group = topn_group(&mut memo, 20, 0, TopNPhase::Final, false, scan_group);
+        let outer = topn(&mut memo, 5, 10, TopNPhase::Final, false, inner_group);
 
         let out = MergeConsecutiveTopN.apply(&outer, &mut memo);
 
@@ -874,8 +945,8 @@ mod tests {
     fn does_not_merge_when_inner_window_is_too_small() {
         let mut memo = Memo::new();
         let scan_group = scan_group(&mut memo);
-        let inner_group = memo.new_group(topn(&memo, 12, 0, TopNPhase::Final, false, scan_group));
-        let outer = topn(&memo, 5, 10, TopNPhase::Final, false, inner_group);
+        let inner_group = topn_group(&mut memo, 12, 0, TopNPhase::Final, false, scan_group);
+        let outer = topn(&mut memo, 5, 10, TopNPhase::Final, false, inner_group);
 
         let out = MergeConsecutiveTopN.apply(&outer, &mut memo);
 
@@ -889,8 +960,8 @@ mod tests {
     fn does_not_merge_when_inner_offset_is_non_zero() {
         let mut memo = Memo::new();
         let scan_group = scan_group(&mut memo);
-        let inner_group = memo.new_group(topn(&memo, 20, 3, TopNPhase::Final, false, scan_group));
-        let outer = topn(&memo, 5, 10, TopNPhase::Final, false, inner_group);
+        let inner_group = topn_group(&mut memo, 20, 3, TopNPhase::Final, false, scan_group);
+        let outer = topn(&mut memo, 5, 10, TopNPhase::Final, false, inner_group);
 
         let out = MergeConsecutiveTopN.apply(&outer, &mut memo);
 
@@ -904,8 +975,8 @@ mod tests {
     fn does_not_merge_split_final_over_partial_topn() {
         let mut memo = Memo::new();
         let scan_group = scan_group(&mut memo);
-        let inner_group = memo.new_group(topn(&memo, 20, 0, TopNPhase::Partial, false, scan_group));
-        let outer = topn(&memo, 5, 0, TopNPhase::Final, true, inner_group);
+        let inner_group = topn_group(&mut memo, 20, 0, TopNPhase::Partial, false, scan_group);
+        let outer = topn(&mut memo, 5, 0, TopNPhase::Final, true, inner_group);
 
         let out = MergeConsecutiveTopN.apply(&outer, &mut memo);
 
@@ -919,8 +990,8 @@ mod tests {
     fn does_not_merge_unsplit_final_over_partial_topn() {
         let mut memo = Memo::new();
         let scan_group = scan_group(&mut memo);
-        let inner_group = memo.new_group(topn(&memo, 20, 0, TopNPhase::Partial, false, scan_group));
-        let outer = topn(&memo, 5, 0, TopNPhase::Final, false, inner_group);
+        let inner_group = topn_group(&mut memo, 20, 0, TopNPhase::Partial, false, scan_group);
+        let outer = topn(&mut memo, 5, 0, TopNPhase::Final, false, inner_group);
 
         let out = MergeConsecutiveTopN.apply(&outer, &mut memo);
 
@@ -939,16 +1010,16 @@ mod tests {
             .equivalence_classes
             .merge_pair(ColumnId(1), ColumnId(2));
         memo.groups[scan_group].logical_props = Some(props);
-        let inner_group = memo.new_group(topn_with_item(
-            &memo,
+        let inner_group = topn_with_item_group(
+            &mut memo,
             sort_item(2),
             20,
             0,
             TopNPhase::Final,
             false,
             scan_group,
-        ));
-        let outer = topn(&memo, 5, 0, TopNPhase::Final, false, inner_group);
+        );
+        let outer = topn(&mut memo, 5, 0, TopNPhase::Final, false, inner_group);
 
         let out = MergeConsecutiveTopN.apply(&outer, &mut memo);
 
@@ -960,8 +1031,8 @@ mod tests {
     fn removes_plain_sort_under_matching_topn() {
         let mut memo = Memo::new();
         let scan_group = scan_group(&mut memo);
-        let sort_group = memo.new_group(sort_with_items(&memo, vec![sort_item(1)], scan_group));
-        let topn = topn(&memo, 10, 0, TopNPhase::Final, false, sort_group);
+        let sort_group = sort_group_with_items(&mut memo, vec![sort_item(1)], scan_group);
+        let topn = topn(&mut memo, 10, 0, TopNPhase::Final, false, sort_group);
 
         let out = RemoveRedundantSortUnderTopN.apply(&topn, &mut memo);
 
@@ -986,12 +1057,8 @@ mod tests {
     fn does_not_remove_analytic_partition_sort_under_topn() {
         let mut memo = Memo::new();
         let scan_group = scan_group(&mut memo);
-        let sort_group = memo.new_group(analytic_sort_with_items(
-            &memo,
-            vec![sort_item(1)],
-            scan_group,
-        ));
-        let topn = topn(&memo, 10, 0, TopNPhase::Final, false, sort_group);
+        let sort_group = analytic_sort_group_with_items(&mut memo, vec![sort_item(1)], scan_group);
+        let topn = topn(&mut memo, 10, 0, TopNPhase::Final, false, sort_group);
 
         let out = RemoveRedundantSortUnderTopN.apply(&topn, &mut memo);
 
@@ -1012,8 +1079,8 @@ mod tests {
         // explicitly: the partition_limit / topn_type fields must survive untouched.
         let mut memo = Memo::new();
         let scan_group = scan_group(&mut memo);
-        let sort_group = memo.new_group(partition_topn_sort(&memo, vec![sort_item(1)], scan_group));
-        let topn = topn(&memo, 10, 0, TopNPhase::Final, false, sort_group);
+        let sort_group = partition_topn_sort_group(&mut memo, vec![sort_item(1)], scan_group);
+        let topn = topn(&mut memo, 10, 0, TopNPhase::Final, false, sort_group);
 
         let out = RemoveRedundantSortUnderTopN.apply(&topn, &mut memo);
 
@@ -1040,8 +1107,8 @@ mod tests {
     fn does_not_remove_sort_when_ordering_does_not_cover_topn() {
         let mut memo = Memo::new();
         let scan_group = scan_group(&mut memo);
-        let sort_group = memo.new_group(sort_with_items(&memo, vec![sort_item(2)], scan_group));
-        let topn = topn(&memo, 10, 0, TopNPhase::Final, false, sort_group);
+        let sort_group = sort_group_with_items(&mut memo, vec![sort_item(2)], scan_group);
+        let topn = topn(&mut memo, 10, 0, TopNPhase::Final, false, sort_group);
 
         let out = RemoveRedundantSortUnderTopN.apply(&topn, &mut memo);
 
@@ -1059,10 +1126,9 @@ mod tests {
             project_item(col(1), 10, "alias_c1"),
             project_item(col(2), 20, "alias_c2"),
         ];
-        let project_group =
-            memo.new_group(project_with_items(&memo, project_items.clone(), scan_group));
+        let project_group = project_group_with_items(&mut memo, project_items.clone(), scan_group);
         let topn = topn_with_item(
-            &memo,
+            &mut memo,
             sort_item(10),
             7,
             2,
@@ -1098,7 +1164,8 @@ mod tests {
                 assert_eq!(pushed.phase, TopNPhase::Final);
                 assert!(!pushed.is_split);
                 assert_eq!(pushed.items.len(), 1);
-                match &pushed.items[0].expr.kind {
+                let item = materialize_sort_key(&memo.scalars, &pushed.items[0]);
+                match &item.expr.kind {
                     ExprKind::ColumnRef { column_id, .. } => {
                         assert_eq!(*column_id, ColumnId(1));
                     }
@@ -1113,13 +1180,13 @@ mod tests {
     fn project_pushdown_reuses_existing_pushed_topn_group() {
         let mut memo = Memo::new();
         let scan_group = scan_group(&mut memo);
-        let project_group = memo.new_group(project_with_items(
-            &memo,
+        let project_group = project_group_with_items(
+            &mut memo,
             vec![project_item(col(1), 10, "alias_c1")],
             scan_group,
-        ));
+        );
         let topn = topn_with_item(
-            &memo,
+            &mut memo,
             sort_item(10),
             7,
             0,
@@ -1156,21 +1223,21 @@ mod tests {
     fn project_pushdown_merge_survives_physical_implementation_dedup() {
         let mut memo = Memo::new();
         let scan_group = scan_group(&mut memo);
-        let inner_group = memo.new_group(topn(&memo, 3, 0, TopNPhase::Final, false, scan_group));
-        let project_group = memo.new_group(project_with_items(
-            &memo,
+        let inner_group = topn_group(&mut memo, 3, 0, TopNPhase::Final, false, scan_group);
+        let project_group = project_group_with_items(
+            &mut memo,
             vec![project_item(col(1), 10, "alias_c1")],
             inner_group,
-        ));
-        let outer_group = memo.new_group(topn_with_item(
-            &memo,
+        );
+        let outer_group = topn_with_item_group(
+            &mut memo,
             sort_item(10),
             2,
             0,
             TopNPhase::Final,
             false,
             project_group,
-        ));
+        );
 
         let outer_expr = memo.groups[outer_group].logical_exprs[0].clone();
         let pushed = project_pushdown_rule().apply(&outer_expr, &mut memo);
@@ -1207,13 +1274,13 @@ mod tests {
     fn project_pushdown_rejects_computed_sort_keys() {
         let mut memo = Memo::new();
         let scan_group = scan_group(&mut memo);
-        let project_group = memo.new_group(project_with_items(
-            &memo,
+        let project_group = project_group_with_items(
+            &mut memo,
             vec![project_item(literal_expr(42), 10, "computed")],
             scan_group,
-        ));
+        );
         let topn = topn_with_item(
-            &memo,
+            &mut memo,
             sort_item(10),
             7,
             0,
@@ -1234,13 +1301,13 @@ mod tests {
     fn project_pushdown_fails_closed_for_partial_topn() {
         let mut memo = Memo::new();
         let scan_group = scan_group(&mut memo);
-        let project_group = memo.new_group(project_with_items(
-            &memo,
+        let project_group = project_group_with_items(
+            &mut memo,
             vec![project_item(col(1), 10, "alias_c1")],
             scan_group,
-        ));
+        );
         let topn = topn_with_item(
-            &memo,
+            &mut memo,
             sort_item(10),
             7,
             0,
@@ -1261,13 +1328,13 @@ mod tests {
     fn project_pushdown_fails_closed_for_split_final_topn() {
         let mut memo = Memo::new();
         let scan_group = scan_group(&mut memo);
-        let project_group = memo.new_group(project_with_items(
-            &memo,
+        let project_group = project_group_with_items(
+            &mut memo,
             vec![project_item(col(1), 10, "alias_c1")],
             scan_group,
-        ));
+        );
         let topn = topn_with_item(
-            &memo,
+            &mut memo,
             sort_item(10),
             7,
             0,
@@ -1288,7 +1355,7 @@ mod tests {
     fn scan_pushdown_fails_closed_with_default_capability() {
         let mut memo = Memo::new();
         let scan_group = scan_group(&mut memo);
-        let topn = topn(&memo, 10, 0, TopNPhase::Final, false, scan_group);
+        let topn = topn(&mut memo, 10, 0, TopNPhase::Final, false, scan_group);
 
         let out = PushTopNIntoScan.apply(&topn, &mut memo);
 
@@ -1304,7 +1371,7 @@ mod tests {
         let left_group = values_group(&mut memo, &[1]);
         let right_group = values_group(&mut memo, &[2]);
         let join_group = join_group(&mut memo, left_group, right_group);
-        let topn = topn(&memo, 10, 0, TopNPhase::Final, false, join_group);
+        let topn = topn(&mut memo, 10, 0, TopNPhase::Final, false, join_group);
 
         let out = rule_by_name("PushTopNThroughJoin").apply(&topn, &mut memo);
 
@@ -1320,7 +1387,7 @@ mod tests {
         let input_group = values_group(&mut memo, &[1, 2]);
         let aggregate_group = aggregate_group(&mut memo, input_group);
         let topn = topn_with_item(
-            &memo,
+            &mut memo,
             sort_item(10),
             10,
             0,
@@ -1343,7 +1410,7 @@ mod tests {
         let left_group = values_group(&mut memo, &[1]);
         let right_group = values_group(&mut memo, &[1]);
         let union_group = union_group(&mut memo, false, vec![left_group, right_group]);
-        let topn = topn(&memo, 10, 0, TopNPhase::Final, false, union_group);
+        let topn = topn(&mut memo, 10, 0, TopNPhase::Final, false, union_group);
 
         let out = rule_by_name("PushTopNThroughSetOp").apply(&topn, &mut memo);
 
@@ -1359,7 +1426,7 @@ mod tests {
         let left_group = values_group(&mut memo, &[1]);
         let right_group = values_group(&mut memo, &[1]);
         let union_group = union_group(&mut memo, true, vec![left_group, right_group]);
-        let topn = topn(&memo, 10, 0, TopNPhase::Final, false, union_group);
+        let topn = topn(&mut memo, 10, 0, TopNPhase::Final, false, union_group);
         let rule = rule_by_name("PushTopNThroughSetOp");
 
         let first = rule.apply(&topn, &mut memo);
@@ -1425,7 +1492,7 @@ mod tests {
         let left_group = values_group(&mut memo, &[1]);
         let right_group = values_group(&mut memo, &[1]);
         let union_group = union_group(&mut memo, true, vec![left_group, right_group]);
-        let topn = topn(&memo, 2, 3, TopNPhase::Final, false, union_group);
+        let topn = topn(&mut memo, 2, 3, TopNPhase::Final, false, union_group);
 
         let out = rule_by_name("PushTopNThroughSetOp").apply(&topn, &mut memo);
 
@@ -1466,7 +1533,7 @@ mod tests {
             vec![output_column(10, "union_c")],
         );
         let topn = topn_with_item(
-            &memo,
+            &mut memo,
             sort_item(10),
             10,
             0,
@@ -1498,7 +1565,7 @@ mod tests {
         let right_group = values_group(&mut memo, &[1]);
         let union_group = union_group(&mut memo, true, vec![left_group, right_group]);
         let topn = topn_with_item(
-            &memo,
+            &mut memo,
             SortItem {
                 expr: literal_expr(1),
                 asc: true,
@@ -1531,7 +1598,7 @@ mod tests {
             vec![output_column(10, "union_c")],
         );
         let topn = topn_with_item(
-            &memo,
+            &mut memo,
             sort_item(99),
             10,
             0,
@@ -1560,7 +1627,7 @@ mod tests {
             vec![output_column(10, "union_c1"), output_column(11, "union_c2")],
         );
         let topn = topn_with_item(
-            &memo,
+            &mut memo,
             sort_item(11),
             10,
             0,
@@ -1593,7 +1660,7 @@ mod tests {
             vec![output_column(10, "union_c")],
         );
         let topn = topn_with_item(
-            &memo,
+            &mut memo,
             sort_item(10),
             10,
             0,
@@ -1626,7 +1693,7 @@ mod tests {
             vec![output_column(10, "union_c")],
         );
         let topn = topn_with_item(
-            &memo,
+            &mut memo,
             sort_item(10),
             10,
             0,
@@ -1649,7 +1716,7 @@ mod tests {
         let left_group = values_group(&mut memo, &[1]);
         let right_group = values_group(&mut memo, &[1]);
         let union_group = union_group(&mut memo, true, vec![left_group, right_group]);
-        let topn_group = memo.new_group(topn(&memo, 10, 0, TopNPhase::Final, false, union_group));
+        let topn_group = topn_group(&mut memo, 10, 0, TopNPhase::Final, false, union_group);
         let topn_expr = memo.groups[topn_group].logical_exprs[0].clone();
         let rule = rule_by_name("PushTopNThroughSetOp");
 
@@ -1682,7 +1749,7 @@ mod tests {
         let left_group = values_group(&mut memo, &[1]);
         let right_group = values_group(&mut memo, &[1]);
         let union_group = union_group(&mut memo, true, vec![left_group, right_group]);
-        let topn = topn(&memo, 10, 0, TopNPhase::Partial, false, union_group);
+        let topn = topn(&mut memo, 10, 0, TopNPhase::Partial, false, union_group);
 
         let out = rule_by_name("PushTopNThroughSetOp").apply(&topn, &mut memo);
 
@@ -1698,7 +1765,7 @@ mod tests {
         let left_group = values_group(&mut memo, &[1]);
         let right_group = values_group(&mut memo, &[1]);
         let union_group = union_group(&mut memo, true, vec![left_group, right_group]);
-        let topn = topn(&memo, 10, 0, TopNPhase::Final, true, union_group);
+        let topn = topn(&mut memo, 10, 0, TopNPhase::Final, true, union_group);
 
         let out = rule_by_name("PushTopNThroughSetOp").apply(&topn, &mut memo);
 
@@ -1714,7 +1781,7 @@ mod tests {
         let left_group = values_group(&mut memo, &[1]);
         let right_group = values_group(&mut memo, &[1]);
         let union_group = union_group(&mut memo, true, vec![left_group, right_group]);
-        let topn = topn(&memo, 1, i64::MAX, TopNPhase::Final, false, union_group);
+        let topn = topn(&mut memo, 1, i64::MAX, TopNPhase::Final, false, union_group);
 
         let out = rule_by_name("PushTopNThroughSetOp").apply(&topn, &mut memo);
 

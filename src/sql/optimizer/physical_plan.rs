@@ -1,8 +1,11 @@
 //! PhysicalPlan tree extracted from the Memo after optimization.
 
+use std::sync::Arc;
+
 use crate::sql::analysis::OutputColumn;
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::property::PhysicalPropertySet;
+use crate::sql::optimizer::scalar::ScalarArena;
 use crate::sql::optimizer::statistics::Statistics;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17,6 +20,10 @@ pub(crate) struct PlanExecutionProps {
     pub output_property: PhysicalPropertySet,
     pub child_output_properties: Vec<PhysicalPropertySet>,
     pub join_distribution: Option<JoinExecutionDistribution>,
+    /// Shared scalar arena that owns all `ScalarId` handles referenced by this
+    /// physical plan. Attached after extraction so codegen can materialize the
+    /// scalar handles at its TypedExpr boundary.
+    pub scalar_arena: Option<Arc<ScalarArena>>,
 }
 
 impl Default for PlanExecutionProps {
@@ -25,6 +32,7 @@ impl Default for PlanExecutionProps {
             output_property: PhysicalPropertySet::any(),
             child_output_properties: Vec::new(),
             join_distribution: None,
+            scalar_arena: None,
         }
     }
 }
@@ -41,6 +49,13 @@ pub(crate) struct PhysicalPlanNode {
     pub build_runtime_filters: Vec<crate::sql::optimizer::runtime_filter_pass::RuntimeFilterDesc>,
     /// OQ-5: probe-side runtime filters consumed here.
     pub probe_runtime_filters: Vec<crate::sql::optimizer::runtime_filter_pass::RuntimeFilterProbe>,
+}
+
+pub(crate) fn attach_scalar_arena(root: &mut PhysicalPlanNode, arena: Arc<ScalarArena>) {
+    root.execution_props.scalar_arena = Some(Arc::clone(&arena));
+    for child in &mut root.children {
+        attach_scalar_arena(child, Arc::clone(&arena));
+    }
 }
 
 #[cfg(test)]
@@ -89,6 +104,7 @@ mod rf_field_tests {
                     crate::sql::optimizer::property::PhysicalPropertySet::any(),
                 ],
                 join_distribution: Some(JoinExecutionDistribution::Broadcast),
+                scalar_arena: None,
             },
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],

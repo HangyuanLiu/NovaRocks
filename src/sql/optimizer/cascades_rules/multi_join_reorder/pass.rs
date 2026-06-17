@@ -190,6 +190,7 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::LogicalProperties;
     use crate::sql::optimizer::operator::LogicalValuesOp;
+    use crate::sql::optimizer::scalar::intern_typed;
     use crate::sql::optimizer::statistics::ColumnStatistic;
 
     fn col(id: u32) -> TypedExpr {
@@ -251,10 +252,10 @@ mod tests {
         g
     }
 
-    fn inner(cond: TypedExpr) -> LogicalJoinOp {
+    fn inner(memo: &mut Memo, cond: TypedExpr) -> LogicalJoinOp {
         LogicalJoinOp {
             join_type: JoinKind::Inner,
-            condition: Some(cond),
+            condition: Some(intern_typed(&mut memo.scalars, &cond)),
         }
     }
 
@@ -269,7 +270,7 @@ mod tests {
             tree = JoinTree::Join {
                 left: Box::new(tree),
                 right: Box::new(JoinTree::Leaf(leaves[i])),
-                op: inner(eq(col(i as u32), col(i as u32 + 1))),
+                op: inner(memo, eq(col(i as u32), col(i as u32 + 1))),
             };
         }
         copy_in_join_tree(memo, &tree, &HashMap::new())

@@ -5,8 +5,8 @@
 //! memo expression is O(1). `intern` hash-conses: structurally-identical nodes
 //! with identical type metadata share one id, giving id-equality == typed
 //! structural-equality (the property the dedup sites and future CSE rely on).
-//! M0 builds the type + the TypedExpr bridge only; no operator field uses it
-//! yet.
+//! M1 memo/physical operators store scalar handles; rewrite and codegen stages
+//! still use the `TypedExpr` bridge during the migration.
 #![allow(dead_code)] // wired into operators in M1.
 
 use std::collections::HashMap;

@@ -81,6 +81,7 @@ mod tests {
     use super::*;
     use crate::sql::optimizer::memo::Memo;
     use crate::sql::optimizer::operator::{LogicalLimitOp, LogicalScanOp, LogicalSortOp};
+    use crate::sql::optimizer::scalar::intern_typed;
 
     fn mk_scan_mexpr(memo: &mut Memo) -> MExpr {
         MExpr {
@@ -215,23 +216,23 @@ mod tests {
         let mut memo = Memo::new();
         let scan_mexpr = mk_scan_mexpr(&mut memo);
         let scan_group = memo.new_group(scan_mexpr);
+        let partition_expr = crate::sql::analysis::TypedExpr {
+            kind: crate::sql::analysis::ExprKind::ColumnRef {
+                column_id: crate::sql::column_id::ColumnId(1),
+                qualifier: None,
+                column: "p".into(),
+            },
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: true,
+        };
+        let partition_expr = intern_typed(&mut memo.scalars, &partition_expr);
 
         let sort_mexpr = MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalSort(LogicalSortOp {
                 items: vec![],
-                analytic_partition_exprs: vec![
-                    // non-empty: partition-topn Sort always carries these
-                    crate::sql::analysis::TypedExpr {
-                        kind: crate::sql::analysis::ExprKind::ColumnRef {
-                            column_id: crate::sql::column_id::ColumnId(1),
-                            qualifier: None,
-                            column: "p".into(),
-                        },
-                        data_type: arrow::datatypes::DataType::Int64,
-                        nullable: true,
-                    },
-                ],
+                // non-empty: partition-topn Sort always carries these
+                analytic_partition_exprs: vec![partition_expr],
                 partition_limit: Some(2),
                 topn_type: Some(crate::exec::node::sort::SortTopNType::Rank),
             }),

@@ -38,7 +38,8 @@ mod tests {
     fn cte_anchor_requires_any_for_both_children() {
         let op = PhysicalCTEAnchorOp { cte_id: 7 };
         let parent_req = PhysicalPropertySet::gather();
-        let child_reqs = op.derive_required(&parent_req, 2);
+        let scalars = ScalarArena::new();
+        let child_reqs = op.derive_required(&scalars, &parent_req, 2);
         assert_eq!(child_reqs.len(), 2);
         assert_eq!(child_reqs[0], PhysicalPropertySet::any());
         assert_eq!(child_reqs[1], PhysicalPropertySet::any());

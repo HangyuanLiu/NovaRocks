@@ -1068,6 +1068,7 @@ mod tests {
     #[test]
     fn from_memo_rejects_split_aggregate() {
         use crate::sql::optimizer::operator::{LogicalAggregateOp, Operator};
+        use crate::sql::optimizer::scalar_bridge::{intern_aggregate_calls, intern_exprs};
         // A split (Local) aggregate is not the original Single shape and must
         // be rejected even when it sits at the matched position.
         let a = col(1, "a");
@@ -1077,10 +1078,10 @@ mod tests {
         let plan = LogicalPlanNode::new(LogicalPlanNodeKind::Scan(scan_op), vec![], None);
         let mut memo = crate::sql::optimizer::memo::Memo::new();
         let scan_gid = crate::sql::optimizer::convert::logical_plan_to_memo(&plan, &mut memo);
-        let split = LogicalAggregateOp::staged(
-            AggStage::Local,
-            vec![col_ref(&a)],
-            vec![AggregateCall {
+        let group_by = intern_exprs(&mut memo.scalars, &[col_ref(&a)]);
+        let aggregates = intern_aggregate_calls(
+            &mut memo.scalars,
+            &[AggregateCall {
                 name: "sum".to_string(),
                 args: vec![col_ref(&v)],
                 distinct: false,
@@ -1088,6 +1089,11 @@ mod tests {
                 order_by: vec![],
                 output_column_id: sum_out.column_id,
             }],
+        );
+        let split = LogicalAggregateOp::staged(
+            AggStage::Local,
+            group_by,
+            aggregates,
             vec![col(1, "a"), sum_out.clone()],
             vec![false],
             true,

@@ -20,7 +20,7 @@ use crate::sql::optimizer::operator::{
     LogicalAggregateOp, LogicalFilterOp, LogicalProjectOp, LogicalScanOp, Operator,
 };
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
-use crate::sql::optimizer::scalar::intern_typed;
+use crate::sql::optimizer::scalar::{intern_typed, materialize};
 use crate::sql::optimizer::scalar_bridge::{
     intern_aggregate_calls, intern_exprs, intern_project_items, materialize_aggregate_calls,
     materialize_exprs,
@@ -871,8 +871,9 @@ mod tests {
         };
         assert_eq!(p.items.len(), 1);
         assert_eq!(p.items[0].output_column_id, cnt.column_id);
-        let ExprKind::FunctionCall { name, args, .. } = &p.items[0].expr.kind else {
-            panic!("expected coalesce call, got {:?}", p.items[0].expr.kind);
+        let project_expr = materialize(&memo.scalars, p.items[0].expr);
+        let ExprKind::FunctionCall { name, args, .. } = &project_expr.kind else {
+            panic!("expected coalesce call, got {:?}", project_expr.kind);
         };
         assert_eq!(name, "coalesce");
         assert_eq!(args.len(), 2);

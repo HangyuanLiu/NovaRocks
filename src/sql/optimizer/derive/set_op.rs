@@ -125,6 +125,7 @@ mod tests {
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::property::{DistributionSpec, HashSource};
+    use crate::sql::optimizer::scalar::ScalarArena;
     use arrow::datatypes::DataType;
 
     fn col(id: u32, name: &str) -> OutputColumn {
@@ -144,7 +145,8 @@ mod tests {
             child_output_columns: vec![vec![col(10, "k")], vec![col(20, "k")]],
         };
 
-        let reqs = op.derive_required(&PhysicalPropertySet::any(), 2);
+        let scalars = ScalarArena::new();
+        let reqs = op.derive_required(&scalars, &PhysicalPropertySet::any(), 2);
 
         assert_eq!(reqs.len(), 2);
         assert_eq!(
@@ -170,7 +172,8 @@ mod tests {
             child_output_columns: vec![vec![col(10, "k")], vec![col(20, "k")]],
         };
 
-        let props = op.derive_output(&[]);
+        let scalars = ScalarArena::new();
+        let props = op.derive_output(&scalars, &[]);
 
         assert_eq!(
             props.distribution,
@@ -189,7 +192,8 @@ mod tests {
             child_output_columns: vec![vec![col(10, "k")], vec![col(20, "k")]],
         };
 
-        let reqs = op.derive_required(&PhysicalPropertySet::any(), 2);
+        let scalars = ScalarArena::new();
+        let reqs = op.derive_required(&scalars, &PhysicalPropertySet::any(), 2);
 
         assert_eq!(reqs.len(), 2);
         assert!(

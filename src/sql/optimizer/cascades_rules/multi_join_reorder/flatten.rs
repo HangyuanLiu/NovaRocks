@@ -155,6 +155,7 @@ mod tests {
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn};
     use crate::sql::optimizer::memo::{JoinTree, LogicalProperties, MExpr};
     use crate::sql::optimizer::operator::LogicalValuesOp;
+    use crate::sql::optimizer::scalar::intern_typed;
     use crate::sql::optimizer::statistics::ColumnStatistic;
     use crate::sql::optimizer::stats::copy_in_join_tree;
     use std::collections::HashMap as Map;
@@ -239,10 +240,10 @@ mod tests {
         g
     }
 
-    fn inner(cond: TypedExpr) -> LogicalJoinOp {
+    fn inner(memo: &mut Memo, cond: TypedExpr) -> LogicalJoinOp {
         LogicalJoinOp {
             join_type: JoinKind::Inner,
-            condition: Some(cond),
+            condition: Some(intern_typed(&mut memo.scalars, &cond)),
         }
     }
 
@@ -257,10 +258,10 @@ mod tests {
             left: Box::new(JoinTree::Join {
                 left: Box::new(JoinTree::Leaf(a)),
                 right: Box::new(JoinTree::Leaf(b)),
-                op: inner(eq(col(1), col(2))),
+                op: inner(&mut memo, eq(col(1), col(2))),
             }),
             right: Box::new(JoinTree::Leaf(c)),
-            op: inner(eq(col(1), col(3))),
+            op: inner(&mut memo, eq(col(1), col(3))),
         };
         let root = copy_in_join_tree(&mut memo, &tree, &Map::new());
 
@@ -281,11 +282,12 @@ mod tests {
         let a = leaf(&mut memo, 1, 1000.0);
         let b = leaf(&mut memo, 2, 100.0);
         let c = leaf(&mut memo, 3, 50.0);
+        let lo_cond = intern_typed(&mut memo.scalars, &eq(col(1), col(2)));
         let lo = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::LeftOuter,
-                condition: Some(eq(col(1), col(2))),
+                condition: Some(lo_cond),
             }),
             children: vec![a, b],
         });
@@ -296,7 +298,7 @@ mod tests {
         let tree = JoinTree::Join {
             left: Box::new(JoinTree::Leaf(lo)),
             right: Box::new(JoinTree::Leaf(c)),
-            op: inner(eq(col(1), col(3))),
+            op: inner(&mut memo, eq(col(1), col(3))),
         };
         let root = copy_in_join_tree(&mut memo, &tree, &Map::new());
 
@@ -323,7 +325,7 @@ mod tests {
         let tree = JoinTree::Join {
             left: Box::new(JoinTree::Leaf(a)),
             right: Box::new(JoinTree::Leaf(b)),
-            op: inner(cond),
+            op: inner(&mut memo, cond),
         };
         let root = copy_in_join_tree(&mut memo, &tree, &Map::new());
 

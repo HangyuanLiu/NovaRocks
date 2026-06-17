@@ -59,6 +59,8 @@ mod tests {
     use crate::sql::analysis::{ExprKind, SortItem, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::property::HashSource;
+    use crate::sql::optimizer::scalar::intern_typed;
+    use crate::sql::optimizer::scalar_bridge::intern_sort_items;
 
     #[test]
     fn output_properties_sort_has_gather_and_ordering() {
@@ -71,17 +73,21 @@ mod tests {
             data_type: arrow::datatypes::DataType::Int32,
             nullable: false,
         };
+        let mut scalars = ScalarArena::new();
         let op = PhysicalSortOp {
-            items: vec![SortItem {
-                expr: col_ref,
-                asc: true,
-                nulls_first: false,
-            }],
+            items: intern_sort_items(
+                &mut scalars,
+                &[SortItem {
+                    expr: col_ref,
+                    asc: true,
+                    nulls_first: false,
+                }],
+            ),
             analytic_partition_exprs: Vec::new(),
             partition_limit: None,
             topn_type: None,
         };
-        let props = op.derive_output(&[]);
+        let props = op.derive_output(&scalars, &[]);
         assert_eq!(props.distribution, DistributionSpec::Gather);
         assert!(matches!(props.ordering, OrderingSpec::Required(_)));
     }
@@ -97,6 +103,8 @@ mod tests {
             data_type: arrow::datatypes::DataType::Int32,
             nullable: false,
         };
+        let mut scalars = ScalarArena::new();
+        let partition = intern_typed(&mut scalars, &partition);
         let op = PhysicalSortOp {
             items: vec![],
             analytic_partition_exprs: vec![partition],
@@ -104,7 +112,7 @@ mod tests {
             topn_type: None,
         };
 
-        let reqs = op.derive_required(&PhysicalPropertySet::any(), 1);
+        let reqs = op.derive_required(&scalars, &PhysicalPropertySet::any(), 1);
         assert_eq!(reqs.len(), 1);
         match &reqs[0].distribution {
             DistributionSpec::HashPartitioned { cols, source } => {

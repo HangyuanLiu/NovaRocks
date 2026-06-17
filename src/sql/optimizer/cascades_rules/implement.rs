@@ -1519,8 +1519,8 @@ mod eq_pair_tests {
         values.iter().copied().map(ColumnId).collect()
     }
 
-    fn eq_pair(left: TypedExpr, right: TypedExpr) -> PhysicalHashJoinEqCondition {
-        PhysicalHashJoinEqCondition {
+    fn eq_pair(left: TypedExpr, right: TypedExpr) -> TypedHashJoinEqCondition {
+        TypedHashJoinEqCondition {
             left,
             right,
             null_safe: false,
@@ -1593,6 +1593,7 @@ mod join_demotion_tests {
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::{LogicalProperties, MExpr, Memo};
+    use crate::sql::optimizer::scalar::ScalarId;
     use arrow::datatypes::{DataType, Field};
     use std::sync::Arc;
 
@@ -1681,6 +1682,28 @@ mod join_demotion_tests {
         }
     }
 
+    fn logical_join_expr(
+        memo: &mut Memo,
+        join_type: JoinKind,
+        condition: TypedExpr,
+        children: Vec<GroupId>,
+    ) -> MExpr {
+        let id = memo.next_expr_id();
+        let condition = Some(intern_typed(&mut memo.scalars, &condition));
+        MExpr {
+            id,
+            op: Operator::LogicalJoin(LogicalJoinOp {
+                join_type,
+                condition,
+            }),
+            children,
+        }
+    }
+
+    fn mat(memo: &Memo, expr: ScalarId) -> TypedExpr {
+        materialize(&memo.scalars, expr)
+    }
+
     /// The full demotion path: a same-side eq pair must land in other_condition
     /// while an orientable pair lands (correctly oriented) in eq_conditions.
     #[test]
@@ -1698,14 +1721,12 @@ mod join_demotion_tests {
         let second_eq = bin(col("a_id"), BinOp::Eq, col("a_name"));
         let condition = bin(first_eq, BinOp::And, second_eq);
 
-        let join_mexpr = MExpr {
-            id: memo.next_expr_id(),
-            op: Operator::LogicalJoin(LogicalJoinOp {
-                join_type: JoinKind::Inner,
-                condition: Some(condition),
-            }),
-            children: vec![left_group, right_group],
-        };
+        let join_mexpr = logical_join_expr(
+            &mut memo,
+            JoinKind::Inner,
+            condition,
+            vec![left_group, right_group],
+        );
 
         let rule = JoinToHashJoin;
         let alternatives = rule.apply(&join_mexpr, &mut memo);
@@ -1729,7 +1750,8 @@ mod join_demotion_tests {
             !eq.null_safe,
             "regular equality should not be marked null-safe"
         );
-        let (lhs, rhs) = (&eq.left, &eq.right);
+        let lhs = mat(&memo, eq.left);
+        let rhs = mat(&memo, eq.right);
         match &lhs.kind {
             ExprKind::ColumnRef { column, .. } => {
                 assert_eq!(column, "a_id", "left side of eq_condition should be a_id")
@@ -1748,6 +1770,7 @@ mod join_demotion_tests {
             .other_condition
             .as_ref()
             .expect("demoted same-side pair must appear in other_condition");
+        let other = mat(&memo, *other);
         match &other.kind {
             ExprKind::BinaryOp { left, op, right } => {
                 assert!(
@@ -1784,14 +1807,12 @@ mod join_demotion_tests {
         let right_group = mk_scan_group(&mut memo, &["b_id"]);
 
         let condition = bin(col("a_id"), BinOp::EqForNull, col("b_id"));
-        let join_mexpr = MExpr {
-            id: memo.next_expr_id(),
-            op: Operator::LogicalJoin(LogicalJoinOp {
-                join_type: JoinKind::Inner,
-                condition: Some(condition),
-            }),
-            children: vec![left_group, right_group],
-        };
+        let join_mexpr = logical_join_expr(
+            &mut memo,
+            JoinKind::Inner,
+            condition,
+            vec![left_group, right_group],
+        );
 
         let rule = JoinToHashJoin;
         let alternatives = rule.apply(&join_mexpr, &mut memo);
@@ -1821,14 +1842,12 @@ mod join_demotion_tests {
             BinOp::Eq,
             col_typed("b_id", DataType::Int32),
         );
-        let join_mexpr = MExpr {
-            id: memo.next_expr_id(),
-            op: Operator::LogicalJoin(LogicalJoinOp {
-                join_type: JoinKind::Inner,
-                condition: Some(condition),
-            }),
-            children: vec![left_group, right_group],
-        };
+        let join_mexpr = logical_join_expr(
+            &mut memo,
+            JoinKind::Inner,
+            condition,
+            vec![left_group, right_group],
+        );
 
         let alternatives = JoinToHashJoin.apply(&join_mexpr, &mut memo);
         assert_eq!(
@@ -1840,14 +1859,16 @@ mod join_demotion_tests {
             panic!("expected PhysicalHashJoin, got {:?}", alternatives[0].op);
         };
         assert_eq!(phys.eq_conditions.len(), 1);
-        assert_eq!(phys.eq_conditions[0].left.data_type, DataType::Int64);
-        assert_eq!(phys.eq_conditions[0].right.data_type, DataType::Int32);
+        let left_key = mat(&memo, phys.eq_conditions[0].left);
+        let right_key = mat(&memo, phys.eq_conditions[0].right);
+        assert_eq!(left_key.data_type, DataType::Int64);
+        assert_eq!(right_key.data_type, DataType::Int32);
         assert!(
-            matches!(phys.eq_conditions[0].left.kind, ExprKind::ColumnRef { .. }),
+            matches!(left_key.kind, ExprKind::ColumnRef { .. }),
             "optimizer hash key should keep raw column refs so distribution can enforce both sides"
         );
         assert!(
-            matches!(phys.eq_conditions[0].right.kind, ExprKind::ColumnRef { .. }),
+            matches!(right_key.kind, ExprKind::ColumnRef { .. }),
             "optimizer hash key should keep raw column refs so distribution can enforce both sides"
         );
         assert!(
@@ -1866,14 +1887,12 @@ mod join_demotion_tests {
             BinOp::Eq,
             col_typed("b_arr", list_type(DataType::Int64)),
         );
-        let join_mexpr = MExpr {
-            id: memo.next_expr_id(),
-            op: Operator::LogicalJoin(LogicalJoinOp {
-                join_type: JoinKind::Inner,
-                condition: Some(condition),
-            }),
-            children: vec![left_group, right_group],
-        };
+        let join_mexpr = logical_join_expr(
+            &mut memo,
+            JoinKind::Inner,
+            condition,
+            vec![left_group, right_group],
+        );
 
         let hash_alternatives = JoinToHashJoin.apply(&join_mexpr, &mut memo);
         assert!(
@@ -1905,14 +1924,12 @@ mod join_demotion_tests {
             col_typed("b_arr", list_type(DataType::Utf8)),
         );
         let condition = bin(scalar_eq, BinOp::And, complex_eq);
-        let join_mexpr = MExpr {
-            id: memo.next_expr_id(),
-            op: Operator::LogicalJoin(LogicalJoinOp {
-                join_type: JoinKind::Inner,
-                condition: Some(condition),
-            }),
-            children: vec![left_group, right_group],
-        };
+        let join_mexpr = logical_join_expr(
+            &mut memo,
+            JoinKind::Inner,
+            condition,
+            vec![left_group, right_group],
+        );
 
         let alternatives = JoinToHashJoin.apply(&join_mexpr, &mut memo);
         assert_eq!(alternatives.len(), 1);
@@ -1924,7 +1941,8 @@ mod join_demotion_tests {
             1,
             "only the scalar equality should remain as a hash key"
         );
-        match &phys.eq_conditions[0].left.kind {
+        let left_key = mat(&memo, phys.eq_conditions[0].left);
+        match &left_key.kind {
             ExprKind::ColumnRef { column, .. } => assert_eq!(column, "a_id"),
             other => panic!("expected scalar hash key on left, got {:?}", other),
         }
@@ -1940,14 +1958,12 @@ mod join_demotion_tests {
         let left_group = mk_scan_group(&mut memo, &["a_id"]);
         let right_group = mk_scan_group(&mut memo, &["b_id"]);
         let condition = bin(col("a_id"), BinOp::Eq, col("b_id"));
-        let expr = MExpr {
-            id: memo.next_expr_id(),
-            op: Operator::LogicalJoin(LogicalJoinOp {
-                join_type: JoinKind::Inner,
-                condition: Some(condition),
-            }),
-            children: vec![left_group, right_group],
-        };
+        let expr = logical_join_expr(
+            &mut memo,
+            JoinKind::Inner,
+            condition,
+            vec![left_group, right_group],
+        );
         let rule = JoinToHashJoin;
         let alternatives = rule.apply(&expr, &mut memo);
 
@@ -1963,6 +1979,7 @@ mod join_demotion_tests {
 mod window_split_tests {
     use super::*;
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::scalar_bridge::intern_window_exprs;
     use crate::sql::planner::plan::WindowExpr;
     use arrow::datatypes::DataType;
 
@@ -2084,10 +2101,11 @@ mod window_split_tests {
         let child_group = memo.new_group(values_mexpr);
 
         // Single window with no partition and no order => single group, no sort.
+        let window_exprs = intern_window_exprs(&mut memo.scalars, &[mk_window_expr("w1", vec![])]);
         let logical_window_mexpr = MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalWindow(LogicalWindowOp {
-                window_exprs: vec![mk_window_expr("w1", vec![])],
+                window_exprs,
                 output_columns: vec![],
             }),
             children: vec![child_group],
@@ -2124,6 +2142,7 @@ mod two_phase_agg_tests {
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::{MExpr, Memo};
+    use crate::sql::optimizer::scalar_bridge::{intern_aggregate_calls, intern_exprs};
     use crate::sql::planner::plan::AggregateCall;
     use arrow::datatypes::DataType;
 
@@ -2160,6 +2179,38 @@ mod two_phase_agg_tests {
         }
     }
 
+    fn single_agg(
+        memo: &mut Memo,
+        group_by: Vec<TypedExpr>,
+        aggregates: Vec<AggregateCall>,
+        output_columns: Vec<OutputColumn>,
+    ) -> LogicalAggregateOp {
+        let group_by = intern_exprs(&mut memo.scalars, &group_by);
+        let aggregates = intern_aggregate_calls(&mut memo.scalars, &aggregates);
+        LogicalAggregateOp::single(group_by, aggregates, output_columns)
+    }
+
+    fn staged_agg(
+        memo: &mut Memo,
+        stage: AggStage,
+        group_by: Vec<TypedExpr>,
+        aggregates: Vec<AggregateCall>,
+        output_columns: Vec<OutputColumn>,
+        is_merge: Vec<bool>,
+        is_split: bool,
+    ) -> LogicalAggregateOp {
+        let group_by = intern_exprs(&mut memo.scalars, &group_by);
+        let aggregates = intern_aggregate_calls(&mut memo.scalars, &aggregates);
+        LogicalAggregateOp::staged(
+            stage,
+            group_by,
+            aggregates,
+            output_columns,
+            is_merge,
+            is_split,
+        )
+    }
+
     fn values_group(memo: &mut Memo) -> usize {
         let id = memo.next_expr_id();
         memo.new_group(MExpr {
@@ -2178,7 +2229,8 @@ mod two_phase_agg_tests {
         let child_group = values_group(&mut memo);
         let expr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+            op: Operator::LogicalAggregate(single_agg(
+                &mut memo,
                 vec![col("k")],
                 vec![count_call("v", false)],
                 vec![output_column(1, "k"), output_column(3, "count(v)")],
@@ -2202,7 +2254,8 @@ mod two_phase_agg_tests {
         let child_group = values_group(&mut memo);
         let local_expr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalAggregate(LogicalAggregateOp::staged(
+            op: Operator::LogicalAggregate(staged_agg(
+                &mut memo,
                 AggStage::Local,
                 vec![col("k")],
                 vec![count_call("v", false)],
@@ -2224,7 +2277,8 @@ mod two_phase_agg_tests {
         let local_group = values_group(&mut memo);
         let global_expr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalAggregate(LogicalAggregateOp::staged(
+            op: Operator::LogicalAggregate(staged_agg(
+                &mut memo,
                 AggStage::Global,
                 vec![col("k")],
                 vec![count_call("v", false)],
@@ -2251,7 +2305,8 @@ mod two_phase_agg_tests {
 
         let expr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+            op: Operator::LogicalAggregate(single_agg(
+                &mut memo,
                 vec![col("city")],
                 vec![AggregateCall {
                     name: "count".into(),

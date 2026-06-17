@@ -122,6 +122,7 @@ pub(crate) fn extract_best(
             output_property: inner_output_property.clone(),
             child_output_properties: winner.child_outputs.clone(),
             join_distribution,
+            scalar_arena: None,
         },
         build_runtime_filters: Vec::new(),
         probe_runtime_filters: Vec::new(),
@@ -157,6 +158,7 @@ pub(crate) fn extract_best(
                 output_property: required.clone(),
                 child_output_properties: vec![inner_output_property],
                 join_distribution: None,
+                scalar_arena: None,
             },
             build_runtime_filters: Vec::new(),
             probe_runtime_filters: Vec::new(),
@@ -197,7 +199,7 @@ fn ordering_spec_to_sort_keys(arena: &mut ScalarArena, ordering: &OrderingSpec) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::JoinKind;
+    use crate::sql::analysis::{ExprKind, JoinKind, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::derive::PropertyAlternativeKind;
     use crate::sql::optimizer::memo::{MExpr, Memo};
@@ -206,6 +208,7 @@ mod tests {
         PhysicalLimitOp, PhysicalScanOp, PhysicalValuesOp,
     };
     use crate::sql::optimizer::property::DistributionSpec;
+    use crate::sql::optimizer::scalar::intern_typed;
     use crate::sql::optimizer::search::{EnforcerInfo, Winner};
 
     fn test_col(id: u32) -> TypedExpr {
@@ -249,6 +252,13 @@ mod tests {
         PhysicalPropertySet,
     ) {
         let mut memo = Memo::new();
+        let left_key = intern_typed(&mut memo.scalars, &test_col(10));
+        let right_key = intern_typed(&mut memo.scalars, &test_col(20));
+        let eq_condition = PhysicalHashJoinEqCondition {
+            left: left_key,
+            right: right_key,
+            null_safe: false,
+        };
         let left = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::PhysicalValues(PhysicalValuesOp {
@@ -269,11 +279,7 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
-                eq_conditions: vec![PhysicalHashJoinEqCondition {
-                    left: test_col(10),
-                    right: test_col(20),
-                    null_safe: false,
-                }],
+                eq_conditions: vec![eq_condition],
                 other_condition: None,
                 distribution: JoinDistribution::Unknown,
             }),
@@ -412,6 +418,13 @@ mod tests {
         PhysicalPropertySet,
     ) {
         let mut memo = Memo::new();
+        let left_key = intern_typed(&mut memo.scalars, &test_col(10));
+        let right_key = intern_typed(&mut memo.scalars, &test_col(20));
+        let eq_condition = PhysicalHashJoinEqCondition {
+            left: left_key,
+            right: right_key,
+            null_safe: false,
+        };
         let left = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::PhysicalValues(PhysicalValuesOp {
@@ -432,11 +445,7 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
-                eq_conditions: vec![PhysicalHashJoinEqCondition {
-                    left: test_col(10),
-                    right: test_col(20),
-                    null_safe: false,
-                }],
+                eq_conditions: vec![eq_condition],
                 other_condition: None,
                 distribution: JoinDistribution::Colocate,
             }),
@@ -479,10 +488,10 @@ mod tests {
 
     #[test]
     fn extract_uses_winner_child_props_instead_of_rederiving() {
-        let (memo, root, winners, required) =
+        let (mut memo, root, winners, required) =
             make_hash_join_winner_with_shuffle_child_props_for_test();
 
-        let plan = extract_best(&memo, root, &required, &winners).expect("extract");
+        let plan = extract_best(&mut memo, root, &required, &winners).expect("extract");
         let winner = winners
             .get(&(root, required.clone()))
             .expect("fixture should record root winner");
@@ -501,10 +510,10 @@ mod tests {
 
     #[test]
     fn extract_preserves_pre_enforcer_execution_output_property() {
-        let (memo, root, winners, required, pre_enforcer_output) =
+        let (mut memo, root, winners, required, pre_enforcer_output) =
             make_enforced_limit_winner_for_test();
 
-        let plan = extract_best(&memo, root, &required, &winners).expect("extract");
+        let plan = extract_best(&mut memo, root, &required, &winners).expect("extract");
 
         assert_eq!(plan.execution_props.output_property, required);
         assert_eq!(
@@ -519,9 +528,9 @@ mod tests {
 
     #[test]
     fn extract_keeps_colocate_hash_join_distribution_when_default_metadata() {
-        let (memo, root, winners, required) = make_colocate_hash_join_winner_for_test();
+        let (mut memo, root, winners, required) = make_colocate_hash_join_winner_for_test();
 
-        let plan = extract_best(&memo, root, &required, &winners).expect("extract");
+        let plan = extract_best(&mut memo, root, &required, &winners).expect("extract");
 
         let Operator::PhysicalHashJoin(join) = &plan.op else {
             panic!("expected hash join");
@@ -576,7 +585,7 @@ mod tests {
             },
         );
 
-        let err = extract_best(&memo, root, &required, &winners)
+        let err = extract_best(&mut memo, root, &required, &winners)
             .expect_err("extract should reject missing child properties");
         assert!(
             err.contains("child_props") && err.contains("expected 1") && err.contains("got 0"),

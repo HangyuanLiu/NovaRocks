@@ -104,6 +104,14 @@ mod tests {
     use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::property::HashSource;
+    use crate::sql::optimizer::scalar::intern_typed;
+
+    fn intern_group_by(scalars: &mut ScalarArena, exprs: Vec<TypedExpr>) -> Vec<ScalarId> {
+        exprs
+            .iter()
+            .map(|expr| intern_typed(scalars, expr))
+            .collect()
+    }
 
     #[test]
     fn single_grouped_aggregate_gathers_input_and_output() {
@@ -116,9 +124,10 @@ mod tests {
             data_type: arrow::datatypes::DataType::Utf8,
             nullable: false,
         };
+        let mut scalars = ScalarArena::new();
         let op = PhysicalHashAggregateOp {
             mode: AggMode::Single,
-            group_by: vec![col_ref],
+            group_by: intern_group_by(&mut scalars, vec![col_ref]),
             aggregates: vec![],
             output_columns: vec![OutputColumn {
                 column_id: ColumnId(3),
@@ -129,10 +138,10 @@ mod tests {
             }],
             is_merge: vec![],
         };
-        let props = op.derive_output(&[]);
+        let props = op.derive_output(&scalars, &[]);
         assert_eq!(props.distribution, DistributionSpec::Gather);
 
-        let reqs = op.derive_required(&PhysicalPropertySet::any(), 1);
+        let reqs = op.derive_required(&scalars, &PhysicalPropertySet::any(), 1);
         assert_eq!(reqs.len(), 1);
         assert_eq!(reqs[0].distribution, DistributionSpec::Gather);
     }
@@ -148,9 +157,10 @@ mod tests {
             data_type: arrow::datatypes::DataType::Utf8,
             nullable: false,
         };
+        let mut scalars = ScalarArena::new();
         let op = PhysicalHashAggregateOp {
             mode: AggMode::Global,
-            group_by: vec![col_ref],
+            group_by: intern_group_by(&mut scalars, vec![col_ref]),
             aggregates: vec![],
             output_columns: vec![OutputColumn {
                 column_id: ColumnId(3),
@@ -161,7 +171,7 @@ mod tests {
             }],
             is_merge: vec![],
         };
-        let props = op.derive_output(&[]);
+        let props = op.derive_output(&scalars, &[]);
         match &props.distribution {
             DistributionSpec::HashPartitioned { cols, source } => {
                 assert_eq!(*source, HashSource::ShuffleAgg);
@@ -191,14 +201,15 @@ mod tests {
             data_type: arrow::datatypes::DataType::Int64,
             nullable: false,
         };
+        let mut scalars = ScalarArena::new();
         let op = PhysicalHashAggregateOp {
             mode: AggMode::DistinctGlobal,
-            group_by: vec![col_g, col_x],
+            group_by: intern_group_by(&mut scalars, vec![col_g, col_x]),
             aggregates: vec![],
             output_columns: vec![],
             is_merge: vec![],
         };
-        let reqs = op.derive_required(&PhysicalPropertySet::any(), 1);
+        let reqs = op.derive_required(&scalars, &PhysicalPropertySet::any(), 1);
         assert_eq!(reqs.len(), 1);
         match &reqs[0].distribution {
             DistributionSpec::HashPartitioned { cols, source } => {
@@ -218,7 +229,8 @@ mod tests {
             output_columns: vec![],
             is_merge: vec![],
         };
-        let reqs = op.derive_required(&PhysicalPropertySet::gather(), 1);
+        let scalars = ScalarArena::new();
+        let reqs = op.derive_required(&scalars, &PhysicalPropertySet::gather(), 1);
         assert_eq!(reqs.len(), 1);
         assert!(matches!(reqs[0].distribution, DistributionSpec::Any));
     }
@@ -232,7 +244,8 @@ mod tests {
             output_columns: vec![],
             is_merge: vec![],
         };
-        let props = op.derive_output(&[]);
+        let scalars = ScalarArena::new();
+        let props = op.derive_output(&scalars, &[]);
         assert!(matches!(props.distribution, DistributionSpec::Any));
     }
 
@@ -247,10 +260,11 @@ mod tests {
             data_type: arrow::datatypes::DataType::Int64,
             nullable: false,
         };
+        let mut scalars = ScalarArena::new();
         for mode in [AggMode::Local, AggMode::DistinctLocal] {
             let op = PhysicalHashAggregateOp {
                 mode,
-                group_by: vec![col_ref.clone()],
+                group_by: intern_group_by(&mut scalars, vec![col_ref.clone()]),
                 aggregates: vec![],
                 output_columns: vec![OutputColumn {
                     column_id: ColumnId(7),
@@ -262,7 +276,7 @@ mod tests {
                 is_merge: vec![],
             };
 
-            let props = op.derive_output(&[]);
+            let props = op.derive_output(&scalars, &[]);
             assert!(matches!(props.distribution, DistributionSpec::Any));
         }
     }
@@ -276,10 +290,11 @@ mod tests {
             output_columns: vec![],
             is_merge: vec![],
         };
-        let out = op.derive_output(&[]);
+        let scalars = ScalarArena::new();
+        let out = op.derive_output(&scalars, &[]);
         assert!(matches!(out.distribution, DistributionSpec::Gather));
 
-        let reqs = op.derive_required(&PhysicalPropertySet::any(), 1);
+        let reqs = op.derive_required(&scalars, &PhysicalPropertySet::any(), 1);
         assert_eq!(reqs.len(), 1);
         assert!(matches!(reqs[0].distribution, DistributionSpec::Gather));
     }
@@ -293,10 +308,11 @@ mod tests {
             output_columns: vec![],
             is_merge: vec![],
         };
-        let out = op.derive_output(&[]);
+        let scalars = ScalarArena::new();
+        let out = op.derive_output(&scalars, &[]);
         assert!(matches!(out.distribution, DistributionSpec::Gather));
 
-        let reqs = op.derive_required(&PhysicalPropertySet::any(), 1);
+        let reqs = op.derive_required(&scalars, &PhysicalPropertySet::any(), 1);
         assert_eq!(reqs.len(), 1);
         assert!(matches!(reqs[0].distribution, DistributionSpec::Gather));
     }

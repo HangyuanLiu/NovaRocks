@@ -1838,6 +1838,10 @@ mod tests {
     };
     use crate::sql::optimizer::convert::logical_plan_to_memo;
     use crate::sql::optimizer::memo::Memo;
+    use crate::sql::optimizer::scalar::intern_typed;
+    use crate::sql::optimizer::scalar_bridge::{
+        intern_aggregate_calls, intern_exprs, intern_window_exprs,
+    };
     use crate::sql::planner::plan::*;
     use crate::sql::planner::plan::*;
     use arrow::datatypes::DataType;
@@ -2099,7 +2103,8 @@ mod tests {
         let LogicalPlanNodeKind::Scan(scan) = scan_plan.kind else {
             unreachable!("scan_plan_with_predicates always returns a Scan");
         };
-        let memo = Memo::new();
+        let mut memo = Memo::new();
+        let predicates = intern_exprs(&mut memo.scalars, &scan.predicates);
         let expr = MExpr {
             id: memo.next_expr_id(),
             op: Operator::PhysicalScan(PhysicalScanOp {
@@ -2107,7 +2112,7 @@ mod tests {
                 table: scan.table,
                 alias: scan.alias,
                 columns: scan.columns,
-                predicates: scan.predicates,
+                predicates,
                 required_columns: scan.required_columns,
                 dict_columns: scan.dict_columns,
                 variant_columns: scan.variant_columns,
@@ -2224,18 +2229,20 @@ mod tests {
         memo.groups[child_group].logical_props = Some(child_props);
 
         fn aggregate_expr(
-            memo: &Memo,
+            memo: &mut Memo,
             child_group: usize,
             stage: AggStage,
             is_merge: Vec<bool>,
             is_split: bool,
         ) -> MExpr {
+            let group_by = intern_exprs(&mut memo.scalars, &[col_ref(1, "k")]);
+            let aggregates = intern_aggregate_calls(&mut memo.scalars, &[count_call()]);
             MExpr {
                 id: memo.next_expr_id(),
                 op: Operator::LogicalAggregate(LogicalAggregateOp::staged(
                     stage,
-                    vec![col_ref(1, "k")],
-                    vec![count_call()],
+                    group_by,
+                    aggregates,
                     vec![output_column(1, "k"), output_column(3, "count(v)")],
                     is_merge,
                     is_split,
@@ -2247,16 +2254,16 @@ mod tests {
         let single = MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalAggregate(LogicalAggregateOp::single(
-                vec![col_ref(1, "k")],
-                vec![count_call()],
+                intern_exprs(&mut memo.scalars, &[col_ref(1, "k")]),
+                intern_aggregate_calls(&mut memo.scalars, &[count_call()]),
                 vec![output_column(1, "k"), output_column(3, "count(v)")],
             )),
             children: vec![child_group],
         };
-        let local = aggregate_expr(&memo, child_group, AggStage::Local, vec![false], true);
-        let global = aggregate_expr(&memo, child_group, AggStage::Global, vec![true], true);
+        let local = aggregate_expr(&mut memo, child_group, AggStage::Local, vec![false], true);
+        let global = aggregate_expr(&mut memo, child_group, AggStage::Global, vec![true], true);
         let global_without_split =
-            aggregate_expr(&memo, child_group, AggStage::Global, vec![true], false);
+            aggregate_expr(&mut memo, child_group, AggStage::Global, vec![true], false);
 
         let table_stats = HashMap::new();
         let single_stats = derive_statistics(&single, &memo, &table_stats);
@@ -2613,6 +2620,10 @@ mod tests {
         vec![col_ref("k1"), col_ref("k2"), col_ref("k3")]
     }
 
+    fn aggregate_group_key_ids(memo: &mut Memo) -> Vec<ScalarId> {
+        intern_exprs(&mut memo.scalars, &aggregate_group_keys())
+    }
+
     fn aggregate_output_columns() -> Vec<OutputColumn> {
         vec![
             stats_output_column(1, "k1"),
@@ -2636,7 +2647,7 @@ mod tests {
         let exact_agg = MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalAggregate(LogicalAggregateOp::single(
-                aggregate_group_keys(),
+                aggregate_group_key_ids(&mut memo),
                 vec![],
                 aggregate_output_columns(),
             )),
@@ -2645,7 +2656,7 @@ mod tests {
         let fallback_agg = MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalAggregate(LogicalAggregateOp::single(
-                aggregate_group_keys(),
+                aggregate_group_key_ids(&mut memo),
                 vec![],
                 aggregate_output_columns(),
             )),
@@ -2677,7 +2688,7 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
                 mode: AggMode::Single,
-                group_by: aggregate_group_keys(),
+                group_by: aggregate_group_key_ids(&mut memo),
                 aggregates: vec![],
                 output_columns: aggregate_output_columns(),
                 is_merge: vec![],
@@ -2688,7 +2699,7 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
                 mode: AggMode::Single,
-                group_by: aggregate_group_keys(),
+                group_by: aggregate_group_key_ids(&mut memo),
                 aggregates: vec![],
                 output_columns: aggregate_output_columns(),
                 is_merge: vec![],
@@ -2718,7 +2729,7 @@ mod tests {
         let logical = MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalAggregate(LogicalAggregateOp::single(
-                aggregate_group_keys(),
+                aggregate_group_key_ids(&mut memo),
                 vec![],
                 aggregate_output_columns(),
             )),
@@ -2728,7 +2739,7 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
                 mode: AggMode::Single,
-                group_by: aggregate_group_keys(),
+                group_by: aggregate_group_key_ids(&mut memo),
                 aggregates: vec![],
                 output_columns: aggregate_output_columns(),
                 is_merge: vec![],
@@ -2905,7 +2916,10 @@ mod tests {
         let filter = MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalFilter(LogicalFilterOp {
-                predicate: eq_expr(col_ref("filter_col"), int_lit(1)),
+                predicate: intern_typed(
+                    &mut memo.scalars,
+                    &eq_expr(col_ref("filter_col"), int_lit(1)),
+                ),
             }),
             children: vec![child],
         };
@@ -2922,7 +2936,10 @@ mod tests {
         let filter = MExpr {
             id: memo.next_expr_id(),
             op: Operator::PhysicalFilter(PhysicalFilterOp {
-                predicate: eq_expr(col_ref("filter_col"), int_lit(1)),
+                predicate: intern_typed(
+                    &mut memo.scalars,
+                    &eq_expr(col_ref("filter_col"), int_lit(1)),
+                ),
             }),
             children: vec![child],
         };
@@ -3025,13 +3042,13 @@ mod tests {
                 join_type: JoinKind::Inner,
                 eq_conditions: vec![
                     PhysicalHashJoinEqCondition {
-                        left: col_ref("l_k1"),
-                        right: col_ref("r_k1"),
+                        left: intern_typed(&mut memo.scalars, &col_ref("l_k1")),
+                        right: intern_typed(&mut memo.scalars, &col_ref("r_k1")),
                         null_safe: false,
                     },
                     PhysicalHashJoinEqCondition {
-                        left: col_ref("l_k2"),
-                        right: col_ref("r_k2"),
+                        left: intern_typed(&mut memo.scalars, &col_ref("l_k2")),
+                        right: intern_typed(&mut memo.scalars, &col_ref("r_k2")),
                         null_safe: false,
                     },
                 ],
@@ -3104,8 +3121,8 @@ mod tests {
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
                 eq_conditions: vec![PhysicalHashJoinEqCondition {
-                    left: col_ref("l_key"),
-                    right: col_ref("r_key"),
+                    left: intern_typed(&mut memo.scalars, &col_ref("l_key")),
+                    right: intern_typed(&mut memo.scalars, &col_ref("r_key")),
                     null_safe: false,
                 }],
                 other_condition: None,
@@ -3179,7 +3196,10 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
-                condition: Some(eq_expr(col_ref("l_key"), col_ref("r_key"))),
+                condition: Some(intern_typed(
+                    &mut memo.scalars,
+                    &eq_expr(col_ref("l_key"), col_ref("r_key")),
+                )),
             }),
             children: vec![left, right],
         };
@@ -3247,7 +3267,10 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
-                condition: Some(eq_expr(col_ref("l_key"), col_ref("r_key"))),
+                condition: Some(intern_typed(
+                    &mut memo.scalars,
+                    &eq_expr(col_ref("l_key"), col_ref("r_key")),
+                )),
             }),
             children: vec![left, right],
         };
@@ -3324,7 +3347,7 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
-                condition: Some(condition),
+                condition: Some(intern_typed(&mut memo.scalars, &condition)),
             }),
             children: vec![left, right],
         };
@@ -3377,7 +3400,10 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
-                condition: Some(eq_expr(col_ref("r_key"), col_ref("l_key"))),
+                condition: Some(intern_typed(
+                    &mut memo.scalars,
+                    &eq_expr(col_ref("r_key"), col_ref("l_key")),
+                )),
             }),
             children: vec![left, right],
         };
@@ -3441,7 +3467,7 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
-                condition: Some(condition),
+                condition: Some(intern_typed(&mut memo.scalars, &condition)),
             }),
             children: vec![left, right],
         };
@@ -3504,7 +3530,10 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
-                condition: Some(eq_expr(col_ref("l_key"), col_ref("r_key"))),
+                condition: Some(intern_typed(
+                    &mut memo.scalars,
+                    &eq_expr(col_ref("l_key"), col_ref("r_key")),
+                )),
             }),
             children: vec![left, right],
         };
@@ -3582,7 +3611,10 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
-                condition: Some(eq_expr(col_ref_with_id(left_id), col_ref_with_id(right_id))),
+                condition: Some(intern_typed(
+                    &mut memo.scalars,
+                    &eq_expr(col_ref_with_id(left_id), col_ref_with_id(right_id)),
+                )),
             }),
             children: vec![left, right],
         };
@@ -3644,7 +3676,10 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::PhysicalNestLoopJoin(PhysicalNestLoopJoinOp {
                 join_type: JoinKind::LeftSemi,
-                condition: Some(eq_expr(col_ref("l_filter"), int_lit(7))),
+                condition: Some(intern_typed(
+                    &mut memo.scalars,
+                    &eq_expr(col_ref("l_filter"), int_lit(7)),
+                )),
             }),
             children: vec![left, right],
         };
@@ -3705,7 +3740,10 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::PhysicalNestLoopJoin(PhysicalNestLoopJoinOp {
                 join_type: JoinKind::RightAnti,
-                condition: Some(eq_expr(col_ref("r_filter"), int_lit(7))),
+                condition: Some(intern_typed(
+                    &mut memo.scalars,
+                    &eq_expr(col_ref("r_filter"), int_lit(7)),
+                )),
             }),
             children: vec![left, right],
         };
@@ -3783,20 +3821,22 @@ mod tests {
 
         let mut memo = Memo::new();
         let child = child_group(&mut memo);
+        let logical_window_exprs = intern_window_exprs(&mut memo.scalars, &[window_expr("rn")]);
         let logical_window = MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalWindow(LogicalWindowOp {
-                window_exprs: vec![window_expr("rn")],
+                window_exprs: logical_window_exprs,
                 output_columns: vec![stats_output_column(1, "base"), stats_output_column(2, "rn")],
             }),
             children: vec![child],
         };
         assert_window_stats(derive_statistics(&logical_window, &memo, &HashMap::new()));
 
+        let physical_window_exprs = intern_window_exprs(&mut memo.scalars, &[window_expr("rn")]);
         let physical_window = MExpr {
             id: memo.next_expr_id(),
             op: Operator::PhysicalWindow(PhysicalWindowOp {
-                window_exprs: vec![window_expr("rn")],
+                window_exprs: physical_window_exprs,
                 output_columns: vec![stats_output_column(1, "base"), stats_output_column(2, "rn")],
             }),
             children: vec![child],
@@ -4111,8 +4151,8 @@ mod tests {
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
                 eq_conditions: vec![PhysicalHashJoinEqCondition {
-                    left: col_ref_id(701, "customer_id"),
-                    right: col_ref_id(801, "customer_id"),
+                    left: intern_typed(&mut memo.scalars, &col_ref_id(701, "customer_id")),
+                    right: intern_typed(&mut memo.scalars, &col_ref_id(801, "customer_id")),
                     null_safe: false,
                 }],
                 other_condition: None,
@@ -4306,11 +4346,16 @@ mod tests {
         use crate::sql::optimizer::operator::{LogicalValuesOp, Operator};
 
         let col = ColumnId::new_for_test(7);
-        let memo = Memo::new();
+        let mut memo = Memo::new();
+        let rows = vec![
+            intern_exprs(&mut memo.scalars, &[int_lit(1)]),
+            intern_exprs(&mut memo.scalars, &[int_lit(2)]),
+            intern_exprs(&mut memo.scalars, &[int_lit(3)]),
+        ];
         let expr = MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalValues(LogicalValuesOp {
-                rows: vec![vec![int_lit(1)], vec![int_lit(2)], vec![int_lit(3)]],
+                rows,
                 columns: vec![stats_output_column(7, "v")],
             }),
             children: vec![],

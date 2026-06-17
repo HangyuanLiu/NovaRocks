@@ -31,6 +31,7 @@ pub(crate) use property::{DistributionSpec, OrderingSpec, PhysicalPropertySet};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::sql::column_id::ColumnRefFactory;
@@ -208,6 +209,7 @@ fn optimize_with_root_property(
 
     // 12. Annotate physical plan with runtime filter descriptors.
     runtime_filter_pass::annotate(&mut physical, &memo.scalars, &options);
+    physical_plan::attach_scalar_arena(&mut physical, Arc::new(memo.scalars.clone()));
 
     Ok(physical)
 }

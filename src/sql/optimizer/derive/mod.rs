@@ -277,14 +277,15 @@ mod tests {
 
     #[test]
     fn default_required_alternative_wraps_legacy_deriver() {
+        let scalars = ScalarArena::new();
         let op = Operator::PhysicalLimit(PhysicalLimitOp {
             limit: Some(10),
             offset: None,
         });
         let parent = PhysicalPropertySet::gather();
 
-        let legacy = derive_required(&op, &parent, 1);
-        let alternatives = derive_required_alternatives(&op, &parent, 1);
+        let legacy = derive_required(&op, &scalars, &parent, 1);
+        let alternatives = derive_required_alternatives(&op, &scalars, &parent, 1);
 
         assert_eq!(alternatives.len(), 1);
         assert_eq!(alternatives[0].kind, PropertyAlternativeKind::Default);

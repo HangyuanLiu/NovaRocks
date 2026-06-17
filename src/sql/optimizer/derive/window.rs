@@ -97,9 +97,10 @@ fn common_window_partition_cols(window_exprs: &[WindowExpr]) -> Option<Vec<Colum
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::{ExprKind, SortItem, TypedExpr};
+    use crate::sql::analysis::{ExprKind, OutputColumn, SortItem, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::property::{HashSource, OrderingSpec};
+    use crate::sql::optimizer::scalar_bridge::intern_window_exprs;
     use crate::sql::planner::plan::WindowExpr;
 
     fn test_col(column_id: ColumnId, name: &str) -> TypedExpr {
@@ -129,6 +130,25 @@ mod tests {
         }
     }
 
+    fn window_op(scalars: &mut ScalarArena, exprs: Vec<WindowExpr>) -> PhysicalWindowOp {
+        let output_columns = exprs
+            .iter()
+            .enumerate()
+            .map(|(idx, expr)| OutputColumn {
+                column_id: ColumnId(1000 + idx as u32),
+                name: expr.output_name.clone(),
+                data_type: expr.result_type.clone(),
+                nullable: true,
+                is_internal: false,
+            })
+            .collect::<Vec<_>>();
+        let window_exprs = intern_window_exprs(scalars, &exprs);
+        PhysicalWindowOp {
+            window_exprs,
+            output_columns,
+        }
+    }
+
     #[test]
     fn output_properties_window_propagates_partition_distribution() {
         let col_c0 = TypedExpr {
@@ -152,11 +172,9 @@ mod tests {
             output_column_id: ColumnId::UNSET,
             result_type: arrow::datatypes::DataType::Int64,
         };
-        let op = PhysicalWindowOp {
-            window_exprs: vec![window_expr],
-            output_columns: vec![],
-        };
-        let props = op.derive_output(&[]);
+        let mut scalars = ScalarArena::new();
+        let op = window_op(&mut scalars, vec![window_expr]);
+        let props = op.derive_output(&scalars, &[]);
         match &props.distribution {
             DistributionSpec::HashPartitioned { cols, source } => {
                 assert_eq!(*source, HashSource::ShuffleAgg);
@@ -180,25 +198,24 @@ mod tests {
             output_column_id: ColumnId::UNSET,
             result_type: arrow::datatypes::DataType::Int64,
         };
-        let op = PhysicalWindowOp {
-            window_exprs: vec![window_expr],
-            output_columns: vec![],
-        };
-        let props = op.derive_output(&[]);
+        let mut scalars = ScalarArena::new();
+        let op = window_op(&mut scalars, vec![window_expr]);
+        let props = op.derive_output(&scalars, &[]);
         assert_eq!(props.distribution, DistributionSpec::Gather);
     }
 
     #[test]
     fn required_properties_disjoint_partition_windows_gather() {
-        let op = PhysicalWindowOp {
-            window_exprs: vec![
+        let mut scalars = ScalarArena::new();
+        let op = window_op(
+            &mut scalars,
+            vec![
                 test_window("by_a", vec![test_col(ColumnId(1), "a")]),
                 test_window("by_b", vec![test_col(ColumnId(2), "b")]),
             ],
-            output_columns: vec![],
-        };
+        );
 
-        let reqs = op.derive_required(&PhysicalPropertySet::any(), 1);
+        let reqs = op.derive_required(&scalars, &PhysicalPropertySet::any(), 1);
 
         assert_eq!(reqs.len(), 1);
         assert_eq!(reqs[0].distribution, DistributionSpec::Gather);
@@ -206,33 +223,35 @@ mod tests {
 
     #[test]
     fn output_properties_disjoint_partition_windows_gather() {
-        let op = PhysicalWindowOp {
-            window_exprs: vec![
+        let mut scalars = ScalarArena::new();
+        let op = window_op(
+            &mut scalars,
+            vec![
                 test_window("by_a", vec![test_col(ColumnId(1), "a")]),
                 test_window("by_b", vec![test_col(ColumnId(2), "b")]),
             ],
-            output_columns: vec![],
-        };
+        );
 
-        let props = op.derive_output(&[]);
+        let props = op.derive_output(&scalars, &[]);
 
         assert_eq!(props.distribution, DistributionSpec::Gather);
     }
 
     #[test]
     fn required_properties_nested_partition_windows_use_common_subset() {
-        let op = PhysicalWindowOp {
-            window_exprs: vec![
+        let mut scalars = ScalarArena::new();
+        let op = window_op(
+            &mut scalars,
+            vec![
                 test_window("by_a", vec![test_col(ColumnId(1), "a")]),
                 test_window(
                     "by_a_b",
                     vec![test_col(ColumnId(1), "a"), test_col(ColumnId(2), "b")],
                 ),
             ],
-            output_columns: vec![],
-        };
+        );
 
-        let reqs = op.derive_required(&PhysicalPropertySet::any(), 1);
+        let reqs = op.derive_required(&scalars, &PhysicalPropertySet::any(), 1);
 
         assert_eq!(reqs.len(), 1);
         match &reqs[0].distribution {
@@ -279,12 +298,10 @@ mod tests {
             output_column_id: ColumnId::UNSET,
             result_type: arrow::datatypes::DataType::Float64,
         };
-        let op = PhysicalWindowOp {
-            window_exprs: vec![partitioned, global],
-            output_columns: vec![],
-        };
+        let mut scalars = ScalarArena::new();
+        let op = window_op(&mut scalars, vec![partitioned, global]);
 
-        let reqs = op.derive_required(&PhysicalPropertySet::any(), 1);
+        let reqs = op.derive_required(&scalars, &PhysicalPropertySet::any(), 1);
 
         assert_eq!(reqs.len(), 1);
         assert_eq!(reqs[0].distribution, DistributionSpec::Gather);
@@ -325,12 +342,10 @@ mod tests {
             output_column_id: ColumnId::UNSET,
             result_type: arrow::datatypes::DataType::Float64,
         };
-        let op = PhysicalWindowOp {
-            window_exprs: vec![partitioned, global],
-            output_columns: vec![],
-        };
+        let mut scalars = ScalarArena::new();
+        let op = window_op(&mut scalars, vec![partitioned, global]);
 
-        let props = op.derive_output(&[]);
+        let props = op.derive_output(&scalars, &[]);
 
         assert_eq!(props.distribution, DistributionSpec::Gather);
     }
@@ -371,12 +386,10 @@ mod tests {
             output_column_id: ColumnId::UNSET,
             result_type: arrow::datatypes::DataType::Int64,
         };
-        let op = PhysicalWindowOp {
-            window_exprs: vec![window_expr],
-            output_columns: vec![],
-        };
+        let mut scalars = ScalarArena::new();
+        let op = window_op(&mut scalars, vec![window_expr]);
 
-        let reqs = op.derive_required(&PhysicalPropertySet::any(), 1);
+        let reqs = op.derive_required(&scalars, &PhysicalPropertySet::any(), 1);
 
         assert_eq!(reqs.len(), 1);
         match &reqs[0].ordering {

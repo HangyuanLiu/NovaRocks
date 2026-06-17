@@ -11,20 +11,26 @@ use crate::sql::optimizer::operator::{
 };
 use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
 use crate::sql::optimizer::property::{DistributionSpec, OrderingSpec, window_ordering_spec};
+use crate::sql::optimizer::scalar::{ScalarArena, materialize};
+use crate::sql::optimizer::scalar_bridge::{
+    materialize_aggregate_calls, materialize_exprs, materialize_project_items,
+    materialize_sort_keys, materialize_window_exprs,
+};
 
 use super::FragmentId;
 use super::fragment::{DataPartition, DataSink, DistributedPlan, PartitionKind, PlanFragment};
 use super::kind::{
     DistributedAssertOneRowNode, DistributedDecodeNode, DistributedExchangeNode,
     DistributedFilterNode, DistributedGenerateSeriesNode, DistributedHashAggregateNode,
-    DistributedHashJoinNode, DistributedNestLoopJoinNode, DistributedProjectNode,
-    DistributedRepeatNode, DistributedScanNode, DistributedSetOpNode, DistributedSortNode,
-    DistributedTableFunctionNode, DistributedTopNNode, DistributedValuesNode,
+    DistributedHashJoinEqCondition, DistributedHashJoinNode, DistributedNestLoopJoinNode,
+    DistributedProjectNode, DistributedRepeatNode, DistributedScanNode, DistributedSetOpNode,
+    DistributedSortNode, DistributedTableFunctionNode, DistributedTopNNode, DistributedValuesNode,
     DistributedWindowNode, ExchangeFlavor, SetOpKind,
 };
 use super::node::{DistributedPlanNode, DistributedPlanNodeKind, PlanNodeStats};
 
-struct DistributedPlanBuilder {
+struct DistributedPlanBuilder<'a> {
+    scalars: &'a ScalarArena,
     next_node_id: i32,
     next_tuple_id: i32,
     next_fragment_id: FragmentId,
@@ -35,7 +41,7 @@ struct DistributedPlanBuilder {
     cte_fragments: HashMap<CteId, usize>,
 }
 
-impl DistributedPlanBuilder {
+impl<'a> DistributedPlanBuilder<'a> {
     fn alloc_node(&mut self) -> i32 {
         let node_id = self.next_node_id;
         self.next_node_id += 1;
@@ -83,7 +89,7 @@ impl DistributedPlanBuilder {
                         table: op.table.clone(),
                         alias: op.alias.clone(),
                         columns: op.columns.clone(),
-                        predicates: op.predicates.clone(),
+                        predicates: materialize_exprs(self.scalars, &op.predicates),
                         required_columns: op.required_columns.clone(),
                         dict_columns: op.dict_columns.clone(),
                         variant_columns: op.variant_columns.clone(),
@@ -94,7 +100,8 @@ impl DistributedPlanBuilder {
             Operator::PhysicalFilter(op) => {
                 let child_plan = expect_single_child(node, "PhysicalFilter")?;
                 let mut child = self.visit(child_plan)?;
-                if fold_filter_into_scan(&mut child, &op.predicate) {
+                let predicate = materialize(self.scalars, op.predicate);
+                if fold_filter_into_scan(&mut child, &predicate) {
                     child.stats = PlanNodeStats::from_statistics(&node.stats);
                     child
                         .probe_runtime_filters
@@ -113,9 +120,7 @@ impl DistributedPlanBuilder {
                         probe_runtime_filters: node.probe_runtime_filters.clone(),
                         children: vec![child],
                         stats: PlanNodeStats::from_statistics(&node.stats),
-                        kind: DistributedPlanNodeKind::Filter(DistributedFilterNode {
-                            predicate: op.predicate.clone(),
-                        }),
+                        kind: DistributedPlanNodeKind::Filter(DistributedFilterNode { predicate }),
                     })
                 }
             }
@@ -136,7 +141,7 @@ impl DistributedPlanBuilder {
                     children: vec![child],
                     stats: PlanNodeStats::from_statistics(&node.stats),
                     kind: DistributedPlanNodeKind::Project(DistributedProjectNode {
-                        items: op.items.clone(),
+                        items: materialize_project_items(self.scalars, &op.items),
                         output_qualifier: op.output_qualifier.clone(),
                     }),
                 })
@@ -157,8 +162,11 @@ impl DistributedPlanBuilder {
                     children: vec![child],
                     stats: PlanNodeStats::from_statistics(&node.stats),
                     kind: DistributedPlanNodeKind::Sort(DistributedSortNode {
-                        items: op.items.clone(),
-                        analytic_partition_exprs: op.analytic_partition_exprs.clone(),
+                        items: materialize_sort_keys(self.scalars, &op.items),
+                        analytic_partition_exprs: materialize_exprs(
+                            self.scalars,
+                            &op.analytic_partition_exprs,
+                        ),
                         output_columns: node.output_columns.clone(),
                         offset: None,
                         partition_limit: op.partition_limit,
@@ -213,7 +221,7 @@ impl DistributedPlanBuilder {
                             children: vec![child],
                             stats: PlanNodeStats::from_statistics(&node.stats),
                             kind: DistributedPlanNodeKind::TopN(DistributedTopNNode {
-                                items: op.items.clone(),
+                                items: materialize_sort_keys(self.scalars, &op.items),
                                 limit: op.limit,
                                 offset: op.offset,
                                 phase: op.phase,
@@ -242,8 +250,13 @@ impl DistributedPlanBuilder {
                     kind: DistributedPlanNodeKind::HashAggregate(Box::new(
                         DistributedHashAggregateNode {
                             mode: op.mode,
-                            group_by: op.group_by.clone(),
-                            aggregates: op.aggregates.clone(),
+                            group_by: materialize_exprs(self.scalars, &op.group_by),
+                            aggregates: materialize_aggregate_calls(
+                                self.scalars,
+                                &op.aggregates,
+                                op.group_by.len(),
+                                &op.output_columns,
+                            ),
                             is_merge: op.is_merge.clone(),
                             output_columns: op.output_columns.clone(),
                         },
@@ -280,8 +293,18 @@ impl DistributedPlanBuilder {
                     stats: PlanNodeStats::from_statistics(&node.stats),
                     kind: DistributedPlanNodeKind::HashJoin(Box::new(DistributedHashJoinNode {
                         join_type: op.join_type,
-                        eq_conditions: op.eq_conditions.clone(),
-                        other_condition: op.other_condition.clone(),
+                        eq_conditions: op
+                            .eq_conditions
+                            .iter()
+                            .map(|eq| DistributedHashJoinEqCondition {
+                                left: materialize(self.scalars, eq.left),
+                                right: materialize(self.scalars, eq.right),
+                                null_safe: eq.null_safe,
+                            })
+                            .collect(),
+                        other_condition: op
+                            .other_condition
+                            .map(|condition| materialize(self.scalars, condition)),
                         distribution: op.distribution.clone(),
                     })),
                 })
@@ -306,7 +329,9 @@ impl DistributedPlanBuilder {
                     stats: PlanNodeStats::from_statistics(&node.stats),
                     kind: DistributedPlanNodeKind::NestLoopJoin(DistributedNestLoopJoinNode {
                         join_type: op.join_type,
-                        condition: op.condition.clone(),
+                        condition: op
+                            .condition
+                            .map(|condition| materialize(self.scalars, condition)),
                     }),
                 })
             }
@@ -331,7 +356,11 @@ impl DistributedPlanBuilder {
                     children: vec![],
                     stats: PlanNodeStats::from_statistics(&node.stats),
                     kind: DistributedPlanNodeKind::Values(DistributedValuesNode {
-                        rows: op.rows.clone(),
+                        rows: op
+                            .rows
+                            .iter()
+                            .map(|row| materialize_exprs(self.scalars, row))
+                            .collect(),
                         columns: op.columns.clone(),
                     }),
                 })
@@ -415,7 +444,9 @@ impl DistributedPlanBuilder {
             Operator::PhysicalWindow(op) => {
                 let child_plan = expect_single_child(node, "PhysicalWindow")?;
                 let child = self.visit(child_plan)?;
-                let groups = group_win_exprs_by_sig(&op.window_exprs);
+                let window_exprs =
+                    materialize_window_exprs(self.scalars, &op.window_exprs, &op.output_columns);
+                let groups = group_win_exprs_by_sig(&window_exprs);
                 if groups.is_empty() {
                     return Err(
                         "build_distributed_plan M0: PhysicalWindow has no window expressions"
@@ -430,7 +461,7 @@ impl DistributedPlanBuilder {
                     let Some(first_idx) = group_indices.first().copied() else {
                         continue;
                     };
-                    let first_win = &op.window_exprs[first_idx];
+                    let first_win = &window_exprs[first_idx];
                     if groups.len() > 1 {
                         let required_ordering =
                             window_ordering_spec(&first_win.partition_by, &first_win.order_by);
@@ -469,7 +500,7 @@ impl DistributedPlanBuilder {
                     children: vec![child],
                     stats: PlanNodeStats::from_statistics(&node.stats),
                     kind: DistributedPlanNodeKind::Window(Box::new(DistributedWindowNode {
-                        window_exprs: op.window_exprs.clone(),
+                        window_exprs,
                         output_columns: op.output_columns.clone(),
                     })),
                 })
@@ -553,7 +584,7 @@ impl DistributedPlanBuilder {
                     kind: DistributedPlanNodeKind::TableFunction(Box::new(
                         DistributedTableFunctionNode {
                             function_name: op.function_name.clone(),
-                            args: op.args.clone(),
+                            args: materialize_exprs(self.scalars, &op.args),
                             output_columns: op.output_columns.clone(),
                             alias: op.alias.clone(),
                             is_left_join: op.is_left_join,
@@ -691,13 +722,14 @@ impl DistributedPlanBuilder {
             &child_plan.output_columns,
         )?;
         let partition_type = partition_type_for_data_partition(&output_partition);
+        let topn_items = materialize_sort_keys(self.scalars, &op.items);
         self.emit_fragment_exchange(
             node,
             child_plan,
             output_partition,
             FragmentStreamKind::Gather,
             ExchangeFlavor::TopNSplit {
-                items: op.items.clone(),
+                items: topn_items.clone(),
                 limit: op.limit,
                 offset: op.offset,
             },
@@ -710,7 +742,7 @@ impl DistributedPlanBuilder {
                 output_columns: Vec::new(),
                 output_qualifier: None,
                 flavor: ExchangeFlavor::TopNSplit {
-                    items: op.items.clone(),
+                    items: topn_items,
                     limit: op.limit,
                     offset: op.offset,
                 },
@@ -1185,7 +1217,24 @@ fn stream_kind_for_distribution(spec: &DistributionSpec) -> FragmentStreamKind {
 }
 
 pub(crate) fn build_distributed_plan(plan: &PhysicalPlanNode) -> Result<DistributedPlan, String> {
+    let plan = match &plan.op {
+        Operator::PhysicalDistribution(op) if matches!(op.spec, DistributionSpec::Gather) => plan
+            .children
+            .first()
+            .ok_or_else(|| "root PhysicalDistribution(Gather) missing child".to_string())?,
+        _ => plan,
+    };
+
+    let scalars = plan
+        .execution_props
+        .scalar_arena
+        .as_deref()
+        .ok_or_else(|| {
+            "PhysicalPlanNode missing scalar arena for distributed plan build".to_string()
+        })?;
+
     let mut builder = DistributedPlanBuilder {
+        scalars,
         next_node_id: 1,
         next_tuple_id: 1,
         next_fragment_id: 0,
@@ -1193,14 +1242,6 @@ pub(crate) fn build_distributed_plan(plan: &PhysicalPlanNode) -> Result<Distribu
         completed_fragments: Vec::new(),
         edges: Vec::new(),
         cte_fragments: HashMap::new(),
-    };
-
-    let plan = match &plan.op {
-        Operator::PhysicalDistribution(op) if matches!(op.spec, DistributionSpec::Gather) => plan
-            .children
-            .first()
-            .ok_or_else(|| "root PhysicalDistribution(Gather) missing child".to_string())?,
-        _ => plan,
     };
 
     let root_fragment_id = builder.alloc_fragment_id();
@@ -1248,6 +1289,8 @@ fn collect_cte_exchange_nodes_inner(node: &DistributedPlanNode, nodes: &mut Vec<
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use arrow::datatypes::DataType;
 
     use super::build_distributed_plan;
@@ -1261,7 +1304,13 @@ mod tests {
         Operator, PhysicalAssertOneRowOp, PhysicalFilterOp, PhysicalProjectOp, PhysicalScanOp,
         PhysicalSortOp, PhysicalWindowOp,
     };
-    use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, PlanExecutionProps};
+    use crate::sql::optimizer::physical_plan::{
+        PhysicalPlanNode, PlanExecutionProps, attach_scalar_arena,
+    };
+    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
+    use crate::sql::optimizer::scalar_bridge::{
+        intern_project_items, intern_sort_items, intern_window_exprs,
+    };
     use crate::sql::optimizer::statistics::{ColumnStatistic, Statistics};
     use crate::sql::planner::plan::WindowExpr;
 
@@ -1294,9 +1343,19 @@ mod tests {
             panic!("project child should be scan");
         };
         assert_eq!(scan.predicates.len(), 3);
-        assert_binary_predicate(&scan.predicates[0], "k", BinOp::Eq, 7);
-        assert_binary_predicate(&scan.predicates[1], "k", BinOp::Gt, 10);
-        assert_binary_predicate(&scan.predicates[2], "v", BinOp::Lt, 20);
+        assert_binary_predicate(&scan.predicates[0], ColumnId::new_for_test(1), BinOp::Eq, 7);
+        assert_binary_predicate(
+            &scan.predicates[1],
+            ColumnId::new_for_test(1),
+            BinOp::Gt,
+            10,
+        );
+        assert_binary_predicate(
+            &scan.predicates[2],
+            ColumnId::new_for_test(2),
+            BinOp::Lt,
+            20,
+        );
     }
 
     #[test]
@@ -1387,21 +1446,27 @@ mod tests {
     }
 
     fn sort_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
+        let mut scalars = scalars_from_children(std::slice::from_ref(&child));
         let output_columns = child.output_columns.clone();
-        physical_node(
+        let mut plan = physical_node(
             Operator::PhysicalSort(PhysicalSortOp {
-                items: vec![SortItem {
-                    expr: column_ref_expr(1, "k", DataType::Int64, false),
-                    asc: true,
-                    nulls_first: false,
-                }],
+                items: intern_sort_items(
+                    &mut scalars,
+                    &[SortItem {
+                        expr: column_ref_expr(1, "k", DataType::Int64, false),
+                        asc: true,
+                        nulls_first: false,
+                    }],
+                ),
                 analytic_partition_exprs: vec![],
                 partition_limit: None,
                 topn_type: None,
             }),
             vec![child],
             output_columns,
-        )
+        );
+        attach_scalar_arena(&mut plan, Arc::new(scalars));
+        plan
     }
 
     fn assert_one_row_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
@@ -1416,51 +1481,55 @@ mod tests {
     }
 
     fn multi_group_window_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
+        let mut scalars = scalars_from_children(std::slice::from_ref(&child));
         let k = output_col(1, "k", DataType::Int64, false);
         let v = output_col(2, "v", DataType::Int64, true);
         let rn_by_k = output_col(3, "rn_by_k", DataType::Int64, false);
         let rn_by_v = output_col(4, "rn_by_v", DataType::Int64, false);
-        physical_node(
+        let window_exprs = vec![
+            WindowExpr {
+                name: "row_number".to_string(),
+                args: vec![],
+                distinct: false,
+                partition_by: vec![],
+                order_by: vec![SortItem {
+                    expr: column_ref_expr(1, "k", DataType::Int64, false),
+                    asc: true,
+                    nulls_first: false,
+                }],
+                window_frame: None,
+                result_type: DataType::Int64,
+                output_name: rn_by_k.name.clone(),
+                output_column_id: rn_by_k.column_id,
+                ignore_nulls: false,
+            },
+            WindowExpr {
+                name: "row_number".to_string(),
+                args: vec![],
+                distinct: false,
+                partition_by: vec![],
+                order_by: vec![SortItem {
+                    expr: column_ref_expr(2, "v", DataType::Int64, true),
+                    asc: true,
+                    nulls_first: false,
+                }],
+                window_frame: None,
+                result_type: DataType::Int64,
+                output_name: rn_by_v.name.clone(),
+                output_column_id: rn_by_v.column_id,
+                ignore_nulls: false,
+            },
+        ];
+        let mut plan = physical_node(
             Operator::PhysicalWindow(PhysicalWindowOp {
-                window_exprs: vec![
-                    WindowExpr {
-                        name: "row_number".to_string(),
-                        args: vec![],
-                        distinct: false,
-                        partition_by: vec![],
-                        order_by: vec![SortItem {
-                            expr: column_ref_expr(1, "k", DataType::Int64, false),
-                            asc: true,
-                            nulls_first: false,
-                        }],
-                        window_frame: None,
-                        result_type: DataType::Int64,
-                        output_name: rn_by_k.name.clone(),
-                        output_column_id: rn_by_k.column_id,
-                        ignore_nulls: false,
-                    },
-                    WindowExpr {
-                        name: "row_number".to_string(),
-                        args: vec![],
-                        distinct: false,
-                        partition_by: vec![],
-                        order_by: vec![SortItem {
-                            expr: column_ref_expr(2, "v", DataType::Int64, true),
-                            asc: true,
-                            nulls_first: false,
-                        }],
-                        window_frame: None,
-                        result_type: DataType::Int64,
-                        output_name: rn_by_v.name.clone(),
-                        output_column_id: rn_by_v.column_id,
-                        ignore_nulls: false,
-                    },
-                ],
+                window_exprs: intern_window_exprs(&mut scalars, &window_exprs),
                 output_columns: vec![k.clone(), v.clone(), rn_by_k.clone(), rn_by_v.clone()],
             }),
             vec![child],
             vec![k, v, rn_by_k, rn_by_v],
-        )
+        );
+        attach_scalar_arena(&mut plan, Arc::new(scalars));
+        plan
     }
 
     fn scan_plan() -> PhysicalPlanNode {
@@ -1468,18 +1537,22 @@ mod tests {
     }
 
     fn scan_plan_with_row_count(row_count: f64) -> PhysicalPlanNode {
+        let mut scalars = ScalarArena::new();
         let k = output_col(1, "k", DataType::Int64, false);
         let v = output_col(2, "v", DataType::Int64, true);
-        physical_node_with_row_count(
+        let mut plan = physical_node_with_row_count(
             Operator::PhysicalScan(PhysicalScanOp {
                 database: "test_db".to_string(),
                 table: table_def(),
                 alias: Some("t".to_string()),
                 columns: vec![k.clone(), v.clone()],
-                predicates: vec![cmp_expr(
-                    column_ref_expr(1, "k", DataType::Int64, false),
-                    BinOp::Eq,
-                    int_lit(7),
+                predicates: vec![intern_typed(
+                    &mut scalars,
+                    &cmp_expr(
+                        column_ref_expr(1, "k", DataType::Int64, false),
+                        BinOp::Eq,
+                        int_lit(7),
+                    ),
                 )],
                 required_columns: None,
                 dict_columns: vec![],
@@ -1489,7 +1562,9 @@ mod tests {
             vec![],
             vec![k, v],
             row_count,
-        )
+        );
+        attach_scalar_arena(&mut plan, Arc::new(scalars));
+        plan
     }
 
     fn filter_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
@@ -1497,42 +1572,52 @@ mod tests {
     }
 
     fn filter_plan_with_row_count(child: PhysicalPlanNode, row_count: f64) -> PhysicalPlanNode {
+        let mut scalars = scalars_from_children(std::slice::from_ref(&child));
         let output_columns = child.output_columns.clone();
-        physical_node_with_row_count(
+        let mut plan = physical_node_with_row_count(
             Operator::PhysicalFilter(PhysicalFilterOp {
-                predicate: and_expr(
-                    cmp_expr(
-                        column_ref_expr(1, "k", DataType::Int64, false),
-                        BinOp::Gt,
-                        int_lit(10),
-                    ),
-                    cmp_expr(
-                        column_ref_expr(2, "v", DataType::Int64, true),
-                        BinOp::Lt,
-                        int_lit(20),
+                predicate: intern_typed(
+                    &mut scalars,
+                    &and_expr(
+                        cmp_expr(
+                            column_ref_expr(1, "k", DataType::Int64, false),
+                            BinOp::Gt,
+                            int_lit(10),
+                        ),
+                        cmp_expr(
+                            column_ref_expr(2, "v", DataType::Int64, true),
+                            BinOp::Lt,
+                            int_lit(20),
+                        ),
                     ),
                 ),
             }),
             vec![child],
             output_columns,
             row_count,
-        )
+        );
+        attach_scalar_arena(&mut plan, Arc::new(scalars));
+        plan
     }
 
     fn project_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
+        let mut scalars = scalars_from_children(std::slice::from_ref(&child));
         let output_columns = vec![output_col(1, "k", DataType::Int64, false)];
-        physical_node(
+        let items = vec![ProjectItem {
+            expr: column_ref_expr(1, "k", DataType::Int64, false),
+            output_name: "k".to_string(),
+            output_column_id: ColumnId::new_for_test(1),
+        }];
+        let mut plan = physical_node(
             Operator::PhysicalProject(PhysicalProjectOp {
-                items: vec![ProjectItem {
-                    expr: column_ref_expr(1, "k", DataType::Int64, false),
-                    output_name: "k".to_string(),
-                    output_column_id: ColumnId::new_for_test(1),
-                }],
+                items: intern_project_items(&mut scalars, &items),
                 output_qualifier: None,
             }),
             vec![child],
             output_columns,
-        )
+        );
+        attach_scalar_arena(&mut plan, Arc::new(scalars));
+        plan
     }
 
     fn physical_node(
@@ -1549,7 +1634,8 @@ mod tests {
         output_columns: Vec<OutputColumn>,
         row_count: f64,
     ) -> PhysicalPlanNode {
-        PhysicalPlanNode {
+        let scalars = scalars_from_children(&children);
+        let mut plan = PhysicalPlanNode {
             op,
             children,
             stats: stats(row_count),
@@ -1557,7 +1643,16 @@ mod tests {
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
-        }
+        };
+        attach_scalar_arena(&mut plan, Arc::new(scalars));
+        plan
+    }
+
+    fn scalars_from_children(children: &[PhysicalPlanNode]) -> ScalarArena {
+        children
+            .iter()
+            .find_map(|child| child.execution_props.scalar_arena.as_deref().cloned())
+            .unwrap_or_else(ScalarArena::new)
     }
 
     fn stats(row_count: f64) -> Statistics {
@@ -1646,7 +1741,7 @@ mod tests {
         }
     }
 
-    fn assert_binary_predicate(expr: &TypedExpr, column: &str, op: BinOp, value: i64) {
+    fn assert_binary_predicate(expr: &TypedExpr, column_id: ColumnId, op: BinOp, value: i64) {
         let ExprKind::BinaryOp {
             left,
             op: actual_op,
@@ -1657,13 +1752,13 @@ mod tests {
         };
         assert_eq!(*actual_op, op);
         let ExprKind::ColumnRef {
-            column: actual_column,
+            column_id: actual_column_id,
             ..
         } = &left.kind
         else {
             panic!("expected column ref left predicate, got {left:?}");
         };
-        assert_eq!(actual_column, column);
+        assert_eq!(*actual_column_id, column_id);
         let ExprKind::Literal(LiteralValue::Int(actual_value)) = &right.kind else {
             panic!("expected int literal right predicate, got {right:?}");
         };

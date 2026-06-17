@@ -115,17 +115,15 @@ pub(crate) fn materialize_aggregate_call(
     call: &ScalarAggregateSpec,
     output_column: Option<&OutputColumn>,
 ) -> AggregateCall {
+    let output_column =
+        output_column.expect("aggregate ScalarId bridge requires output column metadata");
     AggregateCall {
         name: call.name.clone(),
         args: materialize_exprs(arena, &call.args),
         distinct: call.distinct,
-        result_type: output_column
-            .map(|column| column.data_type.clone())
-            .unwrap_or(DataType::Null),
+        result_type: output_column.data_type.clone(),
         order_by: materialize_sort_keys(arena, &call.order_by),
-        output_column_id: output_column
-            .map(|column| column.column_id)
-            .unwrap_or(ColumnId::UNSET),
+        output_column_id: output_column.column_id,
     }
 }
 
@@ -135,6 +133,10 @@ pub(crate) fn materialize_aggregate_calls(
     group_by_len: usize,
     output_columns: &[OutputColumn],
 ) -> Vec<AggregateCall> {
+    assert!(
+        output_columns.len() >= group_by_len + calls.len(),
+        "aggregate output layout must be [group_by..., aggregates...]"
+    );
     calls
         .iter()
         .enumerate()
@@ -171,6 +173,8 @@ pub(crate) fn materialize_window_expr(
     expr: &ScalarWindowSpec,
     output_column: Option<&OutputColumn>,
 ) -> WindowExpr {
+    let output_column =
+        output_column.expect("window ScalarId bridge requires output column metadata");
     WindowExpr {
         name: expr.name.clone(),
         args: materialize_exprs(arena, &expr.args),
@@ -178,15 +182,9 @@ pub(crate) fn materialize_window_expr(
         partition_by: materialize_exprs(arena, &expr.partition_by),
         order_by: materialize_sort_keys(arena, &expr.order_by),
         window_frame: expr.window_frame.clone(),
-        result_type: output_column
-            .map(|column| column.data_type.clone())
-            .unwrap_or(DataType::Null),
-        output_name: output_column
-            .map(|column| column.name.clone())
-            .unwrap_or_default(),
-        output_column_id: output_column
-            .map(|column| column.column_id)
-            .unwrap_or(ColumnId::UNSET),
+        result_type: output_column.data_type.clone(),
+        output_name: output_column.name.clone(),
+        output_column_id: output_column.column_id,
         ignore_nulls: expr.ignore_nulls,
     }
 }
@@ -196,7 +194,11 @@ pub(crate) fn materialize_window_exprs(
     exprs: &[ScalarWindowSpec],
     output_columns: &[OutputColumn],
 ) -> Vec<WindowExpr> {
-    let window_output_start = output_columns.len().saturating_sub(exprs.len());
+    assert!(
+        output_columns.len() >= exprs.len(),
+        "window output layout must include window result columns"
+    );
+    let window_output_start = output_columns.len() - exprs.len();
     exprs
         .iter()
         .enumerate()

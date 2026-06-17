@@ -471,6 +471,8 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::derive::PropertyAlternativeKind;
     use crate::sql::optimizer::property::HashSource;
+    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
+    use std::ops::{Deref, DerefMut};
 
     fn col(id: u32) -> TypedExpr {
         col_with_type(id, arrow::datatypes::DataType::Int64)
@@ -508,17 +510,88 @@ mod tests {
         }
     }
 
-    fn broadcast_inner(eq_left: u32, eq_right: u32) -> PhysicalHashJoinOp {
-        PhysicalHashJoinOp {
-            join_type: JoinKind::Inner,
-            eq_conditions: vec![PhysicalHashJoinEqCondition {
-                left: col(eq_left),
-                right: col(eq_right),
-                null_safe: false,
-            }],
-            other_condition: None,
-            distribution: JoinDistribution::Broadcast,
+    struct TestHashJoinOp {
+        scalars: ScalarArena,
+        op: PhysicalHashJoinOp,
+    }
+
+    impl Deref for TestHashJoinOp {
+        type Target = PhysicalHashJoinOp;
+
+        fn deref(&self) -> &Self::Target {
+            &self.op
         }
+    }
+
+    impl DerefMut for TestHashJoinOp {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.op
+        }
+    }
+
+    impl TestHashJoinOp {
+        fn derive_output(&self, children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
+            self.op.derive_output(&self.scalars, children)
+        }
+
+        fn derive_required(
+            &self,
+            parent_required: &PhysicalPropertySet,
+            num_children: usize,
+        ) -> Vec<PhysicalPropertySet> {
+            self.op
+                .derive_required(&self.scalars, parent_required, num_children)
+        }
+
+        fn derive_required_alternatives(
+            &self,
+            parent_required: &PhysicalPropertySet,
+            num_children: usize,
+        ) -> Vec<ChildRequirementAlternative> {
+            self.op
+                .derive_required_alternatives(&self.scalars, parent_required, num_children)
+        }
+    }
+
+    fn eq(left: TypedExpr, right: TypedExpr) -> (TypedExpr, TypedExpr, bool) {
+        (left, right, false)
+    }
+
+    fn null_safe_eq(left: TypedExpr, right: TypedExpr) -> (TypedExpr, TypedExpr, bool) {
+        (left, right, true)
+    }
+
+    fn join_op(
+        join_type: JoinKind,
+        eq_conditions: Vec<(TypedExpr, TypedExpr, bool)>,
+        distribution: JoinDistribution,
+    ) -> TestHashJoinOp {
+        let mut scalars = ScalarArena::new();
+        let eq_conditions = eq_conditions
+            .into_iter()
+            .map(|(left, right, null_safe)| PhysicalHashJoinEqCondition {
+                left: intern_typed(&mut scalars, &left),
+                right: intern_typed(&mut scalars, &right),
+                null_safe,
+            })
+            .collect();
+        TestHashJoinOp {
+            scalars,
+            op: PhysicalHashJoinOp {
+                join_type,
+                eq_conditions,
+                other_condition: None,
+                distribution,
+            },
+        }
+    }
+
+    fn broadcast_inner(eq_left: u32, eq_right: u32) -> TestHashJoinOp {
+        join_op(
+            JoinKind::Inner,
+            vec![eq(col(eq_left), col(eq_right))],
+            JoinDistribution::Broadcast,
+        )
     }
 
     #[test]
@@ -552,16 +625,11 @@ mod tests {
 
     #[test]
     fn hash_join_unknown_distribution_enumerates_implementation_alternatives() {
-        let op = PhysicalHashJoinOp {
-            join_type: crate::sql::analysis::JoinKind::Inner,
-            eq_conditions: vec![PhysicalHashJoinEqCondition {
-                left: col(10),
-                right: col(20),
-                null_safe: false,
-            }],
-            other_condition: None,
-            distribution: JoinDistribution::Unknown,
-        };
+        let op = join_op(
+            JoinKind::Inner,
+            vec![eq(col(10), col(20))],
+            JoinDistribution::Unknown,
+        );
 
         let alternatives = op.derive_required_alternatives(&PhysicalPropertySet::any(), 2);
         assert_eq!(alternatives.len(), 2);
@@ -587,23 +655,11 @@ mod tests {
 
     #[test]
     fn hash_join_unknown_distribution_skips_shuffle_for_expression_keys() {
-        let op = PhysicalHashJoinOp {
-            join_type: crate::sql::analysis::JoinKind::Inner,
-            eq_conditions: vec![
-                PhysicalHashJoinEqCondition {
-                    left: col(10),
-                    right: col(20),
-                    null_safe: false,
-                },
-                PhysicalHashJoinEqCondition {
-                    left: nested_col(11),
-                    right: nested_col(21),
-                    null_safe: false,
-                },
-            ],
-            other_condition: None,
-            distribution: JoinDistribution::Unknown,
-        };
+        let op = join_op(
+            JoinKind::Inner,
+            vec![eq(col(10), col(20)), eq(nested_col(11), nested_col(21))],
+            JoinDistribution::Unknown,
+        );
 
         let alternatives = op.derive_required_alternatives(&PhysicalPropertySet::any(), 2);
         assert_eq!(alternatives.len(), 1);
@@ -612,23 +668,11 @@ mod tests {
 
     #[test]
     fn hash_join_unknown_distribution_skips_shuffle_for_null_safe_keys() {
-        let op = PhysicalHashJoinOp {
-            join_type: crate::sql::analysis::JoinKind::Inner,
-            eq_conditions: vec![
-                PhysicalHashJoinEqCondition {
-                    left: col(10),
-                    right: col(20),
-                    null_safe: true,
-                },
-                PhysicalHashJoinEqCondition {
-                    left: col(11),
-                    right: col(21),
-                    null_safe: false,
-                },
-            ],
-            other_condition: None,
-            distribution: JoinDistribution::Unknown,
-        };
+        let op = join_op(
+            JoinKind::Inner,
+            vec![null_safe_eq(col(10), col(20)), eq(col(11), col(21))],
+            JoinDistribution::Unknown,
+        );
 
         let alternatives = op.derive_required_alternatives(&PhysicalPropertySet::any(), 2);
         assert_eq!(alternatives.len(), 1);
@@ -637,16 +681,11 @@ mod tests {
 
     #[test]
     fn hash_join_unknown_right_outer_uses_shuffle_only() {
-        let op = PhysicalHashJoinOp {
-            join_type: crate::sql::analysis::JoinKind::RightOuter,
-            eq_conditions: vec![PhysicalHashJoinEqCondition {
-                left: col(10),
-                right: col(20),
-                null_safe: false,
-            }],
-            other_condition: None,
-            distribution: JoinDistribution::Unknown,
-        };
+        let op = join_op(
+            JoinKind::RightOuter,
+            vec![eq(col(10), col(20))],
+            JoinDistribution::Unknown,
+        );
 
         let alternatives = op.derive_required_alternatives(&PhysicalPropertySet::any(), 2);
         assert_eq!(alternatives.len(), 1);
@@ -663,16 +702,11 @@ mod tests {
 
     #[test]
     fn hash_join_legacy_concrete_distribution_limits_alternatives() {
-        let mut op = PhysicalHashJoinOp {
-            join_type: crate::sql::analysis::JoinKind::Inner,
-            eq_conditions: vec![PhysicalHashJoinEqCondition {
-                left: col(10),
-                right: col(20),
-                null_safe: false,
-            }],
-            other_condition: None,
-            distribution: JoinDistribution::Broadcast,
-        };
+        let mut op = join_op(
+            JoinKind::Inner,
+            vec![eq(col(10), col(20))],
+            JoinDistribution::Broadcast,
+        );
 
         let broadcast = op.derive_required_alternatives(&PhysicalPropertySet::any(), 2);
         assert_eq!(broadcast.len(), 1);
@@ -700,23 +734,11 @@ mod tests {
 
     #[test]
     fn hash_join_shuffle_alternative_aligns_with_parent_required_order() {
-        let op = PhysicalHashJoinOp {
-            join_type: crate::sql::analysis::JoinKind::Inner,
-            eq_conditions: vec![
-                PhysicalHashJoinEqCondition {
-                    left: col(10),
-                    right: col(20),
-                    null_safe: false,
-                },
-                PhysicalHashJoinEqCondition {
-                    left: col(11),
-                    right: col(21),
-                    null_safe: false,
-                },
-            ],
-            other_condition: None,
-            distribution: JoinDistribution::Unknown,
-        };
+        let op = join_op(
+            JoinKind::Inner,
+            vec![eq(col(10), col(20)), eq(col(11), col(21))],
+            JoinDistribution::Unknown,
+        );
         let parent = PhysicalPropertySet {
             distribution: DistributionSpec::shuffle_join([ColumnId(11), ColumnId(10)]),
             ordering: OrderingSpec::Any,
@@ -740,23 +762,11 @@ mod tests {
 
     #[test]
     fn hash_join_shuffle_alignment_rejects_duplicate_eq_pair_matches() {
-        let op = PhysicalHashJoinOp {
-            join_type: crate::sql::analysis::JoinKind::Inner,
-            eq_conditions: vec![
-                PhysicalHashJoinEqCondition {
-                    left: col(10),
-                    right: col(20),
-                    null_safe: false,
-                },
-                PhysicalHashJoinEqCondition {
-                    left: col(11),
-                    right: col(21),
-                    null_safe: false,
-                },
-            ],
-            other_condition: None,
-            distribution: JoinDistribution::Unknown,
-        };
+        let op = join_op(
+            JoinKind::Inner,
+            vec![eq(col(10), col(20)), eq(col(11), col(21))],
+            JoinDistribution::Unknown,
+        );
         let parent = PhysicalPropertySet {
             distribution: DistributionSpec::shuffle_join([ColumnId(10), ColumnId(20)]),
             ordering: OrderingSpec::Any,
@@ -779,23 +789,11 @@ mod tests {
 
     #[test]
     fn hash_join_shuffle_alignment_rejects_duplicate_single_side_keys() {
-        let op = PhysicalHashJoinOp {
-            join_type: crate::sql::analysis::JoinKind::Inner,
-            eq_conditions: vec![
-                PhysicalHashJoinEqCondition {
-                    left: col(10),
-                    right: col(20),
-                    null_safe: false,
-                },
-                PhysicalHashJoinEqCondition {
-                    left: col(10),
-                    right: col(21),
-                    null_safe: false,
-                },
-            ],
-            other_condition: None,
-            distribution: JoinDistribution::Unknown,
-        };
+        let op = join_op(
+            JoinKind::Inner,
+            vec![eq(col(10), col(20)), eq(col(10), col(21))],
+            JoinDistribution::Unknown,
+        );
         let parent = PhysicalPropertySet {
             distribution: DistributionSpec::shuffle_join([ColumnId(20), ColumnId(21)]),
             ordering: OrderingSpec::Any,
@@ -818,23 +816,11 @@ mod tests {
 
     #[test]
     fn hash_join_shuffle_alignment_rejects_mixed_side_parent_keys() {
-        let op = PhysicalHashJoinOp {
-            join_type: crate::sql::analysis::JoinKind::Inner,
-            eq_conditions: vec![
-                PhysicalHashJoinEqCondition {
-                    left: col(10),
-                    right: col(20),
-                    null_safe: false,
-                },
-                PhysicalHashJoinEqCondition {
-                    left: col(11),
-                    right: col(21),
-                    null_safe: false,
-                },
-            ],
-            other_condition: None,
-            distribution: JoinDistribution::Unknown,
-        };
+        let op = join_op(
+            JoinKind::Inner,
+            vec![eq(col(10), col(20)), eq(col(11), col(21))],
+            JoinDistribution::Unknown,
+        );
         let parent = PhysicalPropertySet {
             distribution: DistributionSpec::shuffle_join([ColumnId(10), ColumnId(21)]),
             ordering: OrderingSpec::Any,
@@ -857,16 +843,11 @@ mod tests {
 
     #[test]
     fn hash_join_right_outer_alternatives_are_shuffle_only() {
-        let op = PhysicalHashJoinOp {
-            join_type: crate::sql::analysis::JoinKind::RightOuter,
-            eq_conditions: vec![PhysicalHashJoinEqCondition {
-                left: col(10),
-                right: col(20),
-                null_safe: false,
-            }],
-            other_condition: None,
-            distribution: JoinDistribution::Unknown,
-        };
+        let op = join_op(
+            JoinKind::RightOuter,
+            vec![eq(col(10), col(20))],
+            JoinDistribution::Unknown,
+        );
 
         let alternatives = op.derive_required_alternatives(&PhysicalPropertySet::any(), 2);
         assert_eq!(alternatives.len(), 1);
@@ -875,16 +856,11 @@ mod tests {
 
     #[test]
     fn hash_join_right_outer_cast_key_does_not_emit_half_shuffle() {
-        let op = PhysicalHashJoinOp {
-            join_type: crate::sql::analysis::JoinKind::RightOuter,
-            eq_conditions: vec![PhysicalHashJoinEqCondition {
-                left: col(10),
-                right: cast_col(20, arrow::datatypes::DataType::Int64),
-                null_safe: false,
-            }],
-            other_condition: None,
-            distribution: JoinDistribution::Unknown,
-        };
+        let op = join_op(
+            JoinKind::RightOuter,
+            vec![eq(col(10), cast_col(20, arrow::datatypes::DataType::Int64))],
+            JoinDistribution::Unknown,
+        );
 
         let alternatives = op.derive_required_alternatives(&PhysicalPropertySet::any(), 2);
         assert_eq!(alternatives.len(), 1);
@@ -901,16 +877,14 @@ mod tests {
 
     #[test]
     fn hash_join_unknown_string_int_key_skips_shuffle_alternative() {
-        let op = PhysicalHashJoinOp {
-            join_type: crate::sql::analysis::JoinKind::Inner,
-            eq_conditions: vec![PhysicalHashJoinEqCondition {
-                left: col_with_type(10, arrow::datatypes::DataType::Utf8),
-                right: col_with_type(20, arrow::datatypes::DataType::Int32),
-                null_safe: false,
-            }],
-            other_condition: None,
-            distribution: JoinDistribution::Unknown,
-        };
+        let op = join_op(
+            JoinKind::Inner,
+            vec![eq(
+                col_with_type(10, arrow::datatypes::DataType::Utf8),
+                col_with_type(20, arrow::datatypes::DataType::Int32),
+            )],
+            JoinDistribution::Unknown,
+        );
 
         let alternatives = op.derive_required_alternatives(&PhysicalPropertySet::any(), 2);
         assert_eq!(alternatives.len(), 1);
@@ -919,16 +893,14 @@ mod tests {
 
     #[test]
     fn hash_join_forced_shuffle_string_int_key_gathers_both_sides() {
-        let op = PhysicalHashJoinOp {
-            join_type: crate::sql::analysis::JoinKind::RightOuter,
-            eq_conditions: vec![PhysicalHashJoinEqCondition {
-                left: col_with_type(10, arrow::datatypes::DataType::Utf8),
-                right: col_with_type(20, arrow::datatypes::DataType::Int32),
-                null_safe: false,
-            }],
-            other_condition: None,
-            distribution: JoinDistribution::Shuffle,
-        };
+        let op = join_op(
+            JoinKind::RightOuter,
+            vec![eq(
+                col_with_type(10, arrow::datatypes::DataType::Utf8),
+                col_with_type(20, arrow::datatypes::DataType::Int32),
+            )],
+            JoinDistribution::Shuffle,
+        );
 
         let reqs = op.derive_required(&PhysicalPropertySet::any(), 2);
         assert_eq!(reqs[0].distribution, DistributionSpec::Gather);
@@ -940,16 +912,14 @@ mod tests {
 
     #[test]
     fn hash_join_mixed_integer_key_keeps_shuffle_distribution() {
-        let op = PhysicalHashJoinOp {
-            join_type: crate::sql::analysis::JoinKind::Inner,
-            eq_conditions: vec![PhysicalHashJoinEqCondition {
-                left: col_with_type(10, arrow::datatypes::DataType::Int32),
-                right: col_with_type(20, arrow::datatypes::DataType::Int64),
-                null_safe: false,
-            }],
-            other_condition: None,
-            distribution: JoinDistribution::Unknown,
-        };
+        let op = join_op(
+            JoinKind::Inner,
+            vec![eq(
+                col_with_type(10, arrow::datatypes::DataType::Int32),
+                col_with_type(20, arrow::datatypes::DataType::Int64),
+            )],
+            JoinDistribution::Unknown,
+        );
 
         let alternatives = op.derive_required_alternatives(&PhysicalPropertySet::any(), 2);
         let shuffle = alternatives
@@ -973,16 +943,11 @@ mod tests {
             crate::sql::analysis::JoinKind::RightAnti,
             crate::sql::analysis::JoinKind::FullOuter,
         ] {
-            let op = PhysicalHashJoinOp {
+            let op = join_op(
                 join_type,
-                eq_conditions: vec![PhysicalHashJoinEqCondition {
-                    left: col(10),
-                    right: col(20),
-                    null_safe: false,
-                }],
-                other_condition: None,
-                distribution: JoinDistribution::Unknown,
-            };
+                vec![eq(col(10), col(20))],
+                JoinDistribution::Unknown,
+            );
 
             let alternatives = op.derive_required_alternatives(&PhysicalPropertySet::any(), 2);
             assert_eq!(alternatives.len(), 1, "join_type={join_type:?}");
@@ -1014,16 +979,11 @@ mod tests {
             data_type: arrow::datatypes::DataType::Int32,
             nullable: false,
         };
-        let op = PhysicalHashJoinOp {
-            join_type: crate::sql::analysis::JoinKind::Inner,
-            eq_conditions: vec![PhysicalHashJoinEqCondition {
-                left: left_key,
-                right: right_key,
-                null_safe: false,
-            }],
-            other_condition: None,
-            distribution: JoinDistribution::Shuffle,
-        };
+        let op = join_op(
+            JoinKind::Inner,
+            vec![eq(left_key, right_key)],
+            JoinDistribution::Shuffle,
+        );
         let reqs = op.derive_required(&PhysicalPropertySet::any(), 2);
         assert_eq!(reqs.len(), 2);
 
@@ -1050,23 +1010,11 @@ mod tests {
 
     #[test]
     fn shuffle_join_output_and_requirements_use_same_interleaved_key_order() {
-        let op = PhysicalHashJoinOp {
-            join_type: crate::sql::analysis::JoinKind::Inner,
-            eq_conditions: vec![
-                PhysicalHashJoinEqCondition {
-                    left: col(10),
-                    right: col(20),
-                    null_safe: false,
-                },
-                PhysicalHashJoinEqCondition {
-                    left: col(11),
-                    right: col(21),
-                    null_safe: false,
-                },
-            ],
-            other_condition: None,
-            distribution: JoinDistribution::Shuffle,
-        };
+        let op = join_op(
+            JoinKind::Inner,
+            vec![eq(col(10), col(20)), eq(col(11), col(21))],
+            JoinDistribution::Shuffle,
+        );
         let expected = DistributionSpec::shuffle_join([
             ColumnId(10),
             ColumnId(20),
@@ -1105,17 +1053,8 @@ mod tests {
 
     // ── Broadcast non-preserves-left → output stays Any ─────────────────────
 
-    fn broadcast_with_type(jk: crate::sql::analysis::JoinKind) -> PhysicalHashJoinOp {
-        PhysicalHashJoinOp {
-            join_type: jk,
-            eq_conditions: vec![PhysicalHashJoinEqCondition {
-                left: col(10),
-                right: col(20),
-                null_safe: false,
-            }],
-            other_condition: None,
-            distribution: JoinDistribution::Broadcast,
-        }
+    fn broadcast_with_type(jk: crate::sql::analysis::JoinKind) -> TestHashJoinOp {
+        join_op(jk, vec![eq(col(10), col(20))], JoinDistribution::Broadcast)
     }
 
     #[test]
@@ -1164,17 +1103,12 @@ mod tests {
 
     // ── Task 18: Colocate preserves-left + negative ───────────────────────────
 
-    fn colocate_inner(eq_left: u32, eq_right: u32) -> PhysicalHashJoinOp {
-        PhysicalHashJoinOp {
-            join_type: crate::sql::analysis::JoinKind::Inner,
-            eq_conditions: vec![PhysicalHashJoinEqCondition {
-                left: col(eq_left),
-                right: col(eq_right),
-                null_safe: false,
-            }],
-            other_condition: None,
-            distribution: JoinDistribution::Colocate,
-        }
+    fn colocate_inner(eq_left: u32, eq_right: u32) -> TestHashJoinOp {
+        join_op(
+            JoinKind::Inner,
+            vec![eq(col(eq_left), col(eq_right))],
+            JoinDistribution::Colocate,
+        )
     }
 
     #[test]
@@ -1329,16 +1263,11 @@ mod tests {
         // Shuffle's output's HashPartitioned vector must contain BOTH sides
         // of every eq pair — a shuffle partitions both inputs on their
         // respective eq columns, so the output is hash-equivalent in either.
-        let op = PhysicalHashJoinOp {
-            join_type: crate::sql::analysis::JoinKind::Inner,
-            eq_conditions: vec![PhysicalHashJoinEqCondition {
-                left: col(10),
-                right: col(20),
-                null_safe: false,
-            }],
-            other_condition: None,
-            distribution: JoinDistribution::Shuffle,
-        };
+        let op = join_op(
+            JoinKind::Inner,
+            vec![eq(col(10), col(20))],
+            JoinDistribution::Shuffle,
+        );
         let out = op.derive_output(&[&PhysicalPropertySet::any(), &PhysicalPropertySet::any()]);
         match &out.distribution {
             DistributionSpec::HashPartitioned { cols, source } => {

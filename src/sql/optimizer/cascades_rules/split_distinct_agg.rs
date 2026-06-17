@@ -476,6 +476,7 @@ mod tests {
     use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
     use crate::sql::optimizer::memo::Memo;
     use crate::sql::optimizer::operator::{AggMode, LogicalAggregateOp, LogicalScanOp};
+    use crate::sql::optimizer::scalar::materialize;
     use arrow::datatypes::DataType;
     use std::sync::Arc;
 
@@ -527,6 +528,17 @@ mod tests {
         memo.new_group(m)
     }
 
+    fn single_agg(
+        memo: &mut Memo,
+        group_by: Vec<TypedExpr>,
+        aggregates: Vec<AggregateCall>,
+        output_columns: Vec<OutputColumn>,
+    ) -> LogicalAggregateOp {
+        let group_by = intern_exprs(&mut memo.scalars, &group_by);
+        let aggregates = intern_aggregate_calls(&mut memo.scalars, &aggregates);
+        LogicalAggregateOp::single(group_by, aggregates, output_columns)
+    }
+
     fn count_distinct(arg_name: &str) -> AggregateCall {
         AggregateCall {
             name: "count".into(),
@@ -566,7 +578,9 @@ mod tests {
 
     #[test]
     fn matches_when_any_distinct() {
-        let op = Operator::LogicalAggregate(LogicalAggregateOp::single(
+        let mut memo = Memo::new();
+        let op = Operator::LogicalAggregate(single_agg(
+            &mut memo,
             vec![],
             vec![count_distinct("x"), sum_non_distinct("a")],
             vec![],
@@ -576,7 +590,9 @@ mod tests {
 
     #[test]
     fn does_not_match_when_no_distinct() {
-        let op = Operator::LogicalAggregate(LogicalAggregateOp::single(
+        let mut memo = Memo::new();
+        let op = Operator::LogicalAggregate(single_agg(
+            &mut memo,
             vec![],
             vec![sum_non_distinct("a")],
             vec![],
@@ -599,11 +615,7 @@ mod tests {
         let id = memo.next_expr_id();
         let mexpr = MExpr {
             id,
-            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
-                vec![],
-                vec![two_arg],
-                vec![],
-            )),
+            op: Operator::LogicalAggregate(single_agg(&mut memo, vec![], vec![two_arg], vec![])),
             children: vec![sg],
         };
         assert!(SplitDistinctAgg.apply(&mexpr, &mut memo).is_empty());
@@ -616,7 +628,8 @@ mod tests {
         let id = memo.next_expr_id();
         let mexpr = MExpr {
             id,
-            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+            op: Operator::LogicalAggregate(single_agg(
+                &mut memo,
                 vec![],
                 vec![count_distinct("a"), count_distinct("b")],
                 vec![],
@@ -633,7 +646,8 @@ mod tests {
         let id = memo.next_expr_id();
         let mexpr = MExpr {
             id,
-            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+            op: Operator::LogicalAggregate(single_agg(
+                &mut memo,
                 vec![col("g")],
                 vec![
                     AggregateCall {
@@ -668,7 +682,8 @@ mod tests {
         let id = memo.next_expr_id();
         let mexpr = MExpr {
             id,
-            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+            op: Operator::LogicalAggregate(single_agg(
+                &mut memo,
                 vec![],
                 vec![
                     count_distinct("x"),
@@ -695,7 +710,8 @@ mod tests {
         let id = memo.next_expr_id();
         let mexpr = MExpr {
             id,
-            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+            op: Operator::LogicalAggregate(single_agg(
+                &mut memo,
                 vec![col("g")],
                 vec![AggregateCall {
                     name: "array_agg".into(),
@@ -749,7 +765,8 @@ mod tests {
         let id = memo.next_expr_id();
         let mexpr = MExpr {
             id,
-            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+            op: Operator::LogicalAggregate(single_agg(
+                &mut memo,
                 vec![col("g")],
                 vec![count_distinct("x"), sum_non_distinct("a")],
                 vec![
@@ -829,7 +846,8 @@ mod tests {
         let id = memo.next_expr_id();
         let mexpr = MExpr {
             id,
-            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+            op: Operator::LogicalAggregate(single_agg(
+                &mut memo,
                 vec![g],
                 vec![
                     AggregateCall {
@@ -914,7 +932,8 @@ mod tests {
         let id = memo.next_expr_id();
         let mexpr = MExpr {
             id,
-            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+            op: Operator::LogicalAggregate(single_agg(
+                &mut memo,
                 vec![col("g")],
                 vec![
                     array_agg_distinct("x"),
@@ -950,7 +969,8 @@ mod tests {
         let id = memo.next_expr_id();
         let mexpr = MExpr {
             id,
-            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+            op: Operator::LogicalAggregate(single_agg(
+                &mut memo,
                 vec![],
                 vec![count_distinct("x"), sum_non_distinct("a")],
                 vec![
@@ -1025,7 +1045,8 @@ mod tests {
         let id = memo.next_expr_id();
         let mexpr = MExpr {
             id,
-            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+            op: Operator::LogicalAggregate(single_agg(
+                &mut memo,
                 vec![],
                 vec![AggregateCall {
                     name: "count".into(),
@@ -1087,7 +1108,8 @@ mod tests {
         let id = memo.next_expr_id();
         let mexpr = MExpr {
             id,
-            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+            op: Operator::LogicalAggregate(single_agg(
+                &mut memo,
                 vec![],
                 vec![
                     AggregateCall {
@@ -1154,8 +1176,8 @@ mod tests {
             .aggregates
             .iter()
             .filter(|call| call.distinct)
-            .map(|call| match &call.args[0].kind {
-                ExprKind::ColumnRef { column_id, .. } => *column_id,
+            .map(|call| match materialize(&memo.scalars, call.args[0]).kind {
+                ExprKind::ColumnRef { column_id, .. } => column_id,
                 other => panic!("expected ColumnRef arg, got {:?}", other),
             })
             .collect::<Vec<_>>();

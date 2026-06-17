@@ -189,15 +189,17 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{PhysicalFilterOp, PhysicalLimitOp, PhysicalProjectOp};
     use crate::sql::optimizer::property::{DistributionSpec, OrderingSpec, SortKey};
+    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
     use arrow::datatypes::DataType;
 
-    fn bool_filter() -> PhysicalFilterOp {
+    fn bool_filter(scalars: &mut ScalarArena) -> PhysicalFilterOp {
+        let predicate = TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Bool(true)),
+            data_type: DataType::Boolean,
+            nullable: false,
+        };
         PhysicalFilterOp {
-            predicate: TypedExpr {
-                kind: ExprKind::Literal(LiteralValue::Bool(true)),
-                data_type: DataType::Boolean,
-                nullable: false,
-            },
+            predicate: intern_typed(scalars, &predicate),
         }
     }
 
@@ -229,9 +231,10 @@ mod tests {
         // Filter does not constrain its child's distribution: returning [Any]
         // lets the child pick the cheapest plan; any mismatch with the
         // parent's required distribution becomes an enforcer above Filter.
-        let op = bool_filter();
+        let mut scalars = ScalarArena::new();
+        let op = bool_filter(&mut scalars);
         let parent_req = PhysicalPropertySet::gather();
-        let child_reqs = op.derive_required(&parent_req, 1);
+        let child_reqs = op.derive_required(&scalars, &parent_req, 1);
         assert_eq!(child_reqs.len(), 1);
         assert_eq!(child_reqs[0], PhysicalPropertySet::any());
     }
@@ -239,11 +242,12 @@ mod tests {
     #[test]
     fn project_required_is_distribution_blind() {
         let op = make_minimal_project_op();
+        let scalars = ScalarArena::new();
         let parent_req = PhysicalPropertySet {
             distribution: DistributionSpec::shuffle_agg([ColumnId(1)]),
             ordering: OrderingSpec::Any,
         };
-        let child_reqs = op.derive_required(&parent_req, 1);
+        let child_reqs = op.derive_required(&scalars, &parent_req, 1);
         assert_eq!(child_reqs.len(), 1);
         assert_eq!(child_reqs[0], PhysicalPropertySet::any());
     }
@@ -253,8 +257,9 @@ mod tests {
         // Limit is a global barrier: even when the parent accepts Any
         // distribution, LIMIT must run on one query-wide stream.
         let op = make_minimal_limit_op();
+        let scalars = ScalarArena::new();
         let parent = PhysicalPropertySet::any();
-        let reqs = op.derive_required(&parent, 1);
+        let reqs = op.derive_required(&scalars, &parent, 1);
         assert_eq!(reqs, vec![PhysicalPropertySet::gather()]);
     }
 
@@ -262,15 +267,17 @@ mod tests {
 
     #[test]
     fn passthrough_filter_output_follows_child() {
-        let op = bool_filter();
+        let mut scalars = ScalarArena::new();
+        let op = bool_filter(&mut scalars);
         let child = hash_one();
-        let out = op.derive_output(&[&child]);
+        let out = op.derive_output(&scalars, &[&child]);
         assert_eq!(out, child);
     }
 
     #[test]
     fn passthrough_project_output_preserves_ordering() {
         let op = make_minimal_project_op();
+        let scalars = ScalarArena::new();
         let child = PhysicalPropertySet {
             distribution: DistributionSpec::shuffle_agg([ColumnId(1)]),
             ordering: OrderingSpec::Required(vec![SortKey {
@@ -279,15 +286,16 @@ mod tests {
                 nulls_first: false,
             }]),
         };
-        let out = op.derive_output(&[&child]);
+        let out = op.derive_output(&scalars, &[&child]);
         assert_eq!(out, child);
     }
 
     #[test]
     fn limit_output_is_gather_barrier() {
         let op = make_minimal_limit_op();
+        let scalars = ScalarArena::new();
         let child = hash_one();
-        let out = op.derive_output(&[&child]);
+        let out = op.derive_output(&scalars, &[&child]);
 
         assert_eq!(out.distribution, DistributionSpec::Gather);
         assert_eq!(out.ordering, child.ordering);
@@ -295,8 +303,9 @@ mod tests {
 
     #[test]
     fn passthrough_no_children_falls_back_to_any() {
-        let op = bool_filter();
-        let out = op.derive_output(&[]);
+        let mut scalars = ScalarArena::new();
+        let op = bool_filter(&mut scalars);
+        let out = op.derive_output(&scalars, &[]);
         assert_eq!(out, PhysicalPropertySet::any());
     }
 
@@ -313,9 +322,10 @@ mod tests {
             grouping_fn_arg_ids: vec![vec![ColumnId(1)]],
             grouping_fn_ids: vec![("__grouping_fn_0".to_string(), ColumnId(2))],
         };
+        let scalars = ScalarArena::new();
         let child = hash_one();
 
-        let out = op.derive_output(&[&child]);
+        let out = op.derive_output(&scalars, &[&child]);
 
         assert_eq!(out, PhysicalPropertySet::any());
     }

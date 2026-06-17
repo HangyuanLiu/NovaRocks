@@ -566,6 +566,7 @@ mod tests {
     use super::*;
     use crate::sql::analysis::TypedExpr;
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence};
     use std::collections::HashMap;
 
@@ -668,17 +669,18 @@ mod tests {
     fn dp_covers_chains_up_to_ten_atoms() {
         // The DP internal ceiling must honor the configured max_dp (10), not the
         // old hardcoded 8. A 10-atom connected chain must produce a DP plan.
+        let mut arena = ScalarArena::new();
         assert!(
-            dp(&path_graph(10)).is_some(),
+            dp(&path_graph(10), &mut arena).is_some(),
             "DP must enumerate a 10-atom chain (was capped at 8)"
         );
         assert!(
-            dp(&path_graph(9)).is_some(),
+            dp(&path_graph(9), &mut arena).is_some(),
             "DP must enumerate a 9-atom chain"
         );
         // Beyond the safety ceiling (12) DP bails (greedy/left-deep take over).
         assert!(
-            dp(&path_graph(13)).is_none(),
+            dp(&path_graph(13), &mut arena).is_none(),
             "DP bails past the 12-atom ceiling"
         );
     }
@@ -687,7 +689,8 @@ mod tests {
     fn greedy_produces_bushy_orders() {
         // Greedy must enumerate bushy shapes (two join sub-trees), not only
         // left-deep spines, so it can find (0⋈1)⋈(2⋈3).
-        let trees = greedy_topk(&two_pairs_graph(), 10);
+        let mut arena = ScalarArena::new();
+        let trees = greedy_topk(&two_pairs_graph(), 10, &mut arena);
         assert!(
             trees.iter().any(is_bushy),
             "greedy must produce at least one bushy order; got {} trees",
@@ -716,7 +719,8 @@ mod tests {
     #[test]
     fn left_deep_starts_from_largest_and_prefers_equi() {
         let graph = star_graph();
-        let tree = left_deep(&graph).expect("left-deep over 3 atoms");
+        let mut arena = ScalarArena::new();
+        let tree = left_deep(&graph, &mut arena).expect("left-deep over 3 atoms");
         // Left-deep shape: ((fact ⋈ dim) ⋈ dim). The deepest-left leaf is the
         // fact atom (100, the largest), reached by descending left children.
         let mut node = &tree;
@@ -739,7 +743,8 @@ mod tests {
     #[test]
     fn enumerate_orders_produces_candidates_and_dedups() {
         let graph = star_graph();
-        let trees = enumerate_orders(&graph, ReorderCaps::default());
+        let mut arena = ScalarArena::new();
+        let trees = enumerate_orders(&graph, ReorderCaps::default(), &mut arena);
         assert!(!trees.is_empty(), "should enumerate at least one order");
         // All candidates must be 3-atom join trees (2 joins).
         for t in &trees {
