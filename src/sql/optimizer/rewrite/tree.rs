@@ -409,6 +409,10 @@ mod tests {
                 | Operator::LogicalDecode(_)
                 | Operator::LogicalAggregateStateMerge(_)
                 | Operator::LogicalAssertOneRow(_)
+                // Pre-memo logical-only variants (eliminated before memo entry).
+                | Operator::LogicalApply(_)
+                | Operator::LogicalImvDelta(_)
+                | Operator::LogicalImvVersion(_)
                 // Physical variants — also exhaustively listed so the match
                 // is complete without a wildcard.
                 | Operator::PhysicalScan(_)

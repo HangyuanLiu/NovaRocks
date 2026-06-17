@@ -4,12 +4,15 @@
 //! (children are represented as `GroupId`s in `MExpr`).
 //! Physical operators add physical execution decisions (distribution, agg mode).
 
+use std::collections::HashSet;
+
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{JoinKind, OutputColumn, WindowFrame};
-use crate::sql::catalog::TableDef;
+use crate::sql::catalog::{BranchScope, TableDef};
 use crate::sql::column_id::ColumnId;
+use crate::sql::optimizer::rewrite::imv::marker::ImvVersionRef;
 use crate::sql::optimizer::scalar::{ColumnDisplay, ScalarId, SortKey};
-use crate::sql::planner::plan::DecodeMapping;
+use crate::sql::planner::plan::{ApplyKind, DecodeMapping};
 
 pub(crate) use crate::sql::planner::plan::{ScanDictionaryColumn, ScanVariantColumn};
 
@@ -327,6 +330,44 @@ pub(crate) struct DecodeOp {
     pub output_columns: Vec<OutputColumn>,
 }
 
+/// Apply (correlated subquery) operator. Eliminated by the SubqueryRewrite
+/// stage before memo conversion; must not reach derive/cost/codegen.
+///
+/// `TypedExpr` fields from `LogicalApplyNode` are interned as `ScalarId`.
+/// `HashSet<ColumnId>` (non-scalar, pure metadata) is kept as-is.
+#[derive(Clone, Debug)]
+pub(crate) struct ApplyOp {
+    pub kind: ApplyKind,
+    /// Interned scalar for the subquery expression.
+    pub subquery_expr: ScalarId,
+    pub output_column: OutputColumn,
+    pub inner_output_column_id: ColumnId,
+    pub correlation_column_ids: Vec<ColumnId>,
+    /// Interned scalars for the correlation conjuncts.
+    pub correlation_conjuncts: Vec<ScalarId>,
+    /// Interned scalar for the residual predicate, if any.
+    pub residual_predicate: Option<ScalarId>,
+    pub need_check_max_rows: bool,
+    pub use_semi_anti: bool,
+    pub uncorrelated_outer_predicate_columns: HashSet<ColumnId>,
+}
+
+/// IMV delta marker operator. Eliminated during the IMV rewrite stage;
+/// must not reach derive/cost/codegen.
+#[derive(Clone, Debug)]
+pub(crate) struct ImvDeltaOp {
+    pub is_root: bool,
+    pub action_column: Option<ColumnId>,
+    pub branch_scope: Option<BranchScope>,
+}
+
+/// IMV version marker operator. Eliminated during the IMV rewrite stage;
+/// must not reach derive/cost/codegen.
+#[derive(Clone, Debug)]
+pub(crate) struct ImvVersionOp {
+    pub version_ref: ImvVersionRef,
+}
+
 // ---------------------------------------------------------------------------
 // Physical operator structs
 // ---------------------------------------------------------------------------
@@ -400,6 +441,12 @@ pub(crate) enum Operator {
     LogicalDecode(DecodeOp),
     LogicalAggregateStateMerge(AggregateStateMergeOp),
     LogicalAssertOneRow(AssertOneRowOp),
+    /// Apply (correlated subquery). Eliminated by SubqueryRewrite before memo.
+    LogicalApply(ApplyOp),
+    /// IMV delta marker. Eliminated by the IMV rewrite stage before memo.
+    LogicalImvDelta(ImvDeltaOp),
+    /// IMV version marker. Eliminated by the IMV rewrite stage before memo.
+    LogicalImvVersion(ImvVersionOp),
 
     // Physical operators
     PhysicalScan(ScanOp),
@@ -454,6 +501,9 @@ impl Operator {
                 | Operator::LogicalDecode(_)
                 | Operator::LogicalAggregateStateMerge(_)
                 | Operator::LogicalAssertOneRow(_)
+                | Operator::LogicalApply(_)
+                | Operator::LogicalImvDelta(_)
+                | Operator::LogicalImvVersion(_)
         )
     }
 

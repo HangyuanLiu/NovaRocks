@@ -3,9 +3,10 @@
 
 use super::memo::{GroupId, MExpr, Memo};
 use super::operator::{
-    AggregateStateMergeOp, AssertOneRowOp, CTEAnchorOp, CTEConsumeOp, CTEProduceOp, DecodeOp,
-    ExceptOp, FilterOp, GenerateSeriesOp, IntersectOp, LimitOp, LogicalAggregateOp, LogicalJoinOp,
-    Operator, ProjectOp, RepeatOp, ScanOp, SortOp, TableFunctionOp, UnionOp, ValuesOp, WindowOp,
+    AggregateStateMergeOp, ApplyOp, AssertOneRowOp, CTEAnchorOp, CTEConsumeOp, CTEProduceOp,
+    DecodeOp, ExceptOp, FilterOp, GenerateSeriesOp, ImvDeltaOp, ImvVersionOp, IntersectOp,
+    LimitOp, LogicalAggregateOp, LogicalJoinOp, Operator, ProjectOp, RepeatOp, ScanOp, SortOp,
+    TableFunctionOp, UnionOp, ValuesOp, WindowOp,
 };
 use super::opt_expr::OptExpr;
 use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
@@ -303,17 +304,55 @@ pub(crate) fn logical_plan_to_opt_expr(
             OptExpr::new(op, vec![child])
         }
 
-        LogicalPlanNodeKind::Apply(_) => {
-            // Defence in depth: the SubqueryRewrite stage's ApplyException
-            // rule and the optimize() residual-Apply backstop eliminate every
-            // Apply before this point. Reaching here means a planner bug, so
-            // fail loudly rather than mis-optimize.
-            panic!(
-                "apply operator must be eliminated by the SubqueryRewrite stage before memo conversion"
-            );
+        LogicalPlanNodeKind::Apply(node) => {
+            // Apply is consumed by the subquery/imv rewrite rules BEFORE memo
+            // conversion. Building an OptExpr here allows the rewrite rules
+            // (subquery/ and imv/ dirs) to operate on OptExpr trees. After
+            // rewrite the SubqueryRewrite backstop asserts no Apply remains.
+            let outer = logical_plan_to_opt_expr(plan.left(), scalars);
+            let inner = logical_plan_to_opt_expr(plan.right(), scalars);
+            let op = Operator::LogicalApply(ApplyOp {
+                kind: node.kind,
+                subquery_expr: intern_typed(scalars, &node.subquery_expr),
+                output_column: node.output_column.clone(),
+                inner_output_column_id: node.inner_output_column_id,
+                correlation_column_ids: node.correlation_column_ids.clone(),
+                correlation_conjuncts: intern_exprs(scalars, &node.correlation_conjuncts),
+                residual_predicate: node
+                    .residual_predicate
+                    .as_ref()
+                    .map(|e| intern_typed(scalars, e)),
+                need_check_max_rows: node.need_check_max_rows,
+                use_semi_anti: node.use_semi_anti,
+                uncorrelated_outer_predicate_columns: node
+                    .uncorrelated_outer_predicate_columns
+                    .clone(),
+            });
+            OptExpr::new(op, vec![outer, inner])
         }
-        LogicalPlanNodeKind::ImvDelta(_) | LogicalPlanNodeKind::ImvVersion(_) => {
-            panic!("imv marker leaked into non-IMV plan");
+
+        LogicalPlanNodeKind::ImvDelta(node) => {
+            // ImvDelta wraps a child subtree (the base plan being rewritten).
+            let child = logical_plan_to_opt_expr(plan.unary_input(), scalars);
+            let op = Operator::LogicalImvDelta(ImvDeltaOp {
+                is_root: node.is_root,
+                action_column: node.action_column,
+                branch_scope: node.branch_scope.clone(),
+            });
+            OptExpr::new(op, vec![child])
+        }
+
+        LogicalPlanNodeKind::ImvVersion(node) => {
+            // ImvVersion wraps a child plan (the snapshot scan subtree).
+            let op = Operator::LogicalImvVersion(ImvVersionOp {
+                version_ref: node.version_ref.clone(),
+            });
+            if plan.children.is_empty() {
+                OptExpr::leaf(op)
+            } else {
+                let child = logical_plan_to_opt_expr(plan.unary_input(), scalars);
+                OptExpr::new(op, vec![child])
+            }
         }
     };
     expr.required_output_columns = plan.required_output_columns.clone();

@@ -677,6 +677,15 @@ pub(crate) fn derive_statistics(
                 column_statistics: child_stats.column_statistics,
             }
         }
+
+        // Apply and IMV markers are eliminated by the rewrite stage before
+        // statistics derivation. Reaching here indicates a planner bug.
+        Operator::LogicalApply(_) => {
+            unreachable!("Apply operator must be eliminated by SubqueryRewrite before statistics derivation")
+        }
+        Operator::LogicalImvDelta(_) | Operator::LogicalImvVersion(_) => {
+            unreachable!("IMV marker operators must be eliminated by the IMV rewrite stage before statistics derivation")
+        }
     }
 }
 
@@ -1855,6 +1864,14 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
         Operator::PhysicalUnion(op) => op.output_columns.clone(),
         Operator::PhysicalIntersect(op) => op.output_columns.clone(),
         Operator::PhysicalExcept(op) => op.output_columns.clone(),
+
+        // Apply and IMV markers are eliminated before statistics derivation.
+        Operator::LogicalApply(_) => {
+            unreachable!("Apply operator must be eliminated by SubqueryRewrite before output-column derivation")
+        }
+        Operator::LogicalImvDelta(_) | Operator::LogicalImvVersion(_) => {
+            unreachable!("IMV marker operators must be eliminated by the IMV rewrite stage before output-column derivation")
+        }
     }
 }
 
