@@ -12,9 +12,16 @@ use super::opt_expr::OptExpr;
 use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
 use crate::sql::optimizer::scalar_bridge::{
     intern_aggregate_calls, intern_exprs, intern_project_items, intern_sort_items,
-    intern_window_exprs,
+    intern_window_exprs, materialize_aggregate_calls, materialize_exprs, materialize_project_items,
+    materialize_sort_keys,
 };
-use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind};
+use crate::sql::analysis::SortItem;
+use crate::sql::planner::plan::{
+    LogicalAggregateNode, LogicalAggregateStateMergeNode, LogicalFilterNode, LogicalImvDeltaNode,
+    LogicalImvVersionNode, LogicalJoinNode, LogicalLimitNode, LogicalPlanNode,
+    LogicalPlanNodeKind, LogicalProjectNode, LogicalScanNode, LogicalSortNode, LogicalUnionNode,
+    LogicalValuesNode,
+};
 
 /// Copy an `OptExpr` tree into the Memo as Groups (one Group per node).
 /// The operator already holds interned `ScalarId`s, so no scalar interning
@@ -357,6 +364,120 @@ pub(crate) fn logical_plan_to_opt_expr(
     };
     expr.required_output_columns = plan.required_output_columns.clone();
     expr
+}
+
+/// Bridge 2 (reverse): convert an `OptExpr` tree back into a `LogicalPlanNode`
+/// tree, materializing all `ScalarId` values from the provided arena.
+///
+/// This is used exclusively by the IMV rewrite pipeline, which operates on
+/// `OptExpr` internally but produces output that callers (e.g. `engine/mod.rs`)
+/// still consume as `LogicalPlanNode`. Only the operator variants that can
+/// appear in the IMV rewrite path are handled; the remainder panic because
+/// they cannot arise from a well-formed IMV rewrite output.
+pub(crate) fn opt_expr_to_logical_plan(expr: OptExpr, arena: &ScalarArena) -> LogicalPlanNode {
+    let children: Vec<LogicalPlanNode> = expr
+        .children
+        .into_iter()
+        .map(|c| opt_expr_to_logical_plan(c, arena))
+        .collect();
+    let kind = match expr.op {
+        Operator::LogicalScan(op) => LogicalPlanNodeKind::Scan(LogicalScanNode {
+            database: op.database,
+            table: op.table,
+            alias: op.alias,
+            columns: op.columns,
+            predicates: materialize_exprs(arena, &op.predicates),
+            required_columns: op.required_columns,
+            dict_columns: op.dict_columns,
+            variant_columns: op.variant_columns,
+        }),
+        Operator::LogicalFilter(op) => {
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: crate::sql::optimizer::scalar::materialize(arena, op.predicate),
+            })
+        }
+        Operator::LogicalProject(op) => {
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: materialize_project_items(arena, &op.items),
+                output_qualifier: op.output_qualifier,
+            })
+        }
+        Operator::LogicalAggregate(op) => {
+            let group_by = materialize_exprs(arena, &op.group_by);
+            let aggregates = materialize_aggregate_calls(
+                arena,
+                &op.aggregates,
+                op.group_by.len(),
+                &op.output_columns,
+            );
+            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by,
+                aggregates,
+                output_columns: op.output_columns,
+                already_pushed: false,
+            })
+        }
+        Operator::LogicalJoin(op) => LogicalPlanNodeKind::Join(LogicalJoinNode {
+            join_type: op.join_type,
+            condition: op.condition.map(|id| {
+                crate::sql::optimizer::scalar::materialize(arena, id)
+            }),
+        }),
+        Operator::LogicalSort(op) => {
+            let items: Vec<SortItem> = materialize_sort_keys(arena, &op.items);
+            LogicalPlanNodeKind::Sort(LogicalSortNode {
+                items,
+                analytic_partition_by: materialize_exprs(arena, &op.analytic_partition_exprs),
+                partition_limit: op.partition_limit,
+                topn_type: op.topn_type,
+            })
+        }
+        Operator::LogicalLimit(op) => LogicalPlanNodeKind::Limit(LogicalLimitNode {
+            limit: op.limit,
+            offset: op.offset,
+        }),
+        Operator::LogicalUnion(op) => LogicalPlanNodeKind::Union(LogicalUnionNode {
+            all: op.all,
+            output_columns: op.output_columns,
+        }),
+        Operator::LogicalValues(op) => LogicalPlanNodeKind::Values(LogicalValuesNode {
+            rows: op
+                .rows
+                .iter()
+                .map(|row| materialize_exprs(arena, row))
+                .collect(),
+            columns: op.columns,
+        }),
+        Operator::LogicalAggregateStateMerge(op) => {
+            LogicalPlanNodeKind::AggregateStateMerge(LogicalAggregateStateMergeNode {
+                group_key_names: op.group_key_names,
+                aggregate_state_names: op.aggregate_state_names,
+                change_op_column: op.change_op_column,
+                output_columns: op.output_columns,
+            })
+        }
+        Operator::LogicalImvDelta(op) => {
+            LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+                is_root: op.is_root,
+                action_column: op.action_column,
+                branch_scope: op.branch_scope,
+            })
+        }
+        Operator::LogicalImvVersion(op) => {
+            LogicalPlanNodeKind::ImvVersion(LogicalImvVersionNode {
+                version_ref: op.version_ref,
+            })
+        }
+        // The following operators are not expected in the IMV rewrite output
+        // but are included for completeness to avoid non-exhaustive patterns.
+        // If any of these panic in practice it means the IMV pipeline
+        // produced an unexpected operator kind.
+        other => panic!(
+            "opt_expr_to_logical_plan: unexpected operator kind {:?} in IMV rewrite output",
+            other
+        ),
+    };
+    LogicalPlanNode::new(kind, children, expr.required_output_columns)
 }
 
 /// Convert a `LogicalPlanNode` tree into Memo groups (Bridge 1 + copy-in).

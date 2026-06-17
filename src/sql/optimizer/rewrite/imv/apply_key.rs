@@ -12,10 +12,12 @@ use crate::engine::mv::iceberg_target_apply::{
 };
 use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
+use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::imv::action_propagation::{
     descendant_internal_columns, is_supported_fan_in_delta_union,
 };
+use crate::sql::optimizer::rewrite::imv::{bridge_apply_result, opt_expr_to_plan, PlanRewriteResult};
 use crate::sql::optimizer::rewrite::imv::annotation::ImvExtension;
 use crate::sql::optimizer::rewrite::imv::row_id_column::ImvRowIdColumn;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
@@ -104,10 +106,11 @@ impl LogicalRewriteRule for InjectApplyKeyProjectRule {
         RewriteTraversal::TopDown
     }
 
-    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+    fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
         if self.fired.load(Ordering::SeqCst) {
             return false;
         }
+        let plan = opt_expr_to_plan(expr.clone(), ctx);
         if !matches!(
             &plan.kind,
             LogicalPlanNodeKind::Project(_)
@@ -116,75 +119,77 @@ impl LogicalRewriteRule for InjectApplyKeyProjectRule {
         ) {
             return false;
         }
-        root_row_id_ref(plan).is_some() && !output_has_apply_key(plan)
+        root_row_id_ref(&plan).is_some() && !output_has_apply_key(&plan)
     }
 
     fn apply(
         &self,
-        plan: LogicalPlanNode,
+        expr: OptExpr,
         ctx: &mut RewriteContext,
     ) -> Result<RewriteResult, String> {
         self.fired.store(true, Ordering::SeqCst);
-        let Some((row_id_col, row_id_name)) = root_row_id_ref(&plan) else {
-            return Ok(RewriteResult::Unchanged);
-        };
-        let ext = ctx.extension::<ImvExtension>().ok_or_else(|| {
-            "InjectApplyKeyProject requires ImvExtension in RewriteContext".to_string()
-        })?;
-        let apply_key_col = ext.allocate_column_id();
-        let apply_item = ProjectItem {
-            expr: TypedExpr {
-                kind: ExprKind::ColumnRef {
-                    column_id: row_id_col,
-                    qualifier: None,
-                    column: row_id_name,
+        bridge_apply_result(expr, ctx, |plan, ctx| {
+            let Some((row_id_col, row_id_name)) = root_row_id_ref(&plan) else {
+                return Ok(PlanRewriteResult::Unchanged);
+            };
+            let ext = ctx.extension::<ImvExtension>().ok_or_else(|| {
+                "InjectApplyKeyProject requires ImvExtension in RewriteContext".to_string()
+            })?;
+            let apply_key_col = ext.allocate_column_id();
+            let apply_item = ProjectItem {
+                expr: TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        column_id: row_id_col,
+                        qualifier: None,
+                        column: row_id_name,
+                    },
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: false,
                 },
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
-            },
-            output_name: ICEBERG_MV_APPLY_KEY_COLUMN.to_string(),
-            output_column_id: apply_key_col,
-        };
-        let LogicalPlanNode {
-            kind,
-            children,
-            required_output_columns,
-        } = plan;
-        match kind {
-            LogicalPlanNodeKind::Project(mut p) => {
-                p.items.push(apply_item);
-                Ok(RewriteResult::Changed(LogicalPlanNode::new(
-                    LogicalPlanNodeKind::Project(p),
-                    children,
-                    required_output_columns,
-                )))
+                output_name: ICEBERG_MV_APPLY_KEY_COLUMN.to_string(),
+                output_column_id: apply_key_col,
+            };
+            let LogicalPlanNode {
+                kind,
+                children,
+                required_output_columns,
+            } = plan;
+            match kind {
+                LogicalPlanNodeKind::Project(mut p) => {
+                    p.items.push(apply_item);
+                    Ok(PlanRewriteResult::Changed(LogicalPlanNode::new(
+                        LogicalPlanNodeKind::Project(p),
+                        children,
+                        required_output_columns,
+                    )))
+                }
+                LogicalPlanNodeKind::Union(u) => {
+                    let mut items = u
+                        .output_columns
+                        .iter()
+                        .map(project_item_for_output_column)
+                        .collect::<Vec<_>>();
+                    items.push(apply_item);
+                    let union = LogicalPlanNode::new(
+                        LogicalPlanNodeKind::Union(u),
+                        children,
+                        required_output_columns,
+                    );
+                    Ok(PlanRewriteResult::Changed(LogicalPlanNode::new(
+                        LogicalPlanNodeKind::Project(LogicalProjectNode {
+                            items,
+                            output_qualifier: None,
+                        }),
+                        vec![union],
+                        None,
+                    )))
+                }
+                other_kind => Err(format!(
+                    "InjectApplyKeyProject expected root Project or Union for PF MV rewrite, got {}",
+                    plan_kind_from_kind(&other_kind)
+                )),
             }
-            LogicalPlanNodeKind::Union(u) => {
-                let mut items = u
-                    .output_columns
-                    .iter()
-                    .map(project_item_for_output_column)
-                    .collect::<Vec<_>>();
-                items.push(apply_item);
-                let union = LogicalPlanNode::new(
-                    LogicalPlanNodeKind::Union(u),
-                    children,
-                    required_output_columns,
-                );
-                Ok(RewriteResult::Changed(LogicalPlanNode::new(
-                    LogicalPlanNodeKind::Project(LogicalProjectNode {
-                        items,
-                        output_qualifier: None,
-                    }),
-                    vec![union],
-                    None,
-                )))
-            }
-            other_kind => Err(format!(
-                "InjectApplyKeyProject expected root Project or Union for PF MV rewrite, got {}",
-                plan_kind_from_kind(&other_kind)
-            )),
-        }
+        })
     }
 }
 
@@ -253,11 +258,13 @@ mod tests {
         ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::convert::{logical_plan_to_opt_expr, opt_expr_to_logical_plan};
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::imv::annotation::{ImvExtension, ImvPlanAnnotation};
     use crate::sql::optimizer::rewrite::imv::row_id_column::ImvRowIdColumn;
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
+    use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::{
         LogicalFilterNode, LogicalPlanNode, LogicalPlanNodeKind, LogicalProjectNode,
         LogicalScanNode,
@@ -369,10 +376,13 @@ mod tests {
         let rule = InjectApplyKeyProjectRule::new();
         let mut ctx = build_ctx();
         let plan = project_root(delta_scan_with_row_id(ColumnId(101)), ColumnId(101));
-        assert!(rule.matches(&plan, &ctx));
-        let RewriteResult::Changed(changed) = rule.apply(plan, &mut ctx).expect("apply") else {
+        let mut arena = ScalarArena::new();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        assert!(rule.matches(&expr, &ctx));
+        let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("apply") else {
             panic!("expected Changed(Project)");
         };
+        let changed = opt_expr_to_logical_plan(changed_expr, &arena);
         let LogicalPlanNodeKind::Project(root) = changed.kind else {
             panic!("expected Changed(Project)");
         };
@@ -402,7 +412,9 @@ mod tests {
                 output_column_id: ColumnId(200),
             });
         }
-        assert!(!rule.matches(&plan, &ctx));
+        let mut arena = ScalarArena::new();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        assert!(!rule.matches(&expr, &ctx));
     }
 
     #[test]
@@ -424,9 +436,11 @@ mod tests {
             )],
             None,
         );
-        assert!(rule.matches(&plan, &ctx));
+        let mut arena = ScalarArena::new();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        assert!(rule.matches(&expr, &ctx));
         let err = rule
-            .apply(plan, &mut ctx)
+            .apply(expr, &mut ctx)
             .expect_err("non-Project root must fail fast");
         assert!(
             err.contains("expected root Project"),

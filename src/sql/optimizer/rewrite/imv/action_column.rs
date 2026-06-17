@@ -13,10 +13,12 @@ use crate::engine::mv::iceberg_target_apply::ICEBERG_MV_APPLY_KEY_COLUMN;
 use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn};
 use crate::sql::catalog::ScanSource;
 use crate::sql::column_id::ColumnId;
+use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::imv::action_propagation::{
     first_delta_base_fqn, is_supported_branch_union, is_supported_fan_in_delta_union,
 };
+use crate::sql::optimizer::rewrite::imv::opt_expr_to_plan;
 use crate::sql::optimizer::rewrite::imv::join_delta_shape::{
     is_supported_join_delta_branch, is_supported_join_delta_union,
 };
@@ -87,17 +89,18 @@ impl LogicalRewriteRule for ActionColumnValidationRule {
         RewriteTraversal::TopDown
     }
 
-    fn matches(&self, _plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+    fn matches(&self, _expr: &OptExpr, _ctx: &RewriteContext) -> bool {
         // Fire exactly once per pipeline invocation, at the first (root) node.
         !self.fired.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn apply(
         &self,
-        plan: LogicalPlanNode,
-        _ctx: &mut RewriteContext,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
     ) -> Result<RewriteResult, String> {
         self.fired.store(true, std::sync::atomic::Ordering::SeqCst);
+        let plan = opt_expr_to_plan(expr, ctx);
         match validate(&plan) {
             Ok(()) => Ok(RewriteResult::Unchanged),
             Err(message) => Ok(RewriteResult::Rejected(RewriteDiagnostic::rejected(

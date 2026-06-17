@@ -3,10 +3,12 @@ use arrow::datatypes::DataType;
 use crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN;
 use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
+use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::imv::annotation::ImvExtension;
 use crate::sql::optimizer::rewrite::imv::join_delta::plan_output_columns;
 use crate::sql::optimizer::rewrite::imv::marker::plan_contains_imv_marker;
+use crate::sql::optimizer::rewrite::imv::{bridge_apply_result, opt_expr_to_plan, PlanRewriteResult};
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
@@ -30,7 +32,8 @@ impl LogicalRewriteRule for RewriteBranchUnionRule {
         RewriteTraversal::TopDown
     }
 
-    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+    fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
+        let plan = opt_expr_to_plan(expr.clone(), ctx);
         let LogicalPlanNodeKind::ImvDelta(delta) = &plan.kind else {
             return false;
         };
@@ -49,112 +52,114 @@ impl LogicalRewriteRule for RewriteBranchUnionRule {
 
     fn apply(
         &self,
-        plan: LogicalPlanNode,
+        expr: OptExpr,
         ctx: &mut RewriteContext,
     ) -> Result<RewriteResult, String> {
-        let LogicalPlanNode {
-            kind,
-            mut children,
-            required_output_columns: _,
-        } = plan;
-        let LogicalPlanNodeKind::ImvDelta(delta) = kind else {
-            return Ok(RewriteResult::Unchanged);
-        };
-        if !delta.is_root {
-            return Ok(RewriteResult::Unchanged);
-        }
-        let action_column = delta.action_column;
-        if children.len() != 1 {
-            return Ok(RewriteResult::Unchanged);
-        }
-        let union_plan = children.remove(0);
-        let LogicalPlanNode {
-            kind,
-            children: inputs,
-            required_output_columns,
-        } = union_plan;
-        let LogicalPlanNodeKind::Union(union) = kind else {
-            return Ok(RewriteResult::Unchanged);
-        };
-        if !union.all {
-            return Err("Iceberg IMV branch UNION rewrite supports UNION ALL only".to_string());
-        }
-        if inputs.len() < 2 {
-            return Err(
-                "Iceberg IMV branch UNION rewrite requires at least two aggregate branches"
-                    .to_string(),
-            );
-        }
-
-        let output_columns = union.output_columns;
-        for branch in &inputs {
-            if !is_branch_union_aggregate_branch(branch) {
-                return Err(format!(
-                    "Iceberg IMV branch UNION rewrite supports only aggregate or Project-over-Aggregate branches, got {}",
-                    plan_kind(branch)
-                ));
-            }
-        }
-
-        let ext = ctx
-            .extension::<ImvExtension>()
-            .ok_or_else(|| {
-                "RewriteBranchUnion requires ImvExtension in RewriteContext".to_string()
-            })?
-            .clone();
-        let branch_id_column = ext.allocate_column_id();
-        let mut rewritten_inputs = Vec::with_capacity(inputs.len());
-        for (idx, branch) in inputs.into_iter().enumerate() {
-            let branch_id = i32::try_from(idx)
-                .map_err(|_| "Iceberg IMV branch UNION branch index overflow".to_string())?;
-            let branch_kind = plan_kind(&branch);
-            let branch = extract_branch_union_aggregate_branch(branch).ok_or_else(|| {
-                format!(
-                    "Iceberg IMV branch UNION rewrite supports only aggregate or Project-over-Aggregate branches, got {}",
-                    branch_kind
-                )
-            })?;
-            // Tag the aggregate core as an independent, branch-scoped delta sub-problem.
-            // The existing aggregate-state (and join/union-delta beneath it) rules
-            // decompose it in later stages, reading branch_scope off this marker.
-            // Each branch becomes its own root delta sub-problem: `is_root` is
-            // per-sub-problem here, so the post-branch plan intentionally holds one
-            // root delta per branch (not a single global root).
-            let scope = crate::sql::catalog::BranchScope {
-                branch_id_column_name: ICEBERG_MV_BRANCH_ID_COLUMN.to_string(),
-                branch_id,
+        bridge_apply_result(expr, ctx, |plan, ctx| {
+            let LogicalPlanNode {
+                kind,
+                mut children,
+                required_output_columns: _,
+            } = plan;
+            let LogicalPlanNodeKind::ImvDelta(delta) = kind else {
+                return Ok(PlanRewriteResult::Unchanged);
             };
-            let aggregate = LogicalPlanNode::new(
-                LogicalPlanNodeKind::Aggregate(branch.aggregate),
-                vec![branch.aggregate_input],
-                branch.aggregate_required_output_columns,
-            );
-            let core = LogicalPlanNode::new(
-                LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
-                    is_root: true,
-                    action_column,
-                    branch_scope: Some(scope),
-                }),
-                vec![aggregate],
-                None,
-            );
-            let rewritten = match branch.post_project {
-                Some(project) => {
-                    append_branch_id_to_project(project, core, branch_id, branch_id_column)
-                }
-                None => append_branch_id_project(core, branch_id, branch_id_column),
-            }?;
-            rewritten_inputs.push(rewritten);
-        }
+            if !delta.is_root {
+                return Ok(PlanRewriteResult::Unchanged);
+            }
+            let action_column = delta.action_column;
+            if children.len() != 1 {
+                return Ok(PlanRewriteResult::Unchanged);
+            }
+            let union_plan = children.remove(0);
+            let LogicalPlanNode {
+                kind,
+                children: inputs,
+                required_output_columns,
+            } = union_plan;
+            let LogicalPlanNodeKind::Union(union) = kind else {
+                return Ok(PlanRewriteResult::Unchanged);
+            };
+            if !union.all {
+                return Err("Iceberg IMV branch UNION rewrite supports UNION ALL only".to_string());
+            }
+            if inputs.len() < 2 {
+                return Err(
+                    "Iceberg IMV branch UNION rewrite requires at least two aggregate branches"
+                        .to_string(),
+                );
+            }
 
-        Ok(RewriteResult::Changed(LogicalPlanNode::new(
-            LogicalPlanNodeKind::Union(LogicalUnionNode {
-                all: true,
-                output_columns: branch_union_output_columns(output_columns, branch_id_column),
-            }),
-            rewritten_inputs,
-            required_output_columns,
-        )))
+            let output_columns = union.output_columns;
+            for branch in &inputs {
+                if !is_branch_union_aggregate_branch(branch) {
+                    return Err(format!(
+                        "Iceberg IMV branch UNION rewrite supports only aggregate or Project-over-Aggregate branches, got {}",
+                        plan_kind(branch)
+                    ));
+                }
+            }
+
+            let ext = ctx
+                .extension::<ImvExtension>()
+                .ok_or_else(|| {
+                    "RewriteBranchUnion requires ImvExtension in RewriteContext".to_string()
+                })?
+                .clone();
+            let branch_id_column = ext.allocate_column_id();
+            let mut rewritten_inputs = Vec::with_capacity(inputs.len());
+            for (idx, branch) in inputs.into_iter().enumerate() {
+                let branch_id = i32::try_from(idx)
+                    .map_err(|_| "Iceberg IMV branch UNION branch index overflow".to_string())?;
+                let branch_kind = plan_kind(&branch);
+                let branch = extract_branch_union_aggregate_branch(branch).ok_or_else(|| {
+                    format!(
+                        "Iceberg IMV branch UNION rewrite supports only aggregate or Project-over-Aggregate branches, got {}",
+                        branch_kind
+                    )
+                })?;
+                // Tag the aggregate core as an independent, branch-scoped delta sub-problem.
+                // The existing aggregate-state (and join/union-delta beneath it) rules
+                // decompose it in later stages, reading branch_scope off this marker.
+                // Each branch becomes its own root delta sub-problem: `is_root` is
+                // per-sub-problem here, so the post-branch plan intentionally holds one
+                // root delta per branch (not a single global root).
+                let scope = crate::sql::catalog::BranchScope {
+                    branch_id_column_name: ICEBERG_MV_BRANCH_ID_COLUMN.to_string(),
+                    branch_id,
+                };
+                let aggregate = LogicalPlanNode::new(
+                    LogicalPlanNodeKind::Aggregate(branch.aggregate),
+                    vec![branch.aggregate_input],
+                    branch.aggregate_required_output_columns,
+                );
+                let core = LogicalPlanNode::new(
+                    LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+                        is_root: true,
+                        action_column,
+                        branch_scope: Some(scope),
+                    }),
+                    vec![aggregate],
+                    None,
+                );
+                let rewritten = match branch.post_project {
+                    Some(project) => {
+                        append_branch_id_to_project(project, core, branch_id, branch_id_column)
+                    }
+                    None => append_branch_id_project(core, branch_id, branch_id_column),
+                }?;
+                rewritten_inputs.push(rewritten);
+            }
+
+            Ok(PlanRewriteResult::Changed(LogicalPlanNode::new(
+                LogicalPlanNodeKind::Union(LogicalUnionNode {
+                    all: true,
+                    output_columns: branch_union_output_columns(output_columns, branch_id_column),
+                }),
+                rewritten_inputs,
+                required_output_columns,
+            )))
+        })
     }
 }
 
@@ -340,6 +345,8 @@ mod tests {
     use crate::engine::mv::refresh_context::tests_support::{
         make_mv_definition, make_pin, make_ref, make_schema_contract, make_target, parse_query,
     };
+    use crate::sql::optimizer::convert::logical_plan_to_opt_expr;
+    use crate::sql::optimizer::scalar::ScalarArena;
     use crate::meta::repository::mv_contract::{
         AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
         ApplyKeySource, BranchIdColumnContract, BranchUnionContract,
@@ -376,10 +383,14 @@ mod tests {
             None,
         ));
 
-        assert!(rule.matches(&plan, &ctx));
-        let RewriteResult::Changed(rewritten) = rule.apply(plan, &mut ctx).expect("rewrite") else {
+        let mut arena = ScalarArena::new();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        assert!(rule.matches(&expr, &ctx));
+        let RewriteResult::Changed(rewritten_expr) = rule.apply(expr, &mut ctx).expect("rewrite") else {
             panic!("expected Changed(Union)");
         };
+        let arena = ctx.scalar_arena();
+        let rewritten = crate::sql::optimizer::convert::opt_expr_to_logical_plan(rewritten_expr, &arena.borrow());
         let LogicalPlanNodeKind::Union(_) = &rewritten.kind else {
             panic!("expected Changed(Union), got {rewritten:?}");
         };
@@ -433,10 +444,14 @@ mod tests {
             None,
         ));
 
-        assert!(rule.matches(&plan, &ctx));
-        let RewriteResult::Changed(rewritten) = rule.apply(plan, &mut ctx).expect("rewrite") else {
+        let mut arena = ScalarArena::new();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        assert!(rule.matches(&expr, &ctx));
+        let RewriteResult::Changed(rewritten_expr) = rule.apply(expr, &mut ctx).expect("rewrite") else {
             panic!("expected Changed(Union)");
         };
+        let arena = ctx.scalar_arena();
+        let rewritten = crate::sql::optimizer::convert::opt_expr_to_logical_plan(rewritten_expr, &arena.borrow());
         let LogicalPlanNodeKind::Union(_) = &rewritten.kind else {
             panic!("expected Changed(Union), got {rewritten:?}");
         };
@@ -490,8 +505,10 @@ mod tests {
             None,
         ));
 
+        let mut arena = ScalarArena::new();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
         let err = rule
-            .apply(plan, &mut ctx)
+            .apply(expr, &mut ctx)
             .expect_err("scan branch must fail");
         assert!(
             err.contains("supports only aggregate or Project-over-Aggregate branches"),
@@ -523,7 +540,9 @@ mod tests {
             None,
         ));
 
-        assert!(!rule.matches(&plan, &ctx));
+        let mut arena = ScalarArena::new();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        assert!(!rule.matches(&expr, &ctx));
     }
 
     #[test]
@@ -539,7 +558,9 @@ mod tests {
             None,
         ));
 
-        assert!(!rule.matches(&plan, &ctx));
+        let mut arena = ScalarArena::new();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        assert!(!rule.matches(&expr, &ctx));
     }
 
     #[test]
@@ -559,9 +580,13 @@ mod tests {
             None,
         );
 
-        let out = build_imv_pipeline()
-            .rewrite(plan, &mut ctx)
+        let mut arena = ScalarArena::new();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let out_expr = build_imv_pipeline()
+            .rewrite(expr, &mut ctx)
             .expect("pipeline must succeed");
+        let arena = ctx.scalar_arena();
+        let out = crate::sql::optimizer::convert::opt_expr_to_logical_plan(out_expr, &arena.borrow());
 
         // Top is a Union whose branches each end in Project over AggregateStateMerge,
         // carrying a __branch_id__ column, with no IMV marker left anywhere.
@@ -958,9 +983,13 @@ mod tests {
         let filtered = filter_over(join, 1, "region");
         let plan = aggregate_over(filtered);
 
-        let out = build_imv_pipeline()
-            .rewrite(plan, &mut ctx)
+        let mut arena = ScalarArena::new();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let out_expr = build_imv_pipeline()
+            .rewrite(expr, &mut ctx)
             .expect("aggregate over filtered join must compose");
+        let arena = ctx.scalar_arena();
+        let out = crate::sql::optimizer::convert::opt_expr_to_logical_plan(out_expr, &arena.borrow());
 
         assert!(
             !plan_contains_imv_marker(&out),
@@ -979,9 +1008,13 @@ mod tests {
         let outer = join_of_on(inner, scan("b", 20), 1, 20);
         let plan = aggregate_over(outer);
 
-        let out = build_imv_pipeline()
-            .rewrite(plan, &mut ctx)
+        let mut arena = ScalarArena::new();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let out_expr = build_imv_pipeline()
+            .rewrite(expr, &mut ctx)
             .expect("aggregate over nested join must compose");
+        let arena = ctx.scalar_arena();
+        let out = crate::sql::optimizer::convert::opt_expr_to_logical_plan(out_expr, &arena.borrow());
 
         assert!(
             !plan_contains_imv_marker(&out),
@@ -1010,9 +1043,13 @@ mod tests {
             None,
         );
 
-        let out = build_imv_pipeline()
-            .rewrite(plan, &mut ctx)
+        let mut arena = ScalarArena::new();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let out_expr = build_imv_pipeline()
+            .rewrite(expr, &mut ctx)
             .expect("branch union of Project-over-Aggregate must compose");
+        let arena = ctx.scalar_arena();
+        let out = crate::sql::optimizer::convert::opt_expr_to_logical_plan(out_expr, &arena.borrow());
         assert!(
             !plan_contains_imv_marker(&out),
             "no marker may survive: each Project-over-Aggregate branch must fully decompose"
@@ -1068,9 +1105,13 @@ mod tests {
             None,
         );
 
-        let out = build_imv_pipeline()
-            .rewrite(plan, &mut ctx)
+        let mut arena = ScalarArena::new();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let out_expr = build_imv_pipeline()
+            .rewrite(expr, &mut ctx)
             .expect("branch union of aggregate-over-join must compose");
+        let arena = ctx.scalar_arena();
+        let out = crate::sql::optimizer::convert::opt_expr_to_logical_plan(out_expr, &arena.borrow());
         assert!(
             !plan_contains_imv_marker(&out),
             "no marker may survive: the inner joins must be delta-expanded and bound"
