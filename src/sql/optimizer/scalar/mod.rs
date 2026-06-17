@@ -156,6 +156,7 @@ struct ScalarKey {
 }
 
 /// Owns all scalar nodes for one optimize() call; interns (hash-conses) on push.
+#[derive(Clone, Debug)]
 pub(crate) struct ScalarArena {
     nodes: Vec<ScalarNode>,
     types: Vec<DataType>,

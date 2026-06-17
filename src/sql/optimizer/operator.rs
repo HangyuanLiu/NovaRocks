@@ -5,9 +5,10 @@
 //! Physical operators add physical execution decisions (distribution, agg mode).
 
 use crate::sql::analysis::cte::CteId;
-use crate::sql::analysis::{JoinKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
+use crate::sql::analysis::{JoinKind, OutputColumn, ProjectItem, SortItem, TypedExpr, WindowFrame};
 use crate::sql::catalog::TableDef;
 use crate::sql::column_id::ColumnId;
+use crate::sql::optimizer::scalar::{ScalarId, SortKey};
 use crate::sql::planner::plan::{AggregateCall, DecodeMapping, WindowExpr};
 
 pub(crate) use crate::sql::planner::plan::{ScanDictionaryColumn, ScanVariantColumn};
@@ -68,6 +69,32 @@ impl AggStage {
             AggStage::Global => AggMode::Global,
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ScalarProjectItem {
+    pub expr: ScalarId,
+    pub output_name: String,
+    pub output_column_id: ColumnId,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ScalarAggregateSpec {
+    pub name: String,
+    pub args: Vec<ScalarId>,
+    pub distinct: bool,
+    pub order_by: Vec<SortKey>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ScalarWindowSpec {
+    pub name: String,
+    pub args: Vec<ScalarId>,
+    pub distinct: bool,
+    pub partition_by: Vec<ScalarId>,
+    pub order_by: Vec<SortKey>,
+    pub window_frame: Option<WindowFrame>,
+    pub ignore_nulls: bool,
 }
 
 #[derive(Clone, Debug)]
