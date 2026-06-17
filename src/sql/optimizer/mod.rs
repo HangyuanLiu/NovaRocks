@@ -40,6 +40,7 @@ use crate::sql::optimizer::statistics::TableStatistics;
 use crate::sql::planner::plan::LogicalPlanNode;
 use memo::MExpr;
 use rule::Rule;
+use scalar::ScalarArena;
 
 /// Wall-clock timeout for the entire optimization pipeline.
 ///
@@ -120,16 +121,23 @@ fn optimize_with_root_property(
         rewrite_ctx.set_dictionary_provider(provider);
     }
     rewrite_ctx.set_column_ref_factory(Rc::clone(&factory));
-    let rewritten =
-        rewrite::registry::query_rewrite_pipeline(table_stats).rewrite(plan, &mut rewrite_ctx)?;
+    let arena = Rc::new(RefCell::new(scalar::ScalarArena::new()));
+    rewrite_ctx.set_scalar_arena(Rc::clone(&arena));
+    let plan_expr = convert::logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut());
+    let rewritten_expr =
+        rewrite::registry::query_rewrite_pipeline(table_stats).rewrite(plan_expr, &mut rewrite_ctx)?;
 
     // Non-disableable backstop: Apply must not survive the SubqueryRewrite
     // stage. The ApplyException rule reports this with rule attribution, but
     // a user-disabled rule must not let an Apply leak into memo conversion
     // (which panics by contract).
-    if let Some(message) = rewrite::rules::subquery::find_residual_apply(&rewritten) {
+    if let Some(message) = rewrite::rules::subquery::find_residual_apply(&rewritten_expr) {
         return Err(message);
     }
+
+    // Materialize the rewritten OptExpr back to LogicalPlanNode for CTE cleanup
+    // and memo conversion, both of which still operate on LogicalPlanNode.
+    let rewritten = convert::opt_expr_to_logical_plan(rewritten_expr, &arena.borrow());
 
     // 4. CTE cleanup: intentional pre-Memo structural rewrite for CTE shape
     //    cleanup, not a second full logical optimization pass.

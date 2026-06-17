@@ -11,11 +11,13 @@ use std::collections::HashSet;
 
 use arrow::datatypes::DataType;
 
+use super::bridge::{opt_expr_to_plan, plan_to_opt_expr};
 use super::win_magic_util::{
     TableIdentity, collect_scan_column_map, collect_table_ids, expr_phys_eq,
 };
 use crate::sql::analysis::{ExprKind, OutputColumn, SortItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
+use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
@@ -55,41 +57,63 @@ impl LogicalRewriteRule for ApplyToWindow {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
-        let LogicalPlanNodeKind::Filter(_) = &plan.kind else {
-            return false;
-        };
-        let apply = plan.unary_input();
-        let LogicalPlanNodeKind::Apply(a) = &apply.kind else {
-            return false;
-        };
-        a.kind == ApplyKind::Scalar && !a.need_check_max_rows && !a.correlation_conjuncts.is_empty()
+    fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
+        let arena = ctx.scalar_arena();
+        let plan = opt_expr_to_plan(expr, &arena.borrow());
+        matches_plan(&plan)
     }
 
     fn apply(
         &self,
-        plan: LogicalPlanNode,
+        expr: OptExpr,
         ctx: &mut RewriteContext,
     ) -> Result<RewriteResult, String> {
-        let Some(m) = ({
-            let LogicalPlanNodeKind::Filter(f) = &plan.kind else {
-                return Ok(RewriteResult::Unchanged);
-            };
-            let apply = plan.unary_input();
-            let LogicalPlanNodeKind::Apply(a) = &apply.kind else {
-                return Ok(RewriteResult::Unchanged);
-            };
-            check_preconditions(&f.predicate, a, apply.left(), apply.right())
-        }) else {
-            return Ok(RewriteResult::Unchanged);
-        };
+        let arena = ctx.scalar_arena();
+        let plan = opt_expr_to_plan(&expr, &arena.borrow());
+        match apply_plan_inner(plan, ctx)? {
+            Some(new_plan) => {
+                let new_expr = plan_to_opt_expr(&new_plan, &mut arena.borrow_mut());
+                Ok(RewriteResult::Changed(new_expr))
+            }
+            None => Ok(RewriteResult::Unchanged),
+        }
+    }
+}
 
-        // Re-own the pieces. (matches() guaranteed Filter(Apply).)
-        let mut apply_plan = plan.into_single_child();
-        let (outer_subtree, apply_right) = apply_plan.take_two_children();
-        let LogicalPlanNodeKind::Apply(a) = apply_plan.kind else {
-            unreachable!()
+fn matches_plan(plan: &LogicalPlanNode) -> bool {
+    let LogicalPlanNodeKind::Filter(_) = &plan.kind else {
+        return false;
+    };
+    let apply = plan.unary_input();
+    let LogicalPlanNodeKind::Apply(a) = &apply.kind else {
+        return false;
+    };
+    a.kind == ApplyKind::Scalar && !a.need_check_max_rows && !a.correlation_conjuncts.is_empty()
+}
+
+fn apply_plan_inner(
+    plan: LogicalPlanNode,
+    ctx: &mut RewriteContext,
+) -> Result<Option<LogicalPlanNode>, String> {
+    let Some(m) = ({
+        let LogicalPlanNodeKind::Filter(f) = &plan.kind else {
+            return Ok(None);
         };
+        let apply = plan.unary_input();
+        let LogicalPlanNodeKind::Apply(a) = &apply.kind else {
+            return Ok(None);
+        };
+        check_preconditions(&f.predicate, a, apply.left(), apply.right())
+    }) else {
+        return Ok(None);
+    };
+
+    // Re-own the pieces. (matches_plan() guaranteed Filter(Apply).)
+    let mut apply_plan = plan.into_single_child();
+    let (outer_subtree, apply_right) = apply_plan.take_two_children();
+    let LogicalPlanNodeKind::Apply(a) = apply_plan.kind else {
+        unreachable!()
+    };
 
         // --- 1. Remap the inner aggregate's args to the outer instance of the same physical column. ---
         let outer_map = collect_scan_column_map(&outer_subtree);
@@ -107,14 +131,14 @@ impl LogicalRewriteRule for ApplyToWindow {
         for arg in &mut agg_args {
             if !remap_inner_to_outer(arg, &inner_map, &phys_to_outer) {
                 // Required column unavailable on outer side → fall back to join form.
-                return Ok(RewriteResult::Unchanged);
+                return Ok(None);
             }
         }
         // Guard 1: post-condition — verify no inner-scan column survived the remap.
         // This catches any ExprKind variant that remap_inner_to_outer might have missed.
         for arg in &agg_args {
             if !collect_column_id_refs(arg).is_disjoint(&inner_ids) {
-                return Ok(RewriteResult::Unchanged); // an inner column survived the remap
+                return Ok(None); // an inner column survived the remap
             }
         }
 
@@ -211,14 +235,14 @@ impl LogicalRewriteRule for ApplyToWindow {
         {
             let vrefs = collect_column_id_refs(&value_expr);
             if vrefs.contains(&m.inner_agg.output_column_id) || !vrefs.is_disjoint(&inner_ids) {
-                return Ok(RewriteResult::Unchanged); // value expr still references a disappearing inner column
+                return Ok(None); // value expr still references a disappearing inner column
             }
         }
         let mut after_pred = m.subquery_conjunct.clone();
         replace_column_ref(&mut after_pred, a.output_column.column_id, &value_expr);
         // Guard 3: APPLY_OUT must be gone from after_pred — it has been fully replaced.
         if collect_column_id_refs(&after_pred).contains(&a.output_column.column_id) {
-            return Ok(RewriteResult::Unchanged); // APPLY_OUT survived (comparison used an unhandled node)
+            return Ok(None); // APPLY_OUT survived (comparison used an unhandled node)
         }
         let after = LogicalPlanNode::new(
             LogicalPlanNodeKind::Filter(LogicalFilterNode {
@@ -228,8 +252,7 @@ impl LogicalRewriteRule for ApplyToWindow {
             None,
         );
 
-        Ok(RewriteResult::Changed(after))
-    }
+        Ok(Some(after))
 }
 
 /// Recursively remap each `ColumnRef` in `expr` from an inner-scan column id to
@@ -785,9 +808,11 @@ mod tests {
     };
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::{ColumnId, ColumnRefFactory};
+    use crate::sql::optimizer::convert::logical_plan_to_opt_expr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
+    use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::{
         AggregateCall, ApplyKind, LogicalAggregateNode, LogicalApplyNode, LogicalFilterNode,
         LogicalJoinNode, LogicalLimitNode, LogicalPlanNode, LogicalPlanNodeKind,
@@ -1223,13 +1248,24 @@ mod tests {
     }
 
     fn ctx() -> RewriteContext {
-        RewriteContext::for_query(Vec::<String>::new())
+        let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
+        ctx
     }
 
     fn ctx_with_factory() -> RewriteContext {
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         ctx.set_column_ref_factory(Rc::new(RefCell::new(ColumnRefFactory::new())));
+        ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
         ctx
+    }
+
+    fn to_opt_expr(plan: &LogicalPlanNode, ctx: &mut RewriteContext) -> OptExpr {
+        logical_plan_to_opt_expr(plan, &mut ctx.scalar_arena().borrow_mut())
+    }
+
+    fn mat_plan(expr: &OptExpr, ctx: &RewriteContext) -> LogicalPlanNode {
+        opt_expr_to_plan(expr, &ctx.scalar_arena().borrow())
     }
 
     // ---- matches() tests --------------------------------------------------------
@@ -1238,7 +1274,9 @@ mod tests {
     fn matches_returns_true_for_q17_shape() {
         let rule = ApplyToWindow;
         let plan = winmagic_filter_apply();
-        assert!(rule.matches(&plan, &ctx()));
+        let mut ctx = ctx();
+        let expr = to_opt_expr(&plan, &mut ctx);
+        assert!(rule.matches(&expr, &ctx));
     }
 
     #[test]
@@ -1270,7 +1308,9 @@ mod tests {
             vec![make_outer_join(), make_inner_avg_agg()],
             None,
         );
-        assert!(!rule.matches(&apply, &ctx()));
+        let mut ctx = ctx();
+        let expr = to_opt_expr(&apply, &mut ctx);
+        assert!(!rule.matches(&expr, &ctx));
     }
 
     // ---- transform tests --------------------------------------------------------
@@ -1284,15 +1324,17 @@ mod tests {
         let rule = ApplyToWindow;
         let plan = winmagic_filter_apply();
         let mut ctx = ctx_with_factory();
+        let expr = to_opt_expr(&plan, &mut ctx);
 
-        let result = rule.apply(plan, &mut ctx).expect("apply must not error");
-        let RewriteResult::Changed(result) = result else {
+        let result = rule.apply(expr, &mut ctx).expect("apply must not error");
+        let RewriteResult::Changed(result_expr) = result else {
             panic!("expected Changed, got Unchanged");
         };
+        let result = mat_plan(&result_expr, &ctx);
 
         // No Apply anywhere.
         assert!(
-            super::super::find_residual_apply(&result).is_none(),
+            super::super::find_residual_apply(&result_expr).is_none(),
             "Apply must be gone after transform"
         );
 
@@ -1384,10 +1426,12 @@ mod tests {
         {
             let plan = winmagic_filter_apply();
             let mut ctx = ctx_with_factory();
-            let result = rule.apply(plan, &mut ctx).unwrap();
-            let RewriteResult::Changed(result) = result else {
+            let expr = to_opt_expr(&plan, &mut ctx);
+            let result = rule.apply(expr, &mut ctx).unwrap();
+            let RewriteResult::Changed(result_expr) = result else {
                 panic!("expected Changed")
             };
+            let result = mat_plan(&result_expr, &ctx);
             let LogicalPlanNodeKind::Filter(after) = &result.kind else {
                 panic!("expected Filter")
             };
@@ -1416,10 +1460,12 @@ mod tests {
         {
             let (plan, _val_id) = winmagic_filter_apply_with_project();
             let mut ctx = ctx_with_factory();
-            let result = rule.apply(plan, &mut ctx).unwrap();
-            let RewriteResult::Changed(result) = result else {
+            let expr = to_opt_expr(&plan, &mut ctx);
+            let result = rule.apply(expr, &mut ctx).unwrap();
+            let RewriteResult::Changed(result_expr) = result else {
                 panic!("expected Changed")
             };
+            let result = mat_plan(&result_expr, &ctx);
             let LogicalPlanNodeKind::Filter(after) = &result.kind else {
                 panic!("expected Filter")
             };
@@ -1488,7 +1534,8 @@ mod tests {
         let bad_plan = make_filter_apply(pred.clone(), a_orig.clone(), bad_left, right.clone());
 
         let mut ctx = ctx_with_factory();
-        let result = rule.apply(bad_plan, &mut ctx).expect("must not error");
+        let expr = to_opt_expr(&bad_plan, &mut ctx);
+        let result = rule.apply(expr, &mut ctx).expect("must not error");
         assert!(
             matches!(result, RewriteResult::Unchanged),
             "self-join fixture must produce Unchanged"
@@ -1990,14 +2037,16 @@ mod tests {
 
         let rule = ApplyToWindow;
         let mut ctx = ctx_with_factory();
-        let result = rule.apply(plan, &mut ctx).expect("apply must not error");
-        let RewriteResult::Changed(result) = result else {
+        let expr = to_opt_expr(&plan, &mut ctx);
+        let result = rule.apply(expr, &mut ctx).expect("apply must not error");
+        let RewriteResult::Changed(result_expr) = result else {
             panic!("expected Changed — Between-wrapped APPLY_OUT should now be handled");
         };
+        let result = mat_plan(&result_expr, &ctx);
 
         // Structural assertions.
         assert!(
-            super::super::find_residual_apply(&result).is_none(),
+            super::super::find_residual_apply(&result_expr).is_none(),
             "Apply must be gone after transform"
         );
         let LogicalPlanNodeKind::Filter(after_filter) = &result.kind else {
@@ -2178,6 +2227,8 @@ mod tests {
 
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         ctx.set_column_ref_factory(Rc::new(RefCell::new(ColumnRefFactory::new())));
+        ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
+        let expr = to_opt_expr(&plan, &mut ctx);
 
         // Run only the SubqueryRewrite stage so the fixture doesn't need full column wiring.
         let pipeline = RewritePipeline::from_stages(vec![RewriteStage::new(
@@ -2185,13 +2236,14 @@ mod tests {
             RewritePhase::StructuralRewrite,
             subquery_rewrite_rules(),
         )]);
-        let result = pipeline
-            .rewrite(plan, &mut ctx)
+        let result_expr = pipeline
+            .rewrite(expr, &mut ctx)
             .expect("SubqueryRewrite stage must succeed for decorrelatable Apply");
+        let result = mat_plan(&result_expr, &ctx);
 
         // No Apply must survive.
         assert!(
-            super::super::find_residual_apply(&result).is_none(),
+            super::super::find_residual_apply(&result_expr).is_none(),
             "no Apply must survive after SubqueryRewrite stage"
         );
 
@@ -2218,19 +2270,22 @@ mod tests {
         // Disable ApplyToWindow → should fall back to ScalarApplyToJoin (LEFT OUTER JOIN form).
         let mut ctx = RewriteContext::for_query(vec!["ApplyToWindow".to_string()]);
         ctx.set_column_ref_factory(Rc::new(RefCell::new(ColumnRefFactory::new())));
+        ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
+        let expr = to_opt_expr(&plan, &mut ctx);
 
         let pipeline = RewritePipeline::from_stages(vec![RewriteStage::new(
             "SubqueryRewrite",
             RewritePhase::StructuralRewrite,
             subquery_rewrite_rules(),
         )]);
-        let result = pipeline
-            .rewrite(plan, &mut ctx)
+        let result_expr = pipeline
+            .rewrite(expr, &mut ctx)
             .expect("SubqueryRewrite stage must succeed when ApplyToWindow is disabled");
+        let result = mat_plan(&result_expr, &ctx);
 
         // No Apply must survive.
         assert!(
-            super::super::find_residual_apply(&result).is_none(),
+            super::super::find_residual_apply(&result_expr).is_none(),
             "no Apply must survive after SubqueryRewrite stage (disabled-ApplyToWindow path)"
         );
 
