@@ -13,14 +13,17 @@ use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
 use crate::sql::optimizer::scalar_bridge::{
     intern_aggregate_calls, intern_exprs, intern_project_items, intern_sort_items,
     intern_window_exprs, materialize_aggregate_calls, materialize_exprs, materialize_project_items,
-    materialize_sort_keys,
+    materialize_sort_keys, materialize_window_exprs,
 };
 use crate::sql::analysis::SortItem;
 use crate::sql::planner::plan::{
-    LogicalAggregateNode, LogicalAggregateStateMergeNode, LogicalFilterNode, LogicalImvDeltaNode,
-    LogicalImvVersionNode, LogicalJoinNode, LogicalLimitNode, LogicalPlanNode,
-    LogicalPlanNodeKind, LogicalProjectNode, LogicalScanNode, LogicalSortNode, LogicalUnionNode,
-    LogicalValuesNode,
+    LogicalAggregateNode, LogicalAggregateStateMergeNode, LogicalApplyNode,
+    LogicalAssertOneRowNode, LogicalCTEAnchorNode, LogicalCTEConsumeNode, LogicalCTEProduceNode,
+    LogicalDecodeNode, LogicalExceptNode, LogicalFilterNode, LogicalGenerateSeriesNode,
+    LogicalImvDeltaNode, LogicalImvVersionNode, LogicalIntersectNode, LogicalJoinNode,
+    LogicalLimitNode, LogicalPlanNode, LogicalPlanNodeKind, LogicalProjectNode, LogicalRepeatNode,
+    LogicalScanNode, LogicalSortNode, LogicalTableFunctionNode, LogicalUnionNode, LogicalValuesNode,
+    LogicalWindowNode,
 };
 
 /// Copy an `OptExpr` tree into the Memo as Groups (one Group per node).
@@ -468,12 +471,106 @@ pub(crate) fn opt_expr_to_logical_plan(expr: OptExpr, arena: &ScalarArena) -> Lo
                 version_ref: op.version_ref,
             })
         }
-        // The following operators are not expected in the IMV rewrite output
-        // but are included for completeness to avoid non-exhaustive patterns.
-        // If any of these panic in practice it means the IMV pipeline
-        // produced an unexpected operator kind.
+        Operator::LogicalAssertOneRow(op) => {
+            LogicalPlanNodeKind::AssertOneRow(LogicalAssertOneRowNode {
+                subquery_text: op.subquery_text,
+            })
+        }
+        Operator::LogicalIntersect(op) => {
+            LogicalPlanNodeKind::Intersect(LogicalIntersectNode {
+                output_columns: op.output_columns,
+            })
+        }
+        Operator::LogicalExcept(op) => {
+            LogicalPlanNodeKind::Except(LogicalExceptNode {
+                output_columns: op.output_columns,
+            })
+        }
+        Operator::LogicalGenerateSeries(op) => {
+            LogicalPlanNodeKind::GenerateSeries(LogicalGenerateSeriesNode {
+                start: op.start,
+                end: op.end,
+                step: op.step,
+                column_name: op.column_name,
+                alias: op.alias,
+                output_column_id: op.output_column_id,
+            })
+        }
+        Operator::LogicalTableFunction(op) => {
+            LogicalPlanNodeKind::TableFunction(LogicalTableFunctionNode {
+                function_name: op.function_name,
+                args: materialize_exprs(arena, &op.args),
+                output_columns: op.output_columns,
+                alias: op.alias,
+                is_left_join: op.is_left_join,
+            })
+        }
+        Operator::LogicalWindow(op) => {
+            let window_exprs = materialize_window_exprs(arena, &op.window_exprs, &op.output_columns);
+            LogicalPlanNodeKind::Window(LogicalWindowNode {
+                window_exprs,
+                output_columns: op.output_columns,
+            })
+        }
+        Operator::LogicalRepeat(op) => {
+            LogicalPlanNodeKind::Repeat(LogicalRepeatNode {
+                repeat_column_ref_list: op.repeat_column_ref_list,
+                repeat_column_ref_ids: op.repeat_column_ref_ids,
+                grouping_ids: op.grouping_ids,
+                all_rollup_columns: op.all_rollup_columns,
+                all_rollup_column_ids: op.all_rollup_column_ids,
+                grouping_key_aliases: op.grouping_key_aliases,
+                grouping_fn_args: op.grouping_fn_args,
+                grouping_fn_arg_ids: op.grouping_fn_arg_ids,
+                grouping_fn_ids: op.grouping_fn_ids,
+            })
+        }
+        Operator::LogicalCTEAnchor(op) => {
+            LogicalPlanNodeKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: op.cte_id })
+        }
+        Operator::LogicalCTEProduce(op) => {
+            LogicalPlanNodeKind::CTEProduce(LogicalCTEProduceNode {
+                cte_id: op.cte_id,
+                output_columns: op.output_columns,
+            })
+        }
+        Operator::LogicalCTEConsume(op) => {
+            LogicalPlanNodeKind::CTEConsume(LogicalCTEConsumeNode {
+                cte_id: op.cte_id,
+                alias: op.alias,
+                output_columns: op.output_columns,
+            })
+        }
+        Operator::LogicalDecode(op) => {
+            LogicalPlanNodeKind::Decode(LogicalDecodeNode {
+                mappings: op.mappings,
+                output_columns: op.output_columns,
+            })
+        }
+        Operator::LogicalApply(op) => {
+            // Apply is expected to be eliminated by the SubqueryRewrite stage
+            // before opt_expr_to_logical_plan is called. If it survives, we
+            // still need to materialize it correctly for callers that inspect
+            // the plan before memo conversion.
+            LogicalPlanNodeKind::Apply(LogicalApplyNode {
+                kind: op.kind,
+                subquery_expr: crate::sql::optimizer::scalar::materialize(arena, op.subquery_expr),
+                output_column: op.output_column,
+                inner_output_column_id: op.inner_output_column_id,
+                correlation_column_ids: op.correlation_column_ids,
+                correlation_conjuncts: materialize_exprs(arena, &op.correlation_conjuncts),
+                residual_predicate: op.residual_predicate.map(|id| {
+                    crate::sql::optimizer::scalar::materialize(arena, id)
+                }),
+                need_check_max_rows: op.need_check_max_rows,
+                use_semi_anti: op.use_semi_anti,
+                uncorrelated_outer_predicate_columns: op.uncorrelated_outer_predicate_columns,
+            })
+        }
+        // Physical operators should never reach opt_expr_to_logical_plan.
         other => panic!(
-            "opt_expr_to_logical_plan: unexpected operator kind {:?} in IMV rewrite output",
+            "opt_expr_to_logical_plan: unexpected operator kind {:?} — \
+             physical/unknown operators cannot be materialized to LogicalPlanNode",
             other
         ),
     };

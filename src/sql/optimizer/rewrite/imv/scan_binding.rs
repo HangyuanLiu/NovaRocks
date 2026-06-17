@@ -235,6 +235,9 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use crate::sql::optimizer::convert::logical_plan_to_opt_expr;
     use crate::sql::optimizer::rewrite::imv::action_propagation::InjectActionColumnRule;
     use crate::sql::optimizer::rewrite::imv::annotation::{ImvExtension, ImvPlanAnnotation};
@@ -336,6 +339,8 @@ mod tests {
     #[test]
     fn bind_delta_marker_preserves_existing_action_column_id_for_injection() {
         let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
+        let arena = Rc::new(RefCell::new(ScalarArena::new()));
+        ctx.set_scalar_arena(Rc::clone(&arena));
         ctx.set_extension::<ImvExtension>(ImvExtension {
             mv_ctx: dummy_rewrite_context(),
             annotation: ImvPlanAnnotation::default(),
@@ -355,8 +360,7 @@ mod tests {
             None,
         );
         let bind = BindIcebergScanRule;
-        let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut());
         let RewriteResult::Changed(changed_expr) =
             bind.apply(expr, &mut ctx).expect("bind must succeed")
         else {
@@ -384,6 +388,8 @@ mod tests {
     #[test]
     fn bind_delta_marker_rebinds_preexisting_action_column_to_marker_id() {
         let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
+        let arena = Rc::new(RefCell::new(ScalarArena::new()));
+        ctx.set_scalar_arena(Rc::clone(&arena));
         ctx.set_extension::<ImvExtension>(ImvExtension {
             mv_ctx: dummy_rewrite_context(),
             annotation: ImvPlanAnnotation::default(),
@@ -412,8 +418,7 @@ mod tests {
         );
 
         let bind = BindIcebergScanRule;
-        let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut());
         let RewriteResult::Changed(changed_expr) =
             bind.apply(expr, &mut ctx).expect("bind must succeed")
         else {

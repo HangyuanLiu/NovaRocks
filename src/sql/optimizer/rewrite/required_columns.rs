@@ -860,7 +860,7 @@ mod tests {
             data_type: DataType::Int32,
             nullable: false,
         };
-        scalar::intern(arena, &expr)
+        scalar::intern_typed(arena, &expr)
     }
 
     fn int_literal_scalar(arena: &mut ScalarArena, v: i64) -> crate::sql::optimizer::scalar::ScalarId {
@@ -869,7 +869,7 @@ mod tests {
             data_type: DataType::Int64,
             nullable: false,
         };
-        scalar::intern(arena, &expr)
+        scalar::intern_typed(arena, &expr)
     }
 
     fn binop_scalar(
@@ -889,7 +889,7 @@ mod tests {
             data_type: DataType::Boolean,
             nullable: false,
         };
-        scalar::intern(arena, &expr)
+        scalar::intern_typed(arena, &expr)
     }
 
     fn make_scan_with_ids(arena_rc: &Rc<RefCell<ScalarArena>>, id_a: u32, id_b: u32, id_c: u32) -> OptExpr {
@@ -1533,7 +1533,7 @@ mod tests {
                     args: vec![],
                     distinct: false,
                     partition_by: vec![part_by],
-                    order_by: vec![SortKey { expr: order_by, asc: true, nulls_first: false }],
+                    order_by: vec![SortKey { expr: order_by, asc: true, nulls_first: false, display: None }],
                     window_frame: None,
                     ignore_nulls: false,
                 }],
@@ -1578,7 +1578,7 @@ mod tests {
                     args: vec![],
                     distinct: false,
                     partition_by: vec![part_by],
-                    order_by: vec![SortKey { expr: order_by, asc: true, nulls_first: false }],
+                    order_by: vec![SortKey { expr: order_by, asc: true, nulls_first: false, display: None }],
                     window_frame: None,
                     ignore_nulls: false,
                 }],
@@ -1614,7 +1614,7 @@ mod tests {
 
         let sort = OptExpr::new(
             Operator::LogicalSort(SortOp {
-                items: vec![SortKey { expr: col3, asc: true, nulls_first: false }],
+                items: vec![SortKey { expr: col3, asc: true, nulls_first: false, display: None }],
                 analytic_partition_exprs: vec![],
                 partition_limit: None,
                 topn_type: None,
@@ -1721,7 +1721,7 @@ mod tests {
 
         let sort = OptExpr::new(
             Operator::LogicalSort(SortOp {
-                items: vec![SortKey { expr: col3, asc: true, nulls_first: false }],
+                items: vec![SortKey { expr: col3, asc: true, nulls_first: false, display: None }],
                 analytic_partition_exprs: vec![col2],
                 partition_limit: None,
                 topn_type: None,

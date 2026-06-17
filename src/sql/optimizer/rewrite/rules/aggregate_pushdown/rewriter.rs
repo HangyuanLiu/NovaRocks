@@ -196,30 +196,29 @@ pub(crate) fn rewrite(
             }
         })
         .collect();
-    let final_agg_output_cols: Vec<OutputColumn> = final_specs
-        .iter()
-        .enumerate()
-        .map(|(idx, spec)| {
-            let display_name = agg_spec_display_name(spec, arena);
-            let result_type = original
-                .output_columns
-                .get(group_by_len + idx)
-                .map(|c| c.data_type.clone())
-                .or_else(|| {
-                    spec.args
-                        .first()
-                        .map(|id| materialize(arena, *id).data_type)
-                })
-                .unwrap_or(arrow::datatypes::DataType::Int64);
-            OutputColumn {
-                column_id: ColumnId::UNSET,
-                name: display_name,
-                data_type: result_type,
-                nullable: true,
-                is_internal: false,
-            }
-        })
-        .collect();
+    let mut final_agg_output_cols: Vec<OutputColumn> = Vec::with_capacity(final_specs.len());
+    for (idx, spec) in final_specs.iter().enumerate() {
+        let display_name = agg_spec_display_name(spec, arena);
+        let result_type = original
+            .output_columns
+            .get(group_by_len + idx)
+            .map(|c| c.data_type.clone())
+            .or_else(|| {
+                spec.args
+                    .first()
+                    .map(|id| materialize(arena, *id).data_type)
+            })
+            .unwrap_or(arrow::datatypes::DataType::Int64);
+        let col_id =
+            column_ref_factory.create(None, display_name.clone(), result_type.clone(), true);
+        final_agg_output_cols.push(OutputColumn {
+            column_id: col_id,
+            name: display_name,
+            data_type: result_type,
+            nullable: true,
+            is_internal: false,
+        });
+    }
     final_output_cols.extend(final_agg_output_cols);
 
     let is_merge_final = vec![false; final_specs.len()];
@@ -353,10 +352,22 @@ mod tests {
     use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
     use arrow::datatypes::DataType;
 
+    /// Deterministic test ColumnId for a column name: hash the name bytes to get a
+    /// non-zero u32 that is stable across invocations.
+    fn test_col_id(name: &str) -> ColumnId {
+        let mut h: u32 = 2166136261;
+        for b in name.bytes() {
+            h ^= b as u32;
+            h = h.wrapping_mul(16777619);
+        }
+        // Ensure non-zero (ColumnId(0) is UNSET).
+        ColumnId::new_for_test((h % 10000) + 1)
+    }
+
     fn col_ref_typed(name: &str, ty: DataType) -> crate::sql::analysis::TypedExpr {
         crate::sql::analysis::TypedExpr {
             kind: ExprKind::ColumnRef {
-                column_id: ColumnId::UNSET,
+                column_id: test_col_id(name),
                 qualifier: None,
                 column: name.into(),
             },
@@ -366,7 +377,7 @@ mod tests {
     }
 
     fn scan_opt(name: &str, cols: &[(&str, DataType)]) -> OptExpr {
-        scan_opt_with_alias(name, None, &cols.iter().map(|(c, ty)| (*c, ColumnId::UNSET, ty.clone())).collect::<Vec<_>>())
+        scan_opt_with_alias(name, None, &cols.iter().map(|(c, ty)| (*c, test_col_id(c), ty.clone())).collect::<Vec<_>>())
     }
 
     fn scan_opt_with_alias(

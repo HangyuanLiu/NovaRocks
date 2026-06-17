@@ -1,5 +1,6 @@
 //! LowCardinalityDictionaryRewrite — the rule wrapper.
 
+use crate::sql::optimizer::convert::{logical_plan_to_opt_expr, opt_expr_to_logical_plan};
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
@@ -28,18 +29,45 @@ impl LogicalRewriteRule for LowCardinalityDictionaryRewriteRule {
 
     fn apply(
         &self,
-        _expr: OptExpr,
-        _ctx: &mut RewriteContext,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
     ) -> Result<RewriteResult, String> {
-        // TODO(A2-lcd): collector and rewriter still operate on LogicalPlanNode;
-        // stub until collector.rs and rewriter.rs are migrated to OptExpr.
-        todo!("LowCardinalityDictionaryRewrite apply: migrate collector/rewriter to OptExpr first")
+        // Bridge: convert OptExpr to LogicalPlanNode, run the existing
+        // collector + rewriter (which still operate on LogicalPlanNode),
+        // then convert the result back to OptExpr.
+        //
+        // TODO(A2-lcd): migrate collector.rs and rewriter.rs to OptExpr
+        // natively so this bridge round-trip can be removed.
+        let arena_rc = ctx.scalar_arena();
+        let plan = {
+            let arena = arena_rc.borrow();
+            opt_expr_to_logical_plan(expr, &arena)
+        };
+        let mut dict_ctx = super::collector::collect(&plan, ctx)?;
+        // Fast-path: if the collector found no eligible columns (provider
+        // returned None for every scan column), the rewriter would be a
+        // no-op. Return Unchanged to avoid the plan cloning cost.
+        if !dict_ctx.has_any_scan_column() {
+            return Ok(RewriteResult::Unchanged);
+        }
+        let rewritten_plan = super::rewriter::rewrite(plan, &mut dict_ctx)?;
+        let opt_expr = {
+            let mut arena = arena_rc.borrow_mut();
+            logical_plan_to_opt_expr(&rewritten_plan, &mut arena)
+        };
+        Ok(RewriteResult::Changed(opt_expr))
     }
 }
 
 fn contains_scan(expr: &OptExpr) -> bool {
     match &expr.op {
-        Operator::LogicalScan(_) => true,
+        Operator::LogicalScan(scan) => {
+            // The rewriter is idempotent: a scan whose dict_columns is
+            // already populated was already rewritten by a prior pass.
+            // Return false for such scans so the TopDown driver does not
+            // fire the rule again on the already-rewritten subtree.
+            scan.dict_columns.is_empty()
+        }
         // ImvDelta/ImvVersion are not present in the OptExpr Operator enum;
         // the panic that existed in the LogicalPlanNode version is intentionally
         // dropped here — those variants are planner-internal and never reach

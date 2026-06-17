@@ -376,7 +376,8 @@ mod tests {
         let (scan_out, scan_op) = scan_after_round1;
         // Round 2: same predicate above scan that already carries it.
         let pred_id = {
-            let mut arena = ctx.scalar_arena().borrow_mut();
+            let arena_rc = ctx.scalar_arena();
+            let mut arena = arena_rc.borrow_mut();
             scalar::intern_typed(&mut arena, &is_not_null(col("a")))
         };
         let filter2 = OptExpr::new(

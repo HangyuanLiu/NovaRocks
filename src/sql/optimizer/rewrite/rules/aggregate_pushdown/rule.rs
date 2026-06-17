@@ -146,9 +146,13 @@ mod tests {
 
     #[test]
     fn stub_returns_none() {
+        use crate::sql::optimizer::scalar::ScalarArena;
+        use std::cell::RefCell;
+        use std::rc::Rc;
         let rule = AggregatePushdownRule::new(Arc::new(HashMap::new()));
         let plan = dummy_aggregate();
         let mut ctx = RewriteContext::new(RewriteConsumer::Query);
+        ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
         assert!(rule.matches(&plan, &ctx));
         assert!(matches!(
             rule.apply(plan, &mut ctx).unwrap(),
@@ -165,9 +169,16 @@ mod tests {
         use std::rc::Rc;
 
         fn col_typed(name: &str) -> crate::sql::analysis::TypedExpr {
+            // Use a stable non-UNSET ColumnId derived from the name bytes (FNV-1a).
+            let mut h: u32 = 2166136261;
+            for b in name.bytes() {
+                h ^= b as u32;
+                h = h.wrapping_mul(16777619);
+            }
+            let col_id = ColumnId::new_for_test((h % 10000) + 1);
             crate::sql::analysis::TypedExpr {
                 kind: ExprKind::ColumnRef {
-                    column_id: ColumnId::UNSET,
+                    column_id: col_id,
                     qualifier: None,
                     column: name.into(),
                 },

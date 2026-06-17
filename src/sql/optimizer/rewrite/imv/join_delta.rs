@@ -435,12 +435,12 @@ mod tests {
             vec![join_of(scan("l", 1), scan("r", 10))],
             None,
         );
-        let mut arena = ScalarArena::new();
-        let non_root_expr = logical_plan_to_opt_expr(&non_root, &mut arena);
+        let arena_rc = ctx.scalar_arena();
+        let non_root_expr = logical_plan_to_opt_expr(&non_root, &mut arena_rc.borrow_mut());
         assert!(rule.matches(&non_root_expr, &ctx));
 
         let over_agg = delta(aggregate_over(join_over(JoinKind::Inner)));
-        let over_agg_expr = logical_plan_to_opt_expr(&over_agg, &mut arena);
+        let over_agg_expr = logical_plan_to_opt_expr(&over_agg, &mut arena_rc.borrow_mut());
         assert!(!rule.matches(&over_agg_expr, &ctx));
     }
 
@@ -458,8 +458,8 @@ mod tests {
             None,
         );
 
-        let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
         let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("expand") else {
             panic!("pure join-delta must expand ImvDelta(Join) directly into a Union");
         };
@@ -505,8 +505,8 @@ mod tests {
             None,
         );
 
-        let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
         let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("expand") else {
             panic!("pure join-delta must expand into a Union");
         };
@@ -552,8 +552,8 @@ mod tests {
             None,
         );
 
-        let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
         let err = rule.apply(expr, &mut ctx).expect_err("outer must reject");
         assert!(err.contains("inner/cross"), "unexpected: {err}");
     }
@@ -574,8 +574,8 @@ mod tests {
             None,
         );
 
-        let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
         let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("expand outer")
         else {
             panic!("expected Union");
@@ -680,6 +680,7 @@ mod tests {
 
     fn build_ctx() -> RewriteContext {
         let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
+        ctx.set_scalar_arena(std::rc::Rc::new(std::cell::RefCell::new(ScalarArena::new())));
         ctx.set_extension::<ImvExtension>(ImvExtension {
             mv_ctx: dummy_rewrite_context(),
             annotation: ImvPlanAnnotation::default(),

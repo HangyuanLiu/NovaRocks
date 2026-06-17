@@ -462,10 +462,23 @@ mod tests {
         ctx
     }
 
+    /// Compute a stable non-zero test column ID from a (qualifier, name) pair.
+    /// Uses a FNV-like hash to avoid the ColumnId::UNSET sentinel (0).
+    fn test_col_id(qualifier: Option<&str>, name: &str) -> ColumnId {
+        let mut hash: u32 = 2166136261;
+        for b in qualifier.unwrap_or("").bytes().chain(std::iter::once(b'.')).chain(name.bytes()) {
+            hash ^= b as u32;
+            hash = hash.wrapping_mul(16777619);
+        }
+        // Ensure non-zero (UNSET is 0).
+        let id = if hash == 0 { 1 } else { hash };
+        ColumnId::new_for_test(id)
+    }
+
     fn col_ref_typed(name: &str, ty: DataType) -> crate::sql::analysis::TypedExpr {
         crate::sql::analysis::TypedExpr {
             kind: ExprKind::ColumnRef {
-                column_id: ColumnId::UNSET,
+                column_id: test_col_id(None, name),
                 qualifier: None,
                 column: name.into(),
             },
@@ -477,7 +490,7 @@ mod tests {
     fn qualified_col_ref_typed(qualifier: &str, name: &str, ty: DataType) -> crate::sql::analysis::TypedExpr {
         crate::sql::analysis::TypedExpr {
             kind: ExprKind::ColumnRef {
-                column_id: ColumnId::UNSET,
+                column_id: test_col_id(Some(qualifier), name),
                 qualifier: Some(qualifier.into()),
                 column: name.into(),
             },
@@ -537,7 +550,9 @@ mod tests {
             columns: cols
                 .iter()
                 .map(|(n, ty)| OutputColumn {
-                    column_id: ColumnId::UNSET,
+                    // Use the same stable ID that col_ref_typed would assign so
+                    // the collector can match group_by ColumnIds to scan columns.
+                    column_id: test_col_id(alias, n),
                     name: (*n).into(),
                     data_type: ty.clone(),
                     nullable: false,
@@ -548,6 +563,7 @@ mod tests {
             required_columns: None,
             dict_columns: vec![],
             variant_columns: vec![],
+            mv_rewritten_from: None,
         }))
     }
 

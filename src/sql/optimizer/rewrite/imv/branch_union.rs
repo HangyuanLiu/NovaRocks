@@ -383,8 +383,8 @@ mod tests {
             None,
         ));
 
-        let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
         assert!(rule.matches(&expr, &ctx));
         let RewriteResult::Changed(rewritten_expr) = rule.apply(expr, &mut ctx).expect("rewrite") else {
             panic!("expected Changed(Union)");
@@ -444,8 +444,8 @@ mod tests {
             None,
         ));
 
-        let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
         assert!(rule.matches(&expr, &ctx));
         let RewriteResult::Changed(rewritten_expr) = rule.apply(expr, &mut ctx).expect("rewrite") else {
             panic!("expected Changed(Union)");
@@ -505,8 +505,8 @@ mod tests {
             None,
         ));
 
-        let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
         let err = rule
             .apply(expr, &mut ctx)
             .expect_err("scan branch must fail");
@@ -540,8 +540,8 @@ mod tests {
             None,
         ));
 
-        let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
         assert!(!rule.matches(&expr, &ctx));
     }
 
@@ -558,8 +558,8 @@ mod tests {
             None,
         ));
 
-        let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
         assert!(!rule.matches(&expr, &ctx));
     }
 
@@ -580,8 +580,8 @@ mod tests {
             None,
         );
 
-        let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
         let out_expr = build_imv_pipeline()
             .rewrite(expr, &mut ctx)
             .expect("pipeline must succeed");
@@ -751,6 +751,7 @@ mod tests {
         );
 
         let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
+        ctx.set_scalar_arena(std::rc::Rc::new(std::cell::RefCell::new(ScalarArena::new())));
         ctx.set_extension::<ImvExtension>(ImvExtension {
             mv_ctx,
             annotation: ImvPlanAnnotation::default(),
@@ -983,8 +984,8 @@ mod tests {
         let filtered = filter_over(join, 1, "region");
         let plan = aggregate_over(filtered);
 
-        let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
         let out_expr = build_imv_pipeline()
             .rewrite(expr, &mut ctx)
             .expect("aggregate over filtered join must compose");
@@ -1008,8 +1009,8 @@ mod tests {
         let outer = join_of_on(inner, scan("b", 20), 1, 20);
         let plan = aggregate_over(outer);
 
-        let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
         let out_expr = build_imv_pipeline()
             .rewrite(expr, &mut ctx)
             .expect("aggregate over nested join must compose");
@@ -1043,8 +1044,8 @@ mod tests {
             None,
         );
 
-        let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
         let out_expr = build_imv_pipeline()
             .rewrite(expr, &mut ctx)
             .expect("branch union of Project-over-Aggregate must compose");
@@ -1105,8 +1106,8 @@ mod tests {
             None,
         );
 
-        let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
         let out_expr = build_imv_pipeline()
             .rewrite(expr, &mut ctx)
             .expect("branch union of aggregate-over-join must compose");

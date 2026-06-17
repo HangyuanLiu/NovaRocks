@@ -541,6 +541,9 @@ mod tests {
         ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
     use crate::sql::column_id::ColumnId;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use crate::sql::optimizer::convert::{logical_plan_to_opt_expr, opt_expr_to_logical_plan};
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::imv::annotation::{ImvExtension, ImvPlanAnnotation};
@@ -552,6 +555,7 @@ mod tests {
 
     fn build_ctx() -> RewriteContext {
         let mut ctx = RewriteContext::for_mv_refresh(Vec::new());
+        ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
         ctx.set_extension::<ImvExtension>(ImvExtension {
             mv_ctx: dummy_rewrite_context(),
             annotation: ImvPlanAnnotation::default(),
@@ -1153,14 +1157,14 @@ mod tests {
         let mut ctx = build_ctx();
         let scan = scan_plan(delta_scan_with_action(ColumnId(100)));
         let plan = project_over(scan, ColumnId(1));
-        let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
         assert!(rule.matches(&expr, &ctx));
         let result = rule.apply(expr, &mut ctx).expect("apply must succeed");
         let RewriteResult::Changed(changed_expr) = result else {
             panic!("expected Changed(Project)");
         };
-        let changed = opt_expr_to_logical_plan(changed_expr, &arena);
+        let changed = opt_expr_to_logical_plan(changed_expr, &arena_rc.borrow());
         let LogicalPlanNodeKind::Project(project) = changed.kind else {
             panic!("expected Changed(Project)");
         };
@@ -1196,8 +1200,8 @@ mod tests {
                 output_column_id: ColumnId(100),
             });
         }
-        let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
         assert!(!rule.matches(&expr, &ctx));
     }
 
@@ -1312,8 +1316,8 @@ mod tests {
             is_supported_join_delta_branch(&plan),
             "recursive join-delta union should classify as the delta-like side"
         );
-        let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
         assert!(
             !rule.matches(&expr, &ctx),
             "supported recursive join-delta branch must not be rejected"
@@ -1346,8 +1350,8 @@ mod tests {
             None,
         );
 
-        let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&union, &mut arena);
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&union, &mut arena_rc.borrow_mut());
         assert!(!rule.matches(&expr, &ctx));
     }
 
@@ -1376,11 +1380,11 @@ mod tests {
     #[test]
     fn supported_branch_union_is_not_rejected_by_propagation() {
         let rule = PropagateActionColumnRule;
-        let ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
+        let mut ctx = build_ctx();
         let plan = branch_union_with_aggregate_state_merge();
 
-        let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
         assert!(!rule.matches(&expr, &ctx));
         let LogicalPlanNodeKind::Union(_) = &plan.kind else {
             panic!("expected union");
@@ -1391,7 +1395,7 @@ mod tests {
     #[test]
     fn supported_branch_union_project_is_not_rewritten_before_parent_union() {
         let rule = PropagateActionColumnRule;
-        let ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
+        let mut ctx = build_ctx();
         let plan = branch_union_with_aggregate_state_merge();
         let LogicalPlanNodeKind::Union(_) = &plan.kind else {
             panic!("expected union");
@@ -1400,8 +1404,8 @@ mod tests {
 
         assert!(is_supported_branch_union_project(branch_project));
         assert!(!descendant_internal_columns(branch_project.unary_input()).is_empty());
-        let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(branch_project, &mut arena);
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(branch_project, &mut arena_rc.borrow_mut());
         assert!(!rule.matches(&expr, &ctx));
     }
 
@@ -1421,8 +1425,8 @@ mod tests {
             None,
         );
 
-        let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&union, &mut arena);
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&union, &mut arena_rc.borrow_mut());
         assert!(rule.matches(&expr, &ctx));
         let err = rule.apply(expr, &mut ctx).expect_err("Union must fail");
         assert!(err.contains("Phase 6"), "unexpected error: {err}");
@@ -1445,8 +1449,8 @@ mod tests {
             None,
         );
 
-        let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&union, &mut arena);
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&union, &mut arena_rc.borrow_mut());
         assert!(!rule.matches(&expr, &ctx));
     }
 
@@ -1466,8 +1470,9 @@ mod tests {
             None,
         );
 
-        let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&union, &mut arena);
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&union, &mut arena_rc.borrow_mut());
+        drop(arena_rc);
         assert!(rule.matches(&expr, &ctx));
         let err = rule.apply(expr, &mut ctx).expect_err("Union must fail");
         assert!(err.contains("Phase 6"), "unexpected error: {err}");
@@ -1484,13 +1489,15 @@ mod tests {
         scan.columns
             .push(ImvRowIdColumn::output_column(ColumnId(101)));
         let plan = project_over(scan_plan(scan), ColumnId(1));
-        let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        drop(arena_rc);
         assert!(rule.matches(&expr, &ctx));
         let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("apply") else {
             panic!("expected Changed(Project)");
         };
-        let changed = opt_expr_to_logical_plan(changed_expr, &arena);
+        let arena_rc = ctx.scalar_arena();
+        let changed = opt_expr_to_logical_plan(changed_expr, &arena_rc.borrow());
         let LogicalPlanNodeKind::Project(project) = changed.kind else {
             panic!("expected Changed(Project)");
         };
@@ -1519,21 +1526,23 @@ mod tests {
             vec![scan],
             None,
         );
-        let mut arena = ScalarArena::new();
+        let arena_rc = ctx.scalar_arena();
         // Filter itself must not match (schema-passthrough, no work).
-        let filter_expr = logical_plan_to_opt_expr(&filter, &mut arena);
+        let filter_expr = logical_plan_to_opt_expr(&filter, &mut arena_rc.borrow_mut());
         assert!(!rule.matches(&filter_expr, &ctx));
         // find_action_column traverses the Filter to the Scan.
         assert!(find_action_column(&filter).is_some());
         // Project over the Filter propagates the action column.
         let project = project_over(filter, ColumnId(1));
-        let project_expr = logical_plan_to_opt_expr(&project, &mut arena);
+        let project_expr = logical_plan_to_opt_expr(&project, &mut arena_rc.borrow_mut());
+        drop(arena_rc);
         assert!(rule.matches(&project_expr, &ctx));
         let result = rule.apply(project_expr, &mut ctx).expect("apply must succeed");
         let RewriteResult::Changed(changed_expr) = result else {
             panic!("expected Changed(Project)");
         };
-        let changed = opt_expr_to_logical_plan(changed_expr, &arena);
+        let arena_rc = ctx.scalar_arena();
+        let changed = opt_expr_to_logical_plan(changed_expr, &arena_rc.borrow());
         let LogicalPlanNodeKind::Project(p) = changed.kind else {
             panic!("expected Changed(Project)");
         };

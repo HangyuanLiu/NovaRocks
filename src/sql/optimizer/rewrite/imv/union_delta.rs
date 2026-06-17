@@ -496,8 +496,8 @@ mod tests {
         let rule = RewriteUnionAggregateDeltaRule;
         let ctx = build_ctx();
         let plan = delta(aggregate_over(source_union(true)));
-        let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
         assert!(rule.matches(&expr, &ctx));
     }
 
@@ -506,8 +506,8 @@ mod tests {
         let rule = RewriteUnionAggregateDeltaRule;
         let ctx = build_ctx();
         let plan = delta(aggregate_over(marked_source_union()));
-        let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
         assert!(!rule.matches(&expr, &ctx));
     }
 
@@ -517,8 +517,8 @@ mod tests {
         let mut ctx = build_ctx();
         let plan = delta(aggregate_over(source_union(true)));
 
-        let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
         assert!(rule.matches(&expr, &ctx));
         let RewriteResult::Changed(rewritten_expr) = rule
             .apply(expr, &mut ctx)
@@ -580,8 +580,8 @@ mod tests {
         let mut ctx = build_ctx();
         let plan = delta(project_filter_union(true));
 
-        let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
         assert!(rule.matches(&expr, &ctx));
         let RewriteResult::Changed(rewritten_expr) = rule
             .apply(expr, &mut ctx)
@@ -636,8 +636,8 @@ mod tests {
             required_output_columns(),
         ));
 
-        let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
         assert!(rule.matches(&expr, &ctx));
         let err = rule
             .apply(expr, &mut ctx)
@@ -661,8 +661,8 @@ mod tests {
             required_output_columns(),
         ));
 
-        let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
         assert!(rule.matches(&expr, &ctx));
         let err = rule
             .apply(expr, &mut ctx)
@@ -679,8 +679,8 @@ mod tests {
         let mut ctx = build_ctx();
         let plan = delta(project_filter_union(false));
 
-        let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
         assert!(!rule.matches(&expr, &ctx));
         let err = rule
             .apply(expr, &mut ctx)
@@ -693,6 +693,7 @@ mod tests {
 
     fn build_ctx() -> RewriteContext {
         let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
+        ctx.set_scalar_arena(std::rc::Rc::new(std::cell::RefCell::new(ScalarArena::new())));
         ctx.set_extension::<ImvExtension>(ImvExtension {
             mv_ctx: dummy_rewrite_context(),
             annotation: ImvPlanAnnotation::default(),

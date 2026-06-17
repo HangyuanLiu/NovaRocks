@@ -367,14 +367,29 @@ fn lookup_passthrough_projection(
     proj: &ProjectOp,
     arena: &ScalarArena,
 ) -> Option<TypedExpr> {
+    use crate::sql::optimizer::scalar::ScalarNode;
     for item in &proj.items {
-        // Materialize item.expr to check whether it is a bare ColumnRef.
-        let item_expr = scalar::materialize(arena, item.expr);
-        if !matches!(item_expr.kind, ExprKind::ColumnRef { .. }) {
+        // Check directly whether the item is a bare ColumnRef without going
+        // through the display-lookup path (which can be polluted by later
+        // intern_typed calls that overwrite the qualifier for the same column_id).
+        let ScalarNode::ColumnRef(input_col_id) = arena.node(item.expr) else {
             continue;
-        }
+        };
+        let input_col_id = *input_col_id;
+        // The pushed predicate must reference the INPUT column without the
+        // project's output_qualifier — the qualifier belongs to the project's
+        // aliased output, not the underlying column.
+        let stripped = TypedExpr {
+            data_type: arena.data_type(item.expr).clone(),
+            nullable: arena.nullable(item.expr),
+            kind: ExprKind::ColumnRef {
+                column_id: input_col_id,
+                qualifier: None,
+                column: item.output_name.clone(),
+            },
+        };
         if column_id != ColumnId::UNSET && item.output_column_id == column_id {
-            return Some(item_expr);
+            return Some(stripped);
         }
         if let Some(ref output_qualifier) = proj.output_qualifier
             && !qualifier
@@ -384,7 +399,7 @@ fn lookup_passthrough_projection(
             continue;
         }
         if item.output_name.eq_ignore_ascii_case(column) {
-            return Some(item_expr);
+            return Some(stripped);
         }
     }
     None
@@ -635,12 +650,18 @@ mod tests {
                 };
                 assert!(*negated);
                 let ExprKind::ColumnRef {
-                    qualifier, column, ..
+                    column_id: pushed_col_id,
+                    column,
+                    ..
                 } = &expr.kind
                 else {
                     panic!("expected pushed predicate to reference the Project input column");
                 };
-                assert!(qualifier.is_none());
+                // The pushed predicate must reference the underlying input column
+                // (by column_id, which is the semantic identity in the arena model).
+                // The qualifier is display-only and may reflect the intern_typed order,
+                // so we do not assert on it here.
+                assert_eq!(*pushed_col_id, item_sk_id);
                 assert_eq!(column, "item_sk");
             }
             other => panic!("expected Changed, got {:?}", other),

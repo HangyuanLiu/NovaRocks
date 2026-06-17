@@ -326,8 +326,23 @@ mod tests {
             panic!("expected binary condition, got: {condition:?}");
         };
         assert_eq!(*op, BinOp::Eq);
-        assert_column_id(left, OUTER_K);
-        assert_column_id(right, INNER_K);
+        // The arena normalizes commutative Eq by ScalarId order, so the
+        // left/right assignment is an implementation detail rather than a
+        // semantic guarantee. Assert that the two expected column ids appear
+        // somewhere in the condition, regardless of which side is "left".
+        let left_id = match &left.kind {
+            ExprKind::ColumnRef { column_id, .. } => *column_id,
+            other => panic!("expected column ref on left, got: {other:?}"),
+        };
+        let right_id = match &right.kind {
+            ExprKind::ColumnRef { column_id, .. } => *column_id,
+            other => panic!("expected column ref on right, got: {other:?}"),
+        };
+        let pair = (left_id, right_id);
+        assert!(
+            pair == (OUTER_K, INNER_K) || pair == (INNER_K, OUTER_K),
+            "expected correlation condition to reference OUTER_K and INNER_K; got {pair:?}"
+        );
     }
 
     fn assert_true_condition(condition: &TypedExpr) {

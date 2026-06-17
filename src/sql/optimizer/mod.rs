@@ -635,7 +635,11 @@ mod is_known_rule_name_tests {
         QueryDictionaryProvider, RewriteContext, current_dictionary_provider,
         with_dictionary_provider,
     };
+    use std::cell::RefCell;
+
+    use crate::sql::optimizer::convert::{logical_plan_to_opt_expr, opt_expr_to_logical_plan};
     use crate::sql::optimizer::rewrite::registry::query_rewrite_pipeline;
+    use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::{
         AggregateCall, LogicalAggregateNode, LogicalPlanNode, LogicalPlanNodeKind, LogicalScanNode,
     };
@@ -690,6 +694,9 @@ mod is_known_rule_name_tests {
     /// Build the minimal Aggregate(Scan) shape that the rewrite rule
     /// can act on: GROUP BY on the string column `s`.
     fn agg_over_string_scan() -> LogicalPlanNode {
+        // Use deterministic non-UNSET column IDs so that intern_typed succeeds.
+        let s_id = ColumnId::new_for_test(1);
+        let cnt_id = ColumnId::new_for_test(2);
         let table = TableDef {
             name: "t".to_string(),
             columns: vec![ColumnDef {
@@ -706,7 +713,7 @@ mod is_known_rule_name_tests {
             },
         };
         let s_col = OutputColumn {
-            column_id: ColumnId::UNSET,
+            column_id: s_id,
             name: "s".to_string(),
             data_type: DataType::Utf8,
             nullable: false,
@@ -728,7 +735,7 @@ mod is_known_rule_name_tests {
         );
         let s_ref = TypedExpr {
             kind: ExprKind::ColumnRef {
-                column_id: ColumnId::UNSET,
+                column_id: s_id,
                 qualifier: None,
                 column: "s".to_string(),
             },
@@ -744,12 +751,12 @@ mod is_known_rule_name_tests {
                     distinct: false,
                     result_type: DataType::Int64,
                     order_by: vec![],
-                    output_column_id: ColumnId::UNSET,
+                    output_column_id: cnt_id,
                 }],
                 output_columns: vec![
                     s_col,
                     OutputColumn {
-                        column_id: ColumnId::UNSET,
+                        column_id: cnt_id,
                         name: "cnt".to_string(),
                         data_type: DataType::Int64,
                         nullable: false,
@@ -772,7 +779,13 @@ mod is_known_rule_name_tests {
         }
         let table_stats = HashMap::new();
         let pipeline = query_rewrite_pipeline(&table_stats);
-        pipeline.rewrite(agg_over_string_scan(), &mut ctx).unwrap()
+        let mut scalars = ScalarArena::new();
+        let opt_plan = logical_plan_to_opt_expr(&agg_over_string_scan(), &mut scalars);
+        let arena_rc = Rc::new(RefCell::new(scalars));
+        ctx.set_scalar_arena(arena_rc.clone());
+        let opt_result = pipeline.rewrite(opt_plan, &mut ctx).unwrap();
+        let arena = arena_rc.borrow();
+        opt_expr_to_logical_plan(opt_result, &arena)
     }
 
     fn contains_decode(plan: &LogicalPlanNode) -> bool {

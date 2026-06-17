@@ -262,6 +262,9 @@ mod tests {
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::imv::annotation::{ImvExtension, ImvPlanAnnotation};
     use crate::sql::optimizer::rewrite::imv::row_id_column::ImvRowIdColumn;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
     use crate::sql::optimizer::scalar::ScalarArena;
@@ -272,6 +275,7 @@ mod tests {
 
     fn build_ctx() -> RewriteContext {
         let mut ctx = RewriteContext::for_mv_refresh(Vec::new());
+        ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
         ctx.set_extension::<ImvExtension>(ImvExtension {
             mv_ctx: dummy_rewrite_context(),
             annotation: ImvPlanAnnotation::default(),
@@ -376,13 +380,15 @@ mod tests {
         let rule = InjectApplyKeyProjectRule::new();
         let mut ctx = build_ctx();
         let plan = project_root(delta_scan_with_row_id(ColumnId(101)), ColumnId(101));
-        let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        drop(arena_rc);
         assert!(rule.matches(&expr, &ctx));
         let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("apply") else {
             panic!("expected Changed(Project)");
         };
-        let changed = opt_expr_to_logical_plan(changed_expr, &arena);
+        let arena_rc = ctx.scalar_arena();
+        let changed = opt_expr_to_logical_plan(changed_expr, &arena_rc.borrow());
         let LogicalPlanNodeKind::Project(root) = changed.kind else {
             panic!("expected Changed(Project)");
         };
@@ -412,8 +418,8 @@ mod tests {
                 output_column_id: ColumnId(200),
             });
         }
-        let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
         assert!(!rule.matches(&expr, &ctx));
     }
 
@@ -436,8 +442,9 @@ mod tests {
             )],
             None,
         );
-        let mut arena = ScalarArena::new();
-        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        drop(arena_rc);
         assert!(rule.matches(&expr, &ctx));
         let err = rule
             .apply(expr, &mut ctx)

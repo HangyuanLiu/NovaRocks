@@ -379,15 +379,50 @@ mod tests {
 
     fn assert_eq_condition(
         condition: &TypedExpr,
-        expected_left: ColumnId,
-        expected_right: ColumnId,
+        expected_a: ColumnId,
+        expected_b: ColumnId,
     ) {
         let ExprKind::BinaryOp { left, op, right } = &condition.kind else {
             panic!("expected bare Eq condition, got: {condition:?}");
         };
         assert_eq!(*op, BinOp::Eq);
-        assert_column_id(left, expected_left);
-        assert_column_id(right, expected_right);
+        // The arena normalizes commutative Eq by ScalarId order, so left/right
+        // assignment is an implementation detail. Check that the expected pair
+        // of column ids appears in either order.
+        let left_id = match &left.kind {
+            ExprKind::ColumnRef { column_id, .. } => *column_id,
+            other => panic!("expected column ref on left, got: {other:?}"),
+        };
+        let right_id = match &right.kind {
+            ExprKind::ColumnRef { column_id, .. } => *column_id,
+            other => panic!("expected column ref on right, got: {other:?}"),
+        };
+        let pair = (left_id, right_id);
+        assert!(
+            pair == (expected_a, expected_b) || pair == (expected_b, expected_a),
+            "expected Eq condition to reference {expected_a:?} and {expected_b:?}; got {pair:?}"
+        );
+    }
+
+    /// Returns true if `condition` is `a = b` (Eq BinaryOp) with the two
+    /// expected column ids in either order.
+    fn eq_condition_has_pair(condition: &TypedExpr, a: ColumnId, b: ColumnId) -> bool {
+        let ExprKind::BinaryOp { left, op, right } = &condition.kind else {
+            return false;
+        };
+        if *op != BinOp::Eq {
+            return false;
+        }
+        let left_id = match &left.kind {
+            ExprKind::ColumnRef { column_id, .. } => *column_id,
+            _ => return false,
+        };
+        let right_id = match &right.kind {
+            ExprKind::ColumnRef { column_id, .. } => *column_id,
+            _ => return false,
+        };
+        let pair = (left_id, right_id);
+        pair == (a, b) || pair == (b, a)
     }
 
     fn assert_coalesce_false(
@@ -492,8 +527,17 @@ mod tests {
         let conjuncts = split_and(join.condition.as_ref().unwrap().clone());
 
         assert_eq!(conjuncts.len(), 2);
-        assert_eq_condition(&conjuncts[0], OUTER_A, INNER_B);
-        assert_eq_condition(&conjuncts[1], OUTER_K, INNER_K);
+        // The arena normalizes AND by ScalarId order, so conjunct order may
+        // differ from the original. Assert that each expected pair appears
+        // somewhere in the conjunct list.
+        let has_outer_a_inner_b = conjuncts
+            .iter()
+            .any(|c| eq_condition_has_pair(c, OUTER_A, INNER_B));
+        let has_outer_k_inner_k = conjuncts
+            .iter()
+            .any(|c| eq_condition_has_pair(c, OUTER_K, INNER_K));
+        assert!(has_outer_a_inner_b, "expected OUTER_A=INNER_B conjunct");
+        assert!(has_outer_k_inner_k, "expected OUTER_K=INNER_K conjunct");
         let right = plan.right();
         let LogicalPlanNodeKind::Project(_project) = &right.kind else {
             panic!("expected Project right, got: {:?}", right);
@@ -516,8 +560,14 @@ mod tests {
         let conjuncts = split_and(join.condition.as_ref().unwrap().clone());
 
         assert_eq!(conjuncts.len(), 2);
-        assert_eq_condition(&conjuncts[0], OUTER_A, INNER_B);
-        assert_coalesce_false(&conjuncts[1], OUTER_K, INNER_K);
+        // The arena normalizes AND by ScalarId order; find each expected conjunct
+        // without relying on its position in the list.
+        let outer_a_inner_b_idx = conjuncts
+            .iter()
+            .position(|c| eq_condition_has_pair(c, OUTER_A, INNER_B))
+            .expect("expected OUTER_A=INNER_B conjunct");
+        let coalesce_idx = if outer_a_inner_b_idx == 0 { 1 } else { 0 };
+        assert_coalesce_false(&conjuncts[coalesce_idx], OUTER_K, INNER_K);
         let right = plan.right();
         let LogicalPlanNodeKind::Project(_project) = &right.kind else {
             panic!("expected Project right, got: {:?}", right);

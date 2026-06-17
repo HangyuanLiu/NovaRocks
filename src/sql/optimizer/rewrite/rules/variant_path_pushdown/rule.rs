@@ -78,8 +78,12 @@ impl LogicalRewriteRule for VariantPathPushdownRule {
                     Operator::LogicalFilter(f) => f.clone(),
                     _ => unreachable!(),
                 };
-                let mut pred_typed = scalar::materialize(&arena_rc.borrow(), filter_op.predicate);
-                let changed = rewrite_expr(&mut pred_typed, input, &mut factory)?;
+                let pred_typed = scalar::materialize(&arena_rc.borrow(), filter_op.predicate);
+                let mut pred_typed = pred_typed;
+                let changed = {
+                    let arena = arena_rc.borrow();
+                    rewrite_expr(&mut pred_typed, input, &mut factory, &arena)?
+                };
                 if changed {
                     let new_pred_id = scalar::intern_typed(&mut arena_rc.borrow_mut(), &pred_typed);
                     expr.op = Operator::LogicalFilter(FilterOp { predicate: new_pred_id });
@@ -98,7 +102,10 @@ impl LogicalRewriteRule for VariantPathPushdownRule {
                 let mut changed = false;
                 for item in &mut items {
                     let mut item_expr = scalar::materialize(&arena_rc.borrow(), item.expr);
-                    let c = rewrite_expr(&mut item_expr, input, &mut factory)?;
+                    let c = {
+                        let arena = arena_rc.borrow();
+                        rewrite_expr(&mut item_expr, input, &mut factory, &arena)?
+                    };
                     if c {
                         item.expr = scalar::intern_typed(&mut arena_rc.borrow_mut(), &item_expr);
                     }
@@ -164,8 +171,9 @@ fn rewrite_expr(
     expr: &mut TypedExpr,
     scan_root: &mut OptExpr,
     factory: &mut ColumnRefFactory,
+    arena: &ScalarArena,
 ) -> Result<bool, String> {
-    if let Some(replacement) = replacement_for_variant_get(expr, scan_root, factory)? {
+    if let Some(replacement) = replacement_for_variant_get(expr, scan_root, factory, arena)? {
         *expr = replacement;
         return Ok(true);
     }
@@ -173,30 +181,30 @@ fn rewrite_expr(
     let mut changed = false;
     match &mut expr.kind {
         ExprKind::BinaryOp { left, right, .. } => {
-            changed |= rewrite_expr(left, scan_root, factory)?;
-            changed |= rewrite_expr(right, scan_root, factory)?;
+            changed |= rewrite_expr(left, scan_root, factory, arena)?;
+            changed |= rewrite_expr(right, scan_root, factory, arena)?;
         }
         ExprKind::UnaryOp { expr, .. }
         | ExprKind::Cast { expr, .. }
         | ExprKind::IsNull { expr, .. }
         | ExprKind::IsTruthValue { expr, .. }
         | ExprKind::Nested(expr) => {
-            changed |= rewrite_expr(expr, scan_root, factory)?;
+            changed |= rewrite_expr(expr, scan_root, factory, arena)?;
         }
         ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
-            changed |= rewrite_expr_list(args, scan_root, factory)?;
+            changed |= rewrite_expr_list(args, scan_root, factory, arena)?;
             if let ExprKind::AggregateCall { order_by, .. } = &mut expr.kind {
-                changed |= rewrite_sort_items(order_by, scan_root, factory)?;
+                changed |= rewrite_sort_items(order_by, scan_root, factory, arena)?;
             }
         }
         ExprKind::LambdaFunction { body, .. } | ExprKind::Lambda { body, .. } => {
-            changed |= rewrite_expr(body, scan_root, factory)?;
+            changed |= rewrite_expr(body, scan_root, factory, arena)?;
         }
         ExprKind::InList {
             expr: input, list, ..
         } => {
-            changed |= rewrite_expr(input, scan_root, factory)?;
-            changed |= rewrite_expr_list(list, scan_root, factory)?;
+            changed |= rewrite_expr(input, scan_root, factory, arena)?;
+            changed |= rewrite_expr_list(list, scan_root, factory, arena)?;
         }
         ExprKind::Between {
             expr: input,
@@ -204,17 +212,17 @@ fn rewrite_expr(
             high,
             ..
         } => {
-            changed |= rewrite_expr(input, scan_root, factory)?;
-            changed |= rewrite_expr(low, scan_root, factory)?;
-            changed |= rewrite_expr(high, scan_root, factory)?;
+            changed |= rewrite_expr(input, scan_root, factory, arena)?;
+            changed |= rewrite_expr(low, scan_root, factory, arena)?;
+            changed |= rewrite_expr(high, scan_root, factory, arena)?;
         }
         ExprKind::Like {
             expr: input,
             pattern,
             ..
         } => {
-            changed |= rewrite_expr(input, scan_root, factory)?;
-            changed |= rewrite_expr(pattern, scan_root, factory)?;
+            changed |= rewrite_expr(input, scan_root, factory, arena)?;
+            changed |= rewrite_expr(pattern, scan_root, factory, arena)?;
         }
         ExprKind::Case {
             operand,
@@ -222,14 +230,14 @@ fn rewrite_expr(
             else_expr,
         } => {
             if let Some(operand) = operand {
-                changed |= rewrite_expr(operand, scan_root, factory)?;
+                changed |= rewrite_expr(operand, scan_root, factory, arena)?;
             }
             for (when, then) in when_then {
-                changed |= rewrite_expr(when, scan_root, factory)?;
-                changed |= rewrite_expr(then, scan_root, factory)?;
+                changed |= rewrite_expr(when, scan_root, factory, arena)?;
+                changed |= rewrite_expr(then, scan_root, factory, arena)?;
             }
             if let Some(else_expr) = else_expr {
-                changed |= rewrite_expr(else_expr, scan_root, factory)?;
+                changed |= rewrite_expr(else_expr, scan_root, factory, arena)?;
             }
         }
         ExprKind::WindowCall {
@@ -238,9 +246,9 @@ fn rewrite_expr(
             order_by,
             ..
         } => {
-            changed |= rewrite_expr_list(args, scan_root, factory)?;
-            changed |= rewrite_expr_list(partition_by, scan_root, factory)?;
-            changed |= rewrite_sort_items(order_by, scan_root, factory)?;
+            changed |= rewrite_expr_list(args, scan_root, factory, arena)?;
+            changed |= rewrite_expr_list(partition_by, scan_root, factory, arena)?;
+            changed |= rewrite_sort_items(order_by, scan_root, factory, arena)?;
         }
         ExprKind::ColumnRef { .. }
         | ExprKind::LambdaParamRef { .. }
@@ -344,10 +352,11 @@ fn rewrite_expr_list(
     exprs: &mut [TypedExpr],
     scan_root: &mut OptExpr,
     factory: &mut ColumnRefFactory,
+    arena: &ScalarArena,
 ) -> Result<bool, String> {
     let mut changed = false;
     for expr in exprs {
-        changed |= rewrite_expr(expr, scan_root, factory)?;
+        changed |= rewrite_expr(expr, scan_root, factory, arena)?;
     }
     Ok(changed)
 }
@@ -368,10 +377,11 @@ fn rewrite_sort_items(
     items: &mut [SortItem],
     scan_root: &mut OptExpr,
     factory: &mut ColumnRefFactory,
+    arena: &ScalarArena,
 ) -> Result<bool, String> {
     let mut changed = false;
     for item in items {
-        changed |= rewrite_expr(&mut item.expr, scan_root, factory)?;
+        changed |= rewrite_expr(&mut item.expr, scan_root, factory, arena)?;
     }
     Ok(changed)
 }
@@ -392,11 +402,12 @@ fn replacement_for_variant_get(
     expr: &TypedExpr,
     scan_root: &mut OptExpr,
     factory: &mut ColumnRefFactory,
+    arena: &ScalarArena,
 ) -> Result<Option<TypedExpr>, String> {
     let Some(request) = variant_request(expr) else {
         return Ok(None);
     };
-    Ok(find_or_create_slot(scan_root, &request, factory))
+    Ok(find_or_create_slot(scan_root, &request, factory, arena))
 }
 
 fn replacement_for_variant_get_against_scan(
@@ -511,17 +522,19 @@ fn find_or_create_slot(
     expr: &mut OptExpr,
     request: &VariantRequest,
     factory: &mut ColumnRefFactory,
+    arena: &ScalarArena,
 ) -> Option<TypedExpr> {
     match &expr.op {
         Operator::LogicalScan(scan) => {
-            // Check condition from old code:
-            // !request.strict || scan.predicates.is_empty() || scan.predicates.iter().any(...)
-            // With ScalarIds we can't inspect predicates here without arena —
-            // conservatively allow only non-strict OR when there are no predicates.
-            // For strict=true with predicates, fall through to None (won't push).
+            // For strict requests, only push when the scan has no predicates of
+            // its own (same condition as the pre-OptExpr implementation).
             let scan_clone = scan.clone();
             let can_push = !request.strict
-                || scan_clone.predicates.is_empty();
+                || scan_clone.predicates.is_empty()
+                || scan_clone.predicates.iter().any(|pred_id| {
+                    let pred = scalar::materialize(arena, *pred_id);
+                    expr_contains_variant_request(&pred, request)
+                });
             if can_push {
                 let Operator::LogicalScan(scan_mut) = &mut expr.op else { return None; };
                 find_or_create_slot_on_scan(scan_mut, request, factory)
@@ -529,25 +542,25 @@ fn find_or_create_slot(
                 None
             }
         }
-        Operator::LogicalFilter(_) => {
-            // For strict requests, the old code checked that the filter predicate
-            // contains the variant_request. We can't check ScalarId without arena here.
-            // For non-strict, always descend.
+        Operator::LogicalFilter(filter_op) => {
+            // For strict requests, only descend through a Filter whose predicate
+            // contains the same variant_request — this preserves the pre-OptExpr
+            // semantics that prevented spurious pushdown of unrelated projections.
             if !request.strict {
                 let Some(input) = expr.children.get_mut(0) else {
                     return None;
                 };
-                find_or_create_slot(input, request, factory)
+                find_or_create_slot(input, request, factory, arena)
             } else {
-                // For strict requests through Filter: descend unconditionally.
-                // The old code required the filter predicate to contain the same
-                // variant_request for strict — but without arena access here we
-                // can't verify. This may be slightly more permissive but is safe
-                // (worst case: we add a variant column that goes unused).
-                let Some(input) = expr.children.get_mut(0) else {
-                    return None;
-                };
-                find_or_create_slot(input, request, factory)
+                let pred = scalar::materialize(arena, filter_op.predicate);
+                if expr_contains_variant_request(&pred, request) {
+                    let Some(input) = expr.children.get_mut(0) else {
+                        return None;
+                    };
+                    find_or_create_slot(input, request, factory, arena)
+                } else {
+                    None
+                }
             }
         }
         _ => None,
