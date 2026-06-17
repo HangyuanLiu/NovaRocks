@@ -1,89 +1,110 @@
 //! PushDownPredicateScan — `Filter(Scan)` rewrite.
 //!
-//! Pushes filter conjuncts into `LogicalScanNode.predicates` when every column
+//! Pushes filter conjuncts into `ScanOp.predicates` when every column
 //! the conjunct references is present in the scan's output. Unpushable
 //! conjuncts are wrapped back as a residual `Filter` above the scan.
 //!
-//! Mirrors the `LogicalPlanNodeKind::Scan(mut scan)` arm of legacy
-//! `predicate_pushdown::push_filter_into`.
+//! Migrated to `OptExpr` / `LogicalRewriteRule`.
 
 use std::collections::HashSet;
 
 use crate::sql::analysis::TypedExpr;
-use crate::sql::column_id::ColumnId;
-use crate::sql::optimizer::rewrite::rule::PlanRewriteRule as RewriteRule;
+use crate::sql::optimizer::operator::Operator;
+use crate::sql::optimizer::opt_expr::OptExpr;
+use crate::sql::optimizer::rewrite::context::RewriteContext;
+use crate::sql::optimizer::rewrite::result::RewriteResult;
+use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
 use crate::sql::optimizer::rewrite::rules::predicate_pushdown::predicate_group::predicate_key as canonical_predicate_key;
 use crate::sql::optimizer::rewrite::rules::utils::{
-    collect_column_id_refs_strict, collect_output_ids, split_and, wrap_remaining_filter,
+    collect_column_id_refs_strict, collect_output_ids_opt, split_and, wrap_remaining_filter_opt,
 };
-use crate::sql::planner::plan::*;
+use crate::sql::optimizer::rewrite::phase::RewritePhase;
+use crate::sql::optimizer::scalar;
 
 pub(crate) struct PushDownPredicateScan;
 
-impl RewriteRule for PushDownPredicateScan {
+impl LogicalRewriteRule for PushDownPredicateScan {
     fn name(&self) -> &'static str {
         "PushDownPredicateScan"
     }
 
-    fn matches(&self, plan: &LogicalPlanNode) -> bool {
-        matches!(&plan.kind, LogicalPlanNodeKind::Filter(_))
-            && matches!(&plan.unary_input().kind, LogicalPlanNodeKind::Scan(_))
+    fn phase(&self) -> RewritePhase {
+        RewritePhase::StructuralRewrite
     }
 
-    fn apply(&self, plan: LogicalPlanNode) -> Option<LogicalPlanNode> {
-        let LogicalPlanNode {
-            kind,
+    fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
+        matches!(&expr.op, Operator::LogicalFilter(_))
+            && expr
+                .children
+                .first()
+                .map(|c| matches!(&c.op, Operator::LogicalScan(_)))
+                .unwrap_or(false)
+    }
+
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, String> {
+        let OptExpr {
+            op,
             mut children,
             required_output_columns: _,
-        } = plan;
-        let LogicalPlanNodeKind::Filter(filter) = kind else {
-            return None;
+        } = expr;
+        let Operator::LogicalFilter(filter) = op else {
+            return Ok(RewriteResult::Unchanged);
         };
         if children.len() != 1 {
-            return None;
+            return Ok(RewriteResult::Unchanged);
         }
-        let scan_plan = children.remove(0);
-        let LogicalPlanNode {
-            kind,
+        let scan_expr = children.remove(0);
+        let OptExpr {
+            op: scan_op,
             required_output_columns,
             ..
-        } = scan_plan;
-        let LogicalPlanNodeKind::Scan(mut scan) = kind else {
-            return None;
+        } = scan_expr;
+        let Operator::LogicalScan(mut scan) = scan_op else {
+            return Ok(RewriteResult::Unchanged);
         };
 
-        let conjuncts = split_and(filter.predicate);
-        let scan_for_ids = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Scan(scan.clone()),
-            vec![],
-            required_output_columns.clone(),
-        );
-        let mut scan_ids = collect_output_ids(&scan_for_ids);
-        scan_ids.remove(&ColumnId::UNSET);
+        let arena_rc = ctx.scalar_arena();
+        let predicate_typed = {
+            let arena = arena_rc.borrow();
+            scalar::materialize(&arena, filter.predicate)
+        };
 
-        // Canonical keys of predicates already on the scan, so we never append a
-        // structurally-identical duplicate (`P AND P == P`).
-        // This keeps the scan's predicate list clean even when an upstream rule
-        // (e.g. OQ-2 `DeriveJoinNotNullPredicate`) re-derives the same
-        // `IS NOT NULL` across stacked joins on a shared key every fixed-point
-        // round. Only exact duplicates collapse; distinct predicates are kept.
-        let mut seen: HashSet<String> = scan.predicates.iter().map(predicate_key).collect();
+        let conjuncts = split_and(predicate_typed);
+
+        // Build a temporary OptExpr to use collect_output_ids_opt.
+        let scan_for_ids = OptExpr {
+            op: Operator::LogicalScan(scan.clone()),
+            children: vec![],
+            required_output_columns: required_output_columns.clone(),
+        };
+        let mut scan_ids = collect_output_ids_opt(&scan_for_ids);
+        scan_ids.remove(&crate::sql::column_id::ColumnId::UNSET);
+
+        // Canonical keys of predicates already on the scan to avoid duplicate pushdown.
+        let mut seen: HashSet<String> = {
+            let arena = arena_rc.borrow();
+            scan.predicates
+                .iter()
+                .map(|id| predicate_key(&scalar::materialize(&arena, *id)))
+                .collect()
+        };
 
         let mut pushed_any = false;
-        let mut remaining = Vec::new();
+        let mut remaining: Vec<TypedExpr> = Vec::new();
         for conj in conjuncts {
             let Some(refs) = collect_column_id_refs_strict(&conj) else {
                 remaining.push(conj);
                 continue;
             };
             if refs.is_empty() || refs.iter().all(|id| scan_ids.contains(id)) {
-                // Push only if no structurally-identical predicate is present.
                 if seen.insert(predicate_key(&conj)) {
-                    scan.predicates.push(conj);
+                    let interned = scalar::intern_typed(&mut arena_rc.borrow_mut(), &conj);
+                    scan.predicates.push(interned);
                 }
-                // A conjunct that targets this scan is "handled" whether it was
-                // newly pushed or dropped as a duplicate — it must not survive as
-                // a residual filter, otherwise the rule never reaches fixed point.
                 pushed_any = true;
             } else {
                 remaining.push(conj);
@@ -91,36 +112,38 @@ impl RewriteRule for PushDownPredicateScan {
         }
 
         if !pushed_any {
-            // No change — re-wrap the untouched filter so the pipeline's
-            // "Option::None = no-op" contract holds.
-            return None;
+            return Ok(RewriteResult::Unchanged);
         }
 
-        Some(wrap_remaining_filter(
-            LogicalPlanNode::new(
-                LogicalPlanNodeKind::Scan(scan),
-                vec![],
-                required_output_columns,
-            ),
-            remaining,
-        ))
+        let new_scan = OptExpr {
+            op: Operator::LogicalScan(scan),
+            children: vec![],
+            required_output_columns,
+        };
+
+        let result = wrap_remaining_filter_opt(new_scan, remaining, &mut arena_rc.borrow_mut());
+        Ok(RewriteResult::Changed(result))
     }
 }
 
-/// Canonical key for structural predicate equality. `TypedExpr` does not derive
-/// `PartialEq`, so this delegates to the shared predicate-group key used by the
-/// join pushdown rules.
+/// Canonical key for structural predicate equality.
 fn predicate_key(expr: &TypedExpr) -> String {
     canonical_predicate_key(expr).as_str().to_string()
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use super::*;
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::planner::plan::*;
+    use crate::sql::optimizer::operator::{FilterOp, Operator, ScanOp};
+    use crate::sql::optimizer::opt_expr::OptExpr;
+    use crate::sql::optimizer::rewrite::context::RewriteContext;
+    use crate::sql::optimizer::scalar::{self, ScalarArena};
     use arrow::datatypes::DataType;
 
     fn test_col_id(name: &str) -> ColumnId {
@@ -168,111 +191,6 @@ mod tests {
         }
     }
 
-    fn scan_with_cols(cols: &[&str]) -> LogicalPlanNode {
-        LogicalPlanNode::new(
-            LogicalPlanNodeKind::Scan(LogicalScanNode {
-                database: "db".into(),
-                table: TableDef {
-                    name: "t".into(),
-                    columns: cols
-                        .iter()
-                        .map(|n| ColumnDef {
-                            name: (*n).into(),
-                            data_type: DataType::Int64,
-                            nullable: true,
-                            write_default: None,
-                            logical_type: None,
-                        })
-                        .collect(),
-                    iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::StarRocks {
-                        db_id: 0,
-                        table_id: 0,
-                    },
-                },
-                alias: None,
-                columns: cols
-                    .iter()
-                    .map(|n| OutputColumn {
-                        column_id: test_col_id(n),
-                        name: (*n).into(),
-                        data_type: DataType::Int64,
-                        nullable: true,
-                        is_internal: false,
-                    })
-                    .collect(),
-                predicates: vec![],
-                required_columns: None,
-                dict_columns: vec![],
-                variant_columns: vec![],
-            }),
-            vec![],
-            None,
-        )
-    }
-
-    #[test]
-    fn pushes_single_scan_column_predicate() {
-        let scan = scan_with_cols(&["a", "b"]);
-        let filter = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(LogicalFilterNode {
-                predicate: eq(col("a"), int_lit(1)),
-            }),
-            vec![scan],
-            None,
-        );
-        let rule = PushDownPredicateScan;
-        assert!(rule.matches(&filter));
-        let out = rule.apply(filter).expect("should rewrite");
-        match &out.kind {
-            LogicalPlanNodeKind::Scan(s) => {
-                assert_eq!(s.predicates.len(), 1);
-            }
-            other => panic!("expected bare Scan after full pushdown, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn leaves_unmatched_shape_alone() {
-        let rule = PushDownPredicateScan;
-        let scan = scan_with_cols(&["a"]);
-        assert!(!rule.matches(&scan));
-    }
-
-    #[test]
-    fn returns_none_when_nothing_pushed() {
-        // Filter references a column the scan does not expose — nothing
-        // is pushable; rule must return None so the pipeline's fixed-point
-        // terminates on this shape.
-        let scan = scan_with_cols(&["a"]);
-        let filter = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(LogicalFilterNode {
-                predicate: eq(col("zz"), int_lit(1)),
-            }),
-            vec![scan],
-            None,
-        );
-        let rule = PushDownPredicateScan;
-        assert!(rule.apply(filter).is_none());
-    }
-
-    #[test]
-    fn p4_scan_does_not_push_same_name_with_different_column_id() {
-        let scan = scan_with_cols(&["a"]);
-        let filter = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(LogicalFilterNode {
-                predicate: eq(col_with_id("a", ColumnId::new_for_test(77)), int_lit(1)),
-            }),
-            vec![scan],
-            None,
-        );
-        let rule = PushDownPredicateScan;
-        assert!(
-            rule.apply(filter).is_none(),
-            "same name must not push when ColumnId is not produced by the scan"
-        );
-    }
-
     fn and(a: TypedExpr, b: TypedExpr) -> TypedExpr {
         TypedExpr {
             data_type: DataType::Boolean,
@@ -282,31 +200,6 @@ mod tests {
                 op: BinOp::And,
                 right: Box::new(b),
             },
-        }
-    }
-
-    #[test]
-    fn partial_pushdown_leaves_residual_filter() {
-        // a=1 AND zz=2: only a=1 is pushable because `zz` is not in the
-        // scan's output columns. Expect Filter(Scan) with one predicate
-        // on the scan and the residual conjunct above.
-        let scan = scan_with_cols(&["a"]);
-        let pred = and(eq(col("a"), int_lit(1)), eq(col("zz"), int_lit(2)));
-        let filter = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(LogicalFilterNode { predicate: pred }),
-            vec![scan],
-            None,
-        );
-        let out = PushDownPredicateScan.apply(filter).expect("should rewrite");
-        match &out.kind {
-            LogicalPlanNodeKind::Filter(_) => match &out.unary_input().kind {
-                LogicalPlanNodeKind::Scan(s) => assert_eq!(s.predicates.len(), 1),
-                other => panic!("expected Scan under residual Filter, got {:?}", other),
-            },
-            other => panic!(
-                "expected Filter(Scan) for partial pushdown, got {:?}",
-                other
-            ),
         }
     }
 
@@ -321,96 +214,224 @@ mod tests {
         }
     }
 
-    /// Re-pushing a structurally-identical predicate across fixed-point rounds
-    /// (as OQ-2 `DeriveJoinNotNullPredicate` does for a key shared by stacked
-    /// joins) must leave exactly ONE copy on the scan, not accumulate. This is
-    /// the regression guard for the `g3_broadcast` 31-copy blowup.
+    fn make_table_def(cols: &[&str]) -> TableDef {
+        TableDef {
+            name: "t".into(),
+            columns: cols
+                .iter()
+                .map(|n| ColumnDef {
+                    name: (*n).into(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    write_default: None,
+                    logical_type: None,
+                })
+                .collect(),
+            iceberg_row_lineage_metadata_columns: vec![],
+            source: ScanSource::StarRocks {
+                db_id: 0,
+                table_id: 0,
+            },
+        }
+    }
+
+    fn scan_opt(arena: &mut ScalarArena, cols: &[&str]) -> OptExpr {
+        OptExpr::leaf(Operator::LogicalScan(ScanOp {
+            database: "db".into(),
+            table: make_table_def(cols),
+            alias: None,
+            columns: cols
+                .iter()
+                .map(|n| OutputColumn {
+                    column_id: test_col_id(n),
+                    name: (*n).into(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    is_internal: false,
+                })
+                .collect(),
+            predicates: vec![],
+            required_columns: None,
+            dict_columns: vec![],
+            variant_columns: vec![],
+            mv_rewritten_from: None,
+        }))
+    }
+
+    fn filter_opt(arena: &mut ScalarArena, predicate: TypedExpr, child: OptExpr) -> OptExpr {
+        let pred_id = scalar::intern_typed(arena, &predicate);
+        OptExpr::new(
+            Operator::LogicalFilter(FilterOp { predicate: pred_id }),
+            vec![child],
+        )
+    }
+
+    fn make_ctx(arena: ScalarArena) -> RewriteContext {
+        let mut ctx = RewriteContext::for_query(std::iter::empty::<String>());
+        ctx.set_scalar_arena(Rc::new(RefCell::new(arena)));
+        ctx
+    }
+
+    #[test]
+    fn pushes_single_scan_column_predicate() {
+        let mut arena = ScalarArena::new();
+        let scan = scan_opt(&mut arena, &["a", "b"]);
+        let filter = filter_opt(&mut arena, eq(col("a"), int_lit(1)), scan);
+        let rule = PushDownPredicateScan;
+        let mut ctx = make_ctx(arena);
+        assert!(rule.matches(&filter, &ctx));
+        let result = rule.apply(filter, &mut ctx).unwrap();
+        match result {
+            RewriteResult::Changed(out) => match &out.op {
+                Operator::LogicalScan(s) => {
+                    assert_eq!(s.predicates.len(), 1);
+                }
+                other => panic!("expected bare Scan after full pushdown, got {:?}", other),
+            },
+            other => panic!("expected Changed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn leaves_unmatched_shape_alone() {
+        let mut arena = ScalarArena::new();
+        let scan = scan_opt(&mut arena, &["a"]);
+        let rule = PushDownPredicateScan;
+        let ctx = make_ctx(arena);
+        assert!(!rule.matches(&scan, &ctx));
+    }
+
+    #[test]
+    fn returns_unchanged_when_nothing_pushed() {
+        // Filter references a column the scan does not expose.
+        let mut arena = ScalarArena::new();
+        let scan = scan_opt(&mut arena, &["a"]);
+        let filter = filter_opt(&mut arena, eq(col("zz"), int_lit(1)), scan);
+        let rule = PushDownPredicateScan;
+        let mut ctx = make_ctx(arena);
+        let result = rule.apply(filter, &mut ctx).unwrap();
+        assert!(
+            matches!(result, RewriteResult::Unchanged),
+            "expected Unchanged when no conjunct can push"
+        );
+    }
+
+    #[test]
+    fn p4_scan_does_not_push_same_name_with_different_column_id() {
+        let mut arena = ScalarArena::new();
+        let scan = scan_opt(&mut arena, &["a"]);
+        let filter = filter_opt(
+            &mut arena,
+            eq(col_with_id("a", ColumnId::new_for_test(77)), int_lit(1)),
+            scan,
+        );
+        let rule = PushDownPredicateScan;
+        let mut ctx = make_ctx(arena);
+        let result = rule.apply(filter, &mut ctx).unwrap();
+        assert!(
+            matches!(result, RewriteResult::Unchanged),
+            "same name must not push when ColumnId is not produced by the scan"
+        );
+    }
+
+    #[test]
+    fn partial_pushdown_leaves_residual_filter() {
+        let mut arena = ScalarArena::new();
+        let scan = scan_opt(&mut arena, &["a"]);
+        let pred = and(eq(col("a"), int_lit(1)), eq(col("zz"), int_lit(2)));
+        let filter = filter_opt(&mut arena, pred, scan);
+        let mut ctx = make_ctx(arena);
+        let result = PushDownPredicateScan.apply(filter, &mut ctx).unwrap();
+        match result {
+            RewriteResult::Changed(out) => match &out.op {
+                Operator::LogicalFilter(_) => match &out.children[0].op {
+                    Operator::LogicalScan(s) => assert_eq!(s.predicates.len(), 1),
+                    other => panic!("expected Scan under residual Filter, got {:?}", other),
+                },
+                other => panic!("expected Filter(Scan) for partial pushdown, got {:?}", other),
+            },
+            other => panic!("expected Changed, got {:?}", other),
+        }
+    }
+
     #[test]
     fn repeated_identical_predicate_dedups_to_one() {
-        // Round 1: Filter(a IS NOT NULL, Scan) -> Scan with one predicate.
-        let scan = scan_with_cols(&["a", "b"]);
-        let filter = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(LogicalFilterNode {
-                predicate: is_not_null(col("a")),
-            }),
-            vec![scan],
-            None,
-        );
+        let mut arena = ScalarArena::new();
+        let scan = scan_opt(&mut arena, &["a", "b"]);
+        let filter = filter_opt(&mut arena, is_not_null(col("a")), scan);
+        let mut ctx = make_ctx(arena);
         let after_round1 = PushDownPredicateScan
-            .apply(filter)
-            .expect("first push should rewrite");
-        let scan_after_round1 = match &after_round1.kind {
-            LogicalPlanNodeKind::Scan(s) => {
-                assert_eq!(s.predicates.len(), 1, "first push lands one predicate");
-                s
-            }
-            other => panic!("expected bare Scan after full pushdown, got {:?}", other),
+            .apply(filter, &mut ctx)
+            .unwrap();
+        let scan_after_round1 = match after_round1 {
+            RewriteResult::Changed(out) => match out.op.clone() {
+                Operator::LogicalScan(s) => {
+                    assert_eq!(s.predicates.len(), 1, "first push lands one predicate");
+                    (out, s)
+                }
+                other => panic!("expected bare Scan after full pushdown, got {:?}", other),
+            },
+            other => panic!("expected Changed, got {:?}", other),
         };
-
-        // Round 2: an upstream rule re-derives the same conjunct above the scan
-        // that already carries it. The duplicate must be dropped — the scan
-        // still holds exactly one copy, and the redundant Filter is removed.
-        let filter2 = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(LogicalFilterNode {
-                predicate: is_not_null(col("a")),
-            }),
-            vec![LogicalPlanNode::new(
-                LogicalPlanNodeKind::Scan(scan_after_round1.clone()),
-                vec![],
-                None,
-            )],
-            None,
+        let (scan_out, scan_op) = scan_after_round1;
+        // Round 2: same predicate above scan that already carries it.
+        let pred_id = {
+            let mut arena = ctx.scalar_arena().borrow_mut();
+            scalar::intern_typed(&mut arena, &is_not_null(col("a")))
+        };
+        let filter2 = OptExpr::new(
+            Operator::LogicalFilter(FilterOp { predicate: pred_id }),
+            vec![scan_out],
         );
-        let after_round2 = PushDownPredicateScan
-            .apply(filter2)
-            .expect("redundant Filter removal is a structural change -> Some");
-        match &after_round2.kind {
-            LogicalPlanNodeKind::Scan(s) => assert_eq!(
-                s.predicates.len(),
-                1,
-                "re-pushing an identical predicate must not accumulate"
-            ),
-            other => panic!("expected bare Scan after dedup, got {:?}", other),
+        let after_round2 = PushDownPredicateScan.apply(filter2, &mut ctx).unwrap();
+        match after_round2 {
+            RewriteResult::Changed(out) => match &out.op {
+                Operator::LogicalScan(s) => assert_eq!(
+                    s.predicates.len(),
+                    1,
+                    "re-pushing an identical predicate must not accumulate"
+                ),
+                other => panic!("expected bare Scan after dedup, got {:?}", other),
+            },
+            other => panic!("expected Changed, got {:?}", other),
         }
     }
 
-    /// `P AND P` inside a single Filter collapses to one scan predicate.
     #[test]
     fn duplicate_conjuncts_in_one_filter_dedup() {
-        let scan = scan_with_cols(&["a"]);
+        let mut arena = ScalarArena::new();
+        let scan = scan_opt(&mut arena, &["a"]);
         let pred = and(is_not_null(col("a")), is_not_null(col("a")));
-        let filter = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(LogicalFilterNode { predicate: pred }),
-            vec![scan],
-            None,
-        );
-        let out = PushDownPredicateScan.apply(filter).expect("should rewrite");
-        match &out.kind {
-            LogicalPlanNodeKind::Scan(s) => assert_eq!(s.predicates.len(), 1),
-            other => panic!("expected bare Scan, got {:?}", other),
+        let filter = filter_opt(&mut arena, pred, scan);
+        let mut ctx = make_ctx(arena);
+        let result = PushDownPredicateScan.apply(filter, &mut ctx).unwrap();
+        match result {
+            RewriteResult::Changed(out) => match &out.op {
+                Operator::LogicalScan(s) => assert_eq!(s.predicates.len(), 1),
+                other => panic!("expected bare Scan, got {:?}", other),
+            },
+            other => panic!("expected Changed, got {:?}", other),
         }
     }
 
-    /// Distinct predicates on the same column must NOT collapse — dedup is
-    /// exact-match only.
     #[test]
     fn distinct_predicates_are_not_collapsed() {
-        let scan = scan_with_cols(&["a"]);
-        // a IS NOT NULL AND a = 1 -> two distinct predicates.
+        let mut arena = ScalarArena::new();
+        let scan = scan_opt(&mut arena, &["a"]);
         let pred = and(is_not_null(col("a")), eq(col("a"), int_lit(1)));
-        let filter = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(LogicalFilterNode { predicate: pred }),
-            vec![scan],
-            None,
-        );
-        let out = PushDownPredicateScan.apply(filter).expect("should rewrite");
-        match &out.kind {
-            LogicalPlanNodeKind::Scan(s) => assert_eq!(
-                s.predicates.len(),
-                2,
-                "distinct predicates on the same column must be preserved"
-            ),
-            other => panic!("expected bare Scan, got {:?}", other),
+        let filter = filter_opt(&mut arena, pred, scan);
+        let mut ctx = make_ctx(arena);
+        let result = PushDownPredicateScan.apply(filter, &mut ctx).unwrap();
+        match result {
+            RewriteResult::Changed(out) => match &out.op {
+                Operator::LogicalScan(s) => assert_eq!(
+                    s.predicates.len(),
+                    2,
+                    "distinct predicates on the same column must be preserved"
+                ),
+                other => panic!("expected bare Scan, got {:?}", other),
+            },
+            other => panic!("expected Changed, got {:?}", other),
         }
     }
 }

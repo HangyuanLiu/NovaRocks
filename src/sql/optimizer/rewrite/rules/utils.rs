@@ -6,6 +6,10 @@
 use std::collections::HashSet;
 
 use crate::sql::analysis::{BinOp, ExprKind, TypedExpr};
+use crate::sql::column_id::ColumnId;
+use crate::sql::optimizer::operator::{FilterOp, LogicalJoinOp, Operator};
+use crate::sql::optimizer::opt_expr::OptExpr;
+use crate::sql::optimizer::scalar::{self, ScalarArena};
 use crate::sql::planner::plan::*;
 
 /// Split an expression on AND into a flat list of conjuncts.
@@ -962,6 +966,219 @@ fn collect_join_equi_keys(
         },
         _ => {}
     }
+}
+
+// ---------------------------------------------------------------------------
+// OptExpr-based helpers (new rewrite framework)
+// ---------------------------------------------------------------------------
+
+/// Return the ordered Vec of [`ColumnId`]s in the output schema of an `OptExpr`.
+pub(crate) fn collect_output_ids_ordered_opt(expr: &OptExpr) -> Vec<ColumnId> {
+    match &expr.op {
+        Operator::LogicalScan(s) => s.columns.iter().map(|c| c.column_id).collect(),
+        Operator::LogicalProject(p) => p
+            .items
+            .iter()
+            .map(|i| i.output_column_id)
+            .filter(|id| *id != ColumnId::UNSET)
+            .collect(),
+        Operator::LogicalAggregate(a) => a.output_columns.iter().map(|c| c.column_id).collect(),
+        Operator::LogicalWindow(w) => w.output_columns.iter().map(|c| c.column_id).collect(),
+        Operator::LogicalCTEProduce(p) => p.output_columns.iter().map(|c| c.column_id).collect(),
+        Operator::LogicalCTEConsume(c) => c.output_columns.iter().map(|c| c.column_id).collect(),
+        Operator::LogicalUnion(u) => u.output_columns.iter().map(|c| c.column_id).collect(),
+        Operator::LogicalIntersect(i) => i.output_columns.iter().map(|c| c.column_id).collect(),
+        Operator::LogicalExcept(e) => e.output_columns.iter().map(|c| c.column_id).collect(),
+        Operator::LogicalDecode(d) => d.output_columns.iter().map(|c| c.column_id).collect(),
+        Operator::LogicalAggregateStateMerge(a) => {
+            a.output_columns.iter().map(|c| c.column_id).collect()
+        }
+        Operator::LogicalValues(v) => v.columns.iter().map(|c| c.column_id).collect(),
+        Operator::LogicalGenerateSeries(g) => {
+            if g.output_column_id == ColumnId::UNSET {
+                vec![]
+            } else {
+                vec![g.output_column_id]
+            }
+        }
+        // Passthrough: node does not add or rename output ColumnIds.
+        Operator::LogicalFilter(_)
+        | Operator::LogicalSort(_)
+        | Operator::LogicalLimit(_)
+        | Operator::LogicalRepeat(_) => collect_output_ids_ordered_opt(expr.unary_input()),
+        Operator::LogicalTableFunction(t) => {
+            let mut ids = collect_output_ids_ordered_opt(expr.unary_input());
+            ids.extend(t.output_columns.iter().map(|c| c.column_id));
+            ids
+        }
+        Operator::LogicalJoin(_) => {
+            let mut ids = collect_output_ids_ordered_opt(expr.left());
+            ids.extend(collect_output_ids_ordered_opt(expr.right()));
+            ids
+        }
+        Operator::LogicalCTEAnchor(_) => collect_output_ids_ordered_opt(expr.child(1)),
+        Operator::LogicalAssertOneRow(_) => collect_output_ids_ordered_opt(expr.unary_input()),
+        // Physical operators and any other variants are not expected during the RBO phase.
+        _ => vec![],
+    }
+}
+
+/// Return the set of [`ColumnId`]s in the output schema of an `OptExpr`.
+pub(crate) fn collect_output_ids_opt(expr: &OptExpr) -> HashSet<ColumnId> {
+    collect_output_ids_ordered_opt(expr).into_iter().collect()
+}
+
+/// Qualified column reference for `OptExpr`: (qualifier, column), both lowercase.
+pub(crate) fn collect_qualified_output_columns_opt(expr: &OptExpr) -> HashSet<QualifiedRef> {
+    let mut out = HashSet::new();
+    collect_qualified_output_columns_opt_inner(expr, &mut out);
+    out
+}
+
+fn collect_qualified_output_columns_opt_inner(expr: &OptExpr, out: &mut HashSet<QualifiedRef>) {
+    match &expr.op {
+        Operator::LogicalScan(s) => {
+            let alias = s
+                .alias
+                .as_ref()
+                .map(|a| a.to_lowercase())
+                .or_else(|| Some(s.table.name.to_lowercase()));
+            for c in &s.columns {
+                let col = c.name.to_lowercase();
+                if let Some(ref q) = alias {
+                    out.insert((Some(q.clone()), col.clone()));
+                }
+                out.insert((None, col));
+            }
+        }
+        Operator::LogicalFilter(_) => {
+            collect_qualified_output_columns_opt_inner(expr.unary_input(), out)
+        }
+        Operator::LogicalProject(p) => {
+            for item in &p.items {
+                out.insert((None, item.output_name.to_lowercase()));
+            }
+        }
+        Operator::LogicalJoin(_) => {
+            collect_qualified_output_columns_opt_inner(expr.left(), out);
+            collect_qualified_output_columns_opt_inner(expr.right(), out);
+        }
+        Operator::LogicalAggregate(a) => {
+            for c in &a.output_columns {
+                out.insert((None, c.name.to_lowercase()));
+            }
+        }
+        Operator::LogicalAggregateStateMerge(a) => {
+            for c in &a.output_columns {
+                out.insert((None, c.name.to_lowercase()));
+            }
+        }
+        Operator::LogicalSort(_) | Operator::LogicalLimit(_) => {
+            collect_qualified_output_columns_opt_inner(expr.unary_input(), out)
+        }
+        Operator::LogicalWindow(w) => {
+            for c in &w.output_columns {
+                out.insert((None, c.name.to_lowercase()));
+            }
+        }
+        Operator::LogicalUnion(_) => {
+            if let Some(first) = expr.children.first() {
+                collect_qualified_output_columns_opt_inner(first, out);
+            }
+        }
+        Operator::LogicalIntersect(_) => {
+            if let Some(first) = expr.children.first() {
+                collect_qualified_output_columns_opt_inner(first, out);
+            }
+        }
+        Operator::LogicalExcept(_) => {
+            if let Some(first) = expr.children.first() {
+                collect_qualified_output_columns_opt_inner(first, out);
+            }
+        }
+        Operator::LogicalValues(v) => {
+            for c in &v.columns {
+                out.insert((None, c.name.to_lowercase()));
+            }
+        }
+        Operator::LogicalGenerateSeries(g) => {
+            out.insert((None, g.column_name.to_lowercase()));
+        }
+        Operator::LogicalTableFunction(t) => {
+            collect_qualified_output_columns_opt_inner(expr.unary_input(), out);
+            for col in &t.output_columns {
+                out.insert((
+                    t.alias.as_ref().map(|alias| alias.to_lowercase()),
+                    col.name.to_lowercase(),
+                ));
+            }
+        }
+        Operator::LogicalCTEAnchor(_) => {
+            collect_qualified_output_columns_opt_inner(expr.child(1), out);
+        }
+        Operator::LogicalCTEProduce(p) => {
+            for col in &p.output_columns {
+                out.insert((None, col.name.to_lowercase()));
+            }
+        }
+        Operator::LogicalRepeat(_) => {
+            collect_qualified_output_columns_opt_inner(expr.unary_input(), out)
+        }
+        Operator::LogicalCTEConsume(c) => {
+            let alias_lower = c.alias.to_lowercase();
+            for col in &c.output_columns {
+                let col_name = col.name.to_lowercase();
+                out.insert((Some(alias_lower.clone()), col_name.clone()));
+                out.insert((None, col_name));
+            }
+        }
+        Operator::LogicalDecode(d) => {
+            collect_qualified_output_columns_opt_inner(expr.unary_input(), out);
+            for mapping in &d.mappings {
+                out.insert((None, mapping.string_column.to_lowercase()));
+            }
+        }
+        Operator::LogicalAssertOneRow(_) => {
+            collect_qualified_output_columns_opt_inner(expr.unary_input(), out)
+        }
+        // Physical operators are not expected during the RBO phase.
+        _ => {}
+    }
+}
+
+/// Wrap an `OptExpr` in a `LogicalFilter` if there are remaining conjuncts.
+/// Each `TypedExpr` in `remaining` is interned into `arena`.
+pub(crate) fn wrap_remaining_filter_opt(
+    plan: OptExpr,
+    remaining: Vec<TypedExpr>,
+    arena: &mut ScalarArena,
+) -> OptExpr {
+    if remaining.is_empty() {
+        return plan;
+    }
+    let predicate = scalar::intern_typed(arena, &combine_and(remaining));
+    OptExpr::new(Operator::LogicalFilter(FilterOp { predicate }), vec![plan])
+}
+
+/// Extract equi-join key pairs from an `OptExpr` join.
+/// Materializes the join condition from the arena (`ScalarId` → `TypedExpr`).
+pub(crate) fn join_equi_keys_opt(
+    join_op: &LogicalJoinOp,
+    left: &OptExpr,
+    right: &OptExpr,
+    arena: &ScalarArena,
+) -> Vec<JoinEquiKey> {
+    let Some(cond_id) = join_op.condition else {
+        return Vec::new();
+    };
+    let condition = scalar::materialize(arena, cond_id);
+    let left_cols = collect_qualified_output_columns_opt(left);
+    let right_cols = collect_qualified_output_columns_opt(right);
+    let left_ids = collect_output_ids_opt(left);
+    let right_ids = collect_output_ids_opt(right);
+    let mut keys = Vec::new();
+    collect_join_equi_keys(&condition, &left_ids, &right_ids, &left_cols, &right_cols, &mut keys);
+    keys
 }
 
 #[cfg(test)]
