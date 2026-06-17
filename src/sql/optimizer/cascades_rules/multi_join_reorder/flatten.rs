@@ -9,6 +9,7 @@ use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::memo::{GroupId, Memo};
 use crate::sql::optimizer::operator::{LogicalJoinOp, Operator};
 use crate::sql::optimizer::rewrite::rules::utils::{collect_column_id_refs, split_and};
+use crate::sql::optimizer::scalar::materialize;
 use crate::sql::optimizer::statistics::{Confidence, Statistics};
 
 use super::super::implement::get_group_column_ids;
@@ -87,7 +88,7 @@ fn collect_chain(
             collect_chain(memo, expr.children[0], atoms, predicates, chain_joins);
             collect_chain(memo, expr.children[1], atoms, predicates, chain_joins);
             if let Some(cond) = condition {
-                predicates.extend(split_and(cond.clone()));
+                predicates.extend(split_and(materialize(&memo.scalars, *cond)));
             }
         }
         Operator::LogicalFilter(f)
@@ -96,7 +97,7 @@ fn collect_chain(
             // Absorb a filter sitting directly on an inner/cross join. The filter
             // group itself is not a join (JoinAssociativity never matches it), so
             // only the join below it is recorded as a chain join.
-            predicates.extend(split_and(f.predicate.clone()));
+            predicates.extend(split_and(materialize(&memo.scalars, f.predicate)));
             collect_chain(memo, expr.children[0], atoms, predicates, chain_joins);
         }
         // Any other operator (incl. LogicalProject and outer/semi joins) is an
@@ -154,6 +155,7 @@ mod tests {
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn};
     use crate::sql::optimizer::memo::{JoinTree, LogicalProperties, MExpr};
     use crate::sql::optimizer::operator::LogicalValuesOp;
+    use crate::sql::optimizer::scalar::intern_typed;
     use crate::sql::optimizer::statistics::ColumnStatistic;
     use crate::sql::optimizer::stats::copy_in_join_tree;
     use std::collections::HashMap as Map;
@@ -238,10 +240,10 @@ mod tests {
         g
     }
 
-    fn inner(cond: TypedExpr) -> LogicalJoinOp {
+    fn inner(memo: &mut Memo, cond: TypedExpr) -> LogicalJoinOp {
         LogicalJoinOp {
             join_type: JoinKind::Inner,
-            condition: Some(cond),
+            condition: Some(intern_typed(&mut memo.scalars, &cond)),
         }
     }
 
@@ -256,10 +258,10 @@ mod tests {
             left: Box::new(JoinTree::Join {
                 left: Box::new(JoinTree::Leaf(a)),
                 right: Box::new(JoinTree::Leaf(b)),
-                op: inner(eq(col(1), col(2))),
+                op: inner(&mut memo, eq(col(1), col(2))),
             }),
             right: Box::new(JoinTree::Leaf(c)),
-            op: inner(eq(col(1), col(3))),
+            op: inner(&mut memo, eq(col(1), col(3))),
         };
         let root = copy_in_join_tree(&mut memo, &tree, &Map::new());
 
@@ -280,11 +282,12 @@ mod tests {
         let a = leaf(&mut memo, 1, 1000.0);
         let b = leaf(&mut memo, 2, 100.0);
         let c = leaf(&mut memo, 3, 50.0);
+        let lo_cond = intern_typed(&mut memo.scalars, &eq(col(1), col(2)));
         let lo = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::LeftOuter,
-                condition: Some(eq(col(1), col(2))),
+                condition: Some(lo_cond),
             }),
             children: vec![a, b],
         });
@@ -295,7 +298,7 @@ mod tests {
         let tree = JoinTree::Join {
             left: Box::new(JoinTree::Leaf(lo)),
             right: Box::new(JoinTree::Leaf(c)),
-            op: inner(eq(col(1), col(3))),
+            op: inner(&mut memo, eq(col(1), col(3))),
         };
         let root = copy_in_join_tree(&mut memo, &tree, &Map::new());
 
@@ -322,7 +325,7 @@ mod tests {
         let tree = JoinTree::Join {
             left: Box::new(JoinTree::Leaf(a)),
             right: Box::new(JoinTree::Leaf(b)),
-            op: inner(cond),
+            op: inner(&mut memo, cond),
         };
         let root = copy_in_join_tree(&mut memo, &tree, &Map::new());
 

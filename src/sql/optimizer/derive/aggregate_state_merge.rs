@@ -2,17 +2,27 @@
 
 use crate::sql::optimizer::operator::AggregateStateMergeOp;
 use crate::sql::optimizer::property::PhysicalPropertySet;
+use crate::sql::optimizer::scalar::ScalarArena;
 
 use super::{DeriveOutput, DeriveRequired};
 
 impl DeriveOutput for AggregateStateMergeOp {
-    fn derive_output(&self, _children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
+    fn derive_output(
+        &self,
+        _scalars: &ScalarArena,
+        _children: &[&PhysicalPropertySet],
+    ) -> PhysicalPropertySet {
         PhysicalPropertySet::any()
     }
 }
 
 impl DeriveRequired for AggregateStateMergeOp {
-    fn derive_required(&self, _parent: &PhysicalPropertySet, n: usize) -> Vec<PhysicalPropertySet> {
+    fn derive_required(
+        &self,
+        _scalars: &ScalarArena,
+        _parent: &PhysicalPropertySet,
+        n: usize,
+    ) -> Vec<PhysicalPropertySet> {
         vec![PhysicalPropertySet::any(); n]
     }
 }

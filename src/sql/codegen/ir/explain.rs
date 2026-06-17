@@ -1132,6 +1132,7 @@ fn supports_scan_decode_hint(data_type: &DataType) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use arrow::datatypes::DataType;
 
@@ -1149,9 +1150,15 @@ mod tests {
         PhysicalScanOp,
     };
     use crate::sql::optimizer::options::OptimizerOptions;
-    use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, PlanExecutionProps};
+    use crate::sql::optimizer::physical_plan::{
+        PhysicalPlanNode, PlanExecutionProps, attach_scalar_arena,
+    };
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::runtime_filter_pass::{self, test_support};
+    use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::optimizer::scalar_bridge::{
+        intern_aggregate_calls, intern_exprs, intern_project_items, intern_sort_items,
+    };
     use crate::sql::optimizer::statistics::{ColumnStatistic, Statistics};
     use crate::sql::planner::plan::AggregateCall;
 
@@ -1192,7 +1199,7 @@ mod tests {
         let text = explain_distributed_plan(&dp, ExplainLevel::Normal).join("\n");
 
         assert!(
-            text.contains("2:SORT BY [t.k ASC NULLS LAST] partition_limit=3 topn_type=RANK"),
+            text.contains("2:SORT BY [col1 ASC NULLS LAST] partition_limit=3 topn_type=RANK"),
             "expected ranking-window sort suffix in IR explain output:\n{text}"
         );
     }
@@ -1234,7 +1241,17 @@ mod tests {
     #[test]
     fn detailed_ir_explain_shows_build_and_probe_rf_but_normal_hides_them() {
         let mut join = test_support::inner_join_two_scans();
-        runtime_filter_pass::annotate(&mut join, &OptimizerOptions::default_settings());
+        let scalars = join
+            .execution_props
+            .scalar_arena
+            .as_ref()
+            .expect("runtime-filter test plan must carry scalar arena")
+            .clone();
+        runtime_filter_pass::annotate(
+            &mut join,
+            scalars.as_ref(),
+            &OptimizerOptions::default_settings(),
+        );
         let dp = build_distributed_plan(&join).expect("build DistributedPlan");
 
         for level in [
@@ -1290,7 +1307,7 @@ mod tests {
             explain_distributed_plan_analyze(&dp, ExplainLevel::Analyze, &actuals).join("\n");
 
         assert!(
-            text.contains("3:HASH AGGREGATE (SINGLE, group by: [t.k]) stats={rows=3 conf=fallback} act={rows=7 time=2.3ms peak=4.0MB}"),
+            text.contains("3:HASH AGGREGATE (SINGLE, group by: [col1]) stats={rows=3 conf=fallback} act={rows=7 time=2.3ms peak=4.0MB}"),
             "expected aggregate actuals after estimate trailer:\n{text}"
         );
         assert!(
@@ -1298,11 +1315,11 @@ mod tests {
             "expected scan actuals after estimate trailer:\n{text}"
         );
         assert!(
-            text.contains("2:PROJECT [t.k AS k] stats={rows=3 conf=fallback}"),
+            text.contains("2:PROJECT [col1 AS k] stats={rows=3 conf=fallback}"),
             "expected project estimate trailer:\n{text}"
         );
         assert!(
-            !text.contains("2:PROJECT [t.k AS k] stats={rows=3 conf=fallback} act="),
+            !text.contains("2:PROJECT [col1 AS k] stats={rows=3 conf=fallback} act="),
             "nodes absent from the actuals map must not print act=:\n{text}"
         );
     }
@@ -1340,59 +1357,73 @@ mod tests {
     }
 
     fn project_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
+        let mut scalars = scalars_from_children(std::slice::from_ref(&child));
         let output_columns = vec![output_col(1, "k", DataType::Int64, false)];
-        physical_node(
+        let items = vec![ProjectItem {
+            expr: column_ref_expr(1, "k", DataType::Int64, false),
+            output_name: "k".to_string(),
+            output_column_id: ColumnId::new_for_test(1),
+        }];
+        physical_node_with_scalars(
             Operator::PhysicalProject(PhysicalProjectOp {
-                items: vec![ProjectItem {
-                    expr: column_ref_expr(1, "k", DataType::Int64, false),
-                    output_name: "k".to_string(),
-                    output_column_id: ColumnId::new_for_test(1),
-                }],
+                items: intern_project_items(&mut scalars, &items),
                 output_qualifier: None,
             }),
             vec![child],
             output_columns,
+            scalars,
         )
     }
 
     fn aggregate_count_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
+        let mut scalars = scalars_from_children(std::slice::from_ref(&child));
         let k = output_col(1, "k", DataType::Int64, false);
         let count = output_col(3, "count(*)", DataType::Int64, true);
-        physical_node(
+        let aggregate_calls = vec![AggregateCall {
+            name: "count".to_string(),
+            args: vec![],
+            distinct: false,
+            result_type: DataType::Int64,
+            order_by: vec![],
+            output_column_id: ColumnId::new_for_test(3),
+        }];
+        physical_node_with_scalars(
             Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
                 mode: AggMode::Single,
-                group_by: vec![column_ref_expr(1, "k", DataType::Int64, false)],
-                aggregates: vec![AggregateCall {
-                    name: "count".to_string(),
-                    args: vec![],
-                    distinct: false,
-                    result_type: DataType::Int64,
-                    order_by: vec![],
-                    output_column_id: ColumnId::new_for_test(3),
-                }],
+                group_by: intern_exprs(
+                    &mut scalars,
+                    &[column_ref_expr(1, "k", DataType::Int64, false)],
+                ),
+                aggregates: intern_aggregate_calls(&mut scalars, &aggregate_calls),
                 output_columns: vec![k.clone(), count.clone()],
                 is_merge: vec![false],
             }),
             vec![child],
             vec![k, count],
+            scalars,
         )
     }
 
     fn sort_with_partition_limit_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
+        let mut scalars = scalars_from_children(std::slice::from_ref(&child));
         let output_columns = child.output_columns.clone();
-        physical_node(
+        physical_node_with_scalars(
             Operator::PhysicalSort(crate::sql::optimizer::operator::PhysicalSortOp {
-                items: vec![SortItem {
-                    expr: column_ref_expr(1, "k", DataType::Int64, false),
-                    asc: true,
-                    nulls_first: false,
-                }],
+                items: intern_sort_items(
+                    &mut scalars,
+                    &[SortItem {
+                        expr: column_ref_expr(1, "k", DataType::Int64, false),
+                        asc: true,
+                        nulls_first: false,
+                    }],
+                ),
                 analytic_partition_exprs: vec![],
                 partition_limit: Some(3),
                 topn_type: Some(SortTopNType::Rank),
             }),
             vec![child],
             output_columns,
+            scalars,
         )
     }
 
@@ -1410,7 +1441,17 @@ mod tests {
         children: Vec<PhysicalPlanNode>,
         output_columns: Vec<OutputColumn>,
     ) -> PhysicalPlanNode {
-        PhysicalPlanNode {
+        let scalars = scalars_from_children(&children);
+        physical_node_with_scalars(op, children, output_columns, scalars)
+    }
+
+    fn physical_node_with_scalars(
+        op: Operator,
+        children: Vec<PhysicalPlanNode>,
+        output_columns: Vec<OutputColumn>,
+        scalars: ScalarArena,
+    ) -> PhysicalPlanNode {
+        let mut plan = PhysicalPlanNode {
             op,
             children,
             stats: Statistics {
@@ -1421,7 +1462,16 @@ mod tests {
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
-        }
+        };
+        attach_scalar_arena(&mut plan, Arc::new(scalars));
+        plan
+    }
+
+    fn scalars_from_children(children: &[PhysicalPlanNode]) -> ScalarArena {
+        children
+            .iter()
+            .find_map(|child| child.execution_props.scalar_arena.as_deref().cloned())
+            .unwrap_or_else(ScalarArena::new)
     }
 
     fn table_def() -> TableDef {

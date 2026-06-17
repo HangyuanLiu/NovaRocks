@@ -134,6 +134,7 @@ impl SearchContext {
 
             let alternatives = super::derive::derive_required_alternatives(
                 &expr.op,
+                &memo.scalars,
                 required,
                 expr.children.len(),
             );
@@ -212,6 +213,7 @@ impl SearchContext {
                 let total = own_cost + child_cost_total;
                 let provided = super::derive::derive_output_for_alternative(
                     &expr.op,
+                    &memo.scalars,
                     &child_output_refs,
                     &alt.kind,
                 );
@@ -322,6 +324,7 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::MExpr;
     use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
+    use crate::sql::optimizer::scalar::intern_typed;
     use arrow::datatypes::DataType;
 
     /// Build a simple memo with a single PhysicalScan group.
@@ -395,6 +398,14 @@ mod tests {
         }
     }
 
+    fn eq_cond(memo: &mut Memo, left: TypedExpr, right: TypedExpr) -> PhysicalHashJoinEqCondition {
+        PhysicalHashJoinEqCondition {
+            left: intern_typed(&mut memo.scalars, &left),
+            right: intern_typed(&mut memo.scalars, &right),
+            null_safe: false,
+        }
+    }
+
     fn make_two_table_inner_join_memo_for_test() -> (Memo, GroupId) {
         let mut memo = Memo::new();
         let left_group = memo.new_group(MExpr {
@@ -443,15 +454,12 @@ mod tests {
             }),
             children: vec![],
         });
+        let eq_condition = eq_cond(&mut memo, test_col(1, "a_id"), test_col(2, "b_id"));
         let root = memo.new_group(MExpr {
             id: 2,
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
-                eq_conditions: vec![PhysicalHashJoinEqCondition {
-                    left: test_col(1, "a_id"),
-                    right: test_col(2, "b_id"),
-                    null_safe: false,
-                }],
+                eq_conditions: vec![eq_condition],
                 other_condition: None,
                 distribution: JoinDistribution::Unknown,
             }),
@@ -520,6 +528,11 @@ mod tests {
             crate::sql::optimizer::statistics::Confidence::Estimated,
         );
 
+        let eq_condition = eq_cond(
+            &mut memo,
+            test_col(1, "a_id"),
+            minus_int(test_col(2, "b_id"), 52),
+        );
         let root_expr = memo.groups[root]
             .physical_exprs
             .first_mut()
@@ -527,11 +540,7 @@ mod tests {
         let Operator::PhysicalHashJoin(join) = &mut root_expr.op else {
             panic!("fixture root should be a hash join");
         };
-        join.eq_conditions = vec![PhysicalHashJoinEqCondition {
-            left: test_col(1, "a_id"),
-            right: minus_int(test_col(2, "b_id"), 52),
-            null_safe: false,
-        }];
+        join.eq_conditions = vec![eq_condition];
         (memo, root)
     }
 
@@ -567,15 +576,12 @@ mod tests {
             }),
             children: vec![right_scan],
         });
+        let eq_condition = eq_cond(&mut memo, test_col(10, "c10"), test_col(20, "c20"));
         let root = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: crate::sql::analysis::JoinKind::Inner,
-                eq_conditions: vec![PhysicalHashJoinEqCondition {
-                    left: test_col(10, "c10"),
-                    right: test_col(20, "c20"),
-                    null_safe: false,
-                }],
+                eq_conditions: vec![eq_condition],
                 other_condition: None,
                 distribution: JoinDistribution::Unknown,
             }),
@@ -609,15 +615,12 @@ mod tests {
             }),
             children: vec![],
         });
+        let eq_condition = eq_cond(&mut memo, test_col(1, "a_id"), test_col(2, "b_id"));
         let root = memo.new_group(MExpr {
             id: 1,
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
-                eq_conditions: vec![PhysicalHashJoinEqCondition {
-                    left: test_col(1, "a_id"),
-                    right: test_col(2, "b_id"),
-                    null_safe: false,
-                }],
+                eq_conditions: vec![eq_condition],
                 other_condition: None,
                 distribution: JoinDistribution::Unknown,
             }),
@@ -712,7 +715,7 @@ mod tests {
 
     #[test]
     fn winner_records_hash_join_alternative_and_child_properties() {
-        let (memo, root) = make_two_table_inner_join_memo_for_test();
+        let (mut memo, root) = make_two_table_inner_join_memo_for_test();
         let mut ctx = SearchContext::new(Default::default());
         let required = PhysicalPropertySet::gather();
         ctx.optimize_group(&memo, root, &required).expect("search");
@@ -751,12 +754,12 @@ mod tests {
 
     #[test]
     fn unknown_hash_join_search_extracts_concrete_distribution() {
-        let (memo, root) = make_two_table_inner_join_memo_for_test();
+        let (mut memo, root) = make_two_table_inner_join_memo_for_test();
         let mut ctx = SearchContext::new(Default::default());
         let required = PhysicalPropertySet::gather();
         ctx.optimize_group(&memo, root, &required).expect("search");
         let plan =
-            crate::sql::optimizer::extract::extract_best(&memo, root, &required, &ctx.winners)
+            crate::sql::optimizer::extract::extract_best(&mut memo, root, &required, &ctx.winners)
                 .expect("extract");
         let join = find_hash_join_for_test(&plan).expect("hash join");
         let winner = ctx
@@ -939,6 +942,8 @@ mod cascaded_derivation_tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::MExpr;
     use crate::sql::optimizer::operator::*;
+    use crate::sql::optimizer::scalar::intern_typed;
+    use crate::sql::optimizer::scalar_bridge::intern_window_exprs;
     use arrow::datatypes::DataType;
 
     fn col(id: u32) -> TypedExpr {
@@ -950,6 +955,14 @@ mod cascaded_derivation_tests {
             },
             data_type: DataType::Int64,
             nullable: false,
+        }
+    }
+
+    fn eq_cond(memo: &mut Memo, left: TypedExpr, right: TypedExpr) -> PhysicalHashJoinEqCondition {
+        PhysicalHashJoinEqCondition {
+            left: intern_typed(&mut memo.scalars, &left),
+            right: intern_typed(&mut memo.scalars, &right),
+            null_safe: false,
         }
     }
 
@@ -1025,11 +1038,7 @@ mod cascaded_derivation_tests {
 
         let shuffle_join = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
             join_type: JoinKind::Inner,
-            eq_conditions: vec![PhysicalHashJoinEqCondition {
-                left: col(10),
-                right: col(10),
-                null_safe: false,
-            }],
+            eq_conditions: vec![eq_cond(&mut memo, col(10), col(10))],
             other_condition: None,
             distribution: JoinDistribution::Shuffle,
         });
@@ -1041,11 +1050,7 @@ mod cascaded_derivation_tests {
 
         let broadcast_join = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
             join_type: JoinKind::Inner,
-            eq_conditions: vec![PhysicalHashJoinEqCondition {
-                left: col(10),
-                right: col(10),
-                null_safe: false,
-            }],
+            eq_conditions: vec![eq_cond(&mut memo, col(10), col(10))],
             other_condition: None,
             distribution: JoinDistribution::Broadcast,
         });
@@ -1055,20 +1060,27 @@ mod cascaded_derivation_tests {
             children: vec![g_sj, g_small],
         });
 
+        let window_expr = crate::sql::planner::plan::WindowExpr {
+            name: "max".into(),
+            args: vec![],
+            partition_by: vec![col(10)],
+            order_by: vec![],
+            window_frame: None,
+            ignore_nulls: false,
+            distinct: false,
+            output_name: "win".into(),
+            output_column_id: crate::sql::column_id::ColumnId::UNSET,
+            result_type: DataType::Int64,
+        };
         let window = Operator::PhysicalWindow(PhysicalWindowOp {
-            window_exprs: vec![crate::sql::planner::plan::WindowExpr {
-                name: "max".into(),
-                args: vec![],
-                partition_by: vec![col(10)],
-                order_by: vec![],
-                window_frame: None,
-                ignore_nulls: false,
-                distinct: false,
-                output_name: "win".into(),
-                output_column_id: crate::sql::column_id::ColumnId::UNSET,
-                result_type: DataType::Int64,
+            window_exprs: intern_window_exprs(&mut memo.scalars, &[window_expr]),
+            output_columns: vec![crate::sql::analysis::OutputColumn {
+                column_id: ColumnId(1000),
+                name: "win".into(),
+                data_type: DataType::Int64,
+                nullable: true,
+                is_internal: false,
             }],
-            output_columns: vec![],
         });
         let g_w = memo.new_group(MExpr {
             id: 5,
@@ -1119,6 +1131,7 @@ mod cascaded_derivation_tests {
         assert_eq!(window_expr.children.as_slice(), &[g_bj]);
         let bj_req = crate::sql::optimizer::derive::derive_required(
             &window_expr.op,
+            &memo.scalars,
             &PhysicalPropertySet::any(),
             1,
         )

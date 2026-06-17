@@ -39,10 +39,8 @@ use crate::sql::codegen::{
     FragmentBuildResult, FragmentId, MultiFragmentBuildResult, OutputColumn,
 };
 use crate::sql::optimizer::operator::{
-    AggMode, PhysicalAssertOneRowOp, PhysicalDecodeOp, PhysicalGenerateSeriesOp,
-    PhysicalHashAggregateOp, PhysicalHashJoinOp, PhysicalNestLoopJoinOp, PhysicalProjectOp,
-    PhysicalRepeatOp, PhysicalScanOp, PhysicalSortOp, PhysicalTableFunctionOp, PhysicalTopNOp,
-    PhysicalValuesOp, ScanDictionaryColumn, TopNPhase,
+    AggMode, PhysicalAssertOneRowOp, PhysicalDecodeOp, PhysicalGenerateSeriesOp, PhysicalRepeatOp,
+    ScanDictionaryColumn, TopNPhase,
 };
 use crate::sql::optimizer::physical_plan::JoinExecutionDistribution;
 use crate::sql::optimizer::property::{OrderingSpec, window_ordering_spec};
@@ -1087,13 +1085,12 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             ));
         }
         let scan_tuple_id = first_tuple_id(node, "Scan")?;
-        let op = scan_node_to_physical_op(scan);
-        let (scan_plan_node, scope) = self.lower_scan(node.node_id, scan_tuple_id, &op)?;
+        let (scan_plan_node, scope) = self.lower_scan(node.node_id, scan_tuple_id, scan)?;
         Ok(LoweredDistributedNode {
             plan_nodes: vec![scan_plan_node],
             scope,
             tuple_ids: vec![scan_tuple_id],
-            output_columns: op.columns.clone(),
+            output_columns: scan.columns.clone(),
             ordering: OrderingSpec::Any,
         })
     }
@@ -1112,9 +1109,8 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         }
         let child = self.lower_node(&node.children[0])?;
         let project_tuple_id = first_tuple_id(node, "Project")?;
-        let op = project_node_to_physical_op(project);
         let (project_plan_node, scope, _output_columns) =
-            self.lower_project(node.node_id, project_tuple_id, &op, &child.scope)?;
+            self.lower_project(node.node_id, project_tuple_id, project, &child.scope)?;
         let mut plan_nodes = vec![project_plan_node];
         plan_nodes.extend(child.plan_nodes);
         Ok(LoweredDistributedNode {
@@ -1188,10 +1184,9 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             ));
         }
         let child = self.lower_node(&node.children[0])?;
-        let op = sort_node_to_physical_op(sort);
         let sort_plan_node = self.lower_sort(
             node.node_id,
-            &op,
+            sort,
             &child.scope,
             &child.tuple_ids,
             &sort.output_columns,
@@ -1221,9 +1216,8 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             ));
         }
         let child = self.lower_node(&node.children[0])?;
-        let op = top_n_node_to_physical_op(topn);
         let top_n_plan_node =
-            self.lower_top_n_single_or_partial(node.node_id, &op, &child.scope, &child.tuple_ids)?;
+            self.lower_top_n_single_or_partial(node.node_id, topn, &child.scope, &child.tuple_ids)?;
         let mut plan_nodes = vec![top_n_plan_node];
         plan_nodes.extend(child.plan_nodes);
         Ok(LoweredDistributedNode {
@@ -1354,9 +1348,8 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         }
         let child = self.lower_node(&node.children[0])?;
         let agg_tuple_id = first_tuple_id(node, "HashAggregate")?;
-        let op = hash_aggregate_node_to_physical_op(agg);
         let (agg_plan_node, scope) =
-            self.lower_hash_aggregate(node.node_id, agg_tuple_id, &op, &child.scope)?;
+            self.lower_hash_aggregate(node.node_id, agg_tuple_id, agg, &child.scope)?;
         let mut plan_nodes = vec![agg_plan_node];
         plan_nodes.extend(child.plan_nodes);
         Ok(LoweredDistributedNode {
@@ -1388,12 +1381,11 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             tuple_ids: right_tuple_ids,
             ..
         } = right;
-        let op = hash_join_node_to_physical_op(hash_join);
         let (join_plan_node, scope, tuple_ids) = self.lower_hash_join(
             node.node_id,
             &left_tuple_ids,
             &right_tuple_ids,
-            &op,
+            hash_join,
             left_scope,
             right_scope,
             node.execution_join_distribution,
@@ -1431,12 +1423,11 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             tuple_ids: right_tuple_ids,
             ..
         } = right;
-        let op = nest_loop_join_node_to_physical_op(nest_loop);
         let (join_plan_node, scope, tuple_ids) = self.lower_nest_loop_join(
             node.node_id,
             &left_tuple_ids,
             &right_tuple_ids,
-            &op,
+            nest_loop,
             left_scope,
             right_scope,
         )?;
@@ -1465,8 +1456,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             ));
         }
         let tuple_id = first_tuple_id(node, "Values")?;
-        let op = values_node_to_physical_op(values);
-        let (plan_node, scope) = self.lower_values(node.node_id, tuple_id, &op)?;
+        let (plan_node, scope) = self.lower_values(node.node_id, tuple_id, values)?;
         Ok(LoweredDistributedNode {
             plan_nodes: vec![plan_node],
             scope,
@@ -1681,9 +1671,8 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         }
         let child = self.lower_node(&node.children[0])?;
         let output_tuple_id = first_tuple_id(node, "TableFunction")?;
-        let op = table_function_node_to_physical_op(table_function);
         let (table_fn_nodes, scope) =
-            self.lower_table_function(node.node_id, output_tuple_id, &op, &child.scope)?;
+            self.lower_table_function(node.node_id, output_tuple_id, table_function, &child.scope)?;
         let mut plan_nodes = table_fn_nodes;
         plan_nodes.extend(child.plan_nodes);
         Ok(LoweredDistributedNode {
@@ -1774,7 +1763,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         join_node_id: i32,
         left_tuple_ids: &[i32],
         right_tuple_ids: &[i32],
-        op: &PhysicalHashJoinOp,
+        op: &super::kind::DistributedHashJoinNode,
         left_scope: ExprScope,
         right_scope: ExprScope,
         execution_distribution: Option<JoinExecutionDistribution>,
@@ -1901,7 +1890,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         join_node_id: i32,
         left_tuple_ids: &[i32],
         right_tuple_ids: &[i32],
-        op: &PhysicalNestLoopJoinOp,
+        op: &super::kind::DistributedNestLoopJoinNode,
         left_scope: ExprScope,
         right_scope: ExprScope,
     ) -> Result<(plan_nodes::TPlanNode, ExprScope, Vec<i32>), String> {
@@ -2171,7 +2160,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         &mut self,
         scan_node_id: i32,
         scan_tuple_id: i32,
-        op: &PhysicalScanOp,
+        op: &super::kind::DistributedScanNode,
     ) -> Result<(plan_nodes::TPlanNode, ExprScope), String> {
         let state = &mut *self.state;
         let table = state.refresh_scan_table_for_codegen(&op.table)?;
@@ -2634,7 +2623,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         &mut self,
         project_node_id: i32,
         project_tuple_id: i32,
-        op: &PhysicalProjectOp,
+        op: &super::kind::DistributedProjectNode,
         child_scope: &ExprScope,
     ) -> Result<(plan_nodes::TPlanNode, ExprScope, Vec<OutputColumn>), String> {
         let state = &mut *self.state;
@@ -2711,7 +2700,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         &mut self,
         agg_node_id: i32,
         agg_tuple_id: i32,
-        op: &PhysicalHashAggregateOp,
+        op: &super::kind::DistributedHashAggregateNode,
         child_scope: &ExprScope,
     ) -> Result<(plan_nodes::TPlanNode, ExprScope), String> {
         let state = &mut *self.state;
@@ -2895,7 +2884,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
     pub(crate) fn lower_sort(
         &mut self,
         sort_node_id: i32,
-        op: &PhysicalSortOp,
+        op: &super::kind::DistributedSortNode,
         child_scope: &ExprScope,
         child_tuple_ids: &[i32],
         output_columns: &[AnalysisOutputColumn],
@@ -3010,7 +2999,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
     pub(crate) fn lower_top_n_single_or_partial(
         &mut self,
         top_n_node_id: i32,
-        op: &PhysicalTopNOp,
+        op: &super::kind::DistributedTopNNode,
         child_scope: &ExprScope,
         child_tuple_ids: &[i32],
     ) -> Result<plan_nodes::TPlanNode, String> {
@@ -3082,7 +3071,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         &mut self,
         values_node_id: i32,
         output_tuple_id: i32,
-        op: &PhysicalValuesOp,
+        op: &super::kind::DistributedValuesNode,
     ) -> Result<(plan_nodes::TPlanNode, ExprScope), String> {
         let state = &mut *self.state;
 
@@ -3515,7 +3504,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         &mut self,
         table_fn_node_id: i32,
         output_tuple_id: i32,
-        op: &PhysicalTableFunctionOp,
+        op: &super::kind::DistributedTableFunctionNode,
         child_scope: &ExprScope,
     ) -> Result<(Vec<plan_nodes::TPlanNode>, ExprScope), String> {
         let derived_project_node = table_fn_node_id - 1;
@@ -4371,85 +4360,6 @@ fn apply_ignore_nulls_to_root_fn(texpr: &mut exprs::TExpr, ignore_nulls: bool) {
     }
 }
 
-fn scan_node_to_physical_op(kind: &super::kind::DistributedScanNode) -> PhysicalScanOp {
-    PhysicalScanOp {
-        database: kind.database.clone(),
-        table: kind.table.clone(),
-        alias: kind.alias.clone(),
-        columns: kind.columns.clone(),
-        predicates: kind.predicates.clone(),
-        required_columns: kind.required_columns.clone(),
-        dict_columns: kind.dict_columns.clone(),
-        variant_columns: kind.variant_columns.clone(),
-        mv_rewritten_from: kind.mv_rewritten_from.clone(),
-    }
-}
-
-fn project_node_to_physical_op(kind: &super::kind::DistributedProjectNode) -> PhysicalProjectOp {
-    PhysicalProjectOp {
-        items: kind.items.clone(),
-        output_qualifier: kind.output_qualifier.clone(),
-    }
-}
-
-fn sort_node_to_physical_op(kind: &super::kind::DistributedSortNode) -> PhysicalSortOp {
-    PhysicalSortOp {
-        items: kind.items.clone(),
-        analytic_partition_exprs: kind.analytic_partition_exprs.clone(),
-        partition_limit: kind.partition_limit,
-        topn_type: kind.topn_type,
-    }
-}
-
-fn top_n_node_to_physical_op(kind: &super::kind::DistributedTopNNode) -> PhysicalTopNOp {
-    PhysicalTopNOp {
-        items: kind.items.clone(),
-        limit: kind.limit,
-        offset: kind.offset,
-        phase: kind.phase,
-        is_split: kind.is_split,
-    }
-}
-
-fn hash_aggregate_node_to_physical_op(
-    kind: &super::kind::DistributedHashAggregateNode,
-) -> PhysicalHashAggregateOp {
-    PhysicalHashAggregateOp {
-        mode: kind.mode,
-        group_by: kind.group_by.clone(),
-        aggregates: kind.aggregates.clone(),
-        output_columns: kind.output_columns.clone(),
-        is_merge: kind.is_merge.clone(),
-    }
-}
-
-fn hash_join_node_to_physical_op(
-    kind: &super::kind::DistributedHashJoinNode,
-) -> PhysicalHashJoinOp {
-    PhysicalHashJoinOp {
-        join_type: kind.join_type,
-        eq_conditions: kind.eq_conditions.clone(),
-        other_condition: kind.other_condition.clone(),
-        distribution: kind.distribution.clone(),
-    }
-}
-
-fn nest_loop_join_node_to_physical_op(
-    kind: &super::kind::DistributedNestLoopJoinNode,
-) -> PhysicalNestLoopJoinOp {
-    PhysicalNestLoopJoinOp {
-        join_type: kind.join_type,
-        condition: kind.condition.clone(),
-    }
-}
-
-fn values_node_to_physical_op(kind: &super::kind::DistributedValuesNode) -> PhysicalValuesOp {
-    PhysicalValuesOp {
-        rows: kind.rows.clone(),
-        columns: kind.columns.clone(),
-    }
-}
-
 fn assert_one_row_node_to_physical_op(
     kind: &super::kind::DistributedAssertOneRowNode,
 ) -> PhysicalAssertOneRowOp {
@@ -4489,18 +4399,6 @@ fn generate_series_node_to_physical_op(
         column_name: kind.column_name.clone(),
         alias: kind.alias.clone(),
         output_column_id: kind.output_column_id,
-    }
-}
-
-fn table_function_node_to_physical_op(
-    kind: &super::kind::DistributedTableFunctionNode,
-) -> PhysicalTableFunctionOp {
-    PhysicalTableFunctionOp {
-        function_name: kind.function_name.clone(),
-        args: kind.args.clone(),
-        output_columns: kind.output_columns.clone(),
-        alias: kind.alias.clone(),
-        is_left_join: kind.is_left_join,
     }
 }
 
@@ -4612,6 +4510,8 @@ fn refresh_scan_table_for_codegen(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use arrow::datatypes::DataType;
 
     use crate::connector::ConnectorRegistry;
@@ -4626,7 +4526,8 @@ mod tests {
     use crate::sql::codegen::expr_compiler::infer_agg_function_types;
     use crate::sql::codegen::fragment_builder::PlanFragmentBuilder;
     use crate::sql::codegen::ir::kind::{
-        DistributedExchangeNode, DistributedValuesNode, ExchangeFlavor,
+        DistributedExchangeNode, DistributedHashJoinEqCondition, DistributedHashJoinNode,
+        DistributedNestLoopJoinNode, DistributedValuesNode, ExchangeFlavor,
     };
     use crate::sql::codegen::ir::{
         DataPartition, DataSink, DistributedPlan, DistributedPlanNode, DistributedPlanNodeKind,
@@ -4636,10 +4537,13 @@ mod tests {
     use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentStreamKind};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
-        JoinDistribution, Operator, PhysicalHashJoinEqCondition, PhysicalHashJoinOp,
-        PhysicalNestLoopJoinOp, PhysicalProjectOp, PhysicalScanOp,
+        JoinDistribution, Operator, PhysicalProjectOp, PhysicalScanOp,
     };
-    use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, PlanExecutionProps};
+    use crate::sql::optimizer::physical_plan::{
+        PhysicalPlanNode, PlanExecutionProps, attach_scalar_arena,
+    };
+    use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::optimizer::scalar_bridge::intern_project_items;
     use crate::sql::optimizer::statistics::Statistics;
 
     #[test]
@@ -4720,9 +4624,9 @@ mod tests {
         let mut state = super::OwnedLoweringState::new(&connectors, None, 0);
         let (left_column_id, right_column_id, left_key, right_key, left_scope, right_scope) =
             hash_join_test_inputs(&mut state);
-        let op = PhysicalHashJoinOp {
+        let op = DistributedHashJoinNode {
             join_type: JoinKind::NullAwareLeftAnti,
-            eq_conditions: vec![PhysicalHashJoinEqCondition {
+            eq_conditions: vec![DistributedHashJoinEqCondition {
                 left: left_key,
                 right: right_key,
                 null_safe: false,
@@ -4767,9 +4671,9 @@ mod tests {
         let connectors = ConnectorRegistry::new();
         let mut state = super::OwnedLoweringState::new(&connectors, None, 0);
         let (left_column_id, _, _, _, left_scope, right_scope) = hash_join_test_inputs(&mut state);
-        let op = PhysicalHashJoinOp {
+        let op = DistributedHashJoinNode {
             join_type: JoinKind::Inner,
-            eq_conditions: vec![PhysicalHashJoinEqCondition {
+            eq_conditions: vec![DistributedHashJoinEqCondition {
                 left: qualified_column_ref(left_column_id, "l", "k", false),
                 right: qualified_column_ref(left_column_id, "l", "k", false),
                 null_safe: false,
@@ -4803,9 +4707,9 @@ mod tests {
         let (_, _, left_key, right_key, left_scope, right_scope) =
             hash_join_test_inputs(&mut state);
 
-        let op = PhysicalHashJoinOp {
+        let op = DistributedHashJoinNode {
             join_type: JoinKind::Inner,
-            eq_conditions: vec![PhysicalHashJoinEqCondition {
+            eq_conditions: vec![DistributedHashJoinEqCondition {
                 left: right_key,
                 right: left_key,
                 null_safe: false,
@@ -4914,7 +4818,7 @@ mod tests {
         let mut state = super::OwnedLoweringState::new(&connectors, None, 0);
         let (left_column_id, right_column_id, _, _, left_scope, right_scope) =
             hash_join_test_inputs(&mut state);
-        let op = PhysicalNestLoopJoinOp {
+        let op = DistributedNestLoopJoinNode {
             join_type: JoinKind::NullAwareLeftAnti,
             condition: None,
         };
@@ -5297,18 +5201,27 @@ mod tests {
         );
 
         let project_output = output_col(1, "k", DataType::Int64, false);
-        physical_node(
+        let mut scalars = scan
+            .execution_props
+            .scalar_arena
+            .as_deref()
+            .cloned()
+            .unwrap_or_else(ScalarArena::new);
+        let items = vec![ProjectItem {
+            expr: column_ref_expr(1, "k", DataType::Int64, false),
+            output_name: "k".to_string(),
+            output_column_id: ColumnId::new_for_test(1),
+        }];
+        let mut plan = physical_node(
             Operator::PhysicalProject(PhysicalProjectOp {
-                items: vec![ProjectItem {
-                    expr: column_ref_expr(1, "k", DataType::Int64, false),
-                    output_name: "k".to_string(),
-                    output_column_id: ColumnId::new_for_test(1),
-                }],
+                items: intern_project_items(&mut scalars, &items),
                 output_qualifier: None,
             }),
             vec![scan],
             vec![project_output],
-        )
+        );
+        attach_scalar_arena(&mut plan, Arc::new(scalars));
+        plan
     }
 
     fn physical_node(
@@ -5316,7 +5229,11 @@ mod tests {
         children: Vec<PhysicalPlanNode>,
         output_columns: Vec<OutputColumn>,
     ) -> PhysicalPlanNode {
-        PhysicalPlanNode {
+        let scalars = children
+            .iter()
+            .find_map(|child| child.execution_props.scalar_arena.as_deref().cloned())
+            .unwrap_or_else(ScalarArena::new);
+        let mut plan = PhysicalPlanNode {
             op,
             children,
             stats: Statistics::default(),
@@ -5324,7 +5241,9 @@ mod tests {
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
-        }
+        };
+        attach_scalar_arena(&mut plan, Arc::new(scalars));
+        plan
     }
 
     fn metadata_table_def() -> TableDef {

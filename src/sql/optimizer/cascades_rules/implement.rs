@@ -13,6 +13,7 @@ use crate::sql::optimizer::memo::{GroupId, MExpr, Memo};
 use crate::sql::optimizer::operator::*;
 use crate::sql::optimizer::rewrite::rules::utils::collect_column_id_refs_strict;
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
+use crate::sql::optimizer::scalar::{intern_typed, materialize};
 use crate::sql::types::wider_type;
 
 pub(super) fn get_group_column_ids(memo: &Memo, group_id: GroupId) -> HashSet<ColumnId> {
@@ -78,16 +79,23 @@ fn expr_has_column_ref_inner(expr: &TypedExpr, out: &mut bool) {
     }
 }
 
+#[derive(Clone, Debug)]
+struct TypedHashJoinEqCondition {
+    left: TypedExpr,
+    right: TypedExpr,
+    null_safe: bool,
+}
+
 /// Orient an eq pair so that the first element references the left child's
 /// columns and the second references the right. Returns `None` when either side
 /// has unresolved ids, cannot be assigned exclusively to one child, or both
 /// expressions reference the same child.
 fn orient_eq_pair(
-    pair: PhysicalHashJoinEqCondition,
+    pair: TypedHashJoinEqCondition,
     left_ids: &HashSet<ColumnId>,
     right_ids: &HashSet<ColumnId>,
-) -> Option<PhysicalHashJoinEqCondition> {
-    let PhysicalHashJoinEqCondition {
+) -> Option<TypedHashJoinEqCondition> {
+    let TypedHashJoinEqCondition {
         left: a,
         right: b,
         null_safe,
@@ -113,7 +121,7 @@ fn orient_eq_pair(
 
     // Unambiguous exclusive assignment: a from left only, b from right only.
     if a_in_left && !a_in_right && b_in_right && !b_in_left {
-        return Some(PhysicalHashJoinEqCondition {
+        return Some(TypedHashJoinEqCondition {
             left: a,
             right: b,
             null_safe,
@@ -121,7 +129,7 @@ fn orient_eq_pair(
     }
     // Unambiguous exclusive swap: a from right only, b from left only.
     if a_in_right && !a_in_left && b_in_left && !b_in_right {
-        return Some(PhysicalHashJoinEqCondition {
+        return Some(TypedHashJoinEqCondition {
             left: b,
             right: a,
             null_safe,
@@ -145,7 +153,7 @@ fn hash_join_key_type_is_supported(data_type: &DataType) -> bool {
     )
 }
 
-fn hash_join_eq_condition_is_hashable(eq: &PhysicalHashJoinEqCondition) -> bool {
+fn hash_join_eq_condition_is_hashable(eq: &TypedHashJoinEqCondition) -> bool {
     if eq.left.data_type == eq.right.data_type {
         return hash_join_key_type_is_supported(&eq.left.data_type);
     }
@@ -153,16 +161,14 @@ fn hash_join_eq_condition_is_hashable(eq: &PhysicalHashJoinEqCondition) -> bool 
     hash_join_key_type_is_supported(&common_type)
 }
 
-fn coerce_hash_join_eq_condition(
-    eq: PhysicalHashJoinEqCondition,
-) -> Option<PhysicalHashJoinEqCondition> {
+fn coerce_hash_join_eq_condition(eq: TypedHashJoinEqCondition) -> Option<TypedHashJoinEqCondition> {
     if hash_join_eq_condition_is_hashable(&eq) {
         return Some(eq);
     }
     None
 }
 
-fn eq_condition_to_expr(eq: PhysicalHashJoinEqCondition) -> TypedExpr {
+fn eq_condition_to_expr(eq: TypedHashJoinEqCondition) -> TypedExpr {
     TypedExpr {
         data_type: DataType::Boolean,
         nullable: if eq.null_safe {
@@ -213,7 +219,7 @@ fn append_residual_condition(other: &mut Option<TypedExpr>, residual: TypedExpr)
 fn extract_eq_conditions(
     condition: &Option<TypedExpr>,
     _join_type: &JoinKind,
-) -> (Vec<PhysicalHashJoinEqCondition>, Option<TypedExpr>) {
+) -> (Vec<TypedHashJoinEqCondition>, Option<TypedExpr>) {
     let Some(cond) = condition else {
         return (vec![], None);
     };
@@ -243,7 +249,7 @@ fn extract_eq_conditions(
 /// either an equality pair or a residual predicate.
 fn collect_conjuncts(
     expr: &TypedExpr,
-    eq_pairs: &mut Vec<PhysicalHashJoinEqCondition>,
+    eq_pairs: &mut Vec<TypedHashJoinEqCondition>,
     others: &mut Vec<TypedExpr>,
 ) {
     match &expr.kind {
@@ -272,7 +278,7 @@ fn collect_conjuncts(
             let left_has_col = expr_has_column_ref(left);
             let right_has_col = expr_has_column_ref(right);
             if left_has_col && right_has_col {
-                eq_pairs.push(PhysicalHashJoinEqCondition {
+                eq_pairs.push(TypedHashJoinEqCondition {
                     left: *left.clone(),
                     right: *right.clone(),
                     null_safe: matches!(op, BinOp::EqForNull),
@@ -330,7 +336,7 @@ fn typed_expr_eq(a: &TypedExpr, b: &TypedExpr) -> bool {
 }
 
 /// Check if two eq pairs are structurally equal (possibly with swapped sides).
-fn eq_pair_matches(a: &PhysicalHashJoinEqCondition, b: &PhysicalHashJoinEqCondition) -> bool {
+fn eq_pair_matches(a: &TypedHashJoinEqCondition, b: &TypedHashJoinEqCondition) -> bool {
     a.null_safe == b.null_safe
         && ((typed_expr_eq(&a.left, &b.left) && typed_expr_eq(&a.right, &b.right))
             || (typed_expr_eq(&a.left, &b.right) && typed_expr_eq(&a.right, &b.left)))
@@ -344,14 +350,14 @@ fn eq_pair_matches(a: &PhysicalHashJoinEqCondition, b: &PhysicalHashJoinEqCondit
 /// Returns `(common_eq_pairs, rewritten_or_condition)`.
 fn try_extract_common_eq_from_or(
     expr: &TypedExpr,
-) -> (Vec<PhysicalHashJoinEqCondition>, Option<TypedExpr>) {
+) -> (Vec<TypedHashJoinEqCondition>, Option<TypedExpr>) {
     let branches = split_or(expr);
     if branches.len() < 2 {
         return (vec![], Some(expr.clone()));
     }
 
     // For each branch, extract eq pairs and residual.
-    let mut branch_eqs: Vec<Vec<PhysicalHashJoinEqCondition>> = Vec::new();
+    let mut branch_eqs: Vec<Vec<TypedHashJoinEqCondition>> = Vec::new();
     let mut branch_others: Vec<Vec<TypedExpr>> = Vec::new();
     for branch in &branches {
         let mut eqs = Vec::new();
@@ -363,7 +369,7 @@ fn try_extract_common_eq_from_or(
 
     // Find eq pairs that appear in ALL branches.
     let first_eqs = &branch_eqs[0];
-    let mut common: Vec<PhysicalHashJoinEqCondition> = Vec::new();
+    let mut common: Vec<TypedHashJoinEqCondition> = Vec::new();
     for eq in first_eqs {
         if branch_eqs[1..]
             .iter()
@@ -565,7 +571,10 @@ impl Rule for JoinToHashJoin {
         let Operator::LogicalJoin(op) = &expr.op else {
             return vec![];
         };
-        let (raw_eq_conds, mut other) = extract_eq_conditions(&op.condition, &op.join_type);
+        let condition = op
+            .condition
+            .map(|condition| materialize(&memo.scalars, condition));
+        let (raw_eq_conds, mut other) = extract_eq_conditions(&condition, &op.join_type);
 
         // Orient eq_conditions so that pair.0 references the left child's
         // columns and pair.1 references the right child's columns.  Pairs
@@ -590,7 +599,7 @@ impl Rule for JoinToHashJoin {
                     None => {
                         append_residual_condition(
                             &mut other,
-                            eq_condition_to_expr(PhysicalHashJoinEqCondition {
+                            eq_condition_to_expr(TypedHashJoinEqCondition {
                                 left: a,
                                 right: b,
                                 null_safe,
@@ -607,11 +616,22 @@ impl Rule for JoinToHashJoin {
             // No equality conditions — JoinToNestLoop should handle this.
             return vec![];
         }
+        let eq_conditions = eq_conds
+            .into_iter()
+            .map(|eq| PhysicalHashJoinEqCondition {
+                left: intern_typed(&mut memo.scalars, &eq.left),
+                right: intern_typed(&mut memo.scalars, &eq.right),
+                null_safe: eq.null_safe,
+            })
+            .collect();
+        let other_condition = other
+            .as_ref()
+            .map(|condition| intern_typed(&mut memo.scalars, condition));
         vec![NewExpr {
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: op.join_type,
-                eq_conditions: eq_conds,
-                other_condition: other,
+                eq_conditions,
+                other_condition,
                 distribution: JoinDistribution::Unknown,
             }),
             children: expr.children.clone(),
@@ -648,7 +668,10 @@ impl Rule for JoinToNestLoop {
         // physical alternatives. Without this guard, the memo group has no
         // feasible implementation and the optimizer surfaces "no feasible
         // plan for group N".
-        let (eq_conds, _) = extract_eq_conditions(&op.condition, &op.join_type);
+        let condition = op
+            .condition
+            .map(|condition| materialize(&memo.scalars, condition));
+        let (eq_conds, _) = extract_eq_conditions(&condition, &op.join_type);
         if !eq_conds.is_empty() && op.join_type != JoinKind::Cross && expr.children.len() == 2 {
             let left_ids = get_group_column_ids(memo, expr.children[0]);
             let right_ids = get_group_column_ids(memo, expr.children[1]);
@@ -1496,8 +1519,8 @@ mod eq_pair_tests {
         values.iter().copied().map(ColumnId).collect()
     }
 
-    fn eq_pair(left: TypedExpr, right: TypedExpr) -> PhysicalHashJoinEqCondition {
-        PhysicalHashJoinEqCondition {
+    fn eq_pair(left: TypedExpr, right: TypedExpr) -> TypedHashJoinEqCondition {
+        TypedHashJoinEqCondition {
             left,
             right,
             null_safe: false,
@@ -1570,6 +1593,7 @@ mod join_demotion_tests {
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::{LogicalProperties, MExpr, Memo};
+    use crate::sql::optimizer::scalar::ScalarId;
     use arrow::datatypes::{DataType, Field};
     use std::sync::Arc;
 
@@ -1658,6 +1682,28 @@ mod join_demotion_tests {
         }
     }
 
+    fn logical_join_expr(
+        memo: &mut Memo,
+        join_type: JoinKind,
+        condition: TypedExpr,
+        children: Vec<GroupId>,
+    ) -> MExpr {
+        let id = memo.next_expr_id();
+        let condition = Some(intern_typed(&mut memo.scalars, &condition));
+        MExpr {
+            id,
+            op: Operator::LogicalJoin(LogicalJoinOp {
+                join_type,
+                condition,
+            }),
+            children,
+        }
+    }
+
+    fn mat(memo: &Memo, expr: ScalarId) -> TypedExpr {
+        materialize(&memo.scalars, expr)
+    }
+
     /// The full demotion path: a same-side eq pair must land in other_condition
     /// while an orientable pair lands (correctly oriented) in eq_conditions.
     #[test]
@@ -1675,14 +1721,12 @@ mod join_demotion_tests {
         let second_eq = bin(col("a_id"), BinOp::Eq, col("a_name"));
         let condition = bin(first_eq, BinOp::And, second_eq);
 
-        let join_mexpr = MExpr {
-            id: memo.next_expr_id(),
-            op: Operator::LogicalJoin(LogicalJoinOp {
-                join_type: JoinKind::Inner,
-                condition: Some(condition),
-            }),
-            children: vec![left_group, right_group],
-        };
+        let join_mexpr = logical_join_expr(
+            &mut memo,
+            JoinKind::Inner,
+            condition,
+            vec![left_group, right_group],
+        );
 
         let rule = JoinToHashJoin;
         let alternatives = rule.apply(&join_mexpr, &mut memo);
@@ -1706,7 +1750,8 @@ mod join_demotion_tests {
             !eq.null_safe,
             "regular equality should not be marked null-safe"
         );
-        let (lhs, rhs) = (&eq.left, &eq.right);
+        let lhs = mat(&memo, eq.left);
+        let rhs = mat(&memo, eq.right);
         match &lhs.kind {
             ExprKind::ColumnRef { column, .. } => {
                 assert_eq!(column, "a_id", "left side of eq_condition should be a_id")
@@ -1725,6 +1770,7 @@ mod join_demotion_tests {
             .other_condition
             .as_ref()
             .expect("demoted same-side pair must appear in other_condition");
+        let other = mat(&memo, *other);
         match &other.kind {
             ExprKind::BinaryOp { left, op, right } => {
                 assert!(
@@ -1761,14 +1807,12 @@ mod join_demotion_tests {
         let right_group = mk_scan_group(&mut memo, &["b_id"]);
 
         let condition = bin(col("a_id"), BinOp::EqForNull, col("b_id"));
-        let join_mexpr = MExpr {
-            id: memo.next_expr_id(),
-            op: Operator::LogicalJoin(LogicalJoinOp {
-                join_type: JoinKind::Inner,
-                condition: Some(condition),
-            }),
-            children: vec![left_group, right_group],
-        };
+        let join_mexpr = logical_join_expr(
+            &mut memo,
+            JoinKind::Inner,
+            condition,
+            vec![left_group, right_group],
+        );
 
         let rule = JoinToHashJoin;
         let alternatives = rule.apply(&join_mexpr, &mut memo);
@@ -1798,14 +1842,12 @@ mod join_demotion_tests {
             BinOp::Eq,
             col_typed("b_id", DataType::Int32),
         );
-        let join_mexpr = MExpr {
-            id: memo.next_expr_id(),
-            op: Operator::LogicalJoin(LogicalJoinOp {
-                join_type: JoinKind::Inner,
-                condition: Some(condition),
-            }),
-            children: vec![left_group, right_group],
-        };
+        let join_mexpr = logical_join_expr(
+            &mut memo,
+            JoinKind::Inner,
+            condition,
+            vec![left_group, right_group],
+        );
 
         let alternatives = JoinToHashJoin.apply(&join_mexpr, &mut memo);
         assert_eq!(
@@ -1817,14 +1859,16 @@ mod join_demotion_tests {
             panic!("expected PhysicalHashJoin, got {:?}", alternatives[0].op);
         };
         assert_eq!(phys.eq_conditions.len(), 1);
-        assert_eq!(phys.eq_conditions[0].left.data_type, DataType::Int64);
-        assert_eq!(phys.eq_conditions[0].right.data_type, DataType::Int32);
+        let left_key = mat(&memo, phys.eq_conditions[0].left);
+        let right_key = mat(&memo, phys.eq_conditions[0].right);
+        assert_eq!(left_key.data_type, DataType::Int64);
+        assert_eq!(right_key.data_type, DataType::Int32);
         assert!(
-            matches!(phys.eq_conditions[0].left.kind, ExprKind::ColumnRef { .. }),
+            matches!(left_key.kind, ExprKind::ColumnRef { .. }),
             "optimizer hash key should keep raw column refs so distribution can enforce both sides"
         );
         assert!(
-            matches!(phys.eq_conditions[0].right.kind, ExprKind::ColumnRef { .. }),
+            matches!(right_key.kind, ExprKind::ColumnRef { .. }),
             "optimizer hash key should keep raw column refs so distribution can enforce both sides"
         );
         assert!(
@@ -1843,14 +1887,12 @@ mod join_demotion_tests {
             BinOp::Eq,
             col_typed("b_arr", list_type(DataType::Int64)),
         );
-        let join_mexpr = MExpr {
-            id: memo.next_expr_id(),
-            op: Operator::LogicalJoin(LogicalJoinOp {
-                join_type: JoinKind::Inner,
-                condition: Some(condition),
-            }),
-            children: vec![left_group, right_group],
-        };
+        let join_mexpr = logical_join_expr(
+            &mut memo,
+            JoinKind::Inner,
+            condition,
+            vec![left_group, right_group],
+        );
 
         let hash_alternatives = JoinToHashJoin.apply(&join_mexpr, &mut memo);
         assert!(
@@ -1882,14 +1924,12 @@ mod join_demotion_tests {
             col_typed("b_arr", list_type(DataType::Utf8)),
         );
         let condition = bin(scalar_eq, BinOp::And, complex_eq);
-        let join_mexpr = MExpr {
-            id: memo.next_expr_id(),
-            op: Operator::LogicalJoin(LogicalJoinOp {
-                join_type: JoinKind::Inner,
-                condition: Some(condition),
-            }),
-            children: vec![left_group, right_group],
-        };
+        let join_mexpr = logical_join_expr(
+            &mut memo,
+            JoinKind::Inner,
+            condition,
+            vec![left_group, right_group],
+        );
 
         let alternatives = JoinToHashJoin.apply(&join_mexpr, &mut memo);
         assert_eq!(alternatives.len(), 1);
@@ -1901,7 +1941,8 @@ mod join_demotion_tests {
             1,
             "only the scalar equality should remain as a hash key"
         );
-        match &phys.eq_conditions[0].left.kind {
+        let left_key = mat(&memo, phys.eq_conditions[0].left);
+        match &left_key.kind {
             ExprKind::ColumnRef { column, .. } => assert_eq!(column, "a_id"),
             other => panic!("expected scalar hash key on left, got {:?}", other),
         }
@@ -1917,14 +1958,12 @@ mod join_demotion_tests {
         let left_group = mk_scan_group(&mut memo, &["a_id"]);
         let right_group = mk_scan_group(&mut memo, &["b_id"]);
         let condition = bin(col("a_id"), BinOp::Eq, col("b_id"));
-        let expr = MExpr {
-            id: memo.next_expr_id(),
-            op: Operator::LogicalJoin(LogicalJoinOp {
-                join_type: JoinKind::Inner,
-                condition: Some(condition),
-            }),
-            children: vec![left_group, right_group],
-        };
+        let expr = logical_join_expr(
+            &mut memo,
+            JoinKind::Inner,
+            condition,
+            vec![left_group, right_group],
+        );
         let rule = JoinToHashJoin;
         let alternatives = rule.apply(&expr, &mut memo);
 
@@ -1940,6 +1979,7 @@ mod join_demotion_tests {
 mod window_split_tests {
     use super::*;
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::scalar_bridge::intern_window_exprs;
     use crate::sql::planner::plan::WindowExpr;
     use arrow::datatypes::DataType;
 
@@ -2061,10 +2101,11 @@ mod window_split_tests {
         let child_group = memo.new_group(values_mexpr);
 
         // Single window with no partition and no order => single group, no sort.
+        let window_exprs = intern_window_exprs(&mut memo.scalars, &[mk_window_expr("w1", vec![])]);
         let logical_window_mexpr = MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalWindow(LogicalWindowOp {
-                window_exprs: vec![mk_window_expr("w1", vec![])],
+                window_exprs,
                 output_columns: vec![],
             }),
             children: vec![child_group],
@@ -2101,6 +2142,7 @@ mod two_phase_agg_tests {
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::{MExpr, Memo};
+    use crate::sql::optimizer::scalar_bridge::{intern_aggregate_calls, intern_exprs};
     use crate::sql::planner::plan::AggregateCall;
     use arrow::datatypes::DataType;
 
@@ -2137,6 +2179,38 @@ mod two_phase_agg_tests {
         }
     }
 
+    fn single_agg(
+        memo: &mut Memo,
+        group_by: Vec<TypedExpr>,
+        aggregates: Vec<AggregateCall>,
+        output_columns: Vec<OutputColumn>,
+    ) -> LogicalAggregateOp {
+        let group_by = intern_exprs(&mut memo.scalars, &group_by);
+        let aggregates = intern_aggregate_calls(&mut memo.scalars, &aggregates);
+        LogicalAggregateOp::single(group_by, aggregates, output_columns)
+    }
+
+    fn staged_agg(
+        memo: &mut Memo,
+        stage: AggStage,
+        group_by: Vec<TypedExpr>,
+        aggregates: Vec<AggregateCall>,
+        output_columns: Vec<OutputColumn>,
+        is_merge: Vec<bool>,
+        is_split: bool,
+    ) -> LogicalAggregateOp {
+        let group_by = intern_exprs(&mut memo.scalars, &group_by);
+        let aggregates = intern_aggregate_calls(&mut memo.scalars, &aggregates);
+        LogicalAggregateOp::staged(
+            stage,
+            group_by,
+            aggregates,
+            output_columns,
+            is_merge,
+            is_split,
+        )
+    }
+
     fn values_group(memo: &mut Memo) -> usize {
         let id = memo.next_expr_id();
         memo.new_group(MExpr {
@@ -2155,7 +2229,8 @@ mod two_phase_agg_tests {
         let child_group = values_group(&mut memo);
         let expr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+            op: Operator::LogicalAggregate(single_agg(
+                &mut memo,
                 vec![col("k")],
                 vec![count_call("v", false)],
                 vec![output_column(1, "k"), output_column(3, "count(v)")],
@@ -2179,7 +2254,8 @@ mod two_phase_agg_tests {
         let child_group = values_group(&mut memo);
         let local_expr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalAggregate(LogicalAggregateOp::staged(
+            op: Operator::LogicalAggregate(staged_agg(
+                &mut memo,
                 AggStage::Local,
                 vec![col("k")],
                 vec![count_call("v", false)],
@@ -2201,7 +2277,8 @@ mod two_phase_agg_tests {
         let local_group = values_group(&mut memo);
         let global_expr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalAggregate(LogicalAggregateOp::staged(
+            op: Operator::LogicalAggregate(staged_agg(
+                &mut memo,
                 AggStage::Global,
                 vec![col("k")],
                 vec![count_call("v", false)],
@@ -2228,7 +2305,8 @@ mod two_phase_agg_tests {
 
         let expr = MExpr {
             id: memo.next_expr_id(),
-            op: Operator::LogicalAggregate(LogicalAggregateOp::single(
+            op: Operator::LogicalAggregate(single_agg(
+                &mut memo,
                 vec![col("city")],
                 vec![AggregateCall {
                     name: "count".into(),

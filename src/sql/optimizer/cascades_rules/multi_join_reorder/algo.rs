@@ -13,6 +13,7 @@ use crate::sql::optimizer::estimate::join_condition::estimate_join_condition;
 use crate::sql::optimizer::memo::JoinTree;
 use crate::sql::optimizer::operator::LogicalJoinOp;
 use crate::sql::optimizer::rewrite::rules::utils::combine_and;
+use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
 use crate::sql::optimizer::statistics::{CostEstimate, Statistics};
 
 use super::MultiJoinGraph;
@@ -48,23 +49,27 @@ impl Default for ReorderCaps {
 /// Enumerate candidate join orders for a flattened chain. LeftDeep always runs;
 /// DP and Greedy-TopK run subject to caps. Returns deduplicated candidate trees
 /// (by structural shape) for the caller to materialize and let the memo cost.
-pub(crate) fn enumerate_orders(graph: &MultiJoinGraph, caps: ReorderCaps) -> Vec<JoinTree> {
+pub(crate) fn enumerate_orders(
+    graph: &MultiJoinGraph,
+    caps: ReorderCaps,
+    arena: &mut ScalarArena,
+) -> Vec<JoinTree> {
     let n = graph.atom_count();
     if n < 2 {
         return Vec::new();
     }
 
     let mut candidates: Vec<JoinTree> = Vec::new();
-    if let Some(tree) = left_deep(graph) {
+    if let Some(tree) = left_deep(graph, arena) {
         candidates.push(tree);
     }
     if caps.enable_dp && n <= caps.max_dp.min(MAX_MASK_ATOMS) {
-        if let Some(tree) = dp(graph) {
+        if let Some(tree) = dp(graph, arena) {
             candidates.push(tree);
         }
     }
     if caps.enable_greedy && n <= caps.max_greedy.min(MAX_MASK_ATOMS) {
-        candidates.extend(greedy_topk(graph, caps.topk));
+        candidates.extend(greedy_topk(graph, caps.topk, arena));
     }
 
     dedup_trees(candidates)
@@ -163,7 +168,12 @@ struct Cell {
 }
 
 /// Join two cells under the connecting condition (probe = left, build = right).
-fn join_cells(left: &Cell, right: &Cell, condition: Option<TypedExpr>) -> Cell {
+fn join_cells(
+    left: &Cell,
+    right: &Cell,
+    condition: Option<TypedExpr>,
+    arena: &mut ScalarArena,
+) -> Cell {
     let kind = if condition.is_some() {
         JoinKind::Inner
     } else {
@@ -177,13 +187,16 @@ fn join_cells(left: &Cell, right: &Cell, condition: Option<TypedExpr>) -> Cell {
         _ => JoinKind::Cross,
     };
     let self_cost = join_self_cost(&left.stats, &right.stats, &stats, cost_kind);
+    let op_condition = condition
+        .as_ref()
+        .map(|condition| intern_typed(arena, condition));
     Cell {
         tree: JoinTree::Join {
             left: Box::new(left.tree.clone()),
             right: Box::new(right.tree.clone()),
             op: LogicalJoinOp {
                 join_type: kind,
-                condition,
+                condition: op_condition,
             },
         },
         stats,
@@ -206,7 +219,7 @@ fn atom_cell(graph: &MultiJoinGraph, i: usize) -> Cell {
 /// Left-deep greedy reorder: start from the largest atom, then repeatedly attach
 /// the next atom preferring equi-join > non-equi > cross, and within a class the
 /// smallest atom (build side). Always produces a left-deep tree.
-fn left_deep(graph: &MultiJoinGraph) -> Option<JoinTree> {
+fn left_deep(graph: &MultiJoinGraph, arena: &mut ScalarArena) -> Option<JoinTree> {
     let n = graph.atom_count();
     if !(2..=MAX_MASK_ATOMS).contains(&n) {
         return None;
@@ -261,7 +274,7 @@ fn left_deep(graph: &MultiJoinGraph) -> Option<JoinTree> {
         } else {
             Some(combine_and(connecting))
         };
-        current = join_cells(&current, &atom_cell(graph, next), condition);
+        current = join_cells(&current, &atom_cell(graph, next), condition, arena);
         current_mask |= next_mask;
         used |= next_mask;
     }
@@ -273,7 +286,7 @@ fn left_deep(graph: &MultiJoinGraph) -> Option<JoinTree> {
 // DP (System-R style, exhaustive over subsets; bushy)
 // ---------------------------------------------------------------------------
 
-fn dp(graph: &MultiJoinGraph) -> Option<JoinTree> {
+fn dp(graph: &MultiJoinGraph, arena: &mut ScalarArena) -> Option<JoinTree> {
     let n = graph.atom_count();
     if !(2..=MAX_DP_ATOMS).contains(&n) {
         return None;
@@ -294,7 +307,7 @@ fn dp(graph: &MultiJoinGraph) -> Option<JoinTree> {
                     left = (left.wrapping_sub(1)) & subset;
                     continue;
                 }
-                if let Some(cell) = try_partition(&memo, &graph.predicates, left, right) {
+                if let Some(cell) = try_partition(&memo, &graph.predicates, left, right, arena) {
                     if best.as_ref().is_none_or(|b| cell.cost < b.cost) {
                         best = Some(cell);
                     }
@@ -317,6 +330,7 @@ fn try_partition(
     predicates: &[(TypedExpr, u32)],
     left: u32,
     right: u32,
+    arena: &mut ScalarArena,
 ) -> Option<Cell> {
     let connecting = connecting_predicates(predicates, left, right);
     if connecting.is_empty() {
@@ -329,8 +343,8 @@ fn try_partition(
     }
     let left_cell = memo.get(&left)?;
     let right_cell = memo.get(&right)?;
-    let a = join_cells(left_cell, right_cell, Some(condition.clone()));
-    let b = join_cells(right_cell, left_cell, Some(condition));
+    let a = join_cells(left_cell, right_cell, Some(condition.clone()), arena);
+    let b = join_cells(right_cell, left_cell, Some(condition), arena);
     Some(if a.cost <= b.cost { a } else { b })
 }
 
@@ -338,7 +352,7 @@ fn try_partition(
 // Greedy (level-by-level; returns a bounded Top-K of full-join orders)
 // ---------------------------------------------------------------------------
 
-fn greedy_topk(graph: &MultiJoinGraph, k: usize) -> Vec<JoinTree> {
+fn greedy_topk(graph: &MultiJoinGraph, k: usize, arena: &mut ScalarArena) -> Vec<JoinTree> {
     let n = graph.atom_count();
     if !(2..=MAX_MASK_ATOMS).contains(&n) || graph.predicates.is_empty() || k == 0 {
         return Vec::new();
@@ -373,7 +387,7 @@ fn greedy_topk(graph: &MultiJoinGraph, k: usize) -> Vec<JoinTree> {
                     if l == r && lm >= rm {
                         continue; // same-size symmetric pair handled once
                     }
-                    let Some(cell) = try_partition(&best, &graph.predicates, lm, rm) else {
+                    let Some(cell) = try_partition(&best, &graph.predicates, lm, rm, arena) else {
                         continue;
                     };
                     let combined = lm | rm;
@@ -552,6 +566,7 @@ mod tests {
     use super::*;
     use crate::sql::analysis::TypedExpr;
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence};
     use std::collections::HashMap;
 
@@ -654,17 +669,18 @@ mod tests {
     fn dp_covers_chains_up_to_ten_atoms() {
         // The DP internal ceiling must honor the configured max_dp (10), not the
         // old hardcoded 8. A 10-atom connected chain must produce a DP plan.
+        let mut arena = ScalarArena::new();
         assert!(
-            dp(&path_graph(10)).is_some(),
+            dp(&path_graph(10), &mut arena).is_some(),
             "DP must enumerate a 10-atom chain (was capped at 8)"
         );
         assert!(
-            dp(&path_graph(9)).is_some(),
+            dp(&path_graph(9), &mut arena).is_some(),
             "DP must enumerate a 9-atom chain"
         );
         // Beyond the safety ceiling (12) DP bails (greedy/left-deep take over).
         assert!(
-            dp(&path_graph(13)).is_none(),
+            dp(&path_graph(13), &mut arena).is_none(),
             "DP bails past the 12-atom ceiling"
         );
     }
@@ -673,7 +689,8 @@ mod tests {
     fn greedy_produces_bushy_orders() {
         // Greedy must enumerate bushy shapes (two join sub-trees), not only
         // left-deep spines, so it can find (0⋈1)⋈(2⋈3).
-        let trees = greedy_topk(&two_pairs_graph(), 10);
+        let mut arena = ScalarArena::new();
+        let trees = greedy_topk(&two_pairs_graph(), 10, &mut arena);
         assert!(
             trees.iter().any(is_bushy),
             "greedy must produce at least one bushy order; got {} trees",
@@ -702,7 +719,8 @@ mod tests {
     #[test]
     fn left_deep_starts_from_largest_and_prefers_equi() {
         let graph = star_graph();
-        let tree = left_deep(&graph).expect("left-deep over 3 atoms");
+        let mut arena = ScalarArena::new();
+        let tree = left_deep(&graph, &mut arena).expect("left-deep over 3 atoms");
         // Left-deep shape: ((fact ⋈ dim) ⋈ dim). The deepest-left leaf is the
         // fact atom (100, the largest), reached by descending left children.
         let mut node = &tree;
@@ -725,7 +743,8 @@ mod tests {
     #[test]
     fn enumerate_orders_produces_candidates_and_dedups() {
         let graph = star_graph();
-        let trees = enumerate_orders(&graph, ReorderCaps::default());
+        let mut arena = ScalarArena::new();
+        let trees = enumerate_orders(&graph, ReorderCaps::default(), &mut arena);
         assert!(!trees.is_empty(), "should enumerate at least one order");
         // All candidates must be 3-atom join trees (2 joins).
         for t in &trees {

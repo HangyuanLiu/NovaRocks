@@ -5,10 +5,11 @@
 //! Physical operators add physical execution decisions (distribution, agg mode).
 
 use crate::sql::analysis::cte::CteId;
-use crate::sql::analysis::{JoinKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
+use crate::sql::analysis::{JoinKind, OutputColumn, WindowFrame};
 use crate::sql::catalog::TableDef;
 use crate::sql::column_id::ColumnId;
-use crate::sql::planner::plan::{AggregateCall, DecodeMapping, WindowExpr};
+use crate::sql::optimizer::scalar::{ScalarId, SortKey};
+use crate::sql::planner::plan::DecodeMapping;
 
 pub(crate) use crate::sql::planner::plan::{ScanDictionaryColumn, ScanVariantColumn};
 
@@ -71,12 +72,38 @@ impl AggStage {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct ScalarProjectItem {
+    pub expr: ScalarId,
+    pub output_name: String,
+    pub output_column_id: ColumnId,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ScalarAggregateSpec {
+    pub name: String,
+    pub args: Vec<ScalarId>,
+    pub distinct: bool,
+    pub order_by: Vec<SortKey>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ScalarWindowSpec {
+    pub name: String,
+    pub args: Vec<ScalarId>,
+    pub distinct: bool,
+    pub partition_by: Vec<ScalarId>,
+    pub order_by: Vec<SortKey>,
+    pub window_frame: Option<WindowFrame>,
+    pub ignore_nulls: bool,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct LogicalScanOp {
     pub database: String,
     pub table: TableDef,
     pub alias: Option<String>,
     pub columns: Vec<OutputColumn>,
-    pub predicates: Vec<TypedExpr>,
+    pub predicates: Vec<ScalarId>,
     pub required_columns: Option<Vec<String>>,
     /// Per-scan dictionary plan hints. Populated by the Task 7
     /// `LowCardinalityDictionaryRewrite` rule on the logical side and
@@ -94,20 +121,20 @@ pub(crate) struct LogicalScanOp {
 
 #[derive(Clone, Debug)]
 pub(crate) struct LogicalFilterOp {
-    pub predicate: TypedExpr,
+    pub predicate: ScalarId,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct LogicalProjectOp {
-    pub items: Vec<ProjectItem>,
+    pub items: Vec<ScalarProjectItem>,
     pub output_qualifier: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct LogicalAggregateOp {
     pub stage: AggStage,
-    pub group_by: Vec<TypedExpr>,
-    pub aggregates: Vec<AggregateCall>,
+    pub group_by: Vec<ScalarId>,
+    pub aggregates: Vec<ScalarAggregateSpec>,
     pub output_columns: Vec<OutputColumn>,
     pub is_merge: Vec<bool>,
     pub is_split: bool,
@@ -115,8 +142,8 @@ pub(crate) struct LogicalAggregateOp {
 
 impl LogicalAggregateOp {
     pub(crate) fn single(
-        group_by: Vec<TypedExpr>,
-        aggregates: Vec<AggregateCall>,
+        group_by: Vec<ScalarId>,
+        aggregates: Vec<ScalarAggregateSpec>,
         output_columns: Vec<OutputColumn>,
     ) -> Self {
         let is_merge = vec![false; aggregates.len()];
@@ -132,8 +159,8 @@ impl LogicalAggregateOp {
 
     pub(crate) fn staged(
         stage: AggStage,
-        group_by: Vec<TypedExpr>,
-        aggregates: Vec<AggregateCall>,
+        group_by: Vec<ScalarId>,
+        aggregates: Vec<ScalarAggregateSpec>,
         output_columns: Vec<OutputColumn>,
         is_merge: Vec<bool>,
         is_split: bool,
@@ -161,21 +188,20 @@ pub(crate) struct AggregateStateMergeOp {
 #[derive(Clone, Debug)]
 pub(crate) struct LogicalJoinOp {
     pub join_type: JoinKind,
-    pub condition: Option<TypedExpr>,
+    pub condition: Option<ScalarId>,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct LogicalSortOp {
-    pub items: Vec<SortItem>,
+    pub items: Vec<SortKey>,
     /// Set by `build_window_and_project` when this Sort was inserted as a
     /// precursor to a Window (PARTITION BY + ORDER BY). Empty otherwise.
     /// When non-empty, the sort can be done locally per partition after a
     /// HASH EXCHANGE keyed on these columns — no global Gather needed.
     /// Mirrors StarRocks's `TSortNode.analytic_partition_exprs`. Stored as
-    /// `TypedExpr` (not `ColumnRef`) so the fragment builder can compile
-    /// them back to wire-level `TExpr`s; the optimizer converts to
-    /// `ColumnRef` on demand for distribution-property matching.
-    pub analytic_partition_exprs: Vec<crate::sql::analysis::TypedExpr>,
+    /// `ScalarId` handles into `Memo.scalars`; bridge/codegen phases materialize
+    /// them when they need analyzer expressions or wire-level `TExpr`s.
+    pub analytic_partition_exprs: Vec<ScalarId>,
     /// Set by RankingWindowPredicatePushdown: per-partition rank cap + ranking
     /// kind. `None` ⇒ ordinary sort. See OQ-13 ranking-window design spec §4.
     pub partition_limit: Option<usize>,
@@ -190,7 +216,7 @@ pub(crate) struct LogicalLimitOp {
 
 #[derive(Clone, Debug)]
 pub(crate) struct LogicalTopNOp {
-    pub items: Vec<SortItem>,
+    pub items: Vec<SortKey>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
     pub phase: TopNPhase,
@@ -199,7 +225,7 @@ pub(crate) struct LogicalTopNOp {
 
 #[derive(Clone, Debug)]
 pub(crate) struct LogicalWindowOp {
-    pub window_exprs: Vec<WindowExpr>,
+    pub window_exprs: Vec<ScalarWindowSpec>,
     pub output_columns: Vec<OutputColumn>,
 }
 
@@ -224,7 +250,7 @@ pub(crate) struct LogicalExceptOp {
 
 #[derive(Clone, Debug)]
 pub(crate) struct LogicalValuesOp {
-    pub rows: Vec<Vec<TypedExpr>>,
+    pub rows: Vec<Vec<ScalarId>>,
     pub columns: Vec<OutputColumn>,
 }
 
@@ -241,7 +267,7 @@ pub(crate) struct LogicalGenerateSeriesOp {
 #[derive(Clone, Debug)]
 pub(crate) struct LogicalTableFunctionOp {
     pub function_name: String,
-    pub args: Vec<TypedExpr>,
+    pub args: Vec<ScalarId>,
     pub output_columns: Vec<OutputColumn>,
     pub alias: Option<String>,
     pub is_left_join: bool,
@@ -304,7 +330,7 @@ pub(crate) struct PhysicalScanOp {
     pub table: TableDef,
     pub alias: Option<String>,
     pub columns: Vec<OutputColumn>,
-    pub predicates: Vec<TypedExpr>,
+    pub predicates: Vec<ScalarId>,
     pub required_columns: Option<Vec<String>>,
     /// Per-scan dictionary plan hints. Populated by the Task 7
     /// `LowCardinalityDictionaryRewrite` rule when a string column on this
@@ -327,12 +353,12 @@ pub(crate) struct PhysicalScanOp {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PhysicalFilterOp {
-    pub predicate: TypedExpr,
+    pub predicate: ScalarId,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct PhysicalProjectOp {
-    pub items: Vec<ProjectItem>,
+    pub items: Vec<ScalarProjectItem>,
     pub output_qualifier: Option<String>,
 }
 
@@ -340,28 +366,28 @@ pub(crate) struct PhysicalProjectOp {
 pub(crate) struct PhysicalHashJoinOp {
     pub join_type: JoinKind,
     pub eq_conditions: Vec<PhysicalHashJoinEqCondition>,
-    pub other_condition: Option<TypedExpr>,
+    pub other_condition: Option<ScalarId>,
     pub distribution: JoinDistribution,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct PhysicalHashJoinEqCondition {
-    pub left: TypedExpr,
-    pub right: TypedExpr,
+    pub left: ScalarId,
+    pub right: ScalarId,
     pub null_safe: bool,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct PhysicalNestLoopJoinOp {
     pub join_type: JoinKind,
-    pub condition: Option<TypedExpr>,
+    pub condition: Option<ScalarId>,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct PhysicalHashAggregateOp {
     pub mode: AggMode,
-    pub group_by: Vec<TypedExpr>,
-    pub aggregates: Vec<AggregateCall>,
+    pub group_by: Vec<ScalarId>,
+    pub aggregates: Vec<ScalarAggregateSpec>,
     pub output_columns: Vec<OutputColumn>,
     /// Per-aggregate merge flag. `true` → this phase applies the aggregate's
     /// merge function over an intermediate state slot from the child; `false`
@@ -372,10 +398,10 @@ pub(crate) struct PhysicalHashAggregateOp {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PhysicalSortOp {
-    pub items: Vec<SortItem>,
+    pub items: Vec<SortKey>,
     /// Propagated from `LogicalSortOp::analytic_partition_exprs`. See the
     /// LogicalSortOp doc-comment for semantics.
-    pub analytic_partition_exprs: Vec<crate::sql::analysis::TypedExpr>,
+    pub analytic_partition_exprs: Vec<ScalarId>,
     /// Propagated from `LogicalSortOp::partition_limit`. See OQ-13 §4.
     pub partition_limit: Option<usize>,
     pub topn_type: Option<crate::exec::node::sort::SortTopNType>,
@@ -401,7 +427,7 @@ pub(crate) struct PhysicalAssertOneRowOp {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PhysicalTopNOp {
-    pub items: Vec<SortItem>,
+    pub items: Vec<SortKey>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
     pub phase: TopNPhase,
@@ -410,7 +436,7 @@ pub(crate) struct PhysicalTopNOp {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PhysicalWindowOp {
-    pub window_exprs: Vec<WindowExpr>,
+    pub window_exprs: Vec<ScalarWindowSpec>,
     pub output_columns: Vec<OutputColumn>,
 }
 
@@ -472,7 +498,7 @@ pub(crate) struct PhysicalExceptOp {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PhysicalValuesOp {
-    pub rows: Vec<Vec<TypedExpr>>,
+    pub rows: Vec<Vec<ScalarId>>,
     pub columns: Vec<OutputColumn>,
 }
 
@@ -489,7 +515,7 @@ pub(crate) struct PhysicalGenerateSeriesOp {
 #[derive(Clone, Debug)]
 pub(crate) struct PhysicalTableFunctionOp {
     pub function_name: String,
-    pub args: Vec<TypedExpr>,
+    pub args: Vec<ScalarId>,
     pub output_columns: Vec<OutputColumn>,
     pub alias: Option<String>,
     pub is_left_join: bool,
@@ -603,7 +629,7 @@ mod aggregate_stage_tests {
     use super::*;
     use crate::sql::analysis::{OutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::planner::plan::AggregateCall;
+    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
 
     fn output_column(id: u32, name: &str) -> OutputColumn {
         OutputColumn {
@@ -627,22 +653,25 @@ mod aggregate_stage_tests {
         }
     }
 
-    fn count_call() -> AggregateCall {
-        AggregateCall {
+    fn scalar_col_ref(arena: &mut ScalarArena, id: u32, name: &str) -> ScalarId {
+        intern_typed(arena, &col_ref(id, name))
+    }
+
+    fn count_call(arena: &mut ScalarArena) -> ScalarAggregateSpec {
+        ScalarAggregateSpec {
             name: "count".to_string(),
-            args: vec![col_ref(2, "v")],
+            args: vec![scalar_col_ref(arena, 2, "v")],
             distinct: false,
-            result_type: arrow::datatypes::DataType::Int64,
             order_by: vec![],
-            output_column_id: ColumnId::UNSET,
         }
     }
 
     #[test]
     fn single_constructor_sets_unsplit_single_metadata() {
+        let mut arena = ScalarArena::new();
         let op = LogicalAggregateOp::single(
-            vec![col_ref(1, "k")],
-            vec![count_call()],
+            vec![scalar_col_ref(&mut arena, 1, "k")],
+            vec![count_call(&mut arena)],
             vec![output_column(1, "k"), output_column(3, "count(v)")],
         );
         assert_eq!(op.stage, AggStage::Single);
@@ -655,10 +684,11 @@ mod aggregate_stage_tests {
     fn staged_constructor_preserves_merge_flags_and_split_marker() {
         assert_eq!(AggStage::Local.to_physical_mode(), AggMode::Local);
 
+        let mut arena = ScalarArena::new();
         let op = LogicalAggregateOp::staged(
             AggStage::Global,
-            vec![col_ref(1, "k")],
-            vec![count_call()],
+            vec![scalar_col_ref(&mut arena, 1, "k")],
+            vec![count_call(&mut arena)],
             vec![output_column(1, "k"), output_column(3, "count(v)")],
             vec![true],
             true,

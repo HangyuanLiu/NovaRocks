@@ -292,6 +292,7 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::*;
     use crate::sql::optimizer::property::{DistributionSpec, OrderingSpec};
+    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
     use crate::sql::optimizer::statistics::ColumnStatistic;
     use crate::sql::planner::plan::*;
     use std::collections::HashMap;
@@ -459,16 +460,21 @@ mod tests {
         let probe = stats(100_000.0, 100.0);
         let build = stats(10_000.0, 100.0);
         let own = stats(100_000.0, 200.0);
-        let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
-            join_type: JoinKind::Inner,
-            eq_conditions: vec![],
-            other_condition: Some(crate::sql::analysis::TypedExpr {
+        let mut scalars = ScalarArena::new();
+        let other_condition = intern_typed(
+            &mut scalars,
+            &crate::sql::analysis::TypedExpr {
                 kind: crate::sql::analysis::ExprKind::Literal(
                     crate::sql::analysis::LiteralValue::Bool(true),
                 ),
                 data_type: arrow::datatypes::DataType::Boolean,
                 nullable: false,
-            }),
+            },
+        );
+        let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![],
+            other_condition: Some(other_condition),
             distribution: JoinDistribution::Unknown,
         });
         let child_stats = [&probe, &build];

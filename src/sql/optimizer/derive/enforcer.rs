@@ -3,11 +3,16 @@
 
 use crate::sql::optimizer::operator::PhysicalDistributionOp;
 use crate::sql::optimizer::property::{OrderingSpec, PhysicalPropertySet};
+use crate::sql::optimizer::scalar::ScalarArena;
 
 use super::{DeriveOutput, DeriveRequired};
 
 impl DeriveOutput for PhysicalDistributionOp {
-    fn derive_output(&self, _children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
+    fn derive_output(
+        &self,
+        _scalars: &ScalarArena,
+        _children: &[&PhysicalPropertySet],
+    ) -> PhysicalPropertySet {
         PhysicalPropertySet {
             distribution: self.spec.clone(),
             ordering: OrderingSpec::Any,
@@ -18,6 +23,7 @@ impl DeriveOutput for PhysicalDistributionOp {
 impl DeriveRequired for PhysicalDistributionOp {
     fn derive_required(
         &self,
+        _scalars: &ScalarArena,
         _parent: &PhysicalPropertySet,
         _n: usize,
     ) -> Vec<PhysicalPropertySet> {
@@ -45,7 +51,8 @@ mod tests {
             ),
         ] {
             let op = PhysicalDistributionOp { spec };
-            let props = op.derive_output(&[]);
+            let scalars = ScalarArena::new();
+            let props = op.derive_output(&scalars, &[]);
             match props.distribution {
                 DistributionSpec::HashPartitioned { cols, source } => {
                     assert_eq!(source, expected_source);

@@ -9,16 +9,31 @@ use crate::sql::optimizer::operator::{
 };
 use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
 use crate::sql::optimizer::property::DistributionSpec;
+use crate::sql::optimizer::scalar::{ScalarArena, materialize};
+use crate::sql::optimizer::scalar_bridge::{
+    materialize_aggregate_calls, materialize_exprs, materialize_project_items,
+    materialize_sort_keys, materialize_window_exprs,
+};
 
 pub(crate) fn verify_id_binding(plan: &PhysicalPlanNode) -> Result<(), String> {
-    verify_node(plan).map(|_| ())
+    let scalars = plan
+        .execution_props
+        .scalar_arena
+        .as_deref()
+        .ok_or_else(|| {
+            "PhysicalPlanNode missing scalar arena for codegen id verification".to_string()
+        })?;
+    verify_node(plan, scalars).map(|_| ())
 }
 
-fn verify_node(node: &PhysicalPlanNode) -> Result<HashSet<ColumnId>, String> {
+fn verify_node(
+    node: &PhysicalPlanNode,
+    scalars: &ScalarArena,
+) -> Result<HashSet<ColumnId>, String> {
     let child_outputs = node
         .children
         .iter()
-        .map(verify_node)
+        .map(|child| verify_node(child, scalars))
         .collect::<Result<Vec<_>, _>>()?;
 
     let derived = match &node.op {
@@ -27,7 +42,8 @@ fn verify_node(node: &PhysicalPlanNode) -> Result<HashSet<ColumnId>, String> {
             let empty = HashSet::new();
             for row in &op.rows {
                 for expr in row {
-                    verify_expr(expr, &empty, "PhysicalValues row")?;
+                    let expr = materialize(scalars, *expr);
+                    verify_expr(&expr, &empty, "PhysicalValues row")?;
                 }
             }
             Ok(output_ids(op.columns.iter().map(|c| c.column_id)))
@@ -39,20 +55,24 @@ fn verify_node(node: &PhysicalPlanNode) -> Result<HashSet<ColumnId>, String> {
 
         Operator::PhysicalFilter(op) => {
             let input = only_child(&child_outputs, "PhysicalFilter")?;
-            verify_expr(&op.predicate, input, "PhysicalFilter predicate")?;
+            let predicate = materialize(scalars, op.predicate);
+            verify_expr(&predicate, input, "PhysicalFilter predicate")?;
             Ok(input.clone())
         }
         Operator::PhysicalSort(op) => {
             let input = only_child(&child_outputs, "PhysicalSort")?;
-            verify_sort_items(&op.items, input, "PhysicalSort item")?;
-            for expr in &op.analytic_partition_exprs {
+            let items = materialize_sort_keys(scalars, &op.items);
+            verify_sort_items(&items, input, "PhysicalSort item")?;
+            let analytic_partition_exprs = materialize_exprs(scalars, &op.analytic_partition_exprs);
+            for expr in &analytic_partition_exprs {
                 verify_expr(expr, input, "PhysicalSort analytic partition")?;
             }
             Ok(input.clone())
         }
         Operator::PhysicalTopN(op) => {
             let input = only_child(&child_outputs, "PhysicalTopN")?;
-            verify_sort_items(&op.items, input, "PhysicalTopN item")?;
+            let items = materialize_sort_keys(scalars, &op.items);
+            verify_sort_items(&items, input, "PhysicalTopN item")?;
             Ok(input.clone())
         }
         Operator::PhysicalLimit(_)
@@ -65,12 +85,12 @@ fn verify_node(node: &PhysicalPlanNode) -> Result<HashSet<ColumnId>, String> {
             Ok(input.clone())
         }
 
-        Operator::PhysicalProject(op) => verify_project(op, &child_outputs),
-        Operator::PhysicalHashAggregate(op) => verify_hash_aggregate(op, &child_outputs),
-        Operator::PhysicalWindow(op) => verify_window(op, &child_outputs),
-        Operator::PhysicalHashJoin(op) => verify_hash_join(op, &child_outputs),
-        Operator::PhysicalNestLoopJoin(op) => verify_nested_loop_join(op, &child_outputs),
-        Operator::PhysicalTableFunction(op) => verify_table_function(op, &child_outputs),
+        Operator::PhysicalProject(op) => verify_project(op, &child_outputs, scalars),
+        Operator::PhysicalHashAggregate(op) => verify_hash_aggregate(op, &child_outputs, scalars),
+        Operator::PhysicalWindow(op) => verify_window(op, &child_outputs, scalars),
+        Operator::PhysicalHashJoin(op) => verify_hash_join(op, &child_outputs, scalars),
+        Operator::PhysicalNestLoopJoin(op) => verify_nested_loop_join(op, &child_outputs, scalars),
+        Operator::PhysicalTableFunction(op) => verify_table_function(op, &child_outputs, scalars),
         Operator::PhysicalRepeat(op) => verify_repeat(op, &child_outputs),
         Operator::PhysicalDecode(op) => verify_decode(op, &child_outputs),
 
@@ -153,26 +173,34 @@ fn verify_node(node: &PhysicalPlanNode) -> Result<HashSet<ColumnId>, String> {
 fn verify_project(
     op: &PhysicalProjectOp,
     child_outputs: &[HashSet<ColumnId>],
+    scalars: &ScalarArena,
 ) -> Result<HashSet<ColumnId>, String> {
     let input = only_child(child_outputs, "PhysicalProject")?;
-    for item in &op.items {
+    let items = materialize_project_items(scalars, &op.items);
+    for item in &items {
         verify_expr(&item.expr, input, "PhysicalProject item")?;
         verify_output_id(item.output_column_id, "PhysicalProject output")?;
     }
-    Ok(output_ids(
-        op.items.iter().map(|item| item.output_column_id),
-    ))
+    Ok(output_ids(items.iter().map(|item| item.output_column_id)))
 }
 
 fn verify_hash_aggregate(
     op: &PhysicalHashAggregateOp,
     child_outputs: &[HashSet<ColumnId>],
+    scalars: &ScalarArena,
 ) -> Result<HashSet<ColumnId>, String> {
     let input = only_child(child_outputs, "PhysicalHashAggregate")?;
-    for expr in &op.group_by {
+    let group_by = materialize_exprs(scalars, &op.group_by);
+    for expr in &group_by {
         verify_expr(expr, input, "PhysicalHashAggregate group-by")?;
     }
-    for (idx, aggregate) in op.aggregates.iter().enumerate() {
+    let aggregates = materialize_aggregate_calls(
+        scalars,
+        &op.aggregates,
+        op.group_by.len(),
+        &op.output_columns,
+    );
+    for (idx, aggregate) in aggregates.iter().enumerate() {
         if !op.is_merge.get(idx).copied().unwrap_or(false) {
             for arg in &aggregate.args {
                 verify_expr(arg, input, "PhysicalHashAggregate aggregate arg")?;
@@ -193,7 +221,7 @@ fn verify_hash_aggregate(
         verify_output_id(column.column_id, "PhysicalHashAggregate group output")?;
         out.insert(column.column_id);
     }
-    for aggregate in &op.aggregates {
+    for aggregate in &aggregates {
         verify_output_id(
             aggregate.output_column_id,
             "PhysicalHashAggregate aggregate output",
@@ -206,9 +234,11 @@ fn verify_hash_aggregate(
 fn verify_window(
     op: &PhysicalWindowOp,
     child_outputs: &[HashSet<ColumnId>],
+    scalars: &ScalarArena,
 ) -> Result<HashSet<ColumnId>, String> {
     let input = only_child(child_outputs, "PhysicalWindow")?;
-    for window in &op.window_exprs {
+    let window_exprs = materialize_window_exprs(scalars, &op.window_exprs, &op.output_columns);
+    for window in &window_exprs {
         for arg in &window.args {
             verify_expr(arg, input, "PhysicalWindow arg")?;
         }
@@ -224,15 +254,19 @@ fn verify_window(
 fn verify_hash_join(
     op: &PhysicalHashJoinOp,
     child_outputs: &[HashSet<ColumnId>],
+    scalars: &ScalarArena,
 ) -> Result<HashSet<ColumnId>, String> {
     let (left, right) = two_children(child_outputs, "PhysicalHashJoin")?;
     for eq in &op.eq_conditions {
-        verify_expr(&eq.left, left, "PhysicalHashJoin left key")?;
-        verify_expr(&eq.right, right, "PhysicalHashJoin right key")?;
+        let left_key = materialize(scalars, eq.left);
+        let right_key = materialize(scalars, eq.right);
+        verify_expr(&left_key, left, "PhysicalHashJoin left key")?;
+        verify_expr(&right_key, right, "PhysicalHashJoin right key")?;
     }
     if let Some(condition) = &op.other_condition {
+        let condition = materialize(scalars, *condition);
         verify_expr(
-            condition,
+            &condition,
             &union_ids(left, right),
             "PhysicalHashJoin other condition",
         )?;
@@ -243,11 +277,13 @@ fn verify_hash_join(
 fn verify_nested_loop_join(
     op: &PhysicalNestLoopJoinOp,
     child_outputs: &[HashSet<ColumnId>],
+    scalars: &ScalarArena,
 ) -> Result<HashSet<ColumnId>, String> {
     let (left, right) = two_children(child_outputs, "PhysicalNestLoopJoin")?;
     if let Some(condition) = &op.condition {
+        let condition = materialize(scalars, *condition);
         verify_expr(
-            condition,
+            &condition,
             &union_ids(left, right),
             "PhysicalNestLoopJoin condition",
         )?;
@@ -258,9 +294,11 @@ fn verify_nested_loop_join(
 fn verify_table_function(
     op: &PhysicalTableFunctionOp,
     child_outputs: &[HashSet<ColumnId>],
+    scalars: &ScalarArena,
 ) -> Result<HashSet<ColumnId>, String> {
     let input = only_child(child_outputs, "PhysicalTableFunction")?;
-    for arg in &op.args {
+    let args = materialize_exprs(scalars, &op.args);
+    for arg in &args {
         verify_expr(arg, input, "PhysicalTableFunction arg")?;
     }
     let mut out = input.clone();
@@ -545,6 +583,8 @@ fn union_ids(left: &HashSet<ColumnId>, right: &HashSet<ColumnId>) -> HashSet<Col
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use arrow::datatypes::DataType;
 
     use super::*;
@@ -552,7 +592,11 @@ mod tests {
     use crate::sql::optimizer::operator::{
         AggMode, PhysicalHashAggregateOp, PhysicalProjectOp, PhysicalRepeatOp, PhysicalValuesOp,
     };
-    use crate::sql::optimizer::physical_plan::PlanExecutionProps;
+    use crate::sql::optimizer::physical_plan::{PlanExecutionProps, attach_scalar_arena};
+    use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::optimizer::scalar_bridge::{
+        intern_aggregate_calls, intern_exprs, intern_project_items,
+    };
     use crate::sql::optimizer::statistics::Statistics;
     use crate::sql::planner::plan::AggregateCall;
 
@@ -598,13 +642,20 @@ mod tests {
         expr: TypedExpr,
         output_id: ColumnId,
     ) -> PhysicalPlanNode {
-        PhysicalPlanNode {
+        let mut scalars = child
+            .execution_props
+            .scalar_arena
+            .as_deref()
+            .cloned()
+            .unwrap_or_else(ScalarArena::new);
+        let items = vec![ProjectItem {
+            expr,
+            output_name: "p".to_string(),
+            output_column_id: output_id,
+        }];
+        let mut plan = PhysicalPlanNode {
             op: Operator::PhysicalProject(PhysicalProjectOp {
-                items: vec![ProjectItem {
-                    expr,
-                    output_name: "p".to_string(),
-                    output_column_id: output_id,
-                }],
+                items: intern_project_items(&mut scalars, &items),
                 output_qualifier: None,
             }),
             children: vec![child],
@@ -613,7 +664,9 @@ mod tests {
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
-        }
+        };
+        attach_scalar_arena(&mut plan, Arc::new(scalars));
+        plan
     }
 
     fn hash_aggregate_over(
@@ -621,19 +674,26 @@ mod tests {
         aggregate_output_id: ColumnId,
         declared_visible_id: ColumnId,
     ) -> PhysicalPlanNode {
-        PhysicalPlanNode {
+        let mut scalars = child
+            .execution_props
+            .scalar_arena
+            .as_deref()
+            .cloned()
+            .unwrap_or_else(ScalarArena::new);
+        let aggregate_calls = vec![AggregateCall {
+            name: "sum".to_string(),
+            args: vec![column_ref(ColumnId::new_for_test(1), "a")],
+            distinct: false,
+            result_type: DataType::Int32,
+            order_by: vec![],
+            output_column_id: aggregate_output_id,
+        }];
+        let mut plan = PhysicalPlanNode {
             op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
                 mode: AggMode::Single,
                 group_by: vec![],
-                aggregates: vec![AggregateCall {
-                    name: "sum".to_string(),
-                    args: vec![column_ref(ColumnId::new_for_test(1), "a")],
-                    distinct: false,
-                    result_type: DataType::Int32,
-                    order_by: vec![],
-                    output_column_id: aggregate_output_id,
-                }],
-                output_columns: vec![int_col(declared_visible_id, "sum(a) + 1")],
+                aggregates: intern_aggregate_calls(&mut scalars, &aggregate_calls),
+                output_columns: vec![int_col(aggregate_output_id, "sum(a)")],
                 is_merge: vec![false],
             }),
             children: vec![child],
@@ -642,7 +702,9 @@ mod tests {
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
-        }
+        };
+        attach_scalar_arena(&mut plan, Arc::new(scalars));
+        plan
     }
 
     fn repeat_over(child: PhysicalPlanNode, grouping_output_id: ColumnId) -> PhysicalPlanNode {
@@ -670,15 +732,12 @@ mod tests {
 
     #[test]
     fn p3_verify_id_binding_rejects_unset_columnref() {
-        let input_id = ColumnId::new_for_test(1);
-        let output_id = ColumnId::new_for_test(2);
-        let plan = project_over(
-            values_node(vec![int_col(input_id, "a")]),
-            column_ref(ColumnId::UNSET, "a"),
-            output_id,
-        );
-
-        let err = verify_id_binding(&plan).expect_err("UNSET ColumnRef must fail");
+        let err = verify_expr(
+            &column_ref(ColumnId::UNSET, "a"),
+            &std::collections::HashSet::new(),
+            "test expr",
+        )
+        .expect_err("UNSET ColumnRef must fail");
         assert!(err.contains("UNSET ColumnRef"), "unexpected err={err}");
     }
 
@@ -757,13 +816,17 @@ mod tests {
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
-        let aggregate = PhysicalPlanNode {
+        let mut scalars = ScalarArena::new();
+        let mut aggregate = PhysicalPlanNode {
             op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
                 mode: AggMode::Single,
-                group_by: vec![
-                    column_ref(input_id, "a"),
-                    column_ref(grouping_output_id, "__grouping_fn_0"),
-                ],
+                group_by: intern_exprs(
+                    &mut scalars,
+                    &[
+                        column_ref(input_id, "a"),
+                        column_ref(grouping_output_id, "__grouping_fn_0"),
+                    ],
+                ),
                 aggregates: vec![],
                 output_columns: vec![
                     int_col(input_id, "a"),
@@ -781,6 +844,7 @@ mod tests {
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
+        attach_scalar_arena(&mut aggregate, Arc::new(scalars));
 
         verify_id_binding(&aggregate)
             .expect("distribution must preserve Repeat grouping output id for aggregate grouping");

@@ -11,6 +11,8 @@ use crate::sql::catalog::TableDef;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::memo::{MExpr, Memo};
 use crate::sql::optimizer::operator::{AggStage, LogicalAggregateOp, Operator};
+use crate::sql::optimizer::scalar::materialize;
+use crate::sql::optimizer::scalar_bridge::{materialize_aggregate_call, materialize_project_item};
 use crate::sql::planner::plan::{AggregateCall, LogicalPlanNode, LogicalPlanNodeKind};
 
 /// What the alternative must reproduce at the matched group's top.
@@ -264,7 +266,8 @@ impl SpjgDescriptor {
         // Filter chain down to the scan.
         let mut predicates: Vec<TypedExpr> = Vec::new();
         while let Operator::LogicalFilter(f) = &node.op {
-            split_conjuncts(&f.predicate, &mut predicates);
+            let predicate = materialize(&memo.scalars, f.predicate);
+            split_conjuncts(&predicate, &mut predicates);
             node = first_logical(*node.children.first()?)?;
         }
 
@@ -275,12 +278,17 @@ impl SpjgDescriptor {
         if scan.mv_rewritten_from.is_some() {
             return None;
         }
-        predicates.extend(scan.predicates.iter().cloned());
+        predicates.extend(
+            scan.predicates
+                .iter()
+                .map(|predicate| materialize(&memo.scalars, *predicate)),
+        );
 
         // Composition map from the mid project (ColumnId -> expr over scan cols).
         let mut defs: HashMap<ColumnId, TypedExpr> = HashMap::new();
         if let Some(p) = mid_project {
             for item in &p.items {
+                let item = materialize_project_item(&memo.scalars, item);
                 let composed = substitute(&item.expr, &defs);
                 defs.insert(item.output_column_id, composed);
             }
@@ -289,13 +297,24 @@ impl SpjgDescriptor {
 
         let (agg, outputs, shape) = match aggregate {
             Some(a) => {
-                let group_by: Vec<TypedExpr> = a.group_by.iter().map(&compose).collect();
+                let group_by_typed: Vec<TypedExpr> = a
+                    .group_by
+                    .iter()
+                    .map(|expr| materialize(&memo.scalars, *expr))
+                    .collect();
+                let group_by: Vec<TypedExpr> = group_by_typed.iter().map(&compose).collect();
                 let aggregates: Vec<AggregateCall> = a
                     .aggregates
                     .iter()
-                    .map(|c| AggregateCall {
-                        args: c.args.iter().map(&compose).collect(),
-                        ..c.clone()
+                    .enumerate()
+                    .map(|(idx, c)| {
+                        let mut call = materialize_aggregate_call(
+                            &memo.scalars,
+                            c,
+                            a.output_columns.get(a.group_by.len() + idx),
+                        );
+                        call.args = call.args.iter().map(&compose).collect();
+                        call
                     })
                     .collect();
                 if a.output_columns.len() != a.group_by.len() + a.aggregates.len() {
@@ -327,10 +346,13 @@ impl SpjgDescriptor {
                     Some(p) => p
                         .items
                         .iter()
-                        .map(|item| SpjgOutput {
-                            name: item.output_name.clone(),
-                            column_id: item.output_column_id,
-                            expr: SpjgOutputExpr::Dimension(substitute(&item.expr, &defs)),
+                        .map(|item| {
+                            let item = materialize_project_item(&memo.scalars, item);
+                            SpjgOutput {
+                                name: item.output_name.clone(),
+                                column_id: item.output_column_id,
+                                expr: SpjgOutputExpr::Dimension(substitute(&item.expr, &defs)),
+                            }
                         })
                         .collect(),
                     // No surviving Project: the scan's output IS the subtree
@@ -1046,6 +1068,7 @@ mod tests {
     #[test]
     fn from_memo_rejects_split_aggregate() {
         use crate::sql::optimizer::operator::{LogicalAggregateOp, Operator};
+        use crate::sql::optimizer::scalar_bridge::{intern_aggregate_calls, intern_exprs};
         // A split (Local) aggregate is not the original Single shape and must
         // be rejected even when it sits at the matched position.
         let a = col(1, "a");
@@ -1055,10 +1078,10 @@ mod tests {
         let plan = LogicalPlanNode::new(LogicalPlanNodeKind::Scan(scan_op), vec![], None);
         let mut memo = crate::sql::optimizer::memo::Memo::new();
         let scan_gid = crate::sql::optimizer::convert::logical_plan_to_memo(&plan, &mut memo);
-        let split = LogicalAggregateOp::staged(
-            AggStage::Local,
-            vec![col_ref(&a)],
-            vec![AggregateCall {
+        let group_by = intern_exprs(&mut memo.scalars, &[col_ref(&a)]);
+        let aggregates = intern_aggregate_calls(
+            &mut memo.scalars,
+            &[AggregateCall {
                 name: "sum".to_string(),
                 args: vec![col_ref(&v)],
                 distinct: false,
@@ -1066,6 +1089,11 @@ mod tests {
                 order_by: vec![],
                 output_column_id: sum_out.column_id,
             }],
+        );
+        let split = LogicalAggregateOp::staged(
+            AggStage::Local,
+            group_by,
+            aggregates,
             vec![col(1, "a"), sum_out.clone()],
             vec![false],
             true,

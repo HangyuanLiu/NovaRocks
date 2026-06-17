@@ -9,6 +9,7 @@ use crate::sql::optimizer::logical_props::{
 use crate::sql::optimizer::memo::{GroupId, LogicalProperties, MExpr, Memo};
 use crate::sql::optimizer::operator::{LogicalFilterOp, LogicalJoinOp, Operator};
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
+use crate::sql::optimizer::scalar::{intern_typed, materialize};
 use std::collections::{HashMap, HashSet};
 
 pub(crate) struct InnerJoinEquivalencePredicateRule;
@@ -51,7 +52,7 @@ impl Rule for InnerJoinEquivalencePredicateRule {
 
         let left_columns = columns_by_id(&left_props.output_columns);
         let right_columns = columns_by_id(&right_props.output_columns);
-        let mut literal_by_column = literal_equalities_from_join(join)
+        let mut literal_by_column = literal_equalities_from_join(memo, join)
             .into_iter()
             .chain(literal_equalities_from_group(memo, left_group))
             .chain(literal_equalities_from_group(memo, right_group))
@@ -59,10 +60,10 @@ impl Rule for InnerJoinEquivalencePredicateRule {
         expand_literals_with_equivalence(&left_props, &mut literal_by_column);
         expand_literals_with_equivalence(&right_props, &mut literal_by_column);
 
-        let join_literals = literal_equalities_from_join(join);
+        let join_literals = literal_equalities_from_join(memo, join);
         let mut left_new = Vec::new();
         let mut right_new = Vec::new();
-        for (raw_left, raw_right) in join_column_pairs(join) {
+        for (raw_left, raw_right) in join_column_pairs(memo, join) {
             let Some((left_id, right_id)) =
                 orient_pair(raw_left, raw_right, &left_columns, &right_columns)
             else {
@@ -147,18 +148,18 @@ fn expand_literals_with_equivalence(
     }
 }
 
-fn join_column_pairs(join: &LogicalJoinOp) -> Vec<(ColumnId, ColumnId)> {
+fn join_column_pairs(memo: &Memo, join: &LogicalJoinOp) -> Vec<(ColumnId, ColumnId)> {
     join.condition
         .as_ref()
-        .map(collect_column_equalities)
+        .map(|condition| collect_column_equalities(&materialize(&memo.scalars, *condition)))
         .unwrap_or_default()
 }
 
-fn literal_equalities_from_join(join: &LogicalJoinOp) -> Vec<(ColumnId, TypedExpr)> {
+fn literal_equalities_from_join(memo: &Memo, join: &LogicalJoinOp) -> Vec<(ColumnId, TypedExpr)> {
     join.condition
         .as_ref()
         .map(|condition| {
-            collect_literal_equalities(condition)
+            collect_literal_equalities(&materialize(&memo.scalars, *condition))
                 .into_iter()
                 .map(|eq| (eq.column_id, eq.literal))
                 .collect()
@@ -186,8 +187,9 @@ fn literal_equalities_from_group_inner(
     for expr in &group.logical_exprs {
         match &expr.op {
             Operator::LogicalFilter(filter) => {
+                let predicate = materialize(&memo.scalars, filter.predicate);
                 out.extend(
-                    collect_literal_equalities(&filter.predicate)
+                    collect_literal_equalities(&predicate)
                         .into_iter()
                         .map(|eq| (eq.column_id, eq.literal)),
                 );
@@ -197,8 +199,9 @@ fn literal_equalities_from_group_inner(
             }
             Operator::LogicalScan(scan) => {
                 for predicate in &scan.predicates {
+                    let predicate = materialize(&memo.scalars, *predicate);
                     out.extend(
-                        collect_literal_equalities(predicate)
+                        collect_literal_equalities(&predicate)
                             .into_iter()
                             .map(|eq| (eq.column_id, eq.literal)),
                     );
@@ -208,8 +211,9 @@ fn literal_equalities_from_group_inner(
                 if matches!(join.join_type, JoinKind::Inner | JoinKind::Cross) =>
             {
                 if let Some(condition) = &join.condition {
+                    let condition = materialize(&memo.scalars, *condition);
                     out.extend(
-                        collect_literal_equalities(condition)
+                        collect_literal_equalities(&condition)
                             .into_iter()
                             .map(|eq| (eq.column_id, eq.literal)),
                     );
@@ -277,6 +281,7 @@ fn literal_signature(expr: &TypedExpr) -> String {
 fn add_filter_group(memo: &mut Memo, child_group: GroupId, predicates: Vec<TypedExpr>) -> GroupId {
     let predicate =
         combine_with_and(predicates).expect("filter group needs at least one predicate");
+    let predicate = intern_typed(&mut memo.scalars, &predicate);
     let filter_expr = MExpr {
         id: memo.next_expr_id(),
         op: Operator::LogicalFilter(LogicalFilterOp { predicate }),
@@ -306,6 +311,7 @@ mod tests {
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue};
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::optimizer::operator::LogicalScanOp;
+    use crate::sql::optimizer::scalar::{ScalarId, intern_typed, materialize};
     use arrow::datatypes::DataType;
 
     fn output(id: u32, name: &str) -> OutputColumn {
@@ -362,6 +368,28 @@ mod tests {
         }
     }
 
+    fn intern(memo: &mut Memo, expr: &TypedExpr) -> ScalarId {
+        intern_typed(&mut memo.scalars, expr)
+    }
+
+    fn join_mexpr(
+        memo: &mut Memo,
+        join_type: JoinKind,
+        condition: TypedExpr,
+        children: Vec<GroupId>,
+    ) -> MExpr {
+        let id = memo.next_expr_id();
+        let condition = Some(intern(memo, &condition));
+        MExpr {
+            id,
+            op: Operator::LogicalJoin(LogicalJoinOp {
+                join_type,
+                condition,
+            }),
+            children,
+        }
+    }
+
     fn scan_group(memo: &mut Memo, id: u32, name: &str) -> GroupId {
         scan_group_with_predicates(memo, id, name, Vec::new())
     }
@@ -372,8 +400,10 @@ mod tests {
         name: &str,
         predicates: Vec<TypedExpr>,
     ) -> GroupId {
+        let id_expr = memo.next_expr_id();
+        let predicates = predicates.iter().map(|expr| intern(memo, expr)).collect();
         let group = memo.new_group(MExpr {
-            id: memo.next_expr_id(),
+            id: id_expr,
             op: Operator::LogicalScan(LogicalScanOp {
                 database: "db".to_string(),
                 table: TableDef {
@@ -407,11 +437,13 @@ mod tests {
         condition: TypedExpr,
         outputs: Vec<OutputColumn>,
     ) -> GroupId {
+        let id = memo.next_expr_id();
+        let condition_id = intern(memo, &condition);
         let group = memo.new_group(MExpr {
-            id: memo.next_expr_id(),
+            id,
             op: Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
-                condition: Some(condition.clone()),
+                condition: Some(condition_id),
             }),
             children: vec![left, right],
         });
@@ -428,17 +460,12 @@ mod tests {
         let mut memo = Memo::new();
         let left = scan_group(&mut memo, 1, "lk");
         let right = scan_group(&mut memo, 2, "rk");
-        let join = MExpr {
-            id: memo.next_expr_id(),
-            op: Operator::LogicalJoin(LogicalJoinOp {
-                join_type: JoinKind::Inner,
-                condition: Some(and(
-                    eq(col(1, "lk"), col(2, "rk")),
-                    eq(col(1, "lk"), lit(10)),
-                )),
-            }),
-            children: vec![left, right],
-        };
+        let join = join_mexpr(
+            &mut memo,
+            JoinKind::Inner,
+            and(eq(col(1, "lk"), col(2, "rk")), eq(col(1, "lk"), lit(10))),
+            vec![left, right],
+        );
 
         let out = InnerJoinEquivalencePredicateRule.apply(&join, &mut memo);
         assert_eq!(out.len(), 1);
@@ -451,7 +478,8 @@ mod tests {
                 _ => None,
             })
             .expect("right child filter");
-        assert_eq!(collect_literal_equalities(&filter.predicate).len(), 1);
+        let predicate = materialize(&memo.scalars, filter.predicate);
+        assert_eq!(collect_literal_equalities(&predicate).len(), 1);
     }
 
     #[test]
@@ -459,17 +487,12 @@ mod tests {
         let mut memo = Memo::new();
         let left = scan_group(&mut memo, 1, "lk");
         let right = scan_group(&mut memo, 2, "rk");
-        let join = MExpr {
-            id: memo.next_expr_id(),
-            op: Operator::LogicalJoin(LogicalJoinOp {
-                join_type: JoinKind::LeftOuter,
-                condition: Some(and(
-                    eq(col(1, "lk"), col(2, "rk")),
-                    eq(col(1, "lk"), lit(10)),
-                )),
-            }),
-            children: vec![left, right],
-        };
+        let join = join_mexpr(
+            &mut memo,
+            JoinKind::LeftOuter,
+            and(eq(col(1, "lk"), col(2, "rk")), eq(col(1, "lk"), lit(10))),
+            vec![left, right],
+        );
         assert!(!InnerJoinEquivalencePredicateRule.matches(&join.op));
         assert!(
             InnerJoinEquivalencePredicateRule
@@ -483,26 +506,23 @@ mod tests {
         let mut memo = Memo::new();
         let left = scan_group(&mut memo, 1, "lk");
         let right_scan = scan_group(&mut memo, 2, "rk");
+        let right_filter_id = memo.next_expr_id();
+        let right_filter_predicate = intern(&mut memo, &eq(col(2, "rk"), lit(10)));
         let right_filter = memo.new_group(MExpr {
-            id: memo.next_expr_id(),
+            id: right_filter_id,
             op: Operator::LogicalFilter(LogicalFilterOp {
-                predicate: eq(col(2, "rk"), lit(10)),
+                predicate: right_filter_predicate,
             }),
             children: vec![right_scan],
         });
         memo.groups[right_filter].logical_props =
             Some(LogicalProperties::new(vec![output(2, "rk")], 5.0));
-        let join = MExpr {
-            id: memo.next_expr_id(),
-            op: Operator::LogicalJoin(LogicalJoinOp {
-                join_type: JoinKind::Inner,
-                condition: Some(and(
-                    eq(col(1, "lk"), col(2, "rk")),
-                    eq(col(1, "lk"), lit(10)),
-                )),
-            }),
-            children: vec![left, right_filter],
-        };
+        let join = join_mexpr(
+            &mut memo,
+            JoinKind::Inner,
+            and(eq(col(1, "lk"), col(2, "rk")), eq(col(1, "lk"), lit(10))),
+            vec![left, right_filter],
+        );
         assert!(
             InnerJoinEquivalencePredicateRule
                 .apply(&join, &mut memo)
@@ -523,14 +543,12 @@ mod tests {
             vec![output(1, "ak"), output(2, "bk")],
         );
         let right = scan_group_with_predicates(&mut memo, 3, "ck", vec![eq(col(3, "ck"), lit(7))]);
-        let join = MExpr {
-            id: memo.next_expr_id(),
-            op: Operator::LogicalJoin(LogicalJoinOp {
-                join_type: JoinKind::Inner,
-                condition: Some(eq(col(2, "bk"), col(3, "ck"))),
-            }),
-            children: vec![left_join, right],
-        };
+        let join = join_mexpr(
+            &mut memo,
+            JoinKind::Inner,
+            eq(col(2, "bk"), col(3, "ck")),
+            vec![left_join, right],
+        );
 
         assert!(
             InnerJoinEquivalencePredicateRule

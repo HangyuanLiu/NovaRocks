@@ -10,6 +10,7 @@ use crate::sql::optimizer::operator::{PhysicalExceptOp, PhysicalIntersectOp, Phy
 use crate::sql::optimizer::property::{
     DistributionSpec, HashSource, OrderingSpec, PhysicalPropertySet,
 };
+use crate::sql::optimizer::scalar::ScalarArena;
 
 use super::{DeriveOutput, DeriveRequired};
 
@@ -48,7 +49,11 @@ fn set_op_required(
 }
 
 impl DeriveOutput for PhysicalUnionOp {
-    fn derive_output(&self, _children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
+    fn derive_output(
+        &self,
+        _scalars: &ScalarArena,
+        _children: &[&PhysicalPropertySet],
+    ) -> PhysicalPropertySet {
         if self.all {
             PhysicalPropertySet::any()
         } else {
@@ -58,7 +63,12 @@ impl DeriveOutput for PhysicalUnionOp {
 }
 
 impl DeriveRequired for PhysicalUnionOp {
-    fn derive_required(&self, _parent: &PhysicalPropertySet, n: usize) -> Vec<PhysicalPropertySet> {
+    fn derive_required(
+        &self,
+        _scalars: &ScalarArena,
+        _parent: &PhysicalPropertySet,
+        n: usize,
+    ) -> Vec<PhysicalPropertySet> {
         if self.all {
             vec![PhysicalPropertySet::any(); n]
         } else {
@@ -68,25 +78,43 @@ impl DeriveRequired for PhysicalUnionOp {
 }
 
 impl DeriveOutput for PhysicalIntersectOp {
-    fn derive_output(&self, _children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
+    fn derive_output(
+        &self,
+        _scalars: &ScalarArena,
+        _children: &[&PhysicalPropertySet],
+    ) -> PhysicalPropertySet {
         columns_to_shuffle_join_property(&self.output_columns)
     }
 }
 
 impl DeriveRequired for PhysicalIntersectOp {
-    fn derive_required(&self, _parent: &PhysicalPropertySet, n: usize) -> Vec<PhysicalPropertySet> {
+    fn derive_required(
+        &self,
+        _scalars: &ScalarArena,
+        _parent: &PhysicalPropertySet,
+        n: usize,
+    ) -> Vec<PhysicalPropertySet> {
         set_op_required(&self.child_output_columns, n)
     }
 }
 
 impl DeriveOutput for PhysicalExceptOp {
-    fn derive_output(&self, _children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
+    fn derive_output(
+        &self,
+        _scalars: &ScalarArena,
+        _children: &[&PhysicalPropertySet],
+    ) -> PhysicalPropertySet {
         columns_to_shuffle_join_property(&self.output_columns)
     }
 }
 
 impl DeriveRequired for PhysicalExceptOp {
-    fn derive_required(&self, _parent: &PhysicalPropertySet, n: usize) -> Vec<PhysicalPropertySet> {
+    fn derive_required(
+        &self,
+        _scalars: &ScalarArena,
+        _parent: &PhysicalPropertySet,
+        n: usize,
+    ) -> Vec<PhysicalPropertySet> {
         set_op_required(&self.child_output_columns, n)
     }
 }
@@ -97,6 +125,7 @@ mod tests {
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::property::{DistributionSpec, HashSource};
+    use crate::sql::optimizer::scalar::ScalarArena;
     use arrow::datatypes::DataType;
 
     fn col(id: u32, name: &str) -> OutputColumn {
@@ -116,7 +145,8 @@ mod tests {
             child_output_columns: vec![vec![col(10, "k")], vec![col(20, "k")]],
         };
 
-        let reqs = op.derive_required(&PhysicalPropertySet::any(), 2);
+        let scalars = ScalarArena::new();
+        let reqs = op.derive_required(&scalars, &PhysicalPropertySet::any(), 2);
 
         assert_eq!(reqs.len(), 2);
         assert_eq!(
@@ -142,7 +172,8 @@ mod tests {
             child_output_columns: vec![vec![col(10, "k")], vec![col(20, "k")]],
         };
 
-        let props = op.derive_output(&[]);
+        let scalars = ScalarArena::new();
+        let props = op.derive_output(&scalars, &[]);
 
         assert_eq!(
             props.distribution,
@@ -161,7 +192,8 @@ mod tests {
             child_output_columns: vec![vec![col(10, "k")], vec![col(20, "k")]],
         };
 
-        let reqs = op.derive_required(&PhysicalPropertySet::any(), 2);
+        let scalars = ScalarArena::new();
+        let reqs = op.derive_required(&scalars, &PhysicalPropertySet::any(), 2);
 
         assert_eq!(reqs.len(), 2);
         assert!(

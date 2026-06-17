@@ -2,9 +2,7 @@ use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{JoinKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
 use crate::sql::catalog::TableDef;
 use crate::sql::column_id::ColumnId;
-use crate::sql::optimizer::operator::{
-    AggMode, JoinDistribution, PhysicalHashJoinEqCondition, TopNPhase,
-};
+use crate::sql::optimizer::operator::{AggMode, JoinDistribution, TopNPhase};
 use crate::sql::planner::plan::WindowExpr;
 use crate::sql::planner::plan::{AggregateCall, DecodeMapping};
 use crate::sql::planner::plan::{ScanDictionaryColumn, ScanVariantColumn};
@@ -95,9 +93,16 @@ pub(crate) struct DistributedHashAggregateNode {
 #[derive(Clone, Debug)]
 pub(crate) struct DistributedHashJoinNode {
     pub join_type: JoinKind,
-    pub eq_conditions: Vec<PhysicalHashJoinEqCondition>,
+    pub eq_conditions: Vec<DistributedHashJoinEqCondition>,
     pub other_condition: Option<TypedExpr>,
     pub distribution: JoinDistribution,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DistributedHashJoinEqCondition {
+    pub left: TypedExpr,
+    pub right: TypedExpr,
+    pub null_safe: bool,
 }
 
 #[derive(Clone, Debug)]

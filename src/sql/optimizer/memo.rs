@@ -11,6 +11,7 @@ use super::statistics::{ColumnStatistic, Confidence};
 use crate::sql::analysis::OutputColumn;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::column_id::{ColumnId, ColumnRefFactory};
+use crate::sql::optimizer::scalar::ScalarArena;
 
 // ---------------------------------------------------------------------------
 // Core type aliases
@@ -64,6 +65,10 @@ pub(crate) struct Memo {
     /// it does not redundantly re-enumerate orders the reorder pass already
     /// produced (D2: reorder/associativity mutual exclusion).
     pub(crate) reorder_owned_groups: HashSet<GroupId>,
+    /// Owns interned scalar expressions for this optimize() call. After M1,
+    /// memo operators store only `ScalarId` handles into this arena instead of
+    /// owning deep `TypedExpr` trees.
+    pub(crate) scalars: ScalarArena,
 }
 
 impl Memo {
@@ -74,6 +79,7 @@ impl Memo {
             factory: ColumnRefFactory::new(),
             join_group_index: HashMap::new(),
             reorder_owned_groups: HashSet::new(),
+            scalars: ScalarArena::new(),
         }
     }
 
