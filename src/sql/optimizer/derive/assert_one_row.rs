@@ -7,12 +7,17 @@
 
 use crate::sql::optimizer::operator::PhysicalAssertOneRowOp;
 use crate::sql::optimizer::property::{DistributionSpec, PhysicalPropertySet};
+use crate::sql::optimizer::scalar::ScalarArena;
 
 use super::passthrough::passthrough_output;
 use super::{DeriveOutput, DeriveRequired};
 
 impl DeriveOutput for PhysicalAssertOneRowOp {
-    fn derive_output(&self, children_outputs: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
+    fn derive_output(
+        &self,
+        _scalars: &ScalarArena,
+        children_outputs: &[&PhysicalPropertySet],
+    ) -> PhysicalPropertySet {
         passthrough_output(children_outputs)
     }
 }
@@ -20,6 +25,7 @@ impl DeriveOutput for PhysicalAssertOneRowOp {
 impl DeriveRequired for PhysicalAssertOneRowOp {
     fn derive_required(
         &self,
+        _scalars: &ScalarArena,
         parent_required: &PhysicalPropertySet,
         _n: usize,
     ) -> Vec<PhysicalPropertySet> {

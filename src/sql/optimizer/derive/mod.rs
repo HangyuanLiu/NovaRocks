@@ -15,6 +15,7 @@ use super::cost::{DISTRIBUTION_STARTUP_COST, NETWORK_COST};
 use super::memo::Cost;
 use super::operator::*;
 use super::property::*;
+use super::scalar::ScalarArena;
 use super::statistics::Statistics;
 
 // ---------------------------------------------------------------------------
@@ -25,7 +26,11 @@ pub(crate) trait DeriveOutput {
     /// Compute the physical-property set this operator's chosen physical
     /// expression actually delivers, given the children's chosen-winner
     /// outputs (in child-slot order).
-    fn derive_output(&self, children_outputs: &[&PhysicalPropertySet]) -> PhysicalPropertySet;
+    fn derive_output(
+        &self,
+        scalars: &ScalarArena,
+        children_outputs: &[&PhysicalPropertySet],
+    ) -> PhysicalPropertySet;
 }
 
 pub(crate) trait DeriveRequired {
@@ -34,6 +39,7 @@ pub(crate) trait DeriveRequired {
     /// Top-down: children outputs are NOT yet known when this is called.
     fn derive_required(
         &self,
+        scalars: &ScalarArena,
         parent_required: &PhysicalPropertySet,
         num_children: usize,
     ) -> Vec<PhysicalPropertySet>;
@@ -68,33 +74,34 @@ impl ChildRequirementAlternative {
 /// Dispatch `derive_output` based on the operator's concrete variant.
 pub(crate) fn derive_output(
     op: &Operator,
+    scalars: &ScalarArena,
     children_outputs: &[&PhysicalPropertySet],
 ) -> PhysicalPropertySet {
     match op {
-        Operator::PhysicalScan(o) => o.derive_output(children_outputs),
-        Operator::PhysicalValues(o) => o.derive_output(children_outputs),
-        Operator::PhysicalGenerateSeries(o) => o.derive_output(children_outputs),
-        Operator::PhysicalCTEConsume(o) => o.derive_output(children_outputs),
-        Operator::PhysicalUnion(o) => o.derive_output(children_outputs),
-        Operator::PhysicalIntersect(o) => o.derive_output(children_outputs),
-        Operator::PhysicalExcept(o) => o.derive_output(children_outputs),
-        Operator::PhysicalCTEAnchor(o) => o.derive_output(children_outputs),
-        Operator::PhysicalDistribution(o) => o.derive_output(children_outputs),
-        Operator::PhysicalFilter(o) => o.derive_output(children_outputs),
-        Operator::PhysicalProject(o) => o.derive_output(children_outputs),
-        Operator::PhysicalDecode(o) => o.derive_output(children_outputs),
-        Operator::PhysicalAggregateStateMerge(o) => o.derive_output(children_outputs),
-        Operator::PhysicalLimit(o) => o.derive_output(children_outputs),
-        Operator::PhysicalAssertOneRow(o) => o.derive_output(children_outputs),
-        Operator::PhysicalCTEProduce(o) => o.derive_output(children_outputs),
-        Operator::PhysicalRepeat(o) => o.derive_output(children_outputs),
-        Operator::PhysicalTableFunction(o) => o.derive_output(children_outputs),
-        Operator::PhysicalWindow(o) => o.derive_output(children_outputs),
-        Operator::PhysicalNestLoopJoin(o) => o.derive_output(children_outputs),
-        Operator::PhysicalHashAggregate(o) => o.derive_output(children_outputs),
-        Operator::PhysicalSort(o) => o.derive_output(children_outputs),
-        Operator::PhysicalTopN(o) => o.derive_output(children_outputs),
-        Operator::PhysicalHashJoin(o) => o.derive_output(children_outputs),
+        Operator::PhysicalScan(o) => o.derive_output(scalars, children_outputs),
+        Operator::PhysicalValues(o) => o.derive_output(scalars, children_outputs),
+        Operator::PhysicalGenerateSeries(o) => o.derive_output(scalars, children_outputs),
+        Operator::PhysicalCTEConsume(o) => o.derive_output(scalars, children_outputs),
+        Operator::PhysicalUnion(o) => o.derive_output(scalars, children_outputs),
+        Operator::PhysicalIntersect(o) => o.derive_output(scalars, children_outputs),
+        Operator::PhysicalExcept(o) => o.derive_output(scalars, children_outputs),
+        Operator::PhysicalCTEAnchor(o) => o.derive_output(scalars, children_outputs),
+        Operator::PhysicalDistribution(o) => o.derive_output(scalars, children_outputs),
+        Operator::PhysicalFilter(o) => o.derive_output(scalars, children_outputs),
+        Operator::PhysicalProject(o) => o.derive_output(scalars, children_outputs),
+        Operator::PhysicalDecode(o) => o.derive_output(scalars, children_outputs),
+        Operator::PhysicalAggregateStateMerge(o) => o.derive_output(scalars, children_outputs),
+        Operator::PhysicalLimit(o) => o.derive_output(scalars, children_outputs),
+        Operator::PhysicalAssertOneRow(o) => o.derive_output(scalars, children_outputs),
+        Operator::PhysicalCTEProduce(o) => o.derive_output(scalars, children_outputs),
+        Operator::PhysicalRepeat(o) => o.derive_output(scalars, children_outputs),
+        Operator::PhysicalTableFunction(o) => o.derive_output(scalars, children_outputs),
+        Operator::PhysicalWindow(o) => o.derive_output(scalars, children_outputs),
+        Operator::PhysicalNestLoopJoin(o) => o.derive_output(scalars, children_outputs),
+        Operator::PhysicalHashAggregate(o) => o.derive_output(scalars, children_outputs),
+        Operator::PhysicalSort(o) => o.derive_output(scalars, children_outputs),
+        Operator::PhysicalTopN(o) => o.derive_output(scalars, children_outputs),
+        Operator::PhysicalHashJoin(o) => o.derive_output(scalars, children_outputs),
         op => {
             debug_assert!(
                 !op.is_physical(),
@@ -107,50 +114,68 @@ pub(crate) fn derive_output(
 
 pub(crate) fn derive_output_for_alternative(
     op: &Operator,
+    scalars: &ScalarArena,
     children_outputs: &[&PhysicalPropertySet],
     alt_kind: &PropertyAlternativeKind,
 ) -> PhysicalPropertySet {
     match op {
         Operator::PhysicalHashJoin(o) => {
-            o.derive_output_for_alternative(children_outputs, alt_kind)
+            o.derive_output_for_alternative(scalars, children_outputs, alt_kind)
         }
-        _ => derive_output(op, children_outputs),
+        _ => derive_output(op, scalars, children_outputs),
     }
 }
 
 /// Dispatch `derive_required` based on the operator's concrete variant.
 pub(crate) fn derive_required(
     op: &Operator,
+    scalars: &ScalarArena,
     parent_required: &PhysicalPropertySet,
     num_children: usize,
 ) -> Vec<PhysicalPropertySet> {
     match op {
-        Operator::PhysicalScan(o) => o.derive_required(parent_required, num_children),
-        Operator::PhysicalValues(o) => o.derive_required(parent_required, num_children),
-        Operator::PhysicalGenerateSeries(o) => o.derive_required(parent_required, num_children),
-        Operator::PhysicalCTEConsume(o) => o.derive_required(parent_required, num_children),
-        Operator::PhysicalUnion(o) => o.derive_required(parent_required, num_children),
-        Operator::PhysicalIntersect(o) => o.derive_required(parent_required, num_children),
-        Operator::PhysicalExcept(o) => o.derive_required(parent_required, num_children),
-        Operator::PhysicalCTEAnchor(o) => o.derive_required(parent_required, num_children),
-        Operator::PhysicalDistribution(o) => o.derive_required(parent_required, num_children),
-        Operator::PhysicalFilter(o) => o.derive_required(parent_required, num_children),
-        Operator::PhysicalProject(o) => o.derive_required(parent_required, num_children),
-        Operator::PhysicalDecode(o) => o.derive_required(parent_required, num_children),
-        Operator::PhysicalAggregateStateMerge(o) => {
-            o.derive_required(parent_required, num_children)
+        Operator::PhysicalScan(o) => o.derive_required(scalars, parent_required, num_children),
+        Operator::PhysicalValues(o) => o.derive_required(scalars, parent_required, num_children),
+        Operator::PhysicalGenerateSeries(o) => {
+            o.derive_required(scalars, parent_required, num_children)
         }
-        Operator::PhysicalLimit(o) => o.derive_required(parent_required, num_children),
-        Operator::PhysicalAssertOneRow(o) => o.derive_required(parent_required, num_children),
-        Operator::PhysicalCTEProduce(o) => o.derive_required(parent_required, num_children),
-        Operator::PhysicalRepeat(o) => o.derive_required(parent_required, num_children),
-        Operator::PhysicalTableFunction(o) => o.derive_required(parent_required, num_children),
-        Operator::PhysicalWindow(o) => o.derive_required(parent_required, num_children),
-        Operator::PhysicalNestLoopJoin(o) => o.derive_required(parent_required, num_children),
-        Operator::PhysicalHashAggregate(o) => o.derive_required(parent_required, num_children),
-        Operator::PhysicalSort(o) => o.derive_required(parent_required, num_children),
-        Operator::PhysicalTopN(o) => o.derive_required(parent_required, num_children),
-        Operator::PhysicalHashJoin(o) => o.derive_required(parent_required, num_children),
+        Operator::PhysicalCTEConsume(o) => {
+            o.derive_required(scalars, parent_required, num_children)
+        }
+        Operator::PhysicalUnion(o) => o.derive_required(scalars, parent_required, num_children),
+        Operator::PhysicalIntersect(o) => o.derive_required(scalars, parent_required, num_children),
+        Operator::PhysicalExcept(o) => o.derive_required(scalars, parent_required, num_children),
+        Operator::PhysicalCTEAnchor(o) => o.derive_required(scalars, parent_required, num_children),
+        Operator::PhysicalDistribution(o) => {
+            o.derive_required(scalars, parent_required, num_children)
+        }
+        Operator::PhysicalFilter(o) => o.derive_required(scalars, parent_required, num_children),
+        Operator::PhysicalProject(o) => o.derive_required(scalars, parent_required, num_children),
+        Operator::PhysicalDecode(o) => o.derive_required(scalars, parent_required, num_children),
+        Operator::PhysicalAggregateStateMerge(o) => {
+            o.derive_required(scalars, parent_required, num_children)
+        }
+        Operator::PhysicalLimit(o) => o.derive_required(scalars, parent_required, num_children),
+        Operator::PhysicalAssertOneRow(o) => {
+            o.derive_required(scalars, parent_required, num_children)
+        }
+        Operator::PhysicalCTEProduce(o) => {
+            o.derive_required(scalars, parent_required, num_children)
+        }
+        Operator::PhysicalRepeat(o) => o.derive_required(scalars, parent_required, num_children),
+        Operator::PhysicalTableFunction(o) => {
+            o.derive_required(scalars, parent_required, num_children)
+        }
+        Operator::PhysicalWindow(o) => o.derive_required(scalars, parent_required, num_children),
+        Operator::PhysicalNestLoopJoin(o) => {
+            o.derive_required(scalars, parent_required, num_children)
+        }
+        Operator::PhysicalHashAggregate(o) => {
+            o.derive_required(scalars, parent_required, num_children)
+        }
+        Operator::PhysicalSort(o) => o.derive_required(scalars, parent_required, num_children),
+        Operator::PhysicalTopN(o) => o.derive_required(scalars, parent_required, num_children),
+        Operator::PhysicalHashJoin(o) => o.derive_required(scalars, parent_required, num_children),
         op => {
             debug_assert!(
                 !op.is_physical(),
@@ -163,15 +188,17 @@ pub(crate) fn derive_required(
 
 pub(crate) fn derive_required_alternatives(
     op: &Operator,
+    scalars: &ScalarArena,
     parent_required: &PhysicalPropertySet,
     num_children: usize,
 ) -> Vec<ChildRequirementAlternative> {
     match op {
         Operator::PhysicalHashJoin(o) => {
-            o.derive_required_alternatives(parent_required, num_children)
+            o.derive_required_alternatives(scalars, parent_required, num_children)
         }
         _ => vec![ChildRequirementAlternative::default(derive_required(
             op,
+            scalars,
             parent_required,
             num_children,
         ))],

@@ -2,11 +2,16 @@
 
 use crate::sql::optimizer::operator::PhysicalNestLoopJoinOp;
 use crate::sql::optimizer::property::PhysicalPropertySet;
+use crate::sql::optimizer::scalar::ScalarArena;
 
 use super::{DeriveOutput, DeriveRequired};
 
 impl DeriveOutput for PhysicalNestLoopJoinOp {
-    fn derive_output(&self, _children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
+    fn derive_output(
+        &self,
+        _scalars: &ScalarArena,
+        _children: &[&PhysicalPropertySet],
+    ) -> PhysicalPropertySet {
         PhysicalPropertySet::gather()
     }
 }
@@ -14,6 +19,7 @@ impl DeriveOutput for PhysicalNestLoopJoinOp {
 impl DeriveRequired for PhysicalNestLoopJoinOp {
     fn derive_required(
         &self,
+        _scalars: &ScalarArena,
         _parent: &PhysicalPropertySet,
         _n: usize,
     ) -> Vec<PhysicalPropertySet> {

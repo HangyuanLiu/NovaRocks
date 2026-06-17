@@ -21,6 +21,10 @@ use crate::sql::optimizer::estimate::cardinality::{
     JoinCardInput, estimate_join_cardinality, except_rows, intersect_rows, union_all_rows,
     union_distinct_rows,
 };
+use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, materialize};
+use crate::sql::optimizer::scalar_bridge::{
+    materialize_exprs, materialize_project_items, materialize_window_exprs,
+};
 use crate::sql::optimizer::statistics::*;
 use crate::sql::planner::plan::LogicalPlanNode;
 
@@ -61,11 +65,14 @@ pub(crate) fn derive_statistics(
 ) -> Statistics {
     match &expr.op {
         // -- Leaf operators (no children) --
-        Operator::LogicalScan(scan) => derive_scan(scan, table_stats),
+        Operator::LogicalScan(scan) => derive_scan(scan, &memo.scalars, table_stats),
         Operator::LogicalValues(vals) => Statistics {
             output_row_count: vals.rows.len() as f64,
             row_count_confidence: Confidence::Exact,
-            column_statistics: values_column_statistics(&vals.rows, &vals.columns),
+            column_statistics: values_column_statistics(
+                &materialize_rows(&memo.scalars, &vals.rows),
+                &vals.columns,
+            ),
         },
         Operator::LogicalGenerateSeries(gs) => Statistics {
             output_row_count: generate_series_row_count_f64(gs.start, gs.end, gs.step),
@@ -114,8 +121,8 @@ pub(crate) fn derive_statistics(
         // -- Unary operators (single child) --
         Operator::LogicalFilter(filter) => {
             let child_stats = child_statistics(memo, &expr.children, 0);
-            let selectivity =
-                estimate_selectivity(&filter.predicate, &child_stats.column_statistics);
+            let predicate = materialize(&memo.scalars, filter.predicate);
+            let selectivity = estimate_selectivity(&predicate, &child_stats.column_statistics);
             let (output_rows, row_count_confidence) = apply_filter(
                 child_stats.output_row_count,
                 child_stats.row_count_confidence,
@@ -135,14 +142,16 @@ pub(crate) fn derive_statistics(
 
         Operator::LogicalProject(proj) => {
             let child_stats = child_statistics(memo, &expr.children, 0);
+            let items = materialize_project_items(&memo.scalars, &proj.items);
             let projected: HashMap<ColumnId, ColumnStatistic> = proj
                 .items
                 .iter()
+                .zip(items.iter())
                 .filter_map(|item| {
-                    extract_column_id(&item.expr)
+                    extract_column_id(&item.1.expr)
                         .and_then(|column_id| child_stats.column_statistics.get(&column_id))
                         .cloned()
-                        .map(|cs| (item.output_column_id, cs))
+                        .map(|cs| (item.0.output_column_id, cs))
                 })
                 .collect();
             Statistics {
@@ -154,6 +163,7 @@ pub(crate) fn derive_statistics(
 
         Operator::LogicalAggregate(agg) => {
             let child_stats = child_statistics(memo, &expr.children, 0);
+            let group_by = materialize_exprs(&memo.scalars, &agg.group_by);
             if agg.group_by.is_empty() {
                 return Statistics {
                     output_row_count: 1.0,
@@ -164,11 +174,12 @@ pub(crate) fn derive_statistics(
             let group_key_ndvs: Vec<f64> = agg
                 .group_by
                 .iter()
-                .map(|gb_expr| get_expr_ndv(gb_expr, &child_stats.column_statistics))
+                .zip(group_by.iter())
+                .map(|(_, gb_expr)| get_expr_ndv(gb_expr, &child_stats.column_statistics))
                 .collect();
             let output_rows = agg_group_rows(&group_key_ndvs, child_stats.output_row_count);
             let column_statistics = aggregate_group_column_statistics(
-                &agg.group_by,
+                &group_by,
                 &agg.output_columns,
                 &child_stats,
                 output_rows,
@@ -219,7 +230,12 @@ pub(crate) fn derive_statistics(
 
         Operator::LogicalWindow(window) => {
             let child_stats = child_statistics(memo, &expr.children, 0);
-            derive_window_statistics(child_stats, &window.window_exprs)
+            let window_exprs = materialize_window_exprs(
+                &memo.scalars,
+                &window.window_exprs,
+                &window.output_columns,
+            );
+            derive_window_statistics(child_stats, &window_exprs)
         }
 
         Operator::LogicalRepeat(repeat) => {
@@ -268,7 +284,7 @@ pub(crate) fn derive_statistics(
         Operator::LogicalJoin(join) => {
             let left_stats = child_statistics(memo, &expr.children, 0);
             let right_stats = child_statistics(memo, &expr.children, 1);
-            derive_join(join, &left_stats, &right_stats)
+            derive_join(join, &memo.scalars, &left_stats, &right_stats)
         }
 
         Operator::LogicalUnion(union_op) => derive_set_op_statistics(
@@ -297,15 +313,15 @@ pub(crate) fn derive_statistics(
             &scan.table.name,
             scan.alias.as_deref(),
             &scan.columns,
-            &scan.predicates,
+            &materialize_exprs(&memo.scalars, &scan.predicates),
             table_stats,
             estimate_default_row_count(&scan.table.name),
         ),
 
         Operator::PhysicalFilter(filter) => {
             let child_stats = child_statistics(memo, &expr.children, 0);
-            let selectivity =
-                estimate_selectivity(&filter.predicate, &child_stats.column_statistics);
+            let predicate = materialize(&memo.scalars, filter.predicate);
+            let selectivity = estimate_selectivity(&predicate, &child_stats.column_statistics);
             let (output_rows, row_count_confidence) = apply_filter(
                 child_stats.output_row_count,
                 child_stats.row_count_confidence,
@@ -325,14 +341,16 @@ pub(crate) fn derive_statistics(
 
         Operator::PhysicalProject(proj) => {
             let child_stats = child_statistics(memo, &expr.children, 0);
+            let items = materialize_project_items(&memo.scalars, &proj.items);
             let projected: HashMap<ColumnId, ColumnStatistic> = proj
                 .items
                 .iter()
+                .zip(items.iter())
                 .filter_map(|item| {
-                    extract_column_id(&item.expr)
+                    extract_column_id(&item.1.expr)
                         .and_then(|column_id| child_stats.column_statistics.get(&column_id))
                         .cloned()
-                        .map(|cs| (item.output_column_id, cs))
+                        .map(|cs| (item.0.output_column_id, cs))
                 })
                 .collect();
             Statistics {
@@ -344,6 +362,7 @@ pub(crate) fn derive_statistics(
 
         Operator::PhysicalHashAggregate(agg) => {
             let child_stats = child_statistics(memo, &expr.children, 0);
+            let group_by = materialize_exprs(&memo.scalars, &agg.group_by);
             if agg.group_by.is_empty() {
                 return Statistics {
                     output_row_count: 1.0,
@@ -354,11 +373,12 @@ pub(crate) fn derive_statistics(
             let group_key_ndvs: Vec<f64> = agg
                 .group_by
                 .iter()
-                .map(|gb_expr| get_expr_ndv(gb_expr, &child_stats.column_statistics))
+                .zip(group_by.iter())
+                .map(|(_, gb_expr)| get_expr_ndv(gb_expr, &child_stats.column_statistics))
                 .collect();
             let output_rows = agg_group_rows(&group_key_ndvs, child_stats.output_row_count);
             let column_statistics = aggregate_group_column_statistics(
-                &agg.group_by,
+                &group_by,
                 &agg.output_columns,
                 &child_stats,
                 output_rows,
@@ -380,14 +400,16 @@ pub(crate) fn derive_statistics(
                 .eq_conditions
                 .iter()
                 .map(|eq| {
-                    let eq_key_pair = extract_column_id(&eq.left).zip(extract_column_id(&eq.right));
+                    let left = materialize(&memo.scalars, eq.left);
+                    let right = materialize(&memo.scalars, eq.right);
+                    let eq_key_pair = extract_column_id(&left).zip(extract_column_id(&right));
                     let (left_ndv, left_confidence) = best_join_key_ndv(
-                        &eq.left,
+                        &left,
                         &left_stats.column_statistics,
                         &right_stats.column_statistics,
                     );
                     let (right_ndv, right_confidence) = best_join_key_ndv(
-                        &eq.right,
+                        &right,
                         &right_stats.column_statistics,
                         &left_stats.column_statistics,
                     );
@@ -437,13 +459,14 @@ pub(crate) fn derive_statistics(
         Operator::PhysicalNestLoopJoin(join) => {
             let left_stats = child_statistics(memo, &expr.children, 0);
             let right_stats = child_statistics(memo, &expr.children, 1);
-            let non_equi_selectivity = join.condition.as_ref().map(|cond| {
+            let condition = join.condition.map(|cond| materialize(&memo.scalars, cond));
+            let non_equi_selectivity = condition.as_ref().map(|cond| {
                 (
                     estimate_selectivity(cond, &left_stats.column_statistics),
                     Confidence::Estimated,
                 )
             });
-            let eq_key_pairs = collect_equi_join_column_pairs(join.condition.as_ref());
+            let eq_key_pairs = collect_equi_join_column_pairs(condition.as_ref());
 
             let (output_rows, row_count_confidence) = estimate_join_cardinality(&JoinCardInput {
                 left: (left_stats.output_row_count, left_stats.row_count_confidence),
@@ -474,9 +497,11 @@ pub(crate) fn derive_statistics(
         Operator::PhysicalSort(sort) => {
             let child_stats = child_statistics(memo, &expr.children, 0);
             if let Some(k) = sort.partition_limit {
+                let analytic_partition_exprs =
+                    materialize_exprs(&memo.scalars, &sort.analytic_partition_exprs);
                 let output_rows = sort_partition_limit_output_rows(
                     child_stats.output_row_count,
-                    &sort.analytic_partition_exprs,
+                    &analytic_partition_exprs,
                     &child_stats.column_statistics,
                     k,
                 );
@@ -521,7 +546,12 @@ pub(crate) fn derive_statistics(
 
         Operator::PhysicalWindow(window) => {
             let child_stats = child_statistics(memo, &expr.children, 0);
-            derive_window_statistics(child_stats, &window.window_exprs)
+            let window_exprs = materialize_window_exprs(
+                &memo.scalars,
+                &window.window_exprs,
+                &window.output_columns,
+            );
+            derive_window_statistics(child_stats, &window_exprs)
         }
 
         Operator::PhysicalDistribution(_) => {
@@ -595,7 +625,10 @@ pub(crate) fn derive_statistics(
         Operator::PhysicalValues(vals) => Statistics {
             output_row_count: vals.rows.len() as f64,
             row_count_confidence: Confidence::Exact,
-            column_statistics: values_column_statistics(&vals.rows, &vals.columns),
+            column_statistics: values_column_statistics(
+                &materialize_rows(&memo.scalars, &vals.rows),
+                &vals.columns,
+            ),
         },
 
         Operator::PhysicalGenerateSeries(gs) => Statistics {
@@ -684,6 +717,12 @@ fn best_join_key_ndv(
         _ if secondary.0 > primary.0 => secondary,
         _ => primary,
     }
+}
+
+fn materialize_rows(arena: &ScalarArena, rows: &[Vec<ScalarId>]) -> Vec<Vec<TypedExpr>> {
+    rows.iter()
+        .map(|row| row.iter().map(|expr| materialize(arena, *expr)).collect())
+        .collect()
 }
 
 fn aggregate_group_column_statistics(
@@ -1316,13 +1355,14 @@ fn derive_window_statistics(
 /// Derive scan statistics from a `LogicalScanOp`.
 fn derive_scan(
     scan: &super::operator::LogicalScanOp,
+    scalars: &ScalarArena,
     table_stats: &HashMap<String, TableStatistics>,
 ) -> Statistics {
     derive_scan_statistics(
         &scan.table.name,
         scan.alias.as_deref(),
         &scan.columns,
-        &scan.predicates,
+        &materialize_exprs(scalars, &scan.predicates),
         table_stats,
         estimate_default_row_count(&scan.table.name),
     )
@@ -1505,11 +1545,13 @@ fn estimate_default_row_count(table_name: &str) -> f64 {
 /// Derive join statistics from a `LogicalJoinOp` and child stats.
 fn derive_join(
     join: &super::operator::LogicalJoinOp,
+    scalars: &ScalarArena,
     left_stats: &Statistics,
     right_stats: &Statistics,
 ) -> Statistics {
+    let condition = join.condition.map(|cond| materialize(scalars, cond));
     let join_condition = estimate_join_condition(
-        join.condition.as_ref(),
+        condition.as_ref(),
         &left_stats.column_statistics,
         &right_stats.column_statistics,
     );
@@ -1608,8 +1650,8 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
             .map(|item| crate::sql::analysis::OutputColumn {
                 column_id: item.output_column_id,
                 name: item.output_name.clone(),
-                data_type: item.expr.data_type.clone(),
-                nullable: item.expr.nullable,
+                data_type: memo.scalars.data_type(item.expr).clone(),
+                nullable: memo.scalars.nullable(item.expr),
                 is_internal: false,
             })
             .collect(),
@@ -1688,8 +1730,8 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
             .map(|item| crate::sql::analysis::OutputColumn {
                 column_id: item.output_column_id,
                 name: item.output_name.clone(),
-                data_type: item.expr.data_type.clone(),
-                nullable: item.expr.nullable,
+                data_type: memo.scalars.data_type(item.expr).clone(),
+                nullable: memo.scalars.nullable(item.expr),
                 is_internal: false,
             })
             .collect(),

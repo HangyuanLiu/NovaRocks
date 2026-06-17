@@ -11,17 +11,25 @@ use crate::sql::optimizer::property::{
     DistributionSpec, OrderingSpec, PhysicalPropertySet, typed_expr_to_column_id,
     window_ordering_spec,
 };
+use crate::sql::optimizer::scalar::ScalarArena;
+use crate::sql::optimizer::scalar_bridge::materialize_window_exprs;
 use crate::sql::planner::plan::WindowExpr;
 
 use super::{DeriveOutput, DeriveRequired};
 
 impl DeriveOutput for PhysicalWindowOp {
-    fn derive_output(&self, children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
+    fn derive_output(
+        &self,
+        scalars: &ScalarArena,
+        children: &[&PhysicalPropertySet],
+    ) -> PhysicalPropertySet {
         let ordering = children
             .first()
             .map(|props| props.ordering.clone())
             .unwrap_or(OrderingSpec::Any);
-        let distribution = common_window_partition_distribution(&self.window_exprs);
+        let window_exprs =
+            materialize_window_exprs(scalars, &self.window_exprs, &self.output_columns);
+        let distribution = common_window_partition_distribution(&window_exprs);
         PhysicalPropertySet {
             distribution,
             ordering,
@@ -32,15 +40,17 @@ impl DeriveOutput for PhysicalWindowOp {
 impl DeriveRequired for PhysicalWindowOp {
     fn derive_required(
         &self,
+        scalars: &ScalarArena,
         _parent: &PhysicalPropertySet,
         _n: usize,
     ) -> Vec<PhysicalPropertySet> {
-        let ordering = self
-            .window_exprs
+        let window_exprs =
+            materialize_window_exprs(scalars, &self.window_exprs, &self.output_columns);
+        let ordering = window_exprs
             .first()
             .map(|win| window_ordering_spec(&win.partition_by, &win.order_by))
             .unwrap_or(OrderingSpec::Any);
-        let distribution = common_window_partition_distribution(&self.window_exprs);
+        let distribution = common_window_partition_distribution(&window_exprs);
         vec![PhysicalPropertySet {
             distribution,
             ordering,

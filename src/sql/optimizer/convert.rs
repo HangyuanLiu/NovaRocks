@@ -8,6 +8,11 @@ use super::operator::{
     LogicalRepeatOp, LogicalScanOp, LogicalSortOp, LogicalTableFunctionOp, LogicalUnionOp,
     LogicalValuesOp, LogicalWindowOp, Operator,
 };
+use crate::sql::optimizer::scalar::intern_typed;
+use crate::sql::optimizer::scalar_bridge::{
+    intern_aggregate_calls, intern_exprs, intern_project_items, intern_sort_items,
+    intern_window_exprs,
+};
 use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind};
 
 /// Recursively convert a `LogicalPlanNode` tree into Memo groups.
@@ -22,7 +27,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlanNode, memo: &mut Memo) -> G
                 table: node.table.clone(),
                 alias: node.alias.clone(),
                 columns: node.columns.clone(),
-                predicates: node.predicates.clone(),
+                predicates: intern_exprs(&mut memo.scalars, &node.predicates),
                 required_columns: node.required_columns.clone(),
                 dict_columns: node.dict_columns.clone(),
                 variant_columns: node.variant_columns.clone(),
@@ -39,7 +44,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlanNode, memo: &mut Memo) -> G
         LogicalPlanNodeKind::Filter(node) => {
             let child = logical_plan_to_memo(plan.unary_input(), memo);
             let op = Operator::LogicalFilter(LogicalFilterOp {
-                predicate: node.predicate.clone(),
+                predicate: intern_typed(&mut memo.scalars, &node.predicate),
             });
             let expr = MExpr {
                 id: memo.next_expr_id(),
@@ -52,7 +57,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlanNode, memo: &mut Memo) -> G
         LogicalPlanNodeKind::Project(node) => {
             let child = logical_plan_to_memo(plan.unary_input(), memo);
             let op = Operator::LogicalProject(LogicalProjectOp {
-                items: node.items.clone(),
+                items: intern_project_items(&mut memo.scalars, &node.items),
                 output_qualifier: node.output_qualifier.clone(),
             });
             let expr = MExpr {
@@ -65,9 +70,11 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlanNode, memo: &mut Memo) -> G
 
         LogicalPlanNodeKind::Aggregate(node) => {
             let child = logical_plan_to_memo(plan.unary_input(), memo);
+            let group_by = intern_exprs(&mut memo.scalars, &node.group_by);
+            let aggregates = intern_aggregate_calls(&mut memo.scalars, &node.aggregates);
             let op = Operator::LogicalAggregate(LogicalAggregateOp::single(
-                node.group_by.clone(),
-                node.aggregates.clone(),
+                group_by,
+                aggregates,
                 node.output_columns.clone(),
             ));
             let expr = MExpr {
@@ -83,7 +90,10 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlanNode, memo: &mut Memo) -> G
             let right = logical_plan_to_memo(plan.right(), memo);
             let op = Operator::LogicalJoin(LogicalJoinOp {
                 join_type: node.join_type,
-                condition: node.condition.clone(),
+                condition: node
+                    .condition
+                    .as_ref()
+                    .map(|condition| intern_typed(&mut memo.scalars, condition)),
             });
             let expr = MExpr {
                 id: memo.next_expr_id(),
@@ -96,8 +106,11 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlanNode, memo: &mut Memo) -> G
         LogicalPlanNodeKind::Sort(node) => {
             let child = logical_plan_to_memo(plan.unary_input(), memo);
             let op = Operator::LogicalSort(LogicalSortOp {
-                items: node.items.clone(),
-                analytic_partition_exprs: node.analytic_partition_by.clone(),
+                items: intern_sort_items(&mut memo.scalars, &node.items),
+                analytic_partition_exprs: intern_exprs(
+                    &mut memo.scalars,
+                    &node.analytic_partition_by,
+                ),
                 partition_limit: node.partition_limit,
                 topn_type: node.topn_type,
             });
@@ -195,7 +208,11 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlanNode, memo: &mut Memo) -> G
 
         LogicalPlanNodeKind::Values(node) => {
             let op = Operator::LogicalValues(LogicalValuesOp {
-                rows: node.rows.clone(),
+                rows: node
+                    .rows
+                    .iter()
+                    .map(|row| intern_exprs(&mut memo.scalars, row))
+                    .collect(),
                 columns: node.columns.clone(),
             });
             let expr = MExpr {
@@ -227,7 +244,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlanNode, memo: &mut Memo) -> G
             let child = logical_plan_to_memo(plan.unary_input(), memo);
             let op = Operator::LogicalTableFunction(LogicalTableFunctionOp {
                 function_name: node.function_name.clone(),
-                args: node.args.clone(),
+                args: intern_exprs(&mut memo.scalars, &node.args),
                 output_columns: node.output_columns.clone(),
                 alias: node.alias.clone(),
                 is_left_join: node.is_left_join,
@@ -243,7 +260,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlanNode, memo: &mut Memo) -> G
         LogicalPlanNodeKind::Window(node) => {
             let child = logical_plan_to_memo(plan.unary_input(), memo);
             let op = Operator::LogicalWindow(LogicalWindowOp {
-                window_exprs: node.window_exprs.clone(),
+                window_exprs: intern_window_exprs(&mut memo.scalars, &node.window_exprs),
                 output_columns: node.output_columns.clone(),
             });
             let expr = MExpr {

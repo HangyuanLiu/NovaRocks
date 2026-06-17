@@ -9,6 +9,7 @@ use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::memo::{GroupId, Memo};
 use crate::sql::optimizer::operator::{LogicalJoinOp, Operator};
 use crate::sql::optimizer::rewrite::rules::utils::{collect_column_id_refs, split_and};
+use crate::sql::optimizer::scalar::materialize;
 use crate::sql::optimizer::statistics::{Confidence, Statistics};
 
 use super::super::implement::get_group_column_ids;
@@ -87,7 +88,7 @@ fn collect_chain(
             collect_chain(memo, expr.children[0], atoms, predicates, chain_joins);
             collect_chain(memo, expr.children[1], atoms, predicates, chain_joins);
             if let Some(cond) = condition {
-                predicates.extend(split_and(cond.clone()));
+                predicates.extend(split_and(materialize(&memo.scalars, *cond)));
             }
         }
         Operator::LogicalFilter(f)
@@ -96,7 +97,7 @@ fn collect_chain(
             // Absorb a filter sitting directly on an inner/cross join. The filter
             // group itself is not a join (JoinAssociativity never matches it), so
             // only the join below it is recorded as a chain join.
-            predicates.extend(split_and(f.predicate.clone()));
+            predicates.extend(split_and(materialize(&memo.scalars, f.predicate)));
             collect_chain(memo, expr.children[0], atoms, predicates, chain_joins);
         }
         // Any other operator (incl. LogicalProject and outer/semi joins) is an

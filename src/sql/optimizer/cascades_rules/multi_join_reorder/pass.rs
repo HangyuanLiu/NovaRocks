@@ -102,7 +102,7 @@ fn reorder_chain(
         caps.enable_dp = false;
         caps.enable_greedy = false;
     }
-    for tree in enumerate_orders(&graph, caps) {
+    for tree in enumerate_orders(&graph, caps, &mut memo.scalars) {
         inject_candidate(memo, root, tree, table_stats);
     }
 }

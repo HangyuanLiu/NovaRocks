@@ -24,6 +24,7 @@
 
 use crate::sql::optimizer::property::OrderingSpec;
 use crate::sql::optimizer::property::{DistributionSpec, PhysicalPropertySet};
+use crate::sql::optimizer::scalar::ScalarArena;
 
 /// Output of a passthrough operator equals its single child's output.
 pub(crate) fn passthrough_output(children_outputs: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
@@ -68,6 +69,7 @@ macro_rules! passthrough_distribution_blind_impls {
             impl DeriveOutput for $op {
                 fn derive_output(
                     &self,
+                    _scalars: &ScalarArena,
                     children: &[&PhysicalPropertySet],
                 ) -> PhysicalPropertySet {
                     passthrough_output(children)
@@ -77,6 +79,7 @@ macro_rules! passthrough_distribution_blind_impls {
             impl DeriveRequired for $op {
                 fn derive_required(
                     &self,
+                    _scalars: &ScalarArena,
                     parent_required: &PhysicalPropertySet,
                     _n: usize,
                 ) -> Vec<PhysicalPropertySet> {
@@ -95,7 +98,11 @@ passthrough_distribution_blind_impls!(
 );
 
 impl DeriveOutput for PhysicalRepeatOp {
-    fn derive_output(&self, _children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
+    fn derive_output(
+        &self,
+        _scalars: &ScalarArena,
+        _children: &[&PhysicalPropertySet],
+    ) -> PhysicalPropertySet {
         // Repeat rewrites grouping-set keys by NULLing inactive rollup columns
         // and appending grouping-id slots. Any child hash partitioning on the
         // original keys is no longer valid for the repeated rows; a parent
@@ -107,6 +114,7 @@ impl DeriveOutput for PhysicalRepeatOp {
 impl DeriveRequired for PhysicalRepeatOp {
     fn derive_required(
         &self,
+        _scalars: &ScalarArena,
         _parent_required: &PhysicalPropertySet,
         _n: usize,
     ) -> Vec<PhysicalPropertySet> {
@@ -121,6 +129,7 @@ macro_rules! passthrough_full_impls {
             impl DeriveOutput for $op {
                 fn derive_output(
                     &self,
+                    _scalars: &ScalarArena,
                     children: &[&PhysicalPropertySet],
                 ) -> PhysicalPropertySet {
                     passthrough_output(children)
@@ -130,6 +139,7 @@ macro_rules! passthrough_full_impls {
             impl DeriveRequired for $op {
                 fn derive_required(
                     &self,
+                    _scalars: &ScalarArena,
                     parent_required: &PhysicalPropertySet,
                     _n: usize,
                 ) -> Vec<PhysicalPropertySet> {
@@ -141,7 +151,11 @@ macro_rules! passthrough_full_impls {
 }
 
 impl DeriveOutput for PhysicalLimitOp {
-    fn derive_output(&self, children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
+    fn derive_output(
+        &self,
+        _scalars: &ScalarArena,
+        children: &[&PhysicalPropertySet],
+    ) -> PhysicalPropertySet {
         PhysicalPropertySet {
             distribution: DistributionSpec::Gather,
             ordering: children
@@ -155,6 +169,7 @@ impl DeriveOutput for PhysicalLimitOp {
 impl DeriveRequired for PhysicalLimitOp {
     fn derive_required(
         &self,
+        _scalars: &ScalarArena,
         parent_required: &PhysicalPropertySet,
         _n: usize,
     ) -> Vec<PhysicalPropertySet> {

@@ -9,6 +9,7 @@ use crate::sql::optimizer::logical_props::{
 use crate::sql::optimizer::memo::{GroupId, LogicalProperties, MExpr, Memo};
 use crate::sql::optimizer::operator::{LogicalFilterOp, LogicalJoinOp, Operator};
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
+use crate::sql::optimizer::scalar::{intern_typed, materialize};
 use std::collections::{HashMap, HashSet};
 
 pub(crate) struct InnerJoinEquivalencePredicateRule;
@@ -51,7 +52,7 @@ impl Rule for InnerJoinEquivalencePredicateRule {
 
         let left_columns = columns_by_id(&left_props.output_columns);
         let right_columns = columns_by_id(&right_props.output_columns);
-        let mut literal_by_column = literal_equalities_from_join(join)
+        let mut literal_by_column = literal_equalities_from_join(memo, join)
             .into_iter()
             .chain(literal_equalities_from_group(memo, left_group))
             .chain(literal_equalities_from_group(memo, right_group))
@@ -59,10 +60,10 @@ impl Rule for InnerJoinEquivalencePredicateRule {
         expand_literals_with_equivalence(&left_props, &mut literal_by_column);
         expand_literals_with_equivalence(&right_props, &mut literal_by_column);
 
-        let join_literals = literal_equalities_from_join(join);
+        let join_literals = literal_equalities_from_join(memo, join);
         let mut left_new = Vec::new();
         let mut right_new = Vec::new();
-        for (raw_left, raw_right) in join_column_pairs(join) {
+        for (raw_left, raw_right) in join_column_pairs(memo, join) {
             let Some((left_id, right_id)) =
                 orient_pair(raw_left, raw_right, &left_columns, &right_columns)
             else {
@@ -147,18 +148,18 @@ fn expand_literals_with_equivalence(
     }
 }
 
-fn join_column_pairs(join: &LogicalJoinOp) -> Vec<(ColumnId, ColumnId)> {
+fn join_column_pairs(memo: &Memo, join: &LogicalJoinOp) -> Vec<(ColumnId, ColumnId)> {
     join.condition
         .as_ref()
-        .map(collect_column_equalities)
+        .map(|condition| collect_column_equalities(&materialize(&memo.scalars, *condition)))
         .unwrap_or_default()
 }
 
-fn literal_equalities_from_join(join: &LogicalJoinOp) -> Vec<(ColumnId, TypedExpr)> {
+fn literal_equalities_from_join(memo: &Memo, join: &LogicalJoinOp) -> Vec<(ColumnId, TypedExpr)> {
     join.condition
         .as_ref()
         .map(|condition| {
-            collect_literal_equalities(condition)
+            collect_literal_equalities(&materialize(&memo.scalars, *condition))
                 .into_iter()
                 .map(|eq| (eq.column_id, eq.literal))
                 .collect()
@@ -186,8 +187,9 @@ fn literal_equalities_from_group_inner(
     for expr in &group.logical_exprs {
         match &expr.op {
             Operator::LogicalFilter(filter) => {
+                let predicate = materialize(&memo.scalars, filter.predicate);
                 out.extend(
-                    collect_literal_equalities(&filter.predicate)
+                    collect_literal_equalities(&predicate)
                         .into_iter()
                         .map(|eq| (eq.column_id, eq.literal)),
                 );
@@ -197,8 +199,9 @@ fn literal_equalities_from_group_inner(
             }
             Operator::LogicalScan(scan) => {
                 for predicate in &scan.predicates {
+                    let predicate = materialize(&memo.scalars, *predicate);
                     out.extend(
-                        collect_literal_equalities(predicate)
+                        collect_literal_equalities(&predicate)
                             .into_iter()
                             .map(|eq| (eq.column_id, eq.literal)),
                     );
@@ -208,8 +211,9 @@ fn literal_equalities_from_group_inner(
                 if matches!(join.join_type, JoinKind::Inner | JoinKind::Cross) =>
             {
                 if let Some(condition) = &join.condition {
+                    let condition = materialize(&memo.scalars, *condition);
                     out.extend(
-                        collect_literal_equalities(condition)
+                        collect_literal_equalities(&condition)
                             .into_iter()
                             .map(|eq| (eq.column_id, eq.literal)),
                     );
@@ -277,6 +281,7 @@ fn literal_signature(expr: &TypedExpr) -> String {
 fn add_filter_group(memo: &mut Memo, child_group: GroupId, predicates: Vec<TypedExpr>) -> GroupId {
     let predicate =
         combine_with_and(predicates).expect("filter group needs at least one predicate");
+    let predicate = intern_typed(&mut memo.scalars, &predicate);
     let filter_expr = MExpr {
         id: memo.next_expr_id(),
         op: Operator::LogicalFilter(LogicalFilterOp { predicate }),

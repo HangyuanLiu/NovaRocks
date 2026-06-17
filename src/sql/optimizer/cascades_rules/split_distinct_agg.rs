@@ -15,6 +15,9 @@ use crate::sql::optimizer::operator::{
     AggMode, LogicalAggregateOp, Operator, PhysicalHashAggregateOp,
 };
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
+use crate::sql::optimizer::scalar_bridge::{
+    intern_aggregate_calls, intern_exprs, materialize_aggregate_calls, materialize_exprs,
+};
 use crate::sql::planner::plan::AggregateCall;
 
 use crate::sql::codegen::helpers::typed_expr_display_name;
@@ -40,6 +43,13 @@ impl Rule for SplitDistinctAgg {
         let Operator::LogicalAggregate(agg) = &expr.op else {
             return vec![];
         };
+        let group_by = materialize_exprs(&memo.scalars, &agg.group_by);
+        let aggregates = materialize_aggregate_calls(
+            &memo.scalars,
+            &agg.aggregates,
+            agg.group_by.len(),
+            &agg.output_columns,
+        );
 
         // Ordered aggregates need all order-by inputs available at the update
         // phase. The current split-distinct lowering only preserves the
@@ -47,24 +57,20 @@ impl Rule for SplitDistinctAgg {
         // aggregates like `array_agg(distinct x order by y)` lose `y` in the
         // GLOBAL phase. Fall back to the single-stage aggregate for semantic
         // correctness until multi-phase ordered DISTINCT is implemented.
-        if agg.aggregates.iter().any(|call| !call.order_by.is_empty()) {
+        if aggregates.iter().any(|call| !call.order_by.is_empty()) {
             return vec![];
         }
 
         // Validate single-DISTINCT-column precondition.
-        let distinct_col = match extract_single_distinct_col(&agg.aggregates) {
+        let distinct_col = match extract_single_distinct_col(&aggregates) {
             Some(c) => c,
             None => return vec![], // multi-column DISTINCT, or multiple different DISTINCT cols
         };
 
         // Partition aggregates into DISTINCT-bearing (which are deduped away at LOCAL)
         // and non-DISTINCT (which flow as merge states through the phases).
-        let non_distinct: Vec<AggregateCall> = agg
-            .aggregates
-            .iter()
-            .filter(|c| !c.distinct)
-            .cloned()
-            .collect();
+        let non_distinct: Vec<AggregateCall> =
+            aggregates.iter().filter(|c| !c.distinct).cloned().collect();
 
         // Stateful sketch/bitmap aggregates preserve null/empty-state semantics
         // across the current split-distinct phase boundaries poorly. Fall back
@@ -77,10 +83,18 @@ impl Rule for SplitDistinctAgg {
             return vec![];
         }
 
-        if agg.group_by.is_empty() {
-            apply_four_phase(expr, memo, agg, &distinct_col, &non_distinct)
+        if group_by.is_empty() {
+            apply_four_phase(expr, memo, agg, &aggregates, &distinct_col, &non_distinct)
         } else {
-            apply_three_phase(expr, memo, agg, &distinct_col, &non_distinct)
+            apply_three_phase(
+                expr,
+                memo,
+                agg,
+                &group_by,
+                &aggregates,
+                &distinct_col,
+                &non_distinct,
+            )
         }
     }
 }
@@ -148,11 +162,10 @@ fn split_distinct_sensitive_agg(name: &str) -> bool {
 }
 
 fn distinct_aggregate_calls(
-    agg: &LogicalAggregateOp,
+    aggregates: &[AggregateCall],
     distinct_col: &TypedExpr,
 ) -> Vec<AggregateCall> {
-    let distinct_aggs: Vec<AggregateCall> = agg
-        .aggregates
+    let distinct_aggs: Vec<AggregateCall> = aggregates
         .iter()
         .filter(|call| call.distinct)
         .cloned()
@@ -224,11 +237,13 @@ fn apply_three_phase(
     expr: &MExpr,
     memo: &mut Memo,
     agg: &LogicalAggregateOp,
+    group_by: &[TypedExpr],
+    aggregates: &[AggregateCall],
     distinct_col: &TypedExpr,
     non_distinct: &[AggregateCall],
 ) -> Vec<NewExpr> {
     // Group-by for LOCAL and DISTINCT_GLOBAL: original group_by + distinct_col.
-    let mut gb_with_distinct = agg.group_by.clone();
+    let mut gb_with_distinct = group_by.to_vec();
     gb_with_distinct.push(distinct_col.clone());
     // Reuse the original aggregate's group output ids (real ids even for
     // non-ColumnRef group keys such as `group by 1+1`); the distinct column is a
@@ -275,8 +290,8 @@ fn apply_three_phase(
         id: local_id,
         op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
             mode: AggMode::Local,
-            group_by: gb_with_distinct,
-            aggregates: non_distinct.to_vec(),
+            group_by: intern_exprs(&mut memo.scalars, &gb_with_distinct),
+            aggregates: intern_aggregate_calls(&mut memo.scalars, non_distinct),
             output_columns: gb_with_distinct_outputs.clone(),
             is_merge: vec![false; non_distinct.len()],
         }),
@@ -298,8 +313,8 @@ fn apply_three_phase(
         id: dg_id,
         op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
             mode: AggMode::DistinctGlobal,
-            group_by: dg_group_by,
-            aggregates: non_distinct.to_vec(),
+            group_by: intern_exprs(&mut memo.scalars, &dg_group_by),
+            aggregates: intern_aggregate_calls(&mut memo.scalars, non_distinct),
             output_columns: gb_with_distinct_outputs.clone(),
             is_merge: vec![true; non_distinct.len()],
         }),
@@ -315,7 +330,7 @@ fn apply_three_phase(
     // non-DISTINCT merge calls immediately after the first DISTINCT call: the
     // fragment builder maps merge inputs by aggregate index and this ordering
     // aligns them with the DISTINCT_GLOBAL output slots.
-    let distinct_aggs: Vec<AggregateCall> = distinct_aggregate_calls(agg, distinct_col)
+    let distinct_aggs: Vec<AggregateCall> = distinct_aggregate_calls(aggregates, distinct_col)
         .into_iter()
         .map(|call| rebind_distinct_arg_to_phase_output(call, &distinct_phase_arg))
         .collect();
@@ -337,8 +352,11 @@ fn apply_three_phase(
             // Reference DISTINCT_GLOBAL's original group outputs (drop the
             // trailing distinct column), not the raw group expressions which
             // reference child columns no longer produced below the GLOBAL phase.
-            group_by: aggregate_group_key_output_ref(&gb_with_distinct_outputs, agg.group_by.len()),
-            aggregates: global_aggs,
+            group_by: intern_exprs(
+                &mut memo.scalars,
+                &aggregate_group_key_output_ref(&gb_with_distinct_outputs, group_by.len()),
+            ),
+            aggregates: intern_aggregate_calls(&mut memo.scalars, &global_aggs),
             output_columns: agg.output_columns.clone(),
             is_merge: global_merge,
         }),
@@ -350,6 +368,7 @@ fn apply_four_phase(
     expr: &MExpr,
     memo: &mut Memo,
     agg: &crate::sql::optimizer::operator::LogicalAggregateOp,
+    aggregates: &[AggregateCall],
     distinct_col: &TypedExpr,
     non_distinct: &[AggregateCall],
 ) -> Vec<NewExpr> {
@@ -367,8 +386,8 @@ fn apply_four_phase(
         id: local_id,
         op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
             mode: AggMode::Local,
-            group_by: vec![distinct_col.clone()],
-            aggregates: non_distinct.to_vec(),
+            group_by: intern_exprs(&mut memo.scalars, std::slice::from_ref(distinct_col)),
+            aggregates: intern_aggregate_calls(&mut memo.scalars, non_distinct),
             output_columns: distinct_group_outputs.clone(),
             is_merge: vec![false; non_distinct.len()],
         }),
@@ -382,8 +401,8 @@ fn apply_four_phase(
         id: dg_id,
         op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
             mode: AggMode::DistinctGlobal,
-            group_by: distinct_group_by,
-            aggregates: non_distinct.to_vec(),
+            group_by: intern_exprs(&mut memo.scalars, &distinct_group_by),
+            aggregates: intern_aggregate_calls(&mut memo.scalars, non_distinct),
             output_columns: distinct_group_outputs.clone(),
             is_merge: vec![true; non_distinct.len()],
         }),
@@ -398,7 +417,7 @@ fn apply_four_phase(
     //
     // Use the original distinct aggregate calls so their display names match
     // what the PROJECT node expects.
-    let distinct_aggs: Vec<AggregateCall> = distinct_aggregate_calls(agg, distinct_col)
+    let distinct_aggs: Vec<AggregateCall> = distinct_aggregate_calls(aggregates, distinct_col)
         .into_iter()
         .map(|call| rebind_distinct_arg_to_phase_output(call, &distinct_phase_arg))
         .collect();
@@ -421,7 +440,7 @@ fn apply_four_phase(
         op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
             mode: AggMode::DistinctLocal,
             group_by: vec![],
-            aggregates: phase_aggs.clone(),
+            aggregates: intern_aggregate_calls(&mut memo.scalars, &phase_aggs),
             output_columns: vec![],
             is_merge: dl_merge,
         }),
@@ -443,7 +462,7 @@ fn apply_four_phase(
         op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
             mode: AggMode::Global,
             group_by: vec![],
-            aggregates: phase_aggs,
+            aggregates: intern_aggregate_calls(&mut memo.scalars, &phase_aggs),
             output_columns: agg.output_columns.clone(),
             is_merge: global_merge,
         }),

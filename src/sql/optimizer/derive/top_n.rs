@@ -6,6 +6,8 @@ use crate::sql::optimizer::operator::{PhysicalTopNOp, TopNPhase};
 use crate::sql::optimizer::property::{
     DistributionSpec, OrderingSpec, PhysicalPropertySet, SortKey,
 };
+use crate::sql::optimizer::scalar::ScalarArena;
+use crate::sql::optimizer::scalar_bridge::materialize_sort_keys;
 
 use super::{DeriveOutput, DeriveRequired};
 
@@ -17,9 +19,13 @@ fn typed_expr_to_column_id(expr: &TypedExpr) -> Option<ColumnId> {
 }
 
 impl DeriveOutput for PhysicalTopNOp {
-    fn derive_output(&self, _children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
-        let sort_keys: Vec<SortKey> = self
-            .items
+    fn derive_output(
+        &self,
+        scalars: &ScalarArena,
+        _children: &[&PhysicalPropertySet],
+    ) -> PhysicalPropertySet {
+        let items = materialize_sort_keys(scalars, &self.items);
+        let sort_keys: Vec<SortKey> = items
             .iter()
             .filter_map(|item| {
                 typed_expr_to_column_id(&item.expr).map(|col| SortKey {
@@ -48,6 +54,7 @@ impl DeriveOutput for PhysicalTopNOp {
 impl DeriveRequired for PhysicalTopNOp {
     fn derive_required(
         &self,
+        _scalars: &ScalarArena,
         _parent: &PhysicalPropertySet,
         _n: usize,
     ) -> Vec<PhysicalPropertySet> {

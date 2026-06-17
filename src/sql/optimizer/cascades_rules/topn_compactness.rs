@@ -3,6 +3,9 @@ use crate::sql::optimizer::memo::{MExpr, Memo};
 use crate::sql::optimizer::operator::{LogicalTopNOp, Operator, TopNPhase};
 use crate::sql::optimizer::property::typed_expr_to_column_id;
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
+use crate::sql::optimizer::scalar_bridge::{
+    intern_sort_items, materialize_project_items, materialize_sort_keys,
+};
 use crate::sql::optimizer::topn_proof::{
     ScanTopNCapability, TopNWindow, default_scan_topn_capability, ordering_covers,
     remap_sort_items_through_project, sort_items_to_keys, sort_keys_equivalent,
@@ -185,10 +188,12 @@ fn merge_consecutive_topn(expr: &MExpr, memo: &Memo) -> Vec<NewExpr> {
             continue;
         }
 
-        let Some(outer_keys) = sort_items_to_keys(&outer.items) else {
+        let outer_items = materialize_sort_keys(&memo.scalars, &outer.items);
+        let Some(outer_keys) = sort_items_to_keys(&outer_items) else {
             continue;
         };
-        let Some(inner_keys) = sort_items_to_keys(&inner.items) else {
+        let inner_items = materialize_sort_keys(&memo.scalars, &inner.items);
+        let Some(inner_keys) = sort_items_to_keys(&inner_items) else {
             continue;
         };
         let inner_child_group_id = child_expr.children[0];
@@ -216,7 +221,8 @@ fn remove_redundant_sort_under_topn(expr: &MExpr, memo: &Memo) -> Vec<NewExpr> {
     if expr.children.len() != 1 {
         return vec![];
     }
-    let Some(topn_keys) = sort_items_to_keys(&topn.items) else {
+    let topn_items = materialize_sort_keys(&memo.scalars, &topn.items);
+    let Some(topn_keys) = sort_items_to_keys(&topn_items) else {
         return vec![];
     };
     let Some(child_group) = memo.groups.get(expr.children[0]) else {
@@ -238,7 +244,8 @@ fn remove_redundant_sort_under_topn(expr: &MExpr, memo: &Memo) -> Vec<NewExpr> {
         if child_expr.children.len() != 1 {
             continue;
         }
-        let Some(sort_keys) = sort_items_to_keys(&sort.items) else {
+        let sort_items = materialize_sort_keys(&memo.scalars, &sort.items);
+        let Some(sort_keys) = sort_items_to_keys(&sort_items) else {
             continue;
         };
         if !ordering_covers(&sort_keys, &topn_keys, equivalences) {
@@ -276,10 +283,13 @@ fn push_topn_through_project(expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
         if project_expr.children.len() != 1 {
             continue;
         }
-        let Some(remapped_items) = remap_sort_items_through_project(&topn.items, &project.items)
+        let topn_items = materialize_sort_keys(&memo.scalars, &topn.items);
+        let project_items = materialize_project_items(&memo.scalars, &project.items);
+        let Some(remapped_items) = remap_sort_items_through_project(&topn_items, &project_items)
         else {
             continue;
         };
+        let remapped_items = intern_sort_items(&mut memo.scalars, &remapped_items);
 
         let pushed_op = Operator::LogicalTopN(LogicalTopNOp {
             items: remapped_items,
@@ -427,8 +437,9 @@ fn build_union_branch_topn_ops(
     branch_limit: i64,
     union: &crate::sql::optimizer::operator::LogicalUnionOp,
     branch_groups: &[usize],
-    memo: &Memo,
+    memo: &mut Memo,
 ) -> Option<Vec<LogicalTopNOp>> {
+    let topn_items = materialize_sort_keys(&memo.scalars, &topn.items);
     branch_groups
         .iter()
         .map(|branch_group| {
@@ -438,11 +449,14 @@ fn build_union_branch_topn_ops(
                 .logical_props
                 .as_ref()?
                 .output_columns
-                .as_slice();
-            let items =
-                remap_sort_items_through_union(&topn.items, &union.output_columns, branch_outputs)?;
+                .clone();
+            let items = remap_sort_items_through_union(
+                &topn_items,
+                &union.output_columns,
+                &branch_outputs,
+            )?;
             Some(LogicalTopNOp {
-                items,
+                items: intern_sort_items(&mut memo.scalars, &items),
                 limit: Some(branch_limit),
                 offset: Some(0),
                 phase: topn.phase,

@@ -10,7 +10,8 @@ use super::operator::{JoinDistribution, Operator, PhysicalDistributionOp, Physic
 use super::physical_plan::{JoinExecutionDistribution, PhysicalPlanNode, PlanExecutionProps};
 use super::property::{OrderingSpec, PhysicalPropertySet};
 use super::search::{EnforcerKind, Winner};
-use crate::sql::analysis::{ExprKind, SortItem, TypedExpr};
+use crate::sql::optimizer::scalar::{ScalarArena, SortKey};
+use crate::sql::optimizer::scalar_bridge::intern_column_sort_key;
 use crate::sql::optimizer::statistics::Statistics;
 
 /// Extract the best physical plan tree from the Memo.
@@ -21,7 +22,7 @@ use crate::sql::optimizer::statistics::Statistics;
 /// Otherwise, the winner's physical expression is used directly with children
 /// extracted according to the child properties recorded by search.
 pub(crate) fn extract_best(
-    memo: &Memo,
+    memo: &mut Memo,
     root_group: GroupId,
     required: &PhysicalPropertySet,
     winners: &HashMap<(GroupId, PhysicalPropertySet), Winner>,
@@ -41,26 +42,33 @@ pub(crate) fn extract_best(
         ));
     }
 
-    let group = &memo.groups[root_group];
-    let group_stats = group_statistics(group);
-    let output_columns = group
-        .logical_props
-        .as_ref()
-        .map(|lp| lp.output_columns.clone())
-        .unwrap_or_default();
+    let (group_stats, output_columns, expr) = {
+        let group = &memo.groups[root_group];
+        let group_stats = group_statistics(group);
+        let output_columns = group
+            .logical_props
+            .as_ref()
+            .map(|lp| lp.output_columns.clone())
+            .unwrap_or_default();
 
-    // Extract the underlying physical expression (the winner's expr_index).
-    // After G3, the new search loop optimises children with `child_reqs` derived
-    // from (op, required) directly — i.e. there is no separate cached winner
-    // for (group, provided). The enforcer, if present, simply wraps this node.
-    let expr = group.physical_exprs.get(winner.expr_index).ok_or_else(|| {
-        format!(
-            "winner expr_index {} out of bounds for group {} (has {} physical exprs)",
-            winner.expr_index,
-            root_group,
-            group.physical_exprs.len()
-        )
-    })?;
+        // Extract the underlying physical expression (the winner's expr_index).
+        // After G3, the new search loop optimises children with `child_reqs` derived
+        // from (op, required) directly — i.e. there is no separate cached winner
+        // for (group, provided). The enforcer, if present, simply wraps this node.
+        let expr = group
+            .physical_exprs
+            .get(winner.expr_index)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "winner expr_index {} out of bounds for group {} (has {} physical exprs)",
+                    winner.expr_index,
+                    root_group,
+                    group.physical_exprs.len()
+                )
+            })?;
+        (group_stats, output_columns, expr)
+    };
 
     let child_reqs = winner.child_props.clone();
     if child_reqs.len() != expr.children.len() {
@@ -126,7 +134,7 @@ pub(crate) fn extract_best(
                 Operator::PhysicalDistribution(PhysicalDistributionOp { spec: spec.clone() })
             }
             EnforcerKind::Sort(ordering) => {
-                let items = ordering_spec_to_sort_items(ordering);
+                let items = ordering_spec_to_sort_keys(&mut memo.scalars, ordering);
                 // Sort enforcers inserted by the property-derivation pass are
                 // pure ORDER BY enforcers, not analytic precursor sorts —
                 // those come from `WindowToPhysical`. Leave the analytic
@@ -175,25 +183,13 @@ fn group_statistics(group: &super::memo::Group) -> Statistics {
     }
 }
 
-/// Convert an `OrderingSpec` to `Vec<SortItem>` for the enforcer PhysicalSort node.
-fn ordering_spec_to_sort_items(ordering: &OrderingSpec) -> Vec<SortItem> {
+/// Convert an `OrderingSpec` to scalar sort keys for the enforcer PhysicalSort node.
+fn ordering_spec_to_sort_keys(arena: &mut ScalarArena, ordering: &OrderingSpec) -> Vec<SortKey> {
     match ordering {
         OrderingSpec::Any => vec![],
         OrderingSpec::Required(sort_keys) => sort_keys
             .iter()
-            .map(|sk| SortItem {
-                expr: TypedExpr {
-                    kind: ExprKind::ColumnRef {
-                        column_id: sk.column,
-                        qualifier: None,
-                        column: format!("{}", sk.column),
-                    },
-                    data_type: arrow::datatypes::DataType::Null,
-                    nullable: true,
-                },
-                asc: sk.asc,
-                nulls_first: sk.nulls_first,
-            })
+            .map(|sk| intern_column_sort_key(arena, sk))
             .collect(),
     }
 }

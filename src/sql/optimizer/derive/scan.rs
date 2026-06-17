@@ -5,11 +5,16 @@ use crate::sql::optimizer::operator::{
     PhysicalCTEConsumeOp, PhysicalGenerateSeriesOp, PhysicalScanOp, PhysicalValuesOp,
 };
 use crate::sql::optimizer::property::PhysicalPropertySet;
+use crate::sql::optimizer::scalar::ScalarArena;
 
 use super::{DeriveOutput, DeriveRequired};
 
 impl DeriveOutput for PhysicalScanOp {
-    fn derive_output(&self, _children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
+    fn derive_output(
+        &self,
+        _scalars: &ScalarArena,
+        _children: &[&PhysicalPropertySet],
+    ) -> PhysicalPropertySet {
         PhysicalPropertySet::any()
     }
 }
@@ -17,6 +22,7 @@ impl DeriveOutput for PhysicalScanOp {
 impl DeriveRequired for PhysicalScanOp {
     fn derive_required(
         &self,
+        _scalars: &ScalarArena,
         _parent: &PhysicalPropertySet,
         _n: usize,
     ) -> Vec<PhysicalPropertySet> {
@@ -25,7 +31,11 @@ impl DeriveRequired for PhysicalScanOp {
 }
 
 impl DeriveOutput for PhysicalValuesOp {
-    fn derive_output(&self, _children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
+    fn derive_output(
+        &self,
+        _scalars: &ScalarArena,
+        _children: &[&PhysicalPropertySet],
+    ) -> PhysicalPropertySet {
         PhysicalPropertySet::any()
     }
 }
@@ -33,6 +43,7 @@ impl DeriveOutput for PhysicalValuesOp {
 impl DeriveRequired for PhysicalValuesOp {
     fn derive_required(
         &self,
+        _scalars: &ScalarArena,
         _parent: &PhysicalPropertySet,
         _n: usize,
     ) -> Vec<PhysicalPropertySet> {
@@ -41,7 +52,11 @@ impl DeriveRequired for PhysicalValuesOp {
 }
 
 impl DeriveOutput for PhysicalGenerateSeriesOp {
-    fn derive_output(&self, _children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
+    fn derive_output(
+        &self,
+        _scalars: &ScalarArena,
+        _children: &[&PhysicalPropertySet],
+    ) -> PhysicalPropertySet {
         PhysicalPropertySet::any()
     }
 }
@@ -49,6 +64,7 @@ impl DeriveOutput for PhysicalGenerateSeriesOp {
 impl DeriveRequired for PhysicalGenerateSeriesOp {
     fn derive_required(
         &self,
+        _scalars: &ScalarArena,
         _parent: &PhysicalPropertySet,
         _n: usize,
     ) -> Vec<PhysicalPropertySet> {
@@ -57,7 +73,11 @@ impl DeriveRequired for PhysicalGenerateSeriesOp {
 }
 
 impl DeriveOutput for PhysicalCTEConsumeOp {
-    fn derive_output(&self, _children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
+    fn derive_output(
+        &self,
+        _scalars: &ScalarArena,
+        _children: &[&PhysicalPropertySet],
+    ) -> PhysicalPropertySet {
         PhysicalPropertySet::any()
     }
 }
@@ -65,6 +85,7 @@ impl DeriveOutput for PhysicalCTEConsumeOp {
 impl DeriveRequired for PhysicalCTEConsumeOp {
     fn derive_required(
         &self,
+        _scalars: &ScalarArena,
         _parent: &PhysicalPropertySet,
         _n: usize,
     ) -> Vec<PhysicalPropertySet> {

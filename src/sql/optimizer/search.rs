@@ -127,6 +127,7 @@ impl SearchContext {
 
             let alternatives = super::derive::derive_required_alternatives(
                 &expr.op,
+                &memo.scalars,
                 required,
                 expr.children.len(),
             );
@@ -206,6 +207,7 @@ impl SearchContext {
                 let total = own_cost + child_cost_total;
                 let provided = super::derive::derive_output_for_alternative(
                     &expr.op,
+                    &memo.scalars,
                     &child_output_refs,
                     &alt.kind,
                 );
@@ -1113,6 +1115,7 @@ mod cascaded_derivation_tests {
         assert_eq!(window_expr.children.as_slice(), &[g_bj]);
         let bj_req = crate::sql::optimizer::derive::derive_required(
             &window_expr.op,
+            &memo.scalars,
             &PhysicalPropertySet::any(),
             1,
         )

@@ -6,6 +6,9 @@ use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::memo::{MExpr, Memo};
 use crate::sql::optimizer::operator::{AggStage, LogicalAggregateOp, Operator};
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
+use crate::sql::optimizer::scalar_bridge::{
+    intern_exprs, materialize_aggregate_calls, materialize_exprs,
+};
 use crate::sql::planner::plan::AggregateCall;
 
 pub(crate) struct SplitAggregateRule;
@@ -27,13 +30,21 @@ impl Rule for SplitAggregateRule {
         let Operator::LogicalAggregate(agg) = &expr.op else {
             return Vec::new();
         };
-        if !is_eligible(agg) {
+        let group_by = materialize_exprs(&memo.scalars, &agg.group_by);
+        let aggregates = materialize_aggregate_calls(
+            &memo.scalars,
+            &agg.aggregates,
+            agg.group_by.len(),
+            &agg.output_columns,
+        );
+        if !is_eligible(agg, &aggregates) {
             return Vec::new();
         }
 
-        let local_output_columns = local_output_columns(agg);
-        let local_group_by =
+        let local_output_columns = local_output_columns(agg, &group_by, &aggregates);
+        let local_group_by_typed =
             aggregate_group_key_output_ref(&local_output_columns, agg.group_by.len());
+        let local_group_by = intern_exprs(&mut memo.scalars, &local_group_by_typed);
         let local = LogicalAggregateOp::staged(
             AggStage::Local,
             agg.group_by.clone(),
@@ -68,12 +79,12 @@ impl Rule for SplitAggregateRule {
     }
 }
 
-fn is_eligible(agg: &LogicalAggregateOp) -> bool {
+fn is_eligible(agg: &LogicalAggregateOp, aggregates: &[AggregateCall]) -> bool {
     agg.stage == AggStage::Single
         && !agg.is_split
         && agg.is_merge.iter().all(|flag| !*flag)
         && (!agg.aggregates.is_empty() || !agg.group_by.is_empty())
-        && agg.aggregates.iter().all(is_splittable_aggregate)
+        && aggregates.iter().all(is_splittable_aggregate)
 }
 
 fn is_splittable_aggregate(call: &AggregateCall) -> bool {
@@ -81,9 +92,13 @@ fn is_splittable_aggregate(call: &AggregateCall) -> bool {
     aggregate_mergeability(call) == AggMergeability::TwoPhase
 }
 
-fn local_output_columns(agg: &LogicalAggregateOp) -> Vec<OutputColumn> {
+fn local_output_columns(
+    agg: &LogicalAggregateOp,
+    group_by: &[TypedExpr],
+    aggregates: &[AggregateCall],
+) -> Vec<OutputColumn> {
     let mut columns = Vec::with_capacity(agg.group_by.len() + agg.aggregates.len());
-    columns.extend(agg.group_by.iter().enumerate().map(|(idx, expr)| {
+    columns.extend(group_by.iter().enumerate().map(|(idx, expr)| {
         let name = typed_expr_display_name(expr);
         // Non-ColumnRef group keys (constant/alias/expression, e.g. `'a' as g`)
         // reuse the original aggregate's group output id *by position* (the
@@ -108,7 +123,7 @@ fn local_output_columns(agg: &LogicalAggregateOp) -> Vec<OutputColumn> {
             is_internal: false,
         }
     }));
-    columns.extend(agg.aggregates.iter().map(|call| {
+    columns.extend(aggregates.iter().map(|call| {
         let name = agg_call_display_name(call);
         OutputColumn {
             column_id: aggregate_output_column_id(call, &name, &agg.output_columns),

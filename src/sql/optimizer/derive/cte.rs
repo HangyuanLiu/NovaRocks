@@ -5,11 +5,16 @@
 
 use crate::sql::optimizer::operator::PhysicalCTEAnchorOp;
 use crate::sql::optimizer::property::PhysicalPropertySet;
+use crate::sql::optimizer::scalar::ScalarArena;
 
 use super::{DeriveOutput, DeriveRequired};
 
 impl DeriveOutput for PhysicalCTEAnchorOp {
-    fn derive_output(&self, _children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
+    fn derive_output(
+        &self,
+        _scalars: &ScalarArena,
+        _children: &[&PhysicalPropertySet],
+    ) -> PhysicalPropertySet {
         PhysicalPropertySet::any()
     }
 }
@@ -17,6 +22,7 @@ impl DeriveOutput for PhysicalCTEAnchorOp {
 impl DeriveRequired for PhysicalCTEAnchorOp {
     fn derive_required(
         &self,
+        _scalars: &ScalarArena,
         _parent: &PhysicalPropertySet,
         _n: usize,
     ) -> Vec<PhysicalPropertySet> {

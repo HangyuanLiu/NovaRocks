@@ -5,6 +5,7 @@ use crate::sql::analysis::TypedExpr;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::{AggMode, PhysicalHashAggregateOp};
 use crate::sql::optimizer::property::{DistributionSpec, OrderingSpec, PhysicalPropertySet};
+use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, materialize};
 
 use super::{DeriveOutput, DeriveRequired};
 
@@ -14,12 +15,19 @@ fn typed_expr_to_column_id(expr: &TypedExpr) -> Option<ColumnId> {
         _ => None,
     }
 }
-fn typed_exprs_to_column_ids(exprs: &[TypedExpr]) -> Vec<ColumnId> {
-    exprs.iter().filter_map(typed_expr_to_column_id).collect()
+fn scalar_exprs_to_column_ids(arena: &ScalarArena, exprs: &[ScalarId]) -> Vec<ColumnId> {
+    exprs
+        .iter()
+        .filter_map(|expr| typed_expr_to_column_id(&materialize(arena, *expr)))
+        .collect()
 }
 
 impl DeriveOutput for PhysicalHashAggregateOp {
-    fn derive_output(&self, _children: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
+    fn derive_output(
+        &self,
+        _scalars: &ScalarArena,
+        _children: &[&PhysicalPropertySet],
+    ) -> PhysicalPropertySet {
         match self.mode {
             AggMode::Local | AggMode::DistinctLocal => return PhysicalPropertySet::any(),
             AggMode::Single => return PhysicalPropertySet::gather(),
@@ -54,6 +62,7 @@ impl DeriveOutput for PhysicalHashAggregateOp {
 impl DeriveRequired for PhysicalHashAggregateOp {
     fn derive_required(
         &self,
+        scalars: &ScalarArena,
         _parent: &PhysicalPropertySet,
         _n: usize,
     ) -> Vec<PhysicalPropertySet> {
@@ -63,7 +72,7 @@ impl DeriveRequired for PhysicalHashAggregateOp {
             }
             AggMode::Local => vec![PhysicalPropertySet::any()],
             AggMode::Global => {
-                let cols = typed_exprs_to_column_ids(&self.group_by);
+                let cols = scalar_exprs_to_column_ids(scalars, &self.group_by);
                 if cols.is_empty() {
                     vec![PhysicalPropertySet::gather()]
                 } else {
@@ -74,7 +83,7 @@ impl DeriveRequired for PhysicalHashAggregateOp {
                 }
             }
             AggMode::DistinctGlobal => {
-                let cols = typed_exprs_to_column_ids(&self.group_by);
+                let cols = scalar_exprs_to_column_ids(scalars, &self.group_by);
                 if cols.is_empty() {
                     vec![PhysicalPropertySet::gather()]
                 } else {

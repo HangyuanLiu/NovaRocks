@@ -10,6 +10,7 @@ use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::{JoinDistribution, Operator, PhysicalHashJoinEqCondition};
 use crate::sql::optimizer::options::OptimizerOptions;
 use crate::sql::optimizer::physical_plan::{JoinExecutionDistribution, PhysicalPlanNode};
+use crate::sql::optimizer::scalar::{ScalarArena, materialize};
 use std::collections::HashSet;
 
 /// The optimizer-layer name used by `SET disable_optimizer_rules`.
@@ -67,12 +68,16 @@ impl RuntimeFilterProbe {
 ///
 /// Returns immediately if the rule is disabled via
 /// `SET disable_optimizer_rules = 'RuntimeFilterPushDown'`.
-pub(crate) fn annotate(root: &mut PhysicalPlanNode, options: &OptimizerOptions) {
+pub(crate) fn annotate(
+    root: &mut PhysicalPlanNode,
+    scalars: &ScalarArena,
+    options: &OptimizerOptions,
+) {
     if !options.is_enabled(RUNTIME_FILTER_RULE) {
         return;
     }
     let mut next_filter_id: i32 = 0;
-    annotate_node(root, &mut next_filter_id, options);
+    annotate_node(root, scalars, &mut next_filter_id, options);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -253,23 +258,26 @@ struct OrientedRfKey {
 
 fn orient_rf_key(
     node: &PhysicalPlanNode,
+    scalars: &ScalarArena,
     sides: JoinRfSides,
     expr_order: usize,
     eq: &PhysicalHashJoinEqCondition,
 ) -> Option<OrientedRfKey> {
-    let left_child = expr_bound_child(node, &eq.left)?;
-    let right_child = expr_bound_child(node, &eq.right)?;
+    let left = materialize(scalars, eq.left);
+    let right = materialize(scalars, eq.right);
+    let left_child = expr_bound_child(node, &left)?;
+    let right_child = expr_bound_child(node, &right)?;
 
     if left_child == sides.probe_child && right_child == sides.build_child {
         Some(OrientedRfKey {
-            build_expr: eq.right.clone(),
-            probe_expr: eq.left.clone(),
+            build_expr: right,
+            probe_expr: left,
             expr_order,
         })
     } else if left_child == sides.build_child && right_child == sides.probe_child {
         Some(OrientedRfKey {
-            build_expr: eq.left.clone(),
-            probe_expr: eq.right.clone(),
+            build_expr: left,
+            probe_expr: right,
             expr_order,
         })
     } else {
@@ -277,8 +285,8 @@ fn orient_rf_key(
     }
 }
 
-fn rf_key_types_match(eq: &PhysicalHashJoinEqCondition) -> bool {
-    eq.left.data_type == eq.right.data_type
+fn rf_key_types_match(scalars: &ScalarArena, eq: &PhysicalHashJoinEqCondition) -> bool {
+    scalars.data_type(eq.left) == scalars.data_type(eq.right)
 }
 
 /// Returns true if `node` outputs every column id referenced by `probe_expr`.
@@ -429,12 +437,13 @@ fn join_distribution_for_runtime_filter(
 /// Recursive tree walk: post-order so that nested joins get distinct filter ids.
 fn annotate_node(
     node: &mut PhysicalPlanNode,
+    scalars: &ScalarArena,
     next_filter_id: &mut i32,
     options: &OptimizerOptions,
 ) {
     // Recurse into children first (post-order).
     for child in &mut node.children {
-        annotate_node(child, next_filter_id, options);
+        annotate_node(child, scalars, next_filter_id, options);
     }
 
     // Clone the data we need from the join before borrowing children mutably.
@@ -476,14 +485,14 @@ fn annotate_node(
         if eq.null_safe {
             continue;
         }
-        if !rf_key_types_match(eq) {
+        if !rf_key_types_match(scalars, eq) {
             continue;
         }
         // Probe gate: skip this equi-conjunct if it would not reduce probe rows enough.
         if !probe_gate_passes(local, build_size, probe_size, build_min, probe_min, min_sel) {
             continue;
         }
-        let Some(oriented) = orient_rf_key(node, sides, expr_order, eq) else {
+        let Some(oriented) = orient_rf_key(node, scalars, sides, expr_order, eq) else {
             continue;
         };
         if (*next_filter_id as usize) >= options.rf_max_count {

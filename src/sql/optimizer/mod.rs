@@ -17,6 +17,7 @@ pub(crate) mod rewrite;
 pub(crate) mod rule;
 pub(crate) mod runtime_filter_pass;
 pub(crate) mod scalar;
+pub(crate) mod scalar_bridge;
 pub(crate) mod search;
 pub(crate) mod statistics;
 pub(crate) mod stats;
@@ -203,10 +204,10 @@ fn optimize_with_root_property(
     check_deadline(deadline)?;
 
     // 11. Extract best plan.
-    let mut physical = extract::extract_best(&memo, root_group, &root_required, &ctx.winners)?;
+    let mut physical = extract::extract_best(&mut memo, root_group, &root_required, &ctx.winners)?;
 
     // 12. Annotate physical plan with runtime filter descriptors.
-    runtime_filter_pass::annotate(&mut physical, &options);
+    runtime_filter_pass::annotate(&mut physical, &memo.scalars, &options);
 
     Ok(physical)
 }

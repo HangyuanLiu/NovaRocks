@@ -8,6 +8,7 @@ use super::property::ColumnIdSet;
 use super::statistics::{ColumnStatistic, Confidence};
 use crate::sql::analysis::{BinOp, ExprKind, JoinKind, OutputColumn, TypedExpr};
 use crate::sql::column_id::ColumnId;
+use crate::sql::optimizer::scalar::materialize;
 use arrow::datatypes::DataType;
 
 pub(crate) fn derive_for_group(
@@ -52,13 +53,15 @@ pub(crate) fn derive_for_expr(
     match &expr.op {
         Operator::LogicalFilter(filter) => {
             inherit_from_child(memo, expr, 0, &output_ids, &mut props);
-            for (left, right) in collect_column_equalities(&filter.predicate) {
+            let predicate = materialize(&memo.scalars, filter.predicate);
+            for (left, right) in collect_column_equalities(&predicate) {
                 props.equivalence_classes.merge_pair(left, right);
             }
         }
         Operator::PhysicalFilter(filter) => {
             inherit_from_child(memo, expr, 0, &output_ids, &mut props);
-            for (left, right) in collect_column_equalities(&filter.predicate) {
+            let predicate = materialize(&memo.scalars, filter.predicate);
+            for (left, right) in collect_column_equalities(&predicate) {
                 props.equivalence_classes.merge_pair(left, right);
             }
         }
@@ -67,7 +70,8 @@ pub(crate) fn derive_for_expr(
                 inherit_from_child(memo, expr, 0, &output_ids, &mut props);
                 inherit_from_child(memo, expr, 1, &output_ids, &mut props);
                 if let Some(condition) = &join.condition {
-                    for (left, right) in collect_column_equalities(condition) {
+                    let condition = materialize(&memo.scalars, *condition);
+                    for (left, right) in collect_column_equalities(&condition) {
                         props.equivalence_classes.merge_pair(left, right);
                     }
                 }
@@ -79,15 +83,18 @@ pub(crate) fn derive_for_expr(
                 inherit_from_child(memo, expr, 0, &output_ids, &mut props);
                 inherit_from_child(memo, expr, 1, &output_ids, &mut props);
                 for eq in &join.eq_conditions {
+                    let left_expr = materialize(&memo.scalars, eq.left);
+                    let right_expr = materialize(&memo.scalars, eq.right);
                     if let (Some(left), Some(right)) = (
-                        column_id_from_expr(&eq.left),
-                        column_id_from_expr(&eq.right),
+                        column_id_from_expr(&left_expr),
+                        column_id_from_expr(&right_expr),
                     ) {
                         props.equivalence_classes.merge_pair(left, right);
                     }
                 }
                 if let Some(condition) = &join.other_condition {
-                    for (left, right) in collect_column_equalities(condition) {
+                    let condition = materialize(&memo.scalars, *condition);
+                    for (left, right) in collect_column_equalities(&condition) {
                         props.equivalence_classes.merge_pair(left, right);
                     }
                 }

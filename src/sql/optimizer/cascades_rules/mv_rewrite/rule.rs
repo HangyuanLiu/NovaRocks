@@ -20,6 +20,11 @@ use crate::sql::optimizer::operator::{
     LogicalAggregateOp, LogicalFilterOp, LogicalProjectOp, LogicalScanOp, Operator,
 };
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
+use crate::sql::optimizer::scalar::intern_typed;
+use crate::sql::optimizer::scalar_bridge::{
+    intern_aggregate_calls, intern_exprs, intern_project_items, materialize_aggregate_calls,
+    materialize_exprs,
+};
 use crate::sql::planner::plan::AggregateCall;
 
 use super::aggregate_rollup::{RollupKind, plan_rollup};
@@ -162,6 +167,7 @@ fn try_rewrite(
     let mut child_group = scan_group;
     if !compensation.is_empty() {
         let predicate = combine_and(compensation);
+        let predicate = intern_typed(&mut memo.scalars, &predicate);
         child_group = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalFilter(LogicalFilterOp { predicate }),
@@ -189,7 +195,7 @@ fn try_rewrite(
                 .collect::<Option<Vec<_>>>()?;
             Some(NewExpr {
                 op: Operator::LogicalProject(LogicalProjectOp {
-                    items,
+                    items: intern_project_items(&mut memo.scalars, &items),
                     output_qualifier: None,
                 }),
                 children: vec![child_group],
@@ -199,13 +205,20 @@ fn try_rewrite(
         (MatchedShape::Spj, Some(_)) => None,
         // SPJG query on SPJ MV: keep the query aggregate, args rewritten.
         (MatchedShape::Spjg { original_agg }, None) => {
+            let original_group_by = materialize_exprs(&memo.scalars, &original_agg.group_by);
+            let original_aggregates = materialize_aggregate_calls(
+                &memo.scalars,
+                &original_agg.aggregates,
+                original_agg.group_by.len(),
+                &original_agg.output_columns,
+            );
             let group_by = original_agg
                 .group_by
                 .iter()
-                .map(|e| col_map.rewrite(e, &q_names))
+                .zip(original_group_by.iter())
+                .map(|(_, e)| col_map.rewrite(e, &q_names))
                 .collect::<Option<Vec<_>>>()?;
-            let aggregates = original_agg
-                .aggregates
+            let aggregates = original_aggregates
                 .iter()
                 .map(|c| {
                     Some(AggregateCall {
@@ -222,8 +235,8 @@ fn try_rewrite(
             // were rewritten like any other above, so no special handling.
             Some(NewExpr {
                 op: Operator::LogicalAggregate(LogicalAggregateOp::single(
-                    group_by,
-                    aggregates,
+                    intern_exprs(&mut memo.scalars, &group_by),
+                    intern_aggregate_calls(&mut memo.scalars, &aggregates),
                     original_agg.output_columns.clone(),
                 )),
                 children: vec![child_group],
@@ -231,15 +244,22 @@ fn try_rewrite(
         }
         // SPJG query on SPJG MV: direct mapping or rollup.
         (MatchedShape::Spjg { original_agg }, Some(mv_agg)) => {
-            let plan = plan_rollup(
-                &original_agg.group_by,
+            let original_group_by = materialize_exprs(&memo.scalars, &original_agg.group_by);
+            let original_aggregates = materialize_aggregate_calls(
+                &memo.scalars,
                 &original_agg.aggregates,
+                original_agg.group_by.len(),
+                &original_agg.output_columns,
+            );
+            let plan = plan_rollup(
+                &original_group_by,
+                &original_aggregates,
                 &q_names,
                 mv_agg,
                 &cand.mv.outputs,
                 &m_names,
             )?;
-            let n_keys = original_agg.group_by.len();
+            let n_keys = original_group_by.len();
             match plan.kind {
                 RollupKind::Direct => {
                     // One row per group already: Project binding the original
@@ -247,7 +267,7 @@ fn try_rewrite(
                     let mut items: Vec<ProjectItem> = Vec::new();
                     for (i, oc) in original_agg.output_columns.iter().enumerate() {
                         let expr = if i < n_keys {
-                            col_map.rewrite(&original_agg.group_by[i], &q_names)?
+                            col_map.rewrite(&original_group_by[i], &q_names)?
                         } else {
                             let item = &plan.items[i - n_keys];
                             let mv_col = agg_cols[item.mv_output_index].clone()?;
@@ -261,7 +281,7 @@ fn try_rewrite(
                     }
                     Some(NewExpr {
                         op: Operator::LogicalProject(LogicalProjectOp {
-                            items,
+                            items: intern_project_items(&mut memo.scalars, &items),
                             output_qualifier: None,
                         }),
                         children: vec![child_group],
@@ -271,7 +291,8 @@ fn try_rewrite(
                     let group_by = original_agg
                         .group_by
                         .iter()
-                        .map(|e| col_map.rewrite(e, &q_names))
+                        .zip(original_group_by.iter())
+                        .map(|(_, e)| col_map.rewrite(e, &q_names))
                         .collect::<Option<Vec<_>>>()?;
                     let needs_coalesce = plan.items.iter().any(|i| i.needs_coalesce);
                     // Aggregate outputs: reuse original ids directly unless a
@@ -294,7 +315,7 @@ fn try_rewrite(
                         .enumerate()
                         .map(|(i, item)| {
                             let mv_col = agg_cols[item.mv_output_index].clone()?;
-                            let orig = &original_agg.aggregates[i];
+                            let orig = &original_aggregates[i];
                             Some(AggregateCall {
                                 name: item.rollup_fn.to_string(),
                                 args: vec![column_ref(&mv_col)],
@@ -306,8 +327,8 @@ fn try_rewrite(
                         })
                         .collect::<Option<Vec<_>>>()?;
                     let agg_op = Operator::LogicalAggregate(LogicalAggregateOp::single(
-                        group_by,
-                        aggregates,
+                        intern_exprs(&mut memo.scalars, &group_by),
+                        intern_aggregate_calls(&mut memo.scalars, &aggregates),
                         agg_outputs.clone(),
                     ));
                     if !needs_coalesce {
@@ -322,7 +343,7 @@ fn try_rewrite(
                         op: agg_op,
                         children: vec![child_group],
                     });
-                    let items = original_agg
+                    let items: Vec<ProjectItem> = original_agg
                         .output_columns
                         .iter()
                         .enumerate()
@@ -357,7 +378,7 @@ fn try_rewrite(
                         .collect();
                     Some(NewExpr {
                         op: Operator::LogicalProject(LogicalProjectOp {
-                            items,
+                            items: intern_project_items(&mut memo.scalars, &items),
                             output_qualifier: None,
                         }),
                         children: vec![agg_group],
