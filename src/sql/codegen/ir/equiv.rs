@@ -1,34 +1,47 @@
-//! Test-only IR equivalence helpers.
+//! Test-only IR structural coverage helpers.
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::sync::Arc;
 
     use arrow::datatypes::DataType;
+    use iceberg::spec::{
+        DataContentType, DataFileFormat, FormatVersion, NestedField, PrimitiveType, Schema, Struct,
+        Type,
+    };
 
     use crate::connector::iceberg::IcebergMetadataTableType;
     use crate::connector::{ConnectorRegistry, iceberg::IcebergConnectorScanPlanner};
+    use crate::meta::repository::mv::StoredMvDefinition;
+    use crate::meta::repository::mv_contract::{
+        AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
+        ApplyKeySource, BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind,
+        ExpressionLineage, HiddenApplyKeyContract, MvSchemaContract, OutputColumnLineage,
+        OutputContract, TargetContract, TargetVisibleColumn,
+    };
     use crate::sql::analysis::{
         BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, SortItem, TypedExpr,
     };
     use crate::sql::catalog::{
-        CatalogProvider, ColumnDef, IcebergDataFileBinding, IcebergDataFileInfo, IcebergSchemaDef,
-        IcebergTableInfo, ScanSource, TableDef,
+        CatalogProvider, ColumnDef, IcebergDataFileBinding, IcebergDataFileInfo,
+        IcebergMvTargetStatePartitionConstraint, IcebergMvTargetStateRowFilter,
+        IcebergMvTargetStateScan, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
     use crate::sql::codegen::fragment_builder::PlanFragmentBuilder;
     use crate::sql::codegen::{
-        FragmentBuildResult, FragmentEdge, FragmentEdgeKind, MultiFragmentBuildResult,
-        OutputColumn as CodegenOutputColumn, RuntimeFilterPlanResult,
+        DirectExecPlan, FragmentBuildResult, FragmentEdgeKind, FragmentId,
+        MultiFragmentBuildResult, PlanBuildResult,
     };
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
-        AggMode, JoinDistribution, Operator, PhysicalAssertOneRowOp, PhysicalCTEAnchorOp,
-        PhysicalCTEConsumeOp, PhysicalCTEProduceOp, PhysicalDecodeOp, PhysicalDistributionOp,
-        PhysicalExceptOp, PhysicalFilterOp, PhysicalGenerateSeriesOp, PhysicalHashAggregateOp,
-        PhysicalHashJoinEqCondition, PhysicalHashJoinOp, PhysicalIntersectOp, PhysicalLimitOp,
-        PhysicalNestLoopJoinOp, PhysicalProjectOp, PhysicalRepeatOp, PhysicalScanOp,
-        PhysicalSortOp, PhysicalTableFunctionOp, PhysicalTopNOp, PhysicalUnionOp, PhysicalValuesOp,
-        PhysicalWindowOp, ScanDictionaryColumn, TopNPhase,
+        AggMode, AggregateStateMergeOp, JoinDistribution, Operator, PhysicalAssertOneRowOp,
+        PhysicalCTEAnchorOp, PhysicalCTEConsumeOp, PhysicalCTEProduceOp, PhysicalDecodeOp,
+        PhysicalDistributionOp, PhysicalExceptOp, PhysicalFilterOp, PhysicalGenerateSeriesOp,
+        PhysicalHashAggregateOp, PhysicalHashJoinEqCondition, PhysicalHashJoinOp,
+        PhysicalIntersectOp, PhysicalLimitOp, PhysicalNestLoopJoinOp, PhysicalProjectOp,
+        PhysicalRepeatOp, PhysicalScanOp, PhysicalSortOp, PhysicalTableFunctionOp, PhysicalTopNOp,
+        PhysicalUnionOp, PhysicalValuesOp, PhysicalWindowOp, ScanDictionaryColumn, TopNPhase,
     };
     use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, PlanExecutionProps};
     use crate::sql::optimizer::property::DistributionSpec;
@@ -37,370 +50,419 @@ mod tests {
     use crate::sql::planner::plan::{AggregateCall, DecodeMapping, WindowExpr};
 
     #[test]
-    fn scan_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent("scan", scan_plan());
+    fn scan_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure("scan", scan_plan(), 1);
     }
 
     #[test]
-    fn scan_filter_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent("scan_filter", filter_plan(scan_plan()));
+    fn scan_filter_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure("scan_filter", filter_plan(scan_plan()), 1);
     }
 
     #[test]
-    fn scan_project_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent("scan_project", project_plan(scan_plan()));
+    fn scan_project_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure("scan_project", project_plan(scan_plan()), 1);
     }
 
     #[test]
-    fn scan_filter_project_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn scan_filter_project_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "scan_filter_project",
             project_plan(filter_plan(scan_plan())),
+            1,
         );
     }
 
     #[test]
-    fn root_gather_scan_filter_project_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn root_gather_scan_filter_project_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "root_gather_scan_filter_project",
             root_gather_plan(project_plan(filter_plan(scan_plan()))),
+            1,
         );
     }
 
     #[test]
-    fn sort_over_scan_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent("sort_over_scan", sort_plan(scan_plan()));
+    fn sort_over_scan_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure("sort_over_scan", sort_plan(scan_plan()), 1);
     }
 
     #[test]
-    fn limit_over_scan_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn limit_over_scan_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "limit_over_scan",
             limit_plan(scan_plan(), Some(5), None),
+            1,
         );
     }
 
     #[test]
-    fn limit_over_sort_with_offset_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn limit_over_sort_with_offset_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "limit_over_sort_with_offset",
             limit_plan(sort_plan(scan_plan()), Some(5), Some(2)),
+            1,
         );
     }
 
     #[test]
-    fn limit_over_top_n_overrides_top_n_limit_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn limit_over_top_n_overrides_top_n_limit_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "limit_over_top_n_overrides_top_n_limit",
             limit_plan(
                 top_n_plan(scan_plan(), TopNPhase::Final, false, Some(10), Some(0)),
                 Some(5),
                 Some(2),
             ),
+            1,
         );
     }
 
     #[test]
-    fn limit_over_aggregate_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn limit_over_aggregate_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "limit_over_aggregate",
             limit_plan(aggregate_count_plan(scan_plan()), Some(3), None),
+            1,
         );
     }
 
     #[test]
-    fn limit_over_hash_join_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn limit_over_hash_join_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "limit_over_hash_join",
             limit_plan(inner_hash_join_two_scans_plan(), Some(4), None),
+            1,
         );
     }
 
     #[test]
-    fn top_n_final_single_over_scan_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn top_n_final_single_over_scan_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "top_n_final_single_over_scan",
             top_n_plan(scan_plan(), TopNPhase::Final, false, Some(5), Some(1)),
+            1,
         );
     }
 
     #[test]
-    fn top_n_partial_over_scan_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn top_n_partial_over_scan_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "top_n_partial_over_scan",
             top_n_plan(scan_plan(), TopNPhase::Partial, false, Some(7), Some(0)),
+            1,
         );
     }
 
     #[test]
-    fn top_n_split_matches_direct_fragment_builder() {
+    fn top_n_split_builds_ir_fragment_structure() {
         let partial = top_n_plan(scan_plan(), TopNPhase::Partial, false, Some(5), Some(0));
-        assert_distributed_plan_equivalent(
+        assert_distributed_plan_ir_structure(
             "top_n_split",
             top_n_plan(partial, TopNPhase::Final, true, Some(5), Some(0)),
+            2,
         );
     }
 
     #[test]
-    fn limit_offset_exchange_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn limit_offset_exchange_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "limit_offset_exchange",
             limit_plan(scan_plan(), Some(5), Some(1)),
+            2,
         );
     }
 
     #[test]
-    fn gather_over_limit_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn gather_over_limit_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "gather_over_limit",
             sort_plan(distribution_plan(
                 limit_plan(scan_plan(), Some(5), None),
                 DistributionSpec::Gather,
             )),
+            2,
         );
     }
 
     #[test]
-    fn aggregate_single_over_scan_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn aggregate_single_over_scan_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "aggregate_single_over_scan",
             aggregate_group_by_plan(scan_plan()),
+            1,
         );
     }
 
     #[test]
-    fn aggregate_with_count_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn aggregate_with_count_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "aggregate_with_count",
             aggregate_count_plan(scan_plan()),
+            1,
         );
     }
 
     #[test]
-    fn shuffle_agg_exchange_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn shuffle_agg_exchange_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "shuffle_agg_exchange",
             aggregate_group_by_plan(distribution_plan(
                 scan_plan(),
                 DistributionSpec::shuffle_agg([ColumnId::new_for_test(1)]),
             )),
+            2,
         );
     }
 
     #[test]
-    fn nested_gather_exchange_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn nested_gather_exchange_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "nested_gather_exchange",
             sort_plan(distribution_plan(scan_plan(), DistributionSpec::Gather)),
+            2,
         );
     }
 
     #[test]
-    fn cte_produce_consume_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent("cte_produce_consume", cte_produce_consume_plan());
+    fn cte_produce_consume_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure("cte_produce_consume", cte_produce_consume_plan(), 2);
     }
 
     #[test]
-    fn sort_over_project_over_scan_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn sort_over_project_over_scan_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "sort_over_project_over_scan",
             sort_plan(project_plan(scan_plan())),
+            1,
         );
     }
 
     #[test]
-    fn inner_hash_join_two_scans_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn inner_hash_join_two_scans_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "inner_hash_join_two_scans",
             inner_hash_join_two_scans_plan(),
+            1,
         );
     }
 
     #[test]
-    fn broadcast_join_exchange_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn broadcast_join_exchange_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "broadcast_join_exchange",
             broadcast_join_exchange_plan(),
+            2,
         );
     }
 
     #[test]
-    fn two_sided_shuffle_join_exchange_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn two_sided_shuffle_join_exchange_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "two_sided_shuffle_join_exchange",
             two_sided_shuffle_join_exchange_plan(),
+            3,
         );
     }
 
     #[test]
-    fn gather_root_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn gather_root_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "gather_root",
             root_gather_plan(project_plan(filter_plan(scan_plan()))),
+            1,
         );
     }
 
     #[test]
-    fn left_outer_hash_join_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent("left_outer_hash_join", left_outer_hash_join_plan());
+    fn left_outer_hash_join_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
+            "left_outer_hash_join",
+            left_outer_hash_join_plan(),
+            1,
+        );
     }
 
     #[test]
-    fn hash_join_other_condition_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn hash_join_other_condition_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "hash_join_other_condition",
             hash_join_other_condition_plan(),
+            1,
         );
     }
 
     #[test]
-    fn left_semi_hash_join_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn left_semi_hash_join_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "left_semi_hash_join",
             hash_join_surviving_side_plan(JoinKind::LeftSemi),
+            1,
         );
     }
 
     #[test]
-    fn right_anti_hash_join_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn right_anti_hash_join_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "right_anti_hash_join",
             hash_join_surviving_side_plan(JoinKind::RightAnti),
+            1,
         );
     }
 
     #[test]
-    fn null_aware_left_anti_hash_join_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn null_aware_left_anti_hash_join_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "null_aware_left_anti_hash_join",
             hash_join_surviving_side_plan(JoinKind::NullAwareLeftAnti),
+            1,
         );
     }
 
     #[test]
-    fn nest_loop_cross_join_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent("nest_loop_cross_join", nest_loop_cross_join_plan());
+    fn nest_loop_cross_join_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
+            "nest_loop_cross_join",
+            nest_loop_cross_join_plan(),
+            1,
+        );
     }
 
     #[test]
-    fn nest_loop_inner_condition_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn nest_loop_inner_condition_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "nest_loop_inner_condition",
             nest_loop_condition_plan(JoinKind::Inner),
+            1,
         );
     }
 
     #[test]
-    fn nest_loop_left_outer_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn nest_loop_left_outer_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "nest_loop_left_outer",
             nest_loop_condition_plan(JoinKind::LeftOuter),
+            1,
         );
     }
 
     #[test]
-    fn nest_loop_left_anti_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn nest_loop_left_anti_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "nest_loop_left_anti",
             nest_loop_surviving_side_plan(JoinKind::LeftAnti),
+            1,
         );
     }
 
     #[test]
-    fn nest_loop_null_aware_left_anti_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn nest_loop_null_aware_left_anti_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "nest_loop_null_aware_left_anti",
             nest_loop_surviving_side_plan(JoinKind::NullAwareLeftAnti),
+            1,
         );
     }
 
     #[test]
-    fn union_all_two_scans_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn union_all_two_scans_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "union_all_two_scans",
             union_plan(
                 true,
                 aliased_scan_plan("l", 1, 2),
                 aliased_scan_plan("r", 3, 4),
             ),
+            1,
         );
     }
 
     #[test]
-    fn union_distinct_two_scans_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent_with_large_stack(
+    fn union_distinct_two_scans_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure_with_large_stack(
             "union_distinct_two_scans",
             union_plan(
                 false,
                 aliased_scan_plan("l", 1, 2),
                 aliased_scan_plan("r", 3, 4),
             ),
+            2,
         );
     }
 
     #[test]
-    fn intersect_two_scans_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn intersect_two_scans_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "intersect_two_scans",
             intersect_plan(aliased_scan_plan("l", 1, 2), aliased_scan_plan("r", 3, 4)),
+            1,
         );
     }
 
     #[test]
-    fn except_two_scans_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn except_two_scans_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "except_two_scans",
             except_plan(aliased_scan_plan("l", 1, 2), aliased_scan_plan("r", 3, 4)),
+            1,
         );
     }
 
     #[test]
-    fn values_rows_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent("values_rows", values_rows_plan());
+    fn values_rows_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure("values_rows", values_rows_plan(), 1);
     }
 
     #[test]
-    fn assert_one_row_over_scan_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn assert_one_row_over_scan_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "assert_one_row_over_scan",
             assert_one_row_plan(scan_plan()),
+            1,
         );
     }
 
     #[test]
-    fn decode_over_scan_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent("decode_over_scan", decode_over_scan_plan());
+    fn decode_over_scan_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure("decode_over_scan", decode_over_scan_plan(), 1);
     }
 
     #[test]
-    fn repeat_grouping_sets_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent("repeat_grouping_sets", repeat_grouping_sets_plan());
+    fn repeat_grouping_sets_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
+            "repeat_grouping_sets",
+            repeat_grouping_sets_plan(),
+            1,
+        );
     }
 
     #[test]
-    fn window_row_number_over_scan_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn window_row_number_over_scan_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "window_row_number_over_scan",
             window_row_number_over_scan_plan(),
+            1,
         );
     }
 
     #[test]
-    fn generate_series_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent("generate_series", generate_series_plan());
+    fn generate_series_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure("generate_series", generate_series_plan(), 1);
     }
 
     #[test]
-    fn unnest_table_function_over_scan_matches_direct_fragment_builder() {
-        assert_distributed_plan_equivalent(
+    fn unnest_table_function_over_scan_builds_ir_fragment_structure() {
+        assert_distributed_plan_ir_structure(
             "unnest_table_function_over_scan",
             unnest_table_function_over_scan_plan(),
+            1,
         );
     }
 
     #[test]
     fn decode_output_expr_uses_materialized_string_slot() {
         let build = build_distributed_plan_only("decode_output_expr_slot", decode_over_scan_plan());
+        assert_multi_fragment_ir_structure("decode_output_expr_slot", &build, 1);
         let root = fragment_by_id("decode_output_expr_slot", &build, build.root_fragment_id);
         let decode = root
             .plan
@@ -429,6 +491,7 @@ mod tests {
     fn set_op_uses_declared_child_output_order() {
         let build =
             build_distributed_plan_only("set_op_child_output_order", reordered_union_values_plan());
+        assert_multi_fragment_ir_structure("set_op_child_output_order", &build, 1);
         let root = fragment_by_id("set_op_child_output_order", &build, build.root_fragment_id);
         let union = root.plan.nodes.first().expect("set op root");
         assert_eq!(
@@ -471,59 +534,249 @@ mod tests {
     }
 
     #[test]
-    fn iceberg_data_file_scan_ranges_match_direct_fragment_builder() {
+    fn iceberg_data_file_scan_ranges_builds_ir_fragment_structure() {
         let mut connectors = ConnectorRegistry::new();
         connectors.register_scan_planner(Arc::new(IcebergConnectorScanPlanner::new()));
-        let (direct, distributed) = build_both_paths(
+        let distributed = build_distributed_plan(
             "iceberg_data_file_scan_ranges",
             iceberg_data_file_scan_plan(),
             &connectors,
         );
 
-        assert_non_empty_scan_ranges("iceberg_data_file_scan_ranges direct", &direct);
-        assert_non_empty_scan_ranges(
-            "iceberg_data_file_scan_ranges DistributedPlan",
+        assert_non_empty_scan_ranges("iceberg_data_file_scan_ranges", &distributed);
+        assert_multi_fragment_ir_structure("iceberg_data_file_scan_ranges", &distributed, 1);
+    }
+
+    #[test]
+    fn aggregate_state_merge_direct_exec_builds_ir_fragment_structure() {
+        let ctx = aggregate_refresh_context_for_test();
+        let plan = aggregate_state_merge_plan_for_context(&ctx);
+        let distributed = build_distributed_plan_with_mv_refresh_ctx(
+            "aggregate_state_merge_direct_exec",
+            plan,
+            &ConnectorRegistry::new(),
+            Some(&ctx),
+        );
+
+        let merge = root_aggregate_state_merge_direct_exec(
+            "aggregate_state_merge_direct_exec",
             &distributed,
         );
-        assert_multi_fragment_equivalent("iceberg_data_file_scan_ranges", &direct, &distributed);
+        assert_aggregate_state_merge_payload(
+            "aggregate_state_merge_direct_exec",
+            merge,
+            &ctx,
+            None,
+        );
+        assert_multi_fragment_ir_structure("aggregate_state_merge_direct_exec", &distributed, 1);
     }
 
-    fn assert_distributed_plan_equivalent(case_name: &str, plan: PhysicalPlanNode) {
+    #[test]
+    fn mv_target_state_scan_builds_ir_fragment_structure() {
+        let ctx = scan_refresh_context_for_test();
+        let plan = target_state_scan_plan_for_context(&ctx);
+        let mut connectors = ConnectorRegistry::new();
+        connectors.register_scan_planner(Arc::new(IcebergConnectorScanPlanner::new()));
+        let distributed = build_distributed_plan_with_mv_refresh_ctx(
+            "mv_target_state_scan",
+            plan,
+            &connectors,
+            Some(&ctx),
+        );
+
+        let root = fragment_by_id(
+            "mv_target_state_scan",
+            &distributed,
+            distributed.root_fragment_id,
+        );
+        assert!(
+            root.direct_exec.is_none(),
+            "target-state scan must exercise regular fragment build"
+        );
+        assert_multi_fragment_ir_structure("mv_target_state_scan", &distributed, 1);
+    }
+
+    #[test]
+    fn mv_version_scan_builds_ir_fragment_structure() {
+        let fixture = local_version_scan_fixture();
+        let mut ctx = scan_refresh_context_for_test();
+        ctx.base_catalog_entries = [("ice".to_string(), fixture.catalog_entry.clone())]
+            .into_iter()
+            .collect();
+        let plan = version_scan_plan_for_fixture(&fixture);
+        let mut connectors = ConnectorRegistry::new();
+        connectors.register_scan_planner(Arc::new(IcebergConnectorScanPlanner::new()));
+        let distributed = build_distributed_plan_with_mv_refresh_ctx(
+            "mv_version_scan",
+            plan,
+            &connectors,
+            Some(&ctx),
+        );
+
+        let root = fragment_by_id(
+            "mv_version_scan",
+            &distributed,
+            distributed.root_fragment_id,
+        );
+        assert!(
+            root.direct_exec.is_none(),
+            "version scan must exercise regular fragment build"
+        );
+        assert_multi_fragment_ir_structure("mv_version_scan", &distributed, 1);
+    }
+
+    #[test]
+    fn branch_union_aggregate_direct_exec_builds_ir_fragment_structure() {
+        let ctx = aggregate_refresh_context_for_test();
+        let state_names = aggregate_state_names_for_context(&ctx);
+        let branch0 = branch_union_project_for_test(
+            aggregate_merge_plan_for_test(
+                values_plan_for_columns(aggregate_physical_columns_for_test()),
+                values_plan_for_columns(aggregate_delta_state_columns_for_test()),
+                state_names.clone(),
+            ),
+            0,
+            1000,
+        );
+        let branch1 = branch_union_project_for_test(
+            aggregate_merge_plan_for_test(
+                values_plan_for_columns(aggregate_physical_columns_for_test()),
+                values_plan_for_columns(aggregate_delta_state_columns_for_test()),
+                state_names,
+            ),
+            1,
+            1100,
+        );
+        let output_columns = branch0.output_columns.clone();
+        let plan = physical_node(
+            Operator::PhysicalUnion(PhysicalUnionOp {
+                all: true,
+                output_columns: output_columns.clone(),
+                child_output_columns: vec![
+                    branch0.output_columns.clone(),
+                    branch1.output_columns.clone(),
+                ],
+            }),
+            vec![branch0, branch1],
+            output_columns,
+        );
+        let distributed = build_distributed_plan_with_mv_refresh_ctx(
+            "branch_union_aggregate_direct_exec",
+            plan,
+            &ConnectorRegistry::new(),
+            Some(&ctx),
+        );
+
+        let inputs = root_union_all_direct_exec("branch_union_aggregate_direct_exec", &distributed);
+        assert_eq!(
+            inputs.len(),
+            2,
+            "branch_union_aggregate_direct_exec: branch union should keep both direct-exec inputs"
+        );
+        for (idx, (input, expected_branch_id)) in inputs.iter().zip([0, 1]).enumerate() {
+            let merge = plan_result_aggregate_state_merge_direct_exec(
+                &format!("branch_union_aggregate_direct_exec: input {idx}"),
+                input,
+            );
+            assert_aggregate_state_merge_payload(
+                &format!("branch_union_aggregate_direct_exec: input {idx}"),
+                merge,
+                &ctx,
+                Some(expected_branch_id),
+            );
+        }
+        assert_multi_fragment_ir_structure("branch_union_aggregate_direct_exec", &distributed, 1);
+    }
+
+    #[test]
+    fn iceberg_sink_builds_ir_fragment_structure() {
+        let plan = values_plan_for_columns(vec![output_col(1, "id", DataType::Int32, false)]);
         let connectors = ConnectorRegistry::new();
-        let (direct, distributed) = build_both_paths(case_name, plan, &connectors);
-        assert_multi_fragment_equivalent(case_name, &direct, &distributed);
-    }
-
-    fn assert_distributed_plan_equivalent_with_large_stack(
-        case_name: &'static str,
-        plan: PhysicalPlanNode,
-    ) {
-        std::thread::Builder::new()
-            .name(format!("{case_name}_equiv"))
-            .stack_size(64 * 1024 * 1024)
-            .spawn(move || assert_distributed_plan_equivalent(case_name, plan))
-            .expect("spawn equivalence test thread")
-            .join()
-            .expect("equivalence test thread panicked");
-    }
-
-    fn build_both_paths(
-        case_name: &str,
-        plan: PhysicalPlanNode,
-        connectors: &ConnectorRegistry,
-    ) -> (MultiFragmentBuildResult, MultiFragmentBuildResult) {
+        let mut sink_spec =
+            crate::sql::codegen::iceberg_write_sink::test_support::simple_sink_spec();
+        sink_spec.iceberg.serialized_metadata = Some(
+            crate::sql::codegen::iceberg_write_sink::test_support::single_bucket_partition_metadata_json(),
+        );
         let catalog = DummyCatalog;
-        let direct = PlanFragmentBuilder::build(&plan, &catalog, &connectors, "test_db")
-            .unwrap_or_else(|err| panic!("{case_name}: direct build failed: {err}"));
-        let distributed = PlanFragmentBuilder::build_via_distributed_plan(
+        let distributed = PlanFragmentBuilder::build_via_distributed_plan_with_iceberg_sink(
             &plan,
             &catalog,
             &connectors,
             "test_db",
+            None,
+            &sink_spec,
         )
-        .unwrap_or_else(|err| panic!("{case_name}: DistributedPlan build failed: {err}"));
+        .expect("DistributedPlan iceberg sink build");
 
-        (direct, distributed)
+        let root = fragment_by_id("iceberg_sink", &distributed, distributed.root_fragment_id);
+        assert_eq!(
+            root.output_sink.type_,
+            crate::data_sinks::TDataSinkType::ICEBERG_TABLE_SINK
+        );
+        assert!(
+            root.output_sink.iceberg_table_sink.is_some(),
+            "iceberg_sink: root output sink must carry iceberg payload"
+        );
+        assert!(
+            root.output_exprs
+                .as_ref()
+                .is_some_and(|exprs| !exprs.is_empty()),
+            "iceberg_sink: root output exprs must be present"
+        );
+        assert_multi_fragment_ir_structure("iceberg_sink", &distributed, 1);
+    }
+
+    fn assert_distributed_plan_ir_structure(
+        case_name: &str,
+        plan: PhysicalPlanNode,
+        expected_fragment_count: usize,
+    ) {
+        let connectors = ConnectorRegistry::new();
+        let distributed = build_distributed_plan(case_name, plan, &connectors);
+        assert_multi_fragment_ir_structure(case_name, &distributed, expected_fragment_count);
+    }
+
+    fn assert_distributed_plan_ir_structure_with_large_stack(
+        case_name: &'static str,
+        plan: PhysicalPlanNode,
+        expected_fragment_count: usize,
+    ) {
+        std::thread::Builder::new()
+            .name(format!("{case_name}_ir_structure"))
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                assert_distributed_plan_ir_structure(case_name, plan, expected_fragment_count)
+            })
+            .expect("spawn IR structure test thread")
+            .join()
+            .expect("IR structure test thread panicked");
+    }
+
+    fn build_distributed_plan(
+        case_name: &str,
+        plan: PhysicalPlanNode,
+        connectors: &ConnectorRegistry,
+    ) -> MultiFragmentBuildResult {
+        let catalog = DummyCatalog;
+        PlanFragmentBuilder::build_via_distributed_plan(&plan, &catalog, connectors, "test_db")
+            .unwrap_or_else(|err| panic!("{case_name}: DistributedPlan build failed: {err}"))
+    }
+
+    fn build_distributed_plan_with_mv_refresh_ctx(
+        case_name: &str,
+        plan: PhysicalPlanNode,
+        connectors: &ConnectorRegistry,
+        mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+    ) -> MultiFragmentBuildResult {
+        let catalog = DummyCatalog;
+        PlanFragmentBuilder::build_via_distributed_plan_with_mv_refresh_ctx(
+            &plan,
+            &catalog,
+            connectors,
+            "test_db",
+            mv_refresh_ctx,
+        )
+        .unwrap_or_else(|err| panic!("{case_name}: DistributedPlan build failed: {err}"))
     }
 
     fn build_distributed_plan_only(
@@ -558,32 +811,50 @@ mod tests {
         );
     }
 
-    fn assert_multi_fragment_equivalent(
+    fn assert_multi_fragment_ir_structure(
         case_name: &str,
-        direct: &MultiFragmentBuildResult,
-        distributed: &MultiFragmentBuildResult,
+        result: &MultiFragmentBuildResult,
+        expected_fragment_count: usize,
     ) {
-        assert_eq!(
-            direct.root_fragment_id, distributed.root_fragment_id,
-            "{case_name}: root_fragment_id"
+        assert!(
+            !result.fragment_results.is_empty(),
+            "{case_name}: expected at least one fragment"
         );
         assert_eq!(
-            direct.fragment_results.len(),
-            distributed.fragment_results.len(),
+            result.fragment_results.len(),
+            expected_fragment_count,
             "{case_name}: fragment count"
         );
-        assert_edges_eq(case_name, &direct.edges, &distributed.edges);
         assert_eq!(
-            direct.boundary_schemas, distributed.boundary_schemas,
-            "{case_name}: multi-fragment boundary schemas"
+            result
+                .fragment_results
+                .iter()
+                .filter(|fragment| fragment.fragment_id == result.root_fragment_id)
+                .count(),
+            1,
+            "{case_name}: root fragment id must exist exactly once"
         );
-        assert_runtime_filter_plan_eq(case_name, &direct.rf_plan, &distributed.rf_plan);
 
-        for direct_fragment in &direct.fragment_results {
-            let distributed_fragment =
-                fragment_by_id(case_name, distributed, direct_fragment.fragment_id);
-            assert_fragment_equivalent(case_name, direct_fragment, distributed_fragment);
-        }
+        let fragment_ids = assert_unique_fragment_ids(case_name, result);
+        let node_ids_by_fragment = result
+            .fragment_results
+            .iter()
+            .map(|fragment| {
+                (
+                    fragment.fragment_id,
+                    assert_fragment_ir_structure(case_name, fragment),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        assert_edges_well_formed(case_name, result, &fragment_ids, &node_ids_by_fragment);
+        assert_boundary_schemas_well_formed(
+            case_name,
+            result,
+            &fragment_ids,
+            &node_ids_by_fragment,
+        );
+        assert_runtime_filters_well_formed(case_name, result, &fragment_ids, &node_ids_by_fragment);
     }
 
     fn fragment_by_id<'a>(
@@ -598,157 +869,533 @@ mod tests {
             .unwrap_or_else(|| panic!("{case_name}: fragment {fragment_id} not found"))
     }
 
-    fn assert_fragment_equivalent(
+    fn assert_unique_fragment_ids(
         case_name: &str,
-        direct: &FragmentBuildResult,
-        distributed: &FragmentBuildResult,
-    ) {
-        assert_eq!(
-            direct.fragment_id, distributed.fragment_id,
-            "{case_name}: fragment_id"
-        );
-        assert_eq!(direct.plan, distributed.plan, "{case_name}: fragment plan");
-        assert_eq!(
-            direct.desc_tbl, distributed.desc_tbl,
-            "{case_name}: descriptor table"
-        );
-        assert_eq!(
-            direct.exec_params, distributed.exec_params,
-            "{case_name}: exec params"
-        );
-        assert_eq!(
-            direct.output_sink, distributed.output_sink,
-            "{case_name}: output sink"
-        );
-        assert_eq!(
-            direct.output_exprs, distributed.output_exprs,
-            "{case_name}: output exprs"
-        );
-        assert_output_columns_eq(
-            case_name,
-            &direct.output_columns,
-            &distributed.output_columns,
-        );
-        assert!(
-            direct.direct_exec.is_none() && distributed.direct_exec.is_none(),
-            "{case_name}: scan/filter/project root fragments should not use direct exec"
-        );
-        assert_eq!(
-            direct.boundary_schemas, distributed.boundary_schemas,
-            "{case_name}: fragment boundary schemas"
-        );
-        assert_eq!(direct.cte_id, distributed.cte_id, "{case_name}: cte_id");
-        assert_eq!(
-            direct.cte_exchange_nodes, distributed.cte_exchange_nodes,
-            "{case_name}: cte exchange nodes"
-        );
-        assert_eq!(
-            direct.query_global_dicts, distributed.query_global_dicts,
-            "{case_name}: query global dicts"
-        );
-        assert_eq!(
-            direct.query_global_dict_exprs, distributed.query_global_dict_exprs,
-            "{case_name}: query global dict exprs"
-        );
+        result: &MultiFragmentBuildResult,
+    ) -> BTreeSet<FragmentId> {
+        let mut ids = BTreeSet::new();
+        for fragment in &result.fragment_results {
+            assert!(
+                ids.insert(fragment.fragment_id),
+                "{case_name}: duplicate fragment id {}",
+                fragment.fragment_id
+            );
+        }
+        ids
     }
 
-    fn assert_output_columns_eq(
+    fn assert_fragment_ir_structure(
         case_name: &str,
-        direct: &[CodegenOutputColumn],
-        distributed: &[CodegenOutputColumn],
-    ) {
-        assert_eq!(
-            direct.len(),
-            distributed.len(),
-            "{case_name}: output column count"
+        fragment: &FragmentBuildResult,
+    ) -> BTreeSet<i32> {
+        let node_ids = assert_plan_node_ids_unique(
+            &format!("{case_name}: fragment {}", fragment.fragment_id),
+            &fragment.plan,
+            fragment.direct_exec.is_some(),
         );
-        for (idx, (direct, distributed)) in direct.iter().zip(distributed.iter()).enumerate() {
-            assert_eq!(
-                direct.name, distributed.name,
-                "{case_name}: output column {idx} name"
+        for (cte_id, exchange_node_id) in &fragment.cte_exchange_nodes {
+            assert!(
+                node_ids.contains(exchange_node_id),
+                "{case_name}: fragment {} cte_id {} references missing exchange node {}",
+                fragment.fragment_id,
+                cte_id,
+                exchange_node_id
             );
-            assert_eq!(
-                direct.data_type, distributed.data_type,
-                "{case_name}: output column {idx} type"
+            assert_exchange_node(case_name, fragment, *exchange_node_id, "cte exchange node");
+        }
+        if let Some(direct_exec) = fragment.direct_exec.as_deref() {
+            assert_direct_exec_ir_structure(
+                &format!("{case_name}: fragment {} direct_exec", fragment.fragment_id),
+                direct_exec,
             );
-            assert_eq!(
-                direct.nullable, distributed.nullable,
-                "{case_name}: output column {idx} nullability"
-            );
+        }
+        node_ids
+    }
+
+    fn assert_plan_build_result_ir_structure(case_name: &str, result: &PlanBuildResult) {
+        assert_plan_node_ids_unique(case_name, &result.plan, result.direct_exec.is_some());
+        if let Some(direct_exec) = result.direct_exec.as_deref() {
+            assert_direct_exec_ir_structure(&format!("{case_name}: direct_exec"), direct_exec);
         }
     }
 
-    fn assert_edges_eq(case_name: &str, direct: &[FragmentEdge], distributed: &[FragmentEdge]) {
-        assert_eq!(direct.len(), distributed.len(), "{case_name}: edge count");
-        for (idx, (direct, distributed)) in direct.iter().zip(distributed.iter()).enumerate() {
-            assert_eq!(
-                direct.source_fragment_id, distributed.source_fragment_id,
-                "{case_name}: edge {idx} source fragment"
+    fn assert_plan_node_ids_unique(
+        case_name: &str,
+        plan: &crate::plan_nodes::TPlan,
+        allows_direct_exec: bool,
+    ) -> BTreeSet<i32> {
+        if !allows_direct_exec {
+            assert!(
+                !plan.nodes.is_empty(),
+                "{case_name}: normal fragment plan must contain nodes"
             );
-            assert_eq!(
-                direct.target_fragment_id, distributed.target_fragment_id,
-                "{case_name}: edge {idx} target fragment"
-            );
-            assert_eq!(
-                direct.target_exchange_node_id, distributed.target_exchange_node_id,
-                "{case_name}: edge {idx} target exchange node"
-            );
-            assert_eq!(
-                direct.output_partition, distributed.output_partition,
-                "{case_name}: edge {idx} output partition"
-            );
-            assert_eq!(
-                direct.stream_kind, distributed.stream_kind,
-                "{case_name}: edge {idx} stream kind"
-            );
-            assert_fragment_edge_kind_eq(case_name, idx, &direct.edge_kind, &distributed.edge_kind);
         }
+        assert_plan_node_ids_follow_preorder(case_name, plan);
+        let mut node_ids = BTreeSet::new();
+        for node in &plan.nodes {
+            assert!(
+                node_ids.insert(node.node_id),
+                "{case_name}: duplicate node id {}",
+                node.node_id
+            );
+        }
+        node_ids
     }
 
-    fn assert_fragment_edge_kind_eq(
-        case_name: &str,
-        idx: usize,
-        direct: &FragmentEdgeKind,
-        distributed: &FragmentEdgeKind,
-    ) {
-        match (direct, distributed) {
-            (FragmentEdgeKind::Stream, FragmentEdgeKind::Stream) => {}
-            (
-                FragmentEdgeKind::CteMulticast { cte_id: direct_id },
-                FragmentEdgeKind::CteMulticast {
-                    cte_id: distributed_id,
-                },
-            ) => assert_eq!(
-                direct_id, distributed_id,
-                "{case_name}: edge {idx} CTE multicast id"
-            ),
-            _ => panic!("{case_name}: edge {idx} kind mismatch: direct and DistributedPlan differ"),
+    fn assert_plan_node_ids_follow_preorder(case_name: &str, plan: &crate::plan_nodes::TPlan) {
+        if plan.nodes.is_empty() {
+            return;
         }
+
+        let consumed = assert_plan_subtree_node_ids_follow_preorder(case_name, &plan.nodes, 0);
+        assert_eq!(
+            consumed,
+            plan.nodes.len(),
+            "{case_name}: TPlan nodes must contain exactly one pre-order tree"
+        );
     }
 
-    fn assert_runtime_filter_plan_eq(
+    fn assert_plan_subtree_node_ids_follow_preorder(
         case_name: &str,
-        direct: &Option<RuntimeFilterPlanResult>,
-        distributed: &Option<RuntimeFilterPlanResult>,
-    ) {
-        match (direct, distributed) {
-            (None, None) => {}
-            (Some(direct), Some(distributed)) => {
-                assert_eq!(
-                    direct.all_filters, distributed.all_filters,
-                    "{case_name}: runtime filter descriptors"
-                );
-                assert_eq!(
-                    direct.build_side_filters, distributed.build_side_filters,
-                    "{case_name}: runtime filter build-side map"
-                );
-                assert_eq!(
-                    direct.probe_side_filters, distributed.probe_side_filters,
-                    "{case_name}: runtime filter probe-side map"
+        nodes: &[crate::plan_nodes::TPlanNode],
+        root_idx: usize,
+    ) -> usize {
+        let root = nodes
+            .get(root_idx)
+            .unwrap_or_else(|| panic!("{case_name}: missing TPlan subtree root at {root_idx}"));
+        let mut next_idx = root_idx + 1;
+        let mut previous_child_root_id = None;
+        for child_ordinal in 0..root.num_children {
+            let child = nodes.get(next_idx).unwrap_or_else(|| {
+                panic!(
+                    "{case_name}: node {} declares missing child {}",
+                    root.node_id, child_ordinal
+                )
+            });
+            assert!(
+                root.node_id > child.node_id,
+                "{case_name}: parent node id {} must be greater than child root id {} in TPlan pre-order",
+                root.node_id,
+                child.node_id
+            );
+            if let Some(previous_child_root_id) = previous_child_root_id {
+                assert!(
+                    previous_child_root_id < child.node_id,
+                    "{case_name}: sibling child root node ids must increase, got {} before {} under parent {}",
+                    previous_child_root_id,
+                    child.node_id,
+                    root.node_id
                 );
             }
-            _ => panic!("{case_name}: runtime filter plan presence mismatch"),
+            previous_child_root_id = Some(child.node_id);
+            next_idx = assert_plan_subtree_node_ids_follow_preorder(case_name, nodes, next_idx);
         }
+        next_idx
+    }
+
+    fn assert_edges_well_formed(
+        case_name: &str,
+        result: &MultiFragmentBuildResult,
+        fragment_ids: &BTreeSet<FragmentId>,
+        node_ids_by_fragment: &BTreeMap<FragmentId, BTreeSet<i32>>,
+    ) {
+        let cte_id_by_fragment = result
+            .fragment_results
+            .iter()
+            .filter_map(|fragment| fragment.cte_id.map(|cte_id| (fragment.fragment_id, cte_id)))
+            .collect::<BTreeMap<_, _>>();
+        for (idx, edge) in result.edges.iter().enumerate() {
+            assert!(
+                fragment_ids.contains(&edge.source_fragment_id),
+                "{case_name}: edge {idx} references missing source fragment {}",
+                edge.source_fragment_id
+            );
+            assert!(
+                fragment_ids.contains(&edge.target_fragment_id),
+                "{case_name}: edge {idx} references missing target fragment {}",
+                edge.target_fragment_id
+            );
+            assert!(
+                node_ids_by_fragment
+                    .get(&edge.target_fragment_id)
+                    .is_some_and(|node_ids| node_ids.contains(&edge.target_exchange_node_id)),
+                "{case_name}: edge {idx} references missing target exchange node {} in fragment {}",
+                edge.target_exchange_node_id,
+                edge.target_fragment_id
+            );
+            let target = fragment_by_id(case_name, result, edge.target_fragment_id);
+            assert_exchange_node(
+                case_name,
+                target,
+                edge.target_exchange_node_id,
+                "edge target",
+            );
+            match &edge.edge_kind {
+                FragmentEdgeKind::Stream => assert_ne!(
+                    edge.source_fragment_id, edge.target_fragment_id,
+                    "{case_name}: stream edge {idx} must cross fragments"
+                ),
+                FragmentEdgeKind::CteMulticast { cte_id } => {
+                    assert_eq!(
+                        cte_id_by_fragment.get(&edge.source_fragment_id),
+                        Some(cte_id),
+                        "{case_name}: CTE edge {idx} source fragment must declare matching cte_id"
+                    );
+                    assert!(
+                        target.cte_exchange_nodes.iter().any(
+                            |(target_cte_id, exchange_node_id)| {
+                                target_cte_id == cte_id
+                                    && *exchange_node_id == edge.target_exchange_node_id
+                            }
+                        ),
+                        "{case_name}: CTE edge {idx} target fragment must record exchange node"
+                    );
+                }
+            }
+        }
+    }
+
+    fn assert_exchange_node(
+        case_name: &str,
+        fragment: &FragmentBuildResult,
+        node_id: i32,
+        label: &str,
+    ) {
+        let node = fragment
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.node_id == node_id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{case_name}: fragment {} {label} node {} not found",
+                    fragment.fragment_id, node_id
+                )
+            });
+        assert_eq!(
+            node.node_type,
+            crate::plan_nodes::TPlanNodeType::EXCHANGE_NODE,
+            "{case_name}: fragment {} {label} node {} must be EXCHANGE_NODE",
+            fragment.fragment_id,
+            node_id
+        );
+    }
+
+    fn assert_boundary_schemas_well_formed(
+        case_name: &str,
+        result: &MultiFragmentBuildResult,
+        fragment_ids: &BTreeSet<FragmentId>,
+        node_ids_by_fragment: &BTreeMap<FragmentId, BTreeSet<i32>>,
+    ) {
+        for (idx, boundary) in result.boundary_schemas.iter().enumerate() {
+            if let Some(fragment_id) = boundary.fragment_id {
+                let fragment_id = FragmentId::try_from(fragment_id)
+                    .unwrap_or_else(|_| panic!("{case_name}: boundary {idx} negative fragment id"));
+                assert!(
+                    fragment_ids.contains(&fragment_id),
+                    "{case_name}: boundary {idx} references missing fragment {fragment_id}"
+                );
+                if boundary.node_id >= 0 {
+                    let node_in_fragment = node_ids_by_fragment
+                        .get(&fragment_id)
+                        .is_some_and(|node_ids| node_ids.contains(&boundary.node_id));
+                    let sender_edge_exists = matches!(
+                        boundary.boundary_kind,
+                        crate::sql::codegen::boundary_schema::BoundaryKind::ExchangeSender
+                    ) && result.edges.iter().any(|edge| {
+                        edge.source_fragment_id == fragment_id
+                            && edge.target_exchange_node_id == boundary.node_id
+                    });
+                    assert!(
+                        node_in_fragment || sender_edge_exists,
+                        "{case_name}: boundary {idx} references missing node {} in fragment {}",
+                        boundary.node_id,
+                        fragment_id
+                    );
+                }
+            }
+            assert!(
+                !boundary.columns.is_empty(),
+                "{case_name}: boundary {idx} should describe at least one column"
+            );
+        }
+    }
+
+    fn assert_runtime_filters_well_formed(
+        case_name: &str,
+        result: &MultiFragmentBuildResult,
+        fragment_ids: &BTreeSet<FragmentId>,
+        node_ids_by_fragment: &BTreeMap<FragmentId, BTreeSet<i32>>,
+    ) {
+        let Some(rf_plan) = result.rf_plan.as_ref() else {
+            return;
+        };
+        for (fragment_id, filter_ids) in &rf_plan.build_side_filters {
+            assert!(
+                fragment_ids.contains(fragment_id),
+                "{case_name}: runtime filter build side references missing fragment {fragment_id}"
+            );
+            for filter_id in filter_ids {
+                assert!(
+                    rf_plan.all_filters.contains_key(filter_id),
+                    "{case_name}: build-side runtime filter {filter_id} missing descriptor"
+                );
+            }
+        }
+        for (fragment_id, probes) in &rf_plan.probe_side_filters {
+            assert!(
+                fragment_ids.contains(fragment_id),
+                "{case_name}: runtime filter probe side references missing fragment {fragment_id}"
+            );
+            for (filter_id, probe_node_id) in probes {
+                assert!(
+                    rf_plan.all_filters.contains_key(filter_id),
+                    "{case_name}: probe-side runtime filter {filter_id} missing descriptor"
+                );
+                assert!(
+                    node_ids_by_fragment
+                        .get(fragment_id)
+                        .is_some_and(|node_ids| node_ids.contains(probe_node_id)),
+                    "{case_name}: runtime filter {filter_id} references missing probe node {} in fragment {}",
+                    probe_node_id,
+                    fragment_id
+                );
+            }
+        }
+    }
+
+    fn assert_direct_exec_ir_structure(case_name: &str, direct_exec: &DirectExecPlan) {
+        match direct_exec {
+            DirectExecPlan::AggregateStateMerge {
+                old_input,
+                delta_input,
+                ..
+            } => {
+                assert_plan_build_result_ir_structure(
+                    &format!("{case_name}: aggregate merge old input"),
+                    old_input,
+                );
+                assert_plan_build_result_ir_structure(
+                    &format!("{case_name}: aggregate merge delta input"),
+                    delta_input,
+                );
+            }
+            DirectExecPlan::AggregateStatePhysicalize { input, .. } => {
+                assert_plan_build_result_ir_structure(
+                    &format!("{case_name}: aggregate physicalize input"),
+                    input,
+                );
+            }
+            DirectExecPlan::UnionAll { inputs } => {
+                assert!(
+                    !inputs.is_empty(),
+                    "{case_name}: direct union must contain child inputs"
+                );
+                for (idx, input) in inputs.iter().enumerate() {
+                    assert_plan_build_result_ir_structure(
+                        &format!("{case_name}: direct union input {idx}"),
+                        input,
+                    );
+                }
+            }
+        }
+    }
+
+    fn root_aggregate_state_merge_direct_exec<'a>(
+        case_name: &str,
+        result: &'a MultiFragmentBuildResult,
+    ) -> &'a DirectExecPlan {
+        let root = fragment_by_id(case_name, result, result.root_fragment_id);
+        let direct_exec = root
+            .direct_exec
+            .as_deref()
+            .unwrap_or_else(|| panic!("{case_name}: expected root direct_exec"));
+        assert_aggregate_state_merge_variant(case_name, direct_exec);
+        direct_exec
+    }
+
+    fn root_union_all_direct_exec<'a>(
+        case_name: &str,
+        result: &'a MultiFragmentBuildResult,
+    ) -> &'a [PlanBuildResult] {
+        let root = fragment_by_id(case_name, result, result.root_fragment_id);
+        let Some(DirectExecPlan::UnionAll { inputs }) = root.direct_exec.as_deref() else {
+            panic!("{case_name}: expected root UnionAll direct_exec");
+        };
+        inputs
+    }
+
+    fn plan_result_aggregate_state_merge_direct_exec<'a>(
+        case_name: &str,
+        result: &'a PlanBuildResult,
+    ) -> &'a DirectExecPlan {
+        let direct_exec = result
+            .direct_exec
+            .as_deref()
+            .unwrap_or_else(|| panic!("{case_name}: expected direct_exec"));
+        assert_aggregate_state_merge_variant(case_name, direct_exec);
+        direct_exec
+    }
+
+    fn assert_aggregate_state_merge_variant(case_name: &str, direct_exec: &DirectExecPlan) {
+        assert!(
+            matches!(direct_exec, DirectExecPlan::AggregateStateMerge { .. }),
+            "{case_name}: expected AggregateStateMerge direct_exec"
+        );
+    }
+
+    fn assert_aggregate_state_merge_payload(
+        case_name: &str,
+        direct_exec: &DirectExecPlan,
+        ctx: &crate::engine::mv::refresh_context::IcebergMvRefreshContext,
+        expected_branch_id: Option<i32>,
+    ) {
+        let DirectExecPlan::AggregateStateMerge {
+            layout,
+            branch_id,
+            pruning_limits,
+            target_position_locator,
+            ..
+        } = direct_exec
+        else {
+            panic!("{case_name}: expected AggregateStateMerge direct_exec");
+        };
+
+        assert_eq!(
+            *branch_id, expected_branch_id,
+            "{case_name}: aggregate merge branch_id"
+        );
+        assert_eq!(
+            *pruning_limits, ctx.pruning_limits,
+            "{case_name}: aggregate merge pruning limits"
+        );
+        if expected_branch_id.is_some() {
+            assert_eq!(
+                *pruning_limits,
+                crate::engine::mv::refresh_context::MvRefreshPruningLimits::default(),
+                "{case_name}: branch aggregate merge must use default pruning limits"
+            );
+        }
+        if ctx.rewrite.target_snapshot_id.is_some() {
+            assert!(
+                target_position_locator.is_some(),
+                "{case_name}: aggregate merge must carry target position locator for pinned target snapshot"
+            );
+        }
+        let locator = target_position_locator
+            .as_ref()
+            .unwrap_or_else(|| panic!("{case_name}: aggregate merge target locator missing"));
+        assert_target_position_locator_matches_ctx(case_name, locator, ctx);
+        assert_aggregate_merge_layout_matches_ctx(case_name, layout, ctx);
+    }
+
+    fn assert_target_position_locator_matches_ctx(
+        case_name: &str,
+        locator: &crate::sql::codegen::AggregateStateTargetPositionLocator,
+        ctx: &crate::engine::mv::refresh_context::IcebergMvRefreshContext,
+    ) {
+        assert_eq!(
+            locator.target_entry.kind, ctx.target_entry.kind,
+            "{case_name}: target locator catalog kind"
+        );
+        assert_eq!(
+            locator.target_entry.properties, ctx.target_entry.properties,
+            "{case_name}: target locator catalog properties"
+        );
+        assert_eq!(
+            locator.target_entry.warehouse_uri, ctx.target_entry.warehouse_uri,
+            "{case_name}: target locator warehouse URI"
+        );
+        assert_eq!(
+            locator.target_entry.rest_uri, ctx.target_entry.rest_uri,
+            "{case_name}: target locator REST URI"
+        );
+        assert_eq!(
+            locator.target_entry.hms_uris, ctx.target_entry.hms_uris,
+            "{case_name}: target locator HMS URIs"
+        );
+        assert_eq!(
+            locator.target_entry.warehouse_path, ctx.target_entry.warehouse_path,
+            "{case_name}: target locator warehouse path"
+        );
+        assert_eq!(
+            locator.target_table.identifier().to_string(),
+            ctx.target_table.identifier().to_string(),
+            "{case_name}: target locator table identifier"
+        );
+        assert_eq!(
+            locator.target_table.metadata().uuid(),
+            ctx.target_table.metadata().uuid(),
+            "{case_name}: target locator table uuid"
+        );
+        assert_eq!(
+            locator.target_table.metadata().current_snapshot_id(),
+            ctx.target_table.metadata().current_snapshot_id(),
+            "{case_name}: target locator table snapshot"
+        );
+        assert_eq!(
+            locator.partition_filter,
+            ctx.affected_partitions_to_target_partition_filter(),
+            "{case_name}: target locator partition filter"
+        );
+        assert_eq!(
+            locator.apply_key_column, "__row_id__",
+            "{case_name}: target locator apply key column"
+        );
+    }
+
+    fn assert_aggregate_merge_layout_matches_ctx(
+        case_name: &str,
+        layout: &crate::connector::starrocks::table::mv_agg_state::AggregateMvLayout,
+        ctx: &crate::engine::mv::refresh_context::IcebergMvRefreshContext,
+    ) {
+        let expected_layout = ctx
+            .rewrite
+            .aggregate_shape_and_layout_for_execution()
+            .expect("aggregate layout")
+            .1;
+        assert_eq!(
+            layout.row_id_column, expected_layout.row_id_column,
+            "{case_name}: aggregate layout row-id column"
+        );
+        assert_eq!(
+            layout.visible_columns, expected_layout.visible_columns,
+            "{case_name}: aggregate layout visible columns"
+        );
+        assert_eq!(
+            layout.state_columns, expected_layout.state_columns,
+            "{case_name}: aggregate layout state columns"
+        );
+        assert_eq!(
+            layout.group_key_source_indexes, expected_layout.group_key_source_indexes,
+            "{case_name}: aggregate layout group-key source indexes"
+        );
+        assert_eq!(
+            layout.aggregate_input_types, expected_layout.aggregate_input_types,
+            "{case_name}: aggregate layout aggregate input types"
+        );
+        assert_eq!(
+            layout.physical_columns, expected_layout.physical_columns,
+            "{case_name}: aggregate layout physical columns"
+        );
+        assert_eq!(
+            layout
+                .visible_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            ["region", "c", "s"],
+            "{case_name}: aggregate layout visible column names"
+        );
+        assert_eq!(
+            layout
+                .state_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            ["__agg_state_c", "__agg_state_s"],
+            "{case_name}: aggregate layout state column names"
+        );
     }
 
     fn assert_non_empty_scan_ranges(case_name: &str, result: &MultiFragmentBuildResult) {
@@ -764,7 +1411,7 @@ mod tests {
 
     impl CatalogProvider for DummyCatalog {
         fn get_table(&self, _database: &str, _table: &str) -> Result<TableDef, String> {
-            Err("equivalence tests use fully resolved metadata-table scans".to_string())
+            Err("IR structural tests use fully resolved metadata-table scans".to_string())
         }
     }
 
@@ -814,6 +1461,670 @@ mod tests {
             vec![],
             vec![k, v],
         )
+    }
+
+    fn values_plan_for_columns(columns: Vec<OutputColumn>) -> PhysicalPlanNode {
+        physical_node(
+            Operator::PhysicalValues(PhysicalValuesOp {
+                rows: Vec::new(),
+                columns: columns.clone(),
+            }),
+            Vec::new(),
+            columns,
+        )
+    }
+
+    fn aggregate_state_names_for_context(
+        ctx: &crate::engine::mv::refresh_context::IcebergMvRefreshContext,
+    ) -> Vec<String> {
+        ctx.rewrite
+            .aggregate_shape_and_layout_for_execution()
+            .expect("aggregate layout")
+            .1
+            .state_columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect()
+    }
+
+    fn aggregate_state_merge_plan_for_context(
+        ctx: &crate::engine::mv::refresh_context::IcebergMvRefreshContext,
+    ) -> PhysicalPlanNode {
+        aggregate_merge_plan_for_test(
+            values_plan_for_columns(aggregate_physical_columns_for_test()),
+            values_plan_for_columns(aggregate_delta_state_columns_for_test()),
+            aggregate_state_names_for_context(ctx),
+        )
+    }
+
+    fn target_state_scan_plan_for_context(
+        ctx: &crate::engine::mv::refresh_context::IcebergMvRefreshContext,
+    ) -> PhysicalPlanNode {
+        let row_id = output_col(110, "__row_id__", DataType::Utf8, false);
+        let region = output_col(111, "region", DataType::Utf8, true);
+        let scan = target_state_scan_for_context(ctx);
+        physical_node(
+            Operator::PhysicalScan(PhysicalScanOp {
+                database: "ns".to_string(),
+                table: target_state_table_def(scan),
+                alias: Some("mv".to_string()),
+                columns: vec![row_id.clone(), region.clone()],
+                predicates: vec![],
+                required_columns: Some(vec!["__row_id__".to_string(), "region".to_string()]),
+                dict_columns: vec![],
+                variant_columns: vec![],
+                mv_rewritten_from: None,
+            }),
+            vec![],
+            vec![row_id, region],
+        )
+    }
+
+    fn target_state_scan_for_context(
+        ctx: &crate::engine::mv::refresh_context::IcebergMvRefreshContext,
+    ) -> IcebergMvTargetStateScan {
+        let (_, layout) = ctx
+            .rewrite
+            .aggregate_shape_and_layout_for_execution()
+            .expect("aggregate target-state layout");
+        IcebergMvTargetStateScan {
+            catalog: ctx.rewrite.target.catalog.clone(),
+            database: ctx.rewrite.target.namespace.clone(),
+            table: ctx.rewrite.target.table.clone(),
+            target_table_uuid: ctx.rewrite.target_table_uuid.clone(),
+            target_snapshot_id: ctx.rewrite.target_snapshot_id,
+            aggregate_state_layout_version: ctx
+                .rewrite
+                .schema_contract
+                .aggregate
+                .as_ref()
+                .expect("aggregate contract")
+                .state_layout_version,
+            columns: vec![
+                column_def("__row_id__", DataType::Utf8, false),
+                column_def("region", DataType::Utf8, true),
+            ],
+            group_key_names: vec!["region".to_string()],
+            aggregate_state_names: layout
+                .state_columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect(),
+            physical_column_names: layout
+                .physical_columns
+                .iter()
+                .map(|column| column.column.name.clone())
+                .collect(),
+            row_id_column_name: "__row_id__".to_string(),
+            row_filter: IcebergMvTargetStateRowFilter::DeltaInputRowIds {
+                row_id_column_name: "__row_id__".to_string(),
+                branch_scope: None,
+            },
+            partition_constraint: IcebergMvTargetStatePartitionConstraint::Unpartitioned,
+        }
+    }
+
+    fn target_state_table_def(scan: IcebergMvTargetStateScan) -> TableDef {
+        TableDef {
+            name: scan.table.clone(),
+            columns: aggregate_physical_columns_for_test()
+                .into_iter()
+                .map(|column| column_def(&column.name, column.data_type, column.nullable))
+                .collect(),
+            iceberg_row_lineage_metadata_columns: vec![],
+            source: ScanSource::IcebergMvTargetState(scan),
+        }
+    }
+
+    struct LocalVersionScanFixture {
+        _tmpdir: tempfile::TempDir,
+        catalog_entry: crate::connector::iceberg::catalog::registry::IcebergCatalogEntry,
+        table_info: IcebergTableInfo,
+        snapshot_id: i64,
+    }
+
+    fn local_version_scan_fixture() -> LocalVersionScanFixture {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            use crate::connector::iceberg::commit::{
+                CommitCtx, CommitOpKind, FastAppendCommit, IcebergCommitAction,
+                IcebergCommitCollector, WrittenFile,
+            };
+            use iceberg::{NamespaceIdent, TableCreation, TableIdent};
+
+            let tmpdir = tempfile::tempdir().expect("tempdir");
+            let warehouse_uri = format!("file://{}", tmpdir.path().display());
+            let file_io = iceberg::io::FileIO::new_with_fs();
+            let catalog: Arc<dyn iceberg::Catalog> = Arc::new(
+                crate::connector::iceberg::catalog::hadoop_catalog::HadoopFileSystemCatalog::new(
+                    file_io,
+                    warehouse_uri.clone(),
+                ),
+            );
+            let namespace = NamespaceIdent::new("ns".to_string());
+            catalog
+                .create_namespace(&namespace, HashMap::new())
+                .await
+                .expect("create namespace");
+            let schema = Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                ))])
+                .build()
+                .expect("base schema");
+            let table_ident = TableIdent::new(namespace.clone(), "version_base".to_string());
+            let mut table = catalog
+                .create_table(
+                    &namespace,
+                    TableCreation::builder()
+                        .name("version_base".to_string())
+                        .schema(schema)
+                        .format_version(FormatVersion::V3)
+                        .build(),
+                )
+                .await
+                .expect("create base table");
+
+            let table_location = table.metadata().location().to_string();
+            let metadata = table.metadata();
+            let collector = Arc::new(
+                IcebergCommitCollector::new(
+                    CommitOpKind::FastAppend,
+                    table_ident.clone(),
+                    metadata
+                        .current_snapshot()
+                        .map(|snapshot| snapshot.snapshot_id()),
+                    metadata.last_sequence_number(),
+                    metadata.current_schema().clone(),
+                    metadata.default_partition_spec().clone(),
+                    format!("{table_location}/staging"),
+                    crate::common::types::UniqueId { hi: 0, lo: 0 },
+                )
+                .with_table_metadata(metadata.clone()),
+            );
+            collector.inject_written_file(WrittenFile {
+                path: format!("{table_location}/data/file-0.parquet"),
+                format: DataFileFormat::Parquet,
+                content: DataContentType::Data,
+                partition_values: Struct::empty(),
+                partition_spec_id: 0,
+                record_count: 10,
+                file_size_in_bytes: 1024,
+                split_offsets: vec![],
+                column_sizes: HashMap::new(),
+                value_counts: HashMap::new(),
+                null_value_counts: HashMap::new(),
+                lower_bounds: HashMap::new(),
+                upper_bounds: HashMap::new(),
+                key_metadata: None,
+                referenced_data_file: None,
+                equality_ids: None,
+                first_row_id: None,
+                content_offset: None,
+                content_size_in_bytes: None,
+                cardinality: None,
+            });
+            let file_io = table.file_io().clone();
+            let abort_handle = collector.abort_log.clone();
+            let snapshot_properties = BTreeMap::new();
+            let ctx = CommitCtx {
+                collector: &collector,
+                table: &table,
+                catalog: catalog.as_ref(),
+                file_io: &file_io,
+                commit_uuid: uuid::Uuid::new_v4(),
+                abort_handle,
+                target_ref: "main",
+                snapshot_properties: &snapshot_properties,
+            };
+            FastAppendCommit
+                .commit(ctx)
+                .await
+                .expect("append synthetic data file");
+            table = catalog
+                .load_table(&table_ident)
+                .await
+                .expect("reload base table");
+            let snapshot_id = table
+                .metadata()
+                .current_snapshot()
+                .expect("current snapshot")
+                .snapshot_id();
+            let catalog_entry = crate::connector::iceberg::catalog::registry::build_catalog_entry(
+                "ice",
+                &[
+                    ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                    (
+                        "iceberg.catalog.warehouse".to_string(),
+                        warehouse_uri.clone(),
+                    ),
+                ],
+            )
+            .expect("base catalog entry");
+            let table_info = IcebergTableInfo {
+                catalog: "ice".to_string(),
+                namespace: "ns".to_string(),
+                table: "version_base".to_string(),
+                table_uuid: Some(table.metadata().uuid().to_string()),
+                current_snapshot_id: Some(snapshot_id),
+                schema_id: table.metadata().current_schema_id(),
+                location: table.metadata().location().to_string(),
+                schema: IcebergSchemaDef { fields: vec![] },
+                serialized_metadata: None,
+                serialized_metadata_rows: None,
+            };
+
+            LocalVersionScanFixture {
+                _tmpdir: tmpdir,
+                catalog_entry,
+                table_info,
+                snapshot_id,
+            }
+        })
+    }
+
+    fn version_scan_plan_for_fixture(fixture: &LocalVersionScanFixture) -> PhysicalPlanNode {
+        let id = output_col(120, "id", DataType::Int64, false);
+        physical_node(
+            Operator::PhysicalScan(PhysicalScanOp {
+                database: "ns".to_string(),
+                table: TableDef {
+                    name: fixture.table_info.table.clone(),
+                    columns: vec![column_def("id", DataType::Int64, false)],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    source: ScanSource::IcebergVersionTable {
+                        table: fixture.table_info.clone(),
+                        snapshot_id: fixture.snapshot_id,
+                    },
+                },
+                alias: Some("base".to_string()),
+                columns: vec![id.clone()],
+                predicates: vec![],
+                required_columns: Some(vec!["id".to_string()]),
+                dict_columns: vec![],
+                variant_columns: vec![],
+                mv_rewritten_from: None,
+            }),
+            vec![],
+            vec![id],
+        )
+    }
+
+    fn aggregate_merge_plan_for_test(
+        old_child: PhysicalPlanNode,
+        delta_child: PhysicalPlanNode,
+        aggregate_state_names: Vec<String>,
+    ) -> PhysicalPlanNode {
+        let output_columns = vec![
+            output_col(1, "region", DataType::Utf8, true),
+            output_col(2, "c", DataType::Int64, false),
+            output_col(3, "s", DataType::Int64, true),
+            output_col(4, "__change_op", DataType::Int8, false),
+        ];
+        physical_node(
+            Operator::PhysicalAggregateStateMerge(AggregateStateMergeOp {
+                group_key_names: vec!["region".to_string()],
+                aggregate_state_names,
+                change_op_column: crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
+                output_columns: output_columns.clone(),
+            }),
+            vec![old_child, delta_child],
+            output_columns,
+        )
+    }
+
+    fn aggregate_physical_columns_for_test() -> Vec<OutputColumn> {
+        vec![
+            output_col(10, "__row_id__", DataType::Utf8, false),
+            output_col(11, "region", DataType::Utf8, true),
+            output_col(12, "c", DataType::Int64, false),
+            output_col(13, "s", DataType::Int64, true),
+            output_col(14, "__agg_state_c", DataType::Binary, false),
+            output_col(15, "__agg_state_s", DataType::Binary, false),
+        ]
+    }
+
+    fn aggregate_delta_state_columns_for_test() -> Vec<OutputColumn> {
+        vec![
+            output_col(21, "region", DataType::Utf8, true),
+            output_col(22, "__agg_state_c", DataType::Binary, false),
+            output_col(23, "__agg_state_s", DataType::Binary, false),
+        ]
+    }
+
+    fn branch_union_project_for_test(
+        merge: PhysicalPlanNode,
+        branch_id: i32,
+        output_id_base: u32,
+    ) -> PhysicalPlanNode {
+        let mut items = merge
+            .output_columns
+            .iter()
+            .enumerate()
+            .map(|(idx, column)| ProjectItem {
+                expr: TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        column_id: column.column_id,
+                        qualifier: None,
+                        column: column.name.clone(),
+                    },
+                    data_type: column.data_type.clone(),
+                    nullable: column.nullable,
+                },
+                output_name: column.name.clone(),
+                output_column_id: ColumnId::new_for_test(output_id_base + idx as u32),
+            })
+            .collect::<Vec<_>>();
+        let branch_column_id = ColumnId::new_for_test(output_id_base + items.len() as u32);
+        items.push(ProjectItem {
+            expr: TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Int(branch_id as i64)),
+                data_type: DataType::Int32,
+                nullable: false,
+            },
+            output_name: crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN
+                .to_string(),
+            output_column_id: branch_column_id,
+        });
+        let output_columns = items
+            .iter()
+            .map(|item| OutputColumn {
+                column_id: item.output_column_id,
+                name: item.output_name.clone(),
+                data_type: item.expr.data_type.clone(),
+                nullable: item.expr.nullable,
+                is_internal: false,
+            })
+            .collect::<Vec<_>>();
+        physical_node(
+            Operator::PhysicalProject(PhysicalProjectOp {
+                items,
+                output_qualifier: None,
+            }),
+            vec![merge],
+            output_columns,
+        )
+    }
+
+    fn aggregate_refresh_context_for_test()
+    -> crate::engine::mv::refresh_context::IcebergMvRefreshContext {
+        mv_refresh_context_for_test(Some(99))
+    }
+
+    fn scan_refresh_context_for_test() -> crate::engine::mv::refresh_context::IcebergMvRefreshContext
+    {
+        mv_refresh_context_for_test(None)
+    }
+
+    fn mv_refresh_context_for_test(
+        target_snapshot_id: Option<i64>,
+    ) -> crate::engine::mv::refresh_context::IcebergMvRefreshContext {
+        use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+        use iceberg::{CatalogBuilder, NamespaceIdent, TableIdent};
+
+        let target_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(7)
+                .with_fields(vec![
+                    Arc::new(NestedField::optional(
+                        100,
+                        "region",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                    Arc::new(NestedField::required(
+                        101,
+                        "c",
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                    Arc::new(NestedField::optional(
+                        102,
+                        "s",
+                        Type::Primitive(PrimitiveType::Long),
+                    )),
+                    Arc::new(NestedField::required(
+                        999,
+                        "__row_id__",
+                        Type::Primitive(PrimitiveType::String),
+                    )),
+                    Arc::new(NestedField::required(
+                        200,
+                        "__agg_state_c",
+                        Type::Primitive(PrimitiveType::Binary),
+                    )),
+                    Arc::new(NestedField::required(
+                        201,
+                        "__agg_state_s",
+                        Type::Primitive(PrimitiveType::Binary),
+                    )),
+                ])
+                .build()
+                .expect("aggregate target schema"),
+        );
+        let contract = MvSchemaContract {
+            contract_version: 3,
+            base: BaseContract {
+                table_fqn: "ice.ns.orders".to_string(),
+                table_uuid: "uuid-orders".to_string(),
+                alias_at_create: None,
+                schema_id_at_create: 0,
+                schema_at_create: BaseSchemaSnapshot {
+                    fields: vec![
+                        BaseFieldRecord {
+                            field_id: 1,
+                            name_at_create: "region".to_string(),
+                            type_signature: "string".to_string(),
+                            required: false,
+                        },
+                        BaseFieldRecord {
+                            field_id: 2,
+                            name_at_create: "amount".to_string(),
+                            type_signature: "long".to_string(),
+                            required: false,
+                        },
+                    ],
+                },
+            },
+            bases: Vec::new(),
+            output: OutputContract {
+                columns: vec![
+                    OutputColumnLineage {
+                        expression: ExpressionLineage {
+                            kind: ExpressionKind::Column,
+                            referenced_base_field_ids: vec![1],
+                            referenced_base_fields: Vec::new(),
+                        },
+                    },
+                    OutputColumnLineage {
+                        expression: ExpressionLineage {
+                            kind: ExpressionKind::Func,
+                            referenced_base_field_ids: Vec::new(),
+                            referenced_base_fields: Vec::new(),
+                        },
+                    },
+                    OutputColumnLineage {
+                        expression: ExpressionLineage {
+                            kind: ExpressionKind::Func,
+                            referenced_base_field_ids: vec![2],
+                            referenced_base_fields: Vec::new(),
+                        },
+                    },
+                ],
+                filter: None,
+            },
+            join: None,
+            aggregate: Some(AggregateStateContract {
+                state_layout_version: 1,
+                row_id_column_name: "__row_id__".to_string(),
+                state_columns: vec![
+                    AggregateStateColumnContract {
+                        column_name: "__agg_state_c".to_string(),
+                        target_field_id: 200,
+                        type_signature: "binary".to_string(),
+                        nullable: false,
+                        role: AggregateStateRoleContract::Single,
+                    },
+                    AggregateStateColumnContract {
+                        column_name: "__agg_state_s".to_string(),
+                        target_field_id: 201,
+                        type_signature: "binary".to_string(),
+                        nullable: false,
+                        role: AggregateStateRoleContract::Single,
+                    },
+                ],
+            }),
+            branch: None,
+            target: TargetContract {
+                table_fqn: "tgt.ns.orders_mv".to_string(),
+                table_uuid: "uuid-target".to_string(),
+                schema_id_at_create: 7,
+                visible_columns: vec![
+                    TargetVisibleColumn {
+                        output_name: "region".to_string(),
+                        target_field_id: 100,
+                        type_signature: "string".to_string(),
+                        nullable: true,
+                    },
+                    TargetVisibleColumn {
+                        output_name: "c".to_string(),
+                        target_field_id: 101,
+                        type_signature: "long".to_string(),
+                        nullable: false,
+                    },
+                    TargetVisibleColumn {
+                        output_name: "s".to_string(),
+                        target_field_id: 102,
+                        type_signature: "long".to_string(),
+                        nullable: true,
+                    },
+                ],
+                hidden_apply_key: HiddenApplyKeyContract {
+                    column_name: "__row_id__".to_string(),
+                    target_field_id: 999,
+                    source: ApplyKeySource::GroupRowId,
+                },
+                partition: None,
+            },
+        };
+        let mv_definition = StoredMvDefinition {
+            mv_id: 42,
+            select_sql:
+                "select region, count(*) as c, sum(amount) as s from ice.ns.orders group by region"
+                    .to_string(),
+            base_table_refs: vec!["ice.ns.orders".to_string()],
+            primary_key_columns: vec!["__row_id__".to_string()],
+            storage_engine: "iceberg".to_string(),
+            target_catalog: Some("tgt".to_string()),
+            target_namespace: Some("ns".to_string()),
+            target_table: Some("orders_mv".to_string()),
+            schema_contract: Some(contract.clone()),
+            partition_spec: None,
+            partition_state_complete: false,
+            last_refresh_ms: None,
+            last_refresh_rows: None,
+            last_refresh_snapshots: [("ice.ns.orders".to_string(), 11i64)].into_iter().collect(),
+            last_refresh_table_uuids: [("ice.ns.orders".to_string(), "uuid-orders".to_string())]
+                .into_iter()
+                .collect(),
+            last_refreshed_iceberg_snapshot_id: target_snapshot_id,
+            refresh_in_progress: false,
+            active_refresh_id: None,
+            refresh_target_snapshots: Default::default(),
+            refresh_policy: Default::default(),
+            refresh_paused: false,
+            refresh_interval_ms: None,
+            max_staleness_ms: None,
+            last_scheduler_error: None,
+            next_refresh_after_ms: None,
+            created_at_ms: 0,
+        };
+        let query = Arc::new(
+            crate::engine::mv::refresh_context::tests_support::parse_query(
+                "select region, count(*) as c, sum(amount) as s from ice.ns.orders group by region",
+            ),
+        );
+        let base_refs: Arc<[crate::connector::starrocks::table::model::IcebergTableRef]> =
+            Arc::from(vec![
+                crate::engine::mv::refresh_context::tests_support::make_ref("ice", "ns", "orders"),
+            ]);
+        let pin = Arc::new(crate::engine::mv::refresh_context::tests_support::make_pin(
+            &[("ice.ns.orders", 22, "uuid-orders")],
+        ));
+        let rewrite = Arc::new(
+            crate::engine::mv::refresh_context::IcebergMvRewriteContext::from_parts(
+                crate::engine::mv::iceberg_refresh::IcebergMvTarget {
+                    catalog: "tgt".to_string(),
+                    namespace: "ns".to_string(),
+                    table: "orders_mv".to_string(),
+                },
+                42,
+                Some("sess_cat".to_string()),
+                "sess_db".to_string(),
+                Arc::new(mv_definition),
+                query,
+                base_refs,
+                pin,
+                target_snapshot_id,
+                "uuid-target".to_string(),
+                target_schema.clone(),
+                Some(Arc::new(contract)),
+            )
+            .expect("aggregate rewrite context"),
+        );
+        let warehouse = format!("memory://equiv-{}", uuid::Uuid::new_v4());
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let iceberg_catalog: Arc<dyn iceberg::Catalog> = Arc::new(
+            runtime
+                .block_on(MemoryCatalogBuilder::default().load(
+                    "memory",
+                    HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse.clone())]),
+                ))
+                .expect("memory catalog"),
+        );
+        let target_entry = Arc::new(
+            crate::connector::iceberg::catalog::registry::build_catalog_entry(
+                "tgt",
+                &[
+                    ("iceberg.catalog.type".to_string(), "memory".to_string()),
+                    ("iceberg.catalog.warehouse".to_string(), warehouse),
+                ],
+            )
+            .expect("target entry"),
+        );
+        let metadata = iceberg::spec::TableMetadataBuilder::new(
+            target_schema.as_ref().clone(),
+            iceberg::spec::PartitionSpec::unpartition_spec().into_unbound(),
+            iceberg::spec::SortOrder::unsorted_order(),
+            "memory://target/orders_mv".to_string(),
+            iceberg::spec::FormatVersion::V3,
+            HashMap::new(),
+        )
+        .expect("metadata builder")
+        .build()
+        .expect("metadata")
+        .metadata;
+        let target_table = iceberg::table::Table::builder()
+            .file_io(iceberg::io::FileIO::new_with_memory())
+            .metadata(metadata)
+            .identifier(TableIdent::new(
+                NamespaceIdent::new("ns".to_string()),
+                "orders_mv".to_string(),
+            ))
+            .build()
+            .expect("target table");
+
+        crate::engine::mv::refresh_context::IcebergMvRefreshContext {
+            rewrite,
+            target_entry,
+            base_catalog_entries: BTreeMap::new(),
+            iceberg_catalog,
+            target_table,
+            affected_partitions:
+                crate::engine::mv::partition::AffectedTargetPartitions::not_derived("test context"),
+            pruning_limits: crate::engine::mv::refresh_context::MvRefreshPruningLimits::default(),
+        }
     }
 
     fn filter_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
