@@ -25,6 +25,7 @@ use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, materialize};
 use crate::sql::optimizer::scalar_bridge::{
     materialize_exprs, materialize_project_items, materialize_window_exprs,
 };
+use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::statistics::*;
 use crate::sql::planner::plan::LogicalPlanNode;
 
@@ -685,6 +686,31 @@ pub(crate) fn derive_logical_plan_statistics(
 ) -> Statistics {
     let mut memo = Memo::new();
     let root_group = super::convert::logical_plan_to_memo(plan, &mut memo);
+    derive_group_statistics(&mut memo, table_stats);
+    memo.groups
+        .get(root_group)
+        .and_then(|group| group.logical_props.as_ref())
+        .map(|props| Statistics {
+            output_row_count: props.row_count,
+            row_count_confidence: props.row_count_confidence,
+            column_statistics: props.column_statistics.clone(),
+        })
+        .unwrap_or_else(|| Statistics {
+            output_row_count: 1.0,
+            row_count_confidence: Confidence::Fallback,
+            column_statistics: HashMap::new(),
+        })
+}
+
+pub(crate) fn derive_opt_expr_statistics(
+    expr: &OptExpr,
+    arena: &ScalarArena,
+    table_stats: &HashMap<String, TableStatistics>,
+) -> Statistics {
+    let mut memo = Memo::new();
+    // Donate a clone of the caller's arena so the memo can materialize scalars.
+    memo.scalars = arena.clone();
+    let root_group = super::convert::opt_expr_to_memo(expr, &mut memo);
     derive_group_statistics(&mut memo, table_stats);
     memo.groups
         .get(root_group)

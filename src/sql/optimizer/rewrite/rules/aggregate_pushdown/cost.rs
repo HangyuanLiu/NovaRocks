@@ -3,13 +3,9 @@
 use std::collections::HashMap;
 
 use crate::sql::analysis::ExprKind;
+use crate::sql::optimizer::scalar::{ScalarArena, materialize};
 use crate::sql::optimizer::statistics::{Confidence, TableStatistics};
-use crate::sql::optimizer::stats::derive_logical_plan_statistics;
-
-#[cfg(test)]
-use crate::sql::analysis::TypedExpr;
-#[cfg(test)]
-use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind};
+use crate::sql::optimizer::stats::derive_opt_expr_statistics;
 
 use super::context::PushPlan;
 
@@ -19,8 +15,12 @@ const MIN_PARTIAL_BENEFIT_RATIO: f64 = 0.5;
 const UNKNOWN_NDV_ROW_THRESHOLD: f64 = 10_000.0;
 
 /// True iff pushing the partial aggregate is expected to reduce rows.
-pub(crate) fn should_push(plan: &PushPlan, table_stats: &HashMap<String, TableStatistics>) -> bool {
-    let stats = derive_logical_plan_statistics(&plan.target_subtree, table_stats);
+pub(crate) fn should_push(
+    plan: &PushPlan,
+    arena: &ScalarArena,
+    table_stats: &HashMap<String, TableStatistics>,
+) -> bool {
+    let stats = derive_opt_expr_statistics(&plan.target_subtree, arena, table_stats);
     let row_count = stats.output_row_count;
     if row_count <= 1.0 {
         // Trivially small subtree; partial buys nothing.
@@ -30,23 +30,28 @@ pub(crate) fn should_push(plan: &PushPlan, table_stats: &HashMap<String, TableSt
     let ndvs: Vec<Option<f64>> = plan
         .partial_groupby
         .iter()
-        .map(|gb| match &gb.kind {
-            ExprKind::ColumnRef { column_id, .. } => {
-                stats.column_statistics.get(column_id).and_then(|cs| {
-                    let ndv = cs.distinct_values_count;
-                    if !ndv.is_finite() || ndv <= 0.0 {
-                        return None;
-                    }
-                    match cs.confidence {
-                        Confidence::Exact => Some(ndv),
-                        Confidence::Estimated if ndv < row_count * MIN_PARTIAL_BENEFIT_RATIO => {
-                            Some(ndv)
+        .map(|gb_id| {
+            let gb = materialize(arena, *gb_id);
+            match &gb.kind {
+                ExprKind::ColumnRef { column_id, .. } => {
+                    stats.column_statistics.get(column_id).and_then(|cs| {
+                        let ndv = cs.distinct_values_count;
+                        if !ndv.is_finite() || ndv <= 0.0 {
+                            return None;
                         }
-                        Confidence::Estimated | Confidence::Fallback => None,
-                    }
-                })
+                        match cs.confidence {
+                            Confidence::Exact => Some(ndv),
+                            Confidence::Estimated
+                                if ndv < row_count * MIN_PARTIAL_BENEFIT_RATIO =>
+                            {
+                                Some(ndv)
+                            }
+                            Confidence::Estimated | Confidence::Fallback => None,
+                        }
+                    })
+                }
+                _ => None,
             }
-            _ => None,
         })
         .collect();
 
@@ -62,12 +67,13 @@ pub(crate) fn should_push(plan: &PushPlan, table_stats: &HashMap<String, TableSt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::{BinOp, LiteralValue, OutputColumn};
+    use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn};
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::operator::{Operator, ScanOp};
+    use crate::sql::optimizer::opt_expr::OptExpr;
+    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
     use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence};
-    use crate::sql::planner::plan::LogicalScanNode;
-    use crate::sql::planner::plan::*;
     use arrow::datatypes::DataType;
 
     fn test_col_id(name: &str) -> ColumnId {
@@ -77,8 +83,8 @@ mod tests {
         }
     }
 
-    fn col_ref(name: &str) -> TypedExpr {
-        TypedExpr {
+    fn col_ref_typed(name: &str) -> crate::sql::analysis::TypedExpr {
+        crate::sql::analysis::TypedExpr {
             kind: ExprKind::ColumnRef {
                 column_id: test_col_id(name),
                 qualifier: None,
@@ -94,35 +100,34 @@ mod tests {
         row_count: u64,
         col: &str,
         ndv: f64,
-    ) -> (LogicalPlanNode, HashMap<String, TableStatistics>) {
-        let scan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Scan(LogicalScanNode {
-                database: "db".into(),
-                table: TableDef {
-                    name: table.into(),
-                    columns: vec![],
-                    iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::StarRocks {
-                        db_id: 0,
-                        table_id: 0,
-                    },
+        arena: &mut ScalarArena,
+    ) -> (OptExpr, HashMap<String, TableStatistics>) {
+        let scan = OptExpr::leaf(Operator::LogicalScan(ScanOp {
+            database: "db".into(),
+            table: TableDef {
+                name: table.into(),
+                columns: vec![],
+                iceberg_row_lineage_metadata_columns: vec![],
+                source: ScanSource::StarRocks {
+                    db_id: 0,
+                    table_id: 0,
                 },
-                alias: None,
-                columns: vec![OutputColumn {
-                    column_id: test_col_id(col),
-                    name: col.into(),
-                    data_type: DataType::Int64,
-                    nullable: false,
-                    is_internal: false,
-                }],
-                predicates: vec![],
-                required_columns: None,
-                dict_columns: vec![],
-                variant_columns: vec![],
-            }),
-            vec![],
-            None,
-        );
+            },
+            alias: None,
+            columns: vec![OutputColumn {
+                column_id: test_col_id(col),
+                name: col.into(),
+                data_type: DataType::Int64,
+                nullable: false,
+                is_internal: false,
+            }],
+            predicates: vec![],
+            required_columns: None,
+            dict_columns: vec![],
+            variant_columns: vec![],
+            mv_rewritten_from: None,
+        }));
+        let _ = arena; // arena not needed for scan construction but kept for consistency
         let mut col_stats = HashMap::new();
         let confidence = if ndv.is_finite() {
             Confidence::Exact
@@ -152,16 +157,16 @@ mod tests {
         (scan, table_stats)
     }
 
-    fn scan_without_stats_with_predicate() -> LogicalPlanNode {
-        let (scan_plan, _) = scan_with_stats("unknown_table", 1, "k", f64::NAN);
-        let LogicalPlanNodeKind::Scan(mut scan) = scan_plan.kind else {
+    fn scan_without_stats_with_predicate(arena: &mut ScalarArena) -> OptExpr {
+        let (scan, _) = scan_with_stats("unknown_table", 1, "k", f64::NAN, arena);
+        let Operator::LogicalScan(mut scan_op) = scan.op else {
             unreachable!("scan_with_stats returns a scan");
         };
-        scan.predicates = vec![TypedExpr {
+        let predicate = crate::sql::analysis::TypedExpr {
             kind: ExprKind::BinaryOp {
-                left: Box::new(col_ref("k")),
+                left: Box::new(col_ref_typed("k")),
                 op: BinOp::Eq,
-                right: Box::new(TypedExpr {
+                right: Box::new(crate::sql::analysis::TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Int(7)),
                     data_type: DataType::Int64,
                     nullable: false,
@@ -169,37 +174,41 @@ mod tests {
             },
             data_type: DataType::Boolean,
             nullable: false,
-        }];
-        LogicalPlanNode::new(LogicalPlanNodeKind::Scan(scan), vec![], None)
+        };
+        scan_op.predicates.push(intern_typed(arena, &predicate));
+        OptExpr::leaf(Operator::LogicalScan(scan_op))
+    }
+
+    fn make_push_plan(scan: OptExpr, arena: &mut ScalarArena) -> PushPlan {
+        let gb_id = intern_typed(arena, &col_ref_typed("k"));
+        PushPlan {
+            side: super::super::context::Side::Left,
+            target_subtree: scan,
+            partial_groupby: vec![gb_id],
+            partial_aggregates: vec![],
+        }
     }
 
     #[test]
     fn low_cardinality_pushes() {
-        let (scan, stats) = scan_with_stats("t", 10_000, "k", 10.0);
-        let plan = PushPlan {
-            side: super::super::context::Side::Left,
-            target_subtree: scan,
-            partial_groupby: vec![col_ref("k")],
-            partial_aggregates: vec![],
-        };
-        assert!(should_push(&plan, &stats));
+        let mut arena = ScalarArena::new();
+        let (scan, stats) = scan_with_stats("t", 10_000, "k", 10.0, &mut arena);
+        let plan = make_push_plan(scan, &mut arena);
+        assert!(should_push(&plan, &arena, &stats));
     }
 
     #[test]
     fn high_cardinality_rejects() {
-        let (scan, stats) = scan_with_stats("t", 10_000, "k", 10_000.0);
-        let plan = PushPlan {
-            side: super::super::context::Side::Left,
-            target_subtree: scan,
-            partial_groupby: vec![col_ref("k")],
-            partial_aggregates: vec![],
-        };
-        assert!(!should_push(&plan, &stats));
+        let mut arena = ScalarArena::new();
+        let (scan, stats) = scan_with_stats("t", 10_000, "k", 10_000.0, &mut arena);
+        let plan = make_push_plan(scan, &mut arena);
+        assert!(!should_push(&plan, &arena, &stats));
     }
 
     #[test]
     fn estimated_upper_bound_ndv_falls_back_to_row_threshold() {
-        let (scan, mut stats) = scan_with_stats("t", 90_000, "k", 90_000.0);
+        let mut arena = ScalarArena::new();
+        let (scan, mut stats) = scan_with_stats("t", 90_000, "k", 90_000.0, &mut arena);
         stats
             .get_mut("t")
             .unwrap()
@@ -207,59 +216,39 @@ mod tests {
             .get_mut("k")
             .unwrap()
             .confidence = Confidence::Estimated;
-        let plan = PushPlan {
-            side: super::super::context::Side::Left,
-            target_subtree: scan,
-            partial_groupby: vec![col_ref("k")],
-            partial_aggregates: vec![],
-        };
-        assert!(should_push(&plan, &stats));
+        let plan = make_push_plan(scan, &mut arena);
+        assert!(should_push(&plan, &arena, &stats));
     }
 
     #[test]
     fn unknown_ndv_pushes_above_threshold() {
-        let (scan, stats) = scan_with_stats("t", 20_000, "k", f64::NAN);
-        let plan = PushPlan {
-            side: super::super::context::Side::Left,
-            target_subtree: scan,
-            partial_groupby: vec![col_ref("k")],
-            partial_aggregates: vec![],
-        };
-        assert!(should_push(&plan, &stats));
+        let mut arena = ScalarArena::new();
+        let (scan, stats) = scan_with_stats("t", 20_000, "k", f64::NAN, &mut arena);
+        let plan = make_push_plan(scan, &mut arena);
+        assert!(should_push(&plan, &arena, &stats));
     }
 
     #[test]
     fn unknown_ndv_pushes_at_threshold() {
-        let (scan, stats) = scan_with_stats("t", 10_000, "k", f64::NAN);
-        let plan = PushPlan {
-            side: super::super::context::Side::Left,
-            target_subtree: scan,
-            partial_groupby: vec![col_ref("k")],
-            partial_aggregates: vec![],
-        };
-        assert!(should_push(&plan, &stats));
+        let mut arena = ScalarArena::new();
+        let (scan, stats) = scan_with_stats("t", 10_000, "k", f64::NAN, &mut arena);
+        let plan = make_push_plan(scan, &mut arena);
+        assert!(should_push(&plan, &arena, &stats));
     }
 
     #[test]
     fn unknown_ndv_rejects_below_threshold() {
-        let (scan, stats) = scan_with_stats("t", 500, "k", f64::NAN);
-        let plan = PushPlan {
-            side: super::super::context::Side::Left,
-            target_subtree: scan,
-            partial_groupby: vec![col_ref("k")],
-            partial_aggregates: vec![],
-        };
-        assert!(!should_push(&plan, &stats));
+        let mut arena = ScalarArena::new();
+        let (scan, stats) = scan_with_stats("t", 500, "k", f64::NAN, &mut arena);
+        let plan = make_push_plan(scan, &mut arena);
+        assert!(!should_push(&plan, &arena, &stats));
     }
 
     #[test]
     fn fallback_scan_with_predicate_uses_main_optimizer_row_estimate() {
-        let plan = PushPlan {
-            side: super::super::context::Side::Left,
-            target_subtree: scan_without_stats_with_predicate(),
-            partial_groupby: vec![col_ref("k")],
-            partial_aggregates: vec![],
-        };
-        assert!(should_push(&plan, &HashMap::new()));
+        let mut arena = ScalarArena::new();
+        let scan = scan_without_stats_with_predicate(&mut arena);
+        let plan = make_push_plan(scan, &mut arena);
+        assert!(should_push(&plan, &arena, &HashMap::new()));
     }
 }
