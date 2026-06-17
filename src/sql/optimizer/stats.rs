@@ -722,6 +722,17 @@ pub(crate) fn derive_group_statistics(
     table_stats: &HashMap<String, TableStatistics>,
 ) {
     for group_idx in 0..memo.groups.len() {
+        // Memoized derive: a group's logical_props are computed exactly once,
+        // when first needed (StarRocks isStatsDerived semantics). Safe because
+        // the memo is append-only — explore()/implement() only append new exprs
+        // and never rewrite an existing group's logical_exprs.first() in place,
+        // so re-deriving an already-computed group would reproduce the identical
+        // value. INVARIANT: any future rule that mutates an existing group's
+        // first logical expr in place MUST reset that group's logical_props to
+        // None, or this skip will serve stale statistics.
+        if memo.groups[group_idx].logical_props.is_some() {
+            continue;
+        }
         derive_group_statistics_for(memo, group_idx, table_stats);
     }
 }
@@ -733,6 +744,9 @@ pub(crate) fn derive_group_statistics(
 /// newly-created join group immediately, before `implement()` runs — otherwise
 /// a bushy join's children have no column ids and `JoinToHashJoin` degrades the
 /// join to a NestLoop.
+/// Callers rely on the append-only memo invariant: if a rule ever rewrites an
+/// existing group's first expression in place, it must reset that group's
+/// `logical_props` to `None` so a later derive recomputes it.
 pub(crate) fn derive_group_statistics_for(
     memo: &mut Memo,
     group_idx: usize,
@@ -819,8 +833,15 @@ pub(crate) fn copy_in_join_tree(
 ///
 /// Reads `logical_props` from the child group. If not yet derived (should
 /// not happen when groups are processed in order), returns a default.
+/// Returns a conservative default if `index` is out of bounds (malformed memo).
 fn child_statistics(memo: &Memo, children: &[super::memo::GroupId], index: usize) -> Statistics {
-    let group_id = children[index];
+    let Some(&group_id) = children.get(index) else {
+        return Statistics {
+            output_row_count: 10_000.0,
+            row_count_confidence: Confidence::Fallback,
+            column_statistics: HashMap::new(),
+        };
+    };
     let group = &memo.groups[group_id];
     if let Some(ref props) = group.logical_props {
         // Column statistics now travel on LogicalProperties, so propagate
@@ -2754,6 +2775,97 @@ mod tests {
         assert!(physical_stats.column_statistics.is_empty());
     }
 
+    #[test]
+    fn physical_hash_aggregate_own_stats_are_per_expr_not_per_group() {
+        use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
+        use crate::sql::column_id::ColumnId;
+        use crate::sql::optimizer::memo::{LogicalProperties, MExpr, Memo};
+        use crate::sql::optimizer::operator::{
+            AggMode, LogicalValuesOp, Operator, PhysicalHashAggregateOp,
+        };
+        use crate::sql::optimizer::statistics::ColumnStatistic;
+        use std::collections::HashMap;
+
+        fn col_ref(id: u32, name: &str) -> TypedExpr {
+            TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: ColumnId::new_for_test(id),
+                    qualifier: Some("t".to_string()),
+                    column: name.to_string(),
+                },
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: false,
+            }
+        }
+        fn output_column(id: u32, name: &str) -> OutputColumn {
+            OutputColumn {
+                column_id: ColumnId::new_for_test(id),
+                name: name.to_string(),
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: false,
+                is_internal: false,
+            }
+        }
+        // A leaf group with the given row_count and a single group-by column (id=1) of NDV=100.
+        fn child_with_rows(memo: &mut Memo, rows: f64) -> usize {
+            let id = memo.next_expr_id();
+            let g = memo.new_group(MExpr {
+                id,
+                op: Operator::LogicalValues(LogicalValuesOp {
+                    rows: vec![],
+                    columns: vec![],
+                }),
+                children: vec![],
+            });
+            let mut props = LogicalProperties::new(vec![output_column(1, "k")], rows);
+            props.column_statistics.insert(
+                ColumnId::new_for_test(1),
+                ColumnStatistic {
+                    min_value: 0.0,
+                    max_value: rows,
+                    nulls_fraction: 0.0,
+                    average_row_size: 8.0,
+                    distinct_values_count: 100.0,
+                    ..Default::default()
+                },
+            );
+            memo.groups[g].logical_props = Some(props);
+            g
+        }
+        fn agg_over(child: usize, memo: &Memo) -> MExpr {
+            MExpr {
+                id: memo.next_expr_id(), // id is irrelevant to derive_statistics
+                op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+                    mode: AggMode::Single,
+                    group_by: vec![col_ref(1, "k")],
+                    aggregates: vec![],
+                    output_columns: vec![output_column(1, "k")],
+                    is_merge: vec![],
+                }),
+                children: vec![child],
+            }
+        }
+
+        let mut memo = Memo::new();
+        // big: 200 * 0.75 = 150 >= NDV 100  -> agg_group_rows = min(100, 150) = 100 (NDV-capped)
+        let big = child_with_rows(&mut memo, 200.0);
+        // small: 100 * 0.75 = 75 < NDV 100  -> agg_group_rows = min(100, 75) = 75 (row-capped)
+        let small = child_with_rows(&mut memo, 100.0);
+
+        let big_stats = derive_statistics(&agg_over(big, &memo), &memo, &HashMap::new());
+        let small_stats = derive_statistics(&agg_over(small, &memo), &memo, &HashMap::new());
+
+        // Same op, different children -> different own_stats. A single group cache
+        // cannot represent both, which is exactly why search.rs keeps own_stats per-expr.
+        assert!(
+            big_stats.output_row_count > small_stats.output_row_count,
+            "per-expr own_stats must differ: big={} small={}",
+            big_stats.output_row_count,
+            small_stats.output_row_count
+        );
+        assert_ne!(big_stats.output_row_count, small_stats.output_row_count);
+    }
+
     fn col_ref(name: &str) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
@@ -4615,6 +4727,57 @@ mod tests {
         assert!(
             sel > 0.85 && sel < 0.93,
             "not-between selectivity was {sel}"
+        );
+    }
+
+    #[test]
+    fn derive_group_statistics_skips_already_computed_groups() {
+        use crate::sql::optimizer::memo::{LogicalProperties, MExpr, Memo};
+        use crate::sql::optimizer::operator::{LogicalValuesOp, Operator};
+        use std::collections::HashMap;
+
+        let mut memo = Memo::new();
+
+        // Group A: simulates a group computed by an earlier derive pass. The
+        // sentinel row_count 999_999 is a value the real derivation would never
+        // produce for an empty LogicalValues (which derives to 0).
+        let group_a = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalValues(LogicalValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
+            children: vec![],
+        });
+        memo.groups[group_a].logical_props = Some(LogicalProperties::new(vec![], 999_999.0));
+
+        // Group B: simulates a fresh group minted by implement() — logical_props=None.
+        let group_b = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::LogicalValues(LogicalValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
+            children: vec![],
+        });
+        assert!(memo.groups[group_b].logical_props.is_none());
+
+        derive_group_statistics(&mut memo, &HashMap::new());
+
+        // Group A was memoized/skipped — sentinel preserved (NOT recomputed to 0).
+        assert_eq!(
+            memo.groups[group_a]
+                .logical_props
+                .as_ref()
+                .unwrap()
+                .row_count,
+            999_999.0,
+            "already-computed group must be skipped, not recomputed"
+        );
+        // Group B (None) must still be derived.
+        assert!(
+            memo.groups[group_b].logical_props.is_some(),
+            "fresh (None) group must still be derived"
         );
     }
 }
