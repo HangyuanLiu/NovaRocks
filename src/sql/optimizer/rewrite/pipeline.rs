@@ -1,8 +1,8 @@
+use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
 use crate::sql::optimizer::rewrite::tree::rewrite_with_rule;
-use crate::sql::planner::plan::LogicalPlanNode;
 
 pub(crate) struct RewriteStage {
     name: &'static str,
@@ -66,9 +66,9 @@ impl RewritePipeline {
 
     pub(crate) fn rewrite(
         &self,
-        plan: LogicalPlanNode,
+        plan: OptExpr,
         ctx: &mut RewriteContext,
-    ) -> Result<LogicalPlanNode, String> {
+    ) -> Result<OptExpr, String> {
         let mut current = plan;
 
         for stage in &self.stages {
@@ -115,17 +115,17 @@ impl RewritePipeline {
 
 #[cfg(test)]
 mod tests {
-    use crate::sql::planner::plan::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{RewritePipeline, RewriteStage};
+    use crate::sql::optimizer::operator::{Operator, GenerateSeriesOp, ValuesOp};
+    use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::phase::RewritePhase;
     use crate::sql::optimizer::rewrite::result::{RewriteDiagnostic, RewriteResult};
     use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
     use crate::sql::optimizer::rewrite::trace::RewriteTraceEvent;
-    use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind, LogicalValuesNode};
 
     struct DisabledRule {
         matches_called: Arc<AtomicUsize>,
@@ -140,14 +140,14 @@ mod tests {
             RewritePhase::LogicalNormalize
         }
 
-        fn matches(&self, _plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+        fn matches(&self, _expr: &OptExpr, _ctx: &RewriteContext) -> bool {
             self.matches_called.fetch_add(1, Ordering::SeqCst);
             true
         }
 
         fn apply(
             &self,
-            _plan: LogicalPlanNode,
+            _expr: OptExpr,
             _ctx: &mut RewriteContext,
         ) -> Result<RewriteResult, String> {
             Ok(RewriteResult::Unchanged)
@@ -165,13 +165,13 @@ mod tests {
             RewritePhase::LogicalNormalize
         }
 
-        fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
-            matches!(&plan.kind, LogicalPlanNodeKind::Values(_))
+        fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
+            matches!(&expr.op, Operator::LogicalValues(_))
         }
 
         fn apply(
             &self,
-            _plan: LogicalPlanNode,
+            _expr: OptExpr,
             _ctx: &mut RewriteContext,
         ) -> Result<RewriteResult, String> {
             Err("boom".to_string())
@@ -189,13 +189,13 @@ mod tests {
             RewritePhase::LogicalNormalize
         }
 
-        fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
-            matches!(&plan.kind, LogicalPlanNodeKind::Values(_))
+        fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
+            matches!(&expr.op, Operator::LogicalValues(_))
         }
 
         fn apply(
             &self,
-            _plan: LogicalPlanNode,
+            _expr: OptExpr,
             _ctx: &mut RewriteContext,
         ) -> Result<RewriteResult, String> {
             Ok(RewriteResult::Rejected(RewriteDiagnostic::rejected(
@@ -216,19 +216,17 @@ mod tests {
             RewritePhase::StructuralRewrite
         }
 
-        fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
-            matches!(&plan.kind, LogicalPlanNodeKind::Values(_))
+        fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
+            matches!(&expr.op, Operator::LogicalValues(_))
         }
 
         fn apply(
             &self,
-            _plan: LogicalPlanNode,
+            _expr: OptExpr,
             _ctx: &mut RewriteContext,
         ) -> Result<RewriteResult, String> {
-            use crate::sql::planner::plan::LogicalGenerateSeriesNode;
-
-            Ok(RewriteResult::Changed(LogicalPlanNode::new(
-                LogicalPlanNodeKind::GenerateSeries(LogicalGenerateSeriesNode {
+            Ok(RewriteResult::Changed(OptExpr::new(
+                Operator::LogicalGenerateSeries(GenerateSeriesOp {
                     start: 1,
                     end: 1,
                     step: 1,
@@ -237,7 +235,6 @@ mod tests {
                     output_column_id: crate::sql::column_id::ColumnId::UNSET,
                 }),
                 vec![],
-                None,
             )))
         }
     }
@@ -253,13 +250,13 @@ mod tests {
             RewritePhase::StructuralRewrite
         }
 
-        fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
-            matches!(&plan.kind, LogicalPlanNodeKind::GenerateSeries(_))
+        fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
+            matches!(&expr.op, Operator::LogicalGenerateSeries(_))
         }
 
         fn apply(
             &self,
-            _plan: LogicalPlanNode,
+            _expr: OptExpr,
             _ctx: &mut RewriteContext,
         ) -> Result<RewriteResult, String> {
             Ok(RewriteResult::Changed(empty_values_plan()))
@@ -401,7 +398,7 @@ mod tests {
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         let rewritten = pipeline.rewrite(empty_values_plan(), &mut ctx).unwrap();
 
-        assert!(matches!(&rewritten.kind, LogicalPlanNodeKind::Values(_)));
+        assert!(matches!(&rewritten.op, Operator::LogicalValues(_)));
         let changed_rules: Vec<&'static str> = ctx
             .trace()
             .events()
@@ -446,14 +443,13 @@ mod tests {
             .count()
     }
 
-    fn empty_values_plan() -> LogicalPlanNode {
-        LogicalPlanNode::new(
-            LogicalPlanNodeKind::Values(LogicalValuesNode {
+    fn empty_values_plan() -> OptExpr {
+        OptExpr::new(
+            Operator::LogicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![],
             }),
             vec![],
-            None,
         )
     }
 }
