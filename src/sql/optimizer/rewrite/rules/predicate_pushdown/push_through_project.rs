@@ -16,7 +16,9 @@ use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::optimizer::rewrite::rules::utils::{combine_and, split_and, wrap_remaining_filter_opt};
+use crate::sql::optimizer::rewrite::rules::utils::{
+    combine_and, split_and, wrap_remaining_filter_opt,
+};
 use crate::sql::optimizer::scalar::{self, ScalarArena};
 
 pub(crate) struct PushDownPredicateProject;
@@ -39,11 +41,7 @@ impl LogicalRewriteRule for PushDownPredicateProject {
                 .unwrap_or(false)
     }
 
-    fn apply(
-        &self,
-        expr: OptExpr,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         let OptExpr {
             op,
             mut children,
@@ -92,7 +90,9 @@ impl LogicalRewriteRule for PushDownPredicateProject {
         let pushed = combine_and(pushable);
         let pushed_id = scalar::intern_typed(&mut arena_rc.borrow_mut(), &pushed);
         let new_child = OptExpr::new(
-            Operator::LogicalFilter(FilterOp { predicate: pushed_id }),
+            Operator::LogicalFilter(FilterOp {
+                predicate: pushed_id,
+            }),
             vec![project_input],
         );
         let new_project = OptExpr {
@@ -414,7 +414,9 @@ mod tests {
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::operator::{FilterOp, Operator, ProjectOp, ScalarProjectItem, ScanOp};
+    use crate::sql::optimizer::operator::{
+        FilterOp, Operator, ProjectOp, ScalarProjectItem, ScanOp,
+    };
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::scalar::{self, ScalarArena};

@@ -26,11 +26,7 @@ impl LogicalRewriteRule for PruneExceptColumns {
         matches!(&expr.op, Operator::LogicalExcept(_))
     }
 
-    fn apply(
-        &self,
-        expr: OptExpr,
-        _ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         let Operator::LogicalExcept(_) = expr.op else {
             unreachable!()
         };

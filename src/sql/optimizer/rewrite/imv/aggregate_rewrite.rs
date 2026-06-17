@@ -13,11 +13,13 @@ use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
-use crate::sql::optimizer::rewrite::imv::{bridge_apply_result, opt_expr_to_plan, PlanRewriteResult};
 use crate::sql::optimizer::rewrite::imv::annotation::ImvExtension;
 use crate::sql::optimizer::rewrite::imv::join_delta::plan_output_columns;
 use crate::sql::optimizer::rewrite::imv::marker::plan_contains_imv_marker;
 use crate::sql::optimizer::rewrite::imv::target_state::build_target_state_scan_source;
+use crate::sql::optimizer::rewrite::imv::{
+    PlanRewriteResult, bridge_apply_result, opt_expr_to_plan,
+};
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
@@ -64,11 +66,7 @@ impl LogicalRewriteRule for RewriteAggregateStateRule {
         )
     }
 
-    fn apply(
-        &self,
-        expr: OptExpr,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         bridge_apply_result(expr, ctx, |plan, ctx| {
             let LogicalPlanNode {
                 kind, mut children, ..
@@ -1442,7 +1440,9 @@ mod tests {
         );
 
         let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
-        ctx.set_scalar_arena(std::rc::Rc::new(std::cell::RefCell::new(ScalarArena::new())));
+        ctx.set_scalar_arena(std::rc::Rc::new(
+            std::cell::RefCell::new(ScalarArena::new()),
+        ));
         ctx.set_extension::<ImvExtension>(ImvExtension {
             mv_ctx,
             annotation: ImvPlanAnnotation::default(),
@@ -1704,9 +1704,13 @@ mod tests {
         let rule = RewriteAggregateStateRule;
         let ctx = build_ctx();
         let arena_rc = ctx.scalar_arena();
-        let expr1 = logical_plan_to_opt_expr(&delta(aggregate_over(leaf_scan())), &mut arena_rc.borrow_mut());
+        let expr1 = logical_plan_to_opt_expr(
+            &delta(aggregate_over(leaf_scan())),
+            &mut arena_rc.borrow_mut(),
+        );
         assert!(rule.matches(&expr1, &ctx));
-        let expr2 = logical_plan_to_opt_expr(&aggregate_over(leaf_scan()), &mut arena_rc.borrow_mut());
+        let expr2 =
+            logical_plan_to_opt_expr(&aggregate_over(leaf_scan()), &mut arena_rc.borrow_mut());
         assert!(!rule.matches(&expr2, &ctx));
         let nested_delta = LogicalPlanNode::new(
             LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
@@ -1766,7 +1770,10 @@ mod tests {
         let rule = RewriteAggregateStateRule;
         let mut ctx = build_ctx();
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&delta(aggregate_over(leaf_scan())), &mut arena_rc.borrow_mut());
+        let expr = logical_plan_to_opt_expr(
+            &delta(aggregate_over(leaf_scan())),
+            &mut arena_rc.borrow_mut(),
+        );
         let result = rule
             .apply(expr, &mut ctx)
             .expect("aggregate rewrite must succeed");
@@ -1882,7 +1889,10 @@ mod tests {
             }),
         );
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&delta(aggregate_over(leaf_scan())), &mut arena_rc.borrow_mut());
+        let expr = logical_plan_to_opt_expr(
+            &delta(aggregate_over(leaf_scan())),
+            &mut arena_rc.borrow_mut(),
+        );
         let result = rule
             .apply(expr, &mut ctx)
             .expect("aggregate rewrite must succeed");
@@ -1997,8 +2007,10 @@ mod tests {
         );
         let arena_rc = ctx.scalar_arena();
         let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
-        let changed =
-            expect_changed_merge(rule.apply(expr, &mut ctx).expect("rewrite"), &arena_rc.borrow());
+        let changed = expect_changed_merge(
+            rule.apply(expr, &mut ctx).expect("rewrite"),
+            &arena_rc.borrow(),
+        );
         // Branch scope manifests as Project(Filter(Scan)) on the old input.
         assert!(
             matches!(&changed.left().kind, LogicalPlanNodeKind::Project(_)),
@@ -2011,8 +2023,10 @@ mod tests {
         let rule = RewriteAggregateStateRule;
         let mut ctx = build_ctx();
         let arena_rc = ctx.scalar_arena();
-        let expr =
-            logical_plan_to_opt_expr(&delta(aggregate_over(join_expanded_input())), &mut arena_rc.borrow_mut());
+        let expr = logical_plan_to_opt_expr(
+            &delta(aggregate_over(join_expanded_input())),
+            &mut arena_rc.borrow_mut(),
+        );
         let result = rule
             .apply(expr, &mut ctx)
             .expect("aggregate rewrite must succeed");
@@ -2058,7 +2072,8 @@ mod tests {
             None,
         );
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&delta(aggregate_over(input)), &mut arena_rc.borrow_mut());
+        let expr =
+            logical_plan_to_opt_expr(&delta(aggregate_over(input)), &mut arena_rc.borrow_mut());
         let result = rule
             .apply(expr, &mut ctx)
             .expect("aggregate rewrite must succeed");
@@ -2114,8 +2129,10 @@ mod tests {
         let rule = RewriteAggregateStateRule;
         let mut ctx = build_ctx();
         let arena_rc = ctx.scalar_arena();
-        let expr =
-            logical_plan_to_opt_expr(&delta(aggregate_first_output_over(leaf_scan())), &mut arena_rc.borrow_mut());
+        let expr = logical_plan_to_opt_expr(
+            &delta(aggregate_first_output_over(leaf_scan())),
+            &mut arena_rc.borrow_mut(),
+        );
         let result = rule
             .apply(expr, &mut ctx)
             .expect("aggregate rewrite must succeed");
@@ -2130,8 +2147,10 @@ mod tests {
         let rule = RewriteAggregateStateRule;
         let mut ctx = build_ctx();
         let arena_rc = ctx.scalar_arena();
-        let expr =
-            logical_plan_to_opt_expr(&delta(aggregate_with_two_calls(leaf_scan())), &mut arena_rc.borrow_mut());
+        let expr = logical_plan_to_opt_expr(
+            &delta(aggregate_with_two_calls(leaf_scan())),
+            &mut arena_rc.borrow_mut(),
+        );
         let err = rule
             .apply(expr, &mut ctx)
             .expect_err("state column count mismatch must fail");
@@ -2149,7 +2168,10 @@ mod tests {
             retraction_count_state_column(),
         ]);
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&delta(aggregate_over(leaf_scan())), &mut arena_rc.borrow_mut());
+        let expr = logical_plan_to_opt_expr(
+            &delta(aggregate_over(leaf_scan())),
+            &mut arena_rc.borrow_mut(),
+        );
         let err = rule
             .apply(expr, &mut ctx)
             .expect_err("non-binary state column must fail");
@@ -2164,7 +2186,10 @@ mod tests {
         let rule = RewriteAggregateStateRule;
         let mut ctx = build_ctx_with_state_columns(vec![single_state_column("binary")]);
         let arena_rc = ctx.scalar_arena();
-        let expr = logical_plan_to_opt_expr(&delta(aggregate_over(leaf_scan())), &mut arena_rc.borrow_mut());
+        let expr = logical_plan_to_opt_expr(
+            &delta(aggregate_over(leaf_scan())),
+            &mut arena_rc.borrow_mut(),
+        );
         let err = rule
             .apply(expr, &mut ctx)
             .expect_err("missing hidden retraction count state must fail");

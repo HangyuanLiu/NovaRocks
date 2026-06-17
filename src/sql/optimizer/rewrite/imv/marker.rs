@@ -10,7 +10,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::sql::optimizer::operator::{ImvDeltaOp, Operator};
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
-use crate::sql::optimizer::rewrite::imv::{bridge_apply_result, opt_expr_to_plan, PlanRewriteResult};
+use crate::sql::optimizer::rewrite::imv::{
+    PlanRewriteResult, bridge_apply_result, opt_expr_to_plan,
+};
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
@@ -103,11 +105,7 @@ impl LogicalRewriteRule for WrapRootInImvDeltaRule {
         true
     }
 
-    fn apply(
-        &self,
-        expr: OptExpr,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         self.wrapped.store(true, Ordering::SeqCst);
         bridge_apply_result(expr, ctx, |plan, _ctx| {
             Ok(PlanRewriteResult::Changed(LogicalPlanNode::new(
@@ -152,11 +150,7 @@ impl LogicalRewriteRule for UnresolvedMarkerCheckRule {
         plan_contains_imv_marker(&plan)
     }
 
-    fn apply(
-        &self,
-        expr: OptExpr,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         let plan = opt_expr_to_plan(expr, ctx);
         let markers = collect_marker_kinds(&plan);
         Ok(RewriteResult::Rejected(RewriteDiagnostic::rejected(
@@ -496,7 +490,9 @@ mod tests {
         ctx.set_scalar_arena(std::rc::Rc::clone(&arena));
         let plan = empty_values_plan();
         let opt_in = logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut());
-        let opt_out = pipeline.rewrite(opt_in, &mut ctx).expect("plain plan must pass validation");
+        let opt_out = pipeline
+            .rewrite(opt_in, &mut ctx)
+            .expect("plain plan must pass validation");
         let out = opt_expr_to_logical_plan(opt_out, &arena.borrow());
         assert!(matches!(&out.kind, LogicalPlanNodeKind::Values(_)));
     }

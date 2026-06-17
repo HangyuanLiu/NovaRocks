@@ -46,11 +46,7 @@ impl LogicalRewriteRule for PruneDecodeColumns {
         matches!(&expr.op, Operator::LogicalDecode(_))
     }
 
-    fn apply(
-        &self,
-        expr: OptExpr,
-        _ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         let OptExpr {
             op,
             children,

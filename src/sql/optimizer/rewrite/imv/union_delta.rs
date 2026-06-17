@@ -6,7 +6,9 @@ use crate::sql::optimizer::rewrite::imv::join_delta::{
     mark_delta_scan, normalize_branch_output, plan_output_columns,
 };
 use crate::sql::optimizer::rewrite::imv::marker::plan_contains_imv_marker;
-use crate::sql::optimizer::rewrite::imv::{bridge_apply_result, opt_expr_to_plan, PlanRewriteResult};
+use crate::sql::optimizer::rewrite::imv::{
+    PlanRewriteResult, bridge_apply_result, opt_expr_to_plan,
+};
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
@@ -47,11 +49,7 @@ impl LogicalRewriteRule for RewriteUnionAggregateDeltaRule {
             )
     }
 
-    fn apply(
-        &self,
-        expr: OptExpr,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         bridge_apply_result(expr, ctx, |plan, ctx| {
             let LogicalPlanNode {
                 kind, mut children, ..
@@ -87,7 +85,8 @@ impl LogicalRewriteRule for RewriteUnionAggregateDeltaRule {
                 None => ctx
                     .extension::<ImvExtension>()
                     .ok_or_else(|| {
-                        "RewriteUnionAggregateDelta requires ImvExtension in RewriteContext".to_string()
+                        "RewriteUnionAggregateDelta requires ImvExtension in RewriteContext"
+                            .to_string()
                     })?
                     .allocate_column_id(),
             };
@@ -248,11 +247,7 @@ impl LogicalRewriteRule for RewriteTopLevelUnionDeltaRule {
             )
     }
 
-    fn apply(
-        &self,
-        expr: OptExpr,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         bridge_apply_result(expr, ctx, |plan, ctx| {
             let LogicalPlanNode {
                 kind, mut children, ..
@@ -527,7 +522,10 @@ mod tests {
             panic!("expected Changed(ImvDelta)");
         };
         let arena_ref = ctx.scalar_arena();
-        let rewritten = crate::sql::optimizer::convert::opt_expr_to_logical_plan(rewritten_expr, &arena_ref.borrow());
+        let rewritten = crate::sql::optimizer::convert::opt_expr_to_logical_plan(
+            rewritten_expr,
+            &arena_ref.borrow(),
+        );
         let LogicalPlanNodeKind::ImvDelta(root_delta) = &rewritten.kind else {
             panic!("expected Changed(ImvDelta), got {rewritten:?}");
         };
@@ -590,7 +588,10 @@ mod tests {
             panic!("expected Changed(Union)");
         };
         let arena_ref = ctx.scalar_arena();
-        let rewritten = crate::sql::optimizer::convert::opt_expr_to_logical_plan(rewritten_expr, &arena_ref.borrow());
+        let rewritten = crate::sql::optimizer::convert::opt_expr_to_logical_plan(
+            rewritten_expr,
+            &arena_ref.borrow(),
+        );
         let LogicalPlanNodeKind::Union(union) = &rewritten.kind else {
             panic!("expected Changed(Union), got {rewritten:?}");
         };
@@ -693,7 +694,9 @@ mod tests {
 
     fn build_ctx() -> RewriteContext {
         let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
-        ctx.set_scalar_arena(std::rc::Rc::new(std::cell::RefCell::new(ScalarArena::new())));
+        ctx.set_scalar_arena(std::rc::Rc::new(
+            std::cell::RefCell::new(ScalarArena::new()),
+        ));
         ctx.set_extension::<ImvExtension>(ImvExtension {
             mv_ctx: dummy_rewrite_context(),
             annotation: ImvPlanAnnotation::default(),

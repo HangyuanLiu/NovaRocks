@@ -1177,7 +1177,14 @@ pub(crate) fn join_equi_keys_opt(
     let left_ids = collect_output_ids_opt(left);
     let right_ids = collect_output_ids_opt(right);
     let mut keys = Vec::new();
-    collect_join_equi_keys(&condition, &left_ids, &right_ids, &left_cols, &right_cols, &mut keys);
+    collect_join_equi_keys(
+        &condition,
+        &left_ids,
+        &right_ids,
+        &left_cols,
+        &right_cols,
+        &mut keys,
+    );
     keys
 }
 

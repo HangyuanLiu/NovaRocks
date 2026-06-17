@@ -31,11 +31,7 @@ impl LogicalRewriteRule for PruneJoinColumns {
         matches!(&expr.op, Operator::LogicalJoin(_))
     }
 
-    fn apply(
-        &self,
-        _expr: OptExpr,
-        _ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, _expr: OptExpr, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         // No-op: Join has no own output metadata to prune; column needs were
         // propagated to its children by the Phase-1 tagging pass. Kept for
         // architectural symmetry + per-operator disable_optimizer_rules control.

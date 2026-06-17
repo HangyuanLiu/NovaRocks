@@ -46,11 +46,7 @@ impl LogicalRewriteRule for PushDownPredicateJoin {
             || matches!(&expr.op, Operator::LogicalJoin(join) if join.condition.is_some())
     }
 
-    fn apply(
-        &self,
-        expr: OptExpr,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         let arena_rc = ctx.scalar_arena();
         let mut arena = arena_rc.borrow_mut();
 
@@ -98,7 +94,11 @@ impl LogicalRewriteRule for PushDownPredicateJoin {
                 let right = children.remove(1);
                 let left = children.remove(0);
                 match push_join_condition_predicates_opt(
-                    join_op, left, right, required_output_columns, &mut arena,
+                    join_op,
+                    left,
+                    right,
+                    required_output_columns,
+                    &mut arena,
                 ) {
                     Some(result) => Ok(RewriteResult::Changed(result)),
                     None => Ok(RewriteResult::Unchanged),
@@ -128,8 +128,7 @@ fn push_filter_predicates_opt(
     left_ids.remove(&ColumnId::UNSET);
     right_ids.remove(&ColumnId::UNSET);
 
-    let filter_groups =
-        PredicateGroup::from_predicate(predicate.clone(), PredicateOrigin::Filter);
+    let filter_groups = PredicateGroup::from_predicate(predicate.clone(), PredicateOrigin::Filter);
     let join_groups = join
         .condition
         .map(|cond_id| {
@@ -160,8 +159,7 @@ fn push_filter_predicates_opt(
     let mut remaining = Vec::new();
 
     for conj in conjuncts {
-        let Some((in_left, in_right)) =
-            classify_sides_by_column_ids(&conj, &left_ids, &right_ids)
+        let Some((in_left, in_right)) = classify_sides_by_column_ids(&conj, &left_ids, &right_ids)
         else {
             remaining.push(conj);
             continue;
@@ -244,7 +242,9 @@ fn push_filter_predicates_opt(
     } else {
         let pushed_id = scalar::intern_typed(arena, &combine_and(left_preds));
         OptExpr::new(
-            Operator::LogicalFilter(FilterOp { predicate: pushed_id }),
+            Operator::LogicalFilter(FilterOp {
+                predicate: pushed_id,
+            }),
             vec![left],
         )
     };
@@ -254,7 +254,9 @@ fn push_filter_predicates_opt(
     } else {
         let pushed_id = scalar::intern_typed(arena, &combine_and(right_preds));
         OptExpr::new(
-            Operator::LogicalFilter(FilterOp { predicate: pushed_id }),
+            Operator::LogicalFilter(FilterOp {
+                predicate: pushed_id,
+            }),
             vec![right],
         )
     };
@@ -326,8 +328,7 @@ fn push_join_condition_predicates_opt(
     let mut residual_preds = Vec::new();
 
     for conj in conjuncts {
-        let Some((in_left, in_right)) =
-            classify_sides_by_column_ids(&conj, &left_ids, &right_ids)
+        let Some((in_left, in_right)) = classify_sides_by_column_ids(&conj, &left_ids, &right_ids)
         else {
             residual_preds.push(conj);
             continue;
@@ -359,7 +360,9 @@ fn push_join_condition_predicates_opt(
     } else {
         let pushed_id = scalar::intern_typed(arena, &combine_and(left_preds));
         OptExpr::new(
-            Operator::LogicalFilter(FilterOp { predicate: pushed_id }),
+            Operator::LogicalFilter(FilterOp {
+                predicate: pushed_id,
+            }),
             vec![left],
         )
     };
@@ -369,7 +372,9 @@ fn push_join_condition_predicates_opt(
     } else {
         let pushed_id = scalar::intern_typed(arena, &combine_and(right_preds));
         OptExpr::new(
-            Operator::LogicalFilter(FilterOp { predicate: pushed_id }),
+            Operator::LogicalFilter(FilterOp {
+                predicate: pushed_id,
+            }),
             vec![right],
         )
     };

@@ -17,9 +17,11 @@ use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::imv::action_propagation::{
     descendant_internal_columns, is_supported_fan_in_delta_union,
 };
-use crate::sql::optimizer::rewrite::imv::{bridge_apply_result, opt_expr_to_plan, PlanRewriteResult};
 use crate::sql::optimizer::rewrite::imv::annotation::ImvExtension;
 use crate::sql::optimizer::rewrite::imv::row_id_column::ImvRowIdColumn;
+use crate::sql::optimizer::rewrite::imv::{
+    PlanRewriteResult, bridge_apply_result, opt_expr_to_plan,
+};
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
@@ -122,11 +124,7 @@ impl LogicalRewriteRule for InjectApplyKeyProjectRule {
         root_row_id_ref(&plan).is_some() && !output_has_apply_key(&plan)
     }
 
-    fn apply(
-        &self,
-        expr: OptExpr,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         self.fired.store(true, Ordering::SeqCst);
         bridge_apply_result(expr, ctx, |plan, ctx| {
             let Some((row_id_col, row_id_name)) = root_row_id_ref(&plan) else {
@@ -384,7 +382,8 @@ mod tests {
         let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
         drop(arena_rc);
         assert!(rule.matches(&expr, &ctx));
-        let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("apply") else {
+        let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("apply")
+        else {
             panic!("expected Changed(Project)");
         };
         let arena_rc = ctx.scalar_arena();

@@ -32,11 +32,7 @@ impl LogicalRewriteRule for PruneCTEAnchorColumns {
         matches!(&expr.op, Operator::LogicalCTEAnchor(_))
     }
 
-    fn apply(
-        &self,
-        _expr: OptExpr,
-        _ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, _expr: OptExpr, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         // No-op: CTEAnchor is a scope wrapper with no own output metadata to
         // prune; column needs were propagated to the produce/consumer children
         // by the Phase-1 tagging pass. Kept for architectural symmetry +
@@ -66,9 +62,7 @@ mod tests {
     #[test]
     fn prune_cte_anchor_is_always_unchanged() {
         let expr = OptExpr::new(
-            Operator::LogicalCTEAnchor(CTEAnchorOp {
-                cte_id: 1u32,
-            }),
+            Operator::LogicalCTEAnchor(CTEAnchorOp { cte_id: 1u32 }),
             vec![dummy_input(), dummy_input()],
         );
 

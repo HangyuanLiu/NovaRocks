@@ -119,7 +119,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{RewritePipeline, RewriteStage};
-    use crate::sql::optimizer::operator::{Operator, GenerateSeriesOp, ValuesOp};
+    use crate::sql::optimizer::operator::{GenerateSeriesOp, Operator, ValuesOp};
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::phase::RewritePhase;

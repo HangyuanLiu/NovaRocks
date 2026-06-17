@@ -8,8 +8,8 @@ use std::time::Instant;
 use crate::engine::dictionary::model::DictionarySnapshot;
 use crate::sql::catalog::TableDef;
 use crate::sql::column_id::ColumnRefFactory;
-use crate::sql::optimizer::scalar::ScalarArena;
 use crate::sql::optimizer::rewrite::trace::RewriteTrace;
+use crate::sql::optimizer::scalar::ScalarArena;
 use crate::sql::optimizer::statistics::TableStatistics;
 
 /// Loads dictionary snapshots for scan-time low-cardinality string columns.

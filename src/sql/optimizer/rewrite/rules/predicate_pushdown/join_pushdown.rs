@@ -46,7 +46,10 @@ impl RewriteRule for PushDownPredicateJoin {
             && matches!(&expr.children[0].op, Operator::LogicalJoin(_))
     }
 
-    fn apply(&self, expr: crate::sql::optimizer::opt_expr::OptExpr) -> Option<crate::sql::optimizer::opt_expr::OptExpr> {
+    fn apply(
+        &self,
+        expr: crate::sql::optimizer::opt_expr::OptExpr,
+    ) -> Option<crate::sql::optimizer::opt_expr::OptExpr> {
         use crate::sql::optimizer::convert::{logical_plan_to_opt_expr, opt_expr_to_logical_plan};
         use crate::sql::optimizer::scalar::ScalarArena;
         let mut scalars = ScalarArena::new();
@@ -906,7 +909,9 @@ mod tests {
             None,
         );
 
-        let out = PushDownPredicateJoin.apply_with_logical(filter).expect("should rewrite");
+        let out = PushDownPredicateJoin
+            .apply_with_logical(filter)
+            .expect("should rewrite");
         let LogicalPlanNodeKind::Join(join) = &out.kind else {
             panic!("expected Join after OR side-filter extraction");
         };
@@ -947,7 +952,9 @@ mod tests {
             None,
         );
 
-        let out = PushDownPredicateJoin.apply_with_logical(plan).expect("should rewrite");
+        let out = PushDownPredicateJoin
+            .apply_with_logical(plan)
+            .expect("should rewrite");
         let LogicalPlanNodeKind::Join(join) = &out.kind else {
             panic!("expected Join after predicate merge");
         };

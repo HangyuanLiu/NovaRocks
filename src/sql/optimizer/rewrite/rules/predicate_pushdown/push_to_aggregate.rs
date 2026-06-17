@@ -49,11 +49,7 @@ impl LogicalRewriteRule for PushDownPredicateAggregate {
             && !aggregate_child_is_repeat(input.unary_input())
     }
 
-    fn apply(
-        &self,
-        expr: OptExpr,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         let OptExpr {
             op,
             mut children,
@@ -100,15 +96,13 @@ impl LogicalRewriteRule for PushDownPredicateAggregate {
         let group_by_ids: HashSet<ColumnId> = agg
             .group_by
             .iter()
-            .filter_map(|&id| {
-                match arena.node(id) {
-                    crate::sql::optimizer::scalar::ScalarNode::ColumnRef(column_id)
-                        if *column_id != ColumnId::UNSET =>
-                    {
-                        Some(*column_id)
-                    }
-                    _ => None,
+            .filter_map(|&id| match arena.node(id) {
+                crate::sql::optimizer::scalar::ScalarNode::ColumnRef(column_id)
+                    if *column_id != ColumnId::UNSET =>
+                {
+                    Some(*column_id)
                 }
+                _ => None,
             })
             .collect();
 
@@ -141,10 +135,7 @@ impl LogicalRewriteRule for PushDownPredicateAggregate {
             }),
             vec![aggregate_input],
         );
-        let mut new_agg_expr = OptExpr::new(
-            Operator::LogicalAggregate(agg),
-            vec![new_child],
-        );
+        let mut new_agg_expr = OptExpr::new(Operator::LogicalAggregate(agg), vec![new_child]);
         new_agg_expr.required_output_columns = aggregate_required_output_columns;
 
         let result = wrap_remaining_filter_opt(new_agg_expr, remaining, &mut arena);
@@ -173,18 +164,18 @@ fn aggregate_child_is_repeat(expr: &OptExpr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::analysis::TypedExpr;
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::operator::{LogicalAggregateOp, ScanOp, ScalarAggregateSpec};
-    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
+    use crate::sql::optimizer::operator::{LogicalAggregateOp, ScalarAggregateSpec, ScanOp};
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
-    use crate::sql::analysis::TypedExpr;
+    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
+    use arrow::datatypes::DataType;
     use std::cell::RefCell;
     use std::collections::HashSet;
     use std::rc::Rc;
-    use arrow::datatypes::DataType;
 
     fn test_col_id(name: &str) -> ColumnId {
         match name {
@@ -306,7 +297,9 @@ mod tests {
         let agg = make_agg(&mut arena, scan);
         let filter_pred = intern_typed(&mut arena, &eq_expr(col_typed_expr("a"), int_lit_expr(1)));
         let filter = OptExpr::new(
-            Operator::LogicalFilter(FilterOp { predicate: filter_pred }),
+            Operator::LogicalFilter(FilterOp {
+                predicate: filter_pred,
+            }),
             vec![agg],
         );
 
@@ -339,10 +332,14 @@ mod tests {
         let mut arena = ScalarArena::new();
         let scan = make_scan(&mut arena);
         let agg = make_agg(&mut arena, scan);
-        let filter_pred =
-            intern_typed(&mut arena, &eq_expr(col_typed_expr("sum_b"), int_lit_expr(100)));
+        let filter_pred = intern_typed(
+            &mut arena,
+            &eq_expr(col_typed_expr("sum_b"), int_lit_expr(100)),
+        );
         let filter = OptExpr::new(
-            Operator::LogicalFilter(FilterOp { predicate: filter_pred }),
+            Operator::LogicalFilter(FilterOp {
+                predicate: filter_pred,
+            }),
             vec![agg],
         );
 
@@ -363,10 +360,11 @@ mod tests {
         let mut arena = ScalarArena::new();
         let scan = make_scan(&mut arena);
         let agg = make_agg(&mut arena, scan);
-        let filter_pred =
-            intern_typed(&mut arena, &eq_expr(int_lit_expr(1), int_lit_expr(1)));
+        let filter_pred = intern_typed(&mut arena, &eq_expr(int_lit_expr(1), int_lit_expr(1)));
         let filter = OptExpr::new(
-            Operator::LogicalFilter(FilterOp { predicate: filter_pred }),
+            Operator::LogicalFilter(FilterOp {
+                predicate: filter_pred,
+            }),
             vec![agg],
         );
 

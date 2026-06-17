@@ -134,7 +134,13 @@ pub(crate) fn collect_push_plan(
         Operator::LogicalJoin(j) => j,
         _ => return None,
     };
-    split_at_join(join, aggregate_input.left(), aggregate_input.right(), ctx, arena)
+    split_at_join(
+        join,
+        aggregate_input.left(),
+        aggregate_input.right(),
+        ctx,
+        arena,
+    )
 }
 
 fn split_at_join(
@@ -289,10 +295,7 @@ fn find_scalar_id_for_column_ref(
             column_id,
         } = &expr.kind
         {
-            if qualifier == target_qualifier
-                && column == target_column
-                && column_id == target_id
-            {
+            if qualifier == target_qualifier && column == target_column && column_id == target_id {
                 return Some(*id);
             }
         }
@@ -466,7 +469,12 @@ mod tests {
     /// Uses a FNV-like hash to avoid the ColumnId::UNSET sentinel (0).
     fn test_col_id(qualifier: Option<&str>, name: &str) -> ColumnId {
         let mut hash: u32 = 2166136261;
-        for b in qualifier.unwrap_or("").bytes().chain(std::iter::once(b'.')).chain(name.bytes()) {
+        for b in qualifier
+            .unwrap_or("")
+            .bytes()
+            .chain(std::iter::once(b'.'))
+            .chain(name.bytes())
+        {
             hash ^= b as u32;
             hash = hash.wrapping_mul(16777619);
         }
@@ -487,7 +495,11 @@ mod tests {
         }
     }
 
-    fn qualified_col_ref_typed(qualifier: &str, name: &str, ty: DataType) -> crate::sql::analysis::TypedExpr {
+    fn qualified_col_ref_typed(
+        qualifier: &str,
+        name: &str,
+        ty: DataType,
+    ) -> crate::sql::analysis::TypedExpr {
         crate::sql::analysis::TypedExpr {
             kind: ExprKind::ColumnRef {
                 column_id: test_col_id(Some(qualifier), name),
@@ -1000,13 +1012,7 @@ mod tests {
         let mut arena = make_arena();
         let a = scan_opt(&[("k", DataType::Int64), ("v", DataType::Int64)]);
         let b = scan_opt(&[("k", DataType::Int64), ("w", DataType::Int64)]);
-        let join = join_opt(
-            JoinKind::Inner,
-            Some(eq_typed("k", "k")),
-            a,
-            b,
-            &mut arena,
-        );
+        let join = join_opt(JoinKind::Inner, Some(eq_typed("k", "k")), a, b, &mut arena);
         let spec_v = sum_spec("v", &mut arena);
         let spec_w = sum_spec("w", &mut arena);
         let agg = agg_opt(
@@ -1068,7 +1074,10 @@ mod tests {
         };
         let join = join_opt(JoinKind::Inner, Some(cond), a, b, &mut arena);
 
-        let count_arg = intern_typed(&mut arena, &qualified_col_ref_typed("l", "c0", DataType::Int64));
+        let count_arg = intern_typed(
+            &mut arena,
+            &qualified_col_ref_typed("l", "c0", DataType::Int64),
+        );
         let count_spec = ScalarAggregateSpec {
             name: "count".into(),
             args: vec![count_arg],

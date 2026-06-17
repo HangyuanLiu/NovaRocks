@@ -31,11 +31,7 @@ impl LogicalRewriteRule for PruneRepeatColumns {
         matches!(&expr.op, Operator::LogicalRepeat(_))
     }
 
-    fn apply(
-        &self,
-        _expr: OptExpr,
-        _ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, _expr: OptExpr, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         // No-op: Repeat (ROLLUP/CUBE/GROUPING SETS) was assigned keep-all-child
         // semantics by the Phase-1 tagging pass. No output_columns list to prune.
         // Kept for architectural symmetry + per-operator disable_optimizer_rules

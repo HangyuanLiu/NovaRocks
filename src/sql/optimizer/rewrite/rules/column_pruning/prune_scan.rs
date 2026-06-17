@@ -67,7 +67,9 @@ fn collect_scalar_column_ids(
                 collect_scalar_column_ids(arena, item, out);
             }
         }
-        ScalarNode::Between { child, low, high, .. } => {
+        ScalarNode::Between {
+            child, low, high, ..
+        } => {
             collect_scalar_column_ids(arena, *child, out);
             collect_scalar_column_ids(arena, *low, out);
             collect_scalar_column_ids(arena, *high, out);
@@ -134,11 +136,7 @@ impl LogicalRewriteRule for PruneScanColumns {
         matches!(&expr.op, Operator::LogicalScan(_))
     }
 
-    fn apply(
-        &self,
-        expr: OptExpr,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         let OptExpr {
             op,
             children,
@@ -284,10 +282,7 @@ mod tests {
         }
     }
 
-    fn scan_expr(
-        scan: ScanOp,
-        required_output_columns: Option<HashSet<ColumnId>>,
-    ) -> OptExpr {
+    fn scan_expr(scan: ScanOp, required_output_columns: Option<HashSet<ColumnId>>) -> OptExpr {
         OptExpr {
             op: Operator::LogicalScan(scan),
             children: vec![],
@@ -365,7 +360,9 @@ mod tests {
         let mut arena = ScalarArena::new();
         let col_b = arena.intern(ScalarNode::ColumnRef(id_b), DataType::Int32, false);
         let zero = arena.intern(
-            ScalarNode::Literal(scalar::HashableLiteral(crate::sql::analysis::LiteralValue::Int(0))),
+            ScalarNode::Literal(scalar::HashableLiteral(
+                crate::sql::analysis::LiteralValue::Int(0),
+            )),
             DataType::Int32,
             false,
         );
@@ -429,9 +426,7 @@ mod tests {
 
         let rule = PruneScanColumns;
         let mut ctx = ctx_with_arena();
-        let result = rule
-            .apply(scan_expr(scan, Some(needed)), &mut ctx)
-            .unwrap();
+        let result = rule.apply(scan_expr(scan, Some(needed)), &mut ctx).unwrap();
 
         let changed = match result {
             RewriteResult::Changed(p) => p,

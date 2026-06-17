@@ -13,13 +13,15 @@ use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, ProjectItem, Ty
 use crate::sql::catalog::ScanSource;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
-use crate::sql::optimizer::rewrite::imv::{bridge_apply_result, opt_expr_to_plan, PlanRewriteResult};
 use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
 use crate::sql::optimizer::rewrite::imv::annotation::ImvExtension;
 use crate::sql::optimizer::rewrite::imv::join_delta_shape::{
     is_supported_join_delta_branch, is_supported_join_delta_union,
 };
 use crate::sql::optimizer::rewrite::imv::row_id_column::ImvRowIdColumn;
+use crate::sql::optimizer::rewrite::imv::{
+    PlanRewriteResult, bridge_apply_result, opt_expr_to_plan,
+};
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
@@ -188,11 +190,7 @@ impl LogicalRewriteRule for InjectActionColumnRule {
         }
     }
 
-    fn apply(
-        &self,
-        expr: OptExpr,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         bridge_apply_result(expr, ctx, |mut plan, ctx| {
             let LogicalPlanNodeKind::Scan(scan) = &mut plan.kind else {
                 return Ok(PlanRewriteResult::Unchanged);
@@ -272,11 +270,7 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
         }
     }
 
-    fn apply(
-        &self,
-        expr: OptExpr,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         bridge_apply_result(expr, ctx, |mut plan, ctx| {
             // Diagnostic: the delta base under an unsupported node, if any. Computed
             // up-front from `&plan` so the fail-fast arms can name the offending
@@ -678,7 +672,8 @@ mod tests {
         let mut arena = ScalarArena::new();
         let expr = logical_plan_to_opt_expr(&plan, &mut arena);
         assert!(rule.matches(&expr, &ctx));
-        let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("apply") else {
+        let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("apply")
+        else {
             panic!("expected Changed(Scan)");
         };
         let changed = opt_expr_to_logical_plan(changed_expr, &arena);
@@ -1493,7 +1488,8 @@ mod tests {
         let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
         drop(arena_rc);
         assert!(rule.matches(&expr, &ctx));
-        let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("apply") else {
+        let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("apply")
+        else {
             panic!("expected Changed(Project)");
         };
         let arena_rc = ctx.scalar_arena();
@@ -1537,7 +1533,9 @@ mod tests {
         let project_expr = logical_plan_to_opt_expr(&project, &mut arena_rc.borrow_mut());
         drop(arena_rc);
         assert!(rule.matches(&project_expr, &ctx));
-        let result = rule.apply(project_expr, &mut ctx).expect("apply must succeed");
+        let result = rule
+            .apply(project_expr, &mut ctx)
+            .expect("apply must succeed");
         let RewriteResult::Changed(changed_expr) = result else {
             panic!("expected Changed(Project)");
         };

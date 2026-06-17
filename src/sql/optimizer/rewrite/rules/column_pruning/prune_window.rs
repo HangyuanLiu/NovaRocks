@@ -43,11 +43,7 @@ impl LogicalRewriteRule for PruneWindowColumns {
         matches!(&expr.op, Operator::LogicalWindow(_))
     }
 
-    fn apply(
-        &self,
-        _expr: OptExpr,
-        _ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, _expr: OptExpr, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         // NO-OP: Window output pruning is deferred (Gap-5).
         // WindowExpr outputs have stable ids, but the parent Project still
         // references them through UNSET/name ColumnRefs. Name-based pruning
@@ -62,7 +58,7 @@ mod tests {
     use crate::sql::analysis::OutputColumn;
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::operator::{Operator, ScanOp, ScalarWindowSpec, WindowOp};
+    use crate::sql::optimizer::operator::{Operator, ScalarWindowSpec, ScanOp, WindowOp};
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
     use arrow::datatypes::DataType;

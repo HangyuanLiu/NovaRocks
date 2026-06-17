@@ -7,7 +7,9 @@ use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
 use crate::sql::optimizer::rewrite::imv::annotation::ImvExtension;
 use crate::sql::optimizer::rewrite::imv::marker::ImvVersionRef;
-use crate::sql::optimizer::rewrite::imv::{bridge_apply_result, opt_expr_to_plan, PlanRewriteResult};
+use crate::sql::optimizer::rewrite::imv::{
+    PlanRewriteResult, bridge_apply_result, opt_expr_to_plan,
+};
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
@@ -46,11 +48,7 @@ impl LogicalRewriteRule for RewriteJoinDeltaRule {
         )
     }
 
-    fn apply(
-        &self,
-        expr: OptExpr,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         bridge_apply_result(expr, ctx, |plan, ctx| {
             let LogicalPlanNode {
                 kind, mut children, ..
@@ -397,11 +395,11 @@ mod tests {
         ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::convert::logical_plan_to_opt_expr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::imv::annotation::{ImvExtension, ImvPlanAnnotation};
     use crate::sql::optimizer::rewrite::imv::marker::ImvVersionRef;
     use crate::sql::optimizer::rewrite::imv::scan_binding::ImvVersionRole;
-    use crate::sql::optimizer::convert::logical_plan_to_opt_expr;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::{
         LogicalAggregateNode, LogicalImvVersionNode, LogicalJoinNode, LogicalPlanNodeKind,
@@ -460,11 +458,13 @@ mod tests {
 
         let arena_rc = ctx.scalar_arena();
         let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
-        let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("expand") else {
+        let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("expand")
+        else {
             panic!("pure join-delta must expand ImvDelta(Join) directly into a Union");
         };
         let arena = ctx.scalar_arena();
-        let changed = crate::sql::optimizer::convert::opt_expr_to_logical_plan(changed_expr, &arena.borrow());
+        let changed =
+            crate::sql::optimizer::convert::opt_expr_to_logical_plan(changed_expr, &arena.borrow());
         let LogicalPlanNodeKind::Union(union) = &changed.kind else {
             panic!("expected Union");
         };
@@ -507,11 +507,13 @@ mod tests {
 
         let arena_rc = ctx.scalar_arena();
         let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
-        let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("expand") else {
+        let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("expand")
+        else {
             panic!("pure join-delta must expand into a Union");
         };
         let arena = ctx.scalar_arena();
-        let changed = crate::sql::optimizer::convert::opt_expr_to_logical_plan(changed_expr, &arena.borrow());
+        let changed =
+            crate::sql::optimizer::convert::opt_expr_to_logical_plan(changed_expr, &arena.borrow());
         let LogicalPlanNodeKind::Union(union) = &changed.kind else {
             panic!("expected Union");
         };
@@ -576,12 +578,14 @@ mod tests {
 
         let arena_rc = ctx.scalar_arena();
         let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
-        let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("expand outer")
+        let RewriteResult::Changed(changed_expr) =
+            rule.apply(expr, &mut ctx).expect("expand outer")
         else {
             panic!("expected Union");
         };
         let arena = ctx.scalar_arena();
-        let changed = crate::sql::optimizer::convert::opt_expr_to_logical_plan(changed_expr, &arena.borrow());
+        let changed =
+            crate::sql::optimizer::convert::opt_expr_to_logical_plan(changed_expr, &arena.borrow());
         let LogicalPlanNodeKind::Union(_) = &changed.kind else {
             panic!("expected Union");
         };
@@ -680,7 +684,9 @@ mod tests {
 
     fn build_ctx() -> RewriteContext {
         let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
-        ctx.set_scalar_arena(std::rc::Rc::new(std::cell::RefCell::new(ScalarArena::new())));
+        ctx.set_scalar_arena(std::rc::Rc::new(
+            std::cell::RefCell::new(ScalarArena::new()),
+        ));
         ctx.set_extension::<ImvExtension>(ImvExtension {
             mv_ctx: dummy_rewrite_context(),
             annotation: ImvPlanAnnotation::default(),

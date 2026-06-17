@@ -124,8 +124,8 @@ fn optimize_with_root_property(
     let arena = Rc::new(RefCell::new(scalar::ScalarArena::new()));
     rewrite_ctx.set_scalar_arena(Rc::clone(&arena));
     let plan_expr = convert::logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut());
-    let rewritten_expr =
-        rewrite::registry::query_rewrite_pipeline(table_stats).rewrite(plan_expr, &mut rewrite_ctx)?;
+    let rewritten_expr = rewrite::registry::query_rewrite_pipeline(table_stats)
+        .rewrite(plan_expr, &mut rewrite_ctx)?;
 
     // Non-disableable backstop: Apply must not survive the SubqueryRewrite
     // stage. The ApplyException rule reports this with rule attribution, but

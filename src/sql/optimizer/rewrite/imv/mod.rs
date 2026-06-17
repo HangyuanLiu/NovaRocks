@@ -82,8 +82,12 @@ where
             );
             crate::sql::optimizer::rewrite::result::RewriteResult::Changed(opt_out)
         }
-        PlanRewriteResult::Unchanged => crate::sql::optimizer::rewrite::result::RewriteResult::Unchanged,
-        PlanRewriteResult::Rejected(diag) => crate::sql::optimizer::rewrite::result::RewriteResult::Rejected(diag),
+        PlanRewriteResult::Unchanged => {
+            crate::sql::optimizer::rewrite::result::RewriteResult::Unchanged
+        }
+        PlanRewriteResult::Rejected(diag) => {
+            crate::sql::optimizer::rewrite::result::RewriteResult::Rejected(diag)
+        }
     };
     Ok(converted)
 }

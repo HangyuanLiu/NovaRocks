@@ -37,11 +37,7 @@ impl LogicalRewriteRule for PruneUnionColumns {
         matches!(&expr.op, Operator::LogicalUnion(_))
     }
 
-    fn apply(
-        &self,
-        expr: OptExpr,
-        _ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         let OptExpr {
             op,
             children,

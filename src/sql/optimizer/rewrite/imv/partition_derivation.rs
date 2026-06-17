@@ -12,7 +12,7 @@ use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::imv::annotation::{
     ImvExtension, ImvPartitionAnnotation, ImvPlanAnnotation,
 };
-use crate::sql::optimizer::rewrite::imv::{opt_expr_to_plan};
+use crate::sql::optimizer::rewrite::imv::opt_expr_to_plan;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
@@ -42,11 +42,7 @@ impl LogicalRewriteRule for DerivePartitionSpecRule {
             .is_some_and(|ext| ext.annotation.partition.is_none())
     }
 
-    fn apply(
-        &self,
-        expr: OptExpr,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         // Convert expr to plan to satisfy the bridge contract (ignored)
         let _plan = opt_expr_to_plan(expr, ctx);
         let ext = ctx

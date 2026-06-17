@@ -23,11 +23,7 @@ impl LogicalRewriteRule for ApplyException {
         matches!(&expr.op, Operator::LogicalApply(_))
     }
 
-    fn apply(
-        &self,
-        expr: OptExpr,
-        _ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         match &expr.op {
             Operator::LogicalApply(op) => Err(apply_exception_message(op)),
             _ => Ok(RewriteResult::Unchanged),

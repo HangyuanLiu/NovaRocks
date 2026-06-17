@@ -205,7 +205,8 @@ mod tests {
         let opt_plan = logical_plan_to_opt_expr(&plan, &mut scalars);
         let arena_rc = Rc::new(RefCell::new(scalars));
         ctx.set_scalar_arena(arena_rc.clone());
-        let (opt_result, changed) = rewrite_with_rule(opt_plan, &VariantPathPushdownRule, &mut ctx).unwrap();
+        let (opt_result, changed) =
+            rewrite_with_rule(opt_plan, &VariantPathPushdownRule, &mut ctx).unwrap();
         let arena = arena_rc.borrow();
         (opt_expr_to_logical_plan(opt_result, &arena), changed)
     }
@@ -444,7 +445,10 @@ mod tests {
         assert_eq!(scan.variant_columns.len(), 1);
         let synthetic_id = scan.variant_columns[0].synthetic_column_id;
         assert_eq!(column_ref_id(&project.items[0].expr), synthetic_id);
-        assert_eq!(column_ref_id(binary_column_ref_side(&filter.predicate)), synthetic_id);
+        assert_eq!(
+            column_ref_id(binary_column_ref_side(&filter.predicate)),
+            synthetic_id
+        );
     }
 
     #[test]
@@ -557,7 +561,7 @@ mod tests {
         // ColumnId::UNSET cannot be interned via intern_typed (it panics), so this
         // test builds the OptExpr tree directly using arena.intern() to bypass that
         // guard, then verifies the rule returns Unchanged for UNSET source columns.
-        use crate::sql::optimizer::operator::{Operator, ProjectOp, ScanOp, ScalarProjectItem};
+        use crate::sql::optimizer::operator::{Operator, ProjectOp, ScalarProjectItem, ScanOp};
         use crate::sql::optimizer::opt_expr::OptExpr;
         use crate::sql::optimizer::scalar::{ScalarArena, ScalarNode};
 
@@ -632,7 +636,8 @@ mod tests {
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         ctx.set_column_ref_factory(Rc::clone(&factory));
         ctx.set_scalar_arena(arena_rc);
-        let (_, changed) = rewrite_with_rule(project_op, &VariantPathPushdownRule, &mut ctx).unwrap();
+        let (_, changed) =
+            rewrite_with_rule(project_op, &VariantPathPushdownRule, &mut ctx).unwrap();
 
         assert!(!changed);
     }

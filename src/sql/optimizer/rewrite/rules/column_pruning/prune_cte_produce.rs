@@ -25,11 +25,7 @@ impl LogicalRewriteRule for PruneCTEProduceColumns {
         matches!(&expr.op, Operator::LogicalCTEProduce(_))
     }
 
-    fn apply(
-        &self,
-        _expr: OptExpr,
-        _ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, _expr: OptExpr, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         // Conservative no-op: do not prune CTE produce output columns.
         //
         // The CTE produce fragment multicasts ALL its output columns to every

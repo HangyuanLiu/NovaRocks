@@ -13,7 +13,9 @@ use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::imv::annotation::ImvExtension;
-use crate::sql::optimizer::rewrite::imv::{bridge_apply_result, opt_expr_to_plan, PlanRewriteResult};
+use crate::sql::optimizer::rewrite::imv::{
+    PlanRewriteResult, bridge_apply_result, opt_expr_to_plan,
+};
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
@@ -68,11 +70,7 @@ impl LogicalRewriteRule for InjectRowIdRule {
         }
     }
 
-    fn apply(
-        &self,
-        expr: OptExpr,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         bridge_apply_result(expr, ctx, |plan, ctx| {
             let LogicalPlanNode {
                 kind,
@@ -201,11 +199,13 @@ mod tests {
         let mut arena = ScalarArena::new();
         let expr = logical_plan_to_opt_expr(&plan, &mut arena);
         assert!(rule.matches(&expr, &ctx));
-        let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("apply") else {
+        let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("apply")
+        else {
             panic!("expected Changed(Scan)");
         };
         let arena = ctx.scalar_arena();
-        let changed = crate::sql::optimizer::convert::opt_expr_to_logical_plan(changed_expr, &arena.borrow());
+        let changed =
+            crate::sql::optimizer::convert::opt_expr_to_logical_plan(changed_expr, &arena.borrow());
         let LogicalPlanNodeKind::Scan(scan) = changed.kind else {
             panic!("expected Changed(Scan)");
         };
@@ -229,11 +229,13 @@ mod tests {
         let mut arena = ScalarArena::new();
         let expr = logical_plan_to_opt_expr(&plan, &mut arena);
         assert!(rule.matches(&expr, &ctx));
-        let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("apply") else {
+        let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("apply")
+        else {
             panic!("expected Changed(Scan)");
         };
         let arena = ctx.scalar_arena();
-        let changed = crate::sql::optimizer::convert::opt_expr_to_logical_plan(changed_expr, &arena.borrow());
+        let changed =
+            crate::sql::optimizer::convert::opt_expr_to_logical_plan(changed_expr, &arena.borrow());
         let LogicalPlanNodeKind::Scan(scan) = changed.kind else {
             panic!("expected Changed(Scan)");
         };

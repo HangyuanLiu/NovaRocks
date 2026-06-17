@@ -73,7 +73,9 @@ impl LogicalRewriteRule for RankingWindowPredicatePushdownRule {
         let window_expr = match &filter_child.op {
             Operator::LogicalWindow(_) => filter_child,
             Operator::LogicalProject(_) => {
-                let Some(w) = filter_child.children.first() else { return false; };
+                let Some(w) = filter_child.children.first() else {
+                    return false;
+                };
                 if !matches!(&w.op, Operator::LogicalWindow(_)) {
                     return false;
                 }
@@ -103,11 +105,7 @@ impl LogicalRewriteRule for RankingWindowPredicatePushdownRule {
         true
     }
 
-    fn apply(
-        &self,
-        expr: OptExpr,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         // --- Step 1: Destructure Filter -> optional Project -> Window -> Sort ---
         let Operator::LogicalFilter(ref filter_op) = expr.op else {
             return Ok(RewriteResult::Unchanged);
@@ -176,38 +174,42 @@ impl LogicalRewriteRule for RankingWindowPredicatePushdownRule {
 
         // --- Step 5: Find a ranking window expr with a finite upper bound ---
         // `window_op.output_columns[i].column_id` is the output ColumnId for window_exprs[i].
-        let found = window_op.window_exprs.iter().enumerate().find_map(|(i, w_expr)| {
-            let window_output_col_id = window_op
-                .output_columns
-                .get(i)
-                .map(|oc| oc.column_id)
-                .unwrap_or(ColumnId::UNSET);
-            if window_output_col_id == ColumnId::UNSET {
-                return None;
-            }
-
-            // Determine which ColumnId the filter predicate references for this expr.
-            let filter_col_id = if let Some(project_expr) = project_expr_ref {
-                let Operator::LogicalProject(project_op) = &project_expr.op else {
+        let found = window_op
+            .window_exprs
+            .iter()
+            .enumerate()
+            .find_map(|(i, w_expr)| {
+                let window_output_col_id = window_op
+                    .output_columns
+                    .get(i)
+                    .map(|oc| oc.column_id)
+                    .unwrap_or(ColumnId::UNSET);
+                if window_output_col_id == ColumnId::UNSET {
                     return None;
-                };
-                // Walk project items: find one whose expr is a bare ColumnRef to window_output_col_id.
-                project_op.items.iter().find_map(|item| {
-                    let item_expr = scalar::materialize(&arena_rc.borrow(), item.expr);
-                    if let ExprKind::ColumnRef { column_id, .. } = &item_expr.kind
-                        && *column_id == window_output_col_id
-                    {
-                        return Some(item.output_column_id);
-                    }
-                    None
-                })?
-            } else {
-                window_output_col_id
-            };
+                }
 
-            let k = rank_upper_bound(&filter_predicate_typed, filter_col_id)?;
-            Some((k, w_expr))
-        });
+                // Determine which ColumnId the filter predicate references for this expr.
+                let filter_col_id = if let Some(project_expr) = project_expr_ref {
+                    let Operator::LogicalProject(project_op) = &project_expr.op else {
+                        return None;
+                    };
+                    // Walk project items: find one whose expr is a bare ColumnRef to window_output_col_id.
+                    project_op.items.iter().find_map(|item| {
+                        let item_expr = scalar::materialize(&arena_rc.borrow(), item.expr);
+                        if let ExprKind::ColumnRef { column_id, .. } = &item_expr.kind
+                            && *column_id == window_output_col_id
+                        {
+                            return Some(item.output_column_id);
+                        }
+                        None
+                    })?
+                } else {
+                    window_output_col_id
+                };
+
+                let k = rank_upper_bound(&filter_predicate_typed, filter_col_id)?;
+                Some((k, w_expr))
+            });
 
         let Some((k, matched_w_expr)) = found else {
             return Ok(RewriteResult::Unchanged);
@@ -344,8 +346,8 @@ mod tests {
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, SortItem, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
-        FilterOp, LogicalJoinOp, Operator, ProjectOp, ScalarProjectItem, ScalarWindowSpec,
-        SortOp, ValuesOp, WindowOp,
+        FilterOp, LogicalJoinOp, Operator, ProjectOp, ScalarProjectItem, ScalarWindowSpec, SortOp,
+        ValuesOp, WindowOp,
     };
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
@@ -553,10 +555,17 @@ mod tests {
 
     fn filter_opt(arena: &mut ScalarArena, input: OptExpr, predicate: TypedExpr) -> OptExpr {
         let pred_id = scalar::intern_typed(arena, &predicate);
-        OptExpr::new(Operator::LogicalFilter(FilterOp { predicate: pred_id }), vec![input])
+        OptExpr::new(
+            Operator::LogicalFilter(FilterOp { predicate: pred_id }),
+            vec![input],
+        )
     }
 
-    fn project_opt(arena: &mut ScalarArena, input: OptExpr, items: Vec<(TypedExpr, ColumnId)>) -> OptExpr {
+    fn project_opt(
+        arena: &mut ScalarArena,
+        input: OptExpr,
+        items: Vec<(TypedExpr, ColumnId)>,
+    ) -> OptExpr {
         let scalar_items = items
             .into_iter()
             .map(|(expr, out_id)| {
@@ -604,7 +613,10 @@ mod tests {
             let window_expr = match &filter_child.op {
                 Operator::LogicalWindow(_) => filter_child,
                 Operator::LogicalProject(_) => {
-                    let w = filter_child.children.first().expect("project must have child");
+                    let w = filter_child
+                        .children
+                        .first()
+                        .expect("project must have child");
                     assert!(
                         matches!(&w.op, Operator::LogicalWindow(_)),
                         "expected Window under Project"
@@ -613,7 +625,10 @@ mod tests {
                 }
                 _ => panic!("expected Window or Project under Filter"),
             };
-            let sort_expr = window_expr.children.first().expect("window must have child");
+            let sort_expr = window_expr
+                .children
+                .first()
+                .expect("window must have child");
             let Operator::LogicalSort(sort) = &sort_expr.op else {
                 panic!("expected Sort under Window");
             };
@@ -649,8 +664,14 @@ mod tests {
         assert_eq!(rank_upper_bound(&le_typed(col_typed(rk), 5), rk), Some(5));
         assert_eq!(rank_upper_bound(&lt_typed(col_typed(rk), 5), rk), Some(4));
         assert_eq!(rank_upper_bound(&eq_typed(col_typed(rk), 3), rk), Some(3));
-        assert_eq!(rank_upper_bound(&between_typed(col_typed(rk), 2, 9), rk), Some(9));
-        assert_eq!(rank_upper_bound(&in_list_typed(col_typed(rk), &[1, 3, 5]), rk), Some(5));
+        assert_eq!(
+            rank_upper_bound(&between_typed(col_typed(rk), 2, 9), rk),
+            Some(9)
+        );
+        assert_eq!(
+            rank_upper_bound(&in_list_typed(col_typed(rk), &[1, 3, 5]), rk),
+            Some(5)
+        );
         assert_eq!(rank_upper_bound(&ge_typed(col_typed(rk), 5), rk), None);
         assert_eq!(rank_upper_bound(&le_typed(col_typed(rk), 0), rk), None);
         assert_eq!(rank_upper_bound(&le_typed(col_typed(other), 5), rk), None);
@@ -697,7 +718,11 @@ mod tests {
             let mut arena = ScalarArena::new();
             let plan = make_filter_window_sort_opt(&mut arena, "row_number", rk_id, p_id, 3);
             let mut ctx = make_ctx(arena);
-            let sort = extract_sort_from_changed(RankingWindowPredicatePushdownRule.apply(plan, &mut ctx).unwrap());
+            let sort = extract_sort_from_changed(
+                RankingWindowPredicatePushdownRule
+                    .apply(plan, &mut ctx)
+                    .unwrap(),
+            );
             assert_eq!(sort.partition_limit, Some(3));
             assert_eq!(sort.topn_type, Some(SortTopNType::RowNumber));
         }
@@ -705,7 +730,11 @@ mod tests {
             let mut arena = ScalarArena::new();
             let plan = make_filter_window_sort_opt(&mut arena, "dense_rank", rk_id, p_id, 5);
             let mut ctx = make_ctx(arena);
-            let sort = extract_sort_from_changed(RankingWindowPredicatePushdownRule.apply(plan, &mut ctx).unwrap());
+            let sort = extract_sort_from_changed(
+                RankingWindowPredicatePushdownRule
+                    .apply(plan, &mut ctx)
+                    .unwrap(),
+            );
             assert_eq!(sort.partition_limit, Some(5));
             assert_eq!(sort.topn_type, Some(SortTopNType::DenseRank));
         }
@@ -738,7 +767,9 @@ mod tests {
         );
         let mut ctx = make_ctx(arena);
         assert!(matches!(
-            RankingWindowPredicatePushdownRule.apply(plan, &mut ctx).unwrap(),
+            RankingWindowPredicatePushdownRule
+                .apply(plan, &mut ctx)
+                .unwrap(),
             RewriteResult::Unchanged
         ));
     }
@@ -766,7 +797,10 @@ mod tests {
 
         let rule = RankingWindowPredicatePushdownRule;
         let ctx = make_ctx(arena);
-        assert!(!rule.matches(&plan, &ctx), "matches() must return false for empty partition");
+        assert!(
+            !rule.matches(&plan, &ctx),
+            "matches() must return false for empty partition"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -791,7 +825,9 @@ mod tests {
         );
         let mut ctx = make_ctx(arena);
         assert!(matches!(
-            RankingWindowPredicatePushdownRule.apply(plan, &mut ctx).unwrap(),
+            RankingWindowPredicatePushdownRule
+                .apply(plan, &mut ctx)
+                .unwrap(),
             RewriteResult::Unchanged
         ));
     }
@@ -818,7 +854,9 @@ mod tests {
         );
         let mut ctx = make_ctx(arena);
         assert!(matches!(
-            RankingWindowPredicatePushdownRule.apply(plan, &mut ctx).unwrap(),
+            RankingWindowPredicatePushdownRule
+                .apply(plan, &mut ctx)
+                .unwrap(),
             RewriteResult::Unchanged
         ));
     }
@@ -842,11 +880,7 @@ mod tests {
             vec![output_col(rk_id, "rank")],
         );
         // Project: proj_rk_id <- rk_id (bare passthrough)
-        let project = project_opt(
-            &mut arena,
-            window,
-            vec![(col_typed(rk_id), proj_rk_id)],
-        );
+        let project = project_opt(&mut arena, window, vec![(col_typed(rk_id), proj_rk_id)]);
         // Filter references the projected column (proj_rk_id)
         let plan = filter_opt(
             &mut arena,
@@ -901,7 +935,9 @@ mod tests {
         );
         assert!(
             matches!(
-                RankingWindowPredicatePushdownRule.apply(plan, &mut ctx).unwrap(),
+                RankingWindowPredicatePushdownRule
+                    .apply(plan, &mut ctx)
+                    .unwrap(),
                 RewriteResult::Unchanged
             ),
             "apply() must return Unchanged when window contains a non-ranking expr"
@@ -927,11 +963,7 @@ mod tests {
         );
         // Project: proj_rk_id <- rk_id + 1 (NOT a bare passthrough)
         let transformed_expr = binop_typed(col_typed(rk_id), BinOp::Add, int_typed(1));
-        let project = project_opt(
-            &mut arena,
-            window,
-            vec![(transformed_expr, proj_rk_id)],
-        );
+        let project = project_opt(&mut arena, window, vec![(transformed_expr, proj_rk_id)]);
         let plan = filter_opt(
             &mut arena,
             project,
@@ -939,7 +971,9 @@ mod tests {
         );
         let mut ctx = make_ctx(arena);
         assert!(matches!(
-            RankingWindowPredicatePushdownRule.apply(plan, &mut ctx).unwrap(),
+            RankingWindowPredicatePushdownRule
+                .apply(plan, &mut ctx)
+                .unwrap(),
             RewriteResult::Unchanged
         ));
     }
@@ -994,7 +1028,9 @@ mod tests {
         );
         assert!(
             matches!(
-                RankingWindowPredicatePushdownRule.apply(plan, &mut ctx).unwrap(),
+                RankingWindowPredicatePushdownRule
+                    .apply(plan, &mut ctx)
+                    .unwrap(),
                 RewriteResult::Unchanged
             ),
             "apply() must return Unchanged when ranking fns have different ORDER BY"
@@ -1043,7 +1079,9 @@ mod tests {
         );
         let mut ctx = make_ctx(arena);
 
-        let result = RankingWindowPredicatePushdownRule.apply(plan, &mut ctx).unwrap();
+        let result = RankingWindowPredicatePushdownRule
+            .apply(plan, &mut ctx)
+            .unwrap();
         let sort_node = extract_sort_from_changed(result);
         assert_eq!(sort_node.partition_limit, Some(3));
         assert_eq!(sort_node.topn_type, Some(SortTopNType::Rank));

@@ -6,7 +6,9 @@ use arrow::datatypes::DataType;
 
 use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, TypedExpr};
 use crate::sql::column_id::ColumnId;
-use crate::sql::optimizer::operator::{FilterOp, LogicalJoinOp, Operator, ProjectOp, ScanOp, ScalarAggregateSpec, ScalarProjectItem};
+use crate::sql::optimizer::operator::{
+    FilterOp, LogicalJoinOp, Operator, ProjectOp, ScalarAggregateSpec, ScalarProjectItem, ScanOp,
+};
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::options::current_session_optimizer_settings;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
@@ -44,14 +46,14 @@ impl LogicalRewriteRule for PruneUkFkJoin {
 
     fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
         matches!(&expr.op, Operator::LogicalProject(_))
-            && expr.children.first().map(|c| matches!(&c.op, Operator::LogicalJoin(_))).unwrap_or(false)
+            && expr
+                .children
+                .first()
+                .map(|c| matches!(&c.op, Operator::LogicalJoin(_)))
+                .unwrap_or(false)
     }
 
-    fn apply(
-        &self,
-        expr: OptExpr,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         let settings = current_session_optimizer_settings();
         let table_prune_enabled = settings.enable_query_rewrite_table_prune
             || settings.enable_cbo_table_prune
@@ -88,10 +90,11 @@ impl LogicalRewriteRule for PruneUkFkJoin {
 
         let arena_rc = ctx.scalar_arena();
 
-        let retained_side = match project_referenced_side(&project.items, &left, &right, &arena_rc.borrow())? {
-            Some(s) => s,
-            None => return Ok(RewriteResult::Unchanged),
-        };
+        let retained_side =
+            match project_referenced_side(&project.items, &left, &right, &arena_rc.borrow())? {
+                Some(s) => s,
+                None => return Ok(RewriteResult::Unchanged),
+            };
         let eq_pairs = join_equality_pairs(&join, &left, &right, &arena_rc.borrow())?;
         if eq_pairs.is_empty() {
             return Ok(RewriteResult::Unchanged);
@@ -119,13 +122,23 @@ impl LogicalRewriteRule for PruneUkFkJoin {
                 if settings.enable_ukfk_opt
                     && foreign_key_matches(left_scan, right_scan, &left_cols, &right_cols) =>
             {
-                Some(add_not_null_filter(left.clone(), left_scan, &left_cols, &mut arena_rc.borrow_mut()))
+                Some(add_not_null_filter(
+                    left.clone(),
+                    left_scan,
+                    &left_cols,
+                    &mut arena_rc.borrow_mut(),
+                ))
             }
             (JoinKind::Inner, Side::Right)
                 if settings.enable_ukfk_opt
                     && foreign_key_matches(right_scan, left_scan, &right_cols, &left_cols) =>
             {
-                Some(add_not_null_filter(right.clone(), right_scan, &right_cols, &mut arena_rc.borrow_mut()))
+                Some(add_not_null_filter(
+                    right.clone(),
+                    right_scan,
+                    &right_cols,
+                    &mut arena_rc.borrow_mut(),
+                ))
             }
             _ => None,
         };
@@ -154,14 +167,14 @@ impl LogicalRewriteRule for EliminateUniqueAggregate {
 
     fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
         matches!(&expr.op, Operator::LogicalProject(_))
-            && expr.children.first().map(|c| matches!(&c.op, Operator::LogicalAggregate(_))).unwrap_or(false)
+            && expr
+                .children
+                .first()
+                .map(|c| matches!(&c.op, Operator::LogicalAggregate(_)))
+                .unwrap_or(false)
     }
 
-    fn apply(
-        &self,
-        expr: OptExpr,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         let settings = current_session_optimizer_settings();
         if !settings.enable_eliminate_agg {
             return Ok(RewriteResult::Unchanged);
@@ -578,10 +591,7 @@ fn add_not_null_filter(
         return plan;
     }
     let predicate = scalar::intern_typed(arena, &combine_and(predicates));
-    OptExpr::new(
-        Operator::LogicalFilter(FilterOp { predicate }),
-        vec![plan],
-    )
+    OptExpr::new(Operator::LogicalFilter(FilterOp { predicate }), vec![plan])
 }
 
 fn is_eliminable_count(aggregate: &ScalarAggregateSpec, arena: &ScalarArena) -> bool {

@@ -291,8 +291,8 @@ mod tests {
         // Replaces the former rewrite_traverses_into_imv_delta_child test.
         // LogicalJoin is available in Operator and exercises the same traversal
         // path: a parent node that is not matched, with a matched child below it.
-        use crate::sql::optimizer::operator::LogicalJoinOp;
         use crate::sql::analysis::JoinKind;
+        use crate::sql::optimizer::operator::LogicalJoinOp;
 
         let inner = OptExpr::new(
             Operator::LogicalScan(ScanOp {

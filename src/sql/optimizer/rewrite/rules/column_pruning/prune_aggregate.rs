@@ -33,11 +33,7 @@ impl LogicalRewriteRule for PruneAggregateColumns {
         matches!(&expr.op, Operator::LogicalAggregate(_))
     }
 
-    fn apply(
-        &self,
-        expr: OptExpr,
-        _ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         // No-op: see module-level doc comment.
         //
         // Per-aggregate output pruning (Gap 5) remains disabled until upper
@@ -55,7 +51,7 @@ mod tests {
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
-        AggStage, LogicalAggregateOp, Operator, ScanOp, ScalarAggregateSpec,
+        AggStage, LogicalAggregateOp, Operator, ScalarAggregateSpec, ScanOp,
     };
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};

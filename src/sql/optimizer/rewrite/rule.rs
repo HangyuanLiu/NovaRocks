@@ -16,11 +16,7 @@ pub(crate) trait LogicalRewriteRule: Send + Sync {
         RewriteTraversal::BottomUp
     }
     fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool;
-    fn apply(
-        &self,
-        expr: OptExpr,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String>;
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String>;
 }
 
 /// Convenience trait for local `OptExpr -> OptExpr` rules.
@@ -65,11 +61,7 @@ where
         PlanRewriteRule::matches(self, expr)
     }
 
-    fn apply(
-        &self,
-        expr: OptExpr,
-        _ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         Ok(match PlanRewriteRule::apply(self, expr) {
             Some(rewritten) => RewriteResult::Changed(rewritten),
             None => RewriteResult::Unchanged,

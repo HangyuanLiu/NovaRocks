@@ -36,11 +36,7 @@ impl RewriteRule for AggregatePushdownRule {
         matches!(&expr.op, Operator::LogicalAggregate(_))
     }
 
-    fn apply(
-        &self,
-        expr: OptExpr,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         // Extract the aggregate op; return Unchanged if shape doesn't match.
         let agg = match expr.op {
             Operator::LogicalAggregate(ref a) => a.clone(),
@@ -214,10 +210,7 @@ mod tests {
                 join_type: JoinKind::Inner,
                 condition: Some(cond_id),
             }),
-            vec![
-                dummy_scan("a", &["k", "v"]),
-                dummy_scan("b", &["k"]),
-            ],
+            vec![dummy_scan("a", &["k", "v"]), dummy_scan("b", &["k"])],
         );
 
         // Build a plan with is_split = true. The rule must reject.

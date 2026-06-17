@@ -20,8 +20,8 @@ use std::collections::{HashMap, HashSet};
 use crate::sql::analysis::ExprKind;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::column_id::ColumnId;
-use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::operator::Operator;
+use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
@@ -661,11 +661,7 @@ fn tag_cte_anchor(
 
 /// Recursively traverse `expr` and union all `required_output_columns` sets
 /// from `CTEConsume` nodes whose `cte_id` matches `target_id` into `acc`.
-fn collect_cte_consumer_needs(
-    expr: &OptExpr,
-    target_id: CteId,
-    acc: &mut HashSet<ColumnId>,
-) {
+fn collect_cte_consumer_needs(expr: &OptExpr, target_id: CteId, acc: &mut HashSet<ColumnId>) {
     match &expr.op {
         Operator::LogicalCTEConsume(c) if c.cte_id == target_id => {
             if let Some(req) = &expr.required_output_columns {
@@ -696,11 +692,7 @@ fn find_consume_position_map(expr: &OptExpr, target_id: CteId) -> HashMap<Column
     map
 }
 
-fn walk_consume_position_map(
-    expr: &OptExpr,
-    target_id: CteId,
-    map: &mut HashMap<ColumnId, usize>,
-) {
+fn walk_consume_position_map(expr: &OptExpr, target_id: CteId, map: &mut HashMap<ColumnId, usize>) {
     match &expr.op {
         Operator::LogicalCTEConsume(c) if c.cte_id == target_id => {
             // Record consume_side_column_id -> position for each output column.
@@ -799,11 +791,7 @@ impl LogicalRewriteRule for TagRequiredColumns {
         subtree_untagged(expr)
     }
 
-    fn apply(
-        &self,
-        expr: OptExpr,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         let arena_rc = ctx.scalar_arena();
         let arena = arena_rc.borrow();
         let tagged = tag_required_columns(expr, &arena, None);
@@ -818,14 +806,14 @@ impl LogicalRewriteRule for TagRequiredColumns {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn};
     use crate::sql::analysis::cte::CteId;
+    use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::optimizer::operator::{
-        CTEAnchorOp, CTEConsumeOp, CTEProduceOp, ExceptOp, FilterOp, GenerateSeriesOp,
-        IntersectOp, LimitOp, LogicalAggregateOp, LogicalJoinOp, ProjectOp, RepeatOp,
-        ScalarAggregateSpec, ScalarProjectItem, ScalarWindowSpec, ScanOp, SortOp, TableFunctionOp,
-        UnionOp, ValuesOp, WindowOp,
+        CTEAnchorOp, CTEConsumeOp, CTEProduceOp, ExceptOp, FilterOp, GenerateSeriesOp, IntersectOp,
+        LimitOp, LogicalAggregateOp, LogicalJoinOp, ProjectOp, RepeatOp, ScalarAggregateSpec,
+        ScalarProjectItem, ScalarWindowSpec, ScanOp, SortOp, TableFunctionOp, UnionOp, ValuesOp,
+        WindowOp,
     };
     use crate::sql::optimizer::scalar::{self, ScalarArena, SortKey};
     use arrow::datatypes::DataType;
@@ -850,7 +838,10 @@ mod tests {
         }
     }
 
-    fn col_ref_scalar(arena: &mut ScalarArena, id: ColumnId) -> crate::sql::optimizer::scalar::ScalarId {
+    fn col_ref_scalar(
+        arena: &mut ScalarArena,
+        id: ColumnId,
+    ) -> crate::sql::optimizer::scalar::ScalarId {
         let expr = crate::sql::analysis::TypedExpr {
             kind: ExprKind::ColumnRef {
                 column_id: id,
@@ -863,7 +854,10 @@ mod tests {
         scalar::intern_typed(arena, &expr)
     }
 
-    fn int_literal_scalar(arena: &mut ScalarArena, v: i64) -> crate::sql::optimizer::scalar::ScalarId {
+    fn int_literal_scalar(
+        arena: &mut ScalarArena,
+        v: i64,
+    ) -> crate::sql::optimizer::scalar::ScalarId {
         let expr = crate::sql::analysis::TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(v)),
             data_type: DataType::Int64,
@@ -892,17 +886,43 @@ mod tests {
         scalar::intern_typed(arena, &expr)
     }
 
-    fn make_scan_with_ids(arena_rc: &Rc<RefCell<ScalarArena>>, id_a: u32, id_b: u32, id_c: u32) -> OptExpr {
+    fn make_scan_with_ids(
+        arena_rc: &Rc<RefCell<ScalarArena>>,
+        id_a: u32,
+        id_b: u32,
+        id_c: u32,
+    ) -> OptExpr {
         let _ = arena_rc; // scan predicates empty; arena not needed here
         let table = TableDef {
             name: "t".to_string(),
             columns: vec![
-                ColumnDef { name: "a".to_string(), data_type: DataType::Int32, nullable: false, write_default: None, logical_type: None },
-                ColumnDef { name: "b".to_string(), data_type: DataType::Int32, nullable: false, write_default: None, logical_type: None },
-                ColumnDef { name: "c".to_string(), data_type: DataType::Int32, nullable: false, write_default: None, logical_type: None },
+                ColumnDef {
+                    name: "a".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                },
+                ColumnDef {
+                    name: "b".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                },
+                ColumnDef {
+                    name: "c".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    write_default: None,
+                    logical_type: None,
+                },
             ],
             iceberg_row_lineage_metadata_columns: vec![],
-            source: ScanSource::StarRocks { db_id: 0, table_id: 0 },
+            source: ScanSource::StarRocks {
+                db_id: 0,
+                table_id: 0,
+            },
         };
         OptExpr::leaf(Operator::LogicalScan(ScanOp {
             database: "d".to_string(),
@@ -965,7 +985,8 @@ mod tests {
         let arena_rc = make_arena();
         let arena = arena_rc.borrow();
         let subset = needed_set(&[2]);
-        let tagged = tag_required_columns(scan_with_3_cols(&arena_rc), &arena, Some(subset.clone()));
+        let tagged =
+            tag_required_columns(scan_with_3_cols(&arena_rc), &arena, Some(subset.clone()));
         assert!(matches!(&tagged.op, Operator::LogicalScan(_)));
         assert_eq!(required_columns(&tagged), &subset);
     }
@@ -1094,8 +1115,14 @@ mod tests {
         let input = tagged.unary_input();
         assert!(matches!(&input.op, Operator::LogicalScan(_)));
         let req = required_columns(input);
-        assert!(req.contains(&ColumnId::new_for_test(1)), "a needed by parent");
-        assert!(req.contains(&ColumnId::new_for_test(3)), "c needed by predicate");
+        assert!(
+            req.contains(&ColumnId::new_for_test(1)),
+            "a needed by parent"
+        );
+        assert!(
+            req.contains(&ColumnId::new_for_test(3)),
+            "c needed by predicate"
+        );
         assert!(!req.contains(&ColumnId::new_for_test(2)), "b not needed");
     }
 
@@ -1438,7 +1465,11 @@ mod tests {
         assert!(matches!(&produce_input.op, Operator::LogicalScan(_)));
         let req = required_columns(produce_input);
         // Conservative keep-all: produce body scan keeps all 3 columns.
-        assert_eq!(req.len(), 3, "scan must keep all columns (keep-all for CTE produce body)");
+        assert_eq!(
+            req.len(),
+            3,
+            "scan must keep all columns (keep-all for CTE produce body)"
+        );
         assert!(req.contains(&ColumnId::new_for_test(10)), "a@10 kept");
         assert!(req.contains(&ColumnId::new_for_test(20)), "b@20 kept");
         assert!(req.contains(&ColumnId::new_for_test(30)), "c@30 kept");
@@ -1505,7 +1536,11 @@ mod tests {
         assert!(matches!(&produce_input.op, Operator::LogicalScan(_)));
         let req = required_columns(produce_input);
         // Conservative keep-all: produce body scan keeps all 3 columns.
-        assert_eq!(req.len(), 3, "scan must keep all columns (keep-all for CTE produce body)");
+        assert_eq!(
+            req.len(),
+            3,
+            "scan must keep all columns (keep-all for CTE produce body)"
+        );
         assert!(req.contains(&ColumnId::new_for_test(10)), "a@10 kept");
         assert!(req.contains(&ColumnId::new_for_test(20)), "b@20 kept");
         assert!(req.contains(&ColumnId::new_for_test(30)), "c@30 kept");
@@ -1533,7 +1568,12 @@ mod tests {
                     args: vec![],
                     distinct: false,
                     partition_by: vec![part_by],
-                    order_by: vec![SortKey { expr: order_by, asc: true, nulls_first: false, display: None }],
+                    order_by: vec![SortKey {
+                        expr: order_by,
+                        asc: true,
+                        nulls_first: false,
+                        display: None,
+                    }],
                     window_frame: None,
                     ignore_nulls: false,
                 }],
@@ -1578,7 +1618,12 @@ mod tests {
                     args: vec![],
                     distinct: false,
                     partition_by: vec![part_by],
-                    order_by: vec![SortKey { expr: order_by, asc: true, nulls_first: false, display: None }],
+                    order_by: vec![SortKey {
+                        expr: order_by,
+                        asc: true,
+                        nulls_first: false,
+                        display: None,
+                    }],
                     window_frame: None,
                     ignore_nulls: false,
                 }],
@@ -1614,7 +1659,12 @@ mod tests {
 
         let sort = OptExpr::new(
             Operator::LogicalSort(SortOp {
-                items: vec![SortKey { expr: col3, asc: true, nulls_first: false, display: None }],
+                items: vec![SortKey {
+                    expr: col3,
+                    asc: true,
+                    nulls_first: false,
+                    display: None,
+                }],
                 analytic_partition_exprs: vec![],
                 partition_limit: None,
                 topn_type: None,
@@ -1628,7 +1678,10 @@ mod tests {
         assert!(matches!(&input.op, Operator::LogicalScan(_)));
         let req = required_columns(input);
         assert!(req.contains(&ColumnId::new_for_test(1)), "parent needed a");
-        assert!(req.contains(&ColumnId::new_for_test(3)), "sort key c needed");
+        assert!(
+            req.contains(&ColumnId::new_for_test(3)),
+            "sort key c needed"
+        );
         assert!(!req.contains(&ColumnId::new_for_test(2)));
     }
 
@@ -1636,7 +1689,10 @@ mod tests {
     fn tag_limit_passes_needed_through() {
         let arena_rc = make_arena();
         let limit = OptExpr::new(
-            Operator::LogicalLimit(LimitOp { limit: Some(10), offset: None }),
+            Operator::LogicalLimit(LimitOp {
+                limit: Some(10),
+                offset: None,
+            }),
             vec![scan_with_3_cols(&arena_rc)],
         );
         let needed = needed_set(&[2]);
@@ -1697,12 +1753,19 @@ mod tests {
         let arena = arena_rc.borrow();
         let tagged = tag_required_columns(filter, &arena, None);
         assert!(matches!(&tagged.op, Operator::LogicalFilter(_)));
-        assert!(tagged.required_output_columns.is_none(), "filter keeps None on itself");
+        assert!(
+            tagged.required_output_columns.is_none(),
+            "filter keeps None on itself"
+        );
         let input = tagged.unary_input();
         assert!(matches!(&input.op, Operator::LogicalScan(_)));
         // None propagated → Scan expands to all columns.
         let req = required_columns(input);
-        assert_eq!(req.len(), 3, "scan must keep all 3 columns, not just predicate ref c");
+        assert_eq!(
+            req.len(),
+            3,
+            "scan must keep all 3 columns, not just predicate ref c"
+        );
         assert!(req.contains(&ColumnId::new_for_test(1)), "a@1 kept");
         assert!(req.contains(&ColumnId::new_for_test(2)), "b@2 kept");
         assert!(req.contains(&ColumnId::new_for_test(3)), "c@3 kept");
@@ -1721,7 +1784,12 @@ mod tests {
 
         let sort = OptExpr::new(
             Operator::LogicalSort(SortOp {
-                items: vec![SortKey { expr: col3, asc: true, nulls_first: false, display: None }],
+                items: vec![SortKey {
+                    expr: col3,
+                    asc: true,
+                    nulls_first: false,
+                    display: None,
+                }],
                 analytic_partition_exprs: vec![col2],
                 partition_limit: None,
                 topn_type: None,
@@ -1731,12 +1799,19 @@ mod tests {
         let arena = arena_rc.borrow();
         let tagged = tag_required_columns(sort, &arena, None);
         assert!(matches!(&tagged.op, Operator::LogicalSort(_)));
-        assert!(tagged.required_output_columns.is_none(), "sort keeps None on itself");
+        assert!(
+            tagged.required_output_columns.is_none(),
+            "sort keeps None on itself"
+        );
         let input = tagged.unary_input();
         assert!(matches!(&input.op, Operator::LogicalScan(_)));
         // None propagated → Scan expands to all columns.
         let req = required_columns(input);
-        assert_eq!(req.len(), 3, "scan must keep all 3 columns, not just sort/partition refs");
+        assert_eq!(
+            req.len(),
+            3,
+            "scan must keep all 3 columns, not just sort/partition refs"
+        );
         assert!(req.contains(&ColumnId::new_for_test(1)), "a@1 kept");
         assert!(req.contains(&ColumnId::new_for_test(2)), "b@2 kept");
         assert!(req.contains(&ColumnId::new_for_test(3)), "c@3 kept");
@@ -1767,7 +1842,10 @@ mod tests {
         let arena = arena_rc.borrow();
         let tagged = tag_required_columns(join, &arena, None);
         assert!(matches!(&tagged.op, Operator::LogicalJoin(_)));
-        assert!(tagged.required_output_columns.is_none(), "join keeps None on itself");
+        assert!(
+            tagged.required_output_columns.is_none(),
+            "join keeps None on itself"
+        );
         let left = tagged.left();
         assert!(matches!(&left.op, Operator::LogicalScan(_)));
         let right = tagged.right();
@@ -1926,7 +2004,10 @@ mod tests {
             "scan keeps all 3 columns, including arr@2 needed by function arg"
         );
         assert!(req.contains(&ColumnId::new_for_test(1)));
-        assert!(req.contains(&ColumnId::new_for_test(2)), "arr@2 must be kept for UNNEST arg");
+        assert!(
+            req.contains(&ColumnId::new_for_test(2)),
+            "arr@2 must be kept for UNNEST arg"
+        );
         assert!(req.contains(&ColumnId::new_for_test(3)));
     }
 
@@ -2040,9 +2121,18 @@ mod tests {
             .required_output_columns
             .as_ref()
             .expect("required_output_columns must be Some(_) after tagging with None parent");
-        assert!(req.contains(&ColumnId::new_for_test(10)), "x@10 must be kept");
-        assert!(req.contains(&ColumnId::new_for_test(20)), "y@20 must be kept");
-        assert!(req.contains(&ColumnId::new_for_test(30)), "z@30 must be kept");
+        assert!(
+            req.contains(&ColumnId::new_for_test(10)),
+            "x@10 must be kept"
+        );
+        assert!(
+            req.contains(&ColumnId::new_for_test(20)),
+            "y@20 must be kept"
+        );
+        assert!(
+            req.contains(&ColumnId::new_for_test(30)),
+            "z@30 must be kept"
+        );
         assert_eq!(req.len(), 3, "all 3 output ids kept");
     }
 

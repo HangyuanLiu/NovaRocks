@@ -57,11 +57,7 @@ impl LogicalRewriteRule for VariantPathPushdownRule {
         }
     }
 
-    fn apply(
-        &self,
-        mut expr: OptExpr,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, mut expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         let Some(factory) = ctx.column_ref_factory().cloned() else {
             return Ok(RewriteResult::Unchanged);
         };
@@ -86,7 +82,9 @@ impl LogicalRewriteRule for VariantPathPushdownRule {
                 };
                 if changed {
                     let new_pred_id = scalar::intern_typed(&mut arena_rc.borrow_mut(), &pred_typed);
-                    expr.op = Operator::LogicalFilter(FilterOp { predicate: new_pred_id });
+                    expr.op = Operator::LogicalFilter(FilterOp {
+                        predicate: new_pred_id,
+                    });
                 }
                 changed
             }
@@ -127,7 +125,8 @@ impl LogicalRewriteRule for VariantPathPushdownRule {
                 // We need &mut ScanOp to call rewrite_scan_predicates.
                 // Temporarily take it out, mutate, put back.
                 let mut scan = scan_op;
-                let changed = rewrite_scan_predicates(&mut scan, &mut factory, &mut arena_rc.borrow_mut())?;
+                let changed =
+                    rewrite_scan_predicates(&mut scan, &mut factory, &mut arena_rc.borrow_mut())?;
                 if changed {
                     expr.op = Operator::LogicalScan(scan);
                 }
@@ -536,7 +535,9 @@ fn find_or_create_slot(
                     expr_contains_variant_request(&pred, request)
                 });
             if can_push {
-                let Operator::LogicalScan(scan_mut) = &mut expr.op else { return None; };
+                let Operator::LogicalScan(scan_mut) = &mut expr.op else {
+                    return None;
+                };
                 find_or_create_slot_on_scan(scan_mut, request, factory)
             } else {
                 None

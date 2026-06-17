@@ -31,11 +31,7 @@ impl LogicalRewriteRule for PruneSortColumns {
         matches!(&expr.op, Operator::LogicalSort(_))
     }
 
-    fn apply(
-        &self,
-        _expr: OptExpr,
-        _ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, _expr: OptExpr, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         // No-op: Sort has no own output metadata to prune; column needs were
         // propagated to its child by the Phase-1 tagging pass. Kept for
         // architectural symmetry + per-operator disable_optimizer_rules control.

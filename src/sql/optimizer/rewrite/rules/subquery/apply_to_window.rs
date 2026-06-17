@@ -63,11 +63,7 @@ impl LogicalRewriteRule for ApplyToWindow {
         matches_plan(&plan)
     }
 
-    fn apply(
-        &self,
-        expr: OptExpr,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         let arena = ctx.scalar_arena();
         let plan = opt_expr_to_plan(&expr, &arena.borrow());
         match apply_plan_inner(plan, ctx)? {
@@ -115,144 +111,144 @@ fn apply_plan_inner(
         unreachable!()
     };
 
-        // --- 1. Remap the inner aggregate's args to the outer instance of the same physical column. ---
-        let outer_map = collect_scan_column_map(&outer_subtree);
-        let inner_map = collect_scan_column_map(&apply_right);
-        // Collect the set of inner-scan ColumnIds upfront; used by post-condition guards.
-        let inner_ids: HashSet<ColumnId> = inner_map.keys().copied().collect();
-        let outer_cols = plan_output_columns(&outer_subtree)?;
-        let mut phys_to_outer: HashMap<(TableIdentity, String), OutputColumn> = HashMap::new();
-        for oc in &outer_cols {
-            if let Some((tab, name)) = outer_map.get(&oc.column_id) {
-                phys_to_outer.insert((tab.clone(), name.clone()), oc.clone());
-            }
+    // --- 1. Remap the inner aggregate's args to the outer instance of the same physical column. ---
+    let outer_map = collect_scan_column_map(&outer_subtree);
+    let inner_map = collect_scan_column_map(&apply_right);
+    // Collect the set of inner-scan ColumnIds upfront; used by post-condition guards.
+    let inner_ids: HashSet<ColumnId> = inner_map.keys().copied().collect();
+    let outer_cols = plan_output_columns(&outer_subtree)?;
+    let mut phys_to_outer: HashMap<(TableIdentity, String), OutputColumn> = HashMap::new();
+    for oc in &outer_cols {
+        if let Some((tab, name)) = outer_map.get(&oc.column_id) {
+            phys_to_outer.insert((tab.clone(), name.clone()), oc.clone());
         }
-        let mut agg_args = m.inner_agg.args.clone();
-        for arg in &mut agg_args {
-            if !remap_inner_to_outer(arg, &inner_map, &phys_to_outer) {
-                // Required column unavailable on outer side → fall back to join form.
-                return Ok(None);
-            }
+    }
+    let mut agg_args = m.inner_agg.args.clone();
+    for arg in &mut agg_args {
+        if !remap_inner_to_outer(arg, &inner_map, &phys_to_outer) {
+            // Required column unavailable on outer side → fall back to join form.
+            return Ok(None);
         }
-        // Guard 1: post-condition — verify no inner-scan column survived the remap.
-        // This catches any ExprKind variant that remap_inner_to_outer might have missed.
-        for arg in &agg_args {
-            if !collect_column_id_refs(arg).is_disjoint(&inner_ids) {
-                return Ok(None); // an inner column survived the remap
-            }
+    }
+    // Guard 1: post-condition — verify no inner-scan column survived the remap.
+    // This catches any ExprKind variant that remap_inner_to_outer might have missed.
+    for arg in &agg_args {
+        if !collect_column_id_refs(arg).is_disjoint(&inner_ids) {
+            return Ok(None); // an inner column survived the remap
         }
+    }
 
-        // --- 2. Mint the window output column; build the WindowExpr. ---
-        let factory = ctx
-            .column_ref_factory()
-            .ok_or_else(|| "ApplyToWindow requires ColumnRefFactory".to_string())?;
-        let win_id = factory.borrow_mut().create(
-            None,
-            format!("{}_window", m.inner_agg.name),
-            m.inner_agg.result_type.clone(),
-            true,
-        );
-        let win_expr = WindowExpr {
-            name: m.inner_agg.name.clone(),
-            args: agg_args,
-            distinct: false,
-            partition_by: m.partition_by.clone(),
-            order_by: vec![],
-            window_frame: None,
-            result_type: m.inner_agg.result_type.clone(),
-            output_name: format!("{}_window", m.inner_agg.name),
-            output_column_id: win_id,
-            ignore_nulls: false,
-        };
+    // --- 2. Mint the window output column; build the WindowExpr. ---
+    let factory = ctx
+        .column_ref_factory()
+        .ok_or_else(|| "ApplyToWindow requires ColumnRefFactory".to_string())?;
+    let win_id = factory.borrow_mut().create(
+        None,
+        format!("{}_window", m.inner_agg.name),
+        m.inner_agg.result_type.clone(),
+        true,
+    );
+    let win_expr = WindowExpr {
+        name: m.inner_agg.name.clone(),
+        args: agg_args,
+        distinct: false,
+        partition_by: m.partition_by.clone(),
+        order_by: vec![],
+        window_frame: None,
+        result_type: m.inner_agg.result_type.clone(),
+        output_name: format!("{}_window", m.inner_agg.name),
+        output_column_id: win_id,
+        ignore_nulls: false,
+    };
 
-        // --- 3. before-window Filter = all outer conjuncts except the subquery one. ---
-        let before: Vec<TypedExpr> = m
-            .outer_conjuncts
-            .iter()
-            .filter(|oc| !expr_struct_eq(oc, &m.subquery_conjunct))
-            .cloned()
-            .collect();
-        let before_filtered = if before.is_empty() {
-            outer_subtree
-        } else {
-            LogicalPlanNode::new(
-                LogicalPlanNodeKind::Filter(LogicalFilterNode {
-                    predicate: combine_and(before),
-                }),
-                vec![outer_subtree],
-                None,
-            )
-        };
-
-        // --- 4. Sort(partition keys) under the Window. ---
-        let sort_items: Vec<SortItem> = m
-            .partition_by
-            .iter()
-            .map(|e| SortItem {
-                expr: e.clone(),
-                asc: true,
-                nulls_first: true,
-            })
-            .collect();
-        let sorted = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Sort(LogicalSortNode {
-                items: sort_items,
-                analytic_partition_by: m.partition_by.clone(),
-                partition_limit: None,
-                topn_type: None,
-            }),
-            vec![before_filtered],
-            None,
-        );
-
-        // --- 5. Window node: output = base outer columns + the window column. ---
-        let mut window_output = plan_output_columns(&sorted)?;
-        window_output.push(OutputColumn {
-            column_id: win_id,
-            name: format!("{}_window", m.inner_agg.name),
-            data_type: m.inner_agg.result_type.clone(),
-            nullable: true,
-            is_internal: true,
-        });
-        let window = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Window(LogicalWindowNode {
-                window_exprs: vec![win_expr],
-                output_columns: window_output,
-            }),
-            vec![sorted],
-            None,
-        );
-
-        // --- 6. after-window Filter = subquery comparison with APPLY_OUT replaced by the value expr. ---
-        let value_expr = build_value_expr(
-            &apply_right,
-            a.inner_output_column_id,
-            m.inner_agg.output_column_id,
-            win_id,
-            &m.inner_agg.result_type,
-        )?;
-        // Guard 2: value_expr must not reference the inner agg output or any inner-scan column.
-        {
-            let vrefs = collect_column_id_refs(&value_expr);
-            if vrefs.contains(&m.inner_agg.output_column_id) || !vrefs.is_disjoint(&inner_ids) {
-                return Ok(None); // value expr still references a disappearing inner column
-            }
-        }
-        let mut after_pred = m.subquery_conjunct.clone();
-        replace_column_ref(&mut after_pred, a.output_column.column_id, &value_expr);
-        // Guard 3: APPLY_OUT must be gone from after_pred — it has been fully replaced.
-        if collect_column_id_refs(&after_pred).contains(&a.output_column.column_id) {
-            return Ok(None); // APPLY_OUT survived (comparison used an unhandled node)
-        }
-        let after = LogicalPlanNode::new(
+    // --- 3. before-window Filter = all outer conjuncts except the subquery one. ---
+    let before: Vec<TypedExpr> = m
+        .outer_conjuncts
+        .iter()
+        .filter(|oc| !expr_struct_eq(oc, &m.subquery_conjunct))
+        .cloned()
+        .collect();
+    let before_filtered = if before.is_empty() {
+        outer_subtree
+    } else {
+        LogicalPlanNode::new(
             LogicalPlanNodeKind::Filter(LogicalFilterNode {
-                predicate: after_pred,
+                predicate: combine_and(before),
             }),
-            vec![window],
+            vec![outer_subtree],
             None,
-        );
+        )
+    };
 
-        Ok(Some(after))
+    // --- 4. Sort(partition keys) under the Window. ---
+    let sort_items: Vec<SortItem> = m
+        .partition_by
+        .iter()
+        .map(|e| SortItem {
+            expr: e.clone(),
+            asc: true,
+            nulls_first: true,
+        })
+        .collect();
+    let sorted = LogicalPlanNode::new(
+        LogicalPlanNodeKind::Sort(LogicalSortNode {
+            items: sort_items,
+            analytic_partition_by: m.partition_by.clone(),
+            partition_limit: None,
+            topn_type: None,
+        }),
+        vec![before_filtered],
+        None,
+    );
+
+    // --- 5. Window node: output = base outer columns + the window column. ---
+    let mut window_output = plan_output_columns(&sorted)?;
+    window_output.push(OutputColumn {
+        column_id: win_id,
+        name: format!("{}_window", m.inner_agg.name),
+        data_type: m.inner_agg.result_type.clone(),
+        nullable: true,
+        is_internal: true,
+    });
+    let window = LogicalPlanNode::new(
+        LogicalPlanNodeKind::Window(LogicalWindowNode {
+            window_exprs: vec![win_expr],
+            output_columns: window_output,
+        }),
+        vec![sorted],
+        None,
+    );
+
+    // --- 6. after-window Filter = subquery comparison with APPLY_OUT replaced by the value expr. ---
+    let value_expr = build_value_expr(
+        &apply_right,
+        a.inner_output_column_id,
+        m.inner_agg.output_column_id,
+        win_id,
+        &m.inner_agg.result_type,
+    )?;
+    // Guard 2: value_expr must not reference the inner agg output or any inner-scan column.
+    {
+        let vrefs = collect_column_id_refs(&value_expr);
+        if vrefs.contains(&m.inner_agg.output_column_id) || !vrefs.is_disjoint(&inner_ids) {
+            return Ok(None); // value expr still references a disappearing inner column
+        }
+    }
+    let mut after_pred = m.subquery_conjunct.clone();
+    replace_column_ref(&mut after_pred, a.output_column.column_id, &value_expr);
+    // Guard 3: APPLY_OUT must be gone from after_pred — it has been fully replaced.
+    if collect_column_id_refs(&after_pred).contains(&a.output_column.column_id) {
+        return Ok(None); // APPLY_OUT survived (comparison used an unhandled node)
+    }
+    let after = LogicalPlanNode::new(
+        LogicalPlanNodeKind::Filter(LogicalFilterNode {
+            predicate: after_pred,
+        }),
+        vec![window],
+        None,
+    );
+
+    Ok(Some(after))
 }
 
 /// Recursively remap each `ColumnRef` in `expr` from an inner-scan column id to

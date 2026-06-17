@@ -279,7 +279,9 @@ fn exposure_project_items(
             let gb = materialize(arena, *gb_id);
             let output_name = group_by_display_name(*gb_id, arena);
             let (column_id, col_name) = match &gb.kind {
-                ExprKind::ColumnRef { column_id, column, .. } => (*column_id, column.clone()),
+                ExprKind::ColumnRef {
+                    column_id, column, ..
+                } => (*column_id, column.clone()),
                 _ => (ColumnId::UNSET, output_name.clone()),
             };
             // The exposure project emits a ColumnRef to the final aggregate's
@@ -377,7 +379,14 @@ mod tests {
     }
 
     fn scan_opt(name: &str, cols: &[(&str, DataType)]) -> OptExpr {
-        scan_opt_with_alias(name, None, &cols.iter().map(|(c, ty)| (*c, test_col_id(c), ty.clone())).collect::<Vec<_>>())
+        scan_opt_with_alias(
+            name,
+            None,
+            &cols
+                .iter()
+                .map(|(c, ty)| (*c, test_col_id(c), ty.clone()))
+                .collect::<Vec<_>>(),
+        )
     }
 
     fn scan_opt_with_alias(
@@ -645,8 +654,7 @@ mod tests {
         let mut factory = ColumnRefFactory::new();
         let mut arena = ScalarArena::new();
         let c_key = factory.create(Some("t1".into()), "c_key".into(), DataType::Int32, false);
-        let c_bigint =
-            factory.create(Some("t1".into()), "c_bigint".into(), DataType::Int64, true);
+        let c_bigint = factory.create(Some("t1".into()), "c_bigint".into(), DataType::Int64, true);
         let c_int = factory.create(Some("t2".into()), "c_int".into(), DataType::Int32, true);
 
         let left = scan_opt_with_alias(
@@ -657,8 +665,7 @@ mod tests {
                 ("c_bigint", c_bigint, DataType::Int64),
             ],
         );
-        let right =
-            scan_opt_with_alias("t2", Some("t2"), &[("c_int", c_int, DataType::Int32)]);
+        let right = scan_opt_with_alias("t2", Some("t2"), &[("c_int", c_int, DataType::Int32)]);
 
         let qualified_col = |qualifier: &str, name: &str, id: ColumnId, ty: DataType| {
             crate::sql::analysis::TypedExpr {
@@ -762,8 +769,7 @@ mod tests {
         let mut factory = ColumnRefFactory::new();
         let mut arena = ScalarArena::new();
         let c_key = factory.create(Some("t1".into()), "c_key".into(), DataType::Int32, false);
-        let c_bigint =
-            factory.create(Some("t1".into()), "c_bigint".into(), DataType::Int64, true);
+        let c_bigint = factory.create(Some("t1".into()), "c_bigint".into(), DataType::Int64, true);
         let c_int = factory.create(Some("t2".into()), "c_int".into(), DataType::Int32, true);
 
         let qualified_col = |qualifier: &str, name: &str, id: ColumnId, ty: DataType| {
@@ -786,8 +792,7 @@ mod tests {
                 ("c_bigint", c_bigint, DataType::Int64),
             ],
         );
-        let right =
-            scan_opt_with_alias("t2", Some("t2"), &[("c_int", c_int, DataType::Int32)]);
+        let right = scan_opt_with_alias("t2", Some("t2"), &[("c_int", c_int, DataType::Int32)]);
         let join_cond = crate::sql::analysis::TypedExpr {
             kind: ExprKind::BinaryOp {
                 left: Box::new(qualified_col("t1", "c_bigint", c_bigint, DataType::Int64)),

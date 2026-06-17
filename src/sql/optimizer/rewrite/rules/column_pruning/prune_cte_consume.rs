@@ -25,11 +25,7 @@ impl LogicalRewriteRule for PruneCTEConsumeColumns {
         matches!(&expr.op, Operator::LogicalCTEConsume(_))
     }
 
-    fn apply(
-        &self,
-        _expr: OptExpr,
-        _ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, _expr: OptExpr, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         // Conservative no-op: do not prune CTE consume output columns.
         //
         // CTE column pruning (Gap-3) is deferred because the consume↔produce

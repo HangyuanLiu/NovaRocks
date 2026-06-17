@@ -377,11 +377,7 @@ mod tests {
         join
     }
 
-    fn assert_eq_condition(
-        condition: &TypedExpr,
-        expected_a: ColumnId,
-        expected_b: ColumnId,
-    ) {
+    fn assert_eq_condition(condition: &TypedExpr, expected_a: ColumnId, expected_b: ColumnId) {
         let ExprKind::BinaryOp { left, op, right } = &condition.kind else {
             panic!("expected bare Eq condition, got: {condition:?}");
         };

@@ -99,19 +99,13 @@ impl LogicalRewriteRule for JoinPredicateMoveAround {
             left
         } else {
             let predicate = scalar::intern_typed(&mut arena, &combine_and(left_fresh));
-            OptExpr::new(
-                Operator::LogicalFilter(FilterOp { predicate }),
-                vec![left],
-            )
+            OptExpr::new(Operator::LogicalFilter(FilterOp { predicate }), vec![left])
         };
         let new_right = if right_fresh.is_empty() {
             right
         } else {
             let predicate = scalar::intern_typed(&mut arena, &combine_and(right_fresh));
-            OptExpr::new(
-                Operator::LogicalFilter(FilterOp { predicate }),
-                vec![right],
-            )
+            OptExpr::new(Operator::LogicalFilter(FilterOp { predicate }), vec![right])
         };
 
         let new_join = OptExpr {
@@ -159,7 +153,10 @@ fn collect_child_predicate_groups(
     match &expr.op {
         Operator::LogicalFilter(filter) => {
             let typed = scalar::materialize(arena, filter.predicate);
-            out.extend(PredicateGroup::from_predicate(typed, PredicateOrigin::Filter));
+            out.extend(PredicateGroup::from_predicate(
+                typed,
+                PredicateOrigin::Filter,
+            ));
             if !expr.children.is_empty() {
                 collect_child_predicate_groups(expr.unary_input(), out, arena);
             }
@@ -167,7 +164,10 @@ fn collect_child_predicate_groups(
         Operator::LogicalScan(scan) => {
             for &pred_id in &scan.predicates {
                 let typed = scalar::materialize(arena, pred_id);
-                out.extend(PredicateGroup::from_predicate(typed, PredicateOrigin::Filter));
+                out.extend(PredicateGroup::from_predicate(
+                    typed,
+                    PredicateOrigin::Filter,
+                ));
             }
         }
         Operator::LogicalProject(_) | Operator::LogicalSort(_) | Operator::LogicalLimit(_) => {
@@ -455,8 +455,11 @@ mod tests {
         let left_scan = make_scan("l", &[("a", 1)]);
         let left_filter = make_filter(&mut arena, eq(col_expr("l", "a", 1), int_lit(5)), left_scan);
         let right_scan = make_scan("r", &[("b", 2)]);
-        let right_filter =
-            make_filter(&mut arena, eq(col_expr("r", "b", 2), int_lit(5)), right_scan);
+        let right_filter = make_filter(
+            &mut arena,
+            eq(col_expr("r", "b", 2), int_lit(5)),
+            right_scan,
+        );
         let join = make_inner_join(
             &mut arena,
             eq(col_expr("l", "a", 1), col_expr("r", "b", 2)),

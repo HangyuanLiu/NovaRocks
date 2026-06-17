@@ -55,11 +55,7 @@ impl LogicalRewriteRule for PruneProjectColumns {
         matches!(&expr.op, Operator::LogicalProject(_))
     }
 
-    fn apply(
-        &self,
-        expr: OptExpr,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         let OptExpr {
             op,
             children,
@@ -135,7 +131,7 @@ mod tests {
     use crate::sql::analysis::OutputColumn;
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::{ColumnId, ColumnRefFactory};
-    use crate::sql::optimizer::operator::{Operator, ProjectOp, ScanOp, ScalarProjectItem};
+    use crate::sql::optimizer::operator::{Operator, ProjectOp, ScalarProjectItem, ScanOp};
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
     use crate::sql::optimizer::scalar::{self, ScalarArena, ScalarNode};
@@ -212,11 +208,7 @@ mod tests {
     }
 
     /// Intern a simple column-ref expression into the arena.
-    fn col_ref_item(
-        arena: &mut ScalarArena,
-        id: ColumnId,
-        name: &str,
-    ) -> ScalarProjectItem {
+    fn col_ref_item(arena: &mut ScalarArena, id: ColumnId, name: &str) -> ScalarProjectItem {
         let expr = arena.intern(ScalarNode::ColumnRef(id), DataType::Int32, false);
         ScalarProjectItem {
             expr,

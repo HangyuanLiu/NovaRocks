@@ -41,11 +41,7 @@ impl LogicalRewriteRule for PushDownApplyAggFilter {
         matches_plan(&plan)
     }
 
-    fn apply(
-        &self,
-        expr: OptExpr,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         let arena = ctx.scalar_arena();
         let plan = opt_expr_to_plan(&expr, &arena.borrow());
         match apply_plan(plan)? {
@@ -361,7 +357,10 @@ mod tests {
         ctx
     }
 
-    fn to_opt_expr(plan: LogicalPlanNode, ctx: &mut RewriteContext) -> crate::sql::optimizer::opt_expr::OptExpr {
+    fn to_opt_expr(
+        plan: LogicalPlanNode,
+        ctx: &mut RewriteContext,
+    ) -> crate::sql::optimizer::opt_expr::OptExpr {
         let arena = ctx.scalar_arena();
         logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut())
     }

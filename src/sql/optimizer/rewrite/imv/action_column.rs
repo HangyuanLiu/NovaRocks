@@ -18,10 +18,10 @@ use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::imv::action_propagation::{
     first_delta_base_fqn, is_supported_branch_union, is_supported_fan_in_delta_union,
 };
-use crate::sql::optimizer::rewrite::imv::opt_expr_to_plan;
 use crate::sql::optimizer::rewrite::imv::join_delta_shape::{
     is_supported_join_delta_branch, is_supported_join_delta_union,
 };
+use crate::sql::optimizer::rewrite::imv::opt_expr_to_plan;
 use crate::sql::optimizer::rewrite::imv::row_id_column::ImvRowIdColumn;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::{RewriteDiagnostic, RewriteResult};
@@ -94,11 +94,7 @@ impl LogicalRewriteRule for ActionColumnValidationRule {
         !self.fired.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    fn apply(
-        &self,
-        expr: OptExpr,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         self.fired.store(true, std::sync::atomic::Ordering::SeqCst);
         let plan = opt_expr_to_plan(expr, ctx);
         match validate(&plan) {

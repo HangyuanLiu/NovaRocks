@@ -52,11 +52,7 @@ impl LogicalRewriteRule for DeriveJoinNotNullPredicate {
         matches!(&expr.op, Operator::LogicalJoin(_))
     }
 
-    fn apply(
-        &self,
-        expr: OptExpr,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         let OptExpr {
             op,
             mut children,
@@ -156,10 +152,7 @@ fn wrap_not_null(child: OptExpr, preds: Vec<TypedExpr>, arena: &mut ScalarArena)
         return child;
     }
     let predicate = scalar::intern_typed(arena, &combine_and(preds));
-    OptExpr::new(
-        Operator::LogicalFilter(FilterOp { predicate }),
-        vec![child],
-    )
+    OptExpr::new(Operator::LogicalFilter(FilterOp { predicate }), vec![child])
 }
 
 /// Walk `plan`'s predicate spine (passthrough single-input nodes down to the
@@ -188,9 +181,9 @@ fn spine_not_null_inner(expr: &OptExpr, arena: &ScalarArena, ids: &mut HashSet<C
         }
         // Project may rename columns; id-based matching remains valid through
         // passthrough projections and intentionally ignores name-only matches.
-        Operator::LogicalProject(_)
-        | Operator::LogicalSort(_)
-        | Operator::LogicalLimit(_) => spine_not_null_inner(expr.unary_input(), arena, ids),
+        Operator::LogicalProject(_) | Operator::LogicalSort(_) | Operator::LogicalLimit(_) => {
+            spine_not_null_inner(expr.unary_input(), arena, ids)
+        }
         _ => {}
     }
 }
@@ -350,7 +343,11 @@ mod tests {
             .count()
     }
 
-    fn inner_eq_join_opt(arena: &mut ScalarArena, left_nullable: bool, right_nullable: bool) -> OptExpr {
+    fn inner_eq_join_opt(
+        arena: &mut ScalarArena,
+        left_nullable: bool,
+        right_nullable: bool,
+    ) -> OptExpr {
         join_opt(
             arena,
             JoinKind::Inner,
@@ -382,7 +379,10 @@ mod tests {
             let cond = if matches!(jt, JoinKind::Cross) {
                 None
             } else {
-                Some(eq_expr(col_typed("l", "a", 1, true), col_typed("r", "b", 2, true)))
+                Some(eq_expr(
+                    col_typed("l", "a", 1, true),
+                    col_typed("r", "b", 2, true),
+                ))
             };
             let plan = join_opt(
                 &mut arena,
@@ -500,7 +500,10 @@ mod tests {
                     logical_type: None,
                 }],
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::StarRocks { db_id: 0, table_id: 0 },
+                source: ScanSource::StarRocks {
+                    db_id: 0,
+                    table_id: 0,
+                },
             },
             alias: Some("l".to_string()),
             columns: vec![OutputColumn {
@@ -528,7 +531,10 @@ mod tests {
                     logical_type: None,
                 }],
                 iceberg_row_lineage_metadata_columns: vec![],
-                source: ScanSource::StarRocks { db_id: 0, table_id: 0 },
+                source: ScanSource::StarRocks {
+                    db_id: 0,
+                    table_id: 0,
+                },
             },
             alias: Some("r".to_string()),
             columns: vec![OutputColumn {

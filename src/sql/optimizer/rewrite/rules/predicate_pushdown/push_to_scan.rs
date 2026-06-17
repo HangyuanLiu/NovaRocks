@@ -12,13 +12,13 @@ use crate::sql::analysis::TypedExpr;
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
+use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
 use crate::sql::optimizer::rewrite::rules::predicate_pushdown::predicate_group::predicate_key as canonical_predicate_key;
 use crate::sql::optimizer::rewrite::rules::utils::{
     collect_column_id_refs_strict, collect_output_ids_opt, split_and, wrap_remaining_filter_opt,
 };
-use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::scalar;
 
 pub(crate) struct PushDownPredicateScan;
@@ -41,11 +41,7 @@ impl LogicalRewriteRule for PushDownPredicateScan {
                 .unwrap_or(false)
     }
 
-    fn apply(
-        &self,
-        expr: OptExpr,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         let OptExpr {
             op,
             mut children,
@@ -348,7 +344,10 @@ mod tests {
                     Operator::LogicalScan(s) => assert_eq!(s.predicates.len(), 1),
                     other => panic!("expected Scan under residual Filter, got {:?}", other),
                 },
-                other => panic!("expected Filter(Scan) for partial pushdown, got {:?}", other),
+                other => panic!(
+                    "expected Filter(Scan) for partial pushdown, got {:?}",
+                    other
+                ),
             },
             other => panic!("expected Changed, got {:?}", other),
         }
@@ -360,9 +359,7 @@ mod tests {
         let scan = scan_opt(&mut arena, &["a", "b"]);
         let filter = filter_opt(&mut arena, is_not_null(col("a")), scan);
         let mut ctx = make_ctx(arena);
-        let after_round1 = PushDownPredicateScan
-            .apply(filter, &mut ctx)
-            .unwrap();
+        let after_round1 = PushDownPredicateScan.apply(filter, &mut ctx).unwrap();
         let scan_after_round1 = match after_round1 {
             RewriteResult::Changed(out) => match out.op.clone() {
                 Operator::LogicalScan(s) => {

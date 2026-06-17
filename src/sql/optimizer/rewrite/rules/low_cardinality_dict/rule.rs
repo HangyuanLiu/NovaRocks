@@ -27,11 +27,7 @@ impl LogicalRewriteRule for LowCardinalityDictionaryRewriteRule {
         ctx.dictionary_provider().is_some() && contains_scan(expr)
     }
 
-    fn apply(
-        &self,
-        expr: OptExpr,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         // Bridge: convert OptExpr to LogicalPlanNode, run the existing
         // collector + rewriter (which still operate on LogicalPlanNode),
         // then convert the result back to OptExpr.

@@ -50,11 +50,7 @@ impl LogicalRewriteRule for PushSemiAntiRightOnlyCondition {
         ) && j.condition.is_some()
     }
 
-    fn apply(
-        &self,
-        expr: OptExpr,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         let OptExpr {
             op,
             mut children,
@@ -111,7 +107,9 @@ impl LogicalRewriteRule for PushSemiAntiRightOnlyCondition {
         let pushed_pred = combine_and(push_to_right);
         let pushed_id = scalar::intern_typed(&mut arena, &pushed_pred);
         let new_right = OptExpr::new(
-            Operator::LogicalFilter(FilterOp { predicate: pushed_id }),
+            Operator::LogicalFilter(FilterOp {
+                predicate: pushed_id,
+            }),
             vec![right],
         );
         let mut result = OptExpr::new(
@@ -148,17 +146,17 @@ fn classify_right_only_by_column_ids(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::analysis::TypedExpr;
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{ScanOp, ValuesOp};
-    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
-    use crate::sql::analysis::TypedExpr;
+    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
+    use arrow::datatypes::DataType;
     use std::cell::RefCell;
     use std::rc::Rc;
-    use arrow::datatypes::DataType;
 
     fn test_col_id(name: &str) -> ColumnId {
         match name {
@@ -344,15 +342,18 @@ mod tests {
         let right = OptExpr::new(
             Operator::LogicalProject(ProjectOp {
                 items: vec![ScalarProjectItem {
-                    expr: intern_typed(&mut arena, &TypedExpr {
-                        data_type: DataType::Int64,
-                        nullable: true,
-                        kind: ExprKind::ColumnRef {
-                            column_id: ColumnId::new_for_test(22),
-                            qualifier: None,
-                            column: "right_source".to_string(),
+                    expr: intern_typed(
+                        &mut arena,
+                        &TypedExpr {
+                            data_type: DataType::Int64,
+                            nullable: true,
+                            kind: ExprKind::ColumnRef {
+                                column_id: ColumnId::new_for_test(22),
+                                qualifier: None,
+                                column: "right_source".to_string(),
+                            },
                         },
-                    }),
+                    ),
                     output_name: "k".to_string(),
                     output_column_id: ColumnId::new_for_test(202),
                     expr_display: None,
@@ -361,13 +362,23 @@ mod tests {
             }),
             vec![right_source],
         );
-        let join_pred = eq_typed(col_with_id_typed("l", "k", 101), col_with_id_typed("r", "k", 202));
+        let join_pred = eq_typed(
+            col_with_id_typed("l", "k", 101),
+            col_with_id_typed("r", "k", 202),
+        );
         let right_pred = gt_typed(col_with_id_typed("r", "k", 202), int_lit_typed(10));
-        let join = semi_join(&mut arena, left, right, Some(and_typed(join_pred, right_pred)));
+        let join = semi_join(
+            &mut arena,
+            left,
+            right,
+            Some(and_typed(join_pred, right_pred)),
+        );
 
         let rule = PushSemiAntiRightOnlyCondition;
         let mut ctx = make_ctx(arena);
-        let result = rule.apply(join, &mut ctx).expect("right-only derived output predicate should push");
+        let result = rule
+            .apply(join, &mut ctx)
+            .expect("right-only derived output predicate should push");
         let RewriteResult::Changed(out) = result else {
             panic!("expected Changed");
         };
@@ -377,7 +388,10 @@ mod tests {
         };
         assert_eq!(j.join_type, JoinKind::LeftSemi);
         // The equi-join condition should remain.
-        assert!(j.condition.is_some(), "join condition should remain with the equi-join predicate");
+        assert!(
+            j.condition.is_some(),
+            "join condition should remain with the equi-join predicate"
+        );
         // Right child should be a Filter.
         assert!(
             matches!(&out.right().op, Operator::LogicalFilter(_)),
@@ -390,9 +404,17 @@ mod tests {
         let mut arena = ScalarArena::new();
         let left = values_with_output("k", 101);
         let right = values_with_output("k", 202);
-        let join_pred = eq_typed(col_with_id_typed("l", "k", 101), col_with_id_typed("r", "k", 202));
+        let join_pred = eq_typed(
+            col_with_id_typed("l", "k", 101),
+            col_with_id_typed("r", "k", 202),
+        );
         let same_name_wrong_id = gt_typed(col_with_id_typed("r", "k", 999), int_lit_typed(10));
-        let join = semi_join(&mut arena, left, right, Some(and_typed(join_pred, same_name_wrong_id)));
+        let join = semi_join(
+            &mut arena,
+            left,
+            right,
+            Some(and_typed(join_pred, same_name_wrong_id)),
+        );
 
         let rule = PushSemiAntiRightOnlyCondition;
         let mut ctx = make_ctx(arena);
@@ -409,7 +431,11 @@ mod tests {
     #[test]
     fn pushes_right_only_conjunct_into_right_child_for_left_semi() {
         let mut arena = ScalarArena::new();
-        let store_sales = make_scan(&mut arena, "store_sales", &["ss_sold_date_sk", "ss_item_sk"]);
+        let store_sales = make_scan(
+            &mut arena,
+            "store_sales",
+            &["ss_sold_date_sk", "ss_item_sk"],
+        );
         let date_dim = make_scan(&mut arena, "date_dim", &["d_date_sk", "d_year"]);
 
         // corr = ss_item_sk = 100  (left-only)
@@ -425,7 +451,10 @@ mod tests {
 
         let rule = PushSemiAntiRightOnlyCondition;
         let mut ctx = make_ctx(arena);
-        assert!(rule.matches(&join, &ctx), "should match LEFT SEMI with condition");
+        assert!(
+            rule.matches(&join, &ctx),
+            "should match LEFT SEMI with condition"
+        );
         let result = rule.apply(join, &mut ctx).expect("should rewrite");
         let RewriteResult::Changed(out) = result else {
             panic!("expected Changed");
@@ -461,7 +490,11 @@ mod tests {
     #[test]
     fn returns_unchanged_when_no_right_only_conjunct() {
         let mut arena = ScalarArena::new();
-        let store_sales = make_scan(&mut arena, "store_sales", &["ss_sold_date_sk", "ss_item_sk"]);
+        let store_sales = make_scan(
+            &mut arena,
+            "store_sales",
+            &["ss_sold_date_sk", "ss_item_sk"],
+        );
         let date_dim = make_scan(&mut arena, "date_dim", &["d_date_sk", "d_year"]);
 
         // cross-side equi-join: not right-only

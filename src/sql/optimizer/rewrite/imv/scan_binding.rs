@@ -11,7 +11,9 @@ use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
 use crate::sql::optimizer::rewrite::imv::annotation::ImvExtension;
-use crate::sql::optimizer::rewrite::imv::{bridge_apply_result, opt_expr_to_plan, PlanRewriteResult};
+use crate::sql::optimizer::rewrite::imv::{
+    PlanRewriteResult, bridge_apply_result, opt_expr_to_plan,
+};
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
@@ -54,15 +56,11 @@ impl LogicalRewriteRule for BindIcebergScanRule {
         ) && matches!(&plan.unary_input().kind, LogicalPlanNodeKind::Scan(_))
     }
 
-    fn apply(
-        &self,
-        expr: OptExpr,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         bridge_apply_result(expr, ctx, |plan, ctx| {
-            let ext = ctx
-                .extension::<ImvExtension>()
-                .ok_or_else(|| "BindIcebergScan requires ImvExtension in RewriteContext".to_string())?;
+            let ext = ctx.extension::<ImvExtension>().ok_or_else(|| {
+                "BindIcebergScan requires ImvExtension in RewriteContext".to_string()
+            })?;
             let LogicalPlanNode {
                 kind,
                 mut children,
@@ -367,7 +365,10 @@ mod tests {
             panic!("expected changed scan");
         };
         let arena_ref = ctx.scalar_arena();
-        let changed = crate::sql::optimizer::convert::opt_expr_to_logical_plan(changed_expr.clone(), &arena_ref.borrow());
+        let changed = crate::sql::optimizer::convert::opt_expr_to_logical_plan(
+            changed_expr.clone(),
+            &arena_ref.borrow(),
+        );
         let LogicalPlanNodeKind::Scan(bound) = &changed.kind else {
             panic!("expected changed scan");
         };
@@ -425,7 +426,10 @@ mod tests {
             panic!("expected changed scan");
         };
         let arena_ref = ctx.scalar_arena();
-        let changed = crate::sql::optimizer::convert::opt_expr_to_logical_plan(changed_expr, &arena_ref.borrow());
+        let changed = crate::sql::optimizer::convert::opt_expr_to_logical_plan(
+            changed_expr,
+            &arena_ref.borrow(),
+        );
         let LogicalPlanNodeKind::Scan(bound) = &changed.kind else {
             panic!("expected changed scan");
         };

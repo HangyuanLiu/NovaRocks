@@ -4,26 +4,26 @@
 use super::memo::{GroupId, MExpr, Memo};
 use super::operator::{
     AggregateStateMergeOp, ApplyOp, AssertOneRowOp, CTEAnchorOp, CTEConsumeOp, CTEProduceOp,
-    DecodeOp, ExceptOp, FilterOp, GenerateSeriesOp, ImvDeltaOp, ImvVersionOp, IntersectOp,
-    LimitOp, LogicalAggregateOp, LogicalJoinOp, Operator, ProjectOp, RepeatOp, ScanOp, SortOp,
+    DecodeOp, ExceptOp, FilterOp, GenerateSeriesOp, ImvDeltaOp, ImvVersionOp, IntersectOp, LimitOp,
+    LogicalAggregateOp, LogicalJoinOp, Operator, ProjectOp, RepeatOp, ScanOp, SortOp,
     TableFunctionOp, UnionOp, ValuesOp, WindowOp,
 };
 use super::opt_expr::OptExpr;
+use crate::sql::analysis::SortItem;
 use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
 use crate::sql::optimizer::scalar_bridge::{
     intern_aggregate_calls, intern_exprs, intern_project_items, intern_sort_items,
     intern_window_exprs, materialize_aggregate_calls, materialize_exprs, materialize_project_items,
     materialize_sort_keys, materialize_window_exprs,
 };
-use crate::sql::analysis::SortItem;
 use crate::sql::planner::plan::{
     LogicalAggregateNode, LogicalAggregateStateMergeNode, LogicalApplyNode,
     LogicalAssertOneRowNode, LogicalCTEAnchorNode, LogicalCTEConsumeNode, LogicalCTEProduceNode,
     LogicalDecodeNode, LogicalExceptNode, LogicalFilterNode, LogicalGenerateSeriesNode,
     LogicalImvDeltaNode, LogicalImvVersionNode, LogicalIntersectNode, LogicalJoinNode,
     LogicalLimitNode, LogicalPlanNode, LogicalPlanNodeKind, LogicalProjectNode, LogicalRepeatNode,
-    LogicalScanNode, LogicalSortNode, LogicalTableFunctionNode, LogicalUnionNode, LogicalValuesNode,
-    LogicalWindowNode,
+    LogicalScanNode, LogicalSortNode, LogicalTableFunctionNode, LogicalUnionNode,
+    LogicalValuesNode, LogicalWindowNode,
 };
 
 /// Copy an `OptExpr` tree into the Memo as Groups (one Group per node).
@@ -394,17 +394,13 @@ pub(crate) fn opt_expr_to_logical_plan(expr: OptExpr, arena: &ScalarArena) -> Lo
             dict_columns: op.dict_columns,
             variant_columns: op.variant_columns,
         }),
-        Operator::LogicalFilter(op) => {
-            LogicalPlanNodeKind::Filter(LogicalFilterNode {
-                predicate: crate::sql::optimizer::scalar::materialize(arena, op.predicate),
-            })
-        }
-        Operator::LogicalProject(op) => {
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
-                items: materialize_project_items(arena, &op.items),
-                output_qualifier: op.output_qualifier,
-            })
-        }
+        Operator::LogicalFilter(op) => LogicalPlanNodeKind::Filter(LogicalFilterNode {
+            predicate: crate::sql::optimizer::scalar::materialize(arena, op.predicate),
+        }),
+        Operator::LogicalProject(op) => LogicalPlanNodeKind::Project(LogicalProjectNode {
+            items: materialize_project_items(arena, &op.items),
+            output_qualifier: op.output_qualifier,
+        }),
         Operator::LogicalAggregate(op) => {
             let group_by = materialize_exprs(arena, &op.group_by);
             let aggregates = materialize_aggregate_calls(
@@ -422,9 +418,9 @@ pub(crate) fn opt_expr_to_logical_plan(expr: OptExpr, arena: &ScalarArena) -> Lo
         }
         Operator::LogicalJoin(op) => LogicalPlanNodeKind::Join(LogicalJoinNode {
             join_type: op.join_type,
-            condition: op.condition.map(|id| {
-                crate::sql::optimizer::scalar::materialize(arena, id)
-            }),
+            condition: op
+                .condition
+                .map(|id| crate::sql::optimizer::scalar::materialize(arena, id)),
         }),
         Operator::LogicalSort(op) => {
             let items: Vec<SortItem> = materialize_sort_keys(arena, &op.items);
@@ -459,33 +455,25 @@ pub(crate) fn opt_expr_to_logical_plan(expr: OptExpr, arena: &ScalarArena) -> Lo
                 output_columns: op.output_columns,
             })
         }
-        Operator::LogicalImvDelta(op) => {
-            LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
-                is_root: op.is_root,
-                action_column: op.action_column,
-                branch_scope: op.branch_scope,
-            })
-        }
-        Operator::LogicalImvVersion(op) => {
-            LogicalPlanNodeKind::ImvVersion(LogicalImvVersionNode {
-                version_ref: op.version_ref,
-            })
-        }
+        Operator::LogicalImvDelta(op) => LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+            is_root: op.is_root,
+            action_column: op.action_column,
+            branch_scope: op.branch_scope,
+        }),
+        Operator::LogicalImvVersion(op) => LogicalPlanNodeKind::ImvVersion(LogicalImvVersionNode {
+            version_ref: op.version_ref,
+        }),
         Operator::LogicalAssertOneRow(op) => {
             LogicalPlanNodeKind::AssertOneRow(LogicalAssertOneRowNode {
                 subquery_text: op.subquery_text,
             })
         }
-        Operator::LogicalIntersect(op) => {
-            LogicalPlanNodeKind::Intersect(LogicalIntersectNode {
-                output_columns: op.output_columns,
-            })
-        }
-        Operator::LogicalExcept(op) => {
-            LogicalPlanNodeKind::Except(LogicalExceptNode {
-                output_columns: op.output_columns,
-            })
-        }
+        Operator::LogicalIntersect(op) => LogicalPlanNodeKind::Intersect(LogicalIntersectNode {
+            output_columns: op.output_columns,
+        }),
+        Operator::LogicalExcept(op) => LogicalPlanNodeKind::Except(LogicalExceptNode {
+            output_columns: op.output_columns,
+        }),
         Operator::LogicalGenerateSeries(op) => {
             LogicalPlanNodeKind::GenerateSeries(LogicalGenerateSeriesNode {
                 start: op.start,
@@ -506,47 +494,40 @@ pub(crate) fn opt_expr_to_logical_plan(expr: OptExpr, arena: &ScalarArena) -> Lo
             })
         }
         Operator::LogicalWindow(op) => {
-            let window_exprs = materialize_window_exprs(arena, &op.window_exprs, &op.output_columns);
+            let window_exprs =
+                materialize_window_exprs(arena, &op.window_exprs, &op.output_columns);
             LogicalPlanNodeKind::Window(LogicalWindowNode {
                 window_exprs,
                 output_columns: op.output_columns,
             })
         }
-        Operator::LogicalRepeat(op) => {
-            LogicalPlanNodeKind::Repeat(LogicalRepeatNode {
-                repeat_column_ref_list: op.repeat_column_ref_list,
-                repeat_column_ref_ids: op.repeat_column_ref_ids,
-                grouping_ids: op.grouping_ids,
-                all_rollup_columns: op.all_rollup_columns,
-                all_rollup_column_ids: op.all_rollup_column_ids,
-                grouping_key_aliases: op.grouping_key_aliases,
-                grouping_fn_args: op.grouping_fn_args,
-                grouping_fn_arg_ids: op.grouping_fn_arg_ids,
-                grouping_fn_ids: op.grouping_fn_ids,
-            })
-        }
+        Operator::LogicalRepeat(op) => LogicalPlanNodeKind::Repeat(LogicalRepeatNode {
+            repeat_column_ref_list: op.repeat_column_ref_list,
+            repeat_column_ref_ids: op.repeat_column_ref_ids,
+            grouping_ids: op.grouping_ids,
+            all_rollup_columns: op.all_rollup_columns,
+            all_rollup_column_ids: op.all_rollup_column_ids,
+            grouping_key_aliases: op.grouping_key_aliases,
+            grouping_fn_args: op.grouping_fn_args,
+            grouping_fn_arg_ids: op.grouping_fn_arg_ids,
+            grouping_fn_ids: op.grouping_fn_ids,
+        }),
         Operator::LogicalCTEAnchor(op) => {
             LogicalPlanNodeKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: op.cte_id })
         }
-        Operator::LogicalCTEProduce(op) => {
-            LogicalPlanNodeKind::CTEProduce(LogicalCTEProduceNode {
-                cte_id: op.cte_id,
-                output_columns: op.output_columns,
-            })
-        }
-        Operator::LogicalCTEConsume(op) => {
-            LogicalPlanNodeKind::CTEConsume(LogicalCTEConsumeNode {
-                cte_id: op.cte_id,
-                alias: op.alias,
-                output_columns: op.output_columns,
-            })
-        }
-        Operator::LogicalDecode(op) => {
-            LogicalPlanNodeKind::Decode(LogicalDecodeNode {
-                mappings: op.mappings,
-                output_columns: op.output_columns,
-            })
-        }
+        Operator::LogicalCTEProduce(op) => LogicalPlanNodeKind::CTEProduce(LogicalCTEProduceNode {
+            cte_id: op.cte_id,
+            output_columns: op.output_columns,
+        }),
+        Operator::LogicalCTEConsume(op) => LogicalPlanNodeKind::CTEConsume(LogicalCTEConsumeNode {
+            cte_id: op.cte_id,
+            alias: op.alias,
+            output_columns: op.output_columns,
+        }),
+        Operator::LogicalDecode(op) => LogicalPlanNodeKind::Decode(LogicalDecodeNode {
+            mappings: op.mappings,
+            output_columns: op.output_columns,
+        }),
         Operator::LogicalApply(op) => {
             // Apply is expected to be eliminated by the SubqueryRewrite stage
             // before opt_expr_to_logical_plan is called. If it survives, we
@@ -559,9 +540,9 @@ pub(crate) fn opt_expr_to_logical_plan(expr: OptExpr, arena: &ScalarArena) -> Lo
                 inner_output_column_id: op.inner_output_column_id,
                 correlation_column_ids: op.correlation_column_ids,
                 correlation_conjuncts: materialize_exprs(arena, &op.correlation_conjuncts),
-                residual_predicate: op.residual_predicate.map(|id| {
-                    crate::sql::optimizer::scalar::materialize(arena, id)
-                }),
+                residual_predicate: op
+                    .residual_predicate
+                    .map(|id| crate::sql::optimizer::scalar::materialize(arena, id)),
                 need_check_max_rows: op.need_check_max_rows,
                 use_semi_anti: op.use_semi_anti,
                 uncorrelated_outer_predicate_columns: op.uncorrelated_outer_predicate_columns,

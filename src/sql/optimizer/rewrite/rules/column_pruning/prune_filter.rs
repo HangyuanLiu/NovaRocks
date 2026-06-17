@@ -31,11 +31,7 @@ impl LogicalRewriteRule for PruneFilterColumns {
         matches!(&expr.op, Operator::LogicalFilter(_))
     }
 
-    fn apply(
-        &self,
-        _expr: OptExpr,
-        _ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, _expr: OptExpr, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         // No-op: Filter has no own output metadata to prune; column needs were
         // propagated to its child by the Phase-1 tagging pass. Kept for
         // architectural symmetry + per-operator disable_optimizer_rules control.
@@ -46,13 +42,13 @@ impl LogicalRewriteRule for PruneFilterColumns {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::analysis::LiteralValue;
     use crate::sql::optimizer::operator::{FilterOp, Operator, ValuesOp};
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
+    use crate::sql::optimizer::scalar::HashableLiteral;
     use crate::sql::optimizer::scalar::{ScalarArena, ScalarNode};
     use arrow::datatypes::DataType;
-    use crate::sql::optimizer::scalar::HashableLiteral;
-    use crate::sql::analysis::LiteralValue;
 
     fn ctx() -> RewriteContext {
         RewriteContext::new(RewriteConsumer::Query)

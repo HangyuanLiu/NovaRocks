@@ -102,6 +102,7 @@ mod tests {
         ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
     use crate::sql::optimizer::rewrite::imv::annotation::ImvPartitionAnnotation;
@@ -110,6 +111,7 @@ mod tests {
     use crate::sql::optimizer::rewrite::registry::query_rewrite_pipeline;
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
+    use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::*;
     use crate::sql::planner::plan::{
         AggregateCall, LogicalAggregateNode, LogicalAggregateStateMergeNode, LogicalFilterNode,
@@ -118,8 +120,6 @@ mod tests {
     };
     use arrow::datatypes::DataType;
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
-    use crate::sql::optimizer::opt_expr::OptExpr;
-    use crate::sql::optimizer::scalar::ScalarArena;
 
     /// Set up a fresh ScalarArena on `ctx`, convert `plan` to `OptExpr`, and
     /// return the `OptExpr`. Use this when calling `pipeline.rewrite()` directly
@@ -763,7 +763,11 @@ mod tests {
             RewriteTraversal::TopDown
         }
 
-        fn matches(&self, _expr: &crate::sql::optimizer::opt_expr::OptExpr, ctx: &RewriteContext) -> bool {
+        fn matches(
+            &self,
+            _expr: &crate::sql::optimizer::opt_expr::OptExpr,
+            ctx: &RewriteContext,
+        ) -> bool {
             let ext = ctx
                 .extension::<ImvExtension>()
                 .expect("ImvExtension installed");
@@ -850,7 +854,11 @@ mod tests {
             RewritePhase::LogicalNormalize
         }
 
-        fn matches(&self, _expr: &crate::sql::optimizer::opt_expr::OptExpr, _ctx: &RewriteContext) -> bool {
+        fn matches(
+            &self,
+            _expr: &crate::sql::optimizer::opt_expr::OptExpr,
+            _ctx: &RewriteContext,
+        ) -> bool {
             self.matches_called
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             false
@@ -928,7 +936,11 @@ mod tests {
             RewritePhase::LogicalNormalize
         }
 
-        fn matches(&self, _expr: &crate::sql::optimizer::opt_expr::OptExpr, _ctx: &RewriteContext) -> bool {
+        fn matches(
+            &self,
+            _expr: &crate::sql::optimizer::opt_expr::OptExpr,
+            _ctx: &RewriteContext,
+        ) -> bool {
             true
         }
 

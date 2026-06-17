@@ -21,11 +21,11 @@ use crate::sql::optimizer::estimate::cardinality::{
     JoinCardInput, estimate_join_cardinality, except_rows, intersect_rows, union_all_rows,
     union_distinct_rows,
 };
+use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, materialize};
 use crate::sql::optimizer::scalar_bridge::{
     materialize_exprs, materialize_project_items, materialize_window_exprs,
 };
-use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::statistics::*;
 use crate::sql::planner::plan::LogicalPlanNode;
 
@@ -681,10 +681,14 @@ pub(crate) fn derive_statistics(
         // Apply and IMV markers are eliminated by the rewrite stage before
         // statistics derivation. Reaching here indicates a planner bug.
         Operator::LogicalApply(_) => {
-            unreachable!("Apply operator must be eliminated by SubqueryRewrite before statistics derivation")
+            unreachable!(
+                "Apply operator must be eliminated by SubqueryRewrite before statistics derivation"
+            )
         }
         Operator::LogicalImvDelta(_) | Operator::LogicalImvVersion(_) => {
-            unreachable!("IMV marker operators must be eliminated by the IMV rewrite stage before statistics derivation")
+            unreachable!(
+                "IMV marker operators must be eliminated by the IMV rewrite stage before statistics derivation"
+            )
         }
     }
 }
@@ -1867,10 +1871,14 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
 
         // Apply and IMV markers are eliminated before statistics derivation.
         Operator::LogicalApply(_) => {
-            unreachable!("Apply operator must be eliminated by SubqueryRewrite before output-column derivation")
+            unreachable!(
+                "Apply operator must be eliminated by SubqueryRewrite before output-column derivation"
+            )
         }
         Operator::LogicalImvDelta(_) | Operator::LogicalImvVersion(_) => {
-            unreachable!("IMV marker operators must be eliminated by the IMV rewrite stage before output-column derivation")
+            unreachable!(
+                "IMV marker operators must be eliminated by the IMV rewrite stage before output-column derivation"
+            )
         }
     }
 }
