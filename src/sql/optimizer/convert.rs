@@ -43,7 +43,7 @@ pub(crate) fn logical_plan_to_opt_expr(
     plan: &LogicalPlanNode,
     scalars: &mut ScalarArena,
 ) -> OptExpr {
-    match &plan.kind {
+    let mut expr = match &plan.kind {
         LogicalPlanNodeKind::Scan(node) => {
             for column in &node.columns {
                 scalars.remember_source_column_display(
@@ -315,7 +315,9 @@ pub(crate) fn logical_plan_to_opt_expr(
         LogicalPlanNodeKind::ImvDelta(_) | LogicalPlanNodeKind::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
         }
-    }
+    };
+    expr.required_output_columns = plan.required_output_columns.clone();
+    expr
 }
 
 /// Convert a `LogicalPlanNode` tree into Memo groups (Bridge 1 + copy-in).
