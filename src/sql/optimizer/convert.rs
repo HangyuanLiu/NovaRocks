@@ -1,4 +1,5 @@
-//! Converts a `LogicalPlanNode` tree into Memo groups.
+//! Conversion between `LogicalPlanNode`, `OptExpr`, and Memo groups
+//! (Bridge 1 + copy-in).
 
 use super::memo::{GroupId, MExpr, Memo};
 use super::operator::{
@@ -7,8 +8,7 @@ use super::operator::{
     Operator, ProjectOp, RepeatOp, ScanOp, SortOp, TableFunctionOp, UnionOp, ValuesOp, WindowOp,
 };
 use super::opt_expr::OptExpr;
-use crate::sql::optimizer::scalar::ScalarArena;
-use crate::sql::optimizer::scalar::intern_typed;
+use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
 use crate::sql::optimizer::scalar_bridge::{
     intern_aggregate_calls, intern_exprs, intern_project_items, intern_sort_items,
     intern_window_exprs,
@@ -19,8 +19,11 @@ use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind};
 /// The operator already holds interned `ScalarId`s, so no scalar interning
 /// happens here — this is the trivial StarRocks-style `copyIn`.
 pub(crate) fn opt_expr_to_memo(expr: &OptExpr, memo: &mut Memo) -> GroupId {
-    let children: Vec<GroupId> =
-        expr.children.iter().map(|c| opt_expr_to_memo(c, memo)).collect();
+    let children: Vec<GroupId> = expr
+        .children
+        .iter()
+        .map(|c| opt_expr_to_memo(c, memo))
+        .collect();
     let mexpr = MExpr {
         id: memo.next_expr_id(),
         op: expr.op.clone(),

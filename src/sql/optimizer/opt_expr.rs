@@ -20,6 +20,9 @@ impl OptExpr {
     }
 
     pub(crate) fn leaf(op: Operator) -> Self {
-        Self { op, children: Vec::new() }
+        Self {
+            op,
+            children: Vec::new(),
+        }
     }
 }

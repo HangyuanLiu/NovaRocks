@@ -3,7 +3,6 @@
 pub(crate) mod cascades_rules;
 pub(crate) mod convert;
 pub(crate) mod cost;
-pub(crate) mod opt_expr;
 pub(crate) mod cte_rewrite;
 pub(crate) mod derive;
 pub(crate) mod estimate;
@@ -11,6 +10,7 @@ pub(crate) mod extract;
 pub(crate) mod logical_props;
 pub(crate) mod memo;
 pub(crate) mod operator;
+pub(crate) mod opt_expr;
 pub(crate) mod options;
 pub(crate) mod physical_plan;
 pub(crate) mod property;
