@@ -3,6 +3,7 @@
 pub(crate) mod cascades_rules;
 pub(crate) mod convert;
 pub(crate) mod cost;
+pub(crate) mod opt_expr;
 pub(crate) mod cte_rewrite;
 pub(crate) mod derive;
 pub(crate) mod estimate;
