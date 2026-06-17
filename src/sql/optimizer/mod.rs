@@ -10,6 +10,7 @@ pub(crate) mod extract;
 pub(crate) mod logical_props;
 pub(crate) mod memo;
 pub(crate) mod operator;
+pub(crate) mod opt_expr;
 pub(crate) mod options;
 pub(crate) mod physical_plan;
 pub(crate) mod property;
