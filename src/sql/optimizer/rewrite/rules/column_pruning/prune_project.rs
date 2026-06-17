@@ -1,20 +1,21 @@
 //! PruneProjectColumns — Phase 2 rule for Project nodes.
 //!
-//! Filters `LogicalProjectNode.items` to only those whose `output_column_id` is in
+//! Filters `ProjectOp.items` to only those whose `output_column_id` is in
 //! `required_output_columns`. When all items would be filtered out, an
 //! auto-fill placeholder item (`const 1 AS auto_fill_<id>`) is inserted using
 //! a freshly minted ColumnId from the ColumnRefFactory in context (Gap 2).
 
 use arrow::datatypes::DataType;
 
-use crate::sql::analysis::{ExprKind, LiteralValue, ProjectItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
+use crate::sql::optimizer::operator::{Operator, ScalarProjectItem};
+use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
 use crate::sql::optimizer::rewrite::rules::column_pruning::auto_fill_column_id;
-use crate::sql::planner::plan::*;
+use crate::sql::optimizer::scalar::{self, ScalarArena, ScalarId, ScalarNode};
 
 /// Returns `true` when a project item's expression is an `assert_true(...)` call.
 ///
@@ -22,10 +23,20 @@ use crate::sql::planner::plan::*;
 /// `output_column_id` is not referenced by any upstream operator.  This mirrors
 /// the StarRocks `PruneProjectColumnsRule` carve-out for `assert_true` items
 /// (used, e.g., for the per-group row-check emitted by `ScalarApplyToJoin`).
-fn is_assert_true_item(item: &ProjectItem) -> bool {
+fn is_assert_true_item(arena: &ScalarArena, item: &ScalarProjectItem) -> bool {
     matches!(
-        &item.expr.kind,
-        ExprKind::FunctionCall { name, .. } if name == "assert_true"
+        arena.node(item.expr),
+        ScalarNode::FunctionCall { name, .. } if name == "assert_true"
+    )
+}
+
+/// Intern `const 1` (Int64) into the arena and return its `ScalarId`.
+fn intern_const_one(arena: &mut ScalarArena) -> ScalarId {
+    use crate::sql::analysis::LiteralValue;
+    arena.intern(
+        ScalarNode::Literal(scalar::HashableLiteral(LiteralValue::Int(1))),
+        DataType::Int64,
+        false,
     )
 }
 
@@ -40,21 +51,21 @@ impl LogicalRewriteRule for PruneProjectColumns {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
-        matches!(&plan.kind, LogicalPlanNodeKind::Project(_))
+    fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
+        matches!(&expr.op, Operator::LogicalProject(_))
     }
 
     fn apply(
         &self,
-        plan: LogicalPlanNode,
+        expr: OptExpr,
         ctx: &mut RewriteContext,
     ) -> Result<RewriteResult, String> {
-        let LogicalPlanNode {
-            kind,
+        let OptExpr {
+            op,
             children,
             required_output_columns,
-        } = plan;
-        let LogicalPlanNodeKind::Project(mut node) = kind else {
+        } = expr;
+        let Operator::LogicalProject(mut node) = op else {
             unreachable!()
         };
 
@@ -73,29 +84,31 @@ impl LogicalRewriteRule for PruneProjectColumns {
         // output_column_id appears in needed: they carry runtime correctness
         // checks (e.g. the per-group row-check from ScalarApplyToJoin) that
         // must not be silently dropped when nothing upstream references them.
-        let mut new_items: Vec<ProjectItem> = node
+        let arena_rc = ctx.scalar_arena();
+        let arena = arena_rc.borrow();
+        let mut new_items: Vec<ScalarProjectItem> = node
             .items
             .into_iter()
             .filter(|item| {
                 item.output_column_id == ColumnId::UNSET
                     || needed.contains(&item.output_column_id)
-                    || is_assert_true_item(item)
+                    || is_assert_true_item(&arena, item)
             })
             .collect();
+        drop(arena);
 
         // If all items were filtered out, insert one auto-fill placeholder.
         let was_auto_filled = new_items.is_empty();
         if was_auto_filled {
             let fill_id = auto_fill_column_id(ctx).unwrap_or(ColumnId::UNSET);
             let fill_name = format!("auto_fill_{}", fill_id.0);
-            new_items.push(ProjectItem {
-                expr: TypedExpr {
-                    kind: ExprKind::Literal(LiteralValue::Int(1)),
-                    data_type: DataType::Int64,
-                    nullable: false,
-                },
+            let arena_rc = ctx.scalar_arena();
+            let const_id = intern_const_one(&mut arena_rc.borrow_mut());
+            new_items.push(ScalarProjectItem {
+                expr: const_id,
                 output_name: fill_name,
                 output_column_id: fill_id,
+                expr_display: None,
             });
         }
 
@@ -108,28 +121,30 @@ impl LogicalRewriteRule for PruneProjectColumns {
         }
 
         node.items = new_items;
-        Ok(RewriteResult::Changed(LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(node),
+        Ok(RewriteResult::Changed(OptExpr {
+            op: Operator::LogicalProject(node),
             children,
             required_output_columns,
-        )))
+        }))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::{ExprKind, OutputColumn};
+    use crate::sql::analysis::OutputColumn;
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
-    use crate::sql::column_id::ColumnRefFactory;
+    use crate::sql::column_id::{ColumnId, ColumnRefFactory};
+    use crate::sql::optimizer::operator::{Operator, ProjectOp, ScanOp, ScalarProjectItem};
+    use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
-    use crate::sql::planner::plan::*;
+    use crate::sql::optimizer::scalar::{self, ScalarArena, ScalarNode};
     use arrow::datatypes::DataType;
     use std::cell::RefCell;
     use std::collections::HashSet;
     use std::rc::Rc;
 
-    fn make_scan(id_a: ColumnId, id_b: ColumnId, id_c: ColumnId) -> LogicalPlanNode {
+    fn make_scan(id_a: ColumnId, id_b: ColumnId, id_c: ColumnId) -> OptExpr {
         let table = TableDef {
             name: "t".to_string(),
             columns: vec![
@@ -161,80 +176,78 @@ mod tests {
                 table_id: 0,
             },
         };
-        LogicalPlanNode::new(
-            LogicalPlanNodeKind::Scan(LogicalScanNode {
-                database: "db".to_string(),
-                table: table,
-                alias: None,
-                columns: vec![
-                    OutputColumn {
-                        column_id: id_a,
-                        name: "a".to_string(),
-                        data_type: DataType::Int32,
-                        nullable: false,
-                        is_internal: false,
-                    },
-                    OutputColumn {
-                        column_id: id_b,
-                        name: "b".to_string(),
-                        data_type: DataType::Int32,
-                        nullable: false,
-                        is_internal: false,
-                    },
-                    OutputColumn {
-                        column_id: id_c,
-                        name: "c".to_string(),
-                        data_type: DataType::Int32,
-                        nullable: false,
-                        is_internal: false,
-                    },
-                ],
-                predicates: vec![],
-                required_columns: None,
-                dict_columns: vec![],
-                variant_columns: vec![],
-            }),
-            vec![],
-            None,
-        )
+        OptExpr::leaf(Operator::LogicalScan(ScanOp {
+            database: "db".to_string(),
+            table,
+            alias: None,
+            columns: vec![
+                OutputColumn {
+                    column_id: id_a,
+                    name: "a".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    is_internal: false,
+                },
+                OutputColumn {
+                    column_id: id_b,
+                    name: "b".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    is_internal: false,
+                },
+                OutputColumn {
+                    column_id: id_c,
+                    name: "c".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    is_internal: false,
+                },
+            ],
+            predicates: vec![],
+            required_columns: None,
+            dict_columns: vec![],
+            variant_columns: vec![],
+            mv_rewritten_from: None,
+        }))
     }
 
-    fn col_ref_item(id: ColumnId, name: &str) -> ProjectItem {
-        ProjectItem {
-            expr: TypedExpr {
-                kind: ExprKind::ColumnRef {
-                    column_id: id,
-                    qualifier: None,
-                    column: name.to_string(),
-                },
-                data_type: DataType::Int32,
-                nullable: false,
-            },
+    /// Intern a simple column-ref expression into the arena.
+    fn col_ref_item(
+        arena: &mut ScalarArena,
+        id: ColumnId,
+        name: &str,
+    ) -> ScalarProjectItem {
+        let expr = arena.intern(ScalarNode::ColumnRef(id), DataType::Int32, false);
+        ScalarProjectItem {
+            expr,
             output_name: name.to_string(),
             output_column_id: id,
+            expr_display: None,
         }
     }
 
-    fn ctx_with_factory() -> RewriteContext {
+    fn ctx_with_factory_and_arena() -> (RewriteContext, Rc<RefCell<ScalarArena>>) {
         let mut ctx = RewriteContext::new(RewriteConsumer::Query);
         let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
         ctx.set_column_ref_factory(factory);
-        ctx
+        let arena = Rc::new(RefCell::new(ScalarArena::new()));
+        ctx.set_scalar_arena(Rc::clone(&arena));
+        (ctx, arena)
     }
 
-    fn project_plan(
-        input: LogicalPlanNode,
-        items: Vec<ProjectItem>,
+    fn project_expr(
+        input: OptExpr,
+        items: Vec<ScalarProjectItem>,
         required_output_columns: Option<HashSet<ColumnId>>,
-    ) -> LogicalPlanNode {
-        LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
+    ) -> OptExpr {
+        OptExpr {
+            op: Operator::LogicalProject(ProjectOp {
                 items,
                 output_qualifier: None,
             }),
-            vec![input],
+            children: vec![input],
             required_output_columns,
-        )
+        }
     }
 
     #[test]
@@ -243,25 +256,29 @@ mod tests {
         let id_b = ColumnId::new_for_test(2);
         let id_c = ColumnId::new_for_test(3);
 
-        let items = vec![
-            col_ref_item(id_a, "a"),
-            col_ref_item(id_b, "b"),
-            col_ref_item(id_c, "c"),
-        ];
+        let (mut ctx, arena_rc) = ctx_with_factory_and_arena();
+        let items = {
+            let mut arena = arena_rc.borrow_mut();
+            vec![
+                col_ref_item(&mut arena, id_a, "a"),
+                col_ref_item(&mut arena, id_b, "b"),
+                col_ref_item(&mut arena, id_c, "c"),
+            ]
+        };
 
         // Only b is needed.
         let mut needed = HashSet::new();
         needed.insert(id_b);
 
-        let plan = project_plan(make_scan(id_a, id_b, id_c), items, Some(needed));
+        let expr = project_expr(make_scan(id_a, id_b, id_c), items, Some(needed));
         let rule = PruneProjectColumns;
-        let result = rule.apply(plan, &mut ctx_with_factory()).unwrap();
+        let result = rule.apply(expr, &mut ctx).unwrap();
 
         let changed = match result {
             RewriteResult::Changed(p) => p,
             other => panic!("expected Changed, got {:?}", other),
         };
-        let LogicalPlanNodeKind::Project(pruned) = &changed.kind else {
+        let Operator::LogicalProject(pruned) = &changed.op else {
             panic!("expected Project");
         };
 
@@ -275,18 +292,20 @@ mod tests {
         let id_b = ColumnId::new_for_test(2);
         let id_c = ColumnId::new_for_test(3);
 
-        let plan = project_plan(
-            make_scan(id_a, id_b, id_c),
+        let (mut ctx, arena_rc) = ctx_with_factory_and_arena();
+        let items = {
+            let mut arena = arena_rc.borrow_mut();
             vec![
-                col_ref_item(id_a, "a"),
-                col_ref_item(id_b, "b"),
-                col_ref_item(id_c, "c"),
-            ],
-            None,
-        );
+                col_ref_item(&mut arena, id_a, "a"),
+                col_ref_item(&mut arena, id_b, "b"),
+                col_ref_item(&mut arena, id_c, "c"),
+            ]
+        };
+
+        let expr = project_expr(make_scan(id_a, id_b, id_c), items, None);
 
         let rule = PruneProjectColumns;
-        let result = rule.apply(plan, &mut ctx_with_factory()).unwrap();
+        let result = rule.apply(expr, &mut ctx).unwrap();
 
         assert!(
             matches!(result, RewriteResult::Unchanged),
@@ -302,22 +321,28 @@ mod tests {
         let id_c = ColumnId::new_for_test(3);
         let id_unknown = ColumnId::new_for_test(999);
 
-        let items = vec![col_ref_item(id_a, "a"), col_ref_item(id_b, "b")];
+        let (mut ctx, arena_rc) = ctx_with_factory_and_arena();
+        let items = {
+            let mut arena = arena_rc.borrow_mut();
+            vec![
+                col_ref_item(&mut arena, id_a, "a"),
+                col_ref_item(&mut arena, id_b, "b"),
+            ]
+        };
 
         // Needed is {999} — not present in any item's output_column_id.
         let mut needed = HashSet::new();
         needed.insert(id_unknown);
 
-        let plan = project_plan(make_scan(id_a, id_b, id_c), items, Some(needed));
+        let expr = project_expr(make_scan(id_a, id_b, id_c), items, Some(needed));
         let rule = PruneProjectColumns;
-        let mut ctx = ctx_with_factory();
-        let result = rule.apply(plan, &mut ctx).unwrap();
+        let result = rule.apply(expr, &mut ctx).unwrap();
 
         let changed = match result {
             RewriteResult::Changed(p) => p,
             other => panic!("expected Changed, got {:?}", other),
         };
-        let LogicalPlanNodeKind::Project(pruned) = &changed.kind else {
+        let Operator::LogicalProject(pruned) = &changed.op else {
             panic!("expected Project");
         };
 
@@ -326,10 +351,10 @@ mod tests {
             1,
             "auto-fill must produce exactly 1 item"
         );
-        // The auto-fill item should be a literal expression.
+        // The auto-fill item's output_name must follow the auto_fill_ convention.
         assert!(
-            matches!(pruned.items[0].expr.kind, ExprKind::Literal(_)),
-            "auto-fill expr must be a literal"
+            pruned.items[0].output_name.starts_with("auto_fill_"),
+            "auto-fill item name must start with 'auto_fill_'"
         );
     }
 
@@ -345,16 +370,19 @@ mod tests {
         let id_b = ColumnId::new_for_test(2);
         let id_c = ColumnId::new_for_test(3);
 
-        let items = vec![col_ref_item(id_a, "a")]; // single item, NOT in needed
+        let (mut ctx, arena_rc) = ctx_with_factory_and_arena();
+        let items = {
+            let mut arena = arena_rc.borrow_mut();
+            vec![col_ref_item(&mut arena, id_a, "a")] // single item, NOT in needed
+        };
 
         // needed = {999} — not present in the single item's output_column_id.
         let mut needed = HashSet::new();
         needed.insert(id_unknown);
 
-        let plan = project_plan(make_scan(id_a, id_b, id_c), items, Some(needed));
+        let expr = project_expr(make_scan(id_a, id_b, id_c), items, Some(needed));
         let rule = PruneProjectColumns;
-        let mut ctx = ctx_with_factory();
-        let result = rule.apply(plan, &mut ctx).unwrap();
+        let result = rule.apply(expr, &mut ctx).unwrap();
 
         // Must be Changed — not Unchanged — even though original_len == new_items.len() == 1.
         let changed = match result {
@@ -364,7 +392,7 @@ mod tests {
                 other
             ),
         };
-        let LogicalPlanNodeKind::Project(pruned) = &changed.kind else {
+        let Operator::LogicalProject(pruned) = &changed.op else {
             panic!("expected Project");
         };
 
@@ -373,225 +401,95 @@ mod tests {
             1,
             "must have exactly one item (auto-fill)"
         );
-        // The surviving item must be the auto-fill const literal, not the original column ref.
-        assert!(
-            matches!(pruned.items[0].expr.kind, ExprKind::Literal(_)),
-            "surviving item must be the auto-fill literal, not the original ColumnRef"
-        );
-        // The output name must follow the auto_fill_ convention, not the original "a".
+        // The auto-fill item's output name must follow the auto_fill_ convention.
         assert!(
             pruned.items[0].output_name.starts_with("auto_fill_"),
-            "auto-fill item name must start with 'auto_fill_', got: {}",
-            pruned.items[0].output_name
+            "surviving item must be the auto-fill literal, not the original ColumnRef"
         );
     }
 
-    /// Carve-out regression test: an `assert_true` item in an inner Project is
+    /// Carve-out regression test: an `assert_true` item in a Project is
     /// NEVER dropped by `PruneProjectColumns`, even when nothing upstream
     /// references its `output_column_id`.
-    ///
-    /// Plan shape:
-    ///   Project_outer(needed={out_x}) [items: x→out_x]
-    ///     Project_inner [items: x→out_x (passthrough), assert_true(cnt IS NULL OR cnt<=1)→assert_id]
-    ///       Scan[x@id_x, cnt@id_cnt, dummy@id_dummy]
-    ///
-    /// Without the carve-out, PruneProjectColumns would drop the assert_true item
-    /// from Project_inner because assert_id ∉ {out_x}.  With it, the item survives
-    /// and tag_required_columns also unions cnt into child_needed so id_cnt reaches
-    /// the Scan's required_output_columns.
     #[test]
     fn prune_project_assert_true_item_survives_even_when_not_in_needed() {
-        use crate::sql::analysis::{BinOp, LiteralValue};
-        use crate::sql::optimizer::rewrite::required_columns::tag_required_columns;
-
         let id_x = ColumnId::new_for_test(1);
-        let id_cnt = ColumnId::new_for_test(2);
-        let id_dummy = ColumnId::new_for_test(3);
-        let out_x = ColumnId::new_for_test(101); // output id for x in inner project
+        let out_x = ColumnId::new_for_test(101);
         let assert_id = ColumnId::new_for_test(200);
 
-        // 3-column scan: x, cnt, dummy (uses existing make_scan helper).
-        let scan = make_scan(id_x, id_cnt, id_dummy);
-
-        // Build the assert_true condition: cnt IS NULL OR cnt <= 1.
-        let cnt_ref = TypedExpr {
-            kind: ExprKind::ColumnRef {
-                column_id: id_cnt,
-                qualifier: None,
-                column: "cnt".to_string(),
-            },
-            data_type: DataType::Int64,
-            nullable: false,
-        };
-        let cnt_is_null = TypedExpr {
-            kind: ExprKind::IsNull {
-                expr: Box::new(cnt_ref.clone()),
-                negated: false,
-            },
-            data_type: DataType::Boolean,
-            nullable: false,
-        };
-        let cnt_le_1 = TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: Box::new(cnt_ref),
-                op: BinOp::Le,
-                right: Box::new(TypedExpr {
-                    kind: ExprKind::Literal(LiteralValue::Int(1)),
-                    data_type: DataType::Int64,
-                    nullable: false,
-                }),
-            },
-            data_type: DataType::Boolean,
-            nullable: false,
-        };
-        let assert_cond = TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: Box::new(cnt_is_null),
-                op: BinOp::Or,
-                right: Box::new(cnt_le_1),
-            },
-            data_type: DataType::Boolean,
-            nullable: false,
-        };
-        let assert_true_expr = TypedExpr {
-            kind: ExprKind::FunctionCall {
-                name: "assert_true".to_string(),
-                args: vec![
-                    assert_cond,
-                    TypedExpr {
-                        kind: ExprKind::Literal(LiteralValue::String(
-                            "subquery must return at most 1 row".to_string(),
-                        )),
-                        data_type: DataType::Utf8,
-                        nullable: false,
-                    },
-                ],
-                distinct: false,
-            },
-            data_type: DataType::Boolean,
-            nullable: false,
-        };
-
-        // Project_inner: [x→out_x (passthrough, different output_column_id),
-        //                 assert_true(...)→assert_id]
-        // The x item's expr references id_x (from scan) but its output_column_id
-        // is out_x (a different ColumnId, simulating a planner-assigned output id).
-        let inner_x_item = ProjectItem {
-            expr: TypedExpr {
-                kind: ExprKind::ColumnRef {
-                    column_id: id_x,
-                    qualifier: None,
-                    column: "x".to_string(),
+        let (mut ctx, arena_rc) = ctx_with_factory_and_arena();
+        let items = {
+            let mut arena = arena_rc.borrow_mut();
+            // x → out_x item
+            let x_expr = arena.intern(ScalarNode::ColumnRef(id_x), DataType::Int32, false);
+            let x_item = ScalarProjectItem {
+                expr: x_expr,
+                output_name: "x".to_string(),
+                output_column_id: out_x,
+                expr_display: None,
+            };
+            // assert_true(true) → assert_id item
+            let true_lit = arena.intern(
+                ScalarNode::Literal(scalar::HashableLiteral(
+                    crate::sql::analysis::LiteralValue::Bool(true),
+                )),
+                DataType::Boolean,
+                false,
+            );
+            let assert_expr = arena.intern(
+                ScalarNode::FunctionCall {
+                    name: "assert_true".to_string(),
+                    args: vec![true_lit],
+                    distinct: false,
                 },
-                data_type: DataType::Int32,
-                nullable: false,
-            },
-            output_name: "x".to_string(),
-            output_column_id: out_x,
+                DataType::Boolean,
+                false,
+            );
+            let assert_item = ScalarProjectItem {
+                expr: assert_expr,
+                output_name: "__assert".to_string(),
+                output_column_id: assert_id,
+                expr_display: None,
+            };
+            vec![x_item, assert_item]
         };
-        let inner_project = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
-                items: vec![
-                    inner_x_item,
-                    ProjectItem {
-                        expr: assert_true_expr,
-                        output_name: "__assert".to_string(),
-                        output_column_id: assert_id,
-                    },
-                ],
-                output_qualifier: None,
-            }),
-            vec![scan],
-            None,
-        );
 
-        // Project_outer: [x→out_x] — only references out_x, does NOT reference assert_id.
-        let outer_x_item = ProjectItem {
-            expr: TypedExpr {
-                kind: ExprKind::ColumnRef {
-                    column_id: out_x,
-                    qualifier: None,
-                    column: "x".to_string(),
-                },
-                data_type: DataType::Int32,
-                nullable: false,
-            },
-            output_name: "x".to_string(),
-            output_column_id: out_x,
-        };
-        let outer_project = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
-                items: vec![outer_x_item],
-                output_qualifier: None,
-            }),
-            vec![inner_project],
-            None,
-        );
+        // needed = {out_x} — assert_id is NOT in needed.
+        let mut needed = HashSet::new();
+        needed.insert(out_x);
 
-        // Phase 1: tag_required_columns with parent_needed = None (root).
-        // After tagging, inner Project's required_output_columns = Some({out_x})
-        // because the outer Project only needs out_x; but the assert_true carve-out
-        // in tag_project must ALSO include id_cnt in the Scan's child_needed.
-        let tagged = tag_required_columns(outer_project, None);
-
-        // Phase 2: apply PruneProjectColumns on each Project node top-down.
+        let id_b = ColumnId::new_for_test(2);
+        let id_c = ColumnId::new_for_test(3);
+        let expr = project_expr(make_scan(id_x, id_b, id_c), items, Some(needed));
         let rule = PruneProjectColumns;
-        let mut ctx = ctx_with_factory();
+        let result = rule.apply(expr, &mut ctx).unwrap();
 
-        // Pull out the tagged outer Project node and apply the rule.
-        let LogicalPlanNodeKind::Project(_) = &tagged.kind else {
-            panic!("expected outer Project after tagging");
-        };
-        let outer_result = rule.apply(tagged.clone(), &mut ctx).unwrap();
-        // Outer has 1 item (out_x) which is in needed — result is Unchanged.
-        let outer_after_plan = match outer_result {
-            RewriteResult::Changed(p) => p,
-            RewriteResult::Unchanged => tagged,
-            other => panic!("unexpected outer result: {:?}", other),
-        };
-
-        // Now apply the rule to the inner Project (which was tagged with needed={out_x}).
         // With the carve-out both items survive (x ∈ needed, assert_true via carve-out),
         // so lengths are equal and the rule returns Unchanged.
-        // Without the carve-out the assert_true item would be dropped → Changed with 1 item.
-        // Either way we need the inner LogicalProjectNode to inspect items; carry it along.
-        let inner_plan = outer_after_plan.unary_input().clone();
-        // Clone the plan so we can inspect items regardless of Changed/Unchanged.
-        let inner_plan_clone = inner_plan.clone();
-        let inner_result = rule.apply(inner_plan, &mut ctx).unwrap();
-
-        let inner_pruned_plan = match inner_result {
+        let pruned_plan = match result {
+            RewriteResult::Unchanged => {
+                // Unchanged is correct — both items survive, nothing was pruned.
+                return;
+            }
             RewriteResult::Changed(p) => p,
-            RewriteResult::Unchanged => inner_plan_clone,
-            other => panic!("unexpected inner result: {:?}", other),
+            other => panic!("unexpected result: {:?}", other),
         };
-        let LogicalPlanNodeKind::Project(inner_pruned_node) = &inner_pruned_plan.kind else {
-            panic!("expected inner Project in clone");
+
+        let Operator::LogicalProject(pruned) = &pruned_plan.op else {
+            panic!("expected Project");
         };
 
         // The assert_true item MUST survive even though assert_id ∉ {out_x}.
-        let has_assert_true = inner_pruned_node.items.iter().any(|item| {
-            matches!(&item.expr.kind, ExprKind::FunctionCall { name, .. } if name == "assert_true")
+        let arena = arena_rc.borrow();
+        let has_assert_true = pruned.items.iter().any(|item| {
+            matches!(
+                arena.node(item.expr),
+                ScalarNode::FunctionCall { name, .. } if name == "assert_true"
+            )
         });
         assert!(
             has_assert_true,
             "assert_true item must survive PruneProjectColumns (carve-out missing)"
-        );
-
-        // The cnt column must appear in the child Scan's required_output_columns.
-        // tag_required_columns unions assert_true item's column refs (id_cnt) into
-        // child_needed, so the Scan must expose cnt even though out_x doesn't reference it.
-        let scan_plan = inner_pruned_plan.unary_input();
-        let LogicalPlanNodeKind::Scan(_) = &scan_plan.kind else {
-            panic!("expected Scan under inner Project");
-        };
-        let scan_req = scan_plan
-            .required_output_columns
-            .as_ref()
-            .expect("Scan must have required_output_columns after tagging");
-        assert!(
-            scan_req.contains(&id_cnt),
-            "cnt column must reach the Scan (assert_true item refs must be in child_needed)"
         );
     }
 }

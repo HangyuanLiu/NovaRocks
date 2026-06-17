@@ -4,11 +4,12 @@
 //! in row equality. Column pruning cannot remove set-key positions even when
 //! the parent only needs row existence (for example `COUNT(*)` over the set).
 
+use crate::sql::optimizer::operator::Operator;
+use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::planner::plan::*;
 
 pub(crate) struct PruneIntersectColumns;
 
@@ -21,16 +22,16 @@ impl LogicalRewriteRule for PruneIntersectColumns {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
-        matches!(&plan.kind, LogicalPlanNodeKind::Intersect(_))
+    fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
+        matches!(&expr.op, Operator::LogicalIntersect(_))
     }
 
     fn apply(
         &self,
-        plan: LogicalPlanNode,
+        expr: OptExpr,
         _ctx: &mut RewriteContext,
     ) -> Result<RewriteResult, String> {
-        let LogicalPlanNodeKind::Intersect(_) = plan.kind else {
+        let Operator::LogicalIntersect(_) = expr.op else {
             unreachable!()
         };
 
@@ -43,9 +44,9 @@ mod tests {
     use super::*;
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::operator::{IntersectOp, Operator, ValuesOp};
+    use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
-    use crate::sql::planner::plan::*;
-    use crate::sql::planner::plan::{LogicalIntersectNode, LogicalPlanNodeKind, LogicalValuesNode};
     use arrow::datatypes::DataType;
     use std::collections::HashSet;
 
@@ -63,15 +64,11 @@ mod tests {
         }
     }
 
-    fn dummy_input() -> LogicalPlanNode {
-        LogicalPlanNode::new(
-            LogicalPlanNodeKind::Values(LogicalValuesNode {
-                rows: vec![],
-                columns: vec![],
-            }),
-            vec![],
-            None,
-        )
+    fn dummy_input() -> OptExpr {
+        OptExpr::leaf(Operator::LogicalValues(ValuesOp {
+            rows: vec![],
+            columns: vec![],
+        }))
     }
 
     #[test]
@@ -84,20 +81,21 @@ mod tests {
         needed.insert(id_a);
         needed.insert(id_c);
 
-        let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Intersect(LogicalIntersectNode {
+        let mut expr = OptExpr::new(
+            Operator::LogicalIntersect(IntersectOp {
                 output_columns: vec![
                     make_output_column(id_a, "a"),
                     make_output_column(id_b, "b"),
                     make_output_column(id_c, "c"),
                 ],
+                child_output_columns: vec![],
             }),
             vec![dummy_input(), dummy_input()],
-            Some(needed),
         );
+        expr.required_output_columns = Some(needed);
 
         let rule = PruneIntersectColumns;
-        let result = rule.apply(plan, &mut ctx()).unwrap();
+        let result = rule.apply(expr, &mut ctx()).unwrap();
 
         assert!(
             matches!(result, RewriteResult::Unchanged),
@@ -109,16 +107,17 @@ mod tests {
     fn prune_intersect_noop_when_required_output_columns_is_none() {
         let id_a = ColumnId::new_for_test(1);
 
-        let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Intersect(LogicalIntersectNode {
+        let expr = OptExpr::new(
+            Operator::LogicalIntersect(IntersectOp {
                 output_columns: vec![make_output_column(id_a, "a")],
+                child_output_columns: vec![],
             }),
             vec![dummy_input()],
-            None, // not tagged
         );
+        // required_output_columns = None (default)
 
         let rule = PruneIntersectColumns;
-        let result = rule.apply(plan, &mut ctx()).unwrap();
+        let result = rule.apply(expr, &mut ctx()).unwrap();
 
         assert!(
             matches!(result, RewriteResult::Unchanged),
@@ -131,17 +130,17 @@ mod tests {
         let id_a = ColumnId::new_for_test(1);
         let id_b = ColumnId::new_for_test(2);
 
-        // needed is empty — must keep first column.
-        let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Intersect(LogicalIntersectNode {
+        let mut expr = OptExpr::new(
+            Operator::LogicalIntersect(IntersectOp {
                 output_columns: vec![make_output_column(id_a, "a"), make_output_column(id_b, "b")],
+                child_output_columns: vec![],
             }),
             vec![dummy_input()],
-            Some(HashSet::new()),
         );
+        expr.required_output_columns = Some(HashSet::new());
 
         let rule = PruneIntersectColumns;
-        let result = rule.apply(plan, &mut ctx()).unwrap();
+        let result = rule.apply(expr, &mut ctx()).unwrap();
 
         assert!(
             matches!(result, RewriteResult::Unchanged),

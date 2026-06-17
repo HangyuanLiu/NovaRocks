@@ -1,6 +1,6 @@
 //! PruneUnionColumns — Phase 2 rule for Union nodes.
 //!
-//! Filters `LogicalUnionNode.output_columns` to only those whose `column_id`
+//! Filters `UnionOp.output_columns` to only those whose `column_id`
 //! is in `required_output_columns`. Keeps at least one column to preserve
 //! a valid output schema (Gap 4).
 //!
@@ -14,12 +14,13 @@
 use std::collections::HashSet;
 
 use crate::sql::column_id::ColumnId;
+use crate::sql::optimizer::operator::Operator;
+use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
 use crate::sql::optimizer::rewrite::rules::column_pruning::keep_at_least_one;
-use crate::sql::planner::plan::*;
 
 pub(crate) struct PruneUnionColumns;
 
@@ -32,21 +33,21 @@ impl LogicalRewriteRule for PruneUnionColumns {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
-        matches!(&plan.kind, LogicalPlanNodeKind::Union(_))
+    fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
+        matches!(&expr.op, Operator::LogicalUnion(_))
     }
 
     fn apply(
         &self,
-        plan: LogicalPlanNode,
+        expr: OptExpr,
         _ctx: &mut RewriteContext,
     ) -> Result<RewriteResult, String> {
-        let LogicalPlanNode {
-            kind,
+        let OptExpr {
+            op,
             children,
             required_output_columns,
-        } = plan;
-        let LogicalPlanNodeKind::Union(mut node) = kind else {
+        } = expr;
+        let Operator::LogicalUnion(mut node) = op else {
             unreachable!()
         };
 
@@ -88,11 +89,11 @@ impl LogicalRewriteRule for PruneUnionColumns {
         }
 
         node.output_columns = new_output_columns;
-        Ok(RewriteResult::Changed(LogicalPlanNode::new(
-            LogicalPlanNodeKind::Union(node),
+        Ok(RewriteResult::Changed(OptExpr {
+            op: Operator::LogicalUnion(node),
             children,
             required_output_columns,
-        )))
+        }))
     }
 }
 
@@ -101,9 +102,9 @@ mod tests {
     use super::*;
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::operator::{Operator, UnionOp, ValuesOp};
+    use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
-    use crate::sql::planner::plan::*;
-    use crate::sql::planner::plan::{LogicalPlanNodeKind, LogicalUnionNode, LogicalValuesNode};
     use arrow::datatypes::DataType;
 
     fn ctx() -> RewriteContext {
@@ -120,15 +121,11 @@ mod tests {
         }
     }
 
-    fn dummy_input() -> LogicalPlanNode {
-        LogicalPlanNode::new(
-            LogicalPlanNodeKind::Values(LogicalValuesNode {
-                rows: vec![],
-                columns: vec![],
-            }),
-            vec![],
-            None,
-        )
+    fn dummy_input() -> OptExpr {
+        OptExpr::leaf(Operator::LogicalValues(ValuesOp {
+            rows: vec![],
+            columns: vec![],
+        }))
     }
 
     #[test]
@@ -140,27 +137,28 @@ mod tests {
         let mut needed = HashSet::new();
         needed.insert(id_b);
 
-        let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Union(LogicalUnionNode {
+        let mut expr = OptExpr::new(
+            Operator::LogicalUnion(UnionOp {
                 all: true,
                 output_columns: vec![
                     make_output_column(id_a, "a"),
                     make_output_column(id_b, "b"),
                     make_output_column(id_c, "c"),
                 ],
+                child_output_columns: vec![],
             }),
             vec![dummy_input(), dummy_input()],
-            Some(needed),
         );
+        expr.required_output_columns = Some(needed);
 
         let rule = PruneUnionColumns;
-        let result = rule.apply(plan, &mut ctx()).unwrap();
+        let result = rule.apply(expr, &mut ctx()).unwrap();
 
         let changed = match result {
             RewriteResult::Changed(p) => p,
             other => panic!("expected Changed, got {:?}", other),
         };
-        let LogicalPlanNodeKind::Union(pruned) = &changed.kind else {
+        let Operator::LogicalUnion(pruned) = &changed.op else {
             panic!("expected Union");
         };
 
@@ -174,17 +172,18 @@ mod tests {
     fn prune_union_noop_when_required_output_columns_is_none() {
         let id_a = ColumnId::new_for_test(1);
 
-        let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Union(LogicalUnionNode {
+        let expr = OptExpr::new(
+            Operator::LogicalUnion(UnionOp {
                 all: false,
                 output_columns: vec![make_output_column(id_a, "a")],
+                child_output_columns: vec![],
             }),
             vec![dummy_input()],
-            None, // not tagged
         );
+        // required_output_columns = None (default), also all=false
 
         let rule = PruneUnionColumns;
-        let result = rule.apply(plan, &mut ctx()).unwrap();
+        let result = rule.apply(expr, &mut ctx()).unwrap();
 
         assert!(
             matches!(result, RewriteResult::Unchanged),
@@ -198,23 +197,24 @@ mod tests {
         let id_b = ColumnId::new_for_test(2);
 
         // needed is empty — must keep first column.
-        let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Union(LogicalUnionNode {
+        let mut expr = OptExpr::new(
+            Operator::LogicalUnion(UnionOp {
                 all: true,
                 output_columns: vec![make_output_column(id_a, "a"), make_output_column(id_b, "b")],
+                child_output_columns: vec![],
             }),
             vec![dummy_input()],
-            Some(HashSet::new()),
         );
+        expr.required_output_columns = Some(HashSet::new());
 
         let rule = PruneUnionColumns;
-        let result = rule.apply(plan, &mut ctx()).unwrap();
+        let result = rule.apply(expr, &mut ctx()).unwrap();
 
         let changed = match result {
             RewriteResult::Changed(p) => p,
             other => panic!("expected Changed, got {:?}", other),
         };
-        let LogicalPlanNodeKind::Union(pruned) = &changed.kind else {
+        let Operator::LogicalUnion(pruned) = &changed.op else {
             panic!("expected Union");
         };
 

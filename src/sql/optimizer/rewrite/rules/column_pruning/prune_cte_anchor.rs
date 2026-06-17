@@ -10,11 +10,12 @@
 //! Kept for architectural symmetry and to allow per-operator
 //! `disable_optimizer_rules` control in the future.
 
+use crate::sql::optimizer::operator::Operator;
+use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind};
 
 pub(crate) struct PruneCTEAnchorColumns;
 
@@ -27,13 +28,13 @@ impl LogicalRewriteRule for PruneCTEAnchorColumns {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
-        matches!(&plan.kind, LogicalPlanNodeKind::CTEAnchor(_))
+    fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
+        matches!(&expr.op, Operator::LogicalCTEAnchor(_))
     }
 
     fn apply(
         &self,
-        _plan: LogicalPlanNode,
+        _expr: OptExpr,
         _ctx: &mut RewriteContext,
     ) -> Result<RewriteResult, String> {
         // No-op: CTEAnchor is a scope wrapper with no own output metadata to
@@ -47,40 +48,37 @@ impl LogicalRewriteRule for PruneCTEAnchorColumns {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::optimizer::operator::{CTEAnchorOp, Operator, ValuesOp};
+    use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
-    use crate::sql::planner::plan::*;
-    use crate::sql::planner::plan::{LogicalCTEAnchorNode, LogicalPlanNodeKind, LogicalValuesNode};
 
     fn ctx() -> RewriteContext {
         RewriteContext::new(RewriteConsumer::Query)
     }
 
-    fn dummy_input() -> LogicalPlanNode {
-        LogicalPlanNode::new(
-            LogicalPlanNodeKind::Values(LogicalValuesNode {
-                rows: vec![],
-                columns: vec![],
-            }),
-            vec![],
-            None,
-        )
+    fn dummy_input() -> OptExpr {
+        OptExpr::leaf(Operator::LogicalValues(ValuesOp {
+            rows: vec![],
+            columns: vec![],
+        }))
     }
 
     #[test]
     fn prune_cte_anchor_is_always_unchanged() {
-        let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: 1u32 }),
+        let expr = OptExpr::new(
+            Operator::LogicalCTEAnchor(CTEAnchorOp {
+                cte_id: 1u32,
+            }),
             vec![dummy_input(), dummy_input()],
-            None,
         );
 
         let rule = PruneCTEAnchorColumns;
 
         // matches the right variant
-        assert!(rule.matches(&plan, &ctx()));
+        assert!(rule.matches(&expr, &ctx()));
 
         // apply always returns Unchanged
-        let result = rule.apply(plan, &mut ctx()).unwrap();
+        let result = rule.apply(expr, &mut ctx()).unwrap();
         assert!(
             matches!(result, RewriteResult::Unchanged),
             "PruneCTEAnchorColumns must always return Unchanged"

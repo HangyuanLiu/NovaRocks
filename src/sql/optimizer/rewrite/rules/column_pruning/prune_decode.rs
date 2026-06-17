@@ -2,7 +2,7 @@
 //!
 //! ## Decode node mapping semantics
 //!
-//! `LogicalDecodeNode.output_columns[i].name` contains the **string column** name
+//! `DecodeOp.output_columns[i].name` contains the **string column** name
 //! (user-facing). The corresponding `DecodeMapping` has:
 //!   - `dict_column`: name of the dict-encoded slot in the child's output
 //!   - `string_column`: name exposed upward (matches output_columns[i].name)
@@ -23,12 +23,13 @@
 use std::collections::HashSet;
 
 use crate::sql::column_id::ColumnId;
+use crate::sql::optimizer::operator::Operator;
+use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
 use crate::sql::optimizer::rewrite::rules::column_pruning::keep_at_least_one;
-use crate::sql::planner::plan::*;
 
 pub(crate) struct PruneDecodeColumns;
 
@@ -41,21 +42,21 @@ impl LogicalRewriteRule for PruneDecodeColumns {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
-        matches!(&plan.kind, LogicalPlanNodeKind::Decode(_))
+    fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
+        matches!(&expr.op, Operator::LogicalDecode(_))
     }
 
     fn apply(
         &self,
-        plan: LogicalPlanNode,
+        expr: OptExpr,
         _ctx: &mut RewriteContext,
     ) -> Result<RewriteResult, String> {
-        let LogicalPlanNode {
-            kind,
+        let OptExpr {
+            op,
             children,
             required_output_columns,
-        } = plan;
-        let LogicalPlanNodeKind::Decode(mut node) = kind else {
+        } = expr;
+        let Operator::LogicalDecode(mut node) = op else {
             unreachable!()
         };
 
@@ -100,7 +101,7 @@ impl LogicalRewriteRule for PruneDecodeColumns {
             .collect();
 
         // Drop mappings whose string_column is no longer in any kept output column.
-        let new_mappings: Vec<DecodeMapping> = node
+        let new_mappings: Vec<_> = node
             .mappings
             .into_iter()
             .filter(|m| kept_string_names.contains(&m.string_column.to_lowercase()))
@@ -108,11 +109,11 @@ impl LogicalRewriteRule for PruneDecodeColumns {
 
         node.output_columns = new_output_columns;
         node.mappings = new_mappings;
-        Ok(RewriteResult::Changed(LogicalPlanNode::new(
-            LogicalPlanNodeKind::Decode(node),
+        Ok(RewriteResult::Changed(OptExpr {
+            op: Operator::LogicalDecode(node),
             children,
             required_output_columns,
-        )))
+        }))
     }
 }
 
@@ -121,11 +122,10 @@ mod tests {
     use super::*;
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::operator::{DecodeOp, Operator, ValuesOp};
+    use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
-    use crate::sql::planner::plan::*;
-    use crate::sql::planner::plan::{
-        DecodeMapping, LogicalDecodeNode, LogicalPlanNodeKind, LogicalValuesNode,
-    };
+    use crate::sql::planner::plan::DecodeMapping;
     use arrow::datatypes::DataType;
     use std::collections::HashSet;
 
@@ -143,20 +143,16 @@ mod tests {
         }
     }
 
-    fn dummy_input() -> LogicalPlanNode {
-        LogicalPlanNode::new(
-            LogicalPlanNodeKind::Values(LogicalValuesNode {
-                rows: vec![],
-                columns: vec![],
-            }),
-            vec![],
-            None,
-        )
+    fn dummy_input() -> OptExpr {
+        OptExpr::leaf(Operator::LogicalValues(ValuesOp {
+            rows: vec![],
+            columns: vec![],
+        }))
     }
 
     #[test]
     fn prune_decode_drops_unneeded_output_columns_and_mappings() {
-        // LogicalDecodeNode with 2 decoded columns (s1, s2) and 1 passthrough (a).
+        // DecodeOp with 2 decoded columns (s1, s2) and 1 passthrough (a).
         // needed = {id_a, id_s1}; s2 and its mapping should be dropped.
         let id_a = ColumnId::new_for_test(1);
         let id_s1 = ColumnId::new_for_test(10);
@@ -166,8 +162,8 @@ mod tests {
         needed.insert(id_a);
         needed.insert(id_s1);
 
-        let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Decode(LogicalDecodeNode {
+        let mut expr = OptExpr::new(
+            Operator::LogicalDecode(DecodeOp {
                 mappings: vec![
                     DecodeMapping {
                         source_column_id: id_s1,
@@ -189,17 +185,17 @@ mod tests {
                 ],
             }),
             vec![dummy_input()],
-            Some(needed),
         );
+        expr.required_output_columns = Some(needed);
 
         let rule = PruneDecodeColumns;
-        let result = rule.apply(plan, &mut ctx()).unwrap();
+        let result = rule.apply(expr, &mut ctx()).unwrap();
 
         let changed = match result {
             RewriteResult::Changed(p) => p,
             other => panic!("expected Changed, got {:?}", other),
         };
-        let LogicalPlanNodeKind::Decode(pruned) = &changed.kind else {
+        let Operator::LogicalDecode(pruned) = &changed.op else {
             panic!("expected Decode");
         };
 
@@ -219,17 +215,17 @@ mod tests {
     #[test]
     fn prune_decode_noop_when_required_output_columns_is_none() {
         let id_a = ColumnId::new_for_test(1);
-        let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Decode(LogicalDecodeNode {
+        let expr = OptExpr::new(
+            Operator::LogicalDecode(DecodeOp {
                 mappings: vec![],
                 output_columns: vec![make_output_column(id_a, "a")],
             }),
             vec![dummy_input()],
-            None, // not tagged
         );
+        // required_output_columns = None (default)
 
         let rule = PruneDecodeColumns;
-        let result = rule.apply(plan, &mut ctx()).unwrap();
+        let result = rule.apply(expr, &mut ctx()).unwrap();
 
         assert!(
             matches!(result, RewriteResult::Unchanged),
@@ -243,8 +239,8 @@ mod tests {
         let id_a = ColumnId::new_for_test(1);
         let id_s = ColumnId::new_for_test(10);
 
-        let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Decode(LogicalDecodeNode {
+        let mut expr = OptExpr::new(
+            Operator::LogicalDecode(DecodeOp {
                 mappings: vec![DecodeMapping {
                     source_column_id: id_s,
                     output_column_id: id_s,
@@ -254,17 +250,17 @@ mod tests {
                 output_columns: vec![make_output_column(id_a, "a"), make_output_column(id_s, "s")],
             }),
             vec![dummy_input()],
-            Some(HashSet::new()),
         );
+        expr.required_output_columns = Some(HashSet::new());
 
         let rule = PruneDecodeColumns;
-        let result = rule.apply(plan, &mut ctx()).unwrap();
+        let result = rule.apply(expr, &mut ctx()).unwrap();
 
         let changed = match result {
             RewriteResult::Changed(p) => p,
             other => panic!("expected Changed, got {:?}", other),
         };
-        let LogicalPlanNodeKind::Decode(pruned) = &changed.kind else {
+        let Operator::LogicalDecode(pruned) = &changed.op else {
             panic!("expected Decode");
         };
 

@@ -3,11 +3,12 @@
 //! Intentionally a no-op: CTE consume output columns are NOT pruned here.
 //! See the `apply` comment for the rationale (Gap-3 deferred).
 
+use crate::sql::optimizer::operator::Operator;
+use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::planner::plan::*;
 
 pub(crate) struct PruneCTEConsumeColumns;
 
@@ -20,13 +21,13 @@ impl LogicalRewriteRule for PruneCTEConsumeColumns {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
-        matches!(&plan.kind, LogicalPlanNodeKind::CTEConsume(_))
+    fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
+        matches!(&expr.op, Operator::LogicalCTEConsume(_))
     }
 
     fn apply(
         &self,
-        _plan: LogicalPlanNode,
+        _expr: OptExpr,
         _ctx: &mut RewriteContext,
     ) -> Result<RewriteResult, String> {
         // Conservative no-op: do not prune CTE consume output columns.
@@ -53,9 +54,9 @@ mod tests {
     use super::*;
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::operator::{CTEConsumeOp, Operator};
+    use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
-    use crate::sql::planner::plan::LogicalCTEConsumeNode;
-    use crate::sql::planner::plan::*;
     use arrow::datatypes::DataType;
     use std::collections::HashSet;
 
@@ -86,22 +87,19 @@ mod tests {
         let mut needed = HashSet::new();
         needed.insert(id_b);
 
-        let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::CTEConsume(LogicalCTEConsumeNode {
-                cte_id: 1,
-                alias: "cte1".to_string(),
-                output_columns: vec![
-                    make_output_column(id_a, "a"),
-                    make_output_column(id_b, "b"),
-                    make_output_column(id_c, "c"),
-                ],
-            }),
-            vec![],
-            Some(needed),
-        );
+        let mut expr = OptExpr::leaf(Operator::LogicalCTEConsume(CTEConsumeOp {
+            cte_id: 1u32,
+            alias: "cte1".to_string(),
+            output_columns: vec![
+                make_output_column(id_a, "a"),
+                make_output_column(id_b, "b"),
+                make_output_column(id_c, "c"),
+            ],
+        }));
+        expr.required_output_columns = Some(needed);
 
         let rule = PruneCTEConsumeColumns;
-        let result = rule.apply(plan, &mut ctx()).unwrap();
+        let result = rule.apply(expr, &mut ctx()).unwrap();
 
         // Must be Unchanged — CTE consume pruning is a no-op (Gap-3).
         assert!(
@@ -113,18 +111,15 @@ mod tests {
     #[test]
     fn prune_cte_consume_noop_when_required_output_columns_is_none() {
         let id_a = ColumnId::new_for_test(1);
-        let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::CTEConsume(LogicalCTEConsumeNode {
-                cte_id: 2,
-                alias: "cte2".to_string(),
-                output_columns: vec![make_output_column(id_a, "a")],
-            }),
-            vec![],
-            None, // not tagged
-        );
+        let expr = OptExpr::leaf(Operator::LogicalCTEConsume(CTEConsumeOp {
+            cte_id: 2u32,
+            alias: "cte2".to_string(),
+            output_columns: vec![make_output_column(id_a, "a")],
+        }));
+        // required_output_columns = None (default)
 
         let rule = PruneCTEConsumeColumns;
-        let result = rule.apply(plan, &mut ctx()).unwrap();
+        let result = rule.apply(expr, &mut ctx()).unwrap();
 
         assert!(
             matches!(result, RewriteResult::Unchanged),
@@ -137,18 +132,15 @@ mod tests {
         let id_a = ColumnId::new_for_test(1);
         let id_b = ColumnId::new_for_test(2);
 
-        let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::CTEConsume(LogicalCTEConsumeNode {
-                cte_id: 3,
-                alias: "cte3".to_string(),
-                output_columns: vec![make_output_column(id_a, "a"), make_output_column(id_b, "b")],
-            }),
-            vec![],
-            Some(HashSet::new()),
-        );
+        let mut expr = OptExpr::leaf(Operator::LogicalCTEConsume(CTEConsumeOp {
+            cte_id: 3u32,
+            alias: "cte3".to_string(),
+            output_columns: vec![make_output_column(id_a, "a"), make_output_column(id_b, "b")],
+        }));
+        expr.required_output_columns = Some(HashSet::new());
 
         let rule = PruneCTEConsumeColumns;
-        let result = rule.apply(plan, &mut ctx()).unwrap();
+        let result = rule.apply(expr, &mut ctx()).unwrap();
 
         // Even with an empty needed set, the no-op rule returns Unchanged.
         assert!(

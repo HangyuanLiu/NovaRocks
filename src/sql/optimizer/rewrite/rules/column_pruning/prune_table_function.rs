@@ -9,11 +9,12 @@
 //! Kept for architectural symmetry and to allow per-operator
 //! `disable_optimizer_rules` control in the future.
 
+use crate::sql::optimizer::operator::Operator;
+use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind};
 
 pub(crate) struct PruneTableFunctionColumns;
 
@@ -26,13 +27,13 @@ impl LogicalRewriteRule for PruneTableFunctionColumns {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
-        matches!(&plan.kind, LogicalPlanNodeKind::TableFunction(_))
+    fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
+        matches!(&expr.op, Operator::LogicalTableFunction(_))
     }
 
     fn apply(
         &self,
-        _plan: LogicalPlanNode,
+        _expr: OptExpr,
         _ctx: &mut RewriteContext,
     ) -> Result<RewriteResult, String> {
         // No-op: TableFunction was assigned keep-all-child semantics by the
@@ -47,11 +48,9 @@ mod tests {
     use super::*;
     use crate::sql::analysis::OutputColumn;
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::operator::{Operator, TableFunctionOp, ValuesOp};
+    use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
-    use crate::sql::planner::plan::*;
-    use crate::sql::planner::plan::{
-        LogicalPlanNodeKind, LogicalTableFunctionNode, LogicalValuesNode,
-    };
     use arrow::datatypes::DataType;
 
     fn ctx() -> RewriteContext {
@@ -60,8 +59,8 @@ mod tests {
 
     #[test]
     fn prune_table_function_is_always_unchanged() {
-        let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::TableFunction(LogicalTableFunctionNode {
+        let expr = OptExpr::new(
+            Operator::LogicalTableFunction(TableFunctionOp {
                 function_name: "generate_series".to_string(),
                 args: vec![],
                 output_columns: vec![OutputColumn {
@@ -74,24 +73,19 @@ mod tests {
                 alias: None,
                 is_left_join: false,
             }),
-            vec![LogicalPlanNode::new(
-                LogicalPlanNodeKind::Values(LogicalValuesNode {
-                    rows: vec![],
-                    columns: vec![],
-                }),
-                vec![],
-                None,
-            )],
-            None,
+            vec![OptExpr::leaf(Operator::LogicalValues(ValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }))],
         );
 
         let rule = PruneTableFunctionColumns;
 
         // matches the right variant
-        assert!(rule.matches(&plan, &ctx()));
+        assert!(rule.matches(&expr, &ctx()));
 
         // apply always returns Unchanged
-        let result = rule.apply(plan, &mut ctx()).unwrap();
+        let result = rule.apply(expr, &mut ctx()).unwrap();
         assert!(
             matches!(result, RewriteResult::Unchanged),
             "PruneTableFunctionColumns must always return Unchanged"
