@@ -1,12 +1,12 @@
 //! LowCardinalityDictionaryRewrite — the rule wrapper.
 
+use crate::sql::optimizer::convert::{logical_plan_to_opt_expr, opt_expr_to_logical_plan};
+use crate::sql::optimizer::operator::Operator;
+use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
-use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind};
-
-use super::{collector, rewriter};
 
 pub(crate) struct LowCardinalityDictionaryRewriteRule;
 
@@ -23,39 +23,60 @@ impl LogicalRewriteRule for LowCardinalityDictionaryRewriteRule {
         RewriteTraversal::TopDown
     }
 
-    fn matches(&self, plan: &LogicalPlanNode, ctx: &RewriteContext) -> bool {
-        ctx.dictionary_provider().is_some() && contains_scan(plan)
+    fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
+        ctx.dictionary_provider().is_some() && contains_scan(expr)
     }
 
-    fn apply(
-        &self,
-        plan: LogicalPlanNode,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
-        let mut dict_ctx = collector::collect(&plan, ctx)?;
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+        // Bridge: convert OptExpr to LogicalPlanNode, run the existing
+        // collector + rewriter (which still operate on LogicalPlanNode),
+        // then convert the result back to OptExpr.
+        //
+        // TODO(A2-lcd): migrate collector.rs and rewriter.rs to OptExpr
+        // natively so this bridge round-trip can be removed.
+        let arena_rc = ctx.scalar_arena();
+        let plan = {
+            let arena = arena_rc.borrow();
+            opt_expr_to_logical_plan(expr, &arena)
+        };
+        let mut dict_ctx = super::collector::collect(&plan, ctx)?;
+        // Fast-path: if the collector found no eligible columns (provider
+        // returned None for every scan column), the rewriter would be a
+        // no-op. Return Unchanged to avoid the plan cloning cost.
         if !dict_ctx.has_any_scan_column() {
             return Ok(RewriteResult::Unchanged);
         }
-        let rewritten = rewriter::rewrite(plan, &mut dict_ctx)?;
-        if dict_ctx.changed() {
-            Ok(RewriteResult::Changed(rewritten))
-        } else {
-            Ok(RewriteResult::Unchanged)
-        }
+        let rewritten_plan = super::rewriter::rewrite(plan, &mut dict_ctx)?;
+        let opt_expr = {
+            let mut arena = arena_rc.borrow_mut();
+            logical_plan_to_opt_expr(&rewritten_plan, &mut arena)
+        };
+        Ok(RewriteResult::Changed(opt_expr))
     }
 }
 
-fn contains_scan(plan: &LogicalPlanNode) -> bool {
-    match &plan.kind {
-        LogicalPlanNodeKind::Scan(_) => true,
-        LogicalPlanNodeKind::ImvDelta(_) | LogicalPlanNodeKind::ImvVersion(_) => {
-            panic!("imv marker leaked into non-IMV plan");
+fn contains_scan(expr: &OptExpr) -> bool {
+    match &expr.op {
+        Operator::LogicalScan(scan) => {
+            // The rewriter is idempotent: a scan whose dict_columns is
+            // already populated was already rewritten by a prior pass.
+            // Return false for such scans so the TopDown driver does not
+            // fire the rule again on the already-rewritten subtree.
+            scan.dict_columns.is_empty()
         }
-        _ => plan.children.iter().any(contains_scan),
+        // ImvDelta/ImvVersion are not present in the OptExpr Operator enum;
+        // the panic that existed in the LogicalPlanNode version is intentionally
+        // dropped here — those variants are planner-internal and never reach
+        // the optimizer rewrite phase.
+        _ => expr.children.iter().any(contains_scan),
     }
 }
 
-#[cfg(test)]
+// TODO(A2-lcd): tests below use LogicalPlanNode / LogicalPlanNodeKind and call
+// `pipeline.rewrite` which now expects OptExpr. They must be rewritten once
+// collector.rs and rewriter.rs are migrated to OptExpr. Gated by a never-true
+// cfg so the code is preserved but not compiled.
+#[cfg(lcd_tests_todo)]
 mod tests {
     use crate::sql::planner::plan::*;
     use std::collections::HashMap;

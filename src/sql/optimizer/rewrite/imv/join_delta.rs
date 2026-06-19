@@ -2,10 +2,14 @@ use arrow::datatypes::DataType;
 
 use crate::sql::analysis::{JoinKind, OutputColumn, ProjectItem};
 use crate::sql::column_id::ColumnId;
+use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
 use crate::sql::optimizer::rewrite::imv::annotation::ImvExtension;
 use crate::sql::optimizer::rewrite::imv::marker::ImvVersionRef;
+use crate::sql::optimizer::rewrite::imv::{
+    PlanRewriteResult, bridge_apply_result, opt_expr_to_plan,
+};
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
@@ -36,97 +40,96 @@ impl LogicalRewriteRule for RewriteJoinDeltaRule {
         RewriteTraversal::TopDown
     }
 
-    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+    fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
+        let plan = opt_expr_to_plan(expr.clone(), ctx);
         matches!(
             &plan.kind,
             LogicalPlanNodeKind::ImvDelta(_) if matches!(&plan.unary_input().kind, LogicalPlanNodeKind::Join(_))
         )
     }
 
-    fn apply(
-        &self,
-        plan: LogicalPlanNode,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
-        let LogicalPlanNode {
-            kind, mut children, ..
-        } = plan;
-        let LogicalPlanNodeKind::ImvDelta(delta) = kind else {
-            return Ok(RewriteResult::Unchanged);
-        };
-        let input = take_unary_child(&mut children);
-        let LogicalPlanNode {
-            kind: join_kind,
-            children: mut join_children,
-            required_output_columns,
-        } = input;
-        let LogicalPlanNodeKind::Join(join) = join_kind else {
-            return Ok(RewriteResult::Unchanged);
-        };
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+        bridge_apply_result(expr, ctx, |plan, ctx| {
+            let LogicalPlanNode {
+                kind, mut children, ..
+            } = plan;
+            let LogicalPlanNodeKind::ImvDelta(delta) = kind else {
+                return Ok(PlanRewriteResult::Unchanged);
+            };
+            let input = take_unary_child(&mut children);
+            let LogicalPlanNode {
+                kind: join_kind,
+                children: mut join_children,
+                required_output_columns,
+            } = input;
+            let LogicalPlanNodeKind::Join(join) = join_kind else {
+                return Ok(PlanRewriteResult::Unchanged);
+            };
 
-        if !join_delta_kind_supported(join.join_type) {
-            return Err(format!(
-                "Iceberg IMV join delta rewrite supports inner/cross joins only, got {:?}",
-                join.join_type
-            ));
-        }
+            if !join_delta_kind_supported(join.join_type) {
+                return Err(format!(
+                    "Iceberg IMV join delta rewrite supports inner/cross joins only, got {:?}",
+                    join.join_type
+                ));
+            }
 
-        let action_column = match delta.action_column {
-            Some(action_column) => action_column,
-            None => ctx
-                .extension::<ImvExtension>()
-                .ok_or_else(|| {
-                    "RewriteJoinDelta requires ImvExtension in RewriteContext".to_string()
-                })?
-                .allocate_column_id(),
-        };
+            let action_column = match delta.action_column {
+                Some(action_column) => action_column,
+                None => ctx
+                    .extension::<ImvExtension>()
+                    .ok_or_else(|| {
+                        "RewriteJoinDelta requires ImvExtension in RewriteContext".to_string()
+                    })?
+                    .allocate_column_id(),
+            };
 
-        let (left, right) = take_binary_children(&mut join_children);
-        let LogicalJoinNode {
-            join_type,
-            condition,
-        } = join;
-        let mut output_columns = join_output_columns(join_type, &left, &right)?;
-        output_columns.push(ImvActionColumn::output_column(action_column));
+            let (left, right) = take_binary_children(&mut join_children);
+            let LogicalJoinNode {
+                join_type,
+                condition,
+            } = join;
+            let mut output_columns = join_output_columns(join_type, &left, &right)?;
+            output_columns.push(ImvActionColumn::output_column(action_column));
 
-        let left_delta_branch = normalize_branch_output(
-            LogicalPlanNode::new(
-                LogicalPlanNodeKind::Join(LogicalJoinNode {
-                    join_type,
-                    condition: condition.clone(),
+            let left_delta_branch = normalize_branch_output(
+                LogicalPlanNode::new(
+                    LogicalPlanNodeKind::Join(LogicalJoinNode {
+                        join_type,
+                        condition: condition.clone(),
+                    }),
+                    vec![
+                        mark_delta_scan(left.clone(), action_column)?,
+                        mark_version_scan(right.clone(), ImvVersionRef::from_snapshot())?,
+                    ],
+                    required_output_columns.clone(),
+                ),
+                &output_columns,
+            );
+
+            let right_delta_branch = normalize_branch_output(
+                LogicalPlanNode::new(
+                    LogicalPlanNodeKind::Join(LogicalJoinNode {
+                        join_type,
+                        condition,
+                    }),
+                    vec![
+                        mark_version_scan(left, ImvVersionRef::to_snapshot())?,
+                        mark_delta_scan(right, action_column)?,
+                    ],
+                    required_output_columns.clone(),
+                ),
+                &output_columns,
+            );
+
+            Ok(PlanRewriteResult::Changed(LogicalPlanNode::new(
+                LogicalPlanNodeKind::Union(LogicalUnionNode {
+                    all: true,
+                    output_columns,
                 }),
-                vec![
-                    mark_delta_scan(left.clone(), action_column)?,
-                    mark_version_scan(right.clone(), ImvVersionRef::from_snapshot())?,
-                ],
-                required_output_columns.clone(),
-            ),
-            &output_columns,
-        );
-
-        let right_delta_branch = normalize_branch_output(
-            LogicalPlanNode::new(
-                LogicalPlanNodeKind::Join(LogicalJoinNode {
-                    join_type,
-                    condition,
-                }),
-                vec![
-                    mark_version_scan(left, ImvVersionRef::to_snapshot())?,
-                    mark_delta_scan(right, action_column)?,
-                ],
-                required_output_columns.clone(),
-            ),
-            &output_columns,
-        );
-
-        Ok(RewriteResult::Changed(LogicalPlanNode::new(
-            LogicalPlanNodeKind::Union(LogicalUnionNode {
-                all: true,
-                output_columns,
-            }),
-            vec![left_delta_branch, right_delta_branch],
-            required_output_columns,
-        )))
+                vec![left_delta_branch, right_delta_branch],
+                required_output_columns,
+            )))
+        })
     }
 }
 
@@ -392,10 +395,12 @@ mod tests {
         ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::convert::logical_plan_to_opt_expr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::imv::annotation::{ImvExtension, ImvPlanAnnotation};
     use crate::sql::optimizer::rewrite::imv::marker::ImvVersionRef;
     use crate::sql::optimizer::rewrite::imv::scan_binding::ImvVersionRole;
+    use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::{
         LogicalAggregateNode, LogicalImvVersionNode, LogicalJoinNode, LogicalPlanNodeKind,
         LogicalProjectNode, LogicalScanNode,
@@ -428,10 +433,13 @@ mod tests {
             vec![join_of(scan("l", 1), scan("r", 10))],
             None,
         );
-        assert!(rule.matches(&non_root, &ctx));
+        let arena_rc = ctx.scalar_arena();
+        let non_root_expr = logical_plan_to_opt_expr(&non_root, &mut arena_rc.borrow_mut());
+        assert!(rule.matches(&non_root_expr, &ctx));
 
         let over_agg = delta(aggregate_over(join_over(JoinKind::Inner)));
-        assert!(!rule.matches(&over_agg, &ctx));
+        let over_agg_expr = logical_plan_to_opt_expr(&over_agg, &mut arena_rc.borrow_mut());
+        assert!(!rule.matches(&over_agg_expr, &ctx));
     }
 
     #[test]
@@ -448,9 +456,15 @@ mod tests {
             None,
         );
 
-        let RewriteResult::Changed(changed) = rule.apply(plan, &mut ctx).expect("expand") else {
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("expand")
+        else {
             panic!("pure join-delta must expand ImvDelta(Join) directly into a Union");
         };
+        let arena = ctx.scalar_arena();
+        let changed =
+            crate::sql::optimizer::convert::opt_expr_to_logical_plan(changed_expr, &arena.borrow());
         let LogicalPlanNodeKind::Union(union) = &changed.kind else {
             panic!("expected Union");
         };
@@ -491,9 +505,15 @@ mod tests {
             None,
         );
 
-        let RewriteResult::Changed(changed) = rule.apply(plan, &mut ctx).expect("expand") else {
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("expand")
+        else {
             panic!("pure join-delta must expand into a Union");
         };
+        let arena = ctx.scalar_arena();
+        let changed =
+            crate::sql::optimizer::convert::opt_expr_to_logical_plan(changed_expr, &arena.borrow());
         let LogicalPlanNodeKind::Union(union) = &changed.kind else {
             panic!("expected Union");
         };
@@ -534,7 +554,9 @@ mod tests {
             None,
         );
 
-        let err = rule.apply(plan, &mut ctx).expect_err("outer must reject");
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let err = rule.apply(expr, &mut ctx).expect_err("outer must reject");
         assert!(err.contains("inner/cross"), "unexpected: {err}");
     }
 
@@ -554,10 +576,16 @@ mod tests {
             None,
         );
 
-        let RewriteResult::Changed(changed) = rule.apply(plan, &mut ctx).expect("expand outer")
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        let RewriteResult::Changed(changed_expr) =
+            rule.apply(expr, &mut ctx).expect("expand outer")
         else {
             panic!("expected Union");
         };
+        let arena = ctx.scalar_arena();
+        let changed =
+            crate::sql::optimizer::convert::opt_expr_to_logical_plan(changed_expr, &arena.borrow());
         let LogicalPlanNodeKind::Union(_) = &changed.kind else {
             panic!("expected Union");
         };
@@ -656,6 +684,9 @@ mod tests {
 
     fn build_ctx() -> RewriteContext {
         let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
+        ctx.set_scalar_arena(std::rc::Rc::new(
+            std::cell::RefCell::new(ScalarArena::new()),
+        ));
         ctx.set_extension::<ImvExtension>(ImvExtension {
             mv_ctx: dummy_rewrite_context(),
             annotation: ImvPlanAnnotation::default(),

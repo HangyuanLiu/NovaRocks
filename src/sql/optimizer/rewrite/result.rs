@@ -1,4 +1,4 @@
-use crate::sql::planner::plan::LogicalPlanNode;
+use crate::sql::optimizer::opt_expr::OptExpr;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RewriteDiagnosticKind {
@@ -34,15 +34,15 @@ impl RewriteDiagnostic {
 #[derive(Clone, Debug)]
 pub(crate) enum RewriteResult {
     Unchanged,
-    Changed(LogicalPlanNode),
+    Changed(OptExpr),
     Rejected(RewriteDiagnostic),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::planner::plan::*;
-    use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind, LogicalValuesNode};
+    use crate::sql::optimizer::operator::{Operator, ValuesOp};
+    use crate::sql::optimizer::opt_expr::OptExpr;
 
     #[test]
     fn rejected_diagnostic_preserves_rule_and_message() {
@@ -64,18 +64,17 @@ mod tests {
     fn rewrite_result_variants_hold_payloads() {
         assert!(matches!(RewriteResult::Unchanged, RewriteResult::Unchanged));
 
-        let changed = RewriteResult::Changed(LogicalPlanNode::new(
-            LogicalPlanNodeKind::Values(LogicalValuesNode {
+        let changed = RewriteResult::Changed(OptExpr::new(
+            Operator::LogicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![],
             }),
             vec![],
-            None,
         ));
         assert!(matches!(
             changed,
-            RewriteResult::Changed(LogicalPlanNode {
-                kind: LogicalPlanNodeKind::Values(_),
+            RewriteResult::Changed(OptExpr {
+                op: Operator::LogicalValues(_),
                 ..
             })
         ));

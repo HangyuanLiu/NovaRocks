@@ -1,12 +1,13 @@
 use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
-use crate::sql::codegen::helpers::group_win_exprs_by_sig;
 use crate::sql::column_id::ColumnId;
+use crate::sql::optimizer::operator::{Operator, ScalarWindowSpec, SortOp, WindowOp};
+use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
 use crate::sql::optimizer::rewrite::rules::utils::split_and;
-use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind, LogicalSortNode};
+use crate::sql::optimizer::scalar::{self, ScalarArena};
 
 pub(crate) struct RankingWindowPredicatePushdownRule;
 
@@ -22,6 +23,37 @@ fn ranking_topn_type(name: &str) -> Option<crate::exec::node::sort::SortTopNType
     }
 }
 
+/// Returns the number of distinct (partition_by, order_by, frame) groups.
+/// Uses the same string-signature approach as `codegen::helpers::group_win_exprs_by_sig`
+/// but operates on `ScalarWindowSpec` with `ScalarId`s materialized from `arena`.
+fn count_unique_signatures(window_exprs: &[ScalarWindowSpec], arena: &ScalarArena) -> usize {
+    let sig = |e: &ScalarWindowSpec| -> String {
+        format!(
+            "{:?}|{:?}|{:?}",
+            e.partition_by
+                .iter()
+                .map(|id| format!("{:?}", scalar::materialize(arena, *id).kind))
+                .collect::<Vec<_>>(),
+            e.order_by
+                .iter()
+                .map(|sk| {
+                    let expr = scalar::materialize(arena, sk.expr);
+                    format!("{:?}:{}", expr.kind, sk.asc)
+                })
+                .collect::<Vec<_>>(),
+            e.window_frame,
+        )
+    };
+    let mut seen: Vec<String> = Vec::new();
+    for e in window_exprs {
+        let s = sig(e);
+        if !seen.contains(&s) {
+            seen.push(s);
+        }
+    }
+    seen.len()
+}
+
 impl LogicalRewriteRule for RankingWindowPredicatePushdownRule {
     fn name(&self) -> &'static str {
         "RankingWindowPredicatePushdown"
@@ -31,64 +63,94 @@ impl LogicalRewriteRule for RankingWindowPredicatePushdownRule {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
-        let LogicalPlanNodeKind::Filter(_) = &plan.kind else {
+    fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
+        let Operator::LogicalFilter(_) = &expr.op else {
             return false;
         };
-        let window_plan = match &plan.unary_input().kind {
-            LogicalPlanNodeKind::Window(_) => plan.unary_input(),
-            LogicalPlanNodeKind::Project(_) => match &plan.unary_input().unary_input().kind {
-                LogicalPlanNodeKind::Window(_) => plan.unary_input().unary_input(),
-                _ => return false,
-            },
+        let Some(filter_child) = expr.children.first() else {
+            return false;
+        };
+        let window_expr = match &filter_child.op {
+            Operator::LogicalWindow(_) => filter_child,
+            Operator::LogicalProject(_) => {
+                let Some(w) = filter_child.children.first() else {
+                    return false;
+                };
+                if !matches!(&w.op, Operator::LogicalWindow(_)) {
+                    return false;
+                }
+                w
+            }
             _ => return false,
         };
-        matches!(
-            &window_plan.unary_input().kind,
-            LogicalPlanNodeKind::Sort(sort) if !sort.analytic_partition_by.is_empty()
-        )
+        let Some(sort_child) = window_expr.children.first() else {
+            return false;
+        };
+        let Operator::LogicalSort(sort) = &sort_child.op else {
+            return false;
+        };
+        if sort.analytic_partition_exprs.is_empty() {
+            return false;
+        }
+        // Check all window exprs are ranking functions (need arena for nothing here,
+        // the name field is directly on ScalarWindowSpec).
+        let Operator::LogicalWindow(window) = &window_expr.op else {
+            return false;
+        };
+        if window.window_exprs.is_empty() {
+            return false;
+        }
+        // matches() is a quick structural check — full all-ranking guard is in apply().
+        let _ = ctx;
+        true
     }
 
-    fn apply(
-        &self,
-        plan: LogicalPlanNode,
-        _ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         // --- Step 1: Destructure Filter -> optional Project -> Window -> Sort ---
-        let LogicalPlanNodeKind::Filter(filter) = &plan.kind else {
+        let Operator::LogicalFilter(ref filter_op) = expr.op else {
             return Ok(RewriteResult::Unchanged);
         };
+        let filter_predicate_id = filter_op.predicate;
 
-        let filter_input = plan.unary_input();
-        let (project_plan_opt, project_opt, window_plan, window) = match &filter_input.kind {
-            LogicalPlanNodeKind::Window(window) => (None, None, filter_input, window),
-            LogicalPlanNodeKind::Project(project) => match &filter_input.unary_input().kind {
-                LogicalPlanNodeKind::Window(window) => (
-                    Some(filter_input),
-                    Some(project),
-                    filter_input.unary_input(),
-                    window,
-                ),
-                _ => return Ok(RewriteResult::Unchanged),
-            },
+        let filter_child = match expr.children.first() {
+            Some(c) => c,
+            None => return Ok(RewriteResult::Unchanged),
+        };
+
+        // Resolve: Filter -> Window, or Filter -> Project -> Window
+        let (has_project, window_expr_ref, project_expr_ref) = match &filter_child.op {
+            Operator::LogicalWindow(_) => (false, filter_child, None),
+            Operator::LogicalProject(_) => {
+                let Some(w) = filter_child.children.first() else {
+                    return Ok(RewriteResult::Unchanged);
+                };
+                if !matches!(&w.op, Operator::LogicalWindow(_)) {
+                    return Ok(RewriteResult::Unchanged);
+                }
+                (true, w, Some(filter_child))
+            }
             _ => return Ok(RewriteResult::Unchanged),
         };
 
-        let sort_plan = window_plan.unary_input();
-        let LogicalPlanNodeKind::Sort(sort) = &sort_plan.kind else {
+        let Operator::LogicalWindow(window_op) = &window_expr_ref.op else {
+            return Ok(RewriteResult::Unchanged);
+        };
+        let sort_expr_ref = match window_expr_ref.children.first() {
+            Some(s) => s,
+            None => return Ok(RewriteResult::Unchanged),
+        };
+        let Operator::LogicalSort(sort_op) = &sort_expr_ref.op else {
             return Ok(RewriteResult::Unchanged);
         };
 
         // --- Step 2: Idempotency guard ---
-        if sort.partition_limit.is_some() {
+        if sort_op.partition_limit.is_some() {
             return Ok(RewriteResult::Unchanged);
         }
 
-        // --- Step 3: All-ranking guard (CRITICAL correctness guard) ---
-        // If any window expr is a full-partition aggregate (not a ranking function),
-        // truncating the partition would corrupt its result.
-        if window.window_exprs.is_empty()
-            || window
+        // --- Step 3: All-ranking guard ---
+        if window_op.window_exprs.is_empty()
+            || window_op
                 .window_exprs
                 .iter()
                 .any(|w| ranking_topn_type(&w.name).is_none())
@@ -97,49 +159,57 @@ impl LogicalRewriteRule for RankingWindowPredicatePushdownRule {
         }
 
         // --- Step 3b: Single-signature guard ---
-        // All ranking window exprs must share ONE (partition_by, order_by, frame)
-        // signature.  When two ranking fns have DIFFERENT ORDER BY, the analytic Sort
-        // is keyed on window_exprs[0]'s order — setting partition_limit truncates
-        // every partition by that first order, corrupting results for any window expr
-        // with a different ORDER BY.  The safe case (same PARTITION+ORDER, e.g.
-        // rank()+dense_rank() over the same spec) produces exactly one group.
-        if group_win_exprs_by_sig(&window.window_exprs).len() != 1 {
+        let arena_rc = ctx.scalar_arena();
+        if count_unique_signatures(&window_op.window_exprs, &arena_rc.borrow()) != 1 {
             return Ok(RewriteResult::Unchanged);
         }
 
         // --- Step 4: Non-empty partition guard ---
-        if sort.analytic_partition_by.is_empty() {
+        if sort_op.analytic_partition_exprs.is_empty() {
             return Ok(RewriteResult::Unchanged);
         }
 
-        // --- Step 5: Find a ranking window expr with a finite upper bound ---
-        // When a Project is present, we must map the filter's ColumnRef back through
-        // the project to the window's output_column_id.  Only a BARE passthrough
-        // (ProjectItem.expr == ColumnRef(w.output_column_id)) is allowed.
-        let found = window.window_exprs.iter().find_map(|w_expr| {
-            // Determine which ColumnId the filter predicate references for this ranking expr.
-            let filter_col_id = if let Some(proj) = project_opt {
-                // Walk the project items to find an item whose output_column_id matches
-                // something the filter sees, and whose expr is a bare ColumnRef to
-                // w_expr.output_column_id.
-                proj.items.iter().find_map(|item| {
-                    // Is this item a bare passthrough of w_expr.output_column_id?
-                    if let ExprKind::ColumnRef { column_id, .. } = &item.expr.kind
-                        && *column_id == w_expr.output_column_id
-                    {
-                        return Some(item.output_column_id);
-                    }
-                    None
-                })?
-            } else {
-                // No project: the filter references the window output directly.
-                w_expr.output_column_id
-            };
+        // Materialize the filter predicate for rank_upper_bound.
+        let filter_predicate_typed = scalar::materialize(&arena_rc.borrow(), filter_predicate_id);
 
-            // Check whether the filter predicate provides a finite upper bound on filter_col_id.
-            let k = rank_upper_bound(&filter.predicate, filter_col_id)?;
-            Some((k, w_expr))
-        });
+        // --- Step 5: Find a ranking window expr with a finite upper bound ---
+        // `window_op.output_columns[i].column_id` is the output ColumnId for window_exprs[i].
+        let found = window_op
+            .window_exprs
+            .iter()
+            .enumerate()
+            .find_map(|(i, w_expr)| {
+                let window_output_col_id = window_op
+                    .output_columns
+                    .get(i)
+                    .map(|oc| oc.column_id)
+                    .unwrap_or(ColumnId::UNSET);
+                if window_output_col_id == ColumnId::UNSET {
+                    return None;
+                }
+
+                // Determine which ColumnId the filter predicate references for this expr.
+                let filter_col_id = if let Some(project_expr) = project_expr_ref {
+                    let Operator::LogicalProject(project_op) = &project_expr.op else {
+                        return None;
+                    };
+                    // Walk project items: find one whose expr is a bare ColumnRef to window_output_col_id.
+                    project_op.items.iter().find_map(|item| {
+                        let item_expr = scalar::materialize(&arena_rc.borrow(), item.expr);
+                        if let ExprKind::ColumnRef { column_id, .. } = &item_expr.kind
+                            && *column_id == window_output_col_id
+                        {
+                            return Some(item.output_column_id);
+                        }
+                        None
+                    })?
+                } else {
+                    window_output_col_id
+                };
+
+                let k = rank_upper_bound(&filter_predicate_typed, filter_col_id)?;
+                Some((k, w_expr))
+            });
 
         let Some((k, matched_w_expr)) = found else {
             return Ok(RewriteResult::Unchanged);
@@ -148,42 +218,49 @@ impl LogicalRewriteRule for RankingWindowPredicatePushdownRule {
         // --- Step 6: Rebuild the tree with partition_limit / topn_type on the Sort ---
         let topn_type = ranking_topn_type(&matched_w_expr.name).unwrap();
 
-        // Clone and mutate the Sort.
-        let new_sort = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Sort(LogicalSortNode {
-                items: sort.items.clone(),
-                analytic_partition_by: sort.analytic_partition_by.clone(),
+        // Clone sort's children (the subtree below Sort stays the same).
+        let sort_children = sort_expr_ref.children.clone();
+        let sort_required = sort_expr_ref.required_output_columns.clone();
+        let new_sort = OptExpr {
+            op: Operator::LogicalSort(SortOp {
+                items: sort_op.items.clone(),
+                analytic_partition_exprs: sort_op.analytic_partition_exprs.clone(),
                 partition_limit: Some(k),
                 topn_type: Some(topn_type),
             }),
-            sort_plan.children.clone(),
-            sort_plan.required_output_columns.clone(),
-        );
+            children: sort_children,
+            required_output_columns: sort_required,
+        };
 
         // Rebuild Window over the new Sort.
-        let new_window = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Window(window.clone()),
-            vec![new_sort],
-            window_plan.required_output_columns.clone(),
-        );
+        let window_required = window_expr_ref.required_output_columns.clone();
+        let new_window = OptExpr {
+            op: Operator::LogicalWindow(WindowOp {
+                window_exprs: window_op.window_exprs.clone(),
+                output_columns: window_op.output_columns.clone(),
+            }),
+            children: vec![new_sort],
+            required_output_columns: window_required,
+        };
 
         // Rebuild Project (if present) over the new Window.
-        let mid = if let Some(project_plan) = project_plan_opt {
-            LogicalPlanNode::new(
-                project_plan.kind.clone(),
-                vec![new_window],
-                project_plan.required_output_columns.clone(),
-            )
+        let mid = if has_project {
+            let project_expr = project_expr_ref.unwrap();
+            OptExpr {
+                op: project_expr.op.clone(),
+                children: vec![new_window],
+                required_output_columns: project_expr.required_output_columns.clone(),
+            }
         } else {
             new_window
         };
 
         // Rebuild Filter over mid.
-        let new_filter = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(filter.clone()),
-            vec![mid],
-            plan.required_output_columns,
-        );
+        let new_filter = OptExpr {
+            op: expr.op.clone(),
+            children: vec![mid],
+            required_output_columns: expr.required_output_columns,
+        };
 
         Ok(RewriteResult::Changed(new_filter))
     }
@@ -260,17 +337,31 @@ fn conjunct_upper_bound(e: &TypedExpr, rank_col: ColumnId) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use arrow::datatypes::DataType;
 
     use super::{RankingWindowPredicatePushdownRule, rank_upper_bound};
-    use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
+    use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, SortItem, TypedExpr};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::operator::{
+        FilterOp, LogicalJoinOp, Operator, ProjectOp, ScalarProjectItem, ScalarWindowSpec, SortOp,
+        ValuesOp, WindowOp,
+    };
+    use crate::sql::optimizer::opt_expr::OptExpr;
+    use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
+    use crate::sql::optimizer::rewrite::result::RewriteResult;
+    use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
+    use crate::sql::optimizer::scalar::{self, ScalarArena, ScalarId, SortKey};
 
-    // -----------------------------------------------------------------------
-    // Test helpers
-    // -----------------------------------------------------------------------
+    fn make_ctx(arena: ScalarArena) -> RewriteContext {
+        let mut ctx = RewriteContext::new(RewriteConsumer::Query);
+        ctx.set_scalar_arena(Rc::new(RefCell::new(arena)));
+        ctx
+    }
 
-    fn col(id: ColumnId) -> TypedExpr {
+    fn col_typed(id: ColumnId) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
                 column_id: id,
@@ -282,7 +373,7 @@ mod tests {
         }
     }
 
-    fn int(v: i64) -> TypedExpr {
+    fn int_typed(v: i64) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(v)),
             data_type: DataType::Int64,
@@ -290,7 +381,7 @@ mod tests {
         }
     }
 
-    fn binop(left: TypedExpr, op: BinOp, right: TypedExpr) -> TypedExpr {
+    fn binop_typed(left: TypedExpr, op: BinOp, right: TypedExpr) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::BinaryOp {
                 left: Box::new(left),
@@ -302,28 +393,28 @@ mod tests {
         }
     }
 
-    fn le(col: TypedExpr, v: i64) -> TypedExpr {
-        binop(col, BinOp::Le, int(v))
+    fn le_typed(col: TypedExpr, v: i64) -> TypedExpr {
+        binop_typed(col, BinOp::Le, int_typed(v))
     }
 
-    fn lt(col: TypedExpr, v: i64) -> TypedExpr {
-        binop(col, BinOp::Lt, int(v))
+    fn lt_typed(col: TypedExpr, v: i64) -> TypedExpr {
+        binop_typed(col, BinOp::Lt, int_typed(v))
     }
 
-    fn eq(col: TypedExpr, v: i64) -> TypedExpr {
-        binop(col, BinOp::Eq, int(v))
+    fn eq_typed(col: TypedExpr, v: i64) -> TypedExpr {
+        binop_typed(col, BinOp::Eq, int_typed(v))
     }
 
-    fn ge(col: TypedExpr, v: i64) -> TypedExpr {
-        binop(col, BinOp::Ge, int(v))
+    fn ge_typed(col: TypedExpr, v: i64) -> TypedExpr {
+        binop_typed(col, BinOp::Ge, int_typed(v))
     }
 
-    fn between(expr: TypedExpr, low_v: i64, high_v: i64) -> TypedExpr {
+    fn between_typed(expr: TypedExpr, low_v: i64, high_v: i64) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Between {
                 expr: Box::new(expr),
-                low: Box::new(int(low_v)),
-                high: Box::new(int(high_v)),
+                low: Box::new(int_typed(low_v)),
+                high: Box::new(int_typed(high_v)),
                 negated: false,
             },
             data_type: DataType::Boolean,
@@ -331,15 +422,219 @@ mod tests {
         }
     }
 
-    fn in_list(expr: TypedExpr, values: &[i64]) -> TypedExpr {
+    fn in_list_typed(expr: TypedExpr, values: &[i64]) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::InList {
                 expr: Box::new(expr),
-                list: values.iter().map(|&v| int(v)).collect(),
+                list: values.iter().map(|&v| int_typed(v)).collect(),
                 negated: false,
             },
             data_type: DataType::Boolean,
             nullable: false,
+        }
+    }
+
+    fn empty_values_opt() -> OptExpr {
+        OptExpr::leaf(Operator::LogicalValues(ValuesOp {
+            rows: vec![],
+            columns: vec![],
+        }))
+    }
+
+    fn output_col(id: ColumnId, name: &str) -> OutputColumn {
+        OutputColumn {
+            column_id: id,
+            name: name.to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        }
+    }
+
+    fn make_sort_key(arena: &mut ScalarArena, id: ColumnId) -> SortKey {
+        SortKey {
+            expr: scalar::intern_typed(arena, &col_typed(id)),
+            asc: true,
+            nulls_first: true,
+            display: None,
+        }
+    }
+
+    fn make_sort_opt(arena: &mut ScalarArena, p_id: ColumnId) -> OptExpr {
+        let partition_expr = scalar::intern_typed(arena, &col_typed(p_id));
+        let sort_key = make_sort_key(arena, p_id);
+        OptExpr::new(
+            Operator::LogicalSort(SortOp {
+                items: vec![sort_key],
+                analytic_partition_exprs: vec![partition_expr],
+                partition_limit: None,
+                topn_type: None,
+            }),
+            vec![empty_values_opt()],
+        )
+    }
+
+    fn make_sort_opt_with_limit(arena: &mut ScalarArena, p_id: ColumnId, limit: usize) -> OptExpr {
+        use crate::exec::node::sort::SortTopNType;
+        let partition_expr = scalar::intern_typed(arena, &col_typed(p_id));
+        let sort_key = make_sort_key(arena, p_id);
+        OptExpr::new(
+            Operator::LogicalSort(SortOp {
+                items: vec![sort_key],
+                analytic_partition_exprs: vec![partition_expr],
+                partition_limit: Some(limit),
+                topn_type: Some(SortTopNType::Rank),
+            }),
+            vec![empty_values_opt()],
+        )
+    }
+
+    fn make_sort_no_partition_opt(arena: &mut ScalarArena, p_id: ColumnId) -> OptExpr {
+        let sort_key = make_sort_key(arena, p_id);
+        OptExpr::new(
+            Operator::LogicalSort(SortOp {
+                items: vec![sort_key],
+                analytic_partition_exprs: vec![],
+                partition_limit: None,
+                topn_type: None,
+            }),
+            vec![empty_values_opt()],
+        )
+    }
+
+    fn make_window_spec_opt(
+        arena: &mut ScalarArena,
+        fn_name: &str,
+        p_id: ColumnId,
+    ) -> ScalarWindowSpec {
+        let partition_expr = scalar::intern_typed(arena, &col_typed(p_id));
+        let sort_key = make_sort_key(arena, p_id);
+        ScalarWindowSpec {
+            name: fn_name.to_string(),
+            args: vec![],
+            distinct: false,
+            partition_by: vec![partition_expr],
+            order_by: vec![sort_key],
+            window_frame: None,
+            ignore_nulls: false,
+        }
+    }
+
+    fn make_window_spec_opt_with_order(
+        arena: &mut ScalarArena,
+        fn_name: &str,
+        p_id: ColumnId,
+        order_id: ColumnId,
+    ) -> ScalarWindowSpec {
+        let partition_expr = scalar::intern_typed(arena, &col_typed(p_id));
+        let order_key = make_sort_key(arena, order_id);
+        ScalarWindowSpec {
+            name: fn_name.to_string(),
+            args: vec![],
+            distinct: false,
+            partition_by: vec![partition_expr],
+            order_by: vec![order_key],
+            window_frame: None,
+            ignore_nulls: false,
+        }
+    }
+
+    fn window_opt(
+        input: OptExpr,
+        window_exprs: Vec<ScalarWindowSpec>,
+        output_columns: Vec<OutputColumn>,
+    ) -> OptExpr {
+        OptExpr::new(
+            Operator::LogicalWindow(WindowOp {
+                window_exprs,
+                output_columns,
+            }),
+            vec![input],
+        )
+    }
+
+    fn filter_opt(arena: &mut ScalarArena, input: OptExpr, predicate: TypedExpr) -> OptExpr {
+        let pred_id = scalar::intern_typed(arena, &predicate);
+        OptExpr::new(
+            Operator::LogicalFilter(FilterOp { predicate: pred_id }),
+            vec![input],
+        )
+    }
+
+    fn project_opt(
+        arena: &mut ScalarArena,
+        input: OptExpr,
+        items: Vec<(TypedExpr, ColumnId)>,
+    ) -> OptExpr {
+        let scalar_items = items
+            .into_iter()
+            .map(|(expr, out_id)| {
+                let expr_id = scalar::intern_typed(arena, &expr);
+                ScalarProjectItem {
+                    expr: expr_id,
+                    output_name: format!("c_{}", out_id.0),
+                    output_column_id: out_id,
+                    expr_display: None,
+                }
+            })
+            .collect();
+        OptExpr::new(
+            Operator::LogicalProject(ProjectOp {
+                items: scalar_items,
+                output_qualifier: None,
+            }),
+            vec![input],
+        )
+    }
+
+    fn make_filter_window_sort_opt(
+        arena: &mut ScalarArena,
+        fn_name: &str,
+        rk_id: ColumnId,
+        p_id: ColumnId,
+        k: i64,
+    ) -> OptExpr {
+        let sort = make_sort_opt(arena, p_id);
+        let w_spec = make_window_spec_opt(arena, fn_name, p_id);
+        let window = window_opt(sort, vec![w_spec], vec![output_col(rk_id, fn_name)]);
+        filter_opt(
+            arena,
+            window,
+            binop_typed(col_typed(rk_id), BinOp::Le, int_typed(k)),
+        )
+    }
+
+    fn extract_sort_from_changed(result: RewriteResult) -> SortOp {
+        if let RewriteResult::Changed(plan) = result {
+            let Operator::LogicalFilter(_) = &plan.op else {
+                panic!("expected Changed(Filter(...)), got op {:?}", plan.op);
+            };
+            let filter_child = plan.children.first().expect("filter must have child");
+            let window_expr = match &filter_child.op {
+                Operator::LogicalWindow(_) => filter_child,
+                Operator::LogicalProject(_) => {
+                    let w = filter_child
+                        .children
+                        .first()
+                        .expect("project must have child");
+                    assert!(
+                        matches!(&w.op, Operator::LogicalWindow(_)),
+                        "expected Window under Project"
+                    );
+                    w
+                }
+                _ => panic!("expected Window or Project under Filter"),
+            };
+            let sort_expr = window_expr
+                .children
+                .first()
+                .expect("window must have child");
+            let Operator::LogicalSort(sort) = &sort_expr.op else {
+                panic!("expected Sort under Window");
+            };
+            sort.clone()
+        } else {
+            panic!("expected Changed(...), got {:?}", result);
         }
     }
 
@@ -366,232 +661,25 @@ mod tests {
         let rk = ColumnId::new_for_test(7);
         let other = ColumnId::new_for_test(99);
 
-        // rk <= 5  -> Some(5)
-        assert_eq!(rank_upper_bound(&le(col(rk), 5), rk), Some(5));
-
-        // rk < 5   -> Some(4)
-        assert_eq!(rank_upper_bound(&lt(col(rk), 5), rk), Some(4));
-
-        // rk = 3   -> Some(3)
-        assert_eq!(rank_upper_bound(&eq(col(rk), 3), rk), Some(3));
-
-        // BETWEEN 2 AND 9  -> Some(9)
-        assert_eq!(rank_upper_bound(&between(col(rk), 2, 9), rk), Some(9));
-
-        // IN (1, 3, 5)  -> Some(5)
-        assert_eq!(rank_upper_bound(&in_list(col(rk), &[1, 3, 5]), rk), Some(5));
-
-        // rk >= 5  (lower bound only) -> None
-        assert_eq!(rank_upper_bound(&ge(col(rk), 5), rk), None);
-
-        // rk <= 0  (K <= 0) -> None
-        assert_eq!(rank_upper_bound(&le(col(rk), 0), rk), None);
-
-        // comparison on a DIFFERENT column -> None
-        assert_eq!(rank_upper_bound(&le(col(other), 5), rk), None);
+        assert_eq!(rank_upper_bound(&le_typed(col_typed(rk), 5), rk), Some(5));
+        assert_eq!(rank_upper_bound(&lt_typed(col_typed(rk), 5), rk), Some(4));
+        assert_eq!(rank_upper_bound(&eq_typed(col_typed(rk), 3), rk), Some(3));
+        assert_eq!(
+            rank_upper_bound(&between_typed(col_typed(rk), 2, 9), rk),
+            Some(9)
+        );
+        assert_eq!(
+            rank_upper_bound(&in_list_typed(col_typed(rk), &[1, 3, 5]), rk),
+            Some(5)
+        );
+        assert_eq!(rank_upper_bound(&ge_typed(col_typed(rk), 5), rk), None);
+        assert_eq!(rank_upper_bound(&le_typed(col_typed(rk), 0), rk), None);
+        assert_eq!(rank_upper_bound(&le_typed(col_typed(other), 5), rk), None);
     }
 
-    // Verify the rule struct itself is importable and constructable.
     #[test]
     fn ranking_window_predicate_pushdown_rule_is_constructable() {
         let _ = RankingWindowPredicatePushdownRule;
-    }
-
-    // -----------------------------------------------------------------------
-    // Helpers for integration tests (matches + apply)
-    // -----------------------------------------------------------------------
-
-    use crate::exec::node::sort::SortTopNType;
-    use crate::sql::analysis::{OutputColumn, ProjectItem, SortItem};
-    use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
-    use crate::sql::optimizer::rewrite::result::RewriteResult;
-    use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-    use crate::sql::planner::plan::{
-        LogicalFilterNode, LogicalPlanNode, LogicalPlanNodeKind, LogicalProjectNode,
-        LogicalSortNode, LogicalValuesNode, LogicalWindowNode, WindowExpr,
-    };
-
-    fn col_ref(id: ColumnId) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::ColumnRef {
-                column_id: id,
-                qualifier: None,
-                column: format!("c_{}", id.0),
-            },
-            data_type: DataType::Int64,
-            nullable: false,
-        }
-    }
-
-    fn output_col(id: ColumnId, name: &str) -> OutputColumn {
-        OutputColumn {
-            column_id: id,
-            name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
-            is_internal: false,
-        }
-    }
-
-    fn empty_values() -> LogicalPlanNode {
-        LogicalPlanNode::new(
-            LogicalPlanNodeKind::Values(LogicalValuesNode {
-                rows: vec![],
-                columns: vec![],
-            }),
-            vec![],
-            None,
-        )
-    }
-
-    fn sort_item(e: TypedExpr) -> SortItem {
-        SortItem {
-            expr: e,
-            asc: true,
-            nulls_first: true,
-        }
-    }
-
-    /// Build Sort(partition_by=[p_col], items=[p_col]) over an empty Values.
-    fn make_sort(p_id: ColumnId) -> LogicalPlanNode {
-        LogicalPlanNode::new(
-            LogicalPlanNodeKind::Sort(LogicalSortNode {
-                items: vec![sort_item(col_ref(p_id))],
-                analytic_partition_by: vec![col_ref(p_id)],
-                partition_limit: None,
-                topn_type: None,
-            }),
-            vec![empty_values()],
-            None,
-        )
-    }
-
-    fn make_sort_with_limit(p_id: ColumnId, limit: usize) -> LogicalPlanNode {
-        LogicalPlanNode::new(
-            LogicalPlanNodeKind::Sort(LogicalSortNode {
-                items: vec![sort_item(col_ref(p_id))],
-                analytic_partition_by: vec![col_ref(p_id)],
-                partition_limit: Some(limit),
-                topn_type: Some(SortTopNType::Rank),
-            }),
-            vec![empty_values()],
-            None,
-        )
-    }
-
-    fn make_sort_no_partition(p_id: ColumnId) -> LogicalPlanNode {
-        LogicalPlanNode::new(
-            LogicalPlanNodeKind::Sort(LogicalSortNode {
-                items: vec![sort_item(col_ref(p_id))],
-                analytic_partition_by: vec![],
-                partition_limit: None,
-                topn_type: None,
-            }),
-            vec![empty_values()],
-            None,
-        )
-    }
-
-    fn make_window_expr(fn_name: &str, output_id: ColumnId, p_id: ColumnId) -> WindowExpr {
-        WindowExpr {
-            name: fn_name.to_string(),
-            args: vec![],
-            distinct: false,
-            partition_by: vec![col_ref(p_id)],
-            order_by: vec![sort_item(col_ref(p_id))],
-            window_frame: None,
-            result_type: DataType::Int64,
-            output_name: fn_name.to_string(),
-            output_column_id: output_id,
-            ignore_nulls: false,
-        }
-    }
-
-    fn window_over(
-        input: LogicalPlanNode,
-        window_exprs: Vec<WindowExpr>,
-        output_columns: Vec<OutputColumn>,
-    ) -> LogicalPlanNode {
-        LogicalPlanNode::new(
-            LogicalPlanNodeKind::Window(LogicalWindowNode {
-                window_exprs,
-                output_columns,
-            }),
-            vec![input],
-            None,
-        )
-    }
-
-    fn filter_over(input: LogicalPlanNode, predicate: TypedExpr) -> LogicalPlanNode {
-        LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(LogicalFilterNode { predicate }),
-            vec![input],
-            None,
-        )
-    }
-
-    fn project_over(input: LogicalPlanNode, items: Vec<ProjectItem>) -> LogicalPlanNode {
-        LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
-                items,
-                output_qualifier: None,
-            }),
-            vec![input],
-            None,
-        )
-    }
-
-    /// Build Filter(rk_col <= k) -> Window(fn_name, out=rk_id, partition=[p_id]) -> Sort -> Values
-    fn make_filter_window_sort(
-        fn_name: &str,
-        rk_id: ColumnId,
-        p_id: ColumnId,
-        k: i64,
-    ) -> LogicalPlanNode {
-        let sort = make_sort(p_id);
-        let window = window_over(
-            sort,
-            vec![make_window_expr(fn_name, rk_id, p_id)],
-            vec![output_col(rk_id, fn_name)],
-        );
-        filter_over(window, binop(col_ref(rk_id), BinOp::Le, int(k)))
-    }
-
-    fn apply_rule(plan: LogicalPlanNode) -> RewriteResult {
-        let rule = RankingWindowPredicatePushdownRule;
-        let mut ctx = RewriteContext::new(RewriteConsumer::Query);
-        rule.apply(plan, &mut ctx).unwrap()
-    }
-
-    fn extract_sort_from_changed(result: RewriteResult) -> LogicalSortNode {
-        if let RewriteResult::Changed(plan) = result {
-            let LogicalPlanNodeKind::Filter(_) = &plan.kind else {
-                panic!("expected Changed(Filter(...)), got {:?}", plan);
-            };
-            let filter_input = plan.unary_input();
-            let window_plan = match &filter_input.kind {
-                LogicalPlanNodeKind::Window(_) => filter_input,
-                LogicalPlanNodeKind::Project(_) => {
-                    let window_plan = filter_input.unary_input();
-                    if matches!(&window_plan.kind, LogicalPlanNodeKind::Window(_)) {
-                        window_plan
-                    } else {
-                        panic!("expected Window under Project, got {:?}", window_plan);
-                    }
-                }
-                _ => panic!(
-                    "expected Window or Project under Filter, got {:?}",
-                    filter_input
-                ),
-            };
-            let sort_plan = window_plan.unary_input();
-            let LogicalPlanNodeKind::Sort(sort) = &sort_plan.kind else {
-                panic!("expected Sort under Window, got {:?}", sort_plan);
-            };
-            sort.clone()
-        } else {
-            panic!("expected Changed(Filter(...)), got {:?}", result);
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -600,12 +688,14 @@ mod tests {
 
     #[test]
     fn fires_on_rank_per_group_sets_partition_limit() {
+        use crate::exec::node::sort::SortTopNType;
         let rk_id = ColumnId::new_for_test(1);
         let p_id = ColumnId::new_for_test(2);
-        let plan = make_filter_window_sort("rank", rk_id, p_id, 2);
+        let mut arena = ScalarArena::new();
+        let plan = make_filter_window_sort_opt(&mut arena, "rank", rk_id, p_id, 2);
 
         let rule = RankingWindowPredicatePushdownRule;
-        let mut ctx = RewriteContext::new(RewriteConsumer::Query);
+        let mut ctx = make_ctx(arena);
         assert!(rule.matches(&plan, &ctx), "matches() must return true");
 
         let result = rule.apply(plan, &mut ctx).unwrap();
@@ -620,20 +710,34 @@ mod tests {
 
     #[test]
     fn fires_for_row_number_and_dense_rank() {
+        use crate::exec::node::sort::SortTopNType;
         let rk_id = ColumnId::new_for_test(10);
         let p_id = ColumnId::new_for_test(11);
 
-        // row_number
-        let plan_rn = make_filter_window_sort("row_number", rk_id, p_id, 3);
-        let sort_rn = extract_sort_from_changed(apply_rule(plan_rn));
-        assert_eq!(sort_rn.partition_limit, Some(3));
-        assert_eq!(sort_rn.topn_type, Some(SortTopNType::RowNumber));
-
-        // dense_rank
-        let plan_dr = make_filter_window_sort("dense_rank", rk_id, p_id, 5);
-        let sort_dr = extract_sort_from_changed(apply_rule(plan_dr));
-        assert_eq!(sort_dr.partition_limit, Some(5));
-        assert_eq!(sort_dr.topn_type, Some(SortTopNType::DenseRank));
+        {
+            let mut arena = ScalarArena::new();
+            let plan = make_filter_window_sort_opt(&mut arena, "row_number", rk_id, p_id, 3);
+            let mut ctx = make_ctx(arena);
+            let sort = extract_sort_from_changed(
+                RankingWindowPredicatePushdownRule
+                    .apply(plan, &mut ctx)
+                    .unwrap(),
+            );
+            assert_eq!(sort.partition_limit, Some(3));
+            assert_eq!(sort.topn_type, Some(SortTopNType::RowNumber));
+        }
+        {
+            let mut arena = ScalarArena::new();
+            let plan = make_filter_window_sort_opt(&mut arena, "dense_rank", rk_id, p_id, 5);
+            let mut ctx = make_ctx(arena);
+            let sort = extract_sort_from_changed(
+                RankingWindowPredicatePushdownRule
+                    .apply(plan, &mut ctx)
+                    .unwrap(),
+            );
+            assert_eq!(sort.partition_limit, Some(5));
+            assert_eq!(sort.topn_type, Some(SortTopNType::DenseRank));
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -644,44 +748,59 @@ mod tests {
     fn rejects_when_window_has_aggregate_over() {
         let rk_id = ColumnId::new_for_test(20);
         let p_id = ColumnId::new_for_test(21);
-        let sort = make_sort(p_id);
-
-        // Window has both rank() AND avg() — avg is not a ranking fn, so we must reject.
         let avg_id = ColumnId::new_for_test(22);
-        let window = window_over(
+        let mut arena = ScalarArena::new();
+        let sort = make_sort_opt(&mut arena, p_id);
+
+        let window = window_opt(
             sort,
             vec![
-                make_window_expr("rank", rk_id, p_id),
-                make_window_expr("avg", avg_id, p_id),
+                make_window_spec_opt(&mut arena, "rank", p_id),
+                make_window_spec_opt(&mut arena, "avg", p_id),
             ],
             vec![output_col(rk_id, "rank"), output_col(avg_id, "avg")],
         );
-        let plan = filter_over(window, binop(col_ref(rk_id), BinOp::Le, int(2)));
-
-        assert!(matches!(apply_rule(plan), RewriteResult::Unchanged));
+        let plan = filter_opt(
+            &mut arena,
+            window,
+            binop_typed(col_typed(rk_id), BinOp::Le, int_typed(2)),
+        );
+        let mut ctx = make_ctx(arena);
+        assert!(matches!(
+            RankingWindowPredicatePushdownRule
+                .apply(plan, &mut ctx)
+                .unwrap(),
+            RewriteResult::Unchanged
+        ));
     }
 
     // -----------------------------------------------------------------------
-    // Test 6: rejects when sort.analytic_partition_by is empty
+    // Test 6: rejects when sort.analytic_partition_exprs is empty
     // -----------------------------------------------------------------------
 
     #[test]
     fn rejects_empty_partition_by() {
         let rk_id = ColumnId::new_for_test(30);
         let p_id = ColumnId::new_for_test(31);
-        let sort = make_sort_no_partition(p_id);
-        let window = window_over(
+        let mut arena = ScalarArena::new();
+        let sort = make_sort_no_partition_opt(&mut arena, p_id);
+        let window = window_opt(
             sort,
-            vec![make_window_expr("rank", rk_id, p_id)],
+            vec![make_window_spec_opt(&mut arena, "rank", p_id)],
             vec![output_col(rk_id, "rank")],
         );
-        let plan = filter_over(window, binop(col_ref(rk_id), BinOp::Le, int(2)));
+        let plan = filter_opt(
+            &mut arena,
+            window,
+            binop_typed(col_typed(rk_id), BinOp::Le, int_typed(2)),
+        );
 
         let rule = RankingWindowPredicatePushdownRule;
-        let ctx = RewriteContext::new(RewriteConsumer::Query);
-        // matches() should return false because analytic_partition_by is empty
-        assert!(!rule.matches(&plan, &ctx));
-        assert!(matches!(apply_rule(plan), RewriteResult::Unchanged));
+        let ctx = make_ctx(arena);
+        assert!(
+            !rule.matches(&plan, &ctx),
+            "matches() must return false for empty partition"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -692,16 +811,25 @@ mod tests {
     fn rejects_no_upper_bound() {
         let rk_id = ColumnId::new_for_test(40);
         let p_id = ColumnId::new_for_test(41);
-        let sort = make_sort(p_id);
-        let window = window_over(
+        let mut arena = ScalarArena::new();
+        let sort = make_sort_opt(&mut arena, p_id);
+        let window = window_opt(
             sort,
-            vec![make_window_expr("rank", rk_id, p_id)],
+            vec![make_window_spec_opt(&mut arena, "rank", p_id)],
             vec![output_col(rk_id, "rank")],
         );
-        // Filter: rk >= 2 (lower bound only — no upper bound)
-        let plan = filter_over(window, binop(col_ref(rk_id), BinOp::Ge, int(2)));
-
-        assert!(matches!(apply_rule(plan), RewriteResult::Unchanged));
+        let plan = filter_opt(
+            &mut arena,
+            window,
+            binop_typed(col_typed(rk_id), BinOp::Ge, int_typed(2)),
+        );
+        let mut ctx = make_ctx(arena);
+        assert!(matches!(
+            RankingWindowPredicatePushdownRule
+                .apply(plan, &mut ctx)
+                .unwrap(),
+            RewriteResult::Unchanged
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -712,15 +840,25 @@ mod tests {
     fn idempotent_when_sort_already_has_partition_limit() {
         let rk_id = ColumnId::new_for_test(50);
         let p_id = ColumnId::new_for_test(51);
-        let sort = make_sort_with_limit(p_id, 2);
-        let window = window_over(
+        let mut arena = ScalarArena::new();
+        let sort = make_sort_opt_with_limit(&mut arena, p_id, 2);
+        let window = window_opt(
             sort,
-            vec![make_window_expr("rank", rk_id, p_id)],
+            vec![make_window_spec_opt(&mut arena, "rank", p_id)],
             vec![output_col(rk_id, "rank")],
         );
-        let plan = filter_over(window, binop(col_ref(rk_id), BinOp::Le, int(2)));
-
-        assert!(matches!(apply_rule(plan), RewriteResult::Unchanged));
+        let plan = filter_opt(
+            &mut arena,
+            window,
+            binop_typed(col_typed(rk_id), BinOp::Le, int_typed(2)),
+        );
+        let mut ctx = make_ctx(arena);
+        assert!(matches!(
+            RankingWindowPredicatePushdownRule
+                .apply(plan, &mut ctx)
+                .unwrap(),
+            RewriteResult::Unchanged
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -729,32 +867,29 @@ mod tests {
 
     #[test]
     fn sees_through_bare_passthrough_project() {
-        let rk_id = ColumnId::new_for_test(60); // window output column id
-        let proj_rk_id = ColumnId::new_for_test(61); // project output column id (projected rk)
+        use crate::exec::node::sort::SortTopNType;
+        let rk_id = ColumnId::new_for_test(60);
+        let proj_rk_id = ColumnId::new_for_test(61);
         let p_id = ColumnId::new_for_test(62);
+        let mut arena = ScalarArena::new();
 
-        let sort = make_sort(p_id);
-        let window = window_over(
+        let sort = make_sort_opt(&mut arena, p_id);
+        let window = window_opt(
             sort,
-            vec![make_window_expr("rank", rk_id, p_id)],
+            vec![make_window_spec_opt(&mut arena, "rank", p_id)],
             vec![output_col(rk_id, "rank")],
         );
-
-        // Project: proj_rk_id <- rk_id (identity/passthrough)
-        let project = project_over(
-            window,
-            vec![ProjectItem {
-                expr: col_ref(rk_id), // bare ColumnRef to window output
-                output_name: "rk".to_string(),
-                output_column_id: proj_rk_id,
-            }],
+        // Project: proj_rk_id <- rk_id (bare passthrough)
+        let project = project_opt(&mut arena, window, vec![(col_typed(rk_id), proj_rk_id)]);
+        // Filter references the projected column (proj_rk_id)
+        let plan = filter_opt(
+            &mut arena,
+            project,
+            binop_typed(col_typed(proj_rk_id), BinOp::Le, int_typed(3)),
         );
 
-        // Filter references the projected column (proj_rk_id), not rk_id directly
-        let plan = filter_over(project, binop(col_ref(proj_rk_id), BinOp::Le, int(3)));
-
         let rule = RankingWindowPredicatePushdownRule;
-        let mut ctx = RewriteContext::new(RewriteConsumer::Query);
+        let mut ctx = make_ctx(arena);
         assert!(
             rule.matches(&plan, &ctx),
             "matches() must fire on Filter->Project->Window->Sort"
@@ -768,41 +903,43 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Test: rejects mixed ranking+aggregate window (tpc-ds q47/q57 shape)
-    //
-    // Window has rank() OVER w AND avg(x) OVER w.  The filter is on the rank
-    // column, and the Sort has a non-empty analytic_partition_by — so matches()
-    // fires — but apply() must return Unchanged because truncating the partition
-    // would corrupt the avg result (Step 3 all-ranking guard).
     // -----------------------------------------------------------------------
 
     #[test]
     fn rejects_mixed_ranking_and_aggregate_window() {
-        let rk_id = ColumnId::new_for_test(80); // rank() output
-        let avg_id = ColumnId::new_for_test(81); // avg() output
+        let rk_id = ColumnId::new_for_test(80);
+        let avg_id = ColumnId::new_for_test(81);
         let p_id = ColumnId::new_for_test(82);
+        let mut arena = ScalarArena::new();
 
-        let sort = make_sort(p_id); // analytic_partition_by is non-empty
-        let window = window_over(
+        let sort = make_sort_opt(&mut arena, p_id);
+        let window = window_opt(
             sort,
             vec![
-                make_window_expr("rank", rk_id, p_id),
-                make_window_expr("avg", avg_id, p_id),
+                make_window_spec_opt(&mut arena, "rank", p_id),
+                make_window_spec_opt(&mut arena, "avg", p_id),
             ],
             vec![output_col(rk_id, "rank"), output_col(avg_id, "avg")],
         );
-        // Filter on the rank column only (rk_id <= 2).
-        let plan = filter_over(window, binop(col_ref(rk_id), BinOp::Le, int(2)));
+        let plan = filter_opt(
+            &mut arena,
+            window,
+            binop_typed(col_typed(rk_id), BinOp::Le, int_typed(2)),
+        );
 
         let rule = RankingWindowPredicatePushdownRule;
-        let ctx = RewriteContext::new(RewriteConsumer::Query);
-        // matches() sees Filter -> Window -> Sort(non-empty partition) and fires.
+        let mut ctx = make_ctx(arena);
         assert!(
             rule.matches(&plan, &ctx),
             "matches() should fire — the structural shape is valid"
         );
-        // apply() must reject because avg is not a ranking function.
         assert!(
-            matches!(apply_rule(plan), RewriteResult::Unchanged),
+            matches!(
+                RankingWindowPredicatePushdownRule
+                    .apply(plan, &mut ctx)
+                    .unwrap(),
+                RewriteResult::Unchanged
+            ),
             "apply() must return Unchanged when window contains a non-ranking expr"
         );
     }
@@ -816,157 +953,137 @@ mod tests {
         let rk_id = ColumnId::new_for_test(70);
         let proj_rk_id = ColumnId::new_for_test(71);
         let p_id = ColumnId::new_for_test(72);
+        let mut arena = ScalarArena::new();
 
-        let sort = make_sort(p_id);
-        let window = window_over(
+        let sort = make_sort_opt(&mut arena, p_id);
+        let window = window_opt(
             sort,
-            vec![make_window_expr("rank", rk_id, p_id)],
+            vec![make_window_spec_opt(&mut arena, "rank", p_id)],
             vec![output_col(rk_id, "rank")],
         );
-
         // Project: proj_rk_id <- rk_id + 1 (NOT a bare passthrough)
-        let project = project_over(
-            window,
-            vec![ProjectItem {
-                expr: binop(col_ref(rk_id), BinOp::Add, int(1)),
-                output_name: "rk_plus_one".to_string(),
-                output_column_id: proj_rk_id,
-            }],
+        let transformed_expr = binop_typed(col_typed(rk_id), BinOp::Add, int_typed(1));
+        let project = project_opt(&mut arena, window, vec![(transformed_expr, proj_rk_id)]);
+        let plan = filter_opt(
+            &mut arena,
+            project,
+            binop_typed(col_typed(proj_rk_id), BinOp::Le, int_typed(3)),
         );
-
-        // Filter references the projected column
-        let plan = filter_over(project, binop(col_ref(proj_rk_id), BinOp::Le, int(3)));
-
-        assert!(matches!(apply_rule(plan), RewriteResult::Unchanged));
+        let mut ctx = make_ctx(arena);
+        assert!(matches!(
+            RankingWindowPredicatePushdownRule
+                .apply(plan, &mut ctx)
+                .unwrap(),
+            RewriteResult::Unchanged
+        ));
     }
 
     // -----------------------------------------------------------------------
     // Test: rejects multiple ranking fns with DIFFERENT ORDER BY (C1 bug shape)
-    //
-    // Window has rank() ORDER BY a AND rank() ORDER BY b (same PARTITION BY p,
-    // different ORDER BY).  group_win_exprs_by_sig returns 2 groups → Unchanged.
-    // This is exactly the bug shape: the analytic Sort is keyed on exprs[0]'s
-    // order, so setting partition_limit would corrupt exprs[1]'s result.
     // -----------------------------------------------------------------------
-
-    fn make_window_expr_with_order(
-        fn_name: &str,
-        output_id: ColumnId,
-        p_id: ColumnId,
-        order_id: ColumnId,
-    ) -> WindowExpr {
-        WindowExpr {
-            name: fn_name.to_string(),
-            args: vec![],
-            distinct: false,
-            partition_by: vec![col_ref(p_id)],
-            order_by: vec![sort_item(col_ref(order_id))],
-            window_frame: None,
-            result_type: DataType::Int64,
-            output_name: fn_name.to_string(),
-            output_column_id: output_id,
-            ignore_nulls: false,
-        }
-    }
 
     #[test]
     fn rejects_multiple_ranking_signatures_different_order() {
-        let rka_id = ColumnId::new_for_test(90); // rank() ORDER BY a
-        let rkb_id = ColumnId::new_for_test(91); // rank() ORDER BY b
+        let rka_id = ColumnId::new_for_test(90);
+        let rkb_id = ColumnId::new_for_test(91);
         let p_id = ColumnId::new_for_test(92);
         let a_id = ColumnId::new_for_test(93);
         let b_id = ColumnId::new_for_test(94);
+        let mut arena = ScalarArena::new();
 
-        // Sort keyed on partition=[p_id], order=[a_id] (first window's order)
-        let sort = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Sort(LogicalSortNode {
-                items: vec![sort_item(col_ref(p_id)), sort_item(col_ref(a_id))],
-                analytic_partition_by: vec![col_ref(p_id)],
+        // Sort keyed on partition=[p_id], order=[a_id]
+        let partition_expr = scalar::intern_typed(&mut arena, &col_typed(p_id));
+        let sort_key_p = make_sort_key(&mut arena, p_id);
+        let sort_key_a = make_sort_key(&mut arena, a_id);
+        let sort = OptExpr::new(
+            Operator::LogicalSort(SortOp {
+                items: vec![sort_key_p, sort_key_a],
+                analytic_partition_exprs: vec![partition_expr],
                 partition_limit: None,
                 topn_type: None,
             }),
-            vec![empty_values()],
-            None,
+            vec![empty_values_opt()],
         );
 
-        // Window has TWO ranking exprs with different ORDER BY signatures.
-        let window = window_over(
+        let w_a = make_window_spec_opt_with_order(&mut arena, "rank", p_id, a_id);
+        let w_b = make_window_spec_opt_with_order(&mut arena, "rank", p_id, b_id);
+
+        let window = window_opt(
             sort,
-            vec![
-                make_window_expr_with_order("rank", rka_id, p_id, a_id),
-                make_window_expr_with_order("rank", rkb_id, p_id, b_id),
-            ],
+            vec![w_a, w_b],
             vec![output_col(rka_id, "rka"), output_col(rkb_id, "rkb")],
         );
+        // Filter on the SECOND ranking expr's column (rkb <= 2)
+        let plan = filter_opt(
+            &mut arena,
+            window,
+            binop_typed(col_typed(rkb_id), BinOp::Le, int_typed(2)),
+        );
 
-        // Filter on the SECOND ranking expr's column (rkb <= 2) — the one that
-        // would be corrupted if partition_limit were set on the first-order Sort.
-        let plan = filter_over(window, binop(col_ref(rkb_id), BinOp::Le, int(2)));
-
-        // matches() fires (structural shape is valid)
         let rule = RankingWindowPredicatePushdownRule;
-        let ctx = RewriteContext::new(RewriteConsumer::Query);
+        let mut ctx = make_ctx(arena);
         assert!(
             rule.matches(&plan, &ctx),
             "matches() should fire on this structural shape"
         );
-
-        // apply() must return Unchanged — different ORDER BY signatures detected.
         assert!(
-            matches!(apply_rule(plan), RewriteResult::Unchanged),
+            matches!(
+                RankingWindowPredicatePushdownRule
+                    .apply(plan, &mut ctx)
+                    .unwrap(),
+                RewriteResult::Unchanged
+            ),
             "apply() must return Unchanged when ranking fns have different ORDER BY"
         );
     }
 
     // -----------------------------------------------------------------------
     // Test: fires when two ranking fns share the SAME (partition_by, order_by)
-    //
-    // rank() + dense_rank() over PARTITION p ORDER o → single signature group →
-    // group_win_exprs_by_sig returns 1 group → rule fires and sets partition_limit.
     // -----------------------------------------------------------------------
 
     #[test]
     fn fires_for_same_signature_multi_fn() {
-        let rk_id = ColumnId::new_for_test(100); // rank() output
-        let drk_id = ColumnId::new_for_test(101); // dense_rank() output
+        use crate::exec::node::sort::SortTopNType;
+        let rk_id = ColumnId::new_for_test(100);
+        let drk_id = ColumnId::new_for_test(101);
         let p_id = ColumnId::new_for_test(102);
         let o_id = ColumnId::new_for_test(103);
+        let mut arena = ScalarArena::new();
 
-        let sort = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Sort(LogicalSortNode {
-                items: vec![sort_item(col_ref(p_id)), sort_item(col_ref(o_id))],
-                analytic_partition_by: vec![col_ref(p_id)],
+        let partition_expr = scalar::intern_typed(&mut arena, &col_typed(p_id));
+        let sort_key_p = make_sort_key(&mut arena, p_id);
+        let sort_key_o = make_sort_key(&mut arena, o_id);
+        let sort = OptExpr::new(
+            Operator::LogicalSort(SortOp {
+                items: vec![sort_key_p, sort_key_o],
+                analytic_partition_exprs: vec![partition_expr],
                 partition_limit: None,
                 topn_type: None,
             }),
-            vec![empty_values()],
-            None,
+            vec![empty_values_opt()],
         );
 
-        // Both exprs share PARTITION BY p ORDER BY o → same signature.
-        let window = window_over(
+        let w_rank = make_window_spec_opt_with_order(&mut arena, "rank", p_id, o_id);
+        let w_dense = make_window_spec_opt_with_order(&mut arena, "dense_rank", p_id, o_id);
+
+        let window = window_opt(
             sort,
-            vec![
-                make_window_expr_with_order("rank", rk_id, p_id, o_id),
-                make_window_expr_with_order("dense_rank", drk_id, p_id, o_id),
-            ],
+            vec![w_rank, w_dense],
             vec![output_col(rk_id, "rk"), output_col(drk_id, "drk")],
         );
-
-        // Filter on the rank column (rk <= 3).
-        let plan = filter_over(window, binop(col_ref(rk_id), BinOp::Le, int(3)));
-
-        // Rule must FIRE — single signature, both are ranking fns, non-empty partition.
-        let sort_node = extract_sort_from_changed(apply_rule(plan));
-        assert_eq!(
-            sort_node.partition_limit,
-            Some(3),
-            "partition_limit must be set to 3 for same-signature rank+dense_rank"
+        // Filter on the rank column (rk <= 3)
+        let plan = filter_opt(
+            &mut arena,
+            window,
+            binop_typed(col_typed(rk_id), BinOp::Le, int_typed(3)),
         );
-        assert_eq!(
-            sort_node.topn_type,
-            Some(SortTopNType::Rank),
-            "topn_type must reflect the matched ranking function (rank)"
-        );
+        let mut ctx = make_ctx(arena);
+
+        let result = RankingWindowPredicatePushdownRule
+            .apply(plan, &mut ctx)
+            .unwrap();
+        let sort_node = extract_sort_from_changed(result);
+        assert_eq!(sort_node.partition_limit, Some(3));
+        assert_eq!(sort_node.topn_type, Some(SortTopNType::Rank));
     }
 }

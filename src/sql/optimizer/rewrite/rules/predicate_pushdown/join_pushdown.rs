@@ -39,12 +39,33 @@ impl RewriteRule for PushDownPredicateJoin {
         "PushDownPredicateJoin"
     }
 
-    fn matches(&self, plan: &LogicalPlanNode) -> bool {
-        matches!(&plan.kind, LogicalPlanNodeKind::Filter(_) if matches!(&plan.unary_input().kind, LogicalPlanNodeKind::Join(_))
-        )
+    fn matches(&self, expr: &crate::sql::optimizer::opt_expr::OptExpr) -> bool {
+        use crate::sql::optimizer::operator::Operator;
+        matches!(&expr.op, Operator::LogicalFilter(_))
+            && !expr.children.is_empty()
+            && matches!(&expr.children[0].op, Operator::LogicalJoin(_))
     }
 
-    fn apply(&self, plan: LogicalPlanNode) -> Option<LogicalPlanNode> {
+    fn apply(
+        &self,
+        expr: crate::sql::optimizer::opt_expr::OptExpr,
+    ) -> Option<crate::sql::optimizer::opt_expr::OptExpr> {
+        use crate::sql::optimizer::convert::{logical_plan_to_opt_expr, opt_expr_to_logical_plan};
+        use crate::sql::optimizer::scalar::ScalarArena;
+        let mut scalars = ScalarArena::new();
+        let plan = opt_expr_to_logical_plan(expr, &scalars);
+        let result = self.apply_with_logical(plan)?;
+        Some(logical_plan_to_opt_expr(&result, &mut scalars))
+    }
+}
+
+#[cfg(test)]
+impl PushDownPredicateJoin {
+    pub(crate) fn matches_logical(&self, plan: &LogicalPlanNode) -> bool {
+        matches!(&plan.kind, LogicalPlanNodeKind::Filter(_) if matches!(&plan.unary_input().kind, LogicalPlanNodeKind::Join(_)))
+    }
+
+    pub(crate) fn apply_with_logical(&self, plan: LogicalPlanNode) -> Option<LogicalPlanNode> {
         let LogicalPlanNode {
             kind,
             mut children,
@@ -888,7 +909,9 @@ mod tests {
             None,
         );
 
-        let out = PushDownPredicateJoin.apply(filter).expect("should rewrite");
+        let out = PushDownPredicateJoin
+            .apply_with_logical(filter)
+            .expect("should rewrite");
         let LogicalPlanNodeKind::Join(join) = &out.kind else {
             panic!("expected Join after OR side-filter extraction");
         };
@@ -929,7 +952,9 @@ mod tests {
             None,
         );
 
-        let out = PushDownPredicateJoin.apply(plan).expect("should rewrite");
+        let out = PushDownPredicateJoin
+            .apply_with_logical(plan)
+            .expect("should rewrite");
         let LogicalPlanNodeKind::Join(join) = &out.kind else {
             panic!("expected Join after predicate merge");
         };
@@ -972,8 +997,8 @@ mod tests {
         );
 
         let rule = PushDownPredicateJoin;
-        assert!(rule.matches(&filter));
-        let out = rule.apply(filter).expect("should rewrite");
+        assert!(rule.matches_logical(&filter));
+        let out = rule.apply_with_logical(filter).expect("should rewrite");
 
         // Expected shape: Join(Filter(t1), t2) — no outer Filter
         match &out.kind {
@@ -1010,8 +1035,8 @@ mod tests {
         );
 
         let rule = PushDownPredicateJoin;
-        assert!(rule.matches(&filter));
-        let out = rule.apply(filter).expect("should rewrite");
+        assert!(rule.matches_logical(&filter));
+        let out = rule.apply_with_logical(filter).expect("should rewrite");
 
         match &out.kind {
             LogicalPlanNodeKind::Join(j) => {
@@ -1047,8 +1072,8 @@ mod tests {
         );
 
         let rule = PushDownPredicateJoin;
-        assert!(rule.matches(&filter));
-        let out = rule.apply(filter).expect("should rewrite");
+        assert!(rule.matches_logical(&filter));
+        let out = rule.apply_with_logical(filter).expect("should rewrite");
 
         // Expected: INNER join with condition — no outer Filter
         match &out.kind {
@@ -1093,10 +1118,10 @@ mod tests {
         );
 
         let rule = PushDownPredicateJoin;
-        assert!(rule.matches(&filter));
+        assert!(rule.matches_logical(&filter));
         // The predicate references only the left (nullable) side — it cannot
         // be pushed, so the rule detects no change and returns None.
-        let out = rule.apply(filter);
+        let out = rule.apply_with_logical(filter);
         assert!(
             out.is_none(),
             "left-side predicate must not be pushed below a RIGHT OUTER join; got {:?}",
@@ -1172,7 +1197,7 @@ mod tests {
 
         let rule = PushDownPredicateJoin;
         let out = rule
-            .apply(filter)
+            .apply_with_logical(filter)
             .expect("cross-side predicate should push");
         let LogicalPlanNodeKind::Join(join) = &out.kind else {
             panic!("expected bare Join with no remaining Filter");

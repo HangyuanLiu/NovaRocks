@@ -68,7 +68,11 @@ pub(crate) fn compute_cost(
         | Operator::LogicalCTEConsume(_)
         | Operator::LogicalDecode(_)
         | Operator::LogicalAggregateStateMerge(_)
-        | Operator::LogicalAssertOneRow(_) => 0.0,
+        | Operator::LogicalAssertOneRow(_)
+        // Apply and IMV markers are eliminated before costing; unreachable here.
+        | Operator::LogicalApply(_)
+        | Operator::LogicalImvDelta(_)
+        | Operator::LogicalImvVersion(_) => 0.0,
 
         // ------------------------------------------------------------------
         // Physical operators

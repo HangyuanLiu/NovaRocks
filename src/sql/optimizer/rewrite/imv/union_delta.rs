@@ -1,3 +1,4 @@
+use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
 use crate::sql::optimizer::rewrite::imv::annotation::ImvExtension;
@@ -5,6 +6,9 @@ use crate::sql::optimizer::rewrite::imv::join_delta::{
     mark_delta_scan, normalize_branch_output, plan_output_columns,
 };
 use crate::sql::optimizer::rewrite::imv::marker::plan_contains_imv_marker;
+use crate::sql::optimizer::rewrite::imv::{
+    PlanRewriteResult, bridge_apply_result, opt_expr_to_plan,
+};
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
@@ -32,7 +36,8 @@ impl LogicalRewriteRule for RewriteUnionAggregateDeltaRule {
         RewriteTraversal::TopDown
     }
 
-    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+    fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
+        let plan = opt_expr_to_plan(expr.clone(), ctx);
         let LogicalPlanNodeKind::ImvDelta(delta) = &plan.kind else {
             return false;
         };
@@ -44,73 +49,72 @@ impl LogicalRewriteRule for RewriteUnionAggregateDeltaRule {
             )
     }
 
-    fn apply(
-        &self,
-        plan: LogicalPlanNode,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
-        let LogicalPlanNode {
-            kind, mut children, ..
-        } = plan;
-        let LogicalPlanNodeKind::ImvDelta(delta) = kind else {
-            return Ok(RewriteResult::Unchanged);
-        };
-        if !delta.is_root {
-            return Ok(RewriteResult::Unchanged);
-        }
-        let branch_scope = delta.branch_scope;
-        let aggregate_plan = take_unary_child(&mut children);
-        let LogicalPlanNode {
-            kind: aggregate_kind,
-            children: mut aggregate_children,
-            required_output_columns: aggregate_required_output_columns,
-        } = aggregate_plan;
-        let LogicalPlanNodeKind::Aggregate(aggregate) = aggregate_kind else {
-            return Ok(RewriteResult::Unchanged);
-        };
-        let aggregate_input = take_unary_child(&mut aggregate_children);
-        // The source union may sit directly under the aggregate, or under a
-        // unary projection/filter chain that the optimizer's required-column
-        // pruning inserts between the aggregate and a derived UNION ALL subquery
-        // (`SELECT .. FROM (.. UNION ALL ..) GROUP BY ..`). Descend through that
-        // chain to reach the union.
-        if !unary_chain_reaches_unmarked_source_union(&aggregate_input) {
-            return Ok(RewriteResult::Unchanged);
-        }
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+        bridge_apply_result(expr, ctx, |plan, ctx| {
+            let LogicalPlanNode {
+                kind, mut children, ..
+            } = plan;
+            let LogicalPlanNodeKind::ImvDelta(delta) = kind else {
+                return Ok(PlanRewriteResult::Unchanged);
+            };
+            if !delta.is_root {
+                return Ok(PlanRewriteResult::Unchanged);
+            }
+            let branch_scope = delta.branch_scope;
+            let aggregate_plan = take_unary_child(&mut children);
+            let LogicalPlanNode {
+                kind: aggregate_kind,
+                children: mut aggregate_children,
+                required_output_columns: aggregate_required_output_columns,
+            } = aggregate_plan;
+            let LogicalPlanNodeKind::Aggregate(aggregate) = aggregate_kind else {
+                return Ok(PlanRewriteResult::Unchanged);
+            };
+            let aggregate_input = take_unary_child(&mut aggregate_children);
+            // The source union may sit directly under the aggregate, or under a
+            // unary projection/filter chain that the optimizer's required-column
+            // pruning inserts between the aggregate and a derived UNION ALL subquery
+            // (`SELECT .. FROM (.. UNION ALL ..) GROUP BY ..`). Descend through that
+            // chain to reach the union.
+            if !unary_chain_reaches_unmarked_source_union(&aggregate_input) {
+                return Ok(PlanRewriteResult::Unchanged);
+            }
 
-        let action_column = match delta.action_column {
-            Some(action_column) => action_column,
-            None => ctx
-                .extension::<ImvExtension>()
-                .ok_or_else(|| {
-                    "RewriteUnionAggregateDelta requires ImvExtension in RewriteContext".to_string()
-                })?
-                .allocate_column_id(),
-        };
-        let action_output = ImvActionColumn::output_column(action_column);
+            let action_column = match delta.action_column {
+                Some(action_column) => action_column,
+                None => ctx
+                    .extension::<ImvExtension>()
+                    .ok_or_else(|| {
+                        "RewriteUnionAggregateDelta requires ImvExtension in RewriteContext"
+                            .to_string()
+                    })?
+                    .allocate_column_id(),
+            };
+            let action_output = ImvActionColumn::output_column(action_column);
 
-        let aggregate_input =
-            mark_fan_in_union_through_unary(aggregate_input, action_column, &action_output)?;
-        let aggregate = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
-                group_by: aggregate.group_by,
-                aggregates: aggregate.aggregates,
-                output_columns: aggregate.output_columns,
-                already_pushed: aggregate.already_pushed,
-            }),
-            vec![aggregate_input],
-            aggregate_required_output_columns,
-        );
+            let aggregate_input =
+                mark_fan_in_union_through_unary(aggregate_input, action_column, &action_output)?;
+            let aggregate = LogicalPlanNode::new(
+                LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+                    group_by: aggregate.group_by,
+                    aggregates: aggregate.aggregates,
+                    output_columns: aggregate.output_columns,
+                    already_pushed: aggregate.already_pushed,
+                }),
+                vec![aggregate_input],
+                aggregate_required_output_columns,
+            );
 
-        Ok(RewriteResult::Changed(LogicalPlanNode::new(
-            LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
-                is_root: true,
-                action_column: Some(action_column),
-                branch_scope,
-            }),
-            vec![aggregate],
-            None,
-        )))
+            Ok(PlanRewriteResult::Changed(LogicalPlanNode::new(
+                LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+                    is_root: true,
+                    action_column: Some(action_column),
+                    branch_scope,
+                }),
+                vec![aggregate],
+                None,
+            )))
+        })
     }
 }
 
@@ -230,7 +234,8 @@ impl LogicalRewriteRule for RewriteTopLevelUnionDeltaRule {
         RewriteTraversal::TopDown
     }
 
-    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+    fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
+        let plan = opt_expr_to_plan(expr.clone(), ctx);
         let LogicalPlanNodeKind::ImvDelta(delta) = &plan.kind else {
             return false;
         };
@@ -242,86 +247,84 @@ impl LogicalRewriteRule for RewriteTopLevelUnionDeltaRule {
             )
     }
 
-    fn apply(
-        &self,
-        plan: LogicalPlanNode,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
-        let LogicalPlanNode {
-            kind, mut children, ..
-        } = plan;
-        let LogicalPlanNodeKind::ImvDelta(delta) = kind else {
-            return Ok(RewriteResult::Unchanged);
-        };
-        if !delta.is_root {
-            return Ok(RewriteResult::Unchanged);
-        }
-        let union_plan = take_unary_child(&mut children);
-        if !matches!(&union_plan.kind, LogicalPlanNodeKind::Union(_)) {
-            return Ok(RewriteResult::Unchanged);
-        }
-        if plan_contains_imv_marker(&union_plan) {
-            return Ok(RewriteResult::Unchanged);
-        }
-        let LogicalPlanNode {
-            kind: union_kind,
-            children: inputs,
-            required_output_columns,
-        } = union_plan;
-        let LogicalPlanNodeKind::Union(union) = union_kind else {
-            unreachable!();
-        };
-        if !union.all {
-            return Err(
-                "Iceberg IMV top-level union delta rewrite supports UNION ALL only".to_string(),
-            );
-        }
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+        bridge_apply_result(expr, ctx, |plan, ctx| {
+            let LogicalPlanNode {
+                kind, mut children, ..
+            } = plan;
+            let LogicalPlanNodeKind::ImvDelta(delta) = kind else {
+                return Ok(PlanRewriteResult::Unchanged);
+            };
+            if !delta.is_root {
+                return Ok(PlanRewriteResult::Unchanged);
+            }
+            let union_plan = take_unary_child(&mut children);
+            if !matches!(&union_plan.kind, LogicalPlanNodeKind::Union(_)) {
+                return Ok(PlanRewriteResult::Unchanged);
+            }
+            if plan_contains_imv_marker(&union_plan) {
+                return Ok(PlanRewriteResult::Unchanged);
+            }
+            let LogicalPlanNode {
+                kind: union_kind,
+                children: inputs,
+                required_output_columns,
+            } = union_plan;
+            let LogicalPlanNodeKind::Union(union) = union_kind else {
+                unreachable!();
+            };
+            if !union.all {
+                return Err(
+                    "Iceberg IMV top-level union delta rewrite supports UNION ALL only".to_string(),
+                );
+            }
 
-        let ext = ctx.extension::<ImvExtension>().ok_or_else(|| {
-            "RewriteTopLevelUnionDelta requires ImvExtension in RewriteContext".to_string()
-        })?;
-        let action_column = delta
-            .action_column
-            .unwrap_or_else(|| ext.allocate_column_id());
-        let branch_id_column = ext.allocate_column_id();
+            let ext = ctx.extension::<ImvExtension>().ok_or_else(|| {
+                "RewriteTopLevelUnionDelta requires ImvExtension in RewriteContext".to_string()
+            })?;
+            let action_column = delta
+                .action_column
+                .unwrap_or_else(|| ext.allocate_column_id());
+            let branch_id_column = ext.allocate_column_id();
 
-        let action_output = ImvActionColumn::output_column(action_column);
-        let branch_output = branch_id_output_column(branch_id_column);
+            let action_output = ImvActionColumn::output_column(action_column);
+            let branch_output = branch_id_output_column(branch_id_column);
 
-        let mut rewritten_inputs = Vec::with_capacity(inputs.len());
-        for (idx, branch) in inputs.into_iter().enumerate() {
-            ensure_top_level_union_branch_supported(&branch)?;
-            let branch_output_columns = plan_output_columns(&branch)?;
-            if branch_output_columns.len() != union.output_columns.len() {
-                return Err(format!(
-                    "Iceberg IMV top-level UNION ALL delta rewrite branch {idx} output column count {} does not match union output column count {}",
-                    branch_output_columns.len(),
-                    union.output_columns.len()
+            let mut rewritten_inputs = Vec::with_capacity(inputs.len());
+            for (idx, branch) in inputs.into_iter().enumerate() {
+                ensure_top_level_union_branch_supported(&branch)?;
+                let branch_output_columns = plan_output_columns(&branch)?;
+                if branch_output_columns.len() != union.output_columns.len() {
+                    return Err(format!(
+                        "Iceberg IMV top-level UNION ALL delta rewrite branch {idx} output column count {} does not match union output column count {}",
+                        branch_output_columns.len(),
+                        union.output_columns.len()
+                    ));
+                }
+                let marked = mark_delta_scan(branch, action_column)?;
+                rewritten_inputs.push(normalize_top_level_union_branch_output(
+                    marked,
+                    &union.output_columns,
+                    &branch_output_columns,
+                    &action_output,
+                    &branch_output,
+                    idx,
                 ));
             }
-            let marked = mark_delta_scan(branch, action_column)?;
-            rewritten_inputs.push(normalize_top_level_union_branch_output(
-                marked,
-                &union.output_columns,
-                &branch_output_columns,
-                &action_output,
-                &branch_output,
-                idx,
-            ));
-        }
 
-        let mut union_output_columns = union.output_columns;
-        union_output_columns.push(action_output);
-        union_output_columns.push(branch_output);
+            let mut union_output_columns = union.output_columns;
+            union_output_columns.push(action_output);
+            union_output_columns.push(branch_output);
 
-        Ok(RewriteResult::Changed(LogicalPlanNode::new(
-            LogicalPlanNodeKind::Union(LogicalUnionNode {
-                all: union.all,
-                output_columns: union_output_columns,
-            }),
-            rewritten_inputs,
-            required_output_columns,
-        )))
+            Ok(PlanRewriteResult::Changed(LogicalPlanNode::new(
+                LogicalPlanNodeKind::Union(LogicalUnionNode {
+                    all: union.all,
+                    output_columns: union_output_columns,
+                }),
+                rewritten_inputs,
+                required_output_columns,
+            )))
+        })
     }
 }
 
@@ -473,9 +476,11 @@ mod tests {
         ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::convert::logical_plan_to_opt_expr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
     use crate::sql::optimizer::rewrite::imv::annotation::{ImvExtension, ImvPlanAnnotation};
+    use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::{
         LogicalAggregateNode, LogicalFilterNode, LogicalJoinNode, LogicalPlanNodeKind,
         LogicalProjectNode, LogicalScanNode, LogicalUnionNode,
@@ -486,8 +491,9 @@ mod tests {
         let rule = RewriteUnionAggregateDeltaRule;
         let ctx = build_ctx();
         let plan = delta(aggregate_over(source_union(true)));
-
-        assert!(rule.matches(&plan, &ctx));
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        assert!(rule.matches(&expr, &ctx));
     }
 
     #[test]
@@ -495,8 +501,9 @@ mod tests {
         let rule = RewriteUnionAggregateDeltaRule;
         let ctx = build_ctx();
         let plan = delta(aggregate_over(marked_source_union()));
-
-        assert!(!rule.matches(&plan, &ctx));
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        assert!(!rule.matches(&expr, &ctx));
     }
 
     #[test]
@@ -505,13 +512,20 @@ mod tests {
         let mut ctx = build_ctx();
         let plan = delta(aggregate_over(source_union(true)));
 
-        assert!(rule.matches(&plan, &ctx));
-        let RewriteResult::Changed(rewritten) = rule
-            .apply(plan, &mut ctx)
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        assert!(rule.matches(&expr, &ctx));
+        let RewriteResult::Changed(rewritten_expr) = rule
+            .apply(expr, &mut ctx)
             .expect("UNION ALL aggregate delta must rewrite")
         else {
             panic!("expected Changed(ImvDelta)");
         };
+        let arena_ref = ctx.scalar_arena();
+        let rewritten = crate::sql::optimizer::convert::opt_expr_to_logical_plan(
+            rewritten_expr,
+            &arena_ref.borrow(),
+        );
         let LogicalPlanNodeKind::ImvDelta(root_delta) = &rewritten.kind else {
             panic!("expected Changed(ImvDelta), got {rewritten:?}");
         };
@@ -564,13 +578,20 @@ mod tests {
         let mut ctx = build_ctx();
         let plan = delta(project_filter_union(true));
 
-        assert!(rule.matches(&plan, &ctx));
-        let RewriteResult::Changed(rewritten) = rule
-            .apply(plan, &mut ctx)
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        assert!(rule.matches(&expr, &ctx));
+        let RewriteResult::Changed(rewritten_expr) = rule
+            .apply(expr, &mut ctx)
             .expect("top-level UNION ALL delta must rewrite")
         else {
             panic!("expected Changed(Union)");
         };
+        let arena_ref = ctx.scalar_arena();
+        let rewritten = crate::sql::optimizer::convert::opt_expr_to_logical_plan(
+            rewritten_expr,
+            &arena_ref.borrow(),
+        );
         let LogicalPlanNodeKind::Union(union) = &rewritten.kind else {
             panic!("expected Changed(Union), got {rewritten:?}");
         };
@@ -616,9 +637,11 @@ mod tests {
             required_output_columns(),
         ));
 
-        assert!(rule.matches(&plan, &ctx));
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        assert!(rule.matches(&expr, &ctx));
         let err = rule
-            .apply(plan, &mut ctx)
+            .apply(expr, &mut ctx)
             .expect_err("aggregate branch must be rejected");
         assert_eq!(
             err,
@@ -639,9 +662,11 @@ mod tests {
             required_output_columns(),
         ));
 
-        assert!(rule.matches(&plan, &ctx));
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        assert!(rule.matches(&expr, &ctx));
         let err = rule
-            .apply(plan, &mut ctx)
+            .apply(expr, &mut ctx)
             .expect_err("join branch must be rejected");
         assert_eq!(
             err,
@@ -655,9 +680,11 @@ mod tests {
         let mut ctx = build_ctx();
         let plan = delta(project_filter_union(false));
 
-        assert!(!rule.matches(&plan, &ctx));
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        assert!(!rule.matches(&expr, &ctx));
         let err = rule
-            .apply(plan, &mut ctx)
+            .apply(expr, &mut ctx)
             .expect_err("UNION DISTINCT must not be rewritten as UNION ALL");
         assert_eq!(
             err,
@@ -667,6 +694,9 @@ mod tests {
 
     fn build_ctx() -> RewriteContext {
         let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
+        ctx.set_scalar_arena(std::rc::Rc::new(
+            std::cell::RefCell::new(ScalarArena::new()),
+        ));
         ctx.set_extension::<ImvExtension>(ImvExtension {
             mv_ctx: dummy_rewrite_context(),
             annotation: ImvPlanAnnotation::default(),

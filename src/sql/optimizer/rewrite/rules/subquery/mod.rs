@@ -6,6 +6,7 @@
 
 mod apply_exception;
 mod apply_to_window;
+mod bridge;
 mod decorrelate_util;
 mod existential_apply_to_join;
 mod predicate_apply_util;
@@ -25,8 +26,9 @@ pub(crate) use push_down_apply_filter::PushDownApplyFilter;
 pub(crate) use quantified_apply_to_join::QuantifiedApplyToJoin;
 pub(crate) use scalar_apply_to_join::ScalarApplyToJoin;
 
+use crate::sql::optimizer::operator::Operator;
+use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind};
 
 pub(crate) fn subquery_rewrite_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
     vec![
@@ -45,29 +47,43 @@ pub(crate) fn subquery_rewrite_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
 /// disabled the ApplyException rule via `disable_optimizer_rules`); a leaked
 /// Apply must surface as a user-readable error, never as the memo-conversion
 /// panic.
-pub(crate) fn find_residual_apply(plan: &LogicalPlanNode) -> Option<String> {
-    match &plan.kind {
-        LogicalPlanNodeKind::Apply(node) => Some(apply_exception::apply_exception_message(node)),
-        _ => plan.children.iter().find_map(find_residual_apply),
+pub(crate) fn find_residual_apply(expr: &OptExpr) -> Option<String> {
+    match &expr.op {
+        Operator::LogicalApply(op) => Some(apply_exception::apply_exception_message(op)),
+        _ => expr.children.iter().find_map(find_residual_apply),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::sql::planner::plan::*;
+    use std::cell::RefCell;
     use std::collections::HashMap;
     use std::collections::HashSet;
+    use std::rc::Rc;
 
     use arrow::datatypes::DataType;
 
     use super::*;
     use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::convert::logical_plan_to_opt_expr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::registry::query_rewrite_pipeline;
+    use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::{
         ApplyKind, LogicalApplyNode, LogicalLimitNode, LogicalPlanNodeKind, LogicalValuesNode,
     };
+
+    fn ctx_with_arena() -> RewriteContext {
+        let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
+        ctx
+    }
+
+    fn to_opt_expr(plan: &LogicalPlanNode, ctx: &mut RewriteContext) -> OptExpr {
+        logical_plan_to_opt_expr(plan, &mut ctx.scalar_arena().borrow_mut())
+    }
 
     fn empty_values() -> LogicalPlanNode {
         LogicalPlanNode::new(
@@ -214,9 +230,10 @@ mod tests {
         // M1b: an uncorrelated scalar Apply over empty Values is handled by
         // ScalarApplyToJoin (CROSS JOIN + pass-through Project). ApplyException
         // is never reached; the pipeline succeeds.
-        let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        let mut ctx = ctx_with_arena();
+        let expr = to_opt_expr(&apply_over_values(), &mut ctx);
         let result = query_rewrite_pipeline(&HashMap::new())
-            .rewrite(apply_over_values(), &mut ctx)
+            .rewrite(expr, &mut ctx)
             .expect("pipeline must succeed: ScalarApplyToJoin eliminates the Apply");
         // The Apply must be gone — rewritten to a Project wrapping a CrossJoin.
         assert!(
@@ -229,9 +246,10 @@ mod tests {
     fn pipeline_eliminates_uncorrelated_exists_apply() {
         // EXISTS over an uncorrelated empty Values subtree should be rewritten
         // by ExistentialApplyToJoin into a LeftSemi join before ApplyException.
-        let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        let mut ctx = ctx_with_arena();
+        let expr = to_opt_expr(&exists_apply_over_values(), &mut ctx);
         let result = query_rewrite_pipeline(&HashMap::new())
-            .rewrite(exists_apply_over_values(), &mut ctx)
+            .rewrite(expr, &mut ctx)
             .expect("pipeline must succeed: ExistentialApplyToJoin eliminates the Apply");
         assert!(
             find_residual_apply(&result).is_none(),
@@ -243,9 +261,10 @@ mod tests {
     fn pipeline_eliminates_uncorrelated_in_apply() {
         // IN over uncorrelated Values should be rewritten by
         // QuantifiedApplyToJoin before ApplyException runs.
-        let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        let mut ctx = ctx_with_arena();
+        let expr = to_opt_expr(&in_apply_over_values(), &mut ctx);
         let result = query_rewrite_pipeline(&HashMap::new())
-            .rewrite(in_apply_over_values(), &mut ctx)
+            .rewrite(expr, &mut ctx)
             .expect("pipeline must succeed: QuantifiedApplyToJoin eliminates the Apply");
         assert!(
             find_residual_apply(&result).is_none(),
@@ -263,8 +282,10 @@ mod tests {
             "PushDownApplyAggFilter".to_string(),
             "PushDownApplyFilter".to_string(),
         ]);
+        ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
+        let expr = to_opt_expr(&apply_over_values(), &mut ctx);
         let rewritten = query_rewrite_pipeline(&HashMap::new())
-            .rewrite(apply_over_values(), &mut ctx)
+            .rewrite(expr, &mut ctx)
             .expect("pipeline passes with scalar Apply-elimination rules disabled");
         let message = find_residual_apply(&rewritten).expect("backstop must detect the apply");
         assert!(message.contains("subquery decorrelation failed"));
@@ -280,7 +301,9 @@ mod tests {
             vec![],
             None,
         );
-        assert!(find_residual_apply(&plan).is_none());
+        let mut ctx = ctx_with_arena();
+        let expr = to_opt_expr(&plan, &mut ctx);
+        assert!(find_residual_apply(&expr).is_none());
     }
 
     #[test]
@@ -295,7 +318,9 @@ mod tests {
             vec![apply_over_values()],
             None,
         );
-        let message = find_residual_apply(&plan).expect("walker must find the nested apply");
+        let mut ctx = ctx_with_arena();
+        let expr = to_opt_expr(&plan, &mut ctx);
+        let message = find_residual_apply(&expr).expect("walker must find the nested apply");
         assert!(
             message.contains("subquery decorrelation failed"),
             "unexpected message: {message}"

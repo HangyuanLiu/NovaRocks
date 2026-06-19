@@ -21,6 +21,7 @@ use crate::sql::optimizer::estimate::cardinality::{
     JoinCardInput, estimate_join_cardinality, except_rows, intersect_rows, union_all_rows,
     union_distinct_rows,
 };
+use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, materialize};
 use crate::sql::optimizer::scalar_bridge::{
     materialize_exprs, materialize_project_items, materialize_window_exprs,
@@ -676,6 +677,19 @@ pub(crate) fn derive_statistics(
                 column_statistics: child_stats.column_statistics,
             }
         }
+
+        // Apply and IMV markers are eliminated by the rewrite stage before
+        // statistics derivation. Reaching here indicates a planner bug.
+        Operator::LogicalApply(_) => {
+            unreachable!(
+                "Apply operator must be eliminated by SubqueryRewrite before statistics derivation"
+            )
+        }
+        Operator::LogicalImvDelta(_) | Operator::LogicalImvVersion(_) => {
+            unreachable!(
+                "IMV marker operators must be eliminated by the IMV rewrite stage before statistics derivation"
+            )
+        }
     }
 }
 
@@ -685,6 +699,31 @@ pub(crate) fn derive_logical_plan_statistics(
 ) -> Statistics {
     let mut memo = Memo::new();
     let root_group = super::convert::logical_plan_to_memo(plan, &mut memo);
+    derive_group_statistics(&mut memo, table_stats);
+    memo.groups
+        .get(root_group)
+        .and_then(|group| group.logical_props.as_ref())
+        .map(|props| Statistics {
+            output_row_count: props.row_count,
+            row_count_confidence: props.row_count_confidence,
+            column_statistics: props.column_statistics.clone(),
+        })
+        .unwrap_or_else(|| Statistics {
+            output_row_count: 1.0,
+            row_count_confidence: Confidence::Fallback,
+            column_statistics: HashMap::new(),
+        })
+}
+
+pub(crate) fn derive_opt_expr_statistics(
+    expr: &OptExpr,
+    arena: &ScalarArena,
+    table_stats: &HashMap<String, TableStatistics>,
+) -> Statistics {
+    let mut memo = Memo::new();
+    // Donate a clone of the caller's arena so the memo can materialize scalars.
+    memo.scalars = arena.clone();
+    let root_group = super::convert::opt_expr_to_memo(expr, &mut memo);
     derive_group_statistics(&mut memo, table_stats);
     memo.groups
         .get(root_group)
@@ -1829,6 +1868,18 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
         Operator::PhysicalUnion(op) => op.output_columns.clone(),
         Operator::PhysicalIntersect(op) => op.output_columns.clone(),
         Operator::PhysicalExcept(op) => op.output_columns.clone(),
+
+        // Apply and IMV markers are eliminated before statistics derivation.
+        Operator::LogicalApply(_) => {
+            unreachable!(
+                "Apply operator must be eliminated by SubqueryRewrite before output-column derivation"
+            )
+        }
+        Operator::LogicalImvDelta(_) | Operator::LogicalImvVersion(_) => {
+            unreachable!(
+                "IMV marker operators must be eliminated by the IMV rewrite stage before output-column derivation"
+            )
+        }
     }
 }
 

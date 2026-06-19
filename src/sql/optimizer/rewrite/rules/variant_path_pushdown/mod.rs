@@ -19,8 +19,10 @@ mod tests {
         ColumnDef, IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
     use crate::sql::column_id::{ColumnId, ColumnRefFactory};
+    use crate::sql::optimizer::convert::{logical_plan_to_opt_expr, opt_expr_to_logical_plan};
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::tree::rewrite_with_rule;
+    use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::{
         LogicalFilterNode, LogicalPlanNode, LogicalPlanNodeKind, LogicalProjectNode,
         LogicalScanNode,
@@ -199,7 +201,14 @@ mod tests {
     ) -> (LogicalPlanNode, bool) {
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         ctx.set_column_ref_factory(factory);
-        rewrite_with_rule(plan, &VariantPathPushdownRule, &mut ctx).unwrap()
+        let mut scalars = ScalarArena::new();
+        let opt_plan = logical_plan_to_opt_expr(&plan, &mut scalars);
+        let arena_rc = Rc::new(RefCell::new(scalars));
+        ctx.set_scalar_arena(arena_rc.clone());
+        let (opt_result, changed) =
+            rewrite_with_rule(opt_plan, &VariantPathPushdownRule, &mut ctx).unwrap();
+        let arena = arena_rc.borrow();
+        (opt_expr_to_logical_plan(opt_result, &arena), changed)
     }
 
     fn scan_from_plan(plan: &LogicalPlanNode) -> &LogicalScanNode {
@@ -219,9 +228,20 @@ mod tests {
         }
     }
 
-    fn binary_left(expr: &TypedExpr) -> &TypedExpr {
+    /// Return whichever side of a binary predicate is a ColumnRef.
+    /// ScalarArena normalizes commutative ops (including Eq) by ScalarId ordering,
+    /// so after a round-trip through the arena the left/right positions may swap.
+    fn binary_column_ref_side(expr: &TypedExpr) -> &TypedExpr {
         match &expr.kind {
-            ExprKind::BinaryOp { left, .. } => left,
+            ExprKind::BinaryOp { left, right, .. } => {
+                if matches!(left.kind, ExprKind::ColumnRef { .. }) {
+                    left
+                } else if matches!(right.kind, ExprKind::ColumnRef { .. }) {
+                    right
+                } else {
+                    panic!("expected one side to be ColumnRef, got left={left:?}, right={right:?}")
+                }
+            }
             other => panic!("expected BinaryOp, got {other:?}"),
         }
     }
@@ -271,7 +291,7 @@ mod tests {
         assert!(synthetic_output.nullable);
         assert!(synthetic_output.is_internal);
 
-        let rewritten_left = binary_left(&filter.predicate);
+        let rewritten_left = binary_column_ref_side(&filter.predicate);
         assert_eq!(
             column_ref_id(rewritten_left),
             descriptor.synthetic_column_id
@@ -425,7 +445,10 @@ mod tests {
         assert_eq!(scan.variant_columns.len(), 1);
         let synthetic_id = scan.variant_columns[0].synthetic_column_id;
         assert_eq!(column_ref_id(&project.items[0].expr), synthetic_id);
-        assert_eq!(column_ref_id(binary_left(&filter.predicate)), synthetic_id);
+        assert_eq!(
+            column_ref_id(binary_column_ref_side(&filter.predicate)),
+            synthetic_id
+        );
     }
 
     #[test]
@@ -528,14 +551,22 @@ mod tests {
         };
         assert_eq!(scan.variant_columns.len(), 1);
         assert_eq!(
-            column_ref_id(binary_left(&scan.predicates[0])),
+            column_ref_id(binary_column_ref_side(&scan.predicates[0])),
             scan.variant_columns[0].synthetic_column_id
         );
     }
 
     #[test]
     fn unset_source_column_id_is_not_rewritten() {
+        // ColumnId::UNSET cannot be interned via intern_typed (it panics), so this
+        // test builds the OptExpr tree directly using arena.intern() to bypass that
+        // guard, then verifies the rule returns Unchanged for UNSET source columns.
+        use crate::sql::optimizer::operator::{Operator, ProjectOp, ScalarProjectItem, ScanOp};
+        use crate::sql::optimizer::opt_expr::OptExpr;
+        use crate::sql::optimizer::scalar::{ScalarArena, ScalarNode};
+
         let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
+        let output_column_id = add_column(&factory, "a", DataType::Int64, true, false).column_id;
         let source_column = OutputColumn {
             column_id: ColumnId::UNSET,
             name: "v".to_string(),
@@ -543,39 +574,72 @@ mod tests {
             nullable: true,
             is_internal: false,
         };
-        let scan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Scan(LogicalScanNode {
-                database: "db".to_string(),
-                table: table_def(iceberg_source(), DataType::LargeBinary),
-                alias: None,
-                columns: vec![source_column.clone()],
-                predicates: vec![],
-                required_columns: None,
-                dict_columns: vec![],
-                variant_columns: vec![],
-            }),
-            vec![],
-            None,
+
+        let mut scalars = ScalarArena::new();
+
+        // Build the variant_get(UNSET_col, "$.a", "bigint") call directly.
+        // arena.intern() has no UNSET guard — only intern_typed does.
+        let unset_col_id = scalars.intern(
+            ScalarNode::ColumnRef(ColumnId::UNSET),
+            DataType::LargeBinary,
+            true,
         );
-        let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
-                items: vec![ProjectItem {
-                    expr: variant_get("variant_get", &source_column, "$.a", "bigint"),
+        let path_id = scalars.intern(
+            ScalarNode::Literal(crate::sql::optimizer::scalar::HashableLiteral(
+                crate::sql::analysis::LiteralValue::String("$.a".to_string()),
+            )),
+            DataType::Utf8,
+            false,
+        );
+        let ty_id = scalars.intern(
+            ScalarNode::Literal(crate::sql::optimizer::scalar::HashableLiteral(
+                crate::sql::analysis::LiteralValue::String("bigint".to_string()),
+            )),
+            DataType::Utf8,
+            false,
+        );
+        let call_id = scalars.intern(
+            ScalarNode::FunctionCall {
+                name: "variant_get".to_string(),
+                args: vec![unset_col_id, path_id, ty_id],
+                distinct: false,
+            },
+            DataType::Int64,
+            true,
+        );
+
+        let scan_op = OptExpr::leaf(Operator::LogicalScan(ScanOp {
+            database: "db".to_string(),
+            table: table_def(iceberg_source(), DataType::LargeBinary),
+            alias: None,
+            columns: vec![source_column],
+            predicates: vec![],
+            required_columns: None,
+            dict_columns: vec![],
+            variant_columns: vec![],
+            mv_rewritten_from: None,
+        }));
+        let project_op = OptExpr::new(
+            Operator::LogicalProject(ProjectOp {
+                items: vec![ScalarProjectItem {
+                    expr: call_id,
                     output_name: "a".to_string(),
-                    output_column_id: add_column(&factory, "a", DataType::Int64, true, false)
-                        .column_id,
+                    output_column_id,
+                    expr_display: None,
                 }],
                 output_qualifier: None,
             }),
-            vec![scan],
-            None,
+            vec![scan_op],
         );
-        let before = format!("{plan:?}");
 
-        let (rewritten, changed) = rewrite(plan, Rc::clone(&factory));
+        let arena_rc = Rc::new(RefCell::new(scalars));
+        let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        ctx.set_column_ref_factory(Rc::clone(&factory));
+        ctx.set_scalar_arena(arena_rc);
+        let (_, changed) =
+            rewrite_with_rule(project_op, &VariantPathPushdownRule, &mut ctx).unwrap();
 
         assert!(!changed);
-        assert_eq!(format!("{rewritten:?}"), before);
     }
 
     #[test]

@@ -7,9 +7,13 @@
 use crate::connector::starrocks::table::model::IcebergTableRef;
 use crate::engine::mv::refresh_context::IcebergMvRewriteContext;
 use crate::sql::catalog::{IcebergTableInfo, ScanSource};
+use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
 use crate::sql::optimizer::rewrite::imv::annotation::ImvExtension;
+use crate::sql::optimizer::rewrite::imv::{
+    PlanRewriteResult, bridge_apply_result, opt_expr_to_plan,
+};
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
@@ -44,68 +48,67 @@ impl LogicalRewriteRule for BindIcebergScanRule {
         RewriteTraversal::BottomUp
     }
 
-    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+    fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
+        let plan = opt_expr_to_plan(expr.clone(), ctx);
         matches!(
             &plan.kind,
             LogicalPlanNodeKind::ImvDelta(_) | LogicalPlanNodeKind::ImvVersion(_)
         ) && matches!(&plan.unary_input().kind, LogicalPlanNodeKind::Scan(_))
     }
 
-    fn apply(
-        &self,
-        plan: LogicalPlanNode,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
-        let ext = ctx
-            .extension::<ImvExtension>()
-            .ok_or_else(|| "BindIcebergScan requires ImvExtension in RewriteContext".to_string())?;
-        let LogicalPlanNode {
-            kind,
-            mut children,
-            required_output_columns: _,
-        } = plan;
-        if children.len() != 1 {
-            return Ok(RewriteResult::Unchanged);
-        }
-        let scan_plan = children.remove(0);
-        let LogicalPlanNode {
-            kind: scan_kind,
-            required_output_columns,
-            ..
-        } = scan_plan;
-        match &kind {
-            LogicalPlanNodeKind::ImvDelta(node) => {
-                let LogicalPlanNodeKind::Scan(scan) = scan_kind else {
-                    return Ok(RewriteResult::Unchanged);
-                };
-                let mut bound = bind_delta_scan(scan, &ext.mv_ctx)?;
-                if let Some(column_id) = node.action_column {
-                    bound
-                        .columns
-                        .retain(|column| !is_action_column_name(&column.name));
-                    bound
-                        .columns
-                        .push(ImvActionColumn::output_column(column_id));
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+        bridge_apply_result(expr, ctx, |plan, ctx| {
+            let ext = ctx.extension::<ImvExtension>().ok_or_else(|| {
+                "BindIcebergScan requires ImvExtension in RewriteContext".to_string()
+            })?;
+            let LogicalPlanNode {
+                kind,
+                mut children,
+                required_output_columns: _,
+            } = plan;
+            if children.len() != 1 {
+                return Ok(PlanRewriteResult::Unchanged);
+            }
+            let scan_plan = children.remove(0);
+            let LogicalPlanNode {
+                kind: scan_kind,
+                required_output_columns,
+                ..
+            } = scan_plan;
+            match &kind {
+                LogicalPlanNodeKind::ImvDelta(node) => {
+                    let LogicalPlanNodeKind::Scan(scan) = scan_kind else {
+                        return Ok(PlanRewriteResult::Unchanged);
+                    };
+                    let mut bound = bind_delta_scan(scan, &ext.mv_ctx)?;
+                    if let Some(column_id) = node.action_column {
+                        bound
+                            .columns
+                            .retain(|column| !is_action_column_name(&column.name));
+                        bound
+                            .columns
+                            .push(ImvActionColumn::output_column(column_id));
+                    }
+                    Ok(PlanRewriteResult::Changed(LogicalPlanNode::new(
+                        LogicalPlanNodeKind::Scan(bound),
+                        vec![],
+                        required_output_columns,
+                    )))
                 }
-                Ok(RewriteResult::Changed(LogicalPlanNode::new(
-                    LogicalPlanNodeKind::Scan(bound),
-                    vec![],
-                    required_output_columns,
-                )))
+                LogicalPlanNodeKind::ImvVersion(node) => {
+                    let LogicalPlanNodeKind::Scan(scan) = scan_kind else {
+                        return Ok(PlanRewriteResult::Unchanged);
+                    };
+                    let bound = bind_version_scan(scan, &ext.mv_ctx, node.version_ref.role)?;
+                    Ok(PlanRewriteResult::Changed(LogicalPlanNode::new(
+                        LogicalPlanNodeKind::Scan(bound),
+                        vec![],
+                        required_output_columns,
+                    )))
+                }
+                _ => Ok(PlanRewriteResult::Unchanged),
             }
-            LogicalPlanNodeKind::ImvVersion(node) => {
-                let LogicalPlanNodeKind::Scan(scan) = scan_kind else {
-                    return Ok(RewriteResult::Unchanged);
-                };
-                let bound = bind_version_scan(scan, &ext.mv_ctx, node.version_ref.role)?;
-                Ok(RewriteResult::Changed(LogicalPlanNode::new(
-                    LogicalPlanNodeKind::Scan(bound),
-                    vec![],
-                    required_output_columns,
-                )))
-            }
-            _ => Ok(RewriteResult::Unchanged),
-        }
+        })
     }
 }
 
@@ -230,10 +233,15 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use crate::sql::optimizer::convert::logical_plan_to_opt_expr;
     use crate::sql::optimizer::rewrite::imv::action_propagation::InjectActionColumnRule;
     use crate::sql::optimizer::rewrite::imv::annotation::{ImvExtension, ImvPlanAnnotation};
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
+    use crate::sql::optimizer::scalar::ScalarArena;
     use std::sync::Arc;
     use std::sync::atomic::AtomicU32;
 
@@ -329,6 +337,8 @@ mod tests {
     #[test]
     fn bind_delta_marker_preserves_existing_action_column_id_for_injection() {
         let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
+        let arena = Rc::new(RefCell::new(ScalarArena::new()));
+        ctx.set_scalar_arena(Rc::clone(&arena));
         ctx.set_extension::<ImvExtension>(ImvExtension {
             mv_ctx: dummy_rewrite_context(),
             annotation: ImvPlanAnnotation::default(),
@@ -348,11 +358,17 @@ mod tests {
             None,
         );
         let bind = BindIcebergScanRule;
-        let RewriteResult::Changed(changed) =
-            bind.apply(plan, &mut ctx).expect("bind must succeed")
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut());
+        let RewriteResult::Changed(changed_expr) =
+            bind.apply(expr, &mut ctx).expect("bind must succeed")
         else {
             panic!("expected changed scan");
         };
+        let arena_ref = ctx.scalar_arena();
+        let changed = crate::sql::optimizer::convert::opt_expr_to_logical_plan(
+            changed_expr.clone(),
+            &arena_ref.borrow(),
+        );
         let LogicalPlanNodeKind::Scan(bound) = &changed.kind else {
             panic!("expected changed scan");
         };
@@ -365,7 +381,7 @@ mod tests {
 
         let inject = InjectActionColumnRule;
         assert!(
-            !inject.matches(&changed, &ctx),
+            !inject.matches(&changed_expr, &ctx),
             "inject action must skip a scan that already carries the marker action id"
         );
     }
@@ -373,6 +389,8 @@ mod tests {
     #[test]
     fn bind_delta_marker_rebinds_preexisting_action_column_to_marker_id() {
         let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
+        let arena = Rc::new(RefCell::new(ScalarArena::new()));
+        ctx.set_scalar_arena(Rc::clone(&arena));
         ctx.set_extension::<ImvExtension>(ImvExtension {
             mv_ctx: dummy_rewrite_context(),
             annotation: ImvPlanAnnotation::default(),
@@ -401,11 +419,17 @@ mod tests {
         );
 
         let bind = BindIcebergScanRule;
-        let RewriteResult::Changed(changed) =
-            bind.apply(plan, &mut ctx).expect("bind must succeed")
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut());
+        let RewriteResult::Changed(changed_expr) =
+            bind.apply(expr, &mut ctx).expect("bind must succeed")
         else {
             panic!("expected changed scan");
         };
+        let arena_ref = ctx.scalar_arena();
+        let changed = crate::sql::optimizer::convert::opt_expr_to_logical_plan(
+            changed_expr,
+            &arena_ref.borrow(),
+        );
         let LogicalPlanNodeKind::Scan(bound) = &changed.kind else {
             panic!("expected changed scan");
         };

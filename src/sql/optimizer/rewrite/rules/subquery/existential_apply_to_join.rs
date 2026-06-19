@@ -5,8 +5,10 @@
 //! `outer LEFT SEMI JOIN inner ON <normalized correlation predicate>`;
 //! NOT EXISTS -> LEFT ANTI; uncorrelated -> semi/anti ON true.
 
+use super::bridge::{opt_expr_to_plan, plan_to_opt_expr};
 use super::predicate_apply_util::{lift_correlated_inner, literal_true};
 use crate::sql::analysis::JoinKind;
+use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
@@ -25,65 +27,81 @@ impl LogicalRewriteRule for ExistentialApplyToJoin {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
-        matches!(&plan.kind, LogicalPlanNodeKind::Apply(a) if matches!(a.kind, ApplyKind::Exists { .. }))
+    fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
+        let arena = ctx.scalar_arena();
+        let plan = opt_expr_to_plan(expr, &arena.borrow());
+        matches_plan(&plan)
     }
 
-    fn apply(
-        &self,
-        plan: LogicalPlanNode,
-        _ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
-        let LogicalPlanNode {
-            kind,
-            mut children,
-            required_output_columns: _,
-        } = plan;
-        let LogicalPlanNodeKind::Apply(a) = &kind else {
-            return Ok(RewriteResult::Unchanged);
-        };
-        if children.len() != 2 {
-            return Ok(RewriteResult::Unchanged);
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+        let arena = ctx.scalar_arena();
+        let plan = opt_expr_to_plan(&expr, &arena.borrow());
+        match apply_plan(plan)? {
+            Some(new_plan) => {
+                let new_expr = plan_to_opt_expr(&new_plan, &mut arena.borrow_mut());
+                Ok(RewriteResult::Changed(new_expr))
+            }
+            None => Ok(RewriteResult::Unchanged),
         }
-        let apply_right = children.remove(1);
-        let apply_left = children.remove(0);
-        let negated = match a.kind {
-            ApplyKind::Exists { negated } => negated,
-            _ => return Ok(RewriteResult::Unchanged),
-        };
-        let join_type = if negated {
-            JoinKind::LeftAnti
-        } else {
-            JoinKind::LeftSemi
-        };
-
-        let (right, condition) = if a.correlation_column_ids.is_empty() {
-            (apply_right, literal_true())
-        } else {
-            let Some(lifted) = lift_correlated_inner(apply_right, &a.correlation_column_ids) else {
-                return Ok(RewriteResult::Unchanged);
-            };
-            let Some(pred) = lifted.on_predicate else {
-                return Ok(RewriteResult::Unchanged);
-            };
-            (lifted.right, pred)
-        };
-
-        Ok(RewriteResult::Changed(LogicalPlanNode::new(
-            LogicalPlanNodeKind::Join(LogicalJoinNode {
-                join_type,
-                condition: Some(condition),
-            }),
-            vec![apply_left, right],
-            None,
-        )))
     }
+}
+
+fn matches_plan(plan: &LogicalPlanNode) -> bool {
+    matches!(&plan.kind, LogicalPlanNodeKind::Apply(a) if matches!(a.kind, ApplyKind::Exists { .. }))
+}
+
+fn apply_plan(plan: LogicalPlanNode) -> Result<Option<LogicalPlanNode>, String> {
+    let LogicalPlanNode {
+        kind,
+        mut children,
+        required_output_columns: _,
+    } = plan;
+    let LogicalPlanNodeKind::Apply(a) = &kind else {
+        return Ok(None);
+    };
+    if children.len() != 2 {
+        return Ok(None);
+    }
+    let apply_right = children.remove(1);
+    let apply_left = children.remove(0);
+    let negated = match a.kind {
+        ApplyKind::Exists { negated } => negated,
+        _ => return Ok(None),
+    };
+    let join_type = if negated {
+        JoinKind::LeftAnti
+    } else {
+        JoinKind::LeftSemi
+    };
+
+    let (right, condition) = if a.correlation_column_ids.is_empty() {
+        (apply_right, literal_true())
+    } else {
+        let Some(lifted) = lift_correlated_inner(apply_right, &a.correlation_column_ids) else {
+            return Ok(None);
+        };
+        let Some(pred) = lifted.on_predicate else {
+            return Ok(None);
+        };
+        (lifted.right, pred)
+    };
+
+    Ok(Some(LogicalPlanNode::new(
+        LogicalPlanNodeKind::Join(LogicalJoinNode {
+            join_type,
+            condition: Some(condition),
+        }),
+        vec![apply_left, right],
+        None,
+    )))
 }
 
 #[cfg(test)]
 mod tests {
     use crate::sql::planner::plan::*;
+    use std::cell::RefCell;
     use std::collections::HashSet;
+    use std::rc::Rc;
 
     use arrow::datatypes::DataType;
 
@@ -93,7 +111,9 @@ mod tests {
     };
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::convert::logical_plan_to_opt_expr;
     use crate::sql::optimizer::rewrite::result::RewriteResult;
+    use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::{
         ApplyKind, LogicalApplyNode, LogicalFilterNode, LogicalJoinNode, LogicalPlanNodeKind,
         LogicalProjectNode, LogicalScanNode,
@@ -104,8 +124,14 @@ mod tests {
     const EXISTS_OUT: ColumnId = ColumnId(3);
     const CONST_ONE: ColumnId = ColumnId(4);
 
-    fn ctx() -> RewriteContext {
-        RewriteContext::for_query(Vec::<String>::new())
+    fn ctx_with_arena() -> RewriteContext {
+        let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
+        ctx
+    }
+
+    fn to_opt_expr(plan: &LogicalPlanNode, ctx: &mut RewriteContext) -> OptExpr {
+        logical_plan_to_opt_expr(plan, &mut ctx.scalar_arena().borrow_mut())
     }
 
     fn output_column(id: ColumnId, name: &str, data_type: DataType) -> OutputColumn {
@@ -271,10 +297,13 @@ mod tests {
 
     fn rewrite(plan: LogicalPlanNode) -> LogicalPlanNode {
         let rule = ExistentialApplyToJoin;
-        let mut ctx = ctx();
-        assert!(rule.matches(&plan, &ctx));
-        match rule.apply(plan, &mut ctx).expect("rewrite must not error") {
-            RewriteResult::Changed(plan) => plan,
+        let mut ctx = ctx_with_arena();
+        let expr = to_opt_expr(&plan, &mut ctx);
+        assert!(rule.matches(&expr, &ctx));
+        match rule.apply(expr, &mut ctx).expect("rewrite must not error") {
+            RewriteResult::Changed(new_expr) => {
+                opt_expr_to_plan(&new_expr, &ctx.scalar_arena().borrow())
+            }
             other => panic!("expected Changed, got: {other:?}"),
         }
     }
@@ -297,8 +326,23 @@ mod tests {
             panic!("expected binary condition, got: {condition:?}");
         };
         assert_eq!(*op, BinOp::Eq);
-        assert_column_id(left, OUTER_K);
-        assert_column_id(right, INNER_K);
+        // The arena normalizes commutative Eq by ScalarId order, so the
+        // left/right assignment is an implementation detail rather than a
+        // semantic guarantee. Assert that the two expected column ids appear
+        // somewhere in the condition, regardless of which side is "left".
+        let left_id = match &left.kind {
+            ExprKind::ColumnRef { column_id, .. } => *column_id,
+            other => panic!("expected column ref on left, got: {other:?}"),
+        };
+        let right_id = match &right.kind {
+            ExprKind::ColumnRef { column_id, .. } => *column_id,
+            other => panic!("expected column ref on right, got: {other:?}"),
+        };
+        let pair = (left_id, right_id);
+        assert!(
+            pair == (OUTER_K, INNER_K) || pair == (INNER_K, OUTER_K),
+            "expected correlation condition to reference OUTER_K and INNER_K; got {pair:?}"
+        );
     }
 
     fn assert_true_condition(condition: &TypedExpr) {
@@ -371,10 +415,11 @@ mod tests {
     #[test]
     fn exists_correlated_project_scan_returns_unchanged() {
         let rule = ExistentialApplyToJoin;
-        let mut ctx = ctx();
+        let mut ctx = ctx_with_arena();
         let plan = exists_apply(false, correlated_project_scan_inner(), true);
+        let expr = to_opt_expr(&plan, &mut ctx);
 
-        let result = rule.apply(plan, &mut ctx).expect("rewrite must not error");
+        let result = rule.apply(expr, &mut ctx).expect("rewrite must not error");
 
         assert!(matches!(result, RewriteResult::Unchanged));
     }

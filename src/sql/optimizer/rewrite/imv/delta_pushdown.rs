@@ -8,7 +8,10 @@
 //! here unless an earlier rewrite consumed them. Join is handled by
 //! `RewriteJoinDeltaRule` in the same stage's fixpoint.
 
+use crate::sql::optimizer::operator::Operator;
+use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
+use crate::sql::optimizer::rewrite::imv::{PlanRewriteResult, bridge_apply_result};
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
@@ -29,118 +32,121 @@ impl LogicalRewriteRule for PushDeltaThroughUnaryRule {
         RewriteTraversal::TopDown
     }
 
-    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
-        let LogicalPlanNodeKind::ImvDelta(_) = &plan.kind else {
+    fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
+        if !matches!(&expr.op, Operator::LogicalImvDelta(_)) {
             return false;
-        };
+        }
+        if expr.children.is_empty() {
+            return false;
+        }
         matches!(
-            &plan.unary_input().kind,
-            LogicalPlanNodeKind::Project(_)
-                | LogicalPlanNodeKind::Filter(_)
-                | LogicalPlanNodeKind::Aggregate(_)
-                | LogicalPlanNodeKind::Join(_)
-                | LogicalPlanNodeKind::Union(_)
+            &expr.children[0].op,
+            Operator::LogicalProject(_)
+                | Operator::LogicalFilter(_)
+                | Operator::LogicalAggregate(_)
+                | Operator::LogicalJoin(_)
+                | Operator::LogicalUnion(_)
         )
     }
 
-    fn apply(
-        &self,
-        plan: LogicalPlanNode,
-        _ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
-        let LogicalPlanNode {
-            kind,
-            mut children,
-            required_output_columns: _,
-        } = plan;
-        let LogicalPlanNodeKind::ImvDelta(delta) = &kind else {
-            return Ok(RewriteResult::Unchanged);
-        };
-        if children.len() != 1 {
-            return Ok(RewriteResult::Unchanged);
-        }
-        let child = children.remove(0);
-        // Decide based on the child kind WITHOUT consuming `delta` yet. This
-        // two-phase structure avoids both (a) moving the child before we
-        // know how to handle the child and (b) rebuilding an identical marker
-        // for an unhandled child, which would loop forever under fixpoint.
-        // Fail-fast on unsupported shapes here (structural stage) is the first of
-        // three layers; PropagateActionColumnRule and ActionColumnValidationRule
-        // re-assert the same boundary later with richer diagnostics (base FQN).
-        match &child.kind {
-            LogicalPlanNodeKind::Project(_) | LogicalPlanNodeKind::Filter(_) => {
-                /* fall through to push */
-            }
-            LogicalPlanNodeKind::Aggregate(_) => {
-                return Err("Iceberg IMV rewrite does not support this aggregate shape".to_string());
-            }
-            LogicalPlanNodeKind::Join(_) => {
-                // Left for RewriteJoinDeltaRule in the same stage's fixpoint.
-                return Ok(RewriteResult::Unchanged);
-            }
-            LogicalPlanNodeKind::Union(_) => {
-                return Err("Iceberg IMV rewrite does not support this union shape".to_string());
-            }
-            // Scan or any other shape: the marker already directly wraps a leaf
-            // (or a node we do not push through). Leave it for BindIcebergScan.
-            _ => return Ok(RewriteResult::Unchanged),
-        }
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+        bridge_apply_result(expr, ctx, |plan, _ctx| apply_plan(plan))
+    }
+}
 
-        // The relocated marker is no longer at the structural plan root, so it is
-        // is_root: false. WrapRootInImvDelta (the only is_root reader) has already
-        // run in the earlier imv-delta-marker stage and never re-runs.
-        let action_column = delta.action_column;
-        let LogicalPlanNode {
-            kind: child_kind,
-            children: mut child_children,
-            required_output_columns,
-        } = child;
-        if child_children.len() != 1 {
-            return Ok(RewriteResult::Unchanged);
+fn apply_plan(plan: LogicalPlanNode) -> Result<PlanRewriteResult, String> {
+    let LogicalPlanNode {
+        kind,
+        mut children,
+        required_output_columns: _,
+    } = plan;
+    let LogicalPlanNodeKind::ImvDelta(delta) = &kind else {
+        return Ok(PlanRewriteResult::Unchanged);
+    };
+    if children.len() != 1 {
+        return Ok(PlanRewriteResult::Unchanged);
+    }
+    let child = children.remove(0);
+    // Decide based on the child kind WITHOUT consuming `delta` yet. This
+    // two-phase structure avoids both (a) moving the child before we
+    // know how to handle the child and (b) rebuilding an identical marker
+    // for an unhandled child, which would loop forever under fixpoint.
+    // Fail-fast on unsupported shapes here (structural stage) is the first of
+    // three layers; PropagateActionColumnRule and ActionColumnValidationRule
+    // re-assert the same boundary later with richer diagnostics (base FQN).
+    match &child.kind {
+        LogicalPlanNodeKind::Project(_) | LogicalPlanNodeKind::Filter(_) => {
+            /* fall through to push */
         }
-        let original_input = child_children.remove(0);
-        match child_kind {
-            LogicalPlanNodeKind::Project(p) => {
-                // Commutation Delta(Project(x)) == Project(Delta(x)) holds because
-                // Project items are row-local and the delta only marks each row's
-                // change action (carried through by action-column propagation).
-                // Window calls cannot appear here because the planner extracts
-                // them into a dedicated LogicalWindowNode.
-                let inner = LogicalPlanNode::new(
-                    LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
-                        is_root: false,
-                        action_column,
-                        branch_scope: None,
-                    }),
-                    vec![original_input],
-                    None,
-                );
-                Ok(RewriteResult::Changed(LogicalPlanNode::new(
-                    LogicalPlanNodeKind::Project(p),
-                    vec![inner],
-                    required_output_columns,
-                )))
-            }
-            LogicalPlanNodeKind::Filter(f) => {
-                let inner = LogicalPlanNode::new(
-                    LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
-                        is_root: false,
-                        action_column,
-                        branch_scope: None,
-                    }),
-                    vec![original_input],
-                    None,
-                );
-                Ok(RewriteResult::Changed(LogicalPlanNode::new(
-                    LogicalPlanNodeKind::Filter(f),
-                    vec![inner],
-                    required_output_columns,
-                )))
-            }
-            // The decision match above guarantees the child is Project or
-            // Filter at this point; every other shape returned early.
-            _ => unreachable!("child kind already filtered to Project/Filter"),
+        LogicalPlanNodeKind::Aggregate(_) => {
+            return Err("Iceberg IMV rewrite does not support this aggregate shape".to_string());
         }
+        LogicalPlanNodeKind::Join(_) => {
+            // Left for RewriteJoinDeltaRule in the same stage's fixpoint.
+            return Ok(PlanRewriteResult::Unchanged);
+        }
+        LogicalPlanNodeKind::Union(_) => {
+            return Err("Iceberg IMV rewrite does not support this union shape".to_string());
+        }
+        // Scan or any other shape: the marker already directly wraps a leaf
+        // (or a node we do not push through). Leave it for BindIcebergScan.
+        _ => return Ok(PlanRewriteResult::Unchanged),
+    }
+
+    // The relocated marker is no longer at the structural plan root, so it is
+    // is_root: false. WrapRootInImvDelta (the only is_root reader) has already
+    // run in the earlier imv-delta-marker stage and never re-runs.
+    let action_column = delta.action_column;
+    let LogicalPlanNode {
+        kind: child_kind,
+        children: mut child_children,
+        required_output_columns,
+    } = child;
+    if child_children.len() != 1 {
+        return Ok(PlanRewriteResult::Unchanged);
+    }
+    let original_input = child_children.remove(0);
+    match child_kind {
+        LogicalPlanNodeKind::Project(p) => {
+            // Commutation Delta(Project(x)) == Project(Delta(x)) holds because
+            // Project items are row-local and the delta only marks each row's
+            // change action (carried through by action-column propagation).
+            // Window calls cannot appear here because the planner extracts
+            // them into a dedicated LogicalWindowNode.
+            let inner = LogicalPlanNode::new(
+                LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+                    is_root: false,
+                    action_column,
+                    branch_scope: None,
+                }),
+                vec![original_input],
+                None,
+            );
+            Ok(PlanRewriteResult::Changed(LogicalPlanNode::new(
+                LogicalPlanNodeKind::Project(p),
+                vec![inner],
+                required_output_columns,
+            )))
+        }
+        LogicalPlanNodeKind::Filter(f) => {
+            let inner = LogicalPlanNode::new(
+                LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+                    is_root: false,
+                    action_column,
+                    branch_scope: None,
+                }),
+                vec![original_input],
+                None,
+            );
+            Ok(PlanRewriteResult::Changed(LogicalPlanNode::new(
+                LogicalPlanNodeKind::Filter(f),
+                vec![inner],
+                required_output_columns,
+            )))
+        }
+        // The decision match above guarantees the child is Project or
+        // Filter at this point; every other shape returned early.
+        _ => unreachable!("child kind already filtered to Project/Filter"),
     }
 }
 
@@ -158,15 +164,23 @@ mod tests {
     use crate::sql::catalog::{
         ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::convert::{logical_plan_to_opt_expr, opt_expr_to_logical_plan};
     use crate::sql::optimizer::rewrite::context::RewriteContext;
+    use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::{
         LogicalAggregateNode, LogicalFilterNode, LogicalJoinNode, LogicalPlanNodeKind,
         LogicalProjectNode, LogicalScanNode, LogicalUnionNode,
     };
 
-    fn ctx() -> RewriteContext {
-        RewriteContext::for_mv_refresh(Vec::<String>::new())
+    fn ctx_with_arena() -> (RewriteContext, Rc<RefCell<ScalarArena>>) {
+        let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
+        let arena = Rc::new(RefCell::new(ScalarArena::new()));
+        ctx.set_scalar_arena(Rc::clone(&arena));
+        (ctx, arena)
     }
 
     /// A leaf scan. Pushdown does not care about the scan source; an Iceberg
@@ -309,13 +323,15 @@ mod tests {
     #[test]
     fn pushes_delta_through_project() {
         let rule = PushDeltaThroughUnaryRule;
-        let mut ctx = ctx();
+        let (mut ctx, arena) = ctx_with_arena();
         let plan = delta(project_over(leaf_scan()));
-        assert!(rule.matches(&plan, &ctx));
-        let result = rule.apply(plan, &mut ctx).expect("apply must succeed");
-        let RewriteResult::Changed(rewritten) = result else {
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut());
+        assert!(rule.matches(&expr, &ctx));
+        let result = rule.apply(expr, &mut ctx).expect("apply must succeed");
+        let RewriteResult::Changed(rewritten_expr) = result else {
             panic!("expected Changed(Project)");
         };
+        let rewritten = opt_expr_to_logical_plan(rewritten_expr, &arena.borrow());
         let LogicalPlanNodeKind::Project(_) = &rewritten.kind else {
             panic!("expected Changed(Project), got {rewritten:?}");
         };
@@ -333,13 +349,15 @@ mod tests {
     #[test]
     fn pushes_delta_through_filter() {
         let rule = PushDeltaThroughUnaryRule;
-        let mut ctx = ctx();
+        let (mut ctx, arena) = ctx_with_arena();
         let plan = delta(filter_over(leaf_scan()));
-        assert!(rule.matches(&plan, &ctx));
-        let result = rule.apply(plan, &mut ctx).expect("apply must succeed");
-        let RewriteResult::Changed(rewritten) = result else {
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut());
+        assert!(rule.matches(&expr, &ctx));
+        let result = rule.apply(expr, &mut ctx).expect("apply must succeed");
+        let RewriteResult::Changed(rewritten_expr) = result else {
             panic!("expected Changed(Filter)");
         };
+        let rewritten = opt_expr_to_logical_plan(rewritten_expr, &arena.borrow());
         let LogicalPlanNodeKind::Filter(_) = &rewritten.kind else {
             panic!("expected Changed(Filter), got {rewritten:?}");
         };
@@ -357,23 +375,25 @@ mod tests {
     #[test]
     fn leaves_delta_on_scan() {
         let rule = PushDeltaThroughUnaryRule;
-        let mut ctx = ctx();
+        let (mut ctx, arena) = ctx_with_arena();
         let plan = delta(leaf_scan());
         // matches() is false because the direct child is a Scan, not a
         // pushable unary node.
-        assert!(!rule.matches(&plan, &ctx));
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut());
+        assert!(!rule.matches(&expr, &ctx));
         // apply() is also a no-op defensively.
-        let result = rule.apply(plan, &mut ctx).expect("apply must succeed");
+        let result = rule.apply(expr, &mut ctx).expect("apply must succeed");
         assert!(matches!(result, RewriteResult::Unchanged));
     }
 
     #[test]
     fn rejects_delta_over_aggregate() {
         let rule = PushDeltaThroughUnaryRule;
-        let mut ctx = ctx();
+        let (mut ctx, arena) = ctx_with_arena();
         let plan = delta(aggregate_over(leaf_scan()));
-        assert!(rule.matches(&plan, &ctx));
-        let err = rule.apply(plan, &mut ctx).expect_err("Aggregate must fail");
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut());
+        assert!(rule.matches(&expr, &ctx));
+        let err = rule.apply(expr, &mut ctx).expect_err("Aggregate must fail");
         assert!(
             err.contains("Iceberg IMV rewrite does not support this aggregate shape"),
             "unexpected error: {err}"
@@ -383,11 +403,12 @@ mod tests {
     #[test]
     fn leaves_delta_over_join_for_join_delta_rule() {
         let rule = PushDeltaThroughUnaryRule;
-        let mut ctx = ctx();
+        let (mut ctx, arena) = ctx_with_arena();
         let plan = delta(join_over(leaf_scan(), leaf_scan()));
-        assert!(rule.matches(&plan, &ctx));
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut());
+        assert!(rule.matches(&expr, &ctx));
         let result = rule
-            .apply(plan, &mut ctx)
+            .apply(expr, &mut ctx)
             .expect("join must be a no-op, not fail");
         assert!(
             matches!(result, RewriteResult::Unchanged),
@@ -398,10 +419,11 @@ mod tests {
     #[test]
     fn rejects_delta_over_union() {
         let rule = PushDeltaThroughUnaryRule;
-        let mut ctx = ctx();
+        let (mut ctx, arena) = ctx_with_arena();
         let plan = delta(union_over(vec![leaf_scan()]));
-        assert!(rule.matches(&plan, &ctx));
-        let err = rule.apply(plan, &mut ctx).expect_err("Union must fail");
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut());
+        assert!(rule.matches(&expr, &ctx));
+        let err = rule.apply(expr, &mut ctx).expect_err("Union must fail");
         assert!(
             err.contains("Iceberg IMV rewrite does not support this union shape"),
             "unexpected error: {err}"
@@ -415,15 +437,17 @@ mod tests {
         // This proves the marker fully descends across multiple unary levels
         // when the rule is driven to fixpoint, one level per apply.
         let rule = PushDeltaThroughUnaryRule;
-        let mut ctx = ctx();
+        let (mut ctx, arena) = ctx_with_arena();
         let plan = delta(project_over(filter_over(leaf_scan())));
 
         // First apply: push through Project.
-        let RewriteResult::Changed(after1) =
-            rule.apply(plan, &mut ctx).expect("apply must succeed")
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut());
+        let RewriteResult::Changed(after1_expr) =
+            rule.apply(expr, &mut ctx).expect("apply must succeed")
         else {
             panic!("expected Changed after first apply");
         };
+        let after1 = opt_expr_to_logical_plan(after1_expr, &arena.borrow());
         let LogicalPlanNodeKind::Project(_) = &after1.kind else {
             panic!("expected Project at root");
         };
@@ -434,12 +458,14 @@ mod tests {
         };
 
         // Second apply on the nested Delta(Filter(Scan)): push through Filter.
-        let RewriteResult::Changed(after2) = rule
-            .apply(nested_delta, &mut ctx)
+        let nested_expr = logical_plan_to_opt_expr(&nested_delta, &mut arena.borrow_mut());
+        let RewriteResult::Changed(after2_expr) = rule
+            .apply(nested_expr, &mut ctx)
             .expect("apply must succeed")
         else {
             panic!("expected Changed after second apply");
         };
+        let after2 = opt_expr_to_logical_plan(after2_expr, &arena.borrow());
         let LogicalPlanNodeKind::Filter(_) = &after2.kind else {
             panic!("expected Filter");
         };
@@ -461,20 +487,24 @@ mod tests {
         // yielding Project(Delta(Aggregate(Scan))); a second apply on the nested
         // Delta(Aggregate(Scan)) must fail-fast at the aggregate boundary.
         let rule = PushDeltaThroughUnaryRule;
-        let mut ctx = ctx();
+        let (mut ctx, arena) = ctx_with_arena();
         let plan = delta(project_over(aggregate_over(leaf_scan())));
 
-        let RewriteResult::Changed(after1) =
-            rule.apply(plan, &mut ctx).expect("apply must succeed")
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut());
+        let RewriteResult::Changed(after1_expr) =
+            rule.apply(expr, &mut ctx).expect("apply must succeed")
         else {
             panic!("expected Changed after first apply");
         };
+        let after1 = opt_expr_to_logical_plan(after1_expr, &arena.borrow());
         let LogicalPlanNodeKind::Project(_) = &after1.kind else {
             panic!("expected Project at root");
         };
         // Second apply on Delta(Aggregate(Scan)) must fail-fast.
+        let nested_delta = after1.unary_input().clone();
+        let nested_expr = logical_plan_to_opt_expr(&nested_delta, &mut arena.borrow_mut());
         let err = rule
-            .apply(after1.unary_input().clone(), &mut ctx)
+            .apply(nested_expr, &mut ctx)
             .expect_err("aggregate must fail");
         assert!(
             err.contains("Iceberg IMV rewrite does not support this aggregate shape"),

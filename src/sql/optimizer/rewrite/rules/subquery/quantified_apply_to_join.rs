@@ -7,8 +7,10 @@
 //! join that timed out). For correlated NOT IN with a nullable lifted inner
 //! WHERE, that lifted predicate is wrapped coalesce(pred, false).
 
+use super::bridge::{opt_expr_to_plan, plan_to_opt_expr};
 use super::predicate_apply_util::{coalesce_false, eq, lift_correlated_inner};
 use crate::sql::analysis::{ExprKind, JoinKind, TypedExpr};
+use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
@@ -29,110 +31,126 @@ impl LogicalRewriteRule for QuantifiedApplyToJoin {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
-        matches!(
-            &plan.kind,
-            LogicalPlanNodeKind::Apply(a) if a.use_semi_anti && matches!(a.kind, ApplyKind::In { .. })
-        )
+    fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
+        let arena = ctx.scalar_arena();
+        let plan = opt_expr_to_plan(expr, &arena.borrow());
+        matches_plan(&plan)
     }
 
-    fn apply(
-        &self,
-        plan: LogicalPlanNode,
-        _ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
-        let LogicalPlanNode {
-            kind,
-            mut children,
-            required_output_columns: _,
-        } = plan;
-        let LogicalPlanNodeKind::Apply(a) = &kind else {
-            return Ok(RewriteResult::Unchanged);
-        };
-        if children.len() != 2 {
-            return Ok(RewriteResult::Unchanged);
-        }
-        let apply_right = children.remove(1);
-        let apply_left = children.remove(0);
-        let negated = match a.kind {
-            ApplyKind::In { negated } => negated,
-            _ => return Ok(RewriteResult::Unchanged),
-        };
-        if !a.use_semi_anti {
-            return Ok(RewriteResult::Unchanged);
-        }
-
-        let lhs = a.subquery_expr.clone();
-        let inner_cols = plan_output_columns(&apply_right)?;
-        let available_output_ids = inner_cols
-            .iter()
-            .map(|c| c.column_id.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let inner_col_oc = inner_cols
-            .iter()
-            .find(|c| c.column_id == a.inner_output_column_id)
-            .ok_or_else(|| {
-                format!(
-                    "IN subquery inner output column {} not found in right output columns [{}]",
-                    a.inner_output_column_id, available_output_ids
-                )
-            })?;
-        let inner_col_ref = TypedExpr {
-            kind: ExprKind::ColumnRef {
-                column_id: inner_col_oc.column_id,
-                qualifier: None,
-                column: inner_col_oc.name.clone(),
-            },
-            data_type: inner_col_oc.data_type.clone(),
-            nullable: inner_col_oc.nullable,
-        };
-
-        let either_nullable = lhs.nullable || inner_col_ref.nullable;
-        let join_type = if negated {
-            if either_nullable {
-                JoinKind::NullAwareLeftAnti
-            } else {
-                JoinKind::LeftAnti
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+        let arena = ctx.scalar_arena();
+        let plan = opt_expr_to_plan(&expr, &arena.borrow());
+        match apply_plan(plan)? {
+            Some(new_plan) => {
+                let new_expr = plan_to_opt_expr(&new_plan, &mut arena.borrow_mut());
+                Ok(RewriteResult::Changed(new_expr))
             }
-        } else {
-            JoinKind::LeftSemi
-        };
-
-        let in_key = eq(lhs, inner_col_ref);
-
-        let (right, condition) = if a.correlation_column_ids.is_empty() {
-            (apply_right, in_key)
-        } else {
-            let Some(lifted) = lift_correlated_inner(apply_right, &a.correlation_column_ids) else {
-                return Ok(RewriteResult::Unchanged);
-            };
-            let Some(lifted_pred) = lifted.on_predicate else {
-                return Ok(RewriteResult::Unchanged);
-            };
-            let extra = if negated && lifted_pred.nullable {
-                coalesce_false(lifted_pred)
-            } else {
-                lifted_pred
-            };
-            (lifted.right, combine_and(vec![in_key, extra]))
-        };
-
-        Ok(RewriteResult::Changed(LogicalPlanNode::new(
-            LogicalPlanNodeKind::Join(LogicalJoinNode {
-                join_type,
-                condition: Some(condition),
-            }),
-            vec![apply_left, right],
-            None,
-        )))
+            None => Ok(RewriteResult::Unchanged),
+        }
     }
+}
+
+fn matches_plan(plan: &LogicalPlanNode) -> bool {
+    matches!(
+        &plan.kind,
+        LogicalPlanNodeKind::Apply(a) if a.use_semi_anti && matches!(a.kind, ApplyKind::In { .. })
+    )
+}
+
+fn apply_plan(plan: LogicalPlanNode) -> Result<Option<LogicalPlanNode>, String> {
+    let LogicalPlanNode {
+        kind,
+        mut children,
+        required_output_columns: _,
+    } = plan;
+    let LogicalPlanNodeKind::Apply(a) = &kind else {
+        return Ok(None);
+    };
+    if children.len() != 2 {
+        return Ok(None);
+    }
+    let apply_right = children.remove(1);
+    let apply_left = children.remove(0);
+    let negated = match a.kind {
+        ApplyKind::In { negated } => negated,
+        _ => return Ok(None),
+    };
+    if !a.use_semi_anti {
+        return Ok(None);
+    }
+
+    let lhs = a.subquery_expr.clone();
+    let inner_cols = plan_output_columns(&apply_right)?;
+    let available_output_ids = inner_cols
+        .iter()
+        .map(|c| c.column_id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let inner_col_oc = inner_cols
+        .iter()
+        .find(|c| c.column_id == a.inner_output_column_id)
+        .ok_or_else(|| {
+            format!(
+                "IN subquery inner output column {} not found in right output columns [{}]",
+                a.inner_output_column_id, available_output_ids
+            )
+        })?;
+    let inner_col_ref = TypedExpr {
+        kind: ExprKind::ColumnRef {
+            column_id: inner_col_oc.column_id,
+            qualifier: None,
+            column: inner_col_oc.name.clone(),
+        },
+        data_type: inner_col_oc.data_type.clone(),
+        nullable: inner_col_oc.nullable,
+    };
+
+    let either_nullable = lhs.nullable || inner_col_ref.nullable;
+    let join_type = if negated {
+        if either_nullable {
+            JoinKind::NullAwareLeftAnti
+        } else {
+            JoinKind::LeftAnti
+        }
+    } else {
+        JoinKind::LeftSemi
+    };
+
+    let in_key = eq(lhs, inner_col_ref);
+
+    let (right, condition) = if a.correlation_column_ids.is_empty() {
+        (apply_right, in_key)
+    } else {
+        let Some(lifted) = lift_correlated_inner(apply_right, &a.correlation_column_ids) else {
+            return Ok(None);
+        };
+        let Some(lifted_pred) = lifted.on_predicate else {
+            return Ok(None);
+        };
+        let extra = if negated && lifted_pred.nullable {
+            coalesce_false(lifted_pred)
+        } else {
+            lifted_pred
+        };
+        (lifted.right, combine_and(vec![in_key, extra]))
+    };
+
+    Ok(Some(LogicalPlanNode::new(
+        LogicalPlanNodeKind::Join(LogicalJoinNode {
+            join_type,
+            condition: Some(condition),
+        }),
+        vec![apply_left, right],
+        None,
+    )))
 }
 
 #[cfg(test)]
 mod tests {
     use crate::sql::planner::plan::*;
+    use std::cell::RefCell;
     use std::collections::HashSet;
+    use std::rc::Rc;
 
     use arrow::datatypes::DataType;
 
@@ -142,8 +160,10 @@ mod tests {
     };
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::convert::logical_plan_to_opt_expr;
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rules::utils::split_and;
+    use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::{
         ApplyKind, LogicalApplyNode, LogicalFilterNode, LogicalJoinNode, LogicalPlanNodeKind,
         LogicalProjectNode, LogicalScanNode,
@@ -155,8 +175,14 @@ mod tests {
     const INNER_K: ColumnId = ColumnId(4);
     const IN_OUT: ColumnId = ColumnId(5);
 
-    fn ctx() -> RewriteContext {
-        RewriteContext::for_query(Vec::<String>::new())
+    fn ctx_with_arena() -> RewriteContext {
+        let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
+        ctx
+    }
+
+    fn to_opt_expr(plan: &LogicalPlanNode, ctx: &mut RewriteContext) -> OptExpr {
+        logical_plan_to_opt_expr(plan, &mut ctx.scalar_arena().borrow_mut())
     }
 
     fn output_column(id: ColumnId, name: &str, nullable: bool) -> OutputColumn {
@@ -327,10 +353,13 @@ mod tests {
 
     fn rewrite(plan: LogicalPlanNode) -> LogicalPlanNode {
         let rule = QuantifiedApplyToJoin;
-        let mut ctx = ctx();
-        assert!(rule.matches(&plan, &ctx));
-        match rule.apply(plan, &mut ctx).expect("rewrite must not error") {
-            RewriteResult::Changed(plan) => plan,
+        let mut ctx = ctx_with_arena();
+        let expr = to_opt_expr(&plan, &mut ctx);
+        assert!(rule.matches(&expr, &ctx));
+        match rule.apply(expr, &mut ctx).expect("rewrite must not error") {
+            RewriteResult::Changed(new_expr) => {
+                opt_expr_to_plan(&new_expr, &ctx.scalar_arena().borrow())
+            }
             other => panic!("expected Changed, got: {other:?}"),
         }
     }
@@ -348,17 +377,48 @@ mod tests {
         join
     }
 
-    fn assert_eq_condition(
-        condition: &TypedExpr,
-        expected_left: ColumnId,
-        expected_right: ColumnId,
-    ) {
+    fn assert_eq_condition(condition: &TypedExpr, expected_a: ColumnId, expected_b: ColumnId) {
         let ExprKind::BinaryOp { left, op, right } = &condition.kind else {
             panic!("expected bare Eq condition, got: {condition:?}");
         };
         assert_eq!(*op, BinOp::Eq);
-        assert_column_id(left, expected_left);
-        assert_column_id(right, expected_right);
+        // The arena normalizes commutative Eq by ScalarId order, so left/right
+        // assignment is an implementation detail. Check that the expected pair
+        // of column ids appears in either order.
+        let left_id = match &left.kind {
+            ExprKind::ColumnRef { column_id, .. } => *column_id,
+            other => panic!("expected column ref on left, got: {other:?}"),
+        };
+        let right_id = match &right.kind {
+            ExprKind::ColumnRef { column_id, .. } => *column_id,
+            other => panic!("expected column ref on right, got: {other:?}"),
+        };
+        let pair = (left_id, right_id);
+        assert!(
+            pair == (expected_a, expected_b) || pair == (expected_b, expected_a),
+            "expected Eq condition to reference {expected_a:?} and {expected_b:?}; got {pair:?}"
+        );
+    }
+
+    /// Returns true if `condition` is `a = b` (Eq BinaryOp) with the two
+    /// expected column ids in either order.
+    fn eq_condition_has_pair(condition: &TypedExpr, a: ColumnId, b: ColumnId) -> bool {
+        let ExprKind::BinaryOp { left, op, right } = &condition.kind else {
+            return false;
+        };
+        if *op != BinOp::Eq {
+            return false;
+        }
+        let left_id = match &left.kind {
+            ExprKind::ColumnRef { column_id, .. } => *column_id,
+            _ => return false,
+        };
+        let right_id = match &right.kind {
+            ExprKind::ColumnRef { column_id, .. } => *column_id,
+            _ => return false,
+        };
+        let pair = (left_id, right_id);
+        pair == (a, b) || pair == (b, a)
     }
 
     fn assert_coalesce_false(
@@ -463,8 +523,17 @@ mod tests {
         let conjuncts = split_and(join.condition.as_ref().unwrap().clone());
 
         assert_eq!(conjuncts.len(), 2);
-        assert_eq_condition(&conjuncts[0], OUTER_A, INNER_B);
-        assert_eq_condition(&conjuncts[1], OUTER_K, INNER_K);
+        // The arena normalizes AND by ScalarId order, so conjunct order may
+        // differ from the original. Assert that each expected pair appears
+        // somewhere in the conjunct list.
+        let has_outer_a_inner_b = conjuncts
+            .iter()
+            .any(|c| eq_condition_has_pair(c, OUTER_A, INNER_B));
+        let has_outer_k_inner_k = conjuncts
+            .iter()
+            .any(|c| eq_condition_has_pair(c, OUTER_K, INNER_K));
+        assert!(has_outer_a_inner_b, "expected OUTER_A=INNER_B conjunct");
+        assert!(has_outer_k_inner_k, "expected OUTER_K=INNER_K conjunct");
         let right = plan.right();
         let LogicalPlanNodeKind::Project(_project) = &right.kind else {
             panic!("expected Project right, got: {:?}", right);
@@ -487,8 +556,14 @@ mod tests {
         let conjuncts = split_and(join.condition.as_ref().unwrap().clone());
 
         assert_eq!(conjuncts.len(), 2);
-        assert_eq_condition(&conjuncts[0], OUTER_A, INNER_B);
-        assert_coalesce_false(&conjuncts[1], OUTER_K, INNER_K);
+        // The arena normalizes AND by ScalarId order; find each expected conjunct
+        // without relying on its position in the list.
+        let outer_a_inner_b_idx = conjuncts
+            .iter()
+            .position(|c| eq_condition_has_pair(c, OUTER_A, INNER_B))
+            .expect("expected OUTER_A=INNER_B conjunct");
+        let coalesce_idx = if outer_a_inner_b_idx == 0 { 1 } else { 0 };
+        assert_coalesce_false(&conjuncts[coalesce_idx], OUTER_K, INNER_K);
         let right = plan.right();
         let LogicalPlanNodeKind::Project(_project) = &right.kind else {
             panic!("expected Project right, got: {:?}", right);
@@ -518,13 +593,14 @@ mod tests {
     #[test]
     fn missing_inner_output_column_id_errors() {
         let rule = QuantifiedApplyToJoin;
-        let mut ctx = ctx();
+        let mut ctx = ctx_with_arena();
         let mut plan = in_apply(false, false, inner_scan(false, false), false);
         let missing = ColumnId(999);
         set_inner_output_column_id(&mut plan, missing);
+        let expr = to_opt_expr(&plan, &mut ctx);
 
         let err = rule
-            .apply(plan, &mut ctx)
+            .apply(expr, &mut ctx)
             .expect_err("missing inner output column id must error");
 
         assert!(err.contains("c999"), "unexpected error: {err}");
@@ -535,15 +611,16 @@ mod tests {
     #[test]
     fn use_semi_anti_false_is_not_rewritten() {
         let rule = QuantifiedApplyToJoin;
-        let mut ctx = ctx();
+        let mut ctx = ctx_with_arena();
         let mut plan = in_apply(false, false, inner_scan(false, false), false);
         set_use_semi_anti(&mut plan, false);
+        let expr = to_opt_expr(&plan, &mut ctx);
 
         assert!(
-            !rule.matches(&plan, &ctx),
+            !rule.matches(&expr, &ctx),
             "use_semi_anti=false must not match"
         );
-        let result = rule.apply(plan, &mut ctx).expect("rewrite must not error");
+        let result = rule.apply(expr, &mut ctx).expect("rewrite must not error");
         assert!(matches!(result, RewriteResult::Unchanged));
     }
 }

@@ -11,6 +11,7 @@
 use crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN;
 use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
 use crate::sql::catalog::ScanSource;
+use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
 use crate::sql::optimizer::rewrite::imv::annotation::ImvExtension;
@@ -18,6 +19,9 @@ use crate::sql::optimizer::rewrite::imv::join_delta_shape::{
     is_supported_join_delta_branch, is_supported_join_delta_union,
 };
 use crate::sql::optimizer::rewrite::imv::row_id_column::ImvRowIdColumn;
+use crate::sql::optimizer::rewrite::imv::{
+    PlanRewriteResult, bridge_apply_result, opt_expr_to_plan,
+};
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
@@ -175,7 +179,8 @@ impl LogicalRewriteRule for InjectActionColumnRule {
         RewriteTraversal::BottomUp
     }
 
-    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+    fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
+        let plan = opt_expr_to_plan(expr.clone(), ctx);
         match &plan.kind {
             LogicalPlanNodeKind::Scan(scan) => {
                 matches!(scan.table.source, ScanSource::IcebergDeltaTable { .. })
@@ -185,22 +190,20 @@ impl LogicalRewriteRule for InjectActionColumnRule {
         }
     }
 
-    fn apply(
-        &self,
-        mut plan: LogicalPlanNode,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
-        let LogicalPlanNodeKind::Scan(scan) = &mut plan.kind else {
-            return Ok(RewriteResult::Unchanged);
-        };
-        let ext = ctx.extension::<ImvExtension>().ok_or_else(|| {
-            "InjectActionColumn requires ImvExtension in RewriteContext".to_string()
-        })?;
-        let column_id = ext.allocate_column_id();
-        scan.columns
-            .retain(|column| !is_action_column_name(&column.name));
-        scan.columns.push(ImvActionColumn::output_column(column_id));
-        Ok(RewriteResult::Changed(plan))
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+        bridge_apply_result(expr, ctx, |mut plan, ctx| {
+            let LogicalPlanNodeKind::Scan(scan) = &mut plan.kind else {
+                return Ok(PlanRewriteResult::Unchanged);
+            };
+            let ext = ctx.extension::<ImvExtension>().ok_or_else(|| {
+                "InjectActionColumn requires ImvExtension in RewriteContext".to_string()
+            })?;
+            let column_id = ext.allocate_column_id();
+            scan.columns
+                .retain(|column| !is_action_column_name(&column.name));
+            scan.columns.push(ImvActionColumn::output_column(column_id));
+            Ok(PlanRewriteResult::Changed(plan))
+        })
     }
 }
 
@@ -224,10 +227,11 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
         RewriteTraversal::BottomUp
     }
 
-    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+    fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
+        let plan = opt_expr_to_plan(expr.clone(), ctx);
         match &plan.kind {
             LogicalPlanNodeKind::Project(p) => {
-                if is_supported_branch_union_project(plan) {
+                if is_supported_branch_union_project(&plan) {
                     false
                 } else {
                     let internal = descendant_internal_columns(plan.unary_input());
@@ -250,98 +254,96 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
             }
             LogicalPlanNodeKind::Join(_) => {
                 (subtree_has_action_column(plan.left()) || subtree_has_action_column(plan.right()))
-                    && !is_supported_join_delta_branch(plan)
+                    && !is_supported_join_delta_branch(&plan)
             }
             LogicalPlanNodeKind::Union(_) => {
-                if branch_delta_union_needs_row_id_output(plan) {
+                if branch_delta_union_needs_row_id_output(&plan) {
                     true
                 } else {
                     plan.children.iter().any(subtree_has_action_column)
-                        && !is_supported_join_delta_union(plan)
-                        && !is_supported_fan_in_delta_union(plan)
-                        && !is_supported_branch_union(plan)
+                        && !is_supported_join_delta_union(&plan)
+                        && !is_supported_fan_in_delta_union(&plan)
+                        && !is_supported_branch_union(&plan)
                 }
             }
             _ => false,
         }
     }
 
-    fn apply(
-        &self,
-        mut plan: LogicalPlanNode,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
-        // Diagnostic: the delta base under an unsupported node, if any. Computed
-        // up-front from `&plan` so the fail-fast arms can name the offending
-        // base table; harmless for the Project happy path.
-        let base = first_delta_base_fqn(&plan).unwrap_or_else(|| "<unknown>".to_string());
-        if is_supported_branch_union_project(&plan) {
-            return Ok(RewriteResult::Unchanged);
-        }
-        if matches!(plan.kind, LogicalPlanNodeKind::Project(_)) {
-            let internal = descendant_internal_columns(plan.unary_input());
-            let LogicalPlanNodeKind::Project(p) = &mut plan.kind else {
-                unreachable!()
-            };
-            for col in internal {
-                let already = p
-                    .items
-                    .iter()
-                    .any(|item| item.output_name.eq_ignore_ascii_case(&col.name));
-                if already {
-                    continue;
-                }
-                p.items.push(ProjectItem {
-                    expr: TypedExpr {
-                        kind: ExprKind::ColumnRef {
-                            column_id: col.column_id,
-                            qualifier: None,
-                            column: col.name.clone(),
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+        bridge_apply_result(expr, ctx, |mut plan, ctx| {
+            // Diagnostic: the delta base under an unsupported node, if any. Computed
+            // up-front from `&plan` so the fail-fast arms can name the offending
+            // base table; harmless for the Project happy path.
+            let base = first_delta_base_fqn(&plan).unwrap_or_else(|| "<unknown>".to_string());
+            if is_supported_branch_union_project(&plan) {
+                return Ok(PlanRewriteResult::Unchanged);
+            }
+            if matches!(plan.kind, LogicalPlanNodeKind::Project(_)) {
+                let internal = descendant_internal_columns(plan.unary_input());
+                let LogicalPlanNodeKind::Project(p) = &mut plan.kind else {
+                    unreachable!()
+                };
+                for col in internal {
+                    let already = p
+                        .items
+                        .iter()
+                        .any(|item| item.output_name.eq_ignore_ascii_case(&col.name));
+                    if already {
+                        continue;
+                    }
+                    p.items.push(ProjectItem {
+                        expr: TypedExpr {
+                            kind: ExprKind::ColumnRef {
+                                column_id: col.column_id,
+                                qualifier: None,
+                                column: col.name.clone(),
+                            },
+                            data_type: col.data_type.clone(),
+                            nullable: col.nullable,
                         },
-                        data_type: col.data_type.clone(),
-                        nullable: col.nullable,
-                    },
-                    output_name: col.name.clone(),
-                    output_column_id: col.column_id,
-                });
+                        output_name: col.name.clone(),
+                        output_column_id: col.column_id,
+                    });
+                }
+                return Ok(PlanRewriteResult::Changed(plan));
             }
-            return Ok(RewriteResult::Changed(plan));
-        }
 
-        if branch_delta_union_needs_row_id_output(&plan) {
-            let ext = ctx.extension::<ImvExtension>().ok_or_else(|| {
-                "PropagateActionColumn requires ImvExtension in RewriteContext".to_string()
-            })?;
-            let row_id_column = ext.allocate_column_id();
-            for input in &mut plan.children {
-                normalize_branch_row_id_output(input, row_id_column)?;
+            if branch_delta_union_needs_row_id_output(&plan) {
+                let ext = ctx.extension::<ImvExtension>().ok_or_else(|| {
+                    "PropagateActionColumn requires ImvExtension in RewriteContext".to_string()
+                })?;
+                let row_id_column = ext.allocate_column_id();
+                for input in &mut plan.children {
+                    normalize_branch_row_id_output(input, row_id_column)?;
+                }
+                let LogicalPlanNodeKind::Union(u) = &mut plan.kind else {
+                    unreachable!()
+                };
+                u.output_columns
+                    .push(ImvRowIdColumn::output_column(row_id_column));
+                return Ok(PlanRewriteResult::Changed(plan));
             }
-            let LogicalPlanNodeKind::Union(u) = &mut plan.kind else {
-                unreachable!()
-            };
-            u.output_columns
-                .push(ImvRowIdColumn::output_column(row_id_column));
-            return Ok(RewriteResult::Changed(plan));
-        }
 
-        match &plan.kind {
-            LogicalPlanNodeKind::Aggregate(_) => Err(format!(
-                "IMV action column propagation does not support Aggregate above \
-                 delta-bound scan {base} in Phase 2; aggregate state rewrite is \
-                 scheduled for Phase 4"
-            )),
-            LogicalPlanNodeKind::Join(_) => Err(format!(
-                "IMV action column propagation does not support Join above \
-                 delta-bound scan {base} in Phase 2; join delta algebra is \
-                 handled by the delta-pushdown fixpoint"
-            )),
-            LogicalPlanNodeKind::Union(_) => Err(format!(
-                "IMV action column propagation does not support UNION above \
-                 delta-bound scan {base} in Phase 2; union delta rewrite is \
-                 scheduled for Phase 6"
-            )),
-            _ => Ok(RewriteResult::Unchanged),
-        }
+            match &plan.kind {
+                LogicalPlanNodeKind::Aggregate(_) => Err(format!(
+                    "IMV action column propagation does not support Aggregate above \
+                     delta-bound scan {base} in Phase 2; aggregate state rewrite is \
+                     scheduled for Phase 4"
+                )),
+                LogicalPlanNodeKind::Join(_) => Err(format!(
+                    "IMV action column propagation does not support Join above \
+                     delta-bound scan {base} in Phase 2; join delta algebra is \
+                     handled by the delta-pushdown fixpoint"
+                )),
+                LogicalPlanNodeKind::Union(_) => Err(format!(
+                    "IMV action column propagation does not support UNION above \
+                     delta-bound scan {base} in Phase 2; union delta rewrite is \
+                     scheduled for Phase 6"
+                )),
+                _ => Ok(PlanRewriteResult::Unchanged),
+            }
+        })
     }
 }
 
@@ -533,8 +535,13 @@ mod tests {
         ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
     use crate::sql::column_id::ColumnId;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use crate::sql::optimizer::convert::{logical_plan_to_opt_expr, opt_expr_to_logical_plan};
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::imv::annotation::{ImvExtension, ImvPlanAnnotation};
+    use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::{
         AggregateCall, LogicalAggregateNode, LogicalAggregateStateMergeNode, LogicalFilterNode,
         LogicalJoinNode, LogicalPlanNode, LogicalPlanNodeKind, LogicalScanNode, LogicalUnionNode,
@@ -542,6 +549,7 @@ mod tests {
 
     fn build_ctx() -> RewriteContext {
         let mut ctx = RewriteContext::for_mv_refresh(Vec::new());
+        ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
         ctx.set_extension::<ImvExtension>(ImvExtension {
             mv_ctx: dummy_rewrite_context(),
             annotation: ImvPlanAnnotation::default(),
@@ -625,11 +633,14 @@ mod tests {
         let rule = InjectActionColumnRule;
         let mut ctx = build_ctx();
         let plan = scan_plan(delta_scan());
-        assert!(rule.matches(&plan, &ctx));
-        let result = rule.apply(plan, &mut ctx).expect("apply must succeed");
-        let RewriteResult::Changed(changed) = result else {
+        let mut arena = ScalarArena::new();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        assert!(rule.matches(&expr, &ctx));
+        let result = rule.apply(expr, &mut ctx).expect("apply must succeed");
+        let RewriteResult::Changed(changed_expr) = result else {
             panic!("expected Changed(Scan), got {:?}", result);
         };
+        let changed = opt_expr_to_logical_plan(changed_expr, &arena);
         let LogicalPlanNodeKind::Scan(scan) = changed.kind else {
             panic!("expected Changed(Scan)");
         };
@@ -658,10 +669,14 @@ mod tests {
         ));
         let plan = scan_plan(scan);
 
-        assert!(rule.matches(&plan, &ctx));
-        let RewriteResult::Changed(changed) = rule.apply(plan, &mut ctx).expect("apply") else {
+        let mut arena = ScalarArena::new();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        assert!(rule.matches(&expr, &ctx));
+        let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("apply")
+        else {
             panic!("expected Changed(Scan)");
         };
+        let changed = opt_expr_to_logical_plan(changed_expr, &arena);
         let LogicalPlanNodeKind::Scan(scan) = changed.kind else {
             panic!("expected Changed(Scan)");
         };
@@ -680,7 +695,9 @@ mod tests {
         let rule = InjectActionColumnRule;
         let ctx = build_ctx();
         let plan = scan_plan(version_scan());
-        assert!(!rule.matches(&plan, &ctx));
+        let mut arena = ScalarArena::new();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        assert!(!rule.matches(&expr, &ctx));
     }
 
     #[test]
@@ -691,7 +708,9 @@ mod tests {
         scan.columns
             .push(ImvActionColumn::output_column(ColumnId(9)));
         let plan = scan_plan(scan);
-        assert!(!rule.matches(&plan, &ctx));
+        let mut arena = ScalarArena::new();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        assert!(!rule.matches(&expr, &ctx));
     }
 
     #[test]
@@ -699,7 +718,9 @@ mod tests {
         let rule = InjectActionColumnRule;
         let ctx = build_ctx();
         let plan = scan_plan(starrocks_scan());
-        assert!(!rule.matches(&plan, &ctx));
+        let mut arena = ScalarArena::new();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        assert!(!rule.matches(&expr, &ctx));
     }
 
     use crate::sql::planner::plan::LogicalProjectNode;
@@ -1131,11 +1152,14 @@ mod tests {
         let mut ctx = build_ctx();
         let scan = scan_plan(delta_scan_with_action(ColumnId(100)));
         let plan = project_over(scan, ColumnId(1));
-        assert!(rule.matches(&plan, &ctx));
-        let result = rule.apply(plan, &mut ctx).expect("apply must succeed");
-        let RewriteResult::Changed(changed) = result else {
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        assert!(rule.matches(&expr, &ctx));
+        let result = rule.apply(expr, &mut ctx).expect("apply must succeed");
+        let RewriteResult::Changed(changed_expr) = result else {
             panic!("expected Changed(Project)");
         };
+        let changed = opt_expr_to_logical_plan(changed_expr, &arena_rc.borrow());
         let LogicalPlanNodeKind::Project(project) = changed.kind else {
             panic!("expected Changed(Project)");
         };
@@ -1171,7 +1195,9 @@ mod tests {
                 output_column_id: ColumnId(100),
             });
         }
-        assert!(!rule.matches(&plan, &ctx));
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        assert!(!rule.matches(&expr, &ctx));
     }
 
     #[test]
@@ -1180,7 +1206,9 @@ mod tests {
         let rule = PropagateActionColumnRule;
         let ctx = build_ctx();
         let plan = scan_plan(delta_scan_with_action(ColumnId(100)));
-        assert!(!rule.matches(&plan, &ctx));
+        let mut arena = ScalarArena::new();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        assert!(!rule.matches(&expr, &ctx));
     }
 
     #[test]
@@ -1198,8 +1226,10 @@ mod tests {
             vec![scan],
             None,
         );
-        assert!(rule.matches(&plan, &ctx));
-        let err = rule.apply(plan, &mut ctx).expect_err("Aggregate must fail");
+        let mut arena = ScalarArena::new();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        assert!(rule.matches(&expr, &ctx));
+        let err = rule.apply(expr, &mut ctx).expect_err("Aggregate must fail");
         assert!(err.contains("Phase 4"), "unexpected error: {err}");
         assert!(err.contains("ice.db.b"), "unexpected error: {err}");
     }
@@ -1218,8 +1248,10 @@ mod tests {
             vec![left, right],
             None,
         );
-        assert!(rule.matches(&plan, &ctx));
-        let err = rule.apply(plan, &mut ctx).expect_err("Join must fail");
+        let mut arena = ScalarArena::new();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        assert!(rule.matches(&expr, &ctx));
+        let err = rule.apply(expr, &mut ctx).expect_err("Join must fail");
         assert!(
             err.contains("delta-pushdown fixpoint"),
             "unexpected error: {err}"
@@ -1242,8 +1274,10 @@ mod tests {
             ],
             None,
         );
-        assert!(rule.matches(&plan, &ctx));
-        let err = rule.apply(plan, &mut ctx).expect_err("Union must fail");
+        let mut arena = ScalarArena::new();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena);
+        assert!(rule.matches(&expr, &ctx));
+        let err = rule.apply(expr, &mut ctx).expect_err("Union must fail");
         assert!(err.contains("Phase 6"), "unexpected error: {err}");
         assert!(err.contains("ice.db.b"), "unexpected error: {err}");
     }
@@ -1277,8 +1311,10 @@ mod tests {
             is_supported_join_delta_branch(&plan),
             "recursive join-delta union should classify as the delta-like side"
         );
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
         assert!(
-            !rule.matches(&plan, &ctx),
+            !rule.matches(&expr, &ctx),
             "supported recursive join-delta branch must not be rejected"
         );
     }
@@ -1309,7 +1345,9 @@ mod tests {
             None,
         );
 
-        assert!(!rule.matches(&union, &ctx));
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&union, &mut arena_rc.borrow_mut());
+        assert!(!rule.matches(&expr, &ctx));
     }
 
     #[test]
@@ -1329,16 +1367,20 @@ mod tests {
             None,
         );
 
-        assert!(!rule.matches(&union, &ctx));
+        let mut arena = ScalarArena::new();
+        let expr = logical_plan_to_opt_expr(&union, &mut arena);
+        assert!(!rule.matches(&expr, &ctx));
     }
 
     #[test]
     fn supported_branch_union_is_not_rejected_by_propagation() {
         let rule = PropagateActionColumnRule;
-        let ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
+        let mut ctx = build_ctx();
         let plan = branch_union_with_aggregate_state_merge();
 
-        assert!(!rule.matches(&plan, &ctx));
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        assert!(!rule.matches(&expr, &ctx));
         let LogicalPlanNodeKind::Union(_) = &plan.kind else {
             panic!("expected union");
         };
@@ -1348,7 +1390,7 @@ mod tests {
     #[test]
     fn supported_branch_union_project_is_not_rewritten_before_parent_union() {
         let rule = PropagateActionColumnRule;
-        let ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
+        let mut ctx = build_ctx();
         let plan = branch_union_with_aggregate_state_merge();
         let LogicalPlanNodeKind::Union(_) = &plan.kind else {
             panic!("expected union");
@@ -1357,7 +1399,9 @@ mod tests {
 
         assert!(is_supported_branch_union_project(branch_project));
         assert!(!descendant_internal_columns(branch_project.unary_input()).is_empty());
-        assert!(!rule.matches(branch_project, &ctx));
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(branch_project, &mut arena_rc.borrow_mut());
+        assert!(!rule.matches(&expr, &ctx));
     }
 
     #[test]
@@ -1376,8 +1420,10 @@ mod tests {
             None,
         );
 
-        assert!(rule.matches(&union, &ctx));
-        let err = rule.apply(union, &mut ctx).expect_err("Union must fail");
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&union, &mut arena_rc.borrow_mut());
+        assert!(rule.matches(&expr, &ctx));
+        let err = rule.apply(expr, &mut ctx).expect_err("Union must fail");
         assert!(err.contains("Phase 6"), "unexpected error: {err}");
         assert!(err.contains("ice.db.b"), "unexpected error: {err}");
     }
@@ -1398,7 +1444,9 @@ mod tests {
             None,
         );
 
-        assert!(!rule.matches(&union, &ctx));
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&union, &mut arena_rc.borrow_mut());
+        assert!(!rule.matches(&expr, &ctx));
     }
 
     #[test]
@@ -1417,8 +1465,11 @@ mod tests {
             None,
         );
 
-        assert!(rule.matches(&union, &ctx));
-        let err = rule.apply(union, &mut ctx).expect_err("Union must fail");
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&union, &mut arena_rc.borrow_mut());
+        drop(arena_rc);
+        assert!(rule.matches(&expr, &ctx));
+        let err = rule.apply(expr, &mut ctx).expect_err("Union must fail");
         assert!(err.contains("Phase 6"), "unexpected error: {err}");
         assert!(err.contains("ice.db.b"), "unexpected error: {err}");
     }
@@ -1433,10 +1484,16 @@ mod tests {
         scan.columns
             .push(ImvRowIdColumn::output_column(ColumnId(101)));
         let plan = project_over(scan_plan(scan), ColumnId(1));
-        assert!(rule.matches(&plan, &ctx));
-        let RewriteResult::Changed(changed) = rule.apply(plan, &mut ctx).expect("apply") else {
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        drop(arena_rc);
+        assert!(rule.matches(&expr, &ctx));
+        let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("apply")
+        else {
             panic!("expected Changed(Project)");
         };
+        let arena_rc = ctx.scalar_arena();
+        let changed = opt_expr_to_logical_plan(changed_expr, &arena_rc.borrow());
         let LogicalPlanNodeKind::Project(project) = changed.kind else {
             panic!("expected Changed(Project)");
         };
@@ -1465,17 +1522,25 @@ mod tests {
             vec![scan],
             None,
         );
+        let arena_rc = ctx.scalar_arena();
         // Filter itself must not match (schema-passthrough, no work).
-        assert!(!rule.matches(&filter, &ctx));
+        let filter_expr = logical_plan_to_opt_expr(&filter, &mut arena_rc.borrow_mut());
+        assert!(!rule.matches(&filter_expr, &ctx));
         // find_action_column traverses the Filter to the Scan.
         assert!(find_action_column(&filter).is_some());
         // Project over the Filter propagates the action column.
         let project = project_over(filter, ColumnId(1));
-        assert!(rule.matches(&project, &ctx));
-        let result = rule.apply(project, &mut ctx).expect("apply must succeed");
-        let RewriteResult::Changed(changed) = result else {
+        let project_expr = logical_plan_to_opt_expr(&project, &mut arena_rc.borrow_mut());
+        drop(arena_rc);
+        assert!(rule.matches(&project_expr, &ctx));
+        let result = rule
+            .apply(project_expr, &mut ctx)
+            .expect("apply must succeed");
+        let RewriteResult::Changed(changed_expr) = result else {
             panic!("expected Changed(Project)");
         };
+        let arena_rc = ctx.scalar_arena();
+        let changed = opt_expr_to_logical_plan(changed_expr, &arena_rc.borrow());
         let LogicalPlanNodeKind::Project(p) = changed.kind else {
             panic!("expected Changed(Project)");
         };

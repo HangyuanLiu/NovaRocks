@@ -9,6 +9,7 @@ use crate::engine::dictionary::model::DictionarySnapshot;
 use crate::sql::catalog::TableDef;
 use crate::sql::column_id::ColumnRefFactory;
 use crate::sql::optimizer::rewrite::trace::RewriteTrace;
+use crate::sql::optimizer::scalar::ScalarArena;
 use crate::sql::optimizer::statistics::TableStatistics;
 
 /// Loads dictionary snapshots for scan-time low-cardinality string columns.
@@ -107,6 +108,10 @@ pub(crate) struct RewriteContext {
     deadline: Option<Instant>,
     dictionary_provider: Option<Arc<dyn QueryDictionaryProvider>>,
     column_ref_factory: Option<Rc<RefCell<ColumnRefFactory>>>,
+    /// Interned scalar arena for the current optimize() call. Set before the
+    /// rewrite phase (mirrors `column_ref_factory`); rules that inspect or
+    /// build scalars go through this. Unwrapped into `Memo.scalars` at convert.
+    scalar_arena: Option<Rc<RefCell<ScalarArena>>>,
     /// Accumulating set of (lowercased) column names that the
     /// low-cardinality dictionary rewrite must NOT dict-encode, because
     /// they are consumed somewhere in the plan in a position the rewriter
@@ -135,6 +140,7 @@ impl RewriteContext {
             deadline: None,
             dictionary_provider: None,
             column_ref_factory: None,
+            scalar_arena: None,
             dict_rewrite_blocklist: std::collections::BTreeSet::new(),
         }
     }
@@ -232,6 +238,20 @@ impl RewriteContext {
 
     pub(crate) fn column_ref_factory(&self) -> Option<&Rc<RefCell<ColumnRefFactory>>> {
         self.column_ref_factory.as_ref()
+    }
+
+    pub(crate) fn set_scalar_arena(&mut self, arena: Rc<RefCell<ScalarArena>>) {
+        self.scalar_arena = Some(arena);
+    }
+
+    /// The interned scalar arena for this rewrite run. Panics if accessed
+    /// before being set — the arena is always installed before the pipeline.
+    pub(crate) fn scalar_arena(&self) -> Rc<RefCell<ScalarArena>> {
+        Rc::clone(
+            self.scalar_arena
+                .as_ref()
+                .expect("scalar arena must be set before rewrite"),
+        )
     }
 
     pub(crate) fn check_deadline(&self, operation: &str) -> Result<(), String> {

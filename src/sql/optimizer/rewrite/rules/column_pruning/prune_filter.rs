@@ -9,11 +9,12 @@
 //! Kept for architectural symmetry and to allow per-operator
 //! `disable_optimizer_rules` control in the future.
 
+use crate::sql::optimizer::operator::Operator;
+use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind};
 
 pub(crate) struct PruneFilterColumns;
 
@@ -26,15 +27,11 @@ impl LogicalRewriteRule for PruneFilterColumns {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
-        matches!(&plan.kind, LogicalPlanNodeKind::Filter(_))
+    fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
+        matches!(&expr.op, Operator::LogicalFilter(_))
     }
 
-    fn apply(
-        &self,
-        _plan: LogicalPlanNode,
-        _ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, _expr: OptExpr, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         // No-op: Filter has no own output metadata to prune; column needs were
         // propagated to its child by the Phase-1 tagging pass. Kept for
         // architectural symmetry + per-operator disable_optimizer_rules control.
@@ -45,48 +42,45 @@ impl LogicalRewriteRule for PruneFilterColumns {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::TypedExpr;
+    use crate::sql::analysis::LiteralValue;
+    use crate::sql::optimizer::operator::{FilterOp, Operator, ValuesOp};
+    use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
-    use crate::sql::planner::plan::*;
-    use crate::sql::planner::plan::{LogicalFilterNode, LogicalPlanNodeKind, LogicalValuesNode};
+    use crate::sql::optimizer::scalar::HashableLiteral;
+    use crate::sql::optimizer::scalar::{ScalarArena, ScalarNode};
+    use arrow::datatypes::DataType;
 
     fn ctx() -> RewriteContext {
         RewriteContext::new(RewriteConsumer::Query)
     }
 
-    fn bool_literal() -> TypedExpr {
-        use crate::sql::analysis::ExprKind;
-        use arrow::datatypes::DataType;
-        TypedExpr {
-            kind: ExprKind::Literal(crate::sql::analysis::LiteralValue::Bool(true)),
-            data_type: DataType::Boolean,
-            nullable: false,
-        }
+    fn dummy_input() -> OptExpr {
+        OptExpr::leaf(Operator::LogicalValues(ValuesOp {
+            rows: vec![],
+            columns: vec![],
+        }))
     }
 
     #[test]
     fn prune_filter_is_always_unchanged() {
-        let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(LogicalFilterNode {
-                predicate: bool_literal(),
-            }),
-            vec![LogicalPlanNode::new(
-                LogicalPlanNodeKind::Values(LogicalValuesNode {
-                    rows: vec![],
-                    columns: vec![],
-                }),
-                vec![],
-                None,
-            )],
-            None,
+        let mut arena = ScalarArena::new();
+        let pred_id = arena.intern(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Bool(true))),
+            DataType::Boolean,
+            false,
+        );
+
+        let expr = OptExpr::new(
+            Operator::LogicalFilter(FilterOp { predicate: pred_id }),
+            vec![dummy_input()],
         );
         let rule = PruneFilterColumns;
 
         // matches the right variant
-        assert!(rule.matches(&plan, &ctx()));
+        assert!(rule.matches(&expr, &ctx()));
 
         // apply always returns Unchanged
-        let result = rule.apply(plan, &mut ctx()).unwrap();
+        let result = rule.apply(expr, &mut ctx()).unwrap();
         assert!(
             matches!(result, RewriteResult::Unchanged),
             "PruneFilterColumns must always return Unchanged"

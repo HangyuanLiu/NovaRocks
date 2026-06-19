@@ -106,13 +106,13 @@ mod tests {
         default_rewrite_phases, is_known_rewrite_rule_name, mv_rewrite_pipeline,
         query_rewrite_pipeline,
     };
-    use crate::sql::planner::plan::*;
     use std::collections::HashMap;
 
+    use crate::sql::optimizer::operator::{Operator, ValuesOp};
+    use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::phase::RewritePhase;
     use crate::sql::optimizer::rewrite::trace::RewriteTraceEvent;
-    use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind, LogicalValuesNode};
 
     #[derive(Debug, PartialEq, Eq)]
     struct TestMvExtension {
@@ -310,14 +310,13 @@ mod tests {
         );
     }
 
-    fn empty_values_plan() -> LogicalPlanNode {
-        LogicalPlanNode::new(
-            LogicalPlanNodeKind::Values(LogicalValuesNode {
+    fn empty_values_plan() -> OptExpr {
+        OptExpr::new(
+            Operator::LogicalValues(ValuesOp {
                 rows: vec![],
                 columns: vec![],
             }),
             vec![],
-            None,
         )
     }
 }

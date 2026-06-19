@@ -9,14 +9,119 @@
 
 use std::collections::HashSet;
 
+use crate::sql::column_id::ColumnId;
+use crate::sql::optimizer::operator::Operator;
+use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::optimizer::rewrite::rules::utils::collect_column_refs;
-use crate::sql::planner::plan::*;
+use crate::sql::optimizer::scalar::{self, ScalarNode};
 
 pub(crate) struct PruneScanColumns;
+
+/// Collect all ColumnIds referenced by a scalar expression tree rooted at `id`.
+/// Walks the scalar arena transitively.
+fn collect_scalar_column_ids(
+    arena: &scalar::ScalarArena,
+    id: scalar::ScalarId,
+    out: &mut HashSet<ColumnId>,
+) {
+    match arena.node(id) {
+        ScalarNode::ColumnRef(column_id) => {
+            out.insert(*column_id);
+        }
+        ScalarNode::Literal(_) => {}
+        ScalarNode::BinaryOp { left, right, .. } => {
+            collect_scalar_column_ids(arena, *left, out);
+            collect_scalar_column_ids(arena, *right, out);
+        }
+        ScalarNode::UnaryOp { child, .. } => {
+            collect_scalar_column_ids(arena, *child, out);
+        }
+        ScalarNode::FunctionCall { args, .. } => {
+            for &arg in args {
+                collect_scalar_column_ids(arena, arg, out);
+            }
+        }
+        ScalarNode::LambdaFunction { body, .. } => {
+            collect_scalar_column_ids(arena, *body, out);
+        }
+        ScalarNode::AggregateCall { args, order_by, .. } => {
+            for &arg in args {
+                collect_scalar_column_ids(arena, arg, out);
+            }
+            for key in order_by {
+                collect_scalar_column_ids(arena, key.expr, out);
+            }
+        }
+        ScalarNode::Cast { child, .. } => {
+            collect_scalar_column_ids(arena, *child, out);
+        }
+        ScalarNode::IsNull { child, .. } => {
+            collect_scalar_column_ids(arena, *child, out);
+        }
+        ScalarNode::InList { child, list, .. } => {
+            collect_scalar_column_ids(arena, *child, out);
+            for &item in list {
+                collect_scalar_column_ids(arena, item, out);
+            }
+        }
+        ScalarNode::Between {
+            child, low, high, ..
+        } => {
+            collect_scalar_column_ids(arena, *child, out);
+            collect_scalar_column_ids(arena, *low, out);
+            collect_scalar_column_ids(arena, *high, out);
+        }
+        ScalarNode::Like { child, pattern, .. } => {
+            collect_scalar_column_ids(arena, *child, out);
+            collect_scalar_column_ids(arena, *pattern, out);
+        }
+        ScalarNode::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(op) = operand {
+                collect_scalar_column_ids(arena, *op, out);
+            }
+            for &(when, then) in when_then {
+                collect_scalar_column_ids(arena, when, out);
+                collect_scalar_column_ids(arena, then, out);
+            }
+            if let Some(e) = else_expr {
+                collect_scalar_column_ids(arena, *e, out);
+            }
+        }
+        ScalarNode::IsTruthValue { child, .. } => {
+            collect_scalar_column_ids(arena, *child, out);
+        }
+        ScalarNode::Nested(child) => {
+            collect_scalar_column_ids(arena, *child, out);
+        }
+        ScalarNode::WindowCall {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for &arg in args {
+                collect_scalar_column_ids(arena, arg, out);
+            }
+            for &pb in partition_by {
+                collect_scalar_column_ids(arena, pb, out);
+            }
+            for key in order_by {
+                collect_scalar_column_ids(arena, key.expr, out);
+            }
+        }
+        ScalarNode::Lambda { body, .. } => {
+            collect_scalar_column_ids(arena, *body, out);
+        }
+        ScalarNode::LambdaParamRef { .. } => {}
+    }
+}
 
 impl LogicalRewriteRule for PruneScanColumns {
     fn name(&self) -> &'static str {
@@ -27,21 +132,17 @@ impl LogicalRewriteRule for PruneScanColumns {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
-        matches!(&plan.kind, LogicalPlanNodeKind::Scan(_))
+    fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
+        matches!(&expr.op, Operator::LogicalScan(_))
     }
 
-    fn apply(
-        &self,
-        plan: LogicalPlanNode,
-        _ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
-        let LogicalPlanNode {
-            kind,
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+        let OptExpr {
+            op,
+            children,
             required_output_columns,
-            ..
-        } = plan;
-        let LogicalPlanNodeKind::Scan(mut node) = kind else {
+        } = expr;
+        let Operator::LogicalScan(mut node) = op else {
             unreachable!()
         };
 
@@ -61,19 +162,27 @@ impl LogicalRewriteRule for PruneScanColumns {
         // Union in columns referenced by any pushed-down predicates so that
         // predicate evaluation can still access them even if the parent didn't
         // explicitly request them.
-        let pred_col_names: HashSet<String> = node
-            .predicates
-            .iter()
-            .flat_map(|pred| collect_column_refs(pred))
-            .map(|name| name.to_lowercase())
-            .collect();
+        //
+        // Predicates are ScalarId handles; use the arena to collect referenced
+        // ColumnIds, then map those ids to column names.
+        let pred_col_ids: HashSet<ColumnId> = if node.predicates.is_empty() {
+            HashSet::new()
+        } else {
+            let arena_rc = ctx.scalar_arena();
+            let arena = arena_rc.borrow();
+            let mut ids = HashSet::new();
+            for &pred_id in &node.predicates {
+                collect_scalar_column_ids(&arena, pred_id, &mut ids);
+            }
+            ids
+        };
 
         let mut existing_lower: HashSet<String> =
             required_names.iter().map(|n| n.to_lowercase()).collect();
 
         for col in &node.columns {
             let col_lower = col.name.to_lowercase();
-            if pred_col_names.contains(&col_lower) && !existing_lower.contains(&col_lower) {
+            if pred_col_ids.contains(&col.column_id) && !existing_lower.contains(&col_lower) {
                 existing_lower.insert(col_lower);
                 required_names.push(col.name.clone());
             }
@@ -109,25 +218,30 @@ impl LogicalRewriteRule for PruneScanColumns {
         }
 
         node.required_columns = Some(required_names);
-        Ok(RewriteResult::Changed(LogicalPlanNode::new(
-            LogicalPlanNodeKind::Scan(node),
-            vec![],
+        Ok(RewriteResult::Changed(OptExpr {
+            op: Operator::LogicalScan(node),
+            children,
             required_output_columns,
-        )))
+        }))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr};
+    use crate::sql::analysis::OutputColumn;
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::operator::{Operator, ScanOp};
+    use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
-    use crate::sql::planner::plan::*;
+    use crate::sql::optimizer::scalar::{self, ScalarArena, ScalarNode};
     use arrow::datatypes::DataType;
+    use std::cell::RefCell;
+    use std::collections::HashSet;
+    use std::rc::Rc;
 
-    fn make_scan(cols: &[(&str, ColumnId)]) -> LogicalScanNode {
+    fn make_scan(cols: &[(&str, ColumnId)]) -> ScanOp {
         let table = TableDef {
             name: "t".to_string(),
             columns: cols
@@ -146,7 +260,7 @@ mod tests {
                 table_id: 0,
             },
         };
-        LogicalScanNode {
+        ScanOp {
             database: "db".to_string(),
             table,
             alias: None,
@@ -164,34 +278,23 @@ mod tests {
             required_columns: None,
             dict_columns: vec![],
             variant_columns: vec![],
+            mv_rewritten_from: None,
         }
     }
 
-    fn scan_plan(
-        scan: LogicalScanNode,
-        required_output_columns: Option<HashSet<ColumnId>>,
-    ) -> LogicalPlanNode {
-        LogicalPlanNode::new(
-            LogicalPlanNodeKind::Scan(scan),
-            vec![],
+    fn scan_expr(scan: ScanOp, required_output_columns: Option<HashSet<ColumnId>>) -> OptExpr {
+        OptExpr {
+            op: Operator::LogicalScan(scan),
+            children: vec![],
             required_output_columns,
-        )
-    }
-
-    fn col_ref_expr(id: ColumnId, name: &str) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::ColumnRef {
-                column_id: id,
-                qualifier: None,
-                column: name.to_string(),
-            },
-            data_type: DataType::Int32,
-            nullable: false,
         }
     }
 
-    fn ctx() -> RewriteContext {
-        RewriteContext::new(RewriteConsumer::Query)
+    fn ctx_with_arena() -> RewriteContext {
+        let mut ctx = RewriteContext::new(RewriteConsumer::Query);
+        let arena = Rc::new(RefCell::new(ScalarArena::new()));
+        ctx.set_scalar_arena(arena);
+        ctx
     }
 
     #[test]
@@ -205,15 +308,16 @@ mod tests {
         let mut needed = HashSet::new();
         needed.insert(id_b);
 
-        let plan = scan_plan(scan, Some(needed));
+        let expr = scan_expr(scan, Some(needed));
         let rule = PruneScanColumns;
-        let result = rule.apply(plan, &mut ctx()).unwrap();
+        let mut ctx = ctx_with_arena();
+        let result = rule.apply(expr, &mut ctx).unwrap();
 
         let changed = match result {
             RewriteResult::Changed(p) => p,
             other => panic!("expected Changed, got {:?}", other),
         };
-        let LogicalPlanNodeKind::Scan(pruned) = &changed.kind else {
+        let Operator::LogicalScan(pruned) = &changed.op else {
             panic!("expected Scan");
         };
 
@@ -231,9 +335,10 @@ mod tests {
         let scan = make_scan(&[("a", id_a)]);
         // No Phase-1 tag (None).
 
-        let plan = scan_plan(scan, None);
+        let expr = scan_expr(scan, None);
         let rule = PruneScanColumns;
-        let result = rule.apply(plan, &mut ctx()).unwrap();
+        let mut ctx = ctx_with_arena();
+        let result = rule.apply(expr, &mut ctx).unwrap();
 
         assert!(
             matches!(result, RewriteResult::Unchanged),
@@ -250,34 +355,43 @@ mod tests {
         let id_c = ColumnId::new_for_test(3);
 
         let mut scan = make_scan(&[("a", id_a), ("b", id_b), ("c", id_c)]);
-        // Push a predicate referencing b.
-        let pred = TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: Box::new(col_ref_expr(id_b, "b")),
-                op: BinOp::Gt,
-                right: Box::new(TypedExpr {
-                    kind: ExprKind::Literal(LiteralValue::Int(0)),
-                    data_type: DataType::Int32,
-                    nullable: false,
-                }),
+
+        // Build a scalar predicate: b > 0 (referencing id_b).
+        let mut arena = ScalarArena::new();
+        let col_b = arena.intern(ScalarNode::ColumnRef(id_b), DataType::Int32, false);
+        let zero = arena.intern(
+            ScalarNode::Literal(scalar::HashableLiteral(
+                crate::sql::analysis::LiteralValue::Int(0),
+            )),
+            DataType::Int32,
+            false,
+        );
+        let pred = arena.intern(
+            ScalarNode::BinaryOp {
+                op: crate::sql::analysis::BinOp::Gt,
+                left: col_b,
+                right: zero,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
-        };
+            DataType::Boolean,
+            false,
+        );
         scan.predicates.push(pred);
 
         let mut needed = HashSet::new();
         needed.insert(id_a);
 
-        let plan = scan_plan(scan, Some(needed));
+        let expr = scan_expr(scan, Some(needed));
         let rule = PruneScanColumns;
-        let result = rule.apply(plan, &mut ctx()).unwrap();
+
+        let mut ctx = RewriteContext::new(RewriteConsumer::Query);
+        ctx.set_scalar_arena(Rc::new(RefCell::new(arena)));
+        let result = rule.apply(expr, &mut ctx).unwrap();
 
         let changed = match result {
             RewriteResult::Changed(p) => p,
             _ => panic!("expected Changed"),
         };
-        let LogicalPlanNodeKind::Scan(pruned) = &changed.kind else {
+        let Operator::LogicalScan(pruned) = &changed.op else {
             panic!("expected Scan");
         };
 
@@ -311,15 +425,14 @@ mod tests {
         needed.insert(id_a);
 
         let rule = PruneScanColumns;
-        let result = rule
-            .apply(scan_plan(scan, Some(needed)), &mut ctx())
-            .unwrap();
+        let mut ctx = ctx_with_arena();
+        let result = rule.apply(scan_expr(scan, Some(needed)), &mut ctx).unwrap();
 
         let changed = match result {
             RewriteResult::Changed(p) => p,
             _ => panic!("expected Changed"),
         };
-        let LogicalPlanNodeKind::Scan(pruned) = &changed.kind else {
+        let Operator::LogicalScan(pruned) = &changed.op else {
             panic!("expected Scan");
         };
 
@@ -345,17 +458,18 @@ mod tests {
         let id_a = ColumnId::new_for_test(1);
         let id_b = ColumnId::new_for_test(2);
 
-        let mut scan = make_scan(&[("a", id_a), ("b", id_b)]);
+        let scan = make_scan(&[("a", id_a), ("b", id_b)]);
 
-        let plan = scan_plan(scan, Some(HashSet::new()));
+        let expr = scan_expr(scan, Some(HashSet::new()));
         let rule = PruneScanColumns;
-        let result = rule.apply(plan, &mut ctx()).unwrap();
+        let mut ctx = ctx_with_arena();
+        let result = rule.apply(expr, &mut ctx).unwrap();
 
         let changed = match result {
             RewriteResult::Changed(p) => p,
             _ => panic!("expected Changed"),
         };
-        let LogicalPlanNodeKind::Scan(pruned) = &changed.kind else {
+        let Operator::LogicalScan(pruned) = &changed.op else {
             panic!("expected Scan");
         };
 

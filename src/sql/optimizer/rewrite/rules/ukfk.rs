@@ -4,14 +4,21 @@ use std::collections::{HashMap, HashSet};
 
 use arrow::datatypes::DataType;
 
-use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, ProjectItem, TypedExpr};
+use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, TypedExpr};
 use crate::sql::column_id::ColumnId;
-use crate::sql::optimizer::options::current_session_optimizer_settings;
-use crate::sql::optimizer::rewrite::rule::PlanRewriteRule as RewriteRule;
-use crate::sql::optimizer::rewrite::rules::utils::{
-    collect_column_id_refs_strict, collect_output_ids, combine_and,
+use crate::sql::optimizer::operator::{
+    FilterOp, LogicalJoinOp, Operator, ProjectOp, ScalarAggregateSpec, ScalarProjectItem, ScanOp,
 };
-use crate::sql::planner::plan::*;
+use crate::sql::optimizer::opt_expr::OptExpr;
+use crate::sql::optimizer::options::current_session_optimizer_settings;
+use crate::sql::optimizer::rewrite::context::RewriteContext;
+use crate::sql::optimizer::rewrite::phase::RewritePhase;
+use crate::sql::optimizer::rewrite::result::RewriteResult;
+use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
+use crate::sql::optimizer::rewrite::rules::utils::{
+    collect_column_id_refs_strict, collect_output_ids_opt, combine_and,
+};
+use crate::sql::optimizer::scalar::{self, ScalarArena, ScalarId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Side {
@@ -28,57 +35,77 @@ struct ForeignKeyConstraint {
 
 pub(crate) struct PruneUkFkJoin;
 
-impl RewriteRule for PruneUkFkJoin {
+impl LogicalRewriteRule for PruneUkFkJoin {
     fn name(&self) -> &'static str {
         "PruneUkFkJoin"
     }
 
-    fn matches(&self, plan: &LogicalPlanNode) -> bool {
-        matches!(&plan.kind, LogicalPlanNodeKind::Project(_))
-            && matches!(&plan.unary_input().kind, LogicalPlanNodeKind::Join(_))
+    fn phase(&self) -> RewritePhase {
+        RewritePhase::StructuralRewrite
     }
 
-    fn apply(&self, plan: LogicalPlanNode) -> Option<LogicalPlanNode> {
+    fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
+        matches!(&expr.op, Operator::LogicalProject(_))
+            && expr
+                .children
+                .first()
+                .map(|c| matches!(&c.op, Operator::LogicalJoin(_)))
+                .unwrap_or(false)
+    }
+
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         let settings = current_session_optimizer_settings();
         let table_prune_enabled = settings.enable_query_rewrite_table_prune
             || settings.enable_cbo_table_prune
             || settings.enable_table_prune_on_update;
         if !table_prune_enabled && !settings.enable_ukfk_opt {
-            return None;
+            return Ok(RewriteResult::Unchanged);
         }
 
-        let LogicalPlanNode {
-            kind,
+        let OptExpr {
+            op,
             mut children,
             required_output_columns,
-        } = plan;
-        let LogicalPlanNodeKind::Project(project) = kind else {
-            return None;
+        } = expr;
+        let Operator::LogicalProject(project) = op else {
+            return Ok(RewriteResult::Unchanged);
         };
         if children.len() != 1 {
-            return None;
+            return Ok(RewriteResult::Unchanged);
         }
-        let join_plan = children.remove(0);
-        let LogicalPlanNode {
-            kind,
-            mut children,
+        let join_expr = children.remove(0);
+        let OptExpr {
+            op: join_op,
+            children: mut join_children,
             required_output_columns: _,
-        } = join_plan;
-        let LogicalPlanNodeKind::Join(join) = kind else {
-            return None;
+        } = join_expr;
+        let Operator::LogicalJoin(join) = join_op else {
+            return Ok(RewriteResult::Unchanged);
         };
-        if children.len() != 2 {
-            return None;
+        if join_children.len() != 2 {
+            return Ok(RewriteResult::Unchanged);
         }
-        let right = children.remove(1);
-        let left = children.remove(0);
+        let right = join_children.remove(1);
+        let left = join_children.remove(0);
 
-        let retained_side = project_referenced_side(&project.items, &left, &right)?;
-        let eq_pairs = join_equality_pairs(&join, &left, &right)?;
+        let arena_rc = ctx.scalar_arena();
+
+        let retained_side =
+            match project_referenced_side(&project.items, &left, &right, &arena_rc.borrow())? {
+                Some(s) => s,
+                None => return Ok(RewriteResult::Unchanged),
+            };
+        let eq_pairs = join_equality_pairs(&join, &left, &right, &arena_rc.borrow())?;
+        if eq_pairs.is_empty() {
+            return Ok(RewriteResult::Unchanged);
+        }
         let left_cols: Vec<String> = eq_pairs.iter().map(|(left, _)| left.clone()).collect();
         let right_cols: Vec<String> = eq_pairs.iter().map(|(_, right)| right.clone()).collect();
-        let left_scan = root_scan(&left)?;
-        let right_scan = root_scan(&right)?;
+        let left_scan = root_scan(&left);
+        let right_scan = root_scan(&right);
+        let (Some(left_scan), Some(right_scan)) = (left_scan, right_scan) else {
+            return Ok(RewriteResult::Unchanged);
+        };
 
         let retained = match (join.join_type, retained_side) {
             (JoinKind::LeftOuter, Side::Left)
@@ -95,144 +122,193 @@ impl RewriteRule for PruneUkFkJoin {
                 if settings.enable_ukfk_opt
                     && foreign_key_matches(left_scan, right_scan, &left_cols, &right_cols) =>
             {
-                Some(add_not_null_filter(left.clone(), left_scan, &left_cols))
+                Some(add_not_null_filter(
+                    left.clone(),
+                    left_scan,
+                    &left_cols,
+                    &mut arena_rc.borrow_mut(),
+                ))
             }
             (JoinKind::Inner, Side::Right)
                 if settings.enable_ukfk_opt
                     && foreign_key_matches(right_scan, left_scan, &right_cols, &left_cols) =>
             {
-                Some(add_not_null_filter(right.clone(), right_scan, &right_cols))
+                Some(add_not_null_filter(
+                    right.clone(),
+                    right_scan,
+                    &right_cols,
+                    &mut arena_rc.borrow_mut(),
+                ))
             }
             _ => None,
-        }?;
+        };
+        let Some(retained) = retained else {
+            return Ok(RewriteResult::Unchanged);
+        };
 
-        Some(LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
-                items: project.items,
-                output_qualifier: project.output_qualifier,
-            }),
-            vec![retained],
+        Ok(RewriteResult::Changed(OptExpr {
+            op: Operator::LogicalProject(project),
+            children: vec![retained],
             required_output_columns,
-        ))
+        }))
     }
 }
 
 pub(crate) struct EliminateUniqueAggregate;
 
-impl RewriteRule for EliminateUniqueAggregate {
+impl LogicalRewriteRule for EliminateUniqueAggregate {
     fn name(&self) -> &'static str {
         "EliminateUniqueAggregate"
     }
 
-    fn matches(&self, plan: &LogicalPlanNode) -> bool {
-        matches!(&plan.kind, LogicalPlanNodeKind::Project(_))
-            && matches!(&plan.unary_input().kind, LogicalPlanNodeKind::Aggregate(_))
+    fn phase(&self) -> RewritePhase {
+        RewritePhase::StructuralRewrite
     }
 
-    fn apply(&self, plan: LogicalPlanNode) -> Option<LogicalPlanNode> {
+    fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
+        matches!(&expr.op, Operator::LogicalProject(_))
+            && expr
+                .children
+                .first()
+                .map(|c| matches!(&c.op, Operator::LogicalAggregate(_)))
+                .unwrap_or(false)
+    }
+
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         let settings = current_session_optimizer_settings();
         if !settings.enable_eliminate_agg {
-            return None;
+            return Ok(RewriteResult::Unchanged);
         }
 
-        let LogicalPlanNode {
-            kind,
+        let OptExpr {
+            op,
             mut children,
             required_output_columns,
-        } = plan;
-        let LogicalPlanNodeKind::Project(project) = kind else {
-            return None;
+        } = expr;
+        let Operator::LogicalProject(project) = op else {
+            return Ok(RewriteResult::Unchanged);
         };
         if children.len() != 1 {
-            return None;
+            return Ok(RewriteResult::Unchanged);
         }
-        let aggregate_plan = children.remove(0);
-        let LogicalPlanNode {
-            kind,
-            mut children,
+        let aggregate_expr = children.remove(0);
+        let OptExpr {
+            op: agg_op,
+            children: mut agg_children,
             required_output_columns: _,
-        } = aggregate_plan;
-        let LogicalPlanNodeKind::Aggregate(aggregate) = kind else {
-            return None;
+        } = aggregate_expr;
+        let Operator::LogicalAggregate(aggregate) = agg_op else {
+            return Ok(RewriteResult::Unchanged);
         };
-        if children.len() != 1 {
-            return None;
+        if agg_children.len() != 1 {
+            return Ok(RewriteResult::Unchanged);
         }
-        let aggregate_input = children.remove(0);
-        let scan = root_scan(&aggregate_input)?;
-        let group_columns = group_by_columns(&aggregate.group_by)?;
+        let aggregate_input = agg_children.remove(0);
+        let scan = match root_scan(&aggregate_input) {
+            Some(s) => s,
+            None => return Ok(RewriteResult::Unchanged),
+        };
+
+        let arena_rc = ctx.scalar_arena();
+        let group_columns = match group_by_columns(&aggregate.group_by, &arena_rc.borrow()) {
+            Some(cols) => cols,
+            None => return Ok(RewriteResult::Unchanged),
+        };
         if group_columns.is_empty() || !table_has_unique_key(scan, &group_columns) {
-            return None;
+            return Ok(RewriteResult::Unchanged);
         }
-        if aggregate.aggregates.is_empty() || !aggregate.aggregates.iter().all(is_eliminable_count)
+        if aggregate.aggregates.is_empty()
+            || !aggregate
+                .aggregates
+                .iter()
+                .all(|a| is_eliminable_count(a, &arena_rc.borrow()))
         {
-            return None;
+            return Ok(RewriteResult::Unchanged);
         }
         let items = project
             .items
             .into_iter()
-            .map(rewrite_eliminated_aggregate_project_item)
-            .collect::<Option<Vec<_>>>()?;
+            .map(|item| rewrite_eliminated_aggregate_project_item(item, &mut arena_rc.borrow_mut()))
+            .collect::<Option<Vec<_>>>();
+        let Some(items) = items else {
+            return Ok(RewriteResult::Unchanged);
+        };
 
-        Some(LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
+        Ok(RewriteResult::Changed(OptExpr {
+            op: Operator::LogicalProject(ProjectOp {
                 items,
                 output_qualifier: project.output_qualifier,
             }),
-            vec![aggregate_input],
+            children: vec![aggregate_input],
             required_output_columns,
-        ))
+        }))
     }
 }
 
-fn root_scan(plan: &LogicalPlanNode) -> Option<&LogicalScanNode> {
-    match &plan.kind {
-        LogicalPlanNodeKind::Scan(scan) => Some(scan),
-        LogicalPlanNodeKind::Filter(_) => root_scan(plan.unary_input()),
+fn root_scan(expr: &OptExpr) -> Option<&ScanOp> {
+    match &expr.op {
+        Operator::LogicalScan(scan) => Some(scan),
+        Operator::LogicalFilter(_) => root_scan(expr.unary_input()),
         _ => None,
     }
 }
 
 fn project_referenced_side(
-    items: &[ProjectItem],
-    left: &LogicalPlanNode,
-    right: &LogicalPlanNode,
-) -> Option<Side> {
-    let mut left_ids = collect_output_ids(left);
-    let mut right_ids = collect_output_ids(right);
+    items: &[ScalarProjectItem],
+    left: &OptExpr,
+    right: &OptExpr,
+    arena: &ScalarArena,
+) -> Result<Option<Side>, String> {
+    let mut left_ids = collect_output_ids_opt(left);
+    let mut right_ids = collect_output_ids_opt(right);
     left_ids.remove(&ColumnId::UNSET);
     right_ids.remove(&ColumnId::UNSET);
     let mut side = None;
     for item in items {
-        let ids = collect_column_id_refs_strict(&item.expr)?;
+        let item_expr = scalar::materialize(arena, item.expr);
+        let ids = match collect_column_id_refs_strict(&item_expr) {
+            Some(ids) => ids,
+            None => return Ok(None),
+        };
         if ids.is_empty() {
             continue;
         }
-        let reference_side = referenced_side(&ids, &left_ids, &right_ids)?;
+        let reference_side = match referenced_side(&ids, &left_ids, &right_ids) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
         if let Some(existing) = side {
             if existing != reference_side {
-                return None;
+                return Ok(None);
             }
         } else {
             side = Some(reference_side);
         }
     }
-    side
+    Ok(side)
 }
 
 fn join_equality_pairs(
-    join: &LogicalJoinNode,
-    left: &LogicalPlanNode,
-    right: &LogicalPlanNode,
-) -> Option<Vec<(String, String)>> {
-    let condition = join.condition.as_ref()?;
-    let mut left_ids = collect_output_ids(left);
-    let mut right_ids = collect_output_ids(right);
+    join: &LogicalJoinOp,
+    left: &OptExpr,
+    right: &OptExpr,
+    arena: &ScalarArena,
+) -> Result<Vec<(String, String)>, String> {
+    let Some(cond_id) = join.condition else {
+        return Ok(vec![]);
+    };
+    let condition = scalar::materialize(arena, cond_id);
+    let mut left_ids = collect_output_ids_opt(left);
+    let mut right_ids = collect_output_ids_opt(right);
     left_ids.remove(&ColumnId::UNSET);
     right_ids.remove(&ColumnId::UNSET);
     let mut pairs = Vec::new();
-    collect_join_equality_pairs(condition, &left_ids, &right_ids, &mut pairs)?;
-    (!pairs.is_empty()).then_some(pairs)
+    let ok = collect_join_equality_pairs(&condition, &left_ids, &right_ids, &mut pairs);
+    if ok.is_some() && !pairs.is_empty() {
+        Ok(pairs)
+    } else {
+        Ok(vec![])
+    }
 }
 
 fn collect_join_equality_pairs(
@@ -321,25 +397,28 @@ fn classify_column_ref(
     }
 }
 
-fn group_by_columns(group_by: &[TypedExpr]) -> Option<Vec<String>> {
+fn group_by_columns(group_by: &[ScalarId], arena: &ScalarArena) -> Option<Vec<String>> {
     group_by
         .iter()
-        .map(|expr| match &expr.kind {
-            ExprKind::ColumnRef { column, .. } => Some(normalize_identifier(column)),
-            _ => None,
+        .map(|id| {
+            let expr = scalar::materialize(arena, *id);
+            match &expr.kind {
+                ExprKind::ColumnRef { column, .. } => Some(normalize_identifier(column)),
+                _ => None,
+            }
         })
         .collect()
 }
 
-fn table_has_unique_key(scan: &LogicalScanNode, columns: &[String]) -> bool {
+fn table_has_unique_key(scan: &ScanOp, columns: &[String]) -> bool {
     unique_constraints(scan)
         .into_iter()
         .any(|constraint| same_columns(&constraint, columns))
 }
 
 fn foreign_key_matches(
-    local_scan: &LogicalScanNode,
-    referenced_scan: &LogicalScanNode,
+    local_scan: &ScanOp,
+    referenced_scan: &ScanOp,
     local_columns: &[String],
     referenced_columns: &[String],
 ) -> bool {
@@ -353,14 +432,14 @@ fn foreign_key_matches(
     })
 }
 
-fn unique_constraints(scan: &LogicalScanNode) -> Vec<Vec<String>> {
+fn unique_constraints(scan: &ScanOp) -> Vec<Vec<String>> {
     let Some(value) = table_properties(scan).remove("unique_constraints") else {
         return Vec::new();
     };
     value.split(';').filter_map(parse_column_list).collect()
 }
 
-fn foreign_key_constraints(scan: &LogicalScanNode) -> Vec<ForeignKeyConstraint> {
+fn foreign_key_constraints(scan: &ScanOp) -> Vec<ForeignKeyConstraint> {
     let Some(value) = table_properties(scan).remove("foreign_key_constraints") else {
         return Vec::new();
     };
@@ -370,7 +449,7 @@ fn foreign_key_constraints(scan: &LogicalScanNode) -> Vec<ForeignKeyConstraint> 
         .collect()
 }
 
-fn table_properties(scan: &LogicalScanNode) -> HashMap<String, String> {
+fn table_properties(scan: &ScanOp) -> HashMap<String, String> {
     let Some(serialized_metadata) =
         iceberg_table_info(&scan.table.source).and_then(|table| table.serialized_metadata.as_ref())
     else {
@@ -445,7 +524,7 @@ fn same_columns(left: &[String], right: &[String]) -> bool {
     right.iter().all(|column| left.contains(column.as_str()))
 }
 
-fn table_name_matches(scan: &LogicalScanNode, raw_table: &str) -> bool {
+fn table_name_matches(scan: &ScanOp, raw_table: &str) -> bool {
     let table = normalize_table_name(raw_table);
     if table.eq_ignore_ascii_case(&scan.table.name) {
         return true;
@@ -474,10 +553,11 @@ fn normalize_table_name(raw: &str) -> String {
 }
 
 fn add_not_null_filter(
-    plan: LogicalPlanNode,
-    scan: &LogicalScanNode,
+    plan: OptExpr,
+    scan: &ScanOp,
     columns: &[String],
-) -> LogicalPlanNode {
+    arena: &mut ScalarArena,
+) -> OptExpr {
     let qualifier = scan
         .alias
         .clone()
@@ -510,30 +590,42 @@ fn add_not_null_filter(
     if predicates.is_empty() {
         return plan;
     }
-    LogicalPlanNode::new(
-        LogicalPlanNodeKind::Filter(LogicalFilterNode {
-            predicate: combine_and(predicates),
-        }),
-        vec![plan],
-        None,
-    )
+    let predicate = scalar::intern_typed(arena, &combine_and(predicates));
+    OptExpr::new(Operator::LogicalFilter(FilterOp { predicate }), vec![plan])
 }
 
-fn is_eliminable_count(aggregate: &AggregateCall) -> bool {
-    aggregate.name.eq_ignore_ascii_case("count")
-        && !aggregate.distinct
-        && aggregate.order_by.is_empty()
-        && aggregate.args.iter().all(|arg| {
-            matches!(
-                arg.kind,
-                ExprKind::Literal(LiteralValue::Int(_)) | ExprKind::Literal(LiteralValue::Null)
-            )
-        })
+fn is_eliminable_count(aggregate: &ScalarAggregateSpec, arena: &ScalarArena) -> bool {
+    if !aggregate.name.eq_ignore_ascii_case("count") {
+        return false;
+    }
+    if aggregate.distinct {
+        return false;
+    }
+    if !aggregate.order_by.is_empty() {
+        return false;
+    }
+    aggregate.args.iter().all(|id| {
+        let expr = scalar::materialize(arena, *id);
+        matches!(
+            expr.kind,
+            ExprKind::Literal(LiteralValue::Int(_)) | ExprKind::Literal(LiteralValue::Null)
+        )
+    })
 }
 
-fn rewrite_eliminated_aggregate_project_item(item: ProjectItem) -> Option<ProjectItem> {
-    let expr = rewrite_eliminated_aggregate_expr(item.expr)?;
-    Some(ProjectItem { expr, ..item })
+fn rewrite_eliminated_aggregate_project_item(
+    item: ScalarProjectItem,
+    arena: &mut ScalarArena,
+) -> Option<ScalarProjectItem> {
+    let item_expr = scalar::materialize(arena, item.expr);
+    let rewritten = rewrite_eliminated_aggregate_expr(item_expr)?;
+    let new_expr_id = scalar::intern_typed(arena, &rewritten);
+    Some(ScalarProjectItem {
+        expr: new_expr_id,
+        output_name: item.output_name,
+        output_column_id: item.output_column_id,
+        expr_display: item.expr_display,
+    })
 }
 
 fn rewrite_eliminated_aggregate_expr(expr: TypedExpr) -> Option<TypedExpr> {

@@ -10,9 +10,14 @@ use arrow::datatypes::DataType;
 
 use crate::sql::analysis::{ExprKind, JoinKind, TypedExpr};
 use crate::sql::column_id::ColumnId;
-use crate::sql::optimizer::rewrite::rule::PlanRewriteRule;
-use crate::sql::optimizer::rewrite::rules::utils::{combine_and, join_equi_keys, split_and};
-use crate::sql::planner::plan::*;
+use crate::sql::optimizer::operator::{FilterOp, Operator};
+use crate::sql::optimizer::opt_expr::OptExpr;
+use crate::sql::optimizer::rewrite::context::RewriteContext;
+use crate::sql::optimizer::rewrite::phase::RewritePhase;
+use crate::sql::optimizer::rewrite::result::RewriteResult;
+use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
+use crate::sql::optimizer::rewrite::rules::utils::{combine_and, join_equi_keys_opt, split_and};
+use crate::sql::optimizer::scalar::{self, ScalarArena};
 
 pub(crate) struct DeriveJoinNotNullPredicate;
 
@@ -34,63 +39,66 @@ fn safe_sides(join_type: JoinKind) -> (bool, bool) {
     }
 }
 
-impl PlanRewriteRule for DeriveJoinNotNullPredicate {
+impl LogicalRewriteRule for DeriveJoinNotNullPredicate {
     fn name(&self) -> &'static str {
         "DeriveJoinNotNullPredicate"
     }
 
-    fn matches(&self, plan: &LogicalPlanNode) -> bool {
-        matches!(&plan.kind, LogicalPlanNodeKind::Join(_))
+    fn phase(&self) -> RewritePhase {
+        RewritePhase::StructuralRewrite
     }
 
-    fn apply(&self, plan: LogicalPlanNode) -> Option<LogicalPlanNode> {
-        let LogicalPlanNode {
-            kind,
+    fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
+        matches!(&expr.op, Operator::LogicalJoin(_))
+    }
+
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+        let OptExpr {
+            op,
             mut children,
             required_output_columns,
-        } = plan;
-        let LogicalPlanNodeKind::Join(join) = kind else {
-            return None;
+        } = expr;
+        let Operator::LogicalJoin(join) = op else {
+            return Ok(RewriteResult::Unchanged);
         };
         if children.len() != 2 {
-            return None;
+            return Ok(RewriteResult::Unchanged);
         }
         let right = children.remove(1);
         let left = children.remove(0);
         let (derive_left, derive_right) = safe_sides(join.join_type);
         if !derive_left && !derive_right {
-            return None;
+            return Ok(RewriteResult::Unchanged);
         }
-        let keys = join_equi_keys(&join, &left, &right);
+        let arena_rc = ctx.scalar_arena();
+        let keys = join_equi_keys_opt(&join, &left, &right, &arena_rc.borrow());
         if keys.is_empty() {
-            return None;
+            return Ok(RewriteResult::Unchanged);
         }
 
         let left_preds = if derive_left {
-            eligible_not_null(&left, keys.iter().map(|k| &k.left))
+            eligible_not_null(&left, keys.iter().map(|k| &k.left), &arena_rc.borrow())
         } else {
             Vec::new()
         };
         let right_preds = if derive_right {
-            eligible_not_null(&right, keys.iter().map(|k| &k.right))
+            eligible_not_null(&right, keys.iter().map(|k| &k.right), &arena_rc.borrow())
         } else {
             Vec::new()
         };
         if left_preds.is_empty() && right_preds.is_empty() {
-            return None;
+            return Ok(RewriteResult::Unchanged);
         }
 
-        Some(LogicalPlanNode::new(
-            LogicalPlanNodeKind::Join(LogicalJoinNode {
-                join_type: join.join_type,
-                condition: join.condition,
-            }),
-            vec![
-                wrap_not_null(left, left_preds),
-                wrap_not_null(right, right_preds),
-            ],
+        let new_left = wrap_not_null(left, left_preds, &mut arena_rc.borrow_mut());
+        let new_right = wrap_not_null(right, right_preds, &mut arena_rc.borrow_mut());
+
+        let result = OptExpr {
+            op: Operator::LogicalJoin(join),
+            children: vec![new_left, new_right],
             required_output_columns,
-        ))
+        };
+        Ok(RewriteResult::Changed(result))
     }
 }
 
@@ -99,10 +107,11 @@ impl PlanRewriteRule for DeriveJoinNotNullPredicate {
 /// (b) not already guaranteed non-null by `child`'s predicate spine. Dedupe by
 /// column identity within the side.
 fn eligible_not_null<'a>(
-    child: &LogicalPlanNode,
+    child: &OptExpr,
     operands: impl Iterator<Item = &'a TypedExpr>,
+    arena: &ScalarArena,
 ) -> Vec<TypedExpr> {
-    let guaranteed_ids = spine_not_null(child);
+    let guaranteed_ids = spine_not_null(child, arena);
     let mut seen_ids: HashSet<ColumnId> = HashSet::new();
     let mut preds = Vec::new();
     for operand in operands {
@@ -138,46 +147,43 @@ fn is_not_null(operand: TypedExpr) -> TypedExpr {
     }
 }
 
-fn wrap_not_null(child: LogicalPlanNode, preds: Vec<TypedExpr>) -> LogicalPlanNode {
+fn wrap_not_null(child: OptExpr, preds: Vec<TypedExpr>, arena: &mut ScalarArena) -> OptExpr {
     if preds.is_empty() {
         return child;
     }
-    LogicalPlanNode::new(
-        LogicalPlanNodeKind::Filter(LogicalFilterNode {
-            predicate: combine_and(preds),
-        }),
-        vec![child],
-        None,
-    )
+    let predicate = scalar::intern_typed(arena, &combine_and(preds));
+    OptExpr::new(Operator::LogicalFilter(FilterOp { predicate }), vec![child])
 }
 
 /// Walk `plan`'s predicate spine (passthrough single-input nodes down to the
 /// root scan) collecting column identities already guaranteed non-null by an
 /// `IS NOT NULL` conjunct. Used for idempotency / redundant-filter avoidance.
-fn spine_not_null(plan: &LogicalPlanNode) -> HashSet<ColumnId> {
+fn spine_not_null(expr: &OptExpr, arena: &ScalarArena) -> HashSet<ColumnId> {
     let mut ids = HashSet::new();
-    spine_not_null_inner(plan, &mut ids);
+    spine_not_null_inner(expr, arena, &mut ids);
     ids
 }
 
-fn spine_not_null_inner(plan: &LogicalPlanNode, ids: &mut HashSet<ColumnId>) {
-    match &plan.kind {
-        LogicalPlanNodeKind::Filter(f) => {
-            for conj in split_and(f.predicate.clone()) {
+fn spine_not_null_inner(expr: &OptExpr, arena: &ScalarArena, ids: &mut HashSet<ColumnId>) {
+    match &expr.op {
+        Operator::LogicalFilter(f) => {
+            let predicate_typed = scalar::materialize(arena, f.predicate);
+            for conj in split_and(predicate_typed) {
                 record_not_null(&conj, ids);
             }
-            spine_not_null_inner(plan.unary_input(), ids);
+            spine_not_null_inner(expr.unary_input(), arena, ids);
         }
-        LogicalPlanNodeKind::Scan(s) => {
-            for p in &s.predicates {
-                record_not_null(p, ids);
+        Operator::LogicalScan(s) => {
+            for pred_id in &s.predicates {
+                let p = scalar::materialize(arena, *pred_id);
+                record_not_null(&p, ids);
             }
         }
         // Project may rename columns; id-based matching remains valid through
         // passthrough projections and intentionally ignores name-only matches.
-        LogicalPlanNodeKind::Project(_)
-        | LogicalPlanNodeKind::Sort(_)
-        | LogicalPlanNodeKind::Limit(_) => spine_not_null_inner(plan.unary_input(), ids),
+        Operator::LogicalProject(_) | Operator::LogicalSort(_) | Operator::LogicalLimit(_) => {
+            spine_not_null_inner(expr.unary_input(), arena, ids)
+        }
         _ => {}
     }
 }
@@ -198,55 +204,64 @@ fn record_not_null(expr: &TypedExpr, ids: &mut HashSet<ColumnId>) {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use super::*;
     use crate::sql::analysis::{BinOp, OutputColumn};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
-    use crate::sql::planner::plan::*;
+    use crate::sql::optimizer::operator::{LogicalJoinOp, ScanOp};
+    use crate::sql::optimizer::rewrite::context::RewriteContext;
+    use crate::sql::optimizer::scalar::ScalarArena;
 
-    fn scan(alias: &str, table: &str, cols: &[(&str, u32, bool)]) -> LogicalPlanNode {
-        LogicalPlanNode::new(
-            LogicalPlanNodeKind::Scan(LogicalScanNode {
-                database: "default".to_string(),
-                table: TableDef {
-                    name: table.to_string(),
-                    columns: cols
-                        .iter()
-                        .map(|(name, _, nullable)| ColumnDef {
-                            name: name.to_string(),
-                            data_type: DataType::Int32,
-                            nullable: *nullable,
-                            write_default: None,
-                            logical_type: None,
-                        })
-                        .collect(),
-                    iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::StarRocks {
-                        db_id: 0,
-                        table_id: 0,
-                    },
-                },
-                alias: Some(alias.to_string()),
+    fn make_ctx(arena: ScalarArena) -> RewriteContext {
+        let mut ctx = RewriteContext::for_query(std::iter::empty::<String>());
+        ctx.set_scalar_arena(Rc::new(RefCell::new(arena)));
+        ctx
+    }
+
+    fn scan_opt(alias: &str, table: &str, cols: &[(&str, u32, bool)]) -> OptExpr {
+        let scan = ScanOp {
+            database: "default".to_string(),
+            table: TableDef {
+                name: table.to_string(),
                 columns: cols
                     .iter()
-                    .map(|(name, id, nullable)| OutputColumn {
-                        column_id: ColumnId::new_for_test(*id),
+                    .map(|(name, _, nullable)| ColumnDef {
                         name: name.to_string(),
                         data_type: DataType::Int32,
                         nullable: *nullable,
-                        is_internal: false,
+                        write_default: None,
+                        logical_type: None,
                     })
                     .collect(),
-                predicates: vec![],
-                required_columns: None,
-                dict_columns: vec![],
-                variant_columns: vec![],
-            }),
-            vec![],
-            None,
-        )
+                iceberg_row_lineage_metadata_columns: vec![],
+                source: ScanSource::StarRocks {
+                    db_id: 0,
+                    table_id: 0,
+                },
+            },
+            alias: Some(alias.to_string()),
+            columns: cols
+                .iter()
+                .map(|(name, id, nullable)| OutputColumn {
+                    column_id: ColumnId::new_for_test(*id),
+                    name: name.to_string(),
+                    data_type: DataType::Int32,
+                    nullable: *nullable,
+                    is_internal: false,
+                })
+                .collect(),
+            predicates: vec![],
+            required_columns: None,
+            dict_columns: vec![],
+            variant_columns: vec![],
+            mv_rewritten_from: None,
+        };
+        OptExpr::leaf(Operator::LogicalScan(scan))
     }
 
-    fn col(qualifier: &str, name: &str, id: u32, nullable: bool) -> TypedExpr {
+    fn col_typed(qualifier: &str, name: &str, id: u32, nullable: bool) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::ColumnRef {
                 column_id: ColumnId::new_for_test(id),
@@ -258,7 +273,7 @@ mod tests {
         }
     }
 
-    fn eq(left: TypedExpr, right: TypedExpr) -> TypedExpr {
+    fn eq_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::BinaryOp {
                 left: Box::new(left),
@@ -270,7 +285,7 @@ mod tests {
         }
     }
 
-    fn and(left: TypedExpr, right: TypedExpr) -> TypedExpr {
+    fn and_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::BinaryOp {
                 left: Box::new(left),
@@ -282,57 +297,65 @@ mod tests {
         }
     }
 
-    fn join(
+    fn join_opt(
+        arena: &mut ScalarArena,
         jt: JoinKind,
-        left: LogicalPlanNode,
-        right: LogicalPlanNode,
+        left: OptExpr,
+        right: OptExpr,
         cond: Option<TypedExpr>,
-    ) -> LogicalPlanNode {
-        LogicalPlanNode::new(
-            LogicalPlanNodeKind::Join(LogicalJoinNode {
+    ) -> OptExpr {
+        let condition = cond.map(|c| scalar::intern_typed(arena, &c));
+        OptExpr::new(
+            Operator::LogicalJoin(LogicalJoinOp {
                 join_type: jt,
-                condition: cond,
+                condition,
             }),
             vec![left, right],
-            None,
         )
     }
 
-    /// (left_child_is_filter, right_child_is_filter) for the rule's output.
-    fn side_filters(out: Option<LogicalPlanNode>) -> (bool, bool) {
-        match out {
-            None => (false, false),
-            Some(plan) => {
-                let LogicalPlanNodeKind::Join(_) = &plan.kind else {
+    /// Returns (left_child_is_filter, right_child_is_filter) for the rule's output.
+    fn side_filters(out: Result<RewriteResult, String>) -> (bool, bool) {
+        match out.unwrap() {
+            RewriteResult::Unchanged => (false, false),
+            RewriteResult::Changed(plan) => {
+                let Operator::LogicalJoin(_) = &plan.op else {
                     panic!("rule must return a Join");
                 };
                 (
-                    matches!(&plan.left().kind, LogicalPlanNodeKind::Filter(_)),
-                    matches!(&plan.right().kind, LogicalPlanNodeKind::Filter(_)),
+                    matches!(&plan.left().op, Operator::LogicalFilter(_)),
+                    matches!(&plan.right().op, Operator::LogicalFilter(_)),
                 )
             }
+            RewriteResult::Rejected(_) => (false, false),
         }
     }
 
     /// Count IS NOT NULL conjuncts in a Filter's predicate (0 if not a Filter).
-    fn not_null_count(plan: &LogicalPlanNode) -> usize {
-        let LogicalPlanNodeKind::Filter(f) = &plan.kind else {
+    fn not_null_count(expr: &OptExpr, arena: &ScalarArena) -> usize {
+        let Operator::LogicalFilter(f) = &expr.op else {
             return 0;
         };
-        split_and(f.predicate.clone())
+        let predicate_typed = scalar::materialize(arena, f.predicate);
+        split_and(predicate_typed)
             .iter()
             .filter(|e| matches!(&e.kind, ExprKind::IsNull { negated: true, .. }))
             .count()
     }
 
-    fn inner_eq_join(left_nullable: bool, right_nullable: bool) -> LogicalPlanNode {
-        join(
+    fn inner_eq_join_opt(
+        arena: &mut ScalarArena,
+        left_nullable: bool,
+        right_nullable: bool,
+    ) -> OptExpr {
+        join_opt(
+            arena,
             JoinKind::Inner,
-            scan("l", "tl", &[("a", 1, left_nullable)]),
-            scan("r", "tr", &[("b", 2, right_nullable)]),
-            Some(eq(
-                col("l", "a", 1, left_nullable),
-                col("r", "b", 2, right_nullable),
+            scan_opt("l", "tl", &[("a", 1, left_nullable)]),
+            scan_opt("r", "tr", &[("b", 2, right_nullable)]),
+            Some(eq_expr(
+                col_typed("l", "a", 1, left_nullable),
+                col_typed("r", "b", 2, right_nullable),
             )),
         )
     }
@@ -352,19 +375,25 @@ mod tests {
             (JoinKind::Cross, false, false),
         ];
         for (jt, exp_l, exp_r) in cases {
+            let mut arena = ScalarArena::new();
             let cond = if matches!(jt, JoinKind::Cross) {
                 None
             } else {
-                Some(eq(col("l", "a", 1, true), col("r", "b", 2, true)))
+                Some(eq_expr(
+                    col_typed("l", "a", 1, true),
+                    col_typed("r", "b", 2, true),
+                ))
             };
-            let plan = join(
+            let plan = join_opt(
+                &mut arena,
                 jt,
-                scan("l", "tl", &[("a", 1, true)]),
-                scan("r", "tr", &[("b", 2, true)]),
+                scan_opt("l", "tl", &[("a", 1, true)]),
+                scan_opt("r", "tr", &[("b", 2, true)]),
                 cond,
             );
+            let mut ctx = make_ctx(arena);
             assert_eq!(
-                side_filters(DeriveJoinNotNullPredicate.apply(plan)),
+                side_filters(DeriveJoinNotNullPredicate.apply(plan, &mut ctx)),
                 (exp_l, exp_r),
                 "join type {jt:?}"
             );
@@ -373,108 +402,212 @@ mod tests {
 
     #[test]
     fn non_nullable_keys_are_skipped() {
-        assert_eq!(
-            side_filters(DeriveJoinNotNullPredicate.apply(inner_eq_join(false, false))),
-            (false, false)
-        );
-        // Only the nullable side gets a filter.
-        assert_eq!(
-            side_filters(DeriveJoinNotNullPredicate.apply(inner_eq_join(true, false))),
-            (true, false)
-        );
+        {
+            let mut arena = ScalarArena::new();
+            let plan = inner_eq_join_opt(&mut arena, false, false);
+            let mut ctx = make_ctx(arena);
+            assert_eq!(
+                side_filters(DeriveJoinNotNullPredicate.apply(plan, &mut ctx)),
+                (false, false)
+            );
+        }
+        {
+            // Only the nullable side gets a filter.
+            let mut arena = ScalarArena::new();
+            let plan = inner_eq_join_opt(&mut arena, true, false);
+            let mut ctx = make_ctx(arena);
+            assert_eq!(
+                side_filters(DeriveJoinNotNullPredicate.apply(plan, &mut ctx)),
+                (true, false)
+            );
+        }
     }
 
     #[test]
     fn composite_inner_key_derives_all_columns_on_each_side() {
-        let plan = join(
+        let mut arena = ScalarArena::new();
+        let plan = join_opt(
+            &mut arena,
             JoinKind::Inner,
-            scan("l", "tl", &[("a", 1, true), ("a2", 3, true)]),
-            scan("r", "tr", &[("b", 2, true), ("b2", 4, true)]),
-            Some(and(
-                eq(col("l", "a", 1, true), col("r", "b", 2, true)),
-                eq(col("l", "a2", 3, true), col("r", "b2", 4, true)),
+            scan_opt("l", "tl", &[("a", 1, true), ("a2", 3, true)]),
+            scan_opt("r", "tr", &[("b", 2, true), ("b2", 4, true)]),
+            Some(and_expr(
+                eq_expr(col_typed("l", "a", 1, true), col_typed("r", "b", 2, true)),
+                eq_expr(col_typed("l", "a2", 3, true), col_typed("r", "b2", 4, true)),
             )),
         );
-        let Some(rewritten) = DeriveJoinNotNullPredicate.apply(plan) else {
+        let mut ctx = make_ctx(arena);
+        let result = DeriveJoinNotNullPredicate.apply(plan, &mut ctx).unwrap();
+        let RewriteResult::Changed(rewritten) = result else {
+            panic!("expected Changed");
+        };
+        let Operator::LogicalJoin(_) = &rewritten.op else {
             panic!("expected join");
         };
-        let LogicalPlanNodeKind::Join(_) = &rewritten.kind else {
-            panic!("expected join");
-        };
-        assert_eq!(not_null_count(rewritten.left()), 2);
-        assert_eq!(not_null_count(rewritten.right()), 2);
+        let arena_ref = ctx.scalar_arena();
+        let arena = arena_ref.borrow();
+        assert_eq!(not_null_count(rewritten.left(), &arena), 2);
+        assert_eq!(not_null_count(rewritten.right(), &arena), 2);
     }
 
     #[test]
     fn idempotent_second_apply_is_noop() {
-        let once = DeriveJoinNotNullPredicate
-            .apply(inner_eq_join(true, true))
-            .expect("first applies");
+        let mut arena = ScalarArena::new();
+        let plan = inner_eq_join_opt(&mut arena, true, true);
+        let mut ctx = make_ctx(arena);
+        let first = DeriveJoinNotNullPredicate.apply(plan, &mut ctx).unwrap();
+        let RewriteResult::Changed(once) = first else {
+            panic!("first apply expected Changed");
+        };
         // Second application over the already-derived plan must not change it.
-        assert!(DeriveJoinNotNullPredicate.apply(once).is_none());
+        let second = DeriveJoinNotNullPredicate.apply(once, &mut ctx).unwrap();
+        assert!(matches!(second, RewriteResult::Unchanged));
     }
 
     #[test]
     fn idempotent_when_not_null_already_in_scan_predicates() {
         // State B: IS NOT NULL already pushed into scan.predicates (as
         // PushDownPredicateScan would do). The rule must NOT re-derive.
-        fn not_null(operand: TypedExpr) -> TypedExpr {
-            TypedExpr {
-                kind: ExprKind::IsNull {
-                    expr: Box::new(operand),
-                    negated: true,
+        let mut arena = ScalarArena::new();
+        let not_null_pred_l = TypedExpr {
+            kind: ExprKind::IsNull {
+                expr: Box::new(col_typed("l", "a", 1, true)),
+                negated: true,
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        };
+        let not_null_pred_r = TypedExpr {
+            kind: ExprKind::IsNull {
+                expr: Box::new(col_typed("r", "b", 2, true)),
+                negated: true,
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        };
+        let pred_l_id = scalar::intern_typed(&mut arena, &not_null_pred_l);
+        let pred_r_id = scalar::intern_typed(&mut arena, &not_null_pred_r);
+
+        let left_scan = ScanOp {
+            database: "default".to_string(),
+            table: TableDef {
+                name: "tl".to_string(),
+                columns: vec![ColumnDef {
+                    name: "a".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: true,
+                    write_default: None,
+                    logical_type: None,
+                }],
+                iceberg_row_lineage_metadata_columns: vec![],
+                source: ScanSource::StarRocks {
+                    db_id: 0,
+                    table_id: 0,
                 },
-                data_type: DataType::Boolean,
-                nullable: false,
-            }
-        }
-        let mut left = scan("l", "tl", &[("a", 1, true)]);
-        let mut right = scan("r", "tr", &[("b", 2, true)]);
-        if let LogicalPlanNodeKind::Scan(s) = &mut left.kind {
-            s.predicates.push(not_null(col("l", "a", 1, true)));
-        }
-        if let LogicalPlanNodeKind::Scan(s) = &mut right.kind {
-            s.predicates.push(not_null(col("r", "b", 2, true)));
-        }
-        let plan = join(
-            JoinKind::Inner,
-            left,
-            right,
-            Some(eq(col("l", "a", 1, true), col("r", "b", 2, true))),
+            },
+            alias: Some("l".to_string()),
+            columns: vec![OutputColumn {
+                column_id: ColumnId::new_for_test(1),
+                name: "a".to_string(),
+                data_type: DataType::Int32,
+                nullable: true,
+                is_internal: false,
+            }],
+            predicates: vec![pred_l_id],
+            required_columns: None,
+            dict_columns: vec![],
+            variant_columns: vec![],
+            mv_rewritten_from: None,
+        };
+        let right_scan = ScanOp {
+            database: "default".to_string(),
+            table: TableDef {
+                name: "tr".to_string(),
+                columns: vec![ColumnDef {
+                    name: "b".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: true,
+                    write_default: None,
+                    logical_type: None,
+                }],
+                iceberg_row_lineage_metadata_columns: vec![],
+                source: ScanSource::StarRocks {
+                    db_id: 0,
+                    table_id: 0,
+                },
+            },
+            alias: Some("r".to_string()),
+            columns: vec![OutputColumn {
+                column_id: ColumnId::new_for_test(2),
+                name: "b".to_string(),
+                data_type: DataType::Int32,
+                nullable: true,
+                is_internal: false,
+            }],
+            predicates: vec![pred_r_id],
+            required_columns: None,
+            dict_columns: vec![],
+            variant_columns: vec![],
+            mv_rewritten_from: None,
+        };
+
+        let cond = eq_expr(col_typed("l", "a", 1, true), col_typed("r", "b", 2, true));
+        let cond_id = scalar::intern_typed(&mut arena, &cond);
+        let plan = OptExpr::new(
+            Operator::LogicalJoin(LogicalJoinOp {
+                join_type: JoinKind::Inner,
+                condition: Some(cond_id),
+            }),
+            vec![
+                OptExpr::leaf(Operator::LogicalScan(left_scan)),
+                OptExpr::leaf(Operator::LogicalScan(right_scan)),
+            ],
         );
-        assert!(DeriveJoinNotNullPredicate.apply(plan).is_none());
+        let mut ctx = make_ctx(arena);
+        let result = DeriveJoinNotNullPredicate.apply(plan, &mut ctx).unwrap();
+        assert!(matches!(result, RewriteResult::Unchanged));
     }
 
     #[test]
     fn non_equi_and_missing_condition_skipped() {
-        assert!(
-            DeriveJoinNotNullPredicate
-                .apply(join(
-                    JoinKind::Inner,
-                    scan("l", "tl", &[("a", 1, true)]),
-                    scan("r", "tr", &[("b", 2, true)]),
-                    None
-                ))
-                .is_none()
-        );
-        let gt = TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: Box::new(col("l", "a", 1, true)),
-                op: BinOp::Gt,
-                right: Box::new(col("r", "b", 2, true)),
-            },
-            data_type: DataType::Boolean,
-            nullable: true,
-        };
-        assert!(
-            DeriveJoinNotNullPredicate
-                .apply(join(
-                    JoinKind::Inner,
-                    scan("l", "tl", &[("a", 1, true)]),
-                    scan("r", "tr", &[("b", 2, true)]),
-                    Some(gt)
-                ))
-                .is_none()
-        );
+        {
+            let mut arena = ScalarArena::new();
+            let plan = join_opt(
+                &mut arena,
+                JoinKind::Inner,
+                scan_opt("l", "tl", &[("a", 1, true)]),
+                scan_opt("r", "tr", &[("b", 2, true)]),
+                None,
+            );
+            let mut ctx = make_ctx(arena);
+            assert!(matches!(
+                DeriveJoinNotNullPredicate.apply(plan, &mut ctx).unwrap(),
+                RewriteResult::Unchanged
+            ));
+        }
+        {
+            let mut arena = ScalarArena::new();
+            let gt = TypedExpr {
+                kind: ExprKind::BinaryOp {
+                    left: Box::new(col_typed("l", "a", 1, true)),
+                    op: BinOp::Gt,
+                    right: Box::new(col_typed("r", "b", 2, true)),
+                },
+                data_type: DataType::Boolean,
+                nullable: true,
+            };
+            let plan = join_opt(
+                &mut arena,
+                JoinKind::Inner,
+                scan_opt("l", "tl", &[("a", 1, true)]),
+                scan_opt("r", "tr", &[("b", 2, true)]),
+                Some(gt),
+            );
+            let mut ctx = make_ctx(arena);
+            assert!(matches!(
+                DeriveJoinNotNullPredicate.apply(plan, &mut ctx).unwrap(),
+                RewriteResult::Unchanged
+            ));
+        }
     }
 }

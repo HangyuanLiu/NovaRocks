@@ -7,7 +7,12 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::sql::optimizer::operator::{ImvDeltaOp, Operator};
+use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
+use crate::sql::optimizer::rewrite::imv::{
+    PlanRewriteResult, bridge_apply_result, opt_expr_to_plan,
+};
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
@@ -78,7 +83,7 @@ impl LogicalRewriteRule for WrapRootInImvDeltaRule {
         RewriteTraversal::TopDown
     }
 
-    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+    fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
         if self.wrapped.load(Ordering::SeqCst) {
             return false;
         }
@@ -91,8 +96,8 @@ impl LogicalRewriteRule for WrapRootInImvDeltaRule {
         // all nodes; the wrapped flag just short-circuits matches() to prevent
         // double-wrapping.
         if matches!(
-            &plan.kind,
-            LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode { is_root: true, .. })
+            &expr.op,
+            Operator::LogicalImvDelta(ImvDeltaOp { is_root: true, .. })
         ) {
             self.wrapped.store(true, Ordering::SeqCst);
             return false;
@@ -100,21 +105,19 @@ impl LogicalRewriteRule for WrapRootInImvDeltaRule {
         true
     }
 
-    fn apply(
-        &self,
-        plan: LogicalPlanNode,
-        _ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         self.wrapped.store(true, Ordering::SeqCst);
-        Ok(RewriteResult::Changed(LogicalPlanNode::new(
-            LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
-                is_root: true,
-                action_column: None,
-                branch_scope: None,
-            }),
-            vec![plan],
-            None,
-        )))
+        bridge_apply_result(expr, ctx, |plan, _ctx| {
+            Ok(PlanRewriteResult::Changed(LogicalPlanNode::new(
+                LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+                    is_root: true,
+                    action_column: None,
+                    branch_scope: None,
+                }),
+                vec![plan],
+                None,
+            )))
+        })
     }
 }
 
@@ -142,15 +145,13 @@ impl LogicalRewriteRule for UnresolvedMarkerCheckRule {
         RewriteTraversal::TopDown
     }
 
-    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
-        plan_contains_imv_marker(plan)
+    fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
+        let plan = opt_expr_to_plan(expr.clone(), ctx);
+        plan_contains_imv_marker(&plan)
     }
 
-    fn apply(
-        &self,
-        plan: LogicalPlanNode,
-        _ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+        let plan = opt_expr_to_plan(expr, ctx);
         let markers = collect_marker_kinds(&plan);
         Ok(RewriteResult::Rejected(RewriteDiagnostic::rejected(
             "UnresolvedMarkerCheck",
@@ -203,6 +204,8 @@ fn collect_into(plan: &LogicalPlanNode, found: &mut Vec<&'static str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::optimizer::convert::{logical_plan_to_opt_expr, opt_expr_to_logical_plan};
+    use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::*;
     use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind, LogicalValuesNode};
 
@@ -221,7 +224,11 @@ mod tests {
             vec![Box::new(WrapRootInImvDeltaRule::new())],
         )]);
 
-        let out = pipeline.rewrite(plan, &mut ctx).unwrap();
+        let arena = std::rc::Rc::new(std::cell::RefCell::new(ScalarArena::new()));
+        ctx.set_scalar_arena(std::rc::Rc::clone(&arena));
+        let opt_in = logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut());
+        let opt_out = pipeline.rewrite(opt_in, &mut ctx).unwrap();
+        let out = opt_expr_to_logical_plan(opt_out, &arena.borrow());
 
         let LogicalPlanNodeKind::ImvDelta(delta) = &out.kind else {
             panic!("expected ImvDelta at root");
@@ -258,7 +265,11 @@ mod tests {
             vec![Box::new(WrapRootInImvDeltaRule::new())],
         )]);
 
-        let out = pipeline.rewrite(already, &mut ctx).unwrap();
+        let arena = std::rc::Rc::new(std::cell::RefCell::new(ScalarArena::new()));
+        ctx.set_scalar_arena(std::rc::Rc::clone(&arena));
+        let opt_in = logical_plan_to_opt_expr(&already, &mut arena.borrow_mut());
+        let opt_out = pipeline.rewrite(opt_in, &mut ctx).unwrap();
+        let out = opt_expr_to_logical_plan(opt_out, &arena.borrow());
         assert_eq!(format!("{out:?}"), before, "wrap must not double-wrap");
     }
 
@@ -293,12 +304,13 @@ mod tests {
         }
 
         // First invocation — fresh rule instance
-        let out1 = make_pipeline()
-            .rewrite(
-                empty_values_plan(),
-                &mut RewriteContext::for_mv_refresh(Vec::<String>::new()),
-            )
-            .unwrap();
+        let plan1 = empty_values_plan();
+        let mut ctx1 = RewriteContext::for_mv_refresh(Vec::<String>::new());
+        let arena1 = std::rc::Rc::new(std::cell::RefCell::new(ScalarArena::new()));
+        ctx1.set_scalar_arena(std::rc::Rc::clone(&arena1));
+        let opt_in1 = logical_plan_to_opt_expr(&plan1, &mut arena1.borrow_mut());
+        let opt_out1 = make_pipeline().rewrite(opt_in1, &mut ctx1).unwrap();
+        let out1 = opt_expr_to_logical_plan(opt_out1, &arena1.borrow());
         assert!(
             matches!(
                 &out1.kind,
@@ -310,12 +322,13 @@ mod tests {
         // Second invocation — another fresh rule instance (simulates a second
         // `run_imv_rewrite()` call the way `build_imv_pipeline()` works in
         // production).
-        let out2 = make_pipeline()
-            .rewrite(
-                empty_values_plan(),
-                &mut RewriteContext::for_mv_refresh(Vec::<String>::new()),
-            )
-            .unwrap();
+        let plan2 = empty_values_plan();
+        let mut ctx2 = RewriteContext::for_mv_refresh(Vec::<String>::new());
+        let arena2 = std::rc::Rc::new(std::cell::RefCell::new(ScalarArena::new()));
+        ctx2.set_scalar_arena(std::rc::Rc::clone(&arena2));
+        let opt_in2 = logical_plan_to_opt_expr(&plan2, &mut arena2.borrow_mut());
+        let opt_out2 = make_pipeline().rewrite(opt_in2, &mut ctx2).unwrap();
+        let out2 = opt_expr_to_logical_plan(opt_out2, &arena2.borrow());
         assert!(
             matches!(
                 &out2.kind,
@@ -438,8 +451,12 @@ mod tests {
         ]);
 
         let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
+        let arena = std::rc::Rc::new(std::cell::RefCell::new(ScalarArena::new()));
+        ctx.set_scalar_arena(std::rc::Rc::clone(&arena));
+        let plan = empty_values_plan();
+        let opt_in = logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut());
         let err = pipeline
-            .rewrite(empty_values_plan(), &mut ctx)
+            .rewrite(opt_in, &mut ctx)
             .expect_err("Validation must reject the wrapped-but-unconsumed plan");
         assert!(
             err.starts_with("IVM rewrite failed to resolve incremental markers:"),
@@ -469,9 +486,14 @@ mod tests {
         )]);
 
         let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
-        let out = pipeline
-            .rewrite(empty_values_plan(), &mut ctx)
+        let arena = std::rc::Rc::new(std::cell::RefCell::new(ScalarArena::new()));
+        ctx.set_scalar_arena(std::rc::Rc::clone(&arena));
+        let plan = empty_values_plan();
+        let opt_in = logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut());
+        let opt_out = pipeline
+            .rewrite(opt_in, &mut ctx)
             .expect("plain plan must pass validation");
+        let out = opt_expr_to_logical_plan(opt_out, &arena.borrow());
         assert!(matches!(&out.kind, LogicalPlanNodeKind::Values(_)));
     }
 
@@ -486,10 +508,14 @@ mod tests {
         // on a plain non-IMV plan.
         let pipeline = query_rewrite_pipeline(&HashMap::new());
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
-
-        let out = pipeline
-            .rewrite(empty_values_plan(), &mut ctx)
+        let arena = std::rc::Rc::new(std::cell::RefCell::new(ScalarArena::new()));
+        ctx.set_scalar_arena(std::rc::Rc::clone(&arena));
+        let plan = empty_values_plan();
+        let opt_in = logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut());
+        let opt_out = pipeline
+            .rewrite(opt_in, &mut ctx)
             .expect("query pipeline must not error on plain plan");
+        let out = opt_expr_to_logical_plan(opt_out, &arena.borrow());
         assert!(
             !plan_contains_imv_marker(&out),
             "non-IMV pipeline must not emit markers, got {out:?}"

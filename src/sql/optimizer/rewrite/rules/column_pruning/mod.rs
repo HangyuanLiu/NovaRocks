@@ -115,8 +115,13 @@ mod tests {
     };
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use crate::sql::optimizer::convert::{logical_plan_to_opt_expr, opt_expr_to_logical_plan};
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::registry::query_rewrite_pipeline;
+    use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::*;
 
     // -----------------------------------------------------------------------
@@ -188,7 +193,13 @@ mod tests {
         let table_stats = HashMap::new();
         let pipeline = query_rewrite_pipeline(&table_stats);
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
-        pipeline.rewrite(plan, &mut ctx).unwrap()
+        let mut scalars = ScalarArena::new();
+        let opt_plan = logical_plan_to_opt_expr(&plan, &mut scalars);
+        let arena_rc = Rc::new(RefCell::new(scalars));
+        ctx.set_scalar_arena(arena_rc.clone());
+        let opt_result = pipeline.rewrite(opt_plan, &mut ctx).unwrap();
+        let arena = arena_rc.borrow();
+        opt_expr_to_logical_plan(opt_result, &arena)
     }
 
     fn extract_scan(plan: &LogicalPlanNode) -> &LogicalScanNode {

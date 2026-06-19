@@ -87,11 +87,17 @@ fn canonical_expr_key(expr: &TypedExpr) -> String {
             right,
         } => canonical_bool_key("OR", left, right),
         ExprKind::BinaryOp { left, op, right } => {
-            format!(
-                "BinaryOp({op:?},{},{})",
-                canonical_expr_key(left),
-                canonical_expr_key(right)
-            )
+            // For commutative ops (Eq, Ne) canonicalize operand order so that
+            // `a = b` and `b = a` produce the same key regardless of which
+            // direction the arena normalization swapped them.
+            let lk = canonical_expr_key(left);
+            let rk = canonical_expr_key(right);
+            let (lk, rk) = if matches!(op, BinOp::Eq | BinOp::Ne) && lk > rk {
+                (rk, lk)
+            } else {
+                (lk, rk)
+            };
+            format!("BinaryOp({op:?},{lk},{rk})")
         }
         ExprKind::UnaryOp { op, expr } => {
             format!("UnaryOp({op:?},{})", canonical_expr_key(expr))

@@ -8,11 +8,12 @@
 //! Kept for architectural symmetry and to allow per-operator
 //! `disable_optimizer_rules` control in the future.
 
+use crate::sql::optimizer::operator::Operator;
+use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind};
 
 pub(crate) struct PruneLimitColumns;
 
@@ -25,15 +26,11 @@ impl LogicalRewriteRule for PruneLimitColumns {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
-        matches!(&plan.kind, LogicalPlanNodeKind::Limit(_))
+    fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
+        matches!(&expr.op, Operator::LogicalLimit(_))
     }
 
-    fn apply(
-        &self,
-        _plan: LogicalPlanNode,
-        _ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, _expr: OptExpr, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         // No-op: Limit has no own output metadata to prune; column needs were
         // propagated to its child by the Phase-1 tagging pass. Kept for
         // architectural symmetry + per-operator disable_optimizer_rules control.
@@ -44,9 +41,9 @@ impl LogicalRewriteRule for PruneLimitColumns {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::optimizer::operator::{LimitOp, Operator, ValuesOp};
+    use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
-    use crate::sql::planner::plan::*;
-    use crate::sql::planner::plan::{LogicalLimitNode, LogicalPlanNodeKind, LogicalValuesNode};
 
     fn ctx() -> RewriteContext {
         RewriteContext::new(RewriteConsumer::Query)
@@ -54,28 +51,23 @@ mod tests {
 
     #[test]
     fn prune_limit_is_always_unchanged() {
-        let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Limit(LogicalLimitNode {
+        let expr = OptExpr::new(
+            Operator::LogicalLimit(LimitOp {
                 limit: Some(10),
                 offset: None,
             }),
-            vec![LogicalPlanNode::new(
-                LogicalPlanNodeKind::Values(LogicalValuesNode {
-                    rows: vec![],
-                    columns: vec![],
-                }),
-                vec![],
-                None,
-            )],
-            None,
+            vec![OptExpr::leaf(Operator::LogicalValues(ValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }))],
         );
         let rule = PruneLimitColumns;
 
         // matches the right variant
-        assert!(rule.matches(&plan, &ctx()));
+        assert!(rule.matches(&expr, &ctx()));
 
         // apply always returns Unchanged
-        let result = rule.apply(plan, &mut ctx()).unwrap();
+        let result = rule.apply(expr, &mut ctx()).unwrap();
         assert!(
             matches!(result, RewriteResult::Unchanged),
             "PruneLimitColumns must always return Unchanged"

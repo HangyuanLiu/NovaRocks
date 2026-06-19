@@ -7,14 +7,16 @@
 //! plan and never fails the rewrite.
 
 use crate::engine::mv::partition::resolve_partition_derivation_spec;
+use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::imv::annotation::{
     ImvExtension, ImvPartitionAnnotation, ImvPlanAnnotation,
 };
+use crate::sql::optimizer::rewrite::imv::opt_expr_to_plan;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
-use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind};
+use crate::sql::planner::plan::LogicalPlanNodeKind;
 
 pub(crate) struct DerivePartitionSpecRule;
 
@@ -31,7 +33,8 @@ impl LogicalRewriteRule for DerivePartitionSpecRule {
         RewriteTraversal::TopDown
     }
 
-    fn matches(&self, plan: &LogicalPlanNode, ctx: &RewriteContext) -> bool {
+    fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
+        let plan = opt_expr_to_plan(expr.clone(), ctx);
         if !matches!(&plan.kind, LogicalPlanNodeKind::AggregateStateMerge(_)) {
             return false;
         }
@@ -39,11 +42,9 @@ impl LogicalRewriteRule for DerivePartitionSpecRule {
             .is_some_and(|ext| ext.annotation.partition.is_none())
     }
 
-    fn apply(
-        &self,
-        _plan: LogicalPlanNode,
-        ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+        // Convert expr to plan to satisfy the bridge contract (ignored)
+        let _plan = opt_expr_to_plan(expr, ctx);
         let ext = ctx
             .extension::<ImvExtension>()
             .ok_or("DerivePartitionSpec requires ImvExtension")?

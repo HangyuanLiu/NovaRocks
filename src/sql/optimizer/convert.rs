@@ -3,17 +3,28 @@
 
 use super::memo::{GroupId, MExpr, Memo};
 use super::operator::{
-    AggregateStateMergeOp, AssertOneRowOp, CTEAnchorOp, CTEConsumeOp, CTEProduceOp, DecodeOp,
-    ExceptOp, FilterOp, GenerateSeriesOp, IntersectOp, LimitOp, LogicalAggregateOp, LogicalJoinOp,
-    Operator, ProjectOp, RepeatOp, ScanOp, SortOp, TableFunctionOp, UnionOp, ValuesOp, WindowOp,
+    AggregateStateMergeOp, ApplyOp, AssertOneRowOp, CTEAnchorOp, CTEConsumeOp, CTEProduceOp,
+    DecodeOp, ExceptOp, FilterOp, GenerateSeriesOp, ImvDeltaOp, ImvVersionOp, IntersectOp, LimitOp,
+    LogicalAggregateOp, LogicalJoinOp, Operator, ProjectOp, RepeatOp, ScanOp, SortOp,
+    TableFunctionOp, UnionOp, ValuesOp, WindowOp,
 };
 use super::opt_expr::OptExpr;
+use crate::sql::analysis::SortItem;
 use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
 use crate::sql::optimizer::scalar_bridge::{
     intern_aggregate_calls, intern_exprs, intern_project_items, intern_sort_items,
-    intern_window_exprs,
+    intern_window_exprs, materialize_aggregate_calls, materialize_exprs, materialize_project_items,
+    materialize_sort_keys, materialize_window_exprs,
 };
-use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind};
+use crate::sql::planner::plan::{
+    LogicalAggregateNode, LogicalAggregateStateMergeNode, LogicalApplyNode,
+    LogicalAssertOneRowNode, LogicalCTEAnchorNode, LogicalCTEConsumeNode, LogicalCTEProduceNode,
+    LogicalDecodeNode, LogicalExceptNode, LogicalFilterNode, LogicalGenerateSeriesNode,
+    LogicalImvDeltaNode, LogicalImvVersionNode, LogicalIntersectNode, LogicalJoinNode,
+    LogicalLimitNode, LogicalPlanNode, LogicalPlanNodeKind, LogicalProjectNode, LogicalRepeatNode,
+    LogicalScanNode, LogicalSortNode, LogicalTableFunctionNode, LogicalUnionNode,
+    LogicalValuesNode, LogicalWindowNode,
+};
 
 /// Copy an `OptExpr` tree into the Memo as Groups (one Group per node).
 /// The operator already holds interned `ScalarId`s, so no scalar interning
@@ -43,7 +54,7 @@ pub(crate) fn logical_plan_to_opt_expr(
     plan: &LogicalPlanNode,
     scalars: &mut ScalarArena,
 ) -> OptExpr {
-    match &plan.kind {
+    let mut expr = match &plan.kind {
         LogicalPlanNodeKind::Scan(node) => {
             for column in &node.columns {
                 scalars.remember_source_column_display(
@@ -303,19 +314,248 @@ pub(crate) fn logical_plan_to_opt_expr(
             OptExpr::new(op, vec![child])
         }
 
-        LogicalPlanNodeKind::Apply(_) => {
-            // Defence in depth: the SubqueryRewrite stage's ApplyException
-            // rule and the optimize() residual-Apply backstop eliminate every
-            // Apply before this point. Reaching here means a planner bug, so
-            // fail loudly rather than mis-optimize.
-            panic!(
-                "apply operator must be eliminated by the SubqueryRewrite stage before memo conversion"
+        LogicalPlanNodeKind::Apply(node) => {
+            // Apply is consumed by the subquery/imv rewrite rules BEFORE memo
+            // conversion. Building an OptExpr here allows the rewrite rules
+            // (subquery/ and imv/ dirs) to operate on OptExpr trees. After
+            // rewrite the SubqueryRewrite backstop asserts no Apply remains.
+            let outer = logical_plan_to_opt_expr(plan.left(), scalars);
+            let inner = logical_plan_to_opt_expr(plan.right(), scalars);
+            let op = Operator::LogicalApply(ApplyOp {
+                kind: node.kind,
+                subquery_expr: intern_typed(scalars, &node.subquery_expr),
+                output_column: node.output_column.clone(),
+                inner_output_column_id: node.inner_output_column_id,
+                correlation_column_ids: node.correlation_column_ids.clone(),
+                correlation_conjuncts: intern_exprs(scalars, &node.correlation_conjuncts),
+                residual_predicate: node
+                    .residual_predicate
+                    .as_ref()
+                    .map(|e| intern_typed(scalars, e)),
+                need_check_max_rows: node.need_check_max_rows,
+                use_semi_anti: node.use_semi_anti,
+                uncorrelated_outer_predicate_columns: node
+                    .uncorrelated_outer_predicate_columns
+                    .clone(),
+            });
+            OptExpr::new(op, vec![outer, inner])
+        }
+
+        LogicalPlanNodeKind::ImvDelta(node) => {
+            // ImvDelta wraps a child subtree (the base plan being rewritten).
+            let child = logical_plan_to_opt_expr(plan.unary_input(), scalars);
+            let op = Operator::LogicalImvDelta(ImvDeltaOp {
+                is_root: node.is_root,
+                action_column: node.action_column,
+                branch_scope: node.branch_scope.clone(),
+            });
+            OptExpr::new(op, vec![child])
+        }
+
+        LogicalPlanNodeKind::ImvVersion(node) => {
+            // ImvVersion wraps a child plan (the snapshot scan subtree).
+            let op = Operator::LogicalImvVersion(ImvVersionOp {
+                version_ref: node.version_ref.clone(),
+            });
+            if plan.children.is_empty() {
+                OptExpr::leaf(op)
+            } else {
+                let child = logical_plan_to_opt_expr(plan.unary_input(), scalars);
+                OptExpr::new(op, vec![child])
+            }
+        }
+    };
+    expr.required_output_columns = plan.required_output_columns.clone();
+    expr
+}
+
+/// Bridge 2 (reverse): convert an `OptExpr` tree back into a `LogicalPlanNode`
+/// tree, materializing all `ScalarId` values from the provided arena.
+///
+/// This is used exclusively by the IMV rewrite pipeline, which operates on
+/// `OptExpr` internally but produces output that callers (e.g. `engine/mod.rs`)
+/// still consume as `LogicalPlanNode`. Only the operator variants that can
+/// appear in the IMV rewrite path are handled; the remainder panic because
+/// they cannot arise from a well-formed IMV rewrite output.
+pub(crate) fn opt_expr_to_logical_plan(expr: OptExpr, arena: &ScalarArena) -> LogicalPlanNode {
+    let children: Vec<LogicalPlanNode> = expr
+        .children
+        .into_iter()
+        .map(|c| opt_expr_to_logical_plan(c, arena))
+        .collect();
+    let kind = match expr.op {
+        Operator::LogicalScan(op) => LogicalPlanNodeKind::Scan(LogicalScanNode {
+            database: op.database,
+            table: op.table,
+            alias: op.alias,
+            columns: op.columns,
+            predicates: materialize_exprs(arena, &op.predicates),
+            required_columns: op.required_columns,
+            dict_columns: op.dict_columns,
+            variant_columns: op.variant_columns,
+        }),
+        Operator::LogicalFilter(op) => LogicalPlanNodeKind::Filter(LogicalFilterNode {
+            predicate: crate::sql::optimizer::scalar::materialize(arena, op.predicate),
+        }),
+        Operator::LogicalProject(op) => LogicalPlanNodeKind::Project(LogicalProjectNode {
+            items: materialize_project_items(arena, &op.items),
+            output_qualifier: op.output_qualifier,
+        }),
+        Operator::LogicalAggregate(op) => {
+            let group_by = materialize_exprs(arena, &op.group_by);
+            let aggregates = materialize_aggregate_calls(
+                arena,
+                &op.aggregates,
+                op.group_by.len(),
+                &op.output_columns,
             );
+            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+                group_by,
+                aggregates,
+                output_columns: op.output_columns,
+                already_pushed: false,
+            })
         }
-        LogicalPlanNodeKind::ImvDelta(_) | LogicalPlanNodeKind::ImvVersion(_) => {
-            panic!("imv marker leaked into non-IMV plan");
+        Operator::LogicalJoin(op) => LogicalPlanNodeKind::Join(LogicalJoinNode {
+            join_type: op.join_type,
+            condition: op
+                .condition
+                .map(|id| crate::sql::optimizer::scalar::materialize(arena, id)),
+        }),
+        Operator::LogicalSort(op) => {
+            let items: Vec<SortItem> = materialize_sort_keys(arena, &op.items);
+            LogicalPlanNodeKind::Sort(LogicalSortNode {
+                items,
+                analytic_partition_by: materialize_exprs(arena, &op.analytic_partition_exprs),
+                partition_limit: op.partition_limit,
+                topn_type: op.topn_type,
+            })
         }
-    }
+        Operator::LogicalLimit(op) => LogicalPlanNodeKind::Limit(LogicalLimitNode {
+            limit: op.limit,
+            offset: op.offset,
+        }),
+        Operator::LogicalUnion(op) => LogicalPlanNodeKind::Union(LogicalUnionNode {
+            all: op.all,
+            output_columns: op.output_columns,
+        }),
+        Operator::LogicalValues(op) => LogicalPlanNodeKind::Values(LogicalValuesNode {
+            rows: op
+                .rows
+                .iter()
+                .map(|row| materialize_exprs(arena, row))
+                .collect(),
+            columns: op.columns,
+        }),
+        Operator::LogicalAggregateStateMerge(op) => {
+            LogicalPlanNodeKind::AggregateStateMerge(LogicalAggregateStateMergeNode {
+                group_key_names: op.group_key_names,
+                aggregate_state_names: op.aggregate_state_names,
+                change_op_column: op.change_op_column,
+                output_columns: op.output_columns,
+            })
+        }
+        Operator::LogicalImvDelta(op) => LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+            is_root: op.is_root,
+            action_column: op.action_column,
+            branch_scope: op.branch_scope,
+        }),
+        Operator::LogicalImvVersion(op) => LogicalPlanNodeKind::ImvVersion(LogicalImvVersionNode {
+            version_ref: op.version_ref,
+        }),
+        Operator::LogicalAssertOneRow(op) => {
+            LogicalPlanNodeKind::AssertOneRow(LogicalAssertOneRowNode {
+                subquery_text: op.subquery_text,
+            })
+        }
+        Operator::LogicalIntersect(op) => LogicalPlanNodeKind::Intersect(LogicalIntersectNode {
+            output_columns: op.output_columns,
+        }),
+        Operator::LogicalExcept(op) => LogicalPlanNodeKind::Except(LogicalExceptNode {
+            output_columns: op.output_columns,
+        }),
+        Operator::LogicalGenerateSeries(op) => {
+            LogicalPlanNodeKind::GenerateSeries(LogicalGenerateSeriesNode {
+                start: op.start,
+                end: op.end,
+                step: op.step,
+                column_name: op.column_name,
+                alias: op.alias,
+                output_column_id: op.output_column_id,
+            })
+        }
+        Operator::LogicalTableFunction(op) => {
+            LogicalPlanNodeKind::TableFunction(LogicalTableFunctionNode {
+                function_name: op.function_name,
+                args: materialize_exprs(arena, &op.args),
+                output_columns: op.output_columns,
+                alias: op.alias,
+                is_left_join: op.is_left_join,
+            })
+        }
+        Operator::LogicalWindow(op) => {
+            let window_exprs =
+                materialize_window_exprs(arena, &op.window_exprs, &op.output_columns);
+            LogicalPlanNodeKind::Window(LogicalWindowNode {
+                window_exprs,
+                output_columns: op.output_columns,
+            })
+        }
+        Operator::LogicalRepeat(op) => LogicalPlanNodeKind::Repeat(LogicalRepeatNode {
+            repeat_column_ref_list: op.repeat_column_ref_list,
+            repeat_column_ref_ids: op.repeat_column_ref_ids,
+            grouping_ids: op.grouping_ids,
+            all_rollup_columns: op.all_rollup_columns,
+            all_rollup_column_ids: op.all_rollup_column_ids,
+            grouping_key_aliases: op.grouping_key_aliases,
+            grouping_fn_args: op.grouping_fn_args,
+            grouping_fn_arg_ids: op.grouping_fn_arg_ids,
+            grouping_fn_ids: op.grouping_fn_ids,
+        }),
+        Operator::LogicalCTEAnchor(op) => {
+            LogicalPlanNodeKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: op.cte_id })
+        }
+        Operator::LogicalCTEProduce(op) => LogicalPlanNodeKind::CTEProduce(LogicalCTEProduceNode {
+            cte_id: op.cte_id,
+            output_columns: op.output_columns,
+        }),
+        Operator::LogicalCTEConsume(op) => LogicalPlanNodeKind::CTEConsume(LogicalCTEConsumeNode {
+            cte_id: op.cte_id,
+            alias: op.alias,
+            output_columns: op.output_columns,
+        }),
+        Operator::LogicalDecode(op) => LogicalPlanNodeKind::Decode(LogicalDecodeNode {
+            mappings: op.mappings,
+            output_columns: op.output_columns,
+        }),
+        Operator::LogicalApply(op) => {
+            // Apply is expected to be eliminated by the SubqueryRewrite stage
+            // before opt_expr_to_logical_plan is called. If it survives, we
+            // still need to materialize it correctly for callers that inspect
+            // the plan before memo conversion.
+            LogicalPlanNodeKind::Apply(LogicalApplyNode {
+                kind: op.kind,
+                subquery_expr: crate::sql::optimizer::scalar::materialize(arena, op.subquery_expr),
+                output_column: op.output_column,
+                inner_output_column_id: op.inner_output_column_id,
+                correlation_column_ids: op.correlation_column_ids,
+                correlation_conjuncts: materialize_exprs(arena, &op.correlation_conjuncts),
+                residual_predicate: op
+                    .residual_predicate
+                    .map(|id| crate::sql::optimizer::scalar::materialize(arena, id)),
+                need_check_max_rows: op.need_check_max_rows,
+                use_semi_anti: op.use_semi_anti,
+                uncorrelated_outer_predicate_columns: op.uncorrelated_outer_predicate_columns,
+            })
+        }
+        // Physical operators should never reach opt_expr_to_logical_plan.
+        other => panic!(
+            "opt_expr_to_logical_plan: unexpected operator kind {:?} — \
+             physical/unknown operators cannot be materialized to LogicalPlanNode",
+            other
+        ),
+    };
+    LogicalPlanNode::new(kind, children, expr.required_output_columns)
 }
 
 /// Convert a `LogicalPlanNode` tree into Memo groups (Bridge 1 + copy-in).

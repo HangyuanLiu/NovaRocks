@@ -14,26 +14,34 @@
 //! the pushed filter afterwards.
 //!
 //! Mirrors legacy `push_semi_condition_into_children` from
-//! `src/sql/optimizer/predicate_pushdown.rs`. Ported verbatim except for
-//! being exposed through the new logical rewrite rule trait.
+//! `src/sql/optimizer/predicate_pushdown.rs`. Migrated to `OptExpr` / `LogicalRewriteRule`.
 
 use crate::sql::analysis::{JoinKind, TypedExpr};
 use crate::sql::column_id::ColumnId;
-use crate::sql::optimizer::rewrite::rule::PlanRewriteRule as RewriteRule;
+use crate::sql::optimizer::operator::{FilterOp, LogicalJoinOp, Operator};
+use crate::sql::optimizer::opt_expr::OptExpr;
+use crate::sql::optimizer::rewrite::context::RewriteContext;
+use crate::sql::optimizer::rewrite::phase::RewritePhase;
+use crate::sql::optimizer::rewrite::result::RewriteResult;
+use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
 use crate::sql::optimizer::rewrite::rules::utils::{
-    collect_column_id_refs_strict, collect_output_ids, combine_and, split_and,
+    collect_column_id_refs_strict, collect_output_ids_opt, combine_and, split_and,
 };
-use crate::sql::planner::plan::*;
+use crate::sql::optimizer::scalar;
 
 pub(crate) struct PushSemiAntiRightOnlyCondition;
 
-impl RewriteRule for PushSemiAntiRightOnlyCondition {
+impl LogicalRewriteRule for PushSemiAntiRightOnlyCondition {
     fn name(&self) -> &'static str {
         "PushSemiAntiRightOnlyCondition"
     }
 
-    fn matches(&self, plan: &LogicalPlanNode) -> bool {
-        let LogicalPlanNodeKind::Join(j) = &plan.kind else {
+    fn phase(&self) -> RewritePhase {
+        RewritePhase::StructuralRewrite
+    }
+
+    fn matches(&self, expr: &OptExpr, _ctx: &RewriteContext) -> bool {
+        let Operator::LogicalJoin(j) = &expr.op else {
             return false;
         };
         matches!(
@@ -42,26 +50,33 @@ impl RewriteRule for PushSemiAntiRightOnlyCondition {
         ) && j.condition.is_some()
     }
 
-    fn apply(&self, plan: LogicalPlanNode) -> Option<LogicalPlanNode> {
-        let LogicalPlanNode {
-            kind,
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+        let OptExpr {
+            op,
             mut children,
             required_output_columns,
-        } = plan;
-        let LogicalPlanNodeKind::Join(join) = &kind else {
-            return None;
+        } = expr;
+        let Operator::LogicalJoin(join) = op else {
+            return Ok(RewriteResult::Unchanged);
         };
         if children.len() != 2 {
-            return None;
+            return Ok(RewriteResult::Unchanged);
         }
+        let Some(cond_id) = join.condition else {
+            return Ok(RewriteResult::Unchanged);
+        };
         let right = children.remove(1);
         let left = children.remove(0);
-        let condition = join.condition.as_ref()?;
 
-        // Port of push_semi_condition_into_children logic (legacy lines 374-431).
-        let conjuncts = split_and(condition.clone());
-        let mut right_ids = collect_output_ids(&right);
-        let mut left_ids = collect_output_ids(&left);
+        let arena_rc = ctx.scalar_arena();
+        let mut arena = arena_rc.borrow_mut();
+
+        // Materialize the join condition.
+        let condition = scalar::materialize(&arena, cond_id);
+
+        let conjuncts = split_and(condition);
+        let mut right_ids = collect_output_ids_opt(&right);
+        let mut left_ids = collect_output_ids_opt(&left);
         right_ids.remove(&ColumnId::UNSET);
         left_ids.remove(&ColumnId::UNSET);
 
@@ -80,28 +95,32 @@ impl RewriteRule for PushSemiAntiRightOnlyCondition {
         }
 
         if push_to_right.is_empty() {
-            return None;
+            return Ok(RewriteResult::Unchanged);
         }
 
         let new_condition = if keep_in_condition.is_empty() {
             None
         } else {
-            Some(combine_and(keep_in_condition))
+            let combined = combine_and(keep_in_condition);
+            Some(scalar::intern_typed(&mut arena, &combined))
         };
-        let pushed = combine_and(push_to_right);
-        let new_right = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(LogicalFilterNode { predicate: pushed }),
+        let pushed_pred = combine_and(push_to_right);
+        let pushed_id = scalar::intern_typed(&mut arena, &pushed_pred);
+        let new_right = OptExpr::new(
+            Operator::LogicalFilter(FilterOp {
+                predicate: pushed_id,
+            }),
             vec![right],
-            None,
         );
-        Some(LogicalPlanNode::new(
-            LogicalPlanNodeKind::Join(LogicalJoinNode {
+        let mut result = OptExpr::new(
+            Operator::LogicalJoin(LogicalJoinOp {
                 join_type: join.join_type,
                 condition: new_condition,
             }),
             vec![left, new_right],
-            required_output_columns,
-        ))
+        );
+        result.required_output_columns = required_output_columns;
+        Ok(RewriteResult::Changed(result))
     }
 }
 
@@ -127,13 +146,17 @@ fn classify_right_only_by_column_ids(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::{
-        BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
-    };
+    use crate::sql::analysis::TypedExpr;
+    use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::planner::plan::*;
+    use crate::sql::optimizer::operator::{ScanOp, ValuesOp};
+    use crate::sql::optimizer::opt_expr::OptExpr;
+    use crate::sql::optimizer::rewrite::context::RewriteContext;
+    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
     use arrow::datatypes::DataType;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     fn test_col_id(name: &str) -> ColumnId {
         match name {
@@ -149,7 +172,7 @@ mod tests {
         }
     }
 
-    fn col(name: &str) -> TypedExpr {
+    fn col_typed(name: &str) -> TypedExpr {
         TypedExpr {
             data_type: DataType::Int64,
             nullable: true,
@@ -161,124 +184,7 @@ mod tests {
         }
     }
 
-    fn int_lit(v: i64) -> TypedExpr {
-        TypedExpr {
-            data_type: DataType::Int64,
-            nullable: false,
-            kind: ExprKind::Literal(LiteralValue::Int(v)),
-        }
-    }
-
-    fn eq(a: TypedExpr, b: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
-            kind: ExprKind::BinaryOp {
-                left: Box::new(a),
-                op: BinOp::Eq,
-                right: Box::new(b),
-            },
-        }
-    }
-
-    fn gt(a: TypedExpr, b: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
-            kind: ExprKind::BinaryOp {
-                left: Box::new(a),
-                op: BinOp::Gt,
-                right: Box::new(b),
-            },
-        }
-    }
-
-    fn and(a: TypedExpr, b: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
-            kind: ExprKind::BinaryOp {
-                left: Box::new(a),
-                op: BinOp::And,
-                right: Box::new(b),
-            },
-        }
-    }
-
-    fn scan(table_name: &str, cols: &[&str]) -> LogicalPlanNode {
-        LogicalPlanNode::new(
-            LogicalPlanNodeKind::Scan(LogicalScanNode {
-                database: "db".into(),
-                table: TableDef {
-                    name: table_name.into(),
-                    columns: cols
-                        .iter()
-                        .map(|n| ColumnDef {
-                            name: (*n).into(),
-                            data_type: DataType::Int64,
-                            nullable: true,
-                            write_default: None,
-                            logical_type: None,
-                        })
-                        .collect(),
-                    iceberg_row_lineage_metadata_columns: vec![],
-                    source: ScanSource::StarRocks {
-                        db_id: 0,
-                        table_id: 0,
-                    },
-                },
-                alias: Some(table_name.into()),
-                columns: cols
-                    .iter()
-                    .map(|n| OutputColumn {
-                        column_id: test_col_id(n),
-                        name: (*n).into(),
-                        data_type: DataType::Int64,
-                        nullable: true,
-                        is_internal: false,
-                    })
-                    .collect(),
-                predicates: vec![],
-                required_columns: None,
-                dict_columns: vec![],
-                variant_columns: vec![],
-            }),
-            vec![],
-            None,
-        )
-    }
-
-    fn semi_join(
-        left: LogicalPlanNode,
-        right: LogicalPlanNode,
-        condition: Option<TypedExpr>,
-    ) -> LogicalPlanNode {
-        LogicalPlanNode::new(
-            LogicalPlanNodeKind::Join(LogicalJoinNode {
-                join_type: JoinKind::LeftSemi,
-                condition: condition,
-            }),
-            vec![left, right],
-            None,
-        )
-    }
-
-    fn inner_join(
-        left: LogicalPlanNode,
-        right: LogicalPlanNode,
-        condition: Option<TypedExpr>,
-    ) -> LogicalPlanNode {
-        LogicalPlanNode::new(
-            LogicalPlanNodeKind::Join(LogicalJoinNode {
-                join_type: JoinKind::Inner,
-                condition: condition,
-            }),
-            vec![left, right],
-            None,
-        )
-    }
-
-    fn col_with_id(qualifier: &str, name: &str, id: u32) -> TypedExpr {
+    fn col_with_id_typed(qualifier: &str, name: &str, id: u32) -> TypedExpr {
         TypedExpr {
             data_type: DataType::Int64,
             nullable: true,
@@ -290,99 +196,231 @@ mod tests {
         }
     }
 
-    fn values_with_output(name: &str, id: u32) -> LogicalPlanNode {
-        LogicalPlanNode::new(
-            LogicalPlanNodeKind::Values(LogicalValuesNode {
-                rows: vec![],
-                columns: vec![OutputColumn {
-                    column_id: ColumnId::new_for_test(id),
-                    name: name.to_string(),
+    fn int_lit_typed(v: i64) -> TypedExpr {
+        TypedExpr {
+            data_type: DataType::Int64,
+            nullable: false,
+            kind: ExprKind::Literal(LiteralValue::Int(v)),
+        }
+    }
+
+    fn eq_typed(a: TypedExpr, b: TypedExpr) -> TypedExpr {
+        TypedExpr {
+            data_type: DataType::Boolean,
+            nullable: false,
+            kind: ExprKind::BinaryOp {
+                left: Box::new(a),
+                op: BinOp::Eq,
+                right: Box::new(b),
+            },
+        }
+    }
+
+    fn gt_typed(a: TypedExpr, b: TypedExpr) -> TypedExpr {
+        TypedExpr {
+            data_type: DataType::Boolean,
+            nullable: false,
+            kind: ExprKind::BinaryOp {
+                left: Box::new(a),
+                op: BinOp::Gt,
+                right: Box::new(b),
+            },
+        }
+    }
+
+    fn and_typed(a: TypedExpr, b: TypedExpr) -> TypedExpr {
+        TypedExpr {
+            data_type: DataType::Boolean,
+            nullable: false,
+            kind: ExprKind::BinaryOp {
+                left: Box::new(a),
+                op: BinOp::And,
+                right: Box::new(b),
+            },
+        }
+    }
+
+    fn make_scan(arena: &mut ScalarArena, table_name: &str, cols: &[&str]) -> OptExpr {
+        let table = TableDef {
+            name: table_name.into(),
+            columns: cols
+                .iter()
+                .map(|n| ColumnDef {
+                    name: (*n).into(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    write_default: None,
+                    logical_type: None,
+                })
+                .collect(),
+            iceberg_row_lineage_metadata_columns: vec![],
+            source: ScanSource::StarRocks {
+                db_id: 0,
+                table_id: 0,
+            },
+        };
+        OptExpr::leaf(Operator::LogicalScan(ScanOp {
+            database: "db".into(),
+            table,
+            alias: Some(table_name.into()),
+            columns: cols
+                .iter()
+                .map(|n| OutputColumn {
+                    column_id: test_col_id(n),
+                    name: (*n).into(),
                     data_type: DataType::Int64,
                     nullable: true,
                     is_internal: false,
-                }],
+                })
+                .collect(),
+            predicates: vec![],
+            required_columns: None,
+            dict_columns: vec![],
+            variant_columns: vec![],
+            mv_rewritten_from: None,
+        }))
+    }
+
+    fn values_with_output(name: &str, id: u32) -> OptExpr {
+        OptExpr::leaf(Operator::LogicalValues(ValuesOp {
+            rows: vec![],
+            columns: vec![OutputColumn {
+                column_id: ColumnId::new_for_test(id),
+                name: name.to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+                is_internal: false,
+            }],
+        }))
+    }
+
+    fn make_ctx(arena: ScalarArena) -> RewriteContext {
+        let mut ctx = RewriteContext::for_query(std::iter::empty::<String>());
+        ctx.set_scalar_arena(Rc::new(RefCell::new(arena)));
+        ctx
+    }
+
+    fn semi_join(
+        arena: &mut ScalarArena,
+        left: OptExpr,
+        right: OptExpr,
+        condition: Option<TypedExpr>,
+    ) -> OptExpr {
+        let cond_id = condition.map(|c| intern_typed(arena, &c));
+        OptExpr::new(
+            Operator::LogicalJoin(LogicalJoinOp {
+                join_type: JoinKind::LeftSemi,
+                condition: cond_id,
             }),
-            vec![],
-            None,
+            vec![left, right],
         )
     }
 
-    fn derived_project_with_output_id(source_id: u32, output_id: u32) -> LogicalPlanNode {
-        LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
-                items: vec![ProjectItem {
-                    expr: TypedExpr {
-                        data_type: DataType::Int64,
-                        nullable: true,
-                        kind: ExprKind::ColumnRef {
-                            column_id: ColumnId::new_for_test(source_id),
-                            qualifier: None,
-                            column: "right_source".to_string(),
-                        },
-                    },
-                    output_name: "k".to_string(),
-                    output_column_id: ColumnId::new_for_test(output_id),
-                }],
-                output_qualifier: None,
+    fn inner_join(
+        arena: &mut ScalarArena,
+        left: OptExpr,
+        right: OptExpr,
+        condition: Option<TypedExpr>,
+    ) -> OptExpr {
+        let cond_id = condition.map(|c| intern_typed(arena, &c));
+        OptExpr::new(
+            Operator::LogicalJoin(LogicalJoinOp {
+                join_type: JoinKind::Inner,
+                condition: cond_id,
             }),
-            vec![values_with_output("right_source", source_id)],
-            None,
+            vec![left, right],
         )
     }
 
     #[test]
     fn pushes_right_only_alias_free_project_conjunct_by_column_id() {
+        let mut arena = ScalarArena::new();
         let left = values_with_output("k", 101);
-        let right = derived_project_with_output_id(22, 202);
-        let join_pred = eq(col_with_id("l", "k", 101), col_with_id("r", "k", 202));
-        let right_pred = gt(col_with_id("r", "k", 202), int_lit(10));
-        let join = semi_join(left, right, Some(and(join_pred, right_pred)));
+        // right is a project over values: source_id=22, output_id=202
+        let right_source = values_with_output("right_source", 22);
+        use crate::sql::optimizer::operator::{ProjectOp, ScalarProjectItem};
+        let right = OptExpr::new(
+            Operator::LogicalProject(ProjectOp {
+                items: vec![ScalarProjectItem {
+                    expr: intern_typed(
+                        &mut arena,
+                        &TypedExpr {
+                            data_type: DataType::Int64,
+                            nullable: true,
+                            kind: ExprKind::ColumnRef {
+                                column_id: ColumnId::new_for_test(22),
+                                qualifier: None,
+                                column: "right_source".to_string(),
+                            },
+                        },
+                    ),
+                    output_name: "k".to_string(),
+                    output_column_id: ColumnId::new_for_test(202),
+                    expr_display: None,
+                }],
+                output_qualifier: None,
+            }),
+            vec![right_source],
+        );
+        let join_pred = eq_typed(
+            col_with_id_typed("l", "k", 101),
+            col_with_id_typed("r", "k", 202),
+        );
+        let right_pred = gt_typed(col_with_id_typed("r", "k", 202), int_lit_typed(10));
+        let join = semi_join(
+            &mut arena,
+            left,
+            right,
+            Some(and_typed(join_pred, right_pred)),
+        );
 
         let rule = PushSemiAntiRightOnlyCondition;
-        let out = rule
-            .apply(join)
+        let mut ctx = make_ctx(arena);
+        let result = rule
+            .apply(join, &mut ctx)
             .expect("right-only derived output predicate should push");
+        let RewriteResult::Changed(out) = result else {
+            panic!("expected Changed");
+        };
 
-        let LogicalPlanNodeKind::Join(j) = &out.kind else {
+        let Operator::LogicalJoin(j) = &out.op else {
             panic!("expected Join");
         };
         assert_eq!(j.join_type, JoinKind::LeftSemi);
-        assert!(matches!(
-            j.condition.as_ref().map(|expr| &expr.kind),
-            Some(ExprKind::BinaryOp { op: BinOp::Eq, .. })
-        ));
-        let LogicalPlanNodeKind::Filter(filter) = &out.right().kind else {
-            panic!("expected Filter on right child");
-        };
-        assert!(matches!(
-            &filter.predicate.kind,
-            ExprKind::BinaryOp {
-                op: BinOp::Gt,
-                left,
-                ..
-            } if matches!(
-                &left.kind,
-                ExprKind::ColumnRef { column_id, qualifier: Some(q), column }
-                    if *column_id == ColumnId::new_for_test(202) && q == "r" && column == "k"
-            )
-        ));
-        assert!(matches!(
-            &out.right().unary_input().kind,
-            LogicalPlanNodeKind::Project(_)
-        ));
+        // The equi-join condition should remain.
+        assert!(
+            j.condition.is_some(),
+            "join condition should remain with the equi-join predicate"
+        );
+        // Right child should be a Filter.
+        assert!(
+            matches!(&out.right().op, Operator::LogicalFilter(_)),
+            "expected Filter on right child"
+        );
     }
 
     #[test]
     fn p4_semi_anti_does_not_push_same_name_with_wrong_column_id() {
+        let mut arena = ScalarArena::new();
         let left = values_with_output("k", 101);
         let right = values_with_output("k", 202);
-        let join_pred = eq(col_with_id("l", "k", 101), col_with_id("r", "k", 202));
-        let same_name_wrong_id = gt(col_with_id("r", "k", 999), int_lit(10));
-        let join = semi_join(left, right, Some(and(join_pred, same_name_wrong_id)));
+        let join_pred = eq_typed(
+            col_with_id_typed("l", "k", 101),
+            col_with_id_typed("r", "k", 202),
+        );
+        let same_name_wrong_id = gt_typed(col_with_id_typed("r", "k", 999), int_lit_typed(10));
+        let join = semi_join(
+            &mut arena,
+            left,
+            right,
+            Some(and_typed(join_pred, same_name_wrong_id)),
+        );
 
         let rule = PushSemiAntiRightOnlyCondition;
+        let mut ctx = make_ctx(arena);
+        let result = rule.apply(join, &mut ctx).unwrap();
         assert!(
-            rule.apply(join).is_none(),
+            matches!(result, RewriteResult::Unchanged),
             "same column name must not make a predicate right-only without a right ColumnId"
         );
     }
@@ -392,41 +430,46 @@ mod tests {
     // and d_year=2002 is right-only → right child wraps Filter, condition drops d_year=2002.
     #[test]
     fn pushes_right_only_conjunct_into_right_child_for_left_semi() {
-        // store_sales (left): ss_sold_date_sk, ss_item_sk
-        // date_dim (right): d_date_sk, d_year
-        let store_sales = scan("store_sales", &["ss_sold_date_sk", "ss_item_sk"]);
-        let date_dim = scan("date_dim", &["d_date_sk", "d_year"]);
+        let mut arena = ScalarArena::new();
+        let store_sales = make_scan(
+            &mut arena,
+            "store_sales",
+            &["ss_sold_date_sk", "ss_item_sk"],
+        );
+        let date_dim = make_scan(&mut arena, "date_dim", &["d_date_sk", "d_year"]);
 
         // corr = ss_item_sk = 100  (left-only)
-        let corr = eq(col("ss_item_sk"), int_lit(100));
+        let corr = eq_typed(col_typed("ss_item_sk"), int_lit_typed(100));
         // equi-join condition: ss_sold_date_sk = d_date_sk (cross-side)
-        let equi = eq(col("ss_sold_date_sk"), col("d_date_sk"));
+        let equi = eq_typed(col_typed("ss_sold_date_sk"), col_typed("d_date_sk"));
         // right-only predicate: d_year = 2002
-        let yr = eq(col("d_year"), int_lit(2002));
+        let yr = eq_typed(col_typed("d_year"), int_lit_typed(2002));
 
         // condition = corr AND equi AND yr
-        let condition = and(and(corr, equi), yr);
-        let join = semi_join(store_sales, date_dim, Some(condition));
+        let condition = and_typed(and_typed(corr, equi), yr);
+        let join = semi_join(&mut arena, store_sales, date_dim, Some(condition));
 
         let rule = PushSemiAntiRightOnlyCondition;
-        assert!(rule.matches(&join), "should match LEFT SEMI with condition");
-        let out = rule.apply(join).expect("should rewrite");
+        let mut ctx = make_ctx(arena);
+        assert!(
+            rule.matches(&join, &ctx),
+            "should match LEFT SEMI with condition"
+        );
+        let result = rule.apply(join, &mut ctx).expect("should rewrite");
+        let RewriteResult::Changed(out) = result else {
+            panic!("expected Changed");
+        };
 
-        // Expected shape: LeftSemi(store_sales, Filter(date_dim))
-        // with the join condition containing corr AND equi (d_year=2002 pushed down)
-        match &out.kind {
-            LogicalPlanNodeKind::Join(j) => {
+        match &out.op {
+            Operator::LogicalJoin(j) => {
                 assert_eq!(j.join_type, JoinKind::LeftSemi);
                 // Left child should remain an unmodified scan
-                assert!(matches!(&out.left().kind, LogicalPlanNodeKind::Scan(_)));
+                assert!(matches!(&out.left().op, Operator::LogicalScan(_)));
                 // Right child should be a Filter wrapping the date_dim scan
-                match &out.right().kind {
-                    LogicalPlanNodeKind::Filter(_) => {
+                match &out.right().op {
+                    Operator::LogicalFilter(_) => {
                         assert!(
-                            matches!(
-                                &out.right().unary_input().kind,
-                                LogicalPlanNodeKind::Scan(_)
-                            ),
+                            matches!(&out.right().unary_input().op, Operator::LogicalScan(_)),
                             "Filter should wrap the Scan"
                         );
                     }
@@ -443,37 +486,44 @@ mod tests {
     }
 
     // Test 2: LEFT SEMI ON (ss_sold_date_sk = d_date_sk)
-    // The only conjunct is cross-side — no right-only conjunct → rule returns None.
+    // The only conjunct is cross-side — no right-only conjunct → rule returns Unchanged.
     #[test]
-    fn returns_none_when_no_right_only_conjunct() {
-        let store_sales = scan("store_sales", &["ss_sold_date_sk", "ss_item_sk"]);
-        let date_dim = scan("date_dim", &["d_date_sk", "d_year"]);
+    fn returns_unchanged_when_no_right_only_conjunct() {
+        let mut arena = ScalarArena::new();
+        let store_sales = make_scan(
+            &mut arena,
+            "store_sales",
+            &["ss_sold_date_sk", "ss_item_sk"],
+        );
+        let date_dim = make_scan(&mut arena, "date_dim", &["d_date_sk", "d_year"]);
 
         // cross-side equi-join: not right-only
-        let equi = eq(col("ss_sold_date_sk"), col("d_date_sk"));
-        let join = semi_join(store_sales, date_dim, Some(equi));
+        let equi = eq_typed(col_typed("ss_sold_date_sk"), col_typed("d_date_sk"));
+        let join = semi_join(&mut arena, store_sales, date_dim, Some(equi));
 
         let rule = PushSemiAntiRightOnlyCondition;
-        assert!(rule.matches(&join));
-        let out = rule.apply(join);
+        let mut ctx = make_ctx(arena);
+        assert!(rule.matches(&join, &ctx));
+        let result = rule.apply(join, &mut ctx).unwrap();
         assert!(
-            out.is_none(),
-            "no right-only conjunct — rule must return None; got {:?}",
-            out
+            matches!(result, RewriteResult::Unchanged),
+            "no right-only conjunct — rule must return Unchanged"
         );
     }
 
     // Test 3: INNER join with a condition — `matches()` must return false.
     #[test]
     fn does_not_match_inner_join() {
-        let t1 = scan("t1", &["x", "y"]);
-        let t2 = scan("t2", &["a", "b"]);
-        let condition = eq(col("x"), col("a"));
-        let join = inner_join(t1, t2, Some(condition));
+        let mut arena = ScalarArena::new();
+        let t1 = make_scan(&mut arena, "t1", &["x", "y"]);
+        let t2 = make_scan(&mut arena, "t2", &["a", "b"]);
+        let condition = eq_typed(col_typed("x"), col_typed("a"));
+        let join = inner_join(&mut arena, t1, t2, Some(condition));
 
+        let ctx = make_ctx(arena);
         let rule = PushSemiAntiRightOnlyCondition;
         assert!(
-            !rule.matches(&join),
+            !rule.matches(&join, &ctx),
             "INNER join must not match PushSemiAntiRightOnlyCondition"
         );
     }

@@ -40,6 +40,7 @@ use crate::sql::optimizer::statistics::TableStatistics;
 use crate::sql::planner::plan::LogicalPlanNode;
 use memo::MExpr;
 use rule::Rule;
+use scalar::ScalarArena;
 
 /// Wall-clock timeout for the entire optimization pipeline.
 ///
@@ -120,16 +121,23 @@ fn optimize_with_root_property(
         rewrite_ctx.set_dictionary_provider(provider);
     }
     rewrite_ctx.set_column_ref_factory(Rc::clone(&factory));
-    let rewritten =
-        rewrite::registry::query_rewrite_pipeline(table_stats).rewrite(plan, &mut rewrite_ctx)?;
+    let arena = Rc::new(RefCell::new(scalar::ScalarArena::new()));
+    rewrite_ctx.set_scalar_arena(Rc::clone(&arena));
+    let plan_expr = convert::logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut());
+    let rewritten_expr = rewrite::registry::query_rewrite_pipeline(table_stats)
+        .rewrite(plan_expr, &mut rewrite_ctx)?;
 
     // Non-disableable backstop: Apply must not survive the SubqueryRewrite
     // stage. The ApplyException rule reports this with rule attribution, but
     // a user-disabled rule must not let an Apply leak into memo conversion
     // (which panics by contract).
-    if let Some(message) = rewrite::rules::subquery::find_residual_apply(&rewritten) {
+    if let Some(message) = rewrite::rules::subquery::find_residual_apply(&rewritten_expr) {
         return Err(message);
     }
+
+    // Materialize the rewritten OptExpr back to LogicalPlanNode for CTE cleanup
+    // and memo conversion, both of which still operate on LogicalPlanNode.
+    let rewritten = convert::opt_expr_to_logical_plan(rewritten_expr, &arena.borrow());
 
     // 4. CTE cleanup: intentional pre-Memo structural rewrite for CTE shape
     //    cleanup, not a second full logical optimization pass.
@@ -627,7 +635,11 @@ mod is_known_rule_name_tests {
         QueryDictionaryProvider, RewriteContext, current_dictionary_provider,
         with_dictionary_provider,
     };
+    use std::cell::RefCell;
+
+    use crate::sql::optimizer::convert::{logical_plan_to_opt_expr, opt_expr_to_logical_plan};
     use crate::sql::optimizer::rewrite::registry::query_rewrite_pipeline;
+    use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::{
         AggregateCall, LogicalAggregateNode, LogicalPlanNode, LogicalPlanNodeKind, LogicalScanNode,
     };
@@ -682,6 +694,9 @@ mod is_known_rule_name_tests {
     /// Build the minimal Aggregate(Scan) shape that the rewrite rule
     /// can act on: GROUP BY on the string column `s`.
     fn agg_over_string_scan() -> LogicalPlanNode {
+        // Use deterministic non-UNSET column IDs so that intern_typed succeeds.
+        let s_id = ColumnId::new_for_test(1);
+        let cnt_id = ColumnId::new_for_test(2);
         let table = TableDef {
             name: "t".to_string(),
             columns: vec![ColumnDef {
@@ -698,7 +713,7 @@ mod is_known_rule_name_tests {
             },
         };
         let s_col = OutputColumn {
-            column_id: ColumnId::UNSET,
+            column_id: s_id,
             name: "s".to_string(),
             data_type: DataType::Utf8,
             nullable: false,
@@ -720,7 +735,7 @@ mod is_known_rule_name_tests {
         );
         let s_ref = TypedExpr {
             kind: ExprKind::ColumnRef {
-                column_id: ColumnId::UNSET,
+                column_id: s_id,
                 qualifier: None,
                 column: "s".to_string(),
             },
@@ -736,12 +751,12 @@ mod is_known_rule_name_tests {
                     distinct: false,
                     result_type: DataType::Int64,
                     order_by: vec![],
-                    output_column_id: ColumnId::UNSET,
+                    output_column_id: cnt_id,
                 }],
                 output_columns: vec![
                     s_col,
                     OutputColumn {
-                        column_id: ColumnId::UNSET,
+                        column_id: cnt_id,
                         name: "cnt".to_string(),
                         data_type: DataType::Int64,
                         nullable: false,
@@ -764,7 +779,13 @@ mod is_known_rule_name_tests {
         }
         let table_stats = HashMap::new();
         let pipeline = query_rewrite_pipeline(&table_stats);
-        pipeline.rewrite(agg_over_string_scan(), &mut ctx).unwrap()
+        let mut scalars = ScalarArena::new();
+        let opt_plan = logical_plan_to_opt_expr(&agg_over_string_scan(), &mut scalars);
+        let arena_rc = Rc::new(RefCell::new(scalars));
+        ctx.set_scalar_arena(arena_rc.clone());
+        let opt_result = pipeline.rewrite(opt_plan, &mut ctx).unwrap();
+        let arena = arena_rc.borrow();
+        opt_expr_to_logical_plan(opt_result, &arena)
     }
 
     fn contains_decode(plan: &LogicalPlanNode) -> bool {

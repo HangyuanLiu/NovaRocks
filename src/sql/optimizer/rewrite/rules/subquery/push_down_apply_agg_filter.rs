@@ -9,9 +9,11 @@
 
 use std::collections::HashSet;
 
+use super::bridge::{opt_expr_to_plan, plan_to_opt_expr};
 use super::decorrelate_util::{all_binary_eq, orient_eq, partition_conjuncts};
 use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
+use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
@@ -33,191 +35,205 @@ impl LogicalRewriteRule for PushDownApplyAggFilter {
         RewritePhase::StructuralRewrite
     }
 
-    fn matches(&self, plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
-        let LogicalPlanNodeKind::Apply(a) = &plan.kind else {
-            return false;
-        };
-        if a.kind != ApplyKind::Scalar {
-            return false;
-        }
-        if a.correlation_column_ids.is_empty() {
-            return false;
-        }
-        if !a.need_check_max_rows {
-            return false;
-        }
-        let corr_ids: HashSet<ColumnId> = a.correlation_column_ids.iter().copied().collect();
-        inner_is_correlated_scalar_agg(plan.right(), &corr_ids)
+    fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
+        let arena = ctx.scalar_arena();
+        let plan = opt_expr_to_plan(expr, &arena.borrow());
+        matches_plan(&plan)
     }
 
-    fn apply(
-        &self,
-        plan: LogicalPlanNode,
-        _ctx: &mut RewriteContext,
-    ) -> Result<RewriteResult, String> {
-        let LogicalPlanNode {
-            kind,
-            mut children,
-            required_output_columns,
-        } = plan;
-        let LogicalPlanNodeKind::Apply(a) = kind else {
-            return Ok(RewriteResult::Unchanged);
-        };
-        if children.len() != 2 {
-            return Ok(RewriteResult::Unchanged);
-        }
-        let right = children.remove(1);
-        let left = children.remove(0);
-        let corr_ids: HashSet<ColumnId> = a.correlation_column_ids.iter().copied().collect();
-
-        // Peel the optional leading Project and destructure the inner.
-        let peeled = peel_inner(&right, &corr_ids)
-            .ok_or_else(|| "PushDownApplyAggFilter: inner shape mismatch".to_string())?;
-
-        // Split the Filter predicate into (correlated, residual).
-        let predicate = peeled.filter.predicate.clone();
-        let (correlated, residual) = partition_conjuncts(predicate, &corr_ids);
-
-        if correlated.is_empty() {
-            return Err(
-                "correlated subquery without correlation predicate is not supported".to_string(),
-            );
-        }
-        if !all_binary_eq(&correlated) {
-            return Err(
-                "non-EQ correlated predicate in correlated subquery is not supported".to_string(),
-            );
-        }
-
-        // For each correlated EQ conjunct, orient it as (outer, inner) and
-        // collect distinct inner-side ColumnRef expressions as new group-by keys.
-        // Require each inner side to be a ColumnRef (non-column inner is M1c).
-        let mut inner_key_exprs: Vec<TypedExpr> = Vec::new();
-        let mut seen_inner_ids: HashSet<ColumnId> = HashSet::new();
-
-        for conj in &correlated {
-            let Some((_, inner_side)) = orient_eq(conj, &corr_ids) else {
-                // Cannot orient the EQ — both/neither side is outer — fall through.
-                return Ok(RewriteResult::Unchanged);
-            };
-            // Require the inner side to be a ColumnRef.
-            let ExprKind::ColumnRef { column_id, .. } = &inner_side.kind else {
-                // Non-column inner side — fall back (M1c concern).
-                return Ok(RewriteResult::Unchanged);
-            };
-            if seen_inner_ids.insert(*column_id) {
-                inner_key_exprs.push(inner_side.clone());
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+        let arena = ctx.scalar_arena();
+        let plan = opt_expr_to_plan(&expr, &arena.borrow());
+        match apply_plan(plan)? {
+            Some(new_plan) => {
+                let new_expr = plan_to_opt_expr(&new_plan, &mut arena.borrow_mut());
+                Ok(RewriteResult::Changed(new_expr))
             }
+            None => Ok(RewriteResult::Unchanged),
         }
+    }
+}
 
-        // Build OutputColumn entries for the new group-by keys.
-        // Reuse the inner key columns' existing ColumnIds and types — do NOT mint.
-        let new_group_key_output_columns: Vec<OutputColumn> = inner_key_exprs
+fn matches_plan(plan: &LogicalPlanNode) -> bool {
+    let LogicalPlanNodeKind::Apply(a) = &plan.kind else {
+        return false;
+    };
+    if a.kind != ApplyKind::Scalar {
+        return false;
+    }
+    if a.correlation_column_ids.is_empty() {
+        return false;
+    }
+    if !a.need_check_max_rows {
+        return false;
+    }
+    let corr_ids: HashSet<ColumnId> = a.correlation_column_ids.iter().copied().collect();
+    inner_is_correlated_scalar_agg(plan.right(), &corr_ids)
+}
+
+fn apply_plan(plan: LogicalPlanNode) -> Result<Option<LogicalPlanNode>, String> {
+    let LogicalPlanNode {
+        kind,
+        mut children,
+        required_output_columns,
+    } = plan;
+    let LogicalPlanNodeKind::Apply(a) = kind else {
+        return Ok(None);
+    };
+    if children.len() != 2 {
+        return Ok(None);
+    }
+    let right = children.remove(1);
+    let left = children.remove(0);
+    let corr_ids: HashSet<ColumnId> = a.correlation_column_ids.iter().copied().collect();
+
+    // Peel the optional leading Project and destructure the inner.
+    let peeled = peel_inner(&right, &corr_ids)
+        .ok_or_else(|| "PushDownApplyAggFilter: inner shape mismatch".to_string())?;
+
+    // Split the Filter predicate into (correlated, residual).
+    let predicate = peeled.filter.predicate.clone();
+    let (correlated, residual) = partition_conjuncts(predicate, &corr_ids);
+
+    if correlated.is_empty() {
+        return Err(
+            "correlated subquery without correlation predicate is not supported".to_string(),
+        );
+    }
+    if !all_binary_eq(&correlated) {
+        return Err(
+            "non-EQ correlated predicate in correlated subquery is not supported".to_string(),
+        );
+    }
+
+    // For each correlated EQ conjunct, orient it as (outer, inner) and
+    // collect distinct inner-side ColumnRef expressions as new group-by keys.
+    // Require each inner side to be a ColumnRef (non-column inner is M1c).
+    let mut inner_key_exprs: Vec<TypedExpr> = Vec::new();
+    let mut seen_inner_ids: HashSet<ColumnId> = HashSet::new();
+
+    for conj in &correlated {
+        let Some((_, inner_side)) = orient_eq(conj, &corr_ids) else {
+            // Cannot orient the EQ — both/neither side is outer — fall through.
+            return Ok(None);
+        };
+        // Require the inner side to be a ColumnRef.
+        let ExprKind::ColumnRef { column_id, .. } = &inner_side.kind else {
+            // Non-column inner side — fall back (M1c concern).
+            return Ok(None);
+        };
+        if seen_inner_ids.insert(*column_id) {
+            inner_key_exprs.push(inner_side.clone());
+        }
+    }
+
+    // Build OutputColumn entries for the new group-by keys.
+    // Reuse the inner key columns' existing ColumnIds and types — do NOT mint.
+    let new_group_key_output_columns: Vec<OutputColumn> = inner_key_exprs
+        .iter()
+        .map(|expr| {
+            let ExprKind::ColumnRef {
+                column_id,
+                column: col_name,
+                ..
+            } = &expr.kind
+            else {
+                unreachable!("verified above that inner_key_exprs are ColumnRefs");
+            };
+            OutputColumn {
+                column_id: *column_id,
+                name: col_name.clone(),
+                data_type: expr.data_type.clone(),
+                nullable: expr.nullable,
+                is_internal: false,
+            }
+        })
+        .collect();
+
+    // Rebuild the filter input: either drop the Filter entirely (all conjuncts
+    // were correlated) or keep a Filter with just the residual conjuncts.
+    let new_filter_input: LogicalPlanNode = if residual.is_empty() {
+        peeled.filter_input.clone()
+    } else {
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                predicate: combine_and(residual),
+            }),
+            vec![peeled.filter_input.clone()],
+            None,
+        )
+    };
+
+    // Rebuild the Aggregate: group_by = new_key_exprs (since the original was []),
+    // output_columns = [group_key_cols..., original_agg_result_cols...].
+    let new_group_by = inner_key_exprs.clone();
+    let mut new_output_columns = new_group_key_output_columns.clone();
+    new_output_columns.extend(peeled.aggregate.output_columns.clone());
+
+    let new_agg = LogicalPlanNode::new(
+        LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+            group_by: new_group_by,
+            aggregates: peeled.aggregate.aggregates.clone(),
+            output_columns: new_output_columns,
+            already_pushed: peeled.aggregate.already_pushed,
+        }),
+        vec![new_filter_input],
+        None,
+    );
+
+    // Re-wrap in the leading Project if present, extending it to pass through
+    // the new group-key columns so they're visible to the join condition.
+    // The join condition (built by ScalarApplyToJoin, Task 3) needs the inner
+    // key columns to be in the Project's output.
+    let new_inner: LogicalPlanNode = if let Some(proj) = peeled.leading_project {
+        let projected_ids: HashSet<ColumnId> = proj
+            .items
             .iter()
-            .map(|expr| {
-                let ExprKind::ColumnRef {
-                    column_id,
-                    column: col_name,
-                    ..
-                } = &expr.kind
-                else {
-                    unreachable!("verified above that inner_key_exprs are ColumnRefs");
-                };
-                OutputColumn {
-                    column_id: *column_id,
-                    name: col_name.clone(),
-                    data_type: expr.data_type.clone(),
-                    nullable: expr.nullable,
-                    is_internal: false,
-                }
-            })
+            .map(|item| item.output_column_id)
             .collect();
 
-        // Rebuild the filter input: either drop the Filter entirely (all conjuncts
-        // were correlated) or keep a Filter with just the residual conjuncts.
-        let new_filter_input: LogicalPlanNode = if residual.is_empty() {
-            peeled.filter_input.clone()
-        } else {
-            LogicalPlanNode::new(
-                LogicalPlanNodeKind::Filter(LogicalFilterNode {
-                    predicate: combine_and(residual),
-                }),
-                vec![peeled.filter_input.clone()],
-                None,
-            )
-        };
-
-        // Rebuild the Aggregate: group_by = new_key_exprs (since the original was []),
-        // output_columns = [group_key_cols..., original_agg_result_cols...].
-        let new_group_by = inner_key_exprs.clone();
-        let mut new_output_columns = new_group_key_output_columns.clone();
-        new_output_columns.extend(peeled.aggregate.output_columns.clone());
-
-        let new_agg = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
-                group_by: new_group_by,
-                aggregates: peeled.aggregate.aggregates.clone(),
-                output_columns: new_output_columns,
-                already_pushed: peeled.aggregate.already_pushed,
-            }),
-            vec![new_filter_input],
-            None,
-        );
-
-        // Re-wrap in the leading Project if present, extending it to pass through
-        // the new group-key columns so they're visible to the join condition.
-        // The join condition (built by ScalarApplyToJoin, Task 3) needs the inner
-        // key columns to be in the Project's output.
-        let new_inner: LogicalPlanNode = if let Some(proj) = peeled.leading_project {
-            let projected_ids: HashSet<ColumnId> = proj
-                .items
-                .iter()
-                .map(|item| item.output_column_id)
-                .collect();
-
-            let mut new_items = proj.items.clone();
-            for out_col in &new_group_key_output_columns {
-                if !projected_ids.contains(&out_col.column_id) {
-                    new_items.push(ProjectItem {
-                        expr: TypedExpr {
-                            kind: ExprKind::ColumnRef {
-                                column_id: out_col.column_id,
-                                qualifier: None,
-                                column: out_col.name.clone(),
-                            },
-                            data_type: out_col.data_type.clone(),
-                            nullable: out_col.nullable,
+        let mut new_items = proj.items.clone();
+        for out_col in &new_group_key_output_columns {
+            if !projected_ids.contains(&out_col.column_id) {
+                new_items.push(ProjectItem {
+                    expr: TypedExpr {
+                        kind: ExprKind::ColumnRef {
+                            column_id: out_col.column_id,
+                            qualifier: None,
+                            column: out_col.name.clone(),
                         },
-                        output_name: out_col.name.clone(),
-                        output_column_id: out_col.column_id,
-                    });
-                }
+                        data_type: out_col.data_type.clone(),
+                        nullable: out_col.nullable,
+                    },
+                    output_name: out_col.name.clone(),
+                    output_column_id: out_col.column_id,
+                });
             }
+        }
 
-            LogicalPlanNode::new(
-                LogicalPlanNodeKind::Project(LogicalProjectNode {
-                    items: new_items,
-                    output_qualifier: proj.output_qualifier.clone(),
-                }),
-                vec![new_agg],
-                None,
-            )
-        } else {
-            new_agg
-        };
-
-        // Return the rewritten Apply: correlation_conjuncts = the correlated EQ
-        // conjuncts (outer == inner), need_check_max_rows = false.
-        Ok(RewriteResult::Changed(LogicalPlanNode::new(
-            LogicalPlanNodeKind::Apply(LogicalApplyNode {
-                correlation_conjuncts: correlated,
-                need_check_max_rows: false,
-                ..a
+        LogicalPlanNode::new(
+            LogicalPlanNodeKind::Project(LogicalProjectNode {
+                items: new_items,
+                output_qualifier: proj.output_qualifier.clone(),
             }),
-            vec![left, new_inner],
-            required_output_columns,
-        )))
-    }
+            vec![new_agg],
+            None,
+        )
+    } else {
+        new_agg
+    };
+
+    // Return the rewritten Apply: correlation_conjuncts = the correlated EQ
+    // conjuncts (outer == inner), need_check_max_rows = false.
+    Ok(Some(LogicalPlanNode::new(
+        LogicalPlanNodeKind::Apply(LogicalApplyNode {
+            correlation_conjuncts: correlated,
+            need_check_max_rows: false,
+            ..a
+        }),
+        vec![left, new_inner],
+        required_output_columns,
+    )))
 }
 
 /// Returns true iff the given plan has the shape:
@@ -309,7 +325,9 @@ fn peel_agg_over_filter<'a>(
 #[cfg(test)]
 mod tests {
     use crate::sql::planner::plan::*;
+    use std::cell::RefCell;
     use std::collections::HashSet;
+    use std::rc::Rc;
 
     use arrow::datatypes::DataType;
 
@@ -317,8 +335,10 @@ mod tests {
     use crate::sql::analysis::{BinOp, ExprKind, TypedExpr};
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::convert::logical_plan_to_opt_expr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::result::RewriteResult;
+    use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::{
         AggregateCall, ApplyKind, LogicalAggregateNode, LogicalApplyNode, LogicalFilterNode,
         LogicalPlanNode, LogicalPlanNodeKind, LogicalScanNode, LogicalValuesNode,
@@ -330,6 +350,20 @@ mod tests {
     const OUTER_K: ColumnId = ColumnId(100); // t1.k as seen inside the subquery
     const MAX_RESULT: ColumnId = ColumnId(10); // output_column_id for max(v2)
     const APPLY_OUT: ColumnId = ColumnId(20); // the Apply's output column
+
+    fn ctx_with_arena() -> RewriteContext {
+        let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
+        ctx
+    }
+
+    fn to_opt_expr(
+        plan: LogicalPlanNode,
+        ctx: &mut RewriteContext,
+    ) -> crate::sql::optimizer::opt_expr::OptExpr {
+        let arena = ctx.scalar_arena();
+        logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut())
+    }
 
     fn col_ref(id: ColumnId, name: &str, dt: DataType) -> TypedExpr {
         TypedExpr {
@@ -494,20 +528,25 @@ mod tests {
     fn push_down_apply_agg_filter_decorrelates_scalar_agg() {
         let rule = PushDownApplyAggFilter;
         let plan = correlated_scalar_agg_apply();
-        let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        let mut ctx = ctx_with_arena();
+
+        let expr = to_opt_expr(plan, &mut ctx);
 
         assert!(
-            rule.matches(&plan, &ctx),
+            rule.matches(&expr, &ctx),
             "rule must match a correlated scalar agg Apply"
         );
 
         let result = rule
-            .apply(plan, &mut ctx)
+            .apply(expr, &mut ctx)
             .expect("rule apply must not error");
-        let new_plan = match result {
-            RewriteResult::Changed(p) => p,
+        let new_expr = match result {
+            RewriteResult::Changed(e) => e,
             other => panic!("expected Changed, got: {other:?}"),
         };
+
+        let arena = ctx.scalar_arena();
+        let new_plan = opt_expr_to_plan(&new_expr, &arena.borrow());
 
         let LogicalPlanNodeKind::Apply(new_apply) = &new_plan.kind else {
             panic!("expected Apply, got: {new_plan:?}");
@@ -673,14 +712,18 @@ mod tests {
         );
 
         let rule = PushDownApplyAggFilter;
-        let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        let mut ctx = ctx_with_arena();
+        let expr = to_opt_expr(apply, &mut ctx);
         let result = rule
-            .apply(apply, &mut ctx)
+            .apply(expr, &mut ctx)
             .expect("rule apply must not error");
-        let new_plan = match result {
-            RewriteResult::Changed(p) => p,
+        let new_expr = match result {
+            RewriteResult::Changed(e) => e,
             other => panic!("expected Changed, got: {other:?}"),
         };
+
+        let arena = ctx.scalar_arena();
+        let new_plan = opt_expr_to_plan(&new_expr, &arena.borrow());
 
         let LogicalPlanNodeKind::Apply(new_apply) = &new_plan.kind else {
             panic!("expected Apply");
@@ -707,7 +750,7 @@ mod tests {
     #[test]
     fn push_down_apply_agg_filter_no_match_uncorrelated() {
         let rule = PushDownApplyAggFilter;
-        let ctx = RewriteContext::for_query(Vec::<String>::new());
+        let mut ctx = ctx_with_arena();
 
         let plan = LogicalPlanNode::new(
             LogicalPlanNodeKind::Apply(LogicalApplyNode {
@@ -750,8 +793,9 @@ mod tests {
             None,
         );
 
+        let expr = to_opt_expr(plan, &mut ctx);
         assert!(
-            !rule.matches(&plan, &ctx),
+            !rule.matches(&expr, &ctx),
             "must not match uncorrelated Apply"
         );
     }
@@ -759,7 +803,7 @@ mod tests {
     #[test]
     fn push_down_apply_agg_filter_no_match_already_decorrelated() {
         let rule = PushDownApplyAggFilter;
-        let ctx = RewriteContext::for_query(Vec::<String>::new());
+        let mut ctx = ctx_with_arena();
 
         let plan = LogicalPlanNode::new(
             LogicalPlanNodeKind::Apply(LogicalApplyNode {
@@ -798,8 +842,9 @@ mod tests {
             None,
         );
 
+        let expr = to_opt_expr(plan, &mut ctx);
         assert!(
-            !rule.matches(&plan, &ctx),
+            !rule.matches(&expr, &ctx),
             "must not match when need_check_max_rows is already false"
         );
     }
@@ -966,17 +1011,22 @@ mod tests {
         );
 
         let rule = PushDownApplyAggFilter;
-        let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        let mut ctx = ctx_with_arena();
 
-        assert!(rule.matches(&apply, &ctx), "rule must match two-key Apply");
+        let expr = to_opt_expr(apply, &mut ctx);
+
+        assert!(rule.matches(&expr, &ctx), "rule must match two-key Apply");
 
         let result = rule
-            .apply(apply, &mut ctx)
+            .apply(expr, &mut ctx)
             .expect("rule apply must not error");
-        let new_plan = match result {
-            RewriteResult::Changed(p) => p,
+        let new_expr = match result {
+            RewriteResult::Changed(e) => e,
             other => panic!("expected Changed, got: {other:?}"),
         };
+
+        let arena = ctx.scalar_arena();
+        let new_plan = opt_expr_to_plan(&new_expr, &arena.borrow());
 
         let LogicalPlanNodeKind::Apply(new_apply) = &new_plan.kind else {
             panic!("expected Apply");

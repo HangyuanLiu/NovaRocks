@@ -6,10 +6,12 @@ use std::sync::atomic::AtomicU32;
 use std::time::Instant;
 
 use crate::engine::mv::refresh_context::IcebergMvRewriteContext;
+use crate::sql::optimizer::convert::{logical_plan_to_opt_expr, opt_expr_to_logical_plan};
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::imv::annotation::{ImvExtension, ImvPlanAnnotation};
 use crate::sql::optimizer::rewrite::imv::pipeline::build_imv_pipeline;
 use crate::sql::optimizer::rewrite::trace::RewriteTrace;
+use crate::sql::optimizer::scalar::ScalarArena;
 use crate::sql::planner::plan::LogicalPlanNode;
 
 pub(crate) struct ImvRewriteInput {
@@ -52,8 +54,21 @@ pub(crate) fn run_imv_rewrite(input: ImvRewriteInput) -> Result<ImvRewriteOutcom
         ctx_rw.set_deadline(deadline);
     }
 
+    // Bridge 1: convert the incoming LogicalPlanNode to OptExpr so the
+    // rewrite pipeline (which now operates on OptExpr) can process it.
+    // The ScalarArena is shared via the RewriteContext so that the IMV rules
+    // can perform round-trip conversions (OptExpr ↔ LogicalPlanNode) using the
+    // same arena throughout the pipeline run.
+    let scalars = std::rc::Rc::new(std::cell::RefCell::new(ScalarArena::new()));
+    let opt_in = logical_plan_to_opt_expr(&plan, &mut scalars.borrow_mut());
+    ctx_rw.set_scalar_arena(std::rc::Rc::clone(&scalars));
+
     let pipeline = build_imv_pipeline();
-    let plan_out = pipeline.rewrite(plan, &mut ctx_rw)?;
+    let opt_out = pipeline.rewrite(opt_in, &mut ctx_rw)?;
+
+    // Bridge 2: convert the rewritten OptExpr back to LogicalPlanNode so
+    // the callers (engine/mod.rs, iceberg_refresh.rs) are unaffected.
+    let plan_out = opt_expr_to_logical_plan(opt_out, &scalars.borrow());
 
     let ext = ctx_rw
         .extension::<ImvExtension>()
@@ -87,6 +102,7 @@ mod tests {
         ColumnDef, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
     use crate::sql::optimizer::rewrite::imv::annotation::ImvPartitionAnnotation;
@@ -95,6 +111,7 @@ mod tests {
     use crate::sql::optimizer::rewrite::registry::query_rewrite_pipeline;
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
+    use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::*;
     use crate::sql::planner::plan::{
         AggregateCall, LogicalAggregateNode, LogicalAggregateStateMergeNode, LogicalFilterNode,
@@ -103,6 +120,15 @@ mod tests {
     };
     use arrow::datatypes::DataType;
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+
+    /// Set up a fresh ScalarArena on `ctx`, convert `plan` to `OptExpr`, and
+    /// return the `OptExpr`. Use this when calling `pipeline.rewrite()` directly
+    /// in tests that don't go through `run_imv_rewrite`.
+    fn plan_to_opt_expr_with_arena(plan: &LogicalPlanNode, ctx: &mut RewriteContext) -> OptExpr {
+        let arena = std::rc::Rc::new(std::cell::RefCell::new(ScalarArena::new()));
+        ctx.set_scalar_arena(std::rc::Rc::clone(&arena));
+        crate::sql::optimizer::convert::logical_plan_to_opt_expr(plan, &mut arena.borrow_mut())
+    }
     use std::collections::{BTreeMap, HashMap};
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -737,7 +763,11 @@ mod tests {
             RewriteTraversal::TopDown
         }
 
-        fn matches(&self, _plan: &LogicalPlanNode, ctx: &RewriteContext) -> bool {
+        fn matches(
+            &self,
+            _expr: &crate::sql::optimizer::opt_expr::OptExpr,
+            ctx: &RewriteContext,
+        ) -> bool {
             let ext = ctx
                 .extension::<ImvExtension>()
                 .expect("ImvExtension installed");
@@ -751,7 +781,7 @@ mod tests {
 
         fn apply(
             &self,
-            _plan: LogicalPlanNode,
+            _expr: crate::sql::optimizer::opt_expr::OptExpr,
             _ctx: &mut RewriteContext,
         ) -> Result<RewriteResult, String> {
             Ok(RewriteResult::Unchanged)
@@ -802,7 +832,8 @@ mod tests {
             next_column_id: Arc::new(AtomicU32::new(1)),
         });
 
-        let _ = pipeline.rewrite(empty_values_plan(), &mut ctx_rw).unwrap();
+        let opt_in = plan_to_opt_expr_with_arena(&empty_values_plan(), &mut ctx_rw);
+        let _ = pipeline.rewrite(opt_in, &mut ctx_rw).unwrap();
 
         assert!(saw_mv_ctx.load(Ordering::SeqCst));
     }
@@ -823,7 +854,11 @@ mod tests {
             RewritePhase::LogicalNormalize
         }
 
-        fn matches(&self, _plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+        fn matches(
+            &self,
+            _expr: &crate::sql::optimizer::opt_expr::OptExpr,
+            _ctx: &RewriteContext,
+        ) -> bool {
             self.matches_called
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             false
@@ -831,7 +866,7 @@ mod tests {
 
         fn apply(
             &self,
-            _plan: LogicalPlanNode,
+            _expr: crate::sql::optimizer::opt_expr::OptExpr,
             _ctx: &mut RewriteContext,
         ) -> Result<RewriteResult, String> {
             Ok(RewriteResult::Unchanged)
@@ -860,7 +895,8 @@ mod tests {
             next_column_id: Arc::new(AtomicU32::new(1)),
         });
 
-        let _ = pipeline.rewrite(empty_values_plan(), &mut ctx_rw).unwrap();
+        let opt_in = plan_to_opt_expr_with_arena(&empty_values_plan(), &mut ctx_rw);
+        let _ = pipeline.rewrite(opt_in, &mut ctx_rw).unwrap();
 
         assert_eq!(matches_called.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(ctx_rw.trace().events().iter().any(|e| matches!(
@@ -900,13 +936,17 @@ mod tests {
             RewritePhase::LogicalNormalize
         }
 
-        fn matches(&self, _plan: &LogicalPlanNode, _ctx: &RewriteContext) -> bool {
+        fn matches(
+            &self,
+            _expr: &crate::sql::optimizer::opt_expr::OptExpr,
+            _ctx: &RewriteContext,
+        ) -> bool {
             true
         }
 
         fn apply(
             &self,
-            _plan: LogicalPlanNode,
+            _expr: crate::sql::optimizer::opt_expr::OptExpr,
             _ctx: &mut RewriteContext,
         ) -> Result<RewriteResult, String> {
             Err("synthetic failure".to_string())
@@ -935,7 +975,8 @@ mod tests {
         });
 
         let plan = empty_values_plan();
-        let err = pipeline.rewrite(plan, &mut ctx_rw).unwrap_err();
+        let opt_in = plan_to_opt_expr_with_arena(&plan, &mut ctx_rw);
+        let err = pipeline.rewrite(opt_in, &mut ctx_rw).unwrap_err();
         assert_eq!(err, "synthetic failure");
 
         // Original plan binding is intact (Rust value semantics guarantee
@@ -1519,9 +1560,14 @@ mod tests {
 
         let pipeline = query_rewrite_pipeline(&HashMap::new());
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
-        let rewritten = pipeline
-            .rewrite(outcome.plan, &mut ctx)
+        let opt_in = plan_to_opt_expr_with_arena(&outcome.plan, &mut ctx);
+        let opt_out = pipeline
+            .rewrite(opt_in, &mut ctx)
             .expect("query rewrite must preserve join aggregate delta action");
+        let rewritten = crate::sql::optimizer::convert::opt_expr_to_logical_plan(
+            opt_out,
+            &ctx.scalar_arena().borrow(),
+        );
 
         let LogicalPlanNodeKind::AggregateStateMerge(_) = &rewritten.kind else {
             panic!("expected AggregateStateMerge after query rewrite");
