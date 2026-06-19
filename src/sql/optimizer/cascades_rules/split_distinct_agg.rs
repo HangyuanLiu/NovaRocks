@@ -20,7 +20,7 @@ use crate::sql::optimizer::scalar_bridge::{
 };
 use crate::sql::planner::plan::AggregateCall;
 
-use crate::sql::codegen::helpers::typed_expr_display_name;
+use crate::sql::codegen::helpers::{agg_call_display_name, typed_expr_display_name};
 
 use super::split_aggregate::{aggregate_group_key_output_ref, group_key_output_column_id};
 
@@ -84,7 +84,7 @@ impl Rule for SplitDistinctAgg {
         }
 
         if group_by.is_empty() {
-            apply_four_phase(expr, memo, agg, &aggregates, &distinct_col, &non_distinct)
+            apply_four_phase(expr, memo, &aggregates, &distinct_col, &non_distinct)
         } else {
             apply_three_phase(
                 expr,
@@ -233,6 +233,29 @@ fn phase_group_output_columns(group_by: &[TypedExpr]) -> Vec<OutputColumn> {
         .collect()
 }
 
+fn aggregate_output_columns(aggregates: &[AggregateCall]) -> Vec<OutputColumn> {
+    aggregates
+        .iter()
+        .map(|call| OutputColumn {
+            column_id: call.output_column_id,
+            name: agg_call_display_name(call),
+            data_type: call.result_type.clone(),
+            nullable: true,
+            is_internal: true,
+        })
+        .collect()
+}
+
+fn aggregate_phase_output_columns(
+    group_outputs: &[OutputColumn],
+    aggregates: &[AggregateCall],
+) -> Vec<OutputColumn> {
+    let mut outputs = Vec::with_capacity(group_outputs.len() + aggregates.len());
+    outputs.extend(group_outputs.iter().cloned());
+    outputs.extend(aggregate_output_columns(aggregates));
+    outputs
+}
+
 fn apply_three_phase(
     expr: &MExpr,
     memo: &mut Memo,
@@ -282,6 +305,8 @@ fn apply_three_phase(
             }
         })
         .collect();
+    let partial_output_columns =
+        aggregate_phase_output_columns(&gb_with_distinct_outputs, non_distinct);
 
     // LOCAL: group_by = g + x evaluated over the child; non_distinct aggs
     // computed with update semantics.
@@ -292,7 +317,7 @@ fn apply_three_phase(
             mode: AggMode::Local,
             group_by: intern_exprs(&mut memo.scalars, &gb_with_distinct),
             aggregates: intern_aggregate_calls(&mut memo.scalars, non_distinct),
-            output_columns: gb_with_distinct_outputs.clone(),
+            output_columns: partial_output_columns.clone(),
             is_merge: vec![false; non_distinct.len()],
         }),
         children: expr.children.clone(),
@@ -315,7 +340,7 @@ fn apply_three_phase(
             mode: AggMode::DistinctGlobal,
             group_by: intern_exprs(&mut memo.scalars, &dg_group_by),
             aggregates: intern_aggregate_calls(&mut memo.scalars, non_distinct),
-            output_columns: gb_with_distinct_outputs.clone(),
+            output_columns: partial_output_columns,
             is_merge: vec![true; non_distinct.len()],
         }),
         children: vec![local_group],
@@ -345,6 +370,13 @@ fn apply_three_phase(
         false,
         distinct_aggs.len().saturating_sub(1),
     ));
+    let mut global_output_columns: Vec<OutputColumn> = agg
+        .output_columns
+        .iter()
+        .take(group_by.len())
+        .cloned()
+        .collect();
+    global_output_columns.extend(aggregate_output_columns(&global_aggs));
 
     vec![NewExpr {
         op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
@@ -357,7 +389,7 @@ fn apply_three_phase(
                 &aggregate_group_key_output_ref(&gb_with_distinct_outputs, group_by.len()),
             ),
             aggregates: intern_aggregate_calls(&mut memo.scalars, &global_aggs),
-            output_columns: agg.output_columns.clone(),
+            output_columns: global_output_columns,
             is_merge: global_merge,
         }),
         children: vec![dg_group],
@@ -367,7 +399,6 @@ fn apply_three_phase(
 fn apply_four_phase(
     expr: &MExpr,
     memo: &mut Memo,
-    agg: &crate::sql::optimizer::operator::LogicalAggregateOp,
     aggregates: &[AggregateCall],
     distinct_col: &TypedExpr,
     non_distinct: &[AggregateCall],
@@ -379,6 +410,8 @@ fn apply_four_phase(
         .first()
         .cloned()
         .unwrap_or_else(|| distinct_col.clone());
+    let partial_output_columns =
+        aggregate_phase_output_columns(&distinct_group_outputs, non_distinct);
 
     // LOCAL: group_by = [x]; non_distinct aggs with update semantics.
     let local_id = memo.next_expr_id();
@@ -388,7 +421,7 @@ fn apply_four_phase(
             mode: AggMode::Local,
             group_by: intern_exprs(&mut memo.scalars, std::slice::from_ref(distinct_col)),
             aggregates: intern_aggregate_calls(&mut memo.scalars, non_distinct),
-            output_columns: distinct_group_outputs.clone(),
+            output_columns: partial_output_columns.clone(),
             is_merge: vec![false; non_distinct.len()],
         }),
         children: expr.children.clone(),
@@ -403,7 +436,7 @@ fn apply_four_phase(
             mode: AggMode::DistinctGlobal,
             group_by: intern_exprs(&mut memo.scalars, &distinct_group_by),
             aggregates: intern_aggregate_calls(&mut memo.scalars, non_distinct),
-            output_columns: distinct_group_outputs.clone(),
+            output_columns: partial_output_columns,
             is_merge: vec![true; non_distinct.len()],
         }),
         children: vec![local_group],
@@ -441,7 +474,7 @@ fn apply_four_phase(
             mode: AggMode::DistinctLocal,
             group_by: vec![],
             aggregates: intern_aggregate_calls(&mut memo.scalars, &phase_aggs),
-            output_columns: vec![],
+            output_columns: aggregate_output_columns(&phase_aggs),
             is_merge: dl_merge,
         }),
         children: vec![dg_group],
@@ -463,7 +496,7 @@ fn apply_four_phase(
             mode: AggMode::Global,
             group_by: vec![],
             aggregates: intern_aggregate_calls(&mut memo.scalars, &phase_aggs),
-            output_columns: agg.output_columns.clone(),
+            output_columns: aggregate_output_columns(&phase_aggs),
             is_merge: global_merge,
         }),
         children: vec![dl_group],
@@ -631,6 +664,41 @@ mod tests {
             });
         }
         outputs
+    }
+
+    fn phase_output_ids(op: &PhysicalHashAggregateOp) -> Vec<ColumnId> {
+        op.output_columns
+            .iter()
+            .map(|output| output.column_id)
+            .collect()
+    }
+
+    fn aggregate_call_output_ids(memo: &Memo, op: &PhysicalHashAggregateOp) -> Vec<ColumnId> {
+        materialize_aggregate_calls(
+            &memo.scalars,
+            &op.aggregates,
+            op.group_by.len(),
+            &op.output_columns,
+        )
+        .iter()
+        .map(|call| call.output_column_id)
+        .collect()
+    }
+
+    fn assert_hash_aggregate_layout(memo: &Memo, op: &PhysicalHashAggregateOp) {
+        assert_eq!(
+            op.output_columns.len(),
+            op.group_by.len() + op.aggregates.len(),
+            "PhysicalHashAggregate output layout must be [group_by..., aggregates...]"
+        );
+        assert_eq!(
+            op.output_columns
+                .iter()
+                .skip(op.group_by.len())
+                .map(|output| output.column_id)
+                .collect::<Vec<_>>(),
+            aggregate_call_output_ids(memo, op)
+        );
     }
 
     #[test]
@@ -964,7 +1032,11 @@ mod tests {
             other => panic!("expected LOCAL, got {:?}", other),
         };
 
-        let expected = vec![ColumnId::new_for_test(4), ColumnId::new_for_test(5)];
+        let expected = vec![
+            ColumnId::new_for_test(4),
+            ColumnId::new_for_test(5),
+            ColumnId::new_for_test(8),
+        ];
         assert_eq!(
             dg.output_columns
                 .iter()
@@ -1017,6 +1089,7 @@ mod tests {
         assert_eq!(top.aggregates[2].name, "count");
         assert!(top.aggregates[2].distinct);
         assert_eq!(top.is_merge, vec![false, true, false]);
+        assert_hash_aggregate_layout(&memo, top);
     }
 
     #[test]
@@ -1092,6 +1165,127 @@ mod tests {
         assert_eq!(local.group_by.len(), 1);
         assert_eq!(local.is_merge, vec![false]);
         assert_eq!(local_group.physical_exprs[0].children, vec![sg]);
+    }
+
+    #[test]
+    fn four_phase_layout_tracks_phase_aggregate_order_when_distinct_is_last() {
+        let mut memo = Memo::new();
+        let sg = scan_group(&mut memo);
+        let x = col_with_id("x", 5);
+        let a = col_with_id("a", 6);
+        let b = col_with_id("b", 7);
+        let sum_output = ColumnId::new_for_test(20);
+        let count_output = ColumnId::new_for_test(21);
+        let distinct_output = ColumnId::new_for_test(22);
+        let id = memo.next_expr_id();
+        let mexpr = MExpr {
+            id,
+            op: Operator::LogicalAggregate(single_agg(
+                &mut memo,
+                vec![],
+                vec![
+                    AggregateCall {
+                        name: "sum".into(),
+                        args: vec![a],
+                        distinct: false,
+                        result_type: DataType::Int64,
+                        order_by: vec![],
+                        output_column_id: sum_output,
+                    },
+                    AggregateCall {
+                        name: "count".into(),
+                        args: vec![b],
+                        distinct: false,
+                        result_type: DataType::Int64,
+                        order_by: vec![],
+                        output_column_id: count_output,
+                    },
+                    AggregateCall {
+                        name: "count".into(),
+                        args: vec![x],
+                        distinct: true,
+                        result_type: DataType::Int64,
+                        order_by: vec![],
+                        output_column_id: distinct_output,
+                    },
+                ],
+                vec![
+                    OutputColumn {
+                        column_id: sum_output,
+                        name: "sum(a)".into(),
+                        data_type: DataType::Int64,
+                        nullable: true,
+                        is_internal: false,
+                    },
+                    OutputColumn {
+                        column_id: count_output,
+                        name: "count(b)".into(),
+                        data_type: DataType::Int64,
+                        nullable: true,
+                        is_internal: false,
+                    },
+                    OutputColumn {
+                        column_id: distinct_output,
+                        name: "count(distinct x)".into(),
+                        data_type: DataType::Int64,
+                        nullable: true,
+                        is_internal: false,
+                    },
+                ],
+            )),
+            children: vec![sg],
+        };
+
+        let out = SplitDistinctAgg.apply(&mexpr, &mut memo);
+        assert_eq!(out.len(), 1);
+        let top = match &out[0].op {
+            Operator::PhysicalHashAggregate(p) => p,
+            other => panic!("expected GLOBAL, got {:?}", other),
+        };
+        assert!(matches!(top.mode, AggMode::Global));
+        assert_eq!(top.is_merge, vec![true, true, true]);
+        assert_hash_aggregate_layout(&memo, top);
+        assert_eq!(
+            aggregate_call_output_ids(&memo, top),
+            vec![distinct_output, sum_output, count_output]
+        );
+        assert_eq!(
+            phase_output_ids(top),
+            vec![distinct_output, sum_output, count_output]
+        );
+
+        let dl_group = &memo.groups[out[0].children[0]];
+        let dl = match &dl_group.physical_exprs[0].op {
+            Operator::PhysicalHashAggregate(p) => p,
+            other => panic!("expected DISTINCT_LOCAL, got {:?}", other),
+        };
+        assert_hash_aggregate_layout(&memo, dl);
+        assert_eq!(
+            phase_output_ids(dl),
+            vec![distinct_output, sum_output, count_output]
+        );
+
+        let dg_group = &memo.groups[dl_group.physical_exprs[0].children[0]];
+        let dg = match &dg_group.physical_exprs[0].op {
+            Operator::PhysicalHashAggregate(p) => p,
+            other => panic!("expected DISTINCT_GLOBAL, got {:?}", other),
+        };
+        assert_hash_aggregate_layout(&memo, dg);
+        assert_eq!(
+            phase_output_ids(dg),
+            vec![ColumnId::new_for_test(5), sum_output, count_output]
+        );
+
+        let local_group = &memo.groups[dg_group.physical_exprs[0].children[0]];
+        let local = match &local_group.physical_exprs[0].op {
+            Operator::PhysicalHashAggregate(p) => p,
+            other => panic!("expected LOCAL, got {:?}", other),
+        };
+        assert_hash_aggregate_layout(&memo, local);
+        assert_eq!(
+            phase_output_ids(local),
+            vec![ColumnId::new_for_test(5), sum_output, count_output]
+        );
     }
 
     #[test]

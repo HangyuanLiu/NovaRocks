@@ -231,6 +231,8 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
             PlanNodeKind::Project(p) => {
                 if is_supported_branch_union_project(&plan) {
                     false
+                } else if project_over_union_needs_row_id_output(&plan) {
+                    true
                 } else {
                     let internal = descendant_internal_columns(plan.unary_input());
                     !internal.is_empty()
@@ -278,6 +280,7 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
                 return Ok(PlanRewriteResult::Unchanged);
             }
             if matches!(plan.kind, PlanNodeKind::Project(_)) {
+                let mut changed = promote_project_union_row_id_output(&mut plan, ctx)?;
                 let internal = descendant_internal_columns(plan.unary_input());
                 let PlanNodeKind::Project(p) = &mut plan.kind else {
                     unreachable!()
@@ -290,6 +293,7 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
                     if already {
                         continue;
                     }
+                    changed = true;
                     p.items.push(ProjectItem {
                         expr: TypedExpr {
                             kind: ExprKind::ColumnRef {
@@ -304,7 +308,11 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
                         output_column_id: col.column_id,
                     });
                 }
-                return Ok(PlanRewriteResult::Changed(plan));
+                return Ok(if changed {
+                    PlanRewriteResult::Changed(plan)
+                } else {
+                    PlanRewriteResult::Unchanged
+                });
             }
 
             if branch_delta_union_needs_row_id_output(&plan) {
@@ -349,20 +357,12 @@ fn branch_delta_union_needs_row_id_output(plan: &LogicalPlanNode) -> bool {
     let PlanNodeKind::Union(node) = &plan.kind else {
         return false;
     };
-    is_branch_delta_union(plan)
+    node.all
+        && !plan.children.is_empty()
+        && node.output_columns.iter().any(ImvActionColumn::matches)
         && !node.output_columns.iter().any(ImvRowIdColumn::matches)
-        && plan.children.iter().all(branch_project_has_row_id)
-}
-
-fn is_branch_delta_union(plan: &LogicalPlanNode) -> bool {
-    let PlanNodeKind::Union(node) = &plan.kind else {
-        return false;
-    };
-    is_supported_fan_in_delta_union(plan)
-        && node.output_columns.iter().any(|column| {
-            column
-                .name
-                .eq_ignore_ascii_case(ICEBERG_MV_BRANCH_ID_COLUMN)
+        && plan.children.iter().all(|child| {
+            branch_project_has_row_id(child) && branch_output_action_column_id(child).is_some()
         })
 }
 
@@ -374,6 +374,68 @@ fn branch_project_has_row_id(plan: &LogicalPlanNode) -> bool {
             .any(|item| item.output_name.eq_ignore_ascii_case(ImvRowIdColumn::NAME)),
         _ => false,
     }
+}
+
+fn project_over_union_needs_row_id_output(plan: &LogicalPlanNode) -> bool {
+    let PlanNodeKind::Project(project) = &plan.kind else {
+        return false;
+    };
+    let union_plan = plan.unary_input();
+    let PlanNodeKind::Union(_) = &union_plan.kind else {
+        return false;
+    };
+    project
+        .items
+        .iter()
+        .any(|item| item.output_name.eq_ignore_ascii_case(ImvRowIdColumn::NAME))
+        && branch_delta_union_needs_row_id_output(union_plan)
+}
+
+fn promote_project_union_row_id_output(
+    plan: &mut LogicalPlanNode,
+    ctx: &RewriteContext,
+) -> Result<bool, String> {
+    if !project_over_union_needs_row_id_output(plan) {
+        return Ok(false);
+    }
+    let ext = ctx.extension::<ImvExtension>().ok_or_else(|| {
+        "PropagateActionColumn requires ImvExtension in RewriteContext".to_string()
+    })?;
+    let row_id_column = ext.allocate_column_id();
+    let Some(union_plan) = plan.children.get_mut(0) else {
+        return Ok(false);
+    };
+    for input in &mut union_plan.children {
+        normalize_branch_row_id_output(input, row_id_column)?;
+    }
+    let PlanNodeKind::Union(union) = &mut union_plan.kind else {
+        return Ok(false);
+    };
+    union
+        .output_columns
+        .push(ImvRowIdColumn::output_column(row_id_column));
+
+    let PlanNodeKind::Project(project) = &mut plan.kind else {
+        return Ok(false);
+    };
+    if let Some(item) = project
+        .items
+        .iter_mut()
+        .find(|item| item.output_name.eq_ignore_ascii_case(ImvRowIdColumn::NAME))
+    {
+        if let ExprKind::ColumnRef {
+            column_id, column, ..
+        } = &mut item.expr.kind
+        {
+            *column_id = row_id_column;
+            *column = ImvRowIdColumn::NAME.to_string();
+        }
+        item.expr.data_type = arrow::datatypes::DataType::Int64;
+        item.expr.nullable = false;
+        item.output_column_id = row_id_column;
+        item.output_name = ImvRowIdColumn::NAME.to_string();
+    }
+    Ok(true)
 }
 
 fn normalize_branch_row_id_output(
@@ -799,6 +861,30 @@ mod tests {
             )],
             None,
         )
+    }
+
+    fn normalized_delta_project_with_row_id(
+        action_id: ColumnId,
+        user_col_id: ColumnId,
+        row_id: ColumnId,
+    ) -> LogicalPlanNode {
+        let mut plan = normalized_delta_project(action_id, user_col_id);
+        if let PlanNodeKind::Project(project) = &mut plan.kind {
+            project.items.push(ProjectItem {
+                expr: TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        column_id: row_id,
+                        qualifier: None,
+                        column: ImvRowIdColumn::NAME.to_string(),
+                    },
+                    data_type: DataType::Int64,
+                    nullable: false,
+                },
+                output_name: ImvRowIdColumn::NAME.to_string(),
+                output_column_id: row_id,
+            });
+        }
+        plan
     }
 
     fn normalized_delta_project_without_action(user_col_id: ColumnId) -> LogicalPlanNode {
@@ -1374,7 +1460,7 @@ mod tests {
     #[test]
     fn supported_branch_union_is_not_rejected_by_propagation() {
         let rule = PropagateActionColumnRule;
-        let mut ctx = build_ctx();
+        let ctx = build_ctx();
         let plan = branch_union_with_aggregate_state_merge();
 
         let arena_rc = ctx.scalar_arena();
@@ -1389,7 +1475,7 @@ mod tests {
     #[test]
     fn supported_branch_union_project_is_not_rewritten_before_parent_union() {
         let rule = PropagateActionColumnRule;
-        let mut ctx = build_ctx();
+        let ctx = build_ctx();
         let plan = branch_union_with_aggregate_state_merge();
         let PlanNodeKind::Union(_) = &plan.kind else {
             panic!("expected union");
@@ -1446,6 +1532,168 @@ mod tests {
         let arena_rc = ctx.scalar_arena();
         let expr = logical_plan_to_opt_expr(&union, &mut arena_rc.borrow_mut());
         assert!(!rule.matches(&expr, &ctx));
+    }
+
+    #[test]
+    fn promotes_row_id_output_for_fan_in_delta_union() {
+        let rule = PropagateActionColumnRule;
+        let mut ctx = build_ctx();
+        let action_id = ColumnId(20);
+        let union = LogicalPlanNode::new(
+            PlanNodeKind::Union(LogicalUnionNode {
+                all: true,
+                output_columns: vec![
+                    OutputColumn {
+                        column_id: ColumnId(1),
+                        name: "k".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        is_internal: false,
+                    },
+                    ImvActionColumn::output_column(action_id),
+                ],
+            }),
+            vec![
+                normalized_delta_project_with_row_id(action_id, ColumnId(1), ColumnId(101)),
+                normalized_delta_project_with_row_id(action_id, ColumnId(10), ColumnId(201)),
+            ],
+            None,
+        );
+
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&union, &mut arena_rc.borrow_mut());
+        drop(arena_rc);
+        assert!(rule.matches(&expr, &ctx));
+        let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("apply")
+        else {
+            panic!("expected Changed(Union)");
+        };
+
+        let arena_rc = ctx.scalar_arena();
+        let changed = opt_expr_to_logical_plan(changed_expr, &arena_rc.borrow());
+        let PlanNodeKind::Union(union) = &changed.kind else {
+            panic!("expected Changed(Union)");
+        };
+        let row_id = union
+            .output_columns
+            .iter()
+            .find(|column| ImvRowIdColumn::matches(column))
+            .expect("union should expose _row_id");
+        assert_eq!(row_id.column_id, ColumnId(100));
+        for child in &changed.children {
+            let PlanNodeKind::Project(project) = &child.kind else {
+                panic!("expected normalized Project branch");
+            };
+            let item = project
+                .items
+                .iter()
+                .find(|item| item.output_name.eq_ignore_ascii_case(ImvRowIdColumn::NAME))
+                .expect("branch should expose _row_id");
+            assert_eq!(item.output_column_id, row_id.column_id);
+        }
+    }
+
+    #[test]
+    fn promotes_row_id_output_for_project_over_fan_in_delta_union() {
+        let rule = PropagateActionColumnRule;
+        let mut ctx = build_ctx();
+        let action_id = ColumnId(20);
+        let union = LogicalPlanNode::new(
+            PlanNodeKind::Union(LogicalUnionNode {
+                all: true,
+                output_columns: vec![
+                    OutputColumn {
+                        column_id: ColumnId(1),
+                        name: "k".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        is_internal: false,
+                    },
+                    ImvActionColumn::output_column(action_id),
+                ],
+            }),
+            vec![
+                normalized_delta_project_with_row_id(action_id, ColumnId(1), ColumnId(101)),
+                normalized_delta_project_with_row_id(action_id, ColumnId(10), ColumnId(201)),
+            ],
+            None,
+        );
+        let plan = LogicalPlanNode::new(
+            PlanNodeKind::Project(LogicalProjectNode {
+                items: vec![
+                    ProjectItem {
+                        expr: TypedExpr {
+                            kind: ExprKind::ColumnRef {
+                                column_id: ColumnId(1),
+                                qualifier: None,
+                                column: "k".to_string(),
+                            },
+                            data_type: DataType::Int64,
+                            nullable: false,
+                        },
+                        output_name: "k".to_string(),
+                        output_column_id: ColumnId(1),
+                    },
+                    ProjectItem {
+                        expr: TypedExpr {
+                            kind: ExprKind::ColumnRef {
+                                column_id: ColumnId(101),
+                                qualifier: None,
+                                column: ImvRowIdColumn::NAME.to_string(),
+                            },
+                            data_type: DataType::Int64,
+                            nullable: false,
+                        },
+                        output_name: ImvRowIdColumn::NAME.to_string(),
+                        output_column_id: ColumnId(101),
+                    },
+                ],
+                output_qualifier: None,
+            }),
+            vec![union],
+            None,
+        );
+
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        drop(arena_rc);
+        assert!(rule.matches(&expr, &ctx));
+        let RewriteResult::Changed(changed_expr) = rule.apply(expr, &mut ctx).expect("apply")
+        else {
+            panic!("expected Changed(Project)");
+        };
+
+        let arena_rc = ctx.scalar_arena();
+        let changed = opt_expr_to_logical_plan(changed_expr, &arena_rc.borrow());
+        let PlanNodeKind::Project(project) = &changed.kind else {
+            panic!("expected Changed(Project)");
+        };
+        let project_row_id = project
+            .items
+            .iter()
+            .find(|item| item.output_name.eq_ignore_ascii_case(ImvRowIdColumn::NAME))
+            .expect("project should expose _row_id");
+        let union_plan = changed.unary_input();
+        let PlanNodeKind::Union(union) = &union_plan.kind else {
+            panic!("expected child Union");
+        };
+        let union_row_id = union
+            .output_columns
+            .iter()
+            .find(|column| ImvRowIdColumn::matches(column))
+            .expect("union should expose _row_id");
+        assert_eq!(project_row_id.output_column_id, union_row_id.column_id);
+        for child in &union_plan.children {
+            let PlanNodeKind::Project(project) = &child.kind else {
+                panic!("expected normalized Project branch");
+            };
+            let item = project
+                .items
+                .iter()
+                .find(|item| item.output_name.eq_ignore_ascii_case(ImvRowIdColumn::NAME))
+                .expect("branch should expose _row_id");
+            assert_eq!(item.output_column_id, union_row_id.column_id);
+        }
     }
 
     #[test]

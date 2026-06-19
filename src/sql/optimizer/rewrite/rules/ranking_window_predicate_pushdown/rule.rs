@@ -176,10 +176,13 @@ impl LogicalRewriteRule for RankingWindowPredicatePushdownRule {
         // Window output columns are laid out as input columns followed by one
         // result column for each window expression. Keep this in sync with
         // scalar_bridge::materialize_window_exprs.
-        let window_output_start = window_op
+        let Some(window_output_start) = window_op
             .output_columns
             .len()
-            .saturating_sub(window_op.window_exprs.len());
+            .checked_sub(window_op.window_exprs.len())
+        else {
+            return Ok(RewriteResult::Unchanged);
+        };
         let found = window_op
             .window_exprs
             .iter()
@@ -734,6 +737,41 @@ mod tests {
             .apply(plan, &mut ctx)
             .unwrap();
         let sort = extract_sort_from_changed(result);
+        assert_eq!(sort.partition_limit, Some(2));
+        assert_eq!(sort.topn_type, Some(SortTopNType::Rank));
+    }
+
+    #[test]
+    fn fires_when_window_output_columns_include_passthrough_columns() {
+        use crate::exec::node::sort::SortTopNType;
+        let region_id = ColumnId::new_for_test(10);
+        let amount_id = ColumnId::new_for_test(11);
+        let rank_id = ColumnId::new_for_test(12);
+
+        let mut arena = ScalarArena::new();
+        let sort = make_sort_opt(&mut arena, region_id);
+        let window_spec = make_window_spec_opt_with_order(&mut arena, "rank", region_id, amount_id);
+        let window = window_opt(
+            sort,
+            vec![window_spec],
+            vec![
+                output_col(region_id, "region"),
+                output_col(amount_id, "amount"),
+                output_col(rank_id, "rk"),
+            ],
+        );
+        let plan = filter_opt(
+            &mut arena,
+            window,
+            binop_typed(col_typed(rank_id), BinOp::Le, int_typed(2)),
+        );
+
+        let mut ctx = make_ctx(arena);
+        let sort = extract_sort_from_changed(
+            RankingWindowPredicatePushdownRule
+                .apply(plan, &mut ctx)
+                .unwrap(),
+        );
         assert_eq!(sort.partition_limit, Some(2));
         assert_eq!(sort.topn_type, Some(SortTopNType::Rank));
     }

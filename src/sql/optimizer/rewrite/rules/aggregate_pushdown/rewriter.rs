@@ -1,13 +1,13 @@
 //! Aggregate pushdown rewriter — phase 2 of the rule.
 
-use crate::sql::analysis::{ExprKind, OutputColumn};
+use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
 use crate::sql::codegen::helpers::{agg_call_display_name_from_parts, typed_expr_display_name};
 use crate::sql::column_id::{ColumnId, ColumnRefFactory};
 use crate::sql::optimizer::operator::{
     AggStage, LogicalAggregateOp, Operator, ProjectOp, ScalarAggregateSpec, ScalarProjectItem,
 };
 use crate::sql::optimizer::opt_expr::OptExpr;
-use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, materialize};
+use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, intern_typed, materialize};
 use crate::sql::optimizer::scalar_bridge::{materialize_exprs, materialize_sort_keys};
 
 use super::context::PushPlan;
@@ -25,6 +25,46 @@ fn group_by_display_name(id: ScalarId, arena: &ScalarArena) -> String {
     typed_expr_display_name(&expr)
 }
 
+fn append_extra_groupby(
+    partial_groupby: &mut Vec<ScalarId>,
+    extra_groupby: Vec<TypedExpr>,
+    arena: &mut ScalarArena,
+) {
+    for expr in extra_groupby {
+        if partial_groupby
+            .iter()
+            .any(|id| same_column_ref_identity(&materialize(arena, *id), &expr))
+        {
+            continue;
+        }
+        partial_groupby.push(intern_typed(arena, &expr));
+    }
+}
+
+fn same_column_ref_identity(a: &TypedExpr, b: &TypedExpr) -> bool {
+    match (&a.kind, &b.kind) {
+        (
+            ExprKind::ColumnRef {
+                column_id: a_id,
+                qualifier: a_qualifier,
+                column: a_column,
+            },
+            ExprKind::ColumnRef {
+                column_id: b_id,
+                qualifier: b_qualifier,
+                column: b_column,
+            },
+        ) => {
+            if *a_id != ColumnId::UNSET && *b_id != ColumnId::UNSET {
+                a_id == b_id
+            } else {
+                a_qualifier == b_qualifier && a_column == b_column
+            }
+        }
+        _ => false,
+    }
+}
+
 /// Construct the final OptExpr: a top-level Aggregate (with is_split=true)
 /// whose input is the original Join with one side wrapped by a partial
 /// Aggregate.
@@ -35,8 +75,14 @@ pub(crate) fn rewrite(
     column_ref_factory: &mut ColumnRefFactory,
     arena: &mut ScalarArena,
 ) -> OptExpr {
-    // Capture the side before plan is consumed by the moves below.
-    let plan_side = plan.side;
+    let PushPlan {
+        side: plan_side,
+        target_subtree,
+        mut partial_groupby,
+        partial_extra_groupby,
+        partial_aggregates,
+    } = plan;
+    append_extra_groupby(&mut partial_groupby, partial_extra_groupby, arena);
 
     // 1. Build partial ScalarAggregateSpecs. For SUM/MIN/MAX the function name
     //    is unchanged at the partial stage; for COUNT it stays COUNT at partial
@@ -50,46 +96,49 @@ pub(crate) fn rewrite(
     //    layout is [group_by..., aggregates...].
     let group_by_len = original.group_by.len();
 
-    let partial_specs_and_output_cols: Vec<(ScalarAggregateSpec, OutputColumn)> = plan
-        .partial_aggregates
-        .iter()
-        .enumerate()
-        .map(|(idx, spec)| {
-            let partial_spec = ScalarAggregateSpec {
-                name: partial_fn_name(&spec.name),
-                args: spec.args.clone(),
-                distinct: false,
-                order_by: vec![],
-            };
-            let display_name = agg_spec_display_name(&partial_spec, arena);
-            // Result type comes from the original aggregate's output column.
-            let result_type = original
-                .output_columns
-                .get(group_by_len + idx)
-                .map(|c| c.data_type.clone())
-                .or_else(|| {
-                    // Fallback: materialize first arg and use its type.
-                    spec.args
-                        .first()
-                        .map(|id| materialize(arena, *id).data_type)
-                })
-                .unwrap_or(arrow::datatypes::DataType::Int64);
-            let partial_col_id =
-                column_ref_factory.create(None, display_name.clone(), result_type.clone(), true);
-            let output_col = OutputColumn {
-                column_id: partial_col_id,
-                name: display_name,
-                data_type: result_type,
-                nullable: true,
-                is_internal: false,
-            };
-            (partial_spec, output_col)
-        })
-        .collect();
+    let partial_specs_and_output_cols: Vec<(ScalarAggregateSpec, OutputColumn)> =
+        partial_aggregates
+            .iter()
+            .enumerate()
+            .map(|(idx, spec)| {
+                let partial_spec = ScalarAggregateSpec {
+                    name: partial_fn_name(&spec.name),
+                    args: spec.args.clone(),
+                    distinct: false,
+                    order_by: vec![],
+                };
+                let display_name = agg_spec_display_name(&partial_spec, arena);
+                // Result type comes from the original aggregate's output column.
+                let result_type = original
+                    .output_columns
+                    .get(group_by_len + idx)
+                    .map(|c| c.data_type.clone())
+                    .or_else(|| {
+                        // Fallback: materialize first arg and use its type.
+                        spec.args
+                            .first()
+                            .map(|id| materialize(arena, *id).data_type)
+                    })
+                    .unwrap_or(arrow::datatypes::DataType::Int64);
+                let partial_col_id = column_ref_factory.create(
+                    None,
+                    display_name.clone(),
+                    result_type.clone(),
+                    true,
+                );
+                let output_col = OutputColumn {
+                    column_id: partial_col_id,
+                    name: display_name,
+                    data_type: result_type,
+                    nullable: true,
+                    is_internal: false,
+                };
+                (partial_spec, output_col)
+            })
+            .collect();
 
     // 2. Partial group-by output columns (column-ref pass-through).
-    let partial_groupby_outputs: Vec<OutputColumn> = plan
-        .partial_groupby
+    let partial_groupby_outputs: Vec<OutputColumn> = partial_groupby
         .iter()
         .filter_map(|gb_id| {
             let gb = materialize(arena, *gb_id);
@@ -124,13 +173,13 @@ pub(crate) fn rewrite(
     let partial_aggregate = OptExpr::new(
         Operator::LogicalAggregate(LogicalAggregateOp::staged(
             AggStage::Single,
-            plan.partial_groupby,
+            partial_groupby,
             partial_specs,
             partial_output_cols,
             is_merge_partial,
             false, // partial isn't itself a final
         )),
-        vec![plan.target_subtree],
+        vec![target_subtree],
     );
 
     // 3. Splice partial into the chosen side of the join. v1 invariant
@@ -538,6 +587,7 @@ mod tests {
             side: super::super::context::Side::Left,
             target_subtree: a,
             partial_groupby: original.group_by.clone(),
+            partial_extra_groupby: vec![],
             partial_aggregates: vec![count],
         };
         let mut factory = ColumnRefFactory::new();
@@ -576,6 +626,7 @@ mod tests {
             side: super::super::context::Side::Left,
             target_subtree: a,
             partial_groupby: original.group_by.clone(),
+            partial_extra_groupby: vec![],
             partial_aggregates: vec![sum],
         };
         let mut factory = ColumnRefFactory::new();
@@ -628,6 +679,7 @@ mod tests {
             side: super::super::context::Side::Left,
             target_subtree: a,
             partial_groupby: original.group_by.clone(),
+            partial_extra_groupby: vec![],
             partial_aggregates: vec![sum],
         };
         let mut factory = ColumnRefFactory::new();
@@ -731,6 +783,7 @@ mod tests {
             side: super::super::context::Side::Left,
             target_subtree: left.clone(),
             partial_groupby: original.group_by.clone(),
+            partial_extra_groupby: vec![],
             partial_aggregates: vec![sum],
         };
 
@@ -762,6 +815,143 @@ mod tests {
         assert!(scan_op.columns.iter().any(|c| c.column_id == c_bigint));
         // The partial agg group_by must include c_bigint.
         assert!(!partial_agg.group_by.is_empty());
+    }
+
+    #[test]
+    fn rewrite_interns_extra_join_key_into_partial_groupby_output() {
+        let mut factory = ColumnRefFactory::new();
+        let mut arena = ScalarArena::new();
+        let call_center = factory.create(
+            Some("cs".into()),
+            "cs_call_center_sk".into(),
+            DataType::Int64,
+            true,
+        );
+        let sold_date = factory.create(
+            Some("cs".into()),
+            "cs_sold_date_sk".into(),
+            DataType::Int64,
+            true,
+        );
+        let sales_price = factory.create(
+            Some("cs".into()),
+            "cs_sales_price".into(),
+            DataType::Int64,
+            true,
+        );
+        let date_sk = factory.create(Some("d".into()), "d_date_sk".into(), DataType::Int64, true);
+
+        let qualified_col = |qualifier: &str, name: &str, id: ColumnId, ty: DataType| {
+            crate::sql::analysis::TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: id,
+                    qualifier: Some(qualifier.into()),
+                    column: name.into(),
+                },
+                data_type: ty,
+                nullable: true,
+            }
+        };
+
+        let left = scan_opt_with_alias(
+            "catalog_sales",
+            Some("cs"),
+            &[
+                ("cs_call_center_sk", call_center, DataType::Int64),
+                ("cs_sold_date_sk", sold_date, DataType::Int64),
+                ("cs_sales_price", sales_price, DataType::Int64),
+            ],
+        );
+        let right = scan_opt_with_alias(
+            "date_dim",
+            Some("d"),
+            &[("d_date_sk", date_sk, DataType::Int64)],
+        );
+        let join_cond = crate::sql::analysis::TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(qualified_col(
+                    "cs",
+                    "cs_sold_date_sk",
+                    sold_date,
+                    DataType::Int64,
+                )),
+                op: BinOp::Eq,
+                right: Box::new(qualified_col("d", "d_date_sk", date_sk, DataType::Int64)),
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        };
+        let join = join_opt(left.clone(), right, Some(join_cond), &mut arena);
+
+        let sum_arg = intern_typed(
+            &mut arena,
+            &qualified_col("cs", "cs_sales_price", sales_price, DataType::Int64),
+        );
+        let sum = ScalarAggregateSpec {
+            name: "sum".into(),
+            args: vec![sum_arg],
+            distinct: false,
+            order_by: vec![],
+        };
+        let gb_id = intern_typed(
+            &mut arena,
+            &qualified_col("cs", "cs_call_center_sk", call_center, DataType::Int64),
+        );
+        let original = LogicalAggregateOp::staged(
+            AggStage::Single,
+            vec![gb_id],
+            vec![sum.clone()],
+            vec![
+                OutputColumn {
+                    column_id: call_center,
+                    name: "cs_call_center_sk".into(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    is_internal: false,
+                },
+                OutputColumn {
+                    column_id: sales_price,
+                    name: "sum(cs.cs_sales_price)".into(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    is_internal: false,
+                },
+            ],
+            vec![false],
+            false,
+        );
+        let push = PushPlan {
+            side: super::super::context::Side::Left,
+            target_subtree: left,
+            partial_groupby: original.group_by.clone(),
+            partial_extra_groupby: vec![qualified_col(
+                "cs",
+                "cs_sold_date_sk",
+                sold_date,
+                DataType::Int64,
+            )],
+            partial_aggregates: vec![sum],
+        };
+
+        let rewritten = rewrite(&original, &join, push, &mut factory, &mut arena);
+        let (_, top_plan) = unwrap_exposure_project(rewritten);
+        let join_plan = top_plan.children.first().expect("final agg child");
+        let partial_plan = join_plan.children.first().expect("join left child");
+        let Operator::LogicalAggregate(partial_agg) = &partial_plan.op else {
+            panic!("expected partial aggregate on left");
+        };
+
+        let partial_group_ids = partial_agg
+            .group_by
+            .iter()
+            .map(|id| match materialize(&arena, *id).kind {
+                ExprKind::ColumnRef { column_id, .. } => column_id,
+                other => panic!("expected ColumnRef partial group-by, got {:?}", other),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(partial_group_ids, vec![call_center, sold_date]);
+        assert_eq!(partial_agg.output_columns[0].column_id, call_center);
+        assert_eq!(partial_agg.output_columns[1].column_id, sold_date);
     }
 
     #[test]
@@ -832,6 +1022,7 @@ mod tests {
             side: super::super::context::Side::Left,
             target_subtree: left,
             partial_groupby: original.group_by.clone(),
+            partial_extra_groupby: vec![],
             partial_aggregates: vec![count_spec],
         };
 

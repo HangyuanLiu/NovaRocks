@@ -4,12 +4,11 @@
 //! is in `required_output_columns`. Keeps at least one column to preserve
 //! a valid output schema (Gap 4).
 //!
-//! Only the set-op node's own `output_columns` list is touched. Branch inputs
-//! are NOT modified here — the Phase-1 tagging pass has already tagged each
-//! branch with the position-restricted required set, and the branches' own
-//! prune rules handle their pruning independently. Because output and branch
-//! schemas align by position, dropping a position here stays consistent with
-//! the branches after the full rule set runs.
+//! The set-op node's `output_columns` and `child_output_columns` metadata must
+//! be pruned by the same output positions. Branch inputs are NOT modified here
+//! — the Phase-1 tagging pass has already tagged each branch with the
+//! position-restricted required set, and the branches' own prune rules handle
+//! their pruning independently.
 
 use std::collections::HashSet;
 
@@ -74,16 +73,34 @@ impl LogicalRewriteRule for PruneUnionColumns {
             .unwrap_or(ColumnId::UNSET);
         let keep_ids = keep_at_least_one(filtered, fallback);
 
-        let new_output_columns: Vec<_> = node
+        let keep_positions: Vec<usize> = node
             .output_columns
-            .into_iter()
-            .filter(|c| keep_ids.contains(&c.column_id))
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, column)| keep_ids.contains(&column.column_id).then_some(idx))
+            .collect();
+
+        let new_output_columns: Vec<_> = keep_positions
+            .iter()
+            .map(|idx| node.output_columns[*idx].clone())
             .collect();
 
         if new_output_columns.len() == original_len {
             return Ok(RewriteResult::Unchanged);
         }
 
+        if !node.child_output_columns.is_empty() {
+            node.child_output_columns = node
+                .child_output_columns
+                .into_iter()
+                .map(|columns| {
+                    keep_positions
+                        .iter()
+                        .filter_map(|idx| columns.get(*idx).cloned())
+                        .collect()
+                })
+                .collect();
+        }
         node.output_columns = new_output_columns;
         Ok(RewriteResult::Changed(OptExpr {
             op: Operator::LogicalUnion(node),
@@ -162,6 +179,82 @@ mod tests {
         assert_eq!(pruned.output_columns[0].column_id, id_b);
         // inputs are untouched
         assert_eq!(changed.children.len(), 2);
+    }
+
+    #[test]
+    fn prune_union_filters_child_output_columns_by_position() {
+        let id_a = ColumnId::new_for_test(1);
+        let id_b = ColumnId::new_for_test(2);
+        let id_c = ColumnId::new_for_test(3);
+        let left_a = ColumnId::new_for_test(11);
+        let left_b = ColumnId::new_for_test(12);
+        let left_c = ColumnId::new_for_test(13);
+        let right_a = ColumnId::new_for_test(21);
+        let right_b = ColumnId::new_for_test(22);
+        let right_c = ColumnId::new_for_test(23);
+
+        let mut needed = HashSet::new();
+        needed.insert(id_a);
+        needed.insert(id_c);
+
+        let mut expr = OptExpr::new(
+            Operator::LogicalUnion(UnionOp {
+                all: true,
+                output_columns: vec![
+                    make_output_column(id_a, "a"),
+                    make_output_column(id_b, "b"),
+                    make_output_column(id_c, "c"),
+                ],
+                child_output_columns: vec![
+                    vec![
+                        make_output_column(left_a, "left_a"),
+                        make_output_column(left_b, "left_b"),
+                        make_output_column(left_c, "left_c"),
+                    ],
+                    vec![
+                        make_output_column(right_a, "right_a"),
+                        make_output_column(right_b, "right_b"),
+                        make_output_column(right_c, "right_c"),
+                    ],
+                ],
+            }),
+            vec![dummy_input(), dummy_input()],
+        );
+        expr.required_output_columns = Some(needed);
+
+        let rule = PruneUnionColumns;
+        let result = rule.apply(expr, &mut ctx()).unwrap();
+
+        let changed = match result {
+            RewriteResult::Changed(p) => p,
+            other => panic!("expected Changed, got {:?}", other),
+        };
+        let Operator::LogicalUnion(pruned) = &changed.op else {
+            panic!("expected Union");
+        };
+
+        assert_eq!(
+            pruned
+                .output_columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>(),
+            vec![id_a, id_c]
+        );
+        assert_eq!(
+            pruned.child_output_columns[0]
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>(),
+            vec![left_a, left_c]
+        );
+        assert_eq!(
+            pruned.child_output_columns[1]
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>(),
+            vec![right_a, right_c]
+        );
     }
 
     #[test]

@@ -28,12 +28,14 @@ use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal}
 use crate::sql::planner::plan::{LogicalPlanNode, LogicalProjectNode, PlanNodeKind};
 
 pub(crate) struct InjectApplyKeyProjectRule {
+    checked_root: AtomicBool,
     fired: AtomicBool,
 }
 
 impl InjectApplyKeyProjectRule {
     pub(crate) fn new() -> Self {
         Self {
+            checked_root: AtomicBool::new(false),
             fired: AtomicBool::new(false),
         }
     }
@@ -109,6 +111,9 @@ impl LogicalRewriteRule for InjectApplyKeyProjectRule {
     }
 
     fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
+        if self.checked_root.swap(true, Ordering::SeqCst) {
+            return false;
+        }
         if self.fired.load(Ordering::SeqCst) {
             return false;
         }
@@ -231,6 +236,7 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::convert::{logical_plan_to_opt_expr, opt_expr_to_logical_plan};
     use crate::sql::optimizer::rewrite::context::RewriteContext;
+    use crate::sql::optimizer::rewrite::imv::action_column::ImvActionColumn;
     use crate::sql::optimizer::rewrite::imv::annotation::{ImvExtension, ImvPlanAnnotation};
     use crate::sql::optimizer::rewrite::imv::row_id_column::ImvRowIdColumn;
     use std::cell::RefCell;
@@ -420,6 +426,51 @@ mod tests {
         assert!(
             err.contains("expected root Project"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn does_not_inject_apply_key_below_non_apply_key_root() {
+        let rule = InjectApplyKeyProjectRule::new();
+        let ctx = build_ctx();
+        let k = OutputColumn {
+            column_id: ColumnId(1),
+            name: "k".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        };
+        let old_input = LogicalPlanNode::new(
+            PlanNodeKind::Values(LogicalValuesNode {
+                rows: Vec::new(),
+                columns: vec![k.clone()],
+            }),
+            vec![],
+            None,
+        );
+        let delta_input = project_root(delta_scan_with_row_id(ColumnId(101)), ColumnId(101));
+        let plan = LogicalPlanNode::new(
+            PlanNodeKind::AggregateStateMerge(LogicalAggregateStateMergeNode {
+                group_key_names: vec!["k".to_string()],
+                aggregate_state_names: Vec::new(),
+                change_op_column: ImvActionColumn::NAME.to_string(),
+                output_columns: vec![k],
+            }),
+            vec![old_input, delta_input],
+            None,
+        );
+
+        let arena_rc = ctx.scalar_arena();
+        let expr = logical_plan_to_opt_expr(&plan, &mut arena_rc.borrow_mut());
+        drop(arena_rc);
+
+        assert!(
+            !rule.matches(&expr, &ctx),
+            "AggregateStateMerge root should not get an apply-key wrapper"
+        );
+        assert!(
+            !rule.matches(expr.child(1), &ctx),
+            "root-only rule must not fire on descendant Projects"
         );
     }
 }
