@@ -2,7 +2,9 @@
 
 use std::fmt::Write;
 
-use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, ProjectItem, TypedExpr, UnOp};
+use crate::sql::analysis::{
+    BinOp, ExprKind, JoinKind, LiteralValue, ProjectItem, SortItem, TypedExpr, UnOp,
+};
 use crate::sql::catalog::ScanSource;
 use crate::sql::planner::plan::{
     ApplyKind, LogicalPlanNode, PlanNodeKind, validate_logical_plan_stage,
@@ -46,16 +48,9 @@ fn format_node(plan: &LogicalPlanNode, level: ExplainLevel, indent: usize, out: 
     let pad = "  ".repeat(indent);
     match &plan.kind {
         PlanNodeKind::Scan(node) => {
-            let alias = node
-                .alias
-                .as_deref()
-                .map(|a| format!(" (alias={a})"))
-                .unwrap_or_default();
-            out.push(format!(
-                "{pad}0:SCAN {db}.{tbl}{alias}",
-                db = node.database,
-                tbl = node.table.name
-            ));
+            let header = format_shared_plan_node_header(&plan.kind, PlanNodeExplainStage::Logical)
+                .expect("Scan is a shared explain node");
+            out.push(format!("{pad}0:{header}",));
             if let Some(ref cols) = node.required_columns
                 && matches!(
                     level,
@@ -76,17 +71,21 @@ fn format_node(plan: &LogicalPlanNode, level: ExplainLevel, indent: usize, out: 
                 out.push(format!("{pad}     predicates: {}", preds.join(" AND ")));
             }
         }
-        PlanNodeKind::Filter(node) => {
-            out.push(format!("{pad}FILTER"));
-            out.push(format!(
-                "{pad}  predicate: {}",
-                format_expr(&node.predicate)
-            ));
+        PlanNodeKind::Filter(_) => {
+            let header = format_shared_plan_node_header(&plan.kind, PlanNodeExplainStage::Logical)
+                .expect("Filter is a shared explain node");
+            out.push(format!("{pad}{header}"));
+            for line in
+                format_shared_plan_node_detail_lines(&plan.kind, PlanNodeExplainStage::Logical)
+            {
+                out.push(format!("{pad}  {line}"));
+            }
             format_node(plan.unary_input(), level, indent + 1, out);
         }
-        PlanNodeKind::Project(node) => {
-            let items: Vec<String> = node.items.iter().map(format_project_item).collect();
-            out.push(format!("{pad}PROJECT [{}]", items.join(", ")));
+        PlanNodeKind::Project(_) => {
+            let header = format_shared_plan_node_header(&plan.kind, PlanNodeExplainStage::Logical)
+                .expect("Project is a shared explain node");
+            out.push(format!("{pad}{header}"));
             format_node(plan.unary_input(), level, indent + 1, out);
         }
         PlanNodeKind::Aggregate(node) => {
@@ -129,21 +128,10 @@ fn format_node(plan: &LogicalPlanNode, level: ExplainLevel, indent: usize, out: 
             format_node(plan.left(), level, indent + 1, out);
             format_node(plan.right(), level, indent + 1, out);
         }
-        PlanNodeKind::Sort(node) => {
-            let items: Vec<String> = node
-                .items
-                .iter()
-                .map(|s| {
-                    let dir = if s.asc { "ASC" } else { "DESC" };
-                    let nulls = if s.nulls_first {
-                        " NULLS FIRST"
-                    } else {
-                        " NULLS LAST"
-                    };
-                    format!("{} {dir}{nulls}", format_expr(&s.expr))
-                })
-                .collect();
-            out.push(format!("{pad}SORT BY [{}]", items.join(", ")));
+        PlanNodeKind::Sort(_) => {
+            let body = format_shared_plan_node_header(&plan.kind, PlanNodeExplainStage::Logical)
+                .expect("Sort is a shared explain node");
+            out.push(format!("{pad}{body}"));
             format_node(plan.unary_input(), level, indent + 1, out);
         }
         PlanNodeKind::Limit(node) => {
@@ -176,62 +164,32 @@ fn format_node(plan: &LogicalPlanNode, level: ExplainLevel, indent: usize, out: 
                 format_node(input, level, indent + 1, out);
             }
         }
-        PlanNodeKind::Window(node) => {
-            let fns: Vec<String> = node
-                .window_exprs
-                .iter()
-                .map(|w| {
-                    let args: Vec<String> = w.args.iter().map(format_expr).collect();
-                    let partition: Vec<String> = w.partition_by.iter().map(format_expr).collect();
-                    let order: Vec<String> = w
-                        .order_by
-                        .iter()
-                        .map(|s| {
-                            let dir = if s.asc { "ASC" } else { "DESC" };
-                            format!("{} {dir}", format_expr(&s.expr))
-                        })
-                        .collect();
-                    let mut over_parts = Vec::new();
-                    if !partition.is_empty() {
-                        over_parts.push(format!("PARTITION BY {}", partition.join(", ")));
-                    }
-                    if !order.is_empty() {
-                        over_parts.push(format!("ORDER BY {}", order.join(", ")));
-                    }
-                    format!(
-                        "{}({}) OVER ({})",
-                        w.name,
-                        args.join(", "),
-                        over_parts.join(" ")
-                    )
-                })
-                .collect();
-            out.push(format!("{pad}WINDOW [{}]", fns.join("; ")));
+        PlanNodeKind::Window(_) => {
+            let header = format_shared_plan_node_header(&plan.kind, PlanNodeExplainStage::Logical)
+                .expect("Window is a shared explain node");
+            out.push(format!("{pad}{header}"));
             format_node(plan.unary_input(), level, indent + 1, out);
         }
-        PlanNodeKind::Values(node) => {
-            out.push(format!("{pad}VALUES ({} rows)", node.rows.len()));
+        PlanNodeKind::Values(_) => {
+            let body = format_shared_plan_node_header(&plan.kind, PlanNodeExplainStage::Logical)
+                .expect("Values is a shared explain node");
+            out.push(format!("{pad}{body}"));
         }
-        PlanNodeKind::GenerateSeries(node) => {
-            out.push(format!(
-                "{pad}GENERATE_SERIES({}, {}, {})",
-                node.start, node.end, node.step
-            ));
+        PlanNodeKind::GenerateSeries(_) => {
+            let body = format_shared_plan_node_header(&plan.kind, PlanNodeExplainStage::Logical)
+                .expect("GenerateSeries is a shared explain node");
+            out.push(format!("{pad}{body}"));
         }
-        PlanNodeKind::TableFunction(node) => {
-            let join_type = if node.is_left_join { "LEFT" } else { "CROSS" };
-            out.push(format!(
-                "{pad}TABLE_FUNCTION [{} {}]",
-                join_type,
-                node.function_name.to_uppercase()
-            ));
+        PlanNodeKind::TableFunction(_) => {
+            let body = format_shared_plan_node_header(&plan.kind, PlanNodeExplainStage::Logical)
+                .expect("TableFunction is a shared explain node");
+            out.push(format!("{pad}{body}"));
             format_node(plan.unary_input(), level, indent + 1, out);
         }
-        PlanNodeKind::Repeat(node) => {
-            out.push(format!(
-                "{pad}REPEAT ({} grouping sets)",
-                node.grouping_ids.len()
-            ));
+        PlanNodeKind::Repeat(_) => {
+            let body = format_shared_plan_node_header(&plan.kind, PlanNodeExplainStage::Logical)
+                .expect("Repeat is a shared explain node");
+            out.push(format!("{pad}{body}"));
             format_node(plan.unary_input(), level, indent + 1, out);
         }
         PlanNodeKind::CTEAnchor(node) => {
@@ -246,13 +204,10 @@ fn format_node(plan: &LogicalPlanNode, level: ExplainLevel, indent: usize, out: 
         PlanNodeKind::CTEConsume(node) => {
             out.push(format!("{pad}CTE_CONSUME(cte_id={})", node.cte_id));
         }
-        PlanNodeKind::Decode(node) => {
-            let pairs: Vec<String> = node
-                .mappings
-                .iter()
-                .map(|m| format!("{}->{}", m.dict_column, m.string_column))
-                .collect();
-            out.push(format!("{pad}DECODE [{}]", pairs.join(", ")));
+        PlanNodeKind::Decode(_) => {
+            let body = format_shared_plan_node_header(&plan.kind, PlanNodeExplainStage::Logical)
+                .expect("Decode is a shared explain node");
+            out.push(format!("{pad}{body}"));
             format_node(plan.unary_input(), level, indent + 1, out);
         }
         PlanNodeKind::AggregateStateMerge(node) => {
@@ -283,7 +238,9 @@ fn format_node(plan: &LogicalPlanNode, level: ExplainLevel, indent: usize, out: 
             format_node(plan.right(), level, indent + 1, out);
         }
         PlanNodeKind::AssertOneRow(_) => {
-            out.push(format!("{pad}ASSERT ONE ROW"));
+            let body = format_shared_plan_node_header(&plan.kind, PlanNodeExplainStage::Logical)
+                .expect("AssertOneRow is a shared explain node");
+            out.push(format!("{pad}{body}"));
             format_node(plan.unary_input(), level, indent + 1, out);
         }
         PlanNodeKind::ImvDelta(_) | PlanNodeKind::ImvVersion(_) => {
@@ -314,6 +271,144 @@ fn logical_scan_source_label(source: &ScanSource) -> Option<String> {
         )),
         _ => None,
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlanNodeExplainStage {
+    Logical,
+    Distributed,
+}
+
+pub(crate) fn format_shared_plan_node_header(
+    kind: &PlanNodeKind,
+    stage: PlanNodeExplainStage,
+) -> Option<String> {
+    match kind {
+        PlanNodeKind::Scan(node) => {
+            let alias = node
+                .alias
+                .as_deref()
+                .map(|a| format!(" (alias={a})"))
+                .unwrap_or_default();
+            Some(format!(
+                "SCAN {}.{}{}",
+                node.database, node.table.name, alias
+            ))
+        }
+        PlanNodeKind::Filter(_) => Some("FILTER".to_string()),
+        PlanNodeKind::Project(node) => {
+            let items = node
+                .items
+                .iter()
+                .map(format_project_item)
+                .collect::<Vec<_>>();
+            Some(format!("PROJECT [{}]", items.join(", ")))
+        }
+        PlanNodeKind::Sort(node) => {
+            let items = format_sort_items(&node.items);
+            Some(format!("SORT BY [{}]", items.join(", ")))
+        }
+        PlanNodeKind::Window(node) => {
+            let fns = format_window_exprs(&node.window_exprs, stage);
+            Some(format!("WINDOW [{}]", fns.join("; ")))
+        }
+        PlanNodeKind::Values(node) => Some(format!("VALUES ({} rows)", node.rows.len())),
+        PlanNodeKind::Decode(node) => {
+            let pairs = node
+                .mappings
+                .iter()
+                .map(|m| format!("{}->{}", m.dict_column, m.string_column))
+                .collect::<Vec<_>>();
+            Some(format!("DECODE [{}]", pairs.join(", ")))
+        }
+        PlanNodeKind::Repeat(node) => Some(format!(
+            "REPEAT ({} grouping sets)",
+            node.grouping_ids.len()
+        )),
+        PlanNodeKind::GenerateSeries(node) => Some(format!(
+            "GENERATE_SERIES({}, {}, {})",
+            node.start, node.end, node.step
+        )),
+        PlanNodeKind::TableFunction(node) => {
+            let join_type = if node.is_left_join { "LEFT" } else { "CROSS" };
+            Some(format!(
+                "TABLE_FUNCTION [{} {}]",
+                join_type,
+                node.function_name.to_uppercase()
+            ))
+        }
+        PlanNodeKind::AssertOneRow(_) => Some(match stage {
+            PlanNodeExplainStage::Logical => "ASSERT ONE ROW".to_string(),
+            PlanNodeExplainStage::Distributed => "ASSERT NUM ROWS (<= 1)".to_string(),
+        }),
+        _ => None,
+    }
+}
+
+pub(crate) fn format_shared_plan_node_detail_lines(
+    kind: &PlanNodeKind,
+    _stage: PlanNodeExplainStage,
+) -> Vec<String> {
+    match kind {
+        PlanNodeKind::Filter(node) => vec![format!("predicate: {}", format_expr(&node.predicate))],
+        _ => vec![],
+    }
+}
+
+pub(crate) fn format_sort_items(items: &[SortItem]) -> Vec<String> {
+    items
+        .iter()
+        .map(|s| {
+            let dir = if s.asc { "ASC" } else { "DESC" };
+            let nulls = if s.nulls_first {
+                " NULLS FIRST"
+            } else {
+                " NULLS LAST"
+            };
+            format!("{} {dir}{nulls}", format_expr(&s.expr))
+        })
+        .collect()
+}
+
+fn format_window_exprs(
+    exprs: &[crate::sql::planner::plan::WindowExpr],
+    stage: PlanNodeExplainStage,
+) -> Vec<String> {
+    exprs
+        .iter()
+        .map(|w| {
+            let args = w.args.iter().map(format_expr).collect::<Vec<_>>();
+            match stage {
+                PlanNodeExplainStage::Logical => {
+                    let partition = w.partition_by.iter().map(format_expr).collect::<Vec<_>>();
+                    let order = w
+                        .order_by
+                        .iter()
+                        .map(|s| {
+                            let dir = if s.asc { "ASC" } else { "DESC" };
+                            format!("{} {dir}", format_expr(&s.expr))
+                        })
+                        .collect::<Vec<_>>();
+                    let mut over_parts = Vec::new();
+                    if !partition.is_empty() {
+                        over_parts.push(format!("PARTITION BY {}", partition.join(", ")));
+                    }
+                    if !order.is_empty() {
+                        over_parts.push(format!("ORDER BY {}", order.join(", ")));
+                    }
+                    format!(
+                        "{}({}) OVER ({})",
+                        w.name,
+                        args.join(", "),
+                        over_parts.join(" ")
+                    )
+                }
+                PlanNodeExplainStage::Distributed => {
+                    format!("{}({})", w.name, args.join(", "))
+                }
+            }
+        })
+        .collect()
 }
 
 pub(crate) fn format_expr(expr: &TypedExpr) -> String {
@@ -500,15 +595,18 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::{
-        ExplainLevel, explain_plan, explain_plan_checked, format_expr, format_project_item,
+        ExplainLevel, PlanNodeExplainStage, explain_plan, explain_plan_checked, format_expr,
+        format_project_item, format_shared_plan_node_header,
     };
     use crate::sql::analysis::{
-        BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr,
+        BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, SortItem, TypedExpr,
     };
+    use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::plan::{
         ApplyKind, DistributedTopNNode, LogicalAggregateStateMergeNode, LogicalApplyNode,
-        LogicalAssertOneRowNode, LogicalPlanNode, LogicalValuesNode, PlanNodeKind,
+        LogicalAssertOneRowNode, LogicalFilterNode, LogicalPlanNode, LogicalProjectNode,
+        LogicalScanNode, LogicalValuesNode, LogicalWindowNode, PlanNodeKind, WindowExpr,
     };
 
     fn empty_values_for_test() -> LogicalPlanNode {
@@ -520,6 +618,58 @@ mod tests {
             vec![],
             None,
         )
+    }
+
+    fn output_column(id: u32, name: &str, data_type: DataType, nullable: bool) -> OutputColumn {
+        OutputColumn {
+            column_id: ColumnId::new_for_test(id),
+            name: name.to_string(),
+            data_type,
+            nullable,
+            is_internal: false,
+        }
+    }
+
+    fn column_def(name: &str, data_type: DataType, nullable: bool) -> ColumnDef {
+        ColumnDef {
+            name: name.to_string(),
+            data_type,
+            nullable,
+            write_default: None,
+            logical_type: None,
+        }
+    }
+
+    fn test_table_def() -> TableDef {
+        TableDef {
+            name: "t".to_string(),
+            columns: vec![column_def("k", DataType::Int64, false)],
+            iceberg_row_lineage_metadata_columns: vec![],
+            source: ScanSource::StarRocks {
+                db_id: 1,
+                table_id: 2,
+            },
+        }
+    }
+
+    fn column_expr(id: u32, qualifier: Option<&str>, name: &str) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId::new_for_test(id),
+                qualifier: qualifier.map(str::to_string),
+                column: name.to_string(),
+            },
+            data_type: DataType::Int64,
+            nullable: false,
+        }
+    }
+
+    fn int_literal(value: i64) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Int(value)),
+            data_type: DataType::Int64,
+            nullable: false,
+        }
     }
 
     #[test]
@@ -614,6 +764,121 @@ mod tests {
 
         assert!(err.contains("distributed-only"), "{err}");
         assert!(err.contains("TopN"), "{err}");
+    }
+
+    #[test]
+    fn shared_plan_node_header_formats_unified_pass_through_nodes() {
+        let values = PlanNodeKind::Values(LogicalValuesNode {
+            rows: vec![vec![], vec![]],
+            columns: vec![],
+        });
+        let assert = PlanNodeKind::AssertOneRow(LogicalAssertOneRowNode {
+            subquery_text: "select 1".to_string(),
+        });
+
+        assert_eq!(
+            format_shared_plan_node_header(&values, PlanNodeExplainStage::Logical),
+            Some("VALUES (2 rows)".to_string())
+        );
+        assert_eq!(
+            format_shared_plan_node_header(&values, PlanNodeExplainStage::Distributed),
+            Some("VALUES (2 rows)".to_string())
+        );
+        assert_eq!(
+            format_shared_plan_node_header(&assert, PlanNodeExplainStage::Logical),
+            Some("ASSERT ONE ROW".to_string())
+        );
+        assert_eq!(
+            format_shared_plan_node_header(&assert, PlanNodeExplainStage::Distributed),
+            Some("ASSERT NUM ROWS (<= 1)".to_string())
+        );
+    }
+
+    #[test]
+    fn shared_logical_formatter_path_covers_scan_filter_project_and_window() {
+        let scan_columns = vec![output_column(1, "k", DataType::Int64, false)];
+        let scan = LogicalPlanNode::new(
+            PlanNodeKind::Scan(LogicalScanNode {
+                database: "test_db".to_string(),
+                table: test_table_def(),
+                alias: Some("t".to_string()),
+                columns: scan_columns,
+                predicates: vec![],
+                required_columns: None,
+                dict_columns: vec![],
+                variant_columns: vec![],
+                mv_rewritten_from: None,
+            }),
+            vec![],
+            None,
+        );
+        let predicate = TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(column_expr(1, Some("t"), "k")),
+                op: BinOp::Gt,
+                right: Box::new(int_literal(10)),
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        };
+        let filter = LogicalPlanNode::new(
+            PlanNodeKind::Filter(LogicalFilterNode { predicate }),
+            vec![scan],
+            None,
+        );
+        let project = LogicalPlanNode::new(
+            PlanNodeKind::Project(LogicalProjectNode {
+                items: vec![ProjectItem {
+                    expr: column_expr(1, Some("t"), "k"),
+                    output_name: "k".to_string(),
+                    output_column_id: ColumnId::new_for_test(1),
+                }],
+                output_qualifier: None,
+            }),
+            vec![filter],
+            None,
+        );
+        let window = LogicalPlanNode::new(
+            PlanNodeKind::Window(LogicalWindowNode {
+                window_exprs: vec![WindowExpr {
+                    name: "row_number".to_string(),
+                    args: vec![],
+                    distinct: false,
+                    partition_by: vec![column_expr(1, None, "k")],
+                    order_by: vec![SortItem {
+                        expr: column_expr(1, None, "k"),
+                        asc: true,
+                        nulls_first: false,
+                    }],
+                    window_frame: None,
+                    result_type: DataType::Int64,
+                    output_name: "rn".to_string(),
+                    output_column_id: ColumnId::new_for_test(2),
+                    ignore_nulls: false,
+                }],
+                output_columns: vec![
+                    output_column(1, "k", DataType::Int64, false),
+                    output_column(2, "rn", DataType::Int64, false),
+                ],
+            }),
+            vec![project],
+            None,
+        );
+
+        assert_eq!(
+            format_shared_plan_node_header(&window.kind, PlanNodeExplainStage::Logical),
+            Some("WINDOW [row_number() OVER (PARTITION BY k ORDER BY k ASC)]".to_string())
+        );
+        assert_eq!(
+            explain_plan(&window, ExplainLevel::Normal),
+            vec![
+                "WINDOW [row_number() OVER (PARTITION BY k ORDER BY k ASC)]".to_string(),
+                "  PROJECT [t.k AS k]".to_string(),
+                "    FILTER".to_string(),
+                "      predicate: t.k > 10".to_string(),
+                "      0:SCAN test_db.t (alias=t)".to_string(),
+            ]
+        );
     }
 
     #[test]
