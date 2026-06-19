@@ -14,8 +14,15 @@
 use std::collections::BTreeSet;
 
 use crate::sql::analysis::{BinOp, ExprKind, TypedExpr};
+use crate::sql::optimizer::operator::{Operator, ScanOp};
+use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
-use crate::sql::planner::plan::{LogicalPlanNode, LogicalScanNode, PlanNodeKind};
+use crate::sql::optimizer::scalar;
+use crate::sql::optimizer::scalar::ScalarArena;
+use crate::sql::optimizer::scalar_bridge::{
+    materialize_aggregate_calls, materialize_exprs, materialize_project_items,
+    materialize_sort_keys,
+};
 
 use super::context::{DictionaryRewriteContext, ScanColumnKey};
 use super::expr::{
@@ -23,7 +30,7 @@ use super::expr::{
 };
 
 pub(crate) fn collect(
-    plan: &LogicalPlanNode,
+    expr: &OptExpr,
     rewrite_ctx: &mut RewriteContext,
 ) -> Result<DictionaryRewriteContext, String> {
     let mut dict_ctx = DictionaryRewriteContext::default();
@@ -45,7 +52,11 @@ pub(crate) fn collect(
     // (where it is not). Persisting the union across invocations is what
     // keeps a blocklisted column blocked on the bare-scan re-fire.
     let mut blocklist: BTreeSet<String> = BTreeSet::new();
-    collect_blocklist(plan, &mut blocklist);
+    {
+        let arena_rc = rewrite_ctx.scalar_arena();
+        let arena = arena_rc.borrow();
+        collect_blocklist(expr, &arena, &mut blocklist);
+    }
     rewrite_ctx.extend_dict_rewrite_blocklist(blocklist);
     let blocklist = rewrite_ctx.dict_rewrite_blocklist().clone();
 
@@ -54,7 +65,7 @@ pub(crate) fn collect(
         .dictionary_provider()
         .expect("provider presence checked above")
         .clone();
-    walk(plan, provider.as_ref(), &blocklist, &mut dict_ctx)?;
+    walk(expr, provider.as_ref(), &blocklist, &mut dict_ctx)?;
     Ok(dict_ctx)
 }
 
@@ -62,31 +73,38 @@ pub(crate) fn collect(
 /// positions the rewriter does not retarget to the dict slot. Mirrors the
 /// structure of `walk`; per-node behavior matches the rewriter's
 /// retargeting capability.
-fn collect_blocklist(plan: &LogicalPlanNode, out: &mut BTreeSet<String>) {
-    match &plan.kind {
-        PlanNodeKind::Scan(_) => {}
-        PlanNodeKind::Filter(node) => {
+fn collect_blocklist(expr: &OptExpr, arena: &ScalarArena, out: &mut BTreeSet<String>) {
+    match &expr.op {
+        Operator::LogicalScan(_) => {}
+        Operator::LogicalFilter(node) => {
             // A filter predicate is never retargeted — even a bare
             // `s = 'x'` evaluates against the string value.
-            collect_all_columns(&node.predicate, out);
-            collect_blocklist(plan.unary_input(), out);
+            let predicate = scalar::materialize(arena, node.predicate);
+            collect_all_columns(&predicate, out);
+            collect_blocklist(expr.unary_input(), arena, out);
         }
-        PlanNodeKind::Project(node) => {
+        Operator::LogicalProject(node) => {
             // Bare ColumnRef items merely propagate the dict slot (safe);
             // any compound item consumes the string.
-            for item in &node.items {
+            for item in materialize_project_items(arena, &node.items) {
                 collect_nested_columns(&item.expr, out);
             }
-            collect_blocklist(plan.unary_input(), out);
+            collect_blocklist(expr.unary_input(), arena, out);
         }
-        PlanNodeKind::Aggregate(node) => {
+        Operator::LogicalAggregate(node) => {
             // Bare ColumnRef group keys are safe (rewritten to the dict
             // slot + post-aggregate Decode); compound group keys consume
             // the string.
-            for expr in &node.group_by {
-                collect_nested_columns(expr, out);
+            for group_expr in materialize_exprs(arena, &node.group_by) {
+                collect_nested_columns(&group_expr, out);
             }
-            for agg in &node.aggregates {
+            let aggregates = materialize_aggregate_calls(
+                arena,
+                &node.aggregates,
+                node.group_by.len(),
+                &node.output_columns,
+            );
+            for agg in &aggregates {
                 let lower = agg.name.to_ascii_lowercase();
                 if DICT_AGG_FUNCTIONS.iter().any(|f| *f == lower) {
                     // Allowlisted aggregate: a bare ColumnRef arg may
@@ -109,33 +127,40 @@ fn collect_blocklist(plan: &LogicalPlanNode, out: &mut BTreeSet<String>) {
                     }
                 }
             }
-            collect_blocklist(plan.unary_input(), out);
+            collect_blocklist(expr.unary_input(), arena, out);
         }
-        PlanNodeKind::Sort(node) => {
+        Operator::LogicalSort(node) => {
             // Bare ColumnRef sort keys are safe — the rewriter decodes
             // non-order-preserving ones itself. Compound keys consume the
             // string.
-            for item in &node.items {
+            for item in materialize_sort_keys(arena, &node.items) {
                 collect_nested_columns(&item.expr, out);
             }
-            collect_blocklist(plan.unary_input(), out);
+            collect_blocklist(expr.unary_input(), arena, out);
         }
-        PlanNodeKind::Join(node) => {
-            if let Some(cond) = node.condition.as_ref() {
+        Operator::LogicalTopN(node) => {
+            for item in materialize_sort_keys(arena, &node.items) {
+                collect_nested_columns(&item.expr, out);
+            }
+            collect_blocklist(expr.unary_input(), arena, out);
+        }
+        Operator::LogicalJoin(node) => {
+            if let Some(cond) = node.condition {
                 // Spare equi-join keys the rewriter would dict-join;
                 // collect every other column the condition consumes.
-                collect_join_condition(cond, out);
+                let cond = scalar::materialize(arena, cond);
+                collect_join_condition(&cond, out);
             }
-            for child in &plan.children {
-                collect_blocklist(child, out);
+            for child in &expr.children {
+                collect_blocklist(child, arena, out);
             }
         }
-        PlanNodeKind::ImvDelta(_) | PlanNodeKind::ImvVersion(_) => {
+        Operator::LogicalImvDelta(_) | Operator::LogicalImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
         }
         _ => {
-            for child in &plan.children {
-                collect_blocklist(child, out);
+            for child in &expr.children {
+                collect_blocklist(child, arena, out);
             }
         }
     }
@@ -176,36 +201,36 @@ fn collect_join_condition(expr: &TypedExpr, out: &mut BTreeSet<String>) {
 }
 
 fn walk(
-    plan: &LogicalPlanNode,
+    expr: &OptExpr,
     provider: &dyn crate::sql::optimizer::rewrite::context::QueryDictionaryProvider,
     blocklist: &BTreeSet<String>,
     dict_ctx: &mut DictionaryRewriteContext,
 ) -> Result<(), String> {
-    match &plan.kind {
-        PlanNodeKind::Scan(scan) => {
+    match &expr.op {
+        Operator::LogicalScan(scan) => {
             visit_scan(scan, provider, blocklist, dict_ctx)?;
         }
-        PlanNodeKind::Join(_) => {
+        Operator::LogicalJoin(_) => {
             // TODO(task-8): joins with matching dict snapshots on both
             // sides could keep dict ids through the equi-join; today
             // the rewriter inserts a Decode boundary instead.
-            for child in &plan.children {
+            for child in &expr.children {
                 walk(child, provider, blocklist, dict_ctx)?;
             }
         }
-        PlanNodeKind::Union(_) => {
+        Operator::LogicalUnion(_) => {
             // TODO(task-8): UNION ALL with matching dicts on every leg
             // can propagate dict columns upward; for Task 7 we treat
             // every set op as a decode boundary.
-            for child in &plan.children {
+            for child in &expr.children {
                 walk(child, provider, blocklist, dict_ctx)?;
             }
         }
-        PlanNodeKind::ImvDelta(_) | PlanNodeKind::ImvVersion(_) => {
+        Operator::LogicalImvDelta(_) | Operator::LogicalImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
         }
         _ => {
-            for child in &plan.children {
+            for child in &expr.children {
                 walk(child, provider, blocklist, dict_ctx)?;
             }
         }
@@ -214,7 +239,7 @@ fn walk(
 }
 
 fn visit_scan(
-    scan: &LogicalScanNode,
+    scan: &ScanOp,
     provider: &dyn crate::sql::optimizer::rewrite::context::QueryDictionaryProvider,
     blocklist: &BTreeSet<String>,
     dict_ctx: &mut DictionaryRewriteContext,
