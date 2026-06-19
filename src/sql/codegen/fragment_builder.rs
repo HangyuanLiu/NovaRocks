@@ -431,7 +431,7 @@ impl PlanFragmentBuilder {
                 mv_refresh_ctx,
             );
         }
-        let dp = crate::sql::codegen::ir::build_distributed_plan(plan)?;
+        let dp = crate::sql::planner::build_distributed_plan(plan)?;
         crate::sql::codegen::ir::lower_distributed_plan(&dp, catalog, connectors, mv_refresh_ctx)
     }
 

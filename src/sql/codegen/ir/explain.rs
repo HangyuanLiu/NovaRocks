@@ -12,18 +12,19 @@ use crate::sql::optimizer::estimate::arith::MAX_ROW_COUNT;
 use crate::sql::optimizer::operator::{AggMode, JoinDistribution, TopNPhase};
 use crate::sql::optimizer::physical_plan::JoinExecutionDistribution;
 use crate::sql::optimizer::runtime_filter_pass::{RuntimeFilterDesc, RuntimeFilterProbe};
-use crate::sql::planner::plan::ScanVariantColumn;
-
-use super::fragment::{DistributedPlan, PlanFragment};
-use super::kind::{
-    DistributedAssertOneRowNode, DistributedDecodeNode, DistributedExchangeNode,
-    DistributedFilterNode, DistributedGenerateSeriesNode, DistributedHashAggregateNode,
-    DistributedHashJoinNode, DistributedNestLoopJoinNode, DistributedProjectNode,
-    DistributedRepeatNode, DistributedScanNode, DistributedSetOpNode, DistributedSortNode,
-    DistributedTableFunctionNode, DistributedTopNNode, DistributedValuesNode,
-    DistributedWindowNode, ExchangeFlavor, SetOpKind,
+use crate::sql::planner::plan::{
+    DistributedExchangeNode, DistributedHashAggregateNode, DistributedHashJoinNode,
+    DistributedNestLoopJoinNode, DistributedSetOpNode, DistributedTopNNode, ExchangeFlavor,
+    PlanAssertOneRowNode as DistributedAssertOneRowNode, PlanDecodeNode as DistributedDecodeNode,
+    PlanFilterNode as DistributedFilterNode,
+    PlanGenerateSeriesNode as DistributedGenerateSeriesNode, PlanNodeKind,
+    PlanProjectNode as DistributedProjectNode, PlanRepeatNode as DistributedRepeatNode,
+    PlanScanNode as DistributedScanNode, PlanSetOpKind as SetOpKind,
+    PlanSortNode as DistributedSortNode, PlanTableFunctionNode as DistributedTableFunctionNode,
+    PlanValuesNode as DistributedValuesNode, PlanWindowNode as DistributedWindowNode,
+    ScanVariantColumn,
 };
-use super::node::{DistributedPlanNode, PlanNodeKind, PlanNodeStats};
+use crate::sql::planner::{DistributedPlan, DistributedPlanNode, PlanFragment, PlanNodeStats};
 
 pub(crate) fn explain_distributed_plan(dp: &DistributedPlan, level: ExplainLevel) -> Vec<String> {
     explain_distributed_plan_inner(dp, level, None)

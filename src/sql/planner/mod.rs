@@ -1,10 +1,20 @@
-//! Logical Planner — converts [`ResolvedQuery`] into [`LogicalPlanNode`].
+//! Planner — converts analyzed SQL into logical plans and distributed Bridge 2 IR.
 //!
 //! This is a structural transformation that builds a relational algebra tree
-//! from the analyzed query IR.  A future optimizer would rewrite this tree
-//! before it reaches the Thrift emitter.
+//! from the analyzed query IR. It also owns Bridge 2, which materializes
+//! physical optimizer plans into planner-side distributed plan fragments before
+//! codegen lowers them to Thrift.
 
+mod distributed_build;
+mod distributed_fragment;
+mod distributed_node;
 pub(crate) mod plan;
+
+pub(crate) use distributed_build::build_distributed_plan;
+pub(crate) use distributed_fragment::{
+    DataPartition, DataSink, DistributedPlan, PartitionKind, PlanFragment,
+};
+pub(crate) use distributed_node::{DistributedPlanNode, PlanNodeKind, PlanNodeStats};
 
 use arrow::datatypes::DataType;
 
@@ -27,6 +37,21 @@ fn expr_column_id(expr: &TypedExpr, name: &str, factory: &mut ColumnRefFactory) 
             expr.data_type.clone(),
             expr.nullable,
         )
+    }
+}
+
+#[cfg(test)]
+mod bridge2_export_tests {
+    use super::{DistributedPlan, DistributedPlanNode, build_distributed_plan};
+    use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
+
+    #[test]
+    fn planner_exports_bridge2_distributed_plan_api() {
+        fn accepts_builder(_: fn(&PhysicalPlanNode) -> Result<DistributedPlan, String>) {}
+        fn accepts_node(_: Option<DistributedPlanNode>) {}
+
+        accepts_builder(build_distributed_plan);
+        accepts_node(None);
     }
 }
 

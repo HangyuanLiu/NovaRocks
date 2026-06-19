@@ -3232,10 +3232,9 @@ fn explain_analyze_query(
 ) -> Result<QueryResult, String> {
     use crate::runtime::profile::Profiler;
     use crate::runtime::profile_correlate::collect_actuals_by_plan_node_id_multi;
-    use crate::sql::codegen::ir::{
-        build_distributed_plan, explain_distributed_plan_analyze, lower_distributed_plan,
-    };
+    use crate::sql::codegen::ir::{explain_distributed_plan_analyze, lower_distributed_plan};
     use crate::sql::explain::ExplainLevel;
+    use crate::sql::planner::build_distributed_plan;
 
     let t_plan = Instant::now();
     let (resolved, cte_registry, mut factory) =
@@ -3343,8 +3342,9 @@ fn explain_query(
     level: crate::sql::explain::ExplainLevel,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
-    use crate::sql::codegen::ir::{build_distributed_plan, explain_distributed_plan};
+    use crate::sql::codegen::ir::explain_distributed_plan;
     use crate::sql::explain::ExplainLevel;
+    use crate::sql::planner::build_distributed_plan;
 
     let (resolved, cte_registry, mut factory) =
         crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;

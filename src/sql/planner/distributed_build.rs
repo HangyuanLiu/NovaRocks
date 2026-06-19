@@ -1,10 +1,15 @@
+//! Bridge 2: PhysicalPlanNode/PhysicalOperator to DistributedPlanNode.
+//!
+//! This bridge materializes optimizer scalars into typed plan nodes and splits
+//! the tree into distributed fragments.
+
 use std::collections::HashMap;
 
 use crate::partitions;
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{ExprKind, TypedExpr};
 use crate::sql::codegen::helpers::{group_win_exprs_by_sig, split_and_conjuncts_typed};
-use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentStreamKind};
+use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind};
 use crate::sql::optimizer::operator::{
     CTEAnchorOp, CTEConsumeOp, CTEProduceOp, LimitOp, Operator, PhysicalDistributionOp, TopNOp,
     TopNPhase, UnionOp,
@@ -16,18 +21,22 @@ use crate::sql::optimizer::scalar_bridge::{
     materialize_aggregate_calls, materialize_exprs, materialize_project_items,
     materialize_sort_keys, materialize_window_exprs,
 };
-
-use super::FragmentId;
-use super::fragment::{DataPartition, DataSink, DistributedPlan, PartitionKind, PlanFragment};
-use super::kind::{
-    DistributedAssertOneRowNode, DistributedDecodeNode, DistributedExchangeNode,
-    DistributedFilterNode, DistributedGenerateSeriesNode, DistributedHashAggregateNode,
-    DistributedHashJoinEqCondition, DistributedHashJoinNode, DistributedNestLoopJoinNode,
-    DistributedProjectNode, DistributedRepeatNode, DistributedScanNode, DistributedSetOpNode,
-    DistributedSortNode, DistributedTableFunctionNode, DistributedTopNNode, DistributedValuesNode,
-    DistributedWindowNode, ExchangeFlavor, SetOpKind,
+use crate::sql::planner::plan::{
+    DistributedExchangeNode, DistributedHashAggregateNode, DistributedHashJoinEqCondition,
+    DistributedHashJoinNode, DistributedNestLoopJoinNode, DistributedSetOpNode,
+    DistributedTopNNode, ExchangeFlavor, PlanAssertOneRowNode as DistributedAssertOneRowNode,
+    PlanDecodeNode as DistributedDecodeNode, PlanFilterNode as DistributedFilterNode,
+    PlanGenerateSeriesNode as DistributedGenerateSeriesNode,
+    PlanProjectNode as DistributedProjectNode, PlanRepeatNode as DistributedRepeatNode,
+    PlanScanNode as DistributedScanNode, PlanSetOpKind as SetOpKind,
+    PlanSortNode as DistributedSortNode, PlanTableFunctionNode as DistributedTableFunctionNode,
+    PlanValuesNode as DistributedValuesNode, PlanWindowNode as DistributedWindowNode,
 };
-use super::node::{DistributedPlanNode, PlanNodeKind, PlanNodeStats};
+
+use super::distributed_fragment::{
+    DataPartition, DataSink, DistributedPlan, PartitionKind, PlanFragment,
+};
+use super::distributed_node::{DistributedPlanNode, PlanNodeKind, PlanNodeStats};
 
 struct DistributedPlanBuilder<'a> {
     scalars: &'a ScalarArena,
@@ -1294,7 +1303,6 @@ mod tests {
         BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, SortItem, TypedExpr,
     };
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
-    use crate::sql::codegen::ir::PlanNodeKind;
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
         AssertOneRowOp, FilterOp, Operator, ProjectOp, ScanOp, SortOp, WindowOp,
@@ -1307,7 +1315,7 @@ mod tests {
         intern_project_items, intern_sort_items, intern_window_exprs,
     };
     use crate::sql::optimizer::statistics::{ColumnStatistic, Statistics};
-    use crate::sql::planner::plan::WindowExpr;
+    use crate::sql::planner::plan::{PlanNodeKind, WindowExpr};
 
     #[test]
     fn build_distributed_plan_scan_project_shapes_one_fragment() {

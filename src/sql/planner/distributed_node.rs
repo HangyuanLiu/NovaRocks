@@ -1,10 +1,9 @@
 use std::collections::HashMap;
 
+use crate::sql::codegen::FragmentId;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence, Statistics};
 pub(crate) use crate::sql::planner::plan::PlanNodeKind;
-
-use super::FragmentId;
 
 /// Self-contained copy of the estimated stats this node carries, so EXPLAIN /
 /// ANALYZE never reach back into `PhysicalPlanNode`.
@@ -49,9 +48,9 @@ pub(crate) struct DistributedPlanNode {
 
 #[cfg(test)]
 mod tests {
-    use super::super::kind::DistributedValuesNode;
     use super::*;
     use crate::sql::optimizer::statistics::{ColumnStatistic, Statistics};
+    use crate::sql::planner::plan::PlanValuesNode as DistributedValuesNode;
 
     #[test]
     fn plan_node_stats_copies_statistics() {

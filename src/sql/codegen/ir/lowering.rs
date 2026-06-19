@@ -47,7 +47,7 @@ use crate::sql::planner::plan::{AggregateCall, WindowExpr};
 use crate::types;
 
 pub(crate) fn lower_distributed_plan(
-    dp: &super::fragment::DistributedPlan,
+    dp: &crate::sql::planner::DistributedPlan,
     catalog: &dyn CatalogProvider,
     connectors: &crate::connector::ConnectorRegistry,
     mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
@@ -145,8 +145,8 @@ pub(crate) fn lower_distributed_plan(
 }
 
 fn validate_distributed_plan(
-    dp: &super::fragment::DistributedPlan,
-) -> Result<Vec<&super::fragment::PlanFragment>, String> {
+    dp: &crate::sql::planner::DistributedPlan,
+) -> Result<Vec<&crate::sql::planner::PlanFragment>, String> {
     if dp.fragments.is_empty() {
         return Err("lower_distributed_plan requires at least one fragment".to_string());
     }
@@ -177,7 +177,7 @@ fn validate_distributed_plan(
         validate_node_fragment_ownership(fragment.fragment_id, &fragment.root)?;
 
         if fragment.fragment_id == dp.root_fragment_id {
-            if !matches!(fragment.sink, super::fragment::DataSink::Result) {
+            if !matches!(fragment.sink, crate::sql::planner::DataSink::Result) {
                 return Err(format!(
                     "lower_distributed_plan root fragment id={} must use result sink",
                     fragment.fragment_id
@@ -185,7 +185,7 @@ fn validate_distributed_plan(
             }
             ensure_unpartitioned("root output_partition", &fragment.output_partition)?;
         } else {
-            if !matches!(fragment.sink, super::fragment::DataSink::Noop) {
+            if !matches!(fragment.sink, crate::sql::planner::DataSink::Noop) {
                 return Err(format!(
                     "lower_distributed_plan non-root fragment id={} must use noop sink",
                     fragment.fragment_id
@@ -214,7 +214,7 @@ fn validate_distributed_plan(
 
 fn validate_node_fragment_ownership(
     fragment_id: FragmentId,
-    node: &super::node::DistributedPlanNode,
+    node: &crate::sql::planner::DistributedPlanNode,
 ) -> Result<(), String> {
     if node.fragment_id != fragment_id {
         return Err(format!(
@@ -229,8 +229,8 @@ fn validate_node_fragment_ownership(
 }
 
 fn topological_fragment_order(
-    dp: &super::fragment::DistributedPlan,
-    fragments_by_id: &BTreeMap<FragmentId, &super::fragment::PlanFragment>,
+    dp: &crate::sql::planner::DistributedPlan,
+    fragments_by_id: &BTreeMap<FragmentId, &crate::sql::planner::PlanFragment>,
     input_index_by_id: &BTreeMap<FragmentId, usize>,
 ) -> Result<Vec<FragmentId>, String> {
     let mut adjacency: BTreeMap<FragmentId, Vec<FragmentId>> = fragments_by_id
@@ -329,7 +329,7 @@ fn topological_fragment_order(
 
 fn validate_non_root_connectivity(
     root_fragment_id: FragmentId,
-    fragments_by_id: &BTreeMap<FragmentId, &super::fragment::PlanFragment>,
+    fragments_by_id: &BTreeMap<FragmentId, &crate::sql::planner::PlanFragment>,
     adjacency: &BTreeMap<FragmentId, Vec<FragmentId>>,
     reverse_adjacency: &BTreeMap<FragmentId, Vec<FragmentId>>,
 ) -> Result<(), String> {
@@ -377,7 +377,7 @@ fn validate_non_root_connectivity(
 }
 
 fn validate_edge_target_node(
-    target_fragment: &super::fragment::PlanFragment,
+    target_fragment: &crate::sql::planner::PlanFragment,
     edge: &crate::sql::codegen::FragmentEdge,
 ) -> Result<(), String> {
     let target_node = find_node_by_id(&target_fragment.root, edge.target_exchange_node_id)
@@ -388,7 +388,7 @@ fn validate_edge_target_node(
         )
         })?;
 
-    let super::node::PlanNodeKind::Exchange(exchange) = &target_node.kind else {
+    let crate::sql::planner::PlanNodeKind::Exchange(exchange) = &target_node.kind else {
         return Err(format!(
             "lower_distributed_plan edge target_exchange_node_id={} in target fragment id={} must target Exchange",
             edge.target_exchange_node_id, target_fragment.fragment_id
@@ -457,9 +457,9 @@ fn validate_edge_target_node(
 }
 
 fn find_node_by_id(
-    node: &super::node::DistributedPlanNode,
+    node: &crate::sql::planner::DistributedPlanNode,
     node_id: i32,
-) -> Option<&super::node::DistributedPlanNode> {
+) -> Option<&crate::sql::planner::DistributedPlanNode> {
     if node.node_id == node_id {
         return Some(node);
     }
@@ -470,11 +470,11 @@ fn find_node_by_id(
 
 fn ensure_unpartitioned(
     label: &str,
-    partition: &super::fragment::DataPartition,
+    partition: &crate::sql::planner::DataPartition,
 ) -> Result<(), String> {
     if !matches!(
         partition.kind,
-        super::fragment::PartitionKind::Unpartitioned
+        crate::sql::planner::PartitionKind::Unpartitioned
     ) || !partition.exprs.is_empty()
     {
         return Err(format!(
@@ -485,10 +485,10 @@ fn ensure_unpartitioned(
 }
 
 fn lower_fragment_edges(
-    dp: &super::fragment::DistributedPlan,
+    dp: &crate::sql::planner::DistributedPlan,
     state: &mut OwnedLoweringState<'_>,
 ) -> Result<Vec<crate::sql::codegen::FragmentEdge>, String> {
-    let fragments_by_id: BTreeMap<FragmentId, &super::fragment::PlanFragment> = dp
+    let fragments_by_id: BTreeMap<FragmentId, &crate::sql::planner::PlanFragment> = dp
         .fragments
         .iter()
         .map(|fragment| (fragment.fragment_id, fragment))
@@ -571,9 +571,9 @@ fn lower_exchange_output_partition(
 }
 
 fn edge_boundary_schemas(
-    dp: &super::fragment::DistributedPlan,
+    dp: &crate::sql::planner::DistributedPlan,
 ) -> Result<Vec<BoundarySchemaReport>, String> {
-    let fragments_by_id: BTreeMap<FragmentId, &super::fragment::PlanFragment> = dp
+    let fragments_by_id: BTreeMap<FragmentId, &crate::sql::planner::PlanFragment> = dp
         .fragments
         .iter()
         .map(|fragment| (fragment.fragment_id, fragment))
@@ -624,7 +624,7 @@ fn edge_boundary_schemas(
 }
 
 fn target_exchange_for_edge<'a>(
-    fragments_by_id: &'a BTreeMap<FragmentId, &super::fragment::PlanFragment>,
+    fragments_by_id: &'a BTreeMap<FragmentId, &crate::sql::planner::PlanFragment>,
     edge: &crate::sql::codegen::FragmentEdge,
 ) -> Result<&'a super::kind::DistributedExchangeNode, String> {
     let target_fragment = fragments_by_id
@@ -642,7 +642,7 @@ fn target_exchange_for_edge<'a>(
                 edge.target_exchange_node_id, target_fragment.fragment_id
             )
         })?;
-    let super::node::PlanNodeKind::Exchange(exchange) = &target_node.kind else {
+    let crate::sql::planner::PlanNodeKind::Exchange(exchange) = &target_node.kind else {
         return Err(format!(
             "lower_distributed_plan edge target_exchange_node_id={} in target fragment id={} must target Exchange",
             edge.target_exchange_node_id, target_fragment.fragment_id
@@ -806,8 +806,8 @@ pub(crate) struct OwnedLoweringState<'a> {
     rf_build_side_filters: HashMap<FragmentId, Vec<i32>>,
     rf_probe_side_filters: HashMap<FragmentId, Vec<(i32, i32)>>,
     lowered_fragment_outputs: HashMap<FragmentId, LoweredFragmentOutput>,
-    fragments_by_id: HashMap<FragmentId, super::fragment::PlanFragment>,
-    lowered_fragments: Vec<(super::fragment::PlanFragment, LoweredDistributedNode)>,
+    fragments_by_id: HashMap<FragmentId, crate::sql::planner::PlanFragment>,
+    lowered_fragments: Vec<(crate::sql::planner::PlanFragment, LoweredDistributedNode)>,
     lowering_fragments: BTreeSet<FragmentId>,
 }
 
@@ -825,7 +825,7 @@ impl<'a> OwnedLoweringState<'a> {
         connectors: &'a crate::connector::ConnectorRegistry,
         mv_refresh_ctx: Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
         _root_fragment_id: FragmentId,
-        fragments: &[super::fragment::PlanFragment],
+        fragments: &[crate::sql::planner::PlanFragment],
     ) -> Self {
         Self {
             connectors,
@@ -1013,55 +1013,67 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_node(
         &mut self,
-        node: &super::node::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedPlanNode,
     ) -> Result<LoweredDistributedNode, String> {
         let mut lowered = match &node.kind {
-            super::node::PlanNodeKind::Scan(scan) => self.lower_scan_node(node, scan)?,
-            super::node::PlanNodeKind::Project(project) => {
+            crate::sql::planner::PlanNodeKind::Scan(scan) => self.lower_scan_node(node, scan)?,
+            crate::sql::planner::PlanNodeKind::Project(project) => {
                 self.lower_project_node(node, project)?
             }
-            super::node::PlanNodeKind::Filter(filter) => self.lower_filter_node(node, filter)?,
-            super::node::PlanNodeKind::Sort(sort) => self.lower_sort_node(node, sort)?,
-            super::node::PlanNodeKind::TopN(topn) => self.lower_topn_node(node, topn)?,
-            super::node::PlanNodeKind::Exchange(exchange) => {
+            crate::sql::planner::PlanNodeKind::Filter(filter) => {
+                self.lower_filter_node(node, filter)?
+            }
+            crate::sql::planner::PlanNodeKind::Sort(sort) => self.lower_sort_node(node, sort)?,
+            crate::sql::planner::PlanNodeKind::TopN(topn) => self.lower_topn_node(node, topn)?,
+            crate::sql::planner::PlanNodeKind::Exchange(exchange) => {
                 self.lower_exchange_node(node, exchange)?
             }
-            super::node::PlanNodeKind::HashAggregate(agg) => {
+            crate::sql::planner::PlanNodeKind::HashAggregate(agg) => {
                 self.lower_hash_aggregate_node(node, agg.as_ref())?
             }
-            super::node::PlanNodeKind::HashJoin(hash_join) => {
+            crate::sql::planner::PlanNodeKind::HashJoin(hash_join) => {
                 self.lower_hash_join_node(node, hash_join.as_ref())?
             }
-            super::node::PlanNodeKind::NestLoopJoin(nest_loop) => {
+            crate::sql::planner::PlanNodeKind::NestLoopJoin(nest_loop) => {
                 self.lower_nest_loop_join_node(node, nest_loop)?
             }
-            super::node::PlanNodeKind::Values(values) => self.lower_values_node(node, values)?,
-            super::node::PlanNodeKind::AssertOneRow(assert_one_row) => {
+            crate::sql::planner::PlanNodeKind::Values(values) => {
+                self.lower_values_node(node, values)?
+            }
+            crate::sql::planner::PlanNodeKind::AssertOneRow(assert_one_row) => {
                 self.lower_assert_one_row_node(node, assert_one_row)?
             }
-            super::node::PlanNodeKind::Decode(decode) => self.lower_decode_node(node, decode)?,
-            super::node::PlanNodeKind::Repeat(repeat) => self.lower_repeat_node(node, repeat)?,
-            super::node::PlanNodeKind::SetOp(set_op) => self.lower_set_op_node(node, set_op)?,
-            super::node::PlanNodeKind::Window(window) => self.lower_window_node(node, window)?,
-            super::node::PlanNodeKind::GenerateSeries(generate_series) => {
+            crate::sql::planner::PlanNodeKind::Decode(decode) => {
+                self.lower_decode_node(node, decode)?
+            }
+            crate::sql::planner::PlanNodeKind::Repeat(repeat) => {
+                self.lower_repeat_node(node, repeat)?
+            }
+            crate::sql::planner::PlanNodeKind::SetOp(set_op) => {
+                self.lower_set_op_node(node, set_op)?
+            }
+            crate::sql::planner::PlanNodeKind::Window(window) => {
+                self.lower_window_node(node, window)?
+            }
+            crate::sql::planner::PlanNodeKind::GenerateSeries(generate_series) => {
                 self.lower_generate_series_node(node, generate_series)?
             }
-            super::node::PlanNodeKind::TableFunction(table_function) => {
+            crate::sql::planner::PlanNodeKind::TableFunction(table_function) => {
                 self.lower_table_function_node(node, table_function)?
             }
-            super::node::PlanNodeKind::Limit(_)
-            | super::node::PlanNodeKind::Aggregate(_)
-            | super::node::PlanNodeKind::Join(_)
-            | super::node::PlanNodeKind::Union(_)
-            | super::node::PlanNodeKind::Intersect(_)
-            | super::node::PlanNodeKind::Except(_)
-            | super::node::PlanNodeKind::CTEAnchor(_)
-            | super::node::PlanNodeKind::CTEProduce(_)
-            | super::node::PlanNodeKind::CTEConsume(_)
-            | super::node::PlanNodeKind::AggregateStateMerge(_)
-            | super::node::PlanNodeKind::Apply(_)
-            | super::node::PlanNodeKind::ImvDelta(_)
-            | super::node::PlanNodeKind::ImvVersion(_) => {
+            crate::sql::planner::PlanNodeKind::Limit(_)
+            | crate::sql::planner::PlanNodeKind::Aggregate(_)
+            | crate::sql::planner::PlanNodeKind::Join(_)
+            | crate::sql::planner::PlanNodeKind::Union(_)
+            | crate::sql::planner::PlanNodeKind::Intersect(_)
+            | crate::sql::planner::PlanNodeKind::Except(_)
+            | crate::sql::planner::PlanNodeKind::CTEAnchor(_)
+            | crate::sql::planner::PlanNodeKind::CTEProduce(_)
+            | crate::sql::planner::PlanNodeKind::CTEConsume(_)
+            | crate::sql::planner::PlanNodeKind::AggregateStateMerge(_)
+            | crate::sql::planner::PlanNodeKind::Apply(_)
+            | crate::sql::planner::PlanNodeKind::ImvDelta(_)
+            | crate::sql::planner::PlanNodeKind::ImvVersion(_) => {
                 return Err(format!(
                     "logical plan node {} leaked into distributed lowering",
                     node.kind.variant_name()
@@ -1077,7 +1089,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_scan_node(
         &mut self,
-        node: &super::node::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedPlanNode,
         scan: &super::kind::DistributedScanNode,
     ) -> Result<LoweredDistributedNode, String> {
         if !node.children.is_empty() {
@@ -1100,7 +1112,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_project_node(
         &mut self,
-        node: &super::node::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedPlanNode,
         project: &super::kind::DistributedProjectNode,
     ) -> Result<LoweredDistributedNode, String> {
         if node.children.len() != 1 {
@@ -1127,7 +1139,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_filter_node(
         &mut self,
-        node: &super::node::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedPlanNode,
         filter: &super::kind::DistributedFilterNode,
     ) -> Result<LoweredDistributedNode, String> {
         if node.children.len() != 1 {
@@ -1176,7 +1188,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_sort_node(
         &mut self,
-        node: &super::node::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedPlanNode,
         sort: &super::kind::DistributedSortNode,
     ) -> Result<LoweredDistributedNode, String> {
         if node.children.len() != 1 {
@@ -1208,7 +1220,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_topn_node(
         &mut self,
-        node: &super::node::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedPlanNode,
         topn: &super::kind::DistributedTopNNode,
     ) -> Result<LoweredDistributedNode, String> {
         if node.children.len() != 1 {
@@ -1234,7 +1246,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_exchange_node(
         &mut self,
-        node: &super::node::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedPlanNode,
         exchange: &super::kind::DistributedExchangeNode,
     ) -> Result<LoweredDistributedNode, String> {
         if !node.children.is_empty() {
@@ -1339,7 +1351,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_hash_aggregate_node(
         &mut self,
-        node: &super::node::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedPlanNode,
         agg: &super::kind::DistributedHashAggregateNode,
     ) -> Result<LoweredDistributedNode, String> {
         if node.children.len() != 1 {
@@ -1366,7 +1378,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_hash_join_node(
         &mut self,
-        node: &super::node::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedPlanNode,
         hash_join: &super::kind::DistributedHashJoinNode,
     ) -> Result<LoweredDistributedNode, String> {
         let (left_node, right_node) = binary_children(node, "HashJoin")?;
@@ -1408,7 +1420,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_nest_loop_join_node(
         &mut self,
-        node: &super::node::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedPlanNode,
         nest_loop: &super::kind::DistributedNestLoopJoinNode,
     ) -> Result<LoweredDistributedNode, String> {
         let (left_node, right_node) = binary_children(node, "NestLoopJoin")?;
@@ -1448,7 +1460,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_values_node(
         &mut self,
-        node: &super::node::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedPlanNode,
         values: &super::kind::DistributedValuesNode,
     ) -> Result<LoweredDistributedNode, String> {
         if !node.children.is_empty() {
@@ -1471,7 +1483,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_assert_one_row_node(
         &mut self,
-        node: &super::node::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedPlanNode,
         assert_one_row: &super::kind::DistributedAssertOneRowNode,
     ) -> Result<LoweredDistributedNode, String> {
         if node.children.len() != 1 {
@@ -1497,7 +1509,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_decode_node(
         &mut self,
-        node: &super::node::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedPlanNode,
         decode: &super::kind::DistributedDecodeNode,
     ) -> Result<LoweredDistributedNode, String> {
         if node.children.len() != 1 {
@@ -1524,7 +1536,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_repeat_node(
         &mut self,
-        node: &super::node::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedPlanNode,
         repeat: &super::kind::DistributedRepeatNode,
     ) -> Result<LoweredDistributedNode, String> {
         if node.children.len() != 1 {
@@ -1560,7 +1572,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_set_op_node(
         &mut self,
-        node: &super::node::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedPlanNode,
         set_op: &super::kind::DistributedSetOpNode,
     ) -> Result<LoweredDistributedNode, String> {
         if node.children.is_empty() {
@@ -1604,7 +1616,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_window_node(
         &mut self,
-        node: &super::node::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedPlanNode,
         window: &super::kind::DistributedWindowNode,
     ) -> Result<LoweredDistributedNode, String> {
         if node.children.len() != 1 {
@@ -1635,7 +1647,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_generate_series_node(
         &mut self,
-        node: &super::node::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedPlanNode,
         generate_series: &super::kind::DistributedGenerateSeriesNode,
     ) -> Result<LoweredDistributedNode, String> {
         if !node.children.is_empty() {
@@ -1665,7 +1677,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_table_function_node(
         &mut self,
-        node: &super::node::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedPlanNode,
         table_function: &super::kind::DistributedTableFunctionNode,
     ) -> Result<LoweredDistributedNode, String> {
         if node.children.len() != 1 {
@@ -1692,7 +1704,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn lower_stream_exchange_source(
         &mut self,
-        node: &super::node::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedPlanNode,
         exchange: &super::kind::DistributedExchangeNode,
     ) -> Result<LoweredFragmentOutput, String> {
         if self
@@ -2006,7 +2018,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 
     fn record_probe_targets(
         &mut self,
-        node: &super::node::DistributedPlanNode,
+        node: &crate::sql::planner::DistributedPlanNode,
         result: &LoweredDistributedNode,
     ) {
         if node.probe_runtime_filters.is_empty() {
@@ -4270,7 +4282,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
 }
 
 fn first_tuple_id(
-    node: &super::node::DistributedPlanNode,
+    node: &crate::sql::planner::DistributedPlanNode,
     operator_name: &str,
 ) -> Result<i32, String> {
     node.tuple_ids.first().copied().ok_or_else(|| {
@@ -4282,12 +4294,12 @@ fn first_tuple_id(
 }
 
 fn binary_children<'a>(
-    node: &'a super::node::DistributedPlanNode,
+    node: &'a crate::sql::planner::DistributedPlanNode,
     operator_name: &str,
 ) -> Result<
     (
-        &'a super::node::DistributedPlanNode,
-        &'a super::node::DistributedPlanNode,
+        &'a crate::sql::planner::DistributedPlanNode,
+        &'a crate::sql::planner::DistributedPlanNode,
     ),
     String,
 > {
