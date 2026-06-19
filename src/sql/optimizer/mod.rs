@@ -1045,6 +1045,121 @@ mod is_known_rule_name_tests {
         }
     }
 
+    #[test]
+    fn optimize_preserves_ranking_window_partition_topn_sort() {
+        use crate::exec::node::sort::SortTopNType;
+        use crate::sql::catalog::{CatalogProvider, ColumnDef, ScanSource, TableDef};
+        use crate::sql::optimizer::operator::Operator;
+        use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
+
+        struct RankingCatalog;
+        impl CatalogProvider for RankingCatalog {
+            fn get_table(&self, _db: &str, table: &str) -> Result<TableDef, String> {
+                match table {
+                    "rw_sales" => Ok(TableDef {
+                        name: table.to_string(),
+                        columns: vec![
+                            ColumnDef {
+                                name: "region".to_string(),
+                                data_type: arrow::datatypes::DataType::Utf8,
+                                nullable: true,
+                                write_default: None,
+                                logical_type: None,
+                            },
+                            ColumnDef {
+                                name: "amount".to_string(),
+                                data_type: arrow::datatypes::DataType::Int32,
+                                nullable: true,
+                                write_default: None,
+                                logical_type: None,
+                            },
+                        ],
+                        iceberg_row_lineage_metadata_columns: vec![],
+                        source: ScanSource::StarRocks {
+                            db_id: 0,
+                            table_id: 0,
+                        },
+                    }),
+                    other => Err(format!("table not found: {other}")),
+                }
+            }
+        }
+
+        fn has_rank_partition_topn_sort(plan: &PhysicalPlanNode) -> bool {
+            if let Operator::PhysicalSort(sort) = &plan.op
+                && sort.partition_limit == Some(2)
+                && sort.topn_type == Some(SortTopNType::Rank)
+            {
+                return true;
+            }
+            plan.children.iter().any(has_rank_partition_topn_sort)
+        }
+
+        fn logical_has_rank_partition_topn_sort(
+            plan: &crate::sql::planner::plan::LogicalPlanNode,
+        ) -> bool {
+            if let crate::sql::planner::plan::PlanNodeKind::Sort(sort) = &plan.kind
+                && sort.partition_limit == Some(2)
+                && sort.topn_type == Some(SortTopNType::Rank)
+            {
+                return true;
+            }
+            plan.children
+                .iter()
+                .any(logical_has_rank_partition_topn_sort)
+        }
+
+        let sql = "
+            SELECT *
+            FROM (
+                SELECT region, amount,
+                       rank() OVER (PARTITION BY region ORDER BY amount DESC) AS rk
+                FROM rw_sales
+            ) t
+            WHERE rk <= 2
+            ORDER BY region, amount DESC
+        ";
+        let dialect = crate::sql::parser::dialect::StarRocksDialect;
+        let mut ast = sqlparser::parser::Parser::parse_sql(&dialect, sql).expect("parse query");
+        let stmt = ast.pop().expect("expected a statement");
+        let query = match stmt {
+            sqlparser::ast::Statement::Query(q) => q,
+            _ => panic!("expected a query"),
+        };
+        let (resolved, cte_registry, mut factory) =
+            crate::sql::analyzer::analyze(&query, &RankingCatalog, "default").expect("analyze");
+        let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)
+            .expect("plan query");
+        let mut scalars = crate::sql::optimizer::scalar::ScalarArena::new();
+        let opt_plan =
+            crate::sql::optimizer::convert::try_logical_plan_to_opt_expr(&logical, &mut scalars)
+                .expect("logical to opt expr");
+        let mut rewrite_ctx =
+            crate::sql::optimizer::rewrite::context::RewriteContext::for_query(Vec::new());
+        let arena = std::rc::Rc::new(std::cell::RefCell::new(scalars));
+        rewrite_ctx.set_scalar_arena(std::rc::Rc::clone(&arena));
+        let rewritten_expr =
+            crate::sql::optimizer::rewrite::registry::query_rewrite_pipeline(&HashMap::new())
+                .rewrite(opt_plan, &mut rewrite_ctx)
+                .expect("rewrite pipeline");
+        let rewritten_logical = crate::sql::optimizer::convert::opt_expr_to_logical_plan(
+            rewritten_expr,
+            &arena.borrow(),
+        );
+        assert!(
+            logical_has_rank_partition_topn_sort(&rewritten_logical),
+            "expected query rewrite pipeline to set ranking partition-topn, trace: {:#?}, got: {rewritten_logical:#?}",
+            rewrite_ctx.trace().events()
+        );
+        let physical = optimize(logical, &HashMap::new(), factory, None, Vec::new())
+            .expect("optimize ranking window");
+
+        assert!(
+            has_rank_partition_topn_sort(&physical),
+            "expected RankingWindowPredicatePushdown to survive into the physical plan, got: {physical:#?}"
+        );
+    }
+
     /// End-to-end proof: the full analyze → plan_query → optimize chain in
     /// the Apply framework turns a scalar subquery into a `PlanNodeKind::Apply`, which
     /// M1b's `SubqueryRewrite` decorrelation rules (PushDownApplyAggFilter +
