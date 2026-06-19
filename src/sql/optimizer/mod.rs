@@ -40,7 +40,6 @@ use crate::sql::optimizer::statistics::TableStatistics;
 use crate::sql::planner::plan::LogicalPlanNode;
 use memo::MExpr;
 use rule::Rule;
-use scalar::ScalarArena;
 
 /// Wall-clock timeout for the entire optimization pipeline.
 ///
@@ -135,14 +134,13 @@ fn optimize_with_root_property(
         return Err(message);
     }
 
-    // Materialize the rewritten OptExpr back to LogicalPlanNode for CTE cleanup
-    // and memo conversion, both of which still operate on LogicalPlanNode.
-    let rewritten = convert::opt_expr_to_logical_plan(rewritten_expr, &arena.borrow());
-
     // 4. CTE cleanup: intentional pre-Memo structural rewrite for CTE shape
     //    cleanup, not a second full logical optimization pass.
-    let cte_ctx = cte_rewrite::collect_cte_counts(&rewritten);
-    let rewritten = cte_rewrite::inline_single_use_ctes(rewritten, &cte_ctx)?;
+    let cte_ctx = cte_rewrite::collect_cte_counts(&rewritten_expr);
+    let rewritten_expr = {
+        let mut scalar_arena = arena.borrow_mut();
+        cte_rewrite::inline_single_use_ctes(rewritten_expr, &cte_ctx, &mut scalar_arena)?
+    };
 
     // 5. Convert to Memo. Unwrap the factory from Rc<RefCell<...>> — rewrite
     //    is done so the only two references at this call site are the local
@@ -163,7 +161,8 @@ fn optimize_with_root_property(
         .into_inner();
     let mut memo = Memo::new();
     memo.factory = factory;
-    let root_group = convert::try_logical_plan_to_memo(&rewritten, &mut memo)?;
+    memo.scalars = arena.borrow().clone();
+    let root_group = convert::opt_expr_to_memo(&rewritten_expr, &mut memo);
 
     // 6. Derive initial statistics.
     stats::derive_group_statistics(&mut memo, table_stats);
