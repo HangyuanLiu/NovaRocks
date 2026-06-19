@@ -65,8 +65,8 @@ use crate::sql::analysis::{BinOp, ExprKind, OutputColumn, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::planner::plan::{
     AggregateCall, DecodeMapping, LogicalAggregateNode, LogicalDecodeNode, LogicalJoinNode,
-    LogicalPlanNode, LogicalPlanNodeKind, LogicalProjectNode, LogicalScanNode, LogicalSortNode,
-    LogicalUnionNode, ScanDictionaryColumn,
+    LogicalPlanNode, LogicalProjectNode, LogicalScanNode, LogicalSortNode, LogicalUnionNode,
+    PlanNodeKind, ScanDictionaryColumn,
 };
 
 use super::context::{DictBinding, DictScope, DictionaryRewriteContext};
@@ -90,65 +90,65 @@ fn rewrite_node(
         required_output_columns,
     } = plan;
     match kind {
-        LogicalPlanNodeKind::Scan(mut scan) => {
+        PlanNodeKind::Scan(mut scan) => {
             let scope = rewrite_scan(&mut scan, ctx);
             Ok((
                 LogicalPlanNode::new(
-                    LogicalPlanNodeKind::Scan(scan),
+                    PlanNodeKind::Scan(scan),
                     children,
                     required_output_columns,
                 ),
                 scope,
             ))
         }
-        LogicalPlanNodeKind::Filter(node) => {
+        PlanNodeKind::Filter(node) => {
             let input = take_unary_child(&mut children);
             let (input, scope) = rewrite_node(input, ctx)?;
             Ok((
                 LogicalPlanNode::new(
-                    LogicalPlanNodeKind::Filter(node),
+                    PlanNodeKind::Filter(node),
                     vec![input],
                     required_output_columns,
                 ),
                 scope,
             ))
         }
-        LogicalPlanNodeKind::Project(node) => {
+        PlanNodeKind::Project(node) => {
             rewrite_project(node, children, required_output_columns, ctx)
         }
-        LogicalPlanNodeKind::Aggregate(node) => {
+        PlanNodeKind::Aggregate(node) => {
             rewrite_aggregate(node, children, required_output_columns, ctx)
         }
-        LogicalPlanNodeKind::Sort(node) => rewrite_sort(node, children, required_output_columns, ctx),
-        LogicalPlanNodeKind::Limit(node) => {
+        PlanNodeKind::Sort(node) => rewrite_sort(node, children, required_output_columns, ctx),
+        PlanNodeKind::Limit(node) => {
             let input = take_unary_child(&mut children);
             let (input, scope) = rewrite_node(input, ctx)?;
             Ok((
                 LogicalPlanNode::new(
-                    LogicalPlanNodeKind::Limit(node),
+                    PlanNodeKind::Limit(node),
                     vec![input],
                     required_output_columns,
                 ),
                 scope,
             ))
         }
-        LogicalPlanNodeKind::Join(node) => {
+        PlanNodeKind::Join(node) => {
             rewrite_join(node, children, required_output_columns, ctx)
         }
-        LogicalPlanNodeKind::Union(node) => {
+        PlanNodeKind::Union(node) => {
             rewrite_union(node, children, required_output_columns, ctx)
         }
         // UNION DISTINCT / INTERSECT / EXCEPT semantics require hashing
         // on the user-facing string value — dict ids from different
         // snapshots cannot be compared directly. Always decode here.
-        LogicalPlanNodeKind::Intersect(_)
-        | LogicalPlanNodeKind::Except(_)
-        | LogicalPlanNodeKind::Window(_)
-        | LogicalPlanNodeKind::TableFunction(_)
-        | LogicalPlanNodeKind::Repeat(_)
-        | LogicalPlanNodeKind::AggregateStateMerge(_)
-        | LogicalPlanNodeKind::Apply(_)
-        | LogicalPlanNodeKind::AssertOneRow(_)
+        PlanNodeKind::Intersect(_)
+        | PlanNodeKind::Except(_)
+        | PlanNodeKind::Window(_)
+        | PlanNodeKind::TableFunction(_)
+        | PlanNodeKind::Repeat(_)
+        | PlanNodeKind::AggregateStateMerge(_)
+        | PlanNodeKind::Apply(_)
+        | PlanNodeKind::AssertOneRow(_)
         // TODO(post-Task-9): multi-consumer CTEs with matching dict
         // snapshots across every consumer could keep the dict column
         // on the producer output. Doing so requires a fix-up pass over
@@ -160,27 +160,35 @@ fn rewrite_node(
         // already inlined before this rule runs, so the observable
         // surface here is narrow. Deferred until a Task 9+ query case
         // demands it.
-        | LogicalPlanNodeKind::CTEAnchor(_)
-        | LogicalPlanNodeKind::CTEProduce(_) => decode_boundary(
+        | PlanNodeKind::CTEAnchor(_)
+        | PlanNodeKind::CTEProduce(_) => decode_boundary(
             LogicalPlanNode::new(kind, children, required_output_columns),
             ctx,
         ),
         // Leaves that produce no dict columns of their own.
-        LogicalPlanNodeKind::CTEConsume(_)
-        | LogicalPlanNodeKind::Values(_)
-        | LogicalPlanNodeKind::GenerateSeries(_) => Ok((
+        PlanNodeKind::CTEConsume(_)
+        | PlanNodeKind::Values(_)
+        | PlanNodeKind::GenerateSeries(_) => Ok((
             LogicalPlanNode::new(kind, children, required_output_columns),
             DictScope::new(),
         )),
         // Decode is the rewrite's own output; do not recurse into it
         // again. The decoded output is all strings — no dict scope.
-        LogicalPlanNodeKind::Decode(_) => Ok((
+        PlanNodeKind::Decode(_) => Ok((
             LogicalPlanNode::new(kind, children, required_output_columns),
             DictScope::new(),
         )),
 
-        LogicalPlanNodeKind::ImvDelta(_) | LogicalPlanNodeKind::ImvVersion(_) => {
+        PlanNodeKind::ImvDelta(_) | PlanNodeKind::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
+        }
+        PlanNodeKind::TopN(_)
+        | PlanNodeKind::Exchange(_)
+        | PlanNodeKind::HashAggregate(_)
+        | PlanNodeKind::HashJoin(_)
+        | PlanNodeKind::NestLoopJoin(_)
+        | PlanNodeKind::SetOp(_) => {
+            panic!("distributed plan node leaked into logical dictionary rewrite");
         }
     }
 }
@@ -386,7 +394,7 @@ fn rewrite_project(
     }
     Ok((
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
+            PlanNodeKind::Project(LogicalProjectNode {
                 items,
                 output_qualifier: node.output_qualifier,
             }),
@@ -481,7 +489,7 @@ fn rewrite_aggregate(
         .collect::<Vec<_>>();
 
     let aggregate = LogicalPlanNode::new(
-        LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+        PlanNodeKind::Aggregate(LogicalAggregateNode {
             group_by,
             aggregates,
             output_columns: output_columns.clone(),
@@ -531,7 +539,7 @@ fn rewrite_aggregate(
     // strings, so the returned scope is empty.
     Ok((
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Decode(LogicalDecodeNode {
+            PlanNodeKind::Decode(LogicalDecodeNode {
                 mappings,
                 output_columns,
             }),
@@ -583,9 +591,11 @@ fn rewrite_sort(
     };
     Ok((
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Sort(LogicalSortNode {
+            PlanNodeKind::Sort(LogicalSortNode {
                 items: sort_items,
                 analytic_partition_by: node.analytic_partition_by,
+                output_columns: vec![],
+                offset: None,
                 partition_limit: node.partition_limit,
                 topn_type: node.topn_type,
             }),
@@ -702,7 +712,7 @@ fn rewrite_join(
         let right = wrap_with_decode(right, &right_scope, ctx);
         return Ok((
             LogicalPlanNode::new(
-                LogicalPlanNodeKind::Join(LogicalJoinNode {
+                PlanNodeKind::Join(LogicalJoinNode {
                     join_type: node.join_type,
                     condition: node.condition,
                 }),
@@ -796,7 +806,7 @@ fn rewrite_join(
 
     Ok((
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Join(LogicalJoinNode {
+            PlanNodeKind::Join(LogicalJoinNode {
                 join_type: node.join_type,
                 condition,
             }),
@@ -1124,7 +1134,7 @@ fn rewrite_union(
         }
         return Ok((
             LogicalPlanNode::new(
-                LogicalPlanNodeKind::Union(node),
+                PlanNodeKind::Union(node),
                 new_inputs,
                 required_output_columns,
             ),
@@ -1173,7 +1183,7 @@ fn rewrite_union(
         }
         return Ok((
             LogicalPlanNode::new(
-                LogicalPlanNodeKind::Union(node),
+                PlanNodeKind::Union(node),
                 new_inputs,
                 required_output_columns,
             ),
@@ -1197,7 +1207,7 @@ fn rewrite_union(
     // here so the pipeline's fixed-point loop terminates.
     Ok((
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Union(node),
+            PlanNodeKind::Union(node),
             new_inputs,
             required_output_columns,
         ),
@@ -1249,7 +1259,7 @@ pub(crate) fn wrap_with_decode(
         return plan;
     }
     // Avoid double-decoding when the plan is already a Decode.
-    if matches!(&plan.kind, LogicalPlanNodeKind::Decode(_)) {
+    if matches!(&plan.kind, PlanNodeKind::Decode(_)) {
         return plan;
     }
     let mut mappings: Vec<DecodeMapping> = Vec::new();
@@ -1293,7 +1303,7 @@ pub(crate) fn wrap_with_decode(
     }
     ctx.mark_changed();
     LogicalPlanNode::new(
-        LogicalPlanNodeKind::Decode(LogicalDecodeNode {
+        PlanNodeKind::Decode(LogicalDecodeNode {
             mappings,
             output_columns: renamed_outputs,
         }),
@@ -1307,16 +1317,16 @@ pub(crate) fn wrap_with_decode(
 /// downstream-of-decode boundaries do not need it.
 fn plan_output_columns(plan: &LogicalPlanNode) -> Vec<OutputColumn> {
     match &plan.kind {
-        LogicalPlanNodeKind::Scan(scan) => scan.columns.clone(),
-        LogicalPlanNodeKind::Aggregate(node) => node.output_columns.clone(),
-        LogicalPlanNodeKind::Window(node) => node.output_columns.clone(),
-        LogicalPlanNodeKind::TableFunction(node) => node.output_columns.clone(),
-        LogicalPlanNodeKind::CTEProduce(node) => node.output_columns.clone(),
-        LogicalPlanNodeKind::CTEConsume(node) => node.output_columns.clone(),
-        LogicalPlanNodeKind::Decode(node) => node.output_columns.clone(),
-        LogicalPlanNodeKind::AggregateStateMerge(node) => node.output_columns.clone(),
-        LogicalPlanNodeKind::Filter(_) => plan_output_columns(plan.unary_input()),
-        LogicalPlanNodeKind::Project(node) => node
+        PlanNodeKind::Scan(scan) => scan.columns.clone(),
+        PlanNodeKind::Aggregate(node) => node.output_columns.clone(),
+        PlanNodeKind::Window(node) => node.output_columns.clone(),
+        PlanNodeKind::TableFunction(node) => node.output_columns.clone(),
+        PlanNodeKind::CTEProduce(node) => node.output_columns.clone(),
+        PlanNodeKind::CTEConsume(node) => node.output_columns.clone(),
+        PlanNodeKind::Decode(node) => node.output_columns.clone(),
+        PlanNodeKind::AggregateStateMerge(node) => node.output_columns.clone(),
+        PlanNodeKind::Filter(_) => plan_output_columns(plan.unary_input()),
+        PlanNodeKind::Project(node) => node
             .items
             .iter()
             .map(|item| OutputColumn {
@@ -1327,34 +1337,42 @@ fn plan_output_columns(plan: &LogicalPlanNode) -> Vec<OutputColumn> {
                 is_internal: false,
             })
             .collect(),
-        LogicalPlanNodeKind::Sort(_) => plan_output_columns(plan.unary_input()),
-        LogicalPlanNodeKind::Limit(_) => plan_output_columns(plan.unary_input()),
-        LogicalPlanNodeKind::Repeat(_) => plan_output_columns(plan.unary_input()),
-        LogicalPlanNodeKind::Join(_) => {
+        PlanNodeKind::Sort(_) => plan_output_columns(plan.unary_input()),
+        PlanNodeKind::Limit(_) => plan_output_columns(plan.unary_input()),
+        PlanNodeKind::Repeat(_) => plan_output_columns(plan.unary_input()),
+        PlanNodeKind::Join(_) => {
             let mut out = plan_output_columns(plan.left());
             out.extend(plan_output_columns(plan.right()));
             out
         }
-        LogicalPlanNodeKind::Union(node) => node.output_columns.clone(),
-        LogicalPlanNodeKind::Intersect(node) => node.output_columns.clone(),
-        LogicalPlanNodeKind::Except(node) => node.output_columns.clone(),
-        LogicalPlanNodeKind::Values(node) => node.columns.clone(),
-        LogicalPlanNodeKind::GenerateSeries(node) => vec![OutputColumn {
+        PlanNodeKind::Union(node) => node.output_columns.clone(),
+        PlanNodeKind::Intersect(node) => node.output_columns.clone(),
+        PlanNodeKind::Except(node) => node.output_columns.clone(),
+        PlanNodeKind::Values(node) => node.columns.clone(),
+        PlanNodeKind::GenerateSeries(node) => vec![OutputColumn {
             column_id: ColumnId::UNSET,
             name: node.column_name.clone(),
             data_type: DataType::Int64,
             nullable: false,
             is_internal: false,
         }],
-        LogicalPlanNodeKind::CTEAnchor(_) => plan_output_columns(plan.child(1)),
-        LogicalPlanNodeKind::Apply(node) => {
+        PlanNodeKind::CTEAnchor(_) => plan_output_columns(plan.child(1)),
+        PlanNodeKind::Apply(node) => {
             let mut out = plan_output_columns(plan.left());
             out.push(node.output_column.clone());
             out
         }
-        LogicalPlanNodeKind::AssertOneRow(_) => plan_output_columns(plan.unary_input()),
-        LogicalPlanNodeKind::ImvDelta(_) | LogicalPlanNodeKind::ImvVersion(_) => {
+        PlanNodeKind::AssertOneRow(_) => plan_output_columns(plan.unary_input()),
+        PlanNodeKind::ImvDelta(_) | PlanNodeKind::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
+        }
+        PlanNodeKind::TopN(_)
+        | PlanNodeKind::Exchange(_)
+        | PlanNodeKind::HashAggregate(_)
+        | PlanNodeKind::HashJoin(_)
+        | PlanNodeKind::NestLoopJoin(_)
+        | PlanNodeKind::SetOp(_) => {
+            panic!("distributed plan node leaked into logical dictionary rewrite");
         }
     }
 }
@@ -1364,8 +1382,7 @@ mod tests {
     use super::*;
     use crate::sql::planner::plan::*;
     use crate::sql::planner::plan::{
-        LogicalExceptNode, LogicalIntersectNode, LogicalPlanNodeKind, LogicalUnionNode,
-        LogicalValuesNode,
+        LogicalExceptNode, LogicalIntersectNode, LogicalUnionNode, LogicalValuesNode, PlanNodeKind,
     };
 
     fn output_col(id: u32, name: &str) -> OutputColumn {
@@ -1380,7 +1397,7 @@ mod tests {
 
     fn values_with_output(id: u32, name: &str) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Values(LogicalValuesNode {
+            PlanNodeKind::Values(LogicalValuesNode {
                 rows: vec![],
                 columns: vec![output_col(id, name)],
             }),
@@ -1397,7 +1414,7 @@ mod tests {
 
         let plans = vec![
             LogicalPlanNode::new(
-                LogicalPlanNodeKind::Union(LogicalUnionNode {
+                PlanNodeKind::Union(LogicalUnionNode {
                     all: true,
                     output_columns: output_columns.clone(),
                 }),
@@ -1405,14 +1422,14 @@ mod tests {
                 None,
             ),
             LogicalPlanNode::new(
-                LogicalPlanNodeKind::Intersect(LogicalIntersectNode {
+                PlanNodeKind::Intersect(LogicalIntersectNode {
                     output_columns: output_columns.clone(),
                 }),
                 vec![left.clone(), right.clone()],
                 None,
             ),
             LogicalPlanNode::new(
-                LogicalPlanNodeKind::Except(LogicalExceptNode {
+                PlanNodeKind::Except(LogicalExceptNode {
                     output_columns: output_columns.clone(),
                 }),
                 vec![left, right],

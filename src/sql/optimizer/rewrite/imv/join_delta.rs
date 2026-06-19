@@ -15,7 +15,7 @@ use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
 use crate::sql::planner::plan::{
     LogicalImvDeltaNode, LogicalImvVersionNode, LogicalJoinNode, LogicalPlanNode,
-    LogicalPlanNodeKind, LogicalProjectNode, LogicalUnionNode,
+    LogicalProjectNode, LogicalUnionNode, PlanNodeKind,
 };
 
 pub(crate) struct RewriteJoinDeltaRule;
@@ -44,7 +44,7 @@ impl LogicalRewriteRule for RewriteJoinDeltaRule {
         let plan = opt_expr_to_plan(expr.clone(), ctx);
         matches!(
             &plan.kind,
-            LogicalPlanNodeKind::ImvDelta(_) if matches!(&plan.unary_input().kind, LogicalPlanNodeKind::Join(_))
+            PlanNodeKind::ImvDelta(_) if matches!(&plan.unary_input().kind, PlanNodeKind::Join(_))
         )
     }
 
@@ -53,7 +53,7 @@ impl LogicalRewriteRule for RewriteJoinDeltaRule {
             let LogicalPlanNode {
                 kind, mut children, ..
             } = plan;
-            let LogicalPlanNodeKind::ImvDelta(delta) = kind else {
+            let PlanNodeKind::ImvDelta(delta) = kind else {
                 return Ok(PlanRewriteResult::Unchanged);
             };
             let input = take_unary_child(&mut children);
@@ -62,7 +62,7 @@ impl LogicalRewriteRule for RewriteJoinDeltaRule {
                 children: mut join_children,
                 required_output_columns,
             } = input;
-            let LogicalPlanNodeKind::Join(join) = join_kind else {
+            let PlanNodeKind::Join(join) = join_kind else {
                 return Ok(PlanRewriteResult::Unchanged);
             };
 
@@ -93,7 +93,7 @@ impl LogicalRewriteRule for RewriteJoinDeltaRule {
 
             let left_delta_branch = normalize_branch_output(
                 LogicalPlanNode::new(
-                    LogicalPlanNodeKind::Join(LogicalJoinNode {
+                    PlanNodeKind::Join(LogicalJoinNode {
                         join_type,
                         condition: condition.clone(),
                     }),
@@ -108,7 +108,7 @@ impl LogicalRewriteRule for RewriteJoinDeltaRule {
 
             let right_delta_branch = normalize_branch_output(
                 LogicalPlanNode::new(
-                    LogicalPlanNodeKind::Join(LogicalJoinNode {
+                    PlanNodeKind::Join(LogicalJoinNode {
                         join_type,
                         condition,
                     }),
@@ -122,7 +122,7 @@ impl LogicalRewriteRule for RewriteJoinDeltaRule {
             );
 
             Ok(PlanRewriteResult::Changed(LogicalPlanNode::new(
-                LogicalPlanNodeKind::Union(LogicalUnionNode {
+                PlanNodeKind::Union(LogicalUnionNode {
                     all: true,
                     output_columns,
                 }),
@@ -181,11 +181,11 @@ fn mark_scan(plan: LogicalPlanNode, marker: MarkerKind) -> Result<LogicalPlanNod
         required_output_columns,
     } = plan;
     Ok(match kind {
-        LogicalPlanNodeKind::Scan(_) => wrap_scan_marker(
+        PlanNodeKind::Scan(_) => wrap_scan_marker(
             LogicalPlanNode::new(kind, children, required_output_columns),
             marker,
         ),
-        LogicalPlanNodeKind::Project(_) | LogicalPlanNodeKind::Filter(_) => {
+        PlanNodeKind::Project(_) | PlanNodeKind::Filter(_) => {
             let input = take_unary_child(&mut children);
             LogicalPlanNode::new(
                 kind,
@@ -193,19 +193,15 @@ fn mark_scan(plan: LogicalPlanNode, marker: MarkerKind) -> Result<LogicalPlanNod
                 required_output_columns,
             )
         }
-        LogicalPlanNodeKind::Join(join) => match marker {
+        PlanNodeKind::Join(join) => match marker {
             MarkerKind::Delta(action_column) => wrap_scan_marker(
-                LogicalPlanNode::new(
-                    LogicalPlanNodeKind::Join(join),
-                    children,
-                    required_output_columns,
-                ),
+                LogicalPlanNode::new(PlanNodeKind::Join(join), children, required_output_columns),
                 MarkerKind::Delta(action_column),
             ),
             MarkerKind::Version(version_ref) => {
                 let (left, right) = take_binary_children(&mut children);
                 LogicalPlanNode::new(
-                    LogicalPlanNodeKind::Join(LogicalJoinNode {
+                    PlanNodeKind::Join(LogicalJoinNode {
                         join_type: join.join_type,
                         condition: join.condition,
                     }),
@@ -229,7 +225,7 @@ fn mark_scan(plan: LogicalPlanNode, marker: MarkerKind) -> Result<LogicalPlanNod
 fn wrap_scan_marker(scan: LogicalPlanNode, marker: MarkerKind) -> LogicalPlanNode {
     match marker {
         MarkerKind::Delta(action_column) => LogicalPlanNode::new(
-            LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+            PlanNodeKind::ImvDelta(LogicalImvDeltaNode {
                 is_root: false,
                 action_column: Some(action_column),
                 branch_scope: None,
@@ -238,7 +234,7 @@ fn wrap_scan_marker(scan: LogicalPlanNode, marker: MarkerKind) -> LogicalPlanNod
             None,
         ),
         MarkerKind::Version(version_ref) => LogicalPlanNode::new(
-            LogicalPlanNodeKind::ImvVersion(LogicalImvVersionNode { version_ref }),
+            PlanNodeKind::ImvVersion(LogicalImvVersionNode { version_ref }),
             vec![scan],
             None,
         ),
@@ -249,33 +245,8 @@ fn plan_kind(plan: &LogicalPlanNode) -> &'static str {
     plan_kind_from_kind(&plan.kind)
 }
 
-fn plan_kind_from_kind(kind: &LogicalPlanNodeKind) -> &'static str {
-    match kind {
-        LogicalPlanNodeKind::Scan(_) => "Scan",
-        LogicalPlanNodeKind::Filter(_) => "Filter",
-        LogicalPlanNodeKind::Project(_) => "Project",
-        LogicalPlanNodeKind::Aggregate(_) => "Aggregate",
-        LogicalPlanNodeKind::Join(_) => "Join",
-        LogicalPlanNodeKind::Sort(_) => "Sort",
-        LogicalPlanNodeKind::Limit(_) => "Limit",
-        LogicalPlanNodeKind::Union(_) => "Union",
-        LogicalPlanNodeKind::Intersect(_) => "Intersect",
-        LogicalPlanNodeKind::Except(_) => "Except",
-        LogicalPlanNodeKind::Values(_) => "Values",
-        LogicalPlanNodeKind::GenerateSeries(_) => "GenerateSeries",
-        LogicalPlanNodeKind::TableFunction(_) => "TableFunction",
-        LogicalPlanNodeKind::Window(_) => "Window",
-        LogicalPlanNodeKind::Repeat(_) => "Repeat",
-        LogicalPlanNodeKind::CTEAnchor(_) => "CTEAnchor",
-        LogicalPlanNodeKind::CTEProduce(_) => "CTEProduce",
-        LogicalPlanNodeKind::CTEConsume(_) => "CTEConsume",
-        LogicalPlanNodeKind::Decode(_) => "Decode",
-        LogicalPlanNodeKind::AggregateStateMerge(_) => "AggregateStateMerge",
-        LogicalPlanNodeKind::Apply(_) => "Apply",
-        LogicalPlanNodeKind::AssertOneRow(_) => "AssertOneRow",
-        LogicalPlanNodeKind::ImvDelta(_) => "ImvDelta",
-        LogicalPlanNodeKind::ImvVersion(_) => "ImvVersion",
-    }
+fn plan_kind_from_kind(kind: &PlanNodeKind) -> &'static str {
+    kind.variant_name()
 }
 
 pub(crate) fn normalize_branch_output(
@@ -283,7 +254,7 @@ pub(crate) fn normalize_branch_output(
     output_columns: &[OutputColumn],
 ) -> LogicalPlanNode {
     LogicalPlanNode::new(
-        LogicalPlanNodeKind::Project(LogicalProjectNode {
+        PlanNodeKind::Project(LogicalProjectNode {
             output_qualifier: None,
             items: output_columns
                 .iter()
@@ -309,51 +280,60 @@ pub(crate) fn normalize_branch_output(
 
 pub(crate) fn plan_output_columns(plan: &LogicalPlanNode) -> Result<Vec<OutputColumn>, String> {
     Ok(match &plan.kind {
-        LogicalPlanNodeKind::Scan(scan) => scan.columns.clone(),
-        LogicalPlanNodeKind::Project(project) => project
+        PlanNodeKind::Scan(scan) => scan.columns.clone(),
+        PlanNodeKind::Project(project) => project
             .items
             .iter()
             .filter(|item| item.output_column_id != ColumnId::UNSET)
             .map(project_item_output_column)
             .collect(),
-        LogicalPlanNodeKind::Aggregate(aggregate) => aggregate.output_columns.clone(),
-        LogicalPlanNodeKind::Join(join) => {
-            join_output_columns(join.join_type, plan.left(), plan.right())?
-        }
-        LogicalPlanNodeKind::Sort(_) => plan_output_columns(plan.unary_input())?,
-        LogicalPlanNodeKind::Limit(_) => plan_output_columns(plan.unary_input())?,
-        LogicalPlanNodeKind::Filter(_) => plan_output_columns(plan.unary_input())?,
-        LogicalPlanNodeKind::Union(union) => union.output_columns.clone(),
-        LogicalPlanNodeKind::Intersect(intersect) => intersect.output_columns.clone(),
-        LogicalPlanNodeKind::Except(except) => except.output_columns.clone(),
-        LogicalPlanNodeKind::Values(values) => values.columns.clone(),
-        LogicalPlanNodeKind::GenerateSeries(generate) => vec![OutputColumn {
+        PlanNodeKind::Aggregate(aggregate) => aggregate.output_columns.clone(),
+        PlanNodeKind::Join(join) => join_output_columns(join.join_type, plan.left(), plan.right())?,
+        PlanNodeKind::Sort(_) => plan_output_columns(plan.unary_input())?,
+        PlanNodeKind::Limit(_) => plan_output_columns(plan.unary_input())?,
+        PlanNodeKind::Filter(_) => plan_output_columns(plan.unary_input())?,
+        PlanNodeKind::Union(union) => union.output_columns.clone(),
+        PlanNodeKind::Intersect(intersect) => intersect.output_columns.clone(),
+        PlanNodeKind::Except(except) => except.output_columns.clone(),
+        PlanNodeKind::Values(values) => values.columns.clone(),
+        PlanNodeKind::GenerateSeries(generate) => vec![OutputColumn {
             column_id: ColumnId::UNSET,
             name: generate.column_name.clone(),
             data_type: DataType::Int64,
             nullable: false,
             is_internal: false,
         }],
-        LogicalPlanNodeKind::TableFunction(table_function) => {
+        PlanNodeKind::TableFunction(table_function) => {
             let mut out = plan_output_columns(plan.unary_input())?;
             out.extend(table_function.output_columns.clone());
             out
         }
-        LogicalPlanNodeKind::Window(window) => window.output_columns.clone(),
-        LogicalPlanNodeKind::Repeat(_) => plan_output_columns(plan.unary_input())?,
-        LogicalPlanNodeKind::CTEAnchor(_) => plan_output_columns(plan.child(1))?,
-        LogicalPlanNodeKind::CTEProduce(produce) => produce.output_columns.clone(),
-        LogicalPlanNodeKind::CTEConsume(consume) => consume.output_columns.clone(),
-        LogicalPlanNodeKind::Decode(decode) => decode.output_columns.clone(),
-        LogicalPlanNodeKind::AggregateStateMerge(merge) => merge.output_columns.clone(),
-        LogicalPlanNodeKind::Apply(apply) => {
+        PlanNodeKind::Window(window) => window.output_columns.clone(),
+        PlanNodeKind::Repeat(_) => plan_output_columns(plan.unary_input())?,
+        PlanNodeKind::CTEAnchor(_) => plan_output_columns(plan.child(1))?,
+        PlanNodeKind::CTEProduce(produce) => produce.output_columns.clone(),
+        PlanNodeKind::CTEConsume(consume) => consume.output_columns.clone(),
+        PlanNodeKind::Decode(decode) => decode.output_columns.clone(),
+        PlanNodeKind::AggregateStateMerge(merge) => merge.output_columns.clone(),
+        PlanNodeKind::Apply(apply) => {
             let mut out = plan_output_columns(plan.left())?;
             out.push(apply.output_column.clone());
             out
         }
-        LogicalPlanNodeKind::AssertOneRow(_) => plan_output_columns(plan.unary_input())?,
-        LogicalPlanNodeKind::ImvDelta(_) => plan_output_columns(plan.unary_input())?,
-        LogicalPlanNodeKind::ImvVersion(_) => plan_output_columns(plan.unary_input())?,
+        PlanNodeKind::AssertOneRow(_) => plan_output_columns(plan.unary_input())?,
+        PlanNodeKind::ImvDelta(_) => plan_output_columns(plan.unary_input())?,
+        PlanNodeKind::ImvVersion(_) => plan_output_columns(plan.unary_input())?,
+        PlanNodeKind::TopN(_)
+        | PlanNodeKind::Exchange(_)
+        | PlanNodeKind::HashAggregate(_)
+        | PlanNodeKind::HashJoin(_)
+        | PlanNodeKind::NestLoopJoin(_)
+        | PlanNodeKind::SetOp(_) => {
+            return Err(format!(
+                "distributed plan node {} leaked into IMV logical output inference",
+                plan.kind.variant_name()
+            ));
+        }
     })
 }
 
@@ -402,8 +382,8 @@ mod tests {
     use crate::sql::optimizer::rewrite::imv::scan_binding::ImvVersionRole;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::{
-        LogicalAggregateNode, LogicalImvVersionNode, LogicalJoinNode, LogicalPlanNodeKind,
-        LogicalProjectNode, LogicalScanNode,
+        LogicalAggregateNode, LogicalImvVersionNode, LogicalJoinNode, LogicalProjectNode,
+        LogicalScanNode, PlanNodeKind,
     };
 
     #[test]
@@ -425,7 +405,7 @@ mod tests {
         let rule = RewriteJoinDeltaRule;
         let ctx = build_ctx();
         let non_root = LogicalPlanNode::new(
-            LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+            PlanNodeKind::ImvDelta(LogicalImvDeltaNode {
                 is_root: false,
                 action_column: Some(ColumnId(100)),
                 branch_scope: None,
@@ -447,7 +427,7 @@ mod tests {
         let rule = RewriteJoinDeltaRule;
         let mut ctx = build_ctx();
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+            PlanNodeKind::ImvDelta(LogicalImvDeltaNode {
                 is_root: false,
                 action_column: Some(ColumnId(100)),
                 branch_scope: None,
@@ -465,14 +445,14 @@ mod tests {
         let arena = ctx.scalar_arena();
         let changed =
             crate::sql::optimizer::convert::opt_expr_to_logical_plan(changed_expr, &arena.borrow());
-        let LogicalPlanNodeKind::Union(union) = &changed.kind else {
+        let PlanNodeKind::Union(union) = &changed.kind else {
             panic!("expected Union");
         };
 
         assert!(union.all);
         assert_eq!(changed.children.len(), 2);
         let left = assert_normalized_branch(changed.child(0), ColumnId(100));
-        let LogicalPlanNodeKind::Join(left_join) = &left.kind else {
+        let PlanNodeKind::Join(left_join) = &left.kind else {
             panic!("expected Join");
         };
         assert_condition_refs(left_join.condition.as_ref());
@@ -480,7 +460,7 @@ mod tests {
         assert_version(left.right(), "right", ImvVersionRole::From);
 
         let right = assert_normalized_branch(changed.child(1), ColumnId(100));
-        let LogicalPlanNodeKind::Join(right_join) = &right.kind else {
+        let PlanNodeKind::Join(right_join) = &right.kind else {
             panic!("expected Join");
         };
         assert_condition_refs(right_join.condition.as_ref());
@@ -493,7 +473,7 @@ mod tests {
         let rule = RewriteJoinDeltaRule;
         let mut ctx = build_ctx();
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+            PlanNodeKind::ImvDelta(LogicalImvDeltaNode {
                 is_root: false,
                 action_column: Some(ColumnId(100)),
                 branch_scope: None,
@@ -514,7 +494,7 @@ mod tests {
         let arena = ctx.scalar_arena();
         let changed =
             crate::sql::optimizer::convert::opt_expr_to_logical_plan(changed_expr, &arena.borrow());
-        let LogicalPlanNodeKind::Union(union) = &changed.kind else {
+        let PlanNodeKind::Union(union) = &changed.kind else {
             panic!("expected Union");
         };
 
@@ -527,7 +507,7 @@ mod tests {
         assert_eq!(action_outputs[0].column_id, ColumnId(100));
         assert!(action_outputs[0].is_internal);
         for input in &changed.children {
-            let LogicalPlanNodeKind::Project(project) = &input.kind else {
+            let PlanNodeKind::Project(project) = &input.kind else {
                 panic!("expected normalized branch Project");
             };
             let action_items = project
@@ -545,7 +525,7 @@ mod tests {
         let rule = RewriteJoinDeltaRule;
         let mut ctx = build_ctx();
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+            PlanNodeKind::ImvDelta(LogicalImvDeltaNode {
                 is_root: false,
                 action_column: Some(ColumnId(100)),
                 branch_scope: None,
@@ -567,7 +547,7 @@ mod tests {
         let inner = join_of(scan("a", 1), scan("b", 10));
         let outer = join_of_with_left(inner, scan("c", 20));
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+            PlanNodeKind::ImvDelta(LogicalImvDeltaNode {
                 is_root: false,
                 action_column: Some(ColumnId(100)),
                 branch_scope: None,
@@ -586,7 +566,7 @@ mod tests {
         let arena = ctx.scalar_arena();
         let changed =
             crate::sql::optimizer::convert::opt_expr_to_logical_plan(changed_expr, &arena.borrow());
-        let LogicalPlanNodeKind::Union(_) = &changed.kind else {
+        let PlanNodeKind::Union(_) = &changed.kind else {
             panic!("expected Union");
         };
 
@@ -603,15 +583,12 @@ mod tests {
         // NOT push into the two sides.
         let join = join_of(scan("a", 1), scan("b", 10));
         let marked = mark_delta_scan(join, ColumnId(100)).expect("mark delta over join");
-        let LogicalPlanNodeKind::ImvDelta(delta) = &marked.kind else {
+        let PlanNodeKind::ImvDelta(delta) = &marked.kind else {
             panic!("expected ImvDelta wrapping the whole join, got {marked:?}");
         };
         assert!(!delta.is_root, "nested join delta marker is not root");
         assert_eq!(delta.action_column, Some(ColumnId(100)));
-        assert!(matches!(
-            &marked.children[0].kind,
-            LogicalPlanNodeKind::Join(_)
-        ));
+        assert!(matches!(&marked.children[0].kind, PlanNodeKind::Join(_)));
     }
 
     #[test]
@@ -621,7 +598,7 @@ mod tests {
         let join = join_of(scan("a", 1), scan("b", 10));
         let marked = mark_version_scan(join, ImvVersionRef::from_snapshot())
             .expect("mark version over join");
-        let LogicalPlanNodeKind::Join(j) = &marked.kind else {
+        let PlanNodeKind::Join(j) = &marked.kind else {
             panic!("expected Join with both sides version-marked, got {marked:?}");
         };
         let left_v = assert_version_side(marked.left());
@@ -642,7 +619,7 @@ mod tests {
 
     fn assert_version_side(plan: &LogicalPlanNode) -> &LogicalImvVersionNode {
         match &plan.kind {
-            LogicalPlanNodeKind::ImvVersion(v) => v,
+            PlanNodeKind::ImvVersion(v) => v,
             other => panic!("expected ImvVersion on join side, got {other:?}"),
         }
     }
@@ -651,7 +628,7 @@ mod tests {
         plan: &LogicalPlanNode,
         action_column: ColumnId,
     ) -> &LogicalPlanNode {
-        let LogicalPlanNodeKind::Project(project) = &plan.kind else {
+        let PlanNodeKind::Project(project) = &plan.kind else {
             panic!("expected normalized branch Project");
         };
         assert_eq!(
@@ -676,7 +653,7 @@ mod tests {
             "normalized branch Project must expose shared action column"
         );
         let join_plan = plan.unary_input();
-        let LogicalPlanNodeKind::Join(_) = &join_plan.kind else {
+        let PlanNodeKind::Join(_) = &join_plan.kind else {
             panic!("expected Project(Join)");
         };
         join_plan
@@ -697,7 +674,7 @@ mod tests {
 
     fn delta(input: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+            PlanNodeKind::ImvDelta(LogicalImvDeltaNode {
                 is_root: true,
                 action_column: None,
                 branch_scope: None,
@@ -709,7 +686,7 @@ mod tests {
 
     fn aggregate_over(input: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+            PlanNodeKind::Aggregate(LogicalAggregateNode {
                 group_by: vec![col_expr(1, "l_k")],
                 aggregates: Vec::new(),
                 output_columns: vec![output_column(1, "l_k"), output_column(10, "r_k")],
@@ -722,7 +699,7 @@ mod tests {
 
     fn join_over(join_type: JoinKind) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Join(LogicalJoinNode {
+            PlanNodeKind::Join(LogicalJoinNode {
                 join_type: join_type,
                 condition: Some(condition()),
             }),
@@ -740,7 +717,7 @@ mod tests {
         let left_key = &left_cols[0];
         let right_key = &right_cols[0];
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Join(LogicalJoinNode {
+            PlanNodeKind::Join(LogicalJoinNode {
                 join_type: JoinKind::Inner,
                 condition: Some(TypedExpr {
                     kind: ExprKind::BinaryOp {
@@ -763,11 +740,11 @@ mod tests {
 
     fn project_over(input: LogicalPlanNode) -> LogicalPlanNode {
         let columns = match &input.kind {
-            LogicalPlanNodeKind::Scan(scan) => scan.columns.clone(),
+            PlanNodeKind::Scan(scan) => scan.columns.clone(),
             _ => unreachable!(),
         };
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
+            PlanNodeKind::Project(LogicalProjectNode {
                 items: columns
                     .into_iter()
                     .map(|column| ProjectItem {
@@ -789,7 +766,7 @@ mod tests {
             column_def(&format!("{name}_v")),
         ];
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Scan(LogicalScanNode {
+            PlanNodeKind::Scan(LogicalScanNode {
                 database: "db".to_string(),
                 table: TableDef {
                     name: name.to_string(),
@@ -822,6 +799,7 @@ mod tests {
                 required_columns: None,
                 dict_columns: Vec::new(),
                 variant_columns: Vec::new(),
+                mv_rewritten_from: None,
             }),
             vec![],
             None,
@@ -830,7 +808,7 @@ mod tests {
 
     fn scan_with_action_metadata(name: &str, first_id: u32, action_id: u32) -> LogicalPlanNode {
         let mut plan = scan(name, first_id);
-        let LogicalPlanNodeKind::Scan(scan) = &mut plan.kind else {
+        let PlanNodeKind::Scan(scan) = &mut plan.kind else {
             unreachable!();
         };
         scan.columns.push(OutputColumn {
@@ -910,8 +888,8 @@ mod tests {
 
     fn plan_contains_inner_join_delta(plan: &LogicalPlanNode) -> bool {
         match &plan.kind {
-            LogicalPlanNodeKind::ImvDelta(_) => {
-                matches!(&plan.unary_input().kind, LogicalPlanNodeKind::Join(_))
+            PlanNodeKind::ImvDelta(_) => {
+                matches!(&plan.unary_input().kind, PlanNodeKind::Join(_))
                     || plan.children.iter().any(plan_contains_inner_join_delta)
             }
             _ => plan.children.iter().any(plan_contains_inner_join_delta),
@@ -919,11 +897,11 @@ mod tests {
     }
 
     fn assert_delta(plan: &LogicalPlanNode, expected_scan: &str, action_column: ColumnId) {
-        let LogicalPlanNodeKind::Project(project) = &plan.kind else {
+        let PlanNodeKind::Project(project) = &plan.kind else {
             panic!("expected Project");
         };
         let delta_plan = plan.unary_input();
-        let LogicalPlanNodeKind::ImvDelta(delta) = &delta_plan.kind else {
+        let PlanNodeKind::ImvDelta(delta) = &delta_plan.kind else {
             panic!("expected Project(ImvDelta(...))");
         };
         assert!(!delta.is_root);
@@ -932,11 +910,11 @@ mod tests {
     }
 
     fn assert_version(plan: &LogicalPlanNode, expected_scan: &str, role: ImvVersionRole) {
-        let LogicalPlanNodeKind::Project(project) = &plan.kind else {
+        let PlanNodeKind::Project(project) = &plan.kind else {
             panic!("expected Project");
         };
         let version_plan = plan.unary_input();
-        let LogicalPlanNodeKind::ImvVersion(version) = &version_plan.kind else {
+        let PlanNodeKind::ImvVersion(version) = &version_plan.kind else {
             panic!("expected Project(ImvVersion(...))");
         };
         assert_eq!(version.version_ref, ImvVersionRef { role });
@@ -944,7 +922,7 @@ mod tests {
     }
 
     fn assert_scan(plan: &LogicalPlanNode, expected_scan: &str) {
-        let LogicalPlanNodeKind::Scan(scan) = &plan.kind else {
+        let PlanNodeKind::Scan(scan) = &plan.kind else {
             panic!("expected Scan");
         };
         assert_eq!(scan.table.name, expected_scan);

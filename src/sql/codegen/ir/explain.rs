@@ -23,7 +23,7 @@ use super::kind::{
     DistributedTableFunctionNode, DistributedTopNNode, DistributedValuesNode,
     DistributedWindowNode, ExchangeFlavor, SetOpKind,
 };
-use super::node::{DistributedPlanNode, DistributedPlanNodeKind, PlanNodeStats};
+use super::node::{DistributedPlanNode, PlanNodeKind, PlanNodeStats};
 
 pub(crate) fn explain_distributed_plan(dp: &DistributedPlan, level: ExplainLevel) -> Vec<String> {
     explain_distributed_plan_inner(dp, level, None)
@@ -131,71 +131,71 @@ fn format_distributed_node(
     );
 
     match &node.kind {
-        DistributedPlanNodeKind::Scan(scan) => {
+        PlanNodeKind::Scan(scan) => {
             format_scan_node(node, scan, level, &pad, &costs_suffix, &stats_suffix, out);
         }
-        DistributedPlanNodeKind::Project(project) => {
+        PlanNodeKind::Project(project) => {
             format_project_node(node, project, &pad, &costs_suffix, &stats_suffix, out);
             push_probe_rf_lines(&node.probe_runtime_filters, level, &pad, out);
             format_children(node, level, indent, actuals, out);
         }
-        DistributedPlanNodeKind::Filter(filter) => {
+        PlanNodeKind::Filter(filter) => {
             format_filter_node(node, filter, &pad, &costs_suffix, &stats_suffix, out);
             push_probe_rf_lines(&node.probe_runtime_filters, level, &pad, out);
             format_children(node, level, indent, actuals, out);
         }
-        DistributedPlanNodeKind::HashJoin(join) => {
+        PlanNodeKind::HashJoin(join) => {
             format_hash_join_node(node, join, level, &pad, &costs_suffix, &stats_suffix, out);
             format_children(node, level, indent, actuals, out);
         }
-        DistributedPlanNodeKind::NestLoopJoin(join) => {
+        PlanNodeKind::NestLoopJoin(join) => {
             format_nest_loop_join_node(node, join, &pad, &costs_suffix, &stats_suffix, out);
             format_children(node, level, indent, actuals, out);
         }
-        DistributedPlanNodeKind::HashAggregate(agg) => {
+        PlanNodeKind::HashAggregate(agg) => {
             format_hash_aggregate_node(node, agg, &pad, &costs_suffix, &stats_suffix, out);
             push_probe_rf_lines(&node.probe_runtime_filters, level, &pad, out);
             format_children(node, level, indent, actuals, out);
         }
-        DistributedPlanNodeKind::Sort(sort) => {
+        PlanNodeKind::Sort(sort) => {
             format_sort_node(node, sort, &pad, &costs_suffix, &stats_suffix, out);
             format_children(node, level, indent, actuals, out);
         }
-        DistributedPlanNodeKind::TopN(topn) => {
+        PlanNodeKind::TopN(topn) => {
             format_topn_node(node, topn, &pad, &costs_suffix, &stats_suffix, out);
             format_children(node, level, indent, actuals, out);
         }
-        DistributedPlanNodeKind::Exchange(exchange) => {
+        PlanNodeKind::Exchange(exchange) => {
             format_exchange_node(node, exchange, &pad, &costs_suffix, &stats_suffix, out);
         }
-        DistributedPlanNodeKind::Values(values) => {
+        PlanNodeKind::Values(values) => {
             format_values_node(node, values, &pad, &costs_suffix, &stats_suffix, out);
             push_probe_rf_lines(&node.probe_runtime_filters, level, &pad, out);
         }
-        DistributedPlanNodeKind::AssertOneRow(assert) => {
+        PlanNodeKind::AssertOneRow(assert) => {
             format_assert_one_row_node(node, assert, &pad, &costs_suffix, &stats_suffix, out);
             format_children(node, level, indent, actuals, out);
         }
-        DistributedPlanNodeKind::Decode(decode) => {
+        PlanNodeKind::Decode(decode) => {
             format_decode_node(node, decode, &pad, &costs_suffix, &stats_suffix, out);
             format_children(node, level, indent, actuals, out);
         }
-        DistributedPlanNodeKind::Repeat(repeat) => {
+        PlanNodeKind::Repeat(repeat) => {
             format_repeat_node(node, repeat, &pad, &costs_suffix, &stats_suffix, out);
             format_children(node, level, indent, actuals, out);
         }
-        DistributedPlanNodeKind::SetOp(set_op) => {
+        PlanNodeKind::SetOp(set_op) => {
             format_set_op_node(node, set_op, &pad, &costs_suffix, &stats_suffix, out);
             format_children(node, level, indent, actuals, out);
         }
-        DistributedPlanNodeKind::Window(window) => {
+        PlanNodeKind::Window(window) => {
             format_window_node(node, window, &pad, &costs_suffix, &stats_suffix, out);
             format_children(node, level, indent, actuals, out);
         }
-        DistributedPlanNodeKind::GenerateSeries(generate) => {
+        PlanNodeKind::GenerateSeries(generate) => {
             format_generate_series_node(node, generate, &pad, &costs_suffix, &stats_suffix, out);
         }
-        DistributedPlanNodeKind::TableFunction(table_function) => {
+        PlanNodeKind::TableFunction(table_function) => {
             format_table_function_node(
                 node,
                 table_function,
@@ -205,6 +205,24 @@ fn format_distributed_node(
                 out,
             );
             format_children(node, level, indent, actuals, out);
+        }
+        PlanNodeKind::Limit(_)
+        | PlanNodeKind::Aggregate(_)
+        | PlanNodeKind::Join(_)
+        | PlanNodeKind::Union(_)
+        | PlanNodeKind::Intersect(_)
+        | PlanNodeKind::Except(_)
+        | PlanNodeKind::CTEAnchor(_)
+        | PlanNodeKind::CTEProduce(_)
+        | PlanNodeKind::CTEConsume(_)
+        | PlanNodeKind::AggregateStateMerge(_)
+        | PlanNodeKind::Apply(_)
+        | PlanNodeKind::ImvDelta(_)
+        | PlanNodeKind::ImvVersion(_) => {
+            panic!(
+                "logical plan node {} leaked into distributed explain",
+                node.kind.variant_name()
+            );
         }
     }
 }
@@ -665,7 +683,7 @@ fn column_display_lookup(node: &DistributedPlanNode) -> ColumnDisplayLookup {
 }
 
 fn collect_column_displays(node: &DistributedPlanNode, lookup: &mut ColumnDisplayLookup) {
-    if let DistributedPlanNodeKind::Scan(scan) = &node.kind {
+    if let PlanNodeKind::Scan(scan) = &node.kind {
         for column in &scan.columns {
             let display = (scan.alias.clone(), column.name.clone());
             lookup

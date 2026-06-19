@@ -18,7 +18,7 @@ pub(crate) use explain::{explain_distributed_plan, explain_distributed_plan_anal
 pub(crate) use fragment::{DataPartition, DataSink, DistributedPlan, PartitionKind, PlanFragment};
 pub(crate) use lowering::lower_distributed_plan;
 #[cfg(test)]
-pub(crate) use node::{DistributedPlanNode, DistributedPlanNodeKind, PlanNodeStats};
+pub(crate) use node::{DistributedPlanNode, PlanNodeKind, PlanNodeStats};
 
 pub(crate) type FragmentId = u32;
 

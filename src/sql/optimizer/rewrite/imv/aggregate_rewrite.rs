@@ -25,7 +25,7 @@ use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
 use crate::sql::planner::plan::{
     AggregateCall, LogicalAggregateNode, LogicalAggregateStateMergeNode, LogicalFilterNode,
-    LogicalImvDeltaNode, LogicalPlanNode, LogicalPlanNodeKind, LogicalProjectNode, LogicalScanNode,
+    LogicalImvDeltaNode, LogicalPlanNode, LogicalProjectNode, LogicalScanNode, PlanNodeKind,
 };
 
 pub(crate) struct RewriteAggregateStateRule;
@@ -60,9 +60,9 @@ impl LogicalRewriteRule for RewriteAggregateStateRule {
         let plan = opt_expr_to_plan(expr.clone(), ctx);
         matches!(
             &plan.kind,
-            LogicalPlanNodeKind::ImvDelta(delta)
+            PlanNodeKind::ImvDelta(delta)
                 if delta.is_root
-                    && matches!(&plan.unary_input().kind, LogicalPlanNodeKind::Aggregate(_))
+                    && matches!(&plan.unary_input().kind, PlanNodeKind::Aggregate(_))
         )
     }
 
@@ -71,7 +71,7 @@ impl LogicalRewriteRule for RewriteAggregateStateRule {
             let LogicalPlanNode {
                 kind, mut children, ..
             } = plan;
-            let LogicalPlanNodeKind::ImvDelta(delta) = kind else {
+            let PlanNodeKind::ImvDelta(delta) = kind else {
                 return Ok(PlanRewriteResult::Unchanged);
             };
             if !delta.is_root {
@@ -84,7 +84,7 @@ impl LogicalRewriteRule for RewriteAggregateStateRule {
                 children: mut aggregate_children,
                 required_output_columns: aggregate_required_output_columns,
             } = aggregate_plan;
-            let LogicalPlanNodeKind::Aggregate(aggregate) = aggregate_kind else {
+            let PlanNodeKind::Aggregate(aggregate) = aggregate_kind else {
                 return Ok(PlanRewriteResult::Unchanged);
             };
             let aggregate_input = take_unary_child(&mut aggregate_children);
@@ -194,7 +194,7 @@ pub(crate) fn build_aggregate_state_merge(
     )?;
 
     Ok(LogicalPlanNode::new(
-        LogicalPlanNodeKind::AggregateStateMerge(LogicalAggregateStateMergeNode {
+        PlanNodeKind::AggregateStateMerge(LogicalAggregateStateMergeNode {
             group_key_names,
             aggregate_state_names,
             change_op_column: ImvActionColumn::NAME.to_string(),
@@ -227,7 +227,7 @@ fn target_state_old_scan(
         })
         .collect();
     LogicalPlanNode::new(
-        LogicalPlanNodeKind::Scan(LogicalScanNode {
+        PlanNodeKind::Scan(LogicalScanNode {
             database: target.namespace.clone(),
             table: TableDef {
                 name: target.table.clone(),
@@ -241,6 +241,7 @@ fn target_state_old_scan(
             required_columns: None,
             dict_columns: Vec::new(),
             variant_columns: Vec::new(),
+            mv_rewritten_from: None,
         }),
         vec![],
         None,
@@ -257,14 +258,14 @@ fn branch_scoped_old_input(
     };
     let old_outputs = plan_output_columns(&old_scan)?;
     let filtered = LogicalPlanNode::new(
-        LogicalPlanNodeKind::Filter(LogicalFilterNode {
+        PlanNodeKind::Filter(LogicalFilterNode {
             predicate: branch_scope_predicate(&scope, &old_outputs)?,
         }),
         vec![old_scan],
         None,
     );
     Ok(LogicalPlanNode::new(
-        LogicalPlanNodeKind::Project(LogicalProjectNode {
+        PlanNodeKind::Project(LogicalProjectNode {
             items: aggregate_physical_passthrough_items(layout, &old_outputs)?,
             output_qualifier: None,
         }),
@@ -658,7 +659,7 @@ fn signed_aggregate(
         thread_delta_action_column(aggregate_input, action_column)?
     } else {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+            PlanNodeKind::ImvDelta(LogicalImvDeltaNode {
                 is_root: false,
                 action_column: Some(action_column),
                 branch_scope: None,
@@ -683,7 +684,7 @@ fn signed_aggregate(
         &signed_calls,
     )?;
     let signed_aggregate = LogicalPlanNode::new(
-        LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+        PlanNodeKind::Aggregate(LogicalAggregateNode {
             group_by: aggregate.group_by,
             aggregates: signed_calls,
             output_columns: aggregate_output_columns,
@@ -693,7 +694,7 @@ fn signed_aggregate(
         aggregate_required_output_columns,
     );
     Ok(LogicalPlanNode::new(
-        LogicalPlanNodeKind::Project(LogicalProjectNode {
+        PlanNodeKind::Project(LogicalProjectNode {
             items: project_items,
             output_qualifier: None,
         }),
@@ -721,7 +722,7 @@ fn existing_delta_action_column(plan: &LogicalPlanNode) -> Result<Option<ColumnI
 
     fn visit(plan: &LogicalPlanNode, found: &mut Option<ColumnId>) -> Result<(), String> {
         match &plan.kind {
-            LogicalPlanNodeKind::ImvDelta(node) => {
+            PlanNodeKind::ImvDelta(node) => {
                 merge_action(found, node.action_column)?;
             }
             _ => {}
@@ -741,7 +742,7 @@ fn thread_delta_action_column(
     mut plan: LogicalPlanNode,
     action_column: ColumnId,
 ) -> Result<LogicalPlanNode, String> {
-    if let LogicalPlanNodeKind::ImvDelta(node) = &mut plan.kind {
+    if let PlanNodeKind::ImvDelta(node) = &mut plan.kind {
         if let Some(existing) = node.action_column
             && existing != action_column
         {
@@ -1249,7 +1250,7 @@ mod tests {
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::{
         AggregateCall, LogicalAggregateNode, LogicalAggregateStateMergeNode, LogicalImvDeltaNode,
-        LogicalPlanNodeKind, LogicalScanNode, LogicalUnionNode,
+        LogicalScanNode, LogicalUnionNode, PlanNodeKind,
     };
 
     #[test]
@@ -1481,7 +1482,7 @@ mod tests {
             },
         ];
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Scan(LogicalScanNode {
+            PlanNodeKind::Scan(LogicalScanNode {
                 database: "db".to_string(),
                 table: TableDef {
                     name: "b".to_string(),
@@ -1526,6 +1527,7 @@ mod tests {
                 required_columns: None,
                 dict_columns: Vec::new(),
                 variant_columns: Vec::new(),
+                mv_rewritten_from: None,
             }),
             vec![],
             None,
@@ -1534,7 +1536,7 @@ mod tests {
 
     fn aggregate_over(input: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+            PlanNodeKind::Aggregate(LogicalAggregateNode {
                 group_by: vec![col_expr(1, "k")],
                 aggregates: vec![AggregateCall {
                     name: "sum".to_string(),
@@ -1569,7 +1571,7 @@ mod tests {
 
     fn aggregate_first_output_over(input: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+            PlanNodeKind::Aggregate(LogicalAggregateNode {
                 group_by: vec![col_expr(1, "k")],
                 aggregates: vec![AggregateCall {
                     name: "sum".to_string(),
@@ -1604,7 +1606,7 @@ mod tests {
 
     fn aggregate_with_two_calls(input: LogicalPlanNode) -> LogicalPlanNode {
         let mut plan = aggregate_over(input);
-        let LogicalPlanNodeKind::Aggregate(node) = &mut plan.kind else {
+        let PlanNodeKind::Aggregate(node) = &mut plan.kind else {
             unreachable!()
         };
         node.aggregates.push(AggregateCall {
@@ -1630,23 +1632,20 @@ mod tests {
             panic!("expected Changed(AggregateStateMerge)");
         };
         let plan = opt_expr_to_logical_plan(opt, arena);
-        assert!(matches!(
-            &plan.kind,
-            LogicalPlanNodeKind::AggregateStateMerge(_)
-        ));
+        assert!(matches!(&plan.kind, PlanNodeKind::AggregateStateMerge(_)));
         plan
     }
 
     fn merge_node(plan: &LogicalPlanNode) -> &LogicalAggregateStateMergeNode {
         match &plan.kind {
-            LogicalPlanNodeKind::AggregateStateMerge(node) => node,
+            PlanNodeKind::AggregateStateMerge(node) => node,
             _ => unreachable!(),
         }
     }
 
     fn delta(input: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+            PlanNodeKind::ImvDelta(LogicalImvDeltaNode {
                 is_root: true,
                 action_column: None,
                 branch_scope: None,
@@ -1658,7 +1657,7 @@ mod tests {
 
     fn join_expanded_input() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Union(LogicalUnionNode {
+            PlanNodeKind::Union(LogicalUnionNode {
                 all: true,
                 output_columns: vec![
                     OutputColumn {
@@ -1679,7 +1678,7 @@ mod tests {
             }),
             vec![
                 LogicalPlanNode::new(
-                    LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+                    PlanNodeKind::ImvDelta(LogicalImvDeltaNode {
                         is_root: false,
                         action_column: Some(ColumnId::new_for_test(100)),
                         branch_scope: None,
@@ -1688,7 +1687,7 @@ mod tests {
                     None,
                 ),
                 LogicalPlanNode::new(
-                    LogicalPlanNodeKind::ImvVersion(LogicalImvVersionNode {
+                    PlanNodeKind::ImvVersion(LogicalImvVersionNode {
                         version_ref: ImvVersionRef::from_snapshot(),
                     }),
                     vec![leaf_scan()],
@@ -1713,7 +1712,7 @@ mod tests {
             logical_plan_to_opt_expr(&aggregate_over(leaf_scan()), &mut arena_rc.borrow_mut());
         assert!(!rule.matches(&expr2, &ctx));
         let nested_delta = LogicalPlanNode::new(
-            LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+            PlanNodeKind::ImvDelta(LogicalImvDeltaNode {
                 is_root: false,
                 action_column: None,
                 branch_scope: None,
@@ -1730,7 +1729,7 @@ mod tests {
         let rule = RewriteAggregateStateRule;
         let mut ctx = build_ctx();
         let mut aggregate_plan = aggregate_over(leaf_scan());
-        let LogicalPlanNodeKind::Aggregate(aggregate) = &mut aggregate_plan.kind else {
+        let PlanNodeKind::Aggregate(aggregate) = &mut aggregate_plan.kind else {
             unreachable!()
         };
         aggregate.group_by.clear();
@@ -1750,7 +1749,7 @@ mod tests {
         let rule = RewriteAggregateStateRule;
         let mut ctx = build_ctx();
         let mut aggregate_plan = aggregate_over(leaf_scan());
-        let LogicalPlanNodeKind::Aggregate(aggregate) = &mut aggregate_plan.kind else {
+        let PlanNodeKind::Aggregate(aggregate) = &mut aggregate_plan.kind else {
             unreachable!()
         };
         aggregate.aggregates[0].distinct = true;
@@ -1788,7 +1787,7 @@ mod tests {
         assert_eq!(merge.change_op_column, "__change_op");
         assert_eq!(merge.output_columns[1].name, "s");
 
-        let LogicalPlanNodeKind::Scan(old_scan) = &changed.left().kind else {
+        let PlanNodeKind::Scan(old_scan) = &changed.left().kind else {
             panic!("expected target-state scan");
         };
         let ScanSource::IcebergMvTargetState(target_state) = &old_scan.table.source else {
@@ -1802,7 +1801,7 @@ mod tests {
         );
 
         let delta_input = changed.right();
-        let LogicalPlanNodeKind::Project(project) = &delta_input.kind else {
+        let PlanNodeKind::Project(project) = &delta_input.kind else {
             panic!("expected signed aggregate projection delta input");
         };
         assert_eq!(
@@ -1814,12 +1813,12 @@ mod tests {
             vec!["k", "__agg_state_s", "__agg_state___ivm_row_count"]
         );
         let signed_aggregate_plan = delta_input.unary_input();
-        let LogicalPlanNodeKind::Aggregate(signed_aggregate) = &signed_aggregate_plan.kind else {
+        let PlanNodeKind::Aggregate(signed_aggregate) = &signed_aggregate_plan.kind else {
             panic!("expected signed aggregate under projection");
         };
         assert!(matches!(
             &signed_aggregate_plan.unary_input().kind,
-            LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode { is_root: false, .. })
+            PlanNodeKind::ImvDelta(LogicalImvDeltaNode { is_root: false, .. })
         ));
         assert_eq!(
             signed_aggregate
@@ -1897,7 +1896,7 @@ mod tests {
             .apply(expr, &mut ctx)
             .expect("aggregate rewrite must succeed");
         let changed = expect_changed_merge(result, &arena_rc.borrow());
-        let LogicalPlanNodeKind::Scan(old_scan) = &changed.left().kind else {
+        let PlanNodeKind::Scan(old_scan) = &changed.left().kind else {
             panic!("expected target-state scan");
         };
         let ScanSource::IcebergMvTargetState(target_state) = &old_scan.table.source else {
@@ -1915,7 +1914,7 @@ mod tests {
         let ctx = build_branch_ctx();
         let ext = ctx.extension::<ImvExtension>().expect("extension").clone();
         let aggregate_plan = aggregate_over(leaf_scan());
-        let LogicalPlanNodeKind::Aggregate(aggregate) = &aggregate_plan.kind else {
+        let PlanNodeKind::Aggregate(aggregate) = &aggregate_plan.kind else {
             panic!("expected aggregate");
         };
         let aggregate_input = aggregate_plan.unary_input().clone();
@@ -1936,18 +1935,18 @@ mod tests {
             )
             .expect("branch-scoped merge builds");
 
-        let LogicalPlanNodeKind::AggregateStateMerge(_) = &merge.kind else {
+        let PlanNodeKind::AggregateStateMerge(_) = &merge.kind else {
             panic!("expected AggregateStateMerge");
         };
         let old_input = merge.left();
-        let LogicalPlanNodeKind::Project(project) = &old_input.kind else {
+        let PlanNodeKind::Project(project) = &old_input.kind else {
             panic!("expected old input Project dropping branch id");
         };
         let filter_plan = old_input.unary_input();
-        let LogicalPlanNodeKind::Filter(filter) = &filter_plan.kind else {
+        let PlanNodeKind::Filter(filter) = &filter_plan.kind else {
             panic!("expected branch filter under old-input Project");
         };
-        let LogicalPlanNodeKind::Scan(old_scan) = &filter_plan.unary_input().kind else {
+        let PlanNodeKind::Scan(old_scan) = &filter_plan.unary_input().kind else {
             panic!("expected target-state scan under branch filter");
         };
         let ScanSource::IcebergMvTargetState(target_state) = &old_scan.table.source else {
@@ -1992,7 +1991,7 @@ mod tests {
         let rule = RewriteAggregateStateRule;
         let mut ctx = build_branch_ctx();
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+            PlanNodeKind::ImvDelta(LogicalImvDeltaNode {
                 is_root: true,
                 action_column: None,
                 branch_scope: Some(crate::sql::catalog::BranchScope {
@@ -2013,7 +2012,7 @@ mod tests {
         );
         // Branch scope manifests as Project(Filter(Scan)) on the old input.
         assert!(
-            matches!(&changed.left().kind, LogicalPlanNodeKind::Project(_)),
+            matches!(&changed.left().kind, PlanNodeKind::Project(_)),
             "branch-scoped old input must be wrapped in a passthrough Project over a Filter"
         );
     }
@@ -2033,17 +2032,17 @@ mod tests {
         let changed = expect_changed_merge(result, &arena_rc.borrow());
 
         let delta_input = changed.right();
-        let LogicalPlanNodeKind::Project(_) = &delta_input.kind else {
+        let PlanNodeKind::Project(_) = &delta_input.kind else {
             panic!("expected signed aggregate projection delta input");
         };
         let signed_aggregate_plan = delta_input.unary_input();
-        let LogicalPlanNodeKind::Aggregate(_) = &signed_aggregate_plan.kind else {
+        let PlanNodeKind::Aggregate(_) = &signed_aggregate_plan.kind else {
             panic!("expected signed aggregate under projection");
         };
         assert!(
             matches!(
                 &signed_aggregate_plan.unary_input().kind,
-                LogicalPlanNodeKind::Union(_)
+                PlanNodeKind::Union(_)
             ),
             "pre-expanded join delta input must not be wrapped as ImvDelta(Union)"
         );
@@ -2063,7 +2062,7 @@ mod tests {
         let rule = RewriteAggregateStateRule;
         let mut ctx = build_ctx();
         let input = LogicalPlanNode::new(
-            LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+            PlanNodeKind::ImvDelta(LogicalImvDeltaNode {
                 is_root: false,
                 action_column: existing_action,
                 branch_scope: None,
@@ -2079,15 +2078,14 @@ mod tests {
             .expect("aggregate rewrite must succeed");
         let changed = expect_changed_merge(result, &arena_rc.borrow());
         let delta_input = changed.right();
-        let LogicalPlanNodeKind::Project(_) = &delta_input.kind else {
+        let PlanNodeKind::Project(_) = &delta_input.kind else {
             panic!("expected signed aggregate projection delta input");
         };
         let signed_aggregate_plan = delta_input.unary_input();
-        let LogicalPlanNodeKind::Aggregate(signed_aggregate) = &signed_aggregate_plan.kind else {
+        let PlanNodeKind::Aggregate(signed_aggregate) = &signed_aggregate_plan.kind else {
             panic!("expected signed aggregate under projection");
         };
-        let LogicalPlanNodeKind::ImvDelta(delta_input) = &signed_aggregate_plan.unary_input().kind
-        else {
+        let PlanNodeKind::ImvDelta(delta_input) = &signed_aggregate_plan.unary_input().kind else {
             panic!("expected signed aggregate to reuse existing delta marker");
         };
         let action_column = delta_input

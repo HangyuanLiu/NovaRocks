@@ -13,7 +13,7 @@ use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::planner::plan::{ApplyKind, LogicalJoinNode, LogicalPlanNode, LogicalPlanNodeKind};
+use crate::sql::planner::plan::{ApplyKind, LogicalJoinNode, LogicalPlanNode, PlanNodeKind};
 
 #[allow(dead_code)] // Registered by Task 6.
 pub(crate) struct ExistentialApplyToJoin;
@@ -47,7 +47,7 @@ impl LogicalRewriteRule for ExistentialApplyToJoin {
 }
 
 fn matches_plan(plan: &LogicalPlanNode) -> bool {
-    matches!(&plan.kind, LogicalPlanNodeKind::Apply(a) if matches!(a.kind, ApplyKind::Exists { .. }))
+    matches!(&plan.kind, PlanNodeKind::Apply(a) if matches!(a.kind, ApplyKind::Exists { .. }))
 }
 
 fn apply_plan(plan: LogicalPlanNode) -> Result<Option<LogicalPlanNode>, String> {
@@ -56,7 +56,7 @@ fn apply_plan(plan: LogicalPlanNode) -> Result<Option<LogicalPlanNode>, String> 
         mut children,
         required_output_columns: _,
     } = plan;
-    let LogicalPlanNodeKind::Apply(a) = &kind else {
+    let PlanNodeKind::Apply(a) = &kind else {
         return Ok(None);
     };
     if children.len() != 2 {
@@ -87,7 +87,7 @@ fn apply_plan(plan: LogicalPlanNode) -> Result<Option<LogicalPlanNode>, String> 
     };
 
     Ok(Some(LogicalPlanNode::new(
-        LogicalPlanNodeKind::Join(LogicalJoinNode {
+        PlanNodeKind::Join(LogicalJoinNode {
             join_type,
             condition: Some(condition),
         }),
@@ -115,8 +115,8 @@ mod tests {
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::{
-        ApplyKind, LogicalApplyNode, LogicalFilterNode, LogicalJoinNode, LogicalPlanNodeKind,
-        LogicalProjectNode, LogicalScanNode,
+        ApplyKind, LogicalApplyNode, LogicalFilterNode, LogicalJoinNode, LogicalProjectNode,
+        LogicalScanNode, PlanNodeKind,
     };
 
     const OUTER_K: ColumnId = ColumnId(1);
@@ -158,7 +158,7 @@ mod tests {
 
     fn scan(table: &str, id: ColumnId) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Scan(LogicalScanNode {
+            PlanNodeKind::Scan(LogicalScanNode {
                 database: "default".to_string(),
                 table: table_def(table),
                 alias: None,
@@ -167,6 +167,7 @@ mod tests {
                 required_columns: None,
                 dict_columns: vec![],
                 variant_columns: vec![],
+                mv_rewritten_from: None,
             }),
             vec![],
             None,
@@ -217,7 +218,7 @@ mod tests {
 
     fn correlated_inner() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
+            PlanNodeKind::Project(LogicalProjectNode {
                 items: vec![ProjectItem {
                     expr: col_ref(INNER_K, "k"),
                     output_name: "k".to_string(),
@@ -226,7 +227,7 @@ mod tests {
                 output_qualifier: None,
             }),
             vec![LogicalPlanNode::new(
-                LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                PlanNodeKind::Filter(LogicalFilterNode {
                     predicate: correlation_predicate(),
                 }),
                 vec![scan("inner", INNER_K)],
@@ -238,7 +239,7 @@ mod tests {
 
     fn correlated_select_one_inner() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
+            PlanNodeKind::Project(LogicalProjectNode {
                 items: vec![ProjectItem {
                     expr: TypedExpr {
                         kind: ExprKind::Literal(LiteralValue::Int(1)),
@@ -251,7 +252,7 @@ mod tests {
                 output_qualifier: None,
             }),
             vec![LogicalPlanNode::new(
-                LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                PlanNodeKind::Filter(LogicalFilterNode {
                     predicate: correlation_predicate(),
                 }),
                 vec![scan("inner", INNER_K)],
@@ -263,7 +264,7 @@ mod tests {
 
     fn correlated_project_scan_inner() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
+            PlanNodeKind::Project(LogicalProjectNode {
                 items: vec![ProjectItem {
                     expr: col_ref(INNER_K, "k"),
                     output_name: "k".to_string(),
@@ -278,7 +279,7 @@ mod tests {
 
     fn exists_apply(negated: bool, right: LogicalPlanNode, correlated: bool) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Apply(LogicalApplyNode {
+            PlanNodeKind::Apply(LogicalApplyNode {
                 kind: ApplyKind::Exists { negated },
                 subquery_expr: bool_expr(),
                 output_column: exists_output(),
@@ -313,7 +314,7 @@ mod tests {
             !contains_apply(plan),
             "result must not contain Apply: {plan:?}"
         );
-        let LogicalPlanNodeKind::Join(join) = &plan.kind else {
+        let PlanNodeKind::Join(join) = &plan.kind else {
             panic!("expected Join, got: {plan:?}");
         };
         assert_eq!(join.join_type, expected_kind);
@@ -363,19 +364,17 @@ mod tests {
 
     fn contains_apply(plan: &LogicalPlanNode) -> bool {
         match &plan.kind {
-            LogicalPlanNodeKind::Apply(_) => true,
-            LogicalPlanNodeKind::Filter(_) | LogicalPlanNodeKind::Project(_) => {
+            PlanNodeKind::Apply(_) => true,
+            PlanNodeKind::Filter(_) | PlanNodeKind::Project(_) => {
                 contains_apply(plan.unary_input())
             }
-            LogicalPlanNodeKind::Join(_) => {
-                contains_apply(plan.left()) || contains_apply(plan.right())
-            }
+            PlanNodeKind::Join(_) => contains_apply(plan.left()) || contains_apply(plan.right()),
             _ => false,
         }
     }
 
     fn project_outputs_column(plan: &LogicalPlanNode, expected: ColumnId) -> bool {
-        let LogicalPlanNodeKind::Project(project) = &plan.kind else {
+        let PlanNodeKind::Project(project) = &plan.kind else {
             return false;
         };
         project
@@ -391,13 +390,10 @@ mod tests {
 
         assert_correlation_condition(join.condition.as_ref().unwrap());
         let right = plan.right();
-        let LogicalPlanNodeKind::Project(_project) = &right.kind else {
+        let PlanNodeKind::Project(_project) = &right.kind else {
             panic!("expected Project right, got: {:?}", right);
         };
-        assert!(matches!(
-            &right.unary_input().kind,
-            LogicalPlanNodeKind::Scan(_)
-        ));
+        assert!(matches!(&right.unary_input().kind, PlanNodeKind::Scan(_)));
     }
 
     #[test]
@@ -431,13 +427,10 @@ mod tests {
 
         assert_correlation_condition(join.condition.as_ref().unwrap());
         let right = plan.right();
-        let LogicalPlanNodeKind::Project(_project) = &right.kind else {
+        let PlanNodeKind::Project(_project) = &right.kind else {
             panic!("expected Project right, got: {:?}", right);
         };
-        assert!(matches!(
-            &right.unary_input().kind,
-            LogicalPlanNodeKind::Scan(_)
-        ));
+        assert!(matches!(&right.unary_input().kind, PlanNodeKind::Scan(_)));
     }
 
     #[test]
@@ -446,7 +439,7 @@ mod tests {
         let join = assert_join(&plan, JoinKind::LeftSemi);
 
         assert_true_condition(join.condition.as_ref().unwrap());
-        assert!(matches!(&plan.right().kind, LogicalPlanNodeKind::Scan(_)));
+        assert!(matches!(&plan.right().kind, PlanNodeKind::Scan(_)));
     }
 
     #[test]
@@ -455,6 +448,6 @@ mod tests {
         let join = assert_join(&plan, JoinKind::LeftAnti);
 
         assert_true_condition(join.condition.as_ref().unwrap());
-        assert!(matches!(&plan.right().kind, LogicalPlanNodeKind::Scan(_)));
+        assert!(matches!(&plan.right().kind, PlanNodeKind::Scan(_)));
     }
 }

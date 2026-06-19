@@ -21,7 +21,7 @@ use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
 use crate::sql::optimizer::rewrite::rules::utils::combine_and;
 use crate::sql::planner::plan::{
     ApplyKind, LogicalAggregateNode, LogicalApplyNode, LogicalFilterNode, LogicalPlanNode,
-    LogicalPlanNodeKind, LogicalProjectNode,
+    LogicalProjectNode, PlanNodeKind,
 };
 
 pub(crate) struct PushDownApplyAggFilter;
@@ -55,7 +55,7 @@ impl LogicalRewriteRule for PushDownApplyAggFilter {
 }
 
 fn matches_plan(plan: &LogicalPlanNode) -> bool {
-    let LogicalPlanNodeKind::Apply(a) = &plan.kind else {
+    let PlanNodeKind::Apply(a) = &plan.kind else {
         return false;
     };
     if a.kind != ApplyKind::Scalar {
@@ -77,7 +77,7 @@ fn apply_plan(plan: LogicalPlanNode) -> Result<Option<LogicalPlanNode>, String> 
         mut children,
         required_output_columns,
     } = plan;
-    let LogicalPlanNodeKind::Apply(a) = kind else {
+    let PlanNodeKind::Apply(a) = kind else {
         return Ok(None);
     };
     if children.len() != 2 {
@@ -156,7 +156,7 @@ fn apply_plan(plan: LogicalPlanNode) -> Result<Option<LogicalPlanNode>, String> 
         peeled.filter_input.clone()
     } else {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+            PlanNodeKind::Filter(LogicalFilterNode {
                 predicate: combine_and(residual),
             }),
             vec![peeled.filter_input.clone()],
@@ -171,7 +171,7 @@ fn apply_plan(plan: LogicalPlanNode) -> Result<Option<LogicalPlanNode>, String> 
     new_output_columns.extend(peeled.aggregate.output_columns.clone());
 
     let new_agg = LogicalPlanNode::new(
-        LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+        PlanNodeKind::Aggregate(LogicalAggregateNode {
             group_by: new_group_by,
             aggregates: peeled.aggregate.aggregates.clone(),
             output_columns: new_output_columns,
@@ -212,7 +212,7 @@ fn apply_plan(plan: LogicalPlanNode) -> Result<Option<LogicalPlanNode>, String> 
         }
 
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
+            PlanNodeKind::Project(LogicalProjectNode {
                 items: new_items,
                 output_qualifier: proj.output_qualifier.clone(),
             }),
@@ -226,7 +226,7 @@ fn apply_plan(plan: LogicalPlanNode) -> Result<Option<LogicalPlanNode>, String> 
     // Return the rewritten Apply: correlation_conjuncts = the correlated EQ
     // conjuncts (outer == inner), need_check_max_rows = false.
     Ok(Some(LogicalPlanNode::new(
-        LogicalPlanNodeKind::Apply(LogicalApplyNode {
+        PlanNodeKind::Apply(LogicalApplyNode {
             correlation_conjuncts: correlated,
             need_check_max_rows: false,
             ..a
@@ -240,7 +240,7 @@ fn apply_plan(plan: LogicalPlanNode) -> Result<Option<LogicalPlanNode>, String> 
 ///   `[Project?] Aggregate{group_by: []}( Filter{corr_pred}(inner) )`
 /// where the Filter's predicate has at least one conjunct referencing `corr_ids`.
 fn inner_is_correlated_scalar_agg(plan: &LogicalPlanNode, corr_ids: &HashSet<ColumnId>) -> bool {
-    let after_project = if matches!(&plan.kind, LogicalPlanNodeKind::Project(_)) {
+    let after_project = if matches!(&plan.kind, PlanNodeKind::Project(_)) {
         plan.unary_input()
     } else {
         plan
@@ -249,14 +249,14 @@ fn inner_is_correlated_scalar_agg(plan: &LogicalPlanNode, corr_ids: &HashSet<Col
 }
 
 fn check_agg_over_corr_filter(plan: &LogicalPlanNode, corr_ids: &HashSet<ColumnId>) -> bool {
-    let LogicalPlanNodeKind::Aggregate(agg) = &plan.kind else {
+    let PlanNodeKind::Aggregate(agg) = &plan.kind else {
         return false;
     };
     if !agg.group_by.is_empty() {
         return false;
     }
     let filter_input = plan.unary_input();
-    let LogicalPlanNodeKind::Filter(filter) = &filter_input.kind else {
+    let PlanNodeKind::Filter(filter) = &filter_input.kind else {
         return false;
     };
     // At least one conjunct must reference a corr_id.
@@ -280,7 +280,7 @@ fn peel_inner<'a>(
     corr_ids: &HashSet<ColumnId>,
 ) -> Option<PeeledInner<'a>> {
     match &plan.kind {
-        LogicalPlanNodeKind::Project(proj) => {
+        PlanNodeKind::Project(proj) => {
             let (agg, filter, filter_input) = peel_agg_over_filter(plan.unary_input(), corr_ids)?;
             Some(PeeledInner {
                 leading_project: Some(proj),
@@ -309,14 +309,14 @@ fn peel_agg_over_filter<'a>(
     &'a LogicalFilterNode,
     &'a LogicalPlanNode,
 )> {
-    let LogicalPlanNodeKind::Aggregate(agg) = &plan.kind else {
+    let PlanNodeKind::Aggregate(agg) = &plan.kind else {
         return None;
     };
     if !agg.group_by.is_empty() {
         return None;
     }
     let filter_plan = plan.unary_input();
-    let LogicalPlanNodeKind::Filter(filter) = &filter_plan.kind else {
+    let PlanNodeKind::Filter(filter) = &filter_plan.kind else {
         return None;
     };
     Some((agg, filter, filter_plan.unary_input()))
@@ -341,7 +341,7 @@ mod tests {
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::{
         AggregateCall, ApplyKind, LogicalAggregateNode, LogicalApplyNode, LogicalFilterNode,
-        LogicalPlanNode, LogicalPlanNodeKind, LogicalScanNode, LogicalValuesNode,
+        LogicalPlanNode, LogicalScanNode, LogicalValuesNode, PlanNodeKind,
     };
 
     // ---- Column ID constants ------------------------------------------------
@@ -403,7 +403,7 @@ mod tests {
 
     fn make_t2_scan() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Scan(LogicalScanNode {
+            PlanNodeKind::Scan(LogicalScanNode {
                 database: "default".to_string(),
                 table: TableDef {
                     name: "t2".to_string(),
@@ -435,6 +435,7 @@ mod tests {
                 required_columns: None,
                 dict_columns: vec![],
                 variant_columns: vec![],
+                mv_rewritten_from: None,
             }),
             vec![],
             None,
@@ -448,7 +449,7 @@ mod tests {
             col_ref(OUTER_K, "k", DataType::Int64),
         );
         let filter = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+            PlanNodeKind::Filter(LogicalFilterNode {
                 predicate: corr_pred,
             }),
             vec![make_t2_scan()],
@@ -456,7 +457,7 @@ mod tests {
         );
 
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+            PlanNodeKind::Aggregate(LogicalAggregateNode {
                 group_by: vec![],
                 aggregates: vec![AggregateCall {
                     name: "max".to_string(),
@@ -482,7 +483,7 @@ mod tests {
 
     fn correlated_scalar_agg_apply() -> LogicalPlanNode {
         let outer_values = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Values(LogicalValuesNode {
+            PlanNodeKind::Values(LogicalValuesNode {
                 rows: vec![],
                 columns: vec![OutputColumn {
                     column_id: OUTER_K,
@@ -497,7 +498,7 @@ mod tests {
         );
 
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Apply(LogicalApplyNode {
+            PlanNodeKind::Apply(LogicalApplyNode {
                 kind: ApplyKind::Scalar,
                 subquery_expr: col_ref_nullable(APPLY_OUT, "subq", DataType::Int64),
                 output_column: OutputColumn {
@@ -548,7 +549,7 @@ mod tests {
         let arena = ctx.scalar_arena();
         let new_plan = opt_expr_to_plan(&new_expr, &arena.borrow());
 
-        let LogicalPlanNodeKind::Apply(new_apply) = &new_plan.kind else {
+        let PlanNodeKind::Apply(new_apply) = &new_plan.kind else {
             panic!("expected Apply, got: {new_plan:?}");
         };
 
@@ -579,7 +580,7 @@ mod tests {
 
         // right child: Aggregate{group_by:[t2.k]}(Scan t2)
         let right_plan = new_plan.right();
-        let LogicalPlanNodeKind::Aggregate(new_agg) = &right_plan.kind else {
+        let PlanNodeKind::Aggregate(new_agg) = &right_plan.kind else {
             panic!("right child must be Aggregate, got: {:?}", right_plan);
         };
 
@@ -605,7 +606,7 @@ mod tests {
         assert_eq!(new_agg.output_columns[1].column_id, MAX_RESULT);
 
         // Correlated Filter was removed; agg input is the Scan directly.
-        let LogicalPlanNodeKind::Scan(scan) = &right_plan.unary_input().kind else {
+        let PlanNodeKind::Scan(scan) = &right_plan.unary_input().kind else {
             panic!(
                 "agg input must be a Scan (correlated Filter removed), got: {:?}",
                 right_plan.unary_input()
@@ -649,7 +650,7 @@ mod tests {
         };
 
         let inner = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+            PlanNodeKind::Aggregate(LogicalAggregateNode {
                 group_by: vec![],
                 aggregates: vec![AggregateCall {
                     name: "max".to_string(),
@@ -669,7 +670,7 @@ mod tests {
                 already_pushed: false,
             }),
             vec![LogicalPlanNode::new(
-                LogicalPlanNodeKind::Filter(LogicalFilterNode {
+                PlanNodeKind::Filter(LogicalFilterNode {
                     predicate: combined_pred,
                 }),
                 vec![make_t2_scan()],
@@ -679,7 +680,7 @@ mod tests {
         );
 
         let apply = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Apply(LogicalApplyNode {
+            PlanNodeKind::Apply(LogicalApplyNode {
                 kind: ApplyKind::Scalar,
                 subquery_expr: col_ref_nullable(APPLY_OUT, "subq", DataType::Int64),
                 output_column: OutputColumn {
@@ -699,7 +700,7 @@ mod tests {
             }),
             vec![
                 LogicalPlanNode::new(
-                    LogicalPlanNodeKind::Values(LogicalValuesNode {
+                    PlanNodeKind::Values(LogicalValuesNode {
                         rows: vec![],
                         columns: vec![],
                     }),
@@ -725,25 +726,25 @@ mod tests {
         let arena = ctx.scalar_arena();
         let new_plan = opt_expr_to_plan(&new_expr, &arena.borrow());
 
-        let LogicalPlanNodeKind::Apply(new_apply) = &new_plan.kind else {
+        let PlanNodeKind::Apply(new_apply) = &new_plan.kind else {
             panic!("expected Apply");
         };
         assert!(!new_apply.need_check_max_rows);
         assert_eq!(new_apply.correlation_conjuncts.len(), 1);
 
         let right_plan = new_plan.right();
-        let LogicalPlanNodeKind::Aggregate(_) = &right_plan.kind else {
+        let PlanNodeKind::Aggregate(_) = &right_plan.kind else {
             panic!("right must be Aggregate");
         };
         // Residual filter must remain below the agg.
         let residual_plan = right_plan.unary_input();
-        let LogicalPlanNodeKind::Filter(_) = &residual_plan.kind else {
+        let PlanNodeKind::Filter(_) = &residual_plan.kind else {
             panic!("agg input must be a Filter (residual) when there are non-correlated preds");
         };
         // The residual filter's input must be the scan.
         assert!(matches!(
             &residual_plan.unary_input().kind,
-            LogicalPlanNodeKind::Scan(_)
+            PlanNodeKind::Scan(_)
         ));
     }
 
@@ -753,7 +754,7 @@ mod tests {
         let mut ctx = ctx_with_arena();
 
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Apply(LogicalApplyNode {
+            PlanNodeKind::Apply(LogicalApplyNode {
                 kind: ApplyKind::Scalar,
                 subquery_expr: col_ref(APPLY_OUT, "subq", DataType::Int64),
                 output_column: OutputColumn {
@@ -774,7 +775,7 @@ mod tests {
             }),
             vec![
                 LogicalPlanNode::new(
-                    LogicalPlanNodeKind::Values(LogicalValuesNode {
+                    PlanNodeKind::Values(LogicalValuesNode {
                         rows: vec![],
                         columns: vec![],
                     }),
@@ -782,7 +783,7 @@ mod tests {
                     None,
                 ),
                 LogicalPlanNode::new(
-                    LogicalPlanNodeKind::Values(LogicalValuesNode {
+                    PlanNodeKind::Values(LogicalValuesNode {
                         rows: vec![],
                         columns: vec![],
                     }),
@@ -806,7 +807,7 @@ mod tests {
         let mut ctx = ctx_with_arena();
 
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Apply(LogicalApplyNode {
+            PlanNodeKind::Apply(LogicalApplyNode {
                 kind: ApplyKind::Scalar,
                 subquery_expr: col_ref(APPLY_OUT, "subq", DataType::Int64),
                 output_column: OutputColumn {
@@ -830,7 +831,7 @@ mod tests {
             }),
             vec![
                 LogicalPlanNode::new(
-                    LogicalPlanNodeKind::Values(LogicalValuesNode {
+                    PlanNodeKind::Values(LogicalValuesNode {
                         rows: vec![],
                         columns: vec![],
                     }),
@@ -887,7 +888,7 @@ mod tests {
 
         // Extend make_t2_scan() with the two extra columns.
         let scan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Scan(LogicalScanNode {
+            PlanNodeKind::Scan(LogicalScanNode {
                 database: "default".to_string(),
                 table: crate::sql::catalog::TableDef {
                     name: "t2".to_string(),
@@ -926,13 +927,14 @@ mod tests {
                 required_columns: None,
                 dict_columns: vec![],
                 variant_columns: vec![],
+                mv_rewritten_from: None,
             }),
             vec![],
             None,
         );
 
         let filter = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+            PlanNodeKind::Filter(LogicalFilterNode {
                 predicate: combined,
             }),
             vec![scan],
@@ -940,7 +942,7 @@ mod tests {
         );
 
         let inner = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+            PlanNodeKind::Aggregate(LogicalAggregateNode {
                 group_by: vec![],
                 aggregates: vec![AggregateCall {
                     name: "sum".to_string(),
@@ -964,7 +966,7 @@ mod tests {
         );
 
         let outer_values = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Values(LogicalValuesNode {
+            PlanNodeKind::Values(LogicalValuesNode {
                 rows: vec![],
                 columns: vec![
                     OutputColumn {
@@ -988,7 +990,7 @@ mod tests {
         );
 
         let apply = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Apply(LogicalApplyNode {
+            PlanNodeKind::Apply(LogicalApplyNode {
                 kind: ApplyKind::Scalar,
                 subquery_expr: col_ref_nullable(APPLY_OUT, "subq", DataType::Int64),
                 output_column: OutputColumn {
@@ -1028,7 +1030,7 @@ mod tests {
         let arena = ctx.scalar_arena();
         let new_plan = opt_expr_to_plan(&new_expr, &arena.borrow());
 
-        let LogicalPlanNodeKind::Apply(new_apply) = &new_plan.kind else {
+        let PlanNodeKind::Apply(new_apply) = &new_plan.kind else {
             panic!("expected Apply");
         };
 
@@ -1040,7 +1042,7 @@ mod tests {
         );
 
         let right_plan = new_plan.right();
-        let LogicalPlanNodeKind::Aggregate(new_agg) = &right_plan.kind else {
+        let PlanNodeKind::Aggregate(new_agg) = &right_plan.kind else {
             panic!("right child must be Aggregate");
         };
 

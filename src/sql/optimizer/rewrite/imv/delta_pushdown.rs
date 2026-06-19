@@ -15,7 +15,7 @@ use crate::sql::optimizer::rewrite::imv::{PlanRewriteResult, bridge_apply_result
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
-use crate::sql::planner::plan::{LogicalImvDeltaNode, LogicalPlanNode, LogicalPlanNodeKind};
+use crate::sql::planner::plan::{LogicalImvDeltaNode, LogicalPlanNode, PlanNodeKind};
 
 pub(crate) struct PushDeltaThroughUnaryRule;
 
@@ -60,7 +60,7 @@ fn apply_plan(plan: LogicalPlanNode) -> Result<PlanRewriteResult, String> {
         mut children,
         required_output_columns: _,
     } = plan;
-    let LogicalPlanNodeKind::ImvDelta(delta) = &kind else {
+    let PlanNodeKind::ImvDelta(delta) = &kind else {
         return Ok(PlanRewriteResult::Unchanged);
     };
     if children.len() != 1 {
@@ -75,17 +75,15 @@ fn apply_plan(plan: LogicalPlanNode) -> Result<PlanRewriteResult, String> {
     // three layers; PropagateActionColumnRule and ActionColumnValidationRule
     // re-assert the same boundary later with richer diagnostics (base FQN).
     match &child.kind {
-        LogicalPlanNodeKind::Project(_) | LogicalPlanNodeKind::Filter(_) => {
-            /* fall through to push */
-        }
-        LogicalPlanNodeKind::Aggregate(_) => {
+        PlanNodeKind::Project(_) | PlanNodeKind::Filter(_) => { /* fall through to push */ }
+        PlanNodeKind::Aggregate(_) => {
             return Err("Iceberg IMV rewrite does not support this aggregate shape".to_string());
         }
-        LogicalPlanNodeKind::Join(_) => {
+        PlanNodeKind::Join(_) => {
             // Left for RewriteJoinDeltaRule in the same stage's fixpoint.
             return Ok(PlanRewriteResult::Unchanged);
         }
-        LogicalPlanNodeKind::Union(_) => {
+        PlanNodeKind::Union(_) => {
             return Err("Iceberg IMV rewrite does not support this union shape".to_string());
         }
         // Scan or any other shape: the marker already directly wraps a leaf
@@ -107,14 +105,14 @@ fn apply_plan(plan: LogicalPlanNode) -> Result<PlanRewriteResult, String> {
     }
     let original_input = child_children.remove(0);
     match child_kind {
-        LogicalPlanNodeKind::Project(p) => {
+        PlanNodeKind::Project(p) => {
             // Commutation Delta(Project(x)) == Project(Delta(x)) holds because
             // Project items are row-local and the delta only marks each row's
             // change action (carried through by action-column propagation).
             // Window calls cannot appear here because the planner extracts
             // them into a dedicated LogicalWindowNode.
             let inner = LogicalPlanNode::new(
-                LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+                PlanNodeKind::ImvDelta(LogicalImvDeltaNode {
                     is_root: false,
                     action_column,
                     branch_scope: None,
@@ -123,14 +121,14 @@ fn apply_plan(plan: LogicalPlanNode) -> Result<PlanRewriteResult, String> {
                 None,
             );
             Ok(PlanRewriteResult::Changed(LogicalPlanNode::new(
-                LogicalPlanNodeKind::Project(p),
+                PlanNodeKind::Project(p),
                 vec![inner],
                 required_output_columns,
             )))
         }
-        LogicalPlanNodeKind::Filter(f) => {
+        PlanNodeKind::Filter(f) => {
             let inner = LogicalPlanNode::new(
-                LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+                PlanNodeKind::ImvDelta(LogicalImvDeltaNode {
                     is_root: false,
                     action_column,
                     branch_scope: None,
@@ -139,7 +137,7 @@ fn apply_plan(plan: LogicalPlanNode) -> Result<PlanRewriteResult, String> {
                 None,
             );
             Ok(PlanRewriteResult::Changed(LogicalPlanNode::new(
-                LogicalPlanNodeKind::Filter(f),
+                PlanNodeKind::Filter(f),
                 vec![inner],
                 required_output_columns,
             )))
@@ -172,8 +170,8 @@ mod tests {
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::{
-        LogicalAggregateNode, LogicalFilterNode, LogicalJoinNode, LogicalPlanNodeKind,
-        LogicalProjectNode, LogicalScanNode, LogicalUnionNode,
+        LogicalAggregateNode, LogicalFilterNode, LogicalJoinNode, LogicalProjectNode,
+        LogicalScanNode, LogicalUnionNode, PlanNodeKind,
     };
 
     fn ctx_with_arena() -> (RewriteContext, Rc<RefCell<ScalarArena>>) {
@@ -194,7 +192,7 @@ mod tests {
             logical_type: None,
         };
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Scan(LogicalScanNode {
+            PlanNodeKind::Scan(LogicalScanNode {
                 database: "db".to_string(),
                 table: TableDef {
                     name: "b".to_string(),
@@ -230,6 +228,7 @@ mod tests {
                 required_columns: None,
                 dict_columns: Vec::new(),
                 variant_columns: Vec::new(),
+                mv_rewritten_from: None,
             }),
             vec![],
             None,
@@ -238,7 +237,7 @@ mod tests {
 
     fn delta(input: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+            PlanNodeKind::ImvDelta(LogicalImvDeltaNode {
                 is_root: true,
                 action_column: None,
                 branch_scope: None,
@@ -250,7 +249,7 @@ mod tests {
 
     fn project_over(input: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
+            PlanNodeKind::Project(LogicalProjectNode {
                 items: vec![ProjectItem {
                     expr: TypedExpr {
                         kind: ExprKind::ColumnRef {
@@ -273,7 +272,7 @@ mod tests {
 
     fn filter_over(input: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+            PlanNodeKind::Filter(LogicalFilterNode {
                 predicate: TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Bool(true)),
                     data_type: DataType::Boolean,
@@ -287,7 +286,7 @@ mod tests {
 
     fn aggregate_over(input: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+            PlanNodeKind::Aggregate(LogicalAggregateNode {
                 group_by: Vec::new(),
                 aggregates: Vec::new(),
                 output_columns: Vec::new(),
@@ -300,7 +299,7 @@ mod tests {
 
     fn join_over(left: LogicalPlanNode, right: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Join(LogicalJoinNode {
+            PlanNodeKind::Join(LogicalJoinNode {
                 join_type: JoinKind::Inner,
                 condition: None,
             }),
@@ -311,7 +310,7 @@ mod tests {
 
     fn union_over(inputs: Vec<LogicalPlanNode>) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Union(LogicalUnionNode {
+            PlanNodeKind::Union(LogicalUnionNode {
                 all: true,
                 output_columns: Vec::new(),
             }),
@@ -332,17 +331,17 @@ mod tests {
             panic!("expected Changed(Project)");
         };
         let rewritten = opt_expr_to_logical_plan(rewritten_expr, &arena.borrow());
-        let LogicalPlanNodeKind::Project(_) = &rewritten.kind else {
+        let PlanNodeKind::Project(_) = &rewritten.kind else {
             panic!("expected Changed(Project), got {rewritten:?}");
         };
         let delta_plan = rewritten.unary_input();
-        let LogicalPlanNodeKind::ImvDelta(delta) = &delta_plan.kind else {
+        let PlanNodeKind::ImvDelta(delta) = &delta_plan.kind else {
             panic!("expected ImvDelta under Project");
         };
         assert!(!delta.is_root, "relocated marker is no longer the root");
         assert!(matches!(
             &delta_plan.unary_input().kind,
-            LogicalPlanNodeKind::Scan(_)
+            PlanNodeKind::Scan(_)
         ));
     }
 
@@ -358,17 +357,17 @@ mod tests {
             panic!("expected Changed(Filter)");
         };
         let rewritten = opt_expr_to_logical_plan(rewritten_expr, &arena.borrow());
-        let LogicalPlanNodeKind::Filter(_) = &rewritten.kind else {
+        let PlanNodeKind::Filter(_) = &rewritten.kind else {
             panic!("expected Changed(Filter), got {rewritten:?}");
         };
         let delta_plan = rewritten.unary_input();
-        let LogicalPlanNodeKind::ImvDelta(delta) = &delta_plan.kind else {
+        let PlanNodeKind::ImvDelta(delta) = &delta_plan.kind else {
             panic!("expected ImvDelta under Filter");
         };
         assert!(!delta.is_root, "relocated marker is no longer the root");
         assert!(matches!(
             &delta_plan.unary_input().kind,
-            LogicalPlanNodeKind::Scan(_)
+            PlanNodeKind::Scan(_)
         ));
     }
 
@@ -448,12 +447,12 @@ mod tests {
             panic!("expected Changed after first apply");
         };
         let after1 = opt_expr_to_logical_plan(after1_expr, &arena.borrow());
-        let LogicalPlanNodeKind::Project(_) = &after1.kind else {
+        let PlanNodeKind::Project(_) = &after1.kind else {
             panic!("expected Project at root");
         };
         // The child is now Delta(Filter(Scan)).
         let nested_delta = after1.unary_input().clone();
-        let LogicalPlanNodeKind::ImvDelta(_) = &nested_delta.kind else {
+        let PlanNodeKind::ImvDelta(_) = &nested_delta.kind else {
             panic!("expected Delta under Project");
         };
 
@@ -466,17 +465,17 @@ mod tests {
             panic!("expected Changed after second apply");
         };
         let after2 = opt_expr_to_logical_plan(after2_expr, &arena.borrow());
-        let LogicalPlanNodeKind::Filter(_) = &after2.kind else {
+        let PlanNodeKind::Filter(_) = &after2.kind else {
             panic!("expected Filter");
         };
         let delta_plan = after2.unary_input();
-        let LogicalPlanNodeKind::ImvDelta(d) = &delta_plan.kind else {
+        let PlanNodeKind::ImvDelta(d) = &delta_plan.kind else {
             panic!("expected Delta under Filter");
         };
         // Leaf marker reached a Scan, and is_root is false (relocated).
         assert!(matches!(
             &delta_plan.unary_input().kind,
-            LogicalPlanNodeKind::Scan(_)
+            PlanNodeKind::Scan(_)
         ));
         assert!(!d.is_root, "relocated marker is no longer the root");
     }
@@ -497,7 +496,7 @@ mod tests {
             panic!("expected Changed after first apply");
         };
         let after1 = opt_expr_to_logical_plan(after1_expr, &arena.borrow());
-        let LogicalPlanNodeKind::Project(_) = &after1.kind else {
+        let PlanNodeKind::Project(_) = &after1.kind else {
             panic!("expected Project at root");
         };
         // Second apply on Delta(Aggregate(Scan)) must fail-fast.

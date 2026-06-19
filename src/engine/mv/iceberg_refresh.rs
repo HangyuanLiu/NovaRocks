@@ -9653,14 +9653,14 @@ fn plan_canonical_select_for_imv(
 pub(crate) fn normalize_imv_rewrite_root_project(
     plan: crate::sql::planner::plan::LogicalPlanNode,
 ) -> crate::sql::planner::plan::LogicalPlanNode {
-    use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind};
+    use crate::sql::planner::plan::{LogicalPlanNode, PlanNodeKind};
 
     let LogicalPlanNode {
         kind,
         mut children,
         required_output_columns,
     } = plan;
-    let LogicalPlanNodeKind::Project(project) = kind else {
+    let PlanNodeKind::Project(project) = kind else {
         return LogicalPlanNode::new(kind, children, required_output_columns);
     };
     let input = children.remove(0);
@@ -9669,26 +9669,26 @@ pub(crate) fn normalize_imv_rewrite_root_project(
         children: aggregate_children,
         required_output_columns: aggregate_required_output_columns,
     } = input;
-    let LogicalPlanNodeKind::Aggregate(mut aggregate) = input_kind else {
+    let PlanNodeKind::Aggregate(mut aggregate) = input_kind else {
         let input = LogicalPlanNode::new(
             input_kind,
             aggregate_children,
             aggregate_required_output_columns,
         );
         return LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(project),
+            PlanNodeKind::Project(project),
             vec![input],
             required_output_columns,
         );
     };
     if project.items.len() != aggregate.output_columns.len() {
         let input = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Aggregate(aggregate),
+            PlanNodeKind::Aggregate(aggregate),
             aggregate_children,
             aggregate_required_output_columns,
         );
         return LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(project),
+            PlanNodeKind::Project(project),
             vec![input],
             required_output_columns,
         );
@@ -9705,7 +9705,7 @@ pub(crate) fn normalize_imv_rewrite_root_project(
         })
         .collect();
     LogicalPlanNode::new(
-        LogicalPlanNodeKind::Aggregate(aggregate),
+        PlanNodeKind::Aggregate(aggregate),
         aggregate_children,
         aggregate_required_output_columns,
     )
@@ -9809,7 +9809,7 @@ fn logical_plan_contains_aggregate_state_merge(
 ) -> bool {
     matches!(
         &plan.kind,
-        crate::sql::planner::plan::LogicalPlanNodeKind::AggregateStateMerge(_)
+        crate::sql::planner::plan::PlanNodeKind::AggregateStateMerge(_)
     ) || plan
         .children
         .iter()
@@ -10003,12 +10003,12 @@ mod aggregate_refresh_rewrite_validation_tests {
     use crate::sql::optimizer::rewrite::phase::RewritePhase;
     use crate::sql::optimizer::rewrite::trace::RewriteTrace;
     use crate::sql::planner::plan::{
-        LogicalAggregateStateMergeNode, LogicalPlanNode, LogicalPlanNodeKind, LogicalValuesNode,
+        LogicalAggregateStateMergeNode, LogicalPlanNode, LogicalValuesNode, PlanNodeKind,
     };
 
     fn empty_values_plan() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Values(LogicalValuesNode {
+            PlanNodeKind::Values(LogicalValuesNode {
                 rows: Vec::new(),
                 columns: Vec::new(),
             }),
@@ -10019,7 +10019,7 @@ mod aggregate_refresh_rewrite_validation_tests {
 
     fn aggregate_state_merge_plan() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::AggregateStateMerge(LogicalAggregateStateMergeNode {
+            PlanNodeKind::AggregateStateMerge(LogicalAggregateStateMergeNode {
                 group_key_names: Vec::new(),
                 aggregate_state_names: Vec::new(),
                 change_op_column: crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
@@ -10252,7 +10252,7 @@ pub(crate) fn explain_iceberg_mv_refresh_rewrite_plan(
         )?
     };
     let outcome = run_imv_rewrite_for_refresh_explain(state, &ctx)?;
-    Ok(crate::sql::explain::explain_plan(&outcome.plan, level))
+    crate::sql::explain::explain_plan_checked(&outcome.plan, level)
 }
 
 fn build_iceberg_table_def_for_snapshot_scan(

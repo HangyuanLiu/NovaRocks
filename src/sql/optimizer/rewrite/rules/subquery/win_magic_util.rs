@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
 use crate::sql::catalog::ScanSource;
 use crate::sql::column_id::ColumnId;
-use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind, LogicalScanNode};
+use crate::sql::planner::plan::{LogicalPlanNode, LogicalScanNode, PlanNodeKind};
 
 /// Physical identity of a scanned table. Two scans of the same physical table
 /// (e.g. a self-join's two legs, or an outer table re-scanned in a subquery)
@@ -70,21 +70,21 @@ pub(super) fn collect_table_ids(plan: &LogicalPlanNode) -> Vec<TableIdentity> {
 }
 
 fn collect_table_ids_inner(plan: &LogicalPlanNode, out: &mut Vec<TableIdentity>) {
-    if let LogicalPlanNodeKind::Scan(s) = &plan.kind {
+    if let PlanNodeKind::Scan(s) = &plan.kind {
         out.push(TableIdentity::from_scan(s));
         return;
     }
 
     if matches!(
         plan.kind,
-        LogicalPlanNodeKind::Join(_)
-            | LogicalPlanNodeKind::Filter(_)
-            | LogicalPlanNodeKind::Project(_)
-            | LogicalPlanNodeKind::Aggregate(_)
-            | LogicalPlanNodeKind::Sort(_)
-            | LogicalPlanNodeKind::Window(_)
-            | LogicalPlanNodeKind::AssertOneRow(_)
-            | LogicalPlanNodeKind::Apply(_)
+        PlanNodeKind::Join(_)
+            | PlanNodeKind::Filter(_)
+            | PlanNodeKind::Project(_)
+            | PlanNodeKind::Aggregate(_)
+            | PlanNodeKind::Sort(_)
+            | PlanNodeKind::Window(_)
+            | PlanNodeKind::AssertOneRow(_)
+            | PlanNodeKind::Apply(_)
     ) {
         for child in &plan.children {
             collect_table_ids_inner(child, out);
@@ -114,7 +114,7 @@ fn collect_scan_column_map_inner(
     plan: &LogicalPlanNode,
     map: &mut HashMap<ColumnId, (TableIdentity, String)>,
 ) {
-    if let LogicalPlanNodeKind::Scan(s) = &plan.kind {
+    if let PlanNodeKind::Scan(s) = &plan.kind {
         let id = TableIdentity::from_scan(s);
         for c in &s.columns {
             map.insert(c.column_id, (id.clone(), c.name.clone()));
@@ -124,14 +124,14 @@ fn collect_scan_column_map_inner(
 
     if matches!(
         plan.kind,
-        LogicalPlanNodeKind::Join(_)
-            | LogicalPlanNodeKind::Filter(_)
-            | LogicalPlanNodeKind::Project(_)
-            | LogicalPlanNodeKind::Aggregate(_)
-            | LogicalPlanNodeKind::Sort(_)
-            | LogicalPlanNodeKind::Window(_)
-            | LogicalPlanNodeKind::AssertOneRow(_)
-            | LogicalPlanNodeKind::Apply(_)
+        PlanNodeKind::Join(_)
+            | PlanNodeKind::Filter(_)
+            | PlanNodeKind::Project(_)
+            | PlanNodeKind::Aggregate(_)
+            | PlanNodeKind::Sort(_)
+            | PlanNodeKind::Window(_)
+            | PlanNodeKind::AssertOneRow(_)
+            | PlanNodeKind::Apply(_)
     ) {
         for child in &plan.children {
             collect_scan_column_map_inner(child, map);
@@ -228,12 +228,12 @@ mod tests {
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::plan::{
-        LogicalJoinNode, LogicalPlanNode, LogicalPlanNodeKind, LogicalScanNode,
+        LogicalJoinNode, LogicalPlanNode, LogicalScanNode, PlanNodeKind,
     };
 
     fn make_scan(table_id: i64, cols: Vec<(ColumnId, &str)>) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Scan(LogicalScanNode {
+            PlanNodeKind::Scan(LogicalScanNode {
                 database: "default".to_string(),
                 table: TableDef {
                     name: format!("t{table_id}"),
@@ -256,6 +256,7 @@ mod tests {
                 required_columns: None,
                 dict_columns: vec![],
                 variant_columns: vec![],
+                mv_rewritten_from: None,
             }),
             vec![],
             None,
@@ -316,6 +317,7 @@ mod tests {
             required_columns: None,
             dict_columns: vec![],
             variant_columns: vec![],
+            mv_rewritten_from: None,
         };
         let id = TableIdentity::from_scan(&scan_node);
         assert_eq!(
@@ -335,7 +337,7 @@ mod tests {
         let left = make_scan(1, vec![]);
         let right = make_scan(2, vec![]);
         let join = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Join(LogicalJoinNode {
+            PlanNodeKind::Join(LogicalJoinNode {
                 join_type: JoinKind::Cross,
                 condition: None,
             }),
@@ -364,7 +366,7 @@ mod tests {
         let left = make_scan(1, vec![]);
         let right = make_scan(1, vec![]);
         let join = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Join(LogicalJoinNode {
+            PlanNodeKind::Join(LogicalJoinNode {
                 join_type: JoinKind::Cross,
                 condition: None,
             }),

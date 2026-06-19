@@ -388,7 +388,7 @@ fn validate_edge_target_node(
         )
         })?;
 
-    let super::node::DistributedPlanNodeKind::Exchange(exchange) = &target_node.kind else {
+    let super::node::PlanNodeKind::Exchange(exchange) = &target_node.kind else {
         return Err(format!(
             "lower_distributed_plan edge target_exchange_node_id={} in target fragment id={} must target Exchange",
             edge.target_exchange_node_id, target_fragment.fragment_id
@@ -642,7 +642,7 @@ fn target_exchange_for_edge<'a>(
                 edge.target_exchange_node_id, target_fragment.fragment_id
             )
         })?;
-    let super::node::DistributedPlanNodeKind::Exchange(exchange) = &target_node.kind else {
+    let super::node::PlanNodeKind::Exchange(exchange) = &target_node.kind else {
         return Err(format!(
             "lower_distributed_plan edge target_exchange_node_id={} in target fragment id={} must target Exchange",
             edge.target_exchange_node_id, target_fragment.fragment_id
@@ -1016,52 +1016,56 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         node: &super::node::DistributedPlanNode,
     ) -> Result<LoweredDistributedNode, String> {
         let mut lowered = match &node.kind {
-            super::node::DistributedPlanNodeKind::Scan(scan) => {
-                self.lower_scan_node(node, scan.as_ref())?
-            }
-            super::node::DistributedPlanNodeKind::Project(project) => {
+            super::node::PlanNodeKind::Scan(scan) => self.lower_scan_node(node, scan)?,
+            super::node::PlanNodeKind::Project(project) => {
                 self.lower_project_node(node, project)?
             }
-            super::node::DistributedPlanNodeKind::Filter(filter) => {
-                self.lower_filter_node(node, filter)?
-            }
-            super::node::DistributedPlanNodeKind::Sort(sort) => self.lower_sort_node(node, sort)?,
-            super::node::DistributedPlanNodeKind::TopN(topn) => self.lower_topn_node(node, topn)?,
-            super::node::DistributedPlanNodeKind::Exchange(exchange) => {
+            super::node::PlanNodeKind::Filter(filter) => self.lower_filter_node(node, filter)?,
+            super::node::PlanNodeKind::Sort(sort) => self.lower_sort_node(node, sort)?,
+            super::node::PlanNodeKind::TopN(topn) => self.lower_topn_node(node, topn)?,
+            super::node::PlanNodeKind::Exchange(exchange) => {
                 self.lower_exchange_node(node, exchange)?
             }
-            super::node::DistributedPlanNodeKind::HashAggregate(agg) => {
+            super::node::PlanNodeKind::HashAggregate(agg) => {
                 self.lower_hash_aggregate_node(node, agg.as_ref())?
             }
-            super::node::DistributedPlanNodeKind::HashJoin(hash_join) => {
+            super::node::PlanNodeKind::HashJoin(hash_join) => {
                 self.lower_hash_join_node(node, hash_join.as_ref())?
             }
-            super::node::DistributedPlanNodeKind::NestLoopJoin(nest_loop) => {
+            super::node::PlanNodeKind::NestLoopJoin(nest_loop) => {
                 self.lower_nest_loop_join_node(node, nest_loop)?
             }
-            super::node::DistributedPlanNodeKind::Values(values) => {
-                self.lower_values_node(node, values)?
-            }
-            super::node::DistributedPlanNodeKind::AssertOneRow(assert_one_row) => {
+            super::node::PlanNodeKind::Values(values) => self.lower_values_node(node, values)?,
+            super::node::PlanNodeKind::AssertOneRow(assert_one_row) => {
                 self.lower_assert_one_row_node(node, assert_one_row)?
             }
-            super::node::DistributedPlanNodeKind::Decode(decode) => {
-                self.lower_decode_node(node, decode)?
-            }
-            super::node::DistributedPlanNodeKind::Repeat(repeat) => {
-                self.lower_repeat_node(node, repeat.as_ref())?
-            }
-            super::node::DistributedPlanNodeKind::SetOp(set_op) => {
-                self.lower_set_op_node(node, set_op)?
-            }
-            super::node::DistributedPlanNodeKind::Window(window) => {
-                self.lower_window_node(node, window.as_ref())?
-            }
-            super::node::DistributedPlanNodeKind::GenerateSeries(generate_series) => {
+            super::node::PlanNodeKind::Decode(decode) => self.lower_decode_node(node, decode)?,
+            super::node::PlanNodeKind::Repeat(repeat) => self.lower_repeat_node(node, repeat)?,
+            super::node::PlanNodeKind::SetOp(set_op) => self.lower_set_op_node(node, set_op)?,
+            super::node::PlanNodeKind::Window(window) => self.lower_window_node(node, window)?,
+            super::node::PlanNodeKind::GenerateSeries(generate_series) => {
                 self.lower_generate_series_node(node, generate_series)?
             }
-            super::node::DistributedPlanNodeKind::TableFunction(table_function) => {
-                self.lower_table_function_node(node, table_function.as_ref())?
+            super::node::PlanNodeKind::TableFunction(table_function) => {
+                self.lower_table_function_node(node, table_function)?
+            }
+            super::node::PlanNodeKind::Limit(_)
+            | super::node::PlanNodeKind::Aggregate(_)
+            | super::node::PlanNodeKind::Join(_)
+            | super::node::PlanNodeKind::Union(_)
+            | super::node::PlanNodeKind::Intersect(_)
+            | super::node::PlanNodeKind::Except(_)
+            | super::node::PlanNodeKind::CTEAnchor(_)
+            | super::node::PlanNodeKind::CTEProduce(_)
+            | super::node::PlanNodeKind::CTEConsume(_)
+            | super::node::PlanNodeKind::AggregateStateMerge(_)
+            | super::node::PlanNodeKind::Apply(_)
+            | super::node::PlanNodeKind::ImvDelta(_)
+            | super::node::PlanNodeKind::ImvVersion(_) => {
+                return Err(format!(
+                    "logical plan node {} leaked into distributed lowering",
+                    node.kind.variant_name()
+                ));
             }
         };
         if let Some(root) = lowered.plan_nodes.first_mut() {
@@ -1532,9 +1536,12 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         }
         let child = self.lower_node(&node.children[0])?;
         let op = repeat_node_to_physical_op(repeat);
+        let virtual_tuple_id = repeat.virtual_tuple_id.ok_or_else(|| {
+            "distributed Repeat node missing virtual_tuple_id during lowering".to_string()
+        })?;
         let (plan_node, scope, tuple_ids, output_columns) = self.lower_repeat(
             node.node_id,
-            repeat.virtual_tuple_id,
+            virtual_tuple_id,
             &op,
             child.scope,
             child.tuple_ids,
@@ -2908,11 +2915,11 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         // the pipeline engine to run sort locally per partition instead of
         // doing a global merge — matching StarRocks's parallel analytic
         // sort behaviour. Empty for plain ORDER BY.
-        let analytic_partition_exprs = if op.analytic_partition_exprs.is_empty() {
+        let analytic_partition_exprs = if op.analytic_partition_by.is_empty() {
             None
         } else {
-            let mut out = Vec::with_capacity(op.analytic_partition_exprs.len());
-            for expr in &op.analytic_partition_exprs {
+            let mut out = Vec::with_capacity(op.analytic_partition_by.len());
+            for expr in &op.analytic_partition_by {
                 let mut compiler = ExprCompiler::new(state.slot_allocator(), child_scope);
                 out.push(compiler.compile_typed(expr)?);
             }
@@ -2926,8 +2933,8 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
         // is set true ONLY via partition_limit.
         let (partition_exprs_t, partition_limit_t, topn_type_t, use_top_n_for_partition) =
             if let Some(limit) = op.partition_limit {
-                let mut keys = Vec::with_capacity(op.analytic_partition_exprs.len());
-                for expr in &op.analytic_partition_exprs {
+                let mut keys = Vec::with_capacity(op.analytic_partition_by.len());
+                for expr in &op.analytic_partition_by {
                     let mut compiler = ExprCompiler::new(state.slot_allocator(), child_scope);
                     keys.push(compiler.compile_typed(expr)?);
                 }
@@ -4529,8 +4536,8 @@ mod tests {
         DistributedNestLoopJoinNode, DistributedValuesNode, ExchangeFlavor,
     };
     use crate::sql::codegen::ir::{
-        DataPartition, DataSink, DistributedPlan, DistributedPlanNode, DistributedPlanNodeKind,
-        PartitionKind, PlanFragment, PlanNodeStats, build_distributed_plan,
+        DataPartition, DataSink, DistributedPlan, DistributedPlanNode, PartitionKind, PlanFragment,
+        PlanNodeKind, PlanNodeStats, build_distributed_plan,
     };
     use crate::sql::codegen::resolve::{ColumnBinding, ExprScope};
     use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentStreamKind};
@@ -4947,9 +4954,7 @@ mod tests {
         );
 
         let mut mismatched_source = distributed_values_multi_fragment_plan();
-        let DistributedPlanNodeKind::Exchange(exchange) =
-            &mut mismatched_source.fragments[1].root.kind
-        else {
+        let PlanNodeKind::Exchange(exchange) = &mut mismatched_source.fragments[1].root.kind else {
             panic!("root should be exchange");
         };
         exchange.source_fragment_id = 42;
@@ -5104,7 +5109,7 @@ mod tests {
             probe_runtime_filters: vec![],
             children: vec![],
             stats: PlanNodeStats::from_statistics(&Statistics::default()),
-            kind: DistributedPlanNodeKind::Values(DistributedValuesNode {
+            kind: PlanNodeKind::Values(DistributedValuesNode {
                 rows: vec![],
                 columns,
             }),
@@ -5128,7 +5133,7 @@ mod tests {
             probe_runtime_filters: vec![],
             children: vec![],
             stats: PlanNodeStats::from_statistics(&Statistics::default()),
-            kind: DistributedPlanNodeKind::Exchange(DistributedExchangeNode {
+            kind: PlanNodeKind::Exchange(DistributedExchangeNode {
                 partition_type: crate::partitions::TPartitionType::UNPARTITIONED,
                 partition_exprs: vec![],
                 source_fragment_id,

@@ -3329,7 +3329,7 @@ fn explain_logical_query(
     let (resolved, cte_registry, mut factory) =
         crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
-    let lines = crate::sql::explain::explain_plan(&logical, level);
+    let lines = crate::sql::explain::explain_plan_checked(&logical, level)?;
     build_string_query_result("Explain String", lines)
 }
 
@@ -3941,10 +3941,10 @@ fn collect_scan_stats(
     plan: &crate::sql::planner::plan::LogicalPlanNode,
     out: &mut std::collections::HashMap<String, crate::sql::optimizer::statistics::TableStatistics>,
 ) {
-    use crate::sql::planner::plan::LogicalPlanNodeKind;
+    use crate::sql::planner::plan::PlanNodeKind;
 
     match &plan.kind {
-        LogicalPlanNodeKind::Scan(s) => {
+        PlanNodeKind::Scan(s) => {
             if let crate::sql::catalog::ScanSource::IcebergDataFiles {
                 table,
                 files,
@@ -3972,7 +3972,7 @@ fn collect_scan_stats(
                 }
             }
         }
-        LogicalPlanNodeKind::ImvDelta(_) | LogicalPlanNodeKind::ImvVersion(_) => {
+        PlanNodeKind::ImvDelta(_) | PlanNodeKind::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
         }
         _ => {}

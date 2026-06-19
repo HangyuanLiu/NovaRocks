@@ -15,8 +15,8 @@ use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
 use crate::sql::planner::plan::{
-    LogicalAggregateNode, LogicalImvDeltaNode, LogicalPlanNode, LogicalPlanNodeKind,
-    LogicalProjectNode, LogicalUnionNode,
+    LogicalAggregateNode, LogicalImvDeltaNode, LogicalPlanNode, LogicalProjectNode,
+    LogicalUnionNode, PlanNodeKind,
 };
 
 pub(crate) struct RewriteBranchUnionRule;
@@ -36,7 +36,7 @@ impl LogicalRewriteRule for RewriteBranchUnionRule {
 
     fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
         let plan = opt_expr_to_plan(expr.clone(), ctx);
-        let LogicalPlanNodeKind::ImvDelta(delta) = &plan.kind else {
+        let PlanNodeKind::ImvDelta(delta) = &plan.kind else {
             return false;
         };
         if !delta.is_root {
@@ -45,7 +45,7 @@ impl LogicalRewriteRule for RewriteBranchUnionRule {
         let input = plan.unary_input();
         matches!(
             &input.kind,
-            LogicalPlanNodeKind::Union(union)
+            PlanNodeKind::Union(union)
                 if union.all
                     && input.children.iter().all(is_branch_union_aggregate_branch)
                     && !plan_contains_imv_marker(input)
@@ -59,7 +59,7 @@ impl LogicalRewriteRule for RewriteBranchUnionRule {
                 mut children,
                 required_output_columns: _,
             } = plan;
-            let LogicalPlanNodeKind::ImvDelta(delta) = kind else {
+            let PlanNodeKind::ImvDelta(delta) = kind else {
                 return Ok(PlanRewriteResult::Unchanged);
             };
             if !delta.is_root {
@@ -75,7 +75,7 @@ impl LogicalRewriteRule for RewriteBranchUnionRule {
                 children: inputs,
                 required_output_columns,
             } = union_plan;
-            let LogicalPlanNodeKind::Union(union) = kind else {
+            let PlanNodeKind::Union(union) = kind else {
                 return Ok(PlanRewriteResult::Unchanged);
             };
             if !union.all {
@@ -127,12 +127,12 @@ impl LogicalRewriteRule for RewriteBranchUnionRule {
                     branch_id,
                 };
                 let aggregate = LogicalPlanNode::new(
-                    LogicalPlanNodeKind::Aggregate(branch.aggregate),
+                    PlanNodeKind::Aggregate(branch.aggregate),
                     vec![branch.aggregate_input],
                     branch.aggregate_required_output_columns,
                 );
                 let core = LogicalPlanNode::new(
-                    LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+                    PlanNodeKind::ImvDelta(LogicalImvDeltaNode {
                         is_root: true,
                         action_column,
                         branch_scope: Some(scope),
@@ -150,7 +150,7 @@ impl LogicalRewriteRule for RewriteBranchUnionRule {
             }
 
             Ok(PlanRewriteResult::Changed(LogicalPlanNode::new(
-                LogicalPlanNodeKind::Union(LogicalUnionNode {
+                PlanNodeKind::Union(LogicalUnionNode {
                     all: true,
                     output_columns: branch_union_output_columns(output_columns, branch_id_column),
                 }),
@@ -175,9 +175,9 @@ struct BranchUnionAggregateProject {
 
 fn is_branch_union_aggregate_branch(plan: &LogicalPlanNode) -> bool {
     match &plan.kind {
-        LogicalPlanNodeKind::Aggregate(_) => true,
-        LogicalPlanNodeKind::Project(_) => {
-            matches!(&plan.unary_input().kind, LogicalPlanNodeKind::Aggregate(_))
+        PlanNodeKind::Aggregate(_) => true,
+        PlanNodeKind::Project(_) => {
+            matches!(&plan.unary_input().kind, PlanNodeKind::Aggregate(_))
         }
         _ => false,
     }
@@ -192,13 +192,13 @@ fn extract_branch_union_aggregate_branch(
         required_output_columns,
     } = branch;
     match kind {
-        LogicalPlanNodeKind::Aggregate(aggregate) => Some(BranchUnionAggregateBranch {
+        PlanNodeKind::Aggregate(aggregate) => Some(BranchUnionAggregateBranch {
             aggregate,
             aggregate_input: single_child(&mut children)?,
             aggregate_required_output_columns: required_output_columns,
             post_project: None,
         }),
-        LogicalPlanNodeKind::Project(project) => {
+        PlanNodeKind::Project(project) => {
             let LogicalProjectNode {
                 items,
                 output_qualifier,
@@ -209,7 +209,7 @@ fn extract_branch_union_aggregate_branch(
                 mut children,
                 required_output_columns: aggregate_required_output_columns,
             } = aggregate_plan;
-            let LogicalPlanNodeKind::Aggregate(aggregate) = kind else {
+            let PlanNodeKind::Aggregate(aggregate) = kind else {
                 return None;
             };
             Some(BranchUnionAggregateBranch {
@@ -243,7 +243,7 @@ fn append_branch_id_to_project(
     let mut items = project.items;
     items.push(branch_id_project_item(branch_id, branch_id_column));
     Ok(LogicalPlanNode::new(
-        LogicalPlanNodeKind::Project(LogicalProjectNode {
+        PlanNodeKind::Project(LogicalProjectNode {
             items,
             output_qualifier: project.output_qualifier,
         }),
@@ -294,7 +294,7 @@ fn append_branch_id_project(
         .collect::<Vec<_>>();
     items.push(branch_id_project_item(branch_id, branch_id_column));
     Ok(LogicalPlanNode::new(
-        LogicalPlanNodeKind::Project(LogicalProjectNode {
+        PlanNodeKind::Project(LogicalProjectNode {
             items,
             output_qualifier: None,
         }),
@@ -318,12 +318,12 @@ fn branch_union_output_columns(
 
 fn plan_kind(plan: &LogicalPlanNode) -> &'static str {
     match &plan.kind {
-        LogicalPlanNodeKind::Scan(_) => "Scan",
-        LogicalPlanNodeKind::Filter(_) => "Filter",
-        LogicalPlanNodeKind::Project(_) => "Project",
-        LogicalPlanNodeKind::Aggregate(_) => "Aggregate",
-        LogicalPlanNodeKind::Join(_) => "Join",
-        LogicalPlanNodeKind::Union(_) => "Union",
+        PlanNodeKind::Scan(_) => "Scan",
+        PlanNodeKind::Filter(_) => "Filter",
+        PlanNodeKind::Project(_) => "Project",
+        PlanNodeKind::Aggregate(_) => "Aggregate",
+        PlanNodeKind::Join(_) => "Join",
+        PlanNodeKind::Union(_) => "Union",
         _ => "Other",
     }
 }
@@ -362,7 +362,7 @@ mod tests {
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::{
         AggregateCall, LogicalAggregateNode, LogicalFilterNode, LogicalJoinNode, LogicalPlanNode,
-        LogicalPlanNodeKind, LogicalProjectNode, LogicalScanNode, LogicalUnionNode,
+        LogicalProjectNode, LogicalScanNode, LogicalUnionNode, PlanNodeKind,
     };
 
     #[test]
@@ -370,7 +370,7 @@ mod tests {
         let rule = RewriteBranchUnionRule;
         let mut ctx = build_ctx();
         let plan = root_delta(LogicalPlanNode::new(
-            LogicalPlanNodeKind::Union(LogicalUnionNode {
+            PlanNodeKind::Union(LogicalUnionNode {
                 all: true,
                 output_columns: vec![output_column(1, "region"), output_column(3, "s")],
             }),
@@ -393,13 +393,13 @@ mod tests {
             rewritten_expr,
             &arena.borrow(),
         );
-        let LogicalPlanNodeKind::Union(_) = &rewritten.kind else {
+        let PlanNodeKind::Union(_) = &rewritten.kind else {
             panic!("expected Changed(Union), got {rewritten:?}");
         };
 
         assert_eq!(rewritten.children.len(), 2);
         for (idx, branch) in rewritten.children.iter().enumerate() {
-            let LogicalPlanNodeKind::Project(project) = &branch.kind else {
+            let PlanNodeKind::Project(project) = &branch.kind else {
                 panic!("expected Project branch");
             };
             let branch_item = project
@@ -409,7 +409,7 @@ mod tests {
                 .expect("branch id item");
             assert_branch_id_cast(branch_item, idx as i64);
             let delta_plan = branch.unary_input();
-            let LogicalPlanNodeKind::ImvDelta(d) = &delta_plan.kind else {
+            let PlanNodeKind::ImvDelta(d) = &delta_plan.kind else {
                 panic!(
                     "branch core must be a delegated ImvDelta, got {:?}",
                     delta_plan
@@ -421,10 +421,7 @@ mod tests {
                 Some(idx as i32)
             );
             assert!(
-                matches!(
-                    &delta_plan.unary_input().kind,
-                    LogicalPlanNodeKind::Aggregate(_)
-                ),
+                matches!(&delta_plan.unary_input().kind, PlanNodeKind::Aggregate(_)),
                 "delta must sit directly over the Aggregate core"
             );
         }
@@ -435,7 +432,7 @@ mod tests {
         let rule = RewriteBranchUnionRule;
         let mut ctx = build_ctx();
         let plan = root_delta(LogicalPlanNode::new(
-            LogicalPlanNodeKind::Union(LogicalUnionNode {
+            PlanNodeKind::Union(LogicalUnionNode {
                 all: true,
                 output_columns: vec![output_column(1, "region"), output_column(30, "total")],
             }),
@@ -458,17 +455,17 @@ mod tests {
             rewritten_expr,
             &arena.borrow(),
         );
-        let LogicalPlanNodeKind::Union(_) = &rewritten.kind else {
+        let PlanNodeKind::Union(_) = &rewritten.kind else {
             panic!("expected Changed(Union), got {rewritten:?}");
         };
 
         assert_eq!(rewritten.children.len(), 2);
         for (idx, branch) in rewritten.children.iter().enumerate() {
-            let LogicalPlanNodeKind::Project(project) = &branch.kind else {
+            let PlanNodeKind::Project(project) = &branch.kind else {
                 panic!("expected Project branch");
             };
             let delta_plan = branch.unary_input();
-            let LogicalPlanNodeKind::ImvDelta(d) = &delta_plan.kind else {
+            let PlanNodeKind::ImvDelta(d) = &delta_plan.kind else {
                 panic!(
                     "branch core must be a delegated ImvDelta, got {:?}",
                     delta_plan
@@ -480,10 +477,7 @@ mod tests {
                 Some(idx as i32)
             );
             assert!(
-                matches!(
-                    &delta_plan.unary_input().kind,
-                    LogicalPlanNodeKind::Aggregate(_)
-                ),
+                matches!(&delta_plan.unary_input().kind, PlanNodeKind::Aggregate(_)),
                 "delta must sit directly over the Aggregate core"
             );
             assert!(project.items.iter().any(|item| {
@@ -503,7 +497,7 @@ mod tests {
         let rule = RewriteBranchUnionRule;
         let mut ctx = build_ctx();
         let plan = root_delta(LogicalPlanNode::new(
-            LogicalPlanNodeKind::Union(LogicalUnionNode {
+            PlanNodeKind::Union(LogicalUnionNode {
                 all: true,
                 output_columns: vec![output_column(1, "region"), output_column(3, "s")],
             }),
@@ -527,13 +521,13 @@ mod tests {
         let rule = RewriteBranchUnionRule;
         let ctx = build_ctx();
         let plan = root_delta(LogicalPlanNode::new(
-            LogicalPlanNodeKind::Union(LogicalUnionNode {
+            PlanNodeKind::Union(LogicalUnionNode {
                 all: true,
                 output_columns: vec![output_column(1, "region"), output_column(3, "s")],
             }),
             vec![
                 LogicalPlanNode::new(
-                    LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+                    PlanNodeKind::ImvDelta(LogicalImvDeltaNode {
                         is_root: false,
                         action_column: None,
                         branch_scope: None,
@@ -556,7 +550,7 @@ mod tests {
         let rule = RewriteBranchUnionRule;
         let ctx = build_ctx();
         let plan = root_delta(LogicalPlanNode::new(
-            LogicalPlanNodeKind::Union(LogicalUnionNode {
+            PlanNodeKind::Union(LogicalUnionNode {
                 all: true,
                 output_columns: vec![output_column(1, "region"), output_column(2, "amount")],
             }),
@@ -578,7 +572,7 @@ mod tests {
         // build_ctx() registers ice.db.b as the only known base table; both
         // branches must reference that same table so scan binding succeeds.
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Union(LogicalUnionNode {
+            PlanNodeKind::Union(LogicalUnionNode {
                 all: true,
                 output_columns: vec![output_column(1, "region"), output_column(3, "s")],
             }),
@@ -601,7 +595,7 @@ mod tests {
             !plan_contains_imv_marker(&out),
             "no marker may survive validation"
         );
-        let LogicalPlanNodeKind::Union(union) = &out.kind else {
+        let PlanNodeKind::Union(union) = &out.kind else {
             panic!("expected top Union, got {out:?}")
         };
         assert_eq!(out.children.len(), 2);
@@ -613,13 +607,13 @@ mod tests {
             "union output must expose __branch_id__"
         );
         for branch in &out.children {
-            let LogicalPlanNodeKind::Project(p) = &branch.kind else {
+            let PlanNodeKind::Project(p) = &branch.kind else {
                 panic!("expected Project branch, got {branch:?}")
             };
             assert!(
                 matches!(
                     &branch.unary_input().kind,
-                    LogicalPlanNodeKind::AggregateStateMerge(_)
+                    PlanNodeKind::AggregateStateMerge(_)
                 ),
                 "expected Project over AggregateStateMerge, got {:?}",
                 branch.unary_input()
@@ -771,7 +765,7 @@ mod tests {
 
     fn root_delta(input: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+            PlanNodeKind::ImvDelta(LogicalImvDeltaNode {
                 is_root: true,
                 action_column: None,
                 branch_scope: None,
@@ -783,7 +777,7 @@ mod tests {
 
     fn aggregate_over(input: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+            PlanNodeKind::Aggregate(LogicalAggregateNode {
                 group_by: vec![col_expr(1, "region")],
                 aggregates: vec![AggregateCall {
                     name: "sum".to_string(),
@@ -803,7 +797,7 @@ mod tests {
 
     fn project_over_aggregate(input: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
+            PlanNodeKind::Project(LogicalProjectNode {
                 items: vec![
                     ProjectItem {
                         expr: col_expr(1, "region"),
@@ -826,7 +820,7 @@ mod tests {
     fn scan(name: &str, first_id: u32) -> LogicalPlanNode {
         let columns = vec![column_def("region"), column_def("amount")];
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Scan(LogicalScanNode {
+            PlanNodeKind::Scan(LogicalScanNode {
                 database: "db".to_string(),
                 table: TableDef {
                     name: name.to_string(),
@@ -859,6 +853,7 @@ mod tests {
                 required_columns: None,
                 dict_columns: Vec::new(),
                 variant_columns: Vec::new(),
+                mv_rewritten_from: None,
             }),
             vec![],
             None,
@@ -867,7 +862,7 @@ mod tests {
 
     fn project_over_filter(name: &str, first_id: u32) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
+            PlanNodeKind::Project(LogicalProjectNode {
                 items: vec![
                     ProjectItem {
                         expr: col_expr(first_id, "region"),
@@ -889,7 +884,7 @@ mod tests {
 
     fn filter_over(input: LogicalPlanNode, column_id: u32, column: &str) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+            PlanNodeKind::Filter(LogicalFilterNode {
                 predicate: TypedExpr {
                     kind: ExprKind::BinaryOp {
                         left: Box::new(col_expr(column_id, column)),
@@ -962,7 +957,7 @@ mod tests {
             nullable: false,
         };
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Join(LogicalJoinNode {
+            PlanNodeKind::Join(LogicalJoinNode {
                 join_type: JoinKind::Inner,
                 condition: Some(condition),
             }),
@@ -1044,7 +1039,7 @@ mod tests {
         // project_over_aggregate outputs: region (id=1) and total (id=30).
         // Both branches reference the registered base "ice.db.b" so scan binding succeeds.
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Union(LogicalUnionNode {
+            PlanNodeKind::Union(LogicalUnionNode {
                 all: true,
                 output_columns: vec![output_column(1, "region"), output_column(30, "total")],
             }),
@@ -1067,7 +1062,7 @@ mod tests {
             !plan_contains_imv_marker(&out),
             "no marker may survive: each Project-over-Aggregate branch must fully decompose"
         );
-        let LogicalPlanNodeKind::Union(union) = &out.kind else {
+        let PlanNodeKind::Union(union) = &out.kind else {
             panic!("expected top Union, got {out:?}")
         };
         assert_eq!(out.children.len(), 2);
@@ -1079,13 +1074,13 @@ mod tests {
             "union output must expose __branch_id__"
         );
         for branch in &out.children {
-            let LogicalPlanNodeKind::Project(p) = &branch.kind else {
+            let PlanNodeKind::Project(p) = &branch.kind else {
                 panic!("expected Project branch, got {branch:?}")
             };
             assert!(
                 matches!(
                     &branch.unary_input().kind,
-                    LogicalPlanNodeKind::AggregateStateMerge(_)
+                    PlanNodeKind::AggregateStateMerge(_)
                 ),
                 "Project-over-Aggregate branch must land on AggregateStateMerge, got {:?}",
                 branch.unary_input()
@@ -1107,7 +1102,7 @@ mod tests {
 
         let mut ctx = build_ctx();
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Union(LogicalUnionNode {
+            PlanNodeKind::Union(LogicalUnionNode {
                 all: true,
                 output_columns: vec![output_column(1, "region"), output_column(3, "s")],
             }),

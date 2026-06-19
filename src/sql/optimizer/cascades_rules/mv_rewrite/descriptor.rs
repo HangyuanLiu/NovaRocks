@@ -13,7 +13,7 @@ use crate::sql::optimizer::memo::{MExpr, Memo};
 use crate::sql::optimizer::operator::{AggStage, LogicalAggregateOp, Operator};
 use crate::sql::optimizer::scalar::materialize;
 use crate::sql::optimizer::scalar_bridge::{materialize_aggregate_call, materialize_project_item};
-use crate::sql::planner::plan::{AggregateCall, LogicalPlanNode, LogicalPlanNodeKind};
+use crate::sql::planner::plan::{AggregateCall, LogicalPlanNode, PlanNodeKind};
 
 /// What the alternative must reproduce at the matched group's top.
 ///
@@ -86,7 +86,7 @@ impl SpjgDescriptor {
 
         // Optional top project (rebinding of aggregate/scan outputs).
         let top_project = match &node.kind {
-            LogicalPlanNodeKind::Project(p) => {
+            PlanNodeKind::Project(p) => {
                 node = node.unary_input();
                 Some(p)
             }
@@ -94,7 +94,7 @@ impl SpjgDescriptor {
         };
 
         let aggregate = match &node.kind {
-            LogicalPlanNodeKind::Aggregate(a) => {
+            PlanNodeKind::Aggregate(a) => {
                 node = node.unary_input();
                 Some(a)
             }
@@ -104,7 +104,7 @@ impl SpjgDescriptor {
         // Optional pre-aggregate project (planner may compute group-key /
         // agg-arg expressions in a project below the aggregate).
         let mid_project = match &node.kind {
-            LogicalPlanNodeKind::Project(p) => {
+            PlanNodeKind::Project(p) => {
                 node = node.unary_input();
                 Some(p)
             }
@@ -112,12 +112,12 @@ impl SpjgDescriptor {
         };
 
         let mut predicates: Vec<TypedExpr> = Vec::new();
-        while let LogicalPlanNodeKind::Filter(f) = &node.kind {
+        while let PlanNodeKind::Filter(f) = &node.kind {
             split_conjuncts(&f.predicate, &mut predicates);
             node = node.unary_input();
         }
 
-        let LogicalPlanNodeKind::Scan(scan) = &node.kind else {
+        let PlanNodeKind::Scan(scan) = &node.kind else {
             return Err(format!(
                 "not a single-table SPJG shape: unexpected node {:?}",
                 std::mem::discriminant(&node.kind)
@@ -840,8 +840,8 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::plan::*;
     use crate::sql::planner::plan::{
-        AggregateCall, LogicalAggregateNode, LogicalFilterNode, LogicalPlanNode,
-        LogicalPlanNodeKind, LogicalScanNode, LogicalSortNode,
+        AggregateCall, LogicalAggregateNode, LogicalFilterNode, LogicalPlanNode, LogicalScanNode,
+        LogicalSortNode, PlanNodeKind,
     };
     use arrow::datatypes::DataType;
 
@@ -921,11 +921,12 @@ mod tests {
             required_columns: None,
             dict_columns: vec![],
             variant_columns: vec![],
+            mv_rewritten_from: None,
         }
     }
 
     fn scan_plan(cols: &[OutputColumn]) -> LogicalPlanNode {
-        LogicalPlanNode::new(LogicalPlanNodeKind::Scan(scan(cols)), vec![], None)
+        LogicalPlanNode::new(PlanNodeKind::Scan(scan(cols)), vec![], None)
     }
 
     #[test]
@@ -933,7 +934,7 @@ mod tests {
         let a = col(1, "a");
         let b = col(2, "b");
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+            PlanNodeKind::Filter(LogicalFilterNode {
                 predicate: cmp(col_ref(&a), crate::sql::analysis::BinOp::Ge, int_lit(5)),
             }),
             vec![scan_plan(&[a.clone(), b.clone()])],
@@ -952,7 +953,7 @@ mod tests {
         let v = col(2, "v");
         let sum_out = col(3, "s");
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+            PlanNodeKind::Aggregate(LogicalAggregateNode {
                 group_by: vec![col_ref(&a)],
                 aggregates: vec![AggregateCall {
                     name: "sum".to_string(),
@@ -983,9 +984,11 @@ mod tests {
         // Any node outside {Scan, Filter, Project, Aggregate} must yield Err.
         let a = col(1, "a");
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Sort(LogicalSortNode {
+            PlanNodeKind::Sort(LogicalSortNode {
                 items: vec![],
                 analytic_partition_by: vec![],
+                output_columns: vec![],
+                offset: None,
                 partition_limit: None,
                 topn_type: None,
             }),
@@ -1010,7 +1013,7 @@ mod tests {
         let a = col(1, "a");
         let b = col(2, "b");
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+            PlanNodeKind::Filter(LogicalFilterNode {
                 predicate: cmp(col_ref(&a), crate::sql::analysis::BinOp::Ge, int_lit(5)),
             }),
             vec![scan_plan(&[a.clone(), b.clone()])],
@@ -1032,7 +1035,7 @@ mod tests {
         let v = col(2, "v");
         let sum_out = col(3, "s");
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+            PlanNodeKind::Aggregate(LogicalAggregateNode {
                 group_by: vec![col_ref(&a)],
                 aggregates: vec![AggregateCall {
                     name: "sum".to_string(),
@@ -1075,7 +1078,7 @@ mod tests {
         let v = col(2, "v");
         let sum_out = col(3, "s");
         let scan_op = scan(&[a.clone(), v.clone()]);
-        let plan = LogicalPlanNode::new(LogicalPlanNodeKind::Scan(scan_op), vec![], None);
+        let plan = LogicalPlanNode::new(PlanNodeKind::Scan(scan_op), vec![], None);
         let mut memo = crate::sql::optimizer::memo::Memo::new();
         let scan_gid = crate::sql::optimizer::convert::logical_plan_to_memo(&plan, &mut memo);
         let group_by = intern_exprs(&mut memo.scalars, &[col_ref(&a)]);

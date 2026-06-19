@@ -11,16 +11,16 @@ pub(crate) struct CTEContext {
 pub(crate) fn collect_cte_counts(plan: &LogicalPlanNode) -> CTEContext {
     fn visit(plan: &LogicalPlanNode, ctx: &mut CTEContext) {
         match &plan.kind {
-            LogicalPlanNodeKind::CTEAnchor(node) => {
+            PlanNodeKind::CTEAnchor(node) => {
                 ctx.produces.insert(node.cte_id);
                 for child in &plan.children {
                     visit(child, ctx);
                 }
             }
-            LogicalPlanNodeKind::CTEConsume(node) => {
+            PlanNodeKind::CTEConsume(node) => {
                 *ctx.consume_count.entry(node.cte_id).or_insert(0) += 1;
             }
-            LogicalPlanNodeKind::ImvDelta(_) | LogicalPlanNodeKind::ImvVersion(_) => {
+            PlanNodeKind::ImvDelta(_) | PlanNodeKind::ImvVersion(_) => {
                 panic!("imv marker leaked into non-IMV plan");
             }
             _ => {
@@ -41,7 +41,7 @@ pub(crate) fn inline_single_use_ctes(
     ctx: &CTEContext,
 ) -> Result<LogicalPlanNode, String> {
     match &plan.kind {
-        LogicalPlanNodeKind::CTEAnchor(node) => {
+        PlanNodeKind::CTEAnchor(node) => {
             let cte_id = node.cte_id;
             let produce = inline_single_use_ctes(plan.take_child(0), ctx)?;
             let consumer = inline_single_use_ctes(plan.take_child(0), ctx)?;
@@ -52,7 +52,7 @@ pub(crate) fn inline_single_use_ctes(
             if ctx.produces.contains(&cte_id) && consume_count <= 1 {
                 let produce_input = if matches!(
                     &produce.kind,
-                    LogicalPlanNodeKind::CTEProduce(produce_node) if produce_node.cte_id == cte_id
+                    PlanNodeKind::CTEProduce(produce_node) if produce_node.cte_id == cte_id
                 ) {
                     produce.into_single_child()
                 } else {
@@ -64,7 +64,7 @@ pub(crate) fn inline_single_use_ctes(
                 Ok(plan)
             }
         }
-        LogicalPlanNodeKind::ImvDelta(_) | LogicalPlanNodeKind::ImvVersion(_) => {
+        PlanNodeKind::ImvDelta(_) | PlanNodeKind::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
         }
         _ => {
@@ -84,15 +84,15 @@ fn replace_cte_consume(
     replacement: &LogicalPlanNode,
 ) -> Result<LogicalPlanNode, String> {
     match &plan.kind {
-        LogicalPlanNodeKind::CTEConsume(node) if node.cte_id == cte_id => {
+        PlanNodeKind::CTEConsume(node) if node.cte_id == cte_id => {
             crate::sql::planner::adapt_plan_output_with_qualifier(
                 replacement.clone(),
                 &node.output_columns,
                 Some(&node.alias),
             )
         }
-        LogicalPlanNodeKind::CTEConsume(_) => Ok(plan),
-        LogicalPlanNodeKind::ImvDelta(_) | LogicalPlanNodeKind::ImvVersion(_) => {
+        PlanNodeKind::CTEConsume(_) => Ok(plan),
+        PlanNodeKind::ImvDelta(_) | PlanNodeKind::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
         }
         _ => {
@@ -116,7 +116,7 @@ mod tests {
 
     fn scan_plan() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Scan(LogicalScanNode {
+            PlanNodeKind::Scan(LogicalScanNode {
                 database: "db".to_string(),
                 table: TableDef {
                     name: "t1".to_string(),
@@ -145,6 +145,7 @@ mod tests {
                 required_columns: None,
                 dict_columns: vec![],
                 variant_columns: vec![],
+                mv_rewritten_from: None,
             }),
             vec![],
             None,
@@ -173,7 +174,7 @@ mod tests {
 
     fn consume_plan(cte_id: CteId, alias: &str) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::CTEConsume(LogicalCTEConsumeNode {
+            PlanNodeKind::CTEConsume(LogicalCTEConsumeNode {
                 cte_id: cte_id,
                 alias: alias.to_string(),
                 output_columns: output_columns(),
@@ -189,7 +190,7 @@ mod tests {
         output_columns: Vec<OutputColumn>,
     ) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::CTEConsume(LogicalCTEConsumeNode {
+            PlanNodeKind::CTEConsume(LogicalCTEConsumeNode {
                 cte_id: cte_id,
                 alias: alias.to_string(),
                 output_columns: output_columns,
@@ -202,10 +203,10 @@ mod tests {
     #[test]
     fn test_collect_cte_counts_counts_consumes() {
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: 1 }),
+            PlanNodeKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: 1 }),
             vec![
                 LogicalPlanNode::new(
-                    LogicalPlanNodeKind::CTEProduce(LogicalCTEProduceNode {
+                    PlanNodeKind::CTEProduce(LogicalCTEProduceNode {
                         cte_id: 1,
                         output_columns: output_columns(),
                     }),
@@ -213,7 +214,7 @@ mod tests {
                     None,
                 ),
                 LogicalPlanNode::new(
-                    LogicalPlanNodeKind::CTEConsume(LogicalCTEConsumeNode {
+                    PlanNodeKind::CTEConsume(LogicalCTEConsumeNode {
                         cte_id: 1,
                         alias: "t".to_string(),
                         output_columns: output_columns(),
@@ -233,10 +234,10 @@ mod tests {
     #[test]
     fn test_inline_single_use_cte_removes_anchor_without_alias_node() {
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: 1 }),
+            PlanNodeKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: 1 }),
             vec![
                 LogicalPlanNode::new(
-                    LogicalPlanNodeKind::CTEProduce(LogicalCTEProduceNode {
+                    PlanNodeKind::CTEProduce(LogicalCTEProduceNode {
                         cte_id: 1,
                         output_columns: output_columns(),
                     }),
@@ -252,7 +253,7 @@ mod tests {
         let rewritten = inline_single_use_ctes(plan, &ctx).expect("inline should succeed");
         assert!(matches!(
             &rewritten.kind,
-            LogicalPlanNodeKind::Scan(_) | LogicalPlanNodeKind::Project(_)
+            PlanNodeKind::Scan(_) | PlanNodeKind::Project(_)
         ));
     }
 
@@ -261,10 +262,10 @@ mod tests {
         let consume_output_id = ColumnId::new_for_test(42);
         let consume_output_columns = output_columns_with_id_and_name(consume_output_id, "x_id");
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: 1 }),
+            PlanNodeKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: 1 }),
             vec![
                 LogicalPlanNode::new(
-                    LogicalPlanNodeKind::CTEProduce(LogicalCTEProduceNode {
+                    PlanNodeKind::CTEProduce(LogicalCTEProduceNode {
                         cte_id: 1,
                         output_columns: output_columns(),
                     }),
@@ -286,7 +287,7 @@ mod tests {
         assert_eq!(output[0].name, consume_output_columns[0].name);
         assert_eq!(output[0].data_type, consume_output_columns[0].data_type);
         assert_eq!(output[0].nullable, consume_output_columns[0].nullable);
-        let LogicalPlanNodeKind::Project(project) = &rewritten.kind else {
+        let PlanNodeKind::Project(project) = &rewritten.kind else {
             panic!("expected Project adapter");
         };
         assert_eq!(project.items[0].output_name, "x_id");
@@ -296,10 +297,10 @@ mod tests {
     #[test]
     fn test_inline_single_use_cte_keeps_multi_use_anchor() {
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: 1 }),
+            PlanNodeKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: 1 }),
             vec![
                 LogicalPlanNode::new(
-                    LogicalPlanNodeKind::CTEProduce(LogicalCTEProduceNode {
+                    PlanNodeKind::CTEProduce(LogicalCTEProduceNode {
                         cte_id: 1,
                         output_columns: output_columns(),
                     }),
@@ -307,7 +308,7 @@ mod tests {
                     None,
                 ),
                 LogicalPlanNode::new(
-                    LogicalPlanNodeKind::Union(LogicalUnionNode {
+                    PlanNodeKind::Union(LogicalUnionNode {
                         all: true,
                         output_columns: vec![],
                     }),
@@ -322,16 +323,16 @@ mod tests {
         assert_eq!(ctx.consume_count.get(&1), Some(&2));
 
         let rewritten = inline_single_use_ctes(plan, &ctx).expect("inline should succeed");
-        assert!(matches!(&rewritten.kind, LogicalPlanNodeKind::CTEAnchor(_)));
+        assert!(matches!(&rewritten.kind, PlanNodeKind::CTEAnchor(_)));
     }
 
     #[test]
     fn test_inline_single_use_cte_inlines_nested_cte_inside_later_produce() {
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: 1 }),
+            PlanNodeKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: 1 }),
             vec![
                 LogicalPlanNode::new(
-                    LogicalPlanNodeKind::CTEProduce(LogicalCTEProduceNode {
+                    PlanNodeKind::CTEProduce(LogicalCTEProduceNode {
                         cte_id: 1,
                         output_columns: output_columns(),
                     }),
@@ -339,18 +340,18 @@ mod tests {
                     None,
                 ),
                 LogicalPlanNode::new(
-                    LogicalPlanNodeKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: 2 }),
+                    PlanNodeKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: 2 }),
                     vec![
                         LogicalPlanNode::new(
-                            LogicalPlanNodeKind::CTEProduce(LogicalCTEProduceNode {
+                            PlanNodeKind::CTEProduce(LogicalCTEProduceNode {
                                 cte_id: 2,
                                 output_columns: output_columns(),
                             }),
                             vec![LogicalPlanNode::new(
-                                LogicalPlanNodeKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: 1 }),
+                                PlanNodeKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: 1 }),
                                 vec![
                                     LogicalPlanNode::new(
-                                        LogicalPlanNodeKind::CTEProduce(LogicalCTEProduceNode {
+                                        PlanNodeKind::CTEProduce(LogicalCTEProduceNode {
                                             cte_id: 1,
                                             output_columns: output_columns(),
                                         }),
@@ -364,7 +365,7 @@ mod tests {
                             None,
                         ),
                         LogicalPlanNode::new(
-                            LogicalPlanNodeKind::Union(LogicalUnionNode {
+                            PlanNodeKind::Union(LogicalUnionNode {
                                 all: true,
                                 output_columns: vec![],
                             }),
@@ -385,20 +386,17 @@ mod tests {
         let rewritten = inline_single_use_ctes(plan, &ctx).expect("inline should succeed");
 
         match &rewritten.kind {
-            LogicalPlanNodeKind::CTEAnchor(anchor) => {
+            PlanNodeKind::CTEAnchor(anchor) => {
                 assert_eq!(anchor.cte_id, 2);
                 let produce_plan = rewritten.child(0);
                 match &produce_plan.kind {
-                    LogicalPlanNodeKind::CTEProduce(_) => match &produce_plan.unary_input().kind {
-                        LogicalPlanNodeKind::Scan(_) | LogicalPlanNodeKind::Project(_) => {}
+                    PlanNodeKind::CTEProduce(_) => match &produce_plan.unary_input().kind {
+                        PlanNodeKind::Scan(_) | PlanNodeKind::Project(_) => {}
                         other => panic!("expected nested inline replacement, got {other:?}"),
                     },
                     other => panic!("expected CTEProduce for b, got {other:?}"),
                 }
-                assert!(matches!(
-                    &rewritten.child(1).kind,
-                    LogicalPlanNodeKind::Union(_)
-                ));
+                assert!(matches!(&rewritten.child(1).kind, PlanNodeKind::Union(_)));
             }
             other => panic!("expected surviving anchor for b, got {other:?}"),
         }
@@ -407,10 +405,10 @@ mod tests {
     #[test]
     fn test_replace_cte_consume_only_rewrites_targeted_cte_id() {
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: 2 }),
+            PlanNodeKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: 2 }),
             vec![
                 LogicalPlanNode::new(
-                    LogicalPlanNodeKind::CTEProduce(LogicalCTEProduceNode {
+                    PlanNodeKind::CTEProduce(LogicalCTEProduceNode {
                         cte_id: 2,
                         output_columns: output_columns(),
                     }),
@@ -418,7 +416,7 @@ mod tests {
                     None,
                 ),
                 LogicalPlanNode::new(
-                    LogicalPlanNodeKind::Union(LogicalUnionNode {
+                    PlanNodeKind::Union(LogicalUnionNode {
                         all: true,
                         output_columns: vec![],
                     }),
@@ -432,16 +430,16 @@ mod tests {
         let rewritten = replace_cte_consume(plan, 1, &scan_plan()).expect("replace should succeed");
 
         match &rewritten.kind {
-            LogicalPlanNodeKind::CTEAnchor(_) => match &rewritten.child(1).kind {
-                LogicalPlanNodeKind::Union(_) => {
+            PlanNodeKind::CTEAnchor(_) => match &rewritten.child(1).kind {
+                PlanNodeKind::Union(_) => {
                     let union_plan = rewritten.child(1);
                     match &union_plan.child(0).kind {
-                        LogicalPlanNodeKind::Scan(_) | LogicalPlanNodeKind::Project(_) => {}
+                        PlanNodeKind::Scan(_) | PlanNodeKind::Project(_) => {}
                         other => panic!("expected targeted consume to be rewritten, got {other:?}"),
                     }
                     assert!(matches!(
                         &union_plan.child(1).kind,
-                        LogicalPlanNodeKind::CTEConsume(_)
+                        PlanNodeKind::CTEConsume(_)
                     ));
                 }
                 other => panic!("expected union consumer, got {other:?}"),

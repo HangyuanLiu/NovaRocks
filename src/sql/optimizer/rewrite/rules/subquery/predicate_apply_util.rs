@@ -10,7 +10,7 @@ use arrow::datatypes::DataType;
 use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, ProjectItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::rewrite::rules::utils::collect_column_id_refs;
-use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind, LogicalProjectNode};
+use crate::sql::planner::plan::{LogicalPlanNode, LogicalProjectNode, PlanNodeKind};
 use crate::sql::planner::plan_output_columns;
 
 /// Result of lifting a correlated subquery's WHERE into a join ON.
@@ -41,7 +41,7 @@ pub(super) fn lift_correlated_inner(
         required_output_columns,
     } = inner;
     match kind {
-        LogicalPlanNodeKind::Project(p) => {
+        PlanNodeKind::Project(p) => {
             if children.len() != 1 {
                 return None;
             }
@@ -51,7 +51,7 @@ pub(super) fn lift_correlated_inner(
                 mut children,
                 required_output_columns: _,
             } = filter_plan;
-            let LogicalPlanNodeKind::Filter(f) = kind else {
+            let PlanNodeKind::Filter(f) = kind else {
                 return None;
             };
             if children.len() != 1 {
@@ -68,7 +68,7 @@ pub(super) fn lift_correlated_inner(
             )?;
             Some(LiftedInner {
                 right: LogicalPlanNode::new(
-                    LogicalPlanNodeKind::Project(LogicalProjectNode {
+                    PlanNodeKind::Project(LogicalProjectNode {
                         items,
                         output_qualifier: p.output_qualifier,
                     }),
@@ -78,7 +78,7 @@ pub(super) fn lift_correlated_inner(
                 on_predicate: Some(predicate),
             })
         }
-        LogicalPlanNodeKind::Filter(f) => {
+        PlanNodeKind::Filter(f) => {
             if children.len() != 1 {
                 return None;
             }
@@ -339,7 +339,7 @@ mod tests {
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::planner::plan::{
-        LogicalFilterNode, LogicalPlanNodeKind, LogicalProjectNode, LogicalScanNode,
+        LogicalFilterNode, LogicalProjectNode, LogicalScanNode, PlanNodeKind,
     };
 
     const INNER_K: ColumnId = ColumnId(1);
@@ -349,7 +349,7 @@ mod tests {
 
     fn scan() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Scan(LogicalScanNode {
+            PlanNodeKind::Scan(LogicalScanNode {
                 database: "default".to_string(),
                 table: TableDef {
                     name: "t".to_string(),
@@ -372,6 +372,7 @@ mod tests {
                 required_columns: None,
                 dict_columns: vec![],
                 variant_columns: vec![],
+                mv_rewritten_from: None,
             }),
             vec![],
             None,
@@ -440,7 +441,7 @@ mod tests {
 
     fn project(input: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
+            PlanNodeKind::Project(LogicalProjectNode {
                 items: vec![ProjectItem {
                     expr: col_ref(INNER_K, "k"),
                     output_name: "k".to_string(),
@@ -455,7 +456,7 @@ mod tests {
 
     fn project_literal(input: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
+            PlanNodeKind::Project(LogicalProjectNode {
                 items: vec![ProjectItem {
                     expr: TypedExpr {
                         kind: ExprKind::Literal(LiteralValue::Int(1)),
@@ -474,7 +475,7 @@ mod tests {
 
     fn filter(input: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+            PlanNodeKind::Filter(LogicalFilterNode {
                 predicate: predicate(),
             }),
             vec![input],
@@ -484,7 +485,7 @@ mod tests {
 
     fn filter_missing_inner(input: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+            PlanNodeKind::Filter(LogicalFilterNode {
                 predicate: missing_inner_predicate(),
             }),
             vec![input],
@@ -494,7 +495,7 @@ mod tests {
 
     fn filter_with_predicate(input: LogicalPlanNode, predicate: TypedExpr) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+            PlanNodeKind::Filter(LogicalFilterNode {
                 predicate: predicate,
             }),
             vec![input],
@@ -508,12 +509,12 @@ mod tests {
             lift_correlated_inner(project(filter(scan())), &[OUTER_K]).expect("inner must lift");
 
         assert!(lifted.on_predicate.is_some());
-        let LogicalPlanNodeKind::Project(project) = &lifted.right.kind else {
+        let PlanNodeKind::Project(project) = &lifted.right.kind else {
             panic!("expected project");
         };
         assert!(matches!(
             &lifted.right.unary_input().kind,
-            LogicalPlanNodeKind::Scan(_)
+            PlanNodeKind::Scan(_)
         ));
     }
 
@@ -522,7 +523,7 @@ mod tests {
         let lifted = lift_correlated_inner(project_literal(filter(scan())), &[OUTER_K])
             .expect("inner must lift");
 
-        let LogicalPlanNodeKind::Project(project) = &lifted.right.kind else {
+        let PlanNodeKind::Project(project) = &lifted.right.kind else {
             panic!("expected project");
         };
         assert!(
@@ -544,7 +545,7 @@ mod tests {
         let lifted = lift_correlated_inner(filter(scan()), &[OUTER_K]).expect("inner must lift");
 
         assert!(lifted.on_predicate.is_some());
-        assert!(matches!(&lifted.right.kind, LogicalPlanNodeKind::Scan(_)));
+        assert!(matches!(&lifted.right.kind, PlanNodeKind::Scan(_)));
     }
 
     #[test]

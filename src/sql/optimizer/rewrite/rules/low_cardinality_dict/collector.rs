@@ -15,7 +15,7 @@ use std::collections::BTreeSet;
 
 use crate::sql::analysis::{BinOp, ExprKind, TypedExpr};
 use crate::sql::optimizer::rewrite::context::RewriteContext;
-use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind, LogicalScanNode};
+use crate::sql::planner::plan::{LogicalPlanNode, LogicalScanNode, PlanNodeKind};
 
 use super::context::{DictionaryRewriteContext, ScanColumnKey};
 use super::expr::{
@@ -64,14 +64,14 @@ pub(crate) fn collect(
 /// retargeting capability.
 fn collect_blocklist(plan: &LogicalPlanNode, out: &mut BTreeSet<String>) {
     match &plan.kind {
-        LogicalPlanNodeKind::Scan(_) => {}
-        LogicalPlanNodeKind::Filter(node) => {
+        PlanNodeKind::Scan(_) => {}
+        PlanNodeKind::Filter(node) => {
             // A filter predicate is never retargeted — even a bare
             // `s = 'x'` evaluates against the string value.
             collect_all_columns(&node.predicate, out);
             collect_blocklist(plan.unary_input(), out);
         }
-        LogicalPlanNodeKind::Project(node) => {
+        PlanNodeKind::Project(node) => {
             // Bare ColumnRef items merely propagate the dict slot (safe);
             // any compound item consumes the string.
             for item in &node.items {
@@ -79,7 +79,7 @@ fn collect_blocklist(plan: &LogicalPlanNode, out: &mut BTreeSet<String>) {
             }
             collect_blocklist(plan.unary_input(), out);
         }
-        LogicalPlanNodeKind::Aggregate(node) => {
+        PlanNodeKind::Aggregate(node) => {
             // Bare ColumnRef group keys are safe (rewritten to the dict
             // slot + post-aggregate Decode); compound group keys consume
             // the string.
@@ -111,7 +111,7 @@ fn collect_blocklist(plan: &LogicalPlanNode, out: &mut BTreeSet<String>) {
             }
             collect_blocklist(plan.unary_input(), out);
         }
-        LogicalPlanNodeKind::Sort(node) => {
+        PlanNodeKind::Sort(node) => {
             // Bare ColumnRef sort keys are safe — the rewriter decodes
             // non-order-preserving ones itself. Compound keys consume the
             // string.
@@ -120,7 +120,7 @@ fn collect_blocklist(plan: &LogicalPlanNode, out: &mut BTreeSet<String>) {
             }
             collect_blocklist(plan.unary_input(), out);
         }
-        LogicalPlanNodeKind::Join(node) => {
+        PlanNodeKind::Join(node) => {
             if let Some(cond) = node.condition.as_ref() {
                 // Spare equi-join keys the rewriter would dict-join;
                 // collect every other column the condition consumes.
@@ -130,7 +130,7 @@ fn collect_blocklist(plan: &LogicalPlanNode, out: &mut BTreeSet<String>) {
                 collect_blocklist(child, out);
             }
         }
-        LogicalPlanNodeKind::ImvDelta(_) | LogicalPlanNodeKind::ImvVersion(_) => {
+        PlanNodeKind::ImvDelta(_) | PlanNodeKind::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
         }
         _ => {
@@ -182,10 +182,10 @@ fn walk(
     dict_ctx: &mut DictionaryRewriteContext,
 ) -> Result<(), String> {
     match &plan.kind {
-        LogicalPlanNodeKind::Scan(scan) => {
+        PlanNodeKind::Scan(scan) => {
             visit_scan(scan, provider, blocklist, dict_ctx)?;
         }
-        LogicalPlanNodeKind::Join(_) => {
+        PlanNodeKind::Join(_) => {
             // TODO(task-8): joins with matching dict snapshots on both
             // sides could keep dict ids through the equi-join; today
             // the rewriter inserts a Decode boundary instead.
@@ -193,7 +193,7 @@ fn walk(
                 walk(child, provider, blocklist, dict_ctx)?;
             }
         }
-        LogicalPlanNodeKind::Union(_) => {
+        PlanNodeKind::Union(_) => {
             // TODO(task-8): UNION ALL with matching dicts on every leg
             // can propagate dict columns upward; for Task 7 we treat
             // every set op as a decode boundary.
@@ -201,7 +201,7 @@ fn walk(
                 walk(child, provider, blocklist, dict_ctx)?;
             }
         }
-        LogicalPlanNodeKind::ImvDelta(_) | LogicalPlanNodeKind::ImvVersion(_) => {
+        PlanNodeKind::ImvDelta(_) | PlanNodeKind::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
         }
         _ => {

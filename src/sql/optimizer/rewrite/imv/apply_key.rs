@@ -25,7 +25,7 @@ use crate::sql::optimizer::rewrite::imv::{
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
-use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind, LogicalProjectNode};
+use crate::sql::planner::plan::{LogicalPlanNode, LogicalProjectNode, PlanNodeKind};
 
 pub(crate) struct InjectApplyKeyProjectRule {
     fired: AtomicBool,
@@ -42,7 +42,7 @@ impl InjectApplyKeyProjectRule {
 /// Find the propagated `_row_id` column id from the plan's effective output,
 /// walking Project items first then descendant scans.
 fn root_row_id_ref(plan: &LogicalPlanNode) -> Option<(ColumnId, String)> {
-    if let LogicalPlanNodeKind::Project(p) = &plan.kind {
+    if let PlanNodeKind::Project(p) = &plan.kind {
         if let Some(item) = p
             .items
             .iter()
@@ -56,7 +56,7 @@ fn root_row_id_ref(plan: &LogicalPlanNode) -> Option<(ColumnId, String)> {
             }
         }
     }
-    if let LogicalPlanNodeKind::Union(u) = &plan.kind {
+    if let PlanNodeKind::Union(u) = &plan.kind {
         if is_branch_delta_union(plan) {
             if let Some(column) = u
                 .output_columns
@@ -74,7 +74,7 @@ fn root_row_id_ref(plan: &LogicalPlanNode) -> Option<(ColumnId, String)> {
 }
 
 fn is_branch_delta_union(plan: &LogicalPlanNode) -> bool {
-    let LogicalPlanNodeKind::Union(node) = &plan.kind else {
+    let PlanNodeKind::Union(node) = &plan.kind else {
         return false;
     };
     is_supported_fan_in_delta_union(plan)
@@ -87,7 +87,7 @@ fn is_branch_delta_union(plan: &LogicalPlanNode) -> bool {
 
 fn output_has_apply_key(plan: &LogicalPlanNode) -> bool {
     match &plan.kind {
-        LogicalPlanNodeKind::Project(p) => p.items.iter().any(|i| {
+        PlanNodeKind::Project(p) => p.items.iter().any(|i| {
             i.output_name
                 .eq_ignore_ascii_case(ICEBERG_MV_APPLY_KEY_COLUMN)
         }),
@@ -115,9 +115,7 @@ impl LogicalRewriteRule for InjectApplyKeyProjectRule {
         let plan = opt_expr_to_plan(expr.clone(), ctx);
         if !matches!(
             &plan.kind,
-            LogicalPlanNodeKind::Project(_)
-                | LogicalPlanNodeKind::Filter(_)
-                | LogicalPlanNodeKind::Union(_)
+            PlanNodeKind::Project(_) | PlanNodeKind::Filter(_) | PlanNodeKind::Union(_)
         ) {
             return false;
         }
@@ -153,15 +151,15 @@ impl LogicalRewriteRule for InjectApplyKeyProjectRule {
                 required_output_columns,
             } = plan;
             match kind {
-                LogicalPlanNodeKind::Project(mut p) => {
+                PlanNodeKind::Project(mut p) => {
                     p.items.push(apply_item);
                     Ok(PlanRewriteResult::Changed(LogicalPlanNode::new(
-                        LogicalPlanNodeKind::Project(p),
+                        PlanNodeKind::Project(p),
                         children,
                         required_output_columns,
                     )))
                 }
-                LogicalPlanNodeKind::Union(u) => {
+                PlanNodeKind::Union(u) => {
                     let mut items = u
                         .output_columns
                         .iter()
@@ -169,12 +167,12 @@ impl LogicalRewriteRule for InjectApplyKeyProjectRule {
                         .collect::<Vec<_>>();
                     items.push(apply_item);
                     let union = LogicalPlanNode::new(
-                        LogicalPlanNodeKind::Union(u),
+                        PlanNodeKind::Union(u),
                         children,
                         required_output_columns,
                     );
                     Ok(PlanRewriteResult::Changed(LogicalPlanNode::new(
-                        LogicalPlanNodeKind::Project(LogicalProjectNode {
+                        PlanNodeKind::Project(LogicalProjectNode {
                             items,
                             output_qualifier: None,
                         }),
@@ -211,33 +209,8 @@ fn plan_kind(plan: &LogicalPlanNode) -> &'static str {
     plan_kind_from_kind(&plan.kind)
 }
 
-fn plan_kind_from_kind(kind: &LogicalPlanNodeKind) -> &'static str {
-    match kind {
-        LogicalPlanNodeKind::Scan(_) => "Scan",
-        LogicalPlanNodeKind::Filter(_) => "Filter",
-        LogicalPlanNodeKind::Project(_) => "Project",
-        LogicalPlanNodeKind::Aggregate(_) => "Aggregate",
-        LogicalPlanNodeKind::Join(_) => "Join",
-        LogicalPlanNodeKind::Sort(_) => "Sort",
-        LogicalPlanNodeKind::Limit(_) => "Limit",
-        LogicalPlanNodeKind::Union(_) => "Union",
-        LogicalPlanNodeKind::Intersect(_) => "Intersect",
-        LogicalPlanNodeKind::Except(_) => "Except",
-        LogicalPlanNodeKind::Values(_) => "Values",
-        LogicalPlanNodeKind::GenerateSeries(_) => "GenerateSeries",
-        LogicalPlanNodeKind::TableFunction(_) => "TableFunction",
-        LogicalPlanNodeKind::Window(_) => "Window",
-        LogicalPlanNodeKind::Repeat(_) => "Repeat",
-        LogicalPlanNodeKind::CTEAnchor(_) => "CTEAnchor",
-        LogicalPlanNodeKind::CTEProduce(_) => "CTEProduce",
-        LogicalPlanNodeKind::CTEConsume(_) => "CTEConsume",
-        LogicalPlanNodeKind::Decode(_) => "Decode",
-        LogicalPlanNodeKind::AggregateStateMerge(_) => "AggregateStateMerge",
-        LogicalPlanNodeKind::Apply(_) => "Apply",
-        LogicalPlanNodeKind::AssertOneRow(_) => "AssertOneRow",
-        LogicalPlanNodeKind::ImvDelta(_) => "ImvDelta",
-        LogicalPlanNodeKind::ImvVersion(_) => "ImvVersion",
-    }
+fn plan_kind_from_kind(kind: &PlanNodeKind) -> &'static str {
+    kind.variant_name()
 }
 
 #[cfg(test)]
@@ -267,8 +240,7 @@ mod tests {
     use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::{
-        LogicalFilterNode, LogicalPlanNode, LogicalPlanNodeKind, LogicalProjectNode,
-        LogicalScanNode,
+        LogicalFilterNode, LogicalPlanNode, LogicalProjectNode, LogicalScanNode, PlanNodeKind,
     };
 
     fn build_ctx() -> RewriteContext {
@@ -327,13 +299,14 @@ mod tests {
             required_columns: None,
             dict_columns: Vec::new(),
             variant_columns: Vec::new(),
+            mv_rewritten_from: None,
         }
     }
 
     fn project_root(scan: LogicalScanNode, row_id: ColumnId) -> LogicalPlanNode {
         // Project carrying user col k + propagated _row_id (as Task 3 would leave it).
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
+            PlanNodeKind::Project(LogicalProjectNode {
                 items: vec![
                     ProjectItem {
                         expr: TypedExpr {
@@ -364,11 +337,7 @@ mod tests {
                 ],
                 output_qualifier: None,
             }),
-            vec![LogicalPlanNode::new(
-                LogicalPlanNodeKind::Scan(scan),
-                vec![],
-                None,
-            )],
+            vec![LogicalPlanNode::new(PlanNodeKind::Scan(scan), vec![], None)],
             None,
         )
     }
@@ -388,7 +357,7 @@ mod tests {
         };
         let arena_rc = ctx.scalar_arena();
         let changed = opt_expr_to_logical_plan(changed_expr, &arena_rc.borrow());
-        let LogicalPlanNodeKind::Project(root) = changed.kind else {
+        let PlanNodeKind::Project(root) = changed.kind else {
             panic!("expected Changed(Project)");
         };
         assert!(root.items.iter().any(|i| {
@@ -402,7 +371,7 @@ mod tests {
         let rule = InjectApplyKeyProjectRule::new();
         let ctx = build_ctx();
         let mut plan = project_root(delta_scan_with_row_id(ColumnId(101)), ColumnId(101));
-        if let LogicalPlanNodeKind::Project(p) = &mut plan.kind {
+        if let PlanNodeKind::Project(p) = &mut plan.kind {
             p.items.push(ProjectItem {
                 expr: TypedExpr {
                     kind: ExprKind::ColumnRef {
@@ -427,7 +396,7 @@ mod tests {
         let rule = InjectApplyKeyProjectRule::new();
         let mut ctx = build_ctx();
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+            PlanNodeKind::Filter(LogicalFilterNode {
                 predicate: TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Bool(true)),
                     data_type: DataType::Boolean,
@@ -435,7 +404,7 @@ mod tests {
                 },
             }),
             vec![LogicalPlanNode::new(
-                LogicalPlanNodeKind::Scan(delta_scan_with_row_id(ColumnId(101))),
+                PlanNodeKind::Scan(delta_scan_with_row_id(ColumnId(101))),
                 vec![],
                 None,
             )],

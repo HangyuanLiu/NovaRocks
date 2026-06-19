@@ -16,7 +16,7 @@ use crate::sql::optimizer::rewrite::imv::opt_expr_to_plan;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
-use crate::sql::planner::plan::LogicalPlanNodeKind;
+use crate::sql::planner::plan::PlanNodeKind;
 
 pub(crate) struct DerivePartitionSpecRule;
 
@@ -35,7 +35,7 @@ impl LogicalRewriteRule for DerivePartitionSpecRule {
 
     fn matches(&self, expr: &OptExpr, ctx: &RewriteContext) -> bool {
         let plan = opt_expr_to_plan(expr.clone(), ctx);
-        if !matches!(&plan.kind, LogicalPlanNodeKind::AggregateStateMerge(_)) {
+        if !matches!(&plan.kind, PlanNodeKind::AggregateStateMerge(_)) {
             return false;
         }
         ctx.extension::<ImvExtension>()
