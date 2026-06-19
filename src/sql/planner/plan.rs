@@ -9,8 +9,10 @@ use arrow::datatypes::DataType;
 
 use crate::sql::catalog::TableDef;
 
+use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{JoinKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
+use crate::sql::optimizer::operator::{AggMode, JoinDistribution, TopNPhase};
 
 // ---------------------------------------------------------------------------
 // Logical plan tree
@@ -78,6 +80,244 @@ pub(crate) enum LogicalPlanNodeKind {
     // the variant exists here so the type is wired through the plan tree.
     #[allow(dead_code)]
     ImvVersion(LogicalImvVersionNode),
+}
+
+// ---------------------------------------------------------------------------
+// Unified planner-side plan node kind
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) enum PlanNodeKind {
+    Scan(Box<PlanScanNode>),
+    Filter(PlanFilterNode),
+    Project(PlanProjectNode),
+    Sort(PlanSortNode),
+    /// Logical-stage payload only; distributed IR encodes limits on the wrapper,
+    /// Sort/TopN offsets, or ExchangeFlavor::LimitOffset instead of a Limit kind.
+    Limit(PlanLimitNode),
+    Values(PlanValuesNode),
+    Decode(PlanDecodeNode),
+    Repeat(Box<PlanRepeatNode>),
+    Window(Box<PlanWindowNode>),
+    GenerateSeries(PlanGenerateSeriesNode),
+    TableFunction(Box<PlanTableFunctionNode>),
+    AssertOneRow(PlanAssertOneRowNode),
+    Aggregate(LogicalAggregateNode),
+    Join(LogicalJoinNode),
+    Union(LogicalUnionNode),
+    Intersect(LogicalIntersectNode),
+    Except(LogicalExceptNode),
+    CTEAnchor(LogicalCTEAnchorNode),
+    CTEProduce(LogicalCTEProduceNode),
+    CTEConsume(LogicalCTEConsumeNode),
+    AggregateStateMerge(LogicalAggregateStateMergeNode),
+    Apply(LogicalApplyNode),
+    ImvDelta(LogicalImvDeltaNode),
+    ImvVersion(LogicalImvVersionNode),
+    TopN(DistributedTopNNode),
+    Exchange(DistributedExchangeNode),
+    HashAggregate(Box<DistributedHashAggregateNode>),
+    HashJoin(Box<DistributedHashJoinNode>),
+    NestLoopJoin(DistributedNestLoopJoinNode),
+    SetOp(DistributedSetOpNode),
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct PlanScanNode {
+    pub database: String,
+    pub table: TableDef,
+    pub alias: Option<String>,
+    pub columns: Vec<OutputColumn>,
+    pub predicates: Vec<TypedExpr>,
+    pub required_columns: Option<Vec<String>>,
+    pub dict_columns: Vec<ScanDictionaryColumn>,
+    pub variant_columns: Vec<ScanVariantColumn>,
+    pub mv_rewritten_from: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct PlanFilterNode {
+    pub predicate: TypedExpr,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct PlanProjectNode {
+    pub items: Vec<ProjectItem>,
+    pub output_qualifier: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct PlanSortNode {
+    pub items: Vec<SortItem>,
+    pub analytic_partition_by: Vec<TypedExpr>,
+    pub output_columns: Vec<OutputColumn>,
+    pub offset: Option<i64>,
+    pub partition_limit: Option<usize>,
+    pub topn_type: Option<crate::exec::node::sort::SortTopNType>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct PlanLimitNode {
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct PlanValuesNode {
+    pub rows: Vec<Vec<TypedExpr>>,
+    pub columns: Vec<OutputColumn>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct PlanDecodeNode {
+    pub mappings: Vec<DecodeMapping>,
+    pub output_columns: Vec<OutputColumn>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct PlanRepeatNode {
+    pub repeat_column_ref_list: Vec<Vec<String>>,
+    pub repeat_column_ref_ids: Vec<Vec<ColumnId>>,
+    pub grouping_ids: Vec<u64>,
+    pub all_rollup_columns: Vec<String>,
+    pub all_rollup_column_ids: Vec<ColumnId>,
+    pub grouping_key_aliases: Vec<(String, String)>,
+    pub grouping_fn_args: Vec<(String, Vec<String>)>,
+    pub grouping_fn_arg_ids: Vec<Vec<ColumnId>>,
+    pub grouping_fn_ids: Vec<(String, ColumnId)>,
+    pub virtual_tuple_id: Option<i32>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct PlanWindowNode {
+    pub window_exprs: Vec<WindowExpr>,
+    pub output_columns: Vec<OutputColumn>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct PlanGenerateSeriesNode {
+    pub start: i64,
+    pub end: i64,
+    pub step: i64,
+    pub column_name: String,
+    pub alias: Option<String>,
+    pub output_column_id: ColumnId,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct PlanTableFunctionNode {
+    pub function_name: String,
+    pub args: Vec<TypedExpr>,
+    pub output_columns: Vec<OutputColumn>,
+    pub alias: Option<String>,
+    pub is_left_join: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct PlanAssertOneRowNode {
+    pub subquery_text: String,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct DistributedTopNNode {
+    pub items: Vec<SortItem>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+    pub phase: TopNPhase,
+    pub is_split: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct DistributedExchangeNode {
+    pub partition_type: crate::partitions::TPartitionType,
+    pub partition_exprs: Vec<TypedExpr>,
+    pub source_fragment_id: u32,
+    pub output_columns: Vec<OutputColumn>,
+    pub output_qualifier: Option<String>,
+    pub flavor: ExchangeFlavor,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) enum ExchangeFlavor {
+    Distribution,
+    LimitOffset {
+        limit: Option<i64>,
+        offset: Option<i64>,
+    },
+    TopNSplit {
+        items: Vec<SortItem>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    },
+    CteMulticast {
+        cte_id: CteId,
+    },
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct DistributedHashAggregateNode {
+    pub mode: AggMode,
+    pub group_by: Vec<TypedExpr>,
+    pub aggregates: Vec<AggregateCall>,
+    pub is_merge: Vec<bool>,
+    pub output_columns: Vec<OutputColumn>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct DistributedHashJoinNode {
+    pub join_type: JoinKind,
+    pub eq_conditions: Vec<DistributedHashJoinEqCondition>,
+    pub other_condition: Option<TypedExpr>,
+    pub distribution: JoinDistribution,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct DistributedHashJoinEqCondition {
+    pub left: TypedExpr,
+    pub right: TypedExpr,
+    pub null_safe: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct DistributedNestLoopJoinNode {
+    pub join_type: JoinKind,
+    pub condition: Option<TypedExpr>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlanSetOpKind {
+    UnionAll,
+    Intersect,
+    Except,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct DistributedSetOpNode {
+    pub kind: PlanSetOpKind,
+    pub output_columns: Vec<OutputColumn>,
+    pub child_output_columns: Vec<Vec<OutputColumn>>,
 }
 
 #[allow(dead_code)]
@@ -599,5 +839,80 @@ mod plan_tests {
         assert_eq!(node.aggregate_state_names, vec!["c", "s"]);
         assert_eq!(node.change_op_column, "__change_op");
         assert_eq!(node.output_columns.len(), 2);
+    }
+
+    #[test]
+    fn unified_plan_node_kind_scan_carries_mv_rewrite_source() {
+        let table = TableDef {
+            name: "mv_orders".to_string(),
+            columns: vec![],
+            iceberg_row_lineage_metadata_columns: vec![],
+            source: crate::sql::catalog::ScanSource::StarRocks {
+                db_id: 1,
+                table_id: 2,
+            },
+        };
+        let node = PlanNodeKind::Scan(Box::new(PlanScanNode {
+            database: "default".to_string(),
+            table,
+            alias: None,
+            columns: vec![],
+            predicates: vec![],
+            required_columns: None,
+            dict_columns: vec![],
+            variant_columns: vec![],
+            mv_rewritten_from: Some("mv_orders_rollup".to_string()),
+        }));
+
+        let PlanNodeKind::Scan(scan) = node else {
+            panic!("expected Scan");
+        };
+        assert_eq!(scan.mv_rewritten_from.as_deref(), Some("mv_orders_rollup"));
+    }
+
+    #[test]
+    fn unified_plan_node_kind_keeps_limit_and_topn_split_explicit() {
+        let limit = PlanNodeKind::Limit(PlanLimitNode {
+            limit: Some(10),
+            offset: Some(3),
+        });
+        let topn = PlanNodeKind::TopN(DistributedTopNNode {
+            items: vec![],
+            limit: Some(10),
+            offset: Some(3),
+            phase: crate::sql::optimizer::operator::TopNPhase::Final,
+            is_split: false,
+        });
+
+        match limit {
+            PlanNodeKind::Limit(node) => {
+                assert_eq!(node.limit, Some(10));
+                assert_eq!(node.offset, Some(3));
+            }
+            other => panic!("expected Limit, got {other:?}"),
+        }
+        match topn {
+            PlanNodeKind::TopN(node) => {
+                assert_eq!(node.limit, Some(10));
+                assert_eq!(node.offset, Some(3));
+                assert!(!node.is_split);
+            }
+            other => panic!("expected TopN, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unified_plan_node_kind_set_op_uses_plan_scoped_kind() {
+        let set_op = PlanNodeKind::SetOp(DistributedSetOpNode {
+            kind: PlanSetOpKind::UnionAll,
+            output_columns: vec![],
+            child_output_columns: vec![vec![], vec![]],
+        });
+
+        let PlanNodeKind::SetOp(node) = set_op else {
+            panic!("expected SetOp");
+        };
+        assert_eq!(node.kind, PlanSetOpKind::UnionAll);
+        assert_eq!(node.child_output_columns.len(), 2);
     }
 }
