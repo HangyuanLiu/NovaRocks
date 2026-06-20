@@ -32,7 +32,9 @@ const NON_EQUI_JOIN_COST_PENALTY: f64 = 2.0;
 /// NLJ is O(N*M) and should be heavily penalized relative to hash join.
 const NEST_LOOP_COST_PENALTY: f64 = 100.0;
 
+// Deliberately below f64::MAX so downstream weighting can still clamp safely.
 const MAX_FINITE_COST: f64 = 1.0e300;
+const DEFAULT_ROW_WIDTH: f64 = 8.0;
 
 pub(crate) struct CostInput<'a> {
     pub op: &'a Operator,
@@ -289,22 +291,56 @@ fn cost_row_count(stats: &Statistics) -> f64 {
 }
 
 fn cost_row_width(stats: &Statistics) -> f64 {
-    let avg_row_size = stats.avg_row_size();
-    if avg_row_size.is_finite() {
-        if avg_row_size > 0.0 {
-            finite_non_negative_cost(avg_row_size)
-        } else {
-            8.0
-        }
-    } else if avg_row_size.is_infinite() && avg_row_size.is_sign_positive() {
-        MAX_FINITE_COST
-    } else {
-        8.0
+    if stats.column_statistics.is_empty() {
+        return DEFAULT_ROW_WIDTH;
     }
+
+    let mut total = 0.0;
+    for column in stats.column_statistics.values() {
+        let width = column.average_row_size;
+        let contribution = if width.is_finite() {
+            if width > 0.0 {
+                finite_non_negative_cost(width)
+            } else {
+                DEFAULT_ROW_WIDTH
+            }
+        } else if width.is_infinite() && width.is_sign_positive() {
+            return MAX_FINITE_COST;
+        } else {
+            DEFAULT_ROW_WIDTH
+        };
+
+        total = finite_non_negative_cost(total + contribution);
+        if total >= MAX_FINITE_COST {
+            return MAX_FINITE_COST;
+        }
+    }
+    total
 }
 
 fn safe_compute_size(stats: &Statistics) -> f64 {
     finite_non_negative_cost(cost_row_count(stats) * cost_row_width(stats))
+}
+
+fn stats_has_positive_overflow_signal(stats: &Statistics) -> bool {
+    safe_compute_size(stats) >= MAX_FINITE_COST
+}
+
+fn sanitize_legacy_fallback_cost(
+    legacy_cost: Cost,
+    own_stats: &Statistics,
+    child_stats: &[&Statistics],
+) -> Cost {
+    if legacy_cost.is_nan()
+        && (stats_has_positive_overflow_signal(own_stats)
+            || child_stats
+                .iter()
+                .any(|stats| stats_has_positive_overflow_signal(stats)))
+    {
+        MAX_FINITE_COST
+    } else {
+        finite_non_negative_cost(legacy_cost)
+    }
 }
 
 impl CostEstimate {
@@ -498,8 +534,10 @@ pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
                 input.options,
             );
             let cpu_weight = effective_cost_weight(input.options.cpu_weight);
-            let cpu_cost =
-                finite_non_negative_cost(finite_non_negative_cost(legacy_cost) / cpu_weight);
+            let cpu_cost = finite_non_negative_cost(
+                sanitize_legacy_fallback_cost(legacy_cost, input.own_stats, input.child_stats)
+                    / cpu_weight,
+            );
             CostEstimate {
                 // Generic fallback stores the legacy scalar total as CPU-equivalent
                 // cost until the operator gets a real dimensional kernel.
@@ -720,6 +758,17 @@ mod tests {
         assert_eq!(cost_row_width(&stats(1.0, f64::MAX)), MAX_FINITE_COST);
         assert_eq!(
             cost_row_width(&stats_with_column_widths(1.0, &[f64::MAX, f64::MAX])),
+            MAX_FINITE_COST
+        );
+        assert_eq!(
+            cost_row_width(&stats_with_column_widths(
+                1.0,
+                &[f64::INFINITY, f64::NEG_INFINITY],
+            )),
+            MAX_FINITE_COST
+        );
+        assert_eq!(
+            cost_row_width(&stats_with_column_widths(1.0, &[f64::MAX, f64::NAN])),
             MAX_FINITE_COST
         );
         assert_eq!(cost_row_width(&stats(1.0, 0.0)), 8.0);
@@ -1063,6 +1112,38 @@ mod tests {
 
         let estimate = compute_cost_estimate(&input);
         assert_finite_non_negative_dimensions(&estimate);
+    }
+
+    #[test]
+    fn fallback_cost_estimate_saturates_nan_legacy_cost_with_positive_overflow_signal() {
+        let mixed_child_stats = stats_with_column_widths(10.0, &[f64::INFINITY, f64::NEG_INFINITY]);
+        let own_stats = stats(10.0, 8.0);
+        let op = Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+            mode: AggMode::Single,
+            group_by: vec![],
+            aggregates: vec![],
+            output_columns: vec![],
+            is_merge: vec![],
+        });
+        let child_stats = [&mixed_child_stats];
+        let child_outputs = [PhysicalPropertySet::any()];
+        let child_output_refs = [&child_outputs[0]];
+        let required = PhysicalPropertySet::any();
+        let options = CostOptions::default();
+        let input = CostInput {
+            op: &op,
+            own_stats: &own_stats,
+            child_stats: &child_stats,
+            child_outputs: &child_output_refs,
+            required_output: &required,
+            alt_kind: &PropertyAlternativeKind::Default,
+            scalars: None,
+            options: &options,
+        };
+
+        let estimate = compute_cost_estimate(&input);
+        assert_finite_non_negative_dimensions(&estimate);
+        assert_eq!(estimate.cpu_cost, MAX_FINITE_COST);
     }
 
     #[test]
