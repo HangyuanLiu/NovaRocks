@@ -9,7 +9,7 @@ use crate::sql::analysis::{BinOp, ExprKind, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::{FilterOp, LogicalJoinOp, Operator};
 use crate::sql::optimizer::opt_expr::OptExpr;
-use crate::sql::optimizer::scalar::{self, ScalarArena};
+use crate::sql::optimizer::scalar::{self, ScalarArena, ScalarId, ScalarNode};
 use crate::sql::planner::plan::*;
 
 /// Split an expression on AND into a flat list of conjuncts.
@@ -571,6 +571,105 @@ fn collect_column_id_refs_strict_inner(
         ExprKind::SubqueryPlaceholder { .. } => {}
         ExprKind::Lambda { body, .. } => {
             collect_column_id_refs_strict_inner(body, out)?;
+        }
+    }
+    Some(())
+}
+
+pub(crate) fn collect_scalar_column_id_refs_strict(
+    arena: &ScalarArena,
+    expr: ScalarId,
+) -> Option<HashSet<ColumnId>> {
+    let mut out = HashSet::new();
+    collect_scalar_column_id_refs_strict_inner(arena, expr, &mut out)?;
+    Some(out)
+}
+
+fn collect_scalar_column_id_refs_strict_inner(
+    arena: &ScalarArena,
+    expr: ScalarId,
+    out: &mut HashSet<ColumnId>,
+) -> Option<()> {
+    match arena.node(expr) {
+        ScalarNode::ColumnRef(column_id) => {
+            if *column_id == ColumnId::UNSET {
+                return None;
+            }
+            out.insert(*column_id);
+        }
+        ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {}
+        ScalarNode::BinaryOp { left, right, .. } => {
+            collect_scalar_column_id_refs_strict_inner(arena, *left, out)?;
+            collect_scalar_column_id_refs_strict_inner(arena, *right, out)?;
+        }
+        ScalarNode::UnaryOp { child, .. }
+        | ScalarNode::Cast { child, .. }
+        | ScalarNode::IsNull { child, .. }
+        | ScalarNode::IsTruthValue { child, .. }
+        | ScalarNode::Nested(child) => {
+            collect_scalar_column_id_refs_strict_inner(arena, *child, out)?;
+        }
+        ScalarNode::FunctionCall { args, .. } | ScalarNode::AggregateCall { args, .. } => {
+            for arg in args {
+                collect_scalar_column_id_refs_strict_inner(arena, *arg, out)?;
+            }
+            if let ScalarNode::AggregateCall { order_by, .. } = arena.node(expr) {
+                for key in order_by {
+                    collect_scalar_column_id_refs_strict_inner(arena, key.expr, out)?;
+                }
+            }
+        }
+        ScalarNode::LambdaFunction { body, .. } | ScalarNode::Lambda { body, .. } => {
+            collect_scalar_column_id_refs_strict_inner(arena, *body, out)?;
+        }
+        ScalarNode::InList { child, list, .. } => {
+            collect_scalar_column_id_refs_strict_inner(arena, *child, out)?;
+            for item in list {
+                collect_scalar_column_id_refs_strict_inner(arena, *item, out)?;
+            }
+        }
+        ScalarNode::Between {
+            child, low, high, ..
+        } => {
+            collect_scalar_column_id_refs_strict_inner(arena, *child, out)?;
+            collect_scalar_column_id_refs_strict_inner(arena, *low, out)?;
+            collect_scalar_column_id_refs_strict_inner(arena, *high, out)?;
+        }
+        ScalarNode::Like { child, pattern, .. } => {
+            collect_scalar_column_id_refs_strict_inner(arena, *child, out)?;
+            collect_scalar_column_id_refs_strict_inner(arena, *pattern, out)?;
+        }
+        ScalarNode::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(operand) = operand {
+                collect_scalar_column_id_refs_strict_inner(arena, *operand, out)?;
+            }
+            for (when, then) in when_then {
+                collect_scalar_column_id_refs_strict_inner(arena, *when, out)?;
+                collect_scalar_column_id_refs_strict_inner(arena, *then, out)?;
+            }
+            if let Some(else_expr) = else_expr {
+                collect_scalar_column_id_refs_strict_inner(arena, *else_expr, out)?;
+            }
+        }
+        ScalarNode::WindowCall {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for arg in args {
+                collect_scalar_column_id_refs_strict_inner(arena, *arg, out)?;
+            }
+            for expr in partition_by {
+                collect_scalar_column_id_refs_strict_inner(arena, *expr, out)?;
+            }
+            for key in order_by {
+                collect_scalar_column_id_refs_strict_inner(arena, key.expr, out)?;
+            }
         }
     }
     Some(())
@@ -1261,6 +1360,31 @@ mod column_id_helper_tests {
         let expr = col_ref_expr(ColumnId::UNSET);
         let result = collect_column_id_refs(&expr);
         assert!(result.is_empty(), "UNSET must be excluded from the result");
+    }
+
+    #[test]
+    fn scalar_column_ref_strict_collects_its_id() {
+        let id = ColumnId::new_for_test(42);
+        let mut arena = ScalarArena::new();
+        let expr = arena.intern(ScalarNode::ColumnRef(id), DataType::Int32, false);
+
+        let result = collect_scalar_column_id_refs_strict(&arena, expr)
+            .expect("resolved scalar column refs should be collected");
+
+        assert_eq!(result.len(), 1);
+        assert!(result.contains(&id));
+    }
+
+    #[test]
+    fn scalar_unset_column_ref_strict_returns_none() {
+        let mut arena = ScalarArena::new();
+        let expr = arena.intern(
+            ScalarNode::ColumnRef(ColumnId::UNSET),
+            DataType::Int32,
+            false,
+        );
+
+        assert!(collect_scalar_column_id_refs_strict(&arena, expr).is_none());
     }
 
     // -----------------------------------------------------------------------
