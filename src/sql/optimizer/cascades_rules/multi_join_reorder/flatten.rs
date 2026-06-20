@@ -105,7 +105,7 @@ fn build_equi_classes(
             }
         }
         if reps.len() >= 2 {
-            out.push(EquiClass::new(reps));
+            out.push(EquiClass::new(class.iter().collect(), reps));
         }
     }
     out

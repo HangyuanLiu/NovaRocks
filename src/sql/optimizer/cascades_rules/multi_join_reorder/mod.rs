@@ -11,6 +11,7 @@ mod algo;
 mod flatten;
 mod pass;
 
+use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::memo::GroupId;
 use crate::sql::optimizer::scalar::ScalarId;
 use crate::sql::optimizer::statistics::Statistics;
@@ -58,16 +59,19 @@ impl MultiJoinGraph {
 
 /// One cross-atom equivalence class within a flattened chain. `reps[j]` is
 /// `(atom_index, interned ColumnRef ScalarId)` for one representative column of
-/// that atom in the class. Only atoms that actually carry a class column appear,
-/// so a class spanning `m` atoms holds `m` entries — never `C(m, 2)`.
+/// that atom in the class; `columns` is the full transitive column set (for
+/// membership tests when deduplicating literal equi predicates by class). Only
+/// atoms that actually carry a class column appear in `reps`, so a class
+/// spanning `m` atoms holds `m` entries — never `C(m, 2)`.
 #[derive(Clone)]
 pub(crate) struct EquiClass {
+    columns: Vec<ColumnId>,
     reps: Vec<(usize, ScalarId)>,
 }
 
 impl EquiClass {
-    pub(crate) fn new(reps: Vec<(usize, ScalarId)>) -> Self {
-        Self { reps }
+    pub(crate) fn new(columns: Vec<ColumnId>, reps: Vec<(usize, ScalarId)>) -> Self {
+        Self { columns, reps }
     }
 
     /// The representative column-ref scalar of the first atom in `mask` that
@@ -83,5 +87,10 @@ impl EquiClass {
     /// it transitively connects them as an equi-join edge.
     pub(crate) fn straddles(&self, left_mask: u32, right_mask: u32) -> bool {
         self.rep_in(left_mask).is_some() && self.rep_in(right_mask).is_some()
+    }
+
+    /// True if `column` belongs to this equivalence class.
+    pub(crate) fn contains(&self, column: ColumnId) -> bool {
+        self.columns.contains(&column)
     }
 }

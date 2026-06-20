@@ -9,6 +9,7 @@
 
 use arrow::datatypes::DataType;
 
+use crate::sql::column_id::ColumnId;
 use crate::sql::common::{BinOp, JoinKind};
 use crate::sql::optimizer::estimate::cardinality::{JoinCardInput, estimate_join_cardinality};
 use crate::sql::optimizer::estimate::join_condition::estimate_join_condition;
@@ -269,7 +270,11 @@ fn left_deep(graph: &MultiJoinGraph, arena: &mut ScalarArena) -> Option<JoinTree
             let connecting = connecting_predicates(&graph.predicates, current_mask, atom_mask);
             let has_equi = connecting
                 .iter()
-                .any(|predicate| has_equijoin_predicate(arena, *predicate));
+                .any(|predicate| has_equijoin_predicate(arena, *predicate))
+                || graph
+                    .equi_classes
+                    .iter()
+                    .any(|c| c.straddles(current_mask, atom_mask));
             let class = if has_equi {
                 2u8
             } else if connecting.is_empty() {
@@ -291,11 +296,11 @@ fn left_deep(graph: &MultiJoinGraph, arena: &mut ScalarArena) -> Option<JoinTree
 
         let (next, _, _) = best?;
         let next_mask = 1u32 << next;
-        let connecting = connecting_predicates(&graph.predicates, current_mask, next_mask);
-        let condition = if connecting.is_empty() {
+        let parts = connecting_condition_scalars(graph, current_mask, next_mask, arena);
+        let condition = if parts.is_empty() {
             None
         } else {
-            Some(combine_and_scalar(arena, connecting))
+            Some(combine_and_scalar(arena, parts))
         };
         current = join_cells(&current, &atom_cell(graph, next), condition, arena);
         current_mask |= next_mask;
@@ -330,7 +335,7 @@ fn dp(graph: &MultiJoinGraph, arena: &mut ScalarArena) -> Option<JoinTree> {
                     left = (left.wrapping_sub(1)) & subset;
                     continue;
                 }
-                if let Some(cell) = try_partition(&memo, &graph.predicates, left, right, arena) {
+                if let Some(cell) = try_partition(&memo, graph, left, right, arena) {
                     if best.as_ref().is_none_or(|b| cell.cost < b.cost) {
                         best = Some(cell);
                     }
@@ -347,26 +352,27 @@ fn dp(graph: &MultiJoinGraph, arena: &mut ScalarArena) -> Option<JoinTree> {
 }
 
 /// Build the cheaper orientation of joining the `left`/`right` subsets, if they
-/// have a connecting equi-join predicate.
+/// have a connecting equi-join predicate — either a literal one or a transitive
+/// edge synthesized from a straddling equivalence class.
 fn try_partition(
     memo: &std::collections::HashMap<u32, Cell>,
-    predicates: &[(ScalarId, u32)],
+    graph: &MultiJoinGraph,
     left: u32,
     right: u32,
     arena: &mut ScalarArena,
 ) -> Option<Cell> {
-    let connecting = connecting_predicates(predicates, left, right);
-    if connecting.is_empty() {
+    let parts = connecting_condition_scalars(graph, left, right, arena);
+    if parts.is_empty() {
         return None;
     }
-    let condition = combine_and_scalar(arena, connecting);
+    let condition = combine_and_scalar(arena, parts);
     // Require an equi key to avoid materializing NestLoop joins during reorder.
     if !has_equijoin_predicate(arena, condition) {
         return None;
     }
     let left_cell = memo.get(&left)?;
     let right_cell = memo.get(&right)?;
-    let a = join_cells(left_cell, right_cell, Some(condition.clone()), arena);
+    let a = join_cells(left_cell, right_cell, Some(condition), arena);
     let b = join_cells(right_cell, left_cell, Some(condition), arena);
     Some(if a.cost <= b.cost { a } else { b })
 }
@@ -410,7 +416,7 @@ fn greedy_topk(graph: &MultiJoinGraph, k: usize, arena: &mut ScalarArena) -> Vec
                     if l == r && lm >= rm {
                         continue; // same-size symmetric pair handled once
                     }
-                    let Some(cell) = try_partition(&best, &graph.predicates, lm, rm, arena) else {
+                    let Some(cell) = try_partition(&best, graph, lm, rm, arena) else {
                         continue;
                     };
                     let combined = lm | rm;
@@ -483,6 +489,104 @@ fn connecting_predicates(
         })
         .map(|(pred, _)| *pred)
         .collect()
+}
+
+/// The full connecting condition for joining `left`/`right`, reduced to **at
+/// most one equi predicate per equivalence class** (plus every non-equi
+/// connecting predicate). This is the M4 transitive-predicate fix.
+///
+/// Assembly:
+/// 1. Walk the literal connecting predicates. A non-equi one is always kept; an
+///    equi `cL = cR` is kept only if its equivalence class has no kept equi yet
+///    (later equis of the same class are dropped as redundant).
+/// 2. For each equivalence class that *straddles* the cut but got no literal
+///    equi, synthesize one `leftRep = rightRep`, reusing the chain's
+///    already-interned column-ref scalars (no fresh deep copies).
+///
+/// Emitting one equi per class is both the transitive fix (step 2 connects
+/// atoms the literals only relate transitively) and a correctness guard: a path
+/// cut like `{A,C} ⋈ {B}` — which only becomes reachable *because* of a
+/// synthesized `a=c` edge — would otherwise collect both `a=b` and `b=c` and
+/// double-count the class's selectivity. Dropping the redundant `b=c` is safe:
+/// the `{A,C}` sub-plan already enforces `a≡c`, so `a=b` implies `b=c`.
+fn connecting_condition_scalars(
+    graph: &MultiJoinGraph,
+    left_mask: u32,
+    right_mask: u32,
+    arena: &mut ScalarArena,
+) -> Vec<ScalarId> {
+    let mut parts: Vec<ScalarId> = Vec::new();
+    let mut class_covered = vec![false; graph.equi_classes.len()];
+    for predicate in connecting_predicates(&graph.predicates, left_mask, right_mask) {
+        match equi_columns(arena, predicate) {
+            Some((left_col, right_col)) => {
+                match class_index(&graph.equi_classes, left_col, right_col) {
+                    Some(idx) if class_covered[idx] => {} // redundant equi for this class
+                    Some(idx) => {
+                        class_covered[idx] = true;
+                        parts.push(predicate);
+                    }
+                    // An equi not tracked by any class (shouldn't happen, since
+                    // classes are built from these same equis) — keep it.
+                    None => parts.push(predicate),
+                }
+            }
+            None => parts.push(predicate), // non-equi connecting predicate
+        }
+    }
+    for (idx, class) in graph.equi_classes.iter().enumerate() {
+        if class_covered[idx] {
+            continue;
+        }
+        if let (Some(left_col), Some(right_col)) =
+            (class.rep_in(left_mask), class.rep_in(right_mask))
+        {
+            let nullable = arena.nullable(left_col) || arena.nullable(right_col);
+            parts.push(arena.intern(
+                ScalarNode::BinaryOp {
+                    op: BinOp::Eq,
+                    left: left_col,
+                    right: right_col,
+                },
+                DataType::Boolean,
+                nullable,
+            ));
+        }
+    }
+    parts
+}
+
+/// Index of the equivalence class containing either column of an equi predicate.
+fn class_index(
+    classes: &[super::EquiClass],
+    left_col: ColumnId,
+    right_col: ColumnId,
+) -> Option<usize> {
+    classes
+        .iter()
+        .position(|c| c.contains(left_col) || c.contains(right_col))
+}
+
+/// If `expr` is a `col = col` equi conjunct, return its two column ids.
+fn equi_columns(arena: &ScalarArena, expr: ScalarId) -> Option<(ColumnId, ColumnId)> {
+    match arena.node(expr) {
+        ScalarNode::Nested(inner) => equi_columns(arena, *inner),
+        ScalarNode::BinaryOp {
+            op: BinOp::Eq,
+            left,
+            right,
+        } => Some((column_of(arena, *left)?, column_of(arena, *right)?)),
+        _ => None,
+    }
+}
+
+/// The column id of a (possibly `Nested`-wrapped) bare `ColumnRef`, if any.
+fn column_of(arena: &ScalarArena, expr: ScalarId) -> Option<ColumnId> {
+    match arena.node(expr) {
+        ScalarNode::ColumnRef(col) if *col != ColumnId::UNSET => Some(*col),
+        ScalarNode::Nested(inner) => column_of(arena, *inner),
+        _ => None,
+    }
 }
 
 /// True if the predicate contains at least one `col = col` equi-join conjunct.
@@ -916,5 +1020,174 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), 3, "distinct 2-subsets");
+    }
+
+    use super::super::EquiClass;
+
+    /// A path chain (`c_i = c_{i+1}`) whose columns all belong to ONE
+    /// equivalence class spanning every atom, so any atom pair is transitively
+    /// equi-joinable though only consecutive literal edges exist.
+    fn transitive_path_graph(n: usize, arena: &mut ScalarArena) -> MultiJoinGraph {
+        let mut graph = path_graph(n, arena);
+        let columns: Vec<ColumnId> = (0..n)
+            .map(|i| ColumnId::new_for_test(i as u32 + 1))
+            .collect();
+        let reps: Vec<(usize, ScalarId)> = (0..n)
+            .map(|i| (i, intern_typed(arena, &col_ref(i as u32))))
+            .collect();
+        graph.equi_classes = vec![EquiClass::new(columns, reps)];
+        graph
+    }
+
+    #[test]
+    fn connecting_condition_synthesizes_transitive_edge() {
+        // Path c1=c2, c2=c3 (atoms A,B,C). Joining A and C directly has no
+        // literal edge, so exactly one transitive equi is synthesized.
+        let mut arena = ScalarArena::new();
+        let graph = transitive_path_graph(3, &mut arena);
+        let parts = connecting_condition_scalars(&graph, 0b001, 0b100, &mut arena);
+        assert_eq!(parts.len(), 1, "one synthesized transitive A-C edge");
+        assert!(
+            has_equijoin_predicate(&arena, parts[0]),
+            "synthesized edge is an equi"
+        );
+    }
+
+    #[test]
+    fn connecting_condition_drops_redundant_same_class_equi() {
+        // {A,C} ⋈ {B}: both literal edges a=b and b=c cross the cut, but they
+        // belong to the same class, so only ONE equi is kept (no selectivity
+        // double-count). This cut only becomes reachable via the transitive edge.
+        let mut arena = ScalarArena::new();
+        let graph = transitive_path_graph(3, &mut arena);
+        let parts = connecting_condition_scalars(&graph, 0b101, 0b010, &mut arena);
+        assert_eq!(parts.len(), 1, "redundant same-class equi dropped");
+    }
+
+    #[test]
+    fn connecting_condition_unchanged_for_simple_literal_join() {
+        // A ⋈ B on the literal a=b: the kept part is exactly that literal (same
+        // interned scalar), so ordinary joins are byte-identical to before M4.
+        let mut arena = ScalarArena::new();
+        let graph = transitive_path_graph(2, &mut arena);
+        let literal = graph.predicates[0].0;
+        let parts = connecting_condition_scalars(&graph, 0b01, 0b10, &mut arena);
+        assert_eq!(parts, vec![literal], "literal kept verbatim, no synthesis");
+    }
+
+    /// 3 atoms A(tiny) - B(huge) - C(tiny), path a=b, b=c. With `with_class`, the
+    /// class {a,b,c} spans all three, so A and C are transitively equi-joinable.
+    fn three_atom_transitive(arena: &mut ScalarArena, with_class: bool) -> MultiJoinGraph {
+        let predicates = vec![
+            (pred(arena, eq(col_ref(0), col_ref(1))), 0b011),
+            (pred(arena, eq(col_ref(1), col_ref(2))), 0b110),
+        ];
+        let equi_classes = if with_class {
+            vec![EquiClass::new(
+                vec![
+                    ColumnId::new_for_test(1),
+                    ColumnId::new_for_test(2),
+                    ColumnId::new_for_test(3),
+                ],
+                vec![
+                    (0, intern_typed(arena, &col_ref(0))),
+                    (1, intern_typed(arena, &col_ref(1))),
+                    (2, intern_typed(arena, &col_ref(2))),
+                ],
+            )]
+        } else {
+            vec![]
+        };
+        MultiJoinGraph {
+            atoms: vec![100, 101, 102],
+            atom_stats: vec![
+                atom_stats(0, 10.0, 10.0),
+                atom_stats(1, 1_000_000_000.0, 1_000_000_000.0),
+                atom_stats(2, 10.0, 10.0),
+            ],
+            predicates,
+            chain_join_groups: vec![],
+            equi_classes,
+        }
+    }
+
+    fn joins_a_and_c_directly(tree: &JoinTree) -> bool {
+        fn leaf_is(t: &JoinTree, id: usize) -> bool {
+            matches!(t, JoinTree::Leaf(g) if *g == id)
+        }
+        match tree {
+            JoinTree::Leaf(_) => false,
+            JoinTree::Join { left, right, .. } => {
+                (leaf_is(left, 100) && leaf_is(right, 102))
+                    || (leaf_is(left, 102) && leaf_is(right, 100))
+                    || joins_a_and_c_directly(left)
+                    || joins_a_and_c_directly(right)
+            }
+        }
+    }
+
+    #[test]
+    fn enumeration_offers_transitive_join_candidate_only_with_class() {
+        // The transitive edge's job is to make A⋈C a *reachable* equi-join
+        // candidate (whether the cost search picks it is a separate, stats-driven
+        // decision). With the class, greedy enumerates an (A⋈C)⋈B order; without
+        // it, the path ends A and C can never be joined directly (it would be a
+        // cross join, which the enumeration rejects).
+        let mut arena = ScalarArena::new();
+        let with_class = three_atom_transitive(&mut arena, true);
+        let trees = greedy_topk(&with_class, 10, &mut arena);
+        assert!(
+            trees.iter().any(joins_a_and_c_directly),
+            "transitive edge makes the (A⋈C)⋈B order a reachable candidate"
+        );
+
+        let plain = three_atom_transitive(&mut arena, false);
+        let plain_trees = greedy_topk(&plain, 10, &mut arena);
+        assert!(
+            !plain_trees.iter().any(joins_a_and_c_directly),
+            "without the class, A and C are never joined directly (no edge)"
+        );
+    }
+
+    #[test]
+    fn no_transitive_edge_without_equivalence_class() {
+        // The gap before M4: with the class cleared, joining the path ends A and
+        // C yields no connecting predicate at all.
+        let mut arena = ScalarArena::new();
+        let mut graph = transitive_path_graph(3, &mut arena);
+        graph.equi_classes.clear();
+        let parts = connecting_condition_scalars(&graph, 0b001, 0b100, &mut arena);
+        assert!(parts.is_empty(), "no class, no A-C edge — the original gap");
+    }
+
+    #[test]
+    fn transitive_class_synthesis_is_bounded() {
+        // A k-atom equivalence class must not explode: every singleton-vs-
+        // singleton cut yields exactly ONE equi (never the C(k,2) closure), and
+        // interning collapses the distinct synthesized edges to a polynomial
+        // bound — the structural guard against the rolled-back gap2 OOM.
+        let mut arena = ScalarArena::new();
+        let k = 12usize; // DP safety ceiling
+        let graph = transitive_path_graph(k, &mut arena);
+        let mut distinct = std::collections::HashSet::new();
+        for i in 0..k {
+            for j in 0..k {
+                if i == j {
+                    continue;
+                }
+                let parts = connecting_condition_scalars(&graph, 1u32 << i, 1u32 << j, &mut arena);
+                assert_eq!(parts.len(), 1, "one equi per atom pair, never the closure");
+                distinct.insert(format!("{:?}", parts[0]));
+            }
+        }
+        assert!(
+            distinct.len() <= 2 * k * k,
+            "distinct edges polynomially bounded, got {}",
+            distinct.len()
+        );
+        assert!(
+            dp(&graph, &mut arena).is_some(),
+            "DP completes for k=12 class"
+        );
     }
 }
