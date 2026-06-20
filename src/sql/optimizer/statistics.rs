@@ -7,14 +7,18 @@ use arrow::datatypes::DataType;
 use crate::sql::column_id::ColumnId;
 
 /// Trustworthiness of a statistic. Variant order is meaningful: derived
-/// `Ord` makes `Exact > Estimated > Fallback`, so `min` yields the
-/// least-confident input.
+/// `Ord` makes `Measured > Exact > Estimated > Fallback`, so `min` yields
+/// the least-confident input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum Confidence {
     #[default]
     Fallback, // relied on a heuristic/default (name-based rows, default selectivity/NDV)
     Estimated, // derived via formula from at-least-partially-real inputs
-    Exact,     // sourced from real catalog/Iceberg stats (Puffin NDV, metadata row_count)
+    Exact, // sourced from real catalog/Iceberg stats (Puffin NDV, metadata row_count)
+    /// Measured source (MV materialized row count / runtime feedback / sampling).
+    /// Strictly more trustworthy than catalog `Exact`.
+    /// Currently has no producer (stub) — inert until a measured source lands.
+    Measured,
 }
 
 impl Confidence {
@@ -725,6 +729,17 @@ mod tests {
 
         let stats_default = Statistics::default();
         assert_eq!(stats_default.row_count_confidence, Confidence::Fallback);
+    }
+
+    #[test]
+    fn confidence_strict_total_order() {
+        // Variant order must be Fallback < Estimated < Exact < Measured so that
+        // the `< Exact` comparison in cost.rs correctly trusts Exact and Measured.
+        assert!(Confidence::Measured > Confidence::Exact);
+        assert!(Confidence::Exact > Confidence::Estimated);
+        assert!(Confidence::Estimated > Confidence::Fallback);
+        // Default must stay Fallback.
+        assert_eq!(Confidence::default(), Confidence::Fallback);
     }
 
     #[test]

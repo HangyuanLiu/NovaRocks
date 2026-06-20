@@ -59,7 +59,7 @@ fn ndv_for_group_expr(
                 return None;
             }
             match cs.confidence {
-                Confidence::Exact => Some(ndv),
+                Confidence::Exact | Confidence::Measured => Some(ndv),
                 Confidence::Estimated if ndv < row_count * MIN_PARTIAL_BENEFIT_RATIO => Some(ndv),
                 Confidence::Estimated | Confidence::Fallback => None,
             }

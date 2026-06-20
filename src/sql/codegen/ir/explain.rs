@@ -966,7 +966,8 @@ fn format_stats_trailer(stats: &PlanNodeStats, show_conf: bool) -> String {
         match stats.row_count_confidence {
             crate::sql::optimizer::statistics::Confidence::Estimated => " conf=estimated",
             crate::sql::optimizer::statistics::Confidence::Fallback => " conf=fallback",
-            crate::sql::optimizer::statistics::Confidence::Exact => "",
+            crate::sql::optimizer::statistics::Confidence::Exact
+            | crate::sql::optimizer::statistics::Confidence::Measured => "",
         }
     } else {
         ""
