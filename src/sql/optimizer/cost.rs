@@ -6,7 +6,7 @@
 
 use super::memo::Cost;
 use super::operator::{
-    AggMode, JoinDistribution, Operator, PhysicalHashAggregateOp, PhysicalHashJoinOp,
+    AggMode, JoinDistribution, Operator, PhysicalHashAggregateOp, PhysicalHashJoinOp, ScanOp,
 };
 use super::property::{DistributionSpec, PhysicalPropertySet};
 use super::scalar::{ScalarArena, ScalarId, ScalarNode};
@@ -95,7 +95,7 @@ pub(crate) fn compute_cost(
         // ------------------------------------------------------------------
         // Physical operators
         // ------------------------------------------------------------------
-        Operator::PhysicalScan(_) => own_stats.compute_size(),
+        Operator::PhysicalScan(scan) => scan_cost_size(scan, own_stats),
 
         Operator::PhysicalFilter(_) => own_stats.output_row_count * own_stats.avg_row_size() * 0.01,
 
@@ -322,6 +322,35 @@ fn cost_row_width(stats: &Statistics) -> f64 {
 
 fn safe_compute_size(stats: &Statistics) -> f64 {
     finite_non_negative_cost(cost_row_count(stats) * cost_row_width(stats))
+}
+
+fn scan_cost_size(scan: &ScanOp, stats: &Statistics) -> f64 {
+    let Some(required_columns) = scan
+        .required_columns
+        .as_ref()
+        .filter(|cols| !cols.is_empty())
+    else {
+        return safe_compute_size(stats);
+    };
+
+    let mut column_ids = Vec::new();
+    for required_name in required_columns {
+        if let Some(column) = scan
+            .columns
+            .iter()
+            .find(|column| column.name.eq_ignore_ascii_case(required_name))
+        {
+            if !column_ids.contains(&column.column_id) {
+                column_ids.push(column.column_id);
+            }
+        }
+    }
+
+    if column_ids.is_empty() {
+        safe_compute_size(stats)
+    } else {
+        finite_non_negative_cost(stats.compute_size_for_columns(&column_ids))
+    }
 }
 
 fn stats_has_positive_overflow_signal(stats: &Statistics) -> bool {
@@ -595,8 +624,8 @@ pub(crate) fn estimate_sort_cost_estimate(
 
 pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
     match input.op {
-        Operator::PhysicalScan(_) => CostEstimate {
-            cpu_cost: safe_compute_size(input.own_stats),
+        Operator::PhysicalScan(scan) => CostEstimate {
+            cpu_cost: scan_cost_size(scan, input.own_stats),
             memory_cost: 0.0,
             network_cost: 0.0,
         },
@@ -853,6 +882,39 @@ mod tests {
             column_statistics: col,
             ..Default::default()
         }
+    }
+
+    fn output_column(id: u32, name: &str) -> crate::sql::analysis::OutputColumn {
+        crate::sql::analysis::OutputColumn {
+            column_id: ColumnId::new_for_test(id),
+            name: name.to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+            is_internal: false,
+        }
+    }
+
+    fn two_column_scan_op(required_columns: Option<Vec<&str>>) -> Operator {
+        Operator::PhysicalScan(ScanOp {
+            database: String::new(),
+            table: crate::sql::catalog::TableDef {
+                name: "t".into(),
+                columns: vec![],
+                iceberg_row_lineage_metadata_columns: vec![],
+                source: crate::sql::catalog::ScanSource::StarRocks {
+                    db_id: 0,
+                    table_id: 0,
+                },
+            },
+            alias: None,
+            columns: vec![output_column(1, "narrow"), output_column(2, "wide")],
+            predicates: vec![],
+            required_columns: required_columns
+                .map(|columns| columns.into_iter().map(str::to_string).collect()),
+            dict_columns: vec![],
+            variant_columns: vec![],
+            mv_rewritten_from: None,
+        })
     }
 
     fn scan_op() -> Operator {
@@ -1756,6 +1818,50 @@ mod tests {
         });
         let cost = compute_cost(&op, &s, &[]);
         assert!((cost - 100_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn scan_cost_uses_required_columns_when_pruned() {
+        let s = stats_with_column_widths(1000.0, &[4.0, 128.0]);
+        let op = two_column_scan_op(Some(vec!["narrow"]));
+
+        let legacy_cost = compute_cost(&op, &s, &[]);
+        let input = CostInput {
+            op: &op,
+            own_stats: &s,
+            child_stats: &[],
+            child_outputs: &[],
+            required_output: &PhysicalPropertySet::any(),
+            alt_kind: &PropertyAlternativeKind::Default,
+            scalars: None,
+            options: &CostOptions::default(),
+        };
+        let estimate = compute_cost_estimate(&input);
+
+        assert_eq!(legacy_cost, 4_000.0);
+        assert_eq!(estimate.cpu_cost, 4_000.0);
+    }
+
+    #[test]
+    fn scan_cost_with_required_columns_saturates_infinite_rows() {
+        let s = stats_with_column_widths(f64::INFINITY, &[4.0, 128.0]);
+        let op = two_column_scan_op(Some(vec!["narrow"]));
+
+        let legacy_cost = compute_cost(&op, &s, &[]);
+        let input = CostInput {
+            op: &op,
+            own_stats: &s,
+            child_stats: &[],
+            child_outputs: &[],
+            required_output: &PhysicalPropertySet::any(),
+            alt_kind: &PropertyAlternativeKind::Default,
+            scalars: None,
+            options: &CostOptions::default(),
+        };
+        let estimate = compute_cost_estimate(&input);
+
+        assert_eq!(legacy_cost, MAX_FINITE_COST);
+        assert_eq!(estimate.cpu_cost, MAX_FINITE_COST);
     }
 
     #[test]
