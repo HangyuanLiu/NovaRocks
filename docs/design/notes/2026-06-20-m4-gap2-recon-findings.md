@@ -99,3 +99,39 @@ both intern, both derive once, both rely on the existing enumeration caps (#321 
 Both are memory-safe by construction. Recommendation: **option 2** (most contained, reuses
 existing infrastructure, exactly closes the pinned gap). Option 1 is the StarRocks-faithful
 alternative if plan-wide transitive pushdown is also wanted.
+
+## Implementation (chosen) + verification
+
+Implemented **option 2, elevated to a reorder-graph-internal equivalence-class primitive**:
+- `flatten` derives the chain's `col=col` closure via the shared `EquivalenceClasses`
+  union-find (scoped to the chain) and stores it on `MultiJoinGraph::equi_classes` as
+  per-atom representative interned `ColumnRef` scalars — O(atoms-in-class), never C(k,2).
+- The enumeration's `connecting_condition_scalars` reduces a partition's connecting
+  condition to **at most one equi per equivalence class** (literal preferred, else one
+  synthesized `leftRep=rightRep`). This both (a) closes the gap — a transitively-connected
+  atom pair becomes an equi-join candidate — and (b) prevents the selectivity double-count a
+  path cut like `{A,C}⋈B` would otherwise introduce (drops the redundant `b=c`, safe because
+  `{A,C}` already enforces `a≡c`).
+- No fresh deep-cloned predicates (reuses interned scalars); derived once per chain;
+  bounded by the existing enumeration caps (#321 bushy bound, `cbo_max_groups`, explore-cap).
+
+**Why this can't reproduce the gap2 OOM:** the three blowup vectors are structurally absent —
+no C(k,2) (O(k) reps + one-equi-per-class), no deep clone (interned scalars), no per-candidate
+recomputation (derived once in flatten).
+
+**Verification (dev-opt, `-j1`, against the iceberg-rest SF1 fixture):**
+- `cargo test --lib`: 5128 pass (+8 new reorder unit tests: class build, synthesis,
+  same-class dedup, simple-join no-op, candidate reachability, k=12 bounded-ness).
+- **TPC-DS 99/99 verify PASS** (runner exit 0 ⇒ `grand_failed=0`) — no correctness regression.
+- **TPC-DS q72 (the rolled-back gap2's OOM query): PASS, 33.99s, rows=100**, peak server RSS
+  ≈6.6 GB single-run / ≈12.6 GB across the full serial sweep — bounded execution memory, no
+  planning explosion, far below host memory. **The gap2 red line holds.**
+- optimizer plan-golden suite 63/63 PASS — zero plan-shape churn (the suite's joins are below
+  the multi-join reorder threshold, so they never enter this code path).
+- `cargo clippy --lib`: no errors (two pre-existing `collapsible_if` warnings on `main`).
+
+**Deferred:** a runtime `enable_transitive_predicate`-style session toggle for live A/B was not
+added — the feature is safe by construction and the coarse `SET disable_optimizer_rules=
+'MultiJoinReorder'` already gates the whole pass; a fine-grained toggle is an easy follow-up if
+wanted. Branch-vs-`main` runtime A/B was not run (would need a separate `main` rebuild); the
+capability is unit-proven and correctness is covered by 99/99.
