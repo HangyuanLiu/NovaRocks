@@ -367,6 +367,14 @@ fn scalar_complexity(arena: Option<&ScalarArena>, expr: ScalarId) -> f64 {
     }
 }
 
+fn scalar_list_complexity(arena: Option<&ScalarArena>, exprs: &[ScalarId]) -> f64 {
+    exprs
+        .iter()
+        .map(|expr| scalar_complexity(arena, *expr))
+        .sum::<f64>()
+        .max(1.0)
+}
+
 pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
     match input.op {
         Operator::PhysicalScan(_) => CostEstimate {
@@ -393,14 +401,11 @@ pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
                 .first()
                 .map(|stats| stats.safe_output_row_count())
                 .unwrap_or_else(|| input.own_stats.safe_output_row_count());
-            let complexity = project
-                .items
-                .iter()
-                .map(|item| scalar_complexity(input.scalars, item.expr))
-                .sum::<f64>()
-                .max(1.0);
+            let exprs: Vec<_> = project.items.iter().map(|item| item.expr).collect();
             CostEstimate {
-                cpu_cost: input_rows * complexity * input.options.projection_cost_factor,
+                cpu_cost: input_rows
+                    * scalar_list_complexity(input.scalars, &exprs)
+                    * input.options.projection_cost_factor,
                 memory_cost: safe_compute_size(input.own_stats) * 0.02,
                 network_cost: 0.0,
             }
