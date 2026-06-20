@@ -288,14 +288,23 @@ fn cost_row_count(stats: &Statistics) -> f64 {
     }
 }
 
-fn safe_compute_size(stats: &Statistics) -> f64 {
+fn cost_row_width(stats: &Statistics) -> f64 {
     let avg_row_size = stats.avg_row_size();
-    let avg_row_size = if avg_row_size.is_finite() && avg_row_size > 0.0 {
-        avg_row_size
+    if avg_row_size.is_finite() {
+        if avg_row_size > 0.0 {
+            finite_non_negative_cost(avg_row_size)
+        } else {
+            8.0
+        }
+    } else if avg_row_size.is_infinite() && avg_row_size.is_sign_positive() {
+        MAX_FINITE_COST
     } else {
         8.0
-    };
-    finite_non_negative_cost(cost_row_count(stats) * avg_row_size)
+    }
+}
+
+fn safe_compute_size(stats: &Statistics) -> f64 {
+    finite_non_negative_cost(cost_row_count(stats) * cost_row_width(stats))
 }
 
 impl CostEstimate {
@@ -630,6 +639,28 @@ mod tests {
         }
     }
 
+    fn stats_with_column_widths(rows: f64, widths: &[f64]) -> Statistics {
+        let mut col = HashMap::new();
+        for (idx, width) in widths.iter().enumerate() {
+            col.insert(
+                ColumnId::new_for_test(idx as u32 + 1),
+                ColumnStatistic {
+                    min_value: 0.0,
+                    max_value: 100.0,
+                    nulls_fraction: 0.0,
+                    average_row_size: *width,
+                    distinct_values_count: rows,
+                    ..Default::default()
+                },
+            );
+        }
+        Statistics {
+            output_row_count: rows,
+            column_statistics: col,
+            ..Default::default()
+        }
+    }
+
     fn scan_op() -> Operator {
         Operator::PhysicalScan(ScanOp {
             database: String::new(),
@@ -681,6 +712,20 @@ mod tests {
         assert_eq!(cost_row_count(&stats(-1.0, 8.0)), 1.0);
         assert_eq!(cost_row_count(&stats(f64::NEG_INFINITY, 8.0)), 1.0);
         assert_eq!(cost_row_count(&stats(f64::NAN, 8.0)), 1.0);
+    }
+
+    #[test]
+    fn cost_row_width_saturates_positive_infinity_and_preserves_invalid_fallback() {
+        assert_eq!(cost_row_width(&stats(1.0, 42.0)), 42.0);
+        assert_eq!(cost_row_width(&stats(1.0, f64::MAX)), MAX_FINITE_COST);
+        assert_eq!(
+            cost_row_width(&stats_with_column_widths(1.0, &[f64::MAX, f64::MAX])),
+            MAX_FINITE_COST
+        );
+        assert_eq!(cost_row_width(&stats(1.0, 0.0)), 8.0);
+        assert_eq!(cost_row_width(&stats(1.0, -1.0)), 8.0);
+        assert_eq!(cost_row_width(&stats(1.0, f64::NEG_INFINITY)), 8.0);
+        assert_eq!(cost_row_width(&stats(1.0, f64::NAN)), 8.0);
     }
 
     #[test]
@@ -888,6 +933,30 @@ mod tests {
     #[test]
     fn scan_cost_estimate_dimensions_are_finite_for_overflow_size() {
         let overflow_stats = stats(f64::MAX, f64::MAX);
+        let op = scan_op();
+        let child_stats: [&Statistics; 0] = [];
+        let child_outputs: [&PhysicalPropertySet; 0] = [];
+        let required = PhysicalPropertySet::any();
+        let options = CostOptions::default();
+        let input = CostInput {
+            op: &op,
+            own_stats: &overflow_stats,
+            child_stats: &child_stats,
+            child_outputs: &child_outputs,
+            required_output: &required,
+            alt_kind: &PropertyAlternativeKind::Default,
+            scalars: None,
+            options: &options,
+        };
+
+        let estimate = compute_cost_estimate(&input);
+        assert_finite_non_negative_dimensions(&estimate);
+        assert_eq!(estimate.cpu_cost, MAX_FINITE_COST);
+    }
+
+    #[test]
+    fn scan_cost_estimate_saturates_for_overflowed_row_width() {
+        let overflow_stats = stats_with_column_widths(10.0, &[f64::MAX, f64::MAX]);
         let op = scan_op();
         let child_stats: [&Statistics; 0] = [];
         let child_outputs: [&PhysicalPropertySet; 0] = [];
