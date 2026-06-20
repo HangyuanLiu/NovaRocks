@@ -1001,6 +1001,8 @@ fn format_column_stats_costs(stats: &PlanNodeStats) -> String {
 }
 
 fn fmt_f64(v: f64) -> String {
+    const SAFE_INTEGER_DISPLAY_LIMIT: f64 = 9_007_199_254_740_992.0;
+
     if v.is_nan() {
         "?".to_string()
     } else if v.is_infinite() {
@@ -1009,6 +1011,8 @@ fn fmt_f64(v: f64) -> String {
         } else {
             "-inf".to_string()
         }
+    } else if v.abs() > SAFE_INTEGER_DISPLAY_LIMIT {
+        format!("{v:.4e}")
     } else if v.fract() == 0.0 {
         format!("{}", v as i64)
     } else {
@@ -1455,23 +1459,27 @@ mod tests {
 
     #[test]
     fn costs_level_renders_dimensional_costs() {
-        let mut dp = build_distributed_plan(&scan_plan()).expect("build DistributedPlan");
-        let root = dp
-            .fragments
-            .iter_mut()
-            .find(|fragment| fragment.fragment_id == dp.root_fragment_id)
-            .expect("root fragment");
-        root.root.stats.cost_estimate = Some(crate::sql::optimizer::statistics::CostEstimate {
-            cpu_cost: 10.0,
-            memory_cost: 2.0,
-            network_cost: 3.0,
-        });
+        let dp = build_distributed_plan(&scan_plan()).expect("build DistributedPlan");
 
         let costs = explain_distributed_plan(&dp, ExplainLevel::Costs).join("\n");
-        assert!(costs.contains("cost={cpu=10"));
-        assert!(costs.contains("memory=2"));
-        assert!(costs.contains("network=3"));
+        assert!(costs.contains("1:SCAN test_db.t (alias=t) (rows=3 cost={cpu="));
+        assert!(costs.contains("memory="));
+        assert!(costs.contains("network="));
         assert!(costs.contains("total="));
+    }
+
+    #[test]
+    fn fmt_f64_uses_scientific_not_i64_saturation_for_huge_values() {
+        let text = super::fmt_f64(1.0e300);
+
+        assert!(
+            text.contains('e') || text.contains('E'),
+            "huge finite values should use scientific notation, got {text}"
+        );
+        assert!(
+            !text.contains("9223372036854775807"),
+            "huge finite values must not saturate through i64 formatting"
+        );
     }
 
     #[test]

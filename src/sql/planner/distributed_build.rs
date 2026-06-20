@@ -146,7 +146,10 @@ impl<'a> DistributedPlanBuilder<'a> {
                 let mut child = self.visit(child_plan)?;
                 let predicate = materialize(self.scalars, op.predicate);
                 if fold_filter_into_scan(&mut child, &predicate) {
-                    child.stats = PlanNodeStats::from_statistics(&node.stats);
+                    child.stats = PlanNodeStats::from_statistics_with_cost(
+                        &node.stats,
+                        child.stats.cost_estimate.clone(),
+                    );
                     child
                         .probe_runtime_filters
                         .extend(node.probe_runtime_filters.clone());
@@ -227,7 +230,10 @@ impl<'a> DistributedPlanBuilder<'a> {
 
                 let mut child = self.visit(child_plan)?;
                 child.limit = op.limit.unwrap_or(-1);
-                child.stats = PlanNodeStats::from_statistics(&node.stats);
+                child.stats = PlanNodeStats::from_statistics_with_cost(
+                    &node.stats,
+                    child.stats.cost_estimate.clone(),
+                );
                 match &mut child.kind {
                     PlanNodeKind::Sort(sort) => {
                         sort.offset = op.offset;
@@ -667,6 +673,7 @@ impl<'a> DistributedPlanBuilder<'a> {
             ExchangeFlavor::Distribution,
             -1,
             Vec::new(),
+            stats_for_physical_node(node),
             |source_fragment_id| DistributedExchangeNode {
                 partition_type,
                 partition_exprs,
@@ -701,6 +708,7 @@ impl<'a> DistributedPlanBuilder<'a> {
             },
             op.limit.unwrap_or(-1),
             Vec::new(),
+            stats_for_physical_node(distribution_node),
             |source_fragment_id| DistributedExchangeNode {
                 partition_type,
                 partition_exprs: Vec::new(),
@@ -737,6 +745,7 @@ impl<'a> DistributedPlanBuilder<'a> {
             },
             op.limit.unwrap_or(-1),
             Vec::new(),
+            PlanNodeStats::from_statistics(&node.stats),
             |source_fragment_id| DistributedExchangeNode {
                 partition_type,
                 partition_exprs: Vec::new(),
@@ -775,6 +784,7 @@ impl<'a> DistributedPlanBuilder<'a> {
             },
             op.limit.unwrap_or(-1),
             Vec::new(),
+            PlanNodeStats::from_statistics(&node.stats),
             |source_fragment_id| DistributedExchangeNode {
                 partition_type,
                 partition_exprs: Vec::new(),
@@ -800,6 +810,7 @@ impl<'a> DistributedPlanBuilder<'a> {
         flavor_for_validation: ExchangeFlavor,
         limit: i64,
         exchange_output_columns: Vec<crate::sql::analysis::OutputColumn>,
+        exchange_stats: PlanNodeStats,
         build_exchange: impl FnOnce(FragmentId) -> DistributedExchangeNode,
     ) -> Result<DistributedPlanNode, String> {
         let parent_fragment_id = self.current_fragment_id()?;
@@ -847,7 +858,7 @@ impl<'a> DistributedPlanBuilder<'a> {
             build_runtime_filters: node.build_runtime_filters.clone(),
             probe_runtime_filters: node.probe_runtime_filters.clone(),
             children: vec![],
-            stats: stats_for_physical_node(node),
+            stats: exchange_stats,
             kind: PlanNodeKind::Exchange(exchange),
         })
     }
@@ -1081,7 +1092,7 @@ impl<'a> DistributedPlanBuilder<'a> {
             build_runtime_filters: node.build_runtime_filters.clone(),
             probe_runtime_filters: node.probe_runtime_filters.clone(),
             children: vec![child],
-            stats: stats_for_physical_node(node),
+            stats: PlanNodeStats::from_statistics(&node.stats),
             kind: PlanNodeKind::HashAggregate(Box::new(DistributedHashAggregateNode {
                 mode: crate::sql::optimizer::operator::AggMode::Single,
                 group_by,
@@ -1342,17 +1353,19 @@ mod tests {
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
-        AssertOneRowOp, FilterOp, Operator, ProjectOp, ScanOp, SortOp, WindowOp,
+        AssertOneRowOp, FilterOp, LimitOp, Operator, PhysicalDistributionOp, ProjectOp, ScanOp,
+        SortOp, TopNOp, TopNPhase, UnionOp, WindowOp,
     };
     use crate::sql::optimizer::physical_plan::{
         PhysicalPlanNode, PlanExecutionProps, attach_scalar_arena,
     };
+    use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
     use crate::sql::optimizer::scalar_bridge::{
         intern_project_items, intern_sort_items, intern_window_exprs,
     };
     use crate::sql::optimizer::statistics::{ColumnStatistic, Statistics};
-    use crate::sql::planner::plan::{PlanNodeKind, WindowExpr};
+    use crate::sql::planner::plan::{ExchangeFlavor, PlanNodeKind, WindowExpr};
 
     #[test]
     fn build_distributed_plan_scan_project_shapes_one_fragment() {
@@ -1406,6 +1419,101 @@ mod tests {
 
         assert!(matches!(folded_scan.kind, PlanNodeKind::Scan(_)));
         assert_eq!(folded_scan.stats.output_row_count, 5.0);
+    }
+
+    #[test]
+    fn build_distributed_plan_folded_filter_preserves_scan_cost() {
+        let physical = filter_plan_with_row_count(scan_plan_with_row_count(100.0), 5.0);
+        let dp = build_distributed_plan(&physical).expect("build_distributed_plan");
+        let folded_scan = &dp.fragments[0].root;
+
+        assert!(matches!(folded_scan.kind, PlanNodeKind::Scan(_)));
+        assert_eq!(folded_scan.stats.output_row_count, 5.0);
+        assert!(
+            folded_scan.stats.cost_estimate.is_some(),
+            "folded filter should preserve the scan self-cost"
+        );
+    }
+
+    #[test]
+    fn build_distributed_plan_fused_limit_preserves_child_cost() {
+        let physical = limit_plan(scan_plan_with_row_count(100.0), Some(7), None, 7.0);
+        let dp = build_distributed_plan(&physical).expect("build_distributed_plan");
+        let root = &dp.fragments[0].root;
+
+        assert!(matches!(root.kind, PlanNodeKind::Scan(_)));
+        assert_eq!(root.limit, 7);
+        assert_eq!(root.stats.output_row_count, 7.0);
+        assert!(
+            root.stats.cost_estimate.is_some(),
+            "fused limit should preserve the displayed child self-cost"
+        );
+    }
+
+    #[test]
+    fn build_distributed_plan_limit_offset_exchange_has_no_limit_cost() {
+        let physical = limit_plan(scan_plan_with_row_count(100.0), Some(7), Some(2), 7.0);
+        let dp = build_distributed_plan(&physical).expect("build_distributed_plan");
+        let root = root_plan_node(&dp);
+
+        let PlanNodeKind::Exchange(exchange) = &root.kind else {
+            panic!("root should be exchange");
+        };
+        assert!(matches!(
+            exchange.flavor,
+            ExchangeFlavor::LimitOffset { .. }
+        ));
+        assert!(
+            root.stats.cost_estimate.is_none(),
+            "synthetic limit-offset exchange should not display PhysicalLimit cost"
+        );
+    }
+
+    #[test]
+    fn build_distributed_plan_topn_split_exchange_has_no_topn_cost() {
+        let physical = topn_split_plan(scan_plan_with_row_count(100.0));
+        let dp = build_distributed_plan(&physical).expect("build_distributed_plan");
+        let root = root_plan_node(&dp);
+
+        let PlanNodeKind::Exchange(exchange) = &root.kind else {
+            panic!("root should be exchange");
+        };
+        assert!(matches!(exchange.flavor, ExchangeFlavor::TopNSplit { .. }));
+        assert!(
+            root.stats.cost_estimate.is_none(),
+            "synthetic top-n split exchange should not display PhysicalTopN cost"
+        );
+    }
+
+    #[test]
+    fn build_distributed_plan_real_distribution_exchange_keeps_distribution_cost() {
+        let physical = project_plan(distribution_plan(
+            scan_plan_with_row_count(100.0),
+            DistributionSpec::Gather,
+        ));
+        let dp = build_distributed_plan(&physical).expect("build_distributed_plan");
+        let exchange =
+            find_plan_exchange_node(&dp, |flavor| matches!(flavor, ExchangeFlavor::Distribution));
+        assert!(
+            exchange.stats.cost_estimate.is_some(),
+            "real distribution exchange should display PhysicalDistribution cost"
+        );
+    }
+
+    #[test]
+    fn build_distributed_plan_union_distinct_synthetic_aggregate_has_no_union_cost() {
+        let physical = union_distinct_plan(vec![
+            scan_plan_with_row_count(10.0),
+            scan_plan_with_row_count(20.0),
+        ]);
+        let dp = build_distributed_plan(&physical).expect("build_distributed_plan");
+        let root = root_plan_node(&dp);
+
+        assert!(matches!(root.kind, PlanNodeKind::HashAggregate(_)));
+        assert!(
+            root.stats.cost_estimate.is_none(),
+            "synthetic distinct aggregate should not display PhysicalUnion cost"
+        );
     }
 
     #[test]
@@ -1468,6 +1576,38 @@ mod tests {
         project_plan(scan_plan())
     }
 
+    fn root_plan_node(dp: &super::DistributedPlan) -> &super::DistributedPlanNode {
+        &dp.fragments
+            .iter()
+            .find(|fragment| fragment.fragment_id == dp.root_fragment_id)
+            .expect("root fragment")
+            .root
+    }
+
+    fn find_plan_exchange_node(
+        dp: &super::DistributedPlan,
+        matches_flavor: fn(&ExchangeFlavor) -> bool,
+    ) -> &super::DistributedPlanNode {
+        dp.fragments
+            .iter()
+            .find_map(|fragment| find_exchange_node(&fragment.root, matches_flavor))
+            .expect("exchange node")
+    }
+
+    fn find_exchange_node(
+        node: &super::DistributedPlanNode,
+        matches_flavor: fn(&ExchangeFlavor) -> bool,
+    ) -> Option<&super::DistributedPlanNode> {
+        if let PlanNodeKind::Exchange(exchange) = &node.kind
+            && matches_flavor(&exchange.flavor)
+        {
+            return Some(node);
+        }
+        node.children
+            .iter()
+            .find_map(|child| find_exchange_node(child, matches_flavor))
+    }
+
     fn filter_then_project_plan() -> PhysicalPlanNode {
         project_plan(filter_plan(scan_plan()))
     }
@@ -1498,6 +1638,72 @@ mod tests {
         );
         attach_scalar_arena(&mut plan, Arc::new(scalars));
         plan
+    }
+
+    fn limit_plan(
+        child: PhysicalPlanNode,
+        limit: Option<i64>,
+        offset: Option<i64>,
+        row_count: f64,
+    ) -> PhysicalPlanNode {
+        let output_columns = child.output_columns.clone();
+        physical_node_with_row_count(
+            Operator::PhysicalLimit(LimitOp { limit, offset }),
+            vec![child],
+            output_columns,
+            row_count,
+        )
+    }
+
+    fn topn_split_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
+        let mut scalars = scalars_from_children(std::slice::from_ref(&child));
+        let output_columns = child.output_columns.clone();
+        let mut plan = physical_node(
+            Operator::PhysicalTopN(TopNOp {
+                items: intern_sort_items(
+                    &mut scalars,
+                    &[SortItem {
+                        expr: column_ref_expr(1, "k", DataType::Int64, false),
+                        asc: true,
+                        nulls_first: false,
+                    }],
+                ),
+                limit: Some(3),
+                offset: None,
+                phase: TopNPhase::Final,
+                is_split: true,
+            }),
+            vec![child],
+            output_columns,
+        );
+        attach_scalar_arena(&mut plan, Arc::new(scalars));
+        plan
+    }
+
+    fn distribution_plan(child: PhysicalPlanNode, spec: DistributionSpec) -> PhysicalPlanNode {
+        let output_columns = child.output_columns.clone();
+        physical_node(
+            Operator::PhysicalDistribution(PhysicalDistributionOp { spec }),
+            vec![child],
+            output_columns,
+        )
+    }
+
+    fn union_distinct_plan(children: Vec<PhysicalPlanNode>) -> PhysicalPlanNode {
+        let output_columns = children[0].output_columns.clone();
+        let child_output_columns = children
+            .iter()
+            .map(|child| child.output_columns.clone())
+            .collect();
+        physical_node(
+            Operator::PhysicalUnion(UnionOp {
+                all: false,
+                output_columns: output_columns.clone(),
+                child_output_columns,
+            }),
+            children,
+            output_columns,
+        )
     }
 
     fn assert_one_row_plan(child: PhysicalPlanNode) -> PhysicalPlanNode {
