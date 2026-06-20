@@ -257,6 +257,14 @@ fn effective_cost_weight(weight: f64) -> f64 {
     }
 }
 
+fn finite_non_negative_cost(value: f64) -> f64 {
+    if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        0.0
+    }
+}
+
 fn safe_compute_size(stats: &Statistics) -> f64 {
     let avg_row_size = stats.avg_row_size();
     let avg_row_size = if avg_row_size.is_finite() && avg_row_size > 0.0 {
@@ -264,7 +272,7 @@ fn safe_compute_size(stats: &Statistics) -> f64 {
     } else {
         8.0
     };
-    stats.safe_output_row_count() * avg_row_size
+    finite_non_negative_cost(stats.safe_output_row_count() * avg_row_size)
 }
 
 impl CostEstimate {
@@ -359,14 +367,6 @@ fn scalar_complexity(arena: Option<&ScalarArena>, expr: ScalarId) -> f64 {
     }
 }
 
-fn scalar_list_complexity(arena: Option<&ScalarArena>, exprs: &[ScalarId]) -> f64 {
-    exprs
-        .iter()
-        .map(|expr| scalar_complexity(arena, *expr))
-        .sum::<f64>()
-        .max(1.0)
-}
-
 pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
     match input.op {
         Operator::PhysicalScan(_) => CostEstimate {
@@ -393,11 +393,14 @@ pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
                 .first()
                 .map(|stats| stats.safe_output_row_count())
                 .unwrap_or_else(|| input.own_stats.safe_output_row_count());
-            let exprs: Vec<_> = project.items.iter().map(|item| item.expr).collect();
+            let complexity = project
+                .items
+                .iter()
+                .map(|item| scalar_complexity(input.scalars, item.expr))
+                .sum::<f64>()
+                .max(1.0);
             CostEstimate {
-                cpu_cost: input_rows
-                    * scalar_list_complexity(input.scalars, &exprs)
-                    * input.options.projection_cost_factor,
+                cpu_cost: input_rows * complexity * input.options.projection_cost_factor,
                 memory_cost: safe_compute_size(input.own_stats) * 0.02,
                 network_cost: 0.0,
             }
@@ -448,10 +451,12 @@ pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
                 input.options,
             );
             let cpu_weight = effective_cost_weight(input.options.cpu_weight);
+            let cpu_cost =
+                finite_non_negative_cost(finite_non_negative_cost(legacy_cost) / cpu_weight);
             CostEstimate {
                 // Generic fallback stores the legacy scalar total as CPU-equivalent
                 // cost until the operator gets a real dimensional kernel.
-                cpu_cost: legacy_cost / cpu_weight,
+                cpu_cost,
                 memory_cost: 0.0,
                 network_cost: 0.0,
             }
@@ -589,6 +594,12 @@ mod tests {
             variant_columns: vec![],
             mv_rewritten_from: None,
         })
+    }
+
+    fn assert_finite_non_negative_dimensions(estimate: &CostEstimate) {
+        assert!(estimate.cpu_cost.is_finite() && estimate.cpu_cost >= 0.0);
+        assert!(estimate.memory_cost.is_finite() && estimate.memory_cost >= 0.0);
+        assert!(estimate.network_cost.is_finite() && estimate.network_cost >= 0.0);
     }
 
     #[test]
@@ -730,9 +741,61 @@ mod tests {
         };
 
         let estimate = compute_cost_estimate(&input);
-        assert!(estimate.cpu_cost.is_finite() && estimate.cpu_cost >= 0.0);
-        assert!(estimate.memory_cost.is_finite() && estimate.memory_cost >= 0.0);
-        assert!(estimate.network_cost.is_finite() && estimate.network_cost >= 0.0);
+        assert_finite_non_negative_dimensions(&estimate);
+    }
+
+    #[test]
+    fn scan_cost_estimate_dimensions_are_finite_for_overflow_size() {
+        let overflow_stats = stats(f64::MAX, f64::MAX);
+        let op = scan_op();
+        let child_stats: [&Statistics; 0] = [];
+        let child_outputs: [&PhysicalPropertySet; 0] = [];
+        let required = PhysicalPropertySet::any();
+        let options = CostOptions::default();
+        let input = CostInput {
+            op: &op,
+            own_stats: &overflow_stats,
+            child_stats: &child_stats,
+            child_outputs: &child_outputs,
+            required_output: &required,
+            alt_kind: &PropertyAlternativeKind::Default,
+            scalars: None,
+            options: &options,
+        };
+
+        let estimate = compute_cost_estimate(&input);
+        assert_finite_non_negative_dimensions(&estimate);
+    }
+
+    #[test]
+    fn fallback_cost_estimate_dimensions_are_finite_for_invalid_child_stats() {
+        let invalid_child_stats = stats(f64::NAN, f64::INFINITY);
+        let own_stats = stats(10.0, 8.0);
+        let op = Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+            mode: AggMode::Single,
+            group_by: vec![],
+            aggregates: vec![],
+            output_columns: vec![],
+            is_merge: vec![],
+        });
+        let child_stats = [&invalid_child_stats];
+        let child_outputs = [PhysicalPropertySet::any()];
+        let child_output_refs = [&child_outputs[0]];
+        let required = PhysicalPropertySet::any();
+        let options = CostOptions::default();
+        let input = CostInput {
+            op: &op,
+            own_stats: &own_stats,
+            child_stats: &child_stats,
+            child_outputs: &child_output_refs,
+            required_output: &required,
+            alt_kind: &PropertyAlternativeKind::Default,
+            scalars: None,
+            options: &options,
+        };
+
+        let estimate = compute_cost_estimate(&input);
+        assert_finite_non_negative_dimensions(&estimate);
     }
 
     #[test]
