@@ -478,7 +478,9 @@ pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
             network_cost: 0.0,
         },
         _ => {
-            let legacy_cost = compute_cost_with_properties(
+            // Keep the generic fallback independent from the public cost entrypoint.
+            // Task 4 can then rebuild that entrypoint on CostInput without recursion.
+            let legacy_cost = compute_legacy_cost_with_properties(
                 input.op,
                 input.own_stats,
                 input.child_stats,
@@ -532,7 +534,7 @@ pub(crate) fn broadcast_gate_passes(
     true
 }
 
-pub(crate) fn compute_cost_with_properties(
+fn compute_legacy_cost_with_properties(
     op: &Operator,
     own_stats: &Statistics,
     child_stats: &[&Statistics],
@@ -576,6 +578,24 @@ pub(crate) fn compute_cost_with_properties(
         }
         _ => compute_cost(op, own_stats, child_stats),
     }
+}
+
+pub(crate) fn compute_cost_with_properties(
+    op: &Operator,
+    own_stats: &Statistics,
+    child_stats: &[&Statistics],
+    child_outputs: &[&PhysicalPropertySet],
+    alt_kind: &PropertyAlternativeKind,
+    options: &CostOptions,
+) -> Cost {
+    compute_legacy_cost_with_properties(
+        op,
+        own_stats,
+        child_stats,
+        child_outputs,
+        alt_kind,
+        options,
+    )
 }
 
 #[cfg(test)]
@@ -1040,6 +1060,45 @@ mod tests {
             &options,
         );
         assert!((input_cost - property_cost).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn fallback_cost_estimate_uses_legacy_property_helper() {
+        let probe = stats(100_000.0, 100.0);
+        let build = stats(10_000.0, 100.0);
+        let own = stats(100_000.0, 200.0);
+        let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![],
+            other_condition: None,
+            distribution: JoinDistribution::Unknown,
+        });
+        let child_stats = [&probe, &build];
+        let child_outputs = [PhysicalPropertySet::any(), PhysicalPropertySet::broadcast()];
+        let child_output_refs = [&child_outputs[0], &child_outputs[1]];
+        let required = PhysicalPropertySet::any();
+        let options = CostOptions::default();
+        let input = CostInput {
+            op: &op,
+            own_stats: &own,
+            child_stats: &child_stats,
+            child_outputs: &child_output_refs,
+            required_output: &required,
+            alt_kind: &PropertyAlternativeKind::BroadcastJoin,
+            scalars: None,
+            options: &options,
+        };
+
+        let estimate_total = compute_cost_from_input(&input);
+        let legacy_cost = compute_legacy_cost_with_properties(
+            &op,
+            &own,
+            &child_stats,
+            &child_output_refs,
+            &PropertyAlternativeKind::BroadcastJoin,
+            &options,
+        );
+        assert!((estimate_total - legacy_cost).abs() < f64::EPSILON);
     }
 
     #[test]
