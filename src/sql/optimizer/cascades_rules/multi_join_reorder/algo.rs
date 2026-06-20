@@ -23,6 +23,10 @@ use super::MultiJoinGraph;
 /// branch-and-bound comparator finite on cross-join chains (mirrors StarRocks
 /// `JoinOrder.MAXIMUM_COST`).
 const MAX_REORDER_COST: f64 = 1e300;
+const REORDER_CROSS_CPU_FACTOR: f64 = 2.0;
+const REORDER_CROSS_MEMORY_FACTOR: f64 = 200.0;
+const REORDER_HASH_BUILD_FACTOR: f64 = 1.0;
+const REORDER_OUTPUT_FACTOR: f64 = 1.0;
 
 /// Caps controlling which algorithms run, mirroring StarRocks session vars.
 /// Wired to `OptimizerOptions` in Phase 4; plain parameters here.
@@ -145,8 +149,10 @@ fn join_self_cost(
 ) -> f64 {
     let est = match kind {
         JoinKind::Cross => CostEstimate {
-            cpu_cost: finite_cost(left.compute_size() * right.output_row_count * 2.0),
-            memory_cost: finite_cost(right.compute_size() * 200.0),
+            cpu_cost: finite_cost(
+                left.compute_size() * right.output_row_count * REORDER_CROSS_CPU_FACTOR,
+            ),
+            memory_cost: finite_cost(right.compute_size() * REORDER_CROSS_MEMORY_FACTOR),
             network_cost: 0.0,
         },
         _ => {
@@ -154,9 +160,9 @@ fn join_self_cost(
             let probe_penalty = (right_rows / 100_000.0).ln().clamp(1.0, 12.0);
             CostEstimate {
                 cpu_cost: finite_cost(
-                    right.compute_size()
+                    right.compute_size() * REORDER_HASH_BUILD_FACTOR
                         + left.compute_size() * probe_penalty
-                        + output.compute_size(),
+                        + output.compute_size() * REORDER_OUTPUT_FACTOR,
                 ),
                 memory_cost: finite_cost(right.compute_size()),
                 network_cost: 0.0,
@@ -636,6 +642,31 @@ mod tests {
             row_count_confidence: Confidence::Estimated,
             column_statistics: cs,
         }
+    }
+
+    #[test]
+    fn join_self_cost_penalizes_cross_join_above_equi_join() {
+        let left = atom_stats(0, 10_000.0, 10_000.0);
+        let right = atom_stats(1, 10_000.0, 10_000.0);
+        let output = atom_stats(2, 1_000.0, 1_000.0);
+
+        let equi_cost = join_self_cost(&left, &right, &output, JoinKind::Inner);
+        let cross_cost = join_self_cost(&left, &right, &output, JoinKind::Cross);
+
+        assert!(cross_cost > equi_cost * 10.0);
+    }
+
+    #[test]
+    fn join_self_cost_accounts_for_output_size() {
+        let left = atom_stats(0, 10_000.0, 10_000.0);
+        let right = atom_stats(1, 10_000.0, 10_000.0);
+        let small_output = atom_stats(2, 100.0, 100.0);
+        let large_output = atom_stats(3, 100_000.0, 100_000.0);
+
+        assert!(
+            join_self_cost(&left, &right, &large_output, JoinKind::Inner)
+                > join_self_cost(&left, &right, &small_output, JoinKind::Inner)
+        );
     }
 
     fn pred(arena: &mut ScalarArena, expr: TypedExpr) -> ScalarId {
