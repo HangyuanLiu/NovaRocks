@@ -11,8 +11,8 @@ mod algo;
 mod flatten;
 mod pass;
 
-use crate::sql::analysis::TypedExpr;
 use crate::sql::optimizer::memo::GroupId;
+use crate::sql::optimizer::scalar::ScalarId;
 use crate::sql::optimizer::statistics::Statistics;
 
 pub(crate) use algo::{ReorderCaps, enumerate_orders};
@@ -33,7 +33,7 @@ pub(crate) struct MultiJoinGraph {
     pub(crate) atom_stats: Vec<Statistics>,
     /// `(predicate, bitmask of atom indices it references)`. `u32` supports up
     /// to 32 atoms, matching the chain caps.
-    pub(crate) predicates: Vec<(TypedExpr, u32)>,
+    pub(crate) predicates: Vec<(ScalarId, u32)>,
     /// The inner/cross join groups this chain is built from (the root plus every
     /// internal join the flattener descended through). The reorder pass records
     /// these in `Memo::reorder_owned_groups` so `explore` skips

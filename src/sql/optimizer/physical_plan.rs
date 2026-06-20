@@ -62,9 +62,11 @@ pub(crate) fn attach_scalar_arena(root: &mut PhysicalPlanNode, arena: Arc<Scalar
 mod rf_field_tests {
     use super::*;
     use crate::sql::optimizer::runtime_filter_pass::{RuntimeFilterDesc, RuntimeFilterProbe};
+    use crate::sql::optimizer::scalar::ScalarArena;
 
     #[test]
     fn physical_node_carries_rf_annotations() {
+        let mut scalars = ScalarArena::new();
         let mut node = PhysicalPlanNode {
             op: make_test_op(),
             children: vec![],
@@ -80,9 +82,9 @@ mod rf_field_tests {
         };
         assert!(node.build_runtime_filters.is_empty());
         node.build_runtime_filters
-            .push(RuntimeFilterDesc::placeholder(0));
+            .push(RuntimeFilterDesc::placeholder(&mut scalars, 0));
         node.probe_runtime_filters
-            .push(RuntimeFilterProbe::placeholder(0));
+            .push(RuntimeFilterProbe::placeholder(&mut scalars, 0));
         assert_eq!(node.build_runtime_filters.len(), 1);
         assert_eq!(node.probe_runtime_filters.len(), 1);
     }

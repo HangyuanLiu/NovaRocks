@@ -2,13 +2,12 @@
 //! (Hash(partition_cols) + Required).
 
 use crate::sql::optimizer::operator::SortOp;
-use crate::sql::optimizer::property::{
-    DistributionSpec, OrderingSpec, PhysicalPropertySet, typed_exprs_to_column_ids,
-};
+use crate::sql::optimizer::property::{DistributionSpec, OrderingSpec, PhysicalPropertySet};
 use crate::sql::optimizer::scalar::ScalarArena;
-use crate::sql::optimizer::scalar_bridge::{materialize_exprs, materialize_sort_keys};
 
-use super::{DeriveOutput, DeriveRequired};
+use super::{
+    DeriveOutput, DeriveRequired, ordering_from_scalar_sort_keys, scalar_exprs_to_column_ids,
+};
 
 impl DeriveOutput for SortOp {
     fn derive_output(
@@ -19,15 +18,13 @@ impl DeriveOutput for SortOp {
         let distribution = if self.analytic_partition_exprs.is_empty() {
             DistributionSpec::Gather
         } else {
-            let partition_exprs = materialize_exprs(scalars, &self.analytic_partition_exprs);
-            typed_exprs_to_column_ids(&partition_exprs)
+            scalar_exprs_to_column_ids(scalars, &self.analytic_partition_exprs)
                 .map(DistributionSpec::shuffle_agg)
                 .unwrap_or(DistributionSpec::Gather)
         };
-        let items = materialize_sort_keys(scalars, &self.items);
         PhysicalPropertySet {
             distribution,
-            ordering: OrderingSpec::from_sort_items(&items),
+            ordering: ordering_from_scalar_sort_keys(scalars, &self.items),
         }
     }
 }
@@ -39,8 +36,8 @@ impl DeriveRequired for SortOp {
         _parent: &PhysicalPropertySet,
         _n: usize,
     ) -> Vec<PhysicalPropertySet> {
-        let partition_exprs = materialize_exprs(scalars, &self.analytic_partition_exprs);
-        if let Some(partition_cols) = typed_exprs_to_column_ids(&partition_exprs)
+        if let Some(partition_cols) =
+            scalar_exprs_to_column_ids(scalars, &self.analytic_partition_exprs)
             && !partition_cols.is_empty()
         {
             vec![PhysicalPropertySet {

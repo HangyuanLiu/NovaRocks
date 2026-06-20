@@ -1,48 +1,19 @@
 //! IMV-specific logical rewrite substrate. See
 //! docs/design/specs/2026-05-26-incremental-mv-optimizer-foundation-design.md.
 //!
-//! PR-α lands the foundation: empty pipeline, single-tenant extension slot
-//! wrapper, no-op end-to-end behavior. PR-β adds Delta/Version marker
-//! operators on top of this module without changing the public entrypoint.
+//! The module owns the IMV rewrite entrypoint, pipeline rules, annotations,
+//! and temporary bridges used by rules that still rely on `LogicalPlanNode`
+//! helpers during the OptExpr cutover.
 
-/// Convert an `OptExpr` to a `LogicalPlanNode` using the ScalarArena stored
-/// in the given `RewriteContext`. Called from IMV rule `apply` implementations
-/// that delegate to existing `LogicalPlanNode`-based helpers.
+/// Temporary internal bridge for IMV rule helpers that still operate on
+/// `LogicalPlanNode`. This is not the optimizer main path or an engine
+/// boundary.
 pub(crate) fn opt_expr_to_plan(
     expr: crate::sql::optimizer::opt_expr::OptExpr,
     ctx: &crate::sql::optimizer::rewrite::context::RewriteContext,
 ) -> crate::sql::planner::plan::LogicalPlanNode {
     let arena = ctx.scalar_arena();
     crate::sql::optimizer::convert::opt_expr_to_logical_plan(expr, &arena.borrow())
-}
-
-/// Convert a `LogicalPlanNode` to an `OptExpr` using the ScalarArena stored
-/// in the given `RewriteContext`. Called from IMV rule `apply` implementations
-/// to produce the return value expected by the pipeline.
-pub(crate) fn plan_to_opt_expr(
-    plan: crate::sql::planner::plan::LogicalPlanNode,
-    ctx: &crate::sql::optimizer::rewrite::context::RewriteContext,
-) -> crate::sql::optimizer::opt_expr::OptExpr {
-    let arena = ctx.scalar_arena();
-    crate::sql::optimizer::convert::logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut())
-}
-
-/// Convenience wrapper: convert `OptExpr → LogicalPlanNode`, run the given
-/// closure, then convert the result `LogicalPlanNode → OptExpr`. All three
-/// steps use the same ScalarArena from the RewriteContext.
-pub(crate) fn bridge_apply<F>(
-    expr: crate::sql::optimizer::opt_expr::OptExpr,
-    ctx: &crate::sql::optimizer::rewrite::context::RewriteContext,
-    f: F,
-) -> crate::sql::optimizer::opt_expr::OptExpr
-where
-    F: FnOnce(
-        crate::sql::planner::plan::LogicalPlanNode,
-    ) -> crate::sql::planner::plan::LogicalPlanNode,
-{
-    let plan = opt_expr_to_plan(expr, ctx);
-    let out = f(plan);
-    plan_to_opt_expr(out, ctx)
 }
 
 /// Intermediate result type used by closures passed to [`bridge_apply_result`].
@@ -54,8 +25,9 @@ pub(crate) enum PlanRewriteResult {
     Rejected(crate::sql::optimizer::rewrite::result::RewriteDiagnostic),
 }
 
-/// Convenience wrapper: convert `OptExpr → LogicalPlanNode`, run the given
-/// fallible closure, then convert the result `LogicalPlanNode → OptExpr`.
+/// Temporary internal bridge for IMV rule helpers that still return
+/// `LogicalPlanNode`. This is not the optimizer main path or an engine
+/// boundary.
 ///
 /// The closure returns [`PlanRewriteResult`] so it can work entirely with
 /// `LogicalPlanNode` types. The wrapper converts `PlanRewriteResult::Changed`

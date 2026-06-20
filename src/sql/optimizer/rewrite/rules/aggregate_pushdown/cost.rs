@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::sql::analysis::ExprKind;
+use crate::sql::analysis::{ExprKind, TypedExpr};
 use crate::sql::optimizer::scalar::{ScalarArena, materialize};
 use crate::sql::optimizer::statistics::{Confidence, TableStatistics};
 use crate::sql::optimizer::stats::derive_opt_expr_statistics;
@@ -27,33 +27,16 @@ pub(crate) fn should_push(
         return false;
     }
 
-    let ndvs: Vec<Option<f64>> = plan
+    let mut ndvs: Vec<Option<f64>> = plan
         .partial_groupby
         .iter()
-        .map(|gb_id| {
-            let gb = materialize(arena, *gb_id);
-            match &gb.kind {
-                ExprKind::ColumnRef { column_id, .. } => {
-                    stats.column_statistics.get(column_id).and_then(|cs| {
-                        let ndv = cs.distinct_values_count;
-                        if !ndv.is_finite() || ndv <= 0.0 {
-                            return None;
-                        }
-                        match cs.confidence {
-                            Confidence::Exact => Some(ndv),
-                            Confidence::Estimated
-                                if ndv < row_count * MIN_PARTIAL_BENEFIT_RATIO =>
-                            {
-                                Some(ndv)
-                            }
-                            Confidence::Estimated | Confidence::Fallback => None,
-                        }
-                    })
-                }
-                _ => None,
-            }
-        })
+        .map(|gb_id| ndv_for_group_expr(&materialize(arena, *gb_id), &stats, row_count))
         .collect();
+    ndvs.extend(
+        plan.partial_extra_groupby
+            .iter()
+            .map(|gb| ndv_for_group_expr(gb, &stats, row_count)),
+    );
 
     if ndvs.iter().any(|n| n.is_none()) {
         // Fallback: push only if the target is "big enough".
@@ -62,6 +45,31 @@ pub(crate) fn should_push(
 
     let joint_ndv: f64 = ndvs.iter().flatten().product::<f64>().min(row_count);
     joint_ndv < row_count * MIN_PARTIAL_BENEFIT_RATIO
+}
+
+fn ndv_for_group_expr(
+    expr: &TypedExpr,
+    stats: &crate::sql::optimizer::statistics::Statistics,
+    row_count: f64,
+) -> Option<f64> {
+    match &expr.kind {
+        ExprKind::ColumnRef { column_id, .. } => {
+            stats.column_statistics.get(column_id).and_then(|cs| {
+                let ndv = cs.distinct_values_count;
+                if !ndv.is_finite() || ndv <= 0.0 {
+                    return None;
+                }
+                match cs.confidence {
+                    Confidence::Exact => Some(ndv),
+                    Confidence::Estimated if ndv < row_count * MIN_PARTIAL_BENEFIT_RATIO => {
+                        Some(ndv)
+                    }
+                    Confidence::Estimated | Confidence::Fallback => None,
+                }
+            })
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -185,6 +193,7 @@ mod tests {
             side: super::super::context::Side::Left,
             target_subtree: scan,
             partial_groupby: vec![gb_id],
+            partial_extra_groupby: vec![],
             partial_aggregates: vec![],
         }
     }

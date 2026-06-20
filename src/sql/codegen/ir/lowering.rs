@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 
@@ -43,6 +44,7 @@ use crate::sql::optimizer::operator::{
 };
 use crate::sql::optimizer::physical_plan::JoinExecutionDistribution;
 use crate::sql::optimizer::property::{OrderingSpec, window_ordering_spec};
+use crate::sql::optimizer::scalar::{ScalarArena, materialize};
 use crate::sql::planner::plan::{AggregateCall, WindowExpr};
 use crate::types;
 
@@ -60,6 +62,7 @@ pub(crate) fn lower_distributed_plan(
         mv_refresh_ctx,
         dp.root_fragment_id,
         &dp.fragments,
+        Arc::clone(&dp.scalar_arena),
     );
     state.lower_fragment_by_id(dp.root_fragment_id)?;
     state.fragment_stack.clear();
@@ -732,6 +735,7 @@ pub(in crate::sql::codegen) trait LoweringStateAccess<'a> {
     ) -> &mut HashMap<i32, crate::runtime_filter::TRuntimeFilterDescription>;
     fn rf_build_side_filters(&mut self) -> &mut HashMap<FragmentId, Vec<i32>>;
     fn rf_probe_side_filters(&mut self) -> &mut HashMap<FragmentId, Vec<(i32, i32)>>;
+    fn scalar_arena(&self) -> &ScalarArena;
     fn alloc_slot(&mut self) -> i32;
     fn slot_allocator(&self) -> expr_compiler::SlotAllocator;
     fn lowered_fragment_output(&self, _fragment_id: FragmentId) -> Option<&LoweredFragmentOutput> {
@@ -809,6 +813,7 @@ pub(crate) struct OwnedLoweringState<'a> {
     fragments_by_id: HashMap<FragmentId, crate::sql::planner::PlanFragment>,
     lowered_fragments: Vec<(crate::sql::planner::PlanFragment, LoweredDistributedNode)>,
     lowering_fragments: BTreeSet<FragmentId>,
+    scalar_arena: Arc<ScalarArena>,
 }
 
 impl<'a> OwnedLoweringState<'a> {
@@ -818,7 +823,13 @@ impl<'a> OwnedLoweringState<'a> {
         mv_refresh_ctx: Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
         _root_fragment_id: FragmentId,
     ) -> Self {
-        Self::new_with_fragments(connectors, mv_refresh_ctx, _root_fragment_id, &[])
+        Self::new_with_fragments(
+            connectors,
+            mv_refresh_ctx,
+            _root_fragment_id,
+            &[],
+            Arc::new(ScalarArena::new()),
+        )
     }
 
     fn new_with_fragments(
@@ -826,6 +837,7 @@ impl<'a> OwnedLoweringState<'a> {
         mv_refresh_ctx: Option<&'a crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
         _root_fragment_id: FragmentId,
         fragments: &[crate::sql::planner::PlanFragment],
+        scalar_arena: Arc<ScalarArena>,
     ) -> Self {
         Self {
             connectors,
@@ -848,6 +860,7 @@ impl<'a> OwnedLoweringState<'a> {
                 .collect(),
             lowered_fragments: Vec::new(),
             lowering_fragments: BTreeSet::new(),
+            scalar_arena,
         }
     }
 
@@ -959,6 +972,10 @@ impl<'a> LoweringStateAccess<'a> for OwnedLoweringState<'a> {
 
     fn rf_probe_side_filters(&mut self) -> &mut HashMap<FragmentId, Vec<(i32, i32)>> {
         &mut self.rf_probe_side_filters
+    }
+
+    fn scalar_arena(&self) -> &ScalarArena {
+        &self.scalar_arena
     }
 
     fn alloc_slot(&mut self) -> i32 {
@@ -2032,8 +2049,9 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             return;
         };
         for probe in &node.probe_runtime_filters {
+            let probe_expr = materialize(self.state.scalar_arena(), probe.probe_expr);
             let mut compiler = ExprCompiler::new(self.state.slot_allocator(), &result.scope);
-            let Ok(probe_texpr) = compiler.compile_typed(&probe.probe_expr) else {
+            let Ok(probe_texpr) = compiler.compile_typed(&probe_expr) else {
                 continue;
             };
             self.state.rf_probe_targets().insert(
@@ -2082,7 +2100,8 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             else {
                 continue;
             };
-            if !rf_build_expr_matches_join_build_expr(&rf.build_expr, expected_build_expr) {
+            let build_expr = materialize(self.state.scalar_arena(), rf.build_expr);
+            if !rf_build_expr_matches_join_build_expr(&build_expr, expected_build_expr) {
                 tracing::debug!(
                     "skip runtime filter {filter_id}: build expr does not match join build key"
                 );
@@ -2090,7 +2109,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             }
 
             let build_texpr = match ExprCompiler::new(self.state.slot_allocator(), build_scope)
-                .compile_typed(&rf.build_expr)
+                .compile_typed(&build_expr)
             {
                 Ok(t) => t,
                 Err(err) => {
@@ -5032,6 +5051,7 @@ mod tests {
             ],
             root_fragment_id: 1,
             edges: vec![fragment_edge(0, 1, 20)],
+            scalar_arena: Arc::new(ScalarArena::new()),
         }
     }
 
@@ -5081,6 +5101,7 @@ mod tests {
             ],
             root_fragment_id: 2,
             edges: vec![fragment_edge(0, 1, 30), fragment_edge(1, 2, 20)],
+            scalar_arena: Arc::new(ScalarArena::new()),
         }
     }
 

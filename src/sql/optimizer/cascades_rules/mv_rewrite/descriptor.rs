@@ -838,7 +838,6 @@ mod tests {
     use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, TypedExpr};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::planner::plan::*;
     use crate::sql::planner::plan::{
         AggregateCall, LogicalAggregateNode, LogicalFilterNode, LogicalPlanNode, LogicalScanNode,
         LogicalSortNode, PlanNodeKind,
@@ -1001,9 +1000,11 @@ mod tests {
     /// Build a memo from a plan and return the first logical expr of the root
     /// group (cloned) plus the memo, ready for `from_memo`.
     fn memo_root(plan: &LogicalPlanNode) -> (crate::sql::optimizer::memo::Memo, MExpr) {
-        use crate::sql::optimizer::convert::logical_plan_to_memo;
         let mut memo = crate::sql::optimizer::memo::Memo::new();
-        let root = logical_plan_to_memo(plan, &mut memo);
+        let opt_expr =
+            crate::sql::optimizer::convert::try_logical_plan_to_opt_expr(plan, &mut memo.scalars)
+                .expect("logical plan to opt expr");
+        let root = crate::sql::optimizer::convert::opt_expr_to_memo(&opt_expr, &mut memo);
         let root_expr = memo.groups[root].logical_exprs[0].clone();
         (memo, root_expr)
     }
@@ -1080,7 +1081,10 @@ mod tests {
         let scan_op = scan(&[a.clone(), v.clone()]);
         let plan = LogicalPlanNode::new(PlanNodeKind::Scan(scan_op), vec![], None);
         let mut memo = crate::sql::optimizer::memo::Memo::new();
-        let scan_gid = crate::sql::optimizer::convert::logical_plan_to_memo(&plan, &mut memo);
+        let opt_expr =
+            crate::sql::optimizer::convert::try_logical_plan_to_opt_expr(&plan, &mut memo.scalars)
+                .expect("logical plan to opt expr");
+        let scan_gid = crate::sql::optimizer::convert::opt_expr_to_memo(&opt_expr, &mut memo);
         let group_by = intern_exprs(&mut memo.scalars, &[col_ref(&a)]);
         let aggregates = intern_aggregate_calls(
             &mut memo.scalars,

@@ -18,7 +18,7 @@ use crate::sql::analysis::{ExprKind, LiteralValue, OutputColumn, ProjectItem, Ty
 use crate::sql::optimizer::memo::{MExpr, MExprId, Memo};
 use crate::sql::optimizer::operator::{FilterOp, LogicalAggregateOp, Operator, ProjectOp, ScanOp};
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
-use crate::sql::optimizer::scalar::{intern_typed, materialize};
+use crate::sql::optimizer::scalar::intern_typed;
 use crate::sql::optimizer::scalar_bridge::{
     intern_aggregate_calls, intern_exprs, intern_project_items, materialize_aggregate_calls,
     materialize_exprs,
@@ -440,9 +440,8 @@ mod tests {
         ColumnDef, IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::convert::logical_plan_to_memo;
-    use crate::sql::optimizer::memo::Memo;
-    use crate::sql::planner::plan::*;
+    use crate::sql::optimizer::memo::{GroupId, Memo};
+    use crate::sql::optimizer::scalar::materialize;
     use crate::sql::planner::plan::{
         AggregateCall, LogicalAggregateNode, LogicalFilterNode, LogicalPlanNode, LogicalScanNode,
         PlanNodeKind,
@@ -450,6 +449,13 @@ mod tests {
     use arrow::datatypes::DataType;
 
     // --- fixture helpers --------------------------------------------------
+
+    fn logical_plan_to_memo_for_test(plan: &LogicalPlanNode, memo: &mut Memo) -> GroupId {
+        let opt_expr =
+            crate::sql::optimizer::convert::try_logical_plan_to_opt_expr(plan, &mut memo.scalars)
+                .expect("logical plan to opt expr");
+        crate::sql::optimizer::convert::opt_expr_to_memo(&opt_expr, memo)
+    }
 
     fn col(id: u32, name: &str) -> OutputColumn {
         OutputColumn {
@@ -679,7 +685,7 @@ mod tests {
         );
 
         let mut memo = Memo::new();
-        let root = logical_plan_to_memo(&query_plan, &mut memo);
+        let root = logical_plan_to_memo_for_test(&query_plan, &mut memo);
         advance_factory(&mut memo, 200);
         let root_expr = memo.groups[root].logical_exprs[0].clone();
 
@@ -735,7 +741,7 @@ mod tests {
         );
 
         let mut memo = Memo::new();
-        let root = logical_plan_to_memo(&query_plan, &mut memo);
+        let root = logical_plan_to_memo_for_test(&query_plan, &mut memo);
         advance_factory(&mut memo, 200);
         let root_expr = memo.groups[root].logical_exprs[0].clone();
 
@@ -780,7 +786,7 @@ mod tests {
         );
 
         let mut memo = Memo::new();
-        let root = logical_plan_to_memo(&query_plan, &mut memo);
+        let root = logical_plan_to_memo_for_test(&query_plan, &mut memo);
         advance_factory(&mut memo, 200);
         let root_expr = memo.groups[root].logical_exprs[0].clone();
 
@@ -855,7 +861,7 @@ mod tests {
         );
 
         let mut memo = Memo::new();
-        let root = logical_plan_to_memo(&query_plan, &mut memo);
+        let root = logical_plan_to_memo_for_test(&query_plan, &mut memo);
         advance_factory(&mut memo, 200);
         let root_expr = memo.groups[root].logical_exprs[0].clone();
 

@@ -5,12 +5,12 @@
 //! descendant that can bind the probe column. EXPLAIN renders the annotations;
 //! codegen lowers them to thrift `TRuntimeFilterDescription`.
 
-use crate::sql::analysis::{ExprKind, JoinKind, TypedExpr};
+use crate::sql::analysis::JoinKind;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::{JoinDistribution, Operator, PhysicalHashJoinEqCondition};
 use crate::sql::optimizer::options::OptimizerOptions;
 use crate::sql::optimizer::physical_plan::{JoinExecutionDistribution, PhysicalPlanNode};
-use crate::sql::optimizer::scalar::{ScalarArena, materialize};
+use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 use std::collections::HashSet;
 
 /// The optimizer-layer name used by `SET disable_optimizer_rules`.
@@ -22,9 +22,9 @@ pub(crate) const RUNTIME_FILTER_RULE: &str = "RuntimeFilterPushDown";
 pub(crate) struct RuntimeFilterDesc {
     pub filter_id: i32,
     /// Oriented build-side key expression in build-child column space.
-    pub build_expr: TypedExpr,
+    pub build_expr: ScalarId,
     /// Oriented probe-side key expression in the target node's column space.
-    pub probe_expr: TypedExpr,
+    pub probe_expr: ScalarId,
     /// Index into the join's `eq_conditions`.
     pub expr_order: usize,
     /// Join distribution; drives thrift build_join_mode + layout.
@@ -36,16 +36,17 @@ pub(crate) struct RuntimeFilterDesc {
 pub(crate) struct RuntimeFilterProbe {
     pub filter_id: i32,
     /// Probe key expression in this node's column space.
-    pub probe_expr: TypedExpr,
+    pub probe_expr: ScalarId,
 }
 
 #[cfg(test)]
 impl RuntimeFilterDesc {
-    pub(crate) fn placeholder(filter_id: i32) -> Self {
+    pub(crate) fn placeholder(arena: &mut ScalarArena, filter_id: i32) -> Self {
+        let expr = test_null_expr(arena);
         Self {
             filter_id,
-            build_expr: test_null_expr(),
-            probe_expr: test_null_expr(),
+            build_expr: expr,
+            probe_expr: expr,
             expr_order: 0,
             distribution: JoinDistribution::Broadcast,
         }
@@ -54,10 +55,10 @@ impl RuntimeFilterDesc {
 
 #[cfg(test)]
 impl RuntimeFilterProbe {
-    pub(crate) fn placeholder(filter_id: i32) -> Self {
+    pub(crate) fn placeholder(arena: &mut ScalarArena, filter_id: i32) -> Self {
         Self {
             filter_id,
-            probe_expr: test_null_expr(),
+            probe_expr: test_null_expr(arena),
         }
     }
 }
@@ -106,121 +107,105 @@ fn rf_sides_for_join(kind: JoinKind) -> Option<JoinRfSides> {
     }
 }
 
-/// Collect ALL column ids referenced by `expr` into `out`.
-///
-/// This function is exhaustive over every `ExprKind` variant that holds
-/// sub-expressions or column refs. Under-collection would cause `could_bound`
-/// to return `true` when a node does NOT expose a column, placing a probe
-/// incorrectly. Each variant is handled explicitly; only verified leaf variants
-/// (no sub-expressions) use a wildcard arm.
-fn column_ids(expr: &TypedExpr, out: &mut HashSet<ColumnId>) {
-    match &expr.kind {
-        ExprKind::ColumnRef { column_id, .. } => {
+fn column_ids(scalars: &ScalarArena, expr: ScalarId, out: &mut HashSet<ColumnId>) {
+    match scalars.node(expr) {
+        ScalarNode::ColumnRef(column_id) => {
             out.insert(*column_id);
         }
-        ExprKind::BinaryOp { left, right, .. } => {
-            column_ids(left, out);
-            column_ids(right, out);
+        ScalarNode::BinaryOp { left, right, .. } => {
+            column_ids(scalars, *left, out);
+            column_ids(scalars, *right, out);
         }
-        ExprKind::UnaryOp { expr, .. } => {
-            column_ids(expr, out);
+        ScalarNode::UnaryOp { child, .. } => {
+            column_ids(scalars, *child, out);
         }
-        ExprKind::FunctionCall { args, .. } => {
+        ScalarNode::FunctionCall { args, .. } => {
             for arg in args {
-                column_ids(arg, out);
+                column_ids(scalars, *arg, out);
             }
         }
-        ExprKind::LambdaFunction { body, .. } => {
-            // params are declaration-only; column refs can appear in the body.
-            column_ids(body, out);
+        ScalarNode::LambdaFunction { body, .. } => {
+            column_ids(scalars, *body, out);
         }
-        ExprKind::AggregateCall { args, order_by, .. } => {
+        ScalarNode::AggregateCall { args, order_by, .. } => {
             for arg in args {
-                column_ids(arg, out);
+                column_ids(scalars, *arg, out);
             }
             for item in order_by {
-                column_ids(&item.expr, out);
+                column_ids(scalars, item.expr, out);
             }
         }
-        ExprKind::Cast { expr, .. } => {
-            column_ids(expr, out);
+        ScalarNode::Cast { child, .. } => {
+            column_ids(scalars, *child, out);
         }
-        ExprKind::IsNull { expr, .. } => {
-            column_ids(expr, out);
+        ScalarNode::IsNull { child, .. } => {
+            column_ids(scalars, *child, out);
         }
-        ExprKind::InList { expr, list, .. } => {
-            column_ids(expr, out);
+        ScalarNode::InList { child, list, .. } => {
+            column_ids(scalars, *child, out);
             for item in list {
-                column_ids(item, out);
+                column_ids(scalars, *item, out);
             }
         }
-        ExprKind::Between {
-            expr, low, high, ..
+        ScalarNode::Between {
+            child, low, high, ..
         } => {
-            column_ids(expr, out);
-            column_ids(low, out);
-            column_ids(high, out);
+            column_ids(scalars, *child, out);
+            column_ids(scalars, *low, out);
+            column_ids(scalars, *high, out);
         }
-        ExprKind::Like { expr, pattern, .. } => {
-            column_ids(expr, out);
-            column_ids(pattern, out);
+        ScalarNode::Like { child, pattern, .. } => {
+            column_ids(scalars, *child, out);
+            column_ids(scalars, *pattern, out);
         }
-        ExprKind::Case {
+        ScalarNode::Case {
             operand,
             when_then,
             else_expr,
-            ..
         } => {
             if let Some(op) = operand {
-                column_ids(op, out);
+                column_ids(scalars, *op, out);
             }
             for (when, then) in when_then {
-                column_ids(when, out);
-                column_ids(then, out);
+                column_ids(scalars, *when, out);
+                column_ids(scalars, *then, out);
             }
             if let Some(el) = else_expr {
-                column_ids(el, out);
+                column_ids(scalars, *el, out);
             }
         }
-        ExprKind::IsTruthValue { expr, .. } => {
-            column_ids(expr, out);
+        ScalarNode::IsTruthValue { child, .. } => {
+            column_ids(scalars, *child, out);
         }
-        ExprKind::Nested(inner) => {
-            column_ids(inner, out);
+        ScalarNode::Nested(inner) => {
+            column_ids(scalars, *inner, out);
         }
-        ExprKind::WindowCall {
+        ScalarNode::WindowCall {
             args,
             partition_by,
             order_by,
             ..
         } => {
             for arg in args {
-                column_ids(arg, out);
+                column_ids(scalars, *arg, out);
             }
             for pb in partition_by {
-                column_ids(pb, out);
+                column_ids(scalars, *pb, out);
             }
             for item in order_by {
-                column_ids(&item.expr, out);
+                column_ids(scalars, item.expr, out);
             }
         }
-        ExprKind::Lambda { body, .. } => {
-            // params are parameter names only; the body may reference outer columns.
-            column_ids(body, out);
+        ScalarNode::Lambda { body, .. } => {
+            column_ids(scalars, *body, out);
         }
-        // Verified leaves — no sub-expressions, no column refs:
-        // - Literal: holds only a LiteralValue (no TypedExpr).
-        // - LambdaParamRef: references a lambda slot by name/id, not a ColumnId.
-        // - SubqueryPlaceholder: consumed before planning; has no TypedExpr children.
-        ExprKind::Literal(_)
-        | ExprKind::LambdaParamRef { .. }
-        | ExprKind::SubqueryPlaceholder { .. } => {}
+        ScalarNode::Literal(_) | ScalarNode::LambdaParamRef { .. } => {}
     }
 }
 
-fn column_id_vec(expr: &TypedExpr) -> Vec<ColumnId> {
+fn column_id_vec(scalars: &ScalarArena, expr: ScalarId) -> Vec<ColumnId> {
     let mut ids = HashSet::new();
-    column_ids(expr, &mut ids);
+    column_ids(scalars, expr, &mut ids);
     let mut ids: Vec<_> = ids.into_iter().collect();
     ids.sort();
     ids
@@ -230,8 +215,12 @@ fn child_column_set(node: &PhysicalPlanNode) -> HashSet<ColumnId> {
     node.output_columns.iter().map(|c| c.column_id).collect()
 }
 
-fn expr_bound_child(node: &PhysicalPlanNode, expr: &TypedExpr) -> Option<usize> {
-    let ids = column_id_vec(expr);
+fn expr_bound_child(
+    node: &PhysicalPlanNode,
+    scalars: &ScalarArena,
+    expr: ScalarId,
+) -> Option<usize> {
+    let ids = column_id_vec(scalars, expr);
     if ids.is_empty() {
         return None;
     }
@@ -251,8 +240,8 @@ fn expr_bound_child(node: &PhysicalPlanNode, expr: &TypedExpr) -> Option<usize> 
 
 #[derive(Clone, Debug)]
 struct OrientedRfKey {
-    build_expr: TypedExpr,
-    probe_expr: TypedExpr,
+    build_expr: ScalarId,
+    probe_expr: ScalarId,
     expr_order: usize,
 }
 
@@ -263,21 +252,19 @@ fn orient_rf_key(
     expr_order: usize,
     eq: &PhysicalHashJoinEqCondition,
 ) -> Option<OrientedRfKey> {
-    let left = materialize(scalars, eq.left);
-    let right = materialize(scalars, eq.right);
-    let left_child = expr_bound_child(node, &left)?;
-    let right_child = expr_bound_child(node, &right)?;
+    let left_child = expr_bound_child(node, scalars, eq.left)?;
+    let right_child = expr_bound_child(node, scalars, eq.right)?;
 
     if left_child == sides.probe_child && right_child == sides.build_child {
         Some(OrientedRfKey {
-            build_expr: right,
-            probe_expr: left,
+            build_expr: eq.right,
+            probe_expr: eq.left,
             expr_order,
         })
     } else if left_child == sides.build_child && right_child == sides.probe_child {
         Some(OrientedRfKey {
-            build_expr: left,
-            probe_expr: right,
+            build_expr: eq.left,
+            probe_expr: eq.right,
             expr_order,
         })
     } else {
@@ -293,9 +280,9 @@ fn rf_key_types_match(scalars: &ScalarArena, eq: &PhysicalHashJoinEqCondition) -
 ///
 /// An empty needed set (e.g. a literal probe expression) cannot be bound — the
 /// probe is always non-trivial for real join keys, but we guard for correctness.
-fn could_bound(node: &PhysicalPlanNode, probe_expr: &TypedExpr) -> bool {
+fn could_bound(node: &PhysicalPlanNode, scalars: &ScalarArena, probe_expr: ScalarId) -> bool {
     let mut needed = HashSet::new();
-    column_ids(probe_expr, &mut needed);
+    column_ids(scalars, probe_expr, &mut needed);
     if needed.is_empty() {
         return false;
     }
@@ -362,6 +349,7 @@ fn is_probe_semantic_boundary(node: &PhysicalPlanNode) -> bool {
 ///    reachable binder).
 fn push_probe_down(
     node: &mut PhysicalPlanNode,
+    scalars: &ScalarArena,
     probe: &RuntimeFilterProbe,
     policy: ProbePushPolicy,
 ) -> bool {
@@ -370,14 +358,14 @@ fn push_probe_down(
         && distribution_is_crossable(node)
     {
         if let Some(child) = node.children.first_mut() {
-            return push_probe_down(child, probe, policy);
+            return push_probe_down(child, scalars, probe, policy);
         }
         return false;
     }
     if is_exchange(node) {
         return false;
     }
-    if !could_bound(node, &probe.probe_expr) {
+    if !could_bound(node, scalars, probe.probe_expr) {
         return false;
     }
     if is_probe_semantic_boundary(node) {
@@ -385,7 +373,7 @@ fn push_probe_down(
         return true;
     }
     for child in &mut node.children {
-        if push_probe_down(child, probe, policy) {
+        if push_probe_down(child, scalars, probe, policy) {
             return true;
         }
     }
@@ -519,23 +507,29 @@ fn annotate_node(
     for d in &descs {
         let probe = RuntimeFilterProbe {
             filter_id: d.filter_id,
-            probe_expr: d.probe_expr.clone(),
+            probe_expr: d.probe_expr,
         };
         // Descend into the true probe side to the deepest binding node.
-        let _ = push_probe_down(&mut node.children[sides.probe_child], &probe, policy);
+        let _ = push_probe_down(
+            &mut node.children[sides.probe_child],
+            scalars,
+            &probe,
+            policy,
+        );
     }
 
     node.build_runtime_filters = descs;
 }
 
 #[cfg(test)]
-fn test_null_expr() -> TypedExpr {
-    use crate::sql::analysis::{ExprKind, LiteralValue};
-    TypedExpr {
-        kind: ExprKind::Literal(LiteralValue::Null),
-        data_type: arrow::datatypes::DataType::Null,
-        nullable: true,
-    }
+fn test_null_expr(arena: &mut ScalarArena) -> ScalarId {
+    use crate::sql::analysis::LiteralValue;
+    use crate::sql::optimizer::scalar::HashableLiteral;
+    arena.intern(
+        ScalarNode::Literal(HashableLiteral(LiteralValue::Null)),
+        arrow::datatypes::DataType::Null,
+        true,
+    )
 }
 
 #[cfg(test)]
@@ -1236,12 +1230,13 @@ mod tests {
         assert_eq!(join.build_runtime_filters.len(), 1);
         assert_eq!(join.children[0].probe_runtime_filters.len(), 1);
         assert!(join.children[1].probe_runtime_filters.is_empty());
+        let scalars = join.execution_props.scalar_arena.as_deref().unwrap();
         assert_eq!(
-            column_id_vec(&join.build_runtime_filters[0].build_expr),
+            column_id_vec(scalars, join.build_runtime_filters[0].build_expr),
             vec![crate::sql::column_id::ColumnId::new_for_test(2)]
         );
         assert_eq!(
-            column_id_vec(&join.build_runtime_filters[0].probe_expr),
+            column_id_vec(scalars, join.build_runtime_filters[0].probe_expr),
             vec![crate::sql::column_id::ColumnId::new_for_test(1)]
         );
     }

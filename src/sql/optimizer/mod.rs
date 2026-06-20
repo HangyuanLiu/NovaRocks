@@ -36,11 +36,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::sql::column_id::ColumnRefFactory;
+use crate::sql::optimizer::opt_expr::OptExpr;
+use crate::sql::optimizer::scalar::ScalarArena;
 use crate::sql::optimizer::statistics::TableStatistics;
-use crate::sql::planner::plan::LogicalPlanNode;
 use memo::MExpr;
 use rule::Rule;
-use scalar::ScalarArena;
 
 /// Wall-clock timeout for the entire optimization pipeline.
 ///
@@ -56,19 +56,21 @@ const OPTIMIZE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Main entry point for the Cascades optimizer.
 ///
-/// Takes a logical plan and table statistics, applies query logical rewrites,
+/// Takes an optimizer-native logical tree and table statistics, applies query logical rewrites,
 /// converts to Memo, explores logical alternatives, generates physical
 /// alternatives, runs top-down cost-based search with property enforcement,
 /// and extracts the best physical plan.
 pub(crate) fn optimize(
-    plan: LogicalPlanNode,
+    plan_expr: OptExpr,
+    scalar_arena: ScalarArena,
     table_stats: &HashMap<String, TableStatistics>,
     factory: ColumnRefFactory,
     dictionary_provider: Option<std::sync::Arc<dyn rewrite::context::QueryDictionaryProvider>>,
     mv_candidates: Vec<cascades_rules::mv_rewrite::MvRewriteCandidate>,
 ) -> Result<PhysicalPlanNode, String> {
     optimize_with_root_property(
-        plan,
+        plan_expr,
+        scalar_arena,
         table_stats,
         factory,
         dictionary_provider,
@@ -78,7 +80,8 @@ pub(crate) fn optimize(
 }
 
 pub(crate) fn optimize_with_root_distribution(
-    plan: LogicalPlanNode,
+    plan_expr: OptExpr,
+    scalar_arena: ScalarArena,
     table_stats: &HashMap<String, TableStatistics>,
     factory: ColumnRefFactory,
     root_distribution: DistributionSpec,
@@ -87,11 +90,20 @@ pub(crate) fn optimize_with_root_distribution(
         distribution: root_distribution,
         ordering: OrderingSpec::Any,
     };
-    optimize_with_root_property(plan, table_stats, factory, None, Vec::new(), root_required)
+    optimize_with_root_property(
+        plan_expr,
+        scalar_arena,
+        table_stats,
+        factory,
+        None,
+        Vec::new(),
+        root_required,
+    )
 }
 
 fn optimize_with_root_property(
-    plan: LogicalPlanNode,
+    plan_expr: OptExpr,
+    scalar_arena: ScalarArena,
     table_stats: &HashMap<String, TableStatistics>,
     factory: ColumnRefFactory,
     dictionary_provider: Option<std::sync::Arc<dyn rewrite::context::QueryDictionaryProvider>>,
@@ -121,9 +133,8 @@ fn optimize_with_root_property(
         rewrite_ctx.set_dictionary_provider(provider);
     }
     rewrite_ctx.set_column_ref_factory(Rc::clone(&factory));
-    let arena = Rc::new(RefCell::new(scalar::ScalarArena::new()));
+    let arena = Rc::new(RefCell::new(scalar_arena));
     rewrite_ctx.set_scalar_arena(Rc::clone(&arena));
-    let plan_expr = convert::try_logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut())?;
     let rewritten_expr = rewrite::registry::query_rewrite_pipeline(table_stats)
         .rewrite(plan_expr, &mut rewrite_ctx)?;
 
@@ -135,14 +146,13 @@ fn optimize_with_root_property(
         return Err(message);
     }
 
-    // Materialize the rewritten OptExpr back to LogicalPlanNode for CTE cleanup
-    // and memo conversion, both of which still operate on LogicalPlanNode.
-    let rewritten = convert::opt_expr_to_logical_plan(rewritten_expr, &arena.borrow());
-
     // 4. CTE cleanup: intentional pre-Memo structural rewrite for CTE shape
     //    cleanup, not a second full logical optimization pass.
-    let cte_ctx = cte_rewrite::collect_cte_counts(&rewritten);
-    let rewritten = cte_rewrite::inline_single_use_ctes(rewritten, &cte_ctx)?;
+    let cte_ctx = cte_rewrite::collect_cte_counts(&rewritten_expr);
+    let rewritten_expr = {
+        let mut scalar_arena = arena.borrow_mut();
+        cte_rewrite::inline_single_use_ctes(rewritten_expr, &cte_ctx, &mut scalar_arena)?
+    };
 
     // 5. Convert to Memo. Unwrap the factory from Rc<RefCell<...>> — rewrite
     //    is done so the only two references at this call site are the local
@@ -163,7 +173,8 @@ fn optimize_with_root_property(
         .into_inner();
     let mut memo = Memo::new();
     memo.factory = factory;
-    let root_group = convert::try_logical_plan_to_memo(&rewritten, &mut memo)?;
+    memo.scalars = arena.borrow().clone();
+    let root_group = convert::opt_expr_to_memo(&rewritten_expr, &mut memo);
 
     // 6. Derive initial statistics.
     stats::derive_group_statistics(&mut memo, table_stats);
@@ -448,8 +459,8 @@ mod is_known_rule_name_tests {
             None,
         );
         let factory = ColumnRefFactory::new();
-        let physical =
-            optimize(plan, &HashMap::new(), factory, None, Vec::new()).expect("optimize values");
+        let physical = optimize_logical(plan, &HashMap::new(), factory, None, Vec::new())
+            .expect("optimize values");
         let physical_debug = format!("{physical:?}");
         assert!(physical_debug.contains("PhysicalValues"));
     }
@@ -630,19 +641,57 @@ mod is_known_rule_name_tests {
     };
     use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
-    use crate::sql::column_id::ColumnId;
+    use crate::sql::column_id::{ColumnId, ColumnRefFactory};
     use crate::sql::optimizer::rewrite::context::{
         QueryDictionaryProvider, RewriteContext, current_dictionary_provider,
         with_dictionary_provider,
     };
     use std::cell::RefCell;
 
-    use crate::sql::optimizer::convert::{logical_plan_to_opt_expr, opt_expr_to_logical_plan};
+    use crate::sql::optimizer::convert::{
+        logical_plan_to_opt_expr, opt_expr_to_logical_plan, try_logical_plan_to_opt_expr,
+    };
     use crate::sql::optimizer::rewrite::registry::query_rewrite_pipeline;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::{
         AggregateCall, LogicalAggregateNode, LogicalPlanNode, LogicalScanNode, PlanNodeKind,
     };
+
+    fn optimize_logical(
+        plan: LogicalPlanNode,
+        table_stats: &HashMap<String, TableStatistics>,
+        factory: ColumnRefFactory,
+        dictionary_provider: Option<Arc<dyn QueryDictionaryProvider>>,
+        mv_candidates: Vec<cascades_rules::mv_rewrite::MvRewriteCandidate>,
+    ) -> Result<PhysicalPlanNode, String> {
+        let mut scalar_arena = ScalarArena::new();
+        let plan_expr = try_logical_plan_to_opt_expr(&plan, &mut scalar_arena)?;
+        optimize(
+            plan_expr,
+            scalar_arena,
+            table_stats,
+            factory,
+            dictionary_provider,
+            mv_candidates,
+        )
+    }
+
+    fn optimize_logical_with_root_distribution(
+        plan: LogicalPlanNode,
+        table_stats: &HashMap<String, TableStatistics>,
+        factory: ColumnRefFactory,
+        root_distribution: DistributionSpec,
+    ) -> Result<PhysicalPlanNode, String> {
+        let mut scalar_arena = ScalarArena::new();
+        let plan_expr = try_logical_plan_to_opt_expr(&plan, &mut scalar_arena)?;
+        optimize_with_root_distribution(
+            plan_expr,
+            scalar_arena,
+            table_stats,
+            factory,
+            root_distribution,
+        )
+    }
 
     struct AlwaysSomeProvider;
     impl QueryDictionaryProvider for AlwaysSomeProvider {
@@ -871,7 +920,7 @@ mod is_known_rule_name_tests {
             None,
         );
         let factory = ColumnRefFactory::new();
-        let physical = optimize(plan, &HashMap::new(), factory, None, Vec::new())
+        let physical = optimize_logical(plan, &HashMap::new(), factory, None, Vec::new())
             .expect("optimize assert one row");
         let physical_debug = format!("{physical:?}");
         assert!(physical_debug.contains("PhysicalAssertOneRow"));
@@ -945,7 +994,7 @@ mod is_known_rule_name_tests {
             ..Default::default()
         };
         let err = crate::sql::optimizer::options::with_session_optimizer_settings(settings, || {
-            optimize(
+            optimize_logical(
                 plan,
                 &HashMap::new(),
                 ColumnRefFactory::new(),
@@ -966,7 +1015,7 @@ mod is_known_rule_name_tests {
         use crate::sql::catalog::{CatalogProvider, ColumnDef, ScanSource, TableDef};
         use crate::sql::column_id::ColumnRefFactory;
         use crate::sql::optimizer::property::DistributionSpec;
-        use crate::sql::planner::plan::{LogicalPlanNode, PlanNodeKind};
+        use crate::sql::planner::plan::PlanNodeKind;
 
         struct MinimalCatalog;
         impl CatalogProvider for MinimalCatalog {
@@ -1012,7 +1061,7 @@ mod is_known_rule_name_tests {
             other => panic!("expected project root, got {other:?}"),
         };
 
-        let default_physical = optimize(
+        let default_physical = optimize_logical(
             logical.clone(),
             &HashMap::new(),
             ColumnRefFactory::new(),
@@ -1023,7 +1072,7 @@ mod is_known_rule_name_tests {
         assert_root_distribution(&default_physical, &DistributionSpec::Gather);
 
         let root_distribution = DistributionSpec::shuffle_agg([hash_col]);
-        let physical = optimize_with_root_distribution(
+        let physical = optimize_logical_with_root_distribution(
             logical,
             &HashMap::new(),
             ColumnRefFactory::new(),
@@ -1151,7 +1200,7 @@ mod is_known_rule_name_tests {
             "expected query rewrite pipeline to set ranking partition-topn, trace: {:#?}, got: {rewritten_logical:#?}",
             rewrite_ctx.trace().events()
         );
-        let physical = optimize(logical, &HashMap::new(), factory, None, Vec::new())
+        let physical = optimize_logical(logical, &HashMap::new(), factory, None, Vec::new())
             .expect("optimize ranking window");
 
         assert!(
@@ -1231,7 +1280,7 @@ mod is_known_rule_name_tests {
 
         // optimize: M1b's decorrelation rules must rewrite the Apply to a
         // join; no ApplyException error, no residual Apply.
-        let physical = optimize(
+        let physical = optimize_logical(
             plan,
             &HashMap::new(),
             ColumnRefFactory::new(),

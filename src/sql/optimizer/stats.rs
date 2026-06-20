@@ -6,28 +6,20 @@
 
 use std::collections::HashMap;
 
-use super::estimate::join_condition::estimate_join_condition;
-use super::estimate::ndv::{
-    agg_group_rows, cap_ndv_at_rows, get_expr_ndv, get_join_key_ndv_with_confidence,
-};
+use super::estimate::ndv::{agg_group_rows, cap_ndv_at_rows};
 use super::estimate::selectivity::apply_filter;
-pub(crate) use super::estimate::selectivity::{estimate_selectivity, extract_column_id};
 use super::memo::{GroupId, JoinTree, MExpr, Memo};
 use super::operator::Operator;
-use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, TypedExpr};
+use crate::sql::analysis::{BinOp, JoinKind, LiteralValue, OutputColumn, UnOp};
 use crate::sql::column_id::ColumnId;
-use crate::sql::optimizer::estimate::arith::sat_add;
+use crate::sql::optimizer::estimate::arith::{damped_conjunction, sat_add};
 use crate::sql::optimizer::estimate::cardinality::{
     JoinCardInput, estimate_join_cardinality, except_rows, intersect_rows, union_all_rows,
     union_distinct_rows,
 };
 use crate::sql::optimizer::opt_expr::OptExpr;
-use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, materialize};
-use crate::sql::optimizer::scalar_bridge::{
-    materialize_exprs, materialize_project_items, materialize_window_exprs,
-};
+use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 use crate::sql::optimizer::statistics::*;
-use crate::sql::planner::plan::LogicalPlanNode;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -70,8 +62,9 @@ pub(crate) fn derive_statistics(
         Operator::LogicalValues(vals) => Statistics {
             output_row_count: vals.rows.len() as f64,
             row_count_confidence: Confidence::Exact,
-            column_statistics: values_column_statistics(
-                &materialize_rows(&memo.scalars, &vals.rows),
+            column_statistics: values_column_statistics_scalar(
+                &memo.scalars,
+                &vals.rows,
                 &vals.columns,
             ),
         },
@@ -122,8 +115,11 @@ pub(crate) fn derive_statistics(
         // -- Unary operators (single child) --
         Operator::LogicalFilter(filter) => {
             let child_stats = child_statistics(memo, &expr.children, 0);
-            let predicate = materialize(&memo.scalars, filter.predicate);
-            let selectivity = estimate_selectivity(&predicate, &child_stats.column_statistics);
+            let selectivity = estimate_selectivity_scalar(
+                &memo.scalars,
+                filter.predicate,
+                &child_stats.column_statistics,
+            );
             let (output_rows, row_count_confidence) = apply_filter(
                 child_stats.output_row_count,
                 child_stats.row_count_confidence,
@@ -143,16 +139,14 @@ pub(crate) fn derive_statistics(
 
         Operator::LogicalProject(proj) => {
             let child_stats = child_statistics(memo, &expr.children, 0);
-            let items = materialize_project_items(&memo.scalars, &proj.items);
             let projected: HashMap<ColumnId, ColumnStatistic> = proj
                 .items
                 .iter()
-                .zip(items.iter())
                 .filter_map(|item| {
-                    extract_column_id(&item.1.expr)
+                    extract_column_id_scalar(&memo.scalars, item.expr)
                         .and_then(|column_id| child_stats.column_statistics.get(&column_id))
                         .cloned()
-                        .map(|cs| (item.0.output_column_id, cs))
+                        .map(|cs| (item.output_column_id, cs))
                 })
                 .collect();
             Statistics {
@@ -164,7 +158,6 @@ pub(crate) fn derive_statistics(
 
         Operator::LogicalAggregate(agg) => {
             let child_stats = child_statistics(memo, &expr.children, 0);
-            let group_by = materialize_exprs(&memo.scalars, &agg.group_by);
             if agg.group_by.is_empty() {
                 return Statistics {
                     output_row_count: 1.0,
@@ -175,12 +168,14 @@ pub(crate) fn derive_statistics(
             let group_key_ndvs: Vec<f64> = agg
                 .group_by
                 .iter()
-                .zip(group_by.iter())
-                .map(|(_, gb_expr)| get_expr_ndv(gb_expr, &child_stats.column_statistics))
+                .map(|gb_expr| {
+                    get_expr_ndv_scalar(&memo.scalars, *gb_expr, &child_stats.column_statistics)
+                })
                 .collect();
             let output_rows = agg_group_rows(&group_key_ndvs, child_stats.output_row_count);
-            let column_statistics = aggregate_group_column_statistics(
-                &group_by,
+            let column_statistics = aggregate_group_column_statistics_scalar(
+                &memo.scalars,
+                &agg.group_by,
                 &agg.output_columns,
                 &child_stats,
                 output_rows,
@@ -231,12 +226,11 @@ pub(crate) fn derive_statistics(
 
         Operator::LogicalWindow(window) => {
             let child_stats = child_statistics(memo, &expr.children, 0);
-            let window_exprs = materialize_window_exprs(
-                &memo.scalars,
-                &window.window_exprs,
+            derive_window_statistics_scalar(
+                child_stats,
+                window.window_exprs.len(),
                 &window.output_columns,
-            );
-            derive_window_statistics(child_stats, &window_exprs)
+            )
         }
 
         Operator::LogicalRepeat(repeat) => {
@@ -310,19 +304,23 @@ pub(crate) fn derive_statistics(
         ),
 
         // -- Physical operators: derive the same way as their logical counterparts --
-        Operator::PhysicalScan(scan) => derive_scan_statistics(
+        Operator::PhysicalScan(scan) => derive_scan_statistics_scalar(
             &scan.table.name,
             scan.alias.as_deref(),
             &scan.columns,
-            &materialize_exprs(&memo.scalars, &scan.predicates),
+            &scan.predicates,
+            &memo.scalars,
             table_stats,
             estimate_default_row_count(&scan.table.name),
         ),
 
         Operator::PhysicalFilter(filter) => {
             let child_stats = child_statistics(memo, &expr.children, 0);
-            let predicate = materialize(&memo.scalars, filter.predicate);
-            let selectivity = estimate_selectivity(&predicate, &child_stats.column_statistics);
+            let selectivity = estimate_selectivity_scalar(
+                &memo.scalars,
+                filter.predicate,
+                &child_stats.column_statistics,
+            );
             let (output_rows, row_count_confidence) = apply_filter(
                 child_stats.output_row_count,
                 child_stats.row_count_confidence,
@@ -342,16 +340,14 @@ pub(crate) fn derive_statistics(
 
         Operator::PhysicalProject(proj) => {
             let child_stats = child_statistics(memo, &expr.children, 0);
-            let items = materialize_project_items(&memo.scalars, &proj.items);
             let projected: HashMap<ColumnId, ColumnStatistic> = proj
                 .items
                 .iter()
-                .zip(items.iter())
                 .filter_map(|item| {
-                    extract_column_id(&item.1.expr)
+                    extract_column_id_scalar(&memo.scalars, item.expr)
                         .and_then(|column_id| child_stats.column_statistics.get(&column_id))
                         .cloned()
-                        .map(|cs| (item.0.output_column_id, cs))
+                        .map(|cs| (item.output_column_id, cs))
                 })
                 .collect();
             Statistics {
@@ -363,7 +359,6 @@ pub(crate) fn derive_statistics(
 
         Operator::PhysicalHashAggregate(agg) => {
             let child_stats = child_statistics(memo, &expr.children, 0);
-            let group_by = materialize_exprs(&memo.scalars, &agg.group_by);
             if agg.group_by.is_empty() {
                 return Statistics {
                     output_row_count: 1.0,
@@ -374,12 +369,14 @@ pub(crate) fn derive_statistics(
             let group_key_ndvs: Vec<f64> = agg
                 .group_by
                 .iter()
-                .zip(group_by.iter())
-                .map(|(_, gb_expr)| get_expr_ndv(gb_expr, &child_stats.column_statistics))
+                .map(|gb_expr| {
+                    get_expr_ndv_scalar(&memo.scalars, *gb_expr, &child_stats.column_statistics)
+                })
                 .collect();
             let output_rows = agg_group_rows(&group_key_ndvs, child_stats.output_row_count);
-            let column_statistics = aggregate_group_column_statistics(
-                &group_by,
+            let column_statistics = aggregate_group_column_statistics_scalar(
+                &memo.scalars,
+                &agg.group_by,
                 &agg.output_columns,
                 &child_stats,
                 output_rows,
@@ -401,16 +398,17 @@ pub(crate) fn derive_statistics(
                 .eq_conditions
                 .iter()
                 .map(|eq| {
-                    let left = materialize(&memo.scalars, eq.left);
-                    let right = materialize(&memo.scalars, eq.right);
-                    let eq_key_pair = extract_column_id(&left).zip(extract_column_id(&right));
-                    let (left_ndv, left_confidence) = best_join_key_ndv(
-                        &left,
+                    let eq_key_pair = extract_column_id_scalar(&memo.scalars, eq.left)
+                        .zip(extract_column_id_scalar(&memo.scalars, eq.right));
+                    let (left_ndv, left_confidence) = best_join_key_ndv_scalar(
+                        &memo.scalars,
+                        eq.left,
                         &left_stats.column_statistics,
                         &right_stats.column_statistics,
                     );
-                    let (right_ndv, right_confidence) = best_join_key_ndv(
-                        &right,
+                    let (right_ndv, right_confidence) = best_join_key_ndv_scalar(
+                        &memo.scalars,
+                        eq.right,
                         &right_stats.column_statistics,
                         &left_stats.column_statistics,
                     );
@@ -460,14 +458,13 @@ pub(crate) fn derive_statistics(
         Operator::PhysicalNestLoopJoin(join) => {
             let left_stats = child_statistics(memo, &expr.children, 0);
             let right_stats = child_statistics(memo, &expr.children, 1);
-            let condition = join.condition.map(|cond| materialize(&memo.scalars, cond));
-            let non_equi_selectivity = condition.as_ref().map(|cond| {
+            let non_equi_selectivity = join.condition.map(|cond| {
                 (
-                    estimate_selectivity(cond, &left_stats.column_statistics),
+                    estimate_selectivity_scalar(&memo.scalars, cond, &left_stats.column_statistics),
                     Confidence::Estimated,
                 )
             });
-            let eq_key_pairs = collect_equi_join_column_pairs(condition.as_ref());
+            let eq_key_pairs = collect_equi_join_column_pairs_scalar(&memo.scalars, join.condition);
 
             let (output_rows, row_count_confidence) = estimate_join_cardinality(&JoinCardInput {
                 left: (left_stats.output_row_count, left_stats.row_count_confidence),
@@ -498,11 +495,10 @@ pub(crate) fn derive_statistics(
         Operator::PhysicalSort(sort) => {
             let child_stats = child_statistics(memo, &expr.children, 0);
             if let Some(k) = sort.partition_limit {
-                let analytic_partition_exprs =
-                    materialize_exprs(&memo.scalars, &sort.analytic_partition_exprs);
-                let output_rows = sort_partition_limit_output_rows(
+                let output_rows = sort_partition_limit_output_rows_scalar(
+                    &memo.scalars,
                     child_stats.output_row_count,
-                    &analytic_partition_exprs,
+                    &sort.analytic_partition_exprs,
                     &child_stats.column_statistics,
                     k,
                 );
@@ -547,12 +543,11 @@ pub(crate) fn derive_statistics(
 
         Operator::PhysicalWindow(window) => {
             let child_stats = child_statistics(memo, &expr.children, 0);
-            let window_exprs = materialize_window_exprs(
-                &memo.scalars,
-                &window.window_exprs,
+            derive_window_statistics_scalar(
+                child_stats,
+                window.window_exprs.len(),
                 &window.output_columns,
-            );
-            derive_window_statistics(child_stats, &window_exprs)
+            )
         }
 
         Operator::PhysicalDistribution(_) => {
@@ -626,8 +621,9 @@ pub(crate) fn derive_statistics(
         Operator::PhysicalValues(vals) => Statistics {
             output_row_count: vals.rows.len() as f64,
             row_count_confidence: Confidence::Exact,
-            column_statistics: values_column_statistics(
-                &materialize_rows(&memo.scalars, &vals.rows),
+            column_statistics: values_column_statistics_scalar(
+                &memo.scalars,
+                &vals.rows,
                 &vals.columns,
             ),
         },
@@ -693,28 +689,6 @@ pub(crate) fn derive_statistics(
     }
 }
 
-pub(crate) fn derive_logical_plan_statistics(
-    plan: &LogicalPlanNode,
-    table_stats: &HashMap<String, TableStatistics>,
-) -> Statistics {
-    let mut memo = Memo::new();
-    let root_group = super::convert::logical_plan_to_memo(plan, &mut memo);
-    derive_group_statistics(&mut memo, table_stats);
-    memo.groups
-        .get(root_group)
-        .and_then(|group| group.logical_props.as_ref())
-        .map(|props| Statistics {
-            output_row_count: props.row_count,
-            row_count_confidence: props.row_count_confidence,
-            column_statistics: props.column_statistics.clone(),
-        })
-        .unwrap_or_else(|| Statistics {
-            output_row_count: 1.0,
-            row_count_confidence: Confidence::Fallback,
-            column_statistics: HashMap::new(),
-        })
-}
-
 pub(crate) fn derive_opt_expr_statistics(
     expr: &OptExpr,
     arena: &ScalarArena,
@@ -740,13 +714,25 @@ pub(crate) fn derive_opt_expr_statistics(
         })
 }
 
-fn best_join_key_ndv(
-    expr: &TypedExpr,
+const DEFAULT_EXPR_NDV: f64 = 10.0;
+const DEFAULT_JOIN_KEY_NDV: f64 = 40.0;
+const UNKNOWN_JOIN_RESIDUAL_EQ_FILTER: f64 = 0.5;
+
+#[derive(Default)]
+struct ScalarJoinConditionEstimate {
+    eq_key_ndvs: Vec<(f64, f64, Confidence)>,
+    eq_key_pairs: Vec<(ColumnId, ColumnId)>,
+    residual_selectivity: Option<(f64, Confidence)>,
+}
+
+fn best_join_key_ndv_scalar(
+    arena: &ScalarArena,
+    expr: ScalarId,
     primary_stats: &HashMap<ColumnId, ColumnStatistic>,
     secondary_stats: &HashMap<ColumnId, ColumnStatistic>,
 ) -> (f64, Confidence) {
-    let primary = get_join_key_ndv_with_confidence(expr, primary_stats);
-    let secondary = get_join_key_ndv_with_confidence(expr, secondary_stats);
+    let primary = get_join_key_ndv_with_confidence_scalar(arena, expr, primary_stats);
+    let secondary = get_join_key_ndv_with_confidence_scalar(arena, expr, secondary_stats);
     match (
         primary.1 == Confidence::Fallback,
         secondary.1 == Confidence::Fallback,
@@ -758,14 +744,297 @@ fn best_join_key_ndv(
     }
 }
 
-fn materialize_rows(arena: &ScalarArena, rows: &[Vec<ScalarId>]) -> Vec<Vec<TypedExpr>> {
-    rows.iter()
-        .map(|row| row.iter().map(|expr| materialize(arena, *expr)).collect())
-        .collect()
+fn extract_column_id_scalar(arena: &ScalarArena, expr: ScalarId) -> Option<ColumnId> {
+    match arena.node(expr) {
+        ScalarNode::ColumnRef(column_id) if *column_id != ColumnId::UNSET => Some(*column_id),
+        ScalarNode::Cast { child, .. } | ScalarNode::Nested(child) => {
+            extract_column_id_scalar(arena, *child)
+        }
+        _ => None,
+    }
 }
 
-fn aggregate_group_column_statistics(
-    group_by: &[TypedExpr],
+fn get_expr_ndv_scalar(
+    arena: &ScalarArena,
+    expr: ScalarId,
+    column_stats: &HashMap<ColumnId, ColumnStatistic>,
+) -> f64 {
+    real_expr_ndv_scalar(arena, expr, column_stats)
+        .map(|(ndv, _)| ndv)
+        .unwrap_or(DEFAULT_EXPR_NDV)
+}
+
+fn get_join_key_ndv_with_confidence_scalar(
+    arena: &ScalarArena,
+    expr: ScalarId,
+    column_stats: &HashMap<ColumnId, ColumnStatistic>,
+) -> (f64, Confidence) {
+    real_expr_ndv_scalar(arena, expr, column_stats)
+        .unwrap_or((DEFAULT_JOIN_KEY_NDV, Confidence::Fallback))
+}
+
+fn real_expr_ndv_scalar(
+    arena: &ScalarArena,
+    expr: ScalarId,
+    column_stats: &HashMap<ColumnId, ColumnStatistic>,
+) -> Option<(f64, Confidence)> {
+    if let Some(column_id) = extract_column_id_scalar(arena, expr)
+        && let Some(cs) = column_stats.get(&column_id)
+        && cs.distinct_values_count > 1.0
+    {
+        let confidence = if cs.confidence == Confidence::Fallback {
+            Confidence::Estimated
+        } else {
+            cs.confidence
+        };
+        return Some((cs.distinct_values_count, confidence));
+    }
+    None
+}
+
+fn estimate_selectivity_scalar(
+    arena: &ScalarArena,
+    expr: ScalarId,
+    column_stats: &HashMap<ColumnId, ColumnStatistic>,
+) -> f64 {
+    match arena.node(expr) {
+        ScalarNode::BinaryOp { left, op, right } => match *op {
+            BinOp::And => {
+                let mut conjuncts = Vec::new();
+                flatten_and_scalar(arena, expr, &mut conjuncts);
+                let sels: Vec<f64> = conjuncts
+                    .iter()
+                    .map(|conjunct| estimate_selectivity_scalar(arena, *conjunct, column_stats))
+                    .collect();
+                damped_conjunction(&sels)
+            }
+            BinOp::Or => {
+                let l = estimate_selectivity_scalar(arena, *left, column_stats);
+                let r = estimate_selectivity_scalar(arena, *right, column_stats);
+                l + r - l * r
+            }
+            BinOp::Eq | BinOp::EqForNull => {
+                estimate_eq_selectivity_scalar(arena, *left, *right, column_stats)
+            }
+            BinOp::Ne => 1.0 - estimate_eq_selectivity_scalar(arena, *left, *right, column_stats),
+            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                estimate_range_selectivity_scalar(arena, *left, *right, *op, column_stats)
+            }
+            _ => PREDICATE_UNKNOWN_FILTER,
+        },
+        ScalarNode::IsNull { child, negated } => {
+            let col_id = extract_column_id_scalar(arena, *child);
+            let null_frac = col_id
+                .and_then(|column_id| column_stats.get(&column_id))
+                .map(|cs| {
+                    if cs.nulls_fraction > 0.0 {
+                        cs.nulls_fraction
+                    } else {
+                        IS_NULL_FILTER
+                    }
+                })
+                .unwrap_or(IS_NULL_FILTER);
+            if *negated { 1.0 - null_frac } else { null_frac }
+        }
+        ScalarNode::InList {
+            child,
+            list,
+            negated,
+        } => {
+            let col_id = extract_column_id_scalar(arena, *child);
+            let ndv = col_id
+                .and_then(|column_id| column_stats.get(&column_id))
+                .and_then(trusted_distinct_values_count);
+
+            let sel = if let Some(ndv) = ndv {
+                (list.len() as f64 / ndv).min(1.0)
+            } else {
+                IN_PREDICATE_DEFAULT_FILTER
+            };
+            if *negated { 1.0 - sel } else { sel }
+        }
+        ScalarNode::Between {
+            child,
+            low,
+            high,
+            negated,
+        } => {
+            let ge =
+                estimate_range_selectivity_scalar(arena, *child, *low, BinOp::Ge, column_stats);
+            let le =
+                estimate_range_selectivity_scalar(arena, *child, *high, BinOp::Le, column_stats);
+            let sel = ge * le;
+            if *negated { 1.0 - sel } else { sel }
+        }
+        ScalarNode::Like { negated, .. } => {
+            let sel = PREDICATE_UNKNOWN_FILTER;
+            if *negated { 1.0 - sel } else { sel }
+        }
+        ScalarNode::UnaryOp {
+            op: UnOp::Not,
+            child,
+        } => 1.0 - estimate_selectivity_scalar(arena, *child, column_stats),
+        ScalarNode::IsTruthValue { negated, .. } => {
+            let base = 0.5;
+            if *negated { 1.0 - base } else { base }
+        }
+        ScalarNode::Nested(inner) => estimate_selectivity_scalar(arena, *inner, column_stats),
+        _ => PREDICATE_UNKNOWN_FILTER,
+    }
+}
+
+fn flatten_and_scalar(arena: &ScalarArena, expr: ScalarId, out: &mut Vec<ScalarId>) {
+    match arena.node(expr) {
+        ScalarNode::BinaryOp {
+            op: BinOp::And,
+            left,
+            right,
+        } => {
+            flatten_and_scalar(arena, *left, out);
+            flatten_and_scalar(arena, *right, out);
+        }
+        ScalarNode::Nested(inner) => flatten_and_scalar(arena, *inner, out),
+        _ => out.push(expr),
+    }
+}
+
+fn estimate_eq_selectivity_scalar(
+    arena: &ScalarArena,
+    left: ScalarId,
+    right: ScalarId,
+    column_stats: &HashMap<ColumnId, ColumnStatistic>,
+) -> f64 {
+    if let Some((column_id, column_expr, literal_expr)) =
+        extract_column_literal_pair_scalar(arena, left, right)
+        && let Some(cs) = column_stats.get(&column_id)
+    {
+        if let Some(ndv) = trusted_distinct_values_count(cs) {
+            return 1.0 / ndv;
+        }
+        if let Some(selectivity) =
+            discrete_domain_equality_selectivity_scalar(arena, column_expr, literal_expr, cs)
+        {
+            return selectivity;
+        }
+    }
+    PREDICATE_UNKNOWN_FILTER
+}
+
+fn extract_column_literal_pair_scalar(
+    arena: &ScalarArena,
+    left: ScalarId,
+    right: ScalarId,
+) -> Option<(ColumnId, ScalarId, ScalarId)> {
+    if let Some(column_id) = extract_column_id_scalar(arena, left)
+        && scalar_literal_f64(arena, right).is_some()
+    {
+        return Some((column_id, left, right));
+    }
+    if let Some(column_id) = extract_column_id_scalar(arena, right)
+        && scalar_literal_f64(arena, left).is_some()
+    {
+        return Some((column_id, right, left));
+    }
+    None
+}
+
+fn trusted_distinct_values_count(stat: &ColumnStatistic) -> Option<f64> {
+    if stat.confidence > Confidence::Fallback
+        && stat.distinct_values_count.is_finite()
+        && stat.distinct_values_count > 1.0
+    {
+        Some(stat.distinct_values_count)
+    } else {
+        None
+    }
+}
+
+fn discrete_domain_equality_selectivity_scalar(
+    arena: &ScalarArena,
+    column_expr: ScalarId,
+    literal_expr: ScalarId,
+    stat: &ColumnStatistic,
+) -> Option<f64> {
+    if !is_discrete_numeric_domain(arena.data_type(column_expr)) {
+        return None;
+    }
+    let min = stat.min_value;
+    let max = stat.max_value;
+    if !min.is_finite() || !max.is_finite() || max < min {
+        return None;
+    }
+    let value = scalar_literal_f64(arena, literal_expr)?;
+    if value < min || value > max {
+        return Some(0.0);
+    }
+    let domain_width = (max.floor() - min.ceil() + 1.0).max(1.0);
+    Some((1.0 / domain_width).clamp(0.0, 1.0))
+}
+
+fn is_discrete_numeric_domain(data_type: &arrow::datatypes::DataType) -> bool {
+    matches!(
+        data_type,
+        arrow::datatypes::DataType::Boolean
+            | arrow::datatypes::DataType::Int8
+            | arrow::datatypes::DataType::Int16
+            | arrow::datatypes::DataType::Int32
+            | arrow::datatypes::DataType::Int64
+            | arrow::datatypes::DataType::UInt8
+            | arrow::datatypes::DataType::UInt16
+            | arrow::datatypes::DataType::UInt32
+            | arrow::datatypes::DataType::UInt64
+            | arrow::datatypes::DataType::Date32
+    )
+}
+
+fn estimate_range_selectivity_scalar(
+    arena: &ScalarArena,
+    left: ScalarId,
+    right: ScalarId,
+    op: BinOp,
+    column_stats: &HashMap<ColumnId, ColumnStatistic>,
+) -> f64 {
+    let col_id = extract_column_id_scalar(arena, left);
+    let literal_val = scalar_literal_f64(arena, right);
+
+    if let (Some(column_id), Some(val)) = (col_id, literal_val)
+        && let Some(cs) = column_stats.get(&column_id)
+    {
+        let min = cs.min_value;
+        let max = cs.max_value;
+        if min.is_finite() && max.is_finite() && max > min {
+            let range = max - min;
+            return match op {
+                BinOp::Lt => ((val - min) / range).clamp(0.01, 0.99),
+                BinOp::Le => ((val - min + 1.0) / range).clamp(0.01, 0.99),
+                BinOp::Gt => ((max - val) / range).clamp(0.01, 0.99),
+                BinOp::Ge => ((max - val + 1.0) / range).clamp(0.01, 0.99),
+                _ => 0.5,
+            };
+        }
+    }
+    0.5
+}
+
+fn scalar_literal_f64(arena: &ScalarArena, expr: ScalarId) -> Option<f64> {
+    match arena.node(expr) {
+        ScalarNode::Literal(value) => match &value.0 {
+            LiteralValue::Int(v) => Some(*v as f64),
+            LiteralValue::LargeInt(v) => Some(*v as f64),
+            LiteralValue::Float(v) => Some(*v),
+            LiteralValue::Decimal(s) => s.parse::<f64>().ok(),
+            _ => None,
+        },
+        ScalarNode::Cast { child, .. } | ScalarNode::Nested(child) => {
+            scalar_literal_f64(arena, *child)
+        }
+        _ => None,
+    }
+}
+
+fn aggregate_group_column_statistics_scalar(
+    arena: &ScalarArena,
+    group_by: &[ScalarId],
     output_columns: &[OutputColumn],
     child_stats: &Statistics,
     output_rows: f64,
@@ -774,13 +1043,13 @@ fn aggregate_group_column_statistics(
         .iter()
         .zip(output_columns.iter())
         .map(|(expr, output)| {
-            let mut stat = extract_column_id(expr)
+            let mut stat = extract_column_id_scalar(arena, *expr)
                 .and_then(|column_id| child_stats.column_statistics.get(&column_id))
                 .cloned()
                 .unwrap_or_else(|| {
                     let mut fallback = ColumnStatistic::unknown();
                     fallback.distinct_values_count =
-                        get_expr_ndv(expr, &child_stats.column_statistics);
+                        get_expr_ndv_scalar(arena, *expr, &child_stats.column_statistics);
                     fallback
                 });
             stat.distinct_values_count = cap_ndv_at_rows(stat.distinct_values_count, output_rows);
@@ -948,27 +1217,22 @@ fn child_statistics(memo: &Memo, children: &[super::memo::GroupId], index: usize
 /// (`child_rows`) because we have no basis for a reduction estimate.
 ///
 /// The result is capped at `child_rows` — we never inflate.
-fn sort_partition_limit_output_rows(
+fn sort_partition_limit_output_rows_scalar(
+    arena: &ScalarArena,
     child_rows: f64,
-    partition_exprs: &[TypedExpr],
+    partition_exprs: &[ScalarId],
     column_stats: &HashMap<ColumnId, ColumnStatistic>,
     partition_limit: usize,
 ) -> f64 {
     if partition_exprs.is_empty() {
-        // No partition key → single-partition sort; fall back to pass-through.
         return child_rows;
     }
-    // Combine NDVs the same way the aggregate estimator does: take the product
-    // with a damping exponent so many keys don't explode. Here we use a simpler
-    // approach: multiply the per-key NDVs with successive halving exponents,
-    // mirroring `agg_group_rows` logic. For the common single-key case this
-    // reduces to just that key's NDV, which is what the spec asks for.
+
     let mut ndv_product = 1.0_f64;
     let mut exp = 1.0_f64;
-    // Sort NDVs largest first so the dominant key gets full weight.
     let mut ndvs: Vec<f64> = partition_exprs
         .iter()
-        .map(|e| get_expr_ndv(e, column_stats))
+        .map(|expr| get_expr_ndv_scalar(arena, *expr, column_stats))
         .collect();
     ndvs.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
     for ndv in ndvs {
@@ -984,32 +1248,14 @@ fn sort_partition_limit_output_rows(
     estimated.min(child_rows).max(1.0)
 }
 
-fn is_null_literal(expr: &TypedExpr) -> bool {
-    matches!(&expr.kind, ExprKind::Literal(LiteralValue::Null))
-}
-
-/// Extract a numeric `f64` from a literal value expression (the only kind
-/// `VALUES` rows that we synthesize statistics for). Returns `None` for
-/// non-numeric literals so such columns are left without statistics.
-fn values_literal_f64(expr: &TypedExpr) -> Option<f64> {
-    match &expr.kind {
-        ExprKind::Literal(LiteralValue::Int(v)) => Some(*v as f64),
-        ExprKind::Literal(LiteralValue::LargeInt(v)) => Some(*v as f64),
-        ExprKind::Literal(LiteralValue::Float(v)) => Some(*v),
-        ExprKind::Literal(LiteralValue::Decimal(s)) => s.parse::<f64>().ok(),
-        ExprKind::Cast { expr, .. } => values_literal_f64(expr),
-        ExprKind::Nested(inner) => values_literal_f64(inner),
-        _ => None,
-    }
-}
-
 /// Exact per-column statistics for a `VALUES` relation, synthesized from the
 /// literal rows. A column gets stats only when every value is a numeric literal
 /// (or NULL); non-numeric columns are left unknown. NDV is the exact distinct
 /// count, bounded by the literal min/max. Without this, a join on a `VALUES`
 /// column (e.g. an `IN`-list lowered to a values join) has no NDV.
-fn values_column_statistics(
-    rows: &[Vec<TypedExpr>],
+fn values_column_statistics_scalar(
+    arena: &ScalarArena,
+    rows: &[Vec<ScalarId>],
     columns: &[OutputColumn],
 ) -> HashMap<ColumnId, ColumnStatistic> {
     let mut out = HashMap::new();
@@ -1026,8 +1272,8 @@ fn values_column_statistics(
         let mut all_numeric_or_null = true;
         for row in rows {
             match row.get(col_idx) {
-                Some(expr) if is_null_literal(expr) => nulls += 1,
-                Some(expr) => match values_literal_f64(expr) {
+                Some(expr) if scalar_is_null_literal(arena, *expr) => nulls += 1,
+                Some(expr) => match scalar_literal_f64(arena, *expr) {
                     Some(v) => values.push(v),
                     None => {
                         all_numeric_or_null = false;
@@ -1040,26 +1286,45 @@ fn values_column_statistics(
                 }
             }
         }
-        if !all_numeric_or_null || values.is_empty() {
+        if !all_numeric_or_null {
             continue;
         }
-        let mut sorted = values;
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        sorted.dedup();
-        let ndv = sorted.len() as f64;
+        let non_null = values.len();
+        let mut distinct = values.clone();
+        distinct.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        distinct.dedup_by(|a, b| (*a - *b).abs() < f64::EPSILON);
+        let min = values
+            .iter()
+            .copied()
+            .reduce(f64::min)
+            .unwrap_or(f64::NEG_INFINITY);
+        let max = values
+            .iter()
+            .copied()
+            .reduce(f64::max)
+            .unwrap_or(f64::INFINITY);
         out.insert(
             column.column_id,
             ColumnStatistic {
-                min_value: *sorted.first().expect("non-empty after check"),
-                max_value: *sorted.last().expect("non-empty after check"),
+                min_value: min,
+                max_value: max,
                 nulls_fraction: nulls as f64 / row_count,
                 average_row_size: 8.0,
-                distinct_values_count: ndv.max(1.0),
+                distinct_values_count: (distinct.len().max(if non_null > 0 { 1 } else { 0 })
+                    as f64)
+                    .max(1.0),
                 confidence: Confidence::Exact,
             },
         );
     }
     out
+}
+
+fn scalar_is_null_literal(arena: &ScalarArena, expr: ScalarId) -> bool {
+    matches!(
+        arena.node(expr),
+        ScalarNode::Literal(value) if matches!(&value.0, LiteralValue::Null)
+    )
 }
 
 /// Exact per-column statistics for a `generate_series` output column. Every
@@ -1366,48 +1631,64 @@ fn real_column_ndv(stat: &ColumnStatistic) -> Option<f64> {
     }
 }
 
-fn collect_equi_join_column_pairs(condition: Option<&TypedExpr>) -> Vec<(ColumnId, ColumnId)> {
+fn collect_equi_join_column_pairs_scalar(
+    arena: &ScalarArena,
+    condition: Option<ScalarId>,
+) -> Vec<(ColumnId, ColumnId)> {
     let mut pairs = Vec::new();
     if let Some(condition) = condition {
-        collect_equi_join_column_pairs_inner(condition, &mut pairs);
+        collect_equi_join_column_pairs_inner_scalar(arena, condition, &mut pairs);
     }
     pairs
 }
 
-fn collect_equi_join_column_pairs_inner(expr: &TypedExpr, pairs: &mut Vec<(ColumnId, ColumnId)>) {
-    match &expr.kind {
-        ExprKind::BinaryOp {
+fn collect_equi_join_column_pairs_inner_scalar(
+    arena: &ScalarArena,
+    expr: ScalarId,
+    pairs: &mut Vec<(ColumnId, ColumnId)>,
+) {
+    match arena.node(expr) {
+        ScalarNode::BinaryOp {
             left,
             op: BinOp::Eq | BinOp::EqForNull,
             right,
         } => {
-            if let (Some(left_id), Some(right_id)) =
-                (extract_column_id(left), extract_column_id(right))
-            {
+            if let (Some(left_id), Some(right_id)) = (
+                extract_column_id_scalar(arena, *left),
+                extract_column_id_scalar(arena, *right),
+            ) {
                 pairs.push((left_id, right_id));
             }
         }
-        ExprKind::BinaryOp {
+        ScalarNode::BinaryOp {
             left,
             op: BinOp::And,
             right,
         } => {
-            collect_equi_join_column_pairs_inner(left, pairs);
-            collect_equi_join_column_pairs_inner(right, pairs);
+            collect_equi_join_column_pairs_inner_scalar(arena, *left, pairs);
+            collect_equi_join_column_pairs_inner_scalar(arena, *right, pairs);
         }
-        ExprKind::Nested(inner) => collect_equi_join_column_pairs_inner(inner, pairs),
+        ScalarNode::Nested(inner) => {
+            collect_equi_join_column_pairs_inner_scalar(arena, *inner, pairs)
+        }
         _ => {}
     }
 }
 
-fn derive_window_statistics(
+fn derive_window_statistics_scalar(
     mut child_stats: Statistics,
-    window_exprs: &[crate::sql::planner::plan::WindowExpr],
+    window_expr_count: usize,
+    output_columns: &[OutputColumn],
 ) -> Statistics {
-    for window_expr in window_exprs {
+    assert!(
+        output_columns.len() >= window_expr_count,
+        "window output layout must include window result columns"
+    );
+    let window_output_start = output_columns.len() - window_expr_count;
+    for output_column in output_columns.iter().skip(window_output_start) {
         child_stats
             .column_statistics
-            .insert(window_expr.output_column_id, ColumnStatistic::unknown());
+            .insert(output_column.column_id, ColumnStatistic::unknown());
     }
     child_stats
 }
@@ -1418,32 +1699,31 @@ fn derive_scan(
     scalars: &ScalarArena,
     table_stats: &HashMap<String, TableStatistics>,
 ) -> Statistics {
-    derive_scan_statistics(
+    derive_scan_statistics_scalar(
         &scan.table.name,
         scan.alias.as_deref(),
         &scan.columns,
-        &materialize_exprs(scalars, &scan.predicates),
+        &scan.predicates,
+        scalars,
         table_stats,
         estimate_default_row_count(&scan.table.name),
     )
 }
 
-fn derive_scan_statistics(
+fn derive_scan_statistics_scalar(
     table_name: &str,
     alias: Option<&str>,
     columns: &[OutputColumn],
-    predicates: &[TypedExpr],
+    predicates: &[ScalarId],
+    scalars: &ScalarArena,
     table_stats: &HashMap<String, TableStatistics>,
     default_rows: f64,
 ) -> Statistics {
-    // Try alias first, then fall back to the canonical table name.
-    // `collect_scan_stats` inserts by table name, but the scan node
-    // may have an alias that differs from the table name.
     let alias_key = alias.map(|a| a.to_lowercase());
     let table_key = table_name.to_lowercase();
     let ts_opt = alias_key
         .as_deref()
-        .and_then(|k| table_stats.get(k))
+        .and_then(|key| table_stats.get(key))
         .or_else(|| table_stats.get(&table_key));
 
     if let Some(ts) = ts_opt {
@@ -1453,7 +1733,7 @@ fn derive_scan_statistics(
         let mut row_count_confidence = Confidence::Exact;
         let table_column_statistics = map_table_column_stats_to_ids(columns, ts);
         for pred in predicates {
-            let selectivity = estimate_selectivity(pred, &table_column_statistics);
+            let selectivity = estimate_selectivity_scalar(scalars, *pred, &table_column_statistics);
             (output_rows, row_count_confidence) =
                 apply_filter(output_rows, row_count_confidence, selectivity);
         }
@@ -1478,7 +1758,6 @@ fn derive_scan_statistics(
             column_statistics,
         }
     } else {
-        // No table stats available: use heuristic defaults based on table name.
         let mut column_statistics: HashMap<ColumnId, ColumnStatistic> = columns
             .iter()
             .map(|c| (c.column_id, ColumnStatistic::unknown()))
@@ -1486,7 +1765,7 @@ fn derive_scan_statistics(
         let mut output_rows = default_rows;
         let mut row_count_confidence = Confidence::Fallback;
         for pred in predicates {
-            let selectivity = estimate_selectivity(pred, &column_statistics);
+            let selectivity = estimate_selectivity_scalar(scalars, *pred, &column_statistics);
             (output_rows, row_count_confidence) =
                 apply_filter(output_rows, row_count_confidence, selectivity);
         }
@@ -1603,15 +1882,215 @@ fn estimate_default_row_count(table_name: &str) -> f64 {
 }
 
 /// Derive join statistics from a `LogicalJoinOp` and child stats.
+fn estimate_join_condition_scalar(
+    arena: &ScalarArena,
+    condition: Option<ScalarId>,
+    left_stats: &HashMap<ColumnId, ColumnStatistic>,
+    right_stats: &HashMap<ColumnId, ColumnStatistic>,
+) -> ScalarJoinConditionEstimate {
+    let Some(condition) = condition else {
+        return ScalarJoinConditionEstimate::default();
+    };
+
+    let mut estimate = ScalarJoinConditionEstimate::default();
+    let mut residuals = Vec::new();
+    collect_join_conjuncts_scalar(
+        arena,
+        condition,
+        left_stats,
+        right_stats,
+        &mut estimate,
+        &mut residuals,
+    );
+
+    if !residuals.is_empty() {
+        let combined_stats = combined_column_statistics(left_stats, right_stats);
+        let selectivities: Vec<_> = residuals
+            .iter()
+            .map(|expr| estimate_join_residual_selectivity_scalar(arena, *expr, &combined_stats))
+            .collect();
+        estimate.residual_selectivity =
+            Some((damped_conjunction(&selectivities), Confidence::Estimated));
+    }
+
+    estimate
+}
+
+fn collect_join_conjuncts_scalar(
+    arena: &ScalarArena,
+    expr: ScalarId,
+    left_stats: &HashMap<ColumnId, ColumnStatistic>,
+    right_stats: &HashMap<ColumnId, ColumnStatistic>,
+    estimate: &mut ScalarJoinConditionEstimate,
+    residuals: &mut Vec<ScalarId>,
+) {
+    match arena.node(expr) {
+        ScalarNode::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } => {
+            collect_join_conjuncts_scalar(
+                arena,
+                *left,
+                left_stats,
+                right_stats,
+                estimate,
+                residuals,
+            );
+            collect_join_conjuncts_scalar(
+                arena,
+                *right,
+                left_stats,
+                right_stats,
+                estimate,
+                residuals,
+            );
+        }
+        ScalarNode::Nested(inner) => {
+            collect_join_conjuncts_scalar(
+                arena,
+                *inner,
+                left_stats,
+                right_stats,
+                estimate,
+                residuals,
+            );
+        }
+        _ => {
+            if !try_collect_equi_key_scalar(arena, expr, left_stats, right_stats, estimate) {
+                residuals.push(expr);
+            }
+        }
+    }
+}
+
+fn try_collect_equi_key_scalar(
+    arena: &ScalarArena,
+    expr: ScalarId,
+    left_stats: &HashMap<ColumnId, ColumnStatistic>,
+    right_stats: &HashMap<ColumnId, ColumnStatistic>,
+    estimate: &mut ScalarJoinConditionEstimate,
+) -> bool {
+    let ScalarNode::BinaryOp {
+        left,
+        op: BinOp::Eq | BinOp::EqForNull,
+        right,
+    } = arena.node(expr)
+    else {
+        return false;
+    };
+
+    let Some(left_id) = extract_column_id_scalar(arena, *left) else {
+        return false;
+    };
+    let Some(right_id) = extract_column_id_scalar(arena, *right) else {
+        return false;
+    };
+
+    let forward = left_stats.contains_key(&left_id) && right_stats.contains_key(&right_id);
+    let reverse = left_stats.contains_key(&right_id) && right_stats.contains_key(&left_id);
+    let (left_expr, right_expr, left_key, right_key) = match (forward, reverse) {
+        (true, false) => (*left, *right, left_id, right_id),
+        (false, true) => (*right, *left, right_id, left_id),
+        (true, true) if left_id == right_id => {
+            let (left_ndv, left_confidence) =
+                get_join_key_ndv_with_confidence_scalar(arena, *left, left_stats);
+            let (right_ndv, right_confidence) =
+                get_join_key_ndv_with_confidence_scalar(arena, *right, right_stats);
+            estimate.eq_key_ndvs.push((
+                left_ndv,
+                right_ndv,
+                left_confidence.combine(right_confidence),
+            ));
+            return true;
+        }
+        _ => return false,
+    };
+
+    estimate.eq_key_pairs.push((left_key, right_key));
+    let (left_ndv, left_confidence) =
+        get_join_key_ndv_with_confidence_scalar(arena, left_expr, left_stats);
+    let (right_ndv, right_confidence) =
+        get_join_key_ndv_with_confidence_scalar(arena, right_expr, right_stats);
+    estimate.eq_key_ndvs.push((
+        left_ndv,
+        right_ndv,
+        left_confidence.combine(right_confidence),
+    ));
+    true
+}
+
+fn estimate_join_residual_selectivity_scalar(
+    arena: &ScalarArena,
+    expr: ScalarId,
+    column_stats: &HashMap<ColumnId, ColumnStatistic>,
+) -> f64 {
+    let selectivity = estimate_selectivity_scalar(arena, expr, column_stats);
+    if (selectivity - PREDICATE_UNKNOWN_FILTER).abs() < f64::EPSILON
+        && is_unknown_column_literal_eq_scalar(arena, expr, column_stats)
+    {
+        UNKNOWN_JOIN_RESIDUAL_EQ_FILTER
+    } else {
+        selectivity
+    }
+}
+
+fn is_unknown_column_literal_eq_scalar(
+    arena: &ScalarArena,
+    expr: ScalarId,
+    column_stats: &HashMap<ColumnId, ColumnStatistic>,
+) -> bool {
+    let ScalarNode::BinaryOp {
+        left,
+        op: BinOp::Eq | BinOp::EqForNull,
+        right,
+    } = arena.node(expr)
+    else {
+        return false;
+    };
+
+    let Some(column_id) =
+        extract_column_id_scalar(arena, *left).or_else(|| extract_column_id_scalar(arena, *right))
+    else {
+        return false;
+    };
+    if !(scalar_is_literal_like(arena, *left) || scalar_is_literal_like(arena, *right)) {
+        return false;
+    }
+    column_stats
+        .get(&column_id)
+        .map_or(true, |cs| cs.distinct_values_count <= 1.0)
+}
+
+fn scalar_is_literal_like(arena: &ScalarArena, expr: ScalarId) -> bool {
+    match arena.node(expr) {
+        ScalarNode::Literal(_) => true,
+        ScalarNode::Cast { child, .. } | ScalarNode::Nested(child) => {
+            scalar_is_literal_like(arena, *child)
+        }
+        _ => false,
+    }
+}
+
+fn combined_column_statistics(
+    left_stats: &HashMap<ColumnId, ColumnStatistic>,
+    right_stats: &HashMap<ColumnId, ColumnStatistic>,
+) -> HashMap<ColumnId, ColumnStatistic> {
+    let mut combined = left_stats.clone();
+    combined.extend(right_stats.clone());
+    combined
+}
+
 fn derive_join(
     join: &super::operator::LogicalJoinOp,
     scalars: &ScalarArena,
     left_stats: &Statistics,
     right_stats: &Statistics,
 ) -> Statistics {
-    let condition = join.condition.map(|cond| materialize(scalars, cond));
-    let join_condition = estimate_join_condition(
-        condition.as_ref(),
+    let join_condition = estimate_join_condition_scalar(
+        scalars,
+        join.condition,
         &left_stats.column_statistics,
         &right_stats.column_statistics,
     );
@@ -1908,15 +2387,30 @@ mod tests {
     use crate::sql::catalog::{
         ColumnDef, IcebergDataFileInfo, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
-    use crate::sql::optimizer::convert::logical_plan_to_memo;
+    use crate::sql::optimizer::estimate::selectivity::estimate_selectivity;
     use crate::sql::optimizer::memo::Memo;
     use crate::sql::optimizer::scalar::intern_typed;
     use crate::sql::optimizer::scalar_bridge::{
         intern_aggregate_calls, intern_exprs, intern_window_exprs,
     };
     use crate::sql::planner::plan::*;
-    use crate::sql::planner::plan::*;
     use arrow::datatypes::DataType;
+
+    fn logical_plan_to_memo_for_test(plan: &LogicalPlanNode, memo: &mut Memo) -> GroupId {
+        let opt_expr =
+            crate::sql::optimizer::convert::try_logical_plan_to_opt_expr(plan, &mut memo.scalars)
+                .expect("logical plan to opt expr");
+        crate::sql::optimizer::convert::opt_expr_to_memo(&opt_expr, memo)
+    }
+
+    fn estimate_selectivity_for_test(
+        expr: &TypedExpr,
+        column_stats: &HashMap<ColumnId, ColumnStatistic>,
+    ) -> f64 {
+        let mut arena = ScalarArena::new();
+        let id = intern_typed(&mut arena, expr);
+        estimate_selectivity(&arena, id, column_stats)
+    }
 
     fn test_iceberg_table_info() -> IcebergTableInfo {
         IcebergTableInfo {
@@ -2076,7 +2570,7 @@ mod tests {
         let plan = scan_plan_with_predicates("unknown_tbl", &["a"], vec![pred]);
 
         let mut memo = Memo::new();
-        logical_plan_to_memo(&plan, &mut memo);
+        logical_plan_to_memo_for_test(&plan, &mut memo);
         derive_group_statistics(&mut memo, &table_stats);
 
         // default_rows("unknown_tbl") = 100000; unknown-column eq selectivity
@@ -2105,7 +2599,7 @@ mod tests {
         let plan = scan_plan("orders", &["id", "status", "missing"]);
 
         let mut memo = Memo::new();
-        logical_plan_to_memo(&plan, &mut memo);
+        logical_plan_to_memo_for_test(&plan, &mut memo);
         derive_group_statistics(&mut memo, &table_stats);
 
         let props = memo.groups[0].logical_props.as_ref().unwrap();
@@ -2134,7 +2628,7 @@ mod tests {
             scan_plan_with_predicates("orders", &["id"], vec![eq_expr(col_ref("id"), int_lit(42))]);
 
         let mut memo = Memo::new();
-        logical_plan_to_memo(&plan, &mut memo);
+        logical_plan_to_memo_for_test(&plan, &mut memo);
         derive_group_statistics(&mut memo, &table_stats);
 
         let props = memo.groups[0].logical_props.as_ref().unwrap();
@@ -2151,7 +2645,7 @@ mod tests {
             scan_plan_with_predicates("orders", &["id"], vec![eq_expr(col_ref("id"), int_lit(42))]);
 
         let mut memo = Memo::new();
-        logical_plan_to_memo(&plan, &mut memo);
+        logical_plan_to_memo_for_test(&plan, &mut memo);
         derive_group_statistics(&mut memo, &table_stats);
 
         let props = memo.groups[0].logical_props.as_ref().unwrap();
@@ -3118,7 +3612,7 @@ mod tests {
 
         let plan = scan_plan("orders", &["id"]);
         let mut memo = Memo::new();
-        logical_plan_to_memo(&plan, &mut memo);
+        logical_plan_to_memo_for_test(&plan, &mut memo);
         derive_group_statistics(&mut memo, &table_stats);
 
         let props = memo.groups[0].logical_props.as_ref().unwrap();
@@ -3142,7 +3636,7 @@ mod tests {
         );
 
         let mut memo = Memo::new();
-        logical_plan_to_memo(&plan, &mut memo);
+        logical_plan_to_memo_for_test(&plan, &mut memo);
         derive_group_statistics(&mut memo, &table_stats);
 
         // Scan group (0): 10000 rows
@@ -4025,7 +4519,7 @@ mod tests {
         );
 
         let mut memo = Memo::new();
-        logical_plan_to_memo(&plan, &mut memo);
+        logical_plan_to_memo_for_test(&plan, &mut memo);
         derive_group_statistics(&mut memo, &table_stats);
 
         // Join group should have stats derived.
@@ -4060,7 +4554,7 @@ mod tests {
         );
 
         let mut memo = Memo::new();
-        logical_plan_to_memo(&plan, &mut memo);
+        logical_plan_to_memo_for_test(&plan, &mut memo);
         derive_group_statistics(&mut memo, &table_stats);
 
         // Agg group: real NDV(status)=5 now flows through child_statistics,
@@ -4086,7 +4580,7 @@ mod tests {
         );
 
         let mut memo = Memo::new();
-        logical_plan_to_memo(&plan, &mut memo);
+        logical_plan_to_memo_for_test(&plan, &mut memo);
         derive_group_statistics(&mut memo, &table_stats);
 
         let limit_props = memo.groups[1].logical_props.as_ref().unwrap();
@@ -4139,7 +4633,7 @@ mod tests {
         );
 
         let mut memo = Memo::new();
-        logical_plan_to_memo(&anchor, &mut memo);
+        logical_plan_to_memo_for_test(&anchor, &mut memo);
         derive_group_statistics(&mut memo, &table_stats);
 
         // Group 0: Scan (250000 rows from table stats)
@@ -4385,7 +4879,7 @@ mod tests {
         );
 
         let mut memo = Memo::new();
-        logical_plan_to_memo(&anchor, &mut memo);
+        logical_plan_to_memo_for_test(&anchor, &mut memo);
         derive_group_statistics(&mut memo, &table_stats);
 
         // Group 2: CTEConsume — must now carry the producer's column statistics.
@@ -4453,7 +4947,7 @@ mod tests {
         );
 
         let mut memo = Memo::new();
-        logical_plan_to_memo(&plan, &mut memo);
+        logical_plan_to_memo_for_test(&plan, &mut memo);
         derive_group_statistics(&mut memo, &HashMap::new());
 
         let props = memo.groups[0].logical_props.as_ref().unwrap();
@@ -4749,7 +5243,7 @@ mod tests {
         );
 
         let mut memo = Memo::new();
-        logical_plan_to_memo(&plan, &mut memo);
+        logical_plan_to_memo_for_test(&plan, &mut memo);
         derive_group_statistics(&mut memo, &HashMap::new());
 
         let props = memo.groups[1].logical_props.as_ref().unwrap();
@@ -4789,7 +5283,7 @@ mod tests {
         );
 
         let mut memo = Memo::new();
-        logical_plan_to_memo(&plan, &mut memo);
+        logical_plan_to_memo_for_test(&plan, &mut memo);
         derive_group_statistics(&mut memo, &table_stats);
 
         // Group 0 is the scan; group 1 is Decode.
@@ -4832,7 +5326,7 @@ mod tests {
         // a BETWEEN 0 AND 50 over [0,100]: ge = clamp((100-0+1)/100) = 0.99,
         // le = (50-0+1)/100 = 0.51, product ≈ 0.5049.
         let pred = between_expr(col_ref("a"), int_lit(0), int_lit(50));
-        let sel = estimate_selectivity(&pred, &cs);
+        let sel = estimate_selectivity_for_test(&pred, &cs);
         assert!(sel > 0.45 && sel < 0.56, "between selectivity was {sel}");
     }
 
@@ -4857,7 +5351,7 @@ mod tests {
                 negated: true,
             },
         };
-        let sel = estimate_selectivity(&pred, &cs);
+        let sel = estimate_selectivity_for_test(&pred, &cs);
         assert!(
             sel > 0.85 && sel < 0.93,
             "not-between selectivity was {sel}"
@@ -5016,10 +5510,11 @@ mod sort_partition_limit_tests {
     use super::*;
     use crate::sql::analysis::{ExprKind, TypedExpr};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::scalar::intern_typed;
     use arrow::datatypes::DataType;
 
-    fn col_ref_with_id(col_id: u32, name: &str) -> TypedExpr {
-        TypedExpr {
+    fn intern_col_ref(scalars: &mut ScalarArena, col_id: u32, name: &str) -> ScalarId {
+        let expr = TypedExpr {
             kind: ExprKind::ColumnRef {
                 column_id: ColumnId::new_for_test(col_id),
                 qualifier: None,
@@ -5027,7 +5522,8 @@ mod sort_partition_limit_tests {
             },
             data_type: DataType::Int32,
             nullable: false,
-        }
+        };
+        intern_typed(scalars, &expr)
     }
 
     fn col_stat_with_ndv(ndv: f64) -> ColumnStatistic {
@@ -5045,14 +5541,21 @@ mod sort_partition_limit_tests {
     #[test]
     fn sort_partition_limit_caps_output_rows() {
         let partition_col_id = 42u32;
-        let partition_expr = col_ref_with_id(partition_col_id, "pk");
+        let mut scalars = ScalarArena::new();
+        let partition_expr = intern_col_ref(&mut scalars, partition_col_id, "pk");
         let mut col_stats = HashMap::new();
         col_stats.insert(
             ColumnId::new_for_test(partition_col_id),
             col_stat_with_ndv(10.0),
         );
 
-        let result = sort_partition_limit_output_rows(1000.0, &[partition_expr], &col_stats, 3);
+        let result = sort_partition_limit_output_rows_scalar(
+            &scalars,
+            1000.0,
+            &[partition_expr],
+            &col_stats,
+            3,
+        );
         // ndv=10 * k=3 = 30, which is less than child_rows=1000.
         assert!(
             (result - 30.0).abs() < 1e-9,
@@ -5068,7 +5571,9 @@ mod sort_partition_limit_tests {
         // only invoked inside the Some(k) branch). Here we simply confirm that with
         // an empty partition_exprs and any k, we get child_rows back (the no-partition
         // fallback path inside the helper itself).
-        let result = sort_partition_limit_output_rows(5000.0, &[], &HashMap::new(), 99);
+        let scalars = ScalarArena::new();
+        let result =
+            sort_partition_limit_output_rows_scalar(&scalars, 5000.0, &[], &HashMap::new(), 99);
         assert!(
             (result - 5000.0).abs() < 1e-9,
             "expected passthrough 5000.0, got {result}"
@@ -5079,7 +5584,8 @@ mod sort_partition_limit_tests {
     #[test]
     fn sort_partition_limit_never_inflates_above_child_rows() {
         let partition_col_id = 43u32;
-        let partition_expr = col_ref_with_id(partition_col_id, "pk2");
+        let mut scalars = ScalarArena::new();
+        let partition_expr = intern_col_ref(&mut scalars, partition_col_id, "pk2");
         let mut col_stats = HashMap::new();
         col_stats.insert(
             ColumnId::new_for_test(partition_col_id),
@@ -5087,7 +5593,13 @@ mod sort_partition_limit_tests {
         );
 
         // ndv=500 * k=10 = 5000, but child_rows=200 → must be capped at 200.
-        let result = sort_partition_limit_output_rows(200.0, &[partition_expr], &col_stats, 10);
+        let result = sort_partition_limit_output_rows_scalar(
+            &scalars,
+            200.0,
+            &[partition_expr],
+            &col_stats,
+            10,
+        );
         assert!(
             (result - 200.0).abs() < 1e-9,
             "expected cap at child_rows=200.0, got {result}"
@@ -5098,11 +5610,17 @@ mod sort_partition_limit_tests {
     /// The output is still bounded by child_rows.
     #[test]
     fn sort_partition_limit_fallback_default_ndv_when_no_stats() {
-        let partition_expr = col_ref_with_id(99, "unknown_col");
+        let mut scalars = ScalarArena::new();
+        let partition_expr = intern_col_ref(&mut scalars, 99, "unknown_col");
         // No stats → get_expr_ndv returns 10.0 (DEFAULT_EXPR_NDV).
         // ndv=10 * k=5 = 50, child_rows=1000 → 50.
-        let result =
-            sort_partition_limit_output_rows(1000.0, &[partition_expr], &HashMap::new(), 5);
+        let result = sort_partition_limit_output_rows_scalar(
+            &scalars,
+            1000.0,
+            &[partition_expr],
+            &HashMap::new(),
+            5,
+        );
         assert!(
             (result - 50.0).abs() < 1e-9,
             "expected 50.0 with default NDV, got {result}"

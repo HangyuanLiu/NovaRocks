@@ -54,11 +54,10 @@ pub(crate) fn run_imv_rewrite(input: ImvRewriteInput) -> Result<ImvRewriteOutcom
         ctx_rw.set_deadline(deadline);
     }
 
-    // Bridge 1: convert the incoming LogicalPlanNode to OptExpr so the
-    // rewrite pipeline (which now operates on OptExpr) can process it.
-    // The ScalarArena is shared via the RewriteContext so that the IMV rules
-    // can perform round-trip conversions (OptExpr ↔ LogicalPlanNode) using the
-    // same arena throughout the pipeline run.
+    // Boundary materialization for ImvRewriteInput: engine-side refresh code
+    // hands this entrypoint a LogicalPlanNode, while the optimizer rewrite
+    // pipeline operates on OptExpr. This is not a production rewrite
+    // round-trip inside the optimizer.
     let scalars = std::rc::Rc::new(std::cell::RefCell::new(ScalarArena::new()));
     let opt_in = try_logical_plan_to_opt_expr(&plan, &mut scalars.borrow_mut())?;
     ctx_rw.set_scalar_arena(std::rc::Rc::clone(&scalars));
@@ -66,8 +65,9 @@ pub(crate) fn run_imv_rewrite(input: ImvRewriteInput) -> Result<ImvRewriteOutcom
     let pipeline = build_imv_pipeline();
     let opt_out = pipeline.rewrite(opt_in, &mut ctx_rw)?;
 
-    // Bridge 2: convert the rewritten OptExpr back to LogicalPlanNode so
-    // the callers (engine/mod.rs, iceberg_refresh.rs) are unaffected.
+    // Boundary materialization for ImvRewriteOutcome: callers outside the
+    // optimizer still consume LogicalPlanNode. This is the optimizer-to-engine
+    // exit, not an internal optimizer rewrite round-trip.
     let plan_out = opt_expr_to_logical_plan(opt_out, &scalars.borrow());
 
     let ext = ctx_rw
@@ -114,9 +114,8 @@ mod tests {
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::*;
     use crate::sql::planner::plan::{
-        AggregateCall, LogicalAggregateNode, LogicalAggregateStateMergeNode, LogicalFilterNode,
-        LogicalJoinNode, LogicalPlanNode, LogicalProjectNode, LogicalScanNode, LogicalUnionNode,
-        LogicalValuesNode, PlanNodeKind,
+        AggregateCall, LogicalAggregateNode, LogicalFilterNode, LogicalJoinNode, LogicalPlanNode,
+        LogicalProjectNode, LogicalScanNode, LogicalUnionNode, LogicalValuesNode, PlanNodeKind,
     };
     use arrow::datatypes::DataType;
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};

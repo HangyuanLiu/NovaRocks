@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use crate::sql::analysis::{ExprKind, TypedExpr};
+use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::{LogicalAggregateOp, LogicalJoinOp, Operator};
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, materialize};
@@ -165,8 +166,8 @@ fn split_at_join(
     }
 
     // Step 2: per-side column visibility.
-    let left_qcols = collect_qualified_output_names(left, arena);
-    let right_qcols = collect_qualified_output_names(right, arena);
+    let left_qcols = collect_qualified_output_names(left);
+    let right_qcols = collect_qualified_output_names(right);
 
     let side = if ctx
         .required_column_refs
@@ -209,7 +210,7 @@ fn split_at_join(
 
     // Step 5: partial group-by = original group-by cols on this side
     //         + side-bound equi-keys.
-    let mut partial_groupby: Vec<ScalarId> = ctx
+    let partial_groupby: Vec<ScalarId> = ctx
         .original_groupby
         .iter()
         .filter(|gb_id| {
@@ -228,36 +229,19 @@ fn split_at_join(
         .copied()
         .collect();
 
+    let mut partial_extra_groupby: Vec<TypedExpr> = Vec::new();
     for (left_key, right_key) in &equi_keys {
         let candidate_expr = side_bound_equi_key(left_key, right_key, side_qcols)?;
-        // Check if it's already in partial_groupby by column name.
-        let candidate_name = column_ref_name(candidate_expr);
+        // Check if it's already in partial_groupby by ColumnId, falling back
+        // to qualified identity only for synthetic/unset test expressions.
         let already = partial_groupby.iter().any(|gb_id| {
             let gb = materialize(arena, *gb_id);
-            match &gb.kind {
-                ExprKind::ColumnRef { column, .. } => Some(column.as_str()) == candidate_name,
-                _ => false,
-            }
-        });
+            same_column_ref_identity(&gb, candidate_expr)
+        }) || partial_extra_groupby
+            .iter()
+            .any(|gb| same_column_ref_identity(gb, candidate_expr));
         if !already {
-            // Intern the candidate TypedExpr to get a ScalarId.
-            // We need to build the intern via the arena. But here we only
-            // have &ScalarArena (immutable). In v1, the equi-key candidate
-            // is always a ColumnRef that already exists in the arena (it
-            // came from materializing the join condition). We can search for
-            // an existing ScalarId for this ColumnRef.
-            //
-            // Simplification: scan ctx.original_groupby and equi-key
-            // args already interned — find one matching the candidate.
-            // If not found, skip (conservative: don't add unknown keys).
-            if let Some(id) = find_scalar_id_for_column_ref(
-                candidate_expr,
-                &ctx.original_groupby,
-                &equi_keys,
-                arena,
-            ) {
-                partial_groupby.push(id);
-            }
+            partial_extra_groupby.push(candidate_expr.clone());
         }
     }
 
@@ -265,50 +249,9 @@ fn split_at_join(
         side,
         target_subtree: side_subtree.clone(),
         partial_groupby,
+        partial_extra_groupby,
         partial_aggregates: ctx.original_aggregates,
     })
-}
-
-/// Find a ScalarId already in the arena that matches the given ColumnRef TypedExpr.
-/// Searches through candidate ScalarId pools (group_by + equi-key args).
-fn find_scalar_id_for_column_ref(
-    target: &TypedExpr,
-    group_by: &[ScalarId],
-    equi_keys: &[(TypedExpr, TypedExpr)],
-    arena: &ScalarArena,
-) -> Option<ScalarId> {
-    let (target_qualifier, target_column, target_id) = match &target.kind {
-        ExprKind::ColumnRef {
-            qualifier,
-            column,
-            column_id,
-        } => (qualifier, column, column_id),
-        _ => return None,
-    };
-
-    // Search group_by first.
-    for id in group_by {
-        let expr = materialize(arena, *id);
-        if let ExprKind::ColumnRef {
-            qualifier,
-            column,
-            column_id,
-        } = &expr.kind
-        {
-            if qualifier == target_qualifier && column == target_column && column_id == target_id {
-                return Some(*id);
-            }
-        }
-    }
-
-    // Search equi-key args (they were materialized from the join condition).
-    // We need to find their ScalarIds in the join condition arena slot.
-    // Since we can't recover ScalarIds from materialized TypedExprs without
-    // the arena's reverse map, we use the join condition's ScalarId indirectly.
-    // For the equi_keys we have TypedExprs. Use intern_typed on a mut arena —
-    // but we only have &arena here. Fall back to group_by match only.
-    let _ = (equi_keys, target_column, target_qualifier, target_id);
-    None
 }
 
 fn side_bound_equi_key<'a>(
@@ -340,6 +283,30 @@ fn column_ref_qualified(expr: &TypedExpr) -> Option<(Option<String>, String)> {
     }
 }
 
+fn same_column_ref_identity(a: &TypedExpr, b: &TypedExpr) -> bool {
+    match (&a.kind, &b.kind) {
+        (
+            ExprKind::ColumnRef {
+                column_id: a_id,
+                qualifier: a_qualifier,
+                column: a_column,
+            },
+            ExprKind::ColumnRef {
+                column_id: b_id,
+                qualifier: b_qualifier,
+                column: b_column,
+            },
+        ) => {
+            if *a_id != ColumnId::UNSET && *b_id != ColumnId::UNSET {
+                a_id == b_id
+            } else {
+                a_qualifier == b_qualifier && a_column == b_column
+            }
+        }
+        _ => false,
+    }
+}
+
 fn column_ref_belongs_to_side(
     column_ref: &ColumnRefIdentity,
     side_qcols: &[ColumnRefIdentity],
@@ -354,10 +321,7 @@ fn column_ref_belongs_to_side(
 /// Qualified output column identities `(qualifier, name)` for a plan subtree.
 /// Scans contribute their alias (or table name) as the qualifier so equi-join
 /// keys that share a bare name across sides can be told apart.
-fn collect_qualified_output_names(
-    plan: &OptExpr,
-    arena: &ScalarArena,
-) -> Vec<(Option<String>, String)> {
+fn collect_qualified_output_names(plan: &OptExpr) -> Vec<(Option<String>, String)> {
     match &plan.op {
         Operator::LogicalScan(s) => {
             // Each column is acceptable unqualified, by alias, and by table
@@ -376,15 +340,15 @@ fn collect_qualified_output_names(
             }
             out
         }
-        Operator::LogicalFilter(_) => collect_qualified_output_names(plan.unary_input(), arena),
+        Operator::LogicalFilter(_) => collect_qualified_output_names(plan.unary_input()),
         Operator::LogicalProject(p) => p
             .items
             .iter()
             .map(|i| (None, i.output_name.clone()))
             .collect(),
         Operator::LogicalJoin(_) => {
-            let mut l = collect_qualified_output_names(plan.left(), arena);
-            l.extend(collect_qualified_output_names(plan.right(), arena));
+            let mut l = collect_qualified_output_names(plan.left());
+            l.extend(collect_qualified_output_names(plan.right()));
             l
         }
         Operator::LogicalAggregate(a) => a
@@ -393,14 +357,6 @@ fn collect_qualified_output_names(
             .map(|c| (None, c.name.clone()))
             .collect(),
         _ => Vec::new(),
-    }
-}
-
-#[allow(dead_code)]
-fn column_ref_name(expr: &TypedExpr) -> Option<&str> {
-    match &expr.kind {
-        ExprKind::ColumnRef { column, .. } => Some(column),
-        _ => None,
     }
 }
 
@@ -452,7 +408,6 @@ mod tests {
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
-    use crate::sql::optimizer::scalar_bridge;
     use arrow::datatypes::DataType;
 
     fn make_arena() -> ScalarArena {
@@ -905,6 +860,67 @@ mod tests {
         let plan = collect_test_push_plan(&agg, &arena).expect("should push to left");
         assert_eq!(plan.side, super::super::context::Side::Left);
         assert!(matches!(&plan.target_subtree.op, Operator::LogicalScan(_)));
+    }
+
+    #[test]
+    fn adds_side_bound_join_key_to_extra_partial_groupby() {
+        let mut arena = make_arena();
+        let cs = scan_opt_with_alias(
+            Some("cs"),
+            &[
+                ("cs_call_center_sk", DataType::Int64),
+                ("cs_sold_date_sk", DataType::Int64),
+                ("cs_sales_price", DataType::Int64),
+            ],
+        );
+        let d = scan_opt_with_alias(Some("d"), &[("d_date_sk", DataType::Int64)]);
+
+        use crate::sql::analysis::BinOp;
+        let cond = crate::sql::analysis::TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(qualified_col_ref_typed(
+                    "cs",
+                    "cs_sold_date_sk",
+                    DataType::Int64,
+                )),
+                op: BinOp::Eq,
+                right: Box::new(qualified_col_ref_typed("d", "d_date_sk", DataType::Int64)),
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        };
+        let join = join_opt(JoinKind::Inner, Some(cond), cs, d, &mut arena);
+        let sum_arg = intern_typed(
+            &mut arena,
+            &qualified_col_ref_typed("cs", "cs_sales_price", DataType::Int64),
+        );
+        let agg = agg_opt(
+            join,
+            vec![qualified_col_ref_typed(
+                "cs",
+                "cs_call_center_sk",
+                DataType::Int64,
+            )],
+            vec![ScalarAggregateSpec {
+                name: "sum".into(),
+                args: vec![sum_arg],
+                distinct: false,
+                order_by: vec![],
+            }],
+            &mut arena,
+        );
+
+        let plan = collect_test_push_plan(&agg, &arena).expect("should push to catalog_sales");
+        assert_eq!(plan.side, super::super::context::Side::Left);
+        assert!(plan.partial_groupby.iter().any(|id| {
+            let expr = materialize(&arena, *id);
+            matches!(&expr.kind, ExprKind::ColumnRef { column, .. } if column == "cs_call_center_sk")
+        }));
+        assert!(plan.partial_extra_groupby.iter().any(|expr| {
+            matches!(&expr.kind, ExprKind::ColumnRef { column, column_id, .. }
+                if column == "cs_sold_date_sk"
+                    && *column_id == test_col_id(Some("cs"), "cs_sold_date_sk"))
+        }));
     }
 
     #[test]

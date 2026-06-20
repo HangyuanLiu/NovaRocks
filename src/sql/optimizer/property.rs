@@ -345,14 +345,6 @@ pub(crate) fn typed_expr_to_column_id(expr: &TypedExpr) -> Option<ColumnId> {
     }
 }
 
-pub(crate) fn typed_exprs_to_column_ids(exprs: &[TypedExpr]) -> Option<Vec<ColumnId>> {
-    let mut out = Vec::with_capacity(exprs.len());
-    for expr in exprs {
-        out.push(typed_expr_to_column_id(expr)?);
-    }
-    Some(out)
-}
-
 pub(crate) fn window_sort_items(
     partition_by: &[TypedExpr],
     order_by: &[SortItem],

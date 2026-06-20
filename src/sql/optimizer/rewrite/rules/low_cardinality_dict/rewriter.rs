@@ -63,92 +63,106 @@ use arrow::datatypes::DataType;
 
 use crate::sql::analysis::{BinOp, ExprKind, OutputColumn, TypedExpr};
 use crate::sql::column_id::ColumnId;
-use crate::sql::planner::plan::{
-    AggregateCall, DecodeMapping, LogicalAggregateNode, LogicalDecodeNode, LogicalJoinNode,
-    LogicalPlanNode, LogicalProjectNode, LogicalScanNode, LogicalSortNode, LogicalUnionNode,
-    PlanNodeKind, ScanDictionaryColumn,
+use crate::sql::optimizer::operator::{
+    DecodeOp, LogicalAggregateOp, LogicalJoinOp, Operator, ProjectOp, ScanOp, SortOp, TopNOp,
+    UnionOp,
 };
+use crate::sql::optimizer::opt_expr::OptExpr;
+use crate::sql::optimizer::scalar::{self, ScalarArena};
+use crate::sql::optimizer::scalar_bridge::{
+    intern_aggregate_calls, intern_exprs, intern_project_items, intern_sort_items,
+    materialize_aggregate_calls, materialize_exprs, materialize_project_items,
+    materialize_sort_keys,
+};
+use crate::sql::planner::plan::{AggregateCall, DecodeMapping, ScanDictionaryColumn};
 
 use super::context::{DictBinding, DictScope, DictionaryRewriteContext};
 use super::expr::{DICT_AGG_FUNCTIONS, dict_keys_compatible, rewrite_column_ref_with_scope};
 
 pub(crate) fn rewrite(
-    plan: LogicalPlanNode,
+    expr: OptExpr,
     ctx: &mut DictionaryRewriteContext,
-) -> Result<LogicalPlanNode, String> {
-    let (plan, _scope) = rewrite_node(plan, ctx)?;
-    Ok(plan)
+    arena: &mut ScalarArena,
+) -> Result<OptExpr, String> {
+    let (expr, _scope) = rewrite_node(expr, ctx, arena)?;
+    Ok(expr)
 }
 
 fn rewrite_node(
-    plan: LogicalPlanNode,
+    expr: OptExpr,
     ctx: &mut DictionaryRewriteContext,
-) -> Result<(LogicalPlanNode, DictScope), String> {
-    let LogicalPlanNode {
-        kind,
+    arena: &mut ScalarArena,
+) -> Result<(OptExpr, DictScope), String> {
+    let OptExpr {
+        op,
         mut children,
         required_output_columns,
-    } = plan;
-    match kind {
-        PlanNodeKind::Scan(mut scan) => {
+    } = expr;
+    match op {
+        Operator::LogicalScan(mut scan) => {
             let scope = rewrite_scan(&mut scan, ctx);
             Ok((
-                LogicalPlanNode::new(
-                    PlanNodeKind::Scan(scan),
+                opt_expr(
+                    Operator::LogicalScan(scan),
                     children,
                     required_output_columns,
                 ),
                 scope,
             ))
         }
-        PlanNodeKind::Filter(node) => {
+        Operator::LogicalFilter(node) => {
             let input = take_unary_child(&mut children);
-            let (input, scope) = rewrite_node(input, ctx)?;
+            let (input, scope) = rewrite_node(input, ctx, arena)?;
             Ok((
-                LogicalPlanNode::new(
-                    PlanNodeKind::Filter(node),
+                opt_expr(
+                    Operator::LogicalFilter(node),
                     vec![input],
                     required_output_columns,
                 ),
                 scope,
             ))
         }
-        PlanNodeKind::Project(node) => {
-            rewrite_project(node, children, required_output_columns, ctx)
+        Operator::LogicalProject(node) => {
+            rewrite_project(node, children, required_output_columns, ctx, arena)
         }
-        PlanNodeKind::Aggregate(node) => {
-            rewrite_aggregate(node, children, required_output_columns, ctx)
+        Operator::LogicalAggregate(node) => {
+            rewrite_aggregate(node, children, required_output_columns, ctx, arena)
         }
-        PlanNodeKind::Sort(node) => rewrite_sort(node, children, required_output_columns, ctx),
-        PlanNodeKind::Limit(node) => {
+        Operator::LogicalSort(node) => {
+            rewrite_sort(node, children, required_output_columns, ctx, arena)
+        }
+        Operator::LogicalTopN(node) => {
+            rewrite_topn(node, children, required_output_columns, ctx, arena)
+        }
+        Operator::LogicalLimit(node) => {
             let input = take_unary_child(&mut children);
-            let (input, scope) = rewrite_node(input, ctx)?;
+            let (input, scope) = rewrite_node(input, ctx, arena)?;
             Ok((
-                LogicalPlanNode::new(
-                    PlanNodeKind::Limit(node),
+                opt_expr(
+                    Operator::LogicalLimit(node),
                     vec![input],
                     required_output_columns,
                 ),
                 scope,
             ))
         }
-        PlanNodeKind::Join(node) => {
-            rewrite_join(node, children, required_output_columns, ctx)
+        Operator::LogicalJoin(node) => {
+            rewrite_join(node, children, required_output_columns, ctx, arena)
         }
-        PlanNodeKind::Union(node) => {
-            rewrite_union(node, children, required_output_columns, ctx)
+        Operator::LogicalUnion(node) => {
+            rewrite_union(node, children, required_output_columns, ctx, arena)
         }
         // UNION DISTINCT / INTERSECT / EXCEPT semantics require hashing
         // on the user-facing string value — dict ids from different
         // snapshots cannot be compared directly. Always decode here.
-        PlanNodeKind::Intersect(_)
-        | PlanNodeKind::Except(_)
-        | PlanNodeKind::Window(_)
-        | PlanNodeKind::TableFunction(_)
-        | PlanNodeKind::Repeat(_)
-        | PlanNodeKind::AggregateStateMerge(_)
-        | PlanNodeKind::Apply(_)
-        | PlanNodeKind::AssertOneRow(_)
+        Operator::LogicalIntersect(_)
+        | Operator::LogicalExcept(_)
+        | Operator::LogicalWindow(_)
+        | Operator::LogicalTableFunction(_)
+        | Operator::LogicalRepeat(_)
+        | Operator::LogicalAggregateStateMerge(_)
+        | Operator::LogicalApply(_)
+        | Operator::LogicalAssertOneRow(_)
         // TODO(post-Task-9): multi-consumer CTEs with matching dict
         // snapshots across every consumer could keep the dict column
         // on the producer output. Doing so requires a fix-up pass over
@@ -160,52 +174,212 @@ fn rewrite_node(
         // already inlined before this rule runs, so the observable
         // surface here is narrow. Deferred until a Task 9+ query case
         // demands it.
-        | PlanNodeKind::CTEAnchor(_)
-        | PlanNodeKind::CTEProduce(_) => decode_boundary(
-            LogicalPlanNode::new(kind, children, required_output_columns),
-            ctx,
-        ),
+        | Operator::LogicalCTEAnchor(_)
+        | Operator::LogicalCTEProduce(_) => {
+            decode_boundary(opt_expr(op, children, required_output_columns), ctx, arena)
+        }
         // Leaves that produce no dict columns of their own.
-        PlanNodeKind::CTEConsume(_)
-        | PlanNodeKind::Values(_)
-        | PlanNodeKind::GenerateSeries(_) => Ok((
-            LogicalPlanNode::new(kind, children, required_output_columns),
+        Operator::LogicalCTEConsume(_)
+        | Operator::LogicalValues(_)
+        | Operator::LogicalGenerateSeries(_) => Ok((
+            opt_expr(op, children, required_output_columns),
             DictScope::new(),
         )),
         // Decode is the rewrite's own output; do not recurse into it
         // again. The decoded output is all strings — no dict scope.
-        PlanNodeKind::Decode(_) => Ok((
-            LogicalPlanNode::new(kind, children, required_output_columns),
+        Operator::LogicalDecode(_) => Ok((
+            opt_expr(op, children, required_output_columns),
             DictScope::new(),
         )),
 
-        PlanNodeKind::ImvDelta(_) | PlanNodeKind::ImvVersion(_) => {
+        Operator::LogicalImvDelta(_) | Operator::LogicalImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
         }
-        PlanNodeKind::TopN(_)
-        | PlanNodeKind::Exchange(_)
-        | PlanNodeKind::HashAggregate(_)
-        | PlanNodeKind::HashJoin(_)
-        | PlanNodeKind::NestLoopJoin(_)
-        | PlanNodeKind::SetOp(_) => {
-            panic!("distributed plan node leaked into logical dictionary rewrite");
-        }
+        other => panic!(
+            "low-cardinality dictionary rewrite received physical operator {:?}",
+            other
+        ),
     }
 }
 
-fn take_unary_child(children: &mut Vec<LogicalPlanNode>) -> LogicalPlanNode {
+fn opt_expr(
+    op: Operator,
+    children: Vec<OptExpr>,
+    required_output_columns: Option<std::collections::HashSet<ColumnId>>,
+) -> OptExpr {
+    OptExpr {
+        op,
+        children,
+        required_output_columns,
+    }
+}
+
+fn take_unary_child(children: &mut Vec<OptExpr>) -> OptExpr {
     assert_eq!(children.len(), 1, "expected one logical plan child");
     children.remove(0)
 }
 
-fn take_binary_children(children: &mut Vec<LogicalPlanNode>) -> (LogicalPlanNode, LogicalPlanNode) {
+fn take_binary_children(children: &mut Vec<OptExpr>) -> (OptExpr, OptExpr) {
     assert_eq!(children.len(), 2, "expected two logical plan children");
     let right = children.remove(1);
     let left = children.remove(0);
     (left, right)
 }
 
-fn rewrite_scan(scan: &mut LogicalScanNode, ctx: &mut DictionaryRewriteContext) -> DictScope {
+// Dict-slot expressions intentionally reuse the source ColumnId. ScalarArena
+// stores display metadata per ColumnId, so promote the display only after the
+// source expressions have been materialized and retargeted to the dict name.
+fn remember_dict_column_display(arena: &mut ScalarArena, binding: &DictBinding) {
+    arena.remember_project_output_display(
+        binding.source_column_id,
+        None,
+        binding.dict_column.clone(),
+    );
+}
+
+fn remember_scope_dict_ref_displays(arena: &mut ScalarArena, expr: &TypedExpr, scope: &DictScope) {
+    remember_dict_ref_displays_by(arena, expr, &|column_id, column| {
+        resolve_scope_dict_ref(scope, column_id, column)
+    });
+}
+
+fn remember_join_dict_ref_displays(
+    arena: &mut ScalarArena,
+    expr: &TypedExpr,
+    left_scope: &DictScope,
+    right_scope: &DictScope,
+) {
+    remember_dict_ref_displays_by(arena, expr, &|column_id, column| {
+        resolve_scope_dict_ref(left_scope, column_id, column)
+            .or_else(|| resolve_scope_dict_ref(right_scope, column_id, column))
+    });
+}
+
+fn resolve_scope_dict_ref(
+    scope: &DictScope,
+    column_id: ColumnId,
+    column: &str,
+) -> Option<DictBinding> {
+    if column_id != ColumnId::UNSET
+        && let Some((_, binding)) = scope.iter().find(|(_, binding)| {
+            binding.source_column_id == column_id
+                && column.eq_ignore_ascii_case(&binding.dict_column)
+        })
+    {
+        return Some(binding.clone());
+    }
+    scope.resolve_either(column).and_then(|(_, binding)| {
+        if column.eq_ignore_ascii_case(&binding.dict_column) {
+            Some(binding.clone())
+        } else {
+            None
+        }
+    })
+}
+
+fn rewrite_column_ref_to_binding(expr: &TypedExpr, binding: &DictBinding) -> TypedExpr {
+    let qualifier = match &expr.kind {
+        ExprKind::ColumnRef { qualifier, .. } => qualifier.clone(),
+        _ => None,
+    };
+    TypedExpr {
+        kind: ExprKind::ColumnRef {
+            column_id: binding.source_column_id,
+            qualifier,
+            column: binding.dict_column.clone(),
+        },
+        data_type: DataType::Int32,
+        nullable: expr.nullable,
+    }
+}
+
+fn remember_dict_ref_displays_by(
+    arena: &mut ScalarArena,
+    expr: &TypedExpr,
+    resolve: &impl Fn(ColumnId, &str) -> Option<DictBinding>,
+) {
+    match &expr.kind {
+        ExprKind::ColumnRef {
+            column_id, column, ..
+        } => {
+            if let Some(binding) = resolve(*column_id, column) {
+                remember_dict_column_display(arena, &binding);
+            }
+        }
+        ExprKind::Literal(_)
+        | ExprKind::LambdaParamRef { .. }
+        | ExprKind::SubqueryPlaceholder { .. } => {}
+        ExprKind::BinaryOp { left, right, .. } => {
+            remember_dict_ref_displays_by(arena, left, resolve);
+            remember_dict_ref_displays_by(arena, right, resolve);
+        }
+        ExprKind::UnaryOp { expr, .. }
+        | ExprKind::LambdaFunction { body: expr, .. }
+        | ExprKind::Cast { expr, .. }
+        | ExprKind::IsNull { expr, .. }
+        | ExprKind::IsTruthValue { expr, .. }
+        | ExprKind::Nested(expr)
+        | ExprKind::Lambda { body: expr, .. } => {
+            remember_dict_ref_displays_by(arena, expr, resolve);
+        }
+        ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
+            for arg in args {
+                remember_dict_ref_displays_by(arena, arg, resolve);
+            }
+        }
+        ExprKind::InList { expr, list, .. } => {
+            remember_dict_ref_displays_by(arena, expr, resolve);
+            for item in list {
+                remember_dict_ref_displays_by(arena, item, resolve);
+            }
+        }
+        ExprKind::Between {
+            expr, low, high, ..
+        } => {
+            remember_dict_ref_displays_by(arena, expr, resolve);
+            remember_dict_ref_displays_by(arena, low, resolve);
+            remember_dict_ref_displays_by(arena, high, resolve);
+        }
+        ExprKind::Like { expr, pattern, .. } => {
+            remember_dict_ref_displays_by(arena, expr, resolve);
+            remember_dict_ref_displays_by(arena, pattern, resolve);
+        }
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(operand) = operand.as_deref() {
+                remember_dict_ref_displays_by(arena, operand, resolve);
+            }
+            for (when, then) in when_then {
+                remember_dict_ref_displays_by(arena, when, resolve);
+                remember_dict_ref_displays_by(arena, then, resolve);
+            }
+            if let Some(else_expr) = else_expr.as_deref() {
+                remember_dict_ref_displays_by(arena, else_expr, resolve);
+            }
+        }
+        ExprKind::WindowCall {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for arg in args {
+                remember_dict_ref_displays_by(arena, arg, resolve);
+            }
+            for expr in partition_by {
+                remember_dict_ref_displays_by(arena, expr, resolve);
+            }
+            for item in order_by {
+                remember_dict_ref_displays_by(arena, &item.expr, resolve);
+            }
+        }
+    }
+}
+
+fn rewrite_scan(scan: &mut ScanOp, ctx: &mut DictionaryRewriteContext) -> DictScope {
     let mut scope = DictScope::new();
     // Idempotency guard: an already-populated `dict_columns` means a
     // previous application of this rule already rewrote the scan.
@@ -298,13 +472,14 @@ fn rewrite_scan(scan: &mut LogicalScanNode, ctx: &mut DictionaryRewriteContext) 
 }
 
 fn rewrite_project(
-    node: LogicalProjectNode,
-    mut children: Vec<LogicalPlanNode>,
+    node: ProjectOp,
+    mut children: Vec<OptExpr>,
     required_output_columns: Option<std::collections::HashSet<ColumnId>>,
     ctx: &mut DictionaryRewriteContext,
-) -> Result<(LogicalPlanNode, DictScope), String> {
+    arena: &mut ScalarArena,
+) -> Result<(OptExpr, DictScope), String> {
     let input = take_unary_child(&mut children);
-    let (input, input_scope) = rewrite_node(input, ctx)?;
+    let (input, input_scope) = rewrite_node(input, ctx, arena)?;
     // Task 7 scope: do not rewrite arbitrary project item expressions
     // (derived dict expressions like `upper(s)` are TODO(task-8)). But
     // plain ColumnRef items MUST be retargeted to the dict slot now —
@@ -318,7 +493,7 @@ fn rewrite_project(
     // can still find the dict column to decode.
     let mut output_scope = DictScope::new();
     let mut items: Vec<crate::sql::analysis::ProjectItem> = Vec::with_capacity(node.items.len());
-    for item in node.items.into_iter() {
+    for item in materialize_project_items(arena, &node.items).into_iter() {
         if let ExprKind::ColumnRef { column, .. } = &item.expr.kind
             && let Some(binding) = input_scope.get(column)
         {
@@ -366,7 +541,7 @@ fn rewrite_project(
     // columns so the inserted pass-through item matches the scan's
     // declared shape. Defaults to `true` if not found (no production
     // path hits the fallback today, but it stays defensive).
-    let input_cols = plan_output_columns(&input);
+    let input_cols = plan_output_columns(&input, arena);
     for (_source, binding) in input_scope.iter() {
         let dict_name = binding.dict_column.clone();
         if existing_names.contains(&dict_name.to_ascii_lowercase()) {
@@ -393,9 +568,9 @@ fn rewrite_project(
         });
     }
     Ok((
-        LogicalPlanNode::new(
-            PlanNodeKind::Project(LogicalProjectNode {
-                items,
+        opt_expr(
+            Operator::LogicalProject(ProjectOp {
+                items: intern_project_items(arena, &items),
                 output_qualifier: node.output_qualifier,
             }),
             vec![input],
@@ -406,13 +581,21 @@ fn rewrite_project(
 }
 
 fn rewrite_aggregate(
-    node: LogicalAggregateNode,
-    mut children: Vec<LogicalPlanNode>,
+    node: LogicalAggregateOp,
+    mut children: Vec<OptExpr>,
     required_output_columns: Option<std::collections::HashSet<ColumnId>>,
     ctx: &mut DictionaryRewriteContext,
-) -> Result<(LogicalPlanNode, DictScope), String> {
+    arena: &mut ScalarArena,
+) -> Result<(OptExpr, DictScope), String> {
     let input = take_unary_child(&mut children);
-    let (input, input_scope) = rewrite_node(input, ctx)?;
+    let (input, input_scope) = rewrite_node(input, ctx, arena)?;
+    let original_group_by = materialize_exprs(arena, &node.group_by);
+    let original_aggregates = materialize_aggregate_calls(
+        arena,
+        &node.aggregates,
+        node.group_by.len(),
+        &node.output_columns,
+    );
     let mut group_by = Vec::with_capacity(node.group_by.len());
     let mut decoded_group_keys: Vec<(
         String,
@@ -420,19 +603,22 @@ fn rewrite_aggregate(
         ColumnId,
         std::sync::Arc<crate::engine::dictionary::model::DictionarySnapshot>,
     )> = Vec::new();
-    for expr in &node.group_by {
+    for (index, expr) in original_group_by.iter().enumerate() {
         if let crate::sql::analysis::ExprKind::ColumnRef { column, .. } = &expr.kind
-            && let Some(binding) = input_scope.get(column)
+            && let Some((source_name, binding)) = input_scope.resolve_either(column)
         {
-            group_by.push(rewrite_column_ref_with_scope(expr, &input_scope));
-            // Skip the decode-wrap bookkeeping when this group key is
-            // ALREADY pointing at the dict slot (a previous iteration of
-            // this rule under the pipeline's fixed-point loop already
-            // rewrote it). The scope's dict-name binding lets the
-            // expression rewriter resolve the column either way, but
-            // here we must distinguish so we don't double-wrap with
-            // Decode every iteration.
-            if column.eq_ignore_ascii_case(&binding.dict_column) {
+            group_by.push(rewrite_column_ref_to_binding(expr, binding));
+            // Skip the decode-wrap bookkeeping only when the aggregate
+            // output is already the dict slot. With realistic shared
+            // ColumnIds, ScalarArena display metadata can materialize a
+            // pre-rewrite group key as `__nr_dict_*` in the same pass;
+            // the aggregate output column is still the user-facing
+            // source name in that case, so we must still add Decode.
+            let output_already_dict = node
+                .output_columns
+                .get(index)
+                .is_some_and(|out| out.name.eq_ignore_ascii_case(&binding.dict_column));
+            if output_already_dict {
                 continue;
             }
             // The aggregate node was emitting the original string
@@ -440,7 +626,7 @@ fn rewrite_aggregate(
             // through a Decode boundary above the aggregate.
             decoded_group_keys.push((
                 binding.dict_column.clone(),
-                column.clone(),
+                source_name.to_string(),
                 binding.source_column_id,
                 binding.snapshot.clone(),
             ));
@@ -458,7 +644,7 @@ fn rewrite_aggregate(
         .output_columns
         .iter()
         .map(|out| {
-            if let Some(binding) = input_scope.get(&out.name) {
+            if let Some((_, binding)) = input_scope.resolve_either(&out.name) {
                 if out.name.eq_ignore_ascii_case(&binding.dict_column) {
                     return out.clone();
                 }
@@ -482,18 +668,30 @@ fn rewrite_aggregate(
     // extra Decode is needed for these argument paths. Group-by keys
     // are still handled above and are responsible for the post-aggregate
     // Decode boundary that restores the user-facing string name.
-    let aggregates = node
-        .aggregates
+    let aggregates = original_aggregates
         .into_iter()
         .map(|agg| rewrite_aggregate_call(agg, &input_scope, ctx))
         .collect::<Vec<_>>();
+    for expr in &group_by {
+        remember_scope_dict_ref_displays(arena, expr, &input_scope);
+    }
+    for agg in &aggregates {
+        for arg in &agg.args {
+            remember_scope_dict_ref_displays(arena, arg, &input_scope);
+        }
+        for item in &agg.order_by {
+            remember_scope_dict_ref_displays(arena, &item.expr, &input_scope);
+        }
+    }
 
-    let aggregate = LogicalPlanNode::new(
-        PlanNodeKind::Aggregate(LogicalAggregateNode {
-            group_by,
-            aggregates,
+    let aggregate = opt_expr(
+        Operator::LogicalAggregate(LogicalAggregateOp {
+            stage: node.stage,
+            group_by: intern_exprs(arena, &group_by),
+            aggregates: intern_aggregate_calls(arena, &aggregates),
             output_columns: output_columns.clone(),
-            already_pushed: node.already_pushed,
+            is_merge: node.is_merge,
+            is_split: node.is_split,
         }),
         vec![input],
         required_output_columns,
@@ -538,8 +736,8 @@ fn rewrite_aggregate(
     // Decode is a terminator for dict bindings — its output is all
     // strings, so the returned scope is empty.
     Ok((
-        LogicalPlanNode::new(
-            PlanNodeKind::Decode(LogicalDecodeNode {
+        opt_expr(
+            Operator::LogicalDecode(DecodeOp {
                 mappings,
                 output_columns,
             }),
@@ -551,53 +749,118 @@ fn rewrite_aggregate(
 }
 
 fn rewrite_sort(
-    node: LogicalSortNode,
-    mut children: Vec<LogicalPlanNode>,
+    node: SortOp,
+    mut children: Vec<OptExpr>,
     required_output_columns: Option<std::collections::HashSet<ColumnId>>,
     ctx: &mut DictionaryRewriteContext,
-) -> Result<(LogicalPlanNode, DictScope), String> {
+    arena: &mut ScalarArena,
+) -> Result<(OptExpr, DictScope), String> {
     let input = take_unary_child(&mut children);
-    let (input, input_scope) = rewrite_node(input, ctx)?;
-    // Determine whether all sort keys with dict snapshots are
-    // order-preserving. Otherwise insert a Decode before the sort so
-    // the sort still operates on strings.
-    let mut needs_decode = false;
-    let mut sort_items = Vec::with_capacity(node.items.len());
-    for item in &node.items {
+    let (input, input_scope) = rewrite_node(input, ctx, arena)?;
+    let original_items = materialize_sort_keys(arena, &node.items);
+    let needs_decode = original_items.iter().any(|item| {
         if let crate::sql::analysis::ExprKind::ColumnRef { column, .. } = &item.expr.kind
             && let Some(binding) = input_scope.get(column)
         {
-            if binding.snapshot.order_preserving {
+            !binding.snapshot.order_preserving
+        } else {
+            false
+        }
+    });
+    let (items, input, output_scope) = if needs_decode {
+        // Decode below the sort: the sort itself now sees strings and
+        // surfaces strings; no dict columns leak upward.
+        (
+            original_items,
+            wrap_with_decode(input, &input_scope, ctx, arena),
+            DictScope::new(),
+        )
+    } else {
+        let mut items = Vec::with_capacity(node.items.len());
+        for item in &original_items {
+            if let crate::sql::analysis::ExprKind::ColumnRef { column, .. } = &item.expr.kind
+                && let Some(binding) = input_scope.get(column)
+            {
                 let already_dict = column.eq_ignore_ascii_case(&binding.dict_column);
                 let mut rewritten = item.clone();
                 rewritten.expr = rewrite_column_ref_with_scope(&item.expr, &input_scope);
-                sort_items.push(rewritten);
+                items.push(rewritten);
                 if !already_dict {
                     ctx.mark_changed();
                 }
                 continue;
-            } else {
-                needs_decode = true;
             }
+            items.push(item.clone());
         }
-        sort_items.push(item.clone());
-    }
-    let (input, output_scope) = if needs_decode {
-        // Decode below the sort: the sort itself now sees strings and
-        // surfaces strings; no dict columns leak upward.
-        (wrap_with_decode(input, &input_scope, ctx), DictScope::new())
-    } else {
-        (input, input_scope)
+        (items, input, input_scope)
     };
     Ok((
-        LogicalPlanNode::new(
-            PlanNodeKind::Sort(LogicalSortNode {
-                items: sort_items,
-                analytic_partition_by: node.analytic_partition_by,
-                output_columns: vec![],
-                offset: None,
+        opt_expr(
+            Operator::LogicalSort(SortOp {
+                items: intern_sort_items(arena, &items),
+                analytic_partition_exprs: node.analytic_partition_exprs,
                 partition_limit: node.partition_limit,
                 topn_type: node.topn_type,
+            }),
+            vec![input],
+            required_output_columns,
+        ),
+        output_scope,
+    ))
+}
+
+fn rewrite_topn(
+    node: TopNOp,
+    mut children: Vec<OptExpr>,
+    required_output_columns: Option<std::collections::HashSet<ColumnId>>,
+    ctx: &mut DictionaryRewriteContext,
+    arena: &mut ScalarArena,
+) -> Result<(OptExpr, DictScope), String> {
+    let input = take_unary_child(&mut children);
+    let (input, input_scope) = rewrite_node(input, ctx, arena)?;
+    let original_items = materialize_sort_keys(arena, &node.items);
+    let needs_decode = original_items.iter().any(|item| {
+        if let crate::sql::analysis::ExprKind::ColumnRef { column, .. } = &item.expr.kind
+            && let Some(binding) = input_scope.get(column)
+        {
+            !binding.snapshot.order_preserving
+        } else {
+            false
+        }
+    });
+    let (items, input, output_scope) = if needs_decode {
+        (
+            original_items,
+            wrap_with_decode(input, &input_scope, ctx, arena),
+            DictScope::new(),
+        )
+    } else {
+        let mut items = Vec::with_capacity(node.items.len());
+        for item in &original_items {
+            if let crate::sql::analysis::ExprKind::ColumnRef { column, .. } = &item.expr.kind
+                && let Some(binding) = input_scope.get(column)
+            {
+                let already_dict = column.eq_ignore_ascii_case(&binding.dict_column);
+                let mut rewritten = item.clone();
+                rewritten.expr = rewrite_column_ref_with_scope(&item.expr, &input_scope);
+                items.push(rewritten);
+                if !already_dict {
+                    ctx.mark_changed();
+                }
+                continue;
+            }
+            items.push(item.clone());
+        }
+        (items, input, input_scope)
+    };
+    Ok((
+        opt_expr(
+            Operator::LogicalTopN(TopNOp {
+                items: intern_sort_items(arena, &items),
+                limit: node.limit,
+                offset: node.offset,
+                phase: node.phase,
+                is_split: node.is_split,
             }),
             vec![input],
             required_output_columns,
@@ -696,25 +959,26 @@ fn rewrite_aggregate_call(
 /// that cross unchanged are still surfaceable as dict ids by downstream
 /// boundaries via the returned scope.
 fn rewrite_join(
-    node: LogicalJoinNode,
-    mut children: Vec<LogicalPlanNode>,
+    node: LogicalJoinOp,
+    mut children: Vec<OptExpr>,
     required_output_columns: Option<std::collections::HashSet<ColumnId>>,
     ctx: &mut DictionaryRewriteContext,
-) -> Result<(LogicalPlanNode, DictScope), String> {
+    arena: &mut ScalarArena,
+) -> Result<(OptExpr, DictScope), String> {
     let (left, right) = take_binary_children(&mut children);
-    let (left, left_scope) = rewrite_node(left, ctx)?;
-    let (right, right_scope) = rewrite_node(right, ctx)?;
+    let (left, left_scope) = rewrite_node(left, ctx, arena)?;
+    let (right, right_scope) = rewrite_node(right, ctx, arena)?;
 
     // No condition → CROSS JOIN. There is no opportunity to compare on
     // dict ids; keep the conservative boundary by decoding both sides.
-    let Some(condition) = node.condition.as_ref() else {
-        let left = wrap_with_decode(left, &left_scope, ctx);
-        let right = wrap_with_decode(right, &right_scope, ctx);
+    let Some(condition_id) = node.condition else {
+        let left = wrap_with_decode(left, &left_scope, ctx, arena);
+        let right = wrap_with_decode(right, &right_scope, ctx, arena);
         return Ok((
-            LogicalPlanNode::new(
-                PlanNodeKind::Join(LogicalJoinNode {
+            opt_expr(
+                Operator::LogicalJoin(LogicalJoinOp {
                     join_type: node.join_type,
-                    condition: node.condition,
+                    condition: None,
                 }),
                 vec![left, right],
                 required_output_columns,
@@ -722,13 +986,14 @@ fn rewrite_join(
             DictScope::new(),
         ));
     };
+    let condition = scalar::materialize(arena, condition_id);
 
     // Collect the equality pairs that align two dict-compatible columns.
     // For each such pair we keep both sides' dict columns and rewrite the
     // ColumnRef nodes inside the condition. Pairs that don't align
     // (different snapshots, only one side has a dict binding, or non-
     // equality predicates) fall through to per-side Decode.
-    let aligned = aligned_dict_join_pairs(condition, &left_scope, &right_scope);
+    let aligned = aligned_dict_join_pairs(&condition, &left_scope, &right_scope);
 
     // Build the sets of output column names we are KEEPING dict-encoded
     // on each input side. Everything else gets decoded below the join.
@@ -760,8 +1025,8 @@ fn rewrite_join(
         }
     }
 
-    let left = wrap_with_decode_except(left, &left_scope, &keep_left, ctx);
-    let right = wrap_with_decode_except(right, &right_scope, &keep_right, ctx);
+    let left = wrap_with_decode_except(left, &left_scope, &keep_left, ctx, arena);
+    let right = wrap_with_decode_except(right, &right_scope, &keep_right, ctx, arena);
 
     // Rewrite the join condition: equality predicates that match an
     // aligned pair are rewritten so each side references its own dict
@@ -774,17 +1039,15 @@ fn rewrite_join(
     // a no-op. Only call `ctx.mark_changed()` when the condition's
     // ColumnRefs are not yet on the dict slot.
     let condition = if aligned.is_empty() {
-        Some(condition.clone())
+        Some(condition_id)
     } else {
-        if condition_references_source_names(condition, &left_scope, &right_scope) {
+        if condition_references_source_names(&condition, &left_scope, &right_scope) {
             ctx.mark_changed();
         }
-        Some(rewrite_join_condition_pairs(
-            condition,
-            &aligned,
-            &left_scope,
-            &right_scope,
-        ))
+        let rewritten =
+            rewrite_join_condition_pairs(&condition, &aligned, &left_scope, &right_scope);
+        remember_join_dict_ref_displays(arena, &rewritten, &left_scope, &right_scope);
+        Some(scalar::intern_typed(arena, &rewritten))
     };
 
     // Output scope: the equi-keys we kept stay dict-encoded and are
@@ -805,8 +1068,8 @@ fn rewrite_join(
     }
 
     Ok((
-        LogicalPlanNode::new(
-            PlanNodeKind::Join(LogicalJoinNode {
+        opt_expr(
+            Operator::LogicalJoin(LogicalJoinOp {
                 join_type: node.join_type,
                 condition,
             }),
@@ -1033,7 +1296,7 @@ fn rewrite_join_condition_pairs(
                             rhs_scope.get(predicate_right).expect("scope has binding");
                         let new_left = TypedExpr {
                             kind: ExprKind::ColumnRef {
-                                column_id: ColumnId::UNSET,
+                                column_id: lhs_binding.source_column_id,
                                 qualifier: match &left.kind {
                                     ExprKind::ColumnRef { qualifier, .. } => qualifier.clone(),
                                     _ => None,
@@ -1045,7 +1308,7 @@ fn rewrite_join_condition_pairs(
                         };
                         let new_right = TypedExpr {
                             kind: ExprKind::ColumnRef {
-                                column_id: ColumnId::UNSET,
+                                column_id: rhs_binding.source_column_id,
                                 qualifier: match &right.kind {
                                     ExprKind::ColumnRef { qualifier, .. } => qualifier.clone(),
                                     _ => None,
@@ -1077,13 +1340,14 @@ fn rewrite_join_condition_pairs(
 /// name is NOT in `keep`. The kept columns continue to flow upward as
 /// dict ids; everything else is decoded back to strings.
 fn wrap_with_decode_except(
-    plan: LogicalPlanNode,
+    plan: OptExpr,
     scope: &DictScope,
     keep: &std::collections::BTreeSet<String>,
     ctx: &mut DictionaryRewriteContext,
-) -> LogicalPlanNode {
+    arena: &ScalarArena,
+) -> OptExpr {
     let mut decoded_scope = DictScope::new();
-    for col in plan_output_columns(&plan) {
+    for col in plan_output_columns(&plan, arena) {
         let key = col.name.to_ascii_lowercase();
         // Bug B aftermath: the Scan's published output column is now
         // named after the dict column directly (e.g. `__nr_dict_t_s`),
@@ -1105,7 +1369,7 @@ fn wrap_with_decode_except(
     if decoded_scope.is_empty() {
         plan
     } else {
-        wrap_with_decode(plan, &decoded_scope, ctx)
+        wrap_with_decode(plan, &decoded_scope, ctx, arena)
     }
 }
 
@@ -1114,27 +1378,27 @@ fn wrap_with_decode_except(
 /// 2). UNION DISTINCT decodes (the distinct-on-string semantics make a
 /// dict-id union unsafe across snapshots).
 fn rewrite_union(
-    node: LogicalUnionNode,
-    mut children: Vec<LogicalPlanNode>,
+    node: UnionOp,
+    mut children: Vec<OptExpr>,
     required_output_columns: Option<std::collections::HashSet<ColumnId>>,
     ctx: &mut DictionaryRewriteContext,
-) -> Result<(LogicalPlanNode, DictScope), String> {
+    arena: &mut ScalarArena,
+) -> Result<(OptExpr, DictScope), String> {
     // Rewrite every input subtree first so we have per-input scopes.
-    let mut rewritten_inputs: Vec<(LogicalPlanNode, DictScope)> =
-        Vec::with_capacity(children.len());
+    let mut rewritten_inputs: Vec<(OptExpr, DictScope)> = Vec::with_capacity(children.len());
     for input in children.drain(..) {
-        rewritten_inputs.push(rewrite_node(input, ctx)?);
+        rewritten_inputs.push(rewrite_node(input, ctx, arena)?);
     }
 
     // UNION DISTINCT always decodes.
     if !node.all {
         let mut new_inputs = Vec::with_capacity(rewritten_inputs.len());
         for (plan, scope) in rewritten_inputs {
-            new_inputs.push(wrap_with_decode(plan, &scope, ctx));
+            new_inputs.push(wrap_with_decode(plan, &scope, ctx, arena));
         }
         return Ok((
-            LogicalPlanNode::new(
-                PlanNodeKind::Union(node),
+            opt_expr(
+                Operator::LogicalUnion(node),
                 new_inputs,
                 required_output_columns,
             ),
@@ -1153,14 +1417,14 @@ fn rewrite_union(
     // matched on a stable user-facing identifier.
     let mut preserved: std::collections::BTreeMap<String, DictBinding> = Default::default();
     if let Some((first_plan, first_scope)) = rewritten_inputs.first() {
-        for col in plan_output_columns(first_plan) {
+        for col in plan_output_columns(first_plan, arena) {
             if let Some((source_name, b)) = first_scope.resolve_either(&col.name) {
                 preserved.insert(source_name.to_ascii_lowercase(), b.clone());
             }
         }
     }
     for (plan, scope) in rewritten_inputs.iter().skip(1) {
-        let cols = plan_output_columns(plan);
+        let cols = plan_output_columns(plan, arena);
         preserved.retain(|name, kept| {
             let matching = cols.iter().find_map(|c| {
                 scope
@@ -1179,11 +1443,11 @@ fn rewrite_union(
         // At least one input lacks a matching snapshot → decode everywhere.
         let mut new_inputs = Vec::with_capacity(rewritten_inputs.len());
         for (plan, scope) in rewritten_inputs {
-            new_inputs.push(wrap_with_decode(plan, &scope, ctx));
+            new_inputs.push(wrap_with_decode(plan, &scope, ctx, arena));
         }
         return Ok((
-            LogicalPlanNode::new(
-                PlanNodeKind::Union(node),
+            opt_expr(
+                Operator::LogicalUnion(node),
                 new_inputs,
                 required_output_columns,
             ),
@@ -1195,7 +1459,7 @@ fn rewrite_union(
     let keep_set: std::collections::BTreeSet<String> = preserved.keys().cloned().collect();
     let mut new_inputs = Vec::with_capacity(rewritten_inputs.len());
     for (plan, scope) in rewritten_inputs {
-        new_inputs.push(wrap_with_decode_except(plan, &scope, &keep_set, ctx));
+        new_inputs.push(wrap_with_decode_except(plan, &scope, &keep_set, ctx, arena));
     }
     // Output scope: surface the preserved bindings upward.
     let mut out_scope = DictScope::new();
@@ -1206,8 +1470,8 @@ fn rewrite_union(
     // recursion-local effect, not a tree mutation. Avoid `mark_changed`
     // here so the pipeline's fixed-point loop terminates.
     Ok((
-        LogicalPlanNode::new(
-            PlanNodeKind::Union(node),
+        opt_expr(
+            Operator::LogicalUnion(node),
             new_inputs,
             required_output_columns,
         ),
@@ -1216,13 +1480,14 @@ fn rewrite_union(
 }
 
 fn decode_boundary(
-    plan: LogicalPlanNode,
+    plan: OptExpr,
     ctx: &mut DictionaryRewriteContext,
-) -> Result<(LogicalPlanNode, DictScope), String> {
+    arena: &mut ScalarArena,
+) -> Result<(OptExpr, DictScope), String> {
     // For nodes Task 7 does not refine, recurse into their children to
     // pick up scan-side dict columns, then wrap each child with a
     // Decode so the node itself never has to know about dict ids.
-    let rewritten = rewrite_children_decoded(plan, ctx)?;
+    let rewritten = rewrite_children_decoded(plan, ctx, arena)?;
     // After wrapping every child with Decode, the parent boundary's
     // own output is all strings — no scope leaks upward.
     Ok((rewritten, DictScope::new()))
@@ -1235,13 +1500,14 @@ fn decode_boundary(
 /// have their own dedicated `rewrite_join` / `rewrite_union` arms that
 /// can preserve dict columns under matching snapshots.
 fn rewrite_children_decoded(
-    mut plan: LogicalPlanNode,
+    mut plan: OptExpr,
     ctx: &mut DictionaryRewriteContext,
-) -> Result<LogicalPlanNode, String> {
+    arena: &mut ScalarArena,
+) -> Result<OptExpr, String> {
     let mut children = Vec::with_capacity(plan.children.len());
     for child in std::mem::take(&mut plan.children) {
-        let (rewritten, scope) = rewrite_node(child, ctx)?;
-        children.push(wrap_with_decode(rewritten, &scope, ctx));
+        let (rewritten, scope) = rewrite_node(child, ctx, arena)?;
+        children.push(wrap_with_decode(rewritten, &scope, ctx, arena));
     }
     plan.children = children;
     Ok(plan)
@@ -1251,15 +1517,16 @@ fn rewrite_children_decoded(
 /// parent operator only sees string columns. No-op when the scope is
 /// empty or none of the plan's output columns are dict-encoded.
 pub(crate) fn wrap_with_decode(
-    plan: LogicalPlanNode,
+    plan: OptExpr,
     scope: &DictScope,
     ctx: &mut DictionaryRewriteContext,
-) -> LogicalPlanNode {
+    arena: &ScalarArena,
+) -> OptExpr {
     if scope.is_empty() {
         return plan;
     }
     // Avoid double-decoding when the plan is already a Decode.
-    if matches!(&plan.kind, PlanNodeKind::Decode(_)) {
+    if matches!(&plan.op, Operator::LogicalDecode(_)) {
         return plan;
     }
     let mut mappings: Vec<DecodeMapping> = Vec::new();
@@ -1272,7 +1539,7 @@ pub(crate) fn wrap_with_decode(
     // name resolving to the same binding — emit only one DecodeMapping
     // and drop the duplicate output column.
     let mut seen_dict_columns: std::collections::BTreeSet<String> = Default::default();
-    for mut col in plan_output_columns(&plan) {
+    for mut col in plan_output_columns(&plan, arena) {
         // After Bug B's FE rewrite, a Scan's output column is named
         // after the dict column (`__nr_dict_t_s`) directly. Resolve by
         // EITHER the user-facing source name OR the dict column name so
@@ -1302,8 +1569,8 @@ pub(crate) fn wrap_with_decode(
         return plan;
     }
     ctx.mark_changed();
-    LogicalPlanNode::new(
-        PlanNodeKind::Decode(LogicalDecodeNode {
+    opt_expr(
+        Operator::LogicalDecode(DecodeOp {
             mappings,
             output_columns: renamed_outputs,
         }),
@@ -1315,71 +1582,71 @@ pub(crate) fn wrap_with_decode(
 /// Best-effort projection of a logical plan's output columns. Mirrors
 /// the small subset of variants Task 7 actually manipulates;
 /// downstream-of-decode boundaries do not need it.
-fn plan_output_columns(plan: &LogicalPlanNode) -> Vec<OutputColumn> {
-    match &plan.kind {
-        PlanNodeKind::Scan(scan) => scan.columns.clone(),
-        PlanNodeKind::Aggregate(node) => node.output_columns.clone(),
-        PlanNodeKind::Window(node) => node.output_columns.clone(),
-        PlanNodeKind::TableFunction(node) => node.output_columns.clone(),
-        PlanNodeKind::CTEProduce(node) => node.output_columns.clone(),
-        PlanNodeKind::CTEConsume(node) => node.output_columns.clone(),
-        PlanNodeKind::Decode(node) => node.output_columns.clone(),
-        PlanNodeKind::AggregateStateMerge(node) => node.output_columns.clone(),
-        PlanNodeKind::Filter(_) => plan_output_columns(plan.unary_input()),
-        PlanNodeKind::Project(node) => node
+fn plan_output_columns(plan: &OptExpr, arena: &ScalarArena) -> Vec<OutputColumn> {
+    match &plan.op {
+        Operator::LogicalScan(scan) => scan.columns.clone(),
+        Operator::LogicalAggregate(node) => node.output_columns.clone(),
+        Operator::LogicalWindow(node) => node.output_columns.clone(),
+        Operator::LogicalTableFunction(node) => node.output_columns.clone(),
+        Operator::LogicalCTEProduce(node) => node.output_columns.clone(),
+        Operator::LogicalCTEConsume(node) => node.output_columns.clone(),
+        Operator::LogicalDecode(node) => node.output_columns.clone(),
+        Operator::LogicalAggregateStateMerge(node) => node.output_columns.clone(),
+        Operator::LogicalFilter(_) => plan_output_columns(plan.unary_input(), arena),
+        Operator::LogicalProject(node) => node
             .items
             .iter()
             .map(|item| OutputColumn {
                 column_id: item.output_column_id,
                 name: item.output_name.clone(),
-                data_type: item.expr.data_type.clone(),
-                nullable: item.expr.nullable,
+                data_type: arena.data_type(item.expr).clone(),
+                nullable: arena.nullable(item.expr),
                 is_internal: false,
             })
             .collect(),
-        PlanNodeKind::Sort(_) => plan_output_columns(plan.unary_input()),
-        PlanNodeKind::Limit(_) => plan_output_columns(plan.unary_input()),
-        PlanNodeKind::Repeat(_) => plan_output_columns(plan.unary_input()),
-        PlanNodeKind::Join(_) => {
-            let mut out = plan_output_columns(plan.left());
-            out.extend(plan_output_columns(plan.right()));
+        Operator::LogicalSort(_) | Operator::LogicalTopN(_) => {
+            plan_output_columns(plan.unary_input(), arena)
+        }
+        Operator::LogicalLimit(_) => plan_output_columns(plan.unary_input(), arena),
+        Operator::LogicalRepeat(_) => plan_output_columns(plan.unary_input(), arena),
+        Operator::LogicalJoin(_) => {
+            let mut out = plan_output_columns(plan.left(), arena);
+            out.extend(plan_output_columns(plan.right(), arena));
             out
         }
-        PlanNodeKind::Union(node) => node.output_columns.clone(),
-        PlanNodeKind::Intersect(node) => node.output_columns.clone(),
-        PlanNodeKind::Except(node) => node.output_columns.clone(),
-        PlanNodeKind::Values(node) => node.columns.clone(),
-        PlanNodeKind::GenerateSeries(node) => vec![OutputColumn {
+        Operator::LogicalUnion(node) => node.output_columns.clone(),
+        Operator::LogicalIntersect(node) => node.output_columns.clone(),
+        Operator::LogicalExcept(node) => node.output_columns.clone(),
+        Operator::LogicalValues(node) => node.columns.clone(),
+        Operator::LogicalGenerateSeries(node) => vec![OutputColumn {
             column_id: ColumnId::UNSET,
             name: node.column_name.clone(),
             data_type: DataType::Int64,
             nullable: false,
             is_internal: false,
         }],
-        PlanNodeKind::CTEAnchor(_) => plan_output_columns(plan.child(1)),
-        PlanNodeKind::Apply(node) => {
-            let mut out = plan_output_columns(plan.left());
+        Operator::LogicalCTEAnchor(_) => plan_output_columns(plan.child(1), arena),
+        Operator::LogicalApply(node) => {
+            let mut out = plan_output_columns(plan.left(), arena);
             out.push(node.output_column.clone());
             out
         }
-        PlanNodeKind::AssertOneRow(_) => plan_output_columns(plan.unary_input()),
-        PlanNodeKind::ImvDelta(_) | PlanNodeKind::ImvVersion(_) => {
+        Operator::LogicalAssertOneRow(_) => plan_output_columns(plan.unary_input(), arena),
+        Operator::LogicalImvDelta(_) | Operator::LogicalImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
         }
-        PlanNodeKind::TopN(_)
-        | PlanNodeKind::Exchange(_)
-        | PlanNodeKind::HashAggregate(_)
-        | PlanNodeKind::HashJoin(_)
-        | PlanNodeKind::NestLoopJoin(_)
-        | PlanNodeKind::SetOp(_) => {
-            panic!("distributed plan node leaked into logical dictionary rewrite");
-        }
+        other => panic!(
+            "low-cardinality dictionary rewrite received physical operator {:?}",
+            other
+        ),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::optimizer::convert::logical_plan_to_opt_expr;
+    use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::*;
     use crate::sql::planner::plan::{
         LogicalExceptNode, LogicalIntersectNode, LogicalUnionNode, LogicalValuesNode, PlanNodeKind,
@@ -1438,7 +1705,9 @@ mod tests {
         ];
 
         for plan in plans {
-            let actual = plan_output_columns(&plan);
+            let mut arena = ScalarArena::new();
+            let opt = logical_plan_to_opt_expr(&plan, &mut arena);
+            let actual = plan_output_columns(&opt, &arena);
             assert_eq!(actual.len(), output_columns.len());
             assert_eq!(actual[0].column_id, output_columns[0].column_id);
             assert_eq!(actual[0].name, output_columns[0].name);

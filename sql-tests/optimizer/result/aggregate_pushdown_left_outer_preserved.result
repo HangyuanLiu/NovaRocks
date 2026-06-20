@@ -2,24 +2,22 @@ Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
-12:PROJECT [a.k AS k, sum(a.v)] stats={rows=50}
-  11:PROJECT [a.k, sum(sum(a.v)) AS sum(a.v)] stats={rows=50}
-    10:HASH AGGREGATE (GLOBAL, group by: [a.k]) stats={rows=50}
+11:PROJECT [a.k AS k, sum(a.v)] stats={rows=50}
+  10:PROJECT [a.k, sum(sum(a.v)) AS sum(a.v)] stats={rows=50}
+    9:HASH AGGREGATE (SINGLE, group by: [a.k]) stats={rows=50}
       aggregations: sum(sum(a.v))
-      9:HASH EXCHANGE stats={rows=50}
+      8:GATHER stats={rows=100}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
-    EXCHANGE ID: 9
-    PARTITION: HASH_PARTITIONED (a.k)
-8:HASH AGGREGATE (LOCAL, group by: [a.k]) stats={rows=50}
-  aggregations: sum(sum(a.v))
-  7:HASH JOIN (PARTITIONED, LEFT OUTER, eq: [a.k = b.k]) stats={rows=100}
-    4:HASH AGGREGATE (GLOBAL, group by: [a.k]) stats={rows=100}
-      aggregations: sum(a.v)
-      3:HASH EXCHANGE stats={rows=100}
-    6:HASH EXCHANGE stats={rows=50}
+    EXCHANGE ID: 8
+    PARTITION: UNPARTITIONED
+7:HASH JOIN (PARTITIONED, LEFT OUTER, eq: [a.k = b.k]) stats={rows=100}
+  4:HASH AGGREGATE (GLOBAL, group by: [a.k]) stats={rows=100}
+    aggregations: sum(a.v)
+    3:HASH EXCHANGE stats={rows=100}
+  6:HASH EXCHANGE stats={rows=50}
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED

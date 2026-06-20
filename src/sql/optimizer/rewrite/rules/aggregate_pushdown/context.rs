@@ -1,5 +1,6 @@
 //! Aggregate pushdown collector/rewriter shared state.
 
+use crate::sql::analysis::TypedExpr;
 use crate::sql::optimizer::operator::ScalarAggregateSpec;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::scalar::ScalarId;
@@ -34,6 +35,10 @@ pub(crate) struct PushPlan {
     pub target_subtree: OptExpr,
     /// Group-by ScalarIds for the partial aggregate.
     pub partial_groupby: Vec<ScalarId>,
+    /// Side-bound join keys that must become partial group-by expressions but
+    /// were discovered from materialized join predicates rather than existing
+    /// aggregate group-by ScalarIds.
+    pub partial_extra_groupby: Vec<TypedExpr>,
     /// Aggregate specs to use at the partial stage. For v1 these are
     /// the same shape as the original specs (function name unchanged
     /// for SUM/MIN/MAX/COUNT — see rewriter for the final-stage table).

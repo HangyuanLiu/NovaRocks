@@ -8,7 +8,7 @@ use std::collections::HashSet;
 
 use arrow::datatypes::DataType;
 
-use crate::sql::analysis::{ExprKind, JoinKind, TypedExpr};
+use crate::sql::analysis::{BinOp, ExprKind, JoinKind, TypedExpr};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::{FilterOp, Operator};
 use crate::sql::optimizer::opt_expr::OptExpr;
@@ -16,8 +16,8 @@ use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::optimizer::rewrite::rules::utils::{combine_and, join_equi_keys_opt, split_and};
-use crate::sql::optimizer::scalar::{self, ScalarArena};
+use crate::sql::optimizer::rewrite::rules::utils::{combine_and, join_equi_keys_opt};
+use crate::sql::optimizer::scalar::{self, ScalarArena, ScalarId, ScalarNode};
 
 pub(crate) struct DeriveJoinNotNullPredicate;
 
@@ -167,16 +167,12 @@ fn spine_not_null(expr: &OptExpr, arena: &ScalarArena) -> HashSet<ColumnId> {
 fn spine_not_null_inner(expr: &OptExpr, arena: &ScalarArena, ids: &mut HashSet<ColumnId>) {
     match &expr.op {
         Operator::LogicalFilter(f) => {
-            let predicate_typed = scalar::materialize(arena, f.predicate);
-            for conj in split_and(predicate_typed) {
-                record_not_null(&conj, ids);
-            }
+            record_not_null_conjuncts(arena, f.predicate, ids);
             spine_not_null_inner(expr.unary_input(), arena, ids);
         }
         Operator::LogicalScan(s) => {
             for pred_id in &s.predicates {
-                let p = scalar::materialize(arena, *pred_id);
-                record_not_null(&p, ids);
+                record_not_null_conjuncts(arena, *pred_id, ids);
             }
         }
         // Project may rename columns; id-based matching remains valid through
@@ -188,17 +184,30 @@ fn spine_not_null_inner(expr: &OptExpr, arena: &ScalarArena, ids: &mut HashSet<C
     }
 }
 
-fn record_not_null(expr: &TypedExpr, ids: &mut HashSet<ColumnId>) {
-    if let ExprKind::IsNull {
-        expr: inner,
-        negated: true,
-    } = &expr.kind
-    {
-        if let ExprKind::ColumnRef { column_id, .. } = &inner.kind {
-            if *column_id != ColumnId::UNSET {
-                ids.insert(*column_id);
-            }
+fn record_not_null_conjuncts(arena: &ScalarArena, expr: ScalarId, ids: &mut HashSet<ColumnId>) {
+    match arena.node(expr) {
+        ScalarNode::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } => {
+            record_not_null_conjuncts(arena, *left, ids);
+            record_not_null_conjuncts(arena, *right, ids);
         }
+        ScalarNode::Nested(inner) => record_not_null_conjuncts(arena, *inner, ids),
+        _ => record_not_null_scalar(arena, expr, ids),
+    }
+}
+
+fn record_not_null_scalar(arena: &ScalarArena, expr: ScalarId, ids: &mut HashSet<ColumnId>) {
+    if let ScalarNode::IsNull {
+        child,
+        negated: true,
+    } = arena.node(expr)
+        && let ScalarNode::ColumnRef(column_id) = arena.node(*child)
+        && *column_id != ColumnId::UNSET
+    {
+        ids.insert(*column_id);
     }
 }
 
@@ -212,6 +221,7 @@ mod tests {
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::optimizer::operator::{LogicalJoinOp, ScanOp};
     use crate::sql::optimizer::rewrite::context::RewriteContext;
+    use crate::sql::optimizer::rewrite::rules::utils::split_and;
     use crate::sql::optimizer::scalar::ScalarArena;
 
     fn make_ctx(arena: ScalarArena) -> RewriteContext {

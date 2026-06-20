@@ -10,13 +10,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::sql::optimizer::operator::{ImvDeltaOp, Operator};
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
-use crate::sql::optimizer::rewrite::imv::{
-    PlanRewriteResult, bridge_apply_result, opt_expr_to_plan,
-};
+use crate::sql::optimizer::rewrite::imv::opt_expr_to_plan;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
-use crate::sql::planner::plan::{LogicalImvDeltaNode, LogicalPlanNode, PlanNodeKind};
+use crate::sql::planner::plan::{LogicalPlanNode, PlanNodeKind};
 
 /// Snapshot window descriptor used by `LogicalImvVersionNode`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,12 +50,11 @@ impl Default for ImvVersionRef {
 /// Once the flag is set it stays set for the lifetime of this object.
 /// Callers **must** construct a fresh `WrapRootInImvDeltaRule` (and
 /// therefore a fresh `RewritePipeline`) for every independent `rewrite()`
-/// invocation.  When Task 7 registers this rule into the IMV pipeline,
-/// the production path will satisfy this contract: `run_imv_rewrite()`
-/// calls `build_imv_pipeline()` which allocates a new pipeline—and a new
-/// rule instance—on every call.  Reusing the same pipeline across multiple
-/// `rewrite()` calls is incorrect: the second call will silently skip
-/// wrapping because `wrapped` is already `true`.
+/// invocation.  The production path satisfies this contract because
+/// `run_imv_rewrite()` calls `build_imv_pipeline()` which allocates a new
+/// pipeline and a new rule instance on every call.  Reusing the same
+/// pipeline across multiple `rewrite()` calls is incorrect: the second call
+/// will silently skip wrapping because `wrapped` is already `true`.
 pub(crate) struct WrapRootInImvDeltaRule {
     wrapped: AtomicBool,
 }
@@ -105,19 +102,16 @@ impl LogicalRewriteRule for WrapRootInImvDeltaRule {
         true
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
         self.wrapped.store(true, Ordering::SeqCst);
-        bridge_apply_result(expr, ctx, |plan, _ctx| {
-            Ok(PlanRewriteResult::Changed(LogicalPlanNode::new(
-                PlanNodeKind::ImvDelta(LogicalImvDeltaNode {
-                    is_root: true,
-                    action_column: None,
-                    branch_scope: None,
-                }),
-                vec![plan],
-                None,
-            )))
-        })
+        Ok(RewriteResult::Changed(OptExpr::new(
+            Operator::LogicalImvDelta(ImvDeltaOp {
+                is_root: true,
+                action_column: None,
+                branch_scope: None,
+            }),
+            vec![expr],
+        )))
     }
 }
 

@@ -7,13 +7,14 @@
 //! kernel (no plan re-walk). Cost is an *enumeration-internal pruning proxy*
 //! only; the authoritative cost is the memo search (Phase 5).
 
-use crate::sql::analysis::{BinOp, ExprKind, JoinKind, TypedExpr};
+use arrow::datatypes::DataType;
+
+use crate::sql::analysis::{BinOp, JoinKind};
 use crate::sql::optimizer::estimate::cardinality::{JoinCardInput, estimate_join_cardinality};
 use crate::sql::optimizer::estimate::join_condition::estimate_join_condition;
 use crate::sql::optimizer::memo::JoinTree;
 use crate::sql::optimizer::operator::LogicalJoinOp;
-use crate::sql::optimizer::rewrite::rules::utils::combine_and;
-use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
+use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 use crate::sql::optimizer::statistics::{CostEstimate, Statistics};
 
 use super::MultiJoinGraph;
@@ -98,12 +99,18 @@ const GREEDY_LEVEL_WIDTH: usize = 256;
 /// statistics (mirrors `join_reorder/cardinality.rs::estimate_join`, but on
 /// cached stats rather than a plan re-walk).
 fn join_stats(
+    arena: &ScalarArena,
     left: &Statistics,
     right: &Statistics,
-    condition: Option<&TypedExpr>,
+    condition: Option<ScalarId>,
     kind: JoinKind,
 ) -> Statistics {
-    let jc = estimate_join_condition(condition, &left.column_statistics, &right.column_statistics);
+    let jc = estimate_join_condition(
+        arena,
+        condition,
+        &left.column_statistics,
+        &right.column_statistics,
+    );
     let (output_rows, row_count_confidence) = estimate_join_cardinality(&JoinCardInput {
         left: (left.output_row_count, left.row_count_confidence),
         right: (right.output_row_count, right.row_count_confidence),
@@ -171,7 +178,7 @@ struct Cell {
 fn join_cells(
     left: &Cell,
     right: &Cell,
-    condition: Option<TypedExpr>,
+    condition: Option<ScalarId>,
     arena: &mut ScalarArena,
 ) -> Cell {
     let kind = if condition.is_some() {
@@ -179,24 +186,21 @@ fn join_cells(
     } else {
         JoinKind::Cross
     };
-    let stats = join_stats(&left.stats, &right.stats, condition.as_ref(), kind);
+    let stats = join_stats(arena, &left.stats, &right.stats, condition, kind);
     // Cost proxy uses Cross when there is no equi key (NestLoop), matching the
     // RBO cost-side join-type selection.
     let cost_kind = match &condition {
-        Some(c) if has_equijoin_predicate(c) => JoinKind::Inner,
+        Some(c) if has_equijoin_predicate(arena, *c) => JoinKind::Inner,
         _ => JoinKind::Cross,
     };
     let self_cost = join_self_cost(&left.stats, &right.stats, &stats, cost_kind);
-    let op_condition = condition
-        .as_ref()
-        .map(|condition| intern_typed(arena, condition));
     Cell {
         tree: JoinTree::Join {
             left: Box::new(left.tree.clone()),
             right: Box::new(right.tree.clone()),
             op: LogicalJoinOp {
                 join_type: kind,
-                condition: op_condition,
+                condition,
             },
         },
         stats,
@@ -246,7 +250,9 @@ fn left_deep(graph: &MultiJoinGraph, arena: &mut ScalarArena) -> Option<JoinTree
                 continue;
             }
             let connecting = connecting_predicates(&graph.predicates, current_mask, atom_mask);
-            let has_equi = connecting.iter().any(has_equijoin_predicate);
+            let has_equi = connecting
+                .iter()
+                .any(|predicate| has_equijoin_predicate(arena, *predicate));
             let class = if has_equi {
                 2u8
             } else if connecting.is_empty() {
@@ -272,7 +278,7 @@ fn left_deep(graph: &MultiJoinGraph, arena: &mut ScalarArena) -> Option<JoinTree
         let condition = if connecting.is_empty() {
             None
         } else {
-            Some(combine_and(connecting))
+            Some(combine_and_scalar(arena, connecting))
         };
         current = join_cells(&current, &atom_cell(graph, next), condition, arena);
         current_mask |= next_mask;
@@ -327,7 +333,7 @@ fn dp(graph: &MultiJoinGraph, arena: &mut ScalarArena) -> Option<JoinTree> {
 /// have a connecting equi-join predicate.
 fn try_partition(
     memo: &std::collections::HashMap<u32, Cell>,
-    predicates: &[(TypedExpr, u32)],
+    predicates: &[(ScalarId, u32)],
     left: u32,
     right: u32,
     arena: &mut ScalarArena,
@@ -336,9 +342,9 @@ fn try_partition(
     if connecting.is_empty() {
         return None;
     }
-    let condition = combine_and(connecting);
+    let condition = combine_and_scalar(arena, connecting);
     // Require an equi key to avoid materializing NestLoop joins during reorder.
-    if !has_equijoin_predicate(&condition) {
+    if !has_equijoin_predicate(arena, condition) {
         return None;
     }
     let left_cell = memo.get(&left)?;
@@ -442,45 +448,63 @@ fn insert_topk(buf: &mut Vec<Cell>, cell: Cell, k: usize) {
 }
 
 // ---------------------------------------------------------------------------
-// Pure helpers (ported verbatim from reorder.rs — mask / TypedExpr only)
+// Pure helpers (ported verbatim from reorder.rs — mask / ScalarId only)
 // ---------------------------------------------------------------------------
 
 /// Predicates connecting the two subsets: touch both, reference nothing outside
 /// their union. Returns the predicate expressions (cloned).
 fn connecting_predicates(
-    predicates: &[(TypedExpr, u32)],
+    predicates: &[(ScalarId, u32)],
     left_mask: u32,
     right_mask: u32,
-) -> Vec<TypedExpr> {
+) -> Vec<ScalarId> {
     let combined = left_mask | right_mask;
     predicates
         .iter()
         .filter(|(_, mask)| {
             (*mask & left_mask) != 0 && (*mask & right_mask) != 0 && (*mask & !combined) == 0
         })
-        .map(|(pred, _)| pred.clone())
+        .map(|(pred, _)| *pred)
         .collect()
 }
 
 /// True if the predicate contains at least one `col = col` equi-join conjunct.
-fn has_equijoin_predicate(expr: &TypedExpr) -> bool {
-    match &expr.kind {
-        ExprKind::Nested(inner) => has_equijoin_predicate(inner),
-        ExprKind::BinaryOp {
+fn has_equijoin_predicate(arena: &ScalarArena, expr: ScalarId) -> bool {
+    match arena.node(expr) {
+        ScalarNode::Nested(inner) => has_equijoin_predicate(arena, *inner),
+        ScalarNode::BinaryOp {
             left,
             op: BinOp::And,
             right,
-        } => has_equijoin_predicate(left) || has_equijoin_predicate(right),
-        ExprKind::BinaryOp {
+        } => has_equijoin_predicate(arena, *left) || has_equijoin_predicate(arena, *right),
+        ScalarNode::BinaryOp {
             left,
             op: BinOp::Eq,
             right,
         } => {
-            matches!(left.kind, ExprKind::ColumnRef { .. })
-                && matches!(right.kind, ExprKind::ColumnRef { .. })
+            matches!(arena.node(*left), ScalarNode::ColumnRef(_))
+                && matches!(arena.node(*right), ScalarNode::ColumnRef(_))
         }
         _ => false,
     }
+}
+
+fn combine_and_scalar(arena: &mut ScalarArena, mut exprs: Vec<ScalarId>) -> ScalarId {
+    assert!(!exprs.is_empty());
+    let mut result = exprs.pop().unwrap();
+    while let Some(left) = exprs.pop() {
+        let nullable = arena.nullable(left) || arena.nullable(result);
+        result = arena.intern(
+            ScalarNode::BinaryOp {
+                op: BinOp::And,
+                left,
+                right: result,
+            },
+            DataType::Boolean,
+            nullable,
+        );
+    }
+    result
 }
 
 /// Deduplicate candidate trees by structural shape (debug form).
@@ -564,9 +588,9 @@ fn next_submask(current: u32, universe: u32) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::TypedExpr;
+    use crate::sql::analysis::{BinOp, ExprKind, TypedExpr};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
     use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence};
     use std::collections::HashMap;
 
@@ -614,16 +638,20 @@ mod tests {
         }
     }
 
+    fn pred(arena: &mut ScalarArena, expr: TypedExpr) -> ScalarId {
+        intern_typed(arena, &expr)
+    }
+
     /// Left-deep path chain over `n` atoms: c_i = c_{i+1} for i in 0..n-1.
-    fn path_graph(n: usize) -> MultiJoinGraph {
+    fn path_graph(n: usize, arena: &mut ScalarArena) -> MultiJoinGraph {
         let atoms: Vec<usize> = (0..n).map(|i| 100 + i).collect();
         let atom_stats: Vec<Statistics> = (0..n)
             .map(|i| atom_stats(i as u32, 10_000.0, 1_000.0))
             .collect();
-        let predicates: Vec<(TypedExpr, u32)> = (0..n.saturating_sub(1))
+        let predicates: Vec<(ScalarId, u32)> = (0..n.saturating_sub(1))
             .map(|i| {
                 (
-                    eq(col_ref(i as u32), col_ref(i as u32 + 1)),
+                    pred(arena, eq(col_ref(i as u32), col_ref(i as u32 + 1))),
                     (1u32 << i) | (1u32 << (i + 1)),
                 )
             })
@@ -638,7 +666,7 @@ mod tests {
 
     /// Two equi-join pairs (0,1) and (2,3) bridged by 1=2, so the only way to
     /// join the two pairs without a cross join is the bushy (0⋈1)⋈(2⋈3).
-    fn two_pairs_graph() -> MultiJoinGraph {
+    fn two_pairs_graph(arena: &mut ScalarArena) -> MultiJoinGraph {
         MultiJoinGraph {
             atoms: vec![100, 101, 102, 103],
             atom_stats: vec![
@@ -648,9 +676,9 @@ mod tests {
                 atom_stats(3, 1_000_000.0, 1_000_000.0),
             ],
             predicates: vec![
-                (eq(col_ref(0), col_ref(1)), 0b0011),
-                (eq(col_ref(2), col_ref(3)), 0b1100),
-                (eq(col_ref(1), col_ref(2)), 0b0110),
+                (pred(arena, eq(col_ref(0), col_ref(1))), 0b0011),
+                (pred(arena, eq(col_ref(2), col_ref(3))), 0b1100),
+                (pred(arena, eq(col_ref(1), col_ref(2))), 0b0110),
             ],
             chain_join_groups: vec![],
         }
@@ -670,17 +698,20 @@ mod tests {
         // The DP internal ceiling must honor the configured max_dp (10), not the
         // old hardcoded 8. A 10-atom connected chain must produce a DP plan.
         let mut arena = ScalarArena::new();
+        let graph10 = path_graph(10, &mut arena);
         assert!(
-            dp(&path_graph(10), &mut arena).is_some(),
+            dp(&graph10, &mut arena).is_some(),
             "DP must enumerate a 10-atom chain (was capped at 8)"
         );
+        let graph9 = path_graph(9, &mut arena);
         assert!(
-            dp(&path_graph(9), &mut arena).is_some(),
+            dp(&graph9, &mut arena).is_some(),
             "DP must enumerate a 9-atom chain"
         );
         // Beyond the safety ceiling (12) DP bails (greedy/left-deep take over).
+        let graph13 = path_graph(13, &mut arena);
         assert!(
-            dp(&path_graph(13), &mut arena).is_none(),
+            dp(&graph13, &mut arena).is_none(),
             "DP bails past the 12-atom ceiling"
         );
     }
@@ -690,7 +721,8 @@ mod tests {
         // Greedy must enumerate bushy shapes (two join sub-trees), not only
         // left-deep spines, so it can find (0⋈1)⋈(2⋈3).
         let mut arena = ScalarArena::new();
-        let trees = greedy_topk(&two_pairs_graph(), 10, &mut arena);
+        let graph = two_pairs_graph(&mut arena);
+        let trees = greedy_topk(&graph, 10, &mut arena);
         assert!(
             trees.iter().any(is_bushy),
             "greedy must produce at least one bushy order; got {} trees",
@@ -699,7 +731,7 @@ mod tests {
     }
 
     /// Star schema: a big fact atom (0) equi-joined to two small dim atoms (1,2).
-    fn star_graph() -> MultiJoinGraph {
+    fn star_graph(arena: &mut ScalarArena) -> MultiJoinGraph {
         MultiJoinGraph {
             atoms: vec![100, 101, 102],
             atom_stats: vec![
@@ -709,8 +741,8 @@ mod tests {
             ],
             // fact.c0 = dim1.c1 (atoms 0,1) ; fact.c0b = dim2.c2 (atoms 0,2)
             predicates: vec![
-                (eq(col_ref(0), col_ref(1)), 0b011),
-                (eq(col_ref(0), col_ref(2)), 0b101),
+                (pred(arena, eq(col_ref(0), col_ref(1))), 0b011),
+                (pred(arena, eq(col_ref(0), col_ref(2))), 0b101),
             ],
             chain_join_groups: vec![],
         }
@@ -718,8 +750,8 @@ mod tests {
 
     #[test]
     fn left_deep_starts_from_largest_and_prefers_equi() {
-        let graph = star_graph();
         let mut arena = ScalarArena::new();
+        let graph = star_graph(&mut arena);
         let tree = left_deep(&graph, &mut arena).expect("left-deep over 3 atoms");
         // Left-deep shape: ((fact ⋈ dim) ⋈ dim). The deepest-left leaf is the
         // fact atom (100, the largest), reached by descending left children.
@@ -742,8 +774,8 @@ mod tests {
 
     #[test]
     fn enumerate_orders_produces_candidates_and_dedups() {
-        let graph = star_graph();
         let mut arena = ScalarArena::new();
+        let graph = star_graph(&mut arena);
         let trees = enumerate_orders(&graph, ReorderCaps::default(), &mut arena);
         assert!(!trees.is_empty(), "should enumerate at least one order");
         // All candidates must be 3-atom join trees (2 joins).

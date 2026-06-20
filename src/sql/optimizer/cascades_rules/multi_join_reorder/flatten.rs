@@ -4,12 +4,11 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::sql::analysis::{JoinKind, TypedExpr};
+use crate::sql::analysis::JoinKind;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::memo::{GroupId, Memo};
 use crate::sql::optimizer::operator::{LogicalJoinOp, Operator};
-use crate::sql::optimizer::rewrite::rules::utils::{collect_column_id_refs, split_and};
-use crate::sql::optimizer::scalar::materialize;
+use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 use crate::sql::optimizer::statistics::{Confidence, Statistics};
 
 use super::super::implement::get_group_column_ids;
@@ -23,7 +22,7 @@ use super::MultiJoinGraph;
 /// join). Returns `None` for fewer than two atoms or more than 32 (mask cap).
 pub(crate) fn flatten_join_chain(memo: &Memo, root: GroupId) -> Option<MultiJoinGraph> {
     let mut atoms: Vec<GroupId> = Vec::new();
-    let mut raw_predicates: Vec<TypedExpr> = Vec::new();
+    let mut raw_predicates: Vec<ScalarId> = Vec::new();
     let mut chain_joins: Vec<GroupId> = Vec::new();
     collect_chain(
         memo,
@@ -42,10 +41,10 @@ pub(crate) fn flatten_join_chain(memo: &Memo, root: GroupId) -> Option<MultiJoin
         .map(|&g| get_group_column_ids(memo, g))
         .collect();
     let atom_stats: Vec<Statistics> = atoms.iter().map(|&g| group_stats(memo, g)).collect();
-    let mut predicates: Vec<(TypedExpr, u32)> = Vec::new();
+    let mut predicates: Vec<(ScalarId, u32)> = Vec::new();
 
     for pred in raw_predicates {
-        let mask = relation_mask(&pred, &atom_cols);
+        let mask = relation_mask(&memo.scalars, pred, &atom_cols);
         if mask.count_ones() < 2 {
             // A single-relation or constant predicate left inside a join
             // condition (rare after predicate pushdown). Bail rather than risk
@@ -68,7 +67,7 @@ fn collect_chain(
     memo: &Memo,
     group: GroupId,
     atoms: &mut Vec<GroupId>,
-    predicates: &mut Vec<TypedExpr>,
+    predicates: &mut Vec<ScalarId>,
     chain_joins: &mut Vec<GroupId>,
 ) {
     let Some(expr) = memo.groups.get(group).and_then(|g| g.logical_exprs.first()) else {
@@ -88,7 +87,7 @@ fn collect_chain(
             collect_chain(memo, expr.children[0], atoms, predicates, chain_joins);
             collect_chain(memo, expr.children[1], atoms, predicates, chain_joins);
             if let Some(cond) = condition {
-                predicates.extend(split_and(materialize(&memo.scalars, *cond)));
+                predicates.extend(split_and_scalar(&memo.scalars, *cond));
             }
         }
         Operator::LogicalFilter(f)
@@ -97,7 +96,7 @@ fn collect_chain(
             // Absorb a filter sitting directly on an inner/cross join. The filter
             // group itself is not a join (JoinAssociativity never matches it), so
             // only the join below it is recorded as a chain join.
-            predicates.extend(split_and(materialize(&memo.scalars, f.predicate)));
+            predicates.extend(split_and_scalar(&memo.scalars, f.predicate));
             collect_chain(memo, expr.children[0], atoms, predicates, chain_joins);
         }
         // Any other operator (incl. LogicalProject and outer/semi joins) is an
@@ -136,8 +135,9 @@ fn group_stats(memo: &Memo, group: GroupId) -> Statistics {
 }
 
 /// Bitmask of atom indices whose columns the predicate references.
-fn relation_mask(pred: &TypedExpr, atom_cols: &[HashSet<ColumnId>]) -> u32 {
-    let ids = collect_column_id_refs(pred);
+fn relation_mask(arena: &ScalarArena, pred: ScalarId, atom_cols: &[HashSet<ColumnId>]) -> u32 {
+    let mut ids = HashSet::new();
+    collect_scalar_column_ids(arena, pred, &mut ids);
     let mut mask = 0u32;
     for id in ids {
         for (i, cols) in atom_cols.iter().enumerate() {
@@ -149,10 +149,110 @@ fn relation_mask(pred: &TypedExpr, atom_cols: &[HashSet<ColumnId>]) -> u32 {
     mask
 }
 
+fn split_and_scalar(arena: &ScalarArena, expr: ScalarId) -> Vec<ScalarId> {
+    let mut out = Vec::new();
+    split_and_scalar_inner(arena, expr, &mut out);
+    out
+}
+
+fn split_and_scalar_inner(arena: &ScalarArena, expr: ScalarId, out: &mut Vec<ScalarId>) {
+    match arena.node(expr) {
+        ScalarNode::BinaryOp {
+            op: crate::sql::analysis::BinOp::And,
+            left,
+            right,
+        } => {
+            split_and_scalar_inner(arena, *left, out);
+            split_and_scalar_inner(arena, *right, out);
+        }
+        ScalarNode::Nested(inner) => split_and_scalar_inner(arena, *inner, out),
+        _ => out.push(expr),
+    }
+}
+
+fn collect_scalar_column_ids(arena: &ScalarArena, expr: ScalarId, out: &mut HashSet<ColumnId>) {
+    match arena.node(expr) {
+        ScalarNode::ColumnRef(id) => {
+            if *id != ColumnId::UNSET {
+                out.insert(*id);
+            }
+        }
+        ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {}
+        ScalarNode::BinaryOp { left, right, .. } => {
+            collect_scalar_column_ids(arena, *left, out);
+            collect_scalar_column_ids(arena, *right, out);
+        }
+        ScalarNode::UnaryOp { child, .. }
+        | ScalarNode::Cast { child, .. }
+        | ScalarNode::IsNull { child, .. }
+        | ScalarNode::Like { child, .. }
+        | ScalarNode::IsTruthValue { child, .. }
+        | ScalarNode::Nested(child) => collect_scalar_column_ids(arena, *child, out),
+        ScalarNode::FunctionCall { args, .. } | ScalarNode::AggregateCall { args, .. } => {
+            for arg in args {
+                collect_scalar_column_ids(arena, *arg, out);
+            }
+            if let ScalarNode::AggregateCall { order_by, .. } = arena.node(expr) {
+                for key in order_by {
+                    collect_scalar_column_ids(arena, key.expr, out);
+                }
+            }
+        }
+        ScalarNode::LambdaFunction { body, .. } | ScalarNode::Lambda { body, .. } => {
+            collect_scalar_column_ids(arena, *body, out);
+        }
+        ScalarNode::InList { child, list, .. } => {
+            collect_scalar_column_ids(arena, *child, out);
+            for item in list {
+                collect_scalar_column_ids(arena, *item, out);
+            }
+        }
+        ScalarNode::Between {
+            child, low, high, ..
+        } => {
+            collect_scalar_column_ids(arena, *child, out);
+            collect_scalar_column_ids(arena, *low, out);
+            collect_scalar_column_ids(arena, *high, out);
+        }
+        ScalarNode::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(operand) = operand {
+                collect_scalar_column_ids(arena, *operand, out);
+            }
+            for (when, then) in when_then {
+                collect_scalar_column_ids(arena, *when, out);
+                collect_scalar_column_ids(arena, *then, out);
+            }
+            if let Some(else_expr) = else_expr {
+                collect_scalar_column_ids(arena, *else_expr, out);
+            }
+        }
+        ScalarNode::WindowCall {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for arg in args {
+                collect_scalar_column_ids(arena, *arg, out);
+            }
+            for part in partition_by {
+                collect_scalar_column_ids(arena, *part, out);
+            }
+            for key in order_by {
+                collect_scalar_column_ids(arena, key.expr, out);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn};
+    use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr};
     use crate::sql::optimizer::memo::{JoinTree, LogicalProperties, MExpr};
     use crate::sql::optimizer::operator::ValuesOp;
     use crate::sql::optimizer::scalar::intern_typed;

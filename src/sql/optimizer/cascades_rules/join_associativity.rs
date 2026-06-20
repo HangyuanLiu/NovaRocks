@@ -14,9 +14,8 @@ use crate::sql::analysis::JoinKind;
 use crate::sql::optimizer::memo::{MExpr, Memo};
 use crate::sql::optimizer::operator::{LogicalJoinOp, Operator};
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
-use crate::sql::optimizer::scalar::materialize;
 
-use crate::sql::optimizer::rewrite::rules::utils::collect_column_id_refs_strict;
+use crate::sql::optimizer::rewrite::rules::utils::collect_scalar_column_id_refs_strict;
 
 use super::implement::get_group_column_ids;
 
@@ -98,8 +97,7 @@ impl Rule for JoinAssociativity {
         // an unsound plan. A future improvement would split the condition by
         // conjunct and re-distribute across the new structure.
         if let Some(ref cond) = inner_op.condition {
-            let cond = materialize(&memo.scalars, *cond);
-            let Some(cond_ids) = collect_column_id_refs_strict(&cond) else {
+            let Some(cond_ids) = collect_scalar_column_id_refs_strict(&memo.scalars, *cond) else {
                 return vec![];
             };
             let a_ids = get_group_column_ids(memo, a_group);

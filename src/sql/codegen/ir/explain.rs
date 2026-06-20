@@ -15,6 +15,7 @@ use crate::sql::optimizer::estimate::arith::MAX_ROW_COUNT;
 use crate::sql::optimizer::operator::{AggMode, JoinDistribution, TopNPhase};
 use crate::sql::optimizer::physical_plan::JoinExecutionDistribution;
 use crate::sql::optimizer::runtime_filter_pass::{RuntimeFilterDesc, RuntimeFilterProbe};
+use crate::sql::optimizer::scalar::{ScalarArena, materialize};
 use crate::sql::planner::plan::{
     DistributedExchangeNode, DistributedHashAggregateNode, DistributedHashJoinNode,
     DistributedNestLoopJoinNode, DistributedSetOpNode, DistributedTopNNode, ExchangeFlavor,
@@ -86,7 +87,14 @@ fn explain_distributed_plan_inner(
             }
         }
 
-        format_distributed_node(&fragment.root, level, 0, actuals, &mut out);
+        format_distributed_node(
+            &fragment.root,
+            dp.scalar_arena.as_ref(),
+            level,
+            0,
+            actuals,
+            &mut out,
+        );
     }
 
     out
@@ -121,6 +129,7 @@ fn format_output_exprs(exprs: Option<&[TypedExpr]>) -> String {
 
 fn format_distributed_node(
     node: &DistributedPlanNode,
+    arena: &ScalarArena,
     level: ExplainLevel,
     indent: usize,
     actuals: Option<&HashMap<i32, ActualMetrics>>,
@@ -136,65 +145,83 @@ fn format_distributed_node(
 
     match &node.kind {
         PlanNodeKind::Scan(scan) => {
-            format_scan_node(node, scan, level, &pad, &costs_suffix, &stats_suffix, out);
+            format_scan_node(
+                node,
+                scan,
+                arena,
+                level,
+                &pad,
+                &costs_suffix,
+                &stats_suffix,
+                out,
+            );
         }
         PlanNodeKind::Project(project) => {
             format_project_node(node, project, &pad, &costs_suffix, &stats_suffix, out);
-            push_probe_rf_lines(&node.probe_runtime_filters, level, &pad, out);
-            format_children(node, level, indent, actuals, out);
+            push_probe_rf_lines(&node.probe_runtime_filters, arena, level, &pad, out);
+            format_children(node, arena, level, indent, actuals, out);
         }
         PlanNodeKind::Filter(filter) => {
             format_filter_node(node, filter, &pad, &costs_suffix, &stats_suffix, out);
-            push_probe_rf_lines(&node.probe_runtime_filters, level, &pad, out);
-            format_children(node, level, indent, actuals, out);
+            push_probe_rf_lines(&node.probe_runtime_filters, arena, level, &pad, out);
+            format_children(node, arena, level, indent, actuals, out);
         }
         PlanNodeKind::HashJoin(join) => {
-            format_hash_join_node(node, join, level, &pad, &costs_suffix, &stats_suffix, out);
-            format_children(node, level, indent, actuals, out);
+            format_hash_join_node(
+                node,
+                join,
+                arena,
+                level,
+                &pad,
+                &costs_suffix,
+                &stats_suffix,
+                out,
+            );
+            format_children(node, arena, level, indent, actuals, out);
         }
         PlanNodeKind::NestLoopJoin(join) => {
             format_nest_loop_join_node(node, join, &pad, &costs_suffix, &stats_suffix, out);
-            format_children(node, level, indent, actuals, out);
+            format_children(node, arena, level, indent, actuals, out);
         }
         PlanNodeKind::HashAggregate(agg) => {
             format_hash_aggregate_node(node, agg, &pad, &costs_suffix, &stats_suffix, out);
-            push_probe_rf_lines(&node.probe_runtime_filters, level, &pad, out);
-            format_children(node, level, indent, actuals, out);
+            push_probe_rf_lines(&node.probe_runtime_filters, arena, level, &pad, out);
+            format_children(node, arena, level, indent, actuals, out);
         }
         PlanNodeKind::Sort(sort) => {
             format_sort_node(node, sort, &pad, &costs_suffix, &stats_suffix, out);
-            format_children(node, level, indent, actuals, out);
+            format_children(node, arena, level, indent, actuals, out);
         }
         PlanNodeKind::TopN(topn) => {
             format_topn_node(node, topn, &pad, &costs_suffix, &stats_suffix, out);
-            format_children(node, level, indent, actuals, out);
+            format_children(node, arena, level, indent, actuals, out);
         }
         PlanNodeKind::Exchange(exchange) => {
             format_exchange_node(node, exchange, &pad, &costs_suffix, &stats_suffix, out);
         }
         PlanNodeKind::Values(values) => {
             format_values_node(node, values, &pad, &costs_suffix, &stats_suffix, out);
-            push_probe_rf_lines(&node.probe_runtime_filters, level, &pad, out);
+            push_probe_rf_lines(&node.probe_runtime_filters, arena, level, &pad, out);
         }
         PlanNodeKind::AssertOneRow(assert) => {
             format_assert_one_row_node(node, assert, &pad, &costs_suffix, &stats_suffix, out);
-            format_children(node, level, indent, actuals, out);
+            format_children(node, arena, level, indent, actuals, out);
         }
         PlanNodeKind::Decode(decode) => {
             format_decode_node(node, decode, &pad, &costs_suffix, &stats_suffix, out);
-            format_children(node, level, indent, actuals, out);
+            format_children(node, arena, level, indent, actuals, out);
         }
         PlanNodeKind::Repeat(repeat) => {
             format_repeat_node(node, repeat, &pad, &costs_suffix, &stats_suffix, out);
-            format_children(node, level, indent, actuals, out);
+            format_children(node, arena, level, indent, actuals, out);
         }
         PlanNodeKind::SetOp(set_op) => {
             format_set_op_node(node, set_op, &pad, &costs_suffix, &stats_suffix, out);
-            format_children(node, level, indent, actuals, out);
+            format_children(node, arena, level, indent, actuals, out);
         }
         PlanNodeKind::Window(window) => {
             format_window_node(node, window, &pad, &costs_suffix, &stats_suffix, out);
-            format_children(node, level, indent, actuals, out);
+            format_children(node, arena, level, indent, actuals, out);
         }
         PlanNodeKind::GenerateSeries(generate) => {
             format_generate_series_node(node, generate, &pad, &costs_suffix, &stats_suffix, out);
@@ -208,7 +235,7 @@ fn format_distributed_node(
                 &stats_suffix,
                 out,
             );
-            format_children(node, level, indent, actuals, out);
+            format_children(node, arena, level, indent, actuals, out);
         }
         PlanNodeKind::Limit(_)
         | PlanNodeKind::Aggregate(_)
@@ -233,13 +260,14 @@ fn format_distributed_node(
 
 fn format_children(
     node: &DistributedPlanNode,
+    arena: &ScalarArena,
     level: ExplainLevel,
     indent: usize,
     actuals: Option<&HashMap<i32, ActualMetrics>>,
     out: &mut Vec<String>,
 ) {
     for child in &node.children {
-        format_distributed_node(child, level, indent + 1, actuals, out);
+        format_distributed_node(child, arena, level, indent + 1, actuals, out);
     }
 }
 
@@ -250,6 +278,7 @@ fn node_prefix(node: &DistributedPlanNode) -> String {
 fn format_scan_node(
     node: &DistributedPlanNode,
     scan: &DistributedScanNode,
+    arena: &ScalarArena,
     level: ExplainLevel,
     pad: &str,
     costs_suffix: &str,
@@ -301,7 +330,7 @@ fn format_scan_node(
             .collect::<Vec<_>>();
         out.push(format!("{pad}     predicates: {}", preds.join(" AND ")));
     }
-    push_probe_rf_lines(&node.probe_runtime_filters, level, pad, out);
+    push_probe_rf_lines(&node.probe_runtime_filters, arena, level, pad, out);
 }
 
 fn format_scan_predicate(expr: &TypedExpr, scan: &DistributedScanNode) -> String {
@@ -441,6 +470,7 @@ fn format_filter_node(
 fn format_hash_join_node(
     node: &DistributedPlanNode,
     join: &DistributedHashJoinNode,
+    arena: &ScalarArena,
     level: ExplainLevel,
     pad: &str,
     costs_suffix: &str,
@@ -469,7 +499,7 @@ fn format_hash_join_node(
     if let Some(ref other) = join.other_condition {
         out.push(format!("{pad}  other: {}", format_expr(other)));
     }
-    push_build_rf_lines(&node.build_runtime_filters, level, pad, out);
+    push_build_rf_lines(&node.build_runtime_filters, arena, level, pad, out);
 }
 
 fn format_nest_loop_join_node(
@@ -970,6 +1000,7 @@ fn fmt_f64(v: f64) -> String {
 
 fn push_build_rf_lines(
     filters: &[RuntimeFilterDesc],
+    arena: &ScalarArena,
     level: ExplainLevel,
     pad: &str,
     out: &mut Vec<String>,
@@ -982,13 +1013,14 @@ fn push_build_rf_lines(
         out.push(format!(
             "{pad}  - filter_id = {}, build_expr = ({})",
             rf.filter_id,
-            format_expr(&rf.build_expr),
+            format_expr(&materialize(arena, rf.build_expr)),
         ));
     }
 }
 
 fn push_probe_rf_lines(
     filters: &[RuntimeFilterProbe],
+    arena: &ScalarArena,
     level: ExplainLevel,
     pad: &str,
     out: &mut Vec<String>,
@@ -1001,7 +1033,7 @@ fn push_probe_rf_lines(
         out.push(format!(
             "{pad}    - filter_id = {}, probe_expr = ({})",
             rf.filter_id,
-            format_expr(&rf.probe_expr),
+            format_expr(&materialize(arena, rf.probe_expr)),
         ));
     }
 }
