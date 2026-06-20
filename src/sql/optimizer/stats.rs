@@ -2373,6 +2373,35 @@ fn child_output_columns(
 }
 
 // ---------------------------------------------------------------------------
+// Derivability promise
+// ---------------------------------------------------------------------------
+
+/// Derivability promise of a memo expression, from its operator shape.
+/// Join over base inputs → High; bushy join (a child group is itself a join)
+/// → Medium; everything else → High. `Low` is unreachable today (reserved for
+/// future in-memo decorrelation — subqueries are decorrelated pre-memo).
+pub(crate) fn promise(op: &Operator, children: &[GroupId], memo: &Memo) -> DerivePromise {
+    match op {
+        Operator::LogicalJoin(_)
+        | Operator::PhysicalHashJoin(_)
+        | Operator::PhysicalNestLoopJoin(_) => {
+            let bushy = children.iter().any(|&c| {
+                matches!(
+                    memo.groups[c].logical_exprs.first().map(|e| &e.op),
+                    Some(Operator::LogicalJoin(_))
+                )
+            });
+            if bushy {
+                DerivePromise::Medium
+            } else {
+                DerivePromise::High
+            }
+        }
+        _ => DerivePromise::High,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -5624,6 +5653,101 @@ mod sort_partition_limit_tests {
         assert!(
             (result - 50.0).abs() < 1e-9,
             "expected 50.0 with default NDV, got {result}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod promise_tests {
+    use super::*;
+    use crate::sql::analysis::JoinKind;
+    use crate::sql::optimizer::memo::{LogicalProperties, MExpr, Memo};
+    use crate::sql::optimizer::operator::{LogicalJoinOp, Operator, ValuesOp};
+
+    /// Add a leaf group (LogicalValues, no children) to the memo, with
+    /// pre-baked logical_props so child_statistics can read it.
+    fn add_leaf_group(memo: &mut Memo) -> GroupId {
+        let id = memo.next_expr_id();
+        let g = memo.new_group(MExpr {
+            id,
+            op: Operator::LogicalValues(ValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
+            children: vec![],
+        });
+        memo.groups[g].logical_props = Some(LogicalProperties::new(vec![], 1000.0));
+        g
+    }
+
+    /// Add a join group over the given child groups using the given join kind.
+    /// The group gets a LogicalJoin as its first (and only) logical expr.
+    fn add_join_group(memo: &mut Memo, left: GroupId, right: GroupId) -> GroupId {
+        let id = memo.next_expr_id();
+        memo.new_group(MExpr {
+            id,
+            op: Operator::LogicalJoin(LogicalJoinOp {
+                join_type: JoinKind::Inner,
+                condition: None,
+            }),
+            children: vec![left, right],
+        })
+    }
+
+    /// promise() for a join over two base (non-join) leaf groups → High.
+    #[test]
+    fn promise_join_over_base_inputs_is_high() {
+        let mut memo = Memo::new();
+        let left = add_leaf_group(&mut memo);
+        let right = add_leaf_group(&mut memo);
+
+        let op = Operator::LogicalJoin(LogicalJoinOp {
+            join_type: JoinKind::Inner,
+            condition: None,
+        });
+        let children = vec![left, right];
+        assert_eq!(
+            promise(&op, &children, &memo),
+            DerivePromise::High,
+            "join over base inputs must be High"
+        );
+    }
+
+    /// promise() for a bushy join (at least one child group is itself a join) → Medium.
+    #[test]
+    fn promise_bushy_join_is_medium() {
+        let mut memo = Memo::new();
+        let a = add_leaf_group(&mut memo);
+        let b = add_leaf_group(&mut memo);
+        // inner_join = join(a, b) — its first logical_expr is a LogicalJoin
+        let inner_join = add_join_group(&mut memo, a, b);
+        let c = add_leaf_group(&mut memo);
+
+        // bushy_join = join(inner_join, c): left child is a join group → bushy
+        let op = Operator::LogicalJoin(LogicalJoinOp {
+            join_type: JoinKind::Inner,
+            condition: None,
+        });
+        let children = vec![inner_join, c];
+        assert_eq!(
+            promise(&op, &children, &memo),
+            DerivePromise::Medium,
+            "join with a join child must be Medium (bushy)"
+        );
+    }
+
+    /// promise() for a non-join operator (e.g. LogicalValues) → High.
+    #[test]
+    fn promise_non_join_operator_is_high() {
+        let memo = Memo::new();
+        let op = Operator::LogicalValues(ValuesOp {
+            rows: vec![],
+            columns: vec![],
+        });
+        assert_eq!(
+            promise(&op, &[], &memo),
+            DerivePromise::High,
+            "non-join operators must always be High"
         );
     }
 }
