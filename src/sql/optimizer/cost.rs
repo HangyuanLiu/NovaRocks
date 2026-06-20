@@ -257,6 +257,16 @@ fn effective_cost_weight(weight: f64) -> f64 {
     }
 }
 
+fn safe_compute_size(stats: &Statistics) -> f64 {
+    let avg_row_size = stats.avg_row_size();
+    let avg_row_size = if avg_row_size.is_finite() && avg_row_size > 0.0 {
+        avg_row_size
+    } else {
+        8.0
+    };
+    stats.safe_output_row_count() * avg_row_size
+}
+
 impl CostEstimate {
     pub(crate) fn total_with_options(&self, options: &CostOptions) -> Cost {
         self.weighted_total(
@@ -360,7 +370,7 @@ fn scalar_list_complexity(arena: Option<&ScalarArena>, exprs: &[ScalarId]) -> f6
 pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
     match input.op {
         Operator::PhysicalScan(_) => CostEstimate {
-            cpu_cost: input.own_stats.compute_size(),
+            cpu_cost: safe_compute_size(input.own_stats),
             memory_cost: 0.0,
             network_cost: 0.0,
         },
@@ -373,7 +383,7 @@ pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
             let complexity = scalar_complexity(input.scalars, filter.predicate);
             CostEstimate {
                 cpu_cost: input_rows * complexity * input.options.predicate_cost_factor,
-                memory_cost: input.own_stats.compute_size() * 0.05,
+                memory_cost: safe_compute_size(input.own_stats) * 0.05,
                 network_cost: 0.0,
             }
         }
@@ -388,7 +398,7 @@ pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
                 cpu_cost: input_rows
                     * scalar_list_complexity(input.scalars, &exprs)
                     * input.options.projection_cost_factor,
-                memory_cost: input.own_stats.compute_size() * 0.02,
+                memory_cost: safe_compute_size(input.own_stats) * 0.02,
                 network_cost: 0.0,
             }
         }
@@ -400,7 +410,7 @@ pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
                 .unwrap_or_else(|| input.own_stats.safe_output_row_count());
             CostEstimate {
                 cpu_cost: rows * rows.log2().max(1.0) * input.options.sort_cost_factor,
-                memory_cost: input.own_stats.compute_size(),
+                memory_cost: safe_compute_size(input.own_stats),
                 network_cost: 0.0,
             }
         }
@@ -419,7 +429,7 @@ pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
             };
             CostEstimate {
                 cpu_cost: input_rows * k.log2().max(1.0) * input.options.topn_cost_factor,
-                memory_cost: input.own_stats.compute_size(),
+                memory_cost: safe_compute_size(input.own_stats),
                 network_cost: 0.0,
             }
         }
@@ -692,6 +702,37 @@ mod tests {
             topn_estimate.total_with_options(&options)
                 < compute_cost_estimate(&sort_input).total_with_options(&options)
         );
+    }
+
+    #[test]
+    fn cost_estimate_dimensions_are_finite_for_invalid_stats() {
+        let invalid_stats = stats(f64::NAN, f64::INFINITY);
+        let op = Operator::PhysicalSort(SortOp {
+            items: vec![],
+            analytic_partition_exprs: Vec::new(),
+            partition_limit: None,
+            topn_type: None,
+        });
+        let child_stats = [&invalid_stats];
+        let child_outputs = [PhysicalPropertySet::any()];
+        let child_output_refs = [&child_outputs[0]];
+        let required = PhysicalPropertySet::any();
+        let options = CostOptions::default();
+        let input = CostInput {
+            op: &op,
+            own_stats: &invalid_stats,
+            child_stats: &child_stats,
+            child_outputs: &child_output_refs,
+            required_output: &required,
+            alt_kind: &PropertyAlternativeKind::Default,
+            scalars: None,
+            options: &options,
+        };
+
+        let estimate = compute_cost_estimate(&input);
+        assert!(estimate.cpu_cost.is_finite() && estimate.cpu_cost >= 0.0);
+        assert!(estimate.memory_cost.is_finite() && estimate.memory_cost >= 0.0);
+        assert!(estimate.network_cost.is_finite() && estimate.network_cost >= 0.0);
     }
 
     #[test]
