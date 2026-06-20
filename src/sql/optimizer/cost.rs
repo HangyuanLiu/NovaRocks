@@ -32,6 +32,8 @@ const NON_EQUI_JOIN_COST_PENALTY: f64 = 2.0;
 /// NLJ is O(N*M) and should be heavily penalized relative to hash join.
 const NEST_LOOP_COST_PENALTY: f64 = 100.0;
 
+const MAX_FINITE_COST: f64 = 1.0e300;
+
 pub(crate) struct CostInput<'a> {
     pub op: &'a Operator,
     pub own_stats: &'a Statistics,
@@ -258,8 +260,14 @@ fn effective_cost_weight(weight: f64) -> f64 {
 }
 
 fn finite_non_negative_cost(value: f64) -> f64 {
-    if value.is_finite() && value > 0.0 {
-        value
+    if value.is_finite() {
+        if value > 0.0 {
+            value.min(MAX_FINITE_COST)
+        } else {
+            0.0
+        }
+    } else if value.is_infinite() && value.is_sign_positive() {
+        MAX_FINITE_COST
     } else {
         0.0
     }
@@ -390,7 +398,9 @@ pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
                 .unwrap_or_else(|| input.own_stats.safe_output_row_count());
             let complexity = scalar_complexity(input.scalars, filter.predicate);
             CostEstimate {
-                cpu_cost: input_rows * complexity * input.options.predicate_cost_factor,
+                cpu_cost: finite_non_negative_cost(
+                    input_rows * complexity * input.options.predicate_cost_factor,
+                ),
                 memory_cost: safe_compute_size(input.own_stats) * 0.05,
                 network_cost: 0.0,
             }
@@ -403,9 +413,11 @@ pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
                 .unwrap_or_else(|| input.own_stats.safe_output_row_count());
             let exprs: Vec<_> = project.items.iter().map(|item| item.expr).collect();
             CostEstimate {
-                cpu_cost: input_rows
-                    * scalar_list_complexity(input.scalars, &exprs)
-                    * input.options.projection_cost_factor,
+                cpu_cost: finite_non_negative_cost(
+                    input_rows
+                        * scalar_list_complexity(input.scalars, &exprs)
+                        * input.options.projection_cost_factor,
+                ),
                 memory_cost: safe_compute_size(input.own_stats) * 0.02,
                 network_cost: 0.0,
             }
@@ -417,7 +429,9 @@ pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
                 .map(|stats| stats.safe_output_row_count())
                 .unwrap_or_else(|| input.own_stats.safe_output_row_count());
             CostEstimate {
-                cpu_cost: rows * rows.log2().max(1.0) * input.options.sort_cost_factor,
+                cpu_cost: finite_non_negative_cost(
+                    rows * rows.log2().max(1.0) * input.options.sort_cost_factor,
+                ),
                 memory_cost: safe_compute_size(input.own_stats),
                 network_cost: 0.0,
             }
@@ -436,13 +450,15 @@ pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
                 _ => input_rows,
             };
             CostEstimate {
-                cpu_cost: input_rows * k.log2().max(1.0) * input.options.topn_cost_factor,
+                cpu_cost: finite_non_negative_cost(
+                    input_rows * k.log2().max(1.0) * input.options.topn_cost_factor,
+                ),
                 memory_cost: safe_compute_size(input.own_stats),
                 network_cost: 0.0,
             }
         }
         Operator::PhysicalLimit(_) | Operator::PhysicalAssertOneRow(_) => CostEstimate {
-            cpu_cost: input.own_stats.safe_output_row_count() * 0.001,
+            cpu_cost: finite_non_negative_cost(input.own_stats.safe_output_row_count() * 0.001),
             memory_cost: 0.0,
             network_cost: 0.0,
         },
@@ -608,6 +624,20 @@ mod tests {
     }
 
     #[test]
+    fn finite_non_negative_cost_saturates_only_positive_overflow() {
+        assert_eq!(finite_non_negative_cost(42.0), 42.0);
+        assert_eq!(
+            finite_non_negative_cost(MAX_FINITE_COST * 10.0),
+            MAX_FINITE_COST
+        );
+        assert_eq!(finite_non_negative_cost(f64::INFINITY), MAX_FINITE_COST);
+        assert_eq!(finite_non_negative_cost(0.0), 0.0);
+        assert_eq!(finite_non_negative_cost(-1.0), 0.0);
+        assert_eq!(finite_non_negative_cost(f64::NEG_INFINITY), 0.0);
+        assert_eq!(finite_non_negative_cost(f64::NAN), 0.0);
+    }
+
+    #[test]
     fn compute_cost_estimate_returns_dimensions_for_scan() {
         let s = stats(1000.0, 100.0);
         let op = scan_op();
@@ -750,6 +780,36 @@ mod tests {
     }
 
     #[test]
+    fn sort_cost_estimate_cpu_saturates_for_huge_input_rows() {
+        let huge_stats = stats(f64::MAX, 8.0);
+        let op = Operator::PhysicalSort(SortOp {
+            items: vec![],
+            analytic_partition_exprs: Vec::new(),
+            partition_limit: None,
+            topn_type: None,
+        });
+        let child_stats = [&huge_stats];
+        let child_outputs = [PhysicalPropertySet::any()];
+        let child_output_refs = [&child_outputs[0]];
+        let required = PhysicalPropertySet::any();
+        let options = CostOptions::default();
+        let input = CostInput {
+            op: &op,
+            own_stats: &huge_stats,
+            child_stats: &child_stats,
+            child_outputs: &child_output_refs,
+            required_output: &required,
+            alt_kind: &PropertyAlternativeKind::Default,
+            scalars: None,
+            options: &options,
+        };
+
+        let estimate = compute_cost_estimate(&input);
+        assert_finite_non_negative_dimensions(&estimate);
+        assert_eq!(estimate.cpu_cost, MAX_FINITE_COST);
+    }
+
+    #[test]
     fn scan_cost_estimate_dimensions_are_finite_for_overflow_size() {
         let overflow_stats = stats(f64::MAX, f64::MAX);
         let op = scan_op();
@@ -770,6 +830,7 @@ mod tests {
 
         let estimate = compute_cost_estimate(&input);
         assert_finite_non_negative_dimensions(&estimate);
+        assert_eq!(estimate.cpu_cost, MAX_FINITE_COST);
     }
 
     #[test]
