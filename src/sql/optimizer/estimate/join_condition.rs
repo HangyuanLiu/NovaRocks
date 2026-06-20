@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
-use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
+use crate::sql::analysis::{BinOp, LiteralValue};
 use crate::sql::column_id::ColumnId;
+use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence, PREDICATE_UNKNOWN_FILTER};
 
 use super::arith::damped_conjunction;
@@ -18,7 +19,8 @@ pub(crate) struct JoinConditionEstimate {
 }
 
 pub(crate) fn estimate_join_condition(
-    condition: Option<&TypedExpr>,
+    arena: &ScalarArena,
+    condition: Option<ScalarId>,
     left_stats: &HashMap<ColumnId, ColumnStatistic>,
     right_stats: &HashMap<ColumnId, ColumnStatistic>,
 ) -> JoinConditionEstimate {
@@ -29,6 +31,7 @@ pub(crate) fn estimate_join_condition(
     let mut estimate = JoinConditionEstimate::default();
     let mut residuals = Vec::new();
     collect_join_conjuncts(
+        arena,
         condition,
         left_stats,
         right_stats,
@@ -40,7 +43,7 @@ pub(crate) fn estimate_join_condition(
         let combined_stats = combined_column_statistics(left_stats, right_stats);
         let selectivities: Vec<_> = residuals
             .iter()
-            .map(|expr| estimate_join_residual_selectivity(expr, &combined_stats))
+            .map(|expr| estimate_join_residual_selectivity(arena, *expr, &combined_stats))
             .collect();
         estimate.residual_selectivity =
             Some((damped_conjunction(&selectivities), Confidence::Estimated));
@@ -49,27 +52,28 @@ pub(crate) fn estimate_join_condition(
     estimate
 }
 
-fn collect_join_conjuncts<'a>(
-    expr: &'a TypedExpr,
+fn collect_join_conjuncts(
+    arena: &ScalarArena,
+    expr: ScalarId,
     left_stats: &HashMap<ColumnId, ColumnStatistic>,
     right_stats: &HashMap<ColumnId, ColumnStatistic>,
     estimate: &mut JoinConditionEstimate,
-    residuals: &mut Vec<&'a TypedExpr>,
+    residuals: &mut Vec<ScalarId>,
 ) {
-    match &expr.kind {
-        ExprKind::BinaryOp {
+    match arena.node(expr) {
+        ScalarNode::BinaryOp {
             left,
             op: BinOp::And,
             right,
         } => {
-            collect_join_conjuncts(left, left_stats, right_stats, estimate, residuals);
-            collect_join_conjuncts(right, left_stats, right_stats, estimate, residuals);
+            collect_join_conjuncts(arena, *left, left_stats, right_stats, estimate, residuals);
+            collect_join_conjuncts(arena, *right, left_stats, right_stats, estimate, residuals);
         }
-        ExprKind::Nested(inner) => {
-            collect_join_conjuncts(inner, left_stats, right_stats, estimate, residuals);
+        ScalarNode::Nested(inner) => {
+            collect_join_conjuncts(arena, *inner, left_stats, right_stats, estimate, residuals);
         }
         _ => {
-            if !try_collect_equi_key(expr, left_stats, right_stats, estimate) {
+            if !try_collect_equi_key(arena, expr, left_stats, right_stats, estimate) {
                 residuals.push(expr);
             }
         }
@@ -77,36 +81,38 @@ fn collect_join_conjuncts<'a>(
 }
 
 fn try_collect_equi_key(
-    expr: &TypedExpr,
+    arena: &ScalarArena,
+    expr: ScalarId,
     left_stats: &HashMap<ColumnId, ColumnStatistic>,
     right_stats: &HashMap<ColumnId, ColumnStatistic>,
     estimate: &mut JoinConditionEstimate,
 ) -> bool {
-    let ExprKind::BinaryOp {
+    let ScalarNode::BinaryOp {
         left,
         op: BinOp::Eq | BinOp::EqForNull,
         right,
-    } = &expr.kind
+    } = arena.node(expr)
     else {
         return false;
     };
 
-    let Some(left_id) = extract_column_id(left) else {
+    let Some(left_id) = extract_column_id(arena, *left) else {
         return false;
     };
-    let Some(right_id) = extract_column_id(right) else {
+    let Some(right_id) = extract_column_id(arena, *right) else {
         return false;
     };
 
     let forward = left_stats.contains_key(&left_id) && right_stats.contains_key(&right_id);
     let reverse = left_stats.contains_key(&right_id) && right_stats.contains_key(&left_id);
     let (left_expr, right_expr, left_key, right_key) = match (forward, reverse) {
-        (true, false) => (left.as_ref(), right.as_ref(), left_id, right_id),
-        (false, true) => (right.as_ref(), left.as_ref(), right_id, left_id),
+        (true, false) => (*left, *right, left_id, right_id),
+        (false, true) => (*right, *left, right_id, left_id),
         (true, true) if left_id == right_id => {
-            let (left_ndv, left_confidence) = get_join_key_ndv_with_confidence(left, left_stats);
+            let (left_ndv, left_confidence) =
+                get_join_key_ndv_with_confidence(arena, *left, left_stats);
             let (right_ndv, right_confidence) =
-                get_join_key_ndv_with_confidence(right, right_stats);
+                get_join_key_ndv_with_confidence(arena, *right, right_stats);
             estimate.eq_key_ndvs.push((
                 left_ndv,
                 right_ndv,
@@ -118,8 +124,10 @@ fn try_collect_equi_key(
     };
 
     estimate.eq_key_pairs.push((left_key, right_key));
-    let (left_ndv, left_confidence) = get_join_key_ndv_with_confidence(left_expr, left_stats);
-    let (right_ndv, right_confidence) = get_join_key_ndv_with_confidence(right_expr, right_stats);
+    let (left_ndv, left_confidence) =
+        get_join_key_ndv_with_confidence(arena, left_expr, left_stats);
+    let (right_ndv, right_confidence) =
+        get_join_key_ndv_with_confidence(arena, right_expr, right_stats);
     estimate.eq_key_ndvs.push((
         left_ndv,
         right_ndv,
@@ -129,12 +137,13 @@ fn try_collect_equi_key(
 }
 
 fn estimate_join_residual_selectivity(
-    expr: &TypedExpr,
+    arena: &ScalarArena,
+    expr: ScalarId,
     column_stats: &HashMap<ColumnId, ColumnStatistic>,
 ) -> f64 {
-    let selectivity = estimate_selectivity(expr, column_stats);
+    let selectivity = estimate_selectivity(arena, expr, column_stats);
     if (selectivity - PREDICATE_UNKNOWN_FILTER).abs() < f64::EPSILON
-        && is_unknown_column_literal_eq(expr, column_stats)
+        && is_unknown_column_literal_eq(arena, expr, column_stats)
     {
         UNKNOWN_JOIN_RESIDUAL_EQ_FILTER
     } else {
@@ -143,22 +152,25 @@ fn estimate_join_residual_selectivity(
 }
 
 fn is_unknown_column_literal_eq(
-    expr: &TypedExpr,
+    arena: &ScalarArena,
+    expr: ScalarId,
     column_stats: &HashMap<ColumnId, ColumnStatistic>,
 ) -> bool {
-    let ExprKind::BinaryOp {
+    let ScalarNode::BinaryOp {
         left,
         op: BinOp::Eq | BinOp::EqForNull,
         right,
-    } = &expr.kind
+    } = arena.node(expr)
     else {
         return false;
     };
 
-    let Some(column_id) = extract_column_id(left).or_else(|| extract_column_id(right)) else {
+    let Some(column_id) =
+        extract_column_id(arena, *left).or_else(|| extract_column_id(arena, *right))
+    else {
         return false;
     };
-    if !(is_literal_like(left) || is_literal_like(right)) {
+    if !(is_literal_like(arena, *left) || is_literal_like(arena, *right)) {
         return false;
     }
     column_stats
@@ -166,17 +178,22 @@ fn is_unknown_column_literal_eq(
         .map_or(true, |cs| cs.distinct_values_count <= 1.0)
 }
 
-fn is_literal_like(expr: &TypedExpr) -> bool {
-    match &expr.kind {
-        ExprKind::Literal(LiteralValue::Null)
-        | ExprKind::Literal(LiteralValue::Bool(_))
-        | ExprKind::Literal(LiteralValue::Int(_))
-        | ExprKind::Literal(LiteralValue::LargeInt(_))
-        | ExprKind::Literal(LiteralValue::Float(_))
-        | ExprKind::Literal(LiteralValue::Decimal(_))
-        | ExprKind::Literal(LiteralValue::String(_))
-        | ExprKind::Literal(LiteralValue::Binary(_)) => true,
-        ExprKind::Cast { expr, .. } | ExprKind::Nested(expr) => is_literal_like(expr),
+fn is_literal_like(arena: &ScalarArena, expr: ScalarId) -> bool {
+    match arena.node(expr) {
+        ScalarNode::Literal(lit) => matches!(
+            &lit.0,
+            LiteralValue::Null
+                | LiteralValue::Bool(_)
+                | LiteralValue::Int(_)
+                | LiteralValue::LargeInt(_)
+                | LiteralValue::Float(_)
+                | LiteralValue::Decimal(_)
+                | LiteralValue::String(_)
+                | LiteralValue::Binary(_)
+        ),
+        ScalarNode::Cast { child, .. } | ScalarNode::Nested(child) => {
+            is_literal_like(arena, *child)
+        }
         _ => false,
     }
 }

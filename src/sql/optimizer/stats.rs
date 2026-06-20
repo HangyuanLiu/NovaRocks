@@ -2403,6 +2403,15 @@ mod tests {
         crate::sql::optimizer::convert::opt_expr_to_memo(&opt_expr, memo)
     }
 
+    fn estimate_selectivity_for_test(
+        expr: &TypedExpr,
+        column_stats: &HashMap<ColumnId, ColumnStatistic>,
+    ) -> f64 {
+        let mut arena = ScalarArena::new();
+        let id = intern_typed(&mut arena, expr);
+        estimate_selectivity(&arena, id, column_stats)
+    }
+
     fn test_iceberg_table_info() -> IcebergTableInfo {
         IcebergTableInfo {
             catalog: "test_catalog".to_string(),
@@ -5317,7 +5326,7 @@ mod tests {
         // a BETWEEN 0 AND 50 over [0,100]: ge = clamp((100-0+1)/100) = 0.99,
         // le = (50-0+1)/100 = 0.51, product ≈ 0.5049.
         let pred = between_expr(col_ref("a"), int_lit(0), int_lit(50));
-        let sel = estimate_selectivity(&pred, &cs);
+        let sel = estimate_selectivity_for_test(&pred, &cs);
         assert!(sel > 0.45 && sel < 0.56, "between selectivity was {sel}");
     }
 
@@ -5342,7 +5351,7 @@ mod tests {
                 negated: true,
             },
         };
-        let sel = estimate_selectivity(&pred, &cs);
+        let sel = estimate_selectivity_for_test(&pred, &cs);
         assert!(
             sel > 0.85 && sel < 0.93,
             "not-between selectivity was {sel}"

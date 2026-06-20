@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use crate::sql::analysis::TypedExpr;
 use crate::sql::column_id::ColumnId;
+use crate::sql::optimizer::scalar::{ScalarArena, ScalarId};
 use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence};
 
 use super::arith::sat_mul;
@@ -12,23 +12,26 @@ const DEFAULT_JOIN_KEY_NDV: f64 = 40.0;
 
 /// Get the NDV for an expression from column statistics.
 pub(crate) fn get_expr_ndv(
-    expr: &TypedExpr,
+    arena: &ScalarArena,
+    expr: ScalarId,
     column_stats: &HashMap<ColumnId, ColumnStatistic>,
 ) -> f64 {
-    real_expr_ndv(expr, column_stats)
+    real_expr_ndv(arena, expr, column_stats)
         .map(|(ndv, _)| ndv)
         .unwrap_or(DEFAULT_EXPR_NDV)
 }
 
 pub(crate) fn get_join_key_ndv_with_confidence(
-    expr: &TypedExpr,
+    arena: &ScalarArena,
+    expr: ScalarId,
     column_stats: &HashMap<ColumnId, ColumnStatistic>,
 ) -> (f64, Confidence) {
-    real_expr_ndv(expr, column_stats).unwrap_or((DEFAULT_JOIN_KEY_NDV, Confidence::Fallback))
+    real_expr_ndv(arena, expr, column_stats).unwrap_or((DEFAULT_JOIN_KEY_NDV, Confidence::Fallback))
 }
 
 fn real_expr_ndv(
-    expr: &TypedExpr,
+    arena: &ScalarArena,
+    expr: ScalarId,
     column_stats: &HashMap<ColumnId, ColumnStatistic>,
 ) -> Option<(f64, Confidence)> {
     // A column is only useful for cardinality if it carries a real NDV (> 1).
@@ -37,7 +40,7 @@ fn real_expr_ndv(
     // join-key estimation divide left*right by ~1 and explode joins to near
     // cross-products. Mirror the `> 1.0` guard estimate_eq_selectivity uses and
     // fall back to the default NDV for unknown/degenerate columns.
-    if let Some(column_id) = extract_column_id(expr)
+    if let Some(column_id) = extract_column_id(arena, expr)
         && let Some(cs) = column_stats.get(&column_id)
         && cs.distinct_values_count > 1.0
     {
@@ -117,6 +120,7 @@ mod tests {
     use crate::sql::analysis::{ExprKind, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::estimate::arith::MAX_ROW_COUNT;
+    use crate::sql::optimizer::scalar::intern_typed;
     use crate::sql::optimizer::statistics::ColumnStatistic;
 
     fn test_col_id(name: &str) -> ColumnId {
@@ -141,6 +145,12 @@ mod tests {
         }
     }
 
+    fn expr_id(expr: &TypedExpr) -> (ScalarArena, ScalarId) {
+        let mut arena = ScalarArena::new();
+        let id = intern_typed(&mut arena, expr);
+        (arena, id)
+    }
+
     #[test]
     fn get_expr_ndv_ignores_unknown_ndv() {
         // OQ-3 propagates ColumnStatistic::unknown() (distinct_values_count = 1.0)
@@ -153,7 +163,11 @@ mod tests {
             1.0
         );
         let unknown_expr = col_ref("unknown_col");
-        assert_eq!(get_expr_ndv(&unknown_expr, &column_stats), DEFAULT_EXPR_NDV);
+        let (arena, unknown_id) = expr_id(&unknown_expr);
+        assert_eq!(
+            get_expr_ndv(&arena, unknown_id, &column_stats),
+            DEFAULT_EXPR_NDV
+        );
 
         // A degenerate ndv of exactly 1.0 (not via unknown()) is also ignored.
         column_stats.insert(
@@ -168,8 +182,9 @@ mod tests {
             },
         );
         let degenerate_expr = col_ref("degenerate_col");
+        let (arena, degenerate_id) = expr_id(&degenerate_expr);
         assert_eq!(
-            get_expr_ndv(&degenerate_expr, &column_stats),
+            get_expr_ndv(&arena, degenerate_id, &column_stats),
             DEFAULT_EXPR_NDV
         );
 
@@ -186,11 +201,16 @@ mod tests {
             },
         );
         let real_expr = col_ref("real_col");
-        assert_eq!(get_expr_ndv(&real_expr, &column_stats), 50.0);
+        let (arena, real_id) = expr_id(&real_expr);
+        assert_eq!(get_expr_ndv(&arena, real_id, &column_stats), 50.0);
 
         // An unknown column reference (absent from the map) also defaults.
         let missing_expr = col_ref("missing_col");
-        assert_eq!(get_expr_ndv(&missing_expr, &column_stats), DEFAULT_EXPR_NDV);
+        let (arena, missing_id) = expr_id(&missing_expr);
+        assert_eq!(
+            get_expr_ndv(&arena, missing_id, &column_stats),
+            DEFAULT_EXPR_NDV
+        );
     }
 
     #[test]
@@ -199,7 +219,8 @@ mod tests {
         column_stats.insert(test_col_id("unknown_col"), ColumnStatistic::unknown());
 
         let unknown_expr = col_ref("unknown_col");
-        let (ndv, confidence) = get_join_key_ndv_with_confidence(&unknown_expr, &column_stats);
+        let (arena, unknown_id) = expr_id(&unknown_expr);
+        let (ndv, confidence) = get_join_key_ndv_with_confidence(&arena, unknown_id, &column_stats);
         assert_eq!(ndv, DEFAULT_JOIN_KEY_NDV);
         assert_eq!(confidence, Confidence::Fallback);
 
@@ -212,7 +233,8 @@ mod tests {
             },
         );
         let real_expr = col_ref("real_col");
-        let (ndv, confidence) = get_join_key_ndv_with_confidence(&real_expr, &column_stats);
+        let (arena, real_id) = expr_id(&real_expr);
+        let (ndv, confidence) = get_join_key_ndv_with_confidence(&arena, real_id, &column_stats);
         assert_eq!(ndv, 50.0);
         assert_eq!(confidence, Confidence::Exact);
     }
@@ -232,7 +254,8 @@ mod tests {
         );
 
         let expr = col_ref("real_col");
-        let (ndv, confidence) = get_join_key_ndv_with_confidence(&expr, &column_stats);
+        let (arena, id) = expr_id(&expr);
+        let (ndv, confidence) = get_join_key_ndv_with_confidence(&arena, id, &column_stats);
 
         assert_eq!(ndv, 1_000.0);
         assert_eq!(confidence, Confidence::Estimated);

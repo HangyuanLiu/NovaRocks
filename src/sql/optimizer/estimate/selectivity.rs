@@ -4,8 +4,9 @@ use std::collections::HashMap;
 
 use arrow::datatypes::DataType;
 
-use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr, UnOp};
+use crate::sql::analysis::{BinOp, LiteralValue, UnOp};
 use crate::sql::column_id::ColumnId;
+use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 use crate::sql::optimizer::statistics::{
     ColumnStatistic, Confidence, IN_PREDICATE_DEFAULT_FILTER, IS_NULL_FILTER,
     PREDICATE_UNKNOWN_FILTER,
@@ -15,34 +16,37 @@ use super::arith::{damped_conjunction, sat_mul};
 
 /// Estimate selectivity of a predicate expression (0.0..1.0).
 pub(crate) fn estimate_selectivity(
-    expr: &TypedExpr,
+    arena: &ScalarArena,
+    expr: ScalarId,
     column_stats: &HashMap<ColumnId, ColumnStatistic>,
 ) -> f64 {
-    match &expr.kind {
-        ExprKind::BinaryOp { left, op, right } => match op {
+    match arena.node(expr) {
+        ScalarNode::BinaryOp { left, op, right } => match op {
             BinOp::And => {
                 let mut conjuncts = Vec::new();
-                flatten_and(expr, &mut conjuncts);
+                flatten_and(arena, expr, &mut conjuncts);
                 let sels: Vec<f64> = conjuncts
                     .iter()
-                    .map(|c| estimate_selectivity(c, column_stats))
+                    .map(|c| estimate_selectivity(arena, *c, column_stats))
                     .collect();
                 damped_conjunction(&sels)
             }
             BinOp::Or => {
-                let l = estimate_selectivity(left, column_stats);
-                let r = estimate_selectivity(right, column_stats);
+                let l = estimate_selectivity(arena, *left, column_stats);
+                let r = estimate_selectivity(arena, *right, column_stats);
                 l + r - l * r
             }
-            BinOp::Eq | BinOp::EqForNull => estimate_eq_selectivity(left, right, column_stats),
-            BinOp::Ne => 1.0 - estimate_eq_selectivity(left, right, column_stats),
+            BinOp::Eq | BinOp::EqForNull => {
+                estimate_eq_selectivity(arena, *left, *right, column_stats)
+            }
+            BinOp::Ne => 1.0 - estimate_eq_selectivity(arena, *left, *right, column_stats),
             BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                estimate_range_selectivity(left, right, *op, column_stats)
+                estimate_range_selectivity(arena, *left, *right, *op, column_stats)
             }
             _ => PREDICATE_UNKNOWN_FILTER,
         },
-        ExprKind::IsNull { negated, expr } => {
-            let col_id = extract_column_id(expr);
+        ScalarNode::IsNull { negated, child } => {
+            let col_id = extract_column_id(arena, *child);
             let null_frac = col_id
                 .and_then(|column_id| column_stats.get(&column_id))
                 .map(|cs| {
@@ -55,12 +59,12 @@ pub(crate) fn estimate_selectivity(
                 .unwrap_or(IS_NULL_FILTER);
             if *negated { 1.0 - null_frac } else { null_frac }
         }
-        ExprKind::InList {
-            expr,
+        ScalarNode::InList {
+            child,
             list,
             negated,
         } => {
-            let col_id = extract_column_id(expr);
+            let col_id = extract_column_id(arena, *child);
             let ndv = col_id
                 .and_then(|column_id| column_stats.get(&column_id))
                 .and_then(trusted_distinct_values_count);
@@ -72,34 +76,34 @@ pub(crate) fn estimate_selectivity(
             };
             if *negated { 1.0 - sel } else { sel }
         }
-        ExprKind::Between {
+        ScalarNode::Between {
             negated,
-            expr,
+            child,
             low,
             high,
         } => {
             // a BETWEEN low AND high  ==  a >= low AND a <= high
             // Keep BETWEEN as a direct range-bound product; generic AND
             // conjunctions use damped_conjunction to avoid collapse.
-            let ge = estimate_range_selectivity(expr, low, BinOp::Ge, column_stats);
-            let le = estimate_range_selectivity(expr, high, BinOp::Le, column_stats);
+            let ge = estimate_range_selectivity(arena, *child, *low, BinOp::Ge, column_stats);
+            let le = estimate_range_selectivity(arena, *child, *high, BinOp::Le, column_stats);
             let sel = ge * le;
             if *negated { 1.0 - sel } else { sel }
         }
-        ExprKind::Like { negated, .. } => {
+        ScalarNode::Like { negated, .. } => {
             let sel = PREDICATE_UNKNOWN_FILTER;
             if *negated { 1.0 - sel } else { sel }
         }
-        ExprKind::UnaryOp {
+        ScalarNode::UnaryOp {
             op: UnOp::Not,
-            expr,
-        } => 1.0 - estimate_selectivity(expr, column_stats),
-        ExprKind::IsTruthValue { negated, .. } => {
+            child,
+        } => 1.0 - estimate_selectivity(arena, *child, column_stats),
+        ScalarNode::IsTruthValue { negated, .. } => {
             // IS TRUE / IS NOT TRUE / IS FALSE / IS NOT FALSE
             let base = 0.5;
             if *negated { 1.0 - base } else { base }
         }
-        ExprKind::Nested(inner) => estimate_selectivity(inner, column_stats),
+        ScalarNode::Nested(inner) => estimate_selectivity(arena, *inner, column_stats),
         _ => PREDICATE_UNKNOWN_FILTER,
     }
 }
@@ -132,37 +136,39 @@ pub(crate) fn apply_filter(
 }
 
 /// Flatten a left/right-nested AND tree into its leaf conjuncts.
-fn flatten_and<'a>(expr: &'a TypedExpr, out: &mut Vec<&'a TypedExpr>) {
-    if let ExprKind::BinaryOp {
+fn flatten_and(arena: &ScalarArena, expr: ScalarId, out: &mut Vec<ScalarId>) {
+    if let ScalarNode::BinaryOp {
         op: BinOp::And,
         left,
         right,
-    } = &expr.kind
+    } = arena.node(expr)
     {
-        flatten_and(left, out);
-        flatten_and(right, out);
-    } else if let ExprKind::Nested(inner) = &expr.kind {
-        flatten_and(inner, out);
+        flatten_and(arena, *left, out);
+        flatten_and(arena, *right, out);
+    } else if let ScalarNode::Nested(inner) = arena.node(expr) {
+        flatten_and(arena, *inner, out);
     } else {
         out.push(expr);
     }
 }
 
 fn estimate_eq_selectivity(
-    left: &TypedExpr,
-    right: &TypedExpr,
+    arena: &ScalarArena,
+    left: ScalarId,
+    right: ScalarId,
     column_stats: &HashMap<ColumnId, ColumnStatistic>,
 ) -> f64 {
     // col = literal: prefer trusted NDV, then finite min/max for discrete
     // numeric domains when NDV is only a fallback heuristic.
-    if let Some((column_id, column_expr, literal_expr)) = extract_column_literal_pair(left, right)
+    if let Some((column_id, column_expr, literal_expr)) =
+        extract_column_literal_pair(arena, left, right)
         && let Some(cs) = column_stats.get(&column_id)
     {
         if let Some(ndv) = trusted_distinct_values_count(cs) {
             return 1.0 / ndv;
         }
         if let Some(selectivity) =
-            discrete_domain_equality_selectivity(column_expr, literal_expr, cs)
+            discrete_domain_equality_selectivity(arena, column_expr, literal_expr, cs)
         {
             return selectivity;
         }
@@ -170,17 +176,18 @@ fn estimate_eq_selectivity(
     PREDICATE_UNKNOWN_FILTER
 }
 
-fn extract_column_literal_pair<'a>(
-    left: &'a TypedExpr,
-    right: &'a TypedExpr,
-) -> Option<(ColumnId, &'a TypedExpr, &'a TypedExpr)> {
-    if let Some(column_id) = extract_column_id(left)
-        && extract_literal_f64(right).is_some()
+fn extract_column_literal_pair(
+    arena: &ScalarArena,
+    left: ScalarId,
+    right: ScalarId,
+) -> Option<(ColumnId, ScalarId, ScalarId)> {
+    if let Some(column_id) = extract_column_id(arena, left)
+        && extract_literal_f64(arena, right).is_some()
     {
         return Some((column_id, left, right));
     }
-    if let Some(column_id) = extract_column_id(right)
-        && extract_literal_f64(left).is_some()
+    if let Some(column_id) = extract_column_id(arena, right)
+        && extract_literal_f64(arena, left).is_some()
     {
         return Some((column_id, right, left));
     }
@@ -199,11 +206,12 @@ fn trusted_distinct_values_count(stat: &ColumnStatistic) -> Option<f64> {
 }
 
 fn discrete_domain_equality_selectivity(
-    column_expr: &TypedExpr,
-    literal_expr: &TypedExpr,
+    arena: &ScalarArena,
+    column_expr: ScalarId,
+    literal_expr: ScalarId,
     stat: &ColumnStatistic,
 ) -> Option<f64> {
-    if !is_discrete_numeric_domain(&column_expr.data_type) {
+    if !is_discrete_numeric_domain(arena.data_type(column_expr)) {
         return None;
     }
     let min = stat.min_value;
@@ -211,7 +219,7 @@ fn discrete_domain_equality_selectivity(
     if !min.is_finite() || !max.is_finite() || max < min {
         return None;
     }
-    let value = extract_literal_f64(literal_expr)?;
+    let value = extract_literal_f64(arena, literal_expr)?;
     if value < min || value > max {
         return Some(0.0);
     }
@@ -236,14 +244,15 @@ fn is_discrete_numeric_domain(data_type: &DataType) -> bool {
 }
 
 fn estimate_range_selectivity(
-    left: &TypedExpr,
-    right: &TypedExpr,
+    arena: &ScalarArena,
+    left: ScalarId,
+    right: ScalarId,
     op: BinOp,
     column_stats: &HashMap<ColumnId, ColumnStatistic>,
 ) -> f64 {
     // Try to use min/max range if available.
-    let col_id = extract_column_id(left);
-    let literal_val = extract_literal_f64(right);
+    let col_id = extract_column_id(arena, left);
+    let literal_val = extract_literal_f64(arena, right);
 
     if let (Some(column_id), Some(val)) = (col_id, literal_val)
         && let Some(cs) = column_stats.get(&column_id)
@@ -264,24 +273,27 @@ fn estimate_range_selectivity(
     0.5 // default for range predicates
 }
 
-fn extract_literal_f64(expr: &TypedExpr) -> Option<f64> {
-    match &expr.kind {
-        ExprKind::Literal(LiteralValue::Int(v)) => Some(*v as f64),
-        ExprKind::Literal(LiteralValue::LargeInt(v)) => Some(*v as f64),
-        ExprKind::Literal(LiteralValue::Float(v)) => Some(*v),
-        ExprKind::Literal(LiteralValue::Decimal(s)) => s.parse::<f64>().ok(),
-        ExprKind::Cast { expr, .. } => extract_literal_f64(expr),
-        ExprKind::Nested(inner) => extract_literal_f64(inner),
+fn extract_literal_f64(arena: &ScalarArena, expr: ScalarId) -> Option<f64> {
+    match arena.node(expr) {
+        ScalarNode::Literal(lit) => match &lit.0 {
+            LiteralValue::Int(v) => Some(*v as f64),
+            LiteralValue::LargeInt(v) => Some(*v as f64),
+            LiteralValue::Float(v) => Some(*v),
+            LiteralValue::Decimal(s) => s.parse::<f64>().ok(),
+            _ => None,
+        },
+        ScalarNode::Cast { child, .. } => extract_literal_f64(arena, *child),
+        ScalarNode::Nested(inner) => extract_literal_f64(arena, *inner),
         _ => None,
     }
 }
 
 /// Extract ColumnId from a simple column reference expression.
-pub(crate) fn extract_column_id(expr: &TypedExpr) -> Option<ColumnId> {
-    match &expr.kind {
-        ExprKind::ColumnRef { column_id, .. } if *column_id != ColumnId::UNSET => Some(*column_id),
-        ExprKind::Cast { expr, .. } => extract_column_id(expr),
-        ExprKind::Nested(inner) => extract_column_id(inner),
+pub(crate) fn extract_column_id(arena: &ScalarArena, expr: ScalarId) -> Option<ColumnId> {
+    match arena.node(expr) {
+        ScalarNode::ColumnRef(column_id) if *column_id != ColumnId::UNSET => Some(*column_id),
+        ScalarNode::Cast { child, .. } => extract_column_id(arena, *child),
+        ScalarNode::Nested(inner) => extract_column_id(arena, *inner),
         _ => None,
     }
 }
@@ -291,6 +303,7 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
     use crate::sql::optimizer::statistics::Confidence;
     use arrow::datatypes::DataType;
     use std::collections::HashMap;
@@ -367,6 +380,12 @@ mod tests {
         assert!(rows >= 0.0, "row count must be non-negative: {rows}");
     }
 
+    fn estimate_typed(expr: &TypedExpr, column_stats: &HashMap<ColumnId, ColumnStatistic>) -> f64 {
+        let mut arena = ScalarArena::new();
+        let id = intern_typed(&mut arena, expr);
+        estimate_selectivity(&arena, id, column_stats)
+    }
+
     #[test]
     fn tiny_selectivity_floors_and_downgrades() {
         let (rows, conf) = apply_filter(1000.0, Confidence::Exact, 1e-6);
@@ -423,10 +442,7 @@ mod tests {
         );
         let predicate = eq(col("c", 1), int_lit(7));
 
-        assert_eq!(
-            estimate_selectivity(&predicate, &stats),
-            PREDICATE_UNKNOWN_FILTER
-        );
+        assert_eq!(estimate_typed(&predicate, &stats), PREDICATE_UNKNOWN_FILTER);
     }
 
     #[test]
@@ -444,7 +460,7 @@ mod tests {
         );
         let predicate = eq(col("d_year", 1), int_lit(1999));
 
-        let selectivity = estimate_selectivity(&predicate, &stats);
+        let selectivity = estimate_typed(&predicate, &stats);
 
         assert!(
             (selectivity - (1.0 / 201.0)).abs() < 1e-12,
@@ -474,7 +490,7 @@ mod tests {
         };
 
         assert_eq!(
-            estimate_selectivity(&predicate, &stats),
+            estimate_typed(&predicate, &stats),
             IN_PREDICATE_DEFAULT_FILTER
         );
     }
@@ -484,7 +500,7 @@ mod tests {
         // Construct a=? AND b=? AND c=? AND d=? AND e=? with no column stats:
         // each equality falls back to 0.25.
         let preds = and_of_unknown_eq(5);
-        let sel = estimate_selectivity(&preds, &HashMap::new());
+        let sel = estimate_typed(&preds, &HashMap::new());
         assert!(sel > 0.01, "5x0.25 AND must not collapse to ~0.001: {sel}");
         assert!(sel <= 0.25, "must not exceed strongest conjunct");
     }
@@ -498,8 +514,8 @@ mod tests {
         let grouped = and(nested(and(p1.clone(), p2.clone())), p3.clone());
         let flat = and(and(p1, p2), p3);
 
-        let grouped_sel = estimate_selectivity(&grouped, &HashMap::new());
-        let flat_sel = estimate_selectivity(&flat, &HashMap::new());
+        let grouped_sel = estimate_typed(&grouped, &HashMap::new());
+        let flat_sel = estimate_typed(&flat, &HashMap::new());
         assert!(
             (grouped_sel - flat_sel).abs() < 1e-12,
             "nested AND selectivity {grouped_sel} must match flat AND {flat_sel}"
