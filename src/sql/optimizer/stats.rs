@@ -20,7 +20,6 @@ use crate::sql::optimizer::estimate::cardinality::{
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 use crate::sql::optimizer::statistics::*;
-use crate::sql::planner::plan::LogicalPlanNode;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -688,28 +687,6 @@ pub(crate) fn derive_statistics(
             )
         }
     }
-}
-
-pub(crate) fn derive_logical_plan_statistics(
-    plan: &LogicalPlanNode,
-    table_stats: &HashMap<String, TableStatistics>,
-) -> Statistics {
-    let mut memo = Memo::new();
-    let root_group = super::convert::logical_plan_to_memo(plan, &mut memo);
-    derive_group_statistics(&mut memo, table_stats);
-    memo.groups
-        .get(root_group)
-        .and_then(|group| group.logical_props.as_ref())
-        .map(|props| Statistics {
-            output_row_count: props.row_count,
-            row_count_confidence: props.row_count_confidence,
-            column_statistics: props.column_statistics.clone(),
-        })
-        .unwrap_or_else(|| Statistics {
-            output_row_count: 1.0,
-            row_count_confidence: Confidence::Fallback,
-            column_statistics: HashMap::new(),
-        })
 }
 
 pub(crate) fn derive_opt_expr_statistics(
@@ -2410,7 +2387,6 @@ mod tests {
     use crate::sql::catalog::{
         ColumnDef, IcebergDataFileInfo, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
-    use crate::sql::optimizer::convert::logical_plan_to_memo;
     use crate::sql::optimizer::estimate::selectivity::estimate_selectivity;
     use crate::sql::optimizer::memo::Memo;
     use crate::sql::optimizer::scalar::intern_typed;
@@ -2419,6 +2395,13 @@ mod tests {
     };
     use crate::sql::planner::plan::*;
     use arrow::datatypes::DataType;
+
+    fn logical_plan_to_memo_for_test(plan: &LogicalPlanNode, memo: &mut Memo) -> GroupId {
+        let opt_expr =
+            crate::sql::optimizer::convert::try_logical_plan_to_opt_expr(plan, &mut memo.scalars)
+                .expect("logical plan to opt expr");
+        crate::sql::optimizer::convert::opt_expr_to_memo(&opt_expr, memo)
+    }
 
     fn test_iceberg_table_info() -> IcebergTableInfo {
         IcebergTableInfo {
@@ -2578,7 +2561,7 @@ mod tests {
         let plan = scan_plan_with_predicates("unknown_tbl", &["a"], vec![pred]);
 
         let mut memo = Memo::new();
-        logical_plan_to_memo(&plan, &mut memo);
+        logical_plan_to_memo_for_test(&plan, &mut memo);
         derive_group_statistics(&mut memo, &table_stats);
 
         // default_rows("unknown_tbl") = 100000; unknown-column eq selectivity
@@ -2607,7 +2590,7 @@ mod tests {
         let plan = scan_plan("orders", &["id", "status", "missing"]);
 
         let mut memo = Memo::new();
-        logical_plan_to_memo(&plan, &mut memo);
+        logical_plan_to_memo_for_test(&plan, &mut memo);
         derive_group_statistics(&mut memo, &table_stats);
 
         let props = memo.groups[0].logical_props.as_ref().unwrap();
@@ -2636,7 +2619,7 @@ mod tests {
             scan_plan_with_predicates("orders", &["id"], vec![eq_expr(col_ref("id"), int_lit(42))]);
 
         let mut memo = Memo::new();
-        logical_plan_to_memo(&plan, &mut memo);
+        logical_plan_to_memo_for_test(&plan, &mut memo);
         derive_group_statistics(&mut memo, &table_stats);
 
         let props = memo.groups[0].logical_props.as_ref().unwrap();
@@ -2653,7 +2636,7 @@ mod tests {
             scan_plan_with_predicates("orders", &["id"], vec![eq_expr(col_ref("id"), int_lit(42))]);
 
         let mut memo = Memo::new();
-        logical_plan_to_memo(&plan, &mut memo);
+        logical_plan_to_memo_for_test(&plan, &mut memo);
         derive_group_statistics(&mut memo, &table_stats);
 
         let props = memo.groups[0].logical_props.as_ref().unwrap();
@@ -3620,7 +3603,7 @@ mod tests {
 
         let plan = scan_plan("orders", &["id"]);
         let mut memo = Memo::new();
-        logical_plan_to_memo(&plan, &mut memo);
+        logical_plan_to_memo_for_test(&plan, &mut memo);
         derive_group_statistics(&mut memo, &table_stats);
 
         let props = memo.groups[0].logical_props.as_ref().unwrap();
@@ -3644,7 +3627,7 @@ mod tests {
         );
 
         let mut memo = Memo::new();
-        logical_plan_to_memo(&plan, &mut memo);
+        logical_plan_to_memo_for_test(&plan, &mut memo);
         derive_group_statistics(&mut memo, &table_stats);
 
         // Scan group (0): 10000 rows
@@ -4527,7 +4510,7 @@ mod tests {
         );
 
         let mut memo = Memo::new();
-        logical_plan_to_memo(&plan, &mut memo);
+        logical_plan_to_memo_for_test(&plan, &mut memo);
         derive_group_statistics(&mut memo, &table_stats);
 
         // Join group should have stats derived.
@@ -4562,7 +4545,7 @@ mod tests {
         );
 
         let mut memo = Memo::new();
-        logical_plan_to_memo(&plan, &mut memo);
+        logical_plan_to_memo_for_test(&plan, &mut memo);
         derive_group_statistics(&mut memo, &table_stats);
 
         // Agg group: real NDV(status)=5 now flows through child_statistics,
@@ -4588,7 +4571,7 @@ mod tests {
         );
 
         let mut memo = Memo::new();
-        logical_plan_to_memo(&plan, &mut memo);
+        logical_plan_to_memo_for_test(&plan, &mut memo);
         derive_group_statistics(&mut memo, &table_stats);
 
         let limit_props = memo.groups[1].logical_props.as_ref().unwrap();
@@ -4641,7 +4624,7 @@ mod tests {
         );
 
         let mut memo = Memo::new();
-        logical_plan_to_memo(&anchor, &mut memo);
+        logical_plan_to_memo_for_test(&anchor, &mut memo);
         derive_group_statistics(&mut memo, &table_stats);
 
         // Group 0: Scan (250000 rows from table stats)
@@ -4887,7 +4870,7 @@ mod tests {
         );
 
         let mut memo = Memo::new();
-        logical_plan_to_memo(&anchor, &mut memo);
+        logical_plan_to_memo_for_test(&anchor, &mut memo);
         derive_group_statistics(&mut memo, &table_stats);
 
         // Group 2: CTEConsume — must now carry the producer's column statistics.
@@ -4955,7 +4938,7 @@ mod tests {
         );
 
         let mut memo = Memo::new();
-        logical_plan_to_memo(&plan, &mut memo);
+        logical_plan_to_memo_for_test(&plan, &mut memo);
         derive_group_statistics(&mut memo, &HashMap::new());
 
         let props = memo.groups[0].logical_props.as_ref().unwrap();
@@ -5251,7 +5234,7 @@ mod tests {
         );
 
         let mut memo = Memo::new();
-        logical_plan_to_memo(&plan, &mut memo);
+        logical_plan_to_memo_for_test(&plan, &mut memo);
         derive_group_statistics(&mut memo, &HashMap::new());
 
         let props = memo.groups[1].logical_props.as_ref().unwrap();
@@ -5291,7 +5274,7 @@ mod tests {
         );
 
         let mut memo = Memo::new();
-        logical_plan_to_memo(&plan, &mut memo);
+        logical_plan_to_memo_for_test(&plan, &mut memo);
         derive_group_statistics(&mut memo, &table_stats);
 
         // Group 0 is the scan; group 1 is Decode.

@@ -586,21 +586,6 @@ pub(crate) fn opt_expr_to_logical_plan(expr: OptExpr, arena: &ScalarArena) -> Lo
     LogicalPlanNode::new(kind, children, expr.required_output_columns)
 }
 
-/// Convert a `LogicalPlanNode` tree into Memo groups (Bridge 1 + copy-in).
-pub(crate) fn try_logical_plan_to_memo(
-    plan: &LogicalPlanNode,
-    memo: &mut Memo,
-) -> Result<GroupId, String> {
-    let opt_expr = try_logical_plan_to_opt_expr(plan, &mut memo.scalars)?;
-    Ok(opt_expr_to_memo(&opt_expr, memo))
-}
-
-/// Convert a `LogicalPlanNode` tree into Memo groups (Bridge 1 + copy-in).
-/// Kept as a thin wrapper so existing non-Result test call sites are unchanged.
-pub(crate) fn logical_plan_to_memo(plan: &LogicalPlanNode, memo: &mut Memo) -> GroupId {
-    try_logical_plan_to_memo(plan, memo).expect("invalid logical plan stage")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -615,6 +600,12 @@ mod tests {
         ScanVariantColumn,
     };
     use arrow::datatypes::DataType;
+
+    fn logical_plan_to_memo_for_test(plan: &LogicalPlanNode, memo: &mut Memo) -> GroupId {
+        let opt_expr = try_logical_plan_to_opt_expr(plan, &mut memo.scalars)
+            .expect("logical plan to opt expr");
+        opt_expr_to_memo(&opt_expr, memo)
+    }
 
     fn dummy_table_def() -> TableDef {
         TableDef {
@@ -757,7 +748,7 @@ mod tests {
         );
 
         let mut memo = Memo::new();
-        let root = logical_plan_to_memo(&plan, &mut memo);
+        let root = logical_plan_to_memo_for_test(&plan, &mut memo);
         crate::sql::optimizer::stats::derive_group_statistics(
             &mut memo,
             &std::collections::HashMap::new(),
@@ -807,7 +798,7 @@ mod tests {
         );
 
         let mut memo = Memo::new();
-        let gid = logical_plan_to_memo(&scan, &mut memo);
+        let gid = logical_plan_to_memo_for_test(&scan, &mut memo);
 
         assert_eq!(gid, 0);
         assert_eq!(memo.groups.len(), 1);
@@ -866,7 +857,7 @@ mod tests {
         );
 
         let mut memo = Memo::new();
-        let gid = logical_plan_to_memo(&scan, &mut memo);
+        let gid = logical_plan_to_memo_for_test(&scan, &mut memo);
         let logical_expr = memo.groups[gid].logical_exprs[0].clone();
 
         let physical = ScanToPhysical.apply(&logical_expr, &mut memo);
@@ -922,7 +913,7 @@ mod tests {
         );
 
         let mut memo = Memo::new();
-        let gid = logical_plan_to_memo(&filter, &mut memo);
+        let gid = logical_plan_to_memo_for_test(&filter, &mut memo);
 
         // Should produce 2 groups: Scan (group 0) and Filter (group 1).
         assert_eq!(memo.groups.len(), 2);
@@ -989,7 +980,7 @@ mod tests {
         );
 
         let mut memo = Memo::new();
-        let gid = logical_plan_to_memo(&anchor, &mut memo);
+        let gid = logical_plan_to_memo_for_test(&anchor, &mut memo);
 
         assert_eq!(gid, 3);
         assert!(matches!(

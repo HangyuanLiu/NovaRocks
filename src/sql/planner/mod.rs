@@ -4570,8 +4570,15 @@ mod tests {
             parse_analyze_query(sql).expect("analyzer should succeed");
         let logical =
             plan_query(resolved, cte_registry, &mut factory).expect("planner should succeed");
+        let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
+        let opt_expr = crate::sql::optimizer::convert::try_logical_plan_to_opt_expr(
+            &logical,
+            &mut scalar_arena,
+        )
+        .expect("logical to opt expr");
         let physical = crate::sql::optimizer::optimize(
-            logical,
+            opt_expr,
+            scalar_arena,
             &std::collections::HashMap::new(),
             factory,
             None,

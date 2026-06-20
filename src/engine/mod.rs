@@ -3255,8 +3255,17 @@ fn explain_analyze_query(
         None => Vec::new(),
     };
     // dictionary_provider intentionally None; installed via TLS by execute_in_context.
-    let physical =
-        crate::sql::optimizer::optimize(logical, &table_stats, factory, None, mv_candidates)?;
+    let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
+    let opt_expr =
+        crate::sql::optimizer::convert::try_logical_plan_to_opt_expr(&logical, &mut scalar_arena)?;
+    let physical = crate::sql::optimizer::optimize(
+        opt_expr,
+        scalar_arena,
+        &table_stats,
+        factory,
+        None,
+        mv_candidates,
+    )?;
     let dp = build_distributed_plan(&physical)?;
     let build_result = lower_distributed_plan(&dp, codegen_catalog, connectors, None)?;
     let planning_ms = t_plan.elapsed().as_millis() as u64;
@@ -3364,8 +3373,17 @@ fn explain_query(
         None => Vec::new(),
     };
     // dictionary_provider intentionally None; installed via TLS by execute_in_context.
-    let physical =
-        crate::sql::optimizer::optimize(logical, &table_stats, factory, None, mv_candidates)?;
+    let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
+    let opt_expr =
+        crate::sql::optimizer::convert::try_logical_plan_to_opt_expr(&logical, &mut scalar_arena)?;
+    let physical = crate::sql::optimizer::optimize(
+        opt_expr,
+        scalar_arena,
+        &table_stats,
+        factory,
+        None,
+        mv_candidates,
+    )?;
 
     let mut lines = Vec::new();
     if matches!(level, ExplainLevel::Costs) {
@@ -3554,14 +3572,25 @@ pub(crate) fn execute_query_as_iceberg_write(
         Some(resolve_root_distribution) => resolve_root_distribution(&logical)?,
         None => None,
     };
+    let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
+    let opt_expr =
+        crate::sql::optimizer::convert::try_logical_plan_to_opt_expr(&logical, &mut scalar_arena)?;
     let physical = match root_distribution {
         Some(root_distribution) => crate::sql::optimizer::optimize_with_root_distribution(
-            logical,
+            opt_expr,
+            scalar_arena,
             &table_stats,
             factory,
             root_distribution,
         )?,
-        None => crate::sql::optimizer::optimize(logical, &table_stats, factory, None, Vec::new())?,
+        None => crate::sql::optimizer::optimize(
+            opt_expr,
+            scalar_arena,
+            &table_stats,
+            factory,
+            None,
+            Vec::new(),
+        )?,
     };
     let build_result =
         crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_via_distributed_plan_with_iceberg_sink(
@@ -3739,8 +3768,17 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         _ => Vec::new(),
     };
     // dictionary_provider intentionally None; installed via TLS by execute_in_context.
-    let mut physical =
-        crate::sql::optimizer::optimize(logical, &table_stats, factory, None, mv_candidates)?;
+    let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
+    let opt_expr =
+        crate::sql::optimizer::convert::try_logical_plan_to_opt_expr(&logical, &mut scalar_arena)?;
+    let mut physical = crate::sql::optimizer::optimize(
+        opt_expr,
+        scalar_arena,
+        &table_stats,
+        factory,
+        None,
+        mv_candidates,
+    )?;
     // Unit-test states may not start the standalone exchange server. IVM-A1
     // internal queries also pass runtime-local handles (`terminal_sink` or
     // `iceberg_catalogs`) that coordinated fragments cannot currently clone
@@ -6001,9 +6039,21 @@ enable_path_style_access = true
         let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)
             .expect("plan query");
         let table_stats = super::build_table_stats_from_plan(&logical);
-        let physical =
-            crate::sql::optimizer::optimize(logical, &table_stats, factory, None, Vec::new())
-                .expect("optimize");
+        let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
+        let opt_expr = crate::sql::optimizer::convert::try_logical_plan_to_opt_expr(
+            &logical,
+            &mut scalar_arena,
+        )
+        .expect("logical to opt expr");
+        let physical = crate::sql::optimizer::optimize(
+            opt_expr,
+            scalar_arena,
+            &table_stats,
+            factory,
+            None,
+            Vec::new(),
+        )
+        .expect("optimize");
         crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_via_distributed_plan(
             &physical, &catalog, &registry, "default",
         )
