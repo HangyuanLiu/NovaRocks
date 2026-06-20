@@ -764,6 +764,7 @@ mod tests {
             atom_stats,
             predicates,
             chain_join_groups: vec![],
+            equi_classes: vec![],
         }
     }
 
@@ -784,6 +785,7 @@ mod tests {
                 (pred(arena, eq(col_ref(1), col_ref(2))), 0b0110),
             ],
             chain_join_groups: vec![],
+            equi_classes: vec![],
         }
     }
 
@@ -848,6 +850,7 @@ mod tests {
                 (pred(arena, eq(col_ref(0), col_ref(2))), 0b101),
             ],
             chain_join_groups: vec![],
+            equi_classes: vec![],
         }
     }
 

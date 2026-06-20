@@ -5,14 +5,15 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::sql::column_id::ColumnId;
-use crate::sql::common::JoinKind;
+use crate::sql::common::{BinOp, JoinKind};
 use crate::sql::optimizer::memo::{GroupId, Memo};
 use crate::sql::optimizer::operator::{LogicalJoinOp, Operator};
+use crate::sql::optimizer::property::EquivalenceClasses;
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 use crate::sql::optimizer::statistics::{Confidence, Statistics};
 
 use super::super::implement::get_group_column_ids;
-use super::MultiJoinGraph;
+use super::{EquiClass, MultiJoinGraph};
 
 /// Flatten the inner/cross join chain rooted at `root`. Descends only through
 /// inner/cross `LogicalJoin` groups (and a `LogicalFilter` sitting directly on
@@ -43,7 +44,7 @@ pub(crate) fn flatten_join_chain(memo: &Memo, root: GroupId) -> Option<MultiJoin
     let atom_stats: Vec<Statistics> = atoms.iter().map(|&g| group_stats(memo, g)).collect();
     let mut predicates: Vec<(ScalarId, u32)> = Vec::new();
 
-    for pred in raw_predicates {
+    for &pred in &raw_predicates {
         let mask = relation_mask(&memo.scalars, pred, &atom_cols);
         if mask.count_ones() < 2 {
             // A single-relation or constant predicate left inside a join
@@ -55,12 +56,96 @@ pub(crate) fn flatten_join_chain(memo: &Memo, root: GroupId) -> Option<MultiJoin
         predicates.push((pred, mask));
     }
 
+    let equi_classes = build_equi_classes(&memo.scalars, &raw_predicates, &atom_cols);
+
     Some(MultiJoinGraph {
         atoms,
         atom_stats,
         predicates,
         chain_join_groups: chain_joins,
+        equi_classes,
     })
+}
+
+/// Derive the chain's cross-atom equivalence classes for transitive edge
+/// synthesis. Reuses the shared [`EquivalenceClasses`] union-find over this
+/// chain's own `col = col` equi conjuncts (self-contained — independent of
+/// whether `derive_group_statistics` has stamped the root group, and exactly
+/// scoped to the chain). Each resulting class is mapped to one representative
+/// *already-interned* `ColumnRef` scalar per atom, so synthesis later reuses the
+/// chain's existing scalars rather than minting fresh deep-cloned predicates
+/// (the gap2 OOM vector). Classes spanning fewer than two atoms yield no
+/// cross-atom edge and are dropped.
+fn build_equi_classes(
+    arena: &ScalarArena,
+    raw_predicates: &[ScalarId],
+    atom_cols: &[std::collections::HashSet<ColumnId>],
+) -> Vec<EquiClass> {
+    let mut classes = EquivalenceClasses::default();
+    let mut col_scalar: HashMap<ColumnId, ScalarId> = HashMap::new();
+    for &pred in raw_predicates {
+        if let Some((left, right)) = column_equality(arena, pred, &mut col_scalar) {
+            classes.merge_pair(left, right);
+        }
+    }
+
+    let mut out = Vec::new();
+    for class in classes.classes() {
+        let mut reps: Vec<(usize, ScalarId)> = Vec::new();
+        for (atom_idx, cols) in atom_cols.iter().enumerate() {
+            // Deterministic representative: the smallest class column this atom
+            // outputs that we have an interned scalar for.
+            let rep = class
+                .iter()
+                .filter(|c| cols.contains(c))
+                .filter_map(|c| col_scalar.get(&c).map(|s| (c, *s)))
+                .min_by_key(|(c, _)| *c);
+            if let Some((_, scalar)) = rep {
+                reps.push((atom_idx, scalar));
+            }
+        }
+        if reps.len() >= 2 {
+            out.push(EquiClass::new(reps));
+        }
+    }
+    out
+}
+
+/// If `pred` is a `col = col` equality, return the two column ids and record the
+/// (unwrapped) interned `ColumnRef` scalar of each operand in `col_scalar`. Only
+/// plain `Eq` is treated as an equivalence edge (null-safe `EqForNull` is
+/// intentionally excluded — synthesizing a plain `Eq` for it would change
+/// null semantics).
+fn column_equality(
+    arena: &ScalarArena,
+    pred: ScalarId,
+    col_scalar: &mut HashMap<ColumnId, ScalarId>,
+) -> Option<(ColumnId, ColumnId)> {
+    match arena.node(pred) {
+        ScalarNode::Nested(inner) => column_equality(arena, *inner, col_scalar),
+        ScalarNode::BinaryOp {
+            op: BinOp::Eq,
+            left,
+            right,
+        } => {
+            let (left_col, left_scalar) = column_ref(arena, *left)?;
+            let (right_col, right_scalar) = column_ref(arena, *right)?;
+            col_scalar.entry(left_col).or_insert(left_scalar);
+            col_scalar.entry(right_col).or_insert(right_scalar);
+            Some((left_col, right_col))
+        }
+        _ => None,
+    }
+}
+
+/// Unwrap to a bare `ColumnRef`, returning its column id and the scalar id of
+/// the unwrapped node (reused as the synthesis operand).
+fn column_ref(arena: &ScalarArena, id: ScalarId) -> Option<(ColumnId, ScalarId)> {
+    match arena.node(id) {
+        ScalarNode::ColumnRef(col) if *col != ColumnId::UNSET => Some((*col, id)),
+        ScalarNode::Nested(inner) => column_ref(arena, *inner),
+        _ => None,
+    }
 }
 
 fn collect_chain(
@@ -436,5 +521,69 @@ mod tests {
             flatten_join_chain(&memo, root).is_none(),
             "chain with a single-side join-condition predicate must not be reordered"
         );
+    }
+
+    #[test]
+    fn flatten_builds_transitive_equivalence_class() {
+        let mut memo = Memo::new();
+        let a = leaf(&mut memo, 1, 1000.0);
+        let b = leaf(&mut memo, 2, 100.0);
+        let c = leaf(&mut memo, 3, 50.0);
+        // (A ⋈[c1=c2] B) ⋈[c2=c3] C — A and C share an equi class only
+        // transitively (through c2); there is no literal c1=c3 edge.
+        let tree = JoinTree::Join {
+            left: Box::new(JoinTree::Join {
+                left: Box::new(JoinTree::Leaf(a)),
+                right: Box::new(JoinTree::Leaf(b)),
+                op: inner(&mut memo, eq(col(1), col(2))),
+            }),
+            right: Box::new(JoinTree::Leaf(c)),
+            op: inner(&mut memo, eq(col(2), col(3))),
+        };
+        let root = copy_in_join_tree(&mut memo, &tree, &Map::new());
+        let graph = flatten_join_chain(&memo, root).expect("3-atom chain flattens");
+
+        // Literal edges only connect A-B and B-C; no literal A-C edge exists.
+        let masks: std::collections::HashSet<u32> =
+            graph.predicates.iter().map(|(_, m)| *m).collect();
+        assert!(
+            masks.contains(&0b011) && masks.contains(&0b110),
+            "literal A-B and B-C edges present"
+        );
+        assert!(!masks.contains(&0b101), "no literal A-C edge");
+
+        // The class {c1,c2,c3} spans all three atoms and transitively straddles
+        // A (atom 0) and C (atom 2).
+        assert_eq!(
+            graph.equi_classes.len(),
+            1,
+            "one cross-atom equivalence class"
+        );
+        let class = &graph.equi_classes[0];
+        assert!(class.rep_in(0b001).is_some(), "class has a rep in atom A");
+        assert!(class.rep_in(0b100).is_some(), "class has a rep in atom C");
+        assert!(
+            class.straddles(0b001, 0b100),
+            "class transitively connects A and C"
+        );
+    }
+
+    #[test]
+    fn flatten_drops_single_atom_equivalence() {
+        // Two atoms joined on c1=c2 form a 2-atom class (kept). A redundant
+        // self-referential conjunct cannot occur here, so the class set holds
+        // exactly the one cross-atom class.
+        let mut memo = Memo::new();
+        let a = leaf(&mut memo, 1, 1000.0);
+        let b = leaf(&mut memo, 2, 100.0);
+        let tree = JoinTree::Join {
+            left: Box::new(JoinTree::Leaf(a)),
+            right: Box::new(JoinTree::Leaf(b)),
+            op: inner(&mut memo, eq(col(1), col(2))),
+        };
+        let root = copy_in_join_tree(&mut memo, &tree, &Map::new());
+        let graph = flatten_join_chain(&memo, root).expect("2-atom chain flattens");
+        assert_eq!(graph.equi_classes.len(), 1, "one 2-atom class");
+        assert!(graph.equi_classes[0].straddles(0b01, 0b10));
     }
 }
