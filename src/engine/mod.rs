@@ -3232,10 +3232,9 @@ fn explain_analyze_query(
 ) -> Result<QueryResult, String> {
     use crate::runtime::profile::Profiler;
     use crate::runtime::profile_correlate::collect_actuals_by_plan_node_id_multi;
-    use crate::sql::codegen::ir::{
-        build_distributed_plan, explain_distributed_plan_analyze, lower_distributed_plan,
-    };
+    use crate::sql::codegen::ir::{explain_distributed_plan_analyze, lower_distributed_plan};
     use crate::sql::explain::ExplainLevel;
+    use crate::sql::planner::build_distributed_plan;
 
     let t_plan = Instant::now();
     let (resolved, cte_registry, mut factory) =
@@ -3329,7 +3328,7 @@ fn explain_logical_query(
     let (resolved, cte_registry, mut factory) =
         crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
-    let lines = crate::sql::explain::explain_plan(&logical, level);
+    let lines = crate::sql::explain::explain_plan_checked(&logical, level)?;
     build_string_query_result("Explain String", lines)
 }
 
@@ -3343,8 +3342,9 @@ fn explain_query(
     level: crate::sql::explain::ExplainLevel,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
-    use crate::sql::codegen::ir::{build_distributed_plan, explain_distributed_plan};
+    use crate::sql::codegen::ir::explain_distributed_plan;
     use crate::sql::explain::ExplainLevel;
+    use crate::sql::planner::build_distributed_plan;
 
     let (resolved, cte_registry, mut factory) =
         crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
@@ -3941,10 +3941,10 @@ fn collect_scan_stats(
     plan: &crate::sql::planner::plan::LogicalPlanNode,
     out: &mut std::collections::HashMap<String, crate::sql::optimizer::statistics::TableStatistics>,
 ) {
-    use crate::sql::planner::plan::LogicalPlanNodeKind;
+    use crate::sql::planner::plan::PlanNodeKind;
 
     match &plan.kind {
-        LogicalPlanNodeKind::Scan(s) => {
+        PlanNodeKind::Scan(s) => {
             if let crate::sql::catalog::ScanSource::IcebergDataFiles {
                 table,
                 files,
@@ -3972,7 +3972,7 @@ fn collect_scan_stats(
                 }
             }
         }
-        LogicalPlanNodeKind::ImvDelta(_) | LogicalPlanNodeKind::ImvVersion(_) => {
+        PlanNodeKind::ImvDelta(_) | PlanNodeKind::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
         }
         _ => {}

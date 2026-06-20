@@ -263,7 +263,23 @@ implementation 规则。Level 1（共享 payload、保留变体）是温和偏�
   `ScalarId`；少数构造/拆解标量的规则（谓词拆 AND、常量折叠、子查询去关联、低基数字典改写）真 port。
 - A3：`convert` 收敛成 memo copy-in（`OptExpr → MExpr`，标量已是 `ScalarId`，无再 intern）；优化器
   入口签名收口成 `LogicalOperator → PhysicalPlanNode`；`LogicalPlanNode` 退出优化器内部。
-- A4：估计器层的瞬态 materialize（stats/logical_props）评估保留（不放大内存，可后续清理，不阻塞）。
+- A4：**优化器内部估计器去 TypedExpr**——`stats`/`logical_props`/`runtime_filter_pass` 等的瞬态
+  `materialize` 改 `ScalarId`-native（`arena.node(id)` 读，不再还原 `TypedExpr`）。**这不是可选 nit,
+  而是 G1/G4 的真实组成**：这些文件都在 `optimizer/` 下,其瞬态 `TypedExpr` 是"优化器内部仅剩的
+  TypedExpr",清掉才真正达成"优化器只认 `Operator`/`ScalarId`"。性价比：**零内存收益、性能边际、
+  成本中等**（~28 处估计器的表达式检视要从 `TypedExpr`/`ExprKind` 改写成 arena/`ScalarNode`）。
+  **定性 = 目标必需、低优先、Arc A 收尾**（不 urgent、不阻塞封装,但不跳过）。
+
+> **"TypedExpr 退出优化器" = 两块,A4 只是其一:**
+> 1. **A4**：优化器内部估计器(及任何其它优化器内 `materialize` 站点,如 `derive`)去 TypedExpr。
+> 2. **入口 Bridge 1 归位 planner**：目前 `optimize()` 仍收 `LogicalPlanNode`(内部做
+>    `logical_plan_to_opt_expr`)——TypedExpr 仍从入口进优化器。要彻底消失,需 planner 先做
+>    Bridge 1、`optimize()` 直接收 `OptExpr`/`LogicalOperator`(= 上面 A3 行所述"入口签名收口";
+>    **`docs/superpowers/plans/2026-06-19-a3-optexpr-memo-cutover.md` 的 A3 实施 plan 暂缩到只去
+>    post-rewrite 往返,未含此项**,故"入口签名收口"留作收尾)。
+> **注（重要,纠正早期误判）**：codegen/Bridge 2 的 `ScalarId→TypedExpr` materialize 是 **planner 侧**
+> (优化器→engine/codegen 边界),**不计入**本目标(G4 已认定其正当且永久)——所以"优化器内无
+> TypedExpr"是干净、可达成、且重要的目标,不因 codegen 保留 TypedExpr 而打折。
 
 ### Arc B = planner 侧统一（合并 + 迁移 + 形式化 Bridge 2）
 

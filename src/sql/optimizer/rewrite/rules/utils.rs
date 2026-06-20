@@ -163,14 +163,14 @@ fn collect_column_refs_inner<'a>(expr: &'a TypedExpr, out: &mut Vec<&'a str>) {
 /// predicate references.
 pub(crate) fn collect_output_columns(plan: &LogicalPlanNode) -> HashSet<String> {
     match &plan.kind {
-        LogicalPlanNodeKind::Scan(s) => s.columns.iter().map(|c| c.name.to_lowercase()).collect(),
-        LogicalPlanNodeKind::Filter(_) => collect_output_columns(plan.unary_input()),
-        LogicalPlanNodeKind::Project(p) => p
+        PlanNodeKind::Scan(s) => s.columns.iter().map(|c| c.name.to_lowercase()).collect(),
+        PlanNodeKind::Filter(_) => collect_output_columns(plan.unary_input()),
+        PlanNodeKind::Project(p) => p
             .items
             .iter()
             .map(|item| item.output_name.to_lowercase())
             .collect(),
-        LogicalPlanNodeKind::Join(j) => {
+        PlanNodeKind::Join(j) => {
             let left_only = matches!(
                 j.join_type,
                 crate::sql::analysis::JoinKind::LeftSemi
@@ -186,68 +186,68 @@ pub(crate) fn collect_output_columns(plan: &LogicalPlanNode) -> HashSet<String> 
                 cols
             }
         }
-        LogicalPlanNodeKind::Aggregate(a) => a
+        PlanNodeKind::Aggregate(a) => a
             .output_columns
             .iter()
             .map(|c| c.name.to_lowercase())
             .collect(),
-        LogicalPlanNodeKind::AggregateStateMerge(a) => a
+        PlanNodeKind::AggregateStateMerge(a) => a
             .output_columns
             .iter()
             .map(|c| c.name.to_lowercase())
             .collect(),
-        LogicalPlanNodeKind::Sort(_) => collect_output_columns(plan.unary_input()),
-        LogicalPlanNodeKind::Limit(_) => collect_output_columns(plan.unary_input()),
-        LogicalPlanNodeKind::Window(w) => w
+        PlanNodeKind::Sort(_) => collect_output_columns(plan.unary_input()),
+        PlanNodeKind::Limit(_) => collect_output_columns(plan.unary_input()),
+        PlanNodeKind::Window(w) => w
             .output_columns
             .iter()
             .map(|c| c.name.to_lowercase())
             .collect(),
-        LogicalPlanNodeKind::Union(_) => {
+        PlanNodeKind::Union(_) => {
             if let Some(first) = plan.children.first() {
                 collect_output_columns(first)
             } else {
                 HashSet::new()
             }
         }
-        LogicalPlanNodeKind::Intersect(_) => {
+        PlanNodeKind::Intersect(_) => {
             if let Some(first) = plan.children.first() {
                 collect_output_columns(first)
             } else {
                 HashSet::new()
             }
         }
-        LogicalPlanNodeKind::Except(_) => {
+        PlanNodeKind::Except(_) => {
             if let Some(first) = plan.children.first() {
                 collect_output_columns(first)
             } else {
                 HashSet::new()
             }
         }
-        LogicalPlanNodeKind::Values(v) => v.columns.iter().map(|c| c.name.to_lowercase()).collect(),
-        LogicalPlanNodeKind::GenerateSeries(g) => {
+        PlanNodeKind::Values(v) => v.columns.iter().map(|c| c.name.to_lowercase()).collect(),
+        PlanNodeKind::GenerateSeries(g) => {
             let mut cols = HashSet::new();
             cols.insert(g.column_name.to_lowercase());
             cols
         }
-        LogicalPlanNodeKind::TableFunction(t) => {
+        PlanNodeKind::TableFunction(t) => {
             let mut cols = collect_output_columns(plan.unary_input());
             cols.extend(t.output_columns.iter().map(|c| c.name.to_lowercase()));
             cols
         }
-        LogicalPlanNodeKind::CTEAnchor(_) => collect_output_columns(plan.child(1)),
-        LogicalPlanNodeKind::CTEProduce(p) => p
+        PlanNodeKind::CTEAnchor(_) => collect_output_columns(plan.child(1)),
+        PlanNodeKind::CTEProduce(p) => p
             .output_columns
             .iter()
             .map(|col| col.name.to_lowercase())
             .collect(),
-        LogicalPlanNodeKind::Repeat(_) => collect_output_columns(plan.unary_input()),
-        LogicalPlanNodeKind::CTEConsume(c) => c
+        PlanNodeKind::Repeat(_) => collect_output_columns(plan.unary_input()),
+        PlanNodeKind::CTEConsume(c) => c
             .output_columns
             .iter()
             .map(|col| col.name.to_lowercase())
             .collect(),
-        LogicalPlanNodeKind::Decode(d) => {
+        PlanNodeKind::Decode(d) => {
             // Decode replaces dict columns with their string counterparts
             // but otherwise passes through the child's output set.
             let mut cols = collect_output_columns(plan.unary_input());
@@ -257,14 +257,22 @@ pub(crate) fn collect_output_columns(plan: &LogicalPlanNode) -> HashSet<String> 
             }
             cols
         }
-        LogicalPlanNodeKind::Apply(a) => {
+        PlanNodeKind::Apply(a) => {
             let mut out = collect_output_columns(plan.left());
             out.insert(a.output_column.name.to_lowercase());
             out
         }
-        LogicalPlanNodeKind::AssertOneRow(_) => collect_output_columns(plan.unary_input()),
-        LogicalPlanNodeKind::ImvDelta(_) | LogicalPlanNodeKind::ImvVersion(_) => {
+        PlanNodeKind::AssertOneRow(_) => collect_output_columns(plan.unary_input()),
+        PlanNodeKind::ImvDelta(_) | PlanNodeKind::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
+        }
+        PlanNodeKind::TopN(_)
+        | PlanNodeKind::Exchange(_)
+        | PlanNodeKind::HashAggregate(_)
+        | PlanNodeKind::HashJoin(_)
+        | PlanNodeKind::NestLoopJoin(_)
+        | PlanNodeKind::SetOp(_) => {
+            panic!("distributed plan node leaked into logical rewrite utility");
         }
     }
 }
@@ -385,30 +393,26 @@ pub(crate) fn collect_output_ids_ordered(
     plan: &LogicalPlanNode,
 ) -> Vec<crate::sql::column_id::ColumnId> {
     match &plan.kind {
-        LogicalPlanNodeKind::Scan(s) => s.columns.iter().map(|c| c.column_id).collect(),
-        LogicalPlanNodeKind::Project(p) => p
+        PlanNodeKind::Scan(s) => s.columns.iter().map(|c| c.column_id).collect(),
+        PlanNodeKind::Project(p) => p
             .items
             .iter()
             .map(|item| item.output_column_id)
             .filter(|id| *id != crate::sql::column_id::ColumnId::UNSET)
             .collect(),
-        LogicalPlanNodeKind::Aggregate(a) => a.output_columns.iter().map(|c| c.column_id).collect(),
-        LogicalPlanNodeKind::Window(w) => w.output_columns.iter().map(|c| c.column_id).collect(),
-        LogicalPlanNodeKind::CTEProduce(p) => {
-            p.output_columns.iter().map(|c| c.column_id).collect()
-        }
-        LogicalPlanNodeKind::CTEConsume(c) => {
-            c.output_columns.iter().map(|c| c.column_id).collect()
-        }
-        LogicalPlanNodeKind::Union(u) => u.output_columns.iter().map(|c| c.column_id).collect(),
-        LogicalPlanNodeKind::Intersect(i) => i.output_columns.iter().map(|c| c.column_id).collect(),
-        LogicalPlanNodeKind::Except(e) => e.output_columns.iter().map(|c| c.column_id).collect(),
-        LogicalPlanNodeKind::Decode(d) => d.output_columns.iter().map(|c| c.column_id).collect(),
-        LogicalPlanNodeKind::AggregateStateMerge(a) => {
+        PlanNodeKind::Aggregate(a) => a.output_columns.iter().map(|c| c.column_id).collect(),
+        PlanNodeKind::Window(w) => w.output_columns.iter().map(|c| c.column_id).collect(),
+        PlanNodeKind::CTEProduce(p) => p.output_columns.iter().map(|c| c.column_id).collect(),
+        PlanNodeKind::CTEConsume(c) => c.output_columns.iter().map(|c| c.column_id).collect(),
+        PlanNodeKind::Union(u) => u.output_columns.iter().map(|c| c.column_id).collect(),
+        PlanNodeKind::Intersect(i) => i.output_columns.iter().map(|c| c.column_id).collect(),
+        PlanNodeKind::Except(e) => e.output_columns.iter().map(|c| c.column_id).collect(),
+        PlanNodeKind::Decode(d) => d.output_columns.iter().map(|c| c.column_id).collect(),
+        PlanNodeKind::AggregateStateMerge(a) => {
             a.output_columns.iter().map(|c| c.column_id).collect()
         }
-        LogicalPlanNodeKind::Values(v) => v.columns.iter().map(|c| c.column_id).collect(),
-        LogicalPlanNodeKind::GenerateSeries(g) => {
+        PlanNodeKind::Values(v) => v.columns.iter().map(|c| c.column_id).collect(),
+        PlanNodeKind::GenerateSeries(g) => {
             if g.output_column_id == crate::sql::column_id::ColumnId::UNSET {
                 vec![]
             } else {
@@ -416,31 +420,39 @@ pub(crate) fn collect_output_ids_ordered(
             }
         }
         // Passthrough: the node does not add or rename output ColumnIds.
-        LogicalPlanNodeKind::Filter(_)
-        | LogicalPlanNodeKind::Sort(_)
-        | LogicalPlanNodeKind::Limit(_)
-        | LogicalPlanNodeKind::Repeat(_) => collect_output_ids_ordered(plan.unary_input()),
-        LogicalPlanNodeKind::TableFunction(t) => {
+        PlanNodeKind::Filter(_)
+        | PlanNodeKind::Sort(_)
+        | PlanNodeKind::Limit(_)
+        | PlanNodeKind::Repeat(_) => collect_output_ids_ordered(plan.unary_input()),
+        PlanNodeKind::TableFunction(t) => {
             // TableFunction extends the input's output with its own output columns.
             let mut ids = collect_output_ids_ordered(plan.unary_input());
             ids.extend(t.output_columns.iter().map(|c| c.column_id));
             ids
         }
-        LogicalPlanNodeKind::Join(_) => {
+        PlanNodeKind::Join(_) => {
             // Join output = left output ids ++ right output ids (left first).
             let mut ids = collect_output_ids_ordered(plan.left());
             ids.extend(collect_output_ids_ordered(plan.right()));
             ids
         }
-        LogicalPlanNodeKind::CTEAnchor(_) => collect_output_ids_ordered(plan.child(1)),
-        LogicalPlanNodeKind::Apply(a) => {
+        PlanNodeKind::CTEAnchor(_) => collect_output_ids_ordered(plan.child(1)),
+        PlanNodeKind::Apply(a) => {
             let mut ids = collect_output_ids_ordered(plan.left());
             ids.push(a.output_column.column_id);
             ids
         }
-        LogicalPlanNodeKind::AssertOneRow(_) => collect_output_ids_ordered(plan.unary_input()),
-        LogicalPlanNodeKind::ImvDelta(_) | LogicalPlanNodeKind::ImvVersion(_) => {
+        PlanNodeKind::AssertOneRow(_) => collect_output_ids_ordered(plan.unary_input()),
+        PlanNodeKind::ImvDelta(_) | PlanNodeKind::ImvVersion(_) => {
             panic!("imv marker should not appear in non-IMV pruning")
+        }
+        PlanNodeKind::TopN(_)
+        | PlanNodeKind::Exchange(_)
+        | PlanNodeKind::HashAggregate(_)
+        | PlanNodeKind::HashJoin(_)
+        | PlanNodeKind::NestLoopJoin(_)
+        | PlanNodeKind::SetOp(_) => {
+            panic!("distributed plan node leaked into logical rewrite utility");
         }
     }
 }
@@ -582,7 +594,7 @@ pub(crate) fn wrap_remaining_filter(
         plan
     } else {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+            PlanNodeKind::Filter(LogicalFilterNode {
                 predicate: combine_and(remaining),
             }),
             vec![plan],
@@ -720,7 +732,7 @@ pub(crate) fn collect_qualified_output_columns(plan: &LogicalPlanNode) -> HashSe
 
 fn collect_qualified_output_columns_inner(plan: &LogicalPlanNode, out: &mut HashSet<QualifiedRef>) {
     match &plan.kind {
-        LogicalPlanNodeKind::Scan(s) => {
+        PlanNodeKind::Scan(s) => {
             let alias = s
                 .alias
                 .as_ref()
@@ -736,60 +748,58 @@ fn collect_qualified_output_columns_inner(plan: &LogicalPlanNode, out: &mut Hash
                 out.insert((None, col));
             }
         }
-        LogicalPlanNodeKind::Filter(_) => {
-            collect_qualified_output_columns_inner(plan.unary_input(), out)
-        }
-        LogicalPlanNodeKind::Project(p) => {
+        PlanNodeKind::Filter(_) => collect_qualified_output_columns_inner(plan.unary_input(), out),
+        PlanNodeKind::Project(p) => {
             for item in &p.items {
                 out.insert((None, item.output_name.to_lowercase()));
             }
         }
-        LogicalPlanNodeKind::Join(_) => {
+        PlanNodeKind::Join(_) => {
             collect_qualified_output_columns_inner(plan.left(), out);
             collect_qualified_output_columns_inner(plan.right(), out);
         }
-        LogicalPlanNodeKind::Aggregate(a) => {
+        PlanNodeKind::Aggregate(a) => {
             for c in &a.output_columns {
                 out.insert((None, c.name.to_lowercase()));
             }
         }
-        LogicalPlanNodeKind::AggregateStateMerge(a) => {
+        PlanNodeKind::AggregateStateMerge(a) => {
             for c in &a.output_columns {
                 out.insert((None, c.name.to_lowercase()));
             }
         }
-        LogicalPlanNodeKind::Sort(_) | LogicalPlanNodeKind::Limit(_) => {
+        PlanNodeKind::Sort(_) | PlanNodeKind::Limit(_) => {
             collect_qualified_output_columns_inner(plan.unary_input(), out)
         }
-        LogicalPlanNodeKind::Window(w) => {
+        PlanNodeKind::Window(w) => {
             for c in &w.output_columns {
                 out.insert((None, c.name.to_lowercase()));
             }
         }
-        LogicalPlanNodeKind::Union(_) => {
+        PlanNodeKind::Union(_) => {
             if let Some(first) = plan.children.first() {
                 collect_qualified_output_columns_inner(first, out);
             }
         }
-        LogicalPlanNodeKind::Intersect(_) => {
+        PlanNodeKind::Intersect(_) => {
             if let Some(first) = plan.children.first() {
                 collect_qualified_output_columns_inner(first, out);
             }
         }
-        LogicalPlanNodeKind::Except(_) => {
+        PlanNodeKind::Except(_) => {
             if let Some(first) = plan.children.first() {
                 collect_qualified_output_columns_inner(first, out);
             }
         }
-        LogicalPlanNodeKind::Values(v) => {
+        PlanNodeKind::Values(v) => {
             for c in &v.columns {
                 out.insert((None, c.name.to_lowercase()));
             }
         }
-        LogicalPlanNodeKind::GenerateSeries(g) => {
+        PlanNodeKind::GenerateSeries(g) => {
             out.insert((None, g.column_name.to_lowercase()));
         }
-        LogicalPlanNodeKind::TableFunction(t) => {
+        PlanNodeKind::TableFunction(t) => {
             collect_qualified_output_columns_inner(plan.unary_input(), out);
             for col in &t.output_columns {
                 out.insert((
@@ -798,18 +808,16 @@ fn collect_qualified_output_columns_inner(plan: &LogicalPlanNode, out: &mut Hash
                 ));
             }
         }
-        LogicalPlanNodeKind::CTEAnchor(_) => {
+        PlanNodeKind::CTEAnchor(_) => {
             collect_qualified_output_columns_inner(plan.child(1), out);
         }
-        LogicalPlanNodeKind::CTEProduce(p) => {
+        PlanNodeKind::CTEProduce(p) => {
             for col in &p.output_columns {
                 out.insert((None, col.name.to_lowercase()));
             }
         }
-        LogicalPlanNodeKind::Repeat(_) => {
-            collect_qualified_output_columns_inner(plan.unary_input(), out)
-        }
-        LogicalPlanNodeKind::CTEConsume(c) => {
+        PlanNodeKind::Repeat(_) => collect_qualified_output_columns_inner(plan.unary_input(), out),
+        PlanNodeKind::CTEConsume(c) => {
             let alias_lower = c.alias.to_lowercase();
             for col in &c.output_columns {
                 let col_name = col.name.to_lowercase();
@@ -817,7 +825,7 @@ fn collect_qualified_output_columns_inner(plan: &LogicalPlanNode, out: &mut Hash
                 out.insert((None, col_name));
             }
         }
-        LogicalPlanNodeKind::Decode(d) => {
+        PlanNodeKind::Decode(d) => {
             collect_qualified_output_columns_inner(plan.unary_input(), out);
             // Decode adds string output columns alongside the dict inputs.
             for mapping in &d.mappings {
@@ -828,12 +836,20 @@ fn collect_qualified_output_columns_inner(plan: &LogicalPlanNode, out: &mut Hash
         // side contributes qualified refs.
         // Apply's right child (the subquery) is in a nested scope; its table
         // qualifications are not visible in the outer query.
-        LogicalPlanNodeKind::Apply(_) => collect_qualified_output_columns_inner(plan.left(), out),
-        LogicalPlanNodeKind::AssertOneRow(_) => {
+        PlanNodeKind::Apply(_) => collect_qualified_output_columns_inner(plan.left(), out),
+        PlanNodeKind::AssertOneRow(_) => {
             collect_qualified_output_columns_inner(plan.unary_input(), out)
         }
-        LogicalPlanNodeKind::ImvDelta(_) | LogicalPlanNodeKind::ImvVersion(_) => {
+        PlanNodeKind::ImvDelta(_) | PlanNodeKind::ImvVersion(_) => {
             panic!("imv marker leaked into non-IMV plan");
+        }
+        PlanNodeKind::TopN(_)
+        | PlanNodeKind::Exchange(_)
+        | PlanNodeKind::HashAggregate(_)
+        | PlanNodeKind::HashJoin(_)
+        | PlanNodeKind::NestLoopJoin(_)
+        | PlanNodeKind::SetOp(_) => {
+            panic!("distributed plan node leaked into logical rewrite utility");
         }
     }
 }
@@ -1294,7 +1310,7 @@ mod column_id_helper_tests {
             },
         };
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Scan(LogicalScanNode {
+            PlanNodeKind::Scan(LogicalScanNode {
                 database: "default".to_string(),
                 table: table,
                 alias: None,
@@ -1307,6 +1323,7 @@ mod column_id_helper_tests {
                 required_columns: None,
                 dict_columns: vec![],
                 variant_columns: vec![],
+                mv_rewritten_from: None,
             }),
             vec![],
             None,
@@ -1353,7 +1370,7 @@ mod column_id_helper_tests {
             ColumnId::new_for_test(6),
         ];
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Join(LogicalJoinNode {
+            PlanNodeKind::Join(LogicalJoinNode {
                 join_type: crate::sql::analysis::JoinKind::Inner,
                 condition: None,
             }),
@@ -1405,7 +1422,7 @@ mod column_id_helper_tests {
         };
 
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
+            PlanNodeKind::Project(LogicalProjectNode {
                 items: vec![passthrough_item, computed_item],
                 output_qualifier: None,
             }),
@@ -1446,7 +1463,7 @@ mod column_id_helper_tests {
         };
 
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
+            PlanNodeKind::Project(LogicalProjectNode {
                 items: vec![real_item, unset_item],
                 output_qualifier: None,
             }),
@@ -1464,7 +1481,7 @@ mod column_id_helper_tests {
 
         let output_id = ColumnId::new_for_test(88);
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::GenerateSeries(LogicalGenerateSeriesNode {
+            PlanNodeKind::GenerateSeries(LogicalGenerateSeriesNode {
                 start: 1,
                 end: 3,
                 step: 1,
@@ -1513,7 +1530,7 @@ mod column_id_helper_tests {
             })
             .collect();
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Scan(LogicalScanNode {
+            PlanNodeKind::Scan(LogicalScanNode {
                 database: "default".to_string(),
                 table: TableDef {
                     name: table.to_string(),
@@ -1530,6 +1547,7 @@ mod column_id_helper_tests {
                 required_columns: None,
                 dict_columns: vec![],
                 variant_columns: vec![],
+                mv_rewritten_from: None,
             }),
             vec![],
             None,
@@ -1574,7 +1592,7 @@ mod column_id_helper_tests {
 
     fn two_table_join(condition: Option<TypedExpr>) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Join(LogicalJoinNode {
+            PlanNodeKind::Join(LogicalJoinNode {
                 join_type: crate::sql::analysis::JoinKind::Inner,
                 condition,
             }),
@@ -1587,7 +1605,7 @@ mod column_id_helper_tests {
     }
 
     fn test_join_equi_keys(join_plan: &LogicalPlanNode) -> Vec<JoinEquiKey> {
-        let LogicalPlanNodeKind::Join(join) = &join_plan.kind else {
+        let PlanNodeKind::Join(join) = &join_plan.kind else {
             panic!("expected Join test plan");
         };
         join_equi_keys(join, join_plan.left(), join_plan.right())
@@ -1672,7 +1690,7 @@ mod column_id_helper_tests {
     fn join_equi_keys_disambiguates_self_join_by_qualifier() {
         // q22 shape: same column name on both sides, distinct aliases.
         let join = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Join(LogicalJoinNode {
+            PlanNodeKind::Join(LogicalJoinNode {
                 join_type: crate::sql::analysis::JoinKind::LeftSemi,
                 condition: Some(eq_expr(qcol("a", "k", 1), qcol("b", "k", 2))),
             }),
@@ -1698,7 +1716,7 @@ mod column_id_helper_tests {
         output_id: u32,
     ) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
+            PlanNodeKind::Project(LogicalProjectNode {
                 items: vec![ProjectItem {
                     expr: TypedExpr {
                         kind: ExprKind::ColumnRef {
@@ -1715,7 +1733,7 @@ mod column_id_helper_tests {
                 output_qualifier: None,
             }),
             vec![LogicalPlanNode::new(
-                LogicalPlanNodeKind::Values(LogicalValuesNode {
+                PlanNodeKind::Values(LogicalValuesNode {
                     rows: vec![],
                     columns: vec![OutputColumn {
                         column_id: ColumnId::new_for_test(source_id),
@@ -1735,7 +1753,7 @@ mod column_id_helper_tests {
     #[test]
     fn join_equi_keys_classifies_alias_free_project_outputs_by_column_id() {
         let join = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Join(LogicalJoinNode {
+            PlanNodeKind::Join(LogicalJoinNode {
                 join_type: crate::sql::analysis::JoinKind::Inner,
                 condition: Some(eq_expr(qcol("a", "k", 101), qcol("b", "k", 202))),
             }),

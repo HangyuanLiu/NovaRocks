@@ -27,7 +27,7 @@ use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::{RewriteDiagnostic, RewriteResult};
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
 use crate::sql::planner::plan::{
-    LogicalAggregateNode, LogicalPlanNode, LogicalPlanNodeKind, LogicalScanNode,
+    LogicalAggregateNode, LogicalPlanNode, LogicalScanNode, PlanNodeKind,
 };
 
 pub(crate) struct ImvActionColumn;
@@ -117,8 +117,8 @@ fn validate(plan: &LogicalPlanNode) -> Result<(), String> {
         );
     }
     // V6: if a delta subtree exists, root output must carry the apply key.
-    if !matches!(&plan.kind, LogicalPlanNodeKind::AggregateStateMerge(_))
-        && !(matches!(&plan.kind, LogicalPlanNodeKind::Union(_)) && is_supported_branch_union(plan))
+    if !matches!(&plan.kind, PlanNodeKind::AggregateStateMerge(_))
+        && !(matches!(&plan.kind, PlanNodeKind::Union(_)) && is_supported_branch_union(plan))
         && subtree_has_delta(plan)
         && !output_has_apply_key(plan)
     {
@@ -136,13 +136,13 @@ fn validate(plan: &LogicalPlanNode) -> Result<(), String> {
 // imv-validation stage and rejects any surviving marker.
 fn validate_node(plan: &LogicalPlanNode) -> Result<(), String> {
     match &plan.kind {
-        LogicalPlanNodeKind::Scan(scan) => validate_scan(scan),
-        LogicalPlanNodeKind::Filter(_) => validate_node(plan.unary_input()),
-        LogicalPlanNodeKind::AggregateStateMerge(_) => {
+        PlanNodeKind::Scan(scan) => validate_scan(scan),
+        PlanNodeKind::Filter(_) => validate_node(plan.unary_input()),
+        PlanNodeKind::AggregateStateMerge(_) => {
             validate_node(plan.left())?;
             validate_state_merge_delta_input(plan.right())
         }
-        LogicalPlanNodeKind::Project(node) => {
+        PlanNodeKind::Project(node) => {
             let input = plan.unary_input();
             validate_node(input)?;
             // V3: if a delta is below, Project must expose the action column.
@@ -164,34 +164,34 @@ fn validate_node(plan: &LogicalPlanNode) -> Result<(), String> {
             }
             Ok(())
         }
-        LogicalPlanNodeKind::Aggregate(_) if subtree_has_delta(plan) => {
+        PlanNodeKind::Aggregate(_) if subtree_has_delta(plan) => {
             let fqn = first_delta_base_fqn(plan).unwrap_or_else(|| "<unknown>".to_string());
             Err(format!(
                 "Iceberg IMV rewrite does not support this aggregate shape above delta-bound scan {fqn}"
             ))
         }
-        LogicalPlanNodeKind::Join(_) if subtree_has_delta(plan) => {
+        PlanNodeKind::Join(_) if subtree_has_delta(plan) => {
             let fqn = first_delta_base_fqn(plan).unwrap_or_else(|| "<unknown>".to_string());
             Err(format!(
                 "Iceberg IMV rewrite does not support this join shape above delta-bound scan {fqn}"
             ))
         }
-        LogicalPlanNodeKind::Union(_) if is_supported_fan_in_delta_union(plan) => {
+        PlanNodeKind::Union(_) if is_supported_fan_in_delta_union(plan) => {
             for input in &plan.children {
                 validate_node(input)?;
             }
             Ok(())
         }
-        LogicalPlanNodeKind::Union(_) if is_supported_branch_union(plan) => {
+        PlanNodeKind::Union(_) if is_supported_branch_union(plan) => {
             validate_supported_branch_union(plan)
         }
-        LogicalPlanNodeKind::Union(_) if is_supported_join_delta_union(plan) => {
+        PlanNodeKind::Union(_) if is_supported_join_delta_union(plan) => {
             for input in &plan.children {
                 validate_signed_delta_input(input)?;
             }
             Ok(())
         }
-        LogicalPlanNodeKind::Union(_)
+        PlanNodeKind::Union(_)
             if subtree_has_delta(plan)
                 && !is_supported_join_delta_union(plan)
                 && !is_supported_fan_in_delta_union(plan)
@@ -223,7 +223,7 @@ fn validate_supported_branch_union(plan: &LogicalPlanNode) -> Result<(), String>
 }
 
 fn validate_branch_union_input(plan: &LogicalPlanNode) -> Result<(), String> {
-    let LogicalPlanNodeKind::Project(_) = &plan.kind else {
+    let PlanNodeKind::Project(_) = &plan.kind else {
         return Err("supported branch UNION expected Project branch input".to_string());
     };
     if !is_supported_branch_state_merge_project(plan) {
@@ -233,7 +233,7 @@ fn validate_branch_union_input(plan: &LogicalPlanNode) -> Result<(), String> {
         );
     }
     let merge = plan.unary_input();
-    if !matches!(&merge.kind, LogicalPlanNodeKind::AggregateStateMerge(_)) {
+    if !matches!(&merge.kind, PlanNodeKind::AggregateStateMerge(_)) {
         return Err("supported branch UNION expected AggregateStateMerge branch input".to_string());
     }
     validate_node(merge.left())?;
@@ -241,12 +241,12 @@ fn validate_branch_union_input(plan: &LogicalPlanNode) -> Result<(), String> {
 }
 
 fn is_supported_branch_state_merge_project(plan: &LogicalPlanNode) -> bool {
-    let LogicalPlanNodeKind::Project(node) = &plan.kind else {
+    let PlanNodeKind::Project(node) = &plan.kind else {
         return false;
     };
     matches!(
         &plan.unary_input().kind,
-        LogicalPlanNodeKind::AggregateStateMerge(_)
+        PlanNodeKind::AggregateStateMerge(_)
     ) && node.items.iter().any(|item| {
         item.output_name.eq_ignore_ascii_case(
             crate::engine::mv::iceberg_target_apply::ICEBERG_MV_BRANCH_ID_COLUMN,
@@ -267,13 +267,13 @@ fn is_branch_id_literal_expr(expr: &crate::sql::analysis::TypedExpr) -> bool {
 
 fn validate_state_merge_delta_input(plan: &LogicalPlanNode) -> Result<(), String> {
     match &plan.kind {
-        LogicalPlanNodeKind::Aggregate(node) if is_signed_state_aggregate(node) => {
+        PlanNodeKind::Aggregate(node) if is_signed_state_aggregate(node) => {
             validate_signed_delta_input(plan.unary_input())
         }
-        LogicalPlanNodeKind::Project(_)
+        PlanNodeKind::Project(_)
             if matches!(
                 &plan.unary_input().kind,
-                LogicalPlanNodeKind::Aggregate(node) if is_signed_state_aggregate(node)
+                PlanNodeKind::Aggregate(node) if is_signed_state_aggregate(node)
             ) =>
         {
             validate_signed_delta_input(plan.unary_input().unary_input())
@@ -304,9 +304,9 @@ fn is_hidden_retraction_count_call(call: &crate::sql::planner::plan::AggregateCa
 
 fn validate_signed_delta_input(plan: &LogicalPlanNode) -> Result<(), String> {
     match &plan.kind {
-        LogicalPlanNodeKind::Scan(scan) => validate_scan(scan),
-        LogicalPlanNodeKind::Filter(_) => validate_signed_delta_input(plan.unary_input()),
-        LogicalPlanNodeKind::Project(node) => {
+        PlanNodeKind::Scan(scan) => validate_scan(scan),
+        PlanNodeKind::Filter(_) => validate_signed_delta_input(plan.unary_input()),
+        PlanNodeKind::Project(node) => {
             let input = plan.unary_input();
             validate_signed_delta_input(input)?;
             if subtree_has_delta(input) {
@@ -324,11 +324,11 @@ fn validate_signed_delta_input(plan: &LogicalPlanNode) -> Result<(), String> {
             }
             Ok(())
         }
-        LogicalPlanNodeKind::Join(_) if is_supported_join_delta_branch(plan) => {
+        PlanNodeKind::Join(_) if is_supported_join_delta_branch(plan) => {
             validate_signed_delta_input(plan.left())?;
             validate_signed_delta_input(plan.right())
         }
-        LogicalPlanNodeKind::Union(_)
+        PlanNodeKind::Union(_)
             if is_supported_join_delta_union(plan) || is_supported_fan_in_delta_union(plan) =>
         {
             for input in &plan.children {
@@ -389,18 +389,18 @@ fn validate_scan(scan: &LogicalScanNode) -> Result<(), String> {
 
 fn output_has_apply_key(plan: &LogicalPlanNode) -> bool {
     match &plan.kind {
-        LogicalPlanNodeKind::Project(p) => p.items.iter().any(|i| {
+        PlanNodeKind::Project(p) => p.items.iter().any(|i| {
             i.output_name
                 .eq_ignore_ascii_case(ICEBERG_MV_APPLY_KEY_COLUMN)
         }),
-        LogicalPlanNodeKind::Filter(_) => output_has_apply_key(plan.unary_input()),
+        PlanNodeKind::Filter(_) => output_has_apply_key(plan.unary_input()),
         _ => false,
     }
 }
 
 fn subtree_has_delta(plan: &LogicalPlanNode) -> bool {
     match &plan.kind {
-        LogicalPlanNodeKind::Scan(scan) => {
+        PlanNodeKind::Scan(scan) => {
             matches!(scan.table.source, ScanSource::IcebergDeltaTable { .. })
         }
         _ => plan.children.iter().any(subtree_has_delta),
@@ -409,23 +409,23 @@ fn subtree_has_delta(plan: &LogicalPlanNode) -> bool {
 
 fn has_visible_output(plan: &LogicalPlanNode) -> bool {
     match &plan.kind {
-        LogicalPlanNodeKind::Scan(scan) => scan.columns.iter().any(|c| !c.is_internal),
-        LogicalPlanNodeKind::Filter(_) => has_visible_output(plan.unary_input()),
-        LogicalPlanNodeKind::Project(node) => node.items.iter().any(|item| {
+        PlanNodeKind::Scan(scan) => scan.columns.iter().any(|c| !c.is_internal),
+        PlanNodeKind::Filter(_) => has_visible_output(plan.unary_input()),
+        PlanNodeKind::Project(node) => node.items.iter().any(|item| {
             !item.output_name.eq_ignore_ascii_case(ImvActionColumn::NAME)
                 && !item.output_name.eq_ignore_ascii_case(ImvRowIdColumn::NAME)
                 && !item
                     .output_name
                     .eq_ignore_ascii_case(ICEBERG_MV_APPLY_KEY_COLUMN)
         }),
-        LogicalPlanNodeKind::Aggregate(node) => node.output_columns.iter().any(|c| !c.is_internal),
-        LogicalPlanNodeKind::AggregateStateMerge(node) => {
+        PlanNodeKind::Aggregate(node) => node.output_columns.iter().any(|c| !c.is_internal),
+        PlanNodeKind::AggregateStateMerge(node) => {
             node.output_columns.iter().any(|c| !c.is_internal)
         }
-        LogicalPlanNodeKind::Join(_) => {
+        PlanNodeKind::Join(_) => {
             has_visible_output(plan.left()) || has_visible_output(plan.right())
         }
-        LogicalPlanNodeKind::Union(_) => plan.children.iter().any(has_visible_output),
+        PlanNodeKind::Union(_) => plan.children.iter().any(has_visible_output),
         _ => true,
     }
 }
@@ -440,7 +440,7 @@ mod tests {
     use crate::sql::planner::plan::*;
     use crate::sql::planner::plan::{
         AggregateCall, LogicalAggregateNode, LogicalAggregateStateMergeNode, LogicalJoinNode,
-        LogicalPlanNodeKind, LogicalProjectNode, LogicalUnionNode, LogicalValuesNode,
+        LogicalProjectNode, LogicalUnionNode, LogicalValuesNode, PlanNodeKind,
     };
 
     #[test]
@@ -529,6 +529,7 @@ mod tests {
             required_columns: None,
             dict_columns: Vec::new(),
             variant_columns: Vec::new(),
+            mv_rewritten_from: None,
         };
         if let Some(a) = action {
             scan.columns.push(a);
@@ -537,7 +538,7 @@ mod tests {
     }
 
     fn scan_plan(scan: LogicalScanNode) -> LogicalPlanNode {
-        LogicalPlanNode::new(LogicalPlanNodeKind::Scan(scan), vec![], None)
+        LogicalPlanNode::new(PlanNodeKind::Scan(scan), vec![], None)
     }
 
     #[test]
@@ -548,7 +549,7 @@ mod tests {
         scan.columns
             .push(ImvRowIdColumn::output_column(ColumnId(101)));
         let project = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
+            PlanNodeKind::Project(LogicalProjectNode {
                 items: vec![
                     ProjectItem {
                         expr: TypedExpr {
@@ -654,7 +655,7 @@ mod tests {
         scan.columns
             .push(ImvRowIdColumn::output_column(ColumnId(101)));
         let project = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
+            PlanNodeKind::Project(LogicalProjectNode {
                 items: vec![ProjectItem {
                     expr: TypedExpr {
                         kind: ExprKind::ColumnRef {
@@ -706,7 +707,7 @@ mod tests {
             ColumnId(100),
         ))));
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+            PlanNodeKind::Aggregate(LogicalAggregateNode {
                 group_by: Vec::new(),
                 aggregates: Vec::new(),
                 output_columns: Vec::new(),
@@ -732,7 +733,7 @@ mod tests {
         ))));
         let right = scan_plan(delta_scan_with(None));
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Join(LogicalJoinNode {
+            PlanNodeKind::Join(LogicalJoinNode {
                 join_type: JoinKind::Inner,
                 condition: None,
             }),
@@ -749,7 +750,7 @@ mod tests {
     #[test]
     fn validation_rejects_union_above_delta() {
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Union(LogicalUnionNode {
+            PlanNodeKind::Union(LogicalUnionNode {
                 all: true,
                 output_columns: Vec::new(),
             }),
@@ -798,7 +799,7 @@ mod tests {
         scan.columns[0].column_id = user_col_id;
         scan.columns.push(ImvRowIdColumn::output_column(row_id));
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
+            PlanNodeKind::Project(LogicalProjectNode {
                 items: vec![
                     column_ref_item(user_col_id, "k", DataType::Int64, false, "k", user_col_id),
                     column_ref_item(
@@ -833,7 +834,7 @@ mod tests {
         scan.columns[0].column_id = user_col_id;
         scan.columns.push(ImvRowIdColumn::output_column(row_id));
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
+            PlanNodeKind::Project(LogicalProjectNode {
                 items: vec![
                     column_ref_item(user_col_id, "k", DataType::Int64, false, "k", user_col_id),
                     column_ref_item(
@@ -869,7 +870,7 @@ mod tests {
         let mut scan = version_scan_without_action();
         scan.columns[0].column_id = user_col_id;
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
+            PlanNodeKind::Project(LogicalProjectNode {
                 items: vec![column_ref_item(
                     user_col_id,
                     "k",
@@ -887,7 +888,7 @@ mod tests {
 
     fn join_plan(left: LogicalPlanNode, right: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Join(LogicalJoinNode {
+            PlanNodeKind::Join(LogicalJoinNode {
                 join_type: JoinKind::Inner,
                 condition: None,
             }),
@@ -904,7 +905,7 @@ mod tests {
         row_id: ColumnId,
     ) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
+            PlanNodeKind::Project(LogicalProjectNode {
                 items: vec![
                     column_ref_item(user_col_id, "k", DataType::Int64, false, "k", user_col_id),
                     column_ref_item(
@@ -933,7 +934,7 @@ mod tests {
 
     fn recursive_join_delta_union(action_id: ColumnId) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Union(LogicalUnionNode {
+            PlanNodeKind::Union(LogicalUnionNode {
                 all: true,
                 output_columns: vec![
                     OutputColumn {
@@ -969,7 +970,7 @@ mod tests {
 
     fn fan_in_delta_union(action_id: ColumnId) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Union(LogicalUnionNode {
+            PlanNodeKind::Union(LogicalUnionNode {
                 all: true,
                 output_columns: vec![
                     OutputColumn {
@@ -1012,7 +1013,7 @@ mod tests {
         scan.columns
             .push(ImvRowIdColumn::output_column(ColumnId(101)));
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::AggregateStateMerge(LogicalAggregateStateMergeNode {
+            PlanNodeKind::AggregateStateMerge(LogicalAggregateStateMergeNode {
                 group_key_names: vec!["region".to_string()],
                 aggregate_state_names: vec!["__agg_state_s".to_string()],
                 change_op_column: ImvActionColumn::NAME.to_string(),
@@ -1023,7 +1024,7 @@ mod tests {
             }),
             vec![
                 LogicalPlanNode::new(
-                    LogicalPlanNodeKind::Values(LogicalValuesNode {
+                    PlanNodeKind::Values(LogicalValuesNode {
                         rows: Vec::new(),
                         columns: Vec::new(),
                     }),
@@ -1031,7 +1032,7 @@ mod tests {
                     None,
                 ),
                 LogicalPlanNode::new(
-                    LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+                    PlanNodeKind::Aggregate(LogicalAggregateNode {
                         group_by: Vec::new(),
                         aggregates: vec![AggregateCall {
                             name: "sum_state_signed".to_string(),
@@ -1054,7 +1055,7 @@ mod tests {
 
     fn project_with_branch_id(input: LogicalPlanNode, branch_id: i32) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
+            PlanNodeKind::Project(LogicalProjectNode {
                 items: vec![
                     column_ref_item(
                         ColumnId(1),
@@ -1091,7 +1092,7 @@ mod tests {
 
     fn branch_union_with_aggregate_state_merge() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Union(LogicalUnionNode {
+            PlanNodeKind::Union(LogicalUnionNode {
                 all: true,
                 output_columns: vec![
                     output_column(1, "region", DataType::Utf8, false, false),
@@ -1115,7 +1116,7 @@ mod tests {
 
     fn root_project_with_apply_key(input: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
+            PlanNodeKind::Project(LogicalProjectNode {
                 items: vec![
                     column_ref_item(ColumnId(1), "k", DataType::Int64, false, "k", ColumnId(1)),
                     column_ref_item(
@@ -1190,7 +1191,7 @@ mod tests {
         // Project carries k + __change_op + _row_id but NOT __nova_base_row_id.
         let scan = delta_scan_with_action_and_row_id();
         let project = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
+            PlanNodeKind::Project(LogicalProjectNode {
                 items: vec![
                     ProjectItem {
                         expr: TypedExpr {
@@ -1258,7 +1259,7 @@ mod tests {
         scan.columns
             .push(ImvRowIdColumn::output_column(ColumnId(101)));
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::AggregateStateMerge(LogicalAggregateStateMergeNode {
+            PlanNodeKind::AggregateStateMerge(LogicalAggregateStateMergeNode {
                 group_key_names: vec!["k".to_string()],
                 aggregate_state_names: vec!["__agg_state_s".to_string()],
                 change_op_column: "__change_op".to_string(),
@@ -1272,7 +1273,7 @@ mod tests {
             }),
             vec![
                 LogicalPlanNode::new(
-                    LogicalPlanNodeKind::Values(LogicalValuesNode {
+                    PlanNodeKind::Values(LogicalValuesNode {
                         rows: Vec::new(),
                         columns: Vec::new(),
                     }),
@@ -1280,7 +1281,7 @@ mod tests {
                     None,
                 ),
                 LogicalPlanNode::new(
-                    LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+                    PlanNodeKind::Aggregate(LogicalAggregateNode {
                         group_by: Vec::new(),
                         aggregates: vec![AggregateCall {
                             name: "sum_state_signed".to_string(),
@@ -1309,7 +1310,7 @@ mod tests {
 
     fn signed_aggregate_state_merge_over(input: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::AggregateStateMerge(LogicalAggregateStateMergeNode {
+            PlanNodeKind::AggregateStateMerge(LogicalAggregateStateMergeNode {
                 group_key_names: vec!["k".to_string()],
                 aggregate_state_names: vec!["__agg_state_s".to_string()],
                 change_op_column: "__change_op".to_string(),
@@ -1323,7 +1324,7 @@ mod tests {
             }),
             vec![
                 LogicalPlanNode::new(
-                    LogicalPlanNodeKind::Values(LogicalValuesNode {
+                    PlanNodeKind::Values(LogicalValuesNode {
                         rows: Vec::new(),
                         columns: Vec::new(),
                     }),
@@ -1331,7 +1332,7 @@ mod tests {
                     None,
                 ),
                 LogicalPlanNode::new(
-                    LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+                    PlanNodeKind::Aggregate(LogicalAggregateNode {
                         group_by: Vec::new(),
                         aggregates: vec![AggregateCall {
                             name: "sum_state_signed".to_string(),
@@ -1398,7 +1399,7 @@ mod tests {
     fn validation_uses_state_merge_output_for_visible_output_check() {
         let mut plan =
             signed_aggregate_state_merge(Some(ImvActionColumn::output_column(ColumnId(100))));
-        let LogicalPlanNodeKind::AggregateStateMerge(node) = &mut plan.kind else {
+        let PlanNodeKind::AggregateStateMerge(node) = &mut plan.kind else {
             unreachable!();
         };
         node.output_columns = vec![ImvActionColumn::output_column(ColumnId(200))];

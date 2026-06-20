@@ -62,7 +62,7 @@ impl RewriteRule for PushDownPredicateJoin {
 #[cfg(test)]
 impl PushDownPredicateJoin {
     pub(crate) fn matches_logical(&self, plan: &LogicalPlanNode) -> bool {
-        matches!(&plan.kind, LogicalPlanNodeKind::Filter(_) if matches!(&plan.unary_input().kind, LogicalPlanNodeKind::Join(_)))
+        matches!(&plan.kind, PlanNodeKind::Filter(_) if matches!(&plan.unary_input().kind, PlanNodeKind::Join(_)))
     }
 
     pub(crate) fn apply_with_logical(&self, plan: LogicalPlanNode) -> Option<LogicalPlanNode> {
@@ -71,7 +71,7 @@ impl PushDownPredicateJoin {
             mut children,
             required_output_columns: _,
         } = plan;
-        let LogicalPlanNodeKind::Filter(filter) = kind else {
+        let PlanNodeKind::Filter(filter) = kind else {
             return None;
         };
         let join_plan = children.remove(0);
@@ -80,7 +80,7 @@ impl PushDownPredicateJoin {
             mut children,
             required_output_columns,
         } = join_plan;
-        let LogicalPlanNodeKind::Join(join) = join_kind else {
+        let PlanNodeKind::Join(join) = join_kind else {
             return None;
         };
         if children.len() != 2 {
@@ -236,7 +236,7 @@ pub(crate) fn push_filter_predicates_through_join(
     } else {
         let pushed = combine_and(left_preds);
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(LogicalFilterNode { predicate: pushed }),
+            PlanNodeKind::Filter(LogicalFilterNode { predicate: pushed }),
             vec![left],
             None,
         )
@@ -248,7 +248,7 @@ pub(crate) fn push_filter_predicates_through_join(
     } else {
         let pushed = combine_and(right_preds);
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(LogicalFilterNode { predicate: pushed }),
+            PlanNodeKind::Filter(LogicalFilterNode { predicate: pushed }),
             vec![right],
             None,
         )
@@ -266,7 +266,7 @@ pub(crate) fn push_filter_predicates_through_join(
     };
 
     let new_join = LogicalPlanNode::new(
-        LogicalPlanNodeKind::Join(LogicalJoinNode {
+        PlanNodeKind::Join(LogicalJoinNode {
             join_type: new_join_type,
             condition: new_condition,
         }),
@@ -341,7 +341,7 @@ pub(crate) fn push_join_condition_predicates(
         left
     } else {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+            PlanNodeKind::Filter(LogicalFilterNode {
                 predicate: combine_and(left_preds),
             }),
             vec![left],
@@ -353,7 +353,7 @@ pub(crate) fn push_join_condition_predicates(
         right
     } else {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+            PlanNodeKind::Filter(LogicalFilterNode {
                 predicate: combine_and(right_preds),
             }),
             vec![right],
@@ -368,7 +368,7 @@ pub(crate) fn push_join_condition_predicates(
     };
 
     Some(LogicalPlanNode::new(
-        LogicalPlanNodeKind::Join(LogicalJoinNode {
+        PlanNodeKind::Join(LogicalJoinNode {
             join_type: new_join_type,
             condition: new_condition,
         }),
@@ -528,18 +528,18 @@ fn subtree_has_predicate(plan: &LogicalPlanNode, pred: &TypedExpr) -> bool {
 
 fn subtree_has_predicate_key(plan: &LogicalPlanNode, key: &str) -> bool {
     match &plan.kind {
-        LogicalPlanNodeKind::Scan(scan) => scan
+        PlanNodeKind::Scan(scan) => scan
             .predicates
             .iter()
             .any(|existing| predicate_has_conjunct_key(existing, key)),
-        LogicalPlanNodeKind::Filter(filter) => {
+        PlanNodeKind::Filter(filter) => {
             predicate_has_conjunct_key(&filter.predicate, key)
                 || plan
                     .children
                     .iter()
                     .any(|child| subtree_has_predicate_key(child, key))
         }
-        LogicalPlanNodeKind::Join(join) => {
+        PlanNodeKind::Join(join) => {
             join.condition
                 .as_ref()
                 .is_some_and(|condition| predicate_has_conjunct_key(condition, key))
@@ -828,7 +828,7 @@ mod tests {
     /// Build a scan with stable test ColumnIds.
     fn scan(table_name: &str, cols: &[&str]) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Scan(LogicalScanNode {
+            PlanNodeKind::Scan(LogicalScanNode {
                 database: "db".into(),
                 table: TableDef {
                     name: table_name.into(),
@@ -863,6 +863,7 @@ mod tests {
                 required_columns: None,
                 dict_columns: vec![],
                 variant_columns: vec![],
+                mv_rewritten_from: None,
             }),
             vec![],
             None,
@@ -875,7 +876,7 @@ mod tests {
         condition: Option<TypedExpr>,
     ) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Join(LogicalJoinNode {
+            PlanNodeKind::Join(LogicalJoinNode {
                 join_type: JoinKind::Inner,
                 condition: condition,
             }),
@@ -886,7 +887,7 @@ mod tests {
 
     fn cross_join(left: LogicalPlanNode, right: LogicalPlanNode) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Join(LogicalJoinNode {
+            PlanNodeKind::Join(LogicalJoinNode {
                 join_type: JoinKind::Cross,
                 condition: None,
             }),
@@ -904,7 +905,7 @@ mod tests {
             and(eq(col("a"), int_lit(2)), eq(col("x"), int_lit(20))),
         );
         let filter = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(LogicalFilterNode { predicate: pred }),
+            PlanNodeKind::Filter(LogicalFilterNode { predicate: pred }),
             vec![cross_join(left, right)],
             None,
         );
@@ -912,7 +913,7 @@ mod tests {
         let out = PushDownPredicateJoin
             .apply_with_logical(filter)
             .expect("should rewrite");
-        let LogicalPlanNodeKind::Join(join) = &out.kind else {
+        let PlanNodeKind::Join(join) = &out.kind else {
             panic!("expected Join after OR side-filter extraction");
         };
         assert!(
@@ -920,7 +921,7 @@ mod tests {
             "original OR predicate must remain as the join condition"
         );
         match &out.left().kind {
-            LogicalPlanNodeKind::Filter(filter) => {
+            PlanNodeKind::Filter(filter) => {
                 let rendered = format!("{:?}", filter.predicate.kind);
                 assert!(rendered.contains("\"a\""));
                 assert!(rendered.contains("Or"));
@@ -928,7 +929,7 @@ mod tests {
             other => panic!("expected left Filter, got {:?}", other),
         }
         match &out.right().kind {
-            LogicalPlanNodeKind::Filter(filter) => {
+            PlanNodeKind::Filter(filter) => {
                 let rendered = format!("{:?}", filter.predicate.kind);
                 assert!(rendered.contains("\"x\""));
                 assert!(rendered.contains("Or"));
@@ -941,7 +942,7 @@ mod tests {
     fn merge_join_conditions_deduplicates_existing_condition() {
         let condition = eq(col("a"), col("x"));
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+            PlanNodeKind::Filter(LogicalFilterNode {
                 predicate: condition.clone(),
             }),
             vec![inner_join(
@@ -955,7 +956,7 @@ mod tests {
         let out = PushDownPredicateJoin
             .apply_with_logical(plan)
             .expect("should rewrite");
-        let LogicalPlanNodeKind::Join(join) = &out.kind else {
+        let PlanNodeKind::Join(join) = &out.kind else {
             panic!("expected Join after predicate merge");
         };
         let condition = join.condition.as_ref().expect("join condition");
@@ -989,7 +990,7 @@ mod tests {
         let t2 = scan("t2", &["a", "b"]);
         let join = inner_join(t1, t2, None);
         let filter = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+            PlanNodeKind::Filter(LogicalFilterNode {
                 predicate: eq(col("x"), int_lit(1)),
             }),
             vec![join],
@@ -1002,17 +1003,17 @@ mod tests {
 
         // Expected shape: Join(Filter(t1), t2) — no outer Filter
         match &out.kind {
-            LogicalPlanNodeKind::Join(j) => {
+            PlanNodeKind::Join(j) => {
                 assert_eq!(j.join_type, JoinKind::Inner);
                 match &out.left().kind {
-                    LogicalPlanNodeKind::Filter(_) => match &out.left().unary_input().kind {
-                        LogicalPlanNodeKind::Scan(_) => {}
+                    PlanNodeKind::Filter(_) => match &out.left().unary_input().kind {
+                        PlanNodeKind::Scan(_) => {}
                         other => panic!("expected Scan under left Filter, got {:?}", other),
                     },
                     other => panic!("expected Filter on left child, got {:?}", other),
                 }
                 // Right child must be unmodified scan
-                assert!(matches!(&out.right().kind, LogicalPlanNodeKind::Scan(_)));
+                assert!(matches!(&out.right().kind, PlanNodeKind::Scan(_)));
             }
             other => panic!("expected bare Join at top, got {:?}", other),
         }
@@ -1027,7 +1028,7 @@ mod tests {
         let t2 = scan("t2", &["a", "b"]);
         let join = inner_join(t1, t2, None);
         let filter = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+            PlanNodeKind::Filter(LogicalFilterNode {
                 predicate: eq(col("a"), int_lit(1)),
             }),
             vec![join],
@@ -1039,13 +1040,13 @@ mod tests {
         let out = rule.apply_with_logical(filter).expect("should rewrite");
 
         match &out.kind {
-            LogicalPlanNodeKind::Join(j) => {
+            PlanNodeKind::Join(j) => {
                 assert_eq!(j.join_type, JoinKind::Inner);
                 // Left child must be unmodified scan
-                assert!(matches!(&out.left().kind, LogicalPlanNodeKind::Scan(_)));
+                assert!(matches!(&out.left().kind, PlanNodeKind::Scan(_)));
                 match &out.right().kind {
-                    LogicalPlanNodeKind::Filter(_) => match &out.right().unary_input().kind {
-                        LogicalPlanNodeKind::Scan(_) => {}
+                    PlanNodeKind::Filter(_) => match &out.right().unary_input().kind {
+                        PlanNodeKind::Scan(_) => {}
                         other => panic!("expected Scan under right Filter, got {:?}", other),
                     },
                     other => panic!("expected Filter on right child, got {:?}", other),
@@ -1064,7 +1065,7 @@ mod tests {
         let t2 = scan("t2", &["a", "b"]);
         let join = cross_join(t1, t2);
         let filter = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+            PlanNodeKind::Filter(LogicalFilterNode {
                 predicate: eq(col("x"), col("a")),
             }),
             vec![join],
@@ -1077,7 +1078,7 @@ mod tests {
 
         // Expected: INNER join with condition — no outer Filter
         match &out.kind {
-            LogicalPlanNodeKind::Join(j) => {
+            PlanNodeKind::Join(j) => {
                 assert_eq!(
                     j.join_type,
                     JoinKind::Inner,
@@ -1085,8 +1086,8 @@ mod tests {
                 );
                 assert!(j.condition.is_some(), "join condition must be set");
                 // Children should be bare scans (no pushed filters)
-                assert!(matches!(&out.left().kind, LogicalPlanNodeKind::Scan(_)));
-                assert!(matches!(&out.right().kind, LogicalPlanNodeKind::Scan(_)));
+                assert!(matches!(&out.left().kind, PlanNodeKind::Scan(_)));
+                assert!(matches!(&out.right().kind, PlanNodeKind::Scan(_)));
             }
             other => panic!("expected bare Join at top, got {:?}", other),
         }
@@ -1102,7 +1103,7 @@ mod tests {
         let t1 = scan("t1", &["x", "y"]);
         let t2 = scan("t2", &["a", "b"]);
         let join = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Join(LogicalJoinNode {
+            PlanNodeKind::Join(LogicalJoinNode {
                 join_type: JoinKind::RightOuter,
                 condition: None,
             }),
@@ -1110,7 +1111,7 @@ mod tests {
             None,
         );
         let filter = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+            PlanNodeKind::Filter(LogicalFilterNode {
                 predicate: eq(col("x"), int_lit(1)),
             }),
             vec![join],
@@ -1147,7 +1148,7 @@ mod tests {
         output_id: u32,
     ) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
+            PlanNodeKind::Project(LogicalProjectNode {
                 items: vec![ProjectItem {
                     expr: TypedExpr {
                         kind: ExprKind::ColumnRef {
@@ -1164,7 +1165,7 @@ mod tests {
                 output_qualifier: None,
             }),
             vec![LogicalPlanNode::new(
-                LogicalPlanNodeKind::Values(LogicalValuesNode {
+                PlanNodeKind::Values(LogicalValuesNode {
                     rows: vec![],
                     columns: vec![OutputColumn {
                         column_id: ColumnId::new_for_test(source_id),
@@ -1188,7 +1189,7 @@ mod tests {
             derived_project_with_output_id("right", 22, 202),
         );
         let filter = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+            PlanNodeKind::Filter(LogicalFilterNode {
                 predicate: eq(col_with_id("a", "k", 101), col_with_id("b", "k", 202)),
             }),
             vec![join],
@@ -1199,18 +1200,18 @@ mod tests {
         let out = rule
             .apply_with_logical(filter)
             .expect("cross-side predicate should push");
-        let LogicalPlanNodeKind::Join(join) = &out.kind else {
+        let PlanNodeKind::Join(join) = &out.kind else {
             panic!("expected bare Join with no remaining Filter");
         };
         assert_eq!(join.join_type, JoinKind::Inner);
         assert!(join.condition.is_some(), "join condition must be set");
-        assert!(matches!(&out.left().kind, LogicalPlanNodeKind::Project(_)));
-        assert!(matches!(&out.right().kind, LogicalPlanNodeKind::Project(_)));
+        assert!(matches!(&out.left().kind, PlanNodeKind::Project(_)));
+        assert!(matches!(&out.right().kind, PlanNodeKind::Project(_)));
     }
 
     fn scan_with_ids(alias: &str, cols: &[(&str, u32)]) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Scan(LogicalScanNode {
+            PlanNodeKind::Scan(LogicalScanNode {
                 database: "db".to_string(),
                 table: TableDef {
                     name: alias.to_string(),
@@ -1245,6 +1246,7 @@ mod tests {
                 required_columns: None,
                 dict_columns: vec![],
                 variant_columns: vec![],
+                mv_rewritten_from: None,
             }),
             vec![],
             None,
@@ -1253,7 +1255,7 @@ mod tests {
 
     fn join_with_ids(join_type: JoinKind, condition: Option<TypedExpr>) -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Join(LogicalJoinNode {
+            PlanNodeKind::Join(LogicalJoinNode {
                 join_type,
                 condition,
             }),
@@ -1274,7 +1276,7 @@ mod tests {
             mut children,
             required_output_columns,
         } = join_plan;
-        let LogicalPlanNodeKind::Join(join) = kind else {
+        let PlanNodeKind::Join(join) = kind else {
             panic!("expected Join test plan");
         };
         let right = children.remove(1);
@@ -1288,7 +1290,7 @@ mod tests {
             mut children,
             required_output_columns,
         } = join_plan;
-        let LogicalPlanNodeKind::Join(join) = kind else {
+        let PlanNodeKind::Join(join) = kind else {
             panic!("expected Join test plan");
         };
         let right = children.remove(1);
@@ -1310,11 +1312,11 @@ mod tests {
         );
 
         assert!(changed);
-        let LogicalPlanNodeKind::Join(join) = &plan.kind else {
+        let PlanNodeKind::Join(join) = &plan.kind else {
             panic!("expected bare Join");
         };
-        assert!(matches!(&plan.left().kind, LogicalPlanNodeKind::Filter(_)));
-        assert!(matches!(&plan.right().kind, LogicalPlanNodeKind::Filter(_)));
+        assert!(matches!(&plan.left().kind, PlanNodeKind::Filter(_)));
+        assert!(matches!(&plan.right().kind, PlanNodeKind::Filter(_)));
         assert!(join.condition.is_some());
     }
 
@@ -1331,11 +1333,11 @@ mod tests {
         );
 
         assert!(changed);
-        let LogicalPlanNodeKind::Join(join) = &plan.kind else {
+        let PlanNodeKind::Join(join) = &plan.kind else {
             panic!("expected bare Join");
         };
         match &plan.right().kind {
-            LogicalPlanNodeKind::Filter(filter) => {
+            PlanNodeKind::Filter(filter) => {
                 let rendered = format!("{:?}", filter.predicate.kind);
                 assert!(rendered.contains("\"b\""));
                 assert!(rendered.contains("Int(7)"));
@@ -1351,7 +1353,7 @@ mod tests {
     #[test]
     fn derived_predicate_detects_existing_child_filter_conjunct() {
         let existing_left = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(LogicalFilterNode {
+            PlanNodeKind::Filter(LogicalFilterNode {
                 predicate: combine_and(vec![
                     eq(col_with_id("l", "a", 1), int_lit(7)),
                     eq(col_with_id("l", "v", 3), int_lit(3)),
@@ -1361,7 +1363,7 @@ mod tests {
             None,
         );
         let join = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Join(LogicalJoinNode {
+            PlanNodeKind::Join(LogicalJoinNode {
                 join_type: JoinKind::Inner,
                 condition: Some(eq(col_with_id("l", "a", 1), col_with_id("r", "b", 2))),
             }),
@@ -1375,16 +1377,13 @@ mod tests {
         );
 
         assert!(changed);
-        let LogicalPlanNodeKind::Join(join) = &plan.kind else {
+        let PlanNodeKind::Join(join) = &plan.kind else {
             panic!("expected Join");
         };
         match &plan.left().kind {
-            LogicalPlanNodeKind::Filter(filter) => {
+            PlanNodeKind::Filter(filter) => {
                 assert!(
-                    !matches!(
-                        &plan.left().unary_input().kind,
-                        LogicalPlanNodeKind::Filter(_)
-                    ),
+                    !matches!(&plan.left().unary_input().kind, PlanNodeKind::Filter(_)),
                     "must not add duplicate derived left filter over existing conjunct"
                 );
                 let rendered = format!("{:?}", filter.predicate.kind);
@@ -1406,10 +1405,10 @@ mod tests {
             push_test_join_condition_predicates(join_with_ids(JoinKind::Inner, Some(condition)))
                 .expect("join condition should be rewritten");
 
-        let LogicalPlanNodeKind::Join(join) = &plan.kind else {
+        let PlanNodeKind::Join(join) = &plan.kind else {
             panic!("expected Join");
         };
-        assert!(matches!(&plan.left().kind, LogicalPlanNodeKind::Filter(_)));
+        assert!(matches!(&plan.left().kind, PlanNodeKind::Filter(_)));
         let condition = join.condition.as_ref().expect("join condition");
         let rendered = format!("{:?}", condition.kind);
         assert!(rendered.contains("\"v\""));
@@ -1428,11 +1427,11 @@ mod tests {
             push_test_join_condition_predicates(join_with_ids(JoinKind::Inner, Some(condition)))
                 .expect("join condition should derive side filters");
 
-        let LogicalPlanNodeKind::Join(join) = &plan.kind else {
+        let PlanNodeKind::Join(join) = &plan.kind else {
             panic!("expected Join");
         };
         match &plan.left().kind {
-            LogicalPlanNodeKind::Filter(filter) => {
+            PlanNodeKind::Filter(filter) => {
                 let rendered = format!("{:?}", filter.predicate.kind);
                 assert!(rendered.contains("\"a\""));
                 assert!(rendered.contains("Int(7)"));
@@ -1440,7 +1439,7 @@ mod tests {
             other => panic!("expected left Filter, got {:?}", other),
         }
         match &plan.right().kind {
-            LogicalPlanNodeKind::Filter(filter) => {
+            PlanNodeKind::Filter(filter) => {
                 let rendered = format!("{:?}", filter.predicate.kind);
                 assert!(rendered.contains("\"b\""));
                 assert!(rendered.contains("Int(7)"));
@@ -1462,7 +1461,7 @@ mod tests {
             push_test_join_condition_predicates(join_with_ids(JoinKind::Cross, Some(condition)))
                 .expect("cross join should be upgraded");
 
-        let LogicalPlanNodeKind::Join(join) = &plan.kind else {
+        let PlanNodeKind::Join(join) = &plan.kind else {
             panic!("expected Join");
         };
         assert_eq!(join.join_type, JoinKind::Inner);

@@ -173,7 +173,13 @@ impl LogicalRewriteRule for RankingWindowPredicatePushdownRule {
         let filter_predicate_typed = scalar::materialize(&arena_rc.borrow(), filter_predicate_id);
 
         // --- Step 5: Find a ranking window expr with a finite upper bound ---
-        // `window_op.output_columns[i].column_id` is the output ColumnId for window_exprs[i].
+        // Window output columns are laid out as input columns followed by one
+        // result column for each window expression. Keep this in sync with
+        // scalar_bridge::materialize_window_exprs.
+        let window_output_start = window_op
+            .output_columns
+            .len()
+            .saturating_sub(window_op.window_exprs.len());
         let found = window_op
             .window_exprs
             .iter()
@@ -181,7 +187,7 @@ impl LogicalRewriteRule for RankingWindowPredicatePushdownRule {
             .find_map(|(i, w_expr)| {
                 let window_output_col_id = window_op
                     .output_columns
-                    .get(i)
+                    .get(window_output_start + i)
                     .map(|oc| oc.column_id)
                     .unwrap_or(ColumnId::UNSET);
                 if window_output_col_id == ColumnId::UNSET {
@@ -699,6 +705,34 @@ mod tests {
         assert!(rule.matches(&plan, &ctx), "matches() must return true");
 
         let result = rule.apply(plan, &mut ctx).unwrap();
+        let sort = extract_sort_from_changed(result);
+        assert_eq!(sort.partition_limit, Some(2));
+        assert_eq!(sort.topn_type, Some(SortTopNType::Rank));
+    }
+
+    #[test]
+    fn maps_window_expr_to_trailing_output_column() {
+        use crate::exec::node::sort::SortTopNType;
+        let rk_id = ColumnId::new_for_test(1);
+        let p_id = ColumnId::new_for_test(2);
+        let mut arena = ScalarArena::new();
+        let sort = make_sort_opt(&mut arena, p_id);
+        let w_spec = make_window_spec_opt(&mut arena, "rank", p_id);
+        let window = window_opt(
+            sort,
+            vec![w_spec],
+            vec![output_col(p_id, "p"), output_col(rk_id, "rk")],
+        );
+        let plan = filter_opt(
+            &mut arena,
+            window,
+            binop_typed(col_typed(rk_id), BinOp::Le, int_typed(2)),
+        );
+
+        let mut ctx = make_ctx(arena);
+        let result = RankingWindowPredicatePushdownRule
+            .apply(plan, &mut ctx)
+            .unwrap();
         let sort = extract_sort_from_changed(result);
         assert_eq!(sort.partition_limit, Some(2));
         assert_eq!(sort.topn_type, Some(SortTopNType::Rank));

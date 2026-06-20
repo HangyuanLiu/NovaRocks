@@ -1,17 +1,9 @@
 use std::collections::HashMap;
 
+use crate::sql::codegen::FragmentId;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence, Statistics};
-
-use super::FragmentId;
-use super::kind::{
-    DistributedAssertOneRowNode, DistributedDecodeNode, DistributedExchangeNode,
-    DistributedFilterNode, DistributedGenerateSeriesNode, DistributedHashAggregateNode,
-    DistributedHashJoinNode, DistributedNestLoopJoinNode, DistributedProjectNode,
-    DistributedRepeatNode, DistributedScanNode, DistributedSetOpNode, DistributedSortNode,
-    DistributedTableFunctionNode, DistributedTopNNode, DistributedValuesNode,
-    DistributedWindowNode,
-};
+pub(crate) use crate::sql::planner::plan::PlanNodeKind;
 
 /// Self-contained copy of the estimated stats this node carries, so EXPLAIN /
 /// ANALYZE never reach back into `PhysicalPlanNode`.
@@ -51,35 +43,14 @@ pub(crate) struct DistributedPlanNode {
     pub probe_runtime_filters: Vec<crate::sql::optimizer::runtime_filter_pass::RuntimeFilterProbe>,
     pub children: Vec<DistributedPlanNode>,
     pub stats: PlanNodeStats,
-    pub kind: DistributedPlanNodeKind,
-}
-
-/// Operator-specific payload. Grows one variant per operator as slices land.
-#[derive(Clone, Debug)]
-pub(crate) enum DistributedPlanNodeKind {
-    Scan(Box<DistributedScanNode>),
-    Project(DistributedProjectNode),
-    Filter(DistributedFilterNode),
-    Sort(DistributedSortNode),
-    TopN(DistributedTopNNode),
-    Exchange(DistributedExchangeNode),
-    HashAggregate(Box<DistributedHashAggregateNode>),
-    HashJoin(Box<DistributedHashJoinNode>),
-    NestLoopJoin(DistributedNestLoopJoinNode),
-    Values(DistributedValuesNode),
-    AssertOneRow(DistributedAssertOneRowNode),
-    Decode(DistributedDecodeNode),
-    Repeat(Box<DistributedRepeatNode>),
-    SetOp(DistributedSetOpNode),
-    Window(Box<DistributedWindowNode>),
-    GenerateSeries(DistributedGenerateSeriesNode),
-    TableFunction(Box<DistributedTableFunctionNode>),
+    pub kind: PlanNodeKind,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sql::optimizer::statistics::{ColumnStatistic, Statistics};
+    use crate::sql::planner::plan::PlanValuesNode as DistributedValuesNode;
 
     #[test]
     fn plan_node_stats_copies_statistics() {
@@ -114,13 +85,37 @@ mod tests {
             probe_runtime_filters: vec![],
             children: vec![],
             stats: PlanNodeStats::from_statistics(&Statistics::default()),
-            kind: DistributedPlanNodeKind::Values(DistributedValuesNode {
+            kind: PlanNodeKind::Values(DistributedValuesNode {
                 rows: vec![],
                 columns: vec![],
             }),
         };
 
-        assert!(matches!(node.kind, DistributedPlanNodeKind::Values(_)));
+        assert!(matches!(node.kind, PlanNodeKind::Values(_)));
         assert!(node.children.is_empty());
+    }
+
+    #[test]
+    fn distributed_plan_node_uses_unified_kind() {
+        fn accepts_unified_kind(_: &crate::sql::planner::plan::PlanNodeKind) {}
+
+        let node = DistributedPlanNode {
+            node_id: 1,
+            fragment_id: 0,
+            tuple_ids: vec![1],
+            nullable_tuple_ids: vec![],
+            limit: -1,
+            execution_join_distribution: None,
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+            children: vec![],
+            stats: PlanNodeStats::from_statistics(&Statistics::default()),
+            kind: PlanNodeKind::Values(DistributedValuesNode {
+                rows: vec![],
+                columns: vec![],
+            }),
+        };
+
+        accepts_unified_kind(&node.kind);
     }
 }

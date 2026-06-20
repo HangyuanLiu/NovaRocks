@@ -72,7 +72,7 @@ mod tests {
     use crate::sql::optimizer::rewrite::registry::query_rewrite_pipeline;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::{
-        ApplyKind, LogicalApplyNode, LogicalLimitNode, LogicalPlanNodeKind, LogicalValuesNode,
+        ApplyKind, LogicalApplyNode, LogicalLimitNode, LogicalValuesNode, PlanNodeKind,
     };
 
     fn ctx_with_arena() -> RewriteContext {
@@ -87,7 +87,7 @@ mod tests {
 
     fn empty_values() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Values(LogicalValuesNode {
+            PlanNodeKind::Values(LogicalValuesNode {
                 rows: vec![],
                 columns: vec![],
             }),
@@ -98,7 +98,7 @@ mod tests {
 
     fn apply_over_values() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Apply(LogicalApplyNode {
+            PlanNodeKind::Apply(LogicalApplyNode {
                 kind: ApplyKind::Scalar,
                 subquery_expr: TypedExpr {
                     kind: ExprKind::ColumnRef {
@@ -131,7 +131,7 @@ mod tests {
 
     fn exists_apply_over_values() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Apply(LogicalApplyNode {
+            PlanNodeKind::Apply(LogicalApplyNode {
                 kind: ApplyKind::Exists { negated: false },
                 subquery_expr: TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Bool(true)),
@@ -185,7 +185,7 @@ mod tests {
         let inner_col = int_output_column(ColumnId(9), "inner_v");
 
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Apply(LogicalApplyNode {
+            PlanNodeKind::Apply(LogicalApplyNode {
                 kind: ApplyKind::In { negated: false },
                 subquery_expr: int_column_ref(outer_col.column_id, &outer_col.name),
                 output_column: OutputColumn {
@@ -205,7 +205,7 @@ mod tests {
             }),
             vec![
                 LogicalPlanNode::new(
-                    LogicalPlanNodeKind::Values(LogicalValuesNode {
+                    PlanNodeKind::Values(LogicalValuesNode {
                         rows: vec![],
                         columns: vec![outer_col.clone()],
                     }),
@@ -213,7 +213,7 @@ mod tests {
                     None,
                 ),
                 LogicalPlanNode::new(
-                    LogicalPlanNodeKind::Values(LogicalValuesNode {
+                    PlanNodeKind::Values(LogicalValuesNode {
                         rows: vec![],
                         columns: vec![inner_col.clone()],
                     }),
@@ -294,7 +294,7 @@ mod tests {
     #[test]
     fn find_residual_apply_ignores_plain_plans() {
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Values(LogicalValuesNode {
+            PlanNodeKind::Values(LogicalValuesNode {
                 rows: vec![],
                 columns: vec![],
             }),
@@ -311,7 +311,7 @@ mod tests {
         // Apply one level below a unary container: exercises the walker's
         // recursive descent, not just the root case.
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Limit(LogicalLimitNode {
+            PlanNodeKind::Limit(LogicalLimitNode {
                 limit: Some(1),
                 offset: None,
             }),

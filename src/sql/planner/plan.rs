@@ -9,8 +9,10 @@ use arrow::datatypes::DataType;
 
 use crate::sql::catalog::TableDef;
 
+use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{JoinKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
 use crate::sql::column_id::ColumnId;
+use crate::sql::optimizer::operator::{AggMode, JoinDistribution, TopNPhase};
 
 // ---------------------------------------------------------------------------
 // Logical plan tree
@@ -19,73 +21,338 @@ use crate::sql::column_id::ColumnId;
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct LogicalPlanNode {
-    pub kind: LogicalPlanNodeKind,
+    pub kind: PlanNodeKind,
     pub children: Vec<LogicalPlanNode>,
     /// Set by the Phase-1 column-pruning tagging pass; `None` means all columns required.
     pub required_output_columns: Option<HashSet<ColumnId>>,
 }
 
+// ---------------------------------------------------------------------------
+// Unified planner-side plan node kind
+// ---------------------------------------------------------------------------
+
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
-pub(crate) enum LogicalPlanNodeKind {
-    Scan(LogicalScanNode),
-    Filter(LogicalFilterNode),
-    Project(LogicalProjectNode),
+pub(crate) enum PlanNodeKind {
+    Scan(PlanScanNode),
+    Filter(PlanFilterNode),
+    Project(PlanProjectNode),
+    Sort(PlanSortNode),
+    /// Logical-stage payload only; distributed IR encodes limits on the wrapper,
+    /// Sort/TopN offsets, or ExchangeFlavor::LimitOffset instead of a Limit kind.
+    Limit(PlanLimitNode),
+    Values(PlanValuesNode),
+    Decode(PlanDecodeNode),
+    Repeat(PlanRepeatNode),
+    Window(PlanWindowNode),
+    GenerateSeries(PlanGenerateSeriesNode),
+    TableFunction(PlanTableFunctionNode),
+    AssertOneRow(PlanAssertOneRowNode),
     Aggregate(LogicalAggregateNode),
     Join(LogicalJoinNode),
-    Sort(LogicalSortNode),
-    Limit(LogicalLimitNode),
     Union(LogicalUnionNode),
     Intersect(LogicalIntersectNode),
     Except(LogicalExceptNode),
-    Values(LogicalValuesNode),
-    GenerateSeries(LogicalGenerateSeriesNode),
-    TableFunction(LogicalTableFunctionNode),
-    Window(LogicalWindowNode),
-    /// Repeat node for ROLLUP/CUBE/GROUPING SETS.
-    /// Replicates each input row N times with different null patterns.
-    Repeat(LogicalRepeatNode),
-    /// Defines the scope of one CTE. The left child is the producer subtree;
-    /// the right child is the query subtree that may consume it.
     CTEAnchor(LogicalCTEAnchorNode),
-    /// Produces the analyzed CTE definition.
     CTEProduce(LogicalCTEProduceNode),
-    /// Reference to a CTE definition. Leaf node.
     CTEConsume(LogicalCTEConsumeNode),
-    /// Low-cardinality dictionary decode: rewrites string columns to their
-    /// dictionary-encoded form upstream and decodes back to strings before
-    /// emission. Inserted by the dictionary-rewrite optimizer rule (Task 7);
-    /// today no optimizer pass produces this variant — Task 5 only adds the
-    /// type-system plumbing.
-    Decode(LogicalDecodeNode),
-    /// Logical IMV aggregate-state reconciliation over old target state and
-    /// delta state. Execution lowering is added by later tasks.
     AggregateStateMerge(LogicalAggregateStateMergeNode),
-    /// Subquery glue node (outer ⋈ subquery). Eliminated by the
-    /// SubqueryRewrite stage; see LogicalApplyNode.
     Apply(LogicalApplyNode),
-    /// At-most-one-row runtime guard for scalar subqueries.
-    AssertOneRow(LogicalAssertOneRowNode),
-    /// IMV marker: "compute the incremental of input". Emitted by the
-    /// `imv-delta-marker` stage; rejected by `imv-validation` if not
-    /// consumed. Must never reach physical lowering. See
-    /// `src/sql/optimizer/rewrite/imv/marker.rs`.
     ImvDelta(LogicalImvDeltaNode),
-    /// IMV marker: "scan input over a snapshot window". Emitted by task 4
-    /// scan-binding rules; consumed before lowering. Same panic-on-leak
-    /// rule as `ImvDelta`.
-    // PR-β scaffolding: task 4 constructs ImvVersion during scan-binding;
-    // the variant exists here so the type is wired through the plan tree.
-    #[allow(dead_code)]
     ImvVersion(LogicalImvVersionNode),
+    TopN(DistributedTopNNode),
+    Exchange(DistributedExchangeNode),
+    HashAggregate(Box<DistributedHashAggregateNode>),
+    HashJoin(Box<DistributedHashJoinNode>),
+    NestLoopJoin(DistributedNestLoopJoinNode),
+    SetOp(DistributedSetOpNode),
+}
+
+impl PlanNodeKind {
+    pub(crate) fn variant_name(&self) -> &'static str {
+        match self {
+            PlanNodeKind::Scan(_) => "Scan",
+            PlanNodeKind::Filter(_) => "Filter",
+            PlanNodeKind::Project(_) => "Project",
+            PlanNodeKind::Sort(_) => "Sort",
+            PlanNodeKind::Limit(_) => "Limit",
+            PlanNodeKind::Values(_) => "Values",
+            PlanNodeKind::Decode(_) => "Decode",
+            PlanNodeKind::Repeat(_) => "Repeat",
+            PlanNodeKind::Window(_) => "Window",
+            PlanNodeKind::GenerateSeries(_) => "GenerateSeries",
+            PlanNodeKind::TableFunction(_) => "TableFunction",
+            PlanNodeKind::AssertOneRow(_) => "AssertOneRow",
+            PlanNodeKind::Aggregate(_) => "Aggregate",
+            PlanNodeKind::Join(_) => "Join",
+            PlanNodeKind::Union(_) => "Union",
+            PlanNodeKind::Intersect(_) => "Intersect",
+            PlanNodeKind::Except(_) => "Except",
+            PlanNodeKind::CTEAnchor(_) => "CTEAnchor",
+            PlanNodeKind::CTEProduce(_) => "CTEProduce",
+            PlanNodeKind::CTEConsume(_) => "CTEConsume",
+            PlanNodeKind::AggregateStateMerge(_) => "AggregateStateMerge",
+            PlanNodeKind::Apply(_) => "Apply",
+            PlanNodeKind::ImvDelta(_) => "ImvDelta",
+            PlanNodeKind::ImvVersion(_) => "ImvVersion",
+            PlanNodeKind::TopN(_) => "TopN",
+            PlanNodeKind::Exchange(_) => "Exchange",
+            PlanNodeKind::HashAggregate(_) => "HashAggregate",
+            PlanNodeKind::HashJoin(_) => "HashJoin",
+            PlanNodeKind::NestLoopJoin(_) => "NestLoopJoin",
+            PlanNodeKind::SetOp(_) => "SetOp",
+        }
+    }
+}
+
+pub(crate) fn validate_logical_plan_stage(plan: &LogicalPlanNode) -> Result<(), String> {
+    validate_logical_plan_stage_at(plan, "root")
+}
+
+fn validate_logical_plan_stage_at(plan: &LogicalPlanNode, path: &str) -> Result<(), String> {
+    match &plan.kind {
+        PlanNodeKind::TopN(_)
+        | PlanNodeKind::Exchange(_)
+        | PlanNodeKind::HashAggregate(_)
+        | PlanNodeKind::HashJoin(_)
+        | PlanNodeKind::NestLoopJoin(_)
+        | PlanNodeKind::SetOp(_) => {
+            return Err(format!(
+                "distributed-only PlanNodeKind::{} is not valid in LogicalPlanNode at {path}",
+                plan.kind.variant_name()
+            ));
+        }
+        PlanNodeKind::Scan(scan) if scan.mv_rewritten_from.is_some() => {
+            return Err(format!(
+                "LogicalPlanNode at {path} has Scan.mv_rewritten_from set; \
+                 MV rewrite source is a distributed-stage scan field"
+            ));
+        }
+        PlanNodeKind::Sort(sort) if !sort.output_columns.is_empty() => {
+            return Err(format!(
+                "LogicalPlanNode at {path} has Sort.output_columns set; \
+                 output_columns is a distributed-stage sort field"
+            ));
+        }
+        PlanNodeKind::Sort(sort) if sort.offset.is_some() => {
+            return Err(format!(
+                "LogicalPlanNode at {path} has Sort.offset set; \
+                 offset is a distributed-stage sort field"
+            ));
+        }
+        PlanNodeKind::Repeat(repeat) if repeat.virtual_tuple_id.is_some() => {
+            return Err(format!(
+                "LogicalPlanNode at {path} has Repeat.virtual_tuple_id set; \
+                 virtual_tuple_id is a distributed-stage repeat field"
+            ));
+        }
+        _ => {}
+    }
+
+    for (idx, child) in plan.children.iter().enumerate() {
+        validate_logical_plan_stage_at(child, &format!("{path}.children[{idx}]"))?;
+    }
+    Ok(())
 }
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
-pub(crate) struct LogicalDecodeNode {
+pub(crate) struct PlanScanNode {
+    pub database: String,
+    pub table: TableDef,
+    pub alias: Option<String>,
+    pub columns: Vec<OutputColumn>,
+    pub predicates: Vec<TypedExpr>,
+    pub required_columns: Option<Vec<String>>,
+    pub dict_columns: Vec<ScanDictionaryColumn>,
+    pub variant_columns: Vec<ScanVariantColumn>,
+    pub mv_rewritten_from: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct PlanFilterNode {
+    pub predicate: TypedExpr,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct PlanProjectNode {
+    pub items: Vec<ProjectItem>,
+    pub output_qualifier: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct PlanSortNode {
+    pub items: Vec<SortItem>,
+    pub analytic_partition_by: Vec<TypedExpr>,
+    pub output_columns: Vec<OutputColumn>,
+    pub offset: Option<i64>,
+    pub partition_limit: Option<usize>,
+    pub topn_type: Option<crate::exec::node::sort::SortTopNType>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct PlanLimitNode {
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct PlanValuesNode {
+    pub rows: Vec<Vec<TypedExpr>>,
+    pub columns: Vec<OutputColumn>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct PlanDecodeNode {
     pub mappings: Vec<DecodeMapping>,
     pub output_columns: Vec<OutputColumn>,
 }
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct PlanRepeatNode {
+    pub repeat_column_ref_list: Vec<Vec<String>>,
+    pub repeat_column_ref_ids: Vec<Vec<ColumnId>>,
+    pub grouping_ids: Vec<u64>,
+    pub all_rollup_columns: Vec<String>,
+    pub all_rollup_column_ids: Vec<ColumnId>,
+    pub grouping_key_aliases: Vec<(String, String)>,
+    pub grouping_fn_args: Vec<(String, Vec<String>)>,
+    pub grouping_fn_arg_ids: Vec<Vec<ColumnId>>,
+    pub grouping_fn_ids: Vec<(String, ColumnId)>,
+    pub virtual_tuple_id: Option<i32>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct PlanWindowNode {
+    pub window_exprs: Vec<WindowExpr>,
+    pub output_columns: Vec<OutputColumn>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct PlanGenerateSeriesNode {
+    pub start: i64,
+    pub end: i64,
+    pub step: i64,
+    pub column_name: String,
+    pub alias: Option<String>,
+    pub output_column_id: ColumnId,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct PlanTableFunctionNode {
+    pub function_name: String,
+    pub args: Vec<TypedExpr>,
+    pub output_columns: Vec<OutputColumn>,
+    pub alias: Option<String>,
+    pub is_left_join: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct PlanAssertOneRowNode {
+    pub subquery_text: String,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct DistributedTopNNode {
+    pub items: Vec<SortItem>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+    pub phase: TopNPhase,
+    pub is_split: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct DistributedExchangeNode {
+    pub partition_type: crate::partitions::TPartitionType,
+    pub partition_exprs: Vec<TypedExpr>,
+    pub source_fragment_id: u32,
+    pub output_columns: Vec<OutputColumn>,
+    pub output_qualifier: Option<String>,
+    pub flavor: ExchangeFlavor,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) enum ExchangeFlavor {
+    Distribution,
+    LimitOffset {
+        limit: Option<i64>,
+        offset: Option<i64>,
+    },
+    TopNSplit {
+        items: Vec<SortItem>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    },
+    CteMulticast {
+        cte_id: CteId,
+    },
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct DistributedHashAggregateNode {
+    pub mode: AggMode,
+    pub group_by: Vec<TypedExpr>,
+    pub aggregates: Vec<AggregateCall>,
+    pub is_merge: Vec<bool>,
+    pub output_columns: Vec<OutputColumn>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct DistributedHashJoinNode {
+    pub join_type: JoinKind,
+    pub eq_conditions: Vec<DistributedHashJoinEqCondition>,
+    pub other_condition: Option<TypedExpr>,
+    pub distribution: JoinDistribution,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct DistributedHashJoinEqCondition {
+    pub left: TypedExpr,
+    pub right: TypedExpr,
+    pub null_safe: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct DistributedNestLoopJoinNode {
+    pub join_type: JoinKind,
+    pub condition: Option<TypedExpr>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlanSetOpKind {
+    UnionAll,
+    Intersect,
+    Except,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct DistributedSetOpNode {
+    pub kind: PlanSetOpKind,
+    pub output_columns: Vec<OutputColumn>,
+    pub child_output_columns: Vec<Vec<OutputColumn>>,
+}
+
+pub(crate) type LogicalDecodeNode = PlanDecodeNode;
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
@@ -111,25 +378,8 @@ pub(crate) struct LogicalApplyNode {
     pub uncorrelated_outer_predicate_columns: HashSet<ColumnId>,
 }
 
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub(crate) struct LogicalAssertOneRowNode {
-    pub subquery_text: String,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub(crate) struct LogicalRepeatNode {
-    pub repeat_column_ref_list: Vec<Vec<String>>,
-    pub repeat_column_ref_ids: Vec<Vec<ColumnId>>,
-    pub grouping_ids: Vec<u64>,
-    pub all_rollup_columns: Vec<String>,
-    pub all_rollup_column_ids: Vec<ColumnId>,
-    pub grouping_key_aliases: Vec<(String, String)>,
-    pub grouping_fn_args: Vec<(String, Vec<String>)>,
-    pub grouping_fn_arg_ids: Vec<Vec<ColumnId>>,
-    pub grouping_fn_ids: Vec<(String, ColumnId)>,
-}
+pub(crate) type LogicalAssertOneRowNode = PlanAssertOneRowNode;
+pub(crate) type LogicalRepeatNode = PlanRepeatNode;
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
@@ -152,66 +402,13 @@ pub(crate) struct LogicalCTEConsumeNode {
     pub output_columns: Vec<crate::sql::analysis::OutputColumn>,
 }
 
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub(crate) struct LogicalWindowNode {
-    pub window_exprs: Vec<WindowExpr>,
-    pub output_columns: Vec<OutputColumn>,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub(crate) struct LogicalGenerateSeriesNode {
-    pub start: i64,
-    pub end: i64,
-    pub step: i64,
-    pub column_name: String,
-    pub alias: Option<String>,
-    pub output_column_id: ColumnId,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub(crate) struct LogicalTableFunctionNode {
-    pub function_name: String,
-    pub args: Vec<TypedExpr>,
-    pub output_columns: Vec<OutputColumn>,
-    pub alias: Option<String>,
-    pub is_left_join: bool,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub(crate) struct LogicalScanNode {
-    pub database: String,
-    pub table: TableDef,
-    pub alias: Option<String>,
-    pub columns: Vec<OutputColumn>,
-    pub predicates: Vec<TypedExpr>,
-    pub required_columns: Option<Vec<String>>,
-    pub dict_columns: Vec<ScanDictionaryColumn>,
-    pub variant_columns: Vec<ScanVariantColumn>,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub(crate) struct LogicalValuesNode {
-    pub rows: Vec<Vec<TypedExpr>>,
-    pub columns: Vec<OutputColumn>,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub(crate) struct LogicalFilterNode {
-    pub predicate: TypedExpr,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub(crate) struct LogicalProjectNode {
-    pub items: Vec<ProjectItem>,
-    pub output_qualifier: Option<String>,
-}
+pub(crate) type LogicalWindowNode = PlanWindowNode;
+pub(crate) type LogicalGenerateSeriesNode = PlanGenerateSeriesNode;
+pub(crate) type LogicalTableFunctionNode = PlanTableFunctionNode;
+pub(crate) type LogicalScanNode = PlanScanNode;
+pub(crate) type LogicalValuesNode = PlanValuesNode;
+pub(crate) type LogicalFilterNode = PlanFilterNode;
+pub(crate) type LogicalProjectNode = PlanProjectNode;
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
@@ -222,28 +419,8 @@ pub(crate) struct LogicalAggregateNode {
     pub already_pushed: bool,
 }
 
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub(crate) struct LogicalSortNode {
-    pub items: Vec<SortItem>,
-    /// Populated by `build_window_and_project` when this Sort was inserted
-    /// as a precursor to a Window operator (PARTITION BY ...). Carries the
-    /// window's partition_by columns, which become the analytic-partition
-    /// tag on the downstream SortOp / SortOp / TSortNode.
-    /// Empty for top-level `ORDER BY` sorts.
-    pub analytic_partition_by: Vec<TypedExpr>,
-    /// Set by RankingWindowPredicatePushdown: per-partition rank cap + ranking
-    /// kind. `None` means ordinary sort. See OQ-13 ranking-window design spec.
-    pub partition_limit: Option<usize>,
-    pub topn_type: Option<crate::exec::node::sort::SortTopNType>,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub(crate) struct LogicalLimitNode {
-    pub limit: Option<i64>,
-    pub offset: Option<i64>,
-}
+pub(crate) type LogicalSortNode = PlanSortNode;
+pub(crate) type LogicalLimitNode = PlanLimitNode;
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
@@ -370,7 +547,7 @@ pub(crate) struct AggregateCall {
 
 impl LogicalPlanNode {
     pub(crate) fn new(
-        kind: LogicalPlanNodeKind,
+        kind: PlanNodeKind,
         children: Vec<LogicalPlanNode>,
         required_output_columns: Option<HashSet<ColumnId>>,
     ) -> Self {
@@ -427,7 +604,7 @@ mod plan_tests {
 
     fn empty_values_for_test() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Values(LogicalValuesNode {
+            PlanNodeKind::Values(LogicalValuesNode {
                 rows: vec![],
                 columns: vec![],
             }),
@@ -439,7 +616,7 @@ mod plan_tests {
     #[test]
     fn logical_plan_node_exposes_kind_and_children_uniformly() {
         let node = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
+            PlanNodeKind::Project(LogicalProjectNode {
                 items: vec![],
                 output_qualifier: None,
             }),
@@ -447,15 +624,24 @@ mod plan_tests {
             None,
         );
 
-        assert!(matches!(node.kind, LogicalPlanNodeKind::Project(_)));
+        assert!(matches!(node.kind, PlanNodeKind::Project(_)));
         assert_eq!(node.children.len(), 1);
         assert!(node.required_output_columns.is_none());
     }
 
     #[test]
+    fn logical_plan_node_uses_unified_kind() {
+        fn accepts_unified_kind(_: &PlanNodeKind) {}
+
+        let node = empty_values_for_test();
+
+        accepts_unified_kind(&node.kind);
+    }
+
+    #[test]
     fn imv_marker_keeps_input_in_children() {
         let node = LogicalPlanNode::new(
-            LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+            PlanNodeKind::ImvDelta(LogicalImvDeltaNode {
                 is_root: true,
                 action_column: Some(ColumnId::new_for_test(7)),
                 branch_scope: None,
@@ -464,17 +650,14 @@ mod plan_tests {
             None,
         );
         match node.kind {
-            LogicalPlanNodeKind::ImvDelta(delta) => {
+            PlanNodeKind::ImvDelta(delta) => {
                 assert!(delta.is_root);
                 assert_eq!(delta.action_column, Some(ColumnId::new_for_test(7)));
             }
             other => panic!("expected ImvDelta, got {other:?}"),
         }
         assert_eq!(node.children.len(), 1);
-        assert!(matches!(
-            node.children[0].kind,
-            LogicalPlanNodeKind::Values(_)
-        ));
+        assert!(matches!(node.children[0].kind, PlanNodeKind::Values(_)));
     }
 
     #[test]
@@ -491,7 +674,7 @@ mod plan_tests {
     #[test]
     fn wrapper_required_output_columns_defaults_none() {
         let node = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
+            PlanNodeKind::Project(LogicalProjectNode {
                 items: vec![],
                 output_qualifier: None,
             }),
@@ -566,7 +749,7 @@ mod plan_tests {
         let old_input = empty_values_for_test();
         let delta_input = empty_values_for_test();
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::AggregateStateMerge(LogicalAggregateStateMergeNode {
+            PlanNodeKind::AggregateStateMerge(LogicalAggregateStateMergeNode {
                 group_key_names: vec!["region".to_string()],
                 aggregate_state_names: vec!["c".to_string(), "s".to_string()],
                 change_op_column: "__change_op".to_string(),
@@ -591,7 +774,7 @@ mod plan_tests {
             None,
         );
 
-        let LogicalPlanNodeKind::AggregateStateMerge(node) = plan.kind else {
+        let PlanNodeKind::AggregateStateMerge(node) = plan.kind else {
             panic!("expected aggregate state merge");
         };
         assert_eq!(plan.children.len(), 2);
@@ -599,5 +782,80 @@ mod plan_tests {
         assert_eq!(node.aggregate_state_names, vec!["c", "s"]);
         assert_eq!(node.change_op_column, "__change_op");
         assert_eq!(node.output_columns.len(), 2);
+    }
+
+    #[test]
+    fn unified_plan_node_kind_scan_carries_mv_rewrite_source() {
+        let table = TableDef {
+            name: "mv_orders".to_string(),
+            columns: vec![],
+            iceberg_row_lineage_metadata_columns: vec![],
+            source: crate::sql::catalog::ScanSource::StarRocks {
+                db_id: 1,
+                table_id: 2,
+            },
+        };
+        let node = PlanNodeKind::Scan(PlanScanNode {
+            database: "default".to_string(),
+            table,
+            alias: None,
+            columns: vec![],
+            predicates: vec![],
+            required_columns: None,
+            dict_columns: vec![],
+            variant_columns: vec![],
+            mv_rewritten_from: Some("mv_orders_rollup".to_string()),
+        });
+
+        let PlanNodeKind::Scan(scan) = node else {
+            panic!("expected Scan");
+        };
+        assert_eq!(scan.mv_rewritten_from.as_deref(), Some("mv_orders_rollup"));
+    }
+
+    #[test]
+    fn unified_plan_node_kind_keeps_limit_and_topn_split_explicit() {
+        let limit = PlanNodeKind::Limit(PlanLimitNode {
+            limit: Some(10),
+            offset: Some(3),
+        });
+        let topn = PlanNodeKind::TopN(DistributedTopNNode {
+            items: vec![],
+            limit: Some(10),
+            offset: Some(3),
+            phase: crate::sql::optimizer::operator::TopNPhase::Final,
+            is_split: false,
+        });
+
+        match limit {
+            PlanNodeKind::Limit(node) => {
+                assert_eq!(node.limit, Some(10));
+                assert_eq!(node.offset, Some(3));
+            }
+            other => panic!("expected Limit, got {other:?}"),
+        }
+        match topn {
+            PlanNodeKind::TopN(node) => {
+                assert_eq!(node.limit, Some(10));
+                assert_eq!(node.offset, Some(3));
+                assert!(!node.is_split);
+            }
+            other => panic!("expected TopN, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unified_plan_node_kind_set_op_uses_plan_scoped_kind() {
+        let set_op = PlanNodeKind::SetOp(DistributedSetOpNode {
+            kind: PlanSetOpKind::UnionAll,
+            output_columns: vec![],
+            child_output_columns: vec![vec![], vec![]],
+        });
+
+        let PlanNodeKind::SetOp(node) = set_op else {
+            panic!("expected SetOp");
+        };
+        assert_eq!(node.kind, PlanSetOpKind::UnionAll);
+        assert_eq!(node.child_output_columns.len(), 2);
     }
 }

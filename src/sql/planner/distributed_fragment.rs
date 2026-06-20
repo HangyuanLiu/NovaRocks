@@ -1,8 +1,8 @@
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{OutputColumn, TypedExpr};
+use crate::sql::codegen::FragmentId;
 
-use super::FragmentId;
-use super::node::DistributedPlanNode;
+use super::distributed_node::DistributedPlanNode;
 
 #[derive(Clone, Debug)]
 pub(crate) enum PartitionKind {

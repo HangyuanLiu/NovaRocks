@@ -16,7 +16,7 @@ use crate::sql::optimizer::rewrite::imv::{
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
-use crate::sql::planner::plan::{LogicalImvDeltaNode, LogicalPlanNode, LogicalPlanNodeKind};
+use crate::sql::planner::plan::{LogicalImvDeltaNode, LogicalPlanNode, PlanNodeKind};
 
 /// Snapshot window descriptor used by `LogicalImvVersionNode`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,7 +109,7 @@ impl LogicalRewriteRule for WrapRootInImvDeltaRule {
         self.wrapped.store(true, Ordering::SeqCst);
         bridge_apply_result(expr, ctx, |plan, _ctx| {
             Ok(PlanRewriteResult::Changed(LogicalPlanNode::new(
-                LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+                PlanNodeKind::ImvDelta(LogicalImvDeltaNode {
                     is_root: true,
                     action_column: None,
                     branch_scope: None,
@@ -164,7 +164,7 @@ impl LogicalRewriteRule for UnresolvedMarkerCheckRule {
 /// any depth. The Validation stage uses this to detect unresolved markers.
 pub(crate) fn plan_contains_imv_marker(plan: &LogicalPlanNode) -> bool {
     match &plan.kind {
-        LogicalPlanNodeKind::ImvDelta(_) | LogicalPlanNodeKind::ImvVersion(_) => true,
+        PlanNodeKind::ImvDelta(_) | PlanNodeKind::ImvVersion(_) => true,
         _ => plan.children.iter().any(plan_contains_imv_marker),
     }
 }
@@ -181,13 +181,13 @@ pub(crate) fn collect_marker_kinds(plan: &LogicalPlanNode) -> Vec<&'static str> 
 
 fn collect_into(plan: &LogicalPlanNode, found: &mut Vec<&'static str>) {
     match &plan.kind {
-        LogicalPlanNodeKind::ImvDelta(_) => {
+        PlanNodeKind::ImvDelta(_) => {
             found.push("ImvDelta");
             for child in &plan.children {
                 collect_into(child, found);
             }
         }
-        LogicalPlanNodeKind::ImvVersion(_) => {
+        PlanNodeKind::ImvVersion(_) => {
             found.push("ImvVersion");
             for child in &plan.children {
                 collect_into(child, found);
@@ -207,7 +207,7 @@ mod tests {
     use crate::sql::optimizer::convert::{logical_plan_to_opt_expr, opt_expr_to_logical_plan};
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::*;
-    use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind, LogicalValuesNode};
+    use crate::sql::planner::plan::{LogicalPlanNode, LogicalValuesNode, PlanNodeKind};
 
     #[test]
     fn wrap_rule_wraps_plain_root_once() {
@@ -230,15 +230,12 @@ mod tests {
         let opt_out = pipeline.rewrite(opt_in, &mut ctx).unwrap();
         let out = opt_expr_to_logical_plan(opt_out, &arena.borrow());
 
-        let LogicalPlanNodeKind::ImvDelta(delta) = &out.kind else {
+        let PlanNodeKind::ImvDelta(delta) = &out.kind else {
             panic!("expected ImvDelta at root");
         };
         assert!(delta.is_root);
         assert!(delta.action_column.is_none());
-        assert!(matches!(
-            &out.children[0].kind,
-            LogicalPlanNodeKind::Values(_)
-        ));
+        assert!(matches!(&out.children[0].kind, PlanNodeKind::Values(_)));
     }
 
     #[test]
@@ -248,7 +245,7 @@ mod tests {
         use crate::sql::optimizer::rewrite::pipeline::{RewritePipeline, RewriteStage};
 
         let already = LogicalPlanNode::new(
-            LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+            PlanNodeKind::ImvDelta(LogicalImvDeltaNode {
                 is_root: true,
                 action_column: None,
                 branch_scope: None,
@@ -275,7 +272,7 @@ mod tests {
 
     fn empty_values_plan() -> LogicalPlanNode {
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Values(LogicalValuesNode {
+            PlanNodeKind::Values(LogicalValuesNode {
                 rows: vec![],
                 columns: vec![],
             }),
@@ -314,7 +311,7 @@ mod tests {
         assert!(
             matches!(
                 &out1.kind,
-                LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode { is_root: true, .. })
+                PlanNodeKind::ImvDelta(LogicalImvDeltaNode { is_root: true, .. })
             ),
             "first fresh pipeline must wrap the root"
         );
@@ -332,7 +329,7 @@ mod tests {
         assert!(
             matches!(
                 &out2.kind,
-                LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode { is_root: true, .. })
+                PlanNodeKind::ImvDelta(LogicalImvDeltaNode { is_root: true, .. })
             ),
             "second fresh pipeline must also wrap the root independently"
         );
@@ -366,7 +363,7 @@ mod tests {
     #[test]
     fn plan_contains_imv_marker_true_for_root_delta() {
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+            PlanNodeKind::ImvDelta(LogicalImvDeltaNode {
                 is_root: true,
                 action_column: None,
                 branch_scope: None,
@@ -383,14 +380,14 @@ mod tests {
         // Build Limit(Limit(ImvVersion(Values))). The marker is
         // deeply nested; the helper must recurse.
         let nested = LogicalPlanNode::new(
-            LogicalPlanNodeKind::ImvVersion(LogicalImvVersionNode {
+            PlanNodeKind::ImvVersion(LogicalImvVersionNode {
                 version_ref: ImvVersionRef::default(),
             }),
             vec![empty_values_plan()],
             None,
         );
         let inner = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Limit(LogicalLimitNode {
+            PlanNodeKind::Limit(LogicalLimitNode {
                 limit: None,
                 offset: None,
             }),
@@ -398,7 +395,7 @@ mod tests {
             None,
         );
         let outer = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Limit(LogicalLimitNode {
+            PlanNodeKind::Limit(LogicalLimitNode {
                 limit: None,
                 offset: None,
             }),
@@ -411,13 +408,13 @@ mod tests {
     #[test]
     fn collect_marker_kinds_reports_each_distinct_kind() {
         let delta = LogicalPlanNode::new(
-            LogicalPlanNodeKind::ImvDelta(LogicalImvDeltaNode {
+            PlanNodeKind::ImvDelta(LogicalImvDeltaNode {
                 is_root: true,
                 action_column: None,
                 branch_scope: None,
             }),
             vec![LogicalPlanNode::new(
-                LogicalPlanNodeKind::ImvVersion(LogicalImvVersionNode {
+                PlanNodeKind::ImvVersion(LogicalImvVersionNode {
                     version_ref: ImvVersionRef::default(),
                 }),
                 vec![empty_values_plan()],
@@ -494,7 +491,7 @@ mod tests {
             .rewrite(opt_in, &mut ctx)
             .expect("plain plan must pass validation");
         let out = opt_expr_to_logical_plan(opt_out, &arena.borrow());
-        assert!(matches!(&out.kind, LogicalPlanNodeKind::Values(_)));
+        assert!(matches!(&out.kind, PlanNodeKind::Values(_)));
     }
 
     #[test]

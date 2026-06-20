@@ -123,7 +123,7 @@ fn optimize_with_root_property(
     rewrite_ctx.set_column_ref_factory(Rc::clone(&factory));
     let arena = Rc::new(RefCell::new(scalar::ScalarArena::new()));
     rewrite_ctx.set_scalar_arena(Rc::clone(&arena));
-    let plan_expr = convert::logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut());
+    let plan_expr = convert::try_logical_plan_to_opt_expr(&plan, &mut arena.borrow_mut())?;
     let rewritten_expr = rewrite::registry::query_rewrite_pipeline(table_stats)
         .rewrite(plan_expr, &mut rewrite_ctx)?;
 
@@ -163,7 +163,7 @@ fn optimize_with_root_property(
         .into_inner();
     let mut memo = Memo::new();
     memo.factory = factory;
-    let root_group = convert::logical_plan_to_memo(&rewritten, &mut memo);
+    let root_group = convert::try_logical_plan_to_memo(&rewritten, &mut memo)?;
 
     // 6. Derive initial statistics.
     stats::derive_group_statistics(&mut memo, table_stats);
@@ -437,10 +437,10 @@ mod is_known_rule_name_tests {
         use std::collections::HashMap;
 
         use crate::sql::column_id::ColumnRefFactory;
-        use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind, LogicalValuesNode};
+        use crate::sql::planner::plan::{LogicalPlanNode, LogicalValuesNode, PlanNodeKind};
 
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Values(LogicalValuesNode {
+            PlanNodeKind::Values(LogicalValuesNode {
                 rows: vec![],
                 columns: vec![],
             }),
@@ -641,7 +641,7 @@ mod is_known_rule_name_tests {
     use crate::sql::optimizer::rewrite::registry::query_rewrite_pipeline;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::plan::{
-        AggregateCall, LogicalAggregateNode, LogicalPlanNode, LogicalPlanNodeKind, LogicalScanNode,
+        AggregateCall, LogicalAggregateNode, LogicalPlanNode, LogicalScanNode, PlanNodeKind,
     };
 
     struct AlwaysSomeProvider;
@@ -720,7 +720,7 @@ mod is_known_rule_name_tests {
             is_internal: false,
         };
         let scan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Scan(LogicalScanNode {
+            PlanNodeKind::Scan(LogicalScanNode {
                 database: "db".to_string(),
                 table: table,
                 alias: None,
@@ -729,6 +729,7 @@ mod is_known_rule_name_tests {
                 required_columns: None,
                 dict_columns: vec![],
                 variant_columns: vec![],
+                mv_rewritten_from: None,
             }),
             vec![],
             None,
@@ -743,7 +744,7 @@ mod is_known_rule_name_tests {
             nullable: false,
         };
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+            PlanNodeKind::Aggregate(LogicalAggregateNode {
                 group_by: vec![s_ref],
                 aggregates: vec![AggregateCall {
                     name: "count".to_string(),
@@ -790,7 +791,7 @@ mod is_known_rule_name_tests {
 
     fn contains_decode(plan: &LogicalPlanNode) -> bool {
         match &plan.kind {
-            LogicalPlanNodeKind::Decode(_) => true,
+            PlanNodeKind::Decode(_) => true,
             _ => plan.children.iter().any(contains_decode),
         }
     }
@@ -804,10 +805,10 @@ mod is_known_rule_name_tests {
             !contains_decode(&rewritten),
             "no provider → no Decode boundary"
         );
-        let LogicalPlanNodeKind::Aggregate(_) = &rewritten.kind else {
+        let PlanNodeKind::Aggregate(_) = &rewritten.kind else {
             panic!("expected aggregate root")
         };
-        let LogicalPlanNodeKind::Scan(scan) = &rewritten.unary_input().kind else {
+        let PlanNodeKind::Scan(scan) = &rewritten.unary_input().kind else {
             panic!("expected scan child")
         };
         assert!(scan.dict_columns.is_empty());
@@ -819,7 +820,7 @@ mod is_known_rule_name_tests {
         let rewritten = with_dictionary_provider(provider, || rewrite_with(None));
         // Plan must contain a Decode boundary above the aggregate.
         assert!(
-            matches!(&rewritten.kind, LogicalPlanNodeKind::Decode(_)),
+            matches!(&rewritten.kind, PlanNodeKind::Decode(_)),
             "TLS provider must drive the rewrite, got {rewritten:?}"
         );
     }
@@ -837,10 +838,10 @@ mod is_known_rule_name_tests {
             !contains_decode(&rewritten),
             "parameter must override TLS — no Decode expected"
         );
-        let LogicalPlanNodeKind::Aggregate(_) = &rewritten.kind else {
+        let PlanNodeKind::Aggregate(_) = &rewritten.kind else {
             panic!("expected aggregate root, got {rewritten:?}")
         };
-        let LogicalPlanNodeKind::Scan(scan) = &rewritten.unary_input().kind else {
+        let PlanNodeKind::Scan(scan) = &rewritten.unary_input().kind else {
             panic!("expected scan child, got {:?}", rewritten.unary_input())
         };
         assert!(scan.dict_columns.is_empty());
@@ -852,15 +853,15 @@ mod is_known_rule_name_tests {
 
         use crate::sql::column_id::ColumnRefFactory;
         use crate::sql::planner::plan::{
-            LogicalAssertOneRowNode, LogicalPlanNode, LogicalPlanNodeKind, LogicalValuesNode,
+            LogicalAssertOneRowNode, LogicalPlanNode, LogicalValuesNode, PlanNodeKind,
         };
 
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::AssertOneRow(LogicalAssertOneRowNode {
+            PlanNodeKind::AssertOneRow(LogicalAssertOneRowNode {
                 subquery_text: "select 1".to_string(),
             }),
             vec![LogicalPlanNode::new(
-                LogicalPlanNodeKind::Values(LogicalValuesNode {
+                PlanNodeKind::Values(LogicalValuesNode {
                     rows: vec![],
                     columns: vec![],
                 }),
@@ -885,12 +886,12 @@ mod is_known_rule_name_tests {
         use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
         use crate::sql::column_id::{ColumnId, ColumnRefFactory};
         use crate::sql::planner::plan::{
-            ApplyKind, LogicalApplyNode, LogicalPlanNode, LogicalPlanNodeKind, LogicalValuesNode,
+            ApplyKind, LogicalApplyNode, LogicalPlanNode, LogicalValuesNode, PlanNodeKind,
         };
 
         let values = || {
             LogicalPlanNode::new(
-                LogicalPlanNodeKind::Values(LogicalValuesNode {
+                PlanNodeKind::Values(LogicalValuesNode {
                     rows: vec![],
                     columns: vec![],
                 }),
@@ -899,7 +900,7 @@ mod is_known_rule_name_tests {
             )
         };
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Apply(LogicalApplyNode {
+            PlanNodeKind::Apply(LogicalApplyNode {
                 kind: ApplyKind::Scalar,
                 subquery_expr: TypedExpr {
                     kind: ExprKind::ColumnRef {
@@ -965,7 +966,7 @@ mod is_known_rule_name_tests {
         use crate::sql::catalog::{CatalogProvider, ColumnDef, ScanSource, TableDef};
         use crate::sql::column_id::ColumnRefFactory;
         use crate::sql::optimizer::property::DistributionSpec;
-        use crate::sql::planner::plan::{LogicalPlanNode, LogicalPlanNodeKind};
+        use crate::sql::planner::plan::{LogicalPlanNode, PlanNodeKind};
 
         struct MinimalCatalog;
         impl CatalogProvider for MinimalCatalog {
@@ -1004,7 +1005,7 @@ mod is_known_rule_name_tests {
         let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)
             .expect("plan query");
         let hash_col = match &logical.kind {
-            LogicalPlanNodeKind::Project(project) => match &project.items[0].expr.kind {
+            PlanNodeKind::Project(project) => match &project.items[0].expr.kind {
                 ExprKind::ColumnRef { column_id, .. } => *column_id,
                 other => panic!("expected column projection, got {other:?}"),
             },
@@ -1044,8 +1045,123 @@ mod is_known_rule_name_tests {
         }
     }
 
+    #[test]
+    fn optimize_preserves_ranking_window_partition_topn_sort() {
+        use crate::exec::node::sort::SortTopNType;
+        use crate::sql::catalog::{CatalogProvider, ColumnDef, ScanSource, TableDef};
+        use crate::sql::optimizer::operator::Operator;
+        use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
+
+        struct RankingCatalog;
+        impl CatalogProvider for RankingCatalog {
+            fn get_table(&self, _db: &str, table: &str) -> Result<TableDef, String> {
+                match table {
+                    "rw_sales" => Ok(TableDef {
+                        name: table.to_string(),
+                        columns: vec![
+                            ColumnDef {
+                                name: "region".to_string(),
+                                data_type: arrow::datatypes::DataType::Utf8,
+                                nullable: true,
+                                write_default: None,
+                                logical_type: None,
+                            },
+                            ColumnDef {
+                                name: "amount".to_string(),
+                                data_type: arrow::datatypes::DataType::Int32,
+                                nullable: true,
+                                write_default: None,
+                                logical_type: None,
+                            },
+                        ],
+                        iceberg_row_lineage_metadata_columns: vec![],
+                        source: ScanSource::StarRocks {
+                            db_id: 0,
+                            table_id: 0,
+                        },
+                    }),
+                    other => Err(format!("table not found: {other}")),
+                }
+            }
+        }
+
+        fn has_rank_partition_topn_sort(plan: &PhysicalPlanNode) -> bool {
+            if let Operator::PhysicalSort(sort) = &plan.op
+                && sort.partition_limit == Some(2)
+                && sort.topn_type == Some(SortTopNType::Rank)
+            {
+                return true;
+            }
+            plan.children.iter().any(has_rank_partition_topn_sort)
+        }
+
+        fn logical_has_rank_partition_topn_sort(
+            plan: &crate::sql::planner::plan::LogicalPlanNode,
+        ) -> bool {
+            if let crate::sql::planner::plan::PlanNodeKind::Sort(sort) = &plan.kind
+                && sort.partition_limit == Some(2)
+                && sort.topn_type == Some(SortTopNType::Rank)
+            {
+                return true;
+            }
+            plan.children
+                .iter()
+                .any(logical_has_rank_partition_topn_sort)
+        }
+
+        let sql = "
+            SELECT *
+            FROM (
+                SELECT region, amount,
+                       rank() OVER (PARTITION BY region ORDER BY amount DESC) AS rk
+                FROM rw_sales
+            ) t
+            WHERE rk <= 2
+            ORDER BY region, amount DESC
+        ";
+        let dialect = crate::sql::parser::dialect::StarRocksDialect;
+        let mut ast = sqlparser::parser::Parser::parse_sql(&dialect, sql).expect("parse query");
+        let stmt = ast.pop().expect("expected a statement");
+        let query = match stmt {
+            sqlparser::ast::Statement::Query(q) => q,
+            _ => panic!("expected a query"),
+        };
+        let (resolved, cte_registry, mut factory) =
+            crate::sql::analyzer::analyze(&query, &RankingCatalog, "default").expect("analyze");
+        let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)
+            .expect("plan query");
+        let mut scalars = crate::sql::optimizer::scalar::ScalarArena::new();
+        let opt_plan =
+            crate::sql::optimizer::convert::try_logical_plan_to_opt_expr(&logical, &mut scalars)
+                .expect("logical to opt expr");
+        let mut rewrite_ctx =
+            crate::sql::optimizer::rewrite::context::RewriteContext::for_query(Vec::new());
+        let arena = std::rc::Rc::new(std::cell::RefCell::new(scalars));
+        rewrite_ctx.set_scalar_arena(std::rc::Rc::clone(&arena));
+        let rewritten_expr =
+            crate::sql::optimizer::rewrite::registry::query_rewrite_pipeline(&HashMap::new())
+                .rewrite(opt_plan, &mut rewrite_ctx)
+                .expect("rewrite pipeline");
+        let rewritten_logical = crate::sql::optimizer::convert::opt_expr_to_logical_plan(
+            rewritten_expr,
+            &arena.borrow(),
+        );
+        assert!(
+            logical_has_rank_partition_topn_sort(&rewritten_logical),
+            "expected query rewrite pipeline to set ranking partition-topn, trace: {:#?}, got: {rewritten_logical:#?}",
+            rewrite_ctx.trace().events()
+        );
+        let physical = optimize(logical, &HashMap::new(), factory, None, Vec::new())
+            .expect("optimize ranking window");
+
+        assert!(
+            has_rank_partition_topn_sort(&physical),
+            "expected RankingWindowPredicatePushdown to survive into the physical plan, got: {physical:#?}"
+        );
+    }
+
     /// End-to-end proof: the full analyze → plan_query → optimize chain in
-    /// the Apply framework turns a scalar subquery into a `LogicalPlanNodeKind::Apply`, which
+    /// the Apply framework turns a scalar subquery into a `PlanNodeKind::Apply`, which
     /// M1b's `SubqueryRewrite` decorrelation rules (PushDownApplyAggFilter +
     /// ScalarApplyToJoin) rewrite into a LEFT OUTER JOIN over a vector
     /// aggregate. The optimized physical plan contains a HashJoin (or NestLoop)
@@ -1109,7 +1225,7 @@ mod is_known_rule_name_tests {
             crate::sql::analyzer::analyze(&query, &MinimalCatalog, "default")
                 .expect("analyze with apply framework must succeed");
 
-        // plan_query: turns the ApplyScalarSpec into LogicalPlanNodeKind::Apply.
+        // plan_query: turns the ApplyScalarSpec into PlanNodeKind::Apply.
         let plan = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)
             .expect("plan_query with apply framework must succeed");
 

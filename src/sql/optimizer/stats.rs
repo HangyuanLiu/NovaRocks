@@ -2014,7 +2014,7 @@ mod tests {
             })
             .collect();
         LogicalPlanNode::new(
-            LogicalPlanNodeKind::Scan(LogicalScanNode {
+            PlanNodeKind::Scan(LogicalScanNode {
                 database: "db".to_string(),
                 table: TableDef {
                     name: name.to_string(),
@@ -2047,6 +2047,7 @@ mod tests {
                 required_columns: None,
                 dict_columns: vec![],
                 variant_columns: vec![],
+                mv_rewritten_from: None,
             }),
             vec![],
             None,
@@ -2059,7 +2060,7 @@ mod tests {
         predicates: Vec<TypedExpr>,
     ) -> LogicalPlanNode {
         let mut plan = scan_plan(name, cols);
-        let LogicalPlanNodeKind::Scan(node) = &mut plan.kind else {
+        let PlanNodeKind::Scan(node) = &mut plan.kind else {
             unreachable!("scan_plan always returns a Scan");
         };
         node.predicates = predicates;
@@ -2172,7 +2173,7 @@ mod tests {
         table_stats.insert(name, ts);
         let scan_plan =
             scan_plan_with_predicates("orders", &["id"], vec![eq_expr(col_ref("id"), int_lit(42))]);
-        let LogicalPlanNodeKind::Scan(scan) = scan_plan.kind else {
+        let PlanNodeKind::Scan(scan) = scan_plan.kind else {
             unreachable!("scan_plan_with_predicates always returns a Scan");
         };
         let mut memo = Memo::new();
@@ -3135,7 +3136,7 @@ mod tests {
         let scan = scan_plan("t", &["a"]);
         let pred = eq_expr(col_ref("a"), int_lit(42));
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Filter(LogicalFilterNode { predicate: pred }),
+            PlanNodeKind::Filter(LogicalFilterNode { predicate: pred }),
             vec![scan],
             None,
         );
@@ -4015,7 +4016,7 @@ mod tests {
         let cond = eq_expr(col_ref("l_orderkey"), col_ref("o_orderkey"));
 
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Join(LogicalJoinNode {
+            PlanNodeKind::Join(LogicalJoinNode {
                 join_type: JoinKind::Inner,
                 condition: Some(cond),
             }),
@@ -4042,7 +4043,7 @@ mod tests {
 
         let scan = scan_plan("t", &["status"]);
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Aggregate(LogicalAggregateNode {
+            PlanNodeKind::Aggregate(LogicalAggregateNode {
                 group_by: vec![col_ref("status")],
                 aggregates: vec![],
                 output_columns: vec![OutputColumn {
@@ -4076,7 +4077,7 @@ mod tests {
 
         let scan = scan_plan("t", &["a"]);
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Limit(LogicalLimitNode {
+            PlanNodeKind::Limit(LogicalLimitNode {
                 limit: Some(10),
                 offset: None,
             }),
@@ -4103,7 +4104,7 @@ mod tests {
 
         let scan = scan_plan("orders", &["id"]);
         let produce = LogicalPlanNode::new(
-            LogicalPlanNodeKind::CTEProduce(LogicalCTEProduceNode {
+            PlanNodeKind::CTEProduce(LogicalCTEProduceNode {
                 cte_id: 1,
                 output_columns: vec![OutputColumn {
                     column_id: ColumnId::UNSET,
@@ -4117,7 +4118,7 @@ mod tests {
             None,
         );
         let consume = LogicalPlanNode::new(
-            LogicalPlanNodeKind::CTEConsume(LogicalCTEConsumeNode {
+            PlanNodeKind::CTEConsume(LogicalCTEConsumeNode {
                 cte_id: 1,
                 alias: "cte_orders".to_string(),
                 output_columns: vec![OutputColumn {
@@ -4132,7 +4133,7 @@ mod tests {
             None,
         );
         let anchor = LogicalPlanNode::new(
-            LogicalPlanNodeKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: 1 }),
+            PlanNodeKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: 1 }),
             vec![produce, consume],
             None,
         );
@@ -4349,7 +4350,7 @@ mod tests {
 
         let scan = scan_plan("orders", &["id"]);
         let produce = LogicalPlanNode::new(
-            LogicalPlanNodeKind::CTEProduce(LogicalCTEProduceNode {
+            PlanNodeKind::CTEProduce(LogicalCTEProduceNode {
                 cte_id: 1,
                 output_columns: vec![OutputColumn {
                     column_id: test_col_id("id"),
@@ -4363,7 +4364,7 @@ mod tests {
             None,
         );
         let consume = LogicalPlanNode::new(
-            LogicalPlanNodeKind::CTEConsume(LogicalCTEConsumeNode {
+            PlanNodeKind::CTEConsume(LogicalCTEConsumeNode {
                 cte_id: 1,
                 alias: "cte_orders".to_string(),
                 output_columns: vec![OutputColumn {
@@ -4378,7 +4379,7 @@ mod tests {
             None,
         );
         let anchor = LogicalPlanNode::new(
-            LogicalPlanNodeKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: 1 }),
+            PlanNodeKind::CTEAnchor(LogicalCTEAnchorNode { cte_id: 1 }),
             vec![produce, consume],
             None,
         );
@@ -4437,7 +4438,7 @@ mod tests {
     #[test]
     fn values_group_stats() {
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Values(LogicalValuesNode {
+            PlanNodeKind::Values(LogicalValuesNode {
                 rows: vec![vec![], vec![], vec![]],
                 columns: vec![OutputColumn {
                     column_id: ColumnId::UNSET,
@@ -4724,7 +4725,7 @@ mod tests {
     fn project_group_stats_preserve_project_item_output_column_id() {
         let out_id = ColumnId::new_for_test(42);
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Project(LogicalProjectNode {
+            PlanNodeKind::Project(LogicalProjectNode {
                 items: vec![ProjectItem {
                     expr: TypedExpr {
                         kind: ExprKind::Literal(LiteralValue::Int(1)),
@@ -4737,7 +4738,7 @@ mod tests {
                 output_qualifier: None,
             }),
             vec![LogicalPlanNode::new(
-                LogicalPlanNodeKind::Values(LogicalValuesNode {
+                PlanNodeKind::Values(LogicalValuesNode {
                     rows: vec![vec![]],
                     columns: vec![],
                 }),
@@ -4768,7 +4769,7 @@ mod tests {
 
         let scan = scan_plan("t", &["a"]);
         let plan = LogicalPlanNode::new(
-            LogicalPlanNodeKind::Decode(LogicalDecodeNode {
+            PlanNodeKind::Decode(LogicalDecodeNode {
                 mappings: vec![DecodeMapping {
                     source_column_id: ColumnId::new_for_test(1),
                     output_column_id: ColumnId::new_for_test(2),
