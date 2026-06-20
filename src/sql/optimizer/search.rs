@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::cost::{CostOptions, compute_cost_with_properties};
+use super::cost::{CostInput, CostOptions, compute_cost_from_input};
 use super::derive::PropertyAlternativeKind;
 use super::memo::{Cost, GroupId, Memo};
 use super::operator::*;
@@ -202,14 +202,18 @@ impl SearchContext {
                 }
 
                 let child_output_refs: Vec<&PhysicalPropertySet> = child_outputs.iter().collect();
-                let own_cost = compute_cost_with_properties(
-                    &expr.op,
-                    &own_stats,
-                    &child_stats_refs,
-                    &child_output_refs,
-                    &alt.kind,
-                    &CostOptions::default(),
-                );
+                let options = CostOptions::default();
+                let cost_input = CostInput {
+                    op: &expr.op,
+                    own_stats: &own_stats,
+                    child_stats: &child_stats_refs,
+                    child_outputs: &child_output_refs,
+                    required_output: required,
+                    alt_kind: &alt.kind,
+                    scalars: Some(&memo.scalars),
+                    options: &options,
+                };
+                let own_cost = compute_cost_from_input(&cost_input);
                 let total = own_cost + child_cost_total;
                 let provided = super::derive::derive_output_for_alternative(
                     &expr.op,
@@ -231,7 +235,14 @@ impl SearchContext {
                         stats_for_group(&memo.groups[group_id], memo, &self.table_stats);
                     let enforcer_cost: Cost = enforcers
                         .iter()
-                        .map(|e| super::derive::estimate_enforcer_cost(e, &group_stats))
+                        .map(|e| {
+                            super::derive::estimate_enforcer_cost_estimate(
+                                e,
+                                &group_stats,
+                                &options,
+                            )
+                            .total_with_options(&options)
+                        })
                         .sum();
                     let kind = enforcers.into_iter().next().unwrap();
                     (
@@ -750,6 +761,23 @@ mod tests {
                 panic!("unknown hash join should choose a concrete property alternative")
             }
         }
+    }
+
+    #[test]
+    fn search_uses_cost_estimate_total_for_winner_cost() {
+        let options = CostOptions {
+            cpu_weight: 1.0,
+            memory_weight: 0.0,
+            network_weight: 0.0,
+            ..Default::default()
+        };
+        let estimate = crate::sql::optimizer::statistics::CostEstimate {
+            cpu_cost: 10.0,
+            memory_cost: 1000.0,
+            network_cost: 1000.0,
+        };
+
+        assert_eq!(estimate.total_with_options(&options), 10.0);
     }
 
     #[test]

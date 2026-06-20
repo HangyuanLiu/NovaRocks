@@ -256,10 +256,10 @@ impl Default for CostOptions {
 }
 
 fn effective_cost_weight(weight: f64) -> f64 {
-    if weight.is_finite() && weight > 0.0 {
-        weight
+    if weight.is_finite() {
+        weight.max(0.0)
     } else {
-        f64::EPSILON
+        0.0
     }
 }
 
@@ -1729,8 +1729,7 @@ mod tests {
 
         let total = estimate.total_with_options(&options);
         assert!(total.is_finite());
-        assert!(total > 0.0);
-        assert_eq!(total, 6.0 * f64::EPSILON);
+        assert_eq!(total, 0.0);
     }
 
     #[test]
