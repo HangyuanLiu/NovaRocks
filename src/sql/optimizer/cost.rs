@@ -249,12 +249,20 @@ impl Default for CostOptions {
     }
 }
 
+fn effective_cost_weight(weight: f64) -> f64 {
+    if weight.is_finite() && weight > 0.0 {
+        weight
+    } else {
+        f64::EPSILON
+    }
+}
+
 impl CostEstimate {
     pub(crate) fn total_with_options(&self, options: &CostOptions) -> Cost {
         self.weighted_total(
-            options.cpu_weight,
-            options.memory_weight,
-            options.network_weight,
+            effective_cost_weight(options.cpu_weight),
+            effective_cost_weight(options.memory_weight),
+            effective_cost_weight(options.network_weight),
         )
     }
 }
@@ -267,8 +275,15 @@ pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
             network_cost: 0.0,
         },
         _ => {
-            let legacy_cost = compute_cost(input.op, input.own_stats, input.child_stats);
-            let cpu_weight = input.options.cpu_weight.max(f64::EPSILON);
+            let legacy_cost = compute_cost_with_properties(
+                input.op,
+                input.own_stats,
+                input.child_stats,
+                input.child_outputs,
+                input.alt_kind,
+                input.options,
+            );
+            let cpu_weight = effective_cost_weight(input.options.cpu_weight);
             CostEstimate {
                 // Generic fallback stores the legacy scalar total as CPU-equivalent
                 // cost until the operator gets a real dimensional kernel.
@@ -365,7 +380,7 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::*;
     use crate::sql::optimizer::property::{DistributionSpec, OrderingSpec};
-    use crate::sql::optimizer::scalar::{intern_typed, ScalarArena};
+    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
     use crate::sql::optimizer::statistics::{ColumnStatistic, CostEstimate};
     use crate::sql::planner::plan::*;
     use std::collections::HashMap;
@@ -465,6 +480,45 @@ mod tests {
     }
 
     #[test]
+    fn fallback_cost_from_input_uses_property_aware_join_alternative() {
+        let probe = stats(100_000.0, 100.0);
+        let build = stats(10_000.0, 100.0);
+        let own = stats(100_000.0, 200.0);
+        let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![],
+            other_condition: None,
+            distribution: JoinDistribution::Unknown,
+        });
+        let child_stats = [&probe, &build];
+        let child_outputs = [PhysicalPropertySet::any(), PhysicalPropertySet::broadcast()];
+        let child_output_refs = [&child_outputs[0], &child_outputs[1]];
+        let required = PhysicalPropertySet::any();
+        let options = CostOptions::default();
+        let input = CostInput {
+            op: &op,
+            own_stats: &own,
+            child_stats: &child_stats,
+            child_outputs: &child_output_refs,
+            required_output: &required,
+            alt_kind: &PropertyAlternativeKind::BroadcastJoin,
+            scalars: None,
+            options: &options,
+        };
+
+        let input_cost = compute_cost_from_input(&input);
+        let property_cost = compute_cost_with_properties(
+            &op,
+            &own,
+            &child_stats,
+            &child_output_refs,
+            &PropertyAlternativeKind::BroadcastJoin,
+            &options,
+        );
+        assert!((input_cost - property_cost).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn cost_options_weights_drive_total_cost() {
         let options = CostOptions {
             cpu_weight: 1.0,
@@ -479,6 +533,26 @@ mod tests {
         };
 
         assert_eq!(estimate.total_with_options(&options), 321.0);
+    }
+
+    #[test]
+    fn cost_options_clamp_invalid_weights() {
+        let options = CostOptions {
+            cpu_weight: 0.0,
+            memory_weight: -1.0,
+            network_weight: f64::NAN,
+            ..Default::default()
+        };
+        let estimate = CostEstimate {
+            cpu_cost: 1.0,
+            memory_cost: 2.0,
+            network_cost: 3.0,
+        };
+
+        let total = estimate.total_with_options(&options);
+        assert!(total.is_finite());
+        assert!(total > 0.0);
+        assert_eq!(total, 6.0 * f64::EPSILON);
     }
 
     #[test]
