@@ -8,7 +8,7 @@ use super::memo::Cost;
 use super::operator::{
     AggMode, JoinDistribution, Operator, PhysicalHashAggregateOp, PhysicalHashJoinOp,
 };
-use super::property::PhysicalPropertySet;
+use super::property::{DistributionSpec, PhysicalPropertySet};
 use super::scalar::{ScalarArena, ScalarId, ScalarNode};
 use crate::sql::optimizer::derive::PropertyAlternativeKind;
 use crate::sql::optimizer::statistics::{CostEstimate, Statistics};
@@ -445,6 +445,13 @@ fn scalar_list_complexity(arena: Option<&ScalarArena>, exprs: &[ScalarId]) -> f6
         .max(1.0)
 }
 
+fn child_output_is_hash_partitioned(output: Option<&&PhysicalPropertySet>) -> bool {
+    matches!(
+        output.map(|properties| &properties.distribution),
+        Some(DistributionSpec::HashPartitioned { .. })
+    )
+}
+
 fn estimate_hash_join_cost(input: &CostInput<'_>, join: &PhysicalHashJoinOp) -> CostEstimate {
     let probe_stats = input.child_stats.first().copied();
     let build_stats = input.child_stats.get(1).copied();
@@ -486,7 +493,13 @@ fn estimate_hash_join_cost(input: &CostInput<'_>, join: &PhysicalHashJoinOp) -> 
     let network_cost = if is_broadcast {
         finite_non_negative_cost(build_size * input.options.backend_factor)
     } else if is_shuffle {
-        finite_non_negative_cost(probe_size + build_size)
+        if child_output_is_hash_partitioned(input.child_outputs.first())
+            && child_output_is_hash_partitioned(input.child_outputs.get(1))
+        {
+            0.0
+        } else {
+            finite_non_negative_cost(probe_size + build_size)
+        }
     } else {
         0.0
     };
@@ -1439,6 +1452,44 @@ mod tests {
     }
 
     #[test]
+    fn shuffle_join_estimate_waives_network_for_already_hash_partitioned_children() {
+        let probe = stats(1_000_000.0, 64.0);
+        let build = stats(1_000_000.0, 64.0);
+        let own = stats(100_000.0, 128.0);
+        let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![],
+            other_condition: None,
+            distribution: JoinDistribution::Unknown,
+        });
+        let options = CostOptions::default();
+        let required = PhysicalPropertySet::any();
+        let child_outputs = [
+            PhysicalPropertySet {
+                distribution: DistributionSpec::shuffle_join([ColumnId(1)]),
+                ordering: OrderingSpec::Any,
+            },
+            PhysicalPropertySet {
+                distribution: DistributionSpec::shuffle_join([ColumnId(2)]),
+                ordering: OrderingSpec::Any,
+            },
+        ];
+        let input = CostInput {
+            op: &op,
+            own_stats: &own,
+            child_stats: &[&probe, &build],
+            child_outputs: &[&child_outputs[0], &child_outputs[1]],
+            required_output: &required,
+            alt_kind: &PropertyAlternativeKind::ShuffleJoin,
+            scalars: None,
+            options: &options,
+        };
+
+        let estimate = compute_cost_estimate(&input);
+        assert_eq!(estimate.network_cost, 0.0);
+    }
+
+    #[test]
     fn cost_options_weights_drive_total_cost() {
         let options = CostOptions {
             cpu_weight: 1.0,
@@ -1555,11 +1606,19 @@ mod tests {
             &PropertyAlternativeKind::ShuffleJoin,
             &CostOptions::default(),
         );
+        let unshuffled_outputs = [PhysicalPropertySet::any(), PhysicalPropertySet::any()];
+        let unshuffled_child_outputs = [&unshuffled_outputs[0], &unshuffled_outputs[1]];
+        let unshuffled_cost = compute_cost_with_properties(
+            &op,
+            &own,
+            &child_stats,
+            &unshuffled_child_outputs,
+            &PropertyAlternativeKind::ShuffleJoin,
+            &CostOptions::default(),
+        );
 
-        let probe_size = probe.compute_size();
-        let build_size = build.compute_size();
-        assert!(cost < (probe_size + build_size) * NETWORK_COST + probe_size);
-        assert!(cost >= probe_size);
+        assert!(cost > 0.0);
+        assert!(cost < unshuffled_cost);
     }
 
     #[test]
