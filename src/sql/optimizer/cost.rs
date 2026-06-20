@@ -7,7 +7,7 @@
 use super::memo::Cost;
 use super::operator::{AggMode, JoinDistribution, Operator};
 use super::property::PhysicalPropertySet;
-use super::scalar::ScalarArena;
+use super::scalar::{ScalarArena, ScalarId, ScalarNode};
 use crate::sql::optimizer::derive::PropertyAlternativeKind;
 use crate::sql::optimizer::statistics::{CostEstimate, Statistics};
 
@@ -267,10 +267,164 @@ impl CostEstimate {
     }
 }
 
+fn scalar_complexity(arena: Option<&ScalarArena>, expr: ScalarId) -> f64 {
+    let Some(arena) = arena else {
+        return 1.0;
+    };
+    match arena.node(expr) {
+        ScalarNode::ColumnRef(_) | ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {
+            0.1
+        }
+        ScalarNode::Nested(child) | ScalarNode::Cast { child, .. } => {
+            0.2 + scalar_complexity(Some(arena), *child)
+        }
+        ScalarNode::UnaryOp { child, .. }
+        | ScalarNode::IsNull { child, .. }
+        | ScalarNode::IsTruthValue { child, .. } => 0.5 + scalar_complexity(Some(arena), *child),
+        ScalarNode::BinaryOp { left, right, .. } => {
+            1.0 + scalar_complexity(Some(arena), *left) + scalar_complexity(Some(arena), *right)
+        }
+        ScalarNode::FunctionCall { args, .. } => {
+            3.0 + args
+                .iter()
+                .map(|arg| scalar_complexity(Some(arena), *arg))
+                .sum::<f64>()
+        }
+        ScalarNode::LambdaFunction { body, .. } | ScalarNode::Lambda { body, .. } => {
+            2.0 + scalar_complexity(Some(arena), *body)
+        }
+        ScalarNode::AggregateCall { args, order_by, .. } => {
+            2.0 + args
+                .iter()
+                .map(|arg| scalar_complexity(Some(arena), *arg))
+                .sum::<f64>()
+                + order_by.len() as f64
+        }
+        ScalarNode::InList { child, list, .. } => {
+            1.0 + scalar_complexity(Some(arena), *child) + list.len() as f64 * 0.2
+        }
+        ScalarNode::Between {
+            child, low, high, ..
+        } => {
+            1.0 + scalar_complexity(Some(arena), *child)
+                + scalar_complexity(Some(arena), *low)
+                + scalar_complexity(Some(arena), *high)
+        }
+        ScalarNode::Like { child, pattern, .. } => {
+            3.0 + scalar_complexity(Some(arena), *child) + scalar_complexity(Some(arena), *pattern)
+        }
+        ScalarNode::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            operand
+                .map(|expr| scalar_complexity(Some(arena), expr))
+                .unwrap_or(0.0)
+                + when_then
+                    .iter()
+                    .map(|(when, then)| {
+                        scalar_complexity(Some(arena), *when)
+                            + scalar_complexity(Some(arena), *then)
+                    })
+                    .sum::<f64>()
+                + else_expr
+                    .map(|expr| scalar_complexity(Some(arena), expr))
+                    .unwrap_or(0.0)
+                + 1.0
+        }
+        ScalarNode::WindowCall {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            4.0 + args
+                .iter()
+                .chain(partition_by.iter())
+                .map(|arg| scalar_complexity(Some(arena), *arg))
+                .sum::<f64>()
+                + order_by.len() as f64
+        }
+    }
+}
+
+fn scalar_list_complexity(arena: Option<&ScalarArena>, exprs: &[ScalarId]) -> f64 {
+    exprs
+        .iter()
+        .map(|expr| scalar_complexity(arena, *expr))
+        .sum::<f64>()
+        .max(1.0)
+}
+
 pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
     match input.op {
         Operator::PhysicalScan(_) => CostEstimate {
             cpu_cost: input.own_stats.compute_size(),
+            memory_cost: 0.0,
+            network_cost: 0.0,
+        },
+        Operator::PhysicalFilter(filter) => {
+            let input_rows = input
+                .child_stats
+                .first()
+                .map(|stats| stats.safe_output_row_count())
+                .unwrap_or_else(|| input.own_stats.safe_output_row_count());
+            let complexity = scalar_complexity(input.scalars, filter.predicate);
+            CostEstimate {
+                cpu_cost: input_rows * complexity * input.options.predicate_cost_factor,
+                memory_cost: input.own_stats.compute_size() * 0.05,
+                network_cost: 0.0,
+            }
+        }
+        Operator::PhysicalProject(project) => {
+            let input_rows = input
+                .child_stats
+                .first()
+                .map(|stats| stats.safe_output_row_count())
+                .unwrap_or_else(|| input.own_stats.safe_output_row_count());
+            let exprs: Vec<_> = project.items.iter().map(|item| item.expr).collect();
+            CostEstimate {
+                cpu_cost: input_rows
+                    * scalar_list_complexity(input.scalars, &exprs)
+                    * input.options.projection_cost_factor,
+                memory_cost: input.own_stats.compute_size() * 0.02,
+                network_cost: 0.0,
+            }
+        }
+        Operator::PhysicalSort(_) => {
+            let rows = input
+                .child_stats
+                .first()
+                .map(|stats| stats.safe_output_row_count())
+                .unwrap_or_else(|| input.own_stats.safe_output_row_count());
+            CostEstimate {
+                cpu_cost: rows * rows.log2().max(1.0) * input.options.sort_cost_factor,
+                memory_cost: input.own_stats.compute_size(),
+                network_cost: 0.0,
+            }
+        }
+        Operator::PhysicalTopN(topn) => {
+            let input_rows = input
+                .child_stats
+                .first()
+                .map(|stats| stats.safe_output_row_count())
+                .unwrap_or_else(|| input.own_stats.safe_output_row_count());
+            let k = match (topn.limit, topn.offset) {
+                (Some(limit), Some(offset)) => {
+                    ((limit as f64) + (offset as f64)).min(input_rows).max(1.0)
+                }
+                (Some(limit), None) => (limit as f64).min(input_rows).max(1.0),
+                _ => input_rows,
+            };
+            CostEstimate {
+                cpu_cost: input_rows * k.log2().max(1.0) * input.options.topn_cost_factor,
+                memory_cost: input.own_stats.compute_size(),
+                network_cost: 0.0,
+            }
+        }
+        Operator::PhysicalLimit(_) | Operator::PhysicalAssertOneRow(_) => CostEstimate {
+            cpu_cost: input.own_stats.safe_output_row_count() * 0.001,
             memory_cost: 0.0,
             network_cost: 0.0,
         },
@@ -450,6 +604,94 @@ mod tests {
         assert_eq!(estimate.cpu_cost, s.compute_size());
         assert_eq!(estimate.memory_cost, 0.0);
         assert_eq!(estimate.network_cost, 0.0);
+    }
+
+    #[test]
+    fn filter_cost_uses_input_rows_not_output_rows() {
+        let mut arena = ScalarArena::new();
+        let predicate = intern_typed(
+            &mut arena,
+            &crate::sql::analysis::TypedExpr {
+                kind: crate::sql::analysis::ExprKind::Literal(
+                    crate::sql::analysis::LiteralValue::Bool(true),
+                ),
+                data_type: arrow::datatypes::DataType::Boolean,
+                nullable: false,
+            },
+        );
+        let input_stats = stats(1_000_000.0, 16.0);
+        let output_stats = stats(10.0, 16.0);
+        let op = Operator::PhysicalFilter(FilterOp { predicate });
+        let child_stats = [&input_stats];
+        let child_outputs = [PhysicalPropertySet::any()];
+        let child_output_refs = [&child_outputs[0]];
+        let required = PhysicalPropertySet::any();
+        let options = CostOptions::default();
+        let input = CostInput {
+            op: &op,
+            own_stats: &output_stats,
+            child_stats: &child_stats,
+            child_outputs: &child_output_refs,
+            required_output: &required,
+            alt_kind: &PropertyAlternativeKind::Default,
+            scalars: Some(&arena),
+            options: &options,
+        };
+
+        let estimate = compute_cost_estimate(&input);
+        assert!(estimate.cpu_cost > output_stats.compute_size());
+    }
+
+    #[test]
+    fn topn_estimate_is_cheaper_than_full_sort_for_small_limit() {
+        let input_stats = stats(10_000_000.0, 50.0);
+        let output_stats = stats(100.0, 50.0);
+        let sort = Operator::PhysicalSort(SortOp {
+            items: vec![],
+            analytic_partition_exprs: Vec::new(),
+            partition_limit: None,
+            topn_type: None,
+        });
+        let topn = Operator::PhysicalTopN(TopNOp {
+            items: vec![],
+            limit: Some(100),
+            offset: None,
+            phase: TopNPhase::Final,
+            is_split: false,
+        });
+        let options = CostOptions::default();
+        let required = PhysicalPropertySet::any();
+        let child_outputs = [PhysicalPropertySet::any()];
+        let child_output_refs = [&child_outputs[0]];
+        let sort_child_stats = [&input_stats];
+        let topn_child_stats = [&input_stats];
+        let sort_input = CostInput {
+            op: &sort,
+            own_stats: &input_stats,
+            child_stats: &sort_child_stats,
+            child_outputs: &child_output_refs,
+            required_output: &required,
+            alt_kind: &PropertyAlternativeKind::Default,
+            scalars: None,
+            options: &options,
+        };
+        let topn_input = CostInput {
+            op: &topn,
+            own_stats: &output_stats,
+            child_stats: &topn_child_stats,
+            child_outputs: &child_output_refs,
+            required_output: &required,
+            alt_kind: &PropertyAlternativeKind::Default,
+            scalars: None,
+            options: &options,
+        };
+
+        let topn_estimate = compute_cost_estimate(&topn_input);
+        assert!(topn_estimate.memory_cost > 0.0);
+        assert!(
+            topn_estimate.total_with_options(&options)
+                < compute_cost_estimate(&sort_input).total_with_options(&options)
+        );
     }
 
     #[test]
