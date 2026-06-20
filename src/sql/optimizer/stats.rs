@@ -1070,13 +1070,25 @@ pub(crate) fn derive_group_statistics(
 ) {
     for group_idx in 0..memo.groups.len() {
         // Memoized derive: a group's logical_props are computed exactly once,
-        // when first needed (StarRocks isStatsDerived semantics). Safe because
-        // the memo is append-only — explore()/implement() only append new exprs
-        // and never rewrite an existing group's logical_exprs.first() in place,
-        // so re-deriving an already-computed group would reproduce the identical
-        // value. INVARIANT: any future rule that mutates an existing group's
-        // first logical expr in place MUST reset that group's logical_props to
-        // None, or this skip will serve stale statistics.
+        // when first needed (StarRocks isStatsDerived semantics). Under the
+        // per-group argmax collapse (`pick_group_representative`), a group's
+        // representative depends on ALL its members, so this skip is only sound
+        // while every member appended to an already-derived group has a key
+        // (source_confidence, promise) no greater than the current
+        // representative's. That holds today: the in-pipeline appends are
+        // join-reorder and join commutativity/associativity, which add
+        // logically-equivalent members with an EQUAL key (promise is
+        // in-group-constant; same source confidence), so re-deriving would
+        // reproduce the identical representative.
+        //
+        // INVARIANT for a future producer that appends a STRICTLY-HIGHER-key
+        // member to an existing derived group (e.g. measured stats, or an
+        // MV-rewrite member backed by Exact catalog stats): it MUST eagerly
+        // re-derive that group by calling `derive_group_statistics_for` at
+        // append time. It MUST NOT set `logical_props = None`: `implement()`
+        // reads child-group `logical_props` for join-input column ids, and a
+        // `None` there silently degrades HashJoin to NestLoop (M1). Eager
+        // re-derive keeps `logical_props` Some and updates the representative.
         if memo.groups[group_idx].logical_props.is_some() {
             continue;
         }
@@ -1091,9 +1103,13 @@ pub(crate) fn derive_group_statistics(
 /// newly-created join group immediately, before `implement()` runs — otherwise
 /// a bushy join's children have no column ids and `JoinToHashJoin` degrades the
 /// join to a NestLoop.
-/// Callers rely on the append-only memo invariant: if a rule ever rewrites an
-/// existing group's first expression in place, it must reset that group's
-/// `logical_props` to `None` so a later derive recomputes it.
+///
+/// Calling this function is also the **eager re-derive** mechanism: a producer
+/// that appends a strictly-higher-key member to an already-derived group MUST
+/// call this function directly at append time so the argmax is re-run against
+/// all members. The function always keeps `logical_props` `Some` (never goes to
+/// `None`), which preserves the M1 invariant that `implement()` relies on to
+/// read child-group column ids.
 pub(crate) fn derive_group_statistics_for(
     memo: &mut Memo,
     group_idx: usize,
@@ -5773,6 +5789,75 @@ mod tests {
             }
             other => panic!("expected a LogicalJoin, got {other:?}"),
         }
+    }
+
+    /// Documents both the hazard and the fix for the per-group argmax guard.
+    ///
+    /// **Hazard**: when a strictly-higher-key member is appended to an already-
+    /// derived group, the bulk `derive_group_statistics` guard SKIPS the group
+    /// and never sees the new member → the cached `logical_props` stays stale.
+    ///
+    /// **Fix (eager re-derive)**: calling `derive_group_statistics_for` directly
+    /// on the group at append time re-runs the argmax over ALL members, picks the
+    /// higher-key one, and keeps `logical_props` `Some` throughout — satisfying
+    /// the M1 invariant that `implement()` requires to read child-group column ids.
+    #[test]
+    fn eager_rederive_picks_late_higher_confidence_member() {
+        // Only "registered_tbl" is in table_stats, so its scan derives Exact.
+        // "unregistered_tbl" is absent, so its scan derives Fallback.
+        let (name, ts) = make_table_stats("registered_tbl", 2_000, &[("a", 100.0)]);
+        let mut table_stats = HashMap::new();
+        table_stats.insert(name, ts);
+
+        // ── Step 1: create a group whose ONLY member is Fallback. ──────────
+        let mut memo = Memo::new();
+        let group = memo.new_group(scan_mexpr("unregistered_tbl", "a"));
+
+        // ── Step 2: derive via the bulk pass (first derivation). ──────────
+        derive_group_statistics(&mut memo, &table_stats);
+
+        // The group now has cached props — single member is Fallback.
+        let props = memo.groups[group].logical_props.as_ref()
+            .expect("bulk pass must have stamped logical_props");
+        assert_eq!(
+            props.row_count_confidence,
+            Confidence::Fallback,
+            "initial derivation: only Fallback member present, must cache Fallback"
+        );
+
+        // ── Step 3: append a strictly-higher-key member (Exact). ──────────
+        // This simulates a future producer (e.g. MV-rewrite) adding a member
+        // with a higher source_confidence AFTER the group was already derived.
+        memo.add_expr_to_group(group, scan_mexpr("registered_tbl", "a"));
+
+        // ── Step 4: hazard — bulk pass SKIPS the group. ───────────────────
+        // The guard sees `logical_props.is_some()` and does not re-run argmax.
+        derive_group_statistics(&mut memo, &table_stats);
+        let props_after_bulk = memo.groups[group].logical_props.as_ref()
+            .expect("logical_props must remain Some (M1 invariant)");
+        assert_eq!(
+            props_after_bulk.row_count_confidence,
+            Confidence::Fallback,
+            "hazard: bulk pass guard skipped the group — stale Fallback is still cached \
+             even though an Exact member was appended"
+        );
+
+        // ── Step 5: fix — eager re-derive via derive_group_statistics_for. ─
+        // This is what a real producer MUST call at append time.
+        derive_group_statistics_for(&mut memo, group, &table_stats);
+
+        let props_after_eager = memo.groups[group].logical_props.as_ref()
+            .expect("(a) logical_props must remain Some — eager re-derive MUST NOT go to None");
+        assert_eq!(
+            props_after_eager.row_count_confidence,
+            Confidence::Exact,
+            "(b) argmax must now select the Exact member appended in step 3"
+        );
+        assert!(
+            (props_after_eager.row_count - 2_000.0).abs() < 1.0,
+            "row_count must come from the registered_tbl scan (2000 rows), got {}",
+            props_after_eager.row_count
+        );
     }
 }
 
