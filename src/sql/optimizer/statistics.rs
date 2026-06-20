@@ -86,6 +86,31 @@ impl Statistics {
     pub fn compute_size(&self) -> f64 {
         self.output_row_count * self.avg_row_size()
     }
+
+    pub fn safe_output_row_count(&self) -> f64 {
+        if self.output_row_count.is_finite() && self.output_row_count > 0.0 {
+            self.output_row_count
+        } else {
+            1.0
+        }
+    }
+
+    pub fn compute_size_for_columns(&self, columns: &[ColumnId]) -> f64 {
+        if columns.is_empty() {
+            return self.compute_size();
+        }
+        let row_width: f64 = columns
+            .iter()
+            .map(|column_id| {
+                self.column_statistics
+                    .get(column_id)
+                    .map(|c| c.average_row_size)
+                    .filter(|v| v.is_finite() && *v > 0.0)
+                    .unwrap_or(8.0)
+            })
+            .sum();
+        self.safe_output_row_count() * row_width
+    }
 }
 
 pub(crate) fn generate_series_row_count_f64(start: i64, end: i64, step: i64) -> f64 {
@@ -119,6 +144,15 @@ pub struct CostEstimate {
 impl CostEstimate {
     pub fn total_cost(&self) -> f64 {
         self.cpu_cost * 0.5 + self.memory_cost * 2.0 + self.network_cost * 1.5
+    }
+
+    pub fn weighted_total(&self, cpu_weight: f64, memory_weight: f64, network_weight: f64) -> f64 {
+        fn finite_or_zero(v: f64) -> f64 {
+            if v.is_finite() && v > 0.0 { v } else { 0.0 }
+        }
+        finite_or_zero(self.cpu_cost) * cpu_weight
+            + finite_or_zero(self.memory_cost) * memory_weight
+            + finite_or_zero(self.network_cost) * network_weight
     }
 
     #[allow(dead_code)] // used by cost model tests
@@ -429,6 +463,61 @@ mod tests {
         assert!((c.cpu_cost - 40.0).abs() < f64::EPSILON);
         assert!((c.memory_cost - 30.0).abs() < f64::EPSILON);
         assert!((c.network_cost - 20.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn statistics_compute_size_for_requested_columns() {
+        let mut stats = Statistics {
+            output_row_count: 10.0,
+            ..Default::default()
+        };
+        stats.column_statistics.insert(
+            ColumnId::new_for_test(1),
+            ColumnStatistic {
+                average_row_size: 4.0,
+                ..Default::default()
+            },
+        );
+        stats.column_statistics.insert(
+            ColumnId::new_for_test(2),
+            ColumnStatistic {
+                average_row_size: 16.0,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            stats.compute_size_for_columns(&[ColumnId::new_for_test(2)]),
+            160.0
+        );
+        assert_eq!(
+            stats.compute_size_for_columns(&[ColumnId::new_for_test(1), ColumnId::new_for_test(2)]),
+            200.0
+        );
+    }
+
+    #[test]
+    fn statistics_compute_size_for_missing_columns_uses_default_width() {
+        let stats = Statistics {
+            output_row_count: 5.0,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            stats.compute_size_for_columns(&[ColumnId::new_for_test(99)]),
+            40.0
+        );
+    }
+
+    #[test]
+    fn cost_estimate_weighted_total_uses_explicit_weights() {
+        let cost = CostEstimate {
+            cpu_cost: 100.0,
+            memory_cost: 10.0,
+            network_cost: 20.0,
+        };
+
+        assert_eq!(cost.weighted_total(0.5, 2.0, 1.5), 100.0);
     }
 
     #[test]
