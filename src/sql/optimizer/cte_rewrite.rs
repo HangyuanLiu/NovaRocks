@@ -1,8 +1,8 @@
 use crate::sql::analysis::cte::CteId;
-use crate::sql::analysis::{ExprKind, JoinKind, OutputColumn, ProjectItem, TypedExpr};
-use crate::sql::optimizer::operator::{Operator, ProjectOp};
+use crate::sql::analysis::{JoinKind, OutputColumn};
+use crate::sql::optimizer::operator::{Operator, ProjectOp, ScalarProjectItem};
 use crate::sql::optimizer::opt_expr::OptExpr;
-use crate::sql::optimizer::scalar::ScalarArena;
+use crate::sql::optimizer::scalar::{ColumnDisplay, ScalarArena, ScalarNode};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, Default)]
@@ -159,24 +159,28 @@ fn adapt_opt_expr_output_with_qualifier(
                 target.name, source.nullable, target.nullable
             ));
         }
-        items.push(ProjectItem {
-            expr: TypedExpr {
-                kind: ExprKind::ColumnRef {
-                    column_id: source.column_id,
-                    qualifier: None,
-                    column: source.name.clone(),
-                },
-                data_type: source.data_type.clone(),
-                nullable: target.nullable,
-            },
+        scalars.remember_source_column_display(source.column_id, None, source.name.clone());
+        let expr = scalars.intern(
+            ScalarNode::ColumnRef(source.column_id),
+            source.data_type.clone(),
+            target.nullable,
+        );
+        let expr_display = Some(ColumnDisplay {
+            qualifier: None,
+            column: source.name.clone(),
+        });
+        scalars.remember_project_output_display(target.column_id, None, target.name.clone());
+        items.push(ScalarProjectItem {
+            expr,
             output_name: target.name.clone(),
             output_column_id: target.column_id,
+            expr_display,
         });
     }
 
     Ok(OptExpr::new(
         Operator::LogicalProject(ProjectOp {
-            items: crate::sql::optimizer::scalar_bridge::intern_project_items(scalars, &items),
+            items,
             output_qualifier: output_qualifier.map(str::to_string),
         }),
         vec![input],
