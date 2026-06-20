@@ -1099,6 +1099,12 @@ pub(crate) fn derive_group_statistics_for(
     group_idx: usize,
     table_stats: &HashMap<String, TableStatistics>,
 ) {
+    // Output columns are a group-level invariant: all members of a memo group
+    // are logically equivalent and expose the identical output columns, so
+    // picking them via `first()` here is consistent with the argmax-chosen
+    // member. The structural properties that DO vary by member shape
+    // (equivalence classes, unique columns) are derived from the chosen member
+    // inside `derive_for_expr` below.
     let output_columns = derive_output_columns(memo, group_idx);
 
     // Collapse the group to a single representative member by lexicographic
@@ -1142,6 +1148,19 @@ pub(crate) fn derive_group_statistics_for(
 /// Member order is `logical_exprs` then `physical_exprs`, so the lowest index
 /// is `logical_exprs[0]` — exactly today's pick
 /// (`logical_exprs.first().or(physical_exprs.first())`).
+///
+/// Note on the promise (derivability) axis: with the current `promise()`
+/// child-shape proxy, a join's promise is fixed by its arity (High over two
+/// base/leaf inputs, Medium once a child is itself a join). Every member of one
+/// memo group joins the same relation set, so all members share the same arity
+/// and therefore the same promise — the promise axis is in-group-CONSTANT today
+/// and never breaks a within-group tie. It is kept in the lexicographic key as
+/// framework: it gains real within-group signal only when members of one group
+/// can differ in derivability (a more faithful reorder-shape marker, or future
+/// in-memo decorrelation). The live within-group discriminators today are the
+/// source-confidence axis and the FFewerConj sub-tie-break. (This is why no test
+/// constructs two same-group members differing in promise: doing so would
+/// require members joining different relation sets, violating group equivalence.)
 pub(crate) fn pick_group_representative(
     memo: &Memo,
     group_idx: usize,
