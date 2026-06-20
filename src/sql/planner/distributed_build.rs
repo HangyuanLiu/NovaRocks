@@ -10,17 +10,22 @@ use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{ExprKind, TypedExpr};
 use crate::sql::codegen::helpers::{group_win_exprs_by_sig, split_and_conjuncts_typed};
 use crate::sql::codegen::{FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind};
+use crate::sql::optimizer::cost::{CostInput, CostOptions, compute_cost_estimate};
+use crate::sql::optimizer::derive::PropertyAlternativeKind;
 use crate::sql::optimizer::operator::{
     CTEAnchorOp, CTEConsumeOp, CTEProduceOp, LimitOp, Operator, PhysicalDistributionOp, TopNOp,
     TopNPhase, UnionOp,
 };
 use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
-use crate::sql::optimizer::property::{DistributionSpec, OrderingSpec, window_ordering_spec};
+use crate::sql::optimizer::property::{
+    DistributionSpec, OrderingSpec, PhysicalPropertySet, window_ordering_spec,
+};
 use crate::sql::optimizer::scalar::{ScalarArena, materialize};
 use crate::sql::optimizer::scalar_bridge::{
     materialize_aggregate_calls, materialize_exprs, materialize_project_items,
     materialize_sort_keys, materialize_window_exprs,
 };
+use crate::sql::optimizer::statistics::Statistics;
 use crate::sql::planner::plan::{
     DistributedExchangeNode, DistributedHashAggregateNode, DistributedHashJoinEqCondition,
     DistributedHashJoinNode, DistributedNestLoopJoinNode, DistributedSetOpNode,
@@ -48,6 +53,36 @@ struct DistributedPlanBuilder<'a> {
     edges: Vec<FragmentEdge>,
     #[allow(dead_code)]
     cte_fragments: HashMap<CteId, usize>,
+}
+
+fn stats_for_physical_node(node: &PhysicalPlanNode) -> PlanNodeStats {
+    let child_stats: Vec<&Statistics> = node.children.iter().map(|child| &child.stats).collect();
+    let child_outputs: Vec<&PhysicalPropertySet> = node
+        .execution_props
+        .child_output_properties
+        .iter()
+        .collect();
+    let options = CostOptions::default();
+    let alt_kind = match node.execution_props.join_distribution {
+        Some(crate::sql::optimizer::physical_plan::JoinExecutionDistribution::Broadcast) => {
+            PropertyAlternativeKind::BroadcastJoin
+        }
+        Some(crate::sql::optimizer::physical_plan::JoinExecutionDistribution::Partitioned) => {
+            PropertyAlternativeKind::ShuffleJoin
+        }
+        _ => PropertyAlternativeKind::Default,
+    };
+    let input = CostInput {
+        op: &node.op,
+        own_stats: &node.stats,
+        child_stats: &child_stats,
+        child_outputs: &child_outputs,
+        required_output: &node.execution_props.output_property,
+        alt_kind: &alt_kind,
+        scalars: node.execution_props.scalar_arena.as_deref(),
+        options: &options,
+    };
+    PlanNodeStats::from_statistics_with_cost(&node.stats, Some(compute_cost_estimate(&input)))
 }
 
 impl<'a> DistributedPlanBuilder<'a> {
@@ -92,7 +127,7 @@ impl<'a> DistributedPlanBuilder<'a> {
                     build_runtime_filters: node.build_runtime_filters.clone(),
                     probe_runtime_filters: node.probe_runtime_filters.clone(),
                     children: vec![],
-                    stats: PlanNodeStats::from_statistics(&node.stats),
+                    stats: stats_for_physical_node(node),
                     kind: PlanNodeKind::Scan(DistributedScanNode {
                         database: op.database.clone(),
                         table: op.table.clone(),
@@ -128,7 +163,7 @@ impl<'a> DistributedPlanBuilder<'a> {
                         build_runtime_filters: node.build_runtime_filters.clone(),
                         probe_runtime_filters: node.probe_runtime_filters.clone(),
                         children: vec![child],
-                        stats: PlanNodeStats::from_statistics(&node.stats),
+                        stats: stats_for_physical_node(node),
                         kind: PlanNodeKind::Filter(DistributedFilterNode { predicate }),
                     })
                 }
@@ -148,7 +183,7 @@ impl<'a> DistributedPlanBuilder<'a> {
                     build_runtime_filters: node.build_runtime_filters.clone(),
                     probe_runtime_filters: node.probe_runtime_filters.clone(),
                     children: vec![child],
-                    stats: PlanNodeStats::from_statistics(&node.stats),
+                    stats: stats_for_physical_node(node),
                     kind: PlanNodeKind::Project(DistributedProjectNode {
                         items: materialize_project_items(self.scalars, &op.items),
                         output_qualifier: op.output_qualifier.clone(),
@@ -169,7 +204,7 @@ impl<'a> DistributedPlanBuilder<'a> {
                     build_runtime_filters: node.build_runtime_filters.clone(),
                     probe_runtime_filters: node.probe_runtime_filters.clone(),
                     children: vec![child],
-                    stats: PlanNodeStats::from_statistics(&node.stats),
+                    stats: stats_for_physical_node(node),
                     kind: PlanNodeKind::Sort(DistributedSortNode {
                         items: materialize_sort_keys(self.scalars, &op.items),
                         analytic_partition_by: materialize_exprs(
@@ -228,7 +263,7 @@ impl<'a> DistributedPlanBuilder<'a> {
                             build_runtime_filters: node.build_runtime_filters.clone(),
                             probe_runtime_filters: node.probe_runtime_filters.clone(),
                             children: vec![child],
-                            stats: PlanNodeStats::from_statistics(&node.stats),
+                            stats: stats_for_physical_node(node),
                             kind: PlanNodeKind::TopN(DistributedTopNNode {
                                 items: materialize_sort_keys(self.scalars, &op.items),
                                 limit: op.limit,
@@ -255,7 +290,7 @@ impl<'a> DistributedPlanBuilder<'a> {
                     build_runtime_filters: node.build_runtime_filters.clone(),
                     probe_runtime_filters: node.probe_runtime_filters.clone(),
                     children: vec![child],
-                    stats: PlanNodeStats::from_statistics(&node.stats),
+                    stats: stats_for_physical_node(node),
                     kind: PlanNodeKind::HashAggregate(Box::new(DistributedHashAggregateNode {
                         mode: op.mode,
                         group_by: materialize_exprs(self.scalars, &op.group_by),
@@ -297,7 +332,7 @@ impl<'a> DistributedPlanBuilder<'a> {
                     build_runtime_filters: node.build_runtime_filters.clone(),
                     probe_runtime_filters: node.probe_runtime_filters.clone(),
                     children: vec![left, right],
-                    stats: PlanNodeStats::from_statistics(&node.stats),
+                    stats: stats_for_physical_node(node),
                     kind: PlanNodeKind::HashJoin(Box::new(DistributedHashJoinNode {
                         join_type: op.join_type,
                         eq_conditions: op
@@ -333,7 +368,7 @@ impl<'a> DistributedPlanBuilder<'a> {
                     build_runtime_filters: node.build_runtime_filters.clone(),
                     probe_runtime_filters: node.probe_runtime_filters.clone(),
                     children: vec![left, right],
-                    stats: PlanNodeStats::from_statistics(&node.stats),
+                    stats: stats_for_physical_node(node),
                     kind: PlanNodeKind::NestLoopJoin(DistributedNestLoopJoinNode {
                         join_type: op.join_type,
                         condition: op
@@ -361,7 +396,7 @@ impl<'a> DistributedPlanBuilder<'a> {
                     build_runtime_filters: node.build_runtime_filters.clone(),
                     probe_runtime_filters: node.probe_runtime_filters.clone(),
                     children: vec![],
-                    stats: PlanNodeStats::from_statistics(&node.stats),
+                    stats: stats_for_physical_node(node),
                     kind: PlanNodeKind::Values(DistributedValuesNode {
                         rows: op
                             .rows
@@ -386,7 +421,7 @@ impl<'a> DistributedPlanBuilder<'a> {
                     build_runtime_filters: node.build_runtime_filters.clone(),
                     probe_runtime_filters: node.probe_runtime_filters.clone(),
                     children: vec![child],
-                    stats: PlanNodeStats::from_statistics(&node.stats),
+                    stats: stats_for_physical_node(node),
                     kind: PlanNodeKind::AssertOneRow(DistributedAssertOneRowNode {
                         subquery_text: op.subquery_text.clone(),
                     }),
@@ -407,7 +442,7 @@ impl<'a> DistributedPlanBuilder<'a> {
                     build_runtime_filters: node.build_runtime_filters.clone(),
                     probe_runtime_filters: node.probe_runtime_filters.clone(),
                     children: vec![child],
-                    stats: PlanNodeStats::from_statistics(&node.stats),
+                    stats: stats_for_physical_node(node),
                     kind: PlanNodeKind::Decode(DistributedDecodeNode {
                         mappings: op.mappings.clone(),
                         output_columns: op.output_columns.clone(),
@@ -433,7 +468,7 @@ impl<'a> DistributedPlanBuilder<'a> {
                     build_runtime_filters: node.build_runtime_filters.clone(),
                     probe_runtime_filters: node.probe_runtime_filters.clone(),
                     children: vec![child],
-                    stats: PlanNodeStats::from_statistics(&node.stats),
+                    stats: stats_for_physical_node(node),
                     kind: PlanNodeKind::Repeat(DistributedRepeatNode {
                         virtual_tuple_id: Some(virtual_tuple_id),
                         repeat_column_ref_list: op.repeat_column_ref_list.clone(),
@@ -505,7 +540,7 @@ impl<'a> DistributedPlanBuilder<'a> {
                     build_runtime_filters: node.build_runtime_filters.clone(),
                     probe_runtime_filters: node.probe_runtime_filters.clone(),
                     children: vec![child],
-                    stats: PlanNodeStats::from_statistics(&node.stats),
+                    stats: stats_for_physical_node(node),
                     kind: PlanNodeKind::Window(DistributedWindowNode {
                         window_exprs,
                         output_columns: op.output_columns.clone(),
@@ -559,7 +594,7 @@ impl<'a> DistributedPlanBuilder<'a> {
                     build_runtime_filters: node.build_runtime_filters.clone(),
                     probe_runtime_filters: node.probe_runtime_filters.clone(),
                     children: vec![],
-                    stats: PlanNodeStats::from_statistics(&node.stats),
+                    stats: stats_for_physical_node(node),
                     kind: PlanNodeKind::GenerateSeries(DistributedGenerateSeriesNode {
                         start: op.start,
                         end: op.end,
@@ -587,7 +622,7 @@ impl<'a> DistributedPlanBuilder<'a> {
                     build_runtime_filters: node.build_runtime_filters.clone(),
                     probe_runtime_filters: node.probe_runtime_filters.clone(),
                     children: vec![child],
-                    stats: PlanNodeStats::from_statistics(&node.stats),
+                    stats: stats_for_physical_node(node),
                     kind: PlanNodeKind::TableFunction(DistributedTableFunctionNode {
                         function_name: op.function_name.clone(),
                         args: materialize_exprs(self.scalars, &op.args),
@@ -812,7 +847,7 @@ impl<'a> DistributedPlanBuilder<'a> {
             build_runtime_filters: node.build_runtime_filters.clone(),
             probe_runtime_filters: node.probe_runtime_filters.clone(),
             children: vec![],
-            stats: PlanNodeStats::from_statistics(&node.stats),
+            stats: stats_for_physical_node(node),
             kind: PlanNodeKind::Exchange(exchange),
         })
     }
@@ -901,7 +936,7 @@ impl<'a> DistributedPlanBuilder<'a> {
             build_runtime_filters: node.build_runtime_filters.clone(),
             probe_runtime_filters: node.probe_runtime_filters.clone(),
             children: vec![],
-            stats: PlanNodeStats::from_statistics(&node.stats),
+            stats: stats_for_physical_node(node),
             kind: PlanNodeKind::Exchange(DistributedExchangeNode {
                 partition_type: partitions::TPartitionType::UNPARTITIONED,
                 partition_exprs: Vec::new(),
@@ -950,7 +985,7 @@ impl<'a> DistributedPlanBuilder<'a> {
             build_runtime_filters: node.build_runtime_filters.clone(),
             probe_runtime_filters: node.probe_runtime_filters.clone(),
             children,
-            stats: PlanNodeStats::from_statistics(&node.stats),
+            stats: stats_for_physical_node(node),
             kind: PlanNodeKind::SetOp(DistributedSetOpNode {
                 kind,
                 output_columns,
@@ -1046,7 +1081,7 @@ impl<'a> DistributedPlanBuilder<'a> {
             build_runtime_filters: node.build_runtime_filters.clone(),
             probe_runtime_filters: node.probe_runtime_filters.clone(),
             children: vec![child],
-            stats: PlanNodeStats::from_statistics(&node.stats),
+            stats: stats_for_physical_node(node),
             kind: PlanNodeKind::HashAggregate(Box::new(DistributedHashAggregateNode {
                 mode: crate::sql::optimizer::operator::AggMode::Single,
                 group_by,

@@ -911,15 +911,33 @@ fn is_detailed(level: ExplainLevel) -> bool {
 
 fn costs_suffix(stats: &PlanNodeStats, level: ExplainLevel) -> String {
     if matches!(level, ExplainLevel::Costs) {
+        let row_part = format!("rows={:.0}", stats.output_row_count);
+        let cost_part = stats
+            .cost_estimate
+            .as_ref()
+            .map(format_cost_estimate)
+            .unwrap_or_default();
         let colstats = format_column_stats_costs(stats);
-        if colstats.is_empty() {
-            format!(" (rows={:.0})", stats.output_row_count)
-        } else {
-            format!(" (rows={:.0}) {colstats}", stats.output_row_count)
+        match (cost_part.is_empty(), colstats.is_empty()) {
+            (true, true) => format!(" ({row_part})"),
+            (false, true) => format!(" ({row_part} {cost_part})"),
+            (true, false) => format!(" ({row_part}) {colstats}"),
+            (false, false) => format!(" ({row_part} {cost_part}) {colstats}"),
         }
     } else {
         String::new()
     }
+}
+
+fn format_cost_estimate(cost: &crate::sql::optimizer::statistics::CostEstimate) -> String {
+    let options = crate::sql::optimizer::cost::CostOptions::default();
+    format!(
+        "cost={{cpu={} memory={} network={} total={}}}",
+        fmt_f64(cost.cpu_cost),
+        fmt_f64(cost.memory_cost),
+        fmt_f64(cost.network_cost),
+        fmt_f64(cost.total_with_options(&options)),
+    )
 }
 
 fn stats_suffix(stats: &PlanNodeStats, level: ExplainLevel) -> String {
@@ -1433,6 +1451,27 @@ mod tests {
             costs.contains("colstats={col#1[min=0 max=1000 ndv=1000 null_frac=0]}"),
             "Costs must render colstats copied into PlanNodeStats:\n{costs}"
         );
+    }
+
+    #[test]
+    fn costs_level_renders_dimensional_costs() {
+        let mut dp = build_distributed_plan(&scan_plan()).expect("build DistributedPlan");
+        let root = dp
+            .fragments
+            .iter_mut()
+            .find(|fragment| fragment.fragment_id == dp.root_fragment_id)
+            .expect("root fragment");
+        root.root.stats.cost_estimate = Some(crate::sql::optimizer::statistics::CostEstimate {
+            cpu_cost: 10.0,
+            memory_cost: 2.0,
+            network_cost: 3.0,
+        });
+
+        let costs = explain_distributed_plan(&dp, ExplainLevel::Costs).join("\n");
+        assert!(costs.contains("cost={cpu=10"));
+        assert!(costs.contains("memory=2"));
+        assert!(costs.contains("network=3"));
+        assert!(costs.contains("total="));
     }
 
     #[test]

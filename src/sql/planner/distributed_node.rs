@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::sql::codegen::FragmentId;
 use crate::sql::column_id::ColumnId;
-use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence, Statistics};
+use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence, CostEstimate, Statistics};
 pub(crate) use crate::sql::planner::plan::PlanNodeKind;
 
 /// Self-contained copy of the estimated stats this node carries, so EXPLAIN /
@@ -12,14 +12,23 @@ pub(crate) struct PlanNodeStats {
     pub output_row_count: f64,
     pub row_count_confidence: Confidence,
     pub column_statistics: HashMap<ColumnId, ColumnStatistic>,
+    pub cost_estimate: Option<CostEstimate>,
 }
 
 impl PlanNodeStats {
     pub fn from_statistics(stats: &Statistics) -> Self {
+        Self::from_statistics_with_cost(stats, None)
+    }
+
+    pub fn from_statistics_with_cost(
+        stats: &Statistics,
+        cost_estimate: Option<CostEstimate>,
+    ) -> Self {
         Self {
             output_row_count: stats.output_row_count,
             row_count_confidence: stats.row_count_confidence,
             column_statistics: stats.column_statistics.clone(),
+            cost_estimate,
         }
     }
 }
@@ -70,6 +79,22 @@ mod tests {
         let s = PlanNodeStats::from_statistics(&stats);
         assert_eq!(s.output_row_count, 7.0);
         assert_eq!(s.column_statistics[&column_id].distinct_values_count, 3.0);
+    }
+
+    #[test]
+    fn plan_node_stats_can_carry_cost_estimate() {
+        let stats = Statistics {
+            output_row_count: 7.0,
+            ..Default::default()
+        };
+        let cost = crate::sql::optimizer::statistics::CostEstimate {
+            cpu_cost: 1.0,
+            memory_cost: 2.0,
+            network_cost: 3.0,
+        };
+        let s = PlanNodeStats::from_statistics_with_cost(&stats, Some(cost.clone()));
+
+        assert_eq!(s.cost_estimate.unwrap().network_cost, 3.0);
     }
 
     #[test]
