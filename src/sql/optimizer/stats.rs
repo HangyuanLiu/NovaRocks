@@ -3518,7 +3518,7 @@ mod tests {
     }
 
     #[test]
-    fn physical_hash_aggregate_own_stats_are_per_expr_not_per_group() {
+    fn derive_statistics_is_child_sensitive_across_groups() {
         use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
         use crate::sql::column_id::ColumnId;
         use crate::sql::optimizer::memo::{LogicalProperties, MExpr, Memo};
@@ -3598,8 +3598,12 @@ mod tests {
         let big_stats = derive_statistics(&agg_over(big, &mut memo), &memo, &HashMap::new());
         let small_stats = derive_statistics(&agg_over(small, &mut memo), &memo, &HashMap::new());
 
-        // Same op, different children -> different own_stats. A single group cache
-        // cannot represent both, which is exactly why search.rs keeps own_stats per-expr.
+        // Same op, different children -> different derived statistics. These two
+        // aggregates have different children, so they are DIFFERENT memo groups;
+        // this asserts derive_statistics is child-sensitive ACROSS groups. It does
+        // NOT imply within-group per-expr variation: members of one group are
+        // logically equivalent, so the per-group collapsed statistic is correct
+        // (search now reads the per-group stat, not a per-expr derivation).
         assert!(
             big_stats.output_row_count > small_stats.output_row_count,
             "per-expr own_stats must differ: big={} small={}",
