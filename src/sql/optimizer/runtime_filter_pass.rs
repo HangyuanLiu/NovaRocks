@@ -263,6 +263,8 @@ fn orient_rf_key(
     expr_order: usize,
     eq: &PhysicalHashJoinEqCondition,
 ) -> Option<OrientedRfKey> {
+    // Runtime filter descriptors are execution-facing plan payloads; this is an
+    // optimizer-exit bridge from ScalarId back to typed expressions.
     let left = materialize(scalars, eq.left);
     let right = materialize(scalars, eq.right);
     let left_child = expr_bound_child(node, &left)?;

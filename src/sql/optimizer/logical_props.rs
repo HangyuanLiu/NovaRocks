@@ -8,7 +8,7 @@ use super::property::ColumnIdSet;
 use super::statistics::{ColumnStatistic, Confidence};
 use crate::sql::analysis::{BinOp, ExprKind, JoinKind, OutputColumn, TypedExpr};
 use crate::sql::column_id::ColumnId;
-use crate::sql::optimizer::scalar::materialize;
+use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 use arrow::datatypes::DataType;
 
 pub(crate) fn derive_for_group(
@@ -53,15 +53,13 @@ pub(crate) fn derive_for_expr(
     match &expr.op {
         Operator::LogicalFilter(filter) => {
             inherit_from_child(memo, expr, 0, &output_ids, &mut props);
-            let predicate = materialize(&memo.scalars, filter.predicate);
-            for (left, right) in collect_column_equalities(&predicate) {
+            for (left, right) in collect_column_equalities_scalar(&memo.scalars, filter.predicate) {
                 props.equivalence_classes.merge_pair(left, right);
             }
         }
         Operator::PhysicalFilter(filter) => {
             inherit_from_child(memo, expr, 0, &output_ids, &mut props);
-            let predicate = materialize(&memo.scalars, filter.predicate);
-            for (left, right) in collect_column_equalities(&predicate) {
+            for (left, right) in collect_column_equalities_scalar(&memo.scalars, filter.predicate) {
                 props.equivalence_classes.merge_pair(left, right);
             }
         }
@@ -70,8 +68,8 @@ pub(crate) fn derive_for_expr(
                 inherit_from_child(memo, expr, 0, &output_ids, &mut props);
                 inherit_from_child(memo, expr, 1, &output_ids, &mut props);
                 if let Some(condition) = &join.condition {
-                    let condition = materialize(&memo.scalars, *condition);
-                    for (left, right) in collect_column_equalities(&condition) {
+                    for (left, right) in collect_column_equalities_scalar(&memo.scalars, *condition)
+                    {
                         props.equivalence_classes.merge_pair(left, right);
                     }
                 }
@@ -83,18 +81,16 @@ pub(crate) fn derive_for_expr(
                 inherit_from_child(memo, expr, 0, &output_ids, &mut props);
                 inherit_from_child(memo, expr, 1, &output_ids, &mut props);
                 for eq in &join.eq_conditions {
-                    let left_expr = materialize(&memo.scalars, eq.left);
-                    let right_expr = materialize(&memo.scalars, eq.right);
                     if let (Some(left), Some(right)) = (
-                        column_id_from_expr(&left_expr),
-                        column_id_from_expr(&right_expr),
+                        column_id_from_scalar(&memo.scalars, eq.left),
+                        column_id_from_scalar(&memo.scalars, eq.right),
                     ) {
                         props.equivalence_classes.merge_pair(left, right);
                     }
                 }
                 if let Some(condition) = &join.other_condition {
-                    let condition = materialize(&memo.scalars, *condition);
-                    for (left, right) in collect_column_equalities(&condition) {
+                    for (left, right) in collect_column_equalities_scalar(&memo.scalars, *condition)
+                    {
                         props.equivalence_classes.merge_pair(left, right);
                     }
                 }
@@ -178,6 +174,54 @@ fn inherit_from_child(
 
 fn output_id_set(output_columns: &[OutputColumn]) -> ColumnIdSet {
     ColumnIdSet::from_columns(output_columns.iter().map(|column| column.column_id))
+}
+
+fn column_id_from_scalar(scalars: &ScalarArena, expr: ScalarId) -> Option<ColumnId> {
+    match scalars.node(expr) {
+        ScalarNode::ColumnRef(column_id) if *column_id != ColumnId::UNSET => Some(*column_id),
+        ScalarNode::Nested(inner) => column_id_from_scalar(scalars, *inner),
+        _ => None,
+    }
+}
+
+fn collect_column_equalities_scalar(
+    scalars: &ScalarArena,
+    expr: ScalarId,
+) -> Vec<(ColumnId, ColumnId)> {
+    let mut out = Vec::new();
+    collect_column_equalities_scalar_inner(scalars, expr, &mut out);
+    out
+}
+
+fn collect_column_equalities_scalar_inner(
+    scalars: &ScalarArena,
+    expr: ScalarId,
+    out: &mut Vec<(ColumnId, ColumnId)>,
+) {
+    match scalars.node(expr) {
+        ScalarNode::Nested(inner) => collect_column_equalities_scalar_inner(scalars, *inner, out),
+        ScalarNode::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } => {
+            collect_column_equalities_scalar_inner(scalars, *left, out);
+            collect_column_equalities_scalar_inner(scalars, *right, out);
+        }
+        ScalarNode::BinaryOp {
+            left,
+            op: BinOp::Eq | BinOp::EqForNull,
+            right,
+        } => {
+            if let (Some(left_id), Some(right_id)) = (
+                column_id_from_scalar(scalars, *left),
+                column_id_from_scalar(scalars, *right),
+            ) {
+                out.push((left_id, right_id));
+            }
+        }
+        _ => {}
+    }
 }
 
 pub(crate) fn column_id_from_expr(expr: &TypedExpr) -> Option<ColumnId> {

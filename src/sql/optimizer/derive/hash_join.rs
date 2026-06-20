@@ -1,6 +1,5 @@
 //! HashJoin: Shuffle / Broadcast / Colocate.
 
-use crate::sql::analysis::TypedExpr;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::{
     JoinDistribution, PhysicalHashJoinEqCondition, PhysicalHashJoinOp,
@@ -8,10 +7,13 @@ use crate::sql::optimizer::operator::{
 use crate::sql::optimizer::property::{
     DistributionSpec, HashSource, OrderingSpec, PhysicalPropertySet,
 };
-use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, materialize};
+use crate::sql::optimizer::scalar::ScalarArena;
 use arrow::datatypes::DataType;
 
-use super::{ChildRequirementAlternative, DeriveOutput, DeriveRequired, PropertyAlternativeKind};
+use super::{
+    ChildRequirementAlternative, DeriveOutput, DeriveRequired, PropertyAlternativeKind,
+    scalar_expr_to_column_id,
+};
 
 pub(crate) fn join_execution_distribution_for_alternative(
     alt_kind: &PropertyAlternativeKind,
@@ -36,17 +38,6 @@ pub(crate) fn join_execution_distribution_for_alternative(
 fn preserves_left(jk: &crate::sql::analysis::JoinKind) -> bool {
     use crate::sql::analysis::JoinKind::*;
     matches!(jk, Inner | LeftOuter | LeftSemi | LeftAnti | Cross)
-}
-
-fn typed_expr_to_column_id(expr: &TypedExpr) -> Option<ColumnId> {
-    match &expr.kind {
-        crate::sql::analysis::ExprKind::ColumnRef { column_id, .. } => Some(*column_id),
-        _ => None,
-    }
-}
-
-fn scalar_expr_to_column_id(arena: &ScalarArena, expr: ScalarId) -> Option<ColumnId> {
-    typed_expr_to_column_id(&materialize(arena, expr))
 }
 
 fn shuffle_join_column_ids(
@@ -107,12 +98,10 @@ fn shuffle_join_eq_condition_is_supported(
     arena: &ScalarArena,
     eq: &PhysicalHashJoinEqCondition,
 ) -> bool {
-    let left = materialize(arena, eq.left);
-    let right = materialize(arena, eq.right);
     !eq.null_safe
-        && typed_expr_to_column_id(&left).is_some()
-        && typed_expr_to_column_id(&right).is_some()
-        && hash_partition_types_are_compatible(&left.data_type, &right.data_type)
+        && scalar_expr_to_column_id(arena, eq.left).is_some()
+        && scalar_expr_to_column_id(arena, eq.right).is_some()
+        && hash_partition_types_are_compatible(arena.data_type(eq.left), arena.data_type(eq.right))
 }
 
 fn shuffle_join_keys_are_supported(

@@ -15,8 +15,9 @@ use super::cost::{DISTRIBUTION_STARTUP_COST, NETWORK_COST};
 use super::memo::Cost;
 use super::operator::*;
 use super::property::*;
-use super::scalar::ScalarArena;
+use super::scalar::{ScalarArena, ScalarId, ScalarNode, SortKey as ScalarSortKey};
 use super::statistics::Statistics;
+use crate::sql::column_id::ColumnId;
 
 // ---------------------------------------------------------------------------
 // Trait contracts
@@ -64,6 +65,79 @@ impl ChildRequirementAlternative {
             kind: PropertyAlternativeKind::Default,
             child_props,
         }
+    }
+}
+
+pub(super) fn scalar_expr_to_column_id(scalars: &ScalarArena, expr: ScalarId) -> Option<ColumnId> {
+    match scalars.node(expr) {
+        ScalarNode::ColumnRef(column_id) if *column_id != ColumnId::UNSET => Some(*column_id),
+        _ => None,
+    }
+}
+
+pub(super) fn scalar_exprs_to_column_ids(
+    scalars: &ScalarArena,
+    exprs: &[ScalarId],
+) -> Option<Vec<ColumnId>> {
+    let mut out = Vec::with_capacity(exprs.len());
+    for expr in exprs {
+        out.push(scalar_expr_to_column_id(scalars, *expr)?);
+    }
+    Some(out)
+}
+
+pub(super) fn ordering_from_scalar_sort_keys(
+    scalars: &ScalarArena,
+    sort_keys: &[ScalarSortKey],
+) -> OrderingSpec {
+    let mut keys = Vec::with_capacity(sort_keys.len());
+    for sort_key in sort_keys {
+        let Some(column) = scalar_expr_to_column_id(scalars, sort_key.expr) else {
+            return OrderingSpec::Any;
+        };
+        keys.push(SortKey {
+            column,
+            asc: sort_key.asc,
+            nulls_first: sort_key.nulls_first,
+        });
+    }
+    if keys.is_empty() {
+        OrderingSpec::Any
+    } else {
+        OrderingSpec::Required(keys)
+    }
+}
+
+pub(super) fn window_ordering_from_scalar_keys(
+    scalars: &ScalarArena,
+    partition_by: &[ScalarId],
+    order_by: &[ScalarSortKey],
+) -> OrderingSpec {
+    let mut keys = Vec::with_capacity(partition_by.len() + order_by.len());
+    for expr in partition_by {
+        let Some(column) = scalar_expr_to_column_id(scalars, *expr) else {
+            return OrderingSpec::Any;
+        };
+        keys.push(SortKey {
+            column,
+            asc: true,
+            nulls_first: true,
+        });
+    }
+    for sort_key in order_by {
+        let Some(column) = scalar_expr_to_column_id(scalars, sort_key.expr) else {
+            return OrderingSpec::Any;
+        };
+        keys.push(SortKey {
+            column,
+            asc: sort_key.asc,
+            nulls_first: sort_key.nulls_first,
+        });
+    }
+    if keys.is_empty() {
+        OrderingSpec::Any
+    } else {
+        OrderingSpec::Required(keys)
     }
 }
 

@@ -6,16 +6,13 @@
 //! ordering required by the first window signature.
 
 use crate::sql::column_id::ColumnId;
-use crate::sql::optimizer::operator::WindowOp;
-use crate::sql::optimizer::property::{
-    DistributionSpec, OrderingSpec, PhysicalPropertySet, typed_expr_to_column_id,
-    window_ordering_spec,
-};
+use crate::sql::optimizer::operator::{ScalarWindowSpec, WindowOp};
+use crate::sql::optimizer::property::{DistributionSpec, OrderingSpec, PhysicalPropertySet};
 use crate::sql::optimizer::scalar::ScalarArena;
-use crate::sql::optimizer::scalar_bridge::materialize_window_exprs;
-use crate::sql::planner::plan::WindowExpr;
 
-use super::{DeriveOutput, DeriveRequired};
+use super::{
+    DeriveOutput, DeriveRequired, scalar_expr_to_column_id, window_ordering_from_scalar_keys,
+};
 
 impl DeriveOutput for WindowOp {
     fn derive_output(
@@ -27,9 +24,7 @@ impl DeriveOutput for WindowOp {
             .first()
             .map(|props| props.ordering.clone())
             .unwrap_or(OrderingSpec::Any);
-        let window_exprs =
-            materialize_window_exprs(scalars, &self.window_exprs, &self.output_columns);
-        let distribution = common_window_partition_distribution(&window_exprs);
+        let distribution = common_window_partition_distribution(scalars, &self.window_exprs);
         PhysicalPropertySet {
             distribution,
             ordering,
@@ -44,13 +39,12 @@ impl DeriveRequired for WindowOp {
         _parent: &PhysicalPropertySet,
         _n: usize,
     ) -> Vec<PhysicalPropertySet> {
-        let window_exprs =
-            materialize_window_exprs(scalars, &self.window_exprs, &self.output_columns);
-        let ordering = window_exprs
+        let ordering = self
+            .window_exprs
             .first()
-            .map(|win| window_ordering_spec(&win.partition_by, &win.order_by))
+            .map(|win| window_ordering_from_scalar_keys(scalars, &win.partition_by, &win.order_by))
             .unwrap_or(OrderingSpec::Any);
-        let distribution = common_window_partition_distribution(&window_exprs);
+        let distribution = common_window_partition_distribution(scalars, &self.window_exprs);
         vec![PhysicalPropertySet {
             distribution,
             ordering,
@@ -58,14 +52,20 @@ impl DeriveRequired for WindowOp {
     }
 }
 
-fn common_window_partition_distribution(window_exprs: &[WindowExpr]) -> DistributionSpec {
-    let Some(cols) = common_window_partition_cols(window_exprs) else {
+fn common_window_partition_distribution(
+    scalars: &ScalarArena,
+    window_exprs: &[ScalarWindowSpec],
+) -> DistributionSpec {
+    let Some(cols) = common_window_partition_cols(scalars, window_exprs) else {
         return DistributionSpec::Gather;
     };
     DistributionSpec::shuffle_agg(cols)
 }
 
-fn common_window_partition_cols(window_exprs: &[WindowExpr]) -> Option<Vec<ColumnId>> {
+fn common_window_partition_cols(
+    scalars: &ScalarArena,
+    window_exprs: &[ScalarWindowSpec],
+) -> Option<Vec<ColumnId>> {
     let mut common: Option<Vec<_>> = None;
     for win in window_exprs {
         if win.partition_by.is_empty() {
@@ -73,7 +73,7 @@ fn common_window_partition_cols(window_exprs: &[WindowExpr]) -> Option<Vec<Colum
         }
         let mut current = Vec::new();
         for expr in &win.partition_by {
-            let column = typed_expr_to_column_id(expr)?;
+            let column = scalar_expr_to_column_id(scalars, *expr)?;
             if !current.contains(&column) {
                 current.push(column);
             }

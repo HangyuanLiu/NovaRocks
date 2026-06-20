@@ -1,26 +1,12 @@
 //! HashAggregate output / required derivation. Five modes:
 //! Single / Local / Global / DistinctLocal / DistinctGlobal.
 
-use crate::sql::analysis::TypedExpr;
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::operator::{AggMode, PhysicalHashAggregateOp};
 use crate::sql::optimizer::property::{DistributionSpec, OrderingSpec, PhysicalPropertySet};
-use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, materialize};
+use crate::sql::optimizer::scalar::ScalarArena;
 
-use super::{DeriveOutput, DeriveRequired};
-
-fn typed_expr_to_column_id(expr: &TypedExpr) -> Option<ColumnId> {
-    match &expr.kind {
-        crate::sql::analysis::ExprKind::ColumnRef { column_id, .. } => Some(*column_id),
-        _ => None,
-    }
-}
-fn scalar_exprs_to_column_ids(arena: &ScalarArena, exprs: &[ScalarId]) -> Vec<ColumnId> {
-    exprs
-        .iter()
-        .filter_map(|expr| typed_expr_to_column_id(&materialize(arena, *expr)))
-        .collect()
-}
+use super::{DeriveOutput, DeriveRequired, scalar_exprs_to_column_ids};
 
 impl DeriveOutput for PhysicalHashAggregateOp {
     fn derive_output(
@@ -72,7 +58,7 @@ impl DeriveRequired for PhysicalHashAggregateOp {
             }
             AggMode::Local => vec![PhysicalPropertySet::any()],
             AggMode::Global => {
-                let cols = scalar_exprs_to_column_ids(scalars, &self.group_by);
+                let cols = scalar_exprs_to_column_ids(scalars, &self.group_by).unwrap_or_default();
                 if cols.is_empty() {
                     vec![PhysicalPropertySet::gather()]
                 } else {
@@ -83,7 +69,7 @@ impl DeriveRequired for PhysicalHashAggregateOp {
                 }
             }
             AggMode::DistinctGlobal => {
-                let cols = scalar_exprs_to_column_ids(scalars, &self.group_by);
+                let cols = scalar_exprs_to_column_ids(scalars, &self.group_by).unwrap_or_default();
                 if cols.is_empty() {
                     vec![PhysicalPropertySet::gather()]
                 } else {
@@ -104,7 +90,7 @@ mod tests {
     use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::property::HashSource;
-    use crate::sql::optimizer::scalar::intern_typed;
+    use crate::sql::optimizer::scalar::{ScalarId, intern_typed};
 
     fn intern_group_by(scalars: &mut ScalarArena, exprs: Vec<TypedExpr>) -> Vec<ScalarId> {
         exprs
