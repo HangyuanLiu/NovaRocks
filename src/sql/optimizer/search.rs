@@ -299,7 +299,9 @@ fn stats_for_group(
     memo: &Memo,
     table_stats: &HashMap<String, TableStatistics>,
 ) -> crate::sql::optimizer::statistics::Statistics {
-    // Try logical props first (set by derive_group_statistics).
+    // Try logical props first (set by derive_group_statistics). Once Site 1
+    // (derive_group_statistics_for) is argmax-correct, this cache already holds
+    // the lexicographic-argmax representative's stats.
     if let Some(ref lp) = group.logical_props {
         return crate::sql::optimizer::statistics::Statistics {
             output_row_count: lp.row_count,
@@ -308,20 +310,20 @@ fn stats_for_group(
         };
     }
 
-    // Fall back to deriving from the first available expression.
-    if let Some(expr) = group.logical_exprs.first() {
-        return derive_statistics(expr, memo, table_stats);
-    }
-    if let Some(expr) = group.physical_exprs.first() {
-        return derive_statistics(expr, memo, table_stats);
-    }
-
-    // Empty group — should not happen in practice.
-    crate::sql::optimizer::statistics::Statistics {
-        output_row_count: 1.0,
-        row_count_confidence: crate::sql::optimizer::statistics::Confidence::Fallback,
-        column_statistics: HashMap::new(),
-    }
+    // Defensive fallback (should not happen in practice — logical_props is
+    // populated by derive_group_statistics): re-pick the representative via the
+    // same shared argmax helper Site 1 uses, so this path stays consistent
+    // rather than re-deriving from first().
+    crate::sql::optimizer::stats::pick_group_representative(memo, group.id, table_stats)
+        .map(|(_, stats)| stats)
+        .unwrap_or_else(|| {
+            // Empty group — should not happen in practice.
+            crate::sql::optimizer::statistics::Statistics {
+                output_row_count: 1.0,
+                row_count_confidence: crate::sql::optimizer::statistics::Confidence::Fallback,
+                column_statistics: HashMap::new(),
+            }
+        })
 }
 
 // ---------------------------------------------------------------------------
