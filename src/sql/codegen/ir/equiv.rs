@@ -2385,10 +2385,15 @@ mod tests {
     }
 
     fn inner_hash_join_two_scans_plan() -> PhysicalPlanNode {
-        let (mut join, left_key, right_key) = hash_join_plan(JoinKind::Inner);
+        let (mut join, _, _) = hash_join_plan(JoinKind::Inner);
+        let Operator::PhysicalHashJoin(hash_join) = &join.op else {
+            panic!("expected hash join");
+        };
+        let left_key = hash_join.eq_conditions[0].left;
+        let right_key = hash_join.eq_conditions[0].right;
         join.children[0].probe_runtime_filters = vec![RuntimeFilterProbe {
             filter_id: 7,
-            probe_expr: left_key.clone(),
+            probe_expr: left_key,
         }];
         join.build_runtime_filters = vec![RuntimeFilterDesc {
             filter_id: 7,

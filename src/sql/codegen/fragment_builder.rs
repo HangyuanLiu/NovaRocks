@@ -997,7 +997,7 @@ mod tests {
     };
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::runtime_filter_pass::RuntimeFilterDesc;
-    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed, materialize};
+    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
     use crate::sql::optimizer::scalar_bridge::{
         intern_exprs, intern_project_items, intern_sort_items, intern_window_exprs,
     };
@@ -3811,14 +3811,11 @@ mod tests {
             panic!("expected hash join");
         };
         let eq = op.eq_conditions[0].clone();
-        let scalars = plan.execution_props.scalar_arena.as_deref().unwrap();
-        let build_expr = materialize(scalars, eq.right);
-        let probe_expr = materialize(scalars, eq.left);
         plan.execution_props.join_distribution = Some(JoinExecutionDistribution::Partitioned);
         plan.build_runtime_filters = vec![RuntimeFilterDesc {
             filter_id: 7,
-            build_expr,
-            probe_expr,
+            build_expr: eq.right,
+            probe_expr: eq.left,
             expr_order: 0,
             distribution: JoinDistribution::Broadcast,
         }];
@@ -3874,18 +3871,24 @@ mod tests {
             panic!("expected hash join");
         };
         let eq = op.eq_conditions[0].clone();
-        let scalars = plan.execution_props.scalar_arena.as_deref().unwrap();
+        let mut scalars = plan
+            .execution_props
+            .scalar_arena
+            .as_deref()
+            .unwrap()
+            .clone();
         let build_expr = column_ref_expr_for_test(
             ColumnId::new_for_test(9999),
             "wrong_build_id",
             DataType::Int32,
             false,
         );
-        let probe_expr = materialize(scalars, eq.left);
+        let build_expr = intern_exprs(&mut scalars, &[build_expr])[0];
+        attach_scalar_arena(&mut plan, Arc::new(scalars));
         plan.build_runtime_filters = vec![RuntimeFilterDesc {
             filter_id: 99,
             build_expr,
-            probe_expr,
+            probe_expr: eq.left,
             expr_order: 0,
             distribution: JoinDistribution::Broadcast,
         }];
@@ -3935,13 +3938,10 @@ mod tests {
             panic!("expected hash join");
         };
         let eq = op.eq_conditions[0].clone();
-        let scalars = plan.execution_props.scalar_arena.as_deref().unwrap();
-        let build_expr = materialize(scalars, eq.right);
-        let probe_expr = materialize(scalars, eq.left);
         plan.build_runtime_filters = vec![RuntimeFilterDesc {
             filter_id: 7,
-            build_expr,
-            probe_expr,
+            build_expr: eq.right,
+            probe_expr: eq.left,
             expr_order: 0,
             distribution: JoinDistribution::Unknown,
         }];

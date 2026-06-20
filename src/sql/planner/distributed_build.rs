@@ -1230,16 +1230,17 @@ pub(crate) fn build_distributed_plan(plan: &PhysicalPlanNode) -> Result<Distribu
         _ => plan,
     };
 
-    let scalars = plan
+    let scalar_arena = plan
         .execution_props
         .scalar_arena
-        .as_deref()
+        .as_ref()
+        .cloned()
         .ok_or_else(|| {
             "PhysicalPlanNode missing scalar arena for distributed plan build".to_string()
         })?;
 
     let mut builder = DistributedPlanBuilder {
-        scalars,
+        scalars: scalar_arena.as_ref(),
         next_node_id: 1,
         next_tuple_id: 1,
         next_fragment_id: 0,
@@ -1272,6 +1273,7 @@ pub(crate) fn build_distributed_plan(plan: &PhysicalPlanNode) -> Result<Distribu
         fragments,
         root_fragment_id,
         edges: builder.edges,
+        scalar_arena,
     })
 }
 

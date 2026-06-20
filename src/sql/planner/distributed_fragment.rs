@@ -1,6 +1,8 @@
 use crate::sql::analysis::cte::CteId;
 use crate::sql::analysis::{OutputColumn, TypedExpr};
 use crate::sql::codegen::FragmentId;
+use crate::sql::optimizer::scalar::ScalarArena;
+use std::sync::Arc;
 
 use super::distributed_node::DistributedPlanNode;
 
@@ -70,4 +72,5 @@ pub(crate) struct DistributedPlan {
     pub fragments: Vec<PlanFragment>,
     pub root_fragment_id: FragmentId,
     pub edges: Vec<crate::sql::codegen::FragmentEdge>,
+    pub scalar_arena: Arc<ScalarArena>,
 }

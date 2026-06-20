@@ -5444,6 +5444,10 @@ path = "{metadata_path}"
             }
         }
 
+        let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
+        let mut rf = RuntimeFilterDesc::placeholder(&mut scalar_arena, 7);
+        rf.distribution = JoinDistribution::Shuffle;
+
         let plan = PhysicalPlanNode {
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
@@ -5456,13 +5460,10 @@ path = "{metadata_path}"
             output_columns: Vec::new(),
             execution_props: PlanExecutionProps {
                 join_distribution: Some(JoinExecutionDistribution::Partitioned),
+                scalar_arena: Some(std::sync::Arc::new(scalar_arena)),
                 ..PlanExecutionProps::default()
             },
-            build_runtime_filters: {
-                let mut rf = RuntimeFilterDesc::placeholder(7);
-                rf.distribution = JoinDistribution::Shuffle;
-                vec![rf]
-            },
+            build_runtime_filters: vec![rf],
             probe_runtime_filters: Vec::new(),
         };
 
