@@ -11,7 +11,7 @@
 //! `docs/design/specs/2026-05-21-g3-output-properties-visitor-design.md`
 //! §1 for the explanation.
 
-use super::cost::{CostOptions, estimate_distribution_cost_estimate};
+use super::cost::{CostOptions, estimate_distribution_cost_estimate, estimate_sort_cost_estimate};
 use super::memo::Cost;
 use super::operator::*;
 use super::property::*;
@@ -306,14 +306,7 @@ pub(crate) fn estimate_enforcer_cost_estimate(
 ) -> CostEstimate {
     match enforcer {
         EnforcerKind::Distribution(_) => estimate_distribution_cost_estimate(stats, options),
-        EnforcerKind::Sort(_) => {
-            let n = stats.safe_output_row_count();
-            CostEstimate {
-                cpu_cost: n * n.log2().max(1.0) * options.sort_cost_factor,
-                memory_cost: stats.compute_size(),
-                network_cost: 0.0,
-            }
-        }
+        EnforcerKind::Sort(_) => estimate_sort_cost_estimate(stats, options),
     }
 }
 
@@ -410,6 +403,44 @@ mod tests {
 
         assert!(estimate.memory_cost > 0.0);
         assert!(estimate.network_cost > 0.0);
+    }
+
+    #[test]
+    fn sort_enforcer_cost_estimate_saturates_huge_and_sanitizes_invalid_stats() {
+        let options = crate::sql::optimizer::cost::CostOptions::default();
+        let huge_stats = Statistics {
+            output_row_count: f64::MAX,
+            column_statistics: Default::default(),
+            ..Default::default()
+        };
+        let huge_estimate = estimate_enforcer_cost_estimate(
+            &EnforcerKind::Sort(OrderingSpec::Any),
+            &huge_stats,
+            &options,
+        );
+
+        assert!(huge_estimate.cpu_cost.is_finite());
+        assert!(huge_estimate.cpu_cost > 1.0e299);
+        assert!(huge_estimate.memory_cost.is_finite());
+        assert!(huge_estimate.memory_cost > 1.0e299);
+        assert_eq!(huge_estimate.network_cost, 0.0);
+
+        let invalid_stats = Statistics {
+            output_row_count: f64::NAN,
+            column_statistics: Default::default(),
+            ..Default::default()
+        };
+        let invalid_estimate = estimate_enforcer_cost_estimate(
+            &EnforcerKind::Sort(OrderingSpec::Any),
+            &invalid_stats,
+            &options,
+        );
+
+        assert!(invalid_estimate.cpu_cost.is_finite());
+        assert!(invalid_estimate.cpu_cost >= 0.0);
+        assert!(invalid_estimate.memory_cost.is_finite());
+        assert!(invalid_estimate.memory_cost >= 0.0);
+        assert_eq!(invalid_estimate.network_cost, 0.0);
     }
 
     #[test]

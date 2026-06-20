@@ -558,6 +558,18 @@ pub(crate) fn estimate_distribution_cost_estimate(
     }
 }
 
+pub(crate) fn estimate_sort_cost_estimate(
+    stats: &Statistics,
+    options: &CostOptions,
+) -> CostEstimate {
+    let rows = cost_row_count(stats);
+    CostEstimate {
+        cpu_cost: finite_non_negative_cost(rows * rows.log2().max(1.0) * options.sort_cost_factor),
+        memory_cost: safe_compute_size(stats),
+        network_cost: 0.0,
+    }
+}
+
 pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
     match input.op {
         Operator::PhysicalScan(_) => CostEstimate {
@@ -598,18 +610,14 @@ pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
             }
         }
         Operator::PhysicalSort(_) => {
-            let rows = input
+            let stats = input
                 .child_stats
                 .first()
-                .map(|stats| cost_row_count(stats))
-                .unwrap_or_else(|| cost_row_count(input.own_stats));
-            CostEstimate {
-                cpu_cost: finite_non_negative_cost(
-                    rows * rows.log2().max(1.0) * input.options.sort_cost_factor,
-                ),
-                memory_cost: safe_compute_size(input.own_stats),
-                network_cost: 0.0,
-            }
+                .copied()
+                .unwrap_or(input.own_stats);
+            let mut estimate = estimate_sort_cost_estimate(stats, input.options);
+            estimate.memory_cost = safe_compute_size(input.own_stats);
+            estimate
         }
         Operator::PhysicalTopN(topn) => {
             let input_rows = input
