@@ -459,6 +459,8 @@ fn estimate_hash_join_cost(input: &CostInput<'_>, join: &PhysicalHashJoinOp) -> 
     let build_rows = build_stats.map(cost_row_count).unwrap_or(1.0);
     let probe_size = probe_stats.map(safe_compute_size).unwrap_or(0.0);
     let build_size = build_stats.map(safe_compute_size).unwrap_or(0.0);
+    let output_size = safe_compute_size(input.own_stats);
+    let key_factor = (join.eq_conditions.len() as f64).max(1.0);
 
     let is_broadcast = match input.alt_kind {
         PropertyAlternativeKind::BroadcastJoin => true,
@@ -483,8 +485,9 @@ fn estimate_hash_join_cost(input: &CostInput<'_>, join: &PhysicalHashJoinOp) -> 
         },
     };
 
-    let mut cpu_cost =
-        finite_non_negative_cost((probe_rows + build_rows) * input.options.hash_cost_factor);
+    let mut cpu_cost = finite_non_negative_cost(
+        (probe_rows + build_rows) * key_factor * input.options.hash_cost_factor + output_size,
+    );
     let mut memory_cost = if is_broadcast {
         finite_non_negative_cost(build_size * input.options.backend_factor)
     } else if is_shuffle {
@@ -532,11 +535,16 @@ fn estimate_nested_loop_join_cost(input: &CostInput<'_>) -> CostEstimate {
         .get(1)
         .map(|stats| cost_row_count(stats))
         .unwrap_or(1.0);
+    let build_size = input
+        .child_stats
+        .get(1)
+        .map(|stats| safe_compute_size(stats))
+        .unwrap_or(0.0);
     CostEstimate {
         cpu_cost: finite_non_negative_cost(
             left_rows * right_rows * cost_row_width(input.own_stats) * NEST_LOOP_COST_PENALTY,
         ),
-        memory_cost: finite_non_negative_cost(safe_compute_size(input.own_stats) * 0.05),
+        memory_cost: finite_non_negative_cost(build_size),
         network_cost: 0.0,
     }
 }
@@ -873,6 +881,38 @@ mod tests {
         assert!(estimate.cpu_cost.is_finite() && estimate.cpu_cost >= 0.0);
         assert!(estimate.memory_cost.is_finite() && estimate.memory_cost >= 0.0);
         assert!(estimate.network_cost.is_finite() && estimate.network_cost >= 0.0);
+    }
+
+    fn test_eq_condition(
+        arena: &mut ScalarArena,
+        left_value: i64,
+        right_value: i64,
+    ) -> PhysicalHashJoinEqCondition {
+        let left = intern_typed(
+            arena,
+            &crate::sql::analysis::TypedExpr {
+                kind: crate::sql::analysis::ExprKind::Literal(
+                    crate::sql::analysis::LiteralValue::Int(left_value),
+                ),
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: false,
+            },
+        );
+        let right = intern_typed(
+            arena,
+            &crate::sql::analysis::TypedExpr {
+                kind: crate::sql::analysis::ExprKind::Literal(
+                    crate::sql::analysis::LiteralValue::Int(right_value),
+                ),
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: false,
+            },
+        );
+        PhysicalHashJoinEqCondition {
+            left,
+            right,
+            null_safe: false,
+        }
     }
 
     #[test]
@@ -1532,6 +1572,131 @@ mod tests {
     }
 
     #[test]
+    fn hash_join_cpu_increases_with_key_count() {
+        let probe = stats(10_000.0, 16.0);
+        let build = stats(5_000.0, 16.0);
+        let own = stats(1_000.0, 32.0);
+        let mut scalars = ScalarArena::new();
+        let first_key = test_eq_condition(&mut scalars, 1, 11);
+        let second_key = test_eq_condition(&mut scalars, 2, 12);
+        let third_key = test_eq_condition(&mut scalars, 3, 13);
+        let single_key = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![first_key.clone()],
+            other_condition: None,
+            distribution: JoinDistribution::Colocate,
+        });
+        let multi_key = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![first_key, second_key, third_key],
+            other_condition: None,
+            distribution: JoinDistribution::Colocate,
+        });
+        let options = CostOptions::default();
+        let required = PhysicalPropertySet::any();
+        let child_outputs = [PhysicalPropertySet::any(), PhysicalPropertySet::any()];
+
+        let single_input = CostInput {
+            op: &single_key,
+            own_stats: &own,
+            child_stats: &[&probe, &build],
+            child_outputs: &[&child_outputs[0], &child_outputs[1]],
+            required_output: &required,
+            alt_kind: &PropertyAlternativeKind::Default,
+            scalars: Some(&scalars),
+            options: &options,
+        };
+        let multi_input = CostInput {
+            op: &multi_key,
+            own_stats: &own,
+            child_stats: &[&probe, &build],
+            child_outputs: &[&child_outputs[0], &child_outputs[1]],
+            required_output: &required,
+            alt_kind: &PropertyAlternativeKind::Default,
+            scalars: Some(&scalars),
+            options: &options,
+        };
+
+        assert!(
+            compute_cost_estimate(&multi_input).cpu_cost
+                > compute_cost_estimate(&single_input).cpu_cost
+        );
+    }
+
+    #[test]
+    fn hash_join_cpu_includes_output_size() {
+        let probe = stats(10_000.0, 16.0);
+        let build = stats(5_000.0, 16.0);
+        let low_output = stats(10.0, 8.0);
+        let high_output = stats(100_000.0, 128.0);
+        let mut scalars = ScalarArena::new();
+        let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![test_eq_condition(&mut scalars, 1, 11)],
+            other_condition: None,
+            distribution: JoinDistribution::Colocate,
+        });
+        let options = CostOptions::default();
+        let required = PhysicalPropertySet::any();
+        let child_outputs = [PhysicalPropertySet::any(), PhysicalPropertySet::any()];
+
+        let low_input = CostInput {
+            op: &op,
+            own_stats: &low_output,
+            child_stats: &[&probe, &build],
+            child_outputs: &[&child_outputs[0], &child_outputs[1]],
+            required_output: &required,
+            alt_kind: &PropertyAlternativeKind::Default,
+            scalars: Some(&scalars),
+            options: &options,
+        };
+        let high_input = CostInput {
+            op: &op,
+            own_stats: &high_output,
+            child_stats: &[&probe, &build],
+            child_outputs: &[&child_outputs[0], &child_outputs[1]],
+            required_output: &required,
+            alt_kind: &PropertyAlternativeKind::Default,
+            scalars: Some(&scalars),
+            options: &options,
+        };
+
+        assert!(
+            compute_cost_estimate(&high_input).cpu_cost
+                > compute_cost_estimate(&low_input).cpu_cost
+        );
+    }
+
+    #[test]
+    fn nested_loop_join_memory_uses_build_side_size() {
+        let left = stats(10_000.0, 8.0);
+        let build = stats(50_000.0, 256.0);
+        let own = stats(1.0, 8.0);
+        let op = Operator::PhysicalNestLoopJoin(PhysicalNestLoopJoinOp {
+            join_type: JoinKind::Inner,
+            condition: None,
+        });
+        let options = CostOptions::default();
+        let required = PhysicalPropertySet::any();
+        let child_outputs = [PhysicalPropertySet::any(), PhysicalPropertySet::any()];
+        let input = CostInput {
+            op: &op,
+            own_stats: &own,
+            child_stats: &[&left, &build],
+            child_outputs: &[&child_outputs[0], &child_outputs[1]],
+            required_output: &required,
+            alt_kind: &PropertyAlternativeKind::Default,
+            scalars: None,
+            options: &options,
+        };
+
+        let estimate = compute_cost_estimate(&input);
+        let expected_memory = build.compute_size();
+        assert!((estimate.memory_cost - expected_memory).abs() <= f64::EPSILON);
+        assert!(estimate.memory_cost > own.compute_size() * 0.05);
+    }
+
+    #[test]
     fn cost_options_weights_drive_total_cost() {
         let options = CostOptions {
             cpu_weight: 1.0,
@@ -1712,7 +1877,10 @@ mod tests {
         };
         let estimate = compute_cost_estimate(&input);
         let expected = CostEstimate {
-            cpu_cost: cost_row_count(&probe) + cost_row_count(&build),
+            cpu_cost: finite_non_negative_cost(
+                (cost_row_count(&probe) + cost_row_count(&build)) * options.hash_cost_factor
+                    + safe_compute_size(&own),
+            ),
             memory_cost: build.compute_size() * options.backend_factor,
             network_cost: build.compute_size() * options.backend_factor,
         };
@@ -1773,10 +1941,13 @@ mod tests {
             options: &options,
         };
         let estimate = compute_cost_estimate(&input);
-        let base_cpu = cost_row_count(&probe) + cost_row_count(&build);
+        let base_cpu = finite_non_negative_cost(
+            (cost_row_count(&probe) + cost_row_count(&build)) * options.hash_cost_factor
+                + safe_compute_size(&own),
+        );
         let broadcast_fanout_size = build.compute_size() * options.backend_factor;
 
-        assert!((estimate.cpu_cost - base_cpu * 2.0).abs() < f64::EPSILON);
+        assert!((estimate.cpu_cost - base_cpu * NON_EQUI_JOIN_COST_PENALTY).abs() < f64::EPSILON);
         assert!((estimate.memory_cost - broadcast_fanout_size).abs() < f64::EPSILON);
         assert!((estimate.network_cost - broadcast_fanout_size).abs() < f64::EPSILON);
     }
