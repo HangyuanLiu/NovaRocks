@@ -266,11 +266,17 @@ pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
             memory_cost: 0.0,
             network_cost: 0.0,
         },
-        _ => CostEstimate {
-            cpu_cost: compute_cost(input.op, input.own_stats, input.child_stats),
-            memory_cost: 0.0,
-            network_cost: 0.0,
-        },
+        _ => {
+            let legacy_cost = compute_cost(input.op, input.own_stats, input.child_stats);
+            let cpu_weight = input.options.cpu_weight.max(f64::EPSILON);
+            CostEstimate {
+                // Generic fallback stores the legacy scalar total as CPU-equivalent
+                // cost until the operator gets a real dimensional kernel.
+                cpu_cost: legacy_cost / cpu_weight,
+                memory_cost: 0.0,
+                network_cost: 0.0,
+            }
+        }
     }
 }
 
@@ -426,9 +432,36 @@ mod tests {
         };
 
         let estimate = compute_cost_estimate(&input);
-        assert!(estimate.cpu_cost > 0.0);
+        assert_eq!(estimate.cpu_cost, s.compute_size());
         assert_eq!(estimate.memory_cost, 0.0);
         assert_eq!(estimate.network_cost, 0.0);
+    }
+
+    #[test]
+    fn fallback_cost_from_input_preserves_legacy_total() {
+        let s = stats(1000.0, 100.0);
+        let op = Operator::PhysicalValues(ValuesOp {
+            rows: vec![],
+            columns: vec![],
+        });
+        let child_stats: [&Statistics; 0] = [];
+        let child_outputs: [&PhysicalPropertySet; 0] = [];
+        let required = PhysicalPropertySet::any();
+        let options = CostOptions::default();
+        let input = CostInput {
+            op: &op,
+            own_stats: &s,
+            child_stats: &child_stats,
+            child_outputs: &child_outputs,
+            required_output: &required,
+            alt_kind: &PropertyAlternativeKind::Default,
+            scalars: None,
+            options: &options,
+        };
+
+        let estimate_total = compute_cost_from_input(&input);
+        let legacy_total = compute_cost(&op, &s, &[]);
+        assert!((estimate_total - legacy_total).abs() < f64::EPSILON);
     }
 
     #[test]
