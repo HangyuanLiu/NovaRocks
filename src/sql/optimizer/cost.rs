@@ -273,6 +273,21 @@ fn finite_non_negative_cost(value: f64) -> f64 {
     }
 }
 
+fn cost_row_count(stats: &Statistics) -> f64 {
+    let rows = stats.output_row_count;
+    if rows.is_finite() {
+        if rows > 0.0 {
+            finite_non_negative_cost(rows)
+        } else {
+            1.0
+        }
+    } else if rows.is_infinite() && rows.is_sign_positive() {
+        MAX_FINITE_COST
+    } else {
+        1.0
+    }
+}
+
 fn safe_compute_size(stats: &Statistics) -> f64 {
     let avg_row_size = stats.avg_row_size();
     let avg_row_size = if avg_row_size.is_finite() && avg_row_size > 0.0 {
@@ -280,7 +295,7 @@ fn safe_compute_size(stats: &Statistics) -> f64 {
     } else {
         8.0
     };
-    finite_non_negative_cost(stats.safe_output_row_count() * avg_row_size)
+    finite_non_negative_cost(cost_row_count(stats) * avg_row_size)
 }
 
 impl CostEstimate {
@@ -394,8 +409,8 @@ pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
             let input_rows = input
                 .child_stats
                 .first()
-                .map(|stats| stats.safe_output_row_count())
-                .unwrap_or_else(|| input.own_stats.safe_output_row_count());
+                .map(|stats| cost_row_count(stats))
+                .unwrap_or_else(|| cost_row_count(input.own_stats));
             let complexity = scalar_complexity(input.scalars, filter.predicate);
             CostEstimate {
                 cpu_cost: finite_non_negative_cost(
@@ -409,8 +424,8 @@ pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
             let input_rows = input
                 .child_stats
                 .first()
-                .map(|stats| stats.safe_output_row_count())
-                .unwrap_or_else(|| input.own_stats.safe_output_row_count());
+                .map(|stats| cost_row_count(stats))
+                .unwrap_or_else(|| cost_row_count(input.own_stats));
             let exprs: Vec<_> = project.items.iter().map(|item| item.expr).collect();
             CostEstimate {
                 cpu_cost: finite_non_negative_cost(
@@ -426,8 +441,8 @@ pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
             let rows = input
                 .child_stats
                 .first()
-                .map(|stats| stats.safe_output_row_count())
-                .unwrap_or_else(|| input.own_stats.safe_output_row_count());
+                .map(|stats| cost_row_count(stats))
+                .unwrap_or_else(|| cost_row_count(input.own_stats));
             CostEstimate {
                 cpu_cost: finite_non_negative_cost(
                     rows * rows.log2().max(1.0) * input.options.sort_cost_factor,
@@ -440,8 +455,8 @@ pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
             let input_rows = input
                 .child_stats
                 .first()
-                .map(|stats| stats.safe_output_row_count())
-                .unwrap_or_else(|| input.own_stats.safe_output_row_count());
+                .map(|stats| cost_row_count(stats))
+                .unwrap_or_else(|| cost_row_count(input.own_stats));
             let k = match (topn.limit, topn.offset) {
                 (Some(limit), Some(offset)) => {
                     ((limit as f64) + (offset as f64)).min(input_rows).max(1.0)
@@ -458,7 +473,7 @@ pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
             }
         }
         Operator::PhysicalLimit(_) | Operator::PhysicalAssertOneRow(_) => CostEstimate {
-            cpu_cost: finite_non_negative_cost(input.own_stats.safe_output_row_count() * 0.001),
+            cpu_cost: finite_non_negative_cost(cost_row_count(input.own_stats) * 0.001),
             memory_cost: 0.0,
             network_cost: 0.0,
         },
@@ -638,6 +653,17 @@ mod tests {
     }
 
     #[test]
+    fn cost_row_count_saturates_positive_infinity_and_preserves_invalid_fallback() {
+        assert_eq!(cost_row_count(&stats(42.0, 8.0)), 42.0);
+        assert_eq!(cost_row_count(&stats(f64::MAX, 8.0)), MAX_FINITE_COST);
+        assert_eq!(cost_row_count(&stats(f64::INFINITY, 8.0)), MAX_FINITE_COST);
+        assert_eq!(cost_row_count(&stats(0.0, 8.0)), 1.0);
+        assert_eq!(cost_row_count(&stats(-1.0, 8.0)), 1.0);
+        assert_eq!(cost_row_count(&stats(f64::NEG_INFINITY, 8.0)), 1.0);
+        assert_eq!(cost_row_count(&stats(f64::NAN, 8.0)), 1.0);
+    }
+
+    #[test]
     fn compute_cost_estimate_returns_dimensions_for_scan() {
         let s = stats(1000.0, 100.0);
         let op = scan_op();
@@ -810,6 +836,36 @@ mod tests {
     }
 
     #[test]
+    fn sort_cost_estimate_cpu_saturates_for_infinite_input_rows() {
+        let infinite_stats = stats(f64::INFINITY, 8.0);
+        let op = Operator::PhysicalSort(SortOp {
+            items: vec![],
+            analytic_partition_exprs: Vec::new(),
+            partition_limit: None,
+            topn_type: None,
+        });
+        let child_stats = [&infinite_stats];
+        let child_outputs = [PhysicalPropertySet::any()];
+        let child_output_refs = [&child_outputs[0]];
+        let required = PhysicalPropertySet::any();
+        let options = CostOptions::default();
+        let input = CostInput {
+            op: &op,
+            own_stats: &infinite_stats,
+            child_stats: &child_stats,
+            child_outputs: &child_output_refs,
+            required_output: &required,
+            alt_kind: &PropertyAlternativeKind::Default,
+            scalars: None,
+            options: &options,
+        };
+
+        let estimate = compute_cost_estimate(&input);
+        assert_finite_non_negative_dimensions(&estimate);
+        assert_eq!(estimate.cpu_cost, MAX_FINITE_COST);
+    }
+
+    #[test]
     fn scan_cost_estimate_dimensions_are_finite_for_overflow_size() {
         let overflow_stats = stats(f64::MAX, f64::MAX);
         let op = scan_op();
@@ -822,6 +878,62 @@ mod tests {
             own_stats: &overflow_stats,
             child_stats: &child_stats,
             child_outputs: &child_outputs,
+            required_output: &required,
+            alt_kind: &PropertyAlternativeKind::Default,
+            scalars: None,
+            options: &options,
+        };
+
+        let estimate = compute_cost_estimate(&input);
+        assert_finite_non_negative_dimensions(&estimate);
+        assert_eq!(estimate.cpu_cost, MAX_FINITE_COST);
+    }
+
+    #[test]
+    fn scan_cost_estimate_saturates_for_infinite_rows() {
+        let infinite_stats = stats(f64::INFINITY, 8.0);
+        let op = scan_op();
+        let child_stats: [&Statistics; 0] = [];
+        let child_outputs: [&PhysicalPropertySet; 0] = [];
+        let required = PhysicalPropertySet::any();
+        let options = CostOptions::default();
+        let input = CostInput {
+            op: &op,
+            own_stats: &infinite_stats,
+            child_stats: &child_stats,
+            child_outputs: &child_outputs,
+            required_output: &required,
+            alt_kind: &PropertyAlternativeKind::Default,
+            scalars: None,
+            options: &options,
+        };
+
+        let estimate = compute_cost_estimate(&input);
+        assert_finite_non_negative_dimensions(&estimate);
+        assert_eq!(estimate.cpu_cost, MAX_FINITE_COST);
+    }
+
+    #[test]
+    fn topn_cost_estimate_cpu_saturates_for_infinite_input_rows() {
+        let infinite_input_stats = stats(f64::INFINITY, 8.0);
+        let output_stats = stats(100.0, 8.0);
+        let op = Operator::PhysicalTopN(TopNOp {
+            items: vec![],
+            limit: None,
+            offset: None,
+            phase: TopNPhase::Final,
+            is_split: false,
+        });
+        let child_stats = [&infinite_input_stats];
+        let child_outputs = [PhysicalPropertySet::any()];
+        let child_output_refs = [&child_outputs[0]];
+        let required = PhysicalPropertySet::any();
+        let options = CostOptions::default();
+        let input = CostInput {
+            op: &op,
+            own_stats: &output_stats,
+            child_stats: &child_stats,
+            child_outputs: &child_output_refs,
             required_output: &required,
             alt_kind: &PropertyAlternativeKind::Default,
             scalars: None,
