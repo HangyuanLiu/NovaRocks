@@ -1075,20 +1075,28 @@ pub(crate) fn derive_group_statistics(
         // representative depends on ALL its members, so this skip is only sound
         // while every member appended to an already-derived group has a key
         // (source_confidence, promise) no greater than the current
-        // representative's. That holds today: the in-pipeline appends are
-        // join-reorder and join commutativity/associativity, which add
-        // logically-equivalent members with an EQUAL key (promise is
-        // in-group-constant; same source confidence), so re-deriving would
-        // reproduce the identical representative.
+        // representative's. That holds for every producer today:
+        //   - reorder / join commutativity / associativity append logically-
+        //     equivalent join members with an EQUAL key (promise is
+        //     in-group-constant for a fixed relation set; same source
+        //     confidence).
+        //   - MvRewrite appends an MV-backed member whose TOP operator is the
+        //     same SPJG shape (Project/Aggregate) as the incumbent; that top op
+        //     derives `Estimated` (the buried MV-scan `Exact` is capped away by
+        //     the Project/Aggregate derive), so its key also ties. The collapse
+        //     key reads the representative's (top-op) confidence, not a buried
+        //     child's, so a deeper Exact does not by itself raise the key.
+        // Hence the skip reproduces the identical representative today.
         //
-        // INVARIANT for a future producer that appends a STRICTLY-HIGHER-key
-        // member to an existing derived group (e.g. measured stats, or an
-        // MV-rewrite member backed by Exact catalog stats): it MUST eagerly
-        // re-derive that group by calling `derive_group_statistics_for` at
-        // append time. It MUST NOT set `logical_props = None`: `implement()`
-        // reads child-group `logical_props` for join-input column ids, and a
-        // `None` there silently degrades HashJoin to NestLoop (M1). Eager
-        // re-derive keeps `logical_props` Some and updates the representative.
+        // INVARIANT for a future producer that appends a member which RAISES the
+        // representative's key — i.e. lifts the top-op source confidence above
+        // the incumbent (e.g. `Measured` stats stamped at the representative, or
+        // runtime feedback): it MUST eagerly re-derive that group by calling
+        // `derive_group_statistics_for` at append time. It MUST NOT set
+        // `logical_props = None`: `implement()` reads child-group `logical_props`
+        // for join-input column ids, and a `None` there silently degrades
+        // HashJoin to NestLoop (M1). Eager re-derive keeps `logical_props` Some
+        // and updates the representative.
         if memo.groups[group_idx].logical_props.is_some() {
             continue;
         }

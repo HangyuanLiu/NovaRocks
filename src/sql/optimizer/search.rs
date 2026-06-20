@@ -293,9 +293,10 @@ impl SearchContext {
 // Statistics helper
 // ---------------------------------------------------------------------------
 
-/// Get statistics for a group.  Prefers the first logical expr's derived stats
-/// (which are stored in `logical_props`), falling back to deriving from the
-/// first physical expr.
+/// Get a group's collapsed statistic: the lexicographic-argmax representative's
+/// stats cached in `logical_props` (set by `derive_group_statistics`). If those
+/// are absent (defensive — should not happen post-derive), re-pick via
+/// `pick_group_representative`, the same collapse helper the derive path uses.
 fn stats_for_group(
     group: &super::memo::Group,
     memo: &Memo,
