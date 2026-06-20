@@ -5,7 +5,9 @@
 //! StarRocks conventions and the existing `optimizer/cost.rs` model.
 
 use super::memo::Cost;
-use super::operator::{AggMode, JoinDistribution, Operator};
+use super::operator::{
+    AggMode, JoinDistribution, Operator, PhysicalHashAggregateOp, PhysicalHashJoinOp,
+};
 use super::property::PhysicalPropertySet;
 use super::scalar::{ScalarArena, ScalarId, ScalarNode};
 use crate::sql::optimizer::derive::PropertyAlternativeKind;
@@ -443,6 +445,119 @@ fn scalar_list_complexity(arena: Option<&ScalarArena>, exprs: &[ScalarId]) -> f6
         .max(1.0)
 }
 
+fn estimate_hash_join_cost(input: &CostInput<'_>, join: &PhysicalHashJoinOp) -> CostEstimate {
+    let probe_stats = input.child_stats.first().copied();
+    let build_stats = input.child_stats.get(1).copied();
+    let probe_rows = probe_stats.map(cost_row_count).unwrap_or(1.0);
+    let build_rows = build_stats.map(cost_row_count).unwrap_or(1.0);
+    let probe_size = probe_stats.map(safe_compute_size).unwrap_or(0.0);
+    let build_size = build_stats.map(safe_compute_size).unwrap_or(0.0);
+
+    let is_broadcast = match input.alt_kind {
+        PropertyAlternativeKind::BroadcastJoin => true,
+        PropertyAlternativeKind::ShuffleJoin => false,
+        PropertyAlternativeKind::Default => match join.distribution {
+            JoinDistribution::Broadcast => true,
+            JoinDistribution::Shuffle | JoinDistribution::Colocate => false,
+            JoinDistribution::Unknown => {
+                panic!("unknown join distribution should be resolved before costing")
+            }
+        },
+    };
+    let is_shuffle = match input.alt_kind {
+        PropertyAlternativeKind::ShuffleJoin => true,
+        PropertyAlternativeKind::BroadcastJoin => false,
+        PropertyAlternativeKind::Default => match join.distribution {
+            JoinDistribution::Shuffle => true,
+            JoinDistribution::Broadcast | JoinDistribution::Colocate => false,
+            JoinDistribution::Unknown => {
+                panic!("unknown join distribution should be resolved before costing")
+            }
+        },
+    };
+
+    let mut cpu_cost =
+        finite_non_negative_cost((probe_rows + build_rows) * input.options.hash_cost_factor);
+    let mut memory_cost = if is_broadcast {
+        finite_non_negative_cost(build_size * input.options.backend_factor)
+    } else {
+        build_size
+    };
+    let network_cost = if is_broadcast {
+        finite_non_negative_cost(build_size * input.options.backend_factor)
+    } else if is_shuffle {
+        finite_non_negative_cost(probe_size + build_size)
+    } else {
+        0.0
+    };
+
+    if join.join_type == crate::sql::analysis::JoinKind::Cross {
+        cpu_cost = finite_non_negative_cost(cpu_cost * CROSS_JOIN_COST_PENALTY);
+        memory_cost = finite_non_negative_cost(memory_cost * CROSS_JOIN_COST_PENALTY);
+    }
+    if join.other_condition.is_some() {
+        cpu_cost = finite_non_negative_cost(cpu_cost * NON_EQUI_JOIN_COST_PENALTY);
+    }
+
+    CostEstimate {
+        cpu_cost,
+        memory_cost,
+        network_cost,
+    }
+}
+
+fn estimate_nested_loop_join_cost(input: &CostInput<'_>) -> CostEstimate {
+    let left_rows = input
+        .child_stats
+        .first()
+        .map(|stats| cost_row_count(stats))
+        .unwrap_or_else(|| cost_row_count(input.own_stats));
+    let right_rows = input
+        .child_stats
+        .get(1)
+        .map(|stats| cost_row_count(stats))
+        .unwrap_or(1.0);
+    CostEstimate {
+        cpu_cost: finite_non_negative_cost(
+            left_rows * right_rows * cost_row_width(input.own_stats) * NEST_LOOP_COST_PENALTY,
+        ),
+        memory_cost: finite_non_negative_cost(safe_compute_size(input.own_stats) * 0.05),
+        network_cost: 0.0,
+    }
+}
+
+fn estimate_aggregate_cost(input: &CostInput<'_>, agg: &PhysicalHashAggregateOp) -> CostEstimate {
+    let input_size = input
+        .child_stats
+        .first()
+        .map(|stats| safe_compute_size(stats))
+        .unwrap_or_else(|| safe_compute_size(input.own_stats));
+    let phase_factor = match agg.mode {
+        AggMode::Single => 1.0,
+        AggMode::Local => 0.5,
+        AggMode::Global | AggMode::DistinctGlobal | AggMode::DistinctLocal => 0.3,
+    };
+    CostEstimate {
+        cpu_cost: finite_non_negative_cost(
+            input_size * phase_factor * input.options.aggregate_cost_factor,
+        ),
+        memory_cost: safe_compute_size(input.own_stats),
+        network_cost: 0.0,
+    }
+}
+
+pub(crate) fn estimate_distribution_cost_estimate(
+    stats: &Statistics,
+    options: &CostOptions,
+) -> CostEstimate {
+    let size = safe_compute_size(stats);
+    CostEstimate {
+        cpu_cost: finite_non_negative_cost(options.exchange_startup_cost),
+        memory_cost: finite_non_negative_cost(size * 0.05),
+        network_cost: size,
+    }
+}
+
 pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
     match input.op {
         Operator::PhysicalScan(_) => CostEstimate {
@@ -522,6 +637,12 @@ pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
             memory_cost: 0.0,
             network_cost: 0.0,
         },
+        Operator::PhysicalHashJoin(join) => estimate_hash_join_cost(input, join),
+        Operator::PhysicalNestLoopJoin(_) => estimate_nested_loop_join_cost(input),
+        Operator::PhysicalHashAggregate(agg) => estimate_aggregate_cost(input, agg),
+        Operator::PhysicalDistribution(_) => {
+            estimate_distribution_cost_estimate(input.own_stats, input.options)
+        }
         _ => {
             // Keep the generic fallback independent from the public cost entrypoint.
             // Task 4 can then rebuild that entrypoint on CostInput without recursion.
@@ -635,14 +756,18 @@ pub(crate) fn compute_cost_with_properties(
     alt_kind: &PropertyAlternativeKind,
     options: &CostOptions,
 ) -> Cost {
-    compute_legacy_cost_with_properties(
+    let required_output = PhysicalPropertySet::any();
+    let input = CostInput {
         op,
         own_stats,
         child_stats,
         child_outputs,
+        required_output: &required_output,
         alt_kind,
+        scalars: None,
         options,
-    )
+    };
+    compute_cost_from_input(&input)
 }
 
 #[cfg(test)]
@@ -1213,28 +1338,23 @@ mod tests {
     }
 
     #[test]
-    fn fallback_cost_estimate_uses_legacy_property_helper() {
-        let probe = stats(100_000.0, 100.0);
-        let build = stats(10_000.0, 100.0);
-        let own = stats(100_000.0, 200.0);
-        let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
-            join_type: JoinKind::Inner,
-            eq_conditions: vec![],
-            other_condition: None,
-            distribution: JoinDistribution::Unknown,
+    fn fallback_cost_estimate_uses_legacy_property_helper_for_unmodeled_operator() {
+        let s = stats(1000.0, 100.0);
+        let op = Operator::PhysicalValues(ValuesOp {
+            rows: vec![],
+            columns: vec![],
         });
-        let child_stats = [&probe, &build];
-        let child_outputs = [PhysicalPropertySet::any(), PhysicalPropertySet::broadcast()];
-        let child_output_refs = [&child_outputs[0], &child_outputs[1]];
+        let child_stats: [&Statistics; 0] = [];
+        let child_outputs: [&PhysicalPropertySet; 0] = [];
         let required = PhysicalPropertySet::any();
         let options = CostOptions::default();
         let input = CostInput {
             op: &op,
-            own_stats: &own,
+            own_stats: &s,
             child_stats: &child_stats,
-            child_outputs: &child_output_refs,
+            child_outputs: &child_outputs,
             required_output: &required,
-            alt_kind: &PropertyAlternativeKind::BroadcastJoin,
+            alt_kind: &PropertyAlternativeKind::Default,
             scalars: None,
             options: &options,
         };
@@ -1242,13 +1362,72 @@ mod tests {
         let estimate_total = compute_cost_from_input(&input);
         let legacy_cost = compute_legacy_cost_with_properties(
             &op,
-            &own,
+            &s,
             &child_stats,
-            &child_output_refs,
-            &PropertyAlternativeKind::BroadcastJoin,
+            &child_outputs,
+            &PropertyAlternativeKind::Default,
             &options,
         );
         assert!((estimate_total - legacy_cost).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn broadcast_join_estimate_charges_backend_fanout() {
+        let probe = stats(1_000_000.0, 64.0);
+        let build = stats(10_000.0, 32.0);
+        let own = stats(100_000.0, 96.0);
+        let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![],
+            other_condition: None,
+            distribution: JoinDistribution::Unknown,
+        });
+        let options = CostOptions::default();
+        let required = PhysicalPropertySet::any();
+        let child_outputs = [PhysicalPropertySet::any(), PhysicalPropertySet::broadcast()];
+        let input = CostInput {
+            op: &op,
+            own_stats: &own,
+            child_stats: &[&probe, &build],
+            child_outputs: &[&child_outputs[0], &child_outputs[1]],
+            required_output: &required,
+            alt_kind: &PropertyAlternativeKind::BroadcastJoin,
+            scalars: None,
+            options: &options,
+        };
+
+        let estimate = compute_cost_estimate(&input);
+        assert!(estimate.memory_cost >= build.compute_size() * options.backend_factor);
+        assert!(estimate.network_cost >= build.compute_size() * options.backend_factor);
+    }
+
+    #[test]
+    fn shuffle_join_estimate_charges_both_sides_network() {
+        let probe = stats(1_000_000.0, 64.0);
+        let build = stats(1_000_000.0, 64.0);
+        let own = stats(100_000.0, 128.0);
+        let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![],
+            other_condition: None,
+            distribution: JoinDistribution::Unknown,
+        });
+        let options = CostOptions::default();
+        let required = PhysicalPropertySet::any();
+        let child_outputs = [PhysicalPropertySet::any(), PhysicalPropertySet::any()];
+        let input = CostInput {
+            op: &op,
+            own_stats: &own,
+            child_stats: &[&probe, &build],
+            child_outputs: &[&child_outputs[0], &child_outputs[1]],
+            required_output: &required,
+            alt_kind: &PropertyAlternativeKind::ShuffleJoin,
+            scalars: None,
+            options: &options,
+        };
+
+        let estimate = compute_cost_estimate(&input);
+        assert!(estimate.network_cost >= probe.compute_size() + build.compute_size());
     }
 
     #[test]
@@ -1411,19 +1590,39 @@ mod tests {
         let child_output_refs = [&child_outputs[0], &child_outputs[1]];
         let options = CostOptions::default();
 
-        let cost = compute_cost_with_properties(
-            &op,
-            &own,
-            &child_stats,
-            &child_output_refs,
-            &PropertyAlternativeKind::BroadcastJoin,
-            &options,
-        );
+        let required = PhysicalPropertySet::any();
+        let input = CostInput {
+            op: &op,
+            own_stats: &own,
+            child_stats: &child_stats,
+            child_outputs: &child_output_refs,
+            required_output: &required,
+            alt_kind: &PropertyAlternativeKind::BroadcastJoin,
+            scalars: None,
+            options: &options,
+        };
+        let estimate = compute_cost_estimate(&input);
+        let expected = CostEstimate {
+            cpu_cost: cost_row_count(&probe) + cost_row_count(&build),
+            memory_cost: build.compute_size() * options.backend_factor,
+            network_cost: build.compute_size() * options.backend_factor,
+        };
 
-        let expected = probe.compute_size()
-            + build.compute_size() * options.network_cost * options.backend_factor
-            + build.compute_size() * options.memory_cost_weight * options.backend_factor;
-        assert!((cost - expected).abs() < f64::EPSILON);
+        assert!((estimate.cpu_cost - expected.cpu_cost).abs() < f64::EPSILON);
+        assert!((estimate.memory_cost - expected.memory_cost).abs() < f64::EPSILON);
+        assert!((estimate.network_cost - expected.network_cost).abs() < f64::EPSILON);
+        assert!(
+            (compute_cost_with_properties(
+                &op,
+                &own,
+                &child_stats,
+                &child_output_refs,
+                &PropertyAlternativeKind::BroadcastJoin,
+                &options,
+            ) - expected.total_with_options(&options))
+            .abs()
+                < f64::EPSILON
+        );
     }
 
     #[test]
@@ -1453,19 +1652,24 @@ mod tests {
         let child_output_refs = [&child_outputs[0], &child_outputs[1]];
         let options = CostOptions::default();
 
-        let cost = compute_cost_with_properties(
-            &op,
-            &own,
-            &child_stats,
-            &child_output_refs,
-            &PropertyAlternativeKind::BroadcastJoin,
-            &options,
-        );
+        let required = PhysicalPropertySet::any();
+        let input = CostInput {
+            op: &op,
+            own_stats: &own,
+            child_stats: &child_stats,
+            child_outputs: &child_output_refs,
+            required_output: &required,
+            alt_kind: &PropertyAlternativeKind::BroadcastJoin,
+            scalars: Some(&scalars),
+            options: &options,
+        };
+        let estimate = compute_cost_estimate(&input);
+        let base_cpu = cost_row_count(&probe) + cost_row_count(&build);
+        let broadcast_fanout_size = build.compute_size() * options.backend_factor;
 
-        let base = probe.compute_size()
-            + build.compute_size() * options.network_cost * options.backend_factor
-            + build.compute_size() * options.memory_cost_weight * options.backend_factor;
-        assert!((cost - base * 2.0).abs() < f64::EPSILON);
+        assert!((estimate.cpu_cost - base_cpu * 2.0).abs() < f64::EPSILON);
+        assert!((estimate.memory_cost - broadcast_fanout_size).abs() < f64::EPSILON);
+        assert!((estimate.network_cost - broadcast_fanout_size).abs() < f64::EPSILON);
     }
 
     #[test]
