@@ -947,7 +947,7 @@ impl<'a> DistributedPlanBuilder<'a> {
             build_runtime_filters: node.build_runtime_filters.clone(),
             probe_runtime_filters: node.probe_runtime_filters.clone(),
             children: vec![],
-            stats: stats_for_physical_node(node),
+            stats: PlanNodeStats::from_statistics(&node.stats),
             kind: PlanNodeKind::Exchange(DistributedExchangeNode {
                 partition_type: partitions::TPartitionType::UNPARTITIONED,
                 partition_exprs: Vec::new(),
@@ -1347,14 +1347,15 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::build_distributed_plan;
+    use crate::sql::analysis::cte::CteId;
     use crate::sql::analysis::{
         BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, SortItem, TypedExpr,
     };
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{
-        AssertOneRowOp, FilterOp, LimitOp, Operator, PhysicalDistributionOp, ProjectOp, ScanOp,
-        SortOp, TopNOp, TopNPhase, UnionOp, WindowOp,
+        AssertOneRowOp, CTEAnchorOp, CTEConsumeOp, CTEProduceOp, FilterOp, LimitOp, Operator,
+        PhysicalDistributionOp, ProjectOp, ScanOp, SortOp, TopNOp, TopNPhase, UnionOp, WindowOp,
     };
     use crate::sql::optimizer::physical_plan::{
         PhysicalPlanNode, PlanExecutionProps, attach_scalar_arena,
@@ -1423,31 +1424,53 @@ mod tests {
 
     #[test]
     fn build_distributed_plan_folded_filter_preserves_scan_cost() {
-        let physical = filter_plan_with_row_count(scan_plan_with_row_count(100.0), 5.0);
+        let scan = scan_plan_with_row_count(100.0);
+        let expected_scan_cost = super::stats_for_physical_node(&scan)
+            .cost_estimate
+            .expect("scan cost");
+        let expected_filter_cost =
+            super::stats_for_physical_node(&filter_plan_with_row_count(scan.clone(), 5.0))
+                .cost_estimate
+                .expect("filter cost");
+        let physical = filter_plan_with_row_count(scan, 5.0);
         let dp = build_distributed_plan(&physical).expect("build_distributed_plan");
         let folded_scan = &dp.fragments[0].root;
+        let preserved_cost = folded_scan
+            .stats
+            .cost_estimate
+            .as_ref()
+            .expect("folded scan cost");
 
         assert!(matches!(folded_scan.kind, PlanNodeKind::Scan(_)));
         assert_eq!(folded_scan.stats.output_row_count, 5.0);
-        assert!(
-            folded_scan.stats.cost_estimate.is_some(),
-            "folded filter should preserve the scan self-cost"
-        );
+        assert_eq!(preserved_cost.cpu_cost, expected_scan_cost.cpu_cost);
+        assert_ne!(preserved_cost.cpu_cost, expected_filter_cost.cpu_cost);
     }
 
     #[test]
     fn build_distributed_plan_fused_limit_preserves_child_cost() {
-        let physical = limit_plan(scan_plan_with_row_count(100.0), Some(7), None, 7.0);
+        let scan = scan_plan_with_row_count(100.0);
+        let expected_scan_cost = super::stats_for_physical_node(&scan)
+            .cost_estimate
+            .expect("scan cost");
+        let expected_limit_cost =
+            super::stats_for_physical_node(&limit_plan(scan.clone(), Some(7), None, 7.0))
+                .cost_estimate
+                .expect("limit cost");
+        let physical = limit_plan(scan, Some(7), None, 7.0);
         let dp = build_distributed_plan(&physical).expect("build_distributed_plan");
         let root = &dp.fragments[0].root;
+        let preserved_cost = root
+            .stats
+            .cost_estimate
+            .as_ref()
+            .expect("fused limit child cost");
 
         assert!(matches!(root.kind, PlanNodeKind::Scan(_)));
         assert_eq!(root.limit, 7);
         assert_eq!(root.stats.output_row_count, 7.0);
-        assert!(
-            root.stats.cost_estimate.is_some(),
-            "fused limit should preserve the displayed child self-cost"
-        );
+        assert_eq!(preserved_cost.cpu_cost, expected_scan_cost.cpu_cost);
+        assert_ne!(preserved_cost.cpu_cost, expected_limit_cost.cpu_cost);
     }
 
     #[test]
@@ -1513,6 +1536,20 @@ mod tests {
         assert!(
             root.stats.cost_estimate.is_none(),
             "synthetic distinct aggregate should not display PhysicalUnion cost"
+        );
+    }
+
+    #[test]
+    fn build_distributed_plan_cte_multicast_exchange_has_no_consume_cost() {
+        let physical = cte_anchor_plan(scan_plan_with_row_count(10.0), cte_consume_plan(1));
+        let dp = build_distributed_plan(&physical).expect("build_distributed_plan");
+        let exchange = find_plan_exchange_node(&dp, |flavor| {
+            matches!(flavor, ExchangeFlavor::CteMulticast { .. })
+        });
+
+        assert!(
+            exchange.stats.cost_estimate.is_none(),
+            "synthetic CTE multicast exchange should not display PhysicalCTEConsume cost"
         );
     }
 
@@ -1702,6 +1739,45 @@ mod tests {
                 child_output_columns,
             }),
             children,
+            output_columns,
+        )
+    }
+
+    fn cte_anchor_plan(
+        produce_child: PhysicalPlanNode,
+        consume: PhysicalPlanNode,
+    ) -> PhysicalPlanNode {
+        let output_columns = consume.output_columns.clone();
+        physical_node(
+            Operator::PhysicalCTEAnchor(CTEAnchorOp { cte_id: 1 }),
+            vec![cte_produce_plan(1, produce_child), consume],
+            output_columns,
+        )
+    }
+
+    fn cte_produce_plan(cte_id: CteId, child: PhysicalPlanNode) -> PhysicalPlanNode {
+        let output_columns = child.output_columns.clone();
+        physical_node(
+            Operator::PhysicalCTEProduce(CTEProduceOp {
+                cte_id,
+                output_columns: output_columns.clone(),
+            }),
+            vec![child],
+            output_columns,
+        )
+    }
+
+    fn cte_consume_plan(cte_id: CteId) -> PhysicalPlanNode {
+        let k = output_col(1, "k", DataType::Int64, false);
+        let v = output_col(2, "v", DataType::Int64, true);
+        let output_columns = vec![k, v];
+        physical_node(
+            Operator::PhysicalCTEConsume(CTEConsumeOp {
+                cte_id,
+                alias: "cte_t".to_string(),
+                output_columns: output_columns.clone(),
+            }),
+            vec![],
             output_columns,
         )
     }

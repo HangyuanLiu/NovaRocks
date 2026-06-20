@@ -984,7 +984,7 @@ fn format_column_stats_costs(stats: &PlanNodeStats) -> String {
         .map(|column_id| {
             let c = &stats.column_statistics[&column_id];
             let ndv = if c.distinct_values_count.is_finite() {
-                (c.distinct_values_count.round() as i64).to_string()
+                fmt_f64(c.distinct_values_count.round())
             } else {
                 "?".to_string()
             };
@@ -1454,6 +1454,33 @@ mod tests {
         assert!(
             costs.contains("colstats={col#1[min=0 max=1000 ndv=1000 null_frac=0]}"),
             "Costs must render colstats copied into PlanNodeStats:\n{costs}"
+        );
+    }
+
+    #[test]
+    fn costs_colstats_ndv_uses_scientific_not_i64_saturation_for_huge_values() {
+        let mut scan = scan_plan();
+        scan.stats.column_statistics.insert(
+            ColumnId::new_for_test(1),
+            ColumnStatistic {
+                min_value: 0.0,
+                max_value: 1.0e300,
+                nulls_fraction: 0.0,
+                average_row_size: 8.0,
+                distinct_values_count: 1.0e300,
+                ..Default::default()
+            },
+        );
+        let dp = build_distributed_plan(&scan).expect("build DistributedPlan");
+
+        let costs = explain_distributed_plan(&dp, ExplainLevel::Costs).join("\n");
+        assert!(
+            costs.contains("ndv=1.0000e300"),
+            "huge NDV should use scientific notation:\n{costs}"
+        );
+        assert!(
+            !costs.contains("9223372036854775807"),
+            "huge NDV must not saturate through i64 formatting:\n{costs}"
         );
     }
 
