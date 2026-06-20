@@ -7,8 +7,9 @@
 use super::memo::Cost;
 use super::operator::{AggMode, JoinDistribution, Operator};
 use super::property::PhysicalPropertySet;
+use super::scalar::ScalarArena;
 use crate::sql::optimizer::derive::PropertyAlternativeKind;
-use crate::sql::optimizer::statistics::Statistics;
+use crate::sql::optimizer::statistics::{CostEstimate, Statistics};
 
 /// Network transfer multiplier applied to data that crosses node boundaries.
 /// Single source of truth: `derive` imports this constant.
@@ -30,6 +31,17 @@ const NON_EQUI_JOIN_COST_PENALTY: f64 = 2.0;
 /// Penalty multiplier for nest-loop join execution cost.
 /// NLJ is O(N*M) and should be heavily penalized relative to hash join.
 const NEST_LOOP_COST_PENALTY: f64 = 100.0;
+
+pub(crate) struct CostInput<'a> {
+    pub op: &'a Operator,
+    pub own_stats: &'a Statistics,
+    pub child_stats: &'a [&'a Statistics],
+    pub child_outputs: &'a [&'a PhysicalPropertySet],
+    pub required_output: &'a PhysicalPropertySet,
+    pub alt_kind: &'a PropertyAlternativeKind,
+    pub scalars: Option<&'a ScalarArena>,
+    pub options: &'a CostOptions,
+}
 
 /// Estimate the self-cost of a single operator.
 ///
@@ -192,6 +204,9 @@ pub(crate) fn compute_cost(
 
 #[derive(Clone, Debug)]
 pub(crate) struct CostOptions {
+    pub cpu_weight: f64,
+    pub memory_weight: f64,
+    pub network_weight: f64,
     pub backend_factor: f64,
     pub broadcast_row_limit: f64,
     pub broadcast_byte_limit: f64,
@@ -199,11 +214,22 @@ pub(crate) struct CostOptions {
     pub fallback_broadcast_row_limit: f64,
     pub network_cost: f64,
     pub memory_cost_weight: f64,
+    pub predicate_cost_factor: f64,
+    pub projection_cost_factor: f64,
+    pub hash_cost_factor: f64,
+    pub sort_cost_factor: f64,
+    pub topn_cost_factor: f64,
+    pub aggregate_cost_factor: f64,
+    pub exchange_startup_cost: f64,
+    pub fallback_cpu_factor: f64,
 }
 
 impl Default for CostOptions {
     fn default() -> Self {
         Self {
+            cpu_weight: 0.5,
+            memory_weight: 2.0,
+            network_weight: 1.5,
             backend_factor: 3.0,
             broadcast_row_limit: 15_000_000.0,
             broadcast_byte_limit: 512.0 * 1024.0 * 1024.0,
@@ -211,8 +237,45 @@ impl Default for CostOptions {
             fallback_broadcast_row_limit: 500_000.0,
             network_cost: NETWORK_COST,
             memory_cost_weight: 0.25,
+            predicate_cost_factor: 0.02,
+            projection_cost_factor: 0.01,
+            hash_cost_factor: 1.0,
+            sort_cost_factor: 1.0,
+            topn_cost_factor: 1.0,
+            aggregate_cost_factor: 1.0,
+            exchange_startup_cost: DISTRIBUTION_STARTUP_COST,
+            fallback_cpu_factor: 0.01,
         }
     }
+}
+
+impl CostEstimate {
+    pub(crate) fn total_with_options(&self, options: &CostOptions) -> Cost {
+        self.weighted_total(
+            options.cpu_weight,
+            options.memory_weight,
+            options.network_weight,
+        )
+    }
+}
+
+pub(crate) fn compute_cost_estimate(input: &CostInput<'_>) -> CostEstimate {
+    match input.op {
+        Operator::PhysicalScan(_) => CostEstimate {
+            cpu_cost: input.own_stats.compute_size(),
+            memory_cost: 0.0,
+            network_cost: 0.0,
+        },
+        _ => CostEstimate {
+            cpu_cost: compute_cost(input.op, input.own_stats, input.child_stats),
+            memory_cost: 0.0,
+            network_cost: 0.0,
+        },
+    }
+}
+
+pub(crate) fn compute_cost_from_input(input: &CostInput<'_>) -> Cost {
+    compute_cost_estimate(input).total_with_options(input.options)
 }
 
 pub(crate) fn broadcast_gate_passes(
@@ -296,8 +359,8 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::*;
     use crate::sql::optimizer::property::{DistributionSpec, OrderingSpec};
-    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
-    use crate::sql::optimizer::statistics::ColumnStatistic;
+    use crate::sql::optimizer::scalar::{intern_typed, ScalarArena};
+    use crate::sql::optimizer::statistics::{ColumnStatistic, CostEstimate};
     use crate::sql::planner::plan::*;
     use std::collections::HashMap;
 
@@ -319,6 +382,70 @@ mod tests {
             column_statistics: col,
             ..Default::default()
         }
+    }
+
+    fn scan_op() -> Operator {
+        Operator::PhysicalScan(ScanOp {
+            database: String::new(),
+            table: crate::sql::catalog::TableDef {
+                name: "t".into(),
+                columns: vec![],
+                iceberg_row_lineage_metadata_columns: vec![],
+                source: crate::sql::catalog::ScanSource::StarRocks {
+                    db_id: 0,
+                    table_id: 0,
+                },
+            },
+            alias: None,
+            columns: vec![],
+            predicates: vec![],
+            required_columns: None,
+            dict_columns: vec![],
+            variant_columns: vec![],
+            mv_rewritten_from: None,
+        })
+    }
+
+    #[test]
+    fn compute_cost_estimate_returns_dimensions_for_scan() {
+        let s = stats(1000.0, 100.0);
+        let op = scan_op();
+        let child_stats: [&Statistics; 0] = [];
+        let child_outputs: [&PhysicalPropertySet; 0] = [];
+        let required = PhysicalPropertySet::any();
+        let options = CostOptions::default();
+        let input = CostInput {
+            op: &op,
+            own_stats: &s,
+            child_stats: &child_stats,
+            child_outputs: &child_outputs,
+            required_output: &required,
+            alt_kind: &PropertyAlternativeKind::Default,
+            scalars: None,
+            options: &options,
+        };
+
+        let estimate = compute_cost_estimate(&input);
+        assert!(estimate.cpu_cost > 0.0);
+        assert_eq!(estimate.memory_cost, 0.0);
+        assert_eq!(estimate.network_cost, 0.0);
+    }
+
+    #[test]
+    fn cost_options_weights_drive_total_cost() {
+        let options = CostOptions {
+            cpu_weight: 1.0,
+            memory_weight: 10.0,
+            network_weight: 100.0,
+            ..Default::default()
+        };
+        let estimate = CostEstimate {
+            cpu_cost: 1.0,
+            memory_cost: 2.0,
+            network_cost: 3.0,
+        };
+
+        assert_eq!(estimate.total_with_options(&options), 321.0);
     }
 
     #[test]
