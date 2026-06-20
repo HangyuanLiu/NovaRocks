@@ -1,15 +1,15 @@
 //! Inner join equivalence predicate propagation.
 
-use crate::sql::analysis::{JoinKind, OutputColumn, TypedExpr};
+use crate::sql::analysis::{JoinKind, OutputColumn};
 use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::logical_props::{
-    collect_column_equalities, collect_literal_equalities, combine_with_and,
+    collect_column_equalities, collect_literal_equalities, combine_with_and, literal_signature,
     make_eq_literal_predicate,
 };
 use crate::sql::optimizer::memo::{GroupId, LogicalProperties, MExpr, Memo};
 use crate::sql::optimizer::operator::{FilterOp, LogicalJoinOp, Operator};
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
-use crate::sql::optimizer::scalar::{intern_typed, materialize};
+use crate::sql::optimizer::scalar::ScalarId;
 use std::collections::{HashMap, HashSet};
 
 pub(crate) struct InnerJoinEquivalencePredicateRule;
@@ -56,7 +56,7 @@ impl Rule for InnerJoinEquivalencePredicateRule {
             .into_iter()
             .chain(literal_equalities_from_group(memo, left_group))
             .chain(literal_equalities_from_group(memo, right_group))
-            .collect::<HashMap<ColumnId, TypedExpr>>();
+            .collect::<HashMap<ColumnId, ScalarId>>();
         expand_literals_with_equivalence(&left_props, &mut literal_by_column);
         expand_literals_with_equivalence(&right_props, &mut literal_by_column);
 
@@ -76,23 +76,26 @@ impl Rule for InnerJoinEquivalencePredicateRule {
                     right_group,
                     &join_literals,
                     right_id,
-                    &literal,
+                    literal,
                 ) {
                     if let Some(column) = right_columns.get(&right_id) {
-                        right_new.push(make_eq_literal_predicate(column, literal));
+                        right_new.push(make_eq_literal_predicate(
+                            &mut memo.scalars,
+                            column,
+                            literal,
+                        ));
                     }
                 }
             }
             if let Some(literal) = literal_by_column.get(&right_id).cloned() {
-                if !has_literal_equality_in_side(
-                    memo,
-                    left_group,
-                    &join_literals,
-                    left_id,
-                    &literal,
-                ) {
+                if !has_literal_equality_in_side(memo, left_group, &join_literals, left_id, literal)
+                {
                     if let Some(column) = left_columns.get(&left_id) {
-                        left_new.push(make_eq_literal_predicate(column, literal));
+                        left_new.push(make_eq_literal_predicate(
+                            &mut memo.scalars,
+                            column,
+                            literal,
+                        ));
                     }
                 }
             }
@@ -130,16 +133,16 @@ fn columns_by_id(columns: &[OutputColumn]) -> HashMap<ColumnId, OutputColumn> {
 
 fn expand_literals_with_equivalence(
     props: &LogicalProperties,
-    literal_by_column: &mut HashMap<ColumnId, TypedExpr>,
+    literal_by_column: &mut HashMap<ColumnId, ScalarId>,
 ) {
     let mut additions = Vec::new();
     for class in props.equivalence_classes.classes() {
         let literal = class
             .iter()
-            .find_map(|column_id| literal_by_column.get(&column_id).cloned());
+            .find_map(|column_id| literal_by_column.get(&column_id).copied());
         if let Some(literal) = literal {
             for column_id in class.iter() {
-                additions.push((column_id, literal.clone()));
+                additions.push((column_id, literal));
             }
         }
     }
@@ -151,15 +154,16 @@ fn expand_literals_with_equivalence(
 fn join_column_pairs(memo: &Memo, join: &LogicalJoinOp) -> Vec<(ColumnId, ColumnId)> {
     join.condition
         .as_ref()
-        .map(|condition| collect_column_equalities(&materialize(&memo.scalars, *condition)))
+        .map(|condition| collect_column_equalities(&memo.scalars, *condition))
         .unwrap_or_default()
 }
 
-fn literal_equalities_from_join(memo: &Memo, join: &LogicalJoinOp) -> Vec<(ColumnId, TypedExpr)> {
+fn literal_equalities_from_join(memo: &Memo, join: &LogicalJoinOp) -> Vec<(ColumnId, ScalarId)> {
     join.condition
         .as_ref()
-        .map(|condition| {
-            collect_literal_equalities(&materialize(&memo.scalars, *condition))
+        .map(|condition| collect_literal_equalities(&memo.scalars, *condition))
+        .map(|equalities| {
+            equalities
                 .into_iter()
                 .map(|eq| (eq.column_id, eq.literal))
                 .collect()
@@ -167,7 +171,7 @@ fn literal_equalities_from_join(memo: &Memo, join: &LogicalJoinOp) -> Vec<(Colum
         .unwrap_or_default()
 }
 
-fn literal_equalities_from_group(memo: &Memo, group_id: GroupId) -> Vec<(ColumnId, TypedExpr)> {
+fn literal_equalities_from_group(memo: &Memo, group_id: GroupId) -> Vec<(ColumnId, ScalarId)> {
     let mut visited = HashSet::new();
     literal_equalities_from_group_inner(memo, group_id, &mut visited)
 }
@@ -176,7 +180,7 @@ fn literal_equalities_from_group_inner(
     memo: &Memo,
     group_id: GroupId,
     visited: &mut HashSet<GroupId>,
-) -> Vec<(ColumnId, TypedExpr)> {
+) -> Vec<(ColumnId, ScalarId)> {
     if !visited.insert(group_id) {
         return Vec::new();
     }
@@ -187,9 +191,8 @@ fn literal_equalities_from_group_inner(
     for expr in &group.logical_exprs {
         match &expr.op {
             Operator::LogicalFilter(filter) => {
-                let predicate = materialize(&memo.scalars, filter.predicate);
                 out.extend(
-                    collect_literal_equalities(&predicate)
+                    collect_literal_equalities(&memo.scalars, filter.predicate)
                         .into_iter()
                         .map(|eq| (eq.column_id, eq.literal)),
                 );
@@ -199,9 +202,8 @@ fn literal_equalities_from_group_inner(
             }
             Operator::LogicalScan(scan) => {
                 for predicate in &scan.predicates {
-                    let predicate = materialize(&memo.scalars, *predicate);
                     out.extend(
-                        collect_literal_equalities(&predicate)
+                        collect_literal_equalities(&memo.scalars, *predicate)
                             .into_iter()
                             .map(|eq| (eq.column_id, eq.literal)),
                     );
@@ -211,9 +213,8 @@ fn literal_equalities_from_group_inner(
                 if matches!(join.join_type, JoinKind::Inner | JoinKind::Cross) =>
             {
                 if let Some(condition) = &join.condition {
-                    let condition = materialize(&memo.scalars, *condition);
                     out.extend(
-                        collect_literal_equalities(&condition)
+                        collect_literal_equalities(&memo.scalars, *condition)
                             .into_iter()
                             .map(|eq| (eq.column_id, eq.literal)),
                     );
@@ -246,15 +247,16 @@ fn orient_pair(
 fn has_literal_equality_in_side(
     memo: &Memo,
     group_id: GroupId,
-    join_literals: &[(ColumnId, TypedExpr)],
+    join_literals: &[(ColumnId, ScalarId)],
     column_id: ColumnId,
-    literal: &TypedExpr,
+    literal: ScalarId,
 ) -> bool {
-    let signature = literal_signature(literal);
+    let signature = literal_signature(&memo.scalars, literal);
     if join_literals
         .iter()
         .any(|(existing_column, existing_literal)| {
-            *existing_column == column_id && literal_signature(existing_literal) == signature
+            *existing_column == column_id
+                && literal_signature(&memo.scalars, *existing_literal) == signature
         })
     {
         return true;
@@ -270,18 +272,13 @@ fn has_literal_equality_in_side(
                 || props
                     .and_then(|props| props.equivalence_classes.class_containing(column_id))
                     .is_some_and(|class| class.contains(existing_column));
-            same_or_equivalent && literal_signature(&existing_literal) == signature
+            same_or_equivalent && literal_signature(&memo.scalars, existing_literal) == signature
         })
 }
 
-fn literal_signature(expr: &TypedExpr) -> String {
-    format!("{:?}:{:?}", expr.data_type, expr.kind)
-}
-
-fn add_filter_group(memo: &mut Memo, child_group: GroupId, predicates: Vec<TypedExpr>) -> GroupId {
-    let predicate =
-        combine_with_and(predicates).expect("filter group needs at least one predicate");
-    let predicate = intern_typed(&mut memo.scalars, &predicate);
+fn add_filter_group(memo: &mut Memo, child_group: GroupId, predicates: Vec<ScalarId>) -> GroupId {
+    let predicate = combine_with_and(&mut memo.scalars, predicates)
+        .expect("filter group needs at least one predicate");
     let filter_expr = MExpr {
         id: memo.next_expr_id(),
         op: Operator::LogicalFilter(FilterOp { predicate }),
@@ -308,10 +305,10 @@ fn add_filter_group(memo: &mut Memo, child_group: GroupId, predicates: Vec<Typed
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::{BinOp, ExprKind, LiteralValue};
+    use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::optimizer::operator::ScanOp;
-    use crate::sql::optimizer::scalar::{ScalarId, intern_typed, materialize};
+    use crate::sql::optimizer::scalar::{ScalarId, intern_typed};
     use arrow::datatypes::DataType;
 
     fn output(id: u32, name: &str) -> OutputColumn {
@@ -448,7 +445,7 @@ mod tests {
             children: vec![left, right],
         });
         let mut props = LogicalProperties::new(outputs, 10.0);
-        for (left, right) in collect_column_equalities(&condition) {
+        for (left, right) in collect_column_equalities(&memo.scalars, condition_id) {
             props.equivalence_classes.merge_pair(left, right);
         }
         memo.groups[group].logical_props = Some(props);
@@ -478,8 +475,10 @@ mod tests {
                 _ => None,
             })
             .expect("right child filter");
-        let predicate = materialize(&memo.scalars, filter.predicate);
-        assert_eq!(collect_literal_equalities(&predicate).len(), 1);
+        assert_eq!(
+            collect_literal_equalities(&memo.scalars, filter.predicate).len(),
+            1
+        );
     }
 
     #[test]
@@ -579,7 +578,7 @@ mod tests {
         memo.groups[child].logical_props = Some(child_props);
 
         // Call add_filter_group to synthesize a filter group above the scan.
-        let predicate = eq(col(1, "a"), lit(42));
+        let predicate = intern(&mut memo, &eq(col(1, "a"), lit(42)));
         let filter_group = add_filter_group(&mut memo, child, vec![predicate]);
 
         // The filter group's logical_props must carry the child's column stats.

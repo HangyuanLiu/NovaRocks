@@ -6,9 +6,9 @@ use super::memo::{GroupId, LogicalProperties, MExpr, Memo};
 use super::operator::Operator;
 use super::property::ColumnIdSet;
 use super::statistics::{ColumnStatistic, Confidence};
-use crate::sql::analysis::{BinOp, ExprKind, JoinKind, OutputColumn, TypedExpr};
+use crate::sql::analysis::{BinOp, JoinKind, OutputColumn};
 use crate::sql::column_id::ColumnId;
-use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
+use crate::sql::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNode};
 use arrow::datatypes::DataType;
 
 pub(crate) fn derive_for_group(
@@ -53,13 +53,13 @@ pub(crate) fn derive_for_expr(
     match &expr.op {
         Operator::LogicalFilter(filter) => {
             inherit_from_child(memo, expr, 0, &output_ids, &mut props);
-            for (left, right) in collect_column_equalities_scalar(&memo.scalars, filter.predicate) {
+            for (left, right) in collect_column_equalities(&memo.scalars, filter.predicate) {
                 props.equivalence_classes.merge_pair(left, right);
             }
         }
         Operator::PhysicalFilter(filter) => {
             inherit_from_child(memo, expr, 0, &output_ids, &mut props);
-            for (left, right) in collect_column_equalities_scalar(&memo.scalars, filter.predicate) {
+            for (left, right) in collect_column_equalities(&memo.scalars, filter.predicate) {
                 props.equivalence_classes.merge_pair(left, right);
             }
         }
@@ -68,8 +68,7 @@ pub(crate) fn derive_for_expr(
                 inherit_from_child(memo, expr, 0, &output_ids, &mut props);
                 inherit_from_child(memo, expr, 1, &output_ids, &mut props);
                 if let Some(condition) = &join.condition {
-                    for (left, right) in collect_column_equalities_scalar(&memo.scalars, *condition)
-                    {
+                    for (left, right) in collect_column_equalities(&memo.scalars, *condition) {
                         props.equivalence_classes.merge_pair(left, right);
                     }
                 }
@@ -89,8 +88,7 @@ pub(crate) fn derive_for_expr(
                     }
                 }
                 if let Some(condition) = &join.other_condition {
-                    for (left, right) in collect_column_equalities_scalar(&memo.scalars, *condition)
-                    {
+                    for (left, right) in collect_column_equalities(&memo.scalars, *condition) {
                         props.equivalence_classes.merge_pair(left, right);
                     }
                 }
@@ -176,7 +174,7 @@ fn output_id_set(output_columns: &[OutputColumn]) -> ColumnIdSet {
     ColumnIdSet::from_columns(output_columns.iter().map(|column| column.column_id))
 }
 
-fn column_id_from_scalar(scalars: &ScalarArena, expr: ScalarId) -> Option<ColumnId> {
+pub(crate) fn column_id_from_scalar(scalars: &ScalarArena, expr: ScalarId) -> Option<ColumnId> {
     match scalars.node(expr) {
         ScalarNode::ColumnRef(column_id) if *column_id != ColumnId::UNSET => Some(*column_id),
         ScalarNode::Nested(inner) => column_id_from_scalar(scalars, *inner),
@@ -184,29 +182,29 @@ fn column_id_from_scalar(scalars: &ScalarArena, expr: ScalarId) -> Option<Column
     }
 }
 
-fn collect_column_equalities_scalar(
+pub(crate) fn collect_column_equalities(
     scalars: &ScalarArena,
     expr: ScalarId,
 ) -> Vec<(ColumnId, ColumnId)> {
     let mut out = Vec::new();
-    collect_column_equalities_scalar_inner(scalars, expr, &mut out);
+    collect_column_equalities_inner(scalars, expr, &mut out);
     out
 }
 
-fn collect_column_equalities_scalar_inner(
+fn collect_column_equalities_inner(
     scalars: &ScalarArena,
     expr: ScalarId,
     out: &mut Vec<(ColumnId, ColumnId)>,
 ) {
     match scalars.node(expr) {
-        ScalarNode::Nested(inner) => collect_column_equalities_scalar_inner(scalars, *inner, out),
+        ScalarNode::Nested(inner) => collect_column_equalities_inner(scalars, *inner, out),
         ScalarNode::BinaryOp {
             left,
             op: BinOp::And,
             right,
         } => {
-            collect_column_equalities_scalar_inner(scalars, *left, out);
-            collect_column_equalities_scalar_inner(scalars, *right, out);
+            collect_column_equalities_inner(scalars, *left, out);
+            collect_column_equalities_inner(scalars, *right, out);
         }
         ScalarNode::BinaryOp {
             left,
@@ -224,88 +222,55 @@ fn collect_column_equalities_scalar_inner(
     }
 }
 
-pub(crate) fn column_id_from_expr(expr: &TypedExpr) -> Option<ColumnId> {
-    match &expr.kind {
-        ExprKind::ColumnRef { column_id, .. } if *column_id != ColumnId::UNSET => Some(*column_id),
-        ExprKind::Nested(inner) => column_id_from_expr(inner),
-        _ => None,
-    }
-}
-
-pub(crate) fn collect_column_equalities(expr: &TypedExpr) -> Vec<(ColumnId, ColumnId)> {
-    let mut out = Vec::new();
-    collect_column_equalities_inner(expr, &mut out);
-    out
-}
-
-fn collect_column_equalities_inner(expr: &TypedExpr, out: &mut Vec<(ColumnId, ColumnId)>) {
-    match &expr.kind {
-        ExprKind::Nested(inner) => collect_column_equalities_inner(inner, out),
-        ExprKind::BinaryOp {
-            left,
-            op: BinOp::And,
-            right,
-        } => {
-            collect_column_equalities_inner(left, out);
-            collect_column_equalities_inner(right, out);
-        }
-        ExprKind::BinaryOp {
-            left,
-            op: BinOp::Eq | BinOp::EqForNull,
-            right,
-        } => {
-            if let (Some(left_id), Some(right_id)) =
-                (column_id_from_expr(left), column_id_from_expr(right))
-            {
-                out.push((left_id, right_id));
-            }
-        }
-        _ => {}
-    }
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct LiteralEquality {
     pub(crate) column_id: ColumnId,
-    pub(crate) literal: TypedExpr,
+    pub(crate) literal: ScalarId,
 }
 
-pub(crate) fn collect_literal_equalities(expr: &TypedExpr) -> Vec<LiteralEquality> {
+pub(crate) fn collect_literal_equalities(
+    scalars: &ScalarArena,
+    expr: ScalarId,
+) -> Vec<LiteralEquality> {
     let mut out = Vec::new();
-    collect_literal_equalities_inner(expr, &mut out);
+    collect_literal_equalities_inner(scalars, expr, &mut out);
     out
 }
 
-fn collect_literal_equalities_inner(expr: &TypedExpr, out: &mut Vec<LiteralEquality>) {
-    match &expr.kind {
-        ExprKind::Nested(inner) => collect_literal_equalities_inner(inner, out),
-        ExprKind::BinaryOp {
+fn collect_literal_equalities_inner(
+    scalars: &ScalarArena,
+    expr: ScalarId,
+    out: &mut Vec<LiteralEquality>,
+) {
+    match scalars.node(expr) {
+        ScalarNode::Nested(inner) => collect_literal_equalities_inner(scalars, *inner, out),
+        ScalarNode::BinaryOp {
             left,
             op: BinOp::And,
             right,
         } => {
-            collect_literal_equalities_inner(left, out);
-            collect_literal_equalities_inner(right, out);
+            collect_literal_equalities_inner(scalars, *left, out);
+            collect_literal_equalities_inner(scalars, *right, out);
         }
-        ExprKind::BinaryOp {
+        ScalarNode::BinaryOp {
             left,
             op: BinOp::Eq,
             right,
-        } => match (&left.kind, &right.kind) {
-            (ExprKind::ColumnRef { column_id, .. }, ExprKind::Literal(_))
+        } => match (scalars.node(*left), scalars.node(*right)) {
+            (ScalarNode::ColumnRef(column_id), ScalarNode::Literal(_))
                 if *column_id != ColumnId::UNSET =>
             {
                 out.push(LiteralEquality {
                     column_id: *column_id,
-                    literal: right.as_ref().clone(),
+                    literal: *right,
                 });
             }
-            (ExprKind::Literal(_), ExprKind::ColumnRef { column_id, .. })
+            (ScalarNode::Literal(_), ScalarNode::ColumnRef(column_id))
                 if *column_id != ColumnId::UNSET =>
             {
                 out.push(LiteralEquality {
                     column_id: *column_id,
-                    literal: left.as_ref().clone(),
+                    literal: *left,
                 });
             }
             _ => {}
@@ -314,47 +279,87 @@ fn collect_literal_equalities_inner(expr: &TypedExpr, out: &mut Vec<LiteralEqual
     }
 }
 
-pub(crate) fn make_column_ref_expr(column: &OutputColumn) -> TypedExpr {
-    TypedExpr {
-        kind: ExprKind::ColumnRef {
-            column_id: column.column_id,
-            qualifier: None,
-            column: column.name.clone(),
-        },
-        data_type: column.data_type.clone(),
-        nullable: column.nullable,
-    }
+pub(crate) fn make_column_ref_expr(arena: &mut ScalarArena, column: &OutputColumn) -> ScalarId {
+    arena.remember_source_column_display(column.column_id, None, column.name.clone());
+    arena.intern(
+        ScalarNode::ColumnRef(column.column_id),
+        column.data_type.clone(),
+        column.nullable,
+    )
 }
 
-pub(crate) fn make_eq_literal_predicate(column: &OutputColumn, literal: TypedExpr) -> TypedExpr {
-    TypedExpr {
-        nullable: column.nullable || literal.nullable,
-        data_type: DataType::Boolean,
-        kind: ExprKind::BinaryOp {
-            left: Box::new(make_column_ref_expr(column)),
+pub(crate) fn make_eq_literal_predicate(
+    arena: &mut ScalarArena,
+    column: &OutputColumn,
+    literal: ScalarId,
+) -> ScalarId {
+    let left = make_column_ref_expr(arena, column);
+    arena.intern(
+        ScalarNode::BinaryOp {
+            left,
             op: BinOp::Eq,
-            right: Box::new(literal),
+            right: literal,
         },
+        DataType::Boolean,
+        column.nullable || arena.nullable(literal),
+    )
+}
+
+pub(crate) fn combine_with_and(
+    arena: &mut ScalarArena,
+    mut predicates: Vec<ScalarId>,
+) -> Option<ScalarId> {
+    let first = predicates.drain(..1).next()?;
+    Some(predicates.into_iter().fold(first, |left, right| {
+        arena.intern(
+            ScalarNode::BinaryOp {
+                left,
+                op: BinOp::And,
+                right,
+            },
+            DataType::Boolean,
+            arena.nullable(left) || arena.nullable(right),
+        )
+    }))
+}
+
+pub(crate) fn literal_signature(arena: &ScalarArena, literal: ScalarId) -> String {
+    match arena.node(literal) {
+        ScalarNode::Literal(HashableLiteral(value)) => {
+            format!("{:?}:{:?}", arena.data_type(literal), value)
+        }
+        other => format!("{:?}:{:?}", arena.data_type(literal), other),
     }
 }
 
-pub(crate) fn combine_with_and(mut predicates: Vec<TypedExpr>) -> Option<TypedExpr> {
-    let first = predicates.drain(..1).next()?;
-    Some(predicates.into_iter().fold(first, |left, right| TypedExpr {
-        nullable: left.nullable || right.nullable,
-        data_type: DataType::Boolean,
-        kind: ExprKind::BinaryOp {
-            left: Box::new(left),
-            op: BinOp::And,
-            right: Box::new(right),
-        },
-    }))
+#[cfg(test)]
+pub(crate) fn make_eq_literal_predicate_for_test(
+    arena: &mut ScalarArena,
+    column: &OutputColumn,
+    literal: crate::sql::analysis::TypedExpr,
+) -> crate::sql::analysis::TypedExpr {
+    let literal = crate::sql::optimizer::scalar::intern_typed(arena, &literal);
+    let predicate = make_eq_literal_predicate(arena, column, literal);
+    crate::sql::optimizer::scalar::materialize(arena, predicate)
+}
+
+#[cfg(test)]
+pub(crate) fn combine_with_and_for_test(
+    arena: &mut ScalarArena,
+    predicates: Vec<crate::sql::analysis::TypedExpr>,
+) -> Option<crate::sql::analysis::TypedExpr> {
+    let predicates = predicates
+        .iter()
+        .map(|predicate| crate::sql::optimizer::scalar::intern_typed(arena, predicate))
+        .collect();
+    combine_with_and(arena, predicates)
+        .map(|predicate| crate::sql::optimizer::scalar::materialize(arena, predicate))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::analysis::LiteralValue;
+    use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::optimizer::memo::MExpr;
     use crate::sql::optimizer::operator::{FilterOp, LogicalJoinOp, ScanOp};
@@ -445,11 +450,13 @@ mod tests {
     #[test]
     fn collect_column_equalities_reads_top_level_and() {
         let predicate = and(eq(col(1, "a"), col(2, "b")), eq(col(1, "a"), lit(10)));
+        let mut arena = ScalarArena::new();
+        let predicate = intern_typed(&mut arena, &predicate);
         assert_eq!(
-            collect_column_equalities(&predicate),
+            collect_column_equalities(&arena, predicate),
             vec![(ColumnId(1), ColumnId(2))]
         );
-        assert_eq!(collect_literal_equalities(&predicate).len(), 1);
+        assert_eq!(collect_literal_equalities(&arena, predicate).len(), 1);
     }
 
     #[test]
