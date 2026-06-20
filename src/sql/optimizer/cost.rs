@@ -487,6 +487,8 @@ fn estimate_hash_join_cost(input: &CostInput<'_>, join: &PhysicalHashJoinOp) -> 
         finite_non_negative_cost((probe_rows + build_rows) * input.options.hash_cost_factor);
     let mut memory_cost = if is_broadcast {
         finite_non_negative_cost(build_size * input.options.backend_factor)
+    } else if is_shuffle {
+        finite_non_negative_cost(build_size / input.options.backend_factor.max(1.0))
     } else {
         build_size
     };
@@ -1486,6 +1488,46 @@ mod tests {
         };
 
         let estimate = compute_cost_estimate(&input);
+        assert_eq!(estimate.network_cost, 0.0);
+    }
+
+    #[test]
+    fn shuffle_join_estimate_scales_memory_by_backend_factor() {
+        let probe = stats(1_000_000.0, 64.0);
+        let build = stats(10_000.0, 32.0);
+        let own = stats(100_000.0, 96.0);
+        let op = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![],
+            other_condition: None,
+            distribution: JoinDistribution::Unknown,
+        });
+        let options = CostOptions::default();
+        let required = PhysicalPropertySet::any();
+        let child_outputs = [
+            PhysicalPropertySet {
+                distribution: DistributionSpec::shuffle_join([ColumnId(1)]),
+                ordering: OrderingSpec::Any,
+            },
+            PhysicalPropertySet {
+                distribution: DistributionSpec::shuffle_join([ColumnId(2)]),
+                ordering: OrderingSpec::Any,
+            },
+        ];
+        let input = CostInput {
+            op: &op,
+            own_stats: &own,
+            child_stats: &[&probe, &build],
+            child_outputs: &[&child_outputs[0], &child_outputs[1]],
+            required_output: &required,
+            alt_kind: &PropertyAlternativeKind::ShuffleJoin,
+            scalars: None,
+            options: &options,
+        };
+
+        let estimate = compute_cost_estimate(&input);
+        let expected_memory = build.compute_size() / options.backend_factor.max(1.0);
+        assert!((estimate.memory_cost - expected_memory).abs() <= f64::EPSILON);
         assert_eq!(estimate.network_cost, 0.0);
     }
 
