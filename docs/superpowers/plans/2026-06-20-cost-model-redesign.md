@@ -12,15 +12,10 @@
 
 ## Scope And Dirty-Worktree Guard
 
-当前 worktree 已知存在未提交代码改动：
-
-- `src/sql/optimizer/cascades_rules/multi_join_reorder/algo.rs`
-- `src/sql/optimizer/cascades_rules/multi_join_reorder/flatten.rs`
-- `src/sql/optimizer/cascades_rules/multi_join_reorder/mod.rs`
-- `src/sql/optimizer/estimate/join_condition.rs`
-- `src/sql/optimizer/estimate/ndv.rs`
-- `src/sql/optimizer/estimate/selectivity.rs`
-- `src/sql/optimizer/stats.rs`
+本计划已在 `2026-06-20` rebase 到 `origin/main` 的
+`0ccb0597 refactor(optimizer): finish OptExpr memo entry bridge (#340)` 之后重新校准。
+该 main commit 已吸收此前 worktree 中未提交的 ScalarId-native optimizer 改动；计划开始执行时
+worktree 应为干净状态。
 
 执行任何任务前先运行：
 
@@ -28,7 +23,9 @@
 git status --short --branch
 ```
 
-Expected: 只看到上述既有 dirty 文件，或者看到执行者在前一个任务中刚提交后的干净状态。不要用 `git add .`。每次 commit 只 stage 本任务明确列出的文件。任务 8 会触碰已 dirty 的 `multi_join_reorder/algo.rs`，执行前必须先读该文件当前 diff；如果 diff 不是本轮任务生成的，先停止并报告，避免把用户改动混入提交。
+Expected: `## codex/cost-model-superpower-20260620` 且没有 dirty 文件。不要用 `git add .`。
+每次 commit 只 stage 本任务明确列出的文件。如果执行前出现非本轮任务产生的 dirty 文件，
+先停止并报告，避免把用户改动混入提交。
 
 ## File Structure
 
@@ -1417,7 +1414,9 @@ git status --short -- src/sql/optimizer/cascades_rules/multi_join_reorder/algo.r
 git diff -- src/sql/optimizer/cascades_rules/multi_join_reorder/algo.rs
 ```
 
-Expected: if the file is dirty before this task, stop and report the diff summary before editing. Do not stage or commit pre-existing changes with this task.
+Expected: no output from both commands. If the file is dirty before this task,
+stop and report the diff summary before editing. Do not stage or commit pre-existing
+changes with this task.
 
 - [ ] **Step 2: Add failing proxy-cost tests**
 
@@ -1499,16 +1498,14 @@ cargo test --lib greedy_produces_bushy_orders
 
 Expected: all pass.
 
-- [ ] **Step 6: Commit Task 8 if dirty-file guard allows it**
-
-If Step 1 showed a clean file before editing:
+- [ ] **Step 6: Commit Task 8**
 
 ```bash
 git add src/sql/optimizer/cascades_rules/multi_join_reorder/algo.rs
 git commit -m "refactor(optimizer): align join reorder proxy cost"
 ```
 
-If Step 1 showed pre-existing dirty changes, do not commit this file. Report the task output and ask whether to absorb the existing diff into this feature or split it first.
+Expected: commit includes only `src/sql/optimizer/cascades_rules/multi_join_reorder/algo.rs`.
 
 ## Task 9: Final Validation
 
