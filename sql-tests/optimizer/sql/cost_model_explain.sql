@@ -1,0 +1,23 @@
+-- @tags=optimizer,cost-model,explain
+-- Test Objective:
+-- Lock in dimensional CBO cost output for scan/filter, join, and TopN plans.
+-- The EXPLAIN COSTS statements are recorded directly in the golden result;
+-- do not use @explain_contains here because that directive reruns EXPLAIN VERBOSE.
+DROP TABLE IF EXISTS ${case_db}.cost_model_explain_t;
+CREATE TABLE ${case_db}.cost_model_explain_t (k INT, v INT);
+INSERT INTO ${case_db}.cost_model_explain_t
+    SELECT generate_series, generate_series * 10
+    FROM TABLE(generate_series(1, 1000));
+ANALYZE TABLE ${case_db}.cost_model_explain_t;
+
+EXPLAIN COSTS
+SELECT * FROM ${case_db}.cost_model_explain_t WHERE v > 10;
+
+EXPLAIN COSTS
+SELECT cost_model_explain_t.k, cost_model_explain_t.v, gs.generate_series AS rk
+FROM ${case_db}.cost_model_explain_t
+JOIN TABLE(generate_series(1, 100)) gs
+    ON cost_model_explain_t.k = gs.generate_series;
+
+EXPLAIN COSTS
+SELECT * FROM ${case_db}.cost_model_explain_t ORDER BY v DESC LIMIT 10;
