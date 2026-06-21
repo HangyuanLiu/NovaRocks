@@ -275,7 +275,7 @@ implementation 规则。Level 1（共享 payload、保留变体）是温和偏�
 > 2. **入口 Bridge 1 归位 planner**：目前 `optimize()` 仍收 `LogicalPlanNode`(内部做
 >    `logical_plan_to_opt_expr`)——TypedExpr 仍从入口进优化器。要彻底消失,需 planner 先做
 >    Bridge 1、`optimize()` 直接收 `OptExpr`/`LogicalOperator`(= 上面 A3 行所述"入口签名收口";
->    **`docs/superpowers/plans/2026-06-19-a3-optexpr-memo-cutover.md` 的 A3 实施 plan 暂缩到只去
+>    **`docs/design/plans/2026-06-19-a3-optexpr-memo-cutover.md` 的 A3 实施 plan 暂缩到只去
 >    post-rewrite 往返,未含此项**,故"入口签名收口"留作收尾)。
 > **注（重要,纠正早期误判）**：codegen/Bridge 2 的 `ScalarId→TypedExpr` materialize 是 **planner 侧**
 > (优化器→engine/codegen 边界),**不计入**本目标(G4 已认定其正当且永久)——所以"优化器内无
@@ -366,7 +366,7 @@ implementation 规则。Level 1（共享 payload、保留变体）是温和偏�
 
 ## 11. 执行交接
 
-下一步：写 **M3（Arc A）实施 plan** 到 `docs/superpowers/plans/2026-06-17-m3-rbo-on-operator.md`，
+下一步：写 **M3（Arc A）实施 plan** 到 `docs/design/plans/2026-06-17-m3-rbo-on-operator.md`，
 bite-sized TDD 步骤，按 sub-stage **A0→A4** 切分（A0 = Operator 同构化 Level 1，先行地基）；每步
 fmt/clippy/build/单测 + 必要 golden + plan 逐字节等价；用户经 codex 实施，我 review。Arc B 待 A 立稳
 或并行时另出 plan。

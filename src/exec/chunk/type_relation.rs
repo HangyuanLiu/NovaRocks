@@ -18,7 +18,7 @@
 //! The single recursive type relation for the execution layer.
 //!
 //! This is the keystone of the distributed-execution target architecture
-//! (pillar P1, see `docs/design/2026-06-12-distributed-execution-target-architecture.md`).
+//! (pillar P1, see `docs/design/specs/2026-06-12-distributed-execution-target-architecture.md`).
 //! It is the one place that answers "is column type `actual` relatable to the
 //! authoritative descriptor type `expected`?". It replaces the five hand-rolled
 //! copies of that predicate that drifted apart:

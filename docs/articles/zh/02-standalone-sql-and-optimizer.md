@@ -187,7 +187,7 @@ push_down_local_runtime_filters(&mut exec_plan.root, &exec_plan.arena);
 - **RBO 重写 + Cascades CBO 并存**。先用固定顺序的规则把计划改写到稳定形态，再交给 memo 做代价搜索。纯 Cascades 启动慢、规则爆炸难控，先 RBO 收一遍能显著缩小搜索空间；优化还带 `deadline`，避免在病态查询上跑飞。
 - **统计不准时宁可保守**。`NDV > 1.0` 守卫这种细节，体现了一个务实判断：在 managed-lake 这类常常没有统计的场景下，错误的乐观估计（把 join 估成笛卡尔积）比保守估计危害大得多。
 - **优化器要可调试**。`disable_optimizer_rules` 的会话级二分 + 分级 `EXPLAIN`（带 `stats={rows=N}` 与列统计），让优化器的行为可观测、可回归——这也为第 6 篇"把计划形状纳入正确性护栏"埋了伏笔。
-- **通用逻辑重写框架仍在渐进迁移**。`docs/design/2026-05-25-general-logical-rewrite-framework.md` 描述了一个统一重写框架的愿景；当前现实是新框架与旧 RBO 驱动并存——简单规则走新框架，复杂规则暂留旧路径。这是诚实的中间态，不是终态。
+- **通用逻辑重写框架仍在渐进迁移**。`docs/design/specs/2026-05-25-general-logical-rewrite-framework.md` 描述了一个统一重写框架的愿景；当前现实是新框架与旧 RBO 驱动并存——简单规则走新框架，复杂规则暂留旧路径。这是诚实的中间态，不是终态。
 
 ## 小结：下一站，把湖接进来
 

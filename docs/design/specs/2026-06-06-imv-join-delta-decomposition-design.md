@@ -11,7 +11,7 @@
   （rule 目录 per-structural-form：新结构形态 = +1 条可组合 rule）。
 - 承接 plan：[2026-06-05 IMV Phase 4](../plans/2026-06-05-imv-phase4-retire-incremental-mv-shape.md) 的
   "Known limitation"——`Aggregate(Filter(Join))` 不可刷新，本 spec 即兑现那条 follow-up。
-- 关联：`docs/design/2026-05-25-general-logical-rewrite-framework.md`（通用 rewrite 框架 + fixpoint 模型）。
+- 关联：`docs/design/specs/2026-05-25-general-logical-rewrite-framework.md`（通用 rewrite 框架 + fixpoint 模型）。
 
 ---
 

@@ -4,7 +4,7 @@
 
 **Goal:** Introduce the owned `DistributedPlanNode`/`PlanFragment` IR and a parallel `build_via_distributed_plan` path that lowers Scan/Filter/Project through a two-pass `build_distributed_plan` (structure) + `lower_distributed_plan` (binding), producing a `MultiFragmentBuildResult` provably equivalent to today's `PlanFragmentBuilder::build` for those operators.
 
-**Architecture:** Spec `docs/superpowers/specs/2026-06-15-plannode-ir-explain-observability-design.md`. This slice is the foundation of milestone **M0** (behavior-preserving IR introduction). It does **not** change the execution path: the engine keeps calling the old `build`; the new path runs only inside equivalence tests. Strategy = **extract-and-share**: each operator's lowering core moves out of `visit_*` into a `LoweringCtx` method that both the old builder and the new Pass-2 call, so Pass-2 behavior is identical by construction.
+**Architecture:** Spec `docs/design/specs/2026-06-15-plannode-ir-explain-observability-design.md`. This slice is the foundation of milestone **M0** (behavior-preserving IR introduction). It does **not** change the execution path: the engine keeps calling the old `build`; the new path runs only inside equivalence tests. Strategy = **extract-and-share**: each operator's lowering core moves out of `visit_*` into a `LoweringCtx` method that both the old builder and the new Pass-2 call, so Pass-2 behavior is identical by construction.
 
 **Tech Stack:** Rust, thrift 0.17 generated types (`plan_nodes::TPlanNode`, `descriptors::TDescriptorTable`, all derive `PartialEq`+`Debug`), `cargo test`.
 

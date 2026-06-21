@@ -6,7 +6,7 @@
 
 ## 1. 背景与问题
 
-`docs/design/2026-06-12-distributed-execution-target-architecture.md` 将 P6
+`docs/design/specs/2026-06-12-distributed-execution-target-architecture.md` 将 P6
 定义为 Iceberg 写元数据 descriptor 端到端，将 P7 定义为分布式 DML 写与写生命周期剩余。
 这两个支柱必须在同一个 PR 内按固定顺序完成：P6 先消除 writer report 的 lossy metadata
 carrier，P7 再把仍在 coordinator 本地执行的 DML/MV 写文件路径切到 distributed sink。

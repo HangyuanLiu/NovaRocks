@@ -63,6 +63,6 @@ git diff --check
 Then commit:
 
 ```bash
-git add src/engine/mv/iceberg_refresh.rs docs/superpowers/plans/2026-06-12-iceberg-mv-partition-p2c-union-branch-merge.md
+git add src/engine/mv/iceberg_refresh.rs docs/design/plans/2026-06-12-iceberg-mv-partition-p2c-union-branch-merge.md
 git commit -m "feat(mv): merge union branch affected partitions"
 ```

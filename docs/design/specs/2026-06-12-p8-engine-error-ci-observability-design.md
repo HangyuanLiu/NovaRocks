@@ -2,7 +2,7 @@
 
 日期：2026-06-12
 状态：Draft，等待评审
-来源：`docs/design/2026-06-12-distributed-execution-target-architecture.md` 的 P8
+来源：`docs/design/specs/2026-06-12-distributed-execution-target-architecture.md` 的 P8
 交付边界：一个大 PR 一次性完成完整 P8
 
 ## 1. 背景

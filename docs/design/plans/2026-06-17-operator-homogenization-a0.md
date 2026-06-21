@@ -325,7 +325,7 @@ gh pr create --repo NovaRocks/NovaRocks --base main --head HangyuanLiu:claude/op
 
 ## Execution Handoff
 
-**Plan complete and saved to `docs/superpowers/plans/2026-06-17-operator-homogenization-a0.md`. Two execution options:**
+**Plan complete and saved to `docs/design/plans/2026-06-17-operator-homogenization-a0.md`. Two execution options:**
 
 **1. Subagent-Driven (recommended)** — 每个 Task 派新 subagent，任务间 review，快速迭代。
 

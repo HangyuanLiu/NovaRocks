@@ -6,7 +6,7 @@
 
 **Why:** Today (after M0 #318/#322, M1 #328, M2 #330) EXPLAIN renders from the IR, but **execution still uses the legacy `PlanFragmentBuilder::build_with_mv_refresh_ctx`/`build_with_iceberg_sink`**, and the legacy `visit_*` visitor (~9k lines) still exists. Two builders are kept in lock-step by `equiv.rs`. And `explain_analyze_query` **forces single-fragment** (multi-fragment ANALYZE is rejected). This plan closes all of that.
 
-**Architecture:** Spec `docs/superpowers/specs/2026-06-15-plannode-ir-explain-observability-design.md` §2/§9 (M0-S6 cutover, M0-S7 direct-exec/mv passthrough, M0-S8 delete visitor) + §F multi-fragment ANALYZE. Strategy: **first make the IR builder cover everything the legacy builder does for execution** (direct-exec / mv-refresh / iceberg-sink), gated by the existing byte-identical `equiv.rs`; **then** flip the engine call sites and run the full SQL suites; **then** delete the legacy visitor; **then** thread profiling through the multi-fragment coordinator.
+**Architecture:** Spec `docs/design/specs/2026-06-15-plannode-ir-explain-observability-design.md` §2/§9 (M0-S6 cutover, M0-S7 direct-exec/mv passthrough, M0-S8 delete visitor) + §F multi-fragment ANALYZE. Strategy: **first make the IR builder cover everything the legacy builder does for execution** (direct-exec / mv-refresh / iceberg-sink), gated by the existing byte-identical `equiv.rs`; **then** flip the engine call sites and run the full SQL suites; **then** delete the legacy visitor; **then** thread profiling through the multi-fragment coordinator.
 
 **Tech Stack:** Rust, `cargo test`, `sql-tests` runner (`--mode verify`), live standalone server for the multi-fragment ANALYZE smoke.
 
