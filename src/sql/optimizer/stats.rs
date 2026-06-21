@@ -1070,13 +1070,33 @@ pub(crate) fn derive_group_statistics(
 ) {
     for group_idx in 0..memo.groups.len() {
         // Memoized derive: a group's logical_props are computed exactly once,
-        // when first needed (StarRocks isStatsDerived semantics). Safe because
-        // the memo is append-only — explore()/implement() only append new exprs
-        // and never rewrite an existing group's logical_exprs.first() in place,
-        // so re-deriving an already-computed group would reproduce the identical
-        // value. INVARIANT: any future rule that mutates an existing group's
-        // first logical expr in place MUST reset that group's logical_props to
-        // None, or this skip will serve stale statistics.
+        // when first needed (StarRocks isStatsDerived semantics). Under the
+        // per-group argmax collapse (`pick_group_representative`), a group's
+        // representative depends on ALL its members, so this skip is only sound
+        // while every member appended to an already-derived group has a key
+        // (source_confidence, promise) no greater than the current
+        // representative's. That holds for every producer today:
+        //   - reorder / join commutativity / associativity append logically-
+        //     equivalent join members with an EQUAL key (promise is
+        //     in-group-constant for a fixed relation set; same source
+        //     confidence).
+        //   - MvRewrite appends an MV-backed member whose TOP operator is the
+        //     same SPJG shape (Project/Aggregate) as the incumbent; that top op
+        //     derives `Estimated` (the buried MV-scan `Exact` is capped away by
+        //     the Project/Aggregate derive), so its key also ties. The collapse
+        //     key reads the representative's (top-op) confidence, not a buried
+        //     child's, so a deeper Exact does not by itself raise the key.
+        // Hence the skip reproduces the identical representative today.
+        //
+        // INVARIANT for a future producer that appends a member which RAISES the
+        // representative's key — i.e. lifts the top-op source confidence above
+        // the incumbent (e.g. `Measured` stats stamped at the representative, or
+        // runtime feedback): it MUST eagerly re-derive that group by calling
+        // `derive_group_statistics_for` at append time. It MUST NOT set
+        // `logical_props = None`: `implement()` reads child-group `logical_props`
+        // for join-input column ids, and a `None` there silently degrades
+        // HashJoin to NestLoop (M1). Eager re-derive keeps `logical_props` Some
+        // and updates the representative.
         if memo.groups[group_idx].logical_props.is_some() {
             continue;
         }
@@ -1091,40 +1111,144 @@ pub(crate) fn derive_group_statistics(
 /// newly-created join group immediately, before `implement()` runs — otherwise
 /// a bushy join's children have no column ids and `JoinToHashJoin` degrades the
 /// join to a NestLoop.
-/// Callers rely on the append-only memo invariant: if a rule ever rewrites an
-/// existing group's first expression in place, it must reset that group's
-/// `logical_props` to `None` so a later derive recomputes it.
+///
+/// Calling this function is also the **eager re-derive** mechanism: a producer
+/// that appends a strictly-higher-key member to an already-derived group MUST
+/// call this function directly at append time so the argmax is re-run against
+/// all members. The function always keeps `logical_props` `Some` (never goes to
+/// `None`), which preserves the M1 invariant that `implement()` relies on to
+/// read child-group column ids.
 pub(crate) fn derive_group_statistics_for(
     memo: &mut Memo,
     group_idx: usize,
     table_stats: &HashMap<String, TableStatistics>,
 ) {
-    // Derive stats from the first logical expression, else the first physical.
-    let stats = if let Some(first_expr) = memo.groups[group_idx].logical_exprs.first() {
-        let expr_clone = first_expr.clone();
-        derive_statistics(&expr_clone, memo, table_stats)
-    } else if let Some(first_expr) = memo.groups[group_idx].physical_exprs.first() {
-        let expr_clone = first_expr.clone();
-        derive_statistics(&expr_clone, memo, table_stats)
-    } else {
-        // Empty group: use defaults.
-        Statistics {
-            output_row_count: 1.0,
-            row_count_confidence: Confidence::Fallback,
-            column_statistics: HashMap::new(),
-        }
-    };
-
+    // Output columns are a group-level invariant: all members of a memo group
+    // are logically equivalent and expose the identical output columns, so
+    // picking them via `first()` here is consistent with the argmax-chosen
+    // member. The structural properties that DO vary by member shape
+    // (equivalence classes, unique columns) are derived from the chosen member
+    // inside `derive_for_expr` below.
     let output_columns = derive_output_columns(memo, group_idx);
 
-    memo.groups[group_idx].logical_props = Some(super::logical_props::derive_for_group(
-        memo,
-        group_idx,
-        output_columns,
-        stats.output_row_count,
-        stats.row_count_confidence,
-        stats.column_statistics,
-    ));
+    // Collapse the group to a single representative member by lexicographic
+    // confidence argmax, then derive BOTH statistics and structural properties
+    // from that SAME member (member-consistency). For a non-empty group we call
+    // `derive_for_expr` with the chosen member; `derive_for_group` would re-pick
+    // `first()` internally and break member-consistency when argmax selects a
+    // non-first member.
+    if let Some((chosen, stats)) = pick_group_representative(memo, group_idx, table_stats) {
+        memo.groups[group_idx].logical_props = Some(super::logical_props::derive_for_expr(
+            &chosen,
+            memo,
+            output_columns,
+            stats.output_row_count,
+            stats.row_count_confidence,
+            stats.column_statistics,
+        ));
+    } else {
+        // Empty group: keep today's behavior — default statistics plus
+        // `derive_for_group`, which handles the no-member case correctly.
+        memo.groups[group_idx].logical_props = Some(super::logical_props::derive_for_group(
+            memo,
+            group_idx,
+            output_columns,
+            1.0,
+            Confidence::Fallback,
+            HashMap::new(),
+        ));
+    }
+}
+
+/// Pick a group's representative member by lexicographic confidence argmax:
+/// key = (source_confidence, derive_promise); on tie prefer FFewerConj
+/// (inner-join only); on final tie keep the lowest index (canonical-first).
+/// Mirrors GPORCA PgexprBestPromise + FBetterPromise. Strict-greater
+/// replacement from the first member, so an all-equal group degenerates to
+/// `first()` (zero-regression baseline). Returns the chosen member (cloned)
+/// and its already-derived Statistics (reused, not recomputed). Returns None
+/// for an empty group.
+///
+/// Member order is `logical_exprs` then `physical_exprs`, so the lowest index
+/// is `logical_exprs[0]` — exactly today's pick
+/// (`logical_exprs.first().or(physical_exprs.first())`).
+///
+/// Note on the promise (derivability) axis: with the current `promise()`
+/// child-shape proxy, a join's promise is fixed by its arity (High over two
+/// base/leaf inputs, Medium once a child is itself a join). Every member of one
+/// memo group joins the same relation set, so all members share the same arity
+/// and therefore the same promise — the promise axis is in-group-CONSTANT today
+/// and never breaks a within-group tie. It is kept in the lexicographic key as
+/// framework: it gains real within-group signal only when members of one group
+/// can differ in derivability (a more faithful reorder-shape marker, or future
+/// in-memo decorrelation). The live within-group discriminators today are the
+/// source-confidence axis and the FFewerConj sub-tie-break. (This is why no test
+/// constructs two same-group members differing in promise: doing so would
+/// require members joining different relation sets, violating group equivalence.)
+pub(crate) fn pick_group_representative(
+    memo: &Memo,
+    group_idx: usize,
+    table_stats: &HashMap<String, TableStatistics>,
+) -> Option<(MExpr, Statistics)> {
+    // Build the member list as logical_exprs then physical_exprs. Cloning each
+    // member releases the borrow on `memo.groups[..]`, so we can pass `memo`
+    // immutably to `derive_statistics`/`promise` below.
+    let members: Vec<MExpr> = {
+        let group = &memo.groups[group_idx];
+        group
+            .logical_exprs
+            .iter()
+            .chain(group.physical_exprs.iter())
+            .cloned()
+            .collect()
+    };
+
+    let mut iter = members.into_iter();
+    let first = iter.next()?;
+    let first_stats = derive_statistics(&first, memo, table_stats);
+    let first_key = (
+        first_stats.row_count_confidence,
+        promise(&first.op, &first.children, memo),
+    );
+    let mut best = (first, first_stats, first_key);
+
+    for cand in iter {
+        let cand_stats = derive_statistics(&cand, memo, table_stats);
+        let cand_key = (
+            cand_stats.row_count_confidence,
+            promise(&cand.op, &cand.children, memo),
+        );
+        // Strict-greater replacement: replace only on a strict improvement so
+        // ties keep the lower index (canonical-first / zero-regression).
+        let replace = cand_key > best.2
+            || (cand_key == best.2
+                && inner_join_conjunct_count(&cand.op, &memo.scalars)
+                    .zip(inner_join_conjunct_count(&best.0.op, &memo.scalars))
+                    .is_some_and(|(cand_conj, best_conj)| cand_conj < best_conj));
+        if replace {
+            best = (cand, cand_stats, cand_key);
+        }
+    }
+
+    Some((best.0, best.1))
+}
+
+/// Conjunct count of an INNER `LogicalJoin`'s condition (an AND-tree split into
+/// conjuncts), used as the FFewerConj sub-tie-break. Returns `None` for any
+/// operator that is not an inner LogicalJoin, so the tie-break only fires when
+/// BOTH tied members are inner joins (GPORCA FFewerConj semantics).
+fn inner_join_conjunct_count(op: &Operator, scalars: &ScalarArena) -> Option<usize> {
+    match op {
+        Operator::LogicalJoin(join) if join.join_type == JoinKind::Inner => match join.condition {
+            Some(sid) => {
+                let mut conjuncts = Vec::new();
+                flatten_and_scalar(scalars, sid, &mut conjuncts);
+                Some(conjuncts.len())
+            }
+            None => Some(0),
+        },
+        _ => None,
+    }
 }
 
 /// Materialize a [`JoinTree`] candidate order bottom-up into the memo, returning
@@ -2373,6 +2497,35 @@ fn child_output_columns(
 }
 
 // ---------------------------------------------------------------------------
+// Derivability promise
+// ---------------------------------------------------------------------------
+
+/// Derivability promise of a memo expression, from its operator shape.
+/// Join over base inputs → High; bushy join (a child group is itself a join)
+/// → Medium; everything else → High. `Low` is unreachable today (reserved for
+/// future in-memo decorrelation — subqueries are decorrelated pre-memo).
+pub(crate) fn promise(op: &Operator, children: &[GroupId], memo: &Memo) -> DerivePromise {
+    match op {
+        Operator::LogicalJoin(_)
+        | Operator::PhysicalHashJoin(_)
+        | Operator::PhysicalNestLoopJoin(_) => {
+            let bushy = children.iter().any(|&c| {
+                matches!(
+                    memo.groups[c].logical_exprs.first().map(|e| &e.op),
+                    Some(Operator::LogicalJoin(_))
+                )
+            });
+            if bushy {
+                DerivePromise::Medium
+            } else {
+                DerivePromise::High
+            }
+        }
+        _ => DerivePromise::High,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -3373,7 +3526,7 @@ mod tests {
     }
 
     #[test]
-    fn physical_hash_aggregate_own_stats_are_per_expr_not_per_group() {
+    fn derive_statistics_is_child_sensitive_across_groups() {
         use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
         use crate::sql::column_id::ColumnId;
         use crate::sql::optimizer::memo::{LogicalProperties, MExpr, Memo};
@@ -3453,8 +3606,12 @@ mod tests {
         let big_stats = derive_statistics(&agg_over(big, &mut memo), &memo, &HashMap::new());
         let small_stats = derive_statistics(&agg_over(small, &mut memo), &memo, &HashMap::new());
 
-        // Same op, different children -> different own_stats. A single group cache
-        // cannot represent both, which is exactly why search.rs keeps own_stats per-expr.
+        // Same op, different children -> different derived statistics. These two
+        // aggregates have different children, so they are DIFFERENT memo groups;
+        // this asserts derive_statistics is child-sensitive ACROSS groups. It does
+        // NOT imply within-group per-expr variation: members of one group are
+        // logically equivalent, so the per-group collapsed statistic is correct
+        // (search now reads the per-group stat, not a per-expr derivation).
         assert!(
             big_stats.output_row_count > small_stats.output_row_count,
             "per-expr own_stats must differ: big={} small={}",
@@ -5408,6 +5565,318 @@ mod tests {
             "fresh (None) group must still be derived"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // pick_group_representative — lexicographic confidence argmax collapse
+    // -----------------------------------------------------------------------
+
+    /// Build a leaf-scan `MExpr` for `table` over a single column `col` by
+    /// converting a scan plan into a throwaway memo and extracting its sole
+    /// logical expr. Scans are leaves (`children: vec![]`), so the resulting
+    /// `MExpr` carries no group references and can be inserted into any group.
+    fn scan_mexpr(table: &str, col: &str) -> MExpr {
+        let mut tmp = Memo::new();
+        let g = logical_plan_to_memo_for_test(&scan_plan(table, &[col]), &mut tmp);
+        tmp.groups[g].logical_exprs[0].clone()
+    }
+
+    /// A scan of a table registered with table stats derives `Exact`
+    /// confidence; a scan of an unregistered table derives `Fallback`. This
+    /// confirms two members of the SAME group can derive DIFFERENT confidences
+    /// via the real `derive_statistics` (the precondition for the argmax tests).
+    #[test]
+    fn pick_representative_argmax_picks_higher_source_confidence_not_first() {
+        // Only `with_stats` is registered, so its scan derives Exact; the
+        // `no_stats` scan derives Fallback.
+        let (name, ts) = make_table_stats("with_stats", 1_000, &[("a", 50.0)]);
+        let mut table_stats = HashMap::new();
+        table_stats.insert(name, ts);
+
+        // Member at index 0 = Fallback (no stats); member at index 1 = Exact
+        // (with stats). Higher confidence is deliberately NOT first, to prove
+        // the pick is argmax and not `first()`.
+        let mut memo = Memo::new();
+        let group = memo.new_group(scan_mexpr("no_stats", "a"));
+        memo.add_expr_to_group(group, scan_mexpr("with_stats", "a"));
+
+        // Sanity: confirm the two members really do derive different confidence.
+        let m0 = memo.groups[group].logical_exprs[0].clone();
+        let m1 = memo.groups[group].logical_exprs[1].clone();
+        assert_eq!(
+            derive_statistics(&m0, &memo, &table_stats).row_count_confidence,
+            Confidence::Fallback,
+            "index-0 member (unregistered table) must derive Fallback"
+        );
+        assert_eq!(
+            derive_statistics(&m1, &memo, &table_stats).row_count_confidence,
+            Confidence::Exact,
+            "index-1 member (registered table) must derive Exact"
+        );
+
+        // argmax must pick the Exact member (index 1), not first().
+        let (chosen, stats) =
+            pick_group_representative(&memo, group, &table_stats).expect("non-empty group");
+        assert_eq!(
+            stats.row_count_confidence,
+            Confidence::Exact,
+            "argmax must pick the higher-confidence (Exact) member"
+        );
+        assert!(
+            (stats.output_row_count - 1_000.0).abs() < 1.0,
+            "stats must come from the with_stats scan (1000 rows), got {}",
+            stats.output_row_count
+        );
+        assert!(
+            matches!(&chosen.op, Operator::LogicalScan(s) if s.table.name == "with_stats"),
+            "chosen member must be the with_stats scan, not first()"
+        );
+
+        // The cached logical_props (Site 1) must reflect the same argmax pick.
+        derive_group_statistics_for(&mut memo, group, &table_stats);
+        let props = memo.groups[group].logical_props.as_ref().unwrap();
+        assert_eq!(props.row_count_confidence, Confidence::Exact);
+        assert!((props.row_count - 1_000.0).abs() < 1.0);
+    }
+
+    /// An all-equal group (every member same source confidence AND same
+    /// promise) must keep the lowest index — `logical_exprs[0]` — exactly
+    /// reproducing today's `first()` pick (zero-regression baseline).
+    #[test]
+    fn pick_representative_all_equal_degenerates_to_first() {
+        let (name, ts) = make_table_stats("eq_tbl", 1_000, &[("a", 50.0)]);
+        let mut table_stats = HashMap::new();
+        table_stats.insert(name, ts);
+
+        // Two scans of the SAME registered table: both Exact, both leaf (High
+        // promise) → equal key. We distinguish them by column ("a" vs "b") so we
+        // can tell which member was picked.
+        let mut memo = Memo::new();
+        let group = memo.new_group(scan_mexpr("eq_tbl", "a"));
+        memo.add_expr_to_group(group, scan_mexpr("eq_tbl", "b"));
+
+        let (chosen, _) =
+            pick_group_representative(&memo, group, &table_stats).expect("non-empty group");
+        // Lowest index wins the tie → the "a" scan (logical_exprs[0]).
+        assert!(
+            matches!(&chosen.op, Operator::LogicalScan(s)
+                if s.columns.iter().any(|c| c.name == "a")),
+            "all-equal group must keep logical_exprs[0] (the 'a' scan)"
+        );
+    }
+
+    /// Member-consistency: after `derive_group_statistics_for`, the cached
+    /// `logical_props` (both row stats AND column stats) must come from the SAME
+    /// member the argmax chose — proving Site 1 calls `derive_for_expr` with the
+    /// chosen member rather than re-picking `first()` via `derive_for_group`.
+    #[test]
+    fn pick_representative_member_consistency_props_match_argmax_member() {
+        // Distinguishing column stat: the Exact member carries a real NDV for
+        // column "a"; the Fallback member carries only `unknown()` stats.
+        let (name, ts) = make_table_stats("consistent_tbl", 1_000, &[("a", 50.0)]);
+        let mut table_stats = HashMap::new();
+        table_stats.insert(name, ts);
+
+        // Index 0 = Fallback (first()); index 1 = Exact (argmax winner).
+        let mut memo = Memo::new();
+        let group = memo.new_group(scan_mexpr("unregistered_tbl", "a"));
+        memo.add_expr_to_group(group, scan_mexpr("consistent_tbl", "a"));
+
+        derive_group_statistics_for(&mut memo, group, &table_stats);
+        let props = memo.groups[group].logical_props.as_ref().unwrap();
+
+        // Row-level props come from the argmax (Exact) member.
+        assert_eq!(props.row_count_confidence, Confidence::Exact);
+        assert!((props.row_count - 1_000.0).abs() < 1.0);
+
+        // Column-level props also come from the argmax member: the Exact scan's
+        // column "a" has NDV=50 and Exact confidence. The first() member
+        // (unregistered) would have produced only an `unknown()` column stat
+        // (NDV not 50, Fallback confidence), so this distinguishes the source.
+        let a = stat_by_name(&props.column_statistics, "a");
+        assert!(
+            (a.distinct_values_count - 50.0).abs() < 1e-9,
+            "column stat NDV must come from the argmax member (50), got {}",
+            a.distinct_values_count
+        );
+        assert_eq!(
+            a.confidence,
+            Confidence::Exact,
+            "column stat confidence must come from the argmax (Exact) member, not first()"
+        );
+    }
+
+    /// FFewerConj sub-tie-break: two tied inner-join members (same children,
+    /// same source confidence, same promise) differing only in the number of
+    /// join-condition conjuncts — the member with FEWER conjuncts wins.
+    #[test]
+    fn pick_representative_ffewerconj_prefers_fewer_join_conjuncts() {
+        use crate::sql::analysis::ExprKind;
+        use crate::sql::optimizer::memo::LogicalProperties;
+        use crate::sql::optimizer::operator::{LogicalJoinOp, ValuesOp};
+
+        let table_stats: HashMap<String, TableStatistics> = HashMap::new();
+
+        let mut memo = Memo::new();
+
+        // Two base leaf children with pre-baked props (so child_statistics reads
+        // them and both join members get the SAME derived stats + High promise —
+        // both children are non-join, so the join is not bushy).
+        let mk_leaf = |memo: &mut Memo| -> GroupId {
+            let id = memo.next_expr_id();
+            let g = memo.new_group(MExpr {
+                id,
+                op: Operator::LogicalValues(ValuesOp {
+                    rows: vec![],
+                    columns: vec![],
+                }),
+                children: vec![],
+            });
+            let mut props = LogicalProperties::new(vec![], 1_000.0);
+            props.row_count_confidence = Confidence::Estimated;
+            memo.groups[g].logical_props = Some(props);
+            g
+        };
+        let left = mk_leaf(&mut memo);
+        let right = mk_leaf(&mut memo);
+
+        // Build two AND-tree predicates in the memo's scalar arena: one with a
+        // single conjunct, one with two. The literals are arbitrary — only the
+        // conjunct COUNT matters to FFewerConj.
+        let lit = |v: i64| TypedExpr {
+            data_type: DataType::Boolean,
+            nullable: false,
+            kind: ExprKind::Literal(LiteralValue::Int(v)),
+        };
+        let one_conjunct = intern_typed(&mut memo.scalars, &lit(1));
+        let two_conjuncts = {
+            let and = TypedExpr {
+                data_type: DataType::Boolean,
+                nullable: false,
+                kind: ExprKind::BinaryOp {
+                    op: BinOp::And,
+                    left: Box::new(lit(1)),
+                    right: Box::new(lit(2)),
+                },
+            };
+            intern_typed(&mut memo.scalars, &and)
+        };
+
+        // Member 0 (first): TWO conjuncts. Member 1: ONE conjunct. Both inner
+        // joins over the same children → tied key; FFewerConj must pick the
+        // one-conjunct member (index 1), beating first().
+        let id0 = memo.next_expr_id();
+        let group = memo.new_group(MExpr {
+            id: id0,
+            op: Operator::LogicalJoin(LogicalJoinOp {
+                join_type: JoinKind::Inner,
+                condition: Some(two_conjuncts),
+            }),
+            children: vec![left, right],
+        });
+        let id1 = memo.next_expr_id();
+        memo.add_expr_to_group(
+            group,
+            MExpr {
+                id: id1,
+                op: Operator::LogicalJoin(LogicalJoinOp {
+                    join_type: JoinKind::Inner,
+                    condition: Some(one_conjunct),
+                }),
+                children: vec![left, right],
+            },
+        );
+
+        let (chosen, _) =
+            pick_group_representative(&memo, group, &table_stats).expect("non-empty group");
+        match &chosen.op {
+            Operator::LogicalJoin(j) => {
+                let sid = j.condition.expect("join has a condition");
+                let mut conjuncts = Vec::new();
+                flatten_and_scalar(&memo.scalars, sid, &mut conjuncts);
+                assert_eq!(
+                    conjuncts.len(),
+                    1,
+                    "FFewerConj must pick the fewer-conjunct member (index 1), not first()"
+                );
+            }
+            other => panic!("expected a LogicalJoin, got {other:?}"),
+        }
+    }
+
+    /// Documents both the hazard and the fix for the per-group argmax guard.
+    ///
+    /// **Hazard**: when a strictly-higher-key member is appended to an already-
+    /// derived group, the bulk `derive_group_statistics` guard SKIPS the group
+    /// and never sees the new member → the cached `logical_props` stays stale.
+    ///
+    /// **Fix (eager re-derive)**: calling `derive_group_statistics_for` directly
+    /// on the group at append time re-runs the argmax over ALL members, picks the
+    /// higher-key one, and keeps `logical_props` `Some` throughout — satisfying
+    /// the M1 invariant that `implement()` requires to read child-group column ids.
+    #[test]
+    fn eager_rederive_picks_late_higher_confidence_member() {
+        // Only "registered_tbl" is in table_stats, so its scan derives Exact.
+        // "unregistered_tbl" is absent, so its scan derives Fallback.
+        let (name, ts) = make_table_stats("registered_tbl", 2_000, &[("a", 100.0)]);
+        let mut table_stats = HashMap::new();
+        table_stats.insert(name, ts);
+
+        // ── Step 1: create a group whose ONLY member is Fallback. ──────────
+        let mut memo = Memo::new();
+        let group = memo.new_group(scan_mexpr("unregistered_tbl", "a"));
+
+        // ── Step 2: derive via the bulk pass (first derivation). ──────────
+        derive_group_statistics(&mut memo, &table_stats);
+
+        // The group now has cached props — single member is Fallback.
+        let props = memo.groups[group]
+            .logical_props
+            .as_ref()
+            .expect("bulk pass must have stamped logical_props");
+        assert_eq!(
+            props.row_count_confidence,
+            Confidence::Fallback,
+            "initial derivation: only Fallback member present, must cache Fallback"
+        );
+
+        // ── Step 3: append a strictly-higher-key member (Exact). ──────────
+        // This simulates a future producer (e.g. MV-rewrite) adding a member
+        // with a higher source_confidence AFTER the group was already derived.
+        memo.add_expr_to_group(group, scan_mexpr("registered_tbl", "a"));
+
+        // ── Step 4: hazard — bulk pass SKIPS the group. ───────────────────
+        // The guard sees `logical_props.is_some()` and does not re-run argmax.
+        derive_group_statistics(&mut memo, &table_stats);
+        let props_after_bulk = memo.groups[group]
+            .logical_props
+            .as_ref()
+            .expect("logical_props must remain Some (M1 invariant)");
+        assert_eq!(
+            props_after_bulk.row_count_confidence,
+            Confidence::Fallback,
+            "hazard: bulk pass guard skipped the group — stale Fallback is still cached \
+             even though an Exact member was appended"
+        );
+
+        // ── Step 5: fix — eager re-derive via derive_group_statistics_for. ─
+        // This is what a real producer MUST call at append time.
+        derive_group_statistics_for(&mut memo, group, &table_stats);
+
+        let props_after_eager = memo.groups[group]
+            .logical_props
+            .as_ref()
+            .expect("(a) logical_props must remain Some — eager re-derive MUST NOT go to None");
+        assert_eq!(
+            props_after_eager.row_count_confidence,
+            Confidence::Exact,
+            "(b) argmax must now select the Exact member appended in step 3"
+        );
+        assert!(
+            (props_after_eager.row_count - 2_000.0).abs() < 1.0,
+            "row_count must come from the registered_tbl scan (2000 rows), got {}",
+            props_after_eager.row_count
+        );
+    }
 }
 
 #[cfg(test)]
@@ -5624,6 +6093,101 @@ mod sort_partition_limit_tests {
         assert!(
             (result - 50.0).abs() < 1e-9,
             "expected 50.0 with default NDV, got {result}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod promise_tests {
+    use super::*;
+    use crate::sql::analysis::JoinKind;
+    use crate::sql::optimizer::memo::{LogicalProperties, MExpr, Memo};
+    use crate::sql::optimizer::operator::{LogicalJoinOp, Operator, ValuesOp};
+
+    /// Add a leaf group (LogicalValues, no children) to the memo, with
+    /// pre-baked logical_props so child_statistics can read it.
+    fn add_leaf_group(memo: &mut Memo) -> GroupId {
+        let id = memo.next_expr_id();
+        let g = memo.new_group(MExpr {
+            id,
+            op: Operator::LogicalValues(ValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
+            children: vec![],
+        });
+        memo.groups[g].logical_props = Some(LogicalProperties::new(vec![], 1000.0));
+        g
+    }
+
+    /// Add a join group over the given child groups using the given join kind.
+    /// The group gets a LogicalJoin as its first (and only) logical expr.
+    fn add_join_group(memo: &mut Memo, left: GroupId, right: GroupId) -> GroupId {
+        let id = memo.next_expr_id();
+        memo.new_group(MExpr {
+            id,
+            op: Operator::LogicalJoin(LogicalJoinOp {
+                join_type: JoinKind::Inner,
+                condition: None,
+            }),
+            children: vec![left, right],
+        })
+    }
+
+    /// promise() for a join over two base (non-join) leaf groups → High.
+    #[test]
+    fn promise_join_over_base_inputs_is_high() {
+        let mut memo = Memo::new();
+        let left = add_leaf_group(&mut memo);
+        let right = add_leaf_group(&mut memo);
+
+        let op = Operator::LogicalJoin(LogicalJoinOp {
+            join_type: JoinKind::Inner,
+            condition: None,
+        });
+        let children = vec![left, right];
+        assert_eq!(
+            promise(&op, &children, &memo),
+            DerivePromise::High,
+            "join over base inputs must be High"
+        );
+    }
+
+    /// promise() for a bushy join (at least one child group is itself a join) → Medium.
+    #[test]
+    fn promise_bushy_join_is_medium() {
+        let mut memo = Memo::new();
+        let a = add_leaf_group(&mut memo);
+        let b = add_leaf_group(&mut memo);
+        // inner_join = join(a, b) — its first logical_expr is a LogicalJoin
+        let inner_join = add_join_group(&mut memo, a, b);
+        let c = add_leaf_group(&mut memo);
+
+        // bushy_join = join(inner_join, c): left child is a join group → bushy
+        let op = Operator::LogicalJoin(LogicalJoinOp {
+            join_type: JoinKind::Inner,
+            condition: None,
+        });
+        let children = vec![inner_join, c];
+        assert_eq!(
+            promise(&op, &children, &memo),
+            DerivePromise::Medium,
+            "join with a join child must be Medium (bushy)"
+        );
+    }
+
+    /// promise() for a non-join operator (e.g. LogicalValues) → High.
+    #[test]
+    fn promise_non_join_operator_is_high() {
+        let memo = Memo::new();
+        let op = Operator::LogicalValues(ValuesOp {
+            rows: vec![],
+            columns: vec![],
+        });
+        assert_eq!(
+            promise(&op, &[], &memo),
+            DerivePromise::High,
+            "non-join operators must always be High"
         );
     }
 }

@@ -748,7 +748,7 @@ pub(crate) fn broadcast_gate_passes(
         return false;
     }
 
-    if build_stats.row_count_confidence != crate::sql::optimizer::statistics::Confidence::Exact
+    if build_stats.row_count_confidence < crate::sql::optimizer::statistics::Confidence::Exact
         && build_rows > options.fallback_broadcast_row_limit
     {
         return false;

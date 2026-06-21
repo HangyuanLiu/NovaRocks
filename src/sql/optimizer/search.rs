@@ -12,7 +12,6 @@ use super::derive::PropertyAlternativeKind;
 use super::memo::{Cost, GroupId, Memo};
 use super::operator::*;
 use super::property::*;
-use super::stats::derive_statistics;
 use crate::sql::optimizer::statistics::TableStatistics;
 
 pub(crate) use super::derive::EnforcerKind;
@@ -122,15 +121,18 @@ impl SearchContext {
         let mut best_child_props = Vec::new();
         let mut best_child_outputs = Vec::new();
 
+        // own_stats is the operator's own output statistic. All physical
+        // members of a group are logically equivalent, and the operators whose
+        // cost reads own_stats (scan/filter/project/sort/distribution/union,
+        // and NestLoopJoin via avg_row_size) get value-identical own_stats
+        // across members; the operators whose own_stats can vary among members
+        // (hash join reorder shapes, aggregate) are costed from child_stats and
+        // do not read own_stats. So the single per-group collapsed statistic is
+        // the correct, value-identical input — read it once per group.
+        let own_stats = stats_for_group(&memo.groups[group_id], memo, &self.table_stats);
+
         for expr_idx in 0..num_physical {
             let expr = &memo.groups[group_id].physical_exprs[expr_idx];
-
-            // own_stats is the cardinality of THIS physical expr; it does not
-            // depend on the property alternative, so derive it once per expr
-            // instead of once per (expr, alt). Kept per-expr (not the group
-            // cache) because same-group exprs can have different own_stats
-            // (see physical_hash_aggregate_own_stats_are_per_expr_not_per_group).
-            let own_stats = derive_statistics(expr, memo, &self.table_stats);
 
             let alternatives = super::derive::derive_required_alternatives(
                 &expr.op,
@@ -291,15 +293,18 @@ impl SearchContext {
 // Statistics helper
 // ---------------------------------------------------------------------------
 
-/// Get statistics for a group.  Prefers the first logical expr's derived stats
-/// (which are stored in `logical_props`), falling back to deriving from the
-/// first physical expr.
+/// Get a group's collapsed statistic: the lexicographic-argmax representative's
+/// stats cached in `logical_props` (set by `derive_group_statistics`). If those
+/// are absent (defensive — should not happen post-derive), re-pick via
+/// `pick_group_representative`, the same collapse helper the derive path uses.
 fn stats_for_group(
     group: &super::memo::Group,
     memo: &Memo,
     table_stats: &HashMap<String, TableStatistics>,
 ) -> crate::sql::optimizer::statistics::Statistics {
-    // Try logical props first (set by derive_group_statistics).
+    // Try logical props first (set by derive_group_statistics). Once Site 1
+    // (derive_group_statistics_for) is argmax-correct, this cache already holds
+    // the lexicographic-argmax representative's stats.
     if let Some(ref lp) = group.logical_props {
         return crate::sql::optimizer::statistics::Statistics {
             output_row_count: lp.row_count,
@@ -308,20 +313,20 @@ fn stats_for_group(
         };
     }
 
-    // Fall back to deriving from the first available expression.
-    if let Some(expr) = group.logical_exprs.first() {
-        return derive_statistics(expr, memo, table_stats);
-    }
-    if let Some(expr) = group.physical_exprs.first() {
-        return derive_statistics(expr, memo, table_stats);
-    }
-
-    // Empty group — should not happen in practice.
-    crate::sql::optimizer::statistics::Statistics {
-        output_row_count: 1.0,
-        row_count_confidence: crate::sql::optimizer::statistics::Confidence::Fallback,
-        column_statistics: HashMap::new(),
-    }
+    // Defensive fallback (should not happen in practice — logical_props is
+    // populated by derive_group_statistics): re-pick the representative via the
+    // same shared argmax helper Site 1 uses, so this path stays consistent
+    // rather than re-deriving from first().
+    crate::sql::optimizer::stats::pick_group_representative(memo, group.id, table_stats)
+        .map(|(_, stats)| stats)
+        .unwrap_or_else(|| {
+            // Empty group — should not happen in practice.
+            crate::sql::optimizer::statistics::Statistics {
+                output_row_count: 1.0,
+                row_count_confidence: crate::sql::optimizer::statistics::Confidence::Fallback,
+                column_statistics: HashMap::new(),
+            }
+        })
 }
 
 // ---------------------------------------------------------------------------
