@@ -12,6 +12,7 @@ use super::derive::PropertyAlternativeKind;
 use super::memo::{Cost, GroupId, Memo};
 use super::operator::*;
 use super::property::*;
+use super::stats::derive_statistics;
 use crate::sql::optimizer::statistics::TableStatistics;
 
 pub(crate) use super::derive::EnforcerKind;
