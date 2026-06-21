@@ -6,9 +6,9 @@
 
 use std::collections::HashMap;
 
-use crate::sql::analysis::OutputColumn;
 use crate::sql::catalog::TableDef;
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::OutputColumn;
 use crate::sql::optimizer::memo::{MExpr, Memo};
 use crate::sql::optimizer::operator::{
     AggStage, LogicalAggregateOp, Operator, ProjectOp, ScalarAggregateSpec,
@@ -237,7 +237,7 @@ impl SpjgDescriptor {
     /// memo by following the FIRST logical expression of each child group.
     ///
     /// The first logical expr of a group is always its original (unsplit)
-    /// shape — `convert.rs` seeds each group with the planner node, and
+    /// shape — `memo_copy` seeds each group with the planner node, and
     /// transformation rules only ever append alternatives. MvRewrite runs in
     /// the same explore round as `SplitAggregateRule`, so an aggregate group
     /// may already carry a split Local/Global alternative; the first expr is
@@ -826,8 +826,9 @@ mod tests {
         plan: &LogicalPlanNode,
     ) -> Result<(SpjgDescriptor, ScalarArena), String> {
         let mut arena = ScalarArena::new();
-        let opt_expr =
-            crate::sql::optimizer::convert::try_logical_plan_to_opt_expr(plan, &mut arena)?;
+        let opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+            plan, &mut arena,
+        )?;
         let descriptor = SpjgDescriptor::from_opt_expr(&opt_expr, &mut arena)?;
         Ok((descriptor, arena))
     }
@@ -905,10 +906,12 @@ mod tests {
     /// group (cloned) plus the memo, ready for `from_memo`.
     fn memo_root(plan: &LogicalPlanNode) -> (crate::sql::optimizer::memo::Memo, MExpr) {
         let mut memo = crate::sql::optimizer::memo::Memo::new();
-        let opt_expr =
-            crate::sql::optimizer::convert::try_logical_plan_to_opt_expr(plan, &mut memo.scalars)
-                .expect("logical plan to opt expr");
-        let root = crate::sql::optimizer::convert::opt_expr_to_memo(&opt_expr, &mut memo);
+        let opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+            plan,
+            &mut memo.scalars,
+        )
+        .expect("logical plan to opt expr");
+        let root = crate::sql::optimizer::memo_copy::opt_expr_to_memo(&opt_expr, &mut memo);
         let root_expr = memo.groups[root].logical_exprs[0].clone();
         (memo, root_expr)
     }
@@ -976,7 +979,7 @@ mod tests {
     #[test]
     fn from_memo_rejects_split_aggregate() {
         use crate::sql::optimizer::operator::{LogicalAggregateOp, Operator};
-        use crate::sql::optimizer::scalar_bridge::{intern_aggregate_calls, intern_exprs};
+        use crate::sql::planner::optimizer_bridge::scalar::{intern_aggregate_calls, intern_exprs};
         // A split (Local) aggregate is not the original Single shape and must
         // be rejected even when it sits at the matched position.
         let a = col(1, "a");
@@ -985,10 +988,12 @@ mod tests {
         let scan_op = scan(&[a.clone(), v.clone()]);
         let plan = LogicalPlanNode::new(PlanNodeKind::Scan(scan_op), vec![], None);
         let mut memo = crate::sql::optimizer::memo::Memo::new();
-        let opt_expr =
-            crate::sql::optimizer::convert::try_logical_plan_to_opt_expr(&plan, &mut memo.scalars)
-                .expect("logical plan to opt expr");
-        let scan_gid = crate::sql::optimizer::convert::opt_expr_to_memo(&opt_expr, &mut memo);
+        let opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+            &plan,
+            &mut memo.scalars,
+        )
+        .expect("logical plan to opt expr");
+        let scan_gid = crate::sql::optimizer::memo_copy::opt_expr_to_memo(&opt_expr, &mut memo);
         let group_by = intern_exprs(&mut memo.scalars, &[col_ref(&a)]);
         let aggregates = intern_aggregate_calls(
             &mut memo.scalars,

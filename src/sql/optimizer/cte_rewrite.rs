@@ -1,5 +1,5 @@
-use crate::sql::analysis::cte::CteId;
-use crate::sql::analysis::{JoinKind, OutputColumn};
+use crate::sql::common::CteId;
+use crate::sql::common::{JoinKind, OutputColumn};
 use crate::sql::optimizer::operator::{Operator, ProjectOp, ScalarProjectItem};
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::scalar::{ColumnDisplay, ScalarArena, ScalarNode};
@@ -423,7 +423,7 @@ mod tests {
     ) -> Result<Vec<OutputColumn>, String> {
         let mut memo = crate::sql::optimizer::Memo::new();
         memo.scalars = arena.clone();
-        let root_group = crate::sql::optimizer::convert::opt_expr_to_memo(plan, &mut memo);
+        let root_group = crate::sql::optimizer::memo_copy::opt_expr_to_memo(plan, &mut memo);
         crate::sql::optimizer::stats::derive_group_statistics(&mut memo, &HashMap::new());
         Ok(memo.groups[root_group]
             .logical_props
@@ -495,7 +495,10 @@ mod tests {
         };
         assert_eq!(project.items[0].output_name, "x_id");
         assert_eq!(project.items[0].output_column_id, consume_output_id);
-        let materialized = scalar::materialize(&arena, project.items[0].expr);
+        let materialized = crate::sql::planner::optimizer_bridge::scalar::materialize(
+            &arena,
+            project.items[0].expr,
+        );
         let expected = column_ref(&output_columns()[0]);
         assert_eq!(materialized.data_type, expected.data_type);
         assert_eq!(materialized.nullable, expected.nullable);

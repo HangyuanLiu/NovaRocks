@@ -1,20 +1,18 @@
-//! Conversion between `LogicalPlanNode`, `OptExpr`, and Memo groups
-//! (Bridge 1 + copy-in).
+//! Conversion between `LogicalPlanNode` and `OptExpr`.
 
-use super::memo::{GroupId, MExpr, Memo};
-use super::operator::{
+use crate::sql::analysis::SortItem;
+use crate::sql::optimizer::operator::{
     AggregateStateMergeOp, ApplyOp, AssertOneRowOp, CTEAnchorOp, CTEConsumeOp, CTEProduceOp,
     DecodeOp, ExceptOp, FilterOp, GenerateSeriesOp, ImvDeltaOp, ImvVersionOp, IntersectOp, LimitOp,
     LogicalAggregateOp, LogicalJoinOp, Operator, ProjectOp, RepeatOp, ScanOp, SortOp,
     TableFunctionOp, UnionOp, ValuesOp, WindowOp,
 };
-use super::opt_expr::OptExpr;
-use crate::sql::analysis::SortItem;
-use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
-use crate::sql::optimizer::scalar_bridge::{
-    intern_aggregate_calls, intern_exprs, intern_project_items, intern_sort_items,
-    intern_window_exprs, materialize_aggregate_calls, materialize_exprs, materialize_project_items,
-    materialize_sort_keys, materialize_window_exprs,
+use crate::sql::optimizer::opt_expr::OptExpr;
+use crate::sql::optimizer::scalar::ScalarArena;
+use crate::sql::planner::optimizer_bridge::scalar::{
+    intern_aggregate_calls, intern_exprs, intern_project_items, intern_sort_items, intern_typed,
+    intern_window_exprs, materialize, materialize_aggregate_calls, materialize_exprs,
+    materialize_project_items, materialize_sort_keys, materialize_window_exprs,
 };
 use crate::sql::planner::plan::{
     LogicalAggregateNode, LogicalAggregateStateMergeNode, LogicalApplyNode,
@@ -25,28 +23,6 @@ use crate::sql::planner::plan::{
     LogicalSortNode, LogicalTableFunctionNode, LogicalUnionNode, LogicalValuesNode,
     LogicalWindowNode, PlanNodeKind, validate_logical_plan_stage,
 };
-
-/// Copy an `OptExpr` tree into the Memo as Groups (one Group per node).
-/// The operator already holds interned `ScalarId`s, so no scalar interning
-/// happens here — this is the trivial StarRocks-style `copyIn`.
-pub(crate) fn opt_expr_to_memo(expr: &OptExpr, memo: &mut Memo) -> GroupId {
-    let children: Vec<GroupId> = expr
-        .children
-        .iter()
-        .map(|c| opt_expr_to_memo(c, memo))
-        .collect();
-    let mexpr = MExpr {
-        id: memo.next_expr_id(),
-        op: expr.op.clone(),
-        children,
-    };
-    let group_id = memo.new_group(mexpr);
-    // Register CTEProduce groups so CTEConsume can look up their stats.
-    if let Operator::LogicalCTEProduce(op) = &expr.op {
-        memo.cte_produce_groups.insert(op.cte_id, group_id);
-    }
-    group_id
-}
 
 /// Bridge 1: convert a `LogicalPlanNode` tree into an `OptExpr` tree, interning
 /// all scalars into the provided `ScalarArena`. No Memo groups are minted here.
@@ -422,7 +398,7 @@ pub(crate) fn opt_expr_to_logical_plan(expr: OptExpr, arena: &ScalarArena) -> Lo
             mv_rewritten_from: None,
         }),
         Operator::LogicalFilter(op) => PlanNodeKind::Filter(LogicalFilterNode {
-            predicate: crate::sql::optimizer::scalar::materialize(arena, op.predicate),
+            predicate: materialize(arena, op.predicate),
         }),
         Operator::LogicalProject(op) => PlanNodeKind::Project(LogicalProjectNode {
             items: materialize_project_items(arena, &op.items),
@@ -445,9 +421,7 @@ pub(crate) fn opt_expr_to_logical_plan(expr: OptExpr, arena: &ScalarArena) -> Lo
         }
         Operator::LogicalJoin(op) => PlanNodeKind::Join(LogicalJoinNode {
             join_type: op.join_type,
-            condition: op
-                .condition
-                .map(|id| crate::sql::optimizer::scalar::materialize(arena, id)),
+            condition: op.condition.map(|id| materialize(arena, id)),
         }),
         Operator::LogicalSort(op) => {
             let items: Vec<SortItem> = materialize_sort_keys(arena, &op.items);
@@ -563,14 +537,12 @@ pub(crate) fn opt_expr_to_logical_plan(expr: OptExpr, arena: &ScalarArena) -> Lo
             // the plan before memo conversion.
             PlanNodeKind::Apply(LogicalApplyNode {
                 kind: op.kind,
-                subquery_expr: crate::sql::optimizer::scalar::materialize(arena, op.subquery_expr),
+                subquery_expr: materialize(arena, op.subquery_expr),
                 output_column: op.output_column,
                 inner_output_column_id: op.inner_output_column_id,
                 correlation_column_ids: op.correlation_column_ids,
                 correlation_conjuncts: materialize_exprs(arena, &op.correlation_conjuncts),
-                residual_predicate: op
-                    .residual_predicate
-                    .map(|id| crate::sql::optimizer::scalar::materialize(arena, id)),
+                residual_predicate: op.residual_predicate.map(|id| materialize(arena, id)),
                 need_check_max_rows: op.need_check_max_rows,
                 use_semi_anti: op.use_semi_anti,
                 uncorrelated_outer_predicate_columns: op.uncorrelated_outer_predicate_columns,
@@ -593,6 +565,8 @@ mod tests {
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::cascades_rules::implement::ScanToPhysical;
+    use crate::sql::optimizer::memo::{GroupId, Memo};
+    use crate::sql::optimizer::memo_copy::opt_expr_to_memo;
     use crate::sql::optimizer::rule::Rule;
     use crate::sql::planner::plan::*;
     use crate::sql::planner::plan::{

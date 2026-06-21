@@ -5,8 +5,8 @@
 
 use std::collections::HashSet;
 
-use crate::sql::analysis::BinOp;
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::BinOp;
 use crate::sql::optimizer::operator::{FilterOp, LogicalJoinOp, Operator};
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
@@ -1280,7 +1280,9 @@ mod column_id_helper_tests {
         join_plan: &LogicalPlanNode,
     ) -> (Vec<ScalarJoinEquiKey>, ScalarArena) {
         let mut arena = ScalarArena::new();
-        let expr = crate::sql::optimizer::convert::logical_plan_to_opt_expr(join_plan, &mut arena);
+        let expr = crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr(
+            join_plan, &mut arena,
+        );
         let Operator::LogicalJoin(join) = &expr.op else {
             panic!("expected LogicalJoin test expression");
         };

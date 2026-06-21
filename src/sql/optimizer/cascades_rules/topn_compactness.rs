@@ -1,4 +1,4 @@
-use crate::sql::analysis::OutputColumn;
+use crate::sql::common::OutputColumn;
 use crate::sql::optimizer::memo::{MExpr, Memo};
 use crate::sql::optimizer::operator::{Operator, TopNOp, TopNPhase};
 use crate::sql::optimizer::rule::{NewExpr, Rule, RuleType};
@@ -539,7 +539,7 @@ mod tests {
         ValuesOp,
     };
     use crate::sql::optimizer::rule::NewExpr;
-    use crate::sql::optimizer::scalar_bridge::{
+    use crate::sql::planner::optimizer_bridge::scalar::{
         intern_aggregate_calls, intern_exprs, intern_project_items, intern_sort_items,
         materialize_sort_key,
     };

@@ -1,7 +1,7 @@
 //! Aggregate pushdown rewriter — phase 2 of the rule.
 
-use crate::sql::analysis::OutputColumn;
 use crate::sql::column_id::{ColumnId, ColumnRefFactory};
+use crate::sql::common::OutputColumn;
 use crate::sql::optimizer::operator::{
     AggStage, LogicalAggregateOp, Operator, ProjectOp, ScalarAggregateSpec, ScalarProjectItem,
 };
@@ -387,7 +387,9 @@ mod tests {
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{LogicalJoinOp, ScanOp};
-    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed, materialize};
+    use crate::sql::optimizer::scalar::ScalarArena;
+
+    use crate::sql::planner::optimizer_bridge::scalar::{intern_typed, materialize};
     use arrow::datatypes::DataType;
 
     /// Deterministic test ColumnId for a column name: hash the name bytes to get a

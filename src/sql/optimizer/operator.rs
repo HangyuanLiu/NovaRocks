@@ -6,15 +6,14 @@
 
 use std::collections::HashSet;
 
-use crate::sql::analysis::cte::CteId;
-use crate::sql::analysis::{JoinKind, OutputColumn, WindowFrame};
 use crate::sql::catalog::{BranchScope, TableDef};
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::{
+    ApplyKind, CteId, DecodeMapping, ImvVersionRef, JoinKind, OutputColumn, WindowFrame,
+};
 use crate::sql::optimizer::scalar::{ColumnDisplay, ScalarId, SortKey};
-use crate::sql::planner::imv_rewrite::marker::ImvVersionRef;
-use crate::sql::planner::plan::{ApplyKind, DecodeMapping};
 
-pub(crate) use crate::sql::planner::plan::{ScanDictionaryColumn, ScanVariantColumn};
+pub(crate) use crate::sql::common::{ScanDictionaryColumn, ScanVariantColumn};
 
 // ---------------------------------------------------------------------------
 // Physical decision enums
@@ -517,7 +516,9 @@ mod aggregate_stage_tests {
     use super::*;
     use crate::sql::analysis::{OutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
+    use crate::sql::optimizer::scalar::ScalarArena;
+
+    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
 
     fn output_column(id: u32, name: &str) -> OutputColumn {
         OutputColumn {

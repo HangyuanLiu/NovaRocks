@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
-use crate::sql::analysis::JoinKind;
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::JoinKind;
 use crate::sql::optimizer::rewrite::rules::predicate_pushdown::predicate_group::PredicateGroup;
 
 #[derive(Clone, Debug, Default)]
@@ -107,7 +107,9 @@ mod tests {
     use crate::sql::optimizer::rewrite::rules::predicate_pushdown::predicate_group::{
         PredicateDerivedKind, PredicateGroup, PredicateOrigin,
     };
-    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
+    use crate::sql::optimizer::scalar::ScalarArena;
+
+    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
     use arrow::datatypes::DataType;
     use std::collections::HashSet;
 

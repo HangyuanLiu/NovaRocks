@@ -24,13 +24,14 @@ use crate::sql::codegen::iceberg_write_sink::{
     IcebergWriteSinkMode, IcebergWriteSinkSpec, partition_info_from_serialized_metadata,
 };
 use crate::sql::codegen::nodes;
+use crate::sql::codegen::scalar_materialize::materialize;
 use crate::sql::codegen::{
     DirectExecPlan, FragmentBuildResult, MultiFragmentBuildResult, OutputColumn,
 };
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::operator::ProjectOp;
 use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
-use crate::sql::optimizer::scalar::{ScalarArena, materialize};
+use crate::sql::optimizer::scalar::ScalarArena;
 
 use crate::sql::analysis::{ExprKind, LiteralValue, TypedExpr};
 
@@ -997,11 +998,12 @@ mod tests {
     };
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::runtime_filter_pass::RuntimeFilterDesc;
-    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
-    use crate::sql::optimizer::scalar_bridge::{
+    use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::optimizer::statistics::Statistics;
+    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
+    use crate::sql::planner::optimizer_bridge::scalar::{
         intern_exprs, intern_project_items, intern_sort_items, intern_window_exprs,
     };
-    use crate::sql::optimizer::statistics::Statistics;
     use crate::sql::planner::plan::WindowExpr;
 
     /// OQ-5 B1: `remap_rf_expr_order` must translate a runtime filter's
@@ -2434,8 +2436,10 @@ mod tests {
             crate::sql::analyzer::analyze(&query, &catalog, "default")?;
         let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
         let mut scalar_arena = optimizer::scalar::ScalarArena::new();
-        let opt_expr =
-            optimizer::convert::try_logical_plan_to_opt_expr(&logical, &mut scalar_arena)?;
+        let opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+            &logical,
+            &mut scalar_arena,
+        )?;
         let physical = optimizer::optimize(
             opt_expr,
             scalar_arena,
@@ -2461,8 +2465,10 @@ mod tests {
             crate::sql::analyzer::analyze(&query, &catalog, "default")?;
         let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
         let mut scalar_arena = optimizer::scalar::ScalarArena::new();
-        let opt_expr =
-            optimizer::convert::try_logical_plan_to_opt_expr(&logical, &mut scalar_arena)?;
+        let opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+            &logical,
+            &mut scalar_arena,
+        )?;
         let physical = optimizer::optimize(
             opt_expr,
             scalar_arena,

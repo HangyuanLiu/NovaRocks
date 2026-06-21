@@ -4,9 +4,9 @@
 
 use std::collections::HashMap;
 
-use crate::sql::analysis::BinOp;
 use crate::sql::catalog::ScanSource;
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::BinOp;
 use crate::sql::optimizer::operator::{Operator, ScanOp};
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
@@ -228,8 +228,8 @@ mod tests {
     use crate::sql::analysis::{BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, TypedExpr};
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::convert::logical_plan_to_opt_expr;
     use crate::sql::optimizer::scalar::{self, ScalarArena};
+    use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
     use crate::sql::planner::plan::{
         LogicalJoinNode, LogicalPlanNode, LogicalScanNode, PlanNodeKind,
     };
@@ -318,8 +318,8 @@ mod tests {
         map: &HashMap<ColumnId, (TableIdentity, String)>,
     ) -> bool {
         let mut arena = ScalarArena::new();
-        let a = scalar::intern_typed(&mut arena, a);
-        let b = scalar::intern_typed(&mut arena, b);
+        let a = crate::sql::planner::optimizer_bridge::scalar::intern_typed(&mut arena, a);
+        let b = crate::sql::planner::optimizer_bridge::scalar::intern_typed(&mut arena, b);
         super::expr_phys_eq(&arena, a, b, map)
     }
 

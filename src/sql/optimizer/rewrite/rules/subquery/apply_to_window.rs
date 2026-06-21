@@ -12,8 +12,9 @@ use super::scalar_utils;
 use super::win_magic_util::{
     TableIdentity, collect_scan_column_map, collect_table_ids, expr_phys_eq,
 };
-use crate::sql::analysis::{JoinKind, OutputColumn};
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::ApplyKind;
+use crate::sql::common::{JoinKind, OutputColumn};
 use crate::sql::optimizer::operator::{
     ApplyOp, LogicalAggregateOp, Operator, ScalarAggregateSpec, SortOp, WindowOp,
 };
@@ -23,7 +24,6 @@ use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId};
-use crate::sql::planner::plan::ApplyKind;
 
 const WHITELIST: &[&str] = &["count", "sum", "avg", "min", "max"];
 
@@ -513,7 +513,6 @@ mod tests {
     };
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::column_id::{ColumnId, ColumnRefFactory};
-    use crate::sql::optimizer::convert::logical_plan_to_opt_expr;
     use crate::sql::optimizer::operator::Operator;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::result::RewriteResult;
@@ -521,6 +520,7 @@ mod tests {
     use crate::sql::optimizer::rewrite::rules::subquery::bridge::opt_expr_to_plan;
     use crate::sql::optimizer::rewrite::rules::utils::{collect_column_id_refs, split_and};
     use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
     use crate::sql::planner::plan::{
         AggregateCall, ApplyKind, LogicalAggregateNode, LogicalApplyNode, LogicalFilterNode,
         LogicalJoinNode, LogicalLimitNode, LogicalPlanNode, LogicalProjectNode, LogicalScanNode,

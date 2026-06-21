@@ -6,8 +6,8 @@
 
 use std::collections::HashSet;
 
-use crate::sql::analysis::{BinOp, JoinKind};
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::{BinOp, JoinKind};
 use crate::sql::optimizer::operator::{FilterOp, LogicalJoinOp, Operator};
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
@@ -731,7 +731,7 @@ mod tests {
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
     use crate::sql::optimizer::operator::ScanOp;
     use crate::sql::optimizer::rewrite::context::RewriteContext;
-    use crate::sql::optimizer::scalar::{intern_typed, materialize};
+    use crate::sql::planner::optimizer_bridge::scalar::{intern_typed, materialize};
 
     fn col_id(id: u32) -> ColumnId {
         ColumnId::new_for_test(id)

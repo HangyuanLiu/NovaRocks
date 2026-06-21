@@ -151,7 +151,7 @@ impl SearchContext {
                     let required_for_correctness = matches!(
                         &expr.op,
                         Operator::PhysicalHashJoin(join)
-                            if join.join_type == crate::sql::analysis::JoinKind::NullAwareLeftAnti
+                            if join.join_type == crate::sql::common::JoinKind::NullAwareLeftAnti
                     );
                     if let (Some(&probe_group_id), Some(&build_group_id)) =
                         (expr.children.first(), expr.children.get(1))
@@ -335,7 +335,7 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::MExpr;
     use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
-    use crate::sql::optimizer::scalar::intern_typed;
+    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
     use arrow::datatypes::DataType;
 
     /// Build a simple memo with a single PhysicalScan group.
@@ -970,8 +970,8 @@ mod cascaded_derivation_tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::MExpr;
     use crate::sql::optimizer::operator::*;
-    use crate::sql::optimizer::scalar::intern_typed;
-    use crate::sql::optimizer::scalar_bridge::intern_window_exprs;
+    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
+    use crate::sql::planner::optimizer_bridge::scalar::intern_window_exprs;
     use arrow::datatypes::DataType;
 
     fn col(id: u32) -> TypedExpr {

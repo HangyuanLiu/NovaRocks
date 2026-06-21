@@ -4,8 +4,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::sql::analysis::JoinKind;
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::JoinKind;
 use crate::sql::optimizer::memo::{GroupId, Memo};
 use crate::sql::optimizer::operator::{LogicalJoinOp, Operator};
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
@@ -158,7 +158,7 @@ fn split_and_scalar(arena: &ScalarArena, expr: ScalarId) -> Vec<ScalarId> {
 fn split_and_scalar_inner(arena: &ScalarArena, expr: ScalarId, out: &mut Vec<ScalarId>) {
     match arena.node(expr) {
         ScalarNode::BinaryOp {
-            op: crate::sql::analysis::BinOp::And,
+            op: crate::sql::common::BinOp::And,
             left,
             right,
         } => {
@@ -255,9 +255,9 @@ mod tests {
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr};
     use crate::sql::optimizer::memo::{JoinTree, LogicalProperties, MExpr};
     use crate::sql::optimizer::operator::ValuesOp;
-    use crate::sql::optimizer::scalar::intern_typed;
     use crate::sql::optimizer::statistics::ColumnStatistic;
     use crate::sql::optimizer::stats::copy_in_join_tree;
+    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
     use std::collections::HashMap as Map;
 
     fn col(id: u32) -> TypedExpr {

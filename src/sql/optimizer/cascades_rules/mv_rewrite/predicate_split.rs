@@ -4,8 +4,8 @@
 
 use std::collections::HashMap;
 
-use crate::sql::analysis::{BinOp, LiteralValue};
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::{BinOp, LiteralValue};
 use crate::sql::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNode};
 
 use super::column_mapping::{NormExpr, normalize};
@@ -307,7 +307,9 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, OutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, intern_typed};
+    use crate::sql::optimizer::scalar::{ScalarArena, ScalarId};
+
+    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
     use arrow::datatypes::DataType;
     use std::collections::HashMap;
 

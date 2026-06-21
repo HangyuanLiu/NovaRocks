@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::sql::analysis::JoinKind;
+use crate::sql::common::JoinKind;
 use crate::sql::optimizer::memo::{GroupId, JoinTree, MExpr, Memo};
 use crate::sql::optimizer::operator::{LogicalJoinOp, Operator};
 use crate::sql::optimizer::statistics::{Confidence, TableStatistics};
@@ -190,8 +190,8 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::LogicalProperties;
     use crate::sql::optimizer::operator::ValuesOp;
-    use crate::sql::optimizer::scalar::intern_typed;
     use crate::sql::optimizer::statistics::ColumnStatistic;
+    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
 
     fn col(id: u32) -> TypedExpr {
         TypedExpr {

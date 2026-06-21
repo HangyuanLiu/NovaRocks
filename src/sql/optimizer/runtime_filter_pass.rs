@@ -5,8 +5,8 @@
 //! descendant that can bind the probe column. EXPLAIN renders the annotations;
 //! codegen lowers them to thrift `TRuntimeFilterDescription`.
 
-use crate::sql::analysis::JoinKind;
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::JoinKind;
 use crate::sql::optimizer::operator::{JoinDistribution, Operator, PhysicalHashJoinEqCondition};
 use crate::sql::optimizer::options::OptimizerOptions;
 use crate::sql::optimizer::physical_plan::{JoinExecutionDistribution, PhysicalPlanNode};
@@ -542,8 +542,10 @@ pub(crate) mod test_support {
         JoinDistribution, Operator, PhysicalHashJoinEqCondition, PhysicalHashJoinOp, ValuesOp,
     };
     use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, attach_scalar_arena};
-    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
+    use crate::sql::optimizer::scalar::ScalarArena;
+
     use crate::sql::optimizer::statistics::Statistics;
+    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
 
     /// Helper: an Int32 column + a matching ColumnRef expr + OutputColumn.
     fn col(id: u32, name: &str) -> (OutputColumn, TypedExpr) {

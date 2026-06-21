@@ -61,15 +61,15 @@
 
 use arrow::datatypes::DataType;
 
-use crate::sql::analysis::{BinOp, OutputColumn};
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::{BinOp, DictionarySnapshot, OutputColumn};
+use crate::sql::common::{DecodeMapping, ScanDictionaryColumn};
 use crate::sql::optimizer::operator::{
     DecodeOp, LogicalAggregateOp, LogicalJoinOp, Operator, ProjectOp, ScalarAggregateSpec,
     ScalarProjectItem, ScanOp, SortOp, TopNOp, UnionOp,
 };
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::scalar::{ColumnDisplay, ScalarArena, ScalarId, ScalarNode};
-use crate::sql::planner::plan::{DecodeMapping, ScanDictionaryColumn};
 
 use super::context::{DictBinding, DictScope, DictionaryRewriteContext};
 use super::expr::{DICT_AGG_FUNCTIONS, dict_keys_compatible, rewrite_column_ref_with_scope};
@@ -599,7 +599,7 @@ fn rewrite_aggregate(
         String,
         String,
         ColumnId,
-        std::sync::Arc<crate::engine::dictionary::model::DictionarySnapshot>,
+        std::sync::Arc<DictionarySnapshot>,
     )> = Vec::new();
     for (index, expr) in node.group_by.iter().copied().enumerate() {
         if matches!(arena.node(expr), ScalarNode::ColumnRef(_))
@@ -707,10 +707,7 @@ fn rewrite_aggregate(
     // names and types on the decode's output_columns.
     let mut decoded_index: std::collections::BTreeMap<
         String,
-        (
-            String,
-            std::sync::Arc<crate::engine::dictionary::model::DictionarySnapshot>,
-        ),
+        (String, std::sync::Arc<DictionarySnapshot>),
     > = std::collections::BTreeMap::new();
     for (dict, string, _, snap) in &decoded_group_keys {
         decoded_index.insert(dict.clone(), (string.clone(), snap.clone()));
@@ -1619,8 +1616,8 @@ fn plan_output_columns(plan: &OptExpr, arena: &ScalarArena) -> Vec<OutputColumn>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::optimizer::convert::logical_plan_to_opt_expr;
     use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
     use crate::sql::planner::plan::*;
     use crate::sql::planner::plan::{
         LogicalExceptNode, LogicalIntersectNode, LogicalUnionNode, LogicalValuesNode, PlanNodeKind,

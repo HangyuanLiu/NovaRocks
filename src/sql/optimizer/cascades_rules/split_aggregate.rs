@@ -1,5 +1,5 @@
-use crate::sql::analysis::OutputColumn;
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::OutputColumn;
 use crate::sql::optimizer::memo::{MExpr, Memo};
 use crate::sql::optimizer::operator::{
     AggStage, LogicalAggregateOp, Operator, ScalarAggregateSpec,
@@ -215,8 +215,8 @@ mod tests {
     use crate::sql::analysis::{ExprKind, OutputColumn, TypedExpr};
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::operator::{AggStage, LogicalAggregateOp, ValuesOp};
-    use crate::sql::optimizer::scalar::materialize;
-    use crate::sql::optimizer::scalar_bridge::{intern_aggregate_calls, intern_exprs};
+    use crate::sql::planner::optimizer_bridge::scalar::materialize;
+    use crate::sql::planner::optimizer_bridge::scalar::{intern_aggregate_calls, intern_exprs};
     use crate::sql::planner::plan::AggregateCall;
     use arrow::datatypes::DataType;
 

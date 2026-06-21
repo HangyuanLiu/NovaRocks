@@ -1,7 +1,7 @@
 //! Inner join equivalence predicate propagation.
 
-use crate::sql::analysis::{JoinKind, OutputColumn};
 use crate::sql::column_id::ColumnId;
+use crate::sql::common::{JoinKind, OutputColumn};
 use crate::sql::optimizer::logical_props::{
     collect_column_equalities, collect_literal_equalities, combine_with_and, literal_signature,
     make_eq_literal_predicate,
@@ -308,7 +308,9 @@ mod tests {
     use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr};
     use crate::sql::catalog::{ScanSource, TableDef};
     use crate::sql::optimizer::operator::ScanOp;
-    use crate::sql::optimizer::scalar::{ScalarId, intern_typed};
+    use crate::sql::optimizer::scalar::ScalarId;
+
+    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
     use arrow::datatypes::DataType;
 
     fn output(id: u32, name: &str) -> OutputColumn {

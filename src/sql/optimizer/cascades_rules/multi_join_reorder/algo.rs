@@ -9,7 +9,7 @@
 
 use arrow::datatypes::DataType;
 
-use crate::sql::analysis::{BinOp, JoinKind};
+use crate::sql::common::{BinOp, JoinKind};
 use crate::sql::optimizer::estimate::cardinality::{JoinCardInput, estimate_join_cardinality};
 use crate::sql::optimizer::estimate::join_condition::estimate_join_condition;
 use crate::sql::optimizer::memo::JoinTree;
@@ -634,8 +634,10 @@ mod tests {
     use super::*;
     use crate::sql::analysis::{BinOp, ExprKind, TypedExpr};
     use crate::sql::column_id::ColumnId;
-    use crate::sql::optimizer::scalar::{ScalarArena, intern_typed};
+    use crate::sql::optimizer::scalar::ScalarArena;
+
     use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence};
+    use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
     use std::collections::HashMap;
 
     fn col_ref(id: u32) -> TypedExpr {

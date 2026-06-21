@@ -7,6 +7,7 @@
 use crate::connector::starrocks::table::model::IcebergTableRef;
 use crate::engine::mv::refresh_context::IcebergMvRewriteContext;
 use crate::sql::catalog::{IcebergTableInfo, ScanSource};
+pub(crate) use crate::sql::common::ImvVersionRole;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
@@ -16,12 +17,6 @@ use crate::sql::planner::imv_rewrite::action_column::ImvActionColumn;
 use crate::sql::planner::imv_rewrite::annotation::ImvExtension;
 use crate::sql::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
 use crate::sql::planner::plan::{LogicalPlanNode, LogicalScanNode, PlanNodeKind};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ImvVersionRole {
-    From,
-    To,
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ImvSnapshotWindow {
@@ -234,12 +229,12 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use crate::sql::optimizer::convert::logical_plan_to_opt_expr;
     use crate::sql::optimizer::rewrite::result::RewriteResult;
     use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
     use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::planner::imv_rewrite::action_propagation::InjectActionColumnRule;
     use crate::sql::planner::imv_rewrite::annotation::{ImvExtension, ImvPlanAnnotation};
+    use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
     use std::sync::Arc;
     use std::sync::atomic::AtomicU32;
 
@@ -364,7 +359,7 @@ mod tests {
             panic!("expected changed scan");
         };
         let arena_ref = ctx.scalar_arena();
-        let changed = crate::sql::optimizer::convert::opt_expr_to_logical_plan(
+        let changed = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
             changed_expr.clone(),
             &arena_ref.borrow(),
         );
@@ -421,7 +416,7 @@ mod tests {
             panic!("expected changed scan");
         };
         let arena_ref = ctx.scalar_arena();
-        let changed = crate::sql::optimizer::convert::opt_expr_to_logical_plan(
+        let changed = crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
             changed_expr,
             &arena_ref.borrow(),
         );

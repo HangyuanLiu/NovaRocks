@@ -35,6 +35,7 @@ use crate::sql::codegen::runtime_filter_lowering::{
     remap_rf_expr_order, rf_build_expr_matches_join_build_expr,
     rf_layout_for_execution_distribution, rf_pipeline_dop,
 };
+use crate::sql::codegen::scalar_materialize::materialize;
 use crate::sql::codegen::type_infer;
 use crate::sql::codegen::{
     FragmentBuildResult, FragmentId, MultiFragmentBuildResult, OutputColumn,
@@ -43,8 +44,11 @@ use crate::sql::optimizer::operator::{
     AggMode, AssertOneRowOp, DecodeOp, GenerateSeriesOp, RepeatOp, ScanDictionaryColumn, TopNPhase,
 };
 use crate::sql::optimizer::physical_plan::JoinExecutionDistribution;
-use crate::sql::optimizer::property::{OrderingSpec, window_ordering_spec};
-use crate::sql::optimizer::scalar::{ScalarArena, materialize};
+use crate::sql::optimizer::property::OrderingSpec;
+use crate::sql::optimizer::scalar::ScalarArena;
+use crate::sql::planner::optimizer_bridge::property::{
+    ordering_spec_from_sort_items, window_ordering_spec,
+};
 use crate::sql::planner::plan::{AggregateCall, WindowExpr};
 use crate::types;
 
@@ -1231,7 +1235,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             scope: child.scope,
             tuple_ids: child.tuple_ids,
             output_columns: sort.output_columns.clone(),
-            ordering: OrderingSpec::from_sort_items(&sort.items),
+            ordering: ordering_spec_from_sort_items(&sort.items),
         })
     }
 
@@ -1257,7 +1261,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
             scope: child.scope,
             tuple_ids: child.tuple_ids,
             output_columns: child.output_columns,
-            ordering: OrderingSpec::from_sort_items(&topn.items),
+            ordering: ordering_spec_from_sort_items(&topn.items),
         })
     }
 
@@ -1333,7 +1337,7 @@ impl<'s, 'a, S: LoweringStateAccess<'a> + ?Sized> LoweringCtx<'s, 'a, S> {
                     scope: source.scope,
                     tuple_ids: source.tuple_ids,
                     output_columns: source.output_columns,
-                    ordering: OrderingSpec::from_sort_items(items),
+                    ordering: ordering_spec_from_sort_items(items),
                 })
             }
             super::kind::ExchangeFlavor::CteMulticast { .. } => {
@@ -4578,8 +4582,8 @@ mod tests {
         PhysicalPlanNode, PlanExecutionProps, attach_scalar_arena,
     };
     use crate::sql::optimizer::scalar::ScalarArena;
-    use crate::sql::optimizer::scalar_bridge::intern_project_items;
     use crate::sql::optimizer::statistics::Statistics;
+    use crate::sql::planner::optimizer_bridge::scalar::intern_project_items;
 
     #[test]
     fn aggregate_slot_contract_uses_intermediate_only_for_non_finalize() {
