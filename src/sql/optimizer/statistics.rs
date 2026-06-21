@@ -14,7 +14,7 @@ pub enum Confidence {
     #[default]
     Fallback, // relied on a heuristic/default (name-based rows, default selectivity/NDV)
     Estimated, // derived via formula from at-least-partially-real inputs
-    Exact, // sourced from real catalog/Iceberg stats (Puffin NDV, metadata row_count)
+    Exact,     // sourced from real catalog/Iceberg stats (Puffin NDV, metadata row_count)
     /// Measured source (MV materialized row count / runtime feedback / sampling).
     /// Strictly more trustworthy than catalog `Exact`.
     /// Currently has no producer (stub) — inert until a measured source lands.

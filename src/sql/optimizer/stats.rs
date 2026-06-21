@@ -5829,7 +5829,9 @@ mod tests {
         derive_group_statistics(&mut memo, &table_stats);
 
         // The group now has cached props — single member is Fallback.
-        let props = memo.groups[group].logical_props.as_ref()
+        let props = memo.groups[group]
+            .logical_props
+            .as_ref()
             .expect("bulk pass must have stamped logical_props");
         assert_eq!(
             props.row_count_confidence,
@@ -5845,7 +5847,9 @@ mod tests {
         // ── Step 4: hazard — bulk pass SKIPS the group. ───────────────────
         // The guard sees `logical_props.is_some()` and does not re-run argmax.
         derive_group_statistics(&mut memo, &table_stats);
-        let props_after_bulk = memo.groups[group].logical_props.as_ref()
+        let props_after_bulk = memo.groups[group]
+            .logical_props
+            .as_ref()
             .expect("logical_props must remain Some (M1 invariant)");
         assert_eq!(
             props_after_bulk.row_count_confidence,
@@ -5858,7 +5862,9 @@ mod tests {
         // This is what a real producer MUST call at append time.
         derive_group_statistics_for(&mut memo, group, &table_stats);
 
-        let props_after_eager = memo.groups[group].logical_props.as_ref()
+        let props_after_eager = memo.groups[group]
+            .logical_props
+            .as_ref()
             .expect("(a) logical_props must remain Some — eager re-derive MUST NOT go to None");
         assert_eq!(
             props_after_eager.row_count_confidence,
