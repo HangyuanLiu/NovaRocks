@@ -911,15 +911,33 @@ fn is_detailed(level: ExplainLevel) -> bool {
 
 fn costs_suffix(stats: &PlanNodeStats, level: ExplainLevel) -> String {
     if matches!(level, ExplainLevel::Costs) {
+        let row_part = format!("rows={:.0}", stats.output_row_count);
+        let cost_part = stats
+            .cost_estimate
+            .as_ref()
+            .map(format_cost_estimate)
+            .unwrap_or_default();
         let colstats = format_column_stats_costs(stats);
-        if colstats.is_empty() {
-            format!(" (rows={:.0})", stats.output_row_count)
-        } else {
-            format!(" (rows={:.0}) {colstats}", stats.output_row_count)
+        match (cost_part.is_empty(), colstats.is_empty()) {
+            (true, true) => format!(" ({row_part})"),
+            (false, true) => format!(" ({row_part} {cost_part})"),
+            (true, false) => format!(" ({row_part}) {colstats}"),
+            (false, false) => format!(" ({row_part} {cost_part}) {colstats}"),
         }
     } else {
         String::new()
     }
+}
+
+fn format_cost_estimate(cost: &crate::sql::optimizer::statistics::CostEstimate) -> String {
+    let options = crate::sql::optimizer::cost::CostOptions::default();
+    format!(
+        "cost={{cpu={} memory={} network={} total={}}}",
+        fmt_f64(cost.cpu_cost),
+        fmt_f64(cost.memory_cost),
+        fmt_f64(cost.network_cost),
+        fmt_f64(cost.total_with_options(&options)),
+    )
 }
 
 fn stats_suffix(stats: &PlanNodeStats, level: ExplainLevel) -> String {
@@ -966,7 +984,7 @@ fn format_column_stats_costs(stats: &PlanNodeStats) -> String {
         .map(|column_id| {
             let c = &stats.column_statistics[&column_id];
             let ndv = if c.distinct_values_count.is_finite() {
-                (c.distinct_values_count.round() as i64).to_string()
+                fmt_f64(c.distinct_values_count.round())
             } else {
                 "?".to_string()
             };
@@ -983,6 +1001,8 @@ fn format_column_stats_costs(stats: &PlanNodeStats) -> String {
 }
 
 fn fmt_f64(v: f64) -> String {
+    const SAFE_INTEGER_DISPLAY_LIMIT: f64 = 9_007_199_254_740_992.0;
+
     if v.is_nan() {
         "?".to_string()
     } else if v.is_infinite() {
@@ -991,6 +1011,8 @@ fn fmt_f64(v: f64) -> String {
         } else {
             "-inf".to_string()
         }
+    } else if v.abs() > SAFE_INTEGER_DISPLAY_LIMIT {
+        format!("{v:.4e}")
     } else if v.fract() == 0.0 {
         format!("{}", v as i64)
     } else {
@@ -1432,6 +1454,58 @@ mod tests {
         assert!(
             costs.contains("colstats={col#1[min=0 max=1000 ndv=1000 null_frac=0]}"),
             "Costs must render colstats copied into PlanNodeStats:\n{costs}"
+        );
+    }
+
+    #[test]
+    fn costs_colstats_ndv_uses_scientific_not_i64_saturation_for_huge_values() {
+        let mut scan = scan_plan();
+        scan.stats.column_statistics.insert(
+            ColumnId::new_for_test(1),
+            ColumnStatistic {
+                min_value: 0.0,
+                max_value: 1.0e300,
+                nulls_fraction: 0.0,
+                average_row_size: 8.0,
+                distinct_values_count: 1.0e300,
+                ..Default::default()
+            },
+        );
+        let dp = build_distributed_plan(&scan).expect("build DistributedPlan");
+
+        let costs = explain_distributed_plan(&dp, ExplainLevel::Costs).join("\n");
+        assert!(
+            costs.contains("ndv=1.0000e300"),
+            "huge NDV should use scientific notation:\n{costs}"
+        );
+        assert!(
+            !costs.contains("9223372036854775807"),
+            "huge NDV must not saturate through i64 formatting:\n{costs}"
+        );
+    }
+
+    #[test]
+    fn costs_level_renders_dimensional_costs() {
+        let dp = build_distributed_plan(&scan_plan()).expect("build DistributedPlan");
+
+        let costs = explain_distributed_plan(&dp, ExplainLevel::Costs).join("\n");
+        assert!(costs.contains("1:SCAN test_db.t (alias=t) (rows=3 cost={cpu="));
+        assert!(costs.contains("memory="));
+        assert!(costs.contains("network="));
+        assert!(costs.contains("total="));
+    }
+
+    #[test]
+    fn fmt_f64_uses_scientific_not_i64_saturation_for_huge_values() {
+        let text = super::fmt_f64(1.0e300);
+
+        assert!(
+            text.contains('e') || text.contains('E'),
+            "huge finite values should use scientific notation, got {text}"
+        );
+        assert!(
+            !text.contains("9223372036854775807"),
+            "huge finite values must not saturate through i64 formatting"
         );
     }
 

@@ -72,6 +72,8 @@ pub struct Statistics {
 }
 
 impl Statistics {
+    const MAX_FINITE_SIZE: f64 = 1.0e300;
+
     pub fn avg_row_size(&self) -> f64 {
         if self.column_statistics.is_empty() {
             8.0
@@ -85,6 +87,83 @@ impl Statistics {
 
     pub fn compute_size(&self) -> f64 {
         self.output_row_count * self.avg_row_size()
+    }
+
+    pub fn safe_output_row_count(&self) -> f64 {
+        if self.output_row_count.is_finite() && self.output_row_count > 0.0 {
+            self.output_row_count
+        } else if self.output_row_count.is_infinite() && self.output_row_count.is_sign_positive() {
+            Self::MAX_FINITE_SIZE
+        } else {
+            1.0
+        }
+    }
+
+    pub fn compute_size_for_columns(&self, columns: &[ColumnId]) -> f64 {
+        let row_width = if columns.is_empty() {
+            self.safe_width_for_all_columns()
+        } else {
+            let mut row_width = 0.0;
+            for column_id in columns {
+                row_width = Self::add_safe_width(
+                    row_width,
+                    self.column_statistics
+                        .get(column_id)
+                        .map(|c| c.average_row_size),
+                );
+                if row_width >= Self::MAX_FINITE_SIZE {
+                    return Self::MAX_FINITE_SIZE;
+                }
+            }
+            row_width
+        };
+        self.safe_size(row_width)
+    }
+
+    fn safe_width_for_all_columns(&self) -> f64 {
+        if self.column_statistics.is_empty() {
+            return 8.0;
+        }
+        let mut row_width = 0.0;
+        for column in self.column_statistics.values() {
+            row_width = Self::add_safe_width(row_width, Some(column.average_row_size));
+            if row_width >= Self::MAX_FINITE_SIZE {
+                return Self::MAX_FINITE_SIZE;
+            }
+        }
+        row_width
+    }
+
+    fn add_safe_width(total: f64, width: Option<f64>) -> f64 {
+        let contribution = match width {
+            Some(width) if width.is_finite() && width > 0.0 => width,
+            Some(width) if width.is_infinite() && width.is_sign_positive() => {
+                return Self::MAX_FINITE_SIZE;
+            }
+            _ => 8.0,
+        };
+        let total = total + contribution;
+        if total.is_finite() && total >= 0.0 {
+            total.min(Self::MAX_FINITE_SIZE)
+        } else {
+            Self::MAX_FINITE_SIZE
+        }
+    }
+
+    fn safe_size(&self, row_width: f64) -> f64 {
+        if row_width >= Self::MAX_FINITE_SIZE {
+            return Self::MAX_FINITE_SIZE;
+        }
+        let row_count = self.safe_output_row_count();
+        if row_count >= Self::MAX_FINITE_SIZE {
+            return Self::MAX_FINITE_SIZE;
+        }
+        let size = row_count * row_width;
+        if size.is_finite() && size >= 0.0 {
+            size.min(Self::MAX_FINITE_SIZE)
+        } else {
+            Self::MAX_FINITE_SIZE
+        }
     }
 }
 
@@ -119,6 +198,15 @@ pub struct CostEstimate {
 impl CostEstimate {
     pub fn total_cost(&self) -> f64 {
         self.cpu_cost * 0.5 + self.memory_cost * 2.0 + self.network_cost * 1.5
+    }
+
+    pub fn weighted_total(&self, cpu_weight: f64, memory_weight: f64, network_weight: f64) -> f64 {
+        fn finite_or_zero(v: f64) -> f64 {
+            if v.is_finite() && v > 0.0 { v } else { 0.0 }
+        }
+        finite_or_zero(self.cpu_cost) * cpu_weight
+            + finite_or_zero(self.memory_cost) * memory_weight
+            + finite_or_zero(self.network_cost) * network_weight
     }
 
     #[allow(dead_code)] // used by cost model tests
@@ -429,6 +517,145 @@ mod tests {
         assert!((c.cpu_cost - 40.0).abs() < f64::EPSILON);
         assert!((c.memory_cost - 30.0).abs() < f64::EPSILON);
         assert!((c.network_cost - 20.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn statistics_compute_size_for_requested_columns() {
+        let mut stats = Statistics {
+            output_row_count: 10.0,
+            ..Default::default()
+        };
+        stats.column_statistics.insert(
+            ColumnId::new_for_test(1),
+            ColumnStatistic {
+                average_row_size: 4.0,
+                ..Default::default()
+            },
+        );
+        stats.column_statistics.insert(
+            ColumnId::new_for_test(2),
+            ColumnStatistic {
+                average_row_size: 16.0,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            stats.compute_size_for_columns(&[ColumnId::new_for_test(2)]),
+            160.0
+        );
+        assert_eq!(
+            stats.compute_size_for_columns(&[ColumnId::new_for_test(1), ColumnId::new_for_test(2)]),
+            200.0
+        );
+    }
+
+    #[test]
+    fn statistics_compute_size_for_missing_columns_uses_default_width() {
+        let stats = Statistics {
+            output_row_count: 5.0,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            stats.compute_size_for_columns(&[ColumnId::new_for_test(99)]),
+            40.0
+        );
+    }
+
+    #[test]
+    fn statistics_compute_size_for_columns_saturates_invalid_sizes() {
+        let mut invalid_stats = Statistics {
+            output_row_count: f64::NAN,
+            ..Default::default()
+        };
+        invalid_stats.column_statistics.insert(
+            ColumnId::new_for_test(1),
+            ColumnStatistic {
+                average_row_size: f64::NAN,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            invalid_stats.compute_size_for_columns(&[ColumnId::new_for_test(1)]),
+            8.0
+        );
+        assert_eq!(invalid_stats.compute_size_for_columns(&[]), 8.0);
+
+        let mut infinite_row_stats = Statistics {
+            output_row_count: f64::INFINITY,
+            ..Default::default()
+        };
+        infinite_row_stats.column_statistics.insert(
+            ColumnId::new_for_test(1),
+            ColumnStatistic {
+                average_row_size: 4.0,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            infinite_row_stats.compute_size_for_columns(&[ColumnId::new_for_test(1)]),
+            Statistics::MAX_FINITE_SIZE
+        );
+        assert_eq!(
+            infinite_row_stats.compute_size_for_columns(&[]),
+            Statistics::MAX_FINITE_SIZE
+        );
+
+        let mut infinite_width_stats = Statistics {
+            output_row_count: 10.0,
+            ..Default::default()
+        };
+        infinite_width_stats.column_statistics.insert(
+            ColumnId::new_for_test(1),
+            ColumnStatistic {
+                average_row_size: f64::INFINITY,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            infinite_width_stats.compute_size_for_columns(&[ColumnId::new_for_test(1)]),
+            Statistics::MAX_FINITE_SIZE
+        );
+        assert_eq!(
+            infinite_width_stats.compute_size_for_columns(&[]),
+            Statistics::MAX_FINITE_SIZE
+        );
+
+        let mut overflow_stats = Statistics {
+            output_row_count: 1.0e299,
+            ..Default::default()
+        };
+        overflow_stats.column_statistics.insert(
+            ColumnId::new_for_test(1),
+            ColumnStatistic {
+                average_row_size: 1.0e10,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            overflow_stats.compute_size_for_columns(&[ColumnId::new_for_test(1)]),
+            Statistics::MAX_FINITE_SIZE
+        );
+        assert_eq!(
+            overflow_stats.compute_size_for_columns(&[]),
+            Statistics::MAX_FINITE_SIZE
+        );
+    }
+
+    #[test]
+    fn cost_estimate_weighted_total_uses_explicit_weights() {
+        let cost = CostEstimate {
+            cpu_cost: 100.0,
+            memory_cost: 10.0,
+            network_cost: 20.0,
+        };
+
+        assert_eq!(cost.weighted_total(0.5, 2.0, 1.5), 100.0);
     }
 
     #[test]

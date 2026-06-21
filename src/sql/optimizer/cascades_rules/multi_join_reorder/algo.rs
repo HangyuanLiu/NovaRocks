@@ -23,6 +23,11 @@ use super::MultiJoinGraph;
 /// branch-and-bound comparator finite on cross-join chains (mirrors StarRocks
 /// `JoinOrder.MAXIMUM_COST`).
 const MAX_REORDER_COST: f64 = 1e300;
+const REORDER_CROSS_CPU_FACTOR: f64 = 2.0;
+const REORDER_CROSS_MEMORY_FACTOR: f64 = 200.0;
+const REORDER_HASH_BUILD_FACTOR: f64 = 1.0;
+const REORDER_OUTPUT_FACTOR: f64 = 1.0;
+const REORDER_PREDICATE_COMPLEXITY_MAX: f64 = 16.0;
 
 /// Caps controlling which algorithms run, mirroring StarRocks session vars.
 /// Wired to `OptimizerOptions` in Phase 4; plain parameters here.
@@ -142,21 +147,26 @@ fn join_self_cost(
     right: &Statistics,
     output: &Statistics,
     kind: JoinKind,
+    predicate_complexity: f64,
 ) -> f64 {
     let est = match kind {
         JoinKind::Cross => CostEstimate {
-            cpu_cost: finite_cost(left.compute_size() * right.output_row_count * 2.0),
-            memory_cost: finite_cost(right.compute_size() * 200.0),
+            cpu_cost: finite_cost(
+                left.compute_size() * right.output_row_count * REORDER_CROSS_CPU_FACTOR,
+            ),
+            memory_cost: finite_cost(right.compute_size() * REORDER_CROSS_MEMORY_FACTOR),
             network_cost: 0.0,
         },
         _ => {
             let right_rows = right.output_row_count.max(1.0);
             let probe_penalty = (right_rows / 100_000.0).ln().clamp(1.0, 12.0);
+            let predicate_complexity = bounded_predicate_complexity(predicate_complexity);
             CostEstimate {
                 cpu_cost: finite_cost(
-                    right.compute_size()
-                        + left.compute_size() * probe_penalty
-                        + output.compute_size(),
+                    (right.compute_size() * REORDER_HASH_BUILD_FACTOR
+                        + left.compute_size() * probe_penalty)
+                        * predicate_complexity
+                        + output.compute_size() * REORDER_OUTPUT_FACTOR,
                 ),
                 memory_cost: finite_cost(right.compute_size()),
                 network_cost: 0.0,
@@ -193,7 +203,14 @@ fn join_cells(
         Some(c) if has_equijoin_predicate(arena, *c) => JoinKind::Inner,
         _ => JoinKind::Cross,
     };
-    let self_cost = join_self_cost(&left.stats, &right.stats, &stats, cost_kind);
+    let predicate_complexity = join_predicate_complexity(arena, condition);
+    let self_cost = join_self_cost(
+        &left.stats,
+        &right.stats,
+        &stats,
+        cost_kind,
+        predicate_complexity,
+    );
     Cell {
         tree: JoinTree::Join {
             left: Box::new(left.tree.clone()),
@@ -489,6 +506,33 @@ fn has_equijoin_predicate(arena: &ScalarArena, expr: ScalarId) -> bool {
     }
 }
 
+fn join_predicate_complexity(arena: &ScalarArena, condition: Option<ScalarId>) -> f64 {
+    condition
+        .map(|expr| bounded_predicate_complexity(count_predicate_conjuncts(arena, expr) as f64))
+        .unwrap_or(1.0)
+}
+
+fn count_predicate_conjuncts(arena: &ScalarArena, expr: ScalarId) -> usize {
+    match arena.node(expr) {
+        ScalarNode::Nested(inner) => count_predicate_conjuncts(arena, *inner),
+        ScalarNode::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } => count_predicate_conjuncts(arena, *left)
+            .saturating_add(count_predicate_conjuncts(arena, *right)),
+        _ => 1,
+    }
+}
+
+fn bounded_predicate_complexity(v: f64) -> f64 {
+    if v.is_finite() {
+        v.max(1.0).min(REORDER_PREDICATE_COMPLEXITY_MAX)
+    } else {
+        1.0
+    }
+}
+
 fn combine_and_scalar(arena: &mut ScalarArena, mut exprs: Vec<ScalarId>) -> ScalarId {
     assert!(!exprs.is_empty());
     let mut result = exprs.pop().unwrap();
@@ -636,6 +680,63 @@ mod tests {
             row_count_confidence: Confidence::Estimated,
             column_statistics: cs,
         }
+    }
+
+    #[test]
+    fn join_self_cost_penalizes_cross_join_above_equi_join() {
+        let left = atom_stats(0, 10_000.0, 10_000.0);
+        let right = atom_stats(1, 10_000.0, 10_000.0);
+        let output = atom_stats(2, 1_000.0, 1_000.0);
+
+        let equi_cost = join_self_cost(&left, &right, &output, JoinKind::Inner, 1.0);
+        let cross_cost = join_self_cost(&left, &right, &output, JoinKind::Cross, 1.0);
+
+        assert!(cross_cost > equi_cost * 10.0);
+    }
+
+    #[test]
+    fn join_self_cost_accounts_for_output_size() {
+        let left = atom_stats(0, 10_000.0, 10_000.0);
+        let right = atom_stats(1, 10_000.0, 10_000.0);
+        let small_output = atom_stats(2, 100.0, 100.0);
+        let large_output = atom_stats(3, 100_000.0, 100_000.0);
+
+        assert!(
+            join_self_cost(&left, &right, &large_output, JoinKind::Inner, 1.0)
+                > join_self_cost(&left, &right, &small_output, JoinKind::Inner, 1.0)
+        );
+    }
+
+    #[test]
+    fn join_self_cost_accounts_for_predicate_complexity() {
+        let left = atom_stats(0, 10_000.0, 10_000.0);
+        let right = atom_stats(1, 10_000.0, 10_000.0);
+        let output = atom_stats(2, 1_000.0, 1_000.0);
+        let mut arena = ScalarArena::new();
+        let single_key = pred(&mut arena, eq(col_ref(0), col_ref(1)));
+        let second_key = pred(&mut arena, eq(col_ref(2), col_ref(3)));
+        let complex_predicate = combine_and_scalar(&mut arena, vec![single_key, second_key]);
+
+        let single_key_complexity = join_predicate_complexity(&arena, Some(single_key));
+        let complex_predicate_complexity =
+            join_predicate_complexity(&arena, Some(complex_predicate));
+
+        assert!(complex_predicate_complexity > single_key_complexity);
+        assert!(
+            join_self_cost(
+                &left,
+                &right,
+                &output,
+                JoinKind::Inner,
+                complex_predicate_complexity
+            ) > join_self_cost(
+                &left,
+                &right,
+                &output,
+                JoinKind::Inner,
+                single_key_complexity
+            )
+        );
     }
 
     fn pred(arena: &mut ScalarArena, expr: TypedExpr) -> ScalarId {

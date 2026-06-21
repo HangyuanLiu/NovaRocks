@@ -11,12 +11,12 @@
 //! `docs/design/specs/2026-05-21-g3-output-properties-visitor-design.md`
 //! §1 for the explanation.
 
-use super::cost::{DISTRIBUTION_STARTUP_COST, NETWORK_COST};
+use super::cost::{CostOptions, estimate_distribution_cost_estimate, estimate_sort_cost_estimate};
 use super::memo::Cost;
 use super::operator::*;
 use super::property::*;
 use super::scalar::{ScalarArena, ScalarId, ScalarNode, SortKey as ScalarSortKey};
-use super::statistics::Statistics;
+use super::statistics::{CostEstimate, Statistics};
 use crate::sql::column_id::ColumnId;
 
 // ---------------------------------------------------------------------------
@@ -298,20 +298,22 @@ pub(crate) fn needed_enforcers(
     enforcers
 }
 
-// `NETWORK_COST` and `DISTRIBUTION_STARTUP_COST` are the single source of truth
-// in `cost`; imported at the top of this module to avoid drift.
+/// Estimate the dimensional cost of an enforcer given group statistics.
+pub(crate) fn estimate_enforcer_cost_estimate(
+    enforcer: &EnforcerKind,
+    stats: &Statistics,
+    options: &CostOptions,
+) -> CostEstimate {
+    match enforcer {
+        EnforcerKind::Distribution(_) => estimate_distribution_cost_estimate(stats, options),
+        EnforcerKind::Sort(_) => estimate_sort_cost_estimate(stats, options),
+    }
+}
 
 /// Estimate the cost of an enforcer given group statistics.
 pub(crate) fn estimate_enforcer_cost(enforcer: &EnforcerKind, stats: &Statistics) -> Cost {
-    match enforcer {
-        EnforcerKind::Distribution(_) => {
-            DISTRIBUTION_STARTUP_COST + stats.compute_size() * NETWORK_COST
-        }
-        EnforcerKind::Sort(_) => {
-            let n = stats.output_row_count.max(1.0);
-            n * n.log2()
-        }
-    }
+    let options = CostOptions::default();
+    estimate_enforcer_cost_estimate(enforcer, stats, &options).total_with_options(&options)
 }
 
 // ---------------------------------------------------------------------------
@@ -328,6 +330,7 @@ pub(crate) enum EnforcerKind {
 mod tests {
     use super::*;
     use crate::sql::column_id::ColumnId;
+    use crate::sql::optimizer::cost::NETWORK_COST;
 
     #[test]
     fn needed_enforcers_distribution_mismatch() {
@@ -383,6 +386,61 @@ mod tests {
             cost > stats.compute_size() * NETWORK_COST,
             "distribution enforcers must model startup overhead for tiny exchanges"
         );
+    }
+
+    #[test]
+    fn distribution_enforcer_cost_estimate_has_network_dimension() {
+        let stats = Statistics {
+            output_row_count: 1000.0,
+            column_statistics: Default::default(),
+            ..Default::default()
+        };
+        let estimate = estimate_enforcer_cost_estimate(
+            &EnforcerKind::Distribution(DistributionSpec::Gather),
+            &stats,
+            &crate::sql::optimizer::cost::CostOptions::default(),
+        );
+
+        assert!(estimate.memory_cost > 0.0);
+        assert!(estimate.network_cost > 0.0);
+    }
+
+    #[test]
+    fn sort_enforcer_cost_estimate_saturates_huge_and_sanitizes_invalid_stats() {
+        let options = crate::sql::optimizer::cost::CostOptions::default();
+        let huge_stats = Statistics {
+            output_row_count: f64::MAX,
+            column_statistics: Default::default(),
+            ..Default::default()
+        };
+        let huge_estimate = estimate_enforcer_cost_estimate(
+            &EnforcerKind::Sort(OrderingSpec::Any),
+            &huge_stats,
+            &options,
+        );
+
+        assert!(huge_estimate.cpu_cost.is_finite());
+        assert!(huge_estimate.cpu_cost > 1.0e299);
+        assert!(huge_estimate.memory_cost.is_finite());
+        assert!(huge_estimate.memory_cost > 1.0e299);
+        assert_eq!(huge_estimate.network_cost, 0.0);
+
+        let invalid_stats = Statistics {
+            output_row_count: f64::NAN,
+            column_statistics: Default::default(),
+            ..Default::default()
+        };
+        let invalid_estimate = estimate_enforcer_cost_estimate(
+            &EnforcerKind::Sort(OrderingSpec::Any),
+            &invalid_stats,
+            &options,
+        );
+
+        assert!(invalid_estimate.cpu_cost.is_finite());
+        assert!(invalid_estimate.cpu_cost >= 0.0);
+        assert!(invalid_estimate.memory_cost.is_finite());
+        assert!(invalid_estimate.memory_cost >= 0.0);
+        assert_eq!(invalid_estimate.network_cost, 0.0);
     }
 
     #[test]
