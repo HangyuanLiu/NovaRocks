@@ -1029,7 +1029,7 @@ cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
 - [ ] **Step 5: Final commit**
 
 ```bash
-git add tools/dev/audit_optimizer_typedexpr.py docs/superpowers/plans/2026-06-20-arc-a-typedexpr-final-cleanup.md
+git add tools/dev/audit_optimizer_typedexpr.py docs/design/plans/2026-06-20-arc-a-typedexpr-final-cleanup.md
 git commit -m "test(optimizer): enforce TypedExpr cleanup audit"
 ```
 
@@ -1071,7 +1071,7 @@ Commit after every task. Do not batch subquery/IMV with unrelated rules.
 
 ## Execution Handoff
 
-Plan complete and saved to `docs/superpowers/plans/2026-06-20-arc-a-typedexpr-final-cleanup.md`.
+Plan complete and saved to `docs/design/plans/2026-06-20-arc-a-typedexpr-final-cleanup.md`.
 
 Two execution options:
 

@@ -6,7 +6,7 @@
 - 设计讨论（本会话）：把 IMV refresh contract 从 `RefreshStrategy` / `IncrementalMvShape` 的 shape 枚举中解耦，改成 logical plan rewrite 过程中合成的 *property*。
 - 承接 spec：[2026-06-02 Iceberg IMV UNION ALL Delta Rewrite 设计](2026-06-02-iceberg-imv-union-all-delta-rewrite-design.md)（已落地，建好全部底层原语）。
 - 承接 spec：[2026-05-26 IVM VARBINARY state & distinct-count 设计](2026-05-26-ivm-varbinary-state-and-distinct-count-aggregates-design.md)（aggregate state 编码）。
-- 关联：`docs/design/2026-05-25-general-logical-rewrite-framework.md`（通用 rewrite 框架）。
+- 关联：`docs/design/specs/2026-05-25-general-logical-rewrite-framework.md`（通用 rewrite 框架）。
 - Roadmap 索引：`NovaRocks Roadmap.md`（Iceberg v3 Incremental MV Roadmap）。
 
 本文是 IMV refresh 契约推导的**架构 spec**（what / why / 不变量 / 边界 / 阶段），作为后续各 Phase plan 的参照系。它**不重述**承接 spec 已记录的原语机制（branch_id 原理、复合 apply-key、apply 侧定位），只引用并在其上重构。

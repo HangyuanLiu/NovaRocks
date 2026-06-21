@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust, `src/sql/optimizer/` (standalone Cascades optimizer), inline `#[cfg(test)]` unit tests, `sql-tests` golden plan runner.
 
-**Spec:** `docs/superpowers/specs/2026-06-16-optimizer-stats-derivation-dedup-design.md`
+**Spec:** `docs/design/specs/2026-06-16-optimizer-stats-derivation-dedup-design.md`
 
 ---
 

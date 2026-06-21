@@ -77,7 +77,7 @@ Expected: PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/engine/mv/partition/derivation.rs src/engine/mv/partition/mod.rs docs/superpowers/plans/2026-06-12-iceberg-mv-partition-p2b-join-pf-locator-pruning.md
+git add src/engine/mv/partition/derivation.rs src/engine/mv/partition/mod.rs docs/design/plans/2026-06-12-iceberg-mv-partition-p2b-join-pf-locator-pruning.md
 git commit -m "feat(mv): add target-visible partition derivation evaluator"
 ```
 

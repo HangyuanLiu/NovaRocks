@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust, vendored `iceberg 0.9.0` + `iceberg-catalog-rest 0.9.0`, new `iceberg-catalog-hms 0.9.0` (pulls volo/volo-thrift/pilota), Docker Compose fixture (MinIO + Iceberg REST + Spark + new standalone Hive Metastore), `sql-tests` runner.
 
-**Spec:** `docs/superpowers/specs/2026-06-11-iceberg-hms-catalog-design.md`
+**Spec:** `docs/design/specs/2026-06-11-iceberg-hms-catalog-design.md`
 
 ---
 

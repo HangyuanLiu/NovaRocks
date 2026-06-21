@@ -167,7 +167,7 @@ If `add_entry` is not public, search for whatever public method takes a pre-buil
 
 - [ ] **Step 5: Document the finding**
 
-Create `docs/design/spikes/2026-04-28-manifest-deleted-entry.md`:
+Create `docs/design/specs/2026-04-28-manifest-deleted-entry.md`:
 
 ```markdown
 # Spike — ManifestWriter status=DELETED entry path
@@ -194,7 +194,7 @@ Create `docs/design/spikes/2026-04-28-manifest-deleted-entry.md`:
 - [ ] **Step 6: Commit**
 
 ```bash
-git add tests/scratch_manifest_deleted.rs docs/design/spikes/2026-04-28-manifest-deleted-entry.md
+git add tests/scratch_manifest_deleted.rs docs/design/specs/2026-04-28-manifest-deleted-entry.md
 git commit -m "spike: verify ManifestWriter status=DELETED entry path
 
 Spec §7.1 spike. Documents which iceberg-rust 0.9 public API path
@@ -228,7 +228,7 @@ Identify error variants thrown for: AssertRefSnapshotId mismatch (OCC), network/
 
 - [ ] **Step 3: Document classification rule**
 
-Append to `docs/design/spikes/2026-04-28-commit-unknown-classification.md`:
+Append to `docs/design/specs/2026-04-28-commit-unknown-classification.md`:
 
 ```markdown
 # Spike — commit-unknown classification
@@ -265,7 +265,7 @@ If the actual ErrorKind set doesn't have the variants above, adjust the table an
 - [ ] **Step 4: Commit**
 
 ```bash
-git add docs/design/spikes/2026-04-28-commit-unknown-classification.md
+git add docs/design/specs/2026-04-28-commit-unknown-classification.md
 git commit -m "spike: classify iceberg-rust commit-unknown errors
 
 Spec §7.2 spike. Documents the ErrorKind → classification mapping
@@ -3295,7 +3295,7 @@ git commit -m "chore(test): remove spike scratch test now that finding lives in 
 ## Task 22: PR description with performance baseline
 
 **Files:**
-- Create: `docs/design/notes/2026-04-28-phase1-pr-summary.md`
+- Create: `docs/design/plans/2026-04-28-phase1-pr-summary.md`
 
 - [ ] **Step 1: Run baseline measurements**
 
@@ -3351,7 +3351,7 @@ Record wall time + staged file count in the notes doc.
 - [ ] **Step 3: Commit**
 
 ```bash
-git add docs/design/notes/
+git add docs/design/plans/
 git commit -m "docs: phase 1 PR summary with performance baseline"
 ```
 

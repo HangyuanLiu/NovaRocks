@@ -7,7 +7,7 @@
 - [[NovaRocks Iceberg v3 完成度清单]]
 - `docs/design/specs/2026-05-04-iceberg-v3-update-merge-design.md`
 - `docs/design/specs/2026-05-05-iceberg-time-travel-and-branch-tag-design.md`
-- `docs/design/spikes/2026-04-28-commit-unknown-classification.md`
+- `docs/design/specs/2026-04-28-commit-unknown-classification.md`
 
 ---
 
@@ -49,7 +49,7 @@
 - 写 sink：`src/connector/iceberg/sink.rs::IcebergSinkPlan` (`IcebergSinkMode::Data`)
 - branch 写入路径（`t.branch_<x>` 解析）：`src/sql/analyzer/iceberg_ref.rs`、`src/engine/insert_flow.rs` / `delete_flow.rs` / `mutation_flow.rs` 的 `target_ref` 链路
 - AbortLog 失败清理：commit 失败时清掉已写 manifest 文件
-- commit-unknown 分类：`docs/design/spikes/2026-04-28-commit-unknown-classification.md`
+- commit-unknown 分类：`docs/design/specs/2026-04-28-commit-unknown-classification.md`
 
 ### 1.2 缺口
 
@@ -360,7 +360,7 @@ Step E — 失败回滚
 
 ### 6.1 commit-unknown 流入
 
-`docs/design/spikes/2026-04-28-commit-unknown-classification.md` 已分类：
+`docs/design/specs/2026-04-28-commit-unknown-classification.md` 已分类：
 
 - **Definitely-success**：catalog 已经看到新 metadata.json
 - **Definitely-failure**：catalog 拒绝（OCC 冲突 / schema 校验失败 / 网络明确失败）

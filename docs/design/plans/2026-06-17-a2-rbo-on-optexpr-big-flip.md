@@ -257,7 +257,7 @@ gh pr create --repo NovaRocks/NovaRocks --base main --head HangyuanLiu:claude/a2
 
 ## Execution Handoff
 
-**Plan complete and saved to `docs/superpowers/plans/2026-06-17-a2-rbo-on-optexpr-big-flip.md`. Two execution options:**
+**Plan complete and saved to `docs/design/plans/2026-06-17-a2-rbo-on-optexpr-big-flip.md`. Two execution options:**
 
 **1. Subagent-Driven** — 但注意:大翻转 RED 窗口长,per-task 绿验证不适用;subagent 之间难以"绿到绿"交接。若用,建议单个大 implementer 完成整个 Task 3(编译器驱动清零),再 review。
 

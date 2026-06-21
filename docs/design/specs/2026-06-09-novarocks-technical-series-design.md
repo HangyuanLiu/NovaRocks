@@ -47,7 +47,7 @@
 
 ### 第 2 篇 · Standalone SQL 栈与优化器
 - **抓手**：脱离 StarRocks FE，NovaRocks 自己怎么把一句 SQL 变成能跑的计划？
-- **覆盖**：parser / analyzer / optimizer / codegen 全链路；通用逻辑重写框架（见 `docs/design/2026-05-25-general-logical-rewrite-framework.md`）；CBO 统计 / NDV；aggregate pushdown、runtime filter 规划、column pruning；MySQL 协议兼容。
+- **覆盖**：parser / analyzer / optimizer / codegen 全链路；通用逻辑重写框架（见 `docs/design/specs/2026-05-25-general-logical-rewrite-framework.md`）；CBO 统计 / NDV；aggregate pushdown、runtime filter 规划、column pruning；MySQL 协议兼容。
 - **关键代码**：`src/sql/parser/**`、`src/sql/analyzer/**`、`src/sql/optimizer/**`、`src/sql/codegen/**`、`src/engine/mod.rs`、`src/server/mod.rs`、`src/sql/explain.rs`。
 - **看点 / 取舍**：同一执行内核的"另一个前门"；优化器规则如何可观测、可 bisect（`disable_optimizer_rules`）。
 

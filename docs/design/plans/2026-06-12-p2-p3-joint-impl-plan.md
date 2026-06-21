@@ -1,7 +1,7 @@
 # P1-remainder + P2 + P3 联合实现计划（已并入对抗校验修正）
 
 日期：2026-06-12
-依据：`docs/design/2026-06-12-distributed-execution-target-architecture.md`
+依据：`docs/design/specs/2026-06-12-distributed-execution-target-architecture.md`
 目标：决定性（P2）+ 接收端 descriptor 权威（P3）一起做，避免返工。**减法**：删分歧而非到处和解。
 
 ## 已确定的关键事实 / 决策

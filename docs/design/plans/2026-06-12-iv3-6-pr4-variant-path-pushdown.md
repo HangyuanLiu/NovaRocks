@@ -10,7 +10,7 @@
 
 **Background you must know (verified against current `origin/main` on 2026-06-12):**
 - PR-2 is merged in PR #289; `variant_get` / `try_variant_get` are available and the Iceberg commit collector skips variant bounds.
-- PR-4 follows the design in `docs/superpowers/specs/2026-06-10-iv3-6-variant-design.md`: run after predicate pushdown and before required-column tagging, add thrift carrier on `THdfsScanNode`, and do no row-group/page pruning until PR-5.
+- PR-4 follows the design in `docs/design/specs/2026-06-10-iv3-6-variant-design.md`: run after predicate pushdown and before required-column tagging, add thrift carrier on `THdfsScanNode`, and do no row-group/page pruning until PR-5.
 - `ScanNode` already carries scan hints (`dict_columns`) in `src/sql/planner/plan.rs`; those are mirrored through logical/physical conversion and codegen.
 - Query rewrite ordering is in `src/sql/optimizer/rewrite/registry.rs`. The new stage belongs after `PredicatePushdownAfterMoveAround` and before `AggregatePushdown` / `TagRequiredColumns`.
 - HDFS lowering has hidden-slot precedent in `src/lower/node/hdfs_scan.rs`, including `next_hidden_slot_id` / hidden Iceberg virtual handling. Synthetic variant output slots must not be treated as physical `hive_column_names`.

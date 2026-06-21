@@ -4,7 +4,7 @@
 
 **Goal:** 单 base table 的 SPJG 查询能被透明改写为扫描 Iceberg MV 目标表的替代计划，注入 Cascades memo 由 CBO 择优。
 
-**Architecture:** engine 层候选准备（`mv_rewrite_prep.rs`：MV 发现 + 严格 snapshot 新鲜度 + select_sql 重分析 + 目标表 TableDef/统计构造）产出 `MvRewriteCandidate`，经 `optimize()` 新参数传入；优化器层新增 Cascades 变换规则 `MvRewrite`（`cascades_rules/mv_rewrite/`：SPJG 描述符抽取 → 谓词三分类与区间蕴含 → 列映射 → 聚合上卷 → 替代表达式构造）。设计规格见 `docs/superpowers/specs/2026-06-10-mv-query-rewrite-design.md`。
+**Architecture:** engine 层候选准备（`mv_rewrite_prep.rs`：MV 发现 + 严格 snapshot 新鲜度 + select_sql 重分析 + 目标表 TableDef/统计构造）产出 `MvRewriteCandidate`，经 `optimize()` 新参数传入；优化器层新增 Cascades 变换规则 `MvRewrite`（`cascades_rules/mv_rewrite/`：SPJG 描述符抽取 → 谓词三分类与区间蕴含 → 列映射 → 聚合上卷 → 替代表达式构造）。设计规格见 `docs/design/specs/2026-06-10-mv-query-rewrite-design.md`。
 
 **Tech Stack:** Rust；现有 Cascades 优化器（`src/sql/optimizer/`）；sqlparser；Iceberg connector；sql-test-runner。
 
@@ -259,7 +259,7 @@ pub(crate) mod mv_rewrite;
 ```rust
 //! Transparent MV query rewrite (single-table SPJG + aggregate rollup).
 //!
-//! Design spec: docs/superpowers/specs/2026-06-10-mv-query-rewrite-design.md
+//! Design spec: docs/design/specs/2026-06-10-mv-query-rewrite-design.md
 //! StarRocks counterparts: MaterializedViewRewriter / AggregatedMaterializedViewRewriter.
 
 pub(crate) mod aggregate_rollup;
@@ -2581,7 +2581,7 @@ Expected: 与 main 基线相同的通过集（默认开启下，无匹配 MV 的
 
 - [ ] **Step 3: 自检对照 spec**
 
-逐节核对 `docs/superpowers/specs/2026-06-10-mv-query-rewrite-design.md` §2 目标全部落地：SPJ 精确/补偿/上卷/标量 COALESCE/CBO 择优/严格新鲜度/双开关/EXPLAIN 注记/测试矩阵。
+逐节核对 `docs/design/specs/2026-06-10-mv-query-rewrite-design.md` §2 目标全部落地：SPJ 精确/补偿/上卷/标量 COALESCE/CBO 择优/严格新鲜度/双开关/EXPLAIN 注记/测试矩阵。
 
 - [ ] **Step 4: Commit（如有收尾修改）并汇报**
 

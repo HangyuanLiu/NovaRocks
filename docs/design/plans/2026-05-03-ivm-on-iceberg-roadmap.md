@@ -68,11 +68,11 @@ Planned code boundaries:
 
 **Files:**
 - Modify: `/Users/harbor/Documents/Obsidian/NovaRocks IVM on Iceberg Roadmap.md`
-- Create: `docs/design/notes/2026-05-03-ivm-on-iceberg-r0-summary.md`
+- Create: `docs/design/plans/2026-05-03-ivm-on-iceberg-r0-summary.md`
 
 - [ ] **Step 1: Write the R0 status note**
 
-Create `docs/design/notes/2026-05-03-ivm-on-iceberg-r0-summary.md`:
+Create `docs/design/plans/2026-05-03-ivm-on-iceberg-r0-summary.md`:
 
 ```markdown
 # R0 - IVM on Iceberg Baseline Summary
@@ -129,7 +129,7 @@ test result: ok
 Run:
 
 ```bash
-git add docs/design/notes/2026-05-03-ivm-on-iceberg-r0-summary.md
+git add docs/design/plans/2026-05-03-ivm-on-iceberg-r0-summary.md
 git commit -m "docs: summarize IVM on Iceberg R0 baseline"
 ```
 

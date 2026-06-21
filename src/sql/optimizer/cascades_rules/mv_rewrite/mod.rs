@@ -1,6 +1,6 @@
 //! Transparent MV query rewrite (single-table SPJG + aggregate rollup).
 //!
-//! Design spec: docs/superpowers/specs/2026-06-10-mv-query-rewrite-design.md
+//! Design spec: docs/design/specs/2026-06-10-mv-query-rewrite-design.md
 //! StarRocks counterparts: MaterializedViewRewriter / AggregatedMaterializedViewRewriter.
 
 pub(crate) mod aggregate_rollup;
