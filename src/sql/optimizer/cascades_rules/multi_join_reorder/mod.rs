@@ -11,6 +11,7 @@ mod algo;
 mod flatten;
 mod pass;
 
+use crate::sql::column_id::ColumnId;
 use crate::sql::optimizer::memo::GroupId;
 use crate::sql::optimizer::scalar::ScalarId;
 use crate::sql::optimizer::statistics::Statistics;
@@ -39,10 +40,57 @@ pub(crate) struct MultiJoinGraph {
     /// these in `Memo::reorder_owned_groups` so `explore` skips
     /// `JoinAssociativity` on them (D2).
     pub(crate) chain_join_groups: Vec<GroupId>,
+    /// Cross-atom equivalence classes derived from the chain's own `col = col`
+    /// equi conjuncts, used to synthesize *transitive* equi-join edges
+    /// (`a=b ∧ b=c ⟹ a=c`) on demand during enumeration. Each class is the
+    /// generating column set spread across the atoms — O(atoms-in-class), never
+    /// the C(k,2) pairwise closure (the gap2 OOM vector); the reorder
+    /// enumeration consults these to make a transitively-connected atom pair
+    /// joinable and synthesizes exactly one connecting predicate per straddling
+    /// class, reusing already-interned column-ref scalars (no fresh deep copies).
+    pub(crate) equi_classes: Vec<EquiClass>,
 }
 
 impl MultiJoinGraph {
     pub(crate) fn atom_count(&self) -> usize {
         self.atoms.len()
+    }
+}
+
+/// One cross-atom equivalence class within a flattened chain. `reps[j]` is
+/// `(atom_index, interned ColumnRef ScalarId)` for one representative column of
+/// that atom in the class; `columns` is the full transitive column set (for
+/// membership tests when deduplicating literal equi predicates by class). Only
+/// atoms that actually carry a class column appear in `reps`, so a class
+/// spanning `m` atoms holds `m` entries — never `C(m, 2)`.
+#[derive(Clone)]
+pub(crate) struct EquiClass {
+    columns: Vec<ColumnId>,
+    reps: Vec<(usize, ScalarId)>,
+}
+
+impl EquiClass {
+    pub(crate) fn new(columns: Vec<ColumnId>, reps: Vec<(usize, ScalarId)>) -> Self {
+        Self { columns, reps }
+    }
+
+    /// The representative column-ref scalar of the first atom in `mask` that
+    /// belongs to this class, if any.
+    pub(crate) fn rep_in(&self, mask: u32) -> Option<ScalarId> {
+        self.reps
+            .iter()
+            .find(|(atom, _)| mask & (1u32 << atom) != 0)
+            .map(|(_, scalar)| *scalar)
+    }
+
+    /// True if this class has a representative column in both atom subsets, i.e.
+    /// it transitively connects them as an equi-join edge.
+    pub(crate) fn straddles(&self, left_mask: u32, right_mask: u32) -> bool {
+        self.rep_in(left_mask).is_some() && self.rep_in(right_mask).is_some()
+    }
+
+    /// True if `column` belongs to this equivalence class.
+    pub(crate) fn contains(&self, column: ColumnId) -> bool {
+        self.columns.contains(&column)
     }
 }
