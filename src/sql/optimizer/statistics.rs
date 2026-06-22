@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use arrow::datatypes::DataType;
 
 use crate::sql::column_id::ColumnId;
+use crate::sql::optimizer::stats_input::{StatsMissingReason, StatsSource};
 
 /// Trustworthiness of a statistic. Variant order is meaningful: derived
 /// `Ord` makes `Measured > Exact > Estimated > Fallback`, so `min` yields
@@ -43,14 +44,90 @@ impl Confidence {
     }
 }
 
-/// Per-column statistics derived from Iceberg file metadata.
+/// Derivability of a cardinality estimate, given an operator's shape (GPORCA's
+/// `EStatPromise`). Independent of (and lexicographically secondary to) the
+/// source-confidence axis [`Confidence`]: source says how trustworthy the input
+/// numbers are; promise says how reliably the formula derives an estimate from
+/// them. Used only for in-group representative selection (collapse), where it
+/// distinguishes members that differ in shape.
+///
+/// In NovaRocks the only live signal is join-order shape (see `promise`).
+/// `Low` is reserved for a future in-memo subquery-decorrelation consumer that
+/// does not exist yet (subqueries are decorrelated before the memo), so nothing
+/// produces `Low` today.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) enum DerivePromise {
+    Low,
+    Medium,
+    High,
+}
+
+/// Per-column distinct-value metadata with explicit missing state.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum DistinctValueCount {
+    Known {
+        value: f64,
+        confidence: Confidence,
+        source: StatsSource,
+    },
+    Unknown {
+        reason: StatsMissingReason,
+    },
+}
+
+impl DistinctValueCount {
+    pub(crate) fn known(value: f64, confidence: Confidence, source: StatsSource) -> Self {
+        Self::Known {
+            value,
+            confidence,
+            source,
+        }
+    }
+
+    pub(crate) fn unknown(reason: StatsMissingReason) -> Self {
+        Self::Unknown { reason }
+    }
+
+    pub(crate) fn known_value(&self) -> Option<f64> {
+        match self {
+            Self::Known { value, .. } => Some(*value),
+            Self::Unknown { .. } => None,
+        }
+    }
+
+    pub(crate) fn trusted_value(&self) -> Option<(f64, Confidence)> {
+        match self {
+            Self::Known {
+                value, confidence, ..
+            } if *confidence > Confidence::Fallback && value.is_finite() && *value >= 1.0 => {
+                Some((*value, *confidence))
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn source(&self) -> Option<StatsSource> {
+        match self {
+            Self::Known { source, .. } => Some(*source),
+            Self::Unknown { .. } => None,
+        }
+    }
+}
+
+impl Default for DistinctValueCount {
+    fn default() -> Self {
+        Self::unknown(StatsMissingReason::ColumnNotReported("ndv".to_string()))
+    }
+}
+
+/// Per-column statistics derived from catalog or connector metadata.
 #[derive(Clone, Debug, Default)]
 pub struct ColumnStatistic {
     pub min_value: f64,
     pub max_value: f64,
     pub nulls_fraction: f64,
     pub average_row_size: f64,
-    pub distinct_values_count: f64,
+    pub ndv: DistinctValueCount,
     pub confidence: Confidence,
 }
 
@@ -61,9 +138,52 @@ impl ColumnStatistic {
             max_value: f64::INFINITY,
             nulls_fraction: 0.0,
             average_row_size: 8.0,
-            distinct_values_count: 1.0,
+            ndv: DistinctValueCount::unknown(StatsMissingReason::ColumnNotReported(
+                "ndv".to_string(),
+            )),
             confidence: Confidence::Fallback,
         }
+    }
+
+    pub(crate) fn with_known_ndv(
+        mut self,
+        ndv: f64,
+        confidence: Confidence,
+        source: StatsSource,
+    ) -> Self {
+        self.set_known_ndv(ndv, confidence, source);
+        self
+    }
+
+    pub(crate) fn set_known_ndv(&mut self, ndv: f64, confidence: Confidence, source: StatsSource) {
+        self.ndv = DistinctValueCount::known(ndv, confidence, source);
+        self.confidence = self.confidence.max(confidence);
+    }
+
+    pub(crate) fn ndv_value(&self) -> Option<f64> {
+        self.ndv.known_value()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ndv_or_legacy_unknown_sentinel_for_test(&self) -> f64 {
+        self.ndv_value().unwrap_or(1.0)
+    }
+
+    pub(crate) fn trusted_ndv(&self) -> Option<(f64, Confidence)> {
+        self.ndv.trusted_value()
+    }
+
+    pub(crate) fn trusted_ndv_value(&self) -> Option<f64> {
+        self.trusted_ndv().map(|(value, _)| value)
+    }
+
+    pub(crate) fn ndv_source(&self) -> Option<StatsSource> {
+        self.ndv.source()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_with_ndv(ndv: f64, confidence: Confidence) -> Self {
+        Self::unknown().with_known_ndv(ndv, confidence, StatsSource::TestFixture)
     }
 }
 
@@ -231,15 +351,6 @@ pub struct TableStatistics {
 }
 
 impl TableStatistics {
-    /// Task 3 migration adapter from query-scoped base stats into the legacy
-    /// table-stat shape. Task 9 removes or audits this away once NDV is
-    /// missing-aware end to end.
-    pub(crate) fn try_from_base_stats(
-        base: &crate::sql::optimizer::stats_input::BaseTableStatistics,
-    ) -> Option<Self> {
-        Self::try_from_base_stats_with_confidence(base).map(|(stats, _)| stats)
-    }
-
     pub(crate) fn try_from_base_stats_with_confidence(
         base: &crate::sql::optimizer::stats_input::BaseTableStatistics,
     ) -> Option<(Self, Confidence)> {
@@ -274,10 +385,10 @@ impl TableStatistics {
                 if let StatValue::Known {
                     value,
                     confidence: field_confidence,
-                    ..
+                    source,
                 } = &base_column.ndv
                 {
-                    stat.distinct_values_count = *value;
+                    stat.set_known_ndv(*value, *field_confidence, *source);
                     confidence = confidence.max(*field_confidence);
                 }
                 stat.confidence = confidence;
@@ -331,9 +442,8 @@ pub fn build_table_statistics_with_columns(
 /// match the column lookup), but is retained on the signature so callers can
 /// pre-compute it from `IcebergSchemaDef` once per query.
 ///
-/// Priority for `distinct_values_count`:
-///   1. Puffin NDV when present for the column.
-///   2. `sqrt(non_null) * 10` heuristic.
+/// Puffin NDV is retained when present for the column. Without Puffin, NDV
+/// remains missing and consumers decide whether their local fallback is valid.
 ///
 /// Iceberg manifest `value_counts` is a non-null value count, not an NDV. Using
 /// it as distinct-count metadata makes equality predicates on low-cardinality
@@ -421,34 +531,32 @@ pub fn build_table_statistics_with_ndv(
         };
         let min_value = col_min.get(col_name).copied().unwrap_or(f64::NEG_INFINITY);
         let max_value = col_max.get(col_name).copied().unwrap_or(f64::INFINITY);
-        let non_null = (total_rows as f64 * (1.0 - nulls_fraction)).max(1.0);
         let key = col_name.to_lowercase();
-        let (distinct_values_count, confidence) = if let Some(&ndv) = ndv_by_name.get(&key) {
-            (ndv.min(non_null).max(1.0), Confidence::Exact)
-        } else {
-            (
-                (non_null.sqrt() * 10.0).min(non_null).max(1.0),
-                Confidence::Fallback,
-            )
-        };
-        column_stats.insert(
-            col_name.clone(),
-            ColumnStatistic {
-                min_value,
-                max_value,
-                nulls_fraction,
-                average_row_size: if avg_row_size > 0.0 {
-                    avg_row_size
-                } else {
-                    8.0
-                },
-                // NDV priority:
-                //   1. Iceberg Puffin theta sketch when present.
-                //   2. sqrt(non_null) * 10 heuristic.
-                distinct_values_count,
-                confidence,
+        let non_null = (total_rows as f64 * (1.0 - nulls_fraction)).max(1.0);
+        let known_ndv = ndv_by_name
+            .get(&key)
+            .filter(|ndv| ndv.is_finite() && **ndv >= 0.0)
+            .map(|ndv| ndv.min(non_null).max(1.0));
+        let mut stat = ColumnStatistic {
+            min_value,
+            max_value,
+            nulls_fraction,
+            average_row_size: if avg_row_size > 0.0 {
+                avg_row_size
+            } else {
+                8.0
             },
-        );
+            confidence: if known_ndv.is_some() {
+                Confidence::Exact
+            } else {
+                Confidence::Fallback
+            },
+            ..ColumnStatistic::unknown()
+        };
+        if let Some(ndv) = known_ndv {
+            stat.set_known_ndv(ndv, Confidence::Exact, StatsSource::IcebergPuffin);
+        }
+        column_stats.insert(col_name.clone(), stat);
     }
 
     Some(TableStatistics {
@@ -752,7 +860,8 @@ mod tests {
             source: StatsSource::IcebergManifest,
         };
 
-        let converted = TableStatistics::try_from_base_stats(&base).expect("converted stats");
+        let (converted, _) =
+            TableStatistics::try_from_base_stats_with_confidence(&base).expect("converted stats");
 
         assert_eq!(converted.row_count, 10);
         assert_eq!(converted.column_stats["k"].confidence, Confidence::Fallback);
@@ -834,7 +943,7 @@ mod tests {
     fn base_table_stats_adapter_requires_known_row_count() {
         let base = BaseTableStatistics::missing(StatsMissingReason::NoDataFiles);
 
-        assert!(TableStatistics::try_from_base_stats(&base).is_none());
+        assert!(TableStatistics::try_from_base_stats_with_confidence(&base).is_none());
     }
 
     #[test]
@@ -860,7 +969,7 @@ mod tests {
             source: StatsSource::Derived,
         };
 
-        let table_stats = TableStatistics::try_from_base_stats(&base).unwrap();
+        let (table_stats, _) = TableStatistics::try_from_base_stats_with_confidence(&base).unwrap();
         let column = table_stats.column_stats.get("orderkey").unwrap();
 
         assert_eq!(table_stats.row_count, 1000);
@@ -868,7 +977,7 @@ mod tests {
         assert_eq!(column.average_row_size, 16.0);
         assert_eq!(column.min_value, 1.0);
         assert_eq!(column.max_value, f64::INFINITY);
-        assert_eq!(column.distinct_values_count, 100.0);
+        assert_eq!(column.ndv_or_legacy_unknown_sentinel_for_test(), 100.0);
         assert_eq!(column.confidence, Confidence::Exact);
     }
 
@@ -984,8 +1093,7 @@ mod tests {
                 max_value: 100.0,
                 nulls_fraction: 0.0,
                 average_row_size: 4.0,
-                distinct_values_count: 50.0,
-                ..Default::default()
+                ..ColumnStatistic::for_test_with_ndv(50.0, Confidence::Exact)
             },
         );
         col_stats.insert(
@@ -995,8 +1103,7 @@ mod tests {
                 max_value: 1000.0,
                 nulls_fraction: 0.1,
                 average_row_size: 8.0,
-                distinct_values_count: 200.0,
-                ..Default::default()
+                ..ColumnStatistic::for_test_with_ndv(200.0, Confidence::Exact)
             },
         );
         let stats = Statistics {
@@ -1021,7 +1128,7 @@ mod tests {
     fn column_statistic_unknown() {
         let cs = ColumnStatistic::unknown();
         assert!(cs.min_value.is_infinite());
-        assert_eq!(cs.distinct_values_count, 1.0);
+        assert_eq!(cs.ndv_or_legacy_unknown_sentinel_for_test(), 1.0);
     }
 
     #[test]
@@ -1178,8 +1285,9 @@ mod tests {
         assert!((col.min_value - 10.0).abs() < f64::EPSILON);
         assert!((col.max_value - 100.0).abs() < f64::EPSILON);
         // Iceberg value_count is a non-null row count, not a distinct-value
-        // count. Without Puffin NDV, use the heuristic instead.
-        assert!((col.distinct_values_count - 100.0).abs() < f64::EPSILON);
+        // count. Without Puffin NDV, leave NDV missing.
+        assert!(col.ndv_value().is_none());
+        assert_eq!(col.ndv_or_legacy_unknown_sentinel_for_test(), 1.0);
         assert_eq!(col.confidence, Confidence::Fallback);
     }
 
@@ -1226,7 +1334,7 @@ mod tests {
     }
 
     #[test]
-    fn build_table_statistics_without_columns_uses_heuristic_ndv() {
+    fn build_table_statistics_without_columns_leaves_ndv_missing() {
         use crate::sql::catalog::{IcebergColumnStats, IcebergDataFileInfo};
 
         let file = IcebergDataFileInfo {
@@ -1255,8 +1363,9 @@ mod tests {
         };
         let ts = build_table_statistics(&[file]).expect("table stats present");
         let col = ts.column_stats.get("x").expect("col stats present");
-        // No value_count → fallback heuristic = sqrt(10000)*10 = 1000.0
-        assert!((col.distinct_values_count - 1000.0).abs() < 1.0);
+        // No Puffin NDV means no reliable distinct-count metadata.
+        assert!(col.ndv_value().is_none());
+        assert_eq!(col.ndv_or_legacy_unknown_sentinel_for_test(), 1.0);
         assert_eq!(col.confidence, Confidence::Fallback);
     }
 
@@ -1304,7 +1413,7 @@ mod tests {
         let col = ts.column_stats.get("x").expect("col stats present");
         // Puffin NDV (1234) wins over manifest value_count (8000) and the
         // heuristic (sqrt(10000)*10 = 1000).
-        assert!((col.distinct_values_count - 1234.0).abs() < f64::EPSILON);
+        assert!((col.ndv_or_legacy_unknown_sentinel_for_test() - 1234.0).abs() < f64::EPSILON);
         assert_eq!(col.confidence, Confidence::Exact);
     }
 
@@ -1364,7 +1473,7 @@ mod tests {
             .expect("table stats");
         let col = ts.column_stats.get("x").expect("col stats present");
         // Clamped to non_null = 1000.
-        assert!((col.distinct_values_count - 1000.0).abs() < f64::EPSILON);
+        assert!((col.ndv_or_legacy_unknown_sentinel_for_test() - 1000.0).abs() < f64::EPSILON);
     }
 
     #[test]

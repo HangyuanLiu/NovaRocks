@@ -251,8 +251,7 @@ mod tests {
                 max_value: rows,
                 nulls_fraction: 0.0,
                 average_row_size: 8.0,
-                distinct_values_count: rows,
-                confidence: conf,
+                ..ColumnStatistic::for_test_with_ndv(rows, conf)
             },
         );
         memo.groups[g].logical_props = Some(props);

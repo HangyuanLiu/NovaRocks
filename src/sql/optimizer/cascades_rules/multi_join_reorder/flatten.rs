@@ -419,8 +419,7 @@ mod tests {
                 max_value: rows,
                 nulls_fraction: 0.0,
                 average_row_size: 8.0,
-                distinct_values_count: rows,
-                confidence: Confidence::Estimated,
+                ..ColumnStatistic::for_test_with_ndv(rows, Confidence::Estimated)
             },
         );
         memo.groups[g].logical_props = Some(props);
@@ -446,8 +445,7 @@ mod tests {
                     max_value: rows,
                     nulls_fraction: 0.0,
                     average_row_size: 8.0,
-                    distinct_values_count: rows,
-                    confidence: Confidence::Estimated,
+                    ..ColumnStatistic::for_test_with_ndv(rows, Confidence::Estimated)
                 },
             );
         }

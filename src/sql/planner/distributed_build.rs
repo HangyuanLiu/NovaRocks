@@ -1367,7 +1367,7 @@ mod tests {
     };
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::scalar::ScalarArena;
-    use crate::sql::optimizer::statistics::{ColumnStatistic, Statistics};
+    use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence, Statistics};
     use crate::sql::planner::optimizer_bridge::scalar::{
         intern_project_items, intern_sort_items, intern_typed, intern_window_exprs,
     };
@@ -1567,8 +1567,7 @@ mod tests {
             ColumnStatistic {
                 min_value: 1.0,
                 max_value: 9.0,
-                distinct_values_count: 4.0,
-                ..Default::default()
+                ..ColumnStatistic::for_test_with_ndv(4.0, Confidence::Exact)
             },
         );
 
@@ -1583,7 +1582,7 @@ mod tests {
             .expect("column statistics for k");
         assert_eq!(stat.min_value, 1.0);
         assert_eq!(stat.max_value, 9.0);
-        assert_eq!(stat.distinct_values_count, 4.0);
+        assert_eq!(stat.ndv_or_legacy_unknown_sentinel_for_test(), 4.0);
     }
 
     #[test]

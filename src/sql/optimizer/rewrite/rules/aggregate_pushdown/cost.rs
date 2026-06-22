@@ -53,11 +53,11 @@ fn ndv_for_group_expr(
 ) -> Option<f64> {
     match arena.node(expr) {
         ScalarNode::ColumnRef(column_id) => stats.column_statistics.get(column_id).and_then(|cs| {
-            let ndv = cs.distinct_values_count;
+            let (ndv, confidence) = cs.trusted_ndv()?;
             if !ndv.is_finite() || ndv <= 0.0 {
                 return None;
             }
-            match cs.confidence {
+            match confidence {
                 Confidence::Exact | Confidence::Measured => Some(ndv),
                 Confidence::Estimated if ndv < row_count * MIN_PARTIAL_BENEFIT_RATIO => Some(ndv),
                 Confidence::Estimated | Confidence::Fallback => None,
@@ -77,10 +77,12 @@ mod tests {
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::scalar::ScalarArena;
 
-    use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence, TableStatistics};
+    use crate::sql::optimizer::statistics::{
+        ColumnStatistic, Confidence, DistinctValueCount, TableStatistics,
+    };
     use crate::sql::optimizer::stats_input::{
-        BaseColumnStatistics, BaseTableStatistics, QueryStatsSnapshot, StatValue, StatsRef,
-        StatsSource,
+        BaseColumnStatistics, BaseTableStatistics, QueryStatsSnapshot, StatValue,
+        StatsMissingReason, StatsRef, StatsSource,
     };
     use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
     use arrow::datatypes::DataType;
@@ -153,8 +155,7 @@ mod tests {
                 max_value: f64::INFINITY,
                 nulls_fraction: 0.0,
                 average_row_size: 8.0,
-                distinct_values_count: ndv,
-                confidence,
+                ..ColumnStatistic::for_test_with_ndv(ndv, confidence)
             },
         );
         let mut table_stats = HashMap::new();
@@ -165,6 +166,25 @@ mod tests {
                 column_stats: col_stats,
             },
         );
+        (scan, table_stats)
+    }
+
+    fn scan_with_missing_ndv_stats(
+        table: &str,
+        row_count: u64,
+        col: &str,
+        arena: &mut ScalarArena,
+    ) -> (OptExpr, HashMap<String, TableStatistics>) {
+        let (scan, mut table_stats) = scan_with_stats(table, row_count, col, 1.0, arena);
+        table_stats
+            .get_mut(&table.to_ascii_lowercase())
+            .expect("scan_with_stats inserts the requested table")
+            .column_stats
+            .get_mut(col)
+            .expect("scan_with_stats inserts the requested column")
+            .ndv = DistinctValueCount::unknown(StatsMissingReason::ColumnNotReported(
+            col.to_ascii_lowercase(),
+        ));
         (scan, table_stats)
     }
 
@@ -228,10 +248,15 @@ mod tests {
                                 stat.confidence,
                                 StatsSource::TestFixture,
                             ),
-                            ndv: StatValue::known(
-                                stat.distinct_values_count,
-                                stat.confidence,
-                                StatsSource::TestFixture,
+                            ndv: stat.ndv_value().map_or_else(
+                                || {
+                                    StatValue::missing(StatsMissingReason::ColumnNotReported(
+                                        name.to_ascii_lowercase(),
+                                    ))
+                                },
+                                |ndv| {
+                                    StatValue::known(ndv, stat.confidence, StatsSource::TestFixture)
+                                },
                             ),
                         },
                     )
@@ -320,7 +345,7 @@ mod tests {
     #[test]
     fn unknown_ndv_pushes_above_threshold() {
         let mut arena = ScalarArena::new();
-        let (scan, stats) = scan_with_stats("t", 20_000, "k", f64::NAN, &mut arena);
+        let (scan, stats) = scan_with_missing_ndv_stats("t", 20_000, "k", &mut arena);
         let plan = make_push_plan(scan, &mut arena);
         assert!(should_push(
             &plan,
@@ -332,7 +357,7 @@ mod tests {
     #[test]
     fn unknown_ndv_pushes_at_threshold() {
         let mut arena = ScalarArena::new();
-        let (scan, stats) = scan_with_stats("t", 10_000, "k", f64::NAN, &mut arena);
+        let (scan, stats) = scan_with_missing_ndv_stats("t", 10_000, "k", &mut arena);
         let plan = make_push_plan(scan, &mut arena);
         assert!(should_push(
             &plan,
@@ -344,7 +369,7 @@ mod tests {
     #[test]
     fn unknown_ndv_rejects_below_threshold() {
         let mut arena = ScalarArena::new();
-        let (scan, stats) = scan_with_stats("t", 500, "k", f64::NAN, &mut arena);
+        let (scan, stats) = scan_with_missing_ndv_stats("t", 500, "k", &mut arena);
         let plan = make_push_plan(scan, &mut arena);
         assert!(!should_push(
             &plan,

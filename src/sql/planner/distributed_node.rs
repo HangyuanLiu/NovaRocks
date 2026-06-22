@@ -58,7 +58,7 @@ pub(crate) struct DistributedPlanNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::optimizer::statistics::{ColumnStatistic, Statistics};
+    use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence, Statistics};
     use crate::sql::planner::plan::PlanValuesNode as DistributedValuesNode;
 
     #[test]
@@ -71,14 +71,16 @@ mod tests {
         stats.column_statistics.insert(
             column_id,
             ColumnStatistic {
-                distinct_values_count: 3.0,
-                ..Default::default()
+                ..ColumnStatistic::for_test_with_ndv(3.0, Confidence::Exact)
             },
         );
 
         let s = PlanNodeStats::from_statistics(&stats);
         assert_eq!(s.output_row_count, 7.0);
-        assert_eq!(s.column_statistics[&column_id].distinct_values_count, 3.0);
+        assert_eq!(
+            s.column_statistics[&column_id].ndv_or_legacy_unknown_sentinel_for_test(),
+            3.0
+        );
     }
 
     #[test]

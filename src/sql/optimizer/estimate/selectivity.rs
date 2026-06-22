@@ -67,7 +67,7 @@ pub(crate) fn estimate_selectivity(
             let col_id = extract_column_id(arena, *child);
             let ndv = col_id
                 .and_then(|column_id| column_stats.get(&column_id))
-                .and_then(trusted_distinct_values_count);
+                .and_then(ColumnStatistic::trusted_ndv_value);
 
             let sel = if let Some(ndv) = ndv {
                 (list.len() as f64 / ndv).min(1.0)
@@ -164,7 +164,7 @@ fn estimate_eq_selectivity(
         extract_column_literal_pair(arena, left, right)
         && let Some(cs) = column_stats.get(&column_id)
     {
-        if let Some(ndv) = trusted_distinct_values_count(cs) {
+        if let Some(ndv) = cs.trusted_ndv_value() {
             return 1.0 / ndv;
         }
         if let Some(selectivity) =
@@ -192,17 +192,6 @@ fn extract_column_literal_pair(
         return Some((column_id, right, left));
     }
     None
-}
-
-fn trusted_distinct_values_count(stat: &ColumnStatistic) -> Option<f64> {
-    if stat.confidence > Confidence::Fallback
-        && stat.distinct_values_count.is_finite()
-        && stat.distinct_values_count > 1.0
-    {
-        Some(stat.distinct_values_count)
-    } else {
-        None
-    }
 }
 
 fn discrete_domain_equality_selectivity(
@@ -437,9 +426,7 @@ mod tests {
         stats.insert(
             ColumnId::new_for_test(1),
             ColumnStatistic {
-                distinct_values_count: 10_000.0,
-                confidence: Confidence::Fallback,
-                ..ColumnStatistic::unknown()
+                ..ColumnStatistic::for_test_with_ndv(10_000.0, Confidence::Fallback)
             },
         );
         let predicate = eq(col("c", 1), int_lit(7));
@@ -455,9 +442,7 @@ mod tests {
             ColumnStatistic {
                 min_value: 1900.0,
                 max_value: 2100.0,
-                distinct_values_count: 10_000.0,
-                confidence: Confidence::Fallback,
-                ..ColumnStatistic::unknown()
+                ..ColumnStatistic::for_test_with_ndv(10_000.0, Confidence::Fallback)
             },
         );
         let predicate = eq(col("d_year", 1), int_lit(1999));
@@ -476,9 +461,7 @@ mod tests {
         stats.insert(
             ColumnId::new_for_test(1),
             ColumnStatistic {
-                distinct_values_count: 10_000.0,
-                confidence: Confidence::Fallback,
-                ..ColumnStatistic::unknown()
+                ..ColumnStatistic::for_test_with_ndv(10_000.0, Confidence::Fallback)
             },
         );
         let predicate = TypedExpr {

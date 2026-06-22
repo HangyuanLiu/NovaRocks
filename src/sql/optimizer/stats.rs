@@ -20,7 +20,7 @@ use crate::sql::optimizer::estimate::cardinality::{
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 use crate::sql::optimizer::statistics::*;
-use crate::sql::optimizer::stats_input::OptimizerStatsInput;
+use crate::sql::optimizer::stats_input::{OptimizerStatsInput, StatsSource};
 
 // Matches the old unknown-table default from estimate_default_row_count to
 // minimize plan churn while removing table-name heuristics.
@@ -132,8 +132,7 @@ pub(crate) fn derive_statistics(
             );
             let mut column_statistics = child_stats.column_statistics;
             for stat in column_statistics.values_mut() {
-                stat.distinct_values_count =
-                    cap_ndv_at_rows(stat.distinct_values_count, output_rows);
+                cap_stat_ndv_at_rows(stat, output_rows);
             }
             Statistics {
                 output_row_count: output_rows,
@@ -325,8 +324,7 @@ pub(crate) fn derive_statistics(
             );
             let mut column_statistics = child_stats.column_statistics;
             for stat in column_statistics.values_mut() {
-                stat.distinct_values_count =
-                    cap_ndv_at_rows(stat.distinct_values_count, output_rows);
+                cap_stat_ndv_at_rows(stat, output_rows);
             }
             Statistics {
                 output_row_count: output_rows,
@@ -777,14 +775,9 @@ fn real_expr_ndv_scalar(
 ) -> Option<(f64, Confidence)> {
     if let Some(column_id) = extract_column_id_scalar(arena, expr)
         && let Some(cs) = column_stats.get(&column_id)
-        && cs.distinct_values_count > 1.0
+        && let Some((ndv, confidence)) = cs.trusted_ndv()
     {
-        let confidence = if cs.confidence == Confidence::Fallback {
-            Confidence::Estimated
-        } else {
-            cs.confidence
-        };
-        return Some((cs.distinct_values_count, confidence));
+        return Some((ndv, confidence));
     }
     None
 }
@@ -841,7 +834,7 @@ fn estimate_selectivity_scalar(
             let col_id = extract_column_id_scalar(arena, *child);
             let ndv = col_id
                 .and_then(|column_id| column_stats.get(&column_id))
-                .and_then(trusted_distinct_values_count);
+                .and_then(ColumnStatistic::trusted_ndv_value);
 
             let sel = if let Some(ndv) = ndv {
                 (list.len() as f64 / ndv).min(1.0)
@@ -905,7 +898,7 @@ fn estimate_eq_selectivity_scalar(
         extract_column_literal_pair_scalar(arena, left, right)
         && let Some(cs) = column_stats.get(&column_id)
     {
-        if let Some(ndv) = trusted_distinct_values_count(cs) {
+        if let Some(ndv) = cs.trusted_ndv_value() {
             return 1.0 / ndv;
         }
         if let Some(selectivity) =
@@ -933,17 +926,6 @@ fn extract_column_literal_pair_scalar(
         return Some((column_id, right, left));
     }
     None
-}
-
-fn trusted_distinct_values_count(stat: &ColumnStatistic) -> Option<f64> {
-    if stat.confidence > Confidence::Fallback
-        && stat.distinct_values_count.is_finite()
-        && stat.distinct_values_count > 1.0
-    {
-        Some(stat.distinct_values_count)
-    } else {
-        None
-    }
 }
 
 fn discrete_domain_equality_selectivity_scalar(
@@ -1043,13 +1025,8 @@ fn aggregate_group_column_statistics_scalar(
             let mut stat = extract_column_id_scalar(arena, *expr)
                 .and_then(|column_id| child_stats.column_statistics.get(&column_id))
                 .cloned()
-                .unwrap_or_else(|| {
-                    let mut fallback = ColumnStatistic::unknown();
-                    fallback.distinct_values_count =
-                        get_expr_ndv_scalar(arena, *expr, &child_stats.column_statistics);
-                    fallback
-                });
-            stat.distinct_values_count = cap_ndv_at_rows(stat.distinct_values_count, output_rows);
+                .unwrap_or_else(ColumnStatistic::unknown);
+            cap_stat_ndv_at_rows(&mut stat, output_rows);
             (output.column_id, stat)
         })
         .collect()
@@ -1416,11 +1393,14 @@ fn values_column_statistics_scalar(
                 max_value: max,
                 nulls_fraction: nulls as f64 / row_count,
                 average_row_size: 8.0,
-                distinct_values_count: (distinct.len().max(if non_null > 0 { 1 } else { 0 })
-                    as f64)
-                    .max(1.0),
                 confidence: Confidence::Exact,
-            },
+                ..ColumnStatistic::unknown()
+            }
+            .with_known_ndv(
+                (distinct.len().max(if non_null > 0 { 1 } else { 0 }) as f64).max(1.0),
+                Confidence::Exact,
+                StatsSource::Derived,
+            ),
         );
     }
     out
@@ -1455,9 +1435,10 @@ fn generate_series_column_statistics(
             max_value: start.max(end) as f64,
             nulls_fraction: 0.0,
             average_row_size: 8.0,
-            distinct_values_count: rows.max(1.0),
             confidence: Confidence::Exact,
-        },
+            ..ColumnStatistic::unknown()
+        }
+        .with_known_ndv(rows.max(1.0), Confidence::Exact, StatsSource::Derived),
     );
     column_statistics
 }
@@ -1569,7 +1550,8 @@ fn merge_set_op_column_statistics(
         let mut average_row_size = positive_row_size(first.average_row_size);
         let mut confidence = first.confidence;
         let mut union_ndv = 0.0;
-        let mut min_ndv = first.distinct_values_count;
+        let mut min_ndv: Option<f64> = None;
+        let mut missing_ndv = false;
 
         for stat in &stats_for_column {
             min_value = min_value.min(stat.min_value);
@@ -1578,30 +1560,43 @@ fn merge_set_op_column_statistics(
             average_row_size = average_row_size.max(positive_row_size(stat.average_row_size));
             confidence = confidence.combine(stat.confidence);
 
-            let (next_ndv, _) = sat_add(union_ndv, stat.distinct_values_count);
-            union_ndv = next_ndv;
-            min_ndv = min_ndv.min(stat.distinct_values_count);
+            if let Some((stat_ndv, ndv_confidence)) = stat.trusted_ndv() {
+                let (next_ndv, _) = sat_add(union_ndv, stat_ndv);
+                union_ndv = next_ndv;
+                min_ndv = Some(min_ndv.map_or(stat_ndv, |current| current.min(stat_ndv)));
+                confidence = confidence.combine(ndv_confidence);
+            } else {
+                missing_ndv = true;
+            }
         }
 
         let raw_ndv = match kind {
-            SetOpKind::Union { .. } => union_ndv,
-            SetOpKind::Intersect | SetOpKind::Except => min_ndv,
+            SetOpKind::Union { .. } if !missing_child_stat && !missing_ndv => Some(union_ndv),
+            SetOpKind::Intersect | SetOpKind::Except if !missing_child_stat && !missing_ndv => {
+                min_ndv
+            }
+            _ => None,
         };
-        if missing_child_stat {
+        if missing_child_stat || missing_ndv {
             confidence = confidence.combine(Confidence::Fallback);
         }
 
-        merged.insert(
-            output_column.column_id,
-            ColumnStatistic {
-                min_value,
-                max_value,
-                nulls_fraction,
-                average_row_size,
-                distinct_values_count: bounded_set_op_ndv(raw_ndv, output_rows),
+        let mut stat = ColumnStatistic {
+            min_value,
+            max_value,
+            nulls_fraction,
+            average_row_size,
+            confidence,
+            ..ColumnStatistic::unknown()
+        };
+        if let Some(raw_ndv) = raw_ndv {
+            stat.set_known_ndv(
+                bounded_set_op_ndv(raw_ndv, output_rows),
                 confidence,
-            },
-        );
+                StatsSource::Derived,
+            );
+        }
+        merged.insert(output_column.column_id, stat);
     }
 
     merged
@@ -1626,7 +1621,18 @@ fn bounded_set_op_ndv(ndv: f64, output_rows: f64) -> f64 {
 
 fn cap_column_ndvs(column_statistics: &mut HashMap<ColumnId, ColumnStatistic>, output_rows: f64) {
     for stat in column_statistics.values_mut() {
-        stat.distinct_values_count = cap_ndv_at_rows(stat.distinct_values_count, output_rows);
+        cap_stat_ndv_at_rows(stat, output_rows);
+    }
+}
+
+fn cap_stat_ndv_at_rows(stat: &mut ColumnStatistic, output_rows: f64) {
+    let Some(ndv) = stat.ndv_value() else {
+        return;
+    };
+    let capped_ndv = cap_ndv_at_rows(ndv, output_rows);
+    if capped_ndv != ndv {
+        let source = stat.ndv_source().unwrap_or(StatsSource::Derived);
+        stat.set_known_ndv(capped_ndv, stat.confidence, source);
     }
 }
 
@@ -1672,20 +1678,25 @@ fn merge_join_column_statistics(
             continue;
         };
         if let Some(stat) = column_statistics.get_mut(&left_key) {
-            stat.distinct_values_count = contained_ndv;
+            stat.set_known_ndv(contained_ndv, confidence, StatsSource::Derived);
             stat.confidence = confidence;
         }
         if let Some(stat) = column_statistics.get_mut(&right_key) {
-            stat.distinct_values_count = contained_ndv;
+            stat.set_known_ndv(contained_ndv, confidence, StatsSource::Derived);
             stat.confidence = confidence;
         }
     }
 
     for stat in column_statistics.values_mut() {
-        let capped_ndv = cap_ndv_at_rows(stat.distinct_values_count, output_rows);
-        if capped_ndv != stat.distinct_values_count {
-            stat.distinct_values_count = capped_ndv;
-            stat.confidence = Confidence::derive(&[stat.confidence, row_count_confidence], false);
+        let Some(ndv) = stat.ndv_value() else {
+            continue;
+        };
+        let capped_ndv = cap_ndv_at_rows(ndv, output_rows);
+        if capped_ndv != ndv {
+            let source = stat.ndv_source().unwrap_or(StatsSource::Derived);
+            let confidence = Confidence::derive(&[stat.confidence, row_count_confidence], false);
+            stat.set_known_ndv(capped_ndv, confidence, source);
+            stat.confidence = confidence;
         }
     }
 
@@ -1714,27 +1725,18 @@ fn contained_join_key_ndv(
     right: &ColumnStatistic,
     row_count_confidence: Confidence,
 ) -> Option<(f64, Confidence)> {
-    let left_ndv = real_column_ndv(left);
-    let right_ndv = real_column_ndv(right);
-    let ndv = match (left_ndv, right_ndv) {
-        (Some(left), Some(right)) => left.min(right),
-        (Some(left), None) => left,
-        (None, Some(right)) => right,
-        (None, None) => return None,
-    };
+    let left_ndv = real_column_ndv(left)?;
+    let right_ndv = real_column_ndv(right)?;
+    let ndv = left_ndv.min(right_ndv);
     let confidence = Confidence::derive(
         &[left.confidence, right.confidence, row_count_confidence],
-        left_ndv.is_none() || right_ndv.is_none(),
+        false,
     );
     Some((ndv, confidence))
 }
 
 fn real_column_ndv(stat: &ColumnStatistic) -> Option<f64> {
-    if stat.distinct_values_count.is_finite() && stat.distinct_values_count > 1.0 {
-        Some(stat.distinct_values_count)
-    } else {
-        None
-    }
+    stat.trusted_ndv_value()
 }
 
 fn collect_equi_join_column_pairs_scalar(
@@ -2199,7 +2201,7 @@ fn is_unknown_column_literal_eq_scalar(
     }
     column_stats
         .get(&column_id)
-        .map_or(true, |cs| cs.distinct_values_count <= 1.0)
+        .is_none_or(|cs| cs.trusted_ndv().is_none())
 }
 
 fn scalar_is_literal_like(arena: &ScalarArena, expr: ScalarId) -> bool {
@@ -2527,8 +2529,8 @@ mod tests {
     use crate::sql::optimizer::estimate::selectivity::estimate_selectivity;
     use crate::sql::optimizer::memo::Memo;
     use crate::sql::optimizer::stats_input::{
-        BaseColumnStatistics, BaseTableStatistics, QueryStatsSnapshot, StatValue, StatsRef,
-        StatsSource,
+        BaseColumnStatistics, BaseTableStatistics, QueryStatsSnapshot, StatValue,
+        StatsMissingReason, StatsRef, StatsSource,
     };
     use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
     use crate::sql::planner::optimizer_bridge::scalar::{
@@ -2607,8 +2609,7 @@ mod tests {
                     max_value: row_count as f64,
                     nulls_fraction: 0.01,
                     average_row_size: 8.0,
-                    distinct_values_count: ndv,
-                    confidence: Confidence::Exact,
+                    ..ColumnStatistic::for_test_with_ndv(ndv, Confidence::Exact)
                 },
             );
         }
@@ -2676,10 +2677,15 @@ mod tests {
                                 stat.confidence,
                                 StatsSource::TestFixture,
                             ),
-                            ndv: StatValue::known(
-                                stat.distinct_values_count,
-                                stat.confidence,
-                                StatsSource::TestFixture,
+                            ndv: stat.ndv_value().map_or_else(
+                                || {
+                                    StatValue::missing(StatsMissingReason::ColumnNotReported(
+                                        name.to_ascii_lowercase(),
+                                    ))
+                                },
+                                |ndv| {
+                                    StatValue::known(ndv, stat.confidence, StatsSource::TestFixture)
+                                },
                             ),
                         },
                     )
@@ -2906,8 +2912,7 @@ mod tests {
                 max_value: 100_000.0,
                 nulls_fraction: 0.01,
                 average_row_size: 8.0,
-                distinct_values_count: 5.0,
-                confidence: Confidence::Estimated,
+                ..ColumnStatistic::for_test_with_ndv(5.0, Confidence::Estimated)
             },
         );
         let mut table_stats = HashMap::new();
@@ -2968,7 +2973,7 @@ mod tests {
         assert_eq!(props.row_count, 1.0);
         assert_eq!(props.row_count_confidence, Confidence::Fallback);
         assert_eq!(
-            stat_by_name(&props.column_statistics, "id").distinct_values_count,
+            stat_by_name(&props.column_statistics, "id").ndv_or_legacy_unknown_sentinel_for_test(),
             1.0
         );
     }
@@ -3104,8 +3109,7 @@ mod tests {
                 max_value: 10_000.0,
                 nulls_fraction: 0.0,
                 average_row_size: 8.0,
-                distinct_values_count: 100.0,
-                ..Default::default()
+                ..ColumnStatistic::for_test_with_ndv(100.0, Confidence::Exact)
             },
         );
         memo.groups[child_group].logical_props = Some(child_props);
@@ -3201,8 +3205,7 @@ mod tests {
             max_value,
             nulls_fraction,
             average_row_size,
-            distinct_values_count: ndv,
-            confidence,
+            ..ColumnStatistic::for_test_with_ndv(ndv, confidence)
         }
     }
 
@@ -3295,7 +3298,7 @@ mod tests {
         assert_eq!(col.max_value, 20.0);
         assert_eq!(col.nulls_fraction, 0.20);
         assert_eq!(col.average_row_size, 16.0);
-        assert_eq!(col.distinct_values_count, MAX_ROW_COUNT);
+        assert_eq!(col.ndv_or_legacy_unknown_sentinel_for_test(), MAX_ROW_COUNT);
         assert_eq!(col.confidence, Confidence::Estimated);
     }
 
@@ -3337,7 +3340,7 @@ mod tests {
         assert_eq!(col.max_value, 50.0);
         assert_eq!(col.nulls_fraction, 0.15);
         assert_eq!(col.average_row_size, 12.0);
-        assert_eq!(col.distinct_values_count, 130.0);
+        assert_eq!(col.ndv_or_legacy_unknown_sentinel_for_test(), 130.0);
         assert_eq!(col.confidence, Confidence::Estimated);
     }
 
@@ -3371,7 +3374,8 @@ mod tests {
         let col = stat_by_name(&stats.column_statistics, "k");
         assert_eq!(col.min_value, 5.0);
         assert_eq!(col.max_value, 30.0);
-        assert_eq!(col.distinct_values_count, 40.0);
+        assert!(col.ndv_value().is_none());
+        assert_eq!(col.ndv_or_legacy_unknown_sentinel_for_test(), 1.0);
         assert_eq!(col.confidence, Confidence::Fallback);
     }
 
@@ -3392,7 +3396,7 @@ mod tests {
             200.0,
             Confidence::Exact,
             "right_k",
-            set_op_column_stat(-20.0, 80.0, 0.25, 16.0, 30.0, Confidence::Fallback),
+            set_op_column_stat(-20.0, 80.0, 0.25, 16.0, 30.0, Confidence::Estimated),
         );
         let intersect = MExpr {
             id: memo.next_expr_id(),
@@ -3412,8 +3416,8 @@ mod tests {
         assert_eq!(col.max_value, 100.0);
         assert_eq!(col.nulls_fraction, 0.25);
         assert_eq!(col.average_row_size, 16.0);
-        assert_eq!(col.distinct_values_count, 30.0);
-        assert_eq!(col.confidence, Confidence::Fallback);
+        assert_eq!(col.ndv_or_legacy_unknown_sentinel_for_test(), 30.0);
+        assert_eq!(col.confidence, Confidence::Estimated);
     }
 
     #[test]
@@ -3453,7 +3457,7 @@ mod tests {
         assert_eq!(col.max_value, 100.0);
         assert_eq!(col.nulls_fraction, 0.20);
         assert_eq!(col.average_row_size, 16.0);
-        assert_eq!(col.distinct_values_count, 30.0);
+        assert_eq!(col.ndv_or_legacy_unknown_sentinel_for_test(), 30.0);
         assert_eq!(col.confidence, Confidence::Estimated);
     }
 
@@ -3463,8 +3467,7 @@ mod tests {
             max_value: 1_000_000.0,
             nulls_fraction: 0.0,
             average_row_size: 8.0,
-            distinct_values_count: ndv,
-            confidence: Confidence::Exact,
+            ..ColumnStatistic::for_test_with_ndv(ndv, Confidence::Exact)
         }
     }
 
@@ -3640,15 +3643,18 @@ mod tests {
         ] {
             assert_row_count_close(stats.output_row_count, expected);
             assert_eq!(
-                stat_by_name(&stats.column_statistics, "k1").distinct_values_count,
+                stat_by_name(&stats.column_statistics, "k1")
+                    .ndv_or_legacy_unknown_sentinel_for_test(),
                 100.0
             );
             assert_eq!(
-                stat_by_name(&stats.column_statistics, "k2").distinct_values_count,
+                stat_by_name(&stats.column_statistics, "k2")
+                    .ndv_or_legacy_unknown_sentinel_for_test(),
                 100.0
             );
             assert_eq!(
-                stat_by_name(&stats.column_statistics, "k3").distinct_values_count,
+                stat_by_name(&stats.column_statistics, "k3")
+                    .ndv_or_legacy_unknown_sentinel_for_test(),
                 100.0
             );
         }
@@ -3743,8 +3749,7 @@ mod tests {
                     max_value: rows,
                     nulls_fraction: 0.0,
                     average_row_size: 8.0,
-                    distinct_values_count: ndv,
-                    ..Default::default()
+                    ..ColumnStatistic::for_test_with_ndv(ndv, Confidence::Exact)
                 },
             );
             memo.groups[g].logical_props = Some(props);
@@ -3848,8 +3853,7 @@ mod tests {
             max_value: 77.0,
             nulls_fraction: 0.0,
             average_row_size: 8.0,
-            distinct_values_count: ndv,
-            confidence: Confidence::Exact,
+            ..ColumnStatistic::for_test_with_ndv(ndv, Confidence::Exact)
         }
     }
 
@@ -3885,7 +3889,7 @@ mod tests {
         );
         assert_eq!(stats.row_count_confidence, Confidence::Estimated);
         let payload = stat_by_name(&stats.column_statistics, "payload");
-        assert_eq!(payload.distinct_values_count, 100.0);
+        assert_eq!(payload.ndv_or_legacy_unknown_sentinel_for_test(), 100.0);
         assert_eq!(payload.min_value, 7.0);
         assert_eq!(payload.max_value, 77.0);
     }
@@ -3989,8 +3993,7 @@ mod tests {
                 max_value: 1_000.0,
                 nulls_fraction: 0.0,
                 average_row_size: 8.0,
-                distinct_values_count: ndv,
-                confidence: Confidence::Exact,
+                ..ColumnStatistic::for_test_with_ndv(ndv, Confidence::Exact)
             }
         }
 
@@ -4065,8 +4068,7 @@ mod tests {
                 max_value: 1_000.0,
                 nulls_fraction: 0.0,
                 average_row_size: 8.0,
-                distinct_values_count: ndv,
-                confidence: Confidence::Exact,
+                ..ColumnStatistic::for_test_with_ndv(ndv, Confidence::Exact)
             }
         }
 
@@ -4116,19 +4118,23 @@ mod tests {
 
         assert_eq!(stats.output_row_count, 40.0);
         assert_eq!(
-            stat_by_name(&stats.column_statistics, "l_key").distinct_values_count,
+            stat_by_name(&stats.column_statistics, "l_key")
+                .ndv_or_legacy_unknown_sentinel_for_test(),
             20.0
         );
         assert_eq!(
-            stat_by_name(&stats.column_statistics, "r_key").distinct_values_count,
+            stat_by_name(&stats.column_statistics, "r_key")
+                .ndv_or_legacy_unknown_sentinel_for_test(),
             20.0
         );
         assert_eq!(
-            stat_by_name(&stats.column_statistics, "l_payload").distinct_values_count,
+            stat_by_name(&stats.column_statistics, "l_payload")
+                .ndv_or_legacy_unknown_sentinel_for_test(),
             40.0
         );
         assert_eq!(
-            stat_by_name(&stats.column_statistics, "r_payload").distinct_values_count,
+            stat_by_name(&stats.column_statistics, "r_payload")
+                .ndv_or_legacy_unknown_sentinel_for_test(),
             40.0
         );
     }
@@ -4144,8 +4150,7 @@ mod tests {
                 max_value: 1_000.0,
                 nulls_fraction: 0.0,
                 average_row_size: 8.0,
-                distinct_values_count: ndv,
-                confidence: Confidence::Exact,
+                ..ColumnStatistic::for_test_with_ndv(ndv, Confidence::Exact)
             }
         }
 
@@ -4208,8 +4213,7 @@ mod tests {
                 max_value: 1_000.0,
                 nulls_fraction: 0.0,
                 average_row_size: 8.0,
-                distinct_values_count: ndv,
-                confidence: Confidence::Exact,
+                ..ColumnStatistic::for_test_with_ndv(ndv, Confidence::Exact)
             }
         }
 
@@ -4260,19 +4264,23 @@ mod tests {
 
         assert_eq!(stats.output_row_count, 400_000.0);
         assert_eq!(
-            stat_by_name(&stats.column_statistics, "l_key").distinct_values_count,
+            stat_by_name(&stats.column_statistics, "l_key")
+                .ndv_or_legacy_unknown_sentinel_for_test(),
             20.0
         );
         assert_eq!(
-            stat_by_name(&stats.column_statistics, "r_key").distinct_values_count,
+            stat_by_name(&stats.column_statistics, "r_key")
+                .ndv_or_legacy_unknown_sentinel_for_test(),
             20.0
         );
         assert_eq!(
-            stat_by_name(&stats.column_statistics, "l_payload").distinct_values_count,
+            stat_by_name(&stats.column_statistics, "l_payload")
+                .ndv_or_legacy_unknown_sentinel_for_test(),
             400_000.0
         );
         assert_eq!(
-            stat_by_name(&stats.column_statistics, "r_payload").distinct_values_count,
+            stat_by_name(&stats.column_statistics, "r_payload")
+                .ndv_or_legacy_unknown_sentinel_for_test(),
             400_000.0
         );
     }
@@ -4288,8 +4296,7 @@ mod tests {
                 max_value: 1_000.0,
                 nulls_fraction: 0.0,
                 average_row_size: 8.0,
-                distinct_values_count: ndv,
-                confidence: Confidence::Exact,
+                ..ColumnStatistic::for_test_with_ndv(ndv, Confidence::Exact)
             }
         }
 
@@ -4349,8 +4356,7 @@ mod tests {
                 max_value: 1_000.0,
                 nulls_fraction: 0.0,
                 average_row_size: 8.0,
-                distinct_values_count: ndv,
-                confidence: Confidence::Exact,
+                ..ColumnStatistic::for_test_with_ndv(ndv, Confidence::Exact)
             }
         }
 
@@ -4392,11 +4398,13 @@ mod tests {
         let stats = derive_statistics(&join, &memo, &empty_stats_input());
 
         assert_eq!(
-            stat_by_name(&stats.column_statistics, "l_key").distinct_values_count,
+            stat_by_name(&stats.column_statistics, "l_key")
+                .ndv_or_legacy_unknown_sentinel_for_test(),
             20.0
         );
         assert_eq!(
-            stat_by_name(&stats.column_statistics, "r_key").distinct_values_count,
+            stat_by_name(&stats.column_statistics, "r_key")
+                .ndv_or_legacy_unknown_sentinel_for_test(),
             20.0
         );
     }
@@ -4412,8 +4420,7 @@ mod tests {
                 max_value: 1_000.0,
                 nulls_fraction: 0.0,
                 average_row_size: 8.0,
-                distinct_values_count: ndv,
-                confidence: Confidence::Exact,
+                ..ColumnStatistic::for_test_with_ndv(ndv, Confidence::Exact)
             }
         }
 
@@ -4457,19 +4464,23 @@ mod tests {
 
         assert_eq!(stats.output_row_count, 8_000.0);
         assert_eq!(
-            stat_by_name(&stats.column_statistics, "l_k1").distinct_values_count,
+            stat_by_name(&stats.column_statistics, "l_k1")
+                .ndv_or_legacy_unknown_sentinel_for_test(),
             20.0
         );
         assert_eq!(
-            stat_by_name(&stats.column_statistics, "r_k1").distinct_values_count,
+            stat_by_name(&stats.column_statistics, "r_k1")
+                .ndv_or_legacy_unknown_sentinel_for_test(),
             20.0
         );
         assert_eq!(
-            stat_by_name(&stats.column_statistics, "l_k2").distinct_values_count,
+            stat_by_name(&stats.column_statistics, "l_k2")
+                .ndv_or_legacy_unknown_sentinel_for_test(),
             50.0
         );
         assert_eq!(
-            stat_by_name(&stats.column_statistics, "r_k2").distinct_values_count,
+            stat_by_name(&stats.column_statistics, "r_k2")
+                .ndv_or_legacy_unknown_sentinel_for_test(),
             50.0
         );
     }
@@ -4500,8 +4511,7 @@ mod tests {
             max_value: 1_000.0,
             nulls_fraction: 0.0,
             average_row_size: 8.0,
-            distinct_values_count: 100.0,
-            confidence: Confidence::Exact,
+            ..ColumnStatistic::for_test_with_ndv(100.0, Confidence::Exact)
         };
 
         let mut memo = Memo::new();
@@ -4522,16 +4532,23 @@ mod tests {
         let stats = derive_statistics(&join, &memo, &empty_stats_input());
 
         assert_eq!(
-            stat_by_name(&stats.column_statistics, "l_key").distinct_values_count,
+            stat_by_name(&stats.column_statistics, "l_key")
+                .ndv_or_legacy_unknown_sentinel_for_test(),
             100.0
         );
+        assert!(
+            stat_by_name(&stats.column_statistics, "r_key")
+                .ndv_value()
+                .is_none()
+        );
         assert_eq!(
-            stat_by_name(&stats.column_statistics, "r_key").distinct_values_count,
-            100.0
+            stat_by_name(&stats.column_statistics, "r_key")
+                .ndv_or_legacy_unknown_sentinel_for_test(),
+            1.0
         );
         assert_eq!(
             stat_by_name(&stats.column_statistics, "l_key").confidence,
-            Confidence::Fallback
+            Confidence::Exact
         );
         assert_eq!(
             stat_by_name(&stats.column_statistics, "r_key").confidence,
@@ -4550,8 +4567,7 @@ mod tests {
                 max_value: 1_000.0,
                 nulls_fraction: 0.0,
                 average_row_size: 8.0,
-                distinct_values_count: ndv,
-                confidence: Confidence::Exact,
+                ..ColumnStatistic::for_test_with_ndv(ndv, Confidence::Exact)
             }
         }
 
@@ -4604,11 +4620,11 @@ mod tests {
 
         assert_eq!(stats.output_row_count, 400_000.0);
         assert_eq!(
-            stats.column_statistics[&left_id].distinct_values_count,
+            stats.column_statistics[&left_id].ndv_or_legacy_unknown_sentinel_for_test(),
             20.0
         );
         assert_eq!(
-            stats.column_statistics[&right_id].distinct_values_count,
+            stats.column_statistics[&right_id].ndv_or_legacy_unknown_sentinel_for_test(),
             20.0
         );
     }
@@ -4624,8 +4640,7 @@ mod tests {
                 max_value: 1_000.0,
                 nulls_fraction: 0.0,
                 average_row_size: 8.0,
-                distinct_values_count: ndv,
-                confidence: Confidence::Exact,
+                ..ColumnStatistic::for_test_with_ndv(ndv, Confidence::Exact)
             }
         }
 
@@ -4688,8 +4703,7 @@ mod tests {
                 max_value: 1_000.0,
                 nulls_fraction: 0.0,
                 average_row_size: 8.0,
-                distinct_values_count: ndv,
-                confidence: Confidence::Exact,
+                ..ColumnStatistic::for_test_with_ndv(ndv, Confidence::Exact)
             }
         }
 
@@ -4778,8 +4792,7 @@ mod tests {
                     max_value: 10.0,
                     nulls_fraction: 0.0,
                     average_row_size: 8.0,
-                    distinct_values_count: 10.0,
-                    confidence: Confidence::Exact,
+                    ..ColumnStatistic::for_test_with_ndv(10.0, Confidence::Exact)
                 },
             );
             memo.groups[group].logical_props = Some(props);
@@ -4790,12 +4803,13 @@ mod tests {
             assert_eq!(stats.output_row_count, 25.0);
             assert_eq!(stats.row_count_confidence, Confidence::Exact);
             assert_eq!(
-                stat_by_name(&stats.column_statistics, "base").distinct_values_count,
+                stat_by_name(&stats.column_statistics, "base")
+                    .ndv_or_legacy_unknown_sentinel_for_test(),
                 10.0
             );
             let row_number = stat_by_name(&stats.column_statistics, "rn");
             assert_eq!(row_number.confidence, Confidence::Fallback);
-            assert_eq!(row_number.distinct_values_count, 1.0);
+            assert_eq!(row_number.ndv_or_legacy_unknown_sentinel_for_test(), 1.0);
         }
 
         let mut memo = Memo::new();
@@ -5046,9 +5060,9 @@ mod tests {
             .get(&ColumnId::new_for_test(7))
             .expect("consume must carry producer column stats remapped to its own column id");
         assert!(
-            (stat.distinct_values_count - 50_000.0).abs() < 1.0,
+            (stat.ndv_or_legacy_unknown_sentinel_for_test() - 50_000.0).abs() < 1.0,
             "expected propagated NDV 50000, got {}",
-            stat.distinct_values_count
+            stat.ndv_or_legacy_unknown_sentinel_for_test()
         );
         // The producer-side column id must not leak into the consume's statistics.
         assert!(
@@ -5227,7 +5241,7 @@ mod tests {
         let propagated_ndv = consume_props
             .column_statistics
             .values()
-            .map(|s| s.distinct_values_count)
+            .map(|s| s.ndv_or_legacy_unknown_sentinel_for_test())
             .fold(0.0_f64, f64::max);
         assert!(
             (propagated_ndv - 100_000.0).abs() < 1.0,
@@ -5318,9 +5332,9 @@ mod tests {
             .get(&col)
             .expect("generate_series output column must carry exact statistics");
         assert!(
-            (cs.distinct_values_count - 1000.0).abs() < 1.0,
+            (cs.ndv_or_legacy_unknown_sentinel_for_test() - 1000.0).abs() < 1.0,
             "NDV should equal row count, got {}",
-            cs.distinct_values_count
+            cs.ndv_or_legacy_unknown_sentinel_for_test()
         );
         assert!((cs.min_value - 1.0).abs() < 1e-9, "min should be start");
         assert!((cs.max_value - 1000.0).abs() < 1e-9, "max should be end");
@@ -5354,9 +5368,9 @@ mod tests {
             .get(&col)
             .expect("values column must carry literal-derived statistics");
         assert!(
-            (cs.distinct_values_count - 3.0).abs() < 1e-9,
+            (cs.ndv_or_legacy_unknown_sentinel_for_test() - 3.0).abs() < 1e-9,
             "3 distinct literals -> NDV 3, got {}",
-            cs.distinct_values_count
+            cs.ndv_or_legacy_unknown_sentinel_for_test()
         );
         assert!((cs.min_value - 1.0).abs() < 1e-9);
         assert!((cs.max_value - 3.0).abs() < 1e-9);
@@ -5403,9 +5417,9 @@ mod tests {
             .get(&base)
             .expect("table function must pass through child column statistics");
         assert!(
-            (cs.distinct_values_count - 50.0).abs() < 1e-9,
+            (cs.ndv_or_legacy_unknown_sentinel_for_test() - 50.0).abs() < 1e-9,
             "child NDV should pass through, got {}",
-            cs.distinct_values_count
+            cs.ndv_or_legacy_unknown_sentinel_for_test()
         );
     }
 
@@ -5453,9 +5467,9 @@ mod tests {
             .expect("aggregate-state-merge must carry merged child column statistics");
         // union-all merge of NDV 100 and 30 -> >= max child NDV.
         assert!(
-            cs.distinct_values_count >= 100.0,
+            cs.ndv_or_legacy_unknown_sentinel_for_test() >= 100.0,
             "merged NDV should be >= max child NDV, got {}",
-            cs.distinct_values_count
+            cs.ndv_or_legacy_unknown_sentinel_for_test()
         );
     }
 
@@ -5635,8 +5649,7 @@ mod tests {
             max_value: max,
             nulls_fraction: 0.0,
             average_row_size: 8.0,
-            distinct_values_count: ndv,
-            ..Default::default()
+            ..ColumnStatistic::for_test_with_ndv(ndv, Confidence::Exact)
         }
     }
 
@@ -5874,9 +5887,9 @@ mod tests {
         // (NDV not 50, Fallback confidence), so this distinguishes the source.
         let a = stat_by_name(&props.column_statistics, "a");
         assert!(
-            (a.distinct_values_count - 50.0).abs() < 1e-9,
+            (a.ndv_or_legacy_unknown_sentinel_for_test() - 50.0).abs() < 1e-9,
             "column stat NDV must come from the argmax member (50), got {}",
-            a.distinct_values_count
+            a.ndv_or_legacy_unknown_sentinel_for_test()
         );
         assert_eq!(
             a.confidence,
@@ -6182,8 +6195,7 @@ mod sort_partition_limit_tests {
             max_value: ndv,
             nulls_fraction: 0.0,
             average_row_size: 8.0,
-            distinct_values_count: ndv,
-            confidence: Confidence::Exact,
+            ..ColumnStatistic::for_test_with_ndv(ndv, Confidence::Exact)
         }
     }
 

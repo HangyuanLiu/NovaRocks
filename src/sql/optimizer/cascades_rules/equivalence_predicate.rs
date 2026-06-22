@@ -582,7 +582,7 @@ mod tests {
 
     #[test]
     fn add_filter_group_propagates_column_statistics() {
-        use crate::sql::optimizer::statistics::ColumnStatistic;
+        use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence};
 
         let mut memo = Memo::new();
         // Build a scan group with non-empty column_statistics in its logical_props.
@@ -595,8 +595,7 @@ mod tests {
                 max_value: 99.0,
                 nulls_fraction: 0.0,
                 average_row_size: 4.0,
-                distinct_values_count: 50.0,
-                ..Default::default()
+                ..ColumnStatistic::for_test_with_ndv(50.0, Confidence::Exact)
             },
         );
         memo.groups[child].logical_props = Some(child_props);
