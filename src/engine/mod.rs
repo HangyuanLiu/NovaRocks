@@ -2740,6 +2740,30 @@ enum StandaloneExecutionPlan {
     Coordinated(Box<MultiFragmentBuildResult>),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirectExecutionReason {
+    RuntimeLocalTerminalSink,
+    RuntimeLocalIcebergRegistry,
+    UnitTestNoExchangeBackend,
+}
+
+fn direct_execution_reason(
+    has_terminal_sink: bool,
+    has_iceberg_catalogs: bool,
+    exchange_port: u16,
+) -> Option<DirectExecutionReason> {
+    if has_terminal_sink {
+        return Some(DirectExecutionReason::RuntimeLocalTerminalSink);
+    }
+    if has_iceberg_catalogs {
+        return Some(DirectExecutionReason::RuntimeLocalIcebergRegistry);
+    }
+    if exchange_port == 0 {
+        return Some(DirectExecutionReason::UnitTestNoExchangeBackend);
+    }
+    None
+}
+
 /// Recognize the narrow compatibility shape where fragment splitting
 /// only wrapped the real root fragment in a single `EXCHANGE_NODE`.
 fn top_level_stream_root_wrapper_child_id(
@@ -2923,6 +2947,41 @@ fn single_fragment_plan(
         query_global_dicts: fragment.query_global_dicts,
         query_global_dict_exprs: fragment.query_global_dict_exprs,
     }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_query_direct_for_runtime_local_handle(
+    mut physical: crate::sql::optimizer::PhysicalPlanNode,
+    codegen_catalog: &dyn crate::sql::catalog::CatalogProvider,
+    connectors: &crate::connector::ConnectorRegistry,
+    current_database: &str,
+    query_opts: Option<crate::internal_service::TQueryOptions>,
+    terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
+    iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
+    mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+    reason: DirectExecutionReason,
+) -> Result<QueryResult, String> {
+    physical = collapse_distribution_enforcers_for_single_fragment(physical);
+    let build_result = if let Some(mv_refresh_ctx) = mv_refresh_ctx {
+        crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_via_distributed_plan_with_mv_refresh_ctx(
+            &physical,
+            codegen_catalog,
+            connectors,
+            current_database,
+            Some(mv_refresh_ctx),
+        )?
+    } else {
+        crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_via_distributed_plan(
+            &physical,
+            codegen_catalog,
+            connectors,
+            current_database,
+        )?
+    };
+    let plan = single_fragment_plan(build_result).map_err(|_| {
+        format!("direct execution exception {reason:?} produced a multi-fragment plan")
+    })?;
+    execute_plan(*plan, query_opts, terminal_sink, iceberg_catalogs, None)
 }
 
 fn choose_standalone_execution(build_result: MultiFragmentBuildResult) -> StandaloneExecutionPlan {
@@ -3783,7 +3842,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         &logical,
         &mut scalar_arena,
     )?;
-    let mut physical = crate::sql::optimizer::optimize(
+    let physical = crate::sql::optimizer::optimize(
         opt_expr,
         scalar_arena,
         &table_stats,
@@ -3791,16 +3850,25 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         None,
         mv_candidates,
     )?;
-    // Unit-test states may not start the standalone exchange server. IVM-A1
-    // internal queries also pass runtime-local handles (`terminal_sink` or
-    // `iceberg_catalogs`) that coordinated fragments cannot currently clone
-    // into remote fragment execution. Collapse distribution nodes before
-    // fragment building so those refresh queries stay local.
-    let force_single_fragment =
-        terminal_sink.is_some() || iceberg_catalogs.is_some() || exchange_port == 0;
-    if force_single_fragment {
-        physical = collapse_distribution_enforcers_for_single_fragment(physical);
+
+    if let Some(reason) = direct_execution_reason(
+        terminal_sink.is_some(),
+        iceberg_catalogs.is_some(),
+        exchange_port,
+    ) {
+        return execute_query_direct_for_runtime_local_handle(
+            physical,
+            codegen_catalog,
+            connectors,
+            current_database,
+            query_opts,
+            terminal_sink,
+            iceberg_catalogs,
+            mv_refresh_ctx,
+            reason,
+        );
     }
+
     let build_result = if let Some(mv_refresh_ctx) = mv_refresh_ctx {
         crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_via_distributed_plan_with_mv_refresh_ctx(
             &physical,
@@ -3817,37 +3885,14 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
             current_database,
         )?
     };
-
-    let execution_plan = choose_standalone_execution(build_result);
-
-    match execution_plan {
-        StandaloneExecutionPlan::SingleFragment(plan) => {
-            execute_plan(*plan, query_opts, terminal_sink, iceberg_catalogs, None)
-        }
-        StandaloneExecutionPlan::Coordinated(build_result) => {
-            if terminal_sink.is_some() {
-                return Err(
-                    "IVM-A1 custom sink does not yet support coordinated multi-fragment plans"
-                        .to_string(),
-                );
-            }
-            if iceberg_catalogs.is_some() {
-                return Err(
-                    "IVM-A1 iceberg_catalogs runtime registry does not yet support coordinated \
-                     multi-fragment plans"
-                        .to_string(),
-                );
-            }
-            let (dispatcher, scheduler) = coordinated_execution_services()?;
-            crate::runtime::coordinator::ExecutionCoordinator::new(
-                *build_result,
-                dispatcher,
-                scheduler,
-                query_opts,
-            )
-            .execute()
-        }
-    }
+    let (dispatcher, scheduler) = coordinated_execution_services()?;
+    crate::runtime::coordinator::ExecutionCoordinator::new(
+        build_result,
+        dispatcher,
+        scheduler,
+        query_opts,
+    )
+    .execute()
 }
 
 fn coordinated_execution_services() -> Result<
