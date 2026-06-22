@@ -18,10 +18,9 @@
 //! Fragment dispatcher abstraction.
 //!
 //! `FragmentDispatcher` decouples coordinator from where fragments actually
-//! run. `InProcessDispatcher` keeps the all-in-one mode using
-//! `std::thread::spawn`; `RemoteDispatcher` talks to one or more remote BEs
-//! over gRPC by index; `FragmentScheduler` (PR-3/PR-4) will choose which
-//! backend each fragment instance lands on.
+//! run. `RemoteDispatcher` talks to one or more BEs over gRPC by index;
+//! `InProcessDispatcher` remains available for targeted local execution paths.
+//! `FragmentScheduler` chooses which backend each fragment instance lands on.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -86,6 +85,9 @@ pub enum FetchOutcome {
 /// calls `submit_fragment` for each fragment (non-blocking), then polls
 /// `fetch_result` for the root fragment instance until `Eof` or `Err`.
 pub trait FragmentDispatcher: Send + Sync + 'static {
+    #[cfg(test)]
+    fn as_any(&self) -> &dyn std::any::Any;
+
     /// Submit a fragment for asynchronous execution to the given backend.
     /// Returns immediately.
     fn submit_fragment(
@@ -355,10 +357,10 @@ struct InProcessState {
 
 /// Dispatcher that runs all fragments in-process via `std::thread::spawn`.
 ///
-/// Used in all-in-one mode.  Keeps all existing execution semantics:
-/// non-root fragments use `execute_plan_fragment_sync`; the root fragment
-/// (RESULT_SINK) runs the lowering + pipeline executor directly and
-/// delivers `Chunk`s via a `ResultSinkHandle`.
+/// Keeps the legacy local execution semantics for tests and targeted
+/// single-process paths: non-root fragments use `execute_plan_fragment_sync`;
+/// the root fragment (RESULT_SINK) runs the lowering + pipeline executor
+/// directly and delivers `Chunk`s via a `ResultSinkHandle`.
 pub struct InProcessDispatcher {
     state: Arc<InProcessState>,
 }
@@ -528,6 +530,11 @@ fn is_result_sink(params: &internal_service::TExecPlanFragmentParams) -> bool {
 }
 
 impl FragmentDispatcher for InProcessDispatcher {
+    #[cfg(test)]
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn submit_fragment(
         &self,
         backend_idx: usize,
@@ -771,6 +778,11 @@ impl RemoteDispatcher {
 }
 
 impl FragmentDispatcher for RemoteDispatcher {
+    #[cfg(test)]
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn submit_fragment(
         &self,
         backend_idx: usize,

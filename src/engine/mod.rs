@@ -557,20 +557,31 @@ impl StandaloneNovaRocks {
         opts: StandaloneOptions,
         #[cfg(test)] _test_guard: Option<TestSerializationGuard>,
     ) -> Result<Self, String> {
-        // Spec (PR-4): role=fe dispatches all fragments to the remote BE via
-        // RemoteDispatcher and must NOT start a local gRPC/exchange server.
-        // exchange_port is only used by InProcessDispatcher (AllInOne); for Fe
-        // it is unused by dispatcher_for_role so a non-zero sentinel avoids
-        // the force_single_fragment=true short-circuit in execute_query_inner.
-        let role = crate::novarocks_config::config()
-            .map(|c| c.cluster.role)
-            .unwrap_or(crate::common::app_config::ClusterRole::AllInOne);
-        let exchange_port = if role == crate::common::app_config::ClusterRole::Fe {
-            // Sentinel: non-zero to allow coordinated execution, but no local socket is bound.
-            u16::MAX
-        } else {
-            ensure_standalone_exchange_server()?
+        // role=fe dispatches all fragments to registered BEs and must not
+        // start a local gRPC/exchange server. All-in-one binds the local
+        // exchange server and registers it as a loopback BE.
+        let cfg =
+            crate::novarocks_config::config().map_err(|e| format!("read config failed: {e}"))?;
+        let role = cfg.cluster.role;
+        let exchange_port = match role {
+            crate::common::app_config::ClusterRole::Fe => {
+                // Sentinel: non-zero to allow coordinated execution, but no local socket is bound.
+                u16::MAX
+            }
+            crate::common::app_config::ClusterRole::Be
+            | crate::common::app_config::ClusterRole::AllInOne => {
+                ensure_standalone_exchange_server()?
+            }
         };
+        if role == crate::common::app_config::ClusterRole::AllInOne {
+            let endpoint: std::net::SocketAddr = format!("127.0.0.1:{exchange_port}")
+                .parse()
+                .map_err(|e| format!("parse all-in-one loopback backend endpoint failed: {e}"))?;
+            backend_ops::install_all_in_one_backend_registry(
+                endpoint,
+                cfg.cluster.heartbeat_timeout_retries,
+            )?;
+        }
         let metadata_backend = resolve_metadata_backend(&opts)?;
         let metadata_provider = metadata_backend
             .as_ref()
@@ -1133,7 +1144,6 @@ impl StandaloneSession {
                     &catalog_snapshot,
                     &connectors_snapshot,
                     current_database,
-                    self.inner.exchange_port,
                     None,
                     Some(&self.inner),
                 )?;
@@ -3226,7 +3236,6 @@ fn explain_analyze_query(
     codegen_catalog: &InMemoryCatalog,
     connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
-    exchange_port: u16,
     query_opts: Option<crate::internal_service::TQueryOptions>,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
@@ -3283,7 +3292,7 @@ fn explain_analyze_query(
         StandaloneExecutionPlan::Coordinated(build_result) => {
             let mut profiled_query_opts = query_opts.unwrap_or_default();
             profiled_query_opts.enable_profile = Some(true);
-            let (dispatcher, scheduler) = coordinated_execution_services(exchange_port)?;
+            let (dispatcher, scheduler) = coordinated_execution_services()?;
             if !dispatcher.supports_profile_collection() {
                 return Err(
                     "EXPLAIN ANALYZE for coordinated plans requires in-process profile collection; remote fragment profiles are not available yet"
@@ -3544,11 +3553,6 @@ pub(crate) fn execute_query_as_iceberg_write(
         rewrite_time_travel_refs(state, current_catalog, current_database, &mut prepared)?;
     }
 
-    let exchange_port = if state.exchange_port == 0 {
-        ensure_standalone_exchange_server()?
-    } else {
-        state.exchange_port
-    };
     let catalog_snapshot = state
         .catalog
         .read()
@@ -3607,7 +3611,7 @@ pub(crate) fn execute_query_as_iceberg_write(
             None,
             &sink_spec,
         )?;
-    let (dispatcher, scheduler) = coordinated_execution_services(exchange_port)?;
+    let (dispatcher, scheduler) = coordinated_execution_services()?;
     crate::runtime::coordinator::ExecutionCoordinator::new(
         build_result,
         dispatcher,
@@ -3834,7 +3838,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
                         .to_string(),
                 );
             }
-            let (dispatcher, scheduler) = coordinated_execution_services(exchange_port)?;
+            let (dispatcher, scheduler) = coordinated_execution_services()?;
             crate::runtime::coordinator::ExecutionCoordinator::new(
                 *build_result,
                 dispatcher,
@@ -3846,9 +3850,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
     }
 }
 
-fn coordinated_execution_services(
-    exchange_port: u16,
-) -> Result<
+fn coordinated_execution_services() -> Result<
     (
         Arc<dyn crate::runtime::dispatcher::FragmentDispatcher>,
         Arc<crate::runtime::scheduler::FragmentScheduler>,
@@ -3862,15 +3864,10 @@ fn coordinated_execution_services(
         .map(|c| c.cluster.role)
         .unwrap_or(ClusterRole::AllInOne);
     let dispatcher = dispatcher_for_role(role)?;
-    // Backend list for the scheduler: FE uses the live registry snapshot;
-    // all-in-one is the local exchange endpoint; pure BE must not coordinate.
+    // Backend list for the scheduler is the same live registry surface used
+    // by the dispatcher; pure BE must not coordinate.
     let backends: Vec<SocketAddr> = match role {
-        ClusterRole::Fe => backend_ops::live_backend_scheduler_endpoints()?,
-        ClusterRole::AllInOne => vec![
-            format!("127.0.0.1:{exchange_port}")
-                .parse()
-                .map_err(|e| format!("{e}"))?,
-        ],
+        ClusterRole::Fe | ClusterRole::AllInOne => backend_ops::live_backend_scheduler_endpoints()?,
         ClusterRole::Be => {
             return Err("role=be must not enter standalone coordinator".into());
         }
@@ -3881,25 +3878,39 @@ fn coordinated_execution_services(
 
 /// Select a `FragmentDispatcher` implementation based on the effective cluster role.
 ///
-/// - `AllInOne`: uses `InProcessDispatcher`. Exchange destinations are filled by
-///   the scheduler from the backend list (the local exchange endpoint).
-/// - `Fe`: uses `RemoteDispatcher` bound to all configured backends.
+/// - `AllInOne` and `Fe`: use `RemoteDispatcher` bound to live registry backends.
 /// - `Be`: standalone coordinator must not be entered when the process is a pure BE.
 pub(crate) fn dispatcher_for_role(
     role: crate::common::app_config::ClusterRole,
 ) -> Result<Arc<dyn crate::runtime::dispatcher::FragmentDispatcher>, String> {
     use crate::common::app_config::ClusterRole;
     match role {
-        ClusterRole::AllInOne => Ok(Arc::new(
-            crate::runtime::dispatcher::InProcessDispatcher::new(),
-        )),
-        ClusterRole::Fe => {
+        ClusterRole::Fe | ClusterRole::AllInOne => {
             let entries = backend_ops::live_backend_dispatch_entries()?;
             Ok(Arc::new(
                 crate::runtime::dispatcher::RemoteDispatcher::new_with_backend_ids(&entries)?,
             ))
         }
         ClusterRole::Be => Err("role=be must not enter standalone coordinator".to_string()),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn dispatcher_kind_for_test(
+    dispatcher: &Arc<dyn crate::runtime::dispatcher::FragmentDispatcher>,
+) -> &'static str {
+    if dispatcher
+        .as_any()
+        .is::<crate::runtime::dispatcher::RemoteDispatcher>()
+    {
+        "remote"
+    } else if dispatcher
+        .as_any()
+        .is::<crate::runtime::dispatcher::InProcessDispatcher>()
+    {
+        "in-process"
+    } else {
+        "unknown"
     }
 }
 
@@ -9581,8 +9592,34 @@ path = "meta/operations.sqlite"
     #[test]
     fn dispatcher_for_role_all_in_one_ok() {
         use crate::common::app_config::ClusterRole;
+        let _registry = BackendRegistryReset::new();
+        crate::engine::backend_ops::install_all_in_one_backend_registry(
+            "127.0.0.1:19070".parse().unwrap(),
+            3,
+        )
+        .expect("install loopback registry");
         let result = super::dispatcher_for_role(ClusterRole::AllInOne);
         assert!(result.is_ok(), "AllInOne should produce a dispatcher");
+    }
+
+    #[test]
+    fn all_in_one_dispatcher_uses_remote_registry() {
+        let _guard = super::acquire_standalone_test_guard();
+        let _registry = BackendRegistryReset::new();
+        use crate::common::app_config::{ClusterRole, NovaRocksConfig};
+        let mut cfg = NovaRocksConfig::default();
+        cfg.cluster.role = ClusterRole::AllInOne;
+        cfg.cluster.backends.clear();
+        crate::common::app_config::install_preloaded_config(cfg);
+
+        let endpoint = "127.0.0.1:19070".parse().unwrap();
+        crate::engine::backend_ops::install_all_in_one_backend_registry(endpoint, 3)
+            .expect("install loopback registry");
+
+        let dispatcher = super::dispatcher_for_role(ClusterRole::AllInOne).expect("dispatcher");
+
+        assert_eq!(super::dispatcher_kind_for_test(&dispatcher), "remote");
+        assert_eq!(dispatcher.backend_count(), 1);
     }
 
     #[test]

@@ -67,6 +67,26 @@ pub(crate) fn ensure_backend_registry(
     Ok(crate::runtime::backend_registry::backend_registry().unwrap_or(registry))
 }
 
+pub(crate) fn install_all_in_one_backend_registry(
+    endpoint: SocketAddr,
+    heartbeat_timeout_retries: u32,
+) -> Result<Arc<BackendRegistry>, String> {
+    if let Some(registry) = crate::runtime::backend_registry::backend_registry() {
+        return Ok(registry);
+    }
+
+    let registry = Arc::new(BackendRegistry::new(heartbeat_timeout_retries));
+    let be_id = registry.add_backend_with_state(endpoint, BackendState::Live);
+    if be_id != 0 {
+        return Err(format!(
+            "all-in-one loopback backend must be backend 0, got {be_id}"
+        ));
+    }
+
+    crate::runtime::backend_registry::install_backend_registry(Arc::clone(&registry));
+    Ok(crate::runtime::backend_registry::backend_registry().unwrap_or(registry))
+}
+
 pub(crate) fn live_backend_dispatch_entries() -> Result<Vec<(usize, SocketAddr)>, String> {
     if let Some(registry) = crate::runtime::backend_registry::backend_registry() {
         let live = registry.live_endpoints();
@@ -149,31 +169,14 @@ pub(crate) fn execute_show_backends(
                 registry.snapshot(),
             )?))
         }
-        ClusterRole::AllInOne => Ok(StatementResult::Query(show_backends_result(vec![
-            implicit_all_in_one_backend(state),
-        ])?)),
+        ClusterRole::AllInOne => {
+            let registry = crate::runtime::backend_registry::backend_registry()
+                .ok_or_else(|| "all-in-one backend registry is not initialized".to_string())?;
+            Ok(StatementResult::Query(show_backends_result(
+                registry.snapshot(),
+            )?))
+        }
         ClusterRole::Be => Err("SHOW BACKENDS is not available in role=be".to_string()),
-    }
-}
-
-fn implicit_all_in_one_backend(
-    state: &Arc<StandaloneState>,
-) -> crate::runtime::backend_registry::BackendEntry {
-    crate::runtime::backend_registry::BackendEntry {
-        be_id: 0,
-        endpoint: format!("127.0.0.1:{}", state.exchange_port)
-            .parse()
-            .unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap()),
-        state: BackendState::Live,
-        start_epoch: 0,
-        last_heartbeat_ms: 0,
-        missed_heartbeats: 0,
-        last_err: None,
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        num_cores: std::thread::available_parallelism()
-            .map(|n| n.get().min(u32::MAX as usize) as u32)
-            .unwrap_or(1),
-        scheduled_fragments: 0,
     }
 }
 
@@ -377,5 +380,30 @@ fn backend_state_from_str(state: &str) -> Result<BackendState, String> {
         "Lost" => Ok(BackendState::Lost),
         "Decommissioning" => Ok(BackendState::Decommissioning),
         other => Err(format!("invalid persisted backend state '{other}'")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_in_one_loopback_registry_installs_live_backend_zero() {
+        use crate::runtime::backend_registry;
+
+        backend_registry::replace_backend_registry_for_test(None);
+        let endpoint: std::net::SocketAddr = "127.0.0.1:19070".parse().unwrap();
+
+        let registry = install_all_in_one_backend_registry(endpoint, 3)
+            .expect("install all-in-one loopback backend");
+        let live = registry.live_endpoints();
+
+        assert_eq!(live, vec![(0, endpoint)]);
+        assert_eq!(
+            live_backend_dispatch_entries().expect("dispatch entries"),
+            vec![(0usize, endpoint)]
+        );
+
+        backend_registry::replace_backend_registry_for_test(None);
     }
 }

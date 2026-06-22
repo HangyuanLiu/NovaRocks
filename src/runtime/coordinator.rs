@@ -10,8 +10,8 @@
 //! scan-range splits, destinations, prober params, per-exchange sender counts)
 //! is owned by [`FragmentScheduler`]. The coordinator translates each placement
 //! into a `TExecPlanFragmentParams` and submits it through the
-//! `FragmentDispatcher`. `InProcessDispatcher` runs everything in-process;
-//! `RemoteDispatcher` routes per-instance to remote BEs.
+//! `FragmentDispatcher`. `RemoteDispatcher` routes per-instance to BEs over
+//! gRPC; `InProcessDispatcher` remains available for targeted local execution.
 //!
 //! At a single backend (all-in-one / 1FE+1BE), the scheduler produces one
 //! instance per fragment and this path reproduces the prior single-instance
@@ -1520,6 +1520,10 @@ mod tests {
     }
 
     impl FragmentDispatcher for MockDispatcher {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
         fn submit_fragment(
             &self,
             _backend_idx: usize,
@@ -1706,6 +1710,10 @@ mod tests {
     }
 
     impl FragmentDispatcher for ControllableDispatcher {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
         fn submit_fragment(
             &self,
             _backend_idx: usize,
@@ -1751,6 +1759,10 @@ mod tests {
     }
 
     impl FragmentDispatcher for QueryStateFailureDispatcher {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
         fn submit_fragment(
             &self,
             _backend_idx: usize,
@@ -1798,6 +1810,10 @@ mod tests {
     }
 
     impl FragmentDispatcher for RecordingWaitDispatcher {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
         fn submit_fragment(
             &self,
             _backend_idx: usize,
@@ -1838,6 +1854,10 @@ mod tests {
     }
 
     impl FragmentDispatcher for EofSignalDispatcher {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
         fn submit_fragment(
             &self,
             _backend_idx: usize,
@@ -2144,6 +2164,10 @@ mod tests {
     }
 
     impl FragmentDispatcher for RecordingCancelDispatcher {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
         fn submit_fragment(
             &self,
             _backend_idx: usize,
