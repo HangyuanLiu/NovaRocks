@@ -337,7 +337,7 @@ fn load_target_stats(
     };
 
     let (ndv_by_name, name_to_field_id) =
-        super::load_iceberg_puffin_ndv(Some(table), cloud_properties);
+        crate::connector::iceberg::stats::load_iceberg_puffin_ndv(Some(table), cloud_properties);
     let stats = crate::sql::optimizer::statistics::build_table_statistics_with_ndv(
         &files,
         &table_def.columns,

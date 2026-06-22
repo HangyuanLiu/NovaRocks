@@ -21,6 +21,7 @@ pub mod jdbc;
 pub(crate) mod scan_planning;
 pub mod schema;
 pub mod starrocks;
+pub(crate) mod stats;
 
 pub(crate) use backend::{CatalogBackend, MvBackend, TableSink, TableSource};
 #[cfg(test)]

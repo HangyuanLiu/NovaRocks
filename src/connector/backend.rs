@@ -8,7 +8,9 @@
 //! connector fulfils the request.
 
 use arrow::record_batch::RecordBatch;
+use std::sync::Arc;
 
+use crate::connector::stats::TableStatsProvider;
 use crate::engine::mv::lifecycle::{
     CreateMvRequest, DropMvRequest, ListMvsRequest, MvListRow, RefreshCtx, RefreshError,
     RefreshOutcome, RefreshPlan, RefreshRequest,
@@ -180,6 +182,11 @@ pub(crate) trait TableSource: Send + Sync {
         _snapshot_id: Option<i64>,
     ) -> Result<TableDef, String> {
         self.build_table_def(table)
+    }
+
+    #[allow(dead_code)] // Task 5 wires QueryStatsCollector to this staged provider hook.
+    fn stats_provider(&self) -> Option<Arc<dyn TableStatsProvider>> {
+        None
     }
 }
 

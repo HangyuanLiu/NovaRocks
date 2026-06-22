@@ -457,6 +457,167 @@ pub fn build_table_statistics_with_ndv(
     })
 }
 
+#[allow(dead_code)] // Task 5 consumes this through QueryStatsCollector.
+pub(crate) fn build_base_table_statistics_with_ndv(
+    files: &[crate::sql::catalog::IcebergDataFileInfo],
+    columns: &[crate::sql::catalog::ColumnDef],
+    ndv_by_name: &HashMap<String, f64>,
+    name_to_field_id: &HashMap<String, i32>,
+) -> crate::sql::optimizer::stats_input::BaseTableStatistics {
+    use crate::sql::optimizer::stats_input::{
+        BaseColumnStatistics, BaseTableStatistics, StatValue, StatsMissingReason, StatsSource,
+    };
+
+    if files.is_empty() {
+        return BaseTableStatistics {
+            row_count: StatValue::known(0, Confidence::Exact, StatsSource::IcebergManifest),
+            columns: HashMap::new(),
+            source: StatsSource::IcebergManifest,
+        };
+    }
+
+    if files.iter().any(|file| file.row_count.is_none()) {
+        return BaseTableStatistics::missing(StatsMissingReason::ManifestMissingRowCount);
+    }
+
+    let total_rows: u64 = files
+        .iter()
+        .map(|file| file.row_count.unwrap().max(0) as u64)
+        .sum();
+    let type_by_name: HashMap<String, &DataType> = columns
+        .iter()
+        .map(|column| (column.name.to_ascii_lowercase(), &column.data_type))
+        .collect();
+    let mut column_names: Vec<String> = type_by_name.keys().cloned().collect();
+    for name in ndv_by_name.keys().chain(name_to_field_id.keys()) {
+        let lower = name.to_ascii_lowercase();
+        if !column_names.iter().any(|existing| existing == &lower) {
+            column_names.push(lower);
+        }
+    }
+
+    let columns = column_names
+        .into_iter()
+        .map(|column_name| {
+            let missing_reason = StatsMissingReason::ColumnNotReported(column_name.clone());
+            let mut all_null_counts = true;
+            let mut null_count_total: i64 = 0;
+            let mut all_column_sizes = true;
+            let mut column_size_total: i64 = 0;
+            let mut all_lower_bounds = true;
+            let mut min_value: Option<f64> = None;
+            let mut all_upper_bounds = true;
+            let mut max_value: Option<f64> = None;
+
+            for file in files {
+                let file_stats = file.column_stats.as_ref().and_then(|stats| {
+                    stats
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case(&column_name))
+                        .map(|(_, stats)| stats)
+                });
+                match file_stats.and_then(|stats| stats.null_count) {
+                    Some(value) => null_count_total += value,
+                    None => all_null_counts = false,
+                }
+                match file_stats.and_then(|stats| stats.column_size) {
+                    Some(value) => column_size_total += value,
+                    None => all_column_sizes = false,
+                }
+
+                let data_type = type_by_name.get(&column_name).copied();
+                let decoded_lower = data_type.and_then(|data_type| {
+                    file_stats
+                        .and_then(|stats| stats.lower_bound.as_deref())
+                        .and_then(|bytes| decode_bound_to_f64(bytes, data_type))
+                        .filter(|value| value.is_finite())
+                });
+                match decoded_lower {
+                    Some(value) => {
+                        min_value = Some(min_value.map_or(value, |current| current.min(value)))
+                    }
+                    None => all_lower_bounds = false,
+                }
+                let decoded_upper = data_type.and_then(|data_type| {
+                    file_stats
+                        .and_then(|stats| stats.upper_bound.as_deref())
+                        .and_then(|bytes| decode_bound_to_f64(bytes, data_type))
+                        .filter(|value| value.is_finite())
+                });
+                match decoded_upper {
+                    Some(value) => {
+                        max_value = Some(max_value.map_or(value, |current| current.max(value)))
+                    }
+                    None => all_upper_bounds = false,
+                }
+            }
+
+            let nulls_fraction = if all_null_counts {
+                let fraction = if total_rows == 0 {
+                    0.0
+                } else {
+                    null_count_total as f64 / total_rows as f64
+                };
+                StatValue::known(fraction, Confidence::Exact, StatsSource::IcebergManifest)
+            } else {
+                StatValue::missing(missing_reason.clone())
+            };
+            let average_row_size = if all_column_sizes {
+                let average = if total_rows == 0 {
+                    0.0
+                } else {
+                    column_size_total as f64 / total_rows as f64
+                };
+                StatValue::known(average, Confidence::Exact, StatsSource::IcebergManifest)
+            } else {
+                StatValue::missing(missing_reason.clone())
+            };
+            let min_value = if all_lower_bounds {
+                min_value
+                    .map(|value| {
+                        StatValue::known(value, Confidence::Exact, StatsSource::IcebergManifest)
+                    })
+                    .unwrap_or_else(|| StatValue::missing(missing_reason.clone()))
+            } else {
+                StatValue::missing(missing_reason.clone())
+            };
+            let max_value = if all_upper_bounds {
+                max_value
+                    .map(|value| {
+                        StatValue::known(value, Confidence::Exact, StatsSource::IcebergManifest)
+                    })
+                    .unwrap_or_else(|| StatValue::missing(missing_reason.clone()))
+            } else {
+                StatValue::missing(missing_reason.clone())
+            };
+            let ndv = ndv_by_name
+                .get(&column_name)
+                .filter(|value| value.is_finite() && **value >= 0.0)
+                .map(|value| {
+                    StatValue::known(*value, Confidence::Exact, StatsSource::IcebergPuffin)
+                })
+                .unwrap_or_else(|| StatValue::missing(missing_reason.clone()));
+
+            (
+                column_name,
+                BaseColumnStatistics {
+                    nulls_fraction,
+                    average_row_size,
+                    min_value,
+                    max_value,
+                    ndv,
+                },
+            )
+        })
+        .collect();
+
+    BaseTableStatistics {
+        row_count: StatValue::known(total_rows, Confidence::Exact, StatsSource::IcebergManifest),
+        columns,
+        source: StatsSource::IcebergManifest,
+    }
+}
+
 /// Decode an Iceberg manifest lower/upper bound byte payload into a numeric
 /// `f64` based on the column's Arrow data type. Returns `None` for types that
 /// do not have a meaningful numeric ordering (strings, binary, nested).
@@ -1204,5 +1365,411 @@ mod tests {
         let col = ts.column_stats.get("x").expect("col stats present");
         // Clamped to non_null = 1000.
         assert!((col.distinct_values_count - 1000.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn build_base_table_statistics_empty_files_returns_exact_zero() {
+        let base = build_base_table_statistics_with_ndv(&[], &[], &HashMap::new(), &HashMap::new());
+
+        assert_eq!(
+            base.row_count,
+            StatValue::known(0, Confidence::Exact, StatsSource::IcebergManifest)
+        );
+        assert!(base.columns.is_empty());
+        assert_eq!(base.source, StatsSource::IcebergManifest);
+    }
+
+    #[test]
+    fn build_base_table_statistics_missing_row_count_stays_missing() {
+        use crate::sql::catalog::IcebergDataFileInfo;
+
+        let file = IcebergDataFileInfo {
+            path: "f1.parquet".to_string(),
+            size: 100,
+            row_count: None,
+            column_stats: None,
+            partition_spec_id: None,
+            partition_key: None,
+            first_row_id: None,
+            data_sequence_number: Some(1),
+            ivm_change_op: None,
+            included_positions: None,
+            delete_files: vec![],
+            manifest_path: None,
+            partition_values: vec![],
+        };
+
+        let base =
+            build_base_table_statistics_with_ndv(&[file], &[], &HashMap::new(), &HashMap::new());
+
+        assert_eq!(
+            base,
+            BaseTableStatistics::missing(StatsMissingReason::ManifestMissingRowCount)
+        );
+    }
+
+    #[test]
+    fn build_base_table_statistics_keeps_puffin_ndv_without_manifest_column_stats() {
+        use crate::sql::catalog::{ColumnDef, IcebergDataFileInfo};
+
+        let file = IcebergDataFileInfo {
+            path: "f1.parquet".to_string(),
+            size: 100,
+            row_count: Some(100),
+            column_stats: None,
+            partition_spec_id: None,
+            partition_key: None,
+            first_row_id: None,
+            data_sequence_number: Some(1),
+            ivm_change_op: None,
+            included_positions: None,
+            delete_files: vec![],
+            manifest_path: None,
+            partition_values: vec![],
+        };
+        let columns = vec![ColumnDef {
+            name: "OrderKey".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        }];
+        let mut ndv_by_name = HashMap::new();
+        ndv_by_name.insert("orderkey".to_string(), 17.0);
+
+        let base =
+            build_base_table_statistics_with_ndv(&[file], &columns, &ndv_by_name, &HashMap::new());
+
+        let col = base.columns.get("orderkey").expect("lowercase key");
+        assert_eq!(
+            col.ndv,
+            StatValue::known(17.0, Confidence::Exact, StatsSource::IcebergPuffin)
+        );
+        assert_eq!(
+            col.nulls_fraction,
+            StatValue::missing(StatsMissingReason::ColumnNotReported(
+                "orderkey".to_string()
+            ))
+        );
+        assert_eq!(
+            col.average_row_size,
+            StatValue::missing(StatsMissingReason::ColumnNotReported(
+                "orderkey".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn build_base_table_statistics_marks_heuristic_ndv_missing() {
+        use crate::sql::catalog::{ColumnDef, IcebergColumnStats, IcebergDataFileInfo};
+
+        let file = IcebergDataFileInfo {
+            path: "f1.parquet".to_string(),
+            size: 100,
+            row_count: Some(100),
+            column_stats: Some(HashMap::from([(
+                "OrderKey".to_string(),
+                IcebergColumnStats {
+                    null_count: Some(10),
+                    value_count: Some(90),
+                    column_size: Some(720),
+                    lower_bound: Some(1_i32.to_le_bytes().to_vec()),
+                    upper_bound: Some(50_i32.to_le_bytes().to_vec()),
+                },
+            )])),
+            partition_spec_id: None,
+            partition_key: None,
+            first_row_id: None,
+            data_sequence_number: Some(1),
+            ivm_change_op: None,
+            included_positions: None,
+            delete_files: vec![],
+            manifest_path: None,
+            partition_values: vec![],
+        };
+        let columns = vec![ColumnDef {
+            name: "OrderKey".to_string(),
+            data_type: DataType::Int32,
+            nullable: true,
+            write_default: None,
+            logical_type: None,
+        }];
+
+        let base = build_base_table_statistics_with_ndv(
+            &[file],
+            &columns,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        assert_eq!(
+            base.row_count,
+            StatValue::known(100, Confidence::Exact, StatsSource::IcebergManifest)
+        );
+        let col = base.columns.get("orderkey").expect("lowercase key");
+        assert_eq!(
+            col.nulls_fraction,
+            StatValue::known(0.1, Confidence::Exact, StatsSource::IcebergManifest)
+        );
+        assert_eq!(
+            col.average_row_size,
+            StatValue::known(7.2, Confidence::Exact, StatsSource::IcebergManifest)
+        );
+        assert_eq!(
+            col.min_value,
+            StatValue::known(1.0, Confidence::Exact, StatsSource::IcebergManifest)
+        );
+        assert_eq!(
+            col.max_value,
+            StatValue::known(50.0, Confidence::Exact, StatsSource::IcebergManifest)
+        );
+        assert_eq!(
+            col.ndv,
+            StatValue::missing(StatsMissingReason::ColumnNotReported(
+                "orderkey".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn build_base_table_statistics_marks_missing_manifest_fields_missing() {
+        use crate::sql::catalog::{ColumnDef, IcebergColumnStats, IcebergDataFileInfo};
+
+        let file = IcebergDataFileInfo {
+            path: "f1.parquet".to_string(),
+            size: 100,
+            row_count: Some(100),
+            column_stats: Some(HashMap::from([(
+                "OrderKey".to_string(),
+                IcebergColumnStats {
+                    null_count: None,
+                    value_count: Some(100),
+                    column_size: None,
+                    lower_bound: Some(1_i32.to_le_bytes().to_vec()),
+                    upper_bound: Some(50_i32.to_le_bytes().to_vec()),
+                },
+            )])),
+            partition_spec_id: None,
+            partition_key: None,
+            first_row_id: None,
+            data_sequence_number: Some(1),
+            ivm_change_op: None,
+            included_positions: None,
+            delete_files: vec![],
+            manifest_path: None,
+            partition_values: vec![],
+        };
+        let columns = vec![ColumnDef {
+            name: "OrderKey".to_string(),
+            data_type: DataType::Int32,
+            nullable: true,
+            write_default: None,
+            logical_type: None,
+        }];
+
+        let base = build_base_table_statistics_with_ndv(
+            &[file],
+            &columns,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let col = base.columns.get("orderkey").expect("lowercase key");
+        assert_eq!(
+            col.nulls_fraction,
+            StatValue::missing(StatsMissingReason::ColumnNotReported(
+                "orderkey".to_string()
+            ))
+        );
+        assert_eq!(
+            col.average_row_size,
+            StatValue::missing(StatsMissingReason::ColumnNotReported(
+                "orderkey".to_string()
+            ))
+        );
+        assert_eq!(
+            col.min_value,
+            StatValue::known(1.0, Confidence::Exact, StatsSource::IcebergManifest)
+        );
+        assert_eq!(
+            col.max_value,
+            StatValue::known(50.0, Confidence::Exact, StatsSource::IcebergManifest)
+        );
+    }
+
+    #[test]
+    fn build_base_table_statistics_treats_non_finite_float_bounds_as_missing() {
+        use crate::sql::catalog::{ColumnDef, IcebergColumnStats, IcebergDataFileInfo};
+
+        let file = IcebergDataFileInfo {
+            path: "f1.parquet".to_string(),
+            size: 100,
+            row_count: Some(10),
+            column_stats: Some(HashMap::from([
+                (
+                    "FloatNaN".to_string(),
+                    IcebergColumnStats {
+                        null_count: Some(0),
+                        value_count: Some(10),
+                        column_size: Some(40),
+                        lower_bound: Some(f32::NAN.to_le_bytes().to_vec()),
+                        upper_bound: Some(3.5_f32.to_le_bytes().to_vec()),
+                    },
+                ),
+                (
+                    "DoubleInf".to_string(),
+                    IcebergColumnStats {
+                        null_count: Some(0),
+                        value_count: Some(10),
+                        column_size: Some(80),
+                        lower_bound: Some(1.25_f64.to_le_bytes().to_vec()),
+                        upper_bound: Some(f64::INFINITY.to_le_bytes().to_vec()),
+                    },
+                ),
+            ])),
+            partition_spec_id: None,
+            partition_key: None,
+            first_row_id: None,
+            data_sequence_number: Some(1),
+            ivm_change_op: None,
+            included_positions: None,
+            delete_files: vec![],
+            manifest_path: None,
+            partition_values: vec![],
+        };
+        let columns = vec![
+            ColumnDef {
+                name: "FloatNaN".to_string(),
+                data_type: DataType::Float32,
+                nullable: true,
+                write_default: None,
+                logical_type: None,
+            },
+            ColumnDef {
+                name: "DoubleInf".to_string(),
+                data_type: DataType::Float64,
+                nullable: true,
+                write_default: None,
+                logical_type: None,
+            },
+        ];
+
+        let base = build_base_table_statistics_with_ndv(
+            &[file],
+            &columns,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let float_nan = base.columns.get("floatnan").expect("float column");
+        assert_eq!(
+            float_nan.min_value,
+            StatValue::missing(StatsMissingReason::ColumnNotReported(
+                "floatnan".to_string()
+            ))
+        );
+        assert_eq!(
+            float_nan.max_value,
+            StatValue::known(3.5, Confidence::Exact, StatsSource::IcebergManifest)
+        );
+
+        let double_inf = base.columns.get("doubleinf").expect("double column");
+        assert_eq!(
+            double_inf.min_value,
+            StatValue::known(1.25, Confidence::Exact, StatsSource::IcebergManifest)
+        );
+        assert_eq!(
+            double_inf.max_value,
+            StatValue::missing(StatsMissingReason::ColumnNotReported(
+                "doubleinf".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn build_base_table_statistics_preserves_puffin_ndv() {
+        use crate::sql::catalog::{ColumnDef, IcebergColumnStats, IcebergDataFileInfo};
+
+        let file = IcebergDataFileInfo {
+            path: "f1.parquet".to_string(),
+            size: 100,
+            row_count: Some(100),
+            column_stats: Some(HashMap::from([(
+                "OrderKey".to_string(),
+                IcebergColumnStats {
+                    null_count: Some(0),
+                    value_count: Some(100),
+                    column_size: Some(800),
+                    lower_bound: None,
+                    upper_bound: None,
+                },
+            )])),
+            partition_spec_id: None,
+            partition_key: None,
+            first_row_id: None,
+            data_sequence_number: Some(1),
+            ivm_change_op: None,
+            included_positions: None,
+            delete_files: vec![],
+            manifest_path: None,
+            partition_values: vec![],
+        };
+        let columns = vec![ColumnDef {
+            name: "OrderKey".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        }];
+        let mut ndv_by_name = HashMap::new();
+        ndv_by_name.insert("orderkey".to_string(), 17.0);
+
+        let base =
+            build_base_table_statistics_with_ndv(&[file], &columns, &ndv_by_name, &HashMap::new());
+
+        let col = base.columns.get("orderkey").expect("lowercase key");
+        assert_eq!(
+            col.ndv,
+            StatValue::known(17.0, Confidence::Exact, StatsSource::IcebergPuffin)
+        );
+    }
+
+    #[test]
+    fn build_base_table_statistics_preserves_zero_puffin_ndv() {
+        use crate::sql::catalog::{ColumnDef, IcebergDataFileInfo};
+
+        let file = IcebergDataFileInfo {
+            path: "f1.parquet".to_string(),
+            size: 100,
+            row_count: Some(100),
+            column_stats: None,
+            partition_spec_id: None,
+            partition_key: None,
+            first_row_id: None,
+            data_sequence_number: Some(1),
+            ivm_change_op: None,
+            included_positions: None,
+            delete_files: vec![],
+            manifest_path: None,
+            partition_values: vec![],
+        };
+        let columns = vec![ColumnDef {
+            name: "OrderKey".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        }];
+        let mut ndv_by_name = HashMap::new();
+        ndv_by_name.insert("orderkey".to_string(), 0.0);
+
+        let base =
+            build_base_table_statistics_with_ndv(&[file], &columns, &ndv_by_name, &HashMap::new());
+
+        let col = base.columns.get("orderkey").expect("lowercase key");
+        assert_eq!(
+            col.ndv,
+            StatValue::known(0.0, Confidence::Exact, StatsSource::IcebergPuffin)
+        );
     }
 }
