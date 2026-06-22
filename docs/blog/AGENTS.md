@@ -70,7 +70,7 @@
 
 - [NovaRocks 是什么:从一个 mock BE,到 Iceberg-原生的 OLAP 引擎](what-is-novarocks.md)
   —— 总览 / 入口文章:项目是什么、起源(StarRocks BE 在 Mac 上难开发 → mock BE → 验证思路的平台)、三种部署模式、当前已是完整独立 OLAP 引擎,以及「Iceberg v3 强绑定 + IVM 核心特色」的定位。
-- [用 Iceberg v3 实现增量物化视图的原理](incremental-materialized-views-on-iceberg-v3.md)
+- [用 Iceberg v3 实现增量物化视图的原理](incremental-materialized-views-on-iceberg-v3/incremental-materialized-views-on-iceberg-v3.md)
   —— **可作为风格范例**:问题引入(MV 为何难增量)→ Iceberg v3 三块地基 → `__change_op` 增量流
   → apply 到目标表(配 SQL case + 数据表)→ Delta / Version 算子(join 两侧都变的 case + 图)
   → 刷新属性框架(从「唯一行 id」问题切入,配 case + 综合树图)→ staging 分支原子发布(先补 Iceberg 背景)

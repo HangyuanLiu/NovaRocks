@@ -14,6 +14,19 @@
 
 ## 一、增量物化视图为什么难,湖仓给了什么新答案
 
+如果只说「把结果缓存起来」,物化视图很容易被理解成某个引擎里的加速结构:
+为了查得快,多存一份结果。但在湖仓里,这还不够。结果一旦落进私有缓存、专用 cube,
+或另一套报表存储,它就变成了需要单独搬运、授权、治理和对账的第二份数据。
+
+NovaRocks 想要的不是这种 MV。它把 MV 本身也存成一张**标准 Iceberg v3 表**,
+和底表待在同一个 catalog、同一份对象存储里。这样一来,汇总结果不是被锁在 NovaRocks
+内部的私有产物,而是湖仓里一张普通的开放表:Spark 可以跑批,Trino / Presto 可以做交互式查询,
+Flink 也可以继续接下游,不需要 NovaRocks 在场,也不需要额外导出 / 转换。
+
+这还顺手把明细和汇总收回到了同一个入口。明细报表查底表,汇总报表查 MV,但它们共享同一套
+catalog、权限、治理和口径;汇总结果不再是另一条 ETL 算出来的「第二份真相」,
+而是从底表增量推导出来、和底表同构保存的一部分湖仓资产。
+
 学术界和工业界处理增量维护,大致有两条脉络:
 
 - **经典 IVM**:把视图看作关系代数表达式,用「增量代数」推导每个算子的 delta 规则
@@ -32,7 +45,7 @@ NovaRocks 的取舍是另一条路——**批式、快照锚定、把表自身�
 
 这条路之所以走得通,是因为 **Iceberg v3 第一次让一张普通的湖仓表具备了做 changelog 的全部要件**。
 代价是它不是「毫秒级持续物化」,但换来的是:没有额外状态系统、存储原生、可移植——
-MV 本身也是一张普通的 Iceberg v3 表,任何兼容的引擎都能把它当普通表来读。
+这也正是上面两个红利能成立的根本原因。
 
 ---
 
@@ -60,18 +73,23 @@ Iceberg 的每次提交产生一个**快照**(snapshot),快照之间构成父子
 刷新时,NovaRocks 从「上次刷新所锚定的快照」沿父链走到「当前快照」,把这段窗口里的每个快照
 分类成一个增量动作(Append / Delete / Overwrite / Replace)。**这一步纯粹读元数据,不碰一个数据文件**。
 
+![快照窗口:只读元数据识别增量](incremental-materialized-views-on-iceberg-v3-01-snapshot-window.png)
+
+<!--
+Mermaid 逻辑图:快照窗口。注释掉以避免 preview 渲染,保留核心逻辑。
 ```mermaid
 graph LR
   P["上次刷新<br/>pin = S1"]:::pin
-  S0["S0"] --> S1["S1<br/>Append"]
-  S1 --> S2["S2 Replace<br/>压实 · 跳过"]:::skip
-  S2 --> S3["S3 Delete<br/>(DV)"]:::win
-  S3 --> S4["S4 Append<br/>current"]:::win
+  S0["S0"] ==> S1["S1<br/>Append"]
+  S1 ==> S2["S2 Replace<br/>压实 · 跳过"]:::skip
+  S2 ==> S3["S3 Delete<br/>(DV)"]:::win
+  S3 ==> S4["S4 Append<br/>current"]:::win
   P -.-> S1
   classDef pin fill:#3d2f00,stroke:#d29922,color:#fff;
   classDef skip fill:#22262e,stroke:#6e7681,color:#9aa3b2,stroke-dasharray:5 3;
   classDef win fill:#16324f,stroke:#6ea8fe,color:#dfe8f5;
 ```
+-->
 
 *窗口 = 从 pin(S1)到 current(S4)。`S2` 被验证为「压实型 REPLACE」(总记录数不变、schema 不变、
 增删文件数符合压实特征)而**直接跳过**——因为它逻辑内容没变,行血缘也已结转。
@@ -92,10 +110,6 @@ v2 的位置删除(position delete)走同一条路径,按文件合并成一个�
 - **压实不透明**:v2 看不出某次重写「逻辑内容没变」,只能当成「整批删 + 整批插」,从而被迫全量刷新。
 - **没有 DV**:删除无法以增量友好的方式表达。
 
-正因如此,NovaRocks 在 **CREATE 时就做 v3-only 门禁**:底表与目标表都必须
-`format-version=3` 且开启 `write.row-lineage=true`,否则直接 fail-fast 报错——
-这是「快速失败、不做 best-effort」原则的体现,也有回归用例守着(同时拒绝 v2、以及「v3 但未开行血缘」)。
-
 ---
 
 ## 三、一条增量流贯穿全篇:`__change_op` +1 / −1
@@ -114,20 +128,25 @@ NovaRocks 的做法是给增量流加一列 `__change_op`:**插入 = +1,删除 =
 最终,三种来源——新增数据文件、位置删除 / DV、等值删除——都汇聚成一条带 `__change_op` 和
 四列行血缘的统一增量流。
 
+![统一增量流:__change_op +1 / -1](incremental-materialized-views-on-iceberg-v3-02-change-op-flow.png)
+
+<!--
+Mermaid 逻辑图:统一增量流。注释掉以避免 preview 渲染,保留核心逻辑。
 ```mermaid
 graph LR
-  A["新增数据文件<br/>+1 插入"] --> D
-  B["位置删除 / DV<br/>反投影被删行 + _row_id<br/>−1"] --> D
-  C["等值删除<br/>−1"] --> D
-  D["IcebergDeltaScan<br/>注入 __change_op + 行血缘"]:::hub --> E1["行级 merge sink<br/>投影 / 过滤 MV"]
-  D --> E2["聚合态合并<br/>聚合 MV"]
-  E1 --> F["staging 分支<br/>__nova_mv_refresh_*"]:::br
-  E2 --> F
-  F --> G["原子 fast-forward<br/>发布到 main"]:::pub
+  A["新增数据文件<br/>+1 插入"] ==> D
+  B["位置删除 / DV<br/>反投影被删行 + _row_id<br/>−1"] ==> D
+  C["等值删除<br/>−1"] ==> D
+  D["IcebergDeltaScan<br/>注入 __change_op + 行血缘"]:::hub ==> E1["行级 merge sink<br/>投影 / 过滤 MV"]
+  D ==> E2["聚合态合并<br/>聚合 MV"]
+  E1 ==> F["staging 分支<br/>__nova_mv_refresh_*"]:::br
+  E2 ==> F
+  F ==> G["原子 fast-forward<br/>发布到 main"]:::pub
   classDef hub fill:#16324f,stroke:#6ea8fe,color:#dfe8f5;
   classDef br fill:#3d2f00,stroke:#d29922,color:#fff;
   classDef pub fill:#14331f,stroke:#3fb950,color:#dfe8f5;
 ```
+-->
 
 ---
 
@@ -200,8 +219,52 @@ GROUP BY city;
 
 结果:`SH` 行从 `total = 300` 更新到 `320`(`cnt` 仍为 4),`BJ` 纹丝不动。聚合路径把这次变化同样表达成一条 change stream(旧分组行 `−1` + 新分组行 `+1`),流进**和行级路径同一个合并 sink**——两条路,最后都汇到同一处提交。
 
-> 之所以坚持存「可合并 / 可回缩的状态」而不是只存可见结果:`SUM`/`COUNT` 也许还能凑合,但 `MAX` 删掉当前最大值后,
-> 只有保留了足够的中间状态才退得回次大值。**让删除可回退,是聚合增量维护能成立的前提**——这正是这套状态布局背后的设计取舍。
+这个例子用 `SUM` / `COUNT` 是为了好算,但这套状态设计真正有意义的地方,恰恰在那些**只看可见结果会丢信息**的聚合上。
+
+先看 `COUNT(DISTINCT)`:
+
+```sql
+CREATE MATERIALIZED VIEW buyers_by_city AS
+SELECT city, COUNT(DISTINCT user_id) AS buyers
+FROM orders
+GROUP BY city;
+```
+
+假设 `SH` 当前有三笔订单:`u1` 下了两单,`u2` 下了一单。可见结果只是 `buyers = 2`,
+但状态里要记的不是数字 2,而是每个 distinct key 的出现次数:
+
+| city | buyers | `__state_buyers` |
+|:-:|:-:|:-:|
+| SH | 2 | `{u1:2, u2:1}` |
+
+如果删掉 `u1` 的其中一单,delta 是 `{u1:-1}`,合并后状态变成 `{u1:1, u2:1}`,
+可见结果仍然是 2;只有再删掉 `u1` 的最后一单,状态变成 `{u2:1}`,`buyers` 才会从 2 降到 1。
+这就是 `COUNT(DISTINCT)` 不能只存一个计数的原因:删除一行时,你必须知道这个 key 在组里是不是**最后一次出现**。
+
+`MIN` / `MAX` 也是同一个道理:
+
+```sql
+CREATE MATERIALIZED VIEW city_order_range AS
+SELECT city, MIN(amount) AS min_amount, MAX(amount) AS max_amount
+FROM orders
+GROUP BY city;
+```
+
+假设 `BJ` 当前金额是 `80,150,200`,可见结果是 `min = 80`,`max = 200`;
+状态要保留每个候选值的出现次数:
+
+| city | min_amount | max_amount | `__state_amount` |
+|:-:|:-:|:-:|:-:|
+| BJ | 80 | 200 | `{80:1, 150:1, 200:1}` |
+
+现在删除 `200`,如果 MV 只存可见的 `max = 200`,它不知道该退回到谁;有状态就很直接:
+合并 `{200:-1}` 后状态变成 `{80:1, 150:1}`,新的 `max` 从状态里重新派生为 `150`。
+如果原来是 `{80:1, 150:1, 200:2}`,删掉一条 `200` 后状态仍有 `{200:1}`,`max` 也仍然是 200。
+
+所以聚合态不是「把结果多存一份」,而是把每个聚合需要的**可回缩证据**存下来:
+`SUM` / `COUNT` 可以是可加减的数值状态;`COUNT(DISTINCT)`、`MIN`、`MAX` 则更像一个按值计数的 multiset。
+刷新时统一做的事始终没变:旧态和增量态合并,再从合并后的状态派生可见结果。正因为这个契约稳定,
+新的聚合函数才不需要发明一条新的刷新路径,只需要定义自己的状态如何累积、如何回缩、如何转成最终可见值。
 
 ---
 
@@ -279,19 +342,24 @@ FROM orders o JOIN customers c ON o.customer_id = c.id;
 于是 MV 从 `{(o2, 李四, 80), (o5, 王五, 150)}` 变成 `{(o2, 李四四, 80), (o5, 王五, 150), (o9, 李四四, 120)}`——
 「两边各改一行」被精确翻译成「视图改 2 行、加 1 行」,全程没碰任何无关数据。
 
+![Join 增量:Delta + Version 错位计算](incremental-materialized-views-on-iceberg-v3-03-join-delta-version.png)
+
+<!--
+Mermaid 逻辑图:Join Delta + Version。注释掉以避免 preview 渲染,保留核心逻辑。
 ```mermaid
 graph TD
-  DA["Δorders:新增 o9"] --> L["左分支<br/>Δorders ⋈ customers@from"]:::b
-  CF["customers @ from<br/>(改名前)"] --> L
-  AT["orders @ to<br/>(已含 o9)"] --> R["右分支<br/>orders@to ⋈ Δcustomers"]:::b
-  DB["Δcustomers:改名<br/>−李四 / +李四四"] --> R
-  L --> C{"按 apply-key 净抵<br/>o9 的「李四」一进一出抵消"}:::c
-  R --> C
-  C --> M["视图增量<br/>→ 行级合并 sink"]:::m
+  DA["Δorders:新增 o9"] ==> L["左分支<br/>Δorders ⋈ customers@from"]:::b
+  CF["customers @ from<br/>(改名前)"] ==> L
+  AT["orders @ to<br/>(已含 o9)"] ==> R["右分支<br/>orders@to ⋈ Δcustomers"]:::b
+  DB["Δcustomers:改名<br/>−李四 / +李四四"] ==> R
+  L ==> C{"按 apply-key 净抵<br/>o9 的「李四」一进一出抵消"}:::c
+  R ==> C
+  C ==> M["视图增量<br/>→ 行级合并 sink"]:::m
   classDef b fill:#22262e,stroke:#6e7681,color:#cdd6e4;
   classDef c fill:#16324f,stroke:#6ea8fe,color:#dfe8f5;
   classDef m fill:#14331f,stroke:#3fb950,color:#dfe8f5;
 ```
+-->
 
 ### NovaRocks 怎么用 Iceberg 实现 Delta 和 Version
 
@@ -343,15 +411,20 @@ GROUP BY c.city;
 
 它的身份沿树自底向上是这样综合的:
 
+![唯一行 ID:从 BaseRowId 到 GroupRowId](incremental-materialized-views-on-iceberg-v3-04-row-id-framework.png)
+
+<!--
+Mermaid 逻辑图:刷新属性综合。注释掉以避免 preview 渲染,保留核心逻辑。
 ```mermaid
 graph BT
-  O["Scan orders<br/>BaseRowId"] --> J1["Join<br/>JoinRowKey"]
-  C["Scan customers<br/>BaseRowId"] --> J1
-  J1 --> J2["Join<br/>JoinRowKey"]
-  RG["Scan regions<br/>BaseRowId"] --> J2
-  J2 --> AG["Aggregate GROUP BY city<br/>GroupRowId = city"]:::top
+  O["Scan orders<br/>BaseRowId"] ==> J1["Join<br/>JoinRowKey"]
+  C["Scan customers<br/>BaseRowId"] ==> J1
+  J1 ==> J2["Join<br/>JoinRowKey"]
+  RG["Scan regions<br/>BaseRowId"] ==> J2
+  J2 ==> AG["Aggregate GROUP BY city<br/>GroupRowId = city"]:::top
   classDef top fill:#16324f,stroke:#6ea8fe,color:#dfe8f5;
 ```
+-->
 
 下面 join 了三张表、嵌了两层,可一旦到了 `GROUP BY city`,这些全都**坍缩**掉——`city_sales` 每行的唯一 id 就是 `city`,
 apply 时只需「按 `city` 定位分组、合并聚合态」(正是第四节聚合态合并那套),根本不关心底下 join 长什么样。这就是身份综合的威力:**复杂度在该消失的地方消失了。**
@@ -386,12 +459,17 @@ SELECT city, SUM(refund) AS total FROM refunds GROUP BY city;
 两个 `SH` 各归各的分支,退款变更只落到 `(refunds, SH)`,绝不会碰 `(orders, SH)`。**这就是为什么 `Union` 必须在孩子身份之外再叠一个 branch 维度**——
 因为兄弟分支会各自独立地产出**相同的内层身份**,不加分支标签,它们就会在并起来的目标表里相撞。
 
+![UNION ALL:BranchScoped 避免 key 冲突](incremental-materialized-views-on-iceberg-v3-05-union-branch-scoped.png)
+
+<!--
+Mermaid 逻辑图:UNION ALL 分支身份。注释掉以避免 preview 渲染,保留核心逻辑。
 ```mermaid
 graph BT
-  O["orders → GROUP BY city<br/>GroupRowId = city"] --> U["UNION ALL<br/>BranchScoped(GroupRowId)<br/>= (分支, city)"]:::top
-  R["refunds → GROUP BY city<br/>GroupRowId = city"] --> U
+  O["orders → GROUP BY city<br/>GroupRowId = city"] ==> U["UNION ALL<br/>BranchScoped(GroupRowId)<br/>= (分支, city)"]:::top
+  R["refunds → GROUP BY city<br/>GroupRowId = city"] ==> U
   classDef top fill:#16324f,stroke:#6ea8fe,color:#dfe8f5;
 ```
+-->
 
 而这个 branch 维度有两个好性质:它**与分支内部是什么无关**(分支里是聚合、join、还是又一个 union,都不影响「缀一个分支标签」这件事),
 而且**幂等**——`branch ∘ branch = branch`,嵌套的 union 不会越缀越多层,而是收敛成一条「分支路径」。
@@ -429,45 +507,22 @@ graph BT
 
 第五节的 `Version` 读、以及这里的隔离与守卫,全都建立在「快照不可变、可寻址」之上:刷新读的是 pin 住的 `from` / `to` 快照,不受并发写入干扰。而 staging 分支作为一个 ref,**本身就持久化在表元数据里**——进程崩溃重启后,NovaRocks 只要列出还挂着的 `__nova_mv_refresh_*` ref 就能对账:要么发现刷新其实已发布、清掉残留分支,要么发现是半路夭折的尝试、回收它。**恢复所需的全部状态都在 Iceberg 元数据里,不需要第二份事务日志。**
 
+![刷新事务性:隔离、原子发布、崩溃恢复](incremental-materialized-views-on-iceberg-v3-06-refresh-transaction.png)
+
+<!--
+Mermaid 逻辑图:刷新事务性。注释掉以避免 preview 渲染,保留核心逻辑。
 ```mermaid
 graph LR
-  W["刷新:多步写入"] --> SB["staging 分支<br/>对 main 不可见"]:::br
-  SB --> G{"main 仍在预期快照?"}:::g
-  G -->|是| FF["原子 fast-forward<br/>main 推进到新快照"]:::ok
-  G -->|否| AB["撞车 → 整体作废 · 重来"]:::no
+  W["刷新:多步写入"] ==> SB["staging 分支<br/>对 main 不可见"]:::br
+  SB ==> G{"main 仍在预期快照?"}:::g
+  G ==>|是| FF["原子 fast-forward<br/>main 推进到新快照"]:::ok
+  G ==>|否| AB["撞车 → 整体作废 · 重来"]:::no
   X["崩溃重启"] -.-> R["按 ref 对账 · 回收残留分支"]:::g
   classDef br fill:#3d2f00,stroke:#d29922,color:#fff;
   classDef g fill:#22262e,stroke:#6e7681,color:#cdd6e4;
   classDef ok fill:#14331f,stroke:#3fb950,color:#dfe8f5;
   classDef no fill:#3a1d1d,stroke:#f85149,color:#f5dfdf;
 ```
+-->
 
 把这三点合起来——**隔离、原子发布、崩溃恢复**——一件在分布式系统里通常要专门子系统(协调器、独立事务日志)去保证的事,在这里被三个 Iceberg 原语兜住了:NovaRocks 没有为物化视图的事务性另起炉灶,而是直接复用了表本身的能力。
-
----
-
-## 八、为什么 MV 也是一张 Iceberg 表:两个额外的红利
-
-前面反复看到:增量维护骑在 Iceberg 的快照、行血缘、分支之上。而「**把 MV 本身也存成一张标准 Iceberg v3 表**」这个选择,
-好处还不止「省刷新成本」——它顺手解决了数据平台里两件长期头疼的事。
-
-### 红利一:跨引擎、跨平台,不被锁定
-
-MV 不是 NovaRocks 私有的内部结构,它就是一张普通的 Iceberg v3 表,躺在同一个 catalog、同一份对象存储里。
-于是**任何兼容 Iceberg 的引擎都能直接读它**:Spark 跑批、Trino / Presto 做交互式查询、Flink 接流,看到的都是一张正常的表——
-不需要 NovaRocks 在场,也不需要任何导出 / 转换。增量维护所需的全部「状态」(快照链、行血缘、聚合态列)都落在表里,**完全可移植**。
-这跟「把汇总结果锁进某个引擎的私有存储、或一座专用 OLAP cube」是两种世界:在这里,**MV 这份物化产物本身,就是开放湖仓资产的一部分。**
-
-### 红利二:明细与汇总,统一入口
-
-数据平台里有两类常被拆成两套系统的需求:**明细型报表**(查原始事实、逐条钻取)和**汇总型报表**(看聚合指标、趋势)。
-传统做法往往是——明细放数据湖,汇总单独算好、塞进另一套报表库 / OLAP 引擎:两套存储、两套权限、两套口径,还要操心同步。
-
-而在这里,**底表(明细)和 MV(汇总)是同一个湖里、同构的 Iceberg 表**:
-
-- 明细报表直接查底表,汇总报表直接查 MV——**同一个查询入口、同一套 catalog、同一套权限与治理**;
-- 汇总不必再「导去另一个系统」,它就长在明细旁边,由增量刷新保持新鲜;
-- 口径天然一致:MV 是从底表**增量推导**出来的,而不是另一条独立 ETL 算出来的「第二份真相」。
-
-一句话:**因为 MV 选择了和明细数据相同的开放格式,分析型需求与报表型需求被收敛到了同一个入口。**
-这正是把「一张 Iceberg v3 表的能力用到尽头」之后,最终落到用户手里的那份红利。

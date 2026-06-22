@@ -79,7 +79,7 @@ graph TD
 而在「完整 OLAP 引擎」这个共性之上,NovaRocks 有两个鲜明的、刻意选择的**专属定位**:
 
 - **对 Iceberg v3 强绑定、专属优化。** 它不是「顺便支持一下 Iceberg」,而是把 Iceberg v3 当成一等公民来设计——从读写、catalog,到下面要说的物化视图,都深度利用 v3 的能力(行血缘、快照血缘、删除向量等)。
-- **以增量物化视图(IVM)作为核心特色功能。** 这是 NovaRocks 最与众不同的地方:它把 Iceberg v3 表的提交历史当作 changelog,用行血缘做跨快照稳定的行身份,实现**增量**维护物化视图,而不必全量重算。原理见专文:[用 Iceberg v3 实现增量物化视图的原理](incremental-materialized-views-on-iceberg-v3.md)。
+- **以增量物化视图(IVM)作为核心特色功能。** 这是 NovaRocks 最与众不同的地方:它把 Iceberg v3 表的提交历史当作 changelog,用行血缘做跨快照稳定的行身份,实现**增量**维护物化视图,而不必全量重算。原理见专文:[用 Iceberg v3 实现增量物化视图的原理](incremental-materialized-views-on-iceberg-v3/incremental-materialized-views-on-iceberg-v3.md)。
 
 ---
 
