@@ -136,15 +136,7 @@ impl ExecutionCoordinator {
             );
         }
 
-        let live: Vec<(usize, std::net::SocketAddr)> =
-            match crate::runtime::backend_registry::backend_registry() {
-                Some(reg) => reg
-                    .live_endpoints()
-                    .into_iter()
-                    .map(|(be_id, ep)| (be_id as usize, ep))
-                    .collect(),
-                None => scheduler.backends().iter().copied().enumerate().collect(),
-            };
+        let live = scheduler.live_backend_entries().to_vec();
         let mut plan =
             scheduler.assign_with_live(&fragment_results, &edges, query_id.clone(), &live)?;
         scheduler.fill_destinations_with_live(&mut plan, &edges, &live)?;

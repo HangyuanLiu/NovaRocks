@@ -743,7 +743,7 @@ impl RemoteDispatcher {
         Ok(Self { clients, addrs })
     }
 
-    /// The address of `backend_idx`, if in range.
+    /// The address of `backend_idx`/backend id, if present.
     ///
     /// PR-4 destination wiring: `FragmentScheduler` calls this to embed the
     /// correct backend address into `TPlanFragmentDestination` entries when

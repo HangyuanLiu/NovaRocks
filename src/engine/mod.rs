@@ -3858,21 +3858,27 @@ fn coordinated_execution_services() -> Result<
     String,
 > {
     use crate::common::app_config::ClusterRole;
-    use std::net::SocketAddr;
-
     let role = crate::novarocks_config::config()
         .map(|c| c.cluster.role)
         .unwrap_or(ClusterRole::AllInOne);
-    let dispatcher = dispatcher_for_role(role)?;
-    // Backend list for the scheduler is the same live registry surface used
-    // by the dispatcher; pure BE must not coordinate.
-    let backends: Vec<SocketAddr> = match role {
-        ClusterRole::Fe | ClusterRole::AllInOne => backend_ops::live_backend_scheduler_endpoints()?,
+    let (dispatcher, scheduler) = match role {
+        ClusterRole::Fe | ClusterRole::AllInOne => {
+            let entries = backend_ops::live_backend_dispatch_entries()?;
+            let dispatcher = Arc::new(
+                crate::runtime::dispatcher::RemoteDispatcher::new_with_backend_ids(&entries)?,
+            );
+            let scheduler = Arc::new(
+                crate::runtime::scheduler::FragmentScheduler::new_with_backend_ids(entries),
+            );
+            (
+                dispatcher as Arc<dyn crate::runtime::dispatcher::FragmentDispatcher>,
+                scheduler,
+            )
+        }
         ClusterRole::Be => {
             return Err("role=be must not enter standalone coordinator".into());
         }
     };
-    let scheduler = Arc::new(crate::runtime::scheduler::FragmentScheduler::new(backends));
     Ok((dispatcher, scheduler))
 }
 
@@ -5270,7 +5276,18 @@ path = "{metadata_path}"
 
         let result = session.query("SHOW BACKENDS").expect("SHOW BACKENDS");
         assert_eq!(result.row_count(), 1);
+        assert_eq!(string_cell(&result, 0, 0), "0");
+        assert_eq!(string_cell(&result, 0, 1), "127.0.0.1");
+        assert_eq!(
+            string_cell(&result, 0, 2),
+            engine.inner.exchange_port.to_string()
+        );
         assert_eq!(string_cell(&result, 0, 3), "Live");
+        assert_eq!(string_cell(&result, 0, 7), env!("CARGO_PKG_VERSION"));
+        assert!(
+            string_cell(&result, 0, 8).parse::<u32>().unwrap() > 0,
+            "NumCores must be populated"
+        );
     }
 
     #[test]
@@ -9620,6 +9637,30 @@ path = "meta/operations.sqlite"
 
         assert_eq!(super::dispatcher_kind_for_test(&dispatcher), "remote");
         assert_eq!(dispatcher.backend_count(), 1);
+    }
+
+    #[test]
+    fn coordinated_execution_services_use_one_live_backend_snapshot() {
+        let _guard = super::acquire_standalone_test_guard();
+        let _registry = BackendRegistryReset::new();
+        use crate::common::app_config::{ClusterRole, NovaRocksConfig};
+        use crate::runtime::backend_registry::{BackendRegistry, BackendState};
+        let mut cfg = NovaRocksConfig::default();
+        cfg.cluster.role = ClusterRole::Fe;
+        cfg.cluster.backends.clear();
+        crate::common::app_config::install_preloaded_config(cfg);
+
+        let endpoint = "127.0.0.1:19072".parse().unwrap();
+        let registry = Arc::new(BackendRegistry::new(3));
+        registry.restore_backend(2, endpoint, BackendState::Live);
+        crate::runtime::backend_registry::replace_backend_registry_for_test(Some(registry));
+
+        let (dispatcher, scheduler) =
+            super::coordinated_execution_services().expect("coordinated services");
+
+        assert_eq!(super::dispatcher_kind_for_test(&dispatcher), "remote");
+        assert_eq!(dispatcher.backend_count(), 1);
+        assert_eq!(scheduler.live_backend_entries(), &[(2usize, endpoint)]);
     }
 
     #[test]

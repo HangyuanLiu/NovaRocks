@@ -34,8 +34,8 @@
 //! # Backend assignment
 //!
 //! - Multi-instance fragments: instance `i` lands on live backend slot `i`.
-//!   The stored `backend_idx` remains the original configured backend index,
-//!   which may be sparse if the live snapshot filtered some backends out.
+//!   The stored `backend_idx` is the backend id from the live snapshot, which
+//!   may be sparse.
 //! - Single-instance fragments (including the root): `backend_idx =
 //!   live[(query_id.lo as usize) % N].0`.
 //!
@@ -76,7 +76,7 @@ pub(crate) struct FragmentInstancePlacement {
     pub(crate) fragment_id: FragmentId,
     pub(crate) instance_index: usize,
     pub(crate) finst_id: TUniqueId,
-    /// Original index into `FragmentScheduler::backends`.
+    /// Backend id from the scheduler's live backend snapshot.
     pub(crate) backend_idx: usize,
     /// Scan ranges for this instance, keyed by plan node id.
     pub(crate) scan_ranges: BTreeMap<i32, Vec<TScanRangeParams>>,
@@ -106,17 +106,36 @@ pub(crate) struct SchedulingPlan {
 /// Decides which backend each fragment instance lands on.
 pub(crate) struct FragmentScheduler {
     backends: Vec<SocketAddr>,
+    live_backends: Vec<LiveBackend>,
 }
 
 impl FragmentScheduler {
     /// Create a new scheduler with the given backends.
     pub(crate) fn new(backends: Vec<SocketAddr>) -> Self {
-        Self { backends }
+        let live_backends = backends.iter().copied().enumerate().collect();
+        Self {
+            backends,
+            live_backends,
+        }
+    }
+
+    /// Create a scheduler from explicit backend ids and endpoints.
+    pub(crate) fn new_with_backend_ids(backends: Vec<LiveBackend>) -> Self {
+        let endpoints = backends.iter().map(|(_, endpoint)| *endpoint).collect();
+        Self {
+            backends: endpoints,
+            live_backends: backends,
+        }
     }
 
     /// Return the configured backends.
     pub(crate) fn backends(&self) -> &[SocketAddr] {
         &self.backends
+    }
+
+    /// Return the live backend-id/endpoint snapshot used by this scheduler.
+    pub(crate) fn live_backend_entries(&self) -> &[LiveBackend] {
+        &self.live_backends
     }
 
     /// Assign each fragment to one or more instances across the known backends.
@@ -443,7 +462,7 @@ impl FragmentScheduler {
     }
 
     fn full_live_snapshot(&self) -> Vec<LiveBackend> {
-        self.backends.iter().copied().enumerate().collect()
+        self.live_backends.clone()
     }
 }
 
