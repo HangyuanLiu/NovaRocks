@@ -45,6 +45,10 @@ fn rewrite_node(
     match &node.op {
         Operator::PhysicalProject(_) => rewrite_project(node, scalars, factory),
         Operator::PhysicalFilter(_) => rewrite_filter(node, scalars, factory),
+        Operator::PhysicalHashAggregate(_) => rewrite_aggregate(node, scalars, factory),
+        Operator::PhysicalSort(_) => rewrite_sort(node, scalars, factory),
+        Operator::PhysicalTopN(_) => rewrite_topn(node, scalars, factory),
+        Operator::PhysicalWindow(_) => rewrite_window(node, scalars, factory),
         _ => {}
     }
 }
@@ -679,6 +683,150 @@ fn rewrite_filter(
     insert_or_reuse_project_below(&mut node.children[0], prelude, scalars);
 }
 
+fn rewrite_aggregate(
+    node: &mut PhysicalPlanNode,
+    scalars: &mut ScalarArena,
+    factory: &mut ColumnRefFactory,
+) {
+    if node.children.len() != 1 {
+        return;
+    }
+    let Operator::PhysicalHashAggregate(aggregate) = &node.op else {
+        return;
+    };
+    let mut roots = aggregate.group_by.clone();
+    for (index, spec) in aggregate.aggregates.iter().enumerate() {
+        if aggregate.is_merge.get(index).copied().unwrap_or(false) {
+            continue;
+        }
+        roots.extend(spec.args.iter().copied());
+        roots.extend(spec.order_by.iter().map(|key| key.expr));
+    }
+    let commons = pick_commons(scalars, &roots);
+    if commons.is_empty() {
+        return;
+    }
+
+    let (prelude, subst) = build_commons(scalars, factory, &commons);
+    let Operator::PhysicalHashAggregate(aggregate) = &mut node.op else {
+        unreachable!("checked aggregate operator above");
+    };
+    for group_by in &mut aggregate.group_by {
+        *group_by = substitute(scalars, *group_by, &subst);
+    }
+    let is_merge = aggregate.is_merge.clone();
+    for (index, spec) in aggregate.aggregates.iter_mut().enumerate() {
+        if is_merge.get(index).copied().unwrap_or(false) {
+            continue;
+        }
+        for arg in &mut spec.args {
+            *arg = substitute(scalars, *arg, &subst);
+        }
+        for key in &mut spec.order_by {
+            key.expr = substitute(scalars, key.expr, &subst);
+        }
+    }
+    insert_or_reuse_project_below(&mut node.children[0], prelude, scalars);
+}
+
+fn rewrite_sort(
+    node: &mut PhysicalPlanNode,
+    scalars: &mut ScalarArena,
+    factory: &mut ColumnRefFactory,
+) {
+    if node.children.len() != 1 {
+        return;
+    }
+    let Operator::PhysicalSort(sort) = &node.op else {
+        return;
+    };
+    let mut roots = sort.items.iter().map(|key| key.expr).collect::<Vec<_>>();
+    roots.extend(sort.analytic_partition_exprs.iter().copied());
+    let commons = pick_commons(scalars, &roots);
+    if commons.is_empty() {
+        return;
+    }
+
+    let (prelude, subst) = build_commons(scalars, factory, &commons);
+    let Operator::PhysicalSort(sort) = &mut node.op else {
+        unreachable!("checked sort operator above");
+    };
+    for key in &mut sort.items {
+        key.expr = substitute(scalars, key.expr, &subst);
+    }
+    for expr in &mut sort.analytic_partition_exprs {
+        *expr = substitute(scalars, *expr, &subst);
+    }
+    insert_or_reuse_project_below(&mut node.children[0], prelude, scalars);
+}
+
+fn rewrite_topn(
+    node: &mut PhysicalPlanNode,
+    scalars: &mut ScalarArena,
+    factory: &mut ColumnRefFactory,
+) {
+    if node.children.len() != 1 {
+        return;
+    }
+    let Operator::PhysicalTopN(topn) = &node.op else {
+        return;
+    };
+    let roots = topn.items.iter().map(|key| key.expr).collect::<Vec<_>>();
+    let commons = pick_commons(scalars, &roots);
+    if commons.is_empty() {
+        return;
+    }
+
+    let (prelude, subst) = build_commons(scalars, factory, &commons);
+    let Operator::PhysicalTopN(topn) = &mut node.op else {
+        unreachable!("checked topn operator above");
+    };
+    for key in &mut topn.items {
+        key.expr = substitute(scalars, key.expr, &subst);
+    }
+    insert_or_reuse_project_below(&mut node.children[0], prelude, scalars);
+}
+
+fn rewrite_window(
+    node: &mut PhysicalPlanNode,
+    scalars: &mut ScalarArena,
+    factory: &mut ColumnRefFactory,
+) {
+    if node.children.len() != 1 {
+        return;
+    }
+    let Operator::PhysicalWindow(window) = &node.op else {
+        return;
+    };
+    let mut roots = Vec::new();
+    for spec in &window.window_exprs {
+        roots.extend(spec.args.iter().copied());
+        roots.extend(spec.partition_by.iter().copied());
+        roots.extend(spec.order_by.iter().map(|key| key.expr));
+    }
+    let commons = pick_commons(scalars, &roots);
+    if commons.is_empty() {
+        return;
+    }
+
+    let (prelude, subst) = build_commons(scalars, factory, &commons);
+    let Operator::PhysicalWindow(window) = &mut node.op else {
+        unreachable!("checked window operator above");
+    };
+    for spec in &mut window.window_exprs {
+        for arg in &mut spec.args {
+            *arg = substitute(scalars, *arg, &subst);
+        }
+        for partition in &mut spec.partition_by {
+            *partition = substitute(scalars, *partition, &subst);
+        }
+        for key in &mut spec.order_by {
+            key.expr = substitute(scalars, key.expr, &subst);
+        }
+    }
+    insert_or_reuse_project_below(&mut node.children[0], prelude, scalars);
+}
+
 #[cfg(test)]
 mod tests {
     use arrow::datatypes::DataType;
@@ -687,10 +835,13 @@ mod tests {
     use crate::sql::common::OutputColumn;
     use crate::sql::common::{BinOp, LiteralValue};
     use crate::sql::optimizer::operator::{
-        FilterOp, Operator, ProjectOp, ScalarProjectItem, ValuesOp,
+        AggMode, FilterOp, Operator, PhysicalHashAggregateOp, ProjectOp, ScalarAggregateSpec,
+        ScalarProjectItem, ScalarWindowSpec, SortOp, TopNOp, TopNPhase, ValuesOp, WindowOp,
     };
     use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, PlanExecutionProps};
-    use crate::sql::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNode};
+    use crate::sql::optimizer::scalar::{
+        HashableLiteral, ScalarArena, ScalarId, ScalarNode, SortKey,
+    };
     use crate::sql::optimizer::statistics::Statistics;
 
     use super::pick_commons;
@@ -703,6 +854,18 @@ mod tests {
         arena.intern(
             ScalarNode::BinaryOp {
                 op: BinOp::Add,
+                left,
+                right,
+            },
+            DataType::Int64,
+            true,
+        )
+    }
+
+    fn mul(arena: &mut ScalarArena, left: ScalarId, right: ScalarId) -> ScalarId {
+        arena.intern(
+            ScalarNode::BinaryOp {
+                op: BinOp::Mul,
                 left,
                 right,
             },
@@ -794,6 +957,30 @@ mod tests {
             data_type: DataType::Int64,
             nullable: true,
             is_internal: false,
+        }
+    }
+
+    fn values_node(columns: Vec<OutputColumn>) -> PhysicalPlanNode {
+        PhysicalPlanNode {
+            op: Operator::PhysicalValues(ValuesOp {
+                rows: vec![],
+                columns: columns.clone(),
+            }),
+            children: vec![],
+            stats: Statistics::default(),
+            output_columns: columns,
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        }
+    }
+
+    fn sort_key(expr: ScalarId) -> SortKey {
+        SortKey {
+            expr,
+            asc: true,
+            nulls_first: true,
+            display: None,
         }
     }
 
@@ -1539,5 +1726,341 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["x", "y"]
         );
+    }
+
+    #[test]
+    fn rewrite_aggregate_factors_repeated_aggregate_args() {
+        let mut arena = ScalarArena::new();
+        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+        let a = col(&mut arena, 101);
+        let b = col(&mut arena, 102);
+        let a_mul_b = mul(&mut arena, a, b);
+        let child = values_node(vec![output_column(101, "a"), output_column(102, "b")]);
+        let mut node = PhysicalPlanNode {
+            op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+                mode: AggMode::Single,
+                group_by: vec![],
+                aggregates: vec![
+                    ScalarAggregateSpec {
+                        name: "sum".to_string(),
+                        args: vec![a_mul_b],
+                        distinct: false,
+                        order_by: vec![],
+                    },
+                    ScalarAggregateSpec {
+                        name: "avg".to_string(),
+                        args: vec![a_mul_b],
+                        distinct: false,
+                        order_by: vec![],
+                    },
+                ],
+                output_columns: vec![output_column(201, "sum_ab"), output_column(202, "avg_ab")],
+                is_merge: vec![false, false],
+            }),
+            children: vec![child],
+            stats: Statistics::default(),
+            output_columns: vec![output_column(201, "sum_ab"), output_column(202, "avg_ab")],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+
+        super::rewrite_node(&mut node, &mut arena, &mut factory);
+
+        let Operator::PhysicalProject(cse_project) = &node.children[0].op else {
+            panic!("expected inserted CSE project below aggregate");
+        };
+        let cse_item = cse_project
+            .items
+            .iter()
+            .find(|item| item.output_name == "__cse_0")
+            .expect("CSE project item");
+        assert!(matches!(
+            arena.node(cse_item.expr),
+            ScalarNode::BinaryOp { op: BinOp::Mul, .. }
+        ));
+        let cse_column = cse_item.output_column_id;
+        let Operator::PhysicalHashAggregate(aggregate) = &node.op else {
+            panic!("expected physical aggregate");
+        };
+        for spec in &aggregate.aggregates {
+            assert!(matches!(
+                arena.node(spec.args[0]),
+                ScalarNode::ColumnRef(column_id) if *column_id == cse_column
+            ));
+        }
+    }
+
+    #[test]
+    fn rewrite_aggregate_does_not_factor_merge_aggregate_args() {
+        let mut arena = ScalarArena::new();
+        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+        let a = col(&mut arena, 101);
+        let b = col(&mut arena, 102);
+        let a_mul_b = mul(&mut arena, a, b);
+        let child = values_node(vec![
+            output_column(301, "sum_state"),
+            output_column(302, "avg_state"),
+        ]);
+        let mut node = PhysicalPlanNode {
+            op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+                mode: AggMode::Global,
+                group_by: vec![],
+                aggregates: vec![
+                    ScalarAggregateSpec {
+                        name: "sum".to_string(),
+                        args: vec![a_mul_b],
+                        distinct: false,
+                        order_by: vec![],
+                    },
+                    ScalarAggregateSpec {
+                        name: "avg".to_string(),
+                        args: vec![a_mul_b],
+                        distinct: false,
+                        order_by: vec![],
+                    },
+                ],
+                output_columns: vec![output_column(201, "sum_ab"), output_column(202, "avg_ab")],
+                is_merge: vec![true, true],
+            }),
+            children: vec![child],
+            stats: Statistics::default(),
+            output_columns: vec![output_column(201, "sum_ab"), output_column(202, "avg_ab")],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+
+        super::rewrite_node(&mut node, &mut arena, &mut factory);
+
+        assert!(matches!(node.children[0].op, Operator::PhysicalValues(_)));
+        let Operator::PhysicalHashAggregate(aggregate) = &node.op else {
+            panic!("expected physical aggregate");
+        };
+        for spec in &aggregate.aggregates {
+            assert_eq!(spec.args[0], a_mul_b);
+        }
+    }
+
+    #[test]
+    fn rewrite_aggregate_factors_repeated_order_by_exprs_without_rewriting_args() {
+        let mut arena = ScalarArena::new();
+        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+        let a = col(&mut arena, 101);
+        let b = col(&mut arena, 102);
+        let a_mul_b = mul(&mut arena, a, b);
+        let child = values_node(vec![output_column(101, "a"), output_column(102, "b")]);
+        let mut node = PhysicalPlanNode {
+            op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+                mode: AggMode::Single,
+                group_by: vec![],
+                aggregates: vec![
+                    ScalarAggregateSpec {
+                        name: "array_agg".to_string(),
+                        args: vec![a],
+                        distinct: false,
+                        order_by: vec![sort_key(a_mul_b)],
+                    },
+                    ScalarAggregateSpec {
+                        name: "array_agg".to_string(),
+                        args: vec![b],
+                        distinct: false,
+                        order_by: vec![sort_key(a_mul_b)],
+                    },
+                ],
+                output_columns: vec![
+                    output_column(201, "ordered_a"),
+                    output_column(202, "ordered_b"),
+                ],
+                is_merge: vec![false, false],
+            }),
+            children: vec![child],
+            stats: Statistics::default(),
+            output_columns: vec![
+                output_column(201, "ordered_a"),
+                output_column(202, "ordered_b"),
+            ],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+
+        super::rewrite_node(&mut node, &mut arena, &mut factory);
+
+        let Operator::PhysicalProject(cse_project) = &node.children[0].op else {
+            panic!("expected inserted CSE project below aggregate");
+        };
+        let cse_column = cse_project
+            .items
+            .iter()
+            .find(|item| item.output_name == "__cse_0")
+            .expect("CSE project item")
+            .output_column_id;
+        let Operator::PhysicalHashAggregate(aggregate) = &node.op else {
+            panic!("expected physical aggregate");
+        };
+        assert_eq!(aggregate.aggregates[0].args[0], a);
+        assert_eq!(aggregate.aggregates[1].args[0], b);
+        for spec in &aggregate.aggregates {
+            assert!(matches!(
+                arena.node(spec.order_by[0].expr),
+                ScalarNode::ColumnRef(column_id) if *column_id == cse_column
+            ));
+        }
+    }
+
+    #[test]
+    fn rewrite_sort_factors_items_and_analytic_partition_exprs() {
+        let mut arena = ScalarArena::new();
+        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+        let a = col(&mut arena, 101);
+        let b = col(&mut arena, 102);
+        let a_mul_b = mul(&mut arena, a, b);
+        let child = values_node(vec![output_column(101, "a"), output_column(102, "b")]);
+        let mut node = PhysicalPlanNode {
+            op: Operator::PhysicalSort(SortOp {
+                items: vec![sort_key(a_mul_b)],
+                analytic_partition_exprs: vec![a_mul_b],
+                partition_limit: None,
+                topn_type: None,
+            }),
+            children: vec![child],
+            stats: Statistics::default(),
+            output_columns: vec![output_column(101, "a"), output_column(102, "b")],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+
+        super::rewrite_node(&mut node, &mut arena, &mut factory);
+
+        let Operator::PhysicalProject(cse_project) = &node.children[0].op else {
+            panic!("expected inserted CSE project below sort");
+        };
+        let cse_column = cse_project
+            .items
+            .iter()
+            .find(|item| item.output_name == "__cse_0")
+            .expect("CSE project item")
+            .output_column_id;
+        let Operator::PhysicalSort(sort) = &node.op else {
+            panic!("expected physical sort");
+        };
+        assert!(matches!(
+            arena.node(sort.items[0].expr),
+            ScalarNode::ColumnRef(column_id) if *column_id == cse_column
+        ));
+        assert!(matches!(
+            arena.node(sort.analytic_partition_exprs[0]),
+            ScalarNode::ColumnRef(column_id) if *column_id == cse_column
+        ));
+    }
+
+    #[test]
+    fn rewrite_topn_factors_repeated_sort_items() {
+        let mut arena = ScalarArena::new();
+        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+        let a = col(&mut arena, 101);
+        let b = col(&mut arena, 102);
+        let a_mul_b = mul(&mut arena, a, b);
+        let child = values_node(vec![output_column(101, "a"), output_column(102, "b")]);
+        let mut node = PhysicalPlanNode {
+            op: Operator::PhysicalTopN(TopNOp {
+                items: vec![sort_key(a_mul_b), sort_key(a_mul_b)],
+                limit: Some(10),
+                offset: None,
+                phase: TopNPhase::Final,
+                is_split: false,
+            }),
+            children: vec![child],
+            stats: Statistics::default(),
+            output_columns: vec![output_column(101, "a"), output_column(102, "b")],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+
+        super::rewrite_node(&mut node, &mut arena, &mut factory);
+
+        let Operator::PhysicalProject(cse_project) = &node.children[0].op else {
+            panic!("expected inserted CSE project below topn");
+        };
+        let cse_column = cse_project
+            .items
+            .iter()
+            .find(|item| item.output_name == "__cse_0")
+            .expect("CSE project item")
+            .output_column_id;
+        let Operator::PhysicalTopN(topn) = &node.op else {
+            panic!("expected physical topn");
+        };
+        for item in &topn.items {
+            assert!(matches!(
+                arena.node(item.expr),
+                ScalarNode::ColumnRef(column_id) if *column_id == cse_column
+            ));
+        }
+    }
+
+    #[test]
+    fn rewrite_window_factors_args_partition_and_order_by() {
+        let mut arena = ScalarArena::new();
+        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+        let a = col(&mut arena, 101);
+        let b = col(&mut arena, 102);
+        let a_mul_b = mul(&mut arena, a, b);
+        let child = values_node(vec![output_column(101, "a"), output_column(102, "b")]);
+        let mut node = PhysicalPlanNode {
+            op: Operator::PhysicalWindow(WindowOp {
+                window_exprs: vec![ScalarWindowSpec {
+                    name: "sum".to_string(),
+                    args: vec![a_mul_b],
+                    distinct: false,
+                    partition_by: vec![a_mul_b],
+                    order_by: vec![sort_key(a_mul_b)],
+                    window_frame: None,
+                    ignore_nulls: false,
+                }],
+                output_columns: vec![output_column(201, "win_sum")],
+            }),
+            children: vec![child],
+            stats: Statistics::default(),
+            output_columns: vec![
+                output_column(101, "a"),
+                output_column(102, "b"),
+                output_column(201, "win_sum"),
+            ],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+
+        super::rewrite_node(&mut node, &mut arena, &mut factory);
+
+        let Operator::PhysicalProject(cse_project) = &node.children[0].op else {
+            panic!("expected inserted CSE project below window");
+        };
+        let cse_column = cse_project
+            .items
+            .iter()
+            .find(|item| item.output_name == "__cse_0")
+            .expect("CSE project item")
+            .output_column_id;
+        let Operator::PhysicalWindow(window) = &node.op else {
+            panic!("expected physical window");
+        };
+        let spec = &window.window_exprs[0];
+        assert!(matches!(
+            arena.node(spec.args[0]),
+            ScalarNode::ColumnRef(column_id) if *column_id == cse_column
+        ));
+        assert!(matches!(
+            arena.node(spec.partition_by[0]),
+            ScalarNode::ColumnRef(column_id) if *column_id == cse_column
+        ));
+        assert!(matches!(
+            arena.node(spec.order_by[0].expr),
+            ScalarNode::ColumnRef(column_id) if *column_id == cse_column
+        ));
     }
 }
