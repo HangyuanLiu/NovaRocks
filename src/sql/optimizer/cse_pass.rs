@@ -46,6 +46,9 @@ fn rewrite_node(
         Operator::PhysicalProject(_) => rewrite_project(node, scalars, factory),
         Operator::PhysicalFilter(_) => rewrite_filter(node, scalars, factory),
         Operator::PhysicalHashAggregate(_) => rewrite_aggregate(node, scalars, factory),
+        Operator::PhysicalHashJoin(_) | Operator::PhysicalNestLoopJoin(_) => {
+            rewrite_join(node, scalars, factory)
+        }
         Operator::PhysicalSort(_) => rewrite_sort(node, scalars, factory),
         Operator::PhysicalTopN(_) => rewrite_topn(node, scalars, factory),
         Operator::PhysicalWindow(_) => rewrite_window(node, scalars, factory),
@@ -557,6 +560,23 @@ fn insert_or_reuse_project_below(
     wrap_project_around_child(child, prelude, scalars);
 }
 
+fn output_column_set(node: &PhysicalPlanNode) -> HashSet<ColumnId> {
+    node.output_columns
+        .iter()
+        .map(|column| column.column_id)
+        .collect()
+}
+
+fn side_subset(scalars: &ScalarArena, id: ScalarId, side_columns: &HashSet<ColumnId>) -> bool {
+    let Some(refs) = scalar_expr::collect_column_ids_strict(scalars, id) else {
+        return false;
+    };
+    !refs.is_empty()
+        && refs
+            .iter()
+            .all(|column_id| side_columns.contains(column_id))
+}
+
 fn rewrite_project(
     node: &mut PhysicalPlanNode,
     scalars: &mut ScalarArena,
@@ -729,6 +749,61 @@ fn rewrite_aggregate(
     insert_or_reuse_project_below(&mut node.children[0], prelude, scalars);
 }
 
+fn rewrite_join(
+    node: &mut PhysicalPlanNode,
+    scalars: &mut ScalarArena,
+    factory: &mut ColumnRefFactory,
+) {
+    if node.children.len() != 2 {
+        return;
+    }
+    let condition = match &node.op {
+        Operator::PhysicalHashJoin(join) => join.other_condition,
+        Operator::PhysicalNestLoopJoin(join) => join.condition,
+        _ => return,
+    };
+    let Some(condition) = condition else {
+        return;
+    };
+
+    let left_columns = output_column_set(&node.children[0]);
+    let right_columns = output_column_set(&node.children[1]);
+    let commons = pick_commons(scalars, &[condition]);
+    let mut left_commons = Vec::new();
+    let mut right_commons = Vec::new();
+    for common in commons {
+        match (
+            side_subset(scalars, common, &left_columns),
+            side_subset(scalars, common, &right_columns),
+        ) {
+            (true, false) => left_commons.push(common),
+            (false, true) => right_commons.push(common),
+            _ => {}
+        }
+    }
+    if left_commons.is_empty() && right_commons.is_empty() {
+        return;
+    }
+
+    let mut subst = HashMap::new();
+    if !left_commons.is_empty() {
+        let (prelude, side_subst) = build_commons(scalars, factory, &left_commons);
+        subst.extend(side_subst);
+        insert_or_reuse_project_below(&mut node.children[0], prelude, scalars);
+    }
+    if !right_commons.is_empty() {
+        let (prelude, side_subst) = build_commons(scalars, factory, &right_commons);
+        subst.extend(side_subst);
+        insert_or_reuse_project_below(&mut node.children[1], prelude, scalars);
+    }
+    let new_condition = substitute(scalars, condition, &subst);
+    match &mut node.op {
+        Operator::PhysicalHashJoin(join) => join.other_condition = Some(new_condition),
+        Operator::PhysicalNestLoopJoin(join) => join.condition = Some(new_condition),
+        _ => unreachable!("checked join operator above"),
+    }
+}
+
 fn rewrite_sort(
     node: &mut PhysicalPlanNode,
     scalars: &mut ScalarArena,
@@ -833,10 +908,12 @@ mod tests {
 
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::OutputColumn;
-    use crate::sql::common::{BinOp, LiteralValue};
+    use crate::sql::common::{BinOp, JoinKind, LiteralValue};
     use crate::sql::optimizer::operator::{
-        AggMode, FilterOp, Operator, PhysicalHashAggregateOp, ProjectOp, ScalarAggregateSpec,
-        ScalarProjectItem, ScalarWindowSpec, SortOp, TopNOp, TopNPhase, ValuesOp, WindowOp,
+        AggMode, FilterOp, JoinDistribution, Operator, PhysicalHashAggregateOp,
+        PhysicalHashJoinEqCondition, PhysicalHashJoinOp, PhysicalNestLoopJoinOp, ProjectOp,
+        ScalarAggregateSpec, ScalarProjectItem, ScalarWindowSpec, SortOp, TopNOp, TopNPhase,
+        ValuesOp, WindowOp,
     };
     use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, PlanExecutionProps};
     use crate::sql::optimizer::scalar::{
@@ -2062,5 +2139,275 @@ mod tests {
             arena.node(spec.order_by[0].expr),
             ScalarNode::ColumnRef(column_id) if *column_id == cse_column
         ));
+    }
+
+    #[test]
+    fn rewrite_join_factors_left_only_condition_expr_to_left_child() {
+        let mut arena = ScalarArena::new();
+        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+        let left_a = col(&mut arena, 101);
+        let right_b = col(&mut arena, 201);
+        let two = int_lit(&mut arena, 2);
+        let ten = int_lit(&mut arena, 10);
+        let left_a_times_two = mul(&mut arena, left_a, two);
+        let lower = gt(&mut arena, left_a_times_two, right_b);
+        let upper_bound = add(&mut arena, right_b, ten);
+        let upper = lt(&mut arena, left_a_times_two, upper_bound);
+        let condition = and(&mut arena, lower, upper);
+        let left = values_node(vec![output_column(101, "left_a")]);
+        let right = values_node(vec![output_column(201, "right_b")]);
+        let mut node = PhysicalPlanNode {
+            op: Operator::PhysicalNestLoopJoin(PhysicalNestLoopJoinOp {
+                join_type: JoinKind::Inner,
+                condition: Some(condition),
+            }),
+            children: vec![left, right],
+            stats: Statistics::default(),
+            output_columns: vec![output_column(101, "left_a"), output_column(201, "right_b")],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+
+        super::rewrite_node(&mut node, &mut arena, &mut factory);
+
+        let Operator::PhysicalProject(left_project) = &node.children[0].op else {
+            panic!("expected CSE project on left child");
+        };
+        assert!(matches!(node.children[1].op, Operator::PhysicalValues(_)));
+        let cse_column = left_project
+            .items
+            .iter()
+            .find(|item| item.output_name == "__cse_0")
+            .expect("left CSE item")
+            .output_column_id;
+        let Operator::PhysicalNestLoopJoin(join) = &node.op else {
+            panic!("expected nested loop join");
+        };
+        let ScalarNode::BinaryOp { left, right, .. } =
+            arena.node(join.condition.expect("join condition"))
+        else {
+            panic!("expected conjunction");
+        };
+        assert!(matches!(
+            arena.node(*left),
+            ScalarNode::BinaryOp { left, .. }
+                if matches!(arena.node(*left), ScalarNode::ColumnRef(column_id) if *column_id == cse_column)
+        ));
+        assert!(matches!(
+            arena.node(*right),
+            ScalarNode::BinaryOp { left, .. }
+                if matches!(arena.node(*left), ScalarNode::ColumnRef(column_id) if *column_id == cse_column)
+        ));
+    }
+
+    #[test]
+    fn rewrite_join_factors_right_only_hash_join_condition_expr_to_right_child() {
+        let mut arena = ScalarArena::new();
+        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+        let left_a = col(&mut arena, 101);
+        let right_b = col(&mut arena, 201);
+        let right_key = col(&mut arena, 202);
+        let two = int_lit(&mut arena, 2);
+        let ten = int_lit(&mut arena, 10);
+        let right_b_times_two = mul(&mut arena, right_b, two);
+        let lower = gt(&mut arena, right_b_times_two, left_a);
+        let upper_bound = add(&mut arena, left_a, ten);
+        let upper = lt(&mut arena, right_b_times_two, upper_bound);
+        let condition = and(&mut arena, lower, upper);
+        let left = values_node(vec![output_column(101, "left_a")]);
+        let right = values_node(vec![
+            output_column(201, "right_b"),
+            output_column(202, "right_k"),
+        ]);
+        let mut node = PhysicalPlanNode {
+            op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                join_type: JoinKind::Inner,
+                eq_conditions: vec![PhysicalHashJoinEqCondition {
+                    left: left_a,
+                    right: right_key,
+                    null_safe: false,
+                }],
+                other_condition: Some(condition),
+                distribution: JoinDistribution::Broadcast,
+            }),
+            children: vec![left, right],
+            stats: Statistics::default(),
+            output_columns: vec![
+                output_column(101, "left_a"),
+                output_column(201, "right_b"),
+                output_column(202, "right_k"),
+            ],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+
+        super::rewrite_node(&mut node, &mut arena, &mut factory);
+
+        assert!(matches!(node.children[0].op, Operator::PhysicalValues(_)));
+        let Operator::PhysicalProject(right_project) = &node.children[1].op else {
+            panic!("expected CSE project on right child");
+        };
+        let cse_column = right_project
+            .items
+            .iter()
+            .find(|item| item.output_name == "__cse_0")
+            .expect("right CSE item")
+            .output_column_id;
+        let Operator::PhysicalHashJoin(join) = &node.op else {
+            panic!("expected hash join");
+        };
+        let ScalarNode::BinaryOp { left, right, .. } =
+            arena.node(join.other_condition.expect("join other condition"))
+        else {
+            panic!("expected conjunction");
+        };
+        assert!(matches!(
+            arena.node(*left),
+            ScalarNode::BinaryOp { left, .. }
+                if matches!(arena.node(*left), ScalarNode::ColumnRef(column_id) if *column_id == cse_column)
+        ));
+        assert!(matches!(
+            arena.node(*right),
+            ScalarNode::BinaryOp { left, .. }
+                if matches!(arena.node(*left), ScalarNode::ColumnRef(column_id) if *column_id == cse_column)
+        ));
+    }
+
+    #[test]
+    fn rewrite_join_does_not_factor_cross_input_condition_expr() {
+        let mut arena = ScalarArena::new();
+        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+        let left_a = col(&mut arena, 101);
+        let right_b = col(&mut arena, 201);
+        let ten = int_lit(&mut arena, 10);
+        let twenty = int_lit(&mut arena, 20);
+        let left_times_right = mul(&mut arena, left_a, right_b);
+        let lower = gt(&mut arena, left_times_right, ten);
+        let upper = lt(&mut arena, left_times_right, twenty);
+        let condition = and(&mut arena, lower, upper);
+        let left = values_node(vec![output_column(101, "left_a")]);
+        let right = values_node(vec![output_column(201, "right_b")]);
+        let mut node = PhysicalPlanNode {
+            op: Operator::PhysicalNestLoopJoin(PhysicalNestLoopJoinOp {
+                join_type: JoinKind::Inner,
+                condition: Some(condition),
+            }),
+            children: vec![left, right],
+            stats: Statistics::default(),
+            output_columns: vec![output_column(101, "left_a"), output_column(201, "right_b")],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+
+        super::rewrite_node(&mut node, &mut arena, &mut factory);
+
+        assert!(matches!(node.children[0].op, Operator::PhysicalValues(_)));
+        assert!(matches!(node.children[1].op, Operator::PhysicalValues(_)));
+        let Operator::PhysicalNestLoopJoin(join) = &node.op else {
+            panic!("expected nested loop join");
+        };
+        assert_eq!(join.condition, Some(condition));
+    }
+
+    #[test]
+    fn rewrite_join_does_not_factor_ambiguous_side_expr() {
+        let mut arena = ScalarArena::new();
+        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+        let shared = col(&mut arena, 101);
+        let one = int_lit(&mut arena, 1);
+        let ten = int_lit(&mut arena, 10);
+        let twenty = int_lit(&mut arena, 20);
+        let shared_plus_one = add(&mut arena, shared, one);
+        let lower = gt(&mut arena, shared_plus_one, ten);
+        let upper = lt(&mut arena, shared_plus_one, twenty);
+        let condition = and(&mut arena, lower, upper);
+        let left = values_node(vec![output_column(101, "shared_left")]);
+        let right = values_node(vec![output_column(101, "shared_right")]);
+        let mut node = PhysicalPlanNode {
+            op: Operator::PhysicalNestLoopJoin(PhysicalNestLoopJoinOp {
+                join_type: JoinKind::Inner,
+                condition: Some(condition),
+            }),
+            children: vec![left, right],
+            stats: Statistics::default(),
+            output_columns: vec![output_column(101, "shared")],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+
+        super::rewrite_node(&mut node, &mut arena, &mut factory);
+
+        assert!(matches!(node.children[0].op, Operator::PhysicalValues(_)));
+        assert!(matches!(node.children[1].op, Operator::PhysicalValues(_)));
+        let Operator::PhysicalNestLoopJoin(join) = &node.op else {
+            panic!("expected nested loop join");
+        };
+        assert_eq!(join.condition, Some(condition));
+    }
+
+    #[test]
+    fn rewrite_join_does_not_misclassify_lambda_capture_as_single_side() {
+        let mut arena = ScalarArena::new();
+        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+        let left_a = col(&mut arena, 101);
+        let right_b = col(&mut arena, 201);
+        let ten = int_lit(&mut arena, 10);
+        let twenty = int_lit(&mut arena, 20);
+        let lambda_param = arena.intern(
+            ScalarNode::LambdaParamRef {
+                name: "x".to_string(),
+                slot_id: 7,
+            },
+            DataType::Int64,
+            true,
+        );
+        let lambda_body = add(&mut arena, lambda_param, right_b);
+        let lambda = arena.intern(
+            ScalarNode::Lambda {
+                params: vec!["x".to_string()],
+                body: lambda_body,
+            },
+            DataType::Int64,
+            true,
+        );
+        let captures_right = arena.intern(
+            ScalarNode::FunctionCall {
+                name: "test_lambda_wrapper".to_string(),
+                args: vec![left_a, lambda],
+                distinct: false,
+            },
+            DataType::Int64,
+            true,
+        );
+        let lower = gt(&mut arena, captures_right, ten);
+        let upper = lt(&mut arena, captures_right, twenty);
+        let condition = and(&mut arena, lower, upper);
+        let left = values_node(vec![output_column(101, "left_a")]);
+        let right = values_node(vec![output_column(201, "right_b")]);
+        let mut node = PhysicalPlanNode {
+            op: Operator::PhysicalNestLoopJoin(PhysicalNestLoopJoinOp {
+                join_type: JoinKind::Inner,
+                condition: Some(condition),
+            }),
+            children: vec![left, right],
+            stats: Statistics::default(),
+            output_columns: vec![output_column(101, "left_a"), output_column(201, "right_b")],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+
+        super::rewrite_node(&mut node, &mut arena, &mut factory);
+
+        assert!(matches!(node.children[0].op, Operator::PhysicalValues(_)));
+        assert!(matches!(node.children[1].op, Operator::PhysicalValues(_)));
+        let Operator::PhysicalNestLoopJoin(join) = &node.op else {
+            panic!("expected nested loop join");
+        };
+        assert_eq!(join.condition, Some(condition));
     }
 }
