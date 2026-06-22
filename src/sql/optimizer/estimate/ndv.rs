@@ -34,27 +34,16 @@ fn real_expr_ndv(
     expr: ScalarId,
     column_stats: &HashMap<ColumnId, ColumnStatistic>,
 ) -> Option<(f64, Confidence)> {
-    // A column is only useful for cardinality if it carries a real NDV (> 1).
+    // A column is only useful for cardinality if it carries a real NDV.
     // ColumnStatistic::unknown() (propagated for no-stats / managed-lake tables)
-    // reports distinct_values_count = 1.0; treating that as a true NDV would make
+    // reports no NDV; treating an unknown NDV as true would make
     // join-key estimation divide left*right by ~1 and explode joins to near
-    // cross-products. Mirror the `> 1.0` guard estimate_eq_selectivity uses and
-    // fall back to the default NDV for unknown/degenerate columns.
+    // cross-products, so fall back to the default NDV for unknown columns.
     if let Some(column_id) = extract_column_id(arena, expr)
         && let Some(cs) = column_stats.get(&column_id)
-        && cs.distinct_values_count > 1.0
+        && let Some((ndv, confidence)) = cs.trusted_ndv()
     {
-        let confidence = if cs.confidence == Confidence::Fallback {
-            // Fallback column NDV here still came from table metadata
-            // (currently sqrt(non_null) * 10), which is materially different
-            // from having no key statistics and using DEFAULT_JOIN_KEY_NDV.
-            // Join cardinality treats true defaulted NDVs conservatively; keep
-            // heuristic column NDVs usable as estimated inputs.
-            Confidence::Estimated
-        } else {
-            cs.confidence
-        };
-        return Some((cs.distinct_values_count, confidence));
+        return Some((ndv, confidence));
     }
     None
 }
@@ -153,13 +142,13 @@ mod tests {
 
     #[test]
     fn get_expr_ndv_ignores_unknown_ndv() {
-        // OQ-3 propagates ColumnStatistic::unknown() (distinct_values_count = 1.0)
-        // for no-stats / managed-lake tables. get_expr_ndv must treat that as
-        // "no information" and return the generic expression default.
+        // OQ-3 propagates ColumnStatistic::unknown() for no-stats /
+        // managed-lake tables. get_expr_ndv must treat that as "no
+        // information" and return the generic expression default.
         let mut column_stats: HashMap<ColumnId, ColumnStatistic> = HashMap::new();
         column_stats.insert(test_col_id("unknown_col"), ColumnStatistic::unknown());
         assert_eq!(
-            column_stats[&test_col_id("unknown_col")].distinct_values_count,
+            column_stats[&test_col_id("unknown_col")].ndv_or_legacy_unknown_sentinel_for_test(),
             1.0
         );
         let unknown_expr = col_ref("unknown_col");
@@ -169,7 +158,7 @@ mod tests {
             DEFAULT_EXPR_NDV
         );
 
-        // A degenerate ndv of exactly 1.0 (not via unknown()) is also ignored.
+        // A real singleton NDV (not via unknown()) is used as real metadata.
         column_stats.insert(
             test_col_id("degenerate_col"),
             ColumnStatistic {
@@ -177,16 +166,12 @@ mod tests {
                 max_value: 100.0,
                 nulls_fraction: 0.0,
                 average_row_size: 8.0,
-                distinct_values_count: 1.0,
-                ..Default::default()
+                ..ColumnStatistic::for_test_with_ndv(1.0, Confidence::Exact)
             },
         );
         let degenerate_expr = col_ref("degenerate_col");
         let (arena, degenerate_id) = expr_id(&degenerate_expr);
-        assert_eq!(
-            get_expr_ndv(&arena, degenerate_id, &column_stats),
-            DEFAULT_EXPR_NDV
-        );
+        assert_eq!(get_expr_ndv(&arena, degenerate_id, &column_stats), 1.0);
 
         // A real NDV (> 1) is still used verbatim.
         column_stats.insert(
@@ -196,8 +181,7 @@ mod tests {
                 max_value: 100.0,
                 nulls_fraction: 0.0,
                 average_row_size: 8.0,
-                distinct_values_count: 50.0,
-                ..Default::default()
+                ..ColumnStatistic::for_test_with_ndv(50.0, Confidence::Exact)
             },
         );
         let real_expr = col_ref("real_col");
@@ -227,9 +211,7 @@ mod tests {
         column_stats.insert(
             test_col_id("real_col"),
             ColumnStatistic {
-                distinct_values_count: 50.0,
-                confidence: Confidence::Exact,
-                ..Default::default()
+                ..ColumnStatistic::for_test_with_ndv(50.0, Confidence::Exact)
             },
         );
         let real_expr = col_ref("real_col");
@@ -240,16 +222,14 @@ mod tests {
     }
 
     #[test]
-    fn join_key_ndv_treats_heuristic_column_stats_as_estimated() {
+    fn join_key_ndv_ignores_fallback_column_stats() {
         let mut column_stats: HashMap<ColumnId, ColumnStatistic> = HashMap::new();
         column_stats.insert(
             test_col_id("real_col"),
             ColumnStatistic {
                 min_value: 1.0,
                 max_value: 10_000.0,
-                distinct_values_count: 1_000.0,
-                confidence: Confidence::Fallback,
-                ..Default::default()
+                ..ColumnStatistic::for_test_with_ndv(1_000.0, Confidence::Fallback)
             },
         );
 
@@ -257,8 +237,8 @@ mod tests {
         let (arena, id) = expr_id(&expr);
         let (ndv, confidence) = get_join_key_ndv_with_confidence(&arena, id, &column_stats);
 
-        assert_eq!(ndv, 1_000.0);
-        assert_eq!(confidence, Confidence::Estimated);
+        assert_eq!(ndv, DEFAULT_JOIN_KEY_NDV);
+        assert_eq!(confidence, Confidence::Fallback);
     }
 
     #[test]

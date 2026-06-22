@@ -1585,8 +1585,13 @@ mod tests {
         })
         .expect("join aggregate IMV pipeline must rewrite and validate");
 
-        let pipeline = query_rewrite_pipeline(&HashMap::new());
+        let pipeline = query_rewrite_pipeline();
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        ctx.set_query_stats_input(
+            crate::sql::optimizer::stats_input::OptimizerStatsInput::from_legacy_table_stats_for_migration(
+                &HashMap::new(),
+            ),
+        );
         let opt_in = plan_to_opt_expr_with_arena(&outcome.plan, &mut ctx);
         let opt_out = pipeline
             .rewrite(opt_in, &mut ctx)

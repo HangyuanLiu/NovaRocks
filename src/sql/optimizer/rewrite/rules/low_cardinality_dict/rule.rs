@@ -191,8 +191,12 @@ mod tests {
         let input = logical_plan_to_opt_expr(&plan, &mut scalars);
         let arena = Rc::new(RefCell::new(scalars));
         ctx.set_scalar_arena(Rc::clone(&arena));
-        let table_stats = HashMap::new();
-        let pipeline = query_rewrite_pipeline(&table_stats);
+        ctx.set_query_stats_input(
+            crate::sql::optimizer::stats_input::OptimizerStatsInput::from_legacy_table_stats_for_migration(
+                &HashMap::new(),
+            ),
+        );
+        let pipeline = query_rewrite_pipeline();
         let rewritten = pipeline.rewrite(input, ctx).unwrap();
         opt_expr_to_logical_plan(rewritten, &arena.borrow())
     }

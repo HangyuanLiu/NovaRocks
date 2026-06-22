@@ -986,8 +986,8 @@ fn format_column_stats_costs(stats: &PlanNodeStats) -> String {
         .into_iter()
         .map(|column_id| {
             let c = &stats.column_statistics[&column_id];
-            let ndv = if c.distinct_values_count.is_finite() {
-                fmt_f64(c.distinct_values_count.round())
+            let ndv = if let Some(ndv) = c.ndv_value().filter(|ndv| ndv.is_finite()) {
+                fmt_f64(ndv.round())
             } else {
                 "?".to_string()
             };
@@ -1344,7 +1344,7 @@ mod tests {
     use crate::sql::optimizer::property::DistributionSpec;
     use crate::sql::optimizer::runtime_filter_pass::{self, test_support};
     use crate::sql::optimizer::scalar::ScalarArena;
-    use crate::sql::optimizer::statistics::{ColumnStatistic, Statistics};
+    use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence, Statistics};
     use crate::sql::planner::optimizer_bridge::scalar::{
         intern_aggregate_calls, intern_exprs, intern_project_items, intern_sort_items,
     };
@@ -1435,8 +1435,7 @@ mod tests {
                 max_value: 1000.0,
                 nulls_fraction: 0.0,
                 average_row_size: 8.0,
-                distinct_values_count: 1000.0,
-                ..Default::default()
+                ..ColumnStatistic::for_test_with_ndv(1000.0, Confidence::Exact)
             },
         );
         let dp = build_distributed_plan(&scan).expect("build DistributedPlan");
@@ -1469,8 +1468,7 @@ mod tests {
                 max_value: 1.0e300,
                 nulls_fraction: 0.0,
                 average_row_size: 8.0,
-                distinct_values_count: 1.0e300,
-                ..Default::default()
+                ..ColumnStatistic::for_test_with_ndv(1.0e300, Confidence::Exact)
             },
         );
         let dp = build_distributed_plan(&scan).expect("build DistributedPlan");
@@ -1636,6 +1634,7 @@ mod tests {
                 database: "test_db".to_string(),
                 table: table_def(),
                 alias: Some("t".to_string()),
+                stats_ref: None,
                 columns: vec![k.clone(), v.clone()],
                 predicates: vec![],
                 required_columns: Some(vec!["k".to_string(), "v".to_string()]),
@@ -1667,6 +1666,7 @@ mod tests {
                     },
                 },
                 alias: Some("base".to_string()),
+                stats_ref: None,
                 columns: vec![id.clone(), v.clone()],
                 predicates: vec![],
                 required_columns: Some(vec!["id".to_string(), "v".to_string()]),

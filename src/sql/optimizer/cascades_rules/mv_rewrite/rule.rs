@@ -160,6 +160,7 @@ fn try_rewrite(
             database: cand.target_database.clone(),
             table: cand.target_table.clone(),
             alias: None,
+            stats_ref: Some(cand.target_stats_ref),
             columns: scan_columns,
             predicates: vec![],
             required_columns: None,
@@ -674,7 +675,12 @@ mod tests {
             mv_scalars,
             target_database: "ns".to_string(),
             target_table: iceberg_table("cat", "ns", "agg_mv", &["a", "b", "s"]),
+            target_stats_ref: stats_ref_for_test(700),
         }
+    }
+
+    fn stats_ref_for_test(value: u32) -> crate::sql::optimizer::stats_input::StatsRef {
+        crate::sql::optimizer::stats_input::StatsRef::new(value)
     }
 
     /// Walk a child-group chain from `gid`, following first logical expr, and
@@ -751,6 +757,7 @@ mod tests {
         assert!(has_filter(&memo, child), "compensation filter expected");
         let scan = find_scan(&memo, child);
         assert_eq!(scan.table.name, "agg_mv");
+        assert_eq!(scan.stats_ref, Some(stats_ref_for_test(700)));
         assert_eq!(scan.mv_rewritten_from.as_deref(), Some("agg_mv"));
 
         // Idempotency: a second apply on the same expr injects nothing.
@@ -815,6 +822,7 @@ mod tests {
             mv_scalars,
             target_database: "ns".to_string(),
             target_table: iceberg_table("cat", "ns", "spj_mv", &["a", "b", "v"]),
+            target_stats_ref: stats_ref_for_test(701),
         };
 
         // SPJ query: SELECT a, b FROM t WHERE a >= 10. (top = Filter(Scan))
@@ -850,6 +858,7 @@ mod tests {
         assert!(has_filter(&memo, child));
         let scan = find_scan(&memo, child);
         assert_eq!(scan.table.name, "spj_mv");
+        assert_eq!(scan.stats_ref, Some(stats_ref_for_test(701)));
         assert_eq!(scan.mv_rewritten_from.as_deref(), Some("spj_mv"));
     }
 
@@ -884,6 +893,7 @@ mod tests {
             mv_scalars,
             target_database: "ns".to_string(),
             target_table: iceberg_table("cat", "ns", "cnt_mv", &["a", "c"]),
+            target_stats_ref: stats_ref_for_test(702),
         };
 
         let a = col(1, "a");

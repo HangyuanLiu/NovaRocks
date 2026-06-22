@@ -1013,6 +1013,7 @@ mod tests {
             database: "d".to_string(),
             table,
             alias: None,
+            stats_ref: None,
             columns: vec![
                 make_output_column(ColumnId::new_for_test(id_a), "a"),
                 make_output_column(ColumnId::new_for_test(id_b), "b"),
@@ -2142,6 +2143,7 @@ mod tests {
                     },
                 },
                 alias: None,
+                stats_ref: None,
                 columns: vec![make_output_column(ColumnId::new_for_test(1), "a")],
                 predicates: vec![],
                 required_columns: None,
@@ -2151,9 +2153,13 @@ mod tests {
             }))],
         );
 
-        let table_stats = HashMap::new();
-        let pipeline = query_rewrite_pipeline(&table_stats);
+        let pipeline = query_rewrite_pipeline();
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        ctx.set_query_stats_input(
+            crate::sql::optimizer::stats_input::OptimizerStatsInput::from_legacy_table_stats_for_migration(
+                &HashMap::new(),
+            ),
+        );
         ctx.set_scalar_arena(arena_rc.clone());
         let result = pipeline.rewrite(plan, &mut ctx).unwrap();
 

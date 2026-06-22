@@ -36,6 +36,7 @@ pub(crate) mod scan_planner;
 pub mod schema;
 pub mod sink;
 mod state;
+pub(crate) mod stats;
 pub(crate) mod stats_assembler;
 pub(crate) mod stats_loader;
 pub(crate) mod theta_sketch;

@@ -330,6 +330,7 @@ mod tests {
                 },
             },
             alias: None,
+            stats_ref: None,
             columns: vec![OutputColumn {
                 column_id: ColumnId::new_for_test(1),
                 name: "id".to_string(),
@@ -424,7 +425,11 @@ mod tests {
         let mut memo = crate::sql::optimizer::Memo::new();
         memo.scalars = arena.clone();
         let root_group = crate::sql::optimizer::memo_copy::opt_expr_to_memo(plan, &mut memo);
-        crate::sql::optimizer::stats::derive_group_statistics(&mut memo, &HashMap::new());
+        let stats_input =
+            crate::sql::optimizer::stats_input::OptimizerStatsInput::from_legacy_table_stats_for_migration(
+                &HashMap::new(),
+            );
+        crate::sql::optimizer::stats::derive_group_statistics(&mut memo, &stats_input);
         Ok(memo.groups[root_group]
             .logical_props
             .as_ref()

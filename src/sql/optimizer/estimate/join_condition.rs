@@ -175,7 +175,7 @@ fn is_unknown_column_literal_eq(
     }
     column_stats
         .get(&column_id)
-        .map_or(true, |cs| cs.distinct_values_count <= 1.0)
+        .is_none_or(|cs| cs.trusted_ndv().is_none())
 }
 
 fn is_literal_like(arena: &ScalarArena, expr: ScalarId) -> bool {

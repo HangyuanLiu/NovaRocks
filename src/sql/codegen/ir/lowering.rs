@@ -5541,6 +5541,7 @@ mod tests {
                 database: "test_db".to_string(),
                 table: metadata_table_def(),
                 alias: Some("t".to_string()),
+                stats_ref: None,
                 columns: vec![k.clone()],
                 predicates: vec![],
                 required_columns: None,

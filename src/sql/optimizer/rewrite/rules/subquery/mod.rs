@@ -72,6 +72,7 @@ mod tests {
     use crate::sql::optimizer::rewrite::context::RewriteContext;
     use crate::sql::optimizer::rewrite::registry::query_rewrite_pipeline;
     use crate::sql::optimizer::scalar::ScalarArena;
+    use crate::sql::optimizer::stats_input::OptimizerStatsInput;
     use crate::sql::planner::optimizer_bridge::plan::logical_plan_to_opt_expr;
     use crate::sql::planner::plan::{
         ApplyKind, LogicalApplyNode, LogicalLimitNode, LogicalValuesNode, PlanNodeKind,
@@ -79,6 +80,9 @@ mod tests {
 
     fn ctx_with_arena() -> RewriteContext {
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        ctx.set_query_stats_input(OptimizerStatsInput::from_legacy_table_stats_for_migration(
+            &HashMap::new(),
+        ));
         ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
         ctx
     }
@@ -234,7 +238,7 @@ mod tests {
         // is never reached; the pipeline succeeds.
         let mut ctx = ctx_with_arena();
         let expr = to_opt_expr(&apply_over_values(), &mut ctx);
-        let result = query_rewrite_pipeline(&HashMap::new())
+        let result = query_rewrite_pipeline()
             .rewrite(expr, &mut ctx)
             .expect("pipeline must succeed: ScalarApplyToJoin eliminates the Apply");
         // The Apply must be gone — rewritten to a Project wrapping a CrossJoin.
@@ -250,7 +254,7 @@ mod tests {
         // by ExistentialApplyToJoin into a LeftSemi join before ApplyException.
         let mut ctx = ctx_with_arena();
         let expr = to_opt_expr(&exists_apply_over_values(), &mut ctx);
-        let result = query_rewrite_pipeline(&HashMap::new())
+        let result = query_rewrite_pipeline()
             .rewrite(expr, &mut ctx)
             .expect("pipeline must succeed: ExistentialApplyToJoin eliminates the Apply");
         assert!(
@@ -265,7 +269,7 @@ mod tests {
         // QuantifiedApplyToJoin before ApplyException runs.
         let mut ctx = ctx_with_arena();
         let expr = to_opt_expr(&in_apply_over_values(), &mut ctx);
-        let result = query_rewrite_pipeline(&HashMap::new())
+        let result = query_rewrite_pipeline()
             .rewrite(expr, &mut ctx)
             .expect("pipeline must succeed: QuantifiedApplyToJoin eliminates the Apply");
         assert!(
@@ -284,9 +288,12 @@ mod tests {
             "PushDownApplyAggFilter".to_string(),
             "PushDownApplyFilter".to_string(),
         ]);
+        ctx.set_query_stats_input(OptimizerStatsInput::from_legacy_table_stats_for_migration(
+            &HashMap::new(),
+        ));
         ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
         let expr = to_opt_expr(&apply_over_values(), &mut ctx);
-        let rewritten = query_rewrite_pipeline(&HashMap::new())
+        let rewritten = query_rewrite_pipeline()
             .rewrite(expr, &mut ctx)
             .expect("pipeline passes with scalar Apply-elimination rules disabled");
         let message = find_residual_apply(&rewritten).expect("backstop must detect the apply");

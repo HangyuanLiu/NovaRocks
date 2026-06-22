@@ -1,27 +1,14 @@
 //! AggregatePushdownRule entry point.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
 use crate::sql::optimizer::operator::Operator;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::rewrite::context::RewriteContext;
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::result::RewriteResult;
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule as RewriteRule;
-use crate::sql::optimizer::statistics::TableStatistics;
 
 #[allow(dead_code)]
-pub(crate) struct AggregatePushdownRule {
-    table_stats: Arc<HashMap<String, TableStatistics>>,
-}
-
-impl AggregatePushdownRule {
-    #[allow(dead_code)]
-    pub(crate) fn new(table_stats: Arc<HashMap<String, TableStatistics>>) -> Self {
-        Self { table_stats }
-    }
-}
+pub(crate) struct AggregatePushdownRule;
 
 impl RewriteRule for AggregatePushdownRule {
     fn name(&self) -> &'static str {
@@ -44,18 +31,17 @@ impl RewriteRule for AggregatePushdownRule {
         };
 
         let arena_rc = ctx.scalar_arena();
+        let stats_input = ctx
+            .query_stats_input()
+            .cloned()
+            .ok_or_else(|| "AggregatePushdown requires OptimizerStatsInput".to_string())?;
 
         // Phase 1: read-only borrow for collection and cost gating.
         let push = {
             let arena = arena_rc.borrow();
-            let push = super::collector::collect_push_plan(
-                &agg,
-                expr.unary_input(),
-                &self.table_stats,
-                &arena,
-            );
+            let push = super::collector::collect_push_plan(&agg, expr.unary_input(), &arena);
             if let Some(ref p) = push {
-                if !super::cost::should_push(p, &arena, &self.table_stats) {
+                if !super::cost::should_push(p, &arena, &stats_input) {
                     return Ok(RewriteResult::Unchanged);
                 }
             }
@@ -92,7 +78,15 @@ mod tests {
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
     use crate::sql::optimizer::rewrite::result::RewriteResult;
+    use crate::sql::optimizer::stats_input::OptimizerStatsInput;
     use arrow::datatypes::DataType;
+    use std::collections::HashMap;
+
+    fn set_empty_stats_input(ctx: &mut RewriteContext) {
+        ctx.set_query_stats_input(OptimizerStatsInput::from_legacy_table_stats_for_migration(
+            &HashMap::new(),
+        ));
+    }
 
     fn dummy_scan(name: &str, cols: &[&str]) -> OptExpr {
         OptExpr::leaf(Operator::LogicalScan(ScanOp {
@@ -107,6 +101,7 @@ mod tests {
                 },
             },
             alias: None,
+            stats_ref: None,
             columns: cols
                 .iter()
                 .map(|n| OutputColumn {
@@ -145,9 +140,10 @@ mod tests {
         use crate::sql::optimizer::scalar::ScalarArena;
         use std::cell::RefCell;
         use std::rc::Rc;
-        let rule = AggregatePushdownRule::new(Arc::new(HashMap::new()));
+        let rule = AggregatePushdownRule;
         let plan = dummy_aggregate();
         let mut ctx = RewriteContext::new(RewriteConsumer::Query);
+        set_empty_stats_input(&mut ctx);
         ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
         assert!(rule.matches(&plan, &ctx));
         assert!(matches!(
@@ -228,8 +224,9 @@ mod tests {
             vec![join],
         );
 
-        let rule = AggregatePushdownRule::new(Arc::new(HashMap::new()));
+        let rule = AggregatePushdownRule;
         let mut ctx = RewriteContext::new(RewriteConsumer::Query);
+        set_empty_stats_input(&mut ctx);
         ctx.set_scalar_arena(Rc::new(RefCell::new(arena)));
 
         assert!(

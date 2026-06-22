@@ -777,8 +777,7 @@ mod tests {
                 max_value: ndv,
                 nulls_fraction: 0.0,
                 average_row_size: 8.0,
-                distinct_values_count: ndv,
-                confidence: Confidence::Estimated,
+                ..ColumnStatistic::for_test_with_ndv(ndv, Confidence::Estimated)
             },
         );
         Statistics {

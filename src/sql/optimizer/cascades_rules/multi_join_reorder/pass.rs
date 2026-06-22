@@ -7,13 +7,14 @@
 //! `Memo.copyIn` (a single imperative pass, not a fixpoint rule). Invoked from
 //! `optimize()` after `derive_group_statistics`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use crate::sql::common::JoinKind;
 use crate::sql::optimizer::memo::{GroupId, JoinTree, MExpr, Memo};
 use crate::sql::optimizer::operator::{LogicalJoinOp, Operator};
-use crate::sql::optimizer::statistics::{Confidence, TableStatistics};
+use crate::sql::optimizer::statistics::Confidence;
 use crate::sql::optimizer::stats::copy_in_join_tree;
+use crate::sql::optimizer::stats_input::OptimizerStatsInput;
 
 use super::{ReorderCaps, enumerate_orders, flatten_join_chain};
 
@@ -63,12 +64,12 @@ impl ReorderOptions {
 pub(crate) fn run_multi_join_reorder(
     memo: &mut Memo,
     opts: &ReorderOptions,
-    table_stats: &HashMap<String, TableStatistics>,
+    stats_input: &OptimizerStatsInput,
 ) {
     // Snapshot the chain roots before injecting, so the new alternative groups
     // (appended at higher indices) are not themselves reprocessed.
     for root in find_chain_roots(memo) {
-        reorder_chain(memo, root, opts, table_stats);
+        reorder_chain(memo, root, opts, stats_input);
     }
 }
 
@@ -76,7 +77,7 @@ fn reorder_chain(
     memo: &mut Memo,
     root: GroupId,
     opts: &ReorderOptions,
-    table_stats: &HashMap<String, TableStatistics>,
+    stats_input: &OptimizerStatsInput,
 ) {
     let Some(graph) = flatten_join_chain(memo, root) else {
         return;
@@ -103,7 +104,7 @@ fn reorder_chain(
         caps.enable_greedy = false;
     }
     for tree in enumerate_orders(&graph, caps, &mut memo.scalars) {
-        inject_candidate(memo, root, tree, table_stats);
+        inject_candidate(memo, root, tree, stats_input);
     }
 }
 
@@ -113,13 +114,13 @@ fn inject_candidate(
     memo: &mut Memo,
     root: GroupId,
     tree: JoinTree,
-    table_stats: &HashMap<String, TableStatistics>,
+    stats_input: &OptimizerStatsInput,
 ) {
     let JoinTree::Join { left, right, op } = tree else {
         return; // a reorder candidate over >= 2 atoms is always a join
     };
-    let left_id = copy_in_join_tree(memo, &left, table_stats);
-    let right_id = copy_in_join_tree(memo, &right, table_stats);
+    let left_id = copy_in_join_tree(memo, &left, stats_input);
+    let right_id = copy_in_join_tree(memo, &right, stats_input);
     let new_op = Operator::LogicalJoin(op);
     let children = vec![left_id, right_id];
     let already_present = memo.groups[root]
@@ -191,7 +192,13 @@ mod tests {
     use crate::sql::optimizer::memo::LogicalProperties;
     use crate::sql::optimizer::operator::ValuesOp;
     use crate::sql::optimizer::statistics::ColumnStatistic;
+    use crate::sql::optimizer::stats_input::OptimizerStatsInput;
     use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
+    use std::collections::HashMap;
+
+    fn empty_stats_input() -> OptimizerStatsInput {
+        OptimizerStatsInput::from_legacy_table_stats_for_migration(&HashMap::new())
+    }
 
     fn col(id: u32) -> TypedExpr {
         TypedExpr {
@@ -244,8 +251,7 @@ mod tests {
                 max_value: rows,
                 nulls_fraction: 0.0,
                 average_row_size: 8.0,
-                distinct_values_count: rows,
-                confidence: conf,
+                ..ColumnStatistic::for_test_with_ndv(rows, conf)
             },
         );
         memo.groups[g].logical_props = Some(props);
@@ -273,7 +279,7 @@ mod tests {
                 op: inner(memo, eq(col(i as u32), col(i as u32 + 1))),
             };
         }
-        copy_in_join_tree(memo, &tree, &HashMap::new())
+        copy_in_join_tree(memo, &tree, &empty_stats_input())
     }
 
     #[test]
@@ -283,7 +289,7 @@ mod tests {
         let before = memo.groups[root].logical_exprs.len();
         assert_eq!(before, 1, "root starts with the single converted order");
 
-        run_multi_join_reorder(&mut memo, &ReorderOptions::default(), &HashMap::new());
+        run_multi_join_reorder(&mut memo, &ReorderOptions::default(), &empty_stats_input());
 
         let after = memo.groups[root].logical_exprs.len();
         assert!(
@@ -306,7 +312,7 @@ mod tests {
         // join groups are recorded so explore's JoinAssociativity skips them (D2).
         let mut memo = Memo::new();
         let root = build_path_chain(&mut memo, 6, Confidence::Estimated);
-        run_multi_join_reorder(&mut memo, &ReorderOptions::default(), &HashMap::new());
+        run_multi_join_reorder(&mut memo, &ReorderOptions::default(), &empty_stats_input());
         assert!(
             memo.reorder_owned_groups.contains(&root),
             "the chain root must be marked reorder-owned"
@@ -324,7 +330,7 @@ mod tests {
         // must NOT be marked reorder-owned.
         let mut memo = Memo::new();
         build_path_chain(&mut memo, 3, Confidence::Estimated);
-        run_multi_join_reorder(&mut memo, &ReorderOptions::default(), &HashMap::new());
+        run_multi_join_reorder(&mut memo, &ReorderOptions::default(), &empty_stats_input());
         assert!(
             memo.reorder_owned_groups.is_empty(),
             "small chain must not be reorder-owned, got {:?}",
@@ -340,7 +346,7 @@ mod tests {
         let before = memo.groups[root].logical_exprs.len();
         let groups_before = memo.groups.len();
 
-        run_multi_join_reorder(&mut memo, &ReorderOptions::default(), &HashMap::new());
+        run_multi_join_reorder(&mut memo, &ReorderOptions::default(), &empty_stats_input());
 
         assert_eq!(
             memo.groups[root].logical_exprs.len(),
@@ -362,7 +368,7 @@ mod tests {
         let root = build_path_chain(&mut memo, 6, Confidence::Fallback);
         let before = memo.groups[root].logical_exprs.len();
 
-        run_multi_join_reorder(&mut memo, &ReorderOptions::default(), &HashMap::new());
+        run_multi_join_reorder(&mut memo, &ReorderOptions::default(), &empty_stats_input());
 
         let added = memo.groups[root].logical_exprs.len() - before;
         assert!(

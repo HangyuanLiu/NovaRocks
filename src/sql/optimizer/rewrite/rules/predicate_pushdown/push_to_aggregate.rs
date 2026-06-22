@@ -255,6 +255,7 @@ mod tests {
             database: "db".into(),
             table,
             alias: None,
+            stats_ref: None,
             columns: vec![output_col("a"), output_col("b")],
             predicates: vec![],
             required_columns: None,

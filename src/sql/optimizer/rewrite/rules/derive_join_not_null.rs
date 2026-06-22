@@ -277,6 +277,7 @@ mod tests {
                 },
             },
             alias: Some(alias.to_string()),
+            stats_ref: None,
             columns: cols
                 .iter()
                 .map(|(name, id, nullable)| OutputColumn {
@@ -556,6 +557,7 @@ mod tests {
                 },
             },
             alias: Some("l".to_string()),
+            stats_ref: None,
             columns: vec![OutputColumn {
                 column_id: ColumnId::new_for_test(1),
                 name: "a".to_string(),
@@ -587,6 +589,7 @@ mod tests {
                 },
             },
             alias: Some("r".to_string()),
+            stats_ref: None,
             columns: vec![OutputColumn {
                 column_id: ColumnId::new_for_test(2),
                 name: "b".to_string(),

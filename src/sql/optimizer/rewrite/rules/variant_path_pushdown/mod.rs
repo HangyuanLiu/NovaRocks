@@ -614,6 +614,7 @@ mod tests {
             database: "db".to_string(),
             table: table_def(iceberg_source(), DataType::LargeBinary),
             alias: None,
+            stats_ref: None,
             columns: vec![source_column],
             predicates: vec![],
             required_columns: None,

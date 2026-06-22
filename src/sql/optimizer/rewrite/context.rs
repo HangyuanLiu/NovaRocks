@@ -1,6 +1,6 @@
 use std::any::Any;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
@@ -10,7 +10,7 @@ use crate::sql::column_id::ColumnRefFactory;
 use crate::sql::common::DictionarySnapshot;
 use crate::sql::optimizer::rewrite::trace::RewriteTrace;
 use crate::sql::optimizer::scalar::ScalarArena;
-use crate::sql::optimizer::statistics::TableStatistics;
+use crate::sql::optimizer::stats_input::OptimizerStatsInput;
 
 /// Loads dictionary snapshots for scan-time low-cardinality string columns.
 /// Implemented by the engine layer (production) and by tests (fakes).
@@ -104,7 +104,7 @@ pub(crate) struct RewriteContext {
     policy: RewritePolicy,
     trace: RewriteTrace,
     extension: Option<Arc<dyn Any + Send + Sync>>,
-    query_table_stats: Option<Arc<HashMap<String, TableStatistics>>>,
+    query_stats_input: Option<Arc<OptimizerStatsInput>>,
     deadline: Option<Instant>,
     dictionary_provider: Option<Arc<dyn QueryDictionaryProvider>>,
     column_ref_factory: Option<Rc<RefCell<ColumnRefFactory>>>,
@@ -136,7 +136,7 @@ impl RewriteContext {
             policy: RewritePolicy::default(),
             trace: RewriteTrace::default(),
             extension: None,
-            query_table_stats: None,
+            query_stats_input: None,
             deadline: None,
             dictionary_provider: None,
             column_ref_factory: None,
@@ -196,12 +196,12 @@ impl RewriteContext {
         self.extension.as_ref()?.downcast_ref::<T>()
     }
 
-    pub(crate) fn set_query_table_stats(&mut self, table_stats: HashMap<String, TableStatistics>) {
-        self.query_table_stats = Some(Arc::new(table_stats));
+    pub(crate) fn set_query_stats_input(&mut self, stats_input: OptimizerStatsInput) {
+        self.query_stats_input = Some(Arc::new(stats_input));
     }
 
-    pub(crate) fn query_table_stats(&self) -> Option<&HashMap<String, TableStatistics>> {
-        self.query_table_stats.as_deref()
+    pub(crate) fn query_stats_input(&self) -> Option<&OptimizerStatsInput> {
+        self.query_stats_input.as_deref()
     }
 
     pub(crate) fn set_deadline(&mut self, deadline: Instant) {
@@ -408,7 +408,10 @@ mod tests {
     }
 
     #[test]
-    fn query_context_exposes_table_statistics() {
+    fn query_context_exposes_stats_input() {
+        use crate::sql::optimizer::statistics::TableStatistics;
+        use std::collections::HashMap;
+
         let mut stats = HashMap::new();
         stats.insert(
             "db.tbl".to_string(),
@@ -419,9 +422,17 @@ mod tests {
         );
 
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
-        ctx.set_query_table_stats(stats);
+        ctx.set_query_stats_input(OptimizerStatsInput::from_legacy_table_stats_for_migration(
+            &stats,
+        ));
 
-        assert!(ctx.query_table_stats().unwrap().contains_key("db.tbl"));
+        assert!(
+            ctx.query_stats_input()
+                .unwrap()
+                .legacy_table_stats_for_migration()
+                .unwrap()
+                .contains_key("db.tbl")
+        );
     }
 
     #[test]

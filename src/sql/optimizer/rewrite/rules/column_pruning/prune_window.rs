@@ -110,6 +110,7 @@ mod tests {
             database: "db".to_string(),
             table,
             alias: None,
+            stats_ref: None,
             columns: vec![OutputColumn {
                 column_id: ColumnId::new_for_test(99),
                 name: "x".to_string(),

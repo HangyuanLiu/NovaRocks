@@ -839,7 +839,7 @@ mod tests {
     use crate::sql::optimizer::operator::*;
     use crate::sql::optimizer::property::{DistributionSpec, OrderingSpec};
     use crate::sql::optimizer::scalar::ScalarArena;
-    use crate::sql::optimizer::statistics::{ColumnStatistic, CostEstimate};
+    use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence, CostEstimate};
     use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
     use crate::sql::planner::plan::*;
     use std::collections::HashMap;
@@ -853,8 +853,7 @@ mod tests {
                 max_value: 100.0,
                 nulls_fraction: 0.0,
                 average_row_size: avg_size,
-                distinct_values_count: rows,
-                ..Default::default()
+                ..ColumnStatistic::for_test_with_ndv(rows, Confidence::Exact)
             },
         );
         Statistics {
@@ -874,8 +873,7 @@ mod tests {
                     max_value: 100.0,
                     nulls_fraction: 0.0,
                     average_row_size: *width,
-                    distinct_values_count: rows,
-                    ..Default::default()
+                    ..ColumnStatistic::for_test_with_ndv(rows, Confidence::Exact)
                 },
             );
         }
@@ -909,6 +907,7 @@ mod tests {
                 },
             },
             alias: None,
+            stats_ref: None,
             columns: vec![output_column(1, "narrow"), output_column(2, "wide")],
             predicates: vec![],
             required_columns: required_columns
@@ -932,6 +931,7 @@ mod tests {
                 },
             },
             alias: None,
+            stats_ref: None,
             columns: vec![],
             predicates: vec![],
             required_columns: None,
@@ -1811,6 +1811,7 @@ mod tests {
                 },
             },
             alias: None,
+            stats_ref: None,
             columns: vec![],
             predicates: vec![],
             required_columns: None,
@@ -2159,6 +2160,7 @@ mod tests {
                 },
             },
             alias: None,
+            stats_ref: None,
             columns: vec![],
             predicates: vec![],
             required_columns: None,

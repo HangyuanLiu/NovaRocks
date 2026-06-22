@@ -423,6 +423,7 @@ mod tests {
                     },
                 },
                 alias: None,
+                stats_ref: None,
                 columns: vec![output(id, name)],
                 predicates: Vec::new(),
                 required_columns: None,

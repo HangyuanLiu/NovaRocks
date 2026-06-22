@@ -190,6 +190,14 @@ impl TableSource for IcebergTableSource {
         "iceberg"
     }
 
+    fn stats_provider(&self) -> Option<Arc<dyn crate::connector::stats::TableStatsProvider>> {
+        Some(Arc::new(
+            crate::connector::iceberg::stats::IcebergTableStatsProvider::new(Arc::clone(
+                &self.registry,
+            )),
+        ))
+    }
+
     fn build_schema_table_def(&self, table: &ResolvedTable) -> Result<TableDef, String> {
         let guard = self.registry.read().expect("iceberg catalog read lock");
         let entry = guard.get(&table.catalog)?;

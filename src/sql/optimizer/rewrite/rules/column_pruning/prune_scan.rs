@@ -264,6 +264,7 @@ mod tests {
             database: "db".to_string(),
             table,
             alias: None,
+            stats_ref: None,
             columns: cols
                 .iter()
                 .map(|(name, id)| OutputColumn {

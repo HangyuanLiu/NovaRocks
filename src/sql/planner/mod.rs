@@ -4641,7 +4641,7 @@ mod tests {
             &mut scalar_arena,
         )
         .expect("logical to opt expr");
-        let physical = crate::sql::optimizer::optimize(
+        let physical = crate::sql::optimizer::optimize_with_legacy_table_stats_for_migration(
             opt_expr,
             scalar_arena,
             &std::collections::HashMap::new(),

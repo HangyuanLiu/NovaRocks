@@ -2440,7 +2440,7 @@ mod tests {
             &logical,
             &mut scalar_arena,
         )?;
-        let physical = optimizer::optimize(
+        let physical = optimizer::optimize_with_legacy_table_stats_for_migration(
             opt_expr,
             scalar_arena,
             &HashMap::new(),
@@ -2469,7 +2469,7 @@ mod tests {
             &logical,
             &mut scalar_arena,
         )?;
-        let physical = optimizer::optimize(
+        let physical = optimizer::optimize_with_legacy_table_stats_for_migration(
             opt_expr,
             scalar_arena,
             &HashMap::new(),
@@ -2902,6 +2902,7 @@ mod tests {
                 database: "default".to_string(),
                 table,
                 alias: None,
+                stats_ref: None,
                 columns: output_columns(),
                 predicates: vec![],
                 required_columns: Some(vec!["id".to_string()]),
@@ -3038,6 +3039,7 @@ mod tests {
                     },
                 },
                 alias: None,
+                stats_ref: None,
                 columns: output_columns(),
                 predicates: vec![],
                 required_columns: None,
@@ -3074,6 +3076,7 @@ mod tests {
                     },
                 },
                 alias: None,
+                stats_ref: None,
                 columns: output_columns(),
                 predicates: vec![],
                 required_columns: None,
@@ -3112,6 +3115,7 @@ mod tests {
                     },
                 },
                 alias: None,
+                stats_ref: None,
                 columns: output_columns(),
                 predicates: vec![],
                 required_columns: None,
@@ -3154,6 +3158,7 @@ mod tests {
                     },
                 },
                 alias: None,
+                stats_ref: None,
                 columns: output_columns(),
                 predicates: vec![intern_typed(&mut scalars, &id_eq_literal(12))],
                 required_columns: None,
@@ -3198,6 +3203,7 @@ mod tests {
                     },
                 },
                 alias: None,
+                stats_ref: None,
                 columns: output_columns(),
                 predicates: vec![intern_typed(&mut scalars, &id_eq_literal(12))],
                 required_columns: None,
@@ -3240,6 +3246,7 @@ mod tests {
                     },
                 },
                 alias: None,
+                stats_ref: None,
                 columns: output_columns(),
                 predicates: vec![],
                 required_columns: None,
@@ -3282,6 +3289,7 @@ mod tests {
                     },
                 },
                 alias: None,
+                stats_ref: None,
                 columns: output_columns(),
                 predicates: vec![],
                 required_columns: None,
@@ -5170,6 +5178,7 @@ mod tests {
                     },
                 },
                 alias: None,
+                stats_ref: None,
                 columns: vec![OutputColumn {
                     column_id: id_col,
                     name: "id".to_string(),
@@ -5333,6 +5342,7 @@ mod tests {
                     },
                 },
                 alias: None,
+                stats_ref: None,
                 columns: vec![
                     output_col_for_test(8101, "id", DataType::Utf8, false),
                     output_col_for_test(8102, "name", DataType::Utf8, false),
@@ -5545,6 +5555,7 @@ mod tests {
                     },
                 },
                 alias: None,
+                stats_ref: None,
                 columns: vec![output_col_for_test(
                     8301,
                     "__nr_dict_t_s",
@@ -5693,6 +5704,7 @@ mod tests {
                     },
                 },
                 alias: None,
+                stats_ref: None,
                 columns: vec![output_col_for_test(8401, "id", DataType::Utf8, false)],
                 predicates: vec![],
                 required_columns: None,
@@ -5985,6 +5997,7 @@ mod tests {
                     },
                 },
                 alias: None,
+                stats_ref: None,
                 columns: vec![source_column.clone(), synthetic_column.clone()],
                 predicates: vec![],
                 required_columns: Some(vec![synthetic_column.name.clone()]),

@@ -1,11 +1,9 @@
 -- @tags=optimizer,g4,hash_source
 -- Test Objective:
--- 1. A PARTITIONED join output keyed as ShuffleJoin([l.k, r.k]) must not satisfy
---    a narrower ShuffleAgg([l.k]) requirement from the analytic partition.
--- 2. The window/sort above the join must show its own HASH EXCHANGE
---    with source ShuffleAgg, while join-side exchanges show source ShuffleJoin.
--- 3. lineitem/orders names intentionally use large default row-count estimates
---    so Broadcast is pruned by the broadcast row-count limit.
+-- 1. A window partition above the left join must still introduce its own
+--    HASH EXCHANGE for the partition key.
+-- 2. ANALYZE TABLE supplies the scan row counts used by the optimizer; table
+--    names must not carry any row-count heuristic.
 DROP TABLE IF EXISTS ${case_db}.lineitem;
 DROP TABLE IF EXISTS ${case_db}.orders;
 CREATE TABLE ${case_db}.lineitem (k INT, v INT);

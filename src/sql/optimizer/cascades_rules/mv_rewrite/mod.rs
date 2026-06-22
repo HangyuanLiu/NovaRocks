@@ -11,6 +11,7 @@ pub(crate) mod rule;
 
 use crate::sql::catalog::TableDef;
 use crate::sql::optimizer::scalar::ScalarArena;
+use crate::sql::optimizer::stats_input::StatsRef;
 use descriptor::SpjgDescriptor;
 
 pub(crate) const RULE_NAME: &str = "MvRewrite";
@@ -32,4 +33,6 @@ pub(crate) struct MvRewriteCandidate {
     /// Executable TableDef of the MV target table
     /// (ScanSource::IcebergDataFiles, binding = CurrentSnapshot).
     pub target_table: TableDef,
+    /// Query-scoped statistics ref for the MV target scan injected by the rule.
+    pub target_stats_ref: StatsRef,
 }

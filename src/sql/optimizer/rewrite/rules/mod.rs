@@ -1,9 +1,6 @@
 //! Query logical rewrite rule registry.
 
-use std::collections::HashMap;
-
 use crate::sql::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::sql::optimizer::statistics::TableStatistics;
 
 pub(crate) mod aggregate_pushdown;
 pub(crate) mod column_pruning;
@@ -51,15 +48,13 @@ pub(crate) fn variant_path_pushdown_rules() -> Vec<Box<dyn LogicalRewriteRule>> 
 /// All known query rewrite rules for registry and rule-name validation.
 /// Production ordering is defined by query_rewrite_pipeline(), not this set.
 #[allow(dead_code)]
-pub(crate) fn all_query_rewrite_rules(
-    table_stats: &HashMap<String, TableStatistics>,
-) -> Vec<Box<dyn LogicalRewriteRule>> {
+pub(crate) fn all_query_rewrite_rules() -> Vec<Box<dyn LogicalRewriteRule>> {
     let mut all = Vec::new();
     all.extend(predicate_pushdown_rules());
     all.extend(predicate_move_around_rules());
     all.extend(column_pruning_rules());
     all.extend(variant_path_pushdown_rules());
-    all.extend(aggregate_pushdown::aggregate_pushdown_rules(table_stats));
+    all.extend(aggregate_pushdown::aggregate_pushdown_rules());
     all.extend(low_cardinality_dictionary_rules());
     all.push(Box::new(derive_join_not_null::DeriveJoinNotNullPredicate));
     all
@@ -71,7 +66,7 @@ mod tests {
 
     #[test]
     fn registry_contains_expected_rules() {
-        let rules = all_query_rewrite_rules(&HashMap::new());
+        let rules = all_query_rewrite_rules();
         // 17 v2 pruning rules + 2 ukfk + 1 VariantPathPushdown
         // + 1 AggregatePushdown
         // + 1 LowCardinalityDictionaryRewrite + 5 predicate pushdown rules

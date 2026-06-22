@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, StringArray};
@@ -1589,6 +1589,126 @@ fn filtered_column_stats_by_key(
         .collect()
 }
 
+pub(crate) fn catalog_base_table_statistics(
+    state: &Arc<StandaloneState>,
+    database: &str,
+    table: &str,
+    columns: &[crate::sql::catalog::ColumnDef],
+    source: crate::sql::optimizer::stats_input::StatsSource,
+) -> Result<Option<crate::sql::optimizer::stats_input::BaseTableStatistics>, String> {
+    use crate::sql::optimizer::statistics::Confidence;
+    use crate::sql::optimizer::stats_input::{
+        BaseColumnStatistics, BaseTableStatistics, StatValue, StatsMissingReason,
+    };
+
+    let key = TableKey {
+        db: normalize_name(database)?,
+        table: normalize_name(table)?,
+    };
+    let rows = filtered_column_stats_by_key(state, &key);
+    if rows.is_empty() {
+        return Ok(None);
+    }
+
+    let row_count = rows
+        .iter()
+        .map(|row| row.row_count.max(0) as u64)
+        .max()
+        .unwrap_or(0);
+    let mut base_columns = HashMap::new();
+    for column in columns {
+        let column_name = normalize_name(&column.name)?;
+        let matching = rows
+            .iter()
+            .filter(|row| row.column_name.eq_ignore_ascii_case(&column_name));
+        let missing_reason = StatsMissingReason::ColumnNotReported(column_name.clone());
+        let min_value = aggregate_numeric_stat(matching.clone(), |row| &row.min, f64::min)
+            .map(|value| StatValue::known(value, Confidence::Exact, source))
+            .unwrap_or_else(|| StatValue::missing(missing_reason.clone()));
+        let max_value = aggregate_numeric_stat(matching.clone(), |row| &row.max, f64::max)
+            .map(|value| StatValue::known(value, Confidence::Exact, source))
+            .unwrap_or_else(|| StatValue::missing(missing_reason.clone()));
+        let ndv = aggregate_positive_numeric_stat(matching, |row| &row.ndv, f64::max)
+            .map(|value| StatValue::known(value, Confidence::Exact, source))
+            .unwrap_or_else(|| StatValue::missing(missing_reason.clone()));
+
+        base_columns.insert(
+            column_name,
+            BaseColumnStatistics {
+                nulls_fraction: StatValue::missing(missing_reason.clone()),
+                average_row_size: StatValue::missing(missing_reason.clone()),
+                min_value,
+                max_value,
+                ndv,
+            },
+        );
+    }
+
+    Ok(Some(BaseTableStatistics {
+        row_count: StatValue::known(row_count, Confidence::Exact, source),
+        columns: base_columns,
+        source,
+    }))
+}
+
+fn aggregate_numeric_stat<'a>(
+    rows: impl Iterator<Item = &'a ColumnStatRow>,
+    value: fn(&ColumnStatRow) -> &str,
+    combine: fn(f64, f64) -> f64,
+) -> Option<f64> {
+    rows.filter_map(|row| parse_finite_f64(value(row)))
+        .reduce(combine)
+}
+
+fn aggregate_positive_numeric_stat<'a>(
+    rows: impl Iterator<Item = &'a ColumnStatRow>,
+    value: fn(&ColumnStatRow) -> &str,
+    combine: fn(f64, f64) -> f64,
+) -> Option<f64> {
+    rows.filter_map(|row| parse_finite_f64(value(row)))
+        .filter(|value| *value > 0.0)
+        .reduce(combine)
+}
+
+fn parse_finite_f64(value: &str) -> Option<f64> {
+    value
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
+}
+
+#[cfg(test)]
+pub(crate) fn replace_catalog_stats_for_test(
+    state: &Arc<StandaloneState>,
+    database: &str,
+    table: &str,
+    rows: &[(&str, i64, &str, &str, &str)],
+) -> Result<(), String> {
+    let key = TableKey {
+        db: normalize_name(database)?,
+        table: normalize_name(table)?,
+    };
+    replace_column_stats(
+        state,
+        &key,
+        rows.iter()
+            .map(|(column, row_count, min, max, ndv)| {
+                Ok(ColumnStatRow {
+                    key: key.clone(),
+                    column_name: normalize_name(column)?,
+                    partition_name: key.table.clone(),
+                    row_count: *row_count,
+                    max: (*max).to_string(),
+                    min: (*min).to_string(),
+                    ndv: (*ndv).to_string(),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+    );
+    Ok(())
+}
+
 fn table_filter_matches(sql: &str, key: &TableKey) -> bool {
     quoted_filter(sql, "table_name")
         .map(|value| normalize_table_name_filter(&value) == format!("{}.{}", key.db, key.table))
@@ -2403,6 +2523,122 @@ mod tests {
         let result = ok_result().expect("ok result");
         assert_eq!(result.columns[0].name, "Status");
         assert_eq!(result_cell(&result, 0, 0).as_deref(), Some("OK"));
+    }
+
+    #[test]
+    fn catalog_base_table_statistics_reads_analyze_rows_without_name_heuristics() {
+        use crate::sql::catalog::ColumnDef;
+        use crate::sql::optimizer::statistics::Confidence;
+        use crate::sql::optimizer::stats_input::{StatValue, StatsSource};
+
+        let state = Arc::new(StandaloneState::default());
+        let key = TableKey {
+            db: "db1".to_string(),
+            table: "misleading_sales_fact_dim_lineitem".to_string(),
+        };
+        replace_column_stats(
+            &state,
+            &key,
+            vec![
+                ColumnStatRow {
+                    key: key.clone(),
+                    column_name: "id".to_string(),
+                    partition_name: key.table.clone(),
+                    row_count: 3,
+                    max: "3".to_string(),
+                    min: "1".to_string(),
+                    ndv: "3".to_string(),
+                },
+                ColumnStatRow {
+                    key: key.clone(),
+                    column_name: "payload".to_string(),
+                    partition_name: key.table.clone(),
+                    row_count: 3,
+                    max: "thirty".to_string(),
+                    min: "ten".to_string(),
+                    ndv: String::new(),
+                },
+                ColumnStatRow {
+                    key: key.clone(),
+                    column_name: "zero_ndv".to_string(),
+                    partition_name: key.table.clone(),
+                    row_count: 0,
+                    max: "0".to_string(),
+                    min: "-1".to_string(),
+                    ndv: "0".to_string(),
+                },
+                ColumnStatRow {
+                    key: key.clone(),
+                    column_name: "negative_ndv".to_string(),
+                    partition_name: key.table.clone(),
+                    row_count: 0,
+                    max: "0".to_string(),
+                    min: "-1".to_string(),
+                    ndv: "-2".to_string(),
+                },
+            ],
+        );
+        let columns = vec![
+            ColumnDef {
+                name: "id".to_string(),
+                data_type: DataType::Int32,
+                nullable: true,
+                write_default: None,
+                logical_type: None,
+            },
+            ColumnDef {
+                name: "payload".to_string(),
+                data_type: DataType::Utf8,
+                nullable: true,
+                write_default: None,
+                logical_type: None,
+            },
+            ColumnDef {
+                name: "zero_ndv".to_string(),
+                data_type: DataType::Int32,
+                nullable: true,
+                write_default: None,
+                logical_type: None,
+            },
+            ColumnDef {
+                name: "negative_ndv".to_string(),
+                data_type: DataType::Int32,
+                nullable: true,
+                write_default: None,
+                logical_type: None,
+            },
+        ];
+
+        let stats = catalog_base_table_statistics(
+            &state,
+            "db1",
+            "misleading_sales_fact_dim_lineitem",
+            &columns,
+            StatsSource::StarRocksTableMetadata,
+        )
+        .expect("catalog stats lookup")
+        .expect("stats should exist");
+
+        assert_eq!(
+            stats.row_count,
+            StatValue::known(3, Confidence::Exact, StatsSource::StarRocksTableMetadata)
+        );
+        assert_eq!(
+            stats.columns["id"].ndv,
+            StatValue::known(3.0, Confidence::Exact, StatsSource::StarRocksTableMetadata)
+        );
+        assert!(matches!(
+            stats.columns["payload"].min_value,
+            StatValue::Missing { .. }
+        ));
+        assert!(matches!(
+            stats.columns["zero_ndv"].ndv,
+            StatValue::Missing { .. }
+        ));
+        assert!(matches!(
+            stats.columns["negative_ndv"].ndv,
+            StatValue::Missing { .. }
+        ));
     }
 
     #[test]
