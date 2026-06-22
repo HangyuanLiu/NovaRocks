@@ -744,10 +744,6 @@ impl RemoteDispatcher {
     }
 
     /// The address of `backend_idx`/backend id, if present.
-    ///
-    /// PR-4 destination wiring: `FragmentScheduler` calls this to embed the
-    /// correct backend address into `TPlanFragmentDestination` entries when
-    /// assigning fragment instances to specific backends.
     pub fn addr_of(&self, backend_idx: usize) -> Option<SocketAddr> {
         self.addrs.get(&backend_idx).copied()
     }

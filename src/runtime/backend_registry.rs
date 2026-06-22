@@ -336,6 +336,31 @@ pub fn replace_backend_registry_for_test(reg: Option<Arc<BackendRegistry>>) {
 }
 
 #[cfg(test)]
+pub(crate) struct BackendRegistryTestGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl BackendRegistryTestGuard {
+    pub(crate) fn new() -> Self {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let guard = LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        replace_backend_registry_for_test(None);
+        Self { _guard: guard }
+    }
+}
+
+#[cfg(test)]
+impl Drop for BackendRegistryTestGuard {
+    fn drop(&mut self) {
+        replace_backend_registry_for_test(None);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::net::SocketAddr;

@@ -3891,13 +3891,28 @@ pub(crate) fn dispatcher_for_role(
 ) -> Result<Arc<dyn crate::runtime::dispatcher::FragmentDispatcher>, String> {
     use crate::common::app_config::ClusterRole;
     match role {
-        ClusterRole::Fe | ClusterRole::AllInOne => {
+        ClusterRole::Fe => {
+            let entries = backend_ops::live_backend_dispatch_entries()
+                .map_err(|e| with_fe_error_context(e))?;
+            Ok(Arc::new(
+                crate::runtime::dispatcher::RemoteDispatcher::new_with_backend_ids(&entries)?,
+            ))
+        }
+        ClusterRole::AllInOne => {
             let entries = backend_ops::live_backend_dispatch_entries()?;
             Ok(Arc::new(
                 crate::runtime::dispatcher::RemoteDispatcher::new_with_backend_ids(&entries)?,
             ))
         }
         ClusterRole::Be => Err("role=be must not enter standalone coordinator".to_string()),
+    }
+}
+
+fn with_fe_error_context(err: String) -> String {
+    if err.starts_with("role=fe:") {
+        err
+    } else {
+        format!("role=fe: {err}")
     }
 }
 
@@ -4907,6 +4922,7 @@ mod tests {
     use crate::connector::starrocks::lake::context::lock_runtime_test_state;
     use crate::connector::starrocks::table::config::StarRocksTableConfig;
     use crate::meta::MetaStoreProvider;
+    use crate::runtime::backend_registry::BackendRegistryTestGuard as BackendRegistryReset;
     use crate::sql::planner::plan::*;
     use arrow::array::{
         Array, FixedSizeBinaryArray, Int32Array, Int64Array, ListArray, StringArray,
@@ -4915,21 +4931,6 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use tempfile::TempDir;
-
-    struct BackendRegistryReset;
-
-    impl BackendRegistryReset {
-        fn new() -> Self {
-            crate::runtime::backend_registry::replace_backend_registry_for_test(None);
-            Self
-        }
-    }
-
-    impl Drop for BackendRegistryReset {
-        fn drop(&mut self) {
-            crate::runtime::backend_registry::replace_backend_registry_for_test(None);
-        }
-    }
 
     fn string_cell(result: &QueryResult, row: usize, col: usize) -> String {
         let batch = &result.chunks[0].batch;

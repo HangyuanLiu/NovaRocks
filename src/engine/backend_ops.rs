@@ -428,29 +428,7 @@ fn backend_state_from_str(state: &str) -> Result<BackendState, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
-    struct BackendRegistryReset {
-        _guard: MutexGuard<'static, ()>,
-    }
-
-    impl BackendRegistryReset {
-        fn new() -> Self {
-            static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-            let guard = LOCK
-                .get_or_init(|| Mutex::new(()))
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            crate::runtime::backend_registry::replace_backend_registry_for_test(None);
-            Self { _guard: guard }
-        }
-    }
-
-    impl Drop for BackendRegistryReset {
-        fn drop(&mut self) {
-            crate::runtime::backend_registry::replace_backend_registry_for_test(None);
-        }
-    }
+    use crate::runtime::backend_registry::BackendRegistryTestGuard as BackendRegistryReset;
 
     #[test]
     fn all_in_one_loopback_registry_installs_live_backend_zero() {
