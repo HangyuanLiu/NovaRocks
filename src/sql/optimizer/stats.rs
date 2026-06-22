@@ -1073,12 +1073,11 @@ pub(crate) fn derive_group_statistics(
         // when first needed (StarRocks isStatsDerived semantics). Under the
         // per-group argmax collapse (`pick_group_representative`), a group's
         // representative depends on ALL its members, so this skip is only sound
-        // while every member appended to an already-derived group has a key
-        // (source_confidence, promise) no greater than the current
-        // representative's. That holds for every producer today:
+        // while every member appended to an already-derived group has a
+        // source_confidence no greater than the current representative's. That
+        // holds for every producer today:
         //   - reorder / join commutativity / associativity append logically-
-        //     equivalent join members with an EQUAL key (promise is
-        //     in-group-constant for a fixed relation set; same source
+        //     equivalent join members with an EQUAL key (same source
         //     confidence).
         //   - MvRewrite appends an MV-backed member whose TOP operator is the
         //     same SPJG shape (Project/Aggregate) as the incumbent; that top op
@@ -1160,31 +1159,20 @@ pub(crate) fn derive_group_statistics_for(
     }
 }
 
-/// Pick a group's representative member by lexicographic confidence argmax:
-/// key = (source_confidence, derive_promise); on tie prefer FFewerConj
-/// (inner-join only); on final tie keep the lowest index (canonical-first).
-/// Mirrors GPORCA PgexprBestPromise + FBetterPromise. Strict-greater
-/// replacement from the first member, so an all-equal group degenerates to
-/// `first()` (zero-regression baseline). Returns the chosen member (cloned)
-/// and its already-derived Statistics (reused, not recomputed). Returns None
-/// for an empty group.
+/// Pick a group's representative member by source-confidence argmax:
+/// key = source_confidence; on tie prefer FFewerConj (inner-join only); on
+/// final tie keep the lowest index (canonical-first). Mirrors GPORCA
+/// PgexprBestPromise + FBetterPromise (minus the derivability axis, which is
+/// redundant under NovaRocks's derive-then-pick model — per-member confidence
+/// is already computed, so a shape-based promise proxy added no within-group
+/// signal). Strict-greater replacement from the first member, so an all-equal
+/// group degenerates to `first()` (zero-regression baseline). Returns the
+/// chosen member (cloned) and its already-derived Statistics (reused, not
+/// recomputed). Returns None for an empty group.
 ///
 /// Member order is `logical_exprs` then `physical_exprs`, so the lowest index
 /// is `logical_exprs[0]` — exactly today's pick
 /// (`logical_exprs.first().or(physical_exprs.first())`).
-///
-/// Note on the promise (derivability) axis: with the current `promise()`
-/// child-shape proxy, a join's promise is fixed by its arity (High over two
-/// base/leaf inputs, Medium once a child is itself a join). Every member of one
-/// memo group joins the same relation set, so all members share the same arity
-/// and therefore the same promise — the promise axis is in-group-CONSTANT today
-/// and never breaks a within-group tie. It is kept in the lexicographic key as
-/// framework: it gains real within-group signal only when members of one group
-/// can differ in derivability (a more faithful reorder-shape marker, or future
-/// in-memo decorrelation). The live within-group discriminators today are the
-/// source-confidence axis and the FFewerConj sub-tie-break. (This is why no test
-/// constructs two same-group members differing in promise: doing so would
-/// require members joining different relation sets, violating group equivalence.)
 pub(crate) fn pick_group_representative(
     memo: &Memo,
     group_idx: usize,
@@ -1192,7 +1180,7 @@ pub(crate) fn pick_group_representative(
 ) -> Option<(MExpr, Statistics)> {
     // Build the member list as logical_exprs then physical_exprs. Cloning each
     // member releases the borrow on `memo.groups[..]`, so we can pass `memo`
-    // immutably to `derive_statistics`/`promise` below.
+    // immutably to `derive_statistics` below.
     let members: Vec<MExpr> = {
         let group = &memo.groups[group_idx];
         group
@@ -1206,18 +1194,12 @@ pub(crate) fn pick_group_representative(
     let mut iter = members.into_iter();
     let first = iter.next()?;
     let first_stats = derive_statistics(&first, memo, table_stats);
-    let first_key = (
-        first_stats.row_count_confidence,
-        promise(&first.op, &first.children, memo),
-    );
+    let first_key = first_stats.row_count_confidence;
     let mut best = (first, first_stats, first_key);
 
     for cand in iter {
         let cand_stats = derive_statistics(&cand, memo, table_stats);
-        let cand_key = (
-            cand_stats.row_count_confidence,
-            promise(&cand.op, &cand.children, memo),
-        );
+        let cand_key = cand_stats.row_count_confidence;
         // Strict-greater replacement: replace only on a strict improvement so
         // ties keep the lower index (canonical-first / zero-regression).
         let replace = cand_key > best.2
@@ -2494,35 +2476,6 @@ fn child_output_columns(
         .and_then(|&child_id| memo.groups[child_id].logical_props.as_ref())
         .map(|props| props.output_columns.clone())
         .unwrap_or_default()
-}
-
-// ---------------------------------------------------------------------------
-// Derivability promise
-// ---------------------------------------------------------------------------
-
-/// Derivability promise of a memo expression, from its operator shape.
-/// Join over base inputs → High; bushy join (a child group is itself a join)
-/// → Medium; everything else → High. `Low` is unreachable today (reserved for
-/// future in-memo decorrelation — subqueries are decorrelated pre-memo).
-pub(crate) fn promise(op: &Operator, children: &[GroupId], memo: &Memo) -> DerivePromise {
-    match op {
-        Operator::LogicalJoin(_)
-        | Operator::PhysicalHashJoin(_)
-        | Operator::PhysicalNestLoopJoin(_) => {
-            let bushy = children.iter().any(|&c| {
-                matches!(
-                    memo.groups[c].logical_exprs.first().map(|e| &e.op),
-                    Some(Operator::LogicalJoin(_))
-                )
-            });
-            if bushy {
-                DerivePromise::Medium
-            } else {
-                DerivePromise::High
-            }
-        }
-        _ => DerivePromise::High,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5638,18 +5591,18 @@ mod tests {
         assert!((props.row_count - 1_000.0).abs() < 1.0);
     }
 
-    /// An all-equal group (every member same source confidence AND same
-    /// promise) must keep the lowest index — `logical_exprs[0]` — exactly
-    /// reproducing today's `first()` pick (zero-regression baseline).
+    /// An all-equal group (every member same source confidence) must keep the
+    /// lowest index — `logical_exprs[0]` — exactly reproducing today's
+    /// `first()` pick (zero-regression baseline).
     #[test]
     fn pick_representative_all_equal_degenerates_to_first() {
         let (name, ts) = make_table_stats("eq_tbl", 1_000, &[("a", 50.0)]);
         let mut table_stats = HashMap::new();
         table_stats.insert(name, ts);
 
-        // Two scans of the SAME registered table: both Exact, both leaf (High
-        // promise) → equal key. We distinguish them by column ("a" vs "b") so we
-        // can tell which member was picked.
+        // Two scans of the SAME registered table: both Exact → equal key. We
+        // distinguish them by column ("a" vs "b") so we can tell which member
+        // was picked.
         let mut memo = Memo::new();
         let group = memo.new_group(scan_mexpr("eq_tbl", "a"));
         memo.add_expr_to_group(group, scan_mexpr("eq_tbl", "b"));
@@ -5706,8 +5659,8 @@ mod tests {
     }
 
     /// FFewerConj sub-tie-break: two tied inner-join members (same children,
-    /// same source confidence, same promise) differing only in the number of
-    /// join-condition conjuncts — the member with FEWER conjuncts wins.
+    /// same source confidence) differing only in the number of join-condition
+    /// conjuncts — the member with FEWER conjuncts wins.
     #[test]
     fn pick_representative_ffewerconj_prefers_fewer_join_conjuncts() {
         use crate::sql::analysis::ExprKind;
@@ -5719,8 +5672,8 @@ mod tests {
         let mut memo = Memo::new();
 
         // Two base leaf children with pre-baked props (so child_statistics reads
-        // them and both join members get the SAME derived stats + High promise —
-        // both children are non-join, so the join is not bushy).
+        // them and both join members get the SAME derived stats / source
+        // confidence).
         let mk_leaf = |memo: &mut Memo| -> GroupId {
             let id = memo.next_expr_id();
             let g = memo.new_group(MExpr {
@@ -6093,101 +6046,6 @@ mod sort_partition_limit_tests {
         assert!(
             (result - 50.0).abs() < 1e-9,
             "expected 50.0 with default NDV, got {result}"
-        );
-    }
-}
-
-#[cfg(test)]
-mod promise_tests {
-    use super::*;
-    use crate::sql::analysis::JoinKind;
-    use crate::sql::optimizer::memo::{LogicalProperties, MExpr, Memo};
-    use crate::sql::optimizer::operator::{LogicalJoinOp, Operator, ValuesOp};
-
-    /// Add a leaf group (LogicalValues, no children) to the memo, with
-    /// pre-baked logical_props so child_statistics can read it.
-    fn add_leaf_group(memo: &mut Memo) -> GroupId {
-        let id = memo.next_expr_id();
-        let g = memo.new_group(MExpr {
-            id,
-            op: Operator::LogicalValues(ValuesOp {
-                rows: vec![],
-                columns: vec![],
-            }),
-            children: vec![],
-        });
-        memo.groups[g].logical_props = Some(LogicalProperties::new(vec![], 1000.0));
-        g
-    }
-
-    /// Add a join group over the given child groups using the given join kind.
-    /// The group gets a LogicalJoin as its first (and only) logical expr.
-    fn add_join_group(memo: &mut Memo, left: GroupId, right: GroupId) -> GroupId {
-        let id = memo.next_expr_id();
-        memo.new_group(MExpr {
-            id,
-            op: Operator::LogicalJoin(LogicalJoinOp {
-                join_type: JoinKind::Inner,
-                condition: None,
-            }),
-            children: vec![left, right],
-        })
-    }
-
-    /// promise() for a join over two base (non-join) leaf groups → High.
-    #[test]
-    fn promise_join_over_base_inputs_is_high() {
-        let mut memo = Memo::new();
-        let left = add_leaf_group(&mut memo);
-        let right = add_leaf_group(&mut memo);
-
-        let op = Operator::LogicalJoin(LogicalJoinOp {
-            join_type: JoinKind::Inner,
-            condition: None,
-        });
-        let children = vec![left, right];
-        assert_eq!(
-            promise(&op, &children, &memo),
-            DerivePromise::High,
-            "join over base inputs must be High"
-        );
-    }
-
-    /// promise() for a bushy join (at least one child group is itself a join) → Medium.
-    #[test]
-    fn promise_bushy_join_is_medium() {
-        let mut memo = Memo::new();
-        let a = add_leaf_group(&mut memo);
-        let b = add_leaf_group(&mut memo);
-        // inner_join = join(a, b) — its first logical_expr is a LogicalJoin
-        let inner_join = add_join_group(&mut memo, a, b);
-        let c = add_leaf_group(&mut memo);
-
-        // bushy_join = join(inner_join, c): left child is a join group → bushy
-        let op = Operator::LogicalJoin(LogicalJoinOp {
-            join_type: JoinKind::Inner,
-            condition: None,
-        });
-        let children = vec![inner_join, c];
-        assert_eq!(
-            promise(&op, &children, &memo),
-            DerivePromise::Medium,
-            "join with a join child must be Medium (bushy)"
-        );
-    }
-
-    /// promise() for a non-join operator (e.g. LogicalValues) → High.
-    #[test]
-    fn promise_non_join_operator_is_high() {
-        let memo = Memo::new();
-        let op = Operator::LogicalValues(ValuesOp {
-            rows: vec![],
-            columns: vec![],
-        });
-        assert_eq!(
-            promise(&op, &[], &memo),
-            DerivePromise::High,
-            "non-join operators must always be High"
         );
     }
 }
