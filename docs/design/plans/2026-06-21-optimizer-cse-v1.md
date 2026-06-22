@@ -4,7 +4,7 @@
 
 **Goal:** Add common-subexpression elimination (CSE) to the standalone optimizer so a repeated, non-trivial scalar subexpression within one operator's expression set is computed once (materialized as a Project output column) and referenced by ColumnId, instead of being re-evaluated per occurrence.
 
-**Architecture:** A post-CBO physical-tree pass (`cse_pass`) modeled on `runtime_filter_pass`, run inside `optimize()` after `extract_best` and before `attach_scalar_arena` (so it can take `&mut memo.scalars` + `&mut memo.factory`). Detection is a per-operator ScalarId frequency count (the ScalarArena hash-conses, so structural-equality ⟺ same `ScalarId`). The rewrite materializes each common subexpression as a Project output column (rewrite in place for a `PhysicalProject`; insert/reuse a Project below `Filter`/`Aggregate`/`Sort`/`Window` and on the relevant side of a join) and rewrites consumers to reference it via `ScalarNode::ColumnRef`. Cross-input join-condition CSE is **out of scope** (v2). v1 needs **zero** new exec/codegen/thrift code — it produces standard `PhysicalProject` nodes that the existing `build_distributed_plan` bridge and project working-chunk already handle.
+**Architecture:** A post-CBO physical-tree pass (`cse_pass`) modeled on `runtime_filter_pass`, run inside `optimize()` after `extract_best` and before `attach_scalar_arena` (so it can take `&mut memo.scalars` + `&mut memo.factory`). Detection is a per-operator ScalarId frequency count (the ScalarArena hash-conses, so structural-equality ⟺ same `ScalarId`). The rewrite materializes each common subexpression as a Project output column by inserting/reusing a `PhysicalProject` below the consuming operator, including projection-list CSE. This avoids same-Project self-reference because standalone `lower_project` compiles each Project item against child scope only. Consumers are rewritten to reference the CSE output via `ScalarNode::ColumnRef`. Cross-input join-condition CSE is **out of scope** (v2). v1 needs **zero** new exec/codegen/thrift code — it produces standard `PhysicalProject` nodes that the existing `build_distributed_plan` bridge and project working-chunk already handle.
 
 **Tech Stack:** Rust; `src/sql/optimizer/**`; the `ScalarArena`/`ScalarId` IR (`src/sql/optimizer/scalar/mod.rs`); `ColumnRefFactory` (`src/sql/column_id.rs`); sql-test runner (`tests/sql-test-runner`) for plan-golden + result regression.
 
@@ -18,7 +18,7 @@
 - **Modify** `src/sql/optimizer/mod.rs` — `mod cse_pass;`, call `cse_pass::rewrite(...)` at the `optimize()` tail, add `CSE_RULE` to `is_known_rule_name`.
 - **Modify** `src/sql/optimizer/options.rs` — add `enable_common_subexpr_reuse: Option<bool>` to `SessionOptimizerSettings`, gate the rule in `from_session`.
 - **Modify** `src/server/mod.rs` — `SET enable_common_subexpr_reuse` handler.
-- **Create** `tests/sql-test-runner/suites/optimizer/cse_*.sql` — plan-golden + result cases.
+- **Create** `sql-tests/optimizer/sql/cse_*.sql` — plan-golden + result cases.
 
 **Shared signatures (defined in Task 2/3, referenced by later tasks — keep these stable):**
 ```rust
@@ -311,13 +311,13 @@ git commit -m "feat(optimizer): CSE detection — ScalarId frequency count + eli
 
 ---
 
-## Task 3: Projection-list CSE (in-place, smallest end-to-end)
+## Task 3: Projection-list CSE (insert child CSE Project, smallest end-to-end)
 
-This validates the whole chain (optimizer rewrite → `build_distributed_plan` bridge → project working-chunk) with no node insertion.
+This validates the whole chain (optimizer rewrite → `build_distributed_plan` bridge → project working-chunk) using a child CSE Project. Same-Project prelude is invalid in the current codebase because `lower_project` compiles each item against child scope, not prior items in the same Project.
 
 **Files:**
 - Modify: `src/sql/optimizer/cse_pass.rs`
-- Test: inline tests + `tests/sql-test-runner/suites/optimizer/cse_projection.sql`
+- Test: inline tests + `sql-tests/optimizer/sql/cse_projection.sql` and `sql-tests/optimizer/result/cse_projection.result`
 
 - [ ] **Step 1: Write the failing `substitute` + `build_commons` unit test**
 
@@ -434,10 +434,11 @@ fn substitute(
     scalars.intern(rebuilt, ty, nullable)
 }
 
-/// For each common (ordered ascending), build a producer Project item that
-/// computes it (with already-materialized nested commons substituted) into a
-/// freshly minted internal ColumnId. Returns the prelude items (in order) and a
-/// subst map (common ScalarId -> interned ColumnRef id) for rewriting consumers.
+/// For each common, build an independent producer Project item into a freshly
+/// minted internal ColumnId. Producer items must not reference earlier CSE
+/// outputs because a standalone Project item is compiled against child scope
+/// only. Returns the prelude items and a subst map (common ScalarId -> interned
+/// ColumnRef id) for rewriting consumers.
 fn build_commons(
     scalars: &mut ScalarArena,
     factory: &mut ColumnRefFactory,
@@ -446,8 +447,7 @@ fn build_commons(
     let mut subst: HashMap<ScalarId, ScalarId> = HashMap::new();
     let mut items: Vec<ScalarProjectItem> = Vec::new();
     for &c in commons {
-        // c is not yet in subst, so this substitutes only its (already-built) nested commons.
-        let producer = substitute(scalars, c, &subst);
+        let producer = c;
         let ty = scalars.data_type(c).clone();
         let nullable = scalars.nullable(c);
         let name = format!("__cse_{}", items.len());
@@ -472,7 +472,7 @@ Expected: PASS.
 
 - [ ] **Step 5: Write the failing `rewrite_project` test**
 
-Append to the `tests` module. It builds a `PhysicalProject` with two items both using `a+b`, runs the rewrite, and asserts a prelude `__cse_0` item appears first and both originals now reference it. Use the construction template from `runtime_filter_pass.rs:919-934`:
+Append to the `tests` module. It builds a `PhysicalProject` with two items both using `a+b`, runs the rewrite, and asserts a child CSE `PhysicalProject` is inserted below the original Project. The original Project keeps only user-visible items, and those items now reference the CSE child output. Use the construction template from `runtime_filter_pass.rs:919-934`:
 ```rust
     use crate::sql::optimizer::operator::{Operator, ProjectOp};
     use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, PlanExecutionProps};
@@ -496,23 +496,34 @@ Append to the `tests` module. It builds a `PhysicalProject` with two items both 
             proj_item(&arena, ab, 10, "x"),          // x = a+b
             proj_item(&arena, ab2, 11, "y"),         // y = (a+b)+(a+b)
         ];
-        let mut node = PhysicalPlanNode {
-            op: Operator::PhysicalProject(ProjectOp { items, output_qualifier: None }),
+        let child = PhysicalPlanNode {
+            op: Operator::PhysicalValues(ValuesOp {
+                rows: vec![],
+                columns: vec![out_col(1, "a"), out_col(2, "b")],
+            }),
             children: vec![],
             stats: Statistics::default(),
-            output_columns: vec![],
+            output_columns: vec![out_col(1, "a"), out_col(2, "b")],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+        let mut node = PhysicalPlanNode {
+            op: Operator::PhysicalProject(ProjectOp { items, output_qualifier: None }),
+            children: vec![child],
+            stats: Statistics::default(),
+            output_columns: vec![out_col(10, "x"), out_col(11, "y")],
             execution_props: PlanExecutionProps::default(),
             build_runtime_filters: vec![],
             probe_runtime_filters: vec![],
         };
         rewrite_node(&mut node, &mut arena, &mut factory);
         let Operator::PhysicalProject(p) = &node.op else { panic!() };
-        // first item is the minted common producer
-        assert_eq!(p.items[0].output_name, "__cse_0");
-        assert!(matches!(arena.node(p.items[0].expr), ScalarNode::BinaryOp { .. }));
-        // x (now items[1]) references the common column, not a fresh a+b
-        let common_col = p.items[0].output_column_id;
-        assert!(matches!(arena.node(p.items[1].expr), ScalarNode::ColumnRef(c) if *c == common_col));
+        assert_eq!(p.items.len(), 2);
+        let Operator::PhysicalProject(cse_project) = &node.children[0].op else { panic!() };
+        assert_eq!(cse_project.items[2].output_name, "__cse_0");
+        let common_col = cse_project.items[2].output_column_id;
+        assert!(matches!(arena.node(p.items[0].expr), ScalarNode::ColumnRef(c) if *c == common_col));
     }
 ```
 
@@ -553,21 +564,14 @@ fn rewrite_project(
     for item in &mut project.items {
         item.expr = substitute(scalars, item.expr, &subst);
     }
-    // Prepend producer items so they are computed before consumers.
-    let mut new_items = prelude.clone();
-    new_items.append(&mut project.items);
-    project.items = new_items;
-
-    // The minted commons are intermediate, user-invisible columns.
-    for it in &prelude {
-        node.output_columns.push(OutputColumn {
-            column_id: it.output_column_id,
-            name: it.output_name.clone(),
-            data_type: scalars.data_type(it.expr).clone(),
-            nullable: scalars.nullable(it.expr),
-            is_internal: true,
-        });
-    }
+    // Insert a child CSE Project. The original Project remains the visible
+    // result contract and consumes the CSE child output by ColumnId.
+    //
+    // Passthrough columns must come from leaf ColumnRefs referenced by the
+    // original project roots. Do not blindly copy child.output_columns: some
+    // pass-through physical nodes can carry metadata that is not the verifier's
+    // true child scope.
+    insert_cse_project_below_current_project(node, roots, prelude, scalars);
 }
 ```
 
@@ -578,19 +582,23 @@ Expected: PASS (all cse_pass tests).
 
 - [ ] **Step 9: Write the end-to-end plan-golden + result case**
 
-Create `tests/sql-test-runner/suites/optimizer/cse_projection.sql` (follow an existing optimizer suite case for exact directive syntax — e.g. `aggregate_pushdown_*.sql`). It must (a) assert the common appears once in the plan and (b) verify the result columns are exactly the user-selected ones (no `__cse_` leakage):
+Create `sql-tests/optimizer/sql/cse_projection.sql` (follow an existing optimizer suite case for exact directive syntax — e.g. `aggregate_pushdown_*.sql`). It must (a) assert the common appears once in the plan and (b) verify the result columns are exactly the user-selected ones (no `__cse_` leakage):
 ```sql
--- @name cse_projection_basic
--- Repeated (l_extendedprice * l_discount) in the SELECT list is computed once.
-CREATE TABLE cse_t (a BIGINT, b BIGINT) ENGINE=... ;  -- match suite's table setup convention
-INSERT INTO cse_t VALUES (3, 4), (5, 6);
+-- @tags=optimizer,cse
+DROP TABLE IF EXISTS ${case_db}.cse_projection_t;
+CREATE TABLE ${case_db}.cse_projection_t (a BIGINT, b BIGINT);
+INSERT INTO ${case_db}.cse_projection_t VALUES (3, 4), (5, 6);
+
+-- Golden result: exactly two visible columns x,y.
+SELECT (a + b) AS x, (a + b) + a AS y
+FROM ${case_db}.cse_projection_t
+ORDER BY a;
 
 -- @explain_contains=__cse_0
-EXPLAIN VERBOSE
-SELECT (a + b) AS x, (a + b) + a AS y FROM cse_t;
-
--- result must be exactly two columns x,y — no internal CSE column leaks
-SELECT (a + b) AS x, (a + b) + a AS y FROM cse_t ORDER BY a;
+-- @result_not_contains=__cse_
+SELECT (a + b) AS x, (a + b) + a AS y
+FROM ${case_db}.cse_projection_t
+ORDER BY a;
 ```
 
 - [ ] **Step 10: Run the end-to-end case**
@@ -599,16 +607,16 @@ Start standalone-server, then:
 ```bash
 source docker/iceberg-rest/runtime/current/env.sh
 cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
-  --config "$NOVAROCKS_SQL_TEST_CONFIG" --suite optimizer --only cse_projection_basic --mode record
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" --suite optimizer --only cse_projection --mode record --record-from target
 ```
-Inspect the recorded golden: the `EXPLAIN VERBOSE` must show a `__cse_0` PROJECT column computed once and `x`/`y` referencing it; the result must have exactly columns `x`,`y`. Then re-run with `--mode verify` and confirm PASS.
+Inspect the recorded golden: the result must have exactly columns `x`,`y`. The second SELECT validates `EXPLAIN VERBOSE` contains `__cse_0` and the result text does not contain any `__cse_` internal column. Then re-run with `--mode verify` and confirm PASS.
 **If `__cse_0` leaks into the result columns**, the `is_internal` flag is not being honored by the final output projection — fix the output path (or filter internal columns at result assembly) before proceeding; this is the single end-to-end assumption from spec §8.
 
 - [ ] **Step 11: Commit**
 
 ```bash
-git add src/sql/optimizer/cse_pass.rs tests/sql-test-runner/suites/optimizer/cse_projection.sql
-git commit -m "feat(optimizer): CSE for projection lists (in-place Project rewrite)"
+git add src/sql/optimizer/cse_pass.rs sql-tests/optimizer/sql/cse_projection.sql sql-tests/optimizer/result/cse_projection.result
+git commit -m "feat(optimizer): CSE for projection lists"
 ```
 
 ---
@@ -617,7 +625,7 @@ git commit -m "feat(optimizer): CSE for projection lists (in-place Project rewri
 
 **Files:**
 - Modify: `src/sql/optimizer/cse_pass.rs`
-- Test: inline test + `tests/sql-test-runner/suites/optimizer/cse_filter.sql`
+- Test: inline test + `sql-tests/optimizer/sql/cse_filter.sql`
 
 - [ ] **Step 1: Write the failing `insert_or_reuse_project_below` test**
 
@@ -763,7 +771,7 @@ fn rewrite_filter(
 
 - [ ] **Step 6: Write + record the end-to-end Filter case**
 
-Create `tests/sql-test-runner/suites/optimizer/cse_filter.sql` with a `WHERE (a+b) > 1 AND (a+b) < 100` query; `-- @explain_contains=__cse_0`; and a result-correctness check. Record then verify (commands as Task 3 Step 10, `--only cse_filter_basic`).
+Create `sql-tests/optimizer/sql/cse_filter.sql` with a `WHERE (a+b) > 1 AND (a+b) < 100` query; `-- @explain_contains=__cse_0`; and a result-correctness check. Record then verify (commands as Task 3 Step 10, `--only cse_filter`).
 **Verify the spec §8 ordering assumption**: the filter conjunct must evaluate against the inserted Project's output. If the result is wrong/empty, the project operator is applying conjuncts pre-materialization — capture the failure and stop (this is the must-verify item); fix by ensuring conjuncts evaluate on project output.
 
 - [ ] **Step 7: Run full optimizer suite to catch plan-golden drift**
@@ -778,7 +786,7 @@ Expected: only cse_* new cases differ; if pre-existing goldens drift, re-record 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add src/sql/optimizer/cse_pass.rs tests/sql-test-runner/suites/optimizer/cse_filter.sql
+git add src/sql/optimizer/cse_pass.rs sql-tests/optimizer/sql/cse_filter.sql
 git commit -m "feat(optimizer): CSE for Filter (insert/reuse Project below)"
 ```
 
@@ -788,7 +796,7 @@ git commit -m "feat(optimizer): CSE for Filter (insert/reuse Project below)"
 
 Each reuses `pick_commons` + `build_commons` + `insert_or_reuse_project_below`; only the per-operator root extraction and consumer rewrite differ.
 
-**Files:** Modify `src/sql/optimizer/cse_pass.rs`; tests `tests/sql-test-runner/suites/optimizer/cse_agg.sql`.
+**Files:** Modify `src/sql/optimizer/cse_pass.rs`; tests `sql-tests/optimizer/sql/cse_agg.sql`.
 
 - [ ] **Step 1: Write the failing Aggregate unit test**
 
@@ -848,7 +856,7 @@ TopN is identical to Sort but matches `Operator::PhysicalTopN` / `TopNOp { items
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/sql/optimizer/cse_pass.rs tests/sql-test-runner/suites/optimizer/cse_agg.sql
+git add src/sql/optimizer/cse_pass.rs sql-tests/optimizer/sql/cse_agg.sql
 git commit -m "feat(optimizer): CSE for Aggregate/Sort/TopN/Window (Project below)"
 ```
 
@@ -858,7 +866,7 @@ git commit -m "feat(optimizer): CSE for Aggregate/Sort/TopN/Window (Project belo
 
 Only **single-side** subexpressions of a join's non-equi condition are factored — pushed to that side's child Project. Cross-input subexpressions are left untouched (v2).
 
-**Files:** Modify `src/sql/optimizer/cse_pass.rs`; tests `tests/sql-test-runner/suites/optimizer/cse_join.sql`.
+**Files:** Modify `src/sql/optimizer/cse_pass.rs`; tests `sql-tests/optimizer/sql/cse_join.sql`.
 
 - [ ] **Step 1: Write the failing "single-side only" unit test**
 
@@ -936,7 +944,7 @@ fn collect_column_ids(scalars: &ScalarArena, id: ScalarId, out: &mut HashSet<Col
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/sql/optimizer/cse_pass.rs tests/sql-test-runner/suites/optimizer/cse_join.sql
+git add src/sql/optimizer/cse_pass.rs sql-tests/optimizer/sql/cse_join.sql
 git commit -m "feat(optimizer): CSE for join single-side conditions (cross-input deferred to v2)"
 ```
 
@@ -1005,7 +1013,7 @@ Expected: lib tests green; optimizer goldens drift only as intentional `__cse_`/
 - [ ] **Step 8: Commit**
 
 ```bash
-git add src/sql/optimizer/options.rs src/server/mod.rs tests/sql-test-runner/suites/optimizer/cse_projection.sql
+git add src/sql/optimizer/options.rs src/server/mod.rs sql-tests/optimizer/sql/cse_projection.sql
 git commit -m "feat(optimizer): CSE session var + disable-rule gating + full regression"
 ```
 

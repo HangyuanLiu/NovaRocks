@@ -5,9 +5,13 @@
 //!
 //! See docs/design/specs/2026-06-21-optimizer-cse-v1-design.md.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use crate::sql::column_id::ColumnRefFactory;
+use arrow::datatypes::DataType;
+
+use crate::sql::column_id::{ColumnId, ColumnRefFactory};
+use crate::sql::common::OutputColumn;
+use crate::sql::optimizer::operator::{Operator, ScalarProjectItem};
 use crate::sql::optimizer::options::OptimizerOptions;
 use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
@@ -38,8 +42,9 @@ fn rewrite_node(
     for child in &mut node.children {
         rewrite_node(child, scalars, factory);
     }
-    // Per-operator rewrite dispatch added in Tasks 3-6.
-    let _ = (scalars, factory, &node.op);
+    if matches!(&node.op, Operator::PhysicalProject(_)) {
+        rewrite_project(node, scalars, factory);
+    }
 }
 
 fn child_ids(scalars: &ScalarArena, id: ScalarId) -> Vec<ScalarId> {
@@ -179,13 +184,387 @@ fn record_first_seen(
     }
 }
 
+fn collect_column_refs(
+    scalars: &ScalarArena,
+    roots: &[ScalarId],
+) -> Vec<(ColumnId, DataType, bool)> {
+    let mut seen = HashSet::new();
+    let mut refs = Vec::new();
+    for &root in roots {
+        collect_column_refs_inner(scalars, root, &mut seen, &mut refs);
+    }
+    refs
+}
+
+fn collect_column_refs_inner(
+    scalars: &ScalarArena,
+    id: ScalarId,
+    seen: &mut HashSet<ColumnId>,
+    refs: &mut Vec<(ColumnId, DataType, bool)>,
+) {
+    match scalars.node(id) {
+        ScalarNode::ColumnRef(column_id) => {
+            if seen.insert(*column_id) {
+                refs.push((
+                    *column_id,
+                    scalars.data_type(id).clone(),
+                    scalars.nullable(id),
+                ));
+            }
+        }
+        ScalarNode::BinaryOp { left, right, .. } => {
+            collect_column_refs_inner(scalars, *left, seen, refs);
+            collect_column_refs_inner(scalars, *right, seen, refs);
+        }
+        ScalarNode::UnaryOp { child, .. }
+        | ScalarNode::Cast { child, .. }
+        | ScalarNode::IsNull { child, .. }
+        | ScalarNode::IsTruthValue { child, .. }
+        | ScalarNode::Nested(child) => collect_column_refs_inner(scalars, *child, seen, refs),
+        ScalarNode::FunctionCall { args, .. } => {
+            for &arg in args {
+                collect_column_refs_inner(scalars, arg, seen, refs);
+            }
+        }
+        ScalarNode::AggregateCall { args, order_by, .. } => {
+            for &arg in args {
+                collect_column_refs_inner(scalars, arg, seen, refs);
+            }
+            for key in order_by {
+                collect_column_refs_inner(scalars, key.expr, seen, refs);
+            }
+        }
+        ScalarNode::InList { child, list, .. } => {
+            collect_column_refs_inner(scalars, *child, seen, refs);
+            for &item in list {
+                collect_column_refs_inner(scalars, item, seen, refs);
+            }
+        }
+        ScalarNode::Between {
+            child, low, high, ..
+        } => {
+            collect_column_refs_inner(scalars, *child, seen, refs);
+            collect_column_refs_inner(scalars, *low, seen, refs);
+            collect_column_refs_inner(scalars, *high, seen, refs);
+        }
+        ScalarNode::Like { child, pattern, .. } => {
+            collect_column_refs_inner(scalars, *child, seen, refs);
+            collect_column_refs_inner(scalars, *pattern, seen, refs);
+        }
+        ScalarNode::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(operand) = operand {
+                collect_column_refs_inner(scalars, *operand, seen, refs);
+            }
+            for (when, then) in when_then {
+                collect_column_refs_inner(scalars, *when, seen, refs);
+                collect_column_refs_inner(scalars, *then, seen, refs);
+            }
+            if let Some(else_expr) = else_expr {
+                collect_column_refs_inner(scalars, *else_expr, seen, refs);
+            }
+        }
+        ScalarNode::WindowCall {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for &arg in args {
+                collect_column_refs_inner(scalars, arg, seen, refs);
+            }
+            for &partition in partition_by {
+                collect_column_refs_inner(scalars, partition, seen, refs);
+            }
+            for key in order_by {
+                collect_column_refs_inner(scalars, key.expr, seen, refs);
+            }
+        }
+        ScalarNode::LambdaFunction { body, .. } | ScalarNode::Lambda { body, .. } => {
+            collect_column_refs_inner(scalars, *body, seen, refs);
+        }
+        ScalarNode::Literal(_) | ScalarNode::LambdaParamRef { .. } => {}
+    }
+}
+
+fn substitute(
+    scalars: &mut ScalarArena,
+    id: ScalarId,
+    subst: &HashMap<ScalarId, ScalarId>,
+) -> ScalarId {
+    if let Some(&replacement) = subst.get(&id) {
+        return replacement;
+    }
+
+    let node = scalars.node(id).clone();
+    let data_type = scalars.data_type(id).clone();
+    let nullable = scalars.nullable(id);
+    let rewritten = match node {
+        ScalarNode::BinaryOp { op, left, right } => ScalarNode::BinaryOp {
+            op,
+            left: substitute(scalars, left, subst),
+            right: substitute(scalars, right, subst),
+        },
+        ScalarNode::UnaryOp { op, child } => ScalarNode::UnaryOp {
+            op,
+            child: substitute(scalars, child, subst),
+        },
+        ScalarNode::FunctionCall {
+            name,
+            args,
+            distinct,
+        } => ScalarNode::FunctionCall {
+            name,
+            args: args
+                .into_iter()
+                .map(|arg| substitute(scalars, arg, subst))
+                .collect(),
+            distinct,
+        },
+        ScalarNode::AggregateCall {
+            name,
+            args,
+            distinct,
+            order_by,
+        } => ScalarNode::AggregateCall {
+            name,
+            args: args
+                .into_iter()
+                .map(|arg| substitute(scalars, arg, subst))
+                .collect(),
+            distinct,
+            order_by: order_by
+                .into_iter()
+                .map(|mut key| {
+                    key.expr = substitute(scalars, key.expr, subst);
+                    key
+                })
+                .collect(),
+        },
+        ScalarNode::Cast { child, target } => ScalarNode::Cast {
+            child: substitute(scalars, child, subst),
+            target,
+        },
+        ScalarNode::IsNull { child, negated } => ScalarNode::IsNull {
+            child: substitute(scalars, child, subst),
+            negated,
+        },
+        ScalarNode::InList {
+            child,
+            list,
+            negated,
+        } => ScalarNode::InList {
+            child: substitute(scalars, child, subst),
+            list: list
+                .into_iter()
+                .map(|item| substitute(scalars, item, subst))
+                .collect(),
+            negated,
+        },
+        ScalarNode::Between {
+            child,
+            low,
+            high,
+            negated,
+        } => ScalarNode::Between {
+            child: substitute(scalars, child, subst),
+            low: substitute(scalars, low, subst),
+            high: substitute(scalars, high, subst),
+            negated,
+        },
+        ScalarNode::Like {
+            child,
+            pattern,
+            negated,
+        } => ScalarNode::Like {
+            child: substitute(scalars, child, subst),
+            pattern: substitute(scalars, pattern, subst),
+            negated,
+        },
+        ScalarNode::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => ScalarNode::Case {
+            operand: operand.map(|operand| substitute(scalars, operand, subst)),
+            when_then: when_then
+                .into_iter()
+                .map(|(when, then)| {
+                    (
+                        substitute(scalars, when, subst),
+                        substitute(scalars, then, subst),
+                    )
+                })
+                .collect(),
+            else_expr: else_expr.map(|else_expr| substitute(scalars, else_expr, subst)),
+        },
+        ScalarNode::IsTruthValue {
+            child,
+            value,
+            negated,
+        } => ScalarNode::IsTruthValue {
+            child: substitute(scalars, child, subst),
+            value,
+            negated,
+        },
+        ScalarNode::Nested(child) => ScalarNode::Nested(substitute(scalars, child, subst)),
+        ScalarNode::ColumnRef(_)
+        | ScalarNode::Literal(_)
+        | ScalarNode::LambdaParamRef { .. }
+        | ScalarNode::WindowCall { .. }
+        | ScalarNode::Lambda { .. }
+        | ScalarNode::LambdaFunction { .. } => return id,
+    };
+
+    scalars.intern(rewritten, data_type, nullable)
+}
+
+fn build_commons(
+    scalars: &mut ScalarArena,
+    factory: &mut ColumnRefFactory,
+    commons: &[ScalarId],
+) -> (Vec<ScalarProjectItem>, HashMap<ScalarId, ScalarId>) {
+    let mut items = Vec::with_capacity(commons.len());
+    let mut subst = HashMap::new();
+
+    for &common in commons {
+        let expr = common;
+        let data_type = scalars.data_type(common).clone();
+        let nullable = scalars.nullable(common);
+        let output_name = format!("__cse_{}", items.len());
+        let output_column_id =
+            factory.create(None, output_name.clone(), data_type.clone(), nullable);
+        scalars.remember_project_output_display(output_column_id, None, output_name.clone());
+        items.push(ScalarProjectItem {
+            expr,
+            output_name,
+            output_column_id,
+            expr_display: None,
+        });
+
+        let replacement =
+            scalars.intern(ScalarNode::ColumnRef(output_column_id), data_type, nullable);
+        subst.insert(common, replacement);
+    }
+
+    (items, subst)
+}
+
+fn rewrite_project(
+    node: &mut PhysicalPlanNode,
+    scalars: &mut ScalarArena,
+    factory: &mut ColumnRefFactory,
+) {
+    let Operator::PhysicalProject(project) = &node.op else {
+        return;
+    };
+    let roots = project
+        .items
+        .iter()
+        .map(|item| item.expr)
+        .collect::<Vec<_>>();
+    let commons = pick_commons(scalars, &roots);
+    if commons.is_empty() {
+        return;
+    }
+    if node.children.len() != 1 {
+        return;
+    }
+
+    let (prelude, subst) = build_commons(scalars, factory, &commons);
+    let Operator::PhysicalProject(project) = &mut node.op else {
+        unreachable!("checked project operator above");
+    };
+    for item in &mut project.items {
+        item.expr = substitute(scalars, item.expr, &subst);
+    }
+
+    let input_refs = collect_column_refs(scalars, &roots);
+    let child = node.children.remove(0);
+    let mut child_project_items = input_refs
+        .iter()
+        .map(|&(column_id, ref data_type, nullable)| {
+            let expr = scalars.intern(
+                ScalarNode::ColumnRef(column_id),
+                data_type.clone(),
+                nullable,
+            );
+            let child_column = child
+                .output_columns
+                .iter()
+                .find(|column| column.column_id == column_id);
+            ScalarProjectItem {
+                expr,
+                output_name: child_column
+                    .map(|column| column.name.clone())
+                    .unwrap_or_else(|| column_id.to_string()),
+                output_column_id: column_id,
+                expr_display: None,
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut child_project_output_columns = input_refs
+        .iter()
+        .map(|&(column_id, ref data_type, nullable)| {
+            let child_column = child
+                .output_columns
+                .iter()
+                .find(|column| column.column_id == column_id);
+            OutputColumn {
+                column_id,
+                name: child_column
+                    .map(|column| column.name.clone())
+                    .unwrap_or_else(|| column_id.to_string()),
+                data_type: child_column
+                    .map(|column| column.data_type.clone())
+                    .unwrap_or_else(|| data_type.clone()),
+                nullable: child_column
+                    .map(|column| column.nullable)
+                    .unwrap_or(nullable),
+                is_internal: child_column
+                    .map(|column| column.is_internal)
+                    .unwrap_or(false),
+            }
+        })
+        .collect::<Vec<_>>();
+    child_project_output_columns.extend(prelude.iter().map(|item| OutputColumn {
+        column_id: item.output_column_id,
+        name: item.output_name.clone(),
+        data_type: scalars.data_type(item.expr).clone(),
+        nullable: scalars.nullable(item.expr),
+        is_internal: true,
+    }));
+    child_project_items.extend(prelude);
+
+    let cse_project = PhysicalPlanNode {
+        op: Operator::PhysicalProject(crate::sql::optimizer::operator::ProjectOp {
+            items: child_project_items,
+            output_qualifier: None,
+        }),
+        stats: child.stats.clone(),
+        output_columns: child_project_output_columns,
+        execution_props: child.execution_props.clone(),
+        children: vec![child],
+        build_runtime_filters: vec![],
+        probe_runtime_filters: vec![],
+    };
+    node.children.push(cse_project);
+}
+
 #[cfg(test)]
 mod tests {
     use arrow::datatypes::DataType;
 
     use crate::sql::column_id::ColumnId;
     use crate::sql::common::BinOp;
+    use crate::sql::common::OutputColumn;
+    use crate::sql::optimizer::operator::{Operator, ProjectOp, ScalarProjectItem, ValuesOp};
+    use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, PlanExecutionProps};
     use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
+    use crate::sql::optimizer::statistics::Statistics;
 
     use super::pick_commons;
 
@@ -226,6 +605,25 @@ mod tests {
             DataType::Int64,
             true,
         )
+    }
+
+    fn project_item(expr: ScalarId, output_column_id: u32, output_name: &str) -> ScalarProjectItem {
+        ScalarProjectItem {
+            expr,
+            output_name: output_name.to_string(),
+            output_column_id: ColumnId(output_column_id),
+            expr_display: None,
+        }
+    }
+
+    fn output_column(column_id: u32, name: &str) -> OutputColumn {
+        OutputColumn {
+            column_id: ColumnId(column_id),
+            name: name.to_string(),
+            data_type: DataType::Int64,
+            nullable: true,
+            is_internal: false,
+        }
     }
 
     #[test]
@@ -314,6 +712,271 @@ mod tests {
         assert_eq!(
             pick_commons(&arena, &[c_plus_d, a_plus_b, c_plus_d, a_plus_b]),
             vec![c_plus_d, a_plus_b]
+        );
+    }
+
+    #[test]
+    fn substitute_replaces_common_and_reinterns() {
+        let mut arena = ScalarArena::new();
+        let a = col(&mut arena, 1);
+        let b = col(&mut arena, 2);
+        let a_plus_b = add(&mut arena, a, b);
+        let cse_ref = arena.intern(ScalarNode::ColumnRef(ColumnId(99)), DataType::Int64, true);
+        let mut subst = std::collections::HashMap::new();
+        subst.insert(a_plus_b, cse_ref);
+
+        let root = add(&mut arena, a_plus_b, a);
+        let rewritten = super::substitute(&mut arena, root, &subst);
+
+        match arena.node(rewritten) {
+            ScalarNode::BinaryOp { left, right, .. } => {
+                assert!(matches!(
+                    arena.node(*left),
+                    ScalarNode::ColumnRef(ColumnId(99))
+                ));
+                assert!(matches!(
+                    arena.node(*right),
+                    ScalarNode::ColumnRef(ColumnId(1))
+                ));
+            }
+            other => panic!("unexpected node: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_commons_keeps_prelude_items_independent() {
+        let mut arena = ScalarArena::new();
+        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+        let a = col(&mut arena, 1);
+        let b = col(&mut arena, 2);
+        let a_plus_b = add(&mut arena, a, b);
+        let doubled = add(&mut arena, a_plus_b, a_plus_b);
+
+        let (items, subst) = super::build_commons(&mut arena, &mut factory, &[a_plus_b, doubled]);
+
+        assert_eq!(items.len(), 2);
+        let first_cse = items[0].output_column_id;
+        assert!(matches!(
+            arena.node(items[1].expr),
+            ScalarNode::BinaryOp { left, right, .. }
+                if !matches!(arena.node(*left), ScalarNode::ColumnRef(column_id) if *column_id == first_cse)
+                    && !matches!(arena.node(*right), ScalarNode::ColumnRef(column_id) if *column_id == first_cse)
+        ));
+        assert!(matches!(
+            arena.node(*subst.get(&doubled).expect("doubled replacement")),
+            ScalarNode::ColumnRef(column_id) if *column_id == items[1].output_column_id
+        ));
+    }
+
+    #[test]
+    fn collect_column_refs_includes_lambda_captures() {
+        let mut arena = ScalarArena::new();
+        let captured = col(&mut arena, 1);
+        let lambda_param = arena.intern(
+            ScalarNode::LambdaParamRef {
+                name: "x".to_string(),
+                slot_id: 7,
+            },
+            DataType::Int64,
+            true,
+        );
+        let body = add(&mut arena, lambda_param, captured);
+        let lambda = arena.intern(
+            ScalarNode::Lambda {
+                params: vec!["x".to_string()],
+                body,
+            },
+            DataType::Int64,
+            true,
+        );
+
+        let refs = super::collect_column_refs(&arena, &[lambda]);
+
+        assert_eq!(
+            refs.into_iter()
+                .map(|(column_id, _, _)| column_id)
+                .collect::<Vec<_>>(),
+            vec![ColumnId(1)]
+        );
+    }
+
+    #[test]
+    fn rewrite_project_factors_repeated_subexpr() {
+        let mut arena = ScalarArena::new();
+        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+        let a = col(&mut arena, 101);
+        let b = col(&mut arena, 102);
+        let a_plus_b = add(&mut arena, a, b);
+        let doubled = add(&mut arena, a_plus_b, a_plus_b);
+        let child = PhysicalPlanNode {
+            op: Operator::PhysicalValues(ValuesOp {
+                rows: vec![],
+                columns: vec![output_column(101, "a"), output_column(102, "b")],
+            }),
+            children: vec![],
+            stats: Statistics {
+                output_row_count: 42.0,
+                ..Statistics::default()
+            },
+            output_columns: vec![
+                output_column(101, "a"),
+                output_column(102, "b"),
+                OutputColumn {
+                    is_internal: true,
+                    ..output_column(199, "__stale_internal")
+                },
+            ],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+        let mut node = PhysicalPlanNode {
+            op: Operator::PhysicalProject(ProjectOp {
+                items: vec![
+                    project_item(a_plus_b, 110, "x"),
+                    project_item(doubled, 111, "y"),
+                ],
+                output_qualifier: None,
+            }),
+            children: vec![child],
+            stats: Statistics {
+                output_row_count: 7.0,
+                ..Statistics::default()
+            },
+            output_columns: vec![output_column(110, "x"), output_column(111, "y")],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+
+        super::rewrite_node(&mut node, &mut arena, &mut factory);
+
+        let Operator::PhysicalProject(project) = &node.op else {
+            panic!("expected physical project");
+        };
+        assert_eq!(project.items.len(), 2);
+        assert_eq!(
+            project
+                .items
+                .iter()
+                .map(|item| item.output_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["x", "y"]
+        );
+        let Operator::PhysicalProject(cse_project) = &node.children[0].op else {
+            panic!("expected inserted CSE project");
+        };
+        assert_eq!(cse_project.items[2].output_name, "__cse_0");
+        let common_col = cse_project.items[2].output_column_id;
+        assert!(matches!(
+            arena.node(cse_project.items[2].expr),
+            ScalarNode::BinaryOp { .. }
+        ));
+        assert!(matches!(
+            arena.node(project.items[0].expr),
+            ScalarNode::ColumnRef(column_id) if *column_id == common_col
+        ));
+        assert!(matches!(
+            arena.node(project.items[1].expr),
+            ScalarNode::BinaryOp { left, right, .. }
+                if matches!(arena.node(*left), ScalarNode::ColumnRef(column_id) if *column_id == common_col)
+                    && matches!(arena.node(*right), ScalarNode::ColumnRef(column_id) if *column_id == common_col)
+        ));
+        assert_eq!(
+            node.output_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["x", "y"],
+            "Project node output_columns remains the visible result contract"
+        );
+        assert_eq!(
+            node.children[0]
+                .output_columns
+                .iter()
+                .map(|column| (column.name.as_str(), column.is_internal))
+                .collect::<Vec<_>>(),
+            vec![("a", false), ("b", false), ("__cse_0", true)]
+        );
+        assert_eq!(node.children[0].stats.output_row_count, 42.0);
+    }
+
+    #[test]
+    fn rewrite_project_preserves_lambda_capture_input() {
+        let mut arena = ScalarArena::new();
+        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+        let a = col(&mut arena, 101);
+        let b = col(&mut arena, 102);
+        let c = col(&mut arena, 103);
+        let b_plus_c = add(&mut arena, b, c);
+        let doubled = add(&mut arena, b_plus_c, b_plus_c);
+        let lambda_param = arena.intern(
+            ScalarNode::LambdaParamRef {
+                name: "x".to_string(),
+                slot_id: 7,
+            },
+            DataType::Int64,
+            true,
+        );
+        let lambda_body = add(&mut arena, lambda_param, a);
+        let lambda = arena.intern(
+            ScalarNode::Lambda {
+                params: vec!["x".to_string()],
+                body: lambda_body,
+            },
+            DataType::Int64,
+            true,
+        );
+        let child = PhysicalPlanNode {
+            op: Operator::PhysicalValues(ValuesOp {
+                rows: vec![],
+                columns: vec![
+                    output_column(101, "a"),
+                    output_column(102, "b"),
+                    output_column(103, "c"),
+                ],
+            }),
+            children: vec![],
+            stats: Statistics::default(),
+            output_columns: vec![
+                output_column(101, "a"),
+                output_column(102, "b"),
+                output_column(103, "c"),
+            ],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+        let mut node = PhysicalPlanNode {
+            op: Operator::PhysicalProject(ProjectOp {
+                items: vec![
+                    project_item(b_plus_c, 110, "x"),
+                    project_item(doubled, 111, "y"),
+                    project_item(lambda, 112, "lambda_capture"),
+                ],
+                output_qualifier: None,
+            }),
+            children: vec![child],
+            stats: Statistics::default(),
+            output_columns: vec![
+                output_column(110, "x"),
+                output_column(111, "y"),
+                output_column(112, "lambda_capture"),
+            ],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+
+        super::rewrite_node(&mut node, &mut arena, &mut factory);
+
+        assert_eq!(
+            node.children[0]
+                .output_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "c", "a", "__cse_0"]
         );
     }
 }

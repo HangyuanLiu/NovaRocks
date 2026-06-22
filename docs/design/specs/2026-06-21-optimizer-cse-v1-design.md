@@ -83,7 +83,7 @@ count: HashMap<ScalarId, usize>
 candidates = { id | count[id] ≥ 2 且 eligible(id) }
 ```
 
-- **nested common 自动正确**：内层公共子表达式的 count 天然 ≥ 外层，二者都会入选并各自 mint 列，引用关系靠 id 结构成立——无需 StarRocks 的 common-inside-common 特判。
+- **nested common 检测自动正确**：内层公共子表达式的 count 天然 ≥ 外层，二者可各自入选并 mint 列，无需 StarRocks 的 common-inside-common 特判。受 standalone `Project` 的 child-scope 编译约束，v1 的 CSE producer items 彼此独立，外层 producer 不依赖内层 `__cse_` 输出；消费者表达式仍会引用对应公共列。
 - **交换律免费**：intern 时已规范化。
 - **`eligible(id)` 排除**：
   - 叶子 `ColumnRef`、`Literal`（复用无意义）；
@@ -99,17 +99,18 @@ candidates = { id | count[id] ≥ 2 且 eligible(id) }
 
 | 算子 | 承载 Project | 说明 |
 |---|---|---|
-| 投影列表 | **本 Project** | 公共项作为靠前 item 算出，后续 item 改引用其 `ColumnId`；working-chunk 现成支持顺序求值+引用 |
+| 投影列表 | **下方 CSE Project** | 当前 `Project` 的表达式会在 codegen 中按 child scope 编译，不能依赖同一 `Project` 内靠前 item；因此在当前 `Project` 与其孩子之间插入一个只负责公共列物化的 `Project`，当前 `Project` 改引用该 child 输出列 |
 | Filter / Aggregate / Sort / Window | **下方 Project** | 孩子已是 Project 则复用（追加输出列），否则在算子与孩子之间插入一个新 Project；本算子表达式改引用 |
 | join 条件的**单侧**子表达式 | 推到对应那一侧孩子，按上一行处理 | |
 | join 条件的**跨两侧**子表达式 | —（v1 不做） | 见 §3 例外、§9 v2 |
 
-- **插的 Project 紧贴消费方**，无需跨层透传；输出列 = 孩子输出列 + 新公共列。
-- **插入的 Project 属性安全**：Project 分布保持、序保持，故 `output_property` = 孩子的，`stats` = 孩子的，`output_columns` = 孩子 + 新列。
+- **投影列表专用 CSE Project**：透传列以当前投影表达式实际引用的 leaf `ColumnRef` 为准，再追加新公共列，避免盲目复制不代表真实 child scope 的 `output_columns` 元数据。
+- **通用下插 Project**：Filter / Aggregate / Sort / Window / join 单侧改写需要保留完整 child 输出 scope，输出列 = 孩子输出列 + 新公共列。
+- **插入的 Project 属性安全**：Project 分布保持、序保持，故 `output_property` = 孩子的，`stats` = 孩子的。
 - **优先复用相邻已有 Project**，避免 Project 增殖。
 
 ### 4.4 pass 性质
-本 pass 不是纯注解：对投影列表是**就地改写本 Project**，对 Filter/Agg/Sort/Window/join 单侧是**插入或复用 Project**（拓扑改动，但 Project 属性安全）。提供辅助 `insert_or_reuse_project_below(parent_edge, commons) -> ()` 收口插入/复用逻辑。
+本 pass 不是纯注解：对投影列表、Filter/Agg/Sort/Window/join 单侧均是**插入或复用 Project**（拓扑改动，但 Project 属性安全），消费方表达式改引用 CSE Project 产出的内部列。提供辅助 `insert_or_reuse_project_below(parent_edge, commons) -> ()` 收口插入/复用逻辑。
 
 ---
 
@@ -119,7 +120,7 @@ CSE 产出的是**标准 Project 节点 / Project 列**：
 
 - codegen 早已 lower Project 节点（`build_project_node`，`nodes.rs:304`）→ **零 codegen 改动**。
 - exec 早已跑 project working-chunk（`project_processor.rs:250-386`）→ **零 exec 改动、无新算子、无新 thrift 字段**。
-- 投影列表内 CSE 依赖「working-chunk 顺序求值 + 后项按 slot 读前项」——该行为现成（`project_processor.rs:268-386`）。
+- 投影列表内 CSE 也产出标准的下方 `Project` 节点。注意 standalone `lower_project` 当前按 child scope 编译每个 item，同一 `Project` 内前项不能作为后项输入；因此 CSE producer Project 自身不能包含同层 item 依赖。
 
 这是「Project 物化模型 + v1 不做跨侧 join」的直接红利：v1 基本是**纯优化器改动**，实现风险锁在优化器内部。
 
@@ -147,6 +148,7 @@ CSE 产出的是**标准 Project 节点 / Project 列**：
 
 ## 8. 风险与唯一须验证项
 
+- **【已验证，Task 3】同一 `Project` 内前项不能作为后项输入**。`lower_project` 按 child scope 编译每个 item；若把 `__cse_0` 放在同一 `Project` 的靠前 item，后续 item 会在 id binding 校验中失败。因此 projection-list CSE 必须插入下方 CSE Project，且 CSE producer items 之间不能互相引用。
 - **【须验证，低风险】插的 Project 上 fuse 的 conjunct 必须对 Project 的输出 working-chunk 求值（而非输入）**。该语义由现有「Filter-over-Project」计划形状的正确性背书——该形状今天就走「filter conjunct 融进下方 Project 节点」这条路且测试通过，故新插的 Project 与现状同路。实现首步显式验证并加回归用例。
 - **Project 增殖**：靠「优先复用相邻已有 Project」缓解；仅在 CSE 实际触发时插入。
 - **plan golden 漂移**：批量重录，人工审「只多了 compute-once 列/Project」。
@@ -186,4 +188,4 @@ CSE 产出的是**标准 Project 节点 / Project 列**：
 
 ## 12. 执行交接
 
-本 spec 经评审通过后，用 writing-plans 写 bite-sized 实现计划（含 TDD 步骤）。建议首步切片：检测器（id 频次 + eligible）+ 投影列表内 CSE（不插节点，最小端到端，验证 working-chunk 顺序语义）→ 再扩 Filter/Agg/Sort/Window 的 Project 插入/复用 → join 单侧 → gating + EXPLAIN 断言。
+本 spec 经评审通过后，用 writing-plans 写 bite-sized 实现计划（含 TDD 步骤）。建议首步切片：检测器（id 频次 + eligible）+ 投影列表内 CSE（插入下方 CSE Project，验证 codegen/id binding 与结果不泄漏内部列）→ 再扩 Filter/Agg/Sort/Window 的 Project 插入/复用 → join 单侧 → gating + EXPLAIN 断言。
