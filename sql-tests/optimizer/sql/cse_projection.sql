@@ -10,8 +10,28 @@ SELECT (a + b) AS x, (a + b) + a AS y
 FROM ${case_db}.cse_projection_t
 ORDER BY a;
 
--- @explain_contains=__cse_0
--- @result_not_contains=__cse_
-SELECT (a + b) AS x, (a + b) + a AS y
+-- @skip_result_check=true
+-- @result_contains=__cse_
+EXPLAIN VERBOSE SELECT (a + b) AS x, (a + b) + a AS y
 FROM ${case_db}.cse_projection_t
 ORDER BY a;
+
+SET enable_common_subexpr_reuse = false;
+
+-- @skip_result_check=true
+-- @result_not_contains=__cse_
+EXPLAIN VERBOSE SELECT (a + b) AS x, (a + b) + a AS y
+FROM ${case_db}.cse_projection_t
+ORDER BY a;
+
+SET enable_common_subexpr_reuse = true;
+
+SET disable_optimizer_rules = 'CommonSubexpressionReuse';
+
+-- @skip_result_check=true
+-- @result_not_contains=__cse_
+EXPLAIN VERBOSE SELECT (a + b) AS x, (a + b) + a AS y
+FROM ${case_db}.cse_projection_t
+ORDER BY a;
+
+SET disable_optimizer_rules = '';

@@ -832,9 +832,8 @@ fn parse_set_boolean(query: &str) -> Option<(String, bool)> {
     Some((name, enabled))
 }
 
-/// Parse `SET <name> = '<comma-list>'`. The value MUST be single-quoted
-/// (matching mysql session-variable convention); inner items are
-/// comma-separated, whitespace-trimmed, and empty items are dropped.
+/// Parse `SET <name> = '<comma-list>'` or `SET <name> = <comma-list>`.
+/// Inner items are comma-separated, whitespace-trimmed, and empty items are dropped.
 /// Returns the list (possibly empty) when the statement matches the
 /// expected name, else None.
 ///
@@ -863,7 +862,8 @@ fn parse_set_string_csv(query: &str, expected_name: &str) -> Option<Vec<String>>
     let value_str = rest.strip_prefix('=')?.trim();
     let inner = value_str
         .strip_prefix('\'')
-        .and_then(|s| s.strip_suffix('\''))?;
+        .and_then(|s| s.strip_suffix('\''))
+        .unwrap_or(value_str);
 
     let items: Vec<String> = inner
         .split(',')
@@ -1020,6 +1020,9 @@ async fn execute_statement_text(
                 shim.optimizer_settings.enable_table_prune_on_update = enabled
             }
             "enable_eliminate_agg" => shim.optimizer_settings.enable_eliminate_agg = enabled,
+            "enable_common_subexpr_reuse" => {
+                shim.optimizer_settings.enable_common_subexpr_reuse = Some(enabled)
+            }
             // Tri-state Option<bool> field: store Some(enabled) so an explicit
             // SET is preserved as an override; None elsewhere means "default".
             "enable_materialized_view_rewrite" => {
@@ -2017,6 +2020,17 @@ mod tests {
                 "disable_optimizer_rules"
             ),
             Some(vec!["JoinCommutativity".to_string()]),
+        );
+    }
+
+    #[test]
+    fn parse_set_string_csv_accepts_unquoted_value() {
+        assert_eq!(
+            parse_set_string_csv(
+                "SET disable_optimizer_rules = CommonSubexpressionReuse",
+                "disable_optimizer_rules"
+            ),
+            Some(vec!["CommonSubexpressionReuse".to_string()]),
         );
     }
 

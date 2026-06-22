@@ -14,6 +14,8 @@ pub(crate) struct SessionOptimizerSettings {
     pub enable_table_prune_on_update: bool,
     pub enable_eliminate_agg: bool,
     pub disabled_rules: Vec<String>,
+    /// Session override for common-subexpression reuse (None = default true).
+    pub enable_common_subexpr_reuse: Option<bool>,
     /// Session override for the RF build-side maximum size gate (bytes).
     /// `None` means use the StarRocks default (64 MiB).
     pub rf_build_max_bytes: Option<u64>,
@@ -148,6 +150,9 @@ impl OptimizerOptions {
         for rule_name in &settings.disabled_rules {
             opts.disable(rule_name);
         }
+        if settings.enable_common_subexpr_reuse == Some(false) {
+            opts.disable(crate::sql::optimizer::cse_pass::CSE_RULE);
+        }
         if let Some(v) = settings.rf_build_max_bytes {
             opts.rf_build_max_bytes = v;
         }
@@ -229,6 +234,29 @@ mod tests {
         let opts = OptimizerOptions::from_session(&settings);
         assert!(opts.is_enabled("JoinCommutativity"));
         assert!(opts.is_enabled("AnyRuleAtAll"));
+    }
+
+    #[test]
+    fn disabling_cse_via_session_disables_rule() {
+        let settings = SessionOptimizerSettings {
+            enable_common_subexpr_reuse: Some(false),
+            ..Default::default()
+        };
+        let opts = OptimizerOptions::from_session(&settings);
+        assert!(!opts.is_enabled(crate::sql::optimizer::cse_pass::CSE_RULE));
+    }
+
+    #[test]
+    fn cse_session_default_and_true_enable_rule() {
+        let default_opts = OptimizerOptions::from_session(&SessionOptimizerSettings::default());
+        assert!(default_opts.is_enabled(crate::sql::optimizer::cse_pass::CSE_RULE));
+
+        let settings = SessionOptimizerSettings {
+            enable_common_subexpr_reuse: Some(true),
+            ..Default::default()
+        };
+        let opts = OptimizerOptions::from_session(&settings);
+        assert!(opts.is_enabled(crate::sql::optimizer::cse_pass::CSE_RULE));
     }
 
     #[test]

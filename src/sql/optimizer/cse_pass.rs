@@ -472,6 +472,158 @@ fn output_column_for_project_item(scalars: &ScalarArena, item: &ScalarProjectIte
     }
 }
 
+fn available_output_ids(node: &PhysicalPlanNode) -> HashSet<ColumnId> {
+    match &node.op {
+        Operator::PhysicalScan(scan) => {
+            let required = scan
+                .required_columns
+                .as_ref()
+                .map(|columns| columns.iter().map(String::as_str).collect::<HashSet<_>>());
+            scan.columns
+                .iter()
+                .filter(|column| match &required {
+                    Some(required) => required.contains(column.name.as_str()),
+                    None => true,
+                })
+                .map(|column| column.column_id)
+                .collect()
+        }
+        Operator::PhysicalValues(values) => values
+            .columns
+            .iter()
+            .map(|column| column.column_id)
+            .collect(),
+        Operator::PhysicalGenerateSeries(generate_series) => {
+            HashSet::from([generate_series.output_column_id])
+        }
+        Operator::PhysicalProject(project) => project
+            .items
+            .iter()
+            .map(|item| item.output_column_id)
+            .collect(),
+        Operator::PhysicalFilter(_)
+        | Operator::PhysicalSort(_)
+        | Operator::PhysicalLimit(_)
+        | Operator::PhysicalTopN(_)
+        | Operator::PhysicalDistribution(_)
+        | Operator::PhysicalAssertOneRow(_) => node
+            .children
+            .first()
+            .map(available_output_ids)
+            .unwrap_or_default(),
+        Operator::PhysicalHashAggregate(aggregate) => aggregate
+            .output_columns
+            .iter()
+            .map(|column| column.column_id)
+            .collect(),
+        Operator::PhysicalWindow(window) => window
+            .output_columns
+            .iter()
+            .map(|column| column.column_id)
+            .collect(),
+        Operator::PhysicalHashJoin(_) | Operator::PhysicalNestLoopJoin(_) => {
+            let child_ids = node
+                .children
+                .iter()
+                .flat_map(available_output_ids)
+                .collect::<HashSet<_>>();
+            let declared = node
+                .output_columns
+                .iter()
+                .map(|column| column.column_id)
+                .filter(|column_id| child_ids.contains(column_id))
+                .collect::<HashSet<_>>();
+            if declared.is_empty() {
+                child_ids
+            } else {
+                declared
+            }
+        }
+        Operator::PhysicalTableFunction(table_function) => {
+            let mut ids = node
+                .children
+                .first()
+                .map(available_output_ids)
+                .unwrap_or_default();
+            ids.extend(
+                table_function
+                    .output_columns
+                    .iter()
+                    .map(|column| column.column_id),
+            );
+            ids
+        }
+        Operator::PhysicalRepeat(repeat) => {
+            let mut ids = node
+                .children
+                .first()
+                .map(available_output_ids)
+                .unwrap_or_default();
+            ids.extend(
+                repeat
+                    .grouping_fn_ids
+                    .iter()
+                    .map(|(_, column_id)| *column_id),
+            );
+            ids
+        }
+        Operator::PhysicalDecode(decode) => decode
+            .output_columns
+            .iter()
+            .map(|column| column.column_id)
+            .collect(),
+        Operator::PhysicalUnion(union) => union
+            .output_columns
+            .iter()
+            .map(|column| column.column_id)
+            .collect(),
+        Operator::PhysicalIntersect(intersect) => intersect
+            .output_columns
+            .iter()
+            .map(|column| column.column_id)
+            .collect(),
+        Operator::PhysicalExcept(except) => except
+            .output_columns
+            .iter()
+            .map(|column| column.column_id)
+            .collect(),
+        Operator::PhysicalCTEProduce(produce) => {
+            if produce.output_columns.is_empty() {
+                node.children
+                    .first()
+                    .map(available_output_ids)
+                    .unwrap_or_default()
+            } else {
+                produce
+                    .output_columns
+                    .iter()
+                    .map(|column| column.column_id)
+                    .collect()
+            }
+        }
+        Operator::PhysicalCTEConsume(consume) => consume
+            .output_columns
+            .iter()
+            .map(|column| column.column_id)
+            .collect(),
+        Operator::PhysicalCTEAnchor(_) => node
+            .children
+            .get(1)
+            .map(available_output_ids)
+            .unwrap_or_default(),
+        Operator::PhysicalAggregateStateMerge(merge) => merge
+            .output_columns
+            .iter()
+            .map(|column| column.column_id)
+            .collect(),
+        _ => node
+            .output_columns
+            .iter()
+            .map(|column| column.column_id)
+            .collect(),
+    }
+}
+
 fn prelude_binds_to_outputs(
     scalars: &ScalarArena,
     prelude: &[ScalarProjectItem],
@@ -493,8 +645,14 @@ fn wrap_project_around_child(
     scalars: &mut ScalarArena,
 ) {
     let original = child.clone();
-    let mut items = Vec::with_capacity(original.output_columns.len() + prelude.len());
-    for column in &original.output_columns {
+    let available = available_output_ids(&original);
+    let passthrough_columns = original
+        .output_columns
+        .iter()
+        .filter(|column| available.contains(&column.column_id))
+        .collect::<Vec<_>>();
+    let mut items = Vec::with_capacity(passthrough_columns.len() + prelude.len());
+    for column in &passthrough_columns {
         let expr = scalars.intern(
             ScalarNode::ColumnRef(column.column_id),
             column.data_type.clone(),
@@ -509,7 +667,7 @@ fn wrap_project_around_child(
     }
     items.extend(prelude.iter().cloned());
 
-    let mut output_columns = original.output_columns.clone();
+    let mut output_columns = passthrough_columns.into_iter().cloned().collect::<Vec<_>>();
     output_columns.extend(
         prelude
             .iter()
@@ -1473,6 +1631,65 @@ mod tests {
         );
         assert_eq!(parent.children[0].children.len(), 1);
         assert_eq!(parent.children[0].stats.output_row_count, 42.0);
+    }
+
+    #[test]
+    fn insert_or_reuse_project_below_drops_stale_passthrough_metadata() {
+        let mut arena = ScalarArena::new();
+        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+        let a = col(&mut arena, 101);
+        let b = col(&mut arena, 102);
+        let a_plus_b = add(&mut arena, a, b);
+        let (prelude, _) = super::build_commons(&mut arena, &mut factory, &[a_plus_b]);
+        let values = PhysicalPlanNode {
+            op: Operator::PhysicalValues(ValuesOp {
+                rows: vec![],
+                columns: vec![output_column(101, "a"), output_column(102, "b")],
+            }),
+            children: vec![],
+            stats: Statistics::default(),
+            output_columns: vec![output_column(101, "a"), output_column(102, "b")],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+        let mut stale_filter = PhysicalPlanNode {
+            op: Operator::PhysicalFilter(FilterOp {
+                predicate: gt(&mut arena, a, b),
+            }),
+            children: vec![values],
+            stats: Statistics::default(),
+            output_columns: vec![
+                output_column(101, "a"),
+                output_column(102, "b"),
+                output_column(999, "stale_not_in_child_scope"),
+            ],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+
+        super::insert_or_reuse_project_below(&mut stale_filter, prelude, &mut arena);
+
+        let Operator::PhysicalProject(project) = &stale_filter.op else {
+            panic!("expected inserted physical project");
+        };
+        assert_eq!(
+            project
+                .items
+                .iter()
+                .map(|item| item.output_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "__cse_0"]
+        );
+        assert_eq!(
+            stale_filter
+                .output_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "__cse_0"]
+        );
     }
 
     #[test]
