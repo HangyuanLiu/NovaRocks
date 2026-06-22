@@ -23,6 +23,7 @@ pub(crate) mod scalar_expr;
 pub(crate) mod search;
 pub(crate) mod statistics;
 pub(crate) mod stats;
+pub(crate) mod stats_input;
 pub(crate) mod topn_proof;
 
 pub(crate) use memo::Memo;
