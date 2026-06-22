@@ -59,6 +59,7 @@ pub(crate) mod name_resolve;
 pub(crate) mod parquet;
 pub(crate) mod procedure;
 pub(crate) mod query_prep;
+mod query_stats;
 pub(crate) mod sql_expr;
 pub(crate) mod starrocks_table_ctas;
 pub(crate) mod statement;
