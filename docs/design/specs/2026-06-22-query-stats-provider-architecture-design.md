@@ -56,15 +56,16 @@ Analyzer / Planner
   |
   | produces logical plan with table identities
   v
+Planner Optimizer Bridge
+  |
+  | produces owned OptExpr with unbound ScanOp.stats_ref
+  v
 QueryStatsCollector
   |
-  | asks connector/catalog stats providers for table stats
+  | single mutable OptExpr traversal:
+  |   allocate StatsRef, write ScanOp.stats_ref, ask provider
   v
-QueryStatsSnapshot
-  |
-  | keyed by optimizer-native StatsRef
-  v
-Optimizer ScanOp
+QueryStatsSnapshot + bound OptExpr
   |
   | stats_ref -> QueryStatsSnapshot lookup
   v
@@ -81,13 +82,18 @@ derive_scan_statistics
 pub(crate) struct StatsRef(u32);
 ```
 
-由 planner bridge 在构造 `ScanOp` 时分配。每个 logical scan leaf 一个 `StatsRef`。即使两个 scan 引用同一张表,
-也允许共享同一个底层 table stats value, 但 scan 自身仍持有明确的 `StatsRef`。这样可以支持:
+由 `QueryStatsCollector` 在 optimizer bridge 生成 `OptExpr` 之后分配。collector 对同一棵 owned `OptExpr`
+做一次 mutable traversal, 遇到 `ScanOp` 时当场分配 `StatsRef`, 写入 `scan.stats_ref`, 并把 provider 返回的
+`BaseTableStatistics` 插入 `QueryStatsSnapshot`。每个 optimizer scan leaf 一个 `StatsRef`。即使两个 scan
+引用同一张表, 也允许共享同一个底层 table stats value, 但 scan 自身仍持有明确的 `StatsRef`。这样可以支持:
 
 - self join 和 alias 不冲突;
 - time-travel / branch scan 与 current snapshot scan 不混淆;
 - MV candidate target scan 和 query base scan 不靠表名碰撞检测;
 - 后续 connector predicate/projection pushdown 后的 scan-specific stats。
+
+`ScanOp.stats_ref` 在 bridge 刚生成时应是 `None`, 只有 collector 绑定后才变成 `Some(StatsRef)`。
+`optimize()` 入口必须 validate 所有 scan 都已绑定, 防止入口忘记调用 collector 时静默走 fallback。
 
 ### 4.2 QueryStatsSnapshot
 
@@ -158,7 +164,7 @@ pub(crate) enum StatValue<T> {
 - `NoDataFiles`
 - `ManifestMissingRowCount`
 - `StatsFileMissing`
-- `ConnectorUnsupported`
+- `ConnectorUnsupported(String)`
 - `CatalogLoadError`
 - `ColumnNotReported`
 
@@ -196,22 +202,22 @@ pub(crate) struct TableStatsRequest {
 
 ## 6. QueryStatsCollector
 
-新增 `QueryStatsCollector`, 由 engine 在 analyze/plan 之后、optimizer 之前调用。
+新增 `QueryStatsCollector`, 由 engine 在 logical plan 转为 optimizer `OptExpr` 之后、`optimize()` 之前调用。
 
 职责:
 
-1. 遍历 logical plan scan leaves, 为每个 scan 分配 `StatsRef`。
-2. 根据 scan source 构造 `TableStatsRequest`。
-3. 调用对应 provider, 生成 `BaseTableStatistics`。
-4. 对 provider error 做 warn-and-missing, 不让 advisory stats 阻塞查询。
-5. 把 `StatsRef` 写回 optimizer bridge 构造的 `ScanOp`。
+1. 遍历 owned `OptExpr` scan leaves, 为每个 scan 分配 `StatsRef`。
+2. 把 `StatsRef` 写入 `ScanOp.stats_ref`。
+3. 根据 scan source 构造 `TableStatsRequest`。
+4. 调用对应 provider, 生成 `BaseTableStatistics`。
+5. 对 provider error 做 warn-and-missing, 不让 advisory stats 阻塞查询。
 
 推荐位置:
 
 - stats provider trait: `src/connector/backend.rs` 或 `src/connector/stats.rs`
 - collector: `src/engine/query_stats.rs`
 - optimizer native types: `src/sql/optimizer/statistics.rs` 或拆到 `src/sql/optimizer/stats_input.rs`
-- planner bridge wiring: `src/sql/planner/optimizer_bridge/plan.rs`
+- planner bridge: 只负责生成 `ScanOp.stats_ref = None`, 不负责 catalog stats 和 ref 分配
 
 collector 需要同时服务以下入口:
 
@@ -225,19 +231,26 @@ collector 需要同时服务以下入口:
 
 ### 6.1 StatsRef wiring
 
-`LogicalPlanNode` 不应长期携带 optimizer-only 字段。`StatsRef` 的分配推荐放在 planner optimizer bridge:
+`LogicalPlanNode` 不应长期携带 optimizer-only 字段。`StatsRef` 也不应靠 logical plan 与 optimizer bridge
+的两次独立遍历来对齐, 因为 scan ordinal 一旦和 bridge traversal 顺序分叉就会 silent 错配统计。
 
-1. `QueryStatsCollector` 遍历 planner logical plan, 生成一个 `QueryStatsPlan`:
-   - `snapshot: QueryStatsSnapshot`
-   - `scan_refs: HashMap<PlanScanOrdinal, StatsRef>`
-2. `PlanScanOrdinal` 是 collector 和 optimizer bridge 在同一棵 immutable logical plan 上按 DFS scan 顺序得到的
-   稳定序号。它只在一次转换调用内有效, 不写入持久结构。
-3. `try_logical_plan_to_opt_expr` 接收 `scan_refs`, 在转换每个 scan leaf 时写入 `ScanOp.stats_ref`。
-4. 如果 bridge 发现 scan ordinal 不存在, 直接返回 bridge error; 这说明 collector 和 bridge 看到的 plan
-   不一致, 不能 silently fallback。
+目标 wiring 是:
 
-这个设计避免把 optimizer stats key 写进 `LogicalPlanNode`, 也避免在 `ScanOp` 构造后再做二次 mutation。
-如果未来 planner 侧已有 stable `PlanNodeId`, 可以用它替代 `PlanScanOrdinal`, 但不能退回表名或 alias key。
+1. `try_logical_plan_to_opt_expr` 保持单一职责, 只把 logical plan 转成 owned `OptExpr`。
+2. `ScanOp` 增加 `stats_ref: Option<StatsRef>`, bridge 构造 scan 时填 `None`。
+3. `QueryStatsCollector::collect(&mut opt_expr)` 对 `OptExpr` 做单次 mutable traversal:
+   - 为当前 scan 分配 `StatsRef`;
+   - 写入 `scan.stats_ref = Some(stats_ref)`;
+   - 构造 `TableStatsRequest`;
+   - 调用 provider 并写入 `QueryStatsSnapshot`。
+4. collector 完成后满足强不变式: `QueryStatsSnapshot` 的 key 集合等于 `OptExpr` 内所有 bound
+   `ScanOp.stats_ref`。
+5. `optimize()` 入口 validates all scans bound。未绑定是入口 bug, 应直接报错或 debug assert, 不走 row-count
+   fallback。
+
+MV rewrite candidate target scan 不是输入 `OptExpr` 的原始 scan, 仍需在 MV candidate preparation 中单独分配
+`StatsRef` 并写入 snapshot; rule 注入 MV scan 时必须使用 candidate 自己的 stats ref。缺 target stats 时,
+candidate 使用独立 `Missing` stats ref 或放弃 rewrite, 不能借用原 base scan 的 stats ref。
 
 ## 7. Iceberg 首个 provider
 
@@ -253,8 +266,10 @@ Iceberg 是第一阶段必须打通的真实来源, 因为当前代码已经有�
 1. 普通 SELECT 不再依赖 `SchemaOnly` table def 的 empty files。
 2. collector 对 Iceberg table 单独 load metadata/manifests 来构造 stats snapshot。
 3. EXPLAIN 和普通 SELECT 用同一份 collector 结果。
-4. `build_table_statistics_with_ndv` 可保留作为 Iceberg provider 内部 helper, 但输出类型改为带
+4. `build_table_statistics_with_ndv` 可保留作为 Iceberg provider 内部 helper, 但 provider 输出类型改为带
    `StatValue`/missing/source 语义。
+5. provider 必须复用 `IcebergCatalogEntry` 的 data-file cache 或 collector 内 per-query cache, 避免普通
+   SELECT 每次重复 full manifest extraction。
 
 对于空表:
 
@@ -286,6 +301,8 @@ pub(crate) enum DistinctValueCount {
 - join key NDV、group expr NDV、predicate equality selectivity 都显式处理 Missing。
 - 默认 NDV 只能在公式层作为 `Fallback` conservative value 出现, 不能写入 base column stats。
 - `cap_ndv_at_rows` 接受 `Known` 才 cap; `Unknown` 保持 unknown。
+- 旧 `distinct_values_count: f64` 字段最终必须删除或私有化; production consumer 只能通过
+  `trusted_ndv()` / `ndv_value()` 这类访问器读取。
 
 这部分必须和 row-count fallback 删除成对落地。只删除行数 heuristic 而保留 unknown NDV=1.0, 会把问题从
 row count 迁移到 NDV。
@@ -334,7 +351,7 @@ row count 迁移到 NDV。
 - 新增 `StatsRef`、`QueryStatsSnapshot`、`BaseTableStatistics`、`StatValue`、`StatsSource`、
   `StatsMissingReason`。
 - optimizer public API 接受 `&QueryStatsSnapshot`。
-- `ScanOp` 增加 `stats_ref: StatsRef`。
+- `ScanOp` 增加 `stats_ref: Option<StatsRef>`, bridge 初始填 `None`, collector 绑定后填 `Some`。
 - 在同一实现 arc 内允许一个旧 `HashMap<String, TableStatistics>` 到 `QueryStatsSnapshot` 的测试/迁移 adapter,
   但必须有删除任务和审计; 生产新入口不得调用它。
 
@@ -347,7 +364,7 @@ row count 迁移到 NDV。
 
 - 新增 `TableStatsProvider` 能力。
 - Iceberg 实现从 current snapshot manifests 和 Puffin stats 构造 `BaseTableStatistics`。
-- 新增 `QueryStatsCollector`, 遍历 logical plan scan leaves 并生成 snapshot。
+- 新增 `QueryStatsCollector`, 遍历 optimizer `OptExpr` scan leaves, 绑定 `stats_ref` 并生成 snapshot。
 - 普通 SELECT 和 EXPLAIN 改用同一个 collector。
 
 验收:
@@ -372,14 +389,16 @@ row count 迁移到 NDV。
 
 ### Phase 4: ST-2 unknown NDV
 
-- 将 `ColumnStatistic.distinct_values_count: f64` 改成 missing-aware representation, 或在
-  `ColumnStatistic` 内增加 `ndv: StatValue<f64>` 并逐步替换旧字段。
+- 将 `ColumnStatistic.distinct_values_count: f64` 改成 missing-aware representation。迁移中可以短暂增加
+  `ndv: StatValue<f64>` 或 `DistinctValueCount`, 但最终必须删除或私有化旧字段。
 - join/selectivity/aggregate/grouping consumers 显式处理 Missing。
 - 默认 NDV 只存在公式层, 不写回 base stats。
 
 验收:
 
 - `ColumnStatistic::unknown()` 不再能被误用为真实 NDV=1。
+- `rg "distinct_values_count" src/sql/optimizer` 不再命中 production 裸读; 如有测试/compat helper, 必须通过
+  `trusted_ndv()` 等访问器隔离。
 - aggregate pushdown、join cardinality、predicate selectivity 对 missing NDV 均走可观测 fallback。
 
 ### Phase 5: 删除 name-based fallback
@@ -440,6 +459,10 @@ row count 迁移到 NDV。
 | unknown NDV 类型改动面大 | 先引入 `StatValue` 并提供 compatibility accessors, 然后逐步删除旧 `distinct_values_count` |
 | MV rewrite target stats 依赖表名 key | 用 `StatsRef` 消除碰撞; candidate target scan 由 collector 分配独立 stats ref |
 | INSERT SELECT write path 忘记迁移 | 把 optimizer API 改成必须传 `QueryStatsSnapshot`, 编译强制所有入口处理 |
+
+Phase 1 的 Iceberg provider 必须至少复用 `IcebergCatalogEntry` 的 data-file cache 或在 collector 内做 per-query
+cache, 避免普通 SELECT 每次重复 full manifest extraction。若某个 connector 暂时没有可复用 cache, 需要在
+provider 内显式记录为后续性能扩展项, 不能隐藏在 engine 入口。
 
 ## 14. 成功标准
 
