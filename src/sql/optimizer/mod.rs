@@ -2,6 +2,7 @@
 
 pub(crate) mod cascades_rules;
 pub(crate) mod cost;
+mod cse_pass;
 pub(crate) mod cte_rewrite;
 pub(crate) mod derive;
 pub(crate) mod estimate;
@@ -229,6 +230,13 @@ fn optimize_with_root_property(
 
     // 12. Annotate physical plan with runtime filter descriptors.
     runtime_filter_pass::annotate(&mut physical, &memo.scalars, &options);
+    // 13. Common-subexpression elimination (materializes repeats as Project columns).
+    cse_pass::rewrite(
+        &mut physical,
+        &mut memo.scalars,
+        &mut memo.factory,
+        &options,
+    );
     physical_plan::attach_scalar_arena(&mut physical, Arc::new(memo.scalars.clone()));
 
     Ok(physical)
@@ -264,6 +272,7 @@ pub(crate) fn is_known_rule_name(name: &str) -> bool {
             .any(|r| r.name() == name)
         || rewrite::registry::is_known_rewrite_rule_name(name)
         || name == runtime_filter_pass::RUNTIME_FILTER_RULE
+        || name == cse_pass::CSE_RULE
         || name == cascades_rules::mv_rewrite::RULE_NAME
 }
 
@@ -628,6 +637,11 @@ mod is_known_rule_name_tests {
     #[test]
     fn is_known_rule_name_recognizes_runtime_filter() {
         assert!(is_known_rule_name("RuntimeFilterPushDown"));
+    }
+
+    #[test]
+    fn is_known_rule_name_recognizes_cse_rule() {
+        assert!(is_known_rule_name("CommonSubexpressionReuse"));
     }
 
     // --- Item 4 (Important): provider precedence tests for optimize() ---
