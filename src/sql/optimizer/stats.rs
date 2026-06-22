@@ -22,8 +22,7 @@ use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 use crate::sql::optimizer::statistics::*;
 use crate::sql::optimizer::stats_input::{OptimizerStatsInput, StatsSource};
 
-// Matches the old unknown-table default from estimate_default_row_count to
-// minimize plan churn while removing table-name heuristics.
+// Neutral fallback used only when no real base table statistics are available.
 const MISSING_BASE_ROW_COUNT_FALLBACK: f64 = 100_000.0;
 
 // ---------------------------------------------------------------------------
@@ -1936,92 +1935,6 @@ fn map_table_column_stats_to_ids(
         .collect()
 }
 
-/// Heuristic row count estimation for tables without real statistics.
-///
-/// Large fact tables (containing "sales", "returns", "inventory", etc.)
-/// get a larger default, while small dimension tables ("customer_demographics",
-/// "date_dim", "time_dim", etc.) get a smaller default. This prevents the
-/// optimizer from treating all unknown tables equally, which can lead to
-/// bad join ordering.
-fn estimate_default_row_count(table_name: &str) -> f64 {
-    let name = table_name.to_lowercase();
-
-    // Large fact tables: high row count default.
-    const FACT_TABLE_PATTERNS: &[&str] = &[
-        "store_sales",
-        "web_sales",
-        "catalog_sales",
-        "store_returns",
-        "web_returns",
-        "catalog_returns",
-        "inventory",
-        "lineitem",
-        "lineorder",
-        "orders",
-        "partsupp",
-    ];
-    for pattern in FACT_TABLE_PATTERNS {
-        if name == *pattern || name.ends_with(&format!(".{}", pattern)) {
-            return 1_000_000.0;
-        }
-    }
-
-    // Medium dimension tables: moderate row count default.
-    const MEDIUM_TABLE_PATTERNS: &[&str] = &[
-        "customer",
-        "customer_address",
-        "item",
-        "web_page",
-        "catalog_page",
-        "store",
-        "promotion",
-        "household_demographics",
-        "part",
-        "supplier",
-    ];
-    for pattern in MEDIUM_TABLE_PATTERNS {
-        if name == *pattern || name.ends_with(&format!(".{}", pattern)) {
-            return 100_000.0;
-        }
-    }
-
-    // Small dimension tables: low row count default.
-    const SMALL_TABLE_PATTERNS: &[&str] = &[
-        "customer_demographics",
-        "date_dim",
-        "time_dim",
-        "income_band",
-        "reason",
-        "ship_mode",
-        "warehouse",
-        "web_site",
-        "call_center",
-        "nation",
-        "region",
-    ];
-    for pattern in SMALL_TABLE_PATTERNS {
-        if name == *pattern || name.ends_with(&format!(".{}", pattern)) {
-            return 10_000.0;
-        }
-    }
-
-    // General heuristic: names containing "fact" or "sales" or "returns"
-    // suggest a large table.
-    if name.contains("sales")
-        || name.contains("returns")
-        || name.contains("fact")
-        || name.contains("lineitem")
-    {
-        return 1_000_000.0;
-    }
-    if name.contains("_dim") || name.contains("dimension") {
-        return 10_000.0;
-    }
-
-    // Default for completely unknown tables.
-    100_000.0
-}
-
 /// Derive join statistics from a `LogicalJoinOp` and child stats.
 fn estimate_join_condition_scalar(
     arena: &ScalarArena,
@@ -2856,7 +2769,7 @@ mod tests {
         logical_plan_to_memo_for_test(&plan, &mut memo);
         derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
 
-        // default_rows("unknown_tbl") = 100000; unknown-column eq selectivity
+        // Neutral fallback rows = 100000; unknown-column eq selectivity
         // = PREDICATE_UNKNOWN_FILTER (0.25) -> 100000 * 0.25 = 25000.
         let props = memo.groups[0].logical_props.as_ref().unwrap();
         assert!((props.row_count - 25_000.0).abs() < 1.0);
@@ -5248,33 +5161,6 @@ mod tests {
             "consume should see the producer NDV (100000), got {}",
             propagated_ndv
         );
-    }
-
-    #[test]
-    fn default_row_count_fact_table() {
-        // A fact table without stats should get a large default.
-        let rows = estimate_default_row_count("store_sales");
-        assert_eq!(rows, 1_000_000.0);
-    }
-
-    #[test]
-    fn default_row_count_small_dim() {
-        // A small dimension table should get a small default.
-        let rows = estimate_default_row_count("date_dim");
-        assert_eq!(rows, 10_000.0);
-    }
-
-    #[test]
-    fn default_row_count_medium_table() {
-        let rows = estimate_default_row_count("customer");
-        assert_eq!(rows, 100_000.0);
-    }
-
-    #[test]
-    fn default_row_count_unknown_table() {
-        // Completely unknown table gets the general default.
-        let rows = estimate_default_row_count("my_custom_table");
-        assert_eq!(rows, 100_000.0);
     }
 
     #[test]

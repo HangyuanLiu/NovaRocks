@@ -13,7 +13,7 @@ use crate::sql::optimizer::stats_input::{StatsMissingReason, StatsSource};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum Confidence {
     #[default]
-    Fallback, // relied on a heuristic/default (name-based rows, default selectivity/NDV)
+    Fallback, // relied on a heuristic/default (missing-stats rows, default selectivity/NDV)
     Estimated, // derived via formula from at-least-partially-real inputs
     Exact,     // sourced from real catalog/Iceberg stats (Puffin NDV, metadata row_count)
     /// Measured source (MV materialized row count / runtime feedback / sampling).
