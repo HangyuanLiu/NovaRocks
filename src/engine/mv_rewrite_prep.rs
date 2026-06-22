@@ -6,7 +6,6 @@
 //! executable target TableDef, and loads target-table statistics.
 //! Every failure is a warn-and-skip: rewrite is an optional optimization.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::sql::catalog::{CatalogProvider, ScanSource};
@@ -14,14 +13,22 @@ use crate::sql::column_id::ColumnRefFactory;
 use crate::sql::optimizer::cascades_rules::mv_rewrite::{
     MvRewriteCandidate, descriptor::SpjgDescriptor,
 };
-use crate::sql::optimizer::statistics::TableStatistics;
 use crate::sql::planner::plan::LogicalPlanNode;
 
 use super::StandaloneState;
+use super::query_stats::{QueryStatsPlan, QueryStatsProviders};
 
 /// Upper bound on candidates per query; aligned with the StarRocks default
 /// cbo_materialized_view_rewrite_related_mvs_limit = 16.
 const MAX_MV_CANDIDATES: usize = 16;
+
+struct PreparedMvRewriteCandidate {
+    mv_name: String,
+    mv: SpjgDescriptor,
+    mv_scalars: crate::sql::optimizer::scalar::ScalarArena,
+    target_database: String,
+    target_table: crate::sql::catalog::TableDef,
+}
 
 pub(crate) fn prepare_mv_rewrite_candidates(
     state: &Arc<StandaloneState>,
@@ -29,7 +36,7 @@ pub(crate) fn prepare_mv_rewrite_candidates(
     current_database: &str,
     logical: &LogicalPlanNode,
     factory: &mut ColumnRefFactory,
-    table_stats: &mut HashMap<String, TableStatistics>,
+    query_stats: &mut QueryStatsPlan,
 ) -> Vec<MvRewriteCandidate> {
     if !crate::sql::optimizer::options::current_session_optimizer_settings().mv_rewrite_enabled() {
         return Vec::new();
@@ -40,7 +47,7 @@ pub(crate) fn prepare_mv_rewrite_candidates(
         current_database,
         logical,
         factory,
-        table_stats,
+        query_stats,
     ) {
         Ok(c) => c,
         Err(e) => {
@@ -56,7 +63,7 @@ fn try_prepare(
     current_database: &str,
     logical: &LogicalPlanNode,
     factory: &mut ColumnRefFactory,
-    table_stats: &mut HashMap<String, TableStatistics>,
+    query_stats: &mut QueryStatsPlan,
 ) -> Result<Vec<MvRewriteCandidate>, String> {
     // 1. Iceberg base tables referenced by the query, as "cat.ns.tbl" FQNs
     //    (the exact format of StoredMvDefinition.base_table_refs, produced
@@ -79,6 +86,7 @@ fn try_prepare(
         .list_definitions(read.as_ref())
         .map_err(|e| format!("list mv definitions: {e}"))?;
 
+    let stats_providers = QueryStatsProviders::from_standalone_state(state);
     let mut candidates = Vec::new();
     for def in definitions {
         if candidates.len() >= MAX_MV_CANDIDATES {
@@ -95,22 +103,20 @@ fn try_prepare(
         }
         match build_candidate(state, analyzer_catalog, current_database, &def, factory) {
             Ok(Some(c)) => {
-                // 5. Inject target-table statistics (bare lowercase name key;
-                //    see collect_scan_stats insert / derive_scan_statistics
-                //    lookup). A name collision with a query table makes stats
-                //    ambiguous: drop the candidate (spec §5.5).
-                let key = c.target_table.name.to_ascii_lowercase();
-                if table_stats.contains_key(&key) {
-                    tracing::warn!(
-                        "mv rewrite: target table name {key} collides with a query table; skipping {}",
-                        c.mv_name
-                    );
-                    continue;
-                }
-                if let Some(ts) = load_target_stats(state, &c.target_table) {
-                    table_stats.insert(key, ts);
-                }
-                candidates.push(c);
+                let (target_label, target_stats) = super::query_stats::collect_table_stats(
+                    &stats_providers,
+                    &c.target_database,
+                    &c.target_table,
+                );
+                let target_stats_ref = query_stats.add_stats(target_label, target_stats);
+                candidates.push(MvRewriteCandidate {
+                    mv_name: c.mv_name,
+                    mv: c.mv,
+                    mv_scalars: c.mv_scalars,
+                    target_database: c.target_database,
+                    target_table: c.target_table,
+                    target_stats_ref,
+                });
             }
             Ok(None) => {}
             Err(e) => tracing::warn!("mv rewrite: skipping mv {}: {e}", def.mv_id),
@@ -125,7 +131,7 @@ fn build_candidate(
     current_database: &str,
     def: &crate::meta::repository::mv::StoredMvDefinition,
     factory: &mut ColumnRefFactory,
-) -> Result<Option<MvRewriteCandidate>, String> {
+) -> Result<Option<PreparedMvRewriteCandidate>, String> {
     // 2b. Strict freshness: every base table's CURRENT snapshot must equal
     //     the pinned snapshot from the last refresh. Never refreshed -> skip.
     if def.last_refresh_snapshots.is_empty() {
@@ -222,7 +228,7 @@ fn build_candidate(
         return Ok(None);
     }
 
-    Ok(Some(MvRewriteCandidate {
+    Ok(Some(PreparedMvRewriteCandidate {
         mv_name: tbl.clone(),
         mv: mv_desc,
         mv_scalars,
@@ -232,7 +238,7 @@ fn build_candidate(
 }
 
 /// Recursively collect "cat.ns.tbl" FQNs of every Iceberg data-file scan in
-/// the plan. Mirrors `collect_scan_stats` (engine/mod.rs) node coverage.
+/// the plan. Mirrors query-stats collector scan-source coverage.
 fn collect_iceberg_fqns(plan: &LogicalPlanNode, out: &mut Vec<String>) {
     match &plan.kind {
         crate::sql::planner::plan::PlanNodeKind::Scan(s) => {
@@ -293,85 +299,4 @@ fn current_table_uuid(
     let entry = registry.get(&r.catalog)?;
     let loaded = crate::connector::iceberg::catalog::load_table(&entry, &r.namespace, &r.table)?;
     Ok(Some(loaded.table.metadata().uuid().to_string()))
-}
-
-/// Best-effort target-table statistics for the rewritten scan, mirroring
-/// `collect_scan_stats`.
-///
-/// The target TableDef is built schema-only (CurrentSnapshot binding, empty
-/// `files`), so reading its `files` vector directly always yields `None` and
-/// the CBO falls back to a default row count. With a small base table that
-/// default is *larger* than the real MV cardinality, so the MV alternative
-/// loses on cost and the rewrite never fires (plan §"已知风险" #6). To cost
-/// the alternative correctly we enumerate the target table's CURRENT-snapshot
-/// data files here — the same enumeration the ANALYZE/scan path uses
-/// (`extract_data_files_with_stats` -> `data_file_with_stats_to_iceberg_data_file_info`)
-/// — and build stats from those real files plus Puffin NDV.
-///
-/// This is costing metadata only: the injected scan still resolves files at
-/// execution time from its CurrentSnapshot binding, so the stats snapshot used
-/// here never affects result correctness. Fail-closed: any registry/IO error
-/// yields `None` (CBO fallback), never a panic.
-fn load_target_stats(
-    state: &Arc<StandaloneState>,
-    table_def: &crate::sql::catalog::TableDef,
-) -> Option<TableStatistics> {
-    let ScanSource::IcebergDataFiles {
-        table,
-        cloud_properties,
-        ..
-    } = &table_def.source
-    else {
-        return None;
-    };
-
-    let files = match current_snapshot_data_files(state, table) {
-        Ok(files) => files,
-        Err(e) => {
-            tracing::debug!(
-                "mv rewrite: failed to enumerate current-snapshot files for target table {}: {e}; using CBO fallback",
-                table_def.name
-            );
-            return None;
-        }
-    };
-
-    let (ndv_by_name, name_to_field_id) =
-        crate::connector::iceberg::stats::load_iceberg_puffin_ndv(Some(table), cloud_properties);
-    let stats = crate::sql::optimizer::statistics::build_table_statistics_with_ndv(
-        &files,
-        &table_def.columns,
-        &ndv_by_name,
-        &name_to_field_id,
-    );
-    if stats.is_none() {
-        tracing::debug!(
-            "mv rewrite: no derivable stats for target table {} ({} current-snapshot files); using CBO fallback",
-            table_def.name,
-            files.len()
-        );
-    }
-    stats
-}
-
-/// Enumerate the CURRENT-snapshot data files of an Iceberg target table as
-/// `IcebergDataFileInfo`, reusing the catalog registry view (no cache
-/// invalidation, matching `current_snapshot_id`'s consistency contract).
-fn current_snapshot_data_files(
-    state: &Arc<StandaloneState>,
-    table: &crate::sql::catalog::IcebergTableInfo,
-) -> Result<Vec<crate::sql::catalog::IcebergDataFileInfo>, String> {
-    let registry = state
-        .iceberg_catalogs
-        .read()
-        .expect("iceberg catalogs read lock");
-    let entry = registry.get(&table.catalog)?;
-    let loaded =
-        crate::connector::iceberg::catalog::load_table(&entry, &table.namespace, &table.table)?;
-    let data_files =
-        crate::connector::iceberg::catalog::registry::extract_data_files_with_stats(&loaded.table)?;
-    Ok(data_files
-        .into_iter()
-        .map(crate::connector::iceberg::catalog::backend::data_file_with_stats_to_iceberg_data_file_info)
-        .collect())
 }

@@ -71,6 +71,7 @@ pub(crate) fn optimize(
     dictionary_provider: Option<std::sync::Arc<dyn rewrite::context::QueryDictionaryProvider>>,
     mv_candidates: Vec<cascades_rules::mv_rewrite::MvRewriteCandidate>,
 ) -> Result<PhysicalPlanNode, String> {
+    validate_query_stats_bound(&plan_expr)?;
     let stats_input = OptimizerStatsInput::from_query_stats(query_stats);
     optimize_with_root_property(
         plan_expr,
@@ -90,6 +91,7 @@ pub(crate) fn optimize_with_root_distribution(
     factory: ColumnRefFactory,
     root_distribution: DistributionSpec,
 ) -> Result<PhysicalPlanNode, String> {
+    validate_query_stats_bound(&plan_expr)?;
     let root_required = PhysicalPropertySet {
         distribution: root_distribution,
         ordering: OrderingSpec::Any,

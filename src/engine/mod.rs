@@ -3121,7 +3121,15 @@ fn explain_analyze_query(
     let (resolved, cte_registry, mut factory) =
         crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
-    let mut table_stats = build_table_stats_from_plan(&logical);
+    let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
+    let mut opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+        &logical,
+        &mut scalar_arena,
+    )?;
+    let providers = mv_rewrite_state
+        .map(query_stats::QueryStatsProviders::from_standalone_state)
+        .unwrap_or_else(|| query_stats::QueryStatsProviders::from_connectors(connectors));
+    let mut query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut opt_expr);
     // MV query rewrite candidate prep (EXPLAIN ANALYZE has no MV refresh
     // context, so the gate is only `mv_rewrite_state.is_some()`).
     let mv_candidates = match mv_rewrite_state {
@@ -3131,20 +3139,15 @@ fn explain_analyze_query(
             current_database,
             &logical,
             &mut factory,
-            &mut table_stats,
+            &mut query_stats,
         ),
         None => Vec::new(),
     };
     // dictionary_provider intentionally None; installed via TLS by execute_in_context.
-    let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-    let opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
-        &logical,
-        &mut scalar_arena,
-    )?;
-    let physical = crate::sql::optimizer::optimize_with_legacy_table_stats_for_migration(
+    let physical = crate::sql::optimizer::optimize(
         opt_expr,
         scalar_arena,
-        &table_stats,
+        &query_stats.snapshot,
         factory,
         None,
         mv_candidates,
@@ -3229,7 +3232,7 @@ fn explain_query(
     query: &sqlparser::ast::Query,
     analyzer_catalog: &dyn crate::sql::catalog::CatalogProvider,
     _codegen_catalog: &InMemoryCatalog,
-    _connectors: &crate::connector::ConnectorRegistry,
+    connectors: &crate::connector::ConnectorRegistry,
     current_database: &str,
     level: crate::sql::explain::ExplainLevel,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
@@ -3241,7 +3244,15 @@ fn explain_query(
     let (resolved, cte_registry, mut factory) =
         crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
-    let mut table_stats = build_table_stats_from_plan(&logical);
+    let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
+    let mut opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+        &logical,
+        &mut scalar_arena,
+    )?;
+    let providers = mv_rewrite_state
+        .map(query_stats::QueryStatsProviders::from_standalone_state)
+        .unwrap_or_else(|| query_stats::QueryStatsProviders::from_connectors(connectors));
+    let mut query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut opt_expr);
     // MV query rewrite candidate prep (plain EXPLAIN has no MV refresh
     // context, so the gate is only `mv_rewrite_state.is_some()`).
     let mv_candidates = match mv_rewrite_state {
@@ -3251,20 +3262,15 @@ fn explain_query(
             current_database,
             &logical,
             &mut factory,
-            &mut table_stats,
+            &mut query_stats,
         ),
         None => Vec::new(),
     };
     // dictionary_provider intentionally None; installed via TLS by execute_in_context.
-    let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-    let opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
-        &logical,
-        &mut scalar_arena,
-    )?;
-    let physical = crate::sql::optimizer::optimize_with_legacy_table_stats_for_migration(
+    let physical = crate::sql::optimizer::optimize(
         opt_expr,
         scalar_arena,
-        &table_stats,
+        &query_stats.snapshot,
         factory,
         None,
         mv_candidates,
@@ -3272,12 +3278,7 @@ fn explain_query(
 
     let mut lines = Vec::new();
     if matches!(level, ExplainLevel::Costs) {
-        for (table, stats) in &table_stats {
-            lines.push(format!(
-                "  Statistics: {table} row_count={}",
-                stats.row_count
-            ));
-        }
+        lines.extend(query_stats.snapshot.display_rows());
     }
     let dp = build_distributed_plan(&physical)?;
     lines.extend(explain_distributed_plan(&dp, level));
@@ -3447,28 +3448,29 @@ pub(crate) fn execute_query_as_iceberg_write(
     let (resolved, cte_registry, mut factory) =
         crate::sql::analyzer::analyze(&prepared, &analyzer_provider, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
-    let table_stats = build_table_stats_from_plan(&logical);
     let root_distribution = match root_distribution_resolver {
         Some(resolve_root_distribution) => resolve_root_distribution(&logical)?,
         None => None,
     };
     let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-    let opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+    let mut opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
         &logical,
         &mut scalar_arena,
     )?;
+    let providers = query_stats::QueryStatsProviders::from_standalone_state(state);
+    let query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut opt_expr);
     let physical = match root_distribution {
-        Some(root_distribution) => crate::sql::optimizer::optimize_with_root_distribution_and_legacy_table_stats_for_migration(
+        Some(root_distribution) => crate::sql::optimizer::optimize_with_root_distribution(
             opt_expr,
             scalar_arena,
-            &table_stats,
+            &query_stats.snapshot,
             factory,
             root_distribution,
         )?,
-        None => crate::sql::optimizer::optimize_with_legacy_table_stats_for_migration(
+        None => crate::sql::optimizer::optimize(
             opt_expr,
             scalar_arena,
-            &table_stats,
+            &query_stats.snapshot,
             factory,
             None,
             Vec::new(),
@@ -3631,7 +3633,15 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
     } else if imv_rewrite_validator.is_some() {
         return Err("IMV rewrite validator requires MV refresh context".to_string());
     }
-    let mut table_stats = build_table_stats_from_plan(&logical);
+    let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
+    let mut opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+        &logical,
+        &mut scalar_arena,
+    )?;
+    let providers = mv_rewrite_state
+        .map(query_stats::QueryStatsProviders::from_standalone_state)
+        .unwrap_or_else(|| query_stats::QueryStatsProviders::from_connectors(connectors));
+    let mut query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut opt_expr);
     // MV query rewrite: discover fresh Iceberg MV candidates and inject their
     // target-table stats. Gated on a standalone-rewrite path (`Some(state)`)
     // and disabled during MV refresh (`mv_refresh_ctx.is_some()`) so refresh
@@ -3644,21 +3654,16 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
                 current_database,
                 &logical,
                 &mut factory,
-                &mut table_stats,
+                &mut query_stats,
             )
         }
         _ => Vec::new(),
     };
     // dictionary_provider intentionally None; installed via TLS by execute_in_context.
-    let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-    let opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
-        &logical,
-        &mut scalar_arena,
-    )?;
-    let mut physical = crate::sql::optimizer::optimize_with_legacy_table_stats_for_migration(
+    let mut physical = crate::sql::optimizer::optimize(
         opt_expr,
         scalar_arena,
-        &table_stats,
+        &query_stats.snapshot,
         factory,
         None,
         mv_candidates,
@@ -3882,65 +3887,6 @@ fn wait_for_standalone_exchange_server(port: u16) -> Result<(), String> {
                 ));
             }
         }
-    }
-}
-
-/// Walk the logical plan tree and collect table-level statistics for all scan
-/// nodes that reference IcebergDataFiles storage.
-fn build_table_stats_from_plan(
-    plan: &crate::sql::planner::plan::LogicalPlanNode,
-) -> std::collections::HashMap<String, crate::sql::optimizer::statistics::TableStatistics> {
-    let mut stats = std::collections::HashMap::new();
-    collect_scan_stats(plan, &mut stats);
-    stats
-}
-
-/// Recursively visit plan nodes and collect statistics from Scan leaves.
-fn collect_scan_stats(
-    plan: &crate::sql::planner::plan::LogicalPlanNode,
-    out: &mut std::collections::HashMap<String, crate::sql::optimizer::statistics::TableStatistics>,
-) {
-    use crate::sql::planner::plan::PlanNodeKind;
-
-    match &plan.kind {
-        PlanNodeKind::Scan(s) => {
-            if let crate::sql::catalog::ScanSource::IcebergDataFiles {
-                table,
-                files,
-                cloud_properties,
-                ..
-            } = &s.table.source
-            {
-                // Best-effort: pull NDV from registered Puffin statistics for
-                // the table's current snapshot. Any failure quietly degrades
-                // to manifest heuristics (see StatsLoader contract).
-                let (ndv_by_name, name_to_field_id) =
-                    crate::connector::iceberg::stats::load_iceberg_puffin_ndv(
-                        Some(table),
-                        cloud_properties,
-                    );
-                if let Some(ts) = crate::sql::optimizer::statistics::build_table_statistics_with_ndv(
-                    files,
-                    &s.table.columns,
-                    &ndv_by_name,
-                    &name_to_field_id,
-                ) {
-                    // Insert by table name (canonical key).
-                    out.insert(s.table.name.clone(), ts.clone());
-                    // Also insert by alias so that aliased scans can find their stats.
-                    if let Some(ref alias) = s.alias {
-                        out.insert(alias.clone(), ts);
-                    }
-                }
-            }
-        }
-        PlanNodeKind::ImvDelta(_) | PlanNodeKind::ImvVersion(_) => {
-            panic!("imv marker leaked into non-IMV plan");
-        }
-        _ => {}
-    }
-    for child in &plan.children {
-        collect_scan_stats(child, out);
     }
 }
 
@@ -5820,17 +5766,20 @@ enable_path_style_access = true
             crate::sql::analyzer::analyze(&query, &catalog, "default").expect("analyze query");
         let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)
             .expect("plan query");
-        let table_stats = super::build_table_stats_from_plan(&logical);
         let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-        let opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
-            &logical,
-            &mut scalar_arena,
-        )
-        .expect("logical to opt expr");
-        let physical = crate::sql::optimizer::optimize_with_legacy_table_stats_for_migration(
+        let mut opt_expr =
+            crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+                &logical,
+                &mut scalar_arena,
+            )
+            .expect("logical to opt expr");
+        let providers = super::query_stats::QueryStatsProviders::from_connectors(&registry);
+        let query_stats =
+            super::query_stats::QueryStatsCollector::new(providers).collect(&mut opt_expr);
+        let physical = crate::sql::optimizer::optimize(
             opt_expr,
             scalar_arena,
-            &table_stats,
+            &query_stats.snapshot,
             factory,
             None,
             Vec::new(),

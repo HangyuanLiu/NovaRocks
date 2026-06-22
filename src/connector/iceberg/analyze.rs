@@ -159,7 +159,7 @@ pub(crate) fn analyze_iceberg_puffin_stats(
 }
 
 /// Build the lowercased column-name -> field_id map from the table's current
-/// schema. Mirrors `engine::load_iceberg_puffin_ndv`'s field-id mapping so the
+/// schema. Mirrors `connector::iceberg::stats` field-id mapping so the
 /// keys line up with `collect_theta_sketches_by_name`.
 fn name_to_field_id_from_metadata(metadata: &iceberg::spec::TableMetadata) -> HashMap<String, i32> {
     let mut map = HashMap::new();

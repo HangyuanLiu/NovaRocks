@@ -109,54 +109,63 @@ impl QueryStatsCollector {
         &self,
         scan: &crate::sql::optimizer::operator::ScanOp,
     ) -> (String, BaseTableStatistics) {
-        let label = scan_label(scan);
-        let Some(request) = table_stats_request(scan) else {
-            return (
-                label,
-                BaseTableStatistics::missing(StatsMissingReason::ConnectorUnsupported(
-                    "scan source does not expose query stats".to_string(),
-                )),
-            );
-        };
-
-        let stats = match &request.source {
-            ScanSourceIdentity::IcebergTable { .. } => {
-                let Some(provider) = self.providers.iceberg.as_deref() else {
-                    return (
-                        label,
-                        BaseTableStatistics::missing(StatsMissingReason::ConnectorUnsupported(
-                            "iceberg stats provider is not registered".to_string(),
-                        )),
-                    );
-                };
-                provider
-                    .estimate_table_statistics(&request)
-                    .unwrap_or_else(|err| BaseTableStatistics::missing(err.into_missing_reason()))
-            }
-            ScanSourceIdentity::Unsupported { reason } => BaseTableStatistics::missing(
-                StatsMissingReason::ConnectorUnsupported(reason.clone()),
-            ),
-        };
-
-        (label, stats)
+        collect_table_stats(&self.providers, &scan.database, &scan.table)
     }
 }
 
-fn scan_label(scan: &crate::sql::optimizer::operator::ScanOp) -> String {
-    match &scan.table.source {
+pub(super) fn collect_table_stats(
+    providers: &QueryStatsProviders,
+    database: &str,
+    table_def: &crate::sql::catalog::TableDef,
+) -> (String, BaseTableStatistics) {
+    let label = table_label(database, table_def);
+    let Some(request) = table_stats_request(database, table_def) else {
+        return (
+            label,
+            BaseTableStatistics::missing(StatsMissingReason::ConnectorUnsupported(
+                "scan source does not expose query stats".to_string(),
+            )),
+        );
+    };
+
+    let stats = match &request.source {
+        ScanSourceIdentity::IcebergTable { .. } => {
+            let Some(provider) = providers.iceberg.as_deref() else {
+                return (
+                    label,
+                    BaseTableStatistics::missing(StatsMissingReason::ConnectorUnsupported(
+                        "iceberg stats provider is not registered".to_string(),
+                    )),
+                );
+            };
+            provider
+                .estimate_table_statistics(&request)
+                .unwrap_or_else(|err| BaseTableStatistics::missing(err.into_missing_reason()))
+        }
+        ScanSourceIdentity::Unsupported { reason } => {
+            BaseTableStatistics::missing(StatsMissingReason::ConnectorUnsupported(reason.clone()))
+        }
+    };
+
+    (label, stats)
+}
+
+fn table_label(database: &str, table_def: &crate::sql::catalog::TableDef) -> String {
+    match &table_def.source {
         ScanSource::IcebergDataFiles { table, .. }
         | ScanSource::IcebergVersionTable { table, .. }
         | ScanSource::IcebergDeltaTable { table, .. } => {
             format!("{}.{}.{}", table.catalog, table.namespace, table.table)
         }
-        _ => format!("{}.{}", scan.database, scan.table.name),
+        _ => format!("{}.{}", database, table_def.name),
     }
 }
 
 fn table_stats_request(
-    scan: &crate::sql::optimizer::operator::ScanOp,
+    database: &str,
+    table_def: &crate::sql::catalog::TableDef,
 ) -> Option<TableStatsRequest> {
-    match &scan.table.source {
+    match &table_def.source {
         ScanSource::IcebergDataFiles { table, .. } => Some(TableStatsRequest {
             catalog: Some(table.catalog.clone()),
             database: table.namespace.clone(),
@@ -188,7 +197,15 @@ fn table_stats_request(
             },
             snapshot: None,
         }),
-        _ => None,
+        _ => Some(TableStatsRequest {
+            catalog: None,
+            database: database.to_string(),
+            table: table_def.name.clone(),
+            source: ScanSourceIdentity::Unsupported {
+                reason: "scan source does not expose query stats".to_string(),
+            },
+            snapshot: None,
+        }),
     }
 }
 
@@ -223,13 +240,14 @@ mod tests {
 
     #[test]
     fn table_stats_request_maps_iceberg_current_and_version_sources() {
-        let current = table_stats_request(&test_iceberg_scan_op(ScanSource::IcebergDataFiles {
+        let current_scan = test_iceberg_scan_op(ScanSource::IcebergDataFiles {
             table: iceberg_info("cat", "db", "tbl"),
             files: vec![],
             cloud_properties: BTreeMap::new(),
             binding: IcebergDataFileBinding::CurrentSnapshot,
-        }))
-        .expect("current iceberg scan should have stats request");
+        });
+        let current = table_stats_request(&current_scan.database, &current_scan.table)
+            .expect("current iceberg scan should have stats request");
         assert_eq!(current.catalog.as_deref(), Some("cat"));
         assert_eq!(current.database, "db");
         assert_eq!(current.table, "tbl");
@@ -243,11 +261,12 @@ mod tests {
             }
         );
 
-        let version = table_stats_request(&test_iceberg_scan_op(ScanSource::IcebergVersionTable {
+        let version_scan = test_iceberg_scan_op(ScanSource::IcebergVersionTable {
             table: iceberg_info("cat", "db", "tbl"),
             snapshot_id: 42,
-        }))
-        .expect("version iceberg scan should have stats request");
+        });
+        let version = table_stats_request(&version_scan.database, &version_scan.table)
+            .expect("version iceberg scan should have stats request");
         assert_eq!(version.snapshot, Some(TableSnapshotRef::SnapshotId(42)));
         assert_eq!(
             version.source,
@@ -261,12 +280,13 @@ mod tests {
 
     #[test]
     fn table_stats_request_marks_iceberg_delta_unsupported() {
-        let delta = table_stats_request(&test_iceberg_scan_op(ScanSource::IcebergDeltaTable {
+        let delta_scan = test_iceberg_scan_op(ScanSource::IcebergDeltaTable {
             table: iceberg_info("cat", "db", "tbl"),
             from_snapshot_id: 1,
             to_snapshot_id: 2,
-        }))
-        .expect("delta iceberg scan should produce unsupported request");
+        });
+        let delta = table_stats_request(&delta_scan.database, &delta_scan.table)
+            .expect("delta iceberg scan should produce unsupported request");
 
         assert_eq!(delta.snapshot, None);
         assert_eq!(

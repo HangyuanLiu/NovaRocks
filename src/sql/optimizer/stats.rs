@@ -2805,7 +2805,10 @@ mod tests {
         let stats = derive_opt_expr_statistics(&scan, &ScalarArena::new(), &stats_input);
 
         assert!((stats.output_row_count - MISSING_BOUND_STATS_ROW_COUNT_FALLBACK).abs() < 1.0);
-        assert_ne!(stats.output_row_count, estimate_default_row_count("store_sales"));
+        assert_ne!(
+            stats.output_row_count,
+            estimate_default_row_count("store_sales")
+        );
         assert_eq!(stats.row_count_confidence, Confidence::Fallback);
     }
 
