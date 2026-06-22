@@ -15,8 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(test)]
 use std::collections::HashMap;
 
+#[cfg(test)]
 use crate::runtime::profile::Profiler;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -26,10 +28,12 @@ pub(crate) struct ActualMetrics {
     pub(crate) peak_mem_bytes: i64,
 }
 
+#[cfg(test)]
 pub(crate) fn collect_actuals_by_plan_node_id(profiler: &Profiler) -> HashMap<i32, ActualMetrics> {
     collect_actuals_by_plan_node_id_multi(std::slice::from_ref(profiler))
 }
 
+#[cfg(test)]
 pub(crate) fn collect_actuals_by_plan_node_id_multi(
     profilers: &[Profiler],
 ) -> HashMap<i32, ActualMetrics> {
@@ -41,6 +45,7 @@ pub(crate) fn collect_actuals_by_plan_node_id_multi(
     actuals
 }
 
+#[cfg(test)]
 fn collect_rec(node: &Profiler, actuals: &mut HashMap<i32, ActualMetrics>) {
     if let Some(node_id) = parse_plan_node_id(&node.name()) {
         if let Some(common) = node.get_child("CommonMetrics") {
@@ -60,10 +65,12 @@ fn collect_rec(node: &Profiler, actuals: &mut HashMap<i32, ActualMetrics>) {
     }
 }
 
+#[cfg(test)]
 fn counter(common: &Profiler, name: &str) -> i64 {
     common.counter_value(name).unwrap_or(0)
 }
 
+#[cfg(test)]
 fn parse_plan_node_id(name: &str) -> Option<i32> {
     let key = if name.contains("plan_node_id=") {
         "plan_node_id="

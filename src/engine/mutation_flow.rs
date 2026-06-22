@@ -961,7 +961,6 @@ fn merge_all_write_commits(
         query_result: query_result.expect("non-empty parts => query_result set"),
         write_commit: merged_commit,
         write_abort,
-        profilers: Vec::new(),
     })
 }
 
@@ -1034,7 +1033,6 @@ fn no_mutation_write_result() -> CoordinatedQueryResult {
         query_result: QueryResult::empty(),
         write_commit: None,
         write_abort: None,
-        profilers: Vec::new(),
     }
 }
 
@@ -1432,7 +1430,6 @@ impl IcebergWriteTransactionExecutor for DistributedCowUpdateExecutor {
             query_result: QueryResult::empty(),
             write_commit: Some(write_commit),
             write_abort: None,
-            profilers: Vec::new(),
         })
     }
 
@@ -2886,7 +2883,6 @@ impl IcebergWriteTransactionExecutor for DistributedMergeExecutor {
                     query_result: QueryResult::empty(),
                     write_commit: Some(rewrite.write_commit),
                     write_abort: None,
-                    profilers: Vec::new(),
                 });
                 *self
                     .cow_update_rewrite

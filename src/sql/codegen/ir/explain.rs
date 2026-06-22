@@ -35,6 +35,7 @@ pub(crate) fn explain_distributed_plan(dp: &DistributedPlan, level: ExplainLevel
     explain_distributed_plan_inner(dp, level, None)
 }
 
+#[cfg(test)]
 pub(crate) fn explain_distributed_plan_analyze(
     dp: &DistributedPlan,
     level: ExplainLevel,
@@ -1325,13 +1326,12 @@ mod tests {
 
     use arrow::datatypes::DataType;
 
+    use super::explain_distributed_plan_analyze;
     use crate::exec::node::sort::SortTopNType;
     use crate::runtime::profile_correlate::ActualMetrics;
     use crate::sql::analysis::{ExprKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
     use crate::sql::catalog::{ColumnDef, ScanSource, TableDef};
-    use crate::sql::codegen::ir::{
-        build_distributed_plan, explain_distributed_plan, explain_distributed_plan_analyze,
-    };
+    use crate::sql::codegen::ir::{build_distributed_plan, explain_distributed_plan};
     use crate::sql::column_id::ColumnId;
     use crate::sql::explain::{ExplainLevel, PlanNodeExplainStage, format_shared_plan_node_header};
     use crate::sql::optimizer::operator::{

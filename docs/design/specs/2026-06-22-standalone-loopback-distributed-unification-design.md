@@ -97,9 +97,9 @@ MySQL request
 
 ### 5.2 all-in-one 改用 RemoteDispatcher
 
-`dispatcher_for_role(AllInOne)` 应返回 `RemoteDispatcher`，目标 backend 来自 all-in-one registry。`InProcessDispatcher` 从默认产品路径移除，只能作为少量 unit test helper 或过渡期删除对象存在。
+`dispatcher_for_role(AllInOne)` 应返回 `RemoteDispatcher`，目标 backend 来自 all-in-one registry。`InProcessDispatcher` 不应继续作为 test-only fallback 存在；相关 root `ResultSinkHandle` 直连执行逻辑应直接删除。
 
-这样 root fragment 与 non-root fragment 都通过同一套 gRPC submit/fetch/cancel 语义运行。`InProcessDispatcher` 的 root `ResultSinkHandle` 专属逻辑应删除或退役。
+这样 root fragment 与 non-root fragment 都通过同一套 gRPC submit/fetch/cancel 语义运行，避免测试继续覆盖一套产品不会再使用的本地执行语义。
 
 ### 5.3 full-execution gRPC 启动顺序
 
@@ -141,7 +141,7 @@ loopback 方案允许同进程自调用，因此必须保证 coordinator blockin
 
 ### 5.6 Profile / EXPLAIN ANALYZE
 
-当前 in-process profile collection 依赖 `InProcessDispatcher::take_profiles`。改成 loopback 后，all-in-one 与 remote FE/BE 一样不能依赖本地 thread join 收集 fragment profile。
+旧的 in-process profile collection 依赖本地 dispatcher 的 thread join 收集 fragment profile。改成 loopback 后，这条本地 profile 路径应删除；all-in-one 与 remote FE/BE 一样必须通过远程 report/profile API 获取 fragment profile。
 
 阶段性策略：
 
@@ -199,7 +199,7 @@ loopback 方案允许同进程自调用，因此必须保证 coordinator blockin
 1. 新增 all-in-one backend registry 初始化，保留现有执行路径不变，先验证启动和 `SHOW BACKENDS`。
 2. 让 `dispatcher_for_role(AllInOne)` 使用 remote loopback dispatcher，并保留 single-fragment fast path，先跑强制 multi-fragment query。
 3. 删除普通查询 single-fragment fast path，所有普通 SQL 进入 coordinator。
-4. 删除或退役 `InProcessDispatcher` root `ResultSinkHandle` 专属逻辑。
+4. 删除 `InProcessDispatcher` 及其 root `ResultSinkHandle` 专属逻辑，不保留 test-only 实现。
 5. 隔离 `terminal_sink`、`iceberg_catalogs` 等 direct exceptions，给每个调用点命名并补测试。
 6. 修复 `EXPLAIN ANALYZE` remote profile 能力，或在无 remote profile 时保持 fail fast。
 

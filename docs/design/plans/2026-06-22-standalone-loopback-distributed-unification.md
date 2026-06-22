@@ -222,11 +222,6 @@ pub(crate) fn dispatcher_kind_for_test(
 ) -> &'static str {
     if dispatcher.as_any().is::<crate::runtime::dispatcher::RemoteDispatcher>() {
         "remote"
-    } else if dispatcher
-        .as_any()
-        .is::<crate::runtime::dispatcher::InProcessDispatcher>()
-    {
-        "in-process"
     } else {
         "unknown"
     }
@@ -263,7 +258,7 @@ pub trait FragmentDispatcher: Send + Sync {
 }
 ```
 
-- [ ] Implement it for `InProcessDispatcher`, `RemoteDispatcher`, and all test dispatchers in this file.
+- [ ] Implement it for `RemoteDispatcher` and all test dispatchers in this file.
 
 ```rust
 #[cfg(test)]
@@ -570,11 +565,11 @@ test all_in_one_loopback_select_succeeds ... ok
 test all_in_one_select_uses_loopback_submit ... ok
 ```
 
-## Phase 4: retire product use of `InProcessDispatcher`
+## Phase 4: delete `InProcessDispatcher`
 
-**Purpose:** keep in-process dispatcher only as a temporary unit-test utility, or delete it once tests are converted.
+**Purpose:** remove the local-only dispatcher implementation entirely so tests cannot keep exercising a transport path that product code no longer uses.
 
-### Task 4.1: Ensure no product call site constructs `InProcessDispatcher`
+### Task 4.1: Remove local dispatcher implementation and tests
 
 Files:
 
@@ -584,45 +579,30 @@ Files:
 - [ ] Run:
 
 ```bash
-rg -n "InProcessDispatcher::new|InProcessDispatcher::default|InProcessDispatcher" src tests --glob '!src/runtime/dispatcher.rs'
+rg -n "InProcessDispatcher|run_root_fragment_in_process|finish_root_fragment_in_process|RootSlot|take_profiles|supports_profile_collection" src tests
 ```
 
-Expected after Phase 3:
+Expected after cleanup:
 
 ```text
-no non-comment matches outside src/runtime/dispatcher.rs
+no matches
 ```
 
 - [ ] Update stale comments in `src/runtime/coordinator.rs` and `src/runtime/dispatcher.rs`.
-- [ ] If all remaining `InProcessDispatcher` references are tests inside `src/runtime/dispatcher.rs`, gate the type and helper state with `#[cfg(test)]`.
-
-Minimal acceptable transitional shape:
-
-```rust
-#[cfg(test)]
-pub struct InProcessDispatcher {
-    state: Arc<InProcessState>,
-}
-
-#[cfg(test)]
-impl FragmentDispatcher for InProcessDispatcher {
-    // existing test-only implementation
-}
-```
-
-- [ ] If non-test code still depends on `take_profiles` from `InProcessDispatcher`, finish Task 5 before adding `#[cfg(test)]`.
+- [ ] Delete tests that assert local-only root slot, direct result sink, or local profiler behavior.
+- [ ] Keep or add remote/loopback tests for submit, typed fetch, cancel, and no-local-dispatcher source guard.
 
 Verification:
 
 ```bash
 cargo test --lib --package novarocks -- runtime::dispatcher
-rg -n "InProcessDispatcher" src --glob '!src/runtime/dispatcher.rs'
+rg -n "InProcessDispatcher|run_root_fragment_in_process|finish_root_fragment_in_process|RootSlot|take_profiles|supports_profile_collection" src tests
 ```
 
 Expected second command:
 
 ```text
-no matches outside src/runtime/dispatcher.rs
+no matches
 ```
 
 Delete or rewrite the comment if it still says all-in-one uses in-process execution.
@@ -638,30 +618,17 @@ Files:
 - Modify: `src/engine/mod.rs`
 
 - [ ] Remove `choose_standalone_execution` from the EXPLAIN ANALYZE path.
-- [ ] Build the distributed plan and always use `ExecutionCoordinator`.
-- [ ] Keep the existing fail-fast check if the dispatcher cannot collect remote profiles.
+- [ ] Fail fast until a real remote profile report API exists.
+- [ ] Do not keep dispatcher-level profile collection hooks as a local-only fallback.
 
 Target shape:
 
 ```rust
-let build_result = lower_distributed_plan(&dp, codegen_catalog, connectors, None)?;
-let mut profiled_query_opts = query_opts.unwrap_or_default();
-profiled_query_opts.enable_profile = Some(true);
-let (dispatcher, scheduler) = coordinated_execution_services()?;
-if !dispatcher.supports_profile_collection() {
-    return Err(
-        "EXPLAIN ANALYZE requires remote fragment profile collection; \
-         RemoteDispatcher profiles are not available yet"
-            .to_string(),
-    );
-}
-let outcome = crate::runtime::coordinator::ExecutionCoordinator::new(
-    build_result,
-    dispatcher,
-    scheduler,
-    Some(profiled_query_opts),
-)
-.execute_with_write_outcome()?;
+return Err(
+    "EXPLAIN ANALYZE requires remote fragment profile collection; \
+     RemoteDispatcher profiles are not available yet"
+        .to_string(),
+);
 ```
 
 - [ ] If the project already has a remote profile report API by implementation time, replace the fail-fast branch with that API and add an assertion that profiles are non-empty.
@@ -762,7 +729,7 @@ all focused cargo test commands exit 0
 Run:
 
 ```bash
-rg -n "ClusterRole::AllInOne => Ok\\(Arc::new\\(\\s*crate::runtime::dispatcher::InProcessDispatcher" src
+rg -n "InProcessDispatcher|run_root_fragment_in_process|finish_root_fragment_in_process|RootSlot|take_profiles|supports_profile_collection" src tests
 rg -n "force_single_fragment|choose_standalone_execution|StandaloneExecutionPlan" src/engine/mod.rs
 rg -n "implicit_all_in_one_backend" src
 ```
@@ -782,6 +749,6 @@ If the second command still finds `force_single_fragment` in live Rust code, ren
 - Ordinary all-in-one `SELECT 1` fails under `[debug] fault_inject_submit_fail_after = 0`, proving it uses `RemoteDispatcher::submit_fragment`.
 - Ordinary all-in-one `SELECT 1` succeeds without fault injection through loopback gRPC.
 - `ClusterRole::AllInOne` and `ClusterRole::Fe` both use `RemoteDispatcher` and live backend scheduler endpoints.
-- Product code no longer constructs `InProcessDispatcher`.
+- Source code no longer contains `InProcessDispatcher` or its root-slot/profile helper path.
 - Direct execution remains only for explicitly named runtime-local exceptions.
 - Existing `role=fe/be` cluster smoke tests still pass.
