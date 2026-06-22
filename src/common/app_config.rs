@@ -1348,6 +1348,8 @@ pub struct DebugConfig {
     pub fault_inject_fetch_not_ready_count: Option<usize>,
     #[cfg(debug_assertions)]
     pub emit_cancel_marker: bool,
+    #[cfg(debug_assertions)]
+    pub emit_grpc_fragment_marker: bool,
 }
 
 #[cfg(debug_assertions)]
@@ -1359,6 +1361,7 @@ struct DebugConfigToml {
     fault_inject_submit_fail_after: Option<usize>,
     fault_inject_fetch_not_ready_count: Option<usize>,
     emit_cancel_marker: bool,
+    emit_grpc_fragment_marker: bool,
 }
 
 #[cfg(not(debug_assertions))]
@@ -1370,6 +1373,7 @@ struct DebugConfigToml {
     fault_inject_submit_fail_after: Option<usize>,
     fault_inject_fetch_not_ready_count: Option<usize>,
     emit_cancel_marker: Option<bool>,
+    emit_grpc_fragment_marker: Option<bool>,
 }
 
 impl<'de> Deserialize<'de> for DebugConfig {
@@ -1386,6 +1390,7 @@ impl<'de> Deserialize<'de> for DebugConfig {
                 fault_inject_submit_fail_after: raw.fault_inject_submit_fail_after,
                 fault_inject_fetch_not_ready_count: raw.fault_inject_fetch_not_ready_count,
                 emit_cancel_marker: raw.emit_cancel_marker,
+                emit_grpc_fragment_marker: raw.emit_grpc_fragment_marker,
             })
         }
         #[cfg(not(debug_assertions))]
@@ -1403,6 +1408,11 @@ impl<'de> Deserialize<'de> for DebugConfig {
             if raw.emit_cancel_marker.is_some() {
                 return Err(serde::de::Error::custom(
                     "debug.emit_cancel_marker is only available in debug builds",
+                ));
+            }
+            if raw.emit_grpc_fragment_marker.is_some() {
+                return Err(serde::de::Error::custom(
+                    "debug.emit_grpc_fragment_marker is only available in debug builds",
                 ));
             }
             Ok(Self {
@@ -1441,6 +1451,16 @@ impl DebugConfig {
 
     #[cfg(not(debug_assertions))]
     pub fn emit_cancel_marker(&self) -> bool {
+        false
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn emit_grpc_fragment_marker(&self) -> bool {
+        self.emit_grpc_fragment_marker
+    }
+
+    #[cfg(not(debug_assertions))]
+    pub fn emit_grpc_fragment_marker(&self) -> bool {
         false
     }
 }
@@ -1707,12 +1727,14 @@ enable_path_style_access = true
 fault_inject_submit_fail_after = 1
 fault_inject_fetch_not_ready_count = 2
 emit_cancel_marker = true
+emit_grpc_fragment_marker = true
 "#,
         )
         .expect("parse config");
         assert_eq!(cfg.debug.fault_inject_submit_fail_after, Some(1));
         assert_eq!(cfg.debug.fault_inject_fetch_not_ready_count, Some(2));
         assert!(cfg.debug.emit_cancel_marker);
+        assert!(cfg.debug.emit_grpc_fragment_marker);
     }
 
     #[test]
@@ -1745,6 +1767,21 @@ emit_cancel_marker = false
         let err = err.to_string();
         assert!(
             err.contains("emit_cancel_marker"),
+            "unexpected parse error: {err}"
+        );
+
+        let err = match toml::from_str::<NovaRocksConfig>(
+            r#"
+[debug]
+emit_grpc_fragment_marker = false
+"#,
+        ) {
+            Ok(_) => panic!("release config must reject emit_grpc_fragment_marker knob"),
+            Err(err) => err,
+        };
+        let err = err.to_string();
+        assert!(
+            err.contains("emit_grpc_fragment_marker"),
             "unexpected parse error: {err}"
         );
     }

@@ -557,20 +557,31 @@ impl StandaloneNovaRocks {
         opts: StandaloneOptions,
         #[cfg(test)] _test_guard: Option<TestSerializationGuard>,
     ) -> Result<Self, String> {
-        // Spec (PR-4): role=fe dispatches all fragments to the remote BE via
-        // RemoteDispatcher and must NOT start a local gRPC/exchange server.
-        // exchange_port is only used by InProcessDispatcher (AllInOne); for Fe
-        // it is unused by dispatcher_for_role so a non-zero sentinel avoids
-        // the force_single_fragment=true short-circuit in execute_query_inner.
-        let role = crate::novarocks_config::config()
-            .map(|c| c.cluster.role)
-            .unwrap_or(crate::common::app_config::ClusterRole::AllInOne);
-        let exchange_port = if role == crate::common::app_config::ClusterRole::Fe {
-            // Sentinel: non-zero to allow coordinated execution, but no local socket is bound.
-            u16::MAX
-        } else {
-            ensure_standalone_exchange_server()?
+        // role=fe dispatches all fragments to registered BEs and must not
+        // start a local gRPC/exchange server. All-in-one binds the local
+        // exchange server and registers it as a loopback BE.
+        let cfg =
+            crate::novarocks_config::config().map_err(|e| format!("read config failed: {e}"))?;
+        let role = cfg.cluster.role;
+        let exchange_port = match role {
+            crate::common::app_config::ClusterRole::Fe => {
+                // Sentinel: non-zero to allow coordinated execution, but no local socket is bound.
+                u16::MAX
+            }
+            crate::common::app_config::ClusterRole::Be
+            | crate::common::app_config::ClusterRole::AllInOne => {
+                ensure_standalone_exchange_server()?
+            }
         };
+        if role == crate::common::app_config::ClusterRole::AllInOne {
+            let endpoint: std::net::SocketAddr = format!("127.0.0.1:{exchange_port}")
+                .parse()
+                .map_err(|e| format!("parse all-in-one loopback backend endpoint failed: {e}"))?;
+            backend_ops::install_all_in_one_backend_registry(
+                endpoint,
+                cfg.cluster.heartbeat_timeout_retries,
+            )?;
+        }
         let metadata_backend = resolve_metadata_backend(&opts)?;
         let metadata_provider = metadata_backend
             .as_ref()
@@ -608,6 +619,7 @@ impl StandaloneNovaRocks {
         restore_metadata_if_needed(&inner)?;
         if role == crate::common::app_config::ClusterRole::Fe {
             backend_ops::ensure_backend_registry(&inner)?;
+            backend_ops::wait_for_configured_backends_live(&inner)?;
         }
         if inner.starrocks_table_config.is_some() && inner.metadata_provider.is_some() {
             crate::connector::spawn_starrocks_table_erase_worker(Arc::clone(&inner));
@@ -1133,7 +1145,6 @@ impl StandaloneSession {
                     &catalog_snapshot,
                     &connectors_snapshot,
                     current_database,
-                    self.inner.exchange_port,
                     None,
                     Some(&self.inner),
                 )?;
@@ -2720,182 +2731,34 @@ pub(crate) fn record_batch_to_chunk(batch: RecordBatch) -> Result<Chunk, String>
 // Query plan build + execute (delegates to crate::sql::*)
 // ---------------------------------------------------------------------------
 
-use crate::sql::codegen::{
-    FragmentEdgeKind, MultiFragmentBuildResult, PlanBuildResult,
-    boundary_schema::{BoundaryKind, BoundarySchemaReport, output_columns_to_boundary_columns},
-};
+use crate::sql::codegen::{MultiFragmentBuildResult, PlanBuildResult};
 
-enum StandaloneExecutionPlan {
-    SingleFragment(Box<PlanBuildResult>),
-    Coordinated(Box<MultiFragmentBuildResult>),
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirectExecutionReason {
+    RuntimeLocalTerminalSink,
+    RuntimeLocalIcebergRegistry,
+    UnitTestNoExchangeBackend,
 }
 
-/// Recognize the narrow compatibility shape where fragment splitting
-/// only wrapped the real root fragment in a single `EXCHANGE_NODE`.
-fn top_level_stream_root_wrapper_child_id(
-    br: &MultiFragmentBuildResult,
-) -> Option<crate::sql::codegen::FragmentId> {
-    use crate::plan_nodes::TPlanNodeType;
-
-    let root = br
-        .fragment_results
-        .iter()
-        .find(|f| f.fragment_id == br.root_fragment_id)?;
-    if root.cte_id.is_some() || !root.cte_exchange_nodes.is_empty() {
-        return None;
+fn direct_execution_reason(
+    has_terminal_sink: bool,
+    has_iceberg_catalogs: bool,
+    exchange_port: u16,
+) -> Option<DirectExecutionReason> {
+    if has_terminal_sink {
+        return Some(DirectExecutionReason::RuntimeLocalTerminalSink);
     }
-    if root.plan.nodes.len() != 1 || root.plan.nodes[0].node_type != TPlanNodeType::EXCHANGE_NODE {
-        return None;
+    if has_iceberg_catalogs {
+        return Some(DirectExecutionReason::RuntimeLocalIcebergRegistry);
     }
-    let root_exchange = &root.plan.nodes[0];
-    if root_exchange.limit >= 0 {
-        return None;
+    if exchange_port == 0 {
+        return Some(DirectExecutionReason::UnitTestNoExchangeBackend);
     }
-    if let Some(exchange) = root_exchange.exchange_node.as_ref()
-        && (exchange.sort_info.is_some() || exchange.offset.unwrap_or(0) > 0)
-    {
-        return None;
-    }
-    if br
-        .edges
-        .iter()
-        .any(|edge| edge.source_fragment_id == br.root_fragment_id)
-    {
-        return None;
-    }
-
-    let mut incoming_root_edges = br
-        .edges
-        .iter()
-        .filter(|edge| edge.target_fragment_id == br.root_fragment_id);
-    let edge = incoming_root_edges.next()?;
-    if incoming_root_edges.next().is_some() {
-        return None;
-    }
-    if !matches!(edge.edge_kind, FragmentEdgeKind::Stream) {
-        return None;
-    }
-
-    let child_id = edge.source_fragment_id;
-    if child_id == br.root_fragment_id {
-        return None;
-    }
-
-    let child = br
-        .fragment_results
-        .iter()
-        .find(|f| f.fragment_id == child_id)?;
-    if child.plan.nodes.is_empty() {
-        return None;
-    }
-    Some(child_id)
+    None
 }
 
-/// Strip a top-level exchange-only wrapper introduced by a single Gather split.
-///
-/// The stripped child becomes the new root. This keeps Task 1 fragment-builder
-/// output intact while avoiding generic stream-edge execution in standalone.
-fn strip_top_level_stream_root_wrapper(
-    mut build_result: MultiFragmentBuildResult,
-) -> MultiFragmentBuildResult {
-    let Some(child_id) = top_level_stream_root_wrapper_child_id(&build_result) else {
-        return build_result;
-    };
-
-    let old_root_id = build_result.root_fragment_id;
-    let Some(root_fragment) = build_result
-        .fragment_results
-        .iter()
-        .find(|fragment| fragment.fragment_id == old_root_id)
-    else {
-        return build_result;
-    };
-    let root_node = &root_fragment.plan.nodes[0];
-    let root_limit = root_node.limit;
-    let root_offset = root_node
-        .exchange_node
-        .as_ref()
-        .and_then(|exchange| exchange.offset)
-        .unwrap_or(0);
-    if root_offset > 0 {
-        return build_result;
-    }
-    let root_output_sink = root_fragment.output_sink.clone();
-    let root_output_exprs = root_fragment.output_exprs.clone();
-    let root_output_columns = root_fragment.output_columns.clone();
-
-    build_result
-        .fragment_results
-        .retain(|fragment| fragment.fragment_id != old_root_id);
-    build_result.edges.retain(|edge| {
-        !(edge.source_fragment_id == child_id
-            && edge.target_fragment_id == old_root_id
-            && matches!(edge.edge_kind, FragmentEdgeKind::Stream))
-    });
-    build_result.root_fragment_id = child_id;
-    if root_limit >= 0
-        && let Some(child) = build_result
-            .fragment_results
-            .iter_mut()
-            .find(|fragment| fragment.fragment_id == child_id)
-        && let Some(child_root) = child.plan.nodes.first_mut()
-    {
-        child_root.limit = if child_root.limit >= 0 {
-            child_root.limit.min(root_limit)
-        } else {
-            root_limit
-        };
-    }
-    if let Some(child) = build_result
-        .fragment_results
-        .iter_mut()
-        .find(|fragment| fragment.fragment_id == child_id)
-    {
-        child.output_sink = root_output_sink;
-        child.output_exprs = root_output_exprs;
-        child.output_columns = root_output_columns;
-        let node_id = child
-            .plan
-            .nodes
-            .first()
-            .map(|node| node.node_id)
-            .unwrap_or(-1);
-        child.boundary_schemas = vec![BoundarySchemaReport {
-            fragment_id: Some(child.fragment_id as i32),
-            node_id,
-            boundary_kind: BoundaryKind::ResultRoot,
-            columns: output_columns_to_boundary_columns(&child.output_columns),
-        }];
-    }
-    refresh_boundary_schema_aggregate(&mut build_result);
-    build_result
-}
-
-fn refresh_boundary_schema_aggregate(build_result: &mut MultiFragmentBuildResult) {
-    let previous = std::mem::take(&mut build_result.boundary_schemas);
-    for fragment in &build_result.fragment_results {
-        build_result
-            .boundary_schemas
-            .extend(fragment.boundary_schemas.clone());
-    }
-    for report in previous {
-        let keep = match report.boundary_kind {
-            BoundaryKind::ExchangeSender => build_result.edges.iter().any(|edge| {
-                report.fragment_id == Some(edge.source_fragment_id as i32)
-                    && report.node_id == edge.target_exchange_node_id
-            }),
-            BoundaryKind::ExchangeReceiver => build_result.edges.iter().any(|edge| {
-                report.fragment_id == Some(edge.target_fragment_id as i32)
-                    && report.node_id == edge.target_exchange_node_id
-            }),
-            BoundaryKind::RemoteRoot | BoundaryKind::ResultRoot => false,
-        };
-        if keep {
-            build_result.boundary_schemas.push(report);
-        }
-    }
-}
-
+/// Convert the one-fragment result required by explicit direct-execution
+/// exceptions. This is not an ordinary query fast path.
 fn single_fragment_plan(
     build_result: MultiFragmentBuildResult,
 ) -> Result<Box<PlanBuildResult>, Box<MultiFragmentBuildResult>> {
@@ -2915,23 +2778,39 @@ fn single_fragment_plan(
     }))
 }
 
-fn choose_standalone_execution(build_result: MultiFragmentBuildResult) -> StandaloneExecutionPlan {
-    if build_result.fragment_results.len() == 1 {
-        match single_fragment_plan(build_result) {
-            Ok(plan) => return StandaloneExecutionPlan::SingleFragment(plan),
-            Err(br) => return StandaloneExecutionPlan::Coordinated(br),
-        }
-    }
-
-    let build_result = strip_top_level_stream_root_wrapper(build_result);
-    if build_result.fragment_results.len() == 1 {
-        match single_fragment_plan(build_result) {
-            Ok(plan) => return StandaloneExecutionPlan::SingleFragment(plan),
-            Err(br) => return StandaloneExecutionPlan::Coordinated(br),
-        }
-    }
-
-    StandaloneExecutionPlan::Coordinated(Box::new(build_result))
+#[allow(clippy::too_many_arguments)]
+fn execute_query_direct_for_explicit_exception(
+    mut physical: crate::sql::optimizer::PhysicalPlanNode,
+    codegen_catalog: &dyn crate::sql::catalog::CatalogProvider,
+    connectors: &crate::connector::ConnectorRegistry,
+    current_database: &str,
+    query_opts: Option<crate::internal_service::TQueryOptions>,
+    terminal_sink: Option<Box<dyn crate::exec::pipeline::operator_factory::OperatorFactory>>,
+    iceberg_catalogs: Option<&crate::connector::iceberg::catalog::IcebergCatalogRegistry>,
+    mv_refresh_ctx: Option<&crate::engine::mv::refresh_context::IcebergMvRefreshContext>,
+    reason: DirectExecutionReason,
+) -> Result<QueryResult, String> {
+    physical = collapse_distribution_enforcers_for_single_fragment(physical);
+    let build_result = if let Some(mv_refresh_ctx) = mv_refresh_ctx {
+        crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_via_distributed_plan_with_mv_refresh_ctx(
+            &physical,
+            codegen_catalog,
+            connectors,
+            current_database,
+            Some(mv_refresh_ctx),
+        )?
+    } else {
+        crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_via_distributed_plan(
+            &physical,
+            codegen_catalog,
+            connectors,
+            current_database,
+        )?
+    };
+    let plan = single_fragment_plan(build_result).map_err(|_| {
+        format!("direct execution exception {reason:?} produced a multi-fragment plan")
+    })?;
+    execute_plan(*plan, query_opts, terminal_sink, iceberg_catalogs, None)
 }
 
 fn aggregate_delta_row_ids_for_position_locator(
@@ -3221,111 +3100,19 @@ fn prepare_explain_query(
 /// the profiled plan body.
 #[allow(clippy::too_many_arguments)]
 fn explain_analyze_query(
-    query: &sqlparser::ast::Query,
-    analyzer_catalog: &dyn crate::sql::catalog::CatalogProvider,
-    codegen_catalog: &InMemoryCatalog,
-    connectors: &crate::connector::ConnectorRegistry,
-    current_database: &str,
-    exchange_port: u16,
-    query_opts: Option<crate::internal_service::TQueryOptions>,
-    mv_rewrite_state: Option<&Arc<StandaloneState>>,
+    _query: &sqlparser::ast::Query,
+    _analyzer_catalog: &dyn crate::sql::catalog::CatalogProvider,
+    _codegen_catalog: &InMemoryCatalog,
+    _connectors: &crate::connector::ConnectorRegistry,
+    _current_database: &str,
+    _query_opts: Option<crate::internal_service::TQueryOptions>,
+    _mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
-    use crate::runtime::profile::Profiler;
-    use crate::runtime::profile_correlate::collect_actuals_by_plan_node_id_multi;
-    use crate::sql::codegen::ir::{explain_distributed_plan_analyze, lower_distributed_plan};
-    use crate::sql::explain::ExplainLevel;
-    use crate::sql::planner::build_distributed_plan;
-
-    let t_plan = Instant::now();
-    let (resolved, cte_registry, mut factory) =
-        crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
-    let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
-    let mut table_stats = build_table_stats_from_plan(&logical);
-    // MV query rewrite candidate prep (EXPLAIN ANALYZE has no MV refresh
-    // context, so the gate is only `mv_rewrite_state.is_some()`).
-    let mv_candidates = match mv_rewrite_state {
-        Some(state) => crate::engine::mv_rewrite_prep::prepare_mv_rewrite_candidates(
-            state,
-            analyzer_catalog,
-            current_database,
-            &logical,
-            &mut factory,
-            &mut table_stats,
-        ),
-        None => Vec::new(),
-    };
-    // dictionary_provider intentionally None; installed via TLS by execute_in_context.
-    let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
-    let opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
-        &logical,
-        &mut scalar_arena,
-    )?;
-    let physical = crate::sql::optimizer::optimize(
-        opt_expr,
-        scalar_arena,
-        &table_stats,
-        factory,
-        None,
-        mv_candidates,
-    )?;
-    let dp = build_distributed_plan(&physical)?;
-    let build_result = lower_distributed_plan(&dp, codegen_catalog, connectors, None)?;
-    let planning_ms = t_plan.elapsed().as_millis() as u64;
-
-    let t_exec = Instant::now();
-    let (rows, profilers) = match choose_standalone_execution(build_result) {
-        StandaloneExecutionPlan::SingleFragment(plan) => {
-            let profiler = Profiler::new("explain_analyze");
-            let executed = execute_plan(*plan, query_opts, None, None, Some(profiler.clone()))?;
-            let rows: u64 = executed.chunks.iter().map(|c| c.len() as u64).sum();
-            (rows, vec![profiler])
-        }
-        StandaloneExecutionPlan::Coordinated(build_result) => {
-            let mut profiled_query_opts = query_opts.unwrap_or_default();
-            profiled_query_opts.enable_profile = Some(true);
-            let (dispatcher, scheduler) = coordinated_execution_services(exchange_port)?;
-            if !dispatcher.supports_profile_collection() {
-                return Err(
-                    "EXPLAIN ANALYZE for coordinated plans requires in-process profile collection; remote fragment profiles are not available yet"
-                        .to_string(),
-                );
-            }
-            let outcome = crate::runtime::coordinator::ExecutionCoordinator::new(
-                *build_result,
-                dispatcher,
-                scheduler,
-                Some(profiled_query_opts),
-            )
-            .execute_with_write_outcome()?;
-            let rows: u64 = outcome
-                .query_result
-                .chunks
-                .iter()
-                .map(|c| c.len() as u64)
-                .sum();
-            if outcome.profilers.is_empty() {
-                return Err(
-                    "EXPLAIN ANALYZE did not collect any fragment profiles for the coordinated plan"
-                        .to_string(),
-                );
-            }
-            (rows, outcome.profilers)
-        }
-    };
-    let execution_ms = t_exec.elapsed().as_millis() as u64;
-
-    let mut lines = Vec::new();
-    lines.push(format!(
-        "Planning: {planning_ms} ms / Execution: {execution_ms} ms / Rows: {rows}"
-    ));
-    let actuals = collect_actuals_by_plan_node_id_multi(&profilers);
-    lines.extend(explain_distributed_plan_analyze(
-        &dp,
-        ExplainLevel::Analyze,
-        &actuals,
-    ));
-
-    build_string_query_result("Explain String", lines)
+    Err(
+        "EXPLAIN ANALYZE requires remote fragment profile collection; \
+         RemoteDispatcher profiles are not available yet"
+            .to_string(),
+    )
 }
 
 /// Produce non-distributed logical EXPLAIN output for a query without
@@ -3544,11 +3331,6 @@ pub(crate) fn execute_query_as_iceberg_write(
         rewrite_time_travel_refs(state, current_catalog, current_database, &mut prepared)?;
     }
 
-    let exchange_port = if state.exchange_port == 0 {
-        ensure_standalone_exchange_server()?
-    } else {
-        state.exchange_port
-    };
     let catalog_snapshot = state
         .catalog
         .read()
@@ -3607,7 +3389,7 @@ pub(crate) fn execute_query_as_iceberg_write(
             None,
             &sink_spec,
         )?;
-    let (dispatcher, scheduler) = coordinated_execution_services(exchange_port)?;
+    let (dispatcher, scheduler) = coordinated_execution_services()?;
     crate::runtime::coordinator::ExecutionCoordinator::new(
         build_result,
         dispatcher,
@@ -3779,7 +3561,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         &logical,
         &mut scalar_arena,
     )?;
-    let mut physical = crate::sql::optimizer::optimize(
+    let physical = crate::sql::optimizer::optimize(
         opt_expr,
         scalar_arena,
         &table_stats,
@@ -3787,16 +3569,25 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         None,
         mv_candidates,
     )?;
-    // Unit-test states may not start the standalone exchange server. IVM-A1
-    // internal queries also pass runtime-local handles (`terminal_sink` or
-    // `iceberg_catalogs`) that coordinated fragments cannot currently clone
-    // into remote fragment execution. Collapse distribution nodes before
-    // fragment building so those refresh queries stay local.
-    let force_single_fragment =
-        terminal_sink.is_some() || iceberg_catalogs.is_some() || exchange_port == 0;
-    if force_single_fragment {
-        physical = collapse_distribution_enforcers_for_single_fragment(physical);
+
+    if let Some(reason) = direct_execution_reason(
+        terminal_sink.is_some(),
+        iceberg_catalogs.is_some(),
+        exchange_port,
+    ) {
+        return execute_query_direct_for_explicit_exception(
+            physical,
+            codegen_catalog,
+            connectors,
+            current_database,
+            query_opts,
+            terminal_sink,
+            iceberg_catalogs,
+            mv_refresh_ctx,
+            reason,
+        );
     }
+
     let build_result = if let Some(mv_refresh_ctx) = mv_refresh_ctx {
         crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_via_distributed_plan_with_mv_refresh_ctx(
             &physical,
@@ -3813,42 +3604,17 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
             current_database,
         )?
     };
-
-    let execution_plan = choose_standalone_execution(build_result);
-
-    match execution_plan {
-        StandaloneExecutionPlan::SingleFragment(plan) => {
-            execute_plan(*plan, query_opts, terminal_sink, iceberg_catalogs, None)
-        }
-        StandaloneExecutionPlan::Coordinated(build_result) => {
-            if terminal_sink.is_some() {
-                return Err(
-                    "IVM-A1 custom sink does not yet support coordinated multi-fragment plans"
-                        .to_string(),
-                );
-            }
-            if iceberg_catalogs.is_some() {
-                return Err(
-                    "IVM-A1 iceberg_catalogs runtime registry does not yet support coordinated \
-                     multi-fragment plans"
-                        .to_string(),
-                );
-            }
-            let (dispatcher, scheduler) = coordinated_execution_services(exchange_port)?;
-            crate::runtime::coordinator::ExecutionCoordinator::new(
-                *build_result,
-                dispatcher,
-                scheduler,
-                query_opts,
-            )
-            .execute()
-        }
-    }
+    let (dispatcher, scheduler) = coordinated_execution_services()?;
+    crate::runtime::coordinator::ExecutionCoordinator::new(
+        build_result,
+        dispatcher,
+        scheduler,
+        query_opts,
+    )
+    .execute()
 }
 
-fn coordinated_execution_services(
-    exchange_port: u16,
-) -> Result<
+fn coordinated_execution_services() -> Result<
     (
         Arc<dyn crate::runtime::dispatcher::FragmentDispatcher>,
         Arc<crate::runtime::scheduler::FragmentScheduler>,
@@ -3856,50 +3622,75 @@ fn coordinated_execution_services(
     String,
 > {
     use crate::common::app_config::ClusterRole;
-    use std::net::SocketAddr;
-
     let role = crate::novarocks_config::config()
         .map(|c| c.cluster.role)
         .unwrap_or(ClusterRole::AllInOne);
-    let dispatcher = dispatcher_for_role(role)?;
-    // Backend list for the scheduler: FE uses the live registry snapshot;
-    // all-in-one is the local exchange endpoint; pure BE must not coordinate.
-    let backends: Vec<SocketAddr> = match role {
-        ClusterRole::Fe => backend_ops::live_backend_scheduler_endpoints()?,
-        ClusterRole::AllInOne => vec![
-            format!("127.0.0.1:{exchange_port}")
-                .parse()
-                .map_err(|e| format!("{e}"))?,
-        ],
+    let (dispatcher, scheduler) = match role {
+        ClusterRole::Fe | ClusterRole::AllInOne => {
+            let entries = backend_ops::live_backend_dispatch_entries()?;
+            let dispatcher = Arc::new(
+                crate::runtime::dispatcher::RemoteDispatcher::new_with_backend_ids(&entries)?,
+            );
+            let scheduler = Arc::new(
+                crate::runtime::scheduler::FragmentScheduler::new_with_backend_ids(entries),
+            );
+            (
+                dispatcher as Arc<dyn crate::runtime::dispatcher::FragmentDispatcher>,
+                scheduler,
+            )
+        }
         ClusterRole::Be => {
             return Err("role=be must not enter standalone coordinator".into());
         }
     };
-    let scheduler = Arc::new(crate::runtime::scheduler::FragmentScheduler::new(backends));
     Ok((dispatcher, scheduler))
 }
 
 /// Select a `FragmentDispatcher` implementation based on the effective cluster role.
 ///
-/// - `AllInOne`: uses `InProcessDispatcher`. Exchange destinations are filled by
-///   the scheduler from the backend list (the local exchange endpoint).
-/// - `Fe`: uses `RemoteDispatcher` bound to all configured backends.
+/// - `AllInOne` and `Fe`: use `RemoteDispatcher` bound to live registry backends.
 /// - `Be`: standalone coordinator must not be entered when the process is a pure BE.
 pub(crate) fn dispatcher_for_role(
     role: crate::common::app_config::ClusterRole,
 ) -> Result<Arc<dyn crate::runtime::dispatcher::FragmentDispatcher>, String> {
     use crate::common::app_config::ClusterRole;
     match role {
-        ClusterRole::AllInOne => Ok(Arc::new(
-            crate::runtime::dispatcher::InProcessDispatcher::new(),
-        )),
         ClusterRole::Fe => {
+            let entries = backend_ops::live_backend_dispatch_entries()
+                .map_err(|e| with_fe_error_context(e))?;
+            Ok(Arc::new(
+                crate::runtime::dispatcher::RemoteDispatcher::new_with_backend_ids(&entries)?,
+            ))
+        }
+        ClusterRole::AllInOne => {
             let entries = backend_ops::live_backend_dispatch_entries()?;
             Ok(Arc::new(
                 crate::runtime::dispatcher::RemoteDispatcher::new_with_backend_ids(&entries)?,
             ))
         }
         ClusterRole::Be => Err("role=be must not enter standalone coordinator".to_string()),
+    }
+}
+
+fn with_fe_error_context(err: String) -> String {
+    if err.starts_with("role=fe:") {
+        err
+    } else {
+        format!("role=fe: {err}")
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn dispatcher_kind_for_test(
+    dispatcher: &Arc<dyn crate::runtime::dispatcher::FragmentDispatcher>,
+) -> &'static str {
+    if dispatcher
+        .as_any()
+        .is::<crate::runtime::dispatcher::RemoteDispatcher>()
+    {
+        "remote"
+    } else {
+        "unknown"
     }
 }
 
@@ -4890,6 +4681,7 @@ mod tests {
     use crate::connector::starrocks::lake::context::lock_runtime_test_state;
     use crate::connector::starrocks::table::config::StarRocksTableConfig;
     use crate::meta::MetaStoreProvider;
+    use crate::runtime::backend_registry::BackendRegistryTestGuard as BackendRegistryReset;
     use crate::sql::planner::plan::*;
     use arrow::array::{
         Array, FixedSizeBinaryArray, Int32Array, Int64Array, ListArray, StringArray,
@@ -4898,21 +4690,6 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use tempfile::TempDir;
-
-    struct BackendRegistryReset;
-
-    impl BackendRegistryReset {
-        fn new() -> Self {
-            crate::runtime::backend_registry::replace_backend_registry_for_test(None);
-            Self
-        }
-    }
-
-    impl Drop for BackendRegistryReset {
-        fn drop(&mut self) {
-            crate::runtime::backend_registry::replace_backend_registry_for_test(None);
-        }
-    }
 
     fn string_cell(result: &QueryResult, row: usize, col: usize) -> String {
         let batch = &result.chunks[0].batch;
@@ -5259,7 +5036,18 @@ path = "{metadata_path}"
 
         let result = session.query("SHOW BACKENDS").expect("SHOW BACKENDS");
         assert_eq!(result.row_count(), 1);
+        assert_eq!(string_cell(&result, 0, 0), "0");
+        assert_eq!(string_cell(&result, 0, 1), "127.0.0.1");
+        assert_eq!(
+            string_cell(&result, 0, 2),
+            engine.inner.exchange_port.to_string()
+        );
         assert_eq!(string_cell(&result, 0, 3), "Live");
+        assert_eq!(string_cell(&result, 0, 7), env!("CARGO_PKG_VERSION"));
+        assert!(
+            string_cell(&result, 0, 8).parse::<u32>().unwrap() > 0,
+            "NumCores must be populated"
+        );
     }
 
     #[test]
@@ -6784,12 +6572,12 @@ enable_path_style_access = true
     }
 
     #[test]
-    fn explain_analyze_populates_per_operator_profile() {
+    fn explain_analyze_fails_fast_without_remote_profiles() {
         let warehouse = TempDir::new().expect("warehouse");
         let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
         create_kv_tables(&session, "(1,10),(2,20),(3,30)", "(1,100),(2,200),(3,300)");
 
-        let result = session
+        let err = session
             .execute_in_context(
                 "EXPLAIN ANALYZE \
                  SELECT count(*) \
@@ -6798,14 +6586,11 @@ enable_path_style_access = true
                 "db1",
                 None,
             )
-            .expect("explain analyze");
-        let StatementResult::Query(result) = result else {
-            panic!("EXPLAIN ANALYZE must return a query result");
-        };
+            .expect_err("EXPLAIN ANALYZE must fail until remote profiles are available");
 
         assert!(
-            query_result_contains_string(&result, "act={rows="),
-            "EXPLAIN ANALYZE output must contain per-operator actual row counts"
+            err.contains("EXPLAIN ANALYZE requires remote fragment profile collection"),
+            "unexpected EXPLAIN ANALYZE error: {err}"
         );
     }
 
@@ -6870,26 +6655,6 @@ enable_path_style_access = true
                 crate::sql::codegen::FragmentEdgeKind::Stream
             )
         }));
-    }
-
-    #[test]
-    fn top_level_wrapper_with_limit_is_not_stripped() {
-        let build = build_fragments_for_query("SELECT id FROM tbl LIMIT 5");
-
-        assert!(
-            super::top_level_stream_root_wrapper_child_id(&build).is_none(),
-            "top-level exchange wrapper carrying LIMIT must stay as the root"
-        );
-    }
-
-    #[test]
-    fn top_level_merging_topn_wrapper_is_not_stripped() {
-        let build = build_fragments_for_query("SELECT id FROM tbl ORDER BY id LIMIT 5");
-
-        assert!(
-            super::top_level_stream_root_wrapper_child_id(&build).is_none(),
-            "top-level exchange wrapper carrying merging TopN semantics must stay as the root"
-        );
     }
 
     #[test]
@@ -9581,8 +9346,58 @@ path = "meta/operations.sqlite"
     #[test]
     fn dispatcher_for_role_all_in_one_ok() {
         use crate::common::app_config::ClusterRole;
+        let _registry = BackendRegistryReset::new();
+        crate::engine::backend_ops::install_all_in_one_backend_registry(
+            "127.0.0.1:19070".parse().unwrap(),
+            3,
+        )
+        .expect("install loopback registry");
         let result = super::dispatcher_for_role(ClusterRole::AllInOne);
         assert!(result.is_ok(), "AllInOne should produce a dispatcher");
+    }
+
+    #[test]
+    fn all_in_one_dispatcher_uses_remote_registry() {
+        let _guard = super::acquire_standalone_test_guard();
+        let _registry = BackendRegistryReset::new();
+        use crate::common::app_config::{ClusterRole, NovaRocksConfig};
+        let mut cfg = NovaRocksConfig::default();
+        cfg.cluster.role = ClusterRole::AllInOne;
+        cfg.cluster.backends.clear();
+        crate::common::app_config::install_preloaded_config(cfg);
+
+        let endpoint = "127.0.0.1:19070".parse().unwrap();
+        crate::engine::backend_ops::install_all_in_one_backend_registry(endpoint, 3)
+            .expect("install loopback registry");
+
+        let dispatcher = super::dispatcher_for_role(ClusterRole::AllInOne).expect("dispatcher");
+
+        assert_eq!(super::dispatcher_kind_for_test(&dispatcher), "remote");
+        assert_eq!(dispatcher.backend_count(), 1);
+    }
+
+    #[test]
+    fn coordinated_execution_services_use_one_live_backend_snapshot() {
+        let _guard = super::acquire_standalone_test_guard();
+        let _registry = BackendRegistryReset::new();
+        use crate::common::app_config::{ClusterRole, NovaRocksConfig};
+        use crate::runtime::backend_registry::{BackendRegistry, BackendState};
+        let mut cfg = NovaRocksConfig::default();
+        cfg.cluster.role = ClusterRole::Fe;
+        cfg.cluster.backends.clear();
+        crate::common::app_config::install_preloaded_config(cfg);
+
+        let endpoint = "127.0.0.1:19072".parse().unwrap();
+        let registry = Arc::new(BackendRegistry::new(3));
+        registry.restore_backend(2, endpoint, BackendState::Live);
+        crate::runtime::backend_registry::replace_backend_registry_for_test(Some(registry));
+
+        let (dispatcher, scheduler) =
+            super::coordinated_execution_services().expect("coordinated services");
+
+        assert_eq!(super::dispatcher_kind_for_test(&dispatcher), "remote");
+        assert_eq!(dispatcher.backend_count(), 1);
+        assert_eq!(scheduler.live_backend_entries(), &[(2usize, endpoint)]);
     }
 
     #[test]

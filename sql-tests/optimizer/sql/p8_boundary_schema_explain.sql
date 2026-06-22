@@ -8,17 +8,7 @@ FROM (
 ) t
 GROUP BY k;
 
--- @skip_result_check=true
--- @normalize_explain_timing=true
--- @result_contains=Planning:
--- @result_contains=PLAN FRAGMENT 0
--- @result_contains=PLAN FRAGMENT 1
--- @result_contains=EXCHANGE ID:
--- @result_contains=HASH AGGREGATE (SINGLE
--- @result_contains=PROJECT [k, sum(v) AS total_v] stats={rows=2 conf=estimated} act={rows=1
--- @result_contains=HASH AGGREGATE (SINGLE, group by: [k]) stats={rows=2 conf=estimated} act={rows=2
--- @result_contains=VALUES (1 rows) stats={rows=1} act={rows=1
--- @result_not_contains=Boundary Schemas:
+-- @expect_error=EXPLAIN ANALYZE requires remote fragment profile collection
 EXPLAIN ANALYZE SELECT k, SUM(v) AS total_v
 FROM (
     SELECT 1 AS k, 10 AS v

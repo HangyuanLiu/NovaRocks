@@ -14,7 +14,7 @@ pub(crate) use crate::sql::planner::{
     DataPartition, DataSink, DistributedPlan, DistributedPlanNode, PartitionKind, PlanFragment,
     PlanNodeStats, build_distributed_plan,
 };
-pub(crate) use explain::{explain_distributed_plan, explain_distributed_plan_analyze};
+pub(crate) use explain::explain_distributed_plan;
 pub(crate) use lowering::lower_distributed_plan;
 
 #[cfg(test)]

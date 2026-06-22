@@ -196,6 +196,40 @@ fn connect_mysql(port: u16) -> MysqlConn {
     }
 }
 
+fn start_all_in_one(extra: &str) -> (ProcessGuard, u16) {
+    let mysql = ReservedPort::new();
+    let http = ReservedPort::new();
+    let grpc = ReservedPort::new();
+    let mysql_port = mysql.port();
+    let http_port = http.port();
+    let grpc_port = grpc.port();
+    let config = write_config(
+        "all-in-one",
+        &format!(
+            r#"
+[server]
+host = "127.0.0.1"
+http_port = {http_port}
+grpc_port = {grpc_port}
+
+[standalone_server]
+mysql_port = {mysql_port}
+
+[cluster]
+role = "all-in-one"
+
+{extra}
+"#
+        ),
+    );
+    let _ = mysql.release();
+    let _ = http.release();
+    let _ = grpc.release();
+    let mut process = ProcessGuard::spawn(config.path());
+    process.wait_for_ready("NOVAROCKS_READY mysql_port=");
+    (process, mysql_port)
+}
+
 fn assert_fe_report_only_endpoint_rejects_local_submit(port: u16) {
     let addr: std::net::SocketAddr = format!("127.0.0.1:{port}")
         .parse()
@@ -568,6 +602,53 @@ fn fetch_http_text(port: u16, path: &str) -> String {
         .unwrap_or_else(|err| panic!("GET {url} status failed: {err}"))
         .text()
         .unwrap_or_else(|err| panic!("read {url} text failed: {err}"))
+}
+
+#[test]
+fn all_in_one_select_uses_loopback_submit() {
+    let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
+    if !binary.exists() {
+        return;
+    }
+    let _lock = lock_cluster_mvp();
+
+    let (_srv, mysql_port) = start_all_in_one(
+        r#"
+[debug]
+fault_inject_submit_fail_after = 0
+"#,
+    );
+
+    let mut conn = connect_mysql(mysql_port);
+    let err = conn
+        .query::<i64, _>("SELECT 1")
+        .expect_err("SELECT 1 should hit RemoteDispatcher submit fault");
+    let err = err.to_string();
+    assert!(
+        err.contains("debug submit fault injected"),
+        "expected loopback submit fault, got: {err}"
+    );
+}
+
+#[test]
+fn all_in_one_loopback_select_succeeds() {
+    let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
+    if !binary.exists() {
+        return;
+    }
+    let _lock = lock_cluster_mvp();
+
+    let (mut srv, mysql_port) = start_all_in_one(
+        r#"
+[debug]
+emit_grpc_fragment_marker = true
+"#,
+    );
+    let mut conn = connect_mysql(mysql_port);
+    let rows: Vec<i64> = conn.query("SELECT 1").expect("SELECT 1");
+    assert_eq!(rows, vec![1]);
+    srv.wait_for_output_contains("NOVAROCKS_GRPC_SUBMIT call=", Duration::from_secs(3));
+    srv.wait_for_output_contains("NOVAROCKS_GRPC_FETCH_TYPED status=", Duration::from_secs(3));
 }
 
 #[test]

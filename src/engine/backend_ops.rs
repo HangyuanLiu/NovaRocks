@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
@@ -10,7 +10,7 @@ use crate::common::app_config::ClusterRole;
 use crate::engine::{QueryResult, QueryResultColumn, StandaloneState, StatementResult};
 use crate::meta::MetaStoreProvider;
 use crate::meta::repository::backend::StoredBackend;
-use crate::runtime::backend_registry::{BackendRegistry, BackendState, BeId};
+use crate::runtime::backend_registry::{BackendRegistry, BackendState, BeId, HeartbeatOutcome};
 use crate::runtime::query_state::in_flight_table;
 use crate::sql::parser::ast::{AddBackendStmt, DropBackendStmt};
 
@@ -67,11 +67,158 @@ pub(crate) fn ensure_backend_registry(
     Ok(crate::runtime::backend_registry::backend_registry().unwrap_or(registry))
 }
 
+pub(crate) fn wait_for_configured_backends_live(
+    _state: &Arc<StandaloneState>,
+) -> Result<(), String> {
+    let cfg = crate::novarocks_config::config().map_err(|e| format!("read config failed: {e}"))?;
+    let configured = cfg
+        .cluster
+        .backends
+        .iter()
+        .map(|addr| parse_backend_addr(addr))
+        .collect::<Result<Vec<_>, _>>()?;
+    let Some(registry) = crate::runtime::backend_registry::backend_registry() else {
+        return Err("role=fe backend registry is not initialized".to_string());
+    };
+
+    wait_for_configured_backends_live_with(
+        registry.as_ref(),
+        &configured,
+        Duration::from_secs(5),
+        Duration::from_millis(cfg.cluster.heartbeat_interval_ms.max(10).min(200)),
+        crate::runtime::heartbeat_mgr::grpc_heartbeat,
+    )
+}
+
+fn wait_for_configured_backends_live_with<F>(
+    registry: &BackendRegistry,
+    configured: &[SocketAddr],
+    timeout: Duration,
+    retry_interval: Duration,
+    send: F,
+) -> Result<(), String>
+where
+    F: Fn(BeId, SocketAddr) -> HeartbeatOutcome,
+{
+    if configured.is_empty() {
+        return Ok(());
+    }
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        crate::runtime::heartbeat_mgr::run_one_round(registry, &send);
+        if configured_backend_live(registry, configured) {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            let configured = configured
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let snapshot = registry
+                .snapshot()
+                .into_iter()
+                .map(|entry| {
+                    format!(
+                        "be_id={} endpoint={} state={} err={}",
+                        entry.be_id,
+                        entry.endpoint,
+                        backend_state_to_str(entry.state),
+                        entry.last_err.unwrap_or_default()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(format!(
+                "role=fe startup timed out waiting for at least one configured backend to become Live; configured=[{configured}] registry=[{snapshot}]"
+            ));
+        }
+        std::thread::sleep(retry_interval);
+    }
+}
+
+fn configured_backend_live(registry: &BackendRegistry, configured: &[SocketAddr]) -> bool {
+    registry
+        .snapshot()
+        .into_iter()
+        .any(|entry| configured.contains(&entry.endpoint) && entry.state == BackendState::Live)
+}
+
+pub(crate) fn install_all_in_one_backend_registry(
+    endpoint: SocketAddr,
+    heartbeat_timeout_retries: u32,
+) -> Result<Arc<BackendRegistry>, String> {
+    if let Some(registry) = crate::runtime::backend_registry::backend_registry() {
+        validate_all_in_one_loopback_registry(registry.as_ref(), endpoint)?;
+        return Ok(registry);
+    }
+
+    let registry = Arc::new(BackendRegistry::new(heartbeat_timeout_retries));
+    let be_id = registry.add_backend_with_state(endpoint, BackendState::Live);
+    if be_id != 0 {
+        return Err(format!(
+            "all-in-one loopback backend must be backend 0, got {be_id}"
+        ));
+    }
+    registry.apply_heartbeat_result(
+        be_id,
+        HeartbeatOutcome::Ok {
+            start_epoch: crate::runtime::start_epoch::start_epoch(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            num_cores: std::thread::available_parallelism()
+                .map(|n| n.get().min(u32::MAX as usize) as u32)
+                .unwrap_or(1),
+            now_ms: current_time_millis(),
+        },
+    );
+
+    crate::runtime::backend_registry::install_backend_registry(Arc::clone(&registry));
+    Ok(crate::runtime::backend_registry::backend_registry().unwrap_or(registry))
+}
+
+fn validate_all_in_one_loopback_registry(
+    registry: &BackendRegistry,
+    endpoint: SocketAddr,
+) -> Result<(), String> {
+    let snapshot = registry.snapshot();
+    let valid = snapshot.len() == 1
+        && snapshot[0].be_id == 0
+        && snapshot[0].endpoint == endpoint
+        && snapshot[0].state == BackendState::Live;
+    if valid {
+        return Ok(());
+    }
+    let actual = snapshot
+        .iter()
+        .map(|entry| {
+            format!(
+                "be_id={} endpoint={} state={}",
+                entry.be_id,
+                entry.endpoint,
+                backend_state_to_str(entry.state)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "all-in-one loopback backend registry mismatch: expected exactly one Live backend be_id=0 endpoint={endpoint}, got [{}]",
+        actual
+    ))
+}
+
+fn current_time_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 pub(crate) fn live_backend_dispatch_entries() -> Result<Vec<(usize, SocketAddr)>, String> {
     if let Some(registry) = crate::runtime::backend_registry::backend_registry() {
         let live = registry.live_endpoints();
         if live.is_empty() {
-            return Err("role=fe: no live backend available".to_string());
+            return Err("no live backend available".to_string());
         }
         return Ok(live
             .into_iter()
@@ -82,18 +229,11 @@ pub(crate) fn live_backend_dispatch_entries() -> Result<Vec<(usize, SocketAddr)>
     configured_backend_entries()
 }
 
-pub(crate) fn live_backend_scheduler_endpoints() -> Result<Vec<SocketAddr>, String> {
-    Ok(live_backend_dispatch_entries()?
-        .into_iter()
-        .map(|(_, endpoint)| endpoint)
-        .collect())
-}
-
 fn configured_backend_entries() -> Result<Vec<(usize, SocketAddr)>, String> {
     let cfg = crate::novarocks_config::config()
         .map_err(|e| format!("role=fe: cannot read config: {e}"))?;
     if cfg.cluster.backends.is_empty() {
-        return Err("role=fe: no live backend available".to_string());
+        return Err("no live backend available".to_string());
     }
     cfg.cluster
         .backends
@@ -149,31 +289,14 @@ pub(crate) fn execute_show_backends(
                 registry.snapshot(),
             )?))
         }
-        ClusterRole::AllInOne => Ok(StatementResult::Query(show_backends_result(vec![
-            implicit_all_in_one_backend(state),
-        ])?)),
+        ClusterRole::AllInOne => {
+            let registry = crate::runtime::backend_registry::backend_registry()
+                .ok_or_else(|| "all-in-one backend registry is not initialized".to_string())?;
+            Ok(StatementResult::Query(show_backends_result(
+                registry.snapshot(),
+            )?))
+        }
         ClusterRole::Be => Err("SHOW BACKENDS is not available in role=be".to_string()),
-    }
-}
-
-fn implicit_all_in_one_backend(
-    state: &Arc<StandaloneState>,
-) -> crate::runtime::backend_registry::BackendEntry {
-    crate::runtime::backend_registry::BackendEntry {
-        be_id: 0,
-        endpoint: format!("127.0.0.1:{}", state.exchange_port)
-            .parse()
-            .unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap()),
-        state: BackendState::Live,
-        start_epoch: 0,
-        last_heartbeat_ms: 0,
-        missed_heartbeats: 0,
-        last_err: None,
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        num_cores: std::thread::available_parallelism()
-            .map(|n| n.get().min(u32::MAX as usize) as u32)
-            .unwrap_or(1),
-        scheduled_fragments: 0,
     }
 }
 
@@ -377,5 +500,92 @@ fn backend_state_from_str(state: &str) -> Result<BackendState, String> {
         "Lost" => Ok(BackendState::Lost),
         "Decommissioning" => Ok(BackendState::Decommissioning),
         other => Err(format!("invalid persisted backend state '{other}'")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::backend_registry::BackendRegistryTestGuard as BackendRegistryReset;
+
+    #[test]
+    fn all_in_one_loopback_registry_installs_live_backend_zero() {
+        let _registry = BackendRegistryReset::new();
+        let endpoint: std::net::SocketAddr = "127.0.0.1:19070".parse().unwrap();
+
+        let registry = install_all_in_one_backend_registry(endpoint, 3)
+            .expect("install all-in-one loopback backend");
+        let live = registry.live_endpoints();
+        let snapshot = registry.snapshot();
+
+        assert_eq!(live, vec![(0, endpoint)]);
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].be_id, 0);
+        assert_eq!(snapshot[0].endpoint, endpoint);
+        assert_eq!(snapshot[0].state, BackendState::Live);
+        assert_eq!(snapshot[0].version, env!("CARGO_PKG_VERSION"));
+        assert!(snapshot[0].num_cores > 0);
+        assert!(snapshot[0].last_heartbeat_ms > 0);
+        assert_eq!(
+            live_backend_dispatch_entries().expect("dispatch entries"),
+            vec![(0usize, endpoint)]
+        );
+    }
+
+    #[test]
+    fn all_in_one_loopback_registry_rejects_mismatched_existing_registry() {
+        let _registry = BackendRegistryReset::new();
+        let existing_endpoint: std::net::SocketAddr = "127.0.0.1:19070".parse().unwrap();
+        let requested_endpoint: std::net::SocketAddr = "127.0.0.1:19071".parse().unwrap();
+        let registry = Arc::new(BackendRegistry::new(3));
+        registry.add_backend_with_state(existing_endpoint, BackendState::Live);
+        crate::runtime::backend_registry::replace_backend_registry_for_test(Some(registry));
+
+        let err = match install_all_in_one_backend_registry(requested_endpoint, 3) {
+            Ok(_) => panic!("mismatched existing registry must fail"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.contains("all-in-one loopback backend registry"),
+            "{err}"
+        );
+        assert!(err.contains("127.0.0.1:19071"), "{err}");
+    }
+
+    #[test]
+    fn wait_for_configured_backends_live_returns_immediately_without_configured_backends() {
+        let registry = Arc::new(BackendRegistry::new(3));
+
+        wait_for_configured_backends_live_with(
+            &registry,
+            &[],
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            |_be_id, _endpoint| HeartbeatOutcome::failed("should not heartbeat"),
+        )
+        .expect("empty configured backend list must not wait");
+    }
+
+    #[test]
+    fn wait_for_configured_backends_live_heartbeats_until_one_backend_is_live() {
+        let endpoint: std::net::SocketAddr = "127.0.0.1:19070".parse().unwrap();
+        let registry = Arc::new(BackendRegistry::new(3));
+        let be_id = registry.add_backend(endpoint);
+
+        wait_for_configured_backends_live_with(
+            &registry,
+            &[endpoint],
+            Duration::from_millis(50),
+            Duration::from_millis(1),
+            move |actual_be_id, actual_endpoint| {
+                assert_eq!(actual_be_id, be_id);
+                assert_eq!(actual_endpoint, endpoint);
+                HeartbeatOutcome::ok(7, 100)
+            },
+        )
+        .expect("configured backend should become live");
+
+        assert_eq!(registry.live_endpoints(), vec![(be_id, endpoint)]);
     }
 }
