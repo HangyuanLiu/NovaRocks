@@ -501,6 +501,7 @@ mod tests {
             database: "db".into(),
             table: make_table_def(cols),
             alias: None,
+            stats_ref: None,
             columns: cols
                 .iter()
                 .map(|(n, id)| OutputColumn {

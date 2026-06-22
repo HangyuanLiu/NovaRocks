@@ -1013,6 +1013,7 @@ mod tests {
             database: "d".to_string(),
             table,
             alias: None,
+            stats_ref: None,
             columns: vec![
                 make_output_column(ColumnId::new_for_test(id_a), "a"),
                 make_output_column(ColumnId::new_for_test(id_b), "b"),
@@ -2142,6 +2143,7 @@ mod tests {
                     },
                 },
                 alias: None,
+                stats_ref: None,
                 columns: vec![make_output_column(ColumnId::new_for_test(1), "a")],
                 predicates: vec![],
                 required_columns: None,

@@ -107,6 +107,7 @@ mod tests {
                 },
             },
             alias: None,
+            stats_ref: None,
             columns: cols
                 .iter()
                 .map(|n| OutputColumn {

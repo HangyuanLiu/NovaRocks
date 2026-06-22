@@ -264,6 +264,7 @@ mod tests {
             database: "db".into(),
             table,
             alias: Some(table_name.into()),
+            stats_ref: None,
             columns: cols
                 .iter()
                 .map(|n| OutputColumn {

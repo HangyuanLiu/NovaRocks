@@ -98,6 +98,7 @@ mod tests {
                     },
                 },
                 alias: None,
+                stats_ref: None,
                 columns: vec![],
                 predicates: vec![],
                 required_columns: None,

@@ -2784,6 +2784,7 @@ mod tests {
                 database: scan.database,
                 table: scan.table,
                 alias: scan.alias,
+                stats_ref: None,
                 columns: scan.columns,
                 predicates,
                 required_columns: scan.required_columns,

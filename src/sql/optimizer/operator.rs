@@ -12,6 +12,7 @@ use crate::sql::common::{
     ApplyKind, CteId, DecodeMapping, ImvVersionRef, JoinKind, OutputColumn, WindowFrame,
 };
 use crate::sql::optimizer::scalar::{ColumnDisplay, ScalarId, SortKey};
+use crate::sql::optimizer::stats_input::StatsRef;
 
 pub(crate) use crate::sql::common::{ScanDictionaryColumn, ScanVariantColumn};
 
@@ -105,6 +106,7 @@ pub(crate) struct ScanOp {
     pub database: String,
     pub table: TableDef,
     pub alias: Option<String>,
+    pub stats_ref: Option<StatsRef>,
     pub columns: Vec<OutputColumn>,
     pub predicates: Vec<ScalarId>,
     pub required_columns: Option<Vec<String>>,

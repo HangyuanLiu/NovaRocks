@@ -243,6 +243,65 @@ fn optimize_with_root_property(
     Ok(physical)
 }
 
+fn validate_query_stats_bound(expr: &OptExpr) -> Result<(), String> {
+    match &expr.op {
+        Operator::LogicalScan(scan) | Operator::PhysicalScan(scan) if scan.stats_ref.is_none() => {
+            return Err(format!(
+                "optimizer scan statistics are not bound for table {}",
+                scan.table.name
+            ));
+        }
+        _ => {}
+    }
+    for child in &expr.children {
+        validate_query_stats_bound(child)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn optimizer_rejects_unbound_scan_stats() {
+    use arrow::datatypes::DataType;
+
+    use crate::sql::catalog::{ScanSource, TableDef};
+    use crate::sql::common::OutputColumn;
+    use crate::sql::optimizer::operator::{Operator, ScanOp};
+
+    let expr = OptExpr::leaf(Operator::LogicalScan(ScanOp {
+        database: "db".to_string(),
+        table: TableDef {
+            name: "unbound_table".to_string(),
+            columns: vec![],
+            iceberg_row_lineage_metadata_columns: vec![],
+            source: ScanSource::StarRocks {
+                db_id: 0,
+                table_id: 0,
+            },
+        },
+        alias: None,
+        stats_ref: None,
+        columns: vec![OutputColumn {
+            column_id: crate::sql::column_id::ColumnId::new_for_test(1),
+            name: "k".to_string(),
+            data_type: DataType::Int64,
+            nullable: true,
+            is_internal: false,
+        }],
+        predicates: vec![],
+        required_columns: None,
+        dict_columns: vec![],
+        variant_columns: vec![],
+        mv_rewritten_from: None,
+    }));
+
+    let err = validate_query_stats_bound(&expr).expect_err("unbound scan must be rejected");
+    assert!(
+        err.contains("optimizer scan statistics are not bound"),
+        "unexpected error: {err}"
+    );
+}
+
 /// Resolve which dictionary provider should drive the
 /// `LowCardinalityDictionaryRewrite` rule for this `optimize()` call.
 ///

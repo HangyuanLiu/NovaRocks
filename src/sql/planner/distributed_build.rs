@@ -1863,6 +1863,7 @@ mod tests {
                 database: "test_db".to_string(),
                 table: table_def(),
                 alias: Some("t".to_string()),
+                stats_ref: None,
                 columns: vec![k.clone(), v.clone()],
                 predicates: vec![intern_typed(
                     &mut scalars,

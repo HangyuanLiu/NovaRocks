@@ -120,6 +120,7 @@ mod tests {
                 },
             },
             alias: None,
+            stats_ref: None,
             columns: vec![OutputColumn {
                 column_id: test_col_id(col),
                 name: col.into(),

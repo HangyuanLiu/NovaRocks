@@ -330,6 +330,7 @@ mod tests {
                 },
             },
             alias: None,
+            stats_ref: None,
             columns: vec![OutputColumn {
                 column_id: ColumnId::new_for_test(1),
                 name: "id".to_string(),

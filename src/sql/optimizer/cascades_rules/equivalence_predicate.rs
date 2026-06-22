@@ -415,6 +415,7 @@ mod tests {
                     },
                 },
                 alias: None,
+                stats_ref: None,
                 columns: vec![output(id, name)],
                 predicates,
                 required_columns: None,

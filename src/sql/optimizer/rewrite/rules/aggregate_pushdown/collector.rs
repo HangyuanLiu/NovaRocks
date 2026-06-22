@@ -462,6 +462,7 @@ mod tests {
                 },
             },
             alias: alias.map(str::to_string),
+            stats_ref: None,
             columns: cols
                 .iter()
                 .map(|(n, ty)| OutputColumn {

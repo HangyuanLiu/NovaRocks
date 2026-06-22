@@ -160,6 +160,7 @@ fn try_rewrite(
             database: cand.target_database.clone(),
             table: cand.target_table.clone(),
             alias: None,
+            stats_ref: None,
             columns: scan_columns,
             predicates: vec![],
             required_columns: None,

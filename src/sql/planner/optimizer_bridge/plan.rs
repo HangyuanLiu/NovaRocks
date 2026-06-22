@@ -58,6 +58,7 @@ fn logical_plan_to_opt_expr_unchecked(
                 database: node.database.clone(),
                 table: node.table.clone(),
                 alias: node.alias.clone(),
+                stats_ref: None,
                 columns: node.columns.clone(),
                 predicates: intern_exprs(scalars, &node.predicates),
                 required_columns: node.required_columns.clone(),
@@ -568,6 +569,7 @@ mod tests {
     use crate::sql::optimizer::memo::{GroupId, Memo};
     use crate::sql::optimizer::memo_copy::opt_expr_to_memo;
     use crate::sql::optimizer::rule::Rule;
+    use crate::sql::optimizer::stats_input::StatsRef;
     use crate::sql::planner::plan::*;
     use crate::sql::planner::plan::{
         LogicalFilterNode, LogicalScanNode, LogicalUnionNode, LogicalValuesNode, PlanNodeKind,
@@ -832,7 +834,12 @@ mod tests {
 
         let mut memo = Memo::new();
         let gid = logical_plan_to_memo_for_test(&scan, &mut memo);
-        let logical_expr = memo.groups[gid].logical_exprs[0].clone();
+        let mut logical_expr = memo.groups[gid].logical_exprs[0].clone();
+        let stats_ref = StatsRef::new(7);
+        let Operator::LogicalScan(logical_scan) = &mut logical_expr.op else {
+            panic!("expected LogicalScan");
+        };
+        logical_scan.stats_ref = Some(stats_ref);
 
         let physical = ScanToPhysical.apply(&logical_expr, &mut memo);
 
@@ -840,6 +847,7 @@ mod tests {
         let Operator::PhysicalScan(scan) = &physical[0].op else {
             panic!("expected PhysicalScan");
         };
+        assert_eq!(scan.stats_ref, Some(stats_ref));
         assert_eq!(scan.variant_columns.len(), 1);
         let actual = &scan.variant_columns[0];
         assert_eq!(actual.source_column_id, variant_descriptor.source_column_id);

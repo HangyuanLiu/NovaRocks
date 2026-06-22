@@ -22,7 +22,7 @@
 
 - Modify `src/sql/optimizer/mod.rs`, `src/sql/optimizer/rewrite/**`, `src/sql/optimizer/search.rs`, and `src/sql/optimizer/cascades_rules/multi_join_reorder/**`
   - Replace `&HashMap<String, TableStatistics>` optimizer inputs with `&QueryStatsSnapshot`.
-  - Validate all scans are bound at `optimize()` entry.
+  - Validate all scans are bound at `optimize()` entry after the query stats collector is wired into all callers.
 
 - Create `src/connector/stats.rs`
   - Defines `TableStatsProvider`, `TableStatsRequest`, `TableSnapshotRef`, `ScanSourceIdentity`, and `StatsProviderError`.
@@ -349,7 +349,7 @@ stats_ref: None,
 
 Do not change the bridge signature. Do not add any ordinal-based bridge API or a second scan-order mapping.
 
-- [ ] **Step 3: Add optimizer-entry validation**
+- [ ] **Step 3: Add the optimizer-entry validation helper**
 
 In `src/sql/optimizer/mod.rs`, add:
 
@@ -373,11 +373,10 @@ fn validate_query_stats_bound(expr: &OptExpr) -> Result<(), String> {
 }
 ```
 
-At the start of `optimize_with_root_property`, before rewrite runs:
-
-```rust
-validate_query_stats_bound(&plan_expr)?;
-```
+Do not call this helper from `optimize_with_root_property` until Task 6 wires
+`QueryStatsCollector` into all production optimizer callers. Bridge-created
+scans intentionally remain unbound in this task; enabling the validation before
+the collector would make normal scan queries fail.
 
 - [ ] **Step 4: Add validation test**
 
@@ -396,10 +395,11 @@ Use the local optimizer scan test helper already present in `src/sql/optimizer/m
 
 - [ ] **Step 5: Run tests**
 
-Run:
+Run as separate Cargo filter commands if needed:
 
 ```bash
-cargo test --lib sql::optimizer::optimizer_rejects_unbound_scan_stats sql::planner::optimizer_bridge::plan
+cargo test --lib sql::optimizer::optimizer_rejects_unbound_scan_stats
+cargo test --lib sql::planner::optimizer_bridge::plan
 ```
 
 Expected: bridge tests still pass, and the new unbound-scan validation test passes.
@@ -1136,6 +1136,11 @@ let physical = crate::sql::optimizer::optimize(
     mv_candidates,
 )?;
 ```
+
+After every production caller has collected query stats before `optimize`, enable
+the non-optional optimizer boundary check by calling
+`validate_query_stats_bound(&plan_expr)?` at the start of
+`optimize_with_root_property`, before rewrite runs.
 
 For `explain_query` and `explain_analyze_query`, use:
 

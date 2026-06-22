@@ -814,6 +814,7 @@ mod tests {
             database: "db".to_string(),
             table,
             alias: Some(alias.to_string()),
+            stats_ref: None,
             columns: cols
                 .iter()
                 .map(|(name, id)| output_col(name, *id))
