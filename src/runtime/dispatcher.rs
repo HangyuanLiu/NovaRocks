@@ -27,6 +27,7 @@ use std::collections::BTreeMap;
 #[cfg(test)]
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
+#[cfg(test)]
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(test)]
