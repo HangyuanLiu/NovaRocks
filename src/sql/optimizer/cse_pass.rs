@@ -42,8 +42,10 @@ fn rewrite_node(
     for child in &mut node.children {
         rewrite_node(child, scalars, factory);
     }
-    if matches!(&node.op, Operator::PhysicalProject(_)) {
-        rewrite_project(node, scalars, factory);
+    match &node.op {
+        Operator::PhysicalProject(_) => rewrite_project(node, scalars, factory),
+        Operator::PhysicalFilter(_) => rewrite_filter(node, scalars, factory),
+        _ => {}
     }
 }
 
@@ -453,6 +455,104 @@ fn build_commons(
     (items, subst)
 }
 
+fn output_column_for_project_item(scalars: &ScalarArena, item: &ScalarProjectItem) -> OutputColumn {
+    OutputColumn {
+        column_id: item.output_column_id,
+        name: item.output_name.clone(),
+        data_type: scalars.data_type(item.expr).clone(),
+        nullable: scalars.nullable(item.expr),
+        is_internal: true,
+    }
+}
+
+fn prelude_binds_to_outputs(
+    scalars: &ScalarArena,
+    prelude: &[ScalarProjectItem],
+    output_columns: &[OutputColumn],
+) -> bool {
+    let available = output_columns
+        .iter()
+        .map(|column| column.column_id)
+        .collect::<HashSet<_>>();
+    let roots = prelude.iter().map(|item| item.expr).collect::<Vec<_>>();
+    collect_column_refs(scalars, &roots)
+        .into_iter()
+        .all(|(column_id, _, _)| available.contains(&column_id))
+}
+
+fn wrap_project_around_child(
+    child: &mut PhysicalPlanNode,
+    prelude: Vec<ScalarProjectItem>,
+    scalars: &mut ScalarArena,
+) {
+    let original = child.clone();
+    let mut items = Vec::with_capacity(original.output_columns.len() + prelude.len());
+    for column in &original.output_columns {
+        let expr = scalars.intern(
+            ScalarNode::ColumnRef(column.column_id),
+            column.data_type.clone(),
+            column.nullable,
+        );
+        items.push(ScalarProjectItem {
+            expr,
+            output_name: column.name.clone(),
+            output_column_id: column.column_id,
+            expr_display: None,
+        });
+    }
+    items.extend(prelude.iter().cloned());
+
+    let mut output_columns = original.output_columns.clone();
+    output_columns.extend(
+        prelude
+            .iter()
+            .map(|item| output_column_for_project_item(scalars, item)),
+    );
+
+    *child = PhysicalPlanNode {
+        op: Operator::PhysicalProject(crate::sql::optimizer::operator::ProjectOp {
+            items,
+            output_qualifier: None,
+        }),
+        stats: original.stats.clone(),
+        output_columns,
+        execution_props: original.execution_props.clone(),
+        children: vec![original],
+        build_runtime_filters: vec![],
+        probe_runtime_filters: vec![],
+    };
+}
+
+fn insert_or_reuse_project_below(
+    child: &mut PhysicalPlanNode,
+    prelude: Vec<ScalarProjectItem>,
+    scalars: &mut ScalarArena,
+) {
+    if prelude.is_empty() {
+        return;
+    }
+
+    let can_reuse_project = match &child.op {
+        Operator::PhysicalProject(_) if child.children.len() == 1 => {
+            prelude_binds_to_outputs(scalars, &prelude, &child.children[0].output_columns)
+        }
+        _ => false,
+    };
+    if can_reuse_project {
+        if let Operator::PhysicalProject(project) = &mut child.op {
+            child.output_columns.extend(
+                prelude
+                    .iter()
+                    .map(|item| output_column_for_project_item(scalars, item)),
+            );
+            project.items.extend(prelude);
+            return;
+        }
+    }
+
+    wrap_project_around_child(child, prelude, scalars);
+}
+
 fn rewrite_project(
     node: &mut PhysicalPlanNode,
     scalars: &mut ScalarArena,
@@ -554,16 +654,43 @@ fn rewrite_project(
     node.children.push(cse_project);
 }
 
+fn rewrite_filter(
+    node: &mut PhysicalPlanNode,
+    scalars: &mut ScalarArena,
+    factory: &mut ColumnRefFactory,
+) {
+    let Operator::PhysicalFilter(filter) = &node.op else {
+        return;
+    };
+    let roots = [filter.predicate];
+    let commons = pick_commons(scalars, &roots);
+    if commons.is_empty() {
+        return;
+    }
+    if node.children.len() != 1 {
+        return;
+    }
+
+    let (prelude, subst) = build_commons(scalars, factory, &commons);
+    let Operator::PhysicalFilter(filter) = &mut node.op else {
+        unreachable!("checked filter operator above");
+    };
+    filter.predicate = substitute(scalars, filter.predicate, &subst);
+    insert_or_reuse_project_below(&mut node.children[0], prelude, scalars);
+}
+
 #[cfg(test)]
 mod tests {
     use arrow::datatypes::DataType;
 
     use crate::sql::column_id::ColumnId;
-    use crate::sql::common::BinOp;
     use crate::sql::common::OutputColumn;
-    use crate::sql::optimizer::operator::{Operator, ProjectOp, ScalarProjectItem, ValuesOp};
+    use crate::sql::common::{BinOp, LiteralValue};
+    use crate::sql::optimizer::operator::{
+        FilterOp, Operator, ProjectOp, ScalarProjectItem, ValuesOp,
+    };
     use crate::sql::optimizer::physical_plan::{PhysicalPlanNode, PlanExecutionProps};
-    use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
+    use crate::sql::optimizer::scalar::{HashableLiteral, ScalarArena, ScalarId, ScalarNode};
     use crate::sql::optimizer::statistics::Statistics;
 
     use super::pick_commons;
@@ -581,6 +708,50 @@ mod tests {
             },
             DataType::Int64,
             true,
+        )
+    }
+
+    fn gt(arena: &mut ScalarArena, left: ScalarId, right: ScalarId) -> ScalarId {
+        arena.intern(
+            ScalarNode::BinaryOp {
+                op: BinOp::Gt,
+                left,
+                right,
+            },
+            DataType::Boolean,
+            true,
+        )
+    }
+
+    fn lt(arena: &mut ScalarArena, left: ScalarId, right: ScalarId) -> ScalarId {
+        arena.intern(
+            ScalarNode::BinaryOp {
+                op: BinOp::Lt,
+                left,
+                right,
+            },
+            DataType::Boolean,
+            true,
+        )
+    }
+
+    fn and(arena: &mut ScalarArena, left: ScalarId, right: ScalarId) -> ScalarId {
+        arena.intern(
+            ScalarNode::BinaryOp {
+                op: BinOp::And,
+                left,
+                right,
+            },
+            DataType::Boolean,
+            true,
+        )
+    }
+
+    fn int_lit(arena: &mut ScalarArena, value: i64) -> ScalarId {
+        arena.intern(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Int(value))),
+            DataType::Int64,
+            false,
         )
     }
 
@@ -977,6 +1148,396 @@ mod tests {
                 .map(|column| column.name.as_str())
                 .collect::<Vec<_>>(),
             vec!["b", "c", "a", "__cse_0"]
+        );
+    }
+
+    #[test]
+    fn insert_or_reuse_project_below_wraps_non_project_child() {
+        let mut arena = ScalarArena::new();
+        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+        let a = col(&mut arena, 101);
+        let b = col(&mut arena, 102);
+        let a_plus_b = add(&mut arena, a, b);
+        let (prelude, _) = super::build_commons(&mut arena, &mut factory, &[a_plus_b]);
+        let child = PhysicalPlanNode {
+            op: Operator::PhysicalValues(ValuesOp {
+                rows: vec![],
+                columns: vec![output_column(101, "a"), output_column(102, "b")],
+            }),
+            children: vec![],
+            stats: Statistics {
+                output_row_count: 42.0,
+                ..Statistics::default()
+            },
+            output_columns: vec![output_column(101, "a"), output_column(102, "b")],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+        let mut parent = PhysicalPlanNode {
+            op: Operator::PhysicalFilter(FilterOp {
+                predicate: gt(&mut arena, a, b),
+            }),
+            children: vec![child],
+            stats: Statistics::default(),
+            output_columns: vec![output_column(101, "a"), output_column(102, "b")],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+
+        super::insert_or_reuse_project_below(&mut parent.children[0], prelude, &mut arena);
+
+        let Operator::PhysicalProject(project) = &parent.children[0].op else {
+            panic!("expected inserted physical project");
+        };
+        assert_eq!(
+            project
+                .items
+                .iter()
+                .map(|item| item.output_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "__cse_0"]
+        );
+        assert_eq!(
+            parent.children[0]
+                .output_columns
+                .iter()
+                .map(|column| (column.name.as_str(), column.is_internal))
+                .collect::<Vec<_>>(),
+            vec![("a", false), ("b", false), ("__cse_0", true)]
+        );
+        assert_eq!(parent.children[0].children.len(), 1);
+        assert_eq!(parent.children[0].stats.output_row_count, 42.0);
+    }
+
+    #[test]
+    fn insert_or_reuse_project_below_wraps_project_when_producer_refs_project_outputs() {
+        let mut arena = ScalarArena::new();
+        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+        let a = col(&mut arena, 101);
+        let b = col(&mut arena, 102);
+        let x = col(&mut arena, 201);
+        let y = col(&mut arena, 202);
+        let x_plus_y = add(&mut arena, x, y);
+        let (prelude, _) = super::build_commons(&mut arena, &mut factory, &[x_plus_y]);
+        let values = PhysicalPlanNode {
+            op: Operator::PhysicalValues(ValuesOp {
+                rows: vec![],
+                columns: vec![output_column(101, "a"), output_column(102, "b")],
+            }),
+            children: vec![],
+            stats: Statistics::default(),
+            output_columns: vec![output_column(101, "a"), output_column(102, "b")],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+        let mut child_project = PhysicalPlanNode {
+            op: Operator::PhysicalProject(ProjectOp {
+                items: vec![project_item(a, 201, "x"), project_item(b, 202, "y")],
+                output_qualifier: None,
+            }),
+            children: vec![values],
+            stats: Statistics::default(),
+            output_columns: vec![output_column(201, "x"), output_column(202, "y")],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+
+        super::insert_or_reuse_project_below(&mut child_project, prelude, &mut arena);
+
+        let Operator::PhysicalProject(outer_project) = &child_project.op else {
+            panic!("expected outer wrapper project");
+        };
+        assert_eq!(
+            outer_project
+                .items
+                .iter()
+                .map(|item| item.output_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["x", "y", "__cse_0"]
+        );
+        assert_eq!(
+            child_project
+                .output_columns
+                .iter()
+                .map(|column| (column.name.as_str(), column.is_internal))
+                .collect::<Vec<_>>(),
+            vec![("x", false), ("y", false), ("__cse_0", true)]
+        );
+        let Operator::PhysicalProject(inner_project) = &child_project.children[0].op else {
+            panic!("expected original inner project");
+        };
+        assert_eq!(
+            inner_project
+                .items
+                .iter()
+                .map(|item| item.output_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["x", "y"]
+        );
+    }
+
+    #[test]
+    fn insert_or_reuse_project_below_reuses_passthrough_project_when_producer_refs_input() {
+        let mut arena = ScalarArena::new();
+        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+        let a = col(&mut arena, 101);
+        let b = col(&mut arena, 102);
+        let a_plus_b = add(&mut arena, a, b);
+        let (prelude, _) = super::build_commons(&mut arena, &mut factory, &[a_plus_b]);
+        let values = PhysicalPlanNode {
+            op: Operator::PhysicalValues(ValuesOp {
+                rows: vec![],
+                columns: vec![output_column(101, "a"), output_column(102, "b")],
+            }),
+            children: vec![],
+            stats: Statistics::default(),
+            output_columns: vec![output_column(101, "a"), output_column(102, "b")],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+        let mut child_project = PhysicalPlanNode {
+            op: Operator::PhysicalProject(ProjectOp {
+                items: vec![project_item(a, 101, "a"), project_item(b, 102, "b")],
+                output_qualifier: None,
+            }),
+            children: vec![values],
+            stats: Statistics::default(),
+            output_columns: vec![output_column(101, "a"), output_column(102, "b")],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+
+        super::insert_or_reuse_project_below(&mut child_project, prelude, &mut arena);
+
+        let Operator::PhysicalProject(project) = &child_project.op else {
+            panic!("expected reused physical project");
+        };
+        assert!(matches!(
+            child_project.children[0].op,
+            Operator::PhysicalValues(_)
+        ));
+        assert_eq!(
+            project
+                .items
+                .iter()
+                .map(|item| item.output_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "__cse_0"]
+        );
+        assert_eq!(
+            child_project
+                .output_columns
+                .iter()
+                .map(|column| (column.name.as_str(), column.is_internal))
+                .collect::<Vec<_>>(),
+            vec![("a", false), ("b", false), ("__cse_0", true)]
+        );
+        let cse_expr = project
+            .items
+            .iter()
+            .find(|item| item.output_name == "__cse_0")
+            .expect("CSE project item")
+            .expr;
+        assert!(matches!(
+            arena.node(cse_expr),
+            ScalarNode::BinaryOp { left, right, .. }
+                if matches!(arena.node(*left), ScalarNode::ColumnRef(ColumnId(101)))
+                    && matches!(arena.node(*right), ScalarNode::ColumnRef(ColumnId(102)))
+        ));
+    }
+
+    #[test]
+    fn rewrite_filter_factors_repeated_predicate_subexpr() {
+        let mut arena = ScalarArena::new();
+        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+        let a = col(&mut arena, 101);
+        let b = col(&mut arena, 102);
+        let a_plus_b = add(&mut arena, a, b);
+        let ten = int_lit(&mut arena, 10);
+        let twenty = int_lit(&mut arena, 20);
+        let lower = gt(&mut arena, a_plus_b, ten);
+        let upper = lt(&mut arena, a_plus_b, twenty);
+        let predicate = and(&mut arena, lower, upper);
+        let child = PhysicalPlanNode {
+            op: Operator::PhysicalValues(ValuesOp {
+                rows: vec![],
+                columns: vec![output_column(101, "a"), output_column(102, "b")],
+            }),
+            children: vec![],
+            stats: Statistics::default(),
+            output_columns: vec![output_column(101, "a"), output_column(102, "b")],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+        let mut node = PhysicalPlanNode {
+            op: Operator::PhysicalFilter(FilterOp { predicate }),
+            children: vec![child],
+            stats: Statistics::default(),
+            output_columns: vec![output_column(101, "a"), output_column(102, "b")],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+
+        super::rewrite_node(&mut node, &mut arena, &mut factory);
+
+        let Operator::PhysicalProject(cse_project) = &node.children[0].op else {
+            panic!("expected inserted CSE project");
+        };
+        let cse_item = cse_project
+            .items
+            .iter()
+            .find(|item| item.output_name == "__cse_0")
+            .expect("CSE project item");
+        let cse_column = cse_item.output_column_id;
+        assert!(
+            node.children[0]
+                .output_columns
+                .iter()
+                .any(|column| column.column_id == cse_column
+                    && column.name == "__cse_0"
+                    && column.is_internal)
+        );
+        let Operator::PhysicalFilter(filter) = &node.op else {
+            panic!("expected physical filter");
+        };
+        let ScalarNode::BinaryOp { left, right, .. } = arena.node(filter.predicate) else {
+            panic!("expected conjunction");
+        };
+        assert!(matches!(
+            arena.node(*left),
+            ScalarNode::BinaryOp { left, .. }
+                if matches!(arena.node(*left), ScalarNode::ColumnRef(column_id) if *column_id == cse_column)
+        ));
+        assert!(matches!(
+            arena.node(*right),
+            ScalarNode::BinaryOp { left, .. }
+                if matches!(arena.node(*left), ScalarNode::ColumnRef(column_id) if *column_id == cse_column)
+        ));
+        assert_eq!(
+            node.output_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+    }
+
+    #[test]
+    fn rewrite_filter_wraps_existing_project_when_predicate_refs_project_outputs() {
+        let mut arena = ScalarArena::new();
+        let mut factory = crate::sql::column_id::ColumnRefFactory::new();
+        let a = col(&mut arena, 101);
+        let b = col(&mut arena, 102);
+        let x = col(&mut arena, 201);
+        let y = col(&mut arena, 202);
+        let x_plus_y = add(&mut arena, x, y);
+        let ten = int_lit(&mut arena, 10);
+        let twenty = int_lit(&mut arena, 20);
+        let lower = gt(&mut arena, x_plus_y, ten);
+        let upper = lt(&mut arena, x_plus_y, twenty);
+        let predicate = and(&mut arena, lower, upper);
+        let values = PhysicalPlanNode {
+            op: Operator::PhysicalValues(ValuesOp {
+                rows: vec![],
+                columns: vec![output_column(101, "a"), output_column(102, "b")],
+            }),
+            children: vec![],
+            stats: Statistics::default(),
+            output_columns: vec![output_column(101, "a"), output_column(102, "b")],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+        let project = PhysicalPlanNode {
+            op: Operator::PhysicalProject(ProjectOp {
+                items: vec![project_item(a, 201, "x"), project_item(b, 202, "y")],
+                output_qualifier: None,
+            }),
+            children: vec![values],
+            stats: Statistics::default(),
+            output_columns: vec![output_column(201, "x"), output_column(202, "y")],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+        let mut node = PhysicalPlanNode {
+            op: Operator::PhysicalFilter(FilterOp { predicate }),
+            children: vec![project],
+            stats: Statistics::default(),
+            output_columns: vec![output_column(201, "x"), output_column(202, "y")],
+            execution_props: PlanExecutionProps::default(),
+            build_runtime_filters: vec![],
+            probe_runtime_filters: vec![],
+        };
+
+        super::rewrite_node(&mut node, &mut arena, &mut factory);
+
+        let Operator::PhysicalProject(outer_project) = &node.children[0].op else {
+            panic!("expected outer CSE project");
+        };
+        assert_eq!(
+            outer_project
+                .items
+                .iter()
+                .map(|item| item.output_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["x", "y", "__cse_0"]
+        );
+        let cse_item = outer_project
+            .items
+            .iter()
+            .find(|item| item.output_name == "__cse_0")
+            .expect("CSE project item");
+        let cse_column = cse_item.output_column_id;
+        assert_eq!(
+            node.children[0]
+                .output_columns
+                .iter()
+                .map(|column| (column.name.as_str(), column.is_internal))
+                .collect::<Vec<_>>(),
+            vec![("x", false), ("y", false), ("__cse_0", true)]
+        );
+        let Operator::PhysicalProject(inner_project) = &node.children[0].children[0].op else {
+            panic!("expected original inner project");
+        };
+        assert_eq!(
+            inner_project
+                .items
+                .iter()
+                .map(|item| item.output_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["x", "y"]
+        );
+        let Operator::PhysicalFilter(filter) = &node.op else {
+            panic!("expected physical filter");
+        };
+        let ScalarNode::BinaryOp { left, right, .. } = arena.node(filter.predicate) else {
+            panic!("expected conjunction");
+        };
+        assert!(matches!(
+            arena.node(*left),
+            ScalarNode::BinaryOp { left, .. }
+                if matches!(arena.node(*left), ScalarNode::ColumnRef(column_id) if *column_id == cse_column)
+        ));
+        assert!(matches!(
+            arena.node(*right),
+            ScalarNode::BinaryOp { left, .. }
+                if matches!(arena.node(*left), ScalarNode::ColumnRef(column_id) if *column_id == cse_column)
+        ));
+        assert_eq!(
+            node.output_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["x", "y"]
         );
     }
 }
