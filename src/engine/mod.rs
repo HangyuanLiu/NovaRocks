@@ -2730,15 +2730,7 @@ pub(crate) fn record_batch_to_chunk(batch: RecordBatch) -> Result<Chunk, String>
 // Query plan build + execute (delegates to crate::sql::*)
 // ---------------------------------------------------------------------------
 
-use crate::sql::codegen::{
-    FragmentEdgeKind, MultiFragmentBuildResult, PlanBuildResult,
-    boundary_schema::{BoundaryKind, BoundarySchemaReport, output_columns_to_boundary_columns},
-};
-
-enum StandaloneExecutionPlan {
-    SingleFragment(Box<PlanBuildResult>),
-    Coordinated(Box<MultiFragmentBuildResult>),
-}
+use crate::sql::codegen::{MultiFragmentBuildResult, PlanBuildResult};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DirectExecutionReason {
@@ -2764,172 +2756,8 @@ fn direct_execution_reason(
     None
 }
 
-/// Recognize the narrow compatibility shape where fragment splitting
-/// only wrapped the real root fragment in a single `EXCHANGE_NODE`.
-fn top_level_stream_root_wrapper_child_id(
-    br: &MultiFragmentBuildResult,
-) -> Option<crate::sql::codegen::FragmentId> {
-    use crate::plan_nodes::TPlanNodeType;
-
-    let root = br
-        .fragment_results
-        .iter()
-        .find(|f| f.fragment_id == br.root_fragment_id)?;
-    if root.cte_id.is_some() || !root.cte_exchange_nodes.is_empty() {
-        return None;
-    }
-    if root.plan.nodes.len() != 1 || root.plan.nodes[0].node_type != TPlanNodeType::EXCHANGE_NODE {
-        return None;
-    }
-    let root_exchange = &root.plan.nodes[0];
-    if root_exchange.limit >= 0 {
-        return None;
-    }
-    if let Some(exchange) = root_exchange.exchange_node.as_ref()
-        && (exchange.sort_info.is_some() || exchange.offset.unwrap_or(0) > 0)
-    {
-        return None;
-    }
-    if br
-        .edges
-        .iter()
-        .any(|edge| edge.source_fragment_id == br.root_fragment_id)
-    {
-        return None;
-    }
-
-    let mut incoming_root_edges = br
-        .edges
-        .iter()
-        .filter(|edge| edge.target_fragment_id == br.root_fragment_id);
-    let edge = incoming_root_edges.next()?;
-    if incoming_root_edges.next().is_some() {
-        return None;
-    }
-    if !matches!(edge.edge_kind, FragmentEdgeKind::Stream) {
-        return None;
-    }
-
-    let child_id = edge.source_fragment_id;
-    if child_id == br.root_fragment_id {
-        return None;
-    }
-
-    let child = br
-        .fragment_results
-        .iter()
-        .find(|f| f.fragment_id == child_id)?;
-    if child.plan.nodes.is_empty() {
-        return None;
-    }
-    Some(child_id)
-}
-
-/// Strip a top-level exchange-only wrapper introduced by a single Gather split.
-///
-/// The stripped child becomes the new root. This keeps Task 1 fragment-builder
-/// output intact while avoiding generic stream-edge execution in standalone.
-fn strip_top_level_stream_root_wrapper(
-    mut build_result: MultiFragmentBuildResult,
-) -> MultiFragmentBuildResult {
-    let Some(child_id) = top_level_stream_root_wrapper_child_id(&build_result) else {
-        return build_result;
-    };
-
-    let old_root_id = build_result.root_fragment_id;
-    let Some(root_fragment) = build_result
-        .fragment_results
-        .iter()
-        .find(|fragment| fragment.fragment_id == old_root_id)
-    else {
-        return build_result;
-    };
-    let root_node = &root_fragment.plan.nodes[0];
-    let root_limit = root_node.limit;
-    let root_offset = root_node
-        .exchange_node
-        .as_ref()
-        .and_then(|exchange| exchange.offset)
-        .unwrap_or(0);
-    if root_offset > 0 {
-        return build_result;
-    }
-    let root_output_sink = root_fragment.output_sink.clone();
-    let root_output_exprs = root_fragment.output_exprs.clone();
-    let root_output_columns = root_fragment.output_columns.clone();
-
-    build_result
-        .fragment_results
-        .retain(|fragment| fragment.fragment_id != old_root_id);
-    build_result.edges.retain(|edge| {
-        !(edge.source_fragment_id == child_id
-            && edge.target_fragment_id == old_root_id
-            && matches!(edge.edge_kind, FragmentEdgeKind::Stream))
-    });
-    build_result.root_fragment_id = child_id;
-    if root_limit >= 0
-        && let Some(child) = build_result
-            .fragment_results
-            .iter_mut()
-            .find(|fragment| fragment.fragment_id == child_id)
-        && let Some(child_root) = child.plan.nodes.first_mut()
-    {
-        child_root.limit = if child_root.limit >= 0 {
-            child_root.limit.min(root_limit)
-        } else {
-            root_limit
-        };
-    }
-    if let Some(child) = build_result
-        .fragment_results
-        .iter_mut()
-        .find(|fragment| fragment.fragment_id == child_id)
-    {
-        child.output_sink = root_output_sink;
-        child.output_exprs = root_output_exprs;
-        child.output_columns = root_output_columns;
-        let node_id = child
-            .plan
-            .nodes
-            .first()
-            .map(|node| node.node_id)
-            .unwrap_or(-1);
-        child.boundary_schemas = vec![BoundarySchemaReport {
-            fragment_id: Some(child.fragment_id as i32),
-            node_id,
-            boundary_kind: BoundaryKind::ResultRoot,
-            columns: output_columns_to_boundary_columns(&child.output_columns),
-        }];
-    }
-    refresh_boundary_schema_aggregate(&mut build_result);
-    build_result
-}
-
-fn refresh_boundary_schema_aggregate(build_result: &mut MultiFragmentBuildResult) {
-    let previous = std::mem::take(&mut build_result.boundary_schemas);
-    for fragment in &build_result.fragment_results {
-        build_result
-            .boundary_schemas
-            .extend(fragment.boundary_schemas.clone());
-    }
-    for report in previous {
-        let keep = match report.boundary_kind {
-            BoundaryKind::ExchangeSender => build_result.edges.iter().any(|edge| {
-                report.fragment_id == Some(edge.source_fragment_id as i32)
-                    && report.node_id == edge.target_exchange_node_id
-            }),
-            BoundaryKind::ExchangeReceiver => build_result.edges.iter().any(|edge| {
-                report.fragment_id == Some(edge.target_fragment_id as i32)
-                    && report.node_id == edge.target_exchange_node_id
-            }),
-            BoundaryKind::RemoteRoot | BoundaryKind::ResultRoot => false,
-        };
-        if keep {
-            build_result.boundary_schemas.push(report);
-        }
-    }
-}
-
+/// Convert the one-fragment result required by explicit direct-execution
+/// exceptions. This is not an ordinary query fast path.
 fn single_fragment_plan(
     build_result: MultiFragmentBuildResult,
 ) -> Result<Box<PlanBuildResult>, Box<MultiFragmentBuildResult>> {
@@ -2950,7 +2778,7 @@ fn single_fragment_plan(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute_query_direct_for_runtime_local_handle(
+fn execute_query_direct_for_explicit_exception(
     mut physical: crate::sql::optimizer::PhysicalPlanNode,
     codegen_catalog: &dyn crate::sql::catalog::CatalogProvider,
     connectors: &crate::connector::ConnectorRegistry,
@@ -2982,25 +2810,6 @@ fn execute_query_direct_for_runtime_local_handle(
         format!("direct execution exception {reason:?} produced a multi-fragment plan")
     })?;
     execute_plan(*plan, query_opts, terminal_sink, iceberg_catalogs, None)
-}
-
-fn choose_standalone_execution(build_result: MultiFragmentBuildResult) -> StandaloneExecutionPlan {
-    if build_result.fragment_results.len() == 1 {
-        match single_fragment_plan(build_result) {
-            Ok(plan) => return StandaloneExecutionPlan::SingleFragment(plan),
-            Err(br) => return StandaloneExecutionPlan::Coordinated(br),
-        }
-    }
-
-    let build_result = strip_top_level_stream_root_wrapper(build_result);
-    if build_result.fragment_results.len() == 1 {
-        match single_fragment_plan(build_result) {
-            Ok(plan) => return StandaloneExecutionPlan::SingleFragment(plan),
-            Err(br) => return StandaloneExecutionPlan::Coordinated(br),
-        }
-    }
-
-    StandaloneExecutionPlan::Coordinated(Box::new(build_result))
 }
 
 fn aggregate_delta_row_ids_for_position_locator(
@@ -3298,7 +3107,6 @@ fn explain_analyze_query(
     query_opts: Option<crate::internal_service::TQueryOptions>,
     mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
-    use crate::runtime::profile::Profiler;
     use crate::runtime::profile_correlate::collect_actuals_by_plan_node_id_multi;
     use crate::sql::codegen::ir::{explain_distributed_plan_analyze, lower_distributed_plan};
     use crate::sql::explain::ExplainLevel;
@@ -3341,45 +3149,36 @@ fn explain_analyze_query(
     let planning_ms = t_plan.elapsed().as_millis() as u64;
 
     let t_exec = Instant::now();
-    let (rows, profilers) = match choose_standalone_execution(build_result) {
-        StandaloneExecutionPlan::SingleFragment(plan) => {
-            let profiler = Profiler::new("explain_analyze");
-            let executed = execute_plan(*plan, query_opts, None, None, Some(profiler.clone()))?;
-            let rows: u64 = executed.chunks.iter().map(|c| c.len() as u64).sum();
-            (rows, vec![profiler])
-        }
-        StandaloneExecutionPlan::Coordinated(build_result) => {
-            let mut profiled_query_opts = query_opts.unwrap_or_default();
-            profiled_query_opts.enable_profile = Some(true);
-            let (dispatcher, scheduler) = coordinated_execution_services()?;
-            if !dispatcher.supports_profile_collection() {
-                return Err(
-                    "EXPLAIN ANALYZE for coordinated plans requires in-process profile collection; remote fragment profiles are not available yet"
-                        .to_string(),
-                );
-            }
-            let outcome = crate::runtime::coordinator::ExecutionCoordinator::new(
-                *build_result,
-                dispatcher,
-                scheduler,
-                Some(profiled_query_opts),
-            )
-            .execute_with_write_outcome()?;
-            let rows: u64 = outcome
-                .query_result
-                .chunks
-                .iter()
-                .map(|c| c.len() as u64)
-                .sum();
-            if outcome.profilers.is_empty() {
-                return Err(
-                    "EXPLAIN ANALYZE did not collect any fragment profiles for the coordinated plan"
-                        .to_string(),
-                );
-            }
-            (rows, outcome.profilers)
-        }
-    };
+    let mut profiled_query_opts = query_opts.unwrap_or_default();
+    profiled_query_opts.enable_profile = Some(true);
+    let (dispatcher, scheduler) = coordinated_execution_services()?;
+    if !dispatcher.supports_profile_collection() {
+        return Err(
+            "EXPLAIN ANALYZE requires remote fragment profile collection; \
+             RemoteDispatcher profiles are not available yet"
+                .to_string(),
+        );
+    }
+    let outcome = crate::runtime::coordinator::ExecutionCoordinator::new(
+        build_result,
+        dispatcher,
+        scheduler,
+        Some(profiled_query_opts),
+    )
+    .execute_with_write_outcome()?;
+    let rows: u64 = outcome
+        .query_result
+        .chunks
+        .iter()
+        .map(|c| c.len() as u64)
+        .sum();
+    if outcome.profilers.is_empty() {
+        return Err(
+            "EXPLAIN ANALYZE did not collect any fragment profiles for the coordinated plan"
+                .to_string(),
+        );
+    }
+    let profilers = outcome.profilers;
     let execution_ms = t_exec.elapsed().as_millis() as u64;
 
     let mut lines = Vec::new();
@@ -3856,7 +3655,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         iceberg_catalogs.is_some(),
         exchange_port,
     ) {
-        return execute_query_direct_for_runtime_local_handle(
+        return execute_query_direct_for_explicit_exception(
             physical,
             codegen_catalog,
             connectors,
@@ -3970,11 +3769,6 @@ pub(crate) fn dispatcher_kind_for_test(
         .is::<crate::runtime::dispatcher::RemoteDispatcher>()
     {
         "remote"
-    } else if dispatcher
-        .as_any()
-        .is::<crate::runtime::dispatcher::InProcessDispatcher>()
-    {
-        "in-process"
     } else {
         "unknown"
     }
@@ -6858,12 +6652,12 @@ enable_path_style_access = true
     }
 
     #[test]
-    fn explain_analyze_populates_per_operator_profile() {
+    fn explain_analyze_fails_fast_without_remote_profiles() {
         let warehouse = TempDir::new().expect("warehouse");
         let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
         create_kv_tables(&session, "(1,10),(2,20),(3,30)", "(1,100),(2,200),(3,300)");
 
-        let result = session
+        let err = session
             .execute_in_context(
                 "EXPLAIN ANALYZE \
                  SELECT count(*) \
@@ -6872,14 +6666,11 @@ enable_path_style_access = true
                 "db1",
                 None,
             )
-            .expect("explain analyze");
-        let StatementResult::Query(result) = result else {
-            panic!("EXPLAIN ANALYZE must return a query result");
-        };
+            .expect_err("EXPLAIN ANALYZE must fail until remote profiles are available");
 
         assert!(
-            query_result_contains_string(&result, "act={rows="),
-            "EXPLAIN ANALYZE output must contain per-operator actual row counts"
+            err.contains("EXPLAIN ANALYZE requires remote fragment profile collection"),
+            "unexpected EXPLAIN ANALYZE error: {err}"
         );
     }
 
@@ -6944,26 +6735,6 @@ enable_path_style_access = true
                 crate::sql::codegen::FragmentEdgeKind::Stream
             )
         }));
-    }
-
-    #[test]
-    fn top_level_wrapper_with_limit_is_not_stripped() {
-        let build = build_fragments_for_query("SELECT id FROM tbl LIMIT 5");
-
-        assert!(
-            super::top_level_stream_root_wrapper_child_id(&build).is_none(),
-            "top-level exchange wrapper carrying LIMIT must stay as the root"
-        );
-    }
-
-    #[test]
-    fn top_level_merging_topn_wrapper_is_not_stripped() {
-        let build = build_fragments_for_query("SELECT id FROM tbl ORDER BY id LIMIT 5");
-
-        assert!(
-            super::top_level_stream_root_wrapper_child_id(&build).is_none(),
-            "top-level exchange wrapper carrying merging TopN semantics must stay as the root"
-        );
     }
 
     #[test]

@@ -19,14 +19,21 @@
 //!
 //! `FragmentDispatcher` decouples coordinator from where fragments actually
 //! run. `RemoteDispatcher` talks to one or more BEs over gRPC by index;
-//! `InProcessDispatcher` remains available for targeted local execution paths.
 //! `FragmentScheduler` chooses which backend each fragment instance lands on.
+//! Unit tests may use an in-process dispatcher, but product execution should
+//! route fragments through `RemoteDispatcher`.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+#[cfg(test)]
+use std::sync::{Condvar, Mutex};
+#[cfg(test)]
 use std::thread::JoinHandle;
+#[cfg(test)]
 use std::time::Duration;
 
 #[cfg(test)]
@@ -42,26 +49,36 @@ use thrift::transport::{TBufferChannel, TIoChannel};
 use crate::common::ids::SlotId;
 #[cfg(test)]
 use crate::common::thrift::thrift_binary_deserialize;
+#[cfg(test)]
 use crate::common::types::UniqueId;
+#[cfg(test)]
+use crate::data_sinks;
 use crate::exec::chunk::Chunk;
 use crate::exec::chunk::ChunkSchemaRef;
 #[cfg(test)]
 use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
+#[cfg(test)]
 use crate::exec::node::{ExecPlan, push_down_local_runtime_filters};
+#[cfg(test)]
 use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
+#[cfg(test)]
 use crate::exec::pipeline::executor::execute_plan_with_pipeline;
 use crate::internal_service;
+#[cfg(test)]
 use crate::lower::layout::{build_tuple_slot_order, reorder_tuple_slots};
+#[cfg(test)]
 use crate::lower::thrift::lower_plan;
 use crate::runtime::profile::Profiler;
+#[cfg(test)]
 use crate::runtime::query_context::QueryId;
+#[cfg(test)]
 use crate::runtime::runtime_state::RuntimeState;
 use crate::service::grpc_client::NovaRocksGrpcRemoteClient;
 use crate::service::grpc_proto::novarocks::{
     CancelFragmentRequest, FetchResultRequest, PUniqueId, SubmitFragmentRequest,
     fetch_result_response::Status as FetchStatus,
 };
-use crate::{data_sinks, types};
+use crate::types;
 use tracing::warn;
 
 static REMOTE_SUBMIT_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -124,8 +141,8 @@ pub trait FragmentDispatcher: Send + Sync + 'static {
         false
     }
 
-    /// Drain fragment profilers collected by in-process execution. Remote
-    /// dispatchers do not currently surface profiles through this path.
+    /// Drain fragment profilers collected by a profile-capable dispatcher.
+    /// Remote dispatchers do not currently surface profiles through this path.
     fn take_profiles(&self) -> Vec<Profiler> {
         Vec::new()
     }
@@ -293,20 +310,25 @@ fn decode_result_batch_to_chunk(bytes: &[u8]) -> Result<Chunk, String> {
 // Root-fragment slot (RESULT_SINK path)
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 enum RootSlotState {
     Running,
     Done(VecDeque<Chunk>),
     Error(String),
 }
 
+#[cfg(test)]
 type QueryKey = (i64, i64);
+#[cfg(test)]
 type FinstKey = (i64, i64);
 
+#[cfg(test)]
 struct RootSlot {
     state: Mutex<RootSlotState>,
     notify: Condvar,
 }
 
+#[cfg(test)]
 impl RootSlot {
     fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -332,6 +354,7 @@ impl RootSlot {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone)]
 struct RootSlotEntry {
     query_key: QueryKey,
@@ -342,6 +365,7 @@ struct RootSlotEntry {
 // InProcessDispatcher
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 struct InProcessState {
     /// Root fragment result slots (keyed by finst (hi, lo)).
     root_slots: Mutex<HashMap<FinstKey, RootSlotEntry>>,
@@ -355,16 +379,18 @@ struct InProcessState {
     fragment_threads: Mutex<Vec<JoinHandle<()>>>,
 }
 
-/// Dispatcher that runs all fragments in-process via `std::thread::spawn`.
+/// Test dispatcher that runs all fragments in-process via `std::thread::spawn`.
 ///
-/// Keeps the legacy local execution semantics for tests and targeted
-/// single-process paths: non-root fragments use `execute_plan_fragment_sync`;
-/// the root fragment (RESULT_SINK) runs the lowering + pipeline executor
-/// directly and delivers `Chunk`s via a `ResultSinkHandle`.
+/// Keeps legacy local execution semantics for focused unit tests: non-root
+/// fragments use `execute_plan_fragment_sync`; the root fragment (RESULT_SINK)
+/// runs lowering + pipeline execution directly and delivers `Chunk`s via a
+/// `ResultSinkHandle`.
+#[cfg(test)]
 pub struct InProcessDispatcher {
     state: Arc<InProcessState>,
 }
 
+#[cfg(test)]
 impl InProcessDispatcher {
     /// Create an `InProcessDispatcher`.
     ///
@@ -384,12 +410,14 @@ impl InProcessDispatcher {
     }
 }
 
+#[cfg(test)]
 impl Default for InProcessDispatcher {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(test)]
 fn submitted_ids_snapshot(state: &InProcessState) -> Vec<FinstKey> {
     state
         .submitted_ids
@@ -398,6 +426,7 @@ fn submitted_ids_snapshot(state: &InProcessState) -> Vec<FinstKey> {
         .clone()
 }
 
+#[cfg(test)]
 fn cancel_fragment_instance(hi: i64, lo: i64) {
     crate::runtime::result_buffer::cancel(crate::common::types::UniqueId { hi, lo });
     crate::runtime::exchange::cancel_fragment(hi, lo);
@@ -407,12 +436,14 @@ fn cancel_fragment_instance(hi: i64, lo: i64) {
 /// coordinator-side cleanup path. Multiple overlapping cancel waves may race
 /// across the same finst ids; the underlying result buffer and exchange cancel
 /// operations are intentionally safe to repeat.
+#[cfg(test)]
 fn cancel_all_submitted(state: &InProcessState) {
     for (hi, lo) in submitted_ids_snapshot(state) {
         cancel_fragment_instance(hi, lo);
     }
 }
 
+#[cfg(test)]
 fn register_in_process_report_instance(
     params: &internal_service::TExecPlanFragmentParams,
     finst_id: UniqueId,
@@ -448,6 +479,7 @@ fn register_in_process_report_instance(
     }
 }
 
+#[cfg(test)]
 fn record_fragment_error(state: &InProcessState, query_key: QueryKey, msg: String) {
     let msg = {
         let mut guard = state.fragment_errors.lock().expect("fragment_errors lock");
@@ -466,6 +498,7 @@ fn record_fragment_error(state: &InProcessState, query_key: QueryKey, msg: Strin
     }
 }
 
+#[cfg(test)]
 fn pending_fragment_error(state: &InProcessState, query_key: QueryKey) -> Option<String> {
     state
         .fragment_errors
@@ -475,6 +508,7 @@ fn pending_fragment_error(state: &InProcessState, query_key: QueryKey) -> Option
         .cloned()
 }
 
+#[cfg(test)]
 fn record_fragment_profiler(
     state: &InProcessState,
     finst_key: FinstKey,
@@ -489,6 +523,7 @@ fn record_fragment_profiler(
     }
 }
 
+#[cfg(test)]
 fn record_fragment_thread(state: &InProcessState, handle: JoinHandle<()>) {
     state
         .fragment_threads
@@ -497,6 +532,7 @@ fn record_fragment_thread(state: &InProcessState, handle: JoinHandle<()>) {
         .push(handle);
 }
 
+#[cfg(test)]
 fn wait_for_fragment_threads(state: &InProcessState) {
     let handles = std::mem::take(
         &mut *state
@@ -511,6 +547,7 @@ fn wait_for_fragment_threads(state: &InProcessState) {
     }
 }
 
+#[cfg(test)]
 fn format_fragment_error(finst_key: (i64, i64), error: &str) -> String {
     format!(
         "fragment {}/{} failed during in-process execution: {}",
@@ -520,6 +557,7 @@ fn format_fragment_error(finst_key: (i64, i64), error: &str) -> String {
 
 /// Returns true if the TExecPlanFragmentParams carries a RESULT_SINK (root
 /// fragment).
+#[cfg(test)]
 fn is_result_sink(params: &internal_service::TExecPlanFragmentParams) -> bool {
     params
         .fragment
@@ -529,6 +567,7 @@ fn is_result_sink(params: &internal_service::TExecPlanFragmentParams) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(test)]
 impl FragmentDispatcher for InProcessDispatcher {
     #[cfg(test)]
     fn as_any(&self) -> &dyn std::any::Any {
@@ -926,11 +965,13 @@ impl FragmentDispatcher for RemoteDispatcher {
 /// Mirrors the root-fragment execution path from `ExecutionCoordinator` but
 /// operates on the pre-built `TExecPlanFragmentParams` produced by
 /// `build_exec_plan_fragment_params`.
+#[cfg(test)]
 struct RootFragmentOutput {
     chunks: Vec<Chunk>,
     profiler: Option<Profiler>,
 }
 
+#[cfg(test)]
 fn run_root_fragment_in_process(
     params: internal_service::TExecPlanFragmentParams,
 ) -> Result<RootFragmentOutput, String> {
@@ -1050,6 +1091,7 @@ fn run_root_fragment_in_process(
     })
 }
 
+#[cfg(test)]
 fn finish_root_fragment_in_process<F>(
     finst_key: (i64, i64),
     state: Arc<InProcessState>,
@@ -1080,6 +1122,7 @@ fn finish_root_fragment_in_process<F>(
     }
 }
 
+#[cfg(test)]
 fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
         (*message).to_string()
@@ -1090,6 +1133,7 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+#[cfg(test)]
 fn resolve_root_pipeline_dop(params: &internal_service::TExecPlanFragmentParams) -> i32 {
     params
         .pipeline_dop

@@ -11,7 +11,7 @@
 //! is owned by [`FragmentScheduler`]. The coordinator translates each placement
 //! into a `TExecPlanFragmentParams` and submits it through the
 //! `FragmentDispatcher`. `RemoteDispatcher` routes per-instance to BEs over
-//! gRPC; `InProcessDispatcher` remains available for targeted local execution.
+//! gRPC; the in-process dispatcher is limited to unit-test coverage.
 //!
 //! At a single backend (all-in-one / 1FE+1BE), the scheduler produces one
 //! instance per fragment and this path reproduces the prior single-instance
