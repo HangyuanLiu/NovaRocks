@@ -78,6 +78,10 @@ mod tests {
     use crate::sql::optimizer::scalar::ScalarArena;
 
     use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence, TableStatistics};
+    use crate::sql::optimizer::stats_input::{
+        BaseColumnStatistics, BaseTableStatistics, QueryStatsSnapshot, StatValue, StatsRef,
+        StatsSource,
+    };
     use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
     use arrow::datatypes::DataType;
     use std::collections::HashMap;
@@ -108,6 +112,7 @@ mod tests {
         ndv: f64,
         arena: &mut ScalarArena,
     ) -> (OptExpr, HashMap<String, TableStatistics>) {
+        let stats_ref = test_stats_ref_for_table(table);
         let scan = OptExpr::leaf(Operator::LogicalScan(ScanOp {
             database: "db".into(),
             table: TableDef {
@@ -120,7 +125,7 @@ mod tests {
                 },
             },
             alias: None,
-            stats_ref: None,
+            stats_ref: Some(stats_ref),
             columns: vec![OutputColumn {
                 column_id: test_col_id(col),
                 name: col.into(),
@@ -153,7 +158,6 @@ mod tests {
             },
         );
         let mut table_stats = HashMap::new();
-        // estimate_scan keys by alias.unwrap_or(table.name).to_lowercase()
         table_stats.insert(
             table.to_lowercase(),
             TableStatistics {
@@ -164,8 +168,77 @@ mod tests {
         (scan, table_stats)
     }
 
-    fn legacy_stats_input(stats: &HashMap<String, TableStatistics>) -> OptimizerStatsInput {
-        OptimizerStatsInput::from_legacy_table_stats_for_migration(stats)
+    fn test_stats_ref_for_table(table: &str) -> StatsRef {
+        let mut hash = 2_166_136_261u32;
+        for byte in table.to_ascii_lowercase().bytes() {
+            hash ^= byte as u32;
+            hash = hash.wrapping_mul(16_777_619);
+        }
+        StatsRef::new(hash)
+    }
+
+    fn query_stats_input_for_test(stats: &HashMap<String, TableStatistics>) -> OptimizerStatsInput {
+        let mut snapshot = QueryStatsSnapshot::empty();
+        for (name, stats) in stats {
+            let stats_ref = test_stats_ref_for_table(name);
+            assert!(
+                snapshot.get(stats_ref).is_none(),
+                "test stats ref collision for table {name}"
+            );
+            snapshot.insert(
+                stats_ref,
+                format!("db.{name}"),
+                base_stats_from_table_statistics(stats),
+            );
+        }
+        OptimizerStatsInput::from_query_stats(&snapshot)
+    }
+
+    fn base_stats_from_table_statistics(stats: &TableStatistics) -> BaseTableStatistics {
+        BaseTableStatistics {
+            row_count: StatValue::known(
+                stats.row_count,
+                Confidence::Exact,
+                StatsSource::TestFixture,
+            ),
+            columns: stats
+                .column_stats
+                .iter()
+                .map(|(name, stat)| {
+                    (
+                        name.to_ascii_lowercase(),
+                        BaseColumnStatistics {
+                            nulls_fraction: StatValue::known(
+                                stat.nulls_fraction,
+                                stat.confidence,
+                                StatsSource::TestFixture,
+                            ),
+                            average_row_size: StatValue::known(
+                                stat.average_row_size,
+                                stat.confidence,
+                                StatsSource::TestFixture,
+                            ),
+                            min_value: StatValue::known(
+                                stat.min_value,
+                                stat.confidence,
+                                StatsSource::TestFixture,
+                            ),
+                            max_value: StatValue::known(
+                                stat.max_value,
+                                stat.confidence,
+                                StatsSource::TestFixture,
+                            ),
+                            ndv: StatValue::known(
+                                stat.distinct_values_count,
+                                stat.confidence,
+                                StatsSource::TestFixture,
+                            ),
+                        },
+                    )
+                })
+                .collect(),
+            source: StatsSource::TestFixture,
+        }
     }
 
     fn scan_without_stats_with_predicate(arena: &mut ScalarArena) -> OptExpr {
@@ -206,7 +279,11 @@ mod tests {
         let mut arena = ScalarArena::new();
         let (scan, stats) = scan_with_stats("t", 10_000, "k", 10.0, &mut arena);
         let plan = make_push_plan(scan, &mut arena);
-        assert!(should_push(&plan, &arena, &legacy_stats_input(&stats)));
+        assert!(should_push(
+            &plan,
+            &arena,
+            &query_stats_input_for_test(&stats)
+        ));
     }
 
     #[test]
@@ -214,7 +291,11 @@ mod tests {
         let mut arena = ScalarArena::new();
         let (scan, stats) = scan_with_stats("t", 10_000, "k", 10_000.0, &mut arena);
         let plan = make_push_plan(scan, &mut arena);
-        assert!(!should_push(&plan, &arena, &legacy_stats_input(&stats)));
+        assert!(!should_push(
+            &plan,
+            &arena,
+            &query_stats_input_for_test(&stats)
+        ));
     }
 
     #[test]
@@ -229,7 +310,11 @@ mod tests {
             .unwrap()
             .confidence = Confidence::Estimated;
         let plan = make_push_plan(scan, &mut arena);
-        assert!(should_push(&plan, &arena, &legacy_stats_input(&stats)));
+        assert!(should_push(
+            &plan,
+            &arena,
+            &query_stats_input_for_test(&stats)
+        ));
     }
 
     #[test]
@@ -237,7 +322,11 @@ mod tests {
         let mut arena = ScalarArena::new();
         let (scan, stats) = scan_with_stats("t", 20_000, "k", f64::NAN, &mut arena);
         let plan = make_push_plan(scan, &mut arena);
-        assert!(should_push(&plan, &arena, &legacy_stats_input(&stats)));
+        assert!(should_push(
+            &plan,
+            &arena,
+            &query_stats_input_for_test(&stats)
+        ));
     }
 
     #[test]
@@ -245,7 +334,11 @@ mod tests {
         let mut arena = ScalarArena::new();
         let (scan, stats) = scan_with_stats("t", 10_000, "k", f64::NAN, &mut arena);
         let plan = make_push_plan(scan, &mut arena);
-        assert!(should_push(&plan, &arena, &legacy_stats_input(&stats)));
+        assert!(should_push(
+            &plan,
+            &arena,
+            &query_stats_input_for_test(&stats)
+        ));
     }
 
     #[test]
@@ -253,7 +346,11 @@ mod tests {
         let mut arena = ScalarArena::new();
         let (scan, stats) = scan_with_stats("t", 500, "k", f64::NAN, &mut arena);
         let plan = make_push_plan(scan, &mut arena);
-        assert!(!should_push(&plan, &arena, &legacy_stats_input(&stats)));
+        assert!(!should_push(
+            &plan,
+            &arena,
+            &query_stats_input_for_test(&stats)
+        ));
     }
 
     #[test]
@@ -264,7 +361,7 @@ mod tests {
         assert!(should_push(
             &plan,
             &arena,
-            &legacy_stats_input(&HashMap::new())
+            &query_stats_input_for_test(&HashMap::new())
         ));
     }
 }

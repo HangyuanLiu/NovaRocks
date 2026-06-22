@@ -22,7 +22,9 @@ use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 use crate::sql::optimizer::statistics::*;
 use crate::sql::optimizer::stats_input::OptimizerStatsInput;
 
-const MISSING_BOUND_STATS_ROW_COUNT_FALLBACK: f64 = 100_000.0;
+// Matches the old unknown-table default from estimate_default_row_count to
+// minimize plan churn while removing table-name heuristics.
+const MISSING_BASE_ROW_COUNT_FALLBACK: f64 = 100_000.0;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -1810,7 +1812,7 @@ fn derive_scan(
             scalars,
             Some(&resolved.table_stats),
             resolved.row_count_confidence,
-            MISSING_BOUND_STATS_ROW_COUNT_FALLBACK,
+            MISSING_BASE_ROW_COUNT_FALLBACK,
         ),
         ScanStatsResolution::MissingBoundRef => derive_scan_statistics_scalar(
             &scan.columns,
@@ -1818,15 +1820,7 @@ fn derive_scan(
             scalars,
             None,
             Confidence::Fallback,
-            MISSING_BOUND_STATS_ROW_COUNT_FALLBACK,
-        ),
-        ScanStatsResolution::MissingLegacyStats => derive_scan_statistics_scalar(
-            &scan.columns,
-            &scan.predicates,
-            scalars,
-            None,
-            Confidence::Fallback,
-            estimate_default_row_count(&scan.table.name),
+            MISSING_BASE_ROW_COUNT_FALLBACK,
         ),
     }
 }
@@ -1839,45 +1833,27 @@ struct ResolvedScanTableStatistics {
 enum ScanStatsResolution {
     Resolved(ResolvedScanTableStatistics),
     MissingBoundRef,
-    MissingLegacyStats,
 }
 
 fn resolve_scan_table_statistics(
     scan: &super::operator::ScanOp,
     stats_input: &OptimizerStatsInput,
 ) -> ScanStatsResolution {
-    if let Some(stats_ref) = scan.stats_ref {
-        return match stats_input
-            .query_stats()
-            .get(stats_ref)
-            .and_then(TableStatistics::try_from_base_stats_with_confidence)
-        {
-            Some((table_stats, row_count_confidence)) => {
-                ScanStatsResolution::Resolved(ResolvedScanTableStatistics {
-                    table_stats,
-                    row_count_confidence,
-                })
-            }
-            None => ScanStatsResolution::MissingBoundRef,
-        };
-    }
-
-    let Some(legacy_table_stats) = stats_input.legacy_table_stats_for_migration() else {
-        return ScanStatsResolution::MissingLegacyStats;
+    let Some(stats_ref) = scan.stats_ref else {
+        return ScanStatsResolution::MissingBoundRef;
     };
-    let alias_key = scan.alias.as_deref().map(|a| a.to_ascii_lowercase());
-    let table_key = scan.table.name.to_ascii_lowercase();
-    match alias_key
-        .as_deref()
-        .and_then(|key| legacy_table_stats.get(key))
-        .or_else(|| legacy_table_stats.get(&table_key))
-        .cloned()
+    match stats_input
+        .query_stats()
+        .get(stats_ref)
+        .and_then(TableStatistics::try_from_base_stats_with_confidence)
     {
-        Some(table_stats) => ScanStatsResolution::Resolved(ResolvedScanTableStatistics {
-            table_stats,
-            row_count_confidence: Confidence::Exact,
-        }),
-        None => ScanStatsResolution::MissingLegacyStats,
+        Some((table_stats, row_count_confidence)) => {
+            ScanStatsResolution::Resolved(ResolvedScanTableStatistics {
+                table_stats,
+                row_count_confidence,
+            })
+        }
+        None => ScanStatsResolution::MissingBoundRef,
     }
 }
 
@@ -2551,7 +2527,8 @@ mod tests {
     use crate::sql::optimizer::estimate::selectivity::estimate_selectivity;
     use crate::sql::optimizer::memo::Memo;
     use crate::sql::optimizer::stats_input::{
-        BaseTableStatistics, QueryStatsSnapshot, StatValue, StatsRef, StatsSource,
+        BaseColumnStatistics, BaseTableStatistics, QueryStatsSnapshot, StatValue, StatsRef,
+        StatsSource,
     };
     use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
     use crate::sql::planner::optimizer_bridge::scalar::{
@@ -2561,12 +2538,35 @@ mod tests {
     use arrow::datatypes::DataType;
 
     fn logical_plan_to_memo_for_test(plan: &LogicalPlanNode, memo: &mut Memo) -> GroupId {
-        let opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
-            plan,
-            &mut memo.scalars,
-        )
-        .expect("logical plan to opt expr");
+        let mut opt_expr =
+            crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+                plan,
+                &mut memo.scalars,
+            )
+            .expect("logical plan to opt expr");
+        bind_test_scan_refs(&mut opt_expr);
         crate::sql::optimizer::memo_copy::opt_expr_to_memo(&opt_expr, memo)
+    }
+
+    fn bind_test_scan_refs(expr: &mut OptExpr) {
+        match &mut expr.op {
+            Operator::LogicalScan(scan) | Operator::PhysicalScan(scan) => {
+                scan.stats_ref = Some(test_stats_ref_for_table(&scan.table.name));
+            }
+            _ => {}
+        }
+        for child in &mut expr.children {
+            bind_test_scan_refs(child);
+        }
+    }
+
+    fn test_stats_ref_for_table(table: &str) -> StatsRef {
+        let mut hash = 2_166_136_261u32;
+        for byte in table.to_ascii_lowercase().bytes() {
+            hash ^= byte as u32;
+            hash = hash.wrapping_mul(16_777_619);
+        }
+        StatsRef::new(hash)
     }
 
     fn estimate_selectivity_for_test(
@@ -2621,12 +2621,72 @@ mod tests {
         )
     }
 
-    fn legacy_stats_input(stats: &HashMap<String, TableStatistics>) -> OptimizerStatsInput {
-        OptimizerStatsInput::from_legacy_table_stats_for_migration(stats)
+    fn query_stats_input_for_test(stats: &HashMap<String, TableStatistics>) -> OptimizerStatsInput {
+        let mut snapshot = QueryStatsSnapshot::empty();
+        for (name, stats) in stats {
+            let stats_ref = test_stats_ref_for_table(name);
+            assert!(
+                snapshot.get(stats_ref).is_none(),
+                "test stats ref collision for table {name}"
+            );
+            snapshot.insert(
+                stats_ref,
+                format!("db.{name}"),
+                base_stats_from_table_statistics(stats),
+            );
+        }
+        OptimizerStatsInput::from_query_stats(&snapshot)
     }
 
     fn empty_stats_input() -> OptimizerStatsInput {
-        legacy_stats_input(&HashMap::new())
+        OptimizerStatsInput::from_query_stats(&QueryStatsSnapshot::empty())
+    }
+
+    fn base_stats_from_table_statistics(stats: &TableStatistics) -> BaseTableStatistics {
+        BaseTableStatistics {
+            row_count: StatValue::known(
+                stats.row_count,
+                Confidence::Exact,
+                StatsSource::TestFixture,
+            ),
+            columns: stats
+                .column_stats
+                .iter()
+                .map(|(name, stat)| {
+                    (
+                        name.to_ascii_lowercase(),
+                        BaseColumnStatistics {
+                            nulls_fraction: StatValue::known(
+                                stat.nulls_fraction,
+                                stat.confidence,
+                                StatsSource::TestFixture,
+                            ),
+                            average_row_size: StatValue::known(
+                                stat.average_row_size,
+                                stat.confidence,
+                                StatsSource::TestFixture,
+                            ),
+                            min_value: StatValue::known(
+                                stat.min_value,
+                                stat.confidence,
+                                StatsSource::TestFixture,
+                            ),
+                            max_value: StatValue::known(
+                                stat.max_value,
+                                stat.confidence,
+                                StatsSource::TestFixture,
+                            ),
+                            ndv: StatValue::known(
+                                stat.distinct_values_count,
+                                stat.confidence,
+                                StatsSource::TestFixture,
+                            ),
+                        },
+                    )
+                })
+                .collect(),
+            source: StatsSource::TestFixture,
+        }
     }
 
     fn test_col_id(name: &str) -> ColumnId {
@@ -2780,15 +2840,15 @@ mod tests {
 
     #[test]
     fn fallback_scan_applies_predicate_selectivity() {
-        // No table stats registered -> derive_scan takes the heuristic
-        // fallback. With the fix, the predicate still reduces the row count.
+        // No bound snapshot entry -> derive_scan takes the neutral fallback.
+        // The predicate should still reduce the row count.
         let table_stats: HashMap<String, TableStatistics> = HashMap::new();
         let pred = eq_expr(col_ref("a"), int_lit(42));
         let plan = scan_plan_with_predicates("unknown_tbl", &["a"], vec![pred]);
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &legacy_stats_input(&table_stats));
+        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
 
         // default_rows("unknown_tbl") = 100000; unknown-column eq selectivity
         // = PREDICATE_UNKNOWN_FILTER (0.25) -> 100000 * 0.25 = 25000.
@@ -2799,29 +2859,28 @@ mod tests {
 
     #[test]
     fn bound_scan_missing_snapshot_ref_uses_neutral_non_name_fallback() {
-        let stats_ref = StatsRef::new(42);
-        let scan = bound_scan_opt_expr("store_sales", &["k"], stats_ref);
         let stats_input = OptimizerStatsInput::from_query_stats(&QueryStatsSnapshot::empty());
-        let stats = derive_opt_expr_statistics(&scan, &ScalarArena::new(), &stats_input);
 
-        assert!((stats.output_row_count - MISSING_BOUND_STATS_ROW_COUNT_FALLBACK).abs() < 1.0);
-        assert_ne!(
-            stats.output_row_count,
-            estimate_default_row_count("store_sales")
-        );
-        assert_eq!(stats.row_count_confidence, Confidence::Fallback);
+        for table_name in ["store_sales", "tiny_dim"] {
+            let stats_ref = StatsRef::new(42);
+            let scan = bound_scan_opt_expr(table_name, &["k"], stats_ref);
+            let stats = derive_opt_expr_statistics(&scan, &ScalarArena::new(), &stats_input);
+
+            assert!((stats.output_row_count - MISSING_BASE_ROW_COUNT_FALLBACK).abs() < 1.0);
+            assert_eq!(stats.row_count_confidence, Confidence::Fallback);
+        }
     }
 
     #[test]
-    fn bound_scan_preserves_snapshot_row_count_confidence() {
+    fn bound_scan_preserves_snapshot_row_count_despite_misleading_name() {
         let stats_ref = StatsRef::new(7);
         let mut snapshot = QueryStatsSnapshot::empty();
         snapshot.insert(
             stats_ref,
-            "db.estimated",
+            "db.misleading_sales_table",
             BaseTableStatistics {
                 row_count: StatValue::known(
-                    42,
+                    2,
                     Confidence::Estimated,
                     StatsSource::ConnectorEstimate,
                 ),
@@ -2829,11 +2888,11 @@ mod tests {
                 source: StatsSource::ConnectorEstimate,
             },
         );
-        let scan = bound_scan_opt_expr("estimated", &["k"], stats_ref);
+        let scan = bound_scan_opt_expr("misleading_sales_table", &["k"], stats_ref);
         let stats_input = OptimizerStatsInput::from_query_stats(&snapshot);
         let stats = derive_opt_expr_statistics(&scan, &ScalarArena::new(), &stats_input);
 
-        assert!((stats.output_row_count - 42.0).abs() < 1.0);
+        assert!((stats.output_row_count - 2.0).abs() < 1.0);
         assert_eq!(stats.row_count_confidence, Confidence::Estimated);
     }
 
@@ -2857,7 +2916,7 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &legacy_stats_input(&table_stats));
+        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
 
         let props = memo.groups[0].logical_props.as_ref().unwrap();
         assert!((props.row_count - 100_000.0).abs() < 1.0);
@@ -2886,7 +2945,7 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &legacy_stats_input(&table_stats));
+        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
 
         let props = memo.groups[0].logical_props.as_ref().unwrap();
         assert!((props.row_count - 1_000.0).abs() < 1.0);
@@ -2903,7 +2962,7 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &legacy_stats_input(&table_stats));
+        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
 
         let props = memo.groups[0].logical_props.as_ref().unwrap();
         assert_eq!(props.row_count, 1.0);
@@ -2935,7 +2994,7 @@ mod tests {
                 database: scan.database,
                 table: scan.table,
                 alias: scan.alias,
-                stats_ref: None,
+                stats_ref: Some(test_stats_ref_for_table("orders")),
                 columns: scan.columns,
                 predicates,
                 required_columns: scan.required_columns,
@@ -2946,7 +3005,7 @@ mod tests {
             children: vec![],
         };
 
-        let stats = derive_statistics(&expr, &memo, &legacy_stats_input(&table_stats));
+        let stats = derive_statistics(&expr, &memo, &query_stats_input_for_test(&table_stats));
 
         assert!((stats.output_row_count - 1_000.0).abs() < 1.0);
         assert_eq!(stats.row_count_confidence, Confidence::Estimated);
@@ -3089,10 +3148,14 @@ mod tests {
             aggregate_expr(&mut memo, child_group, AggStage::Global, vec![true], false);
 
         let table_stats = HashMap::new();
-        let single_stats = derive_statistics(&single, &memo, &legacy_stats_input(&table_stats));
+        let single_stats =
+            derive_statistics(&single, &memo, &query_stats_input_for_test(&table_stats));
         for alternative in [&local, &global, &global_without_split] {
-            let alternative_stats =
-                derive_statistics(alternative, &memo, &legacy_stats_input(&table_stats));
+            let alternative_stats = derive_statistics(
+                alternative,
+                &memo,
+                &query_stats_input_for_test(&table_stats),
+            );
             assert_eq!(
                 single_stats.output_row_count,
                 alternative_stats.output_row_count
@@ -3876,7 +3939,7 @@ mod tests {
         let plan = scan_plan("orders", &["id"]);
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &legacy_stats_input(&table_stats));
+        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
 
         let props = memo.groups[0].logical_props.as_ref().unwrap();
         assert!((props.row_count - 100_000.0).abs() < 1.0);
@@ -3900,7 +3963,7 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &legacy_stats_input(&table_stats));
+        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
 
         // Scan group (0): 10000 rows
         let scan_props = memo.groups[0].logical_props.as_ref().unwrap();
@@ -4791,7 +4854,7 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &legacy_stats_input(&table_stats));
+        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
 
         // Join group should have stats derived.
         let join_props = memo.groups[2].logical_props.as_ref().unwrap();
@@ -4826,7 +4889,7 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &legacy_stats_input(&table_stats));
+        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
 
         // Agg group: real NDV(status)=5 now flows through child_statistics,
         // so output = min(5, 100000) = 5.
@@ -4852,7 +4915,7 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &legacy_stats_input(&table_stats));
+        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
 
         let limit_props = memo.groups[1].logical_props.as_ref().unwrap();
         assert!((limit_props.row_count - 10.0).abs() < 0.01);
@@ -4905,7 +4968,7 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&anchor, &mut memo);
-        derive_group_statistics(&mut memo, &legacy_stats_input(&table_stats));
+        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
 
         // Group 0: Scan (250000 rows from table stats)
         let scan_props = memo.groups[0].logical_props.as_ref().unwrap();
@@ -5151,7 +5214,7 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&anchor, &mut memo);
-        derive_group_statistics(&mut memo, &legacy_stats_input(&table_stats));
+        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
 
         // Group 2: CTEConsume — must now carry the producer's column statistics.
         let consume_props = memo.groups[2].logical_props.as_ref().unwrap();
@@ -5555,7 +5618,7 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &legacy_stats_input(&table_stats));
+        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
 
         // Group 0 is the scan; group 1 is Decode.
         let decode_props = memo.groups[1].logical_props.as_ref().unwrap();
@@ -5716,19 +5779,21 @@ mod tests {
         let m0 = memo.groups[group].logical_exprs[0].clone();
         let m1 = memo.groups[group].logical_exprs[1].clone();
         assert_eq!(
-            derive_statistics(&m0, &memo, &legacy_stats_input(&table_stats)).row_count_confidence,
+            derive_statistics(&m0, &memo, &query_stats_input_for_test(&table_stats))
+                .row_count_confidence,
             Confidence::Fallback,
             "index-0 member (unregistered table) must derive Fallback"
         );
         assert_eq!(
-            derive_statistics(&m1, &memo, &legacy_stats_input(&table_stats)).row_count_confidence,
+            derive_statistics(&m1, &memo, &query_stats_input_for_test(&table_stats))
+                .row_count_confidence,
             Confidence::Exact,
             "index-1 member (registered table) must derive Exact"
         );
 
         // argmax must pick the Exact member (index 1), not first().
         let (chosen, stats) =
-            pick_group_representative(&memo, group, &legacy_stats_input(&table_stats))
+            pick_group_representative(&memo, group, &query_stats_input_for_test(&table_stats))
                 .expect("non-empty group");
         assert_eq!(
             stats.row_count_confidence,
@@ -5746,7 +5811,7 @@ mod tests {
         );
 
         // The cached logical_props (Site 1) must reflect the same argmax pick.
-        derive_group_statistics_for(&mut memo, group, &legacy_stats_input(&table_stats));
+        derive_group_statistics_for(&mut memo, group, &query_stats_input_for_test(&table_stats));
         let props = memo.groups[group].logical_props.as_ref().unwrap();
         assert_eq!(props.row_count_confidence, Confidence::Exact);
         assert!((props.row_count - 1_000.0).abs() < 1.0);
@@ -5769,7 +5834,7 @@ mod tests {
         memo.add_expr_to_group(group, scan_mexpr("eq_tbl", "b"));
 
         let (chosen, _) =
-            pick_group_representative(&memo, group, &legacy_stats_input(&table_stats))
+            pick_group_representative(&memo, group, &query_stats_input_for_test(&table_stats))
                 .expect("non-empty group");
         // Lowest index wins the tie → the "a" scan (logical_exprs[0]).
         assert!(
@@ -5796,7 +5861,7 @@ mod tests {
         let group = memo.new_group(scan_mexpr("unregistered_tbl", "a"));
         memo.add_expr_to_group(group, scan_mexpr("consistent_tbl", "a"));
 
-        derive_group_statistics_for(&mut memo, group, &legacy_stats_input(&table_stats));
+        derive_group_statistics_for(&mut memo, group, &query_stats_input_for_test(&table_stats));
         let props = memo.groups[group].logical_props.as_ref().unwrap();
 
         // Row-level props come from the argmax (Exact) member.
@@ -5902,7 +5967,7 @@ mod tests {
         );
 
         let (chosen, _) =
-            pick_group_representative(&memo, group, &legacy_stats_input(&table_stats))
+            pick_group_representative(&memo, group, &query_stats_input_for_test(&table_stats))
                 .expect("non-empty group");
         match &chosen.op {
             Operator::LogicalJoin(j) => {
@@ -5942,7 +6007,7 @@ mod tests {
         let group = memo.new_group(scan_mexpr("unregistered_tbl", "a"));
 
         // ── Step 2: derive via the bulk pass (first derivation). ──────────
-        derive_group_statistics(&mut memo, &legacy_stats_input(&table_stats));
+        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
 
         // The group now has cached props — single member is Fallback.
         let props = memo.groups[group]
@@ -5962,7 +6027,7 @@ mod tests {
 
         // ── Step 4: hazard — bulk pass SKIPS the group. ───────────────────
         // The guard sees `logical_props.is_some()` and does not re-run argmax.
-        derive_group_statistics(&mut memo, &legacy_stats_input(&table_stats));
+        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
         let props_after_bulk = memo.groups[group]
             .logical_props
             .as_ref()
@@ -5976,7 +6041,7 @@ mod tests {
 
         // ── Step 5: fix — eager re-derive via derive_group_statistics_for. ─
         // This is what a real producer MUST call at append time.
-        derive_group_statistics_for(&mut memo, group, &legacy_stats_input(&table_stats));
+        derive_group_statistics_for(&mut memo, group, &query_stats_input_for_test(&table_stats));
 
         let props_after_eager = memo.groups[group]
             .logical_props
