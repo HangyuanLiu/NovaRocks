@@ -619,6 +619,7 @@ impl StandaloneNovaRocks {
         restore_metadata_if_needed(&inner)?;
         if role == crate::common::app_config::ClusterRole::Fe {
             backend_ops::ensure_backend_registry(&inner)?;
+            backend_ops::wait_for_configured_backends_live(&inner)?;
         }
         if inner.starrocks_table_config.is_some() && inner.metadata_provider.is_some() {
             crate::connector::spawn_starrocks_table_erase_worker(Arc::clone(&inner));

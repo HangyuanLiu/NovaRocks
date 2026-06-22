@@ -67,6 +67,84 @@ pub(crate) fn ensure_backend_registry(
     Ok(crate::runtime::backend_registry::backend_registry().unwrap_or(registry))
 }
 
+pub(crate) fn wait_for_configured_backends_live(
+    _state: &Arc<StandaloneState>,
+) -> Result<(), String> {
+    let cfg = crate::novarocks_config::config().map_err(|e| format!("read config failed: {e}"))?;
+    let configured = cfg
+        .cluster
+        .backends
+        .iter()
+        .map(|addr| parse_backend_addr(addr))
+        .collect::<Result<Vec<_>, _>>()?;
+    let Some(registry) = crate::runtime::backend_registry::backend_registry() else {
+        return Err("role=fe backend registry is not initialized".to_string());
+    };
+
+    wait_for_configured_backends_live_with(
+        registry.as_ref(),
+        &configured,
+        Duration::from_secs(5),
+        Duration::from_millis(cfg.cluster.heartbeat_interval_ms.max(10).min(200)),
+        crate::runtime::heartbeat_mgr::grpc_heartbeat,
+    )
+}
+
+fn wait_for_configured_backends_live_with<F>(
+    registry: &BackendRegistry,
+    configured: &[SocketAddr],
+    timeout: Duration,
+    retry_interval: Duration,
+    send: F,
+) -> Result<(), String>
+where
+    F: Fn(BeId, SocketAddr) -> HeartbeatOutcome,
+{
+    if configured.is_empty() {
+        return Ok(());
+    }
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        crate::runtime::heartbeat_mgr::run_one_round(registry, &send);
+        if configured_backend_live(registry, configured) {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            let configured = configured
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let snapshot = registry
+                .snapshot()
+                .into_iter()
+                .map(|entry| {
+                    format!(
+                        "be_id={} endpoint={} state={} err={}",
+                        entry.be_id,
+                        entry.endpoint,
+                        backend_state_to_str(entry.state),
+                        entry.last_err.unwrap_or_default()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(format!(
+                "role=fe startup timed out waiting for at least one configured backend to become Live; configured=[{configured}] registry=[{snapshot}]"
+            ));
+        }
+        std::thread::sleep(retry_interval);
+    }
+}
+
+fn configured_backend_live(registry: &BackendRegistry, configured: &[SocketAddr]) -> bool {
+    registry
+        .snapshot()
+        .into_iter()
+        .any(|entry| configured.contains(&entry.endpoint) && entry.state == BackendState::Live)
+}
+
 pub(crate) fn install_all_in_one_backend_registry(
     endpoint: SocketAddr,
     heartbeat_timeout_retries: u32,
@@ -473,5 +551,41 @@ mod tests {
             "{err}"
         );
         assert!(err.contains("127.0.0.1:19071"), "{err}");
+    }
+
+    #[test]
+    fn wait_for_configured_backends_live_returns_immediately_without_configured_backends() {
+        let registry = Arc::new(BackendRegistry::new(3));
+
+        wait_for_configured_backends_live_with(
+            &registry,
+            &[],
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            |_be_id, _endpoint| HeartbeatOutcome::failed("should not heartbeat"),
+        )
+        .expect("empty configured backend list must not wait");
+    }
+
+    #[test]
+    fn wait_for_configured_backends_live_heartbeats_until_one_backend_is_live() {
+        let endpoint: std::net::SocketAddr = "127.0.0.1:19070".parse().unwrap();
+        let registry = Arc::new(BackendRegistry::new(3));
+        let be_id = registry.add_backend(endpoint);
+
+        wait_for_configured_backends_live_with(
+            &registry,
+            &[endpoint],
+            Duration::from_millis(50),
+            Duration::from_millis(1),
+            move |actual_be_id, actual_endpoint| {
+                assert_eq!(actual_be_id, be_id);
+                assert_eq!(actual_endpoint, endpoint);
+                HeartbeatOutcome::ok(7, 100)
+            },
+        )
+        .expect("configured backend should become live");
+
+        assert_eq!(registry.live_endpoints(), vec![(be_id, endpoint)]);
     }
 }

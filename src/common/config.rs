@@ -49,6 +49,13 @@ pub(crate) fn debug_emit_cancel_marker() -> bool {
         .unwrap_or(false)
 }
 
+pub(crate) fn debug_emit_grpc_fragment_marker() -> bool {
+    novarocks_app_config()
+        .ok()
+        .map(|c| c.debug.emit_grpc_fragment_marker())
+        .unwrap_or(false)
+}
+
 pub(crate) fn exchange_wait_ms() -> u64 {
     novarocks_app_config()
         .ok()

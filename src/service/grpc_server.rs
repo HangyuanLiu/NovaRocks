@@ -281,6 +281,10 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
     ) -> Result<tonic::Response<proto::novarocks::SubmitFragmentResponse>, tonic::Status> {
         self.require_local_execution("SubmitFragment")?;
         let call_index = SUBMIT_FRAGMENT_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
+        if crate::common::config::debug_emit_grpc_fragment_marker() {
+            println!("NOVAROCKS_GRPC_SUBMIT call={call_index}");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
         if crate::common::config::debug_fault_inject_submit_fail_after()
             .is_some_and(|successes| call_index > successes)
         {
@@ -372,6 +376,7 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
                     } else {
                         FetchStatus::Ready
                     };
+                    emit_grpc_typed_fetch_marker(status as i32);
                     Ok(tonic::Response::new(
                         proto::novarocks::FetchResultResponse {
                             status: status as i32,
@@ -381,22 +386,28 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
                         },
                     ))
                 }
-                TryFetchTypedResult::NotReady => Ok(tonic::Response::new(
-                    proto::novarocks::FetchResultResponse {
-                        status: FetchStatus::NotReady as i32,
-                        result_batch_thrift: vec![],
-                        result_arrow_ipc: vec![],
-                        message: String::new(),
-                    },
-                )),
-                TryFetchTypedResult::Error(err) => Ok(tonic::Response::new(
-                    proto::novarocks::FetchResultResponse {
-                        status: FetchStatus::Error as i32,
-                        result_batch_thrift: vec![],
-                        result_arrow_ipc: vec![],
-                        message: err.message,
-                    },
-                )),
+                TryFetchTypedResult::NotReady => {
+                    emit_grpc_typed_fetch_marker(FetchStatus::NotReady as i32);
+                    Ok(tonic::Response::new(
+                        proto::novarocks::FetchResultResponse {
+                            status: FetchStatus::NotReady as i32,
+                            result_batch_thrift: vec![],
+                            result_arrow_ipc: vec![],
+                            message: String::new(),
+                        },
+                    ))
+                }
+                TryFetchTypedResult::Error(err) => {
+                    emit_grpc_typed_fetch_marker(FetchStatus::Error as i32);
+                    Ok(tonic::Response::new(
+                        proto::novarocks::FetchResultResponse {
+                            status: FetchStatus::Error as i32,
+                            result_batch_thrift: vec![],
+                            result_arrow_ipc: vec![],
+                            message: err.message,
+                        },
+                    ))
+                }
             };
         }
 
@@ -571,6 +582,13 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
                 },
             )),
         }
+    }
+}
+
+fn emit_grpc_typed_fetch_marker(status: i32) {
+    if crate::common::config::debug_emit_grpc_fragment_marker() {
+        println!("NOVAROCKS_GRPC_FETCH_TYPED status={status}");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
     }
 }
 

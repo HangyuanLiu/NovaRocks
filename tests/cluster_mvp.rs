@@ -638,10 +638,17 @@ fn all_in_one_loopback_select_succeeds() {
     }
     let _lock = lock_cluster_mvp();
 
-    let (_srv, mysql_port) = start_all_in_one("");
+    let (mut srv, mysql_port) = start_all_in_one(
+        r#"
+[debug]
+emit_grpc_fragment_marker = true
+"#,
+    );
     let mut conn = connect_mysql(mysql_port);
     let rows: Vec<i64> = conn.query("SELECT 1").expect("SELECT 1");
     assert_eq!(rows, vec![1]);
+    srv.wait_for_output_contains("NOVAROCKS_GRPC_SUBMIT call=", Duration::from_secs(3));
+    srv.wait_for_output_contains("NOVAROCKS_GRPC_FETCH_TYPED status=", Duration::from_secs(3));
 }
 
 #[test]

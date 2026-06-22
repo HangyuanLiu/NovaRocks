@@ -42,7 +42,7 @@ pub struct BackendEntry {
     pub last_err: Option<String>,
     pub version: String,
     pub num_cores: u32,
-    // Reserved for later scheduling metrics; the registry does not update it yet.
+    // Incremented by FE/all-in-one dispatchers when fragments are assigned.
     pub scheduled_fragments: u64,
 }
 
@@ -311,7 +311,7 @@ impl BackendRegistry {
     }
 }
 
-/// Install the process registry (role=fe only). Idempotent: first writer wins.
+/// Install the process registry for FE and all-in-one dispatch. Idempotent: first writer wins.
 pub fn install_backend_registry(reg: Arc<BackendRegistry>) -> bool {
     let mut guard = global_registry_cell().lock().unwrap();
     if guard.is_none() {
@@ -321,7 +321,7 @@ pub fn install_backend_registry(reg: Arc<BackendRegistry>) -> bool {
     false
 }
 
-/// The process registry, if installed (role=fe).
+/// The process registry, if installed by role=fe or all-in-one startup.
 pub fn backend_registry() -> Option<Arc<BackendRegistry>> {
     global_registry_cell().lock().unwrap().clone()
 }
