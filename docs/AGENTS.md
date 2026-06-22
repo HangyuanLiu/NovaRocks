@@ -28,7 +28,7 @@
 - 实施计划、执行记录、状态、PR summary、recon findings、handoff 放在 `docs/design/plans/`。
   - 推荐命名：`YYYY-MM-DD-<topic>.md`
 
-- 面向用户的教程、文章、部署指南继续放在既有的 `docs/articles/` 或 `docs/guides/`，不要混入 `docs/design/`。
+- 面向用户的技术博客放在 `docs/blog/`，教程和部署指南放在 `docs/guides/`，不要混入 `docs/design/`。
 
 ## 移动和引用修正
 
