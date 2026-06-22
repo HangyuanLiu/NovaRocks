@@ -469,13 +469,16 @@ mod tests {
     fn regular_query_pipeline_does_not_produce_markers() {
         use crate::sql::optimizer::rewrite::context::RewriteContext;
         use crate::sql::optimizer::rewrite::registry::query_rewrite_pipeline;
-        use std::collections::HashMap;
-
         // Exercise the real query rewrite pipeline (the one used by the
         // optimizer before CBO) to ensure it never introduces IMV markers
         // on a plain non-IMV plan.
-        let pipeline = query_rewrite_pipeline(&HashMap::new());
+        let pipeline = query_rewrite_pipeline();
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        ctx.set_query_stats_input(
+            crate::sql::optimizer::stats_input::OptimizerStatsInput::from_legacy_table_stats_for_migration(
+                &std::collections::HashMap::new(),
+            ),
+        );
         let arena = std::rc::Rc::new(std::cell::RefCell::new(ScalarArena::new()));
         ctx.set_scalar_arena(std::rc::Rc::clone(&arena));
         let plan = empty_values_plan();

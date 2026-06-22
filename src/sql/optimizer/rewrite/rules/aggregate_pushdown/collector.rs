@@ -1,14 +1,11 @@
 //! Aggregate pushdown collector — phase 1 of the rule.
 
-use std::collections::HashMap;
-
 use crate::sql::column_id::ColumnId;
 use crate::sql::common::BinOp;
 use crate::sql::optimizer::operator::{LogicalAggregateOp, LogicalJoinOp, Operator};
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 use crate::sql::optimizer::scalar_expr;
-use crate::sql::optimizer::statistics::TableStatistics;
 
 use super::context::{AggregatePushDownContext, ColumnRefIdentity, PushPlan, Side};
 
@@ -91,7 +88,6 @@ fn collect_required_column_refs(
 pub(crate) fn collect_push_plan(
     aggregate: &LogicalAggregateOp,
     aggregate_input: &OptExpr,
-    _table_stats: &HashMap<String, TableStatistics>,
     arena: &ScalarArena,
 ) -> Option<PushPlan> {
     let ctx = entry_safety_check(aggregate, arena)?;
@@ -544,7 +540,7 @@ mod tests {
         let Operator::LogicalAggregate(agg) = &agg_plan.op else {
             panic!("expected Aggregate test plan");
         };
-        collect_push_plan(agg, agg_plan.unary_input(), &HashMap::new(), arena)
+        collect_push_plan(agg, agg_plan.unary_input(), arena)
     }
 
     #[test]

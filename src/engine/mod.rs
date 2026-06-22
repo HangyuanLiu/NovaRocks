@@ -1145,6 +1145,7 @@ impl StandaloneSession {
                     &catalog_snapshot,
                     &connectors_snapshot,
                     current_database,
+                    self.inner.exchange_port,
                     None,
                     Some(&self.inner),
                 )?;
@@ -3100,19 +3101,111 @@ fn prepare_explain_query(
 /// the profiled plan body.
 #[allow(clippy::too_many_arguments)]
 fn explain_analyze_query(
-    _query: &sqlparser::ast::Query,
-    _analyzer_catalog: &dyn crate::sql::catalog::CatalogProvider,
-    _codegen_catalog: &InMemoryCatalog,
-    _connectors: &crate::connector::ConnectorRegistry,
-    _current_database: &str,
-    _query_opts: Option<crate::internal_service::TQueryOptions>,
-    _mv_rewrite_state: Option<&Arc<StandaloneState>>,
+    query: &sqlparser::ast::Query,
+    analyzer_catalog: &dyn crate::sql::catalog::CatalogProvider,
+    codegen_catalog: &InMemoryCatalog,
+    connectors: &crate::connector::ConnectorRegistry,
+    current_database: &str,
+    exchange_port: u16,
+    query_opts: Option<crate::internal_service::TQueryOptions>,
+    mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
-    Err(
-        "EXPLAIN ANALYZE requires remote fragment profile collection; \
-         RemoteDispatcher profiles are not available yet"
-            .to_string(),
-    )
+    use crate::runtime::profile::Profiler;
+    use crate::runtime::profile_correlate::collect_actuals_by_plan_node_id_multi;
+    use crate::sql::codegen::ir::{explain_distributed_plan_analyze, lower_distributed_plan};
+    use crate::sql::explain::ExplainLevel;
+    use crate::sql::planner::build_distributed_plan;
+
+    let t_plan = Instant::now();
+    let (resolved, cte_registry, mut factory) =
+        crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
+    let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
+    let mut table_stats = build_table_stats_from_plan(&logical);
+    // MV query rewrite candidate prep (EXPLAIN ANALYZE has no MV refresh
+    // context, so the gate is only `mv_rewrite_state.is_some()`).
+    let mv_candidates = match mv_rewrite_state {
+        Some(state) => crate::engine::mv_rewrite_prep::prepare_mv_rewrite_candidates(
+            state,
+            analyzer_catalog,
+            current_database,
+            &logical,
+            &mut factory,
+            &mut table_stats,
+        ),
+        None => Vec::new(),
+    };
+    // dictionary_provider intentionally None; installed via TLS by execute_in_context.
+    let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
+    let opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+        &logical,
+        &mut scalar_arena,
+    )?;
+    let physical = crate::sql::optimizer::optimize_with_legacy_table_stats_for_migration(
+        opt_expr,
+        scalar_arena,
+        &table_stats,
+        factory,
+        None,
+        mv_candidates,
+    )?;
+    let dp = build_distributed_plan(&physical)?;
+    let build_result = lower_distributed_plan(&dp, codegen_catalog, connectors, None)?;
+    let planning_ms = t_plan.elapsed().as_millis() as u64;
+
+    let t_exec = Instant::now();
+    let (rows, profilers) = match choose_standalone_execution(build_result) {
+        StandaloneExecutionPlan::SingleFragment(plan) => {
+            let profiler = Profiler::new("explain_analyze");
+            let executed = execute_plan(*plan, query_opts, None, None, Some(profiler.clone()))?;
+            let rows: u64 = executed.chunks.iter().map(|c| c.len() as u64).sum();
+            (rows, vec![profiler])
+        }
+        StandaloneExecutionPlan::Coordinated(build_result) => {
+            let mut profiled_query_opts = query_opts.unwrap_or_default();
+            profiled_query_opts.enable_profile = Some(true);
+            let (dispatcher, scheduler) = coordinated_execution_services(exchange_port)?;
+            if !dispatcher.supports_profile_collection() {
+                return Err(
+                    "EXPLAIN ANALYZE for coordinated plans requires in-process profile collection; remote fragment profiles are not available yet"
+                        .to_string(),
+                );
+            }
+            let outcome = crate::runtime::coordinator::ExecutionCoordinator::new(
+                *build_result,
+                dispatcher,
+                scheduler,
+                Some(profiled_query_opts),
+            )
+            .execute_with_write_outcome()?;
+            let rows: u64 = outcome
+                .query_result
+                .chunks
+                .iter()
+                .map(|c| c.len() as u64)
+                .sum();
+            if outcome.profilers.is_empty() {
+                return Err(
+                    "EXPLAIN ANALYZE did not collect any fragment profiles for the coordinated plan"
+                        .to_string(),
+                );
+            }
+            (rows, outcome.profilers)
+        }
+    };
+    let execution_ms = t_exec.elapsed().as_millis() as u64;
+
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "Planning: {planning_ms} ms / Execution: {execution_ms} ms / Rows: {rows}"
+    ));
+    let actuals = collect_actuals_by_plan_node_id_multi(&profilers);
+    lines.extend(explain_distributed_plan_analyze(
+        &dp,
+        ExplainLevel::Analyze,
+        &actuals,
+    ));
+
+    build_string_query_result("Explain String", lines)
 }
 
 /// Produce non-distributed logical EXPLAIN output for a query without
@@ -3167,7 +3260,7 @@ fn explain_query(
         &logical,
         &mut scalar_arena,
     )?;
-    let physical = crate::sql::optimizer::optimize(
+    let physical = crate::sql::optimizer::optimize_with_legacy_table_stats_for_migration(
         opt_expr,
         scalar_arena,
         &table_stats,
@@ -3364,14 +3457,14 @@ pub(crate) fn execute_query_as_iceberg_write(
         &mut scalar_arena,
     )?;
     let physical = match root_distribution {
-        Some(root_distribution) => crate::sql::optimizer::optimize_with_root_distribution(
+        Some(root_distribution) => crate::sql::optimizer::optimize_with_root_distribution_and_legacy_table_stats_for_migration(
             opt_expr,
             scalar_arena,
             &table_stats,
             factory,
             root_distribution,
         )?,
-        None => crate::sql::optimizer::optimize(
+        None => crate::sql::optimizer::optimize_with_legacy_table_stats_for_migration(
             opt_expr,
             scalar_arena,
             &table_stats,
@@ -3561,7 +3654,7 @@ fn execute_query_with_options_and_imv_validator_with_catalog_provider(
         &logical,
         &mut scalar_arena,
     )?;
-    let physical = crate::sql::optimizer::optimize(
+    let mut physical = crate::sql::optimizer::optimize_with_legacy_table_stats_for_migration(
         opt_expr,
         scalar_arena,
         &table_stats,
@@ -5870,7 +5963,7 @@ enable_path_style_access = true
             &mut scalar_arena,
         )
         .expect("logical to opt expr");
-        let physical = crate::sql::optimizer::optimize(
+        let physical = crate::sql::optimizer::optimize_with_legacy_table_stats_for_migration(
             opt_expr,
             scalar_arena,
             &table_stats,

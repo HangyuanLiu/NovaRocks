@@ -20,6 +20,9 @@ use crate::sql::optimizer::estimate::cardinality::{
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 use crate::sql::optimizer::statistics::*;
+use crate::sql::optimizer::stats_input::OptimizerStatsInput;
+
+const MISSING_BOUND_STATS_ROW_COUNT_FALLBACK: f64 = 100_000.0;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -54,11 +57,11 @@ fn remap_cte_consume_column_statistics(
 pub(crate) fn derive_statistics(
     expr: &MExpr,
     memo: &Memo,
-    table_stats: &HashMap<String, TableStatistics>,
+    stats_input: &OptimizerStatsInput,
 ) -> Statistics {
     match &expr.op {
         // -- Leaf operators (no children) --
-        Operator::LogicalScan(scan) => derive_scan(scan, &memo.scalars, table_stats),
+        Operator::LogicalScan(scan) => derive_scan(scan, &memo.scalars, stats_input),
         Operator::LogicalValues(vals) => Statistics {
             output_row_count: vals.rows.len() as f64,
             row_count_confidence: Confidence::Exact,
@@ -304,15 +307,7 @@ pub(crate) fn derive_statistics(
         ),
 
         // -- Physical operators: derive the same way as their logical counterparts --
-        Operator::PhysicalScan(scan) => derive_scan_statistics_scalar(
-            &scan.table.name,
-            scan.alias.as_deref(),
-            &scan.columns,
-            &scan.predicates,
-            &memo.scalars,
-            table_stats,
-            estimate_default_row_count(&scan.table.name),
-        ),
+        Operator::PhysicalScan(scan) => derive_scan(scan, &memo.scalars, stats_input),
 
         Operator::PhysicalFilter(filter) => {
             let child_stats = child_statistics(memo, &expr.children, 0);
@@ -692,13 +687,13 @@ pub(crate) fn derive_statistics(
 pub(crate) fn derive_opt_expr_statistics(
     expr: &OptExpr,
     arena: &ScalarArena,
-    table_stats: &HashMap<String, TableStatistics>,
+    stats_input: &OptimizerStatsInput,
 ) -> Statistics {
     let mut memo = Memo::new();
     // Donate a clone of the caller's arena so the memo can materialize scalars.
     memo.scalars = arena.clone();
     let root_group = super::memo_copy::opt_expr_to_memo(expr, &mut memo);
-    derive_group_statistics(&mut memo, table_stats);
+    derive_group_statistics(&mut memo, stats_input);
     memo.groups
         .get(root_group)
         .and_then(|group| group.logical_props.as_ref())
@@ -1064,10 +1059,7 @@ fn aggregate_group_column_statistics_scalar(
 /// before their parents, group 0 is the deepest leaf and the last group
 /// is the root. This guarantees that all child groups have their
 /// `logical_props` set before any parent group is processed.
-pub(crate) fn derive_group_statistics(
-    memo: &mut Memo,
-    table_stats: &HashMap<String, TableStatistics>,
-) {
+pub(crate) fn derive_group_statistics(memo: &mut Memo, stats_input: &OptimizerStatsInput) {
     for group_idx in 0..memo.groups.len() {
         // Memoized derive: a group's logical_props are computed exactly once,
         // when first needed (StarRocks isStatsDerived semantics). Under the
@@ -1099,7 +1091,7 @@ pub(crate) fn derive_group_statistics(
         if memo.groups[group_idx].logical_props.is_some() {
             continue;
         }
-        derive_group_statistics_for(memo, group_idx, table_stats);
+        derive_group_statistics_for(memo, group_idx, stats_input);
     }
 }
 
@@ -1120,7 +1112,7 @@ pub(crate) fn derive_group_statistics(
 pub(crate) fn derive_group_statistics_for(
     memo: &mut Memo,
     group_idx: usize,
-    table_stats: &HashMap<String, TableStatistics>,
+    stats_input: &OptimizerStatsInput,
 ) {
     // Output columns are a group-level invariant: all members of a memo group
     // are logically equivalent and expose the identical output columns, so
@@ -1136,7 +1128,7 @@ pub(crate) fn derive_group_statistics_for(
     // `derive_for_expr` with the chosen member; `derive_for_group` would re-pick
     // `first()` internally and break member-consistency when argmax selects a
     // non-first member.
-    if let Some((chosen, stats)) = pick_group_representative(memo, group_idx, table_stats) {
+    if let Some((chosen, stats)) = pick_group_representative(memo, group_idx, stats_input) {
         memo.groups[group_idx].logical_props = Some(super::logical_props::derive_for_expr(
             &chosen,
             memo,
@@ -1176,7 +1168,7 @@ pub(crate) fn derive_group_statistics_for(
 pub(crate) fn pick_group_representative(
     memo: &Memo,
     group_idx: usize,
-    table_stats: &HashMap<String, TableStatistics>,
+    stats_input: &OptimizerStatsInput,
 ) -> Option<(MExpr, Statistics)> {
     // Build the member list as logical_exprs then physical_exprs. Cloning each
     // member releases the borrow on `memo.groups[..]`, so we can pass `memo`
@@ -1193,13 +1185,19 @@ pub(crate) fn pick_group_representative(
 
     let mut iter = members.into_iter();
     let first = iter.next()?;
-    let first_stats = derive_statistics(&first, memo, table_stats);
-    let first_key = first_stats.row_count_confidence;
+    let first_stats = derive_statistics(&first, memo, stats_input);
+    let first_key = (
+        first_stats.row_count_confidence,
+        promise(&first.op, &first.children, memo),
+    );
     let mut best = (first, first_stats, first_key);
 
     for cand in iter {
-        let cand_stats = derive_statistics(&cand, memo, table_stats);
-        let cand_key = cand_stats.row_count_confidence;
+        let cand_stats = derive_statistics(&cand, memo, stats_input);
+        let cand_key = (
+            cand_stats.row_count_confidence,
+            promise(&cand.op, &cand.children, memo),
+        );
         // Strict-greater replacement: replace only on a strict improvement so
         // ties keep the lower index (canonical-first / zero-regression).
         let replace = cand_key > best.2
@@ -1241,15 +1239,15 @@ fn inner_join_conjunct_count(op: &Operator, scalars: &ScalarArena) -> Option<usi
 pub(crate) fn copy_in_join_tree(
     memo: &mut Memo,
     tree: &JoinTree,
-    table_stats: &HashMap<String, TableStatistics>,
+    stats_input: &OptimizerStatsInput,
 ) -> GroupId {
     match tree {
         JoinTree::Leaf(group_id) => *group_id,
         JoinTree::Join { left, right, op } => {
             // Recurse children first so child group ids are always allocated
             // before the parent (the bottom-up invariant M2 relies on).
-            let left_id = copy_in_join_tree(memo, left, table_stats);
-            let right_id = copy_in_join_tree(memo, right, table_stats);
+            let left_id = copy_in_join_tree(memo, left, stats_input);
+            let right_id = copy_in_join_tree(memo, right, stats_input);
             let operator = Operator::LogicalJoin(op.clone());
             // Dedup: reuse an existing group for the same operator + child
             // groups, so candidates sharing intermediate sub-joins do not mint
@@ -1271,7 +1269,7 @@ pub(crate) fn copy_in_join_tree(
             // Stamp statistics immediately: implement() runs before the bulk
             // re-derive (mod.rs), and JoinToHashJoin reads child column ids from
             // logical_props — without this a bushy join degrades to NestLoop (M1).
-            derive_group_statistics_for(memo, group_id, table_stats);
+            derive_group_statistics_for(memo, group_id, stats_input);
             memo.join_group_index.insert(key, group_id);
             group_id
         }
@@ -1803,40 +1801,99 @@ fn derive_window_statistics_scalar(
 fn derive_scan(
     scan: &super::operator::ScanOp,
     scalars: &ScalarArena,
-    table_stats: &HashMap<String, TableStatistics>,
+    stats_input: &OptimizerStatsInput,
 ) -> Statistics {
-    derive_scan_statistics_scalar(
-        &scan.table.name,
-        scan.alias.as_deref(),
-        &scan.columns,
-        &scan.predicates,
-        scalars,
-        table_stats,
-        estimate_default_row_count(&scan.table.name),
-    )
+    match resolve_scan_table_statistics(scan, stats_input) {
+        ScanStatsResolution::Resolved(resolved) => derive_scan_statistics_scalar(
+            &scan.columns,
+            &scan.predicates,
+            scalars,
+            Some(&resolved.table_stats),
+            resolved.row_count_confidence,
+            MISSING_BOUND_STATS_ROW_COUNT_FALLBACK,
+        ),
+        ScanStatsResolution::MissingBoundRef => derive_scan_statistics_scalar(
+            &scan.columns,
+            &scan.predicates,
+            scalars,
+            None,
+            Confidence::Fallback,
+            MISSING_BOUND_STATS_ROW_COUNT_FALLBACK,
+        ),
+        ScanStatsResolution::MissingLegacyStats => derive_scan_statistics_scalar(
+            &scan.columns,
+            &scan.predicates,
+            scalars,
+            None,
+            Confidence::Fallback,
+            estimate_default_row_count(&scan.table.name),
+        ),
+    }
+}
+
+struct ResolvedScanTableStatistics {
+    table_stats: TableStatistics,
+    row_count_confidence: Confidence,
+}
+
+enum ScanStatsResolution {
+    Resolved(ResolvedScanTableStatistics),
+    MissingBoundRef,
+    MissingLegacyStats,
+}
+
+fn resolve_scan_table_statistics(
+    scan: &super::operator::ScanOp,
+    stats_input: &OptimizerStatsInput,
+) -> ScanStatsResolution {
+    if let Some(stats_ref) = scan.stats_ref {
+        return match stats_input
+            .query_stats()
+            .get(stats_ref)
+            .and_then(TableStatistics::try_from_base_stats_with_confidence)
+        {
+            Some((table_stats, row_count_confidence)) => {
+                ScanStatsResolution::Resolved(ResolvedScanTableStatistics {
+                    table_stats,
+                    row_count_confidence,
+                })
+            }
+            None => ScanStatsResolution::MissingBoundRef,
+        };
+    }
+
+    let Some(legacy_table_stats) = stats_input.legacy_table_stats_for_migration() else {
+        return ScanStatsResolution::MissingLegacyStats;
+    };
+    let alias_key = scan.alias.as_deref().map(|a| a.to_ascii_lowercase());
+    let table_key = scan.table.name.to_ascii_lowercase();
+    match alias_key
+        .as_deref()
+        .and_then(|key| legacy_table_stats.get(key))
+        .or_else(|| legacy_table_stats.get(&table_key))
+        .cloned()
+    {
+        Some(table_stats) => ScanStatsResolution::Resolved(ResolvedScanTableStatistics {
+            table_stats,
+            row_count_confidence: Confidence::Exact,
+        }),
+        None => ScanStatsResolution::MissingLegacyStats,
+    }
 }
 
 fn derive_scan_statistics_scalar(
-    table_name: &str,
-    alias: Option<&str>,
     columns: &[OutputColumn],
     predicates: &[ScalarId],
     scalars: &ScalarArena,
-    table_stats: &HashMap<String, TableStatistics>,
+    table_stats: Option<&TableStatistics>,
+    table_row_count_confidence: Confidence,
     default_rows: f64,
 ) -> Statistics {
-    let alias_key = alias.map(|a| a.to_lowercase());
-    let table_key = table_name.to_lowercase();
-    let ts_opt = alias_key
-        .as_deref()
-        .and_then(|key| table_stats.get(key))
-        .or_else(|| table_stats.get(&table_key));
-
-    if let Some(ts) = ts_opt {
+    if let Some(ts) = table_stats {
         let row_count = ts.row_count.max(1) as f64;
 
         let mut output_rows = row_count;
-        let mut row_count_confidence = Confidence::Exact;
+        let mut row_count_confidence = table_row_count_confidence;
         let table_column_statistics = map_table_column_stats_to_ids(columns, ts);
         for pred in predicates {
             let selectivity = estimate_selectivity_scalar(scalars, *pred, &table_column_statistics);
@@ -2493,6 +2550,9 @@ mod tests {
     };
     use crate::sql::optimizer::estimate::selectivity::estimate_selectivity;
     use crate::sql::optimizer::memo::Memo;
+    use crate::sql::optimizer::stats_input::{
+        BaseTableStatistics, QueryStatsSnapshot, StatValue, StatsRef, StatsSource,
+    };
     use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
     use crate::sql::planner::optimizer_bridge::scalar::{
         intern_aggregate_calls, intern_exprs, intern_window_exprs,
@@ -2559,6 +2619,14 @@ mod tests {
                 column_stats: cs,
             },
         )
+    }
+
+    fn legacy_stats_input(stats: &HashMap<String, TableStatistics>) -> OptimizerStatsInput {
+        OptimizerStatsInput::from_legacy_table_stats_for_migration(stats)
+    }
+
+    fn empty_stats_input() -> OptimizerStatsInput {
+        legacy_stats_input(&HashMap::new())
     }
 
     fn test_col_id(name: &str) -> ColumnId {
@@ -2667,6 +2735,49 @@ mod tests {
         plan
     }
 
+    fn bound_scan_opt_expr(name: &str, cols: &[&str], stats_ref: StatsRef) -> OptExpr {
+        let columns: Vec<OutputColumn> = cols
+            .iter()
+            .map(|c| OutputColumn {
+                column_id: test_col_id(c),
+                name: c.to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+                is_internal: false,
+            })
+            .collect();
+        let col_defs: Vec<ColumnDef> = cols
+            .iter()
+            .map(|c| ColumnDef {
+                name: c.to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+                write_default: None,
+                logical_type: None,
+            })
+            .collect();
+        OptExpr::leaf(Operator::LogicalScan(super::super::operator::ScanOp {
+            database: "db".to_string(),
+            table: TableDef {
+                name: name.to_string(),
+                columns: col_defs,
+                iceberg_row_lineage_metadata_columns: vec![],
+                source: ScanSource::StarRocks {
+                    db_id: 1,
+                    table_id: 1,
+                },
+            },
+            alias: None,
+            stats_ref: Some(stats_ref),
+            columns,
+            predicates: vec![],
+            required_columns: None,
+            dict_columns: vec![],
+            variant_columns: vec![],
+            mv_rewritten_from: None,
+        }))
+    }
+
     #[test]
     fn fallback_scan_applies_predicate_selectivity() {
         // No table stats registered -> derive_scan takes the heuristic
@@ -2677,13 +2788,50 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &table_stats);
+        derive_group_statistics(&mut memo, &legacy_stats_input(&table_stats));
 
         // default_rows("unknown_tbl") = 100000; unknown-column eq selectivity
         // = PREDICATE_UNKNOWN_FILTER (0.25) -> 100000 * 0.25 = 25000.
         let props = memo.groups[0].logical_props.as_ref().unwrap();
         assert!((props.row_count - 25_000.0).abs() < 1.0);
         assert_eq!(props.row_count_confidence, Confidence::Fallback);
+    }
+
+    #[test]
+    fn bound_scan_missing_snapshot_ref_uses_neutral_non_name_fallback() {
+        let stats_ref = StatsRef::new(42);
+        let scan = bound_scan_opt_expr("store_sales", &["k"], stats_ref);
+        let stats_input = OptimizerStatsInput::from_query_stats(&QueryStatsSnapshot::empty());
+        let stats = derive_opt_expr_statistics(&scan, &ScalarArena::new(), &stats_input);
+
+        assert!((stats.output_row_count - MISSING_BOUND_STATS_ROW_COUNT_FALLBACK).abs() < 1.0);
+        assert_ne!(stats.output_row_count, estimate_default_row_count("store_sales"));
+        assert_eq!(stats.row_count_confidence, Confidence::Fallback);
+    }
+
+    #[test]
+    fn bound_scan_preserves_snapshot_row_count_confidence() {
+        let stats_ref = StatsRef::new(7);
+        let mut snapshot = QueryStatsSnapshot::empty();
+        snapshot.insert(
+            stats_ref,
+            "db.estimated",
+            BaseTableStatistics {
+                row_count: StatValue::known(
+                    42,
+                    Confidence::Estimated,
+                    StatsSource::ConnectorEstimate,
+                ),
+                columns: HashMap::new(),
+                source: StatsSource::ConnectorEstimate,
+            },
+        );
+        let scan = bound_scan_opt_expr("estimated", &["k"], stats_ref);
+        let stats_input = OptimizerStatsInput::from_query_stats(&snapshot);
+        let stats = derive_opt_expr_statistics(&scan, &ScalarArena::new(), &stats_input);
+
+        assert!((stats.output_row_count - 42.0).abs() < 1.0);
+        assert_eq!(stats.row_count_confidence, Confidence::Estimated);
     }
 
     #[test]
@@ -2706,7 +2854,7 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &table_stats);
+        derive_group_statistics(&mut memo, &legacy_stats_input(&table_stats));
 
         let props = memo.groups[0].logical_props.as_ref().unwrap();
         assert!((props.row_count - 100_000.0).abs() < 1.0);
@@ -2735,7 +2883,7 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &table_stats);
+        derive_group_statistics(&mut memo, &legacy_stats_input(&table_stats));
 
         let props = memo.groups[0].logical_props.as_ref().unwrap();
         assert!((props.row_count - 1_000.0).abs() < 1.0);
@@ -2752,7 +2900,7 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &table_stats);
+        derive_group_statistics(&mut memo, &legacy_stats_input(&table_stats));
 
         let props = memo.groups[0].logical_props.as_ref().unwrap();
         assert_eq!(props.row_count, 1.0);
@@ -2795,7 +2943,7 @@ mod tests {
             children: vec![],
         };
 
-        let stats = derive_statistics(&expr, &memo, &table_stats);
+        let stats = derive_statistics(&expr, &memo, &legacy_stats_input(&table_stats));
 
         assert!((stats.output_row_count - 1_000.0).abs() < 1.0);
         assert_eq!(stats.row_count_confidence, Confidence::Estimated);
@@ -2938,9 +3086,10 @@ mod tests {
             aggregate_expr(&mut memo, child_group, AggStage::Global, vec![true], false);
 
         let table_stats = HashMap::new();
-        let single_stats = derive_statistics(&single, &memo, &table_stats);
+        let single_stats = derive_statistics(&single, &memo, &legacy_stats_input(&table_stats));
         for alternative in [&local, &global, &global_without_split] {
-            let alternative_stats = derive_statistics(alternative, &memo, &table_stats);
+            let alternative_stats =
+                derive_statistics(alternative, &memo, &legacy_stats_input(&table_stats));
             assert_eq!(
                 single_stats.output_row_count,
                 alternative_stats.output_row_count
@@ -3071,7 +3220,7 @@ mod tests {
             children: vec![left, right],
         };
 
-        let stats = derive_statistics(&union, &memo, &HashMap::new());
+        let stats = derive_statistics(&union, &memo, &empty_stats_input());
 
         assert_eq!(stats.output_row_count, MAX_ROW_COUNT);
         assert_eq!(stats.row_count_confidence, Confidence::Fallback);
@@ -3113,7 +3262,7 @@ mod tests {
             children: vec![left, right],
         };
 
-        let stats = derive_statistics(&union, &memo, &HashMap::new());
+        let stats = derive_statistics(&union, &memo, &empty_stats_input());
 
         assert_eq!(stats.output_row_count, 300.0);
         assert_eq!(stats.row_count_confidence, Confidence::Estimated);
@@ -3150,7 +3299,7 @@ mod tests {
             children: vec![left, right],
         };
 
-        let stats = derive_statistics(&union, &memo, &HashMap::new());
+        let stats = derive_statistics(&union, &memo, &empty_stats_input());
 
         assert_eq!(stats.output_row_count, 300.0);
         let col = stat_by_name(&stats.column_statistics, "k");
@@ -3188,7 +3337,7 @@ mod tests {
             children: vec![left, right],
         };
 
-        let stats = derive_statistics(&intersect, &memo, &HashMap::new());
+        let stats = derive_statistics(&intersect, &memo, &empty_stats_input());
 
         assert_eq!(stats.output_row_count, 100.0);
         assert_eq!(stats.row_count_confidence, Confidence::Estimated);
@@ -3229,7 +3378,7 @@ mod tests {
             children: vec![left, right],
         };
 
-        let stats = derive_statistics(&except, &memo, &HashMap::new());
+        let stats = derive_statistics(&except, &memo, &empty_stats_input());
 
         assert_eq!(stats.output_row_count, 500.0);
         assert_eq!(stats.row_count_confidence, Confidence::Estimated);
@@ -3335,11 +3484,11 @@ mod tests {
             children: vec![fallback_child],
         };
 
-        let exact_stats = derive_statistics(&exact_agg, &memo, &HashMap::new());
+        let exact_stats = derive_statistics(&exact_agg, &memo, &empty_stats_input());
         assert_row_count_close(exact_stats.output_row_count, expected);
         assert_eq!(exact_stats.row_count_confidence, Confidence::Estimated);
 
-        let fallback_stats = derive_statistics(&fallback_agg, &memo, &HashMap::new());
+        let fallback_stats = derive_statistics(&fallback_agg, &memo, &empty_stats_input());
         assert_row_count_close(fallback_stats.output_row_count, expected);
         assert_eq!(fallback_stats.row_count_confidence, Confidence::Fallback);
     }
@@ -3379,11 +3528,11 @@ mod tests {
             children: vec![fallback_child],
         };
 
-        let exact_stats = derive_statistics(&exact_agg, &memo, &HashMap::new());
+        let exact_stats = derive_statistics(&exact_agg, &memo, &empty_stats_input());
         assert_row_count_close(exact_stats.output_row_count, expected);
         assert_eq!(exact_stats.row_count_confidence, Confidence::Estimated);
 
-        let fallback_stats = derive_statistics(&fallback_agg, &memo, &HashMap::new());
+        let fallback_stats = derive_statistics(&fallback_agg, &memo, &empty_stats_input());
         assert_row_count_close(fallback_stats.output_row_count, expected);
         assert_eq!(fallback_stats.row_count_confidence, Confidence::Fallback);
     }
@@ -3420,8 +3569,8 @@ mod tests {
         };
 
         for stats in [
-            derive_statistics(&logical, &memo, &HashMap::new()),
-            derive_statistics(&physical, &memo, &HashMap::new()),
+            derive_statistics(&logical, &memo, &empty_stats_input()),
+            derive_statistics(&physical, &memo, &empty_stats_input()),
         ] {
             assert_row_count_close(stats.output_row_count, expected);
             assert_eq!(
@@ -3468,12 +3617,12 @@ mod tests {
             children: vec![child],
         };
 
-        let logical_stats = derive_statistics(&logical, &memo, &HashMap::new());
+        let logical_stats = derive_statistics(&logical, &memo, &empty_stats_input());
         assert_eq!(logical_stats.output_row_count, 1.0);
         assert_eq!(logical_stats.row_count_confidence, Confidence::Estimated);
         assert!(logical_stats.column_statistics.is_empty());
 
-        let physical_stats = derive_statistics(&physical, &memo, &HashMap::new());
+        let physical_stats = derive_statistics(&physical, &memo, &empty_stats_input());
         assert_eq!(physical_stats.output_row_count, 1.0);
         assert_eq!(physical_stats.row_count_confidence, Confidence::Estimated);
         assert!(physical_stats.column_statistics.is_empty());
@@ -3488,7 +3637,6 @@ mod tests {
             AggMode, Operator, PhysicalHashAggregateOp, ValuesOp,
         };
         use crate::sql::optimizer::statistics::ColumnStatistic;
-        use std::collections::HashMap;
 
         fn col_ref(id: u32, name: &str) -> TypedExpr {
             TypedExpr {
@@ -3557,8 +3705,9 @@ mod tests {
         // small: rows=100, NDV=50 -> agg_group_rows = min(50, 100) = 50.
         let small = child_with_stats(&mut memo, 100.0, 50.0);
 
-        let big_stats = derive_statistics(&agg_over(big, &mut memo), &memo, &HashMap::new());
-        let small_stats = derive_statistics(&agg_over(small, &mut memo), &memo, &HashMap::new());
+        let big_stats = derive_statistics(&agg_over(big, &mut memo), &memo, &empty_stats_input());
+        let small_stats =
+            derive_statistics(&agg_over(small, &mut memo), &memo, &empty_stats_input());
 
         // Same op, different children -> different derived statistics. These two
         // aggregates have different children, so they are DIFFERENT memo groups;
@@ -3692,7 +3841,7 @@ mod tests {
             children: vec![child],
         };
 
-        assert_filter_caps_payload_ndv(derive_statistics(&filter, &memo, &HashMap::new()));
+        assert_filter_caps_payload_ndv(derive_statistics(&filter, &memo, &empty_stats_input()));
     }
 
     #[test]
@@ -3712,7 +3861,7 @@ mod tests {
             children: vec![child],
         };
 
-        assert_filter_caps_payload_ndv(derive_statistics(&filter, &memo, &HashMap::new()));
+        assert_filter_caps_payload_ndv(derive_statistics(&filter, &memo, &empty_stats_input()));
     }
 
     #[test]
@@ -3724,7 +3873,7 @@ mod tests {
         let plan = scan_plan("orders", &["id"]);
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &table_stats);
+        derive_group_statistics(&mut memo, &legacy_stats_input(&table_stats));
 
         let props = memo.groups[0].logical_props.as_ref().unwrap();
         assert!((props.row_count - 100_000.0).abs() < 1.0);
@@ -3748,7 +3897,7 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &table_stats);
+        derive_group_statistics(&mut memo, &legacy_stats_input(&table_stats));
 
         // Scan group (0): 10000 rows
         let scan_props = memo.groups[0].logical_props.as_ref().unwrap();
@@ -3825,7 +3974,7 @@ mod tests {
             children: vec![left, right],
         };
 
-        let stats = derive_statistics(&join, &memo, &HashMap::new());
+        let stats = derive_statistics(&join, &memo, &empty_stats_input());
 
         assert!(
             (stats.output_row_count - 1_000.0).abs() < 1.0,
@@ -3897,7 +4046,7 @@ mod tests {
             children: vec![left, right],
         };
 
-        let stats = derive_statistics(&join, &memo, &HashMap::new());
+        let stats = derive_statistics(&join, &memo, &empty_stats_input());
 
         assert_eq!(stats.output_row_count, 40.0);
         assert_eq!(
@@ -3970,7 +4119,7 @@ mod tests {
             children: vec![left, right],
         };
 
-        let stats = derive_statistics(&join, &memo, &HashMap::new());
+        let stats = derive_statistics(&join, &memo, &empty_stats_input());
 
         assert!(
             (stats.output_row_count - 500.0).abs() < 1.0,
@@ -4041,7 +4190,7 @@ mod tests {
             children: vec![left, right],
         };
 
-        let stats = derive_statistics(&join, &memo, &HashMap::new());
+        let stats = derive_statistics(&join, &memo, &empty_stats_input());
 
         assert_eq!(stats.output_row_count, 400_000.0);
         assert_eq!(
@@ -4118,7 +4267,7 @@ mod tests {
             children: vec![left, right],
         };
 
-        let stats = derive_statistics(&join, &memo, &HashMap::new());
+        let stats = derive_statistics(&join, &memo, &empty_stats_input());
 
         assert_eq!(stats.output_row_count, 5.0);
     }
@@ -4174,7 +4323,7 @@ mod tests {
             children: vec![left, right],
         };
 
-        let stats = derive_statistics(&join, &memo, &HashMap::new());
+        let stats = derive_statistics(&join, &memo, &empty_stats_input());
 
         assert_eq!(
             stat_by_name(&stats.column_statistics, "l_key").distinct_values_count,
@@ -4238,7 +4387,7 @@ mod tests {
             children: vec![left, right],
         };
 
-        let stats = derive_statistics(&join, &memo, &HashMap::new());
+        let stats = derive_statistics(&join, &memo, &empty_stats_input());
 
         assert_eq!(stats.output_row_count, 8_000.0);
         assert_eq!(
@@ -4304,7 +4453,7 @@ mod tests {
             children: vec![left, right],
         };
 
-        let stats = derive_statistics(&join, &memo, &HashMap::new());
+        let stats = derive_statistics(&join, &memo, &empty_stats_input());
 
         assert_eq!(
             stat_by_name(&stats.column_statistics, "l_key").distinct_values_count,
@@ -4385,7 +4534,7 @@ mod tests {
             children: vec![left, right],
         };
 
-        let stats = derive_statistics(&join, &memo, &HashMap::new());
+        let stats = derive_statistics(&join, &memo, &empty_stats_input());
 
         assert_eq!(stats.output_row_count, 400_000.0);
         assert_eq!(
@@ -4450,7 +4599,7 @@ mod tests {
             children: vec![left, right],
         };
 
-        let stats = derive_statistics(&join, &memo, &HashMap::new());
+        let stats = derive_statistics(&join, &memo, &empty_stats_input());
 
         assert!(
             (stats.output_row_count - 10.0).abs() < 1.0,
@@ -4514,7 +4663,7 @@ mod tests {
             children: vec![left, right],
         };
 
-        let stats = derive_statistics(&join, &memo, &HashMap::new());
+        let stats = derive_statistics(&join, &memo, &empty_stats_input());
 
         assert!(
             (stats.output_row_count - 20.0).abs() < 1.0,
@@ -4594,7 +4743,11 @@ mod tests {
             }),
             children: vec![child],
         };
-        assert_window_stats(derive_statistics(&logical_window, &memo, &HashMap::new()));
+        assert_window_stats(derive_statistics(
+            &logical_window,
+            &memo,
+            &empty_stats_input(),
+        ));
 
         let physical_window_exprs = intern_window_exprs(&mut memo.scalars, &[window_expr("rn")]);
         let physical_window = MExpr {
@@ -4605,7 +4758,11 @@ mod tests {
             }),
             children: vec![child],
         };
-        assert_window_stats(derive_statistics(&physical_window, &memo, &HashMap::new()));
+        assert_window_stats(derive_statistics(
+            &physical_window,
+            &memo,
+            &empty_stats_input(),
+        ));
     }
 
     #[test]
@@ -4631,7 +4788,7 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &table_stats);
+        derive_group_statistics(&mut memo, &legacy_stats_input(&table_stats));
 
         // Join group should have stats derived.
         let join_props = memo.groups[2].logical_props.as_ref().unwrap();
@@ -4666,7 +4823,7 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &table_stats);
+        derive_group_statistics(&mut memo, &legacy_stats_input(&table_stats));
 
         // Agg group: real NDV(status)=5 now flows through child_statistics,
         // so output = min(5, 100000) = 5.
@@ -4692,7 +4849,7 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &table_stats);
+        derive_group_statistics(&mut memo, &legacy_stats_input(&table_stats));
 
         let limit_props = memo.groups[1].logical_props.as_ref().unwrap();
         assert!((limit_props.row_count - 10.0).abs() < 0.01);
@@ -4745,7 +4902,7 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&anchor, &mut memo);
-        derive_group_statistics(&mut memo, &table_stats);
+        derive_group_statistics(&mut memo, &legacy_stats_input(&table_stats));
 
         // Group 0: Scan (250000 rows from table stats)
         let scan_props = memo.groups[0].logical_props.as_ref().unwrap();
@@ -4807,7 +4964,7 @@ mod tests {
             children: vec![],
         };
 
-        let stats = derive_statistics(&consume, &memo, &HashMap::new());
+        let stats = derive_statistics(&consume, &memo, &empty_stats_input());
 
         assert!(
             (stats.output_row_count - 100_000.0).abs() < 1.0,
@@ -4896,7 +5053,7 @@ mod tests {
                 }),
                 children: vec![],
             };
-            let derived = derive_statistics(&expr, &memo, &HashMap::new());
+            let derived = derive_statistics(&expr, &memo, &empty_stats_input());
             let group = memo.new_group(expr);
             let mut props = LogicalProperties::new(
                 vec![stats_output_column(col_id, "customer_id")],
@@ -4925,7 +5082,7 @@ mod tests {
             children: vec![left, right],
         };
 
-        let stats = derive_statistics(&join, &memo, &HashMap::new());
+        let stats = derive_statistics(&join, &memo, &empty_stats_input());
 
         // Bounded: nowhere near the ~1.56e10 cross-product. A loose upper bound
         // keeps the test robust to estimator-constant tuning while still failing
@@ -4991,7 +5148,7 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&anchor, &mut memo);
-        derive_group_statistics(&mut memo, &table_stats);
+        derive_group_statistics(&mut memo, &legacy_stats_input(&table_stats));
 
         // Group 2: CTEConsume — must now carry the producer's column statistics.
         let consume_props = memo.groups[2].logical_props.as_ref().unwrap();
@@ -5059,7 +5216,7 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &HashMap::new());
+        derive_group_statistics(&mut memo, &empty_stats_input());
 
         let props = memo.groups[0].logical_props.as_ref().unwrap();
         assert!((props.row_count - 3.0).abs() < 0.01);
@@ -5086,7 +5243,7 @@ mod tests {
             children: vec![],
         };
 
-        let stats = derive_statistics(&expr, &memo, &HashMap::new());
+        let stats = derive_statistics(&expr, &memo, &empty_stats_input());
 
         assert!((stats.output_row_count - 1000.0).abs() < 1.0);
         // start=1, end=1000, step=1 -> 1000 distinct values in [1, 1000], all unique.
@@ -5124,7 +5281,7 @@ mod tests {
             }),
             children: vec![],
         };
-        let stats = derive_statistics(&expr, &memo, &HashMap::new());
+        let stats = derive_statistics(&expr, &memo, &empty_stats_input());
         assert!((stats.output_row_count - 3.0).abs() < 1e-9);
         let cs = stats
             .column_statistics
@@ -5174,7 +5331,7 @@ mod tests {
             }),
             children: vec![child],
         };
-        let stats = derive_statistics(&tf, &memo, &HashMap::new());
+        let stats = derive_statistics(&tf, &memo, &empty_stats_input());
         let cs = stats
             .column_statistics
             .get(&base)
@@ -5223,7 +5380,7 @@ mod tests {
             }),
             children: vec![old, delta],
         };
-        let stats = derive_statistics(&merge, &memo, &HashMap::new());
+        let stats = derive_statistics(&merge, &memo, &empty_stats_input());
         let cs = stats
             .column_statistics
             .get(&ColumnId::new_for_test(9))
@@ -5287,7 +5444,7 @@ mod tests {
         let tree = abc_join_tree(a, b, c);
 
         let groups_before = memo.groups.len();
-        let root = copy_in_join_tree(&mut memo, &tree, &HashMap::new());
+        let root = copy_in_join_tree(&mut memo, &tree, &empty_stats_input());
 
         // Two new groups materialized: (A join B) and the root.
         assert_eq!(memo.groups.len(), groups_before + 2);
@@ -5313,11 +5470,11 @@ mod tests {
         let c = join_leaf_group(&mut memo, 3, 50.0, 500.0);
         let tree = abc_join_tree(a, b, c);
 
-        let r1 = copy_in_join_tree(&mut memo, &tree, &HashMap::new());
+        let r1 = copy_in_join_tree(&mut memo, &tree, &empty_stats_input());
         let after_first = memo.groups.len();
         // Re-materializing the identical tree reuses every group: same root,
         // zero new groups (dedup via join_group_index).
-        let r2 = copy_in_join_tree(&mut memo, &tree, &HashMap::new());
+        let r2 = copy_in_join_tree(&mut memo, &tree, &empty_stats_input());
         assert_eq!(r1, r2, "identical tree must dedup to the same root group");
         assert_eq!(
             memo.groups.len(),
@@ -5355,7 +5512,7 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &HashMap::new());
+        derive_group_statistics(&mut memo, &empty_stats_input());
 
         let props = memo.groups[1].logical_props.as_ref().unwrap();
         assert_eq!(props.output_columns.len(), 1);
@@ -5395,7 +5552,7 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &table_stats);
+        derive_group_statistics(&mut memo, &legacy_stats_input(&table_stats));
 
         // Group 0 is the scan; group 1 is Decode.
         let decode_props = memo.groups[1].logical_props.as_ref().unwrap();
@@ -5473,7 +5630,6 @@ mod tests {
     fn derive_group_statistics_skips_already_computed_groups() {
         use crate::sql::optimizer::memo::{LogicalProperties, MExpr, Memo};
         use crate::sql::optimizer::operator::{Operator, ValuesOp};
-        use std::collections::HashMap;
 
         let mut memo = Memo::new();
 
@@ -5501,7 +5657,7 @@ mod tests {
         });
         assert!(memo.groups[group_b].logical_props.is_none());
 
-        derive_group_statistics(&mut memo, &HashMap::new());
+        derive_group_statistics(&mut memo, &empty_stats_input());
 
         // Group A was memoized/skipped — sentinel preserved (NOT recomputed to 0).
         assert_eq!(
@@ -5557,19 +5713,20 @@ mod tests {
         let m0 = memo.groups[group].logical_exprs[0].clone();
         let m1 = memo.groups[group].logical_exprs[1].clone();
         assert_eq!(
-            derive_statistics(&m0, &memo, &table_stats).row_count_confidence,
+            derive_statistics(&m0, &memo, &legacy_stats_input(&table_stats)).row_count_confidence,
             Confidence::Fallback,
             "index-0 member (unregistered table) must derive Fallback"
         );
         assert_eq!(
-            derive_statistics(&m1, &memo, &table_stats).row_count_confidence,
+            derive_statistics(&m1, &memo, &legacy_stats_input(&table_stats)).row_count_confidence,
             Confidence::Exact,
             "index-1 member (registered table) must derive Exact"
         );
 
         // argmax must pick the Exact member (index 1), not first().
         let (chosen, stats) =
-            pick_group_representative(&memo, group, &table_stats).expect("non-empty group");
+            pick_group_representative(&memo, group, &legacy_stats_input(&table_stats))
+                .expect("non-empty group");
         assert_eq!(
             stats.row_count_confidence,
             Confidence::Exact,
@@ -5586,7 +5743,7 @@ mod tests {
         );
 
         // The cached logical_props (Site 1) must reflect the same argmax pick.
-        derive_group_statistics_for(&mut memo, group, &table_stats);
+        derive_group_statistics_for(&mut memo, group, &legacy_stats_input(&table_stats));
         let props = memo.groups[group].logical_props.as_ref().unwrap();
         assert_eq!(props.row_count_confidence, Confidence::Exact);
         assert!((props.row_count - 1_000.0).abs() < 1.0);
@@ -5609,7 +5766,8 @@ mod tests {
         memo.add_expr_to_group(group, scan_mexpr("eq_tbl", "b"));
 
         let (chosen, _) =
-            pick_group_representative(&memo, group, &table_stats).expect("non-empty group");
+            pick_group_representative(&memo, group, &legacy_stats_input(&table_stats))
+                .expect("non-empty group");
         // Lowest index wins the tie → the "a" scan (logical_exprs[0]).
         assert!(
             matches!(&chosen.op, Operator::LogicalScan(s)
@@ -5635,7 +5793,7 @@ mod tests {
         let group = memo.new_group(scan_mexpr("unregistered_tbl", "a"));
         memo.add_expr_to_group(group, scan_mexpr("consistent_tbl", "a"));
 
-        derive_group_statistics_for(&mut memo, group, &table_stats);
+        derive_group_statistics_for(&mut memo, group, &legacy_stats_input(&table_stats));
         let props = memo.groups[group].logical_props.as_ref().unwrap();
 
         // Row-level props come from the argmax (Exact) member.
@@ -5741,7 +5899,8 @@ mod tests {
         );
 
         let (chosen, _) =
-            pick_group_representative(&memo, group, &table_stats).expect("non-empty group");
+            pick_group_representative(&memo, group, &legacy_stats_input(&table_stats))
+                .expect("non-empty group");
         match &chosen.op {
             Operator::LogicalJoin(j) => {
                 let sid = j.condition.expect("join has a condition");
@@ -5780,7 +5939,7 @@ mod tests {
         let group = memo.new_group(scan_mexpr("unregistered_tbl", "a"));
 
         // ── Step 2: derive via the bulk pass (first derivation). ──────────
-        derive_group_statistics(&mut memo, &table_stats);
+        derive_group_statistics(&mut memo, &legacy_stats_input(&table_stats));
 
         // The group now has cached props — single member is Fallback.
         let props = memo.groups[group]
@@ -5800,7 +5959,7 @@ mod tests {
 
         // ── Step 4: hazard — bulk pass SKIPS the group. ───────────────────
         // The guard sees `logical_props.is_some()` and does not re-run argmax.
-        derive_group_statistics(&mut memo, &table_stats);
+        derive_group_statistics(&mut memo, &legacy_stats_input(&table_stats));
         let props_after_bulk = memo.groups[group]
             .logical_props
             .as_ref()
@@ -5814,7 +5973,7 @@ mod tests {
 
         // ── Step 5: fix — eager re-derive via derive_group_statistics_for. ─
         // This is what a real producer MUST call at append time.
-        derive_group_statistics_for(&mut memo, group, &table_stats);
+        derive_group_statistics_for(&mut memo, group, &legacy_stats_input(&table_stats));
 
         let props_after_eager = memo.groups[group]
             .logical_props

@@ -411,151 +411,163 @@ git add src/sql/optimizer/operator.rs src/sql/planner/optimizer_bridge/plan.rs s
 git commit -m "feat: require bound scan stats refs"
 ```
 
-### Task 3: Convert Optimizer API to QueryStatsSnapshot
+### Task 3: 将 Optimizer API 切到 QueryStatsSnapshot
 
-**Files:**
-- Modify: `src/sql/optimizer/mod.rs`
-- Modify: `src/sql/optimizer/rewrite/context.rs`
-- Modify: `src/sql/optimizer/rewrite/registry.rs`
-- Modify: `src/sql/optimizer/rewrite/rules/aggregate_pushdown/**`
-- Modify: `src/sql/optimizer/cascades_rules/multi_join_reorder/**`
-- Test: existing optimizer unit tests
+**文件：**
+- 修改：`src/sql/optimizer/mod.rs`
+- 修改：`src/sql/optimizer/stats_input.rs`
+- 修改：`src/sql/optimizer/statistics.rs`
+- 修改：`src/sql/optimizer/rewrite/context.rs`
+- 修改：`src/sql/optimizer/rewrite/registry.rs`
+- 修改：`src/sql/optimizer/rewrite/rules/aggregate_pushdown/**`
+- 修改：`src/sql/optimizer/cascades_rules/multi_join_reorder/**`
+- 测试：现有 optimizer unit tests
 
-- [ ] **Step 1: Change optimizer function signatures**
+- [ ] **Step 1: 增加保持可编译的 optimizer stats wrapper**
 
-Replace optimizer API parameters:
+在 `src/sql/optimizer/stats_input.rs` 中增加 `OptimizerStatsInput`。它是迁移期 optimizer 内部统一使用的 stats 输入 wrapper：
 
 ```rust
-table_stats: &HashMap<String, TableStatistics>,
+pub(crate) struct OptimizerStatsInput {
+    query_stats: QueryStatsSnapshot,
+    legacy_table_stats_for_migration: Option<HashMap<String, TableStatistics>>,
+}
 ```
 
-with:
+构造方法：
+
+```rust
+pub(crate) fn from_query_stats(query_stats: &QueryStatsSnapshot) -> Self
+pub(crate) fn from_legacy_table_stats_for_migration(
+    table_stats: &HashMap<String, TableStatistics>,
+) -> Self
+```
+
+`legacy_table_stats_for_migration` 是临时字段，只用于让当前 engine/planner/codegen 调用者在 Task 5/6/8 接入真实 query-scoped collection 并移除 name-based scan stats fallback 之前保持可编译。
+
+- [ ] **Step 2: 修改公开 optimizer 函数签名**
+
+公开 optimizer API 接收 query-scoped stats：
+
+```rust
+optimize(...)
+optimize_with_root_distribution(...)
+```
+
+stats 参数为：
 
 ```rust
 query_stats: &crate::sql::optimizer::stats_input::QueryStatsSnapshot,
 ```
 
-Apply this to:
+为当前调用者保留命名清楚的 legacy migration helper：
 
 ```rust
-optimize(...)
-optimize_with_root_distribution(...)
-optimize_with_root_property(...)
+pub(crate) fn optimize_with_legacy_table_stats_for_migration(...)
+pub(crate) fn optimize_with_root_distribution_and_legacy_table_stats_for_migration(...)
 ```
 
-- [ ] **Step 2: Change rewrite context storage**
+这些 helper 将旧的 `HashMap<String, TableStatistics>` 包装为 `OptimizerStatsInput::from_legacy_table_stats_for_migration(...)`，再调用私有的 root-property optimizer。
 
-In `src/sql/optimizer/rewrite/context.rs`, replace table-name stats storage with:
+私有 `optimize_with_root_property(...)` 接收 `OptimizerStatsInput`，不再接收裸 table-name map。
+
+本任务不要在 production optimizer entry 调用 `validate_query_stats_bound()`。bridge 创建的 scan 仍然是 `stats_ref: None`，生产普通 scan query 必须继续通过临时 legacy 路径编译和运行。
+
+- [ ] **Step 3: 修改 rewrite context 存储**
+
+在 `src/sql/optimizer/rewrite/context.rs` 中，将 table-name stats 存储替换为：
 
 ```rust
-query_stats: Option<Arc<QueryStatsSnapshot>>,
+query_stats_input: Option<Arc<OptimizerStatsInput>>,
 ```
 
-Use these methods:
+使用以下方法：
 
 ```rust
-pub(crate) fn set_query_stats(&mut self, query_stats: QueryStatsSnapshot) {
-    self.query_stats = Some(Arc::new(query_stats));
-}
-
-pub(crate) fn query_stats(&self) -> Option<&QueryStatsSnapshot> {
-    self.query_stats.as_deref()
-}
+pub(crate) fn set_query_stats_input(&mut self, stats_input: OptimizerStatsInput)
+pub(crate) fn query_stats_input(&self) -> Option<&OptimizerStatsInput>
 ```
 
-- [ ] **Step 3: Change rewrite pipeline input**
+- [ ] **Step 4: 从 rewrite pipeline 构造中移除 raw stats 参数**
 
-In `src/sql/optimizer/rewrite/registry.rs`, change:
+在 `src/sql/optimizer/rewrite/registry.rs` 中，让 query rewrite pipeline 构造函数不再接收 stats 参数：
 
 ```rust
-pub(crate) fn query_rewrite_pipeline(query_stats: &QueryStatsSnapshot) -> RewritePipeline
+pub(crate) fn query_rewrite_pipeline() -> RewritePipeline
 ```
 
-and pass `query_stats` to aggregate pushdown. Remove `HashMap<String, TableStatistics>` from rewrite pipeline signatures.
+从以下函数中移除 `HashMap<String, TableStatistics>`：
 
-- [ ] **Step 4: Use a stats-ref adapter only inside aggregate pushdown**
+- `query_rewrite_pipeline()`
+- `all_query_rewrite_rules()`
+- `aggregate_pushdown_rules()`
 
-Where aggregate pushdown still expects legacy `TableStatistics`, use `scan.stats_ref`:
+Aggregate pushdown 在 `apply()` 中从 `RewriteContext` 读取 `OptimizerStatsInput`。如果 context 中没有 stats input，返回明确错误。
 
-```rust
-fn legacy_table_stats_for_scan(
-    scan: &crate::sql::optimizer::operator::ScanOp,
-    query_stats: &QueryStatsSnapshot,
-) -> Option<crate::sql::optimizer::statistics::TableStatistics> {
-    let stats_ref = scan.stats_ref?;
-    let base = query_stats.get(stats_ref)?;
-    crate::sql::optimizer::statistics::TableStatistics::try_from_base_stats(base)
-}
-```
+- [ ] **Step 5: 增加临时 base-stats conversion adapter**
 
-This adapter is removed in the ST-2 cleanup task. It must not reconstruct a table-name-keyed map.
-
-- [ ] **Step 5: Add the temporary legacy conversion**
-
-In `src/sql/optimizer/statistics.rs`, add:
+在 `src/sql/optimizer/statistics.rs` 中增加：
 
 ```rust
 impl TableStatistics {
     pub(crate) fn try_from_base_stats(
         base: &crate::sql::optimizer::stats_input::BaseTableStatistics,
     ) -> Option<Self> {
-        use crate::sql::optimizer::stats_input::StatValue;
-
-        let row_count = match &base.row_count {
-            StatValue::Known { value, .. } => *value,
-            StatValue::Missing { .. } => return None,
-        };
-
-        let mut column_stats = HashMap::new();
-        for (name, col) in &base.columns {
-            let mut stat = ColumnStatistic::unknown();
-            if let StatValue::Known { value, confidence, .. } = &col.min_value {
-                stat.min_value = *value;
-                stat.confidence = stat.confidence.max(*confidence);
-            }
-            if let StatValue::Known { value, confidence, .. } = &col.max_value {
-                stat.max_value = *value;
-                stat.confidence = stat.confidence.max(*confidence);
-            }
-            if let StatValue::Known { value, confidence, .. } = &col.nulls_fraction {
-                stat.nulls_fraction = *value;
-                stat.confidence = stat.confidence.max(*confidence);
-            }
-            if let StatValue::Known { value, confidence, .. } = &col.average_row_size {
-                stat.average_row_size = *value;
-                stat.confidence = stat.confidence.max(*confidence);
-            }
-            if let StatValue::Known { value, confidence, .. } = &col.ndv {
-                stat.distinct_values_count = *value;
-                stat.confidence = stat.confidence.max(*confidence);
-            }
-            column_stats.insert(name.to_ascii_lowercase(), stat);
-        }
-
-        Some(Self {
-            row_count,
-            column_stats,
-        })
+        // Require known row count.
+        // Copy known min/max/nulls/average_row_size/ndv into ColumnStatistic::unknown().
+        // Lowercase column keys.
+        // Use the maximum confidence among known copied values.
     }
 }
 ```
 
-This method is a migration adapter only. Task 9 removes production dependency on the legacy NDV field and Task 12 audits away the adapter if no caller remains.
+该方法只是 migration adapter。本任务不要做 NDV enum cleanup。
 
-- [ ] **Step 6: Run compile check**
+- [ ] **Step 6: 在 optimizer 内部传递 OptimizerStatsInput**
 
-Run:
+以下路径统一使用 `OptimizerStatsInput`：
+
+- `stats::derive_statistics(...)`
+- `stats::derive_opt_expr_statistics(...)`
+- `stats::derive_group_statistics(...)`
+- `stats::derive_group_statistics_for(...)`
+- `stats::pick_group_representative(...)`
+- `stats::copy_in_join_tree(...)`
+- `search::SearchContext`
+- `multi_join_reorder::run_multi_join_reorder(...)`
+
+迁移期 scan derivation 规则：
+
+- 如果 `scan.stats_ref` 是 `Some(ref)`，只通过 `stats_input.query_stats().get(ref).and_then(TableStatistics::try_from_base_stats)` 解析。
+- 如果 `scan.stats_ref` 是 `Some(ref)` 但 query snapshot 没有可用 stats，不要 fallback 到 legacy table-name map。
+- 如果 `scan.stats_ref` 是 `None`，使用 `stats_input.legacy_table_stats_for_migration()` 和现有 alias/table-name lookup。
+- 保留当前 missing stats 的 default-row 行为。Task 8 会移除 name-based fallback path。
+
+- [ ] **Step 7: 当前调用者通过命名 helper 迁移**
+
+仍然产出 `HashMap<String, TableStatistics>` 的 engine/planner/codegen 调用者必须调用：
+
+```rust
+optimize_with_legacy_table_stats_for_migration(...)
+optimize_with_root_distribution_and_legacy_table_stats_for_migration(...)
+```
+
+不要在这些调用者中伪造 `StatsRef` binding。Task 5/6 引入真实 collection/binding，Task 8 移除 fallback。
+
+- [ ] **Step 8: 运行编译检查**
+
+运行：
 
 ```bash
 cargo check --lib
 ```
 
-Expected: remaining failures point to engine callers still passing old `table_stats`; do not record SQL goldens in this mid-migration state.
+预期：通过。该迁移中间态不要录制 SQL goldens。
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 9: 提交**
 
 ```bash
-git add src/sql/optimizer
+git add src/sql/optimizer src/sql/planner src/sql/codegen src/engine docs/design/plans/2026-06-22-query-stats-provider-architecture.md
 git commit -m "refactor: pass query stats snapshot into optimizer"
 ```
 

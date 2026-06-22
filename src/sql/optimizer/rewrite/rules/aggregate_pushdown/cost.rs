@@ -1,10 +1,9 @@
 //! Aggregate pushdown cost gate — NDV bucketing + row-count threshold.
 
-use std::collections::HashMap;
-
 use crate::sql::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
-use crate::sql::optimizer::statistics::{Confidence, TableStatistics};
+use crate::sql::optimizer::statistics::Confidence;
 use crate::sql::optimizer::stats::derive_opt_expr_statistics;
+use crate::sql::optimizer::stats_input::OptimizerStatsInput;
 
 use super::context::PushPlan;
 
@@ -17,9 +16,9 @@ const UNKNOWN_NDV_ROW_THRESHOLD: f64 = 10_000.0;
 pub(crate) fn should_push(
     plan: &PushPlan,
     arena: &ScalarArena,
-    table_stats: &HashMap<String, TableStatistics>,
+    stats_input: &OptimizerStatsInput,
 ) -> bool {
-    let stats = derive_opt_expr_statistics(&plan.target_subtree, arena, table_stats);
+    let stats = derive_opt_expr_statistics(&plan.target_subtree, arena, stats_input);
     let row_count = stats.output_row_count;
     if row_count <= 1.0 {
         // Trivially small subtree; partial buys nothing.
@@ -78,9 +77,10 @@ mod tests {
     use crate::sql::optimizer::opt_expr::OptExpr;
     use crate::sql::optimizer::scalar::ScalarArena;
 
-    use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence};
+    use crate::sql::optimizer::statistics::{ColumnStatistic, Confidence, TableStatistics};
     use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
     use arrow::datatypes::DataType;
+    use std::collections::HashMap;
 
     fn test_col_id(name: &str) -> ColumnId {
         match name {
@@ -164,6 +164,10 @@ mod tests {
         (scan, table_stats)
     }
 
+    fn legacy_stats_input(stats: &HashMap<String, TableStatistics>) -> OptimizerStatsInput {
+        OptimizerStatsInput::from_legacy_table_stats_for_migration(stats)
+    }
+
     fn scan_without_stats_with_predicate(arena: &mut ScalarArena) -> OptExpr {
         let (scan, _) = scan_with_stats("unknown_table", 1, "k", f64::NAN, arena);
         let Operator::LogicalScan(mut scan_op) = scan.op else {
@@ -202,7 +206,7 @@ mod tests {
         let mut arena = ScalarArena::new();
         let (scan, stats) = scan_with_stats("t", 10_000, "k", 10.0, &mut arena);
         let plan = make_push_plan(scan, &mut arena);
-        assert!(should_push(&plan, &arena, &stats));
+        assert!(should_push(&plan, &arena, &legacy_stats_input(&stats)));
     }
 
     #[test]
@@ -210,7 +214,7 @@ mod tests {
         let mut arena = ScalarArena::new();
         let (scan, stats) = scan_with_stats("t", 10_000, "k", 10_000.0, &mut arena);
         let plan = make_push_plan(scan, &mut arena);
-        assert!(!should_push(&plan, &arena, &stats));
+        assert!(!should_push(&plan, &arena, &legacy_stats_input(&stats)));
     }
 
     #[test]
@@ -225,7 +229,7 @@ mod tests {
             .unwrap()
             .confidence = Confidence::Estimated;
         let plan = make_push_plan(scan, &mut arena);
-        assert!(should_push(&plan, &arena, &stats));
+        assert!(should_push(&plan, &arena, &legacy_stats_input(&stats)));
     }
 
     #[test]
@@ -233,7 +237,7 @@ mod tests {
         let mut arena = ScalarArena::new();
         let (scan, stats) = scan_with_stats("t", 20_000, "k", f64::NAN, &mut arena);
         let plan = make_push_plan(scan, &mut arena);
-        assert!(should_push(&plan, &arena, &stats));
+        assert!(should_push(&plan, &arena, &legacy_stats_input(&stats)));
     }
 
     #[test]
@@ -241,7 +245,7 @@ mod tests {
         let mut arena = ScalarArena::new();
         let (scan, stats) = scan_with_stats("t", 10_000, "k", f64::NAN, &mut arena);
         let plan = make_push_plan(scan, &mut arena);
-        assert!(should_push(&plan, &arena, &stats));
+        assert!(should_push(&plan, &arena, &legacy_stats_input(&stats)));
     }
 
     #[test]
@@ -249,7 +253,7 @@ mod tests {
         let mut arena = ScalarArena::new();
         let (scan, stats) = scan_with_stats("t", 500, "k", f64::NAN, &mut arena);
         let plan = make_push_plan(scan, &mut arena);
-        assert!(!should_push(&plan, &arena, &stats));
+        assert!(!should_push(&plan, &arena, &legacy_stats_input(&stats)));
     }
 
     #[test]
@@ -257,6 +261,10 @@ mod tests {
         let mut arena = ScalarArena::new();
         let scan = scan_without_stats_with_predicate(&mut arena);
         let plan = make_push_plan(scan, &mut arena);
-        assert!(should_push(&plan, &arena, &HashMap::new()));
+        assert!(should_push(
+            &plan,
+            &arena,
+            &legacy_stats_input(&HashMap::new())
+        ));
     }
 }

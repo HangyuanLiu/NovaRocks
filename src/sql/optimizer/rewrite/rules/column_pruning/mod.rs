@@ -193,9 +193,13 @@ mod tests {
     }
 
     fn run_pipeline(plan: LogicalPlanNode) -> LogicalPlanNode {
-        let table_stats = HashMap::new();
-        let pipeline = query_rewrite_pipeline(&table_stats);
+        let pipeline = query_rewrite_pipeline();
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        ctx.set_query_stats_input(
+            crate::sql::optimizer::stats_input::OptimizerStatsInput::from_legacy_table_stats_for_migration(
+                &HashMap::new(),
+            ),
+        );
         let mut scalars = ScalarArena::new();
         let opt_plan = logical_plan_to_opt_expr(&plan, &mut scalars);
         let arena_rc = Rc::new(RefCell::new(scalars));

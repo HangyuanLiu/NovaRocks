@@ -12,7 +12,7 @@ use super::derive::PropertyAlternativeKind;
 use super::memo::{Cost, GroupId, Memo};
 use super::operator::*;
 use super::property::*;
-use crate::sql::optimizer::statistics::TableStatistics;
+use crate::sql::optimizer::stats_input::OptimizerStatsInput;
 
 pub(crate) use super::derive::EnforcerKind;
 
@@ -59,7 +59,7 @@ pub(crate) struct EnforcerInfo {
 pub(crate) struct SearchContext {
     /// (GroupId, PhysicalPropertySet) -> Winner
     pub(crate) winners: HashMap<(GroupId, PhysicalPropertySet), Winner>,
-    pub(crate) table_stats: HashMap<String, TableStatistics>,
+    pub(crate) stats_input: OptimizerStatsInput,
     /// Set of (GroupId, PhysicalPropertySet) pairs currently being computed.
     /// Used to break mutual enforcer cycles: when group A's enforcer path
     /// recurses back into the same (group, props) that is already on the
@@ -68,10 +68,10 @@ pub(crate) struct SearchContext {
 }
 
 impl SearchContext {
-    pub(crate) fn new(table_stats: HashMap<String, TableStatistics>) -> Self {
+    pub(crate) fn new(stats_input: OptimizerStatsInput) -> Self {
         Self {
             winners: HashMap::new(),
-            table_stats,
+            stats_input,
             in_progress: HashSet::new(),
         }
     }
@@ -129,7 +129,7 @@ impl SearchContext {
         // (hash join reorder shapes, aggregate) are costed from child_stats and
         // do not read own_stats. So the single per-group collapsed statistic is
         // the correct, value-identical input — read it once per group.
-        let own_stats = stats_for_group(&memo.groups[group_id], memo, &self.table_stats);
+        let own_stats = stats_for_group(&memo.groups[group_id], memo, &self.stats_input);
 
         for expr_idx in 0..num_physical {
             let expr = &memo.groups[group_id].physical_exprs[expr_idx];
@@ -159,9 +159,9 @@ impl SearchContext {
                         (expr.children.first(), expr.children.get(1))
                     {
                         let probe_stats =
-                            stats_for_group(&memo.groups[probe_group_id], memo, &self.table_stats);
+                            stats_for_group(&memo.groups[probe_group_id], memo, &self.stats_input);
                         let build_stats =
-                            stats_for_group(&memo.groups[build_group_id], memo, &self.table_stats);
+                            stats_for_group(&memo.groups[build_group_id], memo, &self.stats_input);
                         if !required_for_correctness
                             && !broadcast_is_only_alternative
                             && !super::cost::broadcast_gate_passes(
@@ -178,7 +178,7 @@ impl SearchContext {
                 let child_stats_vec: Vec<_> = expr
                     .children
                     .iter()
-                    .map(|&cg| stats_for_group(&memo.groups[cg], memo, &self.table_stats))
+                    .map(|&cg| stats_for_group(&memo.groups[cg], memo, &self.stats_input))
                     .collect();
                 let child_stats_refs: Vec<&_> = child_stats_vec.iter().collect();
 
@@ -234,7 +234,7 @@ impl SearchContext {
                         continue;
                     }
                     let group_stats =
-                        stats_for_group(&memo.groups[group_id], memo, &self.table_stats);
+                        stats_for_group(&memo.groups[group_id], memo, &self.stats_input);
                     let enforcer_cost: Cost = enforcers
                         .iter()
                         .map(|e| {
@@ -300,7 +300,7 @@ impl SearchContext {
 fn stats_for_group(
     group: &super::memo::Group,
     memo: &Memo,
-    table_stats: &HashMap<String, TableStatistics>,
+    stats_input: &OptimizerStatsInput,
 ) -> crate::sql::optimizer::statistics::Statistics {
     // Try logical props first (set by derive_group_statistics). Once Site 1
     // (derive_group_statistics_for) is argmax-correct, this cache already holds
@@ -317,7 +317,7 @@ fn stats_for_group(
     // populated by derive_group_statistics): re-pick the representative via the
     // same shared argmax helper Site 1 uses, so this path stays consistent
     // rather than re-deriving from first().
-    crate::sql::optimizer::stats::pick_group_representative(memo, group.id, table_stats)
+    crate::sql::optimizer::stats::pick_group_representative(memo, group.id, stats_input)
         .map(|(_, stats)| stats)
         .unwrap_or_else(|| {
             // Empty group — should not happen in practice.
@@ -340,6 +340,7 @@ mod tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::MExpr;
     use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
+    use crate::sql::optimizer::statistics::TableStatistics;
     use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
     use arrow::datatypes::DataType;
 
@@ -385,6 +386,16 @@ mod tests {
             },
         );
         ts
+    }
+
+    pub(super) fn legacy_stats_input(
+        table_stats: HashMap<String, TableStatistics>,
+    ) -> OptimizerStatsInput {
+        OptimizerStatsInput::from_legacy_table_stats_for_migration(&table_stats)
+    }
+
+    fn empty_stats_input() -> OptimizerStatsInput {
+        legacy_stats_input(HashMap::new())
     }
 
     fn test_col(id: u32, name: &str) -> TypedExpr {
@@ -659,7 +670,7 @@ mod tests {
     #[test]
     fn scan_satisfies_any() {
         let (memo, gid) = single_scan_memo();
-        let mut ctx = SearchContext::new(make_table_stats());
+        let mut ctx = SearchContext::new(legacy_stats_input(make_table_stats()));
         let cost = ctx
             .optimize_group(&memo, gid, &PhysicalPropertySet::any())
             .unwrap();
@@ -670,7 +681,7 @@ mod tests {
     #[test]
     fn scan_with_gather_uses_enforcer() {
         let (memo, gid) = single_scan_memo();
-        let mut ctx = SearchContext::new(make_table_stats());
+        let mut ctx = SearchContext::new(legacy_stats_input(make_table_stats()));
         let cost = ctx
             .optimize_group(&memo, gid, &PhysicalPropertySet::gather())
             .unwrap();
@@ -714,7 +725,7 @@ mod tests {
         };
         let gid = memo.new_group(expr);
 
-        let mut ctx = SearchContext::new(make_table_stats());
+        let mut ctx = SearchContext::new(legacy_stats_input(make_table_stats()));
         let cost = ctx
             .optimize_group(&memo, gid, &PhysicalPropertySet::any())
             .unwrap();
@@ -724,7 +735,7 @@ mod tests {
     #[test]
     fn winner_cache_prevents_recomputation() {
         let (memo, gid) = single_scan_memo();
-        let mut ctx = SearchContext::new(make_table_stats());
+        let mut ctx = SearchContext::new(legacy_stats_input(make_table_stats()));
         let cost1 = ctx
             .optimize_group(&memo, gid, &PhysicalPropertySet::any())
             .unwrap();
@@ -737,7 +748,7 @@ mod tests {
     #[test]
     fn winner_records_hash_join_alternative_and_child_properties() {
         let (mut memo, root) = make_two_table_inner_join_memo_for_test();
-        let mut ctx = SearchContext::new(Default::default());
+        let mut ctx = SearchContext::new(empty_stats_input());
         let required = PhysicalPropertySet::gather();
         ctx.optimize_group(&memo, root, &required).expect("search");
 
@@ -793,7 +804,7 @@ mod tests {
     #[test]
     fn unknown_hash_join_search_extracts_concrete_distribution() {
         let (mut memo, root) = make_two_table_inner_join_memo_for_test();
-        let mut ctx = SearchContext::new(Default::default());
+        let mut ctx = SearchContext::new(empty_stats_input());
         let required = PhysicalPropertySet::gather();
         ctx.optimize_group(&memo, root, &required).expect("search");
         let plan =
@@ -820,7 +831,7 @@ mod tests {
     #[test]
     fn malformed_unknown_hash_join_is_infeasible_without_panic() {
         let (memo, root) = make_malformed_unknown_hash_join_memo_for_test();
-        let mut ctx = SearchContext::new(Default::default());
+        let mut ctx = SearchContext::new(empty_stats_input());
         let required = PhysicalPropertySet::gather();
 
         let cost = ctx
@@ -842,7 +853,7 @@ mod tests {
             500_001.0,
             crate::sql::optimizer::statistics::Confidence::Fallback,
         );
-        let mut ctx = SearchContext::new(table_stats);
+        let mut ctx = SearchContext::new(legacy_stats_input(table_stats));
         let required = PhysicalPropertySet::gather();
 
         ctx.optimize_group(&memo, root, &required).expect("search");
@@ -864,7 +875,7 @@ mod tests {
             648_000.0,
             crate::sql::optimizer::statistics::Confidence::Exact,
         );
-        let mut ctx = SearchContext::new(table_stats);
+        let mut ctx = SearchContext::new(legacy_stats_input(table_stats));
         let required = PhysicalPropertySet::gather();
 
         ctx.optimize_group(&memo, root, &required).expect("search");
@@ -883,7 +894,7 @@ mod tests {
             648_000.0,
             crate::sql::optimizer::statistics::Confidence::Estimated,
         );
-        let mut ctx = SearchContext::new(table_stats);
+        let mut ctx = SearchContext::new(legacy_stats_input(table_stats));
         let required = PhysicalPropertySet::gather();
 
         ctx.optimize_group(&memo, root, &required).expect("search");
@@ -898,7 +909,7 @@ mod tests {
     #[test]
     fn search_allows_broadcast_when_expression_key_has_no_shuffle_fallback() {
         let (memo, root) = make_expression_key_large_estimated_build_join_memo_for_test();
-        let mut ctx = SearchContext::new(HashMap::new());
+        let mut ctx = SearchContext::new(empty_stats_input());
         let required = PhysicalPropertySet::gather();
 
         let cost = ctx.optimize_group(&memo, root, &required).expect("search");
@@ -917,7 +928,7 @@ mod tests {
     #[test]
     fn search_reuses_child_shuffle_output_without_top_hash_enforcer() {
         let (memo, root, left, right) = make_join_over_prepartitioned_children_for_test();
-        let mut ctx = SearchContext::new(Default::default());
+        let mut ctx = SearchContext::new(empty_stats_input());
         let required = PhysicalPropertySet {
             distribution: DistributionSpec::shuffle_join([ColumnId(10), ColumnId(20)]),
             ordering: OrderingSpec::Any,
@@ -980,6 +991,7 @@ mod cascaded_derivation_tests {
     use crate::sql::column_id::ColumnId;
     use crate::sql::optimizer::memo::MExpr;
     use crate::sql::optimizer::operator::*;
+    use crate::sql::optimizer::statistics::TableStatistics;
     use crate::sql::planner::optimizer_bridge::scalar::intern_typed;
     use crate::sql::planner::optimizer_bridge::scalar::intern_window_exprs;
     use arrow::datatypes::DataType;
@@ -1133,7 +1145,9 @@ mod cascaded_derivation_tests {
     #[test]
     fn winner_records_actual_output_for_scan() {
         let (memo, gid) = super::tests::single_scan_memo();
-        let mut ctx = SearchContext::new(super::tests::make_table_stats());
+        let mut ctx = SearchContext::new(super::tests::legacy_stats_input(
+            super::tests::make_table_stats(),
+        ));
         ctx.optimize_group(&memo, gid, &PhysicalPropertySet::any())
             .unwrap();
         let w = ctx.winners.get(&(gid, PhysicalPropertySet::any())).unwrap();
@@ -1143,7 +1157,8 @@ mod cascaded_derivation_tests {
     #[test]
     fn cascaded_output_through_broadcast_join_repartitions_after_join() {
         let (memo, root, g_bj) = memo_window_over_broadcast_join();
-        let mut ctx = SearchContext::new(table_stats_for_cascaded());
+        let mut ctx =
+            SearchContext::new(super::tests::legacy_stats_input(table_stats_for_cascaded()));
         let cost = ctx
             .optimize_group(&memo, root, &PhysicalPropertySet::any())
             .unwrap();

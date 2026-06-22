@@ -41,6 +41,7 @@ use crate::sql::column_id::ColumnRefFactory;
 use crate::sql::optimizer::opt_expr::OptExpr;
 use crate::sql::optimizer::scalar::ScalarArena;
 use crate::sql::optimizer::statistics::TableStatistics;
+use crate::sql::optimizer::stats_input::{OptimizerStatsInput, QueryStatsSnapshot};
 use memo::MExpr;
 use rule::Rule;
 
@@ -58,22 +59,23 @@ const OPTIMIZE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Main entry point for the Cascades optimizer.
 ///
-/// Takes an optimizer-native logical tree and table statistics, applies query logical rewrites,
-/// converts to Memo, explores logical alternatives, generates physical
+/// Takes an optimizer-native logical tree and query-scoped statistics, applies query logical
+/// rewrites, converts to Memo, explores logical alternatives, generates physical
 /// alternatives, runs top-down cost-based search with property enforcement,
 /// and extracts the best physical plan.
 pub(crate) fn optimize(
     plan_expr: OptExpr,
     scalar_arena: ScalarArena,
-    table_stats: &HashMap<String, TableStatistics>,
+    query_stats: &QueryStatsSnapshot,
     factory: ColumnRefFactory,
     dictionary_provider: Option<std::sync::Arc<dyn rewrite::context::QueryDictionaryProvider>>,
     mv_candidates: Vec<cascades_rules::mv_rewrite::MvRewriteCandidate>,
 ) -> Result<PhysicalPlanNode, String> {
+    let stats_input = OptimizerStatsInput::from_query_stats(query_stats);
     optimize_with_root_property(
         plan_expr,
         scalar_arena,
-        table_stats,
+        stats_input,
         factory,
         dictionary_provider,
         mv_candidates,
@@ -84,6 +86,49 @@ pub(crate) fn optimize(
 pub(crate) fn optimize_with_root_distribution(
     plan_expr: OptExpr,
     scalar_arena: ScalarArena,
+    query_stats: &QueryStatsSnapshot,
+    factory: ColumnRefFactory,
+    root_distribution: DistributionSpec,
+) -> Result<PhysicalPlanNode, String> {
+    let root_required = PhysicalPropertySet {
+        distribution: root_distribution,
+        ordering: OrderingSpec::Any,
+    };
+    let stats_input = OptimizerStatsInput::from_query_stats(query_stats);
+    optimize_with_root_property(
+        plan_expr,
+        scalar_arena,
+        stats_input,
+        factory,
+        None,
+        Vec::new(),
+        root_required,
+    )
+}
+
+pub(crate) fn optimize_with_legacy_table_stats_for_migration(
+    plan_expr: OptExpr,
+    scalar_arena: ScalarArena,
+    table_stats: &HashMap<String, TableStatistics>,
+    factory: ColumnRefFactory,
+    dictionary_provider: Option<std::sync::Arc<dyn rewrite::context::QueryDictionaryProvider>>,
+    mv_candidates: Vec<cascades_rules::mv_rewrite::MvRewriteCandidate>,
+) -> Result<PhysicalPlanNode, String> {
+    let stats_input = OptimizerStatsInput::from_legacy_table_stats_for_migration(table_stats);
+    optimize_with_root_property(
+        plan_expr,
+        scalar_arena,
+        stats_input,
+        factory,
+        dictionary_provider,
+        mv_candidates,
+        PhysicalPropertySet::gather(),
+    )
+}
+
+pub(crate) fn optimize_with_root_distribution_and_legacy_table_stats_for_migration(
+    plan_expr: OptExpr,
+    scalar_arena: ScalarArena,
     table_stats: &HashMap<String, TableStatistics>,
     factory: ColumnRefFactory,
     root_distribution: DistributionSpec,
@@ -92,10 +137,11 @@ pub(crate) fn optimize_with_root_distribution(
         distribution: root_distribution,
         ordering: OrderingSpec::Any,
     };
+    let stats_input = OptimizerStatsInput::from_legacy_table_stats_for_migration(table_stats);
     optimize_with_root_property(
         plan_expr,
         scalar_arena,
-        table_stats,
+        stats_input,
         factory,
         None,
         Vec::new(),
@@ -106,7 +152,7 @@ pub(crate) fn optimize_with_root_distribution(
 fn optimize_with_root_property(
     plan_expr: OptExpr,
     scalar_arena: ScalarArena,
-    table_stats: &HashMap<String, TableStatistics>,
+    stats_input: OptimizerStatsInput,
     factory: ColumnRefFactory,
     dictionary_provider: Option<std::sync::Arc<dyn rewrite::context::QueryDictionaryProvider>>,
     mv_candidates: Vec<cascades_rules::mv_rewrite::MvRewriteCandidate>,
@@ -129,7 +175,7 @@ fn optimize_with_root_property(
     let mut rewrite_ctx =
         rewrite::context::RewriteContext::for_query(session_settings.disabled_rules.clone());
     rewrite_ctx.policy_mut().max_iterations = options.rewrite_max_iterations;
-    rewrite_ctx.set_query_table_stats(table_stats.clone());
+    rewrite_ctx.set_query_stats_input(stats_input.clone());
     rewrite_ctx.set_deadline(deadline);
     if let Some(provider) = resolve_dictionary_provider(dictionary_provider) {
         rewrite_ctx.set_dictionary_provider(provider);
@@ -137,8 +183,8 @@ fn optimize_with_root_property(
     rewrite_ctx.set_column_ref_factory(Rc::clone(&factory));
     let arena = Rc::new(RefCell::new(scalar_arena));
     rewrite_ctx.set_scalar_arena(Rc::clone(&arena));
-    let rewritten_expr = rewrite::registry::query_rewrite_pipeline(table_stats)
-        .rewrite(plan_expr, &mut rewrite_ctx)?;
+    let rewritten_expr =
+        rewrite::registry::query_rewrite_pipeline().rewrite(plan_expr, &mut rewrite_ctx)?;
 
     // Non-disableable backstop: Apply must not survive the SubqueryRewrite
     // stage. The ApplyException rule reports this with rule attribution, but
@@ -179,7 +225,7 @@ fn optimize_with_root_property(
     let root_group = memo_copy::opt_expr_to_memo(&rewritten_expr, &mut memo);
 
     // 6. Derive initial statistics.
-    stats::derive_group_statistics(&mut memo, table_stats);
+    stats::derive_group_statistics(&mut memo, &stats_input);
 
     // 6b. In-memo multi-candidate join reorder (StarRocks-aligned, one-shot):
     //     inject alternative join orders into each reorderable inner/cross
@@ -192,7 +238,7 @@ fn optimize_with_root_property(
         cascades_rules::multi_join_reorder::run_multi_join_reorder(
             &mut memo,
             &options.reorder,
-            table_stats,
+            &stats_input,
         );
     }
 
@@ -216,12 +262,12 @@ fn optimize_with_root_property(
     implement(&mut memo, &impl_rules, &options);
 
     // 9. Re-derive statistics for any newly created groups (e.g. from AggSplit).
-    stats::derive_group_statistics(&mut memo, table_stats);
+    stats::derive_group_statistics(&mut memo, &stats_input);
 
     check_deadline(deadline)?;
 
     // 10. Top-down search with property enforcement.
-    let mut ctx = search::SearchContext::new(table_stats.clone());
+    let mut ctx = search::SearchContext::new(stats_input.clone());
     ctx.optimize_group(&memo, root_group, &root_required)?;
 
     check_deadline(deadline)?;
@@ -740,7 +786,7 @@ mod is_known_rule_name_tests {
     ) -> Result<PhysicalPlanNode, String> {
         let mut scalar_arena = ScalarArena::new();
         let plan_expr = try_logical_plan_to_opt_expr(&plan, &mut scalar_arena)?;
-        optimize(
+        optimize_with_legacy_table_stats_for_migration(
             plan_expr,
             scalar_arena,
             table_stats,
@@ -758,7 +804,7 @@ mod is_known_rule_name_tests {
     ) -> Result<PhysicalPlanNode, String> {
         let mut scalar_arena = ScalarArena::new();
         let plan_expr = try_logical_plan_to_opt_expr(&plan, &mut scalar_arena)?;
-        optimize_with_root_distribution(
+        optimize_with_root_distribution_and_legacy_table_stats_for_migration(
             plan_expr,
             scalar_arena,
             table_stats,
@@ -901,8 +947,12 @@ mod is_known_rule_name_tests {
         if let Some(provider) = resolve_dictionary_provider(parameter) {
             ctx.set_dictionary_provider(provider);
         }
-        let table_stats = HashMap::new();
-        let pipeline = query_rewrite_pipeline(&table_stats);
+        ctx.set_query_stats_input(
+            crate::sql::optimizer::stats_input::OptimizerStatsInput::from_legacy_table_stats_for_migration(
+                &HashMap::new(),
+            ),
+        );
+        let pipeline = query_rewrite_pipeline();
         let mut scalars = ScalarArena::new();
         let opt_plan = logical_plan_to_opt_expr(&agg_over_string_scan(), &mut scalars);
         let arena_rc = Rc::new(RefCell::new(scalars));
@@ -1261,12 +1311,16 @@ mod is_known_rule_name_tests {
         .expect("logical to opt expr");
         let mut rewrite_ctx =
             crate::sql::optimizer::rewrite::context::RewriteContext::for_query(Vec::new());
+        rewrite_ctx.set_query_stats_input(
+            crate::sql::optimizer::stats_input::OptimizerStatsInput::from_legacy_table_stats_for_migration(
+                &HashMap::new(),
+            ),
+        );
         let arena = std::rc::Rc::new(std::cell::RefCell::new(scalars));
         rewrite_ctx.set_scalar_arena(std::rc::Rc::clone(&arena));
-        let rewritten_expr =
-            crate::sql::optimizer::rewrite::registry::query_rewrite_pipeline(&HashMap::new())
-                .rewrite(opt_plan, &mut rewrite_ctx)
-                .expect("rewrite pipeline");
+        let rewritten_expr = crate::sql::optimizer::rewrite::registry::query_rewrite_pipeline()
+            .rewrite(opt_plan, &mut rewrite_ctx)
+            .expect("rewrite pipeline");
         let rewritten_logical =
             crate::sql::planner::optimizer_bridge::plan::opt_expr_to_logical_plan(
                 rewritten_expr,

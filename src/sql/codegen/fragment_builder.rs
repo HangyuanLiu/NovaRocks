@@ -2440,7 +2440,7 @@ mod tests {
             &logical,
             &mut scalar_arena,
         )?;
-        let physical = optimizer::optimize(
+        let physical = optimizer::optimize_with_legacy_table_stats_for_migration(
             opt_expr,
             scalar_arena,
             &HashMap::new(),
@@ -2469,7 +2469,7 @@ mod tests {
             &logical,
             &mut scalar_arena,
         )?;
-        let physical = optimizer::optimize(
+        let physical = optimizer::optimize_with_legacy_table_stats_for_migration(
             opt_expr,
             scalar_arena,
             &HashMap::new(),

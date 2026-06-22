@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use crate::sql::optimizer::statistics::Confidence;
+use crate::sql::optimizer::statistics::{Confidence, TableStatistics};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct StatsRef(u32);
@@ -192,9 +192,44 @@ impl QueryStatsSnapshot {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct OptimizerStatsInput {
+    query_stats: QueryStatsSnapshot,
+    legacy_table_stats_for_migration: Option<HashMap<String, TableStatistics>>,
+}
+
+impl OptimizerStatsInput {
+    pub(crate) fn from_query_stats(query_stats: &QueryStatsSnapshot) -> Self {
+        Self {
+            query_stats: query_stats.clone(),
+            legacy_table_stats_for_migration: None,
+        }
+    }
+
+    pub(crate) fn from_legacy_table_stats_for_migration(
+        table_stats: &HashMap<String, TableStatistics>,
+    ) -> Self {
+        Self {
+            query_stats: QueryStatsSnapshot::empty(),
+            legacy_table_stats_for_migration: Some(table_stats.clone()),
+        }
+    }
+
+    pub(crate) fn query_stats(&self) -> &QueryStatsSnapshot {
+        &self.query_stats
+    }
+
+    pub(crate) fn legacy_table_stats_for_migration(
+        &self,
+    ) -> Option<&HashMap<String, TableStatistics>> {
+        self.legacy_table_stats_for_migration.as_ref()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::optimizer::statistics::TableStatistics;
 
     #[test]
     fn display_rows_sort_by_numeric_ref() {
@@ -268,6 +303,46 @@ mod tests {
             StatValue::Missing {
                 reason: StatsMissingReason::ConnectorUnsupported("jdbc".to_string()),
             }
+        );
+    }
+
+    #[test]
+    fn query_stats_input_constructor_has_no_legacy_map() {
+        let mut snapshot = QueryStatsSnapshot::empty();
+        snapshot.insert(
+            StatsRef::new(7),
+            "orders",
+            BaseTableStatistics::missing(StatsMissingReason::NoDataFiles),
+        );
+
+        let input = OptimizerStatsInput::from_query_stats(&snapshot);
+
+        assert_eq!(input.query_stats().len(), 1);
+        assert!(input.legacy_table_stats_for_migration().is_none());
+    }
+
+    #[test]
+    fn legacy_stats_input_constructor_preserves_table_entry() {
+        let mut table_stats = HashMap::new();
+        table_stats.insert(
+            "orders".to_string(),
+            TableStatistics {
+                row_count: 42,
+                column_stats: HashMap::new(),
+            },
+        );
+
+        let input = OptimizerStatsInput::from_legacy_table_stats_for_migration(&table_stats);
+
+        assert_eq!(input.query_stats().len(), 0);
+        assert_eq!(
+            input
+                .legacy_table_stats_for_migration()
+                .unwrap()
+                .get("orders")
+                .unwrap()
+                .row_count,
+            42
         );
     }
 }

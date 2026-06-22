@@ -230,6 +230,72 @@ pub struct TableStatistics {
     pub column_stats: HashMap<String, ColumnStatistic>,
 }
 
+impl TableStatistics {
+    /// Task 3 migration adapter from query-scoped base stats into the legacy
+    /// table-stat shape. Task 9 removes or audits this away once NDV is
+    /// missing-aware end to end.
+    pub(crate) fn try_from_base_stats(
+        base: &crate::sql::optimizer::stats_input::BaseTableStatistics,
+    ) -> Option<Self> {
+        Self::try_from_base_stats_with_confidence(base).map(|(stats, _)| stats)
+    }
+
+    pub(crate) fn try_from_base_stats_with_confidence(
+        base: &crate::sql::optimizer::stats_input::BaseTableStatistics,
+    ) -> Option<(Self, Confidence)> {
+        use crate::sql::optimizer::stats_input::StatValue;
+
+        let (row_count, row_count_confidence) = match &base.row_count {
+            StatValue::Known {
+                value, confidence, ..
+            } => (*value, *confidence),
+            StatValue::Missing { .. } => return None,
+        };
+
+        let column_stats = base
+            .columns
+            .iter()
+            .map(|(name, base_column)| {
+                let mut stat = ColumnStatistic::unknown();
+                let mut confidence = stat.confidence;
+
+                if let StatValue::Known { value, .. } = &base_column.min_value {
+                    stat.min_value = *value;
+                }
+                if let StatValue::Known { value, .. } = &base_column.max_value {
+                    stat.max_value = *value;
+                }
+                if let StatValue::Known { value, .. } = &base_column.nulls_fraction {
+                    stat.nulls_fraction = *value;
+                }
+                if let StatValue::Known { value, .. } = &base_column.average_row_size {
+                    stat.average_row_size = *value;
+                }
+                if let StatValue::Known {
+                    value,
+                    confidence: field_confidence,
+                    ..
+                } = &base_column.ndv
+                {
+                    stat.distinct_values_count = *value;
+                    confidence = confidence.max(*field_confidence);
+                }
+                stat.confidence = confidence;
+
+                (name.to_ascii_lowercase(), stat)
+            })
+            .collect();
+
+        Some((
+            Self {
+                row_count,
+                column_stats,
+            },
+            row_count_confidence,
+        ))
+    }
+}
+
 /// Build table-level statistics from `IcebergDataFileInfo` entries.
 ///
 /// Aggregates row counts and per-column Iceberg statistics across all files.
@@ -494,6 +560,42 @@ pub const ANTI_JOIN_SELECTIVITY: f64 = 0.4;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::optimizer::stats_input::{
+        BaseColumnStatistics, BaseTableStatistics, StatValue, StatsMissingReason, StatsSource,
+    };
+
+    #[test]
+    fn base_stats_adapter_does_not_promote_missing_column_confidence() {
+        let mut columns = HashMap::new();
+        columns.insert(
+            "k".to_string(),
+            BaseColumnStatistics {
+                nulls_fraction: StatValue::known(
+                    0.1,
+                    Confidence::Exact,
+                    StatsSource::IcebergManifest,
+                ),
+                average_row_size: StatValue::known(
+                    8.0,
+                    Confidence::Exact,
+                    StatsSource::IcebergManifest,
+                ),
+                min_value: StatValue::known(1.0, Confidence::Exact, StatsSource::IcebergManifest),
+                max_value: StatValue::known(9.0, Confidence::Exact, StatsSource::IcebergManifest),
+                ndv: StatValue::missing(StatsMissingReason::ColumnNotReported("k".to_string())),
+            },
+        );
+        let base = BaseTableStatistics {
+            row_count: StatValue::known(10, Confidence::Exact, StatsSource::IcebergManifest),
+            columns,
+            source: StatsSource::IcebergManifest,
+        };
+
+        let converted = TableStatistics::try_from_base_stats(&base).expect("converted stats");
+
+        assert_eq!(converted.row_count, 10);
+        assert_eq!(converted.column_stats["k"].confidence, Confidence::Fallback);
+    }
 
     #[test]
     fn cost_estimate_total() {
@@ -565,6 +667,48 @@ mod tests {
             stats.compute_size_for_columns(&[ColumnId::new_for_test(99)]),
             40.0
         );
+    }
+
+    #[test]
+    fn base_table_stats_adapter_requires_known_row_count() {
+        let base = BaseTableStatistics::missing(StatsMissingReason::NoDataFiles);
+
+        assert!(TableStatistics::try_from_base_stats(&base).is_none());
+    }
+
+    #[test]
+    fn base_table_stats_adapter_lowercases_columns_and_preserves_known_values() {
+        let mut columns = HashMap::new();
+        columns.insert(
+            "OrderKey".to_string(),
+            BaseColumnStatistics {
+                nulls_fraction: StatValue::known(0.25, Confidence::Estimated, StatsSource::Derived),
+                average_row_size: StatValue::known(
+                    16.0,
+                    Confidence::Exact,
+                    StatsSource::IcebergManifest,
+                ),
+                min_value: StatValue::known(1.0, Confidence::Measured, StatsSource::TestFixture),
+                max_value: StatValue::missing(StatsMissingReason::StatsFileMissing),
+                ndv: StatValue::known(100.0, Confidence::Exact, StatsSource::IcebergPuffin),
+            },
+        );
+        let base = BaseTableStatistics {
+            row_count: StatValue::known(1000, Confidence::Estimated, StatsSource::Derived),
+            columns,
+            source: StatsSource::Derived,
+        };
+
+        let table_stats = TableStatistics::try_from_base_stats(&base).unwrap();
+        let column = table_stats.column_stats.get("orderkey").unwrap();
+
+        assert_eq!(table_stats.row_count, 1000);
+        assert_eq!(column.nulls_fraction, 0.25);
+        assert_eq!(column.average_row_size, 16.0);
+        assert_eq!(column.min_value, 1.0);
+        assert_eq!(column.max_value, f64::INFINITY);
+        assert_eq!(column.distinct_values_count, 100.0);
+        assert_eq!(column.confidence, Confidence::Exact);
     }
 
     #[test]

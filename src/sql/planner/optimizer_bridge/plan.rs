@@ -725,10 +725,11 @@ mod tests {
 
         let mut memo = Memo::new();
         let root = logical_plan_to_memo_for_test(&plan, &mut memo);
-        crate::sql::optimizer::stats::derive_group_statistics(
-            &mut memo,
-            &std::collections::HashMap::new(),
-        );
+        let stats_input =
+            crate::sql::optimizer::stats_input::OptimizerStatsInput::from_legacy_table_stats_for_migration(
+                &std::collections::HashMap::new(),
+            );
+        crate::sql::optimizer::stats::derive_group_statistics(&mut memo, &stats_input);
 
         let output_columns = &memo.groups[root]
             .logical_props

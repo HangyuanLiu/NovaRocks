@@ -1,9 +1,6 @@
-use std::collections::HashMap;
-
 use crate::sql::optimizer::rewrite::phase::RewritePhase;
 use crate::sql::optimizer::rewrite::pipeline::{RewritePipeline, RewriteStage};
 use crate::sql::optimizer::rewrite::rules;
-use crate::sql::optimizer::statistics::TableStatistics;
 
 pub(crate) fn default_rewrite_phases() -> Vec<RewritePhase> {
     vec![
@@ -14,9 +11,7 @@ pub(crate) fn default_rewrite_phases() -> Vec<RewritePhase> {
     ]
 }
 
-pub(crate) fn query_rewrite_pipeline(
-    table_stats: &HashMap<String, TableStatistics>,
-) -> RewritePipeline {
+pub(crate) fn query_rewrite_pipeline() -> RewritePipeline {
     RewritePipeline::from_stages(vec![
         RewriteStage::new(
             "SubqueryRewrite",
@@ -62,7 +57,7 @@ pub(crate) fn query_rewrite_pipeline(
         RewriteStage::new(
             "AggregatePushdown",
             RewritePhase::StructuralRewrite,
-            rules::aggregate_pushdown::aggregate_pushdown_rules(table_stats),
+            rules::aggregate_pushdown::aggregate_pushdown_rules(),
         ),
         RewriteStage::new(
             "TagRequiredColumns",
@@ -89,8 +84,7 @@ pub(crate) fn mv_rewrite_pipeline() -> RewritePipeline {
 }
 
 pub(crate) fn is_known_rewrite_rule_name(name: &str) -> bool {
-    let table_stats = HashMap::new();
-    let query_pipeline = query_rewrite_pipeline(&table_stats);
+    let query_pipeline = query_rewrite_pipeline();
     let mv_pipeline = mv_rewrite_pipeline();
 
     query_pipeline
@@ -106,7 +100,6 @@ mod tests {
         default_rewrite_phases, is_known_rewrite_rule_name, mv_rewrite_pipeline,
         query_rewrite_pipeline,
     };
-    use std::collections::HashMap;
 
     use crate::sql::optimizer::operator::{Operator, ValuesOp};
     use crate::sql::optimizer::opt_expr::OptExpr;
@@ -121,8 +114,7 @@ mod tests {
 
     #[test]
     fn query_pipeline_uses_expected_stage_order_and_rules() {
-        let table_stats = HashMap::new();
-        let pipeline = query_rewrite_pipeline(&table_stats);
+        let pipeline = query_rewrite_pipeline();
 
         assert_eq!(
             pipeline.stage_names(),
