@@ -44,24 +44,6 @@ impl Confidence {
     }
 }
 
-/// Derivability of a cardinality estimate, given an operator's shape (GPORCA's
-/// `EStatPromise`). Independent of (and lexicographically secondary to) the
-/// source-confidence axis [`Confidence`]: source says how trustworthy the input
-/// numbers are; promise says how reliably the formula derives an estimate from
-/// them. Used only for in-group representative selection (collapse), where it
-/// distinguishes members that differ in shape.
-///
-/// In NovaRocks the only live signal is join-order shape (see `promise`).
-/// `Low` is reserved for a future in-memo subquery-decorrelation consumer that
-/// does not exist yet (subqueries are decorrelated before the memo), so nothing
-/// produces `Low` today.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub(crate) enum DerivePromise {
-    Low,
-    Medium,
-    High,
-}
-
 /// Per-column distinct-value metadata with explicit missing state.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum DistinctValueCount {

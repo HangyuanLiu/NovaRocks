@@ -1164,18 +1164,12 @@ pub(crate) fn pick_group_representative(
     let mut iter = members.into_iter();
     let first = iter.next()?;
     let first_stats = derive_statistics(&first, memo, stats_input);
-    let first_key = (
-        first_stats.row_count_confidence,
-        promise(&first.op, &first.children, memo),
-    );
+    let first_key = first_stats.row_count_confidence;
     let mut best = (first, first_stats, first_key);
 
     for cand in iter {
         let cand_stats = derive_statistics(&cand, memo, stats_input);
-        let cand_key = (
-            cand_stats.row_count_confidence,
-            promise(&cand.op, &cand.children, memo),
-        );
+        let cand_key = cand_stats.row_count_confidence;
         // Strict-greater replacement: replace only on a strict improvement so
         // ties keep the lower index (canonical-first / zero-regression).
         let replace = cand_key > best.2

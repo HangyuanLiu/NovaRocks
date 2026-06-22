@@ -195,6 +195,9 @@ impl QueryStatsSnapshot {
 #[derive(Clone, Debug)]
 pub(crate) struct OptimizerStatsInput {
     query_stats: QueryStatsSnapshot,
+    // Transitional bridge for legacy rewrite/test callers that have not been
+    // moved to query-scoped StatsRef binding yet. Base scan row counts must
+    // come from `query_stats`, never from this table-name map.
     legacy_table_stats_for_migration: Option<HashMap<String, TableStatistics>>,
 }
 

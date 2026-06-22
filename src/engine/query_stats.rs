@@ -15,6 +15,7 @@ use crate::sql::optimizer::stats_input::{
 #[derive(Clone, Default)]
 pub(crate) struct QueryStatsProviders {
     iceberg: Option<Arc<dyn TableStatsProvider>>,
+    standalone_state: Option<Arc<super::StandaloneState>>,
 }
 
 impl QueryStatsProviders {
@@ -27,7 +28,10 @@ impl QueryStatsProviders {
             .table_source("iceberg")
             .ok()
             .and_then(|source| source.stats_provider());
-        Self { iceberg }
+        Self {
+            iceberg,
+            standalone_state: None,
+        }
     }
 
     pub(crate) fn from_standalone_state(state: &Arc<super::StandaloneState>) -> Self {
@@ -35,7 +39,9 @@ impl QueryStatsProviders {
             .connectors
             .read()
             .expect("standalone connectors read lock");
-        Self::from_connectors(&connectors)
+        let mut providers = Self::from_connectors(&connectors);
+        providers.standalone_state = Some(Arc::clone(state));
+        providers
     }
 
     pub(crate) fn from_optional_state(state: Option<&Arc<super::StandaloneState>>) -> Self {
@@ -119,6 +125,9 @@ pub(super) fn collect_table_stats(
     table_def: &crate::sql::catalog::TableDef,
 ) -> (String, BaseTableStatistics) {
     let label = table_label(database, table_def);
+    if let Some(stats) = collect_standalone_catalog_stats(providers, database, table_def, &label) {
+        return (label, stats);
+    }
     let Some(request) = table_stats_request(database, table_def) else {
         return (
             label,
@@ -148,6 +157,47 @@ pub(super) fn collect_table_stats(
     };
 
     (label, stats)
+}
+
+fn collect_standalone_catalog_stats(
+    providers: &QueryStatsProviders,
+    database: &str,
+    table_def: &crate::sql::catalog::TableDef,
+    label: &str,
+) -> Option<BaseTableStatistics> {
+    if matches!(
+        table_def.source,
+        ScanSource::IcebergDataFiles { .. }
+            | ScanSource::IcebergMetadataTable { .. }
+            | ScanSource::IcebergVersionTable { .. }
+            | ScanSource::IcebergDeltaTable { .. }
+            | ScanSource::IcebergMvTargetState(_)
+    ) {
+        return None;
+    }
+    let state = providers.standalone_state.as_ref()?;
+    match crate::engine::statistics::catalog_base_table_statistics(
+        state,
+        database,
+        &table_def.name,
+        &table_def.columns,
+        standalone_stats_source(&table_def.source),
+    ) {
+        Ok(Some(stats)) => Some(stats),
+        Ok(None) => None,
+        Err(err) => Some(BaseTableStatistics::missing(
+            StatsMissingReason::CatalogLoadError(format!("{label}: {err}")),
+        )),
+    }
+}
+
+fn standalone_stats_source(source: &ScanSource) -> crate::sql::optimizer::stats_input::StatsSource {
+    match source {
+        ScanSource::StarRocks { .. } => {
+            crate::sql::optimizer::stats_input::StatsSource::StarRocksTableMetadata
+        }
+        _ => crate::sql::optimizer::stats_input::StatsSource::ManagedLakeMetadata,
+    }
 }
 
 fn table_label(database: &str, table_def: &crate::sql::catalog::TableDef) -> String {
@@ -219,11 +269,13 @@ mod tests {
     use super::*;
     use crate::connector::stats::StatsProviderError;
     use crate::sql::catalog::{
-        IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
+        ColumnDef, IcebergDataFileBinding, IcebergSchemaDef, IcebergTableInfo, ScanSource, TableDef,
     };
     use crate::sql::column_id::ColumnId;
+    use crate::sql::column_id::ColumnRefFactory;
     use crate::sql::common::{JoinKind, OutputColumn};
     use crate::sql::optimizer::operator::{LogicalJoinOp, Operator, ScanOp};
+    use crate::sql::optimizer::scalar::ScalarArena;
     use crate::sql::optimizer::stats_input::{StatValue, StatsSource};
 
     #[test]
@@ -302,6 +354,7 @@ mod tests {
         let provider = Arc::new(FailingStatsProvider::default());
         let providers = QueryStatsProviders {
             iceberg: Some(provider.clone()),
+            standalone_state: None,
         };
         let mut expr = test_iceberg_scan(ScanSource::IcebergDataFiles {
             table: iceberg_info("cat", "db", "tbl"),
@@ -322,6 +375,53 @@ mod tests {
             ))
         );
         assert_eq!(provider.requests.lock().expect("requests").len(), 1);
+    }
+
+    #[test]
+    fn standalone_catalog_stats_flow_through_snapshot_and_optimizer() {
+        let state = Arc::new(crate::engine::StandaloneState::default());
+        let table_name = "misleading_sales_fact_dim_lineitem";
+        crate::engine::statistics::replace_catalog_stats_for_test(
+            &state,
+            "db",
+            table_name,
+            &[("k", 3, "1", "3", "3")],
+        )
+        .expect("install catalog stats");
+        let providers = QueryStatsProviders::from_standalone_state(&state);
+        let mut opt_expr = test_scan(table_name, 1);
+
+        let plan = QueryStatsCollector::new(providers).collect(&mut opt_expr);
+
+        let stats_ref = collect_scan_refs_for_test(&opt_expr)[0].expect("scan should be bound");
+        let stats = plan.snapshot.get(stats_ref).expect("snapshot entry");
+        assert_eq!(
+            stats.row_count,
+            StatValue::known(
+                3,
+                crate::sql::optimizer::statistics::Confidence::Exact,
+                StatsSource::StarRocksTableMetadata
+            )
+        );
+        assert!(
+            plan.snapshot
+                .display_rows()
+                .iter()
+                .any(|line| line.contains("rows=3")
+                    && line.contains("source=StarRocksTableMetadata")),
+            "catalog stats source should be visible in query-scoped stats"
+        );
+
+        let physical = crate::sql::optimizer::optimize(
+            opt_expr,
+            ScalarArena::new(),
+            &plan.snapshot,
+            ColumnRefFactory::default(),
+            None,
+            Vec::new(),
+        )
+        .expect("optimizer should consume bound catalog stats");
+        assert_eq!(physical.stats.output_row_count, 3.0);
     }
 
     #[test]
@@ -367,7 +467,13 @@ mod tests {
             database: "db".to_string(),
             table: TableDef {
                 name: name.to_string(),
-                columns: vec![],
+                columns: vec![ColumnDef {
+                    name: "k".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    write_default: None,
+                    logical_type: None,
+                }],
                 iceberg_row_lineage_metadata_columns: vec![],
                 source: ScanSource::StarRocks {
                     db_id: 0,

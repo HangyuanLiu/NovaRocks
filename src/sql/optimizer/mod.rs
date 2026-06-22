@@ -116,6 +116,9 @@ pub(crate) fn optimize_with_legacy_table_stats_for_migration(
     dictionary_provider: Option<std::sync::Arc<dyn rewrite::context::QueryDictionaryProvider>>,
     mv_candidates: Vec<cascades_rules::mv_rewrite::MvRewriteCandidate>,
 ) -> Result<PhysicalPlanNode, String> {
+    // Migration-only entry point for callers that still build unbound scan
+    // expressions. The scan estimator ignores this name-keyed map; production
+    // query planning must use `optimize` with a bound QueryStatsSnapshot.
     let stats_input = OptimizerStatsInput::from_legacy_table_stats_for_migration(table_stats);
     optimize_with_root_property(
         plan_expr,
@@ -135,6 +138,7 @@ pub(crate) fn optimize_with_root_distribution_and_legacy_table_stats_for_migrati
     factory: ColumnRefFactory,
     root_distribution: DistributionSpec,
 ) -> Result<PhysicalPlanNode, String> {
+    // Migration-only entry point; see `optimize_with_legacy_table_stats_for_migration`.
     let root_required = PhysicalPropertySet {
         distribution: root_distribution,
         ordering: OrderingSpec::Any,
