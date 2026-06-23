@@ -90,7 +90,6 @@ pub(crate) fn decode_starrocks_in_filter(
     data_type: Option<&arrow::datatypes::DataType>,
     data: &[u8],
 ) -> Result<RuntimeInFilter, String> {
-    let _ = data_type; // reserved for DECIMAL128 precision/scale recovery (later task)
     if data.is_empty() {
         return Err("runtime filter data is empty".to_string());
     }
@@ -196,6 +195,20 @@ pub(crate) fn decode_starrocks_in_filter(
             set.insert(read_varchar(data, &mut offset)?);
         }
         RuntimeInFilterValues::Utf8(set)
+    } else if t == types::TPrimitiveType::DECIMAL128 {
+        let (precision, scale) = match data_type {
+            Some(arrow::datatypes::DataType::Decimal128(p, s)) => (*p, *s),
+            _ => {
+                return Err(
+                    "decimal128 in-filter decode requires probe Decimal128 column type".to_string(),
+                );
+            }
+        };
+        let mut set = HashSet::new();
+        for _ in 0..element_count {
+            set.insert(read_i128_le(data, &mut offset)?);
+        }
+        RuntimeInFilterValues::Decimal128 { values: set, precision, scale }
     } else {
         return Err(format!(
             "unsupported runtime filter primitive type: {:?}",
@@ -384,8 +397,18 @@ pub(crate) fn encode_starrocks_in_filter(filter: &RuntimeInFilter) -> Result<Vec
                     }),
                 )
             }
-            RuntimeInFilterValues::Decimal128 { .. } => {
-                return Err("runtime filter type not supported for remote encode".to_string());
+            RuntimeInFilterValues::Decimal128 { values, .. } => {
+                // SR DECIMAL128: each value = 16B int128 LE; ltype tag carries no precision/scale (runtime_in_filter.h:233-236)
+                let mut iter = values.iter().copied();
+                (
+                    types::TPrimitiveType::DECIMAL128,
+                    values.len(),
+                    Box::new(move |buf| {
+                        for v in iter.by_ref() {
+                            buf.extend_from_slice(&v.to_le_bytes());
+                        }
+                    }),
+                )
             }
         };
 
@@ -818,6 +841,46 @@ mod tests {
             RuntimeInFilterValues::Utf8(got) => assert_eq!(got, &set),
             other => panic!("expected Utf8, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn decimal128_in_filter_round_trips() {
+        use crate::exec::runtime_filter::{RuntimeInFilter, RuntimeInFilterValues};
+        let mut set = HashSet::new();
+        set.insert(-1i128);
+        set.insert(0i128);
+        set.insert(i128::MAX);
+        set.insert(i128::MIN);
+        let filter = RuntimeInFilter::new(
+            9,
+            SlotId::new(4),
+            RuntimeInFilterValues::Decimal128 { values: set.clone(), precision: 38, scale: 6 },
+        );
+        let encoded = encode_starrocks_in_filter(&filter).expect("encode");
+        let dt = arrow::datatypes::DataType::Decimal128(38, 6);
+        let decoded = decode_starrocks_in_filter(9, SlotId::new(4), Some(&dt), &encoded).expect("decode");
+        match decoded.values() {
+            RuntimeInFilterValues::Decimal128 { values, precision, scale } => {
+                assert_eq!(values, &set);
+                assert_eq!(*precision, 38);
+                assert_eq!(*scale, 6);
+            }
+            other => panic!("expected Decimal128, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decimal128_decode_without_type_errors() {
+        use crate::exec::runtime_filter::{RuntimeInFilter, RuntimeInFilterValues};
+        let mut set = HashSet::new();
+        set.insert(5i128);
+        let filter = RuntimeInFilter::new(
+            9, SlotId::new(4),
+            RuntimeInFilterValues::Decimal128 { values: set, precision: 18, scale: 2 },
+        );
+        let encoded = encode_starrocks_in_filter(&filter).expect("encode");
+        // No probe column type => decimal decode must fail-fast (not fabricate p/s).
+        assert!(decode_starrocks_in_filter(9, SlotId::new(4), None, &encoded).is_err());
     }
 
     #[test]
