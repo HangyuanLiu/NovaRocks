@@ -862,12 +862,34 @@ fn actual_suffix(
     actuals: Option<&HashMap<i32, ActualMetrics>>,
 ) -> String {
     match actuals.and_then(|actuals| actuals.get(&node.node_id)) {
-        Some(metrics) => format!(
-            " act={{rows={} time={} peak={}}}",
-            metrics.output_rows,
-            fmt_time_ns(metrics.total_time_ns),
-            fmt_bytes(metrics.peak_mem_bytes)
-        ),
+        Some(metrics) => {
+            let total_time_ns = metrics.total_time_ns.max(0);
+            let total_time_max_ns = metrics.total_time_max_ns.max(0);
+            let total_time_min_ns = metrics.total_time_min_ns.max(0);
+            let mut s = format!(
+                " act={{rows={} time={}",
+                metrics.output_rows,
+                fmt_time_ns(total_time_ns)
+            );
+            if total_time_max_ns > 0 {
+                s.push_str(&format!(
+                    " (max={} min={})",
+                    fmt_time_ns(total_time_max_ns),
+                    fmt_time_ns(total_time_min_ns)
+                ));
+            }
+            if metrics.build_ht_ns > 0 {
+                s.push_str(&format!(" build_ht={}", fmt_time_ns(metrics.build_ht_ns)));
+            }
+            if metrics.search_ns > 0 {
+                s.push_str(&format!(" search={}", fmt_time_ns(metrics.search_ns)));
+            }
+            if metrics.output_ns > 0 {
+                s.push_str(&format!(" output={}", fmt_time_ns(metrics.output_ns)));
+            }
+            s.push_str(&format!(" peak={}}}", fmt_bytes(metrics.peak_mem_bytes)));
+            s
+        }
         None => String::new(),
     }
 }
@@ -1562,6 +1584,7 @@ mod tests {
                 output_rows: 11,
                 total_time_ns: 450_000,
                 peak_mem_bytes: 64,
+                ..ActualMetrics::default()
             },
         );
         actuals.insert(
@@ -1570,6 +1593,7 @@ mod tests {
                 output_rows: 7,
                 total_time_ns: 2_300_000,
                 peak_mem_bytes: 4 * 1024 * 1024,
+                ..ActualMetrics::default()
             },
         );
 
@@ -1591,6 +1615,70 @@ mod tests {
         assert!(
             !text.contains("2:PROJECT [t.k AS k] stats={rows=3 conf=fallback} act="),
             "nodes absent from the actuals map must not print act=:\n{text}"
+        );
+    }
+
+    #[test]
+    fn actual_suffix_renders_phase_timers_and_minmax() {
+        let dp = build_distributed_plan(&aggregate_count_plan(project_plan(scan_plan())))
+            .expect("build DistributedPlan");
+        let mut actuals = HashMap::new();
+        actuals.insert(
+            1,
+            ActualMetrics {
+                output_rows: 13_502_430,
+                total_time_ns: 44_800_000_000,
+                peak_mem_bytes: 637_000_000,
+                total_time_max_ns: 46_000_000_000,
+                total_time_min_ns: 43_000_000_000,
+                build_ht_ns: 0,
+                search_ns: 20_000_000_000,
+                output_ns: 18_000_000_000,
+            },
+        );
+
+        let text =
+            explain_distributed_plan_analyze(&dp, ExplainLevel::Analyze, &actuals).join("\n");
+
+        assert!(
+            text.contains(
+                "act={rows=13502430 time=44.8s (max=46.0s min=43.0s) search=20.0s output=18.0s peak=607.5MB}"
+            ),
+            "expected scan actuals to include phase timers and per-driver min/max in order:\n{text}"
+        );
+        assert!(
+            !text.contains("build_ht="),
+            "zero build hash-table timer must not render:\n{text}"
+        );
+    }
+
+    #[test]
+    fn actual_suffix_clamps_negative_min_time() {
+        let dp = build_distributed_plan(&aggregate_count_plan(project_plan(scan_plan())))
+            .expect("build DistributedPlan");
+        let mut actuals = HashMap::new();
+        actuals.insert(
+            1,
+            ActualMetrics {
+                output_rows: 1,
+                total_time_ns: 10_000,
+                peak_mem_bytes: 0,
+                total_time_max_ns: 20_000,
+                total_time_min_ns: -5_000,
+                ..ActualMetrics::default()
+            },
+        );
+
+        let text =
+            explain_distributed_plan_analyze(&dp, ExplainLevel::Analyze, &actuals).join("\n");
+
+        assert!(
+            text.contains("min=0ns"),
+            "negative min time must clamp to zero when rendered:\n{text}"
+        );
+        assert!(
+            !text.contains("min=-"),
+            "negative min time must not be rendered:\n{text}"
         );
     }
 
