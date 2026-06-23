@@ -741,6 +741,36 @@ mod tests {
         });
     }
 
+    fn set_group_logical_rows_and_width_for_test(
+        memo: &mut Memo,
+        group: GroupId,
+        rows: f64,
+        confidence: crate::sql::optimizer::statistics::Confidence,
+        average_row_size: f64,
+    ) {
+        let column_id = ColumnId::new_for_test(9_001);
+        let mut column_statistics = HashMap::new();
+        let mut column_stat = crate::sql::optimizer::statistics::ColumnStatistic::unknown();
+        column_stat.average_row_size = average_row_size;
+        column_stat.confidence = confidence;
+        column_statistics.insert(column_id, column_stat);
+
+        memo.groups[group].logical_props = Some(crate::sql::optimizer::memo::LogicalProperties {
+            output_columns: vec![crate::sql::analysis::OutputColumn {
+                column_id,
+                name: "wide_build_col".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                is_internal: false,
+            }],
+            row_count: rows,
+            row_count_confidence: confidence,
+            column_statistics,
+            equivalence_classes: Default::default(),
+            unique_columns: vec![],
+        });
+    }
+
     fn make_large_build_inner_join_memo_for_test(
         probe_rows: f64,
         build_rows: f64,
@@ -1338,6 +1368,52 @@ mod tests {
     }
 
     #[test]
+    fn search_rejects_broadcast_for_uncertain_medium_build_without_large_probe_gap() {
+        let (mut memo, root, table_stats) = make_large_build_inner_join_memo_for_test(
+            1_350_000.0,
+            120_000.0,
+            crate::sql::optimizer::statistics::Confidence::Estimated,
+        );
+        let (_, build_group) = inner_join_child_groups_for_test(&memo, root);
+        set_group_logical_rows_and_width_for_test(
+            &mut memo,
+            build_group,
+            120_000.0,
+            crate::sql::optimizer::statistics::Confidence::Estimated,
+            512.0,
+        );
+        let mut ctx = SearchContext::new_for_test(legacy_stats_input(table_stats));
+        let required = PhysicalPropertySet::gather();
+
+        ctx.optimize_group(&memo, root, &required).expect("search");
+        let winner = ctx.winners.get(&(root, required.clone())).expect("winner");
+
+        assert_eq!(
+            winner.alt_kind,
+            crate::sql::optimizer::derive::PropertyAlternativeKind::ShuffleJoin
+        );
+    }
+
+    #[test]
+    fn search_keeps_broadcast_for_uncertain_tiny_build() {
+        let (memo, root, table_stats) = make_large_build_inner_join_memo_for_test(
+            6_000_000.0,
+            10_000.0,
+            crate::sql::optimizer::statistics::Confidence::Estimated,
+        );
+        let mut ctx = SearchContext::new_for_test(legacy_stats_input(table_stats));
+        let required = PhysicalPropertySet::gather();
+
+        ctx.optimize_group(&memo, root, &required).expect("search");
+        let winner = ctx.winners.get(&(root, required.clone())).expect("winner");
+
+        assert_eq!(
+            winner.alt_kind,
+            crate::sql::optimizer::derive::PropertyAlternativeKind::BroadcastJoin
+        );
+    }
+
+    #[test]
     fn search_broadcast_gate_uses_context_cost_options() {
         let (memo, root, table_stats) = make_large_build_inner_join_memo_for_test(
             10_000_000.0,
@@ -1360,6 +1436,7 @@ mod tests {
 
         let custom_options = CostOptions {
             fallback_broadcast_row_limit: 600_000.0,
+            uncertain_broadcast_row_limit: 600_000.0,
             ..Default::default()
         };
         let mut custom_ctx = SearchContext::new(legacy_stats_input(table_stats), custom_options);

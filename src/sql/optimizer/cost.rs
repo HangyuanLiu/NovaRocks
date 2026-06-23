@@ -218,6 +218,9 @@ pub(crate) struct CostOptions {
     pub backend_factor: f64,
     pub broadcast_row_limit: f64,
     pub broadcast_byte_limit: f64,
+    pub broadcast_fanout_byte_limit: f64,
+    pub uncertain_broadcast_row_limit: f64,
+    pub uncertain_broadcast_probe_scale_factor: f64,
     pub broadcast_right_table_scale_factor: f64,
     pub fallback_broadcast_row_limit: f64,
     pub network_cost: f64,
@@ -241,6 +244,9 @@ impl Default for CostOptions {
             backend_factor: 3.0,
             broadcast_row_limit: 15_000_000.0,
             broadcast_byte_limit: 512.0 * 1024.0 * 1024.0,
+            broadcast_fanout_byte_limit: 256.0 * 1024.0 * 1024.0,
+            uncertain_broadcast_row_limit: 30_000.0,
+            uncertain_broadcast_probe_scale_factor: 100.0,
             broadcast_right_table_scale_factor: 10.0,
             fallback_broadcast_row_limit: 500_000.0,
             network_cost: NETWORK_COST,
@@ -339,6 +345,45 @@ fn scan_cost_size(scan: &ScanOp, stats: &Statistics) -> f64 {
 
 fn stats_has_positive_overflow_signal(stats: &Statistics) -> bool {
     safe_compute_size(stats) >= MAX_FINITE_COST
+}
+
+fn broadcast_backend_factor(options: &CostOptions) -> f64 {
+    if options.backend_factor.is_finite() && options.backend_factor > 1.0 {
+        options.backend_factor.min(MAX_FINITE_COST)
+    } else {
+        1.0
+    }
+}
+
+fn broadcast_fanout_bytes(build_stats: &Statistics, options: &CostOptions) -> f64 {
+    finite_non_negative_cost(safe_compute_size(build_stats) * broadcast_backend_factor(options))
+}
+
+fn uncertain_narrow_broadcast_fanout_limit(options: &CostOptions) -> f64 {
+    finite_positive_option(
+        options.broadcast_fanout_byte_limit / 16.0,
+        16.0 * 1024.0 * 1024.0,
+    )
+}
+
+fn finite_positive_option(value: f64, fallback: f64) -> f64 {
+    if value.is_finite() && value > 0.0 {
+        value.min(MAX_FINITE_COST)
+    } else {
+        fallback
+    }
+}
+
+fn probe_is_much_larger_than_build(
+    probe_bytes: f64,
+    build_fanout_bytes: f64,
+    scale_factor: f64,
+) -> bool {
+    if build_fanout_bytes <= 0.0 {
+        return true;
+    }
+    let scale = finite_positive_option(scale_factor, 1.0);
+    probe_bytes >= finite_non_negative_cost(build_fanout_bytes * scale)
 }
 
 fn sanitize_legacy_fallback_cost(
@@ -472,6 +517,9 @@ fn estimate_hash_join_cost(input: &CostInput<'_>, join: &PhysicalHashJoinOp) -> 
     let build_rows = build_stats.map(cost_row_count).unwrap_or(1.0);
     let probe_size = probe_stats.map(safe_compute_size).unwrap_or(0.0);
     let build_size = build_stats.map(safe_compute_size).unwrap_or(0.0);
+    let build_fanout_size = build_stats
+        .map(|stats| broadcast_fanout_bytes(stats, input.options))
+        .unwrap_or(0.0);
     let output_size = safe_compute_size(input.own_stats);
     let key_factor = (join.eq_conditions.len() as f64).max(1.0);
 
@@ -502,14 +550,14 @@ fn estimate_hash_join_cost(input: &CostInput<'_>, join: &PhysicalHashJoinOp) -> 
         (probe_rows + build_rows) * key_factor * input.options.hash_cost_factor + output_size,
     );
     let mut memory_cost = if is_broadcast {
-        finite_non_negative_cost(build_size * input.options.backend_factor)
+        build_fanout_size
     } else if is_shuffle {
         finite_non_negative_cost(build_size / input.options.backend_factor.max(1.0))
     } else {
         build_size
     };
     let network_cost = if is_broadcast {
-        finite_non_negative_cost(build_size * input.options.backend_factor)
+        build_fanout_size
     } else if is_shuffle {
         if child_output_is_hash_partitioned(input.child_outputs.first())
             && child_output_is_hash_partitioned(input.child_outputs.get(1))
@@ -731,23 +779,56 @@ pub(crate) fn broadcast_gate_passes(
     build_stats: &Statistics,
     options: &CostOptions,
 ) -> bool {
-    let build_rows = build_stats.output_row_count;
-    let build_bytes = build_stats.compute_size();
-    let probe_bytes = probe_stats.compute_size();
+    let build_rows = cost_row_count(build_stats);
+    let build_bytes = safe_compute_size(build_stats);
+    let probe_bytes = safe_compute_size(probe_stats);
+    let build_fanout_bytes = broadcast_fanout_bytes(build_stats, options);
 
-    if build_bytes > options.broadcast_byte_limit {
+    if build_bytes >= MAX_FINITE_COST || build_fanout_bytes >= MAX_FINITE_COST {
         return false;
     }
 
-    if build_stats.row_count_confidence < crate::sql::optimizer::statistics::Confidence::Exact
-        && build_rows > options.fallback_broadcast_row_limit
+    if build_bytes > finite_positive_option(options.broadcast_byte_limit, MAX_FINITE_COST) {
+        return false;
+    }
+
+    if build_fanout_bytes
+        > finite_positive_option(options.broadcast_fanout_byte_limit, MAX_FINITE_COST)
     {
         return false;
     }
 
-    let build_is_obviously_tiny = probe_bytes
-        >= build_bytes * options.backend_factor * options.broadcast_right_table_scale_factor;
-    if build_rows > options.broadcast_row_limit && !build_is_obviously_tiny {
+    let build_is_exact =
+        build_stats.row_count_confidence >= crate::sql::optimizer::statistics::Confidence::Exact;
+    if !build_is_exact {
+        if build_rows > finite_positive_option(options.fallback_broadcast_row_limit, 0.0) {
+            return false;
+        }
+
+        let uncertain_small_limit =
+            finite_positive_option(options.uncertain_broadcast_row_limit, 0.0);
+        let build_is_narrow_by_fanout =
+            build_fanout_bytes <= uncertain_narrow_broadcast_fanout_limit(options);
+        if build_rows > uncertain_small_limit
+            && !build_is_narrow_by_fanout
+            && !probe_is_much_larger_than_build(
+                probe_bytes,
+                build_fanout_bytes,
+                options.uncertain_broadcast_probe_scale_factor,
+            )
+        {
+            return false;
+        }
+    }
+
+    let build_is_obviously_tiny = probe_is_much_larger_than_build(
+        probe_bytes,
+        build_fanout_bytes,
+        options.broadcast_right_table_scale_factor,
+    );
+    if build_rows > finite_positive_option(options.broadcast_row_limit, 0.0)
+        && !build_is_obviously_tiny
+    {
         return false;
     }
 
@@ -850,6 +931,21 @@ mod tests {
         Statistics {
             output_row_count: rows,
             column_statistics: col,
+            ..Default::default()
+        }
+    }
+
+    fn stats_with_confidence(rows: f64, avg_size: f64, confidence: Confidence) -> Statistics {
+        let mut s = stats(rows, avg_size);
+        s.row_count_confidence = confidence;
+        s
+    }
+
+    fn risk_options() -> CostOptions {
+        CostOptions {
+            broadcast_fanout_byte_limit: 256.0 * 1024.0 * 1024.0,
+            uncertain_broadcast_row_limit: 30_000.0,
+            uncertain_broadcast_probe_scale_factor: 100.0,
             ..Default::default()
         }
     }
@@ -1968,6 +2064,69 @@ mod tests {
     }
 
     #[test]
+    fn broadcast_gate_rejects_build_when_fanout_exceeds_limit() {
+        let probe = stats_with_confidence(120_000_000.0, 8.0, Confidence::Exact);
+        let build = stats_with_confidence(12_000_000.0, 8.0, Confidence::Exact);
+        let options = risk_options();
+
+        // Single build is 96 MiB, below broadcast_byte_limit; fanout at
+        // backend_factor=3 is 288 MiB and must be rejected.
+        assert!(safe_compute_size(&build) < options.broadcast_byte_limit);
+        assert!(!broadcast_gate_passes(&probe, &build, &options));
+    }
+
+    #[test]
+    fn broadcast_gate_keeps_small_exact_dimension_build() {
+        let probe = stats_with_confidence(6_000_000.0, 32.0, Confidence::Exact);
+        let build = stats_with_confidence(10_000.0, 32.0, Confidence::Exact);
+        let options = risk_options();
+
+        assert!(broadcast_gate_passes(&probe, &build, &options));
+    }
+
+    #[test]
+    fn broadcast_gate_rejects_uncertain_medium_build_without_huge_probe_gap() {
+        let probe = stats_with_confidence(1_350_000.0, 64.0, Confidence::Estimated);
+        let build = stats_with_confidence(120_000.0, 512.0, Confidence::Estimated);
+        let options = risk_options();
+
+        assert!(cost_row_count(&build) < options.fallback_broadcast_row_limit);
+        assert!(cost_row_count(&build) > options.uncertain_broadcast_row_limit);
+        assert!(!broadcast_gate_passes(&probe, &build, &options));
+    }
+
+    #[test]
+    fn broadcast_gate_keeps_uncertain_narrow_medium_build() {
+        let probe = stats_with_confidence(4_374_886.0, 64.0, Confidence::Estimated);
+        let build = stats_with_confidence(146_501.0, 16.0, Confidence::Estimated);
+        let options = risk_options();
+
+        assert!(cost_row_count(&build) < options.fallback_broadcast_row_limit);
+        assert!(cost_row_count(&build) > options.uncertain_broadcast_row_limit);
+        assert!(broadcast_gate_passes(&probe, &build, &options));
+    }
+
+    #[test]
+    fn broadcast_gate_keeps_uncertain_tiny_build() {
+        let probe = stats_with_confidence(6_000_000.0, 32.0, Confidence::Estimated);
+        let build = stats_with_confidence(10_000.0, 32.0, Confidence::Estimated);
+        let options = risk_options();
+
+        assert!(cost_row_count(&build) <= options.uncertain_broadcast_row_limit);
+        assert!(broadcast_gate_passes(&probe, &build, &options));
+    }
+
+    #[test]
+    fn broadcast_gate_rejects_positive_overflow_build_size() {
+        let probe = stats_with_confidence(1_000_000.0, 8.0, Confidence::Exact);
+        let build = stats_with_confidence(f64::INFINITY, 8.0, Confidence::Exact);
+        let options = risk_options();
+
+        assert_eq!(safe_compute_size(&build), MAX_FINITE_COST);
+        assert!(!broadcast_gate_passes(&probe, &build, &options));
+    }
+
+    #[test]
     fn broadcast_join_alternative_charges_fanout_and_memory_pressure() {
         let probe = stats(100_000.0, 100.0);
         let build = stats(10_000.0, 100.0);
@@ -2000,8 +2159,8 @@ mod tests {
                 (cost_row_count(&probe) + cost_row_count(&build)) * options.hash_cost_factor
                     + safe_compute_size(&own),
             ),
-            memory_cost: build.compute_size() * options.backend_factor,
-            network_cost: build.compute_size() * options.backend_factor,
+            memory_cost: broadcast_fanout_bytes(&build, &options),
+            network_cost: broadcast_fanout_bytes(&build, &options),
         };
 
         assert!((estimate.cpu_cost - expected.cpu_cost).abs() < f64::EPSILON);
@@ -2064,7 +2223,7 @@ mod tests {
             (cost_row_count(&probe) + cost_row_count(&build)) * options.hash_cost_factor
                 + safe_compute_size(&own),
         );
-        let broadcast_fanout_size = build.compute_size() * options.backend_factor;
+        let broadcast_fanout_size = broadcast_fanout_bytes(&build, &options);
 
         assert!((estimate.cpu_cost - base_cpu * NON_EQUI_JOIN_COST_PENALTY).abs() < f64::EPSILON);
         assert!((estimate.memory_cost - broadcast_fanout_size).abs() < f64::EPSILON);
