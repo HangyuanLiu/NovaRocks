@@ -1,0 +1,102 @@
+Explain String
+Planning: 95.7ms / Execution: 91.16s / Rows: 9
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+24:PROJECT [c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice, sum(l_quantity)] stats={rows=100 conf=estimated} act={rows=9 time=62.5us peak=598B}
+  23:MERGING-EXCHANGE stats={rows=100 conf=estimated} act={rows=27 time=791.8us peak=4.2KB}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 23
+    PARTITION: UNPARTITIONED
+22:LOCAL TOP-N (limit=100, offset=0) [o_totalprice DESC NULLS LAST, o_orderdate ASC NULLS FIRST] stats={rows=100 conf=estimated} act={rows=18 time=285.1us peak=188.5KB}
+  21:HASH AGGREGATE (GLOBAL, group by: [c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice]) stats={rows=2430492 conf=estimated} act={rows=18 time=441.5us peak=899.0KB}
+    aggregations: sum(l_quantity)
+    20:HASH EXCHANGE stats={rows=2430492 conf=estimated} act={rows=9 time=73.4us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 20
+    PARTITION: HASH_PARTITIONED (c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice)
+19:HASH AGGREGATE (LOCAL, group by: [c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice]) stats={rows=2430492 conf=estimated} act={rows=72 time=2.5ms peak=1.1MB}
+  aggregations: sum(l_quantity)
+  18:HASH JOIN (PARTITIONED, LEFT SEMI, eq: [o_orderkey = lineitem.l_orderkey]) stats={rows=2430492 conf=estimated} act={rows=6001287 time=32.0s peak=82.5KB}
+    build runtime filters:
+    - filter_id = 1, build_expr = (lineitem.l_orderkey)
+    10:HASH EXCHANGE stats={rows=4487149 conf=estimated} act={rows=6001215 time=625.7ms peak=0B}
+    17:PROJECT [lineitem.l_orderkey AS l_orderkey] stats={rows=658112 conf=estimated} act={rows=9 time=24.9us peak=180B}
+      16:FILTER stats={rows=658112 conf=estimated}
+        predicate: lineitem.l_orderkey IS NOT NULL
+        15:FILTER stats={rows=731236 conf=estimated}
+          predicate: sum(lineitem.l_quantity) > 315
+          14:HASH AGGREGATE (GLOBAL, group by: [lineitem.l_orderkey]) stats={rows=1462472 conf=estimated} act={rows=4762686 time=193.8ms peak=132.8MB}
+            aggregations: sum(lineitem.l_quantity)
+            13:HASH EXCHANGE stats={rows=1462472 conf=estimated} act={rows=3262677 time=6.3us peak=0B}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 13
+    PARTITION: HASH_PARTITIONED (lineitem.l_orderkey)
+12:HASH AGGREGATE (LOCAL, group by: [l_orderkey]) stats={rows=1462472 conf=estimated} act={rows=9263892 time=338.3ms peak=295.6MB}
+  aggregations: sum(lineitem.l_quantity)
+  11:SCAN tpch.lineitem stats={rows=6001215} act={rows=6001215 time=110.8ms peak=0B}
+       TABLE: tpch.lineitem
+       columns: l_orderkey, l_quantity
+       min-max stats
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 10
+    PARTITION: HASH_PARTITIONED (o_orderkey)
+9:HASH JOIN (PARTITIONED, INNER, eq: [l_orderkey = o_orderkey]) stats={rows=4487149 conf=estimated} act={rows=13502430 time=44.8s peak=607.7MB}
+  2:HASH EXCHANGE stats={rows=5401094 conf=estimated} act={rows=6001215 time=301.9us peak=0B}
+  8:HASH EXCHANGE stats={rows=1215000 conf=estimated} act={rows=1500000 time=77.4ms peak=0B}
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 8
+    PARTITION: HASH_PARTITIONED (o_orderkey)
+7:HASH JOIN (PARTITIONED, INNER, eq: [o_custkey = c_custkey]) stats={rows=1215000 conf=estimated} act={rows=3150000 time=3.2s peak=57.6MB}
+  build runtime filters:
+  - filter_id = 0, build_expr = (c_custkey)
+  4:HASH EXCHANGE stats={rows=1215000 conf=estimated} act={rows=1500000 time=93.0us peak=0B}
+  6:HASH EXCHANGE stats={rows=135000 conf=estimated} act={rows=150000 time=12.5us peak=0B}
+PLAN FRAGMENT 6
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 6
+    PARTITION: HASH_PARTITIONED (c_custkey)
+5:SCAN tpch.customer stats={rows=135000 conf=estimated} act={rows=150000 time=315.5us peak=17.3MB}
+     TABLE: tpch.customer
+     columns: c_custkey, c_name
+     min-max stats
+     predicates: c_custkey IS NOT NULL
+PLAN FRAGMENT 7
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 4
+    PARTITION: HASH_PARTITIONED (o_custkey)
+3:SCAN tpch.orders stats={rows=1215000 conf=estimated} act={rows=1500000 time=170.3ms peak=39.4MB}
+     TABLE: tpch.orders
+     columns: o_orderkey, o_custkey, o_totalprice, o_orderdate
+     min-max stats
+     predicates: o_custkey IS NOT NULL AND o_orderkey IS NOT NULL
+PLAN FRAGMENT 8
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 2
+    PARTITION: HASH_PARTITIONED (l_orderkey)
+1:SCAN tpch.lineitem stats={rows=5401094 conf=estimated} act={rows=6001215 time=364.3ms peak=83.7MB}
+     TABLE: tpch.lineitem
+     columns: l_orderkey, l_quantity
+     min-max stats
+     predicates: l_orderkey IS NOT NULL

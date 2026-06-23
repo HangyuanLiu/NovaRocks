@@ -1,0 +1,138 @@
+Explain String
+Planning: 149.9ms / Execution: 5.95s / Rows: 5
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+35:MERGING-EXCHANGE stats={rows=8 conf=estimated} act={rows=15 time=57.5us peak=960B}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 35
+    PARTITION: UNPARTITIONED
+34:LOCAL TOP-N (limit=100, offset=0) [s_store_name ASC NULLS FIRST] stats={rows=8 conf=estimated} act={rows=10 time=28.2us peak=42.0KB}
+  33:PROJECT [s_store_name, sum(ss_net_profit)] stats={rows=8 conf=estimated} act={rows=5 time=23.5us peak=20.1KB}
+    32:HASH AGGREGATE (GLOBAL, group by: [s_store_name]) stats={rows=8 conf=estimated} act={rows=20 time=54.9us peak=513.1KB}
+      aggregations: sum(ss_net_profit)
+      31:HASH EXCHANGE stats={rows=8 conf=estimated} act={rows=15 time=60.4us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 31
+    PARTITION: HASH_PARTITIONED (s_store_name)
+30:HASH AGGREGATE (LOCAL, group by: [s_store_name]) stats={rows=8 conf=estimated} act={rows=63842 time=990.6us peak=11.1MB}
+  aggregations: sum(ss_net_profit)
+  29:HASH JOIN (BROADCAST, INNER, eq: [substring(s_zip, 1, 2) = substring(v1.ca_zip, 1, 2)]) stats={rows=27181618 conf=estimated} act={rows=63842 time=1.7ms peak=5.8MB}
+    build runtime filters:
+    - filter_id = 2, build_expr = (substring(v1.ca_zip, 1, 2))
+    7:HASH JOIN (BROADCAST, INNER, eq: [ss_store_sk = s_store_sk]) stats={rows=117797 conf=estimated} act={rows=77266 time=4.3ms peak=3.8MB}
+      build runtime filters:
+      - filter_id = 1, build_expr = (s_store_sk)
+      4:HASH JOIN (BROADCAST, INNER, eq: [ss_sold_date_sk = d_date_sk]) stats={rows=117797 conf=estimated} act={rows=77503 time=79.1ms peak=6.7MB}
+        build runtime filters:
+        - filter_id = 0, build_expr = (d_date_sk)
+        1:SCAN tpcds.store_sales stats={rows=2626150 conf=estimated} act={rows=2685687 time=16.0ms peak=0B}
+             TABLE: tpcds.store_sales
+             columns: ss_sold_date_sk, ss_store_sk, ss_net_profit
+             min-max stats
+             predicates: ss_sold_date_sk IS NOT NULL AND ss_store_sk IS NOT NULL
+            probe runtime filters:
+            - filter_id = 0, probe_expr = (ss_sold_date_sk)
+            - filter_id = 1, probe_expr = (ss_store_sk)
+        3:GATHER stats={rows=82 conf=estimated} act={rows=273 time=40.9us peak=0B}
+      6:GATHER stats={rows=11 conf=estimated} act={rows=36 time=13.2us peak=0B}
+    28:GATHER stats={rows=923 conf=estimated} act={rows=15 time=111.6us peak=0B}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 28
+    PARTITION: UNPARTITIONED
+27:PROJECT [ca_zip] stats={rows=923 conf=estimated} act={rows=5 time=565.6us peak=4.3KB}
+  26:PROJECT [ca_zip] stats={rows=923 conf=estimated} act={rows=5 time=7.9us peak=57B}
+    25:PROJECT [ca_zip] stats={rows=923 conf=estimated} act={rows=5 time=14.6us peak=57B}
+      24:INTERSECT stats={rows=923 conf=estimated} act={rows=1302 time=189.9us peak=24.1KB}
+        10:HASH EXCHANGE stats={rows=25000 conf=estimated} act={rows=335 time=19.7us peak=0B}
+        23:HASH EXCHANGE stats={rows=1846 conf=estimated} act={rows=962 time=9.9us peak=0B}
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 23
+    PARTITION: HASH_PARTITIONED (ca_zip)
+22:PROJECT [ca_zip] stats={rows=1846 conf=estimated} act={rows=962 time=100.4us peak=40.2KB}
+  21:PROJECT [ca_zip] stats={rows=1846 conf=estimated} act={rows=962 time=75.1us peak=15.9KB}
+    20:PROJECT [substring(ca_zip, 1, 5) AS ca_zip] stats={rows=1846 conf=estimated} act={rows=962 time=114.7us peak=16.0KB}
+      19:FILTER stats={rows=1846 conf=estimated}
+        predicate: count(*) > 10
+        18:HASH AGGREGATE (GLOBAL, group by: [ca_zip]) stats={rows=3692 conf=estimated} act={rows=10176 time=284.5us peak=1.7MB}
+          aggregations: count()
+          17:HASH EXCHANGE stats={rows=3692 conf=estimated} act={rows=6068 time=215.3us peak=0B}
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 17
+    PARTITION: HASH_PARTITIONED (ca_zip)
+16:HASH AGGREGATE (LOCAL, group by: [ca_zip]) stats={rows=3692 conf=estimated} act={rows=53496 time=93.0ms peak=1.9MB}
+  aggregations: count()
+  15:HASH JOIN (PARTITIONED, INNER, eq: [ca_address_sk = c_current_addr_sk]) stats={rows=22500 conf=estimated} act={rows=144856 time=56.6ms peak=15.1MB}
+    12:HASH EXCHANGE stats={rows=45000 conf=estimated} act={rows=50000 time=36.4us peak=0B}
+    14:HASH EXCHANGE stats={rows=22500 conf=estimated} act={rows=47428 time=36.2us peak=0B}
+PLAN FRAGMENT 6
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 14
+    PARTITION: HASH_PARTITIONED (c_current_addr_sk)
+13:SCAN tpcds.customer stats={rows=22500 conf=estimated} act={rows=47428 time=22.7ms peak=5.4MB}
+     TABLE: tpcds.customer
+     columns: c_current_addr_sk, c_preferred_cust_flag
+     min-max stats
+     predicates: c_preferred_cust_flag = 'Y' AND c_current_addr_sk IS NOT NULL
+PLAN FRAGMENT 7
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 12
+    PARTITION: HASH_PARTITIONED (ca_address_sk)
+11:SCAN tpcds.customer_address stats={rows=45000 conf=estimated} act={rows=50000 time=239.9us peak=5.0MB}
+     TABLE: tpcds.customer_address
+     columns: ca_address_sk, ca_zip
+     min-max stats
+     predicates: ca_address_sk IS NOT NULL
+PLAN FRAGMENT 8
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 10
+    PARTITION: HASH_PARTITIONED (ca_zip)
+9:PROJECT [substring(ca_zip, 1, 5) AS ca_zip] stats={rows=25000 conf=estimated} act={rows=335 time=128.9us peak=28.9KB}
+  8:SCAN tpcds.customer_address stats={rows=25000 conf=estimated} act={rows=335 time=3.4us peak=0B}
+       TABLE: tpcds.customer_address
+       columns: ca_zip
+       min-max stats
+       predicates: substring(ca_zip, 1, 5) IN ('24128', '76232', '65084', '87816', '83926', '77556', '20548', '26231', '43848', '15126', '91137', '61265', '98294', '25782', '17920', '18426', '98235', '40081', '84093', '28577', '55565', '17183', '54601', '67897', '22752', '86284', '18376', '38607', '45200', '21756', '29741', '96765', '23932', '89360', '29839', '25989', '28898', '91068', '72550', '10390', '18845', '47770', '82636', '41367', '76638', '86198', '81312', '37126', '39192', '88424', '72175', '81426', '53672', '10445', '42666', '66864', '66708', '41248', '48583', '82276', '18842', '78890', '49448', '14089', '38122', '34425', '79077', '19849', '43285', '39861', '66162', '77610', '13695', '99543', '83444', '83041', '12305', '57665', '68341', '25003', '57834', '62878', '49130', '81096', '18840', '27700', '23470', '50412', '21195', '16021', '76107', '71954', '68309', '18119', '98359', '64544', '10336', '86379', '27068', '39736', '98569', '28915', '24206', '56529', '57647', '54917', '42961', '91110', '63981', '14922', '36420', '23006', '67467', '32754', '30903', '20260', '31671', '51798', '72325', '85816', '68621', '13955', '36446', '41766', '68806', '16725', '15146', '22744', '35850', '88086', '51649', '18270', '52867', '39972', '96976', '63792', '11376', '94898', '13595', '10516', '90225', '58943', '39371', '94945', '28587', '96576', '57855', '28488', '26105', '83933', '25858', '34322', '44438', '73171', '30122', '34102', '22685', '71256', '78451', '54364', '13354', '45375', '40558', '56458', '28286', '45266', '47305', '69399', '83921', '26233', '11101', '15371', '69913', '35942', '15882', '25631', '24610', '44165', '99076', '33786', '70738', '26653', '14328', '72305', '62496', '22152', '10144', '64147', '48425', '14663', '21076', '18799', '30450', '63089', '81019', '68893', '24996', '51200', '51211', '45692', '92712', '70466', '79994', '22437', '25280', '38935', '71791', '73134', '56571', '14060', '19505', '72425', '56575', '74351', '68786', '51650', '20004', '18383', '76614', '11634', '18906', '15765', '41368', '73241', '76698', '78567', '97189', '28545', '76231', '75691', '22246', '51061', '90578', '56691', '68014', '51103', '94167', '57047', '14867', '73520', '15734', '63435', '25733', '35474', '24676', '94627', '53535', '17879', '15559', '53268', '59166', '11928', '59402', '33282', '45721', '43933', '68101', '33515', '36634', '71286', '19736', '58058', '55253', '67473', '41918', '19515', '36495', '19430', '22351', '77191', '91393', '49156', '50298', '87501', '18652', '53179', '18767', '63193', '23968', '65164', '68880', '21286', '72823', '58470', '67301', '13394', '31016', '70372', '67030', '40604', '24317', '45748', '39127', '26065', '77721', '31029', '31880', '60576', '24671', '45549', '13376', '50016', '33123', '19769', '22927', '97789', '46081', '72151', '15723', '46136', '51949', '68100', '96888', '64528', '14171', '79777', '28709', '11489', '25103', '32213', '78668', '22245', '15798', '27156', '37930', '62971', '21337', '51622', '67853', '10567', '38415', '15455', '58263', '42029', '60279', '37125', '56240', '88190', '50308', '26859', '64457', '89091', '82136', '62377', '36233', '63837', '58078', '17043', '30010', '60099', '28810', '98025', '29178', '87343', '73273', '30469', '64034', '39516', '86057', '21309', '90257', '67875', '40162', '11356', '73650', '61810', '72013', '30431', '22461', '19512', '13375', '55307', '30625', '83849', '68908', '26689', '96451', '38193', '46820', '88885', '84935', '69035', '83144', '47537', '56616', '94983', '48033', '69952', '25486', '61547', '27385', '61860', '58048', '56910', '16807', '17871', '35258', '31387', '35458', '35576')
+PLAN FRAGMENT 9
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 6
+    PARTITION: UNPARTITIONED
+5:SCAN tpcds.store stats={rows=11 conf=estimated} act={rows=12 time=41.4us peak=13.5KB}
+     TABLE: tpcds.store
+     columns: s_store_sk, s_store_name, s_zip
+     min-max stats
+     predicates: s_store_sk IS NOT NULL
+PLAN FRAGMENT 10
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: UNPARTITIONED
+2:SCAN tpcds.date_dim stats={rows=82 conf=estimated} act={rows=91 time=34.7us peak=60.2KB}
+     TABLE: tpcds.date_dim
+     columns: d_date_sk, d_year, d_qoy
+     min-max stats
+     predicates: d_qoy = 2 AND d_year = 1998 AND d_date_sk IS NOT NULL

@@ -1,0 +1,402 @@
+-- engine=starrocks
+-- suite=tpc-ds
+-- case=q2
+-- file=/Users/harbor/project/NovaRocks/sql-tests/tpc-ds/sql/q2.sql
+-- elapsed_sec=0.207
+-- exit_code=0
+
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 1.551315907656E9
+  Memory: 5.90969747052E8
+
+PLAN FRAGMENT 0(F17)
+  Fragment Cost: 1.257375536856E9
+  Output Exprs:207: d_week_seq | 437: round | 438: round | 439: round | 440: round | 441: round | 442: round | 443: round
+  Input Partition: UNPARTITIONED
+  RESULT SINK
+
+  35:MERGING-EXCHANGE
+     distribution type: GATHER
+     cardinality: 486210
+
+PLAN FRAGMENT 1(F12)
+  Fragment Cost: 1.20954943008E9
+
+  Input Partition: HASH_PARTITIONED: 444: cast
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 35
+
+  34:SORT
+  |  order by: [207, INT, true] ASC
+  |  offset: 0
+  |  cardinality: 486210
+  |
+  33:Project
+  |  output columns:
+  |  207 <-> [207: d_week_seq, INT, true]
+  |  437 <-> round[([242: sum, DECIMAL128(38,2), true] / [398: sum, DECIMAL128(38,2), true], 2); args: DECIMAL128,INT; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |  438 <-> round[([243: sum, DECIMAL128(38,2), true] / [399: sum, DECIMAL128(38,2), true], 2); args: DECIMAL128,INT; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |  439 <-> round[([244: sum, DECIMAL128(38,2), true] / [400: sum, DECIMAL128(38,2), true], 2); args: DECIMAL128,INT; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |  440 <-> round[([245: sum, DECIMAL128(38,2), true] / [401: sum, DECIMAL128(38,2), true], 2); args: DECIMAL128,INT; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |  441 <-> round[([246: sum, DECIMAL128(38,2), true] / [402: sum, DECIMAL128(38,2), true], 2); args: DECIMAL128,INT; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |  442 <-> round[([247: sum, DECIMAL128(38,2), true] / [403: sum, DECIMAL128(38,2), true], 2); args: DECIMAL128,INT; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |  443 <-> round[([248: sum, DECIMAL128(38,2), true] / [404: sum, DECIMAL128(38,2), true], 2); args: DECIMAL128,INT; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |  cardinality: 486210
+  |
+  32:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [363: d_week_seq, INT, true] = [409: d_week_seq, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 3, build_expr = (409: d_week_seq), remote = true
+  |  output columns: 207, 242, 243, 244, 245, 246, 247, 248, 398, 399, 400, 401, 402, 403, 404
+  |  can local shuffle: false
+  |  cardinality: 486210
+  |
+  |----31:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 13284
+  |
+  28:Project
+  |  output columns:
+  |  207 <-> [207: d_week_seq, INT, true]
+  |  242 <-> [242: sum, DECIMAL128(38,2), true]
+  |  243 <-> [243: sum, DECIMAL128(38,2), true]
+  |  244 <-> [244: sum, DECIMAL128(38,2), true]
+  |  245 <-> [245: sum, DECIMAL128(38,2), true]
+  |  246 <-> [246: sum, DECIMAL128(38,2), true]
+  |  247 <-> [247: sum, DECIMAL128(38,2), true]
+  |  248 <-> [248: sum, DECIMAL128(38,2), true]
+  |  363 <-> [363: d_week_seq, INT, true]
+  |  398 <-> [398: sum, DECIMAL128(38,2), true]
+  |  399 <-> [399: sum, DECIMAL128(38,2), true]
+  |  400 <-> [400: sum, DECIMAL128(38,2), true]
+  |  401 <-> [401: sum, DECIMAL128(38,2), true]
+  |  402 <-> [402: sum, DECIMAL128(38,2), true]
+  |  403 <-> [403: sum, DECIMAL128(38,2), true]
+  |  404 <-> [404: sum, DECIMAL128(38,2), true]
+  |  cardinality: 486210
+  |
+  27:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [207: d_week_seq, INT, true] = [253: d_week_seq, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 2, build_expr = (253: d_week_seq), remote = true
+  |  output columns: 207, 242, 243, 244, 245, 246, 247, 248, 363, 398, 399, 400, 401, 402, 403, 404
+  |  can local shuffle: false
+  |  cardinality: 486210
+  |
+  |----26:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 13284
+  |
+  23:Project
+  |  output columns:
+  |  207 <-> [207: d_week_seq, INT, true]
+  |  242 <-> [242: sum, DECIMAL128(38,2), true]
+  |  243 <-> [243: sum, DECIMAL128(38,2), true]
+  |  244 <-> [244: sum, DECIMAL128(38,2), true]
+  |  245 <-> [245: sum, DECIMAL128(38,2), true]
+  |  246 <-> [246: sum, DECIMAL128(38,2), true]
+  |  247 <-> [247: sum, DECIMAL128(38,2), true]
+  |  248 <-> [248: sum, DECIMAL128(38,2), true]
+  |  363 <-> [363: d_week_seq, INT, true]
+  |  398 <-> [398: sum, DECIMAL128(38,2), true]
+  |  399 <-> [399: sum, DECIMAL128(38,2), true]
+  |  400 <-> [400: sum, DECIMAL128(38,2), true]
+  |  401 <-> [401: sum, DECIMAL128(38,2), true]
+  |  402 <-> [402: sum, DECIMAL128(38,2), true]
+  |  403 <-> [403: sum, DECIMAL128(38,2), true]
+  |  404 <-> [404: sum, DECIMAL128(38,2), true]
+  |  cardinality: 486210
+  |
+  22:HASH JOIN
+  |  join op: INNER JOIN (PARTITIONED)
+  |  equal join conjunct: [444: cast, BIGINT, true] = [445: subtract, BIGINT, true]
+  |  build runtime filters:
+  |  - filter_id = 1, build_expr = (445: subtract), remote = false
+  |  output columns: 207, 242, 243, 244, 245, 246, 247, 248, 363, 398, 399, 400, 401, 402, 403, 404
+  |  can local shuffle: false
+  |  cardinality: 486210
+  |
+  |----21:EXCHANGE
+  |       distribution type: SHUFFLE
+  |       partition exprs: [445: subtract, BIGINT, true]
+  |       cardinality: 486210
+  |       probe runtime filters:
+  |       - filter_id = 3, probe_expr = (363: d_week_seq)
+  |
+  16:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [444: cast, BIGINT, true]
+     cardinality: 486210
+     probe runtime filters:
+     - filter_id = 1, probe_expr = (444: cast)
+     - filter_id = 2, probe_expr = (207: d_week_seq)
+
+PLAN FRAGMENT 2(F15)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 31
+
+  30:Project
+  |  output columns:
+  |  409 <-> [409: d_week_seq, INT, true]
+  |  cardinality: 13284
+  |
+  29:IcebergScanNode
+     TABLE: tpcds.date_dim
+     PREDICATES: 411: d_year = 2002, CAST(409: d_week_seq AS BIGINT) - 53 IS NOT NULL
+     MIN/MAX PREDICATES: 411: d_year <= 2002, 411: d_year >= 2002
+     TABLE VERSION: Snapshot@(149066723028526449)
+     cardinality=13284
+     avgRowSize=2.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 13284
+
+PLAN FRAGMENT 3(F13)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 26
+
+  25:Project
+  |  output columns:
+  |  253 <-> [253: d_week_seq, INT, true]
+  |  cardinality: 13284
+  |
+  24:IcebergScanNode
+     TABLE: tpcds.date_dim
+     PREDICATES: 255: d_year = 2001, CAST(253: d_week_seq AS BIGINT) IS NOT NULL
+     MIN/MAX PREDICATES: 255: d_year <= 2001, 255: d_year >= 2001
+     TABLE VERSION: Snapshot@(149066723028526449)
+     cardinality=13284
+     avgRowSize=2.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 13284
+
+PLAN FRAGMENT 4(F10)
+  Fragment Cost: -3.09850073496E8
+
+  Input Partition: HASH_PARTITIONED: 83: d_week_seq
+  OutPut Partition: HASH_PARTITIONED: 445: subtract
+  OutPut Exchange Id: 21
+
+  20:Project
+  |  output columns:
+  |  363 <-> [363: d_week_seq, INT, true]
+  |  398 <-> [398: sum, DECIMAL128(38,2), true]
+  |  399 <-> [399: sum, DECIMAL128(38,2), true]
+  |  400 <-> [400: sum, DECIMAL128(38,2), true]
+  |  401 <-> [401: sum, DECIMAL128(38,2), true]
+  |  402 <-> [402: sum, DECIMAL128(38,2), true]
+  |  403 <-> [403: sum, DECIMAL128(38,2), true]
+  |  404 <-> [404: sum, DECIMAL128(38,2), true]
+  |  445 <-> cast([363: d_week_seq, INT, true] as BIGINT) - 53
+  |  cardinality: 486210
+  |
+  19:SELECT
+  |  predicates: CAST(363: d_week_seq AS BIGINT) - 53 IS NOT NULL
+  |  cardinality: 486210
+  |
+  18:Project
+  |  output columns:
+  |  363 <-> [83: d_week_seq, INT, true]
+  |  398 <-> [118: sum, DECIMAL128(38,2), true]
+  |  399 <-> [119: sum, DECIMAL128(38,2), true]
+  |  400 <-> [120: sum, DECIMAL128(38,2), true]
+  |  401 <-> [121: sum, DECIMAL128(38,2), true]
+  |  402 <-> [122: sum, DECIMAL128(38,2), true]
+  |  403 <-> [123: sum, DECIMAL128(38,2), true]
+  |  404 <-> [124: sum, DECIMAL128(38,2), true]
+  |  cardinality: 486210
+  |
+  17:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [83: d_week_seq, INT, true]
+     cardinality: 486210
+     probe runtime filters:
+     - filter_id = 3, probe_expr = (83: d_week_seq)
+
+PLAN FRAGMENT 5(F08)
+  Fragment Cost: -3.09850073496E8
+
+  Input Partition: HASH_PARTITIONED: 83: d_week_seq
+  OutPut Partition: HASH_PARTITIONED: 444: cast
+  OutPut Exchange Id: 16
+
+  15:Project
+  |  output columns:
+  |  207 <-> [207: d_week_seq, INT, true]
+  |  242 <-> [242: sum, DECIMAL128(38,2), true]
+  |  243 <-> [243: sum, DECIMAL128(38,2), true]
+  |  244 <-> [244: sum, DECIMAL128(38,2), true]
+  |  245 <-> [245: sum, DECIMAL128(38,2), true]
+  |  246 <-> [246: sum, DECIMAL128(38,2), true]
+  |  247 <-> [247: sum, DECIMAL128(38,2), true]
+  |  248 <-> [248: sum, DECIMAL128(38,2), true]
+  |  444 <-> cast([207: d_week_seq, INT, true] as BIGINT)
+  |  cardinality: 486210
+  |
+  14:SELECT
+  |  predicates: CAST(207: d_week_seq AS BIGINT) IS NOT NULL
+  |  cardinality: 486210
+  |
+  13:Project
+  |  output columns:
+  |  207 <-> [83: d_week_seq, INT, true]
+  |  242 <-> [118: sum, DECIMAL128(38,2), true]
+  |  243 <-> [119: sum, DECIMAL128(38,2), true]
+  |  244 <-> [120: sum, DECIMAL128(38,2), true]
+  |  245 <-> [121: sum, DECIMAL128(38,2), true]
+  |  246 <-> [122: sum, DECIMAL128(38,2), true]
+  |  247 <-> [123: sum, DECIMAL128(38,2), true]
+  |  248 <-> [124: sum, DECIMAL128(38,2), true]
+  |  cardinality: 486210
+  |
+  12:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [83: d_week_seq, INT, true]
+     cardinality: 486210
+     probe runtime filters:
+     - filter_id = 2, probe_expr = (83: d_week_seq)
+
+PLAN FRAGMENT 6(F07)
+  Fragment Cost: 1.7484100812E8
+  Output Exprs:83: d_week_seq | 118: sum | 119: sum | 120: sum | 121: sum | 122: sum | 123: sum | 124: sum
+  Input Partition: HASH_PARTITIONED: 83: d_week_seq
+  MultiCastDataSinks:
+  OutPut Partition: RANDOM
+  OutPut Exchange Id: 12
+  OutPut Partition: RANDOM
+  OutPut Exchange Id: 17
+
+  11:AGGREGATE (merge finalize)
+  |  aggregate: sum[([118: sum, DECIMAL128(38,2), true]); args: DECIMAL32; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([119: sum, DECIMAL128(38,2), true]); args: DECIMAL32; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([120: sum, DECIMAL128(38,2), true]); args: DECIMAL32; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([121: sum, DECIMAL128(38,2), true]); args: DECIMAL32; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([122: sum, DECIMAL128(38,2), true]); args: DECIMAL32; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([123: sum, DECIMAL128(38,2), true]); args: DECIMAL32; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([124: sum, DECIMAL128(38,2), true]); args: DECIMAL32; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |  group by: [83: d_week_seq, INT, true]
+  |  cardinality: 486210
+  |
+  10:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [83: d_week_seq, INT, true]
+     cardinality: 972419
+
+PLAN FRAGMENT 7(F04)
+  Fragment Cost: 1.35009065376E8
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 83: d_week_seq
+  OutPut Exchange Id: 10
+
+  9:AGGREGATE (update serialize)
+  |  STREAMING
+  |  aggregate: sum[([111: case, DECIMAL32(7,2), true]); args: DECIMAL32; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([112: case, DECIMAL32(7,2), true]); args: DECIMAL32; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([113: case, DECIMAL32(7,2), true]); args: DECIMAL32; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([114: case, DECIMAL32(7,2), true]); args: DECIMAL32; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([115: case, DECIMAL32(7,2), true]); args: DECIMAL32; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([116: case, DECIMAL32(7,2), true]); args: DECIMAL32; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([117: case, DECIMAL32(7,2), true]); args: DECIMAL32; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |  group by: [83: d_week_seq, INT, true]
+  |  cardinality: 972419
+  |
+  8:Project
+  |  output columns:
+  |  83 <-> [83: d_week_seq, INT, true]
+  |  111 <-> if[([93: d_day_name, VARCHAR(1073741824), true] = 'Sunday', [78: ws_ext_sales_price, DECIMAL32(7,2), true], NULL); args: BOOLEAN,DECIMAL32,DECIMAL32; result: DECIMAL32(7,2); args nullable: true; result nullable: true]
+  |  112 <-> if[([93: d_day_name, VARCHAR(1073741824), true] = 'Monday', [78: ws_ext_sales_price, DECIMAL32(7,2), true], NULL); args: BOOLEAN,DECIMAL32,DECIMAL32; result: DECIMAL32(7,2); args nullable: true; result nullable: true]
+  |  113 <-> if[([93: d_day_name, VARCHAR(1073741824), true] = 'Tuesday', [78: ws_ext_sales_price, DECIMAL32(7,2), true], NULL); args: BOOLEAN,DECIMAL32,DECIMAL32; result: DECIMAL32(7,2); args nullable: true; result nullable: true]
+  |  114 <-> if[([93: d_day_name, VARCHAR(1073741824), true] = 'Wednesday', [78: ws_ext_sales_price, DECIMAL32(7,2), true], NULL); args: BOOLEAN,DECIMAL32,DECIMAL32; result: DECIMAL32(7,2); args nullable: true; result nullable: true]
+  |  115 <-> if[([93: d_day_name, VARCHAR(1073741824), true] = 'Thursday', [78: ws_ext_sales_price, DECIMAL32(7,2), true], NULL); args: BOOLEAN,DECIMAL32,DECIMAL32; result: DECIMAL32(7,2); args nullable: true; result nullable: true]
+  |  116 <-> if[([93: d_day_name, VARCHAR(1073741824), true] = 'Friday', [78: ws_ext_sales_price, DECIMAL32(7,2), true], NULL); args: BOOLEAN,DECIMAL32,DECIMAL32; result: DECIMAL32(7,2); args nullable: true; result nullable: true]
+  |  117 <-> if[([93: d_day_name, VARCHAR(1073741824), true] = 'Saturday', [78: ws_ext_sales_price, DECIMAL32(7,2), true], NULL); args: BOOLEAN,DECIMAL32,DECIMAL32; result: DECIMAL32(7,2); args nullable: true; result nullable: true]
+  |  cardinality: 1944839
+  |
+  7:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [77: ws_sold_date_sk, INT, true] = [79: d_date_sk, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 0, build_expr = (79: d_date_sk), remote = true
+  |  output columns: 78, 83, 93
+  |  can local shuffle: true
+  |  cardinality: 1944839
+  |
+  |----6:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 65087
+  |
+  0:UNION
+  |  output exprs:
+  |      [77, INT, true] | [78, DECIMAL32(7,2), true]
+  |  child exprs:
+  |      [1: ws_sold_date_sk, INT, true] | [24: ws_ext_sales_price, DECIMAL32(7,2), true]
+  |      [39: cs_sold_date_sk, INT, true] | [62: cs_ext_sales_price, DECIMAL32(7,2), true]
+  |  pass-through-operands: all
+  |  cardinality: 1944839
+  |
+  |----4:EXCHANGE
+  |       distribution type: ROUND_ROBIN
+  |       cardinality: 1297393
+  |       probe runtime filters:
+  |       - filter_id = 0, probe_expr = (39: cs_sold_date_sk)
+  |
+  2:EXCHANGE
+     distribution type: ROUND_ROBIN
+     cardinality: 647446
+     probe runtime filters:
+     - filter_id = 0, probe_expr = (1: ws_sold_date_sk)
+
+PLAN FRAGMENT 8(F05)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 06
+
+  5:IcebergScanNode
+     TABLE: tpcds.date_dim
+     PREDICATES: (CAST(83: d_week_seq AS BIGINT) - 53 IS NOT NULL) OR (CAST(83: d_week_seq AS BIGINT) IS NOT NULL), 79: d_date_sk IS NOT NULL
+     TABLE VERSION: Snapshot@(149066723028526449)
+     cardinality=65087
+     avgRowSize=3.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 65087
+
+PLAN FRAGMENT 9(F02)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: RANDOM
+  OutPut Exchange Id: 04
+
+  3:IcebergScanNode
+     TABLE: tpcds.catalog_sales
+     PREDICATES: 39: cs_sold_date_sk IS NOT NULL
+     TABLE VERSION: Snapshot@(3096389489357933185)
+     cardinality=1297393
+     avgRowSize=2.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 1297393
+     probe runtime filters:
+     - filter_id = 0, probe_expr = (39: cs_sold_date_sk)
+
+PLAN FRAGMENT 10(F00)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: RANDOM
+  OutPut Exchange Id: 02
+
+  1:IcebergScanNode
+     TABLE: tpcds.web_sales
+     PREDICATES: 1: ws_sold_date_sk IS NOT NULL
+     TABLE VERSION: Snapshot@(2984817778172468007)
+     cardinality=647446
+     avgRowSize=2.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 647446
+     probe runtime filters:
+     - filter_id = 0, probe_expr = (1: ws_sold_date_sk)

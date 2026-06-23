@@ -1,0 +1,89 @@
+Explain String
+Planning: 183.5ms / Execution: 5.39s / Rows: 1
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+18:PROJECT [sum(ss_quantity)] stats={rows=1 conf=estimated} act={rows=1 time=19.5us peak=8.0KB}
+  17:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=78.8us peak=64.2KB}
+    aggregations: sum(ss_quantity)
+    16:GATHER stats={rows=1 conf=estimated} act={rows=12 time=8.6us peak=0B}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 16
+    PARTITION: UNPARTITIONED
+15:HASH AGGREGATE (LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=210.6us peak=881.1KB}
+  aggregations: sum(ss_quantity)
+  14:HASH JOIN (BROADCAST, INNER, eq: [ss_sold_date_sk = d_date_sk]) stats={rows=207 conf=estimated} act={rows=1617 time=1.1ms peak=366.8KB}
+    build runtime filters:
+    - filter_id = 3, build_expr = (d_date_sk)
+    11:HASH JOIN (BROADCAST, INNER, eq: [ss_store_sk = s_store_sk]) stats={rows=317 conf=estimated} act={rows=2873 time=3.2ms peak=19.9KB}
+      build runtime filters:
+      - filter_id = 2, build_expr = (s_store_sk)
+      8:HASH JOIN (BROADCAST, INNER, eq: [cd_demo_sk = ss_cdemo_sk]) stats={rows=317 conf=estimated} act={rows=306932 time=41.7ms peak=110.4MB}
+        other: cd_marital_status = 'M' AND cd_education_status = '4 yr Degree' AND ss_sales_price BETWEEN 100.00 AND 150.00 OR cd_marital_status = 'D' AND cd_education_status = '2 yr Degree' AND ss_sales_price BETWEEN 50.00 AND 100.00 OR cd_marital_status = 'S' AND cd_education_status = 'College' AND ss_sales_price BETWEEN 150.00 AND 200.00
+        build runtime filters:
+        - filter_id = 1, build_expr = (ss_cdemo_sk)
+        1:SCAN tpcds.customer_demographics stats={rows=146729 conf=estimated} act={rows=164640 time=62.9us peak=0B}
+             TABLE: tpcds.customer_demographics
+             columns: cd_demo_sk, cd_marital_status, cd_education_status
+             min-max stats
+             predicates: cd_marital_status = 'M' AND cd_education_status = '4 yr Degree' OR cd_marital_status = 'D' AND cd_education_status = '2 yr Degree' OR cd_marital_status = 'S' AND cd_education_status = 'College' AND cd_marital_status IN ('M', 'D', 'S') AND cd_education_status IN ('4 yr Degree', '2 yr Degree', 'College') AND cd_demo_sk IS NOT NULL
+            probe runtime filters:
+            - filter_id = 1, probe_expr = (cd_demo_sk)
+        7:GATHER stats={rows=1225 conf=estimated} act={rows=304095 time=16.9ms peak=0B}
+      10:GATHER stats={rows=11 conf=estimated} act={rows=36 time=6.2us peak=0B}
+    13:GATHER stats={rows=327 conf=estimated} act={rows=1098 time=6.0us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 13
+    PARTITION: UNPARTITIONED
+12:SCAN tpcds.date_dim stats={rows=327 conf=estimated} act={rows=366 time=38.2us peak=222.0KB}
+     TABLE: tpcds.date_dim
+     columns: d_date_sk, d_year
+     min-max stats
+     predicates: d_year = 2000 AND d_date_sk IS NOT NULL
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 10
+    PARTITION: UNPARTITIONED
+9:SCAN tpcds.store stats={rows=11 conf=estimated} act={rows=12 time=23.5us peak=11.0KB}
+     TABLE: tpcds.store
+     columns: s_store_sk
+     min-max stats
+     predicates: s_store_sk IS NOT NULL
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 7
+    PARTITION: UNPARTITIONED
+6:HASH JOIN (BROADCAST, INNER, eq: [ss_addr_sk = ca_address_sk]) stats={rows=1225 conf=estimated} act={rows=144316 time=146.0ms peak=26.3MB}
+  other: ca_state IN ('CO', 'OH', 'TX') AND ss_net_profit BETWEEN 0 AND 2000 AND __cse_0 OR ca_state IN ('OR', 'MN', 'KY') AND ss_net_profit BETWEEN 150 AND 3000 AND __cse_0 OR ca_state IN ('VA', 'CA', 'MS') AND ss_net_profit BETWEEN 50 AND 25000 AND __cse_0
+  build runtime filters:
+  - filter_id = 0, build_expr = (ca_address_sk)
+  2:SCAN tpcds.store_sales stats={rows=471686 conf=estimated} act={rows=169853 time=8.0ms peak=0B}
+       TABLE: tpcds.store_sales
+       columns: ss_sold_date_sk, ss_cdemo_sk, ss_addr_sk, ss_store_sk, ss_quantity, ss_sales_price, ss_net_profit
+       min-max stats
+       predicates: ss_sales_price BETWEEN 100.00 AND 150.00 OR ss_sales_price BETWEEN 50.00 AND 100.00 OR ss_sales_price BETWEEN 150.00 AND 200.00 AND ss_net_profit BETWEEN 0 AND 2000 OR ss_net_profit BETWEEN 150 AND 3000 OR ss_net_profit BETWEEN 50 AND 25000 AND ss_sales_price BETWEEN 50.00 AND 200.00 AND ss_net_profit BETWEEN 0 AND 25000 AND ss_store_sk IS NOT NULL AND ss_cdemo_sk IS NOT NULL AND ss_addr_sk IS NOT NULL AND ss_sold_date_sk IS NOT NULL
+      probe runtime filters:
+      - filter_id = 0, probe_expr = (ss_addr_sk)
+  5:PROJECT [ca_address_sk, ca_state, ca_country, ca_country = 'United States' AS __cse_0] stats={rows=1927 conf=estimated} act={rows=42951 time=526.1us peak=855.2KB}
+    4:GATHER stats={rows=1927 conf=estimated} act={rows=42951 time=16.9us peak=0B}
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 4
+    PARTITION: UNPARTITIONED
+3:SCAN tpcds.customer_address stats={rows=1927 conf=estimated} act={rows=14317 time=446.4us peak=2.2MB}
+     TABLE: tpcds.customer_address
+     columns: ca_address_sk, ca_state, ca_country
+     min-max stats
+     predicates: ca_country IN ('United States', 'United States', 'United States') AND ca_country = 'United States' AND ca_state IN ('CO', 'OH', 'TX') OR ca_country = 'United States' AND ca_state IN ('OR', 'MN', 'KY') OR ca_country = 'United States' AND ca_state IN ('VA', 'CA', 'MS') AND ca_address_sk IS NOT NULL

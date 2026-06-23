@@ -1,0 +1,118 @@
+-- engine=starrocks
+-- suite=tpc-h
+-- case=q14
+-- file=/Users/harbor/project/NovaRocks/sql-tests/tpc-h/sql/q14.sql
+-- elapsed_sec=0.059
+-- exit_code=0
+
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 2.3414334E7
+  Memory: 979186.2
+
+PLAN FRAGMENT 0(F05)
+  Fragment Cost: 176.0
+  Output Exprs:38: expr
+  Input Partition: UNPARTITIONED
+  RESULT SINK
+
+  10:Project
+  |  output columns:
+  |  38 <-> 100.00 * [36: sum, DECIMAL128(38,4), true] / [37: sum, DECIMAL128(38,4), true]
+  |  cardinality: 1
+  |
+  9:AGGREGATE (merge finalize)
+  |  aggregate: sum[([36: sum, DECIMAL128(38,4), true]); args: DECIMAL128; result: DECIMAL128(38,4); args nullable: true; result nullable: true], sum[([37: sum, DECIMAL128(38,4), true]); args: DECIMAL128; result: DECIMAL128(38,4); args nullable: true; result nullable: true]
+  |  cardinality: 1
+  |
+  8:EXCHANGE
+     distribution type: GATHER
+     cardinality: 1
+
+PLAN FRAGMENT 1(F04)
+  Fragment Cost: 1.32737574E7
+
+  Input Partition: HASH_PARTITIONED: 21: p_partkey
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 08
+
+  7:AGGREGATE (update serialize)
+  |  aggregate: sum[(if[([25: p_type, VARCHAR(1073741824), true] LIKE 'PROMO%', [43: multiply, DECIMAL128(31,4), true], 0); args: BOOLEAN,DECIMAL128,DECIMAL128; result: DECIMAL128(31,4); args nullable: true; result nullable: true]); args: DECIMAL128; result: DECIMAL128(38,4); args nullable: true; result nullable: true], sum[([35: expr, DECIMAL128(31,4), true]); args: DECIMAL128; result: DECIMAL128(38,4); args nullable: true; result nullable: true]
+  |  cardinality: 1
+  |
+  6:Project
+  |  output columns:
+  |  25 <-> [25: p_type, VARCHAR(1073741824), true]
+  |  35 <-> clone([43: multiply, DECIMAL128(31,4), true])
+  |  43 <-> [43: multiply, DECIMAL128(31,4), true]
+  |  common expressions:
+  |  39 <-> cast([6: l_extendedprice, DECIMAL64(15,2), true] as DECIMAL128(15,2))
+  |  40 <-> [7: l_discount, DECIMAL64(15,2), true]
+  |  41 <-> 1 - [40: cast, DECIMAL64(16,2), true]
+  |  42 <-> cast([41: subtract, DECIMAL64(16,2), true] as DECIMAL128(16,2))
+  |  43 <-> [39: cast, DECIMAL128(15,2), true] * [42: cast, DECIMAL128(16,2), true]
+  |  cardinality: 180000
+  |
+  5:HASH JOIN
+  |  join op: INNER JOIN (PARTITIONED)
+  |  equal join conjunct: [21: p_partkey, INT, true] = [2: l_partkey, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 0, build_expr = (2: l_partkey), remote = true
+  |  output columns: 6, 7, 25
+  |  can local shuffle: true
+  |  cardinality: 180000
+  |
+  |----4:EXCHANGE
+  |       distribution type: SHUFFLE
+  |       partition exprs: [2: l_partkey, INT, true]
+  |       cardinality: 48957
+  |
+  1:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [21: p_partkey, INT, true]
+     cardinality: 180000
+
+PLAN FRAGMENT 2(F02)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 2: l_partkey
+  OutPut Exchange Id: 04
+
+  3:Project
+  |  output columns:
+  |  2 <-> [2: l_partkey, INT, true]
+  |  6 <-> [6: l_extendedprice, DECIMAL64(15,2), true]
+  |  7 <-> [7: l_discount, DECIMAL64(15,2), true]
+  |  cardinality: 48957
+  |
+  2:IcebergScanNode
+     TABLE: tpch.lineitem
+     PREDICATES: 11: l_shipdate >= '1997-02-01', 11: l_shipdate < '1997-03-01'
+     MIN/MAX PREDICATES: 11: l_shipdate >= '1997-02-01', 11: l_shipdate < '1997-03-01'
+     TABLE VERSION: Snapshot@(2784910170297541234)
+     cardinality=48957
+     avgRowSize=4.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 48957
+
+PLAN FRAGMENT 3(F00)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 21: p_partkey
+  OutPut Exchange Id: 01
+
+  0:IcebergScanNode
+     TABLE: tpch.part
+     PREDICATES: 21: p_partkey IS NOT NULL
+     TABLE VERSION: Snapshot@(4879851144136466836)
+     cardinality=180000
+     avgRowSize=2.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 180000
+     probe runtime filters:
+     - filter_id = 0, probe_expr = (21: p_partkey)

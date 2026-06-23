@@ -1,0 +1,92 @@
+Explain String
+Planning: 135.2ms / Execution: 1.27s / Rows: 100
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+20:MERGING-EXCHANGE stats={rows=100 conf=estimated} act={rows=700 time=127.2us peak=77.1KB}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 20
+    PARTITION: UNPARTITIONED
+19:LOCAL TOP-N (limit=100, offset=0) [s_acctbal DESC NULLS LAST, n_name ASC NULLS FIRST, s_name ASC NULLS FIRST, p_partkey ASC NULLS FIRST] stats={rows=100 conf=estimated} act={rows=300 time=421.1us peak=205.9KB}
+  18:PROJECT [s_acctbal, s_name, n_name, p_partkey, p_mfgr, s_address, s_phone, s_comment] stats={rows=10716 conf=estimated} act={rows=493 time=232.4us peak=656.1KB}
+    17:FILTER stats={rows=10716 conf=estimated}
+      predicate: ps_supplycost = min_window
+      16:WINDOW [min(ps_supplycost)] stats={rows=42865 conf=estimated} act={rows=493 time=92.8us peak=907.7KB}
+        15:SORT BY [p_partkey ASC NULLS FIRST] stats={rows=42865 conf=estimated} act={rows=1362 time=3.4ms peak=3.7MB}
+          14:HASH EXCHANGE stats={rows=42865 conf=estimated} act={rows=681 time=91.1us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 14
+    PARTITION: HASH_PARTITIONED (p_partkey)
+13:HASH JOIN (BROADCAST, INNER, eq: [s_suppkey = ps_suppkey]) stats={rows=42865 conf=estimated} act={rows=10557 time=4.0ms peak=8.7MB}
+  build runtime filters:
+  - filter_id = 3, build_expr = (ps_suppkey)
+  7:HASH JOIN (BROADCAST, INNER, eq: [s_nationkey = n_nationkey]) stats={rows=1476 conf=estimated} act={rows=2051 time=139.1us peak=270.9KB}
+    build runtime filters:
+    - filter_id = 1, build_expr = (n_nationkey)
+    1:SCAN tpch.supplier stats={rows=8100 conf=estimated} act={rows=2036 time=5.1us peak=0B}
+         TABLE: tpch.supplier
+         columns: s_suppkey, s_name, s_address, s_nationkey, s_phone, s_acctbal, s_comment, _file, _pos
+         predicates: s_suppkey IS NOT NULL AND s_nationkey IS NOT NULL
+        probe runtime filters:
+        - filter_id = 1, probe_expr = (s_nationkey)
+        - filter_id = 3, probe_expr = (s_suppkey)
+    6:GATHER stats={rows=5 conf=estimated} act={rows=15 time=33.4us peak=0B}
+  12:GATHER stats={rows=2930 conf=estimated} act={rows=9876 time=49.0us peak=0B}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 12
+    PARTITION: UNPARTITIONED
+11:HASH JOIN (BROADCAST, INNER, eq: [ps_partkey = p_partkey]) stats={rows=2930 conf=estimated} act={rows=5761 time=1.7ms peak=4.7MB}
+  build runtime filters:
+  - filter_id = 2, build_expr = (p_partkey)
+  8:SCAN tpch.partsupp stats={rows=648000 conf=estimated} act={rows=3292 time=201.1us peak=0B}
+       TABLE: tpch.partsupp
+       columns: ps_partkey, ps_suppkey, ps_availqty, ps_supplycost, ps_comment, _file, _pos
+       predicates: ps_partkey IS NOT NULL AND ps_suppkey IS NOT NULL
+      probe runtime filters:
+      - filter_id = 2, probe_expr = (ps_partkey)
+  10:GATHER stats={rows=900 conf=estimated} act={rows=2469 time=37.9us peak=0B}
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 10
+    PARTITION: UNPARTITIONED
+9:SCAN tpch.part stats={rows=900 conf=estimated} act={rows=823 time=574.5us peak=1012.6KB}
+     TABLE: tpch.part
+     columns: p_partkey, p_name, p_mfgr, p_brand, p_type, p_size, p_container, p_retailprice, p_comment, _file, _pos
+     predicates: p_size = 12 AND p_type LIKE '%COPPER' AND p_partkey IS NOT NULL
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 6
+    PARTITION: UNPARTITIONED
+5:HASH JOIN (BROADCAST, INNER, eq: [n_regionkey = r_regionkey]) stats={rows=5 conf=estimated} act={rows=8 time=900.6us peak=32.2KB}
+  build runtime filters:
+  - filter_id = 0, build_expr = (r_regionkey)
+  2:SCAN tpch.nation stats={rows=20 conf=estimated} act={rows=25 time=16.7us peak=0B}
+       TABLE: tpch.nation
+       columns: n_nationkey, n_name, n_regionkey, n_comment, _file, _pos
+       predicates: n_nationkey IS NOT NULL AND n_regionkey IS NOT NULL
+      probe runtime filters:
+      - filter_id = 0, probe_expr = (n_regionkey)
+  4:GATHER stats={rows=1 conf=estimated} act={rows=3 time=43.8us peak=0B}
+PLAN FRAGMENT 6
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 4
+    PARTITION: UNPARTITIONED
+3:SCAN tpch.region stats={rows=1 conf=estimated} act={rows=1 time=20.8us peak=5.9KB}
+     TABLE: tpch.region
+     columns: r_regionkey, r_name, r_comment, _file, _pos
+     predicates: r_name = 'AMERICA' AND r_regionkey IS NOT NULL

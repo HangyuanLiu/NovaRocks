@@ -1,0 +1,48 @@
+Explain String
+Planning: 49.7ms / Execution: 90.5ms / Rows: 4
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+14:TOP-N (limit=100) [i_product_name ASC NULLS FIRST] stats={rows=100 conf=estimated} act={rows=8 time=21.4us peak=30.0KB}
+  13:HASH AGGREGATE (SINGLE, group by: [i_product_name]) stats={rows=1185 conf=estimated} act={rows=12 time=21.2us peak=650.5KB}
+    12:GATHER stats={rows=1185 conf=estimated} act={rows=4 time=5.8us peak=0B}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 12
+    PARTITION: UNPARTITIONED
+11:PROJECT [i1.i_product_name AS i_product_name] stats={rows=1185 conf=estimated} act={rows=4 time=7.4us peak=1.1KB}
+  10:FILTER stats={rows=1185 conf=estimated}
+    predicate: __scalar_sq_0 > 0
+    9:PROJECT [i1.i_product_name AS i_product_name, ifnull(item_cnt, 0) AS __scalar_sq_0] stats={rows=2369 conf=estimated} act={rows=243 time=38.8us peak=23.1KB}
+      8:HASH JOIN (BROADCAST, LEFT OUTER, eq: [i1.i_manufact = item.i_manufact]) stats={rows=2369 conf=estimated} act={rows=269 time=59.0us peak=220.4KB}
+        1:SCAN tpcds.item (alias=i1) stats={rows=2369 conf=estimated} act={rows=239 time=3.3us peak=0B}
+             TABLE: tpcds.item
+             columns: i_manufact, i_product_name, i_manufact_id
+             min-max stats
+             predicates: i1.i_manufact_id BETWEEN 738 AND 738 + 40
+        7:GATHER stats={rows=989 conf=estimated} act={rows=30 time=22.1us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 7
+    PARTITION: UNPARTITIONED
+6:PROJECT [count(*) AS item_cnt, item.i_manufact AS i_manufact] stats={rows=989 conf=estimated} act={rows=10 time=36.7us peak=198.4KB}
+  5:HASH AGGREGATE (GLOBAL, group by: [item.i_manufact]) stats={rows=989 conf=estimated} act={rows=20 time=31.8us peak=897.5KB}
+    aggregations: count()
+    4:HASH EXCHANGE stats={rows=989 conf=estimated} act={rows=10 time=5.9us peak=0B}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 4
+    PARTITION: HASH_PARTITIONED (item.i_manufact)
+3:HASH AGGREGATE (LOCAL, group by: [i_manufact]) stats={rows=989 conf=estimated} act={rows=20 time=124.1us peak=566.3KB}
+  aggregations: count()
+  2:SCAN tpcds.item stats={rows=11602 conf=estimated} act={rows=10 time=3.3us peak=0B}
+       TABLE: tpcds.item
+       columns: i_manufact, i_category, i_size, i_color, i_units
+       min-max stats
+       predicates: i_category = 'Women' AND i_color = 'powder' OR i_color = 'khaki' AND i_units = 'Ounce' OR i_units = 'Oz' AND i_size = 'medium' OR i_size = 'extra large' OR i_category = 'Women' AND i_color = 'brown' OR i_color = 'honeydew' AND i_units = 'Bunch' OR i_units = 'Ton' AND i_size = 'N/A' OR i_size = 'small' OR i_category = 'Men' AND i_color = 'floral' OR i_color = 'deep' AND i_units = 'N/A' OR i_units = 'Dozen' AND i_size = 'petite' OR i_size = 'large' OR i_size = 'medium' OR i_size = 'extra large' AND i_category = 'Men' AND i_color = 'light' OR i_color = 'cornflower' AND i_units = 'Box' OR i_units = 'Pound' OR i_size = 'medium' OR i_size = 'extra large' AND i_category = 'Women' AND i_color = 'midnight' OR i_color = 'snow' AND i_units = 'Pallet' OR i_units = 'Gross' OR i_size = 'N/A' OR i_size = 'small' AND i_category = 'Women' AND i_color = 'cyan' OR i_color = 'papaya' AND i_units = 'Cup' OR i_units = 'Dram' OR i_size = 'petite' OR i_size = 'large' AND i_category = 'Men' AND i_color = 'orange' OR i_color = 'frosted' AND i_units = 'Each' OR i_units = 'Tbl' OR i_size = 'medium' OR i_size = 'extra large' AND i_category = 'Men' AND i_color = 'forest' OR i_color = 'ghost' AND i_units = 'Lb' OR i_units = 'Bundle'

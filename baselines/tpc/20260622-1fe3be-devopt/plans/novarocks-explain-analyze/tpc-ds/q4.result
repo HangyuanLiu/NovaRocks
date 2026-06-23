@@ -1,0 +1,339 @@
+Explain String
+Planning: 480.7ms / Execution: 8.67s / Rows: 8
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+101:MERGING-EXCHANGE stats={rows=100 conf=estimated} act={rows=24 time=23.6us peak=1.6KB}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 101
+    PARTITION: UNPARTITIONED
+100:LOCAL TOP-N (limit=100, offset=0) [t_s_secyear.customer_id ASC NULLS FIRST, t_s_secyear.customer_first_name ASC NULLS FIRST, t_s_secyear.customer_last_name ASC NULLS FIRST, t_s_secyear.customer_preferred_cust_flag ASC NULLS FIRST] stats={rows=100 conf=estimated} act={rows=16 time=51.2us peak=2.6KB}
+  99:PROJECT [t_s_secyear.customer_id AS customer_id, t_s_secyear.customer_first_name AS customer_first_name, t_s_secyear.customer_last_name AS customer_last_name, t_s_secyear.customer_preferred_cust_flag AS customer_preferred_cust_flag] stats={rows=145 conf=estimated} act={rows=8 time=355.2us peak=3.7KB}
+    98:HASH JOIN (BROADCAST, INNER, eq: [t_w_firstyear.customer_id = t_s_firstyear.customer_id]) stats={rows=145 conf=estimated} act={rows=60 time=276.4us peak=765.5KB}
+      other: CASE WHEN t_c_firstyear.year_total > 0 THEN t_c_secyear.year_total / t_c_firstyear.year_total ELSE NULL END > CASE WHEN t_w_firstyear.year_total > 0 THEN t_w_secyear.year_total / t_w_firstyear.year_total ELSE NULL END
+      build runtime filters:
+      - filter_id = 10, build_expr = (t_s_firstyear.customer_id)
+      38:FILTER stats={rows=2980 conf=estimated}
+        predicate: t_w_firstyear.customer_id IS NOT NULL
+        37:FILTER stats={rows=3311 conf=estimated}
+          predicate: t_w_firstyear.sale_type = 'w' AND t_w_firstyear.dyear = 2001 AND t_w_firstyear.year_total > 0
+          36:EXCHANGE stats={rows=4749109 conf=estimated} act={rows=395532 time=3.9ms peak=7.2MB}
+      97:GATHER stats={rows=289 conf=estimated} act={rows=52 time=20.6us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 97
+    PARTITION: UNPARTITIONED
+96:HASH JOIN (BROADCAST, INNER, eq: [t_w_secyear.customer_id = t_s_firstyear.customer_id]) stats={rows=289 conf=estimated} act={rows=573 time=427.5us peak=1.3MB}
+  build runtime filters:
+  - filter_id = 9, build_expr = (t_s_firstyear.customer_id)
+  41:FILTER stats={rows=534275 conf=estimated}
+    predicate: t_w_secyear.customer_id IS NOT NULL
+    40:FILTER stats={rows=593639 conf=estimated}
+      predicate: t_w_secyear.sale_type = 'w' AND 2001 + 1 = t_w_secyear.dyear
+      39:EXCHANGE stats={rows=4749109 conf=estimated} act={rows=395460 time=3.1ms peak=7.2MB}
+  95:GATHER stats={rows=146 conf=estimated} act={rows=521 time=124.4us peak=0B}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 95
+    PARTITION: UNPARTITIONED
+94:HASH JOIN (BROADCAST, INNER, eq: [t_c_firstyear.customer_id = t_s_firstyear.customer_id]) stats={rows=146 conf=estimated} act={rows=4427 time=1.8ms peak=3.5MB}
+  other: CASE WHEN t_c_firstyear.year_total > 0 THEN t_c_secyear.year_total / t_c_firstyear.year_total ELSE NULL END > CASE WHEN t_s_firstyear.year_total > 0 THEN t_s_secyear.year_total / t_s_firstyear.year_total ELSE NULL END
+  build runtime filters:
+  - filter_id = 8, build_expr = (t_s_firstyear.customer_id)
+  44:FILTER stats={rows=2980 conf=estimated}
+    predicate: t_c_firstyear.customer_id IS NOT NULL
+    43:FILTER stats={rows=3311 conf=estimated}
+      predicate: t_c_firstyear.sale_type = 'c' AND t_c_firstyear.dyear = 2001 AND t_c_firstyear.year_total > 0
+      42:EXCHANGE stats={rows=4749109 conf=estimated} act={rows=410522 time=4.6ms peak=7.1MB}
+  93:GATHER stats={rows=292 conf=estimated} act={rows=3906 time=10.9us peak=0B}
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 93
+    PARTITION: UNPARTITIONED
+92:HASH JOIN (BROADCAST, INNER, eq: [t_c_secyear.customer_id = t_s_firstyear.customer_id]) stats={rows=292 conf=estimated} act={rows=18373 time=5.5ms peak=7.3MB}
+  build runtime filters:
+  - filter_id = 7, build_expr = (t_s_firstyear.customer_id)
+  47:FILTER stats={rows=534275 conf=estimated}
+    predicate: t_c_secyear.customer_id IS NOT NULL
+    46:FILTER stats={rows=593639 conf=estimated}
+      predicate: t_c_secyear.sale_type = 'c' AND 2001 + 1 = t_c_secyear.dyear
+      45:EXCHANGE stats={rows=4749109 conf=estimated} act={rows=411385 time=4.0ms peak=7.2MB}
+  91:GATHER stats={rows=148 conf=estimated} act={rows=14467 time=6.0us peak=0B}
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 91
+    PARTITION: UNPARTITIONED
+90:HASH JOIN (BROADCAST, INNER, eq: [t_s_secyear.customer_id = t_s_firstyear.customer_id]) stats={rows=148 conf=estimated} act={rows=52390 time=18.4ms peak=10.4MB}
+  build runtime filters:
+  - filter_id = 6, build_expr = (t_s_firstyear.customer_id)
+  50:FILTER stats={rows=534275 conf=estimated}
+    predicate: t_s_secyear.customer_id IS NOT NULL
+    49:FILTER stats={rows=593639 conf=estimated}
+      predicate: t_s_secyear.sale_type = 's' AND t_s_secyear.dyear = 2001 + 1
+      48:EXCHANGE stats={rows=4749109 conf=estimated} act={rows=422383 time=4.1ms peak=7.2MB}
+  89:GATHER stats={rows=75 conf=estimated} act={rows=37923 time=9.4us peak=0B}
+PLAN FRAGMENT 6
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 89
+    PARTITION: UNPARTITIONED
+88:FILTER stats={rows=75 conf=estimated}
+  predicate: t_s_firstyear.customer_id IS NOT NULL
+  87:FILTER stats={rows=83 conf=estimated}
+    predicate: t_s_firstyear.customer_id IS NOT NULL
+    86:FILTER stats={rows=92 conf=estimated}
+      predicate: t_s_firstyear.customer_id IS NOT NULL
+      85:FILTER stats={rows=102 conf=estimated}
+        predicate: t_s_firstyear.customer_id IS NOT NULL
+        84:FILTER stats={rows=114 conf=estimated}
+          predicate: t_s_firstyear.customer_id IS NOT NULL
+          83:FILTER stats={rows=126 conf=estimated}
+            predicate: t_s_firstyear.customer_id IS NOT NULL
+            82:FILTER stats={rows=140 conf=estimated}
+              predicate: t_s_firstyear.customer_id IS NOT NULL
+              81:FILTER stats={rows=156 conf=estimated}
+                predicate: t_s_firstyear.customer_id IS NOT NULL
+                80:FILTER stats={rows=173 conf=estimated}
+                  predicate: t_s_firstyear.customer_id IS NOT NULL
+                  79:FILTER stats={rows=193 conf=estimated}
+                    predicate: t_s_firstyear.customer_id IS NOT NULL
+                    78:FILTER stats={rows=214 conf=estimated}
+                      predicate: t_s_firstyear.customer_id IS NOT NULL
+                      77:FILTER stats={rows=238 conf=estimated}
+                        predicate: t_s_firstyear.customer_id IS NOT NULL
+                        76:FILTER stats={rows=264 conf=estimated}
+                          predicate: t_s_firstyear.customer_id IS NOT NULL
+                          75:FILTER stats={rows=293 conf=estimated}
+                            predicate: t_s_firstyear.customer_id IS NOT NULL
+                            74:FILTER stats={rows=326 conf=estimated}
+                              predicate: t_s_firstyear.customer_id IS NOT NULL
+                              73:FILTER stats={rows=362 conf=estimated}
+                                predicate: t_s_firstyear.customer_id IS NOT NULL
+                                72:FILTER stats={rows=403 conf=estimated}
+                                  predicate: t_s_firstyear.customer_id IS NOT NULL
+                                  71:FILTER stats={rows=447 conf=estimated}
+                                    predicate: t_s_firstyear.customer_id IS NOT NULL
+                                    70:FILTER stats={rows=497 conf=estimated}
+                                      predicate: t_s_firstyear.customer_id IS NOT NULL
+                                      69:FILTER stats={rows=552 conf=estimated}
+                                        predicate: t_s_firstyear.customer_id IS NOT NULL
+                                        68:FILTER stats={rows=614 conf=estimated}
+                                          predicate: t_s_firstyear.customer_id IS NOT NULL
+                                          67:FILTER stats={rows=682 conf=estimated}
+                                            predicate: t_s_firstyear.customer_id IS NOT NULL
+                                            66:FILTER stats={rows=758 conf=estimated}
+                                              predicate: t_s_firstyear.customer_id IS NOT NULL
+                                              65:FILTER stats={rows=842 conf=estimated}
+                                                predicate: t_s_firstyear.customer_id IS NOT NULL
+                                                64:FILTER stats={rows=935 conf=estimated}
+                                                  predicate: t_s_firstyear.customer_id IS NOT NULL
+                                                  63:FILTER stats={rows=1039 conf=estimated}
+                                                    predicate: t_s_firstyear.customer_id IS NOT NULL
+                                                    62:FILTER stats={rows=1155 conf=estimated}
+                                                      predicate: t_s_firstyear.customer_id IS NOT NULL
+                                                      61:FILTER stats={rows=1283 conf=estimated}
+                                                        predicate: t_s_firstyear.customer_id IS NOT NULL
+                                                        60:FILTER stats={rows=1425 conf=estimated}
+                                                          predicate: t_s_firstyear.customer_id IS NOT NULL
+                                                          59:FILTER stats={rows=1584 conf=estimated}
+                                                            predicate: t_s_firstyear.customer_id IS NOT NULL
+                                                            58:FILTER stats={rows=1760 conf=estimated}
+                                                              predicate: t_s_firstyear.customer_id IS NOT NULL
+                                                              57:FILTER stats={rows=1955 conf=estimated}
+                                                                predicate: t_s_firstyear.customer_id IS NOT NULL
+                                                                56:FILTER stats={rows=2173 conf=estimated}
+                                                                  predicate: t_s_firstyear.customer_id IS NOT NULL
+                                                                  55:FILTER stats={rows=2414 conf=estimated}
+                                                                    predicate: t_s_firstyear.customer_id IS NOT NULL
+                                                                    54:FILTER stats={rows=2682 conf=estimated}
+                                                                      predicate: t_s_firstyear.customer_id IS NOT NULL
+                                                                      53:FILTER stats={rows=2980 conf=estimated}
+                                                                        predicate: t_s_firstyear.customer_id IS NOT NULL
+                                                                        52:FILTER stats={rows=3311 conf=estimated}
+                                                                          predicate: t_s_firstyear.sale_type = 's' AND t_s_firstyear.dyear = 2001 AND t_s_firstyear.year_total > 0
+                                                                          51:EXCHANGE stats={rows=4749109 conf=estimated} act={rows=422131 time=100.8ms peak=10.4MB}
+PLAN FRAGMENT 7
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 36
+    PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 39
+    PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 42
+    PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 45
+    PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 48
+    PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 51
+    PARTITION: UNPARTITIONED
+35:UNION ALL stats={rows=4749109 conf=estimated} act={rows=768416 time=21.5ms peak=148.0MB}
+  23:UNION ALL stats={rows=4030081 conf=estimated} act={rows=655118 time=459.5us peak=94.3MB}
+    11:PROJECT [c_customer_id AS customer_id, c_first_name AS customer_first_name, c_last_name AS customer_last_name, c_preferred_cust_flag AS customer_preferred_cust_flag, c_birth_country AS customer_birth_country, c_login AS customer_login, c_email_address AS customer_email_address, d_year AS dyear, sum((Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: BinaryOp { left: TypedExpr { kind: ColumnRef { column_id: c38, qualifier: None, column: "ss_ext_list_price" }, data_type: Decimal128(7, 2), nullable: true }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c37, qualifier: None, column: "ss_ext_wholesale_cost" }, data_type: Decimal128(7, 2), nullable: true } }, data_type: Decimal128(8, 2), nullable: true }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c35, qualifier: None, column: "ss_ext_discount_amt" }, data_type: Decimal128(7, 2), nullable: true } }, data_type: Decimal128(9, 2), nullable: true }), data_type: Decimal128(9, 2), nullable: true }, op: Add, right: TypedExpr { kind: ColumnRef { column_id: c36, qualifier: None, column: "ss_ext_sales_price" }, data_type: Decimal128(7, 2), nullable: true } }, data_type: Decimal128(10, 2), nullable: true })) / 2) AS year_total, 's' AS sale_type] stats={rows=2602707 conf=estimated} act={rows=190581 time=294.7us peak=24.3MB}
+      10:HASH AGGREGATE (GLOBAL, group by: [customer_id, customer_first_name, customer_last_name, customer_preferred_cust_flag, customer_birth_country, customer_login, customer_email_address, dyear]) stats={rows=2602707 conf=estimated} act={rows=419364 time=12.1ms peak=43.2MB}
+        aggregations: sum(ss_ext_list_price - ss_ext_wholesale_cost - ss_ext_discount_amt + ss_ext_sales_price / 2)
+        9:HASH EXCHANGE stats={rows=2602707 conf=estimated} act={rows=228783 time=13.2us peak=0B}
+    22:PROJECT [c_customer_id AS customer_id, c_first_name AS customer_first_name, c_last_name AS customer_last_name, c_preferred_cust_flag AS customer_preferred_cust_flag, c_birth_country AS customer_birth_country, c_login AS customer_login, c_email_address AS customer_email_address, d_year AS dyear, sum(Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: BinaryOp { left: TypedExpr { kind: ColumnRef { column_id: c123, qualifier: None, column: "cs_ext_list_price" }, data_type: Decimal128(7, 2), nullable: true }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c122, qualifier: None, column: "cs_ext_wholesale_cost" }, data_type: Decimal128(7, 2), nullable: true } }, data_type: Decimal128(8, 2), nullable: true }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c120, qualifier: None, column: "cs_ext_discount_amt" }, data_type: Decimal128(7, 2), nullable: true } }, data_type: Decimal128(9, 2), nullable: true }), data_type: Decimal128(9, 2), nullable: true }, op: Add, right: TypedExpr { kind: ColumnRef { column_id: c121, qualifier: None, column: "cs_ext_sales_price" }, data_type: Decimal128(7, 2), nullable: true } }, data_type: Decimal128(10, 2), nullable: true }), data_type: Decimal128(10, 2), nullable: true }, op: Div, right: TypedExpr { kind: Literal(Int(2)), data_type: Int64, nullable: false } }, data_type: Decimal128(38, 8), nullable: true })) AS year_total, 'c' AS sale_type] stats={rows=1427374 conf=estimated} act={rows=136978 time=606.1us peak=21.2MB}
+      21:HASH AGGREGATE (GLOBAL, group by: [customer_id, customer_first_name, customer_last_name, customer_preferred_cust_flag, customer_birth_country, customer_login, customer_email_address, dyear]) stats={rows=1427374 conf=estimated} act={rows=293697 time=25.8ms peak=30.6MB}
+        aggregations: sum(cs_ext_list_price - cs_ext_wholesale_cost - cs_ext_discount_amt + cs_ext_sales_price / 2)
+        20:HASH EXCHANGE stats={rows=1427374 conf=estimated} act={rows=156719 time=21.6us peak=0B}
+  34:PROJECT [c_customer_id AS customer_id, c_first_name AS customer_first_name, c_last_name AS customer_last_name, c_preferred_cust_flag AS customer_preferred_cust_flag, c_birth_country AS customer_birth_country, c_login AS customer_login, c_email_address AS customer_email_address, d_year AS dyear, sum(Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: BinaryOp { left: TypedExpr { kind: ColumnRef { column_id: c221, qualifier: None, column: "ws_ext_list_price" }, data_type: Decimal128(7, 2), nullable: true }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c220, qualifier: None, column: "ws_ext_wholesale_cost" }, data_type: Decimal128(7, 2), nullable: true } }, data_type: Decimal128(8, 2), nullable: true }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c218, qualifier: None, column: "ws_ext_discount_amt" }, data_type: Decimal128(7, 2), nullable: true } }, data_type: Decimal128(9, 2), nullable: true }), data_type: Decimal128(9, 2), nullable: true }, op: Add, right: TypedExpr { kind: ColumnRef { column_id: c219, qualifier: None, column: "ws_ext_sales_price" }, data_type: Decimal128(7, 2), nullable: true } }, data_type: Decimal128(10, 2), nullable: true }), data_type: Decimal128(10, 2), nullable: true }, op: Div, right: TypedExpr { kind: Literal(Int(2)), data_type: Int64, nullable: false } }, data_type: Decimal128(38, 8), nullable: true })) AS year_total, 'w' AS sale_type] stats={rows=719028 conf=estimated} act={rows=56649 time=370.2us peak=8.5MB}
+    33:HASH AGGREGATE (GLOBAL, group by: [customer_id, customer_first_name, customer_last_name, customer_preferred_cust_flag, customer_birth_country, customer_login, customer_email_address, dyear]) stats={rows=719028 conf=estimated} act={rows=117812 time=16.1ms peak=12.3MB}
+      aggregations: sum(ws_ext_list_price - ws_ext_wholesale_cost - ws_ext_discount_amt + ws_ext_sales_price / 2)
+      32:HASH EXCHANGE stats={rows=719028 conf=estimated} act={rows=61163 time=8.5us peak=0B}
+PLAN FRAGMENT 8
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 32
+    PARTITION: HASH_PARTITIONED (customer_id, customer_first_name, customer_last_name, customer_preferred_cust_flag, customer_birth_country, customer_login, customer_email_address, dyear)
+31:HASH AGGREGATE (LOCAL, group by: [customer_id, customer_first_name, customer_last_name, customer_preferred_cust_flag, customer_birth_country, customer_login, customer_email_address, dyear]) stats={rows=719028 conf=estimated} act={rows=780282 time=242.9ms peak=28.7MB}
+  aggregations: sum(ws_ext_list_price - ws_ext_wholesale_cost - ws_ext_discount_amt + ws_ext_sales_price / 2)
+  30:HASH JOIN (BROADCAST, INNER, eq: [ws_sold_date_sk = d_date_sk]) stats={rows=719028 conf=estimated} act={rows=938266 time=123.5ms peak=43.4MB}
+    build runtime filters:
+    - filter_id = 5, build_expr = (d_date_sk)
+    27:HASH JOIN (BROADCAST, INNER, eq: [ws_bill_customer_sk = c_customer_sk]) stats={rows=719028 conf=estimated} act={rows=1019119 time=115.9ms peak=93.8MB}
+      build runtime filters:
+      - filter_id = 4, build_expr = (c_customer_sk)
+      24:SCAN tpcds.web_sales stats={rows=719028 conf=estimated} act={rows=719119 time=58.5ms peak=0B}
+           TABLE: tpcds.web_sales
+           columns: ws_sold_date_sk, ws_bill_customer_sk, ws_ext_discount_amt, ws_ext_sales_price, ws_ext_wholesale_cost, ws_ext_list_price
+           min-max stats
+           predicates: ws_bill_customer_sk IS NOT NULL AND ws_sold_date_sk IS NOT NULL
+          probe runtime filters:
+          - filter_id = 4, probe_expr = (ws_bill_customer_sk)
+          - filter_id = 5, probe_expr = (ws_sold_date_sk)
+      26:GATHER stats={rows=90000 conf=estimated} act={rows=300000 time=1.1ms peak=0B}
+    29:GATHER stats={rows=65744 conf=estimated} act={rows=219147 time=565.5us peak=0B}
+PLAN FRAGMENT 9
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 29
+    PARTITION: UNPARTITIONED
+28:SCAN tpcds.date_dim stats={rows=65744 conf=estimated} act={rows=73049 time=20.1ms peak=27.1MB}
+     TABLE: tpcds.date_dim
+     columns: d_date_sk, d_year
+     min-max stats
+     predicates: d_date_sk IS NOT NULL
+PLAN FRAGMENT 10
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 26
+    PARTITION: UNPARTITIONED
+25:SCAN tpcds.customer stats={rows=90000 conf=estimated} act={rows=100000 time=18.0ms peak=42.4MB}
+     TABLE: tpcds.customer
+     columns: c_customer_sk, c_customer_id, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_country, c_login, c_email_address
+     min-max stats
+     predicates: c_customer_sk IS NOT NULL
+PLAN FRAGMENT 11
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 20
+    PARTITION: HASH_PARTITIONED (customer_id, customer_first_name, customer_last_name, customer_preferred_cust_flag, customer_birth_country, customer_login, customer_email_address, dyear)
+19:HASH AGGREGATE (LOCAL, group by: [customer_id, customer_first_name, customer_last_name, customer_preferred_cust_flag, customer_birth_country, customer_login, customer_email_address, dyear]) stats={rows=1427374 conf=estimated} act={rows=1587658 time=590.2ms peak=65.2MB}
+  aggregations: sum(cs_ext_list_price - cs_ext_wholesale_cost - cs_ext_discount_amt + cs_ext_sales_price / 2)
+  18:HASH JOIN (BROADCAST, INNER, eq: [cs_sold_date_sk = d_date_sk]) stats={rows=1427374 conf=estimated} act={rows=1650086 time=116.8ms peak=44.1MB}
+    build runtime filters:
+    - filter_id = 3, build_expr = (d_date_sk)
+    15:HASH JOIN (BROADCAST, INNER, eq: [cs_bill_customer_sk = c_customer_sk]) stats={rows=1427374 conf=estimated} act={rows=1730939 time=170.1ms peak=90.0MB}
+      build runtime filters:
+      - filter_id = 2, build_expr = (c_customer_sk)
+      12:SCAN tpcds.catalog_sales stats={rows=1427374 conf=estimated} act={rows=1430939 time=48.4ms peak=0B}
+           TABLE: tpcds.catalog_sales
+           columns: cs_sold_date_sk, cs_bill_customer_sk, cs_ext_discount_amt, cs_ext_sales_price, cs_ext_wholesale_cost, cs_ext_list_price
+           min-max stats
+           predicates: cs_bill_customer_sk IS NOT NULL AND cs_sold_date_sk IS NOT NULL
+          probe runtime filters:
+          - filter_id = 2, probe_expr = (cs_bill_customer_sk)
+          - filter_id = 3, probe_expr = (cs_sold_date_sk)
+      14:GATHER stats={rows=90000 conf=estimated} act={rows=300000 time=13.3ms peak=0B}
+    17:GATHER stats={rows=65744 conf=estimated} act={rows=219147 time=1.3ms peak=0B}
+PLAN FRAGMENT 12
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 17
+    PARTITION: UNPARTITIONED
+16:SCAN tpcds.date_dim stats={rows=65744 conf=estimated} act={rows=73049 time=24.6ms peak=15.7MB}
+     TABLE: tpcds.date_dim
+     columns: d_date_sk, d_year
+     min-max stats
+     predicates: d_date_sk IS NOT NULL
+PLAN FRAGMENT 13
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 14
+    PARTITION: UNPARTITIONED
+13:SCAN tpcds.customer stats={rows=90000 conf=estimated} act={rows=100000 time=21.5us peak=43.4MB}
+     TABLE: tpcds.customer
+     columns: c_customer_sk, c_customer_id, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_country, c_login, c_email_address
+     min-max stats
+     predicates: c_customer_sk IS NOT NULL
+PLAN FRAGMENT 14
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 9
+    PARTITION: HASH_PARTITIONED (customer_id, customer_first_name, customer_last_name, customer_preferred_cust_flag, customer_birth_country, customer_login, customer_email_address, dyear)
+8:HASH AGGREGATE (LOCAL, group by: [customer_id, customer_first_name, customer_last_name, customer_preferred_cust_flag, customer_birth_country, customer_login, customer_email_address, dyear]) stats={rows=2602707 conf=estimated} act={rows=2914236 time=770.5ms peak=95.7MB}
+  aggregations: sum(ss_ext_list_price - ss_ext_wholesale_cost - ss_ext_discount_amt + ss_ext_sales_price / 2)
+  7:HASH JOIN (BROADCAST, INNER, eq: [ss_sold_date_sk = d_date_sk]) stats={rows=2602707 conf=estimated} act={rows=2904600 time=217.3ms peak=44.1MB}
+    build runtime filters:
+    - filter_id = 1, build_expr = (d_date_sk)
+    4:HASH JOIN (BROADCAST, INNER, eq: [ss_customer_sk = c_customer_sk]) stats={rows=2602707 conf=estimated} act={rows=2985453 time=278.7ms peak=90.7MB}
+      build runtime filters:
+      - filter_id = 0, build_expr = (c_customer_sk)
+      1:SCAN tpcds.store_sales stats={rows=2626419 conf=estimated} act={rows=2685453 time=100.8ms peak=0B}
+           TABLE: tpcds.store_sales
+           columns: ss_sold_date_sk, ss_customer_sk, ss_ext_discount_amt, ss_ext_sales_price, ss_ext_wholesale_cost, ss_ext_list_price
+           min-max stats
+           predicates: ss_customer_sk IS NOT NULL AND ss_sold_date_sk IS NOT NULL
+          probe runtime filters:
+          - filter_id = 0, probe_expr = (ss_customer_sk)
+          - filter_id = 1, probe_expr = (ss_sold_date_sk)
+      3:GATHER stats={rows=90000 conf=estimated} act={rows=300000 time=14.7us peak=0B}
+    6:GATHER stats={rows=65744 conf=estimated} act={rows=219147 time=59.3us peak=0B}
+PLAN FRAGMENT 15
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 6
+    PARTITION: UNPARTITIONED
+5:SCAN tpcds.date_dim stats={rows=65744 conf=estimated} act={rows=73049 time=10.5ms peak=24.1MB}
+     TABLE: tpcds.date_dim
+     columns: d_date_sk, d_year
+     min-max stats
+     predicates: d_date_sk IS NOT NULL
+PLAN FRAGMENT 16
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: UNPARTITIONED
+2:SCAN tpcds.customer stats={rows=90000 conf=estimated} act={rows=100000 time=943.6us peak=37.1MB}
+     TABLE: tpcds.customer
+     columns: c_customer_sk, c_customer_id, c_first_name, c_last_name, c_preferred_cust_flag, c_birth_country, c_login, c_email_address
+     min-max stats
+     predicates: c_customer_sk IS NOT NULL

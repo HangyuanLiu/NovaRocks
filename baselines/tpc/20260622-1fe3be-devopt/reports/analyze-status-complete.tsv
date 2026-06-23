@@ -1,0 +1,4 @@
+suite    status    wall_time_sec    log_path
+ssb    0    50.39    /Users/harbor/.codex/worktrees/4f87/NovaRocks/logs/baseline/20260622-231416-tpc-baseline/analyze-ssb.log
+tpc-ds    0    709.04    /Users/harbor/.codex/worktrees/4f87/NovaRocks/logs/baseline/20260622-231416-tpc-baseline/analyze-tpc-ds.log
+tpc-h    0    178.11    /Users/harbor/.codex/worktrees/4f87/NovaRocks/logs/baseline/20260622-231416-tpc-baseline/analyze-tpc-h.log

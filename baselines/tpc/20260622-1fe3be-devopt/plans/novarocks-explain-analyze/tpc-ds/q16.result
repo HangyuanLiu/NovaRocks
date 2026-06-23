@@ -1,0 +1,121 @@
+Explain String
+Planning: 409.0ms / Execution: 5.14s / Rows: 1
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+28:PROJECT [__nr_sel_0 AS order count, __nr_sel_1 AS total shipping cost, __nr_sel_2 AS total net profit] stats={rows=1 conf=estimated} act={rows=1 time=79.3us peak=8.0KB}
+  27:TOP-N (limit=100) [count(DISTINCT cs_order_number) ASC NULLS FIRST] stats={rows=1 conf=estimated} act={rows=1 time=25.3us peak=8.0KB}
+    26:PROJECT [count(DISTINCT cs_order_number) AS __nr_sel_0, sum(cs_ext_ship_cost) AS __nr_sel_1, sum(cs_net_profit) AS __nr_sel_2, count(DISTINCT cs_order_number)] stats={rows=1 conf=estimated} act={rows=1 time=62.4us peak=8.0KB}
+      25:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=280.2us peak=65.8KB}
+        aggregations: count(DISTINCT cs1.cs_order_number), sum(cs1.cs_ext_ship_cost), sum(cs1.cs_net_profit)
+        24:GATHER stats={rows=1 conf=estimated} act={rows=12 time=11.1us peak=0B}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 24
+    PARTITION: UNPARTITIONED
+23:HASH AGGREGATE (DISTINCT_LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=98.9us peak=897.8KB}
+  aggregations: count(DISTINCT cs1.cs_order_number), sum(cs1.cs_ext_ship_cost), sum(cs1.cs_net_profit)
+  22:HASH AGGREGATE (DISTINCT_GLOBAL, group by: [cs1.cs_order_number]) stats={rows=10 conf=fallback} act={rows=472 time=154.6us peak=781.6KB}
+    aggregations: sum(cs1.cs_ext_ship_cost), sum(cs1.cs_net_profit)
+    21:HASH EXCHANGE stats={rows=10 conf=fallback} act={rows=236 time=15.7us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 21
+    PARTITION: HASH_PARTITIONED (cs1.cs_order_number)
+20:HASH AGGREGATE (LOCAL, group by: [cs1.cs_order_number]) stats={rows=10 conf=fallback} act={rows=1069 time=1.0ms peak=977.7KB}
+  aggregations: sum(cs1.cs_ext_ship_cost), sum(cs1.cs_net_profit)
+  19:HASH JOIN (BROADCAST, LEFT ANTI, eq: [cs1.cs_order_number = cr1.cr_order_number]) stats={rows=44575 conf=fallback} act={rows=433034 time=147.9ms peak=15.1MB}
+    15:HASH JOIN (PARTITIONED, LEFT SEMI, eq: [cs1.cs_order_number = cs2.cs_order_number]) stats={rows=111438 conf=estimated} act={rows=1446228 time=185.0ms peak=43.5MB}
+      other: cs1.cs_warehouse_sk != cs2.cs_warehouse_sk
+      build runtime filters:
+      - filter_id = 3, build_expr = (cs2.cs_order_number)
+      11:HASH EXCHANGE stats={rows=148585 conf=estimated} act={rows=2343 time=33.8us peak=0B}
+      14:HASH EXCHANGE stats={rows=1297393 conf=estimated} act={rows=1441548 time=32.6us peak=0B}
+    18:GATHER stats={rows=144067 conf=estimated} act={rows=432201 time=13us peak=0B}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 18
+    PARTITION: UNPARTITIONED
+17:PROJECT [cr1.cr_order_number AS cr_order_number] stats={rows=144067 conf=estimated} act={rows=144067 time=406.4us peak=4.5MB}
+  16:SCAN tpcds.catalog_returns (alias=cr1) stats={rows=144067} act={rows=144067 time=4.7us peak=0B}
+       TABLE: tpcds.catalog_returns
+       columns: cr_order_number
+       min-max stats
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 14
+    PARTITION: HASH_PARTITIONED (cs_order_number)
+13:PROJECT [cs2.cs_warehouse_sk AS cs_warehouse_sk, cs2.cs_order_number AS cs_order_number] stats={rows=1297393 conf=estimated} act={rows=1441548 time=16.2ms peak=12.5MB}
+  12:SCAN tpcds.catalog_sales (alias=cs2) stats={rows=1297393 conf=estimated} act={rows=1441548 time=22.8us peak=0B}
+       TABLE: tpcds.catalog_sales
+       columns: cs_warehouse_sk, cs_order_number
+       min-max stats
+       predicates: cs2.cs_order_number IS NOT NULL
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 11
+    PARTITION: HASH_PARTITIONED (cs_order_number)
+10:HASH JOIN (BROADCAST, INNER, eq: [cs1.cs_call_center_sk = cc_call_center_sk]) stats={rows=148585 conf=estimated} act={rows=2361 time=3.1ms peak=2.6MB}
+  build runtime filters:
+  - filter_id = 2, build_expr = (cc_call_center_sk)
+  7:HASH JOIN (BROADCAST, INNER, eq: [cs1.cs_ship_addr_sk = ca_address_sk]) stats={rows=330188 conf=estimated} act={rows=9681 time=2.6ms peak=3.8MB}
+    build runtime filters:
+    - filter_id = 1, build_expr = (ca_address_sk)
+    4:HASH JOIN (BROADCAST, INNER, eq: [cs1.cs_ship_date_sk = d_date_sk]) stats={rows=1420222 conf=estimated} act={rows=11352 time=7.2ms peak=7.1MB}
+      build runtime filters:
+      - filter_id = 0, build_expr = (d_date_sk)
+      1:SCAN tpcds.catalog_sales (alias=cs1) stats={rows=1420222 conf=estimated} act={rows=452402 time=2.4ms peak=0B}
+           TABLE: tpcds.catalog_sales
+           columns: cs_ship_date_sk, cs_ship_addr_sk, cs_call_center_sk, cs_warehouse_sk, cs_order_number, cs_ext_ship_cost, cs_net_profit
+           min-max stats
+           predicates: cs1.cs_ship_date_sk IS NOT NULL AND cs1.cs_ship_addr_sk IS NOT NULL AND cs1.cs_call_center_sk IS NOT NULL
+          probe runtime filters:
+          - filter_id = 0, probe_expr = (cs1.cs_ship_date_sk)
+          - filter_id = 1, probe_expr = (cs1.cs_ship_addr_sk)
+          - filter_id = 2, probe_expr = (cs1.cs_call_center_sk)
+      3:GATHER stats={rows=16436 conf=estimated} act={rows=183 time=5.9us peak=0B}
+    6:GATHER stats={rows=11250 conf=estimated} act={rows=7338 time=18.2us peak=0B}
+  9:GATHER stats={rows=3 conf=estimated} act={rows=18 time=233.6us peak=0B}
+PLAN FRAGMENT 6
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 9
+    PARTITION: UNPARTITIONED
+8:SCAN tpcds.call_center stats={rows=3 conf=estimated} act={rows=6 time=24.1us peak=8.5KB}
+     TABLE: tpcds.call_center
+     columns: cc_call_center_sk, cc_county
+     min-max stats
+     predicates: cc_county IN ('Williamson County', 'Williamson County', 'Williamson County', 'Williamson County', 'Williamson County') AND cc_call_center_sk IS NOT NULL
+PLAN FRAGMENT 7
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 6
+    PARTITION: UNPARTITIONED
+5:SCAN tpcds.customer_address stats={rows=11250 conf=estimated} act={rows=2446 time=163.2us peak=1.3MB}
+     TABLE: tpcds.customer_address
+     columns: ca_address_sk, ca_state
+     min-max stats
+     predicates: ca_state = 'GA' AND ca_address_sk IS NOT NULL
+PLAN FRAGMENT 8
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: UNPARTITIONED
+2:SCAN tpcds.date_dim stats={rows=16436 conf=estimated} act={rows=61 time=40.8us peak=39.8KB}
+     TABLE: tpcds.date_dim
+     columns: d_date_sk, d_date
+     min-max stats
+     predicates: d_date BETWEEN CAST('2002-2-01' AS Date32) AND date_add(CAST('2002-2-01' AS Date32), 60) AND d_date_sk IS NOT NULL

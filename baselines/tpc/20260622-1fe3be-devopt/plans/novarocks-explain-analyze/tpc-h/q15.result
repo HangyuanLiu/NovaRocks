@@ -1,0 +1,220 @@
+Explain String
+Planning: 123.6ms / Execution: 327.6ms / Rows: 1
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+90:SORT BY [s_suppkey ASC NULLS FIRST] stats={rows=79 conf=estimated} act={rows=2 time=32.0us peak=1.6KB}
+  89:GATHER stats={rows=79 conf=estimated} act={rows=1 time=1.5us peak=0B}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 89
+    PARTITION: UNPARTITIONED
+88:PROJECT [s_suppkey, s_name, s_address, s_phone, total_revenue] stats={rows=79 conf=estimated} act={rows=1 time=9.7us peak=1.8KB}
+  87:PROJECT [s_suppkey, s_name, s_address, s_phone, total_revenue] stats={rows=79 conf=estimated} act={rows=1 time=15.6us peak=255B}
+    86:HASH JOIN (BROADCAST, INNER, eq: [total_revenue = max(total_revenue)]) stats={rows=79 conf=estimated} act={rows=4 time=46.4us peak=87.2KB}
+      build runtime filters:
+      - filter_id = 1, build_expr = (max(total_revenue))
+      42:HASH JOIN (BROADCAST, INNER, eq: [s_suppkey = supplier_no]) stats={rows=315 conf=estimated} act={rows=40000 time=1.5ms peak=2.7MB}
+        build runtime filters:
+        - filter_id = 0, build_expr = (supplier_no)
+        1:SCAN tpch.supplier stats={rows=9000 conf=estimated} act={rows=10000 time=4.8us peak=0B}
+             TABLE: tpch.supplier
+             columns: s_suppkey, s_name, s_address, s_phone
+             min-max stats
+             predicates: s_suppkey IS NOT NULL
+            probe runtime filters:
+            - filter_id = 0, probe_expr = (s_suppkey)
+        41:GATHER stats={rows=315 conf=estimated} act={rows=30000 time=6.5us peak=0B}
+      85:GATHER stats={rows=1 conf=estimated} act={rows=3 time=2.3us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 85
+    PARTITION: UNPARTITIONED
+84:PROJECT [max(b.total_revenue) AS max(total_revenue)] stats={rows=1 conf=estimated} act={rows=1 time=51.0us peak=1.6KB}
+  83:FILTER stats={rows=1 conf=fallback}
+    predicate: max(b.total_revenue) IS NOT NULL
+    82:FILTER stats={rows=1 conf=fallback}
+      predicate: max(b.total_revenue) IS NOT NULL
+      81:FILTER stats={rows=1 conf=fallback}
+        predicate: max(b.total_revenue) IS NOT NULL
+        80:FILTER stats={rows=1 conf=fallback}
+          predicate: max(b.total_revenue) IS NOT NULL
+          79:FILTER stats={rows=1 conf=fallback}
+            predicate: max(b.total_revenue) IS NOT NULL
+            78:FILTER stats={rows=1 conf=fallback}
+              predicate: max(b.total_revenue) IS NOT NULL
+              77:FILTER stats={rows=1 conf=fallback}
+                predicate: max(b.total_revenue) IS NOT NULL
+                76:FILTER stats={rows=1 conf=fallback}
+                  predicate: max(b.total_revenue) IS NOT NULL
+                  75:FILTER stats={rows=1 conf=fallback}
+                    predicate: max(b.total_revenue) IS NOT NULL
+                    74:FILTER stats={rows=1 conf=fallback}
+                      predicate: max(b.total_revenue) IS NOT NULL
+                      73:FILTER stats={rows=1 conf=fallback}
+                        predicate: max(b.total_revenue) IS NOT NULL
+                        72:FILTER stats={rows=1 conf=fallback}
+                          predicate: max(b.total_revenue) IS NOT NULL
+                          71:FILTER stats={rows=1 conf=fallback}
+                            predicate: max(b.total_revenue) IS NOT NULL
+                            70:FILTER stats={rows=1 conf=fallback}
+                              predicate: max(b.total_revenue) IS NOT NULL
+                              69:FILTER stats={rows=1 conf=fallback}
+                                predicate: max(b.total_revenue) IS NOT NULL
+                                68:FILTER stats={rows=1 conf=fallback}
+                                  predicate: max(b.total_revenue) IS NOT NULL
+                                  67:FILTER stats={rows=1 conf=fallback}
+                                    predicate: max(b.total_revenue) IS NOT NULL
+                                    66:FILTER stats={rows=1 conf=fallback}
+                                      predicate: max(b.total_revenue) IS NOT NULL
+                                      65:FILTER stats={rows=1 conf=fallback}
+                                        predicate: max(b.total_revenue) IS NOT NULL
+                                        64:FILTER stats={rows=1 conf=fallback}
+                                          predicate: max(b.total_revenue) IS NOT NULL
+                                          63:FILTER stats={rows=1 conf=fallback}
+                                            predicate: max(b.total_revenue) IS NOT NULL
+                                            62:FILTER stats={rows=1 conf=fallback}
+                                              predicate: max(b.total_revenue) IS NOT NULL
+                                              61:FILTER stats={rows=1 conf=fallback}
+                                                predicate: max(b.total_revenue) IS NOT NULL
+                                                60:FILTER stats={rows=1 conf=fallback}
+                                                  predicate: max(b.total_revenue) IS NOT NULL
+                                                  59:FILTER stats={rows=1 conf=fallback}
+                                                    predicate: max(b.total_revenue) IS NOT NULL
+                                                    58:FILTER stats={rows=1 conf=fallback}
+                                                      predicate: max(b.total_revenue) IS NOT NULL
+                                                      57:FILTER stats={rows=1 conf=fallback}
+                                                        predicate: max(b.total_revenue) IS NOT NULL
+                                                        56:FILTER stats={rows=1 conf=fallback}
+                                                          predicate: max(b.total_revenue) IS NOT NULL
+                                                          55:FILTER stats={rows=1 conf=fallback}
+                                                            predicate: max(b.total_revenue) IS NOT NULL
+                                                            54:FILTER stats={rows=1 conf=fallback}
+                                                              predicate: max(b.total_revenue) IS NOT NULL
+                                                              53:FILTER stats={rows=1 conf=fallback}
+                                                                predicate: max(b.total_revenue) IS NOT NULL
+                                                                52:FILTER stats={rows=1 conf=fallback}
+                                                                  predicate: max(b.total_revenue) IS NOT NULL
+                                                                  51:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=14 time=48.7us peak=64.6KB}
+                                                                    aggregations: max(b.total_revenue)
+                                                                    50:GATHER stats={rows=1 conf=estimated} act={rows=12 time=1.6us peak=0B}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 50
+    PARTITION: UNPARTITIONED
+49:HASH AGGREGATE (LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=676.3us peak=930.7KB}
+  aggregations: max(b.total_revenue)
+  48:PROJECT [total_revenue] stats={rows=10182 conf=estimated} act={rows=10000 time=10.9us peak=156.2KB}
+    47:PROJECT [sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c55, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) AS total_revenue] stats={rows=10182 conf=estimated} act={rows=10000 time=20.2us peak=204.2KB}
+      46:HASH AGGREGATE (GLOBAL, group by: [supplier_no]) stats={rows=10182 conf=estimated} act={rows=39959 time=242.4us peak=1014.4KB}
+        aggregations: sum(l_extendedprice * 1 - l_discount)
+        45:HASH EXCHANGE stats={rows=10182 conf=estimated} act={rows=29959 time=15.2us peak=0B}
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 45
+    PARTITION: HASH_PARTITIONED (supplier_no)
+44:HASH AGGREGATE (LOCAL, group by: [l_suppkey]) stats={rows=10182 conf=estimated} act={rows=260618 time=5.5ms peak=7.8MB}
+  aggregations: sum(l_extendedprice * 1 - l_discount)
+  43:SCAN tpch.lineitem stats={rows=1609580 conf=estimated} act={rows=230659 time=36.1us peak=0B}
+       TABLE: tpch.lineitem
+       columns: l_suppkey, l_extendedprice, l_discount, l_shipdate
+       min-max stats
+       predicates: l_shipdate >= 9312 AND l_shipdate < 9404
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 41
+    PARTITION: UNPARTITIONED
+40:PROJECT [supplier_no, total_revenue] stats={rows=315 conf=estimated} act={rows=10000 time=58.6us peak=1022.4KB}
+  39:PROJECT [l_suppkey AS supplier_no, sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c16, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) AS total_revenue] stats={rows=315 conf=estimated} act={rows=10000 time=35.2us peak=204.2KB}
+    38:FILTER stats={rows=315 conf=estimated}
+      predicate: sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c16, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) IS NOT NULL
+      37:FILTER stats={rows=350 conf=estimated}
+        predicate: sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c16, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) IS NOT NULL
+        36:FILTER stats={rows=388 conf=estimated}
+          predicate: sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c16, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) IS NOT NULL
+          35:FILTER stats={rows=432 conf=estimated}
+            predicate: sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c16, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) IS NOT NULL
+            34:FILTER stats={rows=480 conf=estimated}
+              predicate: sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c16, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) IS NOT NULL
+              33:FILTER stats={rows=533 conf=estimated}
+                predicate: sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c16, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) IS NOT NULL
+                32:FILTER stats={rows=592 conf=estimated}
+                  predicate: sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c16, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) IS NOT NULL
+                  31:FILTER stats={rows=658 conf=estimated}
+                    predicate: sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c16, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) IS NOT NULL
+                    30:FILTER stats={rows=731 conf=estimated}
+                      predicate: sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c16, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) IS NOT NULL
+                      29:FILTER stats={rows=812 conf=estimated}
+                        predicate: sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c16, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) IS NOT NULL
+                        28:FILTER stats={rows=902 conf=estimated}
+                          predicate: sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c16, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) IS NOT NULL
+                          27:FILTER stats={rows=1003 conf=estimated}
+                            predicate: sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c16, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) IS NOT NULL
+                            26:FILTER stats={rows=1114 conf=estimated}
+                              predicate: sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c16, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) IS NOT NULL
+                              25:FILTER stats={rows=1238 conf=estimated}
+                                predicate: sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c16, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) IS NOT NULL
+                                24:FILTER stats={rows=1375 conf=estimated}
+                                  predicate: sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c16, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) IS NOT NULL
+                                  23:FILTER stats={rows=1528 conf=estimated}
+                                    predicate: sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c16, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) IS NOT NULL
+                                    22:FILTER stats={rows=1698 conf=estimated}
+                                      predicate: sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c16, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) IS NOT NULL
+                                      21:FILTER stats={rows=1887 conf=estimated}
+                                        predicate: sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c16, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) IS NOT NULL
+                                        20:FILTER stats={rows=2096 conf=estimated}
+                                          predicate: sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c16, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) IS NOT NULL
+                                          19:FILTER stats={rows=2329 conf=estimated}
+                                            predicate: sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c16, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) IS NOT NULL
+                                            18:FILTER stats={rows=2588 conf=estimated}
+                                              predicate: sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c16, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) IS NOT NULL
+                                              17:FILTER stats={rows=2876 conf=estimated}
+                                                predicate: sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c16, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) IS NOT NULL
+                                                16:FILTER stats={rows=3195 conf=estimated}
+                                                  predicate: sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c16, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) IS NOT NULL
+                                                  15:FILTER stats={rows=3550 conf=estimated}
+                                                    predicate: sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c16, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) IS NOT NULL
+                                                    14:FILTER stats={rows=3945 conf=estimated}
+                                                      predicate: sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c16, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) IS NOT NULL
+                                                      13:FILTER stats={rows=4383 conf=estimated}
+                                                        predicate: sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c16, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) IS NOT NULL
+                                                        12:FILTER stats={rows=4870 conf=estimated}
+                                                          predicate: sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c16, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) IS NOT NULL
+                                                          11:FILTER stats={rows=5411 conf=estimated}
+                                                            predicate: sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c16, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) IS NOT NULL
+                                                            10:FILTER stats={rows=6012 conf=estimated}
+                                                              predicate: sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c16, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) IS NOT NULL
+                                                              9:FILTER stats={rows=6680 conf=estimated}
+                                                                predicate: sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c16, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) IS NOT NULL
+                                                                8:FILTER stats={rows=7423 conf=estimated}
+                                                                  predicate: supplier_no IS NOT NULL
+                                                                  7:FILTER stats={rows=8248 conf=estimated}
+                                                                    predicate: sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c16, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) IS NOT NULL
+                                                                    6:FILTER stats={rows=9164 conf=estimated}
+                                                                      predicate: sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c16, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) IS NOT NULL
+                                                                      5:HASH AGGREGATE (GLOBAL, group by: [supplier_no]) stats={rows=10182 conf=estimated} act={rows=49959 time=355.5us peak=1.2MB}
+                                                                        aggregations: sum(l_extendedprice * 1 - l_discount)
+                                                                        4:HASH EXCHANGE stats={rows=10182 conf=estimated} act={rows=29959 time=7.2us peak=0B}
+PLAN FRAGMENT 6
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 4
+    PARTITION: HASH_PARTITIONED (supplier_no)
+3:HASH AGGREGATE (LOCAL, group by: [l_suppkey]) stats={rows=10182 conf=estimated} act={rows=260618 time=5.0ms peak=7.8MB}
+  aggregations: sum(l_extendedprice * 1 - l_discount)
+  2:SCAN tpch.lineitem stats={rows=1448622 conf=estimated} act={rows=230659 time=12.6us peak=0B}
+       TABLE: tpch.lineitem
+       columns: l_suppkey, l_extendedprice, l_discount, l_shipdate
+       min-max stats
+       predicates: l_shipdate >= 9312 AND l_shipdate < 9404 AND l_suppkey IS NOT NULL

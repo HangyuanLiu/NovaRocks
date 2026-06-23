@@ -1,0 +1,65 @@
+Explain String
+Planning: 50.5ms / Execution: 1.34s / Rows: 100
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+15:PROJECT [__repeat_group.i_product_name AS i_product_name, __repeat_group.i_brand AS i_brand, __repeat_group.i_class AS i_class, __repeat_group.i_category AS i_category, avg(inv_quantity_on_hand) AS qoh] stats={rows=100 conf=estimated} act={rows=100 time=43.0us peak=6.6KB}
+  14:MERGING-EXCHANGE stats={rows=100 conf=estimated} act={rows=700 time=464.9us peak=36.8KB}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 14
+    PARTITION: UNPARTITIONED
+13:LOCAL TOP-N (limit=100, offset=0) [avg(inv_quantity_on_hand) ASC NULLS FIRST, __repeat_group.i_product_name ASC NULLS FIRST, __repeat_group.i_brand ASC NULLS FIRST, __repeat_group.i_class ASC NULLS FIRST, __repeat_group.i_category ASC NULLS FIRST] stats={rows=100 conf=estimated} act={rows=36268 time=2.0ms peak=5.0MB}
+  12:HASH AGGREGATE (GLOBAL, group by: [i_product_name, i_brand, i_class, i_category, __grouping_fn_0]) stats={rows=2099732 conf=estimated} act={rows=143872 time=2.6ms peak=6.7MB}
+    aggregations: avg(inv_quantity_on_hand)
+    11:HASH EXCHANGE stats={rows=2099732 conf=estimated} act={rows=107904 time=116.6us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 11
+    PARTITION: HASH_PARTITIONED (i_product_name, i_brand, i_class, i_category, __grouping_fn_0)
+10:HASH AGGREGATE (LOCAL, group by: [i_product_name, i_brand, i_class, i_category, __grouping_fn_0]) stats={rows=2099732 conf=estimated} act={rows=11807904 time=207.4ms peak=33.0MB}
+  aggregations: avg(inv_quantity_on_hand)
+  9:REPEAT (5 grouping sets) stats={rows=42532172 conf=estimated} act={rows=11700000 time=8.0ms peak=1.1MB}
+    8:PROJECT [i_product_name, i_brand, i_class, i_category, inv_quantity_on_hand, i_product_name AS __repeat_group_key_0, i_brand AS __repeat_group_key_1, i_class AS __repeat_group_key_2, i_category AS __repeat_group_key_3] stats={rows=8506434 conf=estimated} act={rows=2340000 time=13.4ms peak=8.2MB}
+      7:HASH JOIN (BROADCAST, INNER, eq: [inv_item_sk = i_item_sk]) stats={rows=8506434 conf=estimated} act={rows=2394000 time=35.3ms peak=19.9MB}
+        build runtime filters:
+        - filter_id = 1, build_expr = (i_item_sk)
+        4:HASH JOIN (BROADCAST, INNER, eq: [inv_date_sk = d_date_sk]) stats={rows=9513450 conf=estimated} act={rows=2341098 time=31.2ms peak=5.4MB}
+          build runtime filters:
+          - filter_id = 0, build_expr = (d_date_sk)
+          1:SCAN tpcds.inventory stats={rows=9513450 conf=estimated} act={rows=11745000 time=3.8ms peak=0B}
+               TABLE: tpcds.inventory
+               columns: inv_date_sk, inv_item_sk, inv_quantity_on_hand
+               min-max stats
+               predicates: inv_date_sk IS NOT NULL AND inv_item_sk IS NOT NULL
+              probe runtime filters:
+              - filter_id = 0, probe_expr = (inv_date_sk)
+              - filter_id = 1, probe_expr = (inv_item_sk)
+          3:GATHER stats={rows=16450 conf=estimated} act={rows=1098 time=7.9us peak=0B}
+        6:GATHER stats={rows=16200 conf=estimated} act={rows=54000 time=5.8us peak=0B}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 6
+    PARTITION: UNPARTITIONED
+5:SCAN tpcds.item stats={rows=16200 conf=estimated} act={rows=18000 time=577.7us peak=12.2MB}
+     TABLE: tpcds.item
+     columns: i_item_sk, i_brand, i_class, i_category, i_product_name
+     min-max stats
+     predicates: i_item_sk IS NOT NULL
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: UNPARTITIONED
+2:SCAN tpcds.date_dim stats={rows=16450 conf=estimated} act={rows=366 time=28.4us peak=222.0KB}
+     TABLE: tpcds.date_dim
+     columns: d_date_sk, d_month_seq
+     min-max stats
+     predicates: d_month_seq BETWEEN 1200 AND 1200 + 11 AND d_date_sk IS NOT NULL

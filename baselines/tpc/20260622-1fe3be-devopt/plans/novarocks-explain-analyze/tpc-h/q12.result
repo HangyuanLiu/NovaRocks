@@ -1,0 +1,48 @@
+Explain String
+Planning: 34.1ms / Execution: 1.77s / Rows: 2
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+11:SORT BY [l_shipmode ASC NULLS FIRST] stats={rows=7 conf=estimated} act={rows=4 time=64.6us peak=1.3KB}
+  10:GATHER stats={rows=7 conf=estimated} act={rows=2 time=2.8us peak=0B}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 10
+    PARTITION: UNPARTITIONED
+9:PROJECT [l_shipmode, sum(Case { operand: None, when_then: [(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: BinaryOp { left: TypedExpr { kind: ColumnRef { column_id: c6, qualifier: None, column: "o_orderpriority" }, data_type: Utf8, nullable: true }, op: Eq, right: TypedExpr { kind: Literal(String("1-URGENT")), data_type: Utf8, nullable: false } }, data_type: Boolean, nullable: true }, op: Or, right: TypedExpr { kind: BinaryOp { left: TypedExpr { kind: ColumnRef { column_id: c6, qualifier: None, column: "o_orderpriority" }, data_type: Utf8, nullable: true }, op: Eq, right: TypedExpr { kind: Literal(String("2-HIGH")), data_type: Utf8, nullable: false } }, data_type: Boolean, nullable: true } }, data_type: Boolean, nullable: true }, TypedExpr { kind: Cast { expr: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, target: Int64 }, data_type: Int64, nullable: true })], else_expr: Some(TypedExpr { kind: Cast { expr: TypedExpr { kind: Literal(Int(0)), data_type: Int64, nullable: false }, target: Int64 }, data_type: Int64, nullable: true }) }) AS high_line_count, sum(Case { operand: None, when_then: [(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: BinaryOp { left: TypedExpr { kind: ColumnRef { column_id: c6, qualifier: None, column: "o_orderpriority" }, data_type: Utf8, nullable: true }, op: Ne, right: TypedExpr { kind: Literal(String("1-URGENT")), data_type: Utf8, nullable: false } }, data_type: Boolean, nullable: true }, op: And, right: TypedExpr { kind: BinaryOp { left: TypedExpr { kind: ColumnRef { column_id: c6, qualifier: None, column: "o_orderpriority" }, data_type: Utf8, nullable: true }, op: Ne, right: TypedExpr { kind: Literal(String("2-HIGH")), data_type: Utf8, nullable: false } }, data_type: Boolean, nullable: true } }, data_type: Boolean, nullable: true }, TypedExpr { kind: Cast { expr: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, target: Int64 }, data_type: Int64, nullable: true })], else_expr: Some(TypedExpr { kind: Cast { expr: TypedExpr { kind: Literal(Int(0)), data_type: Int64, nullable: false }, target: Int64 }, data_type: Int64, nullable: true }) }) AS low_line_count] stats={rows=7 conf=estimated} act={rows=2 time=19.9us peak=86.0KB}
+  8:HASH AGGREGATE (GLOBAL, group by: [l_shipmode]) stats={rows=7 conf=estimated} act={rows=8 time=28.2us peak=256.9KB}
+    aggregations: sum(CASE WHEN o_orderpriority = '1-URGENT' OR o_orderpriority = '2-HIGH' THEN CAST(1 AS Int64) ELSE CAST(0 AS Int64) END), sum(CASE WHEN o_orderpriority != '1-URGENT' AND o_orderpriority != '2-HIGH' THEN CAST(1 AS Int64) ELSE CAST(0 AS Int64) END)
+    7:HASH EXCHANGE stats={rows=7 conf=estimated} act={rows=6 time=22us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 7
+    PARTITION: HASH_PARTITIONED (l_shipmode)
+6:HASH AGGREGATE (LOCAL, group by: [l_shipmode]) stats={rows=7 conf=estimated} act={rows=31301 time=12.6ms peak=904.6KB}
+  aggregations: sum(CASE WHEN o_orderpriority = '1-URGENT' OR o_orderpriority = '2-HIGH' THEN __cse_0 ELSE __cse_1 END), sum(CASE WHEN o_orderpriority != '1-URGENT' AND o_orderpriority != '2-HIGH' THEN __cse_0 ELSE __cse_1 END)
+  5:PROJECT [o_orderkey, o_orderpriority, l_orderkey, l_shipdate, l_commitdate, l_receiptdate, l_shipmode, CAST(1 AS Int64) AS __cse_0, CAST(0 AS Int64) AS __cse_1] stats={rows=94585 conf=estimated} act={rows=31295 time=50.2ms peak=26.3KB}
+    4:HASH JOIN (BROADCAST, INNER, eq: [o_orderkey = l_orderkey]) stats={rows=94585 conf=estimated} act={rows=125180 time=109.4ms peak=24.6MB}
+      build runtime filters:
+      - filter_id = 0, build_expr = (l_orderkey)
+      1:SCAN tpch.orders stats={rows=1350000 conf=estimated} act={rows=1500000 time=1.9ms peak=0B}
+           TABLE: tpch.orders
+           columns: o_orderkey, o_orderpriority
+           min-max stats
+           predicates: o_orderkey IS NOT NULL
+          probe runtime filters:
+          - filter_id = 0, probe_expr = (o_orderkey)
+      3:GATHER stats={rows=94585 conf=estimated} act={rows=93885 time=76.5us peak=0B}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: UNPARTITIONED
+2:SCAN tpch.lineitem stats={rows=94585 conf=estimated} act={rows=31295 time=2.2ms peak=3.0MB}
+     TABLE: tpch.lineitem
+     columns: l_orderkey, l_shipmode, l_shipdate, l_commitdate, l_receiptdate
+     min-max stats
+     predicates: l_shipmode IN ('REG AIR', 'MAIL') AND l_commitdate < l_receiptdate AND l_shipdate < l_commitdate AND l_receiptdate >= 9862 AND l_receiptdate < 10227 AND l_orderkey IS NOT NULL

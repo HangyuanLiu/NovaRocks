@@ -1,0 +1,312 @@
+Explain String
+Planning: 548.5ms / Execution: 7.77s / Rows: 10
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+123:MERGING-EXCHANGE stats={rows=100 conf=estimated} act={rows=30 time=56.8us peak=2.4KB}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 123
+    PARTITION: UNPARTITIONED
+122:LOCAL TOP-N (limit=100, offset=0) [asceding.rnk ASC NULLS FIRST] stats={rows=100 conf=estimated} act={rows=20 time=92us peak=3.8KB}
+  121:PROJECT [asceding.rnk AS rnk, i1.i_product_name AS best_performing, i2.i_product_name AS worst_performing] stats={rows=4898 conf=estimated} act={rows=10 time=122.8us peak=1.8KB}
+    120:HASH JOIN (BROADCAST, INNER, eq: [i2.i_item_sk = v21.item_sk]) stats={rows=4898 conf=fallback} act={rows=40 time=132.4us peak=1.5MB}
+      build runtime filters:
+      - filter_id = 2, build_expr = (v21.item_sk)
+      1:SCAN tpcds.item (alias=i2) stats={rows=16200 conf=estimated} act={rows=18000 time=3.7us peak=0B}
+           TABLE: tpcds.item
+           columns: i_item_sk, i_product_name
+           min-max stats
+           predicates: i2.i_item_sk IS NOT NULL
+          probe runtime filters:
+          - filter_id = 2, probe_expr = (i2.i_item_sk)
+      119:GATHER stats={rows=4898 conf=fallback} act={rows=30 time=8.5us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 119
+    PARTITION: UNPARTITIONED
+118:HASH JOIN (BROADCAST, INNER, eq: [i1.i_item_sk = v11.item_sk]) stats={rows=4898 conf=fallback} act={rows=40 time=232.1us peak=1.5MB}
+  build runtime filters:
+  - filter_id = 1, build_expr = (v11.item_sk)
+  2:SCAN tpcds.item (alias=i1) stats={rows=16200 conf=estimated} act={rows=18000 time=2.6us peak=0B}
+       TABLE: tpcds.item
+       columns: i_item_sk, i_product_name
+       min-max stats
+       predicates: i1.i_item_sk IS NOT NULL
+      probe runtime filters:
+      - filter_id = 1, probe_expr = (i1.i_item_sk)
+  117:GATHER stats={rows=4898 conf=fallback} act={rows=30 time=14.1us peak=0B}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 117
+    PARTITION: UNPARTITIONED
+116:HASH JOIN (BROADCAST, INNER, eq: [v11.rnk = v21.rnk]) stats={rows=4898 conf=fallback} act={rows=20 time=75.2us peak=5.1KB}
+  build runtime filters:
+  - filter_id = 0, build_expr = (v21.rnk)
+  58:PROJECT [item_sk, rnk] stats={rows=140 conf=estimated} act={rows=10 time=15.8us peak=120B}
+    57:PROJECT [v11.item_sk AS item_sk, v11.rnk AS rnk] stats={rows=140 conf=estimated} act={rows=10 time=16.2us peak=120B}
+      56:PROJECT [item_sk, rnk] stats={rows=140 conf=estimated} act={rows=10 time=17.7us peak=120B}
+        55:PROJECT [item_sk, rnk] stats={rows=140 conf=estimated} act={rows=10 time=33us peak=280B}
+          54:FILTER stats={rows=140 conf=estimated}
+            predicate: v11.item_sk IS NOT NULL
+            53:FILTER stats={rows=156 conf=estimated}
+              predicate: v11.item_sk IS NOT NULL
+              52:FILTER stats={rows=173 conf=estimated}
+                predicate: v11.item_sk IS NOT NULL
+                51:FILTER stats={rows=192 conf=estimated}
+                  predicate: v11.item_sk IS NOT NULL
+                  50:FILTER stats={rows=213 conf=estimated}
+                    predicate: v11.item_sk IS NOT NULL
+                    49:FILTER stats={rows=237 conf=estimated}
+                      predicate: v11.item_sk IS NOT NULL
+                      48:FILTER stats={rows=263 conf=estimated}
+                        predicate: v11.item_sk IS NOT NULL
+                        47:FILTER stats={rows=293 conf=estimated}
+                          predicate: v11.item_sk IS NOT NULL
+                          46:FILTER stats={rows=325 conf=estimated}
+                            predicate: v11.item_sk IS NOT NULL
+                            45:FILTER stats={rows=361 conf=estimated}
+                              predicate: v11.item_sk IS NOT NULL
+                              44:FILTER stats={rows=401 conf=estimated}
+                                predicate: v11.item_sk IS NOT NULL
+                                43:FILTER stats={rows=446 conf=estimated}
+                                  predicate: v11.item_sk IS NOT NULL
+                                  42:FILTER stats={rows=496 conf=estimated}
+                                    predicate: v11.item_sk IS NOT NULL
+                                    41:FILTER stats={rows=551 conf=estimated}
+                                      predicate: v11.item_sk IS NOT NULL
+                                      40:FILTER stats={rows=612 conf=estimated}
+                                        predicate: v11.item_sk IS NOT NULL
+                                        39:FILTER stats={rows=680 conf=estimated}
+                                          predicate: v11.item_sk IS NOT NULL
+                                          38:FILTER stats={rows=755 conf=estimated}
+                                            predicate: v11.item_sk IS NOT NULL
+                                            37:FILTER stats={rows=839 conf=estimated}
+                                              predicate: v11.item_sk IS NOT NULL
+                                              36:FILTER stats={rows=933 conf=estimated}
+                                                predicate: v11.item_sk IS NOT NULL
+                                                35:FILTER stats={rows=1036 conf=estimated}
+                                                  predicate: v11.item_sk IS NOT NULL
+                                                  34:FILTER stats={rows=1151 conf=estimated}
+                                                    predicate: v11.item_sk IS NOT NULL
+                                                    33:FILTER stats={rows=1279 conf=estimated}
+                                                      predicate: v11.item_sk IS NOT NULL
+                                                      32:FILTER stats={rows=1421 conf=estimated}
+                                                        predicate: v11.item_sk IS NOT NULL
+                                                        31:FILTER stats={rows=1579 conf=estimated}
+                                                          predicate: v11.item_sk IS NOT NULL
+                                                          30:FILTER stats={rows=1755 conf=estimated}
+                                                            predicate: v11.item_sk IS NOT NULL
+                                                            29:FILTER stats={rows=1950 conf=estimated}
+                                                              predicate: v11.item_sk IS NOT NULL
+                                                              28:FILTER stats={rows=2166 conf=estimated}
+                                                                predicate: v11.item_sk IS NOT NULL
+                                                                27:FILTER stats={rows=2407 conf=estimated}
+                                                                  predicate: v11.item_sk IS NOT NULL
+                                                                  26:FILTER stats={rows=2675 conf=estimated}
+                                                                    predicate: v11.item_sk IS NOT NULL
+                                                                    25:FILTER stats={rows=2972 conf=estimated}
+                                                                      predicate: v11.item_sk IS NOT NULL
+                                                                      24:FILTER stats={rows=3302 conf=estimated}
+                                                                        predicate: v11.item_sk IS NOT NULL
+                                                                        23:FILTER stats={rows=3669 conf=estimated}
+                                                                          predicate: v11.item_sk IS NOT NULL
+                                                                          22:FILTER stats={rows=4077 conf=estimated}
+                                                                            predicate: v11.rnk IS NOT NULL
+                                                                            21:FILTER stats={rows=4529 conf=estimated}
+                                                                              predicate: v11.rnk < 11
+                                                                              20:WINDOW [rank()] stats={rows=9059 conf=estimated} act={rows=10 time=2.2ms peak=222.2KB}
+                                                                                19:SORT BY [rank_col ASC NULLS FIRST] stats={rows=9059 conf=estimated} act={rows=16256 time=1.1ms peak=213.0KB}
+                                                                                  18:PROJECT [item_sk, rank_col] stats={rows=9059 conf=estimated} act={rows=8128 time=165.0us peak=54.3KB}
+                                                                                    17:PROJECT [ss_item_sk AS item_sk, avg(ss_net_profit) AS rank_col] stats={rows=9059 conf=estimated} act={rows=8128 time=173.2us peak=54.3KB}
+                                                                                      16:PROJECT [v11.item_sk AS item_sk, avg(ss_net_profit)] stats={rows=9059 conf=estimated} act={rows=8128 time=148.2us peak=97.7KB}
+                                                                                        15:NEST LOOP JOIN (INNER) stats={rows=9059 conf=estimated} act={rows=8129 time=657.3us peak=121.6KB}
+                                                                                          on: avg(ss_net_profit) > 0.9 * rank_col
+                                                                                          7:GATHER stats={rows=18118 conf=estimated} act={rows=17999 time=115.4us peak=0B}
+                                                                                          14:ASSERT NUM ROWS (<= 1) stats={rows=1 conf=estimated} act={rows=1 time=145ns peak=128B}
+                                                                                            13:GATHER stats={rows=6 conf=estimated} act={rows=1 time=63.4us peak=0B}
+  115:GATHER stats={rows=140 conf=estimated} act={rows=10 time=7.2us peak=0B}
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 115
+    PARTITION: UNPARTITIONED
+114:PROJECT [item_sk, rnk] stats={rows=140 conf=estimated} act={rows=10 time=49.3us peak=970B}
+  113:PROJECT [v21.item_sk AS item_sk, v21.rnk AS rnk] stats={rows=140 conf=estimated} act={rows=10 time=16.4us peak=120B}
+    112:PROJECT [item_sk, rnk] stats={rows=140 conf=estimated} act={rows=10 time=18.8us peak=120B}
+      111:PROJECT [item_sk, rnk] stats={rows=140 conf=estimated} act={rows=10 time=47.5us peak=280B}
+        110:FILTER stats={rows=140 conf=estimated}
+          predicate: v21.item_sk IS NOT NULL
+          109:FILTER stats={rows=156 conf=estimated}
+            predicate: v21.item_sk IS NOT NULL
+            108:FILTER stats={rows=173 conf=estimated}
+              predicate: v21.item_sk IS NOT NULL
+              107:FILTER stats={rows=192 conf=estimated}
+                predicate: v21.item_sk IS NOT NULL
+                106:FILTER stats={rows=213 conf=estimated}
+                  predicate: v21.item_sk IS NOT NULL
+                  105:FILTER stats={rows=237 conf=estimated}
+                    predicate: v21.item_sk IS NOT NULL
+                    104:FILTER stats={rows=263 conf=estimated}
+                      predicate: v21.item_sk IS NOT NULL
+                      103:FILTER stats={rows=293 conf=estimated}
+                        predicate: v21.item_sk IS NOT NULL
+                        102:FILTER stats={rows=325 conf=estimated}
+                          predicate: v21.item_sk IS NOT NULL
+                          101:FILTER stats={rows=361 conf=estimated}
+                            predicate: v21.item_sk IS NOT NULL
+                            100:FILTER stats={rows=401 conf=estimated}
+                              predicate: v21.item_sk IS NOT NULL
+                              99:FILTER stats={rows=446 conf=estimated}
+                                predicate: v21.item_sk IS NOT NULL
+                                98:FILTER stats={rows=496 conf=estimated}
+                                  predicate: v21.item_sk IS NOT NULL
+                                  97:FILTER stats={rows=551 conf=estimated}
+                                    predicate: v21.item_sk IS NOT NULL
+                                    96:FILTER stats={rows=612 conf=estimated}
+                                      predicate: v21.item_sk IS NOT NULL
+                                      95:FILTER stats={rows=680 conf=estimated}
+                                        predicate: v21.item_sk IS NOT NULL
+                                        94:FILTER stats={rows=755 conf=estimated}
+                                          predicate: v21.item_sk IS NOT NULL
+                                          93:FILTER stats={rows=839 conf=estimated}
+                                            predicate: v21.item_sk IS NOT NULL
+                                            92:FILTER stats={rows=933 conf=estimated}
+                                              predicate: v21.item_sk IS NOT NULL
+                                              91:FILTER stats={rows=1036 conf=estimated}
+                                                predicate: v21.item_sk IS NOT NULL
+                                                90:FILTER stats={rows=1151 conf=estimated}
+                                                  predicate: v21.item_sk IS NOT NULL
+                                                  89:FILTER stats={rows=1279 conf=estimated}
+                                                    predicate: v21.item_sk IS NOT NULL
+                                                    88:FILTER stats={rows=1421 conf=estimated}
+                                                      predicate: v21.item_sk IS NOT NULL
+                                                      87:FILTER stats={rows=1579 conf=estimated}
+                                                        predicate: v21.item_sk IS NOT NULL
+                                                        86:FILTER stats={rows=1755 conf=estimated}
+                                                          predicate: v21.item_sk IS NOT NULL
+                                                          85:FILTER stats={rows=1950 conf=estimated}
+                                                            predicate: v21.item_sk IS NOT NULL
+                                                            84:FILTER stats={rows=2166 conf=estimated}
+                                                              predicate: v21.item_sk IS NOT NULL
+                                                              83:FILTER stats={rows=2407 conf=estimated}
+                                                                predicate: v21.item_sk IS NOT NULL
+                                                                82:FILTER stats={rows=2675 conf=estimated}
+                                                                  predicate: v21.item_sk IS NOT NULL
+                                                                  81:FILTER stats={rows=2972 conf=estimated}
+                                                                    predicate: v21.item_sk IS NOT NULL
+                                                                    80:FILTER stats={rows=3302 conf=estimated}
+                                                                      predicate: v21.item_sk IS NOT NULL
+                                                                      79:FILTER stats={rows=3669 conf=estimated}
+                                                                        predicate: v21.item_sk IS NOT NULL
+                                                                        78:FILTER stats={rows=4077 conf=estimated}
+                                                                          predicate: v21.rnk IS NOT NULL
+                                                                          77:FILTER stats={rows=4529 conf=estimated}
+                                                                            predicate: v21.rnk < 11
+                                                                            76:WINDOW [rank()] stats={rows=9059 conf=estimated} act={rows=10 time=6.5ms peak=222.2KB}
+                                                                              75:SORT BY [rank_col DESC NULLS LAST] stats={rows=9059 conf=estimated} act={rows=16256 time=1.3ms peak=185.9KB}
+                                                                                74:PROJECT [item_sk, rank_col] stats={rows=9059 conf=estimated} act={rows=8128 time=56.7us peak=27.1KB}
+                                                                                  73:PROJECT [ss_item_sk AS item_sk, avg(ss_net_profit) AS rank_col] stats={rows=9059 conf=estimated} act={rows=8128 time=144.0us peak=27.1KB}
+                                                                                    72:PROJECT [v21.item_sk AS item_sk, avg(ss_net_profit)] stats={rows=9059 conf=estimated} act={rows=8128 time=77.7us peak=48.8KB}
+                                                                                      71:NEST LOOP JOIN (INNER) stats={rows=9059 conf=estimated} act={rows=8129 time=652.9us peak=61.3KB}
+                                                                                        on: avg(ss_net_profit) > 0.9 * rank_col
+                                                                                        63:GATHER stats={rows=18118 conf=estimated} act={rows=17999 time=9.4us peak=0B}
+                                                                                        70:ASSERT NUM ROWS (<= 1) stats={rows=1 conf=estimated} act={rows=1 time=146ns peak=128B}
+                                                                                          69:GATHER stats={rows=6 conf=estimated} act={rows=1 time=3.9us peak=0B}
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 69
+    PARTITION: UNPARTITIONED
+68:PROJECT [avg(store_sales.ss_net_profit) AS rank_col] stats={rows=6 conf=estimated} act={rows=1 time=11.6us peak=4.6KB}
+  67:HASH AGGREGATE (GLOBAL, group by: [store_sales.ss_store_sk]) stats={rows=6 conf=estimated} act={rows=4 time=264.6us peak=64.3KB}
+    aggregations: avg(store_sales.ss_net_profit)
+    66:HASH EXCHANGE stats={rows=6 conf=estimated} act={rows=3 time=27.0us peak=0B}
+PLAN FRAGMENT 6
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 66
+    PARTITION: HASH_PARTITIONED (store_sales.ss_store_sk)
+65:HASH AGGREGATE (LOCAL, group by: [ss_store_sk]) stats={rows=6 conf=estimated} act={rows=10775 time=4.1ms peak=412.8KB}
+  aggregations: avg(store_sales.ss_net_profit)
+  64:SCAN tpcds.store_sales stats={rows=21663 conf=estimated} act={rows=10772 time=29.3us peak=0B}
+       TABLE: tpcds.store_sales
+       columns: ss_store_sk, ss_net_profit, ss_addr_sk
+       min-max stats
+       predicates: ss_store_sk = 4 AND ss_addr_sk IS NULL
+PLAN FRAGMENT 7
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 63
+    PARTITION: UNPARTITIONED
+62:HASH AGGREGATE (GLOBAL, group by: [v21.item_sk]) stats={rows=18118 conf=estimated} act={rows=71705 time=1.5ms peak=1.9MB}
+  aggregations: avg(ss1.ss_net_profit)
+  61:HASH EXCHANGE stats={rows=18118 conf=estimated} act={rows=53706 time=8.3us peak=0B}
+PLAN FRAGMENT 8
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 61
+    PARTITION: HASH_PARTITIONED (v21.item_sk)
+60:HASH AGGREGATE (LOCAL, group by: [ss1.ss_item_sk]) stats={rows=18118 conf=estimated} act={rows=511978 time=8.9ms peak=5.8MB}
+  aggregations: avg(ss1.ss_net_profit)
+  59:SCAN tpcds.store_sales (alias=ss1) stats={rows=480067 conf=estimated} act={rows=458272 time=34.3us peak=0B}
+       TABLE: tpcds.store_sales
+       columns: ss_item_sk, ss_net_profit, ss_store_sk
+       min-max stats
+       predicates: ss1.ss_store_sk = 4
+PLAN FRAGMENT 9
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 13
+    PARTITION: UNPARTITIONED
+12:PROJECT [avg(store_sales.ss_net_profit) AS rank_col] stats={rows=6 conf=estimated} act={rows=1 time=676.5us peak=4.6KB}
+  11:HASH AGGREGATE (GLOBAL, group by: [store_sales.ss_store_sk]) stats={rows=6 conf=estimated} act={rows=4 time=19.1ms peak=64.3KB}
+    aggregations: avg(store_sales.ss_net_profit)
+    10:HASH EXCHANGE stats={rows=6 conf=estimated} act={rows=3 time=6.7us peak=0B}
+PLAN FRAGMENT 10
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 10
+    PARTITION: HASH_PARTITIONED (store_sales.ss_store_sk)
+9:HASH AGGREGATE (LOCAL, group by: [ss_store_sk]) stats={rows=6 conf=estimated} act={rows=10775 time=11.5ms peak=407.6KB}
+  aggregations: avg(store_sales.ss_net_profit)
+  8:SCAN tpcds.store_sales stats={rows=21663 conf=estimated} act={rows=10772 time=35.0us peak=0B}
+       TABLE: tpcds.store_sales
+       columns: ss_store_sk, ss_net_profit, ss_addr_sk
+       min-max stats
+       predicates: ss_store_sk = 4 AND ss_addr_sk IS NULL
+PLAN FRAGMENT 11
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 7
+    PARTITION: UNPARTITIONED
+6:HASH AGGREGATE (GLOBAL, group by: [v11.item_sk]) stats={rows=18118 conf=estimated} act={rows=71705 time=1.2ms peak=2.0MB}
+  aggregations: avg(ss1.ss_net_profit)
+  5:HASH EXCHANGE stats={rows=18118 conf=estimated} act={rows=53706 time=43.4us peak=0B}
+PLAN FRAGMENT 12
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 5
+    PARTITION: HASH_PARTITIONED (v11.item_sk)
+4:HASH AGGREGATE (LOCAL, group by: [ss1.ss_item_sk]) stats={rows=18118 conf=estimated} act={rows=511978 time=17.0ms peak=5.7MB}
+  aggregations: avg(ss1.ss_net_profit)
+  3:SCAN tpcds.store_sales (alias=ss1) stats={rows=480067 conf=estimated} act={rows=458272 time=199.1us peak=0B}
+       TABLE: tpcds.store_sales
+       columns: ss_item_sk, ss_net_profit, ss_store_sk
+       min-max stats
+       predicates: ss1.ss_store_sk = 4

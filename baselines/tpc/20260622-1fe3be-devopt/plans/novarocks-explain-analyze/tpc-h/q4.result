@@ -1,0 +1,51 @@
+Explain String
+Planning: 44.4ms / Execution: 2.05s / Rows: 5
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+12:SORT BY [o_orderpriority ASC NULLS FIRST] stats={rows=5 conf=estimated} act={rows=10 time=30.6us peak=1.9KB}
+  11:GATHER stats={rows=5 conf=estimated} act={rows=5 time=1.0us peak=0B}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 11
+    PARTITION: UNPARTITIONED
+10:PROJECT [o_orderpriority, count(*) AS order_count] stats={rows=5 conf=estimated} act={rows=5 time=18.6us peak=134.0KB}
+  9:HASH AGGREGATE (GLOBAL, group by: [o_orderpriority]) stats={rows=5 conf=estimated} act={rows=20 time=50.8us peak=641.7KB}
+    aggregations: count()
+    8:HASH EXCHANGE stats={rows=5 conf=estimated} act={rows=15 time=14.3us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 8
+    PARTITION: HASH_PARTITIONED (o_orderpriority)
+7:HASH AGGREGATE (LOCAL, group by: [o_orderpriority]) stats={rows=5 conf=estimated} act={rows=51713 time=916.0us peak=2.5MB}
+  aggregations: count()
+  6:HASH JOIN (PARTITIONED, LEFT SEMI, eq: [o_orderkey = lineitem.l_orderkey]) stats={rows=395507 conf=estimated} act={rows=3901510 time=36.0ms peak=108.1MB}
+    2:HASH EXCHANGE stats={rows=395507 conf=estimated} act={rows=56516 time=4.6us peak=0B}
+    5:HASH EXCHANGE stats={rows=2700547 conf=estimated} act={rows=3793296 time=941.5us peak=0B}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 5
+    PARTITION: HASH_PARTITIONED (l_orderkey)
+4:PROJECT [lineitem.l_orderkey AS l_orderkey] stats={rows=2700547 conf=estimated} act={rows=3793296 time=7.9ms peak=12.4MB}
+  3:SCAN tpch.lineitem stats={rows=2700547 conf=estimated} act={rows=3793296 time=37.7us peak=0B}
+       TABLE: tpch.lineitem
+       columns: l_orderkey, l_commitdate, l_receiptdate
+       min-max stats
+       predicates: l_receiptdate > l_commitdate AND l_orderkey IS NOT NULL
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 2
+    PARTITION: HASH_PARTITIONED (o_orderkey)
+1:SCAN tpch.orders stats={rows=395507 conf=estimated} act={rows=56516 time=650.3us peak=5.7MB}
+     TABLE: tpch.orders
+     columns: o_orderkey, o_orderpriority, o_orderdate
+     min-max stats
+     predicates: o_orderdate >= 9009 AND o_orderdate < 9100

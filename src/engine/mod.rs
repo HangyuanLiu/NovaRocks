@@ -3101,19 +3101,138 @@ fn prepare_explain_query(
 /// the profiled plan body.
 #[allow(clippy::too_many_arguments)]
 fn explain_analyze_query(
-    _query: &sqlparser::ast::Query,
-    _analyzer_catalog: &dyn crate::sql::catalog::CatalogProvider,
-    _codegen_catalog: &InMemoryCatalog,
-    _connectors: &crate::connector::ConnectorRegistry,
-    _current_database: &str,
-    _query_opts: Option<crate::internal_service::TQueryOptions>,
-    _mv_rewrite_state: Option<&Arc<StandaloneState>>,
+    query: &sqlparser::ast::Query,
+    analyzer_catalog: &dyn crate::sql::catalog::CatalogProvider,
+    codegen_catalog: &InMemoryCatalog,
+    connectors: &crate::connector::ConnectorRegistry,
+    current_database: &str,
+    query_opts: Option<crate::internal_service::TQueryOptions>,
+    mv_rewrite_state: Option<&Arc<StandaloneState>>,
 ) -> Result<QueryResult, String> {
-    Err(
-        "EXPLAIN ANALYZE requires remote fragment profile collection; \
-         RemoteDispatcher profiles are not available yet"
-            .to_string(),
+    use crate::sql::codegen::ir::explain_distributed_plan_analyze;
+    use crate::sql::explain::ExplainLevel;
+    use crate::sql::planner::build_distributed_plan;
+
+    let planning_start = std::time::Instant::now();
+    let (resolved, cte_registry, mut factory) =
+        crate::sql::analyzer::analyze(query, analyzer_catalog, current_database)?;
+    let logical = crate::sql::planner::plan_query(resolved, cte_registry, &mut factory)?;
+    let mut scalar_arena = crate::sql::optimizer::scalar::ScalarArena::new();
+    let mut opt_expr = crate::sql::planner::optimizer_bridge::plan::try_logical_plan_to_opt_expr(
+        &logical,
+        &mut scalar_arena,
+    )?;
+    let providers = mv_rewrite_state
+        .map(query_stats::QueryStatsProviders::from_standalone_state)
+        .unwrap_or_else(|| query_stats::QueryStatsProviders::from_connectors(connectors));
+    let mut query_stats = query_stats::QueryStatsCollector::new(providers).collect(&mut opt_expr);
+    let mv_candidates = match mv_rewrite_state {
+        Some(state) => crate::engine::mv_rewrite_prep::prepare_mv_rewrite_candidates(
+            state,
+            analyzer_catalog,
+            current_database,
+            &logical,
+            &mut factory,
+            &mut query_stats,
+        ),
+        None => Vec::new(),
+    };
+    let physical = crate::sql::optimizer::optimize(
+        opt_expr,
+        scalar_arena,
+        &query_stats.snapshot,
+        factory,
+        None,
+        mv_candidates,
+    )?;
+
+    let dp = build_distributed_plan(&physical)?;
+    let build_result =
+        crate::sql::codegen::fragment_builder::PlanFragmentBuilder::build_via_distributed_plan(
+            &physical,
+            codegen_catalog,
+            connectors,
+            current_database,
+        )?;
+    let planning_elapsed = planning_start.elapsed();
+
+    let mut query_opts = query_opts.unwrap_or_default();
+    query_opts.enable_profile = Some(true);
+    let (dispatcher, scheduler) = coordinated_execution_services()?;
+    let execution_start = std::time::Instant::now();
+    let outcome = crate::runtime::coordinator::ExecutionCoordinator::new(
+        build_result,
+        dispatcher,
+        scheduler,
+        Some(query_opts),
     )
+    .execute_with_profile_outcome()?;
+    let execution_elapsed = execution_start.elapsed();
+    if let Some(abort) = outcome.write_abort.as_ref() {
+        return Err(abort.reason.clone());
+    }
+    if outcome.fragment_profiles.is_empty() {
+        return Err("EXPLAIN ANALYZE completed without fragment runtime profiles".to_string());
+    }
+
+    let actuals =
+        crate::runtime::profile_correlate::collect_actuals_by_plan_node_id_from_profile_trees(
+            &outcome.fragment_profiles,
+        );
+    let profile_summary =
+        crate::runtime::profile_correlate::collect_distributed_profile_summary_from_profile_trees(
+            &outcome.fragment_profiles,
+        );
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "Planning: {} / Execution: {} / Rows: {}",
+        format_explain_analyze_duration(planning_elapsed),
+        format_explain_analyze_duration(execution_elapsed),
+        outcome.query_result.row_count()
+    ));
+    lines.push(format_distributed_profile_summary(&profile_summary));
+    lines.extend(explain_distributed_plan_analyze(
+        &dp,
+        ExplainLevel::Analyze,
+        &actuals,
+    ));
+    build_string_query_result("Explain String", lines)
+}
+
+fn format_distributed_profile_summary(
+    summary: &crate::runtime::profile_correlate::DistributedProfileSummary,
+) -> String {
+    format!(
+        "Profile: fragments={} fragment_wall_max={} fragment_wall_sum={} driver_total={} driver_blocked={} source_wait={} sink_wait={} dependency_wait={} operator_active={} exchange_wait={} exchange_process={} network={} scan_io={}",
+        summary.fragment_instance_count,
+        format_explain_analyze_duration_ns(summary.fragment_wall_max_ns),
+        format_explain_analyze_duration_ns(summary.fragment_wall_sum_ns),
+        format_explain_analyze_duration_ns(summary.driver_total_time_ns),
+        format_explain_analyze_duration_ns(summary.driver_blocked_time_ns),
+        format_explain_analyze_duration_ns(summary.source_wait_time_ns),
+        format_explain_analyze_duration_ns(summary.sink_wait_time_ns),
+        format_explain_analyze_duration_ns(summary.dependency_wait_time_ns),
+        format_explain_analyze_duration_ns(summary.operator_active_time_ns),
+        format_explain_analyze_duration_ns(summary.exchange_wait_time_ns),
+        format_explain_analyze_duration_ns(summary.exchange_process_time_ns),
+        format_explain_analyze_duration_ns(summary.network_time_ns),
+        format_explain_analyze_duration_ns(summary.scan_io_time_ns)
+    )
+}
+
+fn format_explain_analyze_duration_ns(ns: i64) -> String {
+    format_explain_analyze_duration(std::time::Duration::from_nanos(ns.max(0) as u64))
+}
+
+fn format_explain_analyze_duration(duration: std::time::Duration) -> String {
+    let ms = duration.as_secs_f64() * 1000.0;
+    if ms < 1.0 {
+        format!("{ms:.3}ms")
+    } else if ms < 1000.0 {
+        format!("{ms:.1}ms")
+    } else {
+        format!("{:.2}s", duration.as_secs_f64())
+    }
 }
 
 /// Produce non-distributed logical EXPLAIN output for a query without
@@ -4534,6 +4653,22 @@ mod tests {
             .downcast_ref::<StringArray>()
             .expect("StringArray column");
         array.value(row).to_string()
+    }
+
+    fn string_column(result: &QueryResult, col: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        for chunk in &result.chunks {
+            let array = chunk
+                .batch
+                .column(col)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("StringArray column");
+            for row in 0..array.len() {
+                out.push(array.value(row).to_string());
+            }
+        }
+        out
     }
 
     fn write_test_metadata_config(dir: &TempDir, metadata_path: &str) -> PathBuf {
@@ -6410,12 +6545,12 @@ enable_path_style_access = true
     }
 
     #[test]
-    fn explain_analyze_fails_fast_without_remote_profiles() {
+    fn explain_analyze_runs_distributed_plan_and_renders_actuals() {
         let warehouse = TempDir::new().expect("warehouse");
         let (_engine, session) = open_scalar_subquery_test_engine(&warehouse);
         create_kv_tables(&session, "(1,10),(2,20),(3,30)", "(1,100),(2,200),(3,300)");
 
-        let err = session
+        let result = session
             .execute_in_context(
                 "EXPLAIN ANALYZE \
                  SELECT count(*) \
@@ -6424,12 +6559,23 @@ enable_path_style_access = true
                 "db1",
                 None,
             )
-            .expect_err("EXPLAIN ANALYZE must fail until remote profiles are available");
+            .expect("EXPLAIN ANALYZE must execute and render profile actuals");
 
-        assert!(
-            err.contains("EXPLAIN ANALYZE requires remote fragment profile collection"),
-            "unexpected EXPLAIN ANALYZE error: {err}"
-        );
+        let StatementResult::Query(result) = result else {
+            panic!("EXPLAIN ANALYZE must return rows");
+        };
+        let text = string_column(&result, 0).join("\n");
+        assert!(text.starts_with("Planning: "), "{text}");
+        assert!(text.contains(" / Execution: "), "{text}");
+        assert!(text.contains(" / Rows: 1"), "{text}");
+        assert!(text.contains("Profile: fragments="), "{text}");
+        assert!(text.contains("operator_active="), "{text}");
+        assert!(text.contains("source_wait="), "{text}");
+        assert!(text.contains("sink_wait="), "{text}");
+        assert!(text.contains("exchange_wait="), "{text}");
+        assert!(text.contains("PLAN FRAGMENT 0"), "{text}");
+        assert!(text.contains("stats={rows="), "{text}");
+        assert!(text.contains("act={rows="), "{text}");
     }
 
     /// OQ-5 Task 6: codegen must lower the runtime-filter annotations the

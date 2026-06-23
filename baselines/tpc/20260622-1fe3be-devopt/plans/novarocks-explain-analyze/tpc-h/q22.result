@@ -1,0 +1,79 @@
+Explain String
+Planning: 33.7ms / Execution: 426.6ms / Rows: 5
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+22:SORT BY [cntrycode ASC NULLS FIRST] stats={rows=10 conf=estimated} act={rows=10 time=57.0us peak=2.6KB}
+  21:GATHER stats={rows=10 conf=estimated} act={rows=5 time=4.6us peak=0B}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 21
+    PARTITION: UNPARTITIONED
+20:PROJECT [cntrycode, count(*) AS numcust, sum(c_acctbal) AS totacctbal] stats={rows=10 conf=estimated} act={rows=5 time=25.0us peak=135.1KB}
+  19:HASH AGGREGATE (GLOBAL, group by: [cntrycode]) stats={rows=10 conf=estimated} act={rows=20 time=37.7us peak=641.9KB}
+    aggregations: count(), sum(c_acctbal)
+    18:HASH EXCHANGE stats={rows=10 conf=estimated} act={rows=15 time=8.9us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 18
+    PARTITION: HASH_PARTITIONED (cntrycode)
+17:HASH AGGREGATE (LOCAL, group by: [cntrycode]) stats={rows=10 conf=estimated} act={rows=4662 time=1.1ms peak=1.3MB}
+  aggregations: count(), sum(c_acctbal)
+  16:PROJECT [cntrycode, c_acctbal] stats={rows=15000 conf=estimated} act={rows=4647 time=658.5us peak=16.2KB}
+    15:PROJECT [substring(c_phone, 1, 2) AS cntrycode, c_acctbal] stats={rows=15000 conf=estimated} act={rows=4647 time=1.0ms peak=8.9KB}
+      14:HASH JOIN (PARTITIONED, LEFT ANTI, eq: [c_custkey = orders.o_custkey]) stats={rows=15000 conf=fallback} act={rows=1518389 time=10.0ms peak=37.2MB}
+        10:HASH EXCHANGE stats={rows=37500 conf=estimated} act={rows=13742 time=3.9us peak=0B}
+        13:HASH EXCHANGE stats={rows=1500000 conf=estimated} act={rows=1500000 time=288.8us peak=0B}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 13
+    PARTITION: HASH_PARTITIONED (o_custkey)
+12:PROJECT [orders.o_custkey AS o_custkey] stats={rows=1500000 conf=estimated} act={rows=1500000 time=2.8ms peak=7.4MB}
+  11:SCAN tpch.orders stats={rows=1500000} act={rows=1500000 time=108.3us peak=0B}
+       TABLE: tpch.orders
+       columns: o_custkey
+       min-max stats
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 10
+    PARTITION: HASH_PARTITIONED (c_custkey)
+9:PROJECT [c_custkey, c_phone, c_acctbal] stats={rows=37500 conf=estimated} act={rows=13742 time=646.1us peak=1.1MB}
+  8:NEST LOOP JOIN (INNER) stats={rows=37500 conf=estimated} act={rows=13742 time=825.7us peak=598.6KB}
+    on: c_acctbal > avg(c_acctbal)
+    2:GATHER stats={rows=75000 conf=estimated} act={rows=30040 time=8.9us peak=0B}
+    7:PROJECT [avg(customer.c_acctbal) AS avg(c_acctbal)] stats={rows=1 conf=estimated} act={rows=1 time=21.6us peak=16B}
+      6:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=113.4us peak=64.4KB}
+        aggregations: avg(customer.c_acctbal)
+        5:GATHER stats={rows=1 conf=estimated} act={rows=12 time=24.4us peak=0B}
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 5
+    PARTITION: UNPARTITIONED
+4:HASH AGGREGATE (LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=84.7us peak=1.2MB}
+  aggregations: avg(customer.c_acctbal)
+  3:SCAN tpch.customer stats={rows=68182 conf=estimated} act={rows=27375 time=4.2us peak=0B}
+       TABLE: tpch.customer
+       columns: c_acctbal, c_phone
+       min-max stats
+       predicates: c_acctbal > 0.00 AND substring(c_phone, 1, 2) IN ('21', '28', '24', '32', '35', '34', '37')
+PLAN FRAGMENT 6
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 2
+    PARTITION: UNPARTITIONED
+1:SCAN tpch.customer stats={rows=75000 conf=estimated} act={rows=30040 time=399.7us peak=1.9MB}
+     TABLE: tpch.customer
+     columns: c_custkey, c_phone, c_acctbal
+     min-max stats
+     predicates: substring(c_phone, 1, 2) IN ('21', '28', '24', '32', '35', '34', '37')

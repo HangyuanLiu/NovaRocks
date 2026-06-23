@@ -1,0 +1,264 @@
+Explain String
+Planning: 502.3ms / Execution: 12.89s / Rows: 100
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+59:MERGING-EXCHANGE stats={rows=100 conf=estimated} act={rows=300 time=19.8us peak=14.5KB}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 59
+    PARTITION: UNPARTITIONED
+58:LOCAL TOP-N (limit=100, offset=0) [sales_cnt_diff ASC NULLS FIRST, sales_amt_diff ASC NULLS FIRST] stats={rows=100 conf=estimated} act={rows=255 time=316.8us peak=34.4KB}
+  57:PROJECT [prev_yr.d_year AS prev_year, curr_yr.d_year AS year, curr_yr.i_brand_id AS i_brand_id, curr_yr.i_class_id AS i_class_id, curr_yr.i_category_id AS i_category_id, curr_yr.i_manufact_id AS i_manufact_id, prev_yr.sales_cnt AS prev_yr_cnt, curr_yr.sales_cnt AS curr_yr_cnt, curr_yr_cnt - prev_yr_cnt AS sales_cnt_diff, curr_yr.sales_amt - prev_yr.sales_amt AS sales_amt_diff] stats={rows=109 conf=estimated} act={rows=155 time=271.3us peak=13.3KB}
+    56:HASH JOIN (BROADCAST, INNER, eq: [prev_yr.i_brand_id = curr_yr.i_brand_id, prev_yr.i_class_id = curr_yr.i_class_id, prev_yr.i_category_id = curr_yr.i_category_id, prev_yr.i_manufact_id = curr_yr.i_manufact_id]) stats={rows=109 conf=estimated} act={rows=1012 time=347.5us peak=183.2KB}
+      other: CAST(curr_yr_cnt AS Decimal128(17, 2)) / CAST(prev_yr_cnt AS Decimal128(17, 2)) < 0.9
+      build runtime filters:
+      - filter_id = 6, build_expr = (curr_yr.i_brand_id)
+      - filter_id = 7, build_expr = (curr_yr.i_class_id)
+      - filter_id = 8, build_expr = (curr_yr.i_category_id)
+      - filter_id = 9, build_expr = (curr_yr.i_manufact_id)
+      51:FILTER stats={rows=144883 conf=estimated}
+        predicate: prev_yr.i_brand_id IS NOT NULL AND prev_yr.i_class_id IS NOT NULL AND prev_yr.i_category_id IS NOT NULL AND prev_yr.i_manufact_id IS NOT NULL
+        50:FILTER stats={rows=145520 conf=estimated}
+          predicate: prev_year = 2002 - 1
+          49:EXCHANGE stats={rows=582079 conf=estimated} act={rows=5982 time=62.6us peak=224.9KB}
+      55:GATHER stats={rows=961 conf=estimated} act={rows=857 time=9.6us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 55
+    PARTITION: UNPARTITIONED
+54:FILTER stats={rows=961 conf=estimated}
+  predicate: curr_yr.i_brand_id IS NOT NULL AND curr_yr.i_class_id IS NOT NULL AND curr_yr.i_category_id IS NOT NULL AND curr_yr.i_manufact_id IS NOT NULL
+  53:FILTER stats={rows=965 conf=estimated}
+    predicate: year = 2002
+    52:EXCHANGE stats={rows=582079 conf=estimated} act={rows=5958 time=65.8us peak=192.2KB}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 49
+    PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 52
+    PARTITION: UNPARTITIONED
+48:PROJECT [d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, sum(sales_cnt) AS sales_cnt, sum(sales_amt) AS sales_amt] stats={rows=582079 conf=estimated} act={rows=5101 time=64.9us peak=1.0MB}
+  47:HASH AGGREGATE (SINGLE, group by: [d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id]) stats={rows=582079 conf=estimated} act={rows=42373 time=13.8ms peak=23.6MB}
+    aggregations: sum(sales_cnt), sum(sales_amt)
+    46:GATHER stats={rows=582079 conf=estimated} act={rows=478903 time=15.0us peak=0B}
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 46
+    PARTITION: UNPARTITIONED
+45:PROJECT [d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, sales_cnt, sales_amt] stats={rows=582079 conf=estimated} act={rows=478903 time=2.1ms peak=64.0MB}
+  44:HASH AGGREGATE (SINGLE, group by: [d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, sales_cnt, sales_amt]) stats={rows=582079 conf=estimated} act={rows=1436909 time=30.2ms peak=108.0MB}
+    43:GATHER stats={rows=582079 conf=estimated} act={rows=479043 time=39.6us peak=0B}
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 43
+    PARTITION: UNPARTITIONED
+42:UNION ALL stats={rows=582079 conf=estimated} act={rows=958086 time=143.1ms peak=59.5MB}
+  29:HASH AGGREGATE (SINGLE, group by: [d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, sales_cnt, sales_amt]) stats={rows=631416 conf=estimated} act={rows=1226766 time=996.6ms peak=66.4MB}
+    28:GATHER stats={rows=631416 conf=estimated} act={rows=409658 time=144.1ms peak=0B}
+  41:HASH EXCHANGE stats={rows=144690 conf=estimated} act={rows=70745 time=90.2us peak=0B}
+PLAN FRAGMENT 6
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 41
+    PARTITION: HASH_PARTITIONED (d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, sales_cnt, sales_amt)
+40:PROJECT [d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, ws_quantity - coalesce(wr_return_quantity, 0) AS sales_cnt, ws_ext_sales_price - coalesce(wr_return_amt, 0.0) AS sales_amt] stats={rows=144690 conf=estimated} act={rows=70745 time=112.4ms peak=3.8MB}
+  39:HASH JOIN (BROADCAST, LEFT OUTER, eq: [ws_order_number = wr_order_number, ws_item_sk = wr_item_sk]) stats={rows=144690 conf=estimated} act={rows=286034 time=99.7ms peak=47.8MB}
+    36:HASH JOIN (BROADCAST, INNER, eq: [ws_sold_date_sk = d_date_sk]) stats={rows=144690 conf=estimated} act={rows=289892 time=73.4ms peak=41.8MB}
+      build runtime filters:
+      - filter_id = 5, build_expr = (d_date_sk)
+      33:HASH JOIN (BROADCAST, INNER, eq: [ws_item_sk = i_item_sk]) stats={rows=144690 conf=estimated} act={rows=75944 time=67.8ms peak=7.7MB}
+        build runtime filters:
+        - filter_id = 4, build_expr = (i_item_sk)
+        30:SCAN tpcds.web_sales stats={rows=647276 conf=estimated} act={rows=719195 time=40.8ms peak=0B}
+             TABLE: tpcds.web_sales
+             columns: ws_sold_date_sk, ws_item_sk, ws_order_number, ws_quantity, ws_ext_sales_price
+             min-max stats
+             predicates: ws_item_sk IS NOT NULL AND ws_sold_date_sk IS NOT NULL
+            probe runtime filters:
+            - filter_id = 4, probe_expr = (ws_item_sk)
+            - filter_id = 5, probe_expr = (ws_sold_date_sk)
+        32:GATHER stats={rows=4050 conf=estimated} act={rows=5199 time=8.7us peak=0B}
+      35:GATHER stats={rows=65744 conf=estimated} act={rows=219147 time=433.8us peak=0B}
+    38:GATHER stats={rows=71763} act={rows=215289 time=141.1us peak=0B}
+PLAN FRAGMENT 7
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 38
+    PARTITION: UNPARTITIONED
+37:SCAN tpcds.web_returns stats={rows=71763} act={rows=71763 time=609.6us peak=17.9MB}
+     TABLE: tpcds.web_returns
+     columns: wr_item_sk, wr_order_number, wr_return_quantity, wr_return_amt
+     min-max stats
+PLAN FRAGMENT 8
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 35
+    PARTITION: UNPARTITIONED
+34:SCAN tpcds.date_dim stats={rows=65744 conf=estimated} act={rows=73049 time=4.3us peak=13.9MB}
+     TABLE: tpcds.date_dim
+     columns: d_date_sk, d_year
+     min-max stats
+     predicates: d_date_sk IS NOT NULL
+PLAN FRAGMENT 9
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 32
+    PARTITION: UNPARTITIONED
+31:SCAN tpcds.item stats={rows=4050 conf=estimated} act={rows=1733 time=1.4ms peak=1.1MB}
+     TABLE: tpcds.item
+     columns: i_item_sk, i_brand_id, i_class_id, i_category_id, i_manufact_id, i_category
+     min-max stats
+     predicates: i_category = 'Books' AND i_item_sk IS NOT NULL
+PLAN FRAGMENT 10
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 28
+    PARTITION: UNPARTITIONED
+27:UNION ALL stats={rows=631416 conf=estimated} act={rows=819316 time=2.1s peak=6.1MB}
+  13:HASH EXCHANGE stats={rows=288571 conf=estimated} act={rows=140209 time=56.0ms peak=0B}
+  26:HASH EXCHANGE stats={rows=553317 conf=estimated} act={rows=269449 time=33.6ms peak=0B}
+PLAN FRAGMENT 11
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 26
+    PARTITION: HASH_PARTITIONED (d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, sales_cnt, sales_amt)
+25:PROJECT [d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, ss_quantity - coalesce(sr_return_quantity, 0) AS sales_cnt, ss_ext_sales_price - coalesce(sr_return_amt, 0.0) AS sales_amt] stats={rows=553317 conf=estimated} act={rows=269449 time=2.1s peak=12.3MB}
+  24:HASH JOIN (PARTITIONED, LEFT OUTER, eq: [ss_ticket_number = sr_ticket_number, ss_item_sk = sr_item_sk]) stats={rows=553317 conf=estimated} act={rows=826412 time=510.4ms peak=61.4MB}
+    21:HASH EXCHANGE stats={rows=553317 conf=estimated} act={rows=269449 time=20.5ms peak=0B}
+    23:HASH EXCHANGE stats={rows=287514} act={rows=287514 time=689.1us peak=0B}
+PLAN FRAGMENT 12
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 23
+    PARTITION: HASH_PARTITIONED (sr_ticket_number, sr_item_sk)
+22:SCAN tpcds.store_returns stats={rows=287514} act={rows=287514 time=65.2ms peak=10.3MB}
+     TABLE: tpcds.store_returns
+     columns: sr_item_sk, sr_ticket_number, sr_return_quantity, sr_return_amt
+     min-max stats
+PLAN FRAGMENT 13
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 21
+    PARTITION: HASH_PARTITIONED (ss_ticket_number, ss_item_sk)
+20:HASH JOIN (BROADCAST, INNER, eq: [ss_sold_date_sk = d_date_sk]) stats={rows=553317 conf=estimated} act={rows=488596 time=198.5ms peak=57.9MB}
+  build runtime filters:
+  - filter_id = 3, build_expr = (d_date_sk)
+  17:HASH JOIN (BROADCAST, INNER, eq: [ss_item_sk = i_item_sk]) stats={rows=553317 conf=estimated} act={rows=274648 time=63.5ms peak=10.4MB}
+    build runtime filters:
+    - filter_id = 2, build_expr = (i_item_sk)
+    14:SCAN tpcds.store_sales stats={rows=2475280 conf=estimated} act={rows=742232 time=71.0ms peak=0B}
+         TABLE: tpcds.store_sales
+         columns: ss_sold_date_sk, ss_item_sk, ss_ticket_number, ss_quantity, ss_ext_sales_price
+         min-max stats
+         predicates: ss_item_sk IS NOT NULL AND ss_sold_date_sk IS NOT NULL
+        probe runtime filters:
+        - filter_id = 2, probe_expr = (ss_item_sk)
+        - filter_id = 3, probe_expr = (ss_sold_date_sk)
+    16:GATHER stats={rows=4050 conf=estimated} act={rows=5199 time=9.2us peak=0B}
+  19:GATHER stats={rows=65744 conf=estimated} act={rows=219147 time=13.7us peak=0B}
+PLAN FRAGMENT 14
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 19
+    PARTITION: UNPARTITIONED
+18:SCAN tpcds.date_dim stats={rows=65744 conf=estimated} act={rows=73049 time=1.1ms peak=23.5MB}
+     TABLE: tpcds.date_dim
+     columns: d_date_sk, d_year
+     min-max stats
+     predicates: d_date_sk IS NOT NULL
+PLAN FRAGMENT 15
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 16
+    PARTITION: UNPARTITIONED
+15:SCAN tpcds.item stats={rows=4050 conf=estimated} act={rows=1733 time=125.2us peak=1.1MB}
+     TABLE: tpcds.item
+     columns: i_item_sk, i_brand_id, i_class_id, i_category_id, i_manufact_id, i_category
+     min-max stats
+     predicates: i_category = 'Books' AND i_item_sk IS NOT NULL
+PLAN FRAGMENT 16
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 13
+    PARTITION: HASH_PARTITIONED (d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, sales_cnt, sales_amt)
+12:PROJECT [d_year, i_brand_id, i_class_id, i_category_id, i_manufact_id, cs_quantity - coalesce(cr_return_quantity, 0) AS sales_cnt, cs_ext_sales_price - coalesce(cr_return_amount, 0.0) AS sales_amt] stats={rows=288571 conf=estimated} act={rows=140209 time=1.5s peak=11.5MB}
+  11:HASH JOIN (PARTITIONED, LEFT OUTER, eq: [cs_order_number = cr_order_number, cs_item_sk = cr_item_sk]) stats={rows=288571 conf=estimated} act={rows=424485 time=284.1ms peak=31.9MB}
+    8:HASH EXCHANGE stats={rows=288571 conf=estimated} act={rows=140209 time=1.4ms peak=0B}
+    10:HASH EXCHANGE stats={rows=144067} act={rows=144067 time=44.5us peak=0B}
+PLAN FRAGMENT 17
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 10
+    PARTITION: HASH_PARTITIONED (cr_order_number, cr_item_sk)
+9:SCAN tpcds.catalog_returns stats={rows=144067} act={rows=144067 time=43.2ms peak=12.3MB}
+     TABLE: tpcds.catalog_returns
+     columns: cr_item_sk, cr_order_number, cr_return_quantity, cr_return_amount
+     min-max stats
+PLAN FRAGMENT 18
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 8
+    PARTITION: HASH_PARTITIONED (cs_order_number, cs_item_sk)
+7:HASH JOIN (BROADCAST, INNER, eq: [cs_sold_date_sk = d_date_sk]) stats={rows=288571 conf=estimated} act={rows=359356 time=179.5ms peak=54.5MB}
+  build runtime filters:
+  - filter_id = 1, build_expr = (d_date_sk)
+  4:HASH JOIN (BROADCAST, INNER, eq: [cs_item_sk = i_item_sk]) stats={rows=288571 conf=estimated} act={rows=145408 time=47.7ms peak=10.5MB}
+    build runtime filters:
+    - filter_id = 0, build_expr = (i_item_sk)
+    1:SCAN tpcds.catalog_sales stats={rows=1290931 conf=estimated} act={rows=572862 time=29.9ms peak=0B}
+         TABLE: tpcds.catalog_sales
+         columns: cs_sold_date_sk, cs_item_sk, cs_order_number, cs_quantity, cs_ext_sales_price
+         min-max stats
+         predicates: cs_item_sk IS NOT NULL AND cs_sold_date_sk IS NOT NULL
+        probe runtime filters:
+        - filter_id = 0, probe_expr = (cs_item_sk)
+        - filter_id = 1, probe_expr = (cs_sold_date_sk)
+    3:GATHER stats={rows=4050 conf=estimated} act={rows=5199 time=9.8us peak=0B}
+  6:GATHER stats={rows=65744 conf=estimated} act={rows=219147 time=4.4ms peak=0B}
+PLAN FRAGMENT 19
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 6
+    PARTITION: UNPARTITIONED
+5:SCAN tpcds.date_dim stats={rows=65744 conf=estimated} act={rows=73049 time=13.2ms peak=14.5MB}
+     TABLE: tpcds.date_dim
+     columns: d_date_sk, d_year
+     min-max stats
+     predicates: d_date_sk IS NOT NULL
+PLAN FRAGMENT 20
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: UNPARTITIONED
+2:SCAN tpcds.item stats={rows=4050 conf=estimated} act={rows=1733 time=414.9us peak=929.4KB}
+     TABLE: tpcds.item
+     columns: i_item_sk, i_brand_id, i_class_id, i_category_id, i_manufact_id, i_category
+     min-max stats
+     predicates: i_category = 'Books' AND i_item_sk IS NOT NULL

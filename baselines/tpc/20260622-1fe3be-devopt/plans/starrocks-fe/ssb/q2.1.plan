@@ -1,0 +1,195 @@
+-- engine=starrocks
+-- suite=ssb
+-- case=q2.1
+-- file=/Users/harbor/project/NovaRocks/sql-tests/ssb/sql/q2.1.sql
+-- elapsed_sec=0.121
+-- exit_code=0
+
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 7.969281209895002E8
+  Memory: 1.4104025605275002E8
+
+PLAN FRAGMENT 0(F08)
+  Fragment Cost: 1.66730533893E8
+  Output Exprs:67: sum | 26: d_year | 47: p_brand
+  Input Partition: UNPARTITIONED
+  RESULT SINK
+
+  19:MERGING-EXCHANGE
+     distribution type: GATHER
+     cardinality: 1488665
+
+PLAN FRAGMENT 1(F07)
+  Fragment Cost: 2.937633216210001E8
+
+  Input Partition: HASH_PARTITIONED: 26: d_year, 47: p_brand
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 19
+
+  18:SORT
+  |  order by: [26, INT, true] ASC, [47, VARCHAR(1073741824), true] ASC
+  |  offset: 0
+  |  cardinality: 1488665
+  |
+  17:AGGREGATE (merge finalize)
+  |  aggregate: sum[([67: sum, BIGINT, true]); args: INT; result: BIGINT; args nullable: true; result nullable: true]
+  |  group by: [26: d_year, INT, true], [47: p_brand, VARCHAR(1073741824), true]
+  |  cardinality: 1488665
+  |
+  16:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [26: d_year, INT, true], [47: p_brand, VARCHAR(1073741824), true]
+     cardinality: 2835553
+
+PLAN FRAGMENT 2(F00)
+  Fragment Cost: 3.5113822230600005E8
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 26: d_year, 47: p_brand
+  OutPut Exchange Id: 16
+
+  15:AGGREGATE (update serialize)
+  |  STREAMING
+  |  aggregate: sum[([13: lo_revenue, INT, true]); args: INT; result: BIGINT; args nullable: true; result nullable: true]
+  |  group by: [26: d_year, INT, true], [47: p_brand, VARCHAR(1073741824), true]
+  |  cardinality: 2835553
+  |
+  14:Project
+  |  output columns:
+  |  13 <-> [13: lo_revenue, INT, true]
+  |  26 <-> [26: d_year, INT, true]
+  |  47 <-> [47: p_brand, VARCHAR(1073741824), true]
+  |  cardinality: 5401054
+  |
+  13:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [4: lo_partkey, INT, true] = [43: p_partkey, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 2, build_expr = (43: p_partkey), remote = false
+  |  output columns: 13, 26, 47
+  |  can local shuffle: true
+  |  cardinality: 5401054
+  |
+  |----12:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 200000
+  |
+  9:Project
+  |  output columns:
+  |  4 <-> [4: lo_partkey, INT, true]
+  |  13 <-> [13: lo_revenue, INT, true]
+  |  26 <-> [26: d_year, INT, true]
+  |  cardinality: 5401054
+  |
+  8:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [6: lo_orderdate, INT, true] = [22: d_datekey, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 1, build_expr = (22: d_datekey), remote = false
+  |  output columns: 4, 13, 26
+  |  can local shuffle: false
+  |  cardinality: 5401054
+  |
+  |----7:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 2300
+  |
+  5:Project
+  |  output columns:
+  |  4 <-> [4: lo_partkey, INT, true]
+  |  6 <-> [6: lo_orderdate, INT, true]
+  |  13 <-> [13: lo_revenue, INT, true]
+  |  cardinality: 5401054
+  |
+  4:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [5: lo_suppkey, INT, true] = [56: s_suppkey, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 0, build_expr = (56: s_suppkey), remote = false
+  |  output columns: 4, 6, 13
+  |  can local shuffle: false
+  |  cardinality: 5401054
+  |
+  |----3:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 2000
+  |
+  0:IcebergScanNode
+     TABLE: ssb.lineorder
+     PREDICATES: 4: lo_partkey IS NOT NULL
+     TABLE VERSION: Snapshot@(8092092697599283673)
+     cardinality=5401054
+     avgRowSize=4.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 5401054
+     probe runtime filters:
+     - filter_id = 0, probe_expr = (5: lo_suppkey)
+     - filter_id = 1, probe_expr = (6: lo_orderdate)
+     - filter_id = 2, probe_expr = (4: lo_partkey)
+
+PLAN FRAGMENT 3(F05)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 12
+
+  11:Project
+  |  output columns:
+  |  43 <-> [43: p_partkey, INT, true]
+  |  47 <-> [47: p_brand, VARCHAR(1073741824), true]
+  |  cardinality: 200000
+  |
+  10:IcebergScanNode
+     TABLE: ssb.part
+     PREDICATES: 46: p_category = 'MFGR#12'
+     MIN/MAX PREDICATES: 46: p_category <= 'MFGR#12', 46: p_category >= 'MFGR#12'
+     TABLE VERSION: Snapshot@(6349766401983634153)
+     cardinality=200000
+     avgRowSize=3.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 200000
+
+PLAN FRAGMENT 4(F03)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 07
+
+  6:IcebergScanNode
+     TABLE: ssb.dates
+     PREDICATES: 22: d_datekey IS NOT NULL
+     TABLE VERSION: Snapshot@(647863998861664984)
+     cardinality=2300
+     avgRowSize=2.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 2300
+
+PLAN FRAGMENT 5(F01)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 03
+
+  2:Project
+  |  output columns:
+  |  56 <-> [56: s_suppkey, INT, true]
+  |  cardinality: 2000
+  |
+  1:IcebergScanNode
+     TABLE: ssb.supplier
+     PREDICATES: 61: s_region = 'AMERICA'
+     MIN/MAX PREDICATES: 61: s_region <= 'AMERICA', 61: s_region >= 'AMERICA'
+     TABLE VERSION: Snapshot@(4341238882444138957)
+     cardinality=2000
+     avgRowSize=2.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 2000

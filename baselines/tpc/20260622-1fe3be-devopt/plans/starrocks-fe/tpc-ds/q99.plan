@@ -1,0 +1,250 @@
+-- engine=starrocks
+-- suite=tpc-ds
+-- case=q99
+-- file=/Users/harbor/project/NovaRocks/sql-tests/tpc-ds/sql/q99.sql
+-- elapsed_sec=0.093
+-- exit_code=0
+
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 4.0627119092E8
+  Memory: 6368363.413200002
+
+PLAN FRAGMENT 0(F10)
+  Fragment Cost: 19404.0
+  Output Exprs:134: substr | 59: sm_type | 73: cc_name | 140: sum | 141: sum | 142: sum | 143: sum | 144: sum
+  Input Partition: UNPARTITIONED
+  RESULT SINK
+
+  23:MERGING-EXCHANGE
+     distribution type: GATHER
+     limit: 100
+     cardinality: 55
+
+PLAN FRAGMENT 1(F09)
+  Fragment Cost: 37906.0
+
+  Input Partition: HASH_PARTITIONED: 134: substr, 59: sm_type, 73: cc_name
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 23
+
+  22:TOP-N
+  |  order by: [134, VARCHAR, true] ASC, [59, VARCHAR(1073741824), true] ASC, [73, VARCHAR(1073741824), true] ASC
+  |  offset: 0
+  |  limit: 100
+  |  cardinality: 55
+  |
+  21:AGGREGATE (merge finalize)
+  |  aggregate: sum[([140: sum, BIGINT, true]); args: TINYINT; result: BIGINT; args nullable: true; result nullable: true], sum[([141: sum, BIGINT, true]); args: TINYINT; result: BIGINT; args nullable: true; result nullable: true], sum[([142: sum, BIGINT, true]); args: TINYINT; result: BIGINT; args nullable: true; result nullable: true], sum[([143: sum, BIGINT, true]); args: TINYINT; result: BIGINT; args nullable: true; result nullable: true], sum[([144: sum, BIGINT, true]); args: TINYINT; result: BIGINT; args nullable: true; result nullable: true]
+  |  group by: [134: substr, VARCHAR, true], [59: sm_type, VARCHAR(1073741824), true], [73: cc_name, VARCHAR(1073741824), true]
+  |  cardinality: 55
+  |
+  20:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [134: substr, VARCHAR, true], [59: sm_type, VARCHAR(1073741824), true], [73: cc_name, VARCHAR(1073741824), true]
+     cardinality: 100
+
+PLAN FRAGMENT 2(F00)
+  Fragment Cost: 2.1587468228640002E8
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 134: substr, 59: sm_type, 73: cc_name
+  OutPut Exchange Id: 20
+
+  19:TOP-N
+  |  order by: [134, VARCHAR, true] ASC, [59, VARCHAR(1073741824), true] ASC, [73, VARCHAR(1073741824), true] ASC
+  |  offset: 0
+  |  limit: 100
+  |  cardinality: 100
+  |
+  18:AGGREGATE (update serialize)
+  |  STREAMING
+  |  aggregate: sum[([135: case, TINYINT, true]); args: TINYINT; result: BIGINT; args nullable: true; result nullable: true], sum[([136: case, TINYINT, true]); args: TINYINT; result: BIGINT; args nullable: true; result nullable: true], sum[([137: case, TINYINT, true]); args: TINYINT; result: BIGINT; args nullable: true; result nullable: true], sum[([138: case, TINYINT, true]); args: TINYINT; result: BIGINT; args nullable: true; result nullable: true], sum[([139: case, TINYINT, true]); args: TINYINT; result: BIGINT; args nullable: true; result nullable: true]
+  |  group by: [134: substr, VARCHAR, true], [59: sm_type, VARCHAR(1073741824), true], [73: cc_name, VARCHAR(1073741824), true]
+  |  streaming preaggregation mode: force_preaggregation
+  |  cardinality: 715188
+  |
+  17:Project
+  |  output columns:
+  |  59 <-> [59: sm_type, VARCHAR(1073741824), true]
+  |  73 <-> [73: cc_name, VARCHAR(1073741824), true]
+  |  134 <-> substr[([41: w_warehouse_name, VARCHAR(1073741824), true], 1, 20); args: VARCHAR,INT,INT; result: VARCHAR; args nullable: true; result nullable: true]
+  |  135 <-> if[([147: subtract, BIGINT, true] <= 30, 1, 0); args: BOOLEAN,TINYINT,TINYINT; result: TINYINT; args nullable: true; result nullable: true]
+  |  136 <-> if[(([147: subtract, BIGINT, true] > 30) AND ([147: subtract, BIGINT, true] <= 60), 1, 0); args: BOOLEAN,TINYINT,TINYINT; result: TINYINT; args nullable: true; result nullable: true]
+  |  137 <-> if[(([147: subtract, BIGINT, true] > 60) AND ([147: subtract, BIGINT, true] <= 90), 1, 0); args: BOOLEAN,TINYINT,TINYINT; result: TINYINT; args nullable: true; result nullable: true]
+  |  138 <-> if[(([147: subtract, BIGINT, true] > 90) AND ([147: subtract, BIGINT, true] <= 120), 1, 0); args: BOOLEAN,TINYINT,TINYINT; result: TINYINT; args nullable: true; result nullable: true]
+  |  139 <-> if[([147: subtract, BIGINT, true] > 120, 1, 0); args: BOOLEAN,TINYINT,TINYINT; result: TINYINT; args nullable: true; result nullable: true]
+  |  common expressions:
+  |  145 <-> cast([3: cs_ship_date_sk, INT, true] as BIGINT)
+  |  146 <-> cast([1: cs_sold_date_sk, INT, true] as BIGINT)
+  |  147 <-> [145: cast, BIGINT, true] - [146: cast, BIGINT, true]
+  |  cardinality: 1297393
+  |
+  16:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [15: cs_warehouse_sk, INT, true] = [39: w_warehouse_sk, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 3, build_expr = (39: w_warehouse_sk), remote = false
+  |  output columns: 1, 3, 41, 59, 73
+  |  can local shuffle: false
+  |  cardinality: 1297393
+  |
+  |----15:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 5
+  |
+  13:Project
+  |  output columns:
+  |  1 <-> [1: cs_sold_date_sk, INT, true]
+  |  3 <-> [3: cs_ship_date_sk, INT, true]
+  |  15 <-> [15: cs_warehouse_sk, INT, true]
+  |  59 <-> [59: sm_type, VARCHAR(1073741824), true]
+  |  73 <-> [73: cc_name, VARCHAR(1073741824), true]
+  |  cardinality: 1297393
+  |
+  12:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [12: cs_call_center_sk, INT, true] = [67: cc_call_center_sk, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 2, build_expr = (67: cc_call_center_sk), remote = false
+  |  output columns: 1, 3, 15, 59, 73
+  |  can local shuffle: false
+  |  cardinality: 1297393
+  |
+  |----11:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 5
+  |
+  9:Project
+  |  output columns:
+  |  1 <-> [1: cs_sold_date_sk, INT, true]
+  |  3 <-> [3: cs_ship_date_sk, INT, true]
+  |  12 <-> [12: cs_call_center_sk, INT, true]
+  |  15 <-> [15: cs_warehouse_sk, INT, true]
+  |  59 <-> [59: sm_type, VARCHAR(1073741824), true]
+  |  cardinality: 1297393
+  |
+  8:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [14: cs_ship_mode_sk, INT, true] = [57: sm_ship_mode_sk, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 1, build_expr = (57: sm_ship_mode_sk), remote = false
+  |  output columns: 1, 3, 12, 15, 59
+  |  can local shuffle: false
+  |  cardinality: 1297393
+  |
+  |----7:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 18
+  |
+  5:Project
+  |  output columns:
+  |  1 <-> [1: cs_sold_date_sk, INT, true]
+  |  3 <-> [3: cs_ship_date_sk, INT, true]
+  |  12 <-> [12: cs_call_center_sk, INT, true]
+  |  14 <-> [14: cs_ship_mode_sk, INT, true]
+  |  15 <-> [15: cs_warehouse_sk, INT, true]
+  |  cardinality: 1297393
+  |
+  4:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [3: cs_ship_date_sk, INT, true] = [102: d_date_sk, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 0, build_expr = (102: d_date_sk), remote = false
+  |  output columns: 1, 3, 12, 14, 15
+  |  can local shuffle: false
+  |  cardinality: 1297393
+  |
+  |----3:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 7380
+  |
+  0:IcebergScanNode
+     TABLE: tpcds.catalog_sales
+     PREDICATES: 15: cs_warehouse_sk IS NOT NULL
+     TABLE VERSION: Snapshot@(3096389489357933185)
+     cardinality=1297393
+     avgRowSize=5.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 1297393
+     probe runtime filters:
+     - filter_id = 0, probe_expr = (3: cs_ship_date_sk)
+     - filter_id = 1, probe_expr = (14: cs_ship_mode_sk)
+     - filter_id = 2, probe_expr = (12: cs_call_center_sk)
+     - filter_id = 3, probe_expr = (15: cs_warehouse_sk)
+
+PLAN FRAGMENT 3(F07)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 15
+
+  14:IcebergScanNode
+     TABLE: tpcds.warehouse
+     PREDICATES: 39: w_warehouse_sk IS NOT NULL
+     TABLE VERSION: Snapshot@(251089535780523205)
+     cardinality=5
+     avgRowSize=2.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 5
+
+PLAN FRAGMENT 4(F05)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 11
+
+  10:IcebergScanNode
+     TABLE: tpcds.call_center
+     PREDICATES: 67: cc_call_center_sk IS NOT NULL
+     TABLE VERSION: Snapshot@(503885453998060256)
+     cardinality=5
+     avgRowSize=2.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 5
+
+PLAN FRAGMENT 5(F03)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 07
+
+  6:IcebergScanNode
+     TABLE: tpcds.ship_mode
+     PREDICATES: 57: sm_ship_mode_sk IS NOT NULL
+     TABLE VERSION: Snapshot@(3720867965176576029)
+     cardinality=18
+     avgRowSize=2.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 18
+
+PLAN FRAGMENT 6(F01)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 03
+
+  2:Project
+  |  output columns:
+  |  102 <-> [102: d_date_sk, INT, true]
+  |  cardinality: 7380
+  |
+  1:IcebergScanNode
+     TABLE: tpcds.date_dim
+     PREDICATES: 105: d_month_seq >= 1200, 105: d_month_seq <= 1211
+     MIN/MAX PREDICATES: 105: d_month_seq >= 1200, 105: d_month_seq <= 1211
+     TABLE VERSION: Snapshot@(149066723028526449)
+     cardinality=7380
+     avgRowSize=2.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 7380

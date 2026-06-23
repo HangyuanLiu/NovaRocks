@@ -596,6 +596,9 @@ fn handle_standalone_report_exec_status(
     params: crate::frontend_service::TReportExecStatusParams,
 ) -> Result<(), EngineError> {
     let failure = failed_query_from_report(&params).map_err(EngineError::protocol_decode)?;
+    let profile_report_accepted =
+        crate::runtime::coordinator::record_standalone_query_profile_report(&params)
+            .map_err(EngineError::protocol_decode)?;
     match crate::runtime::write_coordinator::lookup_writer_report(&params)
         .map_err(EngineError::protocol_decode)?
     {
@@ -624,6 +627,8 @@ fn handle_standalone_report_exec_status(
         crate::runtime::write_coordinator::WriterReportLookup::UnknownQuery { query_id } => {
             if let Some(failure) = failure {
                 mark_failed_query_report(failure);
+                Ok(())
+            } else if profile_report_accepted {
                 Ok(())
             } else {
                 Err(EngineError::write_coordinator_gone(query_id))

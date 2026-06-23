@@ -1,0 +1,257 @@
+-- engine=starrocks
+-- suite=ssb
+-- case=q4.2
+-- file=/Users/harbor/project/NovaRocks/sql-tests/ssb/sql/q4.2.sql
+-- elapsed_sec=0.106
+-- exit_code=0
+
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 1.7153666300889559E9
+  Memory: 3.1524823374600947E8
+
+PLAN FRAGMENT 0(F10)
+  Fragment Cost: 3.9390088632221246E8
+  Output Exprs:26: d_year | 59: s_nation | 69: p_category | 81: expr
+  Input Partition: UNPARTITIONED
+  RESULT SINK
+
+  25:MERGING-EXCHANGE
+     distribution type: GATHER
+     cardinality: 1641254
+
+PLAN FRAGMENT 1(F09)
+  Fragment Cost: 6.760029950072439E8
+
+  Input Partition: HASH_PARTITIONED: 26: d_year, 59: s_nation, 69: p_category
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 25
+
+  24:SORT
+  |  order by: [26, INT, true] ASC, [59, VARCHAR(1073741824), true] ASC, [69, VARCHAR(1073741824), true] ASC
+  |  offset: 0
+  |  cardinality: 1641254
+  |
+  23:Project
+  |  output columns:
+  |  26 <-> [26: d_year, INT, true]
+  |  59 <-> [59: s_nation, VARCHAR(1073741824), true]
+  |  69 <-> [69: p_category, VARCHAR(1073741824), true]
+  |  81 <-> [79: sum, BIGINT, true] - [80: sum, BIGINT, true]
+  |  cardinality: 1641254
+  |
+  22:AGGREGATE (merge finalize)
+  |  aggregate: sum[([79: sum, BIGINT, true]); args: INT; result: BIGINT; args nullable: true; result nullable: true], sum[([80: sum, BIGINT, true]); args: INT; result: BIGINT; args nullable: true; result nullable: true]
+  |  group by: [26: d_year, INT, true], [59: s_nation, VARCHAR(1073741824), true], [69: p_category, VARCHAR(1073741824), true]
+  |  cardinality: 1641254
+  |
+  21:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [26: d_year, INT, true], [59: s_nation, VARCHAR(1073741824), true], [69: p_category, VARCHAR(1073741824), true]
+     cardinality: 2977331
+
+PLAN FRAGMENT 2(F00)
+  Fragment Cost: 7.169569019487E8
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 26: d_year, 59: s_nation, 69: p_category
+  OutPut Exchange Id: 21
+
+  20:AGGREGATE (update serialize)
+  |  STREAMING
+  |  aggregate: sum[([13: lo_revenue, INT, true]); args: INT; result: BIGINT; args nullable: true; result nullable: true], sum[([14: lo_supplycost, INT, true]); args: INT; result: BIGINT; args nullable: true; result nullable: true]
+  |  group by: [26: d_year, INT, true], [59: s_nation, VARCHAR(1073741824), true], [69: p_category, VARCHAR(1073741824), true]
+  |  cardinality: 2977331
+  |
+  19:Project
+  |  output columns:
+  |  13 <-> [13: lo_revenue, INT, true]
+  |  14 <-> [14: lo_supplycost, INT, true]
+  |  26 <-> [26: d_year, INT, true]
+  |  59 <-> [59: s_nation, VARCHAR(1073741824), true]
+  |  69 <-> [69: p_category, VARCHAR(1073741824), true]
+  |  cardinality: 5401054
+  |
+  18:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [5: lo_suppkey, INT, true] = [55: s_suppkey, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 3, build_expr = (55: s_suppkey), remote = false
+  |  output columns: 13, 14, 26, 59, 69
+  |  can local shuffle: true
+  |  cardinality: 5401054
+  |
+  |----17:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 2000
+  |
+  14:Project
+  |  output columns:
+  |  5 <-> [5: lo_suppkey, INT, true]
+  |  13 <-> [13: lo_revenue, INT, true]
+  |  14 <-> [14: lo_supplycost, INT, true]
+  |  26 <-> [26: d_year, INT, true]
+  |  69 <-> [69: p_category, VARCHAR(1073741824), true]
+  |  cardinality: 5401054
+  |
+  13:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [4: lo_partkey, INT, true] = [66: p_partkey, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 2, build_expr = (66: p_partkey), remote = false
+  |  output columns: 5, 13, 14, 26, 69
+  |  can local shuffle: false
+  |  cardinality: 5401054
+  |
+  |----12:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 100000
+  |
+  9:Project
+  |  output columns:
+  |  4 <-> [4: lo_partkey, INT, true]
+  |  5 <-> [5: lo_suppkey, INT, true]
+  |  13 <-> [13: lo_revenue, INT, true]
+  |  14 <-> [14: lo_supplycost, INT, true]
+  |  26 <-> [26: d_year, INT, true]
+  |  cardinality: 5401054
+  |
+  8:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [6: lo_orderdate, INT, true] = [22: d_datekey, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 1, build_expr = (22: d_datekey), remote = false
+  |  output columns: 4, 5, 13, 14, 26
+  |  can local shuffle: false
+  |  cardinality: 5401054
+  |
+  |----7:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 1278
+  |
+  5:Project
+  |  output columns:
+  |  4 <-> [4: lo_partkey, INT, true]
+  |  5 <-> [5: lo_suppkey, INT, true]
+  |  6 <-> [6: lo_orderdate, INT, true]
+  |  13 <-> [13: lo_revenue, INT, true]
+  |  14 <-> [14: lo_supplycost, INT, true]
+  |  cardinality: 5401054
+  |
+  4:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [3: lo_custkey, INT, true] = [43: c_custkey, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 0, build_expr = (43: c_custkey), remote = false
+  |  output columns: 4, 5, 6, 13, 14
+  |  can local shuffle: false
+  |  cardinality: 5401054
+  |
+  |----3:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 30000
+  |
+  0:IcebergScanNode
+     TABLE: ssb.lineorder
+     PREDICATES: 6: lo_orderdate IS NOT NULL
+     TABLE VERSION: Snapshot@(8092092697599283673)
+     cardinality=5401054
+     avgRowSize=6.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 5401054
+     probe runtime filters:
+     - filter_id = 0, probe_expr = (3: lo_custkey)
+     - filter_id = 1, probe_expr = (6: lo_orderdate)
+     - filter_id = 2, probe_expr = (4: lo_partkey)
+     - filter_id = 3, probe_expr = (5: lo_suppkey)
+
+PLAN FRAGMENT 3(F07)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 17
+
+  16:Project
+  |  output columns:
+  |  55 <-> [55: s_suppkey, INT, true]
+  |  59 <-> [59: s_nation, VARCHAR(1073741824), true]
+  |  cardinality: 2000
+  |
+  15:IcebergScanNode
+     TABLE: ssb.supplier
+     PREDICATES: 60: s_region = 'AMERICA'
+     MIN/MAX PREDICATES: 60: s_region <= 'AMERICA', 60: s_region >= 'AMERICA'
+     TABLE VERSION: Snapshot@(4341238882444138957)
+     cardinality=2000
+     avgRowSize=3.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 2000
+
+PLAN FRAGMENT 4(F05)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 12
+
+  11:Project
+  |  output columns:
+  |  66 <-> [66: p_partkey, INT, true]
+  |  69 <-> [69: p_category, VARCHAR(1073741824), true]
+  |  cardinality: 100000
+  |
+  10:IcebergScanNode
+     TABLE: ssb.part
+     PREDICATES: 68: p_mfgr IN ('MFGR#1', 'MFGR#2')
+     MIN/MAX PREDICATES: 68: p_mfgr >= 'MFGR#1', 68: p_mfgr <= 'MFGR#2'
+     TABLE VERSION: Snapshot@(6349766401983634153)
+     cardinality=100000
+     avgRowSize=3.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 100000
+
+PLAN FRAGMENT 5(F03)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 07
+
+  6:IcebergScanNode
+     TABLE: ssb.dates
+     PREDICATES: 26: d_year IN (1997, 1998)
+     MIN/MAX PREDICATES: 26: d_year >= 1997, 26: d_year <= 1998
+     TABLE VERSION: Snapshot@(647863998861664984)
+     cardinality=1278
+     avgRowSize=2.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 1278
+
+PLAN FRAGMENT 6(F01)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 03
+
+  2:Project
+  |  output columns:
+  |  43 <-> [43: c_custkey, INT, true]
+  |  cardinality: 30000
+  |
+  1:IcebergScanNode
+     TABLE: ssb.customer
+     PREDICATES: 48: c_region = 'AMERICA'
+     MIN/MAX PREDICATES: 48: c_region <= 'AMERICA', 48: c_region >= 'AMERICA'
+     TABLE VERSION: Snapshot@(461654358797894755)
+     cardinality=30000
+     avgRowSize=2.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 30000

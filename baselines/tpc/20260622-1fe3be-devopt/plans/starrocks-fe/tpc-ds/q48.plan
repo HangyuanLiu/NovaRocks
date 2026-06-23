@@ -1,0 +1,233 @@
+-- engine=starrocks
+-- suite=tpc-ds
+-- case=q48
+-- file=/Users/harbor/project/NovaRocks/sql-tests/tpc-ds/sql/q48.sql
+-- elapsed_sec=0.093
+-- exit_code=0
+
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 3.0148851106281644E8
+  Memory: 1.4947224578125E7
+
+PLAN FRAGMENT 0(F11)
+  Fragment Cost: 36.0
+  Output Exprs:123: sum
+  Input Partition: UNPARTITIONED
+  RESULT SINK
+
+  22:AGGREGATE (merge finalize)
+  |  aggregate: sum[([123: sum, BIGINT, true]); args: INT; result: BIGINT; args nullable: true; result nullable: true]
+  |  cardinality: 1
+  |
+  21:EXCHANGE
+     distribution type: GATHER
+     cardinality: 1
+
+PLAN FRAGMENT 1(F06)
+  Fragment Cost: 1.153751704826582E8
+
+  Input Partition: HASH_PARTITIONED: 61: cd_demo_sk
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 21
+
+  20:AGGREGATE (update serialize)
+  |  aggregate: sum[([11: ss_quantity, INT, true]); args: INT; result: BIGINT; args nullable: true; result nullable: true]
+  |  cardinality: 1
+  |
+  19:Project
+  |  output columns:
+  |  11 <-> [11: ss_quantity, INT, true]
+  |  cardinality: 280635
+  |
+  18:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [8: ss_store_sk, INT, true] = [28: s_store_sk, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 3, build_expr = (28: s_store_sk), remote = true
+  |  output columns: 11
+  |  can local shuffle: true
+  |  cardinality: 280635
+  |
+  |----17:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 11
+  |
+  15:Project
+  |  output columns:
+  |  8 <-> [8: ss_store_sk, INT, true]
+  |  11 <-> [11: ss_quantity, INT, true]
+  |  cardinality: 280635
+  |
+  14:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [1: ss_sold_date_sk, INT, true] = [91: d_date_sk, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 2, build_expr = (91: d_date_sk), remote = true
+  |  output columns: 8, 11
+  |  can local shuffle: false
+  |  cardinality: 280635
+  |
+  |----13:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 14760
+  |
+  10:Project
+  |  output columns:
+  |  1 <-> [1: ss_sold_date_sk, INT, true]
+  |  8 <-> [8: ss_store_sk, INT, true]
+  |  11 <-> [11: ss_quantity, INT, true]
+  |  cardinality: 280635
+  |
+  9:HASH JOIN
+  |  join op: INNER JOIN (PARTITIONED)
+  |  equal join conjunct: [61: cd_demo_sk, INT, true] = [5: ss_cdemo_sk, INT, true]
+  |  other join predicates: (((([63: cd_marital_status, VARCHAR(1073741824), true] = 'M') AND ([64: cd_education_status, VARCHAR(1073741824), true] = '4 yr Degree')) AND (([14: ss_sales_price, DECIMAL32(7,2), true] >= 100.00) AND ([14: ss_sales_price, DECIMAL32(7,2), true] <= 150.00))) OR ((([63: cd_marital_status, VARCHAR(1073741824), true] = 'D') AND ([64: cd_education_status, VARCHAR(1073741824), true] = '2 yr Degree')) AND (([14: ss_sales_price, DECIMAL32(7,2), true] >= 50.00) AND ([14: ss_sales_price, DECIMAL32(7,2), true] <= 100.00)))) OR ((([63: cd_marital_status, VARCHAR(1073741824), true] = 'S') AND ([64: cd_education_status, VARCHAR(1073741824), true] = 'College')) AND (([14: ss_sales_price, DECIMAL32(7,2), true] >= 150.00) AND ([14: ss_sales_price, DECIMAL32(7,2), true] <= 200.00)))
+  |  build runtime filters:
+  |  - filter_id = 1, build_expr = (5: ss_cdemo_sk), remote = true
+  |  output columns: 1, 8, 11
+  |  can local shuffle: false
+  |  cardinality: 280635
+  |
+  |----8:EXCHANGE
+  |       distribution type: SHUFFLE
+  |       partition exprs: [5: ss_cdemo_sk, INT, true]
+  |       cardinality: 641452
+  |       probe runtime filters:
+  |       - filter_id = 2, probe_expr = (1: ss_sold_date_sk)
+  |       - filter_id = 3, probe_expr = (8: ss_store_sk)
+  |
+  1:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [61: cd_demo_sk, INT, true]
+     cardinality: 1920800
+
+PLAN FRAGMENT 2(F09)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 17
+
+  16:IcebergScanNode
+     TABLE: tpcds.store
+     PREDICATES: 28: s_store_sk IS NOT NULL
+     TABLE VERSION: Snapshot@(7269431241370138871)
+     cardinality=11
+     avgRowSize=1.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 11
+
+PLAN FRAGMENT 3(F07)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 13
+
+  12:Project
+  |  output columns:
+  |  91 <-> [91: d_date_sk, INT, true]
+  |  cardinality: 14760
+  |
+  11:IcebergScanNode
+     TABLE: tpcds.date_dim
+     PREDICATES: 97: d_year = 2000
+     MIN/MAX PREDICATES: 97: d_year <= 2000, 97: d_year >= 2000
+     TABLE VERSION: Snapshot@(149066723028526449)
+     cardinality=14760
+     avgRowSize=2.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 14760
+
+PLAN FRAGMENT 4(F02)
+  Fragment Cost: 6.1720515253750004E7
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 5: ss_cdemo_sk
+  OutPut Exchange Id: 08
+
+  7:Project
+  |  output columns:
+  |  1 <-> [1: ss_sold_date_sk, INT, true]
+  |  5 <-> [5: ss_cdemo_sk, INT, true]
+  |  8 <-> [8: ss_store_sk, INT, true]
+  |  11 <-> [11: ss_quantity, INT, true]
+  |  14 <-> [14: ss_sales_price, DECIMAL32(7,2), true]
+  |  cardinality: 641452
+  |
+  6:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [7: ss_addr_sk, INT, true] = [74: ca_address_sk, INT, true]
+  |  other join predicates: (((([82: ca_state, VARCHAR(1073741824), true] IN ('CO', 'OH', 'TX')) AND ([23: ss_net_profit, DECIMAL32(7,2), true] >= 0)) AND ([23: ss_net_profit, DECIMAL32(7,2), true] <= 2000)) OR ((([82: ca_state, VARCHAR(1073741824), true] IN ('OR', 'MN', 'KY')) AND ([23: ss_net_profit, DECIMAL32(7,2), true] >= 150)) AND ([23: ss_net_profit, DECIMAL32(7,2), true] <= 3000))) OR ((([82: ca_state, VARCHAR(1073741824), true] IN ('VA', 'CA', 'MS')) AND ([23: ss_net_profit, DECIMAL32(7,2), true] >= 50)) AND ([23: ss_net_profit, DECIMAL32(7,2), true] <= 25000))
+  |  build runtime filters:
+  |  - filter_id = 0, build_expr = (74: ca_address_sk), remote = false
+  |  output columns: 1, 5, 8, 11, 14
+  |  can local shuffle: true
+  |  cardinality: 641452
+  |
+  |----5:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 50000
+  |
+  2:IcebergScanNode
+     TABLE: tpcds.store_sales
+     PREDICATES: 14: ss_sales_price >= 50.00, 14: ss_sales_price <= 200.00, 23: ss_net_profit >= 0, 23: ss_net_profit <= 25000
+     MIN/MAX PREDICATES: 14: ss_sales_price >= 50.00, 14: ss_sales_price <= 200.00, 23: ss_net_profit >= 0, 23: ss_net_profit <= 25000
+     TABLE VERSION: Snapshot@(7480037505330912616)
+     cardinality=2880404
+     avgRowSize=7.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 2880404
+     probe runtime filters:
+     - filter_id = 0, probe_expr = (7: ss_addr_sk)
+     - filter_id = 2, probe_expr = (1: ss_sold_date_sk)
+     - filter_id = 3, probe_expr = (8: ss_store_sk)
+
+PLAN FRAGMENT 5(F03)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 05
+
+  4:Project
+  |  output columns:
+  |  74 <-> [74: ca_address_sk, INT, true]
+  |  82 <-> [82: ca_state, VARCHAR(1073741824), true]
+  |  cardinality: 50000
+  |
+  3:IcebergScanNode
+     TABLE: tpcds.customer_address
+     PREDICATES: 82: ca_state IN ('CO', 'OH', 'TX', 'OR', 'MN', 'KY', 'VA', 'CA', 'MS'), 84: ca_country = 'United States'
+     MIN/MAX PREDICATES: 82: ca_state >= 'CA', 82: ca_state <= 'VA', 84: ca_country <= 'United States', 84: ca_country >= 'United States'
+     TABLE VERSION: Snapshot@(6178518588637829114)
+     cardinality=50000
+     avgRowSize=3.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 50000
+
+PLAN FRAGMENT 6(F00)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 61: cd_demo_sk
+  OutPut Exchange Id: 01
+
+  0:IcebergScanNode
+     TABLE: tpcds.customer_demographics
+     PREDICATES: 63: cd_marital_status IN ('M', 'D', 'S'), 64: cd_education_status IN ('4 yr Degree', '2 yr Degree', 'College')
+     MIN/MAX PREDICATES: 63: cd_marital_status >= 'D', 63: cd_marital_status <= 'S', 64: cd_education_status >= '2 yr Degree', 64: cd_education_status <= 'College'
+     TABLE VERSION: Snapshot@(4396025152219650157)
+     cardinality=1920800
+     avgRowSize=3.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 1920800
+     probe runtime filters:
+     - filter_id = 1, probe_expr = (61: cd_demo_sk)

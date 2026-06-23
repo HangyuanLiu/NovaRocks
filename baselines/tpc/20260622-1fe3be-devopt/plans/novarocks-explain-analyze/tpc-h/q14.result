@@ -1,0 +1,40 @@
+Explain String
+Planning: 39.2ms / Execution: 293.1ms / Rows: 1
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+9:PROJECT [100.00 * sum(Case { operand: None, when_then: [(TypedExpr { kind: Like { expr: TypedExpr { kind: ColumnRef { column_id: c23, qualifier: None, column: "p_type" }, data_type: Utf8, nullable: true }, pattern: TypedExpr { kind: Literal(String("PROMO%")), data_type: Utf8, nullable: false }, negated: false }, data_type: Boolean, nullable: false }, TypedExpr { kind: BinaryOp { left: TypedExpr { kind: ColumnRef { column_id: c6, qualifier: None, column: "l_extendedprice" }, data_type: Decimal128(15, 2), nullable: true }, op: Mul, right: TypedExpr { kind: Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c7, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }), data_type: Decimal128(22, 2), nullable: true } }, data_type: Decimal128(37, 4), nullable: true })], else_expr: Some(TypedExpr { kind: Cast { expr: TypedExpr { kind: Literal(Int(0)), data_type: Int64, nullable: false }, target: Decimal128(37, 4) }, data_type: Decimal128(37, 4), nullable: true }) }) / sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c7, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) AS promo_revenue] stats={rows=1 conf=estimated} act={rows=1 time=12.3us peak=32B}
+  8:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=90.6us peak=65.0KB}
+    aggregations: sum(CASE WHEN p_type LIKE 'PROMO%' THEN l_extendedprice * 1 - l_discount ELSE CAST(0 AS Decimal128(37, 4)) END), sum(l_extendedprice * 1 - l_discount)
+    7:GATHER stats={rows=1 conf=estimated} act={rows=12 time=13.6us peak=0B}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 7
+    PARTITION: UNPARTITIONED
+6:HASH AGGREGATE (LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=4.2ms peak=811.1KB}
+  aggregations: sum(CASE WHEN p_type LIKE 'PROMO%' THEN __cse_2 ELSE CAST(0 AS Decimal128(37, 4)) END), sum(__cse_2)
+  5:PROJECT [l_partkey, l_extendedprice, l_discount, l_shipdate, p_partkey, p_type, 1 - l_discount AS __cse_0, 1 - l_discount AS __cse_1, l_extendedprice * 1 - l_discount AS __cse_2] stats={rows=966103 conf=estimated} act={rows=70245 time=18.0ms peak=76.6KB}
+    4:HASH JOIN (BROADCAST, INNER, eq: [l_partkey = p_partkey]) stats={rows=966103 conf=estimated} act={rows=670245 time=67.9ms peak=120.6MB}
+      build runtime filters:
+      - filter_id = 0, build_expr = (p_partkey)
+      1:SCAN tpch.lineitem stats={rows=1068308 conf=estimated} act={rows=70245 time=46.0us peak=0B}
+           TABLE: tpch.lineitem
+           columns: l_partkey, l_extendedprice, l_discount, l_shipdate
+           min-max stats
+           predicates: l_shipdate >= 9893 AND l_shipdate < 9921 AND l_partkey IS NOT NULL
+          probe runtime filters:
+          - filter_id = 0, probe_expr = (l_partkey)
+      3:GATHER stats={rows=180000 conf=estimated} act={rows=600000 time=17.7us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: UNPARTITIONED
+2:SCAN tpch.part stats={rows=180000 conf=estimated} act={rows=200000 time=1.1ms peak=73.6MB}
+     TABLE: tpch.part
+     columns: p_partkey, p_type
+     min-max stats
+     predicates: p_partkey IS NOT NULL

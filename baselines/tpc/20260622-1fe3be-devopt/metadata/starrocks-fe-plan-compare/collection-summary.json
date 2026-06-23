@@ -1,0 +1,60 @@
+{
+  "artifact_dir": "/Users/harbor/project/NovaRocks/logs/plan-compare/20260613-201518",
+  "engines": {
+    "novarocks": {
+      "catalog": "plan_cmp_nr",
+      "port": "9132"
+    },
+    "starrocks": {
+      "catalog": "plan_cmp_sr",
+      "port": "9030"
+    }
+  },
+  "errors": [],
+  "finished_at": "2026-06-13T20:18:42+0800",
+  "started_at": "2026-06-13T20:17:34+0800",
+  "suites": {
+    "ssb": {
+      "engines": {
+        "novarocks": {
+          "fail": 0,
+          "ok": 13
+        },
+        "starrocks": {
+          "fail": 0,
+          "ok": 13
+        }
+      },
+      "files": 13,
+      "statements": 13
+    },
+    "tpc-ds": {
+      "engines": {
+        "novarocks": {
+          "fail": 0,
+          "ok": 103
+        },
+        "starrocks": {
+          "fail": 0,
+          "ok": 103
+        }
+      },
+      "files": 99,
+      "statements": 103
+    },
+    "tpc-h": {
+      "engines": {
+        "novarocks": {
+          "fail": 0,
+          "ok": 22
+        },
+        "starrocks": {
+          "fail": 0,
+          "ok": 22
+        }
+      },
+      "files": 22,
+      "statements": 22
+    }
+  }
+}

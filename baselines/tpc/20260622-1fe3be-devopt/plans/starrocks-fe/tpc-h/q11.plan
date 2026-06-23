@@ -1,0 +1,286 @@
+-- engine=starrocks
+-- suite=tpc-h
+-- case=q11
+-- file=/Users/harbor/project/NovaRocks/sql-tests/tpc-h/sql/q11.sql
+-- elapsed_sec=0.114
+-- exit_code=0
+
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 2.16144232E8
+  Memory: 1.09476496E7
+
+PLAN FRAGMENT 0(F13)
+  Fragment Cost: 1.2959999999999985E7
+  Output Exprs:1: ps_partkey | 30: sum
+  Input Partition: UNPARTITIONED
+  RESULT SINK
+
+  31:MERGING-EXCHANGE
+     distribution type: GATHER
+     cardinality: 90000
+
+PLAN FRAGMENT 1(F05)
+  Fragment Cost: 8.1726456E7
+
+  Input Partition: HASH_PARTITIONED: 1: ps_partkey
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 31
+
+  30:SORT
+  |  order by: [30, DECIMAL128(38,2), true] DESC
+  |  offset: 0
+  |  cardinality: 90000
+  |
+  29:Project
+  |  output columns:
+  |  1 <-> [1: ps_partkey, INT, true]
+  |  30 <-> [30: sum, DECIMAL128(38,2), true]
+  |  cardinality: 90000
+  |
+  28:NESTLOOP JOIN
+  |  join op: INNER JOIN
+  |  other join predicates: cast([30: sum, DECIMAL128(38,2), true] as DOUBLE) > cast([61: expr, DECIMAL128(38,12), true] as DOUBLE)
+  |  can local shuffle: false
+  |  cardinality: 90000
+  |
+  |----27:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 1
+  |
+  12:AGGREGATE (merge finalize)
+  |  aggregate: sum[([30: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |  group by: [1: ps_partkey, INT, true]
+  |  cardinality: 180000
+  |
+  11:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [1: ps_partkey, INT, true]
+     cardinality: 360000
+
+PLAN FRAGMENT 2(F11)
+  Fragment Cost: 104.0
+
+  Input Partition: UNPARTITIONED
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 27
+
+  26:Project
+  |  output columns:
+  |  61 <-> [60: sum, DECIMAL128(38,2), true] * 0.0001000000
+  |  cardinality: 1
+  |
+  25:AGGREGATE (merge finalize)
+  |  aggregate: sum[([60: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |  cardinality: 1
+  |
+  24:EXCHANGE
+     distribution type: GATHER
+     cardinality: 1
+
+PLAN FRAGMENT 3(F06)
+  Fragment Cost: 2.03226032E7
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 24
+
+  23:AGGREGATE (update serialize)
+  |  aggregate: sum[(cast([34: ps_supplycost, DECIMAL64(15,2), true] as DECIMAL128(15,2)) * cast([33: ps_availqty, INT, true] as DECIMAL128(9,0))); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |  cardinality: 1
+  |
+  22:Project
+  |  output columns:
+  |  33 <-> [33: ps_availqty, INT, true]
+  |  34 <-> [34: ps_supplycost, DECIMAL64(15,2), true]
+  |  cardinality: 720000
+  |
+  21:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [32: ps_suppkey, INT, true] = [40: s_suppkey, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 3, build_expr = (40: s_suppkey), remote = false
+  |  output columns: 33, 34
+  |  can local shuffle: true
+  |  cardinality: 720000
+  |
+  |----20:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 9000
+  |
+  13:IcebergScanNode
+     TABLE: tpch.partsupp
+     PREDICATES: 32: ps_suppkey IS NOT NULL
+     TABLE VERSION: Snapshot@(3548303098888051128)
+     cardinality=720000
+     avgRowSize=3.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 720000
+     probe runtime filters:
+     - filter_id = 3, probe_expr = (32: ps_suppkey)
+
+PLAN FRAGMENT 4(F07)
+  Fragment Cost: 90600.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 20
+
+  19:Project
+  |  output columns:
+  |  40 <-> [40: s_suppkey, INT, true]
+  |  cardinality: 9000
+  |
+  18:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [43: s_nationkey, INT, true] = [51: n_nationkey, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 2, build_expr = (51: n_nationkey), remote = false
+  |  output columns: 40
+  |  can local shuffle: true
+  |  cardinality: 9000
+  |
+  |----17:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 25
+  |
+  14:IcebergScanNode
+     TABLE: tpch.supplier
+     PREDICATES: 40: s_suppkey IS NOT NULL
+     TABLE VERSION: Snapshot@(7110507688499337981)
+     cardinality=9000
+     avgRowSize=2.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 9000
+     probe runtime filters:
+     - filter_id = 2, probe_expr = (43: s_nationkey)
+
+PLAN FRAGMENT 5(F08)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 17
+
+  16:Project
+  |  output columns:
+  |  51 <-> [51: n_nationkey, INT, true]
+  |  cardinality: 25
+  |
+  15:IcebergScanNode
+     TABLE: tpch.nation
+     PREDICATES: 52: n_name = 'PERU'
+     MIN/MAX PREDICATES: 52: n_name <= 'PERU', 52: n_name >= 'PERU'
+     TABLE VERSION: Snapshot@(775196322490798)
+     cardinality=25
+     avgRowSize=2.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 25
+
+PLAN FRAGMENT 6(F00)
+  Fragment Cost: 2.47866E7
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 1: ps_partkey
+  OutPut Exchange Id: 11
+
+  10:AGGREGATE (update serialize)
+  |  STREAMING
+  |  aggregate: sum[([29: expr, DECIMAL128(24,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |  group by: [1: ps_partkey, INT, true]
+  |  cardinality: 360000
+  |
+  9:Project
+  |  output columns:
+  |  1 <-> [1: ps_partkey, INT, true]
+  |  29 <-> cast([4: ps_supplycost, DECIMAL64(15,2), true] as DECIMAL128(15,2)) * cast([3: ps_availqty, INT, true] as DECIMAL128(9,0))
+  |  cardinality: 720000
+  |
+  8:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [2: ps_suppkey, INT, true] = [10: s_suppkey, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 1, build_expr = (10: s_suppkey), remote = false
+  |  output columns: 1, 3, 4
+  |  can local shuffle: true
+  |  cardinality: 720000
+  |
+  |----7:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 9000
+  |
+  0:IcebergScanNode
+     TABLE: tpch.partsupp
+     PREDICATES: 2: ps_suppkey IS NOT NULL
+     TABLE VERSION: Snapshot@(3548303098888051128)
+     cardinality=720000
+     avgRowSize=4.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 720000
+     probe runtime filters:
+     - filter_id = 1, probe_expr = (2: ps_suppkey)
+
+PLAN FRAGMENT 7(F01)
+  Fragment Cost: 90600.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 07
+
+  6:Project
+  |  output columns:
+  |  10 <-> [10: s_suppkey, INT, true]
+  |  cardinality: 9000
+  |
+  5:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [13: s_nationkey, INT, true] = [21: n_nationkey, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 0, build_expr = (21: n_nationkey), remote = false
+  |  output columns: 10
+  |  can local shuffle: true
+  |  cardinality: 9000
+  |
+  |----4:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 25
+  |
+  1:IcebergScanNode
+     TABLE: tpch.supplier
+     PREDICATES: 10: s_suppkey IS NOT NULL
+     TABLE VERSION: Snapshot@(7110507688499337981)
+     cardinality=9000
+     avgRowSize=2.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 9000
+     probe runtime filters:
+     - filter_id = 0, probe_expr = (13: s_nationkey)
+
+PLAN FRAGMENT 8(F02)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 04
+
+  3:Project
+  |  output columns:
+  |  21 <-> [21: n_nationkey, INT, true]
+  |  cardinality: 25
+  |
+  2:IcebergScanNode
+     TABLE: tpch.nation
+     PREDICATES: 22: n_name = 'PERU'
+     MIN/MAX PREDICATES: 22: n_name <= 'PERU', 22: n_name >= 'PERU'
+     TABLE VERSION: Snapshot@(775196322490798)
+     cardinality=25
+     avgRowSize=2.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 25

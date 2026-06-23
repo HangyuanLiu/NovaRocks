@@ -35,7 +35,6 @@ pub(crate) fn explain_distributed_plan(dp: &DistributedPlan, level: ExplainLevel
     explain_distributed_plan_inner(dp, level, None)
 }
 
-#[cfg(test)]
 pub(crate) fn explain_distributed_plan_analyze(
     dp: &DistributedPlan,
     level: ExplainLevel,

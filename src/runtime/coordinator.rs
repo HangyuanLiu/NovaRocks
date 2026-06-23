@@ -57,6 +57,7 @@ pub(crate) struct CoordinatedQueryResult {
     pub(crate) query_result: QueryResult,
     pub(crate) write_commit: Option<WriteCommitInput>,
     pub(crate) write_abort: Option<WriteAbortInput>,
+    pub(crate) fragment_profiles: Vec<crate::runtime_profile::TRuntimeProfileTree>,
 }
 
 /// Coordinates multi-fragment query execution across one or more backends.
@@ -87,6 +88,17 @@ impl ExecutionCoordinator {
     }
 
     pub(crate) fn execute_with_write_outcome(self) -> Result<CoordinatedQueryResult, String> {
+        self.execute_with_profile_collection(false)
+    }
+
+    pub(crate) fn execute_with_profile_outcome(self) -> Result<CoordinatedQueryResult, String> {
+        self.execute_with_profile_collection(true)
+    }
+
+    fn execute_with_profile_collection(
+        self,
+        collect_profiles: bool,
+    ) -> Result<CoordinatedQueryResult, String> {
         let MultiFragmentBuildResult {
             mut fragment_results,
             root_fragment_id,
@@ -199,7 +211,8 @@ impl ExecutionCoordinator {
         // 4. Translate every placement into a fragment params and submit.
         // ---------------------------------------------------------------
         let pipeline_dop = crate::runtime::dispatcher::compute_pipeline_dop();
-        let needs_fragment_status_report = dispatcher.needs_fragment_status_report();
+        let needs_fragment_status_report =
+            dispatcher.needs_fragment_status_report() || collect_profiles;
         let mut novarocks_report_addr: Option<types::TNetworkAddress> = None;
 
         // Snapshot the per-consumer-fragment instance destinations for CTE
@@ -452,6 +465,7 @@ impl ExecutionCoordinator {
             timeout_ms,
             expected_root_chunk_schema.as_ref(),
             write_coordinator.as_ref(),
+            collect_profiles,
         )?;
         if let Some(commit) = fetch_result.write_commit.as_ref() {
             tracing::info!(
@@ -484,6 +498,7 @@ impl ExecutionCoordinator {
             query_result,
             write_commit: fetch_result.write_commit,
             write_abort: fetch_result.write_abort,
+            fragment_profiles: fetch_result.fragment_profiles,
         })
     }
 
@@ -1025,11 +1040,98 @@ impl Drop for StandaloneQueryFailureGuard {
     }
 }
 
+#[derive(Default)]
+struct StandaloneQueryProfileRegistry {
+    active: BTreeSet<(i64, i64)>,
+    profiles: BTreeMap<(i64, i64), Vec<crate::runtime_profile::TRuntimeProfileTree>>,
+}
+
+fn standalone_query_profiles() -> &'static Mutex<StandaloneQueryProfileRegistry> {
+    static REGISTRY: OnceLock<Mutex<StandaloneQueryProfileRegistry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(StandaloneQueryProfileRegistry::default()))
+}
+
+pub(crate) fn record_standalone_query_profile_report(
+    params: &crate::frontend_service::TReportExecStatusParams,
+) -> Result<bool, String> {
+    let Some(query_id) = params.query_id.as_ref() else {
+        return Ok(false);
+    };
+    let key = query_failure_key(query_id);
+    let mut guard = standalone_query_profiles()
+        .lock()
+        .expect("standalone query profile registry lock");
+    if !guard.active.contains(&key) {
+        return Ok(false);
+    }
+
+    let done = params.done.unwrap_or(false);
+    let status = params
+        .status
+        .as_ref()
+        .ok_or_else(|| "TReportExecStatusParams missing status".to_string())?;
+    if done
+        && status.status_code == crate::status_code::TStatusCode::OK
+        && let Some(profile) = params.profile.as_ref()
+    {
+        guard.profiles.entry(key).or_default().push(profile.clone());
+    }
+    Ok(true)
+}
+
+fn standalone_query_profile_count(query_id: &types::TUniqueId) -> usize {
+    standalone_query_profiles()
+        .lock()
+        .expect("standalone query profile registry lock")
+        .profiles
+        .get(&query_failure_key(query_id))
+        .map(Vec::len)
+        .unwrap_or(0)
+}
+
+fn take_standalone_query_profiles(
+    query_id: &types::TUniqueId,
+) -> Vec<crate::runtime_profile::TRuntimeProfileTree> {
+    standalone_query_profiles()
+        .lock()
+        .expect("standalone query profile registry lock")
+        .profiles
+        .remove(&query_failure_key(query_id))
+        .unwrap_or_default()
+}
+
+struct StandaloneQueryProfileGuard {
+    key: (i64, i64),
+}
+
+impl StandaloneQueryProfileGuard {
+    fn register(query_id: &types::TUniqueId) -> Self {
+        let key = query_failure_key(query_id);
+        let mut guard = standalone_query_profiles()
+            .lock()
+            .expect("standalone query profile registry lock");
+        guard.profiles.remove(&key);
+        guard.active.insert(key);
+        Self { key }
+    }
+}
+
+impl Drop for StandaloneQueryProfileGuard {
+    fn drop(&mut self) {
+        let mut guard = standalone_query_profiles()
+            .lock()
+            .expect("standalone query profile registry lock");
+        guard.active.remove(&self.key);
+        guard.profiles.remove(&self.key);
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct SubmitAndFetchResult {
     pub(crate) chunks: Vec<crate::exec::chunk::Chunk>,
     pub(crate) write_commit: Option<WriteCommitInput>,
     pub(crate) write_abort: Option<WriteAbortInput>,
+    pub(crate) fragment_profiles: Vec<crate::runtime_profile::TRuntimeProfileTree>,
 }
 
 struct QueryStateRegistrationGuard {
@@ -1061,6 +1163,7 @@ pub(crate) fn submit_and_fetch_loop(
     timeout_ms: i64,
     expected_root_chunk_schema: Option<&ChunkSchemaRef>,
     write_coordinator: Option<&Arc<Mutex<WriteCoordinator>>>,
+    collect_profiles: bool,
 ) -> Result<SubmitAndFetchResult, String> {
     const REMOTE_FETCH_POLL_INTERVAL_MS: i64 = 300;
     let root_uses_result_buffer = root_uses_result_buffer(&submissions, &root_finst_id)?;
@@ -1072,6 +1175,7 @@ pub(crate) fn submit_and_fetch_loop(
         query_id: runtime_query_id,
     };
     let _failure_guard = StandaloneQueryFailureGuard::register(query_id);
+    let _profile_guard = collect_profiles.then(|| StandaloneQueryProfileGuard::register(query_id));
 
     for (backend_idx, p) in submissions {
         let finst_id = p
@@ -1118,6 +1222,7 @@ pub(crate) fn submit_and_fetch_loop(
                     chunks,
                     write_commit: None,
                     write_abort: Some(abort),
+                    fragment_profiles: Vec::new(),
                 });
             }
             if let Some(err) = take_standalone_query_failure(query_id) {
@@ -1196,11 +1301,82 @@ pub(crate) fn submit_and_fetch_loop(
         (None, None)
     };
 
+    let fragment_profiles = if collect_profiles {
+        wait_for_profile_reports(
+            query_id,
+            tracker.by_backend.values().map(Vec::len).sum(),
+            tracker,
+            dispatcher.as_ref(),
+            deadline,
+            timeout_ms,
+            runtime_query_id,
+        )?
+    } else {
+        Vec::new()
+    };
+
     Ok(SubmitAndFetchResult {
         chunks,
         write_commit,
         write_abort,
+        fragment_profiles,
     })
+}
+
+fn wait_for_profile_reports(
+    query_id: &types::TUniqueId,
+    expected_reports: usize,
+    tracker: &InFlightTracker,
+    dispatcher: &dyn FragmentDispatcher,
+    deadline: std::time::Instant,
+    timeout_ms: i64,
+    runtime_query_id: crate::runtime::query_context::QueryId,
+) -> Result<Vec<crate::runtime_profile::TRuntimeProfileTree>, String> {
+    const PROFILE_REPORT_POLL_INTERVAL_MS: i64 = 10;
+
+    if expected_reports == 0 {
+        return Ok(Vec::new());
+    }
+
+    loop {
+        let received = standalone_query_profile_count(query_id);
+        if received >= expected_reports {
+            return Ok(take_standalone_query_profiles(query_id));
+        }
+
+        if let Some(err) = take_standalone_query_failure(query_id) {
+            tracker.cancel_all(dispatcher);
+            return Err(err);
+        }
+        if crate::runtime::query_cancel::client_disconnected() {
+            tracker.cancel_all(dispatcher);
+            return Err("client disconnected".to_string());
+        }
+        if crate::runtime::query_state::in_flight_table().state(runtime_query_id)
+            == Some(QueryState::Failed)
+        {
+            let reason = crate::runtime::query_state::in_flight_table()
+                .failure_reason(runtime_query_id)
+                .unwrap_or_else(|| format!("query {} failed", runtime_query_id));
+            tracker.cancel_all(dispatcher);
+            return Err(reason);
+        }
+
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            tracker.cancel_all(dispatcher);
+            return Err(format!(
+                "query timed out after {timeout_ms} ms waiting for fragment profile reports: received {received} of {expected_reports}"
+            ));
+        }
+
+        let remaining_ms = deadline
+            .saturating_duration_since(now)
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        let sleep_ms = remaining_ms.clamp(1, PROFILE_REPORT_POLL_INTERVAL_MS);
+        std::thread::sleep(std::time::Duration::from_millis(sleep_ms as u64));
+    }
 }
 
 fn wait_for_write_commit_ready(
@@ -2076,6 +2252,53 @@ mod tests {
         }
     }
 
+    fn profile_report_params(
+        query_id: types::TUniqueId,
+        finst_id: types::TUniqueId,
+        profile: crate::runtime_profile::TRuntimeProfileTree,
+    ) -> crate::frontend_service::TReportExecStatusParams {
+        crate::frontend_service::TReportExecStatusParams::new(
+            crate::frontend_service::FrontendServiceVersion::V1,
+            Some(query_id),
+            Some(0),
+            Some(finst_id),
+            Some(ok_status()),
+            Some(true),
+            Some(profile),
+            Option::<Vec<String>>::None,
+            Option::<Vec<String>>::None,
+            None,
+            None,
+            Option::<Vec<String>>::None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn profile_tree_for_plan_node(node_id: i32) -> crate::runtime_profile::TRuntimeProfileTree {
+        let profiler = crate::runtime::profile::Profiler::new("fragment");
+        let common = profiler
+            .child(format!("SCAN (plan_node_id={node_id})"))
+            .child("CommonMetrics");
+        common.counter_set("PullRowNum", crate::metrics::TUnit::UNIT, 3);
+        common.counter_set("OperatorTotalTime", crate::metrics::TUnit::TIME_NS, 1_000);
+        common.counter_set("OperatorPeakMemoryUsage", crate::metrics::TUnit::BYTES, 64);
+        profiler.to_thrift_tree()
+    }
+
     // -----------------------------------------------------------------------
     // Original regression tests
     // -----------------------------------------------------------------------
@@ -2348,6 +2571,7 @@ mod tests {
             1_000,
             None,
             Some(&write),
+            false,
         );
 
         report_thread.join().expect("delayed report thread");
@@ -2415,6 +2639,7 @@ mod tests {
             1_000,
             None,
             Some(&write),
+            false,
         )
         .expect("writer failure during post-EOF wait must surface write abort");
 
@@ -2497,6 +2722,7 @@ mod tests {
             1_000,
             None,
             Some(&write),
+            false,
         )
         .expect("pre-EOF writer failure must surface write abort");
 
@@ -2562,6 +2788,7 @@ mod tests {
             1_000,
             None,
             None,
+            false,
         )
         .expect_err("standalone report failure must surface before timeout");
 
@@ -2575,6 +2802,48 @@ mod tests {
             ],
             "standalone report failure must cancel all submitted fragments"
         );
+    }
+
+    #[test]
+    fn collect_profiles_waits_for_final_report_after_root_eof() {
+        let query_id = id(787, 1);
+        let root_finst_id = types::TUniqueId::new(787, 10);
+        let (eof_tx, eof_rx) = std::sync::mpsc::channel();
+        let inner = EofSignalDispatcher::new(eof_tx);
+        let dispatcher: Arc<dyn FragmentDispatcher> = inner;
+        let report_query_id = query_id.clone();
+        let report_finst_id = root_finst_id.clone();
+        let report_thread = std::thread::spawn(move || {
+            eof_rx.recv().expect("root EOF signal");
+            let accepted = record_standalone_query_profile_report(&profile_report_params(
+                report_query_id,
+                report_finst_id,
+                profile_tree_for_plan_node(2),
+            ))
+            .expect("record profile report");
+            assert!(accepted, "profile report must match active query collector");
+        });
+
+        let params = single_backend(vec![make_params_with_finst(787, 10)]);
+        let mut tracker = InFlightTracker::default();
+        let result = submit_and_fetch_loop(
+            &dispatcher,
+            &mut tracker,
+            params,
+            0,
+            root_finst_id,
+            &query_id,
+            1_000,
+            None,
+            None,
+            true,
+        )
+        .expect("profile final report should be collected after root EOF");
+
+        report_thread.join().expect("profile report thread");
+        assert_eq!(result.fragment_profiles.len(), 1);
+        assert!(result.write_commit.is_none());
+        assert!(result.write_abort.is_none());
     }
 
     #[test]
@@ -2619,6 +2888,7 @@ mod tests {
             1_000,
             None,
             Some(&write),
+            false,
         )
         .expect("write-only root should use writer reports instead of result fetch");
 
@@ -2658,6 +2928,7 @@ mod tests {
             25,
             None,
             Some(&write),
+            false,
         )
         .expect("missing writer final report after EOF must surface write abort");
 
@@ -2696,6 +2967,7 @@ mod tests {
                 completed_writer_outputs: Vec::new(),
                 incomplete_writers: Vec::new(),
             }),
+            fragment_profiles: Vec::new(),
         })
         .expect_err("legacy query-result wrapper must not hide write aborts");
 
@@ -2730,6 +3002,7 @@ mod tests {
             100,
             None,
             None,
+            false,
         );
         assert!(result.is_ok(), "expected Ok, got {result:?}");
         let output = result.unwrap();
@@ -2779,6 +3052,7 @@ mod tests {
             100,
             None,
             None,
+            false,
         );
         assert!(result.is_err(), "expected Err on submit failure");
         let submitted = inner.submitted_ids();
@@ -2826,6 +3100,7 @@ mod tests {
             100,
             None,
             None,
+            false,
         );
         assert!(result.is_err(), "expected Err on fetch error");
         let err = result.unwrap_err();
@@ -2867,6 +3142,7 @@ mod tests {
             10,
             None,
             None,
+            false,
         );
         assert!(result.is_err(), "expected timeout error");
         let err = result.unwrap_err();
@@ -2907,6 +3183,7 @@ mod tests {
             100,
             None,
             None,
+            false,
         );
 
         let err = result.expect_err("query state failure must propagate");
@@ -2952,6 +3229,7 @@ mod tests {
             300_000,
             None,
             None,
+            false,
         );
 
         assert!(result.is_ok(), "expected fetch loop to finish after Eof");
@@ -2991,6 +3269,7 @@ mod tests {
                     100,
                     None,
                     None,
+                    false,
                 )
             });
 

@@ -1,0 +1,89 @@
+Explain String
+Planning: 290.3ms / Execution: 12.24s / Rows: 100
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+23:PROJECT [__nr_sel_0 AS i_category, __nr_sel_1 AS i_class, __nr_sel_2 AS i_brand, __nr_sel_3 AS s_store_name, __nr_sel_4 AS s_company_name, __nr_sel_5 AS d_moy, __nr_sel_6 AS sum_sales, __nr_sel_7 AS avg_monthly_sales] stats={rows=100 conf=estimated} act={rows=100 time=80.2us peak=10.6KB}
+  22:MERGING-EXCHANGE stats={rows=100 conf=estimated} act={rows=700 time=50.8us peak=46.9KB}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 22
+    PARTITION: UNPARTITIONED
+21:LOCAL TOP-N (limit=100, offset=0) [tmp1.sum_sales - tmp1.avg_monthly_sales ASC NULLS FIRST, tmp1.s_store_name ASC NULLS FIRST] stats={rows=100 conf=estimated} act={rows=300 time=357.1us peak=371.0KB}
+  20:PROJECT [tmp1.i_category AS __nr_sel_0, tmp1.i_class AS __nr_sel_1, tmp1.i_brand AS __nr_sel_2, tmp1.s_store_name AS __nr_sel_3, tmp1.s_company_name AS __nr_sel_4, tmp1.d_moy AS __nr_sel_5, tmp1.sum_sales AS __nr_sel_6, tmp1.avg_monthly_sales AS __nr_sel_7, sum_sales - avg_monthly_sales AS tmp1.sum_sales - tmp1.avg_monthly_sales] stats={rows=6241 conf=estimated} act={rows=2695 time=141.2us peak=257.6KB}
+    19:PROJECT [i_category, i_class, i_brand, s_store_name, s_company_name, d_moy, sum_sales, avg_monthly_sales] stats={rows=6241 conf=estimated} act={rows=2695 time=71.3us peak=257.6KB}
+      18:PROJECT [i_category, i_class, i_brand, s_store_name, s_company_name, d_moy, sum(ss_sales_price) AS sum_sales, avg_monthly_sales] stats={rows=6241 conf=estimated} act={rows=2695 time=95.3us peak=257.6KB}
+        17:FILTER stats={rows=6241 conf=estimated}
+          predicate: CASE WHEN avg_monthly_sales != 0 THEN abs(sum(ss_sales_price) - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1
+          16:WINDOW [avg(sum(ss_sales_price))] stats={rows=12483 conf=estimated} act={rows=2695 time=419.4us peak=285.1KB}
+            15:SORT BY [i_category ASC NULLS FIRST, i_brand ASC NULLS FIRST, s_store_name ASC NULLS FIRST, s_company_name ASC NULLS FIRST] stats={rows=12483 conf=estimated} act={rows=5960 time=472.5us peak=321.8KB}
+              14:HASH EXCHANGE stats={rows=12483 conf=estimated} act={rows=2980 time=16.3us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 14
+    PARTITION: HASH_PARTITIONED (i_category, i_brand, s_store_name, s_company_name)
+13:HASH AGGREGATE (GLOBAL, group by: [i_category, i_class, i_brand, s_store_name, s_company_name, d_moy]) stats={rows=12483 conf=estimated} act={rows=7930 time=263.6us peak=2.4MB}
+  aggregations: sum(ss_sales_price)
+  12:HASH EXCHANGE stats={rows=12483 conf=estimated} act={rows=4950 time=14.6us peak=0B}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 12
+    PARTITION: HASH_PARTITIONED (i_category, i_class, i_brand, s_store_name, s_company_name, d_moy)
+11:HASH AGGREGATE (LOCAL, group by: [i_category, i_class, i_brand, s_store_name, s_company_name, d_moy]) stats={rows=12483 conf=estimated} act={rows=45665 time=57.0ms peak=3.9MB}
+  aggregations: sum(ss_sales_price)
+  10:HASH JOIN (BROADCAST, INNER, eq: [ss_store_sk = s_store_sk]) stats={rows=12483 conf=estimated} act={rows=40751 time=9.4ms peak=594.0KB}
+    build runtime filters:
+    - filter_id = 2, build_expr = (s_store_sk)
+    7:HASH JOIN (BROADCAST, INNER, eq: [ss_sold_date_sk = d_date_sk]) stats={rows=12483 conf=estimated} act={rows=41810 time=23.9ms peak=1.8MB}
+      build runtime filters:
+      - filter_id = 1, build_expr = (d_date_sk)
+      4:HASH JOIN (BROADCAST, INNER, eq: [ss_item_sk = i_item_sk]) stats={rows=69571 conf=estimated} act={rows=210656 time=66.9ms peak=18.9MB}
+        build runtime filters:
+        - filter_id = 0, build_expr = (i_item_sk)
+        1:SCAN tpcds.store_sales stats={rows=2363535 conf=estimated} act={rows=2685687 time=7.9ms peak=0B}
+             TABLE: tpcds.store_sales
+             columns: ss_sold_date_sk, ss_sold_time_sk, ss_item_sk, ss_customer_sk, ss_cdemo_sk, ss_hdemo_sk, ss_addr_sk, ss_store_sk, ss_promo_sk, ss_ticket_number, ss_quantity, ss_wholesale_cost, ss_list_price, ss_sales_price, ss_ext_discount_amt, ss_ext_sales_price, ss_ext_wholesale_cost, ss_ext_list_price, ss_ext_tax, ss_coupon_amt, ss_net_paid, ss_net_paid_inc_tax, ss_net_profit, _file, _pos
+             predicates: ss_item_sk IS NOT NULL AND ss_sold_date_sk IS NOT NULL AND ss_store_sk IS NOT NULL
+            probe runtime filters:
+            - filter_id = 0, probe_expr = (ss_item_sk)
+            - filter_id = 1, probe_expr = (ss_sold_date_sk)
+            - filter_id = 2, probe_expr = (ss_store_sk)
+        3:GATHER stats={rows=533 conf=estimated} act={rows=4104 time=727.4us peak=0B}
+      6:GATHER stats={rows=327 conf=estimated} act={rows=1095 time=753.4us peak=0B}
+    9:GATHER stats={rows=11 conf=estimated} act={rows=36 time=203.9us peak=0B}
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 9
+    PARTITION: UNPARTITIONED
+8:SCAN tpcds.store stats={rows=11 conf=estimated} act={rows=12 time=122.3us peak=50.0KB}
+     TABLE: tpcds.store
+     columns: s_store_sk, s_store_id, s_rec_start_date, s_rec_end_date, s_closed_date_sk, s_store_name, s_number_employees, s_floor_space, s_hours, s_manager, s_market_id, s_geography_class, s_market_desc, s_market_manager, s_division_id, s_division_name, s_company_id, s_company_name, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip, s_country, s_gmt_offset, s_tax_precentage, _file, _pos
+     predicates: s_store_sk IS NOT NULL
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 6
+    PARTITION: UNPARTITIONED
+5:SCAN tpcds.date_dim stats={rows=327 conf=estimated} act={rows=365 time=94.3us peak=442.2KB}
+     TABLE: tpcds.date_dim
+     columns: d_date_sk, d_date_id, d_date, d_month_seq, d_week_seq, d_quarter_seq, d_year, d_dow, d_moy, d_dom, d_qoy, d_fy_year, d_fy_quarter_seq, d_fy_week_seq, d_day_name, d_quarter_name, d_holiday, d_weekend, d_following_holiday, d_first_dom, d_last_dom, d_same_day_ly, d_same_day_lq, d_current_day, d_current_week, d_current_month, d_current_quarter, d_current_year, _file, _pos
+     predicates: d_year IN (1999) AND d_date_sk IS NOT NULL
+PLAN FRAGMENT 6
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: UNPARTITIONED
+2:SCAN tpcds.item stats={rows=533 conf=estimated} act={rows=1368 time=6.8ms peak=1.1MB}
+     TABLE: tpcds.item
+     columns: i_item_sk, i_item_id, i_rec_start_date, i_rec_end_date, i_item_desc, i_current_price, i_wholesale_cost, i_brand_id, i_brand, i_class_id, i_class, i_category_id, i_category, i_manufact_id, i_manufact, i_size, i_formulation, i_color, i_units, i_container, i_manager_id, i_product_name, _file, _pos
+     predicates: i_category IN ('Books', 'Electronics', 'Sports') AND i_class IN ('computers', 'stereo', 'football') OR i_category IN ('Men', 'Jewelry', 'Women') AND i_class IN ('shirts', 'birdal', 'dresses') AND i_item_sk IS NOT NULL

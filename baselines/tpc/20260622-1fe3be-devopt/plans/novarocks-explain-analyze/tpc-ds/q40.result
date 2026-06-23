@@ -1,0 +1,88 @@
+Explain String
+Planning: 291.3ms / Execution: 3.35s / Rows: 100
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+20:PROJECT [w_state, i_item_id, sum(Case { operand: None, when_then: [(TypedExpr { kind: Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Cast { expr: TypedExpr { kind: ColumnRef { column_id: c108, qualifier: None, column: "d_date" }, data_type: Date32, nullable: true }, target: Date32 }, data_type: Date32, nullable: true }, op: Lt, right: TypedExpr { kind: Cast { expr: TypedExpr { kind: Literal(String("2000-03-11")), data_type: Utf8, nullable: false }, target: Date32 }, data_type: Date32, nullable: true } }, data_type: Boolean, nullable: true }), data_type: Boolean, nullable: true }, TypedExpr { kind: BinaryOp { left: TypedExpr { kind: ColumnRef { column_id: c22, qualifier: None, column: "cs_sales_price" }, data_type: Decimal128(7, 2), nullable: true }, op: Sub, right: TypedExpr { kind: FunctionCall { name: "coalesce", args: [TypedExpr { kind: ColumnRef { column_id: c60, qualifier: None, column: "cr_refunded_cash" }, data_type: Decimal128(7, 2), nullable: true }, TypedExpr { kind: Literal(Int(0)), data_type: Int64, nullable: false }], distinct: false }, data_type: Decimal128(7, 2), nullable: true } }, data_type: Decimal128(8, 2), nullable: true })], else_expr: Some(TypedExpr { kind: Cast { expr: TypedExpr { kind: Literal(Int(0)), data_type: Int64, nullable: false }, target: Decimal128(8, 2) }, data_type: Decimal128(8, 2), nullable: true }) }) AS sales_before, sum(Case { operand: None, when_then: [(TypedExpr { kind: Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Cast { expr: TypedExpr { kind: ColumnRef { column_id: c108, qualifier: None, column: "d_date" }, data_type: Date32, nullable: true }, target: Date32 }, data_type: Date32, nullable: true }, op: Ge, right: TypedExpr { kind: Cast { expr: TypedExpr { kind: Literal(String("2000-03-11")), data_type: Utf8, nullable: false }, target: Date32 }, data_type: Date32, nullable: true } }, data_type: Boolean, nullable: true }), data_type: Boolean, nullable: true }, TypedExpr { kind: BinaryOp { left: TypedExpr { kind: ColumnRef { column_id: c22, qualifier: None, column: "cs_sales_price" }, data_type: Decimal128(7, 2), nullable: true }, op: Sub, right: TypedExpr { kind: FunctionCall { name: "coalesce", args: [TypedExpr { kind: ColumnRef { column_id: c60, qualifier: None, column: "cr_refunded_cash" }, data_type: Decimal128(7, 2), nullable: true }, TypedExpr { kind: Literal(Int(0)), data_type: Int64, nullable: false }], distinct: false }, data_type: Decimal128(7, 2), nullable: true } }, data_type: Decimal128(8, 2), nullable: true })], else_expr: Some(TypedExpr { kind: Cast { expr: TypedExpr { kind: Literal(Int(0)), data_type: Int64, nullable: false }, target: Decimal128(8, 2) }, data_type: Decimal128(8, 2), nullable: true }) }) AS sales_after] stats={rows=100 conf=estimated} act={rows=100 time=71.6us peak=5.7KB}
+  19:MERGING-EXCHANGE stats={rows=100 conf=estimated} act={rows=700 time=159.1us peak=24.2KB}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 19
+    PARTITION: UNPARTITIONED
+18:LOCAL TOP-N (limit=100, offset=0) [w_state ASC NULLS FIRST, i_item_id ASC NULLS FIRST] stats={rows=100 conf=estimated} act={rows=834 time=489.1us peak=318.6KB}
+  17:HASH AGGREGATE (GLOBAL, group by: [w_state, i_item_id]) stats={rows=385 conf=estimated} act={rows=1406 time=97.2us peak=1.5MB}
+    aggregations: sum(CASE WHEN CAST(d_date AS Date32) < CAST('2000-03-11' AS Date32) THEN cs_sales_price - coalesce(cr_refunded_cash, 0) ELSE CAST(0 AS Decimal128(8, 2)) END), sum(CASE WHEN CAST(d_date AS Date32) >= CAST('2000-03-11' AS Date32) THEN cs_sales_price - coalesce(cr_refunded_cash, 0) ELSE CAST(0 AS Decimal128(8, 2)) END)
+    16:HASH EXCHANGE stats={rows=385 conf=estimated} act={rows=872 time=26.9us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 16
+    PARTITION: HASH_PARTITIONED (w_state, i_item_id)
+15:HASH AGGREGATE (LOCAL, group by: [w_state, i_item_id]) stats={rows=385 conf=estimated} act={rows=2605 time=1.5ms peak=1.2MB}
+  aggregations: sum(CASE WHEN CAST(d_date AS Date32) < __cse_0 THEN __cse_3 ELSE __cse_1 END), sum(CASE WHEN CAST(d_date AS Date32) >= __cse_0 THEN __cse_3 ELSE __cse_1 END)
+  14:PROJECT [cs_sold_date_sk, cs_warehouse_sk, cs_item_sk, cs_order_number, cs_sales_price, cr_item_sk, cr_order_number, cr_refunded_cash, w_warehouse_sk, w_state, i_item_sk, i_item_id, i_current_price, d_date_sk, d_date, CAST('2000-03-11' AS Date32) AS __cse_0, CAST(0 AS Decimal128(8, 2)) AS __cse_1, coalesce(cr_refunded_cash, 0) AS __cse_2, cs_sales_price - coalesce(cr_refunded_cash, 0) AS __cse_3] stats={rows=24747 conf=estimated} act={rows=1733 time=6.4ms peak=103.9KB}
+    13:HASH JOIN (BROADCAST, INNER, eq: [cs_sold_date_sk = d_date_sk]) stats={rows=24747 conf=estimated} act={rows=1916 time=3.3ms peak=440.8KB}
+      build runtime filters:
+      - filter_id = 2, build_expr = (d_date_sk)
+      10:HASH JOIN (BROADCAST, INNER, eq: [cs_item_sk = i_item_sk]) stats={rows=24747 conf=estimated} act={rows=91827 time=15.5ms peak=13.0MB}
+        build runtime filters:
+        - filter_id = 1, build_expr = (i_item_sk)
+        7:HASH JOIN (BROADCAST, INNER, eq: [cs_warehouse_sk = w_warehouse_sk]) stats={rows=1156079 conf=estimated} act={rows=1430806 time=25.7ms peak=7.3MB}
+          build runtime filters:
+          - filter_id = 0, build_expr = (w_warehouse_sk)
+          4:HASH JOIN (BROADCAST, LEFT OUTER, eq: [cs_order_number = cr_order_number, cs_item_sk = cr_item_sk]) stats={rows=1284532 conf=estimated} act={rows=1862992 time=138.6ms peak=94.6MB}
+            1:SCAN tpcds.catalog_sales stats={rows=1284532 conf=estimated} act={rows=1430791 time=1.0ms peak=0B}
+                 TABLE: tpcds.catalog_sales
+                 columns: cs_sold_date_sk, cs_warehouse_sk, cs_item_sk, cs_order_number, cs_sales_price
+                 min-max stats
+                 predicates: cs_warehouse_sk IS NOT NULL AND cs_item_sk IS NOT NULL AND cs_sold_date_sk IS NOT NULL
+            3:GATHER stats={rows=144067} act={rows=432201 time=35.9us peak=0B}
+          6:GATHER stats={rows=5 conf=estimated} act={rows=15 time=70.8us peak=0B}
+        9:GATHER stats={rows=385 conf=estimated} act={rows=3312 time=140.4us peak=0B}
+      12:GATHER stats={rows=16436 conf=estimated} act={rows=183 time=5.8us peak=0B}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 12
+    PARTITION: UNPARTITIONED
+11:SCAN tpcds.date_dim stats={rows=16436 conf=estimated} act={rows=61 time=350.3us peak=39.8KB}
+     TABLE: tpcds.date_dim
+     columns: d_date_sk, d_date
+     min-max stats
+     predicates: d_date BETWEEN date_add(CAST('2000-03-11' AS Date32), - 30) AND date_add(CAST('2000-03-11' AS Date32), 30) AND d_date_sk IS NOT NULL
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 9
+    PARTITION: UNPARTITIONED
+8:SCAN tpcds.item stats={rows=385 conf=estimated} act={rows=1104 time=232.6us peak=796.9KB}
+     TABLE: tpcds.item
+     columns: i_item_sk, i_item_id, i_current_price
+     min-max stats
+     predicates: i_current_price BETWEEN 0.99 AND 1.49 AND i_item_sk IS NOT NULL
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 6
+    PARTITION: UNPARTITIONED
+5:SCAN tpcds.warehouse stats={rows=5 conf=estimated} act={rows=5 time=119.1us peak=7.0KB}
+     TABLE: tpcds.warehouse
+     columns: w_warehouse_sk, w_state
+     min-max stats
+     predicates: w_warehouse_sk IS NOT NULL
+PLAN FRAGMENT 6
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: UNPARTITIONED
+2:SCAN tpcds.catalog_returns stats={rows=144067} act={rows=144067 time=38.3us peak=18.9MB}
+     TABLE: tpcds.catalog_returns
+     columns: cr_item_sk, cr_order_number, cr_refunded_cash
+     min-max stats

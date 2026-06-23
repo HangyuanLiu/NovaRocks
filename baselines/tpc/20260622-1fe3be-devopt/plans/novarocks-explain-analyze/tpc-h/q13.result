@@ -1,0 +1,64 @@
+Explain String
+Planning: 47.7ms / Execution: 1.44s / Rows: 41
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+16:SORT BY [custdist DESC NULLS LAST, c_count DESC NULLS LAST] stats={rows=10 conf=estimated} act={rows=82 time=784.1us peak=3.8KB}
+  15:GATHER stats={rows=10 conf=estimated} act={rows=41 time=4.6us peak=0B}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 15
+    PARTITION: UNPARTITIONED
+14:PROJECT [c_count, count(*) AS custdist] stats={rows=10 conf=estimated} act={rows=41 time=29.4us peak=391.8KB}
+  13:HASH AGGREGATE (GLOBAL, group by: [c_count]) stats={rows=10 conf=estimated} act={rows=162 time=83.8us peak=770.4KB}
+    aggregations: count()
+    12:HASH EXCHANGE stats={rows=10 conf=estimated} act={rows=121 time=28.5us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 12
+    PARTITION: HASH_PARTITIONED (c_count)
+11:HASH AGGREGATE (LOCAL, group by: [c_count]) stats={rows=10 conf=estimated} act={rows=150121 time=354.4us peak=2.7MB}
+  aggregations: count()
+  10:PROJECT [c_count] stats={rows=96747 conf=estimated} act={rows=150000 time=8.2us peak=1.5MB}
+    9:PROJECT [count(o_orderkey) AS c_count] stats={rows=96747 conf=estimated} act={rows=150000 time=18.4us peak=2.2MB}
+      8:HASH AGGREGATE (GLOBAL, group by: [c_custkey]) stats={rows=96747 conf=estimated} act={rows=300000 time=926.7us peak=3.8MB}
+        aggregations: count(o_orderkey)
+        7:HASH EXCHANGE stats={rows=96747 conf=estimated} act={rows=150000 time=8.9us peak=0B}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 7
+    PARTITION: HASH_PARTITIONED (c_custkey)
+6:HASH AGGREGATE (LOCAL, group by: [c_custkey]) stats={rows=96747 conf=estimated} act={rows=1683872 time=47.6ms peak=21.8MB}
+  aggregations: count(o_orderkey)
+  5:HASH JOIN (PARTITIONED, RIGHT OUTER, eq: [o_custkey = c_custkey]) stats={rows=1141595 conf=estimated} act={rows=3183872 time=602.2ms peak=31.1MB}
+    other: o_comment NOT LIKE '%unusual%deposits%'
+    build runtime filters:
+    - filter_id = 0, build_expr = (c_custkey)
+    2:HASH EXCHANGE stats={rows=1500000} act={rows=1500000 time=660.1us peak=0B}
+    4:HASH EXCHANGE stats={rows=150000} act={rows=150000 time=12.8us peak=0B}
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 4
+    PARTITION: HASH_PARTITIONED (c_custkey)
+3:SCAN tpch.customer stats={rows=150000} act={rows=150000 time=999.4us peak=15.8MB}
+     TABLE: tpch.customer
+     columns: c_custkey
+     min-max stats
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 2
+    PARTITION: HASH_PARTITIONED (o_custkey)
+1:SCAN tpch.orders stats={rows=1500000} act={rows=1500000 time=8.8ms peak=194.8MB}
+     TABLE: tpch.orders
+     columns: o_orderkey, o_custkey, o_comment
+     min-max stats

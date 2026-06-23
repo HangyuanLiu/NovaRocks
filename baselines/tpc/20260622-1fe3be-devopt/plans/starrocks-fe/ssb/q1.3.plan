@@ -1,0 +1,97 @@
+-- engine=starrocks
+-- suite=ssb
+-- case=q1.3
+-- file=/Users/harbor/project/NovaRocks/sql-tests/ssb/sql/q1.3.sql
+-- elapsed_sec=0.055
+-- exit_code=0
+
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 838692.1048654256
+  Memory: 7238.259730851262
+
+PLAN FRAGMENT 0(F03)
+  Fragment Cost: 36.0
+  Output Exprs:43: sum
+  Input Partition: UNPARTITIONED
+  RESULT SINK
+
+  9:AGGREGATE (merge finalize)
+  |  aggregate: sum[([43: sum, BIGINT, true]); args: INT; result: BIGINT; args nullable: true; result nullable: true]
+  |  cardinality: 1
+  |
+  8:EXCHANGE
+     distribution type: GATHER
+     cardinality: 1
+
+PLAN FRAGMENT 1(F00)
+  Fragment Cost: 439220.6666925538
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 08
+
+  7:AGGREGATE (update serialize)
+  |  aggregate: sum[([13: lo_revenue, INT, true]); args: INT; result: BIGINT; args nullable: true; result nullable: true]
+  |  cardinality: 1
+  |
+  6:Project
+  |  output columns:
+  |  13 <-> [13: lo_revenue, INT, true]
+  |  cardinality: 39390
+  |
+  5:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [6: lo_orderdate, INT, true] = [22: d_datekey, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 0, build_expr = (22: d_datekey), remote = false
+  |  output columns: 13
+  |  can local shuffle: true
+  |  cardinality: 39390
+  |
+  |----4:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 904
+  |
+  1:Project
+  |  output columns:
+  |  6 <-> [6: lo_orderdate, INT, true]
+  |  13 <-> [13: lo_revenue, INT, true]
+  |  cardinality: 39390
+  |
+  0:IcebergScanNode
+     TABLE: ssb.lineorder
+     PREDICATES: 12: lo_discount >= 5, 12: lo_discount <= 7, 9: lo_quantity >= 26, 9: lo_quantity <= 35
+     MIN/MAX PREDICATES: 12: lo_discount >= 5, 12: lo_discount <= 7, 9: lo_quantity >= 26, 9: lo_quantity <= 35
+     TABLE VERSION: Snapshot@(8092092697599283673)
+     cardinality=39390
+     avgRowSize=4.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 39390
+     probe runtime filters:
+     - filter_id = 0, probe_expr = (6: lo_orderdate)
+
+PLAN FRAGMENT 2(F01)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 04
+
+  3:Project
+  |  output columns:
+  |  22 <-> [22: d_datekey, INT, true]
+  |  cardinality: 904
+  |
+  2:IcebergScanNode
+     TABLE: ssb.dates
+     PREDICATES: 33: d_weeknuminyear = 6, 26: d_year = 1994
+     MIN/MAX PREDICATES: 33: d_weeknuminyear <= 6, 33: d_weeknuminyear >= 6, 26: d_year <= 1994, 26: d_year >= 1994
+     TABLE VERSION: Snapshot@(647863998861664984)
+     cardinality=904
+     avgRowSize=3.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 904

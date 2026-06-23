@@ -1,0 +1,79 @@
+Explain String
+Planning: 146.3ms / Execution: 3.68s / Rows: 3
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+16:SORT BY [d_year ASC NULLS FIRST, lo_revenue DESC NULLS LAST] stats={rows=15 conf=estimated} act={rows=6 time=37.8us peak=1.9KB}
+  15:GATHER stats={rows=15 conf=estimated} act={rows=3 time=1.9us peak=0B}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 15
+    PARTITION: UNPARTITIONED
+14:PROJECT [c_city, s_city, d_year, sum(lo_revenue) AS lo_revenue] stats={rows=15 conf=estimated} act={rows=3 time=33.4us peak=90.8KB}
+  13:HASH AGGREGATE (GLOBAL, group by: [c_city, s_city, d_year]) stats={rows=15 conf=estimated} act={rows=6 time=31.5us peak=257.3KB}
+    aggregations: sum(lo_revenue)
+    12:HASH EXCHANGE stats={rows=15 conf=estimated} act={rows=3 time=9.9us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 12
+    PARTITION: HASH_PARTITIONED (c_city, s_city, d_year)
+11:HASH AGGREGATE (LOCAL, group by: [c_city, s_city, d_year]) stats={rows=15 conf=estimated} act={rows=10 time=85.8us peak=455.4KB}
+  aggregations: sum(lo_revenue)
+  10:HASH JOIN (BROADCAST, INNER, eq: [lo_suppkey = s_suppkey]) stats={rows=15 conf=estimated} act={rows=64 time=9.2ms peak=32.5KB}
+    build runtime filters:
+    - filter_id = 2, build_expr = (s_suppkey)
+    7:HASH JOIN (BROADCAST, INNER, eq: [lo_custkey = c_custkey]) stats={rows=4909 conf=estimated} act={rows=1416 time=964.5us peak=698.0KB}
+      build runtime filters:
+      - filter_id = 1, build_expr = (c_custkey)
+      4:HASH JOIN (BROADCAST, INNER, eq: [lo_orderdate = d_datekey]) stats={rows=1045710 conf=estimated} act={rows=77544 time=11.5ms peak=8.6MB}
+        build runtime filters:
+        - filter_id = 0, build_expr = (d_datekey)
+        1:SCAN ssb.lineorder stats={rows=4374854 conf=estimated} act={rows=6001171 time=449.2us peak=0B}
+             TABLE: ssb.lineorder
+             columns: lo_custkey, lo_suppkey, lo_orderdate, lo_revenue
+             min-max stats
+             predicates: lo_orderdate IS NOT NULL AND lo_custkey IS NOT NULL AND lo_suppkey IS NOT NULL
+            probe runtime filters:
+            - filter_id = 0, probe_expr = (lo_orderdate)
+            - filter_id = 1, probe_expr = (lo_custkey)
+            - filter_id = 2, probe_expr = (lo_suppkey)
+        3:GATHER stats={rows=575 conf=estimated} act={rows=93 time=3.3us peak=0B}
+      6:GATHER stats={rows=95 conf=estimated} act={rows=777 time=4.7us peak=0B}
+    9:GATHER stats={rows=6 conf=estimated} act={rows=57 time=6.2us peak=0B}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 9
+    PARTITION: UNPARTITIONED
+8:SCAN ssb.supplier stats={rows=6 conf=estimated} act={rows=19 time=277.6us peak=11.4KB}
+     TABLE: ssb.supplier
+     columns: s_suppkey, s_city
+     min-max stats
+     predicates: s_city = 'UNITED KI1' OR s_city = 'UNITED KI5' AND s_city IN ('UNITED KI1', 'UNITED KI5') AND s_suppkey IS NOT NULL
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 6
+    PARTITION: UNPARTITIONED
+5:SCAN ssb.customer stats={rows=95 conf=estimated} act={rows=259 time=222.5us peak=133.6KB}
+     TABLE: ssb.customer
+     columns: c_custkey, c_city
+     min-max stats
+     predicates: c_city = 'UNITED KI1' OR c_city = 'UNITED KI5' AND c_city IN ('UNITED KI1', 'UNITED KI5') AND c_custkey IS NOT NULL
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: UNPARTITIONED
+2:SCAN ssb.dates stats={rows=575 conf=estimated} act={rows=31 time=176.3us peak=17.1KB}
+     TABLE: ssb.dates
+     columns: d_datekey, d_year, d_yearmonth
+     min-max stats
+     predicates: d_yearmonth = 'Dec1997' AND d_datekey IS NOT NULL

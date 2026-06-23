@@ -1,0 +1,99 @@
+Explain String
+Planning: 116.7ms / Execution: 5.10s / Rows: 1
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+26:PROJECT [sum(Case { operand: None, when_then: [(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: IsNull { expr: TypedExpr { kind: ColumnRef { column_id: c122, qualifier: Some("ssci"), column: "customer_sk" }, data_type: Int32, nullable: true }, negated: true }, data_type: Boolean, nullable: false }, op: And, right: TypedExpr { kind: IsNull { expr: TypedExpr { kind: ColumnRef { column_id: c124, qualifier: Some("csci"), column: "customer_sk" }, data_type: Int32, nullable: true }, negated: false }, data_type: Boolean, nullable: false } }, data_type: Boolean, nullable: false }, TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false })], else_expr: Some(TypedExpr { kind: Literal(Int(0)), data_type: Int64, nullable: false }) }) AS store_only, sum(Case { operand: None, when_then: [(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: IsNull { expr: TypedExpr { kind: ColumnRef { column_id: c122, qualifier: Some("ssci"), column: "customer_sk" }, data_type: Int32, nullable: true }, negated: false }, data_type: Boolean, nullable: false }, op: And, right: TypedExpr { kind: IsNull { expr: TypedExpr { kind: ColumnRef { column_id: c124, qualifier: Some("csci"), column: "customer_sk" }, data_type: Int32, nullable: true }, negated: true }, data_type: Boolean, nullable: false } }, data_type: Boolean, nullable: false }, TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false })], else_expr: Some(TypedExpr { kind: Literal(Int(0)), data_type: Int64, nullable: false }) }) AS catalog_only, sum(Case { operand: None, when_then: [(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: IsNull { expr: TypedExpr { kind: ColumnRef { column_id: c122, qualifier: Some("ssci"), column: "customer_sk" }, data_type: Int32, nullable: true }, negated: true }, data_type: Boolean, nullable: false }, op: And, right: TypedExpr { kind: IsNull { expr: TypedExpr { kind: ColumnRef { column_id: c124, qualifier: Some("csci"), column: "customer_sk" }, data_type: Int32, nullable: true }, negated: true }, data_type: Boolean, nullable: false } }, data_type: Boolean, nullable: false }, TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false })], else_expr: Some(TypedExpr { kind: Literal(Int(0)), data_type: Int64, nullable: false }) }) AS store_and_catalog] stats={rows=1 conf=estimated} act={rows=2 time=26.9us peak=72.0KB}
+  25:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=61.4us peak=64.8KB}
+    aggregations: sum(CASE WHEN ssci.customer_sk IS NOT NULL AND csci.customer_sk IS NULL THEN 1 ELSE 0 END), sum(CASE WHEN ssci.customer_sk IS NULL AND csci.customer_sk IS NOT NULL THEN 1 ELSE 0 END), sum(CASE WHEN ssci.customer_sk IS NOT NULL AND csci.customer_sk IS NOT NULL THEN 1 ELSE 0 END)
+    24:GATHER stats={rows=1 conf=estimated} act={rows=12 time=9.8us peak=0B}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 24
+    PARTITION: UNPARTITIONED
+23:HASH AGGREGATE (LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=3.5ms peak=9.7MB}
+  aggregations: sum(CASE WHEN csci.customer_sk IS NULL AND __cse_0 THEN 1 ELSE 0 END), sum(CASE WHEN ssci.customer_sk IS NULL AND __cse_1 THEN 1 ELSE 0 END), sum(CASE WHEN __cse_0 AND __cse_1 THEN 1 ELSE 0 END)
+  22:PROJECT [ssci.customer_sk AS customer_sk, ssci.item_sk AS item_sk, csci.customer_sk AS customer_sk, csci.item_sk AS item_sk, ssci.customer_sk IS NOT NULL AS __cse_0, csci.customer_sk IS NOT NULL AS __cse_1] stats={rows=2750311 conf=estimated} act={rows=834792 time=706.4us peak=8.6MB}
+    21:HASH JOIN (PARTITIONED, FULL OUTER, eq: [ssci.customer_sk = csci.customer_sk, ssci.item_sk = csci.item_sk]) stats={rows=2750311 conf=estimated} act={rows=1669758 time=4.5ms peak=17.3MB}
+      10:HASH EXCHANGE stats={rows=2750311 conf=estimated} act={rows=547500 time=38.1us peak=0B}
+      20:HASH EXCHANGE stats={rows=1434368 conf=estimated} act={rows=287466 time=9.5us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 20
+    PARTITION: HASH_PARTITIONED (customer_sk, item_sk)
+19:PROJECT [customer_sk, item_sk] stats={rows=1434368 conf=estimated} act={rows=287466 time=2.1ms peak=8.3MB}
+  18:PROJECT [cs_bill_customer_sk AS customer_sk, cs_item_sk AS item_sk] stats={rows=1434368 conf=estimated} act={rows=287466 time=93.7us peak=3.0MB}
+    17:HASH AGGREGATE (GLOBAL, group by: [customer_sk, item_sk]) stats={rows=1434368 conf=estimated} act={rows=862486 time=10.9ms peak=6.7MB}
+      16:HASH EXCHANGE stats={rows=1434368 conf=estimated} act={rows=287518 time=22.8us peak=0B}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 16
+    PARTITION: HASH_PARTITIONED (customer_sk, item_sk)
+15:HASH AGGREGATE (LOCAL, group by: [cs_bill_customer_sk, cs_item_sk]) stats={rows=1434368 conf=estimated} act={rows=575053 time=42.1ms peak=18.5MB}
+  14:HASH JOIN (BROADCAST, INNER, eq: [cs_sold_date_sk = d_date_sk]) stats={rows=1434368 conf=estimated} act={rows=288633 time=21.4ms peak=7.9MB}
+    build runtime filters:
+    - filter_id = 1, build_expr = (d_date_sk)
+    11:SCAN tpcds.catalog_sales stats={rows=1434368 conf=estimated} act={rows=1434368 time=1.3ms peak=0B}
+         TABLE: tpcds.catalog_sales
+         columns: cs_sold_date_sk, cs_bill_customer_sk, cs_item_sk
+         min-max stats
+         predicates: cs_sold_date_sk IS NOT NULL
+        probe runtime filters:
+        - filter_id = 1, probe_expr = (cs_sold_date_sk)
+    13:GATHER stats={rows=16450 conf=estimated} act={rows=1098 time=78.0us peak=0B}
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 13
+    PARTITION: UNPARTITIONED
+12:SCAN tpcds.date_dim stats={rows=16450 conf=estimated} act={rows=366 time=1.1ms peak=222.0KB}
+     TABLE: tpcds.date_dim
+     columns: d_date_sk, d_month_seq
+     min-max stats
+     predicates: d_month_seq BETWEEN 1200 AND 1200 + 11 AND d_date_sk IS NOT NULL
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 10
+    PARTITION: HASH_PARTITIONED (customer_sk, item_sk)
+9:PROJECT [customer_sk, item_sk] stats={rows=2750311 conf=estimated} act={rows=547500 time=1.3ms peak=16.4MB}
+  8:PROJECT [ss_customer_sk AS customer_sk, ss_item_sk AS item_sk] stats={rows=2750311 conf=estimated} act={rows=547500 time=25.5us peak=6.1MB}
+    7:HASH AGGREGATE (GLOBAL, group by: [customer_sk, item_sk]) stats={rows=2750311 conf=estimated} act={rows=1648218 time=10.8ms peak=10.1MB}
+      6:HASH EXCHANGE stats={rows=2750311 conf=estimated} act={rows=551008 time=363.9us peak=0B}
+PLAN FRAGMENT 6
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 6
+    PARTITION: HASH_PARTITIONED (customer_sk, item_sk)
+5:HASH AGGREGATE (LOCAL, group by: [ss_customer_sk, ss_item_sk]) stats={rows=2750311 conf=estimated} act={rows=1104869 time=33.9ms peak=23.6MB}
+  4:HASH JOIN (BROADCAST, INNER, eq: [ss_sold_date_sk = d_date_sk]) stats={rows=2750311 conf=estimated} act={rows=554959 time=84.6ms peak=7.9MB}
+    build runtime filters:
+    - filter_id = 0, build_expr = (d_date_sk)
+    1:SCAN tpcds.store_sales stats={rows=2750311 conf=estimated} act={rows=2750311 time=13.7ms peak=0B}
+         TABLE: tpcds.store_sales
+         columns: ss_sold_date_sk, ss_item_sk, ss_customer_sk
+         min-max stats
+         predicates: ss_sold_date_sk IS NOT NULL
+        probe runtime filters:
+        - filter_id = 0, probe_expr = (ss_sold_date_sk)
+    3:GATHER stats={rows=16450 conf=estimated} act={rows=1098 time=952.9us peak=0B}
+PLAN FRAGMENT 7
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: UNPARTITIONED
+2:SCAN tpcds.date_dim stats={rows=16450 conf=estimated} act={rows=366 time=37.4us peak=222.0KB}
+     TABLE: tpcds.date_dim
+     columns: d_date_sk, d_month_seq
+     min-max stats
+     predicates: d_month_seq BETWEEN 1200 AND 1200 + 11 AND d_date_sk IS NOT NULL

@@ -1,0 +1,100 @@
+Explain String
+Planning: 202.1ms / Execution: 4.74s / Rows: 100
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+23:PROJECT [__nr_sel_0 AS c_last_name, __nr_sel_1 AS c_first_name, __nr_sel_2 AS substr(s_city, 1, 30), __nr_sel_3 AS ss_ticket_number, __nr_sel_4 AS amt, __nr_sel_5 AS profit] stats={rows=100 conf=estimated} act={rows=100 time=46.5us peak=6.4KB}
+  22:MERGING-EXCHANGE stats={rows=100 conf=estimated} act={rows=700 time=73.1us peak=30.2KB}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 22
+    PARTITION: UNPARTITIONED
+21:LOCAL TOP-N (limit=100, offset=0) [__nr_sel_0 ASC NULLS FIRST, __nr_sel_1 ASC NULLS FIRST, substring(s_city, 1, 30) ASC NULLS FIRST, __nr_sel_5 ASC NULLS FIRST] stats={rows=100 conf=estimated} act={rows=7313 time=5.1ms peak=115.2KB}
+  20:PROJECT [c_last_name AS __nr_sel_0, c_first_name AS __nr_sel_1, __cse_0 AS __nr_sel_2, ss_ticket_number AS __nr_sel_3, amt AS __nr_sel_4, profit AS __nr_sel_5, __cse_0 AS substring(s_city, 1, 30)] stats={rows=75179 conf=estimated} act={rows=7013 time=1.6ms peak=10.7KB}
+    19:PROJECT [c_last_name, c_first_name, store.s_city AS s_city, ss_ticket_number, amt, profit, substring(store.s_city, 1, 30) AS __cse_0] stats={rows=75179 conf=estimated} act={rows=7013 time=2.0ms peak=24.0KB}
+      18:HASH JOIN (BROADCAST, INNER, eq: [c_customer_sk = ss_customer_sk]) stats={rows=75179 conf=estimated} act={rows=28052 time=1.9ms peak=4.5MB}
+        build runtime filters:
+        - filter_id = 3, build_expr = (ss_customer_sk)
+        1:SCAN tpcds.customer stats={rows=90000 conf=estimated} act={rows=100000 time=16.7us peak=0B}
+             TABLE: tpcds.customer
+             columns: c_customer_sk, c_first_name, c_last_name
+             min-max stats
+             predicates: c_customer_sk IS NOT NULL
+            probe runtime filters:
+            - filter_id = 3, probe_expr = (c_customer_sk)
+        17:GATHER stats={rows=75179 conf=estimated} act={rows=21039 time=214.0us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 17
+    PARTITION: UNPARTITIONED
+16:PROJECT [ss_ticket_number, ss_customer_sk, s_city, amt, profit] stats={rows=75179 conf=estimated} act={rows=7013 time=153.4us peak=1.9MB}
+  15:PROJECT [ss_ticket_number, ss_customer_sk, store.s_city AS s_city, sum(ss_coupon_amt) AS amt, sum(ss_net_profit) AS profit] stats={rows=75179 conf=estimated} act={rows=7013 time=317.6us peak=463.7KB}
+    14:HASH AGGREGATE (GLOBAL, group by: [ss_ticket_number, ss_customer_sk, ss_addr_sk, store.s_city]) stats={rows=75179 conf=estimated} act={rows=14165 time=685.4us peak=1.7MB}
+      aggregations: sum(ss_coupon_amt), sum(ss_net_profit)
+      13:HASH EXCHANGE stats={rows=75179 conf=estimated} act={rows=7152 time=21.5us peak=0B}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 13
+    PARTITION: HASH_PARTITIONED (ss_ticket_number, ss_customer_sk, ss_addr_sk, store.s_city)
+12:HASH AGGREGATE (LOCAL, group by: [ss_ticket_number, ss_customer_sk, ss_addr_sk, store.s_city]) stats={rows=75179 conf=estimated} act={rows=81856 time=12.5ms peak=7.1MB}
+  aggregations: sum(ss_coupon_amt), sum(ss_net_profit)
+  11:HASH JOIN (BROADCAST, INNER, eq: [store_sales.ss_hdemo_sk = household_demographics.hd_demo_sk]) stats={rows=75179 conf=estimated} act={rows=83344 time=6.3ms peak=10.8MB}
+    build runtime filters:
+    - filter_id = 2, build_expr = (household_demographics.hd_demo_sk)
+    8:HASH JOIN (BROADCAST, INNER, eq: [store_sales.ss_store_sk = store.s_store_sk]) stats={rows=184148 conf=estimated} act={rows=187212 time=5.9ms peak=6.9MB}
+      build runtime filters:
+      - filter_id = 1, build_expr = (store.s_store_sk)
+      5:HASH JOIN (BROADCAST, INNER, eq: [store_sales.ss_sold_date_sk = date_dim.d_date_sk]) stats={rows=184148 conf=estimated} act={rows=226339 time=30.5ms peak=7.1MB}
+        build runtime filters:
+        - filter_id = 0, build_expr = (date_dim.d_date_sk)
+        2:SCAN tpcds.store_sales stats={rows=2394799 conf=estimated} act={rows=2636740 time=9.7ms peak=0B}
+             TABLE: tpcds.store_sales
+             columns: ss_sold_date_sk, ss_customer_sk, ss_hdemo_sk, ss_addr_sk, ss_store_sk, ss_ticket_number, ss_coupon_amt, ss_net_profit
+             min-max stats
+             predicates: ss_sold_date_sk IS NOT NULL AND ss_store_sk IS NOT NULL AND ss_hdemo_sk IS NOT NULL AND ss_customer_sk IS NOT NULL
+            probe runtime filters:
+            - filter_id = 0, probe_expr = (store_sales.ss_sold_date_sk)
+            - filter_id = 1, probe_expr = (store_sales.ss_store_sk)
+            - filter_id = 2, probe_expr = (store_sales.ss_hdemo_sk)
+        4:GATHER stats={rows=140 conf=estimated} act={rows=471 time=61.9us peak=0B}
+      7:GATHER stats={rows=11 conf=estimated} act={rows=33 time=61.6us peak=0B}
+    10:GATHER stats={rows=2981 conf=estimated} act={rows=8640 time=8.5us peak=0B}
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 10
+    PARTITION: UNPARTITIONED
+9:SCAN tpcds.household_demographics stats={rows=2981 conf=estimated} act={rows=2880 time=177.2us peak=1.6MB}
+     TABLE: tpcds.household_demographics
+     columns: hd_demo_sk, hd_dep_count, hd_vehicle_count
+     min-max stats
+     predicates: hd_dep_count = 6 OR hd_vehicle_count > 2 AND hd_demo_sk IS NOT NULL
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 7
+    PARTITION: UNPARTITIONED
+6:SCAN tpcds.store stats={rows=11 conf=estimated} act={rows=11 time=57.1us peak=11.4KB}
+     TABLE: tpcds.store
+     columns: s_store_sk, s_city, s_number_employees
+     min-max stats
+     predicates: s_number_employees BETWEEN 200 AND 295 AND s_store_sk IS NOT NULL
+PLAN FRAGMENT 6
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 4
+    PARTITION: UNPARTITIONED
+3:SCAN tpcds.date_dim stats={rows=140 conf=estimated} act={rows=157 time=41.4us peak=100.5KB}
+     TABLE: tpcds.date_dim
+     columns: d_date_sk, d_year, d_dow
+     min-max stats
+     predicates: d_dow = 1 AND d_year IN (1999, 1999 + 1, 1999 + 2) AND d_date_sk IS NOT NULL

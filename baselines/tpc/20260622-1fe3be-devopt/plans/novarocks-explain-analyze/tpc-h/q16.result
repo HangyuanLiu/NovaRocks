@@ -1,0 +1,52 @@
+Explain String
+Planning: 27.0ms / Execution: 936.3ms / Rows: 18138
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+12:SORT BY [supplier_cnt DESC NULLS LAST, p_brand ASC NULLS FIRST, p_type ASC NULLS FIRST, p_size ASC NULLS FIRST] stats={rows=2372 conf=estimated} act={rows=36276 time=6.5ms peak=2.8MB}
+  11:PROJECT [p_brand, p_type, p_size, count(DISTINCT ps_suppkey) AS supplier_cnt] stats={rows=2372 conf=estimated} act={rows=18138 time=34.6us peak=1.4MB}
+    10:HASH AGGREGATE (SINGLE, group by: [p_brand, p_type, p_size]) stats={rows=2372 conf=fallback} act={rows=67730 time=15.5ms peak=7.2MB}
+      aggregations: count(DISTINCT ps_suppkey)
+      9:GATHER stats={rows=23440 conf=fallback} act={rows=117780 time=25.8us peak=0B}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 9
+    PARTITION: UNPARTITIONED
+8:HASH JOIN (BROADCAST, NULL AWARE LEFT ANTI, eq: [ps_suppkey = s_suppkey]) stats={rows=23440 conf=fallback} act={rows=117792 time=1.8ms peak=3.9MB}
+  4:HASH JOIN (BROADCAST, INNER, eq: [ps_partkey = p_partkey]) stats={rows=58601 conf=estimated} act={rows=206199 time=17.0ms peak=21.7MB}
+    build runtime filters:
+    - filter_id = 0, build_expr = (p_partkey)
+    1:SCAN tpch.partsupp stats={rows=720000 conf=estimated} act={rows=219120 time=1.3ms peak=0B}
+         TABLE: tpch.partsupp
+         columns: ps_partkey, ps_suppkey
+         min-max stats
+         predicates: ps_partkey IS NOT NULL
+        probe runtime filters:
+        - filter_id = 0, probe_expr = (ps_partkey)
+    3:GATHER stats={rows=16200 conf=estimated} act={rows=88371 time=16.4us peak=0B}
+  7:GATHER stats={rows=2500 conf=estimated} act={rows=12 time=13.2us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 7
+    PARTITION: UNPARTITIONED
+6:PROJECT [s_suppkey] stats={rows=2500 conf=estimated} act={rows=4 time=16.3us peak=3.1KB}
+  5:SCAN tpch.supplier stats={rows=2500 conf=estimated} act={rows=4 time=4.6us peak=0B}
+       TABLE: tpch.supplier
+       columns: s_suppkey, s_comment
+       min-max stats
+       predicates: s_comment LIKE '%Customer%Complaints%'
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: UNPARTITIONED
+2:SCAN tpch.part stats={rows=16200 conf=estimated} act={rows=29457 time=3.4ms peak=3.0MB}
+     TABLE: tpch.part
+     columns: p_partkey, p_brand, p_type, p_size
+     min-max stats
+     predicates: p_brand != 'Brand#43' AND p_type NOT LIKE 'PROMO BURNISHED%' AND p_size IN (31, 43, 9, 6, 18, 11, 25, 1) AND p_partkey IS NOT NULL

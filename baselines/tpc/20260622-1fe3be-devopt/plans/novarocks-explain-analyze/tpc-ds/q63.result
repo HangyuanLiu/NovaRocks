@@ -1,0 +1,88 @@
+Explain String
+Planning: 265.7ms / Execution: 12.36s / Rows: 100
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+22:MERGING-EXCHANGE stats={rows=47 conf=estimated} act={rows=700 time=70.1us peak=15.0KB}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 22
+    PARTITION: UNPARTITIONED
+21:LOCAL TOP-N (limit=100, offset=0) [i_manager_id ASC NULLS FIRST, tmp1.avg_monthly_sales ASC NULLS FIRST, tmp1.sum_sales ASC NULLS FIRST] stats={rows=47 conf=estimated} act={rows=300 time=160.6us peak=56.0KB}
+  20:PROJECT [tmp1.i_manager_id AS i_manager_id, tmp1.sum_sales AS sum_sales, tmp1.avg_monthly_sales AS avg_monthly_sales] stats={rows=47 conf=estimated} act={rows=921 time=16.3us peak=32.4KB}
+    19:PROJECT [i_manager_id, sum_sales, avg_monthly_sales] stats={rows=47 conf=estimated} act={rows=921 time=16.2us peak=32.4KB}
+      18:PROJECT [i_manager_id, sum(ss_sales_price) AS sum_sales, avg_monthly_sales] stats={rows=47 conf=estimated} act={rows=921 time=25.7us peak=36.0KB}
+        17:FILTER stats={rows=47 conf=estimated}
+          predicate: CASE WHEN tmp1.avg_monthly_sales > 0 THEN abs(sum(ss_sales_price) - tmp1.avg_monthly_sales) / tmp1.avg_monthly_sales ELSE NULL END > 0.1
+          16:WINDOW [avg(sum(ss_sales_price))] stats={rows=94 conf=estimated} act={rows=921 time=182.2us peak=39.2KB}
+            15:SORT BY [i_manager_id ASC NULLS FIRST] stats={rows=94 conf=estimated} act={rows=2006 time=148.8us peak=38.1KB}
+              14:HASH EXCHANGE stats={rows=94 conf=estimated} act={rows=1003 time=28.8us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 14
+    PARTITION: HASH_PARTITIONED (i_manager_id)
+13:HASH AGGREGATE (GLOBAL, group by: [tmp1.i_manager_id, d_moy]) stats={rows=94 conf=estimated} act={rows=2867 time=605.7us peak=926.5KB}
+  aggregations: sum(ss_sales_price)
+  12:HASH EXCHANGE stats={rows=94 conf=estimated} act={rows=1864 time=13.2us peak=0B}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 12
+    PARTITION: HASH_PARTITIONED (tmp1.i_manager_id, d_moy)
+11:HASH AGGREGATE (LOCAL, group by: [tmp1.i_manager_id, d_moy]) stats={rows=94 conf=estimated} act={rows=21148 time=55.7ms peak=2.0MB}
+  aggregations: sum(ss_sales_price)
+  10:HASH JOIN (BROADCAST, INNER, eq: [ss_store_sk = s_store_sk]) stats={rows=636 conf=estimated} act={rows=19320 time=5.4ms peak=577.8KB}
+    build runtime filters:
+    - filter_id = 2, build_expr = (s_store_sk)
+    7:HASH JOIN (BROADCAST, INNER, eq: [ss_sold_date_sk = d_date_sk]) stats={rows=636 conf=estimated} act={rows=20382 time=10.3ms peak=1.4MB}
+      build runtime filters:
+      - filter_id = 1, build_expr = (d_date_sk)
+      4:HASH JOIN (BROADCAST, INNER, eq: [ss_item_sk = i_item_sk]) stats={rows=3531 conf=estimated} act={rows=114819 time=42.7ms peak=18.2MB}
+        build runtime filters:
+        - filter_id = 0, build_expr = (i_item_sk)
+        1:SCAN tpcds.store_sales stats={rows=2363535 conf=estimated} act={rows=2685687 time=15.8ms peak=0B}
+             TABLE: tpcds.store_sales
+             columns: ss_sold_date_sk, ss_sold_time_sk, ss_item_sk, ss_customer_sk, ss_cdemo_sk, ss_hdemo_sk, ss_addr_sk, ss_store_sk, ss_promo_sk, ss_ticket_number, ss_quantity, ss_wholesale_cost, ss_list_price, ss_sales_price, ss_ext_discount_amt, ss_ext_sales_price, ss_ext_wholesale_cost, ss_ext_list_price, ss_ext_tax, ss_coupon_amt, ss_net_paid, ss_net_paid_inc_tax, ss_net_profit, _file, _pos
+             predicates: ss_item_sk IS NOT NULL AND ss_sold_date_sk IS NOT NULL AND ss_store_sk IS NOT NULL
+            probe runtime filters:
+            - filter_id = 0, probe_expr = (ss_item_sk)
+            - filter_id = 1, probe_expr = (ss_sold_date_sk)
+            - filter_id = 2, probe_expr = (ss_store_sk)
+        3:GATHER stats={rows=27 conf=estimated} act={rows=2802 time=41.8us peak=0B}
+      6:GATHER stats={rows=329 conf=estimated} act={rows=1098 time=1.6ms peak=0B}
+    9:GATHER stats={rows=11 conf=estimated} act={rows=36 time=9.2us peak=0B}
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 9
+    PARTITION: UNPARTITIONED
+8:SCAN tpcds.store stats={rows=11 conf=estimated} act={rows=12 time=48.3us peak=50.0KB}
+     TABLE: tpcds.store
+     columns: s_store_sk, s_store_id, s_rec_start_date, s_rec_end_date, s_closed_date_sk, s_store_name, s_number_employees, s_floor_space, s_hours, s_manager, s_market_id, s_geography_class, s_market_desc, s_market_manager, s_division_id, s_division_name, s_company_id, s_company_name, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip, s_country, s_gmt_offset, s_tax_precentage, _file, _pos
+     predicates: s_store_sk IS NOT NULL
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 6
+    PARTITION: UNPARTITIONED
+5:SCAN tpcds.date_dim stats={rows=329 conf=estimated} act={rows=366 time=145.0us peak=442.9KB}
+     TABLE: tpcds.date_dim
+     columns: d_date_sk, d_date_id, d_date, d_month_seq, d_week_seq, d_quarter_seq, d_year, d_dow, d_moy, d_dom, d_qoy, d_fy_year, d_fy_quarter_seq, d_fy_week_seq, d_day_name, d_quarter_name, d_holiday, d_weekend, d_following_holiday, d_first_dom, d_last_dom, d_same_day_ly, d_same_day_lq, d_current_day, d_current_week, d_current_month, d_current_quarter, d_current_year, _file, _pos
+     predicates: d_month_seq IN (1200, 1200 + 1, 1200 + 2, 1200 + 3, 1200 + 4, 1200 + 5, 1200 + 6, 1200 + 7, 1200 + 8, 1200 + 9, 1200 + 10, 1200 + 11) AND d_date_sk IS NOT NULL
+PLAN FRAGMENT 6
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: UNPARTITIONED
+2:SCAN tpcds.item stats={rows=27 conf=estimated} act={rows=934 time=408.4us peak=1.2MB}
+     TABLE: tpcds.item
+     columns: i_item_sk, i_item_id, i_rec_start_date, i_rec_end_date, i_item_desc, i_current_price, i_wholesale_cost, i_brand_id, i_brand, i_class_id, i_class, i_category_id, i_category, i_manufact_id, i_manufact, i_size, i_formulation, i_color, i_units, i_container, i_manager_id, i_product_name, _file, _pos
+     predicates: i_category IN ('Books', 'Children', 'Electronics') AND i_class IN ('personal', 'portable', 'reference', 'self-help') AND i_brand IN ('scholaramalgamalg #14', 'scholaramalgamalg #7', 'exportiunivamalg #9', 'scholaramalgamalg #9') OR i_category IN ('Women', 'Music', 'Men') AND i_class IN ('accessories', 'classical', 'fragrances', 'pants') AND i_brand IN ('amalgimporto #1', 'edu packscholar #1', 'exportiimporto #1', 'importoamalg #1') AND i_item_sk IS NOT NULL

@@ -1,0 +1,126 @@
+Explain String
+Planning: 435.1ms / Execution: 5.42s / Rows: 100
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+26:PROJECT [__repeat_group.i_item_id AS i_item_id, __repeat_group.ca_country AS ca_country, __repeat_group.ca_state AS ca_state, __repeat_group.ca_county AS ca_county, avg(cast(cs_quantity as Decimal128(12, 2))) AS agg1, avg(cast(cs_list_price as Decimal128(12, 2))) AS agg2, avg(cast(cs_coupon_amt as Decimal128(12, 2))) AS agg3, avg(cast(cs_sales_price as Decimal128(12, 2))) AS agg4, avg(cast(cs_net_profit as Decimal128(12, 2))) AS agg5, avg(cast(c_birth_year as Decimal128(12, 2))) AS agg6, avg(cast(cd1.cd_dep_count as Decimal128(12, 2))) AS agg7] stats={rows=100 conf=estimated} act={rows=100 time=143.3us peak=15.1KB}
+  25:TOP-N (limit=100) [__repeat_group.ca_country ASC NULLS FIRST, __repeat_group.ca_state ASC NULLS FIRST, __repeat_group.ca_county ASC NULLS FIRST, __repeat_group.i_item_id ASC NULLS FIRST] stats={rows=100 conf=estimated} act={rows=5122 time=1.4ms peak=1.9MB}
+    24:HASH AGGREGATE (SINGLE, group by: [i_item_id, ca_country, ca_state, ca_county, __grouping_fn_0]) stats={rows=259308 conf=estimated} act={rows=15414 time=24.9ms peak=4.4MB}
+      aggregations: avg(CAST(cs_quantity AS Decimal128(12, 2))), avg(CAST(cs_list_price AS Decimal128(12, 2))), avg(CAST(cs_coupon_amt AS Decimal128(12, 2))), avg(CAST(cs_sales_price AS Decimal128(12, 2))), avg(CAST(cs_net_profit AS Decimal128(12, 2))), avg(CAST(c_birth_year AS Decimal128(12, 2))), avg(CAST(cd1.cd_dep_count AS Decimal128(12, 2)))
+      23:GATHER stats={rows=259308 conf=estimated} act={rows=6590 time=348.2us peak=0B}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 23
+    PARTITION: UNPARTITIONED
+22:REPEAT (5 grouping sets) stats={rows=259308 conf=estimated} act={rows=6590 time=9.5ms peak=5.4MB}
+  21:PROJECT [i_item_id, ca_country, ca_state, ca_county, cs_quantity, cs_list_price, cs_coupon_amt, cs_sales_price, cs_net_profit, c_birth_year, cd1.cd_dep_count AS cd_dep_count, i_item_id AS __repeat_group_key_0, ca_country AS __repeat_group_key_1, ca_state AS __repeat_group_key_2, ca_county AS __repeat_group_key_3] stats={rows=51862 conf=estimated} act={rows=1318 time=64.2ms peak=85.4KB}
+    20:HASH JOIN (BROADCAST, INNER, eq: [cs_item_sk = i_item_sk]) stats={rows=51862 conf=fallback} act={rows=55318 time=19.2ms peak=12.8MB}
+      build runtime filters:
+      - filter_id = 4, build_expr = (i_item_sk)
+      17:HASH JOIN (PARTITIONED, INNER, eq: [cs_bill_cdemo_sk = cd1.cd_demo_sk]) stats={rows=17804 conf=estimated} act={rows=157859 time=55.8ms peak=28.4MB}
+        14:HASH EXCHANGE stats={rows=17804 conf=estimated} act={rows=19341 time=232.2us peak=0B}
+        16:HASH EXCHANGE stats={rows=108045 conf=estimated} act={rows=137200 time=102.3us peak=0B}
+      19:GATHER stats={rows=16200 conf=estimated} act={rows=54000 time=8.2us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 19
+    PARTITION: UNPARTITIONED
+18:SCAN tpcds.item stats={rows=16200 conf=estimated} act={rows=18000 time=892.1us peak=9.5MB}
+     TABLE: tpcds.item
+     columns: i_item_sk, i_item_id
+     min-max stats
+     predicates: i_item_sk IS NOT NULL
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 16
+    PARTITION: HASH_PARTITIONED (cd_demo_sk)
+15:SCAN tpcds.customer_demographics (alias=cd1) stats={rows=108045 conf=estimated} act={rows=137200 time=41.0ms peak=7.0MB}
+     TABLE: tpcds.customer_demographics
+     columns: cd_demo_sk, cd_dep_count, cd_gender, cd_education_status
+     min-max stats
+     predicates: cd1.cd_gender = 'F' AND cd1.cd_education_status = 'Unknown' AND cd1.cd_demo_sk IS NOT NULL
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 14
+    PARTITION: HASH_PARTITIONED (cs_bill_cdemo_sk)
+13:HASH JOIN (BROADCAST, INNER, eq: [cs_sold_date_sk = d_date_sk]) stats={rows=17804 conf=estimated} act={rows=20436 time=24.9ms peak=8.3MB}
+  build runtime filters:
+  - filter_id = 3, build_expr = (d_date_sk)
+  10:HASH JOIN (BROADCAST, INNER, eq: [cs_bill_customer_sk = c_customer_sk]) stats={rows=99611 conf=estimated} act={rows=58873 time=19.5ms peak=62.6MB}
+    build runtime filters:
+    - filter_id = 2, build_expr = (c_customer_sk)
+    1:SCAN tpcds.catalog_sales stats={rows=1278265 conf=estimated} act={rows=426654 time=2.1ms peak=0B}
+         TABLE: tpcds.catalog_sales
+         columns: cs_sold_date_sk, cs_bill_customer_sk, cs_bill_cdemo_sk, cs_item_sk, cs_quantity, cs_list_price, cs_sales_price, cs_coupon_amt, cs_net_profit
+         min-max stats
+         predicates: cs_bill_cdemo_sk IS NOT NULL AND cs_bill_customer_sk IS NOT NULL AND cs_sold_date_sk IS NOT NULL AND cs_item_sk IS NOT NULL
+        probe runtime filters:
+        - filter_id = 2, probe_expr = (cs_bill_customer_sk)
+        - filter_id = 3, probe_expr = (cs_sold_date_sk)
+        - filter_id = 4, probe_expr = (cs_item_sk)
+    9:GATHER stats={rows=6176 conf=estimated} act={rows=20748 time=1.5ms peak=0B}
+  12:GATHER stats={rows=327 conf=estimated} act={rows=1095 time=105.1us peak=0B}
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 12
+    PARTITION: UNPARTITIONED
+11:SCAN tpcds.date_dim stats={rows=327 conf=estimated} act={rows=365 time=329.5us peak=165.9KB}
+     TABLE: tpcds.date_dim
+     columns: d_date_sk, d_year
+     min-max stats
+     predicates: d_year = 1998 AND d_date_sk IS NOT NULL
+PLAN FRAGMENT 6
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 9
+    PARTITION: UNPARTITIONED
+8:HASH JOIN (BROADCAST, INNER, eq: [cd2.cd_demo_sk = c_current_cdemo_sk]) stats={rows=6176 conf=estimated} act={rows=27664 time=123.2ms peak=23.1MB}
+  build runtime filters:
+  - filter_id = 1, build_expr = (c_current_cdemo_sk)
+  2:SCAN tpcds.customer_demographics (alias=cd2) stats={rows=1728720 conf=estimated} act={rows=267930 time=52.5ms peak=0B}
+       TABLE: tpcds.customer_demographics
+       columns: cd_demo_sk
+       min-max stats
+       predicates: cd2.cd_demo_sk IS NOT NULL
+      probe runtime filters:
+      - filter_id = 1, probe_expr = (cd2.cd_demo_sk)
+  7:GATHER stats={rows=6176 conf=estimated} act={rows=20748 time=114.8us peak=0B}
+PLAN FRAGMENT 7
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 7
+    PARTITION: UNPARTITIONED
+6:HASH JOIN (BROADCAST, INNER, eq: [c_current_addr_sk = ca_address_sk]) stats={rows=6176 conf=estimated} act={rows=28867 time=2.5ms peak=9.4MB}
+  build runtime filters:
+  - filter_id = 0, build_expr = (ca_address_sk)
+  3:SCAN tpcds.customer stats={rows=39108 conf=estimated} act={rows=46867 time=26.5us peak=0B}
+       TABLE: tpcds.customer
+       columns: c_customer_sk, c_current_cdemo_sk, c_current_addr_sk, c_birth_year, c_birth_month
+       min-max stats
+       predicates: c_birth_month IN (1, 6, 8, 9, 12, 2) AND c_customer_sk IS NOT NULL AND c_current_cdemo_sk IS NOT NULL AND c_current_addr_sk IS NOT NULL
+      probe runtime filters:
+      - filter_id = 0, probe_expr = (c_current_addr_sk)
+  5:GATHER stats={rows=6176 conf=estimated} act={rows=21951 time=25.6us peak=0B}
+PLAN FRAGMENT 8
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 5
+    PARTITION: UNPARTITIONED
+4:SCAN tpcds.customer_address stats={rows=6176 conf=estimated} act={rows=7317 time=439.1us peak=2.1MB}
+     TABLE: tpcds.customer_address
+     columns: ca_address_sk, ca_county, ca_state, ca_country
+     min-max stats
+     predicates: ca_state IN ('MS', 'IN', 'ND', 'OK', 'NM', 'VA', 'MS') AND ca_address_sk IS NOT NULL
