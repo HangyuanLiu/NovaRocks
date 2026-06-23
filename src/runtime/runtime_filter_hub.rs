@@ -172,7 +172,8 @@ pub(crate) struct RuntimeFilterHub {
     local_deps: Mutex<HashMap<i32, DependencyHandle>>,
     published_in_filters: Mutex<HashMap<i32, RuntimeInFilter>>,
     published_membership_filters: Mutex<HashMap<i32, RuntimeMembershipFilter>>,
-    probe_data_type_by_filter: std::sync::Mutex<std::collections::HashMap<i32, arrow::datatypes::DataType>>,
+    probe_data_type_by_filter:
+        std::sync::Mutex<std::collections::HashMap<i32, arrow::datatypes::DataType>>,
     scan_wait_timeout_ms: AtomicI64,
     wait_timeout_ms: AtomicI64,
 }
@@ -344,7 +345,10 @@ impl RuntimeFilterHub {
             .and_then(|targets| targets.first().map(|t| t.slot_id))
     }
 
-    pub(crate) fn filter_spec_data_type(&self, filter_id: i32) -> Option<arrow::datatypes::DataType> {
+    pub(crate) fn filter_spec_data_type(
+        &self,
+        filter_id: i32,
+    ) -> Option<arrow::datatypes::DataType> {
         self.probe_data_type_by_filter
             .lock()
             .expect("runtime filter hub lock")

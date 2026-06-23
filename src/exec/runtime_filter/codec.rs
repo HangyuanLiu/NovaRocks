@@ -208,7 +208,11 @@ pub(crate) fn decode_starrocks_in_filter(
         for _ in 0..element_count {
             set.insert(read_i128_le(data, &mut offset)?);
         }
-        RuntimeInFilterValues::Decimal128 { values: set, precision, scale }
+        RuntimeInFilterValues::Decimal128 {
+            values: set,
+            precision,
+            scale,
+        }
     } else {
         return Err(format!(
             "unsupported runtime filter primitive type: {:?}",
@@ -854,13 +858,22 @@ mod tests {
         let filter = RuntimeInFilter::new(
             9,
             SlotId::new(4),
-            RuntimeInFilterValues::Decimal128 { values: set.clone(), precision: 38, scale: 6 },
+            RuntimeInFilterValues::Decimal128 {
+                values: set.clone(),
+                precision: 38,
+                scale: 6,
+            },
         );
         let encoded = encode_starrocks_in_filter(&filter).expect("encode");
         let dt = arrow::datatypes::DataType::Decimal128(38, 6);
-        let decoded = decode_starrocks_in_filter(9, SlotId::new(4), Some(&dt), &encoded).expect("decode");
+        let decoded =
+            decode_starrocks_in_filter(9, SlotId::new(4), Some(&dt), &encoded).expect("decode");
         match decoded.values() {
-            RuntimeInFilterValues::Decimal128 { values, precision, scale } => {
+            RuntimeInFilterValues::Decimal128 {
+                values,
+                precision,
+                scale,
+            } => {
                 assert_eq!(values, &set);
                 assert_eq!(*precision, 38);
                 assert_eq!(*scale, 6);
@@ -875,12 +888,79 @@ mod tests {
         let mut set = HashSet::new();
         set.insert(5i128);
         let filter = RuntimeInFilter::new(
-            9, SlotId::new(4),
-            RuntimeInFilterValues::Decimal128 { values: set, precision: 18, scale: 2 },
+            9,
+            SlotId::new(4),
+            RuntimeInFilterValues::Decimal128 {
+                values: set,
+                precision: 18,
+                scale: 2,
+            },
         );
         let encoded = encode_starrocks_in_filter(&filter).expect("encode");
         // No probe column type => decimal decode must fail-fast (not fabricate p/s).
         assert!(decode_starrocks_in_filter(9, SlotId::new(4), None, &encoded).is_err());
+    }
+
+    #[test]
+    fn varchar_in_filter_wire_layout() {
+        let mut set = HashSet::new();
+        set.insert("ab".to_string());
+        let filter = RuntimeInFilter::new(1, SlotId::new(1), RuntimeInFilterValues::Utf8(set));
+        let buf = encode_starrocks_in_filter(&filter).expect("encode");
+        // header: [0x4][type=4][ltype i32 LE = VARCHAR(15)][count u32 LE = 1]
+        assert_eq!(buf[0], RF_VERSION_V3);
+        assert_eq!(buf[1], RF_TYPE_IN_FILTER);
+        assert_eq!(
+            i32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]),
+            crate::types::TPrimitiveType::VARCHAR.0
+        );
+        assert_eq!(u32::from_le_bytes([buf[6], buf[7], buf[8], buf[9]]), 1);
+        // value: [int32 len=2 LE]['a','b']
+        assert_eq!(i32::from_le_bytes([buf[10], buf[11], buf[12], buf[13]]), 2);
+        assert_eq!(&buf[14..16], b"ab");
+    }
+
+    #[test]
+    fn decimal128_in_filter_wire_layout() {
+        let mut set = HashSet::new();
+        set.insert(7i128);
+        let filter = RuntimeInFilter::new(
+            1,
+            SlotId::new(1),
+            RuntimeInFilterValues::Decimal128 {
+                values: set,
+                precision: 10,
+                scale: 2,
+            },
+        );
+        let buf = encode_starrocks_in_filter(&filter).expect("encode");
+        assert_eq!(
+            i32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]),
+            crate::types::TPrimitiveType::DECIMAL128.0
+        );
+        assert_eq!(u32::from_le_bytes([buf[6], buf[7], buf[8], buf[9]]), 1);
+        // value: 16B i128 LE = 7
+        let mut v = [0u8; 16];
+        v.copy_from_slice(&buf[10..26]);
+        assert_eq!(i128::from_le_bytes(v), 7);
+    }
+
+    #[test]
+    fn decimal128_decode_with_wrong_type_errors() {
+        let mut set = HashSet::new();
+        set.insert(5i128);
+        let filter = RuntimeInFilter::new(
+            9,
+            SlotId::new(4),
+            RuntimeInFilterValues::Decimal128 {
+                values: set,
+                precision: 18,
+                scale: 2,
+            },
+        );
+        let encoded = encode_starrocks_in_filter(&filter).expect("encode");
+        let wrong = arrow::datatypes::DataType::Int64;
+        assert!(decode_starrocks_in_filter(9, SlotId::new(4), Some(&wrong), &encoded).is_err());
     }
 
     #[test]

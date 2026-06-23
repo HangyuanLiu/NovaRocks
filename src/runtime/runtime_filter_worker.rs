@@ -95,7 +95,12 @@ impl RuntimeFilterWorker {
         let filter = match rf_type {
             StarrocksRuntimeFilterType::In => {
                 let dt = self.hub.filter_spec_data_type(filter_id);
-                RuntimeFilterPayload::In(decode_starrocks_in_filter(filter_id, slot_id, dt.as_ref(), data)?)
+                RuntimeFilterPayload::In(decode_starrocks_in_filter(
+                    filter_id,
+                    slot_id,
+                    dt.as_ref(),
+                    data,
+                )?)
             }
             _ => RuntimeFilterPayload::Membership(decode_starrocks_membership_filter(
                 filter_id, slot_id, data,
