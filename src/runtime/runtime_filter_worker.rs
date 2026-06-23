@@ -17,6 +17,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+use arrow::datatypes::DataType;
+
 use crate::common::ids::SlotId;
 use crate::exec::runtime_filter::{
     RuntimeInFilter, RuntimeMembershipFilter, StarrocksRuntimeFilterType,
@@ -73,6 +75,7 @@ impl RuntimeFilterWorker {
         filter_id: i32,
         data: &[u8],
         build_be_number: i32,
+        build_data_type: Option<DataType>,
     ) -> Result<(), String> {
         let slot_id = match self.hub.filter_spec_slot_id(filter_id) {
             Some(slot_id) => slot_id,
@@ -94,16 +97,17 @@ impl RuntimeFilterWorker {
         );
         let filter = match rf_type {
             StarrocksRuntimeFilterType::In => {
-                // NOTE (RF-3): the merge node is the coordinator-chosen root-instance BE and
-                // need not have probe specs registered, so `dt` can be None here. VARCHAR/int
-                // decode ignore it; a DECIMAL128 partial then fail-fasts (no fabricated
-                // precision/scale). Cross-process decimal-at-merge needs build-side type
-                // threading, owned by RF-3 (distributed validation), not RF-2.
-                let dt = self.hub.filter_spec_data_type(filter_id);
+                let hub_data_type;
+                let decode_data_type = if let Some(data_type) = build_data_type.as_ref() {
+                    Some(data_type)
+                } else {
+                    hub_data_type = self.hub.filter_spec_data_type(filter_id);
+                    hub_data_type.as_ref()
+                };
                 RuntimeFilterPayload::In(decode_starrocks_in_filter(
                     filter_id,
                     slot_id,
-                    dt.as_ref(),
+                    decode_data_type,
                     data,
                 )?)
             }

@@ -18,6 +18,7 @@ use std::collections::HashMap;
 
 use crate::common::failpoint::{self, FailPointMode};
 use crate::common::ids::SlotId;
+use crate::exec::runtime_filter::arrow_type_from_proto_type_desc;
 use crate::novarocks_logging::warn;
 use crate::runtime::exchange;
 use crate::runtime::lookup::{decode_column_ipc, encode_column_ipc, execute_lookup_request};
@@ -194,6 +195,11 @@ pub(crate) fn handle_transmit_runtime_filter(
         return response;
     }
 
+    let build_data_type = params
+        .column_type
+        .as_ref()
+        .and_then(arrow_type_from_proto_type_desc);
+
     if params.is_partial.unwrap_or(false) {
         let Some(worker) = query_context_manager().get_or_create_runtime_filter_worker(query_id)
         else {
@@ -209,11 +215,14 @@ pub(crate) fn handle_transmit_runtime_filter(
                 filter_id,
                 params.build_be_number.unwrap_or(0),
                 payload.to_vec(),
+                build_data_type,
             );
             return response;
         };
         let build_be_number = params.build_be_number.unwrap_or(0);
-        if let Err(err) = worker.receive_partial(filter_id, payload, build_be_number) {
+        if let Err(err) =
+            worker.receive_partial(filter_id, payload, build_be_number, build_data_type)
+        {
             warn!(
                 "receive_partial_runtime_filter failed: query_id={} filter_id={} err={}",
                 query_id, filter_id, err
@@ -349,6 +358,8 @@ mod tests {
     use crate::exec::node::scan::RowPositionScanConfig;
     use crate::exec::row_position::RowPositionDescriptor;
     use crate::exec::runtime_filter::{RuntimeInFilter, encode_starrocks_in_filter};
+    #[cfg(feature = "compat")]
+    use crate::exec::runtime_filter::{arrow_type_to_proto_type_desc, decode_starrocks_in_filter};
     use crate::fs::scan_context::FileScanRange;
     use crate::runtime::exchange;
     use crate::runtime::query_context::{QueryId, query_context_manager};
@@ -609,6 +620,217 @@ mod tests {
         assert_eq!(sent[0].0, "probe-host");
         assert_eq!(sent[0].1, 9010);
         assert_eq!(sent[0].2.is_partial, Some(false));
+        internal_rpc_client::clear_test_hooks();
+    }
+
+    #[test]
+    #[cfg(feature = "compat")]
+    fn test_handle_transmit_runtime_filter_decimal_partial_uses_build_column_type() {
+        let _hook_guard = internal_rpc_client::test_hook_lock();
+        internal_rpc_client::clear_test_hooks();
+
+        let query_id = QueryId { hi: 101, lo: 201 };
+        query_context_manager()
+            .ensure_context(
+                query_id,
+                false,
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+            )
+            .expect("ensure query context");
+        query_context_manager()
+            .set_runtime_filter_params(
+                query_id,
+                crate::runtime_filter::TRuntimeFilterParams {
+                    id_to_prober_params: Some(BTreeMap::from([(
+                        9,
+                        vec![crate::runtime_filter::TRuntimeFilterProberParams {
+                            fragment_instance_id: None,
+                            fragment_instance_address: Some(types::TNetworkAddress::new(
+                                "probe-host".to_string(),
+                                9010,
+                            )),
+                        }],
+                    )])),
+                    runtime_filter_builder_number: Some(BTreeMap::from([(9, 2)])),
+                    runtime_filter_max_size: None,
+                    skew_join_runtime_filters: None,
+                },
+            )
+            .expect("set runtime filter params");
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sent_capture = Arc::clone(&sent);
+        internal_rpc_client::set_transmit_runtime_filter_hook(move |host, port, params| {
+            sent_capture
+                .lock()
+                .expect("sent lock")
+                .push((host.to_string(), port, params));
+            Ok(proto::starrocks::PTransmitRuntimeFilterResult {
+                status: Some(proto::starrocks::StatusPb {
+                    status_code: 0,
+                    error_msgs: Vec::new(),
+                }),
+                filter_id: Some(9),
+            })
+        });
+
+        let dt = DataType::Decimal128(18, 2);
+        let column_type =
+            arrow_type_to_proto_type_desc(&dt).expect("decimal runtime filter column type");
+        let filter = RuntimeInFilter::empty(9, SlotId::new(11), &dt).expect("empty in filter");
+        let payload = encode_starrocks_in_filter(&filter).expect("encode runtime filter");
+
+        let first =
+            handle_transmit_runtime_filter(proto::starrocks::PTransmitRuntimeFilterParams {
+                is_partial: Some(true),
+                query_id: Some(unique_id(query_id.hi, query_id.lo)),
+                filter_id: Some(9),
+                build_be_number: Some(1),
+                data: Some(payload.clone()),
+                column_type: Some(column_type.clone()),
+                ..Default::default()
+            });
+        let second =
+            handle_transmit_runtime_filter(proto::starrocks::PTransmitRuntimeFilterParams {
+                is_partial: Some(true),
+                query_id: Some(unique_id(query_id.hi, query_id.lo)),
+                filter_id: Some(9),
+                build_be_number: Some(2),
+                data: Some(payload),
+                column_type: Some(column_type),
+                ..Default::default()
+            });
+
+        assert!(
+            ok_status(first.status.as_ref()),
+            "first status: {:?}",
+            first.status
+        );
+        assert!(
+            ok_status(second.status.as_ref()),
+            "second status: {:?}",
+            second.status
+        );
+        let sent = sent.lock().expect("sent lock");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, "probe-host");
+        assert_eq!(sent[0].1, 9010);
+        assert_eq!(sent[0].2.is_partial, Some(false));
+        let final_payload = sent[0]
+            .2
+            .data
+            .as_deref()
+            .expect("final runtime filter payload");
+        let decoded = decode_starrocks_in_filter(9, SlotId::new(11), Some(&dt), final_payload)
+            .expect("decode final decimal runtime filter");
+        assert!(decoded.is_empty());
+        internal_rpc_client::clear_test_hooks();
+    }
+
+    #[test]
+    #[cfg(feature = "compat")]
+    fn test_handle_transmit_runtime_filter_pending_decimal_partial_preserves_build_column_type() {
+        let _hook_guard = internal_rpc_client::test_hook_lock();
+        internal_rpc_client::clear_test_hooks();
+
+        let query_id = QueryId { hi: 102, lo: 202 };
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sent_capture = Arc::clone(&sent);
+        internal_rpc_client::set_transmit_runtime_filter_hook(move |host, port, params| {
+            sent_capture
+                .lock()
+                .expect("sent lock")
+                .push((host.to_string(), port, params));
+            Ok(proto::starrocks::PTransmitRuntimeFilterResult {
+                status: Some(proto::starrocks::StatusPb {
+                    status_code: 0,
+                    error_msgs: Vec::new(),
+                }),
+                filter_id: Some(10),
+            })
+        });
+
+        let dt = DataType::Decimal128(18, 2);
+        let column_type =
+            arrow_type_to_proto_type_desc(&dt).expect("decimal runtime filter column type");
+        let filter = RuntimeInFilter::empty(10, SlotId::new(11), &dt).expect("empty in filter");
+        let payload = encode_starrocks_in_filter(&filter).expect("encode runtime filter");
+
+        let first =
+            handle_transmit_runtime_filter(proto::starrocks::PTransmitRuntimeFilterParams {
+                is_partial: Some(true),
+                query_id: Some(unique_id(query_id.hi, query_id.lo)),
+                filter_id: Some(10),
+                build_be_number: Some(1),
+                data: Some(payload.clone()),
+                column_type: Some(column_type.clone()),
+                ..Default::default()
+            });
+        assert!(
+            ok_status(first.status.as_ref()),
+            "first status: {:?}",
+            first.status
+        );
+        assert!(
+            sent.lock().expect("sent lock").is_empty(),
+            "pending first partial must not broadcast before params are installed"
+        );
+
+        query_context_manager()
+            .set_runtime_filter_params(
+                query_id,
+                crate::runtime_filter::TRuntimeFilterParams {
+                    id_to_prober_params: Some(BTreeMap::from([(
+                        10,
+                        vec![crate::runtime_filter::TRuntimeFilterProberParams {
+                            fragment_instance_id: None,
+                            fragment_instance_address: Some(types::TNetworkAddress::new(
+                                "probe-host".to_string(),
+                                9010,
+                            )),
+                        }],
+                    )])),
+                    runtime_filter_builder_number: Some(BTreeMap::from([(10, 2)])),
+                    runtime_filter_max_size: None,
+                    skew_join_runtime_filters: None,
+                },
+            )
+            .expect("set runtime filter params");
+        assert!(
+            sent.lock().expect("sent lock").is_empty(),
+            "single replayed partial must not broadcast before all builders arrive"
+        );
+
+        let second =
+            handle_transmit_runtime_filter(proto::starrocks::PTransmitRuntimeFilterParams {
+                is_partial: Some(true),
+                query_id: Some(unique_id(query_id.hi, query_id.lo)),
+                filter_id: Some(10),
+                build_be_number: Some(2),
+                data: Some(payload),
+                column_type: Some(column_type),
+                ..Default::default()
+            });
+        assert!(
+            ok_status(second.status.as_ref()),
+            "second status: {:?}",
+            second.status
+        );
+
+        let sent = sent.lock().expect("sent lock");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, "probe-host");
+        assert_eq!(sent[0].1, 9010);
+        assert_eq!(sent[0].2.is_partial, Some(false));
+        let final_payload = sent[0]
+            .2
+            .data
+            .as_deref()
+            .expect("final runtime filter payload");
+        let decoded = decode_starrocks_in_filter(10, SlotId::new(11), Some(&dt), final_payload)
+            .expect("decode final decimal runtime filter");
+        assert!(decoded.is_empty());
         internal_rpc_client::clear_test_hooks();
     }
 
