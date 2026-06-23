@@ -94,6 +94,11 @@ impl RuntimeFilterWorker {
         );
         let filter = match rf_type {
             StarrocksRuntimeFilterType::In => {
+                // NOTE (RF-3): the merge node is the coordinator-chosen root-instance BE and
+                // need not have probe specs registered, so `dt` can be None here. VARCHAR/int
+                // decode ignore it; a DECIMAL128 partial then fail-fasts (no fabricated
+                // precision/scale). Cross-process decimal-at-merge needs build-side type
+                // threading, owned by RF-3 (distributed validation), not RF-2.
                 let dt = self.hub.filter_spec_data_type(filter_id);
                 RuntimeFilterPayload::In(decode_starrocks_in_filter(
                     filter_id,
