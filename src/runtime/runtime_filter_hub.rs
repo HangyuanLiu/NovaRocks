@@ -172,6 +172,7 @@ pub(crate) struct RuntimeFilterHub {
     local_deps: Mutex<HashMap<i32, DependencyHandle>>,
     published_in_filters: Mutex<HashMap<i32, RuntimeInFilter>>,
     published_membership_filters: Mutex<HashMap<i32, RuntimeMembershipFilter>>,
+    probe_data_type_by_filter: std::sync::Mutex<std::collections::HashMap<i32, arrow::datatypes::DataType>>,
     scan_wait_timeout_ms: AtomicI64,
     wait_timeout_ms: AtomicI64,
 }
@@ -223,6 +224,7 @@ impl RuntimeFilterHub {
             local_deps: Mutex::new(HashMap::new()),
             published_in_filters: Mutex::new(HashMap::new()),
             published_membership_filters: Mutex::new(HashMap::new()),
+            probe_data_type_by_filter: std::sync::Mutex::new(std::collections::HashMap::new()),
             scan_wait_timeout_ms: AtomicI64::new(-1),
             wait_timeout_ms: AtomicI64::new(-1),
         }
@@ -302,6 +304,19 @@ impl RuntimeFilterHub {
                 targets.push(RuntimeFilterTarget { node_id, slot_id });
             }
         }
+        {
+            let mut dt_guard = self
+                .probe_data_type_by_filter
+                .lock()
+                .expect("runtime filter hub lock");
+            // First registrant wins: iterating the raw specs is safe because
+            // or_insert_with keeps the first-stored DataType per filter_id.
+            for spec in specs {
+                dt_guard
+                    .entry(spec.filter_id)
+                    .or_insert_with(|| spec.data_type.clone());
+            }
+        }
         debug!(
             "runtime filter probe specs registered: node_id={} expected={} filters={:?}",
             node_id,
@@ -327,6 +342,14 @@ impl RuntimeFilterHub {
         guard
             .get(&filter_id)
             .and_then(|targets| targets.first().map(|t| t.slot_id))
+    }
+
+    pub(crate) fn filter_spec_data_type(&self, filter_id: i32) -> Option<arrow::datatypes::DataType> {
+        self.probe_data_type_by_filter
+            .lock()
+            .expect("runtime filter hub lock")
+            .get(&filter_id)
+            .cloned()
     }
 
     pub(crate) fn local_dependency(&self, build_node_id: i32) -> DependencyHandle {
@@ -432,7 +455,8 @@ impl RuntimeFilterHub {
             data.len()
         );
         if rf_type == StarrocksRuntimeFilterType::In {
-            let filter = decode_starrocks_in_filter(filter_id, first.slot_id, data)?;
+            let dt = self.filter_spec_data_type(filter_id);
+            let filter = decode_starrocks_in_filter(filter_id, first.slot_id, dt.as_ref(), data)?;
             {
                 let mut guard = self
                     .published_in_filters

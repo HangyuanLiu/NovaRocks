@@ -87,8 +87,10 @@ pub(crate) fn peek_starrocks_filter_type(
 pub(crate) fn decode_starrocks_in_filter(
     filter_id: i32,
     slot_id: SlotId,
+    data_type: Option<&arrow::datatypes::DataType>,
     data: &[u8],
 ) -> Result<RuntimeInFilter, String> {
+    let _ = data_type; // reserved for DECIMAL128 precision/scale recovery (later task)
     if data.is_empty() {
         return Err("runtime filter data is empty".to_string());
     }
@@ -756,7 +758,7 @@ mod tests {
             RuntimeInFilterValues::LargeInt(values.clone()),
         );
         let encoded = encode_starrocks_in_filter(&filter).unwrap();
-        let decoded = decode_starrocks_in_filter(1001, SlotId::new(11), &encoded).unwrap();
+        let decoded = decode_starrocks_in_filter(1001, SlotId::new(11), None, &encoded).unwrap();
         match decoded.values() {
             RuntimeInFilterValues::LargeInt(decoded_values) => {
                 assert_eq!(&values, decoded_values);

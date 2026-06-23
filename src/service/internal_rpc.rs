@@ -632,6 +632,7 @@ mod tests {
                 filter_id: 7,
                 expr_id: ExprId(0),
                 slot_id: SlotId::new(11),
+                data_type: arrow::datatypes::DataType::Int32,
             }],
         );
         let probe = hub.register_probe(88);
