@@ -1,0 +1,303 @@
+Explain String
+Planning: 621.9ms / Execution: 20.20s / Rows: 1
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+108:PROJECT [CASE WHEN __scalar_sq_0 > 74219 THEN __scalar_sq_1 ELSE __scalar_sq_2 END AS bucket1, CASE WHEN __scalar_sq_3 > 122840 THEN __scalar_sq_4 ELSE __scalar_sq_5 END AS bucket2, CASE WHEN __scalar_sq_6 > 56580 THEN __scalar_sq_7 ELSE __scalar_sq_8 END AS bucket3, CASE WHEN __scalar_sq_9 > 10097 THEN __scalar_sq_10 ELSE __scalar_sq_11 END AS bucket4, CASE WHEN __scalar_sq_12 > 165306 THEN __scalar_sq_13 ELSE __scalar_sq_14 END AS bucket5] stats={rows=1 conf=estimated} act={rows=1 time=25.3us peak=200B}
+  107:PROJECT [__scalar_sq_0, __scalar_sq_1, __scalar_sq_2, __scalar_sq_3, __scalar_sq_4, __scalar_sq_5, __scalar_sq_6, __scalar_sq_7, __scalar_sq_8, __scalar_sq_9, __scalar_sq_10, __scalar_sq_11, __scalar_sq_12, __scalar_sq_13, avg(ss_net_paid) AS __scalar_sq_14] stats={rows=1 conf=estimated} act={rows=1 time=67.6us peak=200B}
+    106:NEST LOOP JOIN (CROSS) stats={rows=1 conf=estimated} act={rows=1 time=7.3us peak=200B}
+      100:PROJECT [__scalar_sq_0, __scalar_sq_1, __scalar_sq_2, __scalar_sq_3, __scalar_sq_4, __scalar_sq_5, __scalar_sq_6, __scalar_sq_7, __scalar_sq_8, __scalar_sq_9, __scalar_sq_10, __scalar_sq_11, __scalar_sq_12, avg(ss_ext_discount_amt) AS __scalar_sq_13] stats={rows=1 conf=estimated} act={rows=1 time=66.2us peak=184B}
+        99:NEST LOOP JOIN (CROSS) stats={rows=1 conf=estimated} act={rows=1 time=7.0us peak=240B}
+          93:PROJECT [__scalar_sq_0, __scalar_sq_1, __scalar_sq_2, __scalar_sq_3, __scalar_sq_4, __scalar_sq_5, __scalar_sq_6, __scalar_sq_7, __scalar_sq_8, __scalar_sq_9, __scalar_sq_10, __scalar_sq_11, ifnull(count(*), 0) AS __scalar_sq_12] stats={rows=1 conf=estimated} act={rows=1 time=57.3us peak=168B}
+            92:NEST LOOP JOIN (CROSS) stats={rows=1 conf=estimated} act={rows=1 time=6.4us peak=8.2KB}
+              86:PROJECT [__scalar_sq_0, __scalar_sq_1, __scalar_sq_2, __scalar_sq_3, __scalar_sq_4, __scalar_sq_5, __scalar_sq_6, __scalar_sq_7, __scalar_sq_8, __scalar_sq_9, __scalar_sq_10, avg(ss_net_paid) AS __scalar_sq_11] stats={rows=1 conf=estimated} act={rows=1 time=51.0us peak=160B}
+                85:NEST LOOP JOIN (CROSS) stats={rows=1 conf=estimated} act={rows=1 time=5.9us peak=160B}
+                  79:PROJECT [__scalar_sq_0, __scalar_sq_1, __scalar_sq_2, __scalar_sq_3, __scalar_sq_4, __scalar_sq_5, __scalar_sq_6, __scalar_sq_7, __scalar_sq_8, __scalar_sq_9, avg(ss_ext_discount_amt) AS __scalar_sq_10] stats={rows=1 conf=estimated} act={rows=1 time=47.4us peak=144B}
+                    78:NEST LOOP JOIN (CROSS) stats={rows=1 conf=estimated} act={rows=1 time=5.8us peak=200B}
+                      72:PROJECT [__scalar_sq_0, __scalar_sq_1, __scalar_sq_2, __scalar_sq_3, __scalar_sq_4, __scalar_sq_5, __scalar_sq_6, __scalar_sq_7, __scalar_sq_8, ifnull(count(*), 0) AS __scalar_sq_9] stats={rows=1 conf=estimated} act={rows=1 time=47.5us peak=128B}
+                        71:NEST LOOP JOIN (CROSS) stats={rows=1 conf=estimated} act={rows=1 time=6.2us peak=8.1KB}
+                          65:PROJECT [__scalar_sq_0, __scalar_sq_1, __scalar_sq_2, __scalar_sq_3, __scalar_sq_4, __scalar_sq_5, __scalar_sq_6, __scalar_sq_7, avg(ss_net_paid) AS __scalar_sq_8] stats={rows=1 conf=estimated} act={rows=1 time=36.8us peak=120B}
+                            64:NEST LOOP JOIN (CROSS) stats={rows=1 conf=estimated} act={rows=1 time=5.3us peak=120B}
+                              58:PROJECT [__scalar_sq_0, __scalar_sq_1, __scalar_sq_2, __scalar_sq_3, __scalar_sq_4, __scalar_sq_5, __scalar_sq_6, avg(ss_ext_discount_amt) AS __scalar_sq_7] stats={rows=1 conf=estimated} act={rows=1 time=32.8us peak=104B}
+                                57:NEST LOOP JOIN (CROSS) stats={rows=1 conf=estimated} act={rows=1 time=5.3us peak=160B}
+                                  51:PROJECT [__scalar_sq_0, __scalar_sq_1, __scalar_sq_2, __scalar_sq_3, __scalar_sq_4, __scalar_sq_5, ifnull(count(*), 0) AS __scalar_sq_6] stats={rows=1 conf=estimated} act={rows=1 time=29.3us peak=88B}
+                                    50:NEST LOOP JOIN (CROSS) stats={rows=1 conf=estimated} act={rows=1 time=5.8us peak=8.1KB}
+                                      44:PROJECT [__scalar_sq_0, __scalar_sq_1, __scalar_sq_2, __scalar_sq_3, __scalar_sq_4, avg(ss_net_paid) AS __scalar_sq_5] stats={rows=1 conf=estimated} act={rows=1 time=24.6us peak=80B}
+                                        43:NEST LOOP JOIN (CROSS) stats={rows=1 conf=estimated} act={rows=1 time=4.7us peak=80B}
+                                          37:PROJECT [__scalar_sq_0, __scalar_sq_1, __scalar_sq_2, __scalar_sq_3, avg(ss_ext_discount_amt) AS __scalar_sq_4] stats={rows=1 conf=estimated} act={rows=1 time=20.8us peak=64B}
+                                            36:NEST LOOP JOIN (CROSS) stats={rows=1 conf=estimated} act={rows=1 time=3.8us peak=120B}
+                                              30:PROJECT [__scalar_sq_0, __scalar_sq_1, __scalar_sq_2, ifnull(count(*), 0) AS __scalar_sq_3] stats={rows=1 conf=estimated} act={rows=1 time=16.6us peak=48B}
+                                                29:NEST LOOP JOIN (CROSS) stats={rows=1 conf=estimated} act={rows=1 time=3.3us peak=8.0KB}
+                                                  23:PROJECT [__scalar_sq_0, __scalar_sq_1, avg(ss_net_paid) AS __scalar_sq_2] stats={rows=1 conf=estimated} act={rows=1 time=13.8us peak=40B}
+                                                    22:NEST LOOP JOIN (CROSS) stats={rows=1 conf=estimated} act={rows=1 time=3.2us peak=40B}
+                                                      16:PROJECT [__scalar_sq_0, avg(ss_ext_discount_amt) AS __scalar_sq_1] stats={rows=1 conf=estimated} act={rows=1 time=10.8us peak=24B}
+                                                        15:NEST LOOP JOIN (CROSS) stats={rows=1 conf=estimated} act={rows=1 time=3.9us peak=80B}
+                                                          9:PROJECT [ifnull(count(*), 0) AS __scalar_sq_0] stats={rows=1 conf=estimated} act={rows=1 time=18.1us peak=171B}
+                                                            8:NEST LOOP JOIN (CROSS) stats={rows=1 conf=estimated} act={rows=1 time=9.9us peak=8.6KB}
+                                                              2:GATHER stats={rows=1 conf=estimated} act={rows=1 time=27.7us peak=0B}
+                                                              7:PROJECT [count(*)] stats={rows=1 conf=estimated} act={rows=1 time=21.0us peak=8.0KB}
+                                                                6:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=76.9us peak=64.4KB}
+                                                                  aggregations: count()
+                                                                  5:GATHER stats={rows=1 conf=estimated} act={rows=12 time=12.9us peak=0B}
+                                                          14:PROJECT [avg(ss_ext_discount_amt)] stats={rows=1 conf=estimated} act={rows=1 time=8.1us peak=16B}
+                                                            13:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=45.6us peak=64.4KB}
+                                                              aggregations: avg(ss_ext_discount_amt)
+                                                              12:GATHER stats={rows=1 conf=estimated} act={rows=12 time=3.9us peak=0B}
+                                                      21:PROJECT [avg(ss_net_paid)] stats={rows=1 conf=estimated} act={rows=1 time=7.7us peak=16B}
+                                                        20:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=54.4us peak=64.5KB}
+                                                          aggregations: avg(ss_net_paid)
+                                                          19:GATHER stats={rows=1 conf=estimated} act={rows=12 time=26.5us peak=0B}
+                                                  28:PROJECT [count(*)] stats={rows=1 conf=estimated} act={rows=1 time=6.0us peak=8.0KB}
+                                                    27:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=52.4us peak=64.5KB}
+                                                      aggregations: count()
+                                                      26:GATHER stats={rows=1 conf=estimated} act={rows=12 time=23.4us peak=0B}
+                                              35:PROJECT [avg(ss_ext_discount_amt)] stats={rows=1 conf=estimated} act={rows=1 time=5.6us peak=16B}
+                                                34:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=51.1us peak=64.6KB}
+                                                  aggregations: avg(ss_ext_discount_amt)
+                                                  33:GATHER stats={rows=1 conf=estimated} act={rows=12 time=57.5us peak=0B}
+                                          42:PROJECT [avg(ss_net_paid)] stats={rows=1 conf=estimated} act={rows=1 time=17.6us peak=16B}
+                                            41:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=43.4us peak=64.8KB}
+                                              aggregations: avg(ss_net_paid)
+                                              40:GATHER stats={rows=1 conf=estimated} act={rows=12 time=78.7us peak=0B}
+                                      49:PROJECT [count(*)] stats={rows=1 conf=estimated} act={rows=1 time=6.3us peak=8.0KB}
+                                        48:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=51.9us peak=64.4KB}
+                                          aggregations: count()
+                                          47:GATHER stats={rows=1 conf=estimated} act={rows=12 time=11.7us peak=0B}
+                                  56:PROJECT [avg(ss_ext_discount_amt)] stats={rows=1 conf=estimated} act={rows=1 time=12.3us peak=16B}
+                                    55:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=48.0us peak=64.5KB}
+                                      aggregations: avg(ss_ext_discount_amt)
+                                      54:GATHER stats={rows=1 conf=estimated} act={rows=12 time=40.1us peak=0B}
+                              63:PROJECT [avg(ss_net_paid)] stats={rows=1 conf=estimated} act={rows=1 time=8.4us peak=16B}
+                                62:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=73.0us peak=64.4KB}
+                                  aggregations: avg(ss_net_paid)
+                                  61:GATHER stats={rows=1 conf=estimated} act={rows=12 time=18.9us peak=0B}
+                          70:PROJECT [count(*)] stats={rows=1 conf=estimated} act={rows=1 time=17.6us peak=8.0KB}
+                            69:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=63.3us peak=64.4KB}
+                              aggregations: count()
+                              68:GATHER stats={rows=1 conf=estimated} act={rows=12 time=6.1us peak=0B}
+                      77:PROJECT [avg(ss_ext_discount_amt)] stats={rows=1 conf=estimated} act={rows=1 time=13.3us peak=16B}
+                        76:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=59.3us peak=64.9KB}
+                          aggregations: avg(ss_ext_discount_amt)
+                          75:GATHER stats={rows=1 conf=estimated} act={rows=12 time=91.5us peak=0B}
+                  84:PROJECT [avg(ss_net_paid)] stats={rows=1 conf=estimated} act={rows=1 time=7.6us peak=16B}
+                    83:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=52.6us peak=64.6KB}
+                      aggregations: avg(ss_net_paid)
+                      82:GATHER stats={rows=1 conf=estimated} act={rows=12 time=28.6us peak=0B}
+              91:PROJECT [count(*)] stats={rows=1 conf=estimated} act={rows=1 time=11.3us peak=8.0KB}
+                90:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=59.9us peak=64.5KB}
+                  aggregations: count()
+                  89:GATHER stats={rows=1 conf=estimated} act={rows=12 time=24us peak=0B}
+          98:PROJECT [avg(ss_ext_discount_amt)] stats={rows=1 conf=estimated} act={rows=1 time=7.1us peak=16B}
+            97:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=65.2us peak=64.5KB}
+              aggregations: avg(ss_ext_discount_amt)
+              96:GATHER stats={rows=1 conf=estimated} act={rows=12 time=23.1us peak=0B}
+      105:PROJECT [avg(ss_net_paid)] stats={rows=1 conf=estimated} act={rows=1 time=5.8us peak=16B}
+        104:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=83.0us peak=64.6KB}
+          aggregations: avg(ss_net_paid)
+          103:GATHER stats={rows=1 conf=estimated} act={rows=12 time=44.7us peak=0B}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 103
+    PARTITION: UNPARTITIONED
+102:HASH AGGREGATE (LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=684.9us peak=1.8MB}
+  aggregations: avg(ss_net_paid)
+  101:SCAN tpcds.store_sales stats={rows=576081 conf=estimated} act={rows=550788 time=21.4us peak=0B}
+       TABLE: tpcds.store_sales
+       columns: ss_net_paid, ss_quantity
+       min-max stats
+       predicates: ss_quantity BETWEEN 81 AND 100
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 96
+    PARTITION: UNPARTITIONED
+95:HASH AGGREGATE (LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=778.6us peak=1.5MB}
+  aggregations: avg(ss_ext_discount_amt)
+  94:SCAN tpcds.store_sales stats={rows=576081 conf=estimated} act={rows=550788 time=26.0us peak=0B}
+       TABLE: tpcds.store_sales
+       columns: ss_ext_discount_amt, ss_quantity
+       min-max stats
+       predicates: ss_quantity BETWEEN 81 AND 100
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 89
+    PARTITION: UNPARTITIONED
+88:HASH AGGREGATE (LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=479.4us peak=1.2MB}
+  aggregations: count()
+  87:SCAN tpcds.store_sales stats={rows=576081 conf=estimated} act={rows=550788 time=20.3us peak=0B}
+       TABLE: tpcds.store_sales
+       columns: ss_quantity
+       min-max stats
+       predicates: ss_quantity BETWEEN 81 AND 100
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 82
+    PARTITION: UNPARTITIONED
+81:HASH AGGREGATE (LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=723.7us peak=1.2MB}
+  aggregations: avg(ss_net_paid)
+  80:SCAN tpcds.store_sales stats={rows=940444 conf=estimated} act={rows=550565 time=26.9us peak=0B}
+       TABLE: tpcds.store_sales
+       columns: ss_net_paid, ss_quantity
+       min-max stats
+       predicates: ss_quantity BETWEEN 61 AND 80
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 75
+    PARTITION: UNPARTITIONED
+74:HASH AGGREGATE (LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=705.8us peak=1.2MB}
+  aggregations: avg(ss_ext_discount_amt)
+  73:SCAN tpcds.store_sales stats={rows=940444 conf=estimated} act={rows=550565 time=22.0us peak=0B}
+       TABLE: tpcds.store_sales
+       columns: ss_ext_discount_amt, ss_quantity
+       min-max stats
+       predicates: ss_quantity BETWEEN 61 AND 80
+PLAN FRAGMENT 6
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 68
+    PARTITION: UNPARTITIONED
+67:HASH AGGREGATE (LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=488.1us peak=1.6MB}
+  aggregations: count()
+  66:SCAN tpcds.store_sales stats={rows=940444 conf=estimated} act={rows=550565 time=24.6us peak=0B}
+       TABLE: tpcds.store_sales
+       columns: ss_quantity
+       min-max stats
+       predicates: ss_quantity BETWEEN 61 AND 80
+PLAN FRAGMENT 7
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 61
+    PARTITION: UNPARTITIONED
+60:HASH AGGREGATE (LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=755.4us peak=1.6MB}
+  aggregations: avg(ss_net_paid)
+  59:SCAN tpcds.store_sales stats={rows=1058000 conf=estimated} act={rows=549650 time=24.5us peak=0B}
+       TABLE: tpcds.store_sales
+       columns: ss_net_paid, ss_quantity
+       min-max stats
+       predicates: ss_quantity BETWEEN 41 AND 60
+PLAN FRAGMENT 8
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 54
+    PARTITION: UNPARTITIONED
+53:HASH AGGREGATE (LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=715.1us peak=1.4MB}
+  aggregations: avg(ss_ext_discount_amt)
+  52:SCAN tpcds.store_sales stats={rows=1058000 conf=estimated} act={rows=549650 time=22.5us peak=0B}
+       TABLE: tpcds.store_sales
+       columns: ss_ext_discount_amt, ss_quantity
+       min-max stats
+       predicates: ss_quantity BETWEEN 41 AND 60
+PLAN FRAGMENT 9
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 47
+    PARTITION: UNPARTITIONED
+46:HASH AGGREGATE (LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=464.5us peak=1.5MB}
+  aggregations: count()
+  45:SCAN tpcds.store_sales stats={rows=1058000 conf=estimated} act={rows=549650 time=21.7us peak=0B}
+       TABLE: tpcds.store_sales
+       columns: ss_quantity
+       min-max stats
+       predicates: ss_quantity BETWEEN 41 AND 60
+PLAN FRAGMENT 10
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 40
+    PARTITION: UNPARTITIONED
+39:HASH AGGREGATE (LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=667.9us peak=1.4MB}
+  aggregations: avg(ss_net_paid)
+  38:SCAN tpcds.store_sales stats={rows=940444 conf=estimated} act={rows=549402 time=18.6us peak=0B}
+       TABLE: tpcds.store_sales
+       columns: ss_net_paid, ss_quantity
+       min-max stats
+       predicates: ss_quantity BETWEEN 21 AND 40
+PLAN FRAGMENT 11
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 33
+    PARTITION: UNPARTITIONED
+32:HASH AGGREGATE (LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=760.4us peak=1.5MB}
+  aggregations: avg(ss_ext_discount_amt)
+  31:SCAN tpcds.store_sales stats={rows=940444 conf=estimated} act={rows=549402 time=21.3us peak=0B}
+       TABLE: tpcds.store_sales
+       columns: ss_ext_discount_amt, ss_quantity
+       min-max stats
+       predicates: ss_quantity BETWEEN 21 AND 40
+PLAN FRAGMENT 12
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 26
+    PARTITION: UNPARTITIONED
+25:HASH AGGREGATE (LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=465.8us peak=1.2MB}
+  aggregations: count()
+  24:SCAN tpcds.store_sales stats={rows=940444 conf=estimated} act={rows=549402 time=18.7us peak=0B}
+       TABLE: tpcds.store_sales
+       columns: ss_quantity
+       min-max stats
+       predicates: ss_quantity BETWEEN 21 AND 40
+PLAN FRAGMENT 13
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 19
+    PARTITION: UNPARTITIONED
+18:HASH AGGREGATE (LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=867.9us peak=1.4MB}
+  aggregations: avg(ss_net_paid)
+  17:SCAN tpcds.store_sales stats={rows=576081 conf=estimated} act={rows=550003 time=18.9us peak=0B}
+       TABLE: tpcds.store_sales
+       columns: ss_net_paid, ss_quantity
+       min-max stats
+       predicates: ss_quantity BETWEEN 1 AND 20
+PLAN FRAGMENT 14
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 12
+    PARTITION: UNPARTITIONED
+11:HASH AGGREGATE (LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=676.2us peak=1.2MB}
+  aggregations: avg(ss_ext_discount_amt)
+  10:SCAN tpcds.store_sales stats={rows=576081 conf=estimated} act={rows=550003 time=20.0us peak=0B}
+       TABLE: tpcds.store_sales
+       columns: ss_ext_discount_amt, ss_quantity
+       min-max stats
+       predicates: ss_quantity BETWEEN 1 AND 20
+PLAN FRAGMENT 15
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 5
+    PARTITION: UNPARTITIONED
+4:HASH AGGREGATE (LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=433.2us peak=1.4MB}
+  aggregations: count()
+  3:SCAN tpcds.store_sales stats={rows=576081 conf=estimated} act={rows=550003 time=19.1us peak=0B}
+       TABLE: tpcds.store_sales
+       columns: ss_quantity
+       min-max stats
+       predicates: ss_quantity BETWEEN 1 AND 20
+PLAN FRAGMENT 16
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 2
+    PARTITION: UNPARTITIONED
+1:SCAN tpcds.reason stats={rows=1 conf=estimated} act={rows=1 time=10.9us peak=1.3KB}
+     TABLE: tpcds.reason
+     columns: r_reason_sk
+     min-max stats
+     predicates: r_reason_sk = 1

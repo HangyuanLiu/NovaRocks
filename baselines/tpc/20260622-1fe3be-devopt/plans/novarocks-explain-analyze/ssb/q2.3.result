@@ -1,0 +1,79 @@
+Explain String
+Planning: 139.4ms / Execution: 2.83s / Rows: 7
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+16:SORT BY [d_year ASC NULLS FIRST, p_brand ASC NULLS FIRST] stats={rows=2646 conf=estimated} act={rows=14 time=87.8us peak=2.6KB}
+  15:GATHER stats={rows=2646 conf=estimated} act={rows=7 time=2.8us peak=0B}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 15
+    PARTITION: UNPARTITIONED
+14:PROJECT [sum(lo_revenue) AS lo_revenue, d_year, p_brand] stats={rows=2646 conf=estimated} act={rows=7 time=34us peak=174.9KB}
+  13:HASH AGGREGATE (GLOBAL, group by: [d_year, p_brand]) stats={rows=2646 conf=estimated} act={rows=28 time=39.6us peak=641.9KB}
+    aggregations: sum(lo_revenue)
+    12:HASH EXCHANGE stats={rows=2646 conf=estimated} act={rows=21 time=28.9us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 12
+    PARTITION: HASH_PARTITIONED (d_year, p_brand)
+11:HASH AGGREGATE (LOCAL, group by: [d_year, p_brand]) stats={rows=2646 conf=estimated} act={rows=1255 time=6.2ms peak=1.7MB}
+  aggregations: sum(lo_revenue)
+  10:HASH JOIN (BROADCAST, INNER, eq: [lo_suppkey = s_suppkey]) stats={rows=212775 conf=estimated} act={rows=2374 time=4.3ms peak=393.7KB}
+    build runtime filters:
+    - filter_id = 2, build_expr = (s_suppkey)
+    7:HASH JOIN (BROADCAST, INNER, eq: [lo_partkey = p_partkey]) stats={rows=945667 conf=estimated} act={rows=7145 time=39.4ms peak=14.5MB}
+      build runtime filters:
+      - filter_id = 1, build_expr = (p_partkey)
+      4:HASH JOIN (BROADCAST, INNER, eq: [lo_orderdate = d_datekey]) stats={rows=4182840 conf=estimated} act={rows=6008839 time=79.9ms peak=12.6MB}
+        build runtime filters:
+        - filter_id = 0, build_expr = (d_datekey)
+        1:SCAN ssb.lineorder stats={rows=4374854 conf=estimated} act={rows=6001171 time=2.6ms peak=0B}
+             TABLE: ssb.lineorder
+             columns: lo_partkey, lo_suppkey, lo_orderdate, lo_revenue
+             min-max stats
+             predicates: lo_orderdate IS NOT NULL AND lo_partkey IS NOT NULL AND lo_suppkey IS NOT NULL
+            probe runtime filters:
+            - filter_id = 0, probe_expr = (lo_orderdate)
+            - filter_id = 1, probe_expr = (lo_partkey)
+            - filter_id = 2, probe_expr = (lo_suppkey)
+        3:GATHER stats={rows=2300 conf=estimated} act={rows=7668 time=4.1us peak=0B}
+      6:GATHER stats={rows=45000 conf=estimated} act={rows=648 time=80.1us peak=0B}
+    9:GATHER stats={rows=450 conf=estimated} act={rows=1140 time=234.5us peak=0B}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 9
+    PARTITION: UNPARTITIONED
+8:SCAN ssb.supplier stats={rows=450 conf=estimated} act={rows=380 time=155.6us peak=236.5KB}
+     TABLE: ssb.supplier
+     columns: s_suppkey, s_region
+     min-max stats
+     predicates: s_region = 'EUROPE' AND s_suppkey IS NOT NULL
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 6
+    PARTITION: UNPARTITIONED
+5:SCAN ssb.part stats={rows=45000 conf=estimated} act={rows=216 time=776.8us peak=217.9KB}
+     TABLE: ssb.part
+     columns: p_partkey, p_brand
+     min-max stats
+     predicates: p_brand = 'MFGR#2239' AND p_partkey IS NOT NULL
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: UNPARTITIONED
+2:SCAN ssb.dates stats={rows=2300 conf=estimated} act={rows=2556 time=75.8us peak=1.3MB}
+     TABLE: ssb.dates
+     columns: d_datekey, d_year
+     min-max stats
+     predicates: d_datekey IS NOT NULL

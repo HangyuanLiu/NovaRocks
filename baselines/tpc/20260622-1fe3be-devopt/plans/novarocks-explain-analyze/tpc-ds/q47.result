@@ -1,0 +1,211 @@
+Explain String
+Planning: 254.7ms / Execution: 12.13s / Rows: 100
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+71:PROJECT [__nr_sel_0 AS i_category, __nr_sel_1 AS i_brand, __nr_sel_2 AS s_store_name, __nr_sel_3 AS s_company_name, __nr_sel_4 AS d_year, __nr_sel_5 AS d_moy, __nr_sel_6 AS avg_monthly_sales, __nr_sel_7 AS sum_sales, __nr_sel_8 AS psum, __nr_sel_9 AS nsum] stats={rows=2 conf=estimated} act={rows=100 time=103.1us peak=13.4KB}
+  70:MERGING-EXCHANGE stats={rows=2 conf=estimated} act={rows=300 time=27.0us peak=28.9KB}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 70
+    PARTITION: UNPARTITIONED
+69:LOCAL TOP-N (limit=100, offset=0) [v2.sum_sales - v2.avg_monthly_sales ASC NULLS FIRST, v2.s_store_name ASC NULLS FIRST] stats={rows=2 conf=estimated} act={rows=48986 time=3.4ms peak=7.2MB}
+  68:PROJECT [v2.i_category AS __nr_sel_0, v2.i_brand AS __nr_sel_1, v2.s_store_name AS __nr_sel_2, v2.s_company_name AS __nr_sel_3, v2.d_year AS __nr_sel_4, v2.d_moy AS __nr_sel_5, v2.avg_monthly_sales AS __nr_sel_6, v2.sum_sales AS __nr_sel_7, v2.psum AS __nr_sel_8, v2.nsum AS __nr_sel_9, sum_sales - avg_monthly_sales AS v2.sum_sales - v2.avg_monthly_sales] stats={rows=2 conf=estimated} act={rows=48886 time=777.6us peak=4.8MB}
+    67:FILTER stats={rows=2 conf=estimated}
+      predicate: d_year = 1999 AND __cse_0 AND CASE WHEN __cse_0 THEN abs(sum_sales - avg_monthly_sales) / avg_monthly_sales ELSE NULL END > 0.1
+      66:PROJECT [i_category, i_brand, s_store_name, s_company_name, d_year, d_moy, avg_monthly_sales, sum_sales, psum, nsum, avg_monthly_sales > 0 AS __cse_0] stats={rows=389 conf=estimated} act={rows=102713 time=4.7ms peak=10.5MB}
+        65:PROJECT [i_category, i_brand, s_store_name, s_company_name, d_year, d_moy, avg_monthly_sales, sum_sales, psum, nsum] stats={rows=389 conf=estimated} act={rows=53827 time=169.8us peak=5.3MB}
+          64:PROJECT [v1.i_category AS i_category, v1.i_brand AS i_brand, v1.s_store_name AS s_store_name, v1.s_company_name AS s_company_name, v1.d_year AS d_year, v1.d_moy AS d_moy, v1.avg_monthly_sales AS avg_monthly_sales, v1.sum_sales AS sum_sales, v1_lag.sum_sales AS psum, v1_lead.sum_sales AS nsum] stats={rows=389 conf=estimated} act={rows=53827 time=333.4us peak=12.7MB}
+            63:HASH JOIN (BROADCAST, INNER, eq: [v1_lead.i_category = v1.i_category, v1_lead.i_brand = v1.i_brand, v1_lead.s_store_name = v1.s_store_name, v1_lead.s_company_name = v1.s_company_name, v1_lead.rn - 1 = v1.rn]) stats={rows=389 conf=estimated} act={rows=112700 time=37.6ms peak=25.5MB}
+              build runtime filters:
+              - filter_id = 8, build_expr = (v1.i_category)
+              - filter_id = 9, build_expr = (v1.i_brand)
+              - filter_id = 10, build_expr = (v1.s_store_name)
+              - filter_id = 11, build_expr = (v1.s_company_name)
+              - filter_id = 12, build_expr = (v1.rn)
+              23:FILTER stats={rows=24339 conf=estimated}
+                predicate: v1_lead.i_category IS NOT NULL AND v1_lead.i_brand IS NOT NULL AND v1_lead.s_store_name IS NOT NULL AND v1_lead.s_company_name IS NOT NULL
+                22:EXCHANGE stats={rows=28531 conf=estimated} act={rows=129456 time=530.4us peak=6.2MB}
+              62:GATHER stats={rows=242 conf=estimated} act={rows=58873 time=20.3us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 62
+    PARTITION: UNPARTITIONED
+61:HASH JOIN (BROADCAST, INNER, eq: [v1_lag.i_category = v1.i_category, v1_lag.i_brand = v1.i_brand, v1_lag.s_store_name = v1.s_store_name, v1_lag.s_company_name = v1.s_company_name, v1_lag.rn + 1 = v1.rn]) stats={rows=242 conf=estimated} act={rows=123031 time=42.2ms peak=38.5MB}
+  build runtime filters:
+  - filter_id = 3, build_expr = (v1.i_category)
+  - filter_id = 4, build_expr = (v1.i_brand)
+  - filter_id = 5, build_expr = (v1.s_store_name)
+  - filter_id = 6, build_expr = (v1.s_company_name)
+  - filter_id = 7, build_expr = (v1.rn)
+  25:FILTER stats={rows=24339 conf=estimated}
+    predicate: v1_lag.i_category IS NOT NULL AND v1_lag.i_brand IS NOT NULL AND v1_lag.s_store_name IS NOT NULL AND v1_lag.s_company_name IS NOT NULL
+    24:EXCHANGE stats={rows=28531 conf=estimated} act={rows=129456 time=569.2us peak=6.2MB}
+  60:GATHER stats={rows=151 conf=estimated} act={rows=64158 time=12.4us peak=0B}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 60
+    PARTITION: UNPARTITIONED
+59:FILTER stats={rows=151 conf=estimated}
+  predicate: v1.i_category IS NOT NULL AND v1.i_brand IS NOT NULL AND v1.s_store_name IS NOT NULL AND v1.s_company_name IS NOT NULL
+  58:FILTER stats={rows=177 conf=estimated}
+    predicate: v1.i_category IS NOT NULL AND v1.i_brand IS NOT NULL AND v1.s_store_name IS NOT NULL AND v1.s_company_name IS NOT NULL
+    57:FILTER stats={rows=207 conf=estimated}
+      predicate: v1.i_category IS NOT NULL AND v1.i_brand IS NOT NULL AND v1.s_store_name IS NOT NULL AND v1.s_company_name IS NOT NULL
+      56:FILTER stats={rows=243 conf=estimated}
+        predicate: v1.i_category IS NOT NULL AND v1.i_brand IS NOT NULL AND v1.s_store_name IS NOT NULL AND v1.s_company_name IS NOT NULL
+        55:FILTER stats={rows=284 conf=estimated}
+          predicate: v1.i_category IS NOT NULL AND v1.i_brand IS NOT NULL AND v1.s_store_name IS NOT NULL AND v1.s_company_name IS NOT NULL
+          54:FILTER stats={rows=333 conf=estimated}
+            predicate: v1.i_category IS NOT NULL AND v1.i_brand IS NOT NULL AND v1.s_store_name IS NOT NULL AND v1.s_company_name IS NOT NULL
+            53:FILTER stats={rows=391 conf=estimated}
+              predicate: v1.i_category IS NOT NULL AND v1.i_brand IS NOT NULL AND v1.s_store_name IS NOT NULL AND v1.s_company_name IS NOT NULL
+              52:FILTER stats={rows=458 conf=estimated}
+                predicate: v1.i_category IS NOT NULL AND v1.i_brand IS NOT NULL AND v1.s_store_name IS NOT NULL AND v1.s_company_name IS NOT NULL
+                51:FILTER stats={rows=537 conf=estimated}
+                  predicate: v1.i_category IS NOT NULL AND v1.i_brand IS NOT NULL AND v1.s_store_name IS NOT NULL AND v1.s_company_name IS NOT NULL
+                  50:FILTER stats={rows=629 conf=estimated}
+                    predicate: v1.i_category IS NOT NULL AND v1.i_brand IS NOT NULL AND v1.s_store_name IS NOT NULL AND v1.s_company_name IS NOT NULL
+                    49:FILTER stats={rows=738 conf=estimated}
+                      predicate: v1.i_category IS NOT NULL AND v1.i_brand IS NOT NULL AND v1.s_store_name IS NOT NULL AND v1.s_company_name IS NOT NULL
+                      48:FILTER stats={rows=865 conf=estimated}
+                        predicate: v1.i_category IS NOT NULL AND v1.i_brand IS NOT NULL AND v1.s_store_name IS NOT NULL AND v1.s_company_name IS NOT NULL
+                        47:FILTER stats={rows=1014 conf=estimated}
+                          predicate: v1.i_category IS NOT NULL AND v1.i_brand IS NOT NULL AND v1.s_store_name IS NOT NULL AND v1.s_company_name IS NOT NULL
+                          46:FILTER stats={rows=1188 conf=estimated}
+                            predicate: v1.i_category IS NOT NULL AND v1.i_brand IS NOT NULL AND v1.s_store_name IS NOT NULL AND v1.s_company_name IS NOT NULL
+                            45:FILTER stats={rows=1393 conf=estimated}
+                              predicate: v1.i_category IS NOT NULL AND v1.i_brand IS NOT NULL AND v1.s_store_name IS NOT NULL AND v1.s_company_name IS NOT NULL
+                              44:FILTER stats={rows=1633 conf=estimated}
+                                predicate: v1.i_category IS NOT NULL AND v1.i_brand IS NOT NULL AND v1.s_store_name IS NOT NULL AND v1.s_company_name IS NOT NULL
+                                43:FILTER stats={rows=1914 conf=estimated}
+                                  predicate: v1.i_category IS NOT NULL AND v1.i_brand IS NOT NULL AND v1.s_store_name IS NOT NULL AND v1.s_company_name IS NOT NULL
+                                  42:FILTER stats={rows=2244 conf=estimated}
+                                    predicate: v1.i_category IS NOT NULL AND v1.i_brand IS NOT NULL AND v1.s_store_name IS NOT NULL AND v1.s_company_name IS NOT NULL
+                                    41:FILTER stats={rows=2631 conf=estimated}
+                                      predicate: v1.i_category IS NOT NULL AND v1.i_brand IS NOT NULL AND v1.s_store_name IS NOT NULL AND v1.s_company_name IS NOT NULL
+                                      40:FILTER stats={rows=3084 conf=estimated}
+                                        predicate: v1.i_category IS NOT NULL AND v1.i_brand IS NOT NULL AND v1.s_store_name IS NOT NULL AND v1.s_company_name IS NOT NULL
+                                        39:FILTER stats={rows=3615 conf=estimated}
+                                          predicate: v1.i_category IS NOT NULL AND v1.i_brand IS NOT NULL AND v1.s_store_name IS NOT NULL AND v1.s_company_name IS NOT NULL
+                                          38:FILTER stats={rows=4238 conf=estimated}
+                                            predicate: v1.i_category IS NOT NULL AND v1.i_brand IS NOT NULL AND v1.s_store_name IS NOT NULL AND v1.s_company_name IS NOT NULL
+                                            37:FILTER stats={rows=4967 conf=estimated}
+                                              predicate: v1.i_category IS NOT NULL AND v1.i_brand IS NOT NULL AND v1.s_store_name IS NOT NULL AND v1.s_company_name IS NOT NULL
+                                              36:FILTER stats={rows=5823 conf=estimated}
+                                                predicate: v1.i_category IS NOT NULL AND v1.i_brand IS NOT NULL AND v1.s_store_name IS NOT NULL AND v1.s_company_name IS NOT NULL
+                                                35:FILTER stats={rows=6826 conf=estimated}
+                                                  predicate: v1.i_category IS NOT NULL AND v1.i_brand IS NOT NULL AND v1.s_store_name IS NOT NULL AND v1.s_company_name IS NOT NULL
+                                                  34:FILTER stats={rows=8002 conf=estimated}
+                                                    predicate: v1.i_category IS NOT NULL AND v1.i_brand IS NOT NULL AND v1.s_store_name IS NOT NULL AND v1.s_company_name IS NOT NULL
+                                                    33:FILTER stats={rows=9380 conf=estimated}
+                                                      predicate: v1.i_category IS NOT NULL AND v1.i_brand IS NOT NULL AND v1.s_store_name IS NOT NULL AND v1.s_company_name IS NOT NULL
+                                                      32:FILTER stats={rows=10996 conf=estimated}
+                                                        predicate: v1.i_category IS NOT NULL AND v1.i_brand IS NOT NULL AND v1.s_store_name IS NOT NULL AND v1.s_company_name IS NOT NULL
+                                                        31:FILTER stats={rows=12889 conf=estimated}
+                                                          predicate: v1.i_category IS NOT NULL AND v1.i_brand IS NOT NULL AND v1.s_store_name IS NOT NULL AND v1.s_company_name IS NOT NULL
+                                                          30:FILTER stats={rows=15109 conf=estimated}
+                                                            predicate: v1.i_category IS NOT NULL AND v1.i_brand IS NOT NULL AND v1.s_store_name IS NOT NULL AND v1.s_company_name IS NOT NULL
+                                                            29:FILTER stats={rows=17712 conf=estimated}
+                                                              predicate: v1.i_category IS NOT NULL AND v1.i_brand IS NOT NULL AND v1.s_store_name IS NOT NULL AND v1.s_company_name IS NOT NULL
+                                                              28:FILTER stats={rows=20763 conf=estimated}
+                                                                predicate: v1.i_category IS NOT NULL AND v1.i_brand IS NOT NULL AND v1.s_store_name IS NOT NULL AND v1.s_company_name IS NOT NULL
+                                                                27:FILTER stats={rows=24339 conf=estimated}
+                                                                  predicate: v1.i_category IS NOT NULL AND v1.i_brand IS NOT NULL AND v1.s_store_name IS NOT NULL AND v1.s_company_name IS NOT NULL
+                                                                  26:EXCHANGE stats={rows=28531 conf=estimated} act={rows=129456 time=16.5ms peak=18.3MB}
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 22
+    PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 24
+    PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 26
+    PARTITION: UNPARTITIONED
+21:PROJECT [i_category, i_brand, s_store_name, s_company_name, d_year, d_moy, sum(ss_sales_price) AS sum_sales, avg_monthly_sales, rn] stats={rows=28531 conf=estimated} act={rows=65298 time=3.1ms peak=30.8MB}
+  17:WINDOW [avg(sum(ss_sales_price)); rank()] stats={rows=28531 conf=estimated} act={rows=130596 time=8.6ms peak=6.8MB}
+    16:HASH EXCHANGE stats={rows=28531 conf=estimated} act={rows=65298 time=11.0us peak=0B}
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 16
+    PARTITION: HASH_PARTITIONED (i_category, i_brand, s_store_name, s_company_name)
+15:SORT BY [i_category ASC NULLS FIRST, i_brand ASC NULLS FIRST, s_store_name ASC NULLS FIRST, s_company_name ASC NULLS FIRST, d_year ASC NULLS FIRST] stats={rows=28531 conf=estimated} act={rows=130596 time=9.7ms peak=15.0MB}
+  14:HASH EXCHANGE stats={rows=28531 conf=estimated} act={rows=65298 time=37.2us peak=0B}
+PLAN FRAGMENT 6
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 14
+    PARTITION: HASH_PARTITIONED (i_category, i_brand, s_store_name, s_company_name, d_year)
+13:HASH AGGREGATE (GLOBAL, group by: [i_category, i_brand, s_store_name, s_company_name, d_year, d_moy]) stats={rows=28531 conf=estimated} act={rows=173059 time=3.4ms peak=23.2MB}
+  aggregations: sum(ss_sales_price)
+  12:HASH EXCHANGE stats={rows=28531 conf=estimated} act={rows=107761 time=9.6us peak=0B}
+PLAN FRAGMENT 7
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 12
+    PARTITION: HASH_PARTITIONED (i_category, i_brand, s_store_name, s_company_name, d_year, d_moy)
+11:HASH AGGREGATE (LOCAL, group by: [i_category, i_brand, s_store_name, s_company_name, d_year, d_moy]) stats={rows=28531 conf=estimated} act={rows=762051 time=233.4ms peak=52.8MB}
+  aggregations: sum(ss_sales_price)
+  10:HASH JOIN (BROADCAST, INNER, eq: [ss_store_sk = s_store_sk]) stats={rows=1076380 conf=estimated} act={rows=654326 time=98.9ms peak=10.6MB}
+    build runtime filters:
+    - filter_id = 2, build_expr = (s_store_sk)
+    7:HASH JOIN (BROADCAST, INNER, eq: [ss_sold_date_sk = d_date_sk]) stats={rows=1076380 conf=estimated} act={rows=655571 time=100.4ms peak=14.5MB}
+      build runtime filters:
+      - filter_id = 1, build_expr = (d_date_sk)
+      4:HASH JOIN (BROADCAST, INNER, eq: [ss_item_sk = i_item_sk]) stats={rows=2113351 conf=estimated} act={rows=2739687 time=367.8ms peak=49.6MB}
+        build runtime filters:
+        - filter_id = 0, build_expr = (i_item_sk)
+        1:SCAN tpcds.store_sales stats={rows=2363535 conf=estimated} act={rows=2685687 time=16.4ms peak=0B}
+             TABLE: tpcds.store_sales
+             columns: ss_sold_date_sk, ss_sold_time_sk, ss_item_sk, ss_customer_sk, ss_cdemo_sk, ss_hdemo_sk, ss_addr_sk, ss_store_sk, ss_promo_sk, ss_ticket_number, ss_quantity, ss_wholesale_cost, ss_list_price, ss_sales_price, ss_ext_discount_amt, ss_ext_sales_price, ss_ext_wholesale_cost, ss_ext_list_price, ss_ext_tax, ss_coupon_amt, ss_net_paid, ss_net_paid_inc_tax, ss_net_profit, _file, _pos
+             predicates: ss_item_sk IS NOT NULL AND ss_sold_date_sk IS NOT NULL AND ss_store_sk IS NOT NULL
+            probe runtime filters:
+            - filter_id = 0, probe_expr = (ss_item_sk)
+            - filter_id = 1, probe_expr = (ss_sold_date_sk)
+            - filter_id = 2, probe_expr = (ss_store_sk)
+        3:GATHER stats={rows=16200 conf=estimated} act={rows=54000 time=63.1us peak=0B}
+      6:GATHER stats={rows=928 conf=estimated} act={rows=1281 time=487.7us peak=0B}
+    9:GATHER stats={rows=11 conf=estimated} act={rows=36 time=66.9us peak=0B}
+PLAN FRAGMENT 8
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 9
+    PARTITION: UNPARTITIONED
+8:SCAN tpcds.store stats={rows=11 conf=estimated} act={rows=12 time=269.8us peak=36.1KB}
+     TABLE: tpcds.store
+     columns: s_store_sk, s_store_id, s_rec_start_date, s_rec_end_date, s_closed_date_sk, s_store_name, s_number_employees, s_floor_space, s_hours, s_manager, s_market_id, s_geography_class, s_market_desc, s_market_manager, s_division_id, s_division_name, s_company_id, s_company_name, s_street_number, s_street_name, s_street_type, s_suite_number, s_city, s_county, s_state, s_zip, s_country, s_gmt_offset, s_tax_precentage, _file, _pos
+     predicates: s_store_sk IS NOT NULL
+PLAN FRAGMENT 9
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 6
+    PARTITION: UNPARTITIONED
+5:SCAN tpcds.date_dim stats={rows=928 conf=estimated} act={rows=427 time=2.4ms peak=383.7KB}
+     TABLE: tpcds.date_dim
+     columns: d_date_sk, d_date_id, d_date, d_month_seq, d_week_seq, d_quarter_seq, d_year, d_dow, d_moy, d_dom, d_qoy, d_fy_year, d_fy_quarter_seq, d_fy_week_seq, d_day_name, d_quarter_name, d_holiday, d_weekend, d_following_holiday, d_first_dom, d_last_dom, d_same_day_ly, d_same_day_lq, d_current_day, d_current_week, d_current_month, d_current_quarter, d_current_year, _file, _pos
+     predicates: d_year = 1999 OR d_year = 1999 - 1 AND d_moy = 12 OR d_year = 1999 + 1 AND d_moy = 1 AND d_year = 1999 OR d_moy = 12 OR d_moy = 1 AND d_date_sk IS NOT NULL
+PLAN FRAGMENT 10
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: UNPARTITIONED
+2:SCAN tpcds.item stats={rows=16200 conf=estimated} act={rows=18000 time=5.0us peak=14.2MB}
+     TABLE: tpcds.item
+     columns: i_item_sk, i_item_id, i_rec_start_date, i_rec_end_date, i_item_desc, i_current_price, i_wholesale_cost, i_brand_id, i_brand, i_class_id, i_class, i_category_id, i_category, i_manufact_id, i_manufact, i_size, i_formulation, i_color, i_units, i_container, i_manager_id, i_product_name, _file, _pos
+     predicates: i_item_sk IS NOT NULL

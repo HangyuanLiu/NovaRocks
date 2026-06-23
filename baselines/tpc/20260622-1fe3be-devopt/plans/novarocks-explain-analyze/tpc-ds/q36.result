@@ -1,0 +1,86 @@
+Explain String
+Planning: 178.0ms / Execution: 3.52s / Rows: 100
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+23:PROJECT [__nr_sel_0 AS gross_margin, __nr_sel_1 AS i_category, __nr_sel_2 AS i_class, __nr_sel_3 AS lochierarchy, __nr_sel_4 AS rank_within_parent] stats={rows=100 conf=estimated} act={rows=100 time=36.9us peak=6.2KB}
+  22:TOP-N (limit=100) [__nr_sel_3 DESC NULLS LAST, Case { operand: None, when_then: [(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: BinaryOp { left: TypedExpr { kind: ColumnRef { column_id: c114, qualifier: None, column: "__grouping_fn_0" }, data_type: Int64, nullable: false }, op: Add, right: TypedExpr { kind: ColumnRef { column_id: c115, qualifier: None, column: "__grouping_fn_1" }, data_type: Int64, nullable: false } }, data_type: Int64, nullable: false }, op: Eq, right: TypedExpr { kind: Literal(Int(0)), data_type: Int64, nullable: false } }, data_type: Boolean, nullable: false }, TypedExpr { kind: ColumnRef { column_id: c68, qualifier: None, column: "i_category" }, data_type: Utf8, nullable: true })], else_expr: None } ASC NULLS FIRST, __nr_sel_4 ASC NULLS FIRST] stats={rows=100 conf=estimated} act={rows=100 time=205.5us peak=8.1KB}
+    21:PROJECT [sum(ss_net_profit) / sum(ss_ext_sales_price) AS __nr_sel_0, __repeat_group.i_category AS __nr_sel_1, __repeat_group.i_class AS __nr_sel_2, __cse_0 AS __nr_sel_3, rank_within_parent AS __nr_sel_4, CASE WHEN __cse_0 = 0 THEN i_category END AS Case { operand: None, when_then: [(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: BinaryOp { left: TypedExpr { kind: ColumnRef { column_id: c114, qualifier: None, column: "__grouping_fn_0" }, data_type: Int64, nullable: false }, op: Add, right: TypedExpr { kind: ColumnRef { column_id: c115, qualifier: None, column: "__grouping_fn_1" }, data_type: Int64, nullable: false } }, data_type: Int64, nullable: false }, op: Eq, right: TypedExpr { kind: Literal(Int(0)), data_type: Int64, nullable: false } }, data_type: Boolean, nullable: false }, TypedExpr { kind: ColumnRef { column_id: c68, qualifier: None, column: "i_category" }, data_type: Utf8, nullable: true })], else_expr: None }] stats={rows=955 conf=estimated} act={rows=133 time=63.4us peak=11.0KB}
+      20:PROJECT [sum(ss_net_profit), sum(ss_ext_sales_price), i_category, i_class, __grouping_fn_0, __grouping_fn_1, rank_within_parent, __grouping_fn_0 + __grouping_fn_1 AS __cse_0] stats={rows=955 conf=estimated} act={rows=133 time=94.3us peak=15.3KB}
+        19:WINDOW [rank()] stats={rows=955 conf=estimated}
+          18:SORT BY [__cse_0 ASC NULLS FIRST, __cse_2 ASC NULLS FIRST, sum(ss_net_profit) / sum(ss_ext_sales_price) ASC NULLS FIRST] stats={rows=955 conf=estimated} act={rows=266 time=198.5us peak=35.0KB}
+            17:PROJECT [i_category, i_class, __grouping_fn_0, __grouping_fn_1, __grouping_fn_2, __grouping_fn_3, __grouping_fn_4, sum(ss_net_profit), sum(ss_ext_sales_price), __grouping_fn_2 + __grouping_fn_3 AS __cse_0, __grouping_fn_4 = 0 AS __cse_1, CASE WHEN __grouping_fn_4 = 0 THEN i_category END AS __cse_2] stats={rows=955 conf=estimated} act={rows=133 time=1.2ms peak=8.2KB}
+              16:GATHER stats={rows=955 conf=estimated} act={rows=133 time=20.9us peak=0B}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 16
+    PARTITION: UNPARTITIONED
+15:HASH AGGREGATE (GLOBAL, group by: [i_category, i_class, __grouping_fn_0, __grouping_fn_1, __grouping_fn_2, __grouping_fn_3, __grouping_fn_4]) stats={rows=955 conf=estimated} act={rows=532 time=185.1us peak=2.2MB}
+  aggregations: sum(ss_net_profit), sum(ss_ext_sales_price)
+  14:HASH EXCHANGE stats={rows=955 conf=estimated} act={rows=399 time=33.9us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 14
+    PARTITION: HASH_PARTITIONED (i_category, i_class, __grouping_fn_0, __grouping_fn_1, __grouping_fn_2, __grouping_fn_3, __grouping_fn_4)
+13:HASH AGGREGATE (LOCAL, group by: [i_category, i_class, __grouping_fn_0, __grouping_fn_1, __grouping_fn_2, __grouping_fn_3, __grouping_fn_4]) stats={rows=955 conf=estimated} act={rows=1601031 time=36.1ms peak=3.6MB}
+  aggregations: sum(ss_net_profit), sum(ss_ext_sales_price)
+  12:REPEAT (3 grouping sets) stats={rows=1023786 conf=estimated} act={rows=1600632 time=4.4ms peak=295.9KB}
+    11:PROJECT [i_category, i_class, ss_net_profit, ss_ext_sales_price, i_category AS __repeat_group_key_0, i_class AS __repeat_group_key_1] stats={rows=341262 conf=estimated} act={rows=533544 time=11.3ms peak=3.6MB}
+      10:HASH JOIN (BROADCAST, INNER, eq: [ss_store_sk = s_store_sk]) stats={rows=341262 conf=estimated} act={rows=533580 time=9.9ms peak=2.8MB}
+        build runtime filters:
+        - filter_id = 2, build_expr = (s_store_sk)
+        7:HASH JOIN (BROADCAST, INNER, eq: [ss_item_sk = i_item_sk]) stats={rows=379180 conf=estimated} act={rows=587544 time=14.0ms peak=18.3MB}
+          build runtime filters:
+          - filter_id = 1, build_expr = (i_item_sk)
+          4:HASH JOIN (BROADCAST, INNER, eq: [ss_sold_date_sk = d1.d_date_sk]) stats={rows=424069 conf=estimated} act={rows=534639 time=17.6ms peak=7.0MB}
+            build runtime filters:
+            - filter_id = 0, build_expr = (d1.d_date_sk)
+            1:SCAN tpcds.store_sales stats={rows=2363535 conf=estimated} act={rows=2685687 time=13.2ms peak=0B}
+                 TABLE: tpcds.store_sales
+                 columns: ss_sold_date_sk, ss_item_sk, ss_store_sk, ss_ext_sales_price, ss_net_profit
+                 min-max stats
+                 predicates: ss_sold_date_sk IS NOT NULL AND ss_item_sk IS NOT NULL AND ss_store_sk IS NOT NULL
+                probe runtime filters:
+                - filter_id = 0, probe_expr = (ss_sold_date_sk)
+                - filter_id = 1, probe_expr = (ss_item_sk)
+                - filter_id = 2, probe_expr = (ss_store_sk)
+            3:GATHER stats={rows=327 conf=estimated} act={rows=1095 time=8.9us peak=0B}
+          6:GATHER stats={rows=16200 conf=estimated} act={rows=54000 time=17.4us peak=0B}
+        9:GATHER stats={rows=5 conf=estimated} act={rows=36 time=5.2us peak=0B}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 9
+    PARTITION: UNPARTITIONED
+8:SCAN tpcds.store stats={rows=5 conf=estimated} act={rows=12 time=27.0us peak=12.2KB}
+     TABLE: tpcds.store
+     columns: s_store_sk, s_state
+     min-max stats
+     predicates: s_state IN ('TN', 'TN', 'TN', 'TN', 'TN', 'TN', 'TN', 'TN') AND s_store_sk IS NOT NULL
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 6
+    PARTITION: UNPARTITIONED
+5:SCAN tpcds.item stats={rows=16200 conf=estimated} act={rows=18000 time=124.8us peak=8.3MB}
+     TABLE: tpcds.item
+     columns: i_item_sk, i_class, i_category
+     min-max stats
+     predicates: i_item_sk IS NOT NULL
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: UNPARTITIONED
+2:SCAN tpcds.date_dim (alias=d1) stats={rows=327 conf=estimated} act={rows=365 time=38.8us peak=221.5KB}
+     TABLE: tpcds.date_dim
+     columns: d_date_sk, d_year
+     min-max stats
+     predicates: d1.d_year = 2001 AND d1.d_date_sk IS NOT NULL

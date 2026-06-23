@@ -1,0 +1,424 @@
+Explain String
+Planning: 614.8ms / Execution: 6.27s / Rows: 7
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+174:MERGING-EXCHANGE stats={rows=56 conf=estimated} act={rows=21 time=474.6us peak=2.8KB}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 174
+    PARTITION: UNPARTITIONED
+173:LOCAL TOP-N (limit=100, offset=0) [channel ASC NULLS FIRST, id ASC NULLS FIRST] stats={rows=56 conf=estimated} act={rows=14 time=40.9us peak=74.4KB}
+  172:PROJECT [__repeat_group.channel AS channel, __repeat_group.id AS id, sum(sales) AS sales, sum(returns) AS returns, sum(profit) AS profit] stats={rows=56 conf=estimated} act={rows=7 time=89.3us peak=80.0KB}
+    171:HASH AGGREGATE (GLOBAL, group by: [channel, id, __grouping_fn_0]) stats={rows=56 conf=estimated} act={rows=28 time=135.8us peak=773.5KB}
+      aggregations: sum(sales), sum(returns), sum(profit)
+      170:HASH EXCHANGE stats={rows=56 conf=estimated} act={rows=21 time=91.2us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 170
+    PARTITION: HASH_PARTITIONED (channel, id, __grouping_fn_0)
+169:HASH AGGREGATE (LOCAL, group by: [channel, id, __grouping_fn_0]) stats={rows=56 conf=estimated} act={rows=2061 time=234.6us peak=1.7MB}
+  aggregations: sum(sales), sum(returns), sum(profit)
+  168:REPEAT (3 grouping sets) stats={rows=31702 conf=estimated} act={rows=2040 time=70.8us peak=13.1KB}
+    167:PROJECT [channel, id, sales, returns, profit, channel AS __repeat_group_key_0, id AS __repeat_group_key_1] stats={rows=10567 conf=estimated} act={rows=680 time=195.8us peak=13.1KB}
+      166:PROJECT [channel, id, sales, returns, profit] stats={rows=10567 conf=estimated} act={rows=680 time=155.4us peak=13.1KB}
+        165:UNION ALL stats={rows=10567 conf=estimated} act={rows=1360 time=157.8us peak=35.1KB}
+          107:UNION ALL stats={rows=10552 conf=estimated} act={rows=1330 time=120.8us peak=102.8KB}
+            53:PROJECT ['store channel' AS channel, CAST('store' AS Boolean) OR CAST(s_store_id AS Boolean) AS id, sales, returns, profit - profit_loss AS profit] stats={rows=6 conf=estimated} act={rows=6 time=80.7us peak=30.4KB}
+              52:PROJECT [s_store_id, sales, profit, returns, profit_loss] stats={rows=6 conf=estimated} act={rows=6 time=212.1us peak=30.4KB}
+                51:PROJECT [s_store_id, sum(sales_price) AS sales, sum(profit) AS profit, sum(return_amt) AS returns, sum(net_loss) AS profit_loss] stats={rows=6 conf=estimated} act={rows=6 time=247.7us peak=30.4KB}
+                  50:HASH AGGREGATE (GLOBAL, group by: [s_store_id]) stats={rows=6 conf=estimated} act={rows=24 time=90.8us peak=771.3KB}
+                    aggregations: sum(sales_price), sum(profit), sum(return_amt), sum(net_loss)
+                    49:HASH EXCHANGE stats={rows=6 conf=estimated} act={rows=18 time=9.4us peak=0B}
+            106:PROJECT ['catalog channel' AS channel, CAST('catalog_page' AS Boolean) OR CAST(cp_catalog_page_id AS Boolean) AS id, sales, returns, profit - profit_loss AS profit] stats={rows=10546 conf=estimated} act={rows=659 time=80.9us peak=101.3KB}
+              105:PROJECT [cp_catalog_page_id, sales, profit, returns, profit_loss] stats={rows=10546 conf=estimated} act={rows=659 time=72.4us peak=101.3KB}
+                104:PROJECT [cp_catalog_page_id, sum(sales_price) AS sales, sum(profit) AS profit, sum(return_amt) AS returns, sum(net_loss) AS profit_loss] stats={rows=10546 conf=estimated} act={rows=659 time=70.2us peak=101.3KB}
+                  103:HASH AGGREGATE (GLOBAL, group by: [cp_catalog_page_id]) stats={rows=10546 conf=estimated} act={rows=1705 time=88.8us peak=1.5MB}
+                    aggregations: sum(sales_price), sum(profit), sum(return_amt), sum(net_loss)
+                    102:HASH EXCHANGE stats={rows=10546 conf=estimated} act={rows=1046 time=18.0us peak=0B}
+          164:PROJECT ['web channel' AS channel, CAST('web_site' AS Boolean) OR CAST(web_site_id AS Boolean) AS id, sales, returns, profit - profit_loss AS profit] stats={rows=15 conf=estimated} act={rows=15 time=217.0us peak=51.0KB}
+            163:PROJECT [web_site_id, sales, profit, returns, profit_loss] stats={rows=15 conf=estimated} act={rows=15 time=89.8us peak=51.0KB}
+              162:PROJECT [web_site_id, sum(sales_price) AS sales, sum(profit) AS profit, sum(return_amt) AS returns, sum(net_loss) AS profit_loss] stats={rows=15 conf=estimated} act={rows=15 time=86.6us peak=51.0KB}
+                161:HASH AGGREGATE (GLOBAL, group by: [web_site_id]) stats={rows=15 conf=estimated} act={rows=60 time=384.7us peak=1.3MB}
+                  aggregations: sum(sales_price), sum(profit), sum(return_amt), sum(net_loss)
+                  160:HASH EXCHANGE stats={rows=15 conf=estimated} act={rows=45 time=36.2us peak=0B}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 160
+    PARTITION: HASH_PARTITIONED (web_site_id)
+159:HASH AGGREGATE (LOCAL, group by: [web_site_id]) stats={rows=15 conf=estimated} act={rows=8445 time=953.2us peak=6.3MB}
+  aggregations: sum(sales_price), sum(profit), sum(return_amt), sum(net_loss)
+  158:HASH JOIN (BROADCAST, INNER, eq: [wsr_web_site_sk = web_site_sk]) stats={rows=337697 conf=estimated} act={rows=8490 time=314.4us peak=1.4MB}
+    build runtime filters:
+    - filter_id = 7, build_expr = (web_site_sk)
+    155:HASH JOIN (BROADCAST, INNER, eq: [date_sk = d_date_sk]) stats={rows=750438 conf=estimated} act={rows=8445 time=11.2ms peak=881.2KB}
+      build runtime filters:
+      - filter_id = 6, build_expr = (d_date_sk)
+      152:PROJECT [wsr_web_site_sk, date_sk, sales_price, profit, return_amt, net_loss] stats={rows=750438 conf=estimated} act={rows=787735 time=23.9ms peak=864.8KB}
+        151:FILTER stats={rows=750438 conf=estimated}
+          predicate: wsr_web_site_sk IS NOT NULL
+          150:FILTER stats={rows=750632 conf=estimated}
+            predicate: wsr_web_site_sk IS NOT NULL
+            149:FILTER stats={rows=750826 conf=estimated}
+              predicate: wsr_web_site_sk IS NOT NULL
+              148:FILTER stats={rows=751020 conf=estimated}
+                predicate: wsr_web_site_sk IS NOT NULL
+                147:FILTER stats={rows=751215 conf=estimated}
+                  predicate: wsr_web_site_sk IS NOT NULL
+                  146:FILTER stats={rows=751409 conf=estimated}
+                    predicate: wsr_web_site_sk IS NOT NULL
+                    145:FILTER stats={rows=751603 conf=estimated}
+                      predicate: wsr_web_site_sk IS NOT NULL
+                      144:FILTER stats={rows=751798 conf=estimated}
+                        predicate: wsr_web_site_sk IS NOT NULL
+                        143:FILTER stats={rows=751992 conf=estimated}
+                          predicate: wsr_web_site_sk IS NOT NULL
+                          142:FILTER stats={rows=752187 conf=estimated}
+                            predicate: wsr_web_site_sk IS NOT NULL
+                            141:FILTER stats={rows=752381 conf=estimated}
+                              predicate: wsr_web_site_sk IS NOT NULL
+                              140:FILTER stats={rows=752576 conf=estimated}
+                                predicate: wsr_web_site_sk IS NOT NULL
+                                139:FILTER stats={rows=752770 conf=estimated}
+                                  predicate: wsr_web_site_sk IS NOT NULL
+                                  138:FILTER stats={rows=752965 conf=estimated}
+                                    predicate: wsr_web_site_sk IS NOT NULL
+                                    137:FILTER stats={rows=753160 conf=estimated}
+                                      predicate: wsr_web_site_sk IS NOT NULL
+                                      136:FILTER stats={rows=753355 conf=estimated}
+                                        predicate: wsr_web_site_sk IS NOT NULL
+                                        135:FILTER stats={rows=753549 conf=estimated}
+                                          predicate: wsr_web_site_sk IS NOT NULL
+                                          134:FILTER stats={rows=753744 conf=estimated}
+                                            predicate: wsr_web_site_sk IS NOT NULL
+                                            133:FILTER stats={rows=753939 conf=estimated}
+                                              predicate: wsr_web_site_sk IS NOT NULL
+                                              132:FILTER stats={rows=754134 conf=estimated}
+                                                predicate: wsr_web_site_sk IS NOT NULL
+                                                131:FILTER stats={rows=754329 conf=estimated}
+                                                  predicate: wsr_web_site_sk IS NOT NULL
+                                                  130:FILTER stats={rows=754524 conf=estimated}
+                                                    predicate: wsr_web_site_sk IS NOT NULL
+                                                    129:FILTER stats={rows=754719 conf=estimated}
+                                                      predicate: wsr_web_site_sk IS NOT NULL
+                                                      128:FILTER stats={rows=754915 conf=estimated}
+                                                        predicate: wsr_web_site_sk IS NOT NULL
+                                                        127:FILTER stats={rows=755110 conf=estimated}
+                                                          predicate: wsr_web_site_sk IS NOT NULL
+                                                          126:FILTER stats={rows=755305 conf=estimated}
+                                                            predicate: wsr_web_site_sk IS NOT NULL
+                                                            125:FILTER stats={rows=755500 conf=estimated}
+                                                              predicate: wsr_web_site_sk IS NOT NULL
+                                                              124:FILTER stats={rows=755696 conf=estimated}
+                                                                predicate: wsr_web_site_sk IS NOT NULL
+                                                                123:FILTER stats={rows=755891 conf=estimated}
+                                                                  predicate: wsr_web_site_sk IS NOT NULL
+                                                                  122:FILTER stats={rows=756087 conf=estimated}
+                                                                    predicate: wsr_web_site_sk IS NOT NULL
+                                                                    121:FILTER stats={rows=756282 conf=estimated}
+                                                                      predicate: wsr_web_site_sk IS NOT NULL
+                                                                      120:FILTER stats={rows=756478 conf=estimated}
+                                                                        predicate: wsr_web_site_sk IS NOT NULL
+                                                                        119:FILTER stats={rows=756674 conf=estimated}
+                                                                          predicate: date_sk IS NOT NULL
+                                                                          118:UNION ALL stats={rows=791147 conf=estimated} act={rows=2370029 time=52.4ms peak=3.9MB}
+                                                                            110:PROJECT [ws_web_site_sk AS wsr_web_site_sk, ws_sold_date_sk AS date_sk, ws_ext_sales_price AS sales_price, ws_net_profit AS profit, __cse_0 AS return_amt, __cse_0 AS net_loss] stats={rows=719384 conf=estimated} act={rows=719384 time=1.3ms peak=1.5MB}
+                                                                              109:PROJECT [wsr_web_site_sk AS ws_web_site_sk, date_sk AS ws_sold_date_sk, sales_price AS ws_ext_sales_price, profit AS ws_net_profit, CAST(0 AS Decimal128(7, 2)) AS __cse_0] stats={rows=719384} act={rows=719384 time=5.8ms peak=6.7MB}
+                                                                                108:SCAN tpcds.web_sales stats={rows=719384} act={rows=719384 time=10.3us peak=0B}
+                                                                                     TABLE: tpcds.web_sales
+                                                                                     columns: ws_sold_date_sk, ws_web_site_sk, ws_ext_sales_price, ws_net_profit
+                                                                                     min-max stats
+                                                                            117:PROJECT [ws_web_site_sk AS wsr_web_site_sk, wr_returned_date_sk AS date_sk, __cse_0 AS sales_price, __cse_0 AS profit, wr_return_amt AS return_amt, wr_net_loss AS net_loss] stats={rows=71763 conf=estimated} act={rows=71763 time=30.7ms peak=97.5KB}
+                                                                              116:PROJECT [wsr_web_site_sk AS ws_web_site_sk, date_sk AS wr_returned_date_sk, return_amt AS wr_return_amt, net_loss AS wr_net_loss, CAST(0 AS Decimal128(7, 2)) AS __cse_0] stats={rows=71763 conf=estimated} act={rows=71763 time=52.9ms peak=597.1KB}
+                                                                                115:HASH JOIN (PARTITIONED, RIGHT OUTER, eq: [ws_item_sk = wr_item_sk, ws_order_number = wr_order_number]) stats={rows=71763 conf=estimated} act={rows=862910 time=119.3ms peak=24.9MB}
+                                                                                  build runtime filters:
+                                                                                  - filter_id = 4, build_expr = (wr_item_sk)
+                                                                                  - filter_id = 5, build_expr = (wr_order_number)
+                                                                                  112:HASH EXCHANGE stats={rows=719384} act={rows=719384 time=656.4us peak=0B}
+                                                                                  114:HASH EXCHANGE stats={rows=71763} act={rows=71763 time=24.5us peak=0B}
+      154:GATHER stats={rows=16436 conf=estimated} act={rows=45 time=20.7ms peak=0B}
+    157:GATHER stats={rows=27 conf=estimated} act={rows=90 time=5.0ms peak=0B}
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 157
+    PARTITION: UNPARTITIONED
+156:SCAN tpcds.web_site stats={rows=27 conf=estimated} act={rows=30 time=77.6us peak=25.4KB}
+     TABLE: tpcds.web_site
+     columns: web_site_sk, web_site_id
+     min-max stats
+     predicates: web_site_sk IS NOT NULL
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 154
+    PARTITION: UNPARTITIONED
+153:SCAN tpcds.date_dim stats={rows=16436 conf=estimated} act={rows=15 time=2.5ms peak=12.3KB}
+     TABLE: tpcds.date_dim
+     columns: d_date_sk, d_date
+     min-max stats
+     predicates: d_date BETWEEN CAST('2000-08-23' AS Date32) AND date_add(CAST('2000-08-23' AS Date32), 14) AND d_date_sk IS NOT NULL
+PLAN FRAGMENT 6
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 114
+    PARTITION: HASH_PARTITIONED (wr_item_sk, wr_order_number)
+113:SCAN tpcds.web_returns stats={rows=71763} act={rows=71763 time=261.7us peak=9.7MB}
+     TABLE: tpcds.web_returns
+     columns: wr_returned_date_sk, wr_item_sk, wr_order_number, wr_return_amt, wr_net_loss
+     min-max stats
+PLAN FRAGMENT 7
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 112
+    PARTITION: HASH_PARTITIONED (ws_item_sk, ws_order_number)
+111:SCAN tpcds.web_sales stats={rows=719384} act={rows=719384 time=66.3ms peak=14.5MB}
+     TABLE: tpcds.web_sales
+     columns: ws_item_sk, ws_web_site_sk, ws_order_number
+     min-max stats
+PLAN FRAGMENT 8
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 102
+    PARTITION: HASH_PARTITIONED (cp_catalog_page_id)
+101:HASH AGGREGATE (LOCAL, group by: [cp_catalog_page_id]) stats={rows=10546 conf=estimated} act={rows=17049 time=587.2us peak=3.8MB}
+  aggregations: sum(sales_price), sum(profit), sum(return_amt), sum(net_loss)
+  100:HASH JOIN (BROADCAST, INNER, eq: [page_sk = cp_catalog_page_sk]) stats={rows=660871 conf=estimated} act={rows=51157 time=18.8ms peak=9.8MB}
+    build runtime filters:
+    - filter_id = 3, build_expr = (cp_catalog_page_sk)
+    97:HASH JOIN (BROADCAST, INNER, eq: [date_sk = d_date_sk]) stats={rows=827353 conf=estimated} act={rows=16048 time=2.0ms peak=881.3KB}
+      build runtime filters:
+      - filter_id = 2, build_expr = (d_date_sk)
+      94:PROJECT [page_sk, date_sk, sales_price, profit, return_amt, net_loss] stats={rows=827353 conf=estimated} act={rows=1571951 time=2.3ms peak=864.9KB}
+        93:FILTER stats={rows=827353 conf=estimated}
+          predicate: page_sk IS NOT NULL
+          92:FILTER stats={rows=844212 conf=estimated}
+            predicate: page_sk IS NOT NULL
+            91:FILTER stats={rows=861414 conf=estimated}
+              predicate: page_sk IS NOT NULL
+              90:FILTER stats={rows=878967 conf=estimated}
+                predicate: page_sk IS NOT NULL
+                89:FILTER stats={rows=896878 conf=estimated}
+                  predicate: page_sk IS NOT NULL
+                  88:FILTER stats={rows=915153 conf=estimated}
+                    predicate: page_sk IS NOT NULL
+                    87:FILTER stats={rows=933801 conf=estimated}
+                      predicate: page_sk IS NOT NULL
+                      86:FILTER stats={rows=952829 conf=estimated}
+                        predicate: page_sk IS NOT NULL
+                        85:FILTER stats={rows=972244 conf=estimated}
+                          predicate: page_sk IS NOT NULL
+                          84:FILTER stats={rows=992056 conf=estimated}
+                            predicate: page_sk IS NOT NULL
+                            83:FILTER stats={rows=1012271 conf=estimated}
+                              predicate: page_sk IS NOT NULL
+                              82:FILTER stats={rows=1032897 conf=estimated}
+                                predicate: page_sk IS NOT NULL
+                                81:FILTER stats={rows=1053944 conf=estimated}
+                                  predicate: page_sk IS NOT NULL
+                                  80:FILTER stats={rows=1075421 conf=estimated}
+                                    predicate: page_sk IS NOT NULL
+                                    79:FILTER stats={rows=1097334 conf=estimated}
+                                      predicate: page_sk IS NOT NULL
+                                      78:FILTER stats={rows=1119694 conf=estimated}
+                                        predicate: page_sk IS NOT NULL
+                                        77:FILTER stats={rows=1142510 conf=estimated}
+                                          predicate: page_sk IS NOT NULL
+                                          76:FILTER stats={rows=1165791 conf=estimated}
+                                            predicate: page_sk IS NOT NULL
+                                            75:FILTER stats={rows=1189546 conf=estimated}
+                                              predicate: page_sk IS NOT NULL
+                                              74:FILTER stats={rows=1213785 conf=estimated}
+                                                predicate: page_sk IS NOT NULL
+                                                73:FILTER stats={rows=1238518 conf=estimated}
+                                                  predicate: page_sk IS NOT NULL
+                                                  72:FILTER stats={rows=1263755 conf=estimated}
+                                                    predicate: page_sk IS NOT NULL
+                                                    71:FILTER stats={rows=1289506 conf=estimated}
+                                                      predicate: page_sk IS NOT NULL
+                                                      70:FILTER stats={rows=1315782 conf=estimated}
+                                                        predicate: page_sk IS NOT NULL
+                                                        69:FILTER stats={rows=1342594 conf=estimated}
+                                                          predicate: page_sk IS NOT NULL
+                                                          68:FILTER stats={rows=1369952 conf=estimated}
+                                                            predicate: page_sk IS NOT NULL
+                                                            67:FILTER stats={rows=1397867 conf=estimated}
+                                                              predicate: page_sk IS NOT NULL
+                                                              66:FILTER stats={rows=1426351 conf=estimated}
+                                                                predicate: page_sk IS NOT NULL
+                                                                65:FILTER stats={rows=1455415 conf=estimated}
+                                                                  predicate: page_sk IS NOT NULL
+                                                                  64:FILTER stats={rows=1485072 conf=estimated}
+                                                                    predicate: page_sk IS NOT NULL
+                                                                    63:FILTER stats={rows=1515333 conf=estimated}
+                                                                      predicate: page_sk IS NOT NULL
+                                                                      62:FILTER stats={rows=1546211 conf=estimated}
+                                                                        predicate: page_sk IS NOT NULL
+                                                                        61:FILTER stats={rows=1577717 conf=estimated}
+                                                                          predicate: date_sk IS NOT NULL
+                                                                          60:UNION ALL stats={rows=1585615 conf=estimated} act={rows=4743181 time=60.6ms peak=5.1MB}
+                                                                            56:PROJECT [cs_catalog_page_sk AS page_sk, cs_sold_date_sk AS date_sk, cs_ext_sales_price AS sales_price, cs_net_profit AS profit, __cse_0 AS return_amt, __cse_0 AS net_loss] stats={rows=1441548 conf=estimated} act={rows=1441548 time=4.8ms peak=1.5MB}
+                                                                              55:PROJECT [page_sk AS cs_catalog_page_sk, date_sk AS cs_sold_date_sk, sales_price AS cs_ext_sales_price, profit AS cs_net_profit, CAST(0 AS Decimal128(7, 2)) AS __cse_0] stats={rows=1441548} act={rows=1441548 time=30.3ms peak=6.7MB}
+                                                                                54:SCAN tpcds.catalog_sales stats={rows=1441548} act={rows=1441548 time=19.3us peak=0B}
+                                                                                     TABLE: tpcds.catalog_sales
+                                                                                     columns: cs_sold_date_sk, cs_catalog_page_sk, cs_ext_sales_price, cs_net_profit
+                                                                                     min-max stats
+                                                                            59:PROJECT [cr_catalog_page_sk AS page_sk, cr_returned_date_sk AS date_sk, __cse_0 AS sales_price, __cse_0 AS profit, cr_return_amount AS return_amt, cr_net_loss AS net_loss] stats={rows=144067 conf=estimated} act={rows=144067 time=483.0us peak=676.5KB}
+                                                                              58:PROJECT [page_sk AS cr_catalog_page_sk, date_sk AS cr_returned_date_sk, return_amt AS cr_return_amount, net_loss AS cr_net_loss, CAST(0 AS Decimal128(7, 2)) AS __cse_0] stats={rows=144067} act={rows=144067 time=1.3ms peak=2.9MB}
+                                                                                57:SCAN tpcds.catalog_returns stats={rows=144067} act={rows=144067 time=3.7us peak=0B}
+                                                                                     TABLE: tpcds.catalog_returns
+                                                                                     columns: cr_returned_date_sk, cr_catalog_page_sk, cr_return_amount, cr_net_loss
+                                                                                     min-max stats
+      96:GATHER stats={rows=16436 conf=estimated} act={rows=45 time=43.8us peak=0B}
+    99:GATHER stats={rows=10546 conf=estimated} act={rows=35154 time=6.1us peak=0B}
+PLAN FRAGMENT 9
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 99
+    PARTITION: UNPARTITIONED
+98:SCAN tpcds.catalog_page stats={rows=10546 conf=estimated} act={rows=11718 time=62.1us peak=5.3MB}
+     TABLE: tpcds.catalog_page
+     columns: cp_catalog_page_sk, cp_catalog_page_id
+     min-max stats
+     predicates: cp_catalog_page_sk IS NOT NULL
+PLAN FRAGMENT 10
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 96
+    PARTITION: UNPARTITIONED
+95:SCAN tpcds.date_dim stats={rows=16436 conf=estimated} act={rows=15 time=25.9us peak=12.3KB}
+     TABLE: tpcds.date_dim
+     columns: d_date_sk, d_date
+     min-max stats
+     predicates: d_date BETWEEN CAST('2000-08-23' AS Date32) AND date_add(CAST('2000-08-23' AS Date32), 14) AND d_date_sk IS NOT NULL
+PLAN FRAGMENT 11
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 49
+    PARTITION: HASH_PARTITIONED (s_store_id)
+48:HASH AGGREGATE (LOCAL, group by: [s_store_id]) stats={rows=6 conf=estimated} act={rows=30810 time=1.1ms peak=5.8MB}
+  aggregations: sum(sales_price), sum(profit), sum(return_amt), sum(net_loss)
+  47:HASH JOIN (BROADCAST, INNER, eq: [store_sk = s_store_sk]) stats={rows=620800 conf=estimated} act={rows=30828 time=2.3ms peak=1.2MB}
+    build runtime filters:
+    - filter_id = 1, build_expr = (s_store_sk)
+    44:HASH JOIN (BROADCAST, INNER, eq: [date_sk = d_date_sk]) stats={rows=689778 conf=estimated} act={rows=30837 time=3.5ms peak=869.6KB}
+      build runtime filters:
+      - filter_id = 0, build_expr = (d_date_sk)
+      41:PROJECT [store_sk, date_sk, sales_price, profit, return_amt, net_loss] stats={rows=689778 conf=estimated} act={rows=2958113 time=4.3ms peak=853.1KB}
+        40:FILTER stats={rows=689778 conf=estimated}
+          predicate: store_sk IS NOT NULL
+          39:FILTER stats={rows=722390 conf=estimated}
+            predicate: store_sk IS NOT NULL
+            38:FILTER stats={rows=756543 conf=estimated}
+              predicate: store_sk IS NOT NULL
+              37:FILTER stats={rows=792312 conf=estimated}
+                predicate: store_sk IS NOT NULL
+                36:FILTER stats={rows=829771 conf=estimated}
+                  predicate: store_sk IS NOT NULL
+                  35:FILTER stats={rows=869002 conf=estimated}
+                    predicate: store_sk IS NOT NULL
+                    34:FILTER stats={rows=910087 conf=estimated}
+                      predicate: store_sk IS NOT NULL
+                      33:FILTER stats={rows=953115 conf=estimated}
+                        predicate: store_sk IS NOT NULL
+                        32:FILTER stats={rows=998177 conf=estimated}
+                          predicate: store_sk IS NOT NULL
+                          31:FILTER stats={rows=1045369 conf=estimated}
+                            predicate: store_sk IS NOT NULL
+                            30:FILTER stats={rows=1094793 conf=estimated}
+                              predicate: store_sk IS NOT NULL
+                              29:FILTER stats={rows=1146554 conf=estimated}
+                                predicate: store_sk IS NOT NULL
+                                28:FILTER stats={rows=1200761 conf=estimated}
+                                  predicate: store_sk IS NOT NULL
+                                  27:FILTER stats={rows=1257532 conf=estimated}
+                                    predicate: store_sk IS NOT NULL
+                                    26:FILTER stats={rows=1316986 conf=estimated}
+                                      predicate: store_sk IS NOT NULL
+                                      25:FILTER stats={rows=1379252 conf=estimated}
+                                        predicate: store_sk IS NOT NULL
+                                        24:FILTER stats={rows=1444461 conf=estimated}
+                                          predicate: store_sk IS NOT NULL
+                                          23:FILTER stats={rows=1512753 conf=estimated}
+                                            predicate: store_sk IS NOT NULL
+                                            22:FILTER stats={rows=1584274 conf=estimated}
+                                              predicate: store_sk IS NOT NULL
+                                              21:FILTER stats={rows=1659177 conf=estimated}
+                                                predicate: store_sk IS NOT NULL
+                                                20:FILTER stats={rows=1737621 conf=estimated}
+                                                  predicate: store_sk IS NOT NULL
+                                                  19:FILTER stats={rows=1819773 conf=estimated}
+                                                    predicate: store_sk IS NOT NULL
+                                                    18:FILTER stats={rows=1905810 conf=estimated}
+                                                      predicate: store_sk IS NOT NULL
+                                                      17:FILTER stats={rows=1995914 conf=estimated}
+                                                        predicate: store_sk IS NOT NULL
+                                                        16:FILTER stats={rows=2090278 conf=estimated}
+                                                          predicate: store_sk IS NOT NULL
+                                                          15:FILTER stats={rows=2189104 conf=estimated}
+                                                            predicate: store_sk IS NOT NULL
+                                                            14:FILTER stats={rows=2292602 conf=estimated}
+                                                              predicate: store_sk IS NOT NULL
+                                                              13:FILTER stats={rows=2400993 conf=estimated}
+                                                                predicate: store_sk IS NOT NULL
+                                                                12:FILTER stats={rows=2514509 conf=estimated}
+                                                                  predicate: store_sk IS NOT NULL
+                                                                  11:FILTER stats={rows=2633392 conf=estimated}
+                                                                    predicate: store_sk IS NOT NULL
+                                                                    10:FILTER stats={rows=2757895 conf=estimated}
+                                                                      predicate: store_sk IS NOT NULL
+                                                                      9:FILTER stats={rows=2888285 conf=estimated}
+                                                                        predicate: store_sk IS NOT NULL
+                                                                        8:FILTER stats={rows=3024839 conf=estimated}
+                                                                          predicate: date_sk IS NOT NULL
+                                                                          7:UNION ALL stats={rows=3167918 conf=estimated} act={rows=9293949 time=121.6ms peak=6.4MB}
+                                                                            3:PROJECT [ss_store_sk AS store_sk, ss_sold_date_sk AS date_sk, ss_ext_sales_price AS sales_price, ss_net_profit AS profit, __cse_0 AS return_amt, __cse_0 AS net_loss] stats={rows=2880404 conf=estimated} act={rows=2880404 time=40.1ms peak=2.0MB}
+                                                                              2:PROJECT [store_sk AS ss_store_sk, date_sk AS ss_sold_date_sk, sales_price AS ss_ext_sales_price, profit AS ss_net_profit, CAST(0 AS Decimal128(7, 2)) AS __cse_0] stats={rows=2880404} act={rows=2880404 time=121.1ms peak=8.6MB}
+                                                                                1:SCAN tpcds.store_sales stats={rows=2880404} act={rows=2880404 time=1.0ms peak=0B}
+                                                                                     TABLE: tpcds.store_sales
+                                                                                     columns: ss_sold_date_sk, ss_store_sk, ss_ext_sales_price, ss_net_profit
+                                                                                     min-max stats
+                                                                            6:PROJECT [sr_store_sk AS store_sk, sr_returned_date_sk AS date_sk, __cse_0 AS sales_price, __cse_0 AS profit, sr_return_amt AS return_amt, sr_net_loss AS net_loss] stats={rows=287514 conf=estimated} act={rows=287514 time=1.2ms peak=904.0KB}
+                                                                              5:PROJECT [store_sk AS sr_store_sk, date_sk AS sr_returned_date_sk, return_amt AS sr_return_amt, net_loss AS sr_net_loss, CAST(0 AS Decimal128(7, 2)) AS __cse_0] stats={rows=287514} act={rows=287514 time=7.1ms peak=3.8MB}
+                                                                                4:SCAN tpcds.store_returns stats={rows=287514} act={rows=287514 time=7.7us peak=0B}
+                                                                                     TABLE: tpcds.store_returns
+                                                                                     columns: sr_returned_date_sk, sr_store_sk, sr_return_amt, sr_net_loss
+                                                                                     min-max stats
+      43:GATHER stats={rows=16436 conf=estimated} act={rows=45 time=14.6us peak=0B}
+    46:GATHER stats={rows=11 conf=estimated} act={rows=36 time=8.7us peak=0B}
+PLAN FRAGMENT 12
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 46
+    PARTITION: UNPARTITIONED
+45:SCAN tpcds.store stats={rows=11 conf=estimated} act={rows=12 time=15.2us peak=12.8KB}
+     TABLE: tpcds.store
+     columns: s_store_sk, s_store_id
+     min-max stats
+     predicates: s_store_sk IS NOT NULL
+PLAN FRAGMENT 13
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 43
+    PARTITION: UNPARTITIONED
+42:SCAN tpcds.date_dim stats={rows=16436 conf=estimated} act={rows=15 time=28.1us peak=12.3KB}
+     TABLE: tpcds.date_dim
+     columns: d_date_sk, d_date
+     min-max stats
+     predicates: d_date BETWEEN CAST('2000-08-23' AS Date32) AND date_add(CAST('2000-08-23' AS Date32), 14) AND d_date_sk IS NOT NULL

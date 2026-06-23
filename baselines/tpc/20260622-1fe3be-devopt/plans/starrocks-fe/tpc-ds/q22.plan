@@ -1,0 +1,170 @@
+-- engine=starrocks
+-- suite=tpc-ds
+-- case=q22
+-- file=/Users/harbor/project/NovaRocks/sql-tests/tpc-ds/sql/q22.sql
+-- elapsed_sec=0.053
+-- exit_code=0
+
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 6.017412336294729E9
+  Memory: 1.8209926931697288E9
+
+PLAN FRAGMENT 0(F06)
+  Fragment Cost: 32000.0
+  Output Exprs:62: i_product_name | 49: i_brand | 51: i_class | 53: i_category | 67: avg
+  Input Partition: UNPARTITIONED
+  RESULT SINK
+
+  16:MERGING-EXCHANGE
+     distribution type: GATHER
+     limit: 100
+     cardinality: 100
+
+PLAN FRAGMENT 1(F05)
+  Fragment Cost: 7.660329077147665E9
+
+  Input Partition: HASH_PARTITIONED: 62: i_product_name, 49: i_brand, 51: i_class, 53: i_category, 68: GROUPING_ID
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 16
+
+  15:TOP-N
+  |  order by: [67, DOUBLE, true] ASC, [62, VARCHAR(1073741824), true] ASC, [49, VARCHAR(1073741824), true] ASC, [51, VARCHAR(1073741824), true] ASC, [53, VARCHAR(1073741824), true] ASC
+  |  offset: 0
+  |  hasNullableGenerateChild: true
+  |  limit: 100
+  |  cardinality: 100
+  |
+  14:Project
+  |  output columns:
+  |  49 <-> [49: i_brand, VARCHAR(1073741824), true]
+  |  51 <-> [51: i_class, VARCHAR(1073741824), true]
+  |  53 <-> [53: i_category, VARCHAR(1073741824), true]
+  |  62 <-> [62: i_product_name, VARCHAR(1073741824), true]
+  |  67 <-> [67: avg, DOUBLE, true]
+  |  hasNullableGenerateChild: true
+  |  cardinality: 19521803
+  |
+  13:AGGREGATE (merge finalize)
+  |  aggregate: avg[([67: avg, VARBINARY, true]); args: INT; result: DOUBLE; args nullable: true; result nullable: true]
+  |  group by: [62: i_product_name, VARCHAR(1073741824), true], [49: i_brand, VARCHAR(1073741824), true], [51: i_class, VARCHAR(1073741824), true], [53: i_category, VARCHAR(1073741824), true], [68: GROUPING_ID, BIGINT, false]
+  |  hasNullableGenerateChild: true
+  |  cardinality: 19521803
+  |
+  12:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [62: i_product_name, VARCHAR(1073741824), true], [49: i_brand, VARCHAR(1073741824), true], [51: i_class, VARCHAR(1073741824), true], [53: i_category, VARCHAR(1073741824), true], [68: GROUPING_ID, BIGINT, false]
+     cardinality: 32121272
+
+PLAN FRAGMENT 2(F00)
+  Fragment Cost: 1.334655572625E9
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 62: i_product_name, 49: i_brand, 51: i_class, 53: i_category, 68: GROUPING_ID
+  OutPut Exchange Id: 12
+
+  11:AGGREGATE (update serialize)
+  |  STREAMING
+  |  aggregate: avg[([4: inv_quantity_on_hand, INT, true]); args: INT; result: VARBINARY; args nullable: true; result nullable: true]
+  |  group by: [62: i_product_name, VARCHAR(1073741824), true], [49: i_brand, VARCHAR(1073741824), true], [51: i_class, VARCHAR(1073741824), true], [53: i_category, VARCHAR(1073741824), true], [68: GROUPING_ID, BIGINT, false]
+  |  hasNullableGenerateChild: true
+  |  cardinality: 32121272
+  |
+  10:REPEAT_NODE
+  |  repeat: repeat 4 lines [[], [62], [49, 62], [49, 51, 62], [49, 51, 53, 62]]
+  |  cardinality: 52852500
+  |
+  9:Project
+  |  output columns:
+  |  4 <-> [4: inv_quantity_on_hand, INT, true]
+  |  49 <-> [49: i_brand, VARCHAR(1073741824), true]
+  |  51 <-> [51: i_class, VARCHAR(1073741824), true]
+  |  53 <-> [53: i_category, VARCHAR(1073741824), true]
+  |  62 <-> [62: i_product_name, VARCHAR(1073741824), true]
+  |  cardinality: 10570500
+  |
+  8:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [2: inv_item_sk, INT, true] = [41: i_item_sk, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 1, build_expr = (41: i_item_sk), remote = false
+  |  output columns: 4, 49, 51, 53, 62
+  |  can local shuffle: false
+  |  cardinality: 10570500
+  |
+  |----7:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 16200
+  |
+  5:Project
+  |  output columns:
+  |  2 <-> [2: inv_item_sk, INT, true]
+  |  4 <-> [4: inv_quantity_on_hand, INT, true]
+  |  cardinality: 10570500
+  |
+  4:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [1: inv_date_sk, INT, true] = [9: d_date_sk, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 0, build_expr = (9: d_date_sk), remote = false
+  |  output columns: 2, 4
+  |  can local shuffle: false
+  |  cardinality: 10570500
+  |
+  |----3:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 7380
+  |
+  0:IcebergScanNode
+     TABLE: tpcds.inventory
+     PREDICATES: 1: inv_date_sk IS NOT NULL
+     TABLE VERSION: Snapshot@(3057962822543572522)
+     cardinality=10570500
+     avgRowSize=3.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 10570500
+     probe runtime filters:
+     - filter_id = 0, probe_expr = (1: inv_date_sk)
+     - filter_id = 1, probe_expr = (2: inv_item_sk)
+
+PLAN FRAGMENT 3(F03)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 07
+
+  6:IcebergScanNode
+     TABLE: tpcds.item
+     PREDICATES: 41: i_item_sk IS NOT NULL
+     TABLE VERSION: Snapshot@(8681043255458311337)
+     cardinality=16200
+     avgRowSize=5.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 16200
+
+PLAN FRAGMENT 4(F01)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 03
+
+  2:Project
+  |  output columns:
+  |  9 <-> [9: d_date_sk, INT, true]
+  |  cardinality: 7380
+  |
+  1:IcebergScanNode
+     TABLE: tpcds.date_dim
+     PREDICATES: 12: d_month_seq >= 1200, 12: d_month_seq <= 1211
+     MIN/MAX PREDICATES: 12: d_month_seq >= 1200, 12: d_month_seq <= 1211
+     TABLE VERSION: Snapshot@(149066723028526449)
+     cardinality=7380
+     avgRowSize=2.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 7380

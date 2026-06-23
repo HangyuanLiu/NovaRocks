@@ -1,0 +1,101 @@
+Explain String
+Planning: 54.5ms / Execution: 1.55s / Rows: 193
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+26:SORT BY [s_name ASC NULLS FIRST] stats={rows=2025 conf=estimated} act={rows=386 time=125.9us peak=18.8KB}
+  25:GATHER stats={rows=2025 conf=estimated} act={rows=193 time=17.9us peak=0B}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 25
+    PARTITION: UNPARTITIONED
+24:PROJECT [s_name, s_address] stats={rows=2025 conf=estimated} act={rows=193 time=23.6us peak=52.5KB}
+  23:HASH JOIN (BROADCAST, LEFT SEMI, eq: [s_suppkey = ps_suppkey]) stats={rows=2025 conf=estimated} act={rows=17833 time=19.5ms peak=1.3MB}
+    build runtime filters:
+    - filter_id = 2, build_expr = (ps_suppkey)
+    4:HASH JOIN (BROADCAST, INNER, eq: [s_nationkey = n_nationkey]) stats={rows=2025 conf=estimated} act={rows=416 time=136.9us peak=1.1MB}
+      build runtime filters:
+      - filter_id = 0, build_expr = (n_nationkey)
+      1:SCAN tpch.supplier stats={rows=9000 conf=estimated} act={rows=10000 time=4.3us peak=0B}
+           TABLE: tpch.supplier
+           columns: s_suppkey, s_name, s_address, s_nationkey
+           min-max stats
+           predicates: s_nationkey IS NOT NULL
+          probe runtime filters:
+          - filter_id = 0, probe_expr = (s_nationkey)
+          - filter_id = 2, probe_expr = (s_suppkey)
+      3:GATHER stats={rows=6 conf=estimated} act={rows=3 time=4.2us peak=0B}
+    22:GATHER stats={rows=81390 conf=estimated} act={rows=17640 time=438.5us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 22
+    PARTITION: UNPARTITIONED
+21:PROJECT [ps_suppkey] stats={rows=81390 conf=estimated} act={rows=5880 time=10.0ms peak=768.8KB}
+  20:FILTER stats={rows=81390 conf=estimated}
+    predicate: ps_suppkey IS NOT NULL
+    19:FILTER stats={rows=90433 conf=estimated}
+      predicate: ps_availqty > __sq_2.0.5 * (sum(l_quantity))
+      18:HASH JOIN (PARTITIONED, LEFT OUTER, eq: [ps_partkey = l_partkey, ps_suppkey = l_suppkey]) stats={rows=180866 conf=estimated} act={rows=566229 time=17.3ms peak=40.3MB}
+        11:HASH EXCHANGE stats={rows=180866 conf=estimated} act={rows=8704 time=375.0us peak=0B}
+        17:PROJECT [0.5 * (sum(l_quantity)), l_partkey, l_suppkey] stats={rows=1484889 conf=estimated} act={rows=542941 time=27.1us peak=14.3MB}
+          16:PROJECT [0.5 * sum(l_quantity) AS 0.5 * (sum(l_quantity)), l_partkey, l_suppkey] stats={rows=1484889 conf=estimated} act={rows=542941 time=3.4ms peak=14.3MB}
+            15:HASH AGGREGATE (GLOBAL, group by: [l_partkey, l_suppkey]) stats={rows=1484889 conf=estimated} act={rows=1298761 time=33.6ms peak=34.2MB}
+              aggregations: sum(l_quantity)
+              14:HASH EXCHANGE stats={rows=1484889 conf=estimated} act={rows=755820 time=32.6us peak=0B}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 14
+    PARTITION: HASH_PARTITIONED (l_partkey, l_suppkey)
+13:HASH AGGREGATE (LOCAL, group by: [l_partkey, l_suppkey]) stats={rows=1484889 conf=estimated} act={rows=1664541 time=96.8ms peak=76.7MB}
+  aggregations: sum(l_quantity)
+  12:SCAN tpch.lineitem stats={rows=1484889 conf=estimated} act={rows=908721 time=806.9us peak=0B}
+       TABLE: tpch.lineitem
+       columns: l_partkey, l_suppkey, l_quantity, l_shipdate
+       min-max stats
+       predicates: l_shipdate >= 8401 AND l_shipdate < 8766
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 11
+    PARTITION: HASH_PARTITIONED (ps_partkey, ps_suppkey)
+10:HASH JOIN (BROADCAST, LEFT SEMI, eq: [ps_partkey = p_partkey]) stats={rows=180866 conf=estimated} act={rows=15232 time=26.8ms peak=2.3MB}
+  build runtime filters:
+  - filter_id = 1, build_expr = (p_partkey)
+  5:SCAN tpch.partsupp stats={rows=800000} act={rows=9960 time=78.6us peak=0B}
+       TABLE: tpch.partsupp
+       columns: ps_partkey, ps_suppkey, ps_availqty
+       min-max stats
+      probe runtime filters:
+      - filter_id = 1, probe_expr = (ps_partkey)
+  9:GATHER stats={rows=45000 conf=estimated} act={rows=6528 time=7.7us peak=0B}
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 9
+    PARTITION: UNPARTITIONED
+8:PROJECT [p_partkey] stats={rows=45000 conf=estimated} act={rows=2176 time=97.7us peak=79.5KB}
+  7:PROJECT [p_partkey] stats={rows=45000 conf=estimated} act={rows=2176 time=175.9us peak=31.3KB}
+    6:SCAN tpch.part stats={rows=45000 conf=estimated} act={rows=2176 time=5.1us peak=0B}
+         TABLE: tpch.part
+         columns: p_partkey, p_name
+         min-max stats
+         predicates: p_name LIKE 'sienna%' AND p_partkey IS NOT NULL
+PLAN FRAGMENT 6
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: UNPARTITIONED
+2:SCAN tpch.nation stats={rows=6 conf=estimated} act={rows=1 time=36.1us peak=4.8KB}
+     TABLE: tpch.nation
+     columns: n_nationkey, n_name
+     min-max stats
+     predicates: n_name = 'ARGENTINA' AND n_nationkey IS NOT NULL

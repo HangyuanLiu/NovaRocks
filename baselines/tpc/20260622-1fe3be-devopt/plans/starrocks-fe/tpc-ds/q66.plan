@@ -1,0 +1,725 @@
+-- engine=starrocks
+-- suite=tpc-ds
+-- case=q66
+-- file=/Users/harbor/project/NovaRocks/sql-tests/tpc-ds/sql/q66.sql
+-- elapsed_sec=0.205
+-- exit_code=0
+
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 2.164365762671775E9
+  Memory: 5.1649898520623124E8
+
+PLAN FRAGMENT 0(F24)
+  Fragment Cost: 187144.3562130928
+  Output Exprs:323: w_warehouse_name | 324: w_warehouse_sq_ft | 325: w_city | 326: w_county | 327: w_state | 328: w_country | 329: expr | 330: d_year | 367: sum | 368: sum | 369: sum | 370: sum | 371: sum | 372: sum | 373: sum | 374: sum | 375: sum | 376: sum | 377: sum | 378: sum | 379: sum | 380: sum | 381: sum | 382: sum | 383: sum | 384: sum | 385: sum | 386: sum | 387: sum | 388: sum | 389: sum | 390: sum | 391: sum | 392: sum | 393: sum | 394: sum | 395: sum | 396: sum | 397: sum | 398: sum | 399: sum | 400: sum | 401: sum | 402: sum
+  Input Partition: UNPARTITIONED
+  RESULT SINK
+
+  55:MERGING-EXCHANGE
+     distribution type: GATHER
+     limit: 100
+     cardinality: 70
+
+PLAN FRAGMENT 1(F23)
+  Fragment Cost: 347216.5343198776
+
+  Input Partition: HASH_PARTITIONED: 323: w_warehouse_name, 324: w_warehouse_sq_ft, 325: w_city, 326: w_county, 327: w_state, 328: w_country, 329: expr, 330: d_year
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 55
+
+  54:TOP-N
+  |  order by: [323, VARCHAR(1073741824), true] ASC
+  |  offset: 0
+  |  limit: 100
+  |  cardinality: 70
+  |
+  53:AGGREGATE (merge finalize)
+  |  aggregate: sum[([367: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([368: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([369: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([370: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([371: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([372: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([373: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([374: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([375: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([376: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([377: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([378: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([379: sum, DECIMAL128(38,8), true]); args: DECIMAL128; result: DECIMAL128(38,8); args nullable: true; result nullable: true], sum[([380: sum, DECIMAL128(38,8), true]); args: DECIMAL128; result: DECIMAL128(38,8); args nullable: true; result nullable: true], sum[([381: sum, DECIMAL128(38,8), true]); args: DECIMAL128; result: DECIMAL128(38,8); args nullable: true; result nullable: true], sum[([382: sum, DECIMAL128(38,8), true]); args: DECIMAL128; result: DECIMAL128(38,8); args nullable: true; result nullable: true], sum[([383: sum, DECIMAL128(38,8), true]); args: DECIMAL128; result: DECIMAL128(38,8); args nullable: true; result nullable: true], sum[([384: sum, DECIMAL128(38,8), true]); args: DECIMAL128; result: DECIMAL128(38,8); args nullable: true; result nullable: true], sum[([385: sum, DECIMAL128(38,8), true]); args: DECIMAL128; result: DECIMAL128(38,8); args nullable: true; result nullable: true], sum[([386: sum, DECIMAL128(38,8), true]); args: DECIMAL128; result: DECIMAL128(38,8); args nullable: true; result nullable: true], sum[([387: sum, DECIMAL128(38,8), true]); args: DECIMAL128; result: DECIMAL128(38,8); args nullable: true; result nullable: true], sum[([388: sum, DECIMAL128(38,8), true]); args: DECIMAL128; result: DECIMAL128(38,8); args nullable: true; result nullable: true], sum[([389: sum, DECIMAL128(38,8), true]); args: DECIMAL128; result: DECIMAL128(38,8); args nullable: true; result nullable: true], sum[([390: sum, DECIMAL128(38,8), true]); args: DECIMAL128; result: DECIMAL128(38,8); args nullable: true; result nullable: true], sum[([391: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([392: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([393: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([394: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([395: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([396: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([397: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([398: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([399: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([400: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([401: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([402: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |  group by: [323: w_warehouse_name, VARCHAR(1073741824), true], [324: w_warehouse_sq_ft, INT, true], [325: w_city, VARCHAR(1073741824), true], [326: w_county, VARCHAR(1073741824), true], [327: w_state, VARCHAR(1073741824), true], [328: w_country, VARCHAR(1073741824), true], [329: expr, BOOLEAN, true], [330: d_year, INT, true]
+  |  cardinality: 70
+  |
+  52:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [323: w_warehouse_name, VARCHAR(1073741824), true], [324: w_warehouse_sq_ft, INT, true], [325: w_city, VARCHAR(1073741824), true], [326: w_county, VARCHAR(1073741824), true], [327: w_state, VARCHAR(1073741824), true], [328: w_country, VARCHAR(1073741824), true], [329: expr, BOOLEAN, true], [330: d_year, INT, true]
+     cardinality: 100
+
+PLAN FRAGMENT 2(F22)
+  Fragment Cost: 9.367483799449847E8
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 323: w_warehouse_name, 324: w_warehouse_sq_ft, 325: w_city, 326: w_county, 327: w_state, 328: w_country, 329: expr, 330: d_year
+  OutPut Exchange Id: 52
+
+  51:TOP-N
+  |  order by: [323, VARCHAR(1073741824), true] ASC
+  |  offset: 0
+  |  limit: 100
+  |  cardinality: 100
+  |
+  50:AGGREGATE (update serialize)
+  |  STREAMING
+  |  aggregate: sum[([331: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([332: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([333: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([334: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([335: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([336: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([337: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([338: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([339: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([340: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([341: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([342: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([355: expr, DECIMAL128(38,8), true]); args: DECIMAL128; result: DECIMAL128(38,8); args nullable: true; result nullable: true], sum[([356: expr, DECIMAL128(38,8), true]); args: DECIMAL128; result: DECIMAL128(38,8); args nullable: true; result nullable: true], sum[([357: expr, DECIMAL128(38,8), true]); args: DECIMAL128; result: DECIMAL128(38,8); args nullable: true; result nullable: true], sum[([358: expr, DECIMAL128(38,8), true]); args: DECIMAL128; result: DECIMAL128(38,8); args nullable: true; result nullable: true], sum[([359: expr, DECIMAL128(38,8), true]); args: DECIMAL128; result: DECIMAL128(38,8); args nullable: true; result nullable: true], sum[([360: expr, DECIMAL128(38,8), true]); args: DECIMAL128; result: DECIMAL128(38,8); args nullable: true; result nullable: true], sum[([361: expr, DECIMAL128(38,8), true]); args: DECIMAL128; result: DECIMAL128(38,8); args nullable: true; result nullable: true], sum[([362: expr, DECIMAL128(38,8), true]); args: DECIMAL128; result: DECIMAL128(38,8); args nullable: true; result nullable: true], sum[([363: expr, DECIMAL128(38,8), true]); args: DECIMAL128; result: DECIMAL128(38,8); args nullable: true; result nullable: true], sum[([364: expr, DECIMAL128(38,8), true]); args: DECIMAL128; result: DECIMAL128(38,8); args nullable: true; result nullable: true], sum[([365: expr, DECIMAL128(38,8), true]); args: DECIMAL128; result: DECIMAL128(38,8); args nullable: true; result nullable: true], sum[([366: expr, DECIMAL128(38,8), true]); args: DECIMAL128; result: DECIMAL128(38,8); args nullable: true; result nullable: true], sum[([343: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([344: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([345: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([346: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([347: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([348: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([349: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([350: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([351: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([352: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([353: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([354: sum, DECIMAL128(38,2), true]); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |  group by: [323: w_warehouse_name, VARCHAR(1073741824), true], [324: w_warehouse_sq_ft, INT, true], [325: w_city, VARCHAR(1073741824), true], [326: w_county, VARCHAR(1073741824), true], [327: w_state, VARCHAR(1073741824), true], [328: w_country, VARCHAR(1073741824), true], [329: expr, BOOLEAN, true], [330: d_year, INT, true]
+  |  streaming preaggregation mode: force_preaggregation
+  |  cardinality: 614314
+  |
+  49:Project
+  |  output columns:
+  |  323 <-> [323: w_warehouse_name, VARCHAR(1073741824), true]
+  |  324 <-> [324: w_warehouse_sq_ft, INT, true]
+  |  325 <-> [325: w_city, VARCHAR(1073741824), true]
+  |  326 <-> [326: w_county, VARCHAR(1073741824), true]
+  |  327 <-> [327: w_state, VARCHAR(1073741824), true]
+  |  328 <-> [328: w_country, VARCHAR(1073741824), true]
+  |  329 <-> [329: expr, BOOLEAN, true]
+  |  330 <-> [330: d_year, INT, true]
+  |  331 <-> [331: sum, DECIMAL128(38,2), true]
+  |  332 <-> [332: sum, DECIMAL128(38,2), true]
+  |  333 <-> [333: sum, DECIMAL128(38,2), true]
+  |  334 <-> [334: sum, DECIMAL128(38,2), true]
+  |  335 <-> [335: sum, DECIMAL128(38,2), true]
+  |  336 <-> [336: sum, DECIMAL128(38,2), true]
+  |  337 <-> [337: sum, DECIMAL128(38,2), true]
+  |  338 <-> [338: sum, DECIMAL128(38,2), true]
+  |  339 <-> [339: sum, DECIMAL128(38,2), true]
+  |  340 <-> [340: sum, DECIMAL128(38,2), true]
+  |  341 <-> [341: sum, DECIMAL128(38,2), true]
+  |  342 <-> [342: sum, DECIMAL128(38,2), true]
+  |  343 <-> [343: sum, DECIMAL128(38,2), true]
+  |  344 <-> [344: sum, DECIMAL128(38,2), true]
+  |  345 <-> [345: sum, DECIMAL128(38,2), true]
+  |  346 <-> [346: sum, DECIMAL128(38,2), true]
+  |  347 <-> [347: sum, DECIMAL128(38,2), true]
+  |  348 <-> [348: sum, DECIMAL128(38,2), true]
+  |  349 <-> [349: sum, DECIMAL128(38,2), true]
+  |  350 <-> [350: sum, DECIMAL128(38,2), true]
+  |  351 <-> [351: sum, DECIMAL128(38,2), true]
+  |  352 <-> [352: sum, DECIMAL128(38,2), true]
+  |  353 <-> [353: sum, DECIMAL128(38,2), true]
+  |  354 <-> [354: sum, DECIMAL128(38,2), true]
+  |  355 <-> [331: sum, DECIMAL128(38,2), true] / [403: cast, DECIMAL128(38,0), true]
+  |  356 <-> [332: sum, DECIMAL128(38,2), true] / [403: cast, DECIMAL128(38,0), true]
+  |  357 <-> [333: sum, DECIMAL128(38,2), true] / [403: cast, DECIMAL128(38,0), true]
+  |  358 <-> [334: sum, DECIMAL128(38,2), true] / [403: cast, DECIMAL128(38,0), true]
+  |  359 <-> [335: sum, DECIMAL128(38,2), true] / [403: cast, DECIMAL128(38,0), true]
+  |  360 <-> [336: sum, DECIMAL128(38,2), true] / [403: cast, DECIMAL128(38,0), true]
+  |  361 <-> [337: sum, DECIMAL128(38,2), true] / [403: cast, DECIMAL128(38,0), true]
+  |  362 <-> [338: sum, DECIMAL128(38,2), true] / [403: cast, DECIMAL128(38,0), true]
+  |  363 <-> [339: sum, DECIMAL128(38,2), true] / [403: cast, DECIMAL128(38,0), true]
+  |  364 <-> [340: sum, DECIMAL128(38,2), true] / [403: cast, DECIMAL128(38,0), true]
+  |  365 <-> [341: sum, DECIMAL128(38,2), true] / [403: cast, DECIMAL128(38,0), true]
+  |  366 <-> [342: sum, DECIMAL128(38,2), true] / [403: cast, DECIMAL128(38,0), true]
+  |  common expressions:
+  |  403 <-> cast([324: w_warehouse_sq_ft, INT, true] as DECIMAL128(38,0))
+  |  cardinality: 873163
+  |
+  0:UNION
+  |  output exprs:
+  |      [323, VARCHAR(1073741824), true] | [324, INT, true] | [325, VARCHAR(1073741824), true] | [326, VARCHAR(1073741824), true] | [327, VARCHAR(1073741824), true] | [328, VARCHAR(1073741824), true] | [329, BOOLEAN, true] | [330, INT, true] | [331, DECIMAL128(38,2), true] | [332, DECIMAL128(38,2), true] | [333, DECIMAL128(38,2), true] | [334, DECIMAL128(38,2), true] | [335, DECIMAL128(38,2), true] | [336, DECIMAL128(38,2), true] | [337, DECIMAL128(38,2), true] | [338, DECIMAL128(38,2), true] | [339, DECIMAL128(38,2), true] | [340, DECIMAL128(38,2), true] | [341, DECIMAL128(38,2), true] | [342, DECIMAL128(38,2), true] | [343, DECIMAL128(38,2), true] | [344, DECIMAL128(38,2), true] | [345, DECIMAL128(38,2), true] | [346, DECIMAL128(38,2), true] | [347, DECIMAL128(38,2), true] | [348, DECIMAL128(38,2), true] | [349, DECIMAL128(38,2), true] | [350, DECIMAL128(38,2), true] | [351, DECIMAL128(38,2), true] | [352, DECIMAL128(38,2), true] | [353, DECIMAL128(38,2), true] | [354, DECIMAL128(38,2), true]
+  |  child exprs:
+  |      [41: w_warehouse_name, VARCHAR(1073741824), true] | [42: w_warehouse_sq_ft, INT, true] | [47: w_city, VARCHAR(1073741824), true] | [48: w_county, VARCHAR(1073741824), true] | [49: w_state, VARCHAR(1073741824), true] | [51: w_country, VARCHAR(1073741824), true] | [161: expr, BOOLEAN, true] | [63: d_year, INT, true] | [137: sum, DECIMAL128(38,2), true] | [138: sum, DECIMAL128(38,2), true] | [139: sum, DECIMAL128(38,2), true] | [140: sum, DECIMAL128(38,2), true] | [141: sum, DECIMAL128(38,2), true] | [142: sum, DECIMAL128(38,2), true] | [143: sum, DECIMAL128(38,2), true] | [144: sum, DECIMAL128(38,2), true] | [145: sum, DECIMAL128(38,2), true] | [146: sum, DECIMAL128(38,2), true] | [147: sum, DECIMAL128(38,2), true] | [148: sum, DECIMAL128(38,2), true] | [149: sum, DECIMAL128(38,2), true] | [150: sum, DECIMAL128(38,2), true] | [151: sum, DECIMAL128(38,2), true] | [152: sum, DECIMAL128(38,2), true] | [153: sum, DECIMAL128(38,2), true] | [154: sum, DECIMAL128(38,2), true] | [155: sum, DECIMAL128(38,2), true] | [156: sum, DECIMAL128(38,2), true] | [157: sum, DECIMAL128(38,2), true] | [158: sum, DECIMAL128(38,2), true] | [159: sum, DECIMAL128(38,2), true] | [160: sum, DECIMAL128(38,2), true]
+  |      [202: w_warehouse_name, VARCHAR(1073741824), true] | [203: w_warehouse_sq_ft, INT, true] | [208: w_city, VARCHAR(1073741824), true] | [209: w_county, VARCHAR(1073741824), true] | [210: w_state, VARCHAR(1073741824), true] | [212: w_country, VARCHAR(1073741824), true] | [322: expr, BOOLEAN, true] | [224: d_year, INT, true] | [298: sum, DECIMAL128(38,2), true] | [299: sum, DECIMAL128(38,2), true] | [300: sum, DECIMAL128(38,2), true] | [301: sum, DECIMAL128(38,2), true] | [302: sum, DECIMAL128(38,2), true] | [303: sum, DECIMAL128(38,2), true] | [304: sum, DECIMAL128(38,2), true] | [305: sum, DECIMAL128(38,2), true] | [306: sum, DECIMAL128(38,2), true] | [307: sum, DECIMAL128(38,2), true] | [308: sum, DECIMAL128(38,2), true] | [309: sum, DECIMAL128(38,2), true] | [310: sum, DECIMAL128(38,2), true] | [311: sum, DECIMAL128(38,2), true] | [312: sum, DECIMAL128(38,2), true] | [313: sum, DECIMAL128(38,2), true] | [314: sum, DECIMAL128(38,2), true] | [315: sum, DECIMAL128(38,2), true] | [316: sum, DECIMAL128(38,2), true] | [317: sum, DECIMAL128(38,2), true] | [318: sum, DECIMAL128(38,2), true] | [319: sum, DECIMAL128(38,2), true] | [320: sum, DECIMAL128(38,2), true] | [321: sum, DECIMAL128(38,2), true]
+  |  pass-through-operands: all
+  |  cardinality: 873163
+  |
+  |----48:EXCHANGE
+  |       distribution type: ROUND_ROBIN
+  |       cardinality: 582483
+  |
+  24:EXCHANGE
+     distribution type: ROUND_ROBIN
+     cardinality: 290680
+
+PLAN FRAGMENT 3(F20)
+  Fragment Cost: 7.767031673847376E8
+
+  Input Partition: HASH_PARTITIONED: 202: w_warehouse_name, 203: w_warehouse_sq_ft, 208: w_city, 209: w_county, 210: w_state, 212: w_country, 224: d_year
+  OutPut Partition: RANDOM
+  OutPut Exchange Id: 48
+
+  47:Project
+  |  output columns:
+  |  202 <-> [202: w_warehouse_name, VARCHAR(1073741824), true]
+  |  203 <-> [203: w_warehouse_sq_ft, INT, true]
+  |  208 <-> [208: w_city, VARCHAR(1073741824), true]
+  |  209 <-> [209: w_county, VARCHAR(1073741824), true]
+  |  210 <-> [210: w_state, VARCHAR(1073741824), true]
+  |  212 <-> [212: w_country, VARCHAR(1073741824), true]
+  |  224 <-> [224: d_year, INT, true]
+  |  298 <-> [298: sum, DECIMAL128(38,2), true]
+  |  299 <-> [299: sum, DECIMAL128(38,2), true]
+  |  300 <-> [300: sum, DECIMAL128(38,2), true]
+  |  301 <-> [301: sum, DECIMAL128(38,2), true]
+  |  302 <-> [302: sum, DECIMAL128(38,2), true]
+  |  303 <-> [303: sum, DECIMAL128(38,2), true]
+  |  304 <-> [304: sum, DECIMAL128(38,2), true]
+  |  305 <-> [305: sum, DECIMAL128(38,2), true]
+  |  306 <-> [306: sum, DECIMAL128(38,2), true]
+  |  307 <-> [307: sum, DECIMAL128(38,2), true]
+  |  308 <-> [308: sum, DECIMAL128(38,2), true]
+  |  309 <-> [309: sum, DECIMAL128(38,2), true]
+  |  310 <-> [310: sum, DECIMAL128(38,2), true]
+  |  311 <-> [311: sum, DECIMAL128(38,2), true]
+  |  312 <-> [312: sum, DECIMAL128(38,2), true]
+  |  313 <-> [313: sum, DECIMAL128(38,2), true]
+  |  314 <-> [314: sum, DECIMAL128(38,2), true]
+  |  315 <-> [315: sum, DECIMAL128(38,2), true]
+  |  316 <-> [316: sum, DECIMAL128(38,2), true]
+  |  317 <-> [317: sum, DECIMAL128(38,2), true]
+  |  318 <-> [318: sum, DECIMAL128(38,2), true]
+  |  319 <-> [319: sum, DECIMAL128(38,2), true]
+  |  320 <-> [320: sum, DECIMAL128(38,2), true]
+  |  321 <-> [321: sum, DECIMAL128(38,2), true]
+  |  322 <-> ((cast('DHL' as BOOLEAN)) OR (cast(',' as BOOLEAN))) OR (cast('BARIAN' as BOOLEAN))
+  |  cardinality: 582483
+  |
+  46:AGGREGATE (merge finalize)
+  |  aggregate: sum[([321: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([298: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([299: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([300: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([301: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([302: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([303: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([304: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([305: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([306: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([307: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([308: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([309: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([310: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([311: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([312: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([313: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([314: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([315: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([316: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([317: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([318: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([319: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([320: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |  group by: [202: w_warehouse_name, VARCHAR(1073741824), true], [203: w_warehouse_sq_ft, INT, true], [208: w_city, VARCHAR(1073741824), true], [209: w_county, VARCHAR(1073741824), true], [210: w_state, VARCHAR(1073741824), true], [212: w_country, VARCHAR(1073741824), true], [224: d_year, INT, true]
+  |  cardinality: 582483
+  |
+  45:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [202: w_warehouse_name, VARCHAR(1073741824), true], [203: w_warehouse_sq_ft, INT, true], [208: w_city, VARCHAR(1073741824), true], [209: w_county, VARCHAR(1073741824), true], [210: w_state, VARCHAR(1073741824), true], [212: w_country, VARCHAR(1073741824), true], [224: d_year, INT, true]
+     cardinality: 869315
+
+PLAN FRAGMENT 4(F11)
+  Fragment Cost: 4.2243167969463575E8
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 202: w_warehouse_name, 203: w_warehouse_sq_ft, 208: w_city, 209: w_county, 210: w_state, 212: w_country, 224: d_year
+  OutPut Exchange Id: 45
+
+  44:AGGREGATE (update serialize)
+  |  STREAMING
+  |  aggregate: sum[([297: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([274: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([275: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([276: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([277: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([278: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([279: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([280: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([281: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([282: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([283: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([284: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([285: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([286: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([287: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([288: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([289: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([290: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([291: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([292: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([293: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([294: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([295: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([296: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |  group by: [202: w_warehouse_name, VARCHAR(1073741824), true], [203: w_warehouse_sq_ft, INT, true], [208: w_city, VARCHAR(1073741824), true], [209: w_county, VARCHAR(1073741824), true], [210: w_state, VARCHAR(1073741824), true], [212: w_country, VARCHAR(1073741824), true], [224: d_year, INT, true]
+  |  cardinality: 869315
+  |
+  43:Project
+  |  output columns:
+  |  202 <-> [202: w_warehouse_name, VARCHAR(1073741824), true]
+  |  203 <-> [203: w_warehouse_sq_ft, INT, true]
+  |  208 <-> [208: w_city, VARCHAR(1073741824), true]
+  |  209 <-> [209: w_county, VARCHAR(1073741824), true]
+  |  210 <-> [210: w_state, VARCHAR(1073741824), true]
+  |  212 <-> [212: w_country, VARCHAR(1073741824), true]
+  |  224 <-> [224: d_year, INT, true]
+  |  274 <-> if[([433: expr, BOOLEAN, true], [437: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  275 <-> if[([434: expr, BOOLEAN, true], [437: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  276 <-> if[([435: expr, BOOLEAN, true], [437: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  277 <-> if[([424: expr, BOOLEAN, true], [437: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  278 <-> if[([425: expr, BOOLEAN, true], [437: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  279 <-> if[([426: expr, BOOLEAN, true], [437: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  280 <-> if[([427: expr, BOOLEAN, true], [437: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  281 <-> if[([428: expr, BOOLEAN, true], [437: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  282 <-> if[([429: expr, BOOLEAN, true], [437: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  283 <-> if[([430: expr, BOOLEAN, true], [437: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  284 <-> if[([431: expr, BOOLEAN, true], [437: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  285 <-> if[([432: expr, BOOLEAN, true], [437: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  286 <-> if[([433: expr, BOOLEAN, true], [436: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  287 <-> if[([434: expr, BOOLEAN, true], [436: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  288 <-> if[([435: expr, BOOLEAN, true], [436: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  289 <-> if[([424: expr, BOOLEAN, true], [436: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  290 <-> if[([425: expr, BOOLEAN, true], [436: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  291 <-> if[([426: expr, BOOLEAN, true], [436: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  292 <-> if[([427: expr, BOOLEAN, true], [436: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  293 <-> if[([428: expr, BOOLEAN, true], [436: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  294 <-> if[([429: expr, BOOLEAN, true], [436: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  295 <-> if[([430: expr, BOOLEAN, true], [436: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  296 <-> if[([431: expr, BOOLEAN, true], [436: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  297 <-> if[([432: expr, BOOLEAN, true], [436: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  common expressions:
+  |  421 <-> cast([192: cs_net_paid_inc_tax, DECIMAL32(7,2), true] as DECIMAL64(7,2))
+  |  422 <-> cast([180: cs_quantity, INT, true] as DECIMAL64(9,0))
+  |  423 <-> cast([183: cs_sales_price, DECIMAL32(7,2), true] as DECIMAL64(7,2))
+  |  424 <-> [226: d_moy, INT, true] = 4
+  |  425 <-> [226: d_moy, INT, true] = 5
+  |  426 <-> [226: d_moy, INT, true] = 6
+  |  427 <-> [226: d_moy, INT, true] = 7
+  |  428 <-> [226: d_moy, INT, true] = 8
+  |  429 <-> [226: d_moy, INT, true] = 9
+  |  430 <-> [226: d_moy, INT, true] = 10
+  |  431 <-> [226: d_moy, INT, true] = 11
+  |  432 <-> [226: d_moy, INT, true] = 12
+  |  433 <-> [226: d_moy, INT, true] = 1
+  |  434 <-> [226: d_moy, INT, true] = 2
+  |  435 <-> [226: d_moy, INT, true] = 3
+  |  436 <-> [421: cast, DECIMAL64(7,2), true] * [422: cast, DECIMAL64(9,0), true]
+  |  437 <-> [423: cast, DECIMAL64(7,2), true] * [422: cast, DECIMAL64(9,0), true]
+  |  cardinality: 1297393
+  |
+  42:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [176: cs_warehouse_sk, INT, true] = [200: w_warehouse_sk, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 7, build_expr = (200: w_warehouse_sk), remote = false
+  |  output columns: 180, 183, 192, 202, 203, 208, 209, 210, 212, 224, 226
+  |  can local shuffle: true
+  |  cardinality: 1297393
+  |
+  |----41:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 5
+  |
+  39:Project
+  |  output columns:
+  |  176 <-> [176: cs_warehouse_sk, INT, true]
+  |  180 <-> [180: cs_quantity, INT, true]
+  |  183 <-> [183: cs_sales_price, DECIMAL32(7,2), true]
+  |  192 <-> [192: cs_net_paid_inc_tax, DECIMAL32(7,2), true]
+  |  224 <-> [224: d_year, INT, true]
+  |  226 <-> [226: d_moy, INT, true]
+  |  cardinality: 1297393
+  |
+  38:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [162: cs_sold_date_sk, INT, true] = [218: d_date_sk, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 6, build_expr = (218: d_date_sk), remote = false
+  |  output columns: 176, 180, 183, 192, 224, 226
+  |  can local shuffle: false
+  |  cardinality: 1297393
+  |
+  |----37:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 14760
+  |
+  35:Project
+  |  output columns:
+  |  162 <-> [162: cs_sold_date_sk, INT, true]
+  |  176 <-> [176: cs_warehouse_sk, INT, true]
+  |  180 <-> [180: cs_quantity, INT, true]
+  |  183 <-> [183: cs_sales_price, DECIMAL32(7,2), true]
+  |  192 <-> [192: cs_net_paid_inc_tax, DECIMAL32(7,2), true]
+  |  cardinality: 1297393
+  |
+  34:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [175: cs_ship_mode_sk, INT, true] = [264: sm_ship_mode_sk, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 5, build_expr = (264: sm_ship_mode_sk), remote = false
+  |  output columns: 162, 176, 180, 183, 192
+  |  can local shuffle: false
+  |  cardinality: 1297393
+  |
+  |----33:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 10
+  |
+  30:Project
+  |  output columns:
+  |  162 <-> [162: cs_sold_date_sk, INT, true]
+  |  175 <-> [175: cs_ship_mode_sk, INT, true]
+  |  176 <-> [176: cs_warehouse_sk, INT, true]
+  |  180 <-> [180: cs_quantity, INT, true]
+  |  183 <-> [183: cs_sales_price, DECIMAL32(7,2), true]
+  |  192 <-> [192: cs_net_paid_inc_tax, DECIMAL32(7,2), true]
+  |  cardinality: 1297393
+  |
+  29:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [163: cs_sold_time_sk, INT, true] = [250: t_time_sk, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 4, build_expr = (250: t_time_sk), remote = false
+  |  output columns: 162, 175, 176, 180, 183, 192
+  |  can local shuffle: false
+  |  cardinality: 1297393
+  |
+  |----28:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 17661
+  |
+  25:IcebergScanNode
+     TABLE: tpcds.catalog_sales
+     PREDICATES: 176: cs_warehouse_sk IS NOT NULL
+     TABLE VERSION: Snapshot@(3096389489357933185)
+     cardinality=1297393
+     avgRowSize=7.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 1297393
+     probe runtime filters:
+     - filter_id = 4, probe_expr = (163: cs_sold_time_sk)
+     - filter_id = 5, probe_expr = (175: cs_ship_mode_sk)
+     - filter_id = 6, probe_expr = (162: cs_sold_date_sk)
+     - filter_id = 7, probe_expr = (176: cs_warehouse_sk)
+
+PLAN FRAGMENT 5(F18)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 41
+
+  40:IcebergScanNode
+     TABLE: tpcds.warehouse
+     PREDICATES: 200: w_warehouse_sk IS NOT NULL
+     TABLE VERSION: Snapshot@(251089535780523205)
+     cardinality=5
+     avgRowSize=7.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 5
+
+PLAN FRAGMENT 6(F16)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 37
+
+  36:IcebergScanNode
+     TABLE: tpcds.date_dim
+     PREDICATES: 224: d_year = 2001
+     MIN/MAX PREDICATES: 224: d_year <= 2001, 224: d_year >= 2001
+     TABLE VERSION: Snapshot@(149066723028526449)
+     cardinality=14760
+     avgRowSize=3.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 14760
+
+PLAN FRAGMENT 7(F14)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 33
+
+  32:Project
+  |  output columns:
+  |  264 <-> [264: sm_ship_mode_sk, INT, true]
+  |  cardinality: 10
+  |
+  31:IcebergScanNode
+     TABLE: tpcds.ship_mode
+     PREDICATES: 268: sm_carrier IN ('DHL', 'BARIAN')
+     MIN/MAX PREDICATES: 268: sm_carrier >= 'BARIAN', 268: sm_carrier <= 'DHL'
+     TABLE VERSION: Snapshot@(3720867965176576029)
+     cardinality=10
+     avgRowSize=2.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 10
+
+PLAN FRAGMENT 8(F12)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 28
+
+  27:Project
+  |  output columns:
+  |  250 <-> [250: t_time_sk, INT, true]
+  |  cardinality: 17661
+  |
+  26:IcebergScanNode
+     TABLE: tpcds.time_dim
+     PREDICATES: 252: t_time >= 30838, 252: t_time <= 59638
+     MIN/MAX PREDICATES: 252: t_time >= 30838, 252: t_time <= 59638
+     TABLE VERSION: Snapshot@(6706575164464374041)
+     cardinality=17661
+     avgRowSize=2.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 17661
+
+PLAN FRAGMENT 9(F09)
+  Fragment Cost: 3.876026544838619E8
+
+  Input Partition: HASH_PARTITIONED: 41: w_warehouse_name, 42: w_warehouse_sq_ft, 47: w_city, 48: w_county, 49: w_state, 51: w_country, 63: d_year
+  OutPut Partition: RANDOM
+  OutPut Exchange Id: 24
+
+  23:Project
+  |  output columns:
+  |  41 <-> [41: w_warehouse_name, VARCHAR(1073741824), true]
+  |  42 <-> [42: w_warehouse_sq_ft, INT, true]
+  |  47 <-> [47: w_city, VARCHAR(1073741824), true]
+  |  48 <-> [48: w_county, VARCHAR(1073741824), true]
+  |  49 <-> [49: w_state, VARCHAR(1073741824), true]
+  |  51 <-> [51: w_country, VARCHAR(1073741824), true]
+  |  63 <-> [63: d_year, INT, true]
+  |  137 <-> [137: sum, DECIMAL128(38,2), true]
+  |  138 <-> [138: sum, DECIMAL128(38,2), true]
+  |  139 <-> [139: sum, DECIMAL128(38,2), true]
+  |  140 <-> [140: sum, DECIMAL128(38,2), true]
+  |  141 <-> [141: sum, DECIMAL128(38,2), true]
+  |  142 <-> [142: sum, DECIMAL128(38,2), true]
+  |  143 <-> [143: sum, DECIMAL128(38,2), true]
+  |  144 <-> [144: sum, DECIMAL128(38,2), true]
+  |  145 <-> [145: sum, DECIMAL128(38,2), true]
+  |  146 <-> [146: sum, DECIMAL128(38,2), true]
+  |  147 <-> [147: sum, DECIMAL128(38,2), true]
+  |  148 <-> [148: sum, DECIMAL128(38,2), true]
+  |  149 <-> [149: sum, DECIMAL128(38,2), true]
+  |  150 <-> [150: sum, DECIMAL128(38,2), true]
+  |  151 <-> [151: sum, DECIMAL128(38,2), true]
+  |  152 <-> [152: sum, DECIMAL128(38,2), true]
+  |  153 <-> [153: sum, DECIMAL128(38,2), true]
+  |  154 <-> [154: sum, DECIMAL128(38,2), true]
+  |  155 <-> [155: sum, DECIMAL128(38,2), true]
+  |  156 <-> [156: sum, DECIMAL128(38,2), true]
+  |  157 <-> [157: sum, DECIMAL128(38,2), true]
+  |  158 <-> [158: sum, DECIMAL128(38,2), true]
+  |  159 <-> [159: sum, DECIMAL128(38,2), true]
+  |  160 <-> [160: sum, DECIMAL128(38,2), true]
+  |  161 <-> ((cast('DHL' as BOOLEAN)) OR (cast(',' as BOOLEAN))) OR (cast('BARIAN' as BOOLEAN))
+  |  cardinality: 290680
+  |
+  22:AGGREGATE (merge finalize)
+  |  aggregate: sum[([137: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([138: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([139: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([140: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([141: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([142: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([143: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([144: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([145: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([146: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([147: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([148: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([149: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([150: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([151: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([152: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([153: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([154: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([155: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([156: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([157: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([158: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([159: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([160: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |  group by: [41: w_warehouse_name, VARCHAR(1073741824), true], [42: w_warehouse_sq_ft, INT, true], [47: w_city, VARCHAR(1073741824), true], [48: w_county, VARCHAR(1073741824), true], [49: w_state, VARCHAR(1073741824), true], [51: w_country, VARCHAR(1073741824), true], [63: d_year, INT, true]
+  |  cardinality: 290680
+  |
+  21:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [41: w_warehouse_name, VARCHAR(1073741824), true], [42: w_warehouse_sq_ft, INT, true], [47: w_city, VARCHAR(1073741824), true], [48: w_county, VARCHAR(1073741824), true], [49: w_state, VARCHAR(1073741824), true], [51: w_country, VARCHAR(1073741824), true], [63: d_year, INT, true]
+     cardinality: 433820
+
+PLAN FRAGMENT 10(F00)
+  Fragment Cost: 2.1155454675200677E8
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 41: w_warehouse_name, 42: w_warehouse_sq_ft, 47: w_city, 48: w_county, 49: w_state, 51: w_country, 63: d_year
+  OutPut Exchange Id: 21
+
+  20:AGGREGATE (update serialize)
+  |  STREAMING
+  |  aggregate: sum[([113: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([114: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([115: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([116: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([117: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([118: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([119: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([120: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([121: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([122: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([123: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([124: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([125: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([126: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([127: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([128: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([129: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([130: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([131: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([132: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([133: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([134: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([135: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([136: case, DECIMAL64(16,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |  group by: [41: w_warehouse_name, VARCHAR(1073741824), true], [42: w_warehouse_sq_ft, INT, true], [47: w_city, VARCHAR(1073741824), true], [48: w_county, VARCHAR(1073741824), true], [49: w_state, VARCHAR(1073741824), true], [51: w_country, VARCHAR(1073741824), true], [63: d_year, INT, true]
+  |  cardinality: 433820
+  |
+  19:Project
+  |  output columns:
+  |  41 <-> [41: w_warehouse_name, VARCHAR(1073741824), true]
+  |  42 <-> [42: w_warehouse_sq_ft, INT, true]
+  |  47 <-> [47: w_city, VARCHAR(1073741824), true]
+  |  48 <-> [48: w_county, VARCHAR(1073741824), true]
+  |  49 <-> [49: w_state, VARCHAR(1073741824), true]
+  |  51 <-> [51: w_country, VARCHAR(1073741824), true]
+  |  63 <-> [63: d_year, INT, true]
+  |  113 <-> if[([406: expr, BOOLEAN, true], [419: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  114 <-> if[([407: expr, BOOLEAN, true], [419: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  115 <-> if[([409: expr, BOOLEAN, true], [419: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  116 <-> if[([410: expr, BOOLEAN, true], [419: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  117 <-> if[([411: expr, BOOLEAN, true], [419: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  118 <-> if[([412: expr, BOOLEAN, true], [419: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  119 <-> if[([413: expr, BOOLEAN, true], [419: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  120 <-> if[([414: expr, BOOLEAN, true], [419: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  121 <-> if[([415: expr, BOOLEAN, true], [419: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  122 <-> if[([416: expr, BOOLEAN, true], [419: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  123 <-> if[([417: expr, BOOLEAN, true], [419: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  124 <-> if[([418: expr, BOOLEAN, true], [419: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  125 <-> if[([406: expr, BOOLEAN, true], [420: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  126 <-> if[([407: expr, BOOLEAN, true], [420: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  127 <-> if[([409: expr, BOOLEAN, true], [420: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  128 <-> if[([410: expr, BOOLEAN, true], [420: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  129 <-> if[([411: expr, BOOLEAN, true], [420: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  130 <-> if[([412: expr, BOOLEAN, true], [420: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  131 <-> if[([413: expr, BOOLEAN, true], [420: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  132 <-> if[([414: expr, BOOLEAN, true], [420: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  133 <-> if[([415: expr, BOOLEAN, true], [420: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  134 <-> if[([416: expr, BOOLEAN, true], [420: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  135 <-> if[([417: expr, BOOLEAN, true], [420: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  136 <-> if[([418: expr, BOOLEAN, true], [420: multiply, DECIMAL64(16,2), true], 0); args: BOOLEAN,DECIMAL64,DECIMAL64; result: DECIMAL64(16,2); args nullable: true; result nullable: true]
+  |  common expressions:
+  |  416 <-> [65: d_moy, INT, true] = 10
+  |  417 <-> [65: d_moy, INT, true] = 11
+  |  418 <-> [65: d_moy, INT, true] = 12
+  |  419 <-> [404: cast, DECIMAL64(7,2), true] * [405: cast, DECIMAL64(9,0), true]
+  |  420 <-> [408: cast, DECIMAL64(7,2), true] * [405: cast, DECIMAL64(9,0), true]
+  |  404 <-> cast([24: ws_ext_sales_price, DECIMAL32(7,2), true] as DECIMAL64(7,2))
+  |  405 <-> cast([19: ws_quantity, INT, true] as DECIMAL64(9,0))
+  |  406 <-> [65: d_moy, INT, true] = 1
+  |  407 <-> [65: d_moy, INT, true] = 2
+  |  408 <-> cast([30: ws_net_paid, DECIMAL32(7,2), true] as DECIMAL64(7,2))
+  |  409 <-> [65: d_moy, INT, true] = 3
+  |  410 <-> [65: d_moy, INT, true] = 4
+  |  411 <-> [65: d_moy, INT, true] = 5
+  |  412 <-> [65: d_moy, INT, true] = 6
+  |  413 <-> [65: d_moy, INT, true] = 7
+  |  414 <-> [65: d_moy, INT, true] = 8
+  |  415 <-> [65: d_moy, INT, true] = 9
+  |  cardinality: 647446
+  |
+  18:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [16: ws_warehouse_sk, INT, true] = [39: w_warehouse_sk, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 3, build_expr = (39: w_warehouse_sk), remote = false
+  |  output columns: 19, 24, 30, 41, 42, 47, 48, 49, 51, 63, 65
+  |  can local shuffle: true
+  |  cardinality: 647446
+  |
+  |----17:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 5
+  |
+  15:Project
+  |  output columns:
+  |  16 <-> [16: ws_warehouse_sk, INT, true]
+  |  19 <-> [19: ws_quantity, INT, true]
+  |  24 <-> [24: ws_ext_sales_price, DECIMAL32(7,2), true]
+  |  30 <-> [30: ws_net_paid, DECIMAL32(7,2), true]
+  |  63 <-> [63: d_year, INT, true]
+  |  65 <-> [65: d_moy, INT, true]
+  |  cardinality: 647446
+  |
+  14:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [1: ws_sold_date_sk, INT, true] = [57: d_date_sk, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 2, build_expr = (57: d_date_sk), remote = false
+  |  output columns: 16, 19, 24, 30, 63, 65
+  |  can local shuffle: false
+  |  cardinality: 647446
+  |
+  |----13:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 14760
+  |
+  11:Project
+  |  output columns:
+  |  1 <-> [1: ws_sold_date_sk, INT, true]
+  |  16 <-> [16: ws_warehouse_sk, INT, true]
+  |  19 <-> [19: ws_quantity, INT, true]
+  |  24 <-> [24: ws_ext_sales_price, DECIMAL32(7,2), true]
+  |  30 <-> [30: ws_net_paid, DECIMAL32(7,2), true]
+  |  cardinality: 647446
+  |
+  10:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [15: ws_ship_mode_sk, INT, true] = [103: sm_ship_mode_sk, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 1, build_expr = (103: sm_ship_mode_sk), remote = false
+  |  output columns: 1, 16, 19, 24, 30
+  |  can local shuffle: false
+  |  cardinality: 647446
+  |
+  |----9:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 10
+  |
+  6:Project
+  |  output columns:
+  |  1 <-> [1: ws_sold_date_sk, INT, true]
+  |  15 <-> [15: ws_ship_mode_sk, INT, true]
+  |  16 <-> [16: ws_warehouse_sk, INT, true]
+  |  19 <-> [19: ws_quantity, INT, true]
+  |  24 <-> [24: ws_ext_sales_price, DECIMAL32(7,2), true]
+  |  30 <-> [30: ws_net_paid, DECIMAL32(7,2), true]
+  |  cardinality: 647446
+  |
+  5:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [2: ws_sold_time_sk, INT, true] = [89: t_time_sk, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 0, build_expr = (89: t_time_sk), remote = false
+  |  output columns: 1, 15, 16, 19, 24, 30
+  |  can local shuffle: false
+  |  cardinality: 647446
+  |
+  |----4:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 17661
+  |
+  1:IcebergScanNode
+     TABLE: tpcds.web_sales
+     PREDICATES: 16: ws_warehouse_sk IS NOT NULL
+     TABLE VERSION: Snapshot@(2984817778172468007)
+     cardinality=647446
+     avgRowSize=7.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 647446
+     probe runtime filters:
+     - filter_id = 0, probe_expr = (2: ws_sold_time_sk)
+     - filter_id = 1, probe_expr = (15: ws_ship_mode_sk)
+     - filter_id = 2, probe_expr = (1: ws_sold_date_sk)
+     - filter_id = 3, probe_expr = (16: ws_warehouse_sk)
+
+PLAN FRAGMENT 11(F07)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 17
+
+  16:IcebergScanNode
+     TABLE: tpcds.warehouse
+     PREDICATES: 39: w_warehouse_sk IS NOT NULL
+     TABLE VERSION: Snapshot@(251089535780523205)
+     cardinality=5
+     avgRowSize=7.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 5
+
+PLAN FRAGMENT 12(F05)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 13
+
+  12:IcebergScanNode
+     TABLE: tpcds.date_dim
+     PREDICATES: 63: d_year = 2001
+     MIN/MAX PREDICATES: 63: d_year <= 2001, 63: d_year >= 2001
+     TABLE VERSION: Snapshot@(149066723028526449)
+     cardinality=14760
+     avgRowSize=3.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 14760
+
+PLAN FRAGMENT 13(F03)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 09
+
+  8:Project
+  |  output columns:
+  |  103 <-> [103: sm_ship_mode_sk, INT, true]
+  |  cardinality: 10
+  |
+  7:IcebergScanNode
+     TABLE: tpcds.ship_mode
+     PREDICATES: 107: sm_carrier IN ('DHL', 'BARIAN')
+     MIN/MAX PREDICATES: 107: sm_carrier >= 'BARIAN', 107: sm_carrier <= 'DHL'
+     TABLE VERSION: Snapshot@(3720867965176576029)
+     cardinality=10
+     avgRowSize=2.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 10
+
+PLAN FRAGMENT 14(F01)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 04
+
+  3:Project
+  |  output columns:
+  |  89 <-> [89: t_time_sk, INT, true]
+  |  cardinality: 17661
+  |
+  2:IcebergScanNode
+     TABLE: tpcds.time_dim
+     PREDICATES: 91: t_time >= 30838, 91: t_time <= 59638
+     MIN/MAX PREDICATES: 91: t_time >= 30838, 91: t_time <= 59638
+     TABLE VERSION: Snapshot@(6706575164464374041)
+     cardinality=17661
+     avgRowSize=2.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 17661

@@ -1,0 +1,113 @@
+-- engine=starrocks
+-- suite=tpc-h
+-- case=q12
+-- file=/Users/harbor/project/NovaRocks/sql-tests/tpc-h/sql/q12.sql
+-- elapsed_sec=0.049
+-- exit_code=0
+
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 1.56163223125E8
+  Memory: 3.584644625E7
+
+PLAN FRAGMENT 0(F04)
+  Fragment Cost: 4.32E7
+  Output Exprs:28: l_shipmode | 36: sum | 37: sum
+  Input Partition: UNPARTITIONED
+  RESULT SINK
+
+  10:MERGING-EXCHANGE
+     distribution type: GATHER
+     cardinality: 337500
+
+PLAN FRAGMENT 1(F03)
+  Fragment Cost: 7.668E7
+
+  Input Partition: HASH_PARTITIONED: 28: l_shipmode
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 10
+
+  9:SORT
+  |  order by: [28, VARCHAR(1073741824), true] ASC
+  |  offset: 0
+  |  cardinality: 337500
+  |
+  8:AGGREGATE (merge finalize)
+  |  aggregate: sum[([36: sum, BIGINT, true]); args: BIGINT; result: BIGINT; args nullable: true; result nullable: true], sum[([37: sum, BIGINT, true]); args: BIGINT; result: BIGINT; args nullable: true; result nullable: true]
+  |  group by: [28: l_shipmode, VARCHAR(1073741824), true]
+  |  cardinality: 337500
+  |
+  7:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [28: l_shipmode, VARCHAR(1073741824), true]
+     cardinality: 675000
+
+PLAN FRAGMENT 2(F00)
+  Fragment Cost: 6.325933875E7
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 28: l_shipmode
+  OutPut Exchange Id: 07
+
+  6:AGGREGATE (update serialize)
+  |  STREAMING
+  |  aggregate: sum[([34: case, BIGINT, true]); args: BIGINT; result: BIGINT; args nullable: true; result nullable: true], sum[([35: case, BIGINT, true]); args: BIGINT; result: BIGINT; args nullable: true; result nullable: true]
+  |  group by: [28: l_shipmode, VARCHAR(1073741824), true]
+  |  cardinality: 675000
+  |
+  5:Project
+  |  output columns:
+  |  28 <-> [28: l_shipmode, VARCHAR(1073741824), true]
+  |  34 <-> if[(([6: o_orderpriority, VARCHAR(1073741824), true] = '1-URGENT') OR ([6: o_orderpriority, VARCHAR(1073741824), true] = '2-HIGH'), 1, 0); args: BOOLEAN,BIGINT,BIGINT; result: BIGINT; args nullable: true; result nullable: true]
+  |  35 <-> if[(([6: o_orderpriority, VARCHAR(1073741824), true] != '1-URGENT') AND ([6: o_orderpriority, VARCHAR(1073741824), true] != '2-HIGH'), 1, 0); args: BOOLEAN,BIGINT,BIGINT; result: BIGINT; args nullable: true; result nullable: true]
+  |  cardinality: 1350000
+  |
+  4:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [1: o_orderkey, INT, true] = [14: l_orderkey, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 0, build_expr = (14: l_orderkey), remote = false
+  |  output columns: 6, 28
+  |  can local shuffle: true
+  |  cardinality: 1350000
+  |
+  |----3:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 32161
+  |
+  0:IcebergScanNode
+     TABLE: tpch.orders
+     PREDICATES: 1: o_orderkey IS NOT NULL
+     TABLE VERSION: Snapshot@(2660326479417119815)
+     cardinality=1350000
+     avgRowSize=2.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 1350000
+     probe runtime filters:
+     - filter_id = 0, probe_expr = (1: o_orderkey)
+
+PLAN FRAGMENT 3(F01)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 03
+
+  2:Project
+  |  output columns:
+  |  14 <-> [14: l_orderkey, INT, true]
+  |  28 <-> [28: l_shipmode, VARCHAR(1073741824), true]
+  |  cardinality: 32161
+  |
+  1:IcebergScanNode
+     TABLE: tpch.lineitem
+     PREDICATES: 28: l_shipmode IN ('REG AIR', 'MAIL'), 25: l_commitdate < 26: l_receiptdate, 24: l_shipdate < 25: l_commitdate, 26: l_receiptdate >= '1997-01-01', 26: l_receiptdate < '1998-01-01', 25: l_commitdate < '1998-01-01', 24: l_shipdate < '1998-01-01'
+     MIN/MAX PREDICATES: 28: l_shipmode >= 'MAIL', 28: l_shipmode <= 'REG AIR', 26: l_receiptdate >= '1997-01-01', 26: l_receiptdate < '1998-01-01', 25: l_commitdate < '1998-01-01', 24: l_shipdate < '1998-01-01'
+     TABLE VERSION: Snapshot@(2784910170297541234)
+     cardinality=32161
+     avgRowSize=5.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 32161

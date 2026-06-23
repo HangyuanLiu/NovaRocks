@@ -1,0 +1,4 @@
+suite,mode,total,pass,fail,cpu_time_sec,wall_time_sec,log_path
+ssb,record,13,13,0,50.31,50.39,/Users/harbor/.codex/worktrees/4f87/NovaRocks/logs/baseline/20260622-231416-tpc-baseline/analyze-ssb.log
+tpc-h,record,22,22,0,176.12,178.11,/Users/harbor/.codex/worktrees/4f87/NovaRocks/logs/baseline/20260622-231416-tpc-baseline/analyze-tpc-h.log
+tpc-ds,record,99,99,0,704.68,709.04,/Users/harbor/.codex/worktrees/4f87/NovaRocks/logs/baseline/20260622-231416-tpc-baseline/analyze-tpc-ds.log

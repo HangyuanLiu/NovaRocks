@@ -1,0 +1,42 @@
+{
+  "explain": {
+    "ssb": {
+      "source": "/Users/harbor/.codex/worktrees/4f87/NovaRocks/sql-tests/ssb/sql",
+      "generated": "/Users/harbor/.codex/worktrees/4f87/NovaRocks/logs/baseline/20260622-231416-tpc-baseline/generated-sql/explain/ssb",
+      "files": 13,
+      "queries": 13
+    },
+    "tpc-h": {
+      "source": "/Users/harbor/.codex/worktrees/4f87/NovaRocks/sql-tests/tpc-h/sql",
+      "generated": "/Users/harbor/.codex/worktrees/4f87/NovaRocks/logs/baseline/20260622-231416-tpc-baseline/generated-sql/explain/tpc-h",
+      "files": 22,
+      "queries": 22
+    },
+    "tpc-ds": {
+      "source": "/Users/harbor/.codex/worktrees/4f87/NovaRocks/sql-tests/tpc-ds/sql",
+      "generated": "/Users/harbor/.codex/worktrees/4f87/NovaRocks/logs/baseline/20260622-231416-tpc-baseline/generated-sql/explain/tpc-ds",
+      "files": 99,
+      "queries": 103
+    }
+  },
+  "analyze": {
+    "ssb": {
+      "source": "/Users/harbor/.codex/worktrees/4f87/NovaRocks/sql-tests/ssb/sql",
+      "generated": "/Users/harbor/.codex/worktrees/4f87/NovaRocks/logs/baseline/20260622-231416-tpc-baseline/generated-sql/analyze/ssb",
+      "files": 13,
+      "queries": 13
+    },
+    "tpc-h": {
+      "source": "/Users/harbor/.codex/worktrees/4f87/NovaRocks/sql-tests/tpc-h/sql",
+      "generated": "/Users/harbor/.codex/worktrees/4f87/NovaRocks/logs/baseline/20260622-231416-tpc-baseline/generated-sql/analyze/tpc-h",
+      "files": 22,
+      "queries": 22
+    },
+    "tpc-ds": {
+      "source": "/Users/harbor/.codex/worktrees/4f87/NovaRocks/sql-tests/tpc-ds/sql",
+      "generated": "/Users/harbor/.codex/worktrees/4f87/NovaRocks/logs/baseline/20260622-231416-tpc-baseline/generated-sql/analyze/tpc-ds",
+      "files": 99,
+      "queries": 103
+    }
+  }
+}

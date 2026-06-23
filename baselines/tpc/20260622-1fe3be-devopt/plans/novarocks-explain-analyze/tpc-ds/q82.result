@@ -1,0 +1,79 @@
+Explain String
+Planning: 99.7ms / Execution: 2.09s / Rows: 2
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+16:MERGING-EXCHANGE stats={rows=86 conf=estimated} act={rows=6 time=46.4us peak=1.9KB}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 16
+    PARTITION: UNPARTITIONED
+15:LOCAL TOP-N (limit=100, offset=0) [i_item_id ASC NULLS FIRST] stats={rows=86 conf=estimated} act={rows=4 time=25.2us peak=62.7KB}
+  14:PROJECT [i_item_id, i_item_desc, i_current_price] stats={rows=86 conf=estimated} act={rows=2 time=37.8us peak=20.1KB}
+    13:HASH AGGREGATE (GLOBAL, group by: [i_item_id, i_item_desc, i_current_price]) stats={rows=86 conf=estimated} act={rows=10 time=78.1us peak=811.0KB}
+      12:HASH EXCHANGE stats={rows=86 conf=estimated} act={rows=6 time=52.2us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 12
+    PARTITION: HASH_PARTITIONED (i_item_id, i_item_desc, i_current_price)
+11:HASH AGGREGATE (LOCAL, group by: [i_item_id, i_item_desc, i_current_price]) stats={rows=86 conf=estimated} act={rows=8064 time=13.8ms peak=1.1MB}
+  10:HASH JOIN (BROADCAST, INNER, eq: [ss_item_sk = i_item_sk]) stats={rows=431451 conf=estimated} act={rows=8160 time=10.4ms peak=9.1MB}
+    build runtime filters:
+    - filter_id = 2, build_expr = (i_item_sk)
+    1:SCAN tpcds.store_sales stats={rows=2592364 conf=estimated} act={rows=2880404 time=2.2ms peak=0B}
+         TABLE: tpcds.store_sales
+         columns: ss_item_sk
+         min-max stats
+         predicates: ss_item_sk IS NOT NULL
+        probe runtime filters:
+        - filter_id = 2, probe_expr = (ss_item_sk)
+    9:GATHER stats={rows=3015 conf=estimated} act={rows=102 time=18.8us peak=0B}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 9
+    PARTITION: UNPARTITIONED
+8:HASH JOIN (BROADCAST, INNER, eq: [d_date_sk = inv_date_sk]) stats={rows=3015 conf=estimated} act={rows=3325 time=4.0ms peak=4.0MB}
+  build runtime filters:
+  - filter_id = 1, build_expr = (inv_date_sk)
+  2:SCAN tpcds.date_dim stats={rows=16436 conf=estimated} act={rows=61 time=2.1us peak=0B}
+       TABLE: tpcds.date_dim
+       columns: d_date_sk, d_date
+       min-max stats
+       predicates: d_date BETWEEN CAST('2000-05-25' AS Date32) AND date_add(CAST('2000-05-25' AS Date32), 60) AND d_date_sk IS NOT NULL
+      probe runtime filters:
+      - filter_id = 1, probe_expr = (d_date_sk)
+  7:GATHER stats={rows=3015 conf=estimated} act={rows=3291 time=286.6us peak=0B}
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 7
+    PARTITION: UNPARTITIONED
+6:HASH JOIN (BROADCAST, INNER, eq: [inv_item_sk = i_item_sk]) stats={rows=3015 conf=estimated} act={rows=1109 time=3.2ms peak=3.8MB}
+  build runtime filters:
+  - filter_id = 0, build_expr = (i_item_sk)
+  3:SCAN tpcds.inventory stats={rows=4294381 conf=estimated} act={rows=69430 time=6.9ms peak=0B}
+       TABLE: tpcds.inventory
+       columns: inv_date_sk, inv_item_sk, inv_quantity_on_hand
+       min-max stats
+       predicates: inv_quantity_on_hand BETWEEN 100 AND 500 AND inv_item_sk IS NOT NULL AND inv_date_sk IS NOT NULL
+      probe runtime filters:
+      - filter_id = 0, probe_expr = (inv_item_sk)
+  5:GATHER stats={rows=13 conf=estimated} act={rows=12 time=31.6us peak=0B}
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 5
+    PARTITION: UNPARTITIONED
+4:SCAN tpcds.item stats={rows=13 conf=estimated} act={rows=4 time=50.8us peak=15.4KB}
+     TABLE: tpcds.item
+     columns: i_item_sk, i_item_id, i_item_desc, i_current_price, i_manufact_id
+     min-max stats
+     predicates: i_current_price BETWEEN 62 AND 62 + 30 AND i_manufact_id IN (129, 270, 821, 423) AND i_item_sk IS NOT NULL

@@ -1,0 +1,102 @@
+Explain String
+Planning: 189.5ms / Execution: 3.91s / Rows: 5
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+23:SORT BY [cnt DESC NULLS LAST, c_last_name ASC NULLS FIRST] stats={rows=991 conf=estimated} act={rows=10 time=87.7us peak=5.9KB}
+  22:GATHER stats={rows=991 conf=estimated} act={rows=5 time=9.5us peak=0B}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 22
+    PARTITION: UNPARTITIONED
+21:PROJECT [c_last_name, c_first_name, c_salutation, c_preferred_cust_flag, ss_ticket_number, cnt] stats={rows=991 conf=estimated} act={rows=5 time=102.5us peak=9.5KB}
+  20:HASH JOIN (BROADCAST, INNER, eq: [c_customer_sk = ss_customer_sk]) stats={rows=991 conf=estimated} act={rows=20 time=199.3us peak=3.9MB}
+    build runtime filters:
+    - filter_id = 3, build_expr = (ss_customer_sk)
+    1:SCAN tpcds.customer stats={rows=90000 conf=estimated} act={rows=100000 time=15.1us peak=0B}
+         TABLE: tpcds.customer
+         columns: c_customer_sk, c_salutation, c_first_name, c_last_name, c_preferred_cust_flag
+         min-max stats
+         predicates: c_customer_sk IS NOT NULL
+        probe runtime filters:
+        - filter_id = 3, probe_expr = (c_customer_sk)
+    19:GATHER stats={rows=991 conf=estimated} act={rows=15 time=16.8us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 19
+    PARTITION: UNPARTITIONED
+18:PROJECT [ss_ticket_number, ss_customer_sk, cnt] stats={rows=991 conf=estimated} act={rows=5 time=48.5us peak=12.8KB}
+  17:PROJECT [ss_ticket_number, ss_customer_sk, count(*) AS cnt] stats={rows=991 conf=estimated} act={rows=5 time=58.5us peak=80B}
+    16:FILTER stats={rows=991 conf=estimated}
+      predicate: ss_customer_sk IS NOT NULL
+      15:FILTER stats={rows=1038 conf=estimated}
+        predicate: count(*) BETWEEN 1 AND 5
+        14:HASH AGGREGATE (GLOBAL, group by: [ss_ticket_number, ss_customer_sk]) stats={rows=4151 conf=estimated} act={rows=2953 time=360.7us peak=976.0KB}
+          aggregations: count()
+          13:HASH EXCHANGE stats={rows=4151 conf=estimated} act={rows=1481 time=14.6us peak=0B}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 13
+    PARTITION: HASH_PARTITIONED (ss_ticket_number, ss_customer_sk)
+12:HASH AGGREGATE (LOCAL, group by: [ss_ticket_number, ss_customer_sk]) stats={rows=4151 conf=estimated} act={rows=16878 time=19.9ms peak=3.2MB}
+  aggregations: count()
+  11:HASH JOIN (BROADCAST, INNER, eq: [store_sales.ss_hdemo_sk = household_demographics.hd_demo_sk]) stats={rows=4151 conf=estimated} act={rows=18517 time=2.0ms peak=12.5MB}
+    build runtime filters:
+    - filter_id = 2, build_expr = (household_demographics.hd_demo_sk)
+    8:HASH JOIN (BROADCAST, INNER, eq: [store_sales.ss_store_sk = store.s_store_sk]) stats={rows=80180 conf=estimated} act={rows=104864 time=3.0ms peak=7.6MB}
+      build runtime filters:
+      - filter_id = 1, build_expr = (store.s_store_sk)
+      5:HASH JOIN (BROADCAST, INNER, eq: [store_sales.ss_sold_date_sk = date_dim.d_date_sk]) stats={rows=89089 conf=estimated} act={rows=105044 time=38.7ms peak=5.2MB}
+        build runtime filters:
+        - filter_id = 0, build_expr = (date_dim.d_date_sk)
+        2:SCAN tpcds.store_sales stats={rows=2507765 conf=estimated} act={rows=2653156 time=23.6ms peak=0B}
+             TABLE: tpcds.store_sales
+             columns: ss_sold_date_sk, ss_customer_sk, ss_hdemo_sk, ss_store_sk, ss_ticket_number
+             min-max stats
+             predicates: ss_sold_date_sk IS NOT NULL AND ss_store_sk IS NOT NULL AND ss_hdemo_sk IS NOT NULL
+            probe runtime filters:
+            - filter_id = 0, probe_expr = (store_sales.ss_sold_date_sk)
+            - filter_id = 1, probe_expr = (store_sales.ss_store_sk)
+            - filter_id = 2, probe_expr = (store_sales.ss_hdemo_sk)
+        4:GATHER stats={rows=65 conf=estimated} act={rows=216 time=7.8us peak=0B}
+      7:GATHER stats={rows=5 conf=estimated} act={rows=36 time=7.5us peak=0B}
+    10:GATHER stats={rows=378 conf=estimated} act={rows=3120 time=57.3us peak=0B}
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 10
+    PARTITION: UNPARTITIONED
+9:SCAN tpcds.household_demographics stats={rows=378 conf=estimated} act={rows=1040 time=76.2us peak=746.8KB}
+     TABLE: tpcds.household_demographics
+     columns: hd_demo_sk, hd_buy_potential, hd_dep_count, hd_vehicle_count
+     min-max stats
+     predicates: hd_buy_potential = '>10000' OR hd_buy_potential = 'Unknown' AND hd_vehicle_count > 0 AND CASE WHEN hd_vehicle_count > 0 THEN hd_dep_count / hd_vehicle_count ELSE NULL END > 1 AND hd_buy_potential IN ('>10000', 'Unknown') AND hd_demo_sk IS NOT NULL
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 7
+    PARTITION: UNPARTITIONED
+6:SCAN tpcds.store stats={rows=5 conf=estimated} act={rows=12 time=25.0us peak=13.0KB}
+     TABLE: tpcds.store
+     columns: s_store_sk, s_county
+     min-max stats
+     predicates: s_county IN ('Williamson County', 'Franklin Parish', 'Bronx County', 'Orange County') AND s_store_sk IS NOT NULL
+PLAN FRAGMENT 6
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 4
+    PARTITION: UNPARTITIONED
+3:SCAN tpcds.date_dim stats={rows=65 conf=estimated} act={rows=72 time=32.9us peak=48.5KB}
+     TABLE: tpcds.date_dim
+     columns: d_date_sk, d_year, d_dom
+     min-max stats
+     predicates: d_dom BETWEEN 1 AND 2 AND d_year IN (1999, 1999 + 1, 1999 + 2) AND d_date_sk IS NOT NULL

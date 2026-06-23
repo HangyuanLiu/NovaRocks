@@ -1,0 +1,160 @@
+Explain String
+Planning: 463.1ms / Execution: 3.92s / Rows: 6
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+31:PROJECT [__nr_sel_0 AS substr(r_reason_desc, 1, 20), __nr_sel_1 AS avg(ws_quantity), __nr_sel_2 AS avg(wr_refunded_cash), __nr_sel_3 AS avg(wr_fee)] stats={rows=1 conf=estimated} act={rows=6 time=50.1us peak=442B}
+  30:MERGING-EXCHANGE stats={rows=1 conf=estimated} act={rows=18 time=90.4us peak=3.8KB}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 30
+    PARTITION: UNPARTITIONED
+29:LOCAL TOP-N (limit=100, offset=0) [substring(r_reason_desc, 1, 20) ASC NULLS FIRST, __nr_sel_1 ASC NULLS FIRST, __nr_sel_2 ASC NULLS FIRST, __nr_sel_3 ASC NULLS FIRST] stats={rows=1 conf=estimated} act={rows=12 time=33.1us peak=77.8KB}
+  28:PROJECT [__cse_0 AS __nr_sel_0, avg(ws_quantity) AS __nr_sel_1, avg(wr_refunded_cash) AS __nr_sel_2, avg(wr_fee) AS __nr_sel_3, __cse_0 AS substring(r_reason_desc, 1, 20)] stats={rows=1 conf=estimated} act={rows=6 time=41.3us peak=56.3KB}
+    27:PROJECT [r_reason_desc, avg(ws_quantity), avg(wr_refunded_cash), avg(wr_fee), substring(r_reason_desc, 1, 20) AS __cse_0] stats={rows=1 conf=estimated} act={rows=6 time=60.8us peak=52.2KB}
+      26:HASH AGGREGATE (GLOBAL, group by: [r_reason_desc]) stats={rows=1 conf=estimated} act={rows=12 time=124.0us peak=514.6KB}
+        aggregations: avg(ws_quantity), avg(wr_refunded_cash), avg(wr_fee)
+        25:HASH EXCHANGE stats={rows=1 conf=estimated} act={rows=6 time=72.7us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 25
+    PARTITION: HASH_PARTITIONED (r_reason_desc)
+24:HASH AGGREGATE (LOCAL, group by: [r_reason_desc]) stats={rows=1 conf=estimated} act={rows=13 time=131.1us peak=449.1KB}
+  aggregations: avg(ws_quantity), avg(wr_refunded_cash), avg(wr_fee)
+  23:HASH JOIN (BROADCAST, INNER, eq: [d_date_sk = ws_sold_date_sk]) stats={rows=1 conf=estimated} act={rows=55 time=88.7us peak=398.8KB}
+    build runtime filters:
+    - filter_id = 9, build_expr = (ws_sold_date_sk)
+    1:SCAN tpcds.date_dim stats={rows=327 conf=estimated} act={rows=366 time=2.0us peak=0B}
+         TABLE: tpcds.date_dim
+         columns: d_date_sk, d_year
+         min-max stats
+         predicates: d_year = 2000 AND d_date_sk IS NOT NULL
+        probe runtime filters:
+        - filter_id = 9, probe_expr = (d_date_sk)
+    22:GATHER stats={rows=1 conf=estimated} act={rows=48 time=158.4us peak=0B}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 22
+    PARTITION: UNPARTITIONED
+21:HASH JOIN (BROADCAST, INNER, eq: [wp_web_page_sk = ws_web_page_sk]) stats={rows=1 conf=estimated} act={rows=64 time=388.5us peak=619.2KB}
+  build runtime filters:
+  - filter_id = 8, build_expr = (ws_web_page_sk)
+  2:SCAN tpcds.web_page stats={rows=54 conf=estimated} act={rows=60 time=1.9us peak=0B}
+       TABLE: tpcds.web_page
+       columns: wp_web_page_sk
+       min-max stats
+       predicates: wp_web_page_sk IS NOT NULL
+      probe runtime filters:
+      - filter_id = 8, probe_expr = (wp_web_page_sk)
+  20:GATHER stats={rows=1 conf=estimated} act={rows=48 time=45.2us peak=0B}
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 20
+    PARTITION: UNPARTITIONED
+19:HASH JOIN (BROADCAST, INNER, eq: [r_reason_sk = wr_reason_sk]) stats={rows=1 conf=estimated} act={rows=64 time=496.8us peak=545.4KB}
+  build runtime filters:
+  - filter_id = 7, build_expr = (wr_reason_sk)
+  3:SCAN tpcds.reason stats={rows=32 conf=estimated} act={rows=35 time=1.4us peak=0B}
+       TABLE: tpcds.reason
+       columns: r_reason_sk, r_reason_desc
+       min-max stats
+       predicates: r_reason_sk IS NOT NULL
+      probe runtime filters:
+      - filter_id = 7, probe_expr = (r_reason_sk)
+  18:GATHER stats={rows=1 conf=estimated} act={rows=48 time=53.6us peak=0B}
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 18
+    PARTITION: UNPARTITIONED
+17:HASH JOIN (BROADCAST, INNER, eq: [cd1.cd_demo_sk = wr_refunded_cdemo_sk, cd1.cd_marital_status = cd2.cd_marital_status, cd1.cd_education_status = cd2.cd_education_status]) stats={rows=1 conf=estimated} act={rows=256 time=3.6ms peak=1.7MB}
+  other: cd1.cd_marital_status = 'M' AND cd1.cd_education_status = 'Advanced Degree' AND ws_sales_price BETWEEN 100.00 AND 150.00 OR cd1.cd_marital_status = 'S' AND cd1.cd_education_status = 'College' AND ws_sales_price BETWEEN 50.00 AND 100.00 OR cd1.cd_marital_status = 'W' AND cd1.cd_education_status = '2 yr Degree' AND ws_sales_price BETWEEN 150.00 AND 200.00
+  build runtime filters:
+  - filter_id = 4, build_expr = (wr_refunded_cdemo_sk)
+  - filter_id = 5, build_expr = (cd2.cd_marital_status)
+  - filter_id = 6, build_expr = (cd2.cd_education_status)
+  4:SCAN tpcds.customer_demographics (alias=cd1) stats={rows=118850 conf=estimated} act={rows=12671 time=95.5us peak=0B}
+       TABLE: tpcds.customer_demographics
+       columns: cd_demo_sk, cd_marital_status, cd_education_status
+       min-max stats
+       predicates: cd1.cd_marital_status IN ('M', 'S', 'W') AND cd1.cd_education_status IN ('Advanced Degree', 'College', '2 yr Degree') AND cd1.cd_marital_status = 'M' AND cd1.cd_education_status = 'Advanced Degree' OR cd1.cd_marital_status = 'S' AND cd1.cd_education_status = 'College' OR cd1.cd_marital_status = 'W' AND cd1.cd_education_status = '2 yr Degree' AND cd1.cd_demo_sk IS NOT NULL AND cd1.cd_marital_status IS NOT NULL AND cd1.cd_education_status IS NOT NULL
+      probe runtime filters:
+      - filter_id = 4, probe_expr = (cd1.cd_demo_sk)
+      - filter_id = 5, probe_expr = (cd1.cd_marital_status)
+      - filter_id = 6, probe_expr = (cd1.cd_education_status)
+  16:GATHER stats={rows=1 conf=estimated} act={rows=240 time=225.7us peak=0B}
+PLAN FRAGMENT 6
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 16
+    PARTITION: UNPARTITIONED
+15:HASH JOIN (BROADCAST, INNER, eq: [cd2.cd_demo_sk = wr_returning_cdemo_sk]) stats={rows=1 conf=estimated} act={rows=965 time=12.8ms peak=4.3MB}
+  build runtime filters:
+  - filter_id = 3, build_expr = (wr_returning_cdemo_sk)
+  5:SCAN tpcds.customer_demographics (alias=cd2) stats={rows=360068 conf=estimated} act={rows=38001 time=86.6us peak=0B}
+       TABLE: tpcds.customer_demographics
+       columns: cd_demo_sk, cd_marital_status, cd_education_status
+       min-max stats
+       predicates: cd2.cd_education_status IN ('Advanced Degree', 'College', '2 yr Degree') AND cd2.cd_marital_status IN ('M', 'S', 'W') AND cd2.cd_demo_sk IS NOT NULL AND cd2.cd_marital_status IS NOT NULL AND cd2.cd_education_status IS NOT NULL
+      probe runtime filters:
+      - filter_id = 3, probe_expr = (cd2.cd_demo_sk)
+  14:GATHER stats={rows=1 conf=estimated} act={rows=885 time=53.7us peak=0B}
+PLAN FRAGMENT 7
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 14
+    PARTITION: UNPARTITIONED
+13:HASH JOIN (BROADCAST, INNER, eq: [ws_item_sk = wr_item_sk, ws_order_number = wr_order_number]) stats={rows=1 conf=estimated} act={rows=38092 time=16.4ms peak=19.6MB}
+  other: ws_net_profit BETWEEN 100 AND 200 AND ca_state IN ('IN', 'OH', 'NJ') AND __cse_0 OR ws_net_profit BETWEEN 150 AND 300 AND ca_state IN ('WI', 'CT', 'KY') AND __cse_0 OR ws_net_profit BETWEEN 50 AND 250 AND ca_state IN ('LA', 'IA', 'AR') AND __cse_0
+  build runtime filters:
+  - filter_id = 1, build_expr = (wr_item_sk)
+  - filter_id = 2, build_expr = (wr_order_number)
+  6:SCAN tpcds.web_sales stats={rows=28331 conf=estimated} act={rows=15682 time=2.1ms peak=0B}
+       TABLE: tpcds.web_sales
+       columns: ws_sold_date_sk, ws_item_sk, ws_web_page_sk, ws_order_number, ws_quantity, ws_sales_price, ws_net_profit
+       min-max stats
+       predicates: ws_net_profit BETWEEN 100 AND 200 OR ws_net_profit BETWEEN 150 AND 300 OR ws_net_profit BETWEEN 50 AND 250 AND ws_sales_price BETWEEN 50.00 AND 200.00 AND ws_net_profit BETWEEN 50 AND 300 AND ws_sales_price BETWEEN 100.00 AND 150.00 OR ws_sales_price BETWEEN 50.00 AND 100.00 OR ws_sales_price BETWEEN 150.00 AND 200.00 AND ws_item_sk IS NOT NULL AND ws_order_number IS NOT NULL AND ws_web_page_sk IS NOT NULL AND ws_sold_date_sk IS NOT NULL
+      probe runtime filters:
+      - filter_id = 1, probe_expr = (ws_item_sk)
+      - filter_id = 2, probe_expr = (ws_order_number)
+  12:PROJECT [wr_item_sk, wr_refunded_cdemo_sk, wr_refunded_addr_sk, wr_returning_cdemo_sk, wr_reason_sk, wr_order_number, wr_fee, wr_refunded_cash, ca_address_sk, ca_state, ca_country, ca_country = 'United States' AS __cse_0] stats={rows=2479 conf=estimated} act={rows=37797 time=84.4ms peak=355.3KB}
+    11:GATHER stats={rows=2479 conf=estimated} act={rows=37797 time=54.0us peak=0B}
+PLAN FRAGMENT 8
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 11
+    PARTITION: UNPARTITIONED
+10:HASH JOIN (BROADCAST, INNER, eq: [wr_refunded_addr_sk = ca_address_sk]) stats={rows=2479 conf=estimated} act={rows=41243 time=14.8ms peak=13.6MB}
+  build runtime filters:
+  - filter_id = 0, build_expr = (ca_address_sk)
+  7:SCAN tpcds.web_returns stats={rows=48418 conf=estimated} act={rows=65773 time=84.4us peak=0B}
+       TABLE: tpcds.web_returns
+       columns: wr_item_sk, wr_refunded_cdemo_sk, wr_refunded_addr_sk, wr_returning_cdemo_sk, wr_reason_sk, wr_order_number, wr_fee, wr_refunded_cash
+       min-max stats
+       predicates: wr_item_sk IS NOT NULL AND wr_order_number IS NOT NULL AND wr_refunded_cdemo_sk IS NOT NULL AND wr_returning_cdemo_sk IS NOT NULL AND wr_refunded_addr_sk IS NOT NULL AND wr_reason_sk IS NOT NULL
+      probe runtime filters:
+      - filter_id = 0, probe_expr = (wr_refunded_addr_sk)
+  9:GATHER stats={rows=1927 conf=estimated} act={rows=28644 time=12.6us peak=0B}
+PLAN FRAGMENT 9
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 9
+    PARTITION: UNPARTITIONED
+8:SCAN tpcds.customer_address stats={rows=1927 conf=estimated} act={rows=9548 time=807.9us peak=1.6MB}
+     TABLE: tpcds.customer_address
+     columns: ca_address_sk, ca_state, ca_country
+     min-max stats
+     predicates: ca_country IN ('United States', 'United States', 'United States') AND ca_country = 'United States' AND ca_state IN ('IN', 'OH', 'NJ') OR ca_country = 'United States' AND ca_state IN ('WI', 'CT', 'KY') OR ca_country = 'United States' AND ca_state IN ('LA', 'IA', 'AR') AND ca_address_sk IS NOT NULL

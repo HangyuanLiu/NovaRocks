@@ -1,0 +1,223 @@
+-- engine=starrocks
+-- suite=tpc-ds
+-- case=q15
+-- file=/Users/harbor/project/NovaRocks/sql-tests/tpc-ds/sql/q15.sql
+-- elapsed_sec=0.086
+-- exit_code=0
+
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 1.0722139512436125E8
+  Memory: 5864645.648722508
+
+PLAN FRAGMENT 0(F12)
+  Fragment Cost: 6400.0
+  Output Exprs:70: ca_zip | 110: sum
+  Input Partition: UNPARTITIONED
+  RESULT SINK
+
+  21:MERGING-EXCHANGE
+     distribution type: GATHER
+     limit: 100
+     cardinality: 50
+
+PLAN FRAGMENT 1(F11)
+  Fragment Cost: 12800.0
+
+  Input Partition: HASH_PARTITIONED: 70: ca_zip
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 21
+
+  20:TOP-N
+  |  order by: [70, VARCHAR(1073741824), true] ASC
+  |  offset: 0
+  |  limit: 100
+  |  cardinality: 50
+  |
+  19:AGGREGATE (merge finalize)
+  |  aggregate: sum[([110: sum, DECIMAL128(38,2), true]); args: DECIMAL32; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |  group by: [70: ca_zip, VARCHAR(1073741824), true]
+  |  cardinality: 50
+  |
+  18:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [70: ca_zip, VARCHAR(1073741824), true]
+     cardinality: 100
+
+PLAN FRAGMENT 2(F10)
+  Fragment Cost: 3.991821993000001E7
+
+  Input Partition: HASH_PARTITIONED: 4: cs_bill_customer_sk
+  OutPut Partition: HASH_PARTITIONED: 70: ca_zip
+  OutPut Exchange Id: 18
+
+  17:TOP-N
+  |  order by: [70, VARCHAR(1073741824), true] ASC
+  |  offset: 0
+  |  limit: 100
+  |  cardinality: 100
+  |
+  16:AGGREGATE (update serialize)
+  |  STREAMING
+  |  aggregate: sum[([22: cs_sales_price, DECIMAL32(7,2), true]); args: DECIMAL32; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |  group by: [70: ca_zip, VARCHAR(1073741824), true]
+  |  streaming preaggregation mode: force_preaggregation
+  |  cardinality: 567610
+  |
+  15:Project
+  |  output columns:
+  |  22 <-> [22: cs_sales_price, DECIMAL32(7,2), true]
+  |  70 <-> [70: ca_zip, VARCHAR(1073741824), true]
+  |  cardinality: 1135219
+  |
+  14:HASH JOIN
+  |  join op: INNER JOIN (PARTITIONED)
+  |  equal join conjunct: [4: cs_bill_customer_sk, INT, true] = [39: c_customer_sk, INT, true]
+  |  other join predicates: ((substr[([70: ca_zip, VARCHAR(1073741824), true], 1, 5); args: VARCHAR,INT,INT; result: VARCHAR; args nullable: true; result nullable: true] IN ('85669', '86197', '88274', '83405', '86475', '85392', '85460', '80348', '81792')) OR ([69: ca_state, VARCHAR(1073741824), true] IN ('CA', 'WA', 'GA'))) OR ([22: cs_sales_price, DECIMAL32(7,2), true] > 500)
+  |  build runtime filters:
+  |  - filter_id = 2, build_expr = (39: c_customer_sk), remote = true
+  |  output columns: 22, 70
+  |  can local shuffle: false
+  |  cardinality: 1135219
+  |
+  |----13:EXCHANGE
+  |       distribution type: SHUFFLE
+  |       partition exprs: [39: c_customer_sk, INT, true]
+  |       cardinality: 90000
+  |
+  6:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [4: cs_bill_customer_sk, INT, true]
+     cardinality: 1297393
+
+PLAN FRAGMENT 3(F08)
+  Fragment Cost: 5472000.0
+
+  Input Partition: HASH_PARTITIONED: 61: ca_address_sk
+  OutPut Partition: HASH_PARTITIONED: 39: c_customer_sk
+  OutPut Exchange Id: 13
+
+  12:Project
+  |  output columns:
+  |  39 <-> [39: c_customer_sk, INT, true]
+  |  69 <-> [69: ca_state, VARCHAR(1073741824), true]
+  |  70 <-> [70: ca_zip, VARCHAR(1073741824), true]
+  |  cardinality: 90000
+  |
+  11:HASH JOIN
+  |  join op: INNER JOIN (PARTITIONED)
+  |  equal join conjunct: [61: ca_address_sk, INT, true] = [43: c_current_addr_sk, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 1, build_expr = (43: c_current_addr_sk), remote = true
+  |  output columns: 39, 69, 70
+  |  can local shuffle: true
+  |  cardinality: 90000
+  |
+  |----10:EXCHANGE
+  |       distribution type: SHUFFLE
+  |       partition exprs: [43: c_current_addr_sk, INT, true]
+  |       cardinality: 90000
+  |
+  8:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [61: ca_address_sk, INT, true]
+     cardinality: 45000
+
+PLAN FRAGMENT 4(F06)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 43: c_current_addr_sk
+  OutPut Exchange Id: 10
+
+  9:IcebergScanNode
+     TABLE: tpcds.customer
+     PREDICATES: 39: c_customer_sk IS NOT NULL
+     TABLE VERSION: Snapshot@(606596394069267299)
+     cardinality=90000
+     avgRowSize=2.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 90000
+
+PLAN FRAGMENT 5(F04)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 61: ca_address_sk
+  OutPut Exchange Id: 08
+
+  7:IcebergScanNode
+     TABLE: tpcds.customer_address
+     PREDICATES: 61: ca_address_sk IS NOT NULL
+     TABLE VERSION: Snapshot@(6178518588637829114)
+     cardinality=45000
+     avgRowSize=3.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 45000
+     probe runtime filters:
+     - filter_id = 1, probe_expr = (61: ca_address_sk)
+
+PLAN FRAGMENT 6(F00)
+  Fragment Cost: 1.841399030616752E7
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 4: cs_bill_customer_sk
+  OutPut Exchange Id: 06
+
+  5:Project
+  |  output columns:
+  |  4 <-> [4: cs_bill_customer_sk, INT, true]
+  |  22 <-> [22: cs_sales_price, DECIMAL32(7,2), true]
+  |  cardinality: 1297393
+  |
+  4:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [1: cs_sold_date_sk, INT, true] = [78: d_date_sk, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 0, build_expr = (78: d_date_sk), remote = false
+  |  output columns: 4, 22
+  |  can local shuffle: true
+  |  cardinality: 1297393
+  |
+  |----3:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 10437
+  |
+  0:IcebergScanNode
+     TABLE: tpcds.catalog_sales
+     PREDICATES: 4: cs_bill_customer_sk IS NOT NULL
+     TABLE VERSION: Snapshot@(3096389489357933185)
+     cardinality=1297393
+     avgRowSize=3.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 1297393
+     probe runtime filters:
+     - filter_id = 0, probe_expr = (1: cs_sold_date_sk)
+     - filter_id = 2, probe_expr = (4: cs_bill_customer_sk)
+
+PLAN FRAGMENT 7(F01)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 03
+
+  2:Project
+  |  output columns:
+  |  78 <-> [78: d_date_sk, INT, true]
+  |  cardinality: 10437
+  |
+  1:IcebergScanNode
+     TABLE: tpcds.date_dim
+     PREDICATES: 88: d_qoy = 2, 84: d_year = 2001
+     MIN/MAX PREDICATES: 88: d_qoy <= 2, 88: d_qoy >= 2, 84: d_year <= 2001, 84: d_year >= 2001
+     TABLE VERSION: Snapshot@(149066723028526449)
+     cardinality=10437
+     avgRowSize=3.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 10437

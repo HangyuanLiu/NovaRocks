@@ -1,0 +1,549 @@
+Explain String
+Planning: 1.16s / Execution: 20.97s / Rows: 1
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+128:PROJECT [s1.h8_30_to_9 AS h8_30_to_9, s2.h9_to_9_30 AS h9_to_9_30, s3.h9_30_to_10 AS h9_30_to_10, s4.h10_to_10_30 AS h10_to_10_30, s5.h10_30_to_11 AS h10_30_to_11, s6.h11_to_11_30 AS h11_to_11_30, s7.h11_30_to_12 AS h11_30_to_12, s8.h12_to_12_30 AS h12_to_12_30] stats={rows=1 conf=estimated} act={rows=1 time=78.2us peak=64B}
+  127:NEST LOOP JOIN (CROSS) stats={rows=1 conf=estimated} act={rows=1 time=4.2us peak=8.1KB}
+    111:NEST LOOP JOIN (CROSS) stats={rows=1 conf=estimated} act={rows=1 time=3.9us peak=8.0KB}
+      95:NEST LOOP JOIN (CROSS) stats={rows=1 conf=estimated} act={rows=1 time=3.8us peak=8.0KB}
+        79:NEST LOOP JOIN (CROSS) stats={rows=1 conf=estimated} act={rows=1 time=5.8us peak=8.0KB}
+          63:NEST LOOP JOIN (CROSS) stats={rows=1 conf=estimated} act={rows=1 time=3.0us peak=8.0KB}
+            47:NEST LOOP JOIN (CROSS) stats={rows=1 conf=estimated} act={rows=1 time=3.0us peak=8.0KB}
+              31:NEST LOOP JOIN (CROSS) stats={rows=1 conf=estimated} act={rows=1 time=7.6us peak=16.0KB}
+                15:PROJECT [h8_30_to_9] stats={rows=1 conf=estimated} act={rows=1 time=9us peak=8.0KB}
+                  14:PROJECT [count(*) AS h8_30_to_9] stats={rows=1 conf=estimated} act={rows=1 time=26.7us peak=8.0KB}
+                    13:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=79.3us peak=64.2KB}
+                      aggregations: count()
+                      12:GATHER stats={rows=1 conf=estimated} act={rows=12 time=14.0us peak=0B}
+                30:PROJECT [h9_to_9_30] stats={rows=1 conf=estimated} act={rows=1 time=5.2us peak=8.0KB}
+                  29:PROJECT [count(*) AS h9_to_9_30] stats={rows=1 conf=estimated} act={rows=1 time=12.2us peak=8.0KB}
+                    28:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=77.9us peak=64.2KB}
+                      aggregations: count()
+                      27:GATHER stats={rows=1 conf=estimated} act={rows=12 time=6.6us peak=0B}
+              46:PROJECT [h9_30_to_10] stats={rows=1 conf=estimated} act={rows=1 time=4.7us peak=8.0KB}
+                45:PROJECT [count(*) AS h9_30_to_10] stats={rows=1 conf=estimated} act={rows=1 time=7us peak=8.0KB}
+                  44:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=85.9us peak=64.2KB}
+                    aggregations: count()
+                    43:GATHER stats={rows=1 conf=estimated} act={rows=12 time=18.6us peak=0B}
+            62:PROJECT [h10_to_10_30] stats={rows=1 conf=estimated} act={rows=1 time=8.7us peak=8.0KB}
+              61:PROJECT [count(*) AS h10_to_10_30] stats={rows=1 conf=estimated} act={rows=1 time=21.5us peak=8.0KB}
+                60:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=13.7ms peak=64.4KB}
+                  aggregations: count()
+                  59:GATHER stats={rows=1 conf=estimated} act={rows=12 time=9.5us peak=0B}
+          78:PROJECT [h10_30_to_11] stats={rows=1 conf=estimated} act={rows=1 time=9.2us peak=8.0KB}
+            77:PROJECT [count(*) AS h10_30_to_11] stats={rows=1 conf=estimated} act={rows=1 time=18.5us peak=8.0KB}
+              76:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=88.0us peak=64.4KB}
+                aggregations: count()
+                75:GATHER stats={rows=1 conf=estimated} act={rows=12 time=3.9ms peak=0B}
+        94:PROJECT [h11_to_11_30] stats={rows=1 conf=estimated} act={rows=1 time=8.3us peak=8.0KB}
+          93:PROJECT [count(*) AS h11_to_11_30] stats={rows=1 conf=estimated} act={rows=1 time=26.0us peak=8.0KB}
+            92:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=13.4ms peak=64.4KB}
+              aggregations: count()
+              91:GATHER stats={rows=1 conf=estimated} act={rows=12 time=9.0us peak=0B}
+      110:PROJECT [h11_30_to_12] stats={rows=1 conf=estimated} act={rows=1 time=4.6us peak=8.0KB}
+        109:PROJECT [count(*) AS h11_30_to_12] stats={rows=1 conf=estimated} act={rows=1 time=10.1us peak=8.0KB}
+          108:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=84.5us peak=64.2KB}
+            aggregations: count()
+            107:GATHER stats={rows=1 conf=estimated} act={rows=12 time=5.3us peak=0B}
+    126:PROJECT [h12_to_12_30] stats={rows=1 conf=estimated} act={rows=1 time=11.2us peak=8.0KB}
+      125:PROJECT [count(*) AS h12_to_12_30] stats={rows=1 conf=estimated} act={rows=1 time=84.3us peak=8.0KB}
+        124:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=256.7us peak=64.4KB}
+          aggregations: count()
+          123:GATHER stats={rows=1 conf=estimated} act={rows=12 time=613.6us peak=0B}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 123
+    PARTITION: UNPARTITIONED
+122:HASH AGGREGATE (LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=861.9us peak=1.0MB}
+  aggregations: count()
+  121:HASH JOIN (BROADCAST, INNER, eq: [ss_store_sk = s_store_sk]) stats={rows=2099 conf=estimated} act={rows=4536 time=23.4ms peak=311.8KB}
+    build runtime filters:
+    - filter_id = 23, build_expr = (s_store_sk)
+    118:HASH JOIN (BROADCAST, INNER, eq: [ss_sold_time_sk = time_dim.t_time_sk]) stats={rows=4664 conf=estimated} act={rows=33048 time=88.9ms peak=4.7MB}
+      build runtime filters:
+      - filter_id = 22, build_expr = (time_dim.t_time_sk)
+      115:HASH JOIN (BROADCAST, INNER, eq: [ss_hdemo_sk = household_demographics.hd_demo_sk]) stats={rows=131883 conf=estimated} act={rows=711585 time=205.4ms peak=8.4MB}
+        build runtime filters:
+        - filter_id = 21, build_expr = (household_demographics.hd_demo_sk)
+        112:SCAN tpcds.store_sales stats={rows=2508180 conf=estimated} act={rows=2653171 time=66.3ms peak=0B}
+             TABLE: tpcds.store_sales
+             columns: ss_sold_time_sk, ss_hdemo_sk, ss_store_sk
+             min-max stats
+             predicates: ss_hdemo_sk IS NOT NULL AND ss_sold_time_sk IS NOT NULL AND ss_store_sk IS NOT NULL
+            probe runtime filters:
+            - filter_id = 21, probe_expr = (ss_hdemo_sk)
+            - filter_id = 22, probe_expr = (ss_sold_time_sk)
+            - filter_id = 23, probe_expr = (ss_store_sk)
+        114:GATHER stats={rows=384 conf=estimated} act={rows=5760 time=690.5us peak=0B}
+      117:GATHER stats={rows=1647 conf=estimated} act={rows=5400 time=35.9us peak=0B}
+    120:GATHER stats={rows=3 conf=estimated} act={rows=3 time=14.0ms peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 120
+    PARTITION: UNPARTITIONED
+119:SCAN tpcds.store stats={rows=3 conf=estimated} act={rows=1 time=45.2us peak=4.8KB}
+     TABLE: tpcds.store
+     columns: s_store_sk, s_store_name
+     min-max stats
+     predicates: s_store_name = 'ese' AND s_store_sk IS NOT NULL
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 117
+    PARTITION: UNPARTITIONED
+116:SCAN tpcds.time_dim stats={rows=1647 conf=estimated} act={rows=1800 time=100.5us peak=1.1MB}
+     TABLE: tpcds.time_dim
+     columns: t_time_sk, t_hour, t_minute
+     min-max stats
+     predicates: t_hour = 12 AND t_minute < 30 AND t_time_sk IS NOT NULL
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 114
+    PARTITION: UNPARTITIONED
+113:SCAN tpcds.household_demographics stats={rows=384 conf=estimated} act={rows=1920 time=119.9us peak=935.7KB}
+     TABLE: tpcds.household_demographics
+     columns: hd_demo_sk, hd_dep_count, hd_vehicle_count
+     min-max stats
+     predicates: hd_dep_count = 4 AND hd_vehicle_count <= 4 + 2 OR hd_dep_count = 2 AND hd_vehicle_count <= 2 + 2 OR hd_dep_count = 0 AND hd_vehicle_count <= 0 + 2 AND hd_dep_count IN (4, 2, 0) AND hd_demo_sk IS NOT NULL
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 107
+    PARTITION: UNPARTITIONED
+106:HASH AGGREGATE (LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=2.4ms peak=1.0MB}
+  aggregations: count()
+  105:HASH JOIN (BROADCAST, INNER, eq: [ss_store_sk = s_store_sk]) stats={rows=2099 conf=estimated} act={rows=4132 time=14.7ms peak=334.6KB}
+    build runtime filters:
+    - filter_id = 20, build_expr = (s_store_sk)
+    102:HASH JOIN (BROADCAST, INNER, eq: [ss_sold_time_sk = time_dim.t_time_sk]) stats={rows=4664 conf=estimated} act={rows=29291 time=46.1ms peak=4.6MB}
+      build runtime filters:
+      - filter_id = 19, build_expr = (time_dim.t_time_sk)
+      99:HASH JOIN (BROADCAST, INNER, eq: [ss_hdemo_sk = household_demographics.hd_demo_sk]) stats={rows=131883 conf=estimated} act={rows=711585 time=248.1ms peak=8.3MB}
+        build runtime filters:
+        - filter_id = 18, build_expr = (household_demographics.hd_demo_sk)
+        96:SCAN tpcds.store_sales stats={rows=2508180 conf=estimated} act={rows=2653171 time=27.5ms peak=0B}
+             TABLE: tpcds.store_sales
+             columns: ss_sold_time_sk, ss_hdemo_sk, ss_store_sk
+             min-max stats
+             predicates: ss_hdemo_sk IS NOT NULL AND ss_sold_time_sk IS NOT NULL AND ss_store_sk IS NOT NULL
+            probe runtime filters:
+            - filter_id = 18, probe_expr = (ss_hdemo_sk)
+            - filter_id = 19, probe_expr = (ss_sold_time_sk)
+            - filter_id = 20, probe_expr = (ss_store_sk)
+        98:GATHER stats={rows=384 conf=estimated} act={rows=5760 time=1.7ms peak=0B}
+      101:GATHER stats={rows=1647 conf=estimated} act={rows=5400 time=8.9us peak=0B}
+    104:GATHER stats={rows=3 conf=estimated} act={rows=3 time=8.8us peak=0B}
+PLAN FRAGMENT 6
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 104
+    PARTITION: UNPARTITIONED
+103:SCAN tpcds.store stats={rows=3 conf=estimated} act={rows=1 time=22.2us peak=4.8KB}
+     TABLE: tpcds.store
+     columns: s_store_sk, s_store_name
+     min-max stats
+     predicates: s_store_name = 'ese' AND s_store_sk IS NOT NULL
+PLAN FRAGMENT 7
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 101
+    PARTITION: UNPARTITIONED
+100:SCAN tpcds.time_dim stats={rows=1647 conf=estimated} act={rows=1800 time=152.9us peak=1.1MB}
+     TABLE: tpcds.time_dim
+     columns: t_time_sk, t_hour, t_minute
+     min-max stats
+     predicates: t_hour = 11 AND t_minute >= 30 AND t_time_sk IS NOT NULL
+PLAN FRAGMENT 8
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 98
+    PARTITION: UNPARTITIONED
+97:SCAN tpcds.household_demographics stats={rows=384 conf=estimated} act={rows=1920 time=129.7us peak=935.7KB}
+     TABLE: tpcds.household_demographics
+     columns: hd_demo_sk, hd_dep_count, hd_vehicle_count
+     min-max stats
+     predicates: hd_dep_count = 4 AND hd_vehicle_count <= 4 + 2 OR hd_dep_count = 2 AND hd_vehicle_count <= 2 + 2 OR hd_dep_count = 0 AND hd_vehicle_count <= 0 + 2 AND hd_dep_count IN (4, 2, 0) AND hd_demo_sk IS NOT NULL
+PLAN FRAGMENT 9
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 91
+    PARTITION: UNPARTITIONED
+90:HASH AGGREGATE (LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=12.7ms peak=1014.4KB}
+  aggregations: count()
+  89:HASH JOIN (BROADCAST, INNER, eq: [ss_store_sk = s_store_sk]) stats={rows=2099 conf=estimated} act={rows=3963 time=14.1ms peak=268.9KB}
+    build runtime filters:
+    - filter_id = 17, build_expr = (s_store_sk)
+    86:HASH JOIN (BROADCAST, INNER, eq: [ss_sold_time_sk = time_dim.t_time_sk]) stats={rows=4664 conf=estimated} act={rows=29768 time=87.4ms peak=4.5MB}
+      build runtime filters:
+      - filter_id = 16, build_expr = (time_dim.t_time_sk)
+      83:HASH JOIN (BROADCAST, INNER, eq: [ss_hdemo_sk = household_demographics.hd_demo_sk]) stats={rows=131883 conf=estimated} act={rows=711585 time=175.3ms peak=8.3MB}
+        build runtime filters:
+        - filter_id = 15, build_expr = (household_demographics.hd_demo_sk)
+        80:SCAN tpcds.store_sales stats={rows=2508180 conf=estimated} act={rows=2653171 time=19.7ms peak=0B}
+             TABLE: tpcds.store_sales
+             columns: ss_sold_time_sk, ss_hdemo_sk, ss_store_sk
+             min-max stats
+             predicates: ss_hdemo_sk IS NOT NULL AND ss_sold_time_sk IS NOT NULL AND ss_store_sk IS NOT NULL
+            probe runtime filters:
+            - filter_id = 15, probe_expr = (ss_hdemo_sk)
+            - filter_id = 16, probe_expr = (ss_sold_time_sk)
+            - filter_id = 17, probe_expr = (ss_store_sk)
+        82:GATHER stats={rows=384 conf=estimated} act={rows=5760 time=20.2us peak=0B}
+      85:GATHER stats={rows=1647 conf=estimated} act={rows=5400 time=150.3us peak=0B}
+    88:GATHER stats={rows=3 conf=estimated} act={rows=3 time=1.5ms peak=0B}
+PLAN FRAGMENT 10
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 88
+    PARTITION: UNPARTITIONED
+87:SCAN tpcds.store stats={rows=3 conf=estimated} act={rows=1 time=22.2us peak=4.8KB}
+     TABLE: tpcds.store
+     columns: s_store_sk, s_store_name
+     min-max stats
+     predicates: s_store_name = 'ese' AND s_store_sk IS NOT NULL
+PLAN FRAGMENT 11
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 85
+    PARTITION: UNPARTITIONED
+84:SCAN tpcds.time_dim stats={rows=1647 conf=estimated} act={rows=1800 time=102.4us peak=907.6KB}
+     TABLE: tpcds.time_dim
+     columns: t_time_sk, t_hour, t_minute
+     min-max stats
+     predicates: t_hour = 11 AND t_minute < 30 AND t_time_sk IS NOT NULL
+PLAN FRAGMENT 12
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 82
+    PARTITION: UNPARTITIONED
+81:SCAN tpcds.household_demographics stats={rows=384 conf=estimated} act={rows=1920 time=240.1us peak=935.7KB}
+     TABLE: tpcds.household_demographics
+     columns: hd_demo_sk, hd_dep_count, hd_vehicle_count
+     min-max stats
+     predicates: hd_dep_count = 4 AND hd_vehicle_count <= 4 + 2 OR hd_dep_count = 2 AND hd_vehicle_count <= 2 + 2 OR hd_dep_count = 0 AND hd_vehicle_count <= 0 + 2 AND hd_dep_count IN (4, 2, 0) AND hd_demo_sk IS NOT NULL
+PLAN FRAGMENT 13
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 75
+    PARTITION: UNPARTITIONED
+74:HASH AGGREGATE (LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=1.1ms peak=1.0MB}
+  aggregations: count()
+  73:HASH JOIN (BROADCAST, INNER, eq: [ss_store_sk = s_store_sk]) stats={rows=2099 conf=estimated} act={rows=7118 time=37.8ms peak=439.5KB}
+    build runtime filters:
+    - filter_id = 14, build_expr = (s_store_sk)
+    70:HASH JOIN (BROADCAST, INNER, eq: [ss_sold_time_sk = time_dim.t_time_sk]) stats={rows=4664 conf=estimated} act={rows=47686 time=42.1ms peak=4.4MB}
+      build runtime filters:
+      - filter_id = 13, build_expr = (time_dim.t_time_sk)
+      67:HASH JOIN (BROADCAST, INNER, eq: [ss_hdemo_sk = household_demographics.hd_demo_sk]) stats={rows=131883 conf=estimated} act={rows=711585 time=174.5ms peak=7.7MB}
+        build runtime filters:
+        - filter_id = 12, build_expr = (household_demographics.hd_demo_sk)
+        64:SCAN tpcds.store_sales stats={rows=2508180 conf=estimated} act={rows=2653171 time=34.3ms peak=0B}
+             TABLE: tpcds.store_sales
+             columns: ss_sold_time_sk, ss_hdemo_sk, ss_store_sk
+             min-max stats
+             predicates: ss_hdemo_sk IS NOT NULL AND ss_sold_time_sk IS NOT NULL AND ss_store_sk IS NOT NULL
+            probe runtime filters:
+            - filter_id = 12, probe_expr = (ss_hdemo_sk)
+            - filter_id = 13, probe_expr = (ss_sold_time_sk)
+            - filter_id = 14, probe_expr = (ss_store_sk)
+        66:GATHER stats={rows=384 conf=estimated} act={rows=5760 time=2.4ms peak=0B}
+      69:GATHER stats={rows=1647 conf=estimated} act={rows=5400 time=76.7us peak=0B}
+    72:GATHER stats={rows=3 conf=estimated} act={rows=3 time=4.4ms peak=0B}
+PLAN FRAGMENT 14
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 72
+    PARTITION: UNPARTITIONED
+71:SCAN tpcds.store stats={rows=3 conf=estimated} act={rows=1 time=27.2us peak=4.8KB}
+     TABLE: tpcds.store
+     columns: s_store_sk, s_store_name
+     min-max stats
+     predicates: s_store_name = 'ese' AND s_store_sk IS NOT NULL
+PLAN FRAGMENT 15
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 69
+    PARTITION: UNPARTITIONED
+68:SCAN tpcds.time_dim stats={rows=1647 conf=estimated} act={rows=1800 time=127.0us peak=1.1MB}
+     TABLE: tpcds.time_dim
+     columns: t_time_sk, t_hour, t_minute
+     min-max stats
+     predicates: t_hour = 10 AND t_minute >= 30 AND t_time_sk IS NOT NULL
+PLAN FRAGMENT 16
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 66
+    PARTITION: UNPARTITIONED
+65:SCAN tpcds.household_demographics stats={rows=384 conf=estimated} act={rows=1920 time=270.9us peak=935.7KB}
+     TABLE: tpcds.household_demographics
+     columns: hd_demo_sk, hd_dep_count, hd_vehicle_count
+     min-max stats
+     predicates: hd_dep_count = 4 AND hd_vehicle_count <= 4 + 2 OR hd_dep_count = 2 AND hd_vehicle_count <= 2 + 2 OR hd_dep_count = 0 AND hd_vehicle_count <= 0 + 2 AND hd_dep_count IN (4, 2, 0) AND hd_demo_sk IS NOT NULL
+PLAN FRAGMENT 17
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 59
+    PARTITION: UNPARTITIONED
+58:HASH AGGREGATE (LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=5.3ms peak=1.0MB}
+  aggregations: count()
+  57:HASH JOIN (BROADCAST, INNER, eq: [ss_store_sk = s_store_sk]) stats={rows=2099 conf=estimated} act={rows=7541 time=24.8ms peak=308.4KB}
+    build runtime filters:
+    - filter_id = 11, build_expr = (s_store_sk)
+    54:HASH JOIN (BROADCAST, INNER, eq: [ss_sold_time_sk = time_dim.t_time_sk]) stats={rows=4664 conf=estimated} act={rows=48491 time=41.2ms peak=3.7MB}
+      build runtime filters:
+      - filter_id = 10, build_expr = (time_dim.t_time_sk)
+      51:HASH JOIN (BROADCAST, INNER, eq: [ss_hdemo_sk = household_demographics.hd_demo_sk]) stats={rows=131883 conf=estimated} act={rows=711585 time=174.8ms peak=7.1MB}
+        build runtime filters:
+        - filter_id = 9, build_expr = (household_demographics.hd_demo_sk)
+        48:SCAN tpcds.store_sales stats={rows=2508180 conf=estimated} act={rows=2653171 time=45.2ms peak=0B}
+             TABLE: tpcds.store_sales
+             columns: ss_sold_time_sk, ss_hdemo_sk, ss_store_sk
+             min-max stats
+             predicates: ss_hdemo_sk IS NOT NULL AND ss_sold_time_sk IS NOT NULL AND ss_store_sk IS NOT NULL
+            probe runtime filters:
+            - filter_id = 9, probe_expr = (ss_hdemo_sk)
+            - filter_id = 10, probe_expr = (ss_sold_time_sk)
+            - filter_id = 11, probe_expr = (ss_store_sk)
+        50:GATHER stats={rows=384 conf=estimated} act={rows=5760 time=6.1ms peak=0B}
+      53:GATHER stats={rows=1647 conf=estimated} act={rows=5400 time=8.4us peak=0B}
+    56:GATHER stats={rows=3 conf=estimated} act={rows=3 time=8.7us peak=0B}
+PLAN FRAGMENT 18
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 56
+    PARTITION: UNPARTITIONED
+55:SCAN tpcds.store stats={rows=3 conf=estimated} act={rows=1 time=28.9us peak=4.8KB}
+     TABLE: tpcds.store
+     columns: s_store_sk, s_store_name
+     min-max stats
+     predicates: s_store_name = 'ese' AND s_store_sk IS NOT NULL
+PLAN FRAGMENT 19
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 53
+    PARTITION: UNPARTITIONED
+52:SCAN tpcds.time_dim stats={rows=1647 conf=estimated} act={rows=1800 time=1.7ms peak=981.9KB}
+     TABLE: tpcds.time_dim
+     columns: t_time_sk, t_hour, t_minute
+     min-max stats
+     predicates: t_hour = 10 AND t_minute < 30 AND t_time_sk IS NOT NULL
+PLAN FRAGMENT 20
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 50
+    PARTITION: UNPARTITIONED
+49:SCAN tpcds.household_demographics stats={rows=384 conf=estimated} act={rows=1920 time=283.6us peak=971.1KB}
+     TABLE: tpcds.household_demographics
+     columns: hd_demo_sk, hd_dep_count, hd_vehicle_count
+     min-max stats
+     predicates: hd_dep_count = 4 AND hd_vehicle_count <= 4 + 2 OR hd_dep_count = 2 AND hd_vehicle_count <= 2 + 2 OR hd_dep_count = 0 AND hd_vehicle_count <= 0 + 2 AND hd_dep_count IN (4, 2, 0) AND hd_demo_sk IS NOT NULL
+PLAN FRAGMENT 21
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 43
+    PARTITION: UNPARTITIONED
+42:HASH AGGREGATE (LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=454.1us peak=1.0MB}
+  aggregations: count()
+  41:HASH JOIN (BROADCAST, INNER, eq: [ss_store_sk = s_store_sk]) stats={rows=2099 conf=estimated} act={rows=4567 time=11.5ms peak=360.8KB}
+    build runtime filters:
+    - filter_id = 8, build_expr = (s_store_sk)
+    38:HASH JOIN (BROADCAST, INNER, eq: [ss_sold_time_sk = time_dim.t_time_sk]) stats={rows=4664 conf=estimated} act={rows=33679 time=34.4ms peak=4.6MB}
+      build runtime filters:
+      - filter_id = 7, build_expr = (time_dim.t_time_sk)
+      35:HASH JOIN (BROADCAST, INNER, eq: [ss_hdemo_sk = household_demographics.hd_demo_sk]) stats={rows=131883 conf=estimated} act={rows=711585 time=217.6ms peak=8.3MB}
+        build runtime filters:
+        - filter_id = 6, build_expr = (household_demographics.hd_demo_sk)
+        32:SCAN tpcds.store_sales stats={rows=2508180 conf=estimated} act={rows=2653171 time=31.2ms peak=0B}
+             TABLE: tpcds.store_sales
+             columns: ss_sold_time_sk, ss_hdemo_sk, ss_store_sk
+             min-max stats
+             predicates: ss_hdemo_sk IS NOT NULL AND ss_sold_time_sk IS NOT NULL AND ss_store_sk IS NOT NULL
+            probe runtime filters:
+            - filter_id = 6, probe_expr = (ss_hdemo_sk)
+            - filter_id = 7, probe_expr = (ss_sold_time_sk)
+            - filter_id = 8, probe_expr = (ss_store_sk)
+        34:GATHER stats={rows=384 conf=estimated} act={rows=5760 time=7.8us peak=0B}
+      37:GATHER stats={rows=1647 conf=estimated} act={rows=5400 time=590.6us peak=0B}
+    40:GATHER stats={rows=3 conf=estimated} act={rows=3 time=113.1us peak=0B}
+PLAN FRAGMENT 22
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 40
+    PARTITION: UNPARTITIONED
+39:SCAN tpcds.store stats={rows=3 conf=estimated} act={rows=1 time=19.4us peak=4.8KB}
+     TABLE: tpcds.store
+     columns: s_store_sk, s_store_name
+     min-max stats
+     predicates: s_store_name = 'ese' AND s_store_sk IS NOT NULL
+PLAN FRAGMENT 23
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 37
+    PARTITION: UNPARTITIONED
+36:SCAN tpcds.time_dim stats={rows=1647 conf=estimated} act={rows=1800 time=44.5us peak=1.1MB}
+     TABLE: tpcds.time_dim
+     columns: t_time_sk, t_hour, t_minute
+     min-max stats
+     predicates: t_hour = 9 AND t_minute >= 30 AND t_time_sk IS NOT NULL
+PLAN FRAGMENT 24
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 34
+    PARTITION: UNPARTITIONED
+33:SCAN tpcds.household_demographics stats={rows=384 conf=estimated} act={rows=1920 time=49.2us peak=1.1MB}
+     TABLE: tpcds.household_demographics
+     columns: hd_demo_sk, hd_dep_count, hd_vehicle_count
+     min-max stats
+     predicates: hd_dep_count = 4 AND hd_vehicle_count <= 4 + 2 OR hd_dep_count = 2 AND hd_vehicle_count <= 2 + 2 OR hd_dep_count = 0 AND hd_vehicle_count <= 0 + 2 AND hd_dep_count IN (4, 2, 0) AND hd_demo_sk IS NOT NULL
+PLAN FRAGMENT 25
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 27
+    PARTITION: UNPARTITIONED
+26:HASH AGGREGATE (LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=664.3us peak=1021.9KB}
+  aggregations: count()
+  25:HASH JOIN (BROADCAST, INNER, eq: [ss_store_sk = s_store_sk]) stats={rows=2099 conf=estimated} act={rows=4729 time=17.5ms peak=289.8KB}
+    build runtime filters:
+    - filter_id = 5, build_expr = (s_store_sk)
+    22:HASH JOIN (BROADCAST, INNER, eq: [ss_sold_time_sk = time_dim.t_time_sk]) stats={rows=4664 conf=estimated} act={rows=34010 time=45.8ms peak=4.3MB}
+      build runtime filters:
+      - filter_id = 4, build_expr = (time_dim.t_time_sk)
+      19:HASH JOIN (BROADCAST, INNER, eq: [ss_hdemo_sk = household_demographics.hd_demo_sk]) stats={rows=131883 conf=estimated} act={rows=711585 time=199.2ms peak=7.7MB}
+        build runtime filters:
+        - filter_id = 3, build_expr = (household_demographics.hd_demo_sk)
+        16:SCAN tpcds.store_sales stats={rows=2508180 conf=estimated} act={rows=2653171 time=32.8ms peak=0B}
+             TABLE: tpcds.store_sales
+             columns: ss_sold_time_sk, ss_hdemo_sk, ss_store_sk
+             min-max stats
+             predicates: ss_hdemo_sk IS NOT NULL AND ss_sold_time_sk IS NOT NULL AND ss_store_sk IS NOT NULL
+            probe runtime filters:
+            - filter_id = 3, probe_expr = (ss_hdemo_sk)
+            - filter_id = 4, probe_expr = (ss_sold_time_sk)
+            - filter_id = 5, probe_expr = (ss_store_sk)
+        18:GATHER stats={rows=384 conf=estimated} act={rows=5760 time=7.0us peak=0B}
+      21:GATHER stats={rows=1647 conf=estimated} act={rows=5400 time=2.4ms peak=0B}
+    24:GATHER stats={rows=3 conf=estimated} act={rows=3 time=5.5ms peak=0B}
+PLAN FRAGMENT 26
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 24
+    PARTITION: UNPARTITIONED
+23:SCAN tpcds.store stats={rows=3 conf=estimated} act={rows=1 time=16.1us peak=4.8KB}
+     TABLE: tpcds.store
+     columns: s_store_sk, s_store_name
+     min-max stats
+     predicates: s_store_name = 'ese' AND s_store_sk IS NOT NULL
+PLAN FRAGMENT 27
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 21
+    PARTITION: UNPARTITIONED
+20:SCAN tpcds.time_dim stats={rows=1647 conf=estimated} act={rows=1800 time=1.7ms peak=884.4KB}
+     TABLE: tpcds.time_dim
+     columns: t_time_sk, t_hour, t_minute
+     min-max stats
+     predicates: t_hour = 9 AND t_minute < 30 AND t_time_sk IS NOT NULL
+PLAN FRAGMENT 28
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 18
+    PARTITION: UNPARTITIONED
+17:SCAN tpcds.household_demographics stats={rows=384 conf=estimated} act={rows=1920 time=427.0us peak=1.1MB}
+     TABLE: tpcds.household_demographics
+     columns: hd_demo_sk, hd_dep_count, hd_vehicle_count
+     min-max stats
+     predicates: hd_dep_count = 4 AND hd_vehicle_count <= 4 + 2 OR hd_dep_count = 2 AND hd_vehicle_count <= 2 + 2 OR hd_dep_count = 0 AND hd_vehicle_count <= 0 + 2 AND hd_dep_count IN (4, 2, 0) AND hd_demo_sk IS NOT NULL
+PLAN FRAGMENT 29
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 12
+    PARTITION: UNPARTITIONED
+11:HASH AGGREGATE (LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=390.9us peak=984.4KB}
+  aggregations: count()
+  10:HASH JOIN (BROADCAST, INNER, eq: [ss_store_sk = s_store_sk]) stats={rows=2099 conf=estimated} act={rows=2337 time=24.3ms peak=203.6KB}
+    build runtime filters:
+    - filter_id = 2, build_expr = (s_store_sk)
+    7:HASH JOIN (BROADCAST, INNER, eq: [ss_sold_time_sk = time_dim.t_time_sk]) stats={rows=4664 conf=estimated} act={rows=18900 time=44.4ms peak=4.1MB}
+      build runtime filters:
+      - filter_id = 1, build_expr = (time_dim.t_time_sk)
+      4:HASH JOIN (BROADCAST, INNER, eq: [ss_hdemo_sk = household_demographics.hd_demo_sk]) stats={rows=131883 conf=estimated} act={rows=711585 time=147.3ms peak=7.1MB}
+        build runtime filters:
+        - filter_id = 0, build_expr = (household_demographics.hd_demo_sk)
+        1:SCAN tpcds.store_sales stats={rows=2508180 conf=estimated} act={rows=2653171 time=17.8ms peak=0B}
+             TABLE: tpcds.store_sales
+             columns: ss_sold_time_sk, ss_hdemo_sk, ss_store_sk
+             min-max stats
+             predicates: ss_hdemo_sk IS NOT NULL AND ss_sold_time_sk IS NOT NULL AND ss_store_sk IS NOT NULL
+            probe runtime filters:
+            - filter_id = 0, probe_expr = (ss_hdemo_sk)
+            - filter_id = 1, probe_expr = (ss_sold_time_sk)
+            - filter_id = 2, probe_expr = (ss_store_sk)
+        3:GATHER stats={rows=384 conf=estimated} act={rows=5760 time=9.1us peak=0B}
+      6:GATHER stats={rows=1647 conf=estimated} act={rows=5400 time=7.9us peak=0B}
+    9:GATHER stats={rows=3 conf=estimated} act={rows=3 time=3.3ms peak=0B}
+PLAN FRAGMENT 30
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 9
+    PARTITION: UNPARTITIONED
+8:SCAN tpcds.store stats={rows=3 conf=estimated} act={rows=1 time=29.7us peak=4.8KB}
+     TABLE: tpcds.store
+     columns: s_store_sk, s_store_name
+     min-max stats
+     predicates: s_store_name = 'ese' AND s_store_sk IS NOT NULL
+PLAN FRAGMENT 31
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 6
+    PARTITION: UNPARTITIONED
+5:SCAN tpcds.time_dim stats={rows=1647 conf=estimated} act={rows=1800 time=105.2us peak=1.1MB}
+     TABLE: tpcds.time_dim
+     columns: t_time_sk, t_hour, t_minute
+     min-max stats
+     predicates: t_hour = 8 AND t_minute >= 30 AND t_time_sk IS NOT NULL
+PLAN FRAGMENT 32
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: UNPARTITIONED
+2:SCAN tpcds.household_demographics stats={rows=384 conf=estimated} act={rows=1920 time=962.2us peak=730.7KB}
+     TABLE: tpcds.household_demographics
+     columns: hd_demo_sk, hd_dep_count, hd_vehicle_count
+     min-max stats
+     predicates: hd_dep_count = 4 AND hd_vehicle_count <= 4 + 2 OR hd_dep_count = 2 AND hd_vehicle_count <= 2 + 2 OR hd_dep_count = 0 AND hd_vehicle_count <= 0 + 2 AND hd_dep_count IN (4, 2, 0) AND hd_demo_sk IS NOT NULL

@@ -1,0 +1,193 @@
+-- engine=starrocks
+-- suite=tpc-ds
+-- case=q96
+-- file=/Users/harbor/project/NovaRocks/sql-tests/tpc-ds/sql/q96.sql
+-- elapsed_sec=0.078
+-- exit_code=0
+
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 1.6049754384000003E8
+  Memory: 60434.8
+
+PLAN FRAGMENT 0(F08)
+  Fragment Cost: 32.0
+  Output Exprs:84: count
+  Input Partition: UNPARTITIONED
+  RESULT SINK
+
+  20:MERGING-EXCHANGE
+     distribution type: GATHER
+     limit: 100
+     cardinality: 1
+
+PLAN FRAGMENT 1(F07)
+  Fragment Cost: 68.0
+
+  Input Partition: UNPARTITIONED
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 20
+
+  19:TOP-N
+  |  order by: [84, BIGINT, false] ASC
+  |  offset: 0
+  |  limit: 100
+  |  cardinality: 1
+  |
+  18:AGGREGATE (merge finalize)
+  |  aggregate: count[([84: count, BIGINT, false]); args: ; result: BIGINT; args nullable: true; result nullable: false]
+  |  cardinality: 1
+  |
+  17:EXCHANGE
+     distribution type: GATHER
+     cardinality: 1
+
+PLAN FRAGMENT 2(F00)
+  Fragment Cost: 8.041488502000001E7
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 17
+
+  16:AGGREGATE (update serialize)
+  |  aggregate: count[(*); args: ; result: BIGINT; args nullable: false; result nullable: false]
+  |  cardinality: 1
+  |
+  15:Project
+  |  output columns:
+  |  86 <-> 1
+  |  cardinality: 2592364
+  |
+  14:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [8: ss_store_sk, INT, true] = [51: s_store_sk, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 2, build_expr = (51: s_store_sk), remote = false
+  |  output columns: 51
+  |  can local shuffle: true
+  |  cardinality: 2592364
+  |
+  |----13:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 12
+  |
+  10:Project
+  |  output columns:
+  |  8 <-> [8: ss_store_sk, INT, true]
+  |  cardinality: 2592364
+  |
+  9:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [6: ss_hdemo_sk, INT, true] = [28: hd_demo_sk, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 1, build_expr = (28: hd_demo_sk), remote = false
+  |  output columns: 8
+  |  can local shuffle: false
+  |  cardinality: 2592364
+  |
+  |----8:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 3600
+  |
+  5:Project
+  |  output columns:
+  |  6 <-> [6: ss_hdemo_sk, INT, true]
+  |  8 <-> [8: ss_store_sk, INT, true]
+  |  cardinality: 2592364
+  |
+  4:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [2: ss_sold_time_sk, INT, true] = [37: t_time_sk, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 0, build_expr = (37: t_time_sk), remote = false
+  |  output columns: 6, 8
+  |  can local shuffle: false
+  |  cardinality: 2592364
+  |
+  |----3:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 3939
+  |
+  0:IcebergScanNode
+     TABLE: tpcds.store_sales
+     PREDICATES: 6: ss_hdemo_sk IS NOT NULL
+     TABLE VERSION: Snapshot@(7480037505330912616)
+     cardinality=2592364
+     avgRowSize=3.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 2592364
+     probe runtime filters:
+     - filter_id = 0, probe_expr = (2: ss_sold_time_sk)
+     - filter_id = 1, probe_expr = (6: ss_hdemo_sk)
+     - filter_id = 2, probe_expr = (8: ss_store_sk)
+
+PLAN FRAGMENT 3(F05)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 13
+
+  12:Project
+  |  output columns:
+  |  51 <-> [51: s_store_sk, INT, true]
+  |  cardinality: 12
+  |
+  11:IcebergScanNode
+     TABLE: tpcds.store
+     PREDICATES: 56: s_store_name = 'ese'
+     MIN/MAX PREDICATES: 56: s_store_name <= 'ese', 56: s_store_name >= 'ese'
+     TABLE VERSION: Snapshot@(7269431241370138871)
+     cardinality=12
+     avgRowSize=2.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 12
+
+PLAN FRAGMENT 4(F03)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 08
+
+  7:Project
+  |  output columns:
+  |  28 <-> [28: hd_demo_sk, INT, true]
+  |  cardinality: 3600
+  |
+  6:IcebergScanNode
+     TABLE: tpcds.household_demographics
+     PREDICATES: 31: hd_dep_count = 7
+     MIN/MAX PREDICATES: 31: hd_dep_count <= 7, 31: hd_dep_count >= 7
+     TABLE VERSION: Snapshot@(7298886051705637477)
+     cardinality=3600
+     avgRowSize=2.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 3600
+
+PLAN FRAGMENT 5(F01)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 03
+
+  2:Project
+  |  output columns:
+  |  37 <-> [37: t_time_sk, INT, true]
+  |  cardinality: 3939
+  |
+  1:IcebergScanNode
+     TABLE: tpcds.time_dim
+     PREDICATES: 40: t_hour = 20, 41: t_minute >= 30
+     MIN/MAX PREDICATES: 40: t_hour <= 20, 40: t_hour >= 20, 41: t_minute >= 30
+     TABLE VERSION: Snapshot@(6706575164464374041)
+     cardinality=3939
+     avgRowSize=3.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 3939

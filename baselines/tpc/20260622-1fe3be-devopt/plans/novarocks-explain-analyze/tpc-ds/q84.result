@@ -1,0 +1,103 @@
+Explain String
+Planning: 110.0ms / Execution: 401.8ms / Rows: 25
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+19:MERGING-EXCHANGE stats={rows=100 conf=estimated} act={rows=75 time=34.7us peak=1.7KB}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 19
+    PARTITION: UNPARTITIONED
+18:LOCAL TOP-N (limit=100, offset=0) [c_customer_id ASC NULLS FIRST] stats={rows=100 conf=estimated} act={rows=50 time=42.0us peak=11.7KB}
+  17:PROJECT [c_customer_id AS customer_id, CAST(coalesce(c_last_name, '') AS Boolean) OR CAST(', ' AS Boolean) OR CAST(coalesce(c_first_name, '') AS Boolean) AS customername] stats={rows=6728 conf=estimated} act={rows=25 time=235.0us peak=5.1KB}
+    16:HASH JOIN (BROADCAST, INNER, eq: [sr_cdemo_sk = cd_demo_sk]) stats={rows=6728 conf=estimated} act={rows=637 time=1.1ms peak=5.5MB}
+      build runtime filters:
+      - filter_id = 4, build_expr = (cd_demo_sk)
+      1:SCAN tpcds.store_returns stats={rows=277631 conf=estimated} act={rows=277631 time=144.2us peak=0B}
+           TABLE: tpcds.store_returns
+           columns: sr_cdemo_sk
+           min-max stats
+           predicates: sr_cdemo_sk IS NOT NULL
+          probe runtime filters:
+          - filter_id = 4, probe_expr = (sr_cdemo_sk)
+      15:GATHER stats={rows=6273 conf=estimated} act={rows=612 time=203.4us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 15
+    PARTITION: UNPARTITIONED
+14:HASH JOIN (BROADCAST, INNER, eq: [cd_demo_sk = c_current_cdemo_sk]) stats={rows=6273 conf=estimated} act={rows=816 time=1.7ms peak=5.7MB}
+  build runtime filters:
+  - filter_id = 3, build_expr = (c_current_cdemo_sk)
+  2:SCAN tpcds.customer_demographics stats={rows=1728720 conf=estimated} act={rows=118981 time=394.8us peak=0B}
+       TABLE: tpcds.customer_demographics
+       columns: cd_demo_sk
+       min-max stats
+       predicates: cd_demo_sk IS NOT NULL
+      probe runtime filters:
+      - filter_id = 3, probe_expr = (cd_demo_sk)
+  13:GATHER stats={rows=6273 conf=estimated} act={rows=612 time=190.1us peak=0B}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 13
+    PARTITION: UNPARTITIONED
+12:HASH JOIN (BROADCAST, INNER, eq: [c_current_hdemo_sk = hd_demo_sk]) stats={rows=6273 conf=estimated} act={rows=4524 time=1.2ms peak=4.3MB}
+  build runtime filters:
+  - filter_id = 2, build_expr = (hd_demo_sk)
+  6:HASH JOIN (BROADCAST, INNER, eq: [c_current_addr_sk = ca_address_sk]) stats={rows=21832 conf=estimated} act={rows=1596 time=286.4us peak=818.8KB}
+    build runtime filters:
+    - filter_id = 0, build_expr = (ca_address_sk)
+    3:SCAN tpcds.customer stats={rows=83924 conf=estimated} act={rows=17698 time=4.0ms peak=0B}
+         TABLE: tpcds.customer
+         columns: c_customer_id, c_current_cdemo_sk, c_current_hdemo_sk, c_current_addr_sk, c_first_name, c_last_name
+         min-max stats
+         predicates: c_current_addr_sk IS NOT NULL AND c_current_cdemo_sk IS NOT NULL AND c_current_hdemo_sk IS NOT NULL
+        probe runtime filters:
+        - filter_id = 0, probe_expr = (c_current_addr_sk)
+        - filter_id = 2, probe_expr = (c_current_hdemo_sk)
+    5:GATHER stats={rows=11250 conf=estimated} act={rows=1392 time=40.1us peak=0B}
+  11:GATHER stats={rows=2098 conf=estimated} act={rows=4320 time=51.4us peak=0B}
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 11
+    PARTITION: UNPARTITIONED
+10:HASH JOIN (BROADCAST, INNER, eq: [hd_income_band_sk = ib_income_band_sk]) stats={rows=2098 conf=estimated} act={rows=1452 time=116.7us peak=2.4MB}
+  build runtime filters:
+  - filter_id = 1, build_expr = (ib_income_band_sk)
+  7:SCAN tpcds.household_demographics stats={rows=5832 conf=estimated} act={rows=7200 time=2.5us peak=0B}
+       TABLE: tpcds.household_demographics
+       columns: hd_demo_sk, hd_income_band_sk
+       min-max stats
+       predicates: hd_demo_sk IS NOT NULL AND hd_income_band_sk IS NOT NULL
+      probe runtime filters:
+      - filter_id = 1, probe_expr = (hd_income_band_sk)
+  9:GATHER stats={rows=7 conf=estimated} act={rows=12 time=27.7us peak=0B}
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 9
+    PARTITION: UNPARTITIONED
+8:SCAN tpcds.income_band stats={rows=7 conf=estimated} act={rows=4 time=32.5us peak=7.1KB}
+     TABLE: tpcds.income_band
+     columns: ib_income_band_sk, ib_lower_bound, ib_upper_bound
+     min-max stats
+     predicates: ib_lower_bound >= 38128 AND ib_upper_bound <= 38128 + 50000 AND ib_income_band_sk IS NOT NULL
+PLAN FRAGMENT 6
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 5
+    PARTITION: UNPARTITIONED
+4:SCAN tpcds.customer_address stats={rows=11250 conf=estimated} act={rows=464 time=108.7us peak=339.6KB}
+     TABLE: tpcds.customer_address
+     columns: ca_address_sk, ca_city
+     min-max stats
+     predicates: ca_city = 'Edgewood' AND ca_address_sk IS NOT NULL

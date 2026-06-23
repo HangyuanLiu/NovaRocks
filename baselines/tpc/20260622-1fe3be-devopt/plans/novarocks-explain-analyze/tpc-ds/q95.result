@@ -1,0 +1,184 @@
+Explain String
+Planning: 405.1ms / Execution: 3.51s / Rows: 1
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+41:PROJECT [__nr_sel_0 AS order count, __nr_sel_1 AS total shipping cost, __nr_sel_2 AS total net profit] stats={rows=1 conf=estimated} act={rows=1 time=19.2us peak=8.0KB}
+  40:TOP-N (limit=100) [count(DISTINCT ws_order_number) ASC NULLS FIRST] stats={rows=1 conf=estimated} act={rows=1 time=19.9us peak=8.0KB}
+    39:PROJECT [count(DISTINCT ws_order_number) AS __nr_sel_0, sum(ws_ext_ship_cost) AS __nr_sel_1, sum(ws_net_profit) AS __nr_sel_2, count(DISTINCT ws_order_number)] stats={rows=1 conf=estimated} act={rows=1 time=46.5us peak=8.0KB}
+      38:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=121.2us peak=65.4KB}
+        aggregations: count(DISTINCT ws1.ws_order_number), sum(ws1.ws_ext_ship_cost), sum(ws1.ws_net_profit)
+        37:GATHER stats={rows=1 conf=estimated} act={rows=12 time=21.6us peak=0B}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 37
+    PARTITION: UNPARTITIONED
+36:HASH AGGREGATE (DISTINCT_LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=88.3us peak=891.4KB}
+  aggregations: count(DISTINCT ws1.ws_order_number), sum(ws1.ws_ext_ship_cost), sum(ws1.ws_net_profit)
+  35:HASH AGGREGATE (DISTINCT_GLOBAL, group by: [ws1.ws_order_number]) stats={rows=42274 conf=estimated} act={rows=146 time=62.3us peak=773.3KB}
+    aggregations: sum(ws1.ws_ext_ship_cost), sum(ws1.ws_net_profit)
+    34:HASH EXCHANGE stats={rows=42274 conf=estimated} act={rows=73 time=46.0us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 34
+    PARTITION: HASH_PARTITIONED (ws1.ws_order_number)
+33:HASH AGGREGATE (LOCAL, group by: [ws1.ws_order_number]) stats={rows=42274 conf=estimated} act={rows=174 time=190us peak=922.0KB}
+  aggregations: sum(ws1.ws_ext_ship_cost), sum(ws1.ws_net_profit)
+  32:HASH JOIN (PARTITIONED, LEFT SEMI, eq: [ws1.ws_order_number = wr_order_number]) stats={rows=51491 conf=estimated} act={rows=8678194 time=228.3ms peak=209.7MB}
+    build runtime filters:
+    - filter_id = 5, build_expr = (wr_order_number)
+    23:HASH EXCHANGE stats={rows=51491 conf=estimated} act={rows=147 time=10.9us peak=0B}
+    31:HASH EXCHANGE stats={rows=4996686 conf=estimated} act={rows=8677946 time=3.7ms peak=0B}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 31
+    PARTITION: HASH_PARTITIONED (wr_order_number)
+30:PROJECT [wr_order_number] stats={rows=4996686 conf=estimated} act={rows=8677946 time=161.1ms peak=9.7MB}
+  29:HASH JOIN (PARTITIONED, INNER, eq: [ws_wh.ws_order_number = wr_order_number]) stats={rows=4996686 conf=estimated} act={rows=15393713 time=223.7ms peak=15.3MB}
+    build runtime filters:
+    - filter_id = 4, build_expr = (wr_order_number)
+    26:HASH EXCHANGE stats={rows=4678694 conf=estimated} act={rows=6644004 time=971.3us peak=0B}
+    28:HASH EXCHANGE stats={rows=64587 conf=estimated} act={rows=71763 time=28.5us peak=0B}
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 28
+    PARTITION: HASH_PARTITIONED (wr_order_number)
+27:SCAN tpcds.web_returns stats={rows=64587 conf=estimated} act={rows=71763 time=6.2ms peak=7.0MB}
+     TABLE: tpcds.web_returns
+     columns: wr_order_number
+     min-max stats
+     predicates: wr_order_number IS NOT NULL
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 26
+    PARTITION: HASH_PARTITIONED (ws_order_number)
+25:FILTER stats={rows=4678694 conf=estimated}
+  predicate: ws_wh.ws_order_number IS NOT NULL
+  24:EXCHANGE stats={rows=5198549 conf=estimated} act={rows=13288008 time=320.7ms peak=4.9MB}
+PLAN FRAGMENT 6
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 23
+    PARTITION: HASH_PARTITIONED (ws_order_number)
+22:HASH JOIN (PARTITIONED, LEFT SEMI, eq: [ws1.ws_order_number = ws_wh.ws_order_number]) stats={rows=51491 conf=estimated} act={rows=6644298 time=138.3ms peak=160.7MB}
+  build runtime filters:
+  - filter_id = 3, build_expr = (ws_wh.ws_order_number)
+  17:HASH EXCHANGE stats={rows=51491 conf=estimated} act={rows=147 time=36.9us peak=0B}
+  21:HASH EXCHANGE stats={rows=4678694 conf=estimated} act={rows=6644004 time=352.3us peak=0B}
+PLAN FRAGMENT 7
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 21
+    PARTITION: HASH_PARTITIONED (ws_order_number)
+20:PROJECT [ws_wh.ws_order_number AS ws_order_number] stats={rows=4678694 conf=estimated} act={rows=6644004 time=171.9ms peak=4.0MB}
+  19:FILTER stats={rows=4678694 conf=estimated}
+    predicate: ws_wh.ws_order_number IS NOT NULL
+    18:EXCHANGE stats={rows=5198549 conf=estimated} act={rows=13288008 time=38.5ms peak=246.9KB}
+PLAN FRAGMENT 8
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 17
+    PARTITION: HASH_PARTITIONED (ws_order_number)
+16:HASH JOIN (BROADCAST, INNER, eq: [ws1.ws_web_site_sk = web_site_sk]) stats={rows=51491 conf=estimated} act={rows=162 time=24.1ms peak=479.1KB}
+  build runtime filters:
+  - filter_id = 2, build_expr = (web_site_sk)
+  13:HASH JOIN (BROADCAST, INNER, eq: [ws1.ws_ship_addr_sk = ca_address_sk]) stats={rows=228847 conf=estimated} act={rows=5613 time=38.9ms peak=3.6MB}
+    build runtime filters:
+    - filter_id = 1, build_expr = (ca_address_sk)
+    10:HASH JOIN (BROADCAST, INNER, eq: [ws1.ws_ship_date_sk = d_date_sk]) stats={rows=718843 conf=estimated} act={rows=22790 time=13.0ms peak=9.9MB}
+      build runtime filters:
+      - filter_id = 0, build_expr = (d_date_sk)
+      7:SCAN tpcds.web_sales (alias=ws1) stats={rows=718843 conf=estimated} act={rows=432772 time=11.6ms peak=0B}
+           TABLE: tpcds.web_sales
+           columns: ws_ship_date_sk, ws_ship_addr_sk, ws_web_site_sk, ws_order_number, ws_ext_ship_cost, ws_net_profit
+           min-max stats
+           predicates: ws1.ws_ship_date_sk IS NOT NULL AND ws1.ws_ship_addr_sk IS NOT NULL AND ws1.ws_web_site_sk IS NOT NULL
+          probe runtime filters:
+          - filter_id = 0, probe_expr = (ws1.ws_ship_date_sk)
+          - filter_id = 1, probe_expr = (ws1.ws_ship_addr_sk)
+          - filter_id = 2, probe_expr = (ws1.ws_web_site_sk)
+      9:GATHER stats={rows=16436 conf=estimated} act={rows=183 time=9.3us peak=0B}
+    12:GATHER stats={rows=11250 conf=estimated} act={rows=4788 time=8.6us peak=0B}
+  15:GATHER stats={rows=7 conf=estimated} act={rows=15 time=30.8us peak=0B}
+PLAN FRAGMENT 9
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 15
+    PARTITION: UNPARTITIONED
+14:SCAN tpcds.web_site stats={rows=7 conf=estimated} act={rows=5 time=22.4us peak=6.9KB}
+     TABLE: tpcds.web_site
+     columns: web_site_sk, web_company_name
+     min-max stats
+     predicates: web_company_name = 'pri' AND web_site_sk IS NOT NULL
+PLAN FRAGMENT 10
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 12
+    PARTITION: UNPARTITIONED
+11:SCAN tpcds.customer_address stats={rows=11250 conf=estimated} act={rows=1596 time=9.7ms peak=1.0MB}
+     TABLE: tpcds.customer_address
+     columns: ca_address_sk, ca_state
+     min-max stats
+     predicates: ca_state = 'IL' AND ca_address_sk IS NOT NULL
+PLAN FRAGMENT 11
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 9
+    PARTITION: UNPARTITIONED
+8:SCAN tpcds.date_dim stats={rows=16436 conf=estimated} act={rows=61 time=26.9us peak=39.8KB}
+     TABLE: tpcds.date_dim
+     columns: d_date_sk, d_date
+     min-max stats
+     predicates: d_date BETWEEN CAST('1999-2-01' AS Date32) AND date_add(CAST('1999-2-01' AS Date32), 60) AND d_date_sk IS NOT NULL
+PLAN FRAGMENT 12
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 18
+    PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 24
+    PARTITION: UNPARTITIONED
+6:PROJECT [ws1.ws_order_number AS ws_order_number, ws1.ws_warehouse_sk AS wh1, ws2.ws_warehouse_sk AS wh2] stats={rows=5198549 conf=estimated} act={rows=6644004 time=104.3ms peak=26.2MB}
+  5:HASH JOIN (PARTITIONED, INNER, eq: [ws1.ws_order_number = ws2.ws_order_number]) stats={rows=5198549 conf=estimated} act={rows=8082772 time=336.5ms peak=131.4MB}
+    other: wh1 != wh2
+    2:HASH EXCHANGE stats={rows=647446 conf=estimated} act={rows=719384 time=3.1ms peak=0B}
+    4:HASH EXCHANGE stats={rows=647446 conf=estimated} act={rows=719384 time=85.9us peak=0B}
+PLAN FRAGMENT 13
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 4
+    PARTITION: HASH_PARTITIONED (ws_order_number)
+3:SCAN tpcds.web_sales (alias=ws2) stats={rows=647446 conf=estimated} act={rows=719384 time=31.3ms peak=23.6MB}
+     TABLE: tpcds.web_sales
+     columns: ws_warehouse_sk, ws_order_number
+     min-max stats
+     predicates: ws2.ws_order_number IS NOT NULL
+PLAN FRAGMENT 14
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 2
+    PARTITION: HASH_PARTITIONED (ws_order_number)
+1:SCAN tpcds.web_sales (alias=ws1) stats={rows=647446 conf=estimated} act={rows=719384 time=57.8ms peak=12.2MB}
+     TABLE: tpcds.web_sales
+     columns: ws_warehouse_sk, ws_order_number
+     min-max stats
+     predicates: ws1.ws_order_number IS NOT NULL

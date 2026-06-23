@@ -1,0 +1,63 @@
+Explain String
+Planning: 105.9ms / Execution: 2.81s / Rows: 6
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+13:MERGING-EXCHANGE stats={rows=4 conf=estimated} act={rows=18 time=33.0us peak=5.0KB}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 13
+    PARTITION: UNPARTITIONED
+12:LOCAL TOP-N (limit=100, offset=0) [s_store_name ASC NULLS FIRST, s_store_id ASC NULLS FIRST, sun_sales ASC NULLS FIRST, mon_sales ASC NULLS FIRST, tue_sales ASC NULLS FIRST, wed_sales ASC NULLS FIRST, thu_sales ASC NULLS FIRST, fri_sales ASC NULLS FIRST, sat_sales ASC NULLS FIRST] stats={rows=4 conf=estimated} act={rows=12 time=38.7us peak=119.5KB}
+  11:PROJECT [s_store_name, s_store_id, sum(Case { operand: None, when_then: [(TypedExpr { kind: Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: ColumnRef { column_id: c15, qualifier: None, column: "d_day_name" }, data_type: Utf8, nullable: true }, op: Eq, right: TypedExpr { kind: Literal(String("Sunday")), data_type: Utf8, nullable: false } }, data_type: Boolean, nullable: true }), data_type: Boolean, nullable: true }, TypedExpr { kind: ColumnRef { column_id: c44, qualifier: None, column: "ss_sales_price" }, data_type: Decimal128(7, 2), nullable: true })], else_expr: Some(TypedExpr { kind: Literal(Null), data_type: Null, nullable: true }) }) AS sun_sales, sum(Case { operand: None, when_then: [(TypedExpr { kind: Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: ColumnRef { column_id: c15, qualifier: None, column: "d_day_name" }, data_type: Utf8, nullable: true }, op: Eq, right: TypedExpr { kind: Literal(String("Monday")), data_type: Utf8, nullable: false } }, data_type: Boolean, nullable: true }), data_type: Boolean, nullable: true }, TypedExpr { kind: ColumnRef { column_id: c44, qualifier: None, column: "ss_sales_price" }, data_type: Decimal128(7, 2), nullable: true })], else_expr: Some(TypedExpr { kind: Literal(Null), data_type: Null, nullable: true }) }) AS mon_sales, sum(Case { operand: None, when_then: [(TypedExpr { kind: Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: ColumnRef { column_id: c15, qualifier: None, column: "d_day_name" }, data_type: Utf8, nullable: true }, op: Eq, right: TypedExpr { kind: Literal(String("Tuesday")), data_type: Utf8, nullable: false } }, data_type: Boolean, nullable: true }), data_type: Boolean, nullable: true }, TypedExpr { kind: ColumnRef { column_id: c44, qualifier: None, column: "ss_sales_price" }, data_type: Decimal128(7, 2), nullable: true })], else_expr: Some(TypedExpr { kind: Literal(Null), data_type: Null, nullable: true }) }) AS tue_sales, sum(Case { operand: None, when_then: [(TypedExpr { kind: Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: ColumnRef { column_id: c15, qualifier: None, column: "d_day_name" }, data_type: Utf8, nullable: true }, op: Eq, right: TypedExpr { kind: Literal(String("Wednesday")), data_type: Utf8, nullable: false } }, data_type: Boolean, nullable: true }), data_type: Boolean, nullable: true }, TypedExpr { kind: ColumnRef { column_id: c44, qualifier: None, column: "ss_sales_price" }, data_type: Decimal128(7, 2), nullable: true })], else_expr: Some(TypedExpr { kind: Literal(Null), data_type: Null, nullable: true }) }) AS wed_sales, sum(Case { operand: None, when_then: [(TypedExpr { kind: Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: ColumnRef { column_id: c15, qualifier: None, column: "d_day_name" }, data_type: Utf8, nullable: true }, op: Eq, right: TypedExpr { kind: Literal(String("Thursday")), data_type: Utf8, nullable: false } }, data_type: Boolean, nullable: true }), data_type: Boolean, nullable: true }, TypedExpr { kind: ColumnRef { column_id: c44, qualifier: None, column: "ss_sales_price" }, data_type: Decimal128(7, 2), nullable: true })], else_expr: Some(TypedExpr { kind: Literal(Null), data_type: Null, nullable: true }) }) AS thu_sales, sum(Case { operand: None, when_then: [(TypedExpr { kind: Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: ColumnRef { column_id: c15, qualifier: None, column: "d_day_name" }, data_type: Utf8, nullable: true }, op: Eq, right: TypedExpr { kind: Literal(String("Friday")), data_type: Utf8, nullable: false } }, data_type: Boolean, nullable: true }), data_type: Boolean, nullable: true }, TypedExpr { kind: ColumnRef { column_id: c44, qualifier: None, column: "ss_sales_price" }, data_type: Decimal128(7, 2), nullable: true })], else_expr: Some(TypedExpr { kind: Literal(Null), data_type: Null, nullable: true }) }) AS fri_sales, sum(Case { operand: None, when_then: [(TypedExpr { kind: Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: ColumnRef { column_id: c15, qualifier: None, column: "d_day_name" }, data_type: Utf8, nullable: true }, op: Eq, right: TypedExpr { kind: Literal(String("Saturday")), data_type: Utf8, nullable: false } }, data_type: Boolean, nullable: true }), data_type: Boolean, nullable: true }, TypedExpr { kind: ColumnRef { column_id: c44, qualifier: None, column: "ss_sales_price" }, data_type: Decimal128(7, 2), nullable: true })], else_expr: Some(TypedExpr { kind: Literal(Null), data_type: Null, nullable: true }) }) AS sat_sales] stats={rows=4 conf=estimated} act={rows=6 time=104.7us peak=50.8KB}
+    10:HASH AGGREGATE (GLOBAL, group by: [s_store_name, s_store_id]) stats={rows=4 conf=estimated} act={rows=24 time=62.9us peak=645.9KB}
+      aggregations: sum(CASE WHEN d_day_name = 'Sunday' THEN ss_sales_price ELSE NULL END), sum(CASE WHEN d_day_name = 'Monday' THEN ss_sales_price ELSE NULL END), sum(CASE WHEN d_day_name = 'Tuesday' THEN ss_sales_price ELSE NULL END), sum(CASE WHEN d_day_name = 'Wednesday' THEN ss_sales_price ELSE NULL END), sum(CASE WHEN d_day_name = 'Thursday' THEN ss_sales_price ELSE NULL END), sum(CASE WHEN d_day_name = 'Friday' THEN ss_sales_price ELSE NULL END), sum(CASE WHEN d_day_name = 'Saturday' THEN ss_sales_price ELSE NULL END)
+      9:HASH EXCHANGE stats={rows=4 conf=estimated} act={rows=18 time=23.8us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 9
+    PARTITION: HASH_PARTITIONED (s_store_name, s_store_id)
+8:HASH AGGREGATE (LOCAL, group by: [s_store_name, s_store_id]) stats={rows=4 conf=estimated} act={rows=540772 time=22.0ms peak=22.4MB}
+  aggregations: sum(CASE WHEN d_day_name = 'Sunday' THEN ss_sales_price ELSE NULL END), sum(CASE WHEN d_day_name = 'Monday' THEN ss_sales_price ELSE NULL END), sum(CASE WHEN d_day_name = 'Tuesday' THEN ss_sales_price ELSE NULL END), sum(CASE WHEN d_day_name = 'Wednesday' THEN ss_sales_price ELSE NULL END), sum(CASE WHEN d_day_name = 'Thursday' THEN ss_sales_price ELSE NULL END), sum(CASE WHEN d_day_name = 'Friday' THEN ss_sales_price ELSE NULL END), sum(CASE WHEN d_day_name = 'Saturday' THEN ss_sales_price ELSE NULL END)
+  7:HASH JOIN (BROADCAST, INNER, eq: [ss_store_sk = s_store_sk]) stats={rows=212034 conf=estimated} act={rows=540790 time=16.3ms peak=9.1MB}
+    build runtime filters:
+    - filter_id = 1, build_expr = (s_store_sk)
+    4:HASH JOIN (BROADCAST, INNER, eq: [ss_sold_date_sk = d_date_sk]) stats={rows=471187 conf=estimated} act={rows=541852 time=23.0ms peak=7.6MB}
+      build runtime filters:
+      - filter_id = 0, build_expr = (d_date_sk)
+      1:SCAN tpcds.store_sales stats={rows=2626150 conf=estimated} act={rows=2685687 time=16.8ms peak=0B}
+           TABLE: tpcds.store_sales
+           columns: ss_sold_date_sk, ss_store_sk, ss_sales_price
+           min-max stats
+           predicates: ss_sold_date_sk IS NOT NULL AND ss_store_sk IS NOT NULL
+          probe runtime filters:
+          - filter_id = 0, probe_expr = (ss_sold_date_sk)
+          - filter_id = 1, probe_expr = (ss_store_sk)
+      3:GATHER stats={rows=327 conf=estimated} act={rows=1098 time=10.1us peak=0B}
+    6:GATHER stats={rows=3 conf=estimated} act={rows=36 time=5.4us peak=0B}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 6
+    PARTITION: UNPARTITIONED
+5:SCAN tpcds.store stats={rows=3 conf=estimated} act={rows=12 time=30.3us peak=15.6KB}
+     TABLE: tpcds.store
+     columns: s_store_sk, s_store_id, s_store_name, s_gmt_offset
+     min-max stats
+     predicates: s_gmt_offset = - 5 AND s_store_sk IS NOT NULL
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: UNPARTITIONED
+2:SCAN tpcds.date_dim stats={rows=327 conf=estimated} act={rows=366 time=65.3us peak=238.8KB}
+     TABLE: tpcds.date_dim
+     columns: d_date_sk, d_day_name, d_year
+     min-max stats
+     predicates: d_year = 2000 AND d_date_sk IS NOT NULL

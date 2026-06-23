@@ -1,0 +1,97 @@
+Explain String
+Planning: 237.1ms / Execution: 1.41s / Rows: 100
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+21:PROJECT [__nr_sel_0 AS substr(w_warehouse_name, 1, 20), __nr_sel_1 AS sm_type, __nr_sel_2 AS web_name, __nr_sel_3 AS 30 days, __nr_sel_4 AS 31-60 days, __nr_sel_5 AS 61-90 days, __nr_sel_6 AS 91-120 days, __nr_sel_7 AS >120 days] stats={rows=37 conf=estimated} act={rows=100 time=132.8us peak=7.7KB}
+  20:PROJECT [substring(w_warehouse_name, 1, 20) AS __nr_sel_0, sm_type AS __nr_sel_1, web_name AS __nr_sel_2, sum(Case { operand: None, when_then: [(TypedExpr { kind: Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: BinaryOp { left: TypedExpr { kind: ColumnRef { column_id: c3, qualifier: None, column: "ws_ship_date_sk" }, data_type: Int32, nullable: true }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c1, qualifier: None, column: "ws_sold_date_sk" }, data_type: Int32, nullable: true } }, data_type: Int64, nullable: true }, op: Le, right: TypedExpr { kind: Literal(Int(30)), data_type: Int64, nullable: false } }, data_type: Boolean, nullable: true }), data_type: Boolean, nullable: true }, TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false })], else_expr: Some(TypedExpr { kind: Literal(Int(0)), data_type: Int64, nullable: false }) }) AS __nr_sel_3, sum(Case { operand: None, when_then: [(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: BinaryOp { left: TypedExpr { kind: ColumnRef { column_id: c3, qualifier: None, column: "ws_ship_date_sk" }, data_type: Int32, nullable: true }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c1, qualifier: None, column: "ws_sold_date_sk" }, data_type: Int32, nullable: true } }, data_type: Int64, nullable: true }, op: Gt, right: TypedExpr { kind: Literal(Int(30)), data_type: Int64, nullable: false } }, data_type: Boolean, nullable: true }), data_type: Boolean, nullable: true }, op: And, right: TypedExpr { kind: Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: BinaryOp { left: TypedExpr { kind: ColumnRef { column_id: c3, qualifier: None, column: "ws_ship_date_sk" }, data_type: Int32, nullable: true }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c1, qualifier: None, column: "ws_sold_date_sk" }, data_type: Int32, nullable: true } }, data_type: Int64, nullable: true }, op: Le, right: TypedExpr { kind: Literal(Int(60)), data_type: Int64, nullable: false } }, data_type: Boolean, nullable: true }), data_type: Boolean, nullable: true } }, data_type: Boolean, nullable: true }, TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false })], else_expr: Some(TypedExpr { kind: Literal(Int(0)), data_type: Int64, nullable: false }) }) AS __nr_sel_4, sum(Case { operand: None, when_then: [(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: BinaryOp { left: TypedExpr { kind: ColumnRef { column_id: c3, qualifier: None, column: "ws_ship_date_sk" }, data_type: Int32, nullable: true }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c1, qualifier: None, column: "ws_sold_date_sk" }, data_type: Int32, nullable: true } }, data_type: Int64, nullable: true }, op: Gt, right: TypedExpr { kind: Literal(Int(60)), data_type: Int64, nullable: false } }, data_type: Boolean, nullable: true }), data_type: Boolean, nullable: true }, op: And, right: TypedExpr { kind: Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: BinaryOp { left: TypedExpr { kind: ColumnRef { column_id: c3, qualifier: None, column: "ws_ship_date_sk" }, data_type: Int32, nullable: true }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c1, qualifier: None, column: "ws_sold_date_sk" }, data_type: Int32, nullable: true } }, data_type: Int64, nullable: true }, op: Le, right: TypedExpr { kind: Literal(Int(90)), data_type: Int64, nullable: false } }, data_type: Boolean, nullable: true }), data_type: Boolean, nullable: true } }, data_type: Boolean, nullable: true }, TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false })], else_expr: Some(TypedExpr { kind: Literal(Int(0)), data_type: Int64, nullable: false }) }) AS __nr_sel_5, sum(Case { operand: None, when_then: [(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: BinaryOp { left: TypedExpr { kind: ColumnRef { column_id: c3, qualifier: None, column: "ws_ship_date_sk" }, data_type: Int32, nullable: true }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c1, qualifier: None, column: "ws_sold_date_sk" }, data_type: Int32, nullable: true } }, data_type: Int64, nullable: true }, op: Gt, right: TypedExpr { kind: Literal(Int(90)), data_type: Int64, nullable: false } }, data_type: Boolean, nullable: true }), data_type: Boolean, nullable: true }, op: And, right: TypedExpr { kind: Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: BinaryOp { left: TypedExpr { kind: ColumnRef { column_id: c3, qualifier: None, column: "ws_ship_date_sk" }, data_type: Int32, nullable: true }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c1, qualifier: None, column: "ws_sold_date_sk" }, data_type: Int32, nullable: true } }, data_type: Int64, nullable: true }, op: Le, right: TypedExpr { kind: Literal(Int(120)), data_type: Int64, nullable: false } }, data_type: Boolean, nullable: true }), data_type: Boolean, nullable: true } }, data_type: Boolean, nullable: true }, TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false })], else_expr: Some(TypedExpr { kind: Literal(Int(0)), data_type: Int64, nullable: false }) }) AS __nr_sel_6, sum(Case { operand: None, when_then: [(TypedExpr { kind: Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: BinaryOp { left: TypedExpr { kind: ColumnRef { column_id: c3, qualifier: None, column: "ws_ship_date_sk" }, data_type: Int32, nullable: true }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c1, qualifier: None, column: "ws_sold_date_sk" }, data_type: Int32, nullable: true } }, data_type: Int64, nullable: true }, op: Gt, right: TypedExpr { kind: Literal(Int(120)), data_type: Int64, nullable: false } }, data_type: Boolean, nullable: true }), data_type: Boolean, nullable: true }, TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false })], else_expr: Some(TypedExpr { kind: Literal(Int(0)), data_type: Int64, nullable: false }) }) AS __nr_sel_7, substring(w_warehouse_name, 1, 20)] stats={rows=37 conf=estimated} act={rows=100 time=117.0us peak=7.7KB}
+    19:MERGING-EXCHANGE stats={rows=37 conf=estimated} act={rows=400 time=88.1us peak=19.2KB}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 19
+    PARTITION: UNPARTITIONED
+18:LOCAL TOP-N (limit=100, offset=0) [substring(w_warehouse_name, 1, 20) ASC NULLS FIRST, sm_type ASC NULLS FIRST, web_name ASC NULLS FIRST] stats={rows=37 conf=estimated} act={rows=300 time=452.1us peak=1.3MB}
+  17:HASH AGGREGATE (GLOBAL, group by: [substring(w_warehouse_name, 1, 20), sm_type, web_name]) stats={rows=37 conf=estimated} act={rows=600 time=220.0us peak=1.5MB}
+    aggregations: sum(CASE WHEN ws_ship_date_sk - ws_sold_date_sk <= 30 THEN 1 ELSE 0 END), sum(CASE WHEN ws_ship_date_sk - ws_sold_date_sk > 30 AND ws_ship_date_sk - ws_sold_date_sk <= 60 THEN 1 ELSE 0 END), sum(CASE WHEN ws_ship_date_sk - ws_sold_date_sk > 60 AND ws_ship_date_sk - ws_sold_date_sk <= 90 THEN 1 ELSE 0 END), sum(CASE WHEN ws_ship_date_sk - ws_sold_date_sk > 90 AND ws_ship_date_sk - ws_sold_date_sk <= 120 THEN 1 ELSE 0 END), sum(CASE WHEN ws_ship_date_sk - ws_sold_date_sk > 120 THEN 1 ELSE 0 END)
+    16:HASH EXCHANGE stats={rows=37 conf=estimated} act={rows=450 time=47.8us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 16
+    PARTITION: HASH_PARTITIONED (substring(w_warehouse_name, 1, 20), sm_type, web_name)
+15:HASH AGGREGATE (LOCAL, group by: [substring(w_warehouse_name, 1, 20), sm_type, web_name]) stats={rows=37 conf=estimated} act={rows=143549 time=6.5ms peak=4.6MB}
+  aggregations: sum(CASE WHEN __cse_0 <= 30 THEN 1 ELSE 0 END), sum(CASE WHEN __cse_0 > 30 AND __cse_0 <= 60 THEN 1 ELSE 0 END), sum(CASE WHEN __cse_0 > 60 AND __cse_0 <= 90 THEN 1 ELSE 0 END), sum(CASE WHEN __cse_0 > 90 AND __cse_0 <= 120 THEN 1 ELSE 0 END), sum(CASE WHEN __cse_0 > 120 THEN 1 ELSE 0 END)
+  14:PROJECT [ws_sold_date_sk, ws_ship_date_sk, ws_web_site_sk, ws_ship_mode_sk, ws_warehouse_sk, w_warehouse_sk, w_warehouse_name, sm_ship_mode_sk, sm_type, web_site_sk, web_name, d_date_sk, d_month_seq, ws_ship_date_sk - ws_sold_date_sk AS __cse_0] stats={rows=523909 conf=estimated} act={rows=143099 time=3.8ms peak=12.9MB}
+    13:HASH JOIN (BROADCAST, INNER, eq: [ws_warehouse_sk = w_warehouse_sk]) stats={rows=523909 conf=estimated} act={rows=143114 time=3.6ms peak=10.2MB}
+      build runtime filters:
+      - filter_id = 3, build_expr = (w_warehouse_sk)
+      10:HASH JOIN (BROADCAST, INNER, eq: [ws_web_site_sk = web_site_sk]) stats={rows=582121 conf=estimated} act={rows=143189 time=2.1ms peak=7.7MB}
+        build runtime filters:
+        - filter_id = 2, build_expr = (web_site_sk)
+        7:HASH JOIN (BROADCAST, INNER, eq: [ws_ship_mode_sk = sm_ship_mode_sk]) stats={rows=646801 conf=estimated} act={rows=143159 time=1.6ms peak=5.1MB}
+          build runtime filters:
+          - filter_id = 1, build_expr = (sm_ship_mode_sk)
+          4:HASH JOIN (BROADCAST, INNER, eq: [ws_ship_date_sk = d_date_sk]) stats={rows=718668 conf=estimated} act={rows=144197 time=5.7ms peak=8.2MB}
+            build runtime filters:
+            - filter_id = 0, build_expr = (d_date_sk)
+            1:SCAN tpcds.web_sales stats={rows=718668 conf=estimated} act={rows=719053 time=1.3ms peak=0B}
+                 TABLE: tpcds.web_sales
+                 columns: ws_sold_date_sk, ws_ship_date_sk, ws_web_site_sk, ws_ship_mode_sk, ws_warehouse_sk
+                 min-max stats
+                 predicates: ws_warehouse_sk IS NOT NULL AND ws_ship_mode_sk IS NOT NULL AND ws_web_site_sk IS NOT NULL AND ws_ship_date_sk IS NOT NULL
+                probe runtime filters:
+                - filter_id = 0, probe_expr = (ws_ship_date_sk)
+                - filter_id = 1, probe_expr = (ws_ship_mode_sk)
+                - filter_id = 2, probe_expr = (ws_web_site_sk)
+                - filter_id = 3, probe_expr = (ws_warehouse_sk)
+            3:GATHER stats={rows=16450 conf=estimated} act={rows=1098 time=781.0us peak=0B}
+          6:GATHER stats={rows=18 conf=estimated} act={rows=60 time=587.6us peak=0B}
+        9:GATHER stats={rows=27 conf=estimated} act={rows=90 time=7.5us peak=0B}
+      12:GATHER stats={rows=5 conf=estimated} act={rows=15 time=1.7ms peak=0B}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 12
+    PARTITION: UNPARTITIONED
+11:SCAN tpcds.warehouse stats={rows=5 conf=estimated} act={rows=5 time=32.3us peak=7.4KB}
+     TABLE: tpcds.warehouse
+     columns: w_warehouse_sk, w_warehouse_name
+     min-max stats
+     predicates: w_warehouse_sk IS NOT NULL
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 9
+    PARTITION: UNPARTITIONED
+8:SCAN tpcds.web_site stats={rows=27 conf=estimated} act={rows=30 time=33.2us peak=24.2KB}
+     TABLE: tpcds.web_site
+     columns: web_site_sk, web_name
+     min-max stats
+     predicates: web_site_sk IS NOT NULL
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 6
+    PARTITION: UNPARTITIONED
+5:SCAN tpcds.ship_mode stats={rows=18 conf=estimated} act={rows=20 time=26.6us peak=16.9KB}
+     TABLE: tpcds.ship_mode
+     columns: sm_ship_mode_sk, sm_type
+     min-max stats
+     predicates: sm_ship_mode_sk IS NOT NULL
+PLAN FRAGMENT 6
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: UNPARTITIONED
+2:SCAN tpcds.date_dim stats={rows=16450 conf=estimated} act={rows=366 time=37.7us peak=222.0KB}
+     TABLE: tpcds.date_dim
+     columns: d_date_sk, d_month_seq
+     min-max stats
+     predicates: d_month_seq BETWEEN 1200 AND 1200 + 11 AND d_date_sk IS NOT NULL

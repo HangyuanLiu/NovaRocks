@@ -1,0 +1,273 @@
+Explain String
+Planning: 166.5ms / Execution: 2.70s / Rows: 100
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+97:PROJECT [s_store_name1, s_store_id1, d_week_seq1, sun_sales1 / sun_sales2, mon_sales1 / mon_sales2, tue_sales1 / tue_sales2, wed_sales1 / wed_sales2, thu_sales1 / thu_sales2, fri_sales1 / fri_sales2, sat_sales1 / sat_sales2] stats={rows=100 conf=estimated} act={rows=100 time=207.8us peak=27.4KB}
+  96:MERGING-EXCHANGE stats={rows=100 conf=estimated} act={rows=300 time=88.9us peak=57.6KB}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 96
+    PARTITION: UNPARTITIONED
+95:LOCAL TOP-N (limit=100, offset=0) [s_store_name1 ASC NULLS FIRST, s_store_id1 ASC NULLS FIRST, d_week_seq1 ASC NULLS FIRST] stats={rows=100 conf=estimated} act={rows=15388 time=6.1ms peak=1.3MB}
+  94:HASH JOIN (BROADCAST, INNER, eq: [s_store_id1 = s_store_id2, d_week_seq1 = d_week_seq2 - 52]) stats={rows=71933 conf=estimated} act={rows=21858 time=3.9ms peak=1.4MB}
+    build runtime filters:
+    - filter_id = 5, build_expr = (s_store_id2)
+    50:PROJECT [s_store_name1, d_week_seq1, s_store_id1, sun_sales1, mon_sales1, tue_sales1, wed_sales1, thu_sales1, fri_sales1, sat_sales1] stats={rows=1308 conf=estimated} act={rows=2190 time=475.0us peak=32.7KB}
+      49:PROJECT [s_store_name AS s_store_name1, wss.d_week_seq AS d_week_seq1, s_store_id AS s_store_id1, sun_sales AS sun_sales1, mon_sales AS mon_sales1, tue_sales AS tue_sales1, wed_sales AS wed_sales1, thu_sales AS thu_sales1, fri_sales AS fri_sales1, sat_sales AS sat_sales1] stats={rows=1308 conf=estimated} act={rows=2190 time=572.0us peak=101.3KB}
+        48:HASH JOIN (BROADCAST, INNER, eq: [d.d_week_seq = d_week_seq1]) stats={rows=1308 conf=estimated} act={rows=6906 time=398.6us peak=1.8MB}
+          build runtime filters:
+          - filter_id = 2, build_expr = (d_week_seq1)
+          9:SCAN tpcds.date_dim (alias=d) stats={rows=16285 conf=estimated} act={rows=365 time=1.5us peak=0B}
+               TABLE: tpcds.date_dim
+               columns: d_week_seq, d_month_seq
+               min-max stats
+               predicates: d.d_month_seq BETWEEN 1212 AND 1212 + 11 AND d.d_week_seq IS NOT NULL
+              probe runtime filters:
+              - filter_id = 2, probe_expr = (d.d_week_seq)
+          47:GATHER stats={rows=853 conf=estimated} act={rows=4716 time=16.7us peak=0B}
+    93:GATHER stats={rows=1320 conf=estimated} act={rows=6570 time=15.8us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 93
+    PARTITION: UNPARTITIONED
+92:PROJECT [d_week_seq2, s_store_id2, sun_sales2, mon_sales2, tue_sales2, wed_sales2, thu_sales2, fri_sales2, sat_sales2] stats={rows=1320 conf=estimated} act={rows=2190 time=467.8us peak=1.0MB}
+  91:PROJECT [wss.d_week_seq AS d_week_seq2, s_store_id AS s_store_id2, sun_sales AS sun_sales2, mon_sales AS mon_sales2, tue_sales AS tue_sales2, wed_sales AS wed_sales2, thu_sales AS thu_sales2, fri_sales AS fri_sales2, sat_sales AS sat_sales2] stats={rows=1320 conf=estimated} act={rows=2190 time=446.9us peak=93.6KB}
+    90:HASH JOIN (BROADCAST, INNER, eq: [d.d_week_seq = d_week_seq2]) stats={rows=1320 conf=estimated} act={rows=6906 time=503.4us peak=1.6MB}
+      build runtime filters:
+      - filter_id = 4, build_expr = (d_week_seq2)
+      51:SCAN tpcds.date_dim (alias=d) stats={rows=16436 conf=estimated} act={rows=365 time=1.5us peak=0B}
+           TABLE: tpcds.date_dim
+           columns: d_week_seq, d_month_seq
+           min-max stats
+           predicates: d.d_month_seq BETWEEN 1212 + 12 AND 1212 + 23 AND d.d_week_seq IS NOT NULL
+          probe runtime filters:
+          - filter_id = 4, probe_expr = (d.d_week_seq)
+      89:GATHER stats={rows=853 conf=estimated} act={rows=4716 time=20us peak=0B}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 89
+    PARTITION: UNPARTITIONED
+88:HASH JOIN (BROADCAST, INNER, eq: [s_store_sk = ss_store_sk]) stats={rows=853 conf=estimated} act={rows=6288 time=481.0us peak=1.7MB}
+  build runtime filters:
+  - filter_id = 3, build_expr = (ss_store_sk)
+  52:SCAN tpcds.store stats={rows=10 conf=estimated} act={rows=12 time=10.4us peak=0B}
+       TABLE: tpcds.store
+       columns: s_store_sk, s_store_id
+       min-max stats
+       predicates: s_store_sk IS NOT NULL AND s_store_id IS NOT NULL
+      probe runtime filters:
+      - filter_id = 3, probe_expr = (s_store_sk)
+  87:GATHER stats={rows=853 conf=estimated} act={rows=4716 time=123.9us peak=0B}
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 87
+    PARTITION: UNPARTITIONED
+86:FILTER stats={rows=853 conf=estimated}
+  predicate: d_week_seq2 IS NOT NULL
+  85:FILTER stats={rows=948 conf=estimated}
+    predicate: d_week_seq2 IS NOT NULL
+    84:FILTER stats={rows=1053 conf=estimated}
+      predicate: d_week_seq2 IS NOT NULL
+      83:FILTER stats={rows=1170 conf=estimated}
+        predicate: d_week_seq2 IS NOT NULL
+        82:FILTER stats={rows=1300 conf=estimated}
+          predicate: d_week_seq2 IS NOT NULL
+          81:FILTER stats={rows=1445 conf=estimated}
+            predicate: d_week_seq2 IS NOT NULL
+            80:FILTER stats={rows=1605 conf=estimated}
+              predicate: d_week_seq2 IS NOT NULL
+              79:FILTER stats={rows=1784 conf=estimated}
+                predicate: d_week_seq2 IS NOT NULL
+                78:FILTER stats={rows=1982 conf=estimated}
+                  predicate: d_week_seq2 IS NOT NULL
+                  77:FILTER stats={rows=2202 conf=estimated}
+                    predicate: d_week_seq2 IS NOT NULL
+                    76:FILTER stats={rows=2447 conf=estimated}
+                      predicate: d_week_seq2 IS NOT NULL
+                      75:FILTER stats={rows=2718 conf=estimated}
+                        predicate: d_week_seq2 IS NOT NULL
+                        74:FILTER stats={rows=3020 conf=estimated}
+                          predicate: d_week_seq2 IS NOT NULL
+                          73:FILTER stats={rows=3356 conf=estimated}
+                            predicate: d_week_seq2 IS NOT NULL
+                            72:FILTER stats={rows=3729 conf=estimated}
+                              predicate: d_week_seq2 IS NOT NULL
+                              71:FILTER stats={rows=4143 conf=estimated}
+                                predicate: d_week_seq2 IS NOT NULL
+                                70:FILTER stats={rows=4604 conf=estimated}
+                                  predicate: d_week_seq2 IS NOT NULL
+                                  69:FILTER stats={rows=5115 conf=estimated}
+                                    predicate: d_week_seq2 IS NOT NULL
+                                    68:FILTER stats={rows=5683 conf=estimated}
+                                      predicate: d_week_seq2 IS NOT NULL
+                                      67:FILTER stats={rows=6315 conf=estimated}
+                                        predicate: d_week_seq2 IS NOT NULL
+                                        66:FILTER stats={rows=7017 conf=estimated}
+                                          predicate: d_week_seq2 IS NOT NULL
+                                          65:FILTER stats={rows=7796 conf=estimated}
+                                            predicate: d_week_seq2 IS NOT NULL
+                                            64:FILTER stats={rows=8662 conf=estimated}
+                                              predicate: d_week_seq2 IS NOT NULL
+                                              63:FILTER stats={rows=9625 conf=estimated}
+                                                predicate: d_week_seq2 IS NOT NULL
+                                                62:FILTER stats={rows=10694 conf=estimated}
+                                                  predicate: d_week_seq2 IS NOT NULL
+                                                  61:FILTER stats={rows=11883 conf=estimated}
+                                                    predicate: d_week_seq2 IS NOT NULL
+                                                    60:FILTER stats={rows=13203 conf=estimated}
+                                                      predicate: d_week_seq2 IS NOT NULL
+                                                      59:FILTER stats={rows=14670 conf=estimated}
+                                                        predicate: d_week_seq2 IS NOT NULL
+                                                        58:FILTER stats={rows=16300 conf=estimated}
+                                                          predicate: d_week_seq2 IS NOT NULL
+                                                          57:FILTER stats={rows=18111 conf=estimated}
+                                                            predicate: d_week_seq2 IS NOT NULL
+                                                            56:FILTER stats={rows=20123 conf=estimated}
+                                                              predicate: d_week_seq2 IS NOT NULL
+                                                              55:FILTER stats={rows=22359 conf=estimated}
+                                                                predicate: d_week_seq2 IS NOT NULL
+                                                                54:FILTER stats={rows=24844 conf=estimated}
+                                                                  predicate: ss_store_sk IS NOT NULL
+                                                                  53:EXCHANGE stats={rows=26018 conf=estimated} act={rows=3406 time=1.3ms peak=702.8KB}
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 47
+    PARTITION: UNPARTITIONED
+46:HASH JOIN (BROADCAST, INNER, eq: [s_store_sk = ss_store_sk]) stats={rows=853 conf=estimated} act={rows=6288 time=806.4us peak=1.4MB}
+  build runtime filters:
+  - filter_id = 1, build_expr = (ss_store_sk)
+  10:SCAN tpcds.store stats={rows=10 conf=estimated} act={rows=12 time=2.2us peak=0B}
+       TABLE: tpcds.store
+       columns: s_store_sk, s_store_id, s_store_name
+       min-max stats
+       predicates: s_store_sk IS NOT NULL AND s_store_id IS NOT NULL
+      probe runtime filters:
+      - filter_id = 1, probe_expr = (s_store_sk)
+  45:GATHER stats={rows=853 conf=estimated} act={rows=4716 time=710.9us peak=0B}
+PLAN FRAGMENT 6
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 45
+    PARTITION: UNPARTITIONED
+44:FILTER stats={rows=853 conf=estimated}
+  predicate: d_week_seq1 IS NOT NULL
+  43:FILTER stats={rows=948 conf=estimated}
+    predicate: d_week_seq1 IS NOT NULL
+    42:FILTER stats={rows=1053 conf=estimated}
+      predicate: d_week_seq1 IS NOT NULL
+      41:FILTER stats={rows=1170 conf=estimated}
+        predicate: d_week_seq1 IS NOT NULL
+        40:FILTER stats={rows=1300 conf=estimated}
+          predicate: d_week_seq1 IS NOT NULL
+          39:FILTER stats={rows=1445 conf=estimated}
+            predicate: d_week_seq1 IS NOT NULL
+            38:FILTER stats={rows=1605 conf=estimated}
+              predicate: d_week_seq1 IS NOT NULL
+              37:FILTER stats={rows=1784 conf=estimated}
+                predicate: d_week_seq1 IS NOT NULL
+                36:FILTER stats={rows=1982 conf=estimated}
+                  predicate: d_week_seq1 IS NOT NULL
+                  35:FILTER stats={rows=2202 conf=estimated}
+                    predicate: d_week_seq1 IS NOT NULL
+                    34:FILTER stats={rows=2447 conf=estimated}
+                      predicate: d_week_seq1 IS NOT NULL
+                      33:FILTER stats={rows=2718 conf=estimated}
+                        predicate: d_week_seq1 IS NOT NULL
+                        32:FILTER stats={rows=3020 conf=estimated}
+                          predicate: d_week_seq1 IS NOT NULL
+                          31:FILTER stats={rows=3356 conf=estimated}
+                            predicate: d_week_seq1 IS NOT NULL
+                            30:FILTER stats={rows=3729 conf=estimated}
+                              predicate: d_week_seq1 IS NOT NULL
+                              29:FILTER stats={rows=4143 conf=estimated}
+                                predicate: d_week_seq1 IS NOT NULL
+                                28:FILTER stats={rows=4604 conf=estimated}
+                                  predicate: d_week_seq1 IS NOT NULL
+                                  27:FILTER stats={rows=5115 conf=estimated}
+                                    predicate: d_week_seq1 IS NOT NULL
+                                    26:FILTER stats={rows=5683 conf=estimated}
+                                      predicate: d_week_seq1 IS NOT NULL
+                                      25:FILTER stats={rows=6315 conf=estimated}
+                                        predicate: d_week_seq1 IS NOT NULL
+                                        24:FILTER stats={rows=7017 conf=estimated}
+                                          predicate: d_week_seq1 IS NOT NULL
+                                          23:FILTER stats={rows=7796 conf=estimated}
+                                            predicate: d_week_seq1 IS NOT NULL
+                                            22:FILTER stats={rows=8662 conf=estimated}
+                                              predicate: d_week_seq1 IS NOT NULL
+                                              21:FILTER stats={rows=9625 conf=estimated}
+                                                predicate: d_week_seq1 IS NOT NULL
+                                                20:FILTER stats={rows=10694 conf=estimated}
+                                                  predicate: d_week_seq1 IS NOT NULL
+                                                  19:FILTER stats={rows=11883 conf=estimated}
+                                                    predicate: d_week_seq1 IS NOT NULL
+                                                    18:FILTER stats={rows=13203 conf=estimated}
+                                                      predicate: d_week_seq1 IS NOT NULL
+                                                      17:FILTER stats={rows=14670 conf=estimated}
+                                                        predicate: d_week_seq1 IS NOT NULL
+                                                        16:FILTER stats={rows=16300 conf=estimated}
+                                                          predicate: d_week_seq1 IS NOT NULL
+                                                          15:FILTER stats={rows=18111 conf=estimated}
+                                                            predicate: d_week_seq1 IS NOT NULL
+                                                            14:FILTER stats={rows=20123 conf=estimated}
+                                                              predicate: d_week_seq1 IS NOT NULL
+                                                              13:FILTER stats={rows=22359 conf=estimated}
+                                                                predicate: d_week_seq1 IS NOT NULL
+                                                                12:FILTER stats={rows=24844 conf=estimated}
+                                                                  predicate: ss_store_sk IS NOT NULL
+                                                                  11:EXCHANGE stats={rows=26018 conf=estimated} act={rows=3406 time=592.3us peak=632.2KB}
+PLAN FRAGMENT 7
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 11
+    PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 53
+    PARTITION: UNPARTITIONED
+8:PROJECT [d_week_seq, ss_store_sk, sum(Case { operand: None, when_then: [(TypedExpr { kind: Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: ColumnRef { column_id: c40, qualifier: None, column: "d_day_name" }, data_type: Utf8, nullable: true }, op: Eq, right: TypedExpr { kind: Literal(String("Sunday")), data_type: Utf8, nullable: false } }, data_type: Boolean, nullable: true }), data_type: Boolean, nullable: true }, TypedExpr { kind: ColumnRef { column_id: c14, qualifier: None, column: "ss_sales_price" }, data_type: Decimal128(7, 2), nullable: true })], else_expr: Some(TypedExpr { kind: Literal(Null), data_type: Null, nullable: true }) }) AS sun_sales, sum(Case { operand: None, when_then: [(TypedExpr { kind: Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: ColumnRef { column_id: c40, qualifier: None, column: "d_day_name" }, data_type: Utf8, nullable: true }, op: Eq, right: TypedExpr { kind: Literal(String("Monday")), data_type: Utf8, nullable: false } }, data_type: Boolean, nullable: true }), data_type: Boolean, nullable: true }, TypedExpr { kind: ColumnRef { column_id: c14, qualifier: None, column: "ss_sales_price" }, data_type: Decimal128(7, 2), nullable: true })], else_expr: Some(TypedExpr { kind: Literal(Null), data_type: Null, nullable: true }) }) AS mon_sales, sum(Case { operand: None, when_then: [(TypedExpr { kind: Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: ColumnRef { column_id: c40, qualifier: None, column: "d_day_name" }, data_type: Utf8, nullable: true }, op: Eq, right: TypedExpr { kind: Literal(String("Tuesday")), data_type: Utf8, nullable: false } }, data_type: Boolean, nullable: true }), data_type: Boolean, nullable: true }, TypedExpr { kind: ColumnRef { column_id: c14, qualifier: None, column: "ss_sales_price" }, data_type: Decimal128(7, 2), nullable: true })], else_expr: Some(TypedExpr { kind: Literal(Null), data_type: Null, nullable: true }) }) AS tue_sales, sum(Case { operand: None, when_then: [(TypedExpr { kind: Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: ColumnRef { column_id: c40, qualifier: None, column: "d_day_name" }, data_type: Utf8, nullable: true }, op: Eq, right: TypedExpr { kind: Literal(String("Wednesday")), data_type: Utf8, nullable: false } }, data_type: Boolean, nullable: true }), data_type: Boolean, nullable: true }, TypedExpr { kind: ColumnRef { column_id: c14, qualifier: None, column: "ss_sales_price" }, data_type: Decimal128(7, 2), nullable: true })], else_expr: Some(TypedExpr { kind: Literal(Null), data_type: Null, nullable: true }) }) AS wed_sales, sum(Case { operand: None, when_then: [(TypedExpr { kind: Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: ColumnRef { column_id: c40, qualifier: None, column: "d_day_name" }, data_type: Utf8, nullable: true }, op: Eq, right: TypedExpr { kind: Literal(String("Thursday")), data_type: Utf8, nullable: false } }, data_type: Boolean, nullable: true }), data_type: Boolean, nullable: true }, TypedExpr { kind: ColumnRef { column_id: c14, qualifier: None, column: "ss_sales_price" }, data_type: Decimal128(7, 2), nullable: true })], else_expr: Some(TypedExpr { kind: Literal(Null), data_type: Null, nullable: true }) }) AS thu_sales, sum(Case { operand: None, when_then: [(TypedExpr { kind: Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: ColumnRef { column_id: c40, qualifier: None, column: "d_day_name" }, data_type: Utf8, nullable: true }, op: Eq, right: TypedExpr { kind: Literal(String("Friday")), data_type: Utf8, nullable: false } }, data_type: Boolean, nullable: true }), data_type: Boolean, nullable: true }, TypedExpr { kind: ColumnRef { column_id: c14, qualifier: None, column: "ss_sales_price" }, data_type: Decimal128(7, 2), nullable: true })], else_expr: Some(TypedExpr { kind: Literal(Null), data_type: Null, nullable: true }) }) AS fri_sales, sum(Case { operand: None, when_then: [(TypedExpr { kind: Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: ColumnRef { column_id: c40, qualifier: None, column: "d_day_name" }, data_type: Utf8, nullable: true }, op: Eq, right: TypedExpr { kind: Literal(String("Saturday")), data_type: Utf8, nullable: false } }, data_type: Boolean, nullable: true }), data_type: Boolean, nullable: true }, TypedExpr { kind: ColumnRef { column_id: c14, qualifier: None, column: "ss_sales_price" }, data_type: Decimal128(7, 2), nullable: true })], else_expr: Some(TypedExpr { kind: Literal(Null), data_type: Null, nullable: true }) }) AS sat_sales] stats={rows=26018 conf=estimated} act={rows=1834 time=1.6ms peak=1023.3KB}
+  7:HASH AGGREGATE (GLOBAL, group by: [d_week_seq, ss_store_sk]) stats={rows=26018 conf=estimated} act={rows=4089 time=409.5us peak=901.3KB}
+    aggregations: sum(CASE WHEN d_day_name = 'Sunday' THEN ss_sales_price ELSE NULL END), sum(CASE WHEN d_day_name = 'Monday' THEN ss_sales_price ELSE NULL END), sum(CASE WHEN d_day_name = 'Tuesday' THEN ss_sales_price ELSE NULL END), sum(CASE WHEN d_day_name = 'Wednesday' THEN ss_sales_price ELSE NULL END), sum(CASE WHEN d_day_name = 'Thursday' THEN ss_sales_price ELSE NULL END), sum(CASE WHEN d_day_name = 'Friday' THEN ss_sales_price ELSE NULL END), sum(CASE WHEN d_day_name = 'Saturday' THEN ss_sales_price ELSE NULL END)
+    6:HASH EXCHANGE stats={rows=26018 conf=estimated} act={rows=2255 time=15.0us peak=0B}
+PLAN FRAGMENT 8
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 6
+    PARTITION: HASH_PARTITIONED (d_week_seq, ss_store_sk)
+5:HASH AGGREGATE (LOCAL, group by: [d_week_seq, ss_store_sk]) stats={rows=26018 conf=estimated} act={rows=2752566 time=69.6ms peak=16.6MB}
+  aggregations: sum(CASE WHEN d_day_name = 'Sunday' THEN ss_sales_price ELSE NULL END), sum(CASE WHEN d_day_name = 'Monday' THEN ss_sales_price ELSE NULL END), sum(CASE WHEN d_day_name = 'Tuesday' THEN ss_sales_price ELSE NULL END), sum(CASE WHEN d_day_name = 'Wednesday' THEN ss_sales_price ELSE NULL END), sum(CASE WHEN d_day_name = 'Thursday' THEN ss_sales_price ELSE NULL END), sum(CASE WHEN d_day_name = 'Friday' THEN ss_sales_price ELSE NULL END), sum(CASE WHEN d_day_name = 'Saturday' THEN ss_sales_price ELSE NULL END)
+  4:HASH JOIN (BROADCAST, INNER, eq: [ss_sold_date_sk = d_date_sk]) stats={rows=2750311 conf=estimated} act={rows=2969458 time=101.0ms peak=50.9MB}
+    build runtime filters:
+    - filter_id = 0, build_expr = (d_date_sk)
+    1:SCAN tpcds.store_sales stats={rows=2750311 conf=estimated} act={rows=2750311 time=4.4ms peak=0B}
+         TABLE: tpcds.store_sales
+         columns: ss_sold_date_sk, ss_store_sk, ss_sales_price
+         min-max stats
+         predicates: ss_sold_date_sk IS NOT NULL
+        probe runtime filters:
+        - filter_id = 0, probe_expr = (ss_sold_date_sk)
+    3:GATHER stats={rows=65744 conf=estimated} act={rows=219147 time=394.1us peak=0B}
+PLAN FRAGMENT 9
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: UNPARTITIONED
+2:SCAN tpcds.date_dim stats={rows=65744 conf=estimated} act={rows=73049 time=4.0us peak=16.2MB}
+     TABLE: tpcds.date_dim
+     columns: d_date_sk, d_week_seq, d_day_name
+     min-max stats
+     predicates: d_date_sk IS NOT NULL

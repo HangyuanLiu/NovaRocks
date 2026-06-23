@@ -1,0 +1,165 @@
+-- engine=starrocks
+-- suite=tpc-h
+-- case=q16
+-- file=/Users/harbor/project/NovaRocks/sql-tests/tpc-h/sql/q16.sql
+-- elapsed_sec=0.067
+-- exit_code=0
+
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 1.4411006321312153E8
+  Memory: 2.3021457082370356E7
+
+PLAN FRAGMENT 0(F08)
+  Fragment Cost: 1.2856050841840953E7
+  Output Exprs:13: p_brand | 14: p_type | 15: p_size | 35: count
+  Input Partition: UNPARTITIONED
+  RESULT SINK
+
+  16:MERGING-EXCHANGE
+     distribution type: GATHER
+     cardinality: 73046
+
+PLAN FRAGMENT 1(F07)
+  Fragment Cost: 5.221304931084123E7
+
+  Input Partition: HASH_PARTITIONED: 13: p_brand, 14: p_type, 15: p_size
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 16
+
+  15:SORT
+  |  order by: [35, BIGINT, false] DESC, [13, VARCHAR(1073741824), true] ASC, [14, VARCHAR(1073741824), true] ASC, [15, INT, true] ASC
+  |  offset: 0
+  |  cardinality: 73046
+  |
+  14:AGGREGATE (update finalize)
+  |  aggregate: count[([2: ps_suppkey, INT, true]); args: INT; result: BIGINT; args nullable: true; result nullable: false]
+  |  group by: [13: p_brand, VARCHAR(1073741824), true], [14: p_type, VARCHAR(1073741824), true], [15: p_size, INT, true]
+  |  cardinality: 132509
+  |
+  13:AGGREGATE (merge serialize)
+  |  group by: [2: ps_suppkey, INT, true], [13: p_brand, VARCHAR(1073741824), true], [14: p_type, VARCHAR(1073741824), true], [15: p_size, INT, true]
+  |  cardinality: 240380
+  |
+  12:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [13: p_brand, VARCHAR(1073741824), true], [14: p_type, VARCHAR(1073741824), true], [15: p_size, INT, true]
+     cardinality: 415298
+
+PLAN FRAGMENT 2(F04)
+  Fragment Cost: 6.208588375E7
+
+  Input Partition: HASH_PARTITIONED: 1: ps_partkey
+  OutPut Partition: HASH_PARTITIONED: 13: p_brand, 14: p_type, 15: p_size
+  OutPut Exchange Id: 12
+
+  11:AGGREGATE (update serialize)
+  |  STREAMING
+  |  group by: [2: ps_suppkey, INT, true], [13: p_brand, VARCHAR(1073741824), true], [14: p_type, VARCHAR(1073741824), true], [15: p_size, INT, true]
+  |  cardinality: 415298
+  |
+  10:Project
+  |  output columns:
+  |  2 <-> [2: ps_suppkey, INT, true]
+  |  13 <-> [13: p_brand, VARCHAR(1073741824), true]
+  |  14 <-> [14: p_type, VARCHAR(1073741824), true]
+  |  15 <-> [15: p_size, INT, true]
+  |  cardinality: 717500
+  |
+  9:HASH JOIN
+  |  join op: NULL AWARE LEFT ANTI JOIN (BROADCAST)
+  |  equal join conjunct: [2: ps_suppkey, INT, true] = [23: s_suppkey, INT, true]
+  |  output columns: 2, 13, 14, 15
+  |  can local shuffle: true
+  |  cardinality: 717500
+  |
+  |----8:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 2500
+  |
+  5:Project
+  |  output columns:
+  |  2 <-> [2: ps_suppkey, INT, true]
+  |  13 <-> [13: p_brand, VARCHAR(1073741824), true]
+  |  14 <-> [14: p_type, VARCHAR(1073741824), true]
+  |  15 <-> [15: p_size, INT, true]
+  |  cardinality: 720000
+  |
+  4:HASH JOIN
+  |  join op: INNER JOIN (PARTITIONED)
+  |  equal join conjunct: [1: ps_partkey, INT, true] = [10: p_partkey, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 0, build_expr = (10: p_partkey), remote = true
+  |  output columns: 2, 13, 14, 15
+  |  can local shuffle: false
+  |  cardinality: 720000
+  |
+  |----3:EXCHANGE
+  |       distribution type: SHUFFLE
+  |       partition exprs: [10: p_partkey, INT, true]
+  |       cardinality: 37500
+  |
+  1:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [1: ps_partkey, INT, true]
+     cardinality: 720000
+
+PLAN FRAGMENT 3(F05)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 08
+
+  7:Project
+  |  output columns:
+  |  23 <-> [23: s_suppkey, INT, true]
+  |  cardinality: 2500
+  |
+  6:IcebergScanNode
+     TABLE: tpch.supplier
+     PREDICATES: 29: s_comment LIKE '%Customer%Complaints%'
+     TABLE VERSION: Snapshot@(7110507688499337981)
+     cardinality=2500
+     avgRowSize=2.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 2500
+
+PLAN FRAGMENT 4(F02)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 10: p_partkey
+  OutPut Exchange Id: 03
+
+  2:IcebergScanNode
+     TABLE: tpch.part
+     PREDICATES: 13: p_brand != 'Brand#43', NOT (14: p_type LIKE 'PROMO BURNISHED%'), 15: p_size IN (31, 43, 9, 6, 18, 11, 25, 1)
+     MIN/MAX PREDICATES: 15: p_size >= 1, 15: p_size <= 43
+     TABLE VERSION: Snapshot@(4879851144136466836)
+     cardinality=37500
+     avgRowSize=4.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 37500
+
+PLAN FRAGMENT 5(F00)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 1: ps_partkey
+  OutPut Exchange Id: 01
+
+  0:IcebergScanNode
+     TABLE: tpch.partsupp
+     PREDICATES: 1: ps_partkey IS NOT NULL
+     TABLE VERSION: Snapshot@(3548303098888051128)
+     cardinality=720000
+     avgRowSize=2.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 720000
+     probe runtime filters:
+     - filter_id = 0, probe_expr = (1: ps_partkey)

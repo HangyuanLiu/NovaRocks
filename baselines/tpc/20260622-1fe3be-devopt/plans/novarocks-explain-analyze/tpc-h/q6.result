@@ -1,0 +1,22 @@
+Explain String
+Planning: 30.6ms / Execution: 416.8ms / Rows: 1
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+5:PROJECT [sum(l_extendedprice * l_discount) AS revenue] stats={rows=1 conf=estimated} act={rows=1 time=9.7us peak=16B}
+  4:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=135.6us peak=64.4KB}
+    aggregations: sum(l_extendedprice * l_discount)
+    3:GATHER stats={rows=1 conf=estimated} act={rows=12 time=5.7us peak=0B}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: UNPARTITIONED
+2:HASH AGGREGATE (LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=1.0ms peak=1.3MB}
+  aggregations: sum(l_extendedprice * l_discount)
+  1:SCAN tpch.lineitem stats={rows=904713 conf=estimated} act={rows=114781 time=8.0us peak=0B}
+       TABLE: tpch.lineitem
+       columns: l_extendedprice, l_discount, l_quantity, l_shipdate
+       min-max stats
+       predicates: l_shipdate >= 9131 AND l_shipdate < 9496 AND l_discount BETWEEN 0.02 AND 0.04 AND l_quantity < 24

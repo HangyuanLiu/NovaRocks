@@ -1,0 +1,129 @@
+-- engine=starrocks
+-- suite=tpc-h
+-- case=q4
+-- file=/Users/harbor/project/NovaRocks/sql-tests/tpc-h/sql/q4.sql
+-- elapsed_sec=0.046
+-- exit_code=0
+
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 1.79944827E8
+  Memory: 5.8165974E7
+
+PLAN FRAGMENT 0(F06)
+  Fragment Cost: 7.201458E7
+  Output Exprs:6: o_orderpriority | 35: count
+  Input Partition: UNPARTITIONED
+  RESULT SINK
+
+  12:MERGING-EXCHANGE
+     distribution type: GATHER
+     cardinality: 750152
+
+PLAN FRAGMENT 1(F05)
+  Fragment Cost: 1.278258795E8
+
+  Input Partition: HASH_PARTITIONED: 6: o_orderpriority
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 12
+
+  11:SORT
+  |  order by: [6, VARCHAR(1073741824), true] ASC
+  |  offset: 0
+  |  cardinality: 750152
+  |
+  10:AGGREGATE (merge finalize)
+  |  aggregate: count[([35: count, BIGINT, false]); args: ; result: BIGINT; args nullable: true; result nullable: false]
+  |  group by: [6: o_orderpriority, VARCHAR(1073741824), true]
+  |  cardinality: 750152
+  |
+  9:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [6: o_orderpriority, VARCHAR(1073741824), true]
+     cardinality: 1500304
+
+PLAN FRAGMENT 2(F04)
+  Fragment Cost: 6.0253113E7
+
+  Input Partition: HASH_PARTITIONED: 14: l_orderkey
+  OutPut Partition: HASH_PARTITIONED: 6: o_orderpriority
+  OutPut Exchange Id: 09
+
+  8:AGGREGATE (update serialize)
+  |  STREAMING
+  |  aggregate: count[(*); args: ; result: BIGINT; args nullable: false; result nullable: false]
+  |  group by: [6: o_orderpriority, VARCHAR(1073741824), true]
+  |  cardinality: 1500304
+  |
+  7:Project
+  |  output columns:
+  |  6 <-> [6: o_orderpriority, VARCHAR(1073741824), true]
+  |  cardinality: 3000608
+  |
+  6:HASH JOIN
+  |  join op: RIGHT SEMI JOIN (PARTITIONED)
+  |  equal join conjunct: [14: l_orderkey, INT, true] = [1: o_orderkey, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 0, build_expr = (1: o_orderkey), remote = true
+  |  output columns: 6
+  |  can local shuffle: true
+  |  cardinality: 3000608
+  |
+  |----5:EXCHANGE
+  |       distribution type: SHUFFLE
+  |       partition exprs: [1: o_orderkey, INT, true]
+  |       cardinality: 27716
+  |
+  2:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [14: l_orderkey, INT, true]
+     cardinality: 3000608
+
+PLAN FRAGMENT 3(F02)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 1: o_orderkey
+  OutPut Exchange Id: 05
+
+  4:Project
+  |  output columns:
+  |  1 <-> [1: o_orderkey, INT, true]
+  |  6 <-> [6: o_orderpriority, VARCHAR(1073741824), true]
+  |  cardinality: 27716
+  |
+  3:IcebergScanNode
+     TABLE: tpch.orders
+     PREDICATES: 5: o_orderdate >= '1994-09-01', 5: o_orderdate < '1994-12-01'
+     MIN/MAX PREDICATES: 5: o_orderdate >= '1994-09-01', 5: o_orderdate < '1994-12-01'
+     TABLE VERSION: Snapshot@(2660326479417119815)
+     cardinality=27716
+     avgRowSize=3.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 27716
+
+PLAN FRAGMENT 4(F00)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 14: l_orderkey
+  OutPut Exchange Id: 02
+
+  1:Project
+  |  output columns:
+  |  14 <-> [14: l_orderkey, INT, true]
+  |  cardinality: 3000608
+  |
+  0:IcebergScanNode
+     TABLE: tpch.lineitem
+     PREDICATES: 26: l_receiptdate > 25: l_commitdate
+     TABLE VERSION: Snapshot@(2784910170297541234)
+     cardinality=3000608
+     avgRowSize=3.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 3000608
+     probe runtime filters:
+     - filter_id = 0, probe_expr = (14: l_orderkey)

@@ -1,0 +1,227 @@
+-- query 1
+Explain String
+Planning: 51.7ms / Execution: 1.48s / Rows: 243
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+27:SORT BY [inv1.w_warehouse_sk ASC NULLS FIRST, inv1.i_item_sk ASC NULLS FIRST, inv1.d_moy ASC NULLS FIRST, inv1.mean ASC NULLS FIRST, inv1.cov ASC NULLS FIRST, inv2.d_moy ASC NULLS FIRST, inv2.mean ASC NULLS FIRST, inv2.cov ASC NULLS FIRST] stats={rows=1630 conf=estimated} act={rows=486 time=63.5us peak=25.8KB}
+  26:GATHER stats={rows=1630 conf=estimated} act={rows=243 time=4.5us peak=0B}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 26
+    PARTITION: UNPARTITIONED
+25:PROJECT [inv1.w_warehouse_sk AS w_warehouse_sk, inv1.i_item_sk AS i_item_sk, inv1.d_moy AS d_moy, inv1.mean AS mean, inv1.cov AS cov, inv2.w_warehouse_sk AS w_warehouse_sk, inv2.i_item_sk AS i_item_sk, inv2.d_moy AS d_moy, inv2.mean AS mean, inv2.cov AS cov] stats={rows=1630 conf=estimated} act={rows=243 time=177.4us peak=60.8KB}
+  24:HASH JOIN (BROADCAST, INNER, eq: [inv2.i_item_sk = inv1.i_item_sk, inv2.w_warehouse_sk = inv1.w_warehouse_sk]) stats={rows=1630 conf=estimated} act={rows=3323 time=564.8us peak=496.7KB}
+    build runtime filters:
+    - filter_id = 3, build_expr = (inv1.i_item_sk)
+    - filter_id = 4, build_expr = (inv1.w_warehouse_sk)
+    19:FILTER stats={rows=10374 conf=estimated}
+      predicate: inv2.i_item_sk IS NOT NULL AND inv2.w_warehouse_sk IS NOT NULL
+      18:FILTER stats={rows=12150 conf=estimated}
+        predicate: inv2.d_moy = 1 + 1
+        17:EXCHANGE stats={rows=48600 conf=estimated} act={rows=36866 time=179.9us peak=1.8MB}
+    23:GATHER stats={rows=3458 conf=estimated} act={rows=3080 time=7.7us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 23
+    PARTITION: UNPARTITIONED
+22:FILTER stats={rows=3458 conf=estimated}
+  predicate: inv1.i_item_sk IS NOT NULL AND inv1.w_warehouse_sk IS NOT NULL
+  21:FILTER stats={rows=4050 conf=estimated}
+    predicate: inv1.d_moy = 1
+    20:EXCHANGE stats={rows=48600 conf=estimated} act={rows=36776 time=205.5us peak=1.2MB}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 17
+    PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 20
+    PARTITION: UNPARTITIONED
+16:PROJECT [w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy, stdev, mean, CASE mean WHEN 0 THEN NULL ELSE stdev / mean END AS cov] stats={rows=48600 conf=estimated} act={rows=33696 time=191.8us peak=6.8MB}
+  15:PROJECT [w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy, stdev, mean] stats={rows=48600 conf=estimated} act={rows=33696 time=41.6us peak=1.5MB}
+    14:PROJECT [w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy, stddev_samp(inv_quantity_on_hand) AS stdev, avg(inv_quantity_on_hand) AS mean] stats={rows=48600 conf=estimated} act={rows=33696 time=57.0us peak=1.5MB}
+      13:FILTER stats={rows=48600 conf=estimated}
+        predicate: CASE avg(inv_quantity_on_hand) WHEN 0 THEN CAST(0 AS Float64) ELSE stddev_samp(inv_quantity_on_hand) / avg(inv_quantity_on_hand) END > 1
+        12:HASH AGGREGATE (SINGLE, group by: [w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy]) stats={rows=97200 conf=estimated} act={rows=2763086 time=170.5ms peak=306.6MB}
+          aggregations: stddev_samp(inv_quantity_on_hand), avg(inv_quantity_on_hand)
+          11:GATHER stats={rows=6890212 conf=estimated} act={rows=2340000 time=170.1us peak=0B}
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 11
+    PARTITION: UNPARTITIONED
+10:HASH JOIN (BROADCAST, INNER, eq: [inv_date_sk = d_date_sk]) stats={rows=6890212 conf=estimated} act={rows=2341095 time=42.7ms peak=157.2MB}
+  build runtime filters:
+  - filter_id = 2, build_expr = (d_date_sk)
+  7:HASH JOIN (BROADCAST, INNER, eq: [inv_warehouse_sk = w_warehouse_sk]) stats={rows=6890212 conf=estimated} act={rows=2340015 time=31.7ms peak=3.6MB}
+    build runtime filters:
+    - filter_id = 1, build_expr = (w_warehouse_sk)
+    4:HASH JOIN (BROADCAST, INNER, eq: [inv_item_sk = i_item_sk]) stats={rows=7655791 conf=estimated} act={rows=2394000 time=48.4ms peak=14.1MB}
+      build runtime filters:
+      - filter_id = 0, build_expr = (i_item_sk)
+      1:SCAN tpcds.inventory stats={rows=8562105 conf=estimated} act={rows=2340000 time=3.9ms peak=0B}
+           TABLE: tpcds.inventory
+           columns: inv_date_sk, inv_item_sk, inv_warehouse_sk, inv_quantity_on_hand
+           min-max stats
+           predicates: inv_item_sk IS NOT NULL AND inv_warehouse_sk IS NOT NULL AND inv_date_sk IS NOT NULL
+          probe runtime filters:
+          - filter_id = 0, probe_expr = (inv_item_sk)
+          - filter_id = 1, probe_expr = (inv_warehouse_sk)
+          - filter_id = 2, probe_expr = (inv_date_sk)
+      3:GATHER stats={rows=16200 conf=estimated} act={rows=54000 time=26.8us peak=0B}
+    6:GATHER stats={rows=5 conf=estimated} act={rows=15 time=26.5us peak=0B}
+  9:GATHER stats={rows=327 conf=estimated} act={rows=1095 time=12.8us peak=0B}
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 9
+    PARTITION: UNPARTITIONED
+8:SCAN tpcds.date_dim stats={rows=327 conf=estimated} act={rows=365 time=22.6us peak=228.0KB}
+     TABLE: tpcds.date_dim
+     columns: d_date_sk, d_moy, d_year
+     min-max stats
+     predicates: d_year = 2001 AND d_date_sk IS NOT NULL
+PLAN FRAGMENT 6
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 6
+    PARTITION: UNPARTITIONED
+5:SCAN tpcds.warehouse stats={rows=5 conf=estimated} act={rows=5 time=16.8us peak=7.4KB}
+     TABLE: tpcds.warehouse
+     columns: w_warehouse_sk, w_warehouse_name
+     min-max stats
+     predicates: w_warehouse_sk IS NOT NULL
+PLAN FRAGMENT 7
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: UNPARTITIONED
+2:SCAN tpcds.item stats={rows=16200 conf=estimated} act={rows=18000 time=90.0us peak=6.6MB}
+     TABLE: tpcds.item
+     columns: i_item_sk
+     min-max stats
+     predicates: i_item_sk IS NOT NULL
+
+-- query 2
+Explain String
+Planning: 72.0ms / Execution: 1.52s / Rows: 14
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+27:SORT BY [inv1.w_warehouse_sk ASC NULLS FIRST, inv1.i_item_sk ASC NULLS FIRST, inv1.d_moy ASC NULLS FIRST, inv1.mean ASC NULLS FIRST, inv1.cov ASC NULLS FIRST, inv2.d_moy ASC NULLS FIRST, inv2.mean ASC NULLS FIRST, inv2.cov ASC NULLS FIRST] stats={rows=1153 conf=estimated} act={rows=28 time=39.0us peak=6.2KB}
+  26:GATHER stats={rows=1153 conf=estimated} act={rows=14 time=8.3us peak=0B}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 26
+    PARTITION: UNPARTITIONED
+25:PROJECT [inv1.w_warehouse_sk AS w_warehouse_sk, inv1.i_item_sk AS i_item_sk, inv1.d_moy AS d_moy, inv1.mean AS mean, inv1.cov AS cov, inv2.w_warehouse_sk AS w_warehouse_sk, inv2.i_item_sk AS i_item_sk, inv2.d_moy AS d_moy, inv2.mean AS mean, inv2.cov AS cov] stats={rows=1153 conf=estimated} act={rows=14 time=149.7us peak=12.3KB}
+  24:HASH JOIN (BROADCAST, INNER, eq: [inv2.i_item_sk = inv1.i_item_sk, inv2.w_warehouse_sk = inv1.w_warehouse_sk]) stats={rows=1153 conf=estimated} act={rows=136 time=145.5us peak=186.5KB}
+    build runtime filters:
+    - filter_id = 3, build_expr = (inv1.i_item_sk)
+    - filter_id = 4, build_expr = (inv1.w_warehouse_sk)
+    19:FILTER stats={rows=10374 conf=estimated}
+      predicate: inv2.i_item_sk IS NOT NULL AND inv2.w_warehouse_sk IS NOT NULL
+      18:FILTER stats={rows=12150 conf=estimated}
+        predicate: inv2.d_moy = 1 + 1
+        17:EXCHANGE stats={rows=48600 conf=estimated} act={rows=36866 time=213.8us peak=1.8MB}
+    23:GATHER stats={rows=2445 conf=estimated} act={rows=122 time=15.5us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 23
+    PARTITION: UNPARTITIONED
+22:FILTER stats={rows=2445 conf=estimated}
+  predicate: inv1.i_item_sk IS NOT NULL AND inv1.w_warehouse_sk IS NOT NULL
+  21:FILTER stats={rows=2864 conf=estimated}
+    predicate: inv1.d_moy = 1 AND inv1.cov > 1.5
+    20:EXCHANGE stats={rows=48600 conf=estimated} act={rows=33818 time=258.0us peak=933.5KB}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 17
+    PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 20
+    PARTITION: UNPARTITIONED
+16:PROJECT [w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy, stdev, mean, CASE mean WHEN 0 THEN NULL ELSE stdev / mean END AS cov] stats={rows=48600 conf=estimated} act={rows=33696 time=202.5us peak=6.8MB}
+  15:PROJECT [w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy, stdev, mean] stats={rows=48600 conf=estimated} act={rows=33696 time=41.3us peak=1.5MB}
+    14:PROJECT [w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy, stddev_samp(inv_quantity_on_hand) AS stdev, avg(inv_quantity_on_hand) AS mean] stats={rows=48600 conf=estimated} act={rows=33696 time=59.9us peak=1.5MB}
+      13:FILTER stats={rows=48600 conf=estimated}
+        predicate: CASE avg(inv_quantity_on_hand) WHEN 0 THEN CAST(0 AS Float64) ELSE stddev_samp(inv_quantity_on_hand) / avg(inv_quantity_on_hand) END > 1
+        12:HASH AGGREGATE (SINGLE, group by: [w_warehouse_name, w_warehouse_sk, i_item_sk, d_moy]) stats={rows=97200 conf=estimated} act={rows=2848202 time=166.9ms peak=316.2MB}
+          aggregations: stddev_samp(inv_quantity_on_hand), avg(inv_quantity_on_hand)
+          11:GATHER stats={rows=6890212 conf=estimated} act={rows=2340000 time=350.8us peak=0B}
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 11
+    PARTITION: UNPARTITIONED
+10:HASH JOIN (BROADCAST, INNER, eq: [inv_date_sk = d_date_sk]) stats={rows=6890212 conf=estimated} act={rows=2341095 time=42.1ms peak=173.9MB}
+  build runtime filters:
+  - filter_id = 2, build_expr = (d_date_sk)
+  7:HASH JOIN (BROADCAST, INNER, eq: [inv_warehouse_sk = w_warehouse_sk]) stats={rows=6890212 conf=estimated} act={rows=2340015 time=29.2ms peak=3.6MB}
+    build runtime filters:
+    - filter_id = 1, build_expr = (w_warehouse_sk)
+    4:HASH JOIN (BROADCAST, INNER, eq: [inv_item_sk = i_item_sk]) stats={rows=7655791 conf=estimated} act={rows=2394000 time=41.2ms peak=14.0MB}
+      build runtime filters:
+      - filter_id = 0, build_expr = (i_item_sk)
+      1:SCAN tpcds.inventory stats={rows=8562105 conf=estimated} act={rows=2340000 time=3.1ms peak=0B}
+           TABLE: tpcds.inventory
+           columns: inv_date_sk, inv_item_sk, inv_warehouse_sk, inv_quantity_on_hand
+           min-max stats
+           predicates: inv_item_sk IS NOT NULL AND inv_warehouse_sk IS NOT NULL AND inv_date_sk IS NOT NULL
+          probe runtime filters:
+          - filter_id = 0, probe_expr = (inv_item_sk)
+          - filter_id = 1, probe_expr = (inv_warehouse_sk)
+          - filter_id = 2, probe_expr = (inv_date_sk)
+      3:GATHER stats={rows=16200 conf=estimated} act={rows=54000 time=18.5us peak=0B}
+    6:GATHER stats={rows=5 conf=estimated} act={rows=15 time=6.4us peak=0B}
+  9:GATHER stats={rows=327 conf=estimated} act={rows=1095 time=12.0us peak=0B}
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 9
+    PARTITION: UNPARTITIONED
+8:SCAN tpcds.date_dim stats={rows=327 conf=estimated} act={rows=365 time=39.3us peak=228.0KB}
+     TABLE: tpcds.date_dim
+     columns: d_date_sk, d_moy, d_year
+     min-max stats
+     predicates: d_year = 2001 AND d_date_sk IS NOT NULL
+PLAN FRAGMENT 6
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 6
+    PARTITION: UNPARTITIONED
+5:SCAN tpcds.warehouse stats={rows=5 conf=estimated} act={rows=5 time=30.3us peak=7.4KB}
+     TABLE: tpcds.warehouse
+     columns: w_warehouse_sk, w_warehouse_name
+     min-max stats
+     predicates: w_warehouse_sk IS NOT NULL
+PLAN FRAGMENT 7
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: UNPARTITIONED
+2:SCAN tpcds.item stats={rows=16200 conf=estimated} act={rows=18000 time=86.8us peak=7.8MB}
+     TABLE: tpcds.item
+     columns: i_item_sk
+     min-max stats
+     predicates: i_item_sk IS NOT NULL

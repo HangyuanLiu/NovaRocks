@@ -1,0 +1,69 @@
+Explain String
+Planning: 49.1ms / Execution: 2.87s / Rows: 10
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+14:PROJECT [l_orderkey, sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c28, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) AS revenue, o_orderdate, o_shippriority] stats={rows=10 conf=estimated} act={rows=10 time=69.6us peak=280B}
+  13:MERGING-EXCHANGE stats={rows=10 conf=estimated} act={rows=70 time=37.1us peak=2.5KB}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 13
+    PARTITION: UNPARTITIONED
+12:LOCAL TOP-N (limit=10, offset=0) [sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c28, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) DESC NULLS LAST, o_orderdate ASC NULLS FIRST] stats={rows=10 conf=estimated} act={rows=11466 time=366.1us peak=644.5KB}
+  11:HASH AGGREGATE (GLOBAL, group by: [l_orderkey, o_orderdate, o_shippriority]) stats={rows=408707 conf=estimated} act={rows=22872 time=287.0us peak=924.4KB}
+    aggregations: sum(l_extendedprice * 1 - l_discount)
+    10:HASH EXCHANGE stats={rows=408707 conf=estimated} act={rows=11436 time=5.5us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 10
+    PARTITION: HASH_PARTITIONED (l_orderkey, o_orderdate, o_shippriority)
+9:HASH AGGREGATE (LOCAL, group by: [l_orderkey, o_orderdate, o_shippriority]) stats={rows=408707 conf=estimated} act={rows=41707 time=143.1ms peak=1.4MB}
+  aggregations: sum(l_extendedprice * 1 - l_discount)
+  8:HASH JOIN (PARTITIONED, INNER, eq: [l_orderkey = o_orderkey]) stats={rows=408707 conf=estimated} act={rows=3426757 time=379.0ms peak=57.6MB}
+    build runtime filters:
+    - filter_id = 1, build_expr = (o_orderkey)
+    2:HASH EXCHANGE stats={rows=2911243 conf=estimated} act={rows=3251845 time=335.6us peak=0B}
+    7:HASH EXCHANGE stats={rows=205315 conf=estimated} act={rows=144641 time=1.3ms peak=0B}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 7
+    PARTITION: HASH_PARTITIONED (o_orderkey)
+6:HASH JOIN (BROADCAST, INNER, eq: [o_custkey = c_custkey]) stats={rows=205315 conf=estimated} act={rows=235208 time=318.8ms peak=23.6MB}
+  build runtime filters:
+  - filter_id = 0, build_expr = (c_custkey)
+  3:SCAN tpch.orders stats={rows=588555 conf=estimated} act={rows=144641 time=50.5ms peak=0B}
+       TABLE: tpch.orders
+       columns: o_orderkey, o_custkey, o_orderdate, o_shippriority
+       min-max stats
+       predicates: o_orderdate < 9200 AND o_custkey IS NOT NULL AND o_orderkey IS NOT NULL
+      probe runtime filters:
+      - filter_id = 0, probe_expr = (o_custkey)
+  5:GATHER stats={rows=33750 conf=estimated} act={rows=90567 time=17.3us peak=0B}
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 5
+    PARTITION: UNPARTITIONED
+4:SCAN tpch.customer stats={rows=33750 conf=estimated} act={rows=30189 time=175.5us peak=6.9MB}
+     TABLE: tpch.customer
+     columns: c_custkey, c_mktsegment
+     min-max stats
+     predicates: c_mktsegment = 'HOUSEHOLD' AND c_custkey IS NOT NULL
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 2
+    PARTITION: HASH_PARTITIONED (l_orderkey)
+1:SCAN tpch.lineitem stats={rows=2911243 conf=estimated} act={rows=3251845 time=204.8ms peak=123.5MB}
+     TABLE: tpch.lineitem
+     columns: l_orderkey, l_extendedprice, l_discount, l_shipdate
+     min-max stats
+     predicates: l_shipdate > 9200 AND l_orderkey IS NOT NULL

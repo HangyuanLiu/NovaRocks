@@ -1,0 +1,446 @@
+-- engine=starrocks
+-- suite=tpc-ds
+-- case=q78
+-- file=/Users/harbor/project/NovaRocks/sql-tests/tpc-ds/sql/q78.sql
+-- elapsed_sec=0.159
+-- exit_code=0
+
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 2.2970186026911312E8
+  Memory: 2.0125221315759063E7
+
+PLAN FRAGMENT 0(F18)
+  Fragment Cost: 76800.0
+  Output Exprs:58: d_year | 3: ss_item_sk | 4: ss_customer_sk | 292: round | 84: sum | 85: sum | 86: sum | 293: expr | 294: expr | 295: expr
+  Input Partition: UNPARTITIONED
+  RESULT SINK
+
+  41:MERGING-EXCHANGE
+     distribution type: GATHER
+     limit: 100
+     cardinality: 100
+
+PLAN FRAGMENT 1(F05)
+  Fragment Cost: 6.45748603821885E7
+
+  Input Partition: HASH_PARTITIONED: 58: d_year, 3: ss_item_sk, 4: ss_customer_sk
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 41
+
+  40:TOP-N
+  |  order by: [58, INT, true] ASC, [3, INT, true] ASC, [4, INT, true] ASC, [84, BIGINT, true] DESC, [85, DECIMAL128(38,2), true] DESC, [86, DECIMAL128(38,2), true] DESC, [293, BIGINT, true] ASC, [294, DECIMAL128(38,2), true] ASC, [295, DECIMAL128(38,2), true] ASC, [292, DOUBLE, true] ASC
+  |  offset: 0
+  |  hasNullableGenerateChild: true
+  |  limit: 100
+  |  cardinality: 100
+  |
+  39:Project
+  |  output columns:
+  |  3 <-> [3: ss_item_sk, INT, true]
+  |  4 <-> [4: ss_customer_sk, INT, true]
+  |  58 <-> [58: d_year, INT, true]
+  |  84 <-> [84: sum, BIGINT, true]
+  |  85 <-> [85: sum, DECIMAL128(38,2), true]
+  |  86 <-> [86: sum, DECIMAL128(38,2), true]
+  |  292 <-> round[(cast([84: sum, BIGINT, true] as DOUBLE) / cast([298: add, BIGINT, true] as DOUBLE), 2); args: DOUBLE,INT; result: DOUBLE; args nullable: true; result nullable: true]
+  |  293 <-> [298: add, BIGINT, true]
+  |  294 <-> coalesce[([186: sum, DECIMAL128(38,2), true], 0); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true] + coalesce[([290: sum, DECIMAL128(38,2), true], 0); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |  295 <-> coalesce[([187: sum, DECIMAL128(38,2), true], 0); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true] + coalesce[([291: sum, DECIMAL128(38,2), true], 0); args: DECIMAL128; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |  common expressions:
+  |  296 <-> coalesce[([185: sum, BIGINT, true], 0); args: BIGINT; result: BIGINT; args nullable: true; result nullable: true]
+  |  297 <-> coalesce[([289: sum, BIGINT, true], 0); args: BIGINT; result: BIGINT; args nullable: true; result nullable: true]
+  |  298 <-> [296: coalesce, BIGINT, true] + [297: coalesce, BIGINT, true]
+  |  hasNullableGenerateChild: true
+  |  cardinality: 57280
+  |
+  38:HASH JOIN
+  |  join op: LEFT OUTER JOIN (BUCKET_SHUFFLE(S))
+  |  equal join conjunct: [58: d_year, INT, true] = [263: d_year, INT, true]
+  |  equal join conjunct: [3: ss_item_sk, INT, true] = [203: cs_item_sk, INT, true]
+  |  equal join conjunct: [4: ss_customer_sk, INT, true] = [191: cs_bill_customer_sk, INT, true]
+  |  other predicates: (coalesce[([185: sum, BIGINT, true], 0); args: BIGINT; result: BIGINT; args nullable: true; result nullable: true] > 0) OR (coalesce[([289: sum, BIGINT, true], 0); args: BIGINT; result: BIGINT; args nullable: true; result nullable: true] > 0)
+  |  output columns: 3, 4, 58, 84, 85, 86, 185, 186, 187, 289, 290, 291
+  |  can local shuffle: false
+  |  cardinality: 57280
+  |
+  |----37:AGGREGATE (merge finalize)
+  |    |  aggregate: sum[([289: sum, BIGINT, true]); args: INT; result: BIGINT; args nullable: true; result nullable: true], sum[([290: sum, DECIMAL128(38,2), true]); args: DECIMAL32; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([291: sum, DECIMAL128(38,2), true]); args: DECIMAL32; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |    |  group by: [263: d_year, INT, true], [203: cs_item_sk, INT, true], [191: cs_bill_customer_sk, INT, true]
+  |    |  hasNullableGenerateChild: true
+  |    |  cardinality: 39425
+  |    |
+  |    36:EXCHANGE
+  |       distribution type: SHUFFLE
+  |       partition exprs: [263: d_year, INT, true], [203: cs_item_sk, INT, true], [191: cs_bill_customer_sk, INT, true]
+  |       cardinality: 71519
+  |
+  25:Project
+  |  output columns:
+  |  3 <-> [3: ss_item_sk, INT, true]
+  |  4 <-> [4: ss_customer_sk, INT, true]
+  |  58 <-> [58: d_year, INT, true]
+  |  84 <-> [84: sum, BIGINT, true]
+  |  85 <-> [85: sum, DECIMAL128(38,2), true]
+  |  86 <-> [86: sum, DECIMAL128(38,2), true]
+  |  185 <-> [185: sum, BIGINT, true]
+  |  186 <-> [186: sum, DECIMAL128(38,2), true]
+  |  187 <-> [187: sum, DECIMAL128(38,2), true]
+  |  hasNullableGenerateChild: true
+  |  cardinality: 76374
+  |
+  24:HASH JOIN
+  |  join op: LEFT OUTER JOIN (BUCKET_SHUFFLE(S))
+  |  equal join conjunct: [58: d_year, INT, true] = [159: d_year, INT, true]
+  |  equal join conjunct: [3: ss_item_sk, INT, true] = [90: ws_item_sk, INT, true]
+  |  equal join conjunct: [4: ss_customer_sk, INT, true] = [91: ws_bill_customer_sk, INT, true]
+  |  output columns: 3, 4, 58, 84, 85, 86, 185, 186, 187
+  |  can local shuffle: false
+  |  cardinality: 76374
+  |
+  |----23:AGGREGATE (merge finalize)
+  |    |  aggregate: sum[([185: sum, BIGINT, true]); args: INT; result: BIGINT; args nullable: true; result nullable: true], sum[([186: sum, DECIMAL128(38,2), true]); args: DECIMAL32; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([187: sum, DECIMAL128(38,2), true]); args: DECIMAL32; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |    |  group by: [159: d_year, INT, true], [90: ws_item_sk, INT, true], [91: ws_bill_customer_sk, INT, true]
+  |    |  hasNullableGenerateChild: true
+  |    |  cardinality: 19674
+  |    |
+  |    22:EXCHANGE
+  |       distribution type: SHUFFLE
+  |       partition exprs: [159: d_year, INT, true], [90: ws_item_sk, INT, true], [91: ws_bill_customer_sk, INT, true]
+  |       cardinality: 35690
+  |
+  11:AGGREGATE (merge finalize)
+  |  aggregate: sum[([84: sum, BIGINT, true]); args: INT; result: BIGINT; args nullable: true; result nullable: true], sum[([85: sum, DECIMAL128(38,2), true]); args: DECIMAL32; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([86: sum, DECIMAL128(38,2), true]); args: DECIMAL32; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |  group by: [58: d_year, INT, true], [3: ss_item_sk, INT, true], [4: ss_customer_sk, INT, true]
+  |  hasNullableGenerateChild: true
+  |  cardinality: 76374
+  |
+  10:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [58: d_year, INT, true], [3: ss_item_sk, INT, true], [4: ss_customer_sk, INT, true]
+     cardinality: 138547
+
+PLAN FRAGMENT 2(F12)
+  Fragment Cost: 3.2635739953560002E7
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 263: d_year, 203: cs_item_sk, 191: cs_bill_customer_sk
+  OutPut Exchange Id: 36
+
+  35:AGGREGATE (update serialize)
+  |  STREAMING
+  |  aggregate: sum[([206: cs_quantity, INT, true]); args: INT; result: BIGINT; args nullable: true; result nullable: true], sum[([207: cs_wholesale_cost, DECIMAL32(7,2), true]); args: DECIMAL32; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([209: cs_sales_price, DECIMAL32(7,2), true]); args: DECIMAL32; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |  group by: [263: d_year, INT, true], [203: cs_item_sk, INT, true], [191: cs_bill_customer_sk, INT, true]
+  |  hasNullableGenerateChild: true
+  |  cardinality: 71519
+  |
+  34:Project
+  |  output columns:
+  |  191 <-> [191: cs_bill_customer_sk, INT, true]
+  |  203 <-> [203: cs_item_sk, INT, true]
+  |  206 <-> [206: cs_quantity, INT, true]
+  |  207 <-> [207: cs_wholesale_cost, DECIMAL32(7,2), true]
+  |  209 <-> [209: cs_sales_price, DECIMAL32(7,2), true]
+  |  263 <-> [263: d_year, INT, true]
+  |  hasNullableGenerateChild: true
+  |  cardinality: 129739
+  |
+  33:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [188: cs_sold_date_sk, INT, true] = [257: d_date_sk, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 2, build_expr = (257: d_date_sk), remote = false
+  |  output columns: 191, 203, 206, 207, 209, 263
+  |  can local shuffle: true
+  |  cardinality: 129739
+  |
+  |----32:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 13284
+  |
+  30:Project
+  |  output columns:
+  |  188 <-> [188: cs_sold_date_sk, INT, true]
+  |  191 <-> [191: cs_bill_customer_sk, INT, true]
+  |  203 <-> [203: cs_item_sk, INT, true]
+  |  206 <-> [206: cs_quantity, INT, true]
+  |  207 <-> [207: cs_wholesale_cost, DECIMAL32(7,2), true]
+  |  209 <-> [209: cs_sales_price, DECIMAL32(7,2), true]
+  |  hasNullableGenerateChild: true
+  |  cardinality: 129739
+  |
+  29:HASH JOIN
+  |  join op: LEFT OUTER JOIN (BROADCAST)
+  |  equal join conjunct: [205: cs_order_number, INT, true] = [242: cr_order_number, INT, true]
+  |  equal join conjunct: [203: cs_item_sk, INT, true] = [228: cr_item_sk, INT, true]
+  |  other predicates: [242: cr_order_number, INT, true] IS NULL
+  |  output columns: 188, 191, 203, 206, 207, 209
+  |  can local shuffle: false
+  |  cardinality: 129739
+  |
+  |----28:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 144067
+  |
+  26:IcebergScanNode
+     TABLE: tpcds.catalog_sales
+     PREDICATES: 188: cs_sold_date_sk IS NOT NULL
+     TABLE VERSION: Snapshot@(3096389489357933185)
+     cardinality=1297393
+     avgRowSize=7.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 1297393
+     probe runtime filters:
+     - filter_id = 2, probe_expr = (188: cs_sold_date_sk)
+
+PLAN FRAGMENT 3(F15)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 32
+
+  31:IcebergScanNode
+     TABLE: tpcds.date_dim
+     PREDICATES: 263: d_year = 2000, 257: d_date_sk IS NOT NULL
+     MIN/MAX PREDICATES: 263: d_year <= 2000, 263: d_year >= 2000
+     TABLE VERSION: Snapshot@(149066723028526449)
+     cardinality=13284
+     avgRowSize=2.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 13284
+
+PLAN FRAGMENT 4(F13)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 28
+
+  27:IcebergScanNode
+     TABLE: tpcds.catalog_returns
+     TABLE VERSION: Snapshot@(6119582426861084488)
+     cardinality=144067
+     avgRowSize=2.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 144067
+
+PLAN FRAGMENT 5(F06)
+  Fragment Cost: 1.6599516018480001E7
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 159: d_year, 90: ws_item_sk, 91: ws_bill_customer_sk
+  OutPut Exchange Id: 22
+
+  21:AGGREGATE (update serialize)
+  |  STREAMING
+  |  aggregate: sum[([105: ws_quantity, INT, true]); args: INT; result: BIGINT; args nullable: true; result nullable: true], sum[([106: ws_wholesale_cost, DECIMAL32(7,2), true]); args: DECIMAL32; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([108: ws_sales_price, DECIMAL32(7,2), true]); args: DECIMAL32; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |  group by: [159: d_year, INT, true], [90: ws_item_sk, INT, true], [91: ws_bill_customer_sk, INT, true]
+  |  hasNullableGenerateChild: true
+  |  cardinality: 35690
+  |
+  20:Project
+  |  output columns:
+  |  90 <-> [90: ws_item_sk, INT, true]
+  |  91 <-> [91: ws_bill_customer_sk, INT, true]
+  |  105 <-> [105: ws_quantity, INT, true]
+  |  106 <-> [106: ws_wholesale_cost, DECIMAL32(7,2), true]
+  |  108 <-> [108: ws_sales_price, DECIMAL32(7,2), true]
+  |  159 <-> [159: d_year, INT, true]
+  |  hasNullableGenerateChild: true
+  |  cardinality: 64745
+  |
+  19:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [87: ws_sold_date_sk, INT, true] = [153: d_date_sk, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 1, build_expr = (153: d_date_sk), remote = false
+  |  output columns: 90, 91, 105, 106, 108, 159
+  |  can local shuffle: true
+  |  cardinality: 64745
+  |
+  |----18:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 13284
+  |
+  16:Project
+  |  output columns:
+  |  87 <-> [87: ws_sold_date_sk, INT, true]
+  |  90 <-> [90: ws_item_sk, INT, true]
+  |  91 <-> [91: ws_bill_customer_sk, INT, true]
+  |  105 <-> [105: ws_quantity, INT, true]
+  |  106 <-> [106: ws_wholesale_cost, DECIMAL32(7,2), true]
+  |  108 <-> [108: ws_sales_price, DECIMAL32(7,2), true]
+  |  hasNullableGenerateChild: true
+  |  cardinality: 64745
+  |
+  15:HASH JOIN
+  |  join op: LEFT OUTER JOIN (BROADCAST)
+  |  equal join conjunct: [104: ws_order_number, INT, true] = [138: wr_order_number, INT, true]
+  |  equal join conjunct: [90: ws_item_sk, INT, true] = [127: wr_item_sk, INT, true]
+  |  other predicates: [138: wr_order_number, INT, true] IS NULL
+  |  output columns: 87, 90, 91, 105, 106, 108
+  |  can local shuffle: false
+  |  cardinality: 64745
+  |
+  |----14:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 71763
+  |
+  12:IcebergScanNode
+     TABLE: tpcds.web_sales
+     PREDICATES: 87: ws_sold_date_sk IS NOT NULL
+     TABLE VERSION: Snapshot@(2984817778172468007)
+     cardinality=647446
+     avgRowSize=7.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 647446
+     probe runtime filters:
+     - filter_id = 1, probe_expr = (87: ws_sold_date_sk)
+
+PLAN FRAGMENT 6(F09)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 18
+
+  17:IcebergScanNode
+     TABLE: tpcds.date_dim
+     PREDICATES: 159: d_year = 2000, 153: d_date_sk IS NOT NULL
+     MIN/MAX PREDICATES: 159: d_year <= 2000, 159: d_year >= 2000
+     TABLE VERSION: Snapshot@(149066723028526449)
+     cardinality=13284
+     avgRowSize=2.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 13284
+
+PLAN FRAGMENT 7(F07)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 14
+
+  13:IcebergScanNode
+     TABLE: tpcds.web_returns
+     TABLE VERSION: Snapshot@(416096285600249719)
+     cardinality=71763
+     avgRowSize=2.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 71763
+
+PLAN FRAGMENT 8(F00)
+  Fragment Cost: 6.500314158857996E7
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 58: d_year, 3: ss_item_sk, 4: ss_customer_sk
+  OutPut Exchange Id: 10
+
+  9:AGGREGATE (update serialize)
+  |  STREAMING
+  |  aggregate: sum[([11: ss_quantity, INT, true]); args: INT; result: BIGINT; args nullable: true; result nullable: true], sum[([12: ss_wholesale_cost, DECIMAL32(7,2), true]); args: DECIMAL32; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([14: ss_sales_price, DECIMAL32(7,2), true]); args: DECIMAL32; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |  group by: [58: d_year, INT, true], [3: ss_item_sk, INT, true], [4: ss_customer_sk, INT, true]
+  |  hasNullableGenerateChild: true
+  |  cardinality: 138547
+  |
+  8:Project
+  |  output columns:
+  |  3 <-> [3: ss_item_sk, INT, true]
+  |  4 <-> [4: ss_customer_sk, INT, true]
+  |  11 <-> [11: ss_quantity, INT, true]
+  |  12 <-> [12: ss_wholesale_cost, DECIMAL32(7,2), true]
+  |  14 <-> [14: ss_sales_price, DECIMAL32(7,2), true]
+  |  58 <-> [58: d_year, INT, true]
+  |  hasNullableGenerateChild: true
+  |  cardinality: 251332
+  |
+  7:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [1: ss_sold_date_sk, INT, true] = [52: d_date_sk, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 0, build_expr = (52: d_date_sk), remote = false
+  |  output columns: 3, 4, 11, 12, 14, 58
+  |  can local shuffle: true
+  |  cardinality: 251332
+  |
+  |----6:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 13284
+  |
+  4:Project
+  |  output columns:
+  |  1 <-> [1: ss_sold_date_sk, INT, true]
+  |  3 <-> [3: ss_item_sk, INT, true]
+  |  4 <-> [4: ss_customer_sk, INT, true]
+  |  11 <-> [11: ss_quantity, INT, true]
+  |  12 <-> [12: ss_wholesale_cost, DECIMAL32(7,2), true]
+  |  14 <-> [14: ss_sales_price, DECIMAL32(7,2), true]
+  |  hasNullableGenerateChild: true
+  |  cardinality: 251332
+  |
+  3:HASH JOIN
+  |  join op: LEFT OUTER JOIN (BROADCAST)
+  |  equal join conjunct: [10: ss_ticket_number, INT, true] = [37: sr_ticket_number, INT, true]
+  |  equal join conjunct: [3: ss_item_sk, INT, true] = [30: sr_item_sk, INT, true]
+  |  other predicates: [37: sr_ticket_number, INT, true] IS NULL
+  |  output columns: 1, 3, 4, 11, 12, 14
+  |  can local shuffle: false
+  |  cardinality: 251332
+  |
+  |----2:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 287514
+  |
+  0:IcebergScanNode
+     TABLE: tpcds.store_sales
+     PREDICATES: 1: ss_sold_date_sk IS NOT NULL
+     TABLE VERSION: Snapshot@(7480037505330912616)
+     cardinality=2513323
+     avgRowSize=7.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 2513323
+     probe runtime filters:
+     - filter_id = 0, probe_expr = (1: ss_sold_date_sk)
+
+PLAN FRAGMENT 9(F03)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 06
+
+  5:IcebergScanNode
+     TABLE: tpcds.date_dim
+     PREDICATES: 58: d_year = 2000, 52: d_date_sk IS NOT NULL
+     MIN/MAX PREDICATES: 58: d_year <= 2000, 58: d_year >= 2000
+     TABLE VERSION: Snapshot@(149066723028526449)
+     cardinality=13284
+     avgRowSize=2.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 13284
+
+PLAN FRAGMENT 10(F01)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 02
+
+  1:IcebergScanNode
+     TABLE: tpcds.store_returns
+     TABLE VERSION: Snapshot@(7577045274832359048)
+     cardinality=287514
+     avgRowSize=2.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 287514

@@ -1,0 +1,264 @@
+-- engine=starrocks
+-- suite=tpc-ds
+-- case=q79
+-- file=/Users/harbor/project/NovaRocks/sql-tests/tpc-ds/sql/q79.sql
+-- elapsed_sec=0.088
+-- exit_code=0
+
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 8.580771783815454E8
+  Memory: 6.7717142126474E7
+
+PLAN FRAGMENT 0(F10)
+  Fragment Cost: 43200.0
+  Output Exprs:113: c_last_name | 112: c_first_name | 126: substr | 10: ss_ticket_number | 102: sum | 103: sum
+  Input Partition: UNPARTITIONED
+  RESULT SINK
+
+  25:MERGING-EXCHANGE
+     distribution type: GATHER
+     limit: 100
+     cardinality: 100
+
+PLAN FRAGMENT 1(F07)
+  Fragment Cost: 4.3201243519965553E8
+
+  Input Partition: HASH_PARTITIONED: 10: ss_ticket_number, 4: ss_customer_sk, 7: ss_addr_sk, 82: s_city
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 25
+
+  24:TOP-N
+  |  order by: [113, VARCHAR(1073741824), true] ASC, [112, VARCHAR(1073741824), true] ASC, [126, VARCHAR, true] ASC, [103, DECIMAL128(38,2), true] ASC
+  |  offset: 0
+  |  limit: 100
+  |  cardinality: 100
+  |
+  23:Project
+  |  output columns:
+  |  10 <-> [10: ss_ticket_number, INT, true]
+  |  102 <-> [102: sum, DECIMAL128(38,2), true]
+  |  103 <-> [103: sum, DECIMAL128(38,2), true]
+  |  112 <-> [112: c_first_name, VARCHAR(1073741824), true]
+  |  113 <-> [113: c_last_name, VARCHAR(1073741824), true]
+  |  126 <-> substr[([82: s_city, VARCHAR(1073741824), true], 1, 30); args: VARCHAR,INT,INT; result: VARCHAR; args nullable: true; result nullable: true]
+  |  cardinality: 868504
+  |
+  22:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [4: ss_customer_sk, INT, true] = [104: c_customer_sk, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 3, build_expr = (104: c_customer_sk), remote = true
+  |  output columns: 10, 82, 102, 103, 112, 113
+  |  can local shuffle: false
+  |  cardinality: 868504
+  |
+  |----21:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 90000
+  |
+  19:Project
+  |  output columns:
+  |  4 <-> [4: ss_customer_sk, INT, true]
+  |  10 <-> [10: ss_ticket_number, INT, true]
+  |  82 <-> [82: s_city, VARCHAR(1073741824), true]
+  |  102 <-> [102: sum, DECIMAL128(38,2), true]
+  |  103 <-> [103: sum, DECIMAL128(38,2), true]
+  |  cardinality: 868504
+  |
+  18:AGGREGATE (merge finalize)
+  |  aggregate: sum[([102: sum, DECIMAL128(38,2), true]); args: DECIMAL32; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([103: sum, DECIMAL128(38,2), true]); args: DECIMAL32; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |  group by: [10: ss_ticket_number, INT, true], [4: ss_customer_sk, INT, true], [7: ss_addr_sk, INT, true], [82: s_city, VARCHAR(1073741824), true]
+  |  cardinality: 868504
+  |
+  17:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [10: ss_ticket_number, INT, true], [4: ss_customer_sk, INT, true], [7: ss_addr_sk, INT, true], [82: s_city, VARCHAR(1073741824), true]
+     cardinality: 1500492
+     probe runtime filters:
+     - filter_id = 3, probe_expr = (4: ss_customer_sk)
+
+PLAN FRAGMENT 2(F08)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 21
+
+  20:IcebergScanNode
+     TABLE: tpcds.customer
+     PREDICATES: 104: c_customer_sk IS NOT NULL
+     TABLE VERSION: Snapshot@(606596394069267299)
+     cardinality=90000
+     avgRowSize=3.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 90000
+
+PLAN FRAGMENT 3(F00)
+  Fragment Cost: 2.780678221947E8
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 10: ss_ticket_number, 4: ss_customer_sk, 7: ss_addr_sk, 82: s_city
+  OutPut Exchange Id: 17
+
+  16:AGGREGATE (update serialize)
+  |  STREAMING
+  |  aggregate: sum[([20: ss_coupon_amt, DECIMAL32(7,2), true]); args: DECIMAL32; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([23: ss_net_profit, DECIMAL32(7,2), true]); args: DECIMAL32; result: DECIMAL128(38,2); args nullable: true; result nullable: true]
+  |  group by: [10: ss_ticket_number, INT, true], [4: ss_customer_sk, INT, true], [7: ss_addr_sk, INT, true], [82: s_city, VARCHAR(1073741824), true]
+  |  cardinality: 1500492
+  |
+  15:Project
+  |  output columns:
+  |  4 <-> [4: ss_customer_sk, INT, true]
+  |  7 <-> [7: ss_addr_sk, INT, true]
+  |  10 <-> [10: ss_ticket_number, INT, true]
+  |  20 <-> [20: ss_coupon_amt, DECIMAL32(7,2), true]
+  |  23 <-> [23: ss_net_profit, DECIMAL32(7,2), true]
+  |  82 <-> [82: s_city, VARCHAR(1073741824), true]
+  |  cardinality: 2592364
+  |
+  14:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [8: ss_store_sk, INT, true] = [60: s_store_sk, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 2, build_expr = (60: s_store_sk), remote = false
+  |  output columns: 4, 7, 10, 20, 23, 82
+  |  can local shuffle: true
+  |  cardinality: 2592364
+  |
+  |----13:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 3
+  |
+  10:Project
+  |  output columns:
+  |  4 <-> [4: ss_customer_sk, INT, true]
+  |  7 <-> [7: ss_addr_sk, INT, true]
+  |  8 <-> [8: ss_store_sk, INT, true]
+  |  10 <-> [10: ss_ticket_number, INT, true]
+  |  20 <-> [20: ss_coupon_amt, DECIMAL32(7,2), true]
+  |  23 <-> [23: ss_net_profit, DECIMAL32(7,2), true]
+  |  cardinality: 2592364
+  |
+  9:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [6: ss_hdemo_sk, INT, true] = [93: hd_demo_sk, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 1, build_expr = (93: hd_demo_sk), remote = false
+  |  output columns: 4, 7, 8, 10, 20, 23
+  |  can local shuffle: false
+  |  cardinality: 2592364
+  |
+  |----8:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 5400
+  |
+  5:Project
+  |  output columns:
+  |  4 <-> [4: ss_customer_sk, INT, true]
+  |  6 <-> [6: ss_hdemo_sk, INT, true]
+  |  7 <-> [7: ss_addr_sk, INT, true]
+  |  8 <-> [8: ss_store_sk, INT, true]
+  |  10 <-> [10: ss_ticket_number, INT, true]
+  |  20 <-> [20: ss_coupon_amt, DECIMAL32(7,2), true]
+  |  23 <-> [23: ss_net_profit, DECIMAL32(7,2), true]
+  |  cardinality: 2592364
+  |
+  4:HASH JOIN
+  |  join op: INNER JOIN (BROADCAST)
+  |  equal join conjunct: [1: ss_sold_date_sk, INT, true] = [28: d_date_sk, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 0, build_expr = (28: d_date_sk), remote = false
+  |  output columns: 4, 6, 7, 8, 10, 20, 23
+  |  can local shuffle: false
+  |  cardinality: 2592364
+  |
+  |----3:EXCHANGE
+  |       distribution type: BROADCAST
+  |       cardinality: 7380
+  |
+  0:IcebergScanNode
+     TABLE: tpcds.store_sales
+     PREDICATES: 4: ss_customer_sk IS NOT NULL
+     TABLE VERSION: Snapshot@(7480037505330912616)
+     cardinality=2592364
+     avgRowSize=8.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 2592364
+     probe runtime filters:
+     - filter_id = 0, probe_expr = (1: ss_sold_date_sk)
+     - filter_id = 1, probe_expr = (6: ss_hdemo_sk)
+     - filter_id = 2, probe_expr = (8: ss_store_sk)
+     - filter_id = 3, probe_expr = (4: ss_customer_sk)
+
+PLAN FRAGMENT 4(F05)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 13
+
+  12:Project
+  |  output columns:
+  |  60 <-> [60: s_store_sk, INT, true]
+  |  82 <-> [82: s_city, VARCHAR(1073741824), true]
+  |  cardinality: 3
+  |
+  11:IcebergScanNode
+     TABLE: tpcds.store
+     PREDICATES: 66: s_number_employees >= 200, 66: s_number_employees <= 295
+     MIN/MAX PREDICATES: 66: s_number_employees >= 200, 66: s_number_employees <= 295
+     TABLE VERSION: Snapshot@(7269431241370138871)
+     cardinality=3
+     avgRowSize=3.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 3
+
+PLAN FRAGMENT 5(F03)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 08
+
+  7:Project
+  |  output columns:
+  |  93 <-> [93: hd_demo_sk, INT, true]
+  |  cardinality: 5400
+  |
+  6:IcebergScanNode
+     TABLE: tpcds.household_demographics
+     PREDICATES: (96: hd_dep_count = 6) OR (97: hd_vehicle_count > 2)
+     TABLE VERSION: Snapshot@(7298886051705637477)
+     cardinality=5400
+     avgRowSize=3.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 5400
+
+PLAN FRAGMENT 6(F01)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 03
+
+  2:Project
+  |  output columns:
+  |  28 <-> [28: d_date_sk, INT, true]
+  |  cardinality: 7380
+  |
+  1:IcebergScanNode
+     TABLE: tpcds.date_dim
+     PREDICATES: 35: d_dow = 1, 34: d_year IN (1999, 2000, 2001)
+     MIN/MAX PREDICATES: 35: d_dow <= 1, 35: d_dow >= 1, 34: d_year >= 1999, 34: d_year <= 2001
+     TABLE VERSION: Snapshot@(149066723028526449)
+     cardinality=7380
+     avgRowSize=3.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 7380

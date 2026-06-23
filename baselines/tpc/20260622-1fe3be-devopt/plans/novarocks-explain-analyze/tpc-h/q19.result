@@ -1,0 +1,41 @@
+Explain String
+Planning: 67.3ms / Execution: 6.00s / Rows: 1
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+9:PROJECT [sum(l_extendedprice * (Nested(TypedExpr { kind: BinaryOp { left: TypedExpr { kind: Literal(Int(1)), data_type: Int64, nullable: false }, op: Sub, right: TypedExpr { kind: ColumnRef { column_id: c7, qualifier: None, column: "l_discount" }, data_type: Decimal128(15, 2), nullable: true } }, data_type: Decimal128(22, 2), nullable: true }))) AS revenue] stats={rows=1 conf=estimated} act={rows=1 time=6.5us peak=16B}
+  8:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=91.2us peak=64.4KB}
+    aggregations: sum(l_extendedprice * 1 - l_discount)
+    7:GATHER stats={rows=1 conf=estimated} act={rows=12 time=17.8us peak=0B}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 7
+    PARTITION: UNPARTITIONED
+6:HASH AGGREGATE (LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=1.7ms peak=781.6KB}
+  aggregations: sum(l_extendedprice * 1 - l_discount)
+  5:HASH JOIN (BROADCAST, INNER, eq: [l_partkey = p_partkey]) stats={rows=229 conf=estimated} act={rows=1466 time=23.1ms peak=502.6KB}
+    other: p_brand = 'Brand#45' AND p_container IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG') AND l_quantity >= 5 AND l_quantity <= 5 + 10 AND p_size BETWEEN 1 AND 5 AND __cse_0 AND __cse_1 OR __cse_0 AND p_brand = 'Brand#11' AND p_container IN ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK') AND l_quantity >= 15 AND l_quantity <= 15 + 10 AND p_size BETWEEN 1 AND 10 AND __cse_1 OR __cse_0 AND p_brand = 'Brand#21' AND p_container IN ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG') AND l_quantity >= 25 AND l_quantity <= 25 + 10 AND p_size BETWEEN 1 AND 15 AND __cse_1
+    build runtime filters:
+    - filter_id = 0, build_expr = (p_partkey)
+    2:PROJECT [l_partkey, l_quantity, l_extendedprice, l_discount, l_shipinstruct, l_shipmode, l_shipinstruct = 'DELIVER IN PERSON' AS __cse_0, l_shipmode IN ('AIR', 'AIR REG') AS __cse_1] stats={rows=1174001 conf=estimated} act={rows=132509 time=122.8ms peak=277.1KB}
+      1:SCAN tpch.lineitem stats={rows=1174001 conf=estimated} act={rows=132509 time=2.9ms peak=0B}
+           TABLE: tpch.lineitem
+           columns: l_partkey, l_quantity, l_extendedprice, l_discount, l_shipinstruct, l_shipmode
+           min-max stats
+           predicates: l_shipinstruct IN ('DELIVER IN PERSON', 'DELIVER IN PERSON', 'DELIVER IN PERSON') AND l_quantity >= 5 AND l_quantity <= 5 + 10 AND l_shipmode IN ('AIR', 'AIR REG') AND l_shipinstruct = 'DELIVER IN PERSON' OR l_shipinstruct = 'DELIVER IN PERSON' AND l_shipmode IN ('AIR', 'AIR REG') AND l_quantity >= 15 AND l_quantity <= 15 + 10 OR l_shipinstruct = 'DELIVER IN PERSON' AND l_shipmode IN ('AIR', 'AIR REG') AND l_quantity >= 25 AND l_quantity <= 25 + 10 AND l_partkey IS NOT NULL
+          probe runtime filters:
+          - filter_id = 0, probe_expr = (l_partkey)
+    4:GATHER stats={rows=580 conf=estimated} act={rows=1356 time=25.6us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 4
+    PARTITION: UNPARTITIONED
+3:SCAN tpch.part stats={rows=580 conf=estimated} act={rows=452 time=244.1us peak=474.4KB}
+     TABLE: tpch.part
+     columns: p_partkey, p_brand, p_size, p_container
+     min-max stats
+     predicates: p_brand = 'Brand#45' AND p_container IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG') AND p_size BETWEEN 1 AND 5 OR p_brand = 'Brand#11' AND p_container IN ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK') AND p_size BETWEEN 1 AND 10 OR p_brand = 'Brand#21' AND p_container IN ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG') AND p_size BETWEEN 1 AND 15 AND p_size BETWEEN 1 AND 15 AND p_brand IN ('Brand#45', 'Brand#11', 'Brand#21') AND p_partkey IS NOT NULL

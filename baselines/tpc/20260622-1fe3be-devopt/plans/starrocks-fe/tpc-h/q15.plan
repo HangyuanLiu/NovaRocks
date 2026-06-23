@@ -1,0 +1,212 @@
+-- engine=starrocks
+-- suite=tpc-h
+-- case=q15
+-- file=/Users/harbor/project/NovaRocks/sql-tests/tpc-h/sql/q15.sql
+-- elapsed_sec=0.068
+-- exit_code=0
+
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 7801529.35
+  Memory: 3454200.3000000003
+
+PLAN FRAGMENT 0(F08)
+  Fragment Cost: 4624565.4
+  Output Exprs:1: s_suppkey | 2: s_name | 3: s_address | 5: s_phone | 33: sum
+  Input Partition: UNPARTITIONED
+  RESULT SINK
+
+  22:MERGING-EXCHANGE
+     distribution type: GATHER
+     cardinality: 16058
+
+PLAN FRAGMENT 1(F03)
+  Fragment Cost: 7829576.2625
+
+  Input Partition: HASH_PARTITIONED: 14: l_suppkey
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 22
+
+  21:SORT
+  |  order by: [1, INT, true] ASC
+  |  offset: 0
+  |  cardinality: 16058
+  |
+  20:Project
+  |  output columns:
+  |  1 <-> [1: s_suppkey, INT, true]
+  |  2 <-> [2: s_name, VARCHAR(1073741824), true]
+  |  3 <-> [3: s_address, VARCHAR(1073741824), true]
+  |  5 <-> [5: s_phone, VARCHAR(1073741824), true]
+  |  33 <-> [33: sum, DECIMAL128(38,4), true]
+  |  cardinality: 16058
+  |
+  19:HASH JOIN
+  |  join op: INNER JOIN (BUCKET_SHUFFLE(S))
+  |  equal join conjunct: [1: s_suppkey, INT, true] = [14: l_suppkey, INT, true]
+  |  build runtime filters:
+  |  - filter_id = 1, build_expr = (14: l_suppkey), remote = true
+  |  output columns: 1, 2, 3, 5, 33
+  |  can local shuffle: false
+  |  cardinality: 16058
+  |
+  |----18:Project
+  |    |  output columns:
+  |    |  14 <-> [14: l_suppkey, INT, true]
+  |    |  33 <-> [33: sum, DECIMAL128(38,4), true]
+  |    |  cardinality: 16058
+  |    |
+  |    17:HASH JOIN
+  |    |  join op: INNER JOIN (BROADCAST)
+  |    |  equal join conjunct: [33: sum, DECIMAL128(38,4), true] = [56: max, DECIMAL128(38,4), true]
+  |    |  build runtime filters:
+  |    |  - filter_id = 0, build_expr = (56: max), remote = false
+  |    |  output columns: 14, 33
+  |    |  can local shuffle: false
+  |    |  cardinality: 16058
+  |    |
+  |    |----16:EXCHANGE
+  |    |       distribution type: BROADCAST
+  |    |       cardinality: 1
+  |    |
+  |    6:AGGREGATE (merge finalize)
+  |    |  aggregate: sum[([33: sum, DECIMAL128(38,4), true]); args: DECIMAL128; result: DECIMAL128(38,4); args nullable: true; result nullable: true]
+  |    |  group by: [14: l_suppkey, INT, true]
+  |    |  having: [33: sum, DECIMAL128(38,4), true] IS NOT NULL
+  |    |  cardinality: 16058
+  |    |  probe runtime filters:
+  |    |  - filter_id = 0, probe_expr = (33: sum)
+  |    |
+  |    5:EXCHANGE
+  |       distribution type: SHUFFLE
+  |       partition exprs: [14: l_suppkey, INT, true]
+  |       cardinality: 35683
+  |
+  1:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [1: s_suppkey, INT, true]
+     cardinality: 9000
+     probe runtime filters:
+     - filter_id = 1, probe_expr = (1: s_suppkey)
+
+PLAN FRAGMENT 2(F06)
+  Fragment Cost: 72.0
+
+  Input Partition: UNPARTITIONED
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 16
+
+  15:AGGREGATE (merge finalize)
+  |  aggregate: max[([56: max, DECIMAL128(38,4), true]); args: DECIMAL128; result: DECIMAL128(38,4); args nullable: true; result nullable: true]
+  |  having: [56: max, DECIMAL128(38,4), true] IS NOT NULL
+  |  cardinality: 1
+  |
+  14:EXCHANGE
+     distribution type: GATHER
+     cardinality: 1
+
+PLAN FRAGMENT 3(F05)
+  Fragment Cost: 1124029.5125
+
+  Input Partition: HASH_PARTITIONED: 36: l_suppkey
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 14
+
+  13:AGGREGATE (update serialize)
+  |  aggregate: max[([55: sum, DECIMAL128(38,4), true]); args: DECIMAL128; result: DECIMAL128(38,4); args nullable: true; result nullable: true]
+  |  cardinality: 1
+  |
+  12:Project
+  |  output columns:
+  |  55 <-> [55: sum, DECIMAL128(38,4), true]
+  |  cardinality: 17842
+  |
+  11:AGGREGATE (merge finalize)
+  |  aggregate: sum[([55: sum, DECIMAL128(38,4), true]); args: DECIMAL128; result: DECIMAL128(38,4); args nullable: true; result nullable: true]
+  |  group by: [36: l_suppkey, INT, true]
+  |  cardinality: 17842
+  |
+  10:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [36: l_suppkey, INT, true]
+     cardinality: 35683
+
+PLAN FRAGMENT 4(F04)
+  Fragment Cost: 285467.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 36: l_suppkey
+  OutPut Exchange Id: 10
+
+  9:AGGREGATE (update serialize)
+  |  STREAMING
+  |  aggregate: sum[([54: expr, DECIMAL128(31,4), true]); args: DECIMAL128; result: DECIMAL128(38,4); args nullable: true; result nullable: true]
+  |  group by: [36: l_suppkey, INT, true]
+  |  cardinality: 35683
+  |
+  8:Project
+  |  output columns:
+  |  36 <-> [36: l_suppkey, INT, true]
+  |  54 <-> cast([39: l_extendedprice, DECIMAL64(15,2), true] as DECIMAL128(15,2)) * cast(1 - [40: l_discount, DECIMAL64(15,2), true] as DECIMAL128(16,2))
+  |  cardinality: 71367
+  |
+  7:IcebergScanNode
+     TABLE: tpch.lineitem
+     PREDICATES: 44: l_shipdate >= '1995-07-01', 44: l_shipdate < '1995-10-01'
+     MIN/MAX PREDICATES: 44: l_shipdate >= '1995-07-01', 44: l_shipdate < '1995-10-01'
+     TABLE VERSION: Snapshot@(2784910170297541234)
+     cardinality=71367
+     avgRowSize=5.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 71367
+
+PLAN FRAGMENT 5(F02)
+  Fragment Cost: 285467.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 14: l_suppkey
+  OutPut Exchange Id: 05
+
+  4:AGGREGATE (update serialize)
+  |  STREAMING
+  |  aggregate: sum[([32: expr, DECIMAL128(31,4), true]); args: DECIMAL128; result: DECIMAL128(38,4); args nullable: true; result nullable: true]
+  |  group by: [14: l_suppkey, INT, true]
+  |  cardinality: 35683
+  |
+  3:Project
+  |  output columns:
+  |  14 <-> [14: l_suppkey, INT, true]
+  |  32 <-> cast([17: l_extendedprice, DECIMAL64(15,2), true] as DECIMAL128(15,2)) * cast(1 - [18: l_discount, DECIMAL64(15,2), true] as DECIMAL128(16,2))
+  |  cardinality: 71367
+  |
+  2:IcebergScanNode
+     TABLE: tpch.lineitem
+     PREDICATES: 22: l_shipdate >= '1995-07-01', 22: l_shipdate < '1995-10-01'
+     MIN/MAX PREDICATES: 22: l_shipdate >= '1995-07-01', 22: l_shipdate < '1995-10-01'
+     TABLE VERSION: Snapshot@(2784910170297541234)
+     cardinality=71367
+     avgRowSize=5.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 71367
+
+PLAN FRAGMENT 6(F00)
+  Fragment Cost: 0.0
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 1: s_suppkey
+  OutPut Exchange Id: 01
+
+  0:IcebergScanNode
+     TABLE: tpch.supplier
+     PREDICATES: 1: s_suppkey IS NOT NULL
+     TABLE VERSION: Snapshot@(7110507688499337981)
+     cardinality=9000
+     avgRowSize=4.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     cardinality: 9000
+     probe runtime filters:
+     - filter_id = 1, probe_expr = (1: s_suppkey)

@@ -1,0 +1,39 @@
+Explain String
+Planning: 51.6ms / Execution: 2.35s / Rows: 1
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+8:PROJECT [sum(lo_revenue) AS revenue] stats={rows=1 conf=estimated} act={rows=1 time=17.1us peak=8.0KB}
+  7:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=127.2us peak=64.2KB}
+    aggregations: sum(lo_revenue)
+    6:GATHER stats={rows=1 conf=estimated} act={rows=12 time=8.0us peak=0B}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 6
+    PARTITION: UNPARTITIONED
+5:HASH AGGREGATE (LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=318.2us peak=3.8MB}
+  aggregations: sum(lo_revenue)
+  4:HASH JOIN (BROADCAST, INNER, eq: [lo_orderdate = d_datekey]) stats={rows=143086 conf=estimated} act={rows=120237 time=7.5ms peak=5.7MB}
+    build runtime filters:
+    - filter_id = 0, build_expr = (d_datekey)
+    1:SCAN ssb.lineorder stats={rows=1047584 conf=estimated} act={rows=785941 time=924.7us peak=0B}
+         TABLE: ssb.lineorder
+         columns: lo_orderdate, lo_revenue, lo_quantity, lo_discount
+         min-max stats
+         predicates: lo_discount BETWEEN 1 AND 3 AND lo_quantity < 25 AND lo_orderdate IS NOT NULL
+        probe runtime filters:
+        - filter_id = 0, probe_expr = (lo_orderdate)
+    3:GATHER stats={rows=329 conf=estimated} act={rows=1095 time=4.3us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: UNPARTITIONED
+2:SCAN ssb.dates stats={rows=329 conf=estimated} act={rows=365 time=41.6us peak=211.5KB}
+     TABLE: ssb.dates
+     columns: d_datekey, d_year
+     min-max stats
+     predicates: d_year = 1993 AND d_datekey IS NOT NULL

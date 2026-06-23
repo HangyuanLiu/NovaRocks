@@ -1,0 +1,414 @@
+Explain String
+Planning: 266.5ms / Execution: 4.07s / Rows: 51
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+150:SORT BY [ss1.ca_county ASC NULLS FIRST] stats={rows=8 conf=estimated} act={rows=102 time=120.8us peak=39.0KB}
+  149:GATHER stats={rows=8 conf=estimated} act={rows=51 time=13.0us peak=0B}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 149
+    PARTITION: UNPARTITIONED
+148:PROJECT [ss1.ca_county AS ca_county, ss1.d_year AS d_year, ws2.web_sales / ws1.web_sales AS web_q1_q2_increase, ss2.store_sales / ss1.store_sales AS store_q1_q2_increase, ws3.web_sales / ws2.web_sales AS web_q2_q3_increase, ss3.store_sales / ss2.store_sales AS store_q2_q3_increase] stats={rows=8 conf=estimated} act={rows=51 time=1.3ms peak=63.4KB}
+  147:HASH JOIN (BROADCAST, INNER, eq: [ws3.ca_county = ws1.ca_county]) stats={rows=8 conf=estimated} act={rows=298 time=564.5us peak=374.3KB}
+    other: CASE WHEN ws2.web_sales > 0 THEN ws3.web_sales / ws2.web_sales ELSE NULL END > CASE WHEN ss2.store_sales > 0 THEN ss3.store_sales / ss2.store_sales ELSE NULL END
+    build runtime filters:
+    - filter_id = 8, build_expr = (ws1.ca_county)
+    25:FILTER stats={rows=89 conf=estimated}
+      predicate: ws3.ca_county IS NOT NULL
+      24:FILTER stats={rows=92 conf=estimated}
+        predicate: ws3.d_qoy = 3 AND ws3.d_year = 2000
+        23:EXCHANGE stats={rows=37012 conf=estimated} act={rows=24580 time=215.9us peak=329.3KB}
+    146:GATHER stats={rows=17 conf=estimated} act={rows=247 time=17.7us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 146
+    PARTITION: UNPARTITIONED
+145:HASH JOIN (BROADCAST, INNER, eq: [ss3.ca_county = ss2.ca_county]) stats={rows=17 conf=estimated} act={rows=494 time=647.5us peak=647.0KB}
+  build runtime filters:
+  - filter_id = 7, build_expr = (ss2.ca_county)
+  28:FILTER stats={rows=89 conf=estimated}
+    predicate: ss3.ca_county IS NOT NULL
+    27:FILTER stats={rows=92 conf=estimated}
+      predicate: ss3.d_qoy = 3 AND ss3.d_year = 2000
+      26:EXCHANGE stats={rows=37012 conf=estimated} act={rows=36944 time=443.2us peak=495.7KB}
+  144:GATHER stats={rows=17 conf=estimated} act={rows=247 time=18.5us peak=0B}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 144
+    PARTITION: UNPARTITIONED
+143:HASH JOIN (BROADCAST, INNER, eq: [ss2.ca_county = ss1.ca_county]) stats={rows=17 conf=estimated} act={rows=1932 time=1.2ms peak=387.6KB}
+  other: CASE WHEN ws1.web_sales > 0 THEN ws2.web_sales / ws1.web_sales ELSE NULL END > CASE WHEN ss1.store_sales > 0 THEN ss2.store_sales / ss1.store_sales ELSE NULL END
+  build runtime filters:
+  - filter_id = 6, build_expr = (ss1.ca_county)
+  106:HASH JOIN (BROADCAST, INNER, eq: [ws2.ca_county = ws1.ca_county]) stats={rows=34 conf=estimated} act={rows=1425 time=939.8us peak=165.5KB}
+    build runtime filters:
+    - filter_id = 5, build_expr = (ws1.ca_county)
+    68:HASH JOIN (BROADCAST, INNER, eq: [ws2.ca_county = ss2.ca_county]) stats={rows=35 conf=estimated} act={rows=2515 time=856.3us peak=223.4KB}
+      build runtime filters:
+      - filter_id = 4, build_expr = (ss2.ca_county)
+      31:FILTER stats={rows=89 conf=estimated}
+        predicate: ws2.ca_county IS NOT NULL
+        30:FILTER stats={rows=92 conf=estimated}
+          predicate: ws2.d_qoy = 2 AND ws2.d_year = 2000
+          29:EXCHANGE stats={rows=37012 conf=estimated} act={rows=24254 time=259.6us peak=330.2KB}
+      67:GATHER stats={rows=35 conf=estimated} act={rows=1656 time=5.0us peak=0B}
+    105:GATHER stats={rows=34 conf=estimated} act={rows=941 time=2.4us peak=0B}
+  142:GATHER stats={rows=35 conf=estimated} act={rows=1685 time=6.2us peak=0B}
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 142
+    PARTITION: UNPARTITIONED
+141:FILTER stats={rows=35 conf=estimated}
+  predicate: ss1.ca_county IS NOT NULL
+  140:FILTER stats={rows=36 conf=estimated}
+    predicate: ss1.ca_county IS NOT NULL
+    139:FILTER stats={rows=37 conf=estimated}
+      predicate: ss1.ca_county IS NOT NULL
+      138:FILTER stats={rows=38 conf=estimated}
+        predicate: ss1.ca_county IS NOT NULL
+        137:FILTER stats={rows=39 conf=estimated}
+          predicate: ss1.ca_county IS NOT NULL
+          136:FILTER stats={rows=40 conf=estimated}
+            predicate: ss1.ca_county IS NOT NULL
+            135:FILTER stats={rows=41 conf=estimated}
+              predicate: ss1.ca_county IS NOT NULL
+              134:FILTER stats={rows=43 conf=estimated}
+                predicate: ss1.ca_county IS NOT NULL
+                133:FILTER stats={rows=44 conf=estimated}
+                  predicate: ss1.ca_county IS NOT NULL
+                  132:FILTER stats={rows=45 conf=estimated}
+                    predicate: ss1.ca_county IS NOT NULL
+                    131:FILTER stats={rows=46 conf=estimated}
+                      predicate: ss1.ca_county IS NOT NULL
+                      130:FILTER stats={rows=48 conf=estimated}
+                        predicate: ss1.ca_county IS NOT NULL
+                        129:FILTER stats={rows=49 conf=estimated}
+                          predicate: ss1.ca_county IS NOT NULL
+                          128:FILTER stats={rows=51 conf=estimated}
+                            predicate: ss1.ca_county IS NOT NULL
+                            127:FILTER stats={rows=52 conf=estimated}
+                              predicate: ss1.ca_county IS NOT NULL
+                              126:FILTER stats={rows=54 conf=estimated}
+                                predicate: ss1.ca_county IS NOT NULL
+                                125:FILTER stats={rows=56 conf=estimated}
+                                  predicate: ss1.ca_county IS NOT NULL
+                                  124:FILTER stats={rows=57 conf=estimated}
+                                    predicate: ss1.ca_county IS NOT NULL
+                                    123:FILTER stats={rows=59 conf=estimated}
+                                      predicate: ss1.ca_county IS NOT NULL
+                                      122:FILTER stats={rows=61 conf=estimated}
+                                        predicate: ss1.ca_county IS NOT NULL
+                                        121:FILTER stats={rows=63 conf=estimated}
+                                          predicate: ss1.ca_county IS NOT NULL
+                                          120:FILTER stats={rows=64 conf=estimated}
+                                            predicate: ss1.ca_county IS NOT NULL
+                                            119:FILTER stats={rows=66 conf=estimated}
+                                              predicate: ss1.ca_county IS NOT NULL
+                                              118:FILTER stats={rows=68 conf=estimated}
+                                                predicate: ss1.ca_county IS NOT NULL
+                                                117:FILTER stats={rows=70 conf=estimated}
+                                                  predicate: ss1.ca_county IS NOT NULL
+                                                  116:FILTER stats={rows=73 conf=estimated}
+                                                    predicate: ss1.ca_county IS NOT NULL
+                                                    115:FILTER stats={rows=75 conf=estimated}
+                                                      predicate: ss1.ca_county IS NOT NULL
+                                                      114:FILTER stats={rows=77 conf=estimated}
+                                                        predicate: ss1.ca_county IS NOT NULL
+                                                        113:FILTER stats={rows=79 conf=estimated}
+                                                          predicate: ss1.ca_county IS NOT NULL
+                                                          112:FILTER stats={rows=82 conf=estimated}
+                                                            predicate: ss1.ca_county IS NOT NULL
+                                                            111:FILTER stats={rows=84 conf=estimated}
+                                                              predicate: ss1.ca_county IS NOT NULL
+                                                              110:FILTER stats={rows=87 conf=estimated}
+                                                                predicate: ss1.ca_county IS NOT NULL
+                                                                109:FILTER stats={rows=89 conf=estimated}
+                                                                  predicate: ss1.ca_county IS NOT NULL
+                                                                  108:FILTER stats={rows=92 conf=estimated}
+                                                                    predicate: ss1.d_qoy = 1 AND ss1.d_year = 2000
+                                                                    107:EXCHANGE stats={rows=37012 conf=estimated} act={rows=36821 time=3.8ms peak=644.8KB}
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 105
+    PARTITION: UNPARTITIONED
+104:FILTER stats={rows=34 conf=estimated}
+  predicate: ws1.ca_county IS NOT NULL
+  103:FILTER stats={rows=35 conf=estimated}
+    predicate: ws1.ca_county IS NOT NULL
+    102:FILTER stats={rows=36 conf=estimated}
+      predicate: ws1.ca_county IS NOT NULL
+      101:FILTER stats={rows=37 conf=estimated}
+        predicate: ws1.ca_county IS NOT NULL
+        100:FILTER stats={rows=38 conf=estimated}
+          predicate: ws1.ca_county IS NOT NULL
+          99:FILTER stats={rows=39 conf=estimated}
+            predicate: ws1.ca_county IS NOT NULL
+            98:FILTER stats={rows=40 conf=estimated}
+              predicate: ws1.ca_county IS NOT NULL
+              97:FILTER stats={rows=41 conf=estimated}
+                predicate: ws1.ca_county IS NOT NULL
+                96:FILTER stats={rows=43 conf=estimated}
+                  predicate: ws1.ca_county IS NOT NULL
+                  95:FILTER stats={rows=44 conf=estimated}
+                    predicate: ws1.ca_county IS NOT NULL
+                    94:FILTER stats={rows=45 conf=estimated}
+                      predicate: ws1.ca_county IS NOT NULL
+                      93:FILTER stats={rows=46 conf=estimated}
+                        predicate: ws1.ca_county IS NOT NULL
+                        92:FILTER stats={rows=48 conf=estimated}
+                          predicate: ws1.ca_county IS NOT NULL
+                          91:FILTER stats={rows=49 conf=estimated}
+                            predicate: ws1.ca_county IS NOT NULL
+                            90:FILTER stats={rows=51 conf=estimated}
+                              predicate: ws1.ca_county IS NOT NULL
+                              89:FILTER stats={rows=52 conf=estimated}
+                                predicate: ws1.ca_county IS NOT NULL
+                                88:FILTER stats={rows=54 conf=estimated}
+                                  predicate: ws1.ca_county IS NOT NULL
+                                  87:FILTER stats={rows=56 conf=estimated}
+                                    predicate: ws1.ca_county IS NOT NULL
+                                    86:FILTER stats={rows=57 conf=estimated}
+                                      predicate: ws1.ca_county IS NOT NULL
+                                      85:FILTER stats={rows=59 conf=estimated}
+                                        predicate: ws1.ca_county IS NOT NULL
+                                        84:FILTER stats={rows=61 conf=estimated}
+                                          predicate: ws1.ca_county IS NOT NULL
+                                          83:FILTER stats={rows=63 conf=estimated}
+                                            predicate: ws1.ca_county IS NOT NULL
+                                            82:FILTER stats={rows=64 conf=estimated}
+                                              predicate: ws1.ca_county IS NOT NULL
+                                              81:FILTER stats={rows=66 conf=estimated}
+                                                predicate: ws1.ca_county IS NOT NULL
+                                                80:FILTER stats={rows=68 conf=estimated}
+                                                  predicate: ws1.ca_county IS NOT NULL
+                                                  79:FILTER stats={rows=70 conf=estimated}
+                                                    predicate: ws1.ca_county IS NOT NULL
+                                                    78:FILTER stats={rows=73 conf=estimated}
+                                                      predicate: ws1.ca_county IS NOT NULL
+                                                      77:FILTER stats={rows=75 conf=estimated}
+                                                        predicate: ws1.ca_county IS NOT NULL
+                                                        76:FILTER stats={rows=77 conf=estimated}
+                                                          predicate: ws1.ca_county IS NOT NULL
+                                                          75:FILTER stats={rows=79 conf=estimated}
+                                                            predicate: ws1.ca_county IS NOT NULL
+                                                            74:FILTER stats={rows=82 conf=estimated}
+                                                              predicate: ws1.ca_county IS NOT NULL
+                                                              73:FILTER stats={rows=84 conf=estimated}
+                                                                predicate: ws1.ca_county IS NOT NULL
+                                                                72:FILTER stats={rows=87 conf=estimated}
+                                                                  predicate: ws1.ca_county IS NOT NULL
+                                                                  71:FILTER stats={rows=89 conf=estimated}
+                                                                    predicate: ws1.ca_county IS NOT NULL
+                                                                    70:FILTER stats={rows=92 conf=estimated}
+                                                                      predicate: ws1.d_qoy = 1 AND ws1.d_year = 2000
+                                                                      69:EXCHANGE stats={rows=37012 conf=estimated} act={rows=24261 time=4.6ms peak=417.6KB}
+PLAN FRAGMENT 6
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 67
+    PARTITION: UNPARTITIONED
+66:FILTER stats={rows=35 conf=estimated}
+  predicate: ss2.ca_county IS NOT NULL
+  65:FILTER stats={rows=36 conf=estimated}
+    predicate: ss2.ca_county IS NOT NULL
+    64:FILTER stats={rows=37 conf=estimated}
+      predicate: ss2.ca_county IS NOT NULL
+      63:FILTER stats={rows=38 conf=estimated}
+        predicate: ss2.ca_county IS NOT NULL
+        62:FILTER stats={rows=39 conf=estimated}
+          predicate: ss2.ca_county IS NOT NULL
+          61:FILTER stats={rows=40 conf=estimated}
+            predicate: ss2.ca_county IS NOT NULL
+            60:FILTER stats={rows=41 conf=estimated}
+              predicate: ss2.ca_county IS NOT NULL
+              59:FILTER stats={rows=43 conf=estimated}
+                predicate: ss2.ca_county IS NOT NULL
+                58:FILTER stats={rows=44 conf=estimated}
+                  predicate: ss2.ca_county IS NOT NULL
+                  57:FILTER stats={rows=45 conf=estimated}
+                    predicate: ss2.ca_county IS NOT NULL
+                    56:FILTER stats={rows=46 conf=estimated}
+                      predicate: ss2.ca_county IS NOT NULL
+                      55:FILTER stats={rows=48 conf=estimated}
+                        predicate: ss2.ca_county IS NOT NULL
+                        54:FILTER stats={rows=49 conf=estimated}
+                          predicate: ss2.ca_county IS NOT NULL
+                          53:FILTER stats={rows=51 conf=estimated}
+                            predicate: ss2.ca_county IS NOT NULL
+                            52:FILTER stats={rows=52 conf=estimated}
+                              predicate: ss2.ca_county IS NOT NULL
+                              51:FILTER stats={rows=54 conf=estimated}
+                                predicate: ss2.ca_county IS NOT NULL
+                                50:FILTER stats={rows=56 conf=estimated}
+                                  predicate: ss2.ca_county IS NOT NULL
+                                  49:FILTER stats={rows=57 conf=estimated}
+                                    predicate: ss2.ca_county IS NOT NULL
+                                    48:FILTER stats={rows=59 conf=estimated}
+                                      predicate: ss2.ca_county IS NOT NULL
+                                      47:FILTER stats={rows=61 conf=estimated}
+                                        predicate: ss2.ca_county IS NOT NULL
+                                        46:FILTER stats={rows=63 conf=estimated}
+                                          predicate: ss2.ca_county IS NOT NULL
+                                          45:FILTER stats={rows=64 conf=estimated}
+                                            predicate: ss2.ca_county IS NOT NULL
+                                            44:FILTER stats={rows=66 conf=estimated}
+                                              predicate: ss2.ca_county IS NOT NULL
+                                              43:FILTER stats={rows=68 conf=estimated}
+                                                predicate: ss2.ca_county IS NOT NULL
+                                                42:FILTER stats={rows=70 conf=estimated}
+                                                  predicate: ss2.ca_county IS NOT NULL
+                                                  41:FILTER stats={rows=73 conf=estimated}
+                                                    predicate: ss2.ca_county IS NOT NULL
+                                                    40:FILTER stats={rows=75 conf=estimated}
+                                                      predicate: ss2.ca_county IS NOT NULL
+                                                      39:FILTER stats={rows=77 conf=estimated}
+                                                        predicate: ss2.ca_county IS NOT NULL
+                                                        38:FILTER stats={rows=79 conf=estimated}
+                                                          predicate: ss2.ca_county IS NOT NULL
+                                                          37:FILTER stats={rows=82 conf=estimated}
+                                                            predicate: ss2.ca_county IS NOT NULL
+                                                            36:FILTER stats={rows=84 conf=estimated}
+                                                              predicate: ss2.ca_county IS NOT NULL
+                                                              35:FILTER stats={rows=87 conf=estimated}
+                                                                predicate: ss2.ca_county IS NOT NULL
+                                                                34:FILTER stats={rows=89 conf=estimated}
+                                                                  predicate: ss2.ca_county IS NOT NULL
+                                                                  33:FILTER stats={rows=92 conf=estimated}
+                                                                    predicate: ss2.d_qoy = 2 AND ss2.d_year = 2000
+                                                                    32:EXCHANGE stats={rows=37012 conf=estimated} act={rows=36792 time=4.6ms peak=643.8KB}
+PLAN FRAGMENT 7
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 23
+    PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 29
+    PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 69
+    PARTITION: UNPARTITIONED
+22:PROJECT [ca_county, d_qoy, d_year, sum(ws_ext_sales_price) AS web_sales] stats={rows=37012 conf=estimated} act={rows=23320 time=368.5us peak=4.7MB}
+  21:HASH AGGREGATE (GLOBAL, group by: [ca_county, d_qoy, d_year]) stats={rows=37012 conf=estimated} act={rows=60110 time=1.6ms peak=3.0MB}
+    aggregations: sum(ws_ext_sales_price)
+    20:HASH EXCHANGE stats={rows=37012 conf=estimated} act={rows=36790 time=10.1us peak=0B}
+PLAN FRAGMENT 8
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 20
+    PARTITION: HASH_PARTITIONED (ca_county, d_qoy, d_year)
+19:HASH AGGREGATE (LOCAL, group by: [ca_county, d_qoy, d_year]) stats={rows=37012 conf=estimated} act={rows=755908 time=74.9ms peak=9.7MB}
+  aggregations: sum(ws_ext_sales_price)
+  18:HASH JOIN (BROADCAST, INNER, eq: [ws_bill_addr_sk = ca_address_sk]) stats={rows=719023 conf=estimated} act={rows=869118 time=75.3ms peak=40.9MB}
+    build runtime filters:
+    - filter_id = 3, build_expr = (ca_address_sk)
+    15:HASH JOIN (BROADCAST, INNER, eq: [ws_sold_date_sk = d_date_sk]) stats={rows=719023 conf=estimated} act={rows=938265 time=301.1ms peak=49.3MB}
+      build runtime filters:
+      - filter_id = 2, build_expr = (d_date_sk)
+      12:SCAN tpcds.web_sales stats={rows=719023 conf=estimated} act={rows=719118 time=908.8us peak=0B}
+           TABLE: tpcds.web_sales
+           columns: ws_sold_date_sk, ws_bill_addr_sk, ws_ext_sales_price
+           min-max stats
+           predicates: ws_sold_date_sk IS NOT NULL AND ws_bill_addr_sk IS NOT NULL
+          probe runtime filters:
+          - filter_id = 2, probe_expr = (ws_sold_date_sk)
+          - filter_id = 3, probe_expr = (ws_bill_addr_sk)
+      14:GATHER stats={rows=65744 conf=estimated} act={rows=219147 time=9.1us peak=0B}
+    17:GATHER stats={rows=45000 conf=estimated} act={rows=150000 time=22.0us peak=0B}
+PLAN FRAGMENT 9
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 17
+    PARTITION: UNPARTITIONED
+16:SCAN tpcds.customer_address stats={rows=45000 conf=estimated} act={rows=50000 time=32.0ms peak=10.6MB}
+     TABLE: tpcds.customer_address
+     columns: ca_address_sk, ca_county
+     min-max stats
+     predicates: ca_address_sk IS NOT NULL
+PLAN FRAGMENT 10
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 14
+    PARTITION: UNPARTITIONED
+13:SCAN tpcds.date_dim stats={rows=65744 conf=estimated} act={rows=73049 time=63.7ms peak=17.3MB}
+     TABLE: tpcds.date_dim
+     columns: d_date_sk, d_year, d_qoy
+     min-max stats
+     predicates: d_date_sk IS NOT NULL
+PLAN FRAGMENT 11
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 26
+    PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 32
+    PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 107
+    PARTITION: UNPARTITIONED
+11:PROJECT [ca_county, d_qoy, d_year, sum(ss_ext_sales_price) AS store_sales] stats={rows=37012 conf=estimated} act={rows=35136 time=728.9us peak=7.5MB}
+  10:HASH AGGREGATE (GLOBAL, group by: [ca_county, d_qoy, d_year]) stats={rows=37012 conf=estimated} act={rows=110954 time=2.7ms peak=5.7MB}
+    aggregations: sum(ss_ext_sales_price)
+    9:HASH EXCHANGE stats={rows=37012 conf=estimated} act={rows=75818 time=12.6us peak=0B}
+PLAN FRAGMENT 12
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 9
+    PARTITION: HASH_PARTITIONED (ca_county, d_qoy, d_year)
+8:HASH AGGREGATE (LOCAL, group by: [ca_county, d_qoy, d_year]) stats={rows=37012 conf=estimated} act={rows=2761091 time=228.6ms peak=16.6MB}
+  aggregations: sum(ss_ext_sales_price)
+  7:HASH JOIN (BROADCAST, INNER, eq: [ss_addr_sk = ca_address_sk]) stats={rows=2378965 conf=estimated} act={rows=2835273 time=137.7ms peak=44.9MB}
+    build runtime filters:
+    - filter_id = 1, build_expr = (ca_address_sk)
+    4:HASH JOIN (BROADCAST, INNER, eq: [ss_sold_date_sk = d_date_sk]) stats={rows=2626206 conf=estimated} act={rows=2904420 time=269.2ms peak=49.0MB}
+      build runtime filters:
+      - filter_id = 0, build_expr = (d_date_sk)
+      1:SCAN tpcds.store_sales stats={rows=2626206 conf=estimated} act={rows=2685273 time=16.2ms peak=0B}
+           TABLE: tpcds.store_sales
+           columns: ss_sold_date_sk, ss_addr_sk, ss_ext_sales_price
+           min-max stats
+           predicates: ss_sold_date_sk IS NOT NULL AND ss_addr_sk IS NOT NULL
+          probe runtime filters:
+          - filter_id = 0, probe_expr = (ss_sold_date_sk)
+          - filter_id = 1, probe_expr = (ss_addr_sk)
+      3:GATHER stats={rows=65744 conf=estimated} act={rows=219147 time=1.1ms peak=0B}
+    6:GATHER stats={rows=45000 conf=estimated} act={rows=150000 time=330.4us peak=0B}
+PLAN FRAGMENT 13
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 6
+    PARTITION: UNPARTITIONED
+5:SCAN tpcds.customer_address stats={rows=45000 conf=estimated} act={rows=50000 time=395.0us peak=18.9MB}
+     TABLE: tpcds.customer_address
+     columns: ca_address_sk, ca_county
+     min-max stats
+     predicates: ca_address_sk IS NOT NULL
+PLAN FRAGMENT 14
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: UNPARTITIONED
+2:SCAN tpcds.date_dim stats={rows=65744 conf=estimated} act={rows=73049 time=23.3ms peak=21.7MB}
+     TABLE: tpcds.date_dim
+     columns: d_date_sk, d_year, d_qoy
+     min-max stats
+     predicates: d_date_sk IS NOT NULL

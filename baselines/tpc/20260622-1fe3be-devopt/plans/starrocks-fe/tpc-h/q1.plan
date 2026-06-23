@@ -1,0 +1,87 @@
+-- engine=starrocks
+-- suite=tpc-h
+-- case=q1
+-- file=/Users/harbor/project/NovaRocks/sql-tests/tpc-h/sql/q1.sql
+-- elapsed_sec=0.068
+-- exit_code=0
+
+RESOURCE GROUP: default_wg
+
+PLAN COST
+  CPU: 481.2
+  Memory: 471.2
+
+PLAN FRAGMENT 0(F02)
+  Fragment Cost: 608.0
+  Output Exprs:9: l_returnflag | 10: l_linestatus | 23: sum | 24: sum | 25: sum | 26: sum | 27: avg | 28: avg | 29: avg | 30: count
+  Input Partition: UNPARTITIONED
+  RESULT SINK
+
+  6:MERGING-EXCHANGE
+     distribution type: GATHER
+     cardinality: 1
+
+PLAN FRAGMENT 1(F01)
+  Fragment Cost: 995.6
+
+  Input Partition: HASH_PARTITIONED: 9: l_returnflag, 10: l_linestatus
+  OutPut Partition: UNPARTITIONED
+  OutPut Exchange Id: 06
+
+  5:SORT
+  |  order by: [9, VARCHAR(1073741824), true] ASC, [10, VARCHAR(1073741824), true] ASC
+  |  offset: 0
+  |  cardinality: 1
+  |
+  4:AGGREGATE (merge finalize)
+  |  aggregate: sum[([23: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([24: sum, DECIMAL128(38,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([25: sum, DECIMAL128(38,4), true]); args: DECIMAL128; result: DECIMAL128(38,4); args nullable: true; result nullable: true], sum[([26: sum, DECIMAL128(38,6), true]); args: DECIMAL128; result: DECIMAL128(38,6); args nullable: true; result nullable: true], avg[([27: avg, VARBINARY, true]); args: DECIMAL64; result: DECIMAL128(38,8); args nullable: true; result nullable: true], avg[([28: avg, VARBINARY, true]); args: DECIMAL64; result: DECIMAL128(38,8); args nullable: true; result nullable: true], avg[([29: avg, VARBINARY, true]); args: DECIMAL64; result: DECIMAL128(38,8); args nullable: true; result nullable: true], count[([30: count, BIGINT, false]); args: ; result: BIGINT; args nullable: true; result nullable: false]
+  |  group by: [9: l_returnflag, VARCHAR(1073741824), true], [10: l_linestatus, VARCHAR(1073741824), true]
+  |  cardinality: 1
+  |
+  3:EXCHANGE
+     distribution type: SHUFFLE
+     partition exprs: [9: l_returnflag, VARCHAR(1073741824), true], [10: l_linestatus, VARCHAR(1073741824), true]
+     cardinality: 1
+
+PLAN FRAGMENT 2(F00)
+  Fragment Cost: 35.400000000000006
+
+  Input Partition: RANDOM
+  OutPut Partition: HASH_PARTITIONED: 9: l_returnflag, 10: l_linestatus
+  OutPut Exchange Id: 03
+
+  2:AGGREGATE (update serialize)
+  |  STREAMING
+  |  aggregate: sum[([5: l_quantity, DECIMAL64(15,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([6: l_extendedprice, DECIMAL64(15,2), true]); args: DECIMAL64; result: DECIMAL128(38,2); args nullable: true; result nullable: true], sum[([21: expr, DECIMAL128(31,4), true]); args: DECIMAL128; result: DECIMAL128(38,4); args nullable: true; result nullable: true], sum[([22: expr, DECIMAL128(38,6), true]); args: DECIMAL128; result: DECIMAL128(38,6); args nullable: true; result nullable: true], avg[([5: l_quantity, DECIMAL64(15,2), true]); args: DECIMAL64; result: VARBINARY; args nullable: true; result nullable: true], avg[([6: l_extendedprice, DECIMAL64(15,2), true]); args: DECIMAL64; result: VARBINARY; args nullable: true; result nullable: true], avg[([7: l_discount, DECIMAL64(15,2), true]); args: DECIMAL64; result: VARBINARY; args nullable: true; result nullable: true], count[(*); args: ; result: BIGINT; args nullable: false; result nullable: false]
+  |  group by: [9: l_returnflag, VARCHAR(1073741824), true], [10: l_linestatus, VARCHAR(1073741824), true]
+  |  cardinality: 1
+  |
+  1:Project
+  |  output columns:
+  |  5 <-> [5: l_quantity, DECIMAL64(15,2), true]
+  |  6 <-> [6: l_extendedprice, DECIMAL64(15,2), true]
+  |  7 <-> [7: l_discount, DECIMAL64(15,2), true]
+  |  9 <-> [9: l_returnflag, VARCHAR(1073741824), true]
+  |  10 <-> [10: l_linestatus, VARCHAR(1073741824), true]
+  |  21 <-> [35: multiply, DECIMAL128(31,4), true]
+  |  22 <-> [35: multiply, DECIMAL128(31,4), true] * cast(1 + [8: l_tax, DECIMAL64(15,2), true] as DECIMAL128(16,2))
+  |  common expressions:
+  |  32 <-> [7: l_discount, DECIMAL64(15,2), true]
+  |  33 <-> 1 - [32: cast, DECIMAL64(16,2), true]
+  |  34 <-> cast([33: subtract, DECIMAL64(16,2), true] as DECIMAL128(16,2))
+  |  35 <-> [31: cast, DECIMAL128(15,2), true] * [34: cast, DECIMAL128(16,2), true]
+  |  31 <-> cast([6: l_extendedprice, DECIMAL64(15,2), true] as DECIMAL128(15,2))
+  |  cardinality: 1
+  |
+  0:IcebergScanNode
+     TABLE: tpch.lineitem
+     PREDICATES: 11: l_shipdate <= '1998-12-01'
+     MIN/MAX PREDICATES: 11: l_shipdate <= '1998-12-01'
+     TABLE VERSION: Snapshot@(2784910170297541234)
+     cardinality=1
+     avgRowSize=9.0
+     dataCacheOptions={populate: true}
+     partitions=1/1
+     Iceberg Scan Metrics:
+         {"table-name":"plan_cmp_sr.tpch.lineitem","snapshot-id":2784910170297541234,"filter":{"type":"lt-eq","term":"l_shipdate","value":"(date)"},"schema-id":0,"projected-field-ids":[5,6,7,8,9,10,11],"projected-field-names":["l_quantity","l_extendedprice","l_discount","l_tax","l_returnflag","l_linestatus","l_shipdate"],"metrics":{"total-planning-duration":{"count":1,"time-unit":"nanoseconds","total-duration":14354375},"result-data-files":{"unit":"count","value":64},"result-delete-files":{"unit":"count","value":0},"total-data-manifests":{"unit":"count","value":1},"total-delete-manifests":{"unit":"count","value":0},"scanned-data-manifests":{"unit":"count","value":1},"skipped-data-manifests":{"unit":"count","value":0},"total-file-size-in-bytes":{"unit":"bytes","value":141301332},"total-delete-file-size-in-bytes":{"unit":"bytes","value":0},"skipped-data-files":{"unit":"count","value":0},"skipped-delete-files":{"unit":"count","value":0},"scanned-delete-manifests":{"unit":"count","value":0},"skipped-delete-manifests":{"unit":"count","value":0},"indexed-delete-files":{"unit":"count","value":0},"equality-delete-files":{"unit":"count","value":0},"positional-delete-files":{"unit":"count","value":0},"dvs":{"unit":"count","value":0}},"metadata":{"iceberg-version":"Apache Iceberg 1.10.0 (commit 2114bf631e49af532d66e2ce148ee49dd1dd1f1f)","read.split.target-size":"536870912"}}
+     cardinality: 1

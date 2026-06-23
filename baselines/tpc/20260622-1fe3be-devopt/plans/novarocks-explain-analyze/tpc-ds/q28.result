@@ -1,0 +1,185 @@
+Explain String
+Planning: 234.9ms / Execution: 19.43s / Rows: 1
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+60:PROJECT [b1.B1_LP AS B1_LP, b1.B1_CNT AS B1_CNT, b1.B1_CNTD AS B1_CNTD, b2.B2_LP AS B2_LP, b2.B2_CNT AS B2_CNT, b2.B2_CNTD AS B2_CNTD, b3.B3_LP AS B3_LP, b3.B3_CNT AS B3_CNT, b3.B3_CNTD AS B3_CNTD, b4.B4_LP AS B4_LP, b4.B4_CNT AS B4_CNT, b4.B4_CNTD AS B4_CNTD, b5.B5_LP AS B5_LP, b5.B5_CNT AS B5_CNT, b5.B5_CNTD AS B5_CNTD, b6.B6_LP AS B6_LP, b6.B6_CNT AS B6_CNT, b6.B6_CNTD AS B6_CNTD] stats={rows=1 conf=estimated} act={rows=2 time=443.9us peak=576B}
+  59:NEST LOOP JOIN (CROSS) stats={rows=1 conf=estimated} act={rows=1 time=12.2us peak=16.2KB}
+    49:NEST LOOP JOIN (CROSS) stats={rows=1 conf=estimated} act={rows=1 time=13.2us peak=16.1KB}
+      39:NEST LOOP JOIN (CROSS) stats={rows=1 conf=estimated} act={rows=1 time=14.4us peak=16.1KB}
+        29:NEST LOOP JOIN (CROSS) stats={rows=1 conf=estimated} act={rows=1 time=10.5us peak=16.1KB}
+          19:NEST LOOP JOIN (CROSS) stats={rows=1 conf=estimated} act={rows=1 time=19.2us peak=32.0KB}
+            9:PROJECT [B1_LP, B1_CNT, B1_CNTD] stats={rows=1 conf=estimated} act={rows=1 time=33.1us peak=16.0KB}
+              8:PROJECT [avg(ss_list_price) AS B1_LP, count(ss_list_price) AS B1_CNT, count(DISTINCT ss_list_price) AS B1_CNTD] stats={rows=1 conf=estimated} act={rows=1 time=55.5us peak=16.0KB}
+                7:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=2.2ms peak=127.3KB}
+                  aggregations: count(DISTINCT ss_list_price), avg(ss_list_price), count(ss_list_price)
+                  6:GATHER stats={rows=1 conf=estimated} act={rows=12 time=25.2us peak=0B}
+            18:PROJECT [B2_LP, B2_CNT, B2_CNTD] stats={rows=1 conf=estimated} act={rows=1 time=29.2us peak=16.0KB}
+              17:PROJECT [avg(ss_list_price) AS B2_LP, count(ss_list_price) AS B2_CNT, count(DISTINCT ss_list_price) AS B2_CNTD] stats={rows=1 conf=estimated} act={rows=1 time=47.0us peak=16.0KB}
+                16:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=1.1ms peak=109.2KB}
+                  aggregations: count(DISTINCT ss_list_price), avg(ss_list_price), count(ss_list_price)
+                  15:GATHER stats={rows=1 conf=estimated} act={rows=12 time=125.5us peak=0B}
+          28:PROJECT [B3_LP, B3_CNT, B3_CNTD] stats={rows=1 conf=estimated} act={rows=1 time=30.3us peak=16.0KB}
+            27:PROJECT [avg(ss_list_price) AS B3_LP, count(ss_list_price) AS B3_CNT, count(DISTINCT ss_list_price) AS B3_CNTD] stats={rows=1 conf=estimated} act={rows=1 time=47.5us peak=16.0KB}
+              26:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=1.6ms peak=130.2KB}
+                aggregations: count(DISTINCT ss_list_price), avg(ss_list_price), count(ss_list_price)
+                25:GATHER stats={rows=1 conf=estimated} act={rows=12 time=5.4us peak=0B}
+        38:PROJECT [B4_LP, B4_CNT, B4_CNTD] stats={rows=1 conf=estimated} act={rows=1 time=16.2us peak=16.0KB}
+          37:PROJECT [avg(ss_list_price) AS B4_LP, count(ss_list_price) AS B4_CNT, count(DISTINCT ss_list_price) AS B4_CNTD] stats={rows=1 conf=estimated} act={rows=1 time=23.2us peak=16.0KB}
+            36:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=1.2ms peak=117.1KB}
+              aggregations: count(DISTINCT ss_list_price), avg(ss_list_price), count(ss_list_price)
+              35:GATHER stats={rows=1 conf=estimated} act={rows=12 time=152.4us peak=0B}
+      48:PROJECT [B5_LP, B5_CNT, B5_CNTD] stats={rows=1 conf=estimated} act={rows=1 time=33.1us peak=16.0KB}
+        47:PROJECT [avg(ss_list_price) AS B5_LP, count(ss_list_price) AS B5_CNT, count(DISTINCT ss_list_price) AS B5_CNTD] stats={rows=1 conf=estimated} act={rows=1 time=49.8us peak=16.0KB}
+          46:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=1.6ms peak=109.2KB}
+            aggregations: count(DISTINCT ss_list_price), avg(ss_list_price), count(ss_list_price)
+            45:GATHER stats={rows=1 conf=estimated} act={rows=12 time=5.1us peak=0B}
+    58:PROJECT [B6_LP, B6_CNT, B6_CNTD] stats={rows=1 conf=estimated} act={rows=1 time=17.0us peak=16.0KB}
+      57:PROJECT [avg(ss_list_price) AS B6_LP, count(ss_list_price) AS B6_CNT, count(DISTINCT ss_list_price) AS B6_CNTD] stats={rows=1 conf=estimated} act={rows=1 time=32.5us peak=16.0KB}
+        56:HASH AGGREGATE (GLOBAL) stats={rows=1 conf=estimated} act={rows=13 time=695.7us peak=92.1KB}
+          aggregations: count(DISTINCT ss_list_price), avg(ss_list_price), count(ss_list_price)
+          55:GATHER stats={rows=1 conf=estimated} act={rows=12 time=22.6us peak=0B}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 55
+    PARTITION: UNPARTITIONED
+54:HASH AGGREGATE (DISTINCT_LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=104.8us peak=1.4MB}
+  aggregations: count(DISTINCT ss_list_price), avg(ss_list_price), count(ss_list_price)
+  53:HASH AGGREGATE (DISTINCT_GLOBAL, group by: [ss_list_price]) stats={rows=19499 conf=estimated} act={rows=17603 time=363.8us peak=945.1KB}
+    aggregations: avg(ss_list_price), count(ss_list_price)
+    52:HASH EXCHANGE stats={rows=19499 conf=estimated} act={rows=12392 time=7.6us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 52
+    PARTITION: HASH_PARTITIONED (ss_list_price)
+51:HASH AGGREGATE (LOCAL, group by: [ss_list_price]) stats={rows=19499 conf=estimated} act={rows=42489 time=5.3ms peak=1.8MB}
+  aggregations: avg(ss_list_price), count(ss_list_price)
+  50:SCAN tpcds.store_sales stats={rows=444312 conf=estimated} act={rows=30097 time=36.2us peak=0B}
+       TABLE: tpcds.store_sales
+       columns: ss_list_price, ss_quantity, ss_wholesale_cost, ss_coupon_amt
+       min-max stats
+       predicates: ss_quantity BETWEEN 26 AND 30 AND ss_list_price BETWEEN 154 AND 154 + 10 OR ss_coupon_amt BETWEEN 7326 AND 7326 + 1000 OR ss_wholesale_cost BETWEEN 7 AND 7 + 20
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 45
+    PARTITION: UNPARTITIONED
+44:HASH AGGREGATE (DISTINCT_LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=182.1us peak=1.7MB}
+  aggregations: count(DISTINCT ss_list_price), avg(ss_list_price), count(ss_list_price)
+  43:HASH AGGREGATE (DISTINCT_GLOBAL, group by: [ss_list_price]) stats={rows=19499 conf=estimated} act={rows=26008 time=305.4us peak=1.0MB}
+    aggregations: avg(ss_list_price), count(ss_list_price)
+    42:HASH EXCHANGE stats={rows=19499 conf=estimated} act={rows=17343 time=40.6us peak=0B}
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 42
+    PARTITION: HASH_PARTITIONED (ss_list_price)
+41:HASH AGGREGATE (LOCAL, group by: [ss_list_price]) stats={rows=19499 conf=estimated} act={rows=53834 time=4.9ms peak=2.9MB}
+  aggregations: avg(ss_list_price), count(ss_list_price)
+  40:SCAN tpcds.store_sales stats={rows=445717 conf=estimated} act={rows=36491 time=37.4us peak=0B}
+       TABLE: tpcds.store_sales
+       columns: ss_list_price, ss_quantity, ss_wholesale_cost, ss_coupon_amt
+       min-max stats
+       predicates: ss_quantity BETWEEN 21 AND 25 AND ss_list_price BETWEEN 122 AND 122 + 10 OR ss_coupon_amt BETWEEN 836 AND 836 + 1000 OR ss_wholesale_cost BETWEEN 17 AND 17 + 20
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 35
+    PARTITION: UNPARTITIONED
+34:HASH AGGREGATE (DISTINCT_LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=132.9us peak=1.6MB}
+  aggregations: count(DISTINCT ss_list_price), avg(ss_list_price), count(ss_list_price)
+  33:HASH AGGREGATE (DISTINCT_GLOBAL, group by: [ss_list_price]) stats={rows=19499 conf=estimated} act={rows=24324 time=261.4us peak=1.0MB}
+    aggregations: avg(ss_list_price), count(ss_list_price)
+    32:HASH EXCHANGE stats={rows=19499 conf=estimated} act={rows=16645 time=61.5us peak=0B}
+PLAN FRAGMENT 6
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 32
+    PARTITION: HASH_PARTITIONED (ss_list_price)
+31:HASH AGGREGATE (LOCAL, group by: [ss_list_price]) stats={rows=19499 conf=estimated} act={rows=48413 time=4.9ms peak=2.7MB}
+  aggregations: avg(ss_list_price), count(ss_list_price)
+  30:SCAN tpcds.store_sales stats={rows=308500 conf=estimated} act={rows=31768 time=34.2us peak=0B}
+       TABLE: tpcds.store_sales
+       columns: ss_list_price, ss_quantity, ss_wholesale_cost, ss_coupon_amt
+       min-max stats
+       predicates: ss_quantity BETWEEN 16 AND 20 AND ss_list_price BETWEEN 135 AND 135 + 10 OR ss_coupon_amt BETWEEN 6071 AND 6071 + 1000 OR ss_wholesale_cost BETWEEN 38 AND 38 + 20
+PLAN FRAGMENT 7
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 25
+    PARTITION: UNPARTITIONED
+24:HASH AGGREGATE (DISTINCT_LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=169.0us peak=1.7MB}
+  aggregations: count(DISTINCT ss_list_price), avg(ss_list_price), count(ss_list_price)
+  23:HASH AGGREGATE (DISTINCT_GLOBAL, group by: [ss_list_price]) stats={rows=19499 conf=estimated} act={rows=27878 time=297.2us peak=1.0MB}
+    aggregations: avg(ss_list_price), count(ss_list_price)
+    22:HASH EXCHANGE stats={rows=19499 conf=estimated} act={rows=18136 time=30.8us peak=0B}
+PLAN FRAGMENT 8
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 22
+    PARTITION: HASH_PARTITIONED (ss_list_price)
+21:HASH AGGREGATE (LOCAL, group by: [ss_list_price]) stats={rows=19499 conf=estimated} act={rows=46362 time=5.5ms peak=2.9MB}
+  aggregations: avg(ss_list_price), count(ss_list_price)
+  20:SCAN tpcds.store_sales stats={rows=142265 conf=estimated} act={rows=28226 time=39.8us peak=0B}
+       TABLE: tpcds.store_sales
+       columns: ss_list_price, ss_quantity, ss_wholesale_cost, ss_coupon_amt
+       min-max stats
+       predicates: ss_quantity BETWEEN 11 AND 15 AND ss_list_price BETWEEN 142 AND 142 + 10 OR ss_coupon_amt BETWEEN 12214 AND 12214 + 1000 OR ss_wholesale_cost BETWEEN 79 AND 79 + 20
+PLAN FRAGMENT 9
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 15
+    PARTITION: UNPARTITIONED
+14:HASH AGGREGATE (DISTINCT_LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=139.8us peak=1.5MB}
+  aggregations: count(DISTINCT ss_list_price), avg(ss_list_price), count(ss_list_price)
+  13:HASH AGGREGATE (DISTINCT_GLOBAL, group by: [ss_list_price]) stats={rows=19499 conf=estimated} act={rows=22249 time=260.2us peak=995.7KB}
+    aggregations: avg(ss_list_price), count(ss_list_price)
+    12:HASH EXCHANGE stats={rows=19499 conf=estimated} act={rows=15656 time=83.0us peak=0B}
+PLAN FRAGMENT 10
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 12
+    PARTITION: HASH_PARTITIONED (ss_list_price)
+11:HASH AGGREGATE (LOCAL, group by: [ss_list_price]) stats={rows=19499 conf=estimated} act={rows=51185 time=6.3ms peak=2.1MB}
+  aggregations: avg(ss_list_price), count(ss_list_price)
+  10:SCAN tpcds.store_sales stats={rows=205527 conf=estimated} act={rows=35529 time=35.8us peak=0B}
+       TABLE: tpcds.store_sales
+       columns: ss_list_price, ss_quantity, ss_wholesale_cost, ss_coupon_amt
+       min-max stats
+       predicates: ss_quantity BETWEEN 6 AND 10 AND ss_list_price BETWEEN 90 AND 90 + 10 OR ss_coupon_amt BETWEEN 2323 AND 2323 + 1000 OR ss_wholesale_cost BETWEEN 31 AND 31 + 20
+PLAN FRAGMENT 11
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 6
+    PARTITION: UNPARTITIONED
+5:HASH AGGREGATE (DISTINCT_LOCAL) stats={rows=1 conf=estimated} act={rows=12 time=233.4us peak=1.7MB}
+  aggregations: count(DISTINCT ss_list_price), avg(ss_list_price), count(ss_list_price)
+  4:HASH AGGREGATE (DISTINCT_GLOBAL, group by: [ss_list_price]) stats={rows=19499 conf=estimated} act={rows=28360 time=356.6us peak=1.0MB}
+    aggregations: avg(ss_list_price), count(ss_list_price)
+    3:HASH EXCHANGE stats={rows=19499 conf=estimated} act={rows=19149 time=11.3us peak=0B}
+PLAN FRAGMENT 12
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: HASH_PARTITIONED (ss_list_price)
+2:HASH AGGREGATE (LOCAL, group by: [ss_list_price]) stats={rows=19499 conf=estimated} act={rows=55624 time=5.5ms peak=3.0MB}
+  aggregations: avg(ss_list_price), count(ss_list_price)
+  1:SCAN tpcds.store_sales stats={rows=114421 conf=estimated} act={rows=36475 time=29.3us peak=0B}
+       TABLE: tpcds.store_sales
+       columns: ss_list_price, ss_quantity, ss_wholesale_cost, ss_coupon_amt
+       min-max stats
+       predicates: ss_quantity BETWEEN 0 AND 5 AND ss_list_price BETWEEN 8 AND 8 + 10 OR ss_coupon_amt BETWEEN 459 AND 459 + 1000 OR ss_wholesale_cost BETWEEN 57 AND 57 + 20

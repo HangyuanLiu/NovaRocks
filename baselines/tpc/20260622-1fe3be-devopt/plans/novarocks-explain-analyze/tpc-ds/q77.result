@@ -1,0 +1,335 @@
+Explain String
+Planning: 484.3ms / Execution: 5.29s / Rows: 44
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+89:TOP-N (limit=100) [channel ASC NULLS FIRST, id ASC NULLS FIRST] stats={rows=100 conf=estimated} act={rows=88 time=170.8us peak=77.2KB}
+  88:PROJECT [__repeat_group.channel AS channel, __repeat_group.id AS id, sum(sales) AS sales, sum(returns) AS returns, sum(profit) AS profit] stats={rows=288 conf=estimated} act={rows=44 time=49.3us peak=70.6KB}
+    87:HASH AGGREGATE (SINGLE, group by: [channel, id, __grouping_fn_0]) stats={rows=288 conf=estimated} act={rows=150 time=115.6us peak=1.1MB}
+      aggregations: sum(sales), sum(returns), sum(profit)
+      86:GATHER stats={rows=288 conf=estimated} act={rows=168 time=39.4us peak=0B}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 86
+    PARTITION: UNPARTITIONED
+85:REPEAT (3 grouping sets) stats={rows=288 conf=estimated} act={rows=168 time=155.7us peak=101.8KB}
+  84:PROJECT [channel, id, sales, returns, profit, channel AS __repeat_group_key_0, id AS __repeat_group_key_1] stats={rows=96 conf=estimated} act={rows=56 time=330.2us peak=796B}
+    83:PROJECT [channel, id, sales, returns, profit] stats={rows=96 conf=estimated} act={rows=56 time=348.9us peak=796B}
+      82:UNION ALL stats={rows=96 conf=estimated} act={rows=112 time=156.5us peak=5.9KB}
+        54:UNION ALL stats={rows=42 conf=estimated} act={rows=52 time=86.4us peak=4.3KB}
+          27:PROJECT ['store channel' AS channel, ss.s_store_sk AS id, sales, coalesce(returns, 0) AS returns, profit - coalesce(profit_loss, 0) AS profit] stats={rows=6 conf=estimated} act={rows=6 time=91.3us peak=432B}
+            26:HASH JOIN (BROADCAST, LEFT OUTER, eq: [s_store_sk = sr.s_store_sk]) stats={rows=6 conf=estimated} act={rows=12 time=47.1us peak=18.6KB}
+              12:PROJECT [s_store_sk, sales, profit] stats={rows=6 conf=estimated} act={rows=6 time=47.2us peak=16.2KB}
+                11:PROJECT [s_store_sk, sum(ss_ext_sales_price) AS sales, sum(ss_net_profit) AS profit] stats={rows=6 conf=estimated} act={rows=6 time=46.9us peak=16.2KB}
+                  10:HASH AGGREGATE (GLOBAL, group by: [s_store_sk]) stats={rows=6 conf=estimated} act={rows=18 time=56.0us peak=256.6KB}
+                    aggregations: sum(ss_ext_sales_price), sum(ss_net_profit)
+                    9:HASH EXCHANGE stats={rows=6 conf=estimated} act={rows=12 time=19.6us peak=0B}
+              25:GATHER stats={rows=6 conf=estimated} act={rows=6 time=14.6us peak=0B}
+          53:PROJECT ['catalog channel' AS channel, cs_call_center_sk AS id, sales, returns, profit - profit_loss AS profit] stats={rows=36 conf=estimated} act={rows=20 time=126.2us peak=1.1KB}
+            52:NEST LOOP JOIN (CROSS) stats={rows=36 conf=estimated} act={rows=24 time=11.2us peak=28.8KB}
+              39:PROJECT [cr_call_center_sk, returns, profit_loss] stats={rows=6 conf=estimated} act={rows=5 time=18.1us peak=12.3KB}
+                38:PROJECT [cr_call_center_sk, sum(cr_return_amount) AS returns, sum(cr_net_loss) AS profit_loss] stats={rows=6 conf=estimated} act={rows=5 time=117.1us peak=12.3KB}
+                  37:PROJECT [cr_call_center_sk, sum(sum(cr_return_amount)) AS sum(cr_return_amount), sum(sum(cr_net_loss)) AS sum(cr_net_loss)] stats={rows=6 conf=estimated} act={rows=5 time=49.5us peak=12.3KB}
+                    36:HASH AGGREGATE (SINGLE, group by: [cr_call_center_sk]) stats={rows=6 conf=estimated} act={rows=15 time=35.4us peak=263.9KB}
+                      aggregations: sum(sum(cr_return_amount)), sum(sum(cr_net_loss))
+                      35:GATHER stats={rows=5046 conf=estimated} act={rows=128 time=118.9us peak=0B}
+              51:PROJECT [cs_call_center_sk, sales, profit] stats={rows=6 conf=estimated} act={rows=4 time=17.9us peak=8.2KB}
+                50:PROJECT [cs_call_center_sk, sum(cs_ext_sales_price) AS sales, sum(cs_net_profit) AS profit] stats={rows=6 conf=estimated} act={rows=4 time=20.4us peak=8.2KB}
+                  49:PROJECT [cs_call_center_sk, sum(sum(cs_ext_sales_price)) AS sum(cs_ext_sales_price), sum(sum(cs_net_profit)) AS sum(cs_net_profit)] stats={rows=6 conf=estimated} act={rows=4 time=21.7us peak=8.2KB}
+                    48:HASH AGGREGATE (SINGLE, group by: [cs_call_center_sk]) stats={rows=6 conf=estimated} act={rows=12 time=36.4us peak=200.0KB}
+                      aggregations: sum(sum(cs_ext_sales_price)), sum(sum(cs_net_profit))
+                      47:GATHER stats={rows=4483 conf=estimated} act={rows=121 time=12.0us peak=0B}
+        81:PROJECT ['web channel' AS channel, ws.wp_web_page_sk AS id, sales, coalesce(returns, 0) AS returns, profit - coalesce(profit_loss, 0) AS profit] stats={rows=54 conf=estimated} act={rows=30 time=1.8ms peak=2.1KB}
+          80:HASH JOIN (BROADCAST, LEFT OUTER, eq: [wp_web_page_sk = wr.wp_web_page_sk]) stats={rows=54 conf=estimated} act={rows=70 time=1.6ms peak=23.4KB}
+            66:PROJECT [wp_web_page_sk, sales, profit] stats={rows=54 conf=estimated} act={rows=30 time=20.8us peak=16.9KB}
+              65:PROJECT [wp_web_page_sk, sum(ws_ext_sales_price) AS sales, sum(ws_net_profit) AS profit] stats={rows=54 conf=estimated} act={rows=30 time=23.8us peak=16.9KB}
+                64:HASH AGGREGATE (GLOBAL, group by: [wp_web_page_sk]) stats={rows=54 conf=estimated} act={rows=120 time=70.7us peak=257.7KB}
+                  aggregations: sum(ws_ext_sales_price), sum(ws_net_profit)
+                  63:HASH EXCHANGE stats={rows=54 conf=estimated} act={rows=90 time=10.1us peak=0B}
+            79:GATHER stats={rows=54 conf=estimated} act={rows=40 time=10.0us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 79
+    PARTITION: UNPARTITIONED
+78:PROJECT [wp_web_page_sk, returns, profit_loss] stats={rows=54 conf=estimated} act={rows=40 time=242.5us peak=92.2KB}
+  77:PROJECT [wp_web_page_sk, sum(wr_return_amt) AS returns, sum(wr_net_loss) AS profit_loss] stats={rows=54 conf=estimated} act={rows=40 time=192.6us peak=41.2KB}
+    76:HASH AGGREGATE (GLOBAL, group by: [wp_web_page_sk]) stats={rows=54 conf=estimated} act={rows=160 time=332.6us peak=643.8KB}
+      aggregations: sum(wr_return_amt), sum(wr_net_loss)
+      75:HASH EXCHANGE stats={rows=54 conf=estimated} act={rows=120 time=524.0us peak=0B}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 75
+    PARTITION: HASH_PARTITIONED (wp_web_page_sk)
+74:HASH AGGREGATE (LOCAL, group by: [wp_web_page_sk]) stats={rows=54 conf=estimated} act={rows=1145 time=1.0ms peak=1.0MB}
+  aggregations: sum(wr_return_amt), sum(wr_net_loss)
+  73:HASH JOIN (BROADCAST, INNER, eq: [wr_web_page_sk = wp_web_page_sk]) stats={rows=59078 conf=estimated} act={rows=1205 time=12.7ms peak=129.3KB}
+    build runtime filters:
+    - filter_id = 9, build_expr = (wp_web_page_sk)
+    70:HASH JOIN (BROADCAST, INNER, eq: [wr_returned_date_sk = d_date_sk]) stats={rows=65642 conf=estimated} act={rows=1118 time=272.5us peak=2.1MB}
+      build runtime filters:
+      - filter_id = 8, build_expr = (d_date_sk)
+      67:SCAN tpcds.web_returns stats={rows=65642 conf=estimated} act={rows=67029 time=14.1us peak=0B}
+           TABLE: tpcds.web_returns
+           columns: wr_returned_date_sk, wr_web_page_sk, wr_return_amt, wr_net_loss
+           min-max stats
+           predicates: wr_returned_date_sk IS NOT NULL AND wr_web_page_sk IS NOT NULL
+          probe runtime filters:
+          - filter_id = 8, probe_expr = (wr_returned_date_sk)
+          - filter_id = 9, probe_expr = (wr_web_page_sk)
+      69:GATHER stats={rows=16436 conf=estimated} act={rows=93 time=11.5us peak=0B}
+    72:GATHER stats={rows=54 conf=estimated} act={rows=180 time=1.9ms peak=0B}
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 72
+    PARTITION: UNPARTITIONED
+71:SCAN tpcds.web_page stats={rows=54 conf=estimated} act={rows=60 time=2.2ms peak=32.1KB}
+     TABLE: tpcds.web_page
+     columns: wp_web_page_sk
+     min-max stats
+     predicates: wp_web_page_sk IS NOT NULL
+PLAN FRAGMENT 5
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 69
+    PARTITION: UNPARTITIONED
+68:SCAN tpcds.date_dim stats={rows=16436 conf=estimated} act={rows=31 time=34.8us peak=21.8KB}
+     TABLE: tpcds.date_dim
+     columns: d_date_sk, d_date
+     min-max stats
+     predicates: d_date BETWEEN CAST('2000-08-23' AS Date32) AND date_add(CAST('2000-08-23' AS Date32), 30) AND d_date_sk IS NOT NULL
+PLAN FRAGMENT 6
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 63
+    PARTITION: HASH_PARTITIONED (wp_web_page_sk)
+62:HASH AGGREGATE (LOCAL, group by: [wp_web_page_sk]) stats={rows=54 conf=estimated} act={rows=16311 time=674.2us peak=8.4MB}
+  aggregations: sum(ws_ext_sales_price), sum(ws_net_profit)
+  61:HASH JOIN (BROADCAST, INNER, eq: [ws_web_page_sk = wp_web_page_sk]) stats={rows=647106 conf=estimated} act={rows=16401 time=38.4ms peak=2.7MB}
+    build runtime filters:
+    - filter_id = 7, build_expr = (wp_web_page_sk)
+    58:HASH JOIN (BROADCAST, INNER, eq: [ws_sold_date_sk = d_date_sk]) stats={rows=719007 conf=estimated} act={rows=16314 time=2.3ms peak=5.8MB}
+      build runtime filters:
+      - filter_id = 6, build_expr = (d_date_sk)
+      55:SCAN tpcds.web_sales stats={rows=719007 conf=estimated} act={rows=719106 time=13.7ms peak=0B}
+           TABLE: tpcds.web_sales
+           columns: ws_sold_date_sk, ws_web_page_sk, ws_ext_sales_price, ws_net_profit
+           min-max stats
+           predicates: ws_sold_date_sk IS NOT NULL AND ws_web_page_sk IS NOT NULL
+          probe runtime filters:
+          - filter_id = 6, probe_expr = (ws_sold_date_sk)
+          - filter_id = 7, probe_expr = (ws_web_page_sk)
+      57:GATHER stats={rows=16436 conf=estimated} act={rows=93 time=30.6us peak=0B}
+    60:GATHER stats={rows=54 conf=estimated} act={rows=180 time=2.1ms peak=0B}
+PLAN FRAGMENT 7
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 60
+    PARTITION: UNPARTITIONED
+59:SCAN tpcds.web_page stats={rows=54 conf=estimated} act={rows=60 time=3.6ms peak=41.7KB}
+     TABLE: tpcds.web_page
+     columns: wp_web_page_sk
+     min-max stats
+     predicates: wp_web_page_sk IS NOT NULL
+PLAN FRAGMENT 8
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 57
+    PARTITION: UNPARTITIONED
+56:SCAN tpcds.date_dim stats={rows=16436 conf=estimated} act={rows=31 time=118.2us peak=21.8KB}
+     TABLE: tpcds.date_dim
+     columns: d_date_sk, d_date
+     min-max stats
+     predicates: d_date BETWEEN CAST('2000-08-23' AS Date32) AND date_add(CAST('2000-08-23' AS Date32), 30) AND d_date_sk IS NOT NULL
+PLAN FRAGMENT 9
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 47
+    PARTITION: UNPARTITIONED
+46:HASH JOIN (BROADCAST, INNER, eq: [d_date_sk = cs_sold_date_sk]) stats={rows=4483 conf=estimated} act={rows=20911 time=2.3ms peak=1.4MB}
+  build runtime filters:
+  - filter_id = 5, build_expr = (cs_sold_date_sk)
+  40:SCAN tpcds.date_dim stats={rows=16436 conf=estimated} act={rows=31 time=6.1us peak=0B}
+       TABLE: tpcds.date_dim
+       columns: d_date_sk, d_date
+       min-max stats
+       predicates: d_date BETWEEN CAST('2000-08-23' AS Date32) AND date_add(CAST('2000-08-23' AS Date32), 30) AND d_date_sk IS NOT NULL
+      probe runtime filters:
+      - filter_id = 5, probe_expr = (d_date_sk)
+  45:GATHER stats={rows=4483 conf=estimated} act={rows=20790 time=113.0us peak=0B}
+PLAN FRAGMENT 10
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 45
+    PARTITION: UNPARTITIONED
+44:HASH AGGREGATE (GLOBAL, group by: [cs_call_center_sk, cs_sold_date_sk]) stats={rows=4483 conf=estimated} act={rows=14066 time=384.3us peak=2.0MB}
+  aggregations: sum(cs_ext_sales_price), sum(cs_net_profit)
+  43:HASH EXCHANGE stats={rows=4483 conf=estimated} act={rows=7136 time=2.6ms peak=0B}
+PLAN FRAGMENT 11
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 43
+    PARTITION: HASH_PARTITIONED (cs_call_center_sk, cs_sold_date_sk)
+42:HASH AGGREGATE (LOCAL, group by: [cs_call_center_sk, cs_sold_date_sk]) stats={rows=4483 conf=estimated} act={rows=1441504 time=77.6ms peak=11.5MB}
+  aggregations: sum(cs_ext_sales_price), sum(cs_net_profit)
+  41:SCAN tpcds.catalog_sales stats={rows=1434368 conf=estimated} act={rows=1434368 time=1.2ms peak=0B}
+       TABLE: tpcds.catalog_sales
+       columns: cs_sold_date_sk, cs_call_center_sk, cs_ext_sales_price, cs_net_profit
+       min-max stats
+       predicates: cs_sold_date_sk IS NOT NULL
+PLAN FRAGMENT 12
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 35
+    PARTITION: UNPARTITIONED
+34:HASH JOIN (BROADCAST, INNER, eq: [d_date_sk = cr_returned_date_sk]) stats={rows=5046 conf=estimated} act={rows=24788 time=5.1ms peak=1.7MB}
+  build runtime filters:
+  - filter_id = 4, build_expr = (cr_returned_date_sk)
+  28:SCAN tpcds.date_dim stats={rows=16436 conf=estimated} act={rows=31 time=10.6us peak=0B}
+       TABLE: tpcds.date_dim
+       columns: d_date_sk, d_date
+       min-max stats
+       predicates: d_date BETWEEN CAST('2000-08-23' AS Date32) AND date_add(CAST('2000-08-23' AS Date32), 30) AND d_date_sk IS NOT NULL
+      probe runtime filters:
+      - filter_id = 4, probe_expr = (d_date_sk)
+  33:GATHER stats={rows=5046 conf=estimated} act={rows=24660 time=11.2us peak=0B}
+PLAN FRAGMENT 13
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 33
+    PARTITION: UNPARTITIONED
+32:HASH AGGREGATE (GLOBAL, group by: [cr_call_center_sk, cr_returned_date_sk]) stats={rows=5046 conf=estimated} act={rows=19704 time=770.9us peak=2.7MB}
+  aggregations: sum(cr_return_amount), sum(cr_net_loss)
+  31:HASH EXCHANGE stats={rows=5046 conf=estimated} act={rows=11484 time=2.4ms peak=0B}
+PLAN FRAGMENT 14
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 31
+    PARTITION: HASH_PARTITIONED (cr_call_center_sk, cr_returned_date_sk)
+30:HASH AGGREGATE (LOCAL, group by: [cr_call_center_sk, cr_returned_date_sk]) stats={rows=5046 conf=estimated} act={rows=155551 time=4.4ms peak=7.6MB}
+  aggregations: sum(cr_return_amount), sum(cr_net_loss)
+  29:SCAN tpcds.catalog_returns stats={rows=129660 conf=estimated} act={rows=144067 time=5.7us peak=0B}
+       TABLE: tpcds.catalog_returns
+       columns: cr_returned_date_sk, cr_call_center_sk, cr_return_amount, cr_net_loss
+       min-max stats
+       predicates: cr_returned_date_sk IS NOT NULL
+PLAN FRAGMENT 15
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 25
+    PARTITION: UNPARTITIONED
+24:PROJECT [s_store_sk, returns, profit_loss] stats={rows=6 conf=estimated} act={rows=6 time=20.8us peak=44.9KB}
+  23:PROJECT [s_store_sk, sum(sr_return_amt) AS returns, sum(sr_net_loss) AS profit_loss] stats={rows=6 conf=estimated} act={rows=6 time=31.0us peak=20.2KB}
+    22:HASH AGGREGATE (GLOBAL, group by: [s_store_sk]) stats={rows=6 conf=estimated} act={rows=24 time=193.0us peak=322.1KB}
+      aggregations: sum(sr_return_amt), sum(sr_net_loss)
+      21:HASH EXCHANGE stats={rows=6 conf=estimated} act={rows=18 time=15.1us peak=0B}
+PLAN FRAGMENT 16
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 21
+    PARTITION: HASH_PARTITIONED (s_store_sk)
+20:HASH AGGREGATE (LOCAL, group by: [s_store_sk]) stats={rows=6 conf=estimated} act={rows=3325 time=4.7ms peak=1014.7KB}
+  aggregations: sum(sr_return_amt), sum(sr_net_loss)
+  19:HASH JOIN (BROADCAST, INNER, eq: [sr_store_sk = s_store_sk]) stats={rows=267790 conf=estimated} act={rows=3343 time=397.2us peak=77.0KB}
+    build runtime filters:
+    - filter_id = 3, build_expr = (s_store_sk)
+    16:HASH JOIN (BROADCAST, INNER, eq: [sr_returned_date_sk = d_date_sk]) stats={rows=267790 conf=estimated} act={rows=3400 time=3.7ms peak=2.2MB}
+      build runtime filters:
+      - filter_id = 2, build_expr = (d_date_sk)
+      13:SCAN tpcds.store_returns stats={rows=267790 conf=estimated} act={rows=272426 time=516.2us peak=0B}
+           TABLE: tpcds.store_returns
+           columns: sr_returned_date_sk, sr_store_sk, sr_return_amt, sr_net_loss
+           min-max stats
+           predicates: sr_returned_date_sk IS NOT NULL AND sr_store_sk IS NOT NULL
+          probe runtime filters:
+          - filter_id = 2, probe_expr = (sr_returned_date_sk)
+          - filter_id = 3, probe_expr = (sr_store_sk)
+      15:GATHER stats={rows=16436 conf=estimated} act={rows=93 time=1.6ms peak=0B}
+    18:GATHER stats={rows=11 conf=estimated} act={rows=36 time=423.2us peak=0B}
+PLAN FRAGMENT 17
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 18
+    PARTITION: UNPARTITIONED
+17:SCAN tpcds.store stats={rows=11 conf=estimated} act={rows=12 time=30.2us peak=11.0KB}
+     TABLE: tpcds.store
+     columns: s_store_sk
+     min-max stats
+     predicates: s_store_sk IS NOT NULL
+PLAN FRAGMENT 18
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 15
+    PARTITION: UNPARTITIONED
+14:SCAN tpcds.date_dim stats={rows=16436 conf=estimated} act={rows=31 time=29.6us peak=21.8KB}
+     TABLE: tpcds.date_dim
+     columns: d_date_sk, d_date
+     min-max stats
+     predicates: d_date BETWEEN CAST('2000-08-23' AS Date32) AND date_add(CAST('2000-08-23' AS Date32), 30) AND d_date_sk IS NOT NULL
+PLAN FRAGMENT 19
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 9
+    PARTITION: HASH_PARTITIONED (s_store_sk)
+8:HASH AGGREGATE (LOCAL, group by: [s_store_sk]) stats={rows=6 conf=estimated} act={rows=61899 time=3.7ms peak=8.4MB}
+  aggregations: sum(ss_ext_sales_price), sum(ss_net_profit)
+  7:HASH JOIN (BROADCAST, INNER, eq: [ss_store_sk = s_store_sk]) stats={rows=2626150 conf=estimated} act={rows=61923 time=2.3ms peak=2.6MB}
+    build runtime filters:
+    - filter_id = 1, build_expr = (s_store_sk)
+    4:HASH JOIN (BROADCAST, INNER, eq: [ss_sold_date_sk = d_date_sk]) stats={rows=2626150 conf=estimated} act={rows=61980 time=12.7ms peak=6.5MB}
+      build runtime filters:
+      - filter_id = 0, build_expr = (d_date_sk)
+      1:SCAN tpcds.store_sales stats={rows=2626150 conf=estimated} act={rows=2685687 time=3.3ms peak=0B}
+           TABLE: tpcds.store_sales
+           columns: ss_sold_date_sk, ss_store_sk, ss_ext_sales_price, ss_net_profit
+           min-max stats
+           predicates: ss_sold_date_sk IS NOT NULL AND ss_store_sk IS NOT NULL
+          probe runtime filters:
+          - filter_id = 0, probe_expr = (ss_sold_date_sk)
+          - filter_id = 1, probe_expr = (ss_store_sk)
+      3:GATHER stats={rows=16436 conf=estimated} act={rows=93 time=94.8us peak=0B}
+    6:GATHER stats={rows=11 conf=estimated} act={rows=36 time=8.9us peak=0B}
+PLAN FRAGMENT 20
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 6
+    PARTITION: UNPARTITIONED
+5:SCAN tpcds.store stats={rows=11 conf=estimated} act={rows=12 time=17.7us peak=11.0KB}
+     TABLE: tpcds.store
+     columns: s_store_sk
+     min-max stats
+     predicates: s_store_sk IS NOT NULL
+PLAN FRAGMENT 21
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: UNPARTITIONED
+2:SCAN tpcds.date_dim stats={rows=16436 conf=estimated} act={rows=31 time=30.0us peak=21.8KB}
+     TABLE: tpcds.date_dim
+     columns: d_date_sk, d_date
+     min-max stats
+     predicates: d_date BETWEEN CAST('2000-08-23' AS Date32) AND date_add(CAST('2000-08-23' AS Date32), 30) AND d_date_sk IS NOT NULL

@@ -1,0 +1,60 @@
+Explain String
+Planning: 59.4ms / Execution: 4.52s / Rows: 100
+PLAN FRAGMENT 0
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+16:PROJECT [ss_customer_sk, sum(act_sales) AS sumsales] stats={rows=100 conf=estimated} act={rows=100 time=14.0us peak=2.0KB}
+  15:MERGING-EXCHANGE stats={rows=100 conf=estimated} act={rows=700 time=42.3us peak=10.6KB}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 15
+    PARTITION: UNPARTITIONED
+14:LOCAL TOP-N (limit=100, offset=0) [sum(act_sales) ASC NULLS FIRST, ss_customer_sk ASC NULLS FIRST] stats={rows=100 conf=estimated} act={rows=7516 time=305.8us peak=338.6KB}
+  13:HASH AGGREGATE (GLOBAL, group by: [ss_customer_sk]) stats={rows=90820 conf=estimated} act={rows=14631 time=132.2us peak=842.8KB}
+    aggregations: sum(act_sales)
+    12:HASH EXCHANGE stats={rows=90820 conf=estimated} act={rows=7415 time=17.2us peak=0B}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 12
+    PARTITION: HASH_PARTITIONED (ss_customer_sk)
+11:HASH AGGREGATE (LOCAL, group by: [ss_customer_sk]) stats={rows=90820 conf=estimated} act={rows=15398 time=7.4ms peak=1.1MB}
+  aggregations: sum(act_sales)
+  10:PROJECT [ss_customer_sk, act_sales] stats={rows=625586 conf=estimated} act={rows=7983 time=1.4ms peak=4.1KB}
+    9:PROJECT [ss_customer_sk, CASE WHEN sr_return_quantity IS NOT NULL THEN ss_quantity - sr_return_quantity * ss_sales_price ELSE ss_quantity * ss_sales_price END AS act_sales] stats={rows=625586 conf=estimated} act={rows=7983 time=5.8ms peak=96.7KB}
+      8:HASH JOIN (BROADCAST, INNER, eq: [sr_reason_sk = r_reason_sk]) stats={rows=625586 conf=estimated} act={rows=7986 time=13.4ms peak=1.5MB}
+        build runtime filters:
+        - filter_id = 0, build_expr = (r_reason_sk)
+        5:FILTER stats={rows=2780381 conf=estimated}
+          predicate: sr_reason_sk IS NOT NULL
+          4:HASH JOIN (BROADCAST, LEFT OUTER, eq: [ss_item_sk = sr_item_sk, ss_ticket_number = sr_ticket_number]) stats={rows=2880404 conf=estimated} act={rows=4020476 time=182.8ms peak=189.7MB}
+            1:SCAN tpcds.store_sales stats={rows=2880404} act={rows=2880404 time=2.7ms peak=0B}
+                 TABLE: tpcds.store_sales
+                 columns: ss_item_sk, ss_customer_sk, ss_ticket_number, ss_quantity, ss_sales_price
+                 min-max stats
+            3:GATHER stats={rows=287514} act={rows=862542 time=32.4us peak=0B}
+        7:GATHER stats={rows=8 conf=estimated} act={rows=3 time=43.7us peak=0B}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 7
+    PARTITION: UNPARTITIONED
+6:SCAN tpcds.reason stats={rows=8 conf=estimated} act={rows=1 time=228.3us peak=4.8KB}
+     TABLE: tpcds.reason
+     columns: r_reason_sk, r_reason_desc
+     min-max stats
+     predicates: r_reason_desc = 'reason 28' AND r_reason_sk IS NOT NULL
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 3
+    PARTITION: UNPARTITIONED
+2:SCAN tpcds.store_returns stats={rows=287514} act={rows=287514 time=52.4ms peak=15.0MB}
+     TABLE: tpcds.store_returns
+     columns: sr_item_sk, sr_reason_sk, sr_ticket_number, sr_return_quantity
+     min-max stats
