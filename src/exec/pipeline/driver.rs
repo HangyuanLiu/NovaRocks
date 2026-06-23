@@ -71,6 +71,13 @@ pub enum DriverState {
     Failed(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DriverBlockedKind {
+    InputEmpty,
+    OutputFull,
+    Dependency,
+}
+
 #[derive(Debug)]
 /// Scheduling metadata for one driver including blocking and requeue state.
 pub(crate) struct DriverScheduleState {
@@ -187,10 +194,15 @@ pub struct PipelineDriver {
     operators: Vec<Box<dyn Operator>>,
     profiler: Option<Profiler>,
     driver_total_time: Option<CounterRef>,
+    driver_blocked_time: Option<CounterRef>,
+    driver_input_empty_time: Option<CounterRef>,
+    driver_output_full_time: Option<CounterRef>,
+    driver_dependency_wait_time: Option<CounterRef>,
     operator_counters: Vec<OperatorCounters>,
     runtime_state: Arc<RuntimeState>,
     fragment_instance_id: Option<(i64, i64)>,
     state: DriverState,
+    blocked_since: Option<(Instant, DriverBlockedKind)>,
     closed: bool,
     schedule_state: Arc<DriverScheduleState>,
     pending_finish_state: Option<DriverState>,
@@ -232,6 +244,16 @@ impl PipelineDriver {
         let operator_count = operators.len();
         let edge_count = operator_count.saturating_sub(1);
         let driver_total_time = profiler.as_ref().map(|p| p.add_timer("DriverTotalTime"));
+        let driver_blocked_time = profiler.as_ref().map(|p| p.add_timer("DriverBlockedTime"));
+        let driver_input_empty_time = profiler
+            .as_ref()
+            .map(|p| p.add_timer("DriverInputEmptyTime"));
+        let driver_output_full_time = profiler
+            .as_ref()
+            .map(|p| p.add_timer("DriverOutputFullTime"));
+        let driver_dependency_wait_time = profiler
+            .as_ref()
+            .map(|p| p.add_timer("DriverDependencyWaitTime"));
         let operator_counters = if profiler.is_some() {
             debug_assert_eq!(
                 operators.len(),
@@ -327,10 +349,15 @@ impl PipelineDriver {
             operators,
             profiler,
             driver_total_time,
+            driver_blocked_time,
+            driver_input_empty_time,
+            driver_output_full_time,
+            driver_dependency_wait_time,
             operator_counters,
             runtime_state,
             fragment_instance_id,
             state: DriverState::Ready,
+            blocked_since: None,
             closed: false,
             schedule_state: Arc::new(DriverScheduleState::new()),
             pending_finish_state: None,
@@ -626,6 +653,7 @@ impl PipelineDriver {
     }
 
     pub(crate) fn set_ready(&mut self) {
+        self.finish_blocked_interval();
         self.state = DriverState::Ready;
     }
 
@@ -652,6 +680,7 @@ impl PipelineDriver {
     fn block_or_fail(&mut self, reason: BlockedReason) -> DriverState {
         match reason {
             BlockedReason::Dependency(dep) => {
+                self.start_blocked_interval(DriverBlockedKind::Dependency);
                 if let Some((hi, lo)) = self.fragment_instance_id {
                     debug!(
                         "Driver blocked on dependency: finst={} driver_id={} dep_name={}",
@@ -670,17 +699,53 @@ impl PipelineDriver {
                 self.state.clone()
             }
             BlockedReason::InputEmpty => {
+                self.start_blocked_interval(DriverBlockedKind::InputEmpty);
                 self.state = DriverState::Blocked(BlockedReason::InputEmpty);
                 self.state.clone()
             }
             BlockedReason::OutputFull => {
+                self.start_blocked_interval(DriverBlockedKind::OutputFull);
                 self.state = DriverState::Blocked(BlockedReason::OutputFull);
                 self.state.clone()
             }
         }
     }
 
+    fn start_blocked_interval(&mut self, kind: DriverBlockedKind) {
+        if self.blocked_since.is_none() {
+            self.blocked_since = Some((Instant::now(), kind));
+        }
+    }
+
+    fn finish_blocked_interval(&mut self) {
+        let Some((blocked_since, kind)) = self.blocked_since.take() else {
+            return;
+        };
+        let elapsed_ns = clamp_u128_to_i64(blocked_since.elapsed().as_nanos());
+        if let Some(counter) = self.driver_blocked_time.as_ref() {
+            counter.add(elapsed_ns);
+        }
+        match kind {
+            DriverBlockedKind::InputEmpty => {
+                if let Some(counter) = self.driver_input_empty_time.as_ref() {
+                    counter.add(elapsed_ns);
+                }
+            }
+            DriverBlockedKind::OutputFull => {
+                if let Some(counter) = self.driver_output_full_time.as_ref() {
+                    counter.add(elapsed_ns);
+                }
+            }
+            DriverBlockedKind::Dependency => {
+                if let Some(counter) = self.driver_dependency_wait_time.as_ref() {
+                    counter.add(elapsed_ns);
+                }
+            }
+        }
+    }
+
     fn finish_with_state(&mut self, state: DriverState) -> DriverState {
+        self.finish_blocked_interval();
         if matches!(state, DriverState::Canceled | DriverState::Failed(_)) {
             self.cancel_operators();
         }
@@ -1131,6 +1196,7 @@ impl PipelineDriver {
 
 impl Drop for PipelineDriver {
     fn drop(&mut self) {
+        self.finish_blocked_interval();
         self.close_operators();
     }
 }

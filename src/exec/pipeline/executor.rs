@@ -89,6 +89,7 @@ pub(crate) fn execute_plan_with_pipeline_with_root_sink_dop(
     backend_num: Option<i32>,
     root_sink_dop: Option<i32>,
 ) -> Result<(), String> {
+    let fragment_profiler = profiler.clone();
     let dep_manager = DependencyManager::new();
     let runtime_filter_hub = match query_id {
         Some(qid) => {
@@ -208,6 +209,9 @@ pub(crate) fn execute_plan_with_pipeline_with_root_sink_dop(
         let task = DriverTask::new(driver, Arc::clone(&completion), effective_time_slice);
         tasks.push(task);
     }
+    let _fragment_wall_timer = fragment_profiler
+        .as_ref()
+        .map(|p| p.scoped_timer("FragmentWallTime"));
     global_driver_executor().submit(tasks);
     let res = runtime_state
         .query_options()
