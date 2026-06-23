@@ -40,6 +40,7 @@ mod local;
 mod membership;
 mod merger;
 pub(crate) mod min_max;
+mod proto_type;
 
 pub(crate) use apply::{
     filter_chunk_by_in_filters_with_exprs, filter_chunk_by_membership_filters_with_exprs,
@@ -60,6 +61,7 @@ pub(crate) use merger::{
     RuntimeMembershipFilterBuildParam,
 };
 pub(crate) use min_max::RuntimeMinMaxFilter;
+pub(crate) use proto_type::{arrow_type_from_proto_type_desc, arrow_type_to_proto_type_desc};
 
 pub(in crate::exec::runtime_filter) use bloom::SimdBlockFilter;
 pub(in crate::exec::runtime_filter) use in_filter::RuntimeInFilterValues;
