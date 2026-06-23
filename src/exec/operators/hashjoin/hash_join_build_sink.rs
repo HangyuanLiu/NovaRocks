@@ -41,10 +41,12 @@ use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::runtime_filter::{
     LocalRuntimeFilterSet, LocalRuntimeInFilterSet, MAX_RUNTIME_IN_FILTER_CONDITIONS,
-    PartialRuntimeInFilterMerger, RuntimeBloomFilter, RuntimeEmptyFilter, RuntimeInFilter,
-    RuntimeMembershipBuildOptions, RuntimeMembershipFilter, RuntimeMembershipFilterBuildParam,
-    RuntimeMinMaxFilter, arrow_type_to_proto_type_desc, data_type_to_tprimitive,
-    encode_starrocks_bitset_filter, encode_starrocks_bloom_filter, encode_starrocks_empty_filter,
+    PartialRuntimeInFilterMerger, RUNTIME_FILTER_JOIN_MODE_BROADCAST,
+    RUNTIME_FILTER_JOIN_MODE_PARTITIONED, RuntimeBloomFilter, RuntimeEmptyFilter,
+    RuntimeFilterMergeDropCounters, RuntimeInFilter, RuntimeMembershipBuildOptions,
+    RuntimeMembershipFilter, RuntimeMembershipFilterBuildParam, RuntimeMinMaxFilter,
+    arrow_type_to_proto_type_desc, data_type_to_tprimitive, encode_starrocks_bitset_filter,
+    encode_starrocks_bloom_filter, encode_starrocks_empty_filter,
     maybe_build_runtime_bitset_filter,
 };
 use crate::metrics;
@@ -494,6 +496,7 @@ impl HashJoinBuildSinkOperator {
                 membership_params,
                 membership_build_options,
             )?;
+            self.add_runtime_filter_drop_counters_to_profile(merger.drain_drop_counters());
             if let (Some(in_filters), Some(membership_filters)) = (merged_in, merged_membership) {
                 self.log_in_filters("publish", &in_filters);
                 self.log_membership_filters("publish", &membership_filters);
@@ -809,6 +812,29 @@ impl HashJoinBuildSinkOperator {
         }
     }
 
+    fn add_runtime_filter_drop_counters_to_profile(
+        &self,
+        counters: RuntimeFilterMergeDropCounters,
+    ) {
+        let Some(profile) = self.profiles.as_ref() else {
+            return;
+        };
+        if counters.in_filters > 0 {
+            profile.common.counter_add(
+                "RuntimeInFilterDropped",
+                metrics::TUnit::UNIT,
+                counters.in_filters as i64,
+            );
+        }
+        if counters.membership_filters > 0 {
+            profile.common.counter_add(
+                "RuntimeMembershipFilterDropped",
+                metrics::TUnit::UNIT,
+                counters.membership_filters as i64,
+            );
+        }
+    }
+
     fn build_membership_filter_params(
         &self,
     ) -> Result<Vec<RuntimeMembershipFilterBuildParam>, String> {
@@ -816,8 +842,8 @@ impl HashJoinBuildSinkOperator {
             return Ok(Vec::new());
         }
         let join_mode: i8 = match self.distribution_mode {
-            JoinDistributionMode::Broadcast => 1,
-            JoinDistributionMode::Partitioned => 2,
+            JoinDistributionMode::Broadcast => RUNTIME_FILTER_JOIN_MODE_BROADCAST,
+            JoinDistributionMode::Partitioned => RUNTIME_FILTER_JOIN_MODE_PARTITIONED,
         };
         let mut params = Vec::with_capacity(self.runtime_filter_specs.len());
         for spec in &self.runtime_filter_specs {
@@ -904,7 +930,7 @@ impl HashJoinBuildSinkOperator {
             }
             let can_try_bitset = options.enable_join_runtime_bitset_filter
                 && total_rows <= options.global_runtime_filter_build_max_size
-                && param.join_mode() == 1;
+                && param.join_mode() == RUNTIME_FILTER_JOIN_MODE_BROADCAST;
             if can_try_bitset
                 && let Some(bitset) = maybe_build_runtime_bitset_filter(
                     param.filter_id(),
@@ -1008,8 +1034,8 @@ impl HashJoinBuildSinkOperator {
         specs: &[&JoinRuntimeFilterSpec],
     ) -> Result<Vec<RuntimeMembershipFilter>, String> {
         let join_mode: i8 = match self.distribution_mode {
-            JoinDistributionMode::Broadcast => 1,
-            JoinDistributionMode::Partitioned => 2,
+            JoinDistributionMode::Broadcast => RUNTIME_FILTER_JOIN_MODE_BROADCAST,
+            JoinDistributionMode::Partitioned => RUNTIME_FILTER_JOIN_MODE_PARTITIONED,
         };
         let mut filters = Vec::new();
         for spec in specs {
@@ -1077,6 +1103,12 @@ impl HashJoinBuildSinkOperator {
             profile
                 .common
                 .add_counter("RuntimeInFilterNum", metrics::TUnit::UNIT);
+            profile
+                .common
+                .add_counter("RuntimeInFilterDropped", metrics::TUnit::UNIT);
+            profile
+                .common
+                .add_counter("RuntimeMembershipFilterDropped", metrics::TUnit::UNIT);
             profile
                 .common
                 .add_counter("PartialRuntimeMembershipFilterBytes", metrics::TUnit::BYTES);

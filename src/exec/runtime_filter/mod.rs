@@ -57,7 +57,9 @@ pub(crate) use in_filter::{LocalRuntimeInFilterSet, RuntimeInFilter};
 pub(crate) use local::{LocalRuntimeFilterSet, RuntimeFilterMembership};
 pub(crate) use membership::{RuntimeEmptyFilter, RuntimeMembershipFilter};
 pub(crate) use merger::{
-    MAX_RUNTIME_IN_FILTER_CONDITIONS, PartialRuntimeInFilterMerger, RuntimeMembershipBuildOptions,
+    MAX_RUNTIME_IN_FILTER_CONDITIONS, PartialRuntimeInFilterMerger,
+    RUNTIME_FILTER_JOIN_MODE_BROADCAST, RUNTIME_FILTER_JOIN_MODE_PARTITIONED,
+    RuntimeFilterMergeDropCounters, RuntimeMembershipBuildOptions,
     RuntimeMembershipFilterBuildParam,
 };
 pub(crate) use min_max::RuntimeMinMaxFilter;
