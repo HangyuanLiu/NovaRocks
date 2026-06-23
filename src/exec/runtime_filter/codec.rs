@@ -830,7 +830,7 @@ mod tests {
 
     #[test]
     fn varchar_in_filter_round_trips() {
-        let mut set = hashbrown::HashSet::new();
+        let mut set = HashSet::new();
         set.insert(String::new()); // empty string
         set.insert("a".to_string());
         set.insert("中文".to_string()); // multibyte
@@ -934,6 +934,8 @@ mod tests {
             },
         );
         let buf = encode_starrocks_in_filter(&filter).expect("encode");
+        assert_eq!(buf[0], RF_VERSION_V3);
+        assert_eq!(buf[1], RF_TYPE_IN_FILTER);
         assert_eq!(
             i32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]),
             crate::types::TPrimitiveType::DECIMAL128.0
