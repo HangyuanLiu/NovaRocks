@@ -7,11 +7,14 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::cost::{CostInput, CostOptions, compute_cost_from_input};
+use super::cost::{CostInput, CostOptions, compute_cost_estimate};
 use super::derive::PropertyAlternativeKind;
-use super::memo::{Cost, GroupId, Memo};
+use super::memo::{GroupId, Memo, TotalCost};
 use super::operator::*;
 use super::property::*;
+use super::statistics::CostEstimate;
+#[cfg(test)]
+use super::statistics::MAX_FINITE_COST;
 use crate::sql::optimizer::stats_input::OptimizerStatsInput;
 
 pub(crate) use super::derive::EnforcerKind;
@@ -27,7 +30,8 @@ pub(crate) struct Winner {
     pub(crate) group_id: GroupId,
     /// Index into `group.physical_exprs`.
     pub(crate) expr_index: usize,
-    pub(crate) cost: Cost,
+    pub(crate) cost_estimate: CostEstimate,
+    pub(crate) total_cost: TotalCost,
     /// If present, the winner needs an enforcer on top of the physical expr.
     pub(crate) enforcer: Option<EnforcerInfo>,
     /// The actual physical-property set this winner delivers. For an
@@ -38,6 +42,80 @@ pub(crate) struct Winner {
     pub(crate) alt_kind: PropertyAlternativeKind,
     pub(crate) child_props: Vec<PhysicalPropertySet>,
     pub(crate) child_outputs: Vec<PhysicalPropertySet>,
+}
+
+impl Winner {
+    pub(crate) fn new(
+        group_id: GroupId,
+        expr_index: usize,
+        cost_estimate: CostEstimate,
+        cost_options: &CostOptions,
+        enforcer: Option<EnforcerInfo>,
+        output: PhysicalPropertySet,
+        alt_kind: PropertyAlternativeKind,
+        child_props: Vec<PhysicalPropertySet>,
+        child_outputs: Vec<PhysicalPropertySet>,
+    ) -> Self {
+        let total_cost = cost_estimate.total_with_options(cost_options);
+        Self {
+            group_id,
+            expr_index,
+            cost_estimate,
+            total_cost,
+            enforcer,
+            output,
+            alt_kind,
+            child_props,
+            child_outputs,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_legacy_total(
+        group_id: GroupId,
+        expr_index: usize,
+        total_cost: TotalCost,
+        cost_options: &CostOptions,
+        enforcer: Option<EnforcerInfo>,
+        output: PhysicalPropertySet,
+        alt_kind: PropertyAlternativeKind,
+        child_props: Vec<PhysicalPropertySet>,
+        child_outputs: Vec<PhysicalPropertySet>,
+    ) -> Self {
+        let cost_estimate = cost_estimate_for_total(total_cost, cost_options);
+        let total_cost = if total_cost.is_finite() && total_cost > 0.0 {
+            total_cost
+        } else {
+            0.0
+        };
+        // Compatibility bridge for legacy fixtures that still construct
+        // winners from a scalar total.
+        Self {
+            group_id,
+            expr_index,
+            cost_estimate,
+            total_cost,
+            enforcer,
+            output,
+            alt_kind,
+            child_props,
+            child_outputs,
+        }
+    }
+
+    pub(crate) fn infeasible(group_id: GroupId) -> Self {
+        Self {
+            group_id,
+            expr_index: 0,
+            cost_estimate: CostEstimate::default(),
+            total_cost: f64::INFINITY,
+            enforcer: None,
+            output: PhysicalPropertySet::any(),
+            alt_kind: PropertyAlternativeKind::Default,
+            child_props: vec![],
+            child_outputs: vec![],
+        }
+    }
 }
 
 /// Describes the enforcer node that must wrap the winner expression.
@@ -60,6 +138,7 @@ pub(crate) struct SearchContext {
     /// (GroupId, PhysicalPropertySet) -> Winner
     pub(crate) winners: HashMap<(GroupId, PhysicalPropertySet), Winner>,
     pub(crate) stats_input: OptimizerStatsInput,
+    pub(crate) cost_options: CostOptions,
     /// Set of (GroupId, PhysicalPropertySet) pairs currently being computed.
     /// Used to break mutual enforcer cycles: when group A's enforcer path
     /// recurses back into the same (group, props) that is already on the
@@ -68,12 +147,18 @@ pub(crate) struct SearchContext {
 }
 
 impl SearchContext {
-    pub(crate) fn new(stats_input: OptimizerStatsInput) -> Self {
+    pub(crate) fn new(stats_input: OptimizerStatsInput, cost_options: CostOptions) -> Self {
         Self {
             winners: HashMap::new(),
             stats_input,
+            cost_options,
             in_progress: HashSet::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(stats_input: OptimizerStatsInput) -> Self {
+        Self::new(stats_input, CostOptions::default())
     }
 
     /// Top-down cost-based search for the cheapest plan in `group_id` that
@@ -88,12 +173,12 @@ impl SearchContext {
         memo: &Memo,
         group_id: GroupId,
         required: &PhysicalPropertySet,
-    ) -> Result<Cost, String> {
+    ) -> Result<TotalCost, String> {
         let cache_key = (group_id, required.clone());
 
         // 1. Check winner cache.
         if let Some(winner) = self.winners.get(&cache_key) {
-            return Ok(winner.cost);
+            return Ok(winner.total_cost);
         }
 
         // 2. Cycle guard: if this (group, props) is already being computed on
@@ -110,10 +195,12 @@ impl SearchContext {
         // Groups with no physical exprs: return infinity (not an error).
         if num_physical == 0 {
             self.in_progress.remove(&cache_key);
+            self.winners.insert(cache_key, Winner::infeasible(group_id));
             return Ok(f64::INFINITY);
         }
 
         let mut best_cost = f64::INFINITY;
+        let mut best_cost_estimate = CostEstimate::default();
         let mut best_index: usize = 0;
         let mut best_enforcer: Option<EnforcerInfo> = None;
         let mut best_output = PhysicalPropertySet::any();
@@ -167,7 +254,7 @@ impl SearchContext {
                             && !super::cost::broadcast_gate_passes(
                                 &probe_stats,
                                 &build_stats,
-                                &CostOptions::default(),
+                                &self.cost_options,
                             )
                         {
                             continue;
@@ -184,7 +271,7 @@ impl SearchContext {
 
                 let mut child_outputs: Vec<PhysicalPropertySet> =
                     Vec::with_capacity(expr.children.len());
-                let mut child_cost_total = 0.0;
+                let mut child_cost_estimate = CostEstimate::default();
                 let mut feasible = true;
                 for (i, &cg) in expr.children.iter().enumerate() {
                     let child_cost = self.optimize_group(memo, cg, &child_reqs[i])?;
@@ -192,11 +279,11 @@ impl SearchContext {
                         feasible = false;
                         break;
                     }
-                    child_cost_total += child_cost;
                     let cw = self
                         .winners
                         .get(&(cg, child_reqs[i].clone()))
                         .expect("child just optimized; winner must be in cache");
+                    child_cost_estimate = child_cost_estimate.add_sanitized(&cw.cost_estimate);
                     child_outputs.push(cw.output.clone());
                 }
                 if !feasible {
@@ -204,7 +291,6 @@ impl SearchContext {
                 }
 
                 let child_output_refs: Vec<&PhysicalPropertySet> = child_outputs.iter().collect();
-                let options = CostOptions::default();
                 let cost_input = CostInput {
                     op: &expr.op,
                     own_stats: &own_stats,
@@ -213,10 +299,10 @@ impl SearchContext {
                     required_output: required,
                     alt_kind: &alt.kind,
                     scalars: Some(&memo.scalars),
-                    options: &options,
+                    options: &self.cost_options,
                 };
-                let own_cost = compute_cost_from_input(&cost_input);
-                let total = own_cost + child_cost_total;
+                let operator_estimate = compute_cost_estimate(&cost_input).sanitized();
+                let mut candidate_estimate = child_cost_estimate.add_sanitized(&operator_estimate);
                 let provided = super::derive::derive_output_for_alternative(
                     &expr.op,
                     &memo.scalars,
@@ -225,9 +311,8 @@ impl SearchContext {
                 );
 
                 // Bridge provided → required via enforcer if needed.
-                let (actual_output, enforcer_info, candidate_cost) = if provided.satisfies(required)
-                {
-                    (provided, None, total)
+                let (actual_output, enforcer_info) = if provided.satisfies(required) {
+                    (provided, None)
                 } else {
                     let enforcers = super::derive::needed_enforcers(required, &provided);
                     if enforcers.is_empty() {
@@ -235,17 +320,15 @@ impl SearchContext {
                     }
                     let group_stats =
                         stats_for_group(&memo.groups[group_id], memo, &self.stats_input);
-                    let enforcer_cost: Cost = enforcers
-                        .iter()
-                        .map(|e| {
-                            super::derive::estimate_enforcer_cost_estimate(
-                                e,
-                                &group_stats,
-                                &options,
-                            )
-                            .total_with_options(&options)
-                        })
-                        .sum();
+                    for enforcer in &enforcers {
+                        let enforcer_estimate = super::derive::estimate_enforcer_cost_estimate(
+                            enforcer,
+                            &group_stats,
+                            &self.cost_options,
+                        )
+                        .sanitized();
+                        candidate_estimate = candidate_estimate.add_sanitized(&enforcer_estimate);
+                    }
                     let kind = enforcers.into_iter().next().unwrap();
                     (
                         required.clone(),
@@ -253,12 +336,13 @@ impl SearchContext {
                             kind,
                             child_props: provided,
                         }),
-                        total + enforcer_cost,
                     )
                 };
+                let candidate_cost = candidate_estimate.total_with_options(&self.cost_options);
 
                 if candidate_cost < best_cost {
                     best_cost = candidate_cost;
+                    best_cost_estimate = candidate_estimate;
                     best_index = expr_idx;
                     best_enforcer = enforcer_info;
                     best_output = actual_output;
@@ -274,19 +358,106 @@ impl SearchContext {
         self.in_progress.remove(&cache_key);
 
         // Cache the result even if best_cost is INFINITY (avoids recomputation).
-        let winner = Winner {
-            group_id,
-            expr_index: best_index,
-            cost: best_cost,
-            enforcer: best_enforcer,
-            output: best_output,
-            alt_kind: best_alt_kind,
-            child_props: best_child_props,
-            child_outputs: best_child_outputs,
+        let winner = if best_cost.is_infinite() {
+            Winner::infeasible(group_id)
+        } else {
+            Winner::new(
+                group_id,
+                best_index,
+                best_cost_estimate,
+                &self.cost_options,
+                best_enforcer,
+                best_output,
+                best_alt_kind,
+                best_child_props,
+                best_child_outputs,
+            )
         };
+        let total_cost = winner.total_cost;
         self.winners.insert(cache_key, winner);
-        Ok(best_cost)
+        Ok(total_cost)
     }
+}
+
+#[cfg(test)]
+pub(crate) fn cost_estimate_for_total(
+    total_cost: TotalCost,
+    cost_options: &CostOptions,
+) -> CostEstimate {
+    debug_assert!(total_cost.is_finite());
+    let requested_total = if total_cost.is_finite() && total_cost > 0.0 {
+        total_cost
+    } else {
+        0.0
+    };
+    if requested_total == 0.0 {
+        return CostEstimate::default();
+    }
+
+    let mut closest_estimate: Option<(CostEstimate, f64)> = None;
+    // Prefer a weight >= 1.0 so the synthetic dimension stays at or below the
+    // scalar total and does not trip the per-dimension sanitizer cap.
+    for require_weight_at_least_one in [true, false] {
+        for (dimension_index, weight) in [
+            cost_options.cpu_weight,
+            cost_options.memory_weight,
+            cost_options.network_weight,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if !weight.is_finite() || weight <= 0.0 || (require_weight_at_least_one && weight < 1.0)
+            {
+                continue;
+            }
+
+            let dimension_cost = requested_total / weight;
+            if !dimension_cost.is_finite()
+                || dimension_cost < 0.0
+                || dimension_cost > MAX_FINITE_COST
+            {
+                continue;
+            }
+
+            let estimate = match dimension_index {
+                0 => CostEstimate {
+                    cpu_cost: dimension_cost,
+                    memory_cost: 0.0,
+                    network_cost: 0.0,
+                },
+                1 => CostEstimate {
+                    cpu_cost: 0.0,
+                    memory_cost: dimension_cost,
+                    network_cost: 0.0,
+                },
+                2 => CostEstimate {
+                    cpu_cost: 0.0,
+                    memory_cost: 0.0,
+                    network_cost: dimension_cost,
+                },
+                _ => unreachable!("fixed cost dimension list has three entries"),
+            };
+
+            let weighted_total = estimate.total_with_options(cost_options);
+            let delta = (weighted_total - requested_total).abs();
+            let tolerance = requested_total.abs().max(1.0) * 1.0e-12;
+            if delta <= tolerance {
+                return estimate;
+            }
+            match &closest_estimate {
+                Some((_, closest_delta)) if *closest_delta <= delta => {}
+                _ => closest_estimate = Some((estimate, delta)),
+            }
+        }
+    }
+
+    closest_estimate
+        .map(|(estimate, _)| estimate)
+        .unwrap_or_else(|| CostEstimate {
+            cpu_cost: MAX_FINITE_COST,
+            memory_cost: 0.0,
+            network_cost: 0.0,
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -376,6 +547,37 @@ mod tests {
         (memo, gid)
     }
 
+    fn project_over_scan_memo_for_test() -> (Memo, GroupId, GroupId) {
+        let (mut memo, scan_group) = single_scan_memo();
+        let project_expr = intern_typed(&mut memo.scalars, &test_col(1, "c1"));
+        let root = memo.new_group(MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalProject(ProjectOp {
+                items: vec![ScalarProjectItem {
+                    expr: project_expr,
+                    output_name: "c1".to_string(),
+                    output_column_id: ColumnId(1),
+                    expr_display: None,
+                }],
+                output_qualifier: None,
+            }),
+            children: vec![scan_group],
+        });
+        set_group_logical_rows_for_test(
+            &mut memo,
+            scan_group,
+            1_000.0,
+            crate::sql::optimizer::statistics::Confidence::Exact,
+        );
+        set_group_logical_rows_for_test(
+            &mut memo,
+            root,
+            1_000.0,
+            crate::sql::optimizer::statistics::Confidence::Exact,
+        );
+        (memo, root, scan_group)
+    }
+
     pub(super) fn make_table_stats() -> HashMap<String, TableStatistics> {
         let mut ts = HashMap::new();
         ts.insert(
@@ -396,6 +598,20 @@ mod tests {
 
     fn empty_stats_input() -> OptimizerStatsInput {
         legacy_stats_input(HashMap::new())
+    }
+
+    fn assert_cost_estimate_close(actual: &CostEstimate, expected: &CostEstimate) {
+        assert_dimension_close("cpu", actual.cpu_cost, expected.cpu_cost);
+        assert_dimension_close("memory", actual.memory_cost, expected.memory_cost);
+        assert_dimension_close("network", actual.network_cost, expected.network_cost);
+    }
+
+    fn assert_dimension_close(label: &str, actual: f64, expected: f64) {
+        let tolerance = expected.abs().max(1.0) * 1.0e-12;
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "{label} cost mismatch: actual={actual}, expected={expected}, tolerance={tolerance}"
+        );
     }
 
     fn test_col(id: u32, name: &str) -> TypedExpr {
@@ -670,7 +886,7 @@ mod tests {
     #[test]
     fn scan_satisfies_any() {
         let (memo, gid) = single_scan_memo();
-        let mut ctx = SearchContext::new(legacy_stats_input(make_table_stats()));
+        let mut ctx = SearchContext::new_for_test(legacy_stats_input(make_table_stats()));
         let cost = ctx
             .optimize_group(&memo, gid, &PhysicalPropertySet::any())
             .unwrap();
@@ -681,7 +897,7 @@ mod tests {
     #[test]
     fn scan_with_gather_uses_enforcer() {
         let (memo, gid) = single_scan_memo();
-        let mut ctx = SearchContext::new(legacy_stats_input(make_table_stats()));
+        let mut ctx = SearchContext::new_for_test(legacy_stats_input(make_table_stats()));
         let cost = ctx
             .optimize_group(&memo, gid, &PhysicalPropertySet::gather())
             .unwrap();
@@ -692,6 +908,161 @@ mod tests {
             .unwrap();
         // Scan provides Any, Gather requires Gather -> needs enforcer.
         assert!(winner.enforcer.is_some());
+    }
+
+    #[test]
+    fn search_records_cumulative_cost_estimate_for_scan_with_gather_enforcer() {
+        let (memo, gid) = single_scan_memo();
+        let mut ctx = SearchContext::new_for_test(legacy_stats_input(make_table_stats()));
+        let required = PhysicalPropertySet::gather();
+
+        ctx.optimize_group(&memo, gid, &required).expect("search");
+
+        let winner = ctx.winners.get(&(gid, required.clone())).expect("winner");
+        let expr = memo.groups[gid]
+            .physical_exprs
+            .get(winner.expr_index)
+            .expect("winner expression");
+        let own_stats = stats_for_group(&memo.groups[gid], &memo, &ctx.stats_input);
+        let child_outputs: Vec<&PhysicalPropertySet> = Vec::new();
+        let child_stats: Vec<&crate::sql::optimizer::statistics::Statistics> = Vec::new();
+        let scan_input = CostInput {
+            op: &expr.op,
+            own_stats: &own_stats,
+            child_stats: &child_stats,
+            child_outputs: &child_outputs,
+            required_output: &required,
+            alt_kind: &winner.alt_kind,
+            scalars: Some(&memo.scalars),
+            options: &ctx.cost_options,
+        };
+        let scan_estimate = super::super::cost::compute_cost_estimate(&scan_input).sanitized();
+        let enforcer = winner
+            .enforcer
+            .as_ref()
+            .expect("gather requirement should require distribution enforcer");
+        let enforcer_estimate = super::super::derive::estimate_enforcer_cost_estimate(
+            &enforcer.kind,
+            &own_stats,
+            &ctx.cost_options,
+        )
+        .sanitized();
+        let expected = scan_estimate.add_sanitized(&enforcer_estimate);
+
+        assert_eq!(winner.cost_estimate.cpu_cost, expected.cpu_cost);
+        assert_eq!(winner.cost_estimate.memory_cost, expected.memory_cost);
+        assert_eq!(winner.cost_estimate.network_cost, expected.network_cost);
+        assert!(winner.cost_estimate.network_cost > 0.0);
+        assert_eq!(
+            winner.total_cost,
+            winner.cost_estimate.total_with_options(&ctx.cost_options)
+        );
+    }
+
+    #[test]
+    fn search_returned_total_matches_winner_flattened_cost_for_finite_scan_path() {
+        let (memo, gid) = single_scan_memo();
+        let mut ctx = SearchContext::new_for_test(legacy_stats_input(make_table_stats()));
+        let required = PhysicalPropertySet::any();
+
+        let returned_total = ctx.optimize_group(&memo, gid, &required).expect("search");
+
+        let winner = ctx.winners.get(&(gid, required)).expect("winner");
+        assert!(returned_total.is_finite());
+        assert_eq!(returned_total, winner.total_cost);
+        assert_eq!(
+            winner.total_cost,
+            winner.cost_estimate.total_with_options(&ctx.cost_options)
+        );
+    }
+
+    #[test]
+    fn winner_total_cost_uses_context_weights() {
+        let (memo, gid) = single_scan_memo();
+        let options = CostOptions {
+            cpu_weight: 9.0,
+            memory_weight: 0.0,
+            network_weight: 0.0,
+            ..Default::default()
+        };
+        let mut ctx = SearchContext::new(legacy_stats_input(make_table_stats()), options.clone());
+        let required = PhysicalPropertySet::any();
+
+        ctx.optimize_group(&memo, gid, &required).expect("search");
+
+        let winner = ctx.winners.get(&(gid, required)).expect("winner");
+        assert!(winner.cost_estimate.cpu_cost > 0.0);
+        assert_eq!(
+            winner.total_cost,
+            winner.cost_estimate.total_with_options(&options)
+        );
+        assert_ne!(
+            winner.total_cost,
+            winner
+                .cost_estimate
+                .total_with_options(&CostOptions::default())
+        );
+    }
+
+    #[test]
+    fn search_parent_cost_estimate_includes_child_winner_estimate() {
+        let (memo, root, child) = project_over_scan_memo_for_test();
+        let mut ctx = SearchContext::new_for_test(empty_stats_input());
+        let required = PhysicalPropertySet::any();
+
+        ctx.optimize_group(&memo, root, &required).expect("search");
+
+        let parent_winner = ctx
+            .winners
+            .get(&(root, required.clone()))
+            .expect("parent winner");
+        assert_eq!(
+            parent_winner.child_props,
+            vec![PhysicalPropertySet::any()],
+            "project should optimize its single child with Any properties"
+        );
+        assert!(
+            parent_winner.enforcer.is_none(),
+            "Any requirement should not add a parent enforcer"
+        );
+
+        let child_required = parent_winner.child_props[0].clone();
+        let child_winner = ctx
+            .winners
+            .get(&(child, child_required))
+            .expect("child winner");
+        let expr = memo.groups[root]
+            .physical_exprs
+            .get(parent_winner.expr_index)
+            .expect("parent winner expression");
+        let own_stats = stats_for_group(&memo.groups[root], &memo, &ctx.stats_input);
+        let child_stats = stats_for_group(&memo.groups[child], &memo, &ctx.stats_input);
+        let child_stats_refs = vec![&child_stats];
+        let child_output_refs = vec![&child_winner.output];
+        let parent_input = CostInput {
+            op: &expr.op,
+            own_stats: &own_stats,
+            child_stats: &child_stats_refs,
+            child_outputs: &child_output_refs,
+            required_output: &required,
+            alt_kind: &parent_winner.alt_kind,
+            scalars: Some(&memo.scalars),
+            options: &ctx.cost_options,
+        };
+        let parent_self_estimate = compute_cost_estimate(&parent_input).sanitized();
+        assert!(
+            parent_self_estimate.cpu_cost > 0.0 || parent_self_estimate.memory_cost > 0.0,
+            "fixture must have a non-zero parent self cost"
+        );
+
+        let expected = child_winner
+            .cost_estimate
+            .add_sanitized(&parent_self_estimate);
+        assert_cost_estimate_close(&parent_winner.cost_estimate, &expected);
+        assert!(
+            parent_winner.cost_estimate.cpu_cost > child_winner.cost_estimate.cpu_cost,
+            "parent CPU estimate should include child CPU plus project self CPU"
+        );
     }
 
     #[test]
@@ -725,7 +1096,7 @@ mod tests {
         };
         let gid = memo.new_group(expr);
 
-        let mut ctx = SearchContext::new(legacy_stats_input(make_table_stats()));
+        let mut ctx = SearchContext::new_for_test(legacy_stats_input(make_table_stats()));
         let cost = ctx
             .optimize_group(&memo, gid, &PhysicalPropertySet::any())
             .unwrap();
@@ -735,7 +1106,7 @@ mod tests {
     #[test]
     fn winner_cache_prevents_recomputation() {
         let (memo, gid) = single_scan_memo();
-        let mut ctx = SearchContext::new(legacy_stats_input(make_table_stats()));
+        let mut ctx = SearchContext::new_for_test(legacy_stats_input(make_table_stats()));
         let cost1 = ctx
             .optimize_group(&memo, gid, &PhysicalPropertySet::any())
             .unwrap();
@@ -748,7 +1119,7 @@ mod tests {
     #[test]
     fn winner_records_hash_join_alternative_and_child_properties() {
         let (mut memo, root) = make_two_table_inner_join_memo_for_test();
-        let mut ctx = SearchContext::new(empty_stats_input());
+        let mut ctx = SearchContext::new_for_test(empty_stats_input());
         let required = PhysicalPropertySet::gather();
         ctx.optimize_group(&memo, root, &required).expect("search");
 
@@ -802,9 +1173,107 @@ mod tests {
     }
 
     #[test]
+    fn winner_new_keeps_total_cost_in_sync_with_estimate() {
+        let options = CostOptions {
+            cpu_weight: 1.0,
+            memory_weight: 2.0,
+            network_weight: 3.0,
+            ..Default::default()
+        };
+        let estimate = crate::sql::optimizer::statistics::CostEstimate {
+            cpu_cost: 10.0,
+            memory_cost: 20.0,
+            network_cost: 30.0,
+        };
+
+        let winner = Winner::new(
+            7,
+            3,
+            estimate.clone(),
+            &options,
+            None,
+            PhysicalPropertySet::gather(),
+            PropertyAlternativeKind::Default,
+            vec![PhysicalPropertySet::any()],
+            vec![PhysicalPropertySet::any()],
+        );
+
+        assert_eq!(winner.cost_estimate.cpu_cost, estimate.cpu_cost);
+        assert_eq!(winner.cost_estimate.memory_cost, estimate.memory_cost);
+        assert_eq!(winner.cost_estimate.network_cost, estimate.network_cost);
+        assert_eq!(winner.total_cost, estimate.total_with_options(&options));
+    }
+
+    #[test]
+    fn cost_estimate_for_total_preserves_large_finite_total() {
+        let options = CostOptions::default();
+        let best_cost = 6.0e299;
+        let estimate = cost_estimate_for_total(best_cost, &options);
+
+        let winner = Winner::new(
+            7,
+            3,
+            estimate,
+            &options,
+            None,
+            PhysicalPropertySet::gather(),
+            PropertyAlternativeKind::Default,
+            vec![PhysicalPropertySet::any()],
+            vec![PhysicalPropertySet::any()],
+        );
+
+        let tolerance = best_cost * 1.0e-12;
+        assert!(
+            (winner.total_cost - best_cost).abs() <= tolerance,
+            "winner total {} should preserve best cost {}",
+            winner.total_cost,
+            best_cost
+        );
+    }
+
+    #[test]
+    fn legacy_winner_preserves_total_above_dimension_cap() {
+        let options = CostOptions::default();
+        let total_cost = 1.6e300;
+
+        let winner = Winner::from_legacy_total(
+            7,
+            3,
+            total_cost,
+            &options,
+            None,
+            PhysicalPropertySet::gather(),
+            PropertyAlternativeKind::Default,
+            vec![PhysicalPropertySet::any()],
+            vec![PhysicalPropertySet::any()],
+        );
+
+        let tolerance = total_cost * 1.0e-12;
+        assert!(
+            (winner.total_cost - total_cost).abs() <= tolerance,
+            "legacy winner total {} should preserve scalar total {}",
+            winner.total_cost,
+            total_cost
+        );
+        assert!(winner.cost_estimate.cpu_cost.is_finite());
+        assert!(winner.cost_estimate.memory_cost.is_finite());
+        assert!(winner.cost_estimate.network_cost.is_finite());
+    }
+
+    #[test]
+    fn infeasible_winner_uses_total_cost_sentinel_without_infinite_dimensions() {
+        let winner = Winner::infeasible(9);
+
+        assert!(winner.total_cost.is_infinite());
+        assert!(winner.cost_estimate.cpu_cost.is_finite());
+        assert!(winner.cost_estimate.memory_cost.is_finite());
+        assert!(winner.cost_estimate.network_cost.is_finite());
+    }
+
+    #[test]
     fn unknown_hash_join_search_extracts_concrete_distribution() {
         let (mut memo, root) = make_two_table_inner_join_memo_for_test();
-        let mut ctx = SearchContext::new(empty_stats_input());
+        let mut ctx = SearchContext::new_for_test(empty_stats_input());
         let required = PhysicalPropertySet::gather();
         ctx.optimize_group(&memo, root, &required).expect("search");
         let plan =
@@ -831,7 +1300,7 @@ mod tests {
     #[test]
     fn malformed_unknown_hash_join_is_infeasible_without_panic() {
         let (memo, root) = make_malformed_unknown_hash_join_memo_for_test();
-        let mut ctx = SearchContext::new(empty_stats_input());
+        let mut ctx = SearchContext::new_for_test(empty_stats_input());
         let required = PhysicalPropertySet::gather();
 
         let cost = ctx
@@ -843,7 +1312,7 @@ mod tests {
             .winners
             .get(&(root, required))
             .expect("infeasible winner should still be cached");
-        assert!(winner.cost.is_infinite());
+        assert!(winner.total_cost.is_infinite());
     }
 
     #[test]
@@ -853,7 +1322,7 @@ mod tests {
             500_001.0,
             crate::sql::optimizer::statistics::Confidence::Fallback,
         );
-        let mut ctx = SearchContext::new(legacy_stats_input(table_stats));
+        let mut ctx = SearchContext::new_for_test(legacy_stats_input(table_stats));
         let required = PhysicalPropertySet::gather();
 
         ctx.optimize_group(&memo, root, &required).expect("search");
@@ -869,13 +1338,58 @@ mod tests {
     }
 
     #[test]
+    fn search_broadcast_gate_uses_context_cost_options() {
+        let (memo, root, table_stats) = make_large_build_inner_join_memo_for_test(
+            10_000_000.0,
+            500_001.0,
+            crate::sql::optimizer::statistics::Confidence::Fallback,
+        );
+        let required = PhysicalPropertySet::gather();
+
+        let mut default_ctx = SearchContext::new(
+            legacy_stats_input(table_stats.clone()),
+            CostOptions::default(),
+        );
+        default_ctx
+            .optimize_group(&memo, root, &required)
+            .expect("default search");
+        let default_winner = default_ctx
+            .winners
+            .get(&(root, required.clone()))
+            .expect("default winner");
+
+        let custom_options = CostOptions {
+            fallback_broadcast_row_limit: 600_000.0,
+            ..Default::default()
+        };
+        let mut custom_ctx = SearchContext::new(legacy_stats_input(table_stats), custom_options);
+        custom_ctx
+            .optimize_group(&memo, root, &required)
+            .expect("custom search");
+        let custom_winner = custom_ctx
+            .winners
+            .get(&(root, required.clone()))
+            .expect("custom winner");
+
+        assert_eq!(
+            default_winner.alt_kind,
+            crate::sql::optimizer::derive::PropertyAlternativeKind::ShuffleJoin
+        );
+        assert_eq!(
+            custom_winner.alt_kind,
+            crate::sql::optimizer::derive::PropertyAlternativeKind::BroadcastJoin
+        );
+        assert_ne!(default_winner.alt_kind, custom_winner.alt_kind);
+    }
+
+    #[test]
     fn search_prefers_shuffle_when_exact_build_exceeds_probe_side() {
         let (memo, root, table_stats) = make_large_build_inner_join_memo_for_test(
             325_847.0,
             648_000.0,
             crate::sql::optimizer::statistics::Confidence::Exact,
         );
-        let mut ctx = SearchContext::new(legacy_stats_input(table_stats));
+        let mut ctx = SearchContext::new_for_test(legacy_stats_input(table_stats));
         let required = PhysicalPropertySet::gather();
 
         ctx.optimize_group(&memo, root, &required).expect("search");
@@ -894,7 +1408,7 @@ mod tests {
             648_000.0,
             crate::sql::optimizer::statistics::Confidence::Estimated,
         );
-        let mut ctx = SearchContext::new(legacy_stats_input(table_stats));
+        let mut ctx = SearchContext::new_for_test(legacy_stats_input(table_stats));
         let required = PhysicalPropertySet::gather();
 
         ctx.optimize_group(&memo, root, &required).expect("search");
@@ -909,7 +1423,7 @@ mod tests {
     #[test]
     fn search_allows_broadcast_when_expression_key_has_no_shuffle_fallback() {
         let (memo, root) = make_expression_key_large_estimated_build_join_memo_for_test();
-        let mut ctx = SearchContext::new(empty_stats_input());
+        let mut ctx = SearchContext::new_for_test(empty_stats_input());
         let required = PhysicalPropertySet::gather();
 
         let cost = ctx.optimize_group(&memo, root, &required).expect("search");
@@ -928,7 +1442,7 @@ mod tests {
     #[test]
     fn search_reuses_child_shuffle_output_without_top_hash_enforcer() {
         let (memo, root, left, right) = make_join_over_prepartitioned_children_for_test();
-        let mut ctx = SearchContext::new(empty_stats_input());
+        let mut ctx = SearchContext::new_for_test(empty_stats_input());
         let required = PhysicalPropertySet {
             distribution: DistributionSpec::shuffle_join([ColumnId(10), ColumnId(20)]),
             ordering: OrderingSpec::Any,
@@ -1145,7 +1659,7 @@ mod cascaded_derivation_tests {
     #[test]
     fn winner_records_actual_output_for_scan() {
         let (memo, gid) = super::tests::single_scan_memo();
-        let mut ctx = SearchContext::new(super::tests::legacy_stats_input(
+        let mut ctx = SearchContext::new_for_test(super::tests::legacy_stats_input(
             super::tests::make_table_stats(),
         ));
         ctx.optimize_group(&memo, gid, &PhysicalPropertySet::any())
@@ -1157,8 +1671,9 @@ mod cascaded_derivation_tests {
     #[test]
     fn cascaded_output_through_broadcast_join_repartitions_after_join() {
         let (memo, root, g_bj) = memo_window_over_broadcast_join();
-        let mut ctx =
-            SearchContext::new(super::tests::legacy_stats_input(table_stats_for_cascaded()));
+        let mut ctx = SearchContext::new_for_test(super::tests::legacy_stats_input(
+            table_stats_for_cascaded(),
+        ));
         let cost = ctx
             .optimize_group(&memo, root, &PhysicalPropertySet::any())
             .unwrap();
