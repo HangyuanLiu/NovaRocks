@@ -190,6 +190,12 @@ pub(crate) fn decode_starrocks_in_filter(
             set.insert(v);
         }
         RuntimeInFilterValues::TimestampMicrosecond(set)
+    } else if t == types::TPrimitiveType::VARCHAR || t == types::TPrimitiveType::CHAR {
+        let mut set = HashSet::new();
+        for _ in 0..element_count {
+            set.insert(read_varchar(data, &mut offset)?);
+        }
+        RuntimeInFilterValues::Utf8(set)
     } else {
         return Err(format!(
             "unsupported runtime filter primitive type: {:?}",
@@ -364,7 +370,21 @@ pub(crate) fn encode_starrocks_in_filter(filter: &RuntimeInFilter) -> Result<Vec
                     }),
                 )
             }
-            RuntimeInFilterValues::Utf8(_) | RuntimeInFilterValues::Decimal128 { .. } => {
+            RuntimeInFilterValues::Utf8(values) => {
+                // SR VARCHAR in-filter: each value = int32 len (LE) + raw bytes (runtime_in_filter.h:224-231)
+                let mut iter = values.iter().cloned();
+                (
+                    types::TPrimitiveType::VARCHAR,
+                    values.len(),
+                    Box::new(move |buf| {
+                        for v in iter.by_ref() {
+                            buf.extend_from_slice(&(v.len() as i32).to_le_bytes());
+                            buf.extend_from_slice(v.as_bytes());
+                        }
+                    }),
+                )
+            }
+            RuntimeInFilterValues::Decimal128 { .. } => {
                 return Err("runtime filter type not supported for remote encode".to_string());
             }
         };
@@ -613,6 +633,20 @@ pub(super) fn read_u64_le(data: &[u8], offset: &mut usize) -> Result<u64, String
     Ok(read_i64_le(data, offset)? as u64)
 }
 
+fn read_varchar(data: &[u8], offset: &mut usize) -> Result<String, String> {
+    let len = read_i32_le(data, offset)?;
+    if len < 0 {
+        return Err("runtime filter varchar length negative".to_string());
+    }
+    let len = len as usize;
+    if data.len() < *offset + len {
+        return Err("runtime filter data truncated".to_string());
+    }
+    let bytes = data[*offset..*offset + len].to_vec();
+    *offset += len;
+    String::from_utf8(bytes).map_err(|e| format!("runtime filter varchar not utf8: {e}"))
+}
+
 fn write_min_max_i64(
     ltype: &crate::types::TPrimitiveType,
     min_value: i64,
@@ -738,7 +772,7 @@ mod tests {
     use hashbrown::HashSet;
 
     use super::{
-        RF_TYPE_BITSET_FILTER, RF_VERSION_V3, decode_starrocks_in_filter,
+        RF_TYPE_BITSET_FILTER, RF_TYPE_IN_FILTER, RF_VERSION_V3, decode_starrocks_in_filter,
         decode_starrocks_membership_filter, encode_starrocks_in_filter,
     };
     use crate::common::ids::SlotId;
@@ -764,6 +798,25 @@ mod tests {
                 assert_eq!(&values, decoded_values);
             }
             other => panic!("expected LargeInt runtime in-filter, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn varchar_in_filter_round_trips() {
+        let mut set = hashbrown::HashSet::new();
+        set.insert(String::new()); // empty string
+        set.insert("a".to_string());
+        set.insert("中文".to_string()); // multibyte
+        let filter =
+            RuntimeInFilter::new(7, SlotId::new(3), RuntimeInFilterValues::Utf8(set.clone()));
+        let encoded = encode_starrocks_in_filter(&filter).expect("encode");
+        assert_eq!(encoded[0], RF_VERSION_V3);
+        assert_eq!(encoded[1], RF_TYPE_IN_FILTER);
+        let decoded =
+            decode_starrocks_in_filter(7, SlotId::new(3), None, &encoded).expect("decode");
+        match decoded.values() {
+            RuntimeInFilterValues::Utf8(got) => assert_eq!(got, &set),
+            other => panic!("expected Utf8, got {other:?}"),
         }
     }
 
