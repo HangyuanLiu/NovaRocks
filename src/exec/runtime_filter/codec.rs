@@ -87,6 +87,7 @@ pub(crate) fn peek_starrocks_filter_type(
 pub(crate) fn decode_starrocks_in_filter(
     filter_id: i32,
     slot_id: SlotId,
+    data_type: Option<&arrow::datatypes::DataType>,
     data: &[u8],
 ) -> Result<RuntimeInFilter, String> {
     if data.is_empty() {
@@ -188,6 +189,30 @@ pub(crate) fn decode_starrocks_in_filter(
             set.insert(v);
         }
         RuntimeInFilterValues::TimestampMicrosecond(set)
+    } else if t == types::TPrimitiveType::VARCHAR || t == types::TPrimitiveType::CHAR {
+        let mut set = HashSet::new();
+        for _ in 0..element_count {
+            set.insert(read_varchar(data, &mut offset)?);
+        }
+        RuntimeInFilterValues::Utf8(set)
+    } else if t == types::TPrimitiveType::DECIMAL128 {
+        let (precision, scale) = match data_type {
+            Some(arrow::datatypes::DataType::Decimal128(p, s)) => (*p, *s),
+            _ => {
+                return Err(
+                    "decimal128 in-filter decode requires probe Decimal128 column type".to_string(),
+                );
+            }
+        };
+        let mut set = HashSet::new();
+        for _ in 0..element_count {
+            set.insert(read_i128_le(data, &mut offset)?);
+        }
+        RuntimeInFilterValues::Decimal128 {
+            values: set,
+            precision,
+            scale,
+        }
     } else {
         return Err(format!(
             "unsupported runtime filter primitive type: {:?}",
@@ -362,8 +387,32 @@ pub(crate) fn encode_starrocks_in_filter(filter: &RuntimeInFilter) -> Result<Vec
                     }),
                 )
             }
-            RuntimeInFilterValues::Utf8(_) | RuntimeInFilterValues::Decimal128 { .. } => {
-                return Err("runtime filter type not supported for remote encode".to_string());
+            RuntimeInFilterValues::Utf8(values) => {
+                // SR VARCHAR in-filter: each value = int32 len (LE) + raw bytes (runtime_in_filter.h:224-231)
+                let mut iter = values.iter().cloned();
+                (
+                    types::TPrimitiveType::VARCHAR,
+                    values.len(),
+                    Box::new(move |buf| {
+                        for v in iter.by_ref() {
+                            buf.extend_from_slice(&(v.len() as i32).to_le_bytes());
+                            buf.extend_from_slice(v.as_bytes());
+                        }
+                    }),
+                )
+            }
+            RuntimeInFilterValues::Decimal128 { values, .. } => {
+                // SR DECIMAL128: each value = 16B int128 LE; ltype tag carries no precision/scale (runtime_in_filter.h:233-236)
+                let mut iter = values.iter().copied();
+                (
+                    types::TPrimitiveType::DECIMAL128,
+                    values.len(),
+                    Box::new(move |buf| {
+                        for v in iter.by_ref() {
+                            buf.extend_from_slice(&v.to_le_bytes());
+                        }
+                    }),
+                )
             }
         };
 
@@ -611,6 +660,20 @@ pub(super) fn read_u64_le(data: &[u8], offset: &mut usize) -> Result<u64, String
     Ok(read_i64_le(data, offset)? as u64)
 }
 
+fn read_varchar(data: &[u8], offset: &mut usize) -> Result<String, String> {
+    let len = read_i32_le(data, offset)?;
+    if len < 0 {
+        return Err("runtime filter varchar length negative".to_string());
+    }
+    let len = len as usize;
+    if data.len() < *offset + len {
+        return Err("runtime filter data truncated".to_string());
+    }
+    let bytes = data[*offset..*offset + len].to_vec();
+    *offset += len;
+    String::from_utf8(bytes).map_err(|e| format!("runtime filter varchar not utf8: {e}"))
+}
+
 fn write_min_max_i64(
     ltype: &crate::types::TPrimitiveType,
     min_value: i64,
@@ -736,7 +799,7 @@ mod tests {
     use hashbrown::HashSet;
 
     use super::{
-        RF_TYPE_BITSET_FILTER, RF_VERSION_V3, decode_starrocks_in_filter,
+        RF_TYPE_BITSET_FILTER, RF_TYPE_IN_FILTER, RF_VERSION_V3, decode_starrocks_in_filter,
         decode_starrocks_membership_filter, encode_starrocks_in_filter,
     };
     use crate::common::ids::SlotId;
@@ -756,13 +819,150 @@ mod tests {
             RuntimeInFilterValues::LargeInt(values.clone()),
         );
         let encoded = encode_starrocks_in_filter(&filter).unwrap();
-        let decoded = decode_starrocks_in_filter(1001, SlotId::new(11), &encoded).unwrap();
+        let decoded = decode_starrocks_in_filter(1001, SlotId::new(11), None, &encoded).unwrap();
         match decoded.values() {
             RuntimeInFilterValues::LargeInt(decoded_values) => {
                 assert_eq!(&values, decoded_values);
             }
             other => panic!("expected LargeInt runtime in-filter, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn varchar_in_filter_round_trips() {
+        let mut set = HashSet::new();
+        set.insert(String::new()); // empty string
+        set.insert("a".to_string());
+        set.insert("中文".to_string()); // multibyte
+        let filter =
+            RuntimeInFilter::new(7, SlotId::new(3), RuntimeInFilterValues::Utf8(set.clone()));
+        let encoded = encode_starrocks_in_filter(&filter).expect("encode");
+        assert_eq!(encoded[0], RF_VERSION_V3);
+        assert_eq!(encoded[1], RF_TYPE_IN_FILTER);
+        let decoded =
+            decode_starrocks_in_filter(7, SlotId::new(3), None, &encoded).expect("decode");
+        match decoded.values() {
+            RuntimeInFilterValues::Utf8(got) => assert_eq!(got, &set),
+            other => panic!("expected Utf8, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decimal128_in_filter_round_trips() {
+        use crate::exec::runtime_filter::{RuntimeInFilter, RuntimeInFilterValues};
+        let mut set = HashSet::new();
+        set.insert(-1i128);
+        set.insert(0i128);
+        set.insert(i128::MAX);
+        set.insert(i128::MIN);
+        let filter = RuntimeInFilter::new(
+            9,
+            SlotId::new(4),
+            RuntimeInFilterValues::Decimal128 {
+                values: set.clone(),
+                precision: 38,
+                scale: 6,
+            },
+        );
+        let encoded = encode_starrocks_in_filter(&filter).expect("encode");
+        let dt = arrow::datatypes::DataType::Decimal128(38, 6);
+        let decoded =
+            decode_starrocks_in_filter(9, SlotId::new(4), Some(&dt), &encoded).expect("decode");
+        match decoded.values() {
+            RuntimeInFilterValues::Decimal128 {
+                values,
+                precision,
+                scale,
+            } => {
+                assert_eq!(values, &set);
+                assert_eq!(*precision, 38);
+                assert_eq!(*scale, 6);
+            }
+            other => panic!("expected Decimal128, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decimal128_decode_without_type_errors() {
+        use crate::exec::runtime_filter::{RuntimeInFilter, RuntimeInFilterValues};
+        let mut set = HashSet::new();
+        set.insert(5i128);
+        let filter = RuntimeInFilter::new(
+            9,
+            SlotId::new(4),
+            RuntimeInFilterValues::Decimal128 {
+                values: set,
+                precision: 18,
+                scale: 2,
+            },
+        );
+        let encoded = encode_starrocks_in_filter(&filter).expect("encode");
+        // No probe column type => decimal decode must fail-fast (not fabricate p/s).
+        assert!(decode_starrocks_in_filter(9, SlotId::new(4), None, &encoded).is_err());
+    }
+
+    #[test]
+    fn varchar_in_filter_wire_layout() {
+        let mut set = HashSet::new();
+        set.insert("ab".to_string());
+        let filter = RuntimeInFilter::new(1, SlotId::new(1), RuntimeInFilterValues::Utf8(set));
+        let buf = encode_starrocks_in_filter(&filter).expect("encode");
+        // header: [0x4][type=4][ltype i32 LE = VARCHAR(15)][count u32 LE = 1]
+        assert_eq!(buf[0], RF_VERSION_V3);
+        assert_eq!(buf[1], RF_TYPE_IN_FILTER);
+        assert_eq!(
+            i32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]),
+            crate::types::TPrimitiveType::VARCHAR.0
+        );
+        assert_eq!(u32::from_le_bytes([buf[6], buf[7], buf[8], buf[9]]), 1);
+        // value: [int32 len=2 LE]['a','b']
+        assert_eq!(i32::from_le_bytes([buf[10], buf[11], buf[12], buf[13]]), 2);
+        assert_eq!(&buf[14..16], b"ab");
+    }
+
+    #[test]
+    fn decimal128_in_filter_wire_layout() {
+        let mut set = HashSet::new();
+        set.insert(7i128);
+        let filter = RuntimeInFilter::new(
+            1,
+            SlotId::new(1),
+            RuntimeInFilterValues::Decimal128 {
+                values: set,
+                precision: 10,
+                scale: 2,
+            },
+        );
+        let buf = encode_starrocks_in_filter(&filter).expect("encode");
+        assert_eq!(buf[0], RF_VERSION_V3);
+        assert_eq!(buf[1], RF_TYPE_IN_FILTER);
+        assert_eq!(
+            i32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]),
+            crate::types::TPrimitiveType::DECIMAL128.0
+        );
+        assert_eq!(u32::from_le_bytes([buf[6], buf[7], buf[8], buf[9]]), 1);
+        // value: 16B i128 LE = 7
+        let mut v = [0u8; 16];
+        v.copy_from_slice(&buf[10..26]);
+        assert_eq!(i128::from_le_bytes(v), 7);
+    }
+
+    #[test]
+    fn decimal128_decode_with_wrong_type_errors() {
+        let mut set = HashSet::new();
+        set.insert(5i128);
+        let filter = RuntimeInFilter::new(
+            9,
+            SlotId::new(4),
+            RuntimeInFilterValues::Decimal128 {
+                values: set,
+                precision: 18,
+                scale: 2,
+            },
+        );
+        let encoded = encode_starrocks_in_filter(&filter).expect("encode");
+        let wrong = arrow::datatypes::DataType::Int64;
+        assert!(decode_starrocks_in_filter(9, SlotId::new(4), Some(&wrong), &encoded).is_err());
     }
 
     #[test]

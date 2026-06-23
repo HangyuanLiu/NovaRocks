@@ -875,10 +875,15 @@ fn lower_probe_runtime_filter_specs(
             }
         };
         if seen.insert(filter_id) {
+            let Some(data_type) = arena.data_type(expr_id).cloned() else {
+                // probe expression type unknown: skip this RF probe spec rather than register an incomplete one.
+                continue;
+            };
             specs.push(RuntimeFilterProbeSpec {
                 filter_id,
                 expr_id,
                 slot_id,
+                data_type,
             });
         }
     }

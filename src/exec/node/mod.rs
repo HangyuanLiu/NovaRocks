@@ -70,6 +70,7 @@ pub struct RuntimeFilterProbeSpec {
     pub filter_id: i32,
     pub expr_id: ExprId,
     pub slot_id: SlotId,
+    pub data_type: arrow::datatypes::DataType,
 }
 
 #[derive(Clone, Debug)]
@@ -424,10 +425,17 @@ fn push_down_local_runtime_filters_inner(
             }
             let specs: Vec<RuntimeFilterProbeSpec> = filtered
                 .iter()
-                .map(|spec| RuntimeFilterProbeSpec {
-                    filter_id: spec.filter_id,
-                    expr_id: spec.expr_id,
-                    slot_id: spec.slot_id,
+                .filter_map(|spec| {
+                    // Skip a probe spec whose expr has no type in the arena (only a
+                    // stale/out-of-bounds expr_id; valid ids always have a type slot).
+                    // A runtime filter against an unknown-type expr would be unsound.
+                    let data_type = arena.data_type(spec.expr_id)?.clone();
+                    Some(RuntimeFilterProbeSpec {
+                        filter_id: spec.filter_id,
+                        expr_id: spec.expr_id,
+                        slot_id: spec.slot_id,
+                        data_type,
+                    })
                 })
                 .collect();
             scan.add_runtime_filter_specs(&specs);
