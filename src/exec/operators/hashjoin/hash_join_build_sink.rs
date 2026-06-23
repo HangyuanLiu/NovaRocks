@@ -43,8 +43,8 @@ use crate::exec::runtime_filter::{
     LocalRuntimeFilterSet, LocalRuntimeInFilterSet, MAX_RUNTIME_IN_FILTER_CONDITIONS,
     PartialRuntimeInFilterMerger, RuntimeBloomFilter, RuntimeEmptyFilter, RuntimeInFilter,
     RuntimeMembershipBuildOptions, RuntimeMembershipFilter, RuntimeMembershipFilterBuildParam,
-    RuntimeMinMaxFilter, data_type_to_tprimitive, encode_starrocks_bitset_filter,
-    encode_starrocks_bloom_filter, encode_starrocks_empty_filter,
+    RuntimeMinMaxFilter, arrow_type_to_proto_type_desc, data_type_to_tprimitive,
+    encode_starrocks_bitset_filter, encode_starrocks_bloom_filter, encode_starrocks_empty_filter,
     maybe_build_runtime_bitset_filter,
 };
 use crate::metrics;
@@ -666,6 +666,7 @@ impl HashJoinBuildSinkOperator {
                             filter_id: Some(filter.filter_id()),
                             finst_id,
                             build_be_number: Some(build_be_number),
+                            column_type: arrow_type_to_proto_type_desc(&spec.build_data_type),
                             data: Some(data.clone()),
                             ..Default::default()
                         };
