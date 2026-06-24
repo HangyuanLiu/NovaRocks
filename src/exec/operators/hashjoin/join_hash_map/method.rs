@@ -372,10 +372,10 @@ impl DirectIntJoinHashMap {
         if range > options.direct_range_max_len {
             return Ok(None);
         }
-        let row_scaled = (stats.indexed_rows as u64)
+        let row_gate = (stats.indexed_rows as u64)
             .checked_mul(options.direct_range_row_multiplier)
-            .unwrap_or(u64::MAX);
-        if range > row_scaled {
+            .ok_or_else(|| "join direct range gate overflow".to_string())?;
+        if range > row_gate {
             return Ok(None);
         }
         let len = usize::try_from(range)
@@ -795,6 +795,77 @@ mod tests {
         assert!(group_ids[1].is_none());
         assert_eq!(selection.probe, vec![0]);
         assert_eq!(selection.build, vec![1]);
+        assert_eq!(map.method_kind(), JoinHashMapMethodKind::Chained);
+    }
+
+    #[test]
+    fn direct_map_sparse_range_falls_back_to_chained() {
+        let build = int32_chunk(vec![Some(1), Some(1_000_000)]);
+        let batch = BuildKeyBatch::new(build.columns().to_vec(), build.len()).expect("batch");
+        let map = JoinHashMap::build_from_key_batches(
+            vec![DataType::Int32],
+            vec![false],
+            &[batch],
+            JoinHashMapBuildOptions::default(),
+        )
+        .expect("map");
+
+        assert_eq!(map.method_kind(), JoinHashMapMethodKind::Chained);
+    }
+
+    #[test]
+    fn direct_map_range_cap_falls_back_to_chained() {
+        let build = int32_chunk(vec![Some(0), Some((16 * 1024 * 1024) as i32)]);
+        let batch = BuildKeyBatch::new(build.columns().to_vec(), build.len()).expect("batch");
+        let options = JoinHashMapBuildOptions {
+            direct_range_row_multiplier: u64::MAX / 4,
+            direct_range_max_len: 16 * 1024 * 1024,
+        };
+        let map = JoinHashMap::build_from_key_batches(
+            vec![DataType::Int32],
+            vec![false],
+            &[batch],
+            options,
+        )
+        .expect("map");
+
+        assert_eq!(map.method_kind(), JoinHashMapMethodKind::Chained);
+    }
+
+    #[test]
+    fn direct_map_null_safe_equality_falls_back_to_chained() {
+        let build = int32_chunk(vec![Some(1), None]);
+        let batch = BuildKeyBatch::new(build.columns().to_vec(), build.len()).expect("batch");
+        let map = JoinHashMap::build_from_key_batches(
+            vec![DataType::Int32],
+            vec![true],
+            &[batch],
+            JoinHashMapBuildOptions::default(),
+        )
+        .expect("map");
+
+        assert_eq!(map.method_kind(), JoinHashMapMethodKind::Chained);
+    }
+
+    #[test]
+    fn direct_map_row_gate_overflow_returns_error() {
+        let build = int32_chunk(vec![Some(0), Some(1)]);
+        let batch = BuildKeyBatch::new(build.columns().to_vec(), build.len()).expect("batch");
+        let options = JoinHashMapBuildOptions {
+            direct_range_row_multiplier: u64::MAX / 2 + 1,
+            direct_range_max_len: u64::MAX,
+        };
+        let result = JoinHashMap::build_from_key_batches(
+            vec![DataType::Int32],
+            vec![false],
+            &[batch],
+            options,
+        );
+
+        match result {
+            Err(err) => assert_eq!(err, "join direct range gate overflow"),
+            Ok(_) => panic!("expected direct range gate overflow"),
+        }
     }
 
     #[test]
