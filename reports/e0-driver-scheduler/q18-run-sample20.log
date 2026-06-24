@@ -1,0 +1,45 @@
+========================================================================
+📋 TPC-H correctness runner (jobs=1)
+========================================================================
+mode=verify
+cluster_mode=all-in-one
+sql_dir=/Users/harbor/.codex/worktrees/957c/NovaRocks/sql-tests/tpc-h/sql
+sql_glob=q*.sql
+config=/Users/harbor/.codex/worktrees/957c/NovaRocks/docker/iceberg-rest/runtime/novarocks-b82eac2d/sql-test.conf
+result_dir=/Users/harbor/.codex/worktrees/957c/NovaRocks/sql-tests/tpc-h/result
+query_timeout=300s
+target: mysql=mysql, host=127.0.0.1:9180, user=root, catalog=iceberg_cat_sqlt_18bbbf40c684d3a8_22479_0, db=tpch
+verify_enabled=true
+suite_init=/Users/harbor/.codex/worktrees/957c/NovaRocks/sql-tests/tpc-h/init.sql
+suite_env.catalog=iceberg_cat_sqlt_18bbbf40c684d3a8_22479_0
+suite_env.db=tpch
+suite_cleanup=/Users/harbor/.codex/worktrees/957c/NovaRocks/sql-tests/tpc-h/cleanup.sql
+cases=1
+========================================================================
+[tpc-h] running suite init on target: /Users/harbor/.codex/worktrees/957c/NovaRocks/sql-tests/tpc-h/init.sql
+
+[tpc-h] q18 (steps=1)
+  step 1 (order_sensitive=false, epsilon=None)
+    ✅ PASS (152.03s, rows=9)
+    ["Customer#000128120", "128120", "4722021", "1994-04-07", "544089.09", "323.00"]
+    ["Customer#000144617", "144617", "3043270", "1997-02-12", "530604.44", "317.00"]
+    ["Customer#000066790", "66790", "2199712", "1996-09-30", "515531.82", "327.00"]
+    [tpc-h] progress: pass=1, fail=0, total=1
+
+[tpc-h] running suite cleanup on target: /Users/harbor/.codex/worktrees/957c/NovaRocks/sql-tests/tpc-h/cleanup.sql
+
+========================================================================
+summary (tpc-h, mode=verify)
+========================================================================
+total=1
+pass=1
+fail=0
+cpu_time=152.03s
+  suite tpc-h wall_time=155.89s
+
+slowest cases (top 5):
+  [tpc-h] q18: 152.03s
+
+case timings (all):
+  [tpc-h] q18 PASS 152.03s
+========================================================================

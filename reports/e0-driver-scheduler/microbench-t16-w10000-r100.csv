@@ -1,0 +1,8 @@
+mode,threads,tasks,iterations_per_thread,work_us,ops,wall_ms,ops_per_sec,lock_wait_ms,lock_wait_ns_per_op
+atomic_level_heads_packed,16,8,100,0,1600,0.414,3865126.414,0.000,0.000
+atomic_level_heads_padded,16,8,100,0,1600,0.388,4119729.643,0.000,0.000
+atomic_level_heads_per_worker,16,8,100,0,1600,0.287,5578975.630,0.000,0.000
+mutex_central,16,512,100,10000,1600,1121.146,1427.111,14.227,8892.024
+atomic_central,16,512,100,10000,1600,1123.093,1424.637,0.000,0.000
+per_worker_local,16,512,100,10000,1600,1150.061,1391.231,0.000,0.000
+affinity_slot_upper_bound,16,512,100,10000,1600,1133.728,1411.273,0.000,0.000
